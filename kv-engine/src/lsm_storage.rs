@@ -11899,9 +11899,15 @@ mod tests {
     /// quiescence, which waits for an admitted operation to drop its guard. On a
     /// `current_thread` runtime the only thread that can poll that operation - and
     /// so release the guard - is the one inside `close_async`, so running the close
-    /// inline waits for a guard only itself can free. A ticker keeps the runtime
-    /// polling for as long as the guard is held, which is what makes the deadlock
-    /// reachable rather than merely theoretical.
+    /// inline waits for a guard only itself can free.
+    ///
+    /// What this test actually detects on a regression is that the runtime stopped
+    /// polling: with the close inline, the guard task is never polled, so its
+    /// `admit_scan` is never reached and the ticker never runs. The deadlock proper
+    /// needs the guard to be admitted and *parked* before the close starts, released
+    /// by a third thread later - an arrangement that would make this test hang
+    /// rather than fail, which is why it is not used here. The assertion on the
+    /// ticker is what rules out passing vacuously.
     ///
     /// The close runs on its own thread and is joined with a timeout, so a
     /// regression fails here instead of hanging the test binary until nextest kills
