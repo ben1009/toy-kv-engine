@@ -3390,11 +3390,13 @@ impl BackupRepository {
         // The cost is one path an earlier arming covered: if `self.restore` fails
         // after publishing - its repository lock reacquire - this leaves the
         // staging behind, and a later restore to the same destination trips the
-        // guard above until it is removed by hand. That error is indistinguishable
-        // from the loser's from here, so the choice is between leaking on a lock
-        // failure and deleting a peer's staging on a race; this takes the leak.
-        // Telling them apart needs the staging's identity handed back by
-        // `self.restore`, which its signature does not carry.
+        // guard above until it is removed by hand. The two errors are not
+        // distinguishable except by their text - "restore target already exists"
+        // against a failed lock reacquire - with nothing structural saying whether
+        // this call published, so the choice is between leaking on a lock failure
+        // and deleting a peer's staging on a race; this takes the leak. Telling
+        // them apart needs the staging's identity handed back by `self.restore`,
+        // which its signature does not carry.
         //
         // Disarmed before `publish_pitr_restore_staging`, whose own outcomes decide
         // the staging's fate from there: a hard failure discards it, while

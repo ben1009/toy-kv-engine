@@ -3,7 +3,7 @@
 Measured on 2026-09-17 with commit `4dce423d` and the in-tree `pitr-perf`
 harness.
 
-## Method
+## Method (the current harness)
 
 ```bash
 cargo run --release --bin pitr-perf -- --operations 10000
@@ -49,7 +49,7 @@ The 4- and 16-writer inversions show that this short tmpfs workload is noisy;
 they are not evidence that PITR improves throughput. The stable conclusion is
 that the enabled foreground path stayed in the same order of magnitude, while
 copying, catalog publication, and source-manifest completion were isolated in
-the explicit 0.12–0.15 second catch-up measurement.
+the explicit 0.14–0.16 second catch-up measurement.
 
 Device-backed same-device/separate-device archive tests and configured-rate
 backlog tests remain environment-specific follow-ups; this baseline does not
