@@ -4107,12 +4107,26 @@ impl KvEngine {
             secs: observed.secs,
             nanos: observed.nanos,
         };
-        let latest_commit_ts = self
+        let sequencer = self
             .inner
             .mvcc
             .as_ref()
-            .ok_or_else(|| anyhow!("PITR base requires MVCC"))?
-            .latest_commit_ts();
+            .ok_or_else(|| anyhow!("PITR base requires MVCC"))?;
+        // The declared high-water has to be a boundary below which every
+        // admitted commit is published: restore reads `included_commit_ts` as
+        // "this base already represents that commit" and replays nothing past
+        // it, and `PitrBaseCapture::capture` asserts the same equality on the
+        // boundary path. Reading `latest_commit_ts` with admission open is not
+        // enough - that is a high-water mark, not a boundary - so stop
+        // admission and drain before naming it.
+        let latest_commit_ts = match sequencer.stop_commit_admission_and_capture() {
+            Ok(captured) => captured.unwrap_or(0),
+            Err(error) => {
+                sequencer.resume_commit_admission();
+                return Err(error);
+            }
+        };
+        sequencer.resume_commit_admission();
         let included_commit_ts = (latest_commit_ts != 0).then_some(latest_commit_ts);
         let indexed_anchor = state
             .last_commit_anchor
@@ -8923,7 +8937,7 @@ impl LsmStorageInner {
             }
             // Advance current_ts AFTER publish.
             if commit_ts > 0 {
-                mvcc.finish_commit(commit_ts)?;
+                mvcc.publish_commit_ts(commit_ts)?;
             }
         }
         self.try_freeze_memtable()?;
@@ -9065,7 +9079,7 @@ impl LsmStorageInner {
                 && let Some(ref mvcc) = self.mvcc
             {
                 Self::publish_range_tombstones_or_poison(&memtable, &entries, ts, mvcc)?;
-                mvcc.finish_commit(ts)?;
+                mvcc.publish_commit_ts(ts)?;
             } else {
                 memtable.publish_range_tombstones(&entries, ts, 0)?;
             }
@@ -9355,7 +9369,7 @@ impl LsmStorageInner {
             }
             // Advance current_ts AFTER publish.
             if commit_ts > 0 {
-                mvcc.finish_commit(commit_ts)?;
+                mvcc.publish_commit_ts(commit_ts)?;
             }
             commit_ts
         };
@@ -10312,7 +10326,7 @@ impl LsmStorageInner {
             if mvcc_commit_ts > 0
                 && let Some(ref mvcc) = self.mvcc
             {
-                mvcc.finish_commit(mvcc_commit_ts)?;
+                mvcc.publish_commit_ts(mvcc_commit_ts)?;
             }
             // Record serializable txn AFTER WAL sync succeeds, so that failed
             // syncs don't poison the committed_txns set.
@@ -10576,7 +10590,7 @@ impl LsmStorageInner {
                 if commit_ts > 0
                     && let Some(ref mvcc) = self.mvcc
                 {
-                    mvcc.finish_commit(commit_ts)?;
+                    mvcc.publish_commit_ts(commit_ts)?;
                 }
                 if self.options.serializable
                     && let Some(ref mvcc) = self.mvcc
@@ -10658,7 +10672,7 @@ impl LsmStorageInner {
                 if commit_ts > 0
                     && let Some(ref mvcc) = self.mvcc
                 {
-                    mvcc.finish_commit(commit_ts)?;
+                    mvcc.publish_commit_ts(commit_ts)?;
                 }
                 if self.options.serializable
                     && let Some(ref mvcc) = self.mvcc
@@ -10737,7 +10751,7 @@ impl LsmStorageInner {
                 if commit_ts > 0
                     && let Some(ref mvcc) = self.mvcc
                 {
-                    mvcc.finish_commit(commit_ts)?;
+                    mvcc.publish_commit_ts(commit_ts)?;
                 }
                 if self.options.serializable
                     && let Some(ref mvcc) = self.mvcc

@@ -26,6 +26,10 @@ static NEXT_MVCC_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 /// How long the commit barrier waits before rechecking a drain, so that a
 /// signal missed by the lock-free publication path costs a bounded delay
 /// rather than a hang.
+/// Spin budget before a publication waiter parks instead. The wait is normally
+/// one WAL sync; this is generous enough to cover it without burning a core.
+const PUBLICATION_SPIN_LIMIT: u32 = 1 << 14;
+
 const DRAIN_RECHECK: std::time::Duration = std::time::Duration::from_millis(1);
 type WalPublish = (u64, Vec<u8>, Vec<u8>, Option<u64>);
 
@@ -117,16 +121,13 @@ pub(crate) struct LsmMvccInner {
     /// allocation is ordered before the barrier's target read and the barrier
     /// waits for it; otherwise the writer undoes the allocation.
     commit_gate: AtomicBool,
+    /// Mirror of `publication.next_to_publish`, stored under the publication
+    /// lock and read by waiters without it. See `await_publication`.
+    frontier: AtomicU64,
     /// Commit timestamps allocated but neither published nor retired. The
     /// barrier drains this, in both publication modes, to prove that every
     /// commit admitted before it armed has become visible.
     in_flight: AtomicU64,
-    /// Sticky: set the first time a commit barrier is armed. Until then nothing
-    /// requires publication to be ordered, so the write path advances
-    /// `current_ts` directly - publication order only has an observer once a
-    /// boundary has to be a clean cut, and waiting for it costs the write path
-    /// an ordered convoy (see `finish_commit`).
-    ordered: AtomicBool,
     pub(crate) watermark: Watermark,
     pub(crate) committed_txns: Arc<Mutex<BTreeMap<u64, CommittedTxnData>>>,
 }
@@ -204,7 +205,7 @@ impl LsmMvccInner {
             }
             publication.next_to_publish = next.saturating_add(1);
         }
-        self.ordered.store(true, Ordering::SeqCst);
+        self.publish_frontier(&publication);
         let current = self.current_ts.load(Ordering::Acquire);
         Ok((current != 0).then_some(current))
     }
@@ -255,8 +256,8 @@ impl LsmMvccInner {
                 waiters: 0,
             }),
             commit_gate: AtomicBool::new(false),
+            frontier: AtomicU64::new(initial_ts.saturating_add(1)),
             in_flight: AtomicU64::new(0),
-            ordered: AtomicBool::new(false),
             publication_condvar: Condvar::new(),
             watermark: Watermark::new(),
             committed_txns: Arc::new(Mutex::new(BTreeMap::new())),
@@ -272,7 +273,11 @@ impl LsmMvccInner {
     pub fn update_commit_ts(&self, ts: u64) -> bool {
         let mut publication = self.publication.lock();
         // No live reservations: every commit admitted so far has published or
-        // been retired, so a new high-water mark cannot skip one.
+        // been retired, so a new high-water mark cannot skip one. This is
+        // advisory: a reservation between its allocation and its count is not
+        // visible here. No production caller races it - both callers run on an
+        // engine with no concurrent writers (a freshly opened restore staging
+        // engine) or in tests.
         if self.in_flight.load(Ordering::SeqCst) != 0 {
             return false;
         }
@@ -281,6 +286,7 @@ impl LsmMvccInner {
             .fetch_max(ts.saturating_add(1), Ordering::Release);
         publication.next_to_publish = publication.next_to_publish.max(ts.saturating_add(1));
         publication.retired.retain(|retired| *retired > ts);
+        self.publish_frontier(&publication);
         if publication.waiters > 0 {
             self.publication_condvar.notify_all();
         }
@@ -299,6 +305,15 @@ impl LsmMvccInner {
             return Err(self.commit_gate_error());
         }
         let next = self.next_commit_ts.fetch_add(1, Ordering::SeqCst);
+        if next == u64::MAX || next == 0 {
+            // Exhausted. Saturate so no further allocation can wrap into a low
+            // timestamp - zero is only reachable through that wrap, since a
+            // fresh instance allocates from one upwards - and take no
+            // reservation for a commit that will never publish: a reservation
+            // leaked here would leave every later barrier drain waiting.
+            self.next_commit_ts.store(u64::MAX, Ordering::SeqCst);
+            anyhow::bail!("commit timestamp exhausted");
+        }
         // Counted before the second gate check, so a barrier that sees the gate
         // open below cannot also see zero in flight and drain past this commit.
         self.in_flight.fetch_add(1, Ordering::SeqCst);
@@ -309,12 +324,44 @@ impl LsmMvccInner {
             self.retire_commit_ts(next);
             return Err(self.commit_gate_error());
         }
-        if next == u64::MAX {
-            // The counter has no successor; leave it saturated.
-            self.next_commit_ts.store(u64::MAX, Ordering::SeqCst);
-            anyhow::bail!("commit timestamp exhausted");
-        }
         Ok(next)
+    }
+
+    /// Republish the frontier where waiters can read it without the lock.
+    fn publish_frontier(&self, publication: &PublicationState) {
+        self.frontier
+            .store(publication.next_to_publish, Ordering::Release);
+    }
+
+    /// Wait until every commit below `commit_ts` has published.
+    ///
+    /// Spins first, on the mirrored frontier: the wait is one WAL sync long, and
+    /// parking re-acquires the publication lock on every recheck - which delays
+    /// the publisher being waited on. A predecessor that takes longer than the
+    /// spin budget falls back to parking, so a stalled writer does not burn a
+    /// core, and the park is signalled by `publish_commit_ts` as before.
+    fn await_publication(&self, commit_ts: u64) -> anyhow::Result<()> {
+        for _ in 0..PUBLICATION_SPIN_LIMIT {
+            if self.frontier.load(Ordering::Acquire) >= commit_ts {
+                return Ok(());
+            }
+            std::hint::spin_loop();
+        }
+        let mut publication = self.publication.lock();
+        publication.waiters += 1;
+        while publication.next_to_publish < commit_ts {
+            if publication
+                .poisoned_at
+                .is_some_and(|poisoned| commit_ts >= poisoned)
+            {
+                publication.waiters -= 1;
+                anyhow::bail!("commit sequencer requires recovery after unknown WAL durability");
+            }
+            self.publication_condvar
+                .wait_for(&mut publication, DRAIN_RECHECK);
+        }
+        publication.waiters -= 1;
+        Ok(())
     }
 
     /// The error a writer deserves when the gate is closed. Read under the
@@ -350,7 +397,7 @@ impl LsmMvccInner {
 
     pub(crate) fn retire_commit_ts(&self, commit_ts: u64) {
         let mut publication = self.publication.lock();
-        self.in_flight.fetch_sub(1, Ordering::Release);
+        self.in_flight.fetch_sub(1, Ordering::SeqCst);
         if publication.poisoned_at.is_some() {
             // Published nothing, and no boundary can be taken while poisoned.
             return;
@@ -366,6 +413,7 @@ impl LsmMvccInner {
             }
             publication.next_to_publish = next.saturating_add(1);
         }
+        self.publish_frontier(&publication);
         if publication.waiters > 0 {
             self.publication_condvar.notify_all();
         }
@@ -384,49 +432,6 @@ impl LsmMvccInner {
         self.publication_condvar.notify_all();
     }
 
-    /// Finish a commit's publication step.
-    ///
-    /// Until a commit barrier is armed there is no reader that needs commits to
-    /// become visible in timestamp order, so this advances the reader-visible
-    /// timestamp directly - the single atomic step the engine took before the
-    /// ordered sequencer existed. Waiting for an earlier timestamp here instead
-    /// puts every writer through an ordered convoy, which costs the wait *and*
-    /// de-phases the writers enough to break group commit: on a 4-thread put
-    /// workload it produced 2.5x the solo commit groups and about 10% less
-    /// throughput.
-    ///
-    /// Once a barrier has armed, publication is ordered for the rest of the
-    /// database's life, because a boundary has to be a clean cut; that is what
-    /// [`Self::publish_commit_ts`] provides.
-    pub(crate) fn finish_commit(&self, commit_ts: u64) -> anyhow::Result<()> {
-        if self.ordered.load(Ordering::SeqCst) {
-            return self.publish_commit_ts(commit_ts);
-        }
-        // Published before the reservation is released, so a barrier that sees
-        // nothing in flight also sees this timestamp in `current_ts`.
-        self.current_ts.fetch_max(commit_ts, Ordering::Release);
-        if !self.commit_gate.load(Ordering::SeqCst) {
-            // No barrier is draining and nothing is poisoned.
-            self.in_flight.fetch_sub(1, Ordering::Release);
-            return Ok(());
-        }
-        // A barrier is draining, or the sequencer is poisoned; either way this
-        // needs the lock, to signal the drain or to read the poison.
-        let publication = self.publication.lock();
-        if publication
-            .poisoned_at
-            .is_some_and(|poisoned| commit_ts >= poisoned)
-        {
-            // Left in flight, as in `publish_commit_ts`.
-            anyhow::bail!("commit sequencer requires recovery after unknown WAL durability");
-        }
-        self.in_flight.fetch_sub(1, Ordering::Release);
-        if publication.waiters > 0 {
-            self.publication_condvar.notify_all();
-        }
-        Ok(())
-    }
-
     pub(crate) fn publish_commit_ts(&self, commit_ts: u64) -> anyhow::Result<()> {
         let mut publication = self.publication.lock();
         if publication
@@ -439,24 +444,29 @@ impl LsmMvccInner {
             anyhow::bail!("commit sequencer requires recovery after unknown WAL durability");
         }
         if commit_ts < publication.next_to_publish {
-            self.in_flight.fetch_sub(1, Ordering::Release);
+            self.in_flight.fetch_sub(1, Ordering::SeqCst);
             return Ok(());
         }
-        // Announced so that the publishers this call is waiting on signal it
-        // when they advance the frontier.
-        publication.waiters += 1;
-        while commit_ts != publication.next_to_publish {
-            self.publication_condvar.wait(&mut publication);
+        if commit_ts != publication.next_to_publish {
+            // Wait outside the lock: parking here made every waiter re-acquire
+            // the publication lock to recheck, which is what delayed the
+            // publisher it was waiting on.
+            drop(publication);
+            self.await_publication(commit_ts)?;
+            publication = self.publication.lock();
             if publication
                 .poisoned_at
                 .is_some_and(|poisoned| commit_ts >= poisoned)
             {
-                publication.waiters -= 1;
                 anyhow::bail!("commit sequencer requires recovery after unknown WAL durability");
             }
+            if commit_ts < publication.next_to_publish {
+                // Retired while waiting: nothing left to publish.
+                self.in_flight.fetch_sub(1, Ordering::SeqCst);
+                return Ok(());
+            }
         }
-        publication.waiters -= 1;
-        self.in_flight.fetch_sub(1, Ordering::Release);
+        self.in_flight.fetch_sub(1, Ordering::SeqCst);
         self.current_ts.store(commit_ts, Ordering::Release);
         publication.next_to_publish = publication.next_to_publish.saturating_add(1);
         loop {
@@ -466,8 +476,9 @@ impl LsmMvccInner {
             }
             publication.next_to_publish = next.saturating_add(1);
         }
+        self.publish_frontier(&publication);
         // Only when this advance can unblock somebody: the barrier, or a later
-        // timestamp waiting on the frontier this call just moved.
+        // timestamp parked on the condvar rather than spinning.
         if publication.waiters > 0 {
             self.publication_condvar.notify_all();
         }
@@ -703,7 +714,7 @@ impl LsmMvccInner {
             self.poison_commit_ts(commit_ts);
             return Err(error);
         }
-        self.finish_commit(commit_ts)?;
+        self.publish_commit_ts(commit_ts)?;
 
         Ok(commit_ts)
     }
@@ -989,7 +1000,11 @@ impl LsmMvccInner {
     pub(crate) fn advance_ts(&self, ts: u64) -> bool {
         let mut publication = self.publication.lock();
         // No live reservations: every commit admitted so far has published or
-        // been retired, so a new high-water mark cannot skip one.
+        // been retired, so a new high-water mark cannot skip one. This is
+        // advisory: a reservation between its allocation and its count is not
+        // visible here. No production caller races it - both callers run on an
+        // engine with no concurrent writers (a freshly opened restore staging
+        // engine) or in tests.
         if self.in_flight.load(Ordering::SeqCst) != 0 {
             return false;
         }
@@ -998,6 +1013,7 @@ impl LsmMvccInner {
             .fetch_max(ts.saturating_add(1), Ordering::Release);
         publication.next_to_publish = publication.next_to_publish.max(ts.saturating_add(1));
         publication.retired.retain(|retired| *retired > ts);
+        self.publish_frontier(&publication);
         if publication.waiters > 0 {
             self.publication_condvar.notify_all();
         }
@@ -1136,7 +1152,7 @@ mod tests {
             crate::key::KeySlice::from_slice(&encoded_key),
             prefixed.as_slice(),
         )])?;
-        mvcc.finish_commit(commit_ts)?;
+        mvcc.publish_commit_ts(commit_ts)?;
 
         Ok(commit_ts)
     }
@@ -1275,13 +1291,13 @@ mod tests {
         assert!(mvcc.reserve_commit_ts().is_err());
         // The in-flight commit still completes, and the captured boundary is
         // its timestamp: the barrier drained it rather than racing past it.
-        mvcc.finish_commit(commit_ts).unwrap();
+        mvcc.publish_commit_ts(commit_ts).unwrap();
         assert_eq!(capture.join().unwrap().unwrap(), Some(commit_ts));
         // Publication is ordered from here on.
         mvcc.resume_commit_admission();
         let next = mvcc.reserve_commit_ts().unwrap();
         assert_eq!(next, commit_ts + 1);
-        mvcc.finish_commit(next).unwrap();
+        mvcc.publish_commit_ts(next).unwrap();
         assert_eq!(mvcc.latest_commit_ts(), next);
     }
 
