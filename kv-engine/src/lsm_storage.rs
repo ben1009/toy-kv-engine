@@ -2616,6 +2616,26 @@ impl KvEngine {
             ])?;
             self.persist_pitr_lifecycle(std::slice::from_ref(&record), state.clone())?;
         }
+        // Hold the barrier across the lifecycle install and the reconcile.
+        //
+        // The maintenance path and close/disable take the barrier but not the
+        // operation lock, so without it this install races a loaned-out archiver:
+        // the loan would restore its own copy over the one installed here, or find
+        // the slot empty mid-transaction and report the archiver as detached.
+        //
+        // The install publishes the lifecycle it is handed, and it is what attaches
+        // the archiver - the thing that lets the periodic pass run at all. So the
+        // lifecycle has to be read under the same barrier that publishes it. The
+        // read this call started from was taken before the barrier, and a pass that
+        // landed in between has already advanced the lifecycle durably; installing
+        // that older snapshot replaces the advance in memory. Replaying it
+        // re-publishes a transition that is already durable - a second
+        // `SegmentSealed`, or the same for `SegmentArchived`, `SegmentReclaimable`
+        // or `SegmentReclaimed` - and the replay then rejects it on the next open,
+        // leaving a database nothing can open again. Every other reconcile caller
+        // reads under the barrier; this one has to as well.
+        let barrier = self.pitr_barrier_lock.lock();
+        state = self.pitr_manifest_state.lock().clone();
         if self.pitr_runtime.lock().is_none()
             && matches!(
                 state.mode,
@@ -2634,12 +2654,6 @@ impl KvEngine {
             .clone();
         let limiter = controller.limiter();
         let priority = controller.priority_handle();
-        // Hold the barrier across the install and the reconcile. The maintenance
-        // path and close/disable take the barrier but not the operation lock, so
-        // without it this install races a loaned-out archiver: the loan would
-        // restore its own copy over the one installed here, or find the slot
-        // empty mid-transaction and report the archiver as detached.
-        let barrier = self.pitr_barrier_lock.lock();
         let mut archiver = self.pitr_archiver.lock();
         if archiver.is_none() {
             *archiver = Some(
@@ -2651,14 +2665,6 @@ impl KvEngine {
             );
         }
         drop(archiver);
-        // The lifecycle this call started from was read before the barrier, and a
-        // maintenance pass that ran in between has already advanced it. Replaying
-        // that stale snapshot re-publishes a transition that is already durable -
-        // a second `SegmentSealed`, or the same for `SegmentArchived`,
-        // `SegmentReclaimable` or `SegmentReclaimed` - and the replay then rejects
-        // it on the next open, leaving a database nothing can open again. Every
-        // other reconcile caller reads under the barrier; this one has to as well.
-        state = self.pitr_manifest_state.lock().clone();
         state = self.reconcile_durable_archive_obligations(state)?;
         drop(barrier);
         if state.mode == crate::pitr_manifest::PitrMode::PublicationUncertain {
@@ -12960,15 +12966,30 @@ mod tests {
     }
 
     /// A pass that finishes an obligation while `resume_pitr` sits between its
-    /// lifecycle read and the barrier must not be re-published from the snapshot
-    /// that read took. Replaying it appends a transition which is already durable -
-    /// here a second `SegmentSealed` - and the next open rejects the record stream
-    /// as out of order, so the database can never be opened again.
+    /// lifecycle read and the install that publishes it must not be re-published
+    /// from the snapshot that read took. Replaying it appends a transition which is
+    /// already durable - here a second `SegmentSealed` - and the next open rejects
+    /// the record stream as out of order, so the database can never be opened
+    /// again.
     ///
-    /// The window is arranged rather than raced: this thread holds the barrier so
-    /// `resume_pitr` reads the lifecycle and then waits, and the obligation is
-    /// finished while it waits. That is exactly what a background pass wins on its
-    /// own, which is how this was found.
+    /// The install is what attaches the archiver, which is what lets a pass run at
+    /// all, so the window is real without this test: a pass that lands between the
+    /// read and the install has its durable advance replaced in memory by the
+    /// older lifecycle that install was handed.
+    ///
+    /// The window is arranged rather than raced. This thread holds both guards the
+    /// racing resume needs, so the resume parks behind its read either way - on
+    /// `pitr_barrier_lock`, which `resume_pitr` takes before it installs, publishes
+    /// or reconciles anything, or, for a resume that read the lifecycle *before*
+    /// the barrier, on the runtime slot whose absence it tests on its way to the
+    /// install, past its read and still short of publishing it.
+    ///
+    /// Either way the obligation finished below is provably in place before the
+    /// resume publishes. The witness is `pitr_repository_path`: this test clears
+    /// it, and the resume restores it after its read and before either park, so
+    /// waiting for it is what proves the read is behind us. Without that witness a
+    /// resume which read late would let this test pass while the window it exists
+    /// to arrange was never created.
     #[cfg(target_os = "linux")]
     #[test]
     fn a_pass_racing_resume_is_not_replayed_from_a_stale_snapshot() {
@@ -13015,30 +13036,36 @@ mod tests {
         ])
         .unwrap();
         engine.persist_pitr_lifecycle(&starting, torn).unwrap();
+        // Reopened without its repository, which is the shape that installs a
+        // lifecycle: the durable one survives, the runtime does not, and the
+        // install is what attaches the archiver a pass needs. Without this the
+        // resume finds the runtime already attached, skips the install, and the
+        // window this test exists to arrange is never reached.
+        drop(engine);
+        let engine = KvEngine::open(dir.path().join("db"), options.clone()).unwrap();
 
+        // Cleared so the resume's own write to it can witness that it is past the
+        // lifecycle read.
+        *engine.pitr_repository_path.lock() = None;
         let barrier = engine.pitr_barrier_lock.lock();
+        let runtime = engine.pitr_runtime.lock();
         std::thread::scope(|scope| {
             let resume = scope.spawn(|| engine.resume_pitr(repository.clone()));
-            // The operation lock is taken before the lifecycle is read, so finding
-            // it held means that read is already behind us.
-            let mut arranged = false;
-            for _ in 0..200_000 {
-                if engine.pitr_operation_lock.try_lock().is_none() {
-                    arranged = true;
-                    break;
-                }
-                std::thread::yield_now();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while engine.pitr_repository_path.lock().is_none() {
+                // Without the read behind us this test proves nothing, so it has
+                // to fail loudly rather than pass vacuously.
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the racing resume never read the lifecycle; the window this test \
+                     exists to arrange was not created"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(1));
             }
-            // Without the window this test proves nothing, so it has to fail
-            // loudly rather than pass vacuously.
-            assert!(
-                arranged,
-                "the racing resume never reached the barrier; the window this test \
-                 exists to arrange was not created"
-            );
-            // Finish the obligation the way a pass would. The record's high-water
-            // fields are irrelevant here - the replay rejects the duplicate before
-            // it looks at them.
+            // Finish the obligation the way a pass would, while the resume is
+            // parked behind its read. The record's high-water fields are
+            // irrelevant here - the replay rejects the duplicate before it looks
+            // at them.
             let state = engine.pitr_manifest_state.lock().clone();
             let (metadata, _, _) = engine.load_pitr_source_segment(&state, segment_id).unwrap();
             let record = crate::pitr_manifest::PitrManifestRecord::SegmentSealed {
@@ -13057,7 +13084,14 @@ mod tests {
             ])
             .unwrap();
             engine.persist_pitr_lifecycle(&[record], next).unwrap();
+            // Released together, runtime slot first: a resume that read before the
+            // barrier is let through to the install this publish is about, and one
+            // that read under it is let through to the reconcile.
+            drop(runtime);
             drop(barrier);
+            // `resume_pitr` is expected to refuse here - the reopened engine still
+            // writes to the segment - so the outcome carries no assertion. What
+            // must hold is that it published nothing further.
             let _ = resume.join();
         });
         drop(engine);
