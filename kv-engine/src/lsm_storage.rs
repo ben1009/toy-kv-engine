@@ -2791,6 +2791,14 @@ impl KvEngine {
             );
         }
         drop(archiver);
+        // The lifecycle this call started from was read before the barrier, and a
+        // maintenance pass that ran in between has already advanced it. Replaying
+        // that stale snapshot re-publishes a transition that is already durable -
+        // a second `SegmentSealed`, or the same for `SegmentArchived`,
+        // `SegmentReclaimable` or `SegmentReclaimed` - and the replay then rejects
+        // it on the next open, leaving a database nothing can open again. Every
+        // other reconcile caller reads under the barrier; this one has to as well.
+        state = self.pitr_manifest_state.lock().clone();
         state = self.reconcile_durable_archive_obligations(state)?;
         drop(barrier);
         if state.mode == crate::pitr_manifest::PitrMode::PublicationUncertain {
@@ -13192,6 +13200,111 @@ mod tests {
         reopened.put(b"after-resume", b"value").unwrap();
         assert_eq!(
             reopened.get(b"after-resume").unwrap().as_deref(),
+            Some(b"value".as_slice())
+        );
+        let _ = reopened.close();
+    }
+
+    /// A pass that finishes an obligation while `resume_pitr` sits between its
+    /// lifecycle read and the barrier must not be re-published from the snapshot
+    /// that read took. Replaying it appends a transition which is already durable -
+    /// here a second `SegmentSealed` - and the next open rejects the record stream
+    /// as out of order, so the database can never be opened again.
+    ///
+    /// The window is arranged rather than raced: this thread holds the barrier so
+    /// `resume_pitr` reads the lifecycle and then waits, and the obligation is
+    /// finished while it waits. That is exactly what a background pass wins on its
+    /// own, which is how this was found.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_pass_racing_resume_is_not_replayed_from_a_stale_snapshot() {
+        let dir = tempdir().unwrap();
+        let parent = crate::backup::open_directory_no_follow(dir.path()).unwrap();
+        crate::backup::bootstrap_repository(&parent, "repository").unwrap();
+        let repository = dir.path().join("repository");
+        let options = LsmStorageOptions {
+            enable_wal: true,
+            ..LsmStorageOptions::default_for_test()
+        };
+        let engine = KvEngine::open(dir.path().join("db"), options.clone()).unwrap();
+        engine
+            .enable_pitr(crate::pitr_api::PitrOptions {
+                repository: repository.clone(),
+                config: crate::pitr_api::PersistedPitrConfig {
+                    archive_interval: std::time::Duration::from_secs(3600),
+                    max_segment_bytes: 1 << 20,
+                    max_unarchived_bytes: 1 << 20,
+                    max_source_spool_bytes: 2 << 20,
+                },
+                runtime: crate::pitr_api::PitrRuntimeOptions::default(),
+            })
+            .unwrap();
+        engine.put(b"before-race", b"value").unwrap();
+        let segment_id = engine.pitr_manifest_state.lock().active_segment_id.unwrap();
+        let (seal, wal_path, _) = engine.inner.write_pitr_seal_for_active_wal().unwrap();
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&wal_path)
+            .unwrap();
+        file.set_len(seal.logical_length).unwrap();
+        file.sync_all().unwrap();
+        let starting = [crate::pitr_manifest::PitrManifestRecord::SealStarted {
+            segment_id,
+            successor_segment_id: segment_id + 1,
+            logical_length: seal.logical_length,
+        }];
+        let torn = crate::pitr_manifest::replay_pitr_records([
+            crate::pitr_manifest::PitrManifestRecord::Snapshot(Box::new(
+                engine.pitr_manifest_state.lock().clone(),
+            )),
+            starting[0].clone(),
+        ])
+        .unwrap();
+        engine.persist_pitr_lifecycle(&starting, torn).unwrap();
+
+        let barrier = engine.pitr_barrier_lock.lock();
+        std::thread::scope(|scope| {
+            let resume = scope.spawn(|| engine.resume_pitr(repository.clone()));
+            // The operation lock is taken before the lifecycle is read, so finding
+            // it held means that read is already behind us.
+            for _ in 0..200_000 {
+                if engine.pitr_operation_lock.try_lock().is_none() {
+                    break;
+                }
+                std::thread::yield_now();
+            }
+            // Finish the obligation the way a pass would. The record's high-water
+            // fields are irrelevant here - the replay rejects the duplicate before
+            // it looks at them.
+            let state = engine.pitr_manifest_state.lock().clone();
+            let (metadata, _, _) = engine.load_pitr_source_segment(&state, segment_id).unwrap();
+            let record = crate::pitr_manifest::PitrManifestRecord::SegmentSealed {
+                segment_id,
+                segment_anchor: crate::pitr_manifest::PersistedChainAnchor::Segment {
+                    segment_id,
+                    wal_digest: metadata.wal_digest,
+                    seal_digest: metadata.seal_digest,
+                },
+                last_recorded_at: None,
+                last_commit_anchor: None,
+            };
+            let next = crate::pitr_manifest::replay_pitr_records([
+                crate::pitr_manifest::PitrManifestRecord::Snapshot(Box::new(state)),
+                record.clone(),
+            ])
+            .unwrap();
+            engine.persist_pitr_lifecycle(&[record], next).unwrap();
+            drop(barrier);
+            let _ = resume.join();
+        });
+        drop(engine);
+
+        // The stream has to stay replayable: that is the whole invariant.
+        let reopened = KvEngine::open(dir.path().join("db"), options).unwrap_or_else(|error| {
+            panic!("a pass racing resume must not leave a stream nothing can replay: {error:?}")
+        });
+        assert_eq!(
+            reopened.get(b"before-race").unwrap().as_deref(),
             Some(b"value".as_slice())
         );
         let _ = reopened.close();
