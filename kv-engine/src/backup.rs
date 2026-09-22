@@ -45,6 +45,15 @@ const REPOSITORY_ID_FILE: &str = "REPOSITORY_ID";
 const REPOSITORY_ID_TEMP_FILE: &str = "REPOSITORY_ID.tmp";
 const PITR_PURGE_TXN_FILE: &str = "PITR_PURGE_TXN";
 const PITR_PURGE_TXN_MAGIC: &[u8; 8] = b"TKVPTRTX";
+/// Staging names for the two catalogs a PITR purge replaces. They are deliberately
+/// not `BACKUP_CATALOG_LOG.purge.tmp`: `recover_catalog_successor` owns that name
+/// and validates whatever it finds there as a *count-retention* successor, which a
+/// PITR purge's successor can never be - it drops the backups retention released,
+/// and its `base_catalog_digest` names the catalog it replaces. A crash between the
+/// staging sync and the rename would otherwise leave a file recovery refuses, and
+/// the repository could not be opened again.
+const PITR_PURGE_BACKUP_TEMP_FILE: &str = "PITR_BACKUP_CATALOG_LOG.tmp";
+const PITR_PURGE_CATALOG_TEMP_FILE: &str = "PITR_CATALOG_LOG.purge.tmp";
 pub type BackupId = u64;
 static OBJECT_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 #[cfg(all(test, target_os = "linux", feature = "chaos-testing"))]
@@ -688,6 +697,18 @@ fn recover_pitr_purge_transaction(root: &OwnedFd) -> Result<()> {
         result == 0 || std::io::Error::last_os_error().kind() == std::io::ErrorKind::NotFound,
         "failed to remove recovered PITR purge descriptor"
     );
+    // The staging the descriptor carried is what the renames above installed, and
+    // the descriptor is the only thing that can name it once that is done, so
+    // discard it here rather than leave it for a later crash to strand.
+    for name in [PITR_PURGE_BACKUP_TEMP_FILE, PITR_PURGE_CATALOG_TEMP_FILE] {
+        let name = CString::new(name)?;
+        let result = unsafe { libc::unlinkat(root.as_raw_fd(), name.as_ptr(), 0) };
+        ensure!(
+            result == 0 || std::io::Error::last_os_error().kind() == std::io::ErrorKind::NotFound,
+            "failed to discard recovered PITR purge staging: {}",
+            std::io::Error::last_os_error()
+        );
+    }
     fsync_fd(root)
 }
 
@@ -2419,7 +2440,7 @@ impl BackupRepository {
         descriptor.write_all(&successor)?;
         descriptor.sync_all()?;
         fsync_fd(&self.root)?;
-        let temp_name = CString::new("PITR_CATALOG_LOG.purge.tmp")?;
+        let temp_name = CString::new(PITR_PURGE_CATALOG_TEMP_FILE)?;
         let target_name = CString::new("PITR_CATALOG_LOG")?;
         let temp_fd = unsafe {
             libc::openat(
@@ -2447,7 +2468,7 @@ impl BackupRepository {
         // exists: the descriptor is the successor's only other carrier, and the
         // reclamation below unlinks directories that the old catalog commits, so
         // a repository reopened with the stale one cannot validate its backups.
-        let backup_temp_name = CString::new("BACKUP_CATALOG_LOG.purge.tmp")?;
+        let backup_temp_name = CString::new(PITR_PURGE_BACKUP_TEMP_FILE)?;
         let backup_target_name = CString::new("BACKUP_CATALOG_LOG")?;
         let backup_temp_fd = unsafe {
             libc::openat(
@@ -2461,6 +2482,8 @@ impl BackupRepository {
         let mut backup_temp = unsafe { File::from_raw_fd(backup_temp_fd) };
         backup_temp.write_all(&backup_successor)?;
         backup_temp.sync_all()?;
+        #[cfg(feature = "chaos-testing")]
+        crate::chaos::failpoint::fail_point!("pitr.purge.after_backup_temp_sync");
         let backup_replaced = unsafe {
             libc::renameat(
                 self.root.as_raw_fd(),
@@ -7112,6 +7135,100 @@ mod tests {
         )
         .unwrap();
         assert!(BackupRepository::open(dir.path().join("repository")).is_err());
+        scenario.teardown();
+    }
+
+    /// A PITR purge stages both catalogs it replaces, and a crash between the
+    /// staging sync and the rename has to leave a repository that still opens.
+    ///
+    /// The backup catalog is the one at risk: its staging name must not be the one
+    /// `recover_catalog_successor` owns, because that path validates whatever it
+    /// finds there as a *count-retention* successor - same committed set, base
+    /// digest equal to the primary it replaces - and a PITR purge's successor is
+    /// neither, so recovery refuses it and the repository cannot be opened again.
+    #[cfg(all(feature = "chaos-testing", target_os = "linux"))]
+    #[test]
+    fn failpoint_pitr_purge_crash_between_staging_and_rename_still_opens() {
+        use crate::chaos::failpoint::{self, FailScenario};
+        let _test_lock = BACKUP_FAILPOINT_TEST_LOCK.lock();
+        let scenario = FailScenario::setup();
+        let dir = tempfile::tempdir().unwrap();
+        let parent = open_directory_no_follow(dir.path()).unwrap();
+        bootstrap_repository(&parent, "repository").unwrap();
+        let repository_path = dir.path().join("repository");
+        let options = crate::lsm_storage::LsmStorageOptions {
+            enable_wal: true,
+            ..crate::lsm_storage::LsmStorageOptions::default_for_test()
+        };
+        let engine = crate::lsm_storage::KvEngine::open(dir.path().join("db"), options).unwrap();
+        engine
+            .enable_pitr(crate::pitr_api::PitrOptions {
+                repository: repository_path.clone(),
+                config: crate::pitr_api::PersistedPitrConfig {
+                    archive_interval: std::time::Duration::from_secs(3600),
+                    max_segment_bytes: 1 << 20,
+                    max_unarchived_bytes: 1 << 20,
+                    max_source_spool_bytes: 2 << 20,
+                },
+                runtime: crate::pitr_api::PitrRuntimeOptions::default(),
+            })
+            .unwrap();
+        // Two bases, so retention has one to release and the successor it stages is
+        // not the count-retention successor `recover_catalog_successor` expects.
+        engine.put(b"one", b"value").unwrap();
+        engine
+            .create_backup(BackupOptions {
+                repository: repository_path.clone(),
+                use_hard_links: false,
+            })
+            .unwrap();
+        engine.put(b"two", b"value").unwrap();
+        engine
+            .create_backup(BackupOptions {
+                repository: repository_path.clone(),
+                use_hard_links: false,
+            })
+            .unwrap();
+        engine.close().unwrap();
+        drop(engine);
+
+        let repository = BackupRepository::open(&repository_path).unwrap();
+        failpoint::cfg("pitr.purge.after_backup_temp_sync", "panic").unwrap();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            repository
+                .purge_pitr(crate::pitr_api::PitrRetentionPolicy {
+                    minimum_window: std::time::Duration::from_secs(60),
+                    retain_timelines: std::num::NonZeroUsize::new(1).unwrap(),
+                    retain_base_backups: std::num::NonZeroUsize::new(1).unwrap(),
+                })
+                .unwrap();
+        }));
+        assert!(
+            result.is_err(),
+            "the failpoint has to interrupt the purge after it stages the backup catalog"
+        );
+        failpoint::cfg("pitr.purge.after_backup_temp_sync", "off").unwrap();
+        drop(repository);
+
+        // The invariant first: whatever the crash left behind, the repository has to
+        // open. A staged successor under the name recovery owns fails right here,
+        // because that path validates it as a count-retention successor.
+        let reopened = BackupRepository::open(&repository_path).unwrap_or_else(|error| {
+            panic!("a purge interrupted between staging and rename must still open: {error:?}")
+        });
+        let staged = repository_path.join(PITR_PURGE_BACKUP_TEMP_FILE);
+        assert!(
+            !repository_path
+                .join("BACKUP_CATALOG_LOG.purge.tmp")
+                .exists(),
+            "the staged successor must not sit under the name recovery owns"
+        );
+        assert!(
+            !staged.exists(),
+            "recovery has to discard the staging whose rename it completed"
+        );
+        assert!(!repository_path.join(PITR_PURGE_TXN_FILE).exists());
+        drop(reopened);
         scenario.teardown();
     }
 
