@@ -3373,18 +3373,30 @@ impl BackupRepository {
             !temp_path.exists(),
             "PITR restore staging path already exists"
         );
-        // Every exit before the publication decision below discards the staging
-        // this call built - a cancellation between replay units, a failed batch, a
-        // failed close. The name is derived from this process's id, so a retry
-        // would reuse it and trip the guard just above. The guard is disarmed
-        // before `publish_pitr_restore_staging`, whose own outcomes decide the
-        // staging's fate from there: a hard failure discards it, while
+        self.restore(base_backup_id, &temp_path, storage.clone())?;
+        // That call published this staging - it is the one that creates it - and
+        // every exit from here to the publication decision below discards it: a
+        // cancellation between replay units, a failed batch, a failed close. The
+        // name is derived from this process's id, so leaving it behind makes a
+        // retry trip the guard just above.
+        //
+        // Armed only after that call returns, never before. The guard removes the
+        // staging unconditionally, so arming it earlier lets a concurrent restore
+        // to the same destination in this process delete the winner's staging: the
+        // loser's `self.restore` fails with "restore target already exists" once
+        // the winner has published, and the loser would then take the winner's
+        // staging down with it. Not arming on failure leaves a staging that a
+        // failed reacquire inside `self.restore` published behind, which is what
+        // happens without this guard too, and the two cases are indistinguishable
+        // from the error alone.
+        //
+        // Disarmed before `publish_pitr_restore_staging`, whose own outcomes decide
+        // the staging's fate from there: a hard failure discards it, while
         // `PublishedButNotDurable` and `Unknown` deliberately keep it.
         let mut staging_cleanup = RestoreStagingCleanup {
             parent: &parent_fd,
             name: temp_name.clone(),
         };
-        self.restore(base_backup_id, &temp_path, storage.clone())?;
         let engine = crate::lsm_storage::KvEngine::open(&temp_path, storage)?;
         let mut replayed_batches = 0_u64;
         let mut replayed_bytes = 0_u64;
@@ -6928,8 +6940,8 @@ fn crc32(bytes: &[u8]) -> u32 {
 impl BackupRepository {
     /// Eagerly dispatches PITR verification to Tokio's blocking pool.
     ///
-    /// Cancellation is pre-start only, as `PitrTask` documents: the task checks the
-    /// request before entering `verify_pitr`, so a `cancel()` that arrives once
+    /// Cancellation is pre-start only: `PitrTask::spawn` reads the request before
+    /// entering the operation and never again, so a `cancel()` that arrives once
     /// verification is running does not stop it and does not turn its report into a
     /// partial one. `verify_pitr` takes no cancellation token, so nothing inside it
     /// can observe a request, and it holds `operation_lock` while it runs.
@@ -6942,12 +6954,14 @@ impl BackupRepository {
 
     /// Eagerly dispatches PITR retention cleanup to Tokio's blocking pool.
     ///
-    /// Cancellation is pre-start only, as `PitrTask` documents. A `cancel()` that
-    /// arrives after the task starts cannot stop it, and in particular cannot stop
-    /// it before its paired catalog transaction becomes durable - so the returned
+    /// Cancellation is pre-start only: `PitrTask::spawn` reads the request before
+    /// entering the operation and never again. A `cancel()` that arrives after the
+    /// task starts cannot stop it, and in particular cannot stop it before its
+    /// paired catalog transaction becomes durable - so the returned
     /// `PitrPurgeOutcome`, not the cancellation, is the report of what happened.
-    /// `purge_pitr` serializes with the repository's other operations through
-    /// `operation_lock` and takes no cancellation token.
+    /// `purge_pitr` compacts the catalog and defers object deletion, so it has no
+    /// bounded streaming phase a check could sit between; it serializes with the
+    /// repository's other operations through `operation_lock`.
     pub fn purge_pitr_async(
         self: Arc<Self>,
         policy: crate::pitr_api::PitrRetentionPolicy,
