@@ -4301,12 +4301,16 @@ impl KvEngine {
             match entry {
                 crate::pitr::WalEntry::Put { key, value } => {
                     let internal = crate::key::encode_internal_key(key, batch.commit_ts);
-                    let value = if matches!(
-                        value.first(),
-                        Some(byte)
-                            if *byte == crate::vlog::KvKind::Inline as u8
-                                || *byte == crate::vlog::KvKind::Tombstone as u8
-                    ) {
+                    // Any valid kind prefix is already the entry's: `PutRaw` values
+                    // are prefixed before they reach the WAL, and `PutPrefixed`
+                    // carries one, so only a kindless value needs `Inline`. Testing
+                    // for `Inline`/`Tombstone` alone re-prefixed TTL and vLog
+                    // entries and lost their meaning.
+                    let value = if value
+                        .first()
+                        .and_then(|byte| crate::vlog::KvKind::from_u8(*byte))
+                        .is_some()
+                    {
                         value.clone()
                     } else {
                         let mut prefixed = Vec::with_capacity(value.len() + 1);
@@ -11733,6 +11737,50 @@ mod tests {
             matches!(outcome, crate::pitr_api::EnablePitrOutcome::Enabled { .. }),
             "enable_pitr did not reach Enabled: {outcome:?}"
         );
+    }
+
+    /// A restored value has to come back exactly as the WAL carried it.
+    ///
+    /// `put_with_ttl` writes a `TtlInline` payload into the batch and vLog values
+    /// arrive as pointers, so the value in the WAL already starts with a kind byte.
+    /// The restore used to prepend `Inline` to anything that was not `Inline` or
+    /// `Tombstone`, which turned a TTL entry into inline bytes: the TTL was lost and
+    /// a pointer read back as its own raw bytes.
+    ///
+    /// Tested against `apply_pitr_restore_batch_exact` rather than the restore
+    /// planner, which keeps its own model and never prefixes anything.
+    #[test]
+    fn a_restored_ttl_value_keeps_its_kind_prefix() {
+        let dir = tempdir().unwrap();
+        let engine = KvEngine::open(
+            dir.path().join("db"),
+            LsmStorageOptions {
+                enable_wal: true,
+                ..LsmStorageOptions::default_for_test()
+            },
+        )
+        .unwrap();
+        let expire_at = crate::vlog::compute_expire_at(std::time::Duration::from_secs(3600));
+        let batch = crate::pitr::WalBatch {
+            commit_ts: 8,
+            recorded_at: crate::pitr::RecordedAt { secs: 2, nanos: 0 },
+            entries: vec![crate::pitr::WalEntry::Put {
+                key: b"ttl-key".to_vec(),
+                value: crate::vlog::encode_ttl_value(
+                    crate::vlog::KvKind::TtlInline,
+                    expire_at,
+                    b"ttl-value",
+                ),
+            }],
+        };
+        engine.apply_pitr_restore_batch_exact(&batch).unwrap();
+        assert_eq!(
+            engine.get(b"ttl-key").unwrap().as_deref(),
+            Some(b"ttl-value".as_slice()),
+            "a TTL entry has to restore as its user value, not as the kind byte and \
+             the expiry the restore prepended"
+        );
+        let _ = engine.close();
     }
 
     /// A resume that loses the lifecycle to a concurrent disable has to say so. The
