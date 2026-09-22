@@ -4204,13 +4204,17 @@ impl KvEngine {
             }
         }
         let result = self.publish_pitr_base(&options.repository, options.use_hard_links);
-        if result.is_ok() {
-            self.inner
-                .mvcc
-                .as_ref()
-                .ok_or_else(|| anyhow!("PITR backup requires MVCC"))?
-                .resume_commit_admission();
-        }
+        // The recovery point above is durable whichever way this went - the match
+        // refuses every other outcome - so admission reopens either way. What
+        // failed is the base capture, and `resume_pitr` publishes a base for an
+        // engine that has none. Leaving admission stopped instead would reject
+        // every write until the database is reopened, over a lifecycle that is
+        // otherwise settled and needs no reconciliation.
+        self.inner
+            .mvcc
+            .as_ref()
+            .ok_or_else(|| anyhow!("PITR backup requires MVCC"))?
+            .resume_commit_admission();
         result.map(Some)
     }
 
