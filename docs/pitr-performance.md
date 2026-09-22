@@ -57,9 +57,10 @@ claim their results.
 
 ## Regression check at the merged PITR head (2026-09-22)
 
-The table above is the slice-12 baseline. This section answers a narrower question
-asked after the last PITR layer merged: did that work slow the engine down for the
-default, PITR-disabled configuration?
+The table above is the slice-12 baseline. This section answers the question asked
+after the last PITR layer merged - did that work slow the engine down for the default,
+PITR-disabled configuration? - then two follow-ups to it: whether any other workload
+moved, and what enabling PITR costs at the head.
 
 Two baselines, both on `main`:
 
@@ -73,21 +74,43 @@ Head under test: `494a20ab`.
 
 ### Method
 
-`write-perf --suite legacy`, one process per run, 200,000 writes and 100,000 reads
-at 1 KiB values on 4 threads, `--no-wal`. The three revisions are run **interleaved**
-- every repetition runs all three back to back - so host drift lands on all of them
-rather than on whichever ran last. 9 repetitions; medians and quartiles are reported
-because the run-to-run spread is large enough that a single median over a handful of
-runs can produce a difference that is not there (see the note below).
+Three measurements, one process per run:
 
-WAL is disabled for these rows deliberately: with the database on a real disk each
-durable write is sync-bound at roughly 1,700 ops/s, which hides CPU differences
-entirely. The WAL path is measured separately, and the tmpfs method used for the
-table above is **not reproducible on this host**: `/tmp` is a full tmpfs and
-`fallocate` fails there with `EDQUOT`, so absolute numbers from the two sections are
-not comparable - only within-run ratios in each are.
+1. **Steady state** - `write-perf --suite legacy --no-wal`, 200,000 writes and
+   100,000 reads at 1 KiB values on 4 threads. The three revisions are run
+   **interleaved** - every repetition runs all three back to back - so host drift
+   lands on all of them rather than on whichever ran last. 9 repetitions.
+2. **All legacy workloads** - `write-perf --suite legacy --wal`, WAL on so the rows
+   that require it are not skipped. That is every legacy workload except `compact`,
+   which reports elapsed times rather than a rate. A first pass ran all of them at 5
+   repetitions; everything it flagged, plus controls, was re-run at 11 repetitions
+   interleaved across all three revisions, and the rest were brought to 11 as well so
+   that every workload has a direct head-versus-`b5ac2064` comparison.
+   `wal_concurrent` was then run again at 25.
+3. **PITR on/off** - `pitr-perf --operations 10000`, run three times against a disk
+   and nine times against tmpfs. The harness alternates which mode goes first by case
+   position, so each result carries the `mode_order` it was produced under.
 
-Host: Linux 6.18.9, Intel Core i9-13900T, 32 logical CPUs, database under `/home`.
+Medians and quartiles are reported throughout, because the run-to-run spread is large
+enough that a single median over a handful of runs can produce a difference that is
+not there (see the note below).
+
+WAL is disabled in (1) deliberately: with the database on a real disk each durable
+write is sync-bound at roughly 1,700 ops/s, which hides CPU differences entirely.
+That cuts both ways, and it is why (3) is run twice. On `/home` every write pays an
+fsync, so a few microseconds of extra CPU work per commit is invisible by
+construction; on tmpfs the same writes are sync-cheap, and that is the regime in
+which the cost becomes measurable.
+
+Measurements (2) and the tmpfs half of (3) ran under `/tmp`, a 32 GiB tmpfs. That
+filesystem was full when the section above was written - `fallocate` failed there
+with `EDQUOT` - which is why the slice-12 baseline could not be re-run at the time.
+It has since been cleared, so the method is reproducible again; absolute numbers
+still are not comparable to the section above, which used a different harness
+revision on different storage.
+
+Host: Linux 6.18.9, Intel Core i9-13900T, 32 logical CPUs, database under `/home`
+for (1) and the disk half of (3), under `/tmp` for (2) and the tmpfs half of (3).
 
 ### Steady-state write and read paths (WAL off, 9 repetitions)
 
@@ -110,42 +133,138 @@ Medians in ops/s. The head's spread against `b5ac2064` overlaps on every row - f
 | `494a20ab` | 1,735 / 1,744 / 1,741 | 1,741 |
 
 **-0.2%**, with every run inside 0.9% of every other. This is the path the PITR work
-changed (batch encoding and group commit), and it is unchanged.
+changed (batch encoding and group commit), and on a disk it is unchanged.
+
+This row is **sync-bound**: 1,745 ops/s is one fsync per write, of which nearly all
+is kernel time. It therefore cannot see a per-commit CPU cost - and there is one, on
+a different workload, in the tmpfs measurement below. Read this as "the WAL path is
+unchanged on a disk", not as "the WAL path is unchanged".
+
+### All legacy workloads (WAL on, tmpfs)
+
+26 of the 27 legacy workloads were compared; `compact` reports elapsed times rather
+than a rate, so it has no column. At 5 repetitions one row stood out with
+non-overlapping ranges. Every row whose median had moved more than 5% was re-run at
+11 repetitions across all three revisions - this is that pass, medians in ops/s:
+
+| Workload | Metric | `2f556ccb` (pre-PITR) | `b5ac2064` (before #330) | `494a20ab` (head) | head vs before #330 |
+| --- | --- | ---: | ---: | ---: | ---: |
+| `fillrandom` | ops/s | 168,745 | 167,713 | 165,515 | -1.3% |
+| `fillseq` | ops/s | 175,228 | 175,738 | 171,846 | -2.2% |
+| `readrandom` | ops/s | 178,812 | 172,878 | 176,179 | +1.9% |
+| `memtable_publish_delete_concurrent` | ops/s | 4,785,484 | 5,092,244 | 5,103,429 | +0.2% |
+| `seekrandomwhilewriting` | ops/s | 17,932 | 18,778 | 15,582 | -17.0% |
+| `wal_batch_concurrent` | ops/s | 854,265 | 687,349 | 856,511 | +24.6% |
+| `wal_concurrent` | ops/s | 173,650 | 148,767 | 150,698 | +1.3% |
+| `wal_throughput` | ops/s | 143,954 | 142,631 | 139,623 | -2.1% |
+
+The two large numbers in that table are the cautionary ones, not the findings.
+`seekrandomwhilewriting` at -17% has runs spanning 12,178-26,268 ops/s across the same
+revision, and `wal_batch_concurrent` at +24.6% has its `b5ac2064` runs reaching
+1,107,425 - both are the harness moving, not the engine. Every row except
+`wal_concurrent` has overlapping ranges against both baselines.
+
+### The one workload that moved: `wal_concurrent`
+
+25 interleaved repetitions of nothing but this workload, on tmpfs, WAL on, with no
+other process on the machine, ops/s:
+
+| Revision | min | p25 | median | p75 | max |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `2f556ccb` (pre-PITR) | 161,139 | 170,517 | **177,411** | 182,608 | 207,475 |
+| `494a20ab` (head) | 134,970 | 151,708 | **159,336** | 164,981 | 194,559 |
+
+Median **-10.2%**, and the interquartile ranges are disjoint - the head's p75 sits
+below the pre-PITR p25 - even though the tails overlap. It is the only regression the
+survey found.
+
+It is **not** from the last layer. Against `b5ac2064` the head is +1.3% at 11
+repetitions, so the change landed earlier in the PITR line. Of the 128 commits between
+the baseline and `b5ac2064`, exactly five touch a file on this path (`mvcc.rs`,
+`wal.rs`, `mem_table.rs`), and all five are PITR layers: the ordered commit sequencer
+(`#296`), the base-capture barrier (`#310`), the WAL-v5 integration (`#314`), and the
+two recreate layers above them. Which one of the five is not established here; a
+bisect over them would settle it.
+
+The engine's own counters say what changed. Over the same 25 runs, median
+`wal_commit_solo_groups` is **10,859 (pre-PITR) against 26,735 (head)** - groups of
+one - while buffers per group fall only from 2.27 to 2.17. The head does not write
+more (`wal_commit_bytes` is 819,200,000 in both, `wal_commit_buffers` 200,000 in
+both); its commits simply coalesce less often, so more of them pay the submit-and-sync
+path alone.
+
+The workload is 4 threads each issuing single `put`s, which is the shape where a
+per-commit serialization point shows: the batched variant
+(`wal_batch_concurrent`) and the single-threaded one (`wal_throughput`) are both
+within noise. `write-perf` runs with `pitr_repository: None`, so this is the
+**PITR-disabled** path - enabling PITR is not a precondition for the cost.
 
 ### PITR enabled versus disabled at the head
 
-Same harness, `--operations 2000`, one run per writer count:
+Same harness, `--operations 10000`, medians over 3 whole runs against a disk and 9
+against tmpfs. The harness alternates which mode goes first by case position, and
+that position is fixed per writer count, so the column records it:
 
-| Writers | Disabled writes/s | Enabled writes/s | Enabled / disabled | Catch-up seconds |
-| ---: | ---: | ---: | ---: | ---: |
-| 1 | 1,778 | 1,792 | 100.8% | 0.060 |
-| 4 | 3,847 | 3,536 | 91.9% | 0.050 |
-| 8 | 6,053 | 6,521 | 107.7% | 0.046 |
-| 16 | 13,423 | 14,436 | 107.5% | 0.042 |
-| 32 | 24,447 | 22,004 | 90.0% | 0.042 |
+| Writers | Mode order | Disk: enabled/disabled | Disk: disabled -> enabled (writes/s) | tmpfs: enabled/disabled | tmpfs: disabled -> enabled (writes/s) |
+| ---: | --- | ---: | --- | ---: | --- |
+| 1 | PITR first | 99.3% | 1,769 -> 1,757 | **70.2%** | 145,959 -> 102,532 |
+| 4 | PITR second | 91.2% | 3,905 -> 3,563 | **61.1%** | 161,396 -> 98,684 |
+| 8 | PITR first | 101.2% | 6,771 -> 6,851 | **40.9%** | 175,971 -> 72,037 |
+| 16 | PITR second | 102.1% | 12,738 -> 13,005 | 101.3% | 60,189 -> 60,996 |
+| 32 | PITR first | 92.4% | 24,016 -> 22,186 | 101.7% | 15,999 -> 16,263 |
+| **median** | | **99.3%** | | **70.2%** | |
 
-Median **100.8%**, with the spread running in both directions - so on this workload
-the archive path costs nothing measurable rather than costing a consistent few
-percent. The catch-up figure is the explicit recovery point, not a steady-state cost.
+The two columns disagree because they measure different regimes. The disk column
+reproduces the 2,000-operation table this section replaces (median 100.8% there,
+99.3% here): with an fsync in every write, PITR's added CPU work is not visible. On
+tmpfs it is. At 8 writers the two modes are fully disjoint - disabled
+156,610-201,079 against enabled 65,286-114,627 - and PITR runs **first** there, so
+the order is not what is doing the work. At 16 and 32 writers both modes fall to
+about 60k and 16k writes/s: the writers are contending with each other, and the
+difference disappears into that.
+
+So: enabling PITR measured free where fsync latency dominates, and 30-60% of
+foreground write throughput on a sync-cheap filesystem at 1-8 writers. The harness
+holds the archive rate unlimited and the segment large enough that no archive boundary
+is crossed in 10,000 operations, so what is measured is per-commit v5 admission and
+encoding, not archive I/O. Catch-up - the explicit recovery point, not a steady-state
+cost - is 0.085-0.098 s on tmpfs and 0.132-0.207 s on disk.
 
 ### A note on sample size
 
 A first pass at 5 repetitions reported `fillrandom` on the head as **-6.9%** against
 `b5ac2064`, which would have been a real write-path regression. Re-measuring at 9
 repetitions and reporting quartiles refuted it: the medians land 0.2% apart and the
-distributions overlap almost entirely. Anything read from this harness needs the
-spread beside it; a bare median over a few runs is not evidence.
+distributions overlap almost entirely.
+
+The all-workload survey is the same lesson from the other side. At 5 repetitions it
+flagged ten workloads as having moved more than 5% between the pre-PITR baseline and
+the head. All ten were re-run at 11 repetitions and nine of them dissolved into
+overlapping ranges - including `seekrandomwhilewriting`, whose -17% against
+`b5ac2064` sits on runs spanning 12,178-26,268 ops/s within a single revision, and
+`parallel_scan` at +10.4% against the pre-PITR baseline, which is +1.1% against the
+nearer one. `wal_concurrent` survived, and even it needed 25 repetitions before its
+interquartile ranges separated. Anything read from this harness needs the spread
+beside it: a bare median over a few runs is not evidence, and neither is a range that
+overlaps only in the tails.
 
 ### What this does and does not show
 
-What it shows: no regression from the last PITR layer on the write path (WAL on and
-off), the point-read path, or the iterator/seek path, and no measurable steady-state
-cost from enabling PITR.
+What it shows: no regression from the last PITR layer (#330) on any of the 26
+comparable legacy workloads; no measurable cost from enabling PITR where fsync
+latency dominates; and one regression that predates #330 - `wal_concurrent`, about
+10% on tmpfs, on the PITR-disabled path, with the counter signature of reduced commit
+coalescing.
 
 What it does not show:
 
+- **Which commit** in the PITR line caused `wal_concurrent`. Five candidates touch the
+  hot path; no bisect was run, so the finding is a floor on what the PITR work cost,
+  not an attribution.
+- Any production reading of the tmpfs PITR overhead. A filesystem on which a durable
+  write costs microseconds is a benchmark, not a deployment.
 - The +63% write throughput against the pre-PITR revision is **not** attributable to
-  PITR. Those ~200 commits carry unrelated work, and the pre-PITR build was both
+  PITR. Those 128 commits carry unrelated work, and the pre-PITR build was both
   slower and far more variable (its `fillrandom` floor was 65,796 ops/s against a
   1,050,405 floor at the head), so part of the gap is an old build behaving badly
   rather than a PITR improvement.
@@ -154,7 +273,10 @@ What it does not show:
   same-device versus separate-device repositories are not covered; the table above
   says the same, and this section does not claim them either.
 
-Re-running needs the three revisions built: `2f556ccb`, `b5ac2064`, and the head, each
-with `cargo build --release --bin write-perf`, then the same command with `--path` on
-a filesystem that is not a full tmpfs.
+Re-running needs the three revisions built - `2f556ccb`, `b5ac2064`, and the head,
+each with `cargo build --release --bin write-perf` - plus the head with
+`cargo build --release --bin pitr-perf`. Pass `--path` under `/tmp` for the tmpfs
+regime and under `/home` for the disk one. Keeping other work off the machine matters:
+one intermediate pass was discarded because a benchmark was still running in the
+background.
 
