@@ -11912,6 +11912,7 @@ mod tests {
     /// The close runs on its own thread and is joined with a timeout, so a
     /// regression fails here instead of hanging the test binary until nextest kills
     /// it.
+    #[cfg(target_os = "linux")]
     #[test]
     fn close_async_with_pitr_enabled_does_not_block_the_runtime_thread() {
         let dir = tempdir().unwrap();
