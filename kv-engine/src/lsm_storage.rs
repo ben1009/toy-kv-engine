@@ -4848,7 +4848,24 @@ impl KvEngine {
     pub async fn close_async(&self) -> Result<()> {
         let pitr_mode = self.pitr_manifest_state.lock().mode;
         if pitr_mode != crate::pitr_manifest::PitrMode::Disabled {
-            return self.close();
+            // The PITR close joins worker threads and waits for lifecycle
+            // quiescence, exactly like the storage close below, so it has to run
+            // off the executor: an in-flight async scan or transaction needs this
+            // thread to release the guards that wait is for. Running it inline
+            // deadlocks a `current_thread` runtime, whose only thread is the one
+            // blocked in here.
+            let blocking = self.inner.blocking.clone();
+            let inner = self.inner.clone();
+            return blocking
+                .run_result(move || -> Result<()> {
+                    let engine = inner
+                        .weak_engine
+                        .get()
+                        .and_then(std::sync::Weak::upgrade)
+                        .ok_or_else(|| anyhow!("engine handle is no longer available"))?;
+                    engine.close()
+                })
+                .await;
         }
         match self.inner.lifecycle.begin_close() {
             CloseState::AlreadyClosed => return Ok(()),
@@ -11745,6 +11762,102 @@ mod tests {
             matches!(outcome, crate::pitr_api::EnablePitrOutcome::Enabled { .. }),
             "enable_pitr did not reach Enabled: {outcome:?}"
         );
+    }
+
+    /// `close_async` on an enabled PITR lifecycle has to run the close off the
+    /// executor.
+    ///
+    /// The close joins the PITR worker threads and then waits for lifecycle
+    /// quiescence, which waits for an admitted operation to drop its guard. On a
+    /// `current_thread` runtime the only thread that can poll that operation - and
+    /// so release the guard - is the one inside `close_async`, so running the close
+    /// inline waits for a guard only itself can free. A ticker keeps the runtime
+    /// polling for as long as the guard is held, which is what makes the deadlock
+    /// reachable rather than merely theoretical.
+    ///
+    /// The close runs on its own thread and is joined with a timeout, so a
+    /// regression fails here instead of hanging the test binary until nextest kills
+    /// it.
+    #[test]
+    fn close_async_with_pitr_enabled_does_not_block_the_runtime_thread() {
+        let dir = tempdir().unwrap();
+        let parent = crate::backup::open_directory_no_follow(dir.path()).unwrap();
+        crate::backup::bootstrap_repository(&parent, "repository").unwrap();
+        let repository = dir.path().join("repository");
+        let engine = KvEngine::open(
+            dir.path().join("db"),
+            LsmStorageOptions {
+                enable_wal: true,
+                ..LsmStorageOptions::default_for_test()
+            },
+        )
+        .unwrap();
+        engine
+            .enable_pitr(crate::pitr_api::PitrOptions {
+                repository: repository.clone(),
+                config: crate::pitr_api::PersistedPitrConfig {
+                    archive_interval: std::time::Duration::from_secs(3600),
+                    max_segment_bytes: 1 << 20,
+                    max_unarchived_bytes: 1 << 20,
+                    max_source_spool_bytes: 2 << 20,
+                },
+                runtime: crate::pitr_api::PitrRuntimeOptions::default(),
+            })
+            .unwrap();
+        for index in 0..64_u32 {
+            engine
+                .put(format!("key-{index:03}").as_bytes(), b"value")
+                .unwrap();
+        }
+
+        let runtime = std::sync::Arc::new(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap(),
+        );
+        // Held across the whole close: the guard `wait_for_quiescence` is waiting
+        // for, dropped only once this task is polled after its sleep.
+        let guard_engine = std::sync::Arc::clone(&engine);
+        let guard = runtime.spawn(async move {
+            let _guard = guard_engine
+                .inner
+                .lifecycle
+                .admit_scan()
+                .expect("admit a scan the close has to wait for");
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        });
+        let ticks = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let ticker_ticks = std::sync::Arc::clone(&ticks);
+        let ticker = runtime.spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                ticker_ticks.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        });
+
+        let close_runtime = std::sync::Arc::clone(&runtime);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let closing_engine = std::sync::Arc::clone(&engine);
+        std::thread::spawn(move || {
+            let outcome = close_runtime.block_on(closing_engine.close_async());
+            let _ = sender.send(outcome.is_ok());
+        });
+        let finished = receiver
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("close_async must not block the runtime thread the close waits on");
+        assert!(finished, "close_async reported a failure");
+        // The runtime kept polling while the close ran, which is the whole point:
+        // the guard task had to be polled for its guard to drop.
+        let _ = runtime.block_on(guard);
+        ticker.abort();
+        let _ = runtime.block_on(ticker);
+        assert!(
+            ticks.load(std::sync::atomic::Ordering::Relaxed) > 0,
+            "the ticker never ran, so the runtime was never polling and the window \\
+             this test exists to arrange was not created"
+        );
+        drop(engine);
     }
 
     /// A restored value has to come back exactly as the WAL carried it.
