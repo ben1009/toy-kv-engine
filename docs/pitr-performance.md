@@ -13,19 +13,23 @@ The command was run three times. For each writer count the harness runs one
 PITR-disabled and one PITR-enabled case, and the order of the two alternates by
 case position - PITR first in the first, third and fifth cases (1, 8 and 32
 writers), second in the others - so that host state drifting over a run -
-thermal, page cache, neighbouring load - cannot land on one mode only. Each
-result carries a `mode_order` field recording which order actually ran. Each
-case creates a fresh database and writes 10,000 unique keys with 128-byte
-values. WAL is enabled in both modes. PITR uses an unlimited archive-I/O rate
-and a segment large enough that foreground timing contains WAL-v5
-admission/encoding but no automatic archive boundary. The enabled case then
-times an explicit durable recovery point separately as `catchup_seconds`.
+thermal, page cache, neighbouring load - cannot land on one mode only. That
+order is a property of the case rather than of a run, so each result carries the
+same `mode_order` field naming PITR's position in its case, and a pair is read
+against it. Each case creates a fresh database and writes 10,000 unique keys
+with 128-byte values. WAL is enabled in both modes. PITR uses an unlimited
+archive-I/O rate and a segment large enough that foreground timing contains
+WAL-v5 admission/encoding but no automatic archive boundary. The enabled case
+then times an explicit durable recovery point separately as `catchup_seconds`.
 
 The write timer starts before the writer barrier is released, so it covers the
-whole window the writers are running; an earlier revision started it after the
-barrier and excluded writes a writer completed in between, which inflated
-`writes_per_second`. **The table below is therefore not comparable to a fresh
-run of the current harness** - it was measured with the old start point.
+whole window the writers are running. **The table below is not comparable to a
+fresh run of the current harness.** It was measured with an earlier revision that
+differed in three ways: it started the timer after the barrier, so writes a
+writer completed in between fell outside the interval and inflated
+`writes_per_second`; it ran PITR-disabled before PITR-enabled for every writer
+count, with no alternation to counterbalance ordering; and it emitted no
+`mode_order` field at all.
 
 Host: Linux 6.18.9, Intel Core i9-13900T, 32 logical CPUs. The database and
 repository were under `/tmp` on tmpfs, so these numbers are a reproducible CPU
