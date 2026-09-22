@@ -2928,25 +2928,32 @@ impl BackupRepository {
                 .count() as u64;
             Ok(deleted_segments)
         })();
-        // The post-cleanup count is the authoritative one: a segment whose WAL or
-        // seal was already gone - a purge an earlier crash interrupted - is deleted
-        // either way, and counting only this run's successful `unlinkat` calls would
-        // under-report it. `deleted_segment_parts` stays as the byte-owner ledger.
-        let info = |deleted_segments: Option<u64>| crate::pitr_api::PitrPurgeInfo {
+        // The post-cleanup count is the authoritative one for a purge that ran to
+        // completion: a segment whose WAL or seal was already gone - one an earlier
+        // crash interrupted - is deleted either way, and counting only this run's
+        // successful `unlinkat` calls would under-report it, which is what made the
+        // two disagree. A purge whose cleanup failed never computed that count, so
+        // it reports what the ledger saw, which is the honest "nothing was
+        // reclaimed" for a cleanup that stopped early.
+        let ledger_segments = deleted_segment_parts
+            .values()
+            .filter(|parts| **parts == 2)
+            .count() as u64;
+        let info = |deleted_segments: u64| crate::pitr_api::PitrPurgeInfo {
             retained_interval_count,
             planned_reclaim_segments,
             planned_reclaim_bytes,
-            deleted_segments,
+            deleted_segments: Some(deleted_segments),
             deleted_bytes: Some(deleted_bytes),
             oldest_recoverable_commit_ts: oldest_advertised_commit_ts,
         };
         match cleanup_result {
-            Ok(deleted_segments) => Ok(crate::pitr_api::PitrPurgeOutcome::Purged(info(Some(
+            Ok(deleted_segments) => Ok(crate::pitr_api::PitrPurgeOutcome::Purged(info(
                 deleted_segments,
-            )))),
+            ))),
             Err(error) => Ok(
                 crate::pitr_api::PitrPurgeOutcome::CatalogsDurableCleanupIncomplete {
-                    info: info(None),
+                    info: info(ledger_segments),
                     error: into_io_error(error),
                 },
             ),
