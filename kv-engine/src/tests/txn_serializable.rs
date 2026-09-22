@@ -15,6 +15,7 @@ fn serializable_options() -> LsmStorageOptions {
         num_memtable_limit: 2,
         compaction_options: CompactionOptions::NoCompaction,
         enable_wal: false,
+        pitr_repository: None,
         serializable: true,
         value_separation: None,
         manifest_snapshot_threshold_bytes: 0,
