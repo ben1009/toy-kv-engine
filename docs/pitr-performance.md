@@ -295,7 +295,7 @@ wait cost more than the ordering it enforced. PR #337 now mirrors the frontier i
 an atomic that waiters spin on outside the lock, falling back to parking - with the
 drain's timeout - only when a predecessor outlasts the spin budget.
 
-Same method, same host, 15 interleaved repetitions:
+Same method, 15 interleaved repetitions:
 
 | Revision | median ops/s | solo groups | vs pre-PITR |
 | --- | ---: | ---: | ---: |
@@ -303,11 +303,38 @@ Same method, same host, 15 interleaved repetitions:
 | `494a20ab` (before the fix) | 156,361 | 25,592 | -10.5% |
 | with PR #337 | **167,765** | 24,149 | **-4.0%** |
 
-The interquartile ranges overlap the baseline again. The residual -4.0% is the
-ordering itself: writers still wait, so the solo-group signature stays at about 2.2x
-the baseline. All 1314 tests pass, including the sequencer tests that pin ordered
-publication, and the exhaustion, poison-visibility and memory-ordering defects the
-review found are fixed alongside.
+That is one session's reading and the absolute gap moves with machine state: across
+five sessions the same binaries read the fix between -1.3% and -10.2% against the
+baseline, and the unfixed head between -9.4% and -12.3%. What holds in every session
+is that the fix beats the unfixed head, by 2.1 to 6.5 points, with the interquartile
+ranges overlapping the baseline rather than sitting below it. Anything cited from
+this section should be a same-session comparison.
+
+What is left afterwards is the ordering itself, not its implementation. Three
+implementations were measured against each other in single sessions: parking on the
+condvar (the unfixed head), a tight spin on a mirrored frontier (PR #337), and a
+yield-backoff variant, which read 4% *worse* than the spin - a yield is a syscall and
+the wait is only about 4.8 us. Instrumenting the wait put it at 28% of commits, mean
+4.8 us, and a diagnostic build that kept the machinery but never waited matched the
+baseline, so the machinery is free and the wait is the whole cost.
+
+Two structural attempts to remove the wait were built and measured, both null:
+
+- a frontier that any publisher may advance over a contiguous run of ready commits,
+  so a WAL commit group becomes visible in one movement instead of one step per
+  member: -0.2% against the spin, interquartile ranges overlapping;
+- reserving earlier or later relative to the WAL append, to keep timestamp order and
+  durability order together: not attempted, because the append already happens under
+  the same lock as the reservation, so the inversion is in the insert-and-publish
+  tail, not in the append.
+
+That is where the cost sits: a writer waits for its predecessor's skiplist insert and
+publication, which is one commit of pipeline depth that any design enforcing the
+ordered frontier has to pay.
+
+All 1314 tests pass, including the sequencer tests that pin ordered publication, and
+the exhaustion, poison-visibility and memory-ordering defects the review found are
+fixed alongside.
 
 The enabled/disabled sweep with this version reads **55.4%** (median) on tmpfs and
 **98.0%** on disk, against 70.2% and 99.3% before the fix - the tmpfs movement is the
