@@ -3401,10 +3401,22 @@ impl BackupRepository {
             match Self::publish_pitr_restore_staging(&parent_fd, &temp_name, target_name) {
                 Ok(publication) => publication,
                 Err(error) => {
-                    // The rename did not happen, so the staging this call built is
-                    // still there. The name is derived from this process's id, so a
-                    // retry would reuse it and trip the "staging path already exists"
-                    // guard above - which is the one outcome a caller cannot act on.
+                    // The rename did not happen - every `Err` out of
+                    // `publish_pitr_restore_staging` precedes a successful
+                    // `renameat2` - so the staging this call built is still here and
+                    // holds the only copy. It is discarded anyway: this is a hard
+                    // failure the caller has to redo the restore for, and the name
+                    // is derived from this process's id, so a retry would reuse it
+                    // and trip the "staging path already exists" guard above - the
+                    // one failure a caller cannot act on.
+                    //
+                    // The `Ok` arms deliberately keep it. `PublishedButNotDurable`
+                    // and `Unknown` both report a rename that did not happen, but
+                    // they leave the publication's fate to the caller, who may need
+                    // the staging to finish or inspect the restore - deleting the
+                    // only copy of a database on an outcome described as uncertain
+                    // would be the worse failure. `pitr_restore_unknown_publication_
+                    // retains_staging_identity` pins exactly that.
                     let _ = std::fs::remove_dir_all(&temp_path);
                     return Err(error);
                 }
@@ -7217,6 +7229,10 @@ mod tests {
     /// target it finds is somebody else's - the publication has to be reported as a
     /// failure rather than inferred from that presence. Reading it as a publication
     /// is what the arm this pins exists to prevent.
+    ///
+    /// It exercises the real syscall rather than the injected test mode, so it never
+    /// arms `arm_pitr_restore_publication` and never takes that early return.
+    #[cfg(target_os = "linux")]
     #[test]
     fn pitr_restore_reports_an_existing_target_as_a_failed_publication() {
         let dir = tempfile::tempdir().unwrap();
