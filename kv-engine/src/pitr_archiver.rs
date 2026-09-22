@@ -218,7 +218,7 @@ impl PitrArchiver {
                             return Err(anyhow::Error::new(ArchiveThrottleWait(wait)));
                         }
                         wait => {
-                            std::thread::sleep(wait);
+                            wait_for_archive_tokens(wait, cancellation)?;
                             chunk_now = Instant::now();
                         }
                     }
@@ -502,7 +502,7 @@ fn read_source_object(
                     return Err(anyhow::Error::new(ArchiveThrottleWait(wait)));
                 }
                 wait => {
-                    std::thread::sleep(wait);
+                    wait_for_archive_tokens(wait, cancellation)?;
                     chunk_now = Instant::now();
                 }
             }
@@ -532,6 +532,29 @@ fn read_source_object(
 fn check_archive_cancellation(cancellation: Option<&std::sync::atomic::AtomicBool>) -> Result<()> {
     if cancellation.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire)) {
         anyhow::bail!("PITR archive cancelled between I/O chunks");
+    }
+    Ok(())
+}
+
+/// Sleeps out a rate-limiter wait, giving up early if the archive is cancelled.
+///
+/// A configured `archive_io_bytes_per_second` can hand back a wait measured in
+/// seconds, and the limiter loops that call this sleep it off the archiver's
+/// thread. Sleeping it in one call would hold a cancellation - a close, or a
+/// dropped async task - for the whole wait, so the sleep is sliced and cancellation
+/// is rechecked between slices. The total slept is unchanged, so the pacing the
+/// limiter asked for is not weakened.
+#[cfg(target_os = "linux")]
+fn wait_for_archive_tokens(
+    mut wait: Duration,
+    cancellation: Option<&std::sync::atomic::AtomicBool>,
+) -> Result<()> {
+    const SLICE: Duration = Duration::from_millis(50);
+    while !wait.is_zero() {
+        check_archive_cancellation(cancellation)?;
+        let slice = wait.min(SLICE);
+        std::thread::sleep(slice);
+        wait -= slice;
     }
     Ok(())
 }
@@ -704,6 +727,40 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("cancelled"));
+    }
+
+    /// A rate-limit wait must not hold a cancellation for the whole wait.
+    ///
+    /// A configured `archive_io_bytes_per_second` can ask for a wait of seconds,
+    /// and the limiter loops sleep it off the archiver's thread. Slicing the sleep
+    /// is what lets a close or a dropped async task get through; without it this
+    /// returns only once the ten seconds are up.
+    #[test]
+    fn a_rate_limit_wait_ends_early_when_the_archive_is_cancelled() {
+        let cancelled = std::sync::atomic::AtomicBool::new(false);
+        let started = Instant::now();
+        let error = std::thread::scope(|scope| {
+            scope.spawn(|| {
+                std::thread::sleep(Duration::from_millis(30));
+                cancelled.store(true, std::sync::atomic::Ordering::Release);
+            });
+            wait_for_archive_tokens(Duration::from_secs(10), Some(&cancelled)).unwrap_err()
+        });
+        assert!(error.to_string().contains("cancelled"));
+        // Generous against a loaded machine, and still far below the wait asked for.
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the wait ran to completion instead of observing the cancellation: {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// The sliced wait still sleeps out the whole interval the limiter asked for.
+    #[test]
+    fn a_rate_limit_wait_without_cancellation_sleeps_the_full_interval() {
+        let started = Instant::now();
+        wait_for_archive_tokens(Duration::from_millis(120), None).unwrap();
+        assert!(started.elapsed() >= Duration::from_millis(120));
     }
 
     #[test]
