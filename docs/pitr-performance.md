@@ -279,31 +279,40 @@ What it does not show:
 
 ### Cause and fix (2026-09-23)
 
-PR #337 removes the wait from the write path until a commit barrier is first armed:
-order only has an observer once a boundary has to be a clean cut, so before that the
-write path advances `current_ts` with the single atomic store it used before the
-sequencer existed, and `publish_commit_ts` - unchanged, still ordered and still
-blocking - takes over from the first barrier on. The barrier drains an in-flight count
-so it covers reservations taken on either path.
+The ordering is not removable. RFC 023 section 5.1 makes it an invariant: the
+sequencer owns "advancement of one contiguous published frontier", and "a later
+commit may not become visible or advance `latest_commit_ts` while an earlier
+reservation is unresolved". A version of PR #337 that published without ordering
+until the first barrier - reading -1.3% against this baseline - was reverted for
+that reason: it let a concurrent reader's snapshot change under a fixed `read_ts`,
+and it made `publish_pitr_base`'s declared `included_commit_ts` a bare high-water
+mark rather than a boundary.
 
-Same 25-repetition method, same host:
+What the RFC does not prescribe is how the wait is implemented, and that was where
+the cost sat. Every waiter parked on the publication condvar, and every frontier step
+signalled all of them, so each recheck needed the lock the publisher was holding: the
+wait cost more than the ordering it enforced. PR #337 now mirrors the frontier into
+an atomic that waiters spin on outside the lock, falling back to parking - with the
+drain's timeout - only when a predecessor outlasts the spin budget.
 
-| Revision | min | p25 | median | p75 | max | solo groups |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `2f556ccb` (pre-PITR) | 161,006 | 172,019 | 175,887 | 185,321 | 201,684 | 10,957 |
-| `494a20ab` (before the fix) | 143,515 | 149,140 | 159,382 | 169,589 | 176,444 | 25,999 |
-| with PR #337 | 159,935 | 169,825 | **173,629** | 183,427 | 204,357 | **10,247** |
+Same method, same host, 15 interleaved repetitions:
 
-**-9.4% becomes -1.3%**, the interquartile ranges overlap the baseline again, and the
-solo-group count returns to it. All 1314 tests pass, including the sequencer tests
-that pin ordered publication.
+| Revision | median ops/s | solo groups | vs pre-PITR |
+| --- | ---: | ---: | ---: |
+| `2f556ccb` (pre-PITR) | 174,769 | 10,879 | - |
+| `494a20ab` (before the fix) | 156,361 | 25,592 | -10.5% |
+| with PR #337 | **167,765** | 24,149 | **-4.0%** |
 
-This does not make ordered publication cheap for a PITR-*enabled* engine: it still
-waits for earlier timestamps once a barrier arms, and still pays that convoy. The
-tmpfs enabled/disabled sweep reads **39.4%** (median) with the fix, against 70.2%
-before it - not because the enabled path slowed down, but because the disabled
-baseline it is measured against is no longer throttled by the same convoy. The
-disabled column at 32 writers reads 320,437 writes/s where it read 15,999.
+The interquartile ranges overlap the baseline again. The residual -4.0% is the
+ordering itself: writers still wait, so the solo-group signature stays at about 2.2x
+the baseline. All 1314 tests pass, including the sequencer tests that pin ordered
+publication, and the exhaustion, poison-visibility and memory-ordering defects the
+review found are fixed alongside.
+
+The enabled/disabled sweep with this version reads **55.4%** (median) on tmpfs and
+**98.0%** on disk, against 70.2% and 99.3% before the fix - the tmpfs movement is the
+disabled baseline no longer being throttled by the same convoy it was measured
+against.
 
 Re-running needs the three revisions built - `2f556ccb`, `b5ac2064`, and the head,
 each with `cargo build --release --bin write-perf` - plus the head with
