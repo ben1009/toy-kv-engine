@@ -8923,7 +8923,7 @@ impl LsmStorageInner {
             }
             // Advance current_ts AFTER publish.
             if commit_ts > 0 {
-                mvcc.publish_commit_ts(commit_ts)?;
+                mvcc.finish_commit(commit_ts)?;
             }
         }
         self.try_freeze_memtable()?;
@@ -9065,7 +9065,7 @@ impl LsmStorageInner {
                 && let Some(ref mvcc) = self.mvcc
             {
                 Self::publish_range_tombstones_or_poison(&memtable, &entries, ts, mvcc)?;
-                mvcc.publish_commit_ts(ts)?;
+                mvcc.finish_commit(ts)?;
             } else {
                 memtable.publish_range_tombstones(&entries, ts, 0)?;
             }
@@ -9355,7 +9355,7 @@ impl LsmStorageInner {
             }
             // Advance current_ts AFTER publish.
             if commit_ts > 0 {
-                mvcc.publish_commit_ts(commit_ts)?;
+                mvcc.finish_commit(commit_ts)?;
             }
             commit_ts
         };
@@ -10312,7 +10312,7 @@ impl LsmStorageInner {
             if mvcc_commit_ts > 0
                 && let Some(ref mvcc) = self.mvcc
             {
-                mvcc.publish_commit_ts(mvcc_commit_ts)?;
+                mvcc.finish_commit(mvcc_commit_ts)?;
             }
             // Record serializable txn AFTER WAL sync succeeds, so that failed
             // syncs don't poison the committed_txns set.
@@ -10576,7 +10576,7 @@ impl LsmStorageInner {
                 if commit_ts > 0
                     && let Some(ref mvcc) = self.mvcc
                 {
-                    mvcc.publish_commit_ts(commit_ts)?;
+                    mvcc.finish_commit(commit_ts)?;
                 }
                 if self.options.serializable
                     && let Some(ref mvcc) = self.mvcc
@@ -10658,7 +10658,7 @@ impl LsmStorageInner {
                 if commit_ts > 0
                     && let Some(ref mvcc) = self.mvcc
                 {
-                    mvcc.publish_commit_ts(commit_ts)?;
+                    mvcc.finish_commit(commit_ts)?;
                 }
                 if self.options.serializable
                     && let Some(ref mvcc) = self.mvcc
@@ -10737,7 +10737,7 @@ impl LsmStorageInner {
                 if commit_ts > 0
                     && let Some(ref mvcc) = self.mvcc
                 {
-                    mvcc.publish_commit_ts(commit_ts)?;
+                    mvcc.finish_commit(commit_ts)?;
                 }
                 if self.options.serializable
                     && let Some(ref mvcc) = self.mvcc
