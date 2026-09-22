@@ -25,8 +25,15 @@ fn main() -> Result<()> {
     let args = Args::parse();
     ensure!(args.operations > 0, "operations must be nonzero");
     for writers in [1usize, 4, 8, 16, 32] {
-        run_case(&args, writers, false)?;
-        run_case(&args, writers, true)?;
+        // Counterbalance the mode order across writer counts. Running PITR-disabled
+        // first every time would let host state that drifts over the run - thermal,
+        // page cache, neighbours - land on one mode only, and bias the comparison.
+        // The executed order is reported with each result so a pair can be read
+        // against what actually ran.
+        let pitr_first = writers % 2 == 1;
+        for pitr in [pitr_first, !pitr_first] {
+            run_case(&args, writers, pitr)?;
+        }
     }
     Ok(())
 }
@@ -99,8 +106,12 @@ fn run_case(args: &Args, writers: usize, pitr: bool) -> Result<()> {
             Ok(())
         }));
     }
-    barrier.wait();
+    // Recorded before the writers are released, not after: the barrier returns on
+    // every thread at the same moment, so a writer can complete puts before a start
+    // time taken here - and those writes would fall outside the measured interval,
+    // inflating `writes_per_second`.
     let started = Instant::now();
+    barrier.wait();
     for thread in threads {
         thread
             .join()
@@ -125,6 +136,7 @@ fn run_case(args: &Args, writers: usize, pitr: bool) -> Result<()> {
             "writers": writers,
             "operations": args.operations,
             "pitr_enabled": pitr,
+            "mode_order": if pitr { "pitr-first" } else { "pitr-second" },
             "write_seconds": write_elapsed.as_secs_f64(),
             "writes_per_second": args.operations as f64 / write_elapsed.as_secs_f64(),
             "catchup_seconds": pitr.then_some(catchup_elapsed.as_secs_f64()),

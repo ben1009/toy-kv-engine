@@ -484,7 +484,12 @@ fn read_source_object(
     let mut remaining = actual_bytes;
     let mut completed_chunks = 0_u64;
     let mut chunk_now = now;
-    let mut chunk = vec![0_u8; chunk_bytes];
+    // The buffer holds one chunk, and no chunk can be larger than what is left of
+    // the file - so sizing it from the limiter burst would reserve a burst of
+    // memory for every source, including a segment holding a few bytes. The grant
+    // below still asks for the burst-sized chunk, which is what paces the I/O.
+    let read_bytes = chunk_bytes.min(capacity);
+    let mut chunk = vec![0_u8; read_bytes];
     while remaining > 0 {
         check_archive_cancellation(cancellation)?;
         let amount = remaining.min(chunk_bytes as u64);

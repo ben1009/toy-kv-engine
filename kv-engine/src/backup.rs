@@ -1442,6 +1442,15 @@ impl BackupRepository {
         };
         if result != 0 {
             let rename_error = std::io::Error::last_os_error();
+            // `RENAME_NOREPLACE` refuses to replace, so `EEXIST` means the target
+            // was already there and nothing was moved - the presence it explains
+            // is someone else's, not this rename's. Reading that as a publication
+            // would report a restore that never happened. Any other errno leaves
+            // the rename's fate unknown, and only then does the target's presence
+            // say it landed.
+            if rename_error.kind() == std::io::ErrorKind::AlreadyExists {
+                return Err(rename_error.into());
+            }
             return match openat_no_follow(parent, target, libc::O_RDONLY | libc::O_DIRECTORY, 0) {
                 Ok(_) => Ok(PitrRestorePublication::PublishedButNotDurable(rename_error)),
                 Err(error)
@@ -2925,27 +2934,25 @@ impl BackupRepository {
                 .count() as u64;
             Ok(deleted_segments)
         })();
-        let info = || crate::pitr_api::PitrPurgeInfo {
+        // The post-cleanup count is the authoritative one: a segment whose WAL or
+        // seal was already gone - a purge an earlier crash interrupted - is deleted
+        // either way, and counting only this run's successful `unlinkat` calls would
+        // under-report it. `deleted_segment_parts` stays as the byte-owner ledger.
+        let info = |deleted_segments: Option<u64>| crate::pitr_api::PitrPurgeInfo {
             retained_interval_count,
             planned_reclaim_segments,
             planned_reclaim_bytes,
-            deleted_segments: Some(
-                deleted_segment_parts
-                    .values()
-                    .filter(|parts| **parts == 2)
-                    .count() as u64,
-            ),
+            deleted_segments,
             deleted_bytes: Some(deleted_bytes),
             oldest_recoverable_commit_ts: oldest_advertised_commit_ts,
         };
         match cleanup_result {
-            Ok(deleted_segments) => Ok(crate::pitr_api::PitrPurgeOutcome::Purged({
-                debug_assert_eq!(info().deleted_segments, Some(deleted_segments));
-                info()
-            })),
+            Ok(deleted_segments) => Ok(crate::pitr_api::PitrPurgeOutcome::Purged(info(Some(
+                deleted_segments,
+            )))),
             Err(error) => Ok(
                 crate::pitr_api::PitrPurgeOutcome::CatalogsDurableCleanupIncomplete {
-                    info: info(),
+                    info: info(None),
                     error: into_io_error(error),
                 },
             ),
