@@ -3397,7 +3397,18 @@ impl BackupRepository {
         std::fs::write(&recovery_path, recovery_bytes)?;
         std::fs::File::open(&recovery_path)?.sync_all()?;
         std::fs::File::open(&temp_path)?.sync_all()?;
-        let publication = Self::publish_pitr_restore_staging(&parent_fd, &temp_name, target_name)?;
+        let publication =
+            match Self::publish_pitr_restore_staging(&parent_fd, &temp_name, target_name) {
+                Ok(publication) => publication,
+                Err(error) => {
+                    // The rename did not happen, so the staging this call built is
+                    // still there. The name is derived from this process's id, so a
+                    // retry would reuse it and trip the "staging path already exists"
+                    // guard above - which is the one outcome a caller cannot act on.
+                    let _ = std::fs::remove_dir_all(&temp_path);
+                    return Err(error);
+                }
+            };
         let info = crate::pitr_api::RestoreToInfo {
             requested_target,
             resolved_commit_ts: last_commit_ts,
@@ -7200,6 +7211,36 @@ mod tests {
         assert!(matches!(outcome, PitrRestorePublication::Unknown { .. }));
         assert!(dir.path().join("staging").is_dir());
         assert!(!dir.path().join("destination").exists());
+    }
+
+    /// A `renameat2(RENAME_NOREPLACE)` that fails with `EEXIST` moved nothing, so the
+    /// target it finds is somebody else's - the publication has to be reported as a
+    /// failure rather than inferred from that presence. Reading it as a publication
+    /// is what the arm this pins exists to prevent.
+    #[test]
+    fn pitr_restore_reports_an_existing_target_as_a_failed_publication() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("staging")).unwrap();
+        std::fs::create_dir(dir.path().join("destination")).unwrap();
+        let parent = open_directory_no_follow(dir.path()).unwrap();
+        let error =
+            match BackupRepository::publish_pitr_restore_staging(&parent, "staging", "destination")
+            {
+                Ok(_) => panic!("an existing target has to fail the publication, not report one"),
+                Err(error) => error,
+            };
+        assert_eq!(
+            error
+                .downcast_ref::<std::io::Error>()
+                .expect("the publication failure is an io error")
+                .kind(),
+            std::io::ErrorKind::AlreadyExists,
+            "an existing target has to be reported as the failed rename it is"
+        );
+        // Nothing moved: the staging is intact and the destination is the one that
+        // was already there, not a rename of the staging.
+        assert!(dir.path().join("staging").is_dir());
+        assert!(dir.path().join("destination").is_dir());
     }
 
     #[cfg(feature = "chaos-testing")]
