@@ -12005,6 +12005,7 @@ mod tests {
     ///
     /// Tested against `apply_pitr_restore_batch_exact` rather than the restore
     /// planner, which keeps its own model and never prefixes anything.
+    #[cfg(target_os = "linux")]
     #[test]
     fn a_restored_ttl_value_keeps_its_kind_prefix() {
         let dir = tempdir().unwrap();
