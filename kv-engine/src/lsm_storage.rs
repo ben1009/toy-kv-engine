@@ -2619,9 +2619,13 @@ impl KvEngine {
         // Hold the barrier across the lifecycle install and the reconcile.
         //
         // The maintenance path and close/disable take the barrier but not the
-        // operation lock, so without it this install races a loaned-out archiver:
-        // the loan would restore its own copy over the one installed here, or find
-        // the slot empty mid-transaction and report the archiver as detached.
+        // operation lock, so without it this install races both. The guard that
+        // loans the archiver out only refills a slot that is still empty, so a loan
+        // cannot write over the archiver installed here - but `disable_pitr` clears
+        // that slot on its way out, and a clear landing between the install and the
+        // reconcile leaves this call finishing a transition with no archiver, while
+        // a loan restored afterwards would put an archiver back on a disabled
+        // engine. Both sides take the barrier instead.
         //
         // The install publishes the lifecycle it is handed, and it is what attaches
         // the archiver - the thing that lets the periodic pass run at all. So the
@@ -2646,12 +2650,27 @@ impl KvEngine {
         {
             self.resume_pitr_lifecycle(state.clone())?;
         }
-        let controller = self
-            .pitr_runtime
-            .lock()
-            .as_ref()
-            .ok_or_else(|| anyhow!("PITR runtime is not attached"))?
-            .clone();
+        let controller = match self.pitr_runtime.lock().clone() {
+            Some(controller) => controller,
+            // The runtime is absent exactly when the lifecycle left the enabled set
+            // between the read at the top of this call and the barrier above - a
+            // disable that won the race, typically - so the install above was
+            // skipped for that reason. There is nothing left to resume, and saying
+            // so is more use than "the runtime is not attached", which describes a
+            // caller error rather than a concurrent transition.
+            None => {
+                return Ok(crate::pitr_api::PitrResumeOutcome::ReconciliationRequired(
+                    crate::pitr_api::PitrArchiveError {
+                        operation: crate::pitr_api::PitrOperation::Reconcile,
+                        path: repository_path,
+                        kind: crate::pitr_api::PitrArchiveErrorKind::Unavailable,
+                        source: anyhow!(
+                            "PITR left the enabled lifecycle while resume was completing"
+                        ),
+                    },
+                ));
+            }
+        };
         let limiter = controller.limiter();
         let priority = controller.priority_handle();
         let mut archiver = self.pitr_archiver.lock();
@@ -11514,6 +11533,87 @@ mod tests {
             matches!(outcome, crate::pitr_api::EnablePitrOutcome::Enabled { .. }),
             "enable_pitr did not reach Enabled: {outcome:?}"
         );
+    }
+
+    /// A resume that loses the lifecycle to a concurrent disable has to say so. The
+    /// install is skipped because the lifecycle left the enabled set while this call
+    /// was in flight, so reporting "the runtime is not attached" names a caller
+    /// error instead of the transition that actually happened - and it is the one
+    /// interleaving where the caller can do nothing about it.
+    ///
+    /// Arranged, not raced: the barrier parks the resume after its read and before
+    /// the install decision, the witness proves the read happened, and the disable
+    /// lands while the resume waits.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_resume_that_loses_the_lifecycle_reports_reconciliation_rather_than_a_missing_runtime() {
+        let dir = tempdir().unwrap();
+        let parent = crate::backup::open_directory_no_follow(dir.path()).unwrap();
+        crate::backup::bootstrap_repository(&parent, "repository").unwrap();
+        let repository = dir.path().join("repository");
+        let options = LsmStorageOptions {
+            enable_wal: true,
+            ..LsmStorageOptions::default_for_test()
+        };
+        let engine = KvEngine::open(dir.path().join("db"), options.clone()).unwrap();
+        engine
+            .enable_pitr(crate::pitr_api::PitrOptions {
+                repository: repository.clone(),
+                config: crate::pitr_api::PersistedPitrConfig {
+                    archive_interval: std::time::Duration::from_secs(3600),
+                    max_segment_bytes: 1 << 20,
+                    max_unarchived_bytes: 1 << 20,
+                    max_source_spool_bytes: 2 << 20,
+                },
+                runtime: crate::pitr_api::PitrRuntimeOptions::default(),
+            })
+            .unwrap();
+        engine.put(b"before-disable", b"value").unwrap();
+
+        // Cleared so the resume's own write to it witnesses that it is past the
+        // lifecycle read.
+        *engine.pitr_repository_path.lock() = None;
+        let barrier = engine.pitr_barrier_lock.lock();
+        std::thread::scope(|scope| {
+            let resume = scope.spawn(|| engine.resume_pitr(repository.clone()));
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while engine.pitr_repository_path.lock().is_none() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the racing resume never read the lifecycle; the window this test \
+                     exists to arrange was not created"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            // The disable that wins: the lifecycle leaves the enabled set and the
+            // runtime is detached with it. Both happen while the resume is parked at
+            // the barrier, so the resume reads the result of both. The state is the
+            // one a clean disable replays - no active segment and no obligations.
+            let mut disabled = engine.pitr_manifest_state.lock().clone();
+            disabled.mode = crate::pitr_manifest::PitrMode::Disabled;
+            disabled.active_segment_id = None;
+            disabled.obligations.clear();
+            disabled.uncertain_segment_id = None;
+            engine.detach_pitr_lifecycle(disabled).unwrap();
+            drop(barrier);
+            let outcome = resume.join().unwrap().unwrap_or_else(|error| {
+                panic!("a resume that lost the lifecycle must not report an error: {error:?}")
+            });
+            assert!(
+                matches!(
+                    outcome,
+                    crate::pitr_api::PitrResumeOutcome::ReconciliationRequired(_)
+                ),
+                "expected reconciliation to be required, got {outcome:?}"
+            );
+        });
+        drop(engine);
+        let reopened = KvEngine::open(dir.path().join("db"), options).unwrap();
+        assert_eq!(
+            reopened.get(b"before-disable").unwrap().as_deref(),
+            Some(b"value".as_slice())
+        );
+        let _ = reopened.close();
     }
 
     #[cfg(target_os = "linux")]
