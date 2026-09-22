@@ -4408,8 +4408,12 @@ impl KvEngine {
                     // Any valid kind prefix is already the entry's: `PutRaw` values
                     // are prefixed before they reach the WAL, and `PutPrefixed`
                     // carries one, so only a kindless value needs `Inline`. Testing
-                    // for `Inline`/`Tombstone` alone re-prefixed TTL and vLog
-                    // entries and lost their meaning.
+                    // for `Inline`/`Tombstone` alone re-prefixed a `TtlInline`
+                    // entry, whose payload is the expiry followed by the user
+                    // value - so the TTL was lost and the expiry leaked into the
+                    // restored value. The other kinds are accepted for the same
+                    // reason: the write path owns the choice of prefix, not this
+                    // loop, and a `ValuePointer` value is no different in kind.
                     let value = if value
                         .first()
                         .and_then(|byte| crate::vlog::KvKind::from_u8(*byte))
@@ -11986,11 +11990,11 @@ mod tests {
 
     /// A restored value has to come back exactly as the WAL carried it.
     ///
-    /// `put_with_ttl` writes a `TtlInline` payload into the batch and vLog values
-    /// arrive as pointers, so the value in the WAL already starts with a kind byte.
-    /// The restore used to prepend `Inline` to anything that was not `Inline` or
-    /// `Tombstone`, which turned a TTL entry into inline bytes: the TTL was lost and
-    /// a pointer read back as its own raw bytes.
+    /// `put_with_ttl` writes a `TtlInline` payload into the batch, so the value in
+    /// the WAL already starts with a kind byte. The restore used to prepend `Inline`
+    /// to anything that was not `Inline` or `Tombstone`, which turned a TTL entry
+    /// into inline bytes: the TTL was lost and the expiry leaked into the restored
+    /// value.
     ///
     /// Tested against `apply_pitr_restore_batch_exact` rather than the restore
     /// planner, which keeps its own model and never prefixes anything.
@@ -12613,6 +12617,74 @@ mod tests {
         assert_eq!(request.config.archive_interval_ms, 1000);
         assert!(repository.is_dir());
         engine.close().unwrap();
+    }
+
+    /// A disable whose marker write cannot be settled has to leave commit admission
+    /// closed.
+    ///
+    /// `disable_pitr_allow_gap` stops admission before it persists the coverage gap.
+    /// When that publication's outcome is unknowable - the batch may be durable
+    /// without its fsync - reopening would let the epoch accept writes into a
+    /// segment the durable state already describes as sealed, so only a disable that
+    /// landed cleanly reopens. `resume_pitr` is the way to settle the rest.
+    ///
+    /// The other arm - a plain error, which proves the batch did not land - is the
+    /// one that reopens, and `c368b580` is what made it do so; this test pins the
+    /// arm that must stay closed, which is the half a future edit is more likely to
+    /// get wrong by reopening both.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_uncertain_disable_publication_keeps_commit_admission_closed() {
+        let dir = tempdir().unwrap();
+        let parent = crate::backup::open_directory_no_follow(dir.path()).unwrap();
+        crate::backup::bootstrap_repository(&parent, "repository").unwrap();
+        let repository = dir.path().join("repository");
+        let engine = KvEngine::open(
+            dir.path().join("db"),
+            LsmStorageOptions {
+                enable_wal: true,
+                ..LsmStorageOptions::default_for_test()
+            },
+        )
+        .unwrap();
+        engine
+            .enable_pitr(crate::pitr_api::PitrOptions {
+                repository: repository.clone(),
+                config: crate::pitr_api::PersistedPitrConfig {
+                    archive_interval: std::time::Duration::from_secs(3600),
+                    max_segment_bytes: 1 << 20,
+                    max_unarchived_bytes: 1 << 20,
+                    max_source_spool_bytes: 2 << 20,
+                },
+                runtime: crate::pitr_api::PitrRuntimeOptions::default(),
+            })
+            .unwrap();
+        engine.put(b"before-disable", b"value").unwrap();
+
+        crate::manifest::set_manifest_sync_failure(&dir.path().join("db/MANIFEST"));
+        let outcome = engine.disable_pitr_allow_gap().unwrap();
+        assert!(
+            matches!(
+                outcome,
+                crate::pitr_api::DisablePitrOutcome::SourceManifestPublishedButNotDurable { .. }
+                    | crate::pitr_api::DisablePitrOutcome::PublicationUnknown { .. }
+            ),
+            "expected an unsettleable disable publication, got {outcome:?}"
+        );
+        assert!(
+            !engine
+                .inner
+                .mvcc
+                .as_ref()
+                .unwrap()
+                .commit_admission_is_open(),
+            "an unsettleable disable publication has to leave admission closed"
+        );
+        // Writes are refused rather than accepted into a segment the durable state
+        // already describes as sealed - that is the property the closed admission
+        // buys.
+        assert!(engine.put(b"after-disable", b"value").is_err());
+        engine.close_storage().unwrap();
     }
 
     #[cfg(target_os = "linux")]
