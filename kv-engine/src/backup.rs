@@ -2771,6 +2771,12 @@ impl BackupRepository {
                 }
             };
         }
+        #[cfg(test)]
+        if std::env::var_os("PITR_PROCESS_KILL_BEFORE_PURGE_CLEANUP").is_some() {
+            // SAFETY: this is an isolated child-process crash test after the
+            // paired catalog transaction is durable and before cleanup starts.
+            unsafe { libc::_exit(137) }
+        }
         let mut deleted_bytes = 0_u64;
         let mut reclaim_object_owner = std::collections::HashMap::new();
         for metadata in &removed_segments {
@@ -2968,6 +2974,18 @@ impl BackupRepository {
         destination: impl AsRef<Path>,
         options: crate::pitr_api::PitrRestoreOptions,
     ) -> Result<crate::pitr_api::RestoreToOutcome> {
+        self.restore_to_with_cancellation(target, destination, options, None)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn restore_to_with_cancellation(
+        &self,
+        target: crate::pitr_api::RecoveryTarget,
+        destination: impl AsRef<Path>,
+        options: crate::pitr_api::PitrRestoreOptions,
+        cancellation: Option<&std::sync::atomic::AtomicBool>,
+    ) -> Result<crate::pitr_api::RestoreToOutcome> {
+        check_pitr_cancellation(cancellation)?;
         target.validate()?;
         options.validate()?;
         self.ensure_mutation_allowed()?;
@@ -3084,6 +3102,7 @@ impl BackupRepository {
                 destination,
                 options.storage,
                 selected_interval,
+                cancellation,
             );
         }
         let info = crate::pitr_api::RestoreToInfo {
@@ -3095,12 +3114,32 @@ impl BackupRepository {
             replayed_batches: 0,
             replayed_bytes: 0,
         };
+        check_pitr_cancellation(cancellation)?;
         match self.restore(base_backup_id, destination, options.storage)? {
             RestoreOutcome::Restored => Ok(crate::pitr_api::RestoreToOutcome::Restored(info)),
             RestoreOutcome::PublishedButNotDurable { error, .. } => {
                 Ok(crate::pitr_api::RestoreToOutcome::PublishedButNotDurable { info, error })
             }
         }
+    }
+
+    /// Eagerly dispatches PITR restore to Tokio's blocking pool.
+    #[cfg(target_os = "linux")]
+    pub fn restore_to_async(
+        self: Arc<Self>,
+        target: crate::pitr_api::RecoveryTarget,
+        destination: impl AsRef<Path> + Send + 'static,
+        options: crate::pitr_api::PitrRestoreOptions,
+    ) -> crate::pitr_api::PitrTask<crate::pitr_api::RestoreToOutcome> {
+        let destination = destination.as_ref().to_path_buf();
+        crate::pitr_api::PitrTask::spawn_cancellable(move |cancellation| {
+            self.restore_to_with_cancellation(
+                target,
+                destination,
+                options,
+                Some(cancellation.control()),
+            )
+        })
     }
 
     #[cfg(target_os = "linux")]
@@ -3161,6 +3200,7 @@ impl BackupRepository {
     }
 
     #[cfg(target_os = "linux")]
+    #[allow(clippy::too_many_arguments)]
     fn restore_pitr_wal(
         &self,
         base_backup_id: u64,
@@ -3169,7 +3209,9 @@ impl BackupRepository {
         destination: impl AsRef<Path>,
         storage: crate::lsm_storage::LsmStorageOptions,
         selected_interval: crate::pitr_api::RecoveryInterval,
+        cancellation: Option<&std::sync::atomic::AtomicBool>,
     ) -> Result<crate::pitr_api::RestoreToOutcome> {
+        check_pitr_cancellation(cancellation)?;
         let catalog_fd = match openat_no_follow(&self.root, "PITR_CATALOG_LOG", libc::O_RDONLY, 0) {
             Ok(fd) => fd,
             Err(error)
@@ -3283,7 +3325,9 @@ impl BackupRepository {
                 .as_system_time()?;
                 let mut resolved = base.included_commit_ts.filter(|_| base_time <= time);
                 for metadata in &segments {
+                    check_pitr_cancellation(cancellation)?;
                     for batch in read_batches(metadata)? {
+                        check_pitr_cancellation(cancellation)?;
                         if batch.recorded_at.as_system_time()? <= time {
                             resolved = Some(
                                 resolved.map_or(batch.commit_ts, |old| old.max(batch.commit_ts)),
@@ -3330,13 +3374,38 @@ impl BackupRepository {
             "PITR restore staging path already exists"
         );
         self.restore(base_backup_id, &temp_path, storage.clone())?;
-        let engine = match crate::lsm_storage::KvEngine::open(&temp_path, storage) {
-            Ok(engine) => engine,
-            Err(error) => {
-                let _ = std::fs::remove_dir_all(&temp_path);
-                return Err(error);
-            }
+        // That call published this staging - it is the one that creates it - and
+        // every exit from here to the publication decision below discards it: a
+        // cancellation between replay units, a failed batch, a failed close. The
+        // name is derived from this process's id, so leaving it behind makes a
+        // retry trip the guard just above.
+        //
+        // Armed only after that call returns, never before. The guard removes the
+        // staging unconditionally, so arming it earlier lets a concurrent restore
+        // to the same destination in this process delete the winner's staging: the
+        // loser's `self.restore` fails with "restore target already exists" once
+        // the winner has published, and the loser would then take the winner's
+        // staging down with it.
+        //
+        // The cost is one path an earlier arming covered: if `self.restore` fails
+        // after publishing - its repository lock reacquire - this leaves the
+        // staging behind, and a later restore to the same destination trips the
+        // guard above until it is removed by hand. The two errors are not
+        // distinguishable except by their text - "restore target already exists"
+        // against a failed lock reacquire - with nothing structural saying whether
+        // this call published, so the choice is between leaking on a lock failure
+        // and deleting a peer's staging on a race; this takes the leak. Telling
+        // them apart needs the staging's identity handed back by `self.restore`,
+        // which its signature does not carry.
+        //
+        // Disarmed before `publish_pitr_restore_staging`, whose own outcomes decide
+        // the staging's fate from there: a hard failure discards it, while
+        // `PublishedButNotDurable` and `Unknown` deliberately keep it.
+        let mut staging_cleanup = RestoreStagingCleanup {
+            parent: &parent_fd,
+            name: temp_name.clone(),
         };
+        let engine = crate::lsm_storage::KvEngine::open(&temp_path, storage)?;
         let mut replayed_batches = 0_u64;
         let mut replayed_bytes = 0_u64;
         let mut last_commit_ts = base.included_commit_ts;
@@ -3349,8 +3418,10 @@ impl BackupRepository {
             .iter()
             .chain(plan.proof_metadata.iter())
         {
+            check_pitr_cancellation(cancellation)?;
             let batches = read_batches(metadata)?;
             for batch in batches {
+                check_pitr_cancellation(cancellation)?;
                 if batch.commit_ts > target_commit_ts {
                     continue;
                 }
@@ -3360,6 +3431,8 @@ impl BackupRepository {
                 last_commit_ts = Some(batch.commit_ts);
             }
         }
+        // Cancellation is no longer observed once finalization begins: the
+        // staged destination may already contain durable replay state.
         engine.close()?;
         let mut destination_timeline_id = [0_u8; 16];
         OsRng.try_fill_bytes(&mut destination_timeline_id)?;
@@ -3397,6 +3470,9 @@ impl BackupRepository {
         std::fs::write(&recovery_path, recovery_bytes)?;
         std::fs::File::open(&recovery_path)?.sync_all()?;
         std::fs::File::open(&temp_path)?.sync_all()?;
+        // The staging is complete and the publication below owns what happens to
+        // it; see the guard armed where the staging was created.
+        staging_cleanup.disarm();
         let publication =
             match Self::publish_pitr_restore_staging(&parent_fd, &temp_name, target_name) {
                 Ok(publication) => publication,
@@ -6868,6 +6944,48 @@ fn crc32(bytes: &[u8]) -> u32 {
     hasher.finalize()
 }
 
+#[cfg(target_os = "linux")]
+impl BackupRepository {
+    /// Eagerly dispatches PITR verification to Tokio's blocking pool.
+    ///
+    /// Cancellation is pre-start only: `PitrTask::spawn` reads the request before
+    /// entering the operation and never again, so a `cancel()` that arrives once
+    /// verification is running does not stop it and does not turn its report into a
+    /// partial one. `verify_pitr` takes no cancellation token, so nothing inside it
+    /// can observe a request, and it holds `operation_lock` while it runs.
+    pub fn verify_pitr_async(
+        self: Arc<Self>,
+        options: crate::pitr_api::VerifyPitrOptions,
+    ) -> crate::pitr_api::PitrTask<crate::pitr_api::VerifyPitrReport> {
+        crate::pitr_api::PitrTask::spawn(move || self.verify_pitr(options))
+    }
+
+    /// Eagerly dispatches PITR retention cleanup to Tokio's blocking pool.
+    ///
+    /// Cancellation is pre-start only: `PitrTask::spawn` reads the request before
+    /// entering the operation and never again. A `cancel()` that arrives after the
+    /// task starts cannot stop it, and in particular cannot stop it before its
+    /// paired catalog transaction becomes durable - so the returned
+    /// `PitrPurgeOutcome`, not the cancellation, is the report of what happened.
+    /// `purge_pitr` takes no cancellation token; it serializes with the
+    /// repository's other operations through `operation_lock`, and its outcome
+    /// already reports cleanup that stopped part way.
+    pub fn purge_pitr_async(
+        self: Arc<Self>,
+        policy: crate::pitr_api::PitrRetentionPolicy,
+    ) -> crate::pitr_api::PitrTask<crate::pitr_api::PitrPurgeOutcome> {
+        crate::pitr_api::PitrTask::spawn(move || self.purge_pitr(policy))
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn check_pitr_cancellation(cancellation: Option<&std::sync::atomic::AtomicBool>) -> Result<()> {
+    if cancellation.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire)) {
+        anyhow::bail!("PITR restore cancelled before finalization")
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6918,6 +7036,14 @@ mod tests {
             panic!("expected committed backup outcome");
         };
         info
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pitr_restore_cancellation_is_checked_between_replay_units() {
+        let cancelled = std::sync::atomic::AtomicBool::new(true);
+        let error = check_pitr_cancellation(Some(&cancelled)).unwrap_err();
+        assert!(error.to_string().contains("cancelled"));
     }
 
     #[cfg(target_os = "linux")]
@@ -7257,6 +7383,136 @@ mod tests {
         // was already there, not a rename of the staging.
         assert!(dir.path().join("staging").is_dir());
         assert!(dir.path().join("destination").is_dir());
+    }
+
+    /// A cancel that lands while a restore is in flight must not leave the staging
+    /// directory behind.
+    ///
+    /// The staging name carries this process's id, so the caller's retry - the
+    /// second half of this test, and the only thing a cancelled caller can do next -
+    /// would otherwise fail its own "PITR restore staging path already exists"
+    /// guard: a failure it cannot act on, caused by a request it made itself.
+    ///
+    /// The worker is paused inside the base restore, after that call releases the
+    /// repository lock. That is the window this needs: the staging is about to
+    /// exist and the replay loop, the only place cancellation is observed, has not
+    /// started. Cancelling there and then releasing reaches the loop's first check.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pitr_restore_cancellation_discards_the_staging_directory() {
+        // The hook's state is process-global, so this serializes with the other
+        // tests that arm it.
+        let _test_lock = restore_unlock_test_hook::lock();
+        let dir = tempfile::tempdir().unwrap();
+        let repository_path = dir.path().join("repository");
+        let parent = open_directory_no_follow(dir.path()).unwrap();
+        bootstrap_repository(&parent, "repository").unwrap();
+        let engine = crate::lsm_storage::KvEngine::open(
+            dir.path().join("db"),
+            crate::lsm_storage::LsmStorageOptions {
+                enable_wal: true,
+                ..crate::lsm_storage::LsmStorageOptions::default_for_test()
+            },
+        )
+        .unwrap();
+        engine
+            .enable_pitr(crate::pitr_api::PitrOptions {
+                repository: repository_path.clone(),
+                config: crate::pitr_api::PersistedPitrConfig {
+                    archive_interval: std::time::Duration::from_secs(3600),
+                    max_segment_bytes: 1024 * 1024,
+                    max_unarchived_bytes: 2 * 1024 * 1024,
+                    max_source_spool_bytes: 4 * 1024 * 1024,
+                },
+                runtime: crate::pitr_api::PitrRuntimeOptions::default(),
+            })
+            .unwrap();
+        let mut target_commit_ts = None;
+        for (key, value) in [
+            (&b"cancel-a"[..], &b"one"[..]),
+            (&b"cancel-b"[..], &b"two"[..]),
+        ] {
+            engine.put(key, value).unwrap();
+            let crate::pitr_api::RecoveryPointOutcome::Durable(point) =
+                engine.create_recovery_point().unwrap()
+            else {
+                panic!("expected a durable PITR recovery point");
+            };
+            target_commit_ts = point.commit_ts;
+        }
+        let target_commit_ts = target_commit_ts.expect("a recovery point names a commit");
+        let status = engine
+            .pitr_status(crate::pitr_api::PitrStatusOptions {
+                cursor: None,
+                page_size: crate::pitr_api::MAX_STATUS_PAGE_SIZE,
+            })
+            .unwrap();
+        assert!(
+            !status.recoverable_intervals.is_empty(),
+            "the setup must advertise an interval for the restore to select"
+        );
+        let selector = crate::pitr_api::RecoverySelector {
+            timeline_id: status.recoverable_intervals[0].timeline_id,
+            archive_epoch_id: Some(status.recoverable_intervals[0].archive_epoch_id),
+            base_backup_id: None,
+        };
+        engine.close().unwrap();
+
+        let repository = BackupRepository::open(&repository_path).unwrap();
+        let destination = dir.path().join("restored");
+        // The inner restore is called with the staging path as its target, so that
+        // is the name the hook pauses on.
+        let staging_name = format!(".restored.pitr-{}", std::process::id());
+        let staging_path = dir.path().join(&staging_name);
+        let options = crate::pitr_api::PitrRestoreOptions {
+            selector,
+            implementations: crate::pitr_api::ImplementationRegistry,
+            executor_threads: std::num::NonZeroUsize::new(1).unwrap(),
+            cache_capacity: 4096,
+            storage: crate::lsm_storage::LsmStorageOptions::default_for_test(),
+        };
+        restore_unlock_test_hook::arm(&staging_name);
+        let cancelled = AtomicBool::new(false);
+        let error = std::thread::scope(|scope| {
+            let worker = scope.spawn(|| {
+                repository.restore_to_with_cancellation(
+                    crate::pitr_api::RecoveryTarget::CommitTs(target_commit_ts),
+                    &destination,
+                    options.clone(),
+                    Some(&cancelled),
+                )
+            });
+            restore_unlock_test_hook::wait();
+            cancelled.store(true, Ordering::Release);
+            restore_unlock_test_hook::release();
+            worker.join().unwrap().unwrap_err()
+        });
+        assert!(
+            error.to_string().contains("cancelled"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            !staging_path.exists(),
+            "a cancelled restore left its staging directory behind"
+        );
+        assert!(!destination.exists(), "a cancelled restore published");
+        // What the cancelled caller does next. The staging name is derived from the
+        // process id, so a leftover directory is exactly what this would trip on.
+        // The handle is reopened first, as it is after any restore.
+        drop(repository);
+        let repository = BackupRepository::open(&repository_path).unwrap();
+        let outcome = repository
+            .restore_to(
+                crate::pitr_api::RecoveryTarget::CommitTs(target_commit_ts),
+                &destination,
+                options,
+            )
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            crate::pitr_api::RestoreToOutcome::Restored(_)
+        ));
+        assert!(destination.is_dir(), "the retry must publish the restore");
     }
 
     #[cfg(feature = "chaos-testing")]

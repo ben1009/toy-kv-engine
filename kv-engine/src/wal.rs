@@ -15,6 +15,7 @@ use bytes::{Buf, BufMut, Bytes};
 use crossbeam_queue::ArrayQueue;
 use crossbeam_skiplist::SkipMap;
 use parking_lot::{Condvar, Mutex};
+use sha2::{Digest, Sha256};
 
 use crate::{key::KeySlice, range_tombstone::RangeTombstone};
 
@@ -227,6 +228,48 @@ impl<'a> DirectBufCursor<'a> {
 struct TicketedBuf {
     ticket: u64,
     buf: DirectBuf,
+    pitr_entry: Option<crate::pitr_seal::SealEntry>,
+}
+
+struct PitrSealAccumulator {
+    header: crate::pitr::WalV5Header,
+    hasher: Sha256,
+    logical_length: u64,
+    entries: Vec<crate::pitr_seal::SealEntry>,
+}
+
+impl PitrSealAccumulator {
+    fn from_prefix(
+        header: crate::pitr::WalV5Header,
+        prefix: &[u8],
+        entries: Vec<crate::pitr_seal::SealEntry>,
+    ) -> Self {
+        let mut hasher = Sha256::new();
+        hasher.update(prefix);
+        Self {
+            header,
+            hasher,
+            logical_length: prefix.len() as u64,
+            entries,
+        }
+    }
+
+    fn append(&mut self, buf: &DirectBuf, entry: crate::pitr_seal::SealEntry) {
+        self.hasher.update(buf.initialized_slice(0, buf.len()));
+        self.logical_length += buf.len() as u64;
+        self.entries.push(entry);
+    }
+
+    fn seal(&self) -> Result<(crate::pitr_seal::V5Seal, Vec<u8>)> {
+        let seal = crate::pitr_seal::V5Seal {
+            header: self.header,
+            wal_digest: self.hasher.clone().finalize().into(),
+            logical_length: self.logical_length,
+            entries: self.entries.clone(),
+        };
+        let bytes = seal.encode()?;
+        Ok((seal, bytes))
+    }
 }
 
 trait WalPointEntry {
@@ -339,7 +382,11 @@ pub struct Wal {
     /// PITR admission bounds and the ticket-ordered logical end reserved by queued batches.
     pitr_max_segment_bytes: AtomicU64,
     pitr_max_unarchived_bytes: AtomicU64,
+    /// File offset where the current PITR segment started appending.
+    pitr_segment_start: AtomicU64,
     pitr_reserved_end: Mutex<u64>,
+    pitr_rotation_needed: AtomicBool,
+    pitr_seal: Option<Mutex<PitrSealAccumulator>>,
 }
 
 /// Abstraction over WAL entry recovery actions.
@@ -507,6 +554,18 @@ impl Wal {
             }
 
             let (ring, direct_file, alloc_offset) = Self::try_init_io_uring(path)?;
+            let pitr_seal = if format_version == crate::pitr::WAL_V5_VERSION {
+                let wal = std::fs::read(path)?;
+                let (seal, _) = crate::pitr_seal::build_v5_seal(&wal)?;
+                let logical_length = seal.logical_length as usize;
+                Some(Mutex::new(PitrSealAccumulator::from_prefix(
+                    seal.header,
+                    &wal[..logical_length],
+                    seal.entries,
+                )))
+            } else {
+                None
+            };
             Ok(Self {
                 buffered_file: Arc::new(Mutex::new(BufWriter::new(buf_file))),
                 mvcc_format,
@@ -524,7 +583,10 @@ impl Wal {
                 poisoned: AtomicBool::new(false),
                 pitr_max_segment_bytes: AtomicU64::new(u64::MAX),
                 pitr_max_unarchived_bytes: AtomicU64::new(u64::MAX),
+                pitr_segment_start: AtomicU64::new(0),
                 pitr_reserved_end: Mutex::new(0),
+                pitr_rotation_needed: AtomicBool::new(false),
+                pitr_seal,
             })
         } else {
             log::info!("WAL: recovered non-MVCC WAL, using buffered I/O only");
@@ -545,7 +607,10 @@ impl Wal {
                 poisoned: AtomicBool::new(false),
                 pitr_max_segment_bytes: AtomicU64::new(u64::MAX),
                 pitr_max_unarchived_bytes: AtomicU64::new(u64::MAX),
+                pitr_segment_start: AtomicU64::new(0),
                 pitr_reserved_end: Mutex::new(0),
+                pitr_rotation_needed: AtomicBool::new(false),
+                pitr_seal: None,
             })
         }
     }
@@ -703,7 +768,11 @@ impl Wal {
         let enqueue_start = Instant::now();
         let mut pending = self.pending.lock();
         let ticket = self.next_ticket.fetch_add(1, Ordering::Release);
-        pending.push(TicketedBuf { ticket, buf });
+        pending.push(TicketedBuf {
+            ticket,
+            buf,
+            pitr_entry: None,
+        });
         drop(pending);
         #[cfg(feature = "bench")]
         if let Some(profile) = profile {
@@ -788,7 +857,11 @@ impl Wal {
 
         let mut pending = self.pending.lock();
         let ticket = self.next_ticket.fetch_add(1, Ordering::Release);
-        pending.push(TicketedBuf { ticket, buf });
+        pending.push(TicketedBuf {
+            ticket,
+            buf,
+            pitr_entry: None,
+        });
         drop(pending);
 
         #[cfg(feature = "chaos-testing")]
@@ -847,7 +920,10 @@ impl Wal {
             poisoned: AtomicBool::new(false),
             pitr_max_segment_bytes: AtomicU64::new(u64::MAX),
             pitr_max_unarchived_bytes: AtomicU64::new(u64::MAX),
+            pitr_segment_start: AtomicU64::new(0),
             pitr_reserved_end: Mutex::new(0),
+            pitr_rotation_needed: AtomicBool::new(false),
+            pitr_seal: None,
         })
     }
 
@@ -857,6 +933,7 @@ impl Wal {
         header: crate::pitr::WalV5Header,
     ) -> Result<Self> {
         crate::pitr_segment::install_v5_wal_header(path.as_ref(), header)?;
+        let header_bytes = crate::pitr::encode_v5_file_header(header)?;
         let (ring, direct_file, alloc_offset) = Self::try_init_io_uring(path.as_ref())?;
         let buf_file = File::options()
             .read(true)
@@ -879,7 +956,14 @@ impl Wal {
             poisoned: AtomicBool::new(false),
             pitr_max_segment_bytes: AtomicU64::new(u64::MAX),
             pitr_max_unarchived_bytes: AtomicU64::new(u64::MAX),
+            pitr_segment_start: AtomicU64::new(0),
             pitr_reserved_end: Mutex::new(0),
+            pitr_rotation_needed: AtomicBool::new(false),
+            pitr_seal: Some(Mutex::new(PitrSealAccumulator::from_prefix(
+                header,
+                &header_bytes,
+                Vec::new(),
+            ))),
         })
     }
 
@@ -941,6 +1025,18 @@ impl Wal {
         self.next_ticket.load(Ordering::Acquire)
     }
 
+    pub(crate) fn pitr_rotation_needed(&self) -> bool {
+        self.pitr_rotation_needed.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn finalize_pitr_seal(&self) -> Result<(crate::pitr_seal::V5Seal, Vec<u8>)> {
+        self.pitr_seal
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("WAL has no PITR seal accumulator"))?
+            .lock()
+            .seal()
+    }
+
     pub(crate) fn configure_pitr_limits(
         &self,
         max_segment_bytes: u64,
@@ -956,6 +1052,9 @@ impl Wal {
             .store(max_unarchived_bytes, Ordering::Release);
         let mut reserved = self.pitr_reserved_end.lock();
         *reserved = (*reserved).max(self.alloc_offset.load(Ordering::Acquire));
+        self.pitr_segment_start.store(*reserved, Ordering::Release);
+        self.pitr_rotation_needed
+            .store(*reserved >= max_segment_bytes, Ordering::Release);
         Ok(())
     }
 
@@ -991,14 +1090,21 @@ impl Wal {
         buf.write_at(0, &encoded);
         buf.set_len(encoded.len());
         let aligned_len = DirectBuf::align_up(encoded.len()) as u64;
-        anyhow::ensure!(
-            aligned_len <= self.pitr_max_segment_bytes.load(Ordering::Acquire),
-            "PITR batch exceeds maximum segment bytes"
-        );
         let mut reserved = self.pitr_reserved_end.lock();
         let next = reserved
             .checked_add(aligned_len)
             .ok_or_else(|| anyhow::anyhow!("PITR logical WAL reservation overflow"))?;
+        let max_segment_bytes = self.pitr_max_segment_bytes.load(Ordering::Acquire);
+        if next > max_segment_bytes {
+            // A segment must always accept its first batch: the padded v5 header
+            // alone can already fill a small segment budget. The engine rotates
+            // after that batch so later batches land in a fresh segment. A batch
+            // that would not fit into a segment of its own is still rejected.
+            let first_batch = *reserved <= self.pitr_segment_start.load(Ordering::Acquire)
+                && aligned_len <= max_segment_bytes;
+            self.pitr_rotation_needed.store(true, Ordering::Release);
+            anyhow::ensure!(first_batch, "PITR batch would cross maximum segment bytes");
+        }
         anyhow::ensure!(
             next <= self.pitr_max_unarchived_bytes.load(Ordering::Acquire),
             "PITR unarchived WAL limit exceeded"
@@ -1006,7 +1112,17 @@ impl Wal {
         let mut pending = self.pending.lock();
         let ticket = self.next_ticket.fetch_add(1, Ordering::Release);
         *reserved = next;
-        pending.push(TicketedBuf { ticket, buf });
+        if next == max_segment_bytes {
+            self.pitr_rotation_needed.store(true, Ordering::Release);
+        }
+        pending.push(TicketedBuf {
+            ticket,
+            buf,
+            pitr_entry: Some(crate::pitr_seal::SealEntry {
+                commit_ts: batch.commit_ts,
+                recorded_at: batch.recorded_at,
+            }),
+        });
         Ok(ticket)
     }
 
@@ -2348,6 +2464,15 @@ impl Wal {
                 // All CQEs reaped — kernel is done with buffers, safe to drop.
                 drop(std::mem::ManuallyDrop::into_inner(bufs));
                 anyhow::bail!("fdatasync failed: {}", err);
+            }
+        }
+
+        if let Some(accumulator) = &self.pitr_seal {
+            let mut accumulator = accumulator.lock();
+            for ticketed_buf in bufs.iter() {
+                if let Some(entry) = ticketed_buf.pitr_entry {
+                    accumulator.append(&ticketed_buf.buf, entry);
+                }
             }
         }
 

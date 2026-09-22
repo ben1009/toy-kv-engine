@@ -368,3 +368,77 @@ fn test_compaction_filter_replay_after_snapshot() {
     assert_eq!(filters.len(), 1);
     assert_eq!(filters[0].id, second);
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn pitr_manifest_append_crash_replays_record_after_reopen() {
+    let dir = tempdir().unwrap();
+    let manifest_path = dir.path().join("MANIFEST");
+    if std::env::var_os("PITR_MANIFEST_CRASH_CHILD_ROOT").is_some() {
+        let child_path = std::env::var_os("PITR_MANIFEST_CRASH_CHILD_ROOT").unwrap();
+        let manifest = Manifest::create(child_path).unwrap();
+        manifest
+            .add_record_when_init(ManifestRecord::Pitr(
+                crate::pitr_manifest::PitrManifestRecord::SegmentArchived { segment_id: 7 },
+            ))
+            .unwrap();
+        unreachable!("child must exit after manifest append");
+    }
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .arg("--exact")
+        .arg("tests::manifest::pitr_manifest_append_crash_replays_record_after_reopen")
+        .arg("--nocapture")
+        .env("PITR_MANIFEST_CRASH_CHILD_ROOT", &manifest_path)
+        .env("PITR_PROCESS_KILL_AFTER_MANIFEST_APPEND", "1")
+        .status()
+        .unwrap();
+    assert_eq!(status.code(), Some(137));
+    let (_, records) = Manifest::recover(&manifest_path).unwrap();
+    assert!(matches!(
+        records.as_slice(),
+        [ManifestRecord::Pitr(
+            crate::pitr_manifest::PitrManifestRecord::SegmentArchived { segment_id: 7 }
+        )]
+    ));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn pitr_manifest_snapshot_rename_crash_recovers_snapshot() {
+    let dir = tempdir().unwrap();
+    let manifest_path = dir.path().join("MANIFEST");
+    let snapshot = ManifestRecord::Snapshot {
+        l0_sstables: vec![],
+        levels: vec![],
+        range_only_ssts: vec![],
+        next_sst_id: 9,
+        vlog_references: vec![],
+        imm_memtable_ids: vec![],
+        pitr_memtable_segments: vec![],
+        active_compaction_filters: vec![],
+        next_compaction_filter_id: 0,
+        format_version: MANIFEST_FORMAT_VERSION,
+        immutable_file_metadata: vec![],
+        pitr_state: Some(crate::pitr_manifest::PitrState::default()),
+    };
+    if std::env::var_os("PITR_MANIFEST_SNAPSHOT_CHILD_ROOT").is_some() {
+        let child_path = std::env::var_os("PITR_MANIFEST_SNAPSHOT_CHILD_ROOT").unwrap();
+        let manifest = Manifest::create(child_path).unwrap();
+        manifest.snapshot(snapshot).unwrap();
+        unreachable!("child must exit after manifest snapshot rename");
+    }
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .arg("--exact")
+        .arg("tests::manifest::pitr_manifest_snapshot_rename_crash_recovers_snapshot")
+        .arg("--nocapture")
+        .env("PITR_MANIFEST_SNAPSHOT_CHILD_ROOT", &manifest_path)
+        .env("PITR_PROCESS_KILL_AFTER_MANIFEST_SNAPSHOT_RENAME", "1")
+        .status()
+        .unwrap();
+    assert_eq!(status.code(), Some(137));
+    let (_, records) = Manifest::recover(&manifest_path).unwrap();
+    assert!(matches!(
+        records.as_slice(),
+        [ManifestRecord::Snapshot { next_sst_id: 9, .. }]
+    ));
+}
