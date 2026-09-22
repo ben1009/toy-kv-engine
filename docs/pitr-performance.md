@@ -35,7 +35,7 @@ Host: Linux 6.18.9, Intel Core i9-13900T, 32 logical CPUs. The database and
 repository were under `/tmp` on tmpfs, so these numbers are a reproducible CPU
 and synchronization baseline, not a storage-device durability benchmark.
 
-## Median of three alternating runs
+## Median of three runs, fixed order
 
 | Writers | PITR disabled writes/s | PITR enabled writes/s | Enabled / disabled | Catch-up seconds |
 | ---: | ---: | ---: | ---: | ---: |

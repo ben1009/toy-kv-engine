@@ -3385,10 +3385,16 @@ impl BackupRepository {
         // to the same destination in this process delete the winner's staging: the
         // loser's `self.restore` fails with "restore target already exists" once
         // the winner has published, and the loser would then take the winner's
-        // staging down with it. Not arming on failure leaves a staging that a
-        // failed reacquire inside `self.restore` published behind, which is what
-        // happens without this guard too, and the two cases are indistinguishable
-        // from the error alone.
+        // staging down with it.
+        //
+        // The cost is one path an earlier arming covered: if `self.restore` fails
+        // after publishing - its repository lock reacquire - this leaves the
+        // staging behind, and a later restore to the same destination trips the
+        // guard above until it is removed by hand. That error is indistinguishable
+        // from the loser's from here, so the choice is between leaking on a lock
+        // failure and deleting a peer's staging on a race; this takes the leak.
+        // Telling them apart needs the staging's identity handed back by
+        // `self.restore`, which its signature does not carry.
         //
         // Disarmed before `publish_pitr_restore_staging`, whose own outcomes decide
         // the staging's fate from there: a hard failure discards it, while
@@ -6959,9 +6965,9 @@ impl BackupRepository {
     /// task starts cannot stop it, and in particular cannot stop it before its
     /// paired catalog transaction becomes durable - so the returned
     /// `PitrPurgeOutcome`, not the cancellation, is the report of what happened.
-    /// `purge_pitr` compacts the catalog and defers object deletion, so it has no
-    /// bounded streaming phase a check could sit between; it serializes with the
-    /// repository's other operations through `operation_lock`.
+    /// `purge_pitr` takes no cancellation token; it serializes with the
+    /// repository's other operations through `operation_lock`, and its outcome
+    /// already reports cleanup that stopped part way.
     pub fn purge_pitr_async(
         self: Arc<Self>,
         policy: crate::pitr_api::PitrRetentionPolicy,
