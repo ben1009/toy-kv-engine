@@ -1,4 +1,4 @@
-//! Dormant PITR source-spool accounting and seal-boundary coordination.
+//! PITR source-spool accounting and seal-boundary coordination.
 #![allow(dead_code)]
 
 use anyhow::{Result, ensure};

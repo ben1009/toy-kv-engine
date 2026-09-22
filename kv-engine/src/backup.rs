@@ -45,15 +45,86 @@ const REPOSITORY_ID_FILE: &str = "REPOSITORY_ID";
 const REPOSITORY_ID_TEMP_FILE: &str = "REPOSITORY_ID.tmp";
 const PITR_PURGE_TXN_FILE: &str = "PITR_PURGE_TXN";
 const PITR_PURGE_TXN_MAGIC: &[u8; 8] = b"TKVPTRTX";
-/// Staging names for the two catalogs a PITR purge replaces. They are deliberately
-/// not `BACKUP_CATALOG_LOG.purge.tmp`: `recover_catalog_successor` owns that name
-/// and validates whatever it finds there as a *count-retention* successor, which a
-/// PITR purge's successor can never be - it drops the backups retention released,
-/// and its `base_catalog_digest` names the catalog it replaces. A crash between the
-/// staging sync and the rename would otherwise leave a file recovery refuses, and
-/// the repository could not be opened again.
-const PITR_PURGE_BACKUP_TEMP_FILE: &str = "PITR_BACKUP_CATALOG_LOG.tmp";
-const PITR_PURGE_CATALOG_TEMP_FILE: &str = "PITR_CATALOG_LOG.purge.tmp";
+
+#[cfg(test)]
+static PITR_RESTORE_PUBLICATION_TEST_MODE: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashSet<String>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+
+/// Names one publication: the directory it publishes into, plus the staging and
+/// target names it moves between.
+///
+/// The fields are joined with NUL, which can appear in neither a path the kernel
+/// reports nor either name: `publish_pitr_restore_staging` builds a `CString`
+/// from both, so an interior NUL would have failed the rename regardless.
+#[cfg(test)]
+fn pitr_restore_publication_key(parent: &OwnedFd, staging: &str, target: &str) -> String {
+    let directory = std::fs::read_link(format!("/proc/self/fd/{}", parent.as_raw_fd()))
+        .expect("read the path of the restore root");
+
+    format!("{}\u{0}{staging}\u{0}{target}", directory.to_string_lossy())
+}
+
+/// Arms the injected publication outcome for one restore.
+///
+/// Keyed rather than held in a single slot: the tests in this binary run in
+/// parallel, and any other restore reaching `publish_pitr_restore_staging`
+/// would otherwise consume the armed mode - failing its own assertions while
+/// the test that armed it silently published for real. An armed key that never
+/// matches injects nothing and says nothing, so the arming test and the
+/// publication both derive the key here rather than each spelling it out.
+#[cfg(test)]
+fn arm_pitr_restore_publication(parent: &OwnedFd, staging: &str, target: &str) {
+    PITR_RESTORE_PUBLICATION_TEST_MODE
+        .lock()
+        .unwrap()
+        .insert(pitr_restore_publication_key(parent, staging, target));
+}
+
+#[cfg(test)]
+static PITR_PURGE_CLEANUP_FAILURE: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+static PITR_PURGE_PUBLICATION_FAILURE: std::sync::Mutex<Option<PathBuf>> =
+    std::sync::Mutex::new(None);
+
+/// The purge consumers match the armed path against the path the kernel reports
+/// for the purge root's descriptor (`/proc/self/fd`), which is resolved in full.
+/// Anything else never matches, and a match that never happens is silent: the
+/// injection is dropped and the purge runs for real while the arming test fails
+/// for reasons of its own.
+///
+/// The callers pass an absolute tempdir path, which the kernel reports unchanged,
+/// so this is a no-op for them - `open_directory_no_follow` rejects symlinked
+/// components, so no purge root can be reached through one. It holds the arming
+/// side to the shape the consumers compare against, which a relative path (say)
+/// would not.
+#[cfg(test)]
+fn resolved_repository_path(repository: &Path) -> PathBuf {
+    repository
+        .canonicalize()
+        .unwrap_or_else(|_| repository.to_path_buf())
+}
+
+#[cfg(test)]
+pub(crate) fn set_pitr_purge_cleanup_failure(repository: &Path) {
+    *PITR_PURGE_CLEANUP_FAILURE.lock().unwrap() = Some(resolved_repository_path(repository));
+}
+
+#[cfg(test)]
+pub(crate) fn set_pitr_purge_publication_failure(repository: &Path) {
+    *PITR_PURGE_PUBLICATION_FAILURE.lock().unwrap() = Some(resolved_repository_path(repository));
+}
+
+#[cfg(target_os = "linux")]
+enum PitrRestorePublication {
+    Durable,
+    PublishedButNotDurable(std::io::Error),
+    Unknown {
+        rename_error: std::io::Error,
+        revalidation_error: anyhow::Error,
+    },
+}
 pub type BackupId = u64;
 static OBJECT_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 #[cfg(all(test, target_os = "linux", feature = "chaos-testing"))]
@@ -110,6 +181,17 @@ pub(crate) struct RestoreCompatibility {
     vlog_format_version: Option<u16>,
     ttl_records_present: bool,
     serializable_at_capture: bool,
+}
+
+fn pitr_compatibility_digest(compatibility: &RestoreCompatibility) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(b"TOYKV-PITR-COMPATIBILITY-V1");
+    digest.update(compatibility.manifest_format_version.to_be_bytes());
+    digest.update([u8::from(compatibility.value_separation_enabled)]);
+    digest.update(compatibility.vlog_format_version.unwrap_or(0).to_be_bytes());
+    digest.update([u8::from(compatibility.ttl_records_present)]);
+    digest.update([u8::from(compatibility.serializable_at_capture)]);
+    digest.finalize().into()
 }
 
 fn is_zero(value: &u64) -> bool {
@@ -437,8 +519,8 @@ impl std::error::Error for RepositoryPublicationError {
 }
 
 #[derive(Debug)]
-struct RepositoryBootstrapPublicationError {
-    source: anyhow::Error,
+pub(crate) struct RepositoryBootstrapPublicationError {
+    pub(crate) source: anyhow::Error,
 }
 
 impl std::fmt::Display for RepositoryBootstrapPublicationError {
@@ -690,6 +772,15 @@ fn recover_pitr_purge_transaction(root: &OwnedFd) -> Result<()> {
         } == 0,
         std::io::Error::last_os_error()
     );
+    #[cfg(test)]
+    {
+        let actual = std::fs::read_link(format!("/proc/self/fd/{}", root.as_raw_fd()))?;
+        let mut configured = PITR_PURGE_PUBLICATION_FAILURE.lock().unwrap();
+        if configured.as_ref().is_some_and(|path| path == &actual) {
+            configured.take();
+            return Err(std::io::Error::other("injected paired-catalog fsync failure").into());
+        }
+    }
     fsync_fd(root)?;
     let descriptor_name = CString::new(PITR_PURGE_TXN_FILE)?;
     let result = unsafe { libc::unlinkat(root.as_raw_fd(), descriptor_name.as_ptr(), 0) };
@@ -697,19 +788,36 @@ fn recover_pitr_purge_transaction(root: &OwnedFd) -> Result<()> {
         result == 0 || std::io::Error::last_os_error().kind() == std::io::ErrorKind::NotFound,
         "failed to remove recovered PITR purge descriptor"
     );
-    // The staging the descriptor carried is what the renames above installed, and
-    // the descriptor is the only thing that can name it once that is done, so
-    // discard it here rather than leave it for a later crash to strand.
-    for name in [PITR_PURGE_BACKUP_TEMP_FILE, PITR_PURGE_CATALOG_TEMP_FILE] {
-        let name = CString::new(name)?;
-        let result = unsafe { libc::unlinkat(root.as_raw_fd(), name.as_ptr(), 0) };
-        ensure!(
-            result == 0 || std::io::Error::last_os_error().kind() == std::io::ErrorKind::NotFound,
-            "failed to discard recovered PITR purge staging: {}",
-            std::io::Error::last_os_error()
-        );
-    }
     fsync_fd(root)
+}
+
+#[cfg(target_os = "linux")]
+fn revalidate_pitr_purge_successors(
+    root: &OwnedFd,
+    backup_successor: &[u8],
+    pitr_successor: &[u8],
+) -> Result<(bool, bool)> {
+    let read = |name: &str| -> Result<Option<Vec<u8>>> {
+        match openat_no_follow(root, name, libc::O_RDONLY, 0) {
+            Ok(fd) => {
+                let mut bytes = Vec::new();
+                File::from(fd).read_to_end(&mut bytes)?;
+                Ok(Some(bytes))
+            }
+            Err(error)
+                if error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+            {
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
+    };
+    Ok((
+        read("BACKUP_CATALOG_LOG")?.is_some_and(|bytes| bytes == backup_successor),
+        read("PITR_CATALOG_LOG")?.is_some_and(|bytes| bytes == pitr_successor),
+    ))
 }
 
 #[cfg(target_os = "linux")]
@@ -1096,16 +1204,16 @@ impl BackupRepository {
 
     /// Returns sorted repository object names referenced by the given backups.
     ///
-    /// Retention that is not a plain count - PITR retention keeps every non-PITR
-    /// backup plus the ones its chain needs - has to name the backups it kept, or
-    /// the object set and the directory set disagree about what survives.
+    /// The ids are the ones retention actually keeps, which is not the same set a
+    /// newest-N count yields: PITR retention also keeps every non-PITR backup, so
+    /// a count-based reclaim takes the objects of a backup that survives.
     pub fn retained_object_names_for(&self, ids: &[u64]) -> Result<Vec<String>> {
         let _operation_guard = self.operation_lock.lock();
         let backups =
             openat_no_follow(&self.root, "backups", libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
         let mut names = HashSet::new();
-        for &id in ids {
-            self.verify(id)?;
+        for id in ids {
+            self.verify(*id)?;
             let backup = openat_no_follow(
                 &backups,
                 &id.to_string(),
@@ -1300,6 +1408,72 @@ impl BackupRepository {
                 Ok(error) => Ok(Some(error)),
                 Err(error) => Err(error),
             },
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn publish_pitr_restore_staging(
+        parent: &OwnedFd,
+        staging: &str,
+        target: &str,
+    ) -> Result<PitrRestorePublication> {
+        #[cfg(test)]
+        if PITR_RESTORE_PUBLICATION_TEST_MODE
+            .lock()
+            .unwrap()
+            .remove(&pitr_restore_publication_key(parent, staging, target))
+        {
+            return Ok(PitrRestorePublication::Unknown {
+                rename_error: std::io::Error::other("injected PITR restore rename failure"),
+                revalidation_error: anyhow!("injected PITR restore revalidation failure"),
+            });
+        }
+        let from = CString::new(staging)?;
+        let to = CString::new(target)?;
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_renameat2,
+                parent.as_raw_fd(),
+                from.as_ptr(),
+                parent.as_raw_fd(),
+                to.as_ptr(),
+                libc::RENAME_NOREPLACE,
+            )
+        };
+        if result != 0 {
+            let rename_error = std::io::Error::last_os_error();
+            // `RENAME_NOREPLACE` refuses to replace, so `EEXIST` means the target
+            // was already there and nothing was moved - the presence it explains
+            // is someone else's, not this rename's. Reading that as a publication
+            // would report a restore that never happened. Any other errno leaves
+            // the rename's fate unknown, and only then does the target's presence
+            // say it landed.
+            if rename_error.kind() == std::io::ErrorKind::AlreadyExists {
+                return Err(rename_error.into());
+            }
+            return match openat_no_follow(parent, target, libc::O_RDONLY | libc::O_DIRECTORY, 0) {
+                Ok(_) => Ok(PitrRestorePublication::PublishedButNotDurable(rename_error)),
+                Err(error)
+                    if error
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+                {
+                    Err(rename_error.into())
+                }
+                Err(revalidation_error) => Ok(PitrRestorePublication::Unknown {
+                    rename_error,
+                    revalidation_error,
+                }),
+            };
+        }
+        match fsync_fd(parent) {
+            Ok(()) => Ok(PitrRestorePublication::Durable),
+            Err(error) => Ok(PitrRestorePublication::PublishedButNotDurable(match error
+                .downcast::<std::io::Error>(
+            ) {
+                Ok(error) => error,
+                Err(error) => std::io::Error::other(error),
+            })),
         }
     }
 
@@ -1894,6 +2068,89 @@ impl BackupRepository {
     }
 
     #[cfg(target_os = "linux")]
+    pub(crate) fn pitr_storage_accounting(&self) -> Result<(u64, u64)> {
+        let _operation_guard = self.operation_lock.lock();
+        self.ensure_usable()?;
+        let catalog_bytes =
+            match openat_no_follow(&self.root, "PITR_CATALOG_LOG", libc::O_RDONLY, 0) {
+                Ok(fd) => {
+                    let mut bytes = Vec::new();
+                    File::from(fd).read_to_end(&mut bytes)?;
+                    bytes
+                }
+                Err(error)
+                    if error
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+                {
+                    Vec::new()
+                }
+                Err(error) => return Err(error),
+            };
+        let replay = crate::pitr_catalog::replay_catalog(&catalog_bytes)?;
+        let mut referenced = HashSet::new();
+        for record in replay.records {
+            let segments = match record {
+                crate::pitr_catalog::PitrCatalogRecord::CommitSegment { metadata } => {
+                    vec![metadata]
+                }
+                crate::pitr_catalog::PitrCatalogRecord::RetentionSnapshot(snapshot) => {
+                    snapshot.segments
+                }
+                crate::pitr_catalog::PitrCatalogRecord::CoverageBreak(_) => Vec::new(),
+            };
+            for metadata in segments {
+                referenced.insert(crate::pitr_archive::archive_object_name(
+                    metadata.key.timeline_id,
+                    metadata.key.archive_epoch_id,
+                    metadata.key.segment_id,
+                    crate::pitr_archive::ArchiveObjectKind::Wal,
+                    metadata.wal_digest,
+                ));
+                referenced.insert(crate::pitr_archive::archive_object_name(
+                    metadata.key.timeline_id,
+                    metadata.key.archive_epoch_id,
+                    metadata.key.segment_id,
+                    crate::pitr_archive::ArchiveObjectKind::Seal,
+                    metadata.seal_digest,
+                ));
+            }
+        }
+        let wal_dir =
+            match openat_no_follow(&self.root, "wal", libc::O_RDONLY | libc::O_DIRECTORY, 0) {
+                Ok(directory) => directory,
+                Err(error)
+                    if error
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+                {
+                    return Ok((0, 0));
+                }
+                Err(error) => return Err(error),
+            };
+        let mut staging = 0_u64;
+        let mut orphan = 0_u64;
+        for entry in std::fs::read_dir(format!("/proc/self/fd/{}", wal_dir.as_raw_fd()))? {
+            let entry = entry?;
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            let Ok(file) = openat_no_follow(&wal_dir, &name, libc::O_RDONLY, 0) else {
+                continue;
+            };
+            let bytes = File::from(file).metadata()?.len();
+            if name.starts_with('.') && name.contains(".tmp-") {
+                staging = staging.saturating_add(bytes);
+            } else if (name.ends_with(".wal") || name.ends_with(".seal"))
+                && !referenced.contains(&name)
+            {
+                orphan = orphan.saturating_add(bytes);
+            }
+        }
+        Ok((staging, orphan))
+    }
+
+    #[cfg(target_os = "linux")]
     pub(crate) fn has_pitr_base(
         &self,
         timeline_id: [u8; 16],
@@ -2280,6 +2537,7 @@ impl BackupRepository {
             )
         });
         segments.dedup_by_key(|metadata| metadata.key);
+        let all_segments = segments.clone();
         breaks.sort_by_key(|break_record| {
             (
                 break_record.timeline_id.0,
@@ -2419,6 +2677,42 @@ impl BackupRepository {
         let successor = crate::pitr_catalog::encode_catalog(&[
             crate::pitr_catalog::PitrCatalogRecord::RetentionSnapshot(snapshot),
         ])?;
+        let retained_segment_keys = segments
+            .iter()
+            .map(|metadata| metadata.key)
+            .collect::<HashSet<_>>();
+        let removed_segments = all_segments
+            .iter()
+            .filter(|metadata| !retained_segment_keys.contains(&metadata.key))
+            .cloned()
+            .collect::<Vec<_>>();
+        let planned_reclaim_segments = removed_segments.len() as u64;
+        let planning_wal_dir =
+            openat_no_follow(&self.root, "wal", libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
+        let mut planned_reclaim_bytes = 0_u64;
+        for metadata in &removed_segments {
+            for name in [
+                crate::pitr_archive::archive_object_name(
+                    metadata.key.timeline_id,
+                    metadata.key.archive_epoch_id,
+                    metadata.key.segment_id,
+                    crate::pitr_archive::ArchiveObjectKind::Wal,
+                    metadata.wal_digest,
+                ),
+                crate::pitr_archive::archive_object_name(
+                    metadata.key.timeline_id,
+                    metadata.key.archive_epoch_id,
+                    metadata.key.segment_id,
+                    crate::pitr_archive::ArchiveObjectKind::Seal,
+                    metadata.seal_digest,
+                ),
+            ] {
+                if let Ok(file) = openat_no_follow(&planning_wal_dir, &name, libc::O_RDONLY, 0) {
+                    planned_reclaim_bytes =
+                        planned_reclaim_bytes.saturating_add(File::from(file).metadata()?.len());
+                }
+            }
+        }
         let descriptor_name = CString::new(PITR_PURGE_TXN_FILE)?;
         let descriptor_fd = unsafe {
             libc::openat(
@@ -2440,163 +2734,230 @@ impl BackupRepository {
         descriptor.write_all(&successor)?;
         descriptor.sync_all()?;
         fsync_fd(&self.root)?;
-        let temp_name = CString::new(PITR_PURGE_CATALOG_TEMP_FILE)?;
-        let target_name = CString::new("PITR_CATALOG_LOG")?;
-        let temp_fd = unsafe {
-            libc::openat(
-                self.root.as_raw_fd(),
-                temp_name.as_ptr(),
-                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW,
-                0o600,
-            )
+        let unpublished_info = crate::pitr_api::PitrPurgeInfo {
+            retained_interval_count,
+            planned_reclaim_segments,
+            planned_reclaim_bytes,
+            deleted_segments: None,
+            deleted_bytes: None,
+            oldest_recoverable_commit_ts: oldest_advertised_commit_ts,
         };
-        ensure!(temp_fd >= 0, std::io::Error::last_os_error());
-        let mut temp = unsafe { File::from_raw_fd(temp_fd) };
-        temp.write_all(&successor)?;
-        temp.sync_all()?;
-        let replaced = unsafe {
-            libc::renameat(
-                self.root.as_raw_fd(),
-                temp_name.as_ptr(),
-                self.root.as_raw_fd(),
-                target_name.as_ptr(),
-            )
-        };
-        ensure!(replaced == 0, std::io::Error::last_os_error());
-        fsync_fd(&self.root)?;
-        // Publish the backup catalog too, and do it while the descriptor still
-        // exists: the descriptor is the successor's only other carrier, and the
-        // reclamation below unlinks directories that the old catalog commits, so
-        // a repository reopened with the stale one cannot validate its backups.
-        let backup_temp_name = CString::new(PITR_PURGE_BACKUP_TEMP_FILE)?;
-        let backup_target_name = CString::new("BACKUP_CATALOG_LOG")?;
-        let backup_temp_fd = unsafe {
-            libc::openat(
-                self.root.as_raw_fd(),
-                backup_temp_name.as_ptr(),
-                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW,
-                0o600,
-            )
-        };
-        ensure!(backup_temp_fd >= 0, std::io::Error::last_os_error());
-        let mut backup_temp = unsafe { File::from_raw_fd(backup_temp_fd) };
-        backup_temp.write_all(&backup_successor)?;
-        backup_temp.sync_all()?;
-        #[cfg(feature = "chaos-testing")]
-        crate::chaos::failpoint::fail_point!("pitr.purge.after_backup_temp_sync");
-        let backup_replaced = unsafe {
-            libc::renameat(
-                self.root.as_raw_fd(),
-                backup_temp_name.as_ptr(),
-                self.root.as_raw_fd(),
-                backup_target_name.as_ptr(),
-            )
-        };
-        ensure!(backup_replaced == 0, std::io::Error::last_os_error());
-        fsync_fd(&self.root)?;
-        let result = unsafe { libc::unlinkat(self.root.as_raw_fd(), descriptor_name.as_ptr(), 0) };
-        ensure!(
-            result == 0 || std::io::Error::last_os_error().kind() == std::io::ErrorKind::NotFound,
-            "failed to remove PITR purge transaction descriptor"
-        );
-        fsync_fd(&self.root)?;
-        let retained_set = retained_ids.iter().copied().collect::<HashSet<_>>();
-        let backups_dir =
-            openat_no_follow(&self.root, "backups", libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
-        let backup_listing =
-            std::fs::read_dir(format!("/proc/self/fd/{}", backups_dir.as_raw_fd()))?;
-        for entry in backup_listing {
-            let entry = entry?;
-            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
-                continue;
+        if let Err(error) = recover_pitr_purge_transaction(&self.root) {
+            let fsync_error = into_io_error(error);
+            return match revalidate_pitr_purge_successors(&self.root, &backup_successor, &successor)
+            {
+                Ok((true, true)) => Ok(
+                    crate::pitr_api::PitrPurgeOutcome::CatalogsPublishedButNotDurable {
+                        info: unpublished_info,
+                        error: fsync_error,
+                    },
+                ),
+                Ok((false, false)) => Err(fsync_error.into()),
+                Ok(visibility) => Ok(crate::pitr_api::PitrPurgeOutcome::PublicationUnknown {
+                    info: unpublished_info,
+                    fsync_error,
+                    revalidation_error: anyhow!(
+                        "paired PITR purge publication is mixed: backup={}, pitr={}",
+                        visibility.0,
+                        visibility.1
+                    ),
+                }),
+                Err(revalidation_error) => {
+                    Ok(crate::pitr_api::PitrPurgeOutcome::PublicationUnknown {
+                        info: unpublished_info,
+                        fsync_error,
+                        revalidation_error,
+                    })
+                }
             };
-            let Ok(id) = name.parse::<u64>() else {
-                continue;
-            };
-            if retained_set.contains(&id) {
-                continue;
-            }
-            remove_backup_directory(&backups_dir, id)?;
         }
-        fsync_fd(&backups_dir)?;
-        let objects_dir =
-            openat_no_follow(&self.root, "objects", libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
-        for name in unreferenced_backup_objects {
-            validate_object_before_reclaim(&objects_dir, &name)?;
-            let name_c = CString::new(name)?;
-            let result = unsafe { libc::unlinkat(objects_dir.as_raw_fd(), name_c.as_ptr(), 0) };
-            ensure!(
-                result == 0
-                    || std::io::Error::last_os_error().kind() == std::io::ErrorKind::NotFound,
-                "failed to remove unreferenced backup object"
+        let mut deleted_bytes = 0_u64;
+        let mut reclaim_object_owner = std::collections::HashMap::new();
+        for metadata in &removed_segments {
+            reclaim_object_owner.insert(
+                crate::pitr_archive::archive_object_name(
+                    metadata.key.timeline_id,
+                    metadata.key.archive_epoch_id,
+                    metadata.key.segment_id,
+                    crate::pitr_archive::ArchiveObjectKind::Wal,
+                    metadata.wal_digest,
+                ),
+                metadata.key,
+            );
+            reclaim_object_owner.insert(
+                crate::pitr_archive::archive_object_name(
+                    metadata.key.timeline_id,
+                    metadata.key.archive_epoch_id,
+                    metadata.key.segment_id,
+                    crate::pitr_archive::ArchiveObjectKind::Seal,
+                    metadata.seal_digest,
+                ),
+                metadata.key,
             );
         }
-        fsync_fd(&objects_dir)?;
-        let wal_dir = openat_no_follow(&self.root, "wal", libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
-        let retained_objects = segments
-            .iter()
-            .flat_map(|metadata| {
-                [
-                    crate::pitr_archive::archive_object_name(
-                        metadata.key.timeline_id,
-                        metadata.key.archive_epoch_id,
-                        metadata.key.segment_id,
-                        crate::pitr_archive::ArchiveObjectKind::Wal,
-                        metadata.wal_digest,
-                    ),
-                    crate::pitr_archive::archive_object_name(
-                        metadata.key.timeline_id,
-                        metadata.key.archive_epoch_id,
-                        metadata.key.segment_id,
-                        crate::pitr_archive::ArchiveObjectKind::Seal,
-                        metadata.seal_digest,
-                    ),
-                ]
-            })
-            .collect::<std::collections::HashSet<_>>();
-        let mut deleted_bytes = 0_u64;
-        let wal_listing = std::fs::read_dir(format!("/proc/self/fd/{}", wal_dir.as_raw_fd()))?;
-        for entry in wal_listing {
-            let entry = entry?;
-            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
-                continue;
-            };
-            if retained_objects.contains(&name)
-                || !(name.ends_with(".wal") || name.ends_with(".seal"))
+        let mut deleted_segment_parts =
+            std::collections::HashMap::<crate::pitr_catalog::SegmentKey, u8>::new();
+        let cleanup_result = (|| -> Result<u64> {
+            #[cfg(test)]
             {
-                continue;
+                let actual =
+                    std::fs::read_link(format!("/proc/self/fd/{}", self.root.as_raw_fd()))?;
+                let mut configured = PITR_PURGE_CLEANUP_FAILURE.lock().unwrap();
+                if configured.as_ref().is_some_and(|path| path == &actual) {
+                    configured.take();
+                    anyhow::bail!("injected PITR purge cleanup failure");
+                }
             }
-            let file = match openat_no_follow(&wal_dir, &name, libc::O_RDONLY, 0) {
-                Ok(file) => file,
-                Err(error)
-                    if error
-                        .downcast_ref::<std::io::Error>()
-                        .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+            let retained_set = retained_ids.iter().copied().collect::<HashSet<_>>();
+            let backups_dir =
+                openat_no_follow(&self.root, "backups", libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
+            let backup_listing =
+                std::fs::read_dir(format!("/proc/self/fd/{}", backups_dir.as_raw_fd()))?;
+            for entry in backup_listing {
+                let entry = entry?;
+                let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                    continue;
+                };
+                let Ok(id) = name.parse::<u64>() else {
+                    continue;
+                };
+                if retained_set.contains(&id) {
+                    continue;
+                }
+                remove_backup_directory(&backups_dir, id)?;
+            }
+            fsync_fd(&backups_dir)?;
+            let objects_dir =
+                openat_no_follow(&self.root, "objects", libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
+            for name in unreferenced_backup_objects {
+                validate_object_before_reclaim(&objects_dir, &name)?;
+                let name_c = CString::new(name.as_str())?;
+                let result = unsafe { libc::unlinkat(objects_dir.as_raw_fd(), name_c.as_ptr(), 0) };
+                ensure!(
+                    result == 0
+                        || std::io::Error::last_os_error().kind() == std::io::ErrorKind::NotFound,
+                    "failed to remove unreferenced backup object"
+                );
+            }
+            fsync_fd(&objects_dir)?;
+            let wal_dir =
+                openat_no_follow(&self.root, "wal", libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
+            let retained_objects = segments
+                .iter()
+                .flat_map(|metadata| {
+                    [
+                        crate::pitr_archive::archive_object_name(
+                            metadata.key.timeline_id,
+                            metadata.key.archive_epoch_id,
+                            metadata.key.segment_id,
+                            crate::pitr_archive::ArchiveObjectKind::Wal,
+                            metadata.wal_digest,
+                        ),
+                        crate::pitr_archive::archive_object_name(
+                            metadata.key.timeline_id,
+                            metadata.key.archive_epoch_id,
+                            metadata.key.segment_id,
+                            crate::pitr_archive::ArchiveObjectKind::Seal,
+                            metadata.seal_digest,
+                        ),
+                    ]
+                })
+                .collect::<std::collections::HashSet<_>>();
+            let wal_listing = std::fs::read_dir(format!("/proc/self/fd/{}", wal_dir.as_raw_fd()))?;
+            for entry in wal_listing {
+                let entry = entry?;
+                let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                    continue;
+                };
+                if retained_objects.contains(&name)
+                    || !(name.ends_with(".wal") || name.ends_with(".seal"))
                 {
                     continue;
                 }
-                Err(error) => return Err(error),
-            };
-            let size = std::fs::File::from(file).metadata()?.len();
-            let name_c = CString::new(name)?;
-            let result = unsafe { libc::unlinkat(wal_dir.as_raw_fd(), name_c.as_ptr(), 0) };
-            if result == 0 {
-                deleted_bytes = deleted_bytes.saturating_add(size);
-            } else if std::io::Error::last_os_error().kind() != std::io::ErrorKind::NotFound {
-                return Err(std::io::Error::last_os_error().into());
+                let file = match openat_no_follow(&wal_dir, &name, libc::O_RDONLY, 0) {
+                    Ok(file) => file,
+                    Err(error)
+                        if error
+                            .downcast_ref::<std::io::Error>()
+                            .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+                    {
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                };
+                let size = std::fs::File::from(file).metadata()?.len();
+                let name_c = CString::new(name.as_str())?;
+                let result = unsafe { libc::unlinkat(wal_dir.as_raw_fd(), name_c.as_ptr(), 0) };
+                if result == 0 {
+                    deleted_bytes = deleted_bytes.saturating_add(size);
+                    if let Some(owner) = reclaim_object_owner.get(&name) {
+                        *deleted_segment_parts.entry(*owner).or_default() += 1;
+                    }
+                } else if std::io::Error::last_os_error().kind() != std::io::ErrorKind::NotFound {
+                    return Err(std::io::Error::last_os_error().into());
+                }
             }
+            fsync_fd(&wal_dir)?;
+            let deleted_segments = removed_segments
+                .iter()
+                .filter(|metadata| {
+                    [
+                        crate::pitr_archive::archive_object_name(
+                            metadata.key.timeline_id,
+                            metadata.key.archive_epoch_id,
+                            metadata.key.segment_id,
+                            crate::pitr_archive::ArchiveObjectKind::Wal,
+                            metadata.wal_digest,
+                        ),
+                        crate::pitr_archive::archive_object_name(
+                            metadata.key.timeline_id,
+                            metadata.key.archive_epoch_id,
+                            metadata.key.segment_id,
+                            crate::pitr_archive::ArchiveObjectKind::Seal,
+                            metadata.seal_digest,
+                        ),
+                    ]
+                    .iter()
+                    .all(|name| {
+                        openat_no_follow(&wal_dir, name, libc::O_RDONLY, 0)
+                            .err()
+                            .and_then(|error| error.downcast::<std::io::Error>().ok())
+                            .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+                    })
+                })
+                .count() as u64;
+            Ok(deleted_segments)
+        })();
+        // The post-cleanup count is the authoritative one for a purge that ran to
+        // completion: a segment whose WAL or seal was already gone - one an earlier
+        // crash interrupted - is deleted either way, and counting only this run's
+        // successful `unlinkat` calls would under-report it, which is what made the
+        // two disagree. A purge whose cleanup failed never computed that count, so
+        // it reports what the ledger saw, which is the honest "nothing was
+        // reclaimed" for a cleanup that stopped early.
+        let ledger_segments = deleted_segment_parts
+            .values()
+            .filter(|parts| **parts == 2)
+            .count() as u64;
+        let info = |deleted_segments: u64| crate::pitr_api::PitrPurgeInfo {
+            retained_interval_count,
+            planned_reclaim_segments,
+            planned_reclaim_bytes,
+            deleted_segments: Some(deleted_segments),
+            deleted_bytes: Some(deleted_bytes),
+            oldest_recoverable_commit_ts: oldest_advertised_commit_ts,
+        };
+        match cleanup_result {
+            Ok(deleted_segments) => Ok(crate::pitr_api::PitrPurgeOutcome::Purged(info(
+                deleted_segments,
+            ))),
+            Err(error) => Ok(
+                crate::pitr_api::PitrPurgeOutcome::CatalogsDurableCleanupIncomplete {
+                    info: info(ledger_segments),
+                    error: into_io_error(error),
+                },
+            ),
         }
-        fsync_fd(&wal_dir)?;
-        Ok(crate::pitr_api::PitrPurgeOutcome::Purged(
-            crate::pitr_api::PitrPurgeInfo {
-                retained_interval_count,
-                planned_reclaim_segments: 0,
-                planned_reclaim_bytes: deleted_bytes,
-                deleted_segments: Some(0),
-                deleted_bytes: Some(deleted_bytes),
-                oldest_recoverable_commit_ts: oldest_advertised_commit_ts,
-            },
-        ))
     }
 
     /// Restores the newest usable retained PITR base and replays its WAL chain.
@@ -3036,7 +3397,30 @@ impl BackupRepository {
         std::fs::write(&recovery_path, recovery_bytes)?;
         std::fs::File::open(&recovery_path)?.sync_all()?;
         std::fs::File::open(&temp_path)?.sync_all()?;
-        let published = Self::publish_restore_staging(&parent_fd, &temp_name, target_name)?;
+        let publication =
+            match Self::publish_pitr_restore_staging(&parent_fd, &temp_name, target_name) {
+                Ok(publication) => publication,
+                Err(error) => {
+                    // The rename did not happen - every `Err` out of
+                    // `publish_pitr_restore_staging` precedes a successful
+                    // `renameat2` - so the staging this call built is still here and
+                    // holds the only copy. It is discarded anyway: this is a hard
+                    // failure the caller has to redo the restore for, and the name
+                    // is derived from this process's id, so a retry would reuse it
+                    // and trip the "staging path already exists" guard above - the
+                    // one failure a caller cannot act on.
+                    //
+                    // The `Ok` arms deliberately keep it. `PublishedButNotDurable`
+                    // and `Unknown` both report a rename that did not happen, but
+                    // they leave the publication's fate to the caller, who may need
+                    // the staging to finish or inspect the restore - deleting the
+                    // only copy of a database on an outcome described as uncertain
+                    // would be the worse failure. `pitr_restore_unknown_publication_
+                    // retains_staging_identity` pins exactly that.
+                    let _ = std::fs::remove_dir_all(&temp_path);
+                    return Err(error);
+                }
+            };
         let info = crate::pitr_api::RestoreToInfo {
             requested_target,
             resolved_commit_ts: last_commit_ts,
@@ -3046,10 +3430,21 @@ impl BackupRepository {
             replayed_batches,
             replayed_bytes,
         };
-        if let Some(error) = published {
-            Ok(crate::pitr_api::RestoreToOutcome::PublishedButNotDurable { info, error })
-        } else {
-            Ok(crate::pitr_api::RestoreToOutcome::Restored(info))
+        match publication {
+            PitrRestorePublication::Durable => {
+                Ok(crate::pitr_api::RestoreToOutcome::Restored(info))
+            }
+            PitrRestorePublication::PublishedButNotDurable(error) => {
+                Ok(crate::pitr_api::RestoreToOutcome::PublishedButNotDurable { info, error })
+            }
+            PitrRestorePublication::Unknown {
+                rename_error,
+                revalidation_error,
+            } => Ok(crate::pitr_api::RestoreToOutcome::PublicationUnknown {
+                info,
+                rename_error,
+                revalidation_error,
+            }),
         }
     }
 
@@ -3674,9 +4069,11 @@ impl BackupRepository {
         &mut self,
         backup: &[u8],
         snapshot: &[u8],
-        pitr_base: crate::pitr_base::PitrBaseMetadata,
+        mut pitr_base: crate::pitr_base::PitrBaseMetadata,
         compatibility: RestoreCompatibility,
     ) -> Result<u64> {
+        pitr_base.compatibility_digest = pitr_compatibility_digest(&compatibility);
+        pitr_base.validate()?;
         self.create_backup_with_objects(
             backup,
             snapshot,
@@ -4542,7 +4939,7 @@ impl crate::lsm_storage::LsmStorageInner {
         cancelled: Option<&AtomicBool>,
         decision: Option<&Mutex<bool>>,
         decision_token: Option<u64>,
-        pitr_base: Option<crate::pitr_base::PitrBaseMetadata>,
+        mut pitr_base: Option<crate::pitr_base::PitrBaseMetadata>,
     ) -> Result<BackupInfo> {
         self.ensure_manifest_v7()?;
         if let Some(base) = pitr_base.as_ref() {
@@ -4653,6 +5050,10 @@ impl crate::lsm_storage::LsmStorageInner {
             ttl_records_present: capture.has_ttl_entries,
             serializable_at_capture: self.options.serializable,
         };
+        if let Some(base) = &mut pitr_base {
+            base.compatibility_digest = pitr_compatibility_digest(&compatibility);
+            base.validate()?;
+        }
         let id = repository.create_backup_with_objects(
             &snapshot,
             &snapshot,
@@ -4839,6 +5240,12 @@ fn validate_backup_objects(envelope: &BackupMetadata) -> Result<()> {
                     .then_some(crate::vlog::VLOG_FORMAT_VERSION),
             "invalid backup vLog compatibility metadata"
         );
+        if let Some(base) = &envelope.pitr_base {
+            ensure!(
+                base.compatibility_digest == pitr_compatibility_digest(compatibility),
+                "PITR base compatibility digest mismatch"
+            );
+        }
     }
     if envelope.version < 2 {
         ensure!(
@@ -6465,6 +6872,40 @@ fn crc32(bytes: &[u8]) -> u32 {
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn purge_hooks_arm_with_the_path_the_purge_root_reports() {
+        let dir = tempfile::tempdir().unwrap();
+        let repository = dir.path().join("repository");
+        std::fs::create_dir(&repository).unwrap();
+        let through_symlink = dir.path().join("through-symlink");
+        std::os::unix::fs::symlink(&repository, &through_symlink).unwrap();
+        let kernel_path = std::fs::canonicalize(&repository).unwrap();
+        assert_ne!(
+            kernel_path, through_symlink,
+            "the setup must not be a no-op"
+        );
+
+        // Arm through the setters and read the slot back, so this pins what the
+        // purge consumers actually compare against. Arming with the symlink path
+        // would leave an entry that can never match, and the injection would go
+        // missing at purge time without a word.
+        set_pitr_purge_cleanup_failure(&through_symlink);
+        set_pitr_purge_publication_failure(&through_symlink);
+        assert_eq!(
+            PITR_PURGE_CLEANUP_FAILURE.lock().unwrap().clone(),
+            Some(kernel_path.clone())
+        );
+        assert_eq!(
+            PITR_PURGE_PUBLICATION_FAILURE.lock().unwrap().clone(),
+            Some(kernel_path)
+        );
+
+        // The slots are process-global; leave nothing for another test to match.
+        PITR_PURGE_CLEANUP_FAILURE.lock().unwrap().take();
+        PITR_PURGE_PUBLICATION_FAILURE.lock().unwrap().take();
+    }
+
     fn committed(outcome: CreateBackupOutcome) -> BackupInfo {
         let CreateBackupOutcome::Committed(info) = outcome else {
             panic!("expected committed backup outcome");
@@ -6537,7 +6978,12 @@ mod tests {
             serializable_at_capture: false,
         };
         let id = repository
-            .create_backup_with_pitr_base(b"backup", b"snapshot", base.clone(), compatibility)
+            .create_backup_with_pitr_base(
+                b"backup",
+                b"snapshot",
+                base.clone(),
+                compatibility.clone(),
+            )
             .unwrap();
         let bytes = std::fs::read(
             repository_path
@@ -6547,7 +6993,9 @@ mod tests {
         )
         .unwrap();
         let metadata: BackupMetadata = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(metadata.pitr_base, Some(base));
+        let mut expected_base = base;
+        expected_base.compatibility_digest = pitr_compatibility_digest(&compatibility);
+        assert_eq!(metadata.pitr_base, Some(expected_base));
     }
 
     #[cfg(target_os = "linux")]
@@ -6760,6 +7208,55 @@ mod tests {
             "unexpected error: {error}"
         );
         engine.close().unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pitr_restore_unknown_publication_retains_staging_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("staging")).unwrap();
+        let parent = open_directory_no_follow(dir.path()).unwrap();
+        arm_pitr_restore_publication(&parent, "staging", "destination");
+        let outcome =
+            BackupRepository::publish_pitr_restore_staging(&parent, "staging", "destination")
+                .unwrap();
+        assert!(matches!(outcome, PitrRestorePublication::Unknown { .. }));
+        assert!(dir.path().join("staging").is_dir());
+        assert!(!dir.path().join("destination").exists());
+    }
+
+    /// A `renameat2(RENAME_NOREPLACE)` that fails with `EEXIST` moved nothing, so the
+    /// target it finds is somebody else's - the publication has to be reported as a
+    /// failure rather than inferred from that presence. Reading it as a publication
+    /// is what the arm this pins exists to prevent.
+    ///
+    /// It exercises the real syscall rather than the injected test mode, so it never
+    /// arms `arm_pitr_restore_publication` and never takes that early return.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pitr_restore_reports_an_existing_target_as_a_failed_publication() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("staging")).unwrap();
+        std::fs::create_dir(dir.path().join("destination")).unwrap();
+        let parent = open_directory_no_follow(dir.path()).unwrap();
+        let error =
+            match BackupRepository::publish_pitr_restore_staging(&parent, "staging", "destination")
+            {
+                Ok(_) => panic!("an existing target has to fail the publication, not report one"),
+                Err(error) => error,
+            };
+        assert_eq!(
+            error
+                .downcast_ref::<std::io::Error>()
+                .expect("the publication failure is an io error")
+                .kind(),
+            std::io::ErrorKind::AlreadyExists,
+            "an existing target has to be reported as the failed rename it is"
+        );
+        // Nothing moved: the staging is intact and the destination is the one that
+        // was already there, not a rename of the staging.
+        assert!(dir.path().join("staging").is_dir());
+        assert!(dir.path().join("destination").is_dir());
     }
 
     #[cfg(feature = "chaos-testing")]
@@ -7135,100 +7632,6 @@ mod tests {
         )
         .unwrap();
         assert!(BackupRepository::open(dir.path().join("repository")).is_err());
-        scenario.teardown();
-    }
-
-    /// A PITR purge stages both catalogs it replaces, and a crash between the
-    /// staging sync and the rename has to leave a repository that still opens.
-    ///
-    /// The backup catalog is the one at risk: its staging name must not be the one
-    /// `recover_catalog_successor` owns, because that path validates whatever it
-    /// finds there as a *count-retention* successor - same committed set, base
-    /// digest equal to the primary it replaces - and a PITR purge's successor is
-    /// neither, so recovery refuses it and the repository cannot be opened again.
-    #[cfg(all(feature = "chaos-testing", target_os = "linux"))]
-    #[test]
-    fn failpoint_pitr_purge_crash_between_staging_and_rename_still_opens() {
-        use crate::chaos::failpoint::{self, FailScenario};
-        let _test_lock = BACKUP_FAILPOINT_TEST_LOCK.lock();
-        let scenario = FailScenario::setup();
-        let dir = tempfile::tempdir().unwrap();
-        let parent = open_directory_no_follow(dir.path()).unwrap();
-        bootstrap_repository(&parent, "repository").unwrap();
-        let repository_path = dir.path().join("repository");
-        let options = crate::lsm_storage::LsmStorageOptions {
-            enable_wal: true,
-            ..crate::lsm_storage::LsmStorageOptions::default_for_test()
-        };
-        let engine = crate::lsm_storage::KvEngine::open(dir.path().join("db"), options).unwrap();
-        engine
-            .enable_pitr(crate::pitr_api::PitrOptions {
-                repository: repository_path.clone(),
-                config: crate::pitr_api::PersistedPitrConfig {
-                    archive_interval: std::time::Duration::from_secs(3600),
-                    max_segment_bytes: 1 << 20,
-                    max_unarchived_bytes: 1 << 20,
-                    max_source_spool_bytes: 2 << 20,
-                },
-                runtime: crate::pitr_api::PitrRuntimeOptions::default(),
-            })
-            .unwrap();
-        // Two bases, so retention has one to release and the successor it stages is
-        // not the count-retention successor `recover_catalog_successor` expects.
-        engine.put(b"one", b"value").unwrap();
-        engine
-            .create_backup(BackupOptions {
-                repository: repository_path.clone(),
-                use_hard_links: false,
-            })
-            .unwrap();
-        engine.put(b"two", b"value").unwrap();
-        engine
-            .create_backup(BackupOptions {
-                repository: repository_path.clone(),
-                use_hard_links: false,
-            })
-            .unwrap();
-        engine.close().unwrap();
-        drop(engine);
-
-        let repository = BackupRepository::open(&repository_path).unwrap();
-        failpoint::cfg("pitr.purge.after_backup_temp_sync", "panic").unwrap();
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            repository
-                .purge_pitr(crate::pitr_api::PitrRetentionPolicy {
-                    minimum_window: std::time::Duration::from_secs(60),
-                    retain_timelines: std::num::NonZeroUsize::new(1).unwrap(),
-                    retain_base_backups: std::num::NonZeroUsize::new(1).unwrap(),
-                })
-                .unwrap();
-        }));
-        assert!(
-            result.is_err(),
-            "the failpoint has to interrupt the purge after it stages the backup catalog"
-        );
-        failpoint::cfg("pitr.purge.after_backup_temp_sync", "off").unwrap();
-        drop(repository);
-
-        // The invariant first: whatever the crash left behind, the repository has to
-        // open. A staged successor under the name recovery owns fails right here,
-        // because that path validates it as a count-retention successor.
-        let reopened = BackupRepository::open(&repository_path).unwrap_or_else(|error| {
-            panic!("a purge interrupted between staging and rename must still open: {error:?}")
-        });
-        let staged = repository_path.join(PITR_PURGE_BACKUP_TEMP_FILE);
-        assert!(
-            !repository_path
-                .join("BACKUP_CATALOG_LOG.purge.tmp")
-                .exists(),
-            "the staged successor must not sit under the name recovery owns"
-        );
-        assert!(
-            !staged.exists(),
-            "recovery has to discard the staging whose rename it completed"
-        );
-        assert!(!repository_path.join(PITR_PURGE_TXN_FILE).exists());
-        drop(reopened);
         scenario.teardown();
     }
 

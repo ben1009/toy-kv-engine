@@ -1,4 +1,4 @@
-//! Dormant PITR catalog v1 framing, canonical encoding, and replay validation.
+//! PITR catalog v1 framing, canonical encoding, and replay validation.
 //!
 //! This module deliberately does not publish repository objects or mutate the
 //! source manifest. It provides the bounded catalog substrate used by the
