@@ -63,6 +63,33 @@ pub struct WriteProfile {
     pub wal_sync_ns: AtomicU64,
     /// Time submitting and waiting for WAL write SQEs.
     pub wal_submit_ns: AtomicU64,
+    /// Time blocked acquiring the submission ring's mutex. A queueing cost,
+    /// not work: with one commit group in flight it should be near zero, and
+    /// it is the first thing a concurrent-submission design would grow.
+    pub wal_ring_lock_ns: AtomicU64,
+    /// Time building and pushing the group's write SQEs.
+    pub wal_sqe_fill_ns: AtomicU64,
+    /// Time inside `submit_and_wait`: submission plus the wait for the group's
+    /// writes to complete. The wait is the part parallel submissions could
+    /// overlap, and the part no faster submit can remove.
+    pub wal_uring_enter_ns: AtomicU64,
+    /// Time reaping the group's completion events after the wait returns.
+    pub wal_cqe_reap_ns: AtomicU64,
+    /// Completion events reaped, to check against the buffers submitted.
+    pub wal_cqe_count: AtomicU64,
+    /// Time from the previous group releasing `submitting` to the next leader
+    /// entering the commit path, wake-up included.
+    ///
+    /// This is an inter-group gap, not the handoff on its own: the release stamp
+    /// is taken whether or not a buffer is pending, so an interval in which the
+    /// queue is empty - the next write's own memtable and encode work, at one
+    /// writer - is inside this number too. Only the part of it that is
+    /// leader-to-leader is what a dedicated submitter would remove.
+    pub wal_group_gap_ns: AtomicU64,
+    /// Time from a leader entering the commit path to pushing its first SQE:
+    /// draining the pending queue, waiting out the solo-peer spin, and the
+    /// group accounting.
+    pub wal_leader_prepare_ns: AtomicU64,
     /// Time spent in the WAL fdatasync syscall.
     pub wal_fdatasync_ns: AtomicU64,
     /// Time followers spend waiting for the leader to publish durability.
@@ -131,6 +158,13 @@ impl WriteProfile {
         self.wal_enqueue_ns.store(0, o);
         self.wal_sync_ns.store(0, o);
         self.wal_submit_ns.store(0, o);
+        self.wal_ring_lock_ns.store(0, o);
+        self.wal_sqe_fill_ns.store(0, o);
+        self.wal_uring_enter_ns.store(0, o);
+        self.wal_cqe_reap_ns.store(0, o);
+        self.wal_cqe_count.store(0, o);
+        self.wal_group_gap_ns.store(0, o);
+        self.wal_leader_prepare_ns.store(0, o);
         self.wal_fdatasync_ns.store(0, o);
         self.wal_follower_wait_ns.store(0, o);
         self.wal_follower_wait_calls.store(0, o);
@@ -170,6 +204,13 @@ impl WriteProfile {
             wal_enqueue_ns: self.wal_enqueue_ns.load(o),
             wal_sync_ns: self.wal_sync_ns.load(o),
             wal_submit_ns: self.wal_submit_ns.load(o),
+            wal_ring_lock_ns: self.wal_ring_lock_ns.load(o),
+            wal_sqe_fill_ns: self.wal_sqe_fill_ns.load(o),
+            wal_uring_enter_ns: self.wal_uring_enter_ns.load(o),
+            wal_cqe_reap_ns: self.wal_cqe_reap_ns.load(o),
+            wal_cqe_count: self.wal_cqe_count.load(o),
+            wal_group_gap_ns: self.wal_group_gap_ns.load(o),
+            wal_leader_prepare_ns: self.wal_leader_prepare_ns.load(o),
             wal_fdatasync_ns: self.wal_fdatasync_ns.load(o),
             wal_follower_wait_ns: self.wal_follower_wait_ns.load(o),
             wal_follower_wait_calls: self.wal_follower_wait_calls.load(o),
@@ -223,6 +264,48 @@ impl WriteProfile {
     pub(crate) fn record_wal_submit_ns(&self, nanos: u64) {
         self.wal_submit_ns
             .fetch_add(nanos, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn record_wal_ring_lock_ns(&self, nanos: u64) {
+        self.wal_ring_lock_ns
+            .fetch_add(nanos, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn record_wal_sqe_fill_ns(&self, nanos: u64) {
+        self.wal_sqe_fill_ns
+            .fetch_add(nanos, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn record_wal_uring_enter_ns(&self, nanos: u64) {
+        self.wal_uring_enter_ns
+            .fetch_add(nanos, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn record_wal_cqe_reap_ns(&self, nanos: u64) {
+        self.wal_cqe_reap_ns
+            .fetch_add(nanos, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn record_wal_group_gap_ns(&self, nanos: u64) {
+        self.wal_group_gap_ns
+            .fetch_add(nanos, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn record_wal_leader_prepare_ns(&self, nanos: u64) {
+        self.wal_leader_prepare_ns
+            .fetch_add(nanos, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn record_wal_cqe_count(&self, cqes: u64) {
+        self.wal_cqe_count
+            .fetch_add(cqes, std::sync::atomic::Ordering::Relaxed);
     }
 
     #[cfg(feature = "bench")]
@@ -338,6 +421,13 @@ pub struct WriteProfileSnapshot {
     pub wal_enqueue_ns: u64,
     pub wal_sync_ns: u64,
     pub wal_submit_ns: u64,
+    pub wal_ring_lock_ns: u64,
+    pub wal_sqe_fill_ns: u64,
+    pub wal_uring_enter_ns: u64,
+    pub wal_cqe_reap_ns: u64,
+    pub wal_cqe_count: u64,
+    pub wal_group_gap_ns: u64,
+    pub wal_leader_prepare_ns: u64,
     pub wal_fdatasync_ns: u64,
     pub wal_follower_wait_ns: u64,
     pub wal_follower_wait_calls: u64,
@@ -385,6 +475,21 @@ impl WriteProfileSnapshot {
             wal_enqueue_ns: self.wal_enqueue_ns.saturating_sub(before.wal_enqueue_ns),
             wal_sync_ns: self.wal_sync_ns.saturating_sub(before.wal_sync_ns),
             wal_submit_ns: self.wal_submit_ns.saturating_sub(before.wal_submit_ns),
+            wal_ring_lock_ns: self
+                .wal_ring_lock_ns
+                .saturating_sub(before.wal_ring_lock_ns),
+            wal_sqe_fill_ns: self.wal_sqe_fill_ns.saturating_sub(before.wal_sqe_fill_ns),
+            wal_uring_enter_ns: self
+                .wal_uring_enter_ns
+                .saturating_sub(before.wal_uring_enter_ns),
+            wal_cqe_reap_ns: self.wal_cqe_reap_ns.saturating_sub(before.wal_cqe_reap_ns),
+            wal_cqe_count: self.wal_cqe_count.saturating_sub(before.wal_cqe_count),
+            wal_group_gap_ns: self
+                .wal_group_gap_ns
+                .saturating_sub(before.wal_group_gap_ns),
+            wal_leader_prepare_ns: self
+                .wal_leader_prepare_ns
+                .saturating_sub(before.wal_leader_prepare_ns),
             wal_fdatasync_ns: self
                 .wal_fdatasync_ns
                 .saturating_sub(before.wal_fdatasync_ns),
@@ -456,6 +561,30 @@ impl WriteProfileSnapshot {
 
     pub fn wal_write_ms(&self) -> f64 {
         self.wal_write_ns as f64 / 1_000_000.0
+    }
+
+    pub fn wal_ring_lock_ms(&self) -> f64 {
+        self.wal_ring_lock_ns as f64 / 1_000_000.0
+    }
+
+    pub fn wal_sqe_fill_ms(&self) -> f64 {
+        self.wal_sqe_fill_ns as f64 / 1_000_000.0
+    }
+
+    pub fn wal_uring_enter_ms(&self) -> f64 {
+        self.wal_uring_enter_ns as f64 / 1_000_000.0
+    }
+
+    pub fn wal_cqe_reap_ms(&self) -> f64 {
+        self.wal_cqe_reap_ns as f64 / 1_000_000.0
+    }
+
+    pub fn wal_group_gap_ms(&self) -> f64 {
+        self.wal_group_gap_ns as f64 / 1_000_000.0
+    }
+
+    pub fn wal_leader_prepare_ms(&self) -> f64 {
+        self.wal_leader_prepare_ns as f64 / 1_000_000.0
     }
 
     pub fn wal_validate_ms(&self) -> f64 {
@@ -577,6 +706,10 @@ impl WriteProfileSnapshot {
              wal_enqueue:  {:>8.2} ms\n  \
              wal_sync:     {:>8.2} ms  ({:>5.1}%)\n  \
              wal_submit:   {:>8.2} ms\n  \
+             submit_parts: ring_lock={:>7.2} ms  sqe_fill={:>7.2} ms  uring_enter={:>7.2} ms  cqe_reap={:>7.2} ms\n  \
+             cqe_count:    {:>7}  (clean run: equal to commit buffers)\n  \
+             group_gap:    {:>8.2} ms  (previous release -> next leader enters; includes idle)\n  \
+             leader_prep:  {:>8.2} ms  (enter -> first SQE: drain, peer spin, accounting)\n  \
              fdatasync:    {:>8.2} ms\n  \
              follower_wait:{:>8.2} ms\n  \
              pitr_seal:    {:>8.2} ms  (v5 only: leader hashes its group after fdatasync; subset of wal_sync)\n  \
@@ -607,6 +740,13 @@ impl WriteProfileSnapshot {
             self.wal_sync_ms(),
             self.wal_sync_pct(),
             self.wal_submit_ms(),
+            self.wal_ring_lock_ms(),
+            self.wal_sqe_fill_ms(),
+            self.wal_uring_enter_ms(),
+            self.wal_cqe_reap_ms(),
+            self.wal_cqe_count,
+            self.wal_group_gap_ms(),
+            self.wal_leader_prepare_ms(),
             self.wal_fdatasync_ms(),
             self.wal_follower_wait_ms(),
             self.pitr_seal_append_ms(),

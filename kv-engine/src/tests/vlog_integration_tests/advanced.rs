@@ -1,3 +1,5 @@
+use std::time::{Duration, Instant};
+
 use super::*;
 
 #[test]
@@ -36,10 +38,14 @@ fn test_gc_with_concurrent_writes() {
 
     // Part 1: Trigger GC — stale entries from first flush should be reclaimed
     let stats_before = storage.vlog_stats().unwrap();
-    let gc_count = storage.trigger_gc().unwrap();
+    // Not this call's own count: a background compaction can schedule its own GC
+    // on the same files, in which case this trigger finds them locked and reports
+    // 0 without anything being wrong (see
+    // `test_trigger_gc_reports_zero_while_another_gc_holds_the_file`). The counters
+    // below are cumulative, so they prove the reclamation either way.
+    let _gc_count = storage.trigger_gc().unwrap();
     let stats_after = storage.vlog_stats().unwrap();
 
-    assert!(gc_count > 0, "GC should have processed at least 1 file");
     assert!(
         stats_after.gc_files_processed > stats_before.gc_files_processed,
         "gc_files_processed should increase after GC"
@@ -510,9 +516,29 @@ fn test_vlog_stats_api() {
     force_flush(&storage.inner);
     storage.inner.force_full_compaction().unwrap();
 
-    // Trigger GC — should process files and rewrite entries
-    let gc_count = storage.trigger_gc().unwrap();
-    assert!(gc_count > 0, "GC should have processed at least 1 file");
+    // Trigger GC — should process files and rewrite entries.
+    //
+    // The full compaction above schedules its own GC on the background runtime so
+    // that compaction is not blocked by GC I/O (`post_compaction_gc`), which means
+    // this explicit trigger races that task. Losing the race is a legitimate
+    // outcome, not a failure: `gc_file` bails out with `None` when another GC holds
+    // the file's lock, and the caller is told 0 files were GC'd *by this call*.
+    // Asserting `gc_count > 0` here made the test depend on which of the two won,
+    // which is why it failed on slow CI runners while passing locally - on a loaded
+    // machine the background task reliably gets there first.
+    //
+    // The guarantee the API makes is that the files get processed, not that this
+    // call is the one that processes them, so wait on the counter that whichever GC
+    // does the work records.
+    let _ = storage.trigger_gc().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while storage.vlog_stats().unwrap().gc_files_processed == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "no vLog GC processed a file within 10s of the full compaction"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
 
     let stats = storage.vlog_stats().unwrap();
     assert!(
@@ -531,4 +557,75 @@ fn test_vlog_stats_api() {
         storage.get(b"key2").unwrap(),
         Some(Bytes::from(vec![b'd'; 64]))
     );
+}
+
+/// An explicit `trigger_gc` reports 0 files when another GC holds the file's lock.
+///
+/// This is the outcome `test_vlog_stats_api` used to depend on winning. A full
+/// compaction schedules its own GC on the background runtime so that compaction is
+/// not blocked by GC I/O, so which of the two processes a given file is a race -
+/// and on a loaded machine the background task reliably wins. Holding the lock here
+/// makes that outcome deterministic, and pins both halves of the contract: 0 while
+/// the file is held, progress once it is released.
+#[test]
+fn test_trigger_gc_reports_zero_while_another_gc_holds_the_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut options = options_with_vlog_enabled(256, 1 << 20);
+    if let Some(ref mut vs) = options.value_separation {
+        vs.gc_threshold_ratio = 0.0; // Always trigger GC
+    }
+    let storage = KvEngine::open(dir.path(), options).unwrap();
+
+    storage.put(b"key1", &[b'a'; 64]).unwrap();
+    storage.put(b"key2", &[b'b'; 64]).unwrap();
+    force_flush(&storage.inner);
+
+    // The files `gc_all` would visit: everything the live SSTs reference.
+    let vlog = storage.inner.vlog.as_ref().unwrap();
+    let mut file_ids: Vec<u32> = storage
+        .inner
+        .state
+        .load()
+        .sstables
+        .keys()
+        .filter_map(|sst_id| vlog.get_sst_references(*sst_id))
+        .flatten()
+        .collect();
+    file_ids.sort_unstable();
+    file_ids.dedup();
+    assert!(
+        !file_ids.is_empty(),
+        "the flush should have registered vLog references"
+    );
+
+    for file_id in &file_ids {
+        assert!(
+            vlog.try_acquire_gc_lock(*file_id),
+            "file {file_id} should not be locked before this test takes it"
+        );
+    }
+    assert_eq!(
+        storage.trigger_gc().unwrap(),
+        0,
+        "a file held by another GC must be reported as not processed"
+    );
+
+    for file_id in &file_ids {
+        vlog.release_gc_lock(*file_id);
+    }
+
+    // Once the locks are gone the work does happen. Retry rather than asserting a
+    // single call's count, so a GC that takes the file first cannot fail the test.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let _ = storage.trigger_gc().unwrap();
+        if storage.vlog_stats().unwrap().gc_files_processed > 0 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no GC processed the file after its lock was released"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
 }

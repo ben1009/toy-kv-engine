@@ -22,6 +22,14 @@ archive-I/O rate and a segment large enough that foreground timing contains
 WAL-v5 admission/encoding but no automatic archive boundary. The enabled case
 then times an explicit durable recovery point separately as `catchup_seconds`.
 
+The harness also takes `--writers` (a list, default `1,4,8,16,32`), `--modes
+on|off|both` and `--value-size`. One mode per process is what a profiler needs, and
+it is also what makes repetition-paired comparison possible: alternating the order of
+two separate processes inside a repetition, rather than the order of two cases inside
+a run, is the only comparison on this host whose ratio survives the session. Sections
+below that use it say so; the medians of separate runs that older sections quote do
+not reproduce.
+
 The write timer starts before the writer barrier is released, so it covers the
 whole window the writers are running. **The table below is not comparable to a
 fresh run of the current harness.** It was measured with an earlier revision that
@@ -215,34 +223,98 @@ within noise. `write-perf` runs with `pitr_repository: None`, so this is the
 
 ### PITR enabled versus disabled at the head
 
-Same harness, `--operations 10000`, medians over 3 whole runs against a disk and 9
-against tmpfs. The harness alternates which mode goes first by case position, and
-that position is fixed per writer count, so the column records it:
+Paired per-repetition ratios, one mode per process: each repetition runs both modes
+as separate `pitr-perf --modes on|off` invocations and alternates which goes first,
+so the ratio is formed inside a repetition and host drift cannot land on one mode.
+10,000 operations and 128-byte values, one session; 8 repetitions on tmpfs, 6 on
+disk. "Repeated" is the number of repetitions in which the enabled path was faster.
+The harness holds the archive rate unlimited and the segment large enough that no
+archive boundary is crossed in 10,000 operations, so what is measured is per-commit
+v5 admission and encoding, not archive I/O. Catch-up - the explicit recovery point,
+not a steady-state cost - is 0.085-0.098 s on tmpfs and 0.132-0.207 s on disk.
 
-| Writers | Mode order | Disk: enabled/disabled | Disk: disabled -> enabled (writes/s) | tmpfs: enabled/disabled | tmpfs: disabled -> enabled (writes/s) |
-| ---: | --- | ---: | --- | ---: | --- |
-| 1 | PITR first | 99.3% | 1,769 -> 1,757 | **70.2%** | 145,959 -> 102,532 |
-| 4 | PITR second | 91.2% | 3,905 -> 3,563 | **61.1%** | 161,396 -> 98,684 |
-| 8 | PITR first | 101.2% | 6,771 -> 6,851 | **40.9%** | 175,971 -> 72,037 |
-| 16 | PITR second | 102.1% | 12,738 -> 13,005 | 101.3% | 60,189 -> 60,996 |
-| 32 | PITR first | 92.4% | 24,016 -> 22,186 | 101.7% | 15,999 -> 16,263 |
-| **median** | | **99.3%** | | **70.2%** | |
+| Writers | tmpfs enabled/disabled | tmpfs repeated | Disk enabled/disabled | Disk repeated |
+| ---: | ---: | --- | ---: | --- |
+| 1 | 1.026 | 4/8 | | |
+| 4 | 0.993 | 4/8 | 0.960 | 2/6 |
+| 8 | 1.267 | 7/8 | | |
+| 16 | **0.701** | 0/8 | | |
+| 20 | **0.648** | 1/8 | 0.988 | 2/6 |
 
-The two columns disagree because they measure different regimes. The disk column
-reproduces the 2,000-operation table this section replaces (median 100.8% there,
-99.3% here): with an fsync in every write, PITR's added CPU work is not visible. On
-tmpfs it is. At 8 writers the two modes are fully disjoint - disabled
-156,610-201,079 against enabled 65,286-114,627 - and PITR runs **first** there, so
-the order is not what is doing the work. At 16 and 32 writers both modes fall to
-about 60k and 16k writes/s: the writers are contending with each other, and the
-difference disappears into that.
+Through 8 writers the two paths are within noise of each other, and at 8 the enabled
+path led in 7 of 8 repetitions. From 16 writers they separate, and the separation is
+not specific to 16: 20 reads no better, so the earlier reading that the gap belonged
+to 16 writers came from the harness's fixed `[1, 4, 8, 16, 32]` list, where 16 was the
+worst point that happened to be sampled. On disk both counts are parity: with an fsync
+in every commit, the difference is absorbed.
 
-So: enabling PITR measured free where fsync latency dominates, and 30-60% of
-foreground write throughput on a sync-cheap filesystem at 1-8 writers. The harness
-holds the archive rate unlimited and the segment large enough that no archive boundary
-is crossed in 10,000 operations, so what is measured is per-commit v5 admission and
-encoding, not archive I/O. Catch-up - the explicit recovery point, not a steady-state
-cost - is 0.085-0.098 s on tmpfs and 0.132-0.207 s on disk.
+The 20-writer row is the only contrast that held in every session measured on
+2026-09-23: four paired sessions read 0.53-0.67 with 0/12, 1/8, 0/8 and 0/8
+repetitions favouring the enabled path. Absolute throughput is not stable across them
+- the disabled path alone ranged 100k-281k writes/s at this setting - so the ratios
+are what to read, and the medians in the table above are its own session's.
+
+**The enabled path's cost tracks the payload it moves per operation, not the
+machinery it runs - but this control does not isolate the WAL batch.** The v5 WAL
+pads every batch to the 4 KiB `O_DIRECT` alignment, so a 128-byte value leaves a
+4096-byte batch behind it, where the v4 path writes the record and its key - about
+180 bytes at this shape. Raising the *disabled* path's value to 4096 bytes, so both
+paths carry 4 KiB per operation, removes the gap, paired inside the same repetitions
+at 20 writers:
+
+| 20 writers, paired, 8 repetitions | writes/s (median) | paired ratio | enabled faster |
+| --- | ---: | ---: | --- |
+| enabled, 128-byte values - 4 KiB batch | 105,091 | 1.091 | 6/8 |
+| disabled, 4096-byte values - 4 KiB record | 104,778 | | |
+
+What that shows is that the enabled path is not paying for anything the disabled path
+lacks. The disabled path has none of the seal, the ordered publication or the v5
+admission path, and it reads the same once its payload matches, so at this shape none
+of them is what separates the two.
+
+What it does not show is that the padded batch *is* the cost. `--value-size` changes
+the value handed to `engine.put`, so the disabled path's 4 KiB also passes through the
+memtable insert, the key encoding and the bloom filter; parity is equally consistent
+with both paths becoming bound by that larger payload somewhere outside the WAL.
+Isolating the batch would need the enabled path to vary its own padding at a fixed
+value size, which the harness cannot do. Either way the operational reading is the
+same - on this shape the enabled path costs no more than carrying 4 KiB per operation
+- and where the payload is not what dominates, a disk with an fsync in every commit,
+enabling PITR is free, as the disk column shows.
+
+Two further observations from the same session, both saying that this ratio is a
+property of the host as much as of the engine:
+
+- **It is not CPU-bound.** At 20 writers the enabled run used *less* CPU over a
+  longer wall: 439 ms of CPU in 154 ms of wall (2.9x) against the disabled path's
+  618 ms in 98 ms (6.3x). Sampling `/proc/<pid>/task/*/stat` through the write phase
+  agrees - 3.4-7.5 of the 20 writers running at once, about 35% of thread samples
+  parked in futexes (28% for the disabled path), and about 42% of both in kernel
+  `io_wq_worker`s. In both modes it is the WAL write path, not the commit path, where
+  threads block.
+- **It moves with where the threads run.** This host is hybrid: CPUs 0-15 are
+  P-cores and 16-31 E-cores. Pinning the whole run to one type inverts the
+  comparison, 6 paired repetitions each, same session:
+
+| Affinity | enabled | disabled | paired | enabled faster |
+| --- | ---: | ---: | ---: | --- |
+| P-cores 0-15 | 112,164 | 44,429 | 2.49x | 6/6 |
+| E-cores 16-31 | 125,901 | 73,355 | 1.75x | 6/6 |
+| unpinned | 91,690 | 177,806 | 0.60x | 0/6 |
+
+The enabled path's own throughput barely moves across those rows (92k, 112k, 126k);
+the disabled path's collapses when it is confined (178k to 44k). Small writes are
+CPU-hungry - more syscalls and more commit groups per byte - so the disabled path
+needs the machine, while the enabled path is held near 100-130k operations/s by its
+payload either way.
+
+The table this section replaces carried medians of separate runs - 70.2% on tmpfs and
+99.3% on disk - and so did the 55.4% quoted in "What the remaining tmpfs gap was".
+Neither reproduces under the paired method, in this session or in three others the
+same day, and the disabled path's own instability is enough to produce either. They
+are withdrawn as measurements of the gap. What that section's own paired A/B found -
+that the seal hashing belonged off the commit leader's window - is unaffected, and is
+still what its numbers show.
 
 ### A note on sample size
 
@@ -345,10 +417,13 @@ publication, and
 the exhaustion, poison-visibility and memory-ordering defects the review found are
 fixed alongside.
 
-The enabled/disabled sweep with this version reads **55.4%** (median) on tmpfs and
-**98.0%** on disk, against 70.2% and 99.3% before the fix - the tmpfs movement is the
-disabled baseline no longer being throttled by the same convoy it was measured
-against.
+The enabled/disabled sweep with this version read **55.4%** (median) on tmpfs and
+**98.0%** on disk, against 70.2% and 99.3% before the fix - the tmpfs movement being
+the disabled baseline no longer throttled by the same convoy it was measured against.
+Those four figures are medians of separate runs and are **withdrawn**: the paired
+method in "PITR enabled versus disabled at the head" does not reproduce them, in this
+session or in three others the same day. What that section keeps is the paired A/B
+directly below, which is what establishes the fix.
 
 Re-running needs four revisions built with `cargo build --release --bin write-perf`:
 `2f556ccb` (pre-PITR), `b5ac2064` (before #330), `494a20ab` (the unfixed head), and the
@@ -515,6 +590,16 @@ not hashing: 15.0 ms per 28,000 operations is 0.54 us/op, of which the 205 bytes
 this machine's 2.2 GB/s account for ~0.09 us. What is left of `pitr_seal` is the lock,
 the entry push and the per-buffer call - a floor that the 4096-byte case's hash used to
 hide.
+
+That residual is the phase, and the enabled/disabled gap at high writer counts is a
+different quantity that is not hashing either. Paired at 20 writers, raising the
+*disabled* path's value to 4096 bytes - the same payload per operation - removes the
+whole gap (paired 1.091, the enabled path faster in 6 of 8 repetitions). That rules
+the enabled path's own machinery out as the separator, but it does not isolate the
+padded batch, because the control changes what the disabled path's `put` carries too.
+"PITR enabled versus disabled at the head" carries that measurement, what it does and
+does not establish, the affinity caveat that comes with it, and the withdrawal of this
+section's own 55.4%.
 
 **What the rule does not attest any more.** A v6 digest skips the alignment gaps, so a
 byte flipped inside one is no longer a digest mismatch. It is still refused, and at

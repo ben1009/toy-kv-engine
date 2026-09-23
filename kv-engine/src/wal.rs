@@ -424,6 +424,9 @@ pub struct Wal {
     /// threads that are not the leader never block on a lock — they either
     /// become the leader (CAS wins) or wait on the completion condvar.
     submitting: AtomicBool,
+    /// When the last group released `submitting`, for the handoff counter.
+    #[cfg(feature = "bench")]
+    last_release_ns: AtomicU64,
     /// Set to true on I/O error to fail-fast future writes.
     /// Once poisoned, the WAL is unusable — callers must create a new WAL.
     poisoned: AtomicBool,
@@ -629,6 +632,8 @@ impl Wal {
                 preallocated_size: AtomicU64::new(alloc_offset),
                 completion_state: CompletionState::new(),
                 submitting: AtomicBool::new(false),
+                #[cfg(feature = "bench")]
+                last_release_ns: AtomicU64::new(0),
                 poisoned: AtomicBool::new(false),
                 pitr_max_segment_bytes: AtomicU64::new(u64::MAX),
                 pitr_max_unarchived_bytes: AtomicU64::new(u64::MAX),
@@ -654,6 +659,8 @@ impl Wal {
                 preallocated_size: AtomicU64::new(0),
                 completion_state: CompletionState::new(),
                 submitting: AtomicBool::new(false),
+                #[cfg(feature = "bench")]
+                last_release_ns: AtomicU64::new(0),
                 poisoned: AtomicBool::new(false),
                 pitr_max_segment_bytes: AtomicU64::new(u64::MAX),
                 pitr_max_unarchived_bytes: AtomicU64::new(u64::MAX),
@@ -968,6 +975,8 @@ impl Wal {
             preallocated_size: AtomicU64::new(alloc_offset),
             completion_state: CompletionState::new(),
             submitting: AtomicBool::new(false),
+            #[cfg(feature = "bench")]
+            last_release_ns: AtomicU64::new(0),
             poisoned: AtomicBool::new(false),
             pitr_max_segment_bytes: AtomicU64::new(u64::MAX),
             pitr_max_unarchived_bytes: AtomicU64::new(u64::MAX),
@@ -1005,6 +1014,8 @@ impl Wal {
             preallocated_size: AtomicU64::new(alloc_offset),
             completion_state: CompletionState::new(),
             submitting: AtomicBool::new(false),
+            #[cfg(feature = "bench")]
+            last_release_ns: AtomicU64::new(0),
             poisoned: AtomicBool::new(false),
             pitr_max_segment_bytes: AtomicU64::new(u64::MAX),
             pitr_max_unarchived_bytes: AtomicU64::new(u64::MAX),
@@ -1067,6 +1078,14 @@ pub(crate) fn is_recordless_v4_wal(path: &std::path::Path) -> bool {
             Ok(_) | Err(_) => return false,
         }
     }
+}
+
+/// Monotonic nanoseconds since first use, so two threads can compare when they
+/// reached points in the commit path.
+#[cfg(feature = "bench")]
+fn nanos_now() -> u64 {
+    static EPOCH: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    EPOCH.get_or_init(Instant::now).elapsed().as_nanos() as u64
 }
 
 impl Wal {
@@ -2286,6 +2305,24 @@ impl Wal {
         ticket: u64,
         profile: Option<&crate::mem_table::WriteProfile>,
     ) -> Result<()> {
+        // The inter-group gap: from the previous group releasing `submitting` to
+        // this leader reaching the commit path, wake-up included. The release
+        // stamp is taken whether or not a buffer is pending, so this is not the
+        // handoff alone - it also covers any interval in which the queue was
+        // empty and the next write had not arrived yet. A dedicated submitter is
+        // the design that would remove only the handoff part of it.
+        #[cfg(feature = "bench")]
+        let leader_entered = nanos_now();
+        #[cfg(feature = "bench")]
+        {
+            let released = self.last_release_ns.load(Ordering::Acquire);
+            if released > 0
+                && leader_entered > released
+                && let Some(profile) = profile
+            {
+                profile.record_wal_group_gap_ns(leader_entered - released);
+            }
+        }
         self.wait_for_group_commit_peers(ticket);
         let ticketed_bufs = self.drain_pending_ticketed_bufs();
         if ticketed_bufs.is_empty() {
@@ -2300,6 +2337,10 @@ impl Wal {
                 .map(|buf| DirectBuf::align_up(buf.buf.len()) as u64)
                 .sum();
             profile.record_wal_commit_group(buffers, bytes);
+        }
+        #[cfg(feature = "bench")]
+        if let Some(profile) = profile {
+            profile.record_wal_leader_prepare_ns(nanos_now().saturating_sub(leader_entered));
         }
         let result = self.submit_sqes_and_poll(ticketed_bufs, profile);
 
@@ -2431,6 +2472,8 @@ impl Wal {
                 .durable_ticket
                 .fetch_max(max_ticket + 1, Ordering::Release);
         }
+        #[cfg(feature = "bench")]
+        self.last_release_ns.store(nanos_now(), Ordering::Release);
         self.submitting.store(false, Ordering::Release);
         self.completion_state.cond.notify_all();
     }
@@ -2468,6 +2511,12 @@ impl Wal {
         let ring_ref = self.ring.as_ref().unwrap();
 
         // Compute total aligned size first, then preallocate to cover the full batch.
+        //
+        // This preallocation is outside every profile span: `wal_submit` opens at
+        // the ring lock below, and the leader's `wal_leader_prepare` span closed
+        // before this function was called. It is also not per-group work - it
+        // extends the file only when the offset crosses a `PREALLOC_BLOCK`
+        // boundary - so nothing else should be read as having absorbed it.
         let total_size: u64 = bufs
             .iter()
             .map(|b| DirectBuf::align_up(b.buf.len()) as u64)
@@ -2510,8 +2559,17 @@ impl Wal {
             // the gap between submit and poll.
             let mut write_err: Option<i32> = None;
             let chunk_start_idx = global_idx;
+            // Timed outside the lock it waits on: this is queueing, not work.
+            #[cfg(feature = "bench")]
+            let lock_start = Instant::now();
             {
                 let mut ring = ring_ref.lock();
+                #[cfg(feature = "bench")]
+                if let Some(profile) = profile {
+                    profile.record_wal_ring_lock_ns(lock_start.elapsed().as_nanos() as u64);
+                }
+                #[cfg(feature = "bench")]
+                let fill_start = Instant::now();
                 for i in 0..chunk_len {
                     let buf = &bufs[chunk_start + i];
                     let aligned_len = DirectBuf::align_up(buf.buf.len());
@@ -2530,10 +2588,17 @@ impl Wal {
                     offset += aligned_len as u64;
                 }
 
+                #[cfg(feature = "bench")]
+                if let Some(profile) = profile {
+                    profile.record_wal_sqe_fill_ns(fill_start.elapsed().as_nanos() as u64);
+                }
+
                 // Submit all write SQEs in one syscall and wait for completions.
                 // Retry on EINTR to prevent spurious failures from signals
                 // (profilers, thread suspension, etc.), matching fdatasync below.
 
+                #[cfg(feature = "bench")]
+                let enter_start = Instant::now();
                 #[cfg(feature = "chaos-testing")]
                 {
                     crate::chaos::failpoint::fail_point!("wal.after_submit_before_wait");
@@ -2550,6 +2615,15 @@ impl Wal {
                         }
                     }
                 }
+
+                #[cfg(feature = "bench")]
+                if let Some(profile) = profile {
+                    profile.record_wal_uring_enter_ns(enter_start.elapsed().as_nanos() as u64);
+                }
+                #[cfg(feature = "bench")]
+                let reap_start = Instant::now();
+                #[cfg(feature = "bench")]
+                let mut reaped: u64 = 0;
 
                 // Poll CQEs — lock is still held, so close() cannot interfere.
                 let mut cq = ring.completion();
@@ -2579,6 +2653,15 @@ impl Wal {
                             anyhow::bail!("io_uring: stale CQE with user_data={}", user_data);
                         }
                     }
+                    #[cfg(feature = "bench")]
+                    {
+                        reaped += 1;
+                    }
+                }
+                #[cfg(feature = "bench")]
+                if let Some(profile) = profile {
+                    profile.record_wal_cqe_reap_ns(reap_start.elapsed().as_nanos() as u64);
+                    profile.record_wal_cqe_count(reaped);
                 }
                 // ring and cq drop here
             }
