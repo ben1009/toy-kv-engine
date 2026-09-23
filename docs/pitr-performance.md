@@ -447,6 +447,13 @@ across both orders, so only the 1-writer row needed the second ordering to settl
 everywhere else in this document, compare ratios within a session, not absolutes: the
 same `pitr_seal` case read 64.6 ms in the #340 session and 176-184 ms in this one.
 
+The ratio is large and the share is not, and both belong in the same sentence: the
+saving is 0.5-1.0% of the enabled path's wall clock at these writer counts (155.8 ms of
+171.3 ms at 4 writers, 161.0 ms of 176.5 ms at 1, against ~8 s and ~17 s of wall for
+28,000 operations). What the seal cost was the last *PITR-specific* phase at low writer
+counts, not a large share of the run - the rest of the enabled path's cost is the
+ordered-commit machinery, which is present with PITR off too.
+
 The mechanism is visible in one more counter: `seal_bytes` (added here) reads
 **205 B/op** after, against the 4096 B/op the old rule hashed - the harness's own
 `commit_bytes avg = 4096 B` at 1 writer and `avg_bufs = 1.00`. So the bytes hashed per
