@@ -2502,11 +2502,17 @@ impl Wal {
         }
 
         if let Some(accumulator) = &self.pitr_seal {
+            #[cfg(feature = "bench")]
+            let seal_start = Instant::now();
             let mut accumulator = accumulator.lock();
             for ticketed_buf in bufs.iter() {
                 if let Some(entry) = ticketed_buf.pitr_entry {
                     accumulator.append(&ticketed_buf.buf, entry);
                 }
+            }
+            #[cfg(feature = "bench")]
+            if let Some(profile) = profile {
+                profile.record_pitr_seal_append_ns(seal_start.elapsed().as_nanos() as u64);
             }
         }
 
