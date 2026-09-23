@@ -340,7 +340,8 @@ That is where the cost sits: a writer waits for its predecessor's skiplist inser
 publication, which is one commit of pipeline depth that any design enforcing the
 ordered frontier has to pay.
 
-All 1314 tests pass, including the sequencer tests that pin ordered publication, and
+All 1314 tests pass on that revision, including the sequencer tests that pin ordered
+publication, and
 the exhaustion, poison-visibility and memory-ordering defects the review found are
 fixed alongside.
 
@@ -367,9 +368,9 @@ background.
 
 The 55.4% above is the enabled path against the disabled one at the same head, so it is
 not the publication ordering: it is the seal. `PitrSealAccumulator::append` feeds each
-group's buffers into the segment's streaming SHA-256, and because the buffers are
-padded to the 4 KiB `O_DIRECT` alignment, a 1 KiB value hashes about 3.7x the bytes it
-carries. It ran on the commit leader, inside the window where the leader holds
+group's buffers into the segment's streaming SHA-256, and because every batch is
+padded to the 4 KiB `O_DIRECT` alignment, the digest covers far more than the batch
+holds - a single 128-byte value sits in a 4096-byte buffer, so roughly 23x. It ran on the commit leader, inside the window where the leader holds
 `submitting` - the window every other writer waits to enter - at 5.8 us per group.
 
 It was invisible until `pitr-perf --profile` existed (PR #340): `wal_submit` is
@@ -408,12 +409,14 @@ comparison read -11%, and the 30-repetition run above is what settled it.
 #### What is left, and why it is not a tweak (2026-09-23)
 
 With the seal off the commit chain, the digest itself is the remaining PITR-on cost at
-low writer counts. The accumulator hashes the batch's 4 KiB-aligned buffer, so a ~1.1
-KiB batch is hashed as 4096 bytes - 3.7x the bytes it carries, and exactly the padding
-`encode_v5_batch` adds for `O_DIRECT`. Measured with the seal counter timed *inside*
+low writer counts. The accumulator hashes the batch's 4 KiB-aligned buffer, and
+`encode_v5_batch` pads every batch up to that alignment, so a batch holding one
+128-byte value - about 180 bytes - is hashed as 4096. Measured with the seal counter timed *inside*
 the lock it takes (see the note below), 28,000 operations: 64.6 ms at 1 writer, 2.3 us
-per operation, against about 0.63 us of actual SHA-256 work at this machine's measured
-2.2 GB/s. That is roughly 28% of the hot path at 1 writer and ~11% at 16.
+per operation. Hashing 4096 bytes at this machine's measured 2.2 GB/s accounts for
+about 1.9 us of that, and the ~180 bytes a batch actually carries would need roughly
+0.1 us - so nearly all of it is padding. That is roughly 28% of the hot path at 1
+writer and ~11% at 16.
 
 Making that go away is a format change, not a local edit, because `wal_digest` is not
 only the seal's digest: it *equals* `SHA256(segment file bytes)`, and the archive,
@@ -435,7 +438,8 @@ lock. Numbers quoted from it before 2026-09-23 include the wait.
 
 One harness limit to know before re-running this: `pitr-perf` aborts every
 PITR-enabled case above roughly 30,000 operations with `PITR batch would cross maximum
-segment bytes` - each 1 KiB operation costs 4 KiB against the 128 MiB
-`max_segment_bytes` - and an aborted case prints nothing on stdout. A run that produces
+segment bytes` - each operation occupies one 4 KiB-aligned buffer, whatever the
+value's size, so the 128 MiB `max_segment_bytes` admits about 32,768 operations - and
+an aborted case prints nothing on stdout. A run that produces
 an empty result file is that, not a crash.
 
