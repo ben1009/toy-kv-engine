@@ -454,6 +454,30 @@ saving is 0.5-1.0% of the enabled path's wall clock at these writer counts (155.
 counts, not a large share of the run - the rest of the enabled path's cost is the
 ordered-commit machinery, which is present with PITR off too.
 
+**A whole-run comparison says the same thing, and says it is not throughput.** The
+digest change was measured end to end against itself - the tree before it (`438903ac`)
+and after, both with PITR enabled - on a workload that spans a whole run rather than a
+phase: `write-perf --bench wal_concurrent`, 200k puts, 4 threads, 1 KiB values, tmpfs,
+20 paired repetitions with the run order alternated (the harness flag is PR #343).
+Medians: 178.3k ops/s before, 176.6k after; paired median **0.986x**, the after side
+faster in 7/20. That is a null result, and the reason is position rather than size: the
+leader hashes its group *after* publishing it, so the work overlaps the next group's
+I/O wait instead of extending the critical path, and a phase that shrinks 4x in hashed
+bytes (1090 B/op against the ~4090 B/op of aligned buffers this shape writes) is inside
+the noise of a run. Worth making, not worth expecting in ops/s.
+
+Where the PITR line does stand, on that same harness and shape, is a separate question
+this measurement answers while it is set up: paired medians over 20 repetitions of
+pre-PITR `2f556ccb` at 221.2k ops/s, the head with PITR off at 190.9k (**0.863x**,
+1/20) and the head with PITR on at 176.6k (**0.800x**, 1/20), so enabling PITR costs
+**0.927x** (0/20) on top of a head already ~14% behind pre-PITR. One configuration
+detail matters for reading that row: `--target-sst-size` has to be above the run's
+footprint, or the PITR-off leg freezes, flushes and compacts inside the measured window
+while a v5 memtable defers that work. At the 1 MiB default a single run reads the
+disabled leg at 0.75x of the enabled one (171.2k against 229.2k ops/s, 200k puts) -
+that gap is the two legs doing different jobs, not PITR being fast, and it is why the
+rows above are measured with the SST target above the run.
+
 The mechanism is visible in one more counter: `seal_bytes` (added here) reads
 **205 B/op** after, against the 4096 B/op the old rule hashed - the harness's own
 `commit_bytes avg = 4096 B` at 1 writer and `avg_bufs = 1.00`. So the bytes hashed per
