@@ -523,11 +523,13 @@ fn write_entry_into(
 /// Production has exactly one encoder - [`encode_v5_batch_into`], called directly
 /// from the WAL's `put_v5_batch` - and neither this function nor the
 /// [`encode_v5_batch`] wrapper above it is on the write path any more: every
-/// caller of the wrapper is a test. Both are kept as fixtures for `pitr::tests`,
-/// this one because a decoder test needs a builder that preserves duplicate keys,
-/// and the file-level `allow(dead_code)` above is what keeps them compiling. The
-/// pinned digests in that module were produced by this implementation, which is
-/// why they can be checked against it.
+/// caller of the wrapper is a test. Both are kept as fixtures for the crate's
+/// tests - the wrapper is called from `pitr::tests`, `pitr_seal::tests`,
+/// `pitr_restore::tests`, `lsm_storage::tests` and the integration tests - and
+/// this one additionally because a decoder test needs a builder that preserves
+/// duplicate keys. The file-level `allow(dead_code)` above is what keeps them
+/// compiling. The pinned digests in `pitr::tests` were produced by this
+/// implementation, which is why they can be checked against it.
 fn encode_v5_batch_inner(batch: &WalBatch, limits: WalV5Limits) -> Result<Vec<u8>> {
     validate_batch_limits(batch, limits)?;
     ensure!(batch.commit_ts != 0, "v5 commit timestamp must be nonzero");
@@ -1314,7 +1316,10 @@ mod tests {
     /// sides would survive it. Each digest below is of the bytes the
     /// implementation produced *before* it was changed to write straight into the
     /// ring buffer - taken from the same cases by the previous implementation - so
-    /// this fails if the change altered any byte the encoder emits.
+    /// this fails if the change altered any byte the encoder emits *for these
+    /// shapes*. Shapes not listed are not covered, and neither is the length the
+    /// WAL exposes, which is what decides how much of a pooled buffer the ring
+    /// writes; `put_v5_batch` carries a debug assertion for that half instead.
     ///
     /// The destination is poisoned before encoding, which is what gives the claim
     /// above its force. Encoding into a fresh `Vec` - as calling `encode_v5_batch`

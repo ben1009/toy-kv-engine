@@ -1403,8 +1403,10 @@ where the conversion happens: there `wal_write` is about halved as well (36-41 m
 throughput where the producer queue is what the pipeline waits on, which is the
 collapsed region.
 
-`pitr-perf`, paired, one case per invocation, 40 repetitions, alternating order, with a
-null pair - the same binary under both names - at each writer count:
+`pitr-perf`, paired, one case per invocation - `--writers N --modes on --operations
+10000`, default 128-byte values, a release build without `--features bench` - 40
+repetitions, alternating order, with a null pair, the same binary under both names, at
+each writer count:
 
 | writers | paired median | faster | null at that count |
 | ---: | ---: | ---: | ---: |
@@ -1427,7 +1429,8 @@ than its 16-writer one - and nothing here contradicts it.
 
 The PITR-disabled control matters because that path never calls this encoder and must
 read parity, which it does - though that row carries no null of its own, so it is read
-against the 1.043 measured for the enabled pair at the same count.
+against the 1.043 measured for the enabled pair at the same count, which puts it at
+0.972/1.043 = 0.93: a 7% shortfall, inside the protocol's band rather than clear of it.
 
 The null column is why the rest of the table is readable at all. This protocol carries a
 per-count offset of up to about 8%, so a single number without its null beside it means
@@ -1452,9 +1455,12 @@ has collapsed - 1.52 raw and 1.46 against its null at 16 writers, 1.18 and 1.29 
 and parity at 4 and 8 writers (1.004 and 0.902 raw, 0.99 and 0.96 against their nulls).
 The 1-writer row is the one that does not fit that split: 1.078 raw against a null of
 0.952 is 1.13x, a win on this reading, but one count at 40 repetitions with an IQR
-spanning 0.99-1.23 is not measured to the depth that would settle it, so it is not
-counted as one. The honest bound is that the change pays where the producer queue binds
-and nowhere else.
+spanning 0.99-1.23 is not measured to the depth that would settle it - so it is not
+counted as one, and not counted against one either. What the other four rows support is
+narrower than a rule about where this change pays: it is *measured* to pay at the two
+counts where PITR-on has collapsed, and measured to be neutral at 4 and 8. Whether it
+also pays at one writer is open, and saying it does not would be reading the same
+unsettled row the other way.
 
 One tension with the document next door is worth naming rather than leaving for a reader
 to find. `docs/pitr-performance.md`'s payload control concluded that the enabled path's
