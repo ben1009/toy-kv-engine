@@ -570,6 +570,34 @@ fn test_get_with_kind_at_ts_finds_version_in_adjacent_sst() {
         "reader should see version A after GC"
     );
 
+    // Check every key this snapshot can reach, not just the one above. The
+    // invariant GC has to hold is about *all* live readings: whatever the pinned
+    // reader can resolve, its bytes must still be there afterwards. Checking one
+    // key made a misjudged entry in the same file show up as a single-key flake;
+    // the loop names the key, so a recurrence says which version was reclaimed.
+    for (key, expected) in [
+        (b"split".as_slice(), Some(vec![b'A'; 64])),
+        (b"other1".as_slice(), Some(vec![b'X'; 64])),
+        (b"other2".as_slice(), None), // written after the snapshot, so not visible
+        (b"other3".as_slice(), None),
+    ] {
+        let got = reader
+            .get(key)
+            .unwrap_or_else(|error| {
+                panic!(
+                    "reader at ts=1 could not resolve {:?} after GC: {error:#}",
+                    String::from_utf8_lossy(key)
+                )
+            })
+            .map(|bytes| bytes.to_vec());
+        assert_eq!(
+            got,
+            expected,
+            "reader at ts=1 sees the wrong version of {:?} after GC",
+            String::from_utf8_lossy(key)
+        );
+    }
+
     // Latest read should see version C
     let val = storage.get(b"split").unwrap();
     assert_eq!(
