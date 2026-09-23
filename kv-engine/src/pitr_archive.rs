@@ -55,6 +55,28 @@ pub(crate) struct PreparedArchiveObjects {
     segment_key: crate::pitr_catalog::SegmentKey,
     wal_digest: [u8; 32],
     seal_digest: [u8; 32],
+    /// The rule the segment's `wal_digest` follows. Carried from the metadata the
+    /// objects were prepared from so publishing re-checks the WAL under the same
+    /// rule the catalog recorded.
+    wal_digest_rule: crate::pitr::WalDigestRule,
+}
+
+/// How a source object's bytes are digested. A WAL follows the rule its own
+/// segment records; the seal sidecar is not a WAL and is always hashed whole.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SourceObjectDigest {
+    WholeObject,
+    Wal(crate::pitr::WalDigestRule),
+}
+
+impl SourceObjectDigest {
+    /// Digest `bytes` the way this object's name was derived.
+    pub(crate) fn digest(self, bytes: &[u8]) -> anyhow::Result<[u8; 32]> {
+        match self {
+            Self::WholeObject => Ok(sha2::Sha256::digest(bytes).into()),
+            Self::Wal(rule) => crate::pitr_seal::wal_digest(bytes, rule),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -318,7 +340,10 @@ impl ArchiveObjectStager {
             "prepared seal length mismatch"
         );
         anyhow::ensure!(
-            Sha256::digest(wal).as_slice() == prepared.wal_digest,
+            SourceObjectDigest::Wal(prepared.wal_digest_rule)
+                .digest(wal)?
+                .as_slice()
+                == prepared.wal_digest,
             "prepared WAL digest mismatch"
         );
         anyhow::ensure!(
@@ -372,8 +397,11 @@ impl ArchiveObjectStager {
             "prepared archive object length mismatch"
         );
         anyhow::ensure!(
-            Sha256::digest(wal).as_slice() == prepared.wal_digest
-                && Sha256::digest(seal).as_slice() == prepared.seal_digest,
+            SourceObjectDigest::Wal(prepared.wal_digest_rule)
+                .digest(wal)?
+                .as_slice()
+                == prepared.wal_digest
+                && SourceObjectDigest::WholeObject.digest(seal)?.as_slice() == prepared.seal_digest,
             "prepared archive object digest mismatch"
         );
         publish_one_chunked(
@@ -673,8 +701,12 @@ impl PitrArchiveCatalog {
             metadata.wal_bytes == wal.len() as u64,
             "archived WAL length mismatch"
         );
+        let wal_digest_rule = metadata.wal_digest_rule()?;
         anyhow::ensure!(
-            Sha256::digest(wal).as_slice() == metadata.wal_digest,
+            SourceObjectDigest::Wal(wal_digest_rule)
+                .digest(wal)?
+                .as_slice()
+                == metadata.wal_digest,
             "archived WAL digest mismatch"
         );
         anyhow::ensure!(
@@ -701,6 +733,7 @@ impl PitrArchiveCatalog {
             segment_key: metadata.key,
             wal_digest: metadata.wal_digest,
             seal_digest: metadata.seal_digest,
+            wal_digest_rule,
         })
     }
 
@@ -804,8 +837,28 @@ mod tests {
     use super::*;
     use crate::pitr::{ArchiveEpochId, ChainAnchor, SegmentAnchor, SegmentId, TimelineId};
 
+    /// The segment's identity, shared by its WAL header and its metadata.
+    fn header() -> crate::pitr::WalV5Header {
+        crate::tests::harness::pitr_segment_header(
+            TimelineId([2; 16]),
+            ArchiveEpochId([3; 16]),
+            SegmentId(1),
+            ChainAnchor::Genesis {
+                archive_epoch_id: ArchiveEpochId([3; 16]),
+            },
+            crate::pitr::WAL_V5_VERSION,
+        )
+    }
+
+    /// A real v5 WAL, not a stand-in: the digest rules are defined over the
+    /// encoding, so a payload that is not a WAL cannot be verified under one.
+    fn wal_bytes() -> Vec<u8> {
+        crate::tests::harness::pitr_segment_wal_bytes(header())
+    }
+
     fn metadata() -> SegmentMetadata {
-        let wal_digest = Sha256::digest(b"wal").into();
+        let wal_digest =
+            crate::tests::harness::pitr_wal_digest(&wal_bytes(), crate::pitr::WAL_V5_VERSION);
         let seal_digest = Sha256::digest(b"seal").into();
         SegmentMetadata {
             key: crate::pitr_catalog::SegmentKey {
@@ -814,7 +867,7 @@ mod tests {
                 archive_epoch_id: ArchiveEpochId([3; 16]),
                 segment_id: SegmentId(1),
             },
-            wal_format_version: 5,
+            wal_format_version: crate::pitr::WAL_V5_VERSION,
             seal_format_version: 1,
             anchor: SegmentAnchor {
                 segment_id: SegmentId(1),
@@ -827,8 +880,8 @@ mod tests {
             first_commit_ts: Some(1),
             last_commit_ts: Some(1),
             batch_count: 1,
-            logical_bytes: 3,
-            wal_bytes: 3,
+            logical_bytes: wal_bytes().len() as u64,
+            wal_bytes: wal_bytes().len() as u64,
             wal_digest,
             seal_digest,
             source_identity: [4; 32],
@@ -888,7 +941,9 @@ mod tests {
     fn prepares_identity_bound_objects_and_commits_once() {
         let mut catalog = PitrArchiveCatalog::default();
         let metadata = metadata();
-        let prepared = catalog.prepare_objects(&metadata, b"wal", b"seal").unwrap();
+        let prepared = catalog
+            .prepare_objects(&metadata, &wal_bytes(), b"seal")
+            .unwrap();
         assert!(prepared.wal_name.ends_with(".wal"));
         assert!(prepared.seal_name.ends_with(".seal"));
         assert!(matches!(
@@ -972,10 +1027,17 @@ mod tests {
         let stager = ArchiveObjectStager::new(&root).unwrap();
         let metadata = metadata();
         let catalog = PitrArchiveCatalog::default();
-        let prepared = catalog.prepare_objects(&metadata, b"wal", b"seal").unwrap();
-        stager.publish(&prepared, b"wal", b"seal").unwrap();
-        stager.publish(&prepared, b"wal", b"seal").unwrap();
-        assert_eq!(stager.read(&prepared.wal_name, Some(3)).unwrap(), b"wal");
+        let prepared = catalog
+            .prepare_objects(&metadata, &wal_bytes(), b"seal")
+            .unwrap();
+        stager.publish(&prepared, &wal_bytes(), b"seal").unwrap();
+        stager.publish(&prepared, &wal_bytes(), b"seal").unwrap();
+        assert_eq!(
+            stager
+                .read(&prepared.wal_name, Some(wal_bytes().len() as u64))
+                .unwrap(),
+            wal_bytes()
+        );
         assert_eq!(stager.read(&prepared.seal_name, None).unwrap(), b"seal");
         assert!(root.join("wal").join(&prepared.wal_name).is_file());
         assert!(root.join("wal").join(&prepared.seal_name).is_file());
@@ -991,11 +1053,13 @@ mod tests {
         let stager = ArchiveObjectStager::new(&root).unwrap();
         let metadata = metadata();
         let catalog = PitrArchiveCatalog::default();
-        let prepared = catalog.prepare_objects(&metadata, b"wal", b"seal").unwrap();
+        let prepared = catalog
+            .prepare_objects(&metadata, &wal_bytes(), b"seal")
+            .unwrap();
         let fifo = root.join("wal").join(&prepared.wal_name);
         let fifo = CString::new(fifo.as_os_str().as_bytes()).unwrap();
         assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
-        assert!(stager.publish(&prepared, b"wal", b"seal").is_err());
+        assert!(stager.publish(&prepared, &wal_bytes(), b"seal").is_err());
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -1017,7 +1081,9 @@ mod tests {
         let bytes = crate::pitr_catalog::encode_catalog(&[snapshot]).unwrap();
         let mut catalog = PitrArchiveCatalog::open(bytes).unwrap();
         let metadata = metadata();
-        let prepared = catalog.prepare_objects(&metadata, b"wal", b"seal").unwrap();
+        let prepared = catalog
+            .prepare_objects(&metadata, &wal_bytes(), b"seal")
+            .unwrap();
         assert!(matches!(
             catalog.commit_segment(metadata.clone(), &prepared).unwrap(),
             ArchivePublicationOutcome::Committed { sequence: 12 }
@@ -1046,7 +1112,9 @@ mod tests {
         .unwrap();
         let torn = complete[..complete.len() - 2].to_vec();
         let mut catalog = PitrArchiveCatalog::open(torn.clone()).unwrap();
-        let prepared = catalog.prepare_objects(&second, b"wal", b"seal").unwrap();
+        let prepared = catalog
+            .prepare_objects(&second, &wal_bytes(), b"seal")
+            .unwrap();
         assert!(catalog.commit_segment(second, &prepared).is_err());
         assert_eq!(catalog.bytes(), torn);
     }

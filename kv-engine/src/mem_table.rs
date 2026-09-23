@@ -95,6 +95,10 @@ pub struct WriteProfile {
     /// buffer into the segment digest, so it is the enabled path's largest
     /// unaccounted foreground cost.
     pub pitr_seal_append_ns: AtomicU64,
+    /// WAL bytes the seal accumulator actually hashed. The digest rules skip a
+    /// batch's alignment padding, so this is what the seal's cost is proportional
+    /// to - not the segment's length, which the padding dominates.
+    pub pitr_seal_bytes: AtomicU64,
     /// Number of WAL commit groups that reached fdatasync.
     pub wal_commit_groups: AtomicU64,
     /// Number of WAL commit groups that only contained one pending buffer.
@@ -141,6 +145,7 @@ impl WriteProfile {
         self.memtable_publish_skipmap_ns.store(0, o);
         self.memtable_publish_accounting_ns.store(0, o);
         self.pitr_seal_append_ns.store(0, o);
+        self.pitr_seal_bytes.store(0, o);
         self.wal_commit_groups.store(0, o);
         self.wal_commit_solo_groups.store(0, o);
         self.wal_commit_buffers.store(0, o);
@@ -179,6 +184,7 @@ impl WriteProfile {
             memtable_publish_skipmap_ns: self.memtable_publish_skipmap_ns.load(o),
             memtable_publish_accounting_ns: self.memtable_publish_accounting_ns.load(o),
             pitr_seal_append_ns: self.pitr_seal_append_ns.load(o),
+            pitr_seal_bytes: self.pitr_seal_bytes.load(o),
             wal_commit_groups: self.wal_commit_groups.load(o),
             wal_commit_solo_groups: self.wal_commit_solo_groups.load(o),
             wal_commit_buffers: self.wal_commit_buffers.load(o),
@@ -223,6 +229,12 @@ impl WriteProfile {
     pub(crate) fn record_pitr_seal_append_ns(&self, nanos: u64) {
         self.pitr_seal_append_ns
             .fetch_add(nanos, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn record_pitr_seal_bytes(&self, bytes: u64) {
+        self.pitr_seal_bytes
+            .fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
     }
 
     #[cfg(feature = "bench")]
@@ -340,6 +352,7 @@ pub struct WriteProfileSnapshot {
     pub memtable_publish_skipmap_ns: u64,
     pub memtable_publish_accounting_ns: u64,
     pub pitr_seal_append_ns: u64,
+    pub pitr_seal_bytes: u64,
     pub wal_commit_groups: u64,
     pub wal_commit_solo_groups: u64,
     pub wal_commit_buffers: u64,
@@ -414,6 +427,7 @@ impl WriteProfileSnapshot {
             pitr_seal_append_ns: self
                 .pitr_seal_append_ns
                 .saturating_sub(before.pitr_seal_append_ns),
+            pitr_seal_bytes: self.pitr_seal_bytes.saturating_sub(before.pitr_seal_bytes),
             wal_commit_groups: self
                 .wal_commit_groups
                 .saturating_sub(before.wal_commit_groups),
@@ -524,6 +538,14 @@ impl WriteProfileSnapshot {
         self.pitr_seal_append_ns as f64 / 1_000_000.0
     }
 
+    /// Bytes the seal hashed per recorded operation.
+    pub fn pitr_seal_bytes_per_op(&self) -> f64 {
+        if self.op_count == 0 {
+            return 0.0;
+        }
+        self.pitr_seal_bytes as f64 / self.op_count as f64
+    }
+
     pub fn total_ms(&self) -> f64 {
         self.batch_build_ms()
             + self.mvcc_wal_only_ms().max(self.wal_write_ms())
@@ -558,6 +580,7 @@ impl WriteProfileSnapshot {
              fdatasync:    {:>8.2} ms\n  \
              follower_wait:{:>8.2} ms\n  \
              pitr_seal:    {:>8.2} ms  (v5 only: leader hashes its group after fdatasync; subset of wal_sync)\n  \
+             seal_bytes:   avg={:>8.1} B/op  total={:>12} B\n  \
              follower_events: calls={:>7}  parks={:>7}  retries={:>7}\n  \
              memtable:     {:>8.2} ms  ({:>5.1}%)\n  \
              publish_parts: ttl={:>7.2} ms  decode={:>7.2} ms  bloom={:>7.2} ms  map={:>7.2} ms\n  \
@@ -587,6 +610,8 @@ impl WriteProfileSnapshot {
             self.wal_fdatasync_ms(),
             self.wal_follower_wait_ms(),
             self.pitr_seal_append_ms(),
+            self.pitr_seal_bytes_per_op(),
+            self.pitr_seal_bytes,
             self.wal_follower_wait_calls,
             self.wal_follower_condvar_waits,
             self.wal_follower_retry_loops,

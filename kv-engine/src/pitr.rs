@@ -14,10 +14,55 @@ use anyhow::{Context, Result, bail, ensure};
 use sha2::{Digest, Sha256};
 
 pub(crate) const WAL_V5_MAGIC: [u8; 4] = *b"WAL2";
-pub(crate) const WAL_V5_VERSION: u16 = 5;
+/// The v5-family version new segments claim: the v5 batch layout, with a digest
+/// that covers only each batch's own bytes. See [`WalDigestRule`].
+pub(crate) const WAL_V5_VERSION: u16 = 6;
+/// Segments written before the logical-batch digest existed. Read and verified
+/// under the rule they were written with, forever.
+pub(crate) const WAL_V5_VERSION_LEGACY: u16 = 5;
 pub(crate) const WAL_V5_HEADER_LEN: usize = 4096;
 pub(crate) const WAL_V5_BATCH_HEADER_LEN: usize = 40;
 pub(crate) const WAL_V5_ALIGNMENT: usize = 4096;
+
+/// Which bytes a segment's `wal_digest` covers. This is the only difference
+/// between a v5 and a v6 segment; the batch layout is identical.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum WalDigestRule {
+    /// Every byte of the aligned prefix, alignment padding included.
+    WholeAlignedPrefix,
+    /// The file header plus each batch's own bytes, skipping the padding
+    /// `encode_v5_batch` adds for `O_DIRECT` alignment.
+    LogicalBatches,
+}
+
+impl WalDigestRule {
+    /// The part of one batch a digest covers: the batch's whole aligned extent, or
+    /// just its own bytes. Both the walk over a file and the live accumulator call
+    /// this, so the digest a segment accumulates while it is written and the digest
+    /// a rebuild derives from the same bytes cannot disagree about the coverage.
+    ///
+    /// `extent` is the batch's `WAL_V5_BATCH_HEADER_LEN + data_len` .. aligned end
+    /// slice, `logical_len` the header plus data length it carries.
+    pub(crate) fn batch_slice(self, extent: &[u8], logical_len: usize) -> &[u8] {
+        match self {
+            Self::WholeAlignedPrefix => extent,
+            Self::LogicalBatches => &extent[..logical_len],
+        }
+    }
+}
+
+/// Both v5-family versions are read forever; only [`WAL_V5_VERSION`] is written.
+pub(crate) fn is_v5_family(version: u16) -> bool {
+    matches!(version, WAL_V5_VERSION | WAL_V5_VERSION_LEGACY)
+}
+
+pub(crate) fn wal_digest_rule(version: u16) -> Result<WalDigestRule> {
+    match version {
+        WAL_V5_VERSION => Ok(WalDigestRule::LogicalBatches),
+        WAL_V5_VERSION_LEGACY => Ok(WalDigestRule::WholeAlignedPrefix),
+        other => bail!("unsupported v5-family WAL version {other}"),
+    }
+}
 
 pub(crate) const LIVE_WAL_V5_LIMITS: WalV5Limits = WalV5Limits {
     max_input_entry_count: 1 << 20,
@@ -192,6 +237,12 @@ pub(crate) struct WalBatch {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct WalV5Header {
+    /// The v5-family version on the wire: [`WAL_V5_VERSION`] for segments written
+    /// now, [`WAL_V5_VERSION_LEGACY`] for one written before the logical-batch
+    /// digest existed. Carried on the header rather than read from the code so that
+    /// every path holding a header - including a resume of an older segment - has
+    /// the segment's own version, and so the seal can echo it.
+    pub(crate) wal_format_version: u16,
     pub(crate) timeline_id: TimelineId,
     pub(crate) archive_epoch_id: ArchiveEpochId,
     pub(crate) segment_id: SegmentId,
@@ -211,6 +262,8 @@ pub(crate) struct WalV5BatchHeader {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct DecodedBatch {
     pub(crate) batch: WalBatch,
+    /// End of the batch's own bytes, before the alignment padding that follows.
+    pub(crate) data_end: usize,
     pub(crate) logical_end: usize,
 }
 
@@ -234,7 +287,12 @@ impl std::error::Error for V5BatchDecodeError {}
 pub(crate) fn encode_v5_file_header(header: WalV5Header) -> Result<[u8; WAL_V5_HEADER_LEN]> {
     let mut output = [0; WAL_V5_HEADER_LEN];
     output[0..4].copy_from_slice(&WAL_V5_MAGIC);
-    output[4..6].copy_from_slice(&WAL_V5_VERSION.to_be_bytes());
+    ensure!(
+        is_v5_family(header.wal_format_version),
+        "unsupported v5 WAL version {}",
+        header.wal_format_version
+    );
+    output[4..6].copy_from_slice(&header.wal_format_version.to_be_bytes());
     output[8..10].copy_from_slice(&(WAL_V5_HEADER_LEN as u16).to_be_bytes());
     output[12..28].copy_from_slice(&header.timeline_id.0);
     output[28..44].copy_from_slice(&header.archive_epoch_id.0);
@@ -262,7 +320,7 @@ pub(crate) fn decode_v5_file_header(input: &[u8]) -> Result<WalV5Header> {
     ensure!(input.len() >= WAL_V5_HEADER_LEN, "truncated v5 WAL header");
     ensure!(input[0..4] == WAL_V5_MAGIC, "invalid v5 WAL magic");
     ensure!(
-        u16::from_be_bytes([input[4], input[5]]) == WAL_V5_VERSION,
+        is_v5_family(u16::from_be_bytes([input[4], input[5]])),
         "invalid v5 WAL version"
     );
     ensure!(
@@ -307,6 +365,7 @@ pub(crate) fn decode_v5_file_header(input: &[u8]) -> Result<WalV5Header> {
         "nonzero v5 predecessor reserved bytes"
     );
     Ok(WalV5Header {
+        wal_format_version: u16::from_be_bytes([input[4], input[5]]),
         timeline_id: TimelineId(input[12..28].try_into().unwrap()),
         archive_epoch_id: ArchiveEpochId(input[28..44].try_into().unwrap()),
         segment_id: SegmentId(u64::from_be_bytes(input[44..52].try_into().unwrap())),
@@ -384,6 +443,25 @@ fn encode_v5_batch_inner(batch: &WalBatch, limits: WalV5Limits) -> Result<Vec<u8
     let aligned_len = align_up(output.len())?;
     output.resize(aligned_len, 0);
     Ok(output)
+}
+
+/// The logical length of an encoded batch: its fixed header plus the data length
+/// the header carries. Everything past that, up to the alignment boundary, is
+/// padding the digest rules may or may not cover.
+pub(crate) fn encoded_v5_batch_logical_len(encoded: &[u8]) -> Result<usize> {
+    ensure!(
+        encoded.len() >= WAL_V5_BATCH_HEADER_LEN,
+        "truncated v5 batch header"
+    );
+    let data_len = u32::from_be_bytes(encoded[24..28].try_into().unwrap()) as usize;
+    let logical_len = WAL_V5_BATCH_HEADER_LEN
+        .checked_add(data_len)
+        .context("v5 batch logical length overflow")?;
+    ensure!(
+        logical_len <= encoded.len(),
+        "v5 batch data length exceeds its buffer"
+    );
+    Ok(logical_len)
 }
 
 impl WalBatch {
@@ -525,6 +603,7 @@ pub(crate) fn decode_v5_batch(
     );
     Ok(DecodedBatch {
         batch: decoded_batch,
+        data_end,
         logical_end,
     })
 }
@@ -665,6 +744,7 @@ mod tests {
 
     fn header() -> WalV5Header {
         WalV5Header {
+            wal_format_version: crate::pitr::WAL_V5_VERSION,
             timeline_id: TimelineId([1; 16]),
             archive_epoch_id: ArchiveEpochId([2; 16]),
             segment_id: SegmentId(7),
@@ -799,9 +879,17 @@ mod tests {
         assert!(decode_v5_file_header(&nonzero_predecessor).is_err());
     }
 
+    /// The frozen v5 encoding, pinned byte for byte.
+    ///
+    /// Segments written before the logical-batch digest existed keep verifying under
+    /// the rule and the version they were written with, forever, so this test exists
+    /// to fail the day the legacy encoding moves - not merely the day a digest
+    /// function does.
     #[test]
     fn v5_file_header_round_trips_and_has_zero_reserved_bytes() {
-        let encoded = encode_v5_file_header(header()).unwrap();
+        let mut legacy = header();
+        legacy.wal_format_version = WAL_V5_VERSION_LEGACY;
+        let encoded = encode_v5_file_header(legacy).unwrap();
         assert_eq!(&encoded[..4], b"WAL2");
         assert_eq!(u16::from_be_bytes([encoded[4], encoded[5]]), 5);
         assert_eq!(&encoded[128..132], &[51, 214, 118, 33]);
@@ -813,7 +901,43 @@ mod tests {
             ]
         );
         assert!(encoded[132..].iter().all(|byte| *byte == 0));
-        assert_eq!(decode_v5_file_header(&encoded).unwrap(), header());
+        assert_eq!(decode_v5_file_header(&encoded).unwrap(), legacy);
+    }
+
+    /// The same header at the version a segment written now claims: identical but
+    /// for the version field, whose value is inside the header CRC.
+    #[test]
+    fn v6_file_header_differs_from_v5_only_in_the_version_field() {
+        let mut current = header();
+        current.wal_format_version = WAL_V5_VERSION;
+        let encoded = encode_v5_file_header(current).unwrap();
+        assert_eq!(u16::from_be_bytes([encoded[4], encoded[5]]), WAL_V5_VERSION);
+        assert_eq!(decode_v5_file_header(&encoded).unwrap(), current);
+
+        let mut legacy = header();
+        legacy.wal_format_version = WAL_V5_VERSION_LEGACY;
+        let legacy = encode_v5_file_header(legacy).unwrap();
+        // The version field is inside the header CRC's preimage, so the CRC moves
+        // with it and everything else stays put.
+        assert_ne!(&encoded[..], &legacy[..]);
+        assert_eq!(encoded[6..128], legacy[6..128]);
+        assert_ne!(encoded[128..132], legacy[128..132]);
+    }
+
+    #[test]
+    fn v5_family_versions_map_to_their_digest_rules() {
+        assert_eq!(
+            wal_digest_rule(WAL_V5_VERSION_LEGACY).unwrap(),
+            WalDigestRule::WholeAlignedPrefix
+        );
+        assert_eq!(
+            wal_digest_rule(WAL_V5_VERSION).unwrap(),
+            WalDigestRule::LogicalBatches
+        );
+        assert!(is_v5_family(WAL_V5_VERSION_LEGACY));
+        assert!(is_v5_family(WAL_V5_VERSION));
+        assert!(!is_v5_family(4));
+        assert!(wal_digest_rule(4).is_err());
     }
 
     #[test]

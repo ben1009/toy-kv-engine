@@ -52,7 +52,14 @@ impl V5Seal {
         output[..8].copy_from_slice(MAGIC);
         output[8..10].copy_from_slice(&VERSION.to_be_bytes());
         output[10..12].copy_from_slice(&(HEADER_BYTES as u16).to_be_bytes());
-        output[12..14].copy_from_slice(&crate::pitr::WAL_V5_VERSION.to_be_bytes());
+        // The segment's own version, not the code's: a seal for a segment resumed
+        // from before the logical-batch digest must keep naming the old rule, or
+        // every later verification of that segment reads the wrong bytes.
+        ensure!(
+            crate::pitr::is_v5_family(self.header.wal_format_version),
+            "unsupported PITR seal WAL format"
+        );
+        output[12..14].copy_from_slice(&self.header.wal_format_version.to_be_bytes());
         output[16..32].copy_from_slice(&self.header.timeline_id.0);
         output[32..48].copy_from_slice(&self.header.archive_epoch_id.0);
         output[48..56].copy_from_slice(&self.header.segment_id.0.to_be_bytes());
@@ -103,7 +110,7 @@ impl V5Seal {
             "invalid PITR seal header length"
         );
         ensure!(
-            u16::from_be_bytes(bytes[12..14].try_into()?) == crate::pitr::WAL_V5_VERSION,
+            crate::pitr::is_v5_family(u16::from_be_bytes(bytes[12..14].try_into()?)),
             "invalid PITR seal WAL format"
         );
         ensure!(
@@ -152,6 +159,7 @@ impl V5Seal {
             _ => anyhow::bail!("unknown PITR seal predecessor kind"),
         };
         let header = WalV5Header {
+            wal_format_version: u16::from_be_bytes(bytes[12..14].try_into()?),
             timeline_id,
             archive_epoch_id,
             segment_id,
@@ -241,11 +249,19 @@ impl V5Seal {
     }
 }
 
-pub(crate) fn build_v5_seal(wal: &[u8]) -> Result<(V5Seal, Vec<u8>)> {
-    let header = crate::pitr::decode_v5_file_header(wal)?;
+/// Walk a v5-family segment: collect its seal entries, extend `hasher` with
+/// exactly the bytes `rule` covers, and return the aligned logical length the walk
+/// ended at. One implementation serves both rules, so a rebuild and a live
+/// accumulator can never disagree about what a digest covers.
+pub(crate) fn walk_v5_segment(
+    hasher: &mut Sha256,
+    wal: &[u8],
+    rule: crate::pitr::WalDigestRule,
+) -> Result<(u64, Vec<SealEntry>)> {
     ensure!(wal.len() >= WAL_V5_HEADER_LEN, "PITR WAL is truncated");
     let mut offset = WAL_V5_HEADER_LEN;
     let mut entries = Vec::new();
+    let mut spans = Vec::new();
     while offset < wal.len() {
         if wal[offset..].iter().all(|byte| *byte == 0) {
             break;
@@ -255,10 +271,49 @@ pub(crate) fn build_v5_seal(wal: &[u8]) -> Result<(V5Seal, Vec<u8>)> {
             commit_ts: decoded.batch.commit_ts,
             recorded_at: decoded.batch.recorded_at,
         });
+        spans.push((offset, decoded.logical_end, decoded.data_end - offset));
         offset = decoded.logical_end;
     }
-    let logical_length = offset as u64;
-    let wal_digest = Sha256::digest(&wal[..offset]).into();
+    match rule {
+        // A prefix rule covers every byte written so far, including the padding
+        // between and after the batches.
+        crate::pitr::WalDigestRule::WholeAlignedPrefix => hasher.update(&wal[..offset]),
+        crate::pitr::WalDigestRule::LogicalBatches => {
+            hasher.update(&wal[..WAL_V5_HEADER_LEN]);
+            for (start, end, logical_len) in spans {
+                hasher.update(rule.batch_slice(&wal[start..end], logical_len));
+            }
+        }
+    }
+    Ok((offset as u64, entries))
+}
+
+/// Recompute a segment's `wal_digest` from its bytes.
+///
+/// `rule` is checked against the rule the file's own version selects rather than
+/// trusted: every caller passes a rule it took from somewhere else - a catalog
+/// entry, a seal echo, a caller's parameter - and a mismatch there would otherwise
+/// show up only as a digest that never matches.
+pub(crate) fn wal_digest(wal: &[u8], rule: crate::pitr::WalDigestRule) -> Result<[u8; 32]> {
+    let file_rule =
+        crate::pitr::wal_digest_rule(crate::pitr::decode_v5_file_header(wal)?.wal_format_version)?;
+    ensure!(
+        file_rule == rule,
+        "PITR WAL digest rule does not match the segment's own format version"
+    );
+    let mut hasher = Sha256::new();
+    walk_v5_segment(&mut hasher, wal, rule)?;
+    Ok(hasher.finalize().into())
+}
+
+pub(crate) fn build_v5_seal(wal: &[u8]) -> Result<(V5Seal, Vec<u8>)> {
+    let header = crate::pitr::decode_v5_file_header(wal)?;
+    // The file decides the rule, so a segment written before the change keeps
+    // verifying under the rule it was written with.
+    let rule = crate::pitr::wal_digest_rule(header.wal_format_version)?;
+    let mut hasher = Sha256::new();
+    let (logical_length, entries) = walk_v5_segment(&mut hasher, wal, rule)?;
+    let wal_digest = hasher.finalize().into();
     let seal = V5Seal {
         header,
         wal_digest,
@@ -273,9 +328,160 @@ pub(crate) fn build_v5_seal(wal: &[u8]) -> Result<(V5Seal, Vec<u8>)> {
 mod tests {
     use super::*;
 
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
+    fn fixture(name: &str) -> Vec<u8> {
+        std::fs::read(
+            concat!(env!("CARGO_MANIFEST_DIR"), "/src/tests/fixtures/",).to_string() + name,
+        )
+        .unwrap()
+    }
+
+    /// A v6 digest against a preimage written out by hand.
+    ///
+    /// Without this the suite cannot tell a narrowed digest from a padded one: every
+    /// other v6 expectation is either computed by the code under test or satisfied by
+    /// a different mechanism. The padding-tamper assertions pass under either rule
+    /// (the parser refuses a nonzero gap byte before any digest is compared), and the
+    /// "digest differs from the whole file" assertion holds for a file with a
+    /// preallocated tail whatever the rule. Here the bytes are enumerated explicitly -
+    /// header, then each batch's own `data_end - offset` bytes - so a digest that
+    /// stopped stripping the padding disagrees and fails.
+    #[test]
+    fn v6_digest_covers_the_header_and_each_batch_without_its_padding() {
+        let header = crate::pitr::WalV5Header {
+            wal_format_version: crate::pitr::WAL_V5_VERSION,
+            timeline_id: crate::pitr::TimelineId([7; 16]),
+            archive_epoch_id: crate::pitr::ArchiveEpochId([8; 16]),
+            segment_id: crate::pitr::SegmentId(9),
+            predecessor: ChainAnchor::Genesis {
+                archive_epoch_id: crate::pitr::ArchiveEpochId([8; 16]),
+            },
+        };
+        let mut wal = crate::pitr::encode_v5_file_header(header).unwrap().to_vec();
+        for (commit_ts, key, value) in [
+            (1_u64, &b"alpha"[..], &b"one"[..]),
+            (2, &b"beta"[..], &b"two-longer-value"[..]),
+        ] {
+            wal.extend_from_slice(
+                &crate::pitr::encode_v5_batch(
+                    &crate::pitr::WalBatch {
+                        commit_ts,
+                        recorded_at: RecordedAt {
+                            secs: commit_ts as i64,
+                            nanos: 7,
+                        },
+                        entries: vec![crate::pitr::WalEntry::Put {
+                            key: key.to_vec(),
+                            value: value.to_vec(),
+                        }],
+                    },
+                    crate::pitr::LIVE_WAL_V5_LIMITS,
+                )
+                .unwrap(),
+            );
+        }
+
+        let mut expected = Sha256::new();
+        expected.update(&wal[..WAL_V5_HEADER_LEN]);
+        let mut offset = WAL_V5_HEADER_LEN;
+        let mut padding = 0_usize;
+        let mut batches = 0_usize;
+        while offset < wal.len() {
+            let decoded =
+                crate::pitr::decode_v5_batch(&wal, offset, crate::pitr::LIVE_WAL_V5_LIMITS)
+                    .unwrap();
+            expected.update(&wal[offset..decoded.data_end]);
+            padding += decoded.logical_end - decoded.data_end;
+            batches += 1;
+            offset = decoded.logical_end;
+        }
+        // A fixture without padding cannot tell the two rules apart.
+        assert_eq!(batches, 2);
+        assert!(padding > 0, "expected alignment padding to strip");
+        let expected: [u8; 32] = expected.finalize().into();
+
+        let (seal, _) = build_v5_seal(&wal).unwrap();
+        assert_eq!(seal.header.wal_format_version, crate::pitr::WAL_V5_VERSION);
+        assert_eq!(seal.wal_digest, expected);
+        // And it is not the whole-file hash, which is what the legacy rule would give.
+        assert_ne!(seal.wal_digest, <[u8; 32]>::from(Sha256::digest(&wal)));
+        // The legacy rule is refused on this file rather than silently answering.
+        assert!(wal_digest(&wal, crate::pitr::WalDigestRule::WholeAlignedPrefix).is_err());
+    }
+
+    /// A v5 segment written by the tree *before* the logical-batch digest existed,
+    /// committed byte for byte at `src/tests/fixtures/pitr-v5-segment.{wal,seal}`.
+    ///
+    /// A pinned digest guards a digest function; a pinned file guards the encoder,
+    /// the version the segment carries, the rule that version selects, the seal
+    /// echo and every reader at once. Segments written before the change verify
+    /// forever, so this is the test that must fail first if that stops being true.
+    #[test]
+    fn legacy_segment_fixture_still_verifies_under_its_own_rule() {
+        let wal = fixture("pitr-v5-segment.wal");
+        let frozen_seal = fixture("pitr-v5-segment.seal");
+        assert_eq!(
+            hex(&Sha256::digest(&wal)),
+            "4b6c684db2fb59eb0b9febfafa6f371c7f379e52f6c52179d966dd28ef92e03b"
+        );
+        assert_eq!(
+            hex(&Sha256::digest(&frozen_seal)),
+            "173aa1f4c3114d6a05427d666753612af8295eafc7ee0f3284cd8a3352b55542"
+        );
+
+        // Rebuilding reproduces the frozen seal rather than merely agreeing with it:
+        // same digest, same entries, same logical length, and a seal that encodes to
+        // the same bytes.
+        let (seal, seal_bytes) = build_v5_seal(&wal).unwrap();
+        assert_eq!(seal_bytes, frozen_seal);
+        assert_eq!(
+            seal.header.wal_format_version,
+            crate::pitr::WAL_V5_VERSION_LEGACY
+        );
+        assert_eq!(seal.logical_length, 12288);
+        assert_eq!(seal.entries.len(), 2);
+        // The echo the reader trusts is the segment's own version, so the legacy
+        // rule is selected by the file and nobody has to be told which to use.
+        assert_eq!(
+            crate::pitr::wal_digest_rule(seal.header.wal_format_version).unwrap(),
+            crate::pitr::WalDigestRule::WholeAlignedPrefix
+        );
+
+        // Under its own rule the digest is the whole file's, exactly as before.
+        assert_eq!(
+            wal_digest(&wal, crate::pitr::WalDigestRule::WholeAlignedPrefix).unwrap(),
+            <[u8; 32]>::from(Sha256::digest(&wal))
+        );
+        // Under the new rule it is refused, not silently different: a caller that
+        // reads the rule from anywhere but the file gets a named error.
+        let error = wal_digest(&wal, crate::pitr::WalDigestRule::LogicalBatches).unwrap_err();
+        assert!(
+            error.to_string().contains("does not match"),
+            "unexpected error: {error}"
+        );
+
+        // What the new rule would skip here: the batches' own bytes against a file
+        // that is two thirds alignment padding.
+        let mut logical = WAL_V5_HEADER_LEN;
+        let mut offset = WAL_V5_HEADER_LEN;
+        while offset < wal.len() {
+            let decoded =
+                crate::pitr::decode_v5_batch(&wal, offset, crate::pitr::LIVE_WAL_V5_LIMITS)
+                    .unwrap();
+            logical += decoded.data_end - offset;
+            offset = decoded.logical_end;
+        }
+        assert_eq!(logical, 4232);
+        assert_eq!(wal.len(), 12288);
+    }
+
     #[test]
     fn empty_header_seal_round_trips() {
         let header = WalV5Header {
+            wal_format_version: crate::pitr::WAL_V5_VERSION,
             timeline_id: crate::pitr::TimelineId([1; 16]),
             archive_epoch_id: crate::pitr::ArchiveEpochId([2; 16]),
             segment_id: crate::pitr::SegmentId(3),
@@ -296,6 +502,7 @@ mod tests {
     fn segment_predecessor_round_trips() {
         let seal = V5Seal {
             header: WalV5Header {
+                wal_format_version: crate::pitr::WAL_V5_VERSION,
                 timeline_id: crate::pitr::TimelineId([1; 16]),
                 archive_epoch_id: crate::pitr::ArchiveEpochId([2; 16]),
                 segment_id: crate::pitr::SegmentId(4),
@@ -315,6 +522,7 @@ mod tests {
     #[test]
     fn build_seal_indexes_v5_batches_and_logical_prefix() {
         let header = WalV5Header {
+            wal_format_version: crate::pitr::WAL_V5_VERSION,
             timeline_id: crate::pitr::TimelineId([1; 16]),
             archive_epoch_id: crate::pitr::ArchiveEpochId([2; 16]),
             segment_id: crate::pitr::SegmentId(3),

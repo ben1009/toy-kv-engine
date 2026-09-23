@@ -406,33 +406,149 @@ Against the original leader-side build it is 3.2x at 8 writers (control 1.005x).
 1-writer row is the reason to distrust small samples here: at 14 repetitions the same
 comparison read -11%, and the 30-repetition run above is what settled it.
 
-#### What is left, and why it is not a tweak (2026-09-23)
+#### The digest covers logical bytes now (2026-09-23)
 
-With the seal off the commit chain, the digest itself is the remaining PITR-on cost at
-low writer counts. The accumulator hashes the batch's 4 KiB-aligned buffer, and
+With the seal off the commit chain, the digest itself was the remaining PITR-on cost at
+low writer counts. The accumulator hashed the batch's 4 KiB-aligned buffer, and
 `encode_v5_batch` pads every batch up to that alignment, so a batch holding one
-128-byte value - about 180 bytes - is hashed as 4096. Measured with the seal counter timed *inside*
-the lock it takes (see the note below), 28,000 operations: 64.6 ms at 1 writer, 2.3 us
-per operation. Hashing 4096 bytes at this machine's measured 2.2 GB/s accounts for
-about 1.9 us of that, and the ~180 bytes a batch actually carries would need roughly
-0.1 us - so nearly all of it is padding. That is roughly 28% of the hot path at 1
-writer and ~11% at 16.
+128-byte value - about 180 bytes - was hashed as 4096. The digest now covers each
+batch's own bytes (its fixed header plus the data length it carries) instead of the
+padding that follows them.
 
-Making that go away is a format change, not a local edit, because `wal_digest` is not
-only the seal's digest: it *equals* `SHA256(segment file bytes)`, and the archive,
-verify and restore paths compare a freshly hashed file against that stored value in six
-places (`pitr_archiver.rs`, `pitr_archive.rs`, `pitr_restore.rs`, `backup.rs`), none of
-which parse batches. Two further couplings: the anchor digest is derived from file
-bytes at one site and taken from the seal at another, and both feed the successor's
-predecessor anchor, which is later compared stored-against-stored; and the seal's
-`logical_length` must stay a multiple of 4096 for `validate`, the manifest and segment
-truncation, so an unpadded digest cannot be expressed by shortening it. A new rule
-therefore needs a versioned seal, a story for repositories holding both versions, and a
-decision about whether the six whole-file comparisons branch on that version or move to
-a batch-aware preimage.
+**How it is carried.** The v5 file header has no spare byte - flags, reserved fields
+and the region past 132 are all asserted zero, and the header CRC covers `0..128` - so
+the only field an old decoder tolerates is the version itself. New segments therefore
+claim WAL **version 6**; **version 5 is read and verified forever** under the rule it
+was written with. `wal_digest_rule(version)` is the single mapping, the rule is taken
+from the segment's own header rather than from the running binary, and the seal echoes
+the version it was built for in the field it already had (its own `VERSION` stays 1).
+`wal_digest(wal, rule)` refuses a rule that disagrees with the file's version, so a
+wrong rule threaded through a caller is a named error rather than a digest that never
+matches. `logical_length` is unchanged and still alignment-multiple, so truncation,
+manifest accounting and `validate` are untouched.
 
-The counter note: `pitr_seal` was timed around a block that begins by taking the seal
-mutex, so at high writer counts it reported the wait for that mutex as well as the
+**What it measures.** Same session, `pitr-perf --profile --operations 28000`, three
+repetitions per build, alternating which build ran first, medians of `pitr_seal`:
+
+| writers | before | after | ratio | off-control |
+| --- | ---: | ---: | ---: | ---: |
+| 1 | 176.5 ms | 15.5 ms | **11.4x** | 0.99x |
+| 4 | 171.3 ms | 15.6 ms | 11.0x | 1.00x |
+| 8 | 177.0 ms | 19.0 ms | 9.3x | 1.02x |
+| 16 | 179.9 ms | 17.8 ms | 10.1x | 1.00x |
+| 32 | 203.8 ms | 20.1 ms | 10.1x | 1.00x |
+
+The off-control is the PITR-**disabled** case's `fdatasync` between the two binaries -
+a code path this change does not touch - so it is the check that a ratio is not just
+run order. It is what caught the first ordering: with the old build running first in
+every pair, the 1-writer control read 2.34x and its 12.3x ratio was inflated; run the
+other way the control reads 0.99x and the ratio 11.4x. The 4-32 writer rows agree
+across both orders, so only the 1-writer row needed the second ordering to settle. As
+everywhere else in this document, compare ratios within a session, not absolutes: the
+same `pitr_seal` case read 64.6 ms in the #340 session and 176-184 ms in this one.
+
+The ratio is large and the share is not, and both belong in the same sentence: the
+saving is 1-2% of the enabled path's wall clock at these writer counts - 1.9% at 4
+writers and 0.9% at 1, from a before-seal time of 155.8 ms of 171.3 ms and 161.0 ms of
+176.5 ms against ~8 s and ~17 s of wall for 28,000 operations. What the seal cost was the last *PITR-specific* phase at low writer
+counts, not a large share of the run - the rest of the enabled path's cost is the
+ordered-commit machinery, which is present with PITR off too.
+
+**A whole-run comparison says the same thing, and says it is not throughput.** The
+digest change was measured end to end against itself - the tree before it (`438903ac`)
+and after, both with PITR enabled - on a workload that spans a whole run rather than a
+phase: `write-perf --bench wal_concurrent`, 200k puts, 4 threads, 1 KiB values, tmpfs,
+20 paired repetitions with the run order alternated (the harness flag is PR #343).
+Medians: 178.3k ops/s before, 176.6k after; paired median **0.986x**, sd 0.047, 95% CI
+[0.958, 1.002], the after side faster in 7/20 (sign p = 0.26). That is a null result,
+and the run resolves nothing smaller than about 2.5%. The reason is position rather
+than size: `submit_as_leader` publishes the group - releasing `submitting` - *before*
+the leader extends the seal, so the hashing cannot extend the window the next leader
+waits on. What actually absorbs it is the next group's submit and poll work, not
+durability: on tmpfs in this shape `wal_submit` is 479.2 ms against `pitr_seal`'s
+120.8 ms, while `fdatasync` is only 15.7 ms. `pitr_seal` being a subset of `wal_sync`
+in the report is containment, not measured overlap; the case for overlap is the code
+order plus the null, not the phase arithmetic.
+
+An earlier attempt at this same comparison is part of the record: it ran to rep 16 of
+20 and then died with `put failed: commit sequencer requires recovery after unknown WAL
+durability` (the #338 family of intermittent failures), which is why the numbers above
+come from the second, complete run. It also leaves one control unproven: `seal_bytes`
+was added by the change under test, so the 1090 B/op above shows the new rule ran in
+the "after" leg, while the "before" leg's coverage rests on the byte counts quoted
+elsewhere in this section rather than on a counter in this run.
+
+Where the PITR line does stand, on that same harness and shape, is a separate question
+this measurement answers while it is set up. Pre-PITR `2f556ccb` against the head with
+PITR on, both legs alternating between the first and last position of a three-way
+rotation: **0.800x** (1/20) - so the line is ~20% behind its baseline, with the cost of
+*enabling* PITR measured separately below as ~3%. Enabling it costs, in a two-way
+comparison built so that reversal actually balances the order, **0.969x** (5/20, sd
+0.051, 95% CI [0.945, 0.993]) - real, and about a third of what the three-way rotation
+first suggested.
+
+That earlier three-way design put its middle leg in the middle in all 20 repetitions -
+reversing a three-element order leaves the second element second - so its headlines were
+middle-against-end contrasts, and two of them are withdrawn: the enabled-against-
+disabled cost it reported as 0.927x, and the disabled leg's 0.863x against pre-PITR.
+What survives from it is the pre-PITR-against-enabled contrast above (both of its legs
+do move between positions) and the composition those two give for the disabled leg,
+~0.83x, which is quoted as a composition rather than as a measurement.
+
+Two configuration details matter for reading all of these. `--target-sst-size` has to
+be above the run's footprint, or the PITR-off leg freezes, flushes and compacts inside
+the measured window while a v5 memtable defers that work: at the 1 MiB default a
+balanced eight-pair run reads the disabled leg at **0.88x** of the enabled one (156.5k
+against 172.7k ops/s, sd 0.11), the two legs doing different jobs rather than PITR being
+fast, and an earlier single run of the same pair (0.75x) was an uncontrolled outlier
+above every one of those readings. And the enabled leg runs inside a single segment with
+archival parked out of the way (PR #343's `--pitr`), so the measured window contains no
+rotation, boundary or archival work - the costs this document measures elsewhere as
+small but nonzero. Read the ~3% as the write path with PITR enabled, not as a
+deployment's steady state.
+
+The mechanism is visible in one more counter: `seal_bytes` (added here) reads
+**205 B/op** after, against the 4096 B/op the old rule hashed - the harness's own
+`commit_bytes avg = 4096 B` at 1 writer and `avg_bufs = 1.00`. So the bytes hashed per
+operation fell ~20x while the time fell ~10x. The residual is per-group call overhead,
+not hashing: 15.0 ms per 28,000 operations is 0.54 us/op, of which the 205 bytes at
+this machine's 2.2 GB/s account for ~0.09 us. What is left of `pitr_seal` is the lock,
+the entry push and the per-buffer call - a floor that the 4096-byte case's hash used to
+hide.
+
+**What the rule does not attest any more.** A v6 digest skips the alignment gaps, so a
+byte flipped inside one is no longer a digest mismatch. It is still refused, and at
+every verification depth: deriving a stored WAL digest walks the batches, so the
+parser's nonzero-gap check runs before the digest is compared, shallow depth included.
+The accurate statement is that the digest no longer *attests* the padding, not that
+anything stopped *checking* it. v5 segments are unaffected either way: their rule
+covers every byte. What a test pins here is the coverage itself - `pitr_seal.rs`
+compares a v6 digest against a preimage spelled out by hand, which a digest that
+stopped stripping the padding would fail.
+
+**Keeping v5 forever is tested against bytes, not intentions.** `src/tests/fixtures/`
+holds a two-batch v5 segment and its seal, generated by the tree from *before* this
+change (`438903ac`) and committed as bytes, with their SHA-256s pinned. The test
+rebuilds the seal from the frozen WAL and requires the frozen seal back, byte for byte;
+checks the legacy rule still equals `SHA256(file)`; and checks the new rule is refused
+on that file rather than silently producing a different digest. A segment resumed after
+the upgrade keeps the old rule and keeps saying so in the seal it writes - also tested,
+including that its digest still covers the preallocated tail up to `logical_length`,
+which is the length the engine truncates to before archiving.
+
+**Upgrade and rollback.** New segments are v6; a repository that holds both verifies
+each under its own rule, which the mixed-version archive-and-restore test drives end to
+end (the successor's predecessor anchor is a *stored* v5 digest inside a v6 header, and
+object names are built from those stored digests). An *older* binary cannot open a
+repository whose active segment is v6 - it refuses at `open_and_detect` rather than
+misreading it - so rolling back needs the active segment closed with `disable_pitr`
+(which installs a plain v4 WAL) or the repository restored from backup.
+`PITR_BASE_WAL_REPLAY_VERSION` is deliberately **not** bumped: it describes the base
+snapshot's replay contract, not a segment's wire format, and bumping it would
+invalidate existing bases.
+
+The counter note: `pitr_seal` used to be timed around a block that begins by taking the
+seal mutex, so at high writer counts it reported the wait for that mutex as well as the
 hashing - 134.0 ms against 110.6 ms for the same case once the timer moved inside the
 lock. Numbers quoted from it before 2026-09-23 include the wait.
 
@@ -442,4 +558,3 @@ segment bytes` - each operation occupies one 4 KiB-aligned buffer, whatever the
 value's size, so the 128 MiB `max_segment_bytes` admits about 32,768 operations - and
 an aborted case prints nothing on stdout. A run that produces
 an empty result file is that, not a crash.
-

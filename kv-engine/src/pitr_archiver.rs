@@ -28,10 +28,7 @@ pub(crate) fn set_catalog_publication_test_mode(repository: &std::path::Path, mo
 }
 
 #[cfg(target_os = "linux")]
-use anyhow::{Context, Result, ensure};
-
-#[cfg(target_os = "linux")]
-use sha2::{Digest, Sha256};
+use anyhow::{Context, Result};
 
 #[cfg(target_os = "linux")]
 use crate::{
@@ -293,6 +290,7 @@ impl PitrArchiver {
             wal_path.as_ref(),
             metadata.wal_bytes,
             metadata.wal_digest,
+            crate::pitr_archive::SourceObjectDigest::Wal(metadata.wal_digest_rule()?),
             chunk_bytes,
             &self.limiter,
             &self.priority,
@@ -311,6 +309,7 @@ impl PitrArchiver {
             seal_path.as_ref(),
             0,
             metadata.seal_digest,
+            crate::pitr_archive::SourceObjectDigest::WholeObject,
             chunk_bytes,
             &self.limiter,
             &self.priority,
@@ -325,18 +324,6 @@ impl PitrArchiver {
                 };
             }
         };
-        ensure!(
-            wal.len() as u64 == metadata.wal_bytes,
-            "PITR WAL length does not match segment metadata"
-        );
-        ensure!(
-            Sha256::digest(&wal).as_slice() == metadata.wal_digest,
-            "PITR WAL digest does not match segment metadata"
-        );
-        ensure!(
-            Sha256::digest(&seal).as_slice() == metadata.seal_digest,
-            "PITR seal digest does not match segment metadata"
-        );
         self.archive_segment_inner(metadata, &wal, &seal, now, 1, cancellation)
     }
 
@@ -463,6 +450,7 @@ fn read_source_object(
     path: &std::path::Path,
     expected_bytes: u64,
     expected_digest: [u8; 32],
+    digest: crate::pitr_archive::SourceObjectDigest,
     chunk_bytes: usize,
     limiter: &PitrArchiveLimiter,
     priority: &parking_lot::Mutex<crate::pitr_api::ArchiveIoPriority>,
@@ -522,7 +510,7 @@ fn read_source_object(
         );
     }
     anyhow::ensure!(
-        Sha256::digest(&bytes).as_slice() == expected_digest,
+        digest.digest(&bytes)?.as_slice() == expected_digest,
         "PITR source object digest does not match segment metadata"
     );
     Ok(bytes)
@@ -570,8 +558,28 @@ mod tests {
     use sha2::{Digest, Sha256};
     use std::path::PathBuf;
 
+    /// The segment's identity, shared by its WAL header and its metadata.
+    fn header() -> crate::pitr::WalV5Header {
+        crate::tests::harness::pitr_segment_header(
+            TimelineId([2; 16]),
+            ArchiveEpochId([3; 16]),
+            SegmentId(1),
+            ChainAnchor::Genesis {
+                archive_epoch_id: ArchiveEpochId([3; 16]),
+            },
+            crate::pitr::WAL_V5_VERSION,
+        )
+    }
+
+    /// A real v5 WAL, not a stand-in: the digest rules are defined over the
+    /// encoding, so a payload that is not a WAL cannot be verified under one.
+    fn wal_bytes() -> Vec<u8> {
+        crate::tests::harness::pitr_segment_wal_bytes(header())
+    }
+
     fn metadata() -> SegmentMetadata {
-        let wal_digest = Sha256::digest(b"wal").into();
+        let wal_digest =
+            crate::tests::harness::pitr_wal_digest(&wal_bytes(), crate::pitr::WAL_V5_VERSION);
         let seal_digest = Sha256::digest(b"seal").into();
         SegmentMetadata {
             key: SegmentKey {
@@ -580,7 +588,7 @@ mod tests {
                 archive_epoch_id: ArchiveEpochId([3; 16]),
                 segment_id: SegmentId(1),
             },
-            wal_format_version: 5,
+            wal_format_version: crate::pitr::WAL_V5_VERSION,
             seal_format_version: 1,
             anchor: SegmentAnchor {
                 segment_id: SegmentId(1),
@@ -593,12 +601,214 @@ mod tests {
             first_commit_ts: Some(1),
             last_commit_ts: Some(1),
             batch_count: 1,
-            logical_bytes: 3,
-            wal_bytes: 3,
+            logical_bytes: wal_bytes().len() as u64,
+            wal_bytes: wal_bytes().len() as u64,
             wal_digest,
             seal_digest,
             source_identity: [4; 32],
         }
+    }
+
+    /// A repository holding a segment written before the logical-batch digest and
+    /// one written after it, archived, chained and verified in one go.
+    ///
+    /// This is the boundary the rule change is most likely to break: the successor's
+    /// predecessor anchor is a *stored* digest copied from the older segment, so it
+    /// is a v5-rule value sitting in a v6 segment's header, and object names are
+    /// built from those stored digests. Nothing may re-derive either under the
+    /// running binary's rule.
+    #[test]
+    fn mixed_version_repository_archives_verifies_and_chains() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("wal")).unwrap();
+        let mut archiver = PitrArchiver::new(
+            root.path(),
+            ArchiveLimiterOptions {
+                bytes_per_second: None,
+                burst_bytes: NonZeroU64::new(4096).unwrap(),
+            },
+            Instant::now(),
+        )
+        .unwrap();
+
+        // The frozen legacy segment, straight from the fixtures.
+        let legacy_wal = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/tests/fixtures/pitr-v5-segment.wal"
+        ))
+        .unwrap();
+        let legacy_seal = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/tests/fixtures/pitr-v5-segment.seal"
+        ))
+        .unwrap();
+        let legacy_header = crate::pitr::decode_v5_file_header(&legacy_wal).unwrap();
+        assert_eq!(
+            legacy_header.wal_format_version,
+            crate::pitr::WAL_V5_VERSION_LEGACY
+        );
+        let legacy_wal_digest: [u8; 32] = Sha256::digest(&legacy_wal).into();
+        let legacy_seal_digest: [u8; 32] = Sha256::digest(&legacy_seal).into();
+        let legacy = SegmentMetadata {
+            key: SegmentKey {
+                repository_id: [1; 16],
+                timeline_id: legacy_header.timeline_id,
+                archive_epoch_id: legacy_header.archive_epoch_id,
+                segment_id: legacy_header.segment_id,
+            },
+            wal_format_version: legacy_header.wal_format_version,
+            seal_format_version: 1,
+            anchor: SegmentAnchor {
+                segment_id: legacy_header.segment_id,
+                wal_digest: legacy_wal_digest,
+                seal_digest: legacy_seal_digest,
+            },
+            predecessor: legacy_header.predecessor,
+            first_commit_ts: Some(1),
+            last_commit_ts: Some(2),
+            batch_count: 2,
+            logical_bytes: legacy_wal.len() as u64,
+            wal_bytes: legacy_wal.len() as u64,
+            wal_digest: legacy_wal_digest,
+            seal_digest: legacy_seal_digest,
+            source_identity: [4; 32],
+        };
+
+        // Its successor, written under the new rule, pointing back at the legacy
+        // segment's stored anchor.
+        let successor_id = crate::pitr::SegmentId(legacy_header.segment_id.0 + 1);
+        let successor_header = crate::tests::harness::pitr_segment_header(
+            legacy_header.timeline_id,
+            legacy_header.archive_epoch_id,
+            successor_id,
+            crate::pitr::ChainAnchor::Segment(crate::pitr::SegmentAnchor {
+                segment_id: legacy_header.segment_id,
+                wal_digest: legacy_wal_digest,
+                seal_digest: legacy_seal_digest,
+            }),
+            crate::pitr::WAL_V5_VERSION,
+        );
+        // After the legacy segment's range, which ends at 2.
+        let successor_wal = crate::tests::harness::pitr_segment_wal_bytes_at(successor_header, 3);
+        let (successor_seal_parsed, successor_seal) =
+            crate::pitr_seal::build_v5_seal(&successor_wal).unwrap();
+        let successor = SegmentMetadata {
+            key: SegmentKey {
+                repository_id: [1; 16],
+                timeline_id: successor_header.timeline_id,
+                archive_epoch_id: successor_header.archive_epoch_id,
+                segment_id: successor_id,
+            },
+            wal_format_version: successor_header.wal_format_version,
+            seal_format_version: 1,
+            anchor: SegmentAnchor {
+                segment_id: successor_id,
+                wal_digest: successor_seal_parsed.wal_digest,
+                seal_digest: Sha256::digest(&successor_seal).into(),
+            },
+            predecessor: successor_header.predecessor,
+            first_commit_ts: successor_seal_parsed.first_commit_ts(),
+            last_commit_ts: successor_seal_parsed.last_commit_ts(),
+            batch_count: successor_seal_parsed.entries.len() as u64,
+            logical_bytes: successor_seal_parsed.logical_length,
+            wal_bytes: successor_seal_parsed.logical_length,
+            wal_digest: successor_seal_parsed.wal_digest,
+            seal_digest: Sha256::digest(&successor_seal).into(),
+            source_identity: [5; 32],
+        };
+
+        for (metadata, wal, seal) in [
+            (legacy.clone(), &legacy_wal, &legacy_seal),
+            (successor.clone(), &successor_wal, &successor_seal),
+        ] {
+            assert!(matches!(
+                archiver
+                    .archive_segment(metadata, wal, seal, Instant::now())
+                    .unwrap(),
+                ArchiveTransactionOutcome::Committed { .. }
+            ));
+        }
+
+        // The catalog keeps both, in order, with the successor still anchored to the
+        // legacy digest - the value that only the legacy rule reproduces.
+        let replay = crate::pitr_catalog::replay_catalog(archiver.catalog_bytes()).unwrap();
+        let committed = replay
+            .records
+            .iter()
+            .filter_map(|record| match record {
+                crate::pitr_catalog::PitrCatalogRecord::CommitSegment { metadata } => {
+                    Some(metadata.clone())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(committed.len(), 2);
+        assert_eq!(
+            committed[0].wal_format_version,
+            crate::pitr::WAL_V5_VERSION_LEGACY
+        );
+        assert_eq!(committed[1].wal_format_version, crate::pitr::WAL_V5_VERSION);
+        assert_eq!(
+            committed[1].predecessor,
+            crate::pitr::ChainAnchor::Segment(committed[0].anchor)
+        );
+
+        // Restore-side verification agrees with both rules, from the stored digests
+        // alone - and both objects are named after the digests it checks.
+        let wal_dir = root.path().join("wal");
+        for (metadata, wal) in [
+            (&committed[0], &legacy_wal),
+            (&committed[1], &successor_wal),
+        ] {
+            let name = crate::pitr_archive::archive_object_name(
+                metadata.key.timeline_id,
+                metadata.key.archive_epoch_id,
+                metadata.key.segment_id,
+                crate::pitr_archive::ArchiveObjectKind::Wal,
+                metadata.wal_digest,
+            );
+            let stored = std::fs::read(wal_dir.join(&name)).unwrap();
+            assert_eq!(&stored, wal);
+            let object = crate::pitr_restore::PitrRestoreSourceObject {
+                segment_id: metadata.key.segment_id,
+                kind: crate::pitr_archive::ArchiveObjectKind::Wal,
+                name,
+                digest: metadata.wal_digest,
+                bytes: Some(metadata.wal_bytes),
+                wal_digest_rule: metadata.wal_digest_rule().unwrap(),
+            };
+            crate::pitr_restore::verify_source_object(&object, &stored).unwrap();
+            // A flipped padding byte is refused here under either rule - the parser
+            // rejects a nonzero alignment gap before any digest is compared - so this
+            // asserts the object is not accepted, not that the legacy rule caught it.
+            // That the legacy digest covers the padding is pinned by the frozen
+            // fixture's `wal_digest == SHA256(file)` in `pitr_seal.rs`.
+            let mut tampered = stored.clone();
+            let last = tampered.len() - 1;
+            tampered[last] ^= 1;
+            assert!(crate::pitr_restore::verify_source_object(&object, &tampered).is_err());
+        }
+        // The new rule does not cover its padding, so the parser is what refuses a
+        // corrupted gap there: pin that the narrowing is deliberate.
+        let name = crate::pitr_archive::archive_object_name(
+            committed[1].key.timeline_id,
+            committed[1].key.archive_epoch_id,
+            committed[1].key.segment_id,
+            crate::pitr_archive::ArchiveObjectKind::Wal,
+            committed[1].wal_digest,
+        );
+        let mut tampered = successor_wal.clone();
+        let gap = crate::pitr::WAL_V5_HEADER_LEN + crate::pitr::WAL_V5_BATCH_HEADER_LEN + 64;
+        tampered[gap] ^= 1;
+        let object = crate::pitr_restore::PitrRestoreSourceObject {
+            segment_id: committed[1].key.segment_id,
+            kind: crate::pitr_archive::ArchiveObjectKind::Wal,
+            name,
+            digest: committed[1].wal_digest,
+            bytes: Some(committed[1].wal_bytes),
+            wal_digest_rule: committed[1].wal_digest_rule().unwrap(),
+        };
+        assert!(crate::pitr_restore::verify_source_object(&object, &tampered).is_err());
     }
 
     #[test]
@@ -608,11 +818,17 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir(&root).unwrap();
         let start = Instant::now();
+        // Sized against the fixture rather than a handful of stand-in bytes: the
+        // segment is real, so one burst has to cover the whole WAL's chunk - charged
+        // once per I/O operation per chunk - with room left for the seal's, and one
+        // chunk has to hold the whole WAL, or the archiver legitimately sleeps out a
+        // refill for every one of hundreds of chunks.
+        let burst = wal_bytes().len() as u64 * 3;
         let mut archiver = PitrArchiver::new(
             &root,
             ArchiveLimiterOptions {
-                bytes_per_second: NonZeroU64::new(10),
-                burst_bytes: NonZeroU64::new(20).unwrap(),
+                bytes_per_second: NonZeroU64::new(burst * 2),
+                burst_bytes: NonZeroU64::new(burst).unwrap(),
             },
             start,
         )
@@ -620,19 +836,19 @@ mod tests {
         let first = metadata();
         assert!(matches!(
             archiver
-                .archive_segment(first.clone(), b"wal", b"seal", start)
+                .archive_segment(first.clone(), &wal_bytes(), b"seal", start)
                 .unwrap(),
             ArchiveTransactionOutcome::Committed { sequence: 1 }
         ));
         assert!(matches!(
             archiver
-                .archive_segment(first.clone(), b"wal", b"seal", start)
+                .archive_segment(first.clone(), &wal_bytes(), b"seal", start)
                 .unwrap(),
             ArchiveTransactionOutcome::RateLimited { .. }
         ));
         assert!(matches!(
             archiver
-                .archive_segment(first, b"wal", b"seal", start + Duration::from_secs(2))
+                .archive_segment(first, &wal_bytes(), b"seal", start + Duration::from_secs(2))
                 .unwrap(),
             ArchiveTransactionOutcome::AlreadyCommitted { sequence: 1 }
         ));
@@ -655,7 +871,7 @@ mod tests {
             .unwrap();
             set_catalog_publication_test_mode(root.path(), mode);
             let outcome = archiver
-                .archive_segment(metadata(), b"wal", b"seal", Instant::now())
+                .archive_segment(metadata(), &wal_bytes(), b"seal", Instant::now())
                 .unwrap();
             assert_eq!(
                 matches!(
@@ -681,7 +897,7 @@ mod tests {
         std::fs::create_dir(&root).unwrap();
         let wal_path = root.join("source.wal");
         let seal_path = root.join("source.seal");
-        std::fs::write(&wal_path, b"wal").unwrap();
+        std::fs::write(&wal_path, wal_bytes()).unwrap();
         std::fs::write(&seal_path, b"seal").unwrap();
         let mut archiver = PitrArchiver::new(
             &root,
@@ -719,6 +935,7 @@ mod tests {
             &path,
             3,
             Sha256::digest(b"wal").into(),
+            crate::pitr_archive::SourceObjectDigest::WholeObject,
             2,
             &limiter,
             &priority,
@@ -806,7 +1023,7 @@ mod tests {
         let moved = parent.path().join("repository-moved");
         std::fs::rename(&repository, &moved).unwrap();
         let outcome = archiver
-            .archive_segment(metadata(), b"wal", b"seal", Instant::now())
+            .archive_segment(metadata(), &wal_bytes(), b"seal", Instant::now())
             .unwrap();
         assert!(matches!(
             outcome,
@@ -828,7 +1045,7 @@ mod tests {
                 Instant::now(),
             )
             .unwrap();
-            let _ = archiver.archive_segment(metadata(), b"wal", b"seal", Instant::now());
+            let _ = archiver.archive_segment(metadata(), &wal_bytes(), b"seal", Instant::now());
             unreachable!("child must exit at the catalog rename boundary");
         }
         let status = std::process::Command::new(std::env::current_exe().unwrap())
@@ -875,7 +1092,7 @@ mod tests {
                 Instant::now(),
             )
             .unwrap();
-            let _ = archiver.archive_segment(metadata(), b"wal", b"seal", Instant::now());
+            let _ = archiver.archive_segment(metadata(), &wal_bytes(), b"seal", Instant::now());
             unreachable!("child must exit at the object rename boundary");
         }
         let status = std::process::Command::new(std::env::current_exe().unwrap())
@@ -915,7 +1132,7 @@ mod tests {
                 Instant::now(),
             )
             .unwrap();
-            let _ = archiver.archive_segment(metadata(), b"wal", b"seal", Instant::now());
+            let _ = archiver.archive_segment(metadata(), &wal_bytes(), b"seal", Instant::now());
             unreachable!("child must exit after catalog directory sync");
         }
         let status = std::process::Command::new(std::env::current_exe().unwrap())
@@ -966,7 +1183,7 @@ mod tests {
         .unwrap();
         assert!(matches!(
             archiver
-                .archive_segment(first.clone(), b"wal", b"seal", start)
+                .archive_segment(first.clone(), &wal_bytes(), b"seal", start)
                 .unwrap(),
             ArchiveTransactionOutcome::Committed { sequence: 1 }
         ));
@@ -983,7 +1200,7 @@ mod tests {
         .unwrap();
         assert!(matches!(
             reopened
-                .archive_segment(first, b"wal", b"seal", start)
+                .archive_segment(first, &wal_bytes(), b"seal", start)
                 .unwrap(),
             ArchiveTransactionOutcome::AlreadyCommitted { sequence: 1 }
         ));

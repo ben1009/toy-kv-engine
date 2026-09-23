@@ -1955,17 +1955,19 @@ impl BackupRepository {
                 crate::pitr_archive::ArchiveObjectKind::Seal,
                 metadata.seal_digest,
             );
-            for (name, expected_bytes, expected_digest, kind) in [
+            for (name, expected_bytes, expected_digest, digest, kind) in [
                 (
                     wal_name,
                     Some(metadata.wal_bytes),
                     metadata.wal_digest,
+                    crate::pitr_archive::SourceObjectDigest::Wal(metadata.wal_digest_rule()?),
                     crate::pitr_api::SegmentFailureKind::Missing,
                 ),
                 (
                     seal_name,
                     None,
                     metadata.seal_digest,
+                    crate::pitr_archive::SourceObjectDigest::WholeObject,
                     crate::pitr_api::SegmentFailureKind::Missing,
                 ),
             ] {
@@ -1988,8 +1990,12 @@ impl BackupRepository {
                 let mut file = File::from(fd);
                 let mut bytes = Vec::new();
                 file.read_to_end(&mut bytes)?;
+                // A digest that cannot even be derived - a WAL whose batches do
+                // not parse - is exactly as much a corruption as a mismatch.
                 if expected_bytes.is_some_and(|size| size != bytes.len() as u64)
-                    || Sha256::digest(&bytes).as_slice() != expected_digest
+                    || !digest
+                        .digest(&bytes)
+                        .is_ok_and(|actual| actual.as_slice() == expected_digest)
                 {
                     return Ok(crate::pitr_api::VerifyPitrReport {
                         verified_intervals: verified_intervals.clone(),
@@ -3283,7 +3289,8 @@ impl BackupRepository {
             let mut wal = Vec::new();
             file.read_to_end(&mut wal)?;
             ensure!(
-                Sha256::digest(&wal).as_slice() == metadata.wal_digest,
+                crate::pitr_seal::wal_digest(&wal, metadata.wal_digest_rule()?)?.as_slice()
+                    == metadata.wal_digest,
                 "PITR restore WAL digest mismatch"
             );
             let seal_name = crate::pitr_archive::archive_object_name(

@@ -2742,6 +2742,7 @@ impl KvEngine {
                 let state_lock = self.inner.state_lock.lock();
                 self.inner.install_pitr_v5_successor(
                     crate::pitr::WalV5Header {
+                        wal_format_version: crate::pitr::WAL_V5_VERSION,
                         timeline_id,
                         archive_epoch_id,
                         segment_id: crate::pitr::SegmentId(0),
@@ -3214,7 +3215,17 @@ impl KvEngine {
             wal.len() == seal.logical_length as usize,
             "sealed PITR source WAL length mismatch"
         );
-        let wal_digest: [u8; 32] = sha2::Sha256::digest(&wal).into();
+        // Derive the digest under the rule the segment itself records, and hold it
+        // to the seal's own value. This used to recompute unconditionally under a
+        // whole-file hash and overwrite whatever the seal said; the value becomes
+        // the successor's predecessor anchor, so a silent divergence here would
+        // only surface later, as a chain that no longer verifies.
+        let wal_digest_rule = crate::pitr::wal_digest_rule(seal.header.wal_format_version)?;
+        let wal_digest = crate::pitr_seal::wal_digest(&wal, wal_digest_rule)?;
+        ensure!(
+            wal_digest == seal.wal_digest,
+            "sealed PITR source WAL digest does not match its seal"
+        );
         let seal_digest: [u8; 32] = sha2::Sha256::digest(&seal_bytes).into();
         let source_identity: [u8; 32] =
             sha2::Sha256::digest([wal_digest.as_slice(), seal_digest.as_slice()].concat()).into();
@@ -3234,7 +3245,7 @@ impl KvEngine {
                     archive_epoch_id: crate::pitr::ArchiveEpochId(archive_epoch_id),
                     segment_id: crate::pitr::SegmentId(segment_id),
                 },
-                wal_format_version: 5,
+                wal_format_version: seal.header.wal_format_version,
                 seal_format_version: 1,
                 anchor: crate::pitr::SegmentAnchor {
                     segment_id: crate::pitr::SegmentId(segment_id),
@@ -3437,7 +3448,7 @@ impl KvEngine {
                     archive_epoch_id: crate::pitr::ArchiveEpochId(archive_epoch_id),
                     segment_id: crate::pitr::SegmentId(active_segment_id),
                 },
-                wal_format_version: 5,
+                wal_format_version: seal.header.wal_format_version,
                 seal_format_version: 1,
                 anchor: crate::pitr::SegmentAnchor {
                     segment_id: crate::pitr::SegmentId(active_segment_id),
@@ -3473,6 +3484,7 @@ impl KvEngine {
             let state_lock = self.inner.state_lock.lock();
             self.inner.install_pitr_v5_successor(
                 crate::pitr::WalV5Header {
+                    wal_format_version: crate::pitr::WAL_V5_VERSION,
                     timeline_id: crate::pitr::TimelineId(timeline_id),
                     archive_epoch_id: crate::pitr::ArchiveEpochId(archive_epoch_id),
                     segment_id: crate::pitr::SegmentId(successor_segment_id),
@@ -4260,6 +4272,7 @@ impl KvEngine {
         let timeline_id = coordinator.state().timeline_id.unwrap();
         let archive_epoch_id = coordinator.state().archive_epoch_id.unwrap();
         let header = crate::pitr::WalV5Header {
+            wal_format_version: crate::pitr::WAL_V5_VERSION,
             timeline_id: crate::pitr::TimelineId(timeline_id),
             archive_epoch_id: crate::pitr::ArchiveEpochId(archive_epoch_id),
             segment_id: crate::pitr::SegmentId(0),
@@ -6782,6 +6795,7 @@ impl LsmStorageInner {
                         ),
                     };
                     let header = crate::pitr::WalV5Header {
+                        wal_format_version: crate::pitr::WAL_V5_VERSION,
                         timeline_id: crate::pitr::TimelineId(timeline_id),
                         archive_epoch_id: crate::pitr::ArchiveEpochId(archive_epoch_id),
                         segment_id: crate::pitr::SegmentId(active_segment_id),
@@ -7124,6 +7138,7 @@ impl LsmStorageInner {
                         vlog_enabled,
                         wal_path,
                         crate::pitr::WalV5Header {
+                            wal_format_version: crate::pitr::WAL_V5_VERSION,
                             timeline_id,
                             archive_epoch_id,
                             segment_id,
@@ -11131,6 +11146,7 @@ impl LsmStorageInner {
                     vlog_enabled,
                     self.path_of_wal(sst_id),
                     crate::pitr::WalV5Header {
+                        wal_format_version: crate::pitr::WAL_V5_VERSION,
                         timeline_id,
                         archive_epoch_id,
                         segment_id: crate::pitr::SegmentId(segment_id),
@@ -11842,6 +11858,7 @@ mod tests {
             .inner
             .install_pitr_v5_successor(
                 crate::pitr::WalV5Header {
+                    wal_format_version: crate::pitr::WAL_V5_VERSION,
                     timeline_id: crate::pitr::TimelineId([2; 16]),
                     archive_epoch_id: crate::pitr::ArchiveEpochId([3; 16]),
                     segment_id: crate::pitr::SegmentId(0),
@@ -12560,6 +12577,7 @@ mod tests {
             .inner
             .install_pitr_v5_successor(
                 crate::pitr::WalV5Header {
+                    wal_format_version: crate::pitr::WAL_V5_VERSION,
                     timeline_id: crate::pitr::TimelineId([2; 16]),
                     archive_epoch_id: crate::pitr::ArchiveEpochId([3; 16]),
                     segment_id: crate::pitr::SegmentId(0),
@@ -14687,6 +14705,7 @@ mod tests {
         crate::pitr_segment::install_v5_wal_header(
             database.join("pitr-00000000000000000001.wal"),
             crate::pitr::WalV5Header {
+                wal_format_version: crate::pitr::WAL_V5_VERSION,
                 timeline_id: crate::pitr::TimelineId(timeline_id),
                 archive_epoch_id: crate::pitr::ArchiveEpochId(archive_epoch_id),
                 segment_id: crate::pitr::SegmentId(1),
@@ -14704,6 +14723,7 @@ mod tests {
                     false,
                     database.join(format!("pitr-{successor_id:020}.wal")),
                     crate::pitr::WalV5Header {
+                        wal_format_version: crate::pitr::WAL_V5_VERSION,
                         timeline_id: crate::pitr::TimelineId(timeline_id),
                         archive_epoch_id: crate::pitr::ArchiveEpochId(archive_epoch_id),
                         segment_id: crate::pitr::SegmentId(successor_id),

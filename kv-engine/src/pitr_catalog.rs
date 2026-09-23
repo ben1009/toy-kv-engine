@@ -115,8 +115,18 @@ pub(crate) struct SegmentMetadata {
 }
 
 impl SegmentMetadata {
+    /// The rule this segment's `wal_digest` follows. Taken from the segment's own
+    /// recorded version, so a repository holding segments from before the
+    /// logical-batch digest keeps verifying each under the rule it was written with.
+    pub(crate) fn wal_digest_rule(&self) -> Result<crate::pitr::WalDigestRule> {
+        crate::pitr::wal_digest_rule(self.wal_format_version)
+    }
+
     fn validate(&self) -> Result<()> {
-        ensure!(self.wal_format_version == 5, "unsupported PITR WAL format");
+        ensure!(
+            crate::pitr::is_v5_family(self.wal_format_version),
+            "unsupported PITR WAL format"
+        );
         ensure!(
             self.seal_format_version == 1,
             "unsupported PITR seal format"
@@ -1214,7 +1224,7 @@ mod tests {
                 archive_epoch_id: ArchiveEpochId([9; 16]),
                 segment_id: SegmentId(segment_id),
             },
-            wal_format_version: 5,
+            wal_format_version: crate::pitr::WAL_V5_VERSION,
             seal_format_version: 1,
             anchor: SegmentAnchor {
                 segment_id: SegmentId(segment_id),

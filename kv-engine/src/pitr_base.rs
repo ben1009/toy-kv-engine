@@ -14,6 +14,12 @@ use crate::pitr_manifest::{
     replay_pitr_records,
 };
 
+/// The replay contract a base snapshot is captured under. Deliberately not the WAL
+/// wire version: a base's segments now carry v6 headers, and a base recorded as 5
+/// is not exempt from the v6 digest rule. Nothing here decodes a segment - the rule
+/// comes from each segment's own header, and `wal_digest` refuses a disagreement -
+/// so this value describes the replay contract alone and must not be read as "the
+/// segments in this base are v5".
 pub(crate) const PITR_BASE_WAL_REPLAY_VERSION: u16 = 5;
 
 /// Canonical compatibility preimage for a PITR base generation.
