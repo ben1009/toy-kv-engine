@@ -1,6 +1,6 @@
 use std::{
     num::NonZeroU64,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{Arc, Barrier},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -17,6 +17,21 @@ use kv_engine::{
 struct Args {
     #[arg(long, default_value_t = 10_000)]
     operations: usize,
+    /// Writer counts to sweep, in order. Each is run once with PITR disabled and
+    /// once enabled, so a sweep is twice as long as the list.
+    #[arg(long, default_value = "1,4,8,16,32", value_delimiter = ',')]
+    writers: Vec<usize>,
+    /// Which modes to run. A profiler needs `on` or `off` on its own: the two
+    /// cases share a process, so samples from a `both` run cannot be attributed
+    /// to one path.
+    #[arg(long, default_value = "both", value_parser = ["on", "off", "both"])]
+    modes: String,
+    /// Value size in bytes. The PITR WAL pads every batch to 4 KiB regardless, so
+    /// this is the control that separates "the enabled path moves 4 KiB per op"
+    /// from "the enabled path has different concurrency": raising the size moves
+    /// the same bytes through the disabled path.
+    #[arg(long, default_value_t = 128)]
+    value_size: usize,
     #[arg(long, default_value = "/tmp")]
     root: PathBuf,
     /// Print the engine's write-profile phases for each case, so the
@@ -30,7 +45,11 @@ struct Args {
 fn main() -> Result<()> {
     let args = Args::parse();
     ensure!(args.operations > 0, "operations must be nonzero");
-    for (case_index, writers) in [1usize, 4, 8, 16, 32].into_iter().enumerate() {
+    ensure!(
+        !args.writers.is_empty() && args.writers.iter().all(|&w| w > 0),
+        "every writer count must be nonzero"
+    );
+    for (case_index, &writers) in args.writers.iter().enumerate() {
         // Counterbalance the mode order across cases. Running PITR-disabled first
         // every time would let host state that drifts over the run - thermal,
         // page cache, neighbours - land on one mode only, and bias the comparison.
@@ -45,6 +64,13 @@ fn main() -> Result<()> {
         // second there.
         let pitr_first = case_index % 2 == 0;
         for pitr in [pitr_first, !pitr_first] {
+            if match args.modes.as_str() {
+                "on" => !pitr,
+                "off" => pitr,
+                _ => false,
+            } {
+                continue;
+            }
             run_case(&args, writers, pitr, pitr_first)?;
         }
     }
@@ -58,9 +84,25 @@ fn run_case(args: &Args, writers: usize, pitr: bool, pitr_first: bool) -> Result
         std::process::id(),
         u8::from(pitr)
     ));
+    std::fs::create_dir_all(&root)?;
+    // Whatever the outcome, the scratch tree goes away. A case that fails part way
+    // - a PITR admission limit, a poisoned WAL - otherwise leaves its database and
+    // repository behind, and these runs fail far more often than they succeed
+    // cleanly, so the leaks accumulate.
+    let outcome = run_case_in_root(args, writers, pitr, pitr_first, &root);
+    let _ = std::fs::remove_dir_all(&root);
+    outcome
+}
+
+fn run_case_in_root(
+    args: &Args,
+    writers: usize,
+    pitr: bool,
+    pitr_first: bool,
+    root: &Path,
+) -> Result<()> {
     let database = root.join("db");
     let repository = root.join("repository");
-    std::fs::create_dir_all(&root)?;
     let engine = KvEngine::open(
         &database,
         LsmStorageOptions {
@@ -109,11 +151,15 @@ fn run_case(args: &Args, writers: usize, pitr: bool, pitr_first: bool) -> Result
         let engine = Arc::clone(&engine);
         let barrier = Arc::clone(&barrier);
         let operations = args.operations;
+        let value_size = args.value_size;
         threads.push(std::thread::spawn(move || -> Result<()> {
             barrier.wait();
+            // Filled per operation rather than reallocated: this buffer is inside
+            // the timed loop, and the value it held before was a stack array.
+            let mut value = vec![0_u8; value_size];
             for operation in (writer..operations).step_by(writers) {
                 let key = format!("writer-{writer:02}-key-{operation:08}");
-                let value = [operation as u8; 128];
+                value.fill(operation as u8);
                 engine.put(key.as_bytes(), &value)?;
             }
             Ok(())
@@ -157,6 +203,7 @@ fn run_case(args: &Args, writers: usize, pitr: bool, pitr_first: bool) -> Result
         serde_json::json!({
             "writers": writers,
             "operations": args.operations,
+            "value_size": args.value_size,
             "pitr_enabled": pitr,
             // PITR's position in this case, the same on both of its runs: it says
             // how to read the pair, so it cannot be derived from `pitr` here.
@@ -166,6 +213,5 @@ fn run_case(args: &Args, writers: usize, pitr: bool, pitr_first: bool) -> Result
             "catchup_seconds": pitr.then_some(catchup_elapsed.as_secs_f64()),
         })
     );
-    std::fs::remove_dir_all(&root)?;
     Ok(())
 }
