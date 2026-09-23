@@ -12,10 +12,11 @@ use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use wrapper::kv_engine_wrapper;
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use clap::{Parser, ValueEnum};
 use kv_engine_wrapper::{
-    block_on,
+    BackupOptions, CreateBackupOutcome, EnablePitrOutcome, PersistedPitrConfig, PitrOptions,
+    PitrRuntimeOptions, block_on,
     checkpoint::CheckpointOptions,
     compact::{
         CompactionOptions, LeveledCompactionOptions, SimpleLeveledCompactionOptions,
@@ -161,6 +162,12 @@ struct Args {
     vlog: bool,
     #[arg(long)]
     profile: bool,
+    /// Enable PITR on the workload's engine before it runs, bootstrapping a
+    /// repository next to the database. Without this the harness opens with
+    /// `pitr_repository: None`, so no PITR path - and no segment digest - is
+    /// exercised at all, whatever the build contains.
+    #[arg(long)]
+    pitr: bool,
     #[arg(long)]
     clients: Option<usize>,
     #[arg(long)]
@@ -228,6 +235,7 @@ struct HarnessConfig {
     wal_override: Option<bool>,
     vlog_override: bool,
     profile: bool,
+    pitr: bool,
     clients: usize,
     warmup_secs: u64,
     measurement_secs: u64,
@@ -329,6 +337,7 @@ impl HarnessConfig {
             wal_override,
             vlog_override: args.vlog,
             profile: args.profile,
+            pitr: args.pitr,
             clients: args.clients.unwrap_or(clients),
             warmup_secs: args.warmup_secs.unwrap_or(warmup_secs),
             measurement_secs: args.measurement_secs.unwrap_or(measurement_secs),
@@ -2919,11 +2928,61 @@ fn run_wal_throughput(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
     Ok(results)
 }
 
+/// Bootstrap a PITR repository next to the database and enable PITR on it.
+///
+/// The limits are sized for this harness's workload rather than pitr-perf's: a
+/// `wal_concurrent` run writes `num * 4096` aligned bytes (one 4 KiB buffer per
+/// operation whatever the value size) and nothing archives during the run, so
+/// the unarchived budget has to admit the whole run or writes are refused
+/// part-way through. The archive interval is parked far out of the way so the
+/// measurement is the write path and not a background archive.
+fn enable_pitr_for_workload(cfg: &HarnessConfig, engine: &KvEngine, path: &Path) -> Result<()> {
+    let repository = path.with_extension("pitr-repository");
+    let _ = std::fs::remove_dir_all(&repository);
+    ensure!(
+        matches!(
+            engine.create_backup(BackupOptions {
+                repository: repository.clone(),
+                use_hard_links: false,
+            })?,
+            CreateBackupOutcome::Committed(_)
+        ),
+        "repository bootstrap backup was not committed"
+    );
+    // One segment for the whole run, so no boundary is taken while it is being
+    // measured: crossing `max_segment_bytes` stops commit admission, and a put
+    // during a barrier is a hard error rather than something a benchmark can wait
+    // out. The budget has to admit the segment, which the config enforces.
+    let written = (cfg.num as u64).saturating_mul(4096);
+    let segment = written.saturating_mul(2).max(256 * 1024 * 1024);
+    let budget = segment.saturating_mul(2);
+    ensure!(
+        matches!(
+            engine.enable_pitr(PitrOptions {
+                repository,
+                config: PersistedPitrConfig {
+                    archive_interval: Duration::from_secs(3600),
+                    max_segment_bytes: segment,
+                    max_unarchived_bytes: budget,
+                    max_source_spool_bytes: budget,
+                },
+                runtime: PitrRuntimeOptions::default(),
+            })?,
+            EnablePitrOutcome::Enabled { .. }
+        ),
+        "PITR enable did not complete"
+    );
+    Ok(())
+}
+
 fn run_wal_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
     let workload = "wal_concurrent";
     let path = prepare_path(cfg, workload)?;
     let options = cfg.build_options(true, false);
     let engine = KvEngine::open(&path, options.clone())?;
+    if cfg.pitr {
+        enable_pitr_for_workload(cfg, &engine, &path)?;
+    }
     let value = vec![b'x'; cfg.value_size];
     let num_keys = cfg.num;
     let writer_threads = cfg.threads;
@@ -2953,7 +3012,14 @@ fn run_wal_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
     if cfg.profile {
         print_write_profile(&engine, workload);
     }
-    engine.drain_flush()?;
+    // With PITR enabled the drain is skipped: a forced freeze rotates the active
+    // segment without advancing `active_segment_id`, so the close below refuses the
+    // seal as an identity mismatch - issue #342, which has the repro and the code
+    // path. The drain is after `elapsed` was taken, so the measured write path is
+    // unchanged either way, and it stays in place for every other mode.
+    if !cfg.pitr {
+        engine.drain_flush()?;
+    }
     let counters = collect_counter_delta(&baseline, &collect_counters(&engine)?);
     engine.close()?;
     finalize_path(cfg, &path)?;
@@ -8797,6 +8863,7 @@ mod tests {
             base_path: PathBuf::from("/tmp/write-perf"),
             cleanup: true,
             output: OutputFormat::Json,
+            pitr: false,
             num: 1,
             reads: 1,
             duration_secs: 1,
@@ -11201,6 +11268,7 @@ mod tests {
             base_path: PathBuf::from("/tmp/write-perf"),
             cleanup: true,
             output: OutputFormat::Json,
+            pitr: false,
             num: 0,
             reads: 1,
             duration_secs: 1,
