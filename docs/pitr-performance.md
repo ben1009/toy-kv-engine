@@ -405,6 +405,34 @@ Against the original leader-side build it is 3.2x at 8 writers (control 1.005x).
 1-writer row is the reason to distrust small samples here: at 14 repetitions the same
 comparison read -11%, and the 30-repetition run above is what settled it.
 
+#### What is left, and why it is not a tweak (2026-09-23)
+
+With the seal off the commit chain, the digest itself is the remaining PITR-on cost at
+low writer counts. The accumulator hashes the batch's 4 KiB-aligned buffer, so a ~1.1
+KiB batch is hashed as 4096 bytes - 3.7x the bytes it carries, and exactly the padding
+`encode_v5_batch` adds for `O_DIRECT`. Measured with the seal counter timed *inside*
+the lock it takes (see the note below), 28,000 operations: 64.6 ms at 1 writer, 2.3 us
+per operation, against about 0.63 us of actual SHA-256 work at this machine's measured
+2.2 GB/s. That is roughly 28% of the hot path at 1 writer and ~11% at 16.
+
+Making that go away is a format change, not a local edit, because `wal_digest` is not
+only the seal's digest: it *equals* `SHA256(segment file bytes)`, and the archive,
+verify and restore paths compare a freshly hashed file against that stored value in six
+places (`pitr_archiver.rs`, `pitr_archive.rs`, `pitr_restore.rs`, `backup.rs`), none of
+which parse batches. Two further couplings: the anchor digest is derived from file
+bytes at one site and taken from the seal at another, and both feed the successor's
+predecessor anchor, which is later compared stored-against-stored; and the seal's
+`logical_length` must stay a multiple of 4096 for `validate`, the manifest and segment
+truncation, so an unpadded digest cannot be expressed by shortening it. A new rule
+therefore needs a versioned seal, a story for repositories holding both versions, and a
+decision about whether the six whole-file comparisons branch on that version or move to
+a batch-aware preimage.
+
+The counter note: `pitr_seal` was timed around a block that begins by taking the seal
+mutex, so at high writer counts it reported the wait for that mutex as well as the
+hashing - 134.0 ms against 110.6 ms for the same case once the timer moved inside the
+lock. Numbers quoted from it before 2026-09-23 include the wait.
+
 One harness limit to know before re-running this: `pitr-perf` aborts every
 PITR-enabled case above roughly 30,000 operations with `PITR batch would cross maximum
 segment bytes` - each 1 KiB operation costs 4 KiB against the 128 MiB
