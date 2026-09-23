@@ -417,6 +417,9 @@ pub struct Wal {
     /// threads that are not the leader never block on a lock — they either
     /// become the leader (CAS wins) or wait on the completion condvar.
     submitting: AtomicBool,
+    /// When the last group released `submitting`, for the handoff counter.
+    #[cfg(feature = "bench")]
+    last_release_ns: AtomicU64,
     /// Set to true on I/O error to fail-fast future writes.
     /// Once poisoned, the WAL is unusable — callers must create a new WAL.
     poisoned: AtomicBool,
@@ -622,6 +625,8 @@ impl Wal {
                 preallocated_size: AtomicU64::new(alloc_offset),
                 completion_state: CompletionState::new(),
                 submitting: AtomicBool::new(false),
+                #[cfg(feature = "bench")]
+                last_release_ns: AtomicU64::new(0),
                 poisoned: AtomicBool::new(false),
                 pitr_max_segment_bytes: AtomicU64::new(u64::MAX),
                 pitr_max_unarchived_bytes: AtomicU64::new(u64::MAX),
@@ -647,6 +652,8 @@ impl Wal {
                 preallocated_size: AtomicU64::new(0),
                 completion_state: CompletionState::new(),
                 submitting: AtomicBool::new(false),
+                #[cfg(feature = "bench")]
+                last_release_ns: AtomicU64::new(0),
                 poisoned: AtomicBool::new(false),
                 pitr_max_segment_bytes: AtomicU64::new(u64::MAX),
                 pitr_max_unarchived_bytes: AtomicU64::new(u64::MAX),
@@ -961,6 +968,8 @@ impl Wal {
             preallocated_size: AtomicU64::new(alloc_offset),
             completion_state: CompletionState::new(),
             submitting: AtomicBool::new(false),
+            #[cfg(feature = "bench")]
+            last_release_ns: AtomicU64::new(0),
             poisoned: AtomicBool::new(false),
             pitr_max_segment_bytes: AtomicU64::new(u64::MAX),
             pitr_max_unarchived_bytes: AtomicU64::new(u64::MAX),
@@ -998,6 +1007,8 @@ impl Wal {
             preallocated_size: AtomicU64::new(alloc_offset),
             completion_state: CompletionState::new(),
             submitting: AtomicBool::new(false),
+            #[cfg(feature = "bench")]
+            last_release_ns: AtomicU64::new(0),
             poisoned: AtomicBool::new(false),
             pitr_max_segment_bytes: AtomicU64::new(u64::MAX),
             pitr_max_unarchived_bytes: AtomicU64::new(u64::MAX),
@@ -1060,6 +1071,14 @@ pub(crate) fn is_recordless_v4_wal(path: &std::path::Path) -> bool {
             Ok(_) | Err(_) => return false,
         }
     }
+}
+
+/// Monotonic nanoseconds since first use, so two threads can compare when they
+/// reached points in the commit path.
+#[cfg(feature = "bench")]
+fn nanos_now() -> u64 {
+    static EPOCH: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    EPOCH.get_or_init(Instant::now).elapsed().as_nanos() as u64
 }
 
 impl Wal {
@@ -2273,6 +2292,21 @@ impl Wal {
         ticket: u64,
         profile: Option<&crate::mem_table::WriteProfile>,
     ) -> Result<()> {
+        // How long the handoff cost: from the previous group releasing
+        // `submitting` to this leader reaching the commit path, wake-up
+        // included. A dedicated submitter is the design that would remove it.
+        #[cfg(feature = "bench")]
+        let leader_entered = nanos_now();
+        #[cfg(feature = "bench")]
+        {
+            let released = self.last_release_ns.load(Ordering::Acquire);
+            if released > 0
+                && leader_entered > released
+                && let Some(profile) = profile
+            {
+                profile.record_wal_leader_gap_ns(leader_entered - released);
+            }
+        }
         self.wait_for_group_commit_peers(ticket);
         let ticketed_bufs = self.drain_pending_ticketed_bufs();
         if ticketed_bufs.is_empty() {
@@ -2287,6 +2321,10 @@ impl Wal {
                 .map(|buf| DirectBuf::align_up(buf.buf.len()) as u64)
                 .sum();
             profile.record_wal_commit_group(buffers, bytes);
+        }
+        #[cfg(feature = "bench")]
+        if let Some(profile) = profile {
+            profile.record_wal_leader_prepare_ns(nanos_now().saturating_sub(leader_entered));
         }
         let result = self.submit_sqes_and_poll(ticketed_bufs, profile);
 
@@ -2418,6 +2456,8 @@ impl Wal {
                 .durable_ticket
                 .fetch_max(max_ticket + 1, Ordering::Release);
         }
+        #[cfg(feature = "bench")]
+        self.last_release_ns.store(nanos_now(), Ordering::Release);
         self.submitting.store(false, Ordering::Release);
         self.completion_state.cond.notify_all();
     }
