@@ -2268,20 +2268,24 @@ impl Wal {
 
         match result {
             Ok(bufs) => {
-                if seal_guard.is_some() {
+                if seal_guard.is_some()
+                    && let Some(accumulator) = &self.pitr_seal
+                {
+                    let mut accumulator = accumulator.lock();
+                    // Timed *inside* the lock, so this counter is the hashing work
+                    // and not the wait to take the seal mutex - at high writer
+                    // counts those are very different quantities, and the wait is
+                    // the larger one.
                     #[cfg(feature = "bench")]
                     let seal_start = Instant::now();
-                    if let Some(accumulator) = &self.pitr_seal {
-                        let mut accumulator = accumulator.lock();
-                        // Every buffer on a v5 WAL carries a seal entry: only
-                        // `put_v5_batch` produces them and the v4 append paths
-                        // refuse a v5 format, so this is a shape check, not a
-                        // filter that can drop a batch.
-                        for ticketed_buf in bufs.iter() {
-                            debug_assert!(ticketed_buf.pitr_entry.is_some());
-                            if let Some(entry) = ticketed_buf.pitr_entry {
-                                accumulator.append(&ticketed_buf.buf, entry);
-                            }
+                    // Every buffer on a v5 WAL carries a seal entry: only
+                    // `put_v5_batch` produces them and the v4 append paths refuse a
+                    // v5 format, so this is a shape check, not a filter that can
+                    // drop a batch.
+                    for ticketed_buf in bufs.iter() {
+                        debug_assert!(ticketed_buf.pitr_entry.is_some());
+                        if let Some(entry) = ticketed_buf.pitr_entry {
+                            accumulator.append(&ticketed_buf.buf, entry);
                         }
                     }
                     #[cfg(feature = "bench")]
