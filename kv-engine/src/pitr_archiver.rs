@@ -778,8 +778,11 @@ mod tests {
                 wal_digest_rule: metadata.wal_digest_rule().unwrap(),
             };
             crate::pitr_restore::verify_source_object(&object, &stored).unwrap();
-            // A byte flipped anywhere in the padding is still refused under the
-            // legacy rule, which covers it.
+            // A flipped padding byte is refused here under either rule - the parser
+            // rejects a nonzero alignment gap before any digest is compared - so this
+            // asserts the object is not accepted, not that the legacy rule caught it.
+            // That the legacy digest covers the padding is pinned by the frozen
+            // fixture's `wal_digest == SHA256(file)` in `pitr_seal.rs`.
             let mut tampered = stored.clone();
             let last = tampered.len() - 1;
             tampered[last] ^= 1;

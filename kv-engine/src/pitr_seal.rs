@@ -339,6 +339,79 @@ mod tests {
         .unwrap()
     }
 
+    /// A v6 digest against a preimage written out by hand.
+    ///
+    /// Without this the suite cannot tell a narrowed digest from a padded one: every
+    /// other v6 expectation is either computed by the code under test or satisfied by
+    /// a different mechanism. The padding-tamper assertions pass under either rule
+    /// (the parser refuses a nonzero gap byte before any digest is compared), and the
+    /// "digest differs from the whole file" assertion holds for a file with a
+    /// preallocated tail whatever the rule. Here the bytes are enumerated explicitly -
+    /// header, then each batch's own `data_end - offset` bytes - so a digest that
+    /// stopped stripping the padding disagrees and fails.
+    #[test]
+    fn v6_digest_covers_the_header_and_each_batch_without_its_padding() {
+        let header = crate::pitr::WalV5Header {
+            wal_format_version: crate::pitr::WAL_V5_VERSION,
+            timeline_id: crate::pitr::TimelineId([7; 16]),
+            archive_epoch_id: crate::pitr::ArchiveEpochId([8; 16]),
+            segment_id: crate::pitr::SegmentId(9),
+            predecessor: ChainAnchor::Genesis {
+                archive_epoch_id: crate::pitr::ArchiveEpochId([8; 16]),
+            },
+        };
+        let mut wal = crate::pitr::encode_v5_file_header(header).unwrap().to_vec();
+        for (commit_ts, key, value) in [
+            (1_u64, &b"alpha"[..], &b"one"[..]),
+            (2, &b"beta"[..], &b"two-longer-value"[..]),
+        ] {
+            wal.extend_from_slice(
+                &crate::pitr::encode_v5_batch(
+                    &crate::pitr::WalBatch {
+                        commit_ts,
+                        recorded_at: RecordedAt {
+                            secs: commit_ts as i64,
+                            nanos: 7,
+                        },
+                        entries: vec![crate::pitr::WalEntry::Put {
+                            key: key.to_vec(),
+                            value: value.to_vec(),
+                        }],
+                    },
+                    crate::pitr::LIVE_WAL_V5_LIMITS,
+                )
+                .unwrap(),
+            );
+        }
+
+        let mut expected = Sha256::new();
+        expected.update(&wal[..WAL_V5_HEADER_LEN]);
+        let mut offset = WAL_V5_HEADER_LEN;
+        let mut padding = 0_usize;
+        let mut batches = 0_usize;
+        while offset < wal.len() {
+            let decoded =
+                crate::pitr::decode_v5_batch(&wal, offset, crate::pitr::LIVE_WAL_V5_LIMITS)
+                    .unwrap();
+            expected.update(&wal[offset..decoded.data_end]);
+            padding += decoded.logical_end - decoded.data_end;
+            batches += 1;
+            offset = decoded.logical_end;
+        }
+        // A fixture without padding cannot tell the two rules apart.
+        assert_eq!(batches, 2);
+        assert!(padding > 0, "expected alignment padding to strip");
+        let expected: [u8; 32] = expected.finalize().into();
+
+        let (seal, _) = build_v5_seal(&wal).unwrap();
+        assert_eq!(seal.header.wal_format_version, crate::pitr::WAL_V5_VERSION);
+        assert_eq!(seal.wal_digest, expected);
+        // And it is not the whole-file hash, which is what the legacy rule would give.
+        assert_ne!(seal.wal_digest, <[u8; 32]>::from(Sha256::digest(&wal)));
+        // The legacy rule is refused on this file rather than silently answering.
+        assert!(wal_digest(&wal, crate::pitr::WalDigestRule::WholeAlignedPrefix).is_err());
+    }
+
     /// A v5 segment written by the tree *before* the logical-batch digest existed,
     /// committed byte for byte at `src/tests/fixtures/pitr-v5-segment.{wal,seal}`.
     ///
