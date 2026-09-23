@@ -985,15 +985,29 @@ impl ValueLog {
     }
 
     /// Attempt to delete any pending vLog files that are no longer
-    /// referenced by any SST.
-    pub fn reclaim_pending_deletions(&self) -> Result<usize> {
+    /// referenced by any SST or live memtable.
+    ///
+    /// `memtable_vlog_ids` yields the vLog file ids that live memtables still
+    /// resolve into. They must never be deleted here: a GC rewrite binds its
+    /// new file into the LSM by CAS-ing the pointer into the active memtable,
+    /// and a memtable pointer is not recorded in the SST reference map. The
+    /// closure is only called when there is something to reclaim, so callers
+    /// do not pay for scanning memtables on every compaction.
+    pub fn reclaim_pending_deletions(
+        &self,
+        memtable_vlog_ids: impl FnOnce() -> std::collections::HashSet<u32>,
+    ) -> Result<usize> {
         let to_process = self.take_pending_deletions();
+        if to_process.is_empty() {
+            return Ok(0);
+        }
+        let memtable_vlog_ids = memtable_vlog_ids();
 
         let mut remaining = Vec::new();
         let mut deleted = 0usize;
         let mut first_err = None;
         for entry in to_process {
-            match self.try_reclaim_pending_deletion(&entry) {
+            match self.try_reclaim_pending_deletion(&entry, &memtable_vlog_ids) {
                 Ok(true) => deleted += 1,
                 Ok(false) => remaining.push(entry),
                 Err(e) => {
@@ -1045,11 +1059,21 @@ impl ValueLog {
         pending.extend(remaining);
     }
 
-    fn try_reclaim_pending_deletion(&self, entry: &PendingDeletion) -> Result<bool> {
-        if !self
+    fn try_reclaim_pending_deletion(
+        &self,
+        entry: &PendingDeletion,
+        memtable_vlog_ids: &std::collections::HashSet<u32>,
+    ) -> Result<bool> {
+        // A live memtable can still resolve into this file. GC binds rewritten
+        // pointers into the active memtable by CAS, and the reference map only
+        // ever tracks SSTs, so a file reached solely through the memtable looks
+        // unreferenced here.
+        if memtable_vlog_ids.contains(&entry.file_id) {
+            return Ok(false);
+        }
+        if self
             .get_ssts_referencing(entry.file_id)
-            .unwrap_or_default()
-            .is_empty()
+            .is_some_and(|ssts| !ssts.is_empty())
         {
             return Ok(false);
         }

@@ -4690,11 +4690,13 @@ impl KvEngine {
                 self.inner.maybe_snapshot_manifest(&state_lock)?;
             }
 
-            // Attempt to reclaim vLog files that are no longer referenced by any SST.
-            // Note: files with pending memtable CAS writes will still be referenced
-            // (via the SST that hasn't been re-flushed yet), so they won't be deleted.
+            // Attempt to reclaim vLog files that are no longer referenced by any SST
+            // or live memtable. A GC rewrite binds its new file into the memtable
+            // rather than into any SST, so the memtable is consulted directly: it is
+            // the only record of those pointers once the SSTs that carried the
+            // rewrite's bookkeeping are retired.
             let _state_lock = self.inner.state_lock.lock();
-            let _ = vlog.reclaim_pending_deletions();
+            let _ = vlog.reclaim_pending_deletions(|| self.inner.memtable_vlog_file_ids());
 
             Ok(count)
         })
@@ -8333,6 +8335,24 @@ impl LsmStorageInner {
         }
 
         Ok((None, KvKind::Inline, None))
+    }
+
+    /// vLog file ids that live memtables (active and immutable) still resolve
+    /// into.
+    ///
+    /// A GC rewrite binds its new file into the LSM by CAS-ing the pointer into
+    /// the active memtable, and the SST→vLog reference map never records
+    /// memtable pointers. Deletion decisions must therefore treat this set as
+    /// referenced: otherwise a compaction that retires the SSTs which carried
+    /// the rewrite's bookkeeping deletes a file the memtable still reads, and
+    /// every read of the rewritten version fails with `ENOENT`.
+    pub(crate) fn memtable_vlog_file_ids(&self) -> std::collections::HashSet<u32> {
+        let state = self.state.load();
+        let mut ids = state.memtable.collect_vlog_file_ids();
+        for imm in &state.imm_memtables {
+            ids.extend(imm.collect_vlog_file_ids());
+        }
+        ids
     }
 
     fn lookup_exact_version_in_memtables(
