@@ -99,7 +99,7 @@ const GROUP_COMMIT_MIN_SOLO_BYTES: usize = 512 * 1024;
 /// buffers are returned to the pool (not dropped) to prevent pool exhaustion.
 /// If the pool is full, the buffer is dropped (freed) — this is safe because
 /// `Drop` calls `libc::free` on the `posix_memalign` allocation.
-struct DirectBuf {
+pub(crate) struct DirectBuf {
     ptr: *mut u8,
     len: usize,
     cap: usize,
@@ -110,7 +110,7 @@ struct DirectBuf {
 unsafe impl Send for DirectBuf {}
 
 impl DirectBuf {
-    fn new(size: usize) -> Self {
+    pub(crate) fn new(size: usize) -> Self {
         // Cap must be 4KB-aligned to prevent io_uring out-of-bounds reads.
         // align_up() rounds write sizes to 4KB; if cap is smaller, io_uring
         // reads past the allocation.
@@ -144,14 +144,32 @@ impl DirectBuf {
         self.write_at(pos, &value.to_be_bytes());
     }
 
-    fn write_at(&mut self, pos: usize, bytes: &[u8]) {
+    /// The whole allocation as a slice, for encoders that write their own
+    /// layout into it.
+    ///
+    /// The slice is not entirely trustworthy: a fresh allocation from
+    /// `posix_memalign` is uninitialised, and a recycled buffer's only
+    /// known-initialised region is the one its previous [`set_len`] exposed -
+    /// beyond that its bytes are either stale from an earlier batch or never
+    /// written at all, and neither may be read. The caller must therefore write
+    /// every byte it later exposes, which is why this is `pub(crate)` and its
+    /// one caller is the batch encoder.
+    pub(crate) fn as_mut_slice(&mut self) -> &mut [u8] {
+        // SAFETY: the allocation is `cap` bytes and is owned by this struct.
+        // Forming the reference is sound for `u8` - every bit pattern is a valid
+        // `u8` - and the documented contract moves the initialisation duty to
+        // the caller.
+        unsafe { std::slice::from_raw_parts_mut(self.ptr, self.cap) }
+    }
+
+    pub(crate) fn write_at(&mut self, pos: usize, bytes: &[u8]) {
         debug_assert!(pos + bytes.len() <= self.cap);
         unsafe {
             std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.ptr.add(pos), bytes.len());
         }
     }
 
-    fn zero_range(&mut self, start: usize, end: usize) {
+    pub(crate) fn zero_range(&mut self, start: usize, end: usize) {
         debug_assert!(start <= end);
         debug_assert!(end <= self.cap);
         unsafe {
@@ -159,7 +177,7 @@ impl DirectBuf {
         }
     }
 
-    fn initialized_slice(&self, start: usize, end: usize) -> &[u8] {
+    pub(crate) fn initialized_slice(&self, start: usize, end: usize) -> &[u8] {
         debug_assert!(start <= end);
         debug_assert!(end <= self.cap);
         unsafe { std::slice::from_raw_parts(self.ptr.add(start), end - start) }
@@ -173,11 +191,11 @@ impl DirectBuf {
         self.len
     }
 
-    fn cap(&self) -> usize {
+    pub(crate) fn cap(&self) -> usize {
         self.cap
     }
 
-    fn set_len(&mut self, len: usize) {
+    pub(crate) fn set_len(&mut self, len: usize) {
         self.len = len;
     }
 
@@ -1152,29 +1170,52 @@ impl Wal {
         let _ = profile;
         #[cfg(feature = "bench")]
         let encode_start = Instant::now();
-        let encoded = crate::pitr::encode_v5_batch(batch, limits)?;
+        // Size the batch, then encode it straight into the buffer the ring will
+        // read: the encoded form used to be built in a Vec and copied here, which
+        // is a 4 KiB pass and three allocations per put that the wire format does
+        // not need.
+        let canonical = crate::pitr::canonical_batch(batch, limits)?;
+        let encoded_len = crate::pitr::v5_batch_encoded_len(&canonical, limits)?;
         #[cfg(feature = "bench")]
         if let Some(profile) = profile {
             profile.record_wal_encode_ns(encode_start.elapsed().as_nanos() as u64);
         }
         anyhow::ensure!(
-            encoded.len() as u64 <= MAX_WAL_FILE_SIZE,
+            encoded_len as u64 <= MAX_WAL_FILE_SIZE,
             "v5 batch exceeds maximum WAL file size"
         );
         #[cfg(feature = "bench")]
         let prepare_start = Instant::now();
         let mut buf = match self.direct_buf_pool.pop() {
-            Some(buf) if buf.cap() >= encoded.len() => buf,
+            Some(buf) if buf.cap() >= encoded_len => buf,
             Some(buf) => {
                 let _ = self.direct_buf_pool.push(buf);
-                DirectBuf::new(encoded.len())
+                DirectBuf::new(encoded_len)
             }
-            None => DirectBuf::new(encoded.len()),
+            None => DirectBuf::new(encoded_len),
         };
         buf.clear();
-        buf.write_at(0, &encoded);
-        buf.set_len(encoded.len());
-        let aligned_len = DirectBuf::align_up(encoded.len()) as u64;
+        let written =
+            match crate::pitr::encode_v5_batch_into(&canonical, limits, buf.as_mut_slice()) {
+                Ok(written) => written,
+                // Return the buffer before propagating: encoding here cannot fail for
+                // an input `v5_batch_encoded_len` accepted a moment ago, but a buffer
+                // dropped on this path would be a permanent loss from the pool, which
+                // the contract at the pool's definition explicitly rules out.
+                Err(error) => {
+                    let _ = self.direct_buf_pool.push(buf);
+                    return Err(error);
+                }
+            };
+        debug_assert_eq!(written, encoded_len);
+        buf.set_len(written);
+        // The ring writes `align_up(buf.len())` bytes and the seal hashes
+        // `[0, buf.len())`, so this length is what decides how much of a pooled
+        // buffer can reach the disk - and everything past what the encoder wrote
+        // is a previous batch's bytes. Pinning it here means a future change to
+        // this line fails in debug builds rather than exposing that tail.
+        debug_assert_eq!(buf.len(), encoded_len);
+        let aligned_len = written as u64;
         #[cfg(feature = "bench")]
         if let Some(profile) = profile {
             profile.record_wal_prepare_ns(prepare_start.elapsed().as_nanos() as u64);
