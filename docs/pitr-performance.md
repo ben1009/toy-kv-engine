@@ -448,9 +448,9 @@ everywhere else in this document, compare ratios within a session, not absolutes
 same `pitr_seal` case read 64.6 ms in the #340 session and 176-184 ms in this one.
 
 The ratio is large and the share is not, and both belong in the same sentence: the
-saving is 0.5-1.0% of the enabled path's wall clock at these writer counts (155.8 ms of
-171.3 ms at 4 writers, 161.0 ms of 176.5 ms at 1, against ~8 s and ~17 s of wall for
-28,000 operations). What the seal cost was the last *PITR-specific* phase at low writer
+saving is 1-2% of the enabled path's wall clock at these writer counts - 1.9% at 4
+writers and 0.9% at 1, from a before-seal time of 155.8 ms of 171.3 ms and 161.0 ms of
+176.5 ms against ~8 s and ~17 s of wall for 28,000 operations. What the seal cost was the last *PITR-specific* phase at low writer
 counts, not a large share of the run - the rest of the enabled path's cost is the
 ordered-commit machinery, which is present with PITR off too.
 
@@ -459,24 +459,53 @@ digest change was measured end to end against itself - the tree before it (`4389
 and after, both with PITR enabled - on a workload that spans a whole run rather than a
 phase: `write-perf --bench wal_concurrent`, 200k puts, 4 threads, 1 KiB values, tmpfs,
 20 paired repetitions with the run order alternated (the harness flag is PR #343).
-Medians: 178.3k ops/s before, 176.6k after; paired median **0.986x**, the after side
-faster in 7/20. That is a null result, and the reason is position rather than size: the
-leader hashes its group *after* publishing it, so the work overlaps the next group's
-I/O wait instead of extending the critical path, and a phase that shrinks 4x in hashed
-bytes (1090 B/op against the ~4090 B/op of aligned buffers this shape writes) is inside
-the noise of a run. Worth making, not worth expecting in ops/s.
+Medians: 178.3k ops/s before, 176.6k after; paired median **0.986x**, sd 0.047, 95% CI
+[0.958, 1.002], the after side faster in 7/20 (sign p = 0.26). That is a null result,
+and the run resolves nothing smaller than about 2.5%. The reason is position rather
+than size: `submit_as_leader` publishes the group - releasing `submitting` - *before*
+the leader extends the seal, so the hashing cannot extend the window the next leader
+waits on. What actually absorbs it is the next group's submit and poll work, not
+durability: on tmpfs in this shape `wal_submit` is 479.2 ms against `pitr_seal`'s
+120.8 ms, while `fdatasync` is only 15.7 ms. `pitr_seal` being a subset of `wal_sync`
+in the report is containment, not measured overlap; the case for overlap is the code
+order plus the null, not the phase arithmetic.
+
+An earlier attempt at this same comparison is part of the record: it ran to rep 16 of
+20 and then died with `put failed: commit sequencer requires recovery after unknown WAL
+durability` (the #338 family of intermittent failures), which is why the numbers above
+come from the second, complete run. It also leaves one control unproven: `seal_bytes`
+was added by the change under test, so the 1090 B/op above shows the new rule ran in
+the "after" leg, while the "before" leg's coverage rests on the byte counts quoted
+elsewhere in this section rather than on a counter in this run.
 
 Where the PITR line does stand, on that same harness and shape, is a separate question
-this measurement answers while it is set up: paired medians over 20 repetitions of
-pre-PITR `2f556ccb` at 221.2k ops/s, the head with PITR off at 190.9k (**0.863x**,
-1/20) and the head with PITR on at 176.6k (**0.800x**, 1/20), so enabling PITR costs
-**0.927x** (0/20) on top of a head already ~14% behind pre-PITR. One configuration
-detail matters for reading that row: `--target-sst-size` has to be above the run's
-footprint, or the PITR-off leg freezes, flushes and compacts inside the measured window
-while a v5 memtable defers that work. At the 1 MiB default a single run reads the
-disabled leg at 0.75x of the enabled one (171.2k against 229.2k ops/s, 200k puts) -
-that gap is the two legs doing different jobs, not PITR being fast, and it is why the
-rows above are measured with the SST target above the run.
+this measurement answers while it is set up. Pre-PITR `2f556ccb` against the head with
+PITR on, both legs alternating between the first and last position of a three-way
+rotation: **0.800x** (1/20) - so the line is ~20% behind its baseline, with the cost of
+*enabling* PITR measured separately below as ~3%. Enabling it costs, in a two-way
+comparison built so that reversal actually balances the order, **0.969x** (5/20, sd
+0.051, 95% CI [0.945, 0.993]) - real, and about a third of what the three-way rotation
+first suggested.
+
+That earlier three-way design put its middle leg in the middle in all 20 repetitions -
+reversing a three-element order leaves the second element second - so its headlines were
+middle-against-end contrasts, and two of them are withdrawn: the enabled-against-
+disabled cost it reported as 0.927x, and the disabled leg's 0.863x against pre-PITR.
+What survives from it is the pre-PITR-against-enabled contrast above (both of its legs
+do move between positions) and the composition those two give for the disabled leg,
+~0.83x, which is quoted as a composition rather than as a measurement.
+
+Two configuration details matter for reading all of these. `--target-sst-size` has to
+be above the run's footprint, or the PITR-off leg freezes, flushes and compacts inside
+the measured window while a v5 memtable defers that work: at the 1 MiB default a
+balanced eight-pair run reads the disabled leg at **0.88x** of the enabled one (156.5k
+against 172.7k ops/s, sd 0.11), the two legs doing different jobs rather than PITR being
+fast, and an earlier single run of the same pair (0.75x) was an uncontrolled outlier
+above every one of those readings. And the enabled leg runs inside a single segment with
+archival parked out of the way (PR #343's `--pitr`), so the measured window contains no
+rotation, boundary or archival work - the costs this document measures elsewhere as
+small but nonzero. Read the ~3% as the write path with PITR enabled, not as a
+deployment's steady state.
 
 The mechanism is visible in one more counter: `seal_bytes` (added here) reads
 **205 B/op** after, against the 4096 B/op the old rule hashed - the harness's own
@@ -488,11 +517,14 @@ the entry push and the per-buffer call - a floor that the 4096-byte case's hash 
 hide.
 
 **What the rule does not attest any more.** A v6 digest skips the alignment gaps, so a
-byte flipped inside one is no longer a digest mismatch. It is still refused, by the
-parser's nonzero-gap check before the bytes are used - but that is a parse-time
-property, so a verification depth that decodes nothing no longer detects padding
-corruption in a v6 segment. v5 segments are unaffected: their rule covers every byte.
-Pinning that narrowing is what one of the new tests does.
+byte flipped inside one is no longer a digest mismatch. It is still refused, and at
+every verification depth: deriving a stored WAL digest walks the batches, so the
+parser's nonzero-gap check runs before the digest is compared, shallow depth included.
+The accurate statement is that the digest no longer *attests* the padding, not that
+anything stopped *checking* it. v5 segments are unaffected either way: their rule
+covers every byte. What a test pins here is the coverage itself - `pitr_seal.rs`
+compares a v6 digest against a preimage spelled out by hand, which a digest that
+stopped stripping the padding would fail.
 
 **Keeping v5 forever is tested against bytes, not intentions.** `src/tests/fixtures/`
 holds a two-batch v5 segment and its seal, generated by the tree from *before* this
