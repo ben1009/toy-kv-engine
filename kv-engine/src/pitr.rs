@@ -6,6 +6,7 @@
 #![allow(dead_code)]
 
 use std::{
+    borrow::Cow,
     collections::HashMap,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -374,13 +375,145 @@ pub(crate) fn decode_v5_file_header(input: &[u8]) -> Result<WalV5Header> {
 }
 
 pub(crate) fn encode_v5_batch(batch: &WalBatch, limits: WalV5Limits) -> Result<Vec<u8>> {
+    let canonical = canonical_batch(batch, limits)?;
+    let len = v5_batch_encoded_len(&canonical, limits)?;
+    let mut out = vec![0_u8; len];
+    let written = encode_v5_batch_into(&canonical, limits, &mut out)?;
+    debug_assert_eq!(written, len);
+    Ok(out)
+}
+
+/// Canonicalise only when there is something to drop.
+///
+/// Canonicalisation keeps the last point write per key, which takes a map and a
+/// clone of every surviving entry. A batch with fewer than two entries cannot
+/// contain a repeated point key, and a single `put` is exactly that batch, so
+/// the common case skips both.
+pub(crate) fn canonical_batch(batch: &WalBatch, limits: WalV5Limits) -> Result<Cow<'_, WalBatch>> {
+    // The input count is checked before the duplicate scan below, so a batch of
+    // repeated keys cannot make that scan unbounded work. It is a different
+    // bound from `max_entry_count`, which applies to what survives.
     let limits = limits.validate()?;
     ensure!(
         batch.entries.len() <= limits.max_input_entry_count,
         "v5 input entry count exceeds configured limit"
     );
-    let batch = batch.canonicalized()?;
-    encode_v5_batch_inner(&batch, limits)
+    if batch.entries.len() <= 1 {
+        return Ok(Cow::Borrowed(batch));
+    }
+    Ok(Cow::Owned(batch.canonicalized()?))
+}
+
+/// The length one encoded batch occupies: its fixed header, its entries, and the
+/// zero padding up to the `O_DIRECT` alignment.
+pub(crate) fn v5_batch_encoded_len(batch: &WalBatch, limits: WalV5Limits) -> Result<usize> {
+    let limits = limits.validate()?;
+    validate_encoding_inputs(batch, limits)?;
+    align_up(WAL_V5_BATCH_HEADER_LEN + batch_data_len(batch, limits)?)
+}
+
+/// Encode one batch straight into the buffer the ring will read.
+///
+/// `dst` must have room for [`v5_batch_encoded_len`]; the entries are written in
+/// place and hashed as they are written, so the data checksum needs no second
+/// pass over them and no intermediate buffer is allocated.
+pub(crate) fn encode_v5_batch_into(
+    batch: &WalBatch,
+    limits: WalV5Limits,
+    dst: &mut [u8],
+) -> Result<usize> {
+    let limits = limits.validate()?;
+    validate_encoding_inputs(batch, limits)?;
+    let data_len = batch_data_len(batch, limits)?;
+    let logical_len = WAL_V5_BATCH_HEADER_LEN + data_len;
+    let aligned_len = align_up(logical_len)?;
+    ensure!(
+        dst.len() >= aligned_len,
+        "v5 batch output buffer is too small"
+    );
+
+    // Header. Fields are written by position, so the only ordering that matters
+    // is that the bytes the header checksum covers are in place before it is
+    // taken; the data checksum is written after the entries it covers. The
+    // reserved tail is zeroed first because the buffer may be a pooled one.
+    dst[..WAL_V5_BATCH_HEADER_LEN].fill(0);
+    dst[0..8].copy_from_slice(&batch.commit_ts.to_be_bytes());
+    dst[8..16].copy_from_slice(&batch.recorded_at.secs.to_be_bytes());
+    dst[16..20].copy_from_slice(&batch.recorded_at.nanos.to_be_bytes());
+    dst[20..24].copy_from_slice(&(batch.entries.len() as u32).to_be_bytes());
+    dst[24..28].copy_from_slice(
+        &u32::try_from(data_len)
+            .context("v5 batch data too large")?
+            .to_be_bytes(),
+    );
+    let header_crc = crc32fast::hash(&dst[..28]);
+    dst[32..36].copy_from_slice(&header_crc.to_be_bytes());
+
+    let mut hasher = crc32fast::Hasher::new();
+    let mut pos = WAL_V5_BATCH_HEADER_LEN;
+    for entry in &batch.entries {
+        pos = write_entry_into(dst, pos, entry, &mut hasher)?;
+    }
+    debug_assert_eq!(pos, logical_len);
+    dst[28..32].copy_from_slice(&hasher.finalize().to_be_bytes());
+
+    dst[pos..aligned_len].fill(0);
+    Ok(aligned_len)
+}
+
+/// Everything the encoder refuses before it writes a byte.
+fn validate_encoding_inputs(batch: &WalBatch, limits: WalV5Limits) -> Result<()> {
+    ensure!(batch.commit_ts != 0, "v5 commit timestamp must be nonzero");
+    ensure!(!batch.entries.is_empty(), "v5 batch must contain an entry");
+    ensure!(
+        batch.recorded_at.nanos < 1_000_000_000,
+        "recorded_at nanos out of range"
+    );
+    ensure!(
+        batch.entries.len() <= limits.max_entry_count,
+        "v5 entry count exceeds configured limit"
+    );
+
+    Ok(())
+}
+
+/// Write one entry at `pos`, feeding the same bytes to the data checksum.
+fn write_entry_into(
+    dst: &mut [u8],
+    pos: usize,
+    entry: &WalEntry,
+    hasher: &mut crc32fast::Hasher,
+) -> Result<usize> {
+    let (kind, fields): (u8, &[&[u8]]) = match entry {
+        WalEntry::Put { key, value } => (1, &[key.as_slice(), value.as_slice()]),
+        WalEntry::PointDelete { key } => (2, &[key.as_slice()]),
+        WalEntry::RangeDelete { start, end } => (3, &[start.as_slice(), end.as_slice()]),
+    };
+    let payload_len: usize = fields.iter().map(|field| 4 + field.len()).sum();
+    let mut header = [0_u8; 6];
+    header[0] = kind;
+    header[2..6].copy_from_slice(
+        &u32::try_from(payload_len)
+            .context("v5 payload too large")?
+            .to_be_bytes(),
+    );
+    let mut at = pos;
+    dst[at..at + header.len()].copy_from_slice(&header);
+    hasher.update(&header);
+    at += header.len();
+    for field in fields {
+        let prefix = u32::try_from(field.len())
+            .context("v5 field too large")?
+            .to_be_bytes();
+        dst[at..at + prefix.len()].copy_from_slice(&prefix);
+        hasher.update(&prefix);
+        at += prefix.len();
+        dst[at..at + field.len()].copy_from_slice(field);
+        hasher.update(field);
+        at += field.len();
+    }
+
+    Ok(at)
 }
 
 fn encode_v5_batch_inner(batch: &WalBatch, limits: WalV5Limits) -> Result<Vec<u8>> {
@@ -684,6 +817,13 @@ fn validate_batch_limits(batch: &WalBatch, limits: WalV5Limits) -> Result<()> {
         batch.entries.len() <= limits.max_entry_count,
         "v5 entry count exceeds configured limit"
     );
+    batch_data_len(batch, limits)?;
+    Ok(())
+}
+
+/// The size of a batch's entry section, which is what its header records as the
+/// data length.
+fn batch_data_len(batch: &WalBatch, limits: WalV5Limits) -> Result<usize> {
     let mut data_len = 0_usize;
     for entry in &batch.entries {
         data_len = data_len
@@ -694,7 +834,7 @@ fn validate_batch_limits(batch: &WalBatch, limits: WalV5Limits) -> Result<()> {
             "v5 batch data exceeds configured limit"
         );
     }
-    Ok(())
+    Ok(data_len)
 }
 
 fn encoded_entry_len(entry: &WalEntry, limits: WalV5Limits) -> Result<usize> {
@@ -1154,5 +1294,116 @@ mod tests {
         let mut changed = high_water;
         changed.segment_id = SegmentId(8);
         assert_ne!(digest, commit_time_entry_digest(changed));
+    }
+
+    /// The encoder's output is a wire format, so its bytes are pinned rather than
+    /// only round-tripped. Each digest below is of the bytes the implementation
+    /// produced *before* it was changed to write straight into the ring buffer -
+    /// taken from the same cases by the previous implementation - so this fails if
+    /// the change altered a byte, including bytes the decoder happens to tolerate,
+    /// like the batch header's reserved tail or an entry's reserved byte.
+    #[test]
+    fn encoder_bytes_are_unchanged_by_writing_into_the_buffer() {
+        let limits = LIVE_WAL_V5_LIMITS;
+        let cases: Vec<(&str, WalBatch, usize, &str)> = vec![
+            (
+                "single put",
+                WalBatch {
+                    commit_ts: 7,
+                    recorded_at: RecordedAt {
+                        secs: 1_700_000_000,
+                        nanos: 42,
+                    },
+                    entries: vec![WalEntry::Put {
+                        key: b"key-0001".to_vec(),
+                        value: b"value-0001".to_vec(),
+                    }],
+                },
+                4096,
+                "1fe36041eca9fdf1a1954324c533b6cc59942ceac98fe98e26c2a14295f23882",
+            ),
+            (
+                "point delete",
+                WalBatch {
+                    commit_ts: 8,
+                    recorded_at: RecordedAt {
+                        secs: 1_700_000_001,
+                        nanos: 43,
+                    },
+                    entries: vec![WalEntry::PointDelete {
+                        key: b"gone".to_vec(),
+                    }],
+                },
+                4096,
+                "56cd008b5f0c7af10279ae4985fed477ff5548bde8b64741681bb58bd46e418d",
+            ),
+            (
+                "range delete",
+                WalBatch {
+                    commit_ts: 9,
+                    recorded_at: RecordedAt {
+                        secs: 1_700_000_002,
+                        nanos: 44,
+                    },
+                    entries: vec![WalEntry::RangeDelete {
+                        start: b"a".to_vec(),
+                        end: b"z".to_vec(),
+                    }],
+                },
+                4096,
+                "8c5c5683ef4fbc868508b433f772dfdc5516ce26610d39f4549646720d08bb24",
+            ),
+            (
+                "duplicate keys canonicalise",
+                WalBatch {
+                    commit_ts: 10,
+                    recorded_at: RecordedAt {
+                        secs: 1_700_000_003,
+                        nanos: 45,
+                    },
+                    entries: vec![
+                        WalEntry::Put {
+                            key: b"k".to_vec(),
+                            value: b"first".to_vec(),
+                        },
+                        WalEntry::Put {
+                            key: b"other".to_vec(),
+                            value: b"x".to_vec(),
+                        },
+                        WalEntry::Put {
+                            key: b"k".to_vec(),
+                            value: b"last".to_vec(),
+                        },
+                    ],
+                },
+                4096,
+                "1ef8bc680066b75b98a4c061f28b8f0a8a9d3330477d4bf2413b385091841b5e",
+            ),
+            (
+                "full padding boundary",
+                WalBatch {
+                    commit_ts: 11,
+                    recorded_at: RecordedAt {
+                        secs: 1_700_000_004,
+                        nanos: 46,
+                    },
+                    entries: vec![WalEntry::Put {
+                        key: vec![b'k'; 60],
+                        value: vec![b'v'; 4000],
+                    }],
+                },
+                8192,
+                "a3a444a6469c0708f1db2cc2a53072cb5edaed4adeb09ba77f4b72e25db9c40b",
+            ),
+        ];
+        for (name, batch, expected_len, expected_digest) in cases {
+            let encoded = encode_v5_batch(&batch, limits).unwrap();
+            assert_eq!(encoded.len(), expected_len, "{name}: encoded length");
+            assert_eq!(
+                format!("{:x}", Sha256::digest(&encoded)),
+                expected_digest,
+                "{name}: encoded bytes changed"
+            );
+        }
     }
 }
