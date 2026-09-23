@@ -536,6 +536,36 @@ the upgrade keeps the old rule and keeps saying so in the seal it writes - also 
 including that its digest still covers the preallocated tail up to `logical_length`,
 which is the length the engine truncates to before archiving.
 
+#### What deriving a digest costs now that it walks
+
+The digest is no longer one `SHA256` over a file. Every site that derives a stored WAL
+digest - archive, verify, restore, backup, and opening a sealed source - now walks the
+batches, because the v6 rule has to know where each batch ends. `decode_v5_batch` per
+batch allocates a `Vec` per key and value and calls `canonicalized()`, so the walk is
+parse-shaped work the old single hash did not do. Measured on a 16 MiB segment with
+4,095 batches in a release build (reps 1 and 2; the first `sha256` reading was a
+cold-start outlier at 16.2 ms):
+
+| derivation | time | against the old hash |
+| --- | ---: | ---: |
+| `SHA256(file)` - what every site did before | 6.57 / 6.60 ms | - |
+| whole-aligned-prefix walk (a v5 segment) | 10.17 / 10.18 ms | **1.55x** |
+| logical-batch walk (a v6 segment) | 5.31 / 5.44 ms | **0.81x** |
+
+The parse costs about **0.88 us per batch** - 3.6 ms across those 4,095 - and that is
+the whole of the difference. For a v6 segment the rule hashes a quarter of the bytes
+at this shape, which more than pays for it, so verification got *cheaper*. Only a v5
+segment pays more, and that is a fixed population: segments written before this change,
+which age out as they are archived and reclaimed. Extrapolating the same rates to a
+128 MiB segment: about 42 ms for v6 against the 53 ms the old hash took, and about
+82 ms for a legacy segment.
+
+That is why there is no cheaper extent-walk path here. A header-only walk - read
+`data_len` at `offset + 24..28`, step `align_up(offset + 40 + data_len)` - would skip
+the parse, but it would skip the per-batch CRCs and the zero-gap check with it, so it
+would have to be justified by a cost this measurement does not show: the walk is the
+smaller half of a step that is itself one part of reading the object.
+
 **Upgrade and rollback.** New segments are v6; a repository that holds both verifies
 each under its own rule, which the mixed-version archive-and-restore test drives end to
 end (the successor's predecessor anchor is a *stored* v5 digest inside a v6 header, and
