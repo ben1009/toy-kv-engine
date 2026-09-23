@@ -348,3 +348,51 @@ regime and under `/home` for the disk one. Keeping other work off the machine ma
 one intermediate pass was discarded because a benchmark was still running in the
 background.
 
+### What the remaining tmpfs gap was (2026-09-23)
+
+The 55.4% above is the enabled path against the disabled one at the same head, so it is
+not the publication ordering: it is the seal. `PitrSealAccumulator::append` feeds each
+group's buffers into the segment's streaming SHA-256, and because the buffers are
+padded to the 4 KiB `O_DIRECT` alignment, a 1 KiB value hashes about 3.7x the bytes it
+carries. It ran on the commit leader, inside the window where the leader holds
+`submitting` - the window every other writer waits to enter - at 5.8 us per group.
+
+It was invisible until `pitr-perf --profile` existed (PR #340): `wal_submit` is
+recorded before the fdatasync, while the seal block runs after it, so no counter
+covered it. The `pitr_seal` line in that report is this cost.
+
+Moving it off the leader's window closed the gap. Two placements were measured against
+each other, and the first one was wrong:
+
+- hashing on the append path (`put_v5_batch`) takes the work out of the submit chain
+  and is offset-ordered by construction, but it also lands inside `pitr_reserved_end`,
+  the offset-reservation mutex every writer takes. At 4 writers that reads +6%; at 8
+  and 16 the enabled path collapses, because the mutex now serializes a SHA-256 of
+  every aligned buffer across all threads.
+- what shipped takes a `pitr_seal_append` lock *inside* the `submitting` window,
+  publishes the group (releasing `submitting`), and then hashes off that window. The
+  window is exclusive and ordered by group, so the lock is acquired in file order and
+  the digest stays in file order; hashing after the group's fdatasync is what keeps the
+  digest to durable bytes, which the append placement had traded away.
+
+Same-session, 28,000 operations, interleaved repetitions, PITR disabled as the control,
+against the append-path build:
+
+| writers | delta | repetitions | control |
+| --- | ---: | --- | ---: |
+| 8 | **+2.4x** | 14/14 (1.7-3.5x) | 0.97x |
+| 16 | **+1.4x** | 14/14 (1.30-1.80x) | 0.89x |
+| 4 | +6% | 10/14 | 1.04x |
+| 1 | 0.998x | 15/30 | 0.97x |
+| 32 | neutral | 5/14 | 0.98x |
+
+Against the original leader-side build it is 3.2x at 8 writers (control 1.005x). The
+1-writer row is the reason to distrust small samples here: at 14 repetitions the same
+comparison read -11%, and the 30-repetition run above is what settled it.
+
+One harness limit to know before re-running this: `pitr-perf` aborts every
+PITR-enabled case above roughly 30,000 operations with `PITR batch would cross maximum
+segment bytes` - each 1 KiB operation costs 4 KiB against the 128 MiB
+`max_segment_bytes` - and an aborted case prints nothing on stdout. A run that produces
+an empty result file is that, not a crash.
+
