@@ -228,6 +228,9 @@ impl<'a> DirectBufCursor<'a> {
 struct TicketedBuf {
     ticket: u64,
     buf: DirectBuf,
+    /// The seal entry this batch contributes, carried to the commit leader so
+    /// the digest is extended only once the group is durable.
+    pitr_entry: Option<crate::pitr_seal::SealEntry>,
 }
 
 struct PitrSealAccumulator {
@@ -386,6 +389,12 @@ pub struct Wal {
     pitr_reserved_end: Mutex<u64>,
     pitr_rotation_needed: AtomicBool,
     pitr_seal: Option<Mutex<PitrSealAccumulator>>,
+    /// Held across a group's seal append, and acquired *inside* the window in
+    /// which the commit leader holds `submitting`. That window is exclusive and
+    /// ordered by group, so taking this lock there and then releasing
+    /// `submitting` before hashing keeps the digest in file order while leaving
+    /// the group's commit chain at submit + fdatasync.
+    pitr_seal_append: Mutex<()>,
 }
 
 /// Abstraction over WAL entry recovery actions.
@@ -586,6 +595,7 @@ impl Wal {
                 pitr_reserved_end: Mutex::new(0),
                 pitr_rotation_needed: AtomicBool::new(false),
                 pitr_seal,
+                pitr_seal_append: Mutex::new(()),
             })
         } else {
             log::info!("WAL: recovered non-MVCC WAL, using buffered I/O only");
@@ -610,6 +620,7 @@ impl Wal {
                 pitr_reserved_end: Mutex::new(0),
                 pitr_rotation_needed: AtomicBool::new(false),
                 pitr_seal: None,
+                pitr_seal_append: Mutex::new(()),
             })
         }
     }
@@ -767,7 +778,11 @@ impl Wal {
         let enqueue_start = Instant::now();
         let mut pending = self.pending.lock();
         let ticket = self.next_ticket.fetch_add(1, Ordering::Release);
-        pending.push(TicketedBuf { ticket, buf });
+        pending.push(TicketedBuf {
+            ticket,
+            buf,
+            pitr_entry: None,
+        });
         drop(pending);
         #[cfg(feature = "bench")]
         if let Some(profile) = profile {
@@ -852,7 +867,11 @@ impl Wal {
 
         let mut pending = self.pending.lock();
         let ticket = self.next_ticket.fetch_add(1, Ordering::Release);
-        pending.push(TicketedBuf { ticket, buf });
+        pending.push(TicketedBuf {
+            ticket,
+            buf,
+            pitr_entry: None,
+        });
         drop(pending);
 
         #[cfg(feature = "chaos-testing")]
@@ -915,6 +934,7 @@ impl Wal {
             pitr_reserved_end: Mutex::new(0),
             pitr_rotation_needed: AtomicBool::new(false),
             pitr_seal: None,
+            pitr_seal_append: Mutex::new(()),
         })
     }
 
@@ -950,6 +970,7 @@ impl Wal {
             pitr_segment_start: AtomicU64::new(0),
             pitr_reserved_end: Mutex::new(0),
             pitr_rotation_needed: AtomicBool::new(false),
+            pitr_seal_append: Mutex::new(()),
             pitr_seal: Some(Mutex::new(PitrSealAccumulator::from_prefix(
                 header,
                 &header_bytes,
@@ -1021,6 +1042,9 @@ impl Wal {
     }
 
     pub(crate) fn finalize_pitr_seal(&self) -> Result<(crate::pitr_seal::V5Seal, Vec<u8>)> {
+        // Serialized against a group's seal append: the append holds this lock
+        // for the duration of hashing, so taking it here waits that out.
+        let _append_guard = self.pitr_seal_append.lock();
         self.pitr_seal
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("WAL has no PITR seal accumulator"))?
@@ -1130,33 +1154,20 @@ impl Wal {
         }
         #[cfg(feature = "bench")]
         let enqueue_start = Instant::now();
-        // Feed the seal accumulator here instead of after the submit. This
-        // section already orders batches by file offset, so the digest streams
-        // in file order by construction, and the work leaves the commit
-        // leader's serialized section - where it delayed every other writer's
-        // submit by about 5.8 us per group.
-        if let Some(accumulator) = &self.pitr_seal {
-            #[cfg(feature = "bench")]
-            let seal_start = Instant::now();
-            accumulator.lock().append(
-                &buf,
-                crate::pitr_seal::SealEntry {
-                    commit_ts: batch.commit_ts,
-                    recorded_at: batch.recorded_at,
-                },
-            );
-            #[cfg(feature = "bench")]
-            if let Some(profile) = profile {
-                profile.record_pitr_seal_append_ns(seal_start.elapsed().as_nanos() as u64);
-            }
-        }
         let mut pending = self.pending.lock();
         let ticket = self.next_ticket.fetch_add(1, Ordering::Release);
         *reserved = next;
         if next == max_segment_bytes {
             self.pitr_rotation_needed.store(true, Ordering::Release);
         }
-        pending.push(TicketedBuf { ticket, buf });
+        pending.push(TicketedBuf {
+            ticket,
+            buf,
+            pitr_entry: Some(crate::pitr_seal::SealEntry {
+                commit_ts: batch.commit_ts,
+                recorded_at: batch.recorded_at,
+            }),
+        });
         #[cfg(feature = "bench")]
         if let Some(profile) = profile {
             profile.record_wal_enqueue_ns(enqueue_start.elapsed().as_nanos() as u64);
@@ -2239,13 +2250,55 @@ impl Wal {
         }
         let result = self.submit_sqes_and_poll(ticketed_bufs, profile);
 
+        // Take the seal lock while this group still holds `submitting`: that
+        // window is exclusive and ordered by group, so the lock is acquired in
+        // file order, and the hashing below can then happen after `submitting`
+        // is released - off the chain every other writer waits on.
+        let seal_guard = self
+            .pitr_seal
+            .as_ref()
+            .map(|_| self.pitr_seal_append.lock());
+
         #[cfg(feature = "chaos-testing")]
         {
             crate::chaos::failpoint::fail_point!("wal.after_fsync_before_publish");
         }
 
         self.publish_submit_result(max_ticket, &result);
-        result
+
+        match result {
+            Ok(bufs) => {
+                if seal_guard.is_some() {
+                    #[cfg(feature = "bench")]
+                    let seal_start = Instant::now();
+                    if let Some(accumulator) = &self.pitr_seal {
+                        let mut accumulator = accumulator.lock();
+                        for ticketed_buf in bufs.iter() {
+                            if let Some(entry) = ticketed_buf.pitr_entry {
+                                accumulator.append(&ticketed_buf.buf, entry);
+                            }
+                        }
+                    }
+                    #[cfg(feature = "bench")]
+                    if let Some(profile) = profile {
+                        profile.record_pitr_seal_append_ns(seal_start.elapsed().as_nanos() as u64);
+                    }
+                }
+                for ticketed_buf in bufs {
+                    let buf = ticketed_buf.buf;
+                    // Cap: don't return oversized buffers from bulk loads.
+                    if buf.cap() <= BUFFER_POOL_BUF_SIZE * 2 {
+                        let _ = self.direct_buf_pool.push(buf);
+                    }
+                }
+                drop(seal_guard);
+                Ok(())
+            }
+            Err(error) => {
+                drop(seal_guard);
+                Err(error)
+            }
+        }
     }
 
     fn wait_for_group_commit_peers(&self, ticket: u64) {
@@ -2291,7 +2344,7 @@ impl Wal {
         Err(anyhow::anyhow!("{err_msg}"))
     }
 
-    fn publish_submit_result(&self, max_ticket: u64, result: &Result<()>) {
+    fn publish_submit_result<T>(&self, max_ticket: u64, result: &Result<T>) {
         if result.is_err() {
             self.poisoned.store(true, Ordering::Release);
         }
@@ -2334,7 +2387,7 @@ impl Wal {
         &self,
         bufs: Vec<TicketedBuf>,
         profile: Option<&crate::mem_table::WriteProfile>,
-    ) -> Result<()> {
+    ) -> Result<Vec<TicketedBuf>> {
         #[cfg(not(feature = "bench"))]
         let _ = profile;
 
@@ -2510,17 +2563,9 @@ impl Wal {
         // to hold up the leader's serialized section to keep the digest in file
         // order.
 
-        // Return buffers to pool on success. into_inner is safe here because
-        // we only reach this path on success (no SQEs in flight).
-        // Cap: don't return oversized buffers from bulk loads to the pool.
-        let bufs = std::mem::ManuallyDrop::into_inner(bufs);
-        for ticketed_buf in bufs {
-            let buf = ticketed_buf.buf;
-            if buf.cap() <= BUFFER_POOL_BUF_SIZE * 2 {
-                let _ = self.direct_buf_pool.push(buf);
-            }
-        }
-
-        Ok(())
+        // Hand the buffers back rather than pooling them: the caller extends
+        // the seal from them after it releases `submitting`. into_inner is safe
+        // here because we only reach this path on success (no SQEs in flight).
+        Ok(std::mem::ManuallyDrop::into_inner(bufs))
     }
 }
