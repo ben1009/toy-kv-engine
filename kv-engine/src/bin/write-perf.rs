@@ -1075,77 +1075,9 @@ fn print_write_profile_snapshot(
     p: &kv_engine_wrapper::mem_table::WriteProfileSnapshot,
     label: &str,
 ) {
-    if p.op_count == 0 {
-        return;
+    if let Some(report) = p.format_report(label) {
+        eprintln!("{report}");
     }
-    let total = p.total_ms();
-    eprintln!(
-        "\n--- write profile: {label} ({} ops) ---\n  \
-         batch_build:  {:>8.2} ms\n  \
-         mvcc_wal_only:{:>8.2} ms\n  \
-         wal_write:    {:>8.2} ms  ({:>5.1}%)\n  \
-         wal_validate: {:>8.2} ms\n  \
-         wal_prepare:  {:>8.2} ms\n  \
-         wal_encode:   {:>8.2} ms\n  \
-         encode_parts: entries={:>7.2} ms  crc_header={:>7.2} ms  finish={:>7.2} ms\n  \
-         wal_enqueue:  {:>8.2} ms\n  \
-         wal_sync:     {:>8.2} ms  ({:>5.1}%)\n  \
-         wal_submit:   {:>8.2} ms\n  \
-         fdatasync:    {:>8.2} ms\n  \
-         follower_wait:{:>8.2} ms\n  \
-         follower_events: calls={:>7}  parks={:>7}  retries={:>7}\n  \
-         memtable:     {:>8.2} ms  ({:>5.1}%)\n  \
-         publish_parts: ttl={:>7.2} ms  decode={:>7.2} ms  bloom={:>7.2} ms  map={:>7.2} ms\n  \
-         publish_map:   copy={:>7.2} ms  skipmap={:>7.2} ms  accounting={:>7.2} ms\n  \
-         commit_groups: {:>7}  solo={:>7} ({:>5.1}%)  avg_bufs={:>5.2}  max_bufs={:>3}\n  \
-         commit_bytes:  avg={:>8.0} B  max={:>8} B\n  \
-        total:        {:>8.2} ms",
-        p.op_count,
-        p.batch_build_ms(),
-        p.mvcc_wal_only_ms(),
-        p.wal_write_ms(),
-        if total > 0.0 {
-            p.wal_write_ms() / total * 100.0
-        } else {
-            0.0
-        },
-        p.wal_validate_ms(),
-        p.wal_prepare_ms(),
-        p.wal_encode_ms(),
-        p.wal_encode_entries_ms(),
-        p.wal_encode_crc_header_ms(),
-        p.wal_encode_finish_ms(),
-        p.wal_enqueue_ms(),
-        p.wal_sync_ms(),
-        p.wal_sync_pct(),
-        p.wal_submit_ms(),
-        p.wal_fdatasync_ms(),
-        p.wal_follower_wait_ms(),
-        p.wal_follower_wait_calls,
-        p.wal_follower_condvar_waits,
-        p.wal_follower_retry_loops,
-        p.memtable_insert_ms(),
-        if total > 0.0 {
-            p.memtable_insert_ms() / total * 100.0
-        } else {
-            0.0
-        },
-        p.memtable_publish_ttl_check_ms(),
-        p.memtable_publish_decode_ms(),
-        p.memtable_publish_bloom_ms(),
-        p.memtable_publish_map_ms(),
-        p.memtable_publish_copy_ms(),
-        p.memtable_publish_skipmap_ms(),
-        p.memtable_publish_accounting_ms(),
-        p.wal_commit_groups,
-        p.wal_commit_solo_groups,
-        p.wal_commit_solo_pct(),
-        p.wal_commit_avg_buffers(),
-        p.wal_commit_max_buffers,
-        p.wal_commit_avg_bytes(),
-        p.wal_commit_max_bytes,
-        total,
-    );
 }
 
 fn start_hotpath_profile(enabled: bool) -> Option<kv_engine::profiling::HotpathGuard> {

@@ -509,6 +509,87 @@ impl WriteProfileSnapshot {
             + self.memtable_insert_ms()
     }
 
+    /// The phase report the profiling harnesses print.
+    ///
+    /// Lives here so `write-perf` and `pitr-perf` render identical tables - the
+    /// PITR-enabled path goes through WAL v5 encoding and seal accounting that
+    /// the v4 path does not, and comparing the two phases side by side is the
+    /// point of having it in both. Returns `None` when nothing was recorded,
+    /// which is what a build without the `bench` feature produces.
+    pub fn format_report(&self, label: &str) -> Option<String> {
+        if self.op_count == 0 {
+            return None;
+        }
+        let total = self.total_ms();
+        Some(format!(
+            "\n--- write profile: {label} ({} ops) ---\n  \
+             batch_build:  {:>8.2} ms\n  \
+             mvcc_wal_only:{:>8.2} ms\n  \
+             wal_write:    {:>8.2} ms  ({:>5.1}%)\n  \
+             wal_validate: {:>8.2} ms\n  \
+             wal_prepare:  {:>8.2} ms\n  \
+             wal_encode:   {:>8.2} ms\n  \
+             encode_parts: entries={:>7.2} ms  crc_header={:>7.2} ms  finish={:>7.2} ms\n  \
+             wal_enqueue:  {:>8.2} ms\n  \
+             wal_sync:     {:>8.2} ms  ({:>5.1}%)\n  \
+             wal_submit:   {:>8.2} ms\n  \
+             fdatasync:    {:>8.2} ms\n  \
+             follower_wait:{:>8.2} ms\n  \
+             follower_events: calls={:>7}  parks={:>7}  retries={:>7}\n  \
+             memtable:     {:>8.2} ms  ({:>5.1}%)\n  \
+             publish_parts: ttl={:>7.2} ms  decode={:>7.2} ms  bloom={:>7.2} ms  map={:>7.2} ms\n  \
+             publish_map:   copy={:>7.2} ms  skipmap={:>7.2} ms  accounting={:>7.2} ms\n  \
+             commit_groups: {:>7}  solo={:>7} ({:>5.1}%)  avg_bufs={:>5.2}  max_bufs={:>3}\n  \
+             commit_bytes:  avg={:>8.0} B  max={:>8} B\n  \
+            total:        {:>8.2} ms",
+            self.op_count,
+            self.batch_build_ms(),
+            self.mvcc_wal_only_ms(),
+            self.wal_write_ms(),
+            if total > 0.0 {
+                self.wal_write_ms() / total * 100.0
+            } else {
+                0.0
+            },
+            self.wal_validate_ms(),
+            self.wal_prepare_ms(),
+            self.wal_encode_ms(),
+            self.wal_encode_entries_ms(),
+            self.wal_encode_crc_header_ms(),
+            self.wal_encode_finish_ms(),
+            self.wal_enqueue_ms(),
+            self.wal_sync_ms(),
+            self.wal_sync_pct(),
+            self.wal_submit_ms(),
+            self.wal_fdatasync_ms(),
+            self.wal_follower_wait_ms(),
+            self.wal_follower_wait_calls,
+            self.wal_follower_condvar_waits,
+            self.wal_follower_retry_loops,
+            self.memtable_insert_ms(),
+            if total > 0.0 {
+                self.memtable_insert_ms() / total * 100.0
+            } else {
+                0.0
+            },
+            self.memtable_publish_ttl_check_ms(),
+            self.memtable_publish_decode_ms(),
+            self.memtable_publish_bloom_ms(),
+            self.memtable_publish_map_ms(),
+            self.memtable_publish_copy_ms(),
+            self.memtable_publish_skipmap_ms(),
+            self.memtable_publish_accounting_ms(),
+            self.wal_commit_groups,
+            self.wal_commit_solo_groups,
+            self.wal_commit_solo_pct(),
+            self.wal_commit_avg_buffers(),
+            self.wal_commit_max_buffers,
+            self.wal_commit_avg_bytes(),
+            self.wal_commit_max_bytes,
+            total,
+        ))
+    }
+
     pub fn wal_sync_pct(&self) -> f64 {
         let total = self.total_ms();
         if total == 0.0 {
@@ -1153,7 +1234,21 @@ impl MemTable {
             .wal
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("PITR WAL is not configured"))?;
-        Ok(Some(wal.put_v5_batch(batch, limits)?))
+        #[cfg(feature = "bench")]
+        let started = Instant::now();
+        #[cfg(feature = "bench")]
+        let profile = self.write_profile.load();
+        #[cfg(feature = "bench")]
+        let ticket = wal.put_v5_batch(batch, limits, Some(&profile))?;
+        #[cfg(not(feature = "bench"))]
+        let ticket = wal.put_v5_batch(batch, limits, None)?;
+        #[cfg(feature = "bench")]
+        self.write_profile.load().wal_write_ns.fetch_add(
+            started.elapsed().as_nanos() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+
+        Ok(Some(ticket))
     }
 
     pub(crate) fn uses_wal_v5(&self) -> bool {

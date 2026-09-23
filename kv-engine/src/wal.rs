@@ -1059,10 +1059,16 @@ impl Wal {
     }
 
     #[allow(dead_code)]
+    /// Append a v5 (PITR) batch.
+    ///
+    /// `profile` receives the same phase counters the v4 path records, on the
+    /// same fields: on this path they time the v5 encoder, the batch-budget
+    /// checks and the enqueue, which is what the v4 fields mean here.
     pub(crate) fn put_v5_batch(
         &self,
         batch: &crate::pitr::WalBatch,
         limits: crate::pitr::WalV5Limits,
+        profile: Option<&crate::mem_table::WriteProfile>,
     ) -> Result<u64> {
         anyhow::ensure!(
             self.format_version == crate::pitr::WAL_V5_VERSION,
@@ -1073,11 +1079,21 @@ impl Wal {
             !self.poisoned.load(Ordering::Acquire),
             "WAL is poisoned due to a previous I/O error"
         );
+        #[cfg(not(feature = "bench"))]
+        let _ = profile;
+        #[cfg(feature = "bench")]
+        let encode_start = Instant::now();
         let encoded = crate::pitr::encode_v5_batch(batch, limits)?;
+        #[cfg(feature = "bench")]
+        if let Some(profile) = profile {
+            profile.record_wal_encode_ns(encode_start.elapsed().as_nanos() as u64);
+        }
         anyhow::ensure!(
             encoded.len() as u64 <= MAX_WAL_FILE_SIZE,
             "v5 batch exceeds maximum WAL file size"
         );
+        #[cfg(feature = "bench")]
+        let prepare_start = Instant::now();
         let mut buf = match self.direct_buf_pool.pop() {
             Some(buf) if buf.cap() >= encoded.len() => buf,
             Some(buf) => {
@@ -1090,6 +1106,14 @@ impl Wal {
         buf.write_at(0, &encoded);
         buf.set_len(encoded.len());
         let aligned_len = DirectBuf::align_up(encoded.len()) as u64;
+        #[cfg(feature = "bench")]
+        if let Some(profile) = profile {
+            profile.record_wal_prepare_ns(prepare_start.elapsed().as_nanos() as u64);
+        }
+        // The segment and unarchived budgets are checked like the v4 path's
+        // input validation, so they are timed as validation here.
+        #[cfg(feature = "bench")]
+        let validate_start = Instant::now();
         let mut reserved = self.pitr_reserved_end.lock();
         let next = reserved
             .checked_add(aligned_len)
@@ -1109,6 +1133,12 @@ impl Wal {
             next <= self.pitr_max_unarchived_bytes.load(Ordering::Acquire),
             "PITR unarchived WAL limit exceeded"
         );
+        #[cfg(feature = "bench")]
+        if let Some(profile) = profile {
+            profile.record_wal_validate_ns(validate_start.elapsed().as_nanos() as u64);
+        }
+        #[cfg(feature = "bench")]
+        let enqueue_start = Instant::now();
         let mut pending = self.pending.lock();
         let ticket = self.next_ticket.fetch_add(1, Ordering::Release);
         *reserved = next;
@@ -1123,6 +1153,10 @@ impl Wal {
                 recorded_at: batch.recorded_at,
             }),
         });
+        #[cfg(feature = "bench")]
+        if let Some(profile) = profile {
+            profile.record_wal_enqueue_ns(enqueue_start.elapsed().as_nanos() as u64);
+        }
         Ok(ticket)
     }
 

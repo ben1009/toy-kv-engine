@@ -54,7 +54,7 @@ fn test_wal_v5_create_preserves_identity_header() {
             value: b"value".to_vec(),
         }],
     };
-    let ticket = wal.put_v5_batch(&batch, limits).unwrap();
+    let ticket = wal.put_v5_batch(&batch, limits, None).unwrap();
     wal.submit_and_commit(ticket).unwrap();
     let bytes = std::fs::read(path).unwrap();
     assert_eq!(crate::pitr::decode_v5_file_header(&bytes).unwrap(), header);
@@ -68,7 +68,7 @@ fn test_wal_v5_create_preserves_identity_header() {
     let (rebuilt_seal, rebuilt_bytes) = crate::pitr_seal::build_v5_seal(&bytes).unwrap();
     assert_eq!(incremental_seal, rebuilt_seal);
     assert_eq!(incremental_bytes, rebuilt_bytes);
-    assert!(wal.put_v5_batch(&batch, limits).is_err());
+    assert!(wal.put_v5_batch(&batch, limits, None).is_err());
 }
 
 #[test]
@@ -109,6 +109,7 @@ fn test_wal_v5_admission_reserves_before_ticket_without_concurrent_overshoot() {
                     }],
                 },
                 crate::pitr::LIVE_WAL_V5_LIMITS,
+                None,
             )
         }));
     }
@@ -146,7 +147,7 @@ fn test_wal_v5_oversized_batch_fails_before_consuming_ticket() {
         }],
     };
     assert!(
-        wal.put_v5_batch(&oversized, crate::pitr::LIVE_WAL_V5_LIMITS)
+        wal.put_v5_batch(&oversized, crate::pitr::LIVE_WAL_V5_LIMITS, None)
             .is_err()
     );
     assert_eq!(wal.batch_count(), 0);

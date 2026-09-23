@@ -19,6 +19,12 @@ struct Args {
     operations: usize,
     #[arg(long, default_value = "/tmp")]
     root: PathBuf,
+    /// Print the engine's write-profile phases for each case, so the
+    /// PITR-enabled path's WAL v5 encoding and seal accounting can be read next
+    /// to the disabled path's. Requires a build with `--features bench`;
+    /// otherwise nothing is recorded and nothing is printed.
+    #[arg(long)]
+    profile: bool,
 }
 
 fn main() -> Result<()> {
@@ -136,6 +142,15 @@ fn run_case(args: &Args, writers: usize, pitr: bool, pitr_first: bool) -> Result
         );
     }
     let catchup_elapsed = catchup_started.elapsed();
+    if args.profile {
+        let label = format!(
+            "pitr-perf writers={writers} pitr={}",
+            if pitr { "enabled" } else { "disabled" }
+        );
+        if let Some(report) = engine.write_profile().format_report(&label) {
+            eprintln!("{report}");
+        }
+    }
     engine.close()?;
     println!(
         "{}",
