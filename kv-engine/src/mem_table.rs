@@ -89,6 +89,12 @@ pub struct WriteProfile {
     pub memtable_publish_skipmap_ns: AtomicU64,
     /// Time updating approximate-size accounting for published entries.
     pub memtable_publish_accounting_ns: AtomicU64,
+    /// Time the WAL commit leader spends extending the PITR seal accumulator
+    /// after a group's data is durable. This is serialized across writers like
+    /// the submit itself, and on the v5 path it hashes every batch's aligned
+    /// buffer into the segment digest, so it is the enabled path's largest
+    /// unaccounted foreground cost.
+    pub pitr_seal_append_ns: AtomicU64,
     /// Number of WAL commit groups that reached fdatasync.
     pub wal_commit_groups: AtomicU64,
     /// Number of WAL commit groups that only contained one pending buffer.
@@ -134,6 +140,7 @@ impl WriteProfile {
         self.memtable_publish_copy_ns.store(0, o);
         self.memtable_publish_skipmap_ns.store(0, o);
         self.memtable_publish_accounting_ns.store(0, o);
+        self.pitr_seal_append_ns.store(0, o);
         self.wal_commit_groups.store(0, o);
         self.wal_commit_solo_groups.store(0, o);
         self.wal_commit_buffers.store(0, o);
@@ -171,6 +178,7 @@ impl WriteProfile {
             memtable_publish_copy_ns: self.memtable_publish_copy_ns.load(o),
             memtable_publish_skipmap_ns: self.memtable_publish_skipmap_ns.load(o),
             memtable_publish_accounting_ns: self.memtable_publish_accounting_ns.load(o),
+            pitr_seal_append_ns: self.pitr_seal_append_ns.load(o),
             wal_commit_groups: self.wal_commit_groups.load(o),
             wal_commit_solo_groups: self.wal_commit_solo_groups.load(o),
             wal_commit_buffers: self.wal_commit_buffers.load(o),
@@ -208,6 +216,12 @@ impl WriteProfile {
     #[cfg(feature = "bench")]
     pub(crate) fn record_wal_submit_ns(&self, nanos: u64) {
         self.wal_submit_ns
+            .fetch_add(nanos, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn record_pitr_seal_append_ns(&self, nanos: u64) {
+        self.pitr_seal_append_ns
             .fetch_add(nanos, std::sync::atomic::Ordering::Relaxed);
     }
 
@@ -325,6 +339,7 @@ pub struct WriteProfileSnapshot {
     pub memtable_publish_copy_ns: u64,
     pub memtable_publish_skipmap_ns: u64,
     pub memtable_publish_accounting_ns: u64,
+    pub pitr_seal_append_ns: u64,
     pub wal_commit_groups: u64,
     pub wal_commit_solo_groups: u64,
     pub wal_commit_buffers: u64,
@@ -396,6 +411,9 @@ impl WriteProfileSnapshot {
             memtable_publish_accounting_ns: self
                 .memtable_publish_accounting_ns
                 .saturating_sub(before.memtable_publish_accounting_ns),
+            pitr_seal_append_ns: self
+                .pitr_seal_append_ns
+                .saturating_sub(before.pitr_seal_append_ns),
             wal_commit_groups: self
                 .wal_commit_groups
                 .saturating_sub(before.wal_commit_groups),
@@ -502,11 +520,98 @@ impl WriteProfileSnapshot {
         self.memtable_publish_accounting_ns as f64 / 1_000_000.0
     }
 
+    pub fn pitr_seal_append_ms(&self) -> f64 {
+        self.pitr_seal_append_ns as f64 / 1_000_000.0
+    }
+
     pub fn total_ms(&self) -> f64 {
         self.batch_build_ms()
             + self.mvcc_wal_only_ms().max(self.wal_write_ms())
             + self.wal_sync_ms()
             + self.memtable_insert_ms()
+    }
+
+    /// The phase report the profiling harnesses print.
+    ///
+    /// Lives here so `write-perf` and `pitr-perf` render identical tables - the
+    /// PITR-enabled path goes through WAL v5 encoding and seal accounting that
+    /// the v4 path does not, and comparing the two phases side by side is the
+    /// point of having it in both. Returns `None` when nothing was recorded,
+    /// which is what a build without the `bench` feature produces.
+    pub fn format_report(&self, label: &str) -> Option<String> {
+        if self.op_count == 0 {
+            return None;
+        }
+        let total = self.total_ms();
+        Some(format!(
+            "\n--- write profile: {label} ({} ops) ---\n  \
+             batch_build:  {:>8.2} ms\n  \
+             mvcc_wal_only:{:>8.2} ms\n  \
+             wal_write:    {:>8.2} ms  ({:>5.1}%)\n  \
+             wal_validate: {:>8.2} ms\n  \
+             wal_prepare:  {:>8.2} ms\n  \
+             wal_encode:   {:>8.2} ms\n  \
+             encode_parts: entries={:>7.2} ms  crc_header={:>7.2} ms  finish={:>7.2} ms\n  \
+             wal_enqueue:  {:>8.2} ms\n  \
+             wal_sync:     {:>8.2} ms  ({:>5.1}%)\n  \
+             wal_submit:   {:>8.2} ms\n  \
+             fdatasync:    {:>8.2} ms\n  \
+             follower_wait:{:>8.2} ms\n  \
+             pitr_seal:    {:>8.2} ms  (v5 only: leader hashes its group after fdatasync; subset of wal_sync)\n  \
+             follower_events: calls={:>7}  parks={:>7}  retries={:>7}\n  \
+             memtable:     {:>8.2} ms  ({:>5.1}%)\n  \
+             publish_parts: ttl={:>7.2} ms  decode={:>7.2} ms  bloom={:>7.2} ms  map={:>7.2} ms\n  \
+             publish_map:   copy={:>7.2} ms  skipmap={:>7.2} ms  accounting={:>7.2} ms\n  \
+             commit_groups: {:>7}  solo={:>7} ({:>5.1}%)  avg_bufs={:>5.2}  max_bufs={:>3}\n  \
+             commit_bytes:  avg={:>8.0} B  max={:>8} B\n  \
+            total:        {:>8.2} ms",
+            self.op_count,
+            self.batch_build_ms(),
+            self.mvcc_wal_only_ms(),
+            self.wal_write_ms(),
+            if total > 0.0 {
+                self.wal_write_ms() / total * 100.0
+            } else {
+                0.0
+            },
+            self.wal_validate_ms(),
+            self.wal_prepare_ms(),
+            self.wal_encode_ms(),
+            self.wal_encode_entries_ms(),
+            self.wal_encode_crc_header_ms(),
+            self.wal_encode_finish_ms(),
+            self.wal_enqueue_ms(),
+            self.wal_sync_ms(),
+            self.wal_sync_pct(),
+            self.wal_submit_ms(),
+            self.wal_fdatasync_ms(),
+            self.wal_follower_wait_ms(),
+            self.pitr_seal_append_ms(),
+            self.wal_follower_wait_calls,
+            self.wal_follower_condvar_waits,
+            self.wal_follower_retry_loops,
+            self.memtable_insert_ms(),
+            if total > 0.0 {
+                self.memtable_insert_ms() / total * 100.0
+            } else {
+                0.0
+            },
+            self.memtable_publish_ttl_check_ms(),
+            self.memtable_publish_decode_ms(),
+            self.memtable_publish_bloom_ms(),
+            self.memtable_publish_map_ms(),
+            self.memtable_publish_copy_ms(),
+            self.memtable_publish_skipmap_ms(),
+            self.memtable_publish_accounting_ms(),
+            self.wal_commit_groups,
+            self.wal_commit_solo_groups,
+            self.wal_commit_solo_pct(),
+            self.wal_commit_avg_buffers(),
+            self.wal_commit_max_buffers,
+            self.wal_commit_avg_bytes(),
+            self.wal_commit_max_bytes,
+            total,
+        ))
     }
 
     pub fn wal_sync_pct(&self) -> f64 {
@@ -1153,7 +1258,21 @@ impl MemTable {
             .wal
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("PITR WAL is not configured"))?;
-        Ok(Some(wal.put_v5_batch(batch, limits)?))
+        #[cfg(feature = "bench")]
+        let started = Instant::now();
+        #[cfg(feature = "bench")]
+        let profile = self.write_profile.load();
+        #[cfg(feature = "bench")]
+        let ticket = wal.put_v5_batch(batch, limits, Some(&profile))?;
+        #[cfg(not(feature = "bench"))]
+        let ticket = wal.put_v5_batch(batch, limits, None)?;
+        #[cfg(feature = "bench")]
+        self.write_profile.load().wal_write_ns.fetch_add(
+            started.elapsed().as_nanos() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+
+        Ok(Some(ticket))
     }
 
     pub(crate) fn uses_wal_v5(&self) -> bool {

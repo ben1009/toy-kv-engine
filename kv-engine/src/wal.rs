@@ -228,6 +228,8 @@ impl<'a> DirectBufCursor<'a> {
 struct TicketedBuf {
     ticket: u64,
     buf: DirectBuf,
+    /// The seal entry this batch contributes, carried to the commit leader so
+    /// the digest is extended only once the group is durable.
     pitr_entry: Option<crate::pitr_seal::SealEntry>,
 }
 
@@ -387,6 +389,12 @@ pub struct Wal {
     pitr_reserved_end: Mutex<u64>,
     pitr_rotation_needed: AtomicBool,
     pitr_seal: Option<Mutex<PitrSealAccumulator>>,
+    /// Held across a group's seal append, and acquired *inside* the window in
+    /// which the commit leader holds `submitting`. That window is exclusive and
+    /// ordered by group, so taking this lock there and then releasing
+    /// `submitting` before hashing keeps the digest in file order while leaving
+    /// the group's commit chain at submit + fdatasync.
+    pitr_seal_append: Mutex<()>,
 }
 
 /// Abstraction over WAL entry recovery actions.
@@ -587,6 +595,7 @@ impl Wal {
                 pitr_reserved_end: Mutex::new(0),
                 pitr_rotation_needed: AtomicBool::new(false),
                 pitr_seal,
+                pitr_seal_append: Mutex::new(()),
             })
         } else {
             log::info!("WAL: recovered non-MVCC WAL, using buffered I/O only");
@@ -611,6 +620,7 @@ impl Wal {
                 pitr_reserved_end: Mutex::new(0),
                 pitr_rotation_needed: AtomicBool::new(false),
                 pitr_seal: None,
+                pitr_seal_append: Mutex::new(()),
             })
         }
     }
@@ -924,6 +934,7 @@ impl Wal {
             pitr_reserved_end: Mutex::new(0),
             pitr_rotation_needed: AtomicBool::new(false),
             pitr_seal: None,
+            pitr_seal_append: Mutex::new(()),
         })
     }
 
@@ -959,6 +970,7 @@ impl Wal {
             pitr_segment_start: AtomicU64::new(0),
             pitr_reserved_end: Mutex::new(0),
             pitr_rotation_needed: AtomicBool::new(false),
+            pitr_seal_append: Mutex::new(()),
             pitr_seal: Some(Mutex::new(PitrSealAccumulator::from_prefix(
                 header,
                 &header_bytes,
@@ -1030,6 +1042,9 @@ impl Wal {
     }
 
     pub(crate) fn finalize_pitr_seal(&self) -> Result<(crate::pitr_seal::V5Seal, Vec<u8>)> {
+        // Serialized against a group's seal append: the append holds this lock
+        // for the duration of hashing, so taking it here waits that out.
+        let _append_guard = self.pitr_seal_append.lock();
         self.pitr_seal
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("WAL has no PITR seal accumulator"))?
@@ -1059,10 +1074,16 @@ impl Wal {
     }
 
     #[allow(dead_code)]
+    /// Append a v5 (PITR) batch.
+    ///
+    /// `profile` receives the same phase counters the v4 path records, on the
+    /// same fields: on this path they time the v5 encoder, the batch-budget
+    /// checks and the enqueue, which is what the v4 fields mean here.
     pub(crate) fn put_v5_batch(
         &self,
         batch: &crate::pitr::WalBatch,
         limits: crate::pitr::WalV5Limits,
+        profile: Option<&crate::mem_table::WriteProfile>,
     ) -> Result<u64> {
         anyhow::ensure!(
             self.format_version == crate::pitr::WAL_V5_VERSION,
@@ -1073,11 +1094,21 @@ impl Wal {
             !self.poisoned.load(Ordering::Acquire),
             "WAL is poisoned due to a previous I/O error"
         );
+        #[cfg(not(feature = "bench"))]
+        let _ = profile;
+        #[cfg(feature = "bench")]
+        let encode_start = Instant::now();
         let encoded = crate::pitr::encode_v5_batch(batch, limits)?;
+        #[cfg(feature = "bench")]
+        if let Some(profile) = profile {
+            profile.record_wal_encode_ns(encode_start.elapsed().as_nanos() as u64);
+        }
         anyhow::ensure!(
             encoded.len() as u64 <= MAX_WAL_FILE_SIZE,
             "v5 batch exceeds maximum WAL file size"
         );
+        #[cfg(feature = "bench")]
+        let prepare_start = Instant::now();
         let mut buf = match self.direct_buf_pool.pop() {
             Some(buf) if buf.cap() >= encoded.len() => buf,
             Some(buf) => {
@@ -1090,6 +1121,14 @@ impl Wal {
         buf.write_at(0, &encoded);
         buf.set_len(encoded.len());
         let aligned_len = DirectBuf::align_up(encoded.len()) as u64;
+        #[cfg(feature = "bench")]
+        if let Some(profile) = profile {
+            profile.record_wal_prepare_ns(prepare_start.elapsed().as_nanos() as u64);
+        }
+        // The segment and unarchived budgets are checked like the v4 path's
+        // input validation, so they are timed as validation here.
+        #[cfg(feature = "bench")]
+        let validate_start = Instant::now();
         let mut reserved = self.pitr_reserved_end.lock();
         let next = reserved
             .checked_add(aligned_len)
@@ -1109,6 +1148,12 @@ impl Wal {
             next <= self.pitr_max_unarchived_bytes.load(Ordering::Acquire),
             "PITR unarchived WAL limit exceeded"
         );
+        #[cfg(feature = "bench")]
+        if let Some(profile) = profile {
+            profile.record_wal_validate_ns(validate_start.elapsed().as_nanos() as u64);
+        }
+        #[cfg(feature = "bench")]
+        let enqueue_start = Instant::now();
         let mut pending = self.pending.lock();
         let ticket = self.next_ticket.fetch_add(1, Ordering::Release);
         *reserved = next;
@@ -1123,6 +1168,10 @@ impl Wal {
                 recorded_at: batch.recorded_at,
             }),
         });
+        #[cfg(feature = "bench")]
+        if let Some(profile) = profile {
+            profile.record_wal_enqueue_ns(enqueue_start.elapsed().as_nanos() as u64);
+        }
         Ok(ticket)
     }
 
@@ -2201,13 +2250,64 @@ impl Wal {
         }
         let result = self.submit_sqes_and_poll(ticketed_bufs, profile);
 
+        // Take the seal lock while this group still holds `submitting`: that
+        // window is exclusive and ordered by group, so the lock is acquired in
+        // file order, and the hashing below can then happen after `submitting`
+        // is released - off the chain every other writer waits on.
+        let seal_guard = self
+            .pitr_seal
+            .as_ref()
+            .map(|_| self.pitr_seal_append.lock());
+
         #[cfg(feature = "chaos-testing")]
         {
             crate::chaos::failpoint::fail_point!("wal.after_fsync_before_publish");
         }
 
         self.publish_submit_result(max_ticket, &result);
-        result
+
+        match result {
+            Ok(bufs) => {
+                if seal_guard.is_some()
+                    && let Some(accumulator) = &self.pitr_seal
+                {
+                    let mut accumulator = accumulator.lock();
+                    // Timed *inside* the lock, so this counter is the hashing work
+                    // and not the wait to take the seal mutex - at high writer
+                    // counts those are very different quantities, and the wait is
+                    // the larger one.
+                    #[cfg(feature = "bench")]
+                    let seal_start = Instant::now();
+                    // Every buffer on a v5 WAL carries a seal entry: only
+                    // `put_v5_batch` produces them and the v4 append paths refuse a
+                    // v5 format, so this is a shape check, not a filter that can
+                    // drop a batch.
+                    for ticketed_buf in bufs.iter() {
+                        debug_assert!(ticketed_buf.pitr_entry.is_some());
+                        if let Some(entry) = ticketed_buf.pitr_entry {
+                            accumulator.append(&ticketed_buf.buf, entry);
+                        }
+                    }
+                    #[cfg(feature = "bench")]
+                    if let Some(profile) = profile {
+                        profile.record_pitr_seal_append_ns(seal_start.elapsed().as_nanos() as u64);
+                    }
+                }
+                for ticketed_buf in bufs {
+                    let buf = ticketed_buf.buf;
+                    // Cap: don't return oversized buffers from bulk loads.
+                    if buf.cap() <= BUFFER_POOL_BUF_SIZE * 2 {
+                        let _ = self.direct_buf_pool.push(buf);
+                    }
+                }
+                drop(seal_guard);
+                Ok(())
+            }
+            Err(error) => {
+                drop(seal_guard);
+                Err(error)
+            }
+        }
     }
 
     fn wait_for_group_commit_peers(&self, ticket: u64) {
@@ -2253,7 +2353,7 @@ impl Wal {
         Err(anyhow::anyhow!("{err_msg}"))
     }
 
-    fn publish_submit_result(&self, max_ticket: u64, result: &Result<()>) {
+    fn publish_submit_result<T>(&self, max_ticket: u64, result: &Result<T>) {
         if result.is_err() {
             self.poisoned.store(true, Ordering::Release);
         }
@@ -2296,7 +2396,7 @@ impl Wal {
         &self,
         bufs: Vec<TicketedBuf>,
         profile: Option<&crate::mem_table::WriteProfile>,
-    ) -> Result<()> {
+    ) -> Result<Vec<TicketedBuf>> {
         #[cfg(not(feature = "bench"))]
         let _ = profile;
 
@@ -2467,26 +2567,15 @@ impl Wal {
             }
         }
 
-        if let Some(accumulator) = &self.pitr_seal {
-            let mut accumulator = accumulator.lock();
-            for ticketed_buf in bufs.iter() {
-                if let Some(entry) = ticketed_buf.pitr_entry {
-                    accumulator.append(&ticketed_buf.buf, entry);
-                }
-            }
-        }
+        // The seal is deliberately not extended here. The commit leader takes
+        // `pitr_seal_append` inside the exclusive `submitting` window and
+        // extends the digest only after it publishes the group (see
+        // `submit_as_leader`), so the digest stays in file order without any
+        // hashing on this path.
 
-        // Return buffers to pool on success. into_inner is safe here because
-        // we only reach this path on success (no SQEs in flight).
-        // Cap: don't return oversized buffers from bulk loads to the pool.
-        let bufs = std::mem::ManuallyDrop::into_inner(bufs);
-        for ticketed_buf in bufs {
-            let buf = ticketed_buf.buf;
-            if buf.cap() <= BUFFER_POOL_BUF_SIZE * 2 {
-                let _ = self.direct_buf_pool.push(buf);
-            }
-        }
-
-        Ok(())
+        // Hand the buffers back rather than pooling them: the caller extends
+        // the seal from them after it releases `submitting`. into_inner is safe
+        // here because we only reach this path on success (no SQEs in flight).
+        Ok(std::mem::ManuallyDrop::into_inner(bufs))
     }
 }

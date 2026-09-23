@@ -1178,3 +1178,77 @@ more sensitive to lock contention and MVCC version scanning overhead.
 | `lsm_storage.rs` | Reverted thread-local RefCell, back to `decode_user_key_cow` on hot path |
 | `mvcc.rs` | `validate_key_size` helper |
 | `vlog/mod.rs` | Key size validation in vLog writes |
+
+## WAL Group Commit Is Submit-Bound (2026-09-23)
+
+### Finding
+
+`wal_concurrent` (4 threads, 50,000 single `put`s each, 1 KiB values, WAL on, tmpfs) is
+bound by the cost of the group-commit submit rather than by the write path or by MVCC.
+`write-perf --profile` on the merged PITR head, one run:
+
+```text
+wal_sync:       3370.44 ms  (87.9% of 3835.96 ms of thread time)
+  follower_wait: 2498.87 ms        <- 65% of all thread time
+  wal_submit:     596.53 ms        <- 96,874 groups, 6.2 us per submit
+  fdatasync:       17.37 ms        <- tmpfs, so the sync itself is not the cost
+  follower_events: calls=159148  parks=249841  retries=56022
+memtable:        289.58 ms  (7.5%) publish map: copy 111.52, skipmap 76.85, bloom 29.42
+wal_write:       175.93 ms  (4.6%)
+commit_groups:  96874   solo=26269 (27.1%)   avg_bufs=2.06   max_bufs=4
+result:         168,345 ops/s in 1.188 s
+```
+
+The numbers close: `96,874 groups / 1.188 s x 2.06 buffers = 168k ops/s`, which is the
+measured throughput. Only one submit runs at a time (the `submitting` CAS), so one
+leader's 6.2 us is serialized and the other three threads park waiting for it - 65% of
+all thread time is followers waiting on a submit, against 17 ms of actual `fdatasync`.
+
+The ordered commit publication this was measured alongside costs about 270 ms of
+thread time on the same workload. Its three wait implementations and two structural
+redesigns are recorded in `docs/pitr-performance.md`.
+
+### Method
+
+```bash
+cargo build --release --features bench --bin write-perf
+./target/release/write-perf --suite legacy --preset default --wal \
+  --bench wal_concurrent --profile --output json --path <tmpfs dir>
+```
+
+The `WriteProfile` phases are behind `#[cfg(feature = "bench")]`, so the `bench`
+feature is what makes the breakdown available; the throughput counters do not need it.
+
+Machine state dominates absolute numbers here. This run read 168k ops/s, an idle run of
+the same build minutes earlier read 173k, and across sessions the same binaries have
+read between 149k and 175k. Compare builds within one session, never across.
+
+### Rejected: widening the solo-leader window
+
+27.1% of commit groups hold a single buffer, against 11.7% before the ordered commit
+sequencer landed, and each solo group pays a full serialized submit. The mitigation for
+this already exists but cannot fire here: `wait_for_group_commit_peers` only delays a
+solo leader when the lone pending buffer is at least `GROUP_COMMIT_MIN_SOLO_BYTES`
+(512 KiB) and it spins `GROUP_COMMIT_SOLO_SPINS` (4) times, while a 1 KiB value
+produces a buffer of about 1.1 KB.
+
+Widening it to 1024 bytes and 512 spins did exactly what it promises, and lost:
+
+| Variant | solo groups | groups | avg buffers/group | ops/s |
+| --- | ---: | ---: | ---: | ---: |
+| as merged | 26,269 | 96,874 | 2.06 | 168,345 |
+| widened window | 311 | 85,039 | 2.35 | 149,043 |
+
+The leader spins while holding `submitting`, so waiting for peers serializes the submit
+pipeline for every other thread. Group coalescing improved and throughput fell 11.5%.
+Tuning group formation is a dead end while only one submit can be in flight.
+
+### Where the headroom is
+
+Parallel submissions. RFC 012 replaces the leader/follower group commit with io_uring
+submissions and atomic page allocation, which removes both the serialized submit and the
+follower wait it causes - the two terms that dominate this profile.
+
+That ordering roughly doubles the solo rate is *not* an argument for it: the experiment
+above shows that eliminating solo groups does not buy throughput under the current
+submit model, so the submit model is the reason to do RFC 012, not the ordering.
