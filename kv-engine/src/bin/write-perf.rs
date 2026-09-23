@@ -16,8 +16,7 @@ use anyhow::{Context, Result, anyhow, bail, ensure};
 use clap::{Parser, ValueEnum};
 use kv_engine_wrapper::{
     BackupOptions, CreateBackupOutcome, EnablePitrOutcome, PersistedPitrConfig, PitrOptions,
-    PitrRuntimeOptions,
-    block_on,
+    PitrRuntimeOptions, block_on,
     checkpoint::CheckpointOptions,
     compact::{
         CompactionOptions, LeveledCompactionOptions, SimpleLeveledCompactionOptions,
@@ -8864,6 +8863,7 @@ mod tests {
             base_path: PathBuf::from("/tmp/write-perf"),
             cleanup: true,
             output: OutputFormat::Json,
+            pitr: false,
             num: 1,
             reads: 1,
             duration_secs: 1,
@@ -11268,6 +11268,7 @@ mod tests {
             base_path: PathBuf::from("/tmp/write-perf"),
             cleanup: true,
             output: OutputFormat::Json,
+            pitr: false,
             num: 0,
             reads: 1,
             duration_secs: 1,
