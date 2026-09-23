@@ -554,8 +554,16 @@ fn test_get_with_kind_at_ts_finds_version_in_adjacent_sst() {
     let gc = GarbageCollector::new(vlog, &storage.inner, 0.0);
     gc.gc_all().unwrap();
 
-    // Reader at ts=1 should still see version A after GC
-    let val = reader.get(b"split").unwrap();
+    // Reader at ts=1 should still see version A after GC.
+    //
+    // The error is reported rather than unwrapped away: this assertion failed once
+    // on CI (the ASan integration job) and in a burst of local runs on 2026-09-23,
+    // and the message was lost to `unwrap`, which left "GC reclaimed something the
+    // pinned snapshot needed" and "the read raced a file replacing itself"
+    // indistinguishable. If it fails again, the text below says which.
+    let val = reader.get(b"split").unwrap_or_else(|error| {
+        panic!("reader at ts=1 could not resolve version A after GC: {error:#}")
+    });
     assert_eq!(
         val,
         Some(Bytes::from(vec![b'A'; 64])),
