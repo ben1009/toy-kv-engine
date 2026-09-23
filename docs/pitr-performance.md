@@ -89,11 +89,16 @@ Three measurements, one process per run:
    `wal_concurrent` was then run again at 25.
 3. **PITR on/off** - `pitr-perf --operations 10000`, run three times against a disk
    and nine times against tmpfs. The harness alternates which mode goes first by case
-   position, so each result carries the `mode_order` it was produced under.
+   position, so each result carries the `mode_order` it was produced under. That
+   counterbalancing is *across* writer-count cases, not within one: every repetition
+   of a given writer count runs its two modes in the same order, so a ratio read for a
+   single writer count here is potentially order-confounded and `mode_order` records
+   the design without removing it. The seal comparison further down alternates the
+   order every repetition for that reason.
 
-Medians and quartiles are reported throughout, because the run-to-run spread is large
-enough that a single median over a handful of runs can produce a difference that is
-not there (see the note below).
+Medians are reported throughout, with quartiles where the spread decides the reading,
+because the run-to-run spread is large enough that a single median over a handful of
+runs can produce a difference that is not there (see the note below).
 
 WAL is disabled in (1) deliberately: with the database on a real disk each durable
 write is sync-bound at roughly 1,700 ops/s, which hides CPU differences entirely.
@@ -121,9 +126,10 @@ for (1) and the disk half of (3), under `/tmp` for (2) and the tmpfs half of (3)
 | `readrandom` | 205,922 | 208,759 | 205,961 | **-1.3%** | +0.0% |
 | `seekrandom` | 68,661 | 72,556 | 71,566 | **-1.4%** | +4.2% |
 
-Medians in ops/s. The head's spread against `b5ac2064` overlaps on every row - for
-`fillrandom`, head p25-p75 is 1,059k-1,215k against 1,079k-1,220k - so the -1.3% and
--1.4% read-path differences are inside the noise, not a cost.
+Medians in ops/s. Quartiles were recorded for `fillrandom`, whose head p25-p75
+(1,059k-1,215k) overlaps `b5ac2064`'s (1,079k-1,220k) - so its +0.2% is noise. The
+remaining rows are medians-only comparisons at 11 repetitions: their single-digit
+percentages are read as "no resolved movement", not as measured differences.
 
 ### WAL path (WAL on, 20,000 writes, 3 repetitions)
 
@@ -185,7 +191,9 @@ the baseline and `b5ac2064`, exactly five touch a file on this path (`mvcc.rs`,
 (`#296`), the base-capture barrier (`#310`), the WAL-v5 integration (`#314`), and the
 two recreate layers above them.
 
-It is `#296`, identified from the source rather than by bisecting: that commit put
+It is `#296` by attribution, not by isolation - no bisect was run, so this rests on
+source analysis plus the diagnostic builds below, not on a controlled comparison that
+holds the other four layers fixed. What the source shows: that commit put
 `reserve_commit_ts` and `publish_commit_ts` on the write path, and the second of them
 makes every write wait for every earlier timestamp to publish first. That wait both
 costs its own time and de-phases the writers, which is where the throughput went - the
@@ -341,9 +349,16 @@ The enabled/disabled sweep with this version reads **55.4%** (median) on tmpfs a
 disabled baseline no longer being throttled by the same convoy it was measured
 against.
 
-Re-running needs the three revisions built - `2f556ccb`, `b5ac2064`, and the head,
-each with `cargo build --release --bin write-perf` - plus the head with
-`cargo build --release --bin pitr-perf`. Pass `--path` under `/tmp` for the tmpfs
+Re-running needs four revisions built with `cargo build --release --bin write-perf`:
+`2f556ccb` (pre-PITR), `b5ac2064` (before #330), `494a20ab` (the unfixed head), and the
+ordered-publication fix. The fix row above was measured on PR #337's branch tip in that
+session and no commit id was recorded with the numbers - if you reproduce today, use
+`f21d421c`, that branch's final tip, merged to main as `58e587fa`: `write-perf --bench
+wal_concurrent`, repetitions alternated between builds, one session. The ratio is
+session-dependent - the same comparison in a later session read -10.3% rather than
+-4.0%, because its pre-PITR baseline ran faster (192k rather than 175k ops/s) while the
+fixed head held at ~171k. What reproduces is the fix's *own* contribution: about +5
+points on this workload (17/20 paired repetitions). Pass `--path` under `/tmp` for the tmpfs
 regime and under `/home` for the disk one. Keeping other work off the machine matters:
 one intermediate pass was discarded because a benchmark was still running in the
 background.
