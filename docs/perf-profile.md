@@ -1360,7 +1360,10 @@ and by waiting for it, but its *throughput* is not. Removing the submit serializ
 (c), the submit handoff (the serving experiment), or the fsync's syscall shape (d) does
 not raise it, and two of the three lower it. The lever left is the work each operation
 costs before it reaches the WAL - where the PITR v5 encoder's per-operation allocations
-and copies sit, bounded in size by the ~3% that enabling PITR costs end to end.
+and copies sit. That work was bounded above by the ~3% that enabling PITR costs end to
+end in `docs/pitr-performance.md`; that figure comes from `write-perf`'s four-thread
+`wal_concurrent`, a different harness and writer count from the section below, so it is
+not a bound on what the same work costs at 16 writers.
 
 ### The encoder was that work, and it is what the collapse was made of
 (2026-09-23, later still)
@@ -1373,7 +1376,9 @@ writes the batch into the ring buffer directly and skips the map for batches of 
 than two entries, with the encoded bytes pinned byte-for-byte against the previous
 implementation by a digest test.
 
-In-engine counters, `--features bench`, 16 writers, 20,000 operations:
+In-engine counters, from `pitr-perf --writers 16 --modes on --operations 20000
+--profile` on a `--features bench` build - the same harness and mode as the paired table
+below, so the two can be read together:
 
 | | before | after |
 | --- | ---: | ---: |
@@ -1385,10 +1390,18 @@ In-engine counters, `--features bench`, 16 writers, 20,000 operations:
 
 The group counts are the interesting pair. Cheaper producers reach the queue sooner, so
 the leader's drain finds more waiting: 28% fewer groups, each covering 39% more buffers,
-which is 28% fewer serialized submits and fsyncs per operation. The gain is in group
-*formation*, not in the microseconds saved - the same counters at 8 writers show
-`wal_write` about halved (36-41 ms to 20-21 ms per 20k ops) with the group count left
-in the same range (6.3k-7.5k before, 6.3k after), and that case is throughput parity.
+which is 28% fewer serialized submits and fsyncs per operation.
+
+The counters cannot separate that effect from the microseconds themselves, because the
+first follows from the second, and both are the same saving seen twice: across the full
+range the span falls 5.10 -> 2.78 us/op while the per-operation cost derived from the
+paired table falls by about 2.9 us, so most of the reduction is the span's own work,
+converting into throughput through the grouping. What the 8-writer control shows is
+where the conversion happens: there `wal_write` is about halved as well (36-41 ms to
+20-21 ms per 20k ops) with the group count left in the same range (6.3k-7.5k before,
+6.3k after), and that case is throughput parity. Cheaper producers only become
+throughput where the producer queue is what the pipeline waits on, which is the
+collapsed region.
 
 `pitr-perf`, paired, one case per invocation, 40 repetitions, alternating order, with a
 null pair - the same binary under both names - at each writer count:
@@ -1402,10 +1415,11 @@ null pair - the same binary under both names - at each writer count:
 | 32 | 1.181 | 29/40 | 0.919 |
 | control: PITR off, 16 writers | 0.972 | 15/40 | - |
 
-Sixteen writers is where PITR-on collapses (about 118k ops/s against 181k at 8), and
-that is where the change is worth ~1.5x, with 37 of 40 repetitions in its favour against
-a null of 22. The PITR-disabled control matters because that path never calls this
-encoder and must read parity, which it does.
+Sixteen writers is where PITR-on collapses - in those same paired runs the unmodified
+build's median was about 118k ops/s, against 181k at 8 writers - and that is where the
+change is worth ~1.5x, with 37 of 40 repetitions in its favour while the null pair at
+that count took 22 of 40. The PITR-disabled control matters because that path never
+calls this encoder and must read parity, which it does.
 
 The null column is why the rest of the table is readable at all. This protocol carries a
 per-count offset of up to about 8%, so a single number without its null beside it means
@@ -1413,9 +1427,17 @@ little - and the protocol used before it was worse: it ran all five writer count
 one invocation, and its null pair read 0.893-1.056, the same size as the effects it was
 reporting. Those numbers, including an apparent 1.291x at 16 writers from the same
 change, are withdrawn; what is left stands on the single-case runs above and on the
-per-operation counters, which agree in sign at every count.
+per-operation counters - and those were taken at two of the five counts, 8 and 16
+writers, not at 1, 4 or 32. Where both exist they agree at 16 and part company at 8,
+where the span halves while the raw paired row still reads 0.902 (0.936 against its
+null); the 8-writer entry above is called parity on the strength of that null, not of
+the counter.
 
-So the ledger for this workload: the submit serialization, the handoff, and the fsync's
-shape are all worth nothing on the PITR path, and the work each operation does before
-reaching the WAL was worth 1.5x - but only in the region where PITR-on had already
-collapsed. Below 16 writers the same change is parity, which is the honest bound on it.
+So the ledger. The submit serialization, the handoff and the fsync's shape are each worth
+nothing - but those were measured on `write-perf`'s `wal_concurrent`, which runs with
+PITR off, and on a standalone bench outside the engine, so they say nothing directly
+about the PITR path; what they establish is that the submit machinery is not this
+workload's constraint. On the path this section measures, the work each operation does
+before reaching the WAL was worth 1.5x - but only in the region where PITR-on had
+already collapsed. Below 16 writers the same change is parity, which is the honest bound
+on it.

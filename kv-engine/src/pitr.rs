@@ -516,6 +516,16 @@ fn write_entry_into(
     Ok(at)
 }
 
+/// The encoder as it was before it learned to write into the caller's buffer:
+/// it builds the batch in a `Vec` and does not canonicalise, so it is the only
+/// way to encode an uncanonicalised batch.
+///
+/// Production has exactly one encoder now - [`encode_v5_batch_into`], reached
+/// through [`encode_v5_batch`] - and this one is kept only because a decoder test
+/// needs a builder that preserves duplicate keys (`pitr::tests`). It is a test
+/// fixture: it is not on the write path, and the file-level `allow(dead_code)`
+/// above is what keeps it compiling. The pinned digests in that module were
+/// produced by this implementation, which is why they can be checked against it.
 fn encode_v5_batch_inner(batch: &WalBatch, limits: WalV5Limits) -> Result<Vec<u8>> {
     validate_batch_limits(batch, limits)?;
     ensure!(batch.commit_ts != 0, "v5 commit timestamp must be nonzero");
@@ -1302,6 +1312,15 @@ mod tests {
     /// taken from the same cases by the previous implementation - so this fails if
     /// the change altered a byte, including bytes the decoder happens to tolerate,
     /// like the batch header's reserved tail or an entry's reserved byte.
+    ///
+    /// The destination is poisoned before encoding, which is what gives the claim
+    /// above its force. Encoding into a fresh `Vec` - as calling `encode_v5_batch`
+    /// would - makes zeroing the reserved tail and the alignment padding
+    /// unobservable, because those bytes are already zero: deleting either
+    /// `fill(0)` would leave every digest below matching while the ring buffer,
+    /// which is pooled and still holds the previous batch's bytes, went on to
+    /// expose stale data past the logical end. A dirty destination is the only
+    /// version of this test that can fail for the bug it was written for.
     #[test]
     fn encoder_bytes_are_unchanged_by_writing_into_the_buffer() {
         let limits = LIVE_WAL_V5_LIMITS;
@@ -1397,8 +1416,10 @@ mod tests {
             ),
         ];
         for (name, batch, expected_len, expected_digest) in cases {
-            let encoded = encode_v5_batch(&batch, limits).unwrap();
-            assert_eq!(encoded.len(), expected_len, "{name}: encoded length");
+            let canonical = canonical_batch(&batch, limits).unwrap();
+            let mut encoded = vec![0xAA_u8; expected_len];
+            let written = encode_v5_batch_into(&canonical, limits, &mut encoded).unwrap();
+            assert_eq!(written, expected_len, "{name}: encoded length");
             assert_eq!(
                 format!("{:x}", Sha256::digest(&encoded)),
                 expected_digest,

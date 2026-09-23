@@ -1184,7 +1184,18 @@ impl Wal {
             None => DirectBuf::new(encoded_len),
         };
         buf.clear();
-        let written = crate::pitr::encode_v5_batch_into(&canonical, limits, buf.as_mut_slice())?;
+        let written =
+            match crate::pitr::encode_v5_batch_into(&canonical, limits, buf.as_mut_slice()) {
+                Ok(written) => written,
+                // Return the buffer before propagating: encoding here cannot fail for
+                // an input `v5_batch_encoded_len` accepted a moment ago, but a buffer
+                // dropped on this path would be a permanent loss from the pool, which
+                // the contract at the pool's definition explicitly rules out.
+                Err(error) => {
+                    let _ = self.direct_buf_pool.push(buf);
+                    return Err(error);
+                }
+            };
         debug_assert_eq!(written, encoded_len);
         buf.set_len(written);
         let aligned_len = written as u64;
