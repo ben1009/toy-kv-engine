@@ -2292,9 +2292,12 @@ impl Wal {
         ticket: u64,
         profile: Option<&crate::mem_table::WriteProfile>,
     ) -> Result<()> {
-        // How long the handoff cost: from the previous group releasing
-        // `submitting` to this leader reaching the commit path, wake-up
-        // included. A dedicated submitter is the design that would remove it.
+        // The inter-group gap: from the previous group releasing `submitting` to
+        // this leader reaching the commit path, wake-up included. The release
+        // stamp is taken whether or not a buffer is pending, so this is not the
+        // handoff alone - it also covers any interval in which the queue was
+        // empty and the next write had not arrived yet. A dedicated submitter is
+        // the design that would remove only the handoff part of it.
         #[cfg(feature = "bench")]
         let leader_entered = nanos_now();
         #[cfg(feature = "bench")]
@@ -2304,7 +2307,7 @@ impl Wal {
                 && leader_entered > released
                 && let Some(profile) = profile
             {
-                profile.record_wal_leader_gap_ns(leader_entered - released);
+                profile.record_wal_group_gap_ns(leader_entered - released);
             }
         }
         self.wait_for_group_commit_peers(ticket);
@@ -2495,6 +2498,12 @@ impl Wal {
         let ring_ref = self.ring.as_ref().unwrap();
 
         // Compute total aligned size first, then preallocate to cover the full batch.
+        //
+        // This preallocation is outside every profile span: `wal_submit` opens at
+        // the ring lock below, and the leader's `wal_leader_prepare` span closed
+        // before this function was called. It is also not per-group work - it
+        // extends the file only when the offset crosses a `PREALLOC_BLOCK`
+        // boundary - so nothing else should be read as having absorbed it.
         let total_size: u64 = bufs
             .iter()
             .map(|b| DirectBuf::align_up(b.buf.len()) as u64)

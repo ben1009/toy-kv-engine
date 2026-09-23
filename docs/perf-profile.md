@@ -1272,17 +1272,23 @@ they can be checked against the buffers submitted. `wal_concurrent`, 200,000 put
 | 1 | 200,000 | 692.62 ms | 3.16 ms | 3.56 ms | 657.68 ms | 9.51 ms |
 
 `cqe_count` equalled `commit_buffers` (200,000) in every run, so the spans close; about
-3.5% of `wal_submit` sits between them, in the aligned-length computation, the
-preallocation and the chunk bookkeeping. Per group that is 5.75 us at four writers and
+3.5% of `wal_submit` sits between them, in the aligned-length computation and the chunk
+bookkeeping. Preallocation is *not* in that residual: `maybe_preallocate` runs before
+`wal_submit` opens and after `wal_leader_prepare` closes, and it only extends the file
+when the offset crosses a `PREALLOC_BLOCK` boundary, so it is unmeasured here rather
+than absorbed into a span. Per group that is 5.75 us at four writers and
 3.46 us at one, of which `submit_and_wait` is 5.38 and 3.29: **the submit is the wait
 for the group's own writes to complete**, and everything a faster submit could touch -
 filling SQEs, taking the ring lock, reaping events - is about 5% of it. On tmpfs that
 wait is an `io_wq` worker round trip.
 
-Two further counters measure the handoff: `wal_leader_gap` is the time from a group
-releasing `submitting` to the next leader entering the commit path, wake-up included,
-and `wal_leader_prepare` is what that leader does before its first SQE - draining the
-queue, the solo-peer spin, the group accounting:
+Two further counters measure the handoff's neighbourhood. `wal_group_gap` is the time
+from a group releasing `submitting` to the next leader entering the commit path,
+wake-up included - and it is an inter-group gap, not the handoff: the release stamp is
+taken whether or not a buffer is pending, so any interval where the queue was empty and
+the next write had not arrived is inside it too. `wal_leader_prepare` is what that
+leader does before its first SQE - draining the queue, the solo-peer spin, the group
+accounting:
 
 | threads | gap per group | prepare per group |
 | ---: | ---: | ---: |
@@ -1291,8 +1297,11 @@ queue, the solo-peer spin, the group accounting:
 
 At one writer the gap is that writer doing its own memtable and publication work
 between groups, so it is work rather than waiting. At four it is 1.6 us larger per
-group, and that difference is the handoff - the one term a dedicated submitter thread
-would exist to remove. So it was tried, in the cheapest form that exercises the same
+group, but that difference is not the handoff on its own: the gap counts from the
+release stamp, so it also carries however long it took the next buffer to arrive, and
+faster arrival at four writers is part of why the number differs. The handoff is a
+component of it, not the whole. Rather than try to isolate it further, the handoff was
+removed outright, in the cheapest form that exercises the same
 mechanism: after publishing its own group, a leader keeps draining while writers are
 queueing instead of returning to its caller, bounded at eight groups. Paired against
 the same build without it, 20 repetitions, same workload and shape:
@@ -1331,9 +1340,14 @@ no follower wake-ups, several groups in flight with the durability frontier stil
 advancing in order - and it is neutral at four threads and worse at eight. Shape b
 prices `IO_DRAIN` as a barrier, which holds later SQEs behind the fsync: 0.74x. Shape d
 changes only the fsync, to an SQE submitted with the group's writes; the `IO_DRAIN` is
-what makes that ordering-correct, so the pair is what an SQE-based fsync costs, and it
-is 1.7x the direct `fdatasync(2)` call - the claim the code comment makes above that
-call, measured here for the first time.
+what makes that ordering-correct, so an SQE fsync cannot be had here without it. Shape d
+runs at 0.60x shape a's throughput, about 1.7x slower per record - and that is a
+statement about the shape, not about the fsync call. The bench measures records per
+second, so d's ratio carries the barrier's effect on how later SQEs pipeline as well as
+the cost of doing the sync through the ring, and pricing one against a direct
+`fdatasync(2)` would need the call timed on its own, which this pass did not do. It is
+consistent with the comment above that call in `wal.rs`, which expects the direct
+syscall to be cheaper per call; that expectation is still not separately measured.
 
 The disk half of this was not measured. The 200,000-record runs at four and eight
 threads exceeded their timeout - 100,000 fsyncs per run - and were discarded rather than

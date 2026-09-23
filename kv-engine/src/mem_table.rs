@@ -78,9 +78,14 @@ pub struct WriteProfile {
     /// Completion events reaped, to check against the buffers submitted.
     pub wal_cqe_count: AtomicU64,
     /// Time from the previous group releasing `submitting` to the next leader
-    /// entering the commit path: the election handoff, wake-up included. A
-    /// dedicated submitter would remove this term.
-    pub wal_leader_gap_ns: AtomicU64,
+    /// entering the commit path, wake-up included.
+    ///
+    /// This is an inter-group gap, not the handoff on its own: the release stamp
+    /// is taken whether or not a buffer is pending, so an interval in which the
+    /// queue is empty - the next write's own memtable and encode work, at one
+    /// writer - is inside this number too. Only the part of it that is
+    /// leader-to-leader is what a dedicated submitter would remove.
+    pub wal_group_gap_ns: AtomicU64,
     /// Time from a leader entering the commit path to pushing its first SQE:
     /// draining the pending queue, waiting out the solo-peer spin, and the
     /// group accounting.
@@ -158,7 +163,7 @@ impl WriteProfile {
         self.wal_uring_enter_ns.store(0, o);
         self.wal_cqe_reap_ns.store(0, o);
         self.wal_cqe_count.store(0, o);
-        self.wal_leader_gap_ns.store(0, o);
+        self.wal_group_gap_ns.store(0, o);
         self.wal_leader_prepare_ns.store(0, o);
         self.wal_fdatasync_ns.store(0, o);
         self.wal_follower_wait_ns.store(0, o);
@@ -204,7 +209,7 @@ impl WriteProfile {
             wal_uring_enter_ns: self.wal_uring_enter_ns.load(o),
             wal_cqe_reap_ns: self.wal_cqe_reap_ns.load(o),
             wal_cqe_count: self.wal_cqe_count.load(o),
-            wal_leader_gap_ns: self.wal_leader_gap_ns.load(o),
+            wal_group_gap_ns: self.wal_group_gap_ns.load(o),
             wal_leader_prepare_ns: self.wal_leader_prepare_ns.load(o),
             wal_fdatasync_ns: self.wal_fdatasync_ns.load(o),
             wal_follower_wait_ns: self.wal_follower_wait_ns.load(o),
@@ -286,8 +291,8 @@ impl WriteProfile {
     }
 
     #[cfg(feature = "bench")]
-    pub(crate) fn record_wal_leader_gap_ns(&self, nanos: u64) {
-        self.wal_leader_gap_ns
+    pub(crate) fn record_wal_group_gap_ns(&self, nanos: u64) {
+        self.wal_group_gap_ns
             .fetch_add(nanos, std::sync::atomic::Ordering::Relaxed);
     }
 
@@ -421,7 +426,7 @@ pub struct WriteProfileSnapshot {
     pub wal_uring_enter_ns: u64,
     pub wal_cqe_reap_ns: u64,
     pub wal_cqe_count: u64,
-    pub wal_leader_gap_ns: u64,
+    pub wal_group_gap_ns: u64,
     pub wal_leader_prepare_ns: u64,
     pub wal_fdatasync_ns: u64,
     pub wal_follower_wait_ns: u64,
@@ -479,9 +484,9 @@ impl WriteProfileSnapshot {
                 .saturating_sub(before.wal_uring_enter_ns),
             wal_cqe_reap_ns: self.wal_cqe_reap_ns.saturating_sub(before.wal_cqe_reap_ns),
             wal_cqe_count: self.wal_cqe_count.saturating_sub(before.wal_cqe_count),
-            wal_leader_gap_ns: self
-                .wal_leader_gap_ns
-                .saturating_sub(before.wal_leader_gap_ns),
+            wal_group_gap_ns: self
+                .wal_group_gap_ns
+                .saturating_sub(before.wal_group_gap_ns),
             wal_leader_prepare_ns: self
                 .wal_leader_prepare_ns
                 .saturating_sub(before.wal_leader_prepare_ns),
@@ -574,8 +579,8 @@ impl WriteProfileSnapshot {
         self.wal_cqe_reap_ns as f64 / 1_000_000.0
     }
 
-    pub fn wal_leader_gap_ms(&self) -> f64 {
-        self.wal_leader_gap_ns as f64 / 1_000_000.0
+    pub fn wal_group_gap_ms(&self) -> f64 {
+        self.wal_group_gap_ns as f64 / 1_000_000.0
     }
 
     pub fn wal_leader_prepare_ms(&self) -> f64 {
@@ -703,7 +708,7 @@ impl WriteProfileSnapshot {
              wal_submit:   {:>8.2} ms\n  \
              submit_parts: ring_lock={:>7.2} ms  sqe_fill={:>7.2} ms  uring_enter={:>7.2} ms  cqe_reap={:>7.2} ms\n  \
              cqe_count:    {:>7}  (clean run: equal to commit buffers)\n  \
-             leader_gap:   {:>8.2} ms  (previous release -> next leader enters)\n  \
+             group_gap:    {:>8.2} ms  (previous release -> next leader enters; includes idle)\n  \
              leader_prep:  {:>8.2} ms  (enter -> first SQE: drain, peer spin, accounting)\n  \
              fdatasync:    {:>8.2} ms\n  \
              follower_wait:{:>8.2} ms\n  \
@@ -740,7 +745,7 @@ impl WriteProfileSnapshot {
             self.wal_uring_enter_ms(),
             self.wal_cqe_reap_ms(),
             self.wal_cqe_count,
-            self.wal_leader_gap_ms(),
+            self.wal_group_gap_ms(),
             self.wal_leader_prepare_ms(),
             self.wal_fdatasync_ms(),
             self.wal_follower_wait_ms(),
