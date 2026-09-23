@@ -527,3 +527,66 @@ pub fn construct_merge_iterator_over_storage(
     }
     MergeIterator::create(iters)
 }
+
+/// A segment header with the given identity, at the given v5-family version.
+///
+/// `wal_format_version` selects the digest rule: [`crate::pitr::WAL_V5_VERSION`] is
+/// what a segment written now claims, [`crate::pitr::WAL_V5_VERSION_LEGACY`] what one
+/// written before the logical-batch digest claims.
+pub fn pitr_segment_header(
+    timeline_id: crate::pitr::TimelineId,
+    archive_epoch_id: crate::pitr::ArchiveEpochId,
+    segment_id: crate::pitr::SegmentId,
+    predecessor: crate::pitr::ChainAnchor,
+    wal_format_version: u16,
+) -> crate::pitr::WalV5Header {
+    crate::pitr::WalV5Header {
+        wal_format_version,
+        timeline_id,
+        archive_epoch_id,
+        segment_id,
+        predecessor,
+    }
+}
+
+/// A genuine, minimal v5-family PITR segment WAL: the file header plus one batch
+/// carrying one put.
+///
+/// The digest rules are defined over the real encoding, so a fixture that only
+/// pretends to be a WAL cannot be verified under one - a fabricated payload whose
+/// digest was a plain whole-object hash no longer exercises the archive, restore
+/// and verification paths at all.
+pub fn pitr_segment_wal_bytes(header: crate::pitr::WalV5Header) -> Vec<u8> {
+    pitr_segment_wal_bytes_at(header, 1)
+}
+
+/// The same fixture at a given commit timestamp, for callers that have to continue
+/// an existing segment's commit range rather than start one.
+pub fn pitr_segment_wal_bytes_at(header: crate::pitr::WalV5Header, commit_ts: u64) -> Vec<u8> {
+    let mut bytes = crate::pitr::encode_v5_file_header(header)
+        .expect("test segment header encodes")
+        .to_vec();
+    let batch = crate::pitr::WalBatch {
+        commit_ts,
+        recorded_at: crate::pitr::RecordedAt { secs: 1, nanos: 0 },
+        entries: vec![crate::pitr::WalEntry::Put {
+            key: b"k".to_vec(),
+            value: b"v".to_vec(),
+        }],
+    };
+    bytes.extend_from_slice(
+        &crate::pitr::encode_v5_batch(&batch, crate::pitr::LIVE_WAL_V5_LIMITS)
+            .expect("test segment batch encodes"),
+    );
+    bytes
+}
+
+/// The digest a segment at `wal_format_version` has over `wal`.
+pub fn pitr_wal_digest(wal: &[u8], wal_format_version: u16) -> [u8; 32] {
+    crate::pitr_seal::wal_digest(
+        wal,
+        crate::pitr::wal_digest_rule(wal_format_version)
+            .expect("test segment version is in the family"),
+    )
+    .expect("test segment WAL digests")
+}

@@ -207,6 +207,10 @@ pub(crate) struct PitrRestoreSourceObject {
     pub(crate) name: String,
     pub(crate) digest: [u8; 32],
     pub(crate) bytes: Option<u64>,
+    /// The segment's WAL digest rule. Both objects describe the same segment, so
+    /// both carry it; only the WAL object's bytes are digested with it, since the
+    /// sidecar is not a WAL and is always hashed whole.
+    pub(crate) wal_digest_rule: crate::pitr::WalDigestRule,
 }
 
 pub(crate) fn required_source_objects(
@@ -238,6 +242,7 @@ pub(crate) fn required_source_objects(
                 && segment.key.archive_epoch_id.0 == base.archive_epoch_id,
             "PITR restore source segment identity mismatch"
         );
+        let wal_digest_rule = segment.wal_digest_rule()?;
         objects.push(PitrRestoreSourceObject {
             segment_id: *segment_id,
             kind: ArchiveObjectKind::Wal,
@@ -250,6 +255,7 @@ pub(crate) fn required_source_objects(
             ),
             digest: segment.wal_digest,
             bytes: Some(segment.wal_bytes),
+            wal_digest_rule,
         });
         objects.push(PitrRestoreSourceObject {
             segment_id: *segment_id,
@@ -263,6 +269,7 @@ pub(crate) fn required_source_objects(
             ),
             digest: segment.seal_digest,
             bytes: None,
+            wal_digest_rule,
         });
     }
     Ok(objects)
@@ -275,8 +282,13 @@ pub(crate) fn verify_source_object(object: &PitrRestoreSourceObject, bytes: &[u8
             "PITR restore source object length mismatch"
         );
     }
+    let digest = match object.kind {
+        // The sidecar is not a WAL; its name is bound to a plain whole-object digest.
+        ArchiveObjectKind::Seal => Sha256::digest(bytes).into(),
+        ArchiveObjectKind::Wal => crate::pitr_seal::wal_digest(bytes, object.wal_digest_rule)?,
+    };
     ensure!(
-        Sha256::digest(bytes).as_slice() == object.digest,
+        digest.as_slice() == object.digest,
         "PITR restore source object digest mismatch"
     );
     Ok(())
@@ -1105,6 +1117,19 @@ mod tests {
         }
     }
 
+    /// The identity segment 1 carries in the byte-level fixtures.
+    fn header() -> crate::pitr::WalV5Header {
+        crate::tests::harness::pitr_segment_header(
+            TimelineId([2; 16]),
+            ArchiveEpochId([3; 16]),
+            SegmentId(1),
+            ChainAnchor::Genesis {
+                archive_epoch_id: ArchiveEpochId([3; 16]),
+            },
+            crate::pitr::WAL_V5_VERSION,
+        )
+    }
+
     fn segment(id: u64, first: u64, last: u64, predecessor: ChainAnchor) -> SegmentMetadata {
         SegmentMetadata {
             key: SegmentKey {
@@ -1113,7 +1138,7 @@ mod tests {
                 archive_epoch_id: ArchiveEpochId([3; 16]),
                 segment_id: SegmentId(id),
             },
-            wal_format_version: 5,
+            wal_format_version: crate::pitr::WAL_V5_VERSION,
             seal_format_version: 1,
             anchor: SegmentAnchor {
                 segment_id: SegmentId(id),
@@ -1240,16 +1265,18 @@ mod tests {
         assert_eq!(objects[1].digest, segment.seal_digest);
         assert!(objects[0].name.ends_with(".wal"));
         assert!(objects[1].name.ends_with(".seal"));
-        let wal = b"wal-bytes";
-        assert!(verify_source_object(&objects[0], wal).is_err());
+        // Real segment bytes, not a stand-in: the WAL object is digested under its
+        // segment's rule, which is defined over the encoding.
+        let wal = crate::tests::harness::pitr_segment_wal_bytes(header());
+        assert!(verify_source_object(&objects[0], &wal).is_err());
         let mut matching = objects[0].clone();
         matching.bytes = Some(wal.len() as u64);
-        matching.digest = Sha256::digest(wal).into();
-        verify_source_object(&matching, wal).unwrap();
+        matching.digest = crate::tests::harness::pitr_wal_digest(&wal, crate::pitr::WAL_V5_VERSION);
+        verify_source_object(&matching, &wal).unwrap();
         assert!(verify_source_object(&matching, b"tampered").is_err());
         let loaded = load_verified_source_objects(&[matching], |name| {
             ensure!(name.ends_with(".wal"), "unexpected object request");
-            Ok(wal.to_vec())
+            Ok(wal.clone())
         })
         .unwrap();
         assert_eq!(loaded.len(), 1);
@@ -1266,6 +1293,7 @@ mod tests {
             max_value_bytes: 64,
         };
         let header = crate::pitr::encode_v5_file_header(crate::pitr::WalV5Header {
+            wal_format_version: crate::pitr::WAL_V5_VERSION,
             timeline_id: TimelineId([2; 16]),
             archive_epoch_id: ArchiveEpochId([3; 16]),
             segment_id: SegmentId(1),
@@ -1303,6 +1331,7 @@ mod tests {
             max_value_bytes: 64,
         };
         let header = crate::pitr::encode_v5_file_header(crate::pitr::WalV5Header {
+            wal_format_version: crate::pitr::WAL_V5_VERSION,
             timeline_id: TimelineId([2; 16]),
             archive_epoch_id: ArchiveEpochId([3; 16]),
             segment_id: SegmentId(1),
@@ -1358,6 +1387,7 @@ mod tests {
             max_value_bytes: 64,
         };
         let mut wal = crate::pitr::encode_v5_file_header(crate::pitr::WalV5Header {
+            wal_format_version: crate::pitr::WAL_V5_VERSION,
             timeline_id: TimelineId([2; 16]),
             archive_epoch_id: ArchiveEpochId([3; 16]),
             segment_id: SegmentId(1),
@@ -1611,6 +1641,7 @@ mod tests {
             max_value_bytes: 64,
         };
         let header = crate::pitr::encode_v5_file_header(crate::pitr::WalV5Header {
+            wal_format_version: crate::pitr::WAL_V5_VERSION,
             timeline_id: TimelineId([2; 16]),
             archive_epoch_id: ArchiveEpochId([3; 16]),
             segment_id: SegmentId(1),
@@ -1664,6 +1695,7 @@ mod tests {
         };
         let mut metadata = segment(1, 20, 22, predecessor);
         let mut wal = crate::pitr::encode_v5_file_header(crate::pitr::WalV5Header {
+            wal_format_version: crate::pitr::WAL_V5_VERSION,
             timeline_id: TimelineId([2; 16]),
             archive_epoch_id: ArchiveEpochId([3; 16]),
             segment_id: SegmentId(1),
@@ -1685,7 +1717,8 @@ mod tests {
             )
             .unwrap(),
         );
-        metadata.wal_digest = Sha256::digest(&wal).into();
+        metadata.wal_digest =
+            crate::tests::harness::pitr_wal_digest(&wal, crate::pitr::WAL_V5_VERSION);
         metadata.anchor.wal_digest = metadata.wal_digest;
         let seal = b"seal".to_vec();
         metadata.seal_digest = Sha256::digest(&seal).into();

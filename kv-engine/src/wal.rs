@@ -238,6 +238,10 @@ struct PitrSealAccumulator {
     hasher: Sha256,
     logical_length: u64,
     entries: Vec<crate::pitr_seal::SealEntry>,
+    /// What this segment's digest covers. Fixed when the accumulator is created
+    /// from the segment's own version, so a segment resumed after an upgrade keeps
+    /// the rule it was written with.
+    rule: crate::pitr::WalDigestRule,
 }
 
 impl PitrSealAccumulator {
@@ -245,6 +249,7 @@ impl PitrSealAccumulator {
         header: crate::pitr::WalV5Header,
         prefix: &[u8],
         entries: Vec<crate::pitr_seal::SealEntry>,
+        rule: crate::pitr::WalDigestRule,
     ) -> Self {
         let mut hasher = Sha256::new();
         hasher.update(prefix);
@@ -253,13 +258,47 @@ impl PitrSealAccumulator {
             hasher,
             logical_length: prefix.len() as u64,
             entries,
+            rule,
         }
     }
 
-    fn append(&mut self, buf: &DirectBuf, entry: crate::pitr_seal::SealEntry) {
-        self.hasher.update(buf.initialized_slice(0, buf.len()));
+    /// Seed from a segment that already has batches on disk. The hasher must be fed
+    /// exactly the bytes the rule covers, which for the logical rule is not one
+    /// contiguous slice, so the walk is shared with `build_v5_seal`.
+    fn from_wal(header: crate::pitr::WalV5Header, wal: &[u8]) -> Result<Self> {
+        let rule = crate::pitr::wal_digest_rule(header.wal_format_version)?;
+        let mut hasher = Sha256::new();
+        let (logical_length, entries) = crate::pitr_seal::walk_v5_segment(&mut hasher, wal, rule)?;
+        Ok(Self {
+            header,
+            hasher,
+            logical_length,
+            entries,
+            rule,
+        })
+    }
+
+    /// Extend the digest with one batch, returning how many bytes it covered.
+    fn append(&mut self, buf: &DirectBuf, entry: crate::pitr_seal::SealEntry) -> usize {
+        let bytes = buf.initialized_slice(0, buf.len());
+        // The buffer is one encoded batch, so it carries its own logical length in
+        // its header; reading it back from the bytes keeps the coverage decision
+        // the same expression the file walk uses.
+        let logical_len = crate::pitr::encoded_v5_batch_logical_len(bytes)
+            .expect("v5 batch buffer carries its own header");
+        let hashed = self.rule.batch_slice(bytes, logical_len);
+        self.hasher.update(hashed);
+        // The *aligned* length: `logical_length` is what the segment is truncated to
+        // and what its lengths are reported as, so it must stay a multiple of the
+        // alignment even though the digest skips the padding.
         self.logical_length += buf.len() as u64;
+        debug_assert!(
+            self.logical_length
+                .is_multiple_of(crate::pitr::WAL_V5_ALIGNMENT as u64),
+            "v5 seal accumulator lost the alignment of the segment's logical length"
+        );
         self.entries.push(entry);
+        hashed.len()
     }
 
     fn seal(&self) -> Result<(crate::pitr_seal::V5Seal, Vec<u8>)> {
@@ -562,15 +601,10 @@ impl Wal {
             }
 
             let (ring, direct_file, alloc_offset) = Self::try_init_io_uring(path)?;
-            let pitr_seal = if format_version == crate::pitr::WAL_V5_VERSION {
+            let pitr_seal = if crate::pitr::is_v5_family(format_version) {
                 let wal = std::fs::read(path)?;
-                let (seal, _) = crate::pitr_seal::build_v5_seal(&wal)?;
-                let logical_length = seal.logical_length as usize;
-                Some(Mutex::new(PitrSealAccumulator::from_prefix(
-                    seal.header,
-                    &wal[..logical_length],
-                    seal.entries,
-                )))
+                let header = crate::pitr::decode_v5_file_header(&wal)?;
+                Some(Mutex::new(PitrSealAccumulator::from_wal(header, &wal)?))
             } else {
                 None
             };
@@ -953,7 +987,7 @@ impl Wal {
         Ok(Self {
             buffered_file: Arc::new(Mutex::new(BufWriter::new(buf_file))),
             mvcc_format: true,
-            format_version: crate::pitr::WAL_V5_VERSION,
+            format_version: header.wal_format_version,
             is_v3: true,
             direct_file: Some(direct_file),
             ring: Some(Mutex::new(ring)),
@@ -975,6 +1009,7 @@ impl Wal {
                 header,
                 &header_bytes,
                 Vec::new(),
+                crate::pitr::wal_digest_rule(header.wal_format_version)?,
             ))),
         })
     }
@@ -985,7 +1020,7 @@ impl Wal {
     }
 
     pub(crate) fn is_v5(&self) -> bool {
-        self.format_version == crate::pitr::WAL_V5_VERSION
+        crate::pitr::is_v5_family(self.format_version)
     }
 }
 
@@ -1086,7 +1121,7 @@ impl Wal {
         profile: Option<&crate::mem_table::WriteProfile>,
     ) -> Result<u64> {
         anyhow::ensure!(
-            self.format_version == crate::pitr::WAL_V5_VERSION,
+            crate::pitr::is_v5_family(self.format_version),
             "v5 WAL append selected for format {}",
             self.format_version
         );
@@ -1185,7 +1220,7 @@ impl Wal {
         file_len: u64,
         handler: &mut H,
     ) -> Result<(File, u64)> {
-        if wal_version == crate::pitr::WAL_V5_VERSION {
+        if crate::pitr::is_v5_family(wal_version) {
             return Self::recover_v5(f, data, file_len, handler);
         }
         let data_len = data.len();
@@ -1676,13 +1711,15 @@ impl Wal {
                             | WAL_FORMAT_VERSION_V3
                             | WAL_FORMAT_VERSION_V4
                             | crate::pitr::WAL_V5_VERSION
+                            | crate::pitr::WAL_V5_VERSION_LEGACY
                     ),
-                    "unsupported WAL version: got {}, expected {}, {}, {}, or {}",
+                    "unsupported WAL version: got {}, expected {}, {}, {}, {}, or {}",
                     version,
                     WAL_FORMAT_VERSION_V2,
                     WAL_FORMAT_VERSION_V3,
                     WAL_FORMAT_VERSION_V4,
-                    crate::pitr::WAL_V5_VERSION
+                    crate::pitr::WAL_V5_VERSION,
+                    crate::pitr::WAL_V5_VERSION_LEGACY
                 );
                 // The version field alone selects the parser, and the parsers
                 // disagree about where the header ends: a v5 segment read as v4
@@ -1700,7 +1737,7 @@ impl Wal {
                 // a real v2/v3 WAL without trusting the version field, and the two
                 // share their magic, so the version field is not enough to decide.
                 if data.len() >= crate::pitr::WAL_V5_HEADER_LEN {
-                    if version == crate::pitr::WAL_V5_VERSION {
+                    if crate::pitr::is_v5_family(version) {
                         crate::pitr::decode_v5_file_header(&data[..crate::pitr::WAL_V5_HEADER_LEN])
                             .context("WAL claims the v5 format but its header does not validate")?;
                     } else if version == WAL_FORMAT_VERSION_V4
@@ -1718,7 +1755,10 @@ impl Wal {
                     true,
                     matches!(
                         version,
-                        WAL_FORMAT_VERSION_V3 | WAL_FORMAT_VERSION_V4 | crate::pitr::WAL_V5_VERSION
+                        WAL_FORMAT_VERSION_V3
+                            | WAL_FORMAT_VERSION_V4
+                            | crate::pitr::WAL_V5_VERSION
+                            | crate::pitr::WAL_V5_VERSION_LEGACY
                     ),
                     version,
                 )
@@ -1754,7 +1794,7 @@ impl Wal {
             // aligned offset (otherwise pwrite at unaligned EOF fails EINVAL).
             if data.len() < scan_start {
                 anyhow::ensure!(
-                    wal_version != crate::pitr::WAL_V5_VERSION,
+                    !crate::pitr::is_v5_family(wal_version),
                     "truncated v5 WAL header"
                 );
                 data.advance(data.len());
@@ -1762,7 +1802,7 @@ impl Wal {
                 f.sync_all()?;
                 (f, 0u64)
             } else {
-                if wal_version == crate::pitr::WAL_V5_VERSION {
+                if crate::pitr::is_v5_family(wal_version) {
                     crate::pitr::decode_v5_file_header(&data[..crate::pitr::WAL_V5_HEADER_LEN])?;
                 }
                 data.advance(scan_start);
@@ -1815,7 +1855,7 @@ impl Wal {
             };
             if data.len() < scan_start {
                 anyhow::ensure!(
-                    wal_version != crate::pitr::WAL_V5_VERSION,
+                    !crate::pitr::is_v5_family(wal_version),
                     "truncated v5 WAL header"
                 );
                 data.advance(data.len());
@@ -1823,7 +1863,7 @@ impl Wal {
                 f.sync_all()?;
                 (f, 0u64)
             } else {
-                if wal_version == crate::pitr::WAL_V5_VERSION {
+                if crate::pitr::is_v5_family(wal_version) {
                     crate::pitr::decode_v5_file_header(&data[..crate::pitr::WAL_V5_HEADER_LEN])?;
                 }
                 data.advance(scan_start);
@@ -2278,6 +2318,10 @@ impl Wal {
                     // the larger one.
                     #[cfg(feature = "bench")]
                     let seal_start = Instant::now();
+                    // What the digest rule actually covers, which is what the seal's
+                    // cost is proportional to - not the group's aligned byte count.
+                    #[cfg(feature = "bench")]
+                    let mut seal_hashed_bytes = 0_u64;
                     // Every buffer on a v5 WAL carries a seal entry: only
                     // `put_v5_batch` produces them and the v4 append paths refuse a
                     // v5 format, so this is a shape check, not a filter that can
@@ -2285,12 +2329,19 @@ impl Wal {
                     for ticketed_buf in bufs.iter() {
                         debug_assert!(ticketed_buf.pitr_entry.is_some());
                         if let Some(entry) = ticketed_buf.pitr_entry {
-                            accumulator.append(&ticketed_buf.buf, entry);
+                            let hashed = accumulator.append(&ticketed_buf.buf, entry);
+                            #[cfg(feature = "bench")]
+                            {
+                                seal_hashed_bytes += hashed as u64;
+                            }
+                            #[cfg(not(feature = "bench"))]
+                            let _ = hashed;
                         }
                     }
                     #[cfg(feature = "bench")]
                     if let Some(profile) = profile {
                         profile.record_pitr_seal_append_ns(seal_start.elapsed().as_nanos() as u64);
+                        profile.record_pitr_seal_bytes(seal_hashed_bytes);
                     }
                 }
                 for ticketed_buf in bufs {

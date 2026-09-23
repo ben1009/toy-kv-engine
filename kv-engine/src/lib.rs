@@ -66,7 +66,7 @@ pub fn init_logging() {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 #[cfg(test)]
 mod logforth_tests {

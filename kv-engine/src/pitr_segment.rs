@@ -780,6 +780,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("segment-1.wal");
         let header = crate::pitr::WalV5Header {
+            wal_format_version: crate::pitr::WAL_V5_VERSION,
             timeline_id: crate::pitr::TimelineId([1; 16]),
             archive_epoch_id: crate::pitr::ArchiveEpochId([2; 16]),
             segment_id: crate::pitr::SegmentId(1),
@@ -804,6 +805,7 @@ mod tests {
     fn wal_header_install_rejects_existing_payload_or_partial_header() {
         let dir = tempfile::tempdir().unwrap();
         let header = crate::pitr::WalV5Header {
+            wal_format_version: crate::pitr::WAL_V5_VERSION,
             timeline_id: crate::pitr::TimelineId([1; 16]),
             archive_epoch_id: crate::pitr::ArchiveEpochId([2; 16]),
             segment_id: crate::pitr::SegmentId(1),

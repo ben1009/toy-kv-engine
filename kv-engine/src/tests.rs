@@ -7,7 +7,7 @@ mod compaction;
 mod compaction_gc;
 mod compaction_integration;
 mod compaction_integration_2;
-mod harness;
+pub(crate) mod harness;
 mod iterators;
 mod leveled_compaction;
 mod lsm_storage_extra;
