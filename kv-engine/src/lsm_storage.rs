@@ -12815,6 +12815,71 @@ mod tests {
         engine.close().unwrap();
     }
 
+    /// A freeze rotates a PITR segment, and nothing can seal the one it rotated away
+    /// from - so the next boundary refuses. Issue #342.
+    ///
+    /// This test records today's behaviour rather than asserting a desired one. The
+    /// freeze itself is a designed path (`pitr_database_with_two_segments` and the
+    /// restart family depend on it), which is why a fix is a question about the PITR
+    /// state machine rather than about refusing the freeze: the segment that was
+    /// rotated away from is no longer the active one, and the only writer of a
+    /// `.seal` is `write_pitr_seal_for_active_wal`, so its commits cannot enter the
+    /// archive chain, while `active_segment_id` still names it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pitr_freeze_leaves_a_boundary_with_nothing_it_may_seal() {
+        let dir = tempdir().unwrap();
+        let parent = crate::backup::open_directory_no_follow(dir.path()).unwrap();
+        crate::backup::bootstrap_repository(&parent, "repository").unwrap();
+        let engine = KvEngine::open(
+            dir.path().join("db"),
+            LsmStorageOptions {
+                enable_wal: true,
+                ..LsmStorageOptions::default_for_test()
+            },
+        )
+        .unwrap();
+        enable_pitr_for_test(
+            &engine,
+            &dir.path().join("repository"),
+            PITR_TEST_ARCHIVE_INTERVAL,
+        );
+        engine
+            .put(b"before".as_ref(), b"the freeze".as_ref())
+            .unwrap();
+        // The freeze rotates to a new segment, and the state is not told.
+        engine
+            .inner
+            .force_freeze_memtable(&engine.inner.state_lock.lock())
+            .unwrap();
+        let active_wal = engine
+            .inner
+            .state
+            .load()
+            .memtable
+            .wal_path()
+            .expect("the active memtable is a PITR segment WAL")
+            .to_path_buf();
+        // The file is named for its memtable; the segment is in its header.
+        let active_segment =
+            crate::pitr::decode_v5_file_header(&std::fs::read(&active_wal).unwrap())
+                .unwrap()
+                .segment_id
+                .0;
+        assert_ne!(
+            Some(active_segment),
+            engine.inner.pitr_state.lock().active_segment_id,
+            "the freeze advanced the active segment without recording it"
+        );
+
+        let error = engine.create_recovery_point().unwrap_err();
+        assert!(
+            error.to_string().contains("identity does not match"),
+            "unexpected error: {error}"
+        );
+        drop(engine);
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn public_enable_pitr_installs_v5_successor_and_resumes_writes() {
