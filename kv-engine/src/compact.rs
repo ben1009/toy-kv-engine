@@ -2730,7 +2730,7 @@ impl LsmStorageInner {
             {
                 vlog.retire_sst_references(*id);
             }
-            let _ = vlog.reclaim_pending_deletions();
+            let _ = vlog.reclaim_pending_deletions(|| self.memtable_vlog_file_ids());
         }
         self.maybe_snapshot_manifest(&_state_lock)?;
 
@@ -2906,7 +2906,7 @@ impl LsmStorageInner {
                     .map(ManifestRecord::VlogRetire)
                     .collect::<Vec<_>>();
                 manifest.add_records(&_state_lock, &records)?;
-                let _ = vlog.reclaim_pending_deletions();
+                let _ = vlog.reclaim_pending_deletions(|| self.memtable_vlog_file_ids());
             }
         }
         // Delete SST files from disk.
@@ -3108,7 +3108,7 @@ impl LsmStorageInner {
                     for id in rm_sst_ids.iter().chain(input_range_only_ids.iter()) {
                         vlog.retire_sst_references(*id);
                     }
-                    let _ = vlog.reclaim_pending_deletions();
+                    let _ = vlog.reclaim_pending_deletions(|| self.memtable_vlog_file_ids());
                 } else {
                     for id in rm_sst_ids.iter().chain(input_range_only_ids.iter()) {
                         for file_id in vlog.unregister_sst_references(*id) {

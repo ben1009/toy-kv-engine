@@ -788,7 +788,11 @@ fn checkpoint_pins_vlogs_until_copy_finishes_during_reclaim() {
     for file_id in &pinned_vlogs {
         vlog.schedule_deletion(*file_id);
     }
-    assert_eq!(vlog.reclaim_pending_deletions().unwrap(), 0);
+    assert_eq!(
+        vlog.reclaim_pending_deletions(|| engine.inner.memtable_vlog_file_ids())
+            .unwrap(),
+        0
+    );
     for file_id in &pinned_vlogs {
         assert!(
             vlog.path_of_file(*file_id).exists(),

@@ -39,7 +39,9 @@ fn test_gc_100_percent_dead() {
     // The old vLog file should be scheduled for deletion.
     // Since all entries are dead, the file should be reclaimable.
     let vlog = storage.inner.vlog.as_ref().unwrap();
-    let reclaimed = vlog.reclaim_pending_deletions().unwrap();
+    let reclaimed = vlog
+        .reclaim_pending_deletions(|| storage.inner.memtable_vlog_file_ids())
+        .unwrap();
     // May or may not have been reclaimed already by post_compaction_gc
     let _ = reclaimed;
 }
@@ -442,7 +444,9 @@ fn test_mvcc_gc_unreferences_old_vlog_file_for_reclaim() {
                 .is_some_and(|ssts| ssts.is_empty()),
         "MVCC GC should remove the old SST reference and make the file reclaimable"
     );
-    let reclaimed = vlog.reclaim_pending_deletions().unwrap();
+    let reclaimed = vlog
+        .reclaim_pending_deletions(|| storage.inner.memtable_vlog_file_ids())
+        .unwrap();
     let _ = reclaimed;
 }
 
@@ -605,4 +609,67 @@ fn test_get_with_kind_at_ts_finds_version_in_adjacent_sst() {
         Some(Bytes::from(vec![b'C'; 64])),
         "latest read should see version C"
     );
+}
+
+#[test]
+fn test_vlog_gc_rewritten_file_survives_compaction_of_referencing_sst() {
+    use crate::vlog::gc::GarbageCollector;
+
+    // A GC rewrite binds its new file into the LSM by CAS-ing the pointer into
+    // the active memtable, and registers the new file only against the SSTs
+    // that still referenced the source file. So once those SSTs are retired by
+    // a later compaction, nothing in the SST reference map mentions the
+    // rewritten file even though the memtable resolves into it. Deleting it
+    // there breaks every read of the version the rewrite produced.
+    let dir = tempfile::tempdir().unwrap();
+    let options = options_with_vlog_and_compaction(256, 1 << 20);
+    let storage = KvEngine::open(dir.path(), options).unwrap();
+
+    storage.put(b"foo", &[b'A'; 64]).unwrap();
+    force_flush(&storage.inner);
+
+    // Pin the watermark at ts=1 so the ts=1 version survives compaction.
+    let reader = storage.inner.new_txn().unwrap();
+
+    storage.put(b"foo", &[b'B'; 64]).unwrap();
+    force_flush(&storage.inner);
+    storage.inner.force_full_compaction().unwrap();
+
+    let vlog = storage.inner.vlog.as_ref().unwrap();
+    let gc = GarbageCollector::new(vlog, &storage.inner, 0.0);
+    let results = gc.gc_all().unwrap();
+    let rewritten = results
+        .iter()
+        .find(|result| result.new_file_id != u32::MAX)
+        .expect("GC should have rewritten a file with live entries");
+
+    // Premise: the rewrite is registered against the SSTs holding the old
+    // pointers, not against the memtable that now resolves into it.
+    assert!(
+        vlog.get_ssts_referencing(rewritten.new_file_id).is_some(),
+        "rewrite should be registered against the SSTs holding the old pointers"
+    );
+
+    // Compacting those SSTs retires them and drops every SST-level reference to
+    // the rewritten file, while the memtable keeps resolving into it.
+    storage.inner.force_full_compaction().unwrap();
+    assert!(
+        vlog.get_ssts_referencing(rewritten.new_file_id).is_none(),
+        "premise: no SST references the rewritten file after that compaction"
+    );
+    assert!(
+        storage
+            .inner
+            .memtable_vlog_file_ids()
+            .contains(&rewritten.new_file_id),
+        "premise: the memtable still resolves into the rewritten file"
+    );
+
+    let val = reader.get(b"foo").unwrap_or_else(|error| {
+        panic!(
+            "reader at ts=1 could not resolve the rewritten vLog file after a compaction \
+             retired the SSTs that referenced it: {error:#}"
+        )
+    });
+    assert_eq!(val, Some(Bytes::from(vec![b'A'; 64])));
 }
