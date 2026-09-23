@@ -2497,8 +2497,17 @@ impl Wal {
             // the gap between submit and poll.
             let mut write_err: Option<i32> = None;
             let chunk_start_idx = global_idx;
+            // Timed outside the lock it waits on: this is queueing, not work.
+            #[cfg(feature = "bench")]
+            let lock_start = Instant::now();
             {
                 let mut ring = ring_ref.lock();
+                #[cfg(feature = "bench")]
+                if let Some(profile) = profile {
+                    profile.record_wal_ring_lock_ns(lock_start.elapsed().as_nanos() as u64);
+                }
+                #[cfg(feature = "bench")]
+                let fill_start = Instant::now();
                 for i in 0..chunk_len {
                     let buf = &bufs[chunk_start + i];
                     let aligned_len = DirectBuf::align_up(buf.buf.len());
@@ -2517,10 +2526,17 @@ impl Wal {
                     offset += aligned_len as u64;
                 }
 
+                #[cfg(feature = "bench")]
+                if let Some(profile) = profile {
+                    profile.record_wal_sqe_fill_ns(fill_start.elapsed().as_nanos() as u64);
+                }
+
                 // Submit all write SQEs in one syscall and wait for completions.
                 // Retry on EINTR to prevent spurious failures from signals
                 // (profilers, thread suspension, etc.), matching fdatasync below.
 
+                #[cfg(feature = "bench")]
+                let enter_start = Instant::now();
                 #[cfg(feature = "chaos-testing")]
                 {
                     crate::chaos::failpoint::fail_point!("wal.after_submit_before_wait");
@@ -2537,6 +2553,15 @@ impl Wal {
                         }
                     }
                 }
+
+                #[cfg(feature = "bench")]
+                if let Some(profile) = profile {
+                    profile.record_wal_uring_enter_ns(enter_start.elapsed().as_nanos() as u64);
+                }
+                #[cfg(feature = "bench")]
+                let reap_start = Instant::now();
+                #[cfg(feature = "bench")]
+                let mut reaped: u64 = 0;
 
                 // Poll CQEs — lock is still held, so close() cannot interfere.
                 let mut cq = ring.completion();
@@ -2566,6 +2591,15 @@ impl Wal {
                             anyhow::bail!("io_uring: stale CQE with user_data={}", user_data);
                         }
                     }
+                    #[cfg(feature = "bench")]
+                    {
+                        reaped += 1;
+                    }
+                }
+                #[cfg(feature = "bench")]
+                if let Some(profile) = profile {
+                    profile.record_wal_cqe_reap_ns(reap_start.elapsed().as_nanos() as u64);
+                    profile.record_wal_cqe_count(reaped);
                 }
                 // ring and cq drop here
             }
