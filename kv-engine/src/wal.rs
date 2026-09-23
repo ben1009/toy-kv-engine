@@ -2273,7 +2273,12 @@ impl Wal {
                     let seal_start = Instant::now();
                     if let Some(accumulator) = &self.pitr_seal {
                         let mut accumulator = accumulator.lock();
+                        // Every buffer on a v5 WAL carries a seal entry: only
+                        // `put_v5_batch` produces them and the v4 append paths
+                        // refuse a v5 format, so this is a shape check, not a
+                        // filter that can drop a batch.
                         for ticketed_buf in bufs.iter() {
+                            debug_assert!(ticketed_buf.pitr_entry.is_some());
                             if let Some(entry) = ticketed_buf.pitr_entry {
                                 accumulator.append(&ticketed_buf.buf, entry);
                             }
@@ -2558,10 +2563,11 @@ impl Wal {
             }
         }
 
-        // The seal accumulator was extended when each batch was appended, by
-        // the thread that appended it (see `put_v5_batch`), so nothing here has
-        // to hold up the leader's serialized section to keep the digest in file
-        // order.
+        // The seal is deliberately not extended here. The commit leader takes
+        // `pitr_seal_append` inside the exclusive `submitting` window and
+        // extends the digest only after it publishes the group (see
+        // `submit_as_leader`), so the digest stays in file order without any
+        // hashing on this path.
 
         // Hand the buffers back rather than pooling them: the caller extends
         // the seal from them after it releases `submitting`. into_inner is safe

@@ -557,7 +557,7 @@ impl WriteProfileSnapshot {
              wal_submit:   {:>8.2} ms\n  \
              fdatasync:    {:>8.2} ms\n  \
              follower_wait:{:>8.2} ms\n  \
-             pitr_seal:    {:>8.2} ms  (v5 only: hashes each batch into the segment digest)\n  \
+             pitr_seal:    {:>8.2} ms  (v5 only: leader hashes its group after fdatasync; subset of wal_sync)\n  \
              follower_events: calls={:>7}  parks={:>7}  retries={:>7}\n  \
              memtable:     {:>8.2} ms  ({:>5.1}%)\n  \
              publish_parts: ttl={:>7.2} ms  decode={:>7.2} ms  bloom={:>7.2} ms  map={:>7.2} ms\n  \

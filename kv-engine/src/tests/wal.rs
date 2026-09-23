@@ -2267,7 +2267,7 @@ fn test_wal_v5_seal_matches_the_segment_when_writers_race_the_leader() {
                             value: vec![commit_ts as u8; 16],
                         }],
                     };
-                    wal.put_v5_batch(&batch, crate::pitr::LIVE_WAL_V5_LIMITS)
+                    wal.put_v5_batch(&batch, crate::pitr::LIVE_WAL_V5_LIMITS, None)
                         .unwrap()
                 };
                 wal.submit_and_commit(ticket).unwrap();
