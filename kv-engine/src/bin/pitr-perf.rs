@@ -171,12 +171,26 @@ fn run_case_in_root(
     // inflating `writes_per_second`.
     let started = Instant::now();
     barrier.wait();
+    // Join every writer before deciding what to return. Leaving the loop on the
+    // first failure would unwind to `run_case`, which removes the scratch tree
+    // while the remaining writers are still running against it.
+    let mut writer_error: Option<anyhow::Error> = None;
     for thread in threads {
-        thread
+        let joined = thread
             .join()
-            .map_err(|_| anyhow::anyhow!("writer panicked"))??;
+            .map_err(|_| anyhow::anyhow!("writer panicked"))
+            .and_then(|result| result);
+        if let Err(error) = joined {
+            writer_error.get_or_insert(error);
+        }
     }
     let write_elapsed = started.elapsed();
+    // A failed writer makes this case's numbers meaningless, so the engine is
+    // closed and the error reported instead of timing a recovery point on it.
+    if let Some(error) = writer_error {
+        let _ = engine.close();
+        return Err(error);
+    }
     let catchup_started = Instant::now();
     if pitr {
         ensure!(

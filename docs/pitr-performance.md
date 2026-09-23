@@ -254,23 +254,33 @@ repetitions favouring the enabled path. Absolute throughput is not stable across
 - the disabled path alone ranged 100k-281k writes/s at this setting - so the ratios
 are what to read, and the medians in the table above are its own session's.
 
-**The cost is the 4 KiB the enabled path writes per operation, and nothing
-measurable on top of it.** The v5 WAL pads every batch to the 4 KiB `O_DIRECT`
-alignment, so a 128-byte value leaves a 4096-byte batch behind it, where the v4 path
-writes the record and its key - about 180 bytes at this shape. Giving the *disabled*
-path the same payload, a 4096-byte value, removes the gap entirely, paired inside the
-same repetitions at 20 writers:
+**The enabled path's cost tracks the payload it moves per operation, not the
+machinery it runs - but this control does not isolate the WAL batch.** The v5 WAL
+pads every batch to the 4 KiB `O_DIRECT` alignment, so a 128-byte value leaves a
+4096-byte batch behind it, where the v4 path writes the record and its key - about
+180 bytes at this shape. Raising the *disabled* path's value to 4096 bytes, so both
+paths carry 4 KiB per operation, removes the gap, paired inside the same repetitions
+at 20 writers:
 
 | 20 writers, paired, 8 repetitions | writes/s (median) | paired ratio | enabled faster |
 | --- | ---: | ---: | --- |
 | enabled, 128-byte values - 4 KiB batch | 105,091 | 1.091 | 6/8 |
 | disabled, 4096-byte values - 4 KiB record | 104,778 | | |
 
-At this shape, then, enabling PITR costs what writing 4 KiB per operation costs, and
-the seal, the ordered publication and the v5 admission path add nothing measurable
-beyond it: the disabled path has none of those and reads the same when its payload
-matches. Where the payload is not what dominates - a disk, where an fsync sits in
-every commit - enabling PITR is free, as the disk column shows.
+What that shows is that the enabled path is not paying for anything the disabled path
+lacks. The disabled path has none of the seal, the ordered publication or the v5
+admission path, and it reads the same once its payload matches, so at this shape none
+of them is what separates the two.
+
+What it does not show is that the padded batch *is* the cost. `--value-size` changes
+the value handed to `engine.put`, so the disabled path's 4 KiB also passes through the
+memtable insert, the key encoding and the bloom filter; parity is equally consistent
+with both paths becoming bound by that larger payload somewhere outside the WAL.
+Isolating the batch would need the enabled path to vary its own padding at a fixed
+value size, which the harness cannot do. Either way the operational reading is the
+same - on this shape the enabled path costs no more than carrying 4 KiB per operation
+- and where the payload is not what dominates, a disk with an fsync in every commit,
+enabling PITR is free, as the disk column shows.
 
 Two further observations from the same session, both saying that this ratio is a
 property of the host as much as of the engine:
@@ -582,13 +592,14 @@ the entry push and the per-buffer call - a floor that the 4096-byte case's hash 
 hide.
 
 That residual is the phase, and the enabled/disabled gap at high writer counts is a
-different quantity that is not hashing either. Paired at 20 writers, giving the
-*disabled* path the enabled path's 4 KiB per-operation payload removes the whole gap
-(paired 1.091, the enabled path faster in 6 of 8 repetitions), so what separates the
-two paths from 16 writers up is the padded batch the v5 WAL writes - not the digest,
-the seal, or the ordering, none of which the disabled path has. "PITR enabled versus
-disabled at the head" carries that measurement, the affinity caveat that comes with
-it, and the withdrawal of this section's own 55.4%.
+different quantity that is not hashing either. Paired at 20 writers, raising the
+*disabled* path's value to 4096 bytes - the same payload per operation - removes the
+whole gap (paired 1.091, the enabled path faster in 6 of 8 repetitions). That rules
+the enabled path's own machinery out as the separator, but it does not isolate the
+padded batch, because the control changes what the disabled path's `put` carries too.
+"PITR enabled versus disabled at the head" carries that measurement, what it does and
+does not establish, the affinity caveat that comes with it, and the withdrawal of this
+section's own 55.4%.
 
 **What the rule does not attest any more.** A v6 digest skips the alignment gaps, so a
 byte flipped inside one is no longer a digest mismatch. It is still refused, and at
