@@ -146,8 +146,18 @@ impl DirectBuf {
 
     /// The whole allocation as a slice, for encoders that write their own
     /// layout into it.
+    ///
+    /// The slice is not entirely initialised: `posix_memalign` returns raw
+    /// memory and a recycled buffer only has [`initialized_slice`] written, so
+    /// bytes outside the region the caller writes and then [`set_len`]s are
+    /// uninitialised. The caller must therefore write every byte it later
+    /// exposes - reading the tail would be undefined behaviour, which is why
+    /// this is `pub(crate)` and its one caller is the batch encoder.
     pub(crate) fn as_mut_slice(&mut self) -> &mut [u8] {
         // SAFETY: the allocation is `cap` bytes and is owned by this struct.
+        // Forming the reference is sound for `u8` - every bit pattern is a valid
+        // `u8` - and the documented contract moves the initialisation duty to
+        // the caller.
         unsafe { std::slice::from_raw_parts_mut(self.ptr, self.cap) }
     }
 

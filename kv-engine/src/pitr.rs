@@ -520,12 +520,14 @@ fn write_entry_into(
 /// it builds the batch in a `Vec` and does not canonicalise, so it is the only
 /// way to encode an uncanonicalised batch.
 ///
-/// Production has exactly one encoder now - [`encode_v5_batch_into`], reached
-/// through [`encode_v5_batch`] - and this one is kept only because a decoder test
-/// needs a builder that preserves duplicate keys (`pitr::tests`). It is a test
-/// fixture: it is not on the write path, and the file-level `allow(dead_code)`
-/// above is what keeps it compiling. The pinned digests in that module were
-/// produced by this implementation, which is why they can be checked against it.
+/// Production has exactly one encoder - [`encode_v5_batch_into`], called directly
+/// from the WAL's `put_v5_batch` - and neither this function nor the
+/// [`encode_v5_batch`] wrapper above it is on the write path any more: every
+/// caller of the wrapper is a test. Both are kept as fixtures for `pitr::tests`,
+/// this one because a decoder test needs a builder that preserves duplicate keys,
+/// and the file-level `allow(dead_code)` above is what keeps them compiling. The
+/// pinned digests in that module were produced by this implementation, which is
+/// why they can be checked against it.
 fn encode_v5_batch_inner(batch: &WalBatch, limits: WalV5Limits) -> Result<Vec<u8>> {
     validate_batch_limits(batch, limits)?;
     ensure!(batch.commit_ts != 0, "v5 commit timestamp must be nonzero");
@@ -1307,11 +1309,12 @@ mod tests {
     }
 
     /// The encoder's output is a wire format, so its bytes are pinned rather than
-    /// only round-tripped. Each digest below is of the bytes the implementation
-    /// produced *before* it was changed to write straight into the ring buffer -
-    /// taken from the same cases by the previous implementation - so this fails if
-    /// the change altered a byte, including bytes the decoder happens to tolerate,
-    /// like the batch header's reserved tail or an entry's reserved byte.
+    /// only round-tripped - a stricter check, because a round-trip only catches
+    /// what the decoder disagrees with, and a change made consistently on both
+    /// sides would survive it. Each digest below is of the bytes the
+    /// implementation produced *before* it was changed to write straight into the
+    /// ring buffer - taken from the same cases by the previous implementation - so
+    /// this fails if the change altered any byte the encoder emits.
     ///
     /// The destination is poisoned before encoding, which is what gives the claim
     /// above its force. Encoding into a fresh `Vec` - as calling `encode_v5_batch`
