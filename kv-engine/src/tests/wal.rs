@@ -2209,3 +2209,81 @@ fn test_range_batch_advance_ts() {
     let ts_after = mvcc.read_ts();
     assert!(ts_after > ts_before, "ts should advance after range batch");
 }
+
+/// The PITR seal is built incrementally, in file order, by whichever thread is the
+/// commit leader for a group. This pins what that ordering buys: the incrementally
+/// built seal must equal one rebuilt from the segment's own bytes, even when the
+/// batches arrive from threads racing for the leader role.
+#[test]
+fn test_wal_v5_seal_matches_the_segment_when_writers_race_the_leader() {
+    const WRITERS: u64 = 8;
+    const PER_WRITER: u64 = 40;
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("race-v5.wal");
+    let wal = Arc::new(
+        Wal::create_v5(
+            &path,
+            crate::pitr::WalV5Header {
+                timeline_id: crate::pitr::TimelineId([1; 16]),
+                archive_epoch_id: crate::pitr::ArchiveEpochId([2; 16]),
+                segment_id: crate::pitr::SegmentId(3),
+                predecessor: crate::pitr::ChainAnchor::Genesis {
+                    archive_epoch_id: crate::pitr::ArchiveEpochId([2; 16]),
+                },
+            },
+        )
+        .unwrap(),
+    );
+    wal.configure_pitr_limits(8 * 1024 * 1024, 16 * 1024 * 1024)
+        .unwrap();
+
+    // Mirror the engine's discipline: `reserve_commit_ts` and the WAL append both
+    // happen under `write_lock` (mvcc.rs), so commit timestamps reach the file in
+    // increasing order and the seal's monotonicity check can hold at all. What is
+    // NOT serialized there is the commit: several writers are in
+    // `submit_and_commit` at once, racing for the leader role.
+    let next_commit_ts = Arc::new(std::sync::Mutex::new(1u64));
+    let barrier = Arc::new(Barrier::new(WRITERS as usize));
+    let mut workers = Vec::new();
+    for _writer in 0..WRITERS {
+        let wal = Arc::clone(&wal);
+        let barrier = Arc::clone(&barrier);
+        let next_commit_ts = Arc::clone(&next_commit_ts);
+        workers.push(thread::spawn(move || {
+            barrier.wait();
+            for _index in 0..PER_WRITER {
+                let ticket = {
+                    let mut next = next_commit_ts.lock().unwrap();
+                    let commit_ts = *next;
+                    *next += 1;
+                    let batch = crate::pitr::WalBatch {
+                        commit_ts,
+                        recorded_at: crate::pitr::RecordedAt {
+                            secs: 1,
+                            nanos: commit_ts as u32,
+                        },
+                        entries: vec![crate::pitr::WalEntry::Put {
+                            key: format!("key{commit_ts}").into_bytes(),
+                            value: vec![commit_ts as u8; 16],
+                        }],
+                    };
+                    wal.put_v5_batch(&batch, crate::pitr::LIVE_WAL_V5_LIMITS)
+                        .unwrap()
+                };
+                wal.submit_and_commit(ticket).unwrap();
+            }
+        }));
+    }
+    for worker in workers {
+        worker.join().unwrap();
+    }
+
+    // `write_pitr_seal_for_active_wal` syncs before it finalizes; do the same, so
+    // the comparison is between the seal and a segment that is fully on disk.
+    wal.sync().unwrap();
+    let (incremental, _) = wal.finalize_pitr_seal().unwrap();
+    let (rebuilt, _) = crate::pitr_seal::build_v5_seal(&std::fs::read(&path).unwrap()).unwrap();
+
+    assert_eq!(incremental.entries.len(), (WRITERS * PER_WRITER) as usize);
+    assert_eq!(incremental, rebuilt);
+}
