@@ -228,7 +228,6 @@ impl<'a> DirectBufCursor<'a> {
 struct TicketedBuf {
     ticket: u64,
     buf: DirectBuf,
-    pitr_entry: Option<crate::pitr_seal::SealEntry>,
 }
 
 struct PitrSealAccumulator {
@@ -768,11 +767,7 @@ impl Wal {
         let enqueue_start = Instant::now();
         let mut pending = self.pending.lock();
         let ticket = self.next_ticket.fetch_add(1, Ordering::Release);
-        pending.push(TicketedBuf {
-            ticket,
-            buf,
-            pitr_entry: None,
-        });
+        pending.push(TicketedBuf { ticket, buf });
         drop(pending);
         #[cfg(feature = "bench")]
         if let Some(profile) = profile {
@@ -857,11 +852,7 @@ impl Wal {
 
         let mut pending = self.pending.lock();
         let ticket = self.next_ticket.fetch_add(1, Ordering::Release);
-        pending.push(TicketedBuf {
-            ticket,
-            buf,
-            pitr_entry: None,
-        });
+        pending.push(TicketedBuf { ticket, buf });
         drop(pending);
 
         #[cfg(feature = "chaos-testing")]
@@ -1139,20 +1130,33 @@ impl Wal {
         }
         #[cfg(feature = "bench")]
         let enqueue_start = Instant::now();
+        // Feed the seal accumulator here instead of after the submit. This
+        // section already orders batches by file offset, so the digest streams
+        // in file order by construction, and the work leaves the commit
+        // leader's serialized section - where it delayed every other writer's
+        // submit by about 5.8 us per group.
+        if let Some(accumulator) = &self.pitr_seal {
+            #[cfg(feature = "bench")]
+            let seal_start = Instant::now();
+            accumulator.lock().append(
+                &buf,
+                crate::pitr_seal::SealEntry {
+                    commit_ts: batch.commit_ts,
+                    recorded_at: batch.recorded_at,
+                },
+            );
+            #[cfg(feature = "bench")]
+            if let Some(profile) = profile {
+                profile.record_pitr_seal_append_ns(seal_start.elapsed().as_nanos() as u64);
+            }
+        }
         let mut pending = self.pending.lock();
         let ticket = self.next_ticket.fetch_add(1, Ordering::Release);
         *reserved = next;
         if next == max_segment_bytes {
             self.pitr_rotation_needed.store(true, Ordering::Release);
         }
-        pending.push(TicketedBuf {
-            ticket,
-            buf,
-            pitr_entry: Some(crate::pitr_seal::SealEntry {
-                commit_ts: batch.commit_ts,
-                recorded_at: batch.recorded_at,
-            }),
-        });
+        pending.push(TicketedBuf { ticket, buf });
         #[cfg(feature = "bench")]
         if let Some(profile) = profile {
             profile.record_wal_enqueue_ns(enqueue_start.elapsed().as_nanos() as u64);
@@ -2501,20 +2505,10 @@ impl Wal {
             }
         }
 
-        if let Some(accumulator) = &self.pitr_seal {
-            #[cfg(feature = "bench")]
-            let seal_start = Instant::now();
-            let mut accumulator = accumulator.lock();
-            for ticketed_buf in bufs.iter() {
-                if let Some(entry) = ticketed_buf.pitr_entry {
-                    accumulator.append(&ticketed_buf.buf, entry);
-                }
-            }
-            #[cfg(feature = "bench")]
-            if let Some(profile) = profile {
-                profile.record_pitr_seal_append_ns(seal_start.elapsed().as_nanos() as u64);
-            }
-        }
+        // The seal accumulator was extended when each batch was appended, by
+        // the thread that appended it (see `put_v5_batch`), so nothing here has
+        // to hold up the leader's serialized section to keep the digest in file
+        // order.
 
         // Return buffers to pool on success. into_inner is safe here because
         // we only reach this path on success (no SQEs in flight).
