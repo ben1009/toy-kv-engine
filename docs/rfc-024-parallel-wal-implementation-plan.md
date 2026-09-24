@@ -139,7 +139,10 @@ verified after the coordinator exists.
   cancel terminal requests, and join it before releasing buffers or the file.
   If kernel ownership cannot be proved released after a failed shutdown,
   retain or deliberately leak the worker-owned state rather than free a
-  possibly referenced `DirectBuf`.
+  possibly referenced `DirectBuf`. Once `close_async` starts the lifecycle
+  transition, its shutdown owner must continue through worker teardown and
+  `finish_close` even if the awaiting future is cancelled. A later close caller
+  must be able to wait for that owner; do not leave the engine in `Closing`.
 - Integrate retryable `WAL full` across point writes, TTL writes, deletes,
   batches, range tombstones, and transaction commits. After releasing
   `active_memtable_lock`, force a v4 memtable/WAL rotation under the existing
@@ -174,11 +177,12 @@ verified after the coordinator exists.
   retain the transaction's engine `AdmissionGuard` until it finishes, even if
   the awaiting future and `Transaction` are dropped; otherwise engine close
   can pass lifecycle quiescence before the commit admits its WAL ticket.
-  Likewise, move each ordinary async write or `sync_async` lifecycle guard
-  into its spawned blocking closure. Once spawned, that guard must outlive
-  future cancellation and remain held through WAL-full rotation/retry and
-  final publication or sync completion; a cancelled future still waiting for
-  an executor slot may simply drop its guard because no task was spawned.
+  Likewise, move the lifecycle guard for ordinary async writes, `sync_async`,
+  `force_flush_async`, and `drain_flush_async` into each spawned blocking
+  closure. Once spawned, that guard must outlive future cancellation and remain
+  held through WAL-full rotation/retry, WAL freeze/flush, and final publication
+  or sync completion; a cancelled future still waiting for an executor slot
+  may simply drop its guard because no task was spawned.
   Apply the same admission cutoff rule to explicit sync and close.
 
 **Exit:** No writer can straddle old and successor WALs. A later poisoned
@@ -219,7 +223,9 @@ opt-in path is usable end to end for v4 WALs.
   cancel its awaiting future and drop the transaction; close must wait for the
   blocking commit outcome, including a WAL-full rotation retry. Repeat the
   cancellation/close race for ordinary async point and batch writes and
-  `sync_async`; close must wait for each spawned closure to finish.
+  `sync_async`, `force_flush_async`, and `drain_flush_async`; close must wait
+  for each spawned closure to finish. Cancel `close_async` after each await in
+  its shutdown sequence, then call close again and verify teardown finishes.
 
 **Exit:** The model tests, nextest suites, process crash tests, and sanitizer
 jobs pass on a host that permits io_uring. `EPERM` in a sandbox is not a
