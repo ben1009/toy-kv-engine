@@ -137,20 +137,33 @@ concurrent groups for PITR. It does not add a buffered fallback for MVCC WALs.
 
 ### Ticketed queue and ordered packer
 
-Writers keep the existing encoding and ticket assignment, but enqueue the
-owned buffer and wait for their ticket; no client becomes a WAL leader or
-polls a ring. A dedicated WAL I/O worker consumes the queue even if every
-client is waiting. The first implementation may keep the current short
-`pending` mutex: SpanDB's lock-free queue is a benchmarked option, not a
-correctness requirement here. Ticket assignment and insertion into the queue
-must remain one ordered operation; a separately reserved ticket that arrives
-late cannot let a higher ticket leapfrog it.
+Writers keep the existing encoding, then enqueue the owned buffer and wait
+for their ticket; no client becomes a WAL leader or polls a ring. A dedicated
+WAL I/O worker consumes the queue even if every client is waiting. The first
+implementation may keep the current short `pending` mutex: SpanDB's
+lock-free queue is a benchmarked option, not a correctness requirement here.
+Ticket assignment and insertion into the queue must remain one ordered
+operation; a separately reserved ticket that arrives late cannot let a
+higher ticket leapfrog it.
+
+Preparation and WAL admission are distinct phases:
+
+1. **Buffer admission, without a ticket:** validate the batch size, reserve
+   resident-buffer budget, obtain a suitable `DirectBuf` from the pool or
+   allocator, and finish encoding outside the admission mutex. Charge the
+   actual capacity before encoding if a recycled buffer is larger than
+   expected. Failed allocation or encoding releases its budget reservation;
+   neither failure leaves a ticket or file-range hole.
+2. **WAL admission, under the mutex:** recheck that this WAL is open and not
+   poisoned and that the ready batch fits at the current `admitted_end`. If
+   not, unlock and release its buffer and budget without consuming a ticket;
+   return the appropriate `WAL full`, closed, or terminal error. Otherwise,
+   assign the next ticket, advance `admitted_end`, and enqueue the buffer
+   before unlocking. Ownership of the buffer and its budget reservation
+   transfers to the queue.
 
 The admission queue state is the linearization point for writes and barriers.
-Under the same mutex, admission checks that the WAL is open and has capacity,
-assigns the next ticket, advances an `admitted_end` counter by the aligned
-batch length, and enqueues the buffer before releasing the mutex. A rejected
-write receives no ticket. `admitted_end` bounds the file size at admission;
+`admitted_end` bounds the file size at WAL admission;
 the packer's `reserved_end` assigns the actual offsets to those tickets later.
 `sync()` takes that mutex to capture the last assigned ticket, then releases
 it before waiting for durability. Close and rotation take the same mutex to
@@ -173,7 +186,7 @@ that. A group descriptor records its ticket interval, file range, outstanding
 buffer references, and state (`assigned`, `writing`, `written`, `durable`, or
 `failed`). A group never contains a ticket gap.
 
-Admission reserves **resident `DirectBuf` capacity**, not just encoded WAL
+Buffer admission reserves **resident `DirectBuf` capacity**, not just encoded WAL
 bytes, against an initial 64 MiB queued-and-in-flight budget, plus a separate
 initial limit of 256 queued batches. Today even a 4 KiB write normally owns
 a 256 KiB pooled buffer, and a pool miss allocates another 256 KiB buffer;
@@ -241,6 +254,17 @@ because a syscall failed. Shutdown must drain or cancel and confirm every
 possibly submitted request before reclaiming its buffer. If completion cannot
 be established, it must retain those buffers rather than free them, fail
 `close()`, and never report the affected tickets durable.
+
+This ownership rule also applies after `close()` returns an error and the
+`Wal` handle is dropped. The dedicated worker owns the ring, file descriptor,
+and all submitted buffers until it has consumed terminal CQEs or torn down
+the ring with a guarantee that the kernel no longer references them. Normal
+shutdown joins that worker before freeing its buffers. An unsuccessful
+shutdown must transfer unresolved buffers to ownership that outlives the
+`Wal` handle, retaining the worker, ring, and descriptor as needed. If kernel
+ownership cannot be proven released, it must deliberately leak that state
+and its buffer allocations rather than run `DirectBuf::drop`, which calls
+`free`. No `Wal` destruction path may free a possibly kernel-owned `DirectBuf`.
 
 ### One ordered durability coordinator
 
@@ -371,11 +395,16 @@ exhaustion, queue-budget pressure before an explicit sync, idle-worker wakeup,
 and `sync()`/admission and close/rotation/admission races. Hold a sync open
 after full write CQEs and verify its buffers can be reused while group
 durability metadata stays resident. Hold preallocation open and verify it
-does not hold the producer queue mutex. A batch that cannot fit even in a
-fresh WAL must fail without assigning a ticket or looping through rotations.
-Assert that at least two groups have writes
-outstanding simultaneously under a controlled completion schedule; otherwise
-the implementation may accidentally preserve the current serial barrier.
+does not hold the producer queue mutex. Fail buffer allocation or encoding,
+and race a prepared buffer against close and rotation: none may consume a
+ticket or leave a file-range hole on rejection. Inject an ambiguous submission,
+make `close()` return an error, then drop the `Wal` handle; an ownership test
+and the address-sanitized suite must show that the buffer is not freed before
+request resolution or proven ring teardown. A batch that cannot fit even in
+a fresh WAL must fail without assigning a ticket or looping through rotations.
+Assert that at least two groups have writes outstanding simultaneously under
+a controlled completion schedule; otherwise the implementation may
+accidentally preserve the current serial barrier.
 Process crash tests should inject failures after offset reservation, after a
 later group completes first, during sync, and after sync but before frontier
 publication. Reopen must recover a contiguous prefix and preserve every
