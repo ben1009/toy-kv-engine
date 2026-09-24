@@ -170,7 +170,10 @@ verified after the coordinator exists.
   Define async cancellation by its admission outcome: cancellation before
   admission may restore retryability; cancellation must not mark a possibly
   admitted or durable commit retryable, and the snapshot guard must remain
-  pinned until the blocking commit resolves.
+  pinned until the blocking commit resolves. The blocking commit must also
+  retain the transaction's engine `AdmissionGuard` until it finishes, even if
+  the awaiting future and `Transaction` are dropped; otherwise engine close
+  can pass lifecycle quiescence before the commit admits its WAL ticket.
   Apply the same admission cutoff rule to explicit sync and close.
 
 **Exit:** No writer can straddle old and successor WALs. A later poisoned
@@ -207,7 +210,9 @@ opt-in path is usable end to end for v4 WALs.
   `commit_async` future and polling it, add a read that conflicts with another
   commit and verify OCC rejects it. In a separate schedule, add a local write
   and verify it is committed. Repeat with a future constructed while the
-  transaction was read-only.
+  transaction was read-only. Race engine close with a queued async commit, then
+  cancel its awaiting future and drop the transaction; close must wait for the
+  blocking commit outcome, including a WAL-full rotation retry.
 
 **Exit:** The model tests, nextest suites, process crash tests, and sanitizer
 jobs pass on a host that permits io_uring. `EPERM` in a sandbox is not a
