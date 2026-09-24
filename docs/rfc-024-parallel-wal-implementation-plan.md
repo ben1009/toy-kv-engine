@@ -97,11 +97,16 @@ ticket whose MVCC publication is delayed until after a later WAL failure.
 
 ### 3. Buffer admission, packer, and file-cap handling
 
-- Before ticket assignment, validate the encoded size, reserve `DirectBuf`
-  capacity, allocate or recycle the buffer, and finish encoding. Keep the
-  normal 64 MiB active-buffer budget, 256 queued-batch limit, and 256 MiB hard
-  resident `DirectBuf` cap per WAL, including the 16 MiB prefilled pool.
-  A batch exceeding the hard cap fails before allocation or ticket assignment.
+- Before ticket assignment, validate the batch's encoded size and calculate
+  its aligned `DirectBuf` capacity. Reserve that capacity, allocate or recycle
+  the buffer, and finish encoding. Keep the normal 64 MiB active-buffer budget
+  and 256 queued-batch limit. A single batch whose aligned capacity exceeds
+  64 MiB may reserve active capacity exclusively after other active buffers
+  retire, up to 240 MiB; block other active-buffer reservations until its write
+  CQE retires it. The fixed 16 MiB prefilled pool remains resident under the
+  256 MiB hard per-WAL `DirectBuf` cap. Reject a batch whose aligned capacity
+  exceeds 240 MiB with a terminal buffer-limit error before allocation or
+  ticket assignment.
 - Under one short admission mutex, recheck open/poisoned state and the current
   file cap, then assign `ticket`, advance `admitted_end`, and enqueue the ready
   buffer and its encoded aligned length atomically. `sync`, close, and rotation
@@ -121,10 +126,11 @@ ticket whose MVCC publication is delayed until after a later WAL failure.
 
 **Exit:** Allocation/encoding failures and prepared-buffer races with close
 or rotation leave no ticket or offset hole. Mixed batch sizes preserve the
-stored admission lengths through packing. A blocked `fallocate` does not
-block producer admission. The accounting model enforces both resident limits,
-including an oversized batch; worker wakeups and buffer recycling are verified
-after the worker exists.
+stored admission lengths through packing. The accounting model verifies the
+normal-budget and exclusive oversized-batch paths, including rejection above
+the 240 MiB aligned-capacity limit. A blocked `fallocate` does not block
+producer admission. Worker wakeups and buffer recycling are verified after the
+worker exists.
 
 ### 4. Dedicated write worker and buffer ownership
 
