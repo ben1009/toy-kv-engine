@@ -6,9 +6,10 @@ A toy LSM-tree-based key-value storage engine written in Rust. This is an educat
 
 - **Language**: Rust (Edition 2024)
 - **Toolchain**: Nightly (`nightly-2026-09-23`), managed via `rust-toolchain` file
-- **Build Tool**: Cargo + cargo-make (`Makefile.toml`)
-- **Test Runner**: cargo-nextest
-- **Coverage**: cargo-llvm-cov
+- **Build Tool**: Cargo + cargo-make (minimum version `0.37.24`, in `Makefile.toml`)
+- **Test Runner**: cargo-nextest `0.9.145`
+- **Coverage**: cargo-llvm-cov `0.9.0`
+- **Check Tools**: cargo-sort `2.1.4`, cargo-machete `0.9.2`, typos-cli `1.50.1`
 
 Key dependencies:
 - `crossbeam-skiplist` — lock-free memtable
@@ -34,26 +35,16 @@ Key dependencies:
 ├── .config/nextest.toml    # nextest profile (retries, timeouts)
 ├── .typos.toml             # Spell-check allowlist
 ├── lsan-suppressions.txt   # LeakSanitizer suppressions
-├── docs/
-│   ├── bench-report-deleterange.md
-│   ├── bench-report-vlog.md
-│   ├── io-uring-bench.md
-│   └── perf-profile.md
-├── rfcs/
-│   ├── 001-key-value-separation.md
-│   ├── 002-io-uring-disk-writes.md
-│   ├── 003-thread-per-core-compio.md
-│   ├── 004-cache-backfill.md
-│   ├── 005-mvcc.md
-│   ├── 006-prefix-search.md
-│   ├── 007-prefix-bloom-filter.md
-│   ├── 008-prefetching.md
-│   ├── 009-compaction-filter.md
-│   └── 010-delete-range.md
+├── docs/                   # Benchmark reports and implementation notes
+├── rfcs/                   # RFCs 001–023
 └── kv-engine/
     ├── Cargo.toml
     ├── README.md
     ├── integration_tests/          # Process-level Cargo integration tests
+    │   ├── chaos.rs
+    │   ├── chaos_failpoint.rs
+    │   ├── chaos_integration.rs
+    │   └── cross_process_bloom.rs
     ├── benches/
     │   ├── deleterange_benchmarks.rs
     │   ├── vlog_benchmarks.rs
@@ -112,38 +103,17 @@ Key dependencies:
         │   └── index.rs               # Per-file .vidx companion index for GC
         ├── cache.rs                   # Block cache (TinyUFO, lock-free)
         ├── debug.rs
-        └── tests/                     # Integration tests
-            ├── block.rs
-            ├── bloom_compression.rs
-            ├── cache_backfill.rs
-            ├── compaction.rs
-            ├── compaction_gc.rs
-            ├── compaction_integration.rs
-            ├── compaction_integration_2.rs
-            ├── harness.rs
-            ├── iterators.rs
-            ├── leveled_compaction.rs
-            ├── lsm_storage_extra.rs
-            ├── manifest.rs
-            ├── memtable.rs
-            ├── merge_iterator.rs
-            ├── mvcc_scan.rs
-            ├── prefix_scan.rs
-            ├── scan_flush.rs
-            ├── simple_leveled_compaction.rs
-            ├── sst.rs
-            ├── tiered_compaction.rs
-            ├── tiered_unit.rs
-            ├── txn_serializable.rs
+        ├── tests.rs                    # In-crate test module declarations
+        └── tests/                      # In-crate test coverage
+            ├── async_api.rs
+            ├── checkpoint.rs
+            ├── compaction*.rs
+            ├── mvcc_*.rs
+            ├── ttl.rs
             ├── wal.rs
             └── vlog_integration_tests/
                 ├── mod.rs
-                ├── sst_builder.rs
-                ├── basic.rs
-                ├── gc.rs
-                ├── advanced.rs
-                ├── cache.rs
-                └── manifest.rs
+                └── *.rs
 ```
 
 ## Build and Test Commands
@@ -235,8 +205,8 @@ Run `cargo fmt --all` before committing. CI enforces `cargo fmt --check`.
 
 - **Unit tests** live in the same file as the code they test (e.g., `block.rs` has `#[cfg(test)]` blocks).
 - **In-crate tests** live under `kv-engine/src/tests/` and are declared in `kv-engine/src/tests.rs`.
-- **Cargo integration tests** live under `kv-engine/integration_tests/` and are declared in `kv-engine/Cargo.toml`.
-- **vLog integration tests** are in `kv-engine/src/tests/vlog_integration_tests/` (split into `sst_builder.rs`, `basic.rs`, `gc.rs`, `advanced.rs`, `cache.rs`, `manifest.rs`).
+- **Cargo integration tests** live under `kv-engine/integration_tests/`; their explicit target paths and feature gates are declared in `kv-engine/Cargo.toml`.
+- **vLog test modules** live under `kv-engine/src/tests/vlog_integration_tests/` (`sst_builder.rs`, `basic.rs`, `gc.rs`, `advanced.rs`, `cache.rs`, and `manifest.rs`).
 
 ### Test Configuration
 
@@ -262,7 +232,10 @@ in a plain `cargo test --lib`.
 - `tests::tiered_unit` — TieredCompactionController unit tests
 - `tests::lsm_storage_extra` — LSM storage paths (cache stats, vlog stats, drain flush, GC, scans)
 - `tests::txn_serializable` — serializable transaction OCC (conflict detection, write sets, commit)
-- `tests::mvcc_scan` — MVCC snapshot scan correctness
+- `tests::mvcc_scan` / `tests::mvcc_snapshot` — snapshot scan and snapshot lifetime correctness
+- `tests::checkpoint` — checkpoint and backup capture, publication, and recovery behavior
+- `tests::ttl` — TTL-aware reads, scans, and compaction
+- `tests::async_api` — asynchronous API and cancellation behavior
 - `tests::bloom_compression` — bloom filter false-positive rates
 - `tests::cache_backfill` — cache backfill on flush and compaction
 - `tests::harness` — shared test utilities

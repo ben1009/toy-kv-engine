@@ -793,7 +793,7 @@ mod tests {
             // rejects a nonzero alignment gap before any digest is compared - so this
             // asserts the object is not accepted, not that the legacy rule caught it.
             // That the legacy digest covers the padding is pinned by the frozen
-            // fixture's `wal_digest == SHA256(file)` in `pitr_seal.rs`.
+            // fixture's `wal_digest == SHA256(file)` in `pitr/seal.rs`.
             let mut tampered = stored.clone();
             let last = tampered.len() - 1;
             tampered[last] ^= 1;

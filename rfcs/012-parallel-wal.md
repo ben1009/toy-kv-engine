@@ -978,7 +978,7 @@ across N SQEs.
 | 6 | Update recovery to use buffered handle | `wal.rs` |
 | 7 | Add `Wal::close()` for ring cleanup | `wal.rs` |
 | 8 | Add fallback to current group commit | `wal.rs` |
-| 9 | Add tests | `tests/wal.rs` |
+| 9 | Add tests | `src/tests/wal.rs` |
 | 10 | Benchmark | — |
 
 ---

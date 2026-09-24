@@ -61,6 +61,8 @@ The CLI supports basic manual operations such as `fill`, `get`, `del`, `scan`,
 
 - Write-ahead logging with ticket-based group commit.
 - `io_uring` + `O_DIRECT` WAL write path for durable writes.
+- Point-in-time recovery from archived WAL segments, with timeline-aware
+  restore support.
 - Batched writes through `write_batch`, including optimized same-batch publish
   and WAL grouping.
 - Manifest recovery for SST and value-log metadata.
@@ -242,11 +244,16 @@ db.close_async().await?;
   watermarks, snapshots, and transactions.
 - `kv-engine/src/checkpoint.rs` - checkpoint/backup creation, file pinning,
   target locking, and atomic publication helpers.
+- `kv-engine/src/pitr/` - PITR archive, manifest, timeline, and restore modules;
+  see [RFC 023](rfcs/023-point-in-time-recovery.md).
 - `kv-engine/src/vlog/` - value-log writer, reader, GC, and `.vidx` index.
 - `kv-engine/src/cache.rs` - block cache and admission policy.
 - `kv-engine/src/bin/` - CLI, write benchmark, async scan benchmark,
   compaction simulator, and chaos child process.
-- `kv-engine/integration_tests/` - process-level chaos and cross-process persistence tests.
+- `kv-engine/src/tests/` - in-crate coverage for storage, MVCC, compaction,
+  checkpointing, and vLog behavior.
+- `kv-engine/integration_tests/` - process-level chaos and cross-process
+  persistence tests, declared as explicit Cargo targets.
 - `kv-engine/benches/` - Criterion benchmarks for vLog, WAL, memtable, and
   range deletion paths.
 - `rfcs/` - design notes for major features.

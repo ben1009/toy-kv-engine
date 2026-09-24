@@ -896,7 +896,7 @@ moka housekeeper: **0%** (eliminated). Cache overhead dropped from ~13% to ~0.4%
 | `compact.rs` | `state.read().clone()` → `load_full()`, `state.write()` → `store()` |
 | `debug.rs` | `state.read()` → `load()` |
 | `vlog/gc.rs` | `state.read().clone()` → `load_full()` |
-| `tests/*.rs` | Updated state access patterns |
+| `src/tests/*.rs` | Updated state access patterns |
 
 ## Reduce Key Cloning in `SsTableBuilder::add_inner` (2026-06-05)
 
@@ -959,7 +959,7 @@ run-to-run noise.
 | `table/builder.rs` | Derive meta first/last keys from `key_at`; loud error on oversized entry |
 | `key.rs` | Added shared `shared_bytes_from_slice` helper |
 | `mem_table.rs` | Import shared helper, removed local duplicate |
-| `tests/block.rs` | Added `key_at` tests for single entry and empty first key |
+| `src/tests/block.rs` | Added `key_at` tests for single entry and empty first key |
 
 ### Recommendations Update
 

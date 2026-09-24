@@ -1466,8 +1466,9 @@ fn test_gc_100_percent_dead() {
 }
 ```
 
-> **Implementation Note:** All tests listed above are implemented in
-> `vlog_integration_tests.rs`. Additional GC tests exist:
+> **Implementation Note:** All tests listed above are implemented in the
+> in-crate test modules under `kv-engine/src/tests/vlog_integration_tests/`.
+> Additional GC tests exist:
 > `test_gc_preserves_live_values`, `test_gc_below_threshold`, `test_trigger_gc_api`,
 > `test_gc_multiple_files`, `test_gc_analyze_file`, `test_gc_batch_cas`,
 > `test_vlog_stats_api`, `test_value_cache_hit_miss`, and
