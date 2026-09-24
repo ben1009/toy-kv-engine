@@ -162,6 +162,9 @@ verified after the coordinator exists.
   `commit_async`, do not remove the snapshot guard when constructing the future:
   only the future that successfully claims the commit may take ownership of it.
   An unpolled or losing future must leave the guard pinned in the transaction.
+  Capture local writes and the OCC read/write sets only after that claim, so
+  transaction operations between future construction and first poll are
+  included, including a transition from read-only to writing.
   Preserve the write set and restore `committed`/snapshot-guard state on
   retryable pre-admission errors, even if the awaiting future was cancelled.
   Define async cancellation by its admission outcome: cancellation before
@@ -200,7 +203,11 @@ opt-in path is usable end to end for v4 WALs.
   Drop an unpolled `commit_async` future, then commit a conflicting write and
   verify the transaction still detects the conflict. Also construct two commit
   futures, poll the second first, and drop the first; the winning future must
-  retain its snapshot guard through OCC and rotation.
+  retain its snapshot guard through OCC and rotation. Between creating a
+  `commit_async` future and polling it, add a read that conflicts with another
+  commit and verify OCC rejects it. In a separate schedule, add a local write
+  and verify it is committed. Repeat with a future constructed while the
+  transaction was read-only.
 
 **Exit:** The model tests, nextest suites, process crash tests, and sanitizer
 jobs pass on a host that permits io_uring. `EPERM` in a sandbox is not a
