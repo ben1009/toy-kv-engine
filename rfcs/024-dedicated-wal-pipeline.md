@@ -32,6 +32,16 @@ on tmpfs. The ordered publication wait also remains after this change, so
 success must be measured end to end against the current WAL and the pre-PITR
 baseline, not inferred from time spent in WAL follower waits.
 
+### Terminology
+
+| Term | Meaning |
+| --- | --- |
+| WAL batch | One logical committed batch, assigned one ticket. |
+| I/O group | One or more contiguous tickets packed for WAL I/O. |
+| Write SQE | One io_uring write request belonging to a group; a group may need several. |
+| In-flight group | A group with submitted writes that have not all completed. |
+| Outstanding write SQE | A submitted write SQE whose CQE has not been consumed. |
+
 ## Regression and scope
 
 [The PITR performance study](../docs/pitr-performance.md) compared 25
