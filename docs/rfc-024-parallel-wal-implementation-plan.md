@@ -99,8 +99,9 @@ ticket whose MVCC publication is delayed until after a later WAL failure.
 
 **Exit:** Allocation/encoding failures and prepared-buffer races with close
 or rotation leave no ticket or offset hole. A blocked `fallocate` does not
-block producer admission. Budget pressure wakes the worker, and an oversized
-buffer is freed instead of retained in the pool after its CQE.
+block producer admission. The accounting model enforces both resident limits,
+including an oversized batch; worker wakeups and buffer recycling are verified
+after the worker exists.
 
 ### 4. Dedicated write worker and buffer ownership
 
@@ -119,9 +120,10 @@ buffer is freed instead of retained in the pool after its CQE.
   possibly kernel-owned buffer until terminal CQEs or guaranteed ring teardown.
 
 **Exit:** A controlled completion schedule observes at least two groups with
-  simultaneous outstanding writes. Holding sync open does not hold completed
-  `DirectBuf`s. An ambiguous submit followed by `close()` error and `Wal` drop
-  cannot free a buffer still reachable by the kernel, including under ASan.
+simultaneous outstanding writes. An oversized buffer is freed after its CQE.
+An ambiguous submit followed by `close()` error and `Wal` drop cannot free a
+buffer still reachable by the kernel, including under ASan. Sync overlap is
+verified after the coordinator exists.
 
 ### 5. Independent durability coordinator and lifecycle
 
@@ -138,14 +140,26 @@ buffer is freed instead of retained in the pool after its CQE.
   If kernel ownership cannot be proved released after a failed shutdown,
   retain or deliberately leak the worker-owned state rather than free a
   possibly referenced `DirectBuf`.
-- Integrate retryable `WAL full` with the engine's memtable freeze and
-  successor installation. Release `active_memtable_lock` before freeze, and
-  retry with a fresh MVCC reservation as required by the existing sequencer.
-  Apply the same cutoff rule to explicit sync, close, and rotation.
+- Integrate retryable `WAL full` across point writes, TTL writes, deletes,
+  batches, range tombstones, and transaction commits. After releasing
+  `active_memtable_lock`, force a v4 memtable/WAL rotation under the existing
+  checkpoint and state lock order, then retry against the successor with a
+  fresh MVCC reservation. `try_freeze_memtable()` is insufficient: it checks
+  the memtable's SST-size threshold, which may remain below the threshold
+  when the WAL reaches its 1 GiB cap. Concurrent capacity requests must
+  coalesce after rechecking the active WAL identity, not rotate a new
+  successor for every waiting writer.
+- A serializable transaction must also release `commit_lock` before forced
+  rotation. On reacquiring it, rerun OCC conflict validation against commits
+  made during rotation before reserving a new timestamp or admitting a WAL
+  batch. Keep its write set and `committed` state consistent if the retry
+  fails. Apply the same admission cutoff rule to explicit sync and close.
 
 **Exit:** No writer can straddle old and successor WALs. A later poisoned
 group cannot retract an earlier durable ticket, and no worker survives a
-normal successful close. The opt-in path is usable end to end for v4 WALs.
+normal successful close. Holding sync open does not hold completed `DirectBuf`s,
+and queue pressure wakes the worker without another client arrival. The
+opt-in path is usable end to end for v4 WALs.
 
 ### 6. Recovery, crash, and compatibility gate
 
@@ -160,6 +174,10 @@ normal successful close. The opt-in path is usable end to end for v4 WALs.
 - Exercise `sync`/admission and close/rotation/admission races, queue and ring
   exhaustion, oversized batches, short writes, failed sync, and poison while
   an earlier sync is pending or has not yet started.
+- Fill a WAL through repeated overwrites while the memtable remains below its
+  SST-size threshold; verify one forced rotation, bounded retries, and no
+  ticket loss. Race that rotation with a serializable transaction and a
+  conflicting commit; the transaction must rerun OCC and reject the conflict.
 
 **Exit:** The model tests, nextest suites, process crash tests, and sanitizer
 jobs pass on a host that permits io_uring. `EPERM` in a sandbox is not a
