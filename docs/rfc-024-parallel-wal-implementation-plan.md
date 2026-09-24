@@ -153,10 +153,17 @@ verified after the coordinator exists.
   `delete`, `write_batch`, and transaction commit, must release both its
   memtable read guard and `commit_lock` before forced rotation, then reacquire
   the lock and restart its serialized write attempt on the successor WAL.
-  Transaction commit must additionally rerun OCC conflict validation against
-  commits made during rotation before reserving a new timestamp or admitting
-  a WAL batch. Keep its write set and `committed` state consistent if the retry
-  fails. Apply the same admission cutoff rule to explicit sync and close.
+  Both `Transaction::commit` and the separately implemented
+  `Transaction::commit_async` must rerun OCC conflict validation against commits
+  made during rotation before reserving a new timestamp or admitting a WAL
+  batch. Keep the transaction's MVCC snapshot `ReadGuard` pinned across the
+  retry so OCC history cannot be pruned; it is distinct from the active
+  memtable read guard that rotation requires the writer to release. Preserve
+  the write set and restore `committed`/snapshot-guard state on retryable
+  pre-admission errors. Define async cancellation by its admission outcome:
+  cancellation must not mark a possibly admitted or durable commit retryable,
+  and the snapshot guard must remain pinned until the blocking commit resolves.
+  Apply the same admission cutoff rule to explicit sync and close.
 
 **Exit:** No writer can straddle old and successor WALs. A later poisoned
 group cannot retract an earlier durable ticket, and no worker survives a
@@ -183,6 +190,8 @@ opt-in path is usable end to end for v4 WALs.
   conflicting commit; the transaction must rerun OCC and reject the conflict.
   Also force rotation through ordinary serializable point and batch writes to
   verify they release both locks and retry on the successor without deadlock.
+  Cover both sync and async transaction commit with a conflict during rotation;
+  exercise async cancellation and error restoration while the retry is pending.
 
 **Exit:** The model tests, nextest suites, process crash tests, and sanitizer
 jobs pass on a host that permits io_uring. `EPERM` in a sandbox is not a
