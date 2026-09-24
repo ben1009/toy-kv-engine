@@ -202,11 +202,20 @@ Buffer admission reserves **resident `DirectBuf` capacity**, not just encoded WA
 bytes, against an initial 64 MiB queued-and-in-flight budget, plus a separate
 initial limit of 256 queued batches. Today even a 4 KiB write normally owns
 a 256 KiB pooled buffer, and a pool miss allocates another 256 KiB buffer;
-charging only 4 KiB would allow gigabytes of resident buffers. Reserve before allocating,
-charge the actual capacity of any recycled oversized buffer, and account for
-the fixed pool and ring memory separately. A single valid larger batch may
-occupy the dynamic budget exclusively. The worker is independent of blocked
-producers, so backpressure cannot wait for an uncalled `submit_and_commit`.
+charging only 4 KiB would allow gigabytes of resident buffers. The first
+implementation has a hard 256 MiB cap on resident `DirectBuf` capacity per
+WAL, including the prefilled pool's 16 MiB. The normal active-buffer budget
+starts at 64 MiB; a single batch larger than that may use the remaining
+capacity exclusively, up to 240 MiB while the fixed pool remains resident.
+If its aligned buffer would exceed the hard cap even after all other active
+buffers retire, reject it before allocation or ticket assignment with a
+terminal buffer-limit error. This limit is independent of the 1 GiB WAL
+file-size cap. Reserve before allocating and
+charge the actual capacity of any recycled buffer. The ring has a separate
+fixed allocation. Only 256 KiB buffers may return to the bounded 64-slot pool;
+larger buffers are freed after their write CQE and are never retained
+idle. The worker is independent of blocked producers, so backpressure cannot
+wait for an uncalled `submit_and_commit`.
 Pressure also wakes the packer; it must not rely on a client arriving to
 trigger dispatch.
 Release each buffer's budget when its full-length write CQE confirms that the
@@ -432,6 +441,9 @@ make `close()` return an error, then drop the `Wal` handle; an ownership test
 and the address-sanitized suite must show that the buffer is not freed before
 request resolution or proven ring teardown. A batch that cannot fit even in
 a fresh WAL must fail without assigning a ticket or looping through rotations.
+An oversized buffer must respect the 256 MiB resident cap and be freed rather
+than pooled after its write completes; a batch exceeding that cap must fail
+before allocation or ticket assignment.
 Also fail a later group both before and during an earlier group's sync: the
 earlier contiguous written prefix may advance the durable frontier on sync
 success, but no ticket at or after `poison_ticket` may be acknowledged. Fail
