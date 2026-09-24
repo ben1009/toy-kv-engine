@@ -149,10 +149,13 @@ verified after the coordinator exists.
   when the WAL reaches its 1 GiB cap. Concurrent capacity requests must
   coalesce after rechecking the active WAL identity, not rotate a new
   successor for every waiting writer.
-- A serializable transaction must also release `commit_lock` before forced
-  rotation. On reacquiring it, rerun OCC conflict validation against commits
-  made during rotation before reserving a new timestamp or admitting a WAL
-  batch. Keep its write set and `committed` state consistent if the retry
+- Every serializable write entry point, including ordinary `put`, TTL put,
+  `delete`, `write_batch`, and transaction commit, must release both its
+  memtable read guard and `commit_lock` before forced rotation, then reacquire
+  the lock and restart its serialized write attempt on the successor WAL.
+  Transaction commit must additionally rerun OCC conflict validation against
+  commits made during rotation before reserving a new timestamp or admitting
+  a WAL batch. Keep its write set and `committed` state consistent if the retry
   fails. Apply the same admission cutoff rule to explicit sync and close.
 
 **Exit:** No writer can straddle old and successor WALs. A later poisoned
@@ -178,6 +181,8 @@ opt-in path is usable end to end for v4 WALs.
   SST-size threshold; verify one forced rotation, bounded retries, and no
   ticket loss. Race that rotation with a serializable transaction and a
   conflicting commit; the transaction must rerun OCC and reject the conflict.
+  Also force rotation through ordinary serializable point and batch writes to
+  verify they release both locks and retry on the successor without deadlock.
 
 **Exit:** The model tests, nextest suites, process crash tests, and sanitizer
 jobs pass on a host that permits io_uring. `EPERM` in a sandbox is not a
