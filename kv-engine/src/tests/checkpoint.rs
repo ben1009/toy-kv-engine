@@ -38,7 +38,12 @@ fn checkpoint_test_guard() -> std::sync::MutexGuard<'static, ()> {
 }
 
 #[cfg(not(feature = "chaos-testing"))]
-fn checkpoint_test_guard() {}
+struct NoopCheckpointTestGuard;
+
+#[cfg(not(feature = "chaos-testing"))]
+fn checkpoint_test_guard() -> NoopCheckpointTestGuard {
+    NoopCheckpointTestGuard
+}
 
 #[test]
 fn checkpoint_empty_database_reopens() {
