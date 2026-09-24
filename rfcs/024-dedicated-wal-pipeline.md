@@ -321,21 +321,23 @@ clients: encode -> ticketed queue -> wait for durable ticket
 Group write completion may be out of order. The durable frontier must never
 skip a group: if group 2 finishes first, its writers remain blocked until
 group 1 has also completed and a sync covers both. A failed write group
-poisons the WAL and stops new admission. Tickets already acknowledged by the
-durable frontier remain successful and cannot be retracted. Groups before the
-failed group may still become durable if their writes complete and a sync
-covering only that contiguous prefix succeeds, including a sync already in
-flight when the later group fails. The failed group and every later group
-must fail, even if some later writes physically completed; none may advance
-the durable frontier past the failure boundary. WAL failure notifications and
-frontier advancement must be ordered under the same state lock.
+poisons the WAL, stops new admission, and sets `poison_ticket` to the first
+ticket of the earliest failed group. If an earlier group subsequently fails,
+the boundary moves back to that group's first ticket; it never moves forward.
+Tickets already acknowledged durable remain successful and cannot be
+retracted. Any contiguous written prefix strictly before `poison_ticket` may
+still be synchronized and acknowledged, even if no sync was in flight when
+the later group failed. Tickets at or after `poison_ticket` fail, even if some
+later writes physically completed; `durable_ticket` must never advance past
+`poison_ticket`. WAL failure notifications and frontier advancement must be
+ordered under the same state lock.
 
-For example, if group 1 is durable, group 2 is written with its sync in
-flight, group 3 fails, and group 4 is written, group 1 stays successful and
-group 2 may still succeed when its sync succeeds. Groups 3 and 4 cannot be
-acknowledged. A failed `fdatasync` leaves its covered tickets unacknowledged
-because the durability outcome is unknown; reopen and recovery determine
-which complete records are present.
+For example, if groups 1 and 2 are written, group 3 fails, and group 4 is
+written, the coordinator may still sync and acknowledge groups 1 and 2,
+whether or not their sync had started before the failure. Groups 3 and 4
+cannot be acknowledged. A failed `fdatasync` leaves its covered tickets
+unacknowledged because the durability outcome is unknown; reopen and recovery
+determine which complete records are present.
 
 WAL durability and MVCC publication are separate stages. A writer whose WAL
 ticket was acknowledged durable may still insert into the memtable and
@@ -397,7 +399,7 @@ alone proves which writes were acknowledged before a crash.
 - Begin with two logger threads and two rings, as in SpanDB's `2L4R` example.
   The first experiment uses one ring and eight groups to isolate in-flight
   depth from thread count; add the second worker only if measurements show
-  one ring cannot maintain useful device queue depth.
+  one ring cannot maintain enough outstanding writes.
 - Make the ticketed queue lock-free immediately. The current queue mutex
   already serializes ticket assignment with enqueue, and the measured WAL
   work is dominated by `submit_and_wait`. Replace it only if queue-lock
@@ -420,11 +422,13 @@ make `close()` return an error, then drop the `Wal` handle; an ownership test
 and the address-sanitized suite must show that the buffer is not freed before
 request resolution or proven ring teardown. A batch that cannot fit even in
 a fresh WAL must fail without assigning a ticket or looping through rotations.
-Also fail a later group while an earlier group's sync is in flight: the
-earlier group may advance the durable frontier on sync success, but no group
-at or after the failure boundary may be acknowledged. Delay an already
-durable writer's memtable publication until after that later failure and
-verify it can still publish below the MVCC poison timestamp.
+Also fail a later group both before and during an earlier group's sync: the
+earlier contiguous written prefix may advance the durable frontier on sync
+success, but no ticket at or after `poison_ticket` may be acknowledged. Fail
+multiple groups out of order and verify the boundary moves to the earliest
+failed group. Delay an already durable writer's memtable publication until
+after that later failure and verify it can still publish below the MVCC poison
+timestamp.
 Assert that at least two groups have writes outstanding simultaneously under
 a controlled completion schedule; otherwise the implementation may
 accidentally preserve the current serial barrier.
@@ -451,9 +455,11 @@ above the run's footprint; do not call that altered workload a reproduction
 of the original regression.
 
 Report throughput, p50/p99 commit latency, CPU, solo groups, buffers per group,
-groups per sync, publication-wait time, direct-write queue depth, CQE counts,
-ring count, worker wakeups, actual simultaneous in-flight group count,
-preallocation time, `fdatasync` calls, and physical WAL bytes.
+groups per sync, publication-wait time, `outstanding_write_sqes`, CQE counts,
+ring count, worker wakeups, `inflight_groups`, preallocation time,
+`fdatasync` calls, and physical WAL bytes. Outstanding SQEs and groups measure
+the software pipeline, not block-device queue depth; report device queue depth
+separately only when it is measured at the device.
 The WAL profile's `wal_group_gap` includes time with no pending batch, and
 `wal_submit` is dominated by `submit_and_wait`; neither counter alone proves
 that deeper queuing or more rings creates useful device overlap. Include
