@@ -34,10 +34,12 @@ args = ["clean"]
 
 [tasks.check-clippy]
 category = "Dev - check"
-description = "Run full cargo clippy check"
+description = "Run Clippy with default and all features"
 script = """
 #!/usr/bin/env bash
+set -e
 
+cargo clippy --workspace --all-targets -- -D warnings
 cargo clippy --workspace --all-features --all-targets -- -D warnings
 """
 

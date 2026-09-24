@@ -4095,15 +4095,15 @@ impl BackupRepository {
         }
         #[cfg(feature = "chaos-testing")]
         crate::chaos::failpoint::fail_point!("backup.purge.after_object_fsync");
-        let root_sync_result = (|| {
+        fn sync_root_after_purge(root: &OwnedFd) -> Result<()> {
             #[cfg(feature = "chaos-testing")]
             crate::chaos::failpoint::fail_point!("backup.purge.before_root_fsync", |_| {
                 Err(anyhow!("injected backup purge root fsync failure"))
             });
-            fsync_fd(&self.root)
-        })();
+            fsync_fd(root)
+        }
 
-        if let Err(error) = root_sync_result {
+        if let Err(error) = sync_root_after_purge(&self.root) {
             self.usable.store(false, Ordering::Release);
             return Err(error);
         }
