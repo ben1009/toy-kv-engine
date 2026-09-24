@@ -174,6 +174,11 @@ verified after the coordinator exists.
   retain the transaction's engine `AdmissionGuard` until it finishes, even if
   the awaiting future and `Transaction` are dropped; otherwise engine close
   can pass lifecycle quiescence before the commit admits its WAL ticket.
+  Likewise, move each ordinary async write or `sync_async` lifecycle guard
+  into its spawned blocking closure. Once spawned, that guard must outlive
+  future cancellation and remain held through WAL-full rotation/retry and
+  final publication or sync completion; a cancelled future still waiting for
+  an executor slot may simply drop its guard because no task was spawned.
   Apply the same admission cutoff rule to explicit sync and close.
 
 **Exit:** No writer can straddle old and successor WALs. A later poisoned
@@ -212,7 +217,9 @@ opt-in path is usable end to end for v4 WALs.
   and verify it is committed. Repeat with a future constructed while the
   transaction was read-only. Race engine close with a queued async commit, then
   cancel its awaiting future and drop the transaction; close must wait for the
-  blocking commit outcome, including a WAL-full rotation retry.
+  blocking commit outcome, including a WAL-full rotation retry. Repeat the
+  cancellation/close race for ordinary async point and batch writes and
+  `sync_async`; close must wait for each spawned closure to finish.
 
 **Exit:** The model tests, nextest suites, process crash tests, and sanitizer
 jobs pass on a host that permits io_uring. `EPERM` in a sandbox is not a
