@@ -37,6 +37,24 @@ that path intact while adding a private v4 pipeline module (for example,
 must not depend on a process-global environment variable: concurrent tests
 and PITR control runs need independent choices.
 
+## Existing-code prerequisites and scope
+
+Keep the parallel WAL work focused on ticket admission, ordered offsets,
+concurrent I/O, durability, recovery, and WAL-full rotation. The reviews also
+found existing async/lifecycle defects on the current leader path. Fix these in
+separate PRs with their own tests; they are not evidence that the RFC's WAL
+state machine is incomplete.
+
+| Existing defect | Separate fix and gate |
+| --- | --- |
+| [`Transaction::commit_async`](../kv-engine/src/mvcc/txn.rs) takes its MVCC snapshot guard and copies writes/OCC sets when the future is created, before it claims the commit on first poll. | Move ownership and state capture to the winning attempt. An unpolled/losing future must not unpin the snapshot; a cancelled, spawned commit must retain its snapshot and engine admission until its outcome is known. Verify mutation before first poll, two competing futures, cancellation, and close. Required before exposing the candidate through async transactions. |
+| Async engine methods in [`lsm_storage.rs`](../kv-engine/src/lsm_storage.rs) can leave admission guards in cancellable futures while detached blocking closures continue; `batch_get_async` discards its guard. | Audit all blocking engine APIs and transfer each guard to the spawned task or returned cursor. Test cancellation against close for a write, maintenance task, and batch read. Required before exposing the candidate through async APIs. |
+| Async lifecycle waits can lose a [`Notify` wakeup](../kv-engine/src/lsm_storage.rs); `close_async` cancellation or a background-worker join error can leave `Closing` unresolved. | Use state-aware wait registration and a shutdown owner that records a terminal success or error after safe teardown. Test cancellation at each await, failed joins, and a second close caller. Required before relying on async close for candidate teardown. |
+
+The candidate can progress in a controlled synchronous harness through the
+pure model, worker, and recovery slices while these fixes are prepared. Do not
+expose its selector through engine async APIs until the prerequisite tests pass.
+
 ## Implementation slices
 
 ### 1. Baseline, selection, and observability
@@ -139,17 +157,8 @@ verified after the coordinator exists.
   cancel terminal requests, and join it before releasing buffers or the file.
   If kernel ownership cannot be proved released after a failed shutdown,
   retain or deliberately leak the worker-owned state rather than free a
-  possibly referenced `DirectBuf`. Once `close_async` starts the lifecycle
-  transition, its shutdown owner must continue through worker teardown and
-  `finish_close` even if the awaiting future is cancelled. A later close caller
-  must be able to wait for that owner; do not leave the engine in `Closing`.
-  Treat a background-worker join error or panic in either close path as a
-  terminal shutdown outcome too: settle or retain WAL worker/buffer ownership,
-  wake all later close callers, and propagate the failure rather than leaving
-  them waiting forever or reporting a successful close prematurely. Make async
-  quiescence and closed-state waits race-free: register for notification before
-  rechecking the state (or use an equivalent state-bearing channel), so a
-  transition between the check and await cannot strand a waiter.
+  possibly referenced `DirectBuf`. Integrate with the separate async-close
+  prerequisite before enabling this path through `close_async`.
 - Integrate retryable `WAL full` across point writes, TTL writes, deletes,
   batches, range tombstones, and transaction commits. After releasing
   `active_memtable_lock`, force a v4 memtable/WAL rotation under the existing
@@ -163,37 +172,13 @@ verified after the coordinator exists.
   `delete`, `write_batch`, and transaction commit, must release both its
   memtable read guard and `commit_lock` before forced rotation, then reacquire
   the lock and restart its serialized write attempt on the successor WAL.
-  Both `Transaction::commit` and the separately implemented
-  `Transaction::commit_async` must rerun OCC conflict validation against commits
-  made during rotation before reserving a new timestamp or admitting a WAL
-  batch. Keep the transaction's MVCC snapshot `ReadGuard` pinned across the
-  retry so OCC history cannot be pruned; it is distinct from the active
-  memtable read guard that rotation requires the writer to release. In
-  `commit_async`, do not remove the snapshot guard when constructing the future:
-  only the future that successfully claims the commit may take ownership of it.
-  An unpolled or losing future must leave the guard pinned in the transaction.
-  Capture local writes and the OCC read/write sets only after that claim, so
-  transaction operations between future construction and first poll are
-  included, including a transition from read-only to writing.
-  Preserve the write set and restore `committed`/snapshot-guard state on
-  retryable pre-admission errors, even if the awaiting future was cancelled.
-  Define async cancellation by its admission outcome: cancellation before
-  admission may restore retryability; cancellation must not mark a possibly
-  admitted or durable commit retryable, and the snapshot guard must remain
-  pinned until the blocking commit resolves. The blocking commit must also
-  retain the transaction's engine `AdmissionGuard` until it finishes, even if
-  the awaiting future and `Transaction` are dropped; otherwise engine close
-  can pass lifecycle quiescence before the commit admits its WAL ticket.
-  Likewise, audit every async engine API that spawns blocking work touching
-  `LsmStorageInner`: move its lifecycle guard into the spawned closure or
-  returned cursor, including ordinary reads/writes, `sync_async`, flush/drain,
-  full compaction, and compaction-filter removal. In particular,
-  `batch_get_async` must retain its currently discarded admission guard.
-  Once spawned, the guard must outlive future cancellation and remain held
-  through WAL-full rotation/retry, WAL freeze/flush, and final publication or
-  task completion; a cancelled future still waiting for an executor slot may
-  simply drop its guard because no task was spawned.
-  Apply the same admission cutoff rule to explicit sync and close.
+  Both sync and async transaction commit must rerun OCC after rotation, before
+  reserving a new timestamp or admitting a batch. Keep the MVCC snapshot
+  `ReadGuard` pinned across this retry; it is distinct from the memtable read
+  guard that rotation must release. Restore transaction state only when failure
+  occurred before WAL admission. Async use also depends on the separate
+  prerequisites above. Apply the same admission cutoff rule to explicit sync
+  and close.
 
 **Exit:** No writer can straddle old and successor WALs. A later poisoned
 group cannot retract an earlier durable ticket, and no worker survives a
@@ -220,28 +205,10 @@ opt-in path is usable end to end for v4 WALs.
   conflicting commit; the transaction must rerun OCC and reject the conflict.
   Also force rotation through ordinary serializable point and batch writes to
   verify they release both locks and retry on the successor without deadlock.
-  Cover both sync and async transaction commit with a conflict during rotation;
-  exercise async cancellation and error restoration while the retry is pending.
-  Drop an unpolled `commit_async` future, then commit a conflicting write and
-  verify the transaction still detects the conflict. Also construct two commit
-  futures, poll the second first, and drop the first; the winning future must
-  retain its snapshot guard through OCC and rotation. Between creating a
-  `commit_async` future and polling it, add a read that conflicts with another
-  commit and verify OCC rejects it. In a separate schedule, add a local write
-  and verify it is committed. Repeat with a future constructed while the
-  transaction was read-only. Race engine close with a queued async commit, then
-  cancel its awaiting future and drop the transaction; close must wait for the
-  blocking commit outcome, including a WAL-full rotation retry. Repeat the
-  cancellation/close race for ordinary async point and batch writes and
-  `sync_async`, `force_flush_async`, and `drain_flush_async`; close must wait
-  for each spawned closure to finish. Repeat for full compaction, filter
-  removal, and a queued batch read. Cancel `close_async` after each await in
-  its shutdown sequence, then call close again and verify teardown finishes.
-  Force completion between the async waiter state check and wait registration
-  for both quiescence and closed-state waits; neither may lose the wakeup.
-  Inject a background-worker join failure in both sync and async close; verify
-  a second close caller terminates with the recorded failure and no WAL buffer
-  is freed while a request can still reference it.
+  Repeat the transaction conflict with async commit after its prerequisite fix;
+  cancel a spawned commit during rotation and verify close waits for its
+  terminal outcome. Run the separate async/lifecycle prerequisite test suites
+  before enabling candidate WAL selection through those paths.
 
 **Exit:** The model tests, nextest suites, process crash tests, and sanitizer
 jobs pass on a host that permits io_uring. `EPERM` in a sandbox is not a
