@@ -57,8 +57,10 @@ The commit sequence in [`LsmStorageInner::put`](../kv-engine/src/lsm_storage.rs)
 is timestamp reservation and WAL enqueue, WAL ticket durability, memtable
 publication, then `publish_commit_ts`. The last step waits for earlier
 reservations through the frontier in [`mvcc.rs`](../kv-engine/src/mvcc.rs).
-This RFC changes only WAL scheduling. It does not let a later timestamp become
-visible early, and it cannot remove a wait for an earlier skiplist insertion.
+The WAL pipeline owns the written and durable ticket frontiers; the MVCC
+sequencer owns the later publication frontier. This RFC changes only WAL
+scheduling. It does not let a later timestamp become visible early, and it
+cannot remove a wait for an earlier skiplist insertion.
 The experiment must therefore measure `wal_concurrent` end to end, including
 commit-group formation and publication wait, before claiming to address the
 regression.
@@ -287,9 +289,9 @@ writes were completed before the coordinator captured the target; it needs a
 later sync decision. The syscall may persist more bytes than the captured
 prefix, so this is an acknowledgement rule, not a claim about the exact
 physical bytes flushed. If the written frontier advanced during the call,
-the coordinator immediately considers another sync. On failure, it poisons
-the WAL and fails all unacknowledged tickets without retracting an already
-published prefix.
+the coordinator immediately considers another sync. If `fdatasync` fails,
+it poisons the WAL and fails all unacknowledged tickets without retracting
+an already acknowledged durable prefix.
 
 `sync()` and `close()` use the admission mutex cutoff defined above. `sync()`
 waits until the durable frontier passes its captured ticket. `close()` drains
@@ -318,12 +320,28 @@ clients: encode -> ticketed queue -> wait for durable ticket
 
 Group write completion may be out of order. The durable frontier must never
 skip a group: if group 2 finishes first, its writers remain blocked until
-group 1 has also completed and a sync covers both. If any group fails, the
-WAL is poisoned and all tickets not yet published fail; the already published
-prefix remains successful. Failure publication and frontier advancement must
-be ordered under the same state lock. A failed `fdatasync` leaves its covered
-tickets unacknowledged because the durability outcome is unknown; reopen and
-recovery determine which complete records are present.
+group 1 has also completed and a sync covers both. A failed write group
+poisons the WAL and stops new admission. Tickets already acknowledged by the
+durable frontier remain successful and cannot be retracted. Groups before the
+failed group may still become durable if their writes complete and a sync
+covering only that contiguous prefix succeeds, including a sync already in
+flight when the later group fails. The failed group and every later group
+must fail, even if some later writes physically completed; none may advance
+the durable frontier past the failure boundary. WAL failure notifications and
+frontier advancement must be ordered under the same state lock.
+
+For example, if group 1 is durable, group 2 is written with its sync in
+flight, group 3 fails, and group 4 is written, group 1 stays successful and
+group 2 may still succeed when its sync succeeds. Groups 3 and 4 cannot be
+acknowledged. A failed `fdatasync` leaves its covered tickets unacknowledged
+because the durability outcome is unknown; reopen and recovery determine
+which complete records are present.
+
+WAL durability and MVCC publication are separate stages. A writer whose WAL
+ticket was acknowledged durable may still insert into the memtable and
+publish its commit timestamp after a later WAL group poisons the WAL, as long
+as its timestamp precedes the MVCC sequencer's `poisoned_at` boundary. The
+WAL must not fail that writer merely because it has not yet published.
 
 The v4 recovery scanner accepts only a contiguous sequence of valid framed,
 CRC-checked batches and truncates at the first invalid or zero-filled batch.
@@ -402,6 +420,11 @@ make `close()` return an error, then drop the `Wal` handle; an ownership test
 and the address-sanitized suite must show that the buffer is not freed before
 request resolution or proven ring teardown. A batch that cannot fit even in
 a fresh WAL must fail without assigning a ticket or looping through rotations.
+Also fail a later group while an earlier group's sync is in flight: the
+earlier group may advance the durable frontier on sync success, but no group
+at or after the failure boundary may be acknowledged. Delay an already
+durable writer's memtable publication until after that later failure and
+verify it can still publish below the MVCC poison timestamp.
 Assert that at least two groups have writes outstanding simultaneously under
 a controlled completion schedule; otherwise the implementation may
 accidentally preserve the current serial barrier.
