@@ -143,6 +143,10 @@ verified after the coordinator exists.
   transition, its shutdown owner must continue through worker teardown and
   `finish_close` even if the awaiting future is cancelled. A later close caller
   must be able to wait for that owner; do not leave the engine in `Closing`.
+  Treat a background-worker join error or panic in either close path as a
+  terminal shutdown outcome too: settle or retain WAL worker/buffer ownership,
+  wake all later close callers, and propagate the failure rather than leaving
+  them waiting forever or reporting a successful close prematurely.
 - Integrate retryable `WAL full` across point writes, TTL writes, deletes,
   batches, range tombstones, and transaction commits. After releasing
   `active_memtable_lock`, force a v4 memtable/WAL rotation under the existing
@@ -226,6 +230,9 @@ opt-in path is usable end to end for v4 WALs.
   `sync_async`, `force_flush_async`, and `drain_flush_async`; close must wait
   for each spawned closure to finish. Cancel `close_async` after each await in
   its shutdown sequence, then call close again and verify teardown finishes.
+  Inject a background-worker join failure in both sync and async close; verify
+  a second close caller terminates with the recorded failure and no WAL buffer
+  is freed while a request can still reference it.
 
 **Exit:** The model tests, nextest suites, process crash tests, and sanitizer
 jobs pass on a host that permits io_uring. `EPERM` in a sandbox is not a
