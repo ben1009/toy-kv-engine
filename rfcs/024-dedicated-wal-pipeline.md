@@ -146,14 +146,32 @@ correctness requirement here. Ticket assignment and insertion into the queue
 must remain one ordered operation; a separately reserved ticket that arrives
 late cannot let a higher ticket leapfrog it.
 
-An ordered packer drains contiguous tickets, forms groups, preallocates file
-space, and assigns aligned physical offsets in ticket order. This is the thin
-serialization point. It never waits for write completion or sync while
-holding the queue/offset lock. Offset order must follow ticket order even if
-workers are scheduled differently; a free-running `fetch_add` by each logger
-would not guarantee that. A group descriptor records its ticket interval,
-file range, every submitted buffer, and state (`assigned`, `writing`,
-`written`, `durable`, or `failed`). A group never contains a ticket gap.
+The admission queue state is the linearization point for writes and barriers.
+Under the same mutex, admission checks that the WAL is open and has capacity,
+assigns the next ticket, advances an `admitted_end` counter by the aligned
+batch length, and enqueues the buffer before releasing the mutex. A rejected
+write receives no ticket. `admitted_end` bounds the file size at admission;
+the packer's `reserved_end` assigns the actual offsets to those tickets later.
+`sync()` takes that mutex to capture the last assigned ticket, then releases
+it before waiting for durability. Close and rotation take the same mutex to
+stop admission and capture their final ticket. Thus a write is wholly before
+or after each cutoff, including when it races ticket assignment. Rotation
+drains the old WAL through that ticket before installing the successor; a
+writer cannot be assigned to both files.
+
+An ordered packer drains contiguous tickets, forms groups, and assigns aligned
+physical offsets in ticket order. This is the thin serialization point. Under
+the queue/offset lock it reserves the logical file range and advances
+`reserved_end`, then releases the lock. The WAL worker ensures the required
+1 MiB extent is preallocated before submitting writes to that range; it may
+advance a separate `preallocated_end` under worker-side serialization. Neither
+`fallocate` nor its `ftruncate` fallback runs under the producer queue mutex.
+The packer never waits for write completion or sync while holding that mutex.
+Offset order must follow ticket order even if workers are scheduled
+differently; a free-running `fetch_add` by each logger would not guarantee
+that. A group descriptor records its ticket interval, file range, outstanding
+buffer references, and state (`assigned`, `writing`, `written`, `durable`, or
+`failed`). A group never contains a ticket gap.
 
 Admission reserves **resident `DirectBuf` capacity**, not just encoded WAL
 bytes, against an initial 64 MiB queued-and-in-flight budget, plus a separate
@@ -166,12 +184,16 @@ occupy the dynamic budget exclusively. The worker is independent of blocked
 producers, so backpressure cannot wait for an uncalled `submit_and_commit`.
 Pressure also wakes the packer; it must not rely on a client arriving to
 trigger dispatch.
-Release the budget only when the kernel is finished with the buffers and the
-group is retired or failed. The v4 file-size limit is checked before offset
+Release each buffer's budget when its full-length write CQE confirms that the
+kernel has finished reading it. Recycle its `DirectBuf` immediately, even if
+the group is still waiting for `fdatasync`; the group descriptor retains only
+ticket, file-range, completion, and error metadata until it is durable or
+failed. An ambiguous submission or completion retains the buffer until kernel
+ownership is resolved. The v4 file-size limit is checked before offset
 reservation; any later PITR implementation must likewise check its segment
 and spool limits before reservation.
 
-The queue lock also accounts for the aligned end of every accepted ticket.
+The queue lock accounts for the aligned end of every accepted ticket.
 Admission first checks whether the batch fits in an *empty* v4 WAL, including
 its 4 KiB file header, 4 KiB batch alignment, and the rounded preallocation
 extent. If even that exceeds the 1 GiB recovery cap, return a terminal
@@ -245,13 +267,12 @@ the coordinator immediately considers another sync. On failure, it poisons
 the WAL and fails all unacknowledged tickets without retracting an already
 published prefix.
 
-`sync()` captures the highest ticket assigned before its barrier and waits
-until the durable frontier passes it. `close()` stops admission, captures the
-last assigned ticket, drains queue, rings, sync, and seal work, then releases
-the file. On a poisoned WAL, close still resolves or retains in-flight buffer
-ownership before tearing down the ring and descriptor. No new ticket may
-enter after the close cutoff. An empty `sync()`
-remains a no-op.
+`sync()` and `close()` use the admission mutex cutoff defined above. `sync()`
+waits until the durable frontier passes its captured ticket. `close()` drains
+queue, rings, sync, and seal work through its captured final ticket, then
+releases the file. On a poisoned WAL, close still resolves or retains
+in-flight buffer ownership before tearing down the ring and descriptor. An
+empty `sync()` remains a no-op.
 
 ```text
 clients: encode -> ticketed queue -> wait for durable ticket
@@ -347,8 +368,11 @@ durability-frontier state so ordering can be tested without io_uring. State
 tests must cover out-of-order CQEs and groups, a missing early group, partial
 SQE submission, a short write, `fdatasync` failure, late arrivals, slot
 exhaustion, queue-budget pressure before an explicit sync, idle-worker wakeup,
-close/admission races, and a batch that cannot fit even in a fresh WAL. The
-last case must fail without assigning a ticket or looping through rotations.
+and `sync()`/admission and close/rotation/admission races. Hold a sync open
+after full write CQEs and verify its buffers can be reused while group
+durability metadata stays resident. Hold preallocation open and verify it
+does not hold the producer queue mutex. A batch that cannot fit even in a
+fresh WAL must fail without assigning a ticket or looping through rotations.
 Assert that at least two groups have writes
 outstanding simultaneously under a controlled completion schedule; otherwise
 the implementation may accidentally preserve the current serial barrier.
