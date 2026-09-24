@@ -158,11 +158,16 @@ verified after the coordinator exists.
   made during rotation before reserving a new timestamp or admitting a WAL
   batch. Keep the transaction's MVCC snapshot `ReadGuard` pinned across the
   retry so OCC history cannot be pruned; it is distinct from the active
-  memtable read guard that rotation requires the writer to release. Preserve
-  the write set and restore `committed`/snapshot-guard state on retryable
-  pre-admission errors. Define async cancellation by its admission outcome:
-  cancellation must not mark a possibly admitted or durable commit retryable,
-  and the snapshot guard must remain pinned until the blocking commit resolves.
+  memtable read guard that rotation requires the writer to release. In
+  `commit_async`, do not remove the snapshot guard when constructing the future:
+  only the future that successfully claims the commit may take ownership of it.
+  An unpolled or losing future must leave the guard pinned in the transaction.
+  Preserve the write set and restore `committed`/snapshot-guard state on
+  retryable pre-admission errors, even if the awaiting future was cancelled.
+  Define async cancellation by its admission outcome: cancellation before
+  admission may restore retryability; cancellation must not mark a possibly
+  admitted or durable commit retryable, and the snapshot guard must remain
+  pinned until the blocking commit resolves.
   Apply the same admission cutoff rule to explicit sync and close.
 
 **Exit:** No writer can straddle old and successor WALs. A later poisoned
@@ -192,6 +197,10 @@ opt-in path is usable end to end for v4 WALs.
   verify they release both locks and retry on the successor without deadlock.
   Cover both sync and async transaction commit with a conflict during rotation;
   exercise async cancellation and error restoration while the retry is pending.
+  Drop an unpolled `commit_async` future, then commit a conflicting write and
+  verify the transaction still detects the conflict. Also construct two commit
+  futures, poll the second first, and drop the first; the winning future must
+  retain its snapshot guard through OCC and rotation.
 
 **Exit:** The model tests, nextest suites, process crash tests, and sanitizer
 jobs pass on a host that permits io_uring. `EPERM` in a sandbox is not a
