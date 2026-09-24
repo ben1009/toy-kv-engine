@@ -511,6 +511,8 @@ report the measured bottleneck rather than claiming the regression is fixed.
 
 ## Related documents
 
+- [Implementation plan](../docs/rfc-024-parallel-wal-implementation-plan.md):
+  reviewable implementation slices and validation order.
 - [RFC 012](012-parallel-wal.md): original parallel-WAL proposal and historical sketches.
 - [RFC 023](023-point-in-time-recovery.md): PITR WAL format, commit ordering, and recovery contract.
 - [SpanDB paper](https://www.usenix.org/system/files/fast21-chen-hao.pdf):

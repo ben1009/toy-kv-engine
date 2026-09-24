@@ -401,6 +401,7 @@ requires both p95 and p99 to pass, and allows at most 5% regression per metric.
 
 - [RFC 022 Incremental Backup Implementation Plan](docs/rfc-022-incremental-backup-plan.md)
 - [RFC 023 PITR Implementation Plan](docs/rfc-023-pitr-implementation-plan.md)
+- [RFC 024 Parallel WAL Implementation Plan](docs/rfc-024-parallel-wal-implementation-plan.md)
 
 ### RFCs
 
