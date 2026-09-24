@@ -30,6 +30,7 @@ use kv_engine_wrapper::{
     },
     mem_table::MemTable,
     vlog::ValueSeparationOptions,
+    wal::WalIoMode,
 };
 use rand::prelude::*;
 use rand::rngs::StdRng;
@@ -92,6 +93,31 @@ enum CompactionMode {
     Simple,
     Leveled,
     Tiered,
+}
+
+#[derive(Clone, Copy, Debug, Default, ValueEnum, PartialEq, Eq)]
+enum WalIoModeArg {
+    #[default]
+    Leader,
+    Parallel,
+}
+
+impl From<WalIoModeArg> for WalIoMode {
+    fn from(mode: WalIoModeArg) -> Self {
+        match mode {
+            WalIoModeArg::Leader => Self::Leader,
+            WalIoModeArg::Parallel => Self::Parallel,
+        }
+    }
+}
+
+impl WalIoModeArg {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Leader => "leader",
+            Self::Parallel => "parallel",
+        }
+    }
 }
 
 #[derive(Parser, Debug)]
@@ -158,6 +184,9 @@ struct Args {
     wal: bool,
     #[arg(long, conflicts_with = "wal")]
     no_wal: bool,
+    /// Select the v4 WAL path for wal_concurrent comparisons.
+    #[arg(long, value_enum, default_value = "leader")]
+    wal_io_mode: WalIoModeArg,
     #[arg(long)]
     vlog: bool,
     #[arg(long)]
@@ -233,6 +262,7 @@ struct HarnessConfig {
     parallel_scan_cache_admission: String,
     compaction: CompactionMode,
     wal_override: Option<bool>,
+    wal_io_mode: WalIoModeArg,
     vlog_override: bool,
     profile: bool,
     pitr: bool,
@@ -335,6 +365,7 @@ impl HarnessConfig {
                 .unwrap_or_else(|| "bypass".to_string()),
             compaction: args.compaction,
             wal_override,
+            wal_io_mode: args.wal_io_mode,
             vlog_override: args.vlog,
             profile: args.profile,
             pitr: args.pitr,
@@ -819,6 +850,8 @@ struct MeasurementParams {
     operation_mix_period: Option<usize>,
     scan_limit: Option<usize>,
     latency_sample_every: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    wal_io_mode: Option<&'static str>,
     settle_timeout_secs: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     transaction_hot_set: Option<usize>,
@@ -3009,7 +3042,7 @@ fn run_wal_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
     let workload = "wal_concurrent";
     let path = prepare_path(cfg, workload)?;
     let options = cfg.build_options(true, false);
-    let engine = KvEngine::open(&path, options.clone())?;
+    let engine = KvEngine::open_with_wal_io_mode(&path, options.clone(), cfg.wal_io_mode.into())?;
     if cfg.pitr {
         enable_pitr_for_workload(cfg, &engine, &path)?;
     }
@@ -3024,19 +3057,39 @@ fn run_wal_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
     for t in 0..writer_threads {
         let eng = engine.clone();
         let val = value.clone();
-        handles.push(std::thread::spawn(move || {
+        let sample_every = cfg.latency_sample_every;
+        handles.push(std::thread::spawn(move || -> Result<Vec<u64>> {
             let thread_ops = per_thread + usize::from(t < remainder);
             let start_idx = t * per_thread + remainder.min(t);
+            let mut latency_samples = Vec::new();
             for i in 0..thread_ops {
-                eng.put(format!("key{:08}", start_idx + i).as_bytes(), &val)
-                    .expect("put failed");
+                let sample_start = sample_every
+                    .filter(|every| i.is_multiple_of(*every))
+                    .map(|_| Instant::now());
+                eng.put(format!("key{:08}", start_idx + i).as_bytes(), &val)?;
+                if let Some(start) = sample_start {
+                    latency_samples.push(start.elapsed().as_nanos() as u64);
+                }
             }
+            Ok(latency_samples)
         }));
     }
+    let mut latency_samples = Vec::new();
+    let mut writer_error = None;
     for handle in handles {
-        handle
-            .join()
-            .map_err(|_| anyhow!("writer thread panicked"))?;
+        match handle.join() {
+            Ok(Ok(samples)) => latency_samples.extend(samples),
+            Ok(Err(error)) => {
+                writer_error.get_or_insert(error);
+            }
+            Err(_) => {
+                writer_error.get_or_insert_with(|| anyhow!("writer thread panicked"));
+            }
+        }
+    }
+    if let Some(error) = writer_error {
+        let _ = engine.close();
+        return Err(error);
     }
     let elapsed = start.elapsed();
     if cfg.profile {
@@ -3054,7 +3107,7 @@ fn run_wal_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
     engine.close()?;
     finalize_path(cfg, &path)?;
 
-    Ok(vec![make_measurement(
+    let mut measurement = make_measurement(
         cfg,
         workload,
         "concurrent",
@@ -3064,6 +3117,8 @@ fn run_wal_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
             value_size: Some(cfg.value_size),
             threads: Some(writer_threads),
             seed: Some(cfg.seed),
+            latency_sample_every: cfg.latency_sample_every,
+            wal_io_mode: Some(cfg.wal_io_mode.as_str()),
             ..MeasurementParams::default()
         },
         MeasurementResult {
@@ -3073,7 +3128,12 @@ fn run_wal_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
             ..MeasurementResult::default()
         },
         counters,
-    )])
+    );
+    measurement.record.latency = cfg
+        .latency_sample_every
+        .map(|sample_every| latency_record(sample_every, num_keys as u64, &latency_samples));
+
+    Ok(vec![measurement])
 }
 
 fn run_wal_batch_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
@@ -7739,6 +7799,12 @@ fn validate_run_mode(cfg: &HarnessConfig, bench_arg: Option<&str>) -> Result<()>
         !(cfg.prepare_golden && bench_arg.is_some()),
         "--prepare-golden does not support --bench"
     );
+    if cfg.wal_io_mode == WalIoModeArg::Parallel {
+        anyhow::ensure!(
+            bench_arg == Some("wal_concurrent"),
+            "--wal-io-mode parallel currently requires --bench wal_concurrent"
+        );
+    }
 
     Ok(())
 }
@@ -7762,6 +7828,29 @@ mod tests {
             Args::try_parse_from(["write-perf", "--suite", "steady-state", "--num", "1000"])
                 .expect("parse args"),
         )
+    }
+
+    #[test]
+    fn parallel_wal_mode_is_scoped_to_wal_concurrent() {
+        let args = Args::try_parse_from([
+            "write-perf",
+            "--wal-io-mode",
+            "parallel",
+            "--bench",
+            "wal_concurrent",
+        ])
+        .expect("parse parallel WAL selector");
+        let cfg = HarnessConfig::from_args(args);
+
+        assert_eq!(cfg.wal_io_mode, WalIoModeArg::Parallel);
+        validate_run_mode(&cfg, Some("wal_concurrent")).expect("supported selector scope");
+        let error = validate_run_mode(&cfg, Some("fillseq"))
+            .expect_err("parallel selector must not spill into unrelated workloads");
+        assert!(
+            error
+                .to_string()
+                .contains("requires --bench wal_concurrent")
+        );
     }
 
     #[derive(Debug, Deserialize)]
@@ -8949,6 +9038,7 @@ mod tests {
             parallel_scan_cache_admission: "bypass".to_string(),
             compaction: CompactionMode::None,
             wal_override: None,
+            wal_io_mode: WalIoModeArg::Leader,
             vlog_override: false,
             profile: true,
             clients: 1,
@@ -11354,6 +11444,7 @@ mod tests {
             parallel_scan_cache_admission: "bypass".to_string(),
             compaction: CompactionMode::None,
             wal_override: None,
+            wal_io_mode: WalIoModeArg::Leader,
             vlog_override: false,
             profile: false,
             clients: 1,

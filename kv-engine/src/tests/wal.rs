@@ -10,13 +10,13 @@ use crossbeam_skiplist::SkipMap;
 use sha2::{Digest, Sha256};
 use tempfile::tempdir;
 
-use super::harness::create_wal_or_skip;
+use super::harness::{create_wal_or_skip, is_io_uring_unavailable_error};
 #[cfg(feature = "bench")]
 use crate::mem_table::WriteProfile;
 use crate::{
     lsm_storage::{LsmStorageInner, LsmStorageOptions},
     mem_table::MemTable,
-    wal::Wal,
+    wal::{Wal, WalIoMode},
 };
 
 fn new_skiplist() -> Arc<SkipMap<Bytes, Bytes>> {
@@ -40,6 +40,7 @@ fn test_wal_v5_create_preserves_identity_header() {
         return;
     };
     assert_eq!(wal.format_version(), crate::pitr::WAL_V5_VERSION);
+    assert_eq!(wal.io_mode(), WalIoMode::Leader);
     let limits = crate::pitr::WalV5Limits {
         max_input_entry_count: 16,
         max_batch_data_bytes: 4096,
@@ -71,6 +72,44 @@ fn test_wal_v5_create_preserves_identity_header() {
     assert_eq!(incremental_seal, rebuilt_seal);
     assert_eq!(incremental_bytes, rebuilt_bytes);
     assert!(wal.put_v5_batch(&batch, limits, None).is_err());
+}
+
+#[test]
+fn test_parallel_wal_selector_is_carried_by_v4_create_and_recovery_but_is_dormant() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("candidate-v4.wal");
+    let wal = match Wal::create_with_io_mode(&path, WalIoMode::Parallel) {
+        Ok(wal) => wal,
+        Err(error) if is_io_uring_unavailable_error(&error) => {
+            eprintln!("skipping test (io_uring unavailable): {error}");
+            return;
+        }
+        Err(error) => panic!("failed to create WAL: {error:#}"),
+    };
+
+    assert_eq!(wal.io_mode(), WalIoMode::Parallel);
+    let error = wal
+        .put_batch(&[(b"key".as_slice(), b"value".as_slice())], 1)
+        .expect_err("dormant candidate path must reject before writing");
+    assert!(
+        error
+            .to_string()
+            .contains("parallel WAL path is not implemented yet")
+    );
+    assert_eq!(wal.assigned_ticket_count(), 0);
+    drop(wal);
+
+    let skiplist = new_skiplist();
+    let range_tombstones = crate::range_tombstone::RangeTombstoneSet::new();
+    let (recovered, batch) = Wal::recover_with_range_tombstones_and_mode(
+        &path,
+        &skiplist,
+        &range_tombstones,
+        WalIoMode::Parallel,
+    )
+    .unwrap();
+    assert_eq!(recovered.io_mode(), WalIoMode::Parallel);
+    assert_eq!(batch.max_ts, 0);
 }
 
 #[test]

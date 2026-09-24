@@ -87,6 +87,21 @@ const GROUP_COMMIT_SOLO_SPINS: usize = 4;
 /// a meaningful fdatasync cost.
 const GROUP_COMMIT_MIN_SOLO_BYTES: usize = 512 * 1024;
 
+/// Runtime WAL I/O path selector.
+///
+/// This is exposed only so the benchmark binary can select the path on an
+/// individual engine. `Parallel` is a dormant candidate until its worker is
+/// implemented; v4 writes using it fail before ticket assignment.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum WalIoMode {
+    /// Existing client-leader submission and sync path.
+    #[default]
+    Leader,
+    /// Reserved for the dedicated parallel WAL worker.
+    Parallel,
+}
+
 // ── DirectBuf: page-aligned buffer for O_DIRECT I/O ───────────────────────
 
 /// A page-aligned buffer for O_DIRECT I/O.
@@ -415,6 +430,9 @@ pub struct Wal {
     mvcc_format: bool,
     /// Explicit on-disk WAL format version. Zero denotes the legacy unframed format.
     format_version: u16,
+    /// Effective I/O path. Only ordinary v4 WALs can retain a non-default
+    /// requested mode; legacy and PITR WAL constructors use the leader path.
+    io_mode: WalIoMode,
     /// Whether this WAL uses v3 typed entries (kind prefix).
     /// Only meaningful when `mvcc_format` is true. When false, the WAL uses v2
     /// untyped entries. Preserved from recovery so appended records match the
@@ -615,11 +633,17 @@ impl Wal {
         format_version: u16,
         file_len: u64,
         path: &Path,
+        requested_io_mode: WalIoMode,
     ) -> Result<Self> {
         // Re-open a buffered handle for recovery reads and legacy put().
         let buf_file = File::options().read(true).append(true).open(path)?;
 
         if mvcc_format {
+            let io_mode = if format_version == WAL_FORMAT_VERSION_V4 {
+                requested_io_mode
+            } else {
+                WalIoMode::Leader
+            };
             // Pad the file to a 4KB boundary if needed. Pre-v4 WALs may have
             // non-aligned file lengths; O_DIRECT requires page-aligned offsets.
             let aligned_len = DirectBuf::align_up(file_len as usize) as u64;
@@ -643,6 +667,7 @@ impl Wal {
                 buffered_file: Arc::new(Mutex::new(BufWriter::new(buf_file))),
                 mvcc_format,
                 format_version,
+                io_mode,
                 is_v3,
                 direct_file: Some(direct_file),
                 ring: Some(Mutex::new(ring)),
@@ -671,6 +696,7 @@ impl Wal {
                 buffered_file: Arc::new(Mutex::new(BufWriter::new(buf_file))),
                 mvcc_format,
                 format_version: 0,
+                io_mode: WalIoMode::Leader,
                 is_v3,
                 direct_file: None,
                 ring: None,
@@ -955,6 +981,10 @@ impl Wal {
     }
 
     pub fn create(path: impl AsRef<Path>) -> Result<Self> {
+        Self::create_with_io_mode(path, WalIoMode::Leader)
+    }
+
+    pub(crate) fn create_with_io_mode(path: impl AsRef<Path>, io_mode: WalIoMode) -> Result<Self> {
         let f = File::create_new(path.as_ref()).context("failed to create WAL")?;
         let mut w = BufWriter::new(f);
         // Write MVCC WAL header (big-endian to match Buf::get_u32/get_u16).
@@ -989,6 +1019,7 @@ impl Wal {
             buffered_file: Arc::new(Mutex::new(BufWriter::new(buf_file))),
             mvcc_format: true,
             format_version: WAL_FORMAT_VERSION_V4,
+            io_mode,
             is_v3: true,
             direct_file: Some(direct_file),
             ring: Some(Mutex::new(ring)),
@@ -1029,6 +1060,7 @@ impl Wal {
             buffered_file: Arc::new(Mutex::new(BufWriter::new(buf_file))),
             mvcc_format: true,
             format_version: header.wal_format_version,
+            io_mode: WalIoMode::Leader,
             is_v3: true,
             direct_file: Some(direct_file),
             ring: Some(Mutex::new(ring)),
@@ -1064,6 +1096,16 @@ impl Wal {
 
     pub(crate) fn is_v5(&self) -> bool {
         crate::pitr::is_v5_family(self.format_version)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn io_mode(&self) -> WalIoMode {
+        self.io_mode
+    }
+
+    #[cfg(test)]
+    pub(crate) fn assigned_ticket_count(&self) -> u64 {
+        self.next_ticket.load(Ordering::Acquire)
     }
 }
 
@@ -1915,6 +1957,7 @@ impl Wal {
                 wal_version,
                 file_len_after,
                 path.as_ref(),
+                WalIoMode::Leader,
             )?,
             max_ts,
         ))
@@ -1929,6 +1972,20 @@ impl Wal {
         path: impl AsRef<Path>,
         skiplist: &SkipMap<Bytes, Bytes>,
         range_tombstones: &crate::range_tombstone::RangeTombstoneSet,
+    ) -> Result<(Self, RecoveredWalBatch)> {
+        Self::recover_with_range_tombstones_and_mode(
+            path,
+            skiplist,
+            range_tombstones,
+            WalIoMode::Leader,
+        )
+    }
+
+    pub(crate) fn recover_with_range_tombstones_and_mode(
+        path: impl AsRef<Path>,
+        skiplist: &SkipMap<Bytes, Bytes>,
+        range_tombstones: &crate::range_tombstone::RangeTombstoneSet,
+        requested_io_mode: WalIoMode,
     ) -> Result<(Self, RecoveredWalBatch)> {
         let (f, mut data, mvcc_format, is_v3, wal_version, file_len) =
             Self::open_and_detect(&path)?;
@@ -1987,6 +2044,7 @@ impl Wal {
                 wal_version,
                 file_len_after,
                 path.as_ref(),
+                requested_io_mode,
             )?,
             RecoveredWalBatch {
                 points: handler.points,
@@ -2089,6 +2147,11 @@ impl Wal {
         commit_ts: u64,
         profile: Option<&crate::mem_table::WriteProfile>,
     ) -> Result<u64> {
+        anyhow::ensure!(
+            self.io_mode == WalIoMode::Leader,
+            "parallel WAL path is not implemented yet"
+        );
+
         for entry in data {
             let key = entry.key();
             let value = entry.value();
@@ -2175,6 +2238,10 @@ impl Wal {
         tombstones: &[(&[u8], &[u8])],
         commit_ts: u64,
     ) -> Result<u64> {
+        anyhow::ensure!(
+            self.io_mode == WalIoMode::Leader,
+            "parallel WAL path is not implemented yet"
+        );
         anyhow::ensure!(
             self.mvcc_format,
             "range tombstone batches require MVCC WAL format"
@@ -2404,6 +2471,10 @@ impl Wal {
         }
         #[cfg(feature = "bench")]
         if let Some(profile) = profile {
+            profile.record_wal_inflight_groups(1);
+        }
+        #[cfg(feature = "bench")]
+        if let Some(profile) = profile {
             profile.record_wal_leader_prepare_ns(nanos_now().saturating_sub(leader_entered));
         }
         let result = self.submit_sqes_and_poll(ticketed_bufs, profile);
@@ -2587,7 +2658,14 @@ impl Wal {
             .iter()
             .map(|b| DirectBuf::align_up(b.buf.len()) as u64)
             .sum();
-        self.maybe_preallocate(total_size)?;
+        #[cfg(feature = "bench")]
+        let preallocation_start = Instant::now();
+        let preallocation_result = self.maybe_preallocate(total_size);
+        #[cfg(feature = "bench")]
+        if let Some(profile) = profile {
+            profile.record_wal_preallocation_ns(preallocation_start.elapsed().as_nanos() as u64);
+        }
+        preallocation_result?;
 
         // Allocate file offsets atomically using aligned sizes.
         // NOTE: On write failure, the offset space is consumed but no valid data
@@ -2619,6 +2697,10 @@ impl Wal {
 
         for &(chunk_start, chunk_end) in &chunk_ranges {
             let chunk_len = chunk_end - chunk_start;
+            #[cfg(feature = "bench")]
+            if let Some(profile) = profile {
+                profile.record_wal_outstanding_write_sqes(chunk_len as u64);
+            }
 
             // Submit write SQEs, wait for completion, and poll CQEs under a
             // single lock hold. This prevents close() from draining CQEs in
@@ -2757,6 +2839,10 @@ impl Wal {
             let mut fdatasync_err = None;
             #[cfg(feature = "bench")]
             let fdatasync_start = Instant::now();
+            #[cfg(feature = "bench")]
+            if let Some(profile) = profile {
+                profile.record_wal_sync(1);
+            }
             loop {
                 let ret = unsafe { libc::fdatasync(fd) };
                 if ret == 0 {
