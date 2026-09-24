@@ -4,12 +4,12 @@
 use anyhow::{Result, ensure};
 use rand::{RngCore, rngs::OsRng};
 
-use crate::pitr_manifest::{
+use crate::pitr::manifest::{
     PersistedPitrConfig, PitrManifestRecord, PitrMode, PitrState, replay_pitr_records,
 };
 use crate::{
-    mvcc::LsmMvccInner, pitr_backpressure::SealBoundaryCoordinator,
-    pitr_segment::PitrSegmentManager,
+    mvcc::LsmMvccInner, pitr::backpressure::SealBoundaryCoordinator,
+    pitr::segment::PitrSegmentManager,
 };
 
 const MAX_IDENTITY_GENERATION_ATTEMPTS: usize = 32;
@@ -55,11 +55,12 @@ impl PitrEnableLifecycle {
         request: PitrEnableRequest,
         active_segment_id: u64,
         source_spool_limit: u64,
-        accounting: std::sync::Arc<crate::pitr_backpressure::PitrSpoolAccountant>,
+        accounting: std::sync::Arc<crate::pitr::backpressure::PitrSpoolAccountant>,
         sequencer: std::sync::Arc<LsmMvccInner>,
     ) -> Result<Self> {
         let mut coordinator = PitrEnableCoordinator::default();
         coordinator.begin_enable(request)?;
+
         Ok(Self {
             coordinator,
             barrier: SealBoundaryCoordinator::new(accounting),
@@ -116,7 +117,7 @@ impl PitrEnableLifecycle {
         self.coordinator.records()
     }
 
-    pub(crate) fn barrier_state(&self) -> crate::pitr_backpressure::SealBoundaryState {
+    pub(crate) fn barrier_state(&self) -> crate::pitr::backpressure::SealBoundaryState {
         self.barrier.state()
     }
 }
@@ -135,6 +136,7 @@ impl PitrEnableCoordinator {
             "PITR rotation boundary does not match active segment"
         );
         barrier.stop_admission_for_rotation(boundary_segment_id, sequencer)?;
+
         if let Err(error) = (|| {
             segments.begin_sealing(logical_length, successor_spool_bytes)?;
             segments.mark_sealed(boundary_segment_id)
@@ -155,6 +157,7 @@ impl PitrEnableCoordinator {
         let successor_id = segments.install_successor_after_wal(install_wal)?;
         barrier.publish_sealed_rotation(boundary_segment_id)?;
         barrier.release_rotation_admission(sequencer)?;
+
         Ok(successor_id)
     }
 
@@ -214,7 +217,7 @@ impl PitrEnableCoordinator {
         } else {
             ensure!(
                 segments.segment(boundary_segment_id).is_some_and(
-                    |segment| segment.state == crate::pitr_segment::SegmentState::Sealed
+                    |segment| segment.state == crate::pitr::segment::SegmentState::Sealed
                 ),
                 "PITR enable retry has no sealed boundary segment"
             );
@@ -233,14 +236,16 @@ impl PitrEnableCoordinator {
         self.complete_enable(active_segment_id)?;
         barrier.publish_sealed_rotation(boundary_segment_id)?;
         barrier.release_rotation_admission(sequencer)?;
+
         Ok(active_segment_id)
     }
 
     pub(crate) fn request_from_public(
-        options: &crate::pitr_api::PitrOptions,
+        options: &crate::pitr::api::PitrOptions,
         repository_id: [u8; 16],
     ) -> Result<PitrEnableRequest> {
         options.validate()?;
+
         Ok(PitrEnableRequest {
             repository_id,
             config: options.persisted_config()?,
@@ -249,6 +254,7 @@ impl PitrEnableCoordinator {
 
     pub(crate) fn recover(records: Vec<PitrManifestRecord>) -> Result<Self> {
         let state = replay_pitr_records(records.clone())?;
+
         Ok(Self { state, records })
     }
 
@@ -305,6 +311,7 @@ impl PitrEnableCoordinator {
         };
         let archive_epoch_id = next_identity(&mut fill_identity, self.state.archive_epoch_id)?;
         self.begin_enable_with_identities(request, timeline_id, archive_epoch_id)?;
+
         Ok(BeginEnableOutcome::Started {
             timeline_id,
             archive_epoch_id,
@@ -341,6 +348,7 @@ impl PitrEnableCoordinator {
         records.push(record);
         self.state = replay_pitr_records(records.clone())?;
         self.records = records;
+
         Ok(())
     }
 
@@ -352,6 +360,7 @@ impl PitrEnableCoordinator {
         archive_epoch_id: [u8; 16],
     ) -> Result<BeginEnableOutcome> {
         self.begin_enable_with_identities(request, timeline_id, archive_epoch_id)?;
+
         Ok(BeginEnableOutcome::Started {
             timeline_id,
             archive_epoch_id,
@@ -368,6 +377,7 @@ impl PitrEnableCoordinator {
         records.push(record.clone());
         self.state = replay_pitr_records(records.clone())?;
         self.records = records;
+
         Ok(())
     }
 
@@ -381,6 +391,7 @@ impl PitrEnableCoordinator {
             "PITR enable completion has no intent"
         );
         install_successor()?;
+
         self.complete_enable(active_segment_id)
     }
 
@@ -429,6 +440,7 @@ impl EnableConfigValidation for PersistedPitrConfig {
             self.max_source_spool_bytes >= self.max_unarchived_bytes,
             "PITR source spool limit is below unarchived limit"
         );
+
         Ok(())
     }
 }
@@ -436,7 +448,7 @@ impl EnableConfigValidation for PersistedPitrConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pitr_manifest::{CoverageBreakReason, PersistedChainAnchor, PersistedRecoveryGap};
+    use crate::pitr::manifest::{CoverageBreakReason, PersistedChainAnchor, PersistedRecoveryGap};
     use std::{num::NonZeroU64, path::PathBuf, time::Duration};
 
     fn request() -> PitrEnableRequest {
@@ -453,18 +465,18 @@ mod tests {
 
     #[test]
     fn public_options_bind_to_enable_request_without_runtime_persistence() {
-        let options = crate::pitr_api::PitrOptions {
+        let options = crate::pitr::api::PitrOptions {
             repository: PathBuf::from("repo"),
-            config: crate::pitr_api::PersistedPitrConfig {
+            config: crate::pitr::api::PersistedPitrConfig {
                 archive_interval: Duration::from_secs(1),
                 max_segment_bytes: 8192,
                 max_unarchived_bytes: 16384,
                 max_source_spool_bytes: 32768,
             },
-            runtime: crate::pitr_api::PitrRuntimeOptions {
+            runtime: crate::pitr::api::PitrRuntimeOptions {
                 archive_io_bytes_per_second: NonZeroU64::new(100),
                 archive_burst_bytes: NonZeroU64::new(200).unwrap(),
-                archive_io_priority: crate::pitr_api::ArchiveIoPriority::Background,
+                archive_io_priority: crate::pitr::api::ArchiveIoPriority::Background,
             },
         };
         let request = PitrEnableCoordinator::request_from_public(&options, [1; 16]).unwrap();
@@ -511,7 +523,8 @@ mod tests {
     #[test]
     fn rotation_composition_keeps_barrier_stopped_for_wal_retry() {
         let accounting = std::sync::Arc::new(
-            crate::pitr_backpressure::PitrSpoolAccountant::new(64 * 1024, 64 * 1024, 4096).unwrap(),
+            crate::pitr::backpressure::PitrSpoolAccountant::new(64 * 1024, 64 * 1024, 4096)
+                .unwrap(),
         );
         let mut barrier = SealBoundaryCoordinator::new(accounting);
         let sequencer = LsmMvccInner::new(0);
@@ -539,7 +552,7 @@ mod tests {
         );
         assert_eq!(
             barrier.state(),
-            crate::pitr_backpressure::SealBoundaryState::AdmissionStopped
+            crate::pitr::backpressure::SealBoundaryState::AdmissionStopped
         );
         assert_eq!(
             PitrEnableCoordinator::finish_rotation(
@@ -557,7 +570,8 @@ mod tests {
     #[test]
     fn enable_completion_follows_successful_rotation() {
         let accounting = std::sync::Arc::new(
-            crate::pitr_backpressure::PitrSpoolAccountant::new(64 * 1024, 64 * 1024, 4096).unwrap(),
+            crate::pitr::backpressure::PitrSpoolAccountant::new(64 * 1024, 64 * 1024, 4096)
+                .unwrap(),
         );
         let mut barrier = SealBoundaryCoordinator::new(accounting);
         let sequencer = LsmMvccInner::new(0);
@@ -584,7 +598,8 @@ mod tests {
     #[test]
     fn enable_rotation_failure_keeps_intent_and_barrier_retryable() {
         let accounting = std::sync::Arc::new(
-            crate::pitr_backpressure::PitrSpoolAccountant::new(64 * 1024, 64 * 1024, 4096).unwrap(),
+            crate::pitr::backpressure::PitrSpoolAccountant::new(64 * 1024, 64 * 1024, 4096)
+                .unwrap(),
         );
         let mut barrier = SealBoundaryCoordinator::new(accounting);
         let sequencer = LsmMvccInner::new(0);
@@ -607,7 +622,7 @@ mod tests {
         assert_eq!(coordinator.state().mode, PitrMode::Enabling);
         assert_eq!(
             barrier.state(),
-            crate::pitr_backpressure::SealBoundaryState::AdmissionStopped
+            crate::pitr::backpressure::SealBoundaryState::AdmissionStopped
         );
         assert_eq!(segments.pending_successor_id().unwrap(), 2);
         assert_eq!(
@@ -630,7 +645,8 @@ mod tests {
     #[test]
     fn enable_persistence_failure_reopens_admission_before_enabled_state() {
         let accounting = std::sync::Arc::new(
-            crate::pitr_backpressure::PitrSpoolAccountant::new(64 * 1024, 64 * 1024, 4096).unwrap(),
+            crate::pitr::backpressure::PitrSpoolAccountant::new(64 * 1024, 64 * 1024, 4096)
+                .unwrap(),
         );
         let mut barrier = SealBoundaryCoordinator::new(accounting);
         let sequencer = LsmMvccInner::new(0);
@@ -653,7 +669,7 @@ mod tests {
         );
         assert_eq!(
             barrier.state(),
-            crate::pitr_backpressure::SealBoundaryState::AdmissionOpen
+            crate::pitr::backpressure::SealBoundaryState::AdmissionOpen
         );
         assert_eq!(coordinator.state().mode, PitrMode::Enabling);
     }
@@ -661,7 +677,8 @@ mod tests {
     #[test]
     fn lifecycle_object_completes_enable_rotation() {
         let accounting = std::sync::Arc::new(
-            crate::pitr_backpressure::PitrSpoolAccountant::new(64 * 1024, 64 * 1024, 4096).unwrap(),
+            crate::pitr::backpressure::PitrSpoolAccountant::new(64 * 1024, 64 * 1024, 4096)
+                .unwrap(),
         );
         let sequencer = std::sync::Arc::new(LsmMvccInner::new(0));
         let mut lifecycle =
@@ -730,6 +747,7 @@ mod tests {
             coordinator
                 .begin_enable_with_rng(request(), |output| {
                     *output = [0; 16];
+
                     Ok(())
                 })
                 .is_err()
@@ -751,6 +769,7 @@ mod tests {
             coordinator
                 .begin_enable_with_rng(request(), |output| {
                     *output = [3; 16];
+
                     Ok(())
                 })
                 .is_err()
@@ -792,6 +811,7 @@ mod tests {
         let outcome = coordinator
             .begin_enable_with_rng(request(), |output| {
                 *output = identities.next().unwrap();
+
                 Ok(())
             })
             .unwrap();
@@ -810,6 +830,7 @@ mod tests {
         let outcome = coordinator
             .begin_enable_with_rng(request(), |output| {
                 *output = identities.next().unwrap();
+
                 Ok(())
             })
             .unwrap();

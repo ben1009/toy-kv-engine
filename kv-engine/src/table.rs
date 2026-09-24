@@ -193,6 +193,7 @@ impl BlockMeta {
         );
 
         let mut ret = Vec::with_capacity(num_of_elements);
+
         for _ in 0..num_of_elements {
             anyhow::ensure!(
                 datas.len() >= 2,
@@ -295,6 +296,7 @@ impl FileObject {
     pub fn create(path: &Path, data: Vec<u8>) -> Result<Self> {
         std::fs::write(path, &data)?;
         File::open(path)?.sync_all()?;
+
         Ok(FileObject(
             Some(File::options().read(true).write(false).open(path)?),
             data.len() as u64,
@@ -694,6 +696,7 @@ impl SsTable {
                 Some(block_meta[block_meta.len() - 1].last_key.clone()),
             )
         };
+
         Ok(Self {
             file,
             block_meta,
@@ -770,6 +773,7 @@ impl SsTable {
         let filter_bytes_len = section_size_usize - filter_bytes_start;
         let mut filters = Vec::with_capacity(filter_count);
         let mut prev_prefix_len = 0usize;
+
         let mut prev_end = 0usize;
         for i in 0..filter_count {
             let entry_start = 2 + i * 10;
@@ -925,6 +929,7 @@ impl SsTable {
         if hi <= lo {
             return;
         }
+
         let fd = self.file.as_raw_fd();
         unsafe {
             libc::posix_fadvise(
@@ -1132,6 +1137,7 @@ impl SsTable {
         let meta = &self.block_meta[hinted];
         let fk = meta.first_key.encoded_user_key();
         let lk = meta.last_key.encoded_user_key();
+
         let user_key = crate::key::encoded_user_key_prefix(key).unwrap_or(key);
         if user_key < fk || user_key > lk {
             return None;
@@ -1179,6 +1185,7 @@ impl SsTable {
     ) -> Result<crate::block::BlockIterator> {
         let block =
             crate::profile_scope!("sst.read_block_cached", self.read_block_cached(blk_idx))?;
+
         Ok(crate::profile_scope!(
             "block.seek_key",
             crate::block::BlockIterator::create_and_seek_to_key(block, KeySlice::from_slice(key))
@@ -1436,6 +1443,7 @@ impl SsTable {
         let Some(filter) = prefix_blooms.best_filter_for(prefix.len()) else {
             return true;
         };
+
         debug_assert!(prefix.len() >= filter.prefix_len);
         filter
             .bloom

@@ -61,6 +61,8 @@ The CLI supports basic manual operations such as `fill`, `get`, `del`, `scan`,
 
 - Write-ahead logging with ticket-based group commit.
 - `io_uring` + `O_DIRECT` WAL write path for durable writes.
+- Point-in-time recovery from archived WAL segments, with timeline-aware
+  restore support.
 - Batched writes through `write_batch`, including optimized same-batch publish
   and WAL grouping.
 - Manifest recovery for SST and value-log metadata.
@@ -242,11 +244,16 @@ db.close_async().await?;
   watermarks, snapshots, and transactions.
 - `kv-engine/src/checkpoint.rs` - checkpoint/backup creation, file pinning,
   target locking, and atomic publication helpers.
+- `kv-engine/src/pitr/` - PITR archive, manifest, timeline, and restore modules;
+  see [RFC 023](rfcs/023-point-in-time-recovery.md).
 - `kv-engine/src/vlog/` - value-log writer, reader, GC, and `.vidx` index.
 - `kv-engine/src/cache.rs` - block cache and admission policy.
 - `kv-engine/src/bin/` - CLI, write benchmark, async scan benchmark,
   compaction simulator, and chaos child process.
-- `kv-engine/tests/` - process-level chaos and cross-process persistence tests.
+- `kv-engine/src/tests/` - in-crate coverage for storage, MVCC, compaction,
+  checkpointing, and vLog behavior.
+- `kv-engine/integration_tests/` - process-level chaos and cross-process
+  persistence tests, declared as explicit Cargo targets.
 - `kv-engine/benches/` - Criterion benchmarks for vLog, WAL, memtable, and
   range deletion paths.
 - `rfcs/` - design notes for major features.
@@ -380,34 +387,46 @@ requires both p95 and p99 to pass, and allows at most 5% regression per metric.
 
 - [ToyKV vs Fjall Benchmark Report](docs/bench-report-crud-bench-fjall.md)
 - [ToyKV vs RocksDB Benchmark Report](docs/bench-report-crud-bench-rocksdb.md)
+- [Incremental Backup Benchmarks](docs/backup-benchmarks.md)
 - [vLog Benchmark Report](docs/bench-report-vlog.md)
 - [DeleteRange Benchmark Report](docs/bench-report-deleterange.md)
+- [PITR Performance Baseline](docs/pitr-performance.md)
 - [io_uring Benchmark Notes](docs/io-uring-bench.md)
 - [Performance Profiling Report](docs/perf-profile.md)
 - [Async Scan Findings](docs/async-scan-findings.md)
 - [Parallel Scan Findings](docs/parallel-scan-findings.md)
 - [Async Phase 3 Measurement Plan](docs/async-phase3-measurement.md)
 
+### Implementation Records
+
+- [RFC 022 Incremental Backup Implementation Plan](docs/rfc-022-incremental-backup-plan.md)
+- [RFC 023 PITR Implementation Plan](docs/rfc-023-pitr-implementation-plan.md)
+
 ### RFCs
 
 - [001: Key-Value Separation](rfcs/001-key-value-separation.md)
-- [004: Cache Backfill](rfcs/004-cache-backfill.md)
-- [005: MVCC](rfcs/005-mvcc.md)
+- [002: io_uring for Disk Writes](rfcs/002-io-uring-disk-writes.md)
+- [003: Thread-per-Core with compio](rfcs/003-thread-per-core-compio.md)
+- [004: Cache Backfill on Flush and Compaction](rfcs/004-cache-backfill.md)
+- [005: Multi-Version Concurrency Control](rfcs/005-mvcc.md)
 - [006: Prefix Search](rfcs/006-prefix-search.md)
-- [007: Prefix Bloom Filter](rfcs/007-prefix-bloom-filter.md)
-- [009: Compaction Filter](rfcs/009-compaction-filter.md)
+- [007: Prefix Bloom Filters](rfcs/007-prefix-bloom-filter.md)
+- [008: Block and Value Prefetching](rfcs/008-prefetching.md)
+- [009: Compaction Filters](rfcs/009-compaction-filter.md)
 - [010: Range Tombstones](rfcs/010-delete-range.md)
-- [011: db_bench Harness](rfcs/011-db-bench-harness.md)
-- [012: Parallel WAL](rfcs/012-parallel-wal.md)
+- [011: db_bench-Style Benchmark Harness](rfcs/011-db-bench-harness.md)
+- [012: Parallel WAL with io_uring and O_DIRECT](rfcs/012-parallel-wal.md)
 - [013: Chaos Testing](rfcs/013-chaos-testing.md)
-- [014: Async Operations](rfcs/014-async-operations.md)
+- [014: Async Operations End-to-End](rfcs/014-async-operations.md)
 - [015: Parallel Scan](rfcs/015-parallel-scan.md)
-- [016: TTL](rfcs/016-ttl.md)
+- [016: Native Time-To-Live (TTL) Support](rfcs/016-ttl.md)
 - [017: MVCC Garbage Collection](rfcs/017-mvcc-garbage-collection.md)
 - [018: Steady-State Benchmark Suite](rfcs/018-steady-state-benchmark-suite.md)
 - [019: Checkpoint and Backup API](rfcs/019-checkpoint-backup.md)
-- [021: Public CatalogSnapshot API](rfcs/021-public-snapshot-api.md)
+- [020: Merge Operator](rfcs/020-merge-operator.md)
+- [021: Public Snapshot API](rfcs/021-public-snapshot-api.md)
 - [022: Incremental Backup and Restore](rfcs/022-incremental-backup.md)
+- [023: Point-in-Time Recovery](rfcs/023-point-in-time-recovery.md)
 
 ## License
 

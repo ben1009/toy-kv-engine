@@ -6,16 +6,20 @@ the repository root examples, tests, benchmarks, and RFCs.
 ## What Lives Here
 
 - `src/lsm_storage.rs` holds the main engine API and async wrappers.
+- `src/pitr/` contains point-in-time recovery, archive, and restore modules.
 - `src/checkpoint.rs` implements sync/async checkpoint creation, target locks,
   stale-temp validation, and atomic no-replace publication.
+- `../rfcs/023-point-in-time-recovery.md` documents the PITR design.
 - `../rfcs/022-incremental-backup.md` documents the implemented incremental
   backup repository built on immutable SST/vLog object identity and checkpoint
   capture.
 - `src/wal.rs` implements the WAL, including the io_uring durable path.
 - `src/vlog/` contains value-separation storage, indexing, and GC.
-- `src/tests/` contains in-crate integration coverage for MVCC, compaction,
+- `src/tests/` contains in-crate test coverage for MVCC, compaction,
   TTL, scans, and cache behavior.
-- `tests/` contains process-level chaos and cross-process persistence tests.
+- `integration_tests/` contains Cargo integration targets for process-level
+  chaos and cross-process persistence tests. The targets are declared explicitly
+  in `Cargo.toml`.
 - `benches/` contains Criterion benchmarks for vLog, WAL, DeleteRange, and
   memtable hot paths.
 

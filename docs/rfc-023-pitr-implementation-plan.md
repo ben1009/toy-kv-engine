@@ -1,20 +1,29 @@
 # RFC 023: Point-in-Time Recovery Implementation Plan
 
 **RFC:** [RFC 023: Point-in-Time Recovery](../rfcs/023-point-in-time-recovery.md)  
-**Status:** Implementation and validation
-**Last updated:** 2026-09-16
+**Status:** Complete (implementation and validation)
+**Last updated:** 2026-09-24
+
+> This document preserves the implementation sequence and progress history.
+> All planned implementation and validation slices are complete. Current
+> behavior is specified in RFC 023. Remote archives, encryption, compression,
+> standby tailing, export/import, and timeline continuation remain follow-ups.
 
 ## Purpose
 
-This document turns RFC 023 into reviewable implementation slices. The order is
-intentional: commit ordering and the WAL format become independently correct
-before PITR lifecycle state, repository publication, backup integration, or the
-public API depends on them.
+This document records the reviewable implementation slices used to deliver
+RFC 023. Commit ordering and the WAL format were made independently correct
+before PITR lifecycle state, repository publication, backup integration, and
+the public API depended on them.
 
-No public PITR API ships until the synchronous lifecycle, status, verification,
-retention, restore compatibility, and publication outcomes are complete.
+The release gate required the synchronous lifecycle, status, verification,
+retention, restore compatibility, and publication outcomes to be complete
+before the public PITR API shipped; that gate is now closed.
 
-## Current-Code Constraints
+## Pre-Implementation Constraints
+
+These constraints guided the design before implementation and are retained here
+as historical context.
 
 1. MVCC commit timestamps are currently calculated as `current_ts + 1` while a
    short write lock is held, but `current_ts` advances only after WAL durability
@@ -390,9 +399,9 @@ and reclaims unreferenced backup and WAL objects.
 
 The archive limiter now charges source WAL/seal reads and repository writes in
 bounded burst-sized chunks, so a runtime update takes effect at the next chunk
-boundary. The remaining work is the slice 11/12 completion gate: audit typed
-ambiguous publication outcomes and cancellation boundaries, add missing
-process-kill and resource-failure coverage, run the required PITR performance
+boundary. At this checkpoint, the remaining work was the slice 11/12 completion
+gate: audit typed ambiguous publication outcomes and cancellation boundaries,
+add process-kill and resource-failure coverage, run the required PITR performance
 matrix, and perform an independent requirement-by-requirement review before
 declaring RFC 023 complete.
 
@@ -439,9 +448,12 @@ The final audit confirms all six implementation blocks are live, public
 contracts are wired, RFC 022 backup integration is paired, Linux validation and
 all-targets checks are green, and the required performance matrix is recorded.
 
-## Immediate Next Slice
+## Completion Record (2026-09-24)
 
-Complete the chaos, compatibility, cancellation, and performance gate. Treat
-every publication boundary as unproven until its failpoint/reopen test passes,
-then run the full repository gate and the 1/4/8/16/32-writer PITR benchmark
-matrix for disabled and enabled/caught-up modes.
+The remaining chaos, compatibility, cancellation, and performance gates closed
+after the 2026-09-16 checkpoint. Process-kill and resource-failure coverage,
+the independent requirements audit, and the 1/4/8/16/32-writer PITR matrix are
+complete; results are recorded in [the PITR performance baseline](pitr-performance.md).
+The full `cargo make check` gate passed with 1,324 tests on 2026-09-24. No
+implementation slices remain open in this plan; RFC 023's explicitly listed
+Phase 3 features remain separate follow-up work.

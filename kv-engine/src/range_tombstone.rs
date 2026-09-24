@@ -99,6 +99,7 @@ impl RangeTombstoneSet {
             ts: u64::MAX,
             ordinal: u32::MAX,
         };
+
         for entry in self.raw.range(..=bound_key) {
             let key = entry.key();
 
@@ -135,6 +136,7 @@ impl RangeTombstoneSet {
             ts: 0,
             ordinal: 0,
         };
+
         for entry in self.raw.range(..bound_key) {
             let key = entry.key();
             if key.ts > read_ts {
@@ -168,6 +170,7 @@ impl RangeTombstoneSet {
             ts: 0,
             ordinal: 0,
         };
+
         Box::new(self.raw.range(..bound_key).filter_map(move |entry| {
             let key = entry.key();
             let tomb_end = entry.value();
@@ -370,6 +373,7 @@ impl RangeTombstoneFragment {
             cursor.remaining()
         );
         let mut fragments = Vec::with_capacity(record_count);
+
         for _ in 0..record_count {
             anyhow::ensure!(
                 cursor.remaining() >= 8,
@@ -432,6 +436,7 @@ pub fn find_newest_covering_ts(
     }
     // Binary search within covering_ts for the newest ts <= read_ts.
     let ts_idx = frag.covering_ts.partition_point(|&ts| ts <= read_ts);
+
     if ts_idx > 0 {
         Some(frag.covering_ts[ts_idx - 1])
     } else {
@@ -671,6 +676,7 @@ pub fn truncate_fragments(
     let end_bytes = Bytes::copy_from_slice(range_end_exclusive);
 
     let mut result = Vec::new();
+
     for frag in &fragments[start_idx..] {
         // Fragments are sorted, so once frag.start >= end_bytes we're done.
         if frag.start.as_ref() >= range_end_exclusive {
@@ -709,6 +715,7 @@ pub fn gc_range_fragments(
         frag.covering_ts.retain(|&ts| ts > watermark);
         !frag.covering_ts.is_empty()
     });
+
     fragments
 }
 
@@ -840,6 +847,7 @@ impl RangeTombstoneIterator {
 
         // user_key is within [frag.start, frag.end). Check covering_ts.
         let ts_idx = frag.covering_ts.partition_point(|&ts| ts <= read_ts);
+
         if ts_idx > 0 {
             Some(frag.covering_ts[ts_idx - 1])
         } else {

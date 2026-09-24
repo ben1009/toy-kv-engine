@@ -92,6 +92,7 @@ impl PitrSegmentManager {
         };
         let mut segments = BTreeMap::new();
         segments.insert(active_segment_id, active);
+
         Ok(Self {
             segments,
             active_segment_id,
@@ -112,6 +113,7 @@ impl PitrSegmentManager {
             return false;
         }
         self.pending_rotation = Some(reason);
+
         true
     }
 
@@ -171,6 +173,7 @@ impl PitrSegmentManager {
             successor_segment_id: None,
         });
         self.source_spool_reserved = reserved;
+
         Ok(successor_id)
     }
 
@@ -310,6 +313,7 @@ impl PitrSegmentManager {
         );
         segment.state = SegmentState::Sealed;
         segment.archive_pin = true;
+
         Ok(())
     }
 
@@ -337,6 +341,7 @@ impl PitrSegmentManager {
         );
         self.active_segment_id = successor.segment_id;
         self.next_segment_id = next_segment_id;
+
         Ok(self.active_segment_id)
     }
 
@@ -349,6 +354,7 @@ impl PitrSegmentManager {
             .ok_or_else(|| anyhow::anyhow!("PITR successor is not pending"))?
             .segment_id;
         install_wal(successor_id)?;
+
         self.install_successor()
     }
 
@@ -362,6 +368,7 @@ impl PitrSegmentManager {
             "PITR archive is out of order"
         );
         segment.state = SegmentState::Archived;
+
         Ok(())
     }
 
@@ -391,6 +398,7 @@ impl PitrSegmentManager {
             "cannot reclaim while successor installation is pending"
         );
         segment.state = SegmentState::Reclaimable;
+
         Ok(())
     }
 
@@ -405,6 +413,7 @@ impl PitrSegmentManager {
         );
         ensure!(segment.archive_pin, "PITR archive pin is not held");
         segment.archive_pin = false;
+
         Ok(())
     }
 
@@ -417,6 +426,7 @@ impl PitrSegmentManager {
             .source_pins
             .checked_add(1)
             .ok_or_else(|| anyhow::anyhow!("PITR source pin count overflow"))?;
+
         Ok(())
     }
 
@@ -427,6 +437,7 @@ impl PitrSegmentManager {
             .ok_or_else(|| anyhow::anyhow!("unknown PITR segment"))?;
         ensure!(segment.source_pins > 0, "PITR source pin underflow");
         segment.source_pins -= 1;
+
         Ok(())
     }
 
@@ -447,6 +458,7 @@ impl PitrSegmentManager {
             .get_mut(&segment_id)
             .expect("segment was present");
         segment.state = SegmentState::Reclaiming;
+
         Ok(*segment)
     }
 
@@ -489,6 +501,7 @@ impl PitrSegmentManager {
             .remove(&segment_id)
             .expect("segment was present");
         self.source_spool_reserved = new_reserved;
+
         Ok(removed)
     }
 
@@ -534,6 +547,7 @@ pub(crate) fn install_v5_wal_header(
     header: crate::pitr::WalV5Header,
 ) -> Result<()> {
     let bytes = crate::pitr::encode_v5_file_header(header)?;
+
     install_pitr_file_no_replace(path, &bytes)
 }
 
@@ -597,9 +611,11 @@ pub(crate) fn install_pitr_file_no_replace(
             return Err(error.into());
         }
         std::fs::File::open(parent)?.sync_all()?;
+
         Ok(())
     })();
     let _ = std::fs::remove_file(&temp_path);
+
     result
 }
 
@@ -612,6 +628,7 @@ pub(crate) fn install_pitr_file_no_replace(
 #[cfg(target_os = "linux")]
 pub(crate) fn cleanup_pitr_temp_files(dir: impl AsRef<std::path::Path>) -> Result<u64> {
     let mut removed = 0u64;
+
     for entry in std::fs::read_dir(dir.as_ref())? {
         let entry = entry?;
         let name = entry.file_name();
@@ -646,6 +663,7 @@ fn is_pitr_install_temp_name(name: &str) -> bool {
         return false;
     }
     let mut fields = suffix.split('-');
+
     matches!(
         (fields.next(), fields.next(), fields.next()),
         (Some(pid), Some(sequence), None)
@@ -762,6 +780,7 @@ mod tests {
             manager
                 .install_successor_after_wal(|id| {
                     assert_eq!(id, 2);
+
                     Ok(())
                 })
                 .unwrap(),

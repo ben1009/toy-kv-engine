@@ -278,7 +278,7 @@ This child process:
 The parent harness lives in the test suite, for example:
 
 ```text
-kv-engine/src/tests/chaos.rs
+kv-engine/integration_tests/chaos.rs
 ```
 
 The parent:
@@ -523,20 +523,26 @@ If a chaos test cannot be replayed deterministically, it is not very useful.
 
 ### 11.1 Repository Placement
 
-Recommended layout:
+Implemented layout:
 
 ```text
-kv-engine/src/tests/chaos.rs
-kv-engine/src/tests/chaos/
-  child.rs
-  control_log.rs
-  scenarios.rs
 kv-engine/src/bin/chaos-child.rs
+kv-engine/src/chaos/
+  control_log.rs
+  failpoint.rs
+  oracle.rs
+  scenarios.rs
+  stress.rs
+kv-engine/integration_tests/
+  chaos.rs
+  chaos_failpoint.rs
+  chaos_integration.rs
+  cross_process_bloom.rs
 ```
 
-If the child logic can be shared as a library module instead of a standalone
-binary, that is acceptable, but the parent must still be able to kill a real
-process.
+Cargo declares the process-level integration files as explicit test targets in
+`kv-engine/Cargo.toml`. The parent still launches a real child process so the
+tests exercise abrupt process termination and recovery.
 
 ### 11.2 Command Surface
 

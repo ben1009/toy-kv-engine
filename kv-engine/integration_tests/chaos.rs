@@ -248,6 +248,7 @@ fn wait_for_new_sync_point(
     timeout: Duration,
 ) -> Result<(), String> {
     let deadline = Instant::now() + timeout;
+
     loop {
         if let Ok(Some(status)) = child.try_wait() {
             return Err(format!(
@@ -347,6 +348,7 @@ fn write_failure_artifacts(
 
 fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
     fs::create_dir_all(dst)?;
+
     for entry in fs::read_dir(src)? {
         let entry = entry?;
         let file_type = entry.file_type()?;

@@ -44,6 +44,7 @@ impl PersistedPitrConfig {
             self.max_source_spool_bytes >= self.max_unarchived_bytes,
             "PITR source spool limit is below unarchived limit"
         );
+
         Ok(())
     }
 }
@@ -339,6 +340,7 @@ impl PitrState {
             );
         }
         let mut successors = HashSet::new();
+
         for (&segment, obligation) in &self.obligations {
             ensure!(
                 segment != obligation.successor_segment_id,
@@ -437,6 +439,7 @@ pub(crate) fn replay_pitr_records(
 ) -> Result<PitrState> {
     let mut state = PitrState::default();
     let mut saw_record = false;
+
     for record in records {
         match record {
             PitrManifestRecord::EnableIntent {
@@ -737,6 +740,7 @@ pub(crate) fn encode_pitr_snapshot(state: &PitrState) -> Result<Vec<u8>> {
         encoded.len() <= MAX_PITR_SNAPSHOT_BYTES,
         "PITR snapshot exceeds the configured size limit"
     );
+
     Ok(encoded)
 }
 
@@ -774,6 +778,7 @@ pub(crate) fn decode_pitr_snapshot(bytes: &[u8]) -> Result<PitrState> {
     );
     let state: PitrState = serde_json::from_slice(payload)?;
     state.validate()?;
+
     Ok(state)
 }
 
@@ -796,6 +801,7 @@ pub(crate) fn encode_pitr_record(record: &PitrManifestRecord) -> Result<Vec<u8>>
     encoded.extend_from_slice(&payload_len.to_be_bytes());
     encoded.extend_from_slice(&digest);
     encoded.extend_from_slice(&payload);
+
     Ok(encoded)
 }
 
@@ -831,11 +837,13 @@ pub(crate) fn decode_pitr_record(bytes: &[u8]) -> Result<PitrManifestRecord> {
         digest.finalize().as_slice() == &bytes[13..PITR_RECORD_HEADER_LEN],
         "PITR manifest record digest mismatch"
     );
+
     Ok(serde_json::from_slice(payload)?)
 }
 
 pub(crate) fn encode_pitr_record_stream(records: &[PitrManifestRecord]) -> Result<Vec<u8>> {
     let mut encoded = Vec::new();
+
     for record in records {
         let frame = encode_pitr_record(record)?;
         let frame_len = u32::try_from(frame.len())
@@ -857,6 +865,7 @@ pub(crate) fn decode_pitr_record_stream(bytes: &[u8]) -> Result<Vec<PitrManifest
     );
     let mut offset = 0;
     let mut records = Vec::new();
+
     while offset < bytes.len() {
         ensure!(
             bytes.len() - offset >= 4,
@@ -892,6 +901,7 @@ impl PitrManifestLog {
     pub(crate) fn recover(encoded: &[u8]) -> Result<Self> {
         let records = decode_pitr_record_stream(encoded)?;
         let state = replay_pitr_records(records.clone())?;
+
         Ok(Self {
             records,
             encoded: encoded.to_vec(),
@@ -911,6 +921,7 @@ impl PitrManifestLog {
         self.records = records;
         self.encoded.extend_from_slice(&frame);
         self.state = state;
+
         Ok(())
     }
 
@@ -933,6 +944,7 @@ fn disabled_lifecycle_state(state: &PitrState) -> PitrState {
     disabled.active_segment_id = None;
     disabled.obligations.clear();
     disabled.uncertain_segment_id = None;
+
     disabled
 }
 
@@ -958,6 +970,7 @@ fn transition_obligation(
         "segment obligation transitioned out of order"
     );
     obligation.state = to;
+
     Ok(())
 }
 

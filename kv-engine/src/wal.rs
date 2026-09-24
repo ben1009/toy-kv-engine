@@ -119,6 +119,7 @@ impl DirectBuf {
         let ret = unsafe { libc::posix_memalign(&mut ptr, 4096, cap) };
         // posix_memalign failure is OOM — recovery is impossible at this point.
         assert_eq!(ret, 0, "posix_memalign failed (OOM)");
+
         Self {
             ptr: ptr as *mut u8,
             len: 0,
@@ -164,6 +165,7 @@ impl DirectBuf {
 
     pub(crate) fn write_at(&mut self, pos: usize, bytes: &[u8]) {
         debug_assert!(pos + bytes.len() <= self.cap);
+
         unsafe {
             std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.ptr.add(pos), bytes.len());
         }
@@ -172,6 +174,7 @@ impl DirectBuf {
     pub(crate) fn zero_range(&mut self, start: usize, end: usize) {
         debug_assert!(start <= end);
         debug_assert!(end <= self.cap);
+
         unsafe {
             std::ptr::write_bytes(self.ptr.add(start), 0, end - start);
         }
@@ -180,6 +183,7 @@ impl DirectBuf {
     pub(crate) fn initialized_slice(&self, start: usize, end: usize) -> &[u8] {
         debug_assert!(start <= end);
         debug_assert!(end <= self.cap);
+
         unsafe { std::slice::from_raw_parts(self.ptr.add(start), end - start) }
     }
 
@@ -248,14 +252,14 @@ struct TicketedBuf {
     buf: DirectBuf,
     /// The seal entry this batch contributes, carried to the commit leader so
     /// the digest is extended only once the group is durable.
-    pitr_entry: Option<crate::pitr_seal::SealEntry>,
+    pitr_entry: Option<crate::pitr::seal::SealEntry>,
 }
 
 struct PitrSealAccumulator {
     header: crate::pitr::WalV5Header,
     hasher: Sha256,
     logical_length: u64,
-    entries: Vec<crate::pitr_seal::SealEntry>,
+    entries: Vec<crate::pitr::seal::SealEntry>,
     /// What this segment's digest covers. Fixed when the accumulator is created
     /// from the segment's own version, so a segment resumed after an upgrade keeps
     /// the rule it was written with.
@@ -266,11 +270,12 @@ impl PitrSealAccumulator {
     fn from_prefix(
         header: crate::pitr::WalV5Header,
         prefix: &[u8],
-        entries: Vec<crate::pitr_seal::SealEntry>,
+        entries: Vec<crate::pitr::seal::SealEntry>,
         rule: crate::pitr::WalDigestRule,
     ) -> Self {
         let mut hasher = Sha256::new();
         hasher.update(prefix);
+
         Self {
             header,
             hasher,
@@ -286,7 +291,8 @@ impl PitrSealAccumulator {
     fn from_wal(header: crate::pitr::WalV5Header, wal: &[u8]) -> Result<Self> {
         let rule = crate::pitr::wal_digest_rule(header.wal_format_version)?;
         let mut hasher = Sha256::new();
-        let (logical_length, entries) = crate::pitr_seal::walk_v5_segment(&mut hasher, wal, rule)?;
+        let (logical_length, entries) = crate::pitr::seal::walk_v5_segment(&mut hasher, wal, rule)?;
+
         Ok(Self {
             header,
             hasher,
@@ -297,7 +303,7 @@ impl PitrSealAccumulator {
     }
 
     /// Extend the digest with one batch, returning how many bytes it covered.
-    fn append(&mut self, buf: &DirectBuf, entry: crate::pitr_seal::SealEntry) -> usize {
+    fn append(&mut self, buf: &DirectBuf, entry: crate::pitr::seal::SealEntry) -> usize {
         let bytes = buf.initialized_slice(0, buf.len());
         // The buffer is one encoded batch, so it carries its own logical length in
         // its header; reading it back from the bytes keeps the coverage decision
@@ -316,17 +322,19 @@ impl PitrSealAccumulator {
             "v5 seal accumulator lost the alignment of the segment's logical length"
         );
         self.entries.push(entry);
+
         hashed.len()
     }
 
-    fn seal(&self) -> Result<(crate::pitr_seal::V5Seal, Vec<u8>)> {
-        let seal = crate::pitr_seal::V5Seal {
+    fn seal(&self) -> Result<(crate::pitr::seal::V5Seal, Vec<u8>)> {
+        let seal = crate::pitr::seal::V5Seal {
             header: self.header,
             wal_digest: self.hasher.clone().finalize().into(),
             logical_length: self.logical_length,
             entries: self.entries.clone(),
         };
         let bytes = seal.encode()?;
+
         Ok((seal, bytes))
     }
 }
@@ -566,6 +574,7 @@ impl Wal {
     /// Create a pre-filled lock-free pool of page-aligned DirectBuf buffers.
     fn new_direct_buf_pool() -> ArrayQueue<DirectBuf> {
         let pool = ArrayQueue::new(BUFFER_POOL_CAPACITY);
+
         for _ in 0..BUFFER_POOL_CAPACITY {
             let _ = pool.push(DirectBuf::new(BUFFER_POOL_BUF_SIZE));
         }
@@ -629,6 +638,7 @@ impl Wal {
             } else {
                 None
             };
+
             Ok(Self {
                 buffered_file: Arc::new(Mutex::new(BufWriter::new(buf_file))),
                 mvcc_format,
@@ -656,6 +666,7 @@ impl Wal {
             })
         } else {
             log::info!("WAL: recovered non-MVCC WAL, using buffered I/O only");
+
             Ok(Self {
                 buffered_file: Arc::new(Mutex::new(BufWriter::new(buf_file))),
                 mvcc_format,
@@ -693,6 +704,7 @@ impl Wal {
         let offset = self.alloc_offset.load(Ordering::Acquire);
         let file_size = self.preallocated_size.load(Ordering::Acquire);
         let required_end = offset + needed;
+
         if required_end > file_size {
             // Round up to the next PREALLOC_BLOCK boundary.
             let new_size = required_end.div_ceil(PREALLOC_BLOCK) * PREALLOC_BLOCK;
@@ -843,6 +855,7 @@ impl Wal {
             pitr_entry: None,
         });
         drop(pending);
+
         #[cfg(feature = "bench")]
         if let Some(profile) = profile {
             profile.record_wal_enqueue_ns(enqueue_start.elapsed().as_nanos() as u64);
@@ -1004,13 +1017,14 @@ impl Wal {
         path: impl AsRef<Path>,
         header: crate::pitr::WalV5Header,
     ) -> Result<Self> {
-        crate::pitr_segment::install_v5_wal_header(path.as_ref(), header)?;
+        crate::pitr::segment::install_v5_wal_header(path.as_ref(), header)?;
         let header_bytes = crate::pitr::encode_v5_file_header(header)?;
         let (ring, direct_file, alloc_offset) = Self::try_init_io_uring(path.as_ref())?;
         let buf_file = File::options()
             .read(true)
             .append(true)
             .open(path.as_ref())?;
+
         Ok(Self {
             buffered_file: Arc::new(Mutex::new(BufWriter::new(buf_file))),
             mvcc_format: true,
@@ -1082,6 +1096,7 @@ pub(crate) fn is_recordless_v4_wal(path: &std::path::Path) -> bool {
         return false;
     }
     let mut buffer = [0u8; 64 * 1024];
+
     loop {
         match std::io::Read::read(&mut file, &mut buffer) {
             Ok(0) => return true,
@@ -1096,6 +1111,7 @@ pub(crate) fn is_recordless_v4_wal(path: &std::path::Path) -> bool {
 #[cfg(feature = "bench")]
 fn nanos_now() -> u64 {
     static EPOCH: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+
     EPOCH.get_or_init(Instant::now).elapsed().as_nanos() as u64
 }
 
@@ -1113,10 +1129,11 @@ impl Wal {
         self.pitr_rotation_needed.load(Ordering::Acquire)
     }
 
-    pub(crate) fn finalize_pitr_seal(&self) -> Result<(crate::pitr_seal::V5Seal, Vec<u8>)> {
+    pub(crate) fn finalize_pitr_seal(&self) -> Result<(crate::pitr::seal::V5Seal, Vec<u8>)> {
         // Serialized against a group's seal append: the append holds this lock
         // for the duration of hashing, so taking it here waits that out.
         let _append_guard = self.pitr_seal_append.lock();
+
         self.pitr_seal
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("WAL has no PITR seal accumulator"))?
@@ -1142,6 +1159,7 @@ impl Wal {
         self.pitr_segment_start.store(*reserved, Ordering::Release);
         self.pitr_rotation_needed
             .store(*reserved >= max_segment_bytes, Ordering::Release);
+
         Ok(())
     }
 
@@ -1258,11 +1276,12 @@ impl Wal {
         pending.push(TicketedBuf {
             ticket,
             buf,
-            pitr_entry: Some(crate::pitr_seal::SealEntry {
+            pitr_entry: Some(crate::pitr::seal::SealEntry {
                 commit_ts: batch.commit_ts,
                 recorded_at: batch.recorded_at,
             }),
         });
+
         #[cfg(feature = "bench")]
         if let Some(profile) = profile {
             profile.record_wal_enqueue_ns(enqueue_start.elapsed().as_nanos() as u64);
@@ -1407,6 +1426,7 @@ impl Wal {
             offset = decoded.logical_end;
         }
         let valid_file_len = crate::pitr::WAL_V5_HEADER_LEN + offset;
+
         if valid_file_len < file_len as usize {
             f.set_len(valid_file_len as u64)?;
             f.sync_all()?;
@@ -1419,6 +1439,7 @@ impl Wal {
             Some(candidate) => candidate,
             None => return false,
         };
+
         while candidate < bytes.len() {
             if bytes[candidate..].iter().all(|byte| *byte == 0) {
                 return false;
@@ -1469,6 +1490,7 @@ impl Wal {
         }
 
         let mut expected_size = 0usize;
+
         for _ in 0..entry_count {
             expected_size = if is_v3 {
                 Self::validate_v3_entry_size(data, entries_start, expected_size)?
@@ -1495,6 +1517,7 @@ impl Wal {
 
         let kind = data[expected_size];
         let after_kind = expected_size + 1;
+
         match kind {
             0 => Self::validate_put_entry_size(data, entries_start, after_kind),
             1 => Self::validate_point_tombstone_entry_size(data, entries_start, after_kind),
@@ -1520,6 +1543,7 @@ impl Wal {
             return None;
         }
         let val_size = (&data[pos + 2 + key_size..pos + 4 + key_size]).get_u16() as usize;
+
         if entries_start.checked_sub(pos)? < 4 + key_size + val_size {
             return None;
         }
@@ -1536,6 +1560,7 @@ impl Wal {
             return None;
         }
         let key_size = (&data[pos..pos + 2]).get_u16() as usize;
+
         if entries_start.checked_sub(pos)? < 2 + key_size {
             return None;
         }
@@ -1556,6 +1581,7 @@ impl Wal {
             return None;
         }
         let end_size = (&data[pos + 2 + start_size..pos + 4 + start_size]).get_u16() as usize;
+
         if entries_start.checked_sub(pos)? < 4 + start_size + end_size {
             return None;
         }
@@ -1572,6 +1598,7 @@ impl Wal {
         handler: &mut H,
     ) -> Result<()> {
         let mut entry_buf = data.split_to(expected_size);
+
         for _ in 0..entry_count {
             if is_v3 {
                 Self::replay_v3_entry(&mut entry_buf, commit_ts, handler)?;
@@ -1589,6 +1616,7 @@ impl Wal {
         handler: &mut H,
     ) -> Result<()> {
         let kind = entry_buf.get_u8();
+
         match kind {
             0 => Self::replay_put_entry(entry_buf, handler),
             1 => Self::replay_point_tombstone_entry(entry_buf, handler),
@@ -1606,6 +1634,7 @@ impl Wal {
         let key = entry_buf.split_to(key_size);
         let value_size = entry_buf.get_u16() as usize;
         let value = entry_buf.split_to(value_size);
+
         handler.handle_put(key, value)
     }
 
@@ -1615,6 +1644,7 @@ impl Wal {
     ) -> Result<()> {
         let key_size = entry_buf.get_u16() as usize;
         let key = entry_buf.split_to(key_size);
+
         handler.handle_point_tombstone(key)
     }
 
@@ -1627,6 +1657,7 @@ impl Wal {
         let start = entry_buf.split_to(start_size);
         let end_size = entry_buf.get_u16() as usize;
         let end = entry_buf.split_to(end_size);
+
         handler.handle_range_tombstone(start, end, commit_ts)
     }
 
@@ -1644,6 +1675,7 @@ impl Wal {
         let total_batch_size = batch_hdr_size + data_len_field;
         let aligned_size = DirectBuf::align_up(total_batch_size);
         let consumed = expected_size + batch_hdr_size;
+
         if aligned_size > consumed {
             let skip = aligned_size - consumed;
             data.advance(data.remaining().min(skip));
@@ -1664,6 +1696,7 @@ impl Wal {
         };
         let valid_data = data_len - remaining_data;
         let valid_file = scan_start + valid_data;
+
         if (valid_file as u64) < file_len {
             f.set_len(valid_file as u64)?;
             f.sync_all()?;
@@ -1725,6 +1758,7 @@ impl Wal {
 
         // Truncate file to the last valid byte.
         let valid_len = data_len - data.remaining();
+
         if (valid_len as u64) < file_len {
             f.set_len(valid_len as u64)?;
         }
@@ -2101,6 +2135,7 @@ impl Wal {
         let validate_start = Instant::now();
         let per_entry_overhead = if self.is_v3 { 5 } else { 4 };
         let mut validated = Vec::with_capacity(data.len());
+
         let mut entries_size = 0usize;
         for entry in data {
             let key = entry.key();
@@ -2188,6 +2223,7 @@ impl Wal {
                 .context("failed to sync WAL to disk")?;
             return Ok(());
         }
+
         let ticket = self.next_ticket.load(Ordering::Acquire);
         if ticket == 0 {
             return Ok(());
@@ -2434,6 +2470,7 @@ impl Wal {
                     }
                 }
                 drop(seal_guard);
+
                 Ok(())
             }
             Err(error) => {
@@ -2508,6 +2545,7 @@ impl Wal {
 
     fn wait_for_ticket_durability(&self, ticket: u64) -> Result<WaitForTicketStats> {
         let mut state = self.completion_state.mutex.lock();
+
         let mut stats = WaitForTicketStats::default();
         while self.completion_state.durable_ticket.load(Ordering::Acquire) <= ticket {
             if let Some(ref e) = state.last_error {

@@ -140,6 +140,7 @@ fn test_task1_full_compaction() {
     storage.force_full_compaction().unwrap();
     assert!(storage.state.load().l0_sstables.is_empty());
     let mut iter = construct_merge_iterator_over_storage(&storage.state.load());
+
     if TS_ENABLED {
         check_iter_result_by_key(
             &mut iter,
@@ -192,6 +193,7 @@ fn generate_concat_sst(
             .unwrap();
     }
     let path = dir.as_ref().join(format!("{id}.sst"));
+
     builder.build_for_test(path).unwrap()
 }
 

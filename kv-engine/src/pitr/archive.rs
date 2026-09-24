@@ -17,8 +17,8 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
+use crate::pitr::catalog::{PitrCatalogRecord, SegmentMetadata, encode_catalog, replay_catalog};
 use crate::pitr::{ArchiveEpochId, SegmentId, TimelineId};
-use crate::pitr_catalog::{PitrCatalogRecord, SegmentMetadata, encode_catalog, replay_catalog};
 
 #[cfg(target_os = "linux")]
 static STAGE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
@@ -43,6 +43,7 @@ pub(crate) fn archive_object_name(
         ArchiveObjectKind::Wal => "wal",
         ArchiveObjectKind::Seal => "seal",
     };
+
     format!("{timeline}-{epoch}-{:016x}-{digest}.{suffix}", segment_id.0)
 }
 
@@ -52,7 +53,7 @@ pub(crate) struct PreparedArchiveObjects {
     seal_name: String,
     wal_bytes: u64,
     seal_bytes: u64,
-    segment_key: crate::pitr_catalog::SegmentKey,
+    segment_key: crate::pitr::catalog::SegmentKey,
     wal_digest: [u8; 32],
     seal_digest: [u8; 32],
     /// The rule the segment's `wal_digest` follows. Carried from the metadata the
@@ -74,7 +75,7 @@ impl SourceObjectDigest {
     pub(crate) fn digest(self, bytes: &[u8]) -> anyhow::Result<[u8; 32]> {
         match self {
             Self::WholeObject => Ok(sha2::Sha256::digest(bytes).into()),
-            Self::Wal(rule) => crate::pitr_seal::wal_digest(bytes, rule),
+            Self::Wal(rule) => crate::pitr::seal::wal_digest(bytes, rule),
         }
     }
 }
@@ -152,6 +153,7 @@ impl ArchiveObjectStager {
             result == 0,
             "failed to acquire PITR archive repository lock"
         );
+
         Ok(lock)
     }
 
@@ -186,6 +188,7 @@ impl ArchiveObjectStager {
             return Ok(Some(lock));
         }
         let error = std::io::Error::last_os_error();
+
         if error.raw_os_error() == Some(libc::EWOULDBLOCK) {
             return Ok(None);
         }
@@ -210,6 +213,7 @@ impl ArchiveObjectStager {
         // behind somebody else's publication. Skipping costs only disk, because
         // the same names are swept on the next construction.
         let mut removed_staging = false;
+
         if let Some(_lock) = Self::try_acquire_repository_lock(&root_fd)? {
             for entry in std::fs::read_dir(&wal_path)? {
                 let entry = entry?;
@@ -289,6 +293,7 @@ impl ArchiveObjectStager {
         let Ok(entries) = std::fs::read_dir(&self.wal_path) else {
             return;
         };
+
         for entry in entries.flatten() {
             let name = entry.file_name();
             let Some(name) = name.to_str() else { continue };
@@ -318,9 +323,10 @@ impl ArchiveObjectStager {
         prepared: &PreparedArchiveObjects,
         wal: &[u8],
         seal: &[u8],
-        priority: Option<&parking_lot::Mutex<crate::pitr_api::ArchiveIoPriority>>,
+        priority: Option<&parking_lot::Mutex<crate::pitr::api::ArchiveIoPriority>>,
     ) -> anyhow::Result<()> {
         let _lock = self.lock_exclusive()?;
+
         self.publish_with_priority_unlocked(prepared, wal, seal, priority)
     }
 
@@ -329,7 +335,7 @@ impl ArchiveObjectStager {
         prepared: &PreparedArchiveObjects,
         wal: &[u8],
         seal: &[u8],
-        priority: Option<&parking_lot::Mutex<crate::pitr_api::ArchiveIoPriority>>,
+        priority: Option<&parking_lot::Mutex<crate::pitr::api::ArchiveIoPriority>>,
     ) -> anyhow::Result<()> {
         anyhow::ensure!(
             prepared.wal_bytes == wal.len() as u64,
@@ -352,7 +358,7 @@ impl ArchiveObjectStager {
         );
         let mut before_chunk = |_: u64| {
             if priority.is_some_and(|priority| {
-                *priority.lock() == crate::pitr_api::ArchiveIoPriority::Background
+                *priority.lock() == crate::pitr::api::ArchiveIoPriority::Background
             }) {
                 std::thread::yield_now();
             }
@@ -375,6 +381,7 @@ impl ArchiveObjectStager {
             &mut before_chunk,
         )?;
         sync_fd(&self.wal_dir)?;
+
         Ok(())
     }
 
@@ -388,7 +395,7 @@ impl ArchiveObjectStager {
         wal: &[u8],
         seal: &[u8],
         chunk_bytes: usize,
-        priority: Option<&parking_lot::Mutex<crate::pitr_api::ArchiveIoPriority>>,
+        priority: Option<&parking_lot::Mutex<crate::pitr::api::ArchiveIoPriority>>,
         mut before_chunk: impl FnMut(u64) -> anyhow::Result<()>,
     ) -> anyhow::Result<()> {
         anyhow::ensure!(chunk_bytes > 0, "archive chunk size is zero");
@@ -421,6 +428,7 @@ impl ArchiveObjectStager {
             &mut before_chunk,
         )?;
         sync_fd(&self.wal_dir)?;
+
         Ok(())
     }
 
@@ -440,6 +448,7 @@ impl ArchiveObjectStager {
             .map(|bytes| bytes.saturating_add(1))
             .unwrap_or(u64::MAX);
         (&file).take(limit).read_to_end(&mut bytes)?;
+
         if let Some(expected_bytes) = expected_bytes {
             anyhow::ensure!(
                 bytes.len() as u64 == expected_bytes,
@@ -456,7 +465,7 @@ fn publish_one_chunked(
     name: &str,
     bytes: &[u8],
     chunk_bytes: usize,
-    priority: Option<&parking_lot::Mutex<crate::pitr_api::ArchiveIoPriority>>,
+    priority: Option<&parking_lot::Mutex<crate::pitr::api::ArchiveIoPriority>>,
     before_chunk: &mut impl FnMut(u64) -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
     let final_name = CString::new(name)?;
@@ -514,6 +523,7 @@ fn publish_one_chunked(
         Ok(())
     })();
     drop(temp);
+
     if !temp_consumed {
         let unlink = unsafe { libc::unlinkat(directory.as_raw_fd(), temp_name.as_ptr(), 0) };
         if unlink != 0 && result.is_ok() {
@@ -528,14 +538,15 @@ fn publish_one_chunked(
 fn read_bounded_file(
     file: &File,
     limit: u64,
-    priority: Option<&parking_lot::Mutex<crate::pitr_api::ArchiveIoPriority>>,
+    priority: Option<&parking_lot::Mutex<crate::pitr::api::ArchiveIoPriority>>,
 ) -> anyhow::Result<Vec<u8>> {
     let mut bytes = Vec::new();
     let mut buffer = [0_u8; 64 * 1024];
     let mut reader = file.take(limit);
+
     loop {
         if priority.is_some_and(|priority| {
-            *priority.lock() == crate::pitr_api::ArchiveIoPriority::Background
+            *priority.lock() == crate::pitr::api::ArchiveIoPriority::Background
         }) {
             std::thread::yield_now();
         }
@@ -552,11 +563,11 @@ fn read_bounded_file(
 fn write_chunked(
     file: &mut File,
     bytes: &[u8],
-    priority: Option<&parking_lot::Mutex<crate::pitr_api::ArchiveIoPriority>>,
+    priority: Option<&parking_lot::Mutex<crate::pitr::api::ArchiveIoPriority>>,
 ) -> anyhow::Result<()> {
     for chunk in bytes.chunks(64 * 1024) {
         if priority.is_some_and(|priority| {
-            *priority.lock() == crate::pitr_api::ArchiveIoPriority::Background
+            *priority.lock() == crate::pitr::api::ArchiveIoPriority::Background
         }) {
             std::thread::yield_now();
         }
@@ -616,6 +627,7 @@ fn is_archive_temp_name(name: &str) -> bool {
         return false;
     }
     let mut suffix = suffix.split('-');
+
     (object.ends_with(".wal") || object.ends_with(".seal"))
         && suffix
             .next()
@@ -646,6 +658,7 @@ fn open_existing(directory: &File, name: &CString) -> anyhow::Result<File> {
         stat.st_mode & libc::S_IFMT == libc::S_IFREG,
         "archive object is not a regular file"
     );
+
     Ok(file)
 }
 
@@ -658,6 +671,7 @@ fn open_dir(path: &Path) -> anyhow::Result<File> {
         )
     };
     anyhow::ensure!(fd >= 0, std::io::Error::last_os_error());
+
     Ok(unsafe { File::from_raw_fd(fd) })
 }
 
@@ -672,6 +686,7 @@ fn open_dir_at(parent: &File, name: &str) -> anyhow::Result<File> {
         )
     };
     anyhow::ensure!(fd >= 0, std::io::Error::last_os_error());
+
     Ok(unsafe { File::from_raw_fd(fd) })
 }
 
@@ -681,12 +696,14 @@ fn sync_fd(file: &File) -> anyhow::Result<()> {
         unsafe { libc::fsync(file.as_raw_fd()) } == 0,
         std::io::Error::last_os_error()
     );
+
     Ok(())
 }
 
 impl PitrArchiveCatalog {
     pub(crate) fn open(bytes: Vec<u8>) -> anyhow::Result<Self> {
         replay_catalog(&bytes)?;
+
         Ok(Self { bytes })
     }
 
@@ -713,6 +730,7 @@ impl PitrArchiveCatalog {
             Sha256::digest(seal).as_slice() == metadata.seal_digest,
             "archived seal digest mismatch"
         );
+
         Ok(PreparedArchiveObjects {
             wal_name: archive_object_name(
                 metadata.key.timeline_id,
@@ -806,6 +824,7 @@ impl PitrArchiveCatalog {
         records.push(PitrCatalogRecord::CommitSegment { metadata });
         self.bytes = encode_catalog(&records)?;
         let first_sequence = replay_first_sequence(&records)?;
+
         Ok(ArchivePublicationOutcome::Committed {
             sequence: first_sequence
                 .checked_add(records.len() as u64 - 1)
@@ -860,8 +879,9 @@ mod tests {
         let wal_digest =
             crate::tests::harness::pitr_wal_digest(&wal_bytes(), crate::pitr::WAL_V5_VERSION);
         let seal_digest = Sha256::digest(b"seal").into();
+
         SegmentMetadata {
-            key: crate::pitr_catalog::SegmentKey {
+            key: crate::pitr::catalog::SegmentKey {
                 repository_id: [1; 16],
                 timeline_id: TimelineId([2; 16]),
                 archive_epoch_id: ArchiveEpochId([3; 16]),
@@ -1066,7 +1086,7 @@ mod tests {
     #[test]
     fn duplicate_commit_reports_wire_sequence_after_snapshot_replacement() {
         let snapshot =
-            PitrCatalogRecord::RetentionSnapshot(crate::pitr_catalog::RetentionSnapshot {
+            PitrCatalogRecord::RetentionSnapshot(crate::pitr::catalog::RetentionSnapshot {
                 repository_id: [1; 16],
                 replaced_prefix_high_water: 10,
                 replaced_prefix_digest: [5; 32],
@@ -1078,7 +1098,7 @@ mod tests {
                 backup_catalog_high_water: 0,
                 backup_catalog_digest: [0; 32],
             });
-        let bytes = crate::pitr_catalog::encode_catalog(&[snapshot]).unwrap();
+        let bytes = crate::pitr::catalog::encode_catalog(&[snapshot]).unwrap();
         let mut catalog = PitrArchiveCatalog::open(bytes).unwrap();
         let metadata = metadata();
         let prepared = catalog
@@ -1103,7 +1123,7 @@ mod tests {
         second.predecessor = ChainAnchor::Segment(first.anchor);
         second.first_commit_ts = Some(2);
         second.last_commit_ts = Some(2);
-        let complete = crate::pitr_catalog::encode_catalog(&[
+        let complete = crate::pitr::catalog::encode_catalog(&[
             PitrCatalogRecord::CommitSegment { metadata: first },
             PitrCatalogRecord::CommitSegment {
                 metadata: second.clone(),

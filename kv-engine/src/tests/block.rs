@@ -80,6 +80,7 @@ fn num_of_keys() -> usize {
 
 fn generate_block() -> Block {
     let mut builder = BlockBuilder::new(10000);
+
     for idx in 0..num_of_keys() {
         let key = key_of(idx);
         let value = value_of(idx);
@@ -145,6 +146,7 @@ fn test_block_builder_key_at() {
     let keys: Vec<Vec<u8>> = (0..100)
         .map(|i| format!("key_{:03}", i * 5).into_bytes())
         .collect();
+
     for key in &keys {
         assert!(
             builder
@@ -246,6 +248,7 @@ fn test_block_builder_key_at_long_keys() {
             k
         })
         .collect();
+
     for key in &keys {
         assert!(
             builder
@@ -264,6 +267,7 @@ fn test_block_builder_key_at_long_keys() {
 fn test_block_iterator() {
     let block = Arc::new(generate_block());
     let mut iter = BlockIterator::create_and_seek_to_first(block);
+
     for _ in 0..5 {
         for i in 0..num_of_keys() {
             let key = iter.key();
@@ -292,6 +296,7 @@ fn test_block_iterator() {
 fn test_block_seek_key() {
     let block = Arc::new(generate_block());
     let mut iter = BlockIterator::create_and_seek_to_key(block, key_of(0).as_key_slice());
+
     for offset in 1..=5 {
         for i in 0..num_of_keys() {
             let key = iter.key();

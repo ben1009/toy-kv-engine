@@ -49,6 +49,7 @@ fn main() -> Result<()> {
         !args.writers.is_empty() && args.writers.iter().all(|&w| w > 0),
         "every writer count must be nonzero"
     );
+
     for (case_index, &writers) in args.writers.iter().enumerate() {
         // Counterbalance the mode order across cases. Running PITR-disabled first
         // every time would let host state that drifts over the run - thermal,
@@ -91,6 +92,7 @@ fn run_case(args: &Args, writers: usize, pitr: bool, pitr_first: bool) -> Result
     // cleanly, so the leaks accumulate.
     let outcome = run_case_in_root(args, writers, pitr, pitr_first, &root);
     let _ = std::fs::remove_dir_all(&root);
+
     outcome
 }
 
@@ -227,5 +229,6 @@ fn run_case_in_root(
             "catchup_seconds": pitr.then_some(catchup_elapsed.as_secs_f64()),
         })
     );
+
     Ok(())
 }

@@ -152,6 +152,7 @@ impl BlockIterator {
         let prefix_cmp_len = overlap_len
             .min(target.len())
             .min(self.first_key.raw_ref().len());
+
         match self.first_key.raw_ref()[..prefix_cmp_len].cmp(&target[..prefix_cmp_len]) {
             std::cmp::Ordering::Equal => {}
             ord => return ord,

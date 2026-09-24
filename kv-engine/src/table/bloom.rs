@@ -32,6 +32,7 @@ impl<T: AsRef<[u8]>> BitSlice for T {
     fn get_bit(&self, idx: usize) -> bool {
         let pos = idx / 8;
         let offset = idx % 8;
+
         (self.as_ref()[pos] & (1 << offset)) != 0
     }
 
@@ -44,6 +45,7 @@ impl<T: AsMut<[u8]>> BitSliceMut for T {
     fn set_bit(&mut self, idx: usize, val: bool) {
         let pos = idx / 8;
         let offset = idx % 8;
+
         if val {
             self.as_mut()[pos] |= 1 << offset;
         } else {
@@ -57,6 +59,7 @@ impl Bloom {
     pub fn decode(buf: &[u8]) -> Result<Self> {
         let filter = &buf[..buf.len() - 1];
         let k = buf[buf.len() - 1];
+
         Ok(Self {
             filter: filter.to_vec().into(),
             k,
@@ -77,6 +80,7 @@ impl Bloom {
         }
         let size = -(entries as f64) * false_positive_rate.ln() / std::f64::consts::LN_2.powi(2);
         let locs = (size / (entries as f64)).ceil();
+
         locs as usize
     }
 
@@ -166,6 +170,7 @@ impl IncrementalBloom {
         let filter = (0..nbytes)
             .map(|_| std::sync::atomic::AtomicU8::new(0))
             .collect();
+
         Self { filter, k, nbits }
     }
 
@@ -173,6 +178,7 @@ impl IncrementalBloom {
     /// Uses `fetch_or(Release)` — safe to call concurrently with `may_contain_hash`.
     pub fn push_hash(&self, mut h: u32) {
         let delta = h.rotate_left(15);
+
         for _ in 0..self.k {
             let idx = (h as usize) % self.nbits;
             let pos = idx / 8;
@@ -189,6 +195,7 @@ impl IncrementalBloom {
     /// are visible. This eliminates false negatives on ARM/POWER.
     pub fn may_contain_hash(&self, mut h: u32) -> bool {
         let delta = h.rotate_left(15);
+
         for _ in 0..self.k {
             let idx = (h as usize) % self.nbits;
             let pos = idx / 8;

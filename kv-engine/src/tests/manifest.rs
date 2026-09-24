@@ -22,6 +22,7 @@ fn test_fresh_db_writes_format_version() {
         !records.is_empty(),
         "manifest should have at least one record"
     );
+
     match &records[0] {
         ManifestRecord::FormatVersion(v) => {
             assert_eq!(*v, MANIFEST_FORMAT_VERSION, "format version should match");
@@ -120,7 +121,7 @@ fn test_accept_snapshot_with_format_version() {
         next_compaction_filter_id: 0,
         format_version: MANIFEST_FORMAT_VERSION,
         immutable_file_metadata: vec![],
-        pitr_state: Some(crate::pitr_manifest::PitrState::default()),
+        pitr_state: Some(crate::pitr::manifest::PitrState::default()),
     };
     std::fs::write(&snapshot_path, serde_json::to_vec(&snapshot).unwrap()).unwrap();
     std::fs::File::create(&manifest_path).unwrap();
@@ -153,7 +154,7 @@ fn test_snapshot_tmp_crash_recovery() {
         next_compaction_filter_id: 0,
         format_version: MANIFEST_FORMAT_VERSION,
         immutable_file_metadata: vec![],
-        pitr_state: Some(crate::pitr_manifest::PitrState::default()),
+        pitr_state: Some(crate::pitr::manifest::PitrState::default()),
     };
     std::fs::write(&tmp_path, serde_json::to_vec(&snapshot).unwrap()).unwrap();
     std::fs::File::create(&manifest_path).unwrap();
@@ -331,6 +332,7 @@ fn test_manifest_snapshot_preserves_compaction_filters_and_next_id() {
     let snapshot_path = dir.path().join("ENGINE_MANIFEST");
     let snapshot: ManifestRecord =
         serde_json::from_slice(&std::fs::read(snapshot_path).unwrap()).unwrap();
+
     match snapshot {
         ManifestRecord::Snapshot {
             active_compaction_filters,
@@ -379,7 +381,7 @@ fn pitr_manifest_append_crash_replays_record_after_reopen() {
         let manifest = Manifest::create(child_path).unwrap();
         manifest
             .add_record_when_init(ManifestRecord::Pitr(
-                crate::pitr_manifest::PitrManifestRecord::SegmentArchived { segment_id: 7 },
+                crate::pitr::manifest::PitrManifestRecord::SegmentArchived { segment_id: 7 },
             ))
             .unwrap();
         unreachable!("child must exit after manifest append");
@@ -397,7 +399,7 @@ fn pitr_manifest_append_crash_replays_record_after_reopen() {
     assert!(matches!(
         records.as_slice(),
         [ManifestRecord::Pitr(
-            crate::pitr_manifest::PitrManifestRecord::SegmentArchived { segment_id: 7 }
+            crate::pitr::manifest::PitrManifestRecord::SegmentArchived { segment_id: 7 }
         )]
     ));
 }
@@ -419,7 +421,7 @@ fn pitr_manifest_snapshot_rename_crash_recovers_snapshot() {
         next_compaction_filter_id: 0,
         format_version: MANIFEST_FORMAT_VERSION,
         immutable_file_metadata: vec![],
-        pitr_state: Some(crate::pitr_manifest::PitrState::default()),
+        pitr_state: Some(crate::pitr::manifest::PitrState::default()),
     };
     if std::env::var_os("PITR_MANIFEST_SNAPSHOT_CHILD_ROOT").is_some() {
         let child_path = std::env::var_os("PITR_MANIFEST_SNAPSHOT_CHILD_ROOT").unwrap();

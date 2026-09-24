@@ -114,6 +114,7 @@ fn drop_sst_page_cache(dir: &std::path::Path) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
+
     for entry in entries.filter_map(|e| e.ok()) {
         let path = entry.path();
         if path.extension().is_some_and(|ext| ext == "sst")

@@ -95,6 +95,7 @@ impl V5Seal {
         output[208..212].copy_from_slice(&index_crc.to_be_bytes());
         let header_crc = crc32fast::hash(&output[8..212]);
         output[212..216].copy_from_slice(&header_crc.to_be_bytes());
+
         Ok(output)
     }
 
@@ -198,6 +199,7 @@ impl V5Seal {
             entries,
         };
         seal.validate()?;
+
         Ok(seal)
     }
 
@@ -245,6 +247,7 @@ impl V5Seal {
                 || (!self.entries.is_empty() && self.logical_length > WAL_V5_HEADER_LEN as u64),
             "PITR seal empty/nonempty boundary is invalid"
         );
+
         Ok(())
     }
 }
@@ -262,6 +265,7 @@ pub(crate) fn walk_v5_segment(
     let mut offset = WAL_V5_HEADER_LEN;
     let mut entries = Vec::new();
     let mut spans = Vec::new();
+
     while offset < wal.len() {
         if wal[offset..].iter().all(|byte| *byte == 0) {
             break;
@@ -303,6 +307,7 @@ pub(crate) fn wal_digest(wal: &[u8], rule: crate::pitr::WalDigestRule) -> Result
     );
     let mut hasher = Sha256::new();
     walk_v5_segment(&mut hasher, wal, rule)?;
+
     Ok(hasher.finalize().into())
 }
 
@@ -321,6 +326,7 @@ pub(crate) fn build_v5_seal(wal: &[u8]) -> Result<(V5Seal, Vec<u8>)> {
         entries,
     };
     let bytes = seal.encode()?;
+
     Ok((seal, bytes))
 }
 

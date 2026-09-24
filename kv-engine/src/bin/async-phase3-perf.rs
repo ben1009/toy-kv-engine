@@ -224,6 +224,7 @@ struct MeasureRecord {
 
 fn main() -> Result<()> {
     let args = Args::parse();
+
     match args.cmd {
         Command::Prepare(args) => run_prepare(args),
         Command::MeasureOpenClose(args) => run_measure_open_close(args),
@@ -278,6 +279,7 @@ fn run_prepare(args: PrepareArgs) -> Result<()> {
         sst_files,
         vlog_files,
     };
+
     emit_prepare(args.common.output, &record)
 }
 
@@ -290,6 +292,7 @@ fn run_measure_open_close(args: MeasureOpenCloseArgs) -> Result<()> {
     let (sst_files, vlog_files) = count_dataset_files(&cfg.path)?;
 
     let mut records = Vec::new();
+
     match args.mode {
         OpenMode::Sync => records.push(measure_mode(
             "sync",
@@ -409,6 +412,7 @@ fn count_dataset_files(path: &Path) -> Result<(usize, usize)> {
     let mut sst = 0usize;
     let mut vlog = 0usize;
     let mut stack = vec![path.to_path_buf()];
+
     while let Some(dir) = stack.pop() {
         for entry in fs::read_dir(&dir).with_context(|| format!("read {}", dir.display()))? {
             let entry = entry?;
@@ -443,6 +447,7 @@ fn emit_prepare(output: OutputFormat, record: &PrepareRecord) -> Result<()> {
         record.prepare_elapsed_ms,
         record.close_elapsed_ms,
     );
+
     match output {
         OutputFormat::Text => println!("{summary}"),
         OutputFormat::Json => println!("{}", serde_json::to_string(record)?),
@@ -487,6 +492,7 @@ fn ms(duration: Duration) -> f64 {
 fn median_ms(samples: &[f64]) -> f64 {
     let mut values = samples.to_vec();
     values.sort_by(|a, b| a.total_cmp(b));
+
     if values.len() % 2 == 1 {
         values[values.len() / 2]
     } else {

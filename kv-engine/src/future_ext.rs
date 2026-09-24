@@ -36,6 +36,7 @@ pub fn block_on<T>(future: impl std::future::Future<Output = T>) -> T {
         tokio::runtime::Handle::try_current().is_err(),
         "block_on called from within a tokio runtime; use .await instead"
     );
+
     with_runtime(|rt| rt.block_on(future))
 }
 

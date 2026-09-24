@@ -191,6 +191,7 @@ impl WriteProfile {
 
     pub fn snapshot(&self) -> WriteProfileSnapshot {
         let o = std::sync::atomic::Ordering::Relaxed;
+
         WriteProfileSnapshot {
             batch_build_ns: self.batch_build_ns.load(o),
             mvcc_wal_only_ns: self.mvcc_wal_only_ns.load(o),
@@ -374,6 +375,7 @@ impl WriteProfile {
         let o = std::sync::atomic::Ordering::Relaxed;
         self.wal_follower_wait_calls.fetch_add(1, o);
         self.wal_follower_condvar_waits.fetch_add(condvar_waits, o);
+
         if retried_leadership {
             self.wal_follower_retry_loops.fetch_add(1, o);
         }
@@ -694,6 +696,7 @@ impl WriteProfileSnapshot {
             return None;
         }
         let total = self.total_ms();
+
         Some(format!(
             "\n--- write profile: {label} ({} ops) ---\n  \
              batch_build:  {:>8.2} ms\n  \
@@ -946,6 +949,7 @@ impl MemTable {
         let path = path.as_ref().to_path_buf();
         ret.wal = Some(Wal::create_v5(&path, header)?);
         ret.wal_path = Some(path);
+
         Ok(ret)
     }
 
@@ -1290,6 +1294,7 @@ impl MemTable {
         &self,
         sorted_keys: &[(usize, &[u8])],
         read_ts: u64,
+
         bloom_hashes: &[u32],
     ) -> Vec<(usize, Bytes, Bytes)> {
         if self.is_empty() || sorted_keys.is_empty() {
@@ -1461,7 +1466,7 @@ impl MemTable {
         self.wal.as_ref().is_some_and(Wal::pitr_rotation_needed)
     }
 
-    pub(crate) fn finalize_pitr_seal(&self) -> Result<(crate::pitr_seal::V5Seal, Vec<u8>)> {
+    pub(crate) fn finalize_pitr_seal(&self) -> Result<(crate::pitr::seal::V5Seal, Vec<u8>)> {
         self.wal
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("PITR WAL is not configured"))?
@@ -1637,6 +1642,7 @@ impl MemTable {
                     // approximate_size is already approximate — Relaxed ordering
                     // is sufficient and avoids unnecessary fence overhead (L3).
                     // Use raw_ref().len() for key data size (size_of_val on KeySlice
+
                     // returns the struct size, not the data length).
                     approximate_size_delta += key.raw_ref().len() + value.len();
                 }
@@ -1764,6 +1770,7 @@ impl MemTable {
                     {
                         let insert_elapsed_ns = insert_start.elapsed().as_nanos() as u64;
                         skipmap_ns += insert_elapsed_ns;
+
                         map_ns += copy_elapsed_ns + insert_elapsed_ns;
                     }
                 }
@@ -1885,6 +1892,7 @@ impl MemTable {
                     {
                         let insert_elapsed_ns = insert_start.elapsed().as_nanos() as u64;
                         skipmap_ns += insert_elapsed_ns;
+
                         map_ns += copy_elapsed_ns + insert_elapsed_ns;
                     }
                 }
@@ -2253,7 +2261,6 @@ impl MemTable {
     }
 
     /// Insert range tombstones into the in-memory set.
-    ///
     /// Abort on panic during in-memory publication. If a panic (e.g. OOM)
     /// occurs after the WAL has durably recorded the tombstone but before
     /// the memtable has published it, unwinding would leave the engine in
@@ -2375,6 +2382,7 @@ impl MemTable {
                 hi = hi_raw;
             }
             // Two ranges overlap iff query_start <= memtable_end && memtable_start <= query_end.
+
             let l_le_hi = match lower {
                 Bound::Included(x) => x <= hi,
                 Bound::Excluded(x) => x < hi,

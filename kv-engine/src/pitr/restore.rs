@@ -7,11 +7,11 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 
 use crate::{
+    pitr::archive::{ArchiveObjectKind, archive_object_name},
+    pitr::base::PitrBaseMetadata,
+    pitr::catalog::{PitrCatalogRecord, SegmentMetadata, encode_catalog},
+    pitr::manifest::{PitrManifestRecord, PitrState, replay_pitr_records},
     pitr::{ArchiveEpochId, ChainAnchor, SegmentAnchor, SegmentId, TimelineId, WalBatch},
-    pitr_archive::{ArchiveObjectKind, archive_object_name},
-    pitr_base::PitrBaseMetadata,
-    pitr_catalog::{PitrCatalogRecord, SegmentMetadata, encode_catalog},
-    pitr_manifest::{PitrManifestRecord, PitrState, replay_pitr_records},
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -69,6 +69,7 @@ impl PitrRestorePublication {
                 && target_name != "..",
             "PITR restore target must be a single path component"
         );
+
         Ok(Self {
             target_name,
             state: RestorePublicationState::Prepared,
@@ -87,6 +88,7 @@ impl PitrRestorePublication {
         );
         self.recovery_info = Some(info);
         self.state = RestorePublicationState::RecoveryInfoWritten;
+
         Ok(())
     }
 
@@ -96,6 +98,7 @@ impl PitrRestorePublication {
             "PITR restore cannot publish before recovery info"
         );
         self.state = RestorePublicationState::Published;
+
         Ok(())
     }
 
@@ -110,6 +113,7 @@ impl PitrRestorePublication {
         let encoded = self.encoded_recovery_info()?;
         publish_recovery_info(&encoded)?;
         self.state = RestorePublicationState::Published;
+
         Ok(())
     }
 
@@ -137,9 +141,11 @@ impl PitrRestorePublication {
         }
         std::fs::rename(&info_tmp, &info_path)?;
         std::fs::File::open(staging)?.sync_all()?;
+
         match crate::checkpoint::publish_pitr_restore_staging(staging, target) {
             Ok(()) => {
                 self.state = RestorePublicationState::Published;
+
                 Ok(())
             }
             Err(error)
@@ -171,6 +177,7 @@ impl PitrRestorePublication {
             "PITR restore publication cannot be reconciled"
         );
         self.state = RestorePublicationState::Published;
+
         Ok(())
     }
 
@@ -191,6 +198,7 @@ impl PitrRestorePublication {
             .recovery_info
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("PITR recovery info has not been written"))?;
+
         Ok(serde_json::to_vec(info)?)
     }
 }
@@ -231,6 +239,7 @@ pub(crate) fn required_source_objects(
         .chain(plan.proof_segments.iter())
         .copied()
         .collect::<Vec<_>>();
+
     for segment_id in &required_segment_ids {
         let segment = segments
             .iter()
@@ -285,12 +294,13 @@ pub(crate) fn verify_source_object(object: &PitrRestoreSourceObject, bytes: &[u8
     let digest = match object.kind {
         // The sidecar is not a WAL; its name is bound to a plain whole-object digest.
         ArchiveObjectKind::Seal => Sha256::digest(bytes).into(),
-        ArchiveObjectKind::Wal => crate::pitr_seal::wal_digest(bytes, object.wal_digest_rule)?,
+        ArchiveObjectKind::Wal => crate::pitr::seal::wal_digest(bytes, object.wal_digest_rule)?,
     };
     ensure!(
         digest.as_slice() == object.digest,
         "PITR restore source object digest mismatch"
     );
+
     Ok(())
 }
 
@@ -299,6 +309,7 @@ pub(crate) fn load_verified_source_objects(
     mut reader: impl FnMut(&str) -> Result<Vec<u8>>,
 ) -> Result<Vec<(PitrRestoreSourceObject, Vec<u8>)>> {
     let mut loaded = Vec::with_capacity(objects.len());
+
     for object in objects {
         let bytes = reader(&object.name)?;
         verify_source_object(object, &bytes)?;
@@ -323,6 +334,7 @@ pub(crate) fn decode_restore_wal_batches(
         header.segment_id.0 != u64::MAX,
         "PITR restore WAL segment identity is exhausted"
     );
+
     Ok(batches)
 }
 
@@ -342,6 +354,7 @@ pub(crate) fn decode_restore_wal_batches_for_segment(
         header.predecessor == expected.predecessor,
         "PITR restore WAL predecessor does not match catalog metadata"
     );
+
     decode_restore_wal_batches(wal, limits)
 }
 
@@ -352,12 +365,13 @@ fn validate_segment_batch_range(metadata: &SegmentMetadata, batches: &[WalBatch]
             && batches.last().map(|batch| batch.commit_ts) == metadata.last_commit_ts,
         "PITR restore WAL commit range does not match catalog metadata"
     );
+
     Ok(())
 }
 
 #[cfg(target_os = "linux")]
 pub(crate) fn load_verified_archive_objects(
-    stager: &crate::pitr_archive::ArchiveObjectStager,
+    stager: &crate::pitr::archive::ArchiveObjectStager,
     objects: &[PitrRestoreSourceObject],
 ) -> Result<Vec<(PitrRestoreSourceObject, Vec<u8>)>> {
     load_verified_source_objects(objects, |name| {
@@ -406,6 +420,7 @@ impl ExactRestoreExecutor {
     ) -> Self {
         let last_commit_ts = plan.base_included_commit_ts;
         let proofs_verified = plan.proof_segments.is_empty();
+
         Self {
             plan,
             expected_sources,
@@ -426,6 +441,7 @@ impl ExactRestoreExecutor {
             "PITR restore staging has already started"
         );
         self.state = ExactRestoreState::Staging;
+
         Ok(())
     }
 
@@ -451,6 +467,7 @@ impl ExactRestoreExecutor {
             "PITR restore gap proof WALs are not verified"
         );
         self.state = ExactRestoreState::Applying;
+
         Ok(())
     }
 
@@ -507,6 +524,7 @@ impl ExactRestoreExecutor {
             "PITR restore source object set is missing WAL or seal data"
         );
         self.sources_verified = true;
+
         Ok(())
     }
 
@@ -524,6 +542,7 @@ impl ExactRestoreExecutor {
         );
         materialize()?;
         self.base_materialized = true;
+
         Ok(())
     }
 
@@ -542,6 +561,7 @@ impl ExactRestoreExecutor {
         );
         self.validate_proof_wals(objects, limits)?;
         self.proofs_verified = true;
+
         Ok(())
     }
 
@@ -554,6 +574,7 @@ impl ExactRestoreExecutor {
             .expected_sources
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("PITR restore proof sources are not canonical"))?;
+
         for metadata in &self.plan.proof_metadata {
             let expected_wal = expected
                 .iter()
@@ -610,6 +631,7 @@ impl ExactRestoreExecutor {
             self.destination_timeline_id.is_none(),
             "PITR restore destination timeline is already assigned"
         );
+
         for _ in 0..32 {
             let mut identity = [0; 16];
             fill_identity(&mut identity)?;
@@ -632,6 +654,7 @@ impl ExactRestoreExecutor {
         self.model = next_state;
         self.last_commit_ts = Some(batch.commit_ts);
         self.applied_batches = next_count;
+
         Ok(())
     }
 
@@ -658,6 +681,7 @@ impl ExactRestoreExecutor {
             batch.commit_ts <= target,
             "PITR restore batch exceeds the requested target"
         );
+
         Ok(())
     }
 
@@ -667,6 +691,7 @@ impl ExactRestoreExecutor {
         limits: crate::pitr::WalV5Limits,
     ) -> Result<()> {
         let batches = decode_restore_wal_batches(wal, limits)?;
+
         self.apply_batches_through_target(batches)
     }
 
@@ -683,6 +708,7 @@ impl ExactRestoreExecutor {
         self.validate_plan_segment(metadata)?;
         let batches = decode_restore_wal_batches_for_segment(wal, metadata, limits)?;
         validate_segment_batch_range(metadata, &batches)?;
+
         self.apply_batches_through_target(batches)
     }
 
@@ -708,6 +734,7 @@ impl ExactRestoreExecutor {
             }
             Ok(())
         })();
+
         if result.is_err() {
             self.model = model;
             self.last_commit_ts = last_commit_ts;
@@ -722,6 +749,7 @@ impl ExactRestoreExecutor {
             "PITR restore apply is not active"
         );
         self.state = ExactRestoreState::ReadyToPersist;
+
         Ok(())
     }
 
@@ -731,6 +759,7 @@ impl ExactRestoreExecutor {
             "PITR restore frontier cannot persist before apply completes"
         );
         self.state = ExactRestoreState::FrontierPersisted;
+
         Ok(())
     }
 
@@ -740,6 +769,7 @@ impl ExactRestoreExecutor {
             "PITR restore WAL cleanup cannot run before frontier persistence"
         );
         self.state = ExactRestoreState::RecoveryWalClean;
+
         Ok(())
     }
 
@@ -749,6 +779,7 @@ impl ExactRestoreExecutor {
             "PITR restore cannot publish before frontier and WAL cleanup"
         );
         self.state = ExactRestoreState::Published;
+
         Ok(())
     }
 
@@ -768,6 +799,7 @@ impl ExactRestoreExecutor {
         self.sources_verified = false;
         self.proofs_verified = self.plan.proof_segments.is_empty();
         self.base_materialized = false;
+
         Ok(())
     }
 
@@ -795,6 +827,7 @@ impl ExactRestoreExecutor {
             ),
             "PITR recovery info requires a published restore"
         );
+
         Ok(PitrRecoveryInfo {
             source_repository_id: self.plan.repository_id,
             source_timeline_id: self.plan.timeline_id,
@@ -815,6 +848,7 @@ impl ExactRestoreExecutor {
         );
         let info = self.recovery_info()?;
         self.state = ExactRestoreState::Closed;
+
         Ok(info)
     }
 
@@ -838,6 +872,7 @@ impl ExactRestoreExecutor {
             self.publish()?;
             self.recovery_info()
         })();
+
         if result.is_err() {
             let _ = self.abort();
         }
@@ -856,6 +891,7 @@ impl ExactRestoreExecutor {
             "single-WAL restore does not match the selected segment"
         );
         self.validate_plan_segment(metadata)?;
+
         self.run_exact_restore_with_segments(materialize, source_objects, limits)
     }
 
@@ -881,6 +917,7 @@ impl ExactRestoreExecutor {
         }
         self.validate_proof_wals(source_objects, limits)?;
         self.proofs_verified = true;
+
         self.run_exact_restore(materialize, source_objects, batches.into_iter().map(Ok))
     }
 
@@ -895,6 +932,7 @@ impl ExactRestoreExecutor {
             canonical == Some(metadata),
             "PITR restore segment metadata does not match the plan identity"
         );
+
         Ok(())
     }
 
@@ -920,6 +958,7 @@ impl ExactRestoreExecutor {
         }
         publication.publish_staging(staging, target)?;
         self.state = ExactRestoreState::Closed;
+
         Ok(())
     }
 
@@ -931,6 +970,7 @@ impl ExactRestoreExecutor {
             self.state != ExactRestoreState::Planned,
             "PITR restore state cannot be sanitized before staging"
         );
+
         replay_pitr_records([PitrManifestRecord::Snapshot(Box::new(PitrState {
             database_timeline_id: Some(timeline_id),
             ..PitrState::default()
@@ -988,7 +1028,7 @@ pub(crate) fn plan_exact_restore(
         records.push(PitrCatalogRecord::CommitSegment { metadata: segment });
     }
     let encoded = encode_catalog(&records)?;
-    let replay = crate::pitr_catalog::replay_catalog(&encoded)?;
+    let replay = crate::pitr::catalog::replay_catalog(&encoded)?;
     let mut retained = replay
         .records
         .into_iter()
@@ -1069,14 +1109,14 @@ pub(crate) fn plan_exact_restore(
     })
 }
 
-fn persisted_to_chain_anchor(anchor: crate::pitr_manifest::PersistedChainAnchor) -> ChainAnchor {
+fn persisted_to_chain_anchor(anchor: crate::pitr::manifest::PersistedChainAnchor) -> ChainAnchor {
     match anchor {
-        crate::pitr_manifest::PersistedChainAnchor::Genesis { archive_epoch_id } => {
+        crate::pitr::manifest::PersistedChainAnchor::Genesis { archive_epoch_id } => {
             ChainAnchor::Genesis {
                 archive_epoch_id: ArchiveEpochId(archive_epoch_id),
             }
         }
-        crate::pitr_manifest::PersistedChainAnchor::Segment {
+        crate::pitr::manifest::PersistedChainAnchor::Segment {
             segment_id,
             wal_digest,
             seal_digest,
@@ -1091,9 +1131,9 @@ fn persisted_to_chain_anchor(anchor: crate::pitr_manifest::PersistedChainAnchor)
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pitr_base::{PITR_BASE_WAL_REPLAY_VERSION, PitrBaseTimeAnchor};
-    use crate::pitr_catalog::SegmentKey;
-    use crate::pitr_manifest::{PersistedChainAnchor, PersistedRecordedAt};
+    use crate::pitr::base::{PITR_BASE_WAL_REPLAY_VERSION, PitrBaseTimeAnchor};
+    use crate::pitr::catalog::SegmentKey;
+    use crate::pitr::manifest::{PersistedChainAnchor, PersistedRecordedAt};
 
     fn base() -> PitrBaseMetadata {
         PitrBaseMetadata {
@@ -1162,6 +1202,7 @@ mod tests {
         segment.first_commit_ts = None;
         segment.last_commit_ts = None;
         segment.batch_count = 0;
+
         segment
     }
 
@@ -1276,6 +1317,7 @@ mod tests {
         assert!(verify_source_object(&matching, b"tampered").is_err());
         let loaded = load_verified_source_objects(&[matching], |name| {
             ensure!(name.ends_with(".wal"), "unexpected object request");
+
             Ok(wal.clone())
         })
         .unwrap();
@@ -1511,6 +1553,7 @@ mod tests {
             executor
                 .assign_new_timeline_with_rng(|output| {
                     *output = [0; 16];
+
                     Ok(())
                 })
                 .is_err()
@@ -1519,6 +1562,7 @@ mod tests {
         executor
             .assign_new_timeline_with_rng(|output| {
                 *output = [4; 16];
+
                 Ok(())
             })
             .unwrap();
@@ -1545,7 +1589,7 @@ mod tests {
         executor.begin_staging().unwrap();
         let destination = executor.assign_new_timeline().unwrap();
         let state = executor.sanitized_restore_state().unwrap();
-        assert_eq!(state.mode, crate::pitr_manifest::PitrMode::Disabled);
+        assert_eq!(state.mode, crate::pitr::manifest::PitrMode::Disabled);
         assert_eq!(state.database_timeline_id, Some(destination));
         assert!(state.repository_id.is_none());
         assert!(state.archive_epoch_id.is_none());
@@ -1801,6 +1845,7 @@ mod tests {
         publication
             .publish_with(|bytes| {
                 ensure!(!bytes.is_empty(), "empty recovery info");
+
                 Ok(())
             })
             .unwrap();

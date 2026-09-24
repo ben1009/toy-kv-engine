@@ -92,6 +92,7 @@ impl ControlLogWriter {
             .append(true)
             .read(true)
             .open(&path)?;
+
         Ok(Self {
             file,
             path,
@@ -103,6 +104,7 @@ impl ControlLogWriter {
     pub fn next_op_id(&mut self) -> u64 {
         let id = self.next_op_id;
         self.next_op_id += 1;
+
         id
     }
 
@@ -147,6 +149,7 @@ impl ControlLogWriter {
     /// The parent harness detects this to know when to send SIGKILL.
     pub fn write_sync_point(&mut self) -> std::io::Result<()> {
         let id = self.next_op_id();
+
         self.write_durability_boundary(id, OperationKind::SyncPoint)
     }
 
@@ -178,6 +181,7 @@ impl ControlLogReader {
         let mut records = Vec::new();
         let ends_with_newline = bytes.last().copied() == Some(b'\n');
         let mut lines = bytes.split(|&b| b == b'\n').peekable();
+
         while let Some(line_bytes) = lines.next() {
             if line_bytes.iter().all(|&b| b.is_ascii_whitespace()) {
                 continue;
@@ -230,6 +234,7 @@ impl ControlLogReader {
         // Track per-op_id the highest checkpoint seen
         use std::collections::BTreeMap;
         let mut ops: BTreeMap<u64, bool> = BTreeMap::new();
+
         for rec in &self.records {
             match rec.checkpoint {
                 Checkpoint::DurabilityBoundaryPassed => {
@@ -253,6 +258,7 @@ impl ControlLogReader {
     /// Return committed and possibly-visible records grouped by op_id.
     pub fn committed_records(&self, committed_ids: &[u64]) -> Vec<&ControlLogRecord> {
         let set: std::collections::BTreeSet<u64> = committed_ids.iter().copied().collect();
+
         self.records
             .iter()
             .filter(|r| set.contains(&r.op_id))

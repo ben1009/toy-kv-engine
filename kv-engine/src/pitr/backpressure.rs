@@ -6,7 +6,7 @@ use parking_lot::Mutex;
 use std::{collections::BTreeMap, sync::Arc};
 
 use crate::mvcc::LsmMvccInner;
-use crate::pitr_base::PublishedBaseReceipt;
+use crate::pitr::base::PublishedBaseReceipt;
 
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) struct SpoolReservation {
@@ -44,6 +44,7 @@ impl PitrSpoolAccountant {
             logical_limit > 0 && limit > 0 && maintenance_bytes > 0 && maintenance_bytes <= limit,
             "PITR accounting limits are invalid"
         );
+
         Ok(Self {
             logical_limit,
             limit,
@@ -64,6 +65,7 @@ impl PitrSpoolAccountant {
             kind != ReservationKind::Batch,
             "batch reservations must include logical WAL bytes"
         );
+
         self.reserve_with_logical(0, bytes, kind)
     }
 
@@ -73,6 +75,7 @@ impl PitrSpoolAccountant {
         physical_bytes: u64,
     ) -> Result<SpoolReservation> {
         ensure!(logical_bytes > 0, "batch logical WAL bytes must be nonzero");
+
         self.reserve_with_logical(logical_bytes, physical_bytes, ReservationKind::Batch)
     }
 
@@ -141,6 +144,7 @@ impl PitrSpoolAccountant {
                 kind,
             },
         );
+
         Ok(reservation)
     }
 
@@ -164,6 +168,7 @@ impl PitrSpoolAccountant {
             .logical_used_bytes
             .checked_sub(reservation.logical_bytes)
             .ok_or_else(|| anyhow::anyhow!("PITR logical accounting underflow"))?;
+
         Ok(())
     }
 
@@ -174,6 +179,7 @@ impl PitrSpoolAccountant {
     fn stop_admission_if_no_batches(&self) -> bool {
         let mut state = self.state.lock();
         state.admission_open = false;
+
         if state
             .reservations
             .values()
@@ -200,6 +206,7 @@ impl PitrSpoolAccountant {
         } else {
             self.limit.saturating_sub(self.maintenance_bytes)
         };
+
         user_limit.saturating_sub(state.used_bytes)
     }
 
@@ -320,6 +327,7 @@ impl SealBoundaryCoordinator {
             return false;
         }
         self.pending = Some(request);
+
         true
     }
 
@@ -347,6 +355,7 @@ impl SealBoundaryCoordinator {
         self.accounting.stop_admission();
         self.boundary = Some(boundary);
         self.state = SealBoundaryState::AdmissionStopped;
+
         Ok(())
     }
 
@@ -356,6 +365,7 @@ impl SealBoundaryCoordinator {
             "seal boundary is not stopped at requested boundary"
         );
         self.state = SealBoundaryState::Sealed;
+
         Ok(())
     }
 
@@ -388,6 +398,7 @@ impl SealBoundaryCoordinator {
         self.base_commit_high_water = Some(commit_high_water);
         self.base_sequencer_id = Some(sequencer.instance_id());
         self.state = SealBoundaryState::AdmissionStopped;
+
         Ok(())
     }
 
@@ -416,6 +427,7 @@ impl SealBoundaryCoordinator {
         self.boundary = Some(boundary);
         self.rotation_sequencer_id = Some(sequencer.instance_id());
         self.state = SealBoundaryState::AdmissionStopped;
+
         Ok(())
     }
 
@@ -425,6 +437,7 @@ impl SealBoundaryCoordinator {
             "seal rotation is not stopped at requested boundary"
         );
         self.state = SealBoundaryState::Sealed;
+
         Ok(())
     }
 
@@ -443,6 +456,7 @@ impl SealBoundaryCoordinator {
         self.last_completed_boundary = self.boundary.take();
         self.rotation_sequencer_id = None;
         self.state = SealBoundaryState::AdmissionOpen;
+
         Ok(())
     }
 
@@ -460,6 +474,7 @@ impl SealBoundaryCoordinator {
         self.boundary = None;
         self.rotation_sequencer_id = None;
         self.state = SealBoundaryState::AdmissionOpen;
+
         Ok(())
     }
 
@@ -503,6 +518,7 @@ impl SealBoundaryCoordinator {
             segment_id,
             self.barrier_generation,
         ));
+
         Ok(CapturedBaseBoundary {
             timeline_id,
             archive_epoch_id,
@@ -517,6 +533,7 @@ impl SealBoundaryCoordinator {
             self.base_commit_high_water.is_none(),
             "PITR base boundary must release commit admission"
         );
+
         self.release_admission_inner()
     }
 
@@ -548,6 +565,7 @@ impl SealBoundaryCoordinator {
             "PITR base release receipt does not match the issued boundary"
         );
         sequencer.resume_commit_admission();
+
         self.release_admission_inner()
     }
 
@@ -569,6 +587,7 @@ impl SealBoundaryCoordinator {
         self.base_commit_high_water = None;
         self.base_sequencer_id = None;
         self.base_identity = None;
+
         Ok(())
     }
 
@@ -585,6 +604,7 @@ impl SealBoundaryCoordinator {
         self.base_commit_high_water = None;
         self.base_sequencer_id = None;
         self.base_identity = None;
+
         Ok(())
     }
 

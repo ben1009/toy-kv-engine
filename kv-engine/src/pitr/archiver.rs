@@ -32,9 +32,9 @@ use anyhow::{Context, Result};
 
 #[cfg(target_os = "linux")]
 use crate::{
-    pitr_archive::{ArchiveObjectStager, ArchivePublicationOutcome, PitrArchiveCatalog},
-    pitr_catalog::SegmentMetadata,
-    pitr_limiter::PitrArchiveLimiter,
+    pitr::archive::{ArchiveObjectStager, ArchivePublicationOutcome, PitrArchiveCatalog},
+    pitr::catalog::SegmentMetadata,
+    pitr::limiter::PitrArchiveLimiter,
 };
 
 #[cfg(target_os = "linux")]
@@ -82,7 +82,7 @@ pub(crate) struct PitrArchiver {
     catalog: PitrArchiveCatalog,
     catalog_path: std::path::PathBuf,
     limiter: Arc<PitrArchiveLimiter>,
-    priority: Arc<parking_lot::Mutex<crate::pitr_api::ArchiveIoPriority>>,
+    priority: Arc<parking_lot::Mutex<crate::pitr::api::ArchiveIoPriority>>,
 }
 
 #[cfg(target_os = "linux")]
@@ -94,10 +94,11 @@ impl PitrArchiver {
     #[allow(dead_code)]
     pub(crate) fn new_with_runtime_options(
         root: impl AsRef<std::path::Path>,
-        options: &crate::pitr_api::PitrRuntimeOptions,
+        options: &crate::pitr::api::PitrRuntimeOptions,
         now: Instant,
     ) -> Result<Self> {
         options.validate()?;
+
         Self::new_with_limiter_and_priority(
             root,
             Arc::new(PitrArchiveLimiter::new(options.limiter_options(), now)),
@@ -107,7 +108,7 @@ impl PitrArchiver {
 
     pub(crate) fn new(
         root: impl AsRef<std::path::Path>,
-        options: crate::pitr_limiter::ArchiveLimiterOptions,
+        options: crate::pitr::limiter::ArchiveLimiterOptions,
         now: Instant,
     ) -> Result<Self> {
         Self::new_with_limiter(root, Arc::new(PitrArchiveLimiter::new(options, now)))
@@ -121,7 +122,7 @@ impl PitrArchiver {
             root,
             limiter,
             Arc::new(parking_lot::Mutex::new(
-                crate::pitr_api::ArchiveIoPriority::Background,
+                crate::pitr::api::ArchiveIoPriority::Background,
             )),
         )
     }
@@ -129,7 +130,7 @@ impl PitrArchiver {
     pub(crate) fn new_with_limiter_and_priority(
         root: impl AsRef<std::path::Path>,
         limiter: Arc<PitrArchiveLimiter>,
-        priority: Arc<parking_lot::Mutex<crate::pitr_api::ArchiveIoPriority>>,
+        priority: Arc<parking_lot::Mutex<crate::pitr::api::ArchiveIoPriority>>,
     ) -> Result<Self> {
         let root = root.as_ref().to_path_buf();
         let catalog_path = root.join("PITR_CATALOG_LOG");
@@ -140,6 +141,7 @@ impl PitrArchiver {
             }
             Err(error) => return Err(error.into()),
         };
+
         Ok(Self {
             stager: ArchiveObjectStager::new(&root)?,
             catalog,
@@ -193,7 +195,7 @@ impl PitrArchiver {
         let wal_chunk_count = (wal.len().saturating_add(chunk_bytes - 1) / chunk_bytes) as u64;
         let mut completed_chunks = 0_u64;
         let mut chunk_now = now;
-        if *self.priority.lock() == crate::pitr_api::ArchiveIoPriority::Background {
+        if *self.priority.lock() == crate::pitr::api::ArchiveIoPriority::Background {
             std::thread::yield_now();
         }
         let publish_result = self.stager.publish_chunked(
@@ -221,6 +223,7 @@ impl PitrArchiver {
                     }
                 }
                 completed_chunks = completed_chunks.saturating_add(1);
+
                 Ok(())
             },
         );
@@ -233,6 +236,7 @@ impl PitrArchiver {
         let previous_catalog = self.catalog.clone();
         let expected = metadata.clone();
         let publication = self.catalog.commit_segment(metadata, &prepared)?;
+
         if matches!(publication, ArchivePublicationOutcome::Committed { .. })
             && let Err(error) = self.persist_catalog()
         {
@@ -290,7 +294,7 @@ impl PitrArchiver {
             wal_path.as_ref(),
             metadata.wal_bytes,
             metadata.wal_digest,
-            crate::pitr_archive::SourceObjectDigest::Wal(metadata.wal_digest_rule()?),
+            crate::pitr::archive::SourceObjectDigest::Wal(metadata.wal_digest_rule()?),
             chunk_bytes,
             &self.limiter,
             &self.priority,
@@ -309,7 +313,7 @@ impl PitrArchiver {
             seal_path.as_ref(),
             0,
             metadata.seal_digest,
-            crate::pitr_archive::SourceObjectDigest::WholeObject,
+            crate::pitr::archive::SourceObjectDigest::WholeObject,
             chunk_bytes,
             &self.limiter,
             &self.priority,
@@ -324,6 +328,7 @@ impl PitrArchiver {
                 };
             }
         };
+
         self.archive_segment_inner(metadata, &wal, &seal, now, 1, cancellation)
     }
 
@@ -332,14 +337,15 @@ impl PitrArchiver {
     }
 
     pub(crate) fn committed_segment_ids(&self) -> Result<std::collections::BTreeSet<u64>> {
-        let replay = crate::pitr_catalog::replay_catalog(self.catalog.bytes())?;
+        let replay = crate::pitr::catalog::replay_catalog(self.catalog.bytes())?;
         let mut ids = std::collections::BTreeSet::new();
+
         for record in replay.records {
             match record {
-                crate::pitr_catalog::PitrCatalogRecord::CommitSegment { metadata } => {
+                crate::pitr::catalog::PitrCatalogRecord::CommitSegment { metadata } => {
                     ids.insert(metadata.key.segment_id.0);
                 }
-                crate::pitr_catalog::PitrCatalogRecord::RetentionSnapshot(snapshot) => {
+                crate::pitr::catalog::PitrCatalogRecord::RetentionSnapshot(snapshot) => {
                     ids.extend(
                         snapshot
                             .segments
@@ -347,7 +353,7 @@ impl PitrArchiver {
                             .map(|metadata| metadata.key.segment_id.0),
                     );
                 }
-                crate::pitr_catalog::PitrCatalogRecord::CoverageBreak(_) => {}
+                crate::pitr::catalog::PitrCatalogRecord::CoverageBreak(_) => {}
             }
         }
         Ok(ids)
@@ -407,6 +413,7 @@ impl PitrArchiver {
             }
             Ok(())
         })();
+
         if result.is_err() {
             let _ = std::fs::remove_file(&temp_path);
         }
@@ -415,16 +422,17 @@ impl PitrArchiver {
 
     fn revalidate_segment(&self, expected: &SegmentMetadata) -> Result<bool> {
         let bytes = std::fs::read(&self.catalog_path)?;
-        let replay = crate::pitr_catalog::replay_catalog(&bytes)?;
+        let replay = crate::pitr::catalog::replay_catalog(&bytes)?;
+
         Ok(replay.records.iter().any(|record| match record {
-            crate::pitr_catalog::PitrCatalogRecord::CommitSegment { metadata } => {
+            crate::pitr::catalog::PitrCatalogRecord::CommitSegment { metadata } => {
                 metadata == expected
             }
-            crate::pitr_catalog::PitrCatalogRecord::RetentionSnapshot(snapshot) => snapshot
+            crate::pitr::catalog::PitrCatalogRecord::RetentionSnapshot(snapshot) => snapshot
                 .segments
                 .iter()
                 .any(|metadata| metadata == expected),
-            crate::pitr_catalog::PitrCatalogRecord::CoverageBreak(_) => false,
+            crate::pitr::catalog::PitrCatalogRecord::CoverageBreak(_) => false,
         }))
     }
 }
@@ -450,10 +458,10 @@ fn read_source_object(
     path: &std::path::Path,
     expected_bytes: u64,
     expected_digest: [u8; 32],
-    digest: crate::pitr_archive::SourceObjectDigest,
+    digest: crate::pitr::archive::SourceObjectDigest,
     chunk_bytes: usize,
     limiter: &PitrArchiveLimiter,
-    priority: &parking_lot::Mutex<crate::pitr_api::ArchiveIoPriority>,
+    priority: &parking_lot::Mutex<crate::pitr::api::ArchiveIoPriority>,
     now: Instant,
     cancellation: Option<&std::sync::atomic::AtomicBool>,
 ) -> Result<Vec<u8>> {
@@ -495,7 +503,7 @@ fn read_source_object(
                 }
             }
         }
-        if *priority.lock() == crate::pitr_api::ArchiveIoPriority::Background {
+        if *priority.lock() == crate::pitr::api::ArchiveIoPriority::Background {
             std::thread::yield_now();
         }
         std::io::Read::read_exact(&mut file, &mut chunk[..amount.get() as usize])?;
@@ -513,6 +521,7 @@ fn read_source_object(
         digest.digest(&bytes)?.as_slice() == expected_digest,
         "PITR source object digest does not match segment metadata"
     );
+
     Ok(bytes)
 }
 
@@ -538,6 +547,7 @@ fn wait_for_archive_tokens(
     cancellation: Option<&std::sync::atomic::AtomicBool>,
 ) -> Result<()> {
     const SLICE: Duration = Duration::from_millis(50);
+
     while !wait.is_zero() {
         check_archive_cancellation(cancellation)?;
         let slice = wait.min(SLICE);
@@ -551,9 +561,9 @@ fn wait_for_archive_tokens(
 mod tests {
     use super::*;
     use crate::{
+        pitr::catalog::{SegmentKey, SegmentMetadata},
+        pitr::limiter::ArchiveLimiterOptions,
         pitr::{ArchiveEpochId, ChainAnchor, SegmentAnchor, SegmentId, TimelineId},
-        pitr_catalog::{SegmentKey, SegmentMetadata},
-        pitr_limiter::ArchiveLimiterOptions,
     };
     use sha2::{Digest, Sha256};
     use std::path::PathBuf;
@@ -581,6 +591,7 @@ mod tests {
         let wal_digest =
             crate::tests::harness::pitr_wal_digest(&wal_bytes(), crate::pitr::WAL_V5_VERSION);
         let seal_digest = Sha256::digest(b"seal").into();
+
         SegmentMetadata {
             key: SegmentKey {
                 repository_id: [1; 16],
@@ -691,7 +702,7 @@ mod tests {
         // After the legacy segment's range, which ends at 2.
         let successor_wal = crate::tests::harness::pitr_segment_wal_bytes_at(successor_header, 3);
         let (successor_seal_parsed, successor_seal) =
-            crate::pitr_seal::build_v5_seal(&successor_wal).unwrap();
+            crate::pitr::seal::build_v5_seal(&successor_wal).unwrap();
         let successor = SegmentMetadata {
             key: SegmentKey {
                 repository_id: [1; 16],
@@ -731,12 +742,12 @@ mod tests {
 
         // The catalog keeps both, in order, with the successor still anchored to the
         // legacy digest - the value that only the legacy rule reproduces.
-        let replay = crate::pitr_catalog::replay_catalog(archiver.catalog_bytes()).unwrap();
+        let replay = crate::pitr::catalog::replay_catalog(archiver.catalog_bytes()).unwrap();
         let committed = replay
             .records
             .iter()
             .filter_map(|record| match record {
-                crate::pitr_catalog::PitrCatalogRecord::CommitSegment { metadata } => {
+                crate::pitr::catalog::PitrCatalogRecord::CommitSegment { metadata } => {
                     Some(metadata.clone())
                 }
                 _ => None,
@@ -760,55 +771,55 @@ mod tests {
             (&committed[0], &legacy_wal),
             (&committed[1], &successor_wal),
         ] {
-            let name = crate::pitr_archive::archive_object_name(
+            let name = crate::pitr::archive::archive_object_name(
                 metadata.key.timeline_id,
                 metadata.key.archive_epoch_id,
                 metadata.key.segment_id,
-                crate::pitr_archive::ArchiveObjectKind::Wal,
+                crate::pitr::archive::ArchiveObjectKind::Wal,
                 metadata.wal_digest,
             );
             let stored = std::fs::read(wal_dir.join(&name)).unwrap();
             assert_eq!(&stored, wal);
-            let object = crate::pitr_restore::PitrRestoreSourceObject {
+            let object = crate::pitr::restore::PitrRestoreSourceObject {
                 segment_id: metadata.key.segment_id,
-                kind: crate::pitr_archive::ArchiveObjectKind::Wal,
+                kind: crate::pitr::archive::ArchiveObjectKind::Wal,
                 name,
                 digest: metadata.wal_digest,
                 bytes: Some(metadata.wal_bytes),
                 wal_digest_rule: metadata.wal_digest_rule().unwrap(),
             };
-            crate::pitr_restore::verify_source_object(&object, &stored).unwrap();
+            crate::pitr::restore::verify_source_object(&object, &stored).unwrap();
             // A flipped padding byte is refused here under either rule - the parser
             // rejects a nonzero alignment gap before any digest is compared - so this
             // asserts the object is not accepted, not that the legacy rule caught it.
             // That the legacy digest covers the padding is pinned by the frozen
-            // fixture's `wal_digest == SHA256(file)` in `pitr_seal.rs`.
+            // fixture's `wal_digest == SHA256(file)` in `pitr/seal.rs`.
             let mut tampered = stored.clone();
             let last = tampered.len() - 1;
             tampered[last] ^= 1;
-            assert!(crate::pitr_restore::verify_source_object(&object, &tampered).is_err());
+            assert!(crate::pitr::restore::verify_source_object(&object, &tampered).is_err());
         }
         // The new rule does not cover its padding, so the parser is what refuses a
         // corrupted gap there: pin that the narrowing is deliberate.
-        let name = crate::pitr_archive::archive_object_name(
+        let name = crate::pitr::archive::archive_object_name(
             committed[1].key.timeline_id,
             committed[1].key.archive_epoch_id,
             committed[1].key.segment_id,
-            crate::pitr_archive::ArchiveObjectKind::Wal,
+            crate::pitr::archive::ArchiveObjectKind::Wal,
             committed[1].wal_digest,
         );
         let mut tampered = successor_wal.clone();
         let gap = crate::pitr::WAL_V5_HEADER_LEN + crate::pitr::WAL_V5_BATCH_HEADER_LEN + 64;
         tampered[gap] ^= 1;
-        let object = crate::pitr_restore::PitrRestoreSourceObject {
+        let object = crate::pitr::restore::PitrRestoreSourceObject {
             segment_id: committed[1].key.segment_id,
-            kind: crate::pitr_archive::ArchiveObjectKind::Wal,
+            kind: crate::pitr::archive::ArchiveObjectKind::Wal,
             name,
             digest: committed[1].wal_digest,
             bytes: Some(committed[1].wal_bytes),
             wal_digest_rule: committed[1].wal_digest_rule().unwrap(),
         };
-        assert!(crate::pitr_restore::verify_source_object(&object, &tampered).is_err());
+        assert!(crate::pitr::restore::verify_source_object(&object, &tampered).is_err());
     }
 
     #[test]
@@ -930,12 +941,12 @@ mod tests {
             },
             Instant::now(),
         );
-        let priority = parking_lot::Mutex::new(crate::pitr_api::ArchiveIoPriority::Background);
+        let priority = parking_lot::Mutex::new(crate::pitr::api::ArchiveIoPriority::Background);
         let error = read_source_object(
             &path,
             3,
             Sha256::digest(b"wal").into(),
-            crate::pitr_archive::SourceObjectDigest::WholeObject,
+            crate::pitr::archive::SourceObjectDigest::WholeObject,
             2,
             &limiter,
             &priority,
@@ -1051,7 +1062,7 @@ mod tests {
         let status = std::process::Command::new(std::env::current_exe().unwrap())
             .arg("--exact")
             .arg(
-                "pitr_archiver::tests::process_kill_after_catalog_rename_reopens_committed_segment",
+                "pitr::archiver::tests::process_kill_after_catalog_rename_reopens_committed_segment",
             )
             .arg("--nocapture")
             .env("PITR_PROCESS_KILL_CHILD_ROOT", root.path())
@@ -1098,7 +1109,7 @@ mod tests {
         let status = std::process::Command::new(std::env::current_exe().unwrap())
             .arg("--exact")
             .arg(
-                "pitr_archiver::tests::process_kill_after_object_rename_does_not_advertise_segment",
+                "pitr::archiver::tests::process_kill_after_object_rename_does_not_advertise_segment",
             )
             .arg("--nocapture")
             .env("PITR_PROCESS_OBJECT_CHILD_ROOT", root.path())
@@ -1138,7 +1149,7 @@ mod tests {
         let status = std::process::Command::new(std::env::current_exe().unwrap())
             .arg("--exact")
             .arg(
-                "pitr_archiver::tests::process_kill_after_catalog_dir_sync_reopens_committed_segment",
+                "pitr::archiver::tests::process_kill_after_catalog_dir_sync_reopens_committed_segment",
             )
             .arg("--nocapture")
             .env("PITR_PROCESS_CATALOG_SYNC_CHILD_ROOT", root.path())

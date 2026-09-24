@@ -33,6 +33,7 @@ impl SsTableIterator {
         crate::scan_trace::note_block_load();
         let b = table.read_block_cached_with_admission(0, cache_admission)?;
         table.prefetch_block(1);
+
         Ok(SsTableIterator {
             table,
             blk_iter: BlockIterator::create_and_seek_to_first(b),

@@ -171,6 +171,7 @@ impl ValueLogBuilder {
     /// Create a new `ValueLogBuilder` for the given file.
     pub fn create(path: PathBuf, file_id: u32, options: ValueSeparationOptions) -> Result<Self> {
         let writer = ValueLogWriter::create(path, file_id)?;
+
         Ok(Self {
             writer,
             file_id,

@@ -1,9 +1,18 @@
 # RFC 012: Parallel WAL — io_uring + O_DIRECT
 
-**Status:** Proposed
+**Status:** Partially implemented
 **Date:** 2026-06-26
 **Author:** kv-engine Contributors
 **Reference:** SpanDB (FAST 2021) — "SpanDB: A Fast, Cost-Effective LSM-tree Based KV Store on Hybrid Storage"
+
+The MVCC WAL path now uses registered io_uring and O_DIRECT writes with
+buffered recovery reads. The synchronous fallback proposed below is not
+implemented: if io_uring or O_DIRECT initialization fails for an MVCC WAL,
+creation or reopen returns an error. Legacy non-MVCC WALs continue using the
+buffered path.
+
+The remaining sections preserve the original proposal. For shipped behavior,
+see `kv-engine/src/wal.rs` and the WAL tests under `kv-engine/src/tests/`.
 
 ---
 
@@ -23,11 +32,11 @@ fsync waits for all prior writes, replacing the need for an explicit sequencer.
 
 ---
 
-## 2. Motivation
+## 2. Motivation (Original Proposal)
 
-### Current Bottleneck
+### Pre-Implementation Bottleneck
 
-The current WAL uses a single-leader group commit:
+At the time of this proposal, the WAL used a single-leader group commit:
 
 ```text
 8 writers → leader drains → sequential BufWriter::write_all → flush → fsync → wake 8
@@ -37,7 +46,7 @@ The current WAL uses a single-leader group commit:
 
 The leader does all the work. The other 7 threads wait.
 
-### What Changes
+### Proposed Change
 
 ```text
 8 writers → encode buffers → submit 8 SQEs + 1 fsync(DRAIN) → io_uring_enter
@@ -902,7 +911,7 @@ mod io_uring_wal {
 }
 ```
 
-**Fallback format consistency:** The fallback path continues writing v3-format
+**Proposed fallback format consistency:** The fallback path would continue writing v3-format
 batches (16-byte headers, no alignment padding). This ensures the fallback
 WAL is readable by the existing v3 recovery logic without the v4 alignment-gap
 skipping. Only the io_uring path writes v4-format batches. The WAL file header
@@ -978,7 +987,7 @@ across N SQEs.
 | 6 | Update recovery to use buffered handle | `wal.rs` |
 | 7 | Add `Wal::close()` for ring cleanup | `wal.rs` |
 | 8 | Add fallback to current group commit | `wal.rs` |
-| 9 | Add tests | `tests/wal.rs` |
+| 9 | Add tests | `src/tests/wal.rs` |
 | 10 | Benchmark | — |
 
 ---

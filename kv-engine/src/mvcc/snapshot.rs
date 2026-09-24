@@ -77,6 +77,7 @@ impl Snapshot {
             .inner
             .storage
             .scan_with_ts(lower, upper, self.inner.read_ts)?;
+
         Ok(SnapshotScanIterator {
             _snap: self.inner.clone(),
             iter,
@@ -100,6 +101,7 @@ impl Snapshot {
             self.inner
                 .storage
                 .scan_with_prefix_hint(lower, upper, self.inner.read_ts, prefix)?;
+
         Ok(SnapshotScanIterator {
             _snap: self.inner.clone(),
             iter,
@@ -120,6 +122,7 @@ impl Snapshot {
         let snap = Arc::clone(&self.inner);
         let key = Bytes::copy_from_slice(key);
         let blocking = snap.storage.blocking.clone();
+
         async move {
             blocking
                 .run_result(move || {
@@ -141,6 +144,7 @@ impl Snapshot {
         let lower_owned = lower.map(Bytes::copy_from_slice);
         let upper_owned = upper.map(Bytes::copy_from_slice);
         let blocking = self.inner.storage.blocking.clone();
+
         async move {
             let cursor_blocking = blocking.clone();
             blocking
@@ -161,6 +165,7 @@ impl Snapshot {
                     let storage = Arc::clone(&snap.storage);
                     let read_ts = snap.read_ts;
                     let iter = storage.scan_with_ts(lower, upper, read_ts)?;
+
                     Ok(AsyncSnapshotScan {
                         inner: Arc::new(Mutex::new(SnapshotScanIterator { _snap: snap, iter })),
                         blocking: cursor_blocking,
@@ -179,6 +184,7 @@ impl Snapshot {
         let prefix_owned = Bytes::copy_from_slice(prefix);
         let upper_owned = prefix_upper_bound(prefix).map(Bytes::from);
         let blocking = self.inner.storage.blocking.clone();
+
         async move {
             let cursor_blocking = blocking.clone();
             blocking
@@ -200,6 +206,7 @@ impl Snapshot {
                             prefix_owned.as_ref(),
                         )?
                     };
+
                     Ok(AsyncSnapshotScan {
                         inner: Arc::new(Mutex::new(SnapshotScanIterator { _snap: snap, iter })),
                         blocking: cursor_blocking,
@@ -222,6 +229,7 @@ impl Snapshot {
         let snap = Arc::clone(&self.inner);
         let lower_owned = lower.map(Bytes::copy_from_slice);
         let upper_owned = upper.map(Bytes::copy_from_slice);
+
         async move {
             use std::ops::Bound::*;
             let lower = match &lower_owned {
@@ -250,6 +258,7 @@ impl Snapshot {
         let snap = Arc::clone(&self.inner);
         let prefix_owned = Bytes::copy_from_slice(prefix);
         let upper_owned = prefix_upper_bound(prefix).map(Bytes::from);
+
         async move {
             let storage = Arc::clone(&snap.storage);
             if prefix_owned.is_empty() {
@@ -342,6 +351,7 @@ impl AsyncSnapshotScan {
     ) -> impl std::future::Future<Output = Result<Option<(Bytes, Bytes)>>> + Send {
         let inner = Arc::clone(&self.inner);
         let blocking = self.blocking.clone();
+
         async move {
             blocking
                 .run_result(move || {

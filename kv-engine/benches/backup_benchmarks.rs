@@ -62,6 +62,7 @@ struct MeasuredBackup {
 impl Drop for MeasuredBackup {
     fn drop(&mut self) {
         let keys = ACCOUNTING_KEYS.get_or_init(|| Mutex::new(HashSet::new()));
+
         if keys.lock().insert(self.scenario_name.clone()) {
             ACCOUNTING
                 .get_or_init(|| Mutex::new(Vec::new()))
@@ -96,6 +97,7 @@ fn options(value_separation: bool) -> LsmStorageOptions {
         min_value_size: VLOG_THRESHOLD,
         ..Default::default()
     });
+
     options
 }
 
@@ -103,6 +105,7 @@ fn seed(value_separation: bool, value_size: usize, entry_count: usize) -> Scenar
     let dir = tempfile::tempdir().unwrap();
     let engine = KvEngine::open(dir.path().join("db"), options(value_separation)).unwrap();
     let value = vec![0xAB; value_size];
+
     for index in 0..entry_count {
         let key = format!("key-{index:06}");
         engine.put(key.as_bytes(), &value).unwrap();
@@ -149,6 +152,7 @@ fn run_backup(
     entry_count: usize,
 ) -> MeasuredBackup {
     let info = backup_once(&scenario.engine, &scenario.repository);
+
     MeasuredBackup {
         scenario,
         scenario_name: scenario_name.to_owned(),

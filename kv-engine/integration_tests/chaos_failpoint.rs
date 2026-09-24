@@ -26,6 +26,7 @@ fn is_io_uring_unavailable_error(e: &anyhow::Error) -> bool {
 fn skip_if_io_uring_unavailable(opts: &LsmStorageOptions) -> bool {
     let dir = tempfile::tempdir().expect("tempdir");
     let db_path = dir.path().join("probe");
+
     match KvEngine::open(&db_path, opts.clone()) {
         Ok(engine) => {
             let _ = engine.close();

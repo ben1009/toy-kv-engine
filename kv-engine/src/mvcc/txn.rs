@@ -109,6 +109,7 @@ impl Transaction {
         let read_ts = self.read_ts;
         let key = Bytes::copy_from_slice(key);
         let blocking = self.blocking.clone();
+
         async move {
             anyhow::ensure!(
                 !committed.load(std::sync::atomic::Ordering::SeqCst),
@@ -149,6 +150,7 @@ impl Transaction {
         // Position at first entry (same as MemTableIterator::scan).
         local_iter.next()?;
         let merged = TwoMergeIterator::create(local_iter, lsm_iter)?;
+
         TxnIterator::create(
             self.read_set.clone(),
             Arc::clone(&self.read_guard),
@@ -187,6 +189,7 @@ impl Transaction {
         );
         local_iter.next()?;
         let merged = TwoMergeIterator::create(local_iter, lsm_iter)?;
+
         TxnIterator::create(
             self.read_set.clone(),
             Arc::clone(&self.read_guard),
@@ -213,6 +216,7 @@ impl Transaction {
         let lower_owned = lower.map(Bytes::copy_from_slice);
         let upper_owned = upper.map(Bytes::copy_from_slice);
         let blocking = self.blocking.clone();
+
         async move {
             anyhow::ensure!(
                 !committed.load(std::sync::atomic::Ordering::SeqCst),
@@ -244,6 +248,7 @@ impl Transaction {
                     );
                     local_iter.next()?;
                     let merged = TwoMergeIterator::create(local_iter, lsm_iter)?;
+
                     Ok(AsyncTxnScan {
                         inner: Arc::new(Mutex::new(TxnIterator::create(
                             read_set,
@@ -275,6 +280,7 @@ impl Transaction {
         let prefix = Bytes::copy_from_slice(prefix);
         let upper_bound = prefix_upper_bound(&prefix);
         let blocking = self.blocking.clone();
+
         async move {
             anyhow::ensure!(
                 !committed.load(std::sync::atomic::Ordering::SeqCst),
@@ -312,6 +318,7 @@ impl Transaction {
                     );
                     local_iter.next()?;
                     let merged = TwoMergeIterator::create(local_iter, lsm_iter)?;
+
                     Ok(AsyncTxnScan {
                         inner: Arc::new(Mutex::new(TxnIterator::create(
                             read_set,
@@ -782,6 +789,7 @@ impl StorageIterator for TxnIterator {
     fn next(&mut self) -> Result<()> {
         // Advance past current entry, then skip tombstones.
         self.iter.next()?;
+
         while self.iter.is_valid() && crate::vlog::KvKind::is_tombstone_value(self.iter.value()) {
             self.iter.next()?;
         }
@@ -812,6 +820,7 @@ impl AsyncTxnScan {
     ) -> impl std::future::Future<Output = Result<Option<(Bytes, Bytes)>>> + Send {
         let inner = Arc::clone(&self.inner);
         let blocking = self.blocking.clone();
+
         async move {
             blocking
                 .run_result(move || {

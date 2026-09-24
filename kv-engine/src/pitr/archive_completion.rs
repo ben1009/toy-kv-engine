@@ -5,7 +5,7 @@ use std::collections::BTreeSet;
 
 use anyhow::{Result, ensure};
 
-use crate::pitr_segment::{PitrSegmentManager, SegmentState};
+use crate::pitr::segment::{PitrSegmentManager, SegmentState};
 
 #[derive(Debug)]
 pub(crate) struct PitrArchiveCompletion {
@@ -71,6 +71,7 @@ impl PitrArchiveCompletion {
             manifest_archived.is_subset(&published),
             "source manifest Archived state lacks catalog commit"
         );
+
         Ok(Self {
             segments,
             published,
@@ -91,6 +92,7 @@ impl PitrArchiveCompletion {
             self.published.insert(segment_id),
             "archive completion already recorded"
         );
+
         Ok(())
     }
 
@@ -105,6 +107,7 @@ impl PitrArchiveCompletion {
         );
         self.segments.mark_archived(segment_id)?;
         self.manifest_archived.insert(segment_id);
+
         Ok(())
     }
 
@@ -121,6 +124,7 @@ impl PitrArchiveCompletion {
         self.segments.release_archive_pin(segment_id)?;
         self.published.remove(&segment_id);
         self.manifest_archived.remove(&segment_id);
+
         Ok(())
     }
 
@@ -140,6 +144,7 @@ mod tests {
         let mut segments = PitrSegmentManager::new(1, 32 * 1024).unwrap();
         segments.begin_sealing(8192, 4096).unwrap();
         segments.mark_sealed(1).unwrap();
+
         PitrArchiveCompletion::new(segments)
     }
 

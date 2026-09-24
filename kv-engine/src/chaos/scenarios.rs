@@ -21,6 +21,7 @@ impl ScenarioConfig {
         let mut opts = LsmStorageOptions::default_for_test();
         opts.enable_wal = true;
         opts.manifest_snapshot_threshold_bytes = 0;
+
         Self {
             name: "wal-only",
             num_keys: 150,
@@ -33,6 +34,7 @@ impl ScenarioConfig {
         let mut opts = LsmStorageOptions::default_for_test();
         opts.enable_wal = true;
         opts.manifest_snapshot_threshold_bytes = 0;
+
         Self {
             name: "flush-boundary",
             num_keys: 80,
@@ -45,6 +47,7 @@ impl ScenarioConfig {
         let mut opts = LsmStorageOptions::default_for_test();
         opts.enable_wal = true;
         opts.manifest_snapshot_threshold_bytes = 256;
+
         Self {
             name: "manifest-snapshot",
             num_keys: 100,
@@ -61,6 +64,7 @@ impl ScenarioConfig {
         // in the MVP — default_for_test() already sets both off, but be explicit.
         opts.serializable = false;
         opts.value_separation = None;
+
         Self {
             name: "range-tombstone",
             num_keys: 100,
@@ -84,6 +88,7 @@ impl ScenarioConfig {
             max_open_vlog_files: 64,
             value_cache_capacity_bytes: 0, // disable cache to exercise read path
         });
+
         Self {
             name: "vlog",
             num_keys: 80,
@@ -106,6 +111,7 @@ impl ScenarioConfig {
                 max_levels: 3,
                 base_level_size_mb: 1,
             });
+
         Self {
             name: "leveled-compaction",
             num_keys: 60,
@@ -129,6 +135,7 @@ impl ScenarioConfig {
                 min_merge_width: 2,
                 max_merge_width: None,
             });
+
         Self {
             name: "tiered-compaction",
             num_keys: 60,

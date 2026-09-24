@@ -18,12 +18,14 @@ use kv_engine::vlog::reader::ValueLogReader;
 /// Construct the benchmark key for entry `i` at the given key size.
 fn make_key(i: usize, key_size: usize) -> Vec<u8> {
     let key = format!("key_{:0width$}", i, width = key_size.saturating_sub(4));
+
     key.into_bytes()[..key_size].to_vec()
 }
 
 /// Build a VlogIndex with `n` entries of the given key/value size.
 fn make_index(n: usize, key_size: usize, value_size: usize) -> VlogIndex {
     let mut idx = VlogIndex::new(1);
+
     for i in 0..n {
         idx.add_entry((i as u64) * 100, make_key(i, key_size), value_size as u32);
     }

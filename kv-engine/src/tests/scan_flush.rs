@@ -12,6 +12,7 @@ use crate::{
 
 fn wal_files_in_dir(path: &std::path::Path) -> Vec<std::path::PathBuf> {
     let mut wals = Vec::new();
+
     for entry in std::fs::read_dir(path).unwrap() {
         let entry = entry.unwrap();
         let p = entry.path();
@@ -340,6 +341,7 @@ fn test_wal_gc_with_background_flush_thread() {
     // Poll until at least one WAL is deleted, proving a flush ran and cleaned up.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     let mut final_wals = wal_files_in_dir(dir.path());
+
     while final_wals.len() >= 4 {
         assert!(
             std::time::Instant::now() < deadline,

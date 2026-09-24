@@ -1,7 +1,6 @@
 # MVCC / GC / Perf TODO
 
 **RFC:** [rfcs/005-mvcc.md](rfcs/005-mvcc.md)
-**Plan:** [.claude/plans/mvcc.md](.claude/plans/mvcc.md)
 
 ---
 
