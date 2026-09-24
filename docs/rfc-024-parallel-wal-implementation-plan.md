@@ -104,19 +104,24 @@ ticket whose MVCC publication is delayed until after a later WAL failure.
   A batch exceeding the hard cap fails before allocation or ticket assignment.
 - Under one short admission mutex, recheck open/poisoned state and the current
   file cap, then assign `ticket`, advance `admitted_end`, and enqueue the ready
-  buffer atomically. `sync`, close, and rotation capture cutoffs using that
-  mutex. Rejection consumes neither a ticket nor a file range.
+  buffer and its encoded aligned length atomically. `sync`, close, and rotation
+  capture cutoffs using that mutex. Rejection consumes neither a ticket nor a
+  file range.
 - Pack contiguous tickets into groups and reserve aligned offsets in ticket
   order. Include the 4 KiB header, alignment, and rounded 1 MiB preallocation
   extent in the v4 1 GiB cap check. Move `fallocate` and its `ftruncate`
   fallback outside the producer mutex and serialize only the worker-side
-  preallocation watermark.
+  preallocation watermark. Assert `header_end <= reserved_end <= admitted_end
+  <= WAL_CAP` and `reserved_end <= preallocated_end <= WAL_CAP`. The packer
+  must use the aligned length stored at admission; it must not re-encode a
+  batch or recompute its length.
 - Return a distinct retryable `WAL full` only when the batch fits an empty WAL.
   A batch too large for an empty WAL or the buffer cap is a terminal error.
   Do not let the worker wait for engine rotation.
 
 **Exit:** Allocation/encoding failures and prepared-buffer races with close
-or rotation leave no ticket or offset hole. A blocked `fallocate` does not
+or rotation leave no ticket or offset hole. Mixed batch sizes preserve the
+stored admission lengths through packing. A blocked `fallocate` does not
 block producer admission. The accounting model enforces both resident limits,
 including an oversized batch; worker wakeups and buffer recycling are verified
 after the worker exists.
@@ -124,10 +129,12 @@ after the worker exists.
 ### 4. Dedicated write worker and buffer ownership
 
 - Give the candidate worker exclusive ownership of its registered 256-SQE
-  ring, direct file descriptor, submitted buffers, and CQEs. Submit SQEs from
-  at least two groups before waiting for all of either group's completions;
-  never call `submit_and_wait(group_len)` for each group. Bound the entire
-  ring to eight groups and 256 SQEs, including chunked large groups.
+  ring, submitted buffers, and CQEs. The worker and sync coordinator must each
+  hold an owned reference to the WAL file (`Arc<File>` or an owned cloned
+  `File`); never hand the coordinator a borrowed `RawFd`. Submit SQEs from at
+  least two groups before waiting for all of either group's completions; never
+  call `submit_and_wait(group_len)` for each group. Bound the entire ring to
+  eight groups and 256 SQEs, including chunked large groups.
 - Tag each request with group and buffer identity. Handle partial submission,
   `EINTR`, negative or short CQEs, stale identities, and completions arriving
   out of group order. Mark a group written only after all its writes have
@@ -153,12 +160,15 @@ verified after the coordinator exists.
 - Make `submit_and_commit(ticket)` wait for **its own** durable result. Preserve
   an already acknowledged ticket if a later group fails. Keep `sync()`'s
   captured cutoff and empty no-op behavior.
-- Close admission, drain the captured cutoff, stop the worker, consume or
-  cancel terminal requests, and join it before releasing buffers or the file.
-  If kernel ownership cannot be proved released after a failed shutdown,
-  retain or deliberately leak the worker-owned state rather than free a
-  possibly referenced `DirectBuf`. Integrate with the separate async-close
-  prerequisite before enabling this path through `close_async`.
+- Close admission and capture the final cutoff. Have the packer/worker submit
+  the admitted groups through that cutoff, drain or cancel terminal requests,
+  and consume all CQEs. Once no writes remain, stop and join the WAL worker;
+  then have the sync coordinator complete the final captured written prefix
+  and stop and join it. Drop the shared file references only after both threads
+  have joined. On failure, retain any thread, file, and buffer ownership whose
+  safe release is unproven; leak unresolved state rather than free a possibly
+  referenced `DirectBuf`. Integrate with the separate async-close prerequisite
+  before enabling this path through `close_async`.
 - Integrate retryable `WAL full` across point writes, TTL writes, deletes,
   batches, range tombstones, and transaction commits. After releasing
   `active_memtable_lock`, force a v4 memtable/WAL rotation under the existing
@@ -226,8 +236,13 @@ passing result for this gate.
 - Report end-to-end throughput and p50/p99, CPU, publication wait, group and
   sync coalescing, `inflight_groups`, `outstanding_write_sqes`, CQEs, worker
   wakeups, preallocation, physical WAL bytes, and measured device queue depth
-  only when available. Include PITR-on control runs and prove the candidate
-  actually reaches two simultaneous in-flight groups.
+  only when available. For every sync, record wall time, captured target,
+  `written_frontier` at sync start/end, and counts of write SQEs submitted,
+  CQEs completed, and groups completed during the call. This distinguishes
+  software concurrency from writes that actually progress while `fdatasync`
+  runs. Include PITR-on controls, run on a device-backed filesystem (ext4 or
+  XFS on NVMe where available), and prove the candidate reaches two groups in
+  flight.
 
 **Adopt only if:** The four-writer case improves beyond the same-session null
 spread; a representative device-backed workload gains at least 10% paired
