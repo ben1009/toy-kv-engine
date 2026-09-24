@@ -146,7 +146,10 @@ verified after the coordinator exists.
   Treat a background-worker join error or panic in either close path as a
   terminal shutdown outcome too: settle or retain WAL worker/buffer ownership,
   wake all later close callers, and propagate the failure rather than leaving
-  them waiting forever or reporting a successful close prematurely.
+  them waiting forever or reporting a successful close prematurely. Make async
+  quiescence and closed-state waits race-free: register for notification before
+  rechecking the state (or use an equivalent state-bearing channel), so a
+  transition between the check and await cannot strand a waiter.
 - Integrate retryable `WAL full` across point writes, TTL writes, deletes,
   batches, range tombstones, and transaction commits. After releasing
   `active_memtable_lock`, force a v4 memtable/WAL rotation under the existing
@@ -181,12 +184,15 @@ verified after the coordinator exists.
   retain the transaction's engine `AdmissionGuard` until it finishes, even if
   the awaiting future and `Transaction` are dropped; otherwise engine close
   can pass lifecycle quiescence before the commit admits its WAL ticket.
-  Likewise, move the lifecycle guard for ordinary async writes, `sync_async`,
-  `force_flush_async`, and `drain_flush_async` into each spawned blocking
-  closure. Once spawned, that guard must outlive future cancellation and remain
-  held through WAL-full rotation/retry, WAL freeze/flush, and final publication
-  or sync completion; a cancelled future still waiting for an executor slot
-  may simply drop its guard because no task was spawned.
+  Likewise, audit every async engine API that spawns blocking work touching
+  `LsmStorageInner`: move its lifecycle guard into the spawned closure or
+  returned cursor, including ordinary reads/writes, `sync_async`, flush/drain,
+  full compaction, and compaction-filter removal. In particular,
+  `batch_get_async` must retain its currently discarded admission guard.
+  Once spawned, the guard must outlive future cancellation and remain held
+  through WAL-full rotation/retry, WAL freeze/flush, and final publication or
+  task completion; a cancelled future still waiting for an executor slot may
+  simply drop its guard because no task was spawned.
   Apply the same admission cutoff rule to explicit sync and close.
 
 **Exit:** No writer can straddle old and successor WALs. A later poisoned
@@ -228,8 +234,11 @@ opt-in path is usable end to end for v4 WALs.
   blocking commit outcome, including a WAL-full rotation retry. Repeat the
   cancellation/close race for ordinary async point and batch writes and
   `sync_async`, `force_flush_async`, and `drain_flush_async`; close must wait
-  for each spawned closure to finish. Cancel `close_async` after each await in
+  for each spawned closure to finish. Repeat for full compaction, filter
+  removal, and a queued batch read. Cancel `close_async` after each await in
   its shutdown sequence, then call close again and verify teardown finishes.
+  Force completion between the async waiter state check and wait registration
+  for both quiescence and closed-state waits; neither may lose the wakeup.
   Inject a background-worker join failure in both sync and async close; verify
   a second close caller terminates with the recorded failure and no WAL buffer
   is freed while a request can still reference it.
