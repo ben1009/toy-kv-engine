@@ -1,6 +1,6 @@
 # RFC 023: Point-in-Time Recovery
 
-**Status:** Proposed  
+**Status:** Implemented (local PITR)
 **Date:** 2026-09-09  
 **Author:** kv-engine Contributors  
 **References:**

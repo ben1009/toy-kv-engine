@@ -387,13 +387,20 @@ requires both p95 and p99 to pass, and allows at most 5% regression per metric.
 
 - [ToyKV vs Fjall Benchmark Report](docs/bench-report-crud-bench-fjall.md)
 - [ToyKV vs RocksDB Benchmark Report](docs/bench-report-crud-bench-rocksdb.md)
+- [Incremental Backup Benchmarks](docs/backup-benchmarks.md)
 - [vLog Benchmark Report](docs/bench-report-vlog.md)
 - [DeleteRange Benchmark Report](docs/bench-report-deleterange.md)
+- [PITR Performance Baseline](docs/pitr-performance.md)
 - [io_uring Benchmark Notes](docs/io-uring-bench.md)
 - [Performance Profiling Report](docs/perf-profile.md)
 - [Async Scan Findings](docs/async-scan-findings.md)
 - [Parallel Scan Findings](docs/parallel-scan-findings.md)
 - [Async Phase 3 Measurement Plan](docs/async-phase3-measurement.md)
+
+### Implementation Records
+
+- [RFC 022 Incremental Backup Implementation Plan](docs/rfc-022-incremental-backup-plan.md)
+- [RFC 023 PITR Implementation Plan](docs/rfc-023-pitr-implementation-plan.md)
 
 ### RFCs
 
