@@ -44,6 +44,7 @@ fn options_with_vlog_and_compaction(
     target_sst_size: usize,
 ) -> LsmStorageOptions {
     use crate::compact::LeveledCompactionOptions;
+
     LsmStorageOptions {
         block_size,
         target_sst_size,

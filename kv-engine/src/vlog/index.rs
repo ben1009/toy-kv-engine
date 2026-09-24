@@ -116,6 +116,7 @@ impl VlogIndex {
     pub fn rebuild_from_reader(reader: &ValueLogReader, file_id: u32) -> Result<Self> {
         let mut index = Self::new(file_id);
         let header_iter = reader.iter_headers()?.with_file_id(file_id);
+
         for meta_result in header_iter {
             let meta = meta_result?;
             index.add_entry(meta.ptr.offset, meta.key, meta.value_len);
@@ -211,6 +212,7 @@ impl VlogIndex {
         }
 
         let mut pos = 0usize;
+
         for _ in 0..entry_count {
             // Entry layout: [offset:8][key_len:2][key:key_len][value_len:4]
             // Minimum size without key: 8 + 2 + 4 = 14
@@ -328,6 +330,7 @@ mod tests {
             writer.append(k, v).unwrap();
         }
         writer.close().unwrap();
+
         entries
     }
 

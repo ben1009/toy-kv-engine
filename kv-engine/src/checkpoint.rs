@@ -104,6 +104,7 @@ impl CheckpointFilePins {
 
     fn unpin_ssts(&mut self, sst_ids: &[usize]) -> Vec<usize> {
         let mut ready_to_delete = Vec::new();
+
         for id in sst_ids {
             if let Some(count) = self.ssts.get_mut(id) {
                 *count -= 1;
@@ -145,6 +146,7 @@ impl Drop for CheckpointPinGuard<'_> {
             .checkpoint_file_pins
             .lock()
             .unpin_ssts(&self.sst_ids);
+
         for sst_id in pending_delete_ssts {
             let path = self.inner.path_of_sst(sst_id);
             if let Err(err) = fs::remove_file(&path)
@@ -284,6 +286,7 @@ impl KvEngine {
         let guard = self.inner.lifecycle.admit_write()?;
         let inner = self.inner.clone();
         let target_dir = target_dir.as_ref().to_path_buf();
+
         self.inner
             .blocking
             .run_result(move || {
@@ -316,6 +319,7 @@ impl LsmStorageInner {
             drop(_checkpoint_guard);
             self.publish_prepared_checkpoint(&target_dir, &tmp_dir, &options, prepared)
         })();
+
         if result.is_err() {
             let _ = cleanup_checkpoint_tmp(&tmp_dir, &target_dir);
             let _ = cleanup_checkpoint_staging_tmp(&checkpoint_staging_tmp_dir(&tmp_dir));
@@ -356,6 +360,7 @@ impl LsmStorageInner {
             .canonicalize()
             .with_context(|| format!("failed to canonicalize {}", self.db_path().display()))?;
         let target_for_inside_check = canonicalize_existing_prefix(target_dir)?;
+
         if target_for_inside_check.starts_with(&source_dir) {
             bail!(
                 "checkpoint target {} must not be inside source database {}",
@@ -394,6 +399,7 @@ impl LsmStorageInner {
                 staging_tmp_dir.display()
             )
         })?;
+
         if let Some(parent) = tmp_dir.parent() {
             fsync_dir(parent)?;
         }
@@ -464,6 +470,7 @@ impl LsmStorageInner {
                 tmp_dir.display()
             )
         })?;
+
         #[cfg(feature = "chaos-testing")]
         {
             crate::chaos::failpoint::fail_point!("checkpoint.after_publish_rename_before_dir_sync");
@@ -507,6 +514,7 @@ impl LsmStorageInner {
     #[allow(dead_code)] // consumed by the forthcoming backup publisher
     pub(crate) fn capture_checkpoint_state(&self) -> Result<CheckpointCapture<'_>> {
         let _checkpoint_guard = self.checkpoint_lock.lock();
+
         self.capture_checkpoint_state_locked()
     }
 
@@ -514,6 +522,7 @@ impl LsmStorageInner {
         self.flush_all_memtables_for_checkpoint()?;
 
         let snapshot_pins = self.checkpoint_manifest_snapshot_record_and_pin()?;
+
         #[cfg(feature = "chaos-testing")]
         {
             crate::chaos::failpoint::fail_point!("checkpoint.after_sst_pin_before_copy");
@@ -580,6 +589,7 @@ impl LsmStorageInner {
         // Checkpoint capture must retain its existing bounded critical section.
         // Backup-specific publication hashes these pinned files after capture.
         let immutable_file_metadata = Vec::new();
+
         Ok(CheckpointSnapshotPins {
             snapshot_record: ManifestRecord::Snapshot {
                 l0_sstables: state.l0_sstables.clone(),
@@ -611,6 +621,7 @@ impl LsmStorageInner {
         vlog_ids: &[u32],
     ) -> Result<Vec<ImmutableFileMetadata>> {
         let mut metadata = Vec::with_capacity(sst_ids.len() + vlog_ids.len());
+
         for &id in sst_ids {
             metadata.push(hash_immutable_file(
                 ImmutableFileKind::Sst,
@@ -640,6 +651,7 @@ pub(crate) fn hash_immutable_file(
     let file_size = file.metadata()?.len();
     let mut hasher = Sha256::new();
     let mut buf = [0_u8; 64 * 1024];
+
     loop {
         let read = file.read(&mut buf)?;
         if read == 0 {
@@ -886,6 +898,7 @@ fn copy_or_link_file(
     stats.copied_files += 1;
     stats.files_copied = stats.copied_files;
     stats.bytes_copied += size;
+
     #[cfg(feature = "chaos-testing")]
     {
         crate::chaos::failpoint::fail_point!("checkpoint.after_file_copy");
@@ -958,6 +971,7 @@ fn checkpoint_lock_path(target_dir: &Path) -> Result<PathBuf> {
         .file_name()
         .ok_or_else(|| anyhow!("checkpoint target must have a final path component"))?
         .to_string_lossy();
+
     Ok(target_dir.with_file_name(format!("{file_name}.checkpoint.lock")))
 }
 
@@ -975,6 +989,7 @@ fn lock_checkpoint_file(file: &File) -> std::io::Result<()> {
             break result;
         }
     };
+
     if result == 0 {
         Ok(())
     } else {
@@ -1033,6 +1048,7 @@ fn cleanup_checkpoint_tmps_for_target(target_dir: &Path) -> Result<()> {
     let Some(target_name) = target_dir.file_name().map(|name| name.to_string_lossy()) else {
         return Ok(());
     };
+
     if !parent.exists() {
         return Ok(());
     }
@@ -1092,6 +1108,7 @@ fn ensure_stale_checkpoint_tmp_matches(path: &Path, target_dir: &Path) -> Result
 fn read_checkpoint_marker(path: &Path) -> Result<CheckpointMarker> {
     let contents = fs::read(path)
         .with_context(|| format!("failed to read checkpoint marker {}", path.display()))?;
+
     serde_json::from_slice(&contents)
         .with_context(|| format!("failed to parse checkpoint marker {}", path.display()))
 }
@@ -1101,6 +1118,7 @@ fn checkpoint_tmp_dir(target_dir: &Path) -> PathBuf {
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| "checkpoint".to_string());
+
     target_dir.with_file_name(format!(
         "{name}.checkpoint-{}-{}.tmp",
         std::process::id(),
@@ -1121,11 +1139,13 @@ fn absolute_path(path: &Path) -> Result<PathBuf> {
     } else {
         std::env::current_dir()?.join(path)
     };
+
     Ok(normalize_path(&path))
 }
 
 fn normalize_path(path: &Path) -> PathBuf {
     let mut normalized = PathBuf::new();
+
     for component in path.components() {
         match component {
             std::path::Component::CurDir => {}
@@ -1158,6 +1178,7 @@ fn canonicalize_existing_prefix(path: &Path) -> Result<PathBuf> {
             .canonicalize()
             .with_context(|| format!("failed to canonicalize {}", existing.display()))?
     };
+
     for component in rest {
         match component {
             std::path::Component::CurDir => {}
@@ -1199,6 +1220,7 @@ pub(crate) fn publish_pitr_restore_staging(staging: &Path, target: &Path) -> Res
             .parent()
             .ok_or_else(|| anyhow::anyhow!("PITR restore target has no parent directory"))?,
     )?;
+
     Ok(())
 }
 
@@ -1236,6 +1258,7 @@ fn rename_no_replace_platform(from: &Path, to: &Path) -> Result<()> {
     }
 
     let err = std::io::Error::last_os_error();
+
     if matches!(err.raw_os_error(), Some(libc::ENOSYS | libc::EINVAL)) {
         rename_no_replace_unavailable(&from_path, &to_path)
     } else {

@@ -120,6 +120,7 @@ impl MockStorage {
             has_sst_ttl_entries: false,
             immutable_file_metadata: Vec::new(),
         };
+
         Self {
             snapshot,
             next_sst_id: 1,
@@ -132,6 +133,7 @@ impl MockStorage {
     fn generate_sst_id(&mut self) -> usize {
         let id = self.next_sst_id;
         self.next_sst_id += 1;
+
         id
     }
 
@@ -141,6 +143,7 @@ impl MockStorage {
         self.file_list.insert(id, id);
         self.total_flushes += 1;
         self.total_writes += 1;
+
         id
     }
 
@@ -248,6 +251,7 @@ fn generate_random_key_range() -> (KeyBytes, KeyBytes) {
     let mut end_bytes = BytesMut::new();
     begin_bytes.put_u64(begin as u64);
     end_bytes.put_u64(end as u64);
+
     (
         KeyBytes::for_testing_from_bytes_no_ts(begin_bytes.freeze()),
         KeyBytes::for_testing_from_bytes_no_ts(end_bytes.freeze()),
@@ -265,6 +269,7 @@ fn generate_random_split(
     let mut result = Vec::new();
     let split = split as u64;
     assert!(len >= split, "well, this is unfortunate... run again!");
+
     for i in 0..split {
         let nb = begin + len * i / split;
         let ne = begin + len * (i + 1) / split - 1;
@@ -282,6 +287,7 @@ fn generate_random_split(
 
 fn main() {
     let args = Args::parse();
+
     match args {
         Args::Simple {
             dump_real_id,

@@ -77,6 +77,7 @@ struct CompactionSetsumVerifier {
 impl CompactionSetsumVerifier {
     fn enabled() -> bool {
         static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
         *ENABLED.get_or_init(|| {
             std::env::var_os("TOYKV_COMPACTION_SETSUM").is_some_and(|value| value != "0")
         })
@@ -211,6 +212,7 @@ mod tests {
     ) -> Arc<SsTable> {
         let mut builder = SsTableBuilder::new(storage.options.block_size);
         let encoded = KeySlice::for_testing_from_slice_with_ts(key, ts);
+
         builder.add(encoded.as_key_slice(), b"v").unwrap();
         Arc::new(
             builder
@@ -1432,6 +1434,7 @@ impl LsmStorageInner {
         }
 
         all_vlog_ids.sort_unstable();
+
         all_vlog_ids.dedup();
         #[cfg(feature = "compaction-setsum")]
         if let Some(verifier) = setsum_verifier.as_ref() {
@@ -1449,6 +1452,7 @@ impl LsmStorageInner {
     fn new_compaction_builder(&self, should_backfill: bool) -> SsTableBuilder {
         let mut builder = SsTableBuilder::new(self.options.block_size);
         builder.set_collect_blocks(should_backfill);
+
         builder.set_prefix_bloom_options(Some(self.options.prefix_bloom.clone()));
         builder
     }
@@ -1912,6 +1916,7 @@ impl LsmStorageInner {
                 )?
             }
         };
+
         Ok((
             point_ssts,
             vlog_ids,
@@ -2151,6 +2156,7 @@ impl LsmStorageInner {
             }
         }
         ids.sort_unstable();
+
         ids.dedup();
         ids
     }
@@ -2192,6 +2198,7 @@ impl LsmStorageInner {
         }
 
         ranges.sort_unstable_by(|a, b| a.0.cmp(b.0));
+
         let mut current_end = ranges[0].1;
         for (start, end) in ranges.into_iter().skip(1) {
             if start <= current_end {
@@ -2256,6 +2263,7 @@ impl LsmStorageInner {
 
     fn reserve_ssts(&self, mut sst_ids: Vec<usize>) -> Option<ReservedSsts<'_>> {
         sst_ids.sort_unstable();
+
         sst_ids.dedup();
         if self.try_reserve_ssts(&sst_ids) {
             Some(ReservedSsts {
@@ -2271,6 +2279,7 @@ impl LsmStorageInner {
         let input_sst_ids = Self::collect_compaction_input_sst_ids(task);
         let target_level = Self::compaction_target_level(task);
         let mut reserved_ids = input_sst_ids.clone();
+
         reserved_ids.extend(self.collect_input_range_only_ids(task, target_level, &input_sst_ids));
         self.reserve_ssts(reserved_ids)
     }
@@ -3147,6 +3156,7 @@ impl LsmStorageInner {
         self.try_ttl_wholesale_drop()?;
 
         let snapshot = self.state.load_full();
+
         let mut deferred = false;
         if let Some(task) = self
             .compaction_controller

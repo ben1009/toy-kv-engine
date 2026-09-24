@@ -7,9 +7,9 @@ use sha2::{Digest, Sha256};
 use std::cmp::max;
 
 use crate::mvcc::LsmMvccInner;
-use crate::pitr_backpressure::CapturedBaseBoundary;
-use crate::pitr_backpressure::SealBoundaryCoordinator;
-use crate::pitr_manifest::{
+use crate::pitr::backpressure::CapturedBaseBoundary;
+use crate::pitr::backpressure::SealBoundaryCoordinator;
+use crate::pitr::manifest::{
     PersistedChainAnchor, PersistedRecordedAt, PitrManifestRecord, PitrMode, PitrState,
     replay_pitr_records,
 };
@@ -36,6 +36,7 @@ pub(crate) fn pitr_base_compatibility_digest(
     compatibility.update(crate::manifest::MANIFEST_FORMAT_VERSION.to_be_bytes());
     compatibility.update([u8::from(serializable)]);
     compatibility.update([u8::from(value_separation_enabled)]);
+
     if value_separation_enabled {
         compatibility.update(crate::vlog::VLOG_FORMAT_VERSION.to_be_bytes());
     }
@@ -150,6 +151,7 @@ impl PitrBaseMetadata {
             },
             "PITR base commit high-water disagrees with its time anchor"
         );
+
         match self.boundary_anchor {
             PersistedChainAnchor::Genesis { archive_epoch_id } => {
                 ensure!(
@@ -271,6 +273,7 @@ impl PitrBaseCaptureCoordinator {
         );
         self.manifest_state = Some(validated_state);
         self.compatibility_digest = Some(compatibility_digest);
+
         Ok(())
     }
 
@@ -280,6 +283,7 @@ impl PitrBaseCaptureCoordinator {
             .manifest_state
             .as_ref()
             .and_then(|state| state.last_commit_anchor.map(|anchor| anchor.commit_ts));
+
         self.stop_admission_at(CapturedBaseBoundary::for_test(
             boundary_segment_id,
             captured_commit_high_water,
@@ -314,6 +318,7 @@ impl PitrBaseCaptureCoordinator {
         self.captured_commit_high_water = Some(captured_commit_high_water);
         self.boundary_generation = Some(boundary.generation());
         self.state = PitrBaseCaptureState::AdmissionStopped;
+
         Ok(())
     }
 
@@ -406,6 +411,7 @@ impl PitrBaseCaptureCoordinator {
         self.metadata = Some(metadata);
         self.observed_clamp_persisted = false;
         self.state = PitrBaseCaptureState::Captured;
+
         Ok(())
     }
 
@@ -450,6 +456,7 @@ impl PitrBaseCaptureCoordinator {
                 .ok_or_else(|| anyhow::anyhow!("PITR base compatibility is missing"))?,
         };
         metadata.validate()?;
+
         Ok(metadata)
     }
 
@@ -459,6 +466,7 @@ impl PitrBaseCaptureCoordinator {
             "PITR base cannot publish before capture"
         );
         self.state = PitrBaseCaptureState::Published;
+
         Ok(())
     }
 
@@ -483,6 +491,7 @@ impl PitrBaseCaptureCoordinator {
         self.compatibility_digest = None;
         self.observed_clamp_persisted = false;
         self.metadata = None;
+
         Ok(())
     }
 
@@ -520,6 +529,7 @@ impl PitrBaseCaptureCoordinator {
         self.compatibility_digest = None;
         self.metadata = None;
         self.observed_clamp_persisted = false;
+
         Ok(receipt)
     }
 
@@ -569,6 +579,7 @@ impl PitrBaseCaptureCoordinator {
         );
         self.manifest_state = Some(persisted);
         self.observed_clamp_persisted = true;
+
         Ok(())
     }
 
@@ -589,8 +600,8 @@ impl PitrBaseCaptureCoordinator {
 mod tests {
     use super::*;
     use crate::mvcc::LsmMvccInner;
-    use crate::pitr_backpressure::{PitrSpoolAccountant, SealBoundaryCoordinator};
-    use crate::pitr_manifest::{PersistedCommitAnchor, PitrManifestRecord, replay_pitr_records};
+    use crate::pitr::backpressure::{PitrSpoolAccountant, SealBoundaryCoordinator};
+    use crate::pitr::manifest::{PersistedCommitAnchor, PitrManifestRecord, replay_pitr_records};
     use std::sync::Arc;
 
     fn metadata() -> PitrBaseMetadata {
@@ -629,7 +640,7 @@ mod tests {
                 repository_id: [1; 16],
                 timeline_id: [2; 16],
                 archive_epoch_id: [3; 16],
-                config: crate::pitr_manifest::PersistedPitrConfig {
+                config: crate::pitr::manifest::PersistedPitrConfig {
                     archive_interval_ms: 1000,
                     max_segment_bytes: 4096,
                     max_unarchived_bytes: 8192,
@@ -653,6 +664,7 @@ mod tests {
             recorded_at,
             entry_digest: [6; 32],
         });
+
         state
     }
 
@@ -1025,7 +1037,7 @@ mod tests {
         assert_eq!(coordinator.state(), PitrBaseCaptureState::AdmissionOpen);
         assert_eq!(
             admission.state(),
-            crate::pitr_backpressure::SealBoundaryState::AdmissionOpen
+            crate::pitr::backpressure::SealBoundaryState::AdmissionOpen
         );
         assert!(sequencer.reserve_commit_ts().is_ok());
         assert!(accounting.reserve_batch(1, 1).is_ok());

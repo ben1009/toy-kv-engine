@@ -246,7 +246,7 @@ db.close_async().await?;
 - `kv-engine/src/cache.rs` - block cache and admission policy.
 - `kv-engine/src/bin/` - CLI, write benchmark, async scan benchmark,
   compaction simulator, and chaos child process.
-- `kv-engine/tests/` - process-level chaos and cross-process persistence tests.
+- `kv-engine/integration_tests/` - process-level chaos and cross-process persistence tests.
 - `kv-engine/benches/` - Criterion benchmarks for vLog, WAL, memtable, and
   range deletion paths.
 - `rfcs/` - design notes for major features.

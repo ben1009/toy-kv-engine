@@ -85,6 +85,7 @@ impl PitrCatalogLimits {
             self.max_snapshot_items > 0,
             "catalog snapshot limit must be nonzero"
         );
+
         Ok(self)
     }
 }
@@ -143,6 +144,7 @@ impl SegmentMetadata {
             self.anchor.seal_digest == self.seal_digest,
             "segment seal digest mismatch"
         );
+
         match (self.first_commit_ts, self.last_commit_ts) {
             (Some(first), Some(last)) => ensure!(first <= last, "segment commit range regressed"),
             (None, None) => ensure!(self.batch_count == 0, "empty segment has batches"),
@@ -269,6 +271,7 @@ pub(crate) fn encode_catalog_with_limits(
         base_sequence < u64::MAX,
         "replacement catalog cannot resume after snapshot"
     );
+
     for (index, record) in records.iter().enumerate() {
         let sequence = base_sequence
             .checked_add(
@@ -408,6 +411,7 @@ pub(crate) fn replay_catalog_with_limits(
     }
     let mut digest = Sha256::new();
     digest.update(&input[..offset]);
+
     Ok(CatalogReplay {
         sequence: expected_sequence - 1,
         records,
@@ -443,6 +447,7 @@ fn encode_frame(
     frame.extend_from_slice(&payload);
     let crc = crc32fast::hash(&frame[4..]);
     frame.extend_from_slice(&crc.to_be_bytes());
+
     Ok(frame)
 }
 
@@ -456,6 +461,7 @@ fn record_tag(record: &PitrCatalogRecord) -> u8 {
 
 fn encode_record(record: &PitrCatalogRecord) -> Result<Vec<u8>> {
     let mut out = Vec::new();
+
     match record {
         PitrCatalogRecord::CommitSegment { metadata } => encode_metadata(&mut out, metadata)?,
         PitrCatalogRecord::CoverageBreak(break_record) => encode_break(&mut out, break_record)?,
@@ -602,6 +608,7 @@ fn decode_record(
         }
         _ => bail!("unknown PITR catalog record tag"),
     };
+
     Ok(record)
 }
 
@@ -701,6 +708,7 @@ fn validate_break(break_record: &CoverageBreak) -> Result<()> {
 fn validate_replay(records: &[PitrCatalogRecord], max_decoded_state_bytes: usize) -> Result<()> {
     let mut validator = ReplayValidator::default();
     let mut retained_owned_bytes = 0_usize;
+
     for (index, record) in records.iter().enumerate() {
         validator.apply(record)?;
         retained_owned_bytes = retained_owned_bytes
@@ -754,6 +762,7 @@ fn decoded_state_bytes(
         )>())
         .and_then(|bytes| bytes.checked_mul(HASH_ENTRY_OVERHEAD_FACTOR))
         .ok_or_else(|| anyhow::anyhow!("catalog decoded-state size overflow"))?;
+
     record_bytes
         .checked_add(retained_owned_bytes)
         .and_then(|bytes| bytes.checked_add(segment_bytes))
@@ -989,12 +998,14 @@ fn encode_metadata(out: &mut Vec<u8>, metadata: &SegmentMetadata) -> Result<()> 
     put_bytes(out, &metadata.wal_digest);
     put_bytes(out, &metadata.seal_digest);
     put_bytes(out, &metadata.source_identity);
+
     Ok(())
 }
 
 fn decode_metadata(input: &[u8]) -> Result<SegmentMetadata> {
     let (metadata, used) = decode_metadata_prefix(input)?;
     ensure!(used == input.len(), "trailing bytes in segment metadata");
+
     Ok(metadata)
 }
 
@@ -1021,6 +1032,7 @@ fn decode_metadata_prefix(input: &[u8]) -> Result<(SegmentMetadata, usize)> {
         seal_digest: cursor.fixed()?,
         source_identity: cursor.fixed()?,
     };
+
     Ok((metadata, cursor.position()))
 }
 
@@ -1035,12 +1047,14 @@ fn encode_break(out: &mut Vec<u8>, break_record: &CoverageBreak) -> Result<()> {
         CoverageBreakReason::PublicationUnknown => 2,
         CoverageBreakReason::RepositoryUnavailable => 3,
     });
+
     Ok(())
 }
 
 fn decode_break(input: &[u8]) -> Result<CoverageBreak> {
     let (break_record, used) = decode_break_prefix(input)?;
     ensure!(used == input.len(), "trailing bytes in coverage break");
+
     Ok(break_record)
 }
 
@@ -1059,6 +1073,7 @@ fn decode_break_prefix(input: &[u8]) -> Result<(CoverageBreak, usize)> {
             _ => bail!("unknown coverage break reason"),
         },
     };
+
     Ok((break_record, cursor.position()))
 }
 
@@ -1126,6 +1141,7 @@ fn decode_optional_recorded_at(cursor: &mut Cursor<'_>) -> Result<Option<Recorde
             let secs = i64::from_be_bytes(cursor.fixed()?);
             let nanos = u32::from_be_bytes(cursor.fixed()?);
             ensure!(nanos < 1_000_000_000, "recorded_at nanos out of range");
+
             Ok(Some(RecordedAt { secs, nanos }))
         }
         _ => bail!("invalid optional recorded_at"),
@@ -1161,6 +1177,7 @@ impl<'a> Cursor<'a> {
     fn advance(&mut self, count: usize) -> Result<()> {
         ensure!(count <= self.rest().len(), "truncated catalog record");
         self.position += count;
+
         Ok(())
     }
 
@@ -1170,6 +1187,7 @@ impl<'a> Cursor<'a> {
             .get(..count)
             .ok_or_else(|| anyhow::anyhow!("truncated catalog record"))?;
         self.position += count;
+
         Ok(bytes)
     }
 
@@ -1206,6 +1224,7 @@ impl<'a> Cursor<'a> {
             self.position == self.input.len(),
             "trailing bytes in catalog record"
         );
+
         Ok(())
     }
 }
@@ -1217,6 +1236,7 @@ mod tests {
     fn metadata(segment_id: u64, predecessor: ChainAnchor) -> SegmentMetadata {
         let wal_digest = [segment_id as u8; 32];
         let seal_digest = [segment_id as u8 + 1; 32];
+
         SegmentMetadata {
             key: SegmentKey {
                 repository_id: [7; 16],

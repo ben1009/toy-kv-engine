@@ -78,6 +78,7 @@ impl<T> PitrTask<T> {
                 control: worker_control,
             })
         });
+
         Self {
             handle: Some(handle),
             control,
@@ -131,6 +132,7 @@ impl<T> Future for PitrTask<T> {
 impl<T> Drop for PitrTask<T> {
     fn drop(&mut self) {
         self.cancel();
+
         if let Some(handle) = self.handle.take() {
             handle.abort();
         }
@@ -234,6 +236,7 @@ impl PitrRestoreOptions {
             self.cache_capacity > 0,
             "PITR restore cache capacity is zero"
         );
+
         Ok(())
     }
 }
@@ -429,7 +432,7 @@ pub enum PitrArchiveErrorKind {
 
 #[derive(Debug)]
 pub(crate) struct PitrRuntimeController {
-    limiter: Arc<crate::pitr_limiter::PitrArchiveLimiter>,
+    limiter: Arc<crate::pitr::limiter::PitrArchiveLimiter>,
     priority: Arc<parking_lot::Mutex<ArchiveIoPriority>>,
 }
 
@@ -437,8 +440,9 @@ impl PitrRuntimeController {
     #[allow(dead_code)]
     pub(crate) fn new(options: &PitrRuntimeOptions, now: std::time::Instant) -> Result<Self> {
         options.validate()?;
+
         Ok(Self {
-            limiter: Arc::new(crate::pitr_limiter::PitrArchiveLimiter::new(
+            limiter: Arc::new(crate::pitr::limiter::PitrArchiveLimiter::new(
                 options.limiter_options(),
                 now,
             )),
@@ -455,11 +459,12 @@ impl PitrRuntimeController {
         options.validate()?;
         self.limiter.update(options.limiter_options(), now)?;
         *self.priority.lock() = options.archive_io_priority;
+
         Ok(())
     }
 
     #[allow(dead_code)]
-    pub(crate) fn limiter(&self) -> Arc<crate::pitr_limiter::PitrArchiveLimiter> {
+    pub(crate) fn limiter(&self) -> Arc<crate::pitr::limiter::PitrArchiveLimiter> {
         Arc::clone(&self.limiter)
     }
 
@@ -635,16 +640,17 @@ impl PitrOptions {
             "PITR repository is empty"
         );
         self.config.validate()?;
+
         self.runtime.validate()
     }
 
     #[allow(dead_code)]
-    pub(crate) fn persisted_config(&self) -> Result<crate::pitr_manifest::PersistedPitrConfig> {
+    pub(crate) fn persisted_config(&self) -> Result<crate::pitr::manifest::PersistedPitrConfig> {
         self.config.to_persisted()
     }
 
     #[allow(dead_code)]
-    pub(crate) fn limiter_options(&self) -> crate::pitr_limiter::ArchiveLimiterOptions {
+    pub(crate) fn limiter_options(&self) -> crate::pitr::limiter::ArchiveLimiterOptions {
         self.runtime.limiter_options()
     }
 }
@@ -664,11 +670,12 @@ impl PersistedPitrConfig {
             self.max_source_spool_bytes >= self.max_unarchived_bytes,
             "PITR source spool limit is below unarchived limit"
         );
+
         Ok(())
     }
 
     #[allow(dead_code)]
-    pub(crate) fn to_persisted(&self) -> Result<crate::pitr_manifest::PersistedPitrConfig> {
+    pub(crate) fn to_persisted(&self) -> Result<crate::pitr::manifest::PersistedPitrConfig> {
         self.validate()?;
         let archive_interval_ms = u64::try_from(self.archive_interval.as_millis())
             .map_err(|_| anyhow::anyhow!("PITR archive interval exceeds supported range"))?;
@@ -676,7 +683,8 @@ impl PersistedPitrConfig {
             archive_interval_ms > 0,
             "PITR archive interval is below one millisecond"
         );
-        Ok(crate::pitr_manifest::PersistedPitrConfig {
+
+        Ok(crate::pitr::manifest::PersistedPitrConfig {
             archive_interval_ms,
             max_segment_bytes: self.max_segment_bytes,
             max_unarchived_bytes: self.max_unarchived_bytes,
@@ -691,8 +699,8 @@ impl PitrRuntimeOptions {
     }
 
     #[allow(dead_code)]
-    pub(crate) fn limiter_options(&self) -> crate::pitr_limiter::ArchiveLimiterOptions {
-        crate::pitr_limiter::ArchiveLimiterOptions {
+    pub(crate) fn limiter_options(&self) -> crate::pitr::limiter::ArchiveLimiterOptions {
+        crate::pitr::limiter::ArchiveLimiterOptions {
             bytes_per_second: self.archive_io_bytes_per_second,
             burst_bytes: self.archive_burst_bytes,
         }
@@ -705,16 +713,18 @@ impl RecoveryTarget {
             !matches!(self, Self::CommitTs(0)),
             "PITR recovery commit timestamp is zero"
         );
+
         Ok(())
     }
 
     #[allow(dead_code)]
-    pub(crate) fn to_restore_target(self) -> Result<crate::pitr_restore::PitrRestoreTarget> {
+    pub(crate) fn to_restore_target(self) -> Result<crate::pitr::restore::PitrRestoreTarget> {
         self.validate()?;
+
         Ok(match self {
             Self::Latest => anyhow::bail!("Latest target requires archived interval selection"),
             Self::CommitTs(commit_ts) => {
-                crate::pitr_restore::PitrRestoreTarget::CommitTs(commit_ts)
+                crate::pitr::restore::PitrRestoreTarget::CommitTs(commit_ts)
             }
             Self::AtOrBeforeSystemTime(_) => {
                 anyhow::bail!("wall-clock target requires archived time-index selection")
@@ -733,6 +743,7 @@ impl RecoverySelector {
             self.archive_epoch_id.is_none_or(|id| id != [0; 16]),
             "PITR archive epoch identity is empty"
         );
+
         Ok(())
     }
 
@@ -743,6 +754,7 @@ impl RecoverySelector {
             self.base_backup_id.is_none_or(|id| id != 0),
             "PITR base backup identity is zero"
         );
+
         Ok(self)
     }
 }
@@ -753,6 +765,7 @@ impl PitrStatusOptions {
             self.page_size <= MAX_STATUS_PAGE_SIZE,
             "PITR status page size exceeds the configured maximum"
         );
+
         Ok(())
     }
 }
@@ -763,6 +776,7 @@ impl VerifyPitrOptions {
             self.page_size <= MAX_VERIFY_PAGE_SIZE,
             "PITR verification page size exceeds the configured maximum"
         );
+
         if let Some(selector) = self.selector {
             selector.validate()?;
         }
@@ -784,20 +798,19 @@ impl PitrRetentionPolicy {
 
 impl PitrStatus {
     #[allow(dead_code)]
-    pub(crate) fn from_manifest_state(state: &crate::pitr_manifest::PitrState) -> Self {
+    pub(crate) fn from_manifest_state(state: &crate::pitr::manifest::PitrState) -> Self {
         let archive_state = match state.mode {
-            crate::pitr_manifest::PitrMode::Disabled => {
+            crate::pitr::manifest::PitrMode::Disabled => {
                 if state.database_timeline_id.is_some() {
                     PitrArchiveState::Disabled
                 } else {
                     PitrArchiveState::NeverEnabled
                 }
             }
-            crate::pitr_manifest::PitrMode::Enabling | crate::pitr_manifest::PitrMode::Enabled => {
-                PitrArchiveState::Active
-            }
-            crate::pitr_manifest::PitrMode::PublicationUncertain
-            | crate::pitr_manifest::PitrMode::ReconciliationRequired => {
+            crate::pitr::manifest::PitrMode::Enabling
+            | crate::pitr::manifest::PitrMode::Enabled => PitrArchiveState::Active,
+            crate::pitr::manifest::PitrMode::PublicationUncertain
+            | crate::pitr::manifest::PitrMode::ReconciliationRequired => {
                 PitrArchiveState::ReconciliationRequired
             }
         };
@@ -810,12 +823,13 @@ impl PitrStatus {
             .all(|obligation| {
                 matches!(
                     obligation.state,
-                    crate::pitr_manifest::ObligationState::Archived
-                        | crate::pitr_manifest::ObligationState::Reclaimable
+                    crate::pitr::manifest::ObligationState::Archived
+                        | crate::pitr::manifest::ObligationState::Reclaimable
                 )
             })
             .then(|| state.last_commit_anchor.map(|anchor| anchor.commit_ts))
             .flatten();
+
         Self {
             state: archive_state,
             archive_epoch_id: state.archive_epoch_id,
@@ -840,12 +854,12 @@ impl PitrStatus {
 
 impl RecoveryChainAnchor {
     #[allow(dead_code)]
-    pub(crate) fn to_persisted(self) -> crate::pitr_manifest::PersistedChainAnchor {
+    pub(crate) fn to_persisted(self) -> crate::pitr::manifest::PersistedChainAnchor {
         match self {
             Self::Genesis { archive_epoch_id } => {
-                crate::pitr_manifest::PersistedChainAnchor::Genesis { archive_epoch_id }
+                crate::pitr::manifest::PersistedChainAnchor::Genesis { archive_epoch_id }
             }
-            Self::Segment(anchor) => crate::pitr_manifest::PersistedChainAnchor::Segment {
+            Self::Segment(anchor) => crate::pitr::manifest::PersistedChainAnchor::Segment {
                 segment_id: anchor.segment_id,
                 wal_digest: anchor.wal_digest,
                 seal_digest: anchor.seal_digest,
@@ -856,14 +870,14 @@ impl RecoveryChainAnchor {
 
 impl BaseTimeAnchor {
     #[allow(dead_code)]
-    pub(crate) fn to_persisted(self) -> crate::pitr_base::PitrBaseTimeAnchor {
+    pub(crate) fn to_persisted(self) -> crate::pitr::base::PitrBaseTimeAnchor {
         match self {
             Self::Indexed {
                 segment_id,
                 commit_ts,
                 recorded_at,
                 entry_digest,
-            } => crate::pitr_base::PitrBaseTimeAnchor::Indexed {
+            } => crate::pitr::base::PitrBaseTimeAnchor::Indexed {
                 segment_id,
                 commit_ts,
                 recorded_at: public_recorded_at(recorded_at),
@@ -872,7 +886,7 @@ impl BaseTimeAnchor {
             Self::ObservedBoundary {
                 commit_ts,
                 observed_at,
-            } => crate::pitr_base::PitrBaseTimeAnchor::Observed {
+            } => crate::pitr::base::PitrBaseTimeAnchor::Observed {
                 commit_ts,
                 observed_at: public_recorded_at(observed_at),
             },
@@ -881,10 +895,11 @@ impl BaseTimeAnchor {
 }
 
 #[allow(dead_code)]
-fn public_recorded_at(time: SystemTime) -> crate::pitr_manifest::PersistedRecordedAt {
+fn public_recorded_at(time: SystemTime) -> crate::pitr::manifest::PersistedRecordedAt {
     let recorded_at =
         crate::pitr::RecordedAt::from_system_time(time).expect("validated public PITR time anchor");
-    crate::pitr_manifest::PersistedRecordedAt {
+
+    crate::pitr::manifest::PersistedRecordedAt {
         secs: recorded_at.secs,
         nanos: recorded_at.nanos,
     }
@@ -923,6 +938,7 @@ pub(crate) fn page_recovery_intervals(
         interval_index: u64::try_from(end)
             .map_err(|_| anyhow::anyhow!("PITR status interval list is too large"))?,
     });
+
     Ok(RecoveryIntervalPage {
         items: intervals[start..end].to_vec(),
         next_cursor,
@@ -934,6 +950,7 @@ pub(crate) fn verification_query_digest(options: VerifyPitrOptions) -> Result<[u
     options.validate()?;
     let mut digest = Sha256::new();
     digest.update(b"TOYKV-PITR-VERIFY-V1");
+
     match options.depth {
         VerifyPitrDepth::Shallow => digest.update([0]),
         VerifyPitrDepth::Deep { sampled_targets } => {
@@ -1136,7 +1153,7 @@ mod tests {
     fn converts_restore_coordinates_to_internal_contracts() {
         assert_eq!(
             RecoveryTarget::CommitTs(7).to_restore_target().unwrap(),
-            crate::pitr_restore::PitrRestoreTarget::CommitTs(7)
+            crate::pitr::restore::PitrRestoreTarget::CommitTs(7)
         );
         assert!(RecoveryTarget::Latest.to_restore_target().is_err());
         assert_eq!(
@@ -1144,7 +1161,7 @@ mod tests {
                 archive_epoch_id: [3; 16]
             }
             .to_persisted(),
-            crate::pitr_manifest::PersistedChainAnchor::Genesis {
+            crate::pitr::manifest::PersistedChainAnchor::Genesis {
                 archive_epoch_id: [3; 16]
             }
         );
@@ -1155,7 +1172,7 @@ mod tests {
         .to_persisted();
         assert!(matches!(
             anchor,
-            crate::pitr_base::PitrBaseTimeAnchor::Observed { .. }
+            crate::pitr::base::PitrBaseTimeAnchor::Observed { .. }
         ));
     }
 
@@ -1188,13 +1205,13 @@ mod tests {
 
     #[test]
     fn status_projection_preserves_manifest_mode_epoch_and_frontier() {
-        let mut state = crate::pitr_manifest::PitrState {
-            mode: crate::pitr_manifest::PitrMode::Enabled,
+        let mut state = crate::pitr::manifest::PitrState {
+            mode: crate::pitr::manifest::PitrMode::Enabled,
             archive_epoch_id: Some([3; 16]),
-            last_commit_anchor: Some(crate::pitr_manifest::PersistedCommitAnchor {
+            last_commit_anchor: Some(crate::pitr::manifest::PersistedCommitAnchor {
                 segment_id: 7,
                 commit_ts: 11,
-                recorded_at: crate::pitr_manifest::PersistedRecordedAt { secs: 1, nanos: 0 },
+                recorded_at: crate::pitr::manifest::PersistedRecordedAt { secs: 1, nanos: 0 },
                 entry_digest: [4; 32],
             }),
             ..Default::default()
@@ -1204,7 +1221,7 @@ mod tests {
         assert_eq!(status.archive_epoch_id, Some([3; 16]));
         assert_eq!(status.latest_durable_commit_ts, Some(11));
 
-        state.mode = crate::pitr_manifest::PitrMode::ReconciliationRequired;
+        state.mode = crate::pitr::manifest::PitrMode::ReconciliationRequired;
         assert_eq!(
             PitrStatus::from_manifest_state(&state).state,
             PitrArchiveState::ReconciliationRequired

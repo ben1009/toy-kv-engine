@@ -27,17 +27,20 @@ use crate::{
 
 fn value_separation_test_lock() -> parking_lot::MutexGuard<'static, ()> {
     static LOCK: OnceLock<parking_lot::Mutex<()>> = OnceLock::new();
+
     LOCK.get_or_init(|| parking_lot::Mutex::new(())).lock()
 }
 
 fn compaction_parallel_scan_test_lock() -> parking_lot::MutexGuard<'static, ()> {
     static LOCK: OnceLock<parking_lot::Mutex<()>> = OnceLock::new();
+
     LOCK.get_or_init(|| parking_lot::Mutex::new(())).lock()
 }
 
 #[cfg(feature = "chaos-testing")]
 fn async_checkpoint_test_lock() -> parking_lot::MutexGuard<'static, ()> {
     static LOCK: OnceLock<parking_lot::Mutex<()>> = OnceLock::new();
+
     LOCK.get_or_init(|| parking_lot::Mutex::new(())).lock()
 }
 
@@ -45,6 +48,7 @@ fn collect_parallel_rows(
     scan: &mut crate::lsm_storage::ParallelScan,
 ) -> anyhow::Result<Vec<(Bytes, Bytes)>> {
     let mut rows = Vec::new();
+
     while let Some(chunk) = crate::future_ext::block_on(scan.try_next_chunk())? {
         rows.extend(chunk.into_rows());
     }
@@ -98,6 +102,7 @@ fn seeded_parallel_scan_engine() -> (TempDir, Arc<KvEngine>) {
         snapshot.sstables.insert(sst_id, sst);
     }
     engine.inner.state.store(Arc::new(snapshot));
+
     (dir, engine)
 }
 
@@ -141,6 +146,7 @@ fn seeded_parallel_prefix_scan_engine() -> (TempDir, Arc<KvEngine>) {
         a_key.cmp(&b_key)
     });
     engine.inner.state.store(Arc::new(snapshot));
+
     (dir, engine)
 }
 

@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     compact::CompactionTask, lsm_storage::InstalledCompactionFilter,
-    pitr_manifest::PitrManifestRecord,
+    pitr::manifest::PitrManifestRecord,
 };
 
 pub(crate) struct Manifest {
@@ -307,7 +307,7 @@ pub(crate) enum ManifestRecord {
         /// PITR lifecycle state preserved across manifest compaction.
         /// Required for version 7 and later snapshots; optional on older ones.
         #[serde(default)]
-        pitr_state: Option<crate::pitr_manifest::PitrState>,
+        pitr_state: Option<crate::pitr::manifest::PitrState>,
     },
 }
 
@@ -387,6 +387,7 @@ impl Manifest {
         // Step 2+3: Truncate MANIFEST then rename snapshot, all under the
         // manifest lock to prevent new records from being written between them.
         let dir = self.path.parent().unwrap_or(Path::new("."));
+
         {
             let mut file = self.file.lock();
             file.set_len(0)?;
@@ -527,6 +528,7 @@ impl Manifest {
 
         let manifest_records =
             serde_json::Deserializer::from_slice(&buf).into_iter::<ManifestRecord>();
+
         for record in manifest_records {
             records.push(record?);
         }
@@ -667,6 +669,7 @@ impl Manifest {
             .context("failed to reposition the manifest after discarding a partial append")?;
         file.sync_all()
             .context("failed to sync the manifest after discarding a partial append")?;
+
         Ok(false)
     }
 

@@ -788,6 +788,7 @@ fn test_range_tombstone_set_len() {
 fn collect_scan_keys(iter: crate::lsm_iterator::ScanIterator) -> Vec<Vec<u8>> {
     let mut results = Vec::new();
     let mut iter = iter;
+
     while iter.is_valid() {
         results.push(iter.key().to_vec());
         iter.next().unwrap();
@@ -798,6 +799,7 @@ fn collect_scan_keys(iter: crate::lsm_iterator::ScanIterator) -> Vec<Vec<u8>> {
 fn collect_scan_kv(iter: crate::lsm_iterator::ScanIterator) -> Vec<(Vec<u8>, Vec<u8>)> {
     let mut results = Vec::new();
     let mut iter = iter;
+
     while iter.is_valid() {
         results.push((iter.key().to_vec(), iter.value().to_vec()));
         iter.next().unwrap();

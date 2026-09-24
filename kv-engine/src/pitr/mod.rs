@@ -5,6 +5,20 @@
 //! for the later sequencer, segment manager, and PITR replay implementation.
 #![allow(dead_code)]
 
+pub mod api;
+pub(crate) mod archive;
+pub(crate) mod archive_completion;
+pub(crate) mod archiver;
+pub(crate) mod backpressure;
+pub(crate) mod base;
+pub(crate) mod catalog;
+pub(crate) mod enable;
+pub(crate) mod limiter;
+pub(crate) mod manifest;
+pub(crate) mod restore;
+pub(crate) mod seal;
+pub(crate) mod segment;
+
 use std::{
     borrow::Cow,
     collections::HashMap,
@@ -116,6 +130,7 @@ impl WalV5Limits {
             self.max_value_bytes <= u32::MAX as usize,
             "v5 value limit exceeds wire format"
         );
+
         Ok(self)
     }
 }
@@ -189,10 +204,12 @@ impl RecordedAt {
                             .checked_neg()
                             .context("recorded_at seconds exceed supported range")?
                     };
+
                     Ok(Self { secs, nanos: 0 })
                 } else {
                     let seconds = i64::try_from(seconds)
                         .context("recorded_at seconds exceed supported range")?;
+
                     Ok(Self {
                         secs: -seconds - 1,
                         nanos: 1_000_000_000 - duration.subsec_nanos(),
@@ -204,6 +221,7 @@ impl RecordedAt {
 
     pub(crate) fn as_system_time(self) -> Result<SystemTime> {
         ensure!(self.nanos < 1_000_000_000, "recorded_at nanos out of range");
+
         if self.secs >= 0 {
             let duration = Duration::from_secs(self.secs as u64)
                 .checked_add(Duration::from_nanos(u64::from(self.nanos)))
@@ -314,6 +332,7 @@ pub(crate) fn encode_v5_file_header(header: WalV5Header) -> Result<[u8; WAL_V5_H
     }
     let header_crc = crc32fast::hash(&output[..128]);
     output[128..132].copy_from_slice(&header_crc.to_be_bytes());
+
     Ok(output)
 }
 
@@ -365,6 +384,7 @@ pub(crate) fn decode_v5_file_header(input: &[u8]) -> Result<WalV5Header> {
         input[53..56] == [0; 3],
         "nonzero v5 predecessor reserved bytes"
     );
+
     Ok(WalV5Header {
         wal_format_version: u16::from_be_bytes([input[4], input[5]]),
         timeline_id: TimelineId(input[12..28].try_into().unwrap()),
@@ -380,6 +400,7 @@ pub(crate) fn encode_v5_batch(batch: &WalBatch, limits: WalV5Limits) -> Result<V
     let mut out = vec![0_u8; len];
     let written = encode_v5_batch_into(&canonical, limits, &mut out)?;
     debug_assert_eq!(written, len);
+
     Ok(out)
 }
 
@@ -398,6 +419,7 @@ pub(crate) fn canonical_batch(batch: &WalBatch, limits: WalV5Limits) -> Result<C
         batch.entries.len() <= limits.max_input_entry_count,
         "v5 input entry count exceeds configured limit"
     );
+
     if batch.entries.len() <= 1 {
         return Ok(Cow::Borrowed(batch));
     }
@@ -409,6 +431,7 @@ pub(crate) fn canonical_batch(batch: &WalBatch, limits: WalV5Limits) -> Result<C
 pub(crate) fn v5_batch_encoded_len(batch: &WalBatch, limits: WalV5Limits) -> Result<usize> {
     let limits = limits.validate()?;
     validate_encoding_inputs(batch, limits)?;
+
     align_up(WAL_V5_BATCH_HEADER_LEN + batch_data_len(batch, limits)?)
 }
 
@@ -458,6 +481,7 @@ pub(crate) fn encode_v5_batch_into(
     dst[28..32].copy_from_slice(&hasher.finalize().to_be_bytes());
 
     dst[pos..aligned_len].fill(0);
+
     Ok(aligned_len)
 }
 
@@ -501,6 +525,7 @@ fn write_entry_into(
     dst[at..at + header.len()].copy_from_slice(&header);
     hasher.update(&header);
     at += header.len();
+
     for field in fields {
         let prefix = u32::try_from(field.len())
             .context("v5 field too large")?
@@ -524,8 +549,8 @@ fn write_entry_into(
 /// from the WAL's `put_v5_batch` - and neither this function nor the
 /// [`encode_v5_batch`] wrapper above it is on the write path any more: every
 /// caller of the wrapper is a test. Both are kept as fixtures for the crate's
-/// tests - the wrapper is called from `pitr::tests`, `pitr_seal::tests`,
-/// `pitr_restore::tests`, `lsm_storage::tests` and the integration tests - and
+/// tests - the wrapper is called from `pitr::tests`, `pitr::seal::tests`,
+/// `pitr::restore::tests`, `lsm_storage::tests` and the integration tests - and
 /// this one additionally because a decoder test needs a builder that preserves
 /// duplicate keys. The file-level `allow(dead_code)` above is what keeps them
 /// compiling. The pinned digests in `pitr::tests` were produced by this
@@ -589,6 +614,7 @@ fn encode_v5_batch_inner(batch: &WalBatch, limits: WalV5Limits) -> Result<Vec<u8
     output.extend_from_slice(&data);
     let aligned_len = align_up(output.len())?;
     output.resize(aligned_len, 0);
+
     Ok(output)
 }
 
@@ -608,6 +634,7 @@ pub(crate) fn encoded_v5_batch_logical_len(encoded: &[u8]) -> Result<usize> {
         logical_len <= encoded.len(),
         "v5 batch data length exceeds its buffer"
     );
+
     Ok(logical_len)
 }
 
@@ -636,6 +663,7 @@ impl WalBatch {
                 _ => Some(entry.clone()),
             })
             .collect();
+
         Ok(Self {
             commit_ts: self.commit_ts,
             recorded_at: self.recorded_at,
@@ -748,6 +776,7 @@ pub(crate) fn decode_v5_batch(
         decoded_batch.canonicalized()?.entries == decoded_batch.entries,
         "v5 batch is not canonical"
     );
+
     Ok(DecodedBatch {
         batch: decoded_batch,
         data_end,
@@ -763,6 +792,7 @@ pub(crate) fn commit_time_entry_digest(high_water: CommitTimeHighWater) -> [u8; 
     preimage.extend_from_slice(&high_water.commit_ts.to_be_bytes());
     preimage.extend_from_slice(&high_water.recorded_at.secs.to_be_bytes());
     preimage.extend_from_slice(&high_water.recorded_at.nanos.to_be_bytes());
+
     Sha256::digest(preimage).into()
 }
 
@@ -786,6 +816,7 @@ fn decode_entry(kind: u8, payload: &[u8], limits: WalV5Limits) -> Result<WalEntr
         cursor == payload.len(),
         "v5 entry payload has trailing bytes"
     );
+
     Ok(entry)
 }
 
@@ -796,6 +827,7 @@ fn put_len_prefixed(output: &mut Vec<u8>, bytes: &[u8]) -> Result<()> {
             .to_be_bytes(),
     );
     output.extend_from_slice(bytes);
+
     Ok(())
 }
 
@@ -823,6 +855,7 @@ fn read_len_prefixed(
         .context("truncated v5 field")?
         .to_vec();
     *cursor = value_end;
+
     Ok(bytes)
 }
 
@@ -832,6 +865,7 @@ fn validate_batch_limits(batch: &WalBatch, limits: WalV5Limits) -> Result<()> {
         "v5 entry count exceeds configured limit"
     );
     batch_data_len(batch, limits)?;
+
     Ok(())
 }
 
@@ -839,6 +873,7 @@ fn validate_batch_limits(batch: &WalBatch, limits: WalV5Limits) -> Result<()> {
 /// data length.
 fn batch_data_len(batch: &WalBatch, limits: WalV5Limits) -> Result<usize> {
     let mut data_len = 0_usize;
+
     for entry in &batch.entries {
         data_len = data_len
             .checked_add(encoded_entry_len(entry, limits)?)
@@ -874,6 +909,7 @@ fn encoded_entry_len(entry: &WalEntry, limits: WalV5Limits) -> Result<usize> {
         }
     }
     .context("v5 entry payload size overflow")?;
+
     payload_len.checked_add(6).context("v5 entry size overflow")
 }
 
@@ -882,6 +918,7 @@ fn validate_field_len(bytes: &[u8], max_len: usize, field: &str) -> Result<()> {
         bytes.len() <= max_len,
         "v5 {field} exceeds configured limit"
     );
+
     Ok(())
 }
 
@@ -889,6 +926,7 @@ fn align_up(value: usize) -> Result<usize> {
     let rounded = value
         .checked_add(WAL_V5_ALIGNMENT - 1)
         .context("v5 alignment length overflow")?;
+
     Ok(rounded / WAL_V5_ALIGNMENT * WAL_V5_ALIGNMENT)
 }
 
@@ -1423,6 +1461,7 @@ mod tests {
                 "a3a444a6469c0708f1db2cc2a53072cb5edaed4adeb09ba77f4b72e25db9c40b",
             ),
         ];
+
         for (name, batch, expected_len, expected_digest) in cases {
             let canonical = canonical_batch(&batch, limits).unwrap();
             let mut encoded = vec![0xAA_u8; expected_len];

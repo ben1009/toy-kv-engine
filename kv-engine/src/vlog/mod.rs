@@ -158,6 +158,7 @@ pub fn encode_ttl_value(kind: KvKind, expire_at_secs: u64, payload: &[u8]) -> Ve
     buf.push(kind as u8);
     buf.extend_from_slice(&expire_at_secs.to_be_bytes());
     buf.extend_from_slice(payload);
+
     buf
 }
 
@@ -168,6 +169,7 @@ pub fn encode_ttl_value_pointer(expire_at_secs: u64, ptr: ValuePointer) -> Vec<u
     buf.push(KvKind::TtlValuePointer as u8);
     buf.extend_from_slice(&expire_at_secs.to_be_bytes());
     ptr.encode(&mut buf);
+
     buf
 }
 
@@ -216,6 +218,7 @@ impl ValuePointer {
             return None;
         }
         let mut b = buf;
+
         Some(Self {
             file_id: b.get_u32_le(),
             offset: b.get_u64_le(),
@@ -312,6 +315,7 @@ impl VlogFileHeader {
         anyhow::ensure!(version == 1, "unsupported vlog version: {}", version);
         let mut reserved = [0u8; 10];
         buf.copy_to_slice(&mut reserved);
+
         Ok(Self {
             magic,
             version,
@@ -351,6 +355,7 @@ impl VlogEntryHeader {
     pub fn compute_entry_size(key_len: usize, value_len: usize) -> Option<usize> {
         let entry_size = HEADER_SIZE.checked_add(key_len)?.checked_add(value_len)?;
         let padding = (ALIGNMENT - (entry_size % ALIGNMENT)) % ALIGNMENT;
+
         entry_size.checked_add(padding)
     }
 
@@ -364,6 +369,7 @@ impl VlogEntryHeader {
         hasher.update(&self.flags.to_le_bytes());
         hasher.update(&self._padding);
         hasher.update(key);
+
         hasher.finalize()
     }
 }
@@ -436,6 +442,7 @@ impl VlogReferences {
     /// Get the set of vLog file ids referenced by `sst_id`.
     pub fn get_sst_references(&self, sst_id: usize) -> Option<Vec<u32>> {
         let inner = self.inner.read();
+
         inner
             .sst_to_vlogs
             .get(&sst_id)
@@ -445,6 +452,7 @@ impl VlogReferences {
     /// Get the set of SST ids that reference `vlog_id`.
     pub fn get_ssts_referencing(&self, vlog_id: u32) -> Option<Vec<usize>> {
         let inner = self.inner.read();
+
         inner
             .vlog_to_ssts
             .get(&vlog_id)
@@ -455,6 +463,7 @@ impl VlogReferences {
     /// referenced vLog file ids.
     pub fn unregister(&self, sst_id: usize) -> Vec<u32> {
         let mut inner = self.inner.write();
+
         if let Some(vlog_ids) = inner.sst_to_vlogs.remove(&sst_id) {
             for vid in &vlog_ids {
                 if let Some(ssts) = inner.vlog_to_ssts.get_mut(vid) {
@@ -479,6 +488,7 @@ impl VlogReferences {
         }
         let mut inner = self.inner.write();
         let sst_ids = inner.vlog_to_ssts.get(&old_id).cloned().unwrap_or_default();
+
         for sst_id in sst_ids {
             inner.sst_to_vlogs.entry(sst_id).or_default().insert(new_id);
             inner.vlog_to_ssts.entry(new_id).or_default().insert(sst_id);
@@ -560,6 +570,7 @@ impl VlogFilePins {
 
     fn unpin_files(&mut self, file_ids: &[u32]) -> Vec<u32> {
         let mut ready_to_delete = Vec::new();
+
         for id in file_ids {
             if let Some(count) = self.files.get_mut(id) {
                 *count -= 1;
@@ -701,6 +712,7 @@ impl ValueLog {
             }
         };
         self.readers.force_put(file_id, reader.clone(), 1);
+
         {
             let mut locks = self.open_locks.lock();
             if locks
@@ -724,6 +736,7 @@ impl ValueLog {
     /// Return cache hit and miss counts without scanning the directory.
     pub fn cache_hit_miss_counts(&self) -> (u64, u64) {
         use std::sync::atomic::Ordering;
+
         (
             self.cache_hits.load(Ordering::Relaxed),
             self.cache_misses.load(Ordering::Relaxed),
@@ -805,6 +818,7 @@ impl ValueLog {
     /// deferred reclamation once no other SST still references them.
     pub fn retire_sst_references(&self, sst_id: usize) -> Vec<u32> {
         let file_ids = self.unregister_sst_references(sst_id);
+
         for file_id in &file_ids {
             self.schedule_deletion(*file_id);
         }
@@ -827,6 +841,7 @@ impl ValueLog {
 
     pub(crate) fn unpin_files_for_checkpoint(&self, file_ids: &[u32]) {
         let pending_delete_files = self.checkpoint_pins.lock().unpin_files(file_ids);
+
         for file_id in pending_delete_files {
             if let Err(err) = self.remove_file_unpinned(file_id) {
                 log::warn!(
@@ -977,6 +992,7 @@ impl ValueLog {
         let mut ids = std::mem::take(&mut *self.pending_retirements.lock());
         ids.sort_unstable();
         ids.dedup();
+
         ids
     }
 
@@ -1019,6 +1035,7 @@ impl ValueLog {
             }
         }
         self.restore_pending_deletions(remaining);
+
         match first_err {
             Some(e) => Err(e),
             None => Ok(deleted),
@@ -1035,6 +1052,7 @@ impl ValueLog {
     ) -> Result<usize> {
         let orphans = self.collect_orphan_vlog_file_ids(preserve)?;
         let mut deleted = 0;
+
         for file_id in orphans {
             if self.remove_file(file_id).is_ok() {
                 deleted += 1;
@@ -1051,6 +1069,7 @@ impl ValueLog {
         };
         to_process.sort_unstable_by_key(|p| p.file_id);
         to_process.dedup_by_key(|p| p.file_id);
+
         to_process
     }
 
@@ -1090,6 +1109,7 @@ impl ValueLog {
         preserve: &std::collections::HashSet<u32>,
     ) -> Result<Vec<u32>> {
         let mut orphans = Vec::new();
+
         for entry in std::fs::read_dir(&self.path)? {
             let entry = entry?;
             let Some(file_id) = Self::parse_vlog_file_id(&entry)? else {
@@ -1144,6 +1164,7 @@ impl ValueLog {
     pub fn stats(&self) -> Result<ValueLogStats> {
         let mut vlog_total_bytes: u64 = 0;
         let mut vlog_file_count: u32 = 0;
+
         for entry in std::fs::read_dir(&self.path)? {
             let entry = entry?;
             // GC may delete files concurrently — skip entries that vanish
@@ -1385,6 +1406,7 @@ mod tests {
 
         // Read back with ValueLogReader
         let reader = ValueLogReader::open(path).unwrap();
+
         for (i, (expected_key, expected_value)) in entries.iter().enumerate() {
             let entry = reader
                 .read_entry(pointers[i].offset, pointers[i].size)
@@ -1490,6 +1512,7 @@ mod tests {
         let meta_list: Vec<_> = iter.map(|r| r.unwrap()).collect();
 
         assert_eq!(meta_list.len(), entries.len());
+
         for (i, meta) in meta_list.iter().enumerate() {
             assert_eq!(meta.key, entries[i].0, "key mismatch at index {i}");
             assert_eq!(

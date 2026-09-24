@@ -5,7 +5,7 @@ A toy LSM-tree-based key-value storage engine written in Rust. This is an educat
 ## Technology Stack
 
 - **Language**: Rust (Edition 2024)
-- **Toolchain**: Nightly (`nightly-2026-08-20`), managed via `rust-toolchain` file
+- **Toolchain**: Nightly (`nightly-2026-09-23`), managed via `rust-toolchain` file
 - **Build Tool**: Cargo + cargo-make (`Makefile.toml`)
 - **Test Runner**: cargo-nextest
 - **Coverage**: cargo-llvm-cov
@@ -53,6 +53,7 @@ Key dependencies:
 └── kv-engine/
     ├── Cargo.toml
     ├── README.md
+    ├── integration_tests/          # Process-level Cargo integration tests
     ├── benches/
     │   ├── deleterange_benchmarks.rs
     │   ├── vlog_benchmarks.rs
@@ -74,6 +75,15 @@ Key dependencies:
         │   ├── iterator.rs
         │   └── bloom.rs
         ├── mem_table.rs               # In-memory skip-list memtable
+        ├── pitr/                      # Point-in-time recovery implementation
+        │   ├── mod.rs
+        │   ├── api.rs
+        │   ├── archive.rs
+        │   ├── archiver.rs
+        │   ├── backpressure.rs
+        │   ├── catalog.rs
+        │   ├── manifest.rs
+        │   └── ...
         ├── lsm_storage.rs             # Core LSM engine (state, flush, get, put, scan)
         ├── lsm_iterator.rs            # Full-LSM iterator
         ├── iterators.rs               # Iterator trait definitions
@@ -224,7 +234,8 @@ Run `cargo fmt --all` before committing. CI enforces `cargo fmt --check`.
 ### Test Organization
 
 - **Unit tests** live in the same file as the code they test (e.g., `block.rs` has `#[cfg(test)]` blocks).
-- **Integration tests** live under `kv-engine/src/tests/` and are declared in `kv-engine/src/tests.rs`.
+- **In-crate tests** live under `kv-engine/src/tests/` and are declared in `kv-engine/src/tests.rs`.
+- **Cargo integration tests** live under `kv-engine/integration_tests/` and are declared in `kv-engine/Cargo.toml`.
 - **vLog integration tests** are in `kv-engine/src/tests/vlog_integration_tests/` (split into `sst_builder.rs`, `basic.rs`, `gc.rs`, `advanced.rs`, `cache.rs`, `manifest.rs`).
 
 ### Test Configuration

@@ -72,6 +72,7 @@ pub struct BlockCache {
 impl BlockCache {
     pub fn new(capacity: usize) -> Self {
         let cap = capacity.max(1);
+
         Self {
             inner: TinyUfo::new(cap, cap),
             sst_blocks: Mutex::new(AHashMap::new()),
@@ -145,6 +146,7 @@ impl BlockCache {
             .or_default()
             .insert(key);
         self.count.fetch_add(1, Ordering::Relaxed);
+
         {
             let mut w = self.waiters.lock();
             if w.get(&key).is_some_and(|cur| Arc::ptr_eq(cur, &waiter)) {
@@ -341,6 +343,7 @@ impl ValueCache {
             .unwrap_or(usize::MAX);
         // Estimate number of entries: assume average value is 4 KiB.
         let estimated_items = (byte_budget / 4096).max(16) as usize;
+
         Self {
             inner: TinyUfo::new(weight_budget, estimated_items),
             file_keys: Mutex::new(AHashMap::new()),
@@ -354,6 +357,7 @@ impl ValueCache {
     /// budget, to avoid budget overshoot.
     fn value_weight(&self, value: &Bytes) -> Option<u16> {
         let raw = value.len().div_ceil(VALUE_WEIGHT_DIVISOR);
+
         if raw > u16::MAX as usize || raw > self.weight_budget as usize {
             return None;
         }
@@ -385,6 +389,7 @@ impl ValueCache {
             let mut index = self.file_keys.lock();
             index.remove(&file_id).into_iter().flatten().collect()
         };
+
         for key in keys {
             self.inner.remove(&key);
         }

@@ -35,6 +35,7 @@ pub fn is_io_uring_unavailable_error(e: &anyhow::Error) -> bool {
 pub fn skip_if_io_uring_unavailable(opts: &LsmStorageOptions) -> bool {
     let dir = tempfile::tempdir().expect("tempdir");
     let db_path = dir.path().join("probe");
+
     match KvEngine::open(&db_path, opts.clone()) {
         Ok(engine) => {
             let _ = engine.close();
@@ -251,6 +252,7 @@ pub fn generate_sst_with_ts(
     block_cache: Option<Arc<BlockCache>>,
 ) -> SsTable {
     let mut builder = SsTableBuilder::new(128);
+
     for ((key, ts), value) in data {
         builder
             .add(
@@ -374,6 +376,7 @@ pub fn check_compaction_ratio(storage: Arc<KvEngine>) {
         .unwrap()
         .num_active_iterators();
     let num_memtables = storage.inner.state.load().imm_memtables.len() + 1;
+
     match compaction_options {
         CompactionOptions::NoCompaction => unreachable!(),
         CompactionOptions::Simple(SimpleLeveledCompactionOptions {
@@ -491,6 +494,7 @@ pub fn check_compaction_ratio(storage: Arc<KvEngine>) {
 
 pub fn dump_files_in_dir(path: impl AsRef<Path>) {
     println!("--- DIR DUMP ---");
+
     for f in path.as_ref().read_dir().unwrap() {
         let f = f.unwrap();
         print!("{}", f.path().display());
@@ -505,6 +509,7 @@ pub fn construct_merge_iterator_over_storage(
     state: &LsmStorageState,
 ) -> MergeIterator<SsTableIterator> {
     let mut iters = Vec::new();
+
     for t in &state.l0_sstables {
         iters.push(Box::new(
             SsTableIterator::create_and_seek_to_first(
@@ -578,12 +583,13 @@ pub fn pitr_segment_wal_bytes_at(header: crate::pitr::WalV5Header, commit_ts: u6
         &crate::pitr::encode_v5_batch(&batch, crate::pitr::LIVE_WAL_V5_LIMITS)
             .expect("test segment batch encodes"),
     );
+
     bytes
 }
 
 /// The digest a segment at `wal_format_version` has over `wal`.
 pub fn pitr_wal_digest(wal: &[u8], wal_format_version: u16) -> [u8; 32] {
-    crate::pitr_seal::wal_digest(
+    crate::pitr::seal::wal_digest(
         wal,
         crate::pitr::wal_digest_rule(wal_format_version)
             .expect("test segment version is in the family"),

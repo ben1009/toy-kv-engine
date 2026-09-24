@@ -148,6 +148,7 @@ impl StressScenario {
                 )
             })
             .unwrap_or_else(|| "off".to_string());
+
         format!(
             "seed={} key_space={} ops_per_cycle={} flush_stride={} compact_every_flushes={} compaction={} enable_wal={} serializable={} vlog={} target_sst_size={} manifest_snapshot_threshold_bytes={}",
             self.seed,
@@ -198,6 +199,7 @@ pub fn plan_cycle(seed: u64, cycle: u64) -> (StressScenario, StressCyclePlan) {
         operations.push(StressOp::Flush);
     }
     operations.push(StressOp::Compact);
+
     (scenario, StressCyclePlan { phase, operations })
 }
 
@@ -221,6 +223,7 @@ fn execute_cycle_plan(
     cycle: u64,
 ) -> Result<StressCyclePlan, String> {
     let (scenario, plan) = plan_cycle(seed, cycle);
+
     for op in &plan.operations {
         let op_id = log.next_op_id();
         match op {
@@ -323,6 +326,7 @@ pub fn run_loop(
 fn random_data_op(scenario: &StressScenario, phase: StressPhase, rng: &mut StdRng) -> StressOp {
     let allow_delete_range = scenario.allow_delete_range && matches!(phase, StressPhase::Stress);
     let roll = rng.gen_range(0..100);
+
     if roll < 55 {
         let key_index = rng.gen_range(0..scenario.key_space);
         let value_len = choose_value_len(scenario, rng);
@@ -404,6 +408,7 @@ fn make_value(rng: &mut StdRng, len: usize) -> String {
         .choose(rng)
         .copied()
         .unwrap_or('x');
+
     std::iter::repeat_n(fill, len).collect()
 }
 
@@ -439,6 +444,7 @@ fn build_storage_options(
             max_merge_width: None,
         }),
     };
+
     if rng.gen_bool(0.5) {
         let min_value_size = [128usize, 512, 1024, 4096]
             .choose(rng)
@@ -459,6 +465,7 @@ fn build_storage_options(
 
 fn wal_supported() -> bool {
     static SUPPORTED: OnceLock<bool> = OnceLock::new();
+
     *SUPPORTED.get_or_init(|| {
         let probe_dir = std::env::temp_dir().join(format!(
             "kv-engine-chaos-wal-probe-{}-{}",
@@ -509,6 +516,7 @@ pub fn open_stress_engine(
         }
         None => {}
     }
+
     let wal_enabled = effective_options.enable_wal;
     KvEngine::open(db_path, effective_options)
         .map(|engine| (engine, wal_enabled))

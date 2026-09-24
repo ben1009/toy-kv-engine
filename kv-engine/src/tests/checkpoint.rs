@@ -31,6 +31,7 @@ fn vlog_checkpoint_options() -> LsmStorageOptions {
 #[cfg(feature = "chaos-testing")]
 fn checkpoint_test_guard() -> std::sync::MutexGuard<'static, ()> {
     static CHECKPOINT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     CHECKPOINT_TEST_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -981,6 +982,7 @@ fn checkpoint_data_files(checkpoint_path: &std::path::Path) -> Vec<PathBuf> {
         }));
     }
     files.sort();
+
     files
 }
 
@@ -994,6 +996,7 @@ fn vlog_file_ids(vlog_dir: &std::path::Path, extension: &str) -> Vec<u32> {
         })
         .collect::<Vec<_>>();
     ids.sort_unstable();
+
     ids
 }
 
@@ -1090,6 +1093,7 @@ fn current_sst_ids(engine: &KvEngine) -> Vec<usize> {
         .copied()
         .collect::<Vec<_>>();
     sst_ids.sort_unstable();
+
     sst_ids
 }
 
@@ -1106,5 +1110,6 @@ fn hold_checkpoint_lock(path: &std::path::Path) -> fs::File {
         .unwrap();
     let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
     assert_eq!(result, 0);
+
     file
 }

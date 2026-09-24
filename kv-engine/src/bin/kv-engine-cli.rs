@@ -419,16 +419,19 @@ impl ReplBuilder {
 
     pub fn app_name(mut self, app_name: &str) -> Self {
         self.app_name = app_name.to_string();
+
         self
     }
 
     pub fn description(mut self, description: &str) -> Self {
         self.description = description.to_string();
+
         self
     }
 
     pub fn prompt(mut self, prompt: &str) -> Self {
         self.prompt = prompt.to_string();
+
         self
     }
 
@@ -510,6 +513,7 @@ mod tests {
     #[test]
     fn checkpoint_command_accepts_single_target() {
         let command = Command::parse("checkpoint /tmp/checkpoint").unwrap();
+
         match command {
             Command::Checkpoint { target_dir } => {
                 assert_eq!(target_dir, std::path::PathBuf::from("/tmp/checkpoint"));

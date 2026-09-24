@@ -184,6 +184,7 @@ impl LsmIterator {
         let Some(now_secs) = ttl_now_secs else {
             return false;
         };
+
         crate::vlog::TtlMetadata::parse(raw_value)
             .is_some_and(|(meta, _)| now_secs >= meta.expire_at_secs)
     }
@@ -211,6 +212,7 @@ impl LsmIterator {
 
     fn refresh_cached_encoded_user_key(&mut self) {
         self.encoded_user_key.clear();
+
         if self.inner.is_valid() {
             self.encoded_user_key
                 .extend_from_slice(self.inner.key().encoded_user_key());
@@ -436,6 +438,7 @@ impl ScanIterator {
     /// offset handling without duplicating iterator-validity loops.
     pub fn skip_entries(&mut self, n: usize) -> Result<usize> {
         let mut skipped = 0;
+
         if self.iter.has_errored {
             return Ok(skipped);
         }
@@ -454,6 +457,7 @@ impl ScanIterator {
         F: FnMut(&[u8]),
     {
         let mut count = 0;
+
         if self.iter.has_errored {
             return Ok(count);
         }
@@ -475,6 +479,7 @@ impl ScanIterator {
         F: FnMut(&[u8]),
     {
         let mut count = 0;
+
         if self.iter.has_errored {
             return Ok(count);
         }
@@ -493,6 +498,7 @@ impl ScanIterator {
     /// counted entry.
     pub fn count_entries(&mut self, limit: usize) -> Result<usize> {
         let mut count = 0;
+
         if self.iter.has_errored {
             return Ok(count);
         }

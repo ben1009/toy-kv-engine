@@ -207,6 +207,7 @@ impl LsmMvccInner {
         }
         self.publish_frontier(&publication);
         let current = self.current_ts.load(Ordering::Acquire);
+
         Ok((current != 0).then_some(current))
     }
 
@@ -240,6 +241,7 @@ impl LsmMvccInner {
     pub fn new(initial_ts: u64) -> Self {
         let instance_id = NEXT_MVCC_INSTANCE_ID.fetch_add(1, Ordering::Relaxed);
         assert!(instance_id != 0, "MVCC instance identity exhausted");
+
         Self {
             instance_id,
             write_lock: Mutex::new(()),
@@ -287,6 +289,7 @@ impl LsmMvccInner {
         publication.next_to_publish = publication.next_to_publish.max(ts.saturating_add(1));
         publication.retired.retain(|retired| *retired > ts);
         self.publish_frontier(&publication);
+
         if publication.waiters > 0 {
             self.publication_condvar.notify_all();
         }
@@ -317,6 +320,7 @@ impl LsmMvccInner {
         // Counted before the second gate check, so a barrier that sees the gate
         // open below cannot also see zero in flight and drain past this commit.
         self.in_flight.fetch_add(1, Ordering::SeqCst);
+
         if self.commit_gate.load(Ordering::SeqCst) {
             // Admission closed, or the sequencer was poisoned, between the two
             // checks. Retire the allocation so the barrier's drain is not left
@@ -361,6 +365,7 @@ impl LsmMvccInner {
                 .wait_for(&mut publication, DRAIN_RECHECK);
         }
         publication.waiters -= 1;
+
         Ok(())
     }
 
@@ -368,6 +373,7 @@ impl LsmMvccInner {
     /// publication lock so the message names the state that actually closed it.
     fn commit_gate_error(&self) -> anyhow::Error {
         let publication = self.publication.lock();
+
         if publication.poisoned_at.is_some() {
             anyhow::anyhow!("commit sequencer requires recovery after unknown WAL durability")
         } else {
@@ -384,6 +390,7 @@ impl LsmMvccInner {
         let mut high_water = self.recorded_at_high_water.lock();
         let recorded_at = high_water.map_or(sampled, |previous| previous.max(sampled));
         *high_water = Some(recorded_at);
+
         Ok(recorded_at)
     }
 
@@ -414,6 +421,7 @@ impl LsmMvccInner {
             publication.next_to_publish = next.saturating_add(1);
         }
         self.publish_frontier(&publication);
+
         if publication.waiters > 0 {
             self.publication_condvar.notify_all();
         }
@@ -491,6 +499,7 @@ impl LsmMvccInner {
     /// which could cause premature GC of versions still in use.
     pub fn watermark(&self) -> u64 {
         let _guard = self.reader_lock.write();
+
         self.watermark
             .watermark()
             .unwrap_or(self.current_ts.load(Ordering::Acquire))
@@ -505,6 +514,7 @@ impl LsmMvccInner {
     /// Acquires the write lock to ensure no reader is mid-registration.
     pub(crate) fn can_publish_filter_deletion(&self) -> bool {
         let _guard = self.reader_lock.write();
+
         self.watermark.watermark().is_none()
     }
 
@@ -518,6 +528,7 @@ impl LsmMvccInner {
         &self,
     ) -> Option<parking_lot::lock_api::RwLockWriteGuard<'_, parking_lot::RawRwLock, ()>> {
         let guard = self.reader_lock.write();
+
         if self.watermark.watermark().is_none() {
             Some(guard)
         } else {
@@ -1014,6 +1025,7 @@ impl LsmMvccInner {
         publication.next_to_publish = publication.next_to_publish.max(ts.saturating_add(1));
         publication.retired.retain(|retired| *retired > ts);
         self.publish_frontier(&publication);
+
         if publication.waiters > 0 {
             self.publication_condvar.notify_all();
         }
@@ -1036,6 +1048,7 @@ impl LsmMvccInner {
         } else {
             (None, None)
         };
+
         #[allow(clippy::arc_with_non_send_sync)]
         Arc::new(Transaction {
             read_ts,
@@ -1060,6 +1073,7 @@ impl LsmMvccInner {
     ) -> Arc<Transaction> {
         let txn = self.new_txn(inner, serializable);
         *txn.lifecycle_guard.lock() = Some(guard);
+
         txn
     }
 
@@ -1118,6 +1132,7 @@ impl ReadGuard {
             mvcc.watermark.add_reader(ts);
             ts
         };
+
         Self { read_ts, mvcc }
     }
 

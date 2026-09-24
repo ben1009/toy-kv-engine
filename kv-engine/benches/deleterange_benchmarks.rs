@@ -56,6 +56,7 @@ fn flush_all(lsm: &KvEngine) {
 /// Load `n` entries with key format `keyNNNNNN` and a 100-byte value.
 fn load_entries(lsm: &KvEngine, n: usize) {
     let value = vec![0xABu8; 100];
+
     for i in 0..n {
         let key = format!("key{:06}", i);
         lsm.put(key.as_bytes(), &value).unwrap();
@@ -77,6 +78,7 @@ fn insert_noncovering_tombstones(lsm: &KvEngine, n: usize) {
 fn count_scan(iter: impl StorageIterator) -> usize {
     let mut iter = iter;
     let mut count = 0;
+
     while iter.is_valid() {
         count += 1;
         iter.next().unwrap();

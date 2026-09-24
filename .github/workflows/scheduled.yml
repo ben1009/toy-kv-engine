@@ -30,9 +30,11 @@ jobs:
         if: hashFiles('Cargo.lock') == ''
         run: cargo generate-lockfile
       - name: Rust Cache
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Install nextest
-        uses: taiki-e/install-action@nextest
+        uses: taiki-e/install-action@82cd3e7658a6f96c86c0234aeeda1748937cb0a1 # v2.85.13
+        with:
+          tool: nextest@0.9.145
       - name: cargo nextest --locked (unit)
         run: cargo +nightly nextest run --locked --all-features --lib -E 'not test(/integration/)'
 
@@ -57,9 +59,11 @@ jobs:
         if: hashFiles('Cargo.lock') == ''
         run: cargo generate-lockfile
       - name: Rust Cache
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Install nextest
-        uses: taiki-e/install-action@nextest
+        uses: taiki-e/install-action@82cd3e7658a6f96c86c0234aeeda1748937cb0a1 # v2.85.13
+        with:
+          tool: nextest@0.9.145
       - name: cargo nextest --locked (integration)
         run: cargo +nightly nextest run --locked --all-features --lib -E 'test(/integration/)' --test-threads 2
 
@@ -85,7 +89,7 @@ jobs:
         if: hashFiles('Cargo.lock') == ''
         run: cargo generate-lockfile
       - name: Rust Cache
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: cargo test chaos stress
         run: cargo test --package kv-engine --features chaos-testing --test chaos -- --nocapture
       - name: Upload chaos artifacts on failure
@@ -123,9 +127,11 @@ jobs:
         if: hashFiles('Cargo.lock') != ''
         run: cargo update
       - name: Rust Cache
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Install nextest
-        uses: taiki-e/install-action@nextest
+        uses: taiki-e/install-action@82cd3e7658a6f96c86c0234aeeda1748937cb0a1 # v2.85.13
+        with:
+          tool: nextest@0.9.145
       - name: cargo nextest
         if: hashFiles('Cargo.lock') != ''
         run: cargo +beta nextest run --locked --all-features --lib

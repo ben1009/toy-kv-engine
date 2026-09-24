@@ -9,6 +9,7 @@ use wrapper::kv_engine_wrapper::lsm_storage::KvEngine;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+
     if !args.iter().any(|a| a == "--child") {
         return; // pass as test when no --child flag
     }

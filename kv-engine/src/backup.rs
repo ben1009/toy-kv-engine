@@ -150,6 +150,7 @@ pub(crate) fn derived_object_name(
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
+
     format!("{prefix}-{file_id}-{digest}")
 }
 
@@ -169,7 +170,7 @@ struct BackupMetadata {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     compatibility: Option<RestoreCompatibility>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pitr_base: Option<crate::pitr_base::PitrBaseMetadata>,
+    pitr_base: Option<crate::pitr::base::PitrBaseMetadata>,
     body: Vec<u8>,
 }
 
@@ -191,6 +192,7 @@ fn pitr_compatibility_digest(compatibility: &RestoreCompatibility) -> [u8; 32] {
     digest.update(compatibility.vlog_format_version.unwrap_or(0).to_be_bytes());
     digest.update([u8::from(compatibility.ttl_records_present)]);
     digest.update([u8::from(compatibility.serializable_at_capture)]);
+
     digest.finalize().into()
 }
 
@@ -311,6 +313,7 @@ mod commit_decision_test_hook {
     pub fn wait_until_entered(token: u64, id: u64) {
         let (lock, condvar) = STATE.get().unwrap();
         let mut state = lock.lock();
+
         while state.0 != Some((token, id)) || !state.1 {
             condvar.wait(&mut state);
         }
@@ -329,6 +332,7 @@ mod commit_decision_test_hook {
             return;
         };
         let mut state = lock.lock();
+
         if state.0 == Some((token, id)) && !state.1 && !state.2 {
             state.1 = true;
             condvar.notify_all();
@@ -350,6 +354,7 @@ mod commit_decision_test_hook {
     pub fn wait_after(token: u64, id: u64) {
         let (lock, condvar) = POST_STATE.get().unwrap();
         let mut state = lock.lock();
+
         while state.0 != Some((token, id)) || !state.1 {
             condvar.wait(&mut state);
         }
@@ -368,6 +373,7 @@ mod commit_decision_test_hook {
             return;
         };
         let mut state = lock.lock();
+
         if state.0 == Some((token, id)) && !state.1 && !state.2 {
             state.1 = true;
             condvar.notify_all();
@@ -409,6 +415,7 @@ mod restore_unlock_test_hook {
         let mut state = lock.lock();
         state.0 = true;
         condvar.notify_all();
+
         while !state.1 {
             condvar.wait(&mut state);
         }
@@ -417,6 +424,7 @@ mod restore_unlock_test_hook {
     pub fn wait() {
         let (lock, condvar) = STATE.get_or_init(|| (Mutex::new((false, false)), Condvar::new()));
         let mut state = lock.lock();
+
         while !state.0 {
             condvar.wait(&mut state);
         }
@@ -590,18 +598,18 @@ pub(crate) struct BackupObjectRef {
 
 #[cfg(target_os = "linux")]
 fn public_pitr_base_interval(
-    base: &crate::pitr_base::PitrBaseMetadata,
+    base: &crate::pitr::base::PitrBaseMetadata,
     backup_id: u64,
-) -> Result<crate::pitr_api::RecoveryInterval> {
+) -> Result<crate::pitr::api::RecoveryInterval> {
     let boundary = match base.boundary_anchor {
-        crate::pitr_manifest::PersistedChainAnchor::Genesis { archive_epoch_id } => {
-            crate::pitr_api::RecoveryChainAnchor::Genesis { archive_epoch_id }
+        crate::pitr::manifest::PersistedChainAnchor::Genesis { archive_epoch_id } => {
+            crate::pitr::api::RecoveryChainAnchor::Genesis { archive_epoch_id }
         }
-        crate::pitr_manifest::PersistedChainAnchor::Segment {
+        crate::pitr::manifest::PersistedChainAnchor::Segment {
             segment_id,
             wal_digest,
             seal_digest,
-        } => crate::pitr_api::RecoveryChainAnchor::Segment(crate::pitr_api::SegmentAnchor {
+        } => crate::pitr::api::RecoveryChainAnchor::Segment(crate::pitr::api::SegmentAnchor {
             segment_id,
             wal_digest,
             seal_digest,
@@ -613,12 +621,12 @@ fn public_pitr_base_interval(
     }
     .as_system_time()?;
     let base_time_anchor = match base.time_anchor {
-        crate::pitr_base::PitrBaseTimeAnchor::Indexed {
+        crate::pitr::base::PitrBaseTimeAnchor::Indexed {
             segment_id,
             commit_ts,
             recorded_at,
             entry_digest,
-        } => crate::pitr_api::BaseTimeAnchor::Indexed {
+        } => crate::pitr::api::BaseTimeAnchor::Indexed {
             segment_id,
             commit_ts,
             recorded_at: crate::pitr::RecordedAt {
@@ -628,10 +636,10 @@ fn public_pitr_base_interval(
             .as_system_time()?,
             entry_digest,
         },
-        crate::pitr_base::PitrBaseTimeAnchor::Observed {
+        crate::pitr::base::PitrBaseTimeAnchor::Observed {
             commit_ts,
             observed_at,
-        } => crate::pitr_api::BaseTimeAnchor::ObservedBoundary {
+        } => crate::pitr::api::BaseTimeAnchor::ObservedBoundary {
             commit_ts,
             observed_at: crate::pitr::RecordedAt {
                 secs: observed_at.secs,
@@ -640,7 +648,8 @@ fn public_pitr_base_interval(
             .as_system_time()?,
         },
     };
-    Ok(crate::pitr_api::RecoveryInterval {
+
+    Ok(crate::pitr::api::RecoveryInterval {
         repository_id: base.repository_id,
         timeline_id: base.timeline_id,
         archive_epoch_id: base.archive_epoch_id,
@@ -716,7 +725,7 @@ fn recover_pitr_purge_transaction(root: &OwnedFd) -> Result<()> {
         "PITR purge transaction successor checksum mismatch"
     );
     replay_catalog(&read_catalog_records(backup_successor)?)?;
-    crate::pitr_catalog::replay_catalog(successor)?;
+    crate::pitr::catalog::replay_catalog(successor)?;
     let backup_catalog_replay = replay_catalog(&read_catalog_records(backup_successor)?)?;
     ensure!(
         backup_catalog_replay.last_sequence == backup_high_water,
@@ -788,6 +797,7 @@ fn recover_pitr_purge_transaction(root: &OwnedFd) -> Result<()> {
         result == 0 || std::io::Error::last_os_error().kind() == std::io::ErrorKind::NotFound,
         "failed to remove recovered PITR purge descriptor"
     );
+
     fsync_fd(root)
 }
 
@@ -802,6 +812,7 @@ fn revalidate_pitr_purge_successors(
             Ok(fd) => {
                 let mut bytes = Vec::new();
                 File::from(fd).read_to_end(&mut bytes)?;
+
                 Ok(Some(bytes))
             }
             Err(error)
@@ -814,6 +825,7 @@ fn revalidate_pitr_purge_successors(
             Err(error) => Err(error),
         }
     };
+
     Ok((
         read("BACKUP_CATALOG_LOG")?.is_some_and(|bytes| bytes == backup_successor),
         read("PITR_CATALOG_LOG")?.is_some_and(|bytes| bytes == pitr_successor),
@@ -883,6 +895,7 @@ impl BackupRepository {
         file.write_all(&identity)?;
         file.sync_all()?;
         install_repository_identity(&self.root)?;
+
         Ok(identity)
     }
 
@@ -891,6 +904,7 @@ impl BackupRepository {
             self.usable.load(Ordering::Acquire),
             "backup repository is invalidated; reopen it before retrying"
         );
+
         Ok(())
     }
 
@@ -899,6 +913,7 @@ impl BackupRepository {
             !self.stale_after_restore.load(Ordering::Acquire),
             "backup repository handle is stale after restore; reopen it before mutation"
         );
+
         self.ensure_usable()
     }
 
@@ -918,6 +933,7 @@ impl BackupRepository {
         self.pending_prepare_digest = None;
         self.pending_backup_metadata_checksum = None;
         self.pending_parent_backup_id = None;
+
         Ok(())
     }
 
@@ -926,6 +942,7 @@ impl BackupRepository {
         let mut catalog = File::from(catalog_fd);
         let frames = read_catalog_records(&mut catalog)?;
         let replay = replay_catalog(&frames)?;
+
         if replay.committed_backup_ids.contains(&id) {
             Ok(Some(true))
         } else if replay.abandoned_backup_id == Some(id) || replay.backup_id_high_watermark < id {
@@ -941,6 +958,7 @@ impl BackupRepository {
         self.ensure_usable()?;
         let catalog_fd = openat_no_follow(&self.root, "BACKUP_CATALOG_LOG", libc::O_RDONLY, 0)?;
         let mut catalog = File::from(catalog_fd);
+
         replay_catalog(&read_catalog_records(&mut catalog)?)
     }
 
@@ -971,11 +989,13 @@ impl BackupRepository {
 
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let root = open_directory_no_follow(path.as_ref())?;
+
         Self::open_root(root)
     }
 
     fn open_at(parent: &OwnedFd, name: &str) -> Result<Self> {
         let root = openat_no_follow(parent, name, libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
+
         Self::open_root(root)
     }
 
@@ -1006,6 +1026,7 @@ impl BackupRepository {
         }
         remove_uncommitted_backup_orphans(&backups, &replay.committed_backup_ids)?;
         validate_replay_backups(&root, &replay, require_snapshot_metadata)?;
+
         if frames.torn_tail || replay.retained_offset < frames.last_complete_offset {
             catalog.set_len(replay.retained_offset)?;
             catalog.sync_all()?;
@@ -1035,6 +1056,7 @@ impl BackupRepository {
         let replay = self.load_replay()?;
         let backups =
             openat_no_follow(&self.root, "backups", libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
+
         for committed in &replay.committed_backups {
             let backup = openat_no_follow(
                 &backups,
@@ -1090,6 +1112,7 @@ impl BackupRepository {
         let backups =
             openat_no_follow(&self.root, "backups", libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
         let mut result = Vec::with_capacity(replay.committed_backups.len());
+
         for committed in &replay.committed_backups {
             let backup = openat_no_follow(
                 &backups,
@@ -1179,6 +1202,7 @@ impl BackupRepository {
     /// from an empty repository.
     pub fn latest_id_result(&self) -> Result<Option<u64>> {
         let _operation_guard = self.operation_lock.lock();
+
         Ok(self.load_replay()?.committed_backup_ids.last().copied())
     }
 
@@ -1194,6 +1218,7 @@ impl BackupRepository {
         ensure!(retain > 0, "retention count must be greater than zero");
         let replay = self.load_replay()?;
         let keep_from = replay.committed_backup_ids.len().saturating_sub(retain);
+
         Ok(replay.committed_backup_ids[keep_from..].to_vec())
     }
 
@@ -1230,6 +1255,7 @@ impl BackupRepository {
         }
         let mut names = names.into_iter().collect::<Vec<_>>();
         names.sort_unstable();
+
         Ok(names)
     }
 
@@ -1269,12 +1295,14 @@ impl BackupRepository {
             }
         }
         result.sort_unstable();
+
         Ok(result)
     }
 
     /// Computes a retention plan without modifying the repository.
     pub fn plan_purge(&self, retain: usize) -> Result<(Vec<u64>, Vec<String>)> {
         let _operation_guard = self.operation_lock.lock();
+
         Ok((
             self.retained_backup_ids(retain)?,
             self.unreferenced_object_names(retain)?,
@@ -1285,6 +1313,7 @@ impl BackupRepository {
     /// repository lock. Open descriptors pin the source inodes across purge.
     fn pin_backup_objects(&self, envelope: &BackupMetadata) -> Result<Vec<File>> {
         let files = openat_no_follow(&self.root, "objects", libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
+
         envelope
             .objects
             .as_deref()
@@ -1302,6 +1331,7 @@ impl BackupRepository {
                     file.metadata()?.len() == object.file_size,
                     "repository object size mismatch"
                 );
+
                 Ok(file)
             })
             .collect()
@@ -1324,6 +1354,7 @@ impl BackupRepository {
         } else {
             None
         };
+
         for (object, pinned) in envelope
             .objects
             .as_deref()
@@ -1356,6 +1387,7 @@ impl BackupRepository {
     fn write_restore_manifest(target_dir: &OwnedFd, snapshot: &[u8]) -> Result<()> {
         let _: crate::manifest::ManifestRecord =
             serde_json::from_slice(snapshot).context("invalid restore manifest snapshot")?;
+
         for (name, bytes) in [("ENGINE_MANIFEST", snapshot), ("MANIFEST", &[][..])] {
             let mut file = File::from(openat_no_follow(
                 target_dir,
@@ -1399,6 +1431,7 @@ impl BackupRepository {
                 libc::RENAME_NOREPLACE,
             )
         };
+
         if result != 0 {
             return Err(std::io::Error::last_os_error().into());
         }
@@ -1440,6 +1473,7 @@ impl BackupRepository {
                 libc::RENAME_NOREPLACE,
             )
         };
+
         if result != 0 {
             let rename_error = std::io::Error::last_os_error();
             // `RENAME_NOREPLACE` refuses to replace, so `EEXIST` means the target
@@ -1487,6 +1521,7 @@ impl BackupRepository {
             .and_then(|name| name.to_str())
             .ok_or_else(|| anyhow!("restore target must have a UTF-8 basename"))?;
         let parent_fd = open_directory_no_follow(parent)?;
+
         ensure_restore_target_absent(&parent_fd, name)
     }
 
@@ -1584,6 +1619,7 @@ impl BackupRepository {
             let durability_error =
                 Self::publish_restore_staging(&parent_fd, &staging_name, target_name)?;
             cleanup.disarm();
+
             Ok(match durability_error {
                 Some(error) => RestoreOutcome::PublishedButNotDurable {
                     target: target.to_path_buf(),
@@ -1593,6 +1629,7 @@ impl BackupRepository {
             })
         })();
         let relock = relock_guard.reacquire();
+
         match relock {
             Ok(()) => result,
             Err(error) => {
@@ -1607,6 +1644,7 @@ impl BackupRepository {
             !target_name.is_empty(),
             "restore target name must not be empty"
         );
+
         for _ in 0..32 {
             let sequence = OBJECT_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
             let name = format!(".{target_name}.restore-{}-{sequence}", std::process::id());
@@ -1639,6 +1677,7 @@ impl BackupRepository {
         self.ensure_mutation_allowed()?;
         let files = openat_no_follow(&self.root, "objects", libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
         let object_name = derived_object_name(kind, file_id, file_checksum);
+
         copy_or_reuse_object(
             source_dir,
             source_name,
@@ -1774,6 +1813,7 @@ impl BackupRepository {
             bail!("backup cancelled after object publication");
         }
         objects.sort_by(|left, right| left.object_name.cmp(&right.object_name));
+
         Ok((objects, published, reused, new_objects))
     }
 
@@ -1786,6 +1826,7 @@ impl BackupRepository {
         }
         let files = openat_no_follow(&self.root, "objects", libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
         let mut first_error = None;
+
         for name in names {
             if let Err(error) = ensure_repository_object_name(name)
                 .and_then(|_| validate_object_before_reclaim(&files, name))
@@ -1859,6 +1900,7 @@ impl BackupRepository {
             envelope.engine_manifest_checksum == engine_manifest_checksum,
             "backup engine manifest checksum mismatch"
         );
+
         if envelope.version >= 2 {
             validate_restore_snapshot_objects(&envelope, &snapshot_bytes)?;
         }
@@ -1869,6 +1911,7 @@ impl BackupRepository {
     pub fn verify_all(&self) -> Result<()> {
         let _operation_guard = self.operation_lock.lock();
         let replay = self.load_replay()?;
+
         for id in &replay.committed_backup_ids {
             self.verify(*id)
                 .with_context(|| format!("backup {id} failed verification"))?;
@@ -1880,8 +1923,8 @@ impl BackupRepository {
     #[cfg(target_os = "linux")]
     pub fn verify_pitr(
         &self,
-        options: crate::pitr_api::VerifyPitrOptions,
-    ) -> Result<crate::pitr_api::VerifyPitrReport> {
+        options: crate::pitr::api::VerifyPitrOptions,
+    ) -> Result<crate::pitr::api::VerifyPitrReport> {
         options.validate()?;
         let _operation_guard = self.operation_lock.lock();
         self.ensure_usable()?;
@@ -1889,11 +1932,11 @@ impl BackupRepository {
         let mut catalog_file = File::from(catalog_fd);
         let mut catalog_bytes = Vec::new();
         catalog_file.read_to_end(&mut catalog_bytes)?;
-        let replay = crate::pitr_catalog::replay_catalog(&catalog_bytes)?;
+        let replay = crate::pitr::catalog::replay_catalog(&catalog_bytes)?;
         let verified_intervals = self.load_pitr_base_intervals(options.selector)?;
         let catalog_digest =
             pitr_repository_view_digest(replay.prefix_digest, &self.load_replay()?);
-        let query_digest = crate::pitr_api::verification_query_digest(options)?;
+        let query_digest = crate::pitr::api::verification_query_digest(options)?;
         let catalog_high_water = replay.sequence;
         let start = match options.cursor {
             None => 0,
@@ -1911,13 +1954,13 @@ impl BackupRepository {
         let mut segments = Vec::new();
         for record in &replay.records {
             let candidates = match record {
-                crate::pitr_catalog::PitrCatalogRecord::CommitSegment { metadata } => {
+                crate::pitr::catalog::PitrCatalogRecord::CommitSegment { metadata } => {
                     std::slice::from_ref(metadata)
                 }
-                crate::pitr_catalog::PitrCatalogRecord::RetentionSnapshot(snapshot) => {
+                crate::pitr::catalog::PitrCatalogRecord::RetentionSnapshot(snapshot) => {
                     snapshot.segments.as_slice()
                 }
-                crate::pitr_catalog::PitrCatalogRecord::CoverageBreak(_) => &[],
+                crate::pitr::catalog::PitrCatalogRecord::CoverageBreak(_) => &[],
             };
             for metadata in candidates {
                 if let Some(selector) = options.selector
@@ -1941,18 +1984,18 @@ impl BackupRepository {
         let wal_dir = openat_no_follow(&self.root, "wal", libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
         let mut last_verified_commit_ts = None;
         for metadata in &segments[start..end] {
-            let wal_name = crate::pitr_archive::archive_object_name(
+            let wal_name = crate::pitr::archive::archive_object_name(
                 metadata.key.timeline_id,
                 metadata.key.archive_epoch_id,
                 metadata.key.segment_id,
-                crate::pitr_archive::ArchiveObjectKind::Wal,
+                crate::pitr::archive::ArchiveObjectKind::Wal,
                 metadata.wal_digest,
             );
-            let seal_name = crate::pitr_archive::archive_object_name(
+            let seal_name = crate::pitr::archive::archive_object_name(
                 metadata.key.timeline_id,
                 metadata.key.archive_epoch_id,
                 metadata.key.segment_id,
-                crate::pitr_archive::ArchiveObjectKind::Seal,
+                crate::pitr::archive::ArchiveObjectKind::Seal,
                 metadata.seal_digest,
             );
             for (name, expected_bytes, expected_digest, digest, kind) in [
@@ -1960,24 +2003,24 @@ impl BackupRepository {
                     wal_name,
                     Some(metadata.wal_bytes),
                     metadata.wal_digest,
-                    crate::pitr_archive::SourceObjectDigest::Wal(metadata.wal_digest_rule()?),
-                    crate::pitr_api::SegmentFailureKind::Missing,
+                    crate::pitr::archive::SourceObjectDigest::Wal(metadata.wal_digest_rule()?),
+                    crate::pitr::api::SegmentFailureKind::Missing,
                 ),
                 (
                     seal_name,
                     None,
                     metadata.seal_digest,
-                    crate::pitr_archive::SourceObjectDigest::WholeObject,
-                    crate::pitr_api::SegmentFailureKind::Missing,
+                    crate::pitr::archive::SourceObjectDigest::WholeObject,
+                    crate::pitr::api::SegmentFailureKind::Missing,
                 ),
             ] {
                 let fd = match openat_no_follow(&wal_dir, &name, libc::O_RDONLY, 0) {
                     Ok(fd) => fd,
                     Err(_) => {
-                        return Ok(crate::pitr_api::VerifyPitrReport {
+                        return Ok(crate::pitr::api::VerifyPitrReport {
                             verified_intervals: verified_intervals.clone(),
                             next_cursor: None,
-                            first_failure: Some(crate::pitr_api::SegmentFailureLocator {
+                            first_failure: Some(crate::pitr::api::SegmentFailureLocator {
                                 expected_segment_id: Some(metadata.key.segment_id.0),
                                 decoded_anchor: None,
                                 catalog_sequence: None,
@@ -1997,22 +2040,24 @@ impl BackupRepository {
                         .digest(&bytes)
                         .is_ok_and(|actual| actual.as_slice() == expected_digest)
                 {
-                    return Ok(crate::pitr_api::VerifyPitrReport {
+                    return Ok(crate::pitr::api::VerifyPitrReport {
                         verified_intervals: verified_intervals.clone(),
                         next_cursor: None,
-                        first_failure: Some(crate::pitr_api::SegmentFailureLocator {
+                        first_failure: Some(crate::pitr::api::SegmentFailureLocator {
                             expected_segment_id: Some(metadata.key.segment_id.0),
                             decoded_anchor: None,
                             catalog_sequence: None,
-                            kind: crate::pitr_api::SegmentFailureKind::Corrupt,
+                            kind: crate::pitr::api::SegmentFailureKind::Corrupt,
                         }),
                         last_verified_commit_ts,
                     });
                 }
-                if matches!(options.depth, crate::pitr_api::VerifyPitrDepth::Deep { .. })
-                    && name.ends_with(".wal")
+                if matches!(
+                    options.depth,
+                    crate::pitr::api::VerifyPitrDepth::Deep { .. }
+                ) && name.ends_with(".wal")
                 {
-                    crate::pitr_restore::decode_restore_wal_batches_for_segment(
+                    crate::pitr::restore::decode_restore_wal_batches_for_segment(
                         &bytes,
                         metadata,
                         crate::pitr::LIVE_WAL_V5_LIMITS,
@@ -2021,14 +2066,15 @@ impl BackupRepository {
             }
             last_verified_commit_ts = metadata.last_commit_ts.or(last_verified_commit_ts);
         }
-        let next_cursor = (end < segments.len()).then_some(crate::pitr_api::VerifyPitrCursor {
+        let next_cursor = (end < segments.len()).then_some(crate::pitr::api::VerifyPitrCursor {
             catalog_digest,
             catalog_high_water,
             query_digest,
             interval_index: u64::try_from(end)
                 .map_err(|_| anyhow!("PITR verification index overflow"))?,
         });
-        Ok(crate::pitr_api::VerifyPitrReport {
+
+        Ok(crate::pitr::api::VerifyPitrReport {
             verified_intervals,
             next_cursor,
             first_failure: None,
@@ -2039,8 +2085,8 @@ impl BackupRepository {
     #[cfg(target_os = "linux")]
     pub(crate) fn pitr_status_page(
         &self,
-        options: crate::pitr_api::PitrStatusOptions,
-    ) -> Result<crate::pitr_api::RecoveryIntervalPage> {
+        options: crate::pitr::api::PitrStatusOptions,
+    ) -> Result<crate::pitr::api::RecoveryIntervalPage> {
         options.validate()?;
         let _operation_guard = self.operation_lock.lock();
         self.ensure_usable()?;
@@ -2061,11 +2107,12 @@ impl BackupRepository {
                 }
                 Err(error) => return Err(error),
             };
-        let replay = crate::pitr_catalog::replay_catalog(&catalog_bytes)?;
+        let replay = crate::pitr::catalog::replay_catalog(&catalog_bytes)?;
         let intervals = self.load_pitr_base_intervals(None)?;
         let catalog_digest =
             pitr_repository_view_digest(replay.prefix_digest, &self.load_replay()?);
-        crate::pitr_api::page_recovery_intervals(
+
+        crate::pitr::api::page_recovery_intervals(
             &intervals,
             options,
             catalog_digest,
@@ -2093,31 +2140,31 @@ impl BackupRepository {
                 }
                 Err(error) => return Err(error),
             };
-        let replay = crate::pitr_catalog::replay_catalog(&catalog_bytes)?;
+        let replay = crate::pitr::catalog::replay_catalog(&catalog_bytes)?;
         let mut referenced = HashSet::new();
         for record in replay.records {
             let segments = match record {
-                crate::pitr_catalog::PitrCatalogRecord::CommitSegment { metadata } => {
+                crate::pitr::catalog::PitrCatalogRecord::CommitSegment { metadata } => {
                     vec![metadata]
                 }
-                crate::pitr_catalog::PitrCatalogRecord::RetentionSnapshot(snapshot) => {
+                crate::pitr::catalog::PitrCatalogRecord::RetentionSnapshot(snapshot) => {
                     snapshot.segments
                 }
-                crate::pitr_catalog::PitrCatalogRecord::CoverageBreak(_) => Vec::new(),
+                crate::pitr::catalog::PitrCatalogRecord::CoverageBreak(_) => Vec::new(),
             };
             for metadata in segments {
-                referenced.insert(crate::pitr_archive::archive_object_name(
+                referenced.insert(crate::pitr::archive::archive_object_name(
                     metadata.key.timeline_id,
                     metadata.key.archive_epoch_id,
                     metadata.key.segment_id,
-                    crate::pitr_archive::ArchiveObjectKind::Wal,
+                    crate::pitr::archive::ArchiveObjectKind::Wal,
                     metadata.wal_digest,
                 ));
-                referenced.insert(crate::pitr_archive::archive_object_name(
+                referenced.insert(crate::pitr::archive::archive_object_name(
                     metadata.key.timeline_id,
                     metadata.key.archive_epoch_id,
                     metadata.key.segment_id,
-                    crate::pitr_archive::ArchiveObjectKind::Seal,
+                    crate::pitr::archive::ArchiveObjectKind::Seal,
                     metadata.seal_digest,
                 ));
             }
@@ -2136,6 +2183,7 @@ impl BackupRepository {
             };
         let mut staging = 0_u64;
         let mut orphan = 0_u64;
+
         for entry in std::fs::read_dir(format!("/proc/self/fd/{}", wal_dir.as_raw_fd()))? {
             let entry = entry?;
             let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
@@ -2164,8 +2212,9 @@ impl BackupRepository {
     ) -> Result<bool> {
         let _operation_guard = self.operation_lock.lock();
         self.ensure_usable()?;
+
         Ok(!self
-            .load_pitr_base_intervals(Some(crate::pitr_api::RecoverySelector {
+            .load_pitr_base_intervals(Some(crate::pitr::api::RecoverySelector {
                 timeline_id,
                 archive_epoch_id: Some(archive_epoch_id),
                 base_backup_id: None,
@@ -2176,8 +2225,8 @@ impl BackupRepository {
     #[cfg(target_os = "linux")]
     fn load_pitr_base_intervals(
         &self,
-        selector: Option<crate::pitr_api::RecoverySelector>,
-    ) -> Result<Vec<crate::pitr_api::RecoveryInterval>> {
+        selector: Option<crate::pitr::api::RecoverySelector>,
+    ) -> Result<Vec<crate::pitr::api::RecoveryInterval>> {
         let replay = self.load_replay()?;
         let backups =
             openat_no_follow(&self.root, "backups", libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
@@ -2228,17 +2277,17 @@ impl BackupRepository {
                 }
                 Err(error) => return Err(error),
             };
-        let catalog = crate::pitr_catalog::replay_catalog(&catalog_bytes)?;
+        let catalog = crate::pitr::catalog::replay_catalog(&catalog_bytes)?;
         let mut segments = Vec::new();
         for record in catalog.records {
             match record {
-                crate::pitr_catalog::PitrCatalogRecord::CommitSegment { metadata } => {
+                crate::pitr::catalog::PitrCatalogRecord::CommitSegment { metadata } => {
                     segments.push(metadata);
                 }
-                crate::pitr_catalog::PitrCatalogRecord::RetentionSnapshot(snapshot) => {
+                crate::pitr::catalog::PitrCatalogRecord::RetentionSnapshot(snapshot) => {
                     segments.extend(snapshot.segments);
                 }
-                crate::pitr_catalog::PitrCatalogRecord::CoverageBreak(_) => {}
+                crate::pitr::catalog::PitrCatalogRecord::CoverageBreak(_) => {}
             }
         }
         segments.sort_by_key(|metadata| metadata.key.segment_id.0);
@@ -2258,12 +2307,12 @@ impl BackupRepository {
             };
         for interval in &mut intervals {
             let mut predecessor = match interval.boundary {
-                crate::pitr_api::RecoveryChainAnchor::Genesis { archive_epoch_id } => {
+                crate::pitr::api::RecoveryChainAnchor::Genesis { archive_epoch_id } => {
                     crate::pitr::ChainAnchor::Genesis {
                         archive_epoch_id: crate::pitr::ArchiveEpochId(archive_epoch_id),
                     }
                 }
-                crate::pitr_api::RecoveryChainAnchor::Segment(anchor) => {
+                crate::pitr::api::RecoveryChainAnchor::Segment(anchor) => {
                     crate::pitr::ChainAnchor::Segment(crate::pitr::SegmentAnchor {
                         segment_id: crate::pitr::SegmentId(anchor.segment_id),
                         wal_digest: anchor.wal_digest,
@@ -2296,11 +2345,11 @@ impl BackupRepository {
                 if let Some(last) = metadata.last_commit_ts {
                     commit_end = Some(commit_end.map_or(last, |old| old.max(last)));
                 }
-                let seal_name = crate::pitr_archive::archive_object_name(
+                let seal_name = crate::pitr::archive::archive_object_name(
                     metadata.key.timeline_id,
                     metadata.key.archive_epoch_id,
                     metadata.key.segment_id,
-                    crate::pitr_archive::ArchiveObjectKind::Seal,
+                    crate::pitr::archive::ArchiveObjectKind::Seal,
                     metadata.seal_digest,
                 );
                 let seal_fd = openat_no_follow(
@@ -2313,7 +2362,7 @@ impl BackupRepository {
                 )?;
                 let mut seal_bytes = Vec::new();
                 File::from(seal_fd).read_to_end(&mut seal_bytes)?;
-                let seal = crate::pitr_seal::V5Seal::decode(&seal_bytes)?;
+                let seal = crate::pitr::seal::V5Seal::decode(&seal_bytes)?;
                 if let Some(first) = seal.entries.first() {
                     let first = first.recorded_at.as_system_time()?;
                     recorded_start = Some(recorded_start.map_or(first, |old| old.min(first)));
@@ -2330,13 +2379,14 @@ impl BackupRepository {
                 .map(|(start, end)| start..=end);
         }
         intervals.sort_by_key(|interval| interval.base_backup_id);
+
         Ok(intervals)
     }
 
     #[cfg(target_os = "linux")]
     fn build_backup_retention_successor(
         &self,
-        policy: crate::pitr_api::PitrRetentionPolicy,
+        policy: crate::pitr::api::PitrRetentionPolicy,
         cutoff: std::time::SystemTime,
         retained_timelines: &HashSet<[u8; 16]>,
     ) -> Result<(Vec<u8>, u64, Vec<u64>)> {
@@ -2445,6 +2495,7 @@ impl BackupRepository {
         };
         let mut successor = Vec::new();
         append_catalog_record(&mut successor, &record)?;
+
         Ok((successor, sequence, retained_ids))
     }
 
@@ -2454,8 +2505,8 @@ impl BackupRepository {
     #[cfg(target_os = "linux")]
     pub fn purge_pitr(
         &self,
-        policy: crate::pitr_api::PitrRetentionPolicy,
-    ) -> Result<crate::pitr_api::PitrPurgeOutcome> {
+        policy: crate::pitr::api::PitrRetentionPolicy,
+    ) -> Result<crate::pitr::api::PitrPurgeOutcome> {
         policy.validate()?;
         let _operation_guard = self.operation_lock.lock();
         self.ensure_mutation_allowed()?;
@@ -2463,7 +2514,7 @@ impl BackupRepository {
         let mut catalog_file = File::from(catalog_fd);
         let mut catalog_bytes = Vec::new();
         catalog_file.read_to_end(&mut catalog_bytes)?;
-        let replay = crate::pitr_catalog::replay_catalog(&catalog_bytes)?;
+        let replay = crate::pitr::catalog::replay_catalog(&catalog_bytes)?;
         let candidate_cutoff = std::time::SystemTime::now()
             .checked_sub(policy.minimum_window)
             .ok_or_else(|| anyhow!("PITR retention cutoff underflow"))?;
@@ -2471,7 +2522,7 @@ impl BackupRepository {
             .records
             .iter()
             .filter_map(|record| match record {
-                crate::pitr_catalog::PitrCatalogRecord::RetentionSnapshot(snapshot) => {
+                crate::pitr::catalog::PitrCatalogRecord::RetentionSnapshot(snapshot) => {
                     snapshot.retention_cutoff
                 }
                 _ => None,
@@ -2519,15 +2570,15 @@ impl BackupRepository {
         let mut breaks = Vec::new();
         for record in &replay.records {
             match record {
-                crate::pitr_catalog::PitrCatalogRecord::CommitSegment { metadata } => {
+                crate::pitr::catalog::PitrCatalogRecord::CommitSegment { metadata } => {
                     repository_id = Some(metadata.key.repository_id);
                     segments.push(metadata.clone());
                 }
-                crate::pitr_catalog::PitrCatalogRecord::CoverageBreak(break_record) => {
+                crate::pitr::catalog::PitrCatalogRecord::CoverageBreak(break_record) => {
                     repository_id = Some(break_record.repository_id);
                     breaks.push(break_record.clone());
                 }
-                crate::pitr_catalog::PitrCatalogRecord::RetentionSnapshot(snapshot) => {
+                crate::pitr::catalog::PitrCatalogRecord::RetentionSnapshot(snapshot) => {
                     repository_id = Some(snapshot.repository_id);
                     segments.extend(snapshot.segments.iter().cloned());
                     breaks.extend(snapshot.breaks.iter().cloned());
@@ -2573,12 +2624,12 @@ impl BackupRepository {
                 crate::pitr::ArchiveEpochId(interval.archive_epoch_id),
             );
             let boundary = match interval.boundary {
-                crate::pitr_api::RecoveryChainAnchor::Genesis { archive_epoch_id } => {
+                crate::pitr::api::RecoveryChainAnchor::Genesis { archive_epoch_id } => {
                     crate::pitr::ChainAnchor::Genesis {
                         archive_epoch_id: crate::pitr::ArchiveEpochId(archive_epoch_id),
                     }
                 }
-                crate::pitr_api::RecoveryChainAnchor::Segment(anchor) => {
+                crate::pitr::api::RecoveryChainAnchor::Segment(anchor) => {
                     crate::pitr::ChainAnchor::Segment(crate::pitr::SegmentAnchor {
                         segment_id: crate::pitr::SegmentId(anchor.segment_id),
                         wal_digest: anchor.wal_digest,
@@ -2621,7 +2672,7 @@ impl BackupRepository {
                     }
                     started = true;
                     if !matches!(boundary, crate::pitr::ChainAnchor::Genesis { .. }) {
-                        chain_starts.push(crate::pitr_catalog::RetainedChainStart {
+                        chain_starts.push(crate::pitr::catalog::RetainedChainStart {
                             timeline_id,
                             archive_epoch_id,
                             predecessor: boundary,
@@ -2668,7 +2719,7 @@ impl BackupRepository {
             .map(|metadata| (metadata.key.timeline_id.0, metadata.key.archive_epoch_id.0))
             .collect::<std::collections::HashSet<_>>()
             .len() as u64;
-        let snapshot = crate::pitr_catalog::RetentionSnapshot {
+        let snapshot = crate::pitr::catalog::RetentionSnapshot {
             repository_id,
             replaced_prefix_high_water: replay.sequence,
             replaced_prefix_digest: replay.prefix_digest,
@@ -2680,8 +2731,8 @@ impl BackupRepository {
             backup_catalog_high_water,
             backup_catalog_digest,
         };
-        let successor = crate::pitr_catalog::encode_catalog(&[
-            crate::pitr_catalog::PitrCatalogRecord::RetentionSnapshot(snapshot),
+        let successor = crate::pitr::catalog::encode_catalog(&[
+            crate::pitr::catalog::PitrCatalogRecord::RetentionSnapshot(snapshot),
         ])?;
         let retained_segment_keys = segments
             .iter()
@@ -2698,18 +2749,18 @@ impl BackupRepository {
         let mut planned_reclaim_bytes = 0_u64;
         for metadata in &removed_segments {
             for name in [
-                crate::pitr_archive::archive_object_name(
+                crate::pitr::archive::archive_object_name(
                     metadata.key.timeline_id,
                     metadata.key.archive_epoch_id,
                     metadata.key.segment_id,
-                    crate::pitr_archive::ArchiveObjectKind::Wal,
+                    crate::pitr::archive::ArchiveObjectKind::Wal,
                     metadata.wal_digest,
                 ),
-                crate::pitr_archive::archive_object_name(
+                crate::pitr::archive::archive_object_name(
                     metadata.key.timeline_id,
                     metadata.key.archive_epoch_id,
                     metadata.key.segment_id,
-                    crate::pitr_archive::ArchiveObjectKind::Seal,
+                    crate::pitr::archive::ArchiveObjectKind::Seal,
                     metadata.seal_digest,
                 ),
             ] {
@@ -2740,7 +2791,7 @@ impl BackupRepository {
         descriptor.write_all(&successor)?;
         descriptor.sync_all()?;
         fsync_fd(&self.root)?;
-        let unpublished_info = crate::pitr_api::PitrPurgeInfo {
+        let unpublished_info = crate::pitr::api::PitrPurgeInfo {
             retained_interval_count,
             planned_reclaim_segments,
             planned_reclaim_bytes,
@@ -2753,13 +2804,13 @@ impl BackupRepository {
             return match revalidate_pitr_purge_successors(&self.root, &backup_successor, &successor)
             {
                 Ok((true, true)) => Ok(
-                    crate::pitr_api::PitrPurgeOutcome::CatalogsPublishedButNotDurable {
+                    crate::pitr::api::PitrPurgeOutcome::CatalogsPublishedButNotDurable {
                         info: unpublished_info,
                         error: fsync_error,
                     },
                 ),
                 Ok((false, false)) => Err(fsync_error.into()),
-                Ok(visibility) => Ok(crate::pitr_api::PitrPurgeOutcome::PublicationUnknown {
+                Ok(visibility) => Ok(crate::pitr::api::PitrPurgeOutcome::PublicationUnknown {
                     info: unpublished_info,
                     fsync_error,
                     revalidation_error: anyhow!(
@@ -2769,7 +2820,7 @@ impl BackupRepository {
                     ),
                 }),
                 Err(revalidation_error) => {
-                    Ok(crate::pitr_api::PitrPurgeOutcome::PublicationUnknown {
+                    Ok(crate::pitr::api::PitrPurgeOutcome::PublicationUnknown {
                         info: unpublished_info,
                         fsync_error,
                         revalidation_error,
@@ -2787,28 +2838,28 @@ impl BackupRepository {
         let mut reclaim_object_owner = std::collections::HashMap::new();
         for metadata in &removed_segments {
             reclaim_object_owner.insert(
-                crate::pitr_archive::archive_object_name(
+                crate::pitr::archive::archive_object_name(
                     metadata.key.timeline_id,
                     metadata.key.archive_epoch_id,
                     metadata.key.segment_id,
-                    crate::pitr_archive::ArchiveObjectKind::Wal,
+                    crate::pitr::archive::ArchiveObjectKind::Wal,
                     metadata.wal_digest,
                 ),
                 metadata.key,
             );
             reclaim_object_owner.insert(
-                crate::pitr_archive::archive_object_name(
+                crate::pitr::archive::archive_object_name(
                     metadata.key.timeline_id,
                     metadata.key.archive_epoch_id,
                     metadata.key.segment_id,
-                    crate::pitr_archive::ArchiveObjectKind::Seal,
+                    crate::pitr::archive::ArchiveObjectKind::Seal,
                     metadata.seal_digest,
                 ),
                 metadata.key,
             );
         }
         let mut deleted_segment_parts =
-            std::collections::HashMap::<crate::pitr_catalog::SegmentKey, u8>::new();
+            std::collections::HashMap::<crate::pitr::catalog::SegmentKey, u8>::new();
         let cleanup_result = (|| -> Result<u64> {
             #[cfg(test)]
             {
@@ -2858,18 +2909,18 @@ impl BackupRepository {
                 .iter()
                 .flat_map(|metadata| {
                     [
-                        crate::pitr_archive::archive_object_name(
+                        crate::pitr::archive::archive_object_name(
                             metadata.key.timeline_id,
                             metadata.key.archive_epoch_id,
                             metadata.key.segment_id,
-                            crate::pitr_archive::ArchiveObjectKind::Wal,
+                            crate::pitr::archive::ArchiveObjectKind::Wal,
                             metadata.wal_digest,
                         ),
-                        crate::pitr_archive::archive_object_name(
+                        crate::pitr::archive::archive_object_name(
                             metadata.key.timeline_id,
                             metadata.key.archive_epoch_id,
                             metadata.key.segment_id,
-                            crate::pitr_archive::ArchiveObjectKind::Seal,
+                            crate::pitr::archive::ArchiveObjectKind::Seal,
                             metadata.seal_digest,
                         ),
                     ]
@@ -2914,18 +2965,18 @@ impl BackupRepository {
                 .iter()
                 .filter(|metadata| {
                     [
-                        crate::pitr_archive::archive_object_name(
+                        crate::pitr::archive::archive_object_name(
                             metadata.key.timeline_id,
                             metadata.key.archive_epoch_id,
                             metadata.key.segment_id,
-                            crate::pitr_archive::ArchiveObjectKind::Wal,
+                            crate::pitr::archive::ArchiveObjectKind::Wal,
                             metadata.wal_digest,
                         ),
-                        crate::pitr_archive::archive_object_name(
+                        crate::pitr::archive::archive_object_name(
                             metadata.key.timeline_id,
                             metadata.key.archive_epoch_id,
                             metadata.key.segment_id,
-                            crate::pitr_archive::ArchiveObjectKind::Seal,
+                            crate::pitr::archive::ArchiveObjectKind::Seal,
                             metadata.seal_digest,
                         ),
                     ]
@@ -2938,6 +2989,7 @@ impl BackupRepository {
                     })
                 })
                 .count() as u64;
+
             Ok(deleted_segments)
         })();
         // The post-cleanup count is the authoritative one for a purge that ran to
@@ -2951,7 +3003,7 @@ impl BackupRepository {
             .values()
             .filter(|parts| **parts == 2)
             .count() as u64;
-        let info = |deleted_segments: u64| crate::pitr_api::PitrPurgeInfo {
+        let info = |deleted_segments: u64| crate::pitr::api::PitrPurgeInfo {
             retained_interval_count,
             planned_reclaim_segments,
             planned_reclaim_bytes,
@@ -2959,12 +3011,13 @@ impl BackupRepository {
             deleted_bytes: Some(deleted_bytes),
             oldest_recoverable_commit_ts: oldest_advertised_commit_ts,
         };
+
         match cleanup_result {
-            Ok(deleted_segments) => Ok(crate::pitr_api::PitrPurgeOutcome::Purged(info(
+            Ok(deleted_segments) => Ok(crate::pitr::api::PitrPurgeOutcome::Purged(info(
                 deleted_segments,
             ))),
             Err(error) => Ok(
-                crate::pitr_api::PitrPurgeOutcome::CatalogsDurableCleanupIncomplete {
+                crate::pitr::api::PitrPurgeOutcome::CatalogsDurableCleanupIncomplete {
                     info: info(ledger_segments),
                     error: into_io_error(error),
                 },
@@ -2976,21 +3029,21 @@ impl BackupRepository {
     #[cfg(target_os = "linux")]
     pub fn restore_to(
         &self,
-        target: crate::pitr_api::RecoveryTarget,
+        target: crate::pitr::api::RecoveryTarget,
         destination: impl AsRef<Path>,
-        options: crate::pitr_api::PitrRestoreOptions,
-    ) -> Result<crate::pitr_api::RestoreToOutcome> {
+        options: crate::pitr::api::PitrRestoreOptions,
+    ) -> Result<crate::pitr::api::RestoreToOutcome> {
         self.restore_to_with_cancellation(target, destination, options, None)
     }
 
     #[cfg(target_os = "linux")]
     fn restore_to_with_cancellation(
         &self,
-        target: crate::pitr_api::RecoveryTarget,
+        target: crate::pitr::api::RecoveryTarget,
         destination: impl AsRef<Path>,
-        options: crate::pitr_api::PitrRestoreOptions,
+        options: crate::pitr::api::PitrRestoreOptions,
         cancellation: Option<&std::sync::atomic::AtomicBool>,
-    ) -> Result<crate::pitr_api::RestoreToOutcome> {
+    ) -> Result<crate::pitr::api::RestoreToOutcome> {
         check_pitr_cancellation(cancellation)?;
         target.validate()?;
         options.validate()?;
@@ -3002,7 +3055,7 @@ impl BackupRepository {
                 let Some(base_backup_id) =
                     self.select_pitr_base_backup(&replay, target, options.selector)?
                 else {
-                    return Ok(crate::pitr_api::RestoreToOutcome::NoRecoverablePoint);
+                    return Ok(crate::pitr::api::RestoreToOutcome::NoRecoverablePoint);
                 };
                 base_backup_id
             }
@@ -3037,18 +3090,18 @@ impl BackupRepository {
             base.timeline_id == options.selector.timeline_id,
             "selected base timeline does not match restore selector"
         );
-        if let crate::pitr_api::RecoveryTarget::CommitTs(target_commit_ts) = target {
+        if let crate::pitr::api::RecoveryTarget::CommitTs(target_commit_ts) = target {
             ensure!(target_commit_ts != 0, "PITR restore commit target is zero");
         }
         let boundary = match base.boundary_anchor {
-            crate::pitr_manifest::PersistedChainAnchor::Genesis { archive_epoch_id } => {
-                crate::pitr_api::RecoveryChainAnchor::Genesis { archive_epoch_id }
+            crate::pitr::manifest::PersistedChainAnchor::Genesis { archive_epoch_id } => {
+                crate::pitr::api::RecoveryChainAnchor::Genesis { archive_epoch_id }
             }
-            crate::pitr_manifest::PersistedChainAnchor::Segment {
+            crate::pitr::manifest::PersistedChainAnchor::Segment {
                 segment_id,
                 wal_digest,
                 seal_digest,
-            } => crate::pitr_api::RecoveryChainAnchor::Segment(crate::pitr_api::SegmentAnchor {
+            } => crate::pitr::api::RecoveryChainAnchor::Segment(crate::pitr::api::SegmentAnchor {
                 segment_id,
                 wal_digest,
                 seal_digest,
@@ -3060,12 +3113,12 @@ impl BackupRepository {
         }
         .as_system_time()?;
         let base_time_anchor = match base.time_anchor {
-            crate::pitr_base::PitrBaseTimeAnchor::Indexed {
+            crate::pitr::base::PitrBaseTimeAnchor::Indexed {
                 segment_id,
                 commit_ts,
                 recorded_at,
                 entry_digest,
-            } => crate::pitr_api::BaseTimeAnchor::Indexed {
+            } => crate::pitr::api::BaseTimeAnchor::Indexed {
                 segment_id,
                 commit_ts,
                 recorded_at: crate::pitr::RecordedAt {
@@ -3075,10 +3128,10 @@ impl BackupRepository {
                 .as_system_time()?,
                 entry_digest,
             },
-            crate::pitr_base::PitrBaseTimeAnchor::Observed {
+            crate::pitr::base::PitrBaseTimeAnchor::Observed {
                 commit_ts,
                 observed_at,
-            } => crate::pitr_api::BaseTimeAnchor::ObservedBoundary {
+            } => crate::pitr::api::BaseTimeAnchor::ObservedBoundary {
                 commit_ts,
                 observed_at: crate::pitr::RecordedAt {
                     secs: observed_at.secs,
@@ -3087,7 +3140,7 @@ impl BackupRepository {
                 .as_system_time()?,
             },
         };
-        let selected_interval = crate::pitr_api::RecoveryInterval {
+        let selected_interval = crate::pitr::api::RecoveryInterval {
             repository_id: base.repository_id,
             timeline_id: base.timeline_id,
             archive_epoch_id: base.archive_epoch_id,
@@ -3099,7 +3152,7 @@ impl BackupRepository {
             recorded_time_bounds: Some(recorded_at..=recorded_at),
             base_time_anchor,
         };
-        if !matches!(target, crate::pitr_api::RecoveryTarget::CommitTs(commit_ts) if base.included_commit_ts == Some(commit_ts))
+        if !matches!(target, crate::pitr::api::RecoveryTarget::CommitTs(commit_ts) if base.included_commit_ts == Some(commit_ts))
         {
             return self.restore_pitr_wal(
                 base_backup_id,
@@ -3111,7 +3164,7 @@ impl BackupRepository {
                 cancellation,
             );
         }
-        let info = crate::pitr_api::RestoreToInfo {
+        let info = crate::pitr::api::RestoreToInfo {
             requested_target: target,
             resolved_commit_ts: base.included_commit_ts,
             last_applied_commit_ts: base.included_commit_ts,
@@ -3121,10 +3174,11 @@ impl BackupRepository {
             replayed_bytes: 0,
         };
         check_pitr_cancellation(cancellation)?;
+
         match self.restore(base_backup_id, destination, options.storage)? {
-            RestoreOutcome::Restored => Ok(crate::pitr_api::RestoreToOutcome::Restored(info)),
+            RestoreOutcome::Restored => Ok(crate::pitr::api::RestoreToOutcome::Restored(info)),
             RestoreOutcome::PublishedButNotDurable { error, .. } => {
-                Ok(crate::pitr_api::RestoreToOutcome::PublishedButNotDurable { info, error })
+                Ok(crate::pitr::api::RestoreToOutcome::PublishedButNotDurable { info, error })
             }
         }
     }
@@ -3133,12 +3187,13 @@ impl BackupRepository {
     #[cfg(target_os = "linux")]
     pub fn restore_to_async(
         self: Arc<Self>,
-        target: crate::pitr_api::RecoveryTarget,
+        target: crate::pitr::api::RecoveryTarget,
         destination: impl AsRef<Path> + Send + 'static,
-        options: crate::pitr_api::PitrRestoreOptions,
-    ) -> crate::pitr_api::PitrTask<crate::pitr_api::RestoreToOutcome> {
+        options: crate::pitr::api::PitrRestoreOptions,
+    ) -> crate::pitr::api::PitrTask<crate::pitr::api::RestoreToOutcome> {
         let destination = destination.as_ref().to_path_buf();
-        crate::pitr_api::PitrTask::spawn_cancellable(move |cancellation| {
+
+        crate::pitr::api::PitrTask::spawn_cancellable(move |cancellation| {
             self.restore_to_with_cancellation(
                 target,
                 destination,
@@ -3152,12 +3207,13 @@ impl BackupRepository {
     fn select_pitr_base_backup(
         &self,
         replay: &CatalogReplay,
-        target: crate::pitr_api::RecoveryTarget,
-        selector: crate::pitr_api::RecoverySelector,
+        target: crate::pitr::api::RecoveryTarget,
+        selector: crate::pitr::api::RecoverySelector,
     ) -> Result<Option<u64>> {
         let backups =
             openat_no_follow(&self.root, "backups", libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
         let mut selected = None;
+
         for committed in &replay.committed_backups {
             let backup_dir = openat_no_follow(
                 &backups,
@@ -3182,11 +3238,11 @@ impl BackupRepository {
                 continue;
             }
             let eligible = match target {
-                crate::pitr_api::RecoveryTarget::Latest => true,
-                crate::pitr_api::RecoveryTarget::CommitTs(commit_ts) => base
+                crate::pitr::api::RecoveryTarget::Latest => true,
+                crate::pitr::api::RecoveryTarget::CommitTs(commit_ts) => base
                     .included_commit_ts
                     .is_none_or(|base_ts| base_ts <= commit_ts),
-                crate::pitr_api::RecoveryTarget::AtOrBeforeSystemTime(time) => {
+                crate::pitr::api::RecoveryTarget::AtOrBeforeSystemTime(time) => {
                     crate::pitr::RecordedAt {
                         secs: base.base_recorded_at.secs,
                         nanos: base.base_recorded_at.nanos,
@@ -3210,13 +3266,13 @@ impl BackupRepository {
     fn restore_pitr_wal(
         &self,
         base_backup_id: u64,
-        base: crate::pitr_base::PitrBaseMetadata,
-        requested_target: crate::pitr_api::RecoveryTarget,
+        base: crate::pitr::base::PitrBaseMetadata,
+        requested_target: crate::pitr::api::RecoveryTarget,
         destination: impl AsRef<Path>,
         storage: crate::lsm_storage::LsmStorageOptions,
-        selected_interval: crate::pitr_api::RecoveryInterval,
+        selected_interval: crate::pitr::api::RecoveryInterval,
         cancellation: Option<&std::sync::atomic::AtomicBool>,
-    ) -> Result<crate::pitr_api::RestoreToOutcome> {
+    ) -> Result<crate::pitr::api::RestoreToOutcome> {
         check_pitr_cancellation(cancellation)?;
         let catalog_fd = match openat_no_follow(&self.root, "PITR_CATALOG_LOG", libc::O_RDONLY, 0) {
             Ok(fd) => fd,
@@ -3225,7 +3281,7 @@ impl BackupRepository {
                     .downcast_ref::<std::io::Error>()
                     .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
             {
-                let info = crate::pitr_api::RestoreToInfo {
+                let info = crate::pitr::api::RestoreToInfo {
                     requested_target,
                     resolved_commit_ts: base.included_commit_ts,
                     last_applied_commit_ts: base.included_commit_ts,
@@ -3236,10 +3292,10 @@ impl BackupRepository {
                 };
                 return match self.restore(base_backup_id, destination, storage)? {
                     RestoreOutcome::Restored => {
-                        Ok(crate::pitr_api::RestoreToOutcome::Restored(info))
+                        Ok(crate::pitr::api::RestoreToOutcome::Restored(info))
                     }
                     RestoreOutcome::PublishedButNotDurable { error, .. } => {
-                        Ok(crate::pitr_api::RestoreToOutcome::PublishedButNotDurable {
+                        Ok(crate::pitr::api::RestoreToOutcome::PublishedButNotDurable {
                             info,
                             error,
                         })
@@ -3251,11 +3307,11 @@ impl BackupRepository {
         let mut catalog_file = File::from(catalog_fd);
         let mut catalog_bytes = Vec::new();
         catalog_file.read_to_end(&mut catalog_bytes)?;
-        let replay = crate::pitr_catalog::replay_catalog(&catalog_bytes)?;
+        let replay = crate::pitr::catalog::replay_catalog(&catalog_bytes)?;
         let mut segments = Vec::new();
         for record in replay.records {
             match record {
-                crate::pitr_catalog::PitrCatalogRecord::CommitSegment { metadata } => {
+                crate::pitr::catalog::PitrCatalogRecord::CommitSegment { metadata } => {
                     if metadata.key.repository_id == base.repository_id
                         && metadata.key.timeline_id.0 == base.timeline_id
                         && metadata.key.archive_epoch_id.0 == base.archive_epoch_id
@@ -3263,25 +3319,25 @@ impl BackupRepository {
                         segments.push(metadata);
                     }
                 }
-                crate::pitr_catalog::PitrCatalogRecord::RetentionSnapshot(snapshot) => {
+                crate::pitr::catalog::PitrCatalogRecord::RetentionSnapshot(snapshot) => {
                     segments.extend(snapshot.segments.into_iter().filter(|metadata| {
                         metadata.key.repository_id == base.repository_id
                             && metadata.key.timeline_id.0 == base.timeline_id
                             && metadata.key.archive_epoch_id.0 == base.archive_epoch_id
                     }));
                 }
-                crate::pitr_catalog::PitrCatalogRecord::CoverageBreak(_) => {}
+                crate::pitr::catalog::PitrCatalogRecord::CoverageBreak(_) => {}
             }
         }
         segments.sort_by_key(|metadata| metadata.key.segment_id.0);
         segments.dedup_by_key(|metadata| metadata.key);
         let wal_dir = openat_no_follow(&self.root, "wal", libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
-        let read_batches = |metadata: &crate::pitr_catalog::SegmentMetadata| -> Result<Vec<crate::pitr::WalBatch>> {
-            let name = crate::pitr_archive::archive_object_name(
+        let read_batches = |metadata: &crate::pitr::catalog::SegmentMetadata| -> Result<Vec<crate::pitr::WalBatch>> {
+            let name = crate::pitr::archive::archive_object_name(
                 metadata.key.timeline_id,
                 metadata.key.archive_epoch_id,
                 metadata.key.segment_id,
-                crate::pitr_archive::ArchiveObjectKind::Wal,
+                crate::pitr::archive::ArchiveObjectKind::Wal,
                 metadata.wal_digest,
             );
             let fd = openat_no_follow(&wal_dir, &name, libc::O_RDONLY, 0)?;
@@ -3289,15 +3345,15 @@ impl BackupRepository {
             let mut wal = Vec::new();
             file.read_to_end(&mut wal)?;
             ensure!(
-                crate::pitr_seal::wal_digest(&wal, metadata.wal_digest_rule()?)?.as_slice()
+                crate::pitr::seal::wal_digest(&wal, metadata.wal_digest_rule()?)?.as_slice()
                     == metadata.wal_digest,
                 "PITR restore WAL digest mismatch"
             );
-            let seal_name = crate::pitr_archive::archive_object_name(
+            let seal_name = crate::pitr::archive::archive_object_name(
                 metadata.key.timeline_id,
                 metadata.key.archive_epoch_id,
                 metadata.key.segment_id,
-                crate::pitr_archive::ArchiveObjectKind::Seal,
+                crate::pitr::archive::ArchiveObjectKind::Seal,
                 metadata.seal_digest,
             );
             let seal_fd = openat_no_follow(&wal_dir, &seal_name, libc::O_RDONLY, 0)?;
@@ -3308,23 +3364,23 @@ impl BackupRepository {
                 Sha256::digest(&seal).as_slice() == metadata.seal_digest,
                 "PITR restore seal digest mismatch"
             );
-            crate::pitr_restore::decode_restore_wal_batches_for_segment(
+            crate::pitr::restore::decode_restore_wal_batches_for_segment(
                 &wal,
                 metadata,
                 crate::pitr::LIVE_WAL_V5_LIMITS,
             )
         };
         let target = match requested_target {
-            crate::pitr_api::RecoveryTarget::Latest => segments
+            crate::pitr::api::RecoveryTarget::Latest => segments
                 .iter()
                 .filter_map(|metadata| metadata.last_commit_ts)
                 .max()
-                .map(crate::pitr_restore::PitrRestoreTarget::CommitTs)
-                .unwrap_or(crate::pitr_restore::PitrRestoreTarget::Base),
-            crate::pitr_api::RecoveryTarget::CommitTs(commit_ts) => {
-                crate::pitr_restore::PitrRestoreTarget::CommitTs(commit_ts)
+                .map(crate::pitr::restore::PitrRestoreTarget::CommitTs)
+                .unwrap_or(crate::pitr::restore::PitrRestoreTarget::Base),
+            crate::pitr::api::RecoveryTarget::CommitTs(commit_ts) => {
+                crate::pitr::restore::PitrRestoreTarget::CommitTs(commit_ts)
             }
-            crate::pitr_api::RecoveryTarget::AtOrBeforeSystemTime(time) => {
+            crate::pitr::api::RecoveryTarget::AtOrBeforeSystemTime(time) => {
                 let base_time = crate::pitr::RecordedAt {
                     secs: base.base_recorded_at.secs,
                     nanos: base.base_recorded_at.nanos,
@@ -3342,14 +3398,14 @@ impl BackupRepository {
                         }
                     }
                 }
-                crate::pitr_restore::PitrRestoreTarget::CommitTs(
+                crate::pitr::restore::PitrRestoreTarget::CommitTs(
                     resolved
                         .ok_or_else(|| anyhow!("PITR wall-clock target has no covered commit"))?,
                 )
             }
         };
-        if target == crate::pitr_restore::PitrRestoreTarget::Base {
-            let info = crate::pitr_api::RestoreToInfo {
+        if target == crate::pitr::restore::PitrRestoreTarget::Base {
+            let info = crate::pitr::api::RestoreToInfo {
                 requested_target,
                 resolved_commit_ts: base.included_commit_ts,
                 last_applied_commit_ts: base.included_commit_ts,
@@ -3359,13 +3415,13 @@ impl BackupRepository {
                 replayed_bytes: 0,
             };
             return match self.restore(base_backup_id, destination, storage)? {
-                RestoreOutcome::Restored => Ok(crate::pitr_api::RestoreToOutcome::Restored(info)),
+                RestoreOutcome::Restored => Ok(crate::pitr::api::RestoreToOutcome::Restored(info)),
                 RestoreOutcome::PublishedButNotDurable { error, .. } => {
-                    Ok(crate::pitr_api::RestoreToOutcome::PublishedButNotDurable { info, error })
+                    Ok(crate::pitr::api::RestoreToOutcome::PublishedButNotDurable { info, error })
                 }
             };
         }
-        let plan = crate::pitr_restore::plan_exact_restore(&base, segments, target)?;
+        let plan = crate::pitr::restore::plan_exact_restore(&base, segments, target)?;
         let destination = destination.as_ref();
         let parent = destination.parent().unwrap_or_else(|| Path::new("."));
         let target_name = destination
@@ -3417,8 +3473,8 @@ impl BackupRepository {
         let mut replayed_bytes = 0_u64;
         let mut last_commit_ts = base.included_commit_ts;
         let target_commit_ts = match target {
-            crate::pitr_restore::PitrRestoreTarget::CommitTs(commit_ts) => commit_ts,
-            crate::pitr_restore::PitrRestoreTarget::Base => unreachable!(),
+            crate::pitr::restore::PitrRestoreTarget::CommitTs(commit_ts) => commit_ts,
+            crate::pitr::restore::PitrRestoreTarget::Base => unreachable!(),
         };
         for metadata in plan
             .segment_metadata
@@ -3447,7 +3503,7 @@ impl BackupRepository {
             destination_timeline_id != [0; 16],
             "PITR restore destination timeline identity is empty"
         );
-        let recovery_info = crate::pitr_restore::PitrRecoveryInfo {
+        let recovery_info = crate::pitr::restore::PitrRecoveryInfo {
             source_repository_id: base.repository_id,
             source_timeline_id: base.timeline_id,
             source_archive_epoch_id: base.archive_epoch_id,
@@ -3462,7 +3518,7 @@ impl BackupRepository {
             serde_json::from_slice(&manifest_bytes)?;
         match &mut manifest {
             crate::manifest::ManifestRecord::Snapshot { pitr_state, .. } => {
-                *pitr_state = Some(crate::pitr_manifest::PitrState {
+                *pitr_state = Some(crate::pitr::manifest::PitrState {
                     database_timeline_id: Some(destination_timeline_id),
                     ..Default::default()
                 });
@@ -3504,7 +3560,7 @@ impl BackupRepository {
                     return Err(error);
                 }
             };
-        let info = crate::pitr_api::RestoreToInfo {
+        let info = crate::pitr::api::RestoreToInfo {
             requested_target,
             resolved_commit_ts: last_commit_ts,
             last_applied_commit_ts: last_commit_ts,
@@ -3513,17 +3569,18 @@ impl BackupRepository {
             replayed_batches,
             replayed_bytes,
         };
+
         match publication {
             PitrRestorePublication::Durable => {
-                Ok(crate::pitr_api::RestoreToOutcome::Restored(info))
+                Ok(crate::pitr::api::RestoreToOutcome::Restored(info))
             }
             PitrRestorePublication::PublishedButNotDurable(error) => {
-                Ok(crate::pitr_api::RestoreToOutcome::PublishedButNotDurable { info, error })
+                Ok(crate::pitr::api::RestoreToOutcome::PublishedButNotDurable { info, error })
             }
             PitrRestorePublication::Unknown {
                 rename_error,
                 revalidation_error,
-            } => Ok(crate::pitr_api::RestoreToOutcome::PublicationUnknown {
+            } => Ok(crate::pitr::api::RestoreToOutcome::PublicationUnknown {
                 info,
                 rename_error,
                 revalidation_error,
@@ -3583,6 +3640,7 @@ impl BackupRepository {
         }
         self.replay.backup_id_high_watermark = id;
         self.replay.last_sequence = sequence;
+
         Ok(id)
     }
 
@@ -3640,6 +3698,7 @@ impl BackupRepository {
         self.pending_prepare_digest = Some(digest);
         self.pending_backup_metadata_checksum = Some(backup_metadata_checksum);
         self.pending_parent_backup_id = Some(parent_backup_id);
+
         Ok(digest)
     }
 
@@ -3782,6 +3841,7 @@ impl BackupRepository {
         self.pending_prepare_digest = None;
         self.pending_backup_metadata_checksum = None;
         self.pending_parent_backup_id = None;
+
         Ok(())
     }
 
@@ -3841,6 +3901,7 @@ impl BackupRepository {
         self.replay
             .committed_backups
             .retain(|backup| retained_set.contains(&backup.backup_id));
+
         Ok(())
     }
 
@@ -3926,6 +3987,7 @@ impl BackupRepository {
         }
         self.replay.last_sequence = record_sequence(&snapshot);
         self.replay.retained_offset = 0;
+
         Ok(())
     }
 
@@ -3935,6 +3997,7 @@ impl BackupRepository {
         let mut unwind_guard = UnwindInvalidationGuard::new(&usable);
         let result = self.compact_catalog();
         unwind_guard.disarm();
+
         result
     }
 
@@ -3959,6 +4022,7 @@ impl BackupRepository {
         };
         let result = working.purge_inner(retain);
         unwind_guard.disarm();
+
         result
     }
 
@@ -4038,6 +4102,7 @@ impl BackupRepository {
             });
             fsync_fd(&self.root)
         })();
+
         if let Err(error) = root_sync_result {
             self.usable.store(false, Ordering::Release);
             return Err(error);
@@ -4055,7 +4120,7 @@ impl BackupRepository {
         objects: &[BackupObjectRef],
         new_object_bytes: u64,
         compatibility: Option<RestoreCompatibility>,
-        pitr_base: Option<crate::pitr_base::PitrBaseMetadata>,
+        pitr_base: Option<crate::pitr::base::PitrBaseMetadata>,
     ) -> Result<(String, Vec<u8>)> {
         self.ensure_mutation_allowed()?;
         let backups =
@@ -4107,6 +4172,7 @@ impl BackupRepository {
         }
         fsync_fd(&staging_fd)?;
         cleanup.disarm();
+
         Ok((staging, backup))
     }
 
@@ -4133,6 +4199,7 @@ impl BackupRepository {
             "failed to publish backup: {}",
             std::io::Error::last_os_error()
         );
+
         if let Err(error) = fsync_fd(&backups).and_then(|_| fsync_fd(&self.root)) {
             self.usable.store(false, Ordering::Release);
             return Err(anyhow::Error::new(RepositoryPublicationError {
@@ -4152,11 +4219,12 @@ impl BackupRepository {
         &mut self,
         backup: &[u8],
         snapshot: &[u8],
-        mut pitr_base: crate::pitr_base::PitrBaseMetadata,
+        mut pitr_base: crate::pitr::base::PitrBaseMetadata,
         compatibility: RestoreCompatibility,
     ) -> Result<u64> {
         pitr_base.compatibility_digest = pitr_compatibility_digest(&compatibility);
         pitr_base.validate()?;
+
         self.create_backup_with_objects(
             backup,
             snapshot,
@@ -4180,7 +4248,7 @@ impl BackupRepository {
         objects: &[BackupObjectRef],
         new_object_bytes: u64,
         compatibility: Option<RestoreCompatibility>,
-        pitr_base: Option<crate::pitr_base::PitrBaseMetadata>,
+        pitr_base: Option<crate::pitr::base::PitrBaseMetadata>,
         new_objects: &[String],
         cancelled: Option<&AtomicBool>,
         decision: Option<&Mutex<bool>>,
@@ -4343,6 +4411,7 @@ impl BackupRepository {
         #[cfg(test)]
         commit_decision_test_hook::wait_if_armed_after(decision_token.unwrap_or_default(), id);
         self.commit_backup(id, prepare_digest, Some(info))?;
+
         Ok(id)
     }
 }
@@ -4351,6 +4420,7 @@ impl BackupRepository {
 fn cleanup_stale_catalog_temps(root: &OwnedFd) -> Result<()> {
     let path = PathBuf::from(format!("/proc/self/fd/{}", root.as_raw_fd()));
     let mut removed = false;
+
     for entry in std::fs::read_dir(path)? {
         let entry = entry?;
         let file_name = entry.file_name();
@@ -4478,6 +4548,7 @@ fn recover_catalog_successor(root: &OwnedFd) -> Result<()> {
         "failed to install backup purge successor: {}",
         std::io::Error::last_os_error()
     );
+
     fsync_fd(root)
 }
 
@@ -4488,6 +4559,7 @@ fn validate_replay_backups(
     require_snapshot_metadata: bool,
 ) -> Result<()> {
     let backups = openat_no_follow(root, "backups", libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
+
     for committed in &replay.committed_backups {
         let backup = openat_no_follow(
             &backups,
@@ -4603,6 +4675,7 @@ fn validate_object_before_reclaim(files: &OwnedFd, name: &str) -> Result<()> {
         actual == expected,
         "repository object changed before reclaim"
     );
+
     Ok(())
 }
 
@@ -4622,6 +4695,7 @@ fn ensure_repository_object_name(name: &str) -> Result<()> {
             && parts.next().is_none(),
         "unexpected repository object name"
     );
+
     Ok(())
 }
 
@@ -4763,11 +4837,13 @@ fn backup_outcome_from_error(repository: PathBuf, error: anyhow::Error) -> Resul
         }
         Err(error) => error,
     };
+
     match error.downcast::<CommitPublicationError>() {
         Ok(publication) if publication.kind == CommitFailureKind::CommitDurabilityUnknown => {
             let info = publication
                 .info
                 .ok_or_else(|| anyhow!("commit publication metadata is unavailable"))?;
+
             Ok(BackupOutcome::CommitPublicationUnknown {
                 info,
                 fsync_error: into_io_error(publication.source),
@@ -4780,6 +4856,7 @@ fn backup_outcome_from_error(repository: PathBuf, error: anyhow::Error) -> Resul
             let info = publication
                 .info
                 .ok_or_else(|| anyhow!("commit publication metadata is unavailable"))?;
+
             Ok(BackupOutcome::CommitPublishedButNotDurable {
                 info,
                 error: into_io_error(publication.source),
@@ -4830,9 +4907,10 @@ impl crate::lsm_storage::KvEngine {
     pub(crate) fn create_pitr_base_backup(
         &self,
         options: BackupOptions,
-        pitr_base: crate::pitr_base::PitrBaseMetadata,
+        pitr_base: crate::pitr::base::PitrBaseMetadata,
     ) -> Result<BackupInfo> {
         let _lifecycle_guard = self.inner.lifecycle.admit_write()?;
+
         self.inner
             .create_backup_inner_with_pitr_base(options, pitr_base)
     }
@@ -4841,18 +4919,20 @@ impl crate::lsm_storage::KvEngine {
     pub(crate) fn create_pitr_base_backup_from_capture(
         &self,
         options: BackupOptions,
-        capture: &crate::pitr_base::PitrBaseCaptureCoordinator,
+        capture: &crate::pitr::base::PitrBaseCaptureCoordinator,
     ) -> Result<BackupInfo> {
         let metadata = capture
             .metadata()
             .cloned()
             .ok_or_else(|| anyhow!("PITR base capture has no published metadata"))?;
+
         self.create_pitr_base_backup(options, metadata)
     }
 
     #[deprecated(note = "use create_backup")]
     pub fn create_backup_info(&self, options: BackupOptions) -> Result<BackupInfo> {
         let _lifecycle_guard = self.inner.lifecycle.admit_write()?;
+
         self.inner.create_backup_inner(options)
     }
 
@@ -4920,6 +5000,7 @@ impl crate::lsm_storage::KvEngine {
                 Err(error) => backup_outcome_from_error(repository, error),
             }
         });
+
         Ok(BackupTask {
             handle: Some(handle),
             ready: None,
@@ -4937,6 +5018,7 @@ impl crate::lsm_storage::KvEngine {
         }
         let _guard = self.inner.lifecycle.admit_write()?;
         let repository = options.repository.clone();
+
         match self.inner.create_backup_inner(options) {
             Ok(info) => Ok(BackupOutcome::Committed(info)),
             Err(error) => backup_outcome_from_error(repository, error),
@@ -4959,6 +5041,7 @@ impl crate::lsm_storage::KvEngine {
     pub async fn create_backup_async_info(&self, options: BackupOptions) -> Result<BackupInfo> {
         let lifecycle_guard = self.inner.lifecycle.admit_write()?;
         let inner = self.inner.clone();
+
         self.inner
             .blocking
             .run_result(move || {
@@ -4975,6 +5058,7 @@ impl crate::lsm_storage::KvEngine {
         let guard = self.inner.lifecycle.admit_write()?;
         let inner = self.inner.clone();
         let repository = options.repository.clone();
+
         self.inner
             .blocking
             .run_result(move || {
@@ -5011,7 +5095,7 @@ impl crate::lsm_storage::LsmStorageInner {
     pub(crate) fn create_backup_inner_with_pitr_base(
         &self,
         options: BackupOptions,
-        pitr_base: crate::pitr_base::PitrBaseMetadata,
+        pitr_base: crate::pitr::base::PitrBaseMetadata,
     ) -> Result<BackupInfo> {
         self.create_backup_inner_with_cancellation(options, None, None, None, Some(pitr_base))
     }
@@ -5022,14 +5106,14 @@ impl crate::lsm_storage::LsmStorageInner {
         cancelled: Option<&AtomicBool>,
         decision: Option<&Mutex<bool>>,
         decision_token: Option<u64>,
-        mut pitr_base: Option<crate::pitr_base::PitrBaseMetadata>,
+        mut pitr_base: Option<crate::pitr::base::PitrBaseMetadata>,
     ) -> Result<BackupInfo> {
         self.ensure_manifest_v7()?;
         if let Some(base) = pitr_base.as_ref() {
             base.validate()?;
             let state = self.pitr_state.lock().clone();
             ensure!(
-                state.mode == crate::pitr_manifest::PitrMode::Enabled,
+                state.mode == crate::pitr::manifest::PitrMode::Enabled,
                 "PITR base publication requires an enabled engine state"
             );
             ensure!(
@@ -5070,7 +5154,7 @@ impl crate::lsm_storage::LsmStorageInner {
                 .value_separation
                 .as_ref()
                 .is_some_and(|options| options.enabled);
-            let expected_compatibility = crate::pitr_base::pitr_base_compatibility_digest(
+            let expected_compatibility = crate::pitr::base::pitr_base_compatibility_digest(
                 self.options.serializable,
                 value_separation_enabled,
             );
@@ -5149,6 +5233,7 @@ impl crate::lsm_storage::LsmStorageInner {
             decision,
             decision_token,
         )?;
+
         repository
             .list_info()?
             .into_iter()
@@ -5173,6 +5258,7 @@ fn cleanup_staging_backup(root: &OwnedFd, staging: &str) -> Result<()> {
     let name = CString::new(staging).unwrap();
     // SAFETY: backups is trusted and staging is a generated basename.
     let result = unsafe { libc::unlinkat(backups.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR) };
+
     if result != 0 && std::io::Error::last_os_error().kind() != std::io::ErrorKind::NotFound {
         first_error.get_or_insert(anyhow!("failed to remove staging directory"));
     }
@@ -5214,6 +5300,7 @@ fn remove_backup_directory(backups: &OwnedFd, id: u64) -> Result<()> {
     let name = CString::new(id.to_string())?;
     // SAFETY: backups is trusted and the ID-derived name is a basename.
     let result = unsafe { libc::unlinkat(backups.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR) };
+
     if result != 0 {
         let error = std::io::Error::last_os_error();
         if error.kind() != std::io::ErrorKind::NotFound {
@@ -5230,6 +5317,7 @@ fn remove_uncommitted_backup_orphans(
 ) -> Result<()> {
     let path = PathBuf::from(format!("/proc/self/fd/{}", backups.as_raw_fd()));
     let mut removed = false;
+
     for entry in std::fs::read_dir(path)? {
         let entry = entry?;
         let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
@@ -5289,6 +5377,7 @@ pub(crate) fn ensure_regular_file(fd: std::os::fd::RawFd) -> Result<()> {
         (stat.st_mode & libc::S_IFMT) == libc::S_IFREG,
         "backup metadata must be a regular file"
     );
+
     Ok(())
 }
 
@@ -5357,6 +5446,7 @@ fn validate_backup_objects(envelope: &BackupMetadata) -> Result<()> {
     let mut names = HashSet::new();
     let mut identities = HashSet::new();
     let mut previous_name: Option<&str> = None;
+
     for object in objects {
         ensure!(
             !object.source_path.is_empty() && !object.source_path.starts_with('/'),
@@ -5430,6 +5520,7 @@ fn validate_restore_options(
             == value_separation_enabled.then_some(crate::vlog::VLOG_FORMAT_VERSION),
         "restore vLog format is incompatible"
     );
+
     Ok(())
 }
 
@@ -5495,6 +5586,7 @@ fn validate_restore_snapshot_objects(envelope: &BackupMetadata, snapshot: &[u8])
         expected.len() == actual.len() && expected == actual,
         "restore manifest object identities do not match backup"
     );
+
     Ok(())
 }
 
@@ -5504,6 +5596,7 @@ fn validate_backup_objects_on_disk(root: &OwnedFd, envelope: &BackupMetadata) ->
         return Ok(());
     };
     let files = openat_no_follow(root, "objects", libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
+
     for object in objects {
         let file = File::from(openat_no_follow(
             &files,
@@ -5544,6 +5637,7 @@ fn validate_backup_object_metadata_on_disk(
         return Ok(());
     };
     let files = openat_no_follow(root, "objects", libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
+
     for object in objects {
         let file = File::from(openat_no_follow(
             &files,
@@ -5572,6 +5666,7 @@ fn read_backup_metadata(backup: &OwnedFd, name: &str) -> Result<Vec<u8>> {
         bytes.len() <= MAX_BACKUP_METADATA_BYTES,
         "backup metadata {name} exceeds limit"
     );
+
     Ok(bytes)
 }
 
@@ -5605,6 +5700,7 @@ fn catalog_backup_snapshot(
             .checked_add(object.file_size)
             .ok_or_else(|| anyhow!("backup logical byte count overflow"))
     })?;
+
     Ok(CatalogBackupSnapshot {
         backup_id: committed.backup_id,
         parent_backup_id: committed.parent_backup_id,
@@ -5648,6 +5744,7 @@ fn pitr_repository_view_digest(
     digest.update(pitr_catalog_digest);
     digest.update(backup_catalog.last_sequence.to_be_bytes());
     digest.update(backup_catalog.backup_id_high_watermark.to_be_bytes());
+
     for backup in &backup_catalog.committed_backups {
         digest.update(backup.backup_id.to_be_bytes());
         digest.update(backup.backup_metadata_checksum);
@@ -5671,6 +5768,7 @@ impl crate::lsm_storage::LsmStorageInner {
             *immutable_file_metadata = metadata.clone();
         }
         capture.immutable_file_metadata = metadata;
+
         Ok(capture)
     }
 }
@@ -5712,6 +5810,7 @@ impl RepositoryLock {
             }
         };
         ensure!(result == 0, "failed to acquire backup repository lock");
+
         Ok(Self { _fd: fd })
     }
 
@@ -5719,6 +5818,7 @@ impl RepositoryLock {
         // SAFETY: the descriptor remains open and owned by this lock.
         let result = unsafe { libc::flock(self._fd.as_raw_fd(), libc::LOCK_UN) };
         ensure!(result == 0, "failed to release backup repository lock");
+
         Ok(())
     }
 
@@ -5731,6 +5831,7 @@ impl RepositoryLock {
             }
         };
         ensure!(result == 0, "failed to reacquire backup repository lock");
+
         Ok(())
     }
 }
@@ -5784,6 +5885,7 @@ impl<'a> RepositoryRelockGuard<'a> {
     fn reacquire(mut self) -> Result<()> {
         let result = self.lock.reacquire();
         self.armed = false;
+
         if result.is_err() {
             self.usable.store(false, Ordering::Release);
         }
@@ -5823,6 +5925,7 @@ pub(crate) fn open_directory_no_follow(path: &std::path::Path) -> Result<OwnedFd
     // SAFETY: `fd` is valid after the successful `open` above and ownership is
     // transferred exactly once into `OwnedFd`.
     let mut current = unsafe { OwnedFd::from_raw_fd(fd) };
+
     for component in path.components() {
         let std::path::Component::Normal(component) = component else {
             ensure!(
@@ -5881,6 +5984,7 @@ fn read_repository_identity(root: &OwnedFd, name: &str) -> Result<Option<[u8; 16
     ensure!(bytes.len() == 16, "repository identity has invalid length");
     let identity: [u8; 16] = bytes.try_into().unwrap();
     ensure!(identity != [0; 16], "repository identity is empty");
+
     Ok(Some(identity))
 }
 
@@ -5899,6 +6003,7 @@ fn install_repository_identity(root: &OwnedFd) -> Result<()> {
             libc::RENAME_NOREPLACE,
         )
     };
+
     if result != 0 {
         return Err(std::io::Error::last_os_error())
             .context("failed to install repository identity");
@@ -5911,6 +6016,7 @@ fn cleanup_repository_identity_temp(root: &OwnedFd) -> Result<()> {
     let name = CString::new(REPOSITORY_ID_TEMP_FILE)?;
     // SAFETY: root is a live directory descriptor and name is a fixed basename.
     let result = unsafe { libc::unlinkat(root.as_raw_fd(), name.as_ptr(), 0) };
+
     if result != 0 {
         let error = std::io::Error::last_os_error();
         if error.kind() != std::io::ErrorKind::NotFound {
@@ -5943,6 +6049,7 @@ pub(crate) fn openat_no_follow(
             mode,
         )
     };
+
     if fd < 0 {
         return Err(std::io::Error::last_os_error())
             .context("failed to open repository component without following symlinks");
@@ -5961,6 +6068,7 @@ pub(crate) fn mkdirat_no_follow(parent: &OwnedFd, name: &str, mode: u32) -> Resu
         CString::new(name).map_err(|_| anyhow!("repository component contains an interior NUL"))?;
     // SAFETY: parent is a live directory descriptor and name is NUL-terminated.
     let result = unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), mode) };
+
     if result != 0 {
         let error = std::io::Error::last_os_error();
         ensure!(
@@ -5985,6 +6093,7 @@ pub(crate) fn fsync_fd(fd: &OwnedFd) -> Result<()> {
             break result;
         }
     };
+
     if result != 0 {
         return Err(std::io::Error::last_os_error().into());
     }
@@ -6006,6 +6115,7 @@ pub(crate) fn copy_immutable_object(
         libc::O_RDONLY,
         0,
     )?);
+
     copy_immutable_object_from_file(
         source,
         target_dir,
@@ -6111,6 +6221,7 @@ fn copy_immutable_object_from_file(
         return Err(error);
     }
     cleanup.disarm();
+
     Ok((bytes, hasher.finalize().into()))
 }
 
@@ -6151,6 +6262,7 @@ pub(crate) fn reuse_matching_object(
         "repository object checksum mismatch"
     );
     fsync_fd(target_dir)?;
+
     Ok(true)
 }
 
@@ -6209,6 +6321,7 @@ pub(crate) fn copy_or_reuse_object(
                 size == expected_size && checksum == expected_checksum,
                 "copied repository object identity mismatch"
             );
+
             Ok(false)
         }
         Err(error) => Err(error),
@@ -6324,6 +6437,7 @@ fn hard_link_immutable_object(
         return Err(error);
     }
     cleanup.disarm();
+
     Ok(())
 }
 
@@ -6443,6 +6557,7 @@ pub(crate) fn bootstrap_repository(parent: &OwnedFd, name: &str) -> Result<()> {
         return Err(std::io::Error::last_os_error().into());
     }
     cleanup.disarm();
+
     fsync_fd(parent)
         .map_err(|source| anyhow::Error::new(RepositoryBootstrapPublicationError { source }))
 }
@@ -6487,6 +6602,7 @@ impl Drop for BootstrapStagingCleanup<'_> {
             }
         }
         let name = CString::new(self.name.as_str()).unwrap();
+
         unsafe {
             libc::unlinkat(self.parent.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR);
         }
@@ -6498,6 +6614,7 @@ fn mkdirat_exclusive(parent: &OwnedFd, name: &str, mode: u32) -> Result<OwnedFd>
     let name = CString::new(name)?;
     // SAFETY: parent is a valid directory descriptor and name is NUL-terminated.
     let result = unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), mode) };
+
     if result != 0 {
         return Err(std::io::Error::last_os_error().into());
     }
@@ -6586,6 +6703,7 @@ pub(crate) fn append_catalog_record(
     header[8..].copy_from_slice(&header_checksum.to_le_bytes());
     file.write_all(&header)?;
     file.write_all(&payload)?;
+
     Ok(())
 }
 
@@ -6614,6 +6732,7 @@ pub(crate) fn read_catalog_records(mut file: impl Read) -> Result<CatalogFrames>
     );
     let mut frames = Vec::new();
     let mut offset = 0usize;
+
     while offset < bytes.len() {
         if bytes.len() - offset < CATALOG_FRAME_HEADER_BYTES {
             return Ok(CatalogFrames {
@@ -6891,6 +7010,7 @@ pub(crate) fn replay_catalog(frames: &CatalogFrames) -> Result<CatalogReplay> {
         }
         _ => (frames.last_complete_offset, previous_sequence),
     };
+
     Ok(CatalogReplay {
         committed_backup_ids,
         committed_backups,
@@ -6936,6 +7056,7 @@ fn remove_backup_orphan(backups: &OwnedFd, id: u64) -> Result<()> {
         result == 0 || std::io::Error::last_os_error().kind() == std::io::ErrorKind::NotFound,
         "failed to remove orphan backup"
     );
+
     Ok(())
 }
 
@@ -6948,6 +7069,7 @@ fn frame_len(frame: &CatalogFrame) -> Result<u64> {
 fn crc32(bytes: &[u8]) -> u32 {
     let mut hasher = Hasher::new();
     hasher.update(bytes);
+
     hasher.finalize()
 }
 
@@ -6962,9 +7084,9 @@ impl BackupRepository {
     /// can observe a request, and it holds `operation_lock` while it runs.
     pub fn verify_pitr_async(
         self: Arc<Self>,
-        options: crate::pitr_api::VerifyPitrOptions,
-    ) -> crate::pitr_api::PitrTask<crate::pitr_api::VerifyPitrReport> {
-        crate::pitr_api::PitrTask::spawn(move || self.verify_pitr(options))
+        options: crate::pitr::api::VerifyPitrOptions,
+    ) -> crate::pitr::api::PitrTask<crate::pitr::api::VerifyPitrReport> {
+        crate::pitr::api::PitrTask::spawn(move || self.verify_pitr(options))
     }
 
     /// Eagerly dispatches PITR retention cleanup to Tokio's blocking pool.
@@ -6979,9 +7101,9 @@ impl BackupRepository {
     /// already reports cleanup that stopped part way.
     pub fn purge_pitr_async(
         self: Arc<Self>,
-        policy: crate::pitr_api::PitrRetentionPolicy,
-    ) -> crate::pitr_api::PitrTask<crate::pitr_api::PitrPurgeOutcome> {
-        crate::pitr_api::PitrTask::spawn(move || self.purge_pitr(policy))
+        policy: crate::pitr::api::PitrRetentionPolicy,
+    ) -> crate::pitr::api::PitrTask<crate::pitr::api::PitrPurgeOutcome> {
+        crate::pitr::api::PitrTask::spawn(move || self.purge_pitr(policy))
     }
 }
 
@@ -7035,6 +7157,7 @@ mod tests {
         let CreateBackupOutcome::Committed(info) = outcome else {
             panic!("expected committed backup outcome");
         };
+
         info
     }
 
@@ -7042,6 +7165,7 @@ mod tests {
         let BackupOutcome::Committed(info) = outcome else {
             panic!("expected committed backup outcome");
         };
+
         info
     }
 
@@ -7086,21 +7210,21 @@ mod tests {
         bootstrap_repository(&parent, "repository").unwrap();
         let repository_path = dir.path().join("repository");
         let mut repository = BackupRepository::open(&repository_path).unwrap();
-        let base = crate::pitr_base::PitrBaseMetadata {
+        let base = crate::pitr::base::PitrBaseMetadata {
             repository_id: repository.ensure_pitr_repository_identity().unwrap(),
             timeline_id: [2; 16],
             archive_epoch_id: [3; 16],
             included_commit_ts: None,
             boundary_segment_id: 1,
-            boundary_anchor: crate::pitr_manifest::PersistedChainAnchor::Genesis {
+            boundary_anchor: crate::pitr::manifest::PersistedChainAnchor::Genesis {
                 archive_epoch_id: [3; 16],
             },
-            base_recorded_at: crate::pitr_manifest::PersistedRecordedAt { secs: 1, nanos: 0 },
-            time_anchor: crate::pitr_base::PitrBaseTimeAnchor::Observed {
+            base_recorded_at: crate::pitr::manifest::PersistedRecordedAt { secs: 1, nanos: 0 },
+            time_anchor: crate::pitr::base::PitrBaseTimeAnchor::Observed {
                 commit_ts: None,
-                observed_at: crate::pitr_manifest::PersistedRecordedAt { secs: 1, nanos: 0 },
+                observed_at: crate::pitr::manifest::PersistedRecordedAt { secs: 1, nanos: 0 },
             },
-            wal_replay_version: crate::pitr_base::PITR_BASE_WAL_REPLAY_VERSION,
+            wal_replay_version: crate::pitr::base::PITR_BASE_WAL_REPLAY_VERSION,
             compatibility_digest: [4; 32],
         };
         let compatibility = RestoreCompatibility {
@@ -7146,14 +7270,14 @@ mod tests {
             crate::lsm_storage::LsmStorageOptions::default_for_test(),
         )
         .unwrap();
-        let mut capture = crate::pitr_base::PitrBaseCaptureCoordinator::default();
-        let state = crate::pitr_manifest::PitrState {
-            mode: crate::pitr_manifest::PitrMode::Enabled,
+        let mut capture = crate::pitr::base::PitrBaseCaptureCoordinator::default();
+        let state = crate::pitr::manifest::PitrState {
+            mode: crate::pitr::manifest::PitrMode::Enabled,
             database_timeline_id: Some([2; 16]),
             repository_id: Some(repository_id),
             timeline_id: Some([2; 16]),
             archive_epoch_id: Some([3; 16]),
-            config: Some(crate::pitr_manifest::PersistedPitrConfig {
+            config: Some(crate::pitr::manifest::PersistedPitrConfig {
                 archive_interval_ms: 1000,
                 max_segment_bytes: 4096,
                 max_unarchived_bytes: 8192,
@@ -7161,31 +7285,31 @@ mod tests {
             }),
             active_segment_id: Some(9),
             next_segment_id: 10,
-            epoch_genesis_anchor: Some(crate::pitr_manifest::PersistedChainAnchor::Genesis {
+            epoch_genesis_anchor: Some(crate::pitr::manifest::PersistedChainAnchor::Genesis {
                 archive_epoch_id: [3; 16],
             }),
-            predecessor_anchor: Some(crate::pitr_manifest::PersistedChainAnchor::Genesis {
+            predecessor_anchor: Some(crate::pitr::manifest::PersistedChainAnchor::Genesis {
                 archive_epoch_id: [3; 16],
             }),
             ..Default::default()
         };
         capture.bind_manifest_state(state).unwrap();
         capture.stop_admission(9).unwrap();
-        let metadata = crate::pitr_base::PitrBaseMetadata {
+        let metadata = crate::pitr::base::PitrBaseMetadata {
             repository_id,
             timeline_id: [2; 16],
             archive_epoch_id: [3; 16],
             included_commit_ts: None,
             boundary_segment_id: 9,
-            boundary_anchor: crate::pitr_manifest::PersistedChainAnchor::Genesis {
+            boundary_anchor: crate::pitr::manifest::PersistedChainAnchor::Genesis {
                 archive_epoch_id: [3; 16],
             },
-            base_recorded_at: crate::pitr_manifest::PersistedRecordedAt { secs: 1, nanos: 0 },
-            time_anchor: crate::pitr_base::PitrBaseTimeAnchor::Observed {
+            base_recorded_at: crate::pitr::manifest::PersistedRecordedAt { secs: 1, nanos: 0 },
+            time_anchor: crate::pitr::base::PitrBaseTimeAnchor::Observed {
                 commit_ts: None,
-                observed_at: crate::pitr_manifest::PersistedRecordedAt { secs: 1, nanos: 0 },
+                observed_at: crate::pitr::manifest::PersistedRecordedAt { secs: 1, nanos: 0 },
             },
-            wal_replay_version: crate::pitr_base::PITR_BASE_WAL_REPLAY_VERSION,
+            wal_replay_version: crate::pitr::base::PITR_BASE_WAL_REPLAY_VERSION,
             compatibility_digest: [6; 32],
         };
         capture.capture(metadata).unwrap();
@@ -7208,35 +7332,35 @@ mod tests {
         assert!(matches!(
             repository
                 .restore_to(
-                    crate::pitr_api::RecoveryTarget::Latest,
+                    crate::pitr::api::RecoveryTarget::Latest,
                     dir.path().join("no-point"),
-                    crate::pitr_api::PitrRestoreOptions {
-                        selector: crate::pitr_api::RecoverySelector {
+                    crate::pitr::api::PitrRestoreOptions {
+                        selector: crate::pitr::api::RecoverySelector {
                             timeline_id: [9; 16],
                             archive_epoch_id: None,
                             base_backup_id: None,
                         },
-                        implementations: crate::pitr_api::ImplementationRegistry,
+                        implementations: crate::pitr::api::ImplementationRegistry,
                         executor_threads: std::num::NonZeroUsize::new(1).unwrap(),
                         cache_capacity: 4096,
                         storage: crate::lsm_storage::LsmStorageOptions::default_for_test(),
                     },
                 )
                 .unwrap(),
-            crate::pitr_api::RestoreToOutcome::NoRecoverablePoint
+            crate::pitr::api::RestoreToOutcome::NoRecoverablePoint
         ));
         assert!(!dir.path().join("no-point").exists());
         let restore = repository
             .restore_to(
-                crate::pitr_api::RecoveryTarget::Latest,
+                crate::pitr::api::RecoveryTarget::Latest,
                 dir.path().join("restored"),
-                crate::pitr_api::PitrRestoreOptions {
-                    selector: crate::pitr_api::RecoverySelector {
+                crate::pitr::api::PitrRestoreOptions {
+                    selector: crate::pitr::api::RecoverySelector {
                         timeline_id: [2; 16],
                         archive_epoch_id: Some([3; 16]),
                         base_backup_id: None,
                     },
-                    implementations: crate::pitr_api::ImplementationRegistry,
+                    implementations: crate::pitr::api::ImplementationRegistry,
                     executor_threads: std::num::NonZeroUsize::new(1).unwrap(),
                     cache_capacity: 4096,
                     storage: crate::lsm_storage::LsmStorageOptions::default_for_test(),
@@ -7246,7 +7370,7 @@ mod tests {
         // The rejected publication must not leave a recoverable base behind.
         assert!(matches!(
             restore,
-            crate::pitr_api::RestoreToOutcome::NoRecoverablePoint
+            crate::pitr::api::RestoreToOutcome::NoRecoverablePoint
         ));
         assert!(!dir.path().join("restored").exists());
     }
@@ -7267,28 +7391,28 @@ mod tests {
         )
         .unwrap();
         engine
-            .enable_pitr(crate::pitr_api::PitrOptions {
+            .enable_pitr(crate::pitr::api::PitrOptions {
                 repository: repository.clone(),
-                config: crate::pitr_api::PersistedPitrConfig {
+                config: crate::pitr::api::PersistedPitrConfig {
                     archive_interval: std::time::Duration::from_secs(1),
                     max_segment_bytes: 4096,
                     max_unarchived_bytes: 8192,
                     max_source_spool_bytes: 16384,
                 },
-                runtime: crate::pitr_api::PitrRuntimeOptions::default(),
+                runtime: crate::pitr::api::PitrRuntimeOptions::default(),
             })
             .unwrap();
         // The engine is enabled here, so the only thing wrong with this capture is that its
         // repository identity belongs to a different repository than the engine's enabled state.
-        let mut capture = crate::pitr_base::PitrBaseCaptureCoordinator::default();
+        let mut capture = crate::pitr::base::PitrBaseCaptureCoordinator::default();
         capture
-            .bind_manifest_state(crate::pitr_manifest::PitrState {
-                mode: crate::pitr_manifest::PitrMode::Enabled,
+            .bind_manifest_state(crate::pitr::manifest::PitrState {
+                mode: crate::pitr::manifest::PitrMode::Enabled,
                 database_timeline_id: Some([2; 16]),
                 repository_id: Some([9; 16]),
                 timeline_id: Some([2; 16]),
                 archive_epoch_id: Some([3; 16]),
-                config: Some(crate::pitr_manifest::PersistedPitrConfig {
+                config: Some(crate::pitr::manifest::PersistedPitrConfig {
                     archive_interval_ms: 1000,
                     max_segment_bytes: 4096,
                     max_unarchived_bytes: 8192,
@@ -7296,10 +7420,10 @@ mod tests {
                 }),
                 active_segment_id: Some(9),
                 next_segment_id: 10,
-                epoch_genesis_anchor: Some(crate::pitr_manifest::PersistedChainAnchor::Genesis {
+                epoch_genesis_anchor: Some(crate::pitr::manifest::PersistedChainAnchor::Genesis {
                     archive_epoch_id: [3; 16],
                 }),
-                predecessor_anchor: Some(crate::pitr_manifest::PersistedChainAnchor::Genesis {
+                predecessor_anchor: Some(crate::pitr::manifest::PersistedChainAnchor::Genesis {
                     archive_epoch_id: [3; 16],
                 }),
                 ..Default::default()
@@ -7307,21 +7431,21 @@ mod tests {
             .unwrap();
         capture.stop_admission(9).unwrap();
         capture
-            .capture(crate::pitr_base::PitrBaseMetadata {
+            .capture(crate::pitr::base::PitrBaseMetadata {
                 repository_id: [9; 16],
                 timeline_id: [2; 16],
                 archive_epoch_id: [3; 16],
                 included_commit_ts: None,
                 boundary_segment_id: 9,
-                boundary_anchor: crate::pitr_manifest::PersistedChainAnchor::Genesis {
+                boundary_anchor: crate::pitr::manifest::PersistedChainAnchor::Genesis {
                     archive_epoch_id: [3; 16],
                 },
-                base_recorded_at: crate::pitr_manifest::PersistedRecordedAt { secs: 1, nanos: 0 },
-                time_anchor: crate::pitr_base::PitrBaseTimeAnchor::Observed {
+                base_recorded_at: crate::pitr::manifest::PersistedRecordedAt { secs: 1, nanos: 0 },
+                time_anchor: crate::pitr::base::PitrBaseTimeAnchor::Observed {
                     commit_ts: None,
-                    observed_at: crate::pitr_manifest::PersistedRecordedAt { secs: 1, nanos: 0 },
+                    observed_at: crate::pitr::manifest::PersistedRecordedAt { secs: 1, nanos: 0 },
                 },
-                wal_replay_version: crate::pitr_base::PITR_BASE_WAL_REPLAY_VERSION,
+                wal_replay_version: crate::pitr::base::PITR_BASE_WAL_REPLAY_VERSION,
                 compatibility_digest: [6; 32],
             })
             .unwrap();
@@ -7423,15 +7547,15 @@ mod tests {
         )
         .unwrap();
         engine
-            .enable_pitr(crate::pitr_api::PitrOptions {
+            .enable_pitr(crate::pitr::api::PitrOptions {
                 repository: repository_path.clone(),
-                config: crate::pitr_api::PersistedPitrConfig {
+                config: crate::pitr::api::PersistedPitrConfig {
                     archive_interval: std::time::Duration::from_secs(3600),
                     max_segment_bytes: 1024 * 1024,
                     max_unarchived_bytes: 2 * 1024 * 1024,
                     max_source_spool_bytes: 4 * 1024 * 1024,
                 },
-                runtime: crate::pitr_api::PitrRuntimeOptions::default(),
+                runtime: crate::pitr::api::PitrRuntimeOptions::default(),
             })
             .unwrap();
         let mut target_commit_ts = None;
@@ -7440,7 +7564,7 @@ mod tests {
             (&b"cancel-b"[..], &b"two"[..]),
         ] {
             engine.put(key, value).unwrap();
-            let crate::pitr_api::RecoveryPointOutcome::Durable(point) =
+            let crate::pitr::api::RecoveryPointOutcome::Durable(point) =
                 engine.create_recovery_point().unwrap()
             else {
                 panic!("expected a durable PITR recovery point");
@@ -7449,16 +7573,16 @@ mod tests {
         }
         let target_commit_ts = target_commit_ts.expect("a recovery point names a commit");
         let status = engine
-            .pitr_status(crate::pitr_api::PitrStatusOptions {
+            .pitr_status(crate::pitr::api::PitrStatusOptions {
                 cursor: None,
-                page_size: crate::pitr_api::MAX_STATUS_PAGE_SIZE,
+                page_size: crate::pitr::api::MAX_STATUS_PAGE_SIZE,
             })
             .unwrap();
         assert!(
             !status.recoverable_intervals.is_empty(),
             "the setup must advertise an interval for the restore to select"
         );
-        let selector = crate::pitr_api::RecoverySelector {
+        let selector = crate::pitr::api::RecoverySelector {
             timeline_id: status.recoverable_intervals[0].timeline_id,
             archive_epoch_id: Some(status.recoverable_intervals[0].archive_epoch_id),
             base_backup_id: None,
@@ -7471,9 +7595,9 @@ mod tests {
         // is the name the hook pauses on.
         let staging_name = format!(".restored.pitr-{}", std::process::id());
         let staging_path = dir.path().join(&staging_name);
-        let options = crate::pitr_api::PitrRestoreOptions {
+        let options = crate::pitr::api::PitrRestoreOptions {
             selector,
-            implementations: crate::pitr_api::ImplementationRegistry,
+            implementations: crate::pitr::api::ImplementationRegistry,
             executor_threads: std::num::NonZeroUsize::new(1).unwrap(),
             cache_capacity: 4096,
             storage: crate::lsm_storage::LsmStorageOptions::default_for_test(),
@@ -7483,7 +7607,7 @@ mod tests {
         let error = std::thread::scope(|scope| {
             let worker = scope.spawn(|| {
                 repository.restore_to_with_cancellation(
-                    crate::pitr_api::RecoveryTarget::CommitTs(target_commit_ts),
+                    crate::pitr::api::RecoveryTarget::CommitTs(target_commit_ts),
                     &destination,
                     options.clone(),
                     Some(&cancelled),
@@ -7510,14 +7634,14 @@ mod tests {
         let repository = BackupRepository::open(&repository_path).unwrap();
         let outcome = repository
             .restore_to(
-                crate::pitr_api::RecoveryTarget::CommitTs(target_commit_ts),
+                crate::pitr::api::RecoveryTarget::CommitTs(target_commit_ts),
                 &destination,
                 options,
             )
             .unwrap();
         assert!(matches!(
             outcome,
-            crate::pitr_api::RestoreToOutcome::Restored(_)
+            crate::pitr::api::RestoreToOutcome::Restored(_)
         ));
         assert!(destination.is_dir(), "the retry must publish the restore");
     }

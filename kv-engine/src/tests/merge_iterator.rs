@@ -27,6 +27,7 @@ fn test_task1_merge_1() {
         (Bytes::from("d"), Bytes::from("4.2")),
     ]);
     let mut iter = TwoMergeIterator::create(i1, i2).unwrap();
+
     check_iter_result_by_key(
         &mut iter,
         vec![
@@ -52,6 +53,7 @@ fn test_task1_merge_2() {
         (Bytes::from("d"), Bytes::from("4.2")),
     ]);
     let mut iter = TwoMergeIterator::create(i1, i2).unwrap();
+
     check_iter_result_by_key(
         &mut iter,
         vec![
@@ -76,6 +78,7 @@ fn test_task1_merge_3() {
         (Bytes::from("d"), Bytes::from("4.2")),
     ]);
     let mut iter = TwoMergeIterator::create(i1, i2).unwrap();
+
     check_iter_result_by_key(
         &mut iter,
         vec![
@@ -126,6 +129,7 @@ fn test_task1_merge_5() {
     let i2 = MockIterator::new(vec![]);
     let i1 = MockIterator::new(vec![]);
     let mut iter = TwoMergeIterator::create(i1, i2).unwrap();
+
     check_iter_result_by_key(&mut iter, vec![])
 }
 

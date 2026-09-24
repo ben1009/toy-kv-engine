@@ -87,6 +87,7 @@ fn generate_sst() -> (TempDir, SsTable) {
     }
     let dir = tempdir().unwrap();
     let path = dir.path().join("1.sst");
+
     (dir, builder.build_for_test(path).unwrap())
 }
 
@@ -173,6 +174,7 @@ fn test_sst_iterator() {
     let (_dir, sst) = generate_sst();
     let sst = Arc::new(sst);
     let mut iter = SsTableIterator::create_and_seek_to_first(sst, CacheAdmission::Force).unwrap();
+
     for _ in 0..5 {
         for i in 0..num_of_keys() {
             let key = iter.key();
@@ -207,6 +209,7 @@ fn test_sst_seek_key() {
         CacheAdmission::Force,
     )
     .unwrap();
+
     for offset in 1..=5 {
         for i in 0..num_of_keys() {
             let key = iter.key();
@@ -258,6 +261,7 @@ fn generate_multi_version_sst(dir: &tempfile::TempDir, block_size: usize) -> SsT
         (b"B", 3, b"B_v3"),
         (b"C", 6, b"C_v6"),
     ];
+
     for (uk, ts, val) in &entries {
         builder
             .add_raw(KeyVec::from_user_key_ts(uk, *ts).as_key_slice(), val)

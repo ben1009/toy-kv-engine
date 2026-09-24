@@ -8,6 +8,7 @@ impl LsmStorageInner {
     pub fn dump_structure_string(&self) -> String {
         let snapshot = self.state.load();
         let mut out = String::new();
+
         if !snapshot.l0_sstables.is_empty() {
             out.push_str(&format!(
                 "L0 ({}): {:?}\n",

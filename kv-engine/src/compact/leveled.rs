@@ -42,6 +42,7 @@ impl LeveledCompactionController {
             .sum();
 
         let level_num = snapshot.levels[level_idx].0;
+
         if let Some((_, ro_ids)) = snapshot
             .range_only_ssts
             .iter()
@@ -98,6 +99,7 @@ impl LeveledCompactionController {
         // ts_start <= last_key AND ts_end > first_key.
         let first_key_user = first_key.decode_user_key_cow();
         let last_key_user = last_key.decode_user_key_cow();
+
         if let Some((_, ro_ids)) = snapshot
             .range_only_ssts
             .iter()

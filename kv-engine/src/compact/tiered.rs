@@ -35,6 +35,7 @@ impl TieredCompactionController {
             .find(|(level, _)| *level == tier_id)
             .map(|(_, ids)| ids.len())
             .unwrap_or(0);
+
         sst_ids.len() + range_only
     }
 

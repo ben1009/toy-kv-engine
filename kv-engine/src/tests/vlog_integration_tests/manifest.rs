@@ -39,6 +39,7 @@ fn test_manifest_snapshot_basic() {
 
     // Reopen and verify all data is intact
     let storage = KvEngine::open(dir.path(), options).unwrap();
+
     for i in 0..10 {
         let key = format!("key_{:04}", i);
         let expected_byte = b'a' + (i as u8 % 26);
@@ -77,6 +78,7 @@ fn test_manifest_snapshot_with_vlog() {
 
     // Reopen — snapshot should have vLog references
     let storage = KvEngine::open(dir.path(), options).unwrap();
+
     for i in 0..5 {
         let key = format!("key_{:04}", i);
         assert_eq!(

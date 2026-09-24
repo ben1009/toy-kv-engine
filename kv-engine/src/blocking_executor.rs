@@ -61,6 +61,7 @@ impl BlockingExecutor {
     {
         self.acquire_slot().await;
         let active = Arc::clone(&self.active);
+
         tokio::task::spawn_blocking(move || {
             let _guard = DecrementOnDrop(active);
             f()
@@ -80,6 +81,7 @@ impl BlockingExecutor {
     {
         self.acquire_slot().await;
         let active = Arc::clone(&self.active);
+
         tokio::task::spawn_blocking(move || {
             let _guard = DecrementOnDrop(active);
             f()
@@ -106,6 +108,7 @@ impl BlockingExecutor {
             return Ok(None);
         }
         let active = Arc::clone(&self.active);
+
         tokio::task::spawn_blocking(move || {
             let _guard = DecrementOnDrop(active);
             f()

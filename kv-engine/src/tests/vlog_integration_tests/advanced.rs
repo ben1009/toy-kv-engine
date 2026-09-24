@@ -123,6 +123,7 @@ fn test_crash_recovery_after_partial_flush() {
     let dir = tempfile::tempdir().unwrap();
     let mut options = options_with_vlog_enabled(256, 1 << 20);
     options.enable_wal = true;
+
     if super::super::harness::skip_if_io_uring_unavailable(&options) {
         return;
     }
@@ -617,6 +618,7 @@ fn test_trigger_gc_reports_zero_while_another_gc_holds_the_file() {
     // Once the locks are gone the work does happen. Retry rather than asserting a
     // single call's count, so a GC that takes the file first cannot fail the test.
     let deadline = Instant::now() + Duration::from_secs(10);
+
     loop {
         let _ = storage.trigger_gc().unwrap();
         if storage.vlog_stats().unwrap().gc_files_processed > 0 {

@@ -22,6 +22,7 @@ impl BoundedKeyUniverse {
         let keys: Vec<Vec<u8>> = (0..count)
             .map(|i| format!("{prefix}_{i:010}").into_bytes())
             .collect();
+
         Self {
             keys,
             prefix: prefix.to_string(),
@@ -157,6 +158,7 @@ impl ReferenceState {
             }
         }
         let mut latest_committed_op_by_key: HashMap<Vec<u8>, u64> = HashMap::new();
+
         for rec in reader.records() {
             if !committed_set.contains(&rec.op_id) {
                 continue;

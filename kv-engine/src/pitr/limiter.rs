@@ -65,6 +65,7 @@ impl PitrArchiveLimiter {
         state.options = options;
         state.last_refill = effective_now;
         state.pending_stream = None;
+
         if options.bytes_per_second.is_none() {
             state.fractional_credit = 0;
         }
@@ -92,6 +93,7 @@ impl PitrArchiveLimiter {
         }
         let deficit = requested - state.tokens;
         let wait = duration_for_bytes_with_fraction(deficit, rate.get(), state.fractional_credit);
+
         Ok(wait)
     }
 
@@ -148,12 +150,14 @@ impl PitrArchiveLimiter {
         state.fractional_credit = 0;
         state.last_refill = effective_now;
         state.pending_stream = Some((id, bytes.get(), ready));
+
         Ok(StreamGrantOutcome::Wait(wait))
     }
 
     pub(crate) fn tokens(&self, now: Instant) -> u64 {
         let mut state = self.state.lock();
         refill(&mut state, now);
+
         state.tokens
     }
 
@@ -197,11 +201,13 @@ fn duration_for_bytes_with_fraction(bytes: u64, rate: u64, fractional_credit: u1
         .saturating_mul(1_000_000_000)
         .saturating_sub(credited_nanos);
     let wait_nanos = required_nanos.div_ceil(u128::from(rate));
+
     duration_from_nanos(wait_nanos)
 }
 
 fn duration_from_nanos(nanos: u128) -> Duration {
     let seconds = nanos / 1_000_000_000;
+
     if seconds > u128::from(u64::MAX) {
         return Duration::MAX;
     }

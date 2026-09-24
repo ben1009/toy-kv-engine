@@ -67,7 +67,7 @@ fn test_wal_v5_create_preserves_identity_header() {
         batch
     );
     let (incremental_seal, incremental_bytes) = wal.finalize_pitr_seal().unwrap();
-    let (rebuilt_seal, rebuilt_bytes) = crate::pitr_seal::build_v5_seal(&bytes).unwrap();
+    let (rebuilt_seal, rebuilt_bytes) = crate::pitr::seal::build_v5_seal(&bytes).unwrap();
     assert_eq!(incremental_seal, rebuilt_seal);
     assert_eq!(incremental_bytes, rebuilt_bytes);
     assert!(wal.put_v5_batch(&batch, limits, None).is_err());
@@ -905,6 +905,7 @@ fn test_wal_profiled_group_commit_records_follower_wait_events() {
     assert!(snapshot.wal_commit_bytes > 0);
     assert!(snapshot.wal_commit_max_buffers > 0);
     assert!(snapshot.wal_commit_max_bytes > 0);
+
     if snapshot.wal_follower_wait_calls > 0 {
         assert!(snapshot.wal_follower_condvar_waits > 0);
     }
@@ -1948,6 +1949,7 @@ fn test_range_tombstone_key_ordering_different_starts() {
 #[test]
 fn test_storage_open_and_close() {
     let dir = tempdir().unwrap();
+
     {
         let _storage =
             LsmStorageInner::open(dir.path(), LsmStorageOptions::default_for_test()).unwrap();
@@ -2295,7 +2297,7 @@ fn test_wal_v5_seal_matches_the_segment_when_writers_race_the_leader() {
     // the comparison is between the seal and a segment that is fully on disk.
     wal.sync().unwrap();
     let (incremental, _) = wal.finalize_pitr_seal().unwrap();
-    let (rebuilt, _) = crate::pitr_seal::build_v5_seal(&std::fs::read(&path).unwrap()).unwrap();
+    let (rebuilt, _) = crate::pitr::seal::build_v5_seal(&std::fs::read(&path).unwrap()).unwrap();
 
     assert_eq!(incremental.entries.len(), (WRITERS * PER_WRITER) as usize);
     assert_eq!(incremental, rebuilt);
@@ -2351,7 +2353,7 @@ fn test_wal_v5_legacy_segment_resumes_under_its_own_rule() {
 
     let (incremental, incremental_bytes) = wal.finalize_pitr_seal().unwrap();
     let segment = std::fs::read(&path).unwrap();
-    let (rebuilt, rebuilt_bytes) = crate::pitr_seal::build_v5_seal(&segment).unwrap();
+    let (rebuilt, rebuilt_bytes) = crate::pitr::seal::build_v5_seal(&segment).unwrap();
 
     // Same digest, same entries, same bytes: the resumed accumulator hashed the
     // legacy prefix under the legacy rule and then each new batch the same way.
@@ -2364,7 +2366,7 @@ fn test_wal_v5_legacy_segment_resumes_under_its_own_rule() {
         incremental.header.wal_format_version,
         crate::pitr::WAL_V5_VERSION_LEGACY
     );
-    let decoded = crate::pitr_seal::V5Seal::decode(&incremental_bytes).unwrap();
+    let decoded = crate::pitr::seal::V5Seal::decode(&incremental_bytes).unwrap();
     assert_eq!(decoded, incremental);
     assert_eq!(
         decoded.header.wal_format_version,

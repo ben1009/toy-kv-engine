@@ -843,6 +843,7 @@ fn test_batch_get_basic() {
     let keys: Vec<&[u8]> = formatted.iter().map(|k| k.as_bytes()).collect();
     let results = engine.batch_get(&keys);
     assert_eq!(results.len(), 20);
+
     for (i, res) in results.iter().enumerate() {
         let expected = format!("val_{:04}", i);
         assert_eq!(res.as_ref().unwrap(), &Some(Bytes::from(expected)));
@@ -935,6 +936,7 @@ fn test_batch_get_with_flush() {
         .collect();
     let key_refs: Vec<&[u8]> = keys.iter().map(|k| k.as_slice()).collect();
     let results = engine.batch_get(&key_refs);
+
     for (i, res) in results.iter().enumerate().take(10) {
         let expected = format!("sst_{:04}", i);
         assert_eq!(res.as_ref().unwrap(), &Some(Bytes::from(expected)));
@@ -966,6 +968,7 @@ fn test_batch_get_matches_individual_gets() {
         b"also_missing",
     ];
     let batch_results = engine.batch_get(&keys);
+
     for (i, key) in keys.iter().enumerate() {
         let individual = engine.get(key).unwrap();
         assert_eq!(

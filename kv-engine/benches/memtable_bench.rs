@@ -171,6 +171,7 @@ fn seek_bound_ref(memtable: &MemTable, user_key: &[u8], read_ts: u64) -> Option<
         std::ops::Bound::Included(seek_key),
         std::ops::Bound::Unbounded,
     ));
+
     for entry in range.by_ref() {
         let found_key = entry.key();
         if let Some(found_user_key) = key::encoded_user_key_prefix(found_key) {
@@ -194,6 +195,7 @@ fn seek_bytes_alloc(memtable: &MemTable, user_key: &[u8], read_ts: u64) -> Optio
     let seek_key = Bytes::from(key::encode_internal_key(user_key, u64::MAX));
     let seek_prefix = key::encoded_user_key_prefix(&seek_key).unwrap();
     let mut range = memtable.raw_map().range::<Bytes, _>(seek_key.clone()..);
+
     for entry in range.by_ref() {
         let found_key = entry.key();
         if let Some(found_user_key) = key::encoded_user_key_prefix(found_key) {
@@ -217,6 +219,7 @@ fn make_key(size: usize, idx: usize) -> Vec<u8> {
     let bytes = (idx as u64).to_le_bytes();
     let copy_len = size.min(8);
     key[..copy_len].copy_from_slice(&bytes[..copy_len]);
+
     key
 }
 

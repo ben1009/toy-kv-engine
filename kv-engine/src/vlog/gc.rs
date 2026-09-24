@@ -498,6 +498,7 @@ impl<'a> GarbageCollector<'a> {
         })();
 
         self.vlog.release_gc_lock(file_id);
+
         result
     }
 
@@ -517,6 +518,7 @@ impl<'a> GarbageCollector<'a> {
         vlog_files.sort_unstable();
 
         let mut results = Vec::with_capacity(vlog_files.len());
+
         for file_id in vlog_files {
             if let Some(result) = self.gc_file(file_id)? {
                 results.push(result);

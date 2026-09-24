@@ -13,20 +13,7 @@ pub mod lsm_storage;
 pub mod manifest;
 pub mod mem_table;
 pub mod mvcc;
-pub(crate) mod pitr;
-pub mod pitr_api;
-pub(crate) mod pitr_archive;
-pub(crate) mod pitr_archive_completion;
-pub(crate) mod pitr_archiver;
-pub(crate) mod pitr_backpressure;
-pub(crate) mod pitr_base;
-pub(crate) mod pitr_catalog;
-pub(crate) mod pitr_enable;
-pub(crate) mod pitr_limiter;
-pub(crate) mod pitr_manifest;
-pub(crate) mod pitr_restore;
-pub(crate) mod pitr_seal;
-pub(crate) mod pitr_segment;
+pub mod pitr;
 pub mod profiling;
 pub mod range_tombstone;
 pub(crate) mod scan_trace;
@@ -45,7 +32,8 @@ pub use backup::{
     BackupId, BackupInfo, BackupOptions, BackupOutcome, CreateBackupOutcome, RestoreOutcome,
 };
 pub use future_ext::block_on;
-pub use pitr_api::*;
+pub use pitr::api as pitr_api;
+pub use pitr::api::*;
 
 /// Initialize structured logging via logforth.
 ///

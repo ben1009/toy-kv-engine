@@ -50,6 +50,7 @@ impl ValueLogReader {
             .with_context(|| format!("failed to read header of vLog file {:?}", path))?;
         VlogFileHeader::decode(&header_buf)
             .with_context(|| format!("failed to decode header of vLog file {:?}", path))?;
+
         Ok(Self {
             file,
             path,
@@ -60,6 +61,7 @@ impl ValueLogReader {
     /// Set the file ID for generated `ValuePointer`s.
     pub fn with_file_id(mut self, file_id: u32) -> Self {
         self.file_id = file_id;
+
         self
     }
 
@@ -246,6 +248,7 @@ impl VlogHeaderIterator {
     /// Set the file ID for generated `ValuePointer`s.
     pub fn with_file_id(mut self, file_id: u32) -> Self {
         self.file_id = file_id;
+
         self
     }
 }

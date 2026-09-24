@@ -66,6 +66,7 @@ fn test_task1_memtable_iter() {
 fn test_task1_empty_memtable_iter() {
     use std::ops::Bound;
     let memtable = MemTable::create(0, false);
+
     {
         let iter =
             memtable.for_testing_scan_slice(Bound::Excluded(b"key1"), Bound::Excluded(b"key3"));
@@ -283,6 +284,7 @@ fn test_task4_integration() {
         .unwrap();
     storage.put(b"1", b"233333").unwrap();
     storage.put(b"3", b"233333").unwrap();
+
     {
         let mut iter = storage.scan(Bound::Unbounded, Bound::Unbounded).unwrap();
         check_lsm_iter_result_by_key(

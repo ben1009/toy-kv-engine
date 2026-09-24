@@ -13,7 +13,7 @@ min_version = "0.37.24"
 [tasks.install-nextest]
 category = "Misc"
 description = "install cargo-nextest"
-install_crate = { crate_name = "cargo-nextest", version = "0.9.137", binary = "cargo", test_arg = [
+install_crate = { crate_name = "cargo-nextest", version = "0.9.145", binary = "cargo", test_arg = [
     "nextest",
     "--help",
 ] }
@@ -21,7 +21,7 @@ install_crate = { crate_name = "cargo-nextest", version = "0.9.137", binary = "c
 [tasks.install-llvm-cov]
 category = "Misc"
 description = "install cargo-llvm-cov"
-install_crate = { crate_name = "cargo-llvm-cov", version = "0.8.7", binary = "cargo", test_arg = [
+install_crate = { crate_name = "cargo-llvm-cov", version = "0.9.0", binary = "cargo", test_arg = [
     "llvm-cov",
     "--help",
 ] }
@@ -50,7 +50,7 @@ args = ["fmt", "--all"]
 [tasks.check-typos]
 category = "Dev - check"
 description = "Run cargo typos-cli check"
-install_crate = { version = "1.47.0", crate_name = "typos-cli", binary = "typos", test_arg = [
+install_crate = { version = "1.50.1", crate_name = "typos-cli", binary = "typos", test_arg = [
     "--help",
 ] }
 script = """

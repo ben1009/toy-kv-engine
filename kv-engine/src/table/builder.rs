@@ -98,6 +98,7 @@ impl SsTableBuilder {
         vlog_options: ValueSeparationOptions,
     ) -> Self {
         let file_id = vlog_builder.file_id();
+
         Self {
             builder: BlockBuilder::new(block_size),
             data: Vec::new(),
@@ -267,6 +268,7 @@ impl SsTableBuilder {
         }
         // Track TTL metadata for per-SST aggregation.
         self.total_entry_count += 1;
+
         if !value.is_empty() {
             match KvKind::from_u8(value[0]) {
                 Some(KvKind::TtlInline) | Some(KvKind::TtlValuePointer) if value.len() >= 9 => {
@@ -406,6 +408,7 @@ impl SsTableBuilder {
         if !opts.enabled {
             return None;
         }
+
         let mut filters = Vec::new();
         for &len in &opts.prefix_lengths {
             if let Some(hashes) = self.prefix_hash_sets.get_mut(&len)

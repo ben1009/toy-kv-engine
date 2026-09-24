@@ -127,6 +127,7 @@ pub fn encode_internal_key_inline<'a, const N: usize>(
     encode_memcomparable_user_key_inline(buf, &mut pos, user_key);
     let inv_ts = u64::MAX - ts;
     buf[pos..pos + 8].copy_from_slice(&inv_ts.to_be_bytes());
+
     &buf[..pos + 8]
 }
 
@@ -134,6 +135,7 @@ pub fn encode_internal_key_inline<'a, const N: usize>(
 /// Used to validate key size before encoding (RFC §6.1).
 pub fn encoded_internal_key_len(user_key_len: usize) -> usize {
     let groups = user_key_len / ENC_GROUP_SIZE + 1;
+
     groups
         .checked_mul(ENC_GROUP_SIZE + 1)
         .and_then(|n| n.checked_add(8)) // +8 for timestamp
@@ -175,6 +177,7 @@ pub fn decode_user_key_into(encoded_prefix: &[u8], dst: &mut Vec<u8>) -> bool {
         return false;
     }
     let mut i = 0;
+
     while i + ENC_GROUP_SIZE <= encoded_prefix.len() {
         let group = &encoded_prefix[i..i + ENC_GROUP_SIZE];
         let marker = encoded_prefix[i + ENC_GROUP_SIZE];
@@ -206,6 +209,7 @@ pub fn decode_user_key_into(encoded_prefix: &[u8], dst: &mut Vec<u8>) -> bool {
 pub fn decode_user_key(encoded: &[u8]) -> Option<Vec<u8>> {
     let prefix = encoded_user_key_prefix(encoded)?;
     let mut buf = Vec::new();
+
     if decode_user_key_into(prefix, &mut buf) {
         Some(buf)
     } else {
@@ -448,6 +452,7 @@ mod tests {
             (b"abcdefghijklmnop", 9), // exactly 2 full groups
             (&[0x00; 16], 42),        // all zeros, 2 groups
         ];
+
         for (uk, ts) in cases {
             let enc = encode_internal_key(uk, ts);
             assert_eq!(decode_user_key(&enc).unwrap(), uk);

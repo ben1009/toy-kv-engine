@@ -375,6 +375,7 @@ impl HarnessConfig {
                 .unwrap_or(matches!(self.suite, Suite::SteadyState))
         };
         let enable_vlog = vlog || self.vlog_override;
+
         LsmStorageOptions {
             block_size: 4096,
             target_sst_size: self.target_sst_size,
@@ -1150,6 +1151,7 @@ fn select_workloads(
                 !selected.is_empty(),
                 "no workloads remain for the selected suite and WAL setting"
             );
+
             Ok(selected)
         }
         Some(filter) => {
@@ -1238,6 +1240,7 @@ fn validate_json_artifact(path: &Path) -> Result<()> {
         path.display()
     );
     eprintln!("validated {rows} JSON record(s) from {}", path.display());
+
     Ok(())
 }
 
@@ -1255,6 +1258,7 @@ fn validate_steady_state_json_record(record: &serde_json::Value) -> Result<()> {
         json_str(record, "suite")? == "steady_state",
         "steady-state v2 rows must use suite steady_state"
     );
+
     let phase = json_str(record, "phase")?;
     match phase {
         "prepare" => {
@@ -1271,6 +1275,7 @@ fn validate_steady_state_json_record(record: &serde_json::Value) -> Result<()> {
             validate_golden_manifest_matches_record(manifest, record)?;
             let drain = json_object(record, "drain")?;
             validate_drain_json(drain)?;
+
             Ok(())
         }
         "measurement" => validate_steady_state_measurement_json(record),
@@ -1291,6 +1296,7 @@ fn validate_steady_state_measurement_json(record: &serde_json::Value) -> Result<
     let drain = json_object(record, "drain")?;
     validate_validation_json(validation)?;
     validate_workload_validation_json(validation, workload, task)?;
+
     validate_drain_json(drain)?;
     if let Some(manifest) = record.get("golden_manifest") {
         validate_golden_manifest_json(manifest)?;
@@ -1356,6 +1362,7 @@ fn validate_transaction_engine_options_json(
         engine_options.serializable,
         "transaction_contention engine_options.serializable must be true"
     );
+
     Ok(())
 }
 
@@ -1374,6 +1381,7 @@ fn validate_measurement_label(workload: &str, measurement: &str) -> Result<()> {
         measurement == expected,
         "{workload} measurement must be {expected}"
     );
+
     Ok(())
 }
 
@@ -1394,6 +1402,7 @@ fn validate_known_steady_state_workload(workload: &str) -> Result<()> {
         ),
         "unknown steady-state workload `{workload}`"
     );
+
     Ok(())
 }
 
@@ -1490,6 +1499,7 @@ fn validate_steady_state_task_json(
 fn validate_steady_state_task_shape(task: &serde_json::Value, workload: &str) -> Result<()> {
     let period = usize::try_from(json_u64(task, "operation_mix_period")?)
         .context("task.operation_mix_period does not fit usize")?;
+
     let operation_mix = json_str(task, "operation_mix")?;
     match workload {
         "idle" => {
@@ -1628,6 +1638,7 @@ fn validate_task_u64_matches_params(
         task_value == params_value,
         "task.{field} must match params.{field}"
     );
+
     Ok(())
 }
 
@@ -1642,6 +1653,7 @@ fn validate_task_str_matches_params(
         task_value == params_value,
         "task.{field} must match params.{field}"
     );
+
     Ok(())
 }
 
@@ -1813,6 +1825,7 @@ fn ensure_throughput_rate_window_absent(
         throughput.get(field).is_none(),
         "{workload} throughput.{field} must be absent"
     );
+
     Ok(())
 }
 
@@ -1840,6 +1853,7 @@ fn validate_rate_window_json(
         min <= p1 && p1 <= p50 && p50 <= p95 && p95 <= p99 && p99 <= max,
         "{field_name} percentile rates must be ordered"
     );
+
     Ok(())
 }
 
@@ -1882,6 +1896,7 @@ fn validate_non_idle_latency_json(
         min <= avg && avg <= max,
         "latency.avg_ms must be between latency.min_ms and latency.max_ms"
     );
+
     Ok(())
 }
 
@@ -1891,6 +1906,7 @@ fn max_latency_samples(selected_operations: u64, clients: u64, sample_every: u64
     }
 
     let active_clients = clients.min(selected_operations);
+
     let remaining_operations = selected_operations - active_clients;
     active_clients
         .checked_add(remaining_operations / sample_every)
@@ -1914,6 +1930,7 @@ fn validate_counter_snapshots_json(record: &serde_json::Value) -> Result<()> {
         counters == expected,
         "counters must equal counter_snapshots.after minus counter_snapshots.before"
     );
+
     Ok(())
 }
 
@@ -2031,6 +2048,7 @@ fn validate_monotonic_counter_snapshots(
         before.parallel_scan_bytes_emitted,
         after.parallel_scan_bytes_emitted,
     )?;
+
     Ok(())
 }
 
@@ -2039,6 +2057,7 @@ fn ensure_counter_monotonic(field: &str, before: u64, after: u64) -> Result<()> 
         after >= before,
         "counter_snapshots.{field} must be monotonic"
     );
+
     Ok(())
 }
 
@@ -2294,6 +2313,7 @@ fn validate_mixed_workload_validation(
         observed_get_slots == expected_get_slots && observed_put_slots == expected_put_slots,
         "{workload} observed_operation_mix must match observed get/put counts"
     );
+
     Ok(())
 }
 
@@ -2323,6 +2343,7 @@ fn parse_observed_get_put_slots(spec: &str, period: u64) -> Result<(u64, u64)> {
         get_slots + put_slots == period,
         "observed mixed operation mix must contain only get and put ratios"
     );
+
     Ok((get_slots, put_slots))
 }
 
@@ -2331,6 +2352,7 @@ fn validate_expected_u64(record: &serde_json::Value, field: &str, expected: u64)
         json_u64(record, field)? == expected,
         "validation.{field} must match observed workload count"
     );
+
     Ok(())
 }
 
@@ -2340,6 +2362,7 @@ fn validate_expected_null(record: &serde_json::Value, field: &str) -> Result<()>
         value.is_null(),
         "validation.{field} must be null for this workload"
     );
+
     Ok(())
 }
 
@@ -2364,6 +2387,7 @@ fn validate_validation_json(validation: &serde_json::Value) -> Result<()> {
         attempts == reconciled_attempts,
         "transaction attempts must equal commits plus conflicts"
     );
+
     Ok(())
 }
 
@@ -2373,6 +2397,7 @@ fn validate_drain_json(drain: &serde_json::Value) -> Result<()> {
         status != "timed_out",
         "drain.background_drain_status must not be timed_out"
     );
+
     Ok(())
 }
 
@@ -2403,6 +2428,7 @@ fn validate_golden_manifest_json(manifest: &serde_json::Value) -> Result<()> {
             && manifest.manifest_digest == legacy_golden_manifest_digest(&manifest)?,
         "golden_manifest.engine_options_hash does not match engine_options"
     );
+
     Ok(())
 }
 
@@ -2430,6 +2456,7 @@ fn validate_golden_manifest_matches_record(
         row_options == manifest.engine_options,
         "engine_options must match golden_manifest.engine_options"
     );
+
     Ok(())
 }
 
@@ -2442,6 +2469,7 @@ fn json_required<'a>(record: &'a serde_json::Value, field: &str) -> Result<&'a s
 fn json_object<'a>(record: &'a serde_json::Value, field: &str) -> Result<&'a serde_json::Value> {
     let value = json_required(record, field)?;
     anyhow::ensure!(value.is_object(), "`{field}` must be an object");
+
     Ok(value)
 }
 
@@ -2478,6 +2506,7 @@ fn json_f64(record: &serde_json::Value, field: &str) -> Result<f64> {
         value.is_finite() && value >= 0.0,
         "`{field}` must be a finite non-negative number"
     );
+
     Ok(value)
 }
 
@@ -2972,6 +3001,7 @@ fn enable_pitr_for_workload(cfg: &HarnessConfig, engine: &KvEngine, path: &Path)
         ),
         "PITR enable did not complete"
     );
+
     Ok(())
 }
 
@@ -3264,6 +3294,7 @@ fn run_memtable_publish_workload(
             .join()
             .map_err(|_| anyhow!("writer thread panicked"))??;
     }
+
     let elapsed = start.elapsed();
     if cfg.profile {
         let snapshot = memtable.write_profile().snapshot();
@@ -3300,6 +3331,7 @@ fn run_memtable_publish_workload(
 fn effective_wal_batch_size(num_keys: usize, writer_threads: usize, requested: usize) -> usize {
     let per_thread = num_keys / writer_threads;
     let remainder = num_keys % writer_threads;
+
     let max_thread_ops = per_thread + usize::from(remainder > 0);
     requested.min(max_thread_ops.max(1))
 }
@@ -3474,6 +3506,7 @@ fn run_crud_bench_batch_create_100(cfg: &HarnessConfig) -> Result<Vec<BenchMeasu
 fn crud_bench_like_payload(value_size: usize) -> Vec<u8> {
     let mut value = Vec::with_capacity(value_size.max(1));
     value.push(6);
+
     value.extend(std::iter::repeat_n(b'x', value_size.saturating_sub(1)));
     value
 }
@@ -3488,6 +3521,7 @@ fn splitmix64(mut x: u64) -> u64 {
     x = x.wrapping_add(0x9e37_79b9_7f4a_7c15);
     let mut z = x;
     z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+
     z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
     z ^ (z >> 31)
 }
@@ -3498,12 +3532,14 @@ fn steady_state_stream_seed(base_seed: u64, label: u64, client_id: u64) -> u64 {
 
 fn steady_state_loaded_key(id: u64) -> [u8; 20] {
     let mut key = [b'0'; 20];
+
     key[..8].copy_from_slice(&id.to_be_bytes());
     key
 }
 
 fn steady_state_missing_key(id: u64) -> [u8; 20] {
     let mut key = steady_state_loaded_key(id);
+
     key[19] = b'1';
     key
 }
@@ -3593,6 +3629,7 @@ impl SteadyStateOperationMix {
             STEADY_STATE_OPERATION_STREAM_LABEL,
             client_id as u64,
         ));
+
         schedule.shuffle(&mut rng);
         schedule
     }
@@ -3613,6 +3650,7 @@ impl SteadyStateOperationMix {
             expected_puts,
             selected_puts
         );
+
         Ok(())
     }
 }
@@ -3629,6 +3667,7 @@ impl ZipfianSampler {
             "zipfian exponent must be finite and positive"
         );
         let mut cdf = Vec::with_capacity(record_count);
+
         let mut total = 0.0;
         for rank in 1..=record_count {
             total += 1.0 / (rank as f64).powf(exponent);
@@ -3754,6 +3793,7 @@ impl SteadyStateWindowStats {
         self.tail_gets += other.tail_gets;
         self.tail_puts += other.tail_puts;
         self.tail_operations += other.tail_operations;
+
         self.latency_samples_ns.extend(other.latency_samples_ns);
         if self.rate_windows.len() < other.rate_windows.len() {
             self.rate_windows
@@ -3888,6 +3928,7 @@ fn run_steady_state_read_window(
                 stats.complete_period_gets = stats.selected_gets;
                 stats.complete_period_puts = 0;
                 stats.complete_period_operations = stats.selected_operations;
+
                 Ok(stats)
             },
         ));
@@ -4002,6 +4043,7 @@ fn run_steady_state_scan_window(
                 stats.complete_period_gets = 0;
                 stats.complete_period_puts = 0;
                 stats.complete_period_operations = stats.selected_operations;
+
                 Ok(stats)
             },
         ));
@@ -4099,6 +4141,7 @@ fn run_steady_state_ingest_window(
                 stats.complete_period_operations = complete_period_operations;
                 stats.tail_puts = stats.selected_puts - complete_period_operations;
                 stats.tail_operations = stats.selected_operations - complete_period_operations;
+
                 Ok(stats)
             },
         ));
@@ -4254,6 +4297,7 @@ fn run_steady_state_mixed_window(
                 stats.tail_gets = tail_gets;
                 stats.tail_puts = tail_puts;
                 stats.tail_operations = tail_operations;
+
                 Ok(stats)
             },
         ));
@@ -4425,6 +4469,7 @@ fn run_steady_state_transaction_window(
                 stats.complete_period_gets = stats.reads;
                 stats.complete_period_puts = stats.writes;
                 stats.complete_period_operations = stats.completed_operations;
+
                 Ok(stats)
             },
         ));
@@ -4465,6 +4510,7 @@ fn latency_record(
 
     let mut sorted = samples_ns.to_vec();
     sorted.sort_unstable();
+
     let sum: u128 = sorted.iter().map(|sample| *sample as u128).sum();
     LatencyRecord {
         sample_every,
@@ -4517,6 +4563,7 @@ fn rate_window_record(values: impl Iterator<Item = u64>) -> Option<RateWindowRec
     }
 
     sorted.sort_unstable();
+
     let len = sorted.len();
     Some(RateWindowRecord {
         total,
@@ -4532,12 +4579,14 @@ fn rate_window_record(values: impl Iterator<Item = u64>) -> Option<RateWindowRec
 
 fn percentile_rate(sorted_values: &[u64], percentile: f64) -> f64 {
     debug_assert!(!sorted_values.is_empty());
+
     let idx = ((sorted_values.len() - 1) as f64 * percentile).round() as usize;
     sorted_values[idx] as f64
 }
 
 fn percentile_latency_ms(sorted_samples_ns: &[u64], percentile: f64) -> f64 {
     debug_assert!(!sorted_samples_ns.is_empty());
+
     let idx = ((sorted_samples_ns.len() - 1) as f64 * percentile).round() as usize;
     sorted_samples_ns[idx] as f64 / 1_000_000.0
 }
@@ -4630,6 +4679,7 @@ fn validate_range_scan_window(workload: &str, stats: &SteadyStateWindowStats) ->
         "{workload} saw {} scan key validation errors",
         stats.scan_key_errors
     );
+
     Ok(())
 }
 
@@ -4643,6 +4693,7 @@ fn run_crud_bench_batch_create_iterations(
 ) -> Result<Duration> {
     let next_iteration = Arc::new(AtomicUsize::new(0));
     let start = Instant::now();
+
     let mut handles = vec![];
     for _ in 0..writer_threads {
         let eng = engine.clone();
@@ -4744,6 +4795,7 @@ fn run_concurrent_batch_write_phase(
     let per_thread = num_keys / writer_threads;
     let remainder = num_keys % writer_threads;
     let start = Instant::now();
+
     let mut handles = vec![];
     for t in 0..writer_threads {
         let eng = engine.clone();
@@ -5898,6 +5950,7 @@ fn build_golden_manifest_record(
 
 fn write_golden_manifest(path: &Path, manifest: GoldenManifestRecord) -> Result<()> {
     let manifest_path = golden_manifest_path(path);
+
     let contents = serde_json::to_vec_pretty(&manifest)?;
     fs::write(&manifest_path, contents)
         .with_context(|| format!("failed to write {}", manifest_path.display()))
@@ -6056,6 +6109,7 @@ fn engine_options_hash(options: &EngineOptionsRecord) -> Result<String> {
 
 fn legacy_engine_options_hash(options: &EngineOptionsRecord) -> Result<String> {
     let legacy = LegacyEngineOptionsRecord::from(options);
+
     Ok(stable_digest(&serde_json::to_vec(&legacy)?))
 }
 
@@ -6150,6 +6204,7 @@ fn golden_manifest_digest(manifest: &GoldenManifestRecord) -> Result<String> {
         settle_status: &manifest.settle_status,
         settle_timeout_secs: manifest.settle_timeout_secs,
     };
+
     Ok(stable_digest(&serde_json::to_vec(&digest_record)?))
 }
 
@@ -6169,6 +6224,7 @@ fn legacy_golden_manifest_digest(manifest: &GoldenManifestRecord) -> Result<Stri
         settle_status: &manifest.settle_status,
         settle_timeout_secs: manifest.settle_timeout_secs,
     };
+
     Ok(stable_digest(&serde_json::to_vec(&digest_record)?))
 }
 
@@ -6177,6 +6233,7 @@ fn golden_manifest_digest_matches(manifest: &GoldenManifestRecord) -> Result<boo
         return Ok(true);
     }
     let legacy_options_hash = legacy_engine_options_hash(&manifest.engine_options)?;
+
     Ok(!manifest.engine_options.serializable
         && manifest.engine_options_hash == legacy_options_hash
         && manifest.manifest_digest == legacy_golden_manifest_digest(manifest)?)
@@ -6199,6 +6256,7 @@ fn runtime_git_source_commit() -> Option<String> {
         return None;
     }
     let commit = String::from_utf8(output.stdout).ok()?;
+
     let commit = commit.trim();
     (!commit.is_empty()).then(|| commit.to_string())
 }
@@ -6518,6 +6576,7 @@ fn resolved_write_only_operation_mix(cfg: &HarnessConfig) -> Result<(String, usi
     match &cfg.operation_mix {
         Some(operation_mix) => {
             validate_write_only_operation_mix(operation_mix, cfg.operation_mix_period)?;
+
             Ok((operation_mix.clone(), cfg.operation_mix_period))
         }
         None => Ok(("put=1.0".to_string(), 1)),
@@ -7135,6 +7194,7 @@ fn make_measurement(
         counter_snapshots: None,
         counters,
     };
+
     let summary = summary_for(&record);
     BenchMeasurement { record, summary }
 }
@@ -7253,6 +7313,7 @@ fn collect_counters(engine: &KvEngine) -> Result<MeasurementCounters> {
     let filters = engine.compaction_filter_stats();
     let parallel = engine.parallel_scan_stats();
     let vlog = engine.vlog_stats().ok();
+
     Ok(MeasurementCounters {
         block_cache_entry_count: cache.block_cache_entry_count,
         block_cache_hit_count: cache.block_cache_hit_count,
@@ -7582,6 +7643,7 @@ fn validate_single_operation_mix(
         (required_ratio - 1.0).abs() <= 1e-9,
         "{workload_kind} require --operation-mix {required_operation}=1.0"
     );
+
     Ok(())
 }
 
@@ -8044,6 +8106,7 @@ mod tests {
             settle_elapsed_ms: 0.0,
             settle_timeout_secs: None,
         };
+
         manifest.manifest_digest = golden_manifest_digest(&manifest).expect("digest manifest");
         manifest
     }

@@ -96,6 +96,7 @@ fn dir_size(path: &Path, extension: &str) -> u64 {
     let Ok(entries) = std::fs::read_dir(path) else {
         return 0;
     };
+
     entries
         .filter_map(|e| e.ok())
         .filter(|e| e.path().extension().is_some_and(|ext| ext == extension))
@@ -143,6 +144,7 @@ fn setup_instance(
         make_options(vlog_enabled, min_value_size)
     };
     let lsm = KvEngine::open(dir.path(), options).unwrap();
+
     (dir, lsm)
 }
 
@@ -155,6 +157,7 @@ fn setup_instance_with_data(
 ) -> (tempfile::TempDir, Arc<KvEngine>) {
     let (dir, lsm) = setup_instance(vlog_enabled, min_value_size, compaction);
     load_data(&lsm, num_entries, value_size);
+
     (dir, lsm)
 }
 
