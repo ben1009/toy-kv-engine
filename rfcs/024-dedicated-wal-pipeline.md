@@ -36,7 +36,7 @@ baseline, not inferred from time spent in WAL follower waits.
 
 | Term | Meaning |
 | --- | --- |
-| WAL batch | One logical committed batch, assigned one ticket. |
+| WAL batch | One logical write batch assigned one ticket. |
 | I/O group | One or more contiguous tickets packed for WAL I/O. |
 | Write SQE | One io_uring write request belonging to a group; a group may need several. |
 | In-flight group | A group with submitted writes that have not all completed. |
