@@ -1564,6 +1564,24 @@ impl MemTable {
         self.wal.as_ref().is_some_and(|wal| wal.is_v5())
     }
 
+    /// Join the background runtime owned by a candidate parallel WAL.
+    ///
+    /// The legacy WAL paths keep their existing close behavior; engine
+    /// shutdown only needs to explicitly tear down the dedicated runtime.
+    pub(crate) fn close_parallel_wal(&self) -> Result<()> {
+        if let Some(wal) = &self.wal
+            && wal.is_parallel()
+        {
+            wal.close()?;
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn parallel_wal_is_closed(&self) -> Option<bool> {
+        self.wal.as_ref().and_then(Wal::parallel_runtime_is_closed)
+    }
+
     pub(crate) fn wal_path(&self) -> Option<&Path> {
         self.wal_path.as_deref()
     }

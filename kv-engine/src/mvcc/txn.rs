@@ -420,59 +420,72 @@ impl Transaction {
                     .as_ref()
                     .expect("serializable requires MVCC");
                 // Acquire commit_lock to serialize conflict check + write.
-                let _commit_guard = mvcc.commit_lock.lock();
-                // Prune old committed_txns entries below watermark.
-                let watermark = mvcc.watermark();
                 let read_ts = self.read_ts;
-                {
-                    let mut committed = mvcc.committed_txns.lock();
-                    if let Some(cutoff) = watermark.checked_add(1) {
-                        *committed = committed.split_off(&cutoff);
-                    } else {
-                        committed.clear();
-                    }
-                    // Check for conflicts: any committed txn with commit_ts > read_ts
-                    // whose write_set intersects our read_set.
-                    // Use BTreeMap::range to skip entries <= read_ts (O(log N + K)).
-                    for (commit_ts, txn_data) in committed.range((
-                        std::ops::Bound::Excluded(read_ts),
-                        std::ops::Bound::Unbounded,
-                    )) {
-                        if txn_data
-                            .write_set
-                            .intersection(&read_set_guard)
-                            .next()
-                            .is_some()
-                        {
-                            // Drop read_guard to unpin watermark before returning.
-                            self.read_guard.lock().take();
-                            anyhow::bail!(
-                                "serializable conflict: key written by another transaction at ts={}",
-                                commit_ts
-                            );
-                        }
-                    }
-                }
                 // No conflict — write batch and record our write_set.
                 let owned: Vec<(bytes::Bytes, bytes::Bytes, crate::mvcc::BatchEntryKind)> = entries
                     .iter()
                     .map(|(k, v, t)| (k.clone(), v.clone(), *t))
                     .collect();
-                let commit_ts = self.inner.mvcc_write_batch_inner(&owned)?;
-                // Record our write_set in committed_txns.
-                mvcc.record_committed_txn(
-                    commit_ts,
-                    std::mem::take(&mut *write_set_guard),
-                    read_ts,
-                );
-                // Release read_guard to unpin watermark.
-                self.read_guard.lock().take();
-                // Drop commit_lock before try_freeze to avoid deadlock with
-                // non-txn serializable writes that hold active_memtable_lock.read().
-                drop(_commit_guard);
-                // Freeze memtable if it exceeds target size, matching other write paths.
-                self.inner.try_freeze_memtable()?;
-                return Ok(());
+                let mut retries = 0;
+                loop {
+                    let _commit_guard = mvcc.commit_lock.lock();
+                    // Re-run OCC after each WAL rotation while the transaction's
+                    // snapshot guard remains pinned.
+                    let watermark = mvcc.watermark();
+                    {
+                        let mut committed = mvcc.committed_txns.lock();
+                        if let Some(cutoff) = watermark.checked_add(1) {
+                            *committed = committed.split_off(&cutoff);
+                        } else {
+                            committed.clear();
+                        }
+                        for (commit_ts, txn_data) in committed.range((
+                            std::ops::Bound::Excluded(read_ts),
+                            std::ops::Bound::Unbounded,
+                        )) {
+                            if txn_data
+                                .write_set
+                                .intersection(&read_set_guard)
+                                .next()
+                                .is_some()
+                            {
+                                self.read_guard.lock().take();
+                                anyhow::bail!(
+                                    "serializable conflict: key written by another transaction at ts={}",
+                                    commit_ts
+                                );
+                            }
+                        }
+                    }
+
+                    let expected_memtable = self.inner.state.load().memtable.clone();
+                    match self.inner.mvcc_write_batch_inner(&owned) {
+                        Ok(commit_ts) => {
+                            mvcc.record_committed_txn(
+                                commit_ts,
+                                std::mem::take(&mut *write_set_guard),
+                                read_ts,
+                            );
+                            self.read_guard.lock().take();
+                            drop(_commit_guard);
+                            self.inner.try_freeze_memtable()?;
+                            return Ok(());
+                        }
+                        Err(error) if crate::wal::Wal::is_retryable_full_error(&error) => {
+                            drop(_commit_guard);
+                            if let Err(rotation_error) = self.inner.retry_after_wal_full(
+                                error,
+                                &expected_memtable,
+                                &mut retries,
+                            ) {
+                                self.committed
+                                    .store(false, std::sync::atomic::Ordering::SeqCst);
+                                return Err(rotation_error);
+                            }
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
             }
         }
         // Non-serializable path (or read-only serializable).
@@ -532,10 +545,17 @@ impl Transaction {
         let inner = self.inner.clone();
         let mvcc = inner.mvcc.clone();
         let read_guard_slot = Arc::clone(&self.read_guard);
+        let parallel_wal_error = inner
+            .selects_parallel_wal_io()
+            .then(|| anyhow::anyhow!("parallel WAL is not available through async APIs yet"));
         // Take read_guard before .await (Send requirement) but defer
         // dropping it until after OCC check + write complete, so the
         // watermark stays pinned across the critical section.
-        let read_guard = read_guard_slot.lock().take();
+        let read_guard = if parallel_wal_error.is_none() {
+            read_guard_slot.lock().take()
+        } else {
+            None
+        };
         let read_set_snapshot = self
             .read_set
             .as_ref()
@@ -546,6 +566,9 @@ impl Transaction {
             .map(|write_set| write_set.lock().clone());
 
         async move {
+            if let Some(error) = parallel_wal_error {
+                return Err(error);
+            }
             if committed
                 .compare_exchange(
                     false,

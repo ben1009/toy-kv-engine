@@ -2,9 +2,9 @@
 
 **RFC:** [RFC 024: Dedicated WAL I/O Pipeline](../rfcs/024-dedicated-wal-pipeline.md)
 
-**Status:** Proposed; no parallel WAL implementation is enabled
+**Status:** Slices 1–5 implemented; Slice 5 awaiting review; recovery and benchmark gates remain
 
-**Last updated:** 2026-09-24
+**Last updated:** 2026-09-25
 
 ## Purpose and boundary
 
@@ -23,11 +23,11 @@ timestamps or weaken the sequencer's `poisoned_at` rule.
 
 | Seam | Current behavior | Planned change |
 | --- | --- | --- |
-| [`Wal::put_batch`](../kv-engine/src/wal.rs) and range-batch encoding | Encode into `DirectBuf`, then assign a ticket and append to `pending`. | Share the v4 encoder; add pre-ticket budget reservation and atomic ticket/file-cap admission for the opt-in path. |
-| [`Wal::submit_and_commit`](../kv-engine/src/wal.rs) | A client wins `submitting`, drains one group, submits and waits for its CQEs, calls `fdatasync`, then wakes followers. | On the opt-in path, wait for a dedicated worker's durable frontier; preserve the old branch unchanged for control and PITR. |
-| [`Wal::sync` / `Wal::close`](../kv-engine/src/wal.rs) | Read `next_ticket` and use the client-leader barrier. | Capture a cutoff under the same admission mutex as ticket assignment; drain through that cutoff and settle worker ownership before teardown. |
+| [`Wal::put_batch`](../kv-engine/src/wal.rs) and range-batch encoding | Encode into `DirectBuf`, then assign a ticket and append to `pending`. | The opt-in path shares the v4 encoder, reserves buffer capacity before ticket assignment, and atomically assigns ticket/file offset and enqueues. |
+| [`Wal::submit_and_commit`](../kv-engine/src/wal.rs) | A client wins `submitting`, drains one group, submits and waits for its CQEs, calls `fdatasync`, then wakes followers. | The opt-in path waits for its ticket on the dedicated worker's durable frontier; the old branch remains the control and PITR path. |
+| [`Wal::sync` / `Wal::close`](../kv-engine/src/wal.rs) | Read `next_ticket` and use the client-leader barrier. | The opt-in path captures a cutoff under the admission mutex, drains through it, and settles worker and sync coordinator ownership before teardown. |
 | [`MemTable::commit_wal_ticket`](../kv-engine/src/mem_table.rs) | Waits for the caller's ticket before publication. | Keep its contract; dispatch to the selected WAL path inside `Wal`. |
-| Memtable WAL creation/recovery in [`mem_table.rs`](../kv-engine/src/mem_table.rs) and rotation in [`lsm_storage.rs`](../kv-engine/src/lsm_storage.rs) | Create or reopen a WAL, freeze a full memtable, and install a successor. | Carry a per-WAL internal path choice through create/reopen; handle retryable `WAL full` without holding `active_memtable_lock` while freezing. |
+| Memtable WAL creation/recovery in [`mem_table.rs`](../kv-engine/src/mem_table.rs) and rotation in [`lsm_storage.rs`](../kv-engine/src/lsm_storage.rs) | Create or reopen a WAL, freeze a full memtable, and install a successor. | Carry the per-WAL selector through create/reopen; retry the explicit `WAL full` result after releasing the active-memtable guard, forcing and coalescing v4 rotations. |
 | [`write-perf`](../kv-engine/src/bin/write-perf.rs) | Measures `wal_concurrent` and existing WAL profile fields. | Select either path in the same binary and report actual group/SQE overlap and sync behavior. |
 
 The current `pending` queue, `next_ticket`, `alloc_offset`, ring lock,
@@ -51,9 +51,8 @@ state machine is incomplete.
 | Async engine methods in [`lsm_storage.rs`](../kv-engine/src/lsm_storage.rs) can leave admission guards in cancellable futures while detached blocking closures continue; `batch_get_async` discards its guard. | Audit all blocking engine APIs and transfer each guard to the spawned task or returned cursor. Test cancellation against close for a write, maintenance task, and batch read. Required before exposing the candidate through async APIs. |
 | Async lifecycle waits can lose a [`Notify` wakeup](../kv-engine/src/lsm_storage.rs); `close_async` cancellation or a background-worker join error can leave `Closing` unresolved. | Use state-aware wait registration and a shutdown owner that records a terminal success or error after safe teardown. Test cancellation at each await, failed joins, and a second close caller. Required before relying on async close for candidate teardown. |
 
-The candidate can progress in a controlled synchronous harness through the
-pure model, worker, and recovery slices while these fixes are prepared. Do not
-expose its selector through engine async APIs until the prerequisite tests pass.
+The candidate now runs through synchronous v4 WAL and engine paths. Do not
+expose it through engine async APIs until the prerequisite tests pass.
 
 ## Implementation slices
 
@@ -159,7 +158,7 @@ An ambiguous submit followed by `close()` error and `Wal` drop cannot free a
 buffer still reachable by the kernel, including under ASan. Sync overlap is
 verified after the coordinator exists.
 
-### 5. Independent durability coordinator and lifecycle
+### 5. Independent durability coordinator and lifecycle — implemented
 
 - Run at most one `fdatasync` at a time on a coordinator that cannot block the
   ring worker. Capture the largest contiguous written ticket before each
@@ -264,10 +263,12 @@ only if the one-ring candidate demonstrably cannot sustain useful overlap.
 
 ## Review and verification cadence
 
-Keep slices 1-3 dormant or test-only; enable the candidate for v4 behind the
-internal selector only after slices 4-5 are complete. Each implementation PR
-should state its invariant, affected WAL format, failure behavior, and evidence
-from the matching slice. Run `cargo make check` for code changes, focused
-nextest and failpoint tests while iterating, then the all-feature suite and
-sanitizers for the crash-safety gate. Do not interpret a benchmark result as
-an adoption decision until correctness and device-backed runs are complete.
+Slices 1-3 stayed dormant or test-only until the worker and coordinator were
+integrated. The v4 candidate is now opt-in behind the internal selector; keep
+the leader path as default until recovery and benchmark gates pass. Each
+implementation PR should state its invariant, affected WAL format, failure
+behavior, and evidence from the matching slice. Run `cargo make check` for code
+changes, focused nextest and failpoint tests while iterating, then the
+all-feature suite and sanitizers for the crash-safety gate. Do not interpret a
+benchmark result as an adoption decision until correctness and device-backed
+runs are complete.
