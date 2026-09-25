@@ -46,6 +46,7 @@ struct BufferBudget {
 struct BufferBudgetState {
     active_bytes: u64,
     oversized_active: bool,
+    oversized_waiters: usize,
     closed: bool,
 }
 
@@ -55,6 +56,7 @@ impl BufferBudget {
             state: Mutex::new(BufferBudgetState {
                 active_bytes: 0,
                 oversized_active: false,
+                oversized_waiters: 0,
                 closed: false,
             }),
             available: Condvar::new(),
@@ -67,21 +69,34 @@ impl BufferBudget {
             "WAL batch exceeds the direct-buffer capacity limit"
         );
         let mut state = self.state.lock();
+        let oversized = bytes > NORMAL_ACTIVE_BUFFER_BUDGET;
+        if oversized {
+            state.oversized_waiters = state
+                .oversized_waiters
+                .checked_add(1)
+                .ok_or_else(|| anyhow!("oversized WAL buffer waiter count overflow"))?;
+        }
         loop {
             if state.closed {
+                if oversized {
+                    state.oversized_waiters -= 1;
+                }
                 bail!("parallel WAL is closed");
             }
-            let oversized = bytes > NORMAL_ACTIVE_BUFFER_BUDGET;
             let fits = if oversized {
                 state.active_bytes == 0 && !state.oversized_active
             } else {
                 !state.oversized_active
+                    && state.oversized_waiters == 0
                     && state
                         .active_bytes
                         .checked_add(bytes)
                         .is_some_and(|active| active <= NORMAL_ACTIVE_BUFFER_BUDGET)
             };
             if fits {
+                if oversized {
+                    state.oversized_waiters -= 1;
+                }
                 state.active_bytes = state
                     .active_bytes
                     .checked_add(bytes)
@@ -900,6 +915,8 @@ fn synchronize_written_prefix(sync_file: &File, inner: &RuntimeInner) -> Result<
     Ok(())
 }
 
+/// Preallocate space and extend `i_size` so later direct writes target an
+/// already-sized range and avoid extending the WAL themselves.
 fn preallocate(file: &File, end: u64) -> Result<()> {
     ensure!(
         end <= MAX_WAL_FILE_SIZE,
@@ -913,7 +930,7 @@ fn preallocate(file: &File, end: u64) -> Result<()> {
     let result = unsafe {
         libc::fallocate(
             file.as_raw_fd(),
-            libc::FALLOC_FL_KEEP_SIZE,
+            0,
             0,
             i64::try_from(end).context("WAL preallocation exceeds i64")?,
         )
@@ -946,7 +963,8 @@ fn round_up(value: u64, alignment: u64) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::{
-        BufferBudget, MAX_BUFFER_CAPACITY, NORMAL_ACTIVE_BUFFER_BUDGET, WalFull, round_up,
+        BufferBudget, MAX_BUFFER_CAPACITY, NORMAL_ACTIVE_BUFFER_BUDGET, PREALLOC_BLOCK,
+        WAL_HEADER_END, WalFull, preallocate, round_up,
     };
     use crate::wal::Wal;
 
@@ -975,6 +993,70 @@ mod tests {
     }
 
     #[test]
+    fn oversized_waiter_blocks_new_normal_reservations_until_it_runs() {
+        use std::{
+            sync::Arc,
+            thread,
+            time::{Duration, Instant},
+        };
+
+        use crossbeam_channel::bounded;
+
+        let budget = Arc::new(BufferBudget::new());
+        let initial_bytes = NORMAL_ACTIVE_BUFFER_BUDGET - 4096;
+        let oversized_bytes = NORMAL_ACTIVE_BUFFER_BUDGET + 4096;
+        budget
+            .reserve(initial_bytes)
+            .expect("reserve normal buffers");
+
+        let (oversized_tx, oversized_rx) = bounded(1);
+        let oversized_budget = Arc::clone(&budget);
+        let oversized_waiter = thread::spawn(move || {
+            let result = oversized_budget.reserve(oversized_bytes);
+            oversized_tx
+                .send(result.is_ok())
+                .expect("report large reservation");
+        });
+
+        let started = Instant::now();
+        loop {
+            if budget.state.lock().oversized_waiters == 1 {
+                break;
+            }
+            assert!(started.elapsed() < Duration::from_secs(5));
+            thread::yield_now();
+        }
+
+        let (normal_tx, normal_rx) = bounded(1);
+        let normal_budget = Arc::clone(&budget);
+        let normal_waiter = thread::spawn(move || {
+            let result = normal_budget.reserve(4096);
+            normal_tx
+                .send(result.is_ok())
+                .expect("report normal reservation");
+        });
+
+        assert!(normal_rx.recv_timeout(Duration::from_millis(25)).is_err());
+        budget.release(initial_bytes);
+        assert!(
+            oversized_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("oversized reservation completes")
+        );
+        assert!(normal_rx.try_recv().is_err());
+
+        budget.release(oversized_bytes);
+        assert!(
+            normal_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("normal reservation resumes")
+        );
+        budget.release(4096);
+        oversized_waiter.join().expect("oversized waiter joins");
+        normal_waiter.join().expect("normal waiter joins");
+    }
+
+    #[test]
     fn buffer_budget_rejects_hard_cap_before_reserving_memory() {
         let budget = BufferBudget::new();
         assert!(budget.reserve(MAX_BUFFER_CAPACITY + 4096).is_err());
@@ -995,5 +1077,27 @@ mod tests {
         assert_eq!(round_up(4096, 1 << 20), Some(1 << 20));
         assert_eq!(round_up(1 << 20, 1 << 20), Some(1 << 20));
         assert_eq!(round_up(u64::MAX, 4096), None);
+    }
+
+    #[test]
+    fn preallocate_extends_the_file_size_for_parallel_direct_writes() {
+        use std::fs::OpenOptions;
+
+        let directory = tempfile::tempdir().expect("create temp directory");
+        let file = OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(directory.path().join("wal"))
+            .expect("create WAL file");
+        file.set_len(WAL_HEADER_END)
+            .expect("write WAL header extent");
+
+        preallocate(&file, PREALLOC_BLOCK).expect("preallocate WAL extent");
+
+        assert_eq!(
+            file.metadata().expect("read WAL metadata").len(),
+            PREALLOC_BLOCK
+        );
     }
 }
