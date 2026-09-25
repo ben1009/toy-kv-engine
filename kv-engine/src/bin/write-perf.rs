@@ -7804,6 +7804,7 @@ fn validate_run_mode(cfg: &HarnessConfig, bench_arg: Option<&str>) -> Result<()>
             bench_arg == Some("wal_concurrent"),
             "--wal-io-mode parallel currently requires --bench wal_concurrent"
         );
+        anyhow::ensure!(!cfg.pitr, "--wal-io-mode parallel does not support --pitr");
     }
 
     Ok(())
@@ -7851,6 +7852,20 @@ mod tests {
                 .to_string()
                 .contains("requires --bench wal_concurrent")
         );
+
+        let pitr_args = Args::try_parse_from([
+            "write-perf",
+            "--wal-io-mode",
+            "parallel",
+            "--bench",
+            "wal_concurrent",
+            "--pitr",
+        ])
+        .expect("parse PITR with parallel WAL selector");
+        let pitr_cfg = HarnessConfig::from_args(pitr_args);
+        let error = validate_run_mode(&pitr_cfg, Some("wal_concurrent"))
+            .expect_err("parallel selector must not label PITR's leader path as parallel");
+        assert!(error.to_string().contains("does not support --pitr"));
     }
 
     #[derive(Debug, Deserialize)]

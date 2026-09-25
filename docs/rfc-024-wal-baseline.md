@@ -32,8 +32,9 @@ Exact benchmark arguments, used for both filesystems:
 --latency-sample-every 100 --profile --output json
 ```
 
-The runs were performed on 2026-09-25. `/tmp` was tmpfs. The repository WAL
-path was on ext4 backed by `/dev/nvme0n1p3`, a SOLIDIGM SSDPFKNU010TZ NVMe SSD
+The runs were performed on 2026-09-25 in Asia/Chongqing (UTC+08:00). `/tmp`
+was tmpfs. The repository WAL path was on ext4 backed by `/dev/nvme0n1p3`, a
+SOLIDIGM SSDPFKNU010TZ NVMe SSD
 (953.9 GiB). The ext4 benchmark directory was removed by the harness.
 
 ## Same-binary paired current-path results
