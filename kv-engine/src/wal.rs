@@ -22,6 +22,13 @@ use crate::{key::KeySlice, range_tombstone::RangeTombstone};
 #[cfg(test)]
 mod parallel;
 
+// This worker is intentionally dormant until the independent durability
+// coordinator is implemented. The production WAL continues to use its leader
+// path until both pieces are integrated.
+#[allow(dead_code)]
+#[path = "wal/parallel/worker.rs"]
+mod parallel_worker;
+
 /// Result of recovering a WAL file, containing both point entries and range tombstones.
 pub struct RecoveredWalBatch {
     /// Point key-value entries recovered from the WAL.
