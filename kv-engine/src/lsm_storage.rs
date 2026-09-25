@@ -2195,8 +2195,7 @@ impl KvEngine {
         self.inner.lifecycle.wait_for_quiescence();
         let result = (|| -> Result<()> {
             if self.inner.options.enable_wal {
-                self.inner.sync()?;
-                self.inner.sync_dir()?;
+                self.inner.sync_and_close_parallel_wals()?;
             } else {
                 // flush memtable to imm_memtable
                 let new_id = self.inner.next_sst_id();
@@ -2226,8 +2225,10 @@ impl KvEngine {
     /// Open an engine with a selected WAL I/O path.
     ///
     /// This hidden selector is used by `write-perf` to compare paths in one
-    /// binary. The parallel path is currently dormant and rejects v4 writes
-    /// before ticket assignment. Legacy and PITR WALs retain their old path.
+    /// binary. `Parallel` opts ordinary v4 WALs into the dedicated pipeline;
+    /// legacy and PITR WALs retain their existing path. Async writes and close
+    /// remain unavailable with the candidate until their lifecycle prerequisites
+    /// are complete.
     #[doc(hidden)]
     pub fn open_with_wal_io_mode(
         path: impl AsRef<Path>,
@@ -4892,6 +4893,14 @@ impl KvEngine {
 // ── Async API (RFC 014 Phase 1) ─────────────────────────────────────
 
 impl KvEngine {
+    fn ensure_async_wal_path_supported(&self) -> Result<()> {
+        ensure!(
+            !self.inner.selects_parallel_wal_io(),
+            "parallel WAL is not available through async APIs yet"
+        );
+        Ok(())
+    }
+
     /// Eagerly dispatches the PITR enable transition to the blocking pool.
     #[cfg(target_os = "linux")]
     pub fn enable_pitr_async(
@@ -5073,6 +5082,7 @@ impl KvEngine {
 
     /// Async graceful shutdown.
     pub async fn close_async(&self) -> Result<()> {
+        self.ensure_async_wal_path_supported()?;
         let pitr_mode = self.pitr_manifest_state.lock().mode;
         if pitr_mode != crate::pitr::manifest::PitrMode::Disabled {
             // The PITR close joins worker threads and waits for lifecycle
@@ -5113,8 +5123,7 @@ impl KvEngine {
         let result = b
             .run_result(move || -> anyhow::Result<()> {
                 if wal {
-                    inner.sync()?;
-                    inner.sync_dir()?;
+                    inner.sync_and_close_parallel_wals()?;
                 } else {
                     let id = inner.next_sst_id();
                     let mt = MemTable::create(id, inner.vlog.is_some());
@@ -5165,6 +5174,7 @@ impl KvEngine {
 
     /// Async put.
     pub async fn put_async(&self, key: &[u8], value: &[u8]) -> Result<()> {
+        self.ensure_async_wal_path_supported()?;
         let _guard = self.inner.lifecycle.admit_write()?;
         let inner = self.inner.clone();
         let key = key.to_vec();
@@ -5177,6 +5187,7 @@ impl KvEngine {
 
     /// Async delete.
     pub async fn delete_async(&self, key: &[u8]) -> Result<()> {
+        self.ensure_async_wal_path_supported()?;
         let _guard = self.inner.lifecycle.admit_write()?;
         let inner = self.inner.clone();
         let key = key.to_vec();
@@ -5188,6 +5199,7 @@ impl KvEngine {
 
     /// Async delete range.
     pub async fn delete_range_async(&self, start: &[u8], end: &[u8]) -> Result<()> {
+        self.ensure_async_wal_path_supported()?;
         let _guard = self.inner.lifecycle.admit_write()?;
         let inner = self.inner.clone();
         let start = start.to_vec();
@@ -5203,6 +5215,7 @@ impl KvEngine {
         &self,
         batch: &[WriteBatchRecord<T>],
     ) -> Result<()> {
+        self.ensure_async_wal_path_supported()?;
         let _guard = self.inner.lifecycle.admit_write()?;
         let inner = self.inner.clone();
         let owned: Vec<WriteBatchRecord<Vec<u8>>> = batch
@@ -5229,6 +5242,7 @@ impl KvEngine {
 
     /// Async sync.
     pub async fn sync_async(&self) -> Result<()> {
+        self.ensure_async_wal_path_supported()?;
         let _guard = self.inner.lifecycle.admit_write()?;
         let inner = self.inner.clone();
         self.inner.blocking.run_result(move || inner.sync()).await
@@ -5762,6 +5776,7 @@ impl Drop for ParallelScan {
 }
 
 impl LsmStorageInner {
+    const MAX_WAL_FULL_ROTATION_RETRIES: usize = 8;
     /// Batch point-read for multiple keys.
     ///
     /// Optimized for throughput when reading many keys at once:
@@ -7396,6 +7411,43 @@ impl LsmStorageInner {
 
     pub fn sync(&self) -> Result<()> {
         self.state.load().memtable.sync_wal()
+    }
+
+    /// The selector is fixed for this engine even while PITR temporarily
+    /// installs a v5 WAL on the leader path. Async admission must use this
+    /// stable choice because a later rotation can restore a parallel v4 WAL.
+    pub(crate) fn selects_parallel_wal_io(&self) -> bool {
+        self.options.enable_wal && self.wal_io_mode == crate::wal::WalIoMode::Parallel
+    }
+
+    /// Sync the active WAL and shut down every parallel WAL runtime still
+    /// reachable from the active or immutable memtables. Evaluate all cleanup
+    /// steps even if an earlier sync fails so a returned close error cannot
+    /// leave dedicated WAL threads running.
+    pub(crate) fn sync_and_close_parallel_wals(&self) -> Result<()> {
+        let sync_result = self.sync();
+        let close_result = self.close_parallel_wals();
+        let dir_sync_result = self.sync_dir();
+
+        sync_result.and(close_result).and(dir_sync_result)
+    }
+
+    fn close_parallel_wals(&self) -> Result<()> {
+        let state = self.state.load_full();
+        let mut first_error = None;
+
+        for memtable in std::iter::once(&state.memtable).chain(state.imm_memtables.iter()) {
+            if let Err(error) = memtable.close_parallel_wal() {
+                first_error.get_or_insert_with(|| {
+                    error.context(format!(
+                        "failed to close parallel WAL for memtable {}",
+                        memtable.id()
+                    ))
+                });
+            }
+        }
+
+        first_error.map_or(Ok(()), Err)
     }
 
     pub(crate) fn checkpoint_compaction_filter_snapshot(
@@ -9036,25 +9088,43 @@ impl LsmStorageInner {
         entries: &[(bytes::Bytes, bytes::Bytes, crate::mvcc::BatchEntryKind)],
     ) -> Result<()> {
         let mvcc = self.mvcc.as_ref().expect("mvcc_write_batch requires MVCC");
-        {
-            let _read_guard = self.active_memtable_lock.read();
-            let state = self.state.load();
-            let (commit_ts, data, ticket) = mvcc.write_batch_wal_only(
-                entries,
-                &state.memtable,
-                Self::use_owned_batch_publish(entries.len()),
-            )?;
-            let memtable = state.memtable.clone();
-            Self::commit_wal_ticket_or_poison(&memtable, ticket, self.mvcc.as_deref(), commit_ts)?;
-            if !data.is_empty() {
-                Self::publish_deferred_batch_or_poison(&memtable, data, mvcc, commit_ts)?;
-            }
-            // Advance current_ts AFTER publish.
-            if commit_ts > 0 {
-                mvcc.publish_commit_ts(commit_ts)?;
+        let mut retries = 0;
+        loop {
+            let expected_memtable = self.state.load().memtable.clone();
+            let result = self.mvcc_write_batch_attempt(entries, mvcc);
+            match result {
+                Ok(()) => break,
+                Err(error) => {
+                    self.retry_after_wal_full(error, &expected_memtable, &mut retries)?;
+                }
             }
         }
         self.try_freeze_memtable()?;
+
+        Ok(())
+    }
+
+    fn mvcc_write_batch_attempt(
+        &self,
+        entries: &[(bytes::Bytes, bytes::Bytes, crate::mvcc::BatchEntryKind)],
+        mvcc: &crate::mvcc::LsmMvccInner,
+    ) -> Result<()> {
+        let _read_guard = self.active_memtable_lock.read();
+        let state = self.state.load();
+        let (commit_ts, data, ticket) = mvcc.write_batch_wal_only(
+            entries,
+            &state.memtable,
+            Self::use_owned_batch_publish(entries.len()),
+        )?;
+        let memtable = state.memtable.clone();
+        Self::commit_wal_ticket_or_poison(&memtable, ticket, self.mvcc.as_deref(), commit_ts)?;
+        if !data.is_empty() {
+            Self::publish_deferred_batch_or_poison(&memtable, data, mvcc, commit_ts)?;
+        }
+        // Advance current_ts AFTER publish.
+        if commit_ts > 0 {
+            mvcc.publish_commit_ts(commit_ts)?;
+        }
 
         Ok(())
     }
@@ -9176,15 +9246,28 @@ impl LsmStorageInner {
             );
         }
 
+        let mut retries = 0;
+        loop {
+            let expected_memtable = self.state.load().memtable.clone();
+            match self.range_batch_write_attempt(&entries) {
+                Ok(()) => return self.try_freeze_memtable(),
+                Err(error) => {
+                    self.retry_after_wal_full(error, &expected_memtable, &mut retries)?;
+                }
+            }
+        }
+    }
+
+    fn range_batch_write_attempt(&self, entries: &[(&[u8], &[u8])]) -> Result<()> {
         {
             let _guard = self.active_memtable_lock.read();
             let state = self.state.load_full();
             let (ts, ticket) = if let Some(ref mvcc) = self.mvcc {
-                mvcc.write_range_batch_wal_only(&entries, &state.memtable)?
+                mvcc.write_range_batch_wal_only(entries, &state.memtable)?
             } else {
                 let ticket = state
                     .memtable
-                    .put_range_tombstone_batch_wal_only(&entries, 0, 0)?;
+                    .put_range_tombstone_batch_wal_only(entries, 0, 0)?;
                 (0, ticket)
             };
             let memtable = state.memtable.clone();
@@ -9192,13 +9275,14 @@ impl LsmStorageInner {
             if ts > 0
                 && let Some(ref mvcc) = self.mvcc
             {
-                Self::publish_range_tombstones_or_poison(&memtable, &entries, ts, mvcc)?;
+                Self::publish_range_tombstones_or_poison(&memtable, entries, ts, mvcc)?;
                 mvcc.publish_commit_ts(ts)?;
             } else {
-                memtable.publish_range_tombstones(&entries, ts, 0)?;
+                memtable.publish_range_tombstones(entries, ts, 0)?;
             }
         }
-        self.try_freeze_memtable()
+
+        Ok(())
     }
 
     fn push_point_batch_entry<T: AsRef<[u8]>>(
@@ -10127,6 +10211,26 @@ impl LsmStorageInner {
         new: &[u8],
         new_kind: KvKind,
     ) -> Result<bool> {
+        let mut retries = 0;
+        loop {
+            let expected_memtable = self.state.load().memtable.clone();
+            match self.compare_and_set_with_kind_once(key, old, old_kind, new, new_kind) {
+                Ok(result) => return Ok(result),
+                Err(error) => {
+                    self.retry_after_wal_full(error, &expected_memtable, &mut retries)?;
+                }
+            }
+        }
+    }
+
+    fn compare_and_set_with_kind_once(
+        &self,
+        key: &[u8],
+        old: &[u8],
+        old_kind: KvKind,
+        new: &[u8],
+        new_kind: KvKind,
+    ) -> Result<bool> {
         let _lock = self.state_lock.lock();
         // Write lock prevents foreground put() from racing between check and write.
         let _mt_guard = self.active_memtable_lock.write();
@@ -10161,6 +10265,19 @@ impl LsmStorageInner {
         &self,
         entries: &[CasEntry],
     ) -> Result<Vec<bool>> {
+        let mut retries = 0;
+        loop {
+            let expected_memtable = self.state.load().memtable.clone();
+            match self.compare_and_set_batch_with_kind_once(entries) {
+                Ok(results) => return Ok(results),
+                Err(error) => {
+                    self.retry_after_wal_full(error, &expected_memtable, &mut retries)?;
+                }
+            }
+        }
+    }
+
+    fn compare_and_set_batch_with_kind_once(&self, entries: &[CasEntry]) -> Result<Vec<bool>> {
         let _lock = self.state_lock.lock();
 
         // Phase 1: Lookups under read lock — concurrent reads not blocked
@@ -10330,9 +10447,32 @@ impl LsmStorageInner {
         self.maybe_start_write_batch_profile_window();
 
         if has_range {
-            return self.range_batch_write(batch);
+            self.range_batch_write(batch)?;
+        } else {
+            let mut retries = 0;
+            loop {
+                let expected_memtable = self.state.load().memtable.clone();
+                match self.write_point_batch_once(batch, delete_only) {
+                    Ok(()) => break,
+                    Err(error) => {
+                        self.retry_after_wal_full(error, &expected_memtable, &mut retries)?;
+                    }
+                }
+            }
         }
 
+        #[cfg(feature = "bench")]
+        self.maybe_log_write_batch_profile_window();
+
+        Ok(())
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn write_point_batch_once<T: AsRef<[u8]>>(
+        &self,
+        batch: &[WriteBatchRecord<T>],
+        delete_only: bool,
+    ) -> Result<()> {
         // Defer serializable txn recording until after commit_wal_ticket succeeds.
         let mut txn_info: Option<(u64, std::collections::HashSet<bytes::Bytes>)> = None;
         // Track commit_ts for advancing current_ts after publish.
@@ -10456,8 +10596,6 @@ impl LsmStorageInner {
         }
         drop(_commit_guard);
         self.try_freeze_memtable()?;
-        #[cfg(feature = "bench")]
-        self.maybe_log_write_batch_profile_window();
 
         Ok(())
     }
@@ -10561,6 +10699,32 @@ impl LsmStorageInner {
         Ok(())
     }
 
+    pub(crate) fn retry_after_wal_full(
+        &self,
+        error: anyhow::Error,
+        expected_memtable: &Arc<MemTable>,
+        retries: &mut usize,
+    ) -> Result<()> {
+        if !crate::wal::Wal::is_retryable_full_error(&error) {
+            return Err(error);
+        }
+        if *retries >= Self::MAX_WAL_FULL_ROTATION_RETRIES {
+            return Err(error.context("WAL remained full after bounded rotations"));
+        }
+        *retries += 1;
+
+        let _checkpoint_guard = self.checkpoint_lock.lock();
+        let state_lock = self.state_lock.lock();
+        let active = self.state.load_full();
+        if Arc::ptr_eq(&active.memtable, expected_memtable) {
+            drop(active);
+            self.force_freeze_memtable(&state_lock)
+                .context("failed to rotate full active WAL")?;
+        }
+
+        Ok(())
+    }
+
     fn maybe_queue_pitr_maintenance(&self, check_size: bool) -> Result<()> {
         let state = self.pitr_state.lock().clone();
         if !matches!(
@@ -10635,6 +10799,19 @@ impl LsmStorageInner {
     /// Rejects values that are exactly the tombstone marker byte (`[0x02]`),
     /// since those would be indistinguishable from a deletion marker.
     pub fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
+        let mut retries = 0;
+        loop {
+            let expected_memtable = self.state.load().memtable.clone();
+            match self.put_once(key, value) {
+                Ok(()) => return Ok(()),
+                Err(error) => {
+                    self.retry_after_wal_full(error, &expected_memtable, &mut retries)?;
+                }
+            }
+        }
+    }
+
+    fn put_once(&self, key: &[u8], value: &[u8]) -> Result<()> {
         anyhow::ensure!(
             !(value.len() == 1 && value[0] == crate::vlog::KvKind::Tombstone as u8),
             "value must not be the tombstone marker byte (0x02)"
@@ -10724,6 +10901,19 @@ impl LsmStorageInner {
 
     /// Write a key-value pair with a time-to-live duration.
     pub fn put_with_ttl(&self, key: &[u8], value: &[u8], ttl: std::time::Duration) -> Result<()> {
+        let mut retries = 0;
+        loop {
+            let expected_memtable = self.state.load().memtable.clone();
+            match self.put_with_ttl_once(key, value, ttl) {
+                Ok(()) => return Ok(()),
+                Err(error) => {
+                    self.retry_after_wal_full(error, &expected_memtable, &mut retries)?;
+                }
+            }
+        }
+    }
+
+    fn put_with_ttl_once(&self, key: &[u8], value: &[u8], ttl: std::time::Duration) -> Result<()> {
         anyhow::ensure!(
             !(value.len() == 1 && value[0] == crate::vlog::KvKind::Tombstone as u8),
             "value must not be the tombstone marker byte (0x02)"
@@ -10806,6 +10996,19 @@ impl LsmStorageInner {
 
     /// Remove a key from the storage by writing a tombstone marker.
     pub fn delete(&self, key: &[u8]) -> Result<()> {
+        let mut retries = 0;
+        loop {
+            let expected_memtable = self.state.load().memtable.clone();
+            match self.delete_once(key) {
+                Ok(()) => return Ok(()),
+                Err(error) => {
+                    self.retry_after_wal_full(error, &expected_memtable, &mut retries)?;
+                }
+            }
+        }
+    }
+
+    fn delete_once(&self, key: &[u8]) -> Result<()> {
         Self::validate_key_size(key)?;
         // Hold commit_lock through record_write to prevent concurrent serializable
         // transactions from passing conflict checks before our write set is visible.
@@ -10907,6 +11110,19 @@ impl LsmStorageInner {
         Self::validate_key_size(start)?;
         Self::validate_key_size(end)?;
 
+        let mut retries = 0;
+        loop {
+            let expected_memtable = self.state.load().memtable.clone();
+            match self.delete_range_once(start, end) {
+                Ok(()) => return Ok(()),
+                Err(error) => {
+                    self.retry_after_wal_full(error, &expected_memtable, &mut retries)?;
+                }
+            }
+        }
+    }
+
+    fn delete_range_once(&self, start: &[u8], end: &[u8]) -> Result<()> {
         {
             let _guard = self.active_memtable_lock.read();
             let state = self.state.load_full();

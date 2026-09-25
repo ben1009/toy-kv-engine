@@ -14,7 +14,7 @@ use super::harness::{create_wal_or_skip, is_io_uring_unavailable_error};
 #[cfg(feature = "bench")]
 use crate::mem_table::WriteProfile;
 use crate::{
-    lsm_storage::{LsmStorageInner, LsmStorageOptions},
+    lsm_storage::{KvEngine, LsmStorageInner, LsmStorageOptions, WriteBatchRecord},
     mem_table::MemTable,
     wal::{Wal, WalIoMode},
 };
@@ -75,7 +75,7 @@ fn test_wal_v5_create_preserves_identity_header() {
 }
 
 #[test]
-fn test_parallel_wal_selector_is_carried_by_v4_create_and_recovery_but_is_dormant() {
+fn test_parallel_v4_wal_writes_syncs_and_recovers() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("candidate-v4.wal");
     let wal = match Wal::create_with_io_mode(&path, WalIoMode::Parallel) {
@@ -88,15 +88,23 @@ fn test_parallel_wal_selector_is_carried_by_v4_create_and_recovery_but_is_dorman
     };
 
     assert_eq!(wal.io_mode(), WalIoMode::Parallel);
-    let error = wal
+    let first = wal
         .put_batch(&[(b"key".as_slice(), b"value".as_slice())], 1)
-        .expect_err("dormant candidate path must reject before writing");
-    assert!(
-        error
-            .to_string()
-            .contains("parallel WAL path is not implemented yet")
-    );
-    assert_eq!(wal.assigned_ticket_count(), 0);
+        .expect("admit first parallel WAL batch");
+    let second = wal
+        .put_batch(&[(b"key-2".as_slice(), b"value-2".as_slice())], 2)
+        .expect("admit second parallel WAL batch");
+    let third = wal
+        .put_range_tombstone_batch(&[(b"range-start".as_slice(), b"range-end".as_slice())], 3)
+        .expect("admit parallel range tombstone batch");
+    assert_eq!((first, second, third), (0, 1, 2));
+    assert_eq!(wal.assigned_ticket_count(), 3);
+    wal.submit_and_commit(first).expect("durable first batch");
+    wal.submit_and_commit(second).expect("durable second batch");
+    wal.submit_and_commit(third)
+        .expect("durable range tombstone batch");
+    wal.sync().expect("sync captured ticket cutoff");
+    wal.close().expect("drain and close parallel WAL");
     drop(wal);
 
     let skiplist = new_skiplist();
@@ -109,7 +117,124 @@ fn test_parallel_wal_selector_is_carried_by_v4_create_and_recovery_but_is_dorman
     )
     .unwrap();
     assert_eq!(recovered.io_mode(), WalIoMode::Parallel);
-    assert_eq!(batch.max_ts, 0);
+    assert_eq!(batch.max_ts, 3);
+    assert_eq!(
+        skiplist.get(b"key".as_slice()).unwrap().value().as_ref(),
+        b"value"
+    );
+    assert_eq!(
+        skiplist.get(b"key-2".as_slice()).unwrap().value().as_ref(),
+        b"value-2"
+    );
+}
+
+#[test]
+fn test_parallel_wal_engine_publishes_point_and_transaction_commits() {
+    let dir = tempdir().unwrap();
+    let mut options = LsmStorageOptions::default_for_test();
+    options.enable_wal = true;
+    options.serializable = true;
+    options.target_sst_size = 1 << 30;
+
+    let engine = match KvEngine::open_with_wal_io_mode(dir.path(), options, WalIoMode::Parallel) {
+        Ok(engine) => engine,
+        Err(error) if is_io_uring_unavailable_error(&error) => {
+            eprintln!("skipping test (io_uring unavailable): {error:#}");
+            return;
+        }
+        Err(error) => panic!("failed to open parallel WAL engine: {error:#}"),
+    };
+
+    engine
+        .put(b"direct", b"value")
+        .expect("commit direct write");
+    engine
+        .write_batch(&[WriteBatchRecord::Put(
+            b"batch".as_slice(),
+            b"batch-value".as_slice(),
+        )])
+        .expect("commit batch write");
+    let transaction = engine.new_txn().expect("create serializable transaction");
+    transaction.put(b"transaction", b"value").unwrap();
+    transaction.commit().expect("commit transaction");
+    engine.sync().expect("sync parallel WAL");
+
+    assert_eq!(
+        engine.get(b"direct").unwrap().as_deref(),
+        Some(&b"value"[..])
+    );
+    assert_eq!(
+        engine.get(b"batch").unwrap().as_deref(),
+        Some(&b"batch-value"[..])
+    );
+    assert_eq!(
+        engine.get(b"transaction").unwrap().as_deref(),
+        Some(&b"value"[..])
+    );
+
+    {
+        let state_lock = engine.inner.state_lock.lock();
+        engine
+            .inner
+            .force_freeze_memtable(&state_lock)
+            .expect("freeze parallel WAL into immutable memtable");
+    }
+    let state = engine.inner.state.load_full();
+    assert_eq!(state.memtable.parallel_wal_is_closed(), Some(false));
+    assert_eq!(state.imm_memtables.len(), 1);
+    assert_eq!(state.imm_memtables[0].parallel_wal_is_closed(), Some(false));
+
+    engine.close().expect("close parallel WAL engine");
+    assert_eq!(state.memtable.parallel_wal_is_closed(), Some(true));
+    assert_eq!(state.imm_memtables[0].parallel_wal_is_closed(), Some(true));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn test_parallel_selector_rejects_async_writes_during_v5_successor() {
+    let dir = tempdir().unwrap();
+    let mut options = LsmStorageOptions::default_for_test();
+    options.enable_wal = true;
+    options.serializable = true;
+    let engine = match KvEngine::open_with_wal_io_mode(dir.path(), options, WalIoMode::Parallel) {
+        Ok(engine) => engine,
+        Err(error) if is_io_uring_unavailable_error(&error) => {
+            eprintln!("skipping test (io_uring unavailable): {error:#}");
+            return;
+        }
+        Err(error) => panic!("failed to open parallel WAL engine: {error:#}"),
+    };
+
+    let header = crate::pitr::WalV5Header {
+        wal_format_version: crate::pitr::WAL_V5_VERSION,
+        timeline_id: crate::pitr::TimelineId([1; 16]),
+        archive_epoch_id: crate::pitr::ArchiveEpochId([2; 16]),
+        segment_id: crate::pitr::SegmentId(3),
+        predecessor: crate::pitr::ChainAnchor::Genesis {
+            archive_epoch_id: crate::pitr::ArchiveEpochId([2; 16]),
+        },
+    };
+    {
+        let state_lock = engine.inner.state_lock.lock();
+        engine
+            .inner
+            .install_pitr_v5_successor(header, &state_lock)
+            .expect("install temporary PITR WAL");
+    }
+    assert!(engine.inner.state.load().memtable.uses_wal_v5());
+    assert!(engine.inner.selects_parallel_wal_io());
+
+    let error = crate::future_ext::block_on(engine.put_async(b"async", b"value"))
+        .expect_err("async write must remain disabled while v5 is active");
+    assert!(error.to_string().contains("parallel WAL"));
+
+    let txn = engine.new_txn().expect("start transaction");
+    txn.put(b"txn", b"value").unwrap();
+    let error = crate::future_ext::block_on(txn.commit_async())
+        .expect_err("async transaction must remain disabled while v5 is active");
+    assert!(error.to_string().contains("parallel WAL"));
+
+    engine.close().expect("close parallel WAL engine");
 }
 
 #[test]

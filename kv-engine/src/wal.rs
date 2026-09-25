@@ -22,12 +22,14 @@ use crate::{key::KeySlice, range_tombstone::RangeTombstone};
 #[cfg(test)]
 mod parallel;
 
-// This worker is intentionally dormant until the independent durability
-// coordinator is implemented. The production WAL continues to use its leader
-// path until both pieces are integrated.
+// Parallel WAL components are selected only for ordinary v4 WALs. The leader
+// path remains the default, while legacy and PITR WALs keep their existing I/O.
 #[allow(dead_code)]
 #[path = "wal/parallel/worker.rs"]
 mod parallel_worker;
+
+#[path = "wal/parallel/runtime.rs"]
+mod parallel_runtime;
 
 /// Result of recovering a WAL file, containing both point entries and range tombstones.
 pub struct RecoveredWalBatch {
@@ -100,15 +102,15 @@ const GROUP_COMMIT_MIN_SOLO_BYTES: usize = 512 * 1024;
 /// Runtime WAL I/O path selector.
 ///
 /// This is exposed only so the benchmark binary can select the path on an
-/// individual engine. `Parallel` is a dormant candidate until its worker is
-/// implemented; v4 writes using it fail before ticket assignment.
+/// individual engine. The parallel path currently applies to ordinary v4 WALs;
+/// legacy and PITR WALs continue to use the leader path.
 #[doc(hidden)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum WalIoMode {
     /// Existing client-leader submission and sync path.
     #[default]
     Leader,
-    /// Reserved for the dedicated parallel WAL worker.
+    /// Dedicated packer, io_uring worker, and durability coordinator.
     Parallel,
 }
 
@@ -280,6 +282,20 @@ struct TicketedBuf {
     pitr_entry: Option<crate::pitr::seal::SealEntry>,
 }
 
+enum EncodedWalBuffer {
+    Leader(DirectBuf),
+    Parallel(parallel_runtime::ParallelBuffer),
+}
+
+impl EncodedWalBuffer {
+    fn direct_mut(&mut self) -> &mut DirectBuf {
+        match self {
+            Self::Leader(buffer) => buffer,
+            Self::Parallel(buffer) => buffer.direct_mut(),
+        }
+    }
+}
+
 struct PitrSealAccumulator {
     header: crate::pitr::WalV5Header,
     hasher: Sha256,
@@ -443,6 +459,8 @@ pub struct Wal {
     /// Effective I/O path. Only ordinary v4 WALs can retain a non-default
     /// requested mode; legacy and PITR WAL constructors use the leader path.
     io_mode: WalIoMode,
+    /// Dedicated packer/worker/sync coordinator for candidate v4 WALs.
+    parallel_runtime: Option<parallel_runtime::ParallelWalRuntime>,
     /// Whether this WAL uses v3 typed entries (kind prefix).
     /// Only meaningful when `mvcc_format` is true. When false, the WAL uses v2
     /// untyped entries. Preserved from recovery so appended records match the
@@ -599,12 +617,57 @@ impl RecoveryHandler for SkiplistRangeRecovery<'_> {
 impl Wal {
     // ── io_uring + O_DIRECT helpers ────────────────────────────────────────
 
+    fn allocate_encoded_buffer(&self, alloc_size: usize) -> Result<EncodedWalBuffer> {
+        if self.io_mode == WalIoMode::Parallel {
+            let runtime = self
+                .parallel_runtime
+                .as_ref()
+                .context("parallel WAL runtime was not initialized")?;
+            return Ok(EncodedWalBuffer::Parallel(
+                runtime.allocate_buffer(alloc_size)?,
+            ));
+        }
+
+        let buffer = match self.direct_buf_pool.pop() {
+            Some(buffer) if buffer.cap() >= alloc_size => buffer,
+            Some(buffer) => {
+                let _ = self.direct_buf_pool.push(buffer);
+                DirectBuf::new(alloc_size)
+            }
+            None => DirectBuf::new(alloc_size),
+        };
+
+        Ok(EncodedWalBuffer::Leader(buffer))
+    }
+
+    fn enqueue_encoded_buffer(&self, buffer: EncodedWalBuffer, aligned_len: usize) -> Result<u64> {
+        match buffer {
+            EncodedWalBuffer::Leader(buf) => {
+                let mut pending = self.pending.lock();
+                let ticket = self.next_ticket.fetch_add(1, Ordering::Release);
+                pending.push(TicketedBuf {
+                    ticket,
+                    buf,
+                    pitr_entry: None,
+                });
+                Ok(ticket)
+            }
+            EncodedWalBuffer::Parallel(buffer) => self
+                .parallel_runtime
+                .as_ref()
+                .expect("parallel WAL buffers have a runtime")
+                .admit(buffer, aligned_len),
+        }
+    }
+
     /// Create a pre-filled lock-free pool of page-aligned DirectBuf buffers.
-    fn new_direct_buf_pool() -> ArrayQueue<DirectBuf> {
+    fn new_direct_buf_pool(prefill: bool) -> ArrayQueue<DirectBuf> {
         let pool = ArrayQueue::new(BUFFER_POOL_CAPACITY);
 
-        for _ in 0..BUFFER_POOL_CAPACITY {
-            let _ = pool.push(DirectBuf::new(BUFFER_POOL_BUF_SIZE));
+        if prefill {
+            for _ in 0..BUFFER_POOL_CAPACITY {
+                let _ = pool.push(DirectBuf::new(BUFFER_POOL_BUF_SIZE));
+            }
         }
         pool
     }
@@ -614,22 +677,54 @@ impl Wal {
     fn try_init_io_uring(path: &Path) -> Result<(io_uring::IoUring, File, u64)> {
         let ring =
             io_uring::IoUring::new(RING_SIZE as u32).context("failed to create io_uring ring")?;
-
-        let direct_file = File::options()
-            .read(true)
-            .write(true) // NOT append — pwrite controls position
-            .custom_flags(libc::O_DIRECT)
-            .open(path)
-            .context("failed to open O_DIRECT handle")?;
+        let (direct_file, alloc_offset) = Self::open_direct_file(path)?;
 
         let raw_fd = direct_file.as_raw_fd();
         ring.submitter()
             .register_files(&[raw_fd])
             .context("failed to register WAL fd with io_uring")?;
 
+        Ok((ring, direct_file, alloc_offset))
+    }
+
+    fn open_direct_file(path: &Path) -> Result<(File, u64)> {
+        let direct_file = File::options()
+            .read(true)
+            .write(true) // NOT append — pwrite controls position
+            .custom_flags(libc::O_DIRECT)
+            .open(path)
+            .context("failed to open O_DIRECT handle")?;
         let alloc_offset = direct_file.metadata()?.len();
 
-        Ok((ring, direct_file, alloc_offset))
+        Ok((direct_file, alloc_offset))
+    }
+
+    fn try_init_parallel_runtime(
+        direct_file: &File,
+        alloc_offset: u64,
+    ) -> Result<parallel_runtime::ParallelWalRuntime> {
+        let worker_file = Arc::new(
+            direct_file
+                .try_clone()
+                .context("failed to clone WAL worker file")?,
+        );
+        let sync_file = Arc::new(
+            direct_file
+                .try_clone()
+                .context("failed to clone WAL sync file")?,
+        );
+        let preallocator = Arc::new(
+            direct_file
+                .try_clone()
+                .context("failed to clone WAL preallocator file")?,
+        );
+
+        parallel_runtime::ParallelWalRuntime::spawn(
+            worker_file,
+            sync_file,
+            preallocator,
+            alloc_offset,
+        )
     }
 
     /// Construct a Wal from a recovered file, setting up io_uring for MVCC WALs.
@@ -664,7 +759,15 @@ impl Wal {
                 drop(buf_file_pad);
             }
 
-            let (ring, direct_file, alloc_offset) = Self::try_init_io_uring(path)?;
+            let (ring, direct_file, alloc_offset, parallel_runtime) =
+                if io_mode == WalIoMode::Parallel {
+                    let (direct_file, alloc_offset) = Self::open_direct_file(path)?;
+                    let runtime = Self::try_init_parallel_runtime(&direct_file, alloc_offset)?;
+                    (None, direct_file, alloc_offset, Some(runtime))
+                } else {
+                    let (ring, direct_file, alloc_offset) = Self::try_init_io_uring(path)?;
+                    (Some(Mutex::new(ring)), direct_file, alloc_offset, None)
+                };
             let pitr_seal = if crate::pitr::is_v5_family(format_version) {
                 let wal = std::fs::read(path)?;
                 let header = crate::pitr::decode_v5_file_header(&wal)?;
@@ -678,10 +781,11 @@ impl Wal {
                 mvcc_format,
                 format_version,
                 io_mode,
+                parallel_runtime,
                 is_v3,
                 direct_file: Some(direct_file),
-                ring: Some(Mutex::new(ring)),
-                direct_buf_pool: Self::new_direct_buf_pool(),
+                ring,
+                direct_buf_pool: Self::new_direct_buf_pool(io_mode == WalIoMode::Leader),
                 pending: Mutex::new(Vec::new()),
                 next_ticket: AtomicU64::new(0),
                 alloc_offset: AtomicU64::new(alloc_offset),
@@ -707,10 +811,11 @@ impl Wal {
                 mvcc_format,
                 format_version: 0,
                 io_mode: WalIoMode::Leader,
+                parallel_runtime: None,
                 is_v3,
                 direct_file: None,
                 ring: None,
-                direct_buf_pool: Self::new_direct_buf_pool(),
+                direct_buf_pool: Self::new_direct_buf_pool(true),
                 pending: Mutex::new(Vec::new()),
                 next_ticket: AtomicU64::new(0),
                 alloc_offset: AtomicU64::new(0),
@@ -820,16 +925,8 @@ impl Wal {
         );
         let alloc_size = DirectBuf::align_up(total_size).max(BUFFER_POOL_BUF_SIZE);
 
-        let mut buf = match self.direct_buf_pool.pop() {
-            Some(b) if b.cap() >= alloc_size => b,
-            Some(b) => {
-                // Return undersized buffer to pool to avoid permanent capacity loss.
-                let _ = self.direct_buf_pool.push(b);
-                DirectBuf::new(alloc_size)
-            }
-            None => DirectBuf::new(alloc_size),
-        };
-        buf.clear();
+        let mut buf = self.allocate_encoded_buffer(alloc_size)?;
+        buf.direct_mut().clear();
         #[cfg(feature = "bench")]
         if let Some(profile) = profile {
             profile.record_wal_prepare_ns(prepare_start.elapsed().as_nanos() as u64);
@@ -838,7 +935,7 @@ impl Wal {
         #[cfg(feature = "bench")]
         let encode_start = Instant::now();
         // Reserve header space (filled later).
-        let mut cursor = DirectBufCursor::new(&mut buf, V4_BATCH_HEADER_SIZE);
+        let mut cursor = DirectBufCursor::new(buf.direct_mut(), V4_BATCH_HEADER_SIZE);
 
         #[cfg(feature = "bench")]
         let entries_start = Instant::now();
@@ -859,11 +956,12 @@ impl Wal {
         #[cfg(feature = "bench")]
         let crc_header_start = Instant::now();
         let pos = cursor.position();
-        let crc = crc32fast::hash(buf.initialized_slice(V4_BATCH_HEADER_SIZE, pos));
-        buf.write_u64_be_at(0, commit_ts);
-        buf.write_u32_be_at(8, entry_count);
-        buf.write_u32_be_at(12, crc);
-        buf.write_u32_be_at(16, entries_size as u32);
+        let direct_buffer = buf.direct_mut();
+        let crc = crc32fast::hash(direct_buffer.initialized_slice(V4_BATCH_HEADER_SIZE, pos));
+        direct_buffer.write_u64_be_at(0, commit_ts);
+        direct_buffer.write_u32_be_at(8, entry_count);
+        direct_buffer.write_u32_be_at(12, crc);
+        direct_buffer.write_u32_be_at(16, entries_size as u32);
         #[cfg(feature = "bench")]
         let crc_header_ns = crc_header_start.elapsed().as_nanos() as u64;
 
@@ -871,8 +969,8 @@ impl Wal {
         #[cfg(feature = "bench")]
         let finish_start = Instant::now();
         let aligned_len = DirectBuf::align_up(pos);
-        buf.zero_range(pos, aligned_len);
-        buf.set_len(aligned_len);
+        direct_buffer.zero_range(pos, aligned_len);
+        direct_buffer.set_len(aligned_len);
         #[cfg(feature = "bench")]
         let finish_ns = finish_start.elapsed().as_nanos() as u64;
         #[cfg(feature = "bench")]
@@ -883,14 +981,7 @@ impl Wal {
 
         #[cfg(feature = "bench")]
         let enqueue_start = Instant::now();
-        let mut pending = self.pending.lock();
-        let ticket = self.next_ticket.fetch_add(1, Ordering::Release);
-        pending.push(TicketedBuf {
-            ticket,
-            buf,
-            pitr_entry: None,
-        });
-        drop(pending);
+        let ticket = self.enqueue_encoded_buffer(buf, aligned_len)?;
 
         #[cfg(feature = "bench")]
         if let Some(profile) = profile {
@@ -941,18 +1032,10 @@ impl Wal {
         );
         let alloc_size = DirectBuf::align_up(total_size).max(BUFFER_POOL_BUF_SIZE);
 
-        let mut buf = match self.direct_buf_pool.pop() {
-            Some(b) if b.cap() >= alloc_size => b,
-            Some(b) => {
-                // Return undersized buffer to pool to avoid permanent capacity loss.
-                let _ = self.direct_buf_pool.push(b);
-                DirectBuf::new(alloc_size)
-            }
-            None => DirectBuf::new(alloc_size),
-        };
-        buf.clear();
+        let mut buf = self.allocate_encoded_buffer(alloc_size)?;
+        buf.direct_mut().clear();
 
-        let mut cursor = DirectBufCursor::new(&mut buf, V4_BATCH_HEADER_SIZE);
+        let mut cursor = DirectBufCursor::new(buf.direct_mut(), V4_BATCH_HEADER_SIZE);
 
         for (start, end) in tombstones {
             cursor.write_u8(WalEntryKind::RangeTombstone as u8);
@@ -963,24 +1046,18 @@ impl Wal {
         }
 
         let pos = cursor.position();
-        let crc = crc32fast::hash(buf.initialized_slice(V4_BATCH_HEADER_SIZE, pos));
-        buf.write_u64_be_at(0, commit_ts);
-        buf.write_u32_be_at(8, entry_count);
-        buf.write_u32_be_at(12, crc);
-        buf.write_u32_be_at(16, entries_size as u32);
+        let direct_buffer = buf.direct_mut();
+        let crc = crc32fast::hash(direct_buffer.initialized_slice(V4_BATCH_HEADER_SIZE, pos));
+        direct_buffer.write_u64_be_at(0, commit_ts);
+        direct_buffer.write_u32_be_at(8, entry_count);
+        direct_buffer.write_u32_be_at(12, crc);
+        direct_buffer.write_u32_be_at(16, entries_size as u32);
 
         let aligned_len = DirectBuf::align_up(pos);
-        buf.zero_range(pos, aligned_len);
-        buf.set_len(aligned_len);
+        direct_buffer.zero_range(pos, aligned_len);
+        direct_buffer.set_len(aligned_len);
 
-        let mut pending = self.pending.lock();
-        let ticket = self.next_ticket.fetch_add(1, Ordering::Release);
-        pending.push(TicketedBuf {
-            ticket,
-            buf,
-            pitr_entry: None,
-        });
-        drop(pending);
+        let ticket = self.enqueue_encoded_buffer(buf, aligned_len)?;
 
         #[cfg(feature = "chaos-testing")]
         {
@@ -1011,10 +1088,24 @@ impl Wal {
         // Initialize io_uring + O_DIRECT AFTER header is flushed so alloc_offset is correct.
         // If this fails (e.g. old kernel, filesystem rejects O_DIRECT), clean up
         // the WAL file so retries don't fail on create_new.
-        let (ring, direct_file, alloc_offset) = Self::try_init_io_uring(path.as_ref())
-            .inspect_err(|_| {
-                let _ = std::fs::remove_file(path.as_ref());
-            })?;
+        let (ring, direct_file, alloc_offset, parallel_runtime) = if io_mode == WalIoMode::Parallel
+        {
+            let (direct_file, alloc_offset) =
+                Self::open_direct_file(path.as_ref()).inspect_err(|_| {
+                    let _ = std::fs::remove_file(path.as_ref());
+                })?;
+            let runtime =
+                Self::try_init_parallel_runtime(&direct_file, alloc_offset).inspect_err(|_| {
+                    let _ = std::fs::remove_file(path.as_ref());
+                })?;
+            (None, direct_file, alloc_offset, Some(runtime))
+        } else {
+            let (ring, direct_file, alloc_offset) = Self::try_init_io_uring(path.as_ref())
+                .inspect_err(|_| {
+                    let _ = std::fs::remove_file(path.as_ref());
+                })?;
+            (Some(Mutex::new(ring)), direct_file, alloc_offset, None)
+        };
 
         // Re-open buffered handle for recovery reads and legacy put().
         let buf_file = File::options()
@@ -1030,10 +1121,11 @@ impl Wal {
             mvcc_format: true,
             format_version: WAL_FORMAT_VERSION_V4,
             io_mode,
+            parallel_runtime,
             is_v3: true,
             direct_file: Some(direct_file),
-            ring: Some(Mutex::new(ring)),
-            direct_buf_pool: Self::new_direct_buf_pool(),
+            ring,
+            direct_buf_pool: Self::new_direct_buf_pool(io_mode == WalIoMode::Leader),
             pending: Mutex::new(Vec::new()),
             next_ticket: AtomicU64::new(0),
             alloc_offset: AtomicU64::new(alloc_offset),
@@ -1071,10 +1163,11 @@ impl Wal {
             mvcc_format: true,
             format_version: header.wal_format_version,
             io_mode: WalIoMode::Leader,
+            parallel_runtime: None,
             is_v3: true,
             direct_file: Some(direct_file),
             ring: Some(Mutex::new(ring)),
-            direct_buf_pool: Self::new_direct_buf_pool(),
+            direct_buf_pool: Self::new_direct_buf_pool(true),
             pending: Mutex::new(Vec::new()),
             next_ticket: AtomicU64::new(0),
             alloc_offset: AtomicU64::new(alloc_offset),
@@ -1108,6 +1201,17 @@ impl Wal {
         crate::pitr::is_v5_family(self.format_version)
     }
 
+    pub(crate) fn is_parallel(&self) -> bool {
+        self.parallel_runtime.is_some()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn parallel_runtime_is_closed(&self) -> Option<bool> {
+        self.parallel_runtime
+            .as_ref()
+            .map(parallel_runtime::ParallelWalRuntime::is_closed)
+    }
+
     #[cfg(test)]
     pub(crate) fn io_mode(&self) -> WalIoMode {
         self.io_mode
@@ -1115,7 +1219,10 @@ impl Wal {
 
     #[cfg(test)]
     pub(crate) fn assigned_ticket_count(&self) -> u64 {
-        self.next_ticket.load(Ordering::Acquire)
+        self.parallel_runtime.as_ref().map_or_else(
+            || self.next_ticket.load(Ordering::Acquire),
+            |runtime| runtime.assigned_ticket_count(),
+        )
     }
 }
 
@@ -1169,12 +1276,22 @@ fn nanos_now() -> u64 {
 
 impl Wal {
     pub(crate) fn logical_length(&self) -> u64 {
-        self.alloc_offset.load(Ordering::Acquire)
+        self.parallel_runtime.as_ref().map_or_else(
+            || self.alloc_offset.load(Ordering::Acquire),
+            |runtime| runtime.logical_length(),
+        )
     }
 
     #[allow(dead_code)]
     pub(crate) fn batch_count(&self) -> u64 {
-        self.next_ticket.load(Ordering::Acquire)
+        self.parallel_runtime.as_ref().map_or_else(
+            || self.next_ticket.load(Ordering::Acquire),
+            |runtime| runtime.batch_count(),
+        )
+    }
+
+    pub(crate) fn is_retryable_full_error(error: &anyhow::Error) -> bool {
+        error.downcast_ref::<parallel_runtime::WalFull>().is_some()
     }
 
     pub(crate) fn pitr_rotation_needed(&self) -> bool {
@@ -2157,11 +2274,6 @@ impl Wal {
         commit_ts: u64,
         profile: Option<&crate::mem_table::WriteProfile>,
     ) -> Result<u64> {
-        anyhow::ensure!(
-            self.io_mode == WalIoMode::Leader,
-            "parallel WAL path is not implemented yet"
-        );
-
         for entry in data {
             let key = entry.key();
             let value = entry.value();
@@ -2249,10 +2361,6 @@ impl Wal {
         commit_ts: u64,
     ) -> Result<u64> {
         anyhow::ensure!(
-            self.io_mode == WalIoMode::Leader,
-            "parallel WAL path is not implemented yet"
-        );
-        anyhow::ensure!(
             self.mvcc_format,
             "range tombstone batches require MVCC WAL format"
         );
@@ -2290,6 +2398,10 @@ impl Wal {
     /// For MVCC WALs: delegates to `submit_and_commit` (io_uring path).
     /// For legacy WALs: flushes and fsyncs the BufWriter directly.
     pub fn sync(&self) -> Result<()> {
+        if let Some(runtime) = &self.parallel_runtime {
+            return runtime.sync();
+        }
+
         if !self.mvcc_format {
             // Legacy path: flush and fsync the BufWriter directly.
             // submit_and_commit() only handles the io_uring path.
@@ -2310,6 +2422,10 @@ impl Wal {
 
     /// Close the WAL, draining any pending buffers and in-flight io_uring SQEs.
     pub fn close(&self) -> Result<()> {
+        if let Some(runtime) = &self.parallel_runtime {
+            return runtime.close();
+        }
+
         // Flush legacy buffered writes before draining io_uring.
         // submit_and_commit() only handles the io_uring path, so buffered
         // data from non-MVCC put() calls would be lost without this flush.
@@ -2366,6 +2482,12 @@ impl Wal {
         ticket: u64,
         profile: Option<&crate::mem_table::WriteProfile>,
     ) -> Result<()> {
+        if let Some(runtime) = &self.parallel_runtime {
+            #[cfg(not(feature = "bench"))]
+            let _ = profile;
+            return runtime.wait_durable(ticket);
+        }
+
         if !self.mvcc_format {
             return self.flush_legacy_wal();
         }

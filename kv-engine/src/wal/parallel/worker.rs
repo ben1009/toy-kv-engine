@@ -1,14 +1,14 @@
 //! Dormant dedicated io_uring writer for the v4 parallel WAL candidate.
 //!
-//! The worker is not connected to [`super::WalIoMode::Parallel`] yet. Slice 5
-//! adds the durability coordinator and wires both pieces into `Wal` together.
+//! Dedicated io_uring writer for the v4 parallel WAL candidate.
 
 use std::{
     collections::{HashMap, VecDeque},
     fs::File,
     io,
+    marker::PhantomData,
     ops::Range,
-    os::fd::AsRawFd,
+    os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
     sync::Arc,
     thread::{self, JoinHandle},
 };
@@ -91,13 +91,30 @@ impl<B> WriteGroup<B> {
     }
 }
 
-trait WorkerBuffer: Send + 'static {
+pub(crate) trait WorkerBuffer: Send + 'static + Sized {
     fn as_ptr(&self) -> *const u8;
+    fn len(&self) -> usize;
+    fn cap(&self) -> usize;
+    fn retire(self, pool: &ArrayQueue<Self>);
 }
 
 impl WorkerBuffer for DirectBuf {
     fn as_ptr(&self) -> *const u8 {
         DirectBuf::as_ptr(self)
+    }
+
+    fn len(&self) -> usize {
+        DirectBuf::len(self)
+    }
+
+    fn cap(&self) -> usize {
+        DirectBuf::cap(self)
+    }
+
+    fn retire(self, pool: &ArrayQueue<Self>) {
+        if self.cap() == BUFFER_POOL_BUF_SIZE {
+            let _ = pool.push(self);
+        }
     }
 }
 
@@ -733,33 +750,124 @@ impl Drop for GroupPermit {
     }
 }
 
-enum WorkerCommand {
+enum WorkerCommand<B = DirectBuf> {
     Group {
         id: GroupId,
-        group: WriteGroup,
+        group: WriteGroup<B>,
         permit: GroupPermit,
     },
     Shutdown(Sender<Result<(), String>>),
 }
 
+/// Wakes the worker when a command arrives while it is waiting for a CQE.
+/// Only the worker reads the eventfd; submitters share its write side.
+struct WorkerWake {
+    fd: OwnedFd,
+}
+
+impl WorkerWake {
+    fn new() -> io::Result<Self> {
+        let fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+
+        // SAFETY: eventfd returned a fresh descriptor, now owned by this value.
+        Ok(Self {
+            fd: unsafe { OwnedFd::from_raw_fd(fd) },
+        })
+    }
+
+    fn signal(&self) -> io::Result<()> {
+        let value = 1_u64;
+        loop {
+            // SAFETY: eventfd requires an eight-byte write; `value` remains
+            // valid for the duration of this call.
+            let written = unsafe {
+                libc::write(
+                    self.fd.as_raw_fd(),
+                    (&value as *const u64).cast(),
+                    std::mem::size_of::<u64>(),
+                )
+            };
+            if written == std::mem::size_of::<u64>() as isize {
+                return Ok(());
+            }
+            if written >= 0 {
+                return Err(io::Error::other("short WAL worker wakeup write"));
+            }
+            let error = io::Error::last_os_error();
+            match error.kind() {
+                io::ErrorKind::Interrupted => continue,
+                io::ErrorKind::WouldBlock => return Ok(()),
+                _ => return Err(error),
+            }
+        }
+    }
+
+    fn drain(&self) -> io::Result<()> {
+        let mut value = 0_u64;
+        loop {
+            // SAFETY: eventfd requires an eight-byte read into live storage.
+            let read = unsafe {
+                libc::read(
+                    self.fd.as_raw_fd(),
+                    (&mut value as *mut u64).cast(),
+                    std::mem::size_of::<u64>(),
+                )
+            };
+            if read == std::mem::size_of::<u64>() as isize {
+                return Ok(());
+            }
+            if read >= 0 {
+                return Err(io::Error::other("short WAL worker wakeup read"));
+            }
+            let error = io::Error::last_os_error();
+            match error.kind() {
+                io::ErrorKind::Interrupted => continue,
+                io::ErrorKind::WouldBlock => return Ok(()),
+                _ => return Err(error),
+            }
+        }
+    }
+}
+
 /// A handle to one dedicated WAL write thread. The thread creates and owns its
 /// registered ring and retains the WAL file until it has reaped all CQEs.
-pub(crate) struct IoWorker {
-    commands: Sender<WorkerCommand>,
+pub(crate) struct IoWorker<B: WorkerBuffer = DirectBuf> {
+    commands: Sender<WorkerCommand<B>>,
     slots: Arc<GroupSlots>,
-    completions: Receiver<GroupWriteResult>,
+    wake: Arc<WorkerWake>,
+    completions: Option<Receiver<GroupWriteResult>>,
     join: Option<JoinHandle<Result<()>>>,
     shutdown_sent: bool,
 }
 
-impl IoWorker {
-    pub(crate) fn spawn(
-        wal_file: Arc<File>,
-        buffer_pool: Arc<ArrayQueue<DirectBuf>>,
-    ) -> Result<Self> {
+/// Cloneable submission handle for the worker. Completion ownership remains
+/// with the WAL durability coordinator.
+pub(crate) struct IoWorkerClient<B: WorkerBuffer> {
+    commands: Sender<WorkerCommand<B>>,
+    slots: Arc<GroupSlots>,
+    wake: Arc<WorkerWake>,
+    marker: PhantomData<fn() -> B>,
+}
+
+impl<B: WorkerBuffer> Clone for IoWorkerClient<B> {
+    fn clone(&self) -> Self {
+        Self {
+            commands: self.commands.clone(),
+            slots: Arc::clone(&self.slots),
+            wake: Arc::clone(&self.wake),
+            marker: PhantomData,
+        }
+    }
+}
+
+impl<B: WorkerBuffer> IoWorker<B> {
+    pub(crate) fn spawn(wal_file: Arc<File>, buffer_pool: Arc<ArrayQueue<B>>) -> Result<Self> {
         let (command_tx, command_rx) = unbounded();
         let (completion_tx, completion_rx) = unbounded();
-        let (startup_tx, startup_rx) = bounded(1);
+        let (startup_tx, startup_rx) = bounded::<Result<()>>(1);
         let slots = Arc::new(GroupSlots {
             state: Mutex::new(SlotState {
                 active_groups: 0,
@@ -770,21 +878,24 @@ impl IoWorker {
         });
         let worker_slots = Arc::clone(&slots);
         let worker_file = Arc::clone(&wal_file);
+        let wake = Arc::new(WorkerWake::new().context("failed to create WAL worker wakeup")?);
+        let worker_wake = Arc::clone(&wake);
         let join = thread::Builder::new()
             .name("wal-io-worker".to_owned())
             .spawn(move || {
                 let mut ring = match io_uring::IoUring::new(RING_SIZE as u32) {
                     Ok(ring) => ring,
                     Err(error) => {
-                        let message = format!("failed to create WAL io_uring: {error}");
-                        let _ = startup_tx.send(Err(message.clone()));
-                        return Err(anyhow!(message));
+                        let _ = startup_tx
+                            .send(Err(anyhow!(error).context("failed to create WAL io_uring")));
+                        return Err(anyhow!("WAL io_uring initialization failed"));
                     }
                 };
                 if let Err(error) = ring.submitter().register_files(&[worker_file.as_raw_fd()]) {
-                    let message = format!("failed to register WAL file with io_uring: {error}");
-                    let _ = startup_tx.send(Err(message.clone()));
-                    return Err(anyhow!(message));
+                    let _ = startup_tx.send(Err(
+                        anyhow!(error).context("failed to register WAL file with io_uring")
+                    ));
+                    return Err(anyhow!("WAL io_uring file registration failed"));
                 }
                 startup_tx
                     .send(Ok(()))
@@ -796,6 +907,7 @@ impl IoWorker {
                     command_rx,
                     completion_tx,
                     worker_slots,
+                    &worker_wake,
                 )
             })
             .context("failed to spawn WAL I/O worker")?;
@@ -807,59 +919,43 @@ impl IoWorker {
             Ok(()) => Ok(Self {
                 commands: command_tx,
                 slots,
-                completions: completion_rx,
+                wake,
+                completions: Some(completion_rx),
                 join: Some(join),
                 shutdown_sent: false,
             }),
-            Err(message) => {
+            Err(error) => {
                 let _ = join.join();
-                bail!("{message}")
+                Err(error).context("failed to start WAL I/O worker")
             }
         }
     }
 
     /// Queue a preallocated group. Backpressure counts queued and in-flight
     /// groups together, not just groups already submitted to the ring.
-    pub(crate) fn submit_group(&self, group: WriteGroup) -> Result<u64> {
-        let tickets = group.tickets.clone();
-        for write in &group.writes {
-            ensure!(
-                write.write_len == write.buffer.len() && write.write_len <= write.buffer.cap(),
-                "WAL write length exceeds its owned DirectBuf"
-            );
+    pub(crate) fn submit_group(&self, group: WriteGroup<B>) -> Result<u64> {
+        self.client().submit_group(group)
+    }
+
+    pub(crate) fn client(&self) -> IoWorkerClient<B> {
+        IoWorkerClient {
+            commands: self.commands.clone(),
+            slots: Arc::clone(&self.slots),
+            wake: Arc::clone(&self.wake),
+            marker: PhantomData,
         }
-        let mut state = self.slots.state.lock();
-        while state.active_groups >= MAX_INFLIGHT_GROUPS && !state.closed {
-            self.slots.available.wait(&mut state);
-        }
-        ensure!(!state.closed, "WAL I/O worker is closed");
-        if let Some(id) = state.next_group_id.checked_add(1) {
-            let group_id = GroupId(state.next_group_id);
-            state.next_group_id = id;
-            state.active_groups += 1;
-            let permit = GroupPermit {
-                slots: Arc::clone(&self.slots),
-            };
-            match self.commands.send(WorkerCommand::Group {
-                id: group_id,
-                group,
-                permit,
-            }) {
-                Ok(()) => Ok(group_id.0),
-                Err(error) => {
-                    drop(state);
-                    drop(error.0);
-                    Err(anyhow!("WAL I/O worker has stopped"))
-                }
-            }
-        } else {
-            Err(anyhow!("WAL I/O group identifier overflow"))
-        }
-        .with_context(|| format!("failed to enqueue WAL group for tickets {tickets:?}"))
+    }
+
+    pub(crate) fn take_completions(&mut self) -> Receiver<GroupWriteResult> {
+        self.completions
+            .take()
+            .expect("WAL worker completions may be transferred only once")
     }
 
     pub(crate) fn completions(&self) -> &Receiver<GroupWriteResult> {
-        &self.completions
+        self.completions
+            .as_ref()
+            .expect("WAL worker completions were transferred")
     }
 
     pub(crate) fn close(mut self) -> Result<()> {
@@ -868,6 +964,7 @@ impl IoWorker {
 
     fn shutdown_and_join(&mut self) -> Result<()> {
         let mut ack_receiver = None;
+        let mut wake_result = Ok(());
         if !self.shutdown_sent {
             let (ack_tx, ack_rx) = bounded(1);
             let mut state = self.slots.state.lock();
@@ -878,6 +975,10 @@ impl IoWorker {
             self.shutdown_sent = true;
             if send_result.is_ok() {
                 ack_receiver = Some(ack_rx);
+                wake_result = self
+                    .wake
+                    .signal()
+                    .context("failed to wake WAL I/O worker for shutdown");
             }
         }
 
@@ -899,11 +1000,62 @@ impl IoWorker {
             None => Ok(()),
         };
 
-        ack_result.and(join_result)
+        wake_result.and(ack_result).and(join_result)
     }
 }
 
-impl Drop for IoWorker {
+impl<B: WorkerBuffer> IoWorkerClient<B> {
+    /// Queue a preallocated group. Backpressure counts queued and in-flight
+    /// groups together, not just groups already submitted to the ring.
+    pub(crate) fn submit_group(&self, group: WriteGroup<B>) -> Result<u64> {
+        let tickets = group.tickets.clone();
+        for write in &group.writes {
+            ensure!(
+                write.write_len == write.buffer.len() && write.write_len <= write.buffer.cap(),
+                "WAL write length exceeds its owned DirectBuf"
+            );
+        }
+        let mut state = self.slots.state.lock();
+        while state.active_groups >= MAX_INFLIGHT_GROUPS && !state.closed {
+            self.slots.available.wait(&mut state);
+        }
+        ensure!(!state.closed, "WAL I/O worker is closed");
+        if let Some(id) = state.next_group_id.checked_add(1) {
+            let group_id = GroupId(state.next_group_id);
+            state.next_group_id = id;
+            state.active_groups += 1;
+            let permit = GroupPermit {
+                slots: Arc::clone(&self.slots),
+            };
+            let send_result = self.commands.send(WorkerCommand::Group {
+                id: group_id,
+                group,
+                permit,
+            });
+            drop(state);
+            match send_result {
+                Ok(()) => {
+                    // The group is already owned by the worker. A wakeup
+                    // failure cannot be reported as failed admission; the
+                    // bounded poll timeout still drains the queue.
+                    if let Err(error) = self.wake.signal() {
+                        log::error!("failed to wake WAL I/O worker: {error}");
+                    }
+                    Ok(group_id.0)
+                }
+                Err(error) => {
+                    drop(error.0);
+                    Err(anyhow!("WAL I/O worker has stopped"))
+                }
+            }
+        } else {
+            Err(anyhow!("WAL I/O group identifier overflow"))
+        }
+        .with_context(|| format!("failed to enqueue WAL group for tickets {tickets:?}"))
+    }
+}
+
+impl<B: WorkerBuffer> Drop for IoWorker<B> {
     fn drop(&mut self) {
         if self.join.is_some()
             && let Err(error) = self.shutdown_and_join()
@@ -913,14 +1065,15 @@ impl Drop for IoWorker {
     }
 }
 
-fn run_worker(
+fn run_worker<B: WorkerBuffer>(
     ring: &mut io_uring::IoUring,
-    buffer_pool: Arc<ArrayQueue<DirectBuf>>,
-    commands: Receiver<WorkerCommand>,
+    buffer_pool: Arc<ArrayQueue<B>>,
+    commands: Receiver<WorkerCommand<B>>,
     completions: Sender<GroupWriteResult>,
     slots: Arc<GroupSlots>,
+    wake: &WorkerWake,
 ) -> Result<()> {
-    let mut core = WorkerCore::<DirectBuf>::new();
+    let mut core = WorkerCore::<B>::new();
     let mut group_permits = HashMap::<GroupId, GroupPermit>::new();
     let mut ring_staged = VecDeque::<RequestId>::new();
     let mut shutdown_reply = None;
@@ -932,6 +1085,7 @@ fn run_worker(
         &commands,
         &completions,
         &slots,
+        wake,
         &mut core,
         &mut group_permits,
         &mut ring_staged,
@@ -974,13 +1128,14 @@ fn run_worker(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn run_worker_loop(
+fn run_worker_loop<B: WorkerBuffer>(
     ring: &mut io_uring::IoUring,
-    buffer_pool: &ArrayQueue<DirectBuf>,
-    commands: &Receiver<WorkerCommand>,
+    buffer_pool: &ArrayQueue<B>,
+    commands: &Receiver<WorkerCommand<B>>,
     completions: &Sender<GroupWriteResult>,
     slots: &GroupSlots,
-    core: &mut WorkerCore<DirectBuf>,
+    wake: &WorkerWake,
+    core: &mut WorkerCore<B>,
     group_permits: &mut HashMap<GroupId, GroupPermit>,
     ring_staged: &mut VecDeque<RequestId>,
     shutdown_reply: &mut Option<Sender<Result<(), String>>>,
@@ -1067,26 +1222,15 @@ fn run_worker_loop(
                 }
                 Err(_) => *stopping = true,
             }
+            wake.drain().context("failed to drain WAL worker wakeup")?;
             continue;
         }
 
         if completion_count == 0 && core.outstanding_sqe_count() > 0 && ring_staged.is_empty() {
-            // Keep submission and waiting separate. `submit_and_wait` can
-            // submit SQEs before its wait is interrupted; retrying that call
-            // would lose the first call's submission count and misalign
-            // `ring_staged` with the kernel-owned requests.
-            wait_for_completion(ring_staged, core.outstanding_sqe_count(), || {
-                ring.submit_and_wait(1)
-            })?;
-            let completed = drain_completions(ring);
-            process_completions(
-                completed,
-                core,
-                buffer_pool,
-                group_permits,
-                completions,
-                slots,
-            )?;
+            // Wake on either a later group or a CQE. Waiting only for a CQE
+            // would serialize a group admitted after this wait begins.
+            wait_for_worker_progress(ring.as_raw_fd(), wake)
+                .context("failed while waiting for WAL I/O progress")?;
         }
     }
 }
@@ -1162,25 +1306,42 @@ fn submit_staged_writes<B: WorkerBuffer>(
     Ok(submitted)
 }
 
-fn wait_for_completion(
-    staged: &VecDeque<RequestId>,
-    outstanding_sqe_count: usize,
-    wait: impl FnMut() -> io::Result<usize>,
-) -> Result<()> {
-    if outstanding_sqe_count == 0 {
-        return Ok(());
+fn wait_for_worker_progress(ring_fd: RawFd, wake: &WorkerWake) -> io::Result<bool> {
+    let mut fds = [
+        libc::pollfd {
+            fd: ring_fd,
+            events: libc::POLLIN,
+            revents: 0,
+        },
+        libc::pollfd {
+            fd: wake.fd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        },
+    ];
+    loop {
+        // A timeout is only a fallback if eventfd signaling fails after a
+        // command was queued; normal progress is driven by readiness.
+        let ready = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, 1000) };
+        if ready >= 0 {
+            break;
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
     }
-    ensure!(
-        staged.is_empty(),
-        "cannot wait for a completion while WAL writes remain unaccounted"
-    );
-    let submitted =
-        retry_interrupted(wait).context("failed while waiting for a WAL write completion")?;
-    ensure!(
-        submitted == 0,
-        "completion wait unexpectedly submitted untracked WAL writes"
-    );
-    Ok(())
+    if fds
+        .iter()
+        .any(|fd| fd.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0)
+    {
+        return Err(io::Error::other("WAL worker progress fd failed"));
+    }
+    let command_ready = fds[1].revents & libc::POLLIN != 0;
+    if command_ready {
+        wake.drain()?;
+    }
+    Ok(command_ready)
 }
 
 fn mark_submitted_prefix<B: WorkerBuffer>(
@@ -1209,10 +1370,10 @@ fn drain_completions(ring: &mut io_uring::IoUring) -> Vec<(u64, i32)> {
         .collect()
 }
 
-fn process_completions(
+fn process_completions<B: WorkerBuffer>(
     completed: Vec<(u64, i32)>,
-    core: &mut WorkerCore<DirectBuf>,
-    buffer_pool: &ArrayQueue<DirectBuf>,
+    core: &mut WorkerCore<B>,
+    buffer_pool: &ArrayQueue<B>,
     group_permits: &mut HashMap<GroupId, GroupPermit>,
     completion_tx: &Sender<GroupWriteResult>,
     slots: &GroupSlots,
@@ -1231,18 +1392,16 @@ fn process_completions(
     Ok(())
 }
 
-fn process_worker_events(
-    events: Vec<WorkerEvent<DirectBuf>>,
-    buffer_pool: &ArrayQueue<DirectBuf>,
+fn process_worker_events<B: WorkerBuffer>(
+    events: Vec<WorkerEvent<B>>,
+    buffer_pool: &ArrayQueue<B>,
     group_permits: &mut HashMap<GroupId, GroupPermit>,
     completion_tx: &Sender<GroupWriteResult>,
 ) {
     for event in events {
         match event {
             WorkerEvent::BufferRetired(buffer) => {
-                if buffer.cap() == BUFFER_POOL_BUF_SIZE {
-                    let _ = buffer_pool.push(buffer);
-                }
+                buffer.retire(buffer_pool);
             }
             WorkerEvent::GroupFinished(result) => {
                 group_permits.remove(&GroupId(result.group_id));
@@ -1273,14 +1432,23 @@ mod tests {
         Arc,
         atomic::{AtomicUsize, Ordering},
     };
-    use std::{fs::File, os::unix::fs::OpenOptionsExt, thread, time::Duration};
+    use std::{
+        fs::File,
+        os::{
+            fd::AsRawFd,
+            unix::{fs::OpenOptionsExt, net::UnixStream},
+        },
+        thread,
+        time::Duration,
+    };
 
     use super::{
         DirectBuf, GroupId, GroupPermit, GroupSlots, GroupWriteResult, IoWorker, RequestId,
-        SlotState, WorkerCommand, WorkerCore, WorkerError, WorkerEvent, WriteBuffer, WriteGroup,
-        close_group_admission, enqueue_group_command, fail_shutdown_reply, flush_staged_writes,
-        retry_interrupted, submit_staged_writes, wait_for_completion,
+        SlotState, WorkerCommand, WorkerCore, WorkerError, WorkerEvent, WorkerWake, WriteBuffer,
+        WriteGroup, close_group_admission, enqueue_group_command, fail_shutdown_reply,
+        flush_staged_writes, retry_interrupted, wait_for_worker_progress,
     };
+    use crossbeam_queue::ArrayQueue;
     use parking_lot::{Condvar, Mutex};
 
     struct DropProbe {
@@ -1301,6 +1469,16 @@ mod tests {
         fn as_ptr(&self) -> *const u8 {
             self.bytes.as_ptr()
         }
+
+        fn len(&self) -> usize {
+            self.bytes.len()
+        }
+
+        fn cap(&self) -> usize {
+            self.bytes.len()
+        }
+
+        fn retire(self, _pool: &ArrayQueue<Self>) {}
     }
 
     impl Drop for DropProbe {
@@ -1371,13 +1549,12 @@ mod tests {
     }
 
     fn io_uring_unavailable(error: &anyhow::Error) -> bool {
-        [
-            "Operation not permitted",
-            "Cannot allocate memory",
-            "Function not implemented",
-        ]
-        .iter()
-        .any(|message| error.to_string().contains(message))
+        error.chain().any(|cause| {
+            cause
+                .downcast_ref::<std::io::Error>()
+                .and_then(|error| error.raw_os_error())
+                .is_some_and(|code| matches!(code, libc::EPERM | libc::ENOMEM | libc::ENOSYS))
+        })
     }
 
     #[test]
@@ -1813,46 +1990,46 @@ mod tests {
     }
 
     #[test]
-    fn interrupted_wait_preserves_accounted_submission_and_completes_group() {
+    fn later_group_wakes_worker_before_earlier_write_completes() {
         let drops = Arc::new(AtomicUsize::new(0));
         let mut core = WorkerCore::new();
         core.enqueue(make_group(0..1, 4096, 1, 4096, &drops))
             .expect("enqueue group");
-        let submissions = core.stage_writes(1).expect("stage write");
-        let request_id = submissions[0].request_id;
-        let mut ring_staged = submissions
-            .into_iter()
-            .map(|submission| submission.request_id)
-            .collect::<std::collections::VecDeque<_>>();
-
-        let submitted = submit_staged_writes(&mut ring_staged, &mut core, || Ok(1))
-            .expect("account successful submission");
-        assert_eq!(submitted, 1);
-        assert!(ring_staged.is_empty());
+        let first = submitted_ids(&mut core, 1);
         assert_eq!(core.outstanding_sqe_count(), 1);
-        assert_eq!(core.writes[&request_id].state, super::WriteState::Submitted);
 
-        let mut wait_attempts = 0;
-        wait_for_completion(&ring_staged, core.outstanding_sqe_count(), || {
-            wait_attempts += 1;
-            if wait_attempts == 1 {
-                Err(std::io::Error::from(std::io::ErrorKind::Interrupted))
-            } else {
-                Ok(0)
-            }
-        })
-        .expect("retry interrupted wait without resubmitting writes");
-        assert_eq!(wait_attempts, 2);
-        assert_eq!(core.outstanding_sqe_count(), 1);
-        assert_eq!(core.writes[&request_id].state, super::WriteState::Submitted);
+        // The fake CQ descriptor is never written: only the later group may
+        // wake the worker, while the first write remains outstanding.
+        let (fake_cq, _peer) = UnixStream::pair().expect("fake CQ socket");
+        let wake = Arc::new(WorkerWake::new().expect("eventfd"));
+        let (group_tx, group_rx) = crossbeam_channel::unbounded();
+        let producer_wake = Arc::clone(&wake);
+        let producer_drops = Arc::clone(&drops);
+        let producer = thread::spawn(move || {
+            group_tx
+                .send(make_group(1..2, 8192, 1, 4096, &producer_drops))
+                .expect("enqueue later group");
+            producer_wake.signal().expect("signal worker");
+        });
 
-        let result = take_group_result(
-            core.complete_write(request_id, 4096)
-                .expect("deliver write completion"),
+        assert!(wait_for_worker_progress(fake_cq.as_raw_fd(), &wake).expect("worker wakes"));
+        producer.join().expect("producer joins");
+        core.enqueue(group_rx.try_recv().expect("later group queued"))
+            .expect("worker accepts later group");
+        let second = submitted_ids(&mut core, 1);
+        assert_eq!(core.inflight_group_count(), 2);
+        assert_eq!(core.outstanding_sqe_count(), 2);
+
+        drop(
+            core.complete_write(second[0], 4096)
+                .expect("later write CQE"),
         );
-        assert_eq!(result.error, None);
+        drop(
+            core.complete_write(first[0], 4096)
+                .expect("earlier write CQE"),
+        );
         assert!(core.is_idle());
-        assert_eq!(drops.load(Ordering::Acquire), 1);
+        assert_eq!(drops.load(Ordering::Acquire), 2);
     }
 
     #[test]
@@ -1887,10 +2064,11 @@ mod tests {
             available: Condvar::new(),
         });
         let (_completion_tx, completions) = crossbeam_channel::unbounded();
-        let mut worker = IoWorker {
+        let mut worker: IoWorker<DirectBuf> = IoWorker {
             commands: command_tx,
             slots,
-            completions,
+            wake: Arc::new(WorkerWake::new().expect("eventfd")),
+            completions: Some(completions),
             join: Some(join),
             shutdown_sent: false,
         };
