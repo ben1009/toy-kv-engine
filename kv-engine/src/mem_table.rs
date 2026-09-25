@@ -23,7 +23,7 @@ use crate::{
     },
     table::{SsTableBuilder, bloom::IncrementalBloom},
     vlog::{KvKind, ValueLog, ValuePointer},
-    wal::Wal,
+    wal::{Wal, WalIoMode},
 };
 
 /// Expected number of entries per memtable for bloom filter sizing.
@@ -77,6 +77,18 @@ pub struct WriteProfile {
     pub wal_cqe_reap_ns: AtomicU64,
     /// Completion events reaped, to check against the buffers submitted.
     pub wal_cqe_count: AtomicU64,
+    /// Maximum write groups outstanding at once in the software pipeline.
+    pub wal_inflight_groups_max: AtomicU64,
+    /// Maximum submitted write SQEs whose CQEs had not yet been consumed.
+    /// This is a software metric, not the block device queue depth.
+    pub wal_outstanding_write_sqes_max: AtomicU64,
+    /// Number of fdatasync attempts and total groups covered by those syncs.
+    pub wal_sync_count: AtomicU64,
+    pub wal_sync_groups_total: AtomicU64,
+    /// Number of times a dedicated WAL worker was woken for queued work.
+    pub wal_worker_wakeups: AtomicU64,
+    /// Time spent extending WAL preallocation, kept separate from write time.
+    pub wal_preallocation_ns: AtomicU64,
     /// Time from the previous group releasing `submitting` to the next leader
     /// entering the commit path, wake-up included.
     ///
@@ -163,6 +175,12 @@ impl WriteProfile {
         self.wal_uring_enter_ns.store(0, o);
         self.wal_cqe_reap_ns.store(0, o);
         self.wal_cqe_count.store(0, o);
+        self.wal_inflight_groups_max.store(0, o);
+        self.wal_outstanding_write_sqes_max.store(0, o);
+        self.wal_sync_count.store(0, o);
+        self.wal_sync_groups_total.store(0, o);
+        self.wal_worker_wakeups.store(0, o);
+        self.wal_preallocation_ns.store(0, o);
         self.wal_group_gap_ns.store(0, o);
         self.wal_leader_prepare_ns.store(0, o);
         self.wal_fdatasync_ns.store(0, o);
@@ -210,6 +228,12 @@ impl WriteProfile {
             wal_uring_enter_ns: self.wal_uring_enter_ns.load(o),
             wal_cqe_reap_ns: self.wal_cqe_reap_ns.load(o),
             wal_cqe_count: self.wal_cqe_count.load(o),
+            wal_inflight_groups_max: self.wal_inflight_groups_max.load(o),
+            wal_outstanding_write_sqes_max: self.wal_outstanding_write_sqes_max.load(o),
+            wal_sync_count: self.wal_sync_count.load(o),
+            wal_sync_groups_total: self.wal_sync_groups_total.load(o),
+            wal_worker_wakeups: self.wal_worker_wakeups.load(o),
+            wal_preallocation_ns: self.wal_preallocation_ns.load(o),
             wal_group_gap_ns: self.wal_group_gap_ns.load(o),
             wal_leader_prepare_ns: self.wal_leader_prepare_ns.load(o),
             wal_fdatasync_ns: self.wal_fdatasync_ns.load(o),
@@ -307,6 +331,38 @@ impl WriteProfile {
     pub(crate) fn record_wal_cqe_count(&self, cqes: u64) {
         self.wal_cqe_count
             .fetch_add(cqes, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn record_wal_inflight_groups(&self, groups: u64) {
+        self.wal_inflight_groups_max
+            .fetch_max(groups, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn record_wal_outstanding_write_sqes(&self, sqes: u64) {
+        self.wal_outstanding_write_sqes_max
+            .fetch_max(sqes, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn record_wal_sync(&self, groups: u64) {
+        let o = std::sync::atomic::Ordering::Relaxed;
+        self.wal_sync_count.fetch_add(1, o);
+        self.wal_sync_groups_total.fetch_add(groups, o);
+    }
+
+    #[cfg(feature = "bench")]
+    #[allow(dead_code)] // Wired when the dedicated worker is added in a later slice.
+    pub(crate) fn record_wal_worker_wakeup(&self) {
+        self.wal_worker_wakeups
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn record_wal_preallocation_ns(&self, nanos: u64) {
+        self.wal_preallocation_ns
+            .fetch_add(nanos, std::sync::atomic::Ordering::Relaxed);
     }
 
     #[cfg(feature = "bench")]
@@ -428,6 +484,12 @@ pub struct WriteProfileSnapshot {
     pub wal_uring_enter_ns: u64,
     pub wal_cqe_reap_ns: u64,
     pub wal_cqe_count: u64,
+    pub wal_inflight_groups_max: u64,
+    pub wal_outstanding_write_sqes_max: u64,
+    pub wal_sync_count: u64,
+    pub wal_sync_groups_total: u64,
+    pub wal_worker_wakeups: u64,
+    pub wal_preallocation_ns: u64,
     pub wal_group_gap_ns: u64,
     pub wal_leader_prepare_ns: u64,
     pub wal_fdatasync_ns: u64,
@@ -486,6 +548,18 @@ impl WriteProfileSnapshot {
                 .saturating_sub(before.wal_uring_enter_ns),
             wal_cqe_reap_ns: self.wal_cqe_reap_ns.saturating_sub(before.wal_cqe_reap_ns),
             wal_cqe_count: self.wal_cqe_count.saturating_sub(before.wal_cqe_count),
+            wal_inflight_groups_max: self.wal_inflight_groups_max,
+            wal_outstanding_write_sqes_max: self.wal_outstanding_write_sqes_max,
+            wal_sync_count: self.wal_sync_count.saturating_sub(before.wal_sync_count),
+            wal_sync_groups_total: self
+                .wal_sync_groups_total
+                .saturating_sub(before.wal_sync_groups_total),
+            wal_worker_wakeups: self
+                .wal_worker_wakeups
+                .saturating_sub(before.wal_worker_wakeups),
+            wal_preallocation_ns: self
+                .wal_preallocation_ns
+                .saturating_sub(before.wal_preallocation_ns),
             wal_group_gap_ns: self
                 .wal_group_gap_ns
                 .saturating_sub(before.wal_group_gap_ns),
@@ -711,6 +785,9 @@ impl WriteProfileSnapshot {
              wal_submit:   {:>8.2} ms\n  \
              submit_parts: ring_lock={:>7.2} ms  sqe_fill={:>7.2} ms  uring_enter={:>7.2} ms  cqe_reap={:>7.2} ms\n  \
              cqe_count:    {:>7}  (clean run: equal to commit buffers)\n  \
+             pipeline_peak: groups={} outstanding_write_sqes={} (software depth; not device queue depth)\n  \
+             syncs:        count={} groups={} avg_groups={:.2} worker_wakeups={}\n  \
+             preallocation:{:>8.2} ms\n  \
              group_gap:    {:>8.2} ms  (previous release -> next leader enters; includes idle)\n  \
              leader_prep:  {:>8.2} ms  (enter -> first SQE: drain, peer spin, accounting)\n  \
              fdatasync:    {:>8.2} ms\n  \
@@ -748,6 +825,17 @@ impl WriteProfileSnapshot {
             self.wal_uring_enter_ms(),
             self.wal_cqe_reap_ms(),
             self.wal_cqe_count,
+            self.wal_inflight_groups_max,
+            self.wal_outstanding_write_sqes_max,
+            self.wal_sync_count,
+            self.wal_sync_groups_total,
+            if self.wal_sync_count == 0 {
+                0.0
+            } else {
+                self.wal_sync_groups_total as f64 / self.wal_sync_count as f64
+            },
+            self.wal_worker_wakeups,
+            self.wal_preallocation_ns as f64 / 1_000_000.0,
             self.wal_group_gap_ms(),
             self.wal_leader_prepare_ms(),
             self.wal_fdatasync_ms(),
@@ -930,9 +1018,18 @@ impl MemTable {
 
     /// Create a new mem-table with WAL.
     pub fn create_with_wal(id: usize, vlog_enabled: bool, path: impl AsRef<Path>) -> Result<Self> {
+        Self::create_with_wal_and_mode(id, vlog_enabled, path, WalIoMode::Leader)
+    }
+
+    pub(crate) fn create_with_wal_and_mode(
+        id: usize,
+        vlog_enabled: bool,
+        path: impl AsRef<Path>,
+        io_mode: WalIoMode,
+    ) -> Result<Self> {
         let mut ret = Self::create(id, vlog_enabled);
         let path = path.as_ref().to_path_buf();
-        ret.wal = Some(Wal::create(&path)?);
+        ret.wal = Some(Wal::create_with_io_mode(&path, io_mode)?);
         ret.wal_path = Some(path);
 
         Ok(ret)
@@ -994,10 +1091,28 @@ impl MemTable {
         vlog_enabled: bool,
         path: impl AsRef<Path>,
     ) -> Result<(Self, u64)> {
+        Self::recover_from_wal_with_range_tombstones_and_mode(
+            id,
+            vlog_enabled,
+            path,
+            WalIoMode::Leader,
+        )
+    }
+
+    pub(crate) fn recover_from_wal_with_range_tombstones_and_mode(
+        id: usize,
+        vlog_enabled: bool,
+        path: impl AsRef<Path>,
+        io_mode: WalIoMode,
+    ) -> Result<(Self, u64)> {
         let path = path.as_ref().to_path_buf();
         let mut ret = Self::create(id, vlog_enabled);
-        let (wal, batch) =
-            Wal::recover_with_range_tombstones(&path, &ret.map, &ret.range_tombstones)?;
+        let (wal, batch) = Wal::recover_with_range_tombstones_and_mode(
+            &path,
+            &ret.map,
+            &ret.range_tombstones,
+            io_mode,
+        )?;
         ret.wal = Some(wal);
         ret.wal_path = Some(path);
         ret.recovered_recorded_at = batch.max_recorded_at;

@@ -453,6 +453,7 @@ struct RecoveryPlan {
     max_commit_ts: u64,
     max_recorded_at: Option<crate::pitr::RecordedAt>,
     options: LsmStorageOptions,
+    wal_io_mode: crate::wal::WalIoMode,
     compaction_controller: CompactionController,
     pitr_state: crate::pitr::manifest::PitrState,
     /// The newest segment the database has on disk, measured at recovery. The
@@ -1560,6 +1561,7 @@ pub(crate) struct LsmStorageInner {
     pub(crate) block_cache: Arc<BlockCache>,
     next_sst_id: AtomicUsize,
     pub(crate) options: Arc<LsmStorageOptions>,
+    wal_io_mode: crate::wal::WalIoMode,
     pub(crate) compaction_controller: CompactionController,
     pub(crate) pitr_state: Mutex<crate::pitr::manifest::PitrState>,
     pub(crate) pitr_next_segment_id: AtomicU64,
@@ -2218,7 +2220,21 @@ impl KvEngine {
     /// Start the storage engine by either loading an existing directory or creating a new one if
     /// the directory does not exist.
     pub fn open(path: impl AsRef<Path>, options: LsmStorageOptions) -> Result<Arc<Self>> {
-        Ok(Self::open_inner(path, options, false)?.0)
+        Self::open_with_wal_io_mode(path, options, crate::wal::WalIoMode::Leader)
+    }
+
+    /// Open an engine with a selected WAL I/O path.
+    ///
+    /// This hidden selector is used by `write-perf` to compare paths in one
+    /// binary. The parallel path is currently dormant and rejects v4 writes
+    /// before ticket assignment. Legacy and PITR WALs retain their old path.
+    #[doc(hidden)]
+    pub fn open_with_wal_io_mode(
+        path: impl AsRef<Path>,
+        options: LsmStorageOptions,
+        wal_io_mode: crate::wal::WalIoMode,
+    ) -> Result<Arc<Self>> {
+        Ok(Self::open_inner(path, options, false, wal_io_mode)?.0)
     }
 
     /// Open a database that lists an immutable memtable whose WAL is missing,
@@ -2240,18 +2256,19 @@ impl KvEngine {
             options.enable_wal,
             "repairing requires enable_wal: a database opened without WAL does not recover memtables"
         );
-        Self::open_inner(path, options, true)
+        Self::open_inner(path, options, true, crate::wal::WalIoMode::Leader)
     }
 
     fn open_inner(
         path: impl AsRef<Path>,
         options: LsmStorageOptions,
         repair_unrecoverable: bool,
+        wal_io_mode: crate::wal::WalIoMode,
     ) -> Result<(Arc<Self>, Vec<usize>)> {
         let inner = Arc::new(if repair_unrecoverable {
-            LsmStorageInner::open_with_repair(path, options, true)?
+            LsmStorageInner::open_with_repair_and_wal_io_mode(path, options, true, wal_io_mode)?
         } else {
-            LsmStorageInner::open(path, options)?
+            LsmStorageInner::open_with_wal_io_mode(path, options, wal_io_mode)?
         });
         let repaired_memtable_ids = inner.repaired_memtable_ids.clone();
         // Set the weak self-reference so background threads (e.g., async GC) can
@@ -4974,9 +4991,11 @@ impl KvEngine {
         // Phase 1: sequential recovery (manifest replay + WAL) on a blocking thread.
         let plan = {
             let p = path_buf.clone();
-            tokio::task::spawn_blocking(move || LsmStorageInner::recover_phase1(&p, options, false))
-                .await
-                .expect("recovery phase 1 panicked")?
+            tokio::task::spawn_blocking(move || {
+                LsmStorageInner::recover_phase1(&p, options, false, crate::wal::WalIoMode::Leader)
+            })
+            .await
+            .expect("recovery phase 1 panicked")?
         };
 
         // Phase 2: open SSTs concurrently. Each SST read is independent.
@@ -6323,6 +6342,7 @@ impl LsmStorageInner {
         path: &Path,
         options: LsmStorageOptions,
         repair_unrecoverable: bool,
+        wal_io_mode: crate::wal::WalIoMode,
     ) -> Result<RecoveryPlan> {
         options.prefix_bloom.validate()?;
         let vlog_enabled = options
@@ -6400,7 +6420,12 @@ impl LsmStorageInner {
                 // means the manifest was lost rather than never written, and must
                 // be left alone for recovery.
                 Self::discard_header_only_wal(&wal_path)?;
-                state.memtable = Arc::new(MemTable::create_with_wal(id, vlog_enabled, wal_path)?)
+                state.memtable = Arc::new(MemTable::create_with_wal_and_mode(
+                    id,
+                    vlog_enabled,
+                    wal_path,
+                    wal_io_mode,
+                )?)
             } else {
                 state.memtable = Arc::new(MemTable::create(state.memtable.id(), vlog_enabled));
             }
@@ -6762,11 +6787,13 @@ impl LsmStorageInner {
                             .ok_or_else(|| anyhow!("missing WAL for immutable memtable {id}"))?;
                         (path, Some(segment_id))
                     };
-                    let (m, wal_max_ts) = MemTable::recover_from_wal_with_range_tombstones(
-                        id,
-                        vlog_enabled,
-                        wal_path,
-                    )?;
+                    let (m, wal_max_ts) =
+                        MemTable::recover_from_wal_with_range_tombstones_and_mode(
+                            id,
+                            vlog_enabled,
+                            wal_path,
+                            wal_io_mode,
+                        )?;
                     if wal_max_ts > max_commit_ts {
                         max_commit_ts = wal_max_ts;
                     }
@@ -6867,11 +6894,13 @@ impl LsmStorageInner {
                                 .is_some_and(|epoch| header.archive_epoch_id.0 == epoch),
                         "active PITR WAL identity does not match persisted state"
                     );
-                    let (memtable, wal_max_ts) = MemTable::recover_from_wal_with_range_tombstones(
-                        max_id,
-                        vlog_enabled,
-                        wal_path,
-                    )?;
+                    let (memtable, wal_max_ts) =
+                        MemTable::recover_from_wal_with_range_tombstones_and_mode(
+                            max_id,
+                            vlog_enabled,
+                            wal_path,
+                            wal_io_mode,
+                        )?;
                     max_commit_ts = max_commit_ts.max(wal_max_ts);
                     if let Some(current) = memtable.recovered_recorded_at() {
                         max_recorded_at =
@@ -6915,6 +6944,7 @@ impl LsmStorageInner {
             max_commit_ts,
             max_recorded_at,
             options,
+            wal_io_mode,
             compaction_controller,
             pitr_state,
             recovered_pitr_segment_id,
@@ -7189,10 +7219,11 @@ impl LsmStorageInner {
                     )?)
                 } else {
                     Self::discard_header_only_wal(&wal_path)?;
-                    Arc::new(MemTable::create_with_wal(
+                    Arc::new(MemTable::create_with_wal_and_mode(
                         plan.max_id,
                         vlog_enabled,
                         wal_path,
+                        plan.wal_io_mode,
                     )?)
                 };
                 plan.manifest
@@ -7265,6 +7296,7 @@ impl LsmStorageInner {
             repaired_memtable_ids: plan.repaired_memtable_ids,
             manifest: Some(plan.manifest),
             options: plan.options.into(),
+            wal_io_mode: plan.wal_io_mode,
             mvcc: Some(Arc::new(LsmMvccInner::new(plan.max_commit_ts))),
             reserved_ssts: Mutex::new(HashSet::new()),
             compaction_filters: Mutex::new(CompactionFilterRegistry {
@@ -7325,21 +7357,27 @@ impl LsmStorageInner {
 
     /// Start the storage engine by either loading an existing directory or creating a new one if
     /// the directory does not exist.
+    #[cfg(test)]
     pub(crate) fn open(path: impl AsRef<Path>, options: LsmStorageOptions) -> Result<Self> {
-        Self::open_with_repair(path, options, false)
+        Self::open_with_wal_io_mode(path, options, crate::wal::WalIoMode::Leader)
     }
 
-    /// Open, dropping immutable memtables whose WAL is missing instead of
-    /// refusing to open. Such a memtable cannot be recovered from anything else,
-    /// so its data is already gone and refusing preserves nothing; the dropped
-    /// ids are logged and reported through [`Self::repaired_memtable_ids`].
-    pub(crate) fn open_with_repair(
+    pub(crate) fn open_with_wal_io_mode(
+        path: impl AsRef<Path>,
+        options: LsmStorageOptions,
+        wal_io_mode: crate::wal::WalIoMode,
+    ) -> Result<Self> {
+        Self::open_with_repair_and_wal_io_mode(path, options, false, wal_io_mode)
+    }
+
+    pub(crate) fn open_with_repair_and_wal_io_mode(
         path: impl AsRef<Path>,
         options: LsmStorageOptions,
         repair_unrecoverable: bool,
+        wal_io_mode: crate::wal::WalIoMode,
     ) -> Result<Self> {
         let path = path.as_ref();
-        let plan = Self::recover_phase1(path, options, repair_unrecoverable)?;
+        let plan = Self::recover_phase1(path, options, repair_unrecoverable, wal_io_mode)?;
 
         // Open SSTs sequentially (sync path — identical to prior behaviour).
         let mut ssts = HashMap::with_capacity(plan.sst_ids.len());
@@ -11222,10 +11260,11 @@ impl LsmStorageInner {
                     },
                 )?
             } else {
-                mem_table::MemTable::create_with_wal(
+                mem_table::MemTable::create_with_wal_and_mode(
                     sst_id,
                     vlog_enabled,
                     self.path_of_wal(sst_id),
+                    self.wal_io_mode,
                 )?
             }
         } else {
@@ -11309,10 +11348,11 @@ impl LsmStorageInner {
         ensure!(self.options.enable_wal, "PITR disable requires WAL");
         let state_lock = self.state_lock.lock();
         let sst_id = self.next_sst_id();
-        let memtable = mem_table::MemTable::create_with_wal(
+        let memtable = mem_table::MemTable::create_with_wal_and_mode(
             sst_id,
             self.vlog.is_some(),
             self.path_of_wal(sst_id),
+            self.wal_io_mode,
         )?;
         memtable.set_write_profile(self.write_profile.clone());
         let active_guard = self.active_memtable_lock.write();
