@@ -19,6 +19,9 @@ use sha2::{Digest, Sha256};
 
 use crate::{key::KeySlice, range_tombstone::RangeTombstone};
 
+#[cfg(test)]
+mod parallel;
+
 /// Result of recovering a WAL file, containing both point entries and range tombstones.
 pub struct RecoveredWalBatch {
     /// Point key-value entries recovered from the WAL.
