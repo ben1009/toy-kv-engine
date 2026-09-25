@@ -928,26 +928,55 @@ mod tests {
     }
 
     #[test]
-    fn blocked_worker_preallocation_state_does_not_block_producer_admission() {
+    fn producer_admission_proceeds_while_worker_preallocates_packed_group() {
         let controller = Arc::new(AdmissionController::new());
-        let prepared = reserve(&controller, 64);
-        // Holding this worker-side lock models a slow fallocate/ftruncate call.
-        let preallocation_guard = controller.packer.lock();
-        let (sender, receiver) = mpsc::channel();
+        let first = reserve(&controller, 64);
+        assert_eq!(controller.admit(first), Ok(0));
+        let group = controller
+            .pack_next_group(1)
+            .expect("pack group before preallocation")
+            .expect("first batch queued");
+
+        // Pause the worker after it reserves the file range and before its
+        // fallocate/ftruncate completion advances the preallocation watermark.
+        let (started_sender, started_receiver) = mpsc::channel();
+        let (resume_sender, resume_receiver) = mpsc::channel();
         let writer_controller = Arc::clone(&controller);
+        let preallocation_end = group.preallocation_end;
+        let preallocator = thread::spawn(move || {
+            started_sender.send(()).expect("signal preallocation start");
+            resume_receiver
+                .recv()
+                .expect("resume simulated preallocation");
+            writer_controller
+                .mark_preallocated(WAL_HEADER_END..preallocation_end)
+                .expect("complete simulated preallocation");
+        });
+        started_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("worker entered preallocation interval");
+
+        let later = reserve(&controller, 64);
+        let (sender, receiver) = mpsc::channel();
+        let admission_controller = Arc::clone(&controller);
         let writer = thread::spawn(move || {
             sender
-                .send(writer_controller.admit(prepared))
+                .send(admission_controller.admit(later))
                 .expect("send admission result");
         });
-
         let result = receiver.recv_timeout(Duration::from_secs(1));
-        drop(preallocation_guard);
+
+        resume_sender.send(()).expect("resume worker");
+        preallocator.join().expect("join preallocation worker");
         writer.join().expect("join admission writer");
         assert_eq!(
-            result.expect("admission must not wait for preallocation"),
-            Ok(0)
+            result.expect("admission must proceed during preallocation"),
+            Ok(1)
         );
+
+        retire_group(&controller, group);
+        let later_group = pack(&controller, 1);
+        retire_group(&controller, later_group);
     }
 
     #[test]
