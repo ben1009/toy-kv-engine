@@ -114,12 +114,15 @@ ticket whose MVCC publication is delayed until after a later WAL failure.
   file range.
 - Pack contiguous tickets into groups and reserve aligned offsets in ticket
   order. Include the 4 KiB header, alignment, and rounded 1 MiB preallocation
-  extent in the v4 1 GiB cap check. Move `fallocate` and its `ftruncate`
-  fallback outside the producer mutex and serialize only the worker-side
-  preallocation watermark. Assert `header_end <= reserved_end <= admitted_end
-  <= WAL_CAP` and `reserved_end <= preallocated_end <= WAL_CAP`. The packer
-  must use the aligned length stored at admission; it must not re-encode a
-  batch or recompute its length.
+  extent in the v4 1 GiB cap check. Reserve the group range and transfer its
+  queued buffers before preallocation; a preallocation failure must fail that
+  assigned group and poison its ticket boundary. Move `fallocate` and its
+  `ftruncate` fallback outside the producer mutex and serialize only the
+  worker-side preallocation watermark. Assert `header_end <= reserved_end <=
+  admitted_end <= WAL_CAP` and `header_end <= preallocated_end <= WAL_CAP`;
+  before write submission, assert the group's file end is at or below
+  `preallocated_end`. The packer must use the aligned length stored at
+  admission; it must not re-encode a batch or recompute its length.
 - Return a distinct retryable `WAL full` only when the batch fits an empty WAL.
   A batch too large for an empty WAL or the buffer cap is a terminal error.
   Do not let the worker wait for engine rotation.

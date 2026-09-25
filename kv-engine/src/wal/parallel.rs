@@ -1,10 +1,14 @@
-//! Test-only state model for the dedicated WAL pipeline.
+//! Test-only models for the dedicated WAL pipeline.
 //!
-//! This model has no I/O or synchronization primitives. The worker and
-//! coordinator added by later slices will drive these transitions while
-//! holding their shared state lock.
+//! `PipelineState` is a deterministic model with no I/O or synchronization
+//! primitives. The admission model uses locks and an atomic counter to exercise
+//! producer/packer concurrency without connecting to the production WAL.
+
+mod admission;
 
 use std::ops::Range;
+
+use super::{MAX_WAL_FILE_SIZE, PREALLOC_BLOCK};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct GroupId(usize);
@@ -56,7 +60,9 @@ enum StateError {
     SyncAlreadyInFlight,
     SyncNotInFlight,
     WrongSyncId,
-    UnassignedTicket,
+    UnadmittedTicket,
+    PreallocationPending,
+    InvalidPreallocationRange,
     CounterOverflow,
 }
 
@@ -87,8 +93,10 @@ struct SyncAttempt {
 /// `0..n`. All groups are assigned in ticket and file-offset order.
 struct PipelineState {
     groups: Vec<IoGroup>,
+    admitted_ticket_end: u64,
     assigned_ticket_end: u64,
     reserved_file_end: u64,
+    preallocated_file_end: u64,
     written_frontier: u64,
     durable_ticket: u64,
     poison_ticket: Option<u64>,
@@ -100,14 +108,32 @@ impl PipelineState {
     fn new(header_end: u64) -> Self {
         Self {
             groups: Vec::new(),
+            admitted_ticket_end: 0,
             assigned_ticket_end: 0,
             reserved_file_end: header_end,
+            preallocated_file_end: header_end,
             written_frontier: 0,
             durable_ticket: 0,
             poison_ticket: None,
             sync_in_flight: None,
             next_sync_id: 0,
         }
+    }
+
+    fn admit_ticket(&mut self, ticket: u64) -> Result<(), StateError> {
+        if self.poison_ticket.is_some() {
+            return Err(StateError::Poisoned);
+        }
+        if ticket != self.admitted_ticket_end {
+            return Err(StateError::NonContiguousTickets);
+        }
+        self.admitted_ticket_end = self
+            .admitted_ticket_end
+            .checked_add(1)
+            .ok_or(StateError::CounterOverflow)?;
+        self.assert_invariants();
+
+        Ok(())
     }
 
     fn assign_group(
@@ -131,6 +157,9 @@ impl PipelineState {
         if file_bytes.start != self.reserved_file_end {
             return Err(StateError::NonContiguousFileRange);
         }
+        if tickets.end > self.admitted_ticket_end {
+            return Err(StateError::UnadmittedTicket);
+        }
         if write_count == 0 {
             return Err(StateError::EmptyGroup);
         }
@@ -150,6 +179,26 @@ impl PipelineState {
         Ok(id)
     }
 
+    /// Record a successful, contiguous preallocation operation.
+    fn complete_preallocation(&mut self, range: Range<u64>) -> Result<(), StateError> {
+        let required_end = self
+            .reserved_file_end
+            .checked_add(PREALLOC_BLOCK - 1)
+            .map(|end| end / PREALLOC_BLOCK * PREALLOC_BLOCK)
+            .ok_or(StateError::InvalidPreallocationRange)?;
+        if range.start != self.preallocated_file_end
+            || range.end < range.start
+            || range.end > required_end
+            || range.end > MAX_WAL_FILE_SIZE
+            || !range.end.is_multiple_of(PREALLOC_BLOCK)
+        {
+            return Err(StateError::InvalidPreallocationRange);
+        }
+        self.preallocated_file_end = range.end;
+
+        Ok(())
+    }
+
     fn submit_write(&mut self, group_id: GroupId, write_index: usize) -> Result<(), StateError> {
         let group = self
             .groups
@@ -160,6 +209,9 @@ impl PipelineState {
             .is_some_and(|poison| group.tickets.start >= poison)
         {
             return Err(StateError::Poisoned);
+        }
+        if group.file_bytes.end > self.preallocated_file_end {
+            return Err(StateError::PreallocationPending);
         }
 
         let status = group
@@ -220,6 +272,28 @@ impl PipelineState {
         Ok(())
     }
 
+    /// Fail an assigned group before any write is submitted, for example when
+    /// preallocation fails. Earlier written groups may still become durable.
+    fn fail_unsubmitted_group(&mut self, group_id: GroupId) -> Result<(), StateError> {
+        let group = self
+            .groups
+            .get(group_id.0)
+            .ok_or(StateError::UnknownGroup)?;
+        if group
+            .writes
+            .iter()
+            .any(|status| *status != WriteStatus::NotSubmitted)
+        {
+            return Err(StateError::WriteAlreadySubmitted);
+        }
+
+        let failed_ticket = group.tickets.start;
+        self.poison_at(failed_ticket);
+        self.assert_invariants();
+
+        Ok(())
+    }
+
     fn begin_sync(&mut self) -> Result<Option<SyncId>, StateError> {
         if self.sync_in_flight.is_some() {
             return Err(StateError::SyncAlreadyInFlight);
@@ -271,8 +345,8 @@ impl PipelineState {
     }
 
     fn ticket_result(&self, ticket: u64) -> Result<TicketResult, StateError> {
-        if ticket >= self.assigned_ticket_end {
-            return Err(StateError::UnassignedTicket);
+        if ticket >= self.admitted_ticket_end {
+            return Err(StateError::UnadmittedTicket);
         }
         if ticket < self.durable_ticket {
             return Ok(TicketResult::Durable);
@@ -304,6 +378,7 @@ impl PipelineState {
     }
 
     fn assert_invariants(&self) {
+        debug_assert!(self.assigned_ticket_end <= self.admitted_ticket_end);
         debug_assert!(self.durable_ticket <= self.written_frontier);
         debug_assert!(self.written_frontier <= self.assigned_ticket_end);
         debug_assert!(
@@ -326,7 +401,10 @@ impl PipelineState {
 
 #[cfg(test)]
 mod tests {
-    use super::{GroupId, PipelineState, StateError, SyncResult, TicketResult, WriteCompletion};
+    use super::{
+        GroupId, MAX_WAL_FILE_SIZE, PREALLOC_BLOCK, PipelineState, StateError, SyncResult,
+        TicketResult, WriteCompletion,
+    };
 
     const WAL_HEADER_END: u64 = 4096;
 
@@ -337,14 +415,26 @@ mod tests {
         write_count: usize,
     ) -> GroupId {
         let ticket_start = state.assigned_ticket_end;
+        let ticket_end = ticket_start + ticket_count;
         let file_start = state.reserved_file_end;
-        state
+        while state.admitted_ticket_end < ticket_end {
+            state
+                .admit_ticket(state.admitted_ticket_end)
+                .expect("admit next ticket");
+        }
+        let group = state
             .assign_group(
-                ticket_start..ticket_start + ticket_count,
+                ticket_start..ticket_end,
                 file_start..file_start + file_bytes,
                 write_count,
             )
-            .expect("assign contiguous group")
+            .expect("assign contiguous group");
+        let required_end = (file_start + file_bytes).div_ceil(PREALLOC_BLOCK) * PREALLOC_BLOCK;
+        state
+            .complete_preallocation(state.preallocated_file_end..required_end)
+            .expect("preallocate assigned group");
+
+        group
     }
 
     fn submit_all(state: &mut PipelineState, group_id: GroupId, write_count: usize) {
@@ -398,6 +488,8 @@ mod tests {
         assert_eq!(state.poison_ticket, Some(0));
         assert_eq!(state.ticket_result(0), Ok(TicketResult::Failed));
         assert_eq!(state.ticket_result(1), Ok(TicketResult::Failed));
+        assert_eq!(state.admit_ticket(2), Err(StateError::Poisoned));
+        assert_eq!(state.admitted_ticket_end, 2);
         assert_eq!(
             state.assign_group(2..3, 12_288..16_384, 1),
             Err(StateError::Poisoned)
@@ -531,6 +623,8 @@ mod tests {
         assert_eq!(state.durable_ticket, 1);
         assert_eq!(state.ticket_result(0), Ok(TicketResult::Durable));
         assert_eq!(state.ticket_result(1), Ok(TicketResult::Failed));
+        assert_eq!(state.admit_ticket(2), Err(StateError::Poisoned));
+        assert_eq!(state.admitted_ticket_end, 2);
     }
 
     #[test]
@@ -558,6 +652,8 @@ mod tests {
         assert_eq!(state.durable_ticket, 1);
         assert_eq!(state.ticket_result(0), Ok(TicketResult::Durable));
         assert_eq!(state.ticket_result(1), Ok(TicketResult::Failed));
+        assert_eq!(state.admit_ticket(2), Err(StateError::Poisoned));
+        assert_eq!(state.admitted_ticket_end, 2);
     }
 
     #[test]
@@ -579,6 +675,35 @@ mod tests {
         assert_eq!(group, GroupId(0));
         assert_eq!(state.assigned_ticket_end, 1);
         assert_eq!(state.reserved_file_end, 8192);
+    }
+
+    #[test]
+    fn write_submission_waits_for_contiguous_preallocation() {
+        let mut state = PipelineState::new(WAL_HEADER_END);
+        state.admit_ticket(0).expect("admit ticket");
+        let group = state
+            .assign_group(0..1, 4096..8192, 1)
+            .expect("assign group");
+        assert_eq!(
+            state.submit_write(group, 0),
+            Err(StateError::PreallocationPending)
+        );
+        assert_eq!(
+            state.complete_preallocation(8192..12_288),
+            Err(StateError::InvalidPreallocationRange)
+        );
+        assert_eq!(
+            state.complete_preallocation(4096..PREALLOC_BLOCK * 2),
+            Err(StateError::InvalidPreallocationRange)
+        );
+        assert_eq!(
+            state.complete_preallocation(4096..MAX_WAL_FILE_SIZE + PREALLOC_BLOCK),
+            Err(StateError::InvalidPreallocationRange)
+        );
+        state
+            .complete_preallocation(4096..PREALLOC_BLOCK)
+            .expect("preallocate contiguous range");
+        assert_eq!(state.submit_write(group, 0), Ok(()));
     }
 
     #[test]
