@@ -488,6 +488,39 @@ The producer-side queue-drain comparisons are summarized in
 `target/rfc024-fused-leader-ext4-runs` and
 `/tmp/rfc024-fused-leader-tmpfs-runs`.
 
+### Production-build publication-lock experiment
+
+**Run date:** 2026-09-27.
+
+To avoid charging parallel WAL for benchmark-only profile counters, this
+follow-up used `write-perf` built in release mode without the `bench` Cargo
+feature. Five alternating 20k-operation pairs (four writers, 1-KiB values,
+1-GiB SST target, tmpfs) tested a publication fast path that waits on the
+atomic publication frontier before taking the publication mutex. Parallel
+throughput ratios were `1.396, 0.977, 1.287, 1.051, 1.085`; the median was
+1.085, but the paired bootstrap 95% interval was `0.977–1.396`. Median p99
+increased by 16% and median process CPU fell by 12%. Five ext4 pairs at 5k
+operations measured a 1.013 median throughput ratio (95% interval
+`0.990–1.062`), with no established gain.
+
+The 20k result did not reproduce at 100k operations with 1,000 latency samples
+per run. Five tmpfs throughput ratios were `0.792, 0.882, 1.167, 1.004,
+1.117`; the median was 1.004 and its 95% interval was `0.792–1.167`. Median
+p99 and process CPU ratios were 0.994 and 0.993, respectively. This is too
+variable to support the change. A second experiment reduced the publication
+spin budget from 16,384 to 1,024 iterations; five 20k tmpfs pairs had a 0.942
+median throughput ratio and 1.061 median CPU ratio. Both changes were
+discarded, and the committed publication path remains unchanged.
+
+An atomic active-group counter was also tested to avoid taking the worker slot
+mutex when a group completes. On the 50k-operation, four-writer,
+1-GiB-SST workload, five paired ratios against the prior worker were 0.931 on
+tmpfs (95% interval `0.671–1.181`) and 1.006 on ext4 (95% interval
+`0.982–1.012`); neither showed a repeatable gain, so that change was discarded
+as well. These measurements reinforce that the next optimization needs to
+reduce per-ticket coordination work as a whole; removing one lock or adjusting
+the spin budget does not yet improve the end-to-end result reliably.
+
 Raw JSONL outputs from the Slice 7 session are in
 `/tmp/rfc024-slice7-artifacts`; the current 20k WAL-focused outputs are in
 `/tmp/rfc024-packer-single-allocation-five-pair`, and the exact-case pairs are
