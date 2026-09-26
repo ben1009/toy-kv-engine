@@ -938,6 +938,7 @@ struct WalPipelineRecord {
     #[serde(skip_serializing_if = "Option::is_none")]
     sync_groups_total: Option<u64>,
     worker_eventfd_notifications: u64,
+    worker_eventfd_writes: u64,
     preallocation_ns: u64,
     fdatasync_ns: u64,
     wal_sync_wait_ns: u64,
@@ -989,6 +990,7 @@ fn wal_pipeline_record(engine: &KvEngine, detailed: bool) -> Result<WalPipelineR
         sync_count: profile.wal_sync_count,
         sync_groups_total: detailed.then_some(profile.wal_sync_groups_total),
         worker_eventfd_notifications: profile.wal_worker_eventfd_notifications,
+        worker_eventfd_writes: profile.wal_worker_eventfd_writes,
         preallocation_ns: profile.wal_preallocation_ns,
         fdatasync_ns: profile.wal_fdatasync_ns,
         wal_sync_wait_ns: profile.wal_sync_ns,
@@ -11850,12 +11852,14 @@ mod tests {
             sync_count: 3,
             sync_groups_total: None,
             worker_eventfd_notifications: 5,
+            worker_eventfd_writes: 3,
             sync_observations: None,
             ..WalPipelineRecord::default()
         };
         let ordinary_json = serde_json::to_value(ordinary).expect("serialize ordinary WAL metrics");
         assert_eq!(ordinary_json["sync_count"], 3);
         assert_eq!(ordinary_json["worker_eventfd_notifications"], 5);
+        assert_eq!(ordinary_json["worker_eventfd_writes"], 3);
         assert!(ordinary_json.get("sync_groups_total").is_none());
         assert!(ordinary_json.get("sync_observations").is_none());
 

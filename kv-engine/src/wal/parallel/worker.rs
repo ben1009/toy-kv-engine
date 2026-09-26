@@ -9,14 +9,15 @@ use std::{
     marker::PhantomData,
     ops::Range,
     os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     thread::{self, JoinHandle},
 };
 
 #[cfg(feature = "bench")]
 use std::collections::BTreeMap;
-#[cfg(feature = "bench")]
-use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(feature = "bench")]
 use std::time::Instant;
 
@@ -183,6 +184,13 @@ impl WalSyncProgress {
         #[cfg(feature = "bench")]
         if let Some(profile) = self.profile() {
             profile.record_wal_worker_eventfd_notification();
+        }
+    }
+
+    pub(crate) fn record_worker_eventfd_write(&self) {
+        #[cfg(feature = "bench")]
+        if let Some(profile) = self.profile() {
+            profile.record_wal_worker_eventfd_write();
         }
     }
 
@@ -1265,6 +1273,8 @@ enum WorkerCommand<B = DirectBuf> {
 /// Only the worker reads the eventfd; submitters share its write side.
 struct WorkerWake {
     fd: OwnedFd,
+    pending: AtomicBool,
+    waiting_for_progress: AtomicBool,
 }
 
 impl WorkerWake {
@@ -1277,10 +1287,30 @@ impl WorkerWake {
         // SAFETY: eventfd returned a fresh descriptor, now owned by this value.
         Ok(Self {
             fd: unsafe { OwnedFd::from_raw_fd(fd) },
+            pending: AtomicBool::new(false),
+            waiting_for_progress: AtomicBool::new(false),
         })
     }
 
-    fn signal(&self) -> io::Result<()> {
+    /// Signal only when the worker is waiting for ring or command readiness.
+    /// The worker publishes that state before checking the command queue, so a
+    /// command either makes that check observe it or sees the published state
+    /// and writes the eventfd before the worker polls.
+    fn signal_if_waiting(&self) -> io::Result<bool> {
+        if !self.waiting_for_progress.load(Ordering::SeqCst) {
+            return Ok(false);
+        }
+        self.signal()
+    }
+
+    /// Set the wakeup only on the transition from no pending event to pending.
+    /// Commands are enqueued before this method is called, so one eventfd write
+    /// wakes the worker to drain every command accumulated behind it.
+    fn signal(&self) -> io::Result<bool> {
+        if self.pending.swap(true, Ordering::AcqRel) {
+            return Ok(false);
+        }
+
         let value = 1_u64;
         loop {
             // SAFETY: eventfd requires an eight-byte write; `value` remains
@@ -1293,16 +1323,20 @@ impl WorkerWake {
                 )
             };
             if written == std::mem::size_of::<u64>() as isize {
-                return Ok(());
+                return Ok(true);
             }
             if written >= 0 {
+                self.pending.store(false, Ordering::Release);
                 return Err(io::Error::other("short WAL worker wakeup write"));
             }
             let error = io::Error::last_os_error();
             match error.kind() {
                 io::ErrorKind::Interrupted => continue,
-                io::ErrorKind::WouldBlock => return Ok(()),
-                _ => return Err(error),
+                io::ErrorKind::WouldBlock => return Ok(false),
+                _ => {
+                    self.pending.store(false, Ordering::Release);
+                    return Err(error);
+                }
             }
         }
     }
@@ -1319,15 +1353,20 @@ impl WorkerWake {
                 )
             };
             if read == std::mem::size_of::<u64>() as isize {
+                self.pending.store(false, Ordering::Release);
                 return Ok(());
             }
             if read >= 0 {
+                self.pending.store(false, Ordering::Release);
                 return Err(io::Error::other("short WAL worker wakeup read"));
             }
             let error = io::Error::last_os_error();
             match error.kind() {
                 io::ErrorKind::Interrupted => continue,
-                io::ErrorKind::WouldBlock => return Ok(()),
+                io::ErrorKind::WouldBlock => {
+                    self.pending.store(false, Ordering::Release);
+                    return Ok(());
+                }
                 _ => return Err(error),
             }
         }
@@ -1371,7 +1410,7 @@ impl<B: WorkerBuffer> Clone for IoWorkerClient<B> {
 impl<B: WorkerBuffer> IoWorker<B> {
     pub(crate) fn spawn(wal_file: Arc<File>, buffer_pool: Arc<ArrayQueue<B>>) -> Result<Self> {
         let (command_tx, command_rx) = unbounded();
-        let (completion_tx, completion_rx) = unbounded();
+        let (completion_tx, completion_rx) = unbounded::<GroupWriteResult>();
         let (startup_tx, startup_rx) = bounded::<Result<()>>(1);
         let slots = Arc::new(GroupSlots {
             state: Mutex::new(SlotState {
@@ -1491,7 +1530,8 @@ impl<B: WorkerBuffer> IoWorker<B> {
                 ack_receiver = Some(ack_rx);
                 wake_result = self
                     .wake
-                    .signal()
+                    .signal_if_waiting()
+                    .map(|_| ())
                     .context("failed to wake WAL I/O worker for shutdown");
             }
         }
@@ -1549,11 +1589,16 @@ impl<B: WorkerBuffer> IoWorkerClient<B> {
             drop(state);
             match send_result {
                 Ok(()) => {
-                    // The group is already owned by the worker. A wakeup
-                    // failure cannot be reported as failed admission; the
-                    // bounded poll timeout still drains the queue.
-                    match self.wake.signal() {
-                        Ok(()) => self.sync_progress.record_worker_eventfd_notification(),
+                    // The channel wakes the idle receive path. Signal the
+                    // eventfd only when the worker is about to wait on ring
+                    // progress; a wakeup failure cannot undo group admission.
+                    match self.wake.signal_if_waiting() {
+                        Ok(wrote_eventfd) => {
+                            self.sync_progress.record_worker_eventfd_notification();
+                            if wrote_eventfd {
+                                self.sync_progress.record_worker_eventfd_write();
+                            }
+                        }
                         Err(error) => log::error!("failed to wake WAL I/O worker: {error}"),
                     }
                     Ok(group_id.0)
@@ -1626,8 +1671,8 @@ fn run_worker<B: WorkerBuffer>(
         }
         let reason = format!("WAL I/O worker stopped: {error:#}");
         fail_shutdown_reply(&mut shutdown_reply, &reason);
-        for failed in core.failed_group_results(&reason) {
-            let _ = completions.send(failed);
+        for result in core.failed_group_results(&reason) {
+            let _ = completions.send(result);
         }
         for command in commands.try_iter() {
             match command {
@@ -1785,7 +1830,7 @@ fn run_worker_loop<B: WorkerBuffer>(
         if completion_count == 0 && core.outstanding_sqe_count() > 0 && ring_staged.is_empty() {
             // Wake on either a later group or a CQE. Waiting only for a CQE
             // would serialize a group admitted after this wait begins.
-            wait_for_worker_progress(ring.as_raw_fd(), wake)
+            wait_for_worker_progress(ring.as_raw_fd(), wake, || !commands.is_empty())
                 .context("failed while waiting for WAL I/O progress")?;
         }
     }
@@ -1884,7 +1929,17 @@ fn submit_staged_writes<B: WorkerBuffer>(
     Ok((submitted, submitted_at))
 }
 
-fn wait_for_worker_progress(ring_fd: RawFd, wake: &WorkerWake) -> io::Result<bool> {
+fn wait_for_worker_progress(
+    ring_fd: RawFd,
+    wake: &WorkerWake,
+    commands_pending: impl FnOnce() -> bool,
+) -> io::Result<bool> {
+    wake.waiting_for_progress.store(true, Ordering::SeqCst);
+    if commands_pending() {
+        wake.waiting_for_progress.store(false, Ordering::SeqCst);
+        return Ok(true);
+    }
+
     let mut fds = [
         libc::pollfd {
             fd: ring_fd,
@@ -1897,18 +1952,20 @@ fn wait_for_worker_progress(ring_fd: RawFd, wake: &WorkerWake) -> io::Result<boo
             revents: 0,
         },
     ];
-    loop {
+    let ready = loop {
         // A timeout is only a fallback if eventfd signaling fails after a
         // command was queued; normal progress is driven by readiness.
         let ready = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, 1000) };
         if ready >= 0 {
-            break;
+            break Ok(());
         }
         let error = io::Error::last_os_error();
         if error.kind() != io::ErrorKind::Interrupted {
-            return Err(error);
+            break Err(error);
         }
-    }
+    };
+    wake.waiting_for_progress.store(false, Ordering::SeqCst);
+    ready?;
     if fds
         .iter()
         .any(|fd| fd.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0)
@@ -1959,9 +2016,14 @@ fn process_completions<B: WorkerBuffer>(
 ) -> Result<()> {
     for (user_data, cqe_result) in completed {
         let request_id = RequestId(user_data);
-        let events = core
-            .complete_write(request_id, cqe_result)
-            .map_err(|error| anyhow!("invalid or stale WAL io_uring completion: {error:?}"))?;
+        let events = match core.complete_write(request_id, cqe_result) {
+            Ok(events) => events,
+            Err(error) => {
+                return Err(anyhow!(
+                    "invalid or stale WAL io_uring completion: {error:?}"
+                ));
+            }
+        };
         if core.poison_ticket.is_some() {
             close_group_admission(slots);
         }
@@ -2873,6 +2935,60 @@ mod tests {
     }
 
     #[test]
+    fn worker_wakeup_coalesces_signals_until_the_eventfd_is_drained() {
+        let (fake_cq, _peer) = UnixStream::pair().expect("fake CQ socket");
+        let wake = WorkerWake::new().expect("eventfd");
+
+        assert!(wake.signal().expect("write first wakeup"));
+        assert!(!wake.signal().expect("coalesce second wakeup"));
+        assert!(
+            wait_for_worker_progress(fake_cq.as_raw_fd(), &wake, || false).expect("worker wakes")
+        );
+        assert!(!wake.pending.load(Ordering::Acquire));
+
+        assert!(wake.signal().expect("write wakeup after drain"));
+        assert!(
+            wait_for_worker_progress(fake_cq.as_raw_fd(), &wake, || false)
+                .expect("worker wakes again")
+        );
+    }
+
+    #[test]
+    fn worker_wakeup_skips_eventfd_when_the_worker_is_not_waiting() {
+        let wake = WorkerWake::new().expect("eventfd");
+
+        assert!(
+            !wake
+                .signal_if_waiting()
+                .expect("active worker needs no wake")
+        );
+        assert!(!wake.pending.load(Ordering::Acquire));
+
+        wake.waiting_for_progress.store(true, Ordering::SeqCst);
+        assert!(
+            wake.signal_if_waiting()
+                .expect("waiting worker is signaled")
+        );
+        wake.waiting_for_progress.store(false, Ordering::SeqCst);
+        wake.drain().expect("drain eventfd");
+    }
+
+    #[test]
+    fn worker_checks_queued_commands_before_polling() {
+        let (fake_cq, _peer) = UnixStream::pair().expect("fake CQ socket");
+        let wake = WorkerWake::new().expect("eventfd");
+        let (command_tx, command_rx) = crossbeam_channel::unbounded();
+        command_tx.send(()).expect("queue command");
+
+        assert!(
+            wait_for_worker_progress(fake_cq.as_raw_fd(), &wake, || !command_rx.is_empty())
+                .expect("queued command avoids polling")
+        );
+        assert!(!wake.waiting_for_progress.load(Ordering::SeqCst));
+        assert!(!wake.pending.load(Ordering::Acquire));
+    }
+
+    #[test]
     fn later_group_wakes_worker_before_earlier_write_completes() {
         let drops = Arc::new(AtomicUsize::new(0));
         let mut core = WorkerCore::new();
@@ -2892,10 +3008,15 @@ mod tests {
             group_tx
                 .send(make_group(1..2, 8192, 1, 4096, &producer_drops))
                 .expect("enqueue later group");
-            producer_wake.signal().expect("signal worker");
+            producer_wake
+                .signal_if_waiting()
+                .expect("signal worker if it has reached the poll");
         });
 
-        assert!(wait_for_worker_progress(fake_cq.as_raw_fd(), &wake).expect("worker wakes"));
+        assert!(
+            wait_for_worker_progress(fake_cq.as_raw_fd(), &wake, || !group_rx.is_empty())
+                .expect("worker wakes or observes queued group")
+        );
         producer.join().expect("producer joins");
         core.enqueue(group_rx.try_recv().expect("later group queued"))
             .expect("worker accepts later group");

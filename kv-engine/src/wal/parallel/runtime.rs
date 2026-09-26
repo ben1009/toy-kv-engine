@@ -7,10 +7,8 @@ use std::{
     os::fd::AsRawFd,
     sync::Arc,
     thread::{self, JoinHandle},
+    time::{Duration, Instant},
 };
-
-#[cfg(feature = "bench")]
-use std::time::Instant;
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use crossbeam_channel::{Receiver, Sender, TryRecvError, unbounded};
@@ -28,6 +26,12 @@ use super::{
 const NORMAL_ACTIVE_BUFFER_BUDGET: u64 = 64 * 1024 * 1024;
 const MAX_BUFFER_CAPACITY: u64 = 240 * 1024 * 1024;
 const WAL_HEADER_END: u64 = 4096;
+const PACKER_GROUP_MAX_TICKETS: usize = 8;
+// Wait only for tickets already admitted when a written prefix is ready to sync.
+// Skip the wait when the prior sync was cheap; new admission cannot extend the
+// deadline or the captured cutoff.
+const SYNC_COALESCE_WAIT: Duration = Duration::from_micros(50);
+const SYNC_COALESCE_MIN_SYNC: Duration = Duration::from_micros(100);
 
 #[derive(Debug)]
 pub(crate) struct WalFull;
@@ -209,6 +213,13 @@ struct AdmittedBatch {
     file_offset: u64,
     aligned_len: usize,
     buffer: ParallelBuffer,
+}
+
+struct PackedGroup {
+    first_ticket: u64,
+    next_ticket: u64,
+    reserved_end: u64,
+    writes: Vec<WriteBuffer<ParallelBuffer>>,
 }
 
 struct AdmissionState {
@@ -642,7 +653,7 @@ fn run_packer(
     let mut preallocated_end = initial_file_end;
 
     loop {
-        let batch = {
+        let packed_result = {
             let mut admission = inner.admission.lock();
             while admission.queue.is_empty() && admission.open {
                 inner.admission_changed.wait(&mut admission);
@@ -656,48 +667,39 @@ fn run_packer(
                         "parallel WAL packer stopped at ticket {next_ticket} before close cutoff {cutoff}"
                     );
                 }
-                break;
-            }
-            let batch = admission
-                .queue
-                .pop_front()
-                .expect("nonempty WAL admission queue has a first batch");
-            if admission
-                .poison
-                .as_ref()
-                .is_some_and(|(poison, _)| batch.ticket >= *poison)
-            {
-                admission.queue.clear();
-                inner.admission_changed.notify_all();
                 None
             } else {
-                Some(batch)
+                Some(take_admitted_group(
+                    &mut admission,
+                    next_ticket,
+                    reserved_end,
+                    PACKER_GROUP_MAX_TICKETS,
+                ))
             }
         };
-        let Some(batch) = batch else {
+        let Some(packed_result) = packed_result else {
             break;
         };
+        let packed = match packed_result {
+            Ok(Some(packed)) => packed,
+            Ok(None) => continue,
+            Err(error) => {
+                report_packer_failure(&inner, &failures, next_ticket, &error);
+                return Err(error);
+            }
+        };
+        let first_ticket = packed.first_ticket;
+        let expected_ticket = packed.next_ticket;
+        reserved_end = packed.reserved_end;
+        let writes = packed.writes;
 
-        if batch.ticket != next_ticket || batch.file_offset != reserved_end {
-            let error = anyhow!("parallel WAL admission queue is not ticket/offset contiguous");
-            report_packer_failure(&inner, &failures, batch.ticket, &error);
-            return Err(error);
-        }
-        let file_end = batch
-            .file_offset
-            .checked_add(batch.aligned_len as u64)
-            .ok_or_else(|| anyhow!("parallel WAL offset overflow"))?;
-        reserved_end = file_end;
-        #[cfg(feature = "chaos-testing")]
-        crate::chaos::failpoint::parallel_wal_crash_point("parallel_wal.offset_reserved");
-
-        let target_preallocated_end = round_up(file_end, PREALLOC_BLOCK)
+        let target_preallocated_end = round_up(reserved_end, PREALLOC_BLOCK)
             .ok_or_else(|| anyhow!("parallel WAL preallocation offset overflow"))?;
         if target_preallocated_end > preallocated_end {
             #[cfg(feature = "bench")]
             let preallocation_start = Instant::now();
             if let Err(error) = preallocate(&inner.preallocator, target_preallocated_end) {
-                report_packer_failure(&inner, &failures, batch.ticket, &error);
+                report_packer_failure(&inner, &failures, first_ticket, &error);
                 return Err(error);
             }
             #[cfg(feature = "bench")]
@@ -713,29 +715,93 @@ fn run_packer(
         debug_assert!(preallocated_end >= reserved_end);
         debug_assert!(preallocated_end <= MAX_WAL_FILE_SIZE);
         ensure!(
-            file_end <= preallocated_end,
+            reserved_end <= preallocated_end,
             "WAL write extends beyond preallocation"
         );
 
-        let write = WriteBuffer::new(batch.buffer, batch.file_offset, batch.aligned_len);
-        let group = match WriteGroup::new(batch.ticket..batch.ticket + 1, vec![write]) {
+        let group = match WriteGroup::new(next_ticket..expected_ticket, writes) {
             Ok(group) => group,
             Err(error) => {
                 let error = anyhow!("invalid packed WAL group: {error:?}");
-                report_packer_failure(&inner, &failures, batch.ticket, &error);
+                report_packer_failure(&inner, &failures, first_ticket, &error);
                 return Err(error);
             }
         };
         if let Err(error) = inner.worker.submit_group(group) {
-            report_packer_failure(&inner, &failures, batch.ticket, &error);
+            report_packer_failure(&inner, &failures, first_ticket, &error);
             return Err(error).context("failed to submit packed WAL group");
         }
-        next_ticket = next_ticket
-            .checked_add(1)
-            .ok_or_else(|| anyhow!("parallel WAL ticket counter overflow"))?;
+        next_ticket = expected_ticket;
     }
 
     Ok(())
+}
+
+fn take_admitted_group(
+    admission: &mut AdmissionState,
+    next_ticket: u64,
+    reserved_end: u64,
+    max_tickets: usize,
+) -> Result<Option<PackedGroup>> {
+    debug_assert!(max_tickets > 0);
+    let Some(first) = admission.queue.front() else {
+        return Ok(None);
+    };
+    if admission
+        .poison
+        .as_ref()
+        .is_some_and(|(poison_ticket, _)| first.ticket >= *poison_ticket)
+    {
+        admission.queue.clear();
+        return Ok(None);
+    }
+
+    let first_ticket = first.ticket;
+    let group_capacity = admission.queue.len().min(max_tickets);
+    let mut writes = Vec::with_capacity(group_capacity);
+    let mut expected_ticket = next_ticket;
+    let mut packed_end = reserved_end;
+    while writes.len() < max_tickets {
+        let Some(next) = admission.queue.front() else {
+            break;
+        };
+        if admission
+            .poison
+            .as_ref()
+            .is_some_and(|(poison_ticket, _)| next.ticket >= *poison_ticket)
+        {
+            admission.queue.clear();
+            break;
+        }
+        let batch = admission
+            .queue
+            .pop_front()
+            .expect("front WAL batch remains queued");
+        ensure!(
+            batch.ticket == expected_ticket && batch.file_offset == packed_end,
+            "parallel WAL admission queue is not ticket/offset contiguous"
+        );
+        packed_end = batch
+            .file_offset
+            .checked_add(batch.aligned_len as u64)
+            .ok_or_else(|| anyhow!("parallel WAL offset overflow"))?;
+        expected_ticket = expected_ticket
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("parallel WAL ticket counter overflow"))?;
+        #[cfg(feature = "chaos-testing")]
+        crate::chaos::failpoint::parallel_wal_crash_point("parallel_wal.offset_reserved");
+        writes.push(WriteBuffer::new(
+            batch.buffer,
+            batch.file_offset,
+            batch.aligned_len,
+        ));
+    }
+    Ok(Some(PackedGroup {
+        first_ticket,
+        next_ticket: expected_ticket,
+        reserved_end: packed_end,
+        writes,
+    }))
 }
 
 fn report_packer_failure(
@@ -774,11 +840,13 @@ fn run_sync_coordinator(
     packer_failures: Receiver<GroupWriteResult>,
     inner: Arc<RuntimeInner>,
 ) -> Result<()> {
-    let disconnected = crossbeam_channel::never();
+    let disconnected_worker = crossbeam_channel::never::<GroupWriteResult>();
+    let disconnected_packer = crossbeam_channel::never::<GroupWriteResult>();
     let mut worker_completions = worker_completions;
     let mut packer_failures = packer_failures;
     let mut worker_open = true;
     let mut packer_open = true;
+    let mut last_sync_latency = None;
 
     while worker_open || packer_open {
         crossbeam_channel::select! {
@@ -787,7 +855,7 @@ fn run_sync_coordinator(
                     Ok(result) => process_group_result(&inner, result),
                     Err(_) => {
                         worker_open = false;
-                        worker_completions = disconnected.clone();
+                        worker_completions = disconnected_worker.clone();
                     }
                 }
             }
@@ -796,7 +864,7 @@ fn run_sync_coordinator(
                     Ok(result) => process_group_result(&inner, result),
                     Err(_) => {
                         packer_open = false;
-                        packer_failures = disconnected.clone();
+                        packer_failures = disconnected_packer.clone();
                     }
                 }
             }
@@ -809,9 +877,23 @@ fn run_sync_coordinator(
             &mut packer_failures,
             &mut worker_open,
             &mut packer_open,
-            &disconnected,
+            &disconnected_worker,
+            &disconnected_packer,
         );
-        synchronize_written_prefix(&sync_file, &inner)?;
+        if last_sync_latency.is_some_and(|latency| latency >= SYNC_COALESCE_MIN_SYNC) {
+            coalesce_admitted_prefix(
+                &inner,
+                &mut worker_completions,
+                &mut packer_failures,
+                &mut worker_open,
+                &mut packer_open,
+                &disconnected_worker,
+                &disconnected_packer,
+            );
+        }
+        if let Some(latency) = synchronize_written_prefix(&sync_file, &inner)? {
+            last_sync_latency = Some(latency);
+        }
     }
 
     // Both producers have terminated. Freeze the final written prefix and
@@ -822,13 +904,68 @@ fn run_sync_coordinator(
     Ok(())
 }
 
+fn coalesce_admitted_prefix(
+    inner: &RuntimeInner,
+    worker_completions: &mut Receiver<GroupWriteResult>,
+    packer_failures: &mut Receiver<GroupWriteResult>,
+    worker_open: &mut bool,
+    packer_open: &mut bool,
+    disconnected_worker: &Receiver<GroupWriteResult>,
+    disconnected_packer: &Receiver<GroupWriteResult>,
+) {
+    if !*worker_open {
+        return;
+    }
+    let (cutoff, written) = {
+        let state = inner.durability.state.lock();
+        if state.poison_ticket.is_some() || state.written_frontier <= state.durable_frontier {
+            return;
+        }
+        (inner.admission.lock().next_ticket, state.written_frontier)
+    };
+    if cutoff <= written {
+        return;
+    }
+
+    let deadline = Instant::now() + SYNC_COALESCE_WAIT;
+    loop {
+        let state = inner.durability.state.lock();
+        if state.poison_ticket.is_some() || state.written_frontier >= cutoff {
+            return;
+        }
+        drop(state);
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            return;
+        };
+        crossbeam_channel::select! {
+            recv(*worker_completions) -> result => match result {
+                Ok(result) => process_group_result(inner, result),
+                Err(_) => {
+                    *worker_open = false;
+                    *worker_completions = disconnected_worker.clone();
+                    return;
+                }
+            },
+            recv(*packer_failures) -> result => match result {
+                Ok(result) => process_group_result(inner, result),
+                Err(_) => {
+                    *packer_open = false;
+                    *packer_failures = disconnected_packer.clone();
+                }
+            },
+            default(remaining) => return,
+        }
+    }
+}
+
 fn drain_ready_results(
     inner: &RuntimeInner,
     worker_completions: &mut Receiver<GroupWriteResult>,
     packer_failures: &mut Receiver<GroupWriteResult>,
     worker_open: &mut bool,
     packer_open: &mut bool,
-    disconnected: &Receiver<GroupWriteResult>,
+    disconnected_worker: &Receiver<GroupWriteResult>,
+    disconnected_packer: &Receiver<GroupWriteResult>,
 ) {
     while *worker_open {
         match worker_completions.try_recv() {
@@ -836,7 +973,7 @@ fn drain_ready_results(
             Err(TryRecvError::Empty) => break,
             Err(TryRecvError::Disconnected) => {
                 *worker_open = false;
-                *worker_completions = disconnected.clone();
+                *worker_completions = disconnected_worker.clone();
             }
         }
     }
@@ -847,7 +984,7 @@ fn drain_ready_results(
             Err(TryRecvError::Empty) => break,
             Err(TryRecvError::Disconnected) => {
                 *packer_open = false;
-                *packer_failures = disconnected.clone();
+                *packer_failures = disconnected_packer.clone();
             }
         }
     }
@@ -955,7 +1092,7 @@ fn validate_sync_diagnostics_transition(
     Ok(())
 }
 
-fn synchronize_written_prefix(sync_file: &File, inner: &RuntimeInner) -> Result<()> {
+fn synchronize_written_prefix(sync_file: &File, inner: &RuntimeInner) -> Result<Option<Duration>> {
     let (target, durable) = {
         let state = inner.durability.state.lock();
         let target = state
@@ -970,7 +1107,7 @@ fn synchronize_written_prefix(sync_file: &File, inner: &RuntimeInner) -> Result<
         (target, state.durable_frontier)
     };
     if target <= durable {
-        return Ok(());
+        return Ok(None);
     }
 
     #[cfg(feature = "chaos-testing")]
@@ -979,19 +1116,14 @@ fn synchronize_written_prefix(sync_file: &File, inner: &RuntimeInner) -> Result<
     crate::chaos::failpoint::before_parallel_wal_fdatasync_call();
     let _sync_start = inner.sync_progress.begin_sync(target, durable);
     inner.sync_progress.start_sync_activity();
+    let started_at = Instant::now();
     #[cfg(feature = "bench")]
-    let mut syscall_started_at = None;
+    let syscall_started_at = Some(started_at);
     #[cfg(not(feature = "bench"))]
     let syscall_started_at = None;
     let (sync_error, syscall_finished_at) = loop {
-        #[cfg(feature = "bench")]
-        let call_started_at = Instant::now();
         let error = fdatasync_file(sync_file).err();
         let call_finished_at = wal_sync_timestamp();
-        #[cfg(feature = "bench")]
-        if syscall_started_at.is_none() {
-            syscall_started_at = Some(call_started_at);
-        }
         if let Some(error) = error {
             if error.kind() == io::ErrorKind::Interrupted {
                 continue;
@@ -1000,13 +1132,14 @@ fn synchronize_written_prefix(sync_file: &File, inner: &RuntimeInner) -> Result<
         }
         break (None, call_finished_at);
     };
+    let sync_latency = started_at.elapsed();
     let (_sync_end, finished_at) = inner
         .sync_progress
         .finish_sync(syscall_started_at, syscall_finished_at);
     #[cfg(feature = "bench")]
     let duration_ns = finished_at
         .expect("benchmark WAL sync completion has a timestamp")
-        .duration_since(syscall_started_at.expect("fdatasync call records its start timestamp"))
+        .duration_since(started_at)
         .as_nanos() as u64;
     #[cfg(not(feature = "bench"))]
     let _ = finished_at;
@@ -1047,7 +1180,7 @@ fn synchronize_written_prefix(sync_file: &File, inner: &RuntimeInner) -> Result<
         drop(state);
         inner.sync_progress.mark_durable(acknowledged);
 
-        return Ok(());
+        return Ok(Some(sync_latency));
     };
 
     let message = format!("fdatasync failed: {error}");
@@ -1070,7 +1203,7 @@ fn synchronize_written_prefix(sync_file: &File, inner: &RuntimeInner) -> Result<
     // batch into the still-open admission queue.
     inner.durability.changed.notify_all();
 
-    Ok(())
+    Ok(Some(sync_latency))
 }
 
 fn fdatasync_file(sync_file: &File) -> io::Result<()> {
@@ -1149,10 +1282,57 @@ mod tests {
     #[cfg(feature = "bench")]
     use super::validate_sync_diagnostics_transition;
     use super::{
-        BufferBudget, MAX_BUFFER_CAPACITY, NORMAL_ACTIVE_BUFFER_BUDGET, PREALLOC_BLOCK,
-        WAL_HEADER_END, WalFull, preallocate, round_up,
+        AdmissionState, AdmittedBatch, BufferBudget, MAX_BUFFER_CAPACITY,
+        NORMAL_ACTIVE_BUFFER_BUDGET, PREALLOC_BLOCK, ParallelBuffer, WAL_HEADER_END, WalFull,
+        preallocate, round_up, take_admitted_group,
     };
-    use crate::wal::Wal;
+    use crate::wal::{DirectBuf, Wal};
+
+    fn admitted_batch(
+        budget: &std::sync::Arc<BufferBudget>,
+        ticket: u64,
+        file_offset: u64,
+    ) -> AdmittedBatch {
+        budget.reserve(4096).expect("reserve test buffer");
+        let mut direct = DirectBuf::new(4096);
+        direct.set_len(4096);
+        AdmittedBatch {
+            ticket,
+            file_offset,
+            aligned_len: 4096,
+            buffer: ParallelBuffer::activate(direct, std::sync::Arc::clone(budget), 4096),
+        }
+    }
+
+    #[test]
+    fn packer_coalesces_contiguous_tickets_but_stops_before_poison() {
+        let budget = std::sync::Arc::new(BufferBudget::new());
+        let mut admission = AdmissionState {
+            open: false,
+            close_cutoff: Some(4),
+            poison: Some((3, "write failure".to_owned())),
+            next_ticket: 4,
+            admitted_end: WAL_HEADER_END + 4 * 4096,
+            queue: std::collections::VecDeque::from([
+                admitted_batch(&budget, 0, WAL_HEADER_END),
+                admitted_batch(&budget, 1, WAL_HEADER_END + 4096),
+                admitted_batch(&budget, 2, WAL_HEADER_END + 2 * 4096),
+                admitted_batch(&budget, 3, WAL_HEADER_END + 3 * 4096),
+            ]),
+        };
+
+        let group = take_admitted_group(&mut admission, 0, WAL_HEADER_END, 8)
+            .expect("contiguous tickets form a valid I/O group")
+            .expect("tickets below the poison boundary remain packable");
+
+        assert_eq!(group.first_ticket, 0);
+        assert_eq!(group.next_ticket, 3);
+        assert_eq!(group.reserved_end, WAL_HEADER_END + 3 * 4096);
+        assert_eq!(group.writes.len(), 3);
+        assert!(admission.queue.is_empty());
+        drop(group);
+        assert_eq!(budget.state.lock().active_bytes, 0);
+    }
 
     #[test]
     fn buffer_budget_allows_one_exclusive_oversized_batch() {
