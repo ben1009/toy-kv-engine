@@ -662,3 +662,35 @@ identify which kernel operation dominates. More queue or lock substitutions
 are unlikely to close it; a future slice should reduce complete per-ticket
 handoffs and measure syscall counts and group formation before changing the
 default.
+
+### Follow-up: assertion lock and 16-group cap (rejected)
+
+**Run date:** 2026-09-27.
+
+Moving two admission-mutex reads into their `debug_assert!` expressions did
+not help the release build. Five 10,000-put, four-writer ext4 pairs measured
+candidate/baseline throughput ratios of `1.036, 0.969, 0.978, 0.952, 0.935`
+(median `0.969`). The five 100,000-put tmpfs pairs ranged from `0.515` to
+`1.617`, too noisy to support a gain. The source change was reverted.
+
+Doubling the worker's in-flight-group limit from eight to sixteen gave five
+20,000-put, 16-writer ext4 ratios of `0.966, 1.007, 1.006, 0.994, 0.961`
+(median `0.994`). Three four-writer ext4 pairs had median `1.014`; three
+eight-writer ext4 pairs had median `1.003`. Thus more group slots did not
+improve the device-backed throughput. Five 100,000-put, 16-writer tmpfs pairs
+all favored the larger cap (median `1.226`), but four-writer tmpfs pairs also
+showed a `1.248` median even though those writers cannot fill eight slots.
+Same-binary tmpfs null pairs ranged from `0.692` to `1.175` with four writers
+and `0.883` to `1.110` with sixteen. The tmpfs signal warrants a controlled
+retest, not a cap increase that leaves ext4 and the main four-writer regression
+unchanged. The limit remains eight.
+
+The principal cost remains group formation and handoff: the original
+four-writer regression recorded about 200,000 solo parallel I/O groups versus
+about 94,000 leader commit groups for 200,000 puts. Raising queue depth cannot
+merge those groups. A substantive next candidate should let the worker trigger
+packing of an accumulated admission prefix while preserving immediate progress
+when the WAL is idle. It must prove that tickets do not strand, that at least
+two groups remain in flight, and that sync and recovery frontiers still retire
+only contiguous prefixes. It should then be compared with both the current
+parallel path and the leader on device-backed storage.
