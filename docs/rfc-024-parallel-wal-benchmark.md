@@ -546,3 +546,26 @@ are under `target/rfc024-adaptive-exact` (ext4) and
 `/tmp/rfc024-adaptive-exact` (tmpfs). The 50k-put profiles are
 `/tmp/rfc024-isolated-parallel.perf` and
 `/tmp/rfc024-isolated-leader.perf`.
+
+### Atomic buffer-budget fast path (rejected)
+
+**Run date:** 2026-09-27.
+
+The experiment replaced the buffer-budget mutex on the normal reservation and
+write-completion paths with an atomic byte counter. The mutex remained for
+capacity waits, oversized-buffer fairness, and close wakeups. Five alternating
+release-build pairs compared the change with the committed runtime on tmpfs
+using 50,000 puts, four writers, 1-KiB values, a 1-GiB SST target, and one
+latency sample per 100 operations. Candidate/baseline throughput ratios were
+`0.677, 0.940, 1.105, 0.978, 0.842`; the median was `0.940` and the exhaustive
+paired bootstrap 95% interval was `0.677–1.105`. Median p99 and process CPU
+ratios were `1.476` and `1.076`. One ext4 screening pair measured `0.511`
+throughput, `1.622` p99, and `1.214` process CPU ratios; that single pair is
+not a device-backed estimate, but also gave no reason to continue the run.
+The prototype was reverted. Reducing these per-buffer mutex acquisitions did
+not improve end-to-end performance, so further work should focus on reducing
+the pipeline's producer-to-worker/coordinator handoffs rather than replacing
+another individual lock.
+
+The raw JSONL from this screening session is
+`/tmp/rfc024-buffer-budget-pairs.jsonl`.
