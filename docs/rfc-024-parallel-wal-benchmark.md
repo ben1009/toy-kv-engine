@@ -1,9 +1,9 @@
 # RFC 024 Slice 7: Parallel WAL benchmark outcome
 
-**Decision:** Keep the client-leader WAL as the default. The opt-in parallel
-candidate reached the intended concurrency and overlapped writes with
-`fdatasync`, but did not demonstrate a reliable end-to-end gain and regressed
-several latency and throughput cases.
+**Decision:** Keep the client-leader WAL as the default. The initial opt-in
+parallel candidate reached the intended concurrency and overlapped writes
+with `fdatasync`, but regressed several cases. Later coalescing improvements
+helped device-backed runs; tmpfs still falls well behind the leader.
 
 ## Run manifest
 
@@ -181,10 +181,208 @@ its 95% interval includes parity. It also loses consistently on tmpfs, has a
 large p99 regression in the exact case, and fails the one-writer batch
 throughput bound. The pipeline is real, but not beneficial enough to adopt.
 
-If further work is approved, investigate coalescing adjacent tickets into
-fewer I/O groups and batching worker notifications before trying a second
-worker or ring. Retest with the same paired gate after that change.
+The follow-up below explores adjacent-ticket packing and coalesced worker
+notifications. It remains below the adoption gate on the exact workload; repeat
+that case in a five-pair series before considering another worker or ring.
 
-Raw JSONL outputs from this session are in
-`/tmp/rfc024-slice7-artifacts`; the persistent summary tables above record the
-adoption-relevant measurements.
+## Exploratory optimization follow-up
+
+After the Slice 7 measurements, the candidate packer was changed to combine up
+to eight already-queued contiguous tickets into one I/O group, without adding a
+timed batching delay. It now constructs the group directly from the admission
+queue, removing the intermediate batch vector and second admission-lock
+acquisition. Worker eventfd notifications coalesce while one wake is pending,
+and the benchmark reports both notification requests and actual eventfd writes.
+
+Five paired 20k-operation ext4 WAL-focused runs (1 GiB SST target, four
+writers) measured paired parallel/leader throughput ratios of 1.089, 1.129,
+1.179, 1.135, and 1.053. The median paired gain was 12.9%, with a paired
+bootstrap 95% percentile interval of 5.3%–17.9%. Median p99 was 2.266 ms for
+parallel versus 2.333 ms for the leader. Median group counts were 18,136
+parallel versus 8,916 leader; parallel groups were still mostly solo (16,315
+solo groups). Median worker eventfd writes fell from 18,136 notification
+requests to 13,866 syscalls.
+
+The exact 200k-operation ext4 case (1 MiB SST target) was also run as five
+pairs. Parallel/leader throughput ratios were 1.869, 0.687, 1.521, 1.780, and
+0.657; the median paired ratio was 1.521, but the paired bootstrap 95%
+percentile interval (0.657–1.869) crosses parity, and only three pairs favored
+parallel. Per-mode median p99 was 8.795 ms for parallel and 11.516 ms for the
+leader, but paired tail latency also varied sharply. The exact case therefore
+does not establish a repeatable adoption gain; keep the leader as default.
+
+### Conditional worker wakeup
+
+The worker now skips eventfd signaling when it is not waiting for ring or
+command progress. Five paired 20k-operation ext4 runs (four writers, 1 KiB
+values, 1 GiB SST target) compared this with the previous coalesced-eventfd
+behavior. Run order alternated by pair. Conditional/always-signal throughput
+ratios were 0.960, 0.982, 1.014, 1.053, and 0.999; the median was 0.999 and
+the paired bootstrap 95% percentile interval was 0.960–1.053. Median p99 was
+2.283 ms with conditional wakeups and 2.292 ms with unconditional signaling.
+This did not produce a measurable throughput or tail-latency gain.
+
+The eventfd syscall count did fall substantially: median writes went from
+13,969 to 1,509 per run, an 89% reduction. Median process CPU time (user plus
+system) was 1,780 ms versus 1,805 ms. Keep this as a syscall-efficiency
+improvement, not as evidence that the WAL is faster. The current candidate's
+separate five-pair comparison against the leader measured a 9.7% median gain
+(paired bootstrap 95% interval 5.2%–12.0%); median p99 was 2.269 ms versus
+2.442 ms for the leader.
+
+At 16 writers, five more alternating pairs produced a median
+conditional/always-signal throughput ratio of 0.996 (−0.4%); its bootstrap
+interval was 0.376–1.011 because the first conditional run was a large outlier
+(0.376). Excluding that run, the remaining four paired ratios were 0.966,
+0.996, 0.997, and 1.011, with no consistent throughput gain. Median p99 was
+2.426 ms versus 2.431 ms, and median eventfd writes fell from 7,232 to 2,554
+(65%). This reinforces the syscall-reduction result without establishing a
+speedup.
+
+A profiled candidate run showed the larger throughput opportunity: 20,000
+operations used 8,253 `fdatasync` calls covering 17,835 groups (2.16 groups
+per sync), while 88.2% of commit groups contained one ticket. `fdatasync`
+accounted for 3.67 seconds of the 4.47-second run. This suggests testing a
+latency-bounded packer or sync-coalescing window to raise groups per sync; it
+does not establish that such a window will improve the workload, since added
+batching delay can hurt p99 and low-concurrency cases.
+
+Two no-delay coordinator alternatives were also tested in five alternating
+pairs on the same 20k-operation ext4 workload. Sending all group completions
+from one CQE drain as one channel message had a median parallel throughput
+ratio of 0.933 versus scalar completion messages (−6.7%; paired bootstrap 95%
+interval 0.897–1.049). Median p99 was effectively unchanged at 2.281 ms versus
+2.274 ms, while median sync calls increased from 8,614 to 9,443 and groups per
+sync fell from 2.116 to 1.915. The completion-vector change was discarded.
+
+Suppressing the durability condition-variable notification after successful
+group writes also failed the throughput check: median throughput ratio was
+0.914 (−8.6%; paired bootstrap 95% interval 0.509–0.975), median p99 was
+2.293 ms versus 2.257 ms, and median sync calls rose from 8,707 to 9,618. It
+reduced median process CPU time by about 5.7%, but reduced groups per sync from
+2.077 to 1.947; the notification behavior was retained. This indicates that
+the current coordinator's useful coalescing depends on scheduling between
+completed groups, so reducing wakeups in isolation is not an end-to-end win.
+
+### Conditional sync coalescing follow-up
+
+The initial coalescing candidate waited up to 50 microseconds only when a contiguous written
+prefix is ready and tickets already admitted at that instant remain unwritten.
+It freezes the ticket cutoff and deadline; new admission cannot prolong the
+wait. It still syncs the captured written prefix after timeout, worker closure,
+or poison. This differs from adding a delay to every group or to the
+solo-leader path.
+
+Five alternating paired ext4 runs of the 20k-operation, four-writer,
+1-KiB-value, 1-GiB-SST workload measured coalescing/no-wait throughput ratios
+of 1.529, 1.484, 1.434, 1.434, and 1.383 (median 1.434). Median sync calls
+fell from 9,097 to 5,459 and groups per sync rose from 2.00 to 3.15. Three
+additional pairs with 2,000 latency samples per run measured a median 1.412
+throughput ratio and a median p99 ratio of 0.585. Four 5k-operation,
+one-writer no-wait/coalescing pairs measured a median throughput ratio of
+1.006, with no observed p99 regression; the one-writer path normally has no
+later admitted ticket to wait for.
+
+Five further alternating ext4 pairs compared the optimized parallel path with
+the leader in the same binary: throughput ratios were 1.516, 1.500, 1.610,
+1.626, and 1.627 (median 1.610; paired bootstrap 95% interval 1.500–1.627).
+Median p99 was 1.677 ms for parallel versus 2.452 ms for the leader. Three
+5k-operation one-writer leader/parallel pairs measured a median throughput
+ratio of 0.965 and p99 ratio of 1.029. One earlier 20k one-writer pair was
+discarded as inconclusive because mean `fdatasync` time changed from 0.47 to
+1.36 ms between arms; the four shorter alternating pairs had stable mean sync
+times near 0.33 ms.
+
+This is a measured improvement for the WAL-isolated four-writer ext4 case.
+The original 200k-operation, 1-MiB-SST regression case, tmpfs, and the full
+writer-count/workload matrix have not been rerun with this optimization, so
+the original decision to leave parallel WAL opt-in remains in force.
+
+The 20k-operation, 1-MiB-SST rotation case was then rerun. Five ext4
+leader/parallel pairs had throughput ratios 0.653, 2.472, 4.492, 1.408, and
+1.434 (median 1.434), with large `fdatasync` latency swings between arms.
+The same tmpfs case had ratios 0.304, 0.254, 0.447, 0.295, and 0.451 (median
+0.304). A separate three-pair tmpfs comparison found that removing the
+50-microsecond wait improved the parallel path by about 15% at the median,
+but left most of its gap to the leader. A release-only removal of worker
+invariant scans measured a 1.012 median ratio in five tmpfs pairs and was
+discarded as noise.
+
+To avoid the cheap-sync penalty, coalescing now requires the preceding
+`fdatasync` to have taken at least 100 microseconds. Five alternating tmpfs
+fixed/adaptive pairs measured adaptive throughput ratios 1.134, 1.078, 1.084,
+0.833, and 1.049 (median 1.078). Ten additional alternating tmpfs pairs
+measured a median ratio of 1.143, with a paired bootstrap 95% interval of
+1.100–1.216; nine of ten favored adaptive coalescing. Five ext4 WAL-isolated
+pairs measured
+0.987, 1.005, 1.031, 1.025, and 0.996 (median 1.005); three one-writer
+ext4 pairs measured a median ratio of 1.006 and p99 ratio of 1.007. A direct
+five-pair tmpfs leader/adaptive comparison on the rotation case still had a
+parallel/leader median of 0.468. The adaptive wait is a modest improvement
+for fast sync, not a solution to the parallel pipeline's tmpfs CPU and
+thread-handoff overhead.
+
+### Adaptive candidate on the original 200k-write case
+
+Three alternating leader/parallel pairs reran the original regression workload:
+200,000 single puts, four writers, 1-KiB values, a 1-MiB SST target, and one
+latency sample per 100 operations. The parallel/leader throughput ratios on
+ext4 were 0.993, 1.400, and 2.234 (median 1.400); p99 ratios were 1.012,
+0.876, and 0.198 (median 0.876). The wide variation, including a pair below
+parity, does not satisfy the adoption gate. On tmpfs, throughput ratios were
+0.499, 0.497, and 0.453 (median 0.497), while p99 ratios were 2.358, 1.818,
+and 1.858 (median 1.858). The leader remains the default.
+
+The tmpfs median process CPU time was 7.43 seconds for parallel versus 2.83
+seconds for the leader. Median aggregate `fdatasync` time was only 25 ms versus
+19 ms, respectively, so sync latency cannot explain the gap. A separate
+50,000-put tmpfs profile measured roughly 61,000 parallel ops/s at 1.91 seconds
+of process CPU versus 150,000 leader ops/s at 0.71 seconds. This points to
+per-ticket CPU and handoff costs in the parallel pipeline as the next area to
+reduce; the profile alone does not attribute the full difference to one call.
+
+Three low-risk prototypes were measured and discarded. A 5-microsecond packer
+wait reduced group count but had a 0.602 median throughput ratio against the
+unchanged parallel path in five tmpfs pairs, and one ext4 pair also regressed.
+Replacing the worker maps with `AHashMap` gave a 0.971 median ratio in five
+tmpfs pairs. Bounding the worker command channel gave a 0.893 median ratio in
+seven tmpfs pairs. None is retained. Further speedup likely requires reducing
+the number of per-ticket producer/packer/worker/coordinator handoffs, while
+preserving ordered offset allocation and the durability frontier. This is a
+new implementation slice, not a conclusion that parallel WAL is faster on all
+storage.
+
+An additional inline-event prototype replaced per-completion event vectors
+with `SmallVec`. Twenty alternating tmpfs pairs of the 50k-put WAL-isolated
+workload had a 1.029 median throughput ratio against the unchanged parallel
+path, with 13 of 20 pairs favoring the prototype. Five alternating ext4 pairs
+of the 20k-put WAL-isolated workload measured 1.024, 0.905, 1.011, 0.889, and
+0.925 (median 0.925). Because the device-backed case regressed, the prototype
+and its direct dependency were reverted. Reducing worker allocations alone
+did not address the dominant pipeline cost.
+
+Raw JSONL outputs from the Slice 7 session are in
+`/tmp/rfc024-slice7-artifacts`; the current 20k WAL-focused outputs are in
+`/tmp/rfc024-packer-single-allocation-five-pair`, and the exact-case pairs are
+in `/tmp/rfc024-packer-single-allocation-exact-pair` and
+`/tmp/rfc024-packer-single-allocation-exact-followup`. The wakeup comparison
+is in `/tmp/rfc024-wake-ab-five-pair`, the updated candidate/leader comparison
+is in `/tmp/rfc024-worker-wait-five-pair`, and the diagnostic profile is in
+`/tmp/rfc024-wake-profile.json` and `/tmp/rfc024-wake-profile.stderr`. The
+16-writer wakeup comparison is in `/tmp/rfc024-wake-ab-16w-five-pair`. The
+persistent summary tables above record the adoption-relevant measurements.
+The completion-message comparison is in `/tmp/rfc024-cqe-batch-ab`, and the
+condition-variable notification comparison is in
+`/tmp/rfc024-no-written-wakeup-ab`. The conditional-coalescing JSON outputs
+are under `target/rfc024-coalesce-paired`, `target/rfc024-coalesce-p99`,
+`target/rfc024-coalesce-solo`, `target/rfc024-coalesce-leader`, and
+`target/rfc024-coalesce-leader-solo`. The rotation comparison is under
+`target/rfc024-coalesce-rotation` and `/tmp/rfc024-coalesce-rotation`; the
+adaptive comparisons are under `/tmp/rfc024-adaptive-ab`,
+`/tmp/rfc024-adaptive-ab-extended`,
+`target/rfc024-adaptive-ab`, `target/rfc024-adaptive-solo`, and
+`/tmp/rfc024-adaptive-leader-tmpfs`. The original 200k-write adaptive pairs
+are under `target/rfc024-adaptive-exact` (ext4) and
+`/tmp/rfc024-adaptive-exact` (tmpfs). The 50k-put profiles are
+`/tmp/rfc024-isolated-parallel.perf` and
+`/tmp/rfc024-isolated-leader.perf`.

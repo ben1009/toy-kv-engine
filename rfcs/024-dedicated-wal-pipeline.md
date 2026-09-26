@@ -297,9 +297,14 @@ at most one sync in flight. The I/O worker continues submitting later groups
 while that call runs; this is why the coordinator cannot block the ring worker
 on `fdatasync`. Whether a filesystem lets the sync overlap later direct
 writes efficiently is a device-backed measurement, not a guarantee of this
-design. The coordinator may coalesce several completed groups into one call but
-does not add a fixed batching delay: the measured widened solo-leader window
-reduced throughput.
+design. The coordinator may coalesce several completed groups into one call.
+When a written prefix is ready and already-admitted tickets remain unwritten,
+it may wait up to 50 microseconds for that captured ticket cutoff before
+syncing, but only after the preceding `fdatasync` took at least 100
+microseconds. New admission cannot extend the cutoff or deadline. A lone
+writer does not incur this wait. The latency check avoids adding the wait on
+cheap-sync filesystems. This bounded wait is specific to the parallel
+pipeline; a widened solo-leader batching window reduced throughput.
 
 On successful sync, the coordinator advances `durable_ticket` to one past the
 captured ticket and wakes only tickets now covered. A later group may also
