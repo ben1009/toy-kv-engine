@@ -1051,12 +1051,9 @@ fn synchronize_written_prefix(sync_file: &File, inner: &RuntimeInner) -> Result<
     };
 
     let message = format!("fdatasync failed: {error}");
-    {
-        let mut state = inner.durability.state.lock();
-        let poison = state.durable_frontier;
-        set_poison(&mut state, poison, message.clone());
-        inner.durability.changed.notify_all();
-    }
+    let mut state = inner.durability.state.lock();
+    let poison = state.durable_frontier;
+    set_poison(&mut state, poison, message.clone());
     let mut admission = inner.admission.lock();
     admission.open = false;
     if admission
@@ -1068,6 +1065,10 @@ fn synchronize_written_prefix(sync_file: &File, inner: &RuntimeInner) -> Result<
     }
     inner.admission_changed.notify_all();
     inner.buffer_budget.close();
+    // Publish the admission poison before waking writers that are waiting on
+    // this failed sync. Otherwise a waiter can return `Err` and race a new
+    // batch into the still-open admission queue.
+    inner.durability.changed.notify_all();
 
     Ok(())
 }
