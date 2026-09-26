@@ -688,9 +688,31 @@ unchanged. The limit remains eight.
 The principal cost remains group formation and handoff: the original
 four-writer regression recorded about 200,000 solo parallel I/O groups versus
 about 94,000 leader commit groups for 200,000 puts. Raising queue depth cannot
-merge those groups. A substantive next candidate should let the worker trigger
-packing of an accumulated admission prefix while preserving immediate progress
-when the WAL is idle. It must prove that tickets do not strand, that at least
-two groups remain in flight, and that sync and recovery frontiers still retire
-only contiguous prefixes. It should then be compared with both the current
-parallel path and the leader on device-backed storage.
+merge those groups. The completion-triggered candidate below tested one way
+to accumulate tickets; it did not improve the device-backed workload.
+
+### Completion-triggered packing (rejected)
+
+**Run date:** 2026-09-27.
+
+A candidate left one admission ticket queued while an earlier group was
+active, packing when a second ticket arrived or when the coordinator consumed
+the earlier group's completion. An idle WAL still packed immediately. The
+focused parallel-WAL nextest suite passed all 68 selected tests, and the
+all-features Clippy check passed, but paired release benchmarks rejected the
+change.
+
+With 100,000 puts and four writers, five tmpfs candidate/baseline throughput
+ratios were `1.045, 0.828, 0.784, 0.716, 1.002` (median `0.828`); the median
+sampled p99 ratio was `1.820`. With 20,000 puts and four writers on ext4, all
+five ratios were below one: `0.945, 0.934, 0.915, 0.932, 0.931` (median
+`0.932`), with higher system CPU in every pair. Three eight-writer ext4 pairs
+had a `0.991` median. The single-writer ext4 runs experienced large device
+latency swings and are not useful as a performance estimate. The source
+change was reverted.
+
+This experiment let the queue accumulate, but added a slot-state lookup to
+admission and moved some preallocation and group submission onto the sync
+coordinator's completion path. The measurements do not isolate either cost;
+they establish that this handoff design is slower. A future group-formation
+change should remove a pipeline handoff rather than wait for another one.
