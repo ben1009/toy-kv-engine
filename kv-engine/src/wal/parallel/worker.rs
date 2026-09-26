@@ -1724,40 +1724,42 @@ fn run_worker_loop<B: WorkerBuffer>(
             flush_staged_writes(ring_staged, core, sync_progress, || ring.submit())?;
         }
 
-        let mut completion_event = sync_progress.begin_io_event();
-        #[cfg(feature = "chaos-testing")]
-        let mut completed = drain_completions(ring);
-        #[cfg(not(feature = "chaos-testing"))]
-        let completed = drain_completions(ring);
-        let completion_at = completion_event.event_timestamp();
-        completion_event.set_event_at(completion_at);
-        completion_event.record_write_completions(completed.len() as u64);
-        #[cfg(feature = "chaos-testing")]
-        if crate::chaos::failpoint::defer_lowest_parallel_wal_group_completion()
-            && let Some(lowest_ticket) = core.lowest_group_ticket()
-        {
-            let mut ready = Vec::with_capacity(completed.len());
-            for completion in completed.drain(..) {
-                let request_id = RequestId(completion.0);
-                if core.request_ticket_start(request_id) == Some(lowest_ticket) {
-                    deferred_lowest_group_completions.push(completion);
-                } else {
-                    ready.push(completion);
+        let completion_count = {
+            let mut completion_event = sync_progress.begin_io_event();
+            #[cfg(feature = "chaos-testing")]
+            let mut completed = drain_completions(ring);
+            #[cfg(not(feature = "chaos-testing"))]
+            let completed = drain_completions(ring);
+            let completion_at = completion_event.event_timestamp();
+            completion_event.set_event_at(completion_at);
+            completion_event.record_write_completions(completed.len() as u64);
+            #[cfg(feature = "chaos-testing")]
+            if crate::chaos::failpoint::defer_lowest_parallel_wal_group_completion()
+                && let Some(lowest_ticket) = core.lowest_group_ticket()
+            {
+                let mut ready = Vec::with_capacity(completed.len());
+                for completion in completed.drain(..) {
+                    let request_id = RequestId(completion.0);
+                    if core.request_ticket_start(request_id) == Some(lowest_ticket) {
+                        deferred_lowest_group_completions.push(completion);
+                    } else {
+                        ready.push(completion);
+                    }
                 }
+                completed = ready;
             }
-            completed = ready;
-        }
-        let completion_count = completed.len();
-        process_completions(
-            completed,
-            core,
-            buffer_pool,
-            group_permits,
-            completions,
-            slots,
-            &completion_event,
-        )?;
-        drop(completion_event);
+            let completion_count = completed.len();
+            process_completions(
+                completed,
+                core,
+                buffer_pool,
+                group_permits,
+                completions,
+                slots,
+                &completion_event,
+            )?;
+            completion_count
+        };
 
         if core.is_idle() && ring_staged.is_empty() {
             if *stopping {
