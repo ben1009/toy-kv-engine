@@ -1582,6 +1582,14 @@ impl MemTable {
         self.wal.as_ref().and_then(Wal::parallel_runtime_is_closed)
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_parallel_wal_file_size_limit_for_test(&self, limit: u64) -> Result<()> {
+        self.wal
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("memtable has no WAL"))?
+            .set_file_size_limit_for_test(limit)
+    }
+
     pub(crate) fn wal_path(&self) -> Option<&Path> {
         self.wal_path.as_deref()
     }

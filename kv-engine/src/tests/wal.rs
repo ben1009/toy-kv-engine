@@ -23,6 +23,15 @@ fn new_skiplist() -> Arc<SkipMap<Bytes, Bytes>> {
     Arc::new(SkipMap::new())
 }
 
+fn set_parallel_wal_file_size_limit(engine: &KvEngine, limit: u64) -> usize {
+    let state = engine.inner.state.load_full();
+    state
+        .memtable
+        .set_parallel_wal_file_size_limit_for_test(limit)
+        .expect("set active parallel WAL size limit");
+    state.memtable.id()
+}
+
 #[test]
 fn test_wal_v5_create_preserves_identity_header() {
     let dir = tempdir().unwrap();
@@ -126,6 +135,67 @@ fn test_parallel_v4_wal_writes_syncs_and_recovers() {
         skiplist.get(b"key-2".as_slice()).unwrap().value().as_ref(),
         b"value-2"
     );
+    assert_eq!(batch.range_tombstones.len(), 1);
+    assert_eq!(batch.range_tombstones[0].start.as_ref(), b"range-start");
+    assert_eq!(batch.range_tombstones[0].end.as_ref(), b"range-end");
+}
+
+#[test]
+fn test_parallel_v4_recovery_stops_at_first_invalid_batch() {
+    const BATCH_ALIGNMENT: usize = 4096;
+    const WAL_HEADER_END: usize = 4096;
+
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("candidate-v4-hole.wal");
+    let wal = match Wal::create_with_io_mode(&path, WalIoMode::Parallel) {
+        Ok(wal) => wal,
+        Err(error) if is_io_uring_unavailable_error(&error) => {
+            eprintln!("skipping test (io_uring unavailable): {error:#}");
+            return;
+        }
+        Err(error) => panic!("failed to create WAL: {error:#}"),
+    };
+
+    for (key, value, commit_ts) in [
+        (b"before".as_slice(), b"durable-before".as_slice(), 1),
+        (b"hole".as_slice(), b"damaged".as_slice(), 2),
+        (b"after".as_slice(), b"complete-after-hole".as_slice(), 3),
+    ] {
+        let ticket = wal.put_batch(&[(key, value)], commit_ts).unwrap();
+        wal.submit_and_commit(ticket).unwrap();
+    }
+    wal.close().unwrap();
+    drop(wal);
+
+    // Inject media corruption after close to test the v4 scanner's prefix rule.
+    // The separate process-kill test checks survival of acknowledged batches.
+    let mut bytes = std::fs::read(&path).unwrap();
+    let second_batch_crc = WAL_HEADER_END + BATCH_ALIGNMENT + 12;
+    bytes[second_batch_crc] ^= 0xff;
+    std::fs::write(&path, bytes).unwrap();
+
+    let skiplist = new_skiplist();
+    let range_tombstones = crate::range_tombstone::RangeTombstoneSet::new();
+    let (recovered, batch) = Wal::recover_with_range_tombstones_and_mode(
+        &path,
+        &skiplist,
+        &range_tombstones,
+        WalIoMode::Leader,
+    )
+    .unwrap();
+
+    assert_eq!(batch.max_ts, 1);
+    assert_eq!(
+        skiplist.get(b"before".as_slice()).unwrap().value().as_ref(),
+        b"durable-before"
+    );
+    assert!(skiplist.get(b"hole".as_slice()).is_none());
+    assert!(skiplist.get(b"after".as_slice()).is_none());
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().len(),
+        (WAL_HEADER_END + BATCH_ALIGNMENT) as u64
+    );
+    recovered.close().unwrap();
 }
 
 #[test]
@@ -187,6 +257,120 @@ fn test_parallel_wal_engine_publishes_point_and_transaction_commits() {
     engine.close().expect("close parallel WAL engine");
     assert_eq!(state.memtable.parallel_wal_is_closed(), Some(true));
     assert_eq!(state.imm_memtables[0].parallel_wal_is_closed(), Some(true));
+}
+
+#[test]
+fn test_parallel_wal_full_rotates_point_transaction_and_batch_writes() {
+    const TEST_WAL_CAP: u64 = 1 << 20;
+    const LARGE_VALUE_LEN: usize = 60 * 1024;
+
+    let dir = tempdir().unwrap();
+    let mut options = LsmStorageOptions::default_for_test();
+    options.enable_wal = true;
+    options.serializable = true;
+    options.target_sst_size = 1 << 30;
+    let engine = match KvEngine::open_with_wal_io_mode(dir.path(), options, WalIoMode::Parallel) {
+        Ok(engine) => engine,
+        Err(error) if is_io_uring_unavailable_error(&error) => {
+            eprintln!("skipping test (io_uring unavailable): {error:#}");
+            return;
+        }
+        Err(error) => panic!("failed to open parallel WAL engine: {error:#}"),
+    };
+    let large_value = vec![b'x'; LARGE_VALUE_LEN];
+
+    let first_memtable_id = set_parallel_wal_file_size_limit(&engine, TEST_WAL_CAP);
+    engine.put(b"conflict", b"initial").unwrap();
+    for _ in 0..15 {
+        engine.put(b"filler", &large_value).unwrap();
+    }
+    let before_point_rotation = Arc::clone(&engine.inner.state.load().memtable);
+    assert_eq!(before_point_rotation.id(), first_memtable_id);
+    assert_eq!(before_point_rotation.wal_batch_count(), Some(16));
+
+    let conflicting_txn = engine.new_txn().unwrap();
+    assert_eq!(
+        conflicting_txn.get(b"conflict").unwrap().as_deref(),
+        Some(&b"initial"[..])
+    );
+    conflicting_txn
+        .put(b"transaction-conflict-write", b"must-not-publish")
+        .unwrap();
+    engine.put(b"conflict", &large_value).unwrap();
+    let point_rotation_id = engine.inner.state.load().memtable.id();
+    assert_ne!(point_rotation_id, first_memtable_id);
+    assert_eq!(before_point_rotation.wal_batch_count(), Some(16));
+    assert!(conflicting_txn.commit().is_err());
+
+    set_parallel_wal_file_size_limit(&engine, TEST_WAL_CAP);
+    for _ in 0..14 {
+        engine.put(b"filler", &large_value).unwrap();
+    }
+    let before_transaction_rotation = Arc::clone(&engine.inner.state.load().memtable);
+    assert_eq!(before_transaction_rotation.wal_batch_count(), Some(15));
+    let transaction = engine.new_txn().unwrap();
+    transaction
+        .put(b"transaction-rotation", &large_value)
+        .unwrap();
+    transaction.commit().unwrap();
+    assert_ne!(
+        engine.inner.state.load().memtable.id(),
+        before_transaction_rotation.id()
+    );
+    assert_eq!(before_transaction_rotation.wal_batch_count(), Some(15));
+
+    set_parallel_wal_file_size_limit(&engine, TEST_WAL_CAP);
+    for _ in 0..14 {
+        engine.put(b"filler", &large_value).unwrap();
+    }
+    let before_batch_rotation = Arc::clone(&engine.inner.state.load().memtable);
+    assert_eq!(before_batch_rotation.wal_batch_count(), Some(15));
+    engine
+        .write_batch(&[WriteBatchRecord::Put(
+            b"batch-rotation".as_slice(),
+            large_value.as_slice(),
+        )])
+        .unwrap();
+    assert_ne!(
+        engine.inner.state.load().memtable.id(),
+        before_batch_rotation.id()
+    );
+    assert_eq!(before_batch_rotation.wal_batch_count(), Some(15));
+
+    assert_eq!(
+        engine.get(b"conflict").unwrap().as_deref(),
+        Some(large_value.as_slice())
+    );
+    assert_eq!(
+        engine.get(b"transaction-rotation").unwrap().as_deref(),
+        Some(large_value.as_slice())
+    );
+    assert_eq!(
+        engine.get(b"batch-rotation").unwrap().as_deref(),
+        Some(large_value.as_slice())
+    );
+    engine.close().unwrap();
+    drop(engine);
+
+    let mut options = LsmStorageOptions::default_for_test();
+    options.enable_wal = true;
+    options.serializable = true;
+    options.target_sst_size = 1 << 30;
+    let reopened =
+        KvEngine::open_with_wal_io_mode(dir.path(), options, WalIoMode::Parallel).unwrap();
+    assert_eq!(
+        reopened.get(b"conflict").unwrap().as_deref(),
+        Some(large_value.as_slice())
+    );
+    assert_eq!(
+        reopened.get(b"transaction-rotation").unwrap().as_deref(),
+        Some(large_value.as_slice())
+    );
+    assert_eq!(
+        reopened.get(b"batch-rotation").unwrap().as_deref(),
+        Some(large_value.as_slice())
+    );
+    reopened.close().unwrap();
 }
 
 #[cfg(target_os = "linux")]
@@ -528,6 +712,52 @@ fn test_v5_wal_recovery_rejects_corrupt_middle_batch() {
     bytes[middle_payload] ^= 0xff;
     std::fs::write(&path, bytes).unwrap();
     assert!(Wal::recover(&path, &new_skiplist()).is_err());
+}
+
+#[test]
+fn test_v5_family_recovery_rejects_valid_batch_after_zero_hole() {
+    for version in [
+        crate::pitr::WAL_V5_VERSION_LEGACY,
+        crate::pitr::WAL_V5_VERSION,
+    ] {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join(format!("v{version}-zero-hole.wal"));
+        let header = crate::pitr::WalV5Header {
+            wal_format_version: version,
+            timeline_id: crate::pitr::TimelineId([1; 16]),
+            archive_epoch_id: crate::pitr::ArchiveEpochId([2; 16]),
+            segment_id: crate::pitr::SegmentId(3),
+            predecessor: crate::pitr::ChainAnchor::Genesis {
+                archive_epoch_id: crate::pitr::ArchiveEpochId([2; 16]),
+            },
+        };
+        let make_batch = |commit_ts| crate::pitr::WalBatch {
+            commit_ts,
+            recorded_at: crate::pitr::RecordedAt {
+                secs: commit_ts as i64,
+                nanos: 0,
+            },
+            entries: vec![crate::pitr::WalEntry::Put {
+                key: vec![commit_ts as u8],
+                value: vec![crate::vlog::KvKind::Inline as u8, commit_ts as u8],
+            }],
+        };
+        let mut bytes = crate::pitr::encode_v5_file_header(header).unwrap().to_vec();
+        bytes.extend(
+            crate::pitr::encode_v5_batch(&make_batch(1), crate::pitr::LIVE_WAL_V5_LIMITS).unwrap(),
+        );
+        bytes.extend(vec![0; crate::pitr::WAL_V5_ALIGNMENT]);
+        bytes.extend(
+            crate::pitr::encode_v5_batch(&make_batch(2), crate::pitr::LIVE_WAL_V5_LIMITS).unwrap(),
+        );
+        std::fs::write(&path, &bytes).unwrap();
+
+        assert!(
+            Wal::recover(&path, &new_skiplist()).is_err(),
+            "v{version} recovery must reject a valid batch after a zero-filled hole"
+        );
+        assert_eq!(std::fs::read(path).unwrap(), bytes);
+    }
 }
 
 #[test]

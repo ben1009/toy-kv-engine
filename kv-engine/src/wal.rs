@@ -1282,6 +1282,14 @@ impl Wal {
         )
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_file_size_limit_for_test(&self, limit: u64) -> Result<()> {
+        self.parallel_runtime
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("file size limit applies only to parallel WALs"))?
+            .set_file_size_limit(limit)
+    }
+
     #[allow(dead_code)]
     pub(crate) fn batch_count(&self) -> u64 {
         self.parallel_runtime.as_ref().map_or_else(

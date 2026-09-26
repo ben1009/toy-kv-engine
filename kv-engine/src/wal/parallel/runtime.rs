@@ -233,6 +233,8 @@ struct DurabilityShared {
 struct RuntimeInner {
     admission: Mutex<AdmissionState>,
     admission_changed: Condvar,
+    #[cfg(test)]
+    file_size_limit: std::sync::atomic::AtomicU64,
     buffer_budget: Arc<BufferBudget>,
     buffer_pool: Arc<ArrayQueue<ParallelBuffer>>,
     worker: IoWorkerClient<ParallelBuffer>,
@@ -293,6 +295,8 @@ impl ParallelWalRuntime {
                 queue: VecDeque::new(),
             }),
             admission_changed: Condvar::new(),
+            #[cfg(test)]
+            file_size_limit: std::sync::atomic::AtomicU64::new(MAX_WAL_FILE_SIZE),
             buffer_budget,
             buffer_pool,
             worker: worker_client,
@@ -394,6 +398,14 @@ impl ParallelWalRuntime {
         };
 
         let mut state = self.inner.admission.lock();
+        #[cfg(test)]
+        let file_size_limit = self
+            .inner
+            .file_size_limit
+            .load(std::sync::atomic::Ordering::Acquire);
+        #[cfg(not(test))]
+        let file_size_limit = MAX_WAL_FILE_SIZE;
+
         if let Some((ticket, error)) = &state.poison {
             let error = anyhow!("parallel WAL is poisoned at ticket {ticket}: {error}");
             drop(state);
@@ -416,12 +428,12 @@ impl ParallelWalRuntime {
             self.recycle(buffer);
             bail!("WAL preallocation offset overflow");
         };
-        if preallocation_end > MAX_WAL_FILE_SIZE {
+        if preallocation_end > file_size_limit {
             let empty_file_end = WAL_HEADER_END.checked_add(aligned_len_u64);
             let empty_end = empty_file_end.and_then(|end| round_up(end, PREALLOC_BLOCK));
             drop(state);
             self.recycle(buffer);
-            if empty_end.is_none_or(|end| end > MAX_WAL_FILE_SIZE) {
+            if empty_end.is_none_or(|end| end > file_size_limit) {
                 return Err(anyhow!("WAL batch exceeds the maximum empty-file capacity"));
             }
             return Err(anyhow::Error::new(WalFull));
@@ -442,12 +454,32 @@ impl ParallelWalRuntime {
             aligned_len,
             buffer,
         });
+        #[cfg(feature = "chaos-testing")]
+        crate::chaos::failpoint::note_parallel_wal_admission();
         debug_assert!(WAL_HEADER_END <= state.admitted_end);
         debug_assert!(state.admitted_end <= MAX_WAL_FILE_SIZE);
         debug_assert_eq!(state.next_ticket, ticket + 1);
         self.inner.admission_changed.notify_one();
 
         Ok(ticket)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_file_size_limit(&self, limit: u64) -> Result<()> {
+        ensure!(
+            (PREALLOC_BLOCK..=MAX_WAL_FILE_SIZE).contains(&limit)
+                && limit.is_multiple_of(PREALLOC_BLOCK),
+            "test WAL size limit must be a preallocation-aligned value within the production cap"
+        );
+        let admission = self.inner.admission.lock();
+        ensure!(
+            round_up(admission.admitted_end, PREALLOC_BLOCK).is_some_and(|end| end <= limit),
+            "test WAL size limit cannot exclude admitted bytes or their preallocation extent"
+        );
+        self.inner
+            .file_size_limit
+            .store(limit, std::sync::atomic::Ordering::Release);
+        Ok(())
     }
 
     #[cfg(test)]
@@ -629,6 +661,8 @@ fn run_packer(
             .checked_add(batch.aligned_len as u64)
             .ok_or_else(|| anyhow!("parallel WAL offset overflow"))?;
         reserved_end = file_end;
+        #[cfg(feature = "chaos-testing")]
+        crate::chaos::failpoint::parallel_wal_crash_point("parallel_wal.offset_reserved");
 
         let target_preallocated_end = round_up(file_end, PREALLOC_BLOCK)
             .ok_or_else(|| anyhow!("parallel WAL preallocation offset overflow"))?;
@@ -783,7 +817,12 @@ fn drain_ready_results(
 }
 
 fn process_group_result(inner: &RuntimeInner, result: GroupWriteResult) {
+    #[cfg(feature = "chaos-testing")]
+    let result_end = result.tickets.end;
     let mut state = inner.durability.state.lock();
+    #[cfg(feature = "chaos-testing")]
+    let out_of_order_completion =
+        result.error.is_none() && result.tickets.start > state.written_frontier;
     if let Some(error) = &result.error {
         set_poison(&mut state, result.tickets.start, error.clone());
         let mut admission = inner.admission.lock();
@@ -823,7 +862,17 @@ fn process_group_result(inner: &RuntimeInner, result: GroupWriteResult) {
     let assigned = inner.admission.lock().next_ticket;
     debug_assert!(state.written_frontier <= assigned);
     debug_assert!(state.durable_frontier <= state.written_frontier);
+    #[cfg(feature = "chaos-testing")]
+    let later_group_remains_outside_prefix = state.written_frontier < result_end;
     inner.durability.changed.notify_all();
+    drop(state);
+
+    #[cfg(feature = "chaos-testing")]
+    if out_of_order_completion && later_group_remains_outside_prefix {
+        crate::chaos::failpoint::parallel_wal_crash_point(
+            "parallel_wal.later_group_completed_first",
+        );
+    }
 }
 
 fn terminalize_unresolved_prefix(inner: &RuntimeInner) {
@@ -871,6 +920,8 @@ fn synchronize_written_prefix(sync_file: &File, inner: &RuntimeInner) -> Result<
     }
 
     loop {
+        #[cfg(feature = "chaos-testing")]
+        crate::chaos::failpoint::parallel_wal_crash_point("parallel_wal.before_fdatasync");
         let result = unsafe { libc::fdatasync(sync_file.as_raw_fd()) };
         if result == 0 {
             break;
@@ -899,6 +950,8 @@ fn synchronize_written_prefix(sync_file: &File, inner: &RuntimeInner) -> Result<
         return Ok(());
     }
 
+    #[cfg(feature = "chaos-testing")]
+    crate::chaos::failpoint::parallel_wal_crash_point("parallel_wal.after_fdatasync");
     let mut state = inner.durability.state.lock();
     let acknowledged = state
         .poison_ticket
