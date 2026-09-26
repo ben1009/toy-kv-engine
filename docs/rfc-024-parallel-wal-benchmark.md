@@ -631,3 +631,34 @@ The raw benchmark JSON is under `/tmp/rfc024-arrayqueue-bench`. A more
 promising next experiment should reduce the number of per-group handoffs,
 for example by batching already-formed groups into one worker command, rather
 than replacing the worker's queue and wait primitive independently.
+
+### Follow-up: bounded channel and one scheduler yield (rejected)
+
+**Run date:** 2026-09-27.
+
+On the current inline-group baseline, a bounded crossbeam command channel
+retained the worker's blocking receive path. Five alternating tmpfs pairs of
+100,000 puts measured candidate/baseline throughput ratios of `0.972, 1.056,
+0.833, 0.795, 0.713` (median `0.833`). Three 10,000-put ext4 pairs measured
+`0.976, 0.945, 1.024` (median `0.976`). This confirms the earlier bounded
+channel rejection without changing the worker wakeup mechanism. The change was
+reverted.
+
+A separate candidate yielded the CPU once after taking the packer mutex and
+releasing the admission mutex, giving other already-encoding writers a chance
+to join the group without a fixed timer. With the same alternating setup,
+tmpfs throughput ratios were `0.805, 1.078, 1.434, 0.818, 0.804` (median
+`0.818`); ext4 ratios were `1.022, 0.986, 0.985` (median `0.986`). The yield
+was also reverted. These small samples, especially tmpfs, have substantial
+run-to-run variance, but neither candidate met the improvement gate.
+
+For a separate 200,000-put tmpfs profile with four writers, the current
+parallel path completed roughly 45,000 puts/s and used 6.65 seconds of system
+CPU; the leader completed roughly 213,000 puts/s and used 1.18 seconds of
+system CPU. The profile was sampled in user space only because this host's
+`perf_event_paranoid=2` disallows kernel samples. The observed gap is consistent
+with the parallel path's per-group submit/wakeup work, but these samples do not
+identify which kernel operation dominates. More queue or lock substitutions
+are unlikely to close it; a future slice should reduce complete per-ticket
+handoffs and measure syscall counts and group formation before changing the
+default.
