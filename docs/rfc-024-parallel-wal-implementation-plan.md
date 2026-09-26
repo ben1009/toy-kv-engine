@@ -68,7 +68,8 @@ expose it through engine async APIs until the prerequisite tests pass.
   v5/v6 and legacy constructors must reject or ignore candidate selection
   explicitly. Keep the default on the existing leader path.
 - Define counters for `inflight_groups`, `outstanding_write_sqes`, CQEs,
-  groups per sync, worker wakeups, and preallocation time. Label software
+  groups per sync, worker eventfd notification requests, and preallocation
+  time. Notifications may coalesce and are not actual wakeups. Label software
   outstanding depth separately from measured block-device queue depth.
 
 **Exit:** The selector and counters compile, the control path is unchanged,
@@ -133,8 +134,8 @@ or rotation leave no ticket or offset hole. Mixed batch sizes preserve the
 stored admission lengths through packing. The accounting model verifies the
 normal-budget and exclusive oversized-batch paths, including rejection above
 the 240 MiB aligned-capacity limit. A blocked `fallocate` does not block
-producer admission. Worker wakeups and buffer recycling are verified after the
-worker exists.
+producer admission. Worker notification delivery and buffer recycling are
+verified after the worker exists.
 
 ### 4. Dedicated write worker and buffer ownership
 
@@ -275,14 +276,28 @@ and adoption gate also remains open.
   an SST target above the run footprint as WAL-isolated, not as reproduction.
 - Report end-to-end throughput and p50/p99, CPU, publication wait, group and
   sync coalescing, `inflight_groups`, `outstanding_write_sqes`, CQEs, worker
-  wakeups, preallocation, physical WAL bytes, and measured device queue depth
-  only when available. For every sync, record wall time, captured target,
-  `written_frontier` at sync start/end, and counts of write SQEs submitted,
-  CQEs completed, and groups completed during the call. This distinguishes
-  software concurrency from writes that actually progress while `fdatasync`
-  runs. Include PITR-on controls, run on a device-backed filesystem (ext4 or
-  XFS on NVMe where available), and prove the candidate reaches two groups in
-  flight.
+  eventfd notification requests, preallocation, WAL file length and
+  filesystem-allocated bytes, and measured device queue depth only when
+  available. The write-perf JSON records
+  process user/system CPU, WAL sync wait and memtable insertion time, plus one
+  observation per `fdatasync`: wall time, captured target, `written_frontier`
+  at sync start/end, and counts of write SQEs submitted, CQEs completed, and
+  groups completed during the call. Filesystem-allocated bytes use `st_blocks`
+  where available; they include preallocation and are not device write traffic.
+  `outstanding_write_sqes` remains a software metric and must not be presented
+  as device queue depth. These observations distinguish software concurrency
+  from writes that actually progress while `fdatasync` runs. WAL file bytes are
+  a point-in-time snapshot taken under the storage state lock and, on Linux,
+  the PITR barrier. These serialize the scan with background flush, WAL
+  reclamation, and archive reclamation; later work may reclaim files after the
+  snapshot. Include PITR-on controls, run on a device-backed
+  filesystem (ext4 or XFS on NVMe where available), and prove the candidate
+  reaches two groups in flight.
+
+  Per-sync observations and their frontier-tracking synchronization are enabled
+  only by `write-perf --profile`; this diagnostic mode adds measurement overhead.
+  Use ordinary non-profiled runs for throughput and latency adoption comparisons,
+  and use profiled runs separately to inspect write progress during `fdatasync`.
 
 **Adopt only if:** The four-writer case improves beyond the same-session null
 spread; a representative device-backed workload gains at least 10% paired

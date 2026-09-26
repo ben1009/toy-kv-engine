@@ -1302,6 +1302,26 @@ impl Wal {
         error.downcast_ref::<parallel_runtime::WalFull>().is_some()
     }
 
+    pub(crate) fn set_write_profile(&self, profile: Arc<crate::mem_table::WriteProfile>) {
+        if let Some(runtime) = &self.parallel_runtime {
+            runtime.set_write_profile(profile);
+        }
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn set_wal_sync_diagnostics_enabled(
+        &self,
+        profile: &crate::mem_table::WriteProfile,
+        enabled: bool,
+    ) -> Result<()> {
+        if let Some(runtime) = &self.parallel_runtime {
+            runtime.set_wal_sync_diagnostics_enabled(profile, enabled)
+        } else {
+            profile.set_wal_sync_diagnostics_enabled(enabled);
+            Ok(())
+        }
+    }
+
     pub(crate) fn pitr_rotation_needed(&self) -> bool {
         self.pitr_rotation_needed.load(Ordering::Acquire)
     }
@@ -2617,7 +2637,7 @@ impl Wal {
         if let Some(profile) = profile {
             profile.record_wal_leader_prepare_ns(nanos_now().saturating_sub(leader_entered));
         }
-        let result = self.submit_sqes_and_poll(ticketed_bufs, profile);
+        let result = self.submit_sqes_and_poll(ticketed_bufs, max_ticket + 1, profile);
 
         // Take the seal lock while this group still holds `submitting`: that
         // window is exclusive and ordered by group, so the lock is acquired in
@@ -2779,10 +2799,11 @@ impl Wal {
     fn submit_sqes_and_poll(
         &self,
         bufs: Vec<TicketedBuf>,
+        captured_target: u64,
         profile: Option<&crate::mem_table::WriteProfile>,
     ) -> Result<Vec<TicketedBuf>> {
         #[cfg(not(feature = "bench"))]
-        let _ = profile;
+        let _ = (captured_target, profile);
 
         // SAFETY: only called for MVCC WALs which always have a ring.
         let ring_ref = self.ring.as_ref().unwrap();
@@ -2997,7 +3018,19 @@ impl Wal {
             }
             #[cfg(feature = "bench")]
             if let Some(profile) = profile {
-                profile.record_wal_fdatasync_ns(fdatasync_start.elapsed().as_nanos() as u64);
+                let duration_ns = fdatasync_start.elapsed().as_nanos() as u64;
+                profile.record_wal_fdatasync_ns(duration_ns);
+                if profile.wal_sync_diagnostics_enabled() {
+                    profile.record_wal_sync_observation(crate::mem_table::WalSyncObservation {
+                        captured_target,
+                        written_frontier_start: captured_target,
+                        written_frontier_end: captured_target,
+                        groups_covered: 1,
+                        duration_ns,
+                        succeeded: fdatasync_err.is_none(),
+                        ..crate::mem_table::WalSyncObservation::default()
+                    });
+                }
             }
             if let Some(err) = fdatasync_err {
                 // All CQEs reaped — kernel is done with buffers, safe to drop.

@@ -9,6 +9,9 @@ use std::{
     thread::{self, JoinHandle},
 };
 
+#[cfg(feature = "bench")]
+use std::time::Instant;
+
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use crossbeam_channel::{Receiver, Sender, TryRecvError, unbounded};
 use crossbeam_queue::ArrayQueue;
@@ -17,7 +20,8 @@ use parking_lot::{Condvar, Mutex};
 use super::{
     BUFFER_POOL_BUF_SIZE, BUFFER_POOL_CAPACITY, DirectBuf, MAX_WAL_FILE_SIZE, PREALLOC_BLOCK,
     parallel_worker::{
-        GroupWriteResult, IoWorker, IoWorkerClient, WorkerBuffer, WriteBuffer, WriteGroup,
+        GroupWriteResult, IoWorker, IoWorkerClient, WalSyncProgress, WorkerBuffer, WriteBuffer,
+        WriteGroup,
     },
 };
 
@@ -238,6 +242,7 @@ struct RuntimeInner {
     buffer_budget: Arc<BufferBudget>,
     buffer_pool: Arc<ArrayQueue<ParallelBuffer>>,
     worker: IoWorkerClient<ParallelBuffer>,
+    sync_progress: Arc<WalSyncProgress>,
     preallocator: Arc<File>,
     durability: Arc<DurabilityShared>,
 }
@@ -279,6 +284,7 @@ impl ParallelWalRuntime {
 
         let mut worker = IoWorker::spawn(worker_file, Arc::clone(&buffer_pool))?;
         let worker_client = worker.client();
+        let sync_progress = worker.sync_progress();
         let worker_completions = worker.take_completions();
         let (packer_failures_tx, packer_failures_rx) = unbounded();
         let durability = Arc::new(DurabilityShared {
@@ -300,6 +306,7 @@ impl ParallelWalRuntime {
             buffer_budget,
             buffer_pool,
             worker: worker_client,
+            sync_progress,
             preallocator,
             durability: Arc::clone(&durability),
         });
@@ -495,6 +502,26 @@ impl ParallelWalRuntime {
         self.inner.admission.lock().next_ticket
     }
 
+    pub(crate) fn set_write_profile(&self, profile: Arc<crate::mem_table::WriteProfile>) {
+        self.inner.sync_progress.set_profile(profile);
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn set_wal_sync_diagnostics_enabled(
+        &self,
+        profile: &crate::mem_table::WriteProfile,
+        enabled: bool,
+    ) -> Result<()> {
+        let admission = self.inner.admission.lock();
+        validate_sync_diagnostics_transition(
+            enabled,
+            profile.wal_sync_diagnostics_enabled(),
+            admission.next_ticket,
+        )?;
+        profile.set_wal_sync_diagnostics_enabled(enabled);
+        Ok(())
+    }
+
     pub(crate) fn sync(&self) -> Result<()> {
         let cutoff = {
             let admission = self.inner.admission.lock();
@@ -667,10 +694,16 @@ fn run_packer(
         let target_preallocated_end = round_up(file_end, PREALLOC_BLOCK)
             .ok_or_else(|| anyhow!("parallel WAL preallocation offset overflow"))?;
         if target_preallocated_end > preallocated_end {
+            #[cfg(feature = "bench")]
+            let preallocation_start = Instant::now();
             if let Err(error) = preallocate(&inner.preallocator, target_preallocated_end) {
                 report_packer_failure(&inner, &failures, batch.ticket, &error);
                 return Err(error);
             }
+            #[cfg(feature = "bench")]
+            inner
+                .sync_progress
+                .record_preallocation_ns(preallocation_start.elapsed().as_nanos() as u64);
             preallocated_end = target_preallocated_end;
         }
         let admitted_end = inner.admission.lock().admitted_end;
@@ -729,6 +762,8 @@ fn report_packer_failure(
     let _ = failures.send(GroupWriteResult {
         group_id: u64::MAX,
         tickets: ticket..ticket.saturating_add(1),
+        write_count: 0,
+        write_bytes: 0,
         error: Some(message),
     });
 }
@@ -905,67 +940,145 @@ fn set_poison(state: &mut DurabilityState, ticket: u64, error: String) {
     }
 }
 
+#[cfg(feature = "bench")]
+fn validate_sync_diagnostics_transition(
+    enabled: bool,
+    currently_enabled: bool,
+    next_ticket: u64,
+) -> Result<()> {
+    ensure!(
+        !enabled || currently_enabled || next_ticket == 0,
+        "WAL sync diagnostics must be enabled before the first WAL ticket"
+    );
+    Ok(())
+}
+
 fn synchronize_written_prefix(sync_file: &File, inner: &RuntimeInner) -> Result<()> {
-    let target = {
+    let (target, durable) = {
         let state = inner.durability.state.lock();
-        state
+        let target = state
             .poison_ticket
             .map_or(state.written_frontier, |poison| {
                 state.written_frontier.min(poison)
-            })
+            });
+        (target, state.durable_frontier)
     };
-    let durable = inner.durability.state.lock().durable_frontier;
     if target <= durable {
         return Ok(());
     }
 
-    loop {
-        #[cfg(feature = "chaos-testing")]
-        crate::chaos::failpoint::parallel_wal_crash_point("parallel_wal.before_fdatasync");
+    #[cfg(feature = "chaos-testing")]
+    crate::chaos::failpoint::parallel_wal_crash_point("parallel_wal.before_fdatasync");
+    let _sync_start = inner.sync_progress.begin_sync(target, durable);
+    inner.sync_progress.start_sync_activity();
+    #[cfg(feature = "bench")]
+    let mut syscall_started_at = None;
+    #[cfg(not(feature = "bench"))]
+    let syscall_started_at = None;
+    let (sync_error, syscall_finished_at) = loop {
+        #[cfg(feature = "bench")]
+        let call_started_at = Instant::now();
         let result = unsafe { libc::fdatasync(sync_file.as_raw_fd()) };
-        if result == 0 {
-            break;
+        let error = if result == 0 {
+            None
+        } else {
+            Some(io::Error::last_os_error())
+        };
+        let call_finished_at = wal_sync_timestamp();
+        #[cfg(feature = "bench")]
+        if syscall_started_at.is_none() {
+            syscall_started_at = Some(call_started_at);
         }
-        let error = io::Error::last_os_error();
-        if error.kind() == io::ErrorKind::Interrupted {
-            continue;
+        if let Some(error) = error {
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            break (Some(error), call_finished_at);
         }
-        let message = format!("fdatasync failed: {error}");
+        break (None, call_finished_at);
+    };
+    let (_sync_end, finished_at) = inner
+        .sync_progress
+        .finish_sync(syscall_started_at, syscall_finished_at);
+    #[cfg(feature = "bench")]
+    let duration_ns = finished_at
+        .expect("benchmark WAL sync completion has a timestamp")
+        .duration_since(syscall_started_at.expect("fdatasync call records its start timestamp"))
+        .as_nanos() as u64;
+    #[cfg(not(feature = "bench"))]
+    let _ = finished_at;
+    #[cfg(feature = "bench")]
+    if let Some(profile) = inner.sync_progress.profile() {
+        profile.record_wal_sync(_sync_end.groups_covered);
+        profile.record_wal_fdatasync_ns(duration_ns);
+        if profile.wal_sync_diagnostics_enabled() {
+            profile.record_wal_sync_observation(crate::mem_table::WalSyncObservation {
+                captured_target: target,
+                written_frontier_start: _sync_end.written_frontier_start,
+                written_frontier_end: _sync_end.written_frontier_end,
+                write_sqes_submitted: _sync_end.write_sqes_submitted,
+                write_cqes_completed: _sync_end.write_cqes_completed,
+                groups_completed: _sync_end.groups_completed,
+                groups_covered: _sync_end.groups_covered,
+                duration_ns,
+                succeeded: sync_error.is_none(),
+            });
+        }
+    }
+    let Some(error) = sync_error else {
+        #[cfg(feature = "chaos-testing")]
+        crate::chaos::failpoint::parallel_wal_crash_point("parallel_wal.after_fdatasync");
+
+        let mut state = inner.durability.state.lock();
+        let acknowledged = state
+            .poison_ticket
+            .map_or(target, |poison| target.min(poison));
+        state.durable_frontier = state.durable_frontier.max(acknowledged);
+        debug_assert!(state.durable_frontier <= state.written_frontier);
+        if let Some(poison) = state.poison_ticket {
+            debug_assert!(state.durable_frontier <= poison);
+        }
+        let assigned = inner.admission.lock().next_ticket;
+        debug_assert!(state.written_frontier <= assigned);
+        inner.durability.changed.notify_all();
+        drop(state);
+        inner.sync_progress.mark_durable(acknowledged);
+
+        return Ok(());
+    };
+
+    let message = format!("fdatasync failed: {error}");
+    {
         let mut state = inner.durability.state.lock();
         let poison = state.durable_frontier;
         set_poison(&mut state, poison, message.clone());
-        drop(state);
-        let mut admission = inner.admission.lock();
-        admission.open = false;
-        if admission
-            .poison
-            .as_ref()
-            .is_none_or(|(ticket, _)| poison < *ticket)
-        {
-            admission.poison = Some((poison, message.clone()));
-        }
-        inner.admission_changed.notify_all();
-        inner.buffer_budget.close();
         inner.durability.changed.notify_all();
-        return Ok(());
     }
-
-    #[cfg(feature = "chaos-testing")]
-    crate::chaos::failpoint::parallel_wal_crash_point("parallel_wal.after_fdatasync");
-    let mut state = inner.durability.state.lock();
-    let acknowledged = state
-        .poison_ticket
-        .map_or(target, |poison| target.min(poison));
-    state.durable_frontier = state.durable_frontier.max(acknowledged);
-    debug_assert!(state.durable_frontier <= state.written_frontier);
-    if let Some(poison) = state.poison_ticket {
-        debug_assert!(state.durable_frontier <= poison);
+    let mut admission = inner.admission.lock();
+    admission.open = false;
+    if admission
+        .poison
+        .as_ref()
+        .is_none_or(|(ticket, _)| durable < *ticket)
+    {
+        admission.poison = Some((durable, message));
     }
-    let assigned = inner.admission.lock().next_ticket;
-    debug_assert!(state.written_frontier <= assigned);
-    inner.durability.changed.notify_all();
+    inner.admission_changed.notify_all();
+    inner.buffer_budget.close();
 
     Ok(())
+}
+
+#[inline]
+fn wal_sync_timestamp() -> Option<std::time::Instant> {
+    #[cfg(feature = "bench")]
+    {
+        Some(Instant::now())
+    }
+    #[cfg(not(feature = "bench"))]
+    {
+        None
+    }
 }
 
 /// Preallocate space and extend `i_size` so later direct writes target an
@@ -1015,6 +1128,8 @@ fn round_up(value: u64, alignment: u64) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "bench")]
+    use super::validate_sync_diagnostics_transition;
     use super::{
         BufferBudget, MAX_BUFFER_CAPACITY, NORMAL_ACTIVE_BUFFER_BUDGET, PREALLOC_BLOCK,
         WAL_HEADER_END, WalFull, preallocate, round_up,
@@ -1130,6 +1245,15 @@ mod tests {
         assert_eq!(round_up(4096, 1 << 20), Some(1 << 20));
         assert_eq!(round_up(1 << 20, 1 << 20), Some(1 << 20));
         assert_eq!(round_up(u64::MAX, 4096), None);
+    }
+
+    #[cfg(feature = "bench")]
+    #[test]
+    fn sync_diagnostics_can_only_be_enabled_before_wal_admission() {
+        assert!(validate_sync_diagnostics_transition(false, false, 10).is_ok());
+        assert!(validate_sync_diagnostics_transition(true, false, 0).is_ok());
+        assert!(validate_sync_diagnostics_transition(true, true, 10).is_ok());
+        assert!(validate_sync_diagnostics_transition(true, false, 10).is_err());
     }
 
     #[test]

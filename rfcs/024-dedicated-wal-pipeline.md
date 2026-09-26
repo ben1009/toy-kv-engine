@@ -478,7 +478,8 @@ of the original regression.
 
 Report throughput, p50/p99 commit latency, CPU, solo groups, buffers per group,
 groups per sync, publication-wait time, `outstanding_write_sqes`, CQE counts,
-ring count, worker wakeups, `inflight_groups`, preallocation time,
+ring count, worker eventfd notification requests (which may coalesce and are
+not actual wakeups), `inflight_groups`, preallocation time,
 `fdatasync` calls, and physical WAL bytes. Outstanding SQEs and groups measure
 the software pipeline, not block-device queue depth; report device queue depth
 separately only when it is measured at the device.
