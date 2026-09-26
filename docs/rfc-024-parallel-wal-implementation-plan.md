@@ -2,8 +2,8 @@
 
 **RFC:** [RFC 024: Dedicated WAL I/O Pipeline](../rfcs/024-dedicated-wal-pipeline.md)
 
-**Status:** Slices 1–6 implemented for the synchronous v4 WAL path; Slice 7's
-performance and adoption gate remains open
+**Status:** Slices 1–7 complete for the synchronous v4 WAL path; the
+parallel candidate remains opt-in because it did not pass the adoption gate
 
 **Last updated:** 2026-09-26
 
@@ -267,7 +267,7 @@ AddressSanitizer and LeakSanitizer commands also passed.
 
 This closes Slice 6 for the synchronous v4 candidate path. Async candidate
 writes and close remain disabled until their separate lifecycle prerequisites
-are met. Slice 7's paired benchmark and adoption gate remains open.
+are met.
 
 ### 7. Paired benchmark and adoption decision
 
@@ -312,11 +312,17 @@ the same-session pre-PITR gap. Otherwise keep the leader path as default and
 publish the measured bottleneck. A second worker/ring is a later experiment
 only if the one-ring candidate demonstrably cannot sustain useful overlap.
 
+**Outcome (2026-09-26):** The candidate reached four groups in flight and
+showed writes completing during `fdatasync`, but did not pass the throughput,
+latency, and confidence gates. Keep the leader path as default. The paired
+results, controls, and measured bottleneck are recorded in the
+[Slice 7 benchmark report](rfc-024-parallel-wal-benchmark.md).
+
 ## Review and verification cadence
 
 Slices 1-3 stayed dormant or test-only until the worker and coordinator were
-integrated. The v4 candidate is now opt-in behind the internal selector; keep
-the leader path as default until recovery and benchmark gates pass. Each
+integrated. The v4 candidate remains opt-in behind the internal selector;
+keep the leader path as default because the benchmark gate did not pass. Each
 implementation PR should state its invariant, affected WAL format, failure
 behavior, and evidence from the matching slice. Run `cargo make check` for code
 changes, focused nextest and failpoint tests while iterating, then the

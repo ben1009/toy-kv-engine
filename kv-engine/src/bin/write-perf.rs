@@ -3288,11 +3288,20 @@ fn run_wal_batch_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>
     let workload = "wal_batch_concurrent";
     let path = prepare_path(cfg, workload)?;
     let options = cfg.build_options(true, false);
-    let engine = KvEngine::open(&path, options.clone())?;
+    let engine = KvEngine::open_with_wal_io_mode(&path, options.clone(), cfg.wal_io_mode.into())?;
+    if cfg.pitr {
+        enable_pitr_for_workload(cfg, &engine, &path)?;
+    }
+    #[cfg(feature = "bench")]
+    {
+        engine.reset_write_profile();
+        engine.set_wal_sync_diagnostics_enabled(cfg.profile)?;
+    }
     let value = vec![b'x'; cfg.value_size];
     let num_keys = cfg.num;
     let writer_threads = cfg.threads;
     let baseline = collect_counters(&engine)?;
+    let cpu_start = process_cpu_times();
     let per_thread = num_keys / writer_threads;
     let remainder = num_keys % writer_threads;
     let batch_size = effective_wal_batch_size(num_keys, writer_threads, cfg.wal_batch_size);
@@ -3301,10 +3310,13 @@ fn run_wal_batch_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>
     for t in 0..writer_threads {
         let eng = engine.clone();
         let val = value.clone();
-        handles.push(std::thread::spawn(move || {
+        let sample_every = cfg.latency_sample_every;
+        handles.push(std::thread::spawn(move || -> Result<Vec<u64>> {
             let thread_ops = per_thread + usize::from(t < remainder);
             let start_idx = t * per_thread + remainder.min(t);
             let mut next = 0usize;
+            let mut batch_index = 0usize;
+            let mut latency_samples = Vec::new();
             while next < thread_ops {
                 let current_batch = (thread_ops - next).min(batch_size);
                 let mut keys = Vec::with_capacity(current_batch);
@@ -3315,26 +3327,55 @@ fn run_wal_batch_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>
                     .iter()
                     .map(|key| WriteBatchRecord::Put(key.as_slice(), val.as_slice()))
                     .collect();
-                eng.write_batch(&batch).expect("write_batch failed");
+                let sample_start = sample_every
+                    .filter(|every| batch_index.is_multiple_of(*every))
+                    .map(|_| Instant::now());
+                eng.write_batch(&batch)?;
+                if let Some(sample_start) = sample_start {
+                    latency_samples.push(sample_start.elapsed().as_nanos() as u64);
+                }
                 next += current_batch;
+                batch_index += 1;
             }
+            Ok(latency_samples)
         }));
     }
+    let mut latency_samples = Vec::new();
+    let mut writer_error = None;
     for handle in handles {
-        handle
-            .join()
-            .map_err(|_| anyhow!("writer thread panicked"))?;
+        let result = match handle.join() {
+            Ok(result) => result,
+            Err(_) => Err(anyhow!("writer thread panicked")),
+        };
+        match result {
+            Ok(samples) => latency_samples.extend(samples),
+            Err(error) => {
+                writer_error.get_or_insert(error);
+            }
+        }
+    }
+    if let Some(error) = writer_error {
+        let _ = engine.close();
+        return Err(error);
     }
     let elapsed = start.elapsed();
+    let (process_cpu_user_ms, process_cpu_system_ms) =
+        process_cpu_delta(cpu_start, process_cpu_times());
+    #[cfg(feature = "bench")]
+    let wal_pipeline = Some(wal_pipeline_record(&engine, cfg.profile)?);
+    #[cfg(not(feature = "bench"))]
+    let wal_pipeline = None;
     if cfg.profile {
         print_write_profile(&engine, workload);
     }
-    engine.drain_flush()?;
+    if !cfg.pitr {
+        engine.drain_flush()?;
+    }
     let counters = collect_counter_delta(&baseline, &collect_counters(&engine)?);
     engine.close()?;
     finalize_path(cfg, &path)?;
 
-    Ok(vec![make_measurement(
+    let mut measurement = make_measurement(
         cfg,
         workload,
         format!("concurrent_batch_{batch_size}"),
@@ -3345,16 +3386,28 @@ fn run_wal_batch_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>
             batch_size: Some(batch_size),
             threads: Some(writer_threads),
             seed: Some(cfg.seed),
+            latency_sample_every: cfg.latency_sample_every,
+            wal_io_mode: Some(cfg.wal_io_mode.as_str()),
             ..MeasurementParams::default()
         },
         MeasurementResult {
             measure_elapsed_ms: ms(elapsed),
             ops: Some(num_keys as u64),
             ops_per_sec: Some(rate(num_keys as u64, elapsed)),
+            process_cpu_user_ms,
+            process_cpu_system_ms,
+            wal_pipeline,
             ..MeasurementResult::default()
         },
         counters,
-    )])
+    );
+    measurement.record.latency = cfg.latency_sample_every.map(|sample_every| {
+        let completed_commits =
+            effective_wal_batch_commit_count(num_keys, writer_threads, batch_size);
+        latency_record(sample_every, completed_commits, &latency_samples)
+    });
+
+    Ok(vec![measurement])
 }
 
 fn run_wal_batch_delete_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
@@ -3542,6 +3595,18 @@ fn effective_wal_batch_size(num_keys: usize, writer_threads: usize, requested: u
 
     let max_thread_ops = per_thread + usize::from(remainder > 0);
     requested.min(max_thread_ops.max(1))
+}
+
+fn effective_wal_batch_commit_count(
+    num_keys: usize,
+    writer_threads: usize,
+    batch_size: usize,
+) -> u64 {
+    let per_thread = num_keys / writer_threads;
+    let remainder = num_keys % writer_threads;
+    (0..writer_threads)
+        .map(|thread| (per_thread + usize::from(thread < remainder)).div_ceil(batch_size) as u64)
+        .sum()
 }
 
 #[derive(Clone, Copy)]
@@ -7948,9 +8013,11 @@ fn validate_run_mode(cfg: &HarnessConfig, bench_arg: Option<&str>) -> Result<()>
         "--prepare-golden does not support --bench"
     );
     if cfg.wal_io_mode == WalIoModeArg::Parallel {
+        let is_supported_wal_workload =
+            matches!(bench_arg, Some("wal_concurrent" | "wal_batch_concurrent"));
         anyhow::ensure!(
-            bench_arg == Some("wal_concurrent"),
-            "--wal-io-mode parallel currently requires --bench wal_concurrent"
+            is_supported_wal_workload,
+            "--wal-io-mode parallel requires --bench wal_concurrent or wal_batch_concurrent"
         );
         anyhow::ensure!(!cfg.pitr, "--wal-io-mode parallel does not support --pitr");
     }
@@ -7980,7 +8047,22 @@ mod tests {
     }
 
     #[test]
-    fn parallel_wal_mode_is_scoped_to_wal_concurrent() {
+    fn parallel_wal_mode_is_scoped_to_concurrent_wal_workloads() {
+        for workload in ["wal_concurrent", "wal_batch_concurrent"] {
+            let args = Args::try_parse_from([
+                "write-perf",
+                "--wal-io-mode",
+                "parallel",
+                "--bench",
+                workload,
+            ])
+            .expect("parse parallel WAL selector");
+            let cfg = HarnessConfig::from_args(args);
+
+            assert_eq!(cfg.wal_io_mode, WalIoModeArg::Parallel);
+            validate_run_mode(&cfg, Some(workload)).expect("supported selector scope");
+        }
+
         let args = Args::try_parse_from([
             "write-perf",
             "--wal-io-mode",
@@ -7990,15 +8072,12 @@ mod tests {
         ])
         .expect("parse parallel WAL selector");
         let cfg = HarnessConfig::from_args(args);
-
-        assert_eq!(cfg.wal_io_mode, WalIoModeArg::Parallel);
-        validate_run_mode(&cfg, Some("wal_concurrent")).expect("supported selector scope");
         let error = validate_run_mode(&cfg, Some("fillseq"))
             .expect_err("parallel selector must not spill into unrelated workloads");
         assert!(
             error
                 .to_string()
-                .contains("requires --bench wal_concurrent")
+                .contains("requires --bench wal_concurrent or wal_batch_concurrent")
         );
 
         let pitr_args = Args::try_parse_from([
@@ -9160,6 +9239,12 @@ mod tests {
         assert_eq!(effective_wal_batch_size(100, 4, 100), 25);
         assert_eq!(effective_wal_batch_size(101, 4, 100), 26);
         assert_eq!(effective_wal_batch_size(1000, 4, 100), 100);
+    }
+
+    #[test]
+    fn effective_wal_batch_commit_count_sums_each_writer_partition() {
+        assert_eq!(effective_wal_batch_commit_count(29, 4, 4), 8);
+        assert_eq!(effective_wal_batch_commit_count(10, 4, 3), 4);
     }
 
     #[test]
