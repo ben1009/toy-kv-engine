@@ -13,12 +13,493 @@ use std::{
     thread::{self, JoinHandle},
 };
 
+#[cfg(feature = "bench")]
+use std::collections::BTreeMap;
+#[cfg(feature = "bench")]
+use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(feature = "bench")]
+use std::time::Instant;
+
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
 use crossbeam_queue::ArrayQueue;
 use parking_lot::{Condvar, Mutex};
 
 use super::{BUFFER_POOL_BUF_SIZE, DirectBuf, MAX_WAL_FILE_SIZE, RING_SIZE, WAL_FD_INDEX};
+
+/// Benchmark-only observations shared by the WAL worker and sync coordinator.
+/// Production builds keep this as a zero-sized no-op.
+#[derive(Default)]
+pub(crate) struct WalSyncProgress {
+    #[cfg(feature = "bench")]
+    state: Mutex<WalSyncProgressState>,
+    #[cfg(feature = "bench")]
+    profile: arc_swap::ArcSwapOption<crate::mem_table::WriteProfile>,
+    #[cfg(feature = "bench")]
+    sync_active: AtomicBool,
+    #[cfg(feature = "bench")]
+    io_event_gate: Mutex<()>,
+}
+
+/// Pins a diagnostic-window tag across one io_uring operation and its accounting.
+pub(crate) struct WalIoEvent<'a> {
+    progress: &'a WalSyncProgress,
+    #[cfg(feature = "bench")]
+    _gate: Option<parking_lot::MutexGuard<'a, ()>>,
+    #[cfg(feature = "bench")]
+    during_sync: bool,
+    #[cfg(feature = "bench")]
+    diagnostics_enabled: bool,
+    #[cfg(feature = "bench")]
+    event_at: Option<Instant>,
+    #[cfg(not(feature = "bench"))]
+    _progress: PhantomData<&'a WalSyncProgress>,
+}
+
+impl WalIoEvent<'_> {
+    fn during_sync(&self) -> bool {
+        #[cfg(feature = "bench")]
+        {
+            self.during_sync
+        }
+        #[cfg(not(feature = "bench"))]
+        {
+            false
+        }
+    }
+
+    fn set_event_at(&mut self, event_at: Option<std::time::Instant>) {
+        #[cfg(feature = "bench")]
+        {
+            self.event_at = event_at;
+        }
+        #[cfg(not(feature = "bench"))]
+        let _ = event_at;
+    }
+
+    fn event_timestamp(&self) -> Option<std::time::Instant> {
+        #[cfg(feature = "bench")]
+        {
+            self.diagnostics_enabled.then(Instant::now)
+        }
+        #[cfg(not(feature = "bench"))]
+        {
+            None
+        }
+    }
+
+    fn event_at(&self) -> Option<std::time::Instant> {
+        #[cfg(feature = "bench")]
+        {
+            self.event_at
+        }
+        #[cfg(not(feature = "bench"))]
+        {
+            None
+        }
+    }
+
+    fn record_write_submission(
+        &self,
+        count: u64,
+        inflight_groups: u64,
+        outstanding_write_sqes: u64,
+    ) {
+        self.progress.record_write_submission(
+            count,
+            inflight_groups,
+            outstanding_write_sqes,
+            self.during_sync(),
+            self.event_at(),
+        );
+    }
+
+    fn record_write_completions(&self, count: u64) {
+        self.progress
+            .record_write_completions(count, self.during_sync(), self.event_at());
+    }
+
+    fn record_group_completion(&self, result: &GroupWriteResult) {
+        self.progress
+            .record_group_completion(result, self.during_sync(), self.event_at());
+    }
+}
+
+#[cfg(feature = "bench")]
+#[derive(Default)]
+struct WalSyncProgressState {
+    sync_write_sqes_submitted: u64,
+    sync_write_cqes_completed: u64,
+    sync_groups_completed: u64,
+    sync_written_frontier_start: u64,
+    sync_written_frontier_end: u64,
+    sync_groups_covered: u64,
+    sync_io_events: Vec<WalSyncIoEvent>,
+    written_frontier: u64,
+    durable_frontier: u64,
+    completed_groups: BTreeMap<u64, (u64, u64, u64, Instant)>,
+}
+
+#[cfg(feature = "bench")]
+#[derive(Clone, Copy)]
+struct WalSyncIoEvent {
+    at: Instant,
+    kind: WalSyncIoEventKind,
+}
+
+#[cfg(feature = "bench")]
+#[derive(Clone, Copy)]
+enum WalSyncIoEventKind {
+    WriteSubmission(u64),
+    WriteCompletion(u64),
+    GroupCompletion,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct SyncProgressSnapshot {
+    pub(crate) written_frontier_start: u64,
+    pub(crate) written_frontier_end: u64,
+    pub(crate) write_sqes_submitted: u64,
+    pub(crate) write_cqes_completed: u64,
+    pub(crate) groups_completed: u64,
+    pub(crate) groups_covered: u64,
+}
+
+impl WalSyncProgress {
+    #[cfg(feature = "bench")]
+    pub(crate) fn set_profile(&self, profile: std::sync::Arc<crate::mem_table::WriteProfile>) {
+        self.profile.store(Some(profile));
+    }
+
+    #[cfg(not(feature = "bench"))]
+    pub(crate) fn set_profile(&self, _profile: std::sync::Arc<crate::mem_table::WriteProfile>) {}
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn profile(&self) -> Option<std::sync::Arc<crate::mem_table::WriteProfile>> {
+        self.profile.load_full()
+    }
+
+    pub(crate) fn record_worker_eventfd_notification(&self) {
+        #[cfg(feature = "bench")]
+        if let Some(profile) = self.profile() {
+            profile.record_wal_worker_eventfd_notification();
+        }
+    }
+
+    /// Capture the active-window tag before an I/O operation.
+    ///
+    /// The caller must timestamp the operation itself and pass that timestamp
+    /// when recording metrics. The tag alone is insufficient because the
+    /// worker may be descheduled between this call and the operation.
+    pub(crate) fn begin_io_event(&self) -> WalIoEvent<'_> {
+        #[cfg(feature = "bench")]
+        {
+            let diagnostics_enabled = self
+                .profile()
+                .is_some_and(|profile| profile.wal_sync_diagnostics_enabled());
+            if !diagnostics_enabled {
+                return WalIoEvent {
+                    progress: self,
+                    _gate: None,
+                    during_sync: false,
+                    diagnostics_enabled: false,
+                    event_at: None,
+                };
+            }
+            let gate = self.io_event_gate.lock();
+            let during_sync = self.sync_active.load(Ordering::Acquire);
+            WalIoEvent {
+                progress: self,
+                _gate: Some(gate),
+                during_sync,
+                diagnostics_enabled: true,
+                event_at: None,
+            }
+        }
+        #[cfg(not(feature = "bench"))]
+        {
+            WalIoEvent {
+                progress: self,
+                _progress: PhantomData,
+            }
+        }
+    }
+
+    pub(crate) fn record_write_submission(
+        &self,
+        count: u64,
+        inflight_groups: u64,
+        outstanding_write_sqes: u64,
+        during_sync: bool,
+        event_at: Option<std::time::Instant>,
+    ) {
+        #[cfg(feature = "bench")]
+        {
+            let profile = self.profile();
+            if let Some(profile) = &profile {
+                profile.record_wal_inflight_groups(inflight_groups);
+                profile.record_wal_outstanding_write_sqes(outstanding_write_sqes);
+            }
+            if profile.is_some_and(|profile| profile.wal_sync_diagnostics_enabled()) {
+                let mut state = self.state.lock();
+                if during_sync && let Some(at) = event_at {
+                    state.sync_io_events.push(WalSyncIoEvent {
+                        at,
+                        kind: WalSyncIoEventKind::WriteSubmission(count),
+                    });
+                }
+            }
+        }
+        #[cfg(not(feature = "bench"))]
+        let _ = (
+            count,
+            inflight_groups,
+            outstanding_write_sqes,
+            during_sync,
+            event_at,
+        );
+    }
+
+    pub(crate) fn record_write_completions(
+        &self,
+        count: u64,
+        during_sync: bool,
+        event_at: Option<std::time::Instant>,
+    ) {
+        #[cfg(feature = "bench")]
+        {
+            if let Some(profile) = self.profile() {
+                profile.record_wal_cqe_count(count);
+                if profile.wal_sync_diagnostics_enabled() {
+                    let mut state = self.state.lock();
+                    if during_sync && let Some(at) = event_at {
+                        state.sync_io_events.push(WalSyncIoEvent {
+                            at,
+                            kind: WalSyncIoEventKind::WriteCompletion(count),
+                        });
+                    }
+                }
+            }
+        }
+        #[cfg(not(feature = "bench"))]
+        let _ = (count, during_sync, event_at);
+    }
+
+    pub(crate) fn record_group_completion(
+        &self,
+        result: &GroupWriteResult,
+        during_sync: bool,
+        event_at: Option<std::time::Instant>,
+    ) {
+        #[cfg(feature = "bench")]
+        if result.error.is_none()
+            && let Some(profile) = self.profile()
+        {
+            profile.record_wal_commit_group(result.write_count, result.write_bytes);
+            if profile.wal_sync_diagnostics_enabled() {
+                let mut state = self.state.lock();
+                let previous = state.completed_groups.insert(
+                    result.tickets.start,
+                    (
+                        result.tickets.end,
+                        result.write_count,
+                        result.write_bytes,
+                        event_at.unwrap_or_else(Instant::now),
+                    ),
+                );
+                debug_assert!(previous.is_none(), "WAL group completion is unique");
+                while let Some((end, _, _, _)) = state.completed_groups.get(&state.written_frontier)
+                {
+                    state.written_frontier = *end;
+                }
+                if during_sync && let Some(at) = event_at {
+                    state.sync_io_events.push(WalSyncIoEvent {
+                        at,
+                        kind: WalSyncIoEventKind::GroupCompletion,
+                    });
+                }
+            }
+        }
+        #[cfg(not(feature = "bench"))]
+        let _ = (result, during_sync, event_at);
+    }
+
+    pub(crate) fn record_preallocation_ns(&self, nanos: u64) {
+        #[cfg(feature = "bench")]
+        if let Some(profile) = self.profile() {
+            profile.record_wal_preallocation_ns(nanos);
+        }
+        #[cfg(not(feature = "bench"))]
+        let _ = nanos;
+    }
+
+    pub(crate) fn begin_sync(&self, target: u64, durable_frontier: u64) -> SyncProgressSnapshot {
+        #[cfg(feature = "bench")]
+        {
+            let Some(profile) = self.profile().filter(|p| p.wal_sync_diagnostics_enabled()) else {
+                let _ = (target, durable_frontier);
+                return SyncProgressSnapshot::default();
+            };
+            drop(profile);
+            let mut state = self.state.lock();
+            debug_assert!(
+                !self.sync_active.load(Ordering::Acquire),
+                "only one WAL sync may be active"
+            );
+            debug_assert_eq!(state.durable_frontier, durable_frontier);
+            state.sync_write_sqes_submitted = 0;
+            state.sync_write_cqes_completed = 0;
+            state.sync_groups_completed = 0;
+            let groups_covered = state
+                .completed_groups
+                .range(durable_frontier..target)
+                .count() as u64;
+            state.sync_written_frontier_start = state.written_frontier;
+            state.sync_written_frontier_end = state.written_frontier;
+            state.sync_groups_covered = groups_covered;
+            SyncProgressSnapshot {
+                written_frontier_start: state.written_frontier,
+                written_frontier_end: state.written_frontier,
+                groups_covered,
+                ..SyncProgressSnapshot::default()
+            }
+        }
+        #[cfg(not(feature = "bench"))]
+        {
+            let _ = (target, durable_frontier);
+            SyncProgressSnapshot::default()
+        }
+    }
+
+    /// Mark the start of the `fdatasync` observation window after its snapshot
+    /// has been prepared. The event gate ensures earlier worker bookkeeping is
+    /// assigned to the preceding window before this one starts.
+    #[cfg(feature = "bench")]
+    pub(crate) fn start_sync_activity(&self) {
+        let diagnostics_enabled = self
+            .profile()
+            .is_some_and(|profile| profile.wal_sync_diagnostics_enabled());
+        if diagnostics_enabled {
+            let _event_gate = self.io_event_gate.lock();
+            let mut state = self.state.lock();
+            state.sync_written_frontier_start = state.written_frontier;
+            state.sync_written_frontier_end = state.written_frontier;
+            state.sync_io_events.clear();
+            let was_active = self.sync_active.swap(true, Ordering::AcqRel);
+            debug_assert!(!was_active, "only one WAL sync may be active");
+        }
+    }
+
+    #[cfg(not(feature = "bench"))]
+    pub(crate) fn start_sync_activity(&self) {}
+
+    pub(crate) fn finish_sync(
+        &self,
+        started_at: Option<std::time::Instant>,
+        finished_at: Option<std::time::Instant>,
+    ) -> (SyncProgressSnapshot, Option<std::time::Instant>) {
+        #[cfg(feature = "bench")]
+        {
+            // The caller samples both timestamps around the fdatasync call.
+            // Event timestamps exclude work in the setup/teardown gaps even if
+            // an event retained a stale active-window tag.
+            let was_active = self.sync_active.swap(false, Ordering::AcqRel);
+            let finished_at = finished_at.unwrap_or_else(Instant::now);
+            if !was_active {
+                return (SyncProgressSnapshot::default(), Some(finished_at));
+            }
+            let _event_gate = self.io_event_gate.lock();
+            let mut state = self.state.lock();
+            let started_at =
+                started_at.expect("active benchmark WAL sync records its start timestamp");
+            let mut written_frontier_start = state.sync_written_frontier_start;
+            loop {
+                let next_group = state
+                    .completed_groups
+                    .get(&written_frontier_start)
+                    .map(|(end, _, _, completed_at)| (*end, *completed_at));
+                let Some((end, completed_at)) = next_group else {
+                    break;
+                };
+                if completed_at >= started_at {
+                    break;
+                }
+                written_frontier_start = end;
+            }
+            state.sync_written_frontier_start = written_frontier_start;
+            let mut write_sqes_submitted = 0_u64;
+            let mut write_cqes_completed = 0_u64;
+            let mut groups_completed = 0_u64;
+            for event in &state.sync_io_events {
+                if event.at < started_at || event.at >= finished_at {
+                    continue;
+                }
+                match event.kind {
+                    WalSyncIoEventKind::WriteSubmission(count) => {
+                        write_sqes_submitted = write_sqes_submitted.saturating_add(count);
+                    }
+                    WalSyncIoEventKind::WriteCompletion(count) => {
+                        write_cqes_completed = write_cqes_completed.saturating_add(count);
+                    }
+                    WalSyncIoEventKind::GroupCompletion => {
+                        groups_completed = groups_completed.saturating_add(1);
+                    }
+                }
+            }
+            state.sync_write_sqes_submitted = write_sqes_submitted;
+            state.sync_write_cqes_completed = write_cqes_completed;
+            state.sync_groups_completed = groups_completed;
+            state.sync_io_events.clear();
+            state.sync_written_frontier_end = written_frontier_start;
+            loop {
+                let next_group = state
+                    .completed_groups
+                    .get(&state.sync_written_frontier_end)
+                    .map(|(end, _, _, completed_at)| (*end, *completed_at));
+                let Some((end, completed_at)) = next_group else {
+                    break;
+                };
+                if completed_at >= finished_at {
+                    break;
+                }
+                state.sync_written_frontier_end = end;
+            }
+            (
+                SyncProgressSnapshot {
+                    written_frontier_start,
+                    written_frontier_end: state.sync_written_frontier_end,
+                    write_sqes_submitted: state.sync_write_sqes_submitted,
+                    write_cqes_completed: state.sync_write_cqes_completed,
+                    groups_completed: state.sync_groups_completed,
+                    groups_covered: state.sync_groups_covered,
+                },
+                Some(finished_at),
+            )
+        }
+        #[cfg(not(feature = "bench"))]
+        {
+            let _ = (started_at, finished_at);
+            (SyncProgressSnapshot::default(), None)
+        }
+    }
+
+    pub(crate) fn mark_durable(&self, target: u64) {
+        #[cfg(feature = "bench")]
+        {
+            let Some(profile) = self.profile().filter(|p| p.wal_sync_diagnostics_enabled()) else {
+                let _ = target;
+                return;
+            };
+            drop(profile);
+            let mut state = self.state.lock();
+            debug_assert!(!self.sync_active.load(Ordering::Acquire));
+            state.durable_frontier = state.durable_frontier.max(target);
+            state.completed_groups = state.completed_groups.split_off(&target);
+        }
+        #[cfg(not(feature = "bench"))]
+        let _ = target;
+    }
+}
 
 const MAX_INFLIGHT_GROUPS: usize = 8;
 const MAX_OUTSTANDING_SQES: usize = RING_SIZE;
@@ -194,6 +675,8 @@ enum WorkerEvent<B> {
 pub(crate) struct GroupWriteResult {
     pub(crate) group_id: u64,
     pub(crate) tickets: Range<u64>,
+    pub(crate) write_count: u64,
+    pub(crate) write_bytes: u64,
     pub(crate) error: Option<String>,
 }
 
@@ -583,6 +1066,8 @@ impl<B: WorkerBuffer> WorkerCore<B> {
                 .groups
                 .remove(&group_id)
                 .expect("completed group exists");
+            let write_count = group.request_ids.len() as u64;
+            let write_bytes = group.file_range.end - group.file_range.start;
             self.group_order.retain(|queued_id| *queued_id != group_id);
             for request_id in group.request_ids {
                 let write = self.writes.remove(&request_id);
@@ -602,6 +1087,8 @@ impl<B: WorkerBuffer> WorkerCore<B> {
             events.push(WorkerEvent::GroupFinished(GroupWriteResult {
                 group_id: group_id.0,
                 tickets: group.tickets,
+                write_count,
+                write_bytes,
                 error,
             }));
         }
@@ -698,6 +1185,8 @@ impl<B: WorkerBuffer> WorkerCore<B> {
                 self.groups.get(group_id).map(|group| GroupWriteResult {
                     group_id: group_id.0,
                     tickets: group.tickets.clone(),
+                    write_count: group.request_ids.len() as u64,
+                    write_bytes: group.file_range.end - group.file_range.start,
                     error: Some(reason.to_owned()),
                 })
             })
@@ -851,6 +1340,7 @@ pub(crate) struct IoWorker<B: WorkerBuffer = DirectBuf> {
     commands: Sender<WorkerCommand<B>>,
     slots: Arc<GroupSlots>,
     wake: Arc<WorkerWake>,
+    sync_progress: Arc<WalSyncProgress>,
     completions: Option<Receiver<GroupWriteResult>>,
     join: Option<JoinHandle<Result<()>>>,
     shutdown_sent: bool,
@@ -862,6 +1352,7 @@ pub(crate) struct IoWorkerClient<B: WorkerBuffer> {
     commands: Sender<WorkerCommand<B>>,
     slots: Arc<GroupSlots>,
     wake: Arc<WorkerWake>,
+    sync_progress: Arc<WalSyncProgress>,
     marker: PhantomData<fn() -> B>,
 }
 
@@ -871,6 +1362,7 @@ impl<B: WorkerBuffer> Clone for IoWorkerClient<B> {
             commands: self.commands.clone(),
             slots: Arc::clone(&self.slots),
             wake: Arc::clone(&self.wake),
+            sync_progress: Arc::clone(&self.sync_progress),
             marker: PhantomData,
         }
     }
@@ -890,6 +1382,8 @@ impl<B: WorkerBuffer> IoWorker<B> {
             available: Condvar::new(),
         });
         let worker_slots = Arc::clone(&slots);
+        let sync_progress = Arc::new(WalSyncProgress::default());
+        let worker_sync_progress = Arc::clone(&sync_progress);
         let worker_file = Arc::clone(&wal_file);
         let wake = Arc::new(WorkerWake::new().context("failed to create WAL worker wakeup")?);
         let worker_wake = Arc::clone(&wake);
@@ -921,6 +1415,7 @@ impl<B: WorkerBuffer> IoWorker<B> {
                     completion_tx,
                     worker_slots,
                     &worker_wake,
+                    worker_sync_progress,
                 )
             })
             .context("failed to spawn WAL I/O worker")?;
@@ -933,6 +1428,7 @@ impl<B: WorkerBuffer> IoWorker<B> {
                 commands: command_tx,
                 slots,
                 wake,
+                sync_progress,
                 completions: Some(completion_rx),
                 join: Some(join),
                 shutdown_sent: false,
@@ -955,8 +1451,13 @@ impl<B: WorkerBuffer> IoWorker<B> {
             commands: self.commands.clone(),
             slots: Arc::clone(&self.slots),
             wake: Arc::clone(&self.wake),
+            sync_progress: Arc::clone(&self.sync_progress),
             marker: PhantomData,
         }
+    }
+
+    pub(crate) fn sync_progress(&self) -> Arc<WalSyncProgress> {
+        Arc::clone(&self.sync_progress)
     }
 
     pub(crate) fn take_completions(&mut self) -> Receiver<GroupWriteResult> {
@@ -1051,8 +1552,9 @@ impl<B: WorkerBuffer> IoWorkerClient<B> {
                     // The group is already owned by the worker. A wakeup
                     // failure cannot be reported as failed admission; the
                     // bounded poll timeout still drains the queue.
-                    if let Err(error) = self.wake.signal() {
-                        log::error!("failed to wake WAL I/O worker: {error}");
+                    match self.wake.signal() {
+                        Ok(()) => self.sync_progress.record_worker_eventfd_notification(),
+                        Err(error) => log::error!("failed to wake WAL I/O worker: {error}"),
                     }
                     Ok(group_id.0)
                 }
@@ -1085,6 +1587,7 @@ fn run_worker<B: WorkerBuffer>(
     completions: Sender<GroupWriteResult>,
     slots: Arc<GroupSlots>,
     wake: &WorkerWake,
+    sync_progress: Arc<WalSyncProgress>,
 ) -> Result<()> {
     let mut core = WorkerCore::<B>::new();
     let mut group_permits = HashMap::<GroupId, GroupPermit>::new();
@@ -1099,6 +1602,7 @@ fn run_worker<B: WorkerBuffer>(
         &completions,
         &slots,
         wake,
+        &sync_progress,
         &mut core,
         &mut group_permits,
         &mut ring_staged,
@@ -1110,7 +1614,14 @@ fn run_worker<B: WorkerBuffer>(
         if !ring_staged.is_empty() {
             let staged = ring_staged.iter().copied().collect::<Vec<_>>();
             if let Ok(events) = core.mark_ambiguous(&staged) {
-                process_worker_events(events, &buffer_pool, &mut group_permits, &completions);
+                let io_event = sync_progress.begin_io_event();
+                process_worker_events(
+                    events,
+                    &buffer_pool,
+                    &mut group_permits,
+                    &completions,
+                    &io_event,
+                );
             }
         }
         let reason = format!("WAL I/O worker stopped: {error:#}");
@@ -1127,6 +1638,8 @@ fn run_worker<B: WorkerBuffer>(
                     let _ = completions.send(GroupWriteResult {
                         group_id: id.0,
                         tickets,
+                        write_count: 0,
+                        write_bytes: 0,
                         error: Some(reason.clone()),
                     });
                 }
@@ -1148,6 +1661,7 @@ fn run_worker_loop<B: WorkerBuffer>(
     completions: &Sender<GroupWriteResult>,
     slots: &GroupSlots,
     wake: &WorkerWake,
+    sync_progress: &WalSyncProgress,
     core: &mut WorkerCore<B>,
     group_permits: &mut HashMap<GroupId, GroupPermit>,
     ring_staged: &mut VecDeque<RequestId>,
@@ -1207,37 +1721,45 @@ fn run_worker_loop<B: WorkerBuffer>(
         }
 
         if !ring_staged.is_empty() {
-            flush_staged_writes(ring_staged, core, || ring.submit())?;
+            flush_staged_writes(ring_staged, core, sync_progress, || ring.submit())?;
         }
 
-        #[cfg(feature = "chaos-testing")]
-        let mut completed = drain_completions(ring);
-        #[cfg(not(feature = "chaos-testing"))]
-        let completed = drain_completions(ring);
-        #[cfg(feature = "chaos-testing")]
-        if crate::chaos::failpoint::defer_lowest_parallel_wal_group_completion()
-            && let Some(lowest_ticket) = core.lowest_group_ticket()
-        {
-            let mut ready = Vec::with_capacity(completed.len());
-            for completion in completed.drain(..) {
-                let request_id = RequestId(completion.0);
-                if core.request_ticket_start(request_id) == Some(lowest_ticket) {
-                    deferred_lowest_group_completions.push(completion);
-                } else {
-                    ready.push(completion);
+        let completion_count = {
+            let mut completion_event = sync_progress.begin_io_event();
+            #[cfg(feature = "chaos-testing")]
+            let mut completed = drain_completions(ring);
+            #[cfg(not(feature = "chaos-testing"))]
+            let completed = drain_completions(ring);
+            let completion_at = completion_event.event_timestamp();
+            completion_event.set_event_at(completion_at);
+            completion_event.record_write_completions(completed.len() as u64);
+            #[cfg(feature = "chaos-testing")]
+            if crate::chaos::failpoint::defer_lowest_parallel_wal_group_completion()
+                && let Some(lowest_ticket) = core.lowest_group_ticket()
+            {
+                let mut ready = Vec::with_capacity(completed.len());
+                for completion in completed.drain(..) {
+                    let request_id = RequestId(completion.0);
+                    if core.request_ticket_start(request_id) == Some(lowest_ticket) {
+                        deferred_lowest_group_completions.push(completion);
+                    } else {
+                        ready.push(completion);
+                    }
                 }
+                completed = ready;
             }
-            completed = ready;
-        }
-        let completion_count = completed.len();
-        process_completions(
-            completed,
-            core,
-            buffer_pool,
-            group_permits,
-            completions,
-            slots,
-        )?;
+            let completion_count = completed.len();
+            process_completions(
+                completed,
+                core,
+                buffer_pool,
+                group_permits,
+                completions,
+                slots,
+                &completion_event,
+            )?;
+            completion_count
+        };
 
         if core.is_idle() && ring_staged.is_empty() {
             if *stopping {
@@ -1289,6 +1811,8 @@ fn enqueue_group_command<B: WorkerBuffer>(
             let _ = completions.send(GroupWriteResult {
                 group_id: id.0,
                 tickets,
+                write_count: 0,
+                write_bytes: 0,
                 error: Some(format!("WAL poisoned at ticket {poison_ticket}")),
             });
         }
@@ -1297,6 +1821,8 @@ fn enqueue_group_command<B: WorkerBuffer>(
             let _ = completions.send(GroupWriteResult {
                 group_id: id.0,
                 tickets,
+                write_count: 0,
+                write_bytes: 0,
                 error: Some(format!("WAL worker rejected group: {error:?}")),
             });
             bail!("WAL worker rejected group: {error:?}");
@@ -1317,10 +1843,19 @@ fn close_group_admission(slots: &GroupSlots) {
 fn flush_staged_writes<B: WorkerBuffer>(
     staged: &mut VecDeque<RequestId>,
     core: &mut WorkerCore<B>,
+    sync_progress: &WalSyncProgress,
     mut submit: impl FnMut() -> io::Result<usize>,
 ) -> Result<()> {
     while !staged.is_empty() {
-        let submitted = submit_staged_writes(staged, core, &mut submit)?;
+        let mut io_event = sync_progress.begin_io_event();
+        let (submitted, submitted_at) =
+            submit_staged_writes(staged, core, &mut submit, || io_event.event_timestamp())?;
+        io_event.set_event_at(submitted_at);
+        io_event.record_write_submission(
+            submitted as u64,
+            core.inflight_group_count() as u64,
+            core.outstanding_sqe_count() as u64,
+        );
         ensure!(
             submitted > 0,
             "io_uring made no progress with staged WAL writes"
@@ -1333,11 +1868,20 @@ fn flush_staged_writes<B: WorkerBuffer>(
 fn submit_staged_writes<B: WorkerBuffer>(
     staged: &mut VecDeque<RequestId>,
     core: &mut WorkerCore<B>,
-    submit: impl FnMut() -> io::Result<usize>,
-) -> Result<usize> {
-    let submitted = retry_interrupted(submit).context("failed to submit WAL writes to io_uring")?;
+    mut submit: impl FnMut() -> io::Result<usize>,
+    mut timestamp: impl FnMut() -> Option<std::time::Instant>,
+) -> Result<(usize, Option<std::time::Instant>)> {
+    let mut submitted_at = None;
+    let submitted = retry_interrupted(|| {
+        let result = submit();
+        if result.is_ok() {
+            submitted_at = timestamp();
+        }
+        result
+    })
+    .context("failed to submit WAL writes to io_uring")?;
     mark_submitted_prefix(submitted, staged, core)?;
-    Ok(submitted)
+    Ok((submitted, submitted_at))
 }
 
 fn wait_for_worker_progress(ring_fd: RawFd, wake: &WorkerWake) -> io::Result<bool> {
@@ -1411,6 +1955,7 @@ fn process_completions<B: WorkerBuffer>(
     group_permits: &mut HashMap<GroupId, GroupPermit>,
     completion_tx: &Sender<GroupWriteResult>,
     slots: &GroupSlots,
+    io_event: &WalIoEvent<'_>,
 ) -> Result<()> {
     for (user_data, cqe_result) in completed {
         let request_id = RequestId(user_data);
@@ -1420,7 +1965,7 @@ fn process_completions<B: WorkerBuffer>(
         if core.poison_ticket.is_some() {
             close_group_admission(slots);
         }
-        process_worker_events(events, buffer_pool, group_permits, completion_tx);
+        process_worker_events(events, buffer_pool, group_permits, completion_tx, io_event);
     }
 
     Ok(())
@@ -1431,6 +1976,7 @@ fn process_worker_events<B: WorkerBuffer>(
     buffer_pool: &ArrayQueue<B>,
     group_permits: &mut HashMap<GroupId, GroupPermit>,
     completion_tx: &Sender<GroupWriteResult>,
+    io_event: &WalIoEvent<'_>,
 ) {
     for event in events {
         match event {
@@ -1438,6 +1984,7 @@ fn process_worker_events<B: WorkerBuffer>(
                 buffer.retire(buffer_pool);
             }
             WorkerEvent::GroupFinished(result) => {
+                io_event.record_group_completion(&result);
                 group_permits.remove(&GroupId(result.group_id));
                 let _ = completion_tx.send(result);
             }
@@ -1476,11 +2023,13 @@ mod tests {
         time::Duration,
     };
 
+    #[cfg(feature = "bench")]
+    use super::SyncProgressSnapshot;
     use super::{
         DirectBuf, GroupId, GroupPermit, GroupSlots, GroupWriteResult, IoWorker, RequestId,
-        SlotState, WorkerCommand, WorkerCore, WorkerError, WorkerEvent, WorkerWake, WriteBuffer,
-        WriteGroup, close_group_admission, enqueue_group_command, fail_shutdown_reply,
-        flush_staged_writes, retry_interrupted, wait_for_worker_progress,
+        SlotState, WalSyncProgress, WorkerCommand, WorkerCore, WorkerError, WorkerEvent,
+        WorkerWake, WriteBuffer, WriteGroup, close_group_admission, enqueue_group_command,
+        fail_shutdown_reply, flush_staged_writes, retry_interrupted, wait_for_worker_progress,
     };
     use crossbeam_queue::ArrayQueue;
     use parking_lot::{Condvar, Mutex};
@@ -1678,6 +2227,283 @@ mod tests {
         }
         assert!(core.is_idle());
         assert_eq!(drops.load(Ordering::Acquire), 4);
+    }
+
+    #[cfg(feature = "bench")]
+    #[test]
+    fn sync_progress_records_frontiers_and_write_activity_during_sync() {
+        let progress = WalSyncProgress::default();
+        let profile = Arc::new(crate::mem_table::WriteProfile::default());
+        profile.set_wal_sync_diagnostics_enabled(true);
+        progress.set_profile(Arc::clone(&profile));
+
+        // The later group finishes first. It must not move the contiguous
+        // written frontier past the unresolved first group.
+        progress.record_group_completion(
+            &GroupWriteResult {
+                group_id: 1,
+                tickets: 1..2,
+                write_count: 1,
+                write_bytes: 4096,
+                error: None,
+            },
+            false,
+            Some(std::time::Instant::now()),
+        );
+        progress.record_group_completion(
+            &GroupWriteResult {
+                group_id: 0,
+                tickets: 0..1,
+                write_count: 1,
+                write_bytes: 4096,
+                error: None,
+            },
+            false,
+            Some(std::time::Instant::now()),
+        );
+
+        let sync_start = progress.begin_sync(2, 0);
+        // Snapshot preparation happens before the syscall window and must not
+        // inflate its activity counts.
+        progress.record_write_submission(1, 1, 1, false, None);
+        progress.start_sync_activity();
+        let syscall_started_at = std::time::Instant::now();
+        let event_at = std::time::Instant::now();
+        progress.record_write_submission(1, 1, 1, true, Some(event_at));
+        progress.record_write_completions(1, true, Some(event_at));
+        progress.record_group_completion(
+            &GroupWriteResult {
+                group_id: 2,
+                tickets: 2..3,
+                write_count: 1,
+                write_bytes: 4096,
+                error: None,
+            },
+            true,
+            Some(event_at),
+        );
+        let (sync_end, finished_at) =
+            progress.finish_sync(Some(syscall_started_at), Some(std::time::Instant::now()));
+
+        assert!(finished_at.is_some());
+        assert_eq!(sync_start.written_frontier_start, 2);
+        assert_eq!(sync_start.groups_covered, 2);
+        assert_eq!(sync_end.written_frontier_end, 3);
+        assert_eq!(sync_end.write_sqes_submitted, 1);
+        assert_eq!(sync_end.write_cqes_completed, 1);
+        assert_eq!(sync_end.groups_completed, 1);
+
+        // Events observed after the sync window closes must not be attributed
+        // to that fdatasync, even if they arrive before the snapshot is read.
+        progress.record_write_submission(1, 1, 1, false, None);
+        progress.record_write_completions(1, false, None);
+        progress.record_group_completion(
+            &GroupWriteResult {
+                group_id: 3,
+                tickets: 3..4,
+                write_count: 1,
+                write_bytes: 4096,
+                error: None,
+            },
+            false,
+            Some(std::time::Instant::now()),
+        );
+        let next_sync = progress.begin_sync(4, 0);
+        progress.start_sync_activity();
+        let syscall_started_at = std::time::Instant::now();
+        let (after_sync, _) =
+            progress.finish_sync(Some(syscall_started_at), Some(std::time::Instant::now()));
+        assert_eq!(next_sync.groups_covered, 4);
+        assert_eq!(after_sync.write_sqes_submitted, 0);
+        assert_eq!(after_sync.write_cqes_completed, 0);
+        assert_eq!(after_sync.groups_completed, 0);
+
+        let profile = profile.snapshot();
+        assert_eq!(profile.wal_inflight_groups_max, 1);
+        assert_eq!(profile.wal_outstanding_write_sqes_max, 1);
+        assert_eq!(profile.wal_cqe_count, 2);
+        assert_eq!(profile.wal_commit_groups, 4);
+    }
+
+    #[cfg(feature = "bench")]
+    #[test]
+    fn sync_progress_keeps_aggregate_metrics_without_detailed_diagnostics() {
+        let progress = WalSyncProgress::default();
+        let profile = Arc::new(crate::mem_table::WriteProfile::default());
+        progress.set_profile(Arc::clone(&profile));
+        progress.record_group_completion(
+            &GroupWriteResult {
+                group_id: 0,
+                tickets: 0..1,
+                write_count: 1,
+                write_bytes: 4096,
+                error: None,
+            },
+            false,
+            Some(std::time::Instant::now()),
+        );
+
+        let sync_start = progress.begin_sync(1, 0);
+        progress.start_sync_activity();
+        let syscall_started_at = std::time::Instant::now();
+        progress.record_write_submission(1, 1, 1, false, None);
+        progress.record_write_completions(1, false, None);
+        let (sync_end, finished_at) =
+            progress.finish_sync(Some(syscall_started_at), Some(std::time::Instant::now()));
+
+        assert_eq!(sync_start, SyncProgressSnapshot::default());
+        assert_eq!(sync_end, SyncProgressSnapshot::default());
+        assert!(finished_at.is_some());
+
+        let profile = profile.snapshot();
+        assert_eq!(profile.wal_commit_groups, 1);
+        assert_eq!(profile.wal_inflight_groups_max, 1);
+        assert_eq!(profile.wal_outstanding_write_sqes_max, 1);
+        assert_eq!(profile.wal_cqe_count, 1);
+    }
+
+    #[cfg(feature = "bench")]
+    #[test]
+    fn sync_finish_waits_for_tagged_io_event_accounting() {
+        let progress = Arc::new(WalSyncProgress::default());
+        let profile = Arc::new(crate::mem_table::WriteProfile::default());
+        profile.set_wal_sync_diagnostics_enabled(true);
+        progress.set_profile(profile);
+
+        progress.begin_sync(1, 0);
+        progress.start_sync_activity();
+        let syscall_started_at = std::time::Instant::now();
+        let io_event = progress.begin_io_event();
+        assert!(io_event.during_sync());
+        let operation_at = std::time::Instant::now();
+
+        let finish_progress = Arc::clone(&progress);
+        let finish = thread::spawn(move || {
+            finish_progress.finish_sync(Some(syscall_started_at), Some(std::time::Instant::now()))
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while progress.sync_active.load(Ordering::Acquire) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "sync finish did not close the event window"
+            );
+            thread::yield_now();
+        }
+
+        // The operation happened during sync but metrics were delayed. Finish
+        // waits for the tag and uses the operation timestamp, not accounting time.
+        progress.record_write_submission(1, 1, 1, io_event.during_sync(), Some(operation_at));
+        progress.record_write_completions(1, io_event.during_sync(), Some(operation_at));
+        progress.record_group_completion(
+            &GroupWriteResult {
+                group_id: 0,
+                tickets: 0..1,
+                write_count: 1,
+                write_bytes: 4096,
+                error: None,
+            },
+            io_event.during_sync(),
+            Some(operation_at),
+        );
+        drop(io_event);
+
+        let (snapshot, _) = finish.join().expect("sync finish thread");
+        assert_eq!(snapshot.write_sqes_submitted, 1);
+        assert_eq!(snapshot.write_cqes_completed, 1);
+        assert_eq!(snapshot.groups_completed, 1);
+        assert_eq!(snapshot.written_frontier_end, 1);
+    }
+
+    #[cfg(feature = "bench")]
+    #[test]
+    fn sync_finish_excludes_io_that_runs_after_the_sync_window() {
+        let progress = Arc::new(WalSyncProgress::default());
+        let profile = Arc::new(crate::mem_table::WriteProfile::default());
+        profile.set_wal_sync_diagnostics_enabled(true);
+        progress.set_profile(profile);
+
+        progress.begin_sync(1, 0);
+        progress.start_sync_activity();
+        let syscall_started_at = std::time::Instant::now();
+        let io_event = progress.begin_io_event();
+        assert!(io_event.during_sync());
+
+        let finished_at = std::time::Instant::now();
+        let finish_progress = Arc::clone(&progress);
+        let finish = thread::spawn(move || {
+            finish_progress.finish_sync(Some(syscall_started_at), Some(finished_at))
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while progress.sync_active.load(Ordering::Acquire) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "sync finish did not close the event window"
+            );
+            thread::yield_now();
+        }
+
+        // The old tag is still true, but the actual operation timestamp is
+        // after fdatasync returned and must not be counted in its observation.
+        let operation_at = std::time::Instant::now();
+        progress.record_write_submission(1, 1, 1, io_event.during_sync(), Some(operation_at));
+        progress.record_write_completions(1, io_event.during_sync(), Some(operation_at));
+        progress.record_group_completion(
+            &GroupWriteResult {
+                group_id: 0,
+                tickets: 0..1,
+                write_count: 1,
+                write_bytes: 4096,
+                error: None,
+            },
+            io_event.during_sync(),
+            Some(operation_at),
+        );
+        drop(io_event);
+
+        let (snapshot, _) = finish.join().expect("sync finish thread");
+        assert_eq!(snapshot.write_sqes_submitted, 0);
+        assert_eq!(snapshot.write_cqes_completed, 0);
+        assert_eq!(snapshot.groups_completed, 0);
+        assert_eq!(snapshot.written_frontier_end, 0);
+    }
+
+    #[cfg(feature = "bench")]
+    #[test]
+    fn sync_finish_excludes_io_between_window_setup_and_syscall_start() {
+        let progress = WalSyncProgress::default();
+        let profile = Arc::new(crate::mem_table::WriteProfile::default());
+        profile.set_wal_sync_diagnostics_enabled(true);
+        progress.set_profile(profile);
+
+        progress.begin_sync(1, 0);
+        progress.start_sync_activity();
+        let io_event = progress.begin_io_event();
+        assert!(io_event.during_sync());
+        let operation_at = std::time::Instant::now();
+        progress.record_write_submission(1, 1, 1, io_event.during_sync(), Some(operation_at));
+        progress.record_write_completions(1, io_event.during_sync(), Some(operation_at));
+        progress.record_group_completion(
+            &GroupWriteResult {
+                group_id: 0,
+                tickets: 0..1,
+                write_count: 1,
+                write_bytes: 4096,
+                error: None,
+            },
+            io_event.during_sync(),
+            Some(operation_at),
+        );
+        drop(io_event);
+
+        let syscall_started_at = std::time::Instant::now();
+        let (snapshot, _) =
+            progress.finish_sync(Some(syscall_started_at), Some(std::time::Instant::now()));
+
+        assert_eq!(snapshot.written_frontier_start, 1);
+        assert_eq!(snapshot.written_frontier_end, 1);
+        assert_eq!(snapshot.write_sqes_submitted, 0);
+        assert_eq!(snapshot.write_cqes_completed, 0);
+        assert_eq!(snapshot.groups_completed, 0);
     }
 
     #[test]
@@ -1954,7 +2780,8 @@ mod tests {
         let mut submission_counts = [2, 1].into_iter();
         let mut submit_attempts = 0;
 
-        flush_staged_writes(&mut ring_staged, &mut core, || {
+        let sync_progress = WalSyncProgress::default();
+        flush_staged_writes(&mut ring_staged, &mut core, &sync_progress, || {
             submit_attempts += 1;
             Ok(submission_counts.next().expect("expected partial submit"))
         })
@@ -2102,6 +2929,7 @@ mod tests {
             commands: command_tx,
             slots,
             wake: Arc::new(WorkerWake::new().expect("eventfd")),
+            sync_progress: Arc::new(WalSyncProgress::default()),
             completions: Some(completions),
             join: Some(join),
             shutdown_sent: false,

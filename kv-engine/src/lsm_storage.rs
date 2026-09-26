@@ -4885,6 +4885,93 @@ impl KvEngine {
         self.inner.write_profile.reset();
     }
 
+    #[cfg(feature = "bench")]
+    /// Enable detailed WAL sync observations for the active WAL.
+    ///
+    /// Diagnostics must be enabled before its first ticket is admitted. They
+    /// can be disabled later, but cannot be re-enabled on that WAL because the
+    /// worker cannot reconstruct observations for the disabled interval.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if diagnostics are enabled after the active parallel
+    /// WAL has admitted a ticket.
+    pub fn set_wal_sync_diagnostics_enabled(&self, enabled: bool) -> Result<()> {
+        let _active_memtable = self.inner.active_memtable_lock.read();
+        self.inner
+            .state
+            .load()
+            .memtable
+            .set_wal_sync_diagnostics_enabled(enabled)
+    }
+
+    /// Per-call durability progress captured during the last profiled workload.
+    #[cfg(feature = "bench")]
+    pub fn write_profile_sync_observations(&self) -> Vec<crate::mem_table::WalSyncObservation> {
+        self.inner.write_profile.wal_sync_observations()
+    }
+
+    /// Snapshot bytes for WAL files currently present in the database directory.
+    ///
+    /// The state lock serializes this scan with background flush and WAL
+    /// reclamation; on Linux, the PITR barrier also serializes it with archive
+    /// reclamation. Files can be reclaimed after this method returns.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if directory metadata cannot be read or the byte totals
+    /// overflow.
+    #[cfg(feature = "bench")]
+    #[doc(hidden)]
+    pub fn benchmark_wal_file_usage(&self) -> Result<(u64, Option<u64>)> {
+        #[cfg(target_os = "linux")]
+        let _pitr_barrier = self.pitr_barrier_lock.lock();
+        let _state_lock = self.inner.state_lock.lock();
+        let path = &self.inner.path;
+        let mut length_bytes = 0_u64;
+        #[cfg(unix)]
+        let mut allocated_bytes = 0_u64;
+
+        for entry in fs::read_dir(path)
+            .with_context(|| format!("failed to read benchmark directory {}", path.display()))?
+        {
+            let entry = entry?;
+            if !entry.file_type()?.is_file()
+                || entry
+                    .path()
+                    .extension()
+                    .and_then(|extension| extension.to_str())
+                    != Some("wal")
+            {
+                continue;
+            }
+
+            let metadata = entry.metadata()?;
+            length_bytes = length_bytes
+                .checked_add(metadata.len())
+                .ok_or_else(|| anyhow!("WAL file length total overflow"))?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+
+                let file_allocated_bytes = metadata
+                    .blocks()
+                    .checked_mul(512)
+                    .ok_or_else(|| anyhow!("WAL allocated byte count overflow"))?;
+                allocated_bytes = allocated_bytes
+                    .checked_add(file_allocated_bytes)
+                    .ok_or_else(|| anyhow!("WAL allocated byte total overflow"))?;
+            }
+        }
+
+        #[cfg(unix)]
+        let allocated_bytes = Some(allocated_bytes);
+        #[cfg(not(unix))]
+        let allocated_bytes = None;
+
+        Ok((length_bytes, allocated_bytes))
+    }
+
     pub fn parallel_scan_stats(&self) -> ParallelScanStats {
         self.inner.parallel_scan_stats.snapshot()
     }

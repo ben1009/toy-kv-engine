@@ -904,6 +904,139 @@ struct MeasurementResult {
     parallel_scan_max_shard_block_loads: Option<u64>,
     parallel_scan_max_shard_sst_switches: Option<u64>,
     parallel_scan_coordinator_wait_ms: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    process_cpu_user_ms: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    process_cpu_system_ms: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    wal_pipeline: Option<WalPipelineRecord>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+struct WalSyncObservationRecord {
+    captured_target: u64,
+    written_frontier_start: u64,
+    written_frontier_end: u64,
+    write_sqes_submitted: u64,
+    write_cqes_completed: u64,
+    groups_completed: u64,
+    groups_covered: u64,
+    duration_ns: u64,
+    succeeded: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+struct WalPipelineRecord {
+    commit_groups: u64,
+    commit_solo_groups: u64,
+    commit_buffers: u64,
+    commit_bytes: u64,
+    cqe_count: u64,
+    inflight_groups_max: u64,
+    outstanding_write_sqes_max: u64,
+    sync_count: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sync_groups_total: Option<u64>,
+    worker_eventfd_notifications: u64,
+    preallocation_ns: u64,
+    fdatasync_ns: u64,
+    wal_sync_wait_ns: u64,
+    memtable_insert_ns: u64,
+    wal_file_length_bytes: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    wal_allocated_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sync_observations: Option<Vec<WalSyncObservationRecord>>,
+}
+
+#[cfg(feature = "bench")]
+impl From<kv_engine_wrapper::mem_table::WalSyncObservation> for WalSyncObservationRecord {
+    fn from(observation: kv_engine_wrapper::mem_table::WalSyncObservation) -> Self {
+        Self {
+            captured_target: observation.captured_target,
+            written_frontier_start: observation.written_frontier_start,
+            written_frontier_end: observation.written_frontier_end,
+            write_sqes_submitted: observation.write_sqes_submitted,
+            write_cqes_completed: observation.write_cqes_completed,
+            groups_completed: observation.groups_completed,
+            groups_covered: observation.groups_covered,
+            duration_ns: observation.duration_ns,
+            succeeded: observation.succeeded,
+        }
+    }
+}
+
+#[cfg(feature = "bench")]
+fn wal_pipeline_record(engine: &KvEngine, detailed: bool) -> Result<WalPipelineRecord> {
+    let profile = engine.write_profile();
+    let (wal_file_length_bytes, wal_allocated_bytes) = engine.benchmark_wal_file_usage()?;
+    let sync_observations = detailed.then(|| {
+        engine
+            .write_profile_sync_observations()
+            .into_iter()
+            .map(WalSyncObservationRecord::from)
+            .collect()
+    });
+
+    Ok(WalPipelineRecord {
+        commit_groups: profile.wal_commit_groups,
+        commit_solo_groups: profile.wal_commit_solo_groups,
+        commit_buffers: profile.wal_commit_buffers,
+        commit_bytes: profile.wal_commit_bytes,
+        cqe_count: profile.wal_cqe_count,
+        inflight_groups_max: profile.wal_inflight_groups_max,
+        outstanding_write_sqes_max: profile.wal_outstanding_write_sqes_max,
+        sync_count: profile.wal_sync_count,
+        sync_groups_total: detailed.then_some(profile.wal_sync_groups_total),
+        worker_eventfd_notifications: profile.wal_worker_eventfd_notifications,
+        preallocation_ns: profile.wal_preallocation_ns,
+        fdatasync_ns: profile.wal_fdatasync_ns,
+        wal_sync_wait_ns: profile.wal_sync_ns,
+        memtable_insert_ns: profile.memtable_insert_ns,
+        wal_file_length_bytes,
+        wal_allocated_bytes,
+        sync_observations,
+    })
+}
+
+#[derive(Clone, Copy)]
+struct ProcessCpuTimes {
+    user_ms: f64,
+    system_ms: f64,
+}
+
+fn process_cpu_times() -> Option<ProcessCpuTimes> {
+    #[cfg(unix)]
+    {
+        let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
+        // SAFETY: `getrusage` initializes the output structure on success.
+        if unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) } != 0 {
+            return None;
+        }
+        // SAFETY: the successful call above initialized the whole structure.
+        let usage = unsafe { usage.assume_init() };
+        let to_ms =
+            |time: libc::timeval| time.tv_sec as f64 * 1_000.0 + time.tv_usec as f64 / 1_000.0;
+        Some(ProcessCpuTimes {
+            user_ms: to_ms(usage.ru_utime),
+            system_ms: to_ms(usage.ru_stime),
+        })
+    }
+    #[cfg(not(unix))]
+    None
+}
+
+fn process_cpu_delta(
+    start: Option<ProcessCpuTimes>,
+    end: Option<ProcessCpuTimes>,
+) -> (Option<f64>, Option<f64>) {
+    match (start, end) {
+        (Some(start), Some(end)) => (
+            Some((end.user_ms - start.user_ms).max(0.0)),
+            Some((end.system_ms - start.system_ms).max(0.0)),
+        ),
+        _ => (None, None),
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
@@ -3046,10 +3179,16 @@ fn run_wal_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
     if cfg.pitr {
         enable_pitr_for_workload(cfg, &engine, &path)?;
     }
+    #[cfg(feature = "bench")]
+    {
+        engine.reset_write_profile();
+        engine.set_wal_sync_diagnostics_enabled(cfg.profile)?;
+    }
     let value = vec![b'x'; cfg.value_size];
     let num_keys = cfg.num;
     let writer_threads = cfg.threads;
     let baseline = collect_counters(&engine)?;
+    let cpu_start = process_cpu_times();
     let per_thread = num_keys / writer_threads;
     let remainder = num_keys % writer_threads;
     let start = Instant::now();
@@ -3092,6 +3231,12 @@ fn run_wal_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
         return Err(error);
     }
     let elapsed = start.elapsed();
+    let (process_cpu_user_ms, process_cpu_system_ms) =
+        process_cpu_delta(cpu_start, process_cpu_times());
+    #[cfg(feature = "bench")]
+    let wal_pipeline = Some(wal_pipeline_record(&engine, cfg.profile)?);
+    #[cfg(not(feature = "bench"))]
+    let wal_pipeline = None;
     if cfg.profile {
         print_write_profile(&engine, workload);
     }
@@ -3125,6 +3270,9 @@ fn run_wal_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
             measure_elapsed_ms: ms(elapsed),
             ops: Some(num_keys as u64),
             ops_per_sec: Some(rate(num_keys as u64, elapsed)),
+            process_cpu_user_ms,
+            process_cpu_system_ms,
+            wal_pipeline,
             ..MeasurementResult::default()
         },
         counters,
@@ -11580,5 +11728,60 @@ mod tests {
             err.to_string()
                 .contains("--settle-timeout-secs must be > 0")
         );
+    }
+
+    #[cfg(feature = "bench")]
+    #[test]
+    fn wal_sync_observation_json_exposes_overlap_activity() {
+        let observation =
+            WalSyncObservationRecord::from(kv_engine_wrapper::mem_table::WalSyncObservation {
+                captured_target: 10,
+                written_frontier_start: 10,
+                written_frontier_end: 14,
+                write_sqes_submitted: 6,
+                write_cqes_completed: 4,
+                groups_completed: 2,
+                groups_covered: 3,
+                duration_ns: 250_000,
+                succeeded: true,
+            });
+
+        let json = serde_json::to_value(observation).expect("serialize sync observation");
+        assert_eq!(json["captured_target"], 10);
+        assert_eq!(json["written_frontier_start"], 10);
+        assert_eq!(json["written_frontier_end"], 14);
+        assert_eq!(json["write_sqes_submitted"], 6);
+        assert_eq!(json["write_cqes_completed"], 4);
+        assert_eq!(json["groups_completed"], 2);
+        assert_eq!(json["groups_covered"], 3);
+        assert_eq!(json["duration_ns"], 250_000);
+        assert_eq!(json["succeeded"], true);
+    }
+
+    #[cfg(feature = "bench")]
+    #[test]
+    fn unprofiled_wal_pipeline_json_omits_sync_details() {
+        let ordinary = WalPipelineRecord {
+            sync_count: 3,
+            sync_groups_total: None,
+            worker_eventfd_notifications: 5,
+            sync_observations: None,
+            ..WalPipelineRecord::default()
+        };
+        let ordinary_json = serde_json::to_value(ordinary).expect("serialize ordinary WAL metrics");
+        assert_eq!(ordinary_json["sync_count"], 3);
+        assert_eq!(ordinary_json["worker_eventfd_notifications"], 5);
+        assert!(ordinary_json.get("sync_groups_total").is_none());
+        assert!(ordinary_json.get("sync_observations").is_none());
+
+        let detailed = WalPipelineRecord {
+            sync_count: 3,
+            sync_groups_total: Some(4),
+            sync_observations: Some(Vec::new()),
+            ..WalPipelineRecord::default()
+        };
+        let detailed_json = serde_json::to_value(detailed).expect("serialize detailed WAL metrics");
+        assert_eq!(detailed_json["sync_groups_total"], 4);
+        assert_eq!(detailed_json["sync_observations"], serde_json::json!([]));
     }
 }

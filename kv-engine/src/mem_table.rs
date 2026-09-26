@@ -13,6 +13,8 @@ use anyhow::{Context, Ok, Result};
 use bytes::Bytes;
 use crossbeam_skiplist::SkipMap;
 use ouroboros::self_referencing;
+#[cfg(feature = "bench")]
+use parking_lot::Mutex;
 
 use crate::{
     iterators::StorageIterator,
@@ -85,8 +87,9 @@ pub struct WriteProfile {
     /// Number of fdatasync attempts and total groups covered by those syncs.
     pub wal_sync_count: AtomicU64,
     pub wal_sync_groups_total: AtomicU64,
-    /// Number of times a dedicated WAL worker was woken for queued work.
-    pub wal_worker_wakeups: AtomicU64,
+    /// Number of queued groups whose eventfd notification call completed.
+    /// Notifications may coalesce, so this is not a count of worker wakeups.
+    pub wal_worker_eventfd_notifications: AtomicU64,
     /// Time spent extending WAL preallocation, kept separate from write time.
     pub wal_preallocation_ns: AtomicU64,
     /// Time from the previous group releasing `submitting` to the next leader
@@ -152,6 +155,28 @@ pub struct WriteProfile {
     pub wal_commit_max_bytes: AtomicU64,
     /// Number of write operations profiled.
     pub op_count: AtomicU64,
+    /// Per-fdatasync detail for paired WAL pipeline benchmarks.
+    #[cfg(feature = "bench")]
+    wal_sync_observations: Mutex<Vec<WalSyncObservation>>,
+    /// Enables per-SQE synchronization tracking for explicit diagnostic runs.
+    #[cfg(feature = "bench")]
+    wal_sync_diagnostics_enabled: AtomicBool,
+}
+
+/// One logical `fdatasync` call and the WAL progress observed while it ran.
+/// Ticket frontiers are exclusive: a target of `N` covers tickets below `N`.
+#[cfg(feature = "bench")]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WalSyncObservation {
+    pub captured_target: u64,
+    pub written_frontier_start: u64,
+    pub written_frontier_end: u64,
+    pub write_sqes_submitted: u64,
+    pub write_cqes_completed: u64,
+    pub groups_completed: u64,
+    pub groups_covered: u64,
+    pub duration_ns: u64,
+    pub succeeded: bool,
 }
 
 impl WriteProfile {
@@ -179,7 +204,11 @@ impl WriteProfile {
         self.wal_outstanding_write_sqes_max.store(0, o);
         self.wal_sync_count.store(0, o);
         self.wal_sync_groups_total.store(0, o);
-        self.wal_worker_wakeups.store(0, o);
+        #[cfg(feature = "bench")]
+        self.wal_sync_observations.lock().clear();
+        #[cfg(feature = "bench")]
+        self.wal_sync_diagnostics_enabled.store(false, o);
+        self.wal_worker_eventfd_notifications.store(0, o);
         self.wal_preallocation_ns.store(0, o);
         self.wal_group_gap_ns.store(0, o);
         self.wal_leader_prepare_ns.store(0, o);
@@ -232,7 +261,7 @@ impl WriteProfile {
             wal_outstanding_write_sqes_max: self.wal_outstanding_write_sqes_max.load(o),
             wal_sync_count: self.wal_sync_count.load(o),
             wal_sync_groups_total: self.wal_sync_groups_total.load(o),
-            wal_worker_wakeups: self.wal_worker_wakeups.load(o),
+            wal_worker_eventfd_notifications: self.wal_worker_eventfd_notifications.load(o),
             wal_preallocation_ns: self.wal_preallocation_ns.load(o),
             wal_group_gap_ns: self.wal_group_gap_ns.load(o),
             wal_leader_prepare_ns: self.wal_leader_prepare_ns.load(o),
@@ -353,9 +382,30 @@ impl WriteProfile {
     }
 
     #[cfg(feature = "bench")]
-    #[allow(dead_code)] // Wired when the dedicated worker is added in a later slice.
-    pub(crate) fn record_wal_worker_wakeup(&self) {
-        self.wal_worker_wakeups
+    pub(crate) fn record_wal_sync_observation(&self, observation: WalSyncObservation) {
+        self.wal_sync_observations.lock().push(observation);
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn set_wal_sync_diagnostics_enabled(&self, enabled: bool) {
+        self.wal_sync_diagnostics_enabled
+            .store(enabled, std::sync::atomic::Ordering::Release);
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn wal_sync_diagnostics_enabled(&self) -> bool {
+        self.wal_sync_diagnostics_enabled
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    #[cfg(feature = "bench")]
+    pub fn wal_sync_observations(&self) -> Vec<WalSyncObservation> {
+        self.wal_sync_observations.lock().clone()
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn record_wal_worker_eventfd_notification(&self) {
+        self.wal_worker_eventfd_notifications
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
@@ -488,7 +538,7 @@ pub struct WriteProfileSnapshot {
     pub wal_outstanding_write_sqes_max: u64,
     pub wal_sync_count: u64,
     pub wal_sync_groups_total: u64,
-    pub wal_worker_wakeups: u64,
+    pub wal_worker_eventfd_notifications: u64,
     pub wal_preallocation_ns: u64,
     pub wal_group_gap_ns: u64,
     pub wal_leader_prepare_ns: u64,
@@ -554,9 +604,9 @@ impl WriteProfileSnapshot {
             wal_sync_groups_total: self
                 .wal_sync_groups_total
                 .saturating_sub(before.wal_sync_groups_total),
-            wal_worker_wakeups: self
-                .wal_worker_wakeups
-                .saturating_sub(before.wal_worker_wakeups),
+            wal_worker_eventfd_notifications: self
+                .wal_worker_eventfd_notifications
+                .saturating_sub(before.wal_worker_eventfd_notifications),
             wal_preallocation_ns: self
                 .wal_preallocation_ns
                 .saturating_sub(before.wal_preallocation_ns),
@@ -786,7 +836,7 @@ impl WriteProfileSnapshot {
              submit_parts: ring_lock={:>7.2} ms  sqe_fill={:>7.2} ms  uring_enter={:>7.2} ms  cqe_reap={:>7.2} ms\n  \
              cqe_count:    {:>7}  (clean run: equal to commit buffers)\n  \
              pipeline_peak: groups={} outstanding_write_sqes={} (software depth; not device queue depth)\n  \
-             syncs:        count={} groups={} avg_groups={:.2} worker_wakeups={}\n  \
+             syncs:        count={} groups={} avg_groups={:.2} worker_eventfd_notifications={}\n  \
              preallocation:{:>8.2} ms\n  \
              group_gap:    {:>8.2} ms  (previous release -> next leader enters; includes idle)\n  \
              leader_prep:  {:>8.2} ms  (enter -> first SQE: drain, peer spin, accounting)\n  \
@@ -834,7 +884,7 @@ impl WriteProfileSnapshot {
             } else {
                 self.wal_sync_groups_total as f64 / self.wal_sync_count as f64
             },
-            self.wal_worker_wakeups,
+            self.wal_worker_eventfd_notifications,
             self.wal_preallocation_ns as f64 / 1_000_000.0,
             self.wal_group_gap_ms(),
             self.wal_leader_prepare_ms(),
@@ -2294,7 +2344,21 @@ impl MemTable {
     /// Replace the write profile with a shared instance (e.g., from LsmStorageInner).
     /// This allows profiling to accumulate across memtable freezes.
     pub fn set_write_profile(&self, profile: Arc<WriteProfile>) {
-        self.write_profile.store(profile);
+        self.write_profile.store(Arc::clone(&profile));
+        if let Some(wal) = &self.wal {
+            wal.set_write_profile(profile);
+        }
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn set_wal_sync_diagnostics_enabled(&self, enabled: bool) -> Result<()> {
+        let profile = self.write_profile.load_full();
+        if let Some(wal) = &self.wal {
+            wal.set_wal_sync_diagnostics_enabled(&profile, enabled)
+        } else {
+            profile.set_wal_sync_diagnostics_enabled(enabled);
+            Ok(())
+        }
     }
 
     /// Write a range tombstone into the memtable.
