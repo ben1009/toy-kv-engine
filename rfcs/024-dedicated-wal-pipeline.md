@@ -299,7 +299,7 @@ on `fdatasync`. Whether a filesystem lets the sync overlap later direct
 writes efficiently is a device-backed measurement, not a guarantee of this
 design. The coordinator may coalesce several completed groups into one call.
 When a written prefix is ready and already-admitted tickets remain unwritten,
-it may wait up to 50 microseconds for that captured ticket cutoff before
+it may wait up to 100 microseconds for that captured ticket cutoff before
 syncing, but only after the preceding `fdatasync` took at least 100
 microseconds. New admission cannot extend the cutoff or deadline. A lone
 writer does not incur this wait. The latency check avoids adding the wait on

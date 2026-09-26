@@ -361,6 +361,39 @@ of the 20k-put WAL-isolated workload measured 1.024, 0.905, 1.011, 0.889, and
 and its direct dependency were reverted. Reducing worker allocations alone
 did not address the dominant pipeline cost.
 
+### Conditional sync window: 100 versus 50 microseconds
+
+The same adaptive gate was retained: the coordinator waits only if the
+preceding `fdatasync` took at least 100 microseconds and a written prefix has
+already-admitted unfinished tickets behind it. The maximum wait increased
+from 50 to 100 microseconds; the captured cutoff still cannot move.
+
+Five alternating ext4 pairs on the 50k-put, four-writer, 1-MiB-SST workload
+measured 100/50-microsecond throughput ratios of 1.127, 1.150, 1.157, 1.151,
+and 1.153 (median 1.151). Median p99 ratio was 0.908. Median sync calls fell
+from 16,170 to 13,056, and median aggregate `fdatasync` time fell from 6.28
+to 4.80 seconds. Ten ext4 pairs on the 20k-put WAL-isolated workload had a
+1.05 median throughput ratio, but two pairs experienced large device-latency
+swings; the rotation-heavy result is the more stable comparison.
+
+Three pairs of the original 200k-put ext4 workload measured throughput ratios
+of 2.051, 2.092, and 1.134. The 50-microsecond arm varied from 2.72k to
+4.97k ops/s, while the 100-microsecond arm stayed between 5.64k and 5.70k
+ops/s. The first two pairs had much slower baseline syncs, so the apparent
+twofold median gain should not be generalized. Sync counts were about 64–66k
+for 50 microseconds and 53–54k for 100 microseconds. This is a comparison
+between two parallel configurations, not a new parallel-versus-leader
+adoption result.
+
+Five tmpfs pairs of the same 200k-put workload had a 1.021 median throughput
+ratio and a 1.082 median p99 ratio. Five one-writer ext4 pairs of 5k puts had
+a 0.994 median throughput ratio and a 0.984 median p99 ratio. The larger
+window is retained as a scoped device-backed improvement; the leader remains
+the default because the parallel path is still much slower on tmpfs. Raw
+50k-put ext4 and 200k-put ext4 JSON are under
+`target/rfc024-sync-window-rotation` and `target/rfc024-sync-window-exact`;
+the 200k-put tmpfs JSON is under `/tmp/rfc024-sync-window-exact`.
+
 Raw JSONL outputs from the Slice 7 session are in
 `/tmp/rfc024-slice7-artifacts`; the current 20k WAL-focused outputs are in
 `/tmp/rfc024-packer-single-allocation-five-pair`, and the exact-case pairs are
