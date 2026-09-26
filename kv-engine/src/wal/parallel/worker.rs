@@ -1984,12 +1984,34 @@ fn process_worker_events<B: WorkerBuffer>(
                 buffer.retire(buffer_pool);
             }
             WorkerEvent::GroupFinished(result) => {
+                #[cfg(all(test, feature = "chaos-testing"))]
+                let (result, injected_failure) = inject_parallel_wal_group_failure(result);
+
                 io_event.record_group_completion(&result);
                 group_permits.remove(&GroupId(result.group_id));
+                #[cfg(all(test, feature = "chaos-testing"))]
+                if completion_tx.send(result).is_ok() && injected_failure {
+                    crate::chaos::failpoint::note_parallel_wal_injected_group_failure();
+                }
+                #[cfg(not(all(test, feature = "chaos-testing")))]
                 let _ = completion_tx.send(result);
             }
         }
     }
+}
+
+#[cfg(all(test, feature = "chaos-testing"))]
+fn inject_parallel_wal_group_failure(mut result: GroupWriteResult) -> (GroupWriteResult, bool) {
+    let injected_failure =
+        match crate::chaos::failpoint::parallel_wal_group_completion_error(result.tickets.start) {
+            Some(error) => {
+                result.error = Some(error);
+                true
+            }
+            None => false,
+        };
+
+    (result, injected_failure)
 }
 
 fn fail_shutdown_reply(reply: &mut Option<Sender<Result<(), String>>>, reason: &str) {

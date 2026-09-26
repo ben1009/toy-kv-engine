@@ -28,6 +28,26 @@ slow-timeout = { period = "2m", terminate-after = 1, grace-period = "10s" }
 retries = 0
 
 [[profile.default.overrides]]
+filter = 'test(failpoint_parallel_wal_fdatasync_failure_preserves_durable_prefix)'
+slow-timeout = { period = "2m", terminate-after = 1, grace-period = "10s" }
+retries = 0
+
+[[profile.default.overrides]]
+filter = 'test(failpoint_parallel_wal_group_poison_during_sync_keeps_earlier_ticket_durable)'
+slow-timeout = { period = "2m", terminate-after = 1, grace-period = "10s" }
+retries = 0
+
+[[profile.default.overrides]]
+filter = 'test(failpoint_parallel_wal_poison_before_sync_preserves_written_prefix)'
+slow-timeout = { period = "2m", terminate-after = 1, grace-period = "10s" }
+retries = 0
+
+[[profile.default.overrides]]
+filter = 'test(failpoint_parallel_wal_rotation_reruns_transaction_conflict_check)'
+slow-timeout = { period = "2m", terminate-after = 1, grace-period = "10s" }
+retries = 0
+
+[[profile.default.overrides]]
 filter = 'test(failpoint_manifest_after_append_before_sync)'
 slow-timeout = { period = "2m", terminate-after = 1, grace-period = "10s" }
 retries = 0
