@@ -539,27 +539,89 @@ impl<B> WriteBuffer<B> {
     }
 }
 
+/// Avoid a heap allocation for the common one-write group while retaining a
+/// spill vector for groups that contain multiple writes.
+pub(crate) struct WriteGroupBuffers<B> {
+    first: Option<WriteBuffer<B>>,
+    rest: Vec<WriteBuffer<B>>,
+}
+
+impl<B> WriteGroupBuffers<B> {
+    pub(crate) fn with_capacity(capacity: usize) -> Self {
+        Self {
+            first: None,
+            rest: Vec::with_capacity(capacity.saturating_sub(1)),
+        }
+    }
+
+    pub(crate) fn push(&mut self, write: WriteBuffer<B>) {
+        if self.first.is_none() {
+            self.first = Some(write);
+        } else {
+            self.rest.push(write);
+        }
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        usize::from(self.first.is_some()) + self.rest.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.first.is_none()
+    }
+
+    fn first(&self) -> Option<&WriteBuffer<B>> {
+        self.first.as_ref()
+    }
+
+    fn last(&self) -> Option<&WriteBuffer<B>> {
+        self.rest.last().or(self.first.as_ref())
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &WriteBuffer<B>> {
+        self.first.iter().chain(self.rest.iter())
+    }
+
+    fn into_iter(self) -> impl Iterator<Item = WriteBuffer<B>> {
+        self.first.into_iter().chain(self.rest)
+    }
+}
+
+impl<B> From<Vec<WriteBuffer<B>>> for WriteGroupBuffers<B> {
+    fn from(writes: Vec<WriteBuffer<B>>) -> Self {
+        let mut writes = writes.into_iter();
+        Self {
+            first: writes.next(),
+            rest: writes.collect(),
+        }
+    }
+}
+
 /// A ticket-ordered group whose file range has already been reserved and
 /// preallocated by the packer.
 pub(crate) struct WriteGroup<B = DirectBuf> {
     tickets: Range<u64>,
-    writes: Vec<WriteBuffer<B>>,
+    writes: WriteGroupBuffers<B>,
 }
 
 impl<B> WriteGroup<B> {
     pub(crate) fn new(
         tickets: Range<u64>,
-        writes: Vec<WriteBuffer<B>>,
+        writes: impl Into<WriteGroupBuffers<B>>,
     ) -> Result<Self, WorkerError> {
         if tickets.start >= tickets.end {
             return Err(WorkerError::InvalidTicketRange);
         }
+        let writes = writes.into();
         if writes.is_empty() {
             return Err(WorkerError::EmptyGroup);
         }
 
-        let mut expected_offset = writes[0].file_offset;
-        for write in &writes {
+        let mut expected_offset = writes
+            .first()
+            .expect("nonempty group has first write")
+            .file_offset;
+        for write in writes.iter() {
             if write.write_len == 0
                 || write.write_len > i32::MAX as usize
                 || !write.write_len.is_multiple_of(DIRECT_IO_ALIGNMENT)
@@ -640,7 +702,7 @@ struct OwnedWrite<B> {
 struct GroupState {
     tickets: Range<u64>,
     file_range: Range<u64>,
-    request_ids: Vec<RequestId>,
+    request_ids: Range<u64>,
     next_ready_index: usize,
     remaining_writes: usize,
     error: Option<String>,
@@ -742,7 +804,11 @@ impl<B: WorkerBuffer> WorkerCore<B> {
             return Err(WorkerError::TooManyGroups);
         }
 
-        let file_start = group.writes[0].file_offset;
+        let file_start = group
+            .writes
+            .first()
+            .expect("validated group has writes")
+            .file_offset;
         if self
             .next_file_offset
             .is_some_and(|next_file_offset| file_start != next_file_offset)
@@ -771,13 +837,12 @@ impl<B: WorkerBuffer> WorkerCore<B> {
             .next_buffer_id
             .checked_add(request_count)
             .ok_or(WorkerError::CounterOverflow)?;
-        let mut request_ids = Vec::with_capacity(group.writes.len());
-        for write in group.writes {
+        let request_ids_start = self.next_request_id;
+        for write in group.writes.into_iter() {
             let request_id = RequestId(self.next_request_id);
             self.next_request_id += 1;
             let buffer_id = BufferId(self.next_buffer_id);
             self.next_buffer_id += 1;
-            request_ids.push(request_id);
             self.writes.insert(
                 request_id,
                 OwnedWrite {
@@ -797,12 +862,14 @@ impl<B: WorkerBuffer> WorkerCore<B> {
         self.next_ticket = Some(group.tickets.end);
         self.next_file_offset = Some(file_end);
         self.group_order.push_back(group_id);
+        let request_ids = request_ids_start..next_request_id;
         self.groups.insert(
             group_id,
             GroupState {
                 tickets: group.tickets,
                 file_range: file_start..file_end,
-                remaining_writes: request_ids.len(),
+                remaining_writes: usize::try_from(request_count)
+                    .expect("request count came from a usize"),
                 request_ids,
                 next_ready_index: 0,
                 error: None,
@@ -839,10 +906,10 @@ impl<B: WorkerBuffer> WorkerCore<B> {
                 }
                 if let Some((request_offset, request_id)) = group
                     .request_ids
-                    .iter()
-                    .copied()
+                    .clone()
                     .enumerate()
                     .skip(group.next_ready_index)
+                    .map(|(request_offset, request_id)| (request_offset, RequestId(request_id)))
                     .find(|(_, request_id)| {
                         self.writes
                             .get(request_id)
@@ -1025,16 +1092,14 @@ impl<B: WorkerBuffer> WorkerCore<B> {
                 .expect("ordered group exists")
                 .request_ids
                 .clone();
-            let group = self
-                .groups
+            self.groups
                 .get_mut(&group_id)
-                .expect("ordered group exists");
-            group
+                .expect("ordered group exists")
                 .error
                 .get_or_insert_with(|| format!("WAL poisoned at ticket {poison_ticket}"));
             let mut cancelled_writes = 0;
 
-            for request_id in request_ids {
+            for request_id in request_ids.map(RequestId) {
                 let write = self
                     .writes
                     .get_mut(&request_id)
@@ -1047,6 +1112,10 @@ impl<B: WorkerBuffer> WorkerCore<B> {
                     cancelled_writes += 1;
                 }
             }
+            let group = self
+                .groups
+                .get_mut(&group_id)
+                .expect("ordered group exists");
             group.remaining_writes = group
                 .remaining_writes
                 .checked_sub(cancelled_writes)
@@ -1074,10 +1143,10 @@ impl<B: WorkerBuffer> WorkerCore<B> {
                 .groups
                 .remove(&group_id)
                 .expect("completed group exists");
-            let write_count = group.request_ids.len() as u64;
+            let write_count = group.request_ids.end - group.request_ids.start;
             let write_bytes = group.file_range.end - group.file_range.start;
             self.group_order.retain(|queued_id| *queued_id != group_id);
-            for request_id in group.request_ids {
+            for request_id in group.request_ids.map(RequestId) {
                 let write = self.writes.remove(&request_id);
                 debug_assert!(write.is_some_and(|write| write.state.is_terminal()));
             }
@@ -1173,8 +1242,8 @@ impl<B: WorkerBuffer> WorkerCore<B> {
         self.groups
             .values()
             .filter(|group| {
-                group.request_ids.iter().any(|request_id| {
-                    self.writes.get(request_id).is_some_and(|write| {
+                group.request_ids.clone().map(RequestId).any(|request_id| {
+                    self.writes.get(&request_id).is_some_and(|write| {
                         matches!(write.state, WriteState::Submitted | WriteState::Ambiguous)
                     })
                 })
@@ -1193,7 +1262,7 @@ impl<B: WorkerBuffer> WorkerCore<B> {
                 self.groups.get(group_id).map(|group| GroupWriteResult {
                     group_id: group_id.0,
                     tickets: group.tickets.clone(),
-                    write_count: group.request_ids.len() as u64,
+                    write_count: group.request_ids.end - group.request_ids.start,
                     write_bytes: group.file_range.end - group.file_range.start,
                     error: Some(reason.to_owned()),
                 })
@@ -1563,7 +1632,7 @@ impl<B: WorkerBuffer> IoWorkerClient<B> {
     /// groups together, not just groups already submitted to the ring.
     pub(crate) fn submit_group(&self, group: WriteGroup<B>) -> Result<u64> {
         let tickets = group.tickets.clone();
-        for write in &group.writes {
+        for write in group.writes.iter() {
             ensure!(
                 write.write_len == write.buffer.len() && write.write_len <= write.buffer.cap(),
                 "WAL write length exceeds its owned DirectBuf"
@@ -2110,10 +2179,11 @@ mod tests {
     #[cfg(feature = "bench")]
     use super::SyncProgressSnapshot;
     use super::{
-        DirectBuf, GroupId, GroupPermit, GroupSlots, GroupWriteResult, IoWorker, RequestId,
-        SlotState, WalSyncProgress, WorkerCommand, WorkerCore, WorkerError, WorkerEvent,
-        WorkerWake, WriteBuffer, WriteGroup, close_group_admission, enqueue_group_command,
-        fail_shutdown_reply, flush_staged_writes, retry_interrupted, wait_for_worker_progress,
+        DIRECT_IO_ALIGNMENT, DirectBuf, GroupId, GroupPermit, GroupSlots, GroupWriteResult,
+        IoWorker, RequestId, SlotState, WalSyncProgress, WorkerCommand, WorkerCore, WorkerError,
+        WorkerEvent, WorkerWake, WriteBuffer, WriteGroup, WriteGroupBuffers, close_group_admission,
+        enqueue_group_command, fail_shutdown_reply, flush_staged_writes, retry_interrupted,
+        wait_for_worker_progress,
     };
     use crossbeam_queue::ArrayQueue;
     use parking_lot::{Condvar, Mutex};
@@ -2172,7 +2242,7 @@ mod tests {
         allocation_len: usize,
         drops: &Arc<AtomicUsize>,
     ) -> WriteGroup<DropProbe> {
-        let writes = (0..write_count)
+        let writes: Vec<_> = (0..write_count)
             .map(|index| {
                 WriteBuffer::new(
                     DropProbe::new(allocation_len, Arc::clone(drops)),
@@ -2213,6 +2283,30 @@ mod tests {
                 }
             })
             .expect("group completion event")
+    }
+
+    #[test]
+    fn one_write_group_stays_inline_and_multiple_writes_spill() {
+        let mut single = WriteGroupBuffers::with_capacity(1);
+        single.push(WriteBuffer::new(1_u8, 0, DIRECT_IO_ALIGNMENT));
+        assert_eq!(single.len(), 1);
+        assert_eq!(single.rest.capacity(), 0);
+        assert_eq!(single.first().map(|write| write.file_offset), Some(0));
+        assert_eq!(single.last().map(|write| write.file_offset), Some(0));
+
+        let mut multiple = WriteGroupBuffers::with_capacity(3);
+        for offset in [0, 4096, 8192] {
+            multiple.push(WriteBuffer::new(1_u8, offset, DIRECT_IO_ALIGNMENT));
+        }
+        assert_eq!(multiple.len(), 3);
+        assert!(multiple.rest.capacity() >= 2);
+        assert_eq!(
+            multiple
+                .iter()
+                .map(|write| write.file_offset)
+                .collect::<Vec<_>>(),
+            [0, 4096, 8192]
+        );
     }
 
     fn io_uring_unavailable(error: &anyhow::Error) -> bool {

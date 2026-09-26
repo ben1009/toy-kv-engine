@@ -569,3 +569,36 @@ another individual lock.
 
 The raw JSONL from this screening session is
 `/tmp/rfc024-buffer-budget-pairs.jsonl`.
+
+### Inline storage for single-write groups
+
+**Run date:** 2026-09-27.
+
+The producer-side packer commonly sends one-write groups. Its packed write
+vector and the worker's per-group request-ID vector each allocated on the
+heap for that case. `WriteGroupBuffers` now stores the first write inline and
+spills only additional writes to a `Vec`; request IDs are represented by the
+contiguous range assigned to the group. This removes those two heap
+allocations for each single-write group without adding a dependency. The
+multi-write path remains covered by the parallel worker tests.
+
+Alternating release-build pairs used 50,000 puts, four writers, 1-KiB values,
+a 1-GiB SST target, a 100-operation latency sample interval, and the opt-in
+parallel v4 WAL path. On tmpfs, five candidate/baseline throughput ratios were
+`1.254, 1.003, 0.998, 1.571, 0.918`; the median was `1.003` and the exhaustive
+paired bootstrap 95% interval was `0.918–1.571`. Median p99 and process CPU
+ratios were `1.035` and `0.959`.
+
+Ten ext4 throughput ratios were `1.017, 1.013, 1.016, 1.002, 1.014, 1.004,
+0.986, 1.022, 4.991, 1.623`. The median was `1.015`; a 200,000-resample
+paired bootstrap 95% interval was `1.004–1.320`. Median p99 and process CPU
+ratios were `0.966` and `0.960`. The last two pairs included severe device
+slowdowns: baseline throughput fell to 1,297 and 1,030 ops/s, compared with
+roughly 6,300–6,500 ops/s in the first eight pairs. All completed pairs are
+reported; this noise makes the upper confidence bound imprecise.
+
+The result is a small ext4 improvement with lower process CPU, and no
+measurable tmpfs throughput change. Keep the allocation reduction in the
+opt-in parallel path; it does not satisfy the separate gate for changing the
+leader default. Raw outputs are under `/tmp/rfc024-inline-group-tmpfs` and
+`target/rfc024-inline-group-ext4`.

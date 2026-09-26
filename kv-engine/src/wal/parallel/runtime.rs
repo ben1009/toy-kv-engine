@@ -19,7 +19,7 @@ use super::{
     BUFFER_POOL_BUF_SIZE, BUFFER_POOL_CAPACITY, DirectBuf, MAX_WAL_FILE_SIZE, PREALLOC_BLOCK,
     parallel_worker::{
         GroupWriteResult, IoWorker, IoWorkerClient, WalSyncProgress, WorkerBuffer, WriteBuffer,
-        WriteGroup,
+        WriteGroup, WriteGroupBuffers,
     },
 };
 
@@ -219,7 +219,7 @@ struct PackedGroup {
     first_ticket: u64,
     next_ticket: u64,
     reserved_end: u64,
-    writes: Vec<WriteBuffer<ParallelBuffer>>,
+    writes: WriteGroupBuffers<ParallelBuffer>,
 }
 
 struct AdmissionState {
@@ -749,7 +749,7 @@ fn take_admitted_group(
 
     let first_ticket = first.ticket;
     let group_capacity = admission.queue.len().min(max_tickets);
-    let mut writes = Vec::with_capacity(group_capacity);
+    let mut writes = WriteGroupBuffers::with_capacity(group_capacity);
     let mut expected_ticket = next_ticket;
     let mut packed_end = reserved_end;
     while writes.len() < max_tickets {
