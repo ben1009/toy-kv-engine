@@ -200,6 +200,63 @@ fn test_parallel_v4_wal_writes_syncs_and_recovers() {
     assert_eq!(batch.range_tombstones[0].end.as_ref(), b"range-end");
 }
 
+#[test]
+fn test_parallel_v4_wal_concurrent_admission_drains_on_close() {
+    const WRITERS: usize = 4;
+    const WRITES_PER_WRITER: usize = 64;
+    const TOTAL_WRITES: usize = WRITERS * WRITES_PER_WRITER;
+
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("concurrent-admission.wal");
+    let wal = match Wal::create_with_io_mode(&path, WalIoMode::Parallel) {
+        Ok(wal) => Arc::new(wal),
+        Err(error) if is_io_uring_unavailable_error(&error) => {
+            eprintln!("skipping test (io_uring unavailable): {error}");
+            return;
+        }
+        Err(error) => panic!("failed to create WAL: {error:#}"),
+    };
+    let barrier = Arc::new(Barrier::new(WRITERS + 1));
+    let writers = (0..WRITERS)
+        .map(|writer| {
+            let wal = Arc::clone(&wal);
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                barrier.wait();
+                for write in 0..WRITES_PER_WRITER {
+                    let commit_ts = (writer * WRITES_PER_WRITER + write + 1) as u64;
+                    let key = format!("{writer}/{write}");
+                    let batch = [(key.as_bytes(), b"value".as_slice())];
+                    let ticket = wal.put_batch(&batch, commit_ts).expect("admit WAL batch");
+                    wal.submit_and_commit(ticket)
+                        .expect("wait for WAL durability");
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+
+    barrier.wait();
+    for writer in writers {
+        writer.join().expect("WAL writer thread joins");
+    }
+    assert_eq!(wal.assigned_ticket_count(), TOTAL_WRITES as u64);
+    wal.close().expect("drain queued tickets and close WAL");
+    drop(wal);
+
+    let skiplist = new_skiplist();
+    let range_tombstones = crate::range_tombstone::RangeTombstoneSet::new();
+    let (recovered, batch) = Wal::recover_with_range_tombstones_and_mode(
+        &path,
+        &skiplist,
+        &range_tombstones,
+        WalIoMode::Parallel,
+    )
+    .expect("recover all concurrently admitted batches");
+    assert_eq!(batch.max_ts, TOTAL_WRITES as u64);
+    assert_eq!(skiplist.len(), TOTAL_WRITES);
+    recovered.close().expect("close recovered WAL");
+}
+
 #[cfg(feature = "chaos-testing")]
 #[test]
 fn failpoint_parallel_wal_fdatasync_failure_preserves_durable_prefix() {

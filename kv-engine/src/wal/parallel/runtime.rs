@@ -13,7 +13,7 @@ use std::{
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use crossbeam_channel::{Receiver, Sender, TryRecvError, unbounded};
 use crossbeam_queue::ArrayQueue;
-use parking_lot::{Condvar, Mutex};
+use parking_lot::{Condvar, Mutex, MutexGuard};
 
 use super::{
     BUFFER_POOL_BUF_SIZE, BUFFER_POOL_CAPACITY, DirectBuf, MAX_WAL_FILE_SIZE, PREALLOC_BLOCK,
@@ -247,7 +247,8 @@ struct DurabilityShared {
 
 struct RuntimeInner {
     admission: Mutex<AdmissionState>,
-    admission_changed: Condvar,
+    packer_state: Mutex<PackerState>,
+    packer_failures: Mutex<Option<Sender<GroupWriteResult>>>,
     #[cfg(test)]
     file_size_limit: std::sync::atomic::AtomicU64,
     buffer_budget: Arc<BufferBudget>,
@@ -259,14 +260,20 @@ struct RuntimeInner {
 }
 
 struct RuntimeThreads {
-    packer: Option<JoinHandle<Result<()>>>,
     worker: Option<IoWorker<ParallelBuffer>>,
     coordinator: Option<JoinHandle<Result<()>>>,
     closed: bool,
     close_error: Option<String>,
 }
 
-/// Dedicated packer, I/O worker, and single-owner durability coordinator.
+struct PackerState {
+    next_ticket: u64,
+    reserved_end: u64,
+    preallocated_end: u64,
+}
+
+/// Parallel WAL runtime with admission-driven packing, an I/O worker, and a
+/// single-owner durability coordinator.
 pub(crate) struct ParallelWalRuntime {
     inner: Arc<RuntimeInner>,
     threads: Mutex<RuntimeThreads>,
@@ -311,7 +318,12 @@ impl ParallelWalRuntime {
                 admitted_end: initial_file_end,
                 queue: VecDeque::new(),
             }),
-            admission_changed: Condvar::new(),
+            packer_state: Mutex::new(PackerState {
+                next_ticket: 0,
+                reserved_end: initial_file_end,
+                preallocated_end: initial_file_end,
+            }),
+            packer_failures: Mutex::new(Some(packer_failures_tx)),
             #[cfg(test)]
             file_size_limit: std::sync::atomic::AtomicU64::new(MAX_WAL_FILE_SIZE),
             buffer_budget,
@@ -340,29 +352,9 @@ impl ParallelWalRuntime {
             }
         };
 
-        let packer_inner = Arc::clone(&inner);
-        let packer = match thread::Builder::new()
-            .name("wal-ordered-packer".to_owned())
-            .spawn(move || run_packer(packer_inner, packer_failures_tx, initial_file_end))
-        {
-            Ok(join) => join,
-            Err(error) => {
-                inner.buffer_budget.close();
-                {
-                    let mut admission = inner.admission.lock();
-                    admission.open = false;
-                    inner.admission_changed.notify_all();
-                }
-                let _ = worker.close();
-                let _ = coordinator.join();
-                return Err(error).context("failed to spawn WAL ordered packer");
-            }
-        };
-
         Ok(Self {
             inner,
             threads: Mutex::new(RuntimeThreads {
-                packer: Some(packer),
                 worker: Some(worker),
                 coordinator: Some(coordinator),
                 closed: false,
@@ -477,7 +469,15 @@ impl ParallelWalRuntime {
         debug_assert!(WAL_HEADER_END <= state.admitted_end);
         debug_assert!(state.admitted_end <= MAX_WAL_FILE_SIZE);
         debug_assert_eq!(state.next_ticket, ticket + 1);
-        self.inner.admission_changed.notify_one();
+
+        // If no other writer is packing, this writer drains the queue. A
+        // current packer observes this ticket before releasing its mutex,
+        // while the admission lock is still held, so work cannot be stranded.
+        let packer = self.inner.packer_state.try_lock();
+        drop(state);
+        if let Some(packer) = packer {
+            pack_admitted_groups(&self.inner, packer)?;
+        }
 
         Ok(ticket)
     }
@@ -584,18 +584,15 @@ impl ParallelWalRuntime {
             let mut admission = self.inner.admission.lock();
             admission.open = false;
             admission.close_cutoff = Some(admission.next_ticket);
-            self.inner.admission_changed.notify_all();
         }
         self.inner.buffer_budget.close();
 
         let mut close_error = None;
-        if let Some(packer) = threads.packer.take() {
-            match packer.join() {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => close_error = Some(format!("packer failed: {error:#}")),
-                Err(_) => close_error = Some("WAL packer panicked".to_owned()),
-            }
+        let packer = self.inner.packer_state.lock();
+        if let Err(error) = pack_admitted_groups(&self.inner, packer) {
+            close_error = Some(format!("packer failed: {error:#}"));
         }
+        self.inner.packer_failures.lock().take();
 
         if let Some(worker) = threads.worker.take()
             && let Err(error) = worker.close()
@@ -643,98 +640,92 @@ impl Drop for ParallelWalRuntime {
     }
 }
 
-fn run_packer(
-    inner: Arc<RuntimeInner>,
-    failures: Sender<GroupWriteResult>,
-    initial_file_end: u64,
+fn pack_admitted_groups(
+    inner: &RuntimeInner,
+    mut packer: MutexGuard<'_, PackerState>,
 ) -> Result<()> {
-    let mut next_ticket = 0_u64;
-    let mut reserved_end = initial_file_end;
-    let mut preallocated_end = initial_file_end;
-
     loop {
         let packed_result = {
             let mut admission = inner.admission.lock();
-            while admission.queue.is_empty() && admission.open {
-                inner.admission_changed.wait(&mut admission);
-            }
-            if admission.queue.is_empty() && !admission.open {
+            if admission.queue.is_empty() {
                 if admission.poison.is_none()
                     && let Some(cutoff) = admission.close_cutoff
                 {
                     ensure!(
-                        next_ticket == cutoff,
-                        "parallel WAL packer stopped at ticket {next_ticket} before close cutoff {cutoff}"
+                        packer.next_ticket == cutoff,
+                        "parallel WAL packer stopped at ticket {} before close cutoff {cutoff}",
+                        packer.next_ticket
                     );
                 }
-                None
-            } else {
-                Some(take_admitted_group(
-                    &mut admission,
-                    next_ticket,
-                    reserved_end,
-                    PACKER_GROUP_MAX_TICKETS,
-                ))
+                // Release in this lock order to pair with admission's
+                // nonblocking packer try_lock and prevent stranded tickets.
+                drop(packer);
+                return Ok(());
             }
-        };
-        let Some(packed_result) = packed_result else {
-            break;
+            take_admitted_group(
+                &mut admission,
+                packer.next_ticket,
+                packer.reserved_end,
+                PACKER_GROUP_MAX_TICKETS,
+            )
         };
         let packed = match packed_result {
             Ok(Some(packed)) => packed,
             Ok(None) => continue,
             Err(error) => {
-                report_packer_failure(&inner, &failures, next_ticket, &error);
+                report_packer_failure(inner, packer.next_ticket, &error);
                 return Err(error);
             }
         };
         let first_ticket = packed.first_ticket;
         let expected_ticket = packed.next_ticket;
-        reserved_end = packed.reserved_end;
+        packer.reserved_end = packed.reserved_end;
         let writes = packed.writes;
 
-        let target_preallocated_end = round_up(reserved_end, PREALLOC_BLOCK)
-            .ok_or_else(|| anyhow!("parallel WAL preallocation offset overflow"))?;
-        if target_preallocated_end > preallocated_end {
+        let Some(target_preallocated_end) = round_up(packer.reserved_end, PREALLOC_BLOCK) else {
+            let error = anyhow!("parallel WAL preallocation offset overflow");
+            report_packer_failure(inner, first_ticket, &error);
+            return Err(error);
+        };
+        if target_preallocated_end > packer.preallocated_end {
             #[cfg(feature = "bench")]
             let preallocation_start = Instant::now();
             if let Err(error) = preallocate(&inner.preallocator, target_preallocated_end) {
-                report_packer_failure(&inner, &failures, first_ticket, &error);
+                report_packer_failure(inner, first_ticket, &error);
                 return Err(error);
             }
             #[cfg(feature = "bench")]
             inner
                 .sync_progress
                 .record_preallocation_ns(preallocation_start.elapsed().as_nanos() as u64);
-            preallocated_end = target_preallocated_end;
+            packer.preallocated_end = target_preallocated_end;
         }
         let admitted_end = inner.admission.lock().admitted_end;
-        debug_assert!(WAL_HEADER_END <= reserved_end);
-        debug_assert!(reserved_end <= admitted_end);
+        debug_assert!(WAL_HEADER_END <= packer.reserved_end);
+        debug_assert!(packer.reserved_end <= admitted_end);
         debug_assert!(admitted_end <= MAX_WAL_FILE_SIZE);
-        debug_assert!(preallocated_end >= reserved_end);
-        debug_assert!(preallocated_end <= MAX_WAL_FILE_SIZE);
-        ensure!(
-            reserved_end <= preallocated_end,
-            "WAL write extends beyond preallocation"
-        );
+        debug_assert!(packer.preallocated_end >= packer.reserved_end);
+        debug_assert!(packer.preallocated_end <= MAX_WAL_FILE_SIZE);
+        if packer.reserved_end > packer.preallocated_end {
+            let error = anyhow!("WAL write extends beyond preallocation");
+            report_packer_failure(inner, first_ticket, &error);
+            return Err(error);
+        }
 
-        let group = match WriteGroup::new(next_ticket..expected_ticket, writes) {
+        let group = match WriteGroup::new(packer.next_ticket..expected_ticket, writes) {
             Ok(group) => group,
             Err(error) => {
                 let error = anyhow!("invalid packed WAL group: {error:?}");
-                report_packer_failure(&inner, &failures, first_ticket, &error);
+                report_packer_failure(inner, first_ticket, &error);
                 return Err(error);
             }
         };
         if let Err(error) = inner.worker.submit_group(group) {
-            report_packer_failure(&inner, &failures, first_ticket, &error);
+            report_packer_failure(inner, first_ticket, &error);
             return Err(error).context("failed to submit packed WAL group");
         }
-        next_ticket = expected_ticket;
+        packer.next_ticket = expected_ticket;
     }
-
-    Ok(())
 }
 
 fn take_admitted_group(
@@ -804,12 +795,7 @@ fn take_admitted_group(
     }))
 }
 
-fn report_packer_failure(
-    inner: &RuntimeInner,
-    failures: &Sender<GroupWriteResult>,
-    ticket: u64,
-    error: &anyhow::Error,
-) {
+fn report_packer_failure(inner: &RuntimeInner, ticket: u64, error: &anyhow::Error) {
     let message = format!("{error:#}");
     {
         let mut admission = inner.admission.lock();
@@ -822,16 +808,17 @@ fn report_packer_failure(
             admission.poison = Some((ticket, message.clone()));
         }
         admission.queue.clear();
-        inner.admission_changed.notify_all();
     }
     inner.buffer_budget.close();
-    let _ = failures.send(GroupWriteResult {
-        group_id: u64::MAX,
-        tickets: ticket..ticket.saturating_add(1),
-        write_count: 0,
-        write_bytes: 0,
-        error: Some(message),
-    });
+    if let Some(failures) = inner.packer_failures.lock().as_ref() {
+        let _ = failures.send(GroupWriteResult {
+            group_id: u64::MAX,
+            tickets: ticket..ticket.saturating_add(1),
+            write_count: 0,
+            write_bytes: 0,
+            error: Some(message),
+        });
+    }
 }
 
 fn run_sync_coordinator(
@@ -1009,7 +996,6 @@ fn process_group_result(inner: &RuntimeInner, result: GroupWriteResult) {
             admission.poison = Some((result.tickets.start, error.clone()));
         }
         admission.queue.clear();
-        inner.admission_changed.notify_all();
         inner.buffer_budget.close();
     } else {
         let previous = state.completed.insert(result.tickets.start, result);
@@ -1066,7 +1052,6 @@ fn terminalize_unresolved_prefix(inner: &RuntimeInner) {
         {
             admission.poison = Some((poison, error));
         }
-        inner.admission_changed.notify_all();
         inner.buffer_budget.close();
     }
     inner.durability.changed.notify_all();
@@ -1196,7 +1181,6 @@ fn synchronize_written_prefix(sync_file: &File, inner: &RuntimeInner) -> Result<
     {
         admission.poison = Some((durable, message));
     }
-    inner.admission_changed.notify_all();
     inner.buffer_budget.close();
     // Publish the admission poison before waking writers that are waiting on
     // this failed sync. Otherwise a waiter can return `Err` and race a new
