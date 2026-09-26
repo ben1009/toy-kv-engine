@@ -602,3 +602,32 @@ measurable tmpfs throughput change. Keep the allocation reduction in the
 opt-in parallel path; it does not satisfy the separate gate for changing the
 leader default. Raw outputs are under `/tmp/rfc024-inline-group-tmpfs` and
 `target/rfc024-inline-group-ext4`.
+
+### Fixed-capacity worker command queue (rejected)
+
+**Run date:** 2026-09-27.
+
+A fresh, low-overhead `perf record` could not run alongside io_uring because
+the perf mmap caused ring creation to fail with `ENOMEM`. A smaller mmap did
+capture 51 user samples, with 8.93% lost; the worker command-channel receive
+accounted for 13.73% of those samples. This is directional evidence only.
+
+The experiment replaced the allocating unbounded crossbeam worker-command
+channel with the existing `ArrayQueue`, sized for eight admitted groups plus
+one shutdown command. The worker used its eventfd to wake from `poll` when
+idle. Alternating release-build pairs used 50,000 puts, four writers, 1-KiB
+values, a 1-GiB SST target, and the opt-in parallel v4 WAL path. Five tmpfs
+candidate/baseline throughput ratios were `0.745, 0.435, 0.877, 0.998, 1.002`
+(median `0.877`; exhaustive paired bootstrap 95% interval `0.435–1.002`).
+Median p99 and process CPU ratios were `1.260` and `1.080`.
+
+Three ext4 throughput ratios were `1.004, 0.992, and 0.993` (median `0.993`;
+exhaustive paired bootstrap 95% interval `0.992–1.004`). Median p99 and
+process CPU ratios were `0.993` and `0.912`. The ext4 screen was effectively
+at throughput parity, while tmpfs regressed and the candidate added idle
+`poll` wakeups. Revert the queue change; retain the unbounded channel.
+
+The raw benchmark JSON is under `/tmp/rfc024-arrayqueue-bench`. A more
+promising next experiment should reduce the number of per-group handoffs,
+for example by batching already-formed groups into one worker command, rather
+than replacing the worker's queue and wait primitive independently.
