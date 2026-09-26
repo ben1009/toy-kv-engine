@@ -34,6 +34,40 @@ fn set_parallel_wal_file_size_limit(engine: &KvEngine, limit: u64) -> usize {
     state.memtable.id()
 }
 
+fn fill_parallel_wal_below_sst_limit(
+    engine: &KvEngine,
+    cap: u64,
+    large_value: &[u8],
+    large_batches: usize,
+    small_batches: usize,
+) -> Arc<MemTable> {
+    let active_id = set_parallel_wal_file_size_limit(engine, cap);
+    let initial_batch_count = engine
+        .inner
+        .state
+        .load()
+        .memtable
+        .wal_batch_count()
+        .unwrap_or_default();
+    for _ in 0..large_batches {
+        engine.put(b"wal-fill-large", large_value).unwrap();
+    }
+    for index in 0..small_batches {
+        let key = format!("range/{index:02}");
+        engine.put(key.as_bytes(), b"x").unwrap();
+    }
+
+    let memtable = Arc::clone(&engine.inner.state.load().memtable);
+    assert_eq!(memtable.id(), active_id, "WAL fill must not SST-rotate");
+    assert_eq!(
+        memtable.wal_batch_count(),
+        Some(initial_batch_count + (large_batches + small_batches) as u64)
+    );
+    assert!(memtable.approximate_size() < engine.inner.options.target_sst_size);
+
+    memtable
+}
+
 #[cfg(feature = "chaos-testing")]
 fn create_parallel_wal_or_skip(path: &std::path::Path) -> Option<Wal> {
     match Wal::create_with_io_mode(path, WalIoMode::Parallel) {
@@ -446,6 +480,51 @@ fn test_parallel_wal_engine_publishes_point_and_transaction_commits() {
 }
 
 #[test]
+fn test_parallel_wal_engine_recovers_ttl_deletes_and_range_tombstones() {
+    let dir = tempdir().unwrap();
+    let mut options = LsmStorageOptions::default_for_test();
+    options.enable_wal = true;
+    options.target_sst_size = 1 << 30;
+
+    let engine = match KvEngine::open_with_wal_io_mode(dir.path(), options, WalIoMode::Parallel) {
+        Ok(engine) => engine,
+        Err(error) if is_io_uring_unavailable_error(&error) => {
+            eprintln!("skipping test (io_uring unavailable): {error:#}");
+            return;
+        }
+        Err(error) => panic!("failed to open parallel WAL engine: {error:#}"),
+    };
+
+    engine.put(b"deleted", b"value").unwrap();
+    engine.put(b"range/a", b"first").unwrap();
+    engine.put(b"range/b", b"second").unwrap();
+    engine
+        .put_with_ttl(b"ttl", b"live", Duration::from_secs(3600))
+        .unwrap();
+    engine.delete(b"deleted").unwrap();
+    engine.delete_range(b"range/", b"range0").unwrap();
+    engine.sync().unwrap();
+
+    assert_eq!(engine.get(b"deleted").unwrap(), None);
+    assert_eq!(engine.get(b"range/a").unwrap(), None);
+    assert_eq!(engine.get(b"range/b").unwrap(), None);
+    assert_eq!(engine.get(b"ttl").unwrap().as_deref(), Some(&b"live"[..]));
+    engine.close().unwrap();
+    drop(engine);
+
+    let mut options = LsmStorageOptions::default_for_test();
+    options.enable_wal = true;
+    options.target_sst_size = 1 << 30;
+    let reopened =
+        KvEngine::open_with_wal_io_mode(dir.path(), options, WalIoMode::Parallel).unwrap();
+    assert_eq!(reopened.get(b"deleted").unwrap(), None);
+    assert_eq!(reopened.get(b"range/a").unwrap(), None);
+    assert_eq!(reopened.get(b"range/b").unwrap(), None);
+    assert_eq!(reopened.get(b"ttl").unwrap().as_deref(), Some(&b"live"[..]));
+    reopened.close().unwrap();
+}
+
+#[test]
 fn test_parallel_wal_full_rotates_point_transaction_and_batch_writes() {
     const TEST_WAL_CAP: u64 = 1 << 20;
     const LARGE_VALUE_LEN: usize = 60 * 1024;
@@ -556,6 +635,203 @@ fn test_parallel_wal_full_rotates_point_transaction_and_batch_writes() {
         reopened.get(b"batch-rotation").unwrap().as_deref(),
         Some(large_value.as_slice())
     );
+    reopened.close().unwrap();
+}
+
+#[cfg(feature = "chaos-testing")]
+#[test]
+fn failpoint_parallel_wal_rotation_reruns_transaction_conflict_check() {
+    const TEST_WAL_CAP: u64 = 1 << 20;
+    const LARGE_VALUE_LEN: usize = 60 * 1024;
+
+    let dir = tempdir().unwrap();
+    let mut options = LsmStorageOptions::default_for_test();
+    options.enable_wal = true;
+    options.serializable = true;
+    options.target_sst_size = 1 << 30;
+    let engine = match KvEngine::open_with_wal_io_mode(dir.path(), options, WalIoMode::Parallel) {
+        Ok(engine) => engine,
+        Err(error) if is_io_uring_unavailable_error(&error) => {
+            eprintln!("skipping failpoint test (io_uring unavailable): {error:#}");
+            return;
+        }
+        Err(error) => panic!("failed to open parallel WAL engine: {error:#}"),
+    };
+    let large_value = vec![b'x'; LARGE_VALUE_LEN];
+
+    let first_memtable_id = set_parallel_wal_file_size_limit(&engine, TEST_WAL_CAP);
+    engine.put(b"conflict", b"initial").unwrap();
+    for _ in 0..15 {
+        engine.put(b"filler", &large_value).unwrap();
+    }
+    let full_memtable = Arc::clone(&engine.inner.state.load().memtable);
+    assert_eq!(full_memtable.id(), first_memtable_id);
+    assert_eq!(full_memtable.wal_batch_count(), Some(16));
+
+    let transaction = Arc::try_unwrap(engine.new_txn().unwrap())
+        .unwrap_or_else(|_| panic!("new transaction should have a unique owner"));
+    assert_eq!(
+        transaction.get(b"conflict").unwrap().as_deref(),
+        Some(&b"initial"[..])
+    );
+    transaction.put(b"transaction-only", &large_value).unwrap();
+
+    let rotation_gate = crate::chaos::failpoint::arm_parallel_wal_txn_rotation_gate();
+    let commit = thread::spawn(move || transaction.commit());
+    assert!(
+        rotation_gate.wait_until_entered(Duration::from_secs(10)),
+        "transaction should pause after WAL-full admission and before rotation"
+    );
+
+    engine
+        .put(b"conflict", &large_value)
+        .expect("competing write rotates the full WAL and commits on its successor");
+    let successor = engine.inner.state.load().memtable.clone();
+    assert_ne!(successor.id(), full_memtable.id());
+    assert_eq!(full_memtable.wal_batch_count(), Some(16));
+    assert_eq!(successor.wal_batch_count(), Some(1));
+
+    rotation_gate.release();
+    let error = commit
+        .join()
+        .expect("transaction commit thread joins")
+        .expect_err("the transaction must detect the concurrent conflicting write after rotation");
+    assert!(
+        error.to_string().contains("serializable conflict"),
+        "unexpected transaction error: {error:#}"
+    );
+    assert_eq!(
+        successor.wal_batch_count(),
+        Some(1),
+        "OCC rejection must happen before the transaction consumes a successor-WAL ticket"
+    );
+    assert_eq!(engine.get(b"transaction-only").unwrap(), None);
+    assert_eq!(
+        engine.get(b"conflict").unwrap().as_deref(),
+        Some(large_value.as_slice())
+    );
+
+    engine.close().unwrap();
+    drop(engine);
+
+    let mut options = LsmStorageOptions::default_for_test();
+    options.enable_wal = true;
+    options.serializable = true;
+    options.target_sst_size = 1 << 30;
+    let reopened =
+        KvEngine::open_with_wal_io_mode(dir.path(), options, WalIoMode::Parallel).unwrap();
+    assert_eq!(reopened.get(b"transaction-only").unwrap(), None);
+    assert_eq!(
+        reopened.get(b"conflict").unwrap().as_deref(),
+        Some(large_value.as_slice())
+    );
+    reopened.close().unwrap();
+}
+
+#[test]
+fn test_parallel_wal_full_rotates_ttl_and_delete_writes() {
+    const TEST_WAL_CAP: u64 = 1 << 20;
+    const LARGE_VALUE_LEN: usize = 60 * 1024;
+
+    let dir = tempdir().unwrap();
+    let mut options = LsmStorageOptions::default_for_test();
+    options.enable_wal = true;
+    options.serializable = true;
+    options.target_sst_size = 1 << 30;
+    let engine = match KvEngine::open_with_wal_io_mode(dir.path(), options, WalIoMode::Parallel) {
+        Ok(engine) => engine,
+        Err(error) if is_io_uring_unavailable_error(&error) => {
+            eprintln!("skipping test (io_uring unavailable): {error:#}");
+            return;
+        }
+        Err(error) => panic!("failed to open parallel WAL engine: {error:#}"),
+    };
+    let large_value = vec![b'x'; LARGE_VALUE_LEN];
+
+    let full_before_ttl =
+        fill_parallel_wal_below_sst_limit(&engine, TEST_WAL_CAP, &large_value, 15, 15);
+    engine
+        .put_with_ttl(b"ttl-rotation", &large_value, Duration::from_secs(3600))
+        .unwrap();
+    let before_delete = Arc::clone(&engine.inner.state.load().memtable);
+    assert_ne!(before_delete.id(), full_before_ttl.id());
+    assert_eq!(full_before_ttl.wal_batch_count(), Some(30));
+    assert_eq!(before_delete.wal_batch_count(), Some(1));
+
+    let full_before_delete =
+        fill_parallel_wal_below_sst_limit(&engine, TEST_WAL_CAP, &large_value, 14, 15);
+    assert_eq!(full_before_delete.wal_batch_count(), Some(30));
+    engine.delete(b"range/00").unwrap();
+    let successor = Arc::clone(&engine.inner.state.load().memtable);
+    assert_ne!(successor.id(), full_before_delete.id());
+    assert_eq!(full_before_delete.wal_batch_count(), Some(30));
+    assert_eq!(successor.wal_batch_count(), Some(1));
+    assert_eq!(
+        engine.get(b"ttl-rotation").unwrap().as_deref(),
+        Some(large_value.as_slice())
+    );
+    assert_eq!(engine.get(b"range/00").unwrap(), None);
+
+    engine.close().unwrap();
+    drop(engine);
+
+    let mut options = LsmStorageOptions::default_for_test();
+    options.enable_wal = true;
+    options.serializable = true;
+    options.target_sst_size = 1 << 30;
+    let reopened =
+        KvEngine::open_with_wal_io_mode(dir.path(), options, WalIoMode::Parallel).unwrap();
+    assert_eq!(
+        reopened.get(b"ttl-rotation").unwrap().as_deref(),
+        Some(large_value.as_slice())
+    );
+    assert_eq!(reopened.get(b"range/00").unwrap(), None);
+    reopened.close().unwrap();
+}
+
+#[test]
+fn test_parallel_wal_full_rotates_range_tombstone_write() {
+    const TEST_WAL_CAP: u64 = 1 << 20;
+    const LARGE_VALUE_LEN: usize = 60 * 1024;
+
+    let dir = tempdir().unwrap();
+    let mut options = LsmStorageOptions::default_for_test();
+    options.enable_wal = true;
+    options.target_sst_size = 1 << 30;
+    let engine = match KvEngine::open_with_wal_io_mode(dir.path(), options, WalIoMode::Parallel) {
+        Ok(engine) => engine,
+        Err(error) if is_io_uring_unavailable_error(&error) => {
+            eprintln!("skipping test (io_uring unavailable): {error:#}");
+            return;
+        }
+        Err(error) => panic!("failed to open parallel WAL engine: {error:#}"),
+    };
+    let large_value = vec![b'x'; LARGE_VALUE_LEN];
+
+    let full_memtable =
+        fill_parallel_wal_below_sst_limit(&engine, TEST_WAL_CAP, &large_value, 15, 15);
+    engine.delete_range(b"range/", b"range0").unwrap();
+    let successor = Arc::clone(&engine.inner.state.load().memtable);
+    assert_ne!(successor.id(), full_memtable.id());
+    assert_eq!(full_memtable.wal_batch_count(), Some(30));
+    assert_eq!(successor.wal_batch_count(), Some(1));
+    for index in 0..15 {
+        let key = format!("range/{index:02}");
+        assert_eq!(engine.get(key.as_bytes()).unwrap(), None);
+    }
+
+    engine.close().unwrap();
+    drop(engine);
+
+    let mut options = LsmStorageOptions::default_for_test();
+    options.enable_wal = true;
+    options.target_sst_size = 1 << 30;
+    let reopened =
+        KvEngine::open_with_wal_io_mode(dir.path(), options, WalIoMode::Parallel).unwrap();
+    for index in 0..15 {
+        let key = format!("range/{index:02}");
+        assert_eq!(reopened.get(key.as_bytes()).unwrap(), None);
+    }
     reopened.close().unwrap();
 }
 

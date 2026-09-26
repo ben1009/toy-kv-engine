@@ -43,6 +43,11 @@ slow-timeout = { period = "2m", terminate-after = 1, grace-period = "10s" }
 retries = 0
 
 [[profile.default.overrides]]
+filter = 'test(failpoint_parallel_wal_rotation_reruns_transaction_conflict_check)'
+slow-timeout = { period = "2m", terminate-after = 1, grace-period = "10s" }
+retries = 0
+
+[[profile.default.overrides]]
 filter = 'test(failpoint_manifest_after_append_before_sync)'
 slow-timeout = { period = "2m", terminate-after = 1, grace-period = "10s" }
 retries = 0

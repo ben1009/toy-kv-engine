@@ -2,9 +2,8 @@
 
 **RFC:** [RFC 024: Dedicated WAL I/O Pipeline](../rfcs/024-dedicated-wal-pipeline.md)
 
-**Status:** Slices 1–5 implemented; Slice 6 now includes sync-failure and both
-poison/sync ordering tests, while its broader exit gate remains open; Slice 7
-remains gated
+**Status:** Slices 1–6 implemented for the synchronous v4 WAL path; Slice 7's
+performance and adoption gate remains open
 
 **Last updated:** 2026-09-26
 
@@ -207,7 +206,7 @@ normal successful close. Holding sync open does not hold completed `DirectBuf`s,
 and queue pressure wakes the worker without another client arrival. The
 opt-in path is usable end to end for v4 WALs.
 
-### 6. Recovery, crash, and compatibility gate — in progress
+### 6. Recovery, crash, and compatibility gate — complete for synchronous v4 WAL
 
 - The parallel WAL process-kill test kills a child after sequential writes
   return and verifies all acknowledged operations after reopen. A separate
@@ -254,19 +253,21 @@ poison-race cases above, model tests, applicable nextest suites, and sanitizer
 jobs must pass on a host that permits io_uring. `EPERM` in a sandbox is not a
 passing result for this gate.
 
-**Verification to date (2026-09-26):** `cargo make check` passed (1,381
-nextest tests); the parallel WAL process-kill/reopen test passed with 171
-acknowledged operations; the deterministic crash-boundary process test passed
-on a host that permits io_uring; and the repository's AddressSanitizer and
-LeakSanitizer test commands passed. The v4 invalid-middle-batch scanner test
-and v5/v6 zero-filled `A / hole / C` compatibility test passed. The new
-sync-failure, queued-during-sync failure, and poison-before-sync failpoint
-tests passed, and the full in-crate WAL module passed (101 tests);
-all-feature/all-target Clippy passed.
-Async candidate writes and close remain disabled until their separate
-lifecycle prerequisites are met. Slice 6's exit gate remains open pending its
-full prescribed matrix, model tests, applicable suites, and sanitizer jobs;
-Slice 7's performance and adoption gate also remains open.
+**Verification (2026-09-26):** `cargo make check` passed (1,396 tests, zero
+skipped), including the model, candidate WAL, failpoint, and process-crash
+suites; all-feature/all-target Clippy passed. The parallel WAL process-kill /
+reopen test preserved 171 acknowledged operations, and the deterministic
+four-boundary crash test passed on a host that permits io_uring. The v4
+invalid-middle-batch scanner test and v5/v6 zero-filled `A / hole / C`
+compatibility test passed. Sync-failure, queued-during-sync failure,
+poison-before-sync, and the new serializable-transaction/WAL-rotation race
+failpoint tests passed. The added TTL, point-delete, and range-tombstone
+recovery and WAL-full rotation cases passed. The repository-prescribed
+AddressSanitizer and LeakSanitizer commands also passed.
+
+This closes Slice 6 for the synchronous v4 candidate path. Async candidate
+writes and close remain disabled until their separate lifecycle prerequisites
+are met. Slice 7's paired benchmark and adoption gate remains open.
 
 ### 7. Paired benchmark and adoption decision
 

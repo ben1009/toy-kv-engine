@@ -473,6 +473,8 @@ impl Transaction {
                         }
                         Err(error) if crate::wal::Wal::is_retryable_full_error(&error) => {
                             drop(_commit_guard);
+                            #[cfg(all(test, feature = "chaos-testing"))]
+                            crate::chaos::failpoint::before_parallel_wal_transaction_rotation();
                             if let Err(rotation_error) = self.inner.retry_after_wal_full(
                                 error,
                                 &expected_memtable,
