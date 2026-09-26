@@ -394,6 +394,46 @@ the default because the parallel path is still much slower on tmpfs. Raw
 `target/rfc024-sync-window-rotation` and `target/rfc024-sync-window-exact`;
 the 200k-put tmpfs JSON is under `/tmp/rfc024-sync-window-exact`.
 
+### Current 100-microsecond path and next optimization target
+
+Five alternating leader/parallel pairs reran the 50k-put, four-writer,
+1-KiB-value, 1-MiB-SST workload with the current 100-microsecond parallel
+window. The same binary was used for both modes. On ext4, paired parallel /
+leader throughput ratios were 1.580, 2.927, 1.570, 1.591, and 1.585 (median
+1.585). The second leader run was a slow device outlier; the other four pairs
+clustered around 1.58. Median sync calls were 13,073 parallel versus 21,725
+leader. The five paired p99 ratios ranged from 0.654 to 1.295, so this run
+does not establish a consistent tail-latency improvement.
+
+On tmpfs, the five parallel / leader throughput ratios were 0.446, 0.515,
+0.406, 0.534, and 0.423 (median 0.446). Median process CPU time was 2.51
+seconds parallel versus 0.81 seconds leader, and paired p99 ratios ranged
+from 1.443 to 2.621. The ext4 gain does not make the parallel path suitable
+as the default while this fast-filesystem regression remains.
+
+Two more isolated changes were rejected. Raising the conditional window from
+100 to 200 microseconds gave a 1.020 median throughput ratio in five paired
+ext4 50k-put runs, but a 0.983 throughput ratio and 1.063 p99 ratio in five
+paired tmpfs 200k-put runs. Compiling out three admission-mutex reads used
+only by assertions yielded a 0.983 median throughput ratio and 1.152 p99
+ratio in five paired tmpfs 200k-put runs. Both experiments were reverted.
+
+A current tmpfs CPU profile sampled the worker command-channel receive,
+ordered packer submission, and sync coordination in the parallel path. Along
+with the roughly threefold process CPU gap, this points to the per-ticket
+producer-to-packer-to-worker handoff as the next structural experiment. A
+candidate should let the I/O worker drain ready tickets in order, while
+preserving admission's ticket/offset linearization, preallocation before
+submission, bounded in-flight groups, and the existing contiguous durability
+frontier. Benchmark it against this 100-microsecond baseline on both filesystems
+before retaining it. The leader remains the default.
+
+The paired JSON summaries are `/tmp/rfc024-current-lp-ext4.json`,
+`/tmp/rfc024-current-lp-tmpfs.json`, `/tmp/rfc024-200vs100-ext4.json`,
+`/tmp/rfc024-200vs100-tmpfs.json`, and `/tmp/rfc024-lock-exact-tmpfs.json`.
+The current CPU profiles are `/tmp/rfc024-current-parallel.perf` and
+`/tmp/rfc024-current-leader.perf`.
+
 Raw JSONL outputs from the Slice 7 session are in
 `/tmp/rfc024-slice7-artifacts`; the current 20k WAL-focused outputs are in
 `/tmp/rfc024-packer-single-allocation-five-pair`, and the exact-case pairs are
