@@ -1,3 +1,5 @@
+#[cfg(feature = "chaos-testing")]
+use std::time::Instant;
 use std::{
     sync::{Arc, Barrier},
     thread,
@@ -30,6 +32,30 @@ fn set_parallel_wal_file_size_limit(engine: &KvEngine, limit: u64) -> usize {
         .set_parallel_wal_file_size_limit_for_test(limit)
         .expect("set active parallel WAL size limit");
     state.memtable.id()
+}
+
+#[cfg(feature = "chaos-testing")]
+fn create_parallel_wal_or_skip(path: &std::path::Path) -> Option<Wal> {
+    match Wal::create_with_io_mode(path, WalIoMode::Parallel) {
+        Ok(wal) => Some(wal),
+        Err(error) if is_io_uring_unavailable_error(&error) => {
+            eprintln!("skipping failpoint test (io_uring unavailable): {error:#}");
+            None
+        }
+        Err(error) => panic!("failed to create parallel WAL: {error:#}"),
+    }
+}
+
+#[cfg(feature = "chaos-testing")]
+fn wait_for_parallel_wal_counter(counter: impl Fn() -> usize, expected: usize, description: &str) {
+    let started = Instant::now();
+    while counter() < expected {
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "timed out waiting for {description}"
+        );
+        thread::yield_now();
+    }
 }
 
 #[test]
@@ -138,6 +164,166 @@ fn test_parallel_v4_wal_writes_syncs_and_recovers() {
     assert_eq!(batch.range_tombstones.len(), 1);
     assert_eq!(batch.range_tombstones[0].start.as_ref(), b"range-start");
     assert_eq!(batch.range_tombstones[0].end.as_ref(), b"range-end");
+}
+
+#[cfg(feature = "chaos-testing")]
+#[test]
+fn failpoint_parallel_wal_fdatasync_failure_preserves_durable_prefix() {
+    use crate::chaos::failpoint::{self, FailScenario};
+
+    let scenario = FailScenario::setup();
+    let dir = tempdir().expect("create temporary WAL directory");
+    let Some(wal) = create_parallel_wal_or_skip(&dir.path().join("sync-failure.wal")) else {
+        return;
+    };
+
+    let durable_ticket = wal
+        .put_batch(&[(b"durable".as_slice(), b"value".as_slice())], 1)
+        .expect("admit prefix ticket");
+    wal.submit_and_commit(durable_ticket)
+        .expect("first ticket becomes durable");
+
+    failpoint::cfg("parallel_wal.fdatasync_failure", "return").expect("inject sync failure");
+    let failed_ticket = wal
+        .put_batch(&[(b"failed".as_slice(), b"value".as_slice())], 2)
+        .expect("admit ticket whose sync will fail");
+    let failed_result = wal.submit_and_commit(failed_ticket);
+    failpoint::cfg("parallel_wal.fdatasync_failure", "off").expect("disable sync failure");
+
+    let failed_error = failed_result.expect_err("failed sync must fail its ticket");
+    assert!(
+        failed_error
+            .to_string()
+            .contains("fdatasync failed: injected parallel WAL fdatasync failure"),
+        "unexpected WAL failure: {failed_error:#}"
+    );
+    wal.submit_and_commit(durable_ticket)
+        .expect("later failure must not retract the acknowledged prefix");
+    assert!(wal.submit_and_commit(failed_ticket).is_err());
+    assert!(
+        wal.put_batch(&[(b"rejected".as_slice(), b"value".as_slice())], 3)
+            .is_err(),
+        "poison must stop later admission"
+    );
+    assert_eq!(wal.assigned_ticket_count(), 2);
+    assert!(wal.close().is_err(), "close reports the sync poison");
+
+    scenario.teardown();
+}
+
+#[cfg(feature = "chaos-testing")]
+#[test]
+fn failpoint_parallel_wal_group_poison_during_sync_keeps_earlier_ticket_durable() {
+    use crate::chaos::failpoint::{self, FailScenario};
+
+    let scenario = FailScenario::setup();
+    let dir = tempdir().expect("create temporary WAL directory");
+    let Some(wal) = create_parallel_wal_or_skip(&dir.path().join("poison-race.wal")) else {
+        return;
+    };
+    let wal = Arc::new(wal);
+    failpoint::reset_parallel_wal_failure_test_counters();
+    let sync_gate = failpoint::arm_parallel_wal_sync_gate();
+    failpoint::cfg("parallel_wal.group_completion_failure", "return")
+        .expect("inject a later group failure");
+
+    let first_ticket = wal
+        .put_batch(&[(b"prefix".as_slice(), b"value".as_slice())], 1)
+        .expect("admit prefix ticket");
+    let first_wal = Arc::clone(&wal);
+    let first_commit = thread::spawn(move || first_wal.submit_and_commit(first_ticket));
+    assert!(
+        sync_gate.wait_until_entered(Duration::from_secs(10)),
+        "the prefix sync coordinator should reach the gate after capturing its target"
+    );
+
+    let failed_ticket = wal
+        .put_batch(&[(b"later".as_slice(), b"value".as_slice())], 2)
+        .expect("admit later ticket while prefix sync is paused");
+    wait_for_parallel_wal_counter(
+        failpoint::parallel_wal_injected_group_failure_count,
+        1,
+        "the later group failure to be queued for the coordinator",
+    );
+
+    sync_gate.release();
+    let first_result = first_commit.join().expect("prefix waiter joins");
+    let failed_result = wal.submit_and_commit(failed_ticket);
+    failpoint::cfg("parallel_wal.group_completion_failure", "off")
+        .expect("disable later group failure");
+
+    assert!(
+        first_result.is_ok(),
+        "the sync may retire its captured prefix"
+    );
+    assert!(failed_result.is_err(), "the failed group must be poisoned");
+    wal.submit_and_commit(first_ticket)
+        .expect("poison after the captured prefix must not retract it");
+    assert!(wal.submit_and_commit(failed_ticket).is_err());
+    assert_eq!(wal.assigned_ticket_count(), 2);
+    assert!(wal.close().is_err(), "close reports the write poison");
+
+    scenario.teardown();
+}
+
+#[cfg(feature = "chaos-testing")]
+#[test]
+fn failpoint_parallel_wal_poison_before_sync_preserves_written_prefix() {
+    use crate::chaos::failpoint::{self, FailScenario};
+
+    let scenario = FailScenario::setup();
+    let dir = tempdir().expect("create temporary WAL directory");
+    let Some(wal) = create_parallel_wal_or_skip(&dir.path().join("poison-before-sync.wal")) else {
+        return;
+    };
+    let wal = Arc::new(wal);
+    failpoint::reset_parallel_wal_failure_test_counters();
+    let result_drain_gate = failpoint::arm_parallel_wal_result_drain_gate();
+    failpoint::cfg("parallel_wal.group_completion_failure", "return")
+        .expect("inject a later group failure");
+
+    let first_ticket = wal
+        .put_batch(&[(b"prefix".as_slice(), b"value".as_slice())], 1)
+        .expect("admit prefix ticket");
+    let first_wal = Arc::clone(&wal);
+    let first_commit = thread::spawn(move || first_wal.submit_and_commit(first_ticket));
+    assert!(
+        result_drain_gate.wait_until_entered(Duration::from_secs(10)),
+        "the coordinator should process the first written group before syncing it"
+    );
+
+    let failed_ticket = wal
+        .put_batch(&[(b"later".as_slice(), b"value".as_slice())], 2)
+        .expect("admit later ticket before the prefix sync starts");
+    wait_for_parallel_wal_counter(
+        failpoint::parallel_wal_injected_group_failure_count,
+        1,
+        "the later group failure to be queued for the coordinator",
+    );
+
+    result_drain_gate.release();
+    let first_result = first_commit.join().expect("prefix waiter joins");
+    let failed_result = wal.submit_and_commit(failed_ticket);
+    failpoint::cfg("parallel_wal.group_completion_failure", "off")
+        .expect("disable later group failure");
+
+    assert!(
+        first_result.is_ok(),
+        "the written prefix must become durable"
+    );
+    assert!(failed_result.is_err(), "the failed group must be poisoned");
+    assert_eq!(
+        failpoint::parallel_wal_sync_with_poison_count(),
+        1,
+        "the coordinator must record poison before syncing the written prefix"
+    );
+    wal.submit_and_commit(first_ticket)
+        .expect("the later poison must not retract the durable prefix");
+    assert!(wal.submit_and_commit(failed_ticket).is_err());
+    assert_eq!(wal.assigned_ticket_count(), 2);
+    assert!(wal.close().is_err(), "close reports the write poison");
+
+    scenario.teardown();
 }
 
 #[test]

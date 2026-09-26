@@ -2,8 +2,8 @@
 
 **RFC:** [RFC 024: Dedicated WAL I/O Pipeline](../rfcs/024-dedicated-wal-pipeline.md)
 
-**Status:** Slices 1–5 implemented; Slice 6 crash-boundary coverage is
-implemented, with sync-failure and poison-race coverage still open; Slice 7
+**Status:** Slices 1–5 implemented; Slice 6 now includes sync-failure and both
+poison/sync ordering tests, while its broader exit gate remains open; Slice 7
 remains gated
 
 **Last updated:** 2026-09-26
@@ -259,11 +259,14 @@ nextest tests); the parallel WAL process-kill/reopen test passed with 171
 acknowledged operations; the deterministic crash-boundary process test passed
 on a host that permits io_uring; and the repository's AddressSanitizer and
 LeakSanitizer test commands passed. The v4 invalid-middle-batch scanner test
-and v5/v6 zero-filled `A / hole / C` compatibility test passed. Async
-candidate writes and close remain disabled until their separate lifecycle
-prerequisites are met. Sync-failure and pending-sync poison-race coverage is
-still outstanding, so Slice 6's exit gate remains open; Slice 7's performance
-and adoption gate also remains open.
+and v5/v6 zero-filled `A / hole / C` compatibility test passed. The new
+sync-failure, queued-during-sync failure, and poison-before-sync failpoint
+tests passed, and the full in-crate WAL module passed (101 tests);
+all-feature/all-target Clippy passed.
+Async candidate writes and close remain disabled until their separate
+lifecycle prerequisites are met. Slice 6's exit gate remains open pending its
+full prescribed matrix, model tests, applicable suites, and sanitizer jobs;
+Slice 7's performance and adoption gate also remains open.
 
 ### 7. Paired benchmark and adoption decision
 

@@ -50,6 +50,29 @@ pub const PARALLEL_WAL_CRASH_MARKER_ENV: &str = "TOY_KV_PARALLEL_WAL_CRASH_MARKE
 static PARALLEL_WAL_CRASH_POINT_HITS: AtomicUsize = AtomicUsize::new(0);
 static DEFER_LOWEST_PARALLEL_WAL_GROUP_COMPLETION: AtomicBool = AtomicBool::new(false);
 static PARALLEL_WAL_ADMISSIONS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(all(test, feature = "chaos-testing"))]
+static PARALLEL_WAL_INJECTED_GROUP_FAILURES: AtomicUsize = AtomicUsize::new(0);
+#[cfg(all(test, feature = "chaos-testing"))]
+static PARALLEL_WAL_SYNCS_WITH_POISON: AtomicUsize = AtomicUsize::new(0);
+#[cfg(all(test, feature = "chaos-testing"))]
+#[derive(Default)]
+struct ParallelWalTestGateState {
+    armed: bool,
+    entered: bool,
+    released: bool,
+}
+#[cfg(all(test, feature = "chaos-testing"))]
+#[derive(Default)]
+struct ParallelWalTestGate {
+    state: std::sync::Mutex<ParallelWalTestGateState>,
+    changed: std::sync::Condvar,
+}
+#[cfg(all(test, feature = "chaos-testing"))]
+static PARALLEL_WAL_FDATASYNC_GATE: std::sync::OnceLock<ParallelWalTestGate> =
+    std::sync::OnceLock::new();
+#[cfg(all(test, feature = "chaos-testing"))]
+static PARALLEL_WAL_RESULT_DRAIN_GATE: std::sync::OnceLock<ParallelWalTestGate> =
+    std::sync::OnceLock::new();
 
 /// Pause a child at a configured parallel WAL boundary until the parent kills it.
 pub(crate) fn parallel_wal_crash_point(point: &str) {
@@ -108,6 +131,155 @@ pub fn parallel_wal_admission_count() -> usize {
 
 pub(crate) fn note_parallel_wal_admission() {
     PARALLEL_WAL_ADMISSIONS.fetch_add(1, Ordering::AcqRel);
+}
+
+#[cfg(all(test, feature = "chaos-testing"))]
+pub(crate) fn reset_parallel_wal_failure_test_counters() {
+    PARALLEL_WAL_INJECTED_GROUP_FAILURES.store(0, Ordering::Release);
+    PARALLEL_WAL_SYNCS_WITH_POISON.store(0, Ordering::Release);
+}
+
+#[cfg(all(test, feature = "chaos-testing"))]
+pub(crate) fn parallel_wal_injected_group_failure_count() -> usize {
+    PARALLEL_WAL_INJECTED_GROUP_FAILURES.load(Ordering::Acquire)
+}
+
+#[cfg(all(test, feature = "chaos-testing"))]
+pub(crate) fn parallel_wal_sync_with_poison_count() -> usize {
+    PARALLEL_WAL_SYNCS_WITH_POISON.load(Ordering::Acquire)
+}
+
+#[cfg(all(test, feature = "chaos-testing"))]
+pub(crate) fn note_parallel_wal_sync_with_poison() {
+    PARALLEL_WAL_SYNCS_WITH_POISON.fetch_add(1, Ordering::AcqRel);
+}
+
+#[cfg(all(test, feature = "chaos-testing"))]
+pub(crate) struct ParallelWalTestGateGuard(&'static ParallelWalTestGate);
+
+#[cfg(all(test, feature = "chaos-testing"))]
+impl ParallelWalTestGateGuard {
+    pub(crate) fn wait_until_entered(&self, timeout: Duration) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        let mut state = self
+            .0
+            .state
+            .lock()
+            .expect("parallel WAL test gate mutex poisoned");
+        while !state.entered {
+            let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) else {
+                return false;
+            };
+            let (next_state, result) = self
+                .0
+                .changed
+                .wait_timeout(state, remaining)
+                .expect("parallel WAL test gate mutex poisoned");
+            state = next_state;
+            if result.timed_out() && !state.entered {
+                return false;
+            }
+        }
+
+        true
+    }
+
+    pub(crate) fn release(&self) {
+        let mut state = self
+            .0
+            .state
+            .lock()
+            .expect("parallel WAL test gate mutex poisoned");
+        state.armed = false;
+        state.released = true;
+        self.0.changed.notify_all();
+    }
+}
+
+#[cfg(all(test, feature = "chaos-testing"))]
+impl Drop for ParallelWalTestGateGuard {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+#[cfg(all(test, feature = "chaos-testing"))]
+impl ParallelWalTestGate {
+    fn arm(&'static self) -> ParallelWalTestGateGuard {
+        let mut state = self
+            .state
+            .lock()
+            .expect("parallel WAL test gate mutex poisoned");
+        *state = ParallelWalTestGateState {
+            armed: true,
+            ..ParallelWalTestGateState::default()
+        };
+
+        ParallelWalTestGateGuard(self)
+    }
+
+    fn enter(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .expect("parallel WAL test gate mutex poisoned");
+        if !state.armed {
+            return;
+        }
+
+        state.entered = true;
+        self.changed.notify_all();
+        while !state.released {
+            state = self
+                .changed
+                .wait(state)
+                .expect("parallel WAL test gate mutex poisoned");
+        }
+        state.armed = false;
+    }
+}
+
+#[cfg(all(test, feature = "chaos-testing"))]
+pub(crate) fn arm_parallel_wal_sync_gate() -> ParallelWalTestGateGuard {
+    PARALLEL_WAL_FDATASYNC_GATE
+        .get_or_init(ParallelWalTestGate::default)
+        .arm()
+}
+
+#[cfg(all(test, feature = "chaos-testing"))]
+pub(crate) fn arm_parallel_wal_result_drain_gate() -> ParallelWalTestGateGuard {
+    PARALLEL_WAL_RESULT_DRAIN_GATE
+        .get_or_init(ParallelWalTestGate::default)
+        .arm()
+}
+
+#[cfg(all(test, feature = "chaos-testing"))]
+pub(crate) fn before_parallel_wal_fdatasync_call() {
+    PARALLEL_WAL_FDATASYNC_GATE
+        .get_or_init(ParallelWalTestGate::default)
+        .enter();
+}
+
+#[cfg(all(test, feature = "chaos-testing"))]
+pub(crate) fn before_parallel_wal_result_drain() {
+    PARALLEL_WAL_RESULT_DRAIN_GATE
+        .get_or_init(ParallelWalTestGate::default)
+        .enter();
+}
+
+#[cfg(all(test, feature = "chaos-testing"))]
+pub(crate) fn parallel_wal_group_completion_error(ticket_start: u64) -> Option<String> {
+    fail_point!(
+        "parallel_wal.group_completion_failure",
+        ticket_start > 0,
+        |_| Some("injected parallel WAL group write failure".to_owned())
+    );
+    None
+}
+
+#[cfg(all(test, feature = "chaos-testing"))]
+pub(crate) fn note_parallel_wal_injected_group_failure() {
+    PARALLEL_WAL_INJECTED_GROUP_FAILURES.fetch_add(1, Ordering::AcqRel);
 }
 
 pub(crate) fn defer_lowest_parallel_wal_group_completion() -> bool {

@@ -801,6 +801,8 @@ fn run_sync_coordinator(
                 }
             }
         }
+        #[cfg(all(test, feature = "chaos-testing"))]
+        crate::chaos::failpoint::before_parallel_wal_result_drain();
         drain_ready_results(
             &inner,
             &mut worker_completions,
@@ -961,6 +963,10 @@ fn synchronize_written_prefix(sync_file: &File, inner: &RuntimeInner) -> Result<
             .map_or(state.written_frontier, |poison| {
                 state.written_frontier.min(poison)
             });
+        #[cfg(all(test, feature = "chaos-testing"))]
+        if state.poison_ticket.is_some() && target > state.durable_frontier {
+            crate::chaos::failpoint::note_parallel_wal_sync_with_poison();
+        }
         (target, state.durable_frontier)
     };
     if target <= durable {
@@ -969,6 +975,8 @@ fn synchronize_written_prefix(sync_file: &File, inner: &RuntimeInner) -> Result<
 
     #[cfg(feature = "chaos-testing")]
     crate::chaos::failpoint::parallel_wal_crash_point("parallel_wal.before_fdatasync");
+    #[cfg(all(test, feature = "chaos-testing"))]
+    crate::chaos::failpoint::before_parallel_wal_fdatasync_call();
     let _sync_start = inner.sync_progress.begin_sync(target, durable);
     inner.sync_progress.start_sync_activity();
     #[cfg(feature = "bench")]
@@ -978,12 +986,7 @@ fn synchronize_written_prefix(sync_file: &File, inner: &RuntimeInner) -> Result<
     let (sync_error, syscall_finished_at) = loop {
         #[cfg(feature = "bench")]
         let call_started_at = Instant::now();
-        let result = unsafe { libc::fdatasync(sync_file.as_raw_fd()) };
-        let error = if result == 0 {
-            None
-        } else {
-            Some(io::Error::last_os_error())
-        };
+        let error = fdatasync_file(sync_file).err();
         let call_finished_at = wal_sync_timestamp();
         #[cfg(feature = "bench")]
         if syscall_started_at.is_none() {
@@ -1067,6 +1070,20 @@ fn synchronize_written_prefix(sync_file: &File, inner: &RuntimeInner) -> Result<
     inner.buffer_budget.close();
 
     Ok(())
+}
+
+fn fdatasync_file(sync_file: &File) -> io::Result<()> {
+    #[cfg(all(test, feature = "chaos-testing"))]
+    crate::chaos::failpoint::fail_point!("parallel_wal.fdatasync_failure", |_| Err(
+        io::Error::other("injected parallel WAL fdatasync failure")
+    ));
+
+    let result = unsafe { libc::fdatasync(sync_file.as_raw_fd()) };
+    if result == 0 {
+        return Ok(());
+    }
+
+    Err(io::Error::last_os_error())
 }
 
 #[inline]
