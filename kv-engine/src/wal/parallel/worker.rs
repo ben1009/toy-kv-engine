@@ -657,6 +657,19 @@ impl<B: WorkerBuffer> WorkerCore<B> {
         self.groups.len()
     }
 
+    #[cfg(feature = "chaos-testing")]
+    fn lowest_group_ticket(&self) -> Option<u64> {
+        self.groups.values().map(|group| group.tickets.start).min()
+    }
+
+    #[cfg(feature = "chaos-testing")]
+    fn request_ticket_start(&self, request_id: RequestId) -> Option<u64> {
+        let write = self.writes.get(&request_id)?;
+        self.groups
+            .get(&write.group_id)
+            .map(|group| group.tickets.start)
+    }
+
     fn outstanding_sqe_count(&self) -> usize {
         self.outstanding_sqes
     }
@@ -1141,6 +1154,9 @@ fn run_worker_loop<B: WorkerBuffer>(
     shutdown_reply: &mut Option<Sender<Result<(), String>>>,
     stopping: &mut bool,
 ) -> Result<()> {
+    #[cfg(feature = "chaos-testing")]
+    let mut deferred_lowest_group_completions = Vec::new();
+
     loop {
         if !*stopping {
             while core.group_count() < MAX_INFLIGHT_GROUPS {
@@ -1194,7 +1210,25 @@ fn run_worker_loop<B: WorkerBuffer>(
             flush_staged_writes(ring_staged, core, || ring.submit())?;
         }
 
+        #[cfg(feature = "chaos-testing")]
+        let mut completed = drain_completions(ring);
+        #[cfg(not(feature = "chaos-testing"))]
         let completed = drain_completions(ring);
+        #[cfg(feature = "chaos-testing")]
+        if crate::chaos::failpoint::defer_lowest_parallel_wal_group_completion()
+            && let Some(lowest_ticket) = core.lowest_group_ticket()
+        {
+            let mut ready = Vec::with_capacity(completed.len());
+            for completion in completed.drain(..) {
+                let request_id = RequestId(completion.0);
+                if core.request_ticket_start(request_id) == Some(lowest_ticket) {
+                    deferred_lowest_group_completions.push(completion);
+                } else {
+                    ready.push(completion);
+                }
+            }
+            completed = ready;
+        }
         let completion_count = completed.len();
         process_completions(
             completed,

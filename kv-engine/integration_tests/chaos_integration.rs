@@ -7,9 +7,13 @@
 #![cfg(feature = "chaos-testing")]
 
 use kv_engine::chaos::control_log::{ControlLogReader, OperationKind};
+use kv_engine::chaos::failpoint::{
+    PARALLEL_WAL_CRASH_MARKER_ENV, PARALLEL_WAL_CRASH_OCCURRENCE_ENV, PARALLEL_WAL_CRASH_POINT_ENV,
+};
 use kv_engine::chaos::oracle::{self, BoundedKeyUniverse, ReferenceState};
 use kv_engine::chaos::scenarios::ScenarioConfig;
 use kv_engine::lsm_storage::KvEngine;
+use kv_engine::wal::WalIoMode;
 use std::io::Read;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -25,6 +29,14 @@ fn chaos_child_path() -> PathBuf {
 /// Spawns the child, waits for the sync-point marker in the control log, sends
 /// SIGKILL, reopens the database, and validates crash invariants.
 fn run_chaos_scenario(scenario_name: &str, config: &ScenarioConfig) {
+    run_chaos_scenario_with_wal_mode(scenario_name, config, WalIoMode::Leader);
+}
+
+fn run_chaos_scenario_with_wal_mode(
+    scenario_name: &str,
+    config: &ScenarioConfig,
+    wal_io_mode: WalIoMode,
+) {
     let dir = tempfile::tempdir().expect("create temp dir");
     let db_path = dir.path().join("db");
     let control_log_path = dir.path().join("chaos_control.log");
@@ -44,6 +56,9 @@ fn run_chaos_scenario(scenario_name: &str, config: &ScenarioConfig) {
         .arg(&control_log_path)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    if wal_io_mode == WalIoMode::Parallel {
+        child.arg("--parallel-wal");
+    }
     let mut child = child
         .spawn()
         .unwrap_or_else(|e| panic!("failed to spawn chaos-child: {e}"));
@@ -217,6 +232,212 @@ fn run_chaos_scenario(scenario_name: &str, config: &ScenarioConfig) {
 #[test]
 fn chaos_wal_only() {
     run_chaos_scenario("wal-only", &ScenarioConfig::wal_only());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn chaos_parallel_wal_only() {
+    let config = ScenarioConfig::wal_only();
+    let probe_dir = tempfile::tempdir().expect("create parallel WAL probe directory");
+    match KvEngine::open_with_wal_io_mode(
+        probe_dir.path(),
+        config.storage_options.clone(),
+        WalIoMode::Parallel,
+    ) {
+        Ok(engine) => engine.close().expect("close parallel WAL probe"),
+        Err(error) if io_uring_is_unavailable(&error) => {
+            eprintln!("skipping test (io_uring unavailable): {error:#}");
+            return;
+        }
+        Err(error) => panic!("parallel WAL probe failed unexpectedly: {error:#}"),
+    }
+
+    run_chaos_scenario_with_wal_mode("wal-only", &config, WalIoMode::Parallel);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn failpoint_parallel_wal_crash_boundaries() {
+    let config = ScenarioConfig::wal_only();
+    let probe_dir = tempfile::tempdir().expect("create parallel WAL crash probe directory");
+    match KvEngine::open_with_wal_io_mode(
+        probe_dir.path(),
+        config.storage_options.clone(),
+        WalIoMode::Parallel,
+    ) {
+        Ok(engine) => engine.close().expect("close parallel WAL crash probe"),
+        Err(error) => panic!("parallel WAL crash-boundary gate requires io_uring: {error:#}"),
+    }
+
+    run_parallel_wal_crash_case(
+        "parallel_wal.offset_reserved",
+        2,
+        &[(b"unacknowledged-before-crash", b"candidate")],
+        CandidateRecovery::Absent,
+    );
+    run_parallel_wal_crash_case(
+        "parallel_wal.later_group_completed_first",
+        1,
+        &[
+            (b"parallel-crash-first", b"first"),
+            (b"parallel-crash-second", b"second"),
+        ],
+        CandidateRecovery::ContiguousPrefix,
+    );
+    run_parallel_wal_crash_case(
+        "parallel_wal.before_fdatasync",
+        2,
+        &[(b"unacknowledged-before-crash", b"candidate")],
+        CandidateRecovery::Either,
+    );
+    run_parallel_wal_crash_case(
+        "parallel_wal.after_fdatasync",
+        2,
+        &[(b"unacknowledged-before-crash", b"candidate")],
+        CandidateRecovery::Present,
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy)]
+enum CandidateRecovery {
+    Present,
+    Absent,
+    Either,
+    ContiguousPrefix,
+}
+
+#[cfg(target_os = "linux")]
+fn run_parallel_wal_crash_case(
+    crash_point: &str,
+    occurrence: usize,
+    candidates: &[(&[u8], &[u8])],
+    candidate_recovery: CandidateRecovery,
+) {
+    let dir = tempfile::tempdir().expect("create parallel WAL crash case directory");
+    let db_path = dir.path().join("db");
+    let control_log_path = dir.path().join("chaos_control.log");
+    let marker_path = dir.path().join("crash.marker");
+
+    let mut child = Command::new(chaos_child_path());
+    child
+        .arg("--child")
+        .arg("--scenario")
+        .arg("parallel-wal-crash")
+        .arg("--seed")
+        .arg("42")
+        .arg("--db-path")
+        .arg(&db_path)
+        .arg("--control-log-path")
+        .arg(&control_log_path)
+        .arg("--parallel-wal")
+        .arg("--crash-point")
+        .arg(crash_point)
+        .env(PARALLEL_WAL_CRASH_POINT_ENV, crash_point)
+        .env(PARALLEL_WAL_CRASH_OCCURRENCE_ENV, occurrence.to_string())
+        .env(PARALLEL_WAL_CRASH_MARKER_ENV, &marker_path)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = child.spawn().unwrap_or_else(|error| {
+        panic!("failed to spawn parallel WAL crash child at {crash_point}: {error}")
+    });
+
+    let mut child_stdout = child.stdout.take().expect("capture child stdout");
+    let mut child_stderr = child.stderr.take().expect("capture child stderr");
+    let stdout_handle = std::thread::spawn(move || {
+        let mut output = String::new();
+        let _ = child_stdout.read_to_string(&mut output);
+        output
+    });
+    let stderr_handle = std::thread::spawn(move || {
+        let mut output = String::new();
+        let _ = child_stderr.read_to_string(&mut output);
+        output
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut marker_detected = false;
+    let mut early_exit = None;
+    while Instant::now() < deadline {
+        if marker_path.is_file() {
+            marker_detected = true;
+            break;
+        }
+        if let Ok(Some(status)) = child.try_wait() {
+            early_exit = Some(status);
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    let _ = child.kill();
+    let _ = child.wait();
+    let child_stdout = stdout_handle.join().unwrap_or_default();
+    let child_stderr = stderr_handle.join().unwrap_or_default();
+
+    assert!(
+        marker_detected,
+        "parallel WAL crash point {crash_point} was not reached within 60s; early exit: {early_exit:?}\nchild_stdout:\n{child_stdout}\nchild_stderr:\n{child_stderr}"
+    );
+    let marker = std::fs::read_to_string(&marker_path).expect("read crash marker");
+    assert_eq!(marker.trim(), crash_point);
+
+    let config = ScenarioConfig::wal_only();
+    let engine = KvEngine::open(&db_path, config.storage_options).unwrap_or_else(|error| {
+        panic!("reopen after {crash_point} process kill failed: {error:#}")
+    });
+    assert_eq!(
+        engine
+            .get(b"acknowledged-before-crash")
+            .expect("read acknowledged baseline after recovery")
+            .as_deref(),
+        Some(b"stable".as_slice()),
+        "acknowledged write was lost after crash at {crash_point}"
+    );
+
+    let mut missing_candidate = false;
+    for (key, expected) in candidates {
+        let actual = engine
+            .get(key)
+            .unwrap_or_else(|error| panic!("read candidate after {crash_point} failed: {error:#}"));
+        match candidate_recovery {
+            CandidateRecovery::Present => {
+                assert_eq!(actual.as_deref(), Some(*expected), "at {crash_point}");
+            }
+            CandidateRecovery::Absent => {
+                assert!(
+                    actual.is_none(),
+                    "unwritten candidate recovered at {crash_point}"
+                );
+            }
+            CandidateRecovery::Either => assert!(
+                actual.is_none() || actual.as_deref() == Some(*expected),
+                "candidate recovered with unexpected value at {crash_point}: {actual:?}"
+            ),
+            CandidateRecovery::ContiguousPrefix => match actual.as_deref() {
+                Some(value) => {
+                    assert!(
+                        !missing_candidate,
+                        "recovery skipped an earlier ticket and recovered {key:?} at {crash_point}"
+                    );
+                    assert_eq!(value, *expected, "at {crash_point}");
+                }
+                None => missing_candidate = true,
+            },
+        }
+    }
+    engine
+        .close()
+        .expect("close recovered parallel WAL database");
+}
+
+fn io_uring_is_unavailable(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .and_then(std::io::Error::raw_os_error)
+            .is_some_and(|code| matches!(code, libc::EPERM | libc::ENOMEM | libc::ENOSYS))
+    })
 }
 
 #[test]

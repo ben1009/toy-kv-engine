@@ -2,9 +2,11 @@
 
 **RFC:** [RFC 024: Dedicated WAL I/O Pipeline](../rfcs/024-dedicated-wal-pipeline.md)
 
-**Status:** Slices 1–5 implemented; Slice 5 awaiting review; recovery and benchmark gates remain
+**Status:** Slices 1–5 implemented; Slice 6 crash-boundary coverage is
+implemented, with sync-failure and poison-race coverage still open; Slice 7
+remains gated
 
-**Last updated:** 2026-09-25
+**Last updated:** 2026-09-26
 
 ## Purpose and boundary
 
@@ -204,13 +206,31 @@ normal successful close. Holding sync open does not hold completed `DirectBuf`s,
 and queue pressure wakes the worker without another client arrival. The
 opt-in path is usable end to end for v4 WALs.
 
-### 6. Recovery, crash, and compatibility gate
+### 6. Recovery, crash, and compatibility gate — in progress
 
-- Reopen files after failures at offset reservation, a later group completing
-  first, sync in flight, and sync success before frontier publication. The v4
-  scanner must stop at the first invalid/zero batch and recover a contiguous
-  prefix; every acknowledged ticket must survive, while a complete
-  unacknowledged suffix remains an allowed unknown outcome.
+- The parallel WAL process-kill test kills a child after sequential writes
+  return and verifies all acknowledged operations after reopen. A separate
+  deterministic process-kill test covers four boundaries: after offset
+  reservation and before preallocation/write; after a later-group result is
+  delivered while the lowest-ticket group remains unresolved; after capturing
+  the sync target and immediately before calling `fdatasync`; and after a
+  successful `fdatasync` but before publishing the durable frontier. Every
+  case verifies the acknowledged baseline survives. The candidate must be
+  absent when killed before its write, may recover at the other
+  pre-acknowledgement boundaries, and must recover after successful `fdatasync`.
+- The later-group case admits the first candidate before starting the second,
+  fixing their ticket order, and defers processing the lowest group's CQE so
+  the coordinator receives the later group's result first. Recovery must
+  return a contiguous prefix of those candidates under this controlled
+  schedule.
+  The pre-`fdatasync` case stops after target capture and before entering the
+  syscall; it does not claim to pause inside the kernel call. Together, the
+  pre-call and post-success cases cover the allowed recovery outcomes for an
+  unacknowledged suffix.
+- A separate v4 scanner test corrupts a middle batch after close and verifies
+  recovery truncates at the first invalid batch. The v5/v6 `A complete / B
+  hole / C complete` test verifies the unchanged recovery path rejects the
+  file without modifying it.
 - Run existing WAL, range-tombstone, MVCC, async, freeze/rotation, and PITR
   suites against the candidate where applicable. Test the v5/v6
   `A complete / B hole / C complete` corruption rule on the unchanged path.
@@ -228,9 +248,21 @@ opt-in path is usable end to end for v4 WALs.
   terminal outcome. Run the separate async/lifecycle prerequisite test suites
   before enabling candidate WAL selection through those paths.
 
-**Exit:** The model tests, nextest suites, process crash tests, and sanitizer
-jobs pass on a host that permits io_uring. `EPERM` in a sandbox is not a
+**Exit:** The deterministic process-crash/reopen cases, sync-failure and
+poison-race cases above, model tests, applicable nextest suites, and sanitizer
+jobs must pass on a host that permits io_uring. `EPERM` in a sandbox is not a
 passing result for this gate.
+
+**Verification to date (2026-09-26):** `cargo make check` passed (1,381
+nextest tests); the parallel WAL process-kill/reopen test passed with 171
+acknowledged operations; the deterministic crash-boundary process test passed
+on a host that permits io_uring; and the repository's AddressSanitizer and
+LeakSanitizer test commands passed. The v4 invalid-middle-batch scanner test
+and v5/v6 zero-filled `A / hole / C` compatibility test passed. Async
+candidate writes and close remain disabled until their separate lifecycle
+prerequisites are met. Sync-failure and pending-sync poison-race coverage is
+still outstanding, so Slice 6's exit gate remains open; Slice 7's performance
+and adoption gate also remains open.
 
 ### 7. Paired benchmark and adoption decision
 

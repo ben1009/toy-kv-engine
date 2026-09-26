@@ -6,6 +6,7 @@ use wrapper::kv_engine_wrapper::chaos::control_log::ControlLogWriter;
 use wrapper::kv_engine_wrapper::chaos::scenarios::{self, ScenarioConfig};
 use wrapper::kv_engine_wrapper::chaos::stress::{self, StressScenario};
 use wrapper::kv_engine_wrapper::lsm_storage::KvEngine;
+use wrapper::kv_engine_wrapper::wal::WalIoMode;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -32,6 +33,11 @@ fn child_main(args: &[String]) -> Result<(), String> {
         .unwrap_or(0);
     let db_path = get_arg(args, "--db-path").ok_or("missing --db-path")?;
     let log_path = get_arg(args, "--control-log-path").ok_or("missing --control-log-path")?;
+    let wal_io_mode = if args.iter().any(|arg| arg == "--parallel-wal") {
+        WalIoMode::Parallel
+    } else {
+        WalIoMode::Leader
+    };
     let replay = args.iter().any(|a| a == "--replay");
     let effective_wal = get_arg(args, "--effective-wal")
         .map(|value| match value.as_str() {
@@ -125,6 +131,7 @@ fn child_main(args: &[String]) -> Result<(), String> {
     // Look up scenario config
     let config = match scenario.as_str() {
         "wal-only" => ScenarioConfig::wal_only(),
+        "parallel-wal-crash" => ScenarioConfig::wal_only(),
         "flush-boundary" => ScenarioConfig::flush_boundary(),
         "manifest-snapshot" => ScenarioConfig::manifest_snapshot(),
         "range-tombstone" => ScenarioConfig::range_tombstone(),
@@ -135,8 +142,12 @@ fn child_main(args: &[String]) -> Result<(), String> {
     };
 
     // Open the database
-    let engine = KvEngine::open(db_path.as_str(), config.storage_options.clone())
-        .map_err(|e| format!("KvEngine::open failed: {e}"))?;
+    let engine = KvEngine::open_with_wal_io_mode(
+        db_path.as_str(),
+        config.storage_options.clone(),
+        wal_io_mode,
+    )
+    .map_err(|e| format!("KvEngine::open failed: {e}"))?;
 
     // Create the control log writer
     let mut log = ControlLogWriter::new(log_path.as_str())
@@ -144,6 +155,10 @@ fn child_main(args: &[String]) -> Result<(), String> {
 
     // Run the scenario
     match scenario.as_str() {
+        "parallel-wal-crash" => {
+            run_parallel_wal_crash(&engine, args)?;
+            return Err("configured parallel WAL crash boundary was not reached".to_string());
+        }
         "wal-only" => scenarios::wal_only_restart(&engine, &mut log, &config, seed)?,
         "flush-boundary" => scenarios::flush_boundary(&engine, &mut log, &config, seed)?,
         "manifest-snapshot" => {
@@ -160,6 +175,54 @@ fn child_main(args: &[String]) -> Result<(), String> {
     loop {
         std::thread::park();
     }
+}
+
+fn run_parallel_wal_crash(engine: &KvEngine, args: &[String]) -> Result<(), String> {
+    use wrapper::kv_engine_wrapper::chaos::failpoint;
+
+    let crash_point = get_arg(args, "--crash-point").ok_or("missing --crash-point")?;
+    engine
+        .put(b"acknowledged-before-crash", b"stable")
+        .map_err(|error| format!("baseline WAL write failed: {error:#}"))?;
+
+    if crash_point == "parallel_wal.later_group_completed_first" {
+        failpoint::enable_deferred_lowest_parallel_wal_group_completion();
+        failpoint::reset_parallel_wal_admission_count();
+
+        std::thread::scope(|scope| {
+            let first = scope.spawn(|| engine.put(b"parallel-crash-first", b"first"));
+            let admission_deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            while failpoint::parallel_wal_admission_count() == 0 {
+                if first.is_finished() {
+                    return Err(
+                        "first parallel WAL writer finished before admission was observed"
+                            .to_string(),
+                    );
+                }
+                if std::time::Instant::now() >= admission_deadline {
+                    return Err("first parallel WAL writer was not admitted within 30s".to_string());
+                }
+                std::thread::yield_now();
+            }
+
+            // Admit the second write only after the first owns the lower ticket.
+            let second = scope.spawn(|| engine.put(b"parallel-crash-second", b"second"));
+
+            for (name, handle) in [("first", first), ("second", second)] {
+                handle
+                    .join()
+                    .map_err(|_| format!("{name} parallel WAL writer panicked"))?
+                    .map_err(|error| format!("{name} parallel WAL writer failed: {error:#}"))?;
+            }
+            Ok::<(), String>(())
+        })?;
+    } else {
+        engine
+            .put(b"unacknowledged-before-crash", b"candidate")
+            .map_err(|error| format!("candidate WAL write failed: {error:#}"))?;
+    }
+
+    Ok(())
 }
 
 fn get_arg(args: &[String], name: &str) -> Option<String> {
