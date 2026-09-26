@@ -1,16 +1,20 @@
-# RFC 024 Slice 7: Parallel WAL benchmark outcome
+# RFC 024: Parallel WAL benchmark outcomes
 
-**Decision:** Keep the client-leader WAL as the default. The initial opt-in
-parallel candidate reached the intended concurrency and overlapped writes
-with `fdatasync`, but regressed several cases. Later coalescing improvements
-helped device-backed runs; tmpfs still falls well behind the leader.
+**Decision:** Keep the client-leader WAL as the default. Removing the parallel
+path's dedicated packer thread improved it on tmpfs and left ext4 throughput
+near parity with the previous parallel implementation. The current candidate
+still loses to the leader on tmpfs, so parallel WAL remains opt-in.
 
 ## Run manifest
 
 - Date: 2026-09-26, Asia/Chongqing
-- Current source: base revision `3e67e905072b58b2317aae64c6039e3c28c7005d`
-  plus the Slice 7 `write-perf` changes in this worktree
+- Current source: base revision `ca9e45670af2b6ae716d625e4a97ba25de9ab1f7`
+  plus the producer-side queue-drain change in this worktree
 - Current release binary: SHA-256
+  `820433a84a1409c76fd52352c96a31c87eecdd1c4654722ed0415d7224993517`
+- Previous 100-microsecond parallel baseline binary: SHA-256
+  `9a65a859a55c931c9e2e29a75818efffcc908badab9955cba035349a6dde20a5`
+- Slice 7 binary used for the original regression case: SHA-256
   `4612e15ec02c221eba4356ce658e1289689bf19b40ffb6f11ad61592d895fdd9`
 - Historical source: pre-PITR revision `2f556ccb`, built in the same session
   with the installed toolchain; binary SHA-256
@@ -25,7 +29,8 @@ helped device-backed runs; tmpfs still falls well behind the leader.
 - Device queue depth: unavailable; reported SQE counts are software pipeline
   measurements only
 
-The main regression case used the same current binary for both modes:
+The original Slice 7 200k-write regression case used the Slice 7 binary for
+both modes; it predates the producer-side queue-drain change:
 
 ```text
 --suite legacy --preset default --wal --bench wal_concurrent
@@ -418,21 +423,70 @@ paired tmpfs 200k-put runs. Compiling out three admission-mutex reads used
 only by assertions yielded a 0.983 median throughput ratio and 1.152 p99
 ratio in five paired tmpfs 200k-put runs. Both experiments were reverted.
 
-A current tmpfs CPU profile sampled the worker command-channel receive,
-ordered packer submission, and sync coordination in the parallel path. Along
-with the roughly threefold process CPU gap, this points to the per-ticket
-producer-to-packer-to-worker handoff as the next structural experiment. A
-candidate should let the I/O worker drain ready tickets in order, while
-preserving admission's ticket/offset linearization, preallocation before
-submission, bounded in-flight groups, and the existing contiguous durability
-frontier. Benchmark it against this 100-microsecond baseline on both filesystems
-before retaining it. The leader remains the default.
+The tmpfs CPU profile sampled the worker command-channel receive, ordered
+packer submission, and sync coordination. The next experiment removed the
+dedicated packer thread while preserving ticket/offset order, preallocation
+before submission, bounded in-flight groups, and the contiguous durability
+frontier. Results follow.
+
+### Producer-side queue draining
+
+After admitting a ticket, a producer tries to acquire the packer state without
+blocking while it still holds the admission mutex. If it succeeds, it releases
+admission and drains ready tickets in order, preallocates outside the admission
+mutex, and submits groups to the existing I/O worker. Other producers can
+continue admission while that drain is in progress. The drainer checks for an
+empty queue while holding admission and releases the packer state before
+releasing admission, so a concurrent enqueue either becomes visible to the
+current drainer or claims the packer itself. Close stops admission, acquires
+the same packer state, and drains through its captured cutoff.
+
+Five alternating pairs compared this candidate to the previous 100-microsecond
+parallel path on the 50,000-put, four-writer, 1-KiB-value, 1-MiB-SST workload.
+The candidate used one I/O group per ticket (50,000 groups in every run); the
+previous path produced a median 42,059 groups on ext4 and 38,783 on tmpfs.
+
+| Filesystem | Candidate / previous throughput | 95% bootstrap interval | Candidate / previous p99 | Candidate / previous process CPU |
+| --- | ---: | ---: | ---: | ---: |
+| ext4 | 0.994 | 0.968–1.076 | 0.908 | 0.952 |
+| tmpfs | 1.320 | 1.168–1.334 | 0.673 | 0.761 |
+
+Intervals enumerate all 3,125 bootstrap resamples of the five paired median
+ratios, using nearest-rank 2.5th and 97.5th percentiles. The candidate was
+effectively at parity on ext4 and improved tmpfs throughput by 32%, p99 by
+33%, and process CPU by 24% against the previous parallel path.
+
+Five fresh alternating leader/candidate pairs used the same candidate binary
+for both modes. The table reports candidate divided by leader; p99 values
+above 1 mean worse candidate tail latency. Throughput ratios by pair were
+`1.570, 1.532, 1.563, 0.843, 1.551` on ext4 and
+`0.871, 0.654, 1.004, 0.850, 0.688` on tmpfs.
+
+The intervals in the next table use the same exhaustive bootstrap method.
+
+| Filesystem | Median throughput ratio | 95% bootstrap interval | Median p99 ratio | Median process CPU ratio |
+| --- | ---: | ---: | ---: | ---: |
+| ext4 | 1.551 | 0.843–1.570 | 0.924 | 1.500 |
+| tmpfs | 0.850 | 0.654–1.004 | 1.281 | 1.485 |
+
+The candidate reached four in-flight groups on both filesystems. Its ext4
+median was 55% above leader, but the paired interval includes parity and
+process CPU was 50% higher, so the device-backed adoption gate is not
+established. On tmpfs the candidate lost to leader in four of five pairs and
+used about 49% more process CPU. Keep this optimization in the opt-in parallel
+path; do not change the leader default.
 
 The paired JSON summaries are `/tmp/rfc024-current-lp-ext4.json`,
 `/tmp/rfc024-current-lp-tmpfs.json`, `/tmp/rfc024-200vs100-ext4.json`,
 `/tmp/rfc024-200vs100-tmpfs.json`, and `/tmp/rfc024-lock-exact-tmpfs.json`.
 The current CPU profiles are `/tmp/rfc024-current-parallel.perf` and
 `/tmp/rfc024-current-leader.perf`.
+
+The producer-side queue-drain comparisons are summarized in
+`/tmp/rfc024-fused-packer-ext4.json` and
+`/tmp/rfc024-fused-packer-tmpfs.json`. Current candidate/leader raw JSON is in
+`target/rfc024-fused-leader-ext4-runs` and
+`/tmp/rfc024-fused-leader-tmpfs-runs`.
 
 Raw JSONL outputs from the Slice 7 session are in
 `/tmp/rfc024-slice7-artifacts`; the current 20k WAL-focused outputs are in
