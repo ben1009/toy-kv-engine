@@ -663,6 +663,22 @@ are unlikely to close it; a future slice should reduce complete per-ticket
 handoffs and measure syscall counts and group formation before changing the
 default.
 
+A follow-up `/proc` thread-CPU sample of the same 200k-put tmpfs case measured
+about 4.37 seconds of system CPU in the writer threads and 1.84 seconds in the
+kernel io_uring worker for parallel WAL, versus about 0.87 seconds in writers
+and 0.32 seconds across kernel io_uring workers for the leader path. These are
+sampled thread totals, not syscall attribution. A 20k-put, 1-GiB-SST ext4
+sample instead ran at about 6.38k puts/s parallel versus 3.77k leader. The
+two filesystems therefore need separate adoption decisions.
+
+Forcing the existing 100-microsecond sync coalescing window after every sync,
+including cheap tmpfs syncs, did not solve the fast-filesystem cost. Three
+alternating 20k-put, four-writer, 1-GiB-SST pairs gave candidate/baseline
+tmpfs throughput ratios of 0.947, 1.038, and 0.842. Ext4 ratios were 1.002,
+1.037, and 0.993. The change was reverted. This small screen does not support
+extra delay as an optimization; the next candidate should reduce per-ticket
+work or form larger groups without inserting a wait into every commit.
+
 ### Follow-up: assertion lock and 16-group cap (rejected)
 
 **Run date:** 2026-09-27.
