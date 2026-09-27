@@ -1712,3 +1712,38 @@ The existing preallocation test now checks repeated extension, preservation
 of header and batch bytes, and that a smaller target does not shrink the file.
 Raw records and the reproduction script are available transiently at
 `/tmp/rfc024-suffix-bench.jsonl` and `/tmp/rfc024_suffix_bench.py`.
+
+### Bounded geometric preallocation growth (rejected, 2026-09-28)
+
+After suffix-only allocation landed in `80fa66d2`, a separate prototype grew
+allocation increments geometrically from 1 MiB to a maximum of 8 MiB. The
+hypothesis was that fewer allocation calls and file-size extensions would
+reduce ext4 stalls. Both arms used parallel WAL, the same release/`bench`
+profile, 1 KiB values, and latency sampling every 100 operations. No build or
+test ran alongside timing.
+
+An initial three-pair screen showed a 1.025 throughput ratio at 16 writers on
+ext4, but regressions on tmpfs. Five additional alternating pairs checked those
+cases independently:
+
+| Case | Puts / writers / SST target | Median paired throughput ratio | Median paired p99 ratio |
+| --- | --- | ---: | ---: |
+| ext4, growing WAL | 50k / 16 / 1 GiB | 0.995 | 1.172 |
+| tmpfs, growing WAL | 50k / 1 / 1 GiB | 0.920 | 1.009 |
+| tmpfs, original case | 200k / 4 / 1 MiB | 0.987 | 1.102 |
+
+Ext4 preallocation time fell from 27.2 ms to 4.6 ms, but paired throughput
+ratios were 1.042, 0.983, 1.021, 0.995, and 0.992. The syscall-time saving did
+not produce a repeatable end-to-end gain. Tmpfs single-writer preallocation
+time increased from 29.0 ms to 32.5 ms. On the growing-WAL workload the
+candidate reserved 209,715,200 bytes versus 205,520,896 bytes in the baseline.
+The earlier ext4 rotation screen was near parity (1.006 median ratio), while
+its single-writer case encountered the known device-latency cliff and cannot
+isolate the code effect.
+
+The larger growth increments were removed; suffix-only allocation remains.
+The restored release binary was compared with the saved baseline. Transient
+artifacts are `/tmp/rfc024-growth-bench.jsonl`,
+`/tmp/rfc024-growth-confirm-bench.jsonl`,
+`/tmp/rfc024_growth_confirm_bench.py`, and
+`/tmp/rfc024-growth-rejected.patch`.
