@@ -1459,3 +1459,35 @@ between adjacent arms, and the historical binary supplies no comparable p99.
 Keep the leader default while the RFC's full throughput, one-writer, and p99
 gates remain unresolved. Raw records, including complete benchmark JSON, are
 in `/tmp/rfc024-pre-pitr-triplets.jsonl` (transient).
+
+### Bounded durability wait (rejected)
+
+**Run date:** 2026-09-27. To reduce the one-writer producer-to-coordinator
+round trip, a prototype mirrored the durable frontier in an atomic and spun
+for a bounded number of iterations before falling back to the existing
+condition variable. The atomic was published after the same `fdatasync`
+success as the locked frontier; the poison/error path remained locked. Each
+configuration was compared against the unchanged release binary in five
+alternating pairs per case. The cases used 1 KiB values and a 1 GiB SST target:
+50,000 puts on tmpfs with one writer, 5,000 puts on ext4 with one writer, and
+20,000 puts on ext4 with four writers.
+
+| Spin iterations | Case | Median throughput ratio | Median p99 ratio | Median process CPU ratio |
+| ---: | --- | ---: | ---: | ---: |
+| 4,096 | tmpfs, one writer | 1.058 | 0.792 | 1.249 |
+| 4,096 | ext4, one writer | 1.084 | 0.937 | 3.159 |
+| 4,096 | ext4, four writers | 1.089 | 0.985 | 5.062 |
+| 256 | tmpfs, one writer | 1.044 | 0.951 | 1.231 |
+| 256 | ext4, one writer | 0.991 | 0.988 | 1.378 |
+| 256 | ext4, four writers | 0.988 | 0.997 | 1.807 |
+
+The long spin improved throughput, but its ext4 CPU cost was 3-5 times the
+control, which is not an acceptable way to clear the gate. The short spin
+kept a small tmpfs improvement but lost the ext4 gain while still using more
+CPU. Two short-spin ext4 four-writer pairs crossed the device-latency cliff;
+in the three fast-device pairs, the short-spin arm was also slightly slower.
+Both prototypes were reverted. Even the long-spin tmpfs gain leaves the
+one-writer parallel path far below the leader because each solo commit still
+crosses the worker and coordinator. Raw paired records are in
+`/tmp/rfc024-durable-spin-bench.jsonl` and
+`/tmp/rfc024-durable-spin-256-bench.jsonl` (transient).
