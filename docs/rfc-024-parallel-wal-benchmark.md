@@ -51,6 +51,29 @@ that pattern (13,298/3.8 versus 4,959/22.0). The pair without a stall measured
 to the group limit from these measurements. The cap change is retained for the
 opt-in WAL; the device-backed tail-latency cliff still needs investigation.
 
+### Ext4 long-run sync-stall control
+
+With the sixteen-group cap, three alternating pairs reran 200,000 puts, 16
+writers, 1 KiB values, and a 1 MiB SST target on ext4. Both arms kept the WAL
+and memtable flushes; one used leveled compaction and the other disabled
+background compaction. The table shows throughput, sampled p99, and aggregate
+WAL `fdatasync` time divided by sync count:
+
+| Pair | Leveled ops/s / p99 ms / sync ms | No compaction ops/s / p99 ms / sync ms |
+| --- | ---: | ---: |
+| 1 | 14,728 / 3.65 / 0.411 | 15,383 / 3.41 / 0.371 |
+| 2 | 14,740 / 3.17 / 0.415 | 15,533 / 2.98 / 0.371 |
+| 3 | 5,006 / 21.69 / 1.436 | 13,667 / 7.37 / 0.442 |
+
+In the two fast pairs, disabling compaction improved throughput by about 4–5%
+and reduced mean WAL sync time by about 0.04 ms. The third leveled run
+reproduced the cliff: 29.8 seconds of aggregate WAL `fdatasync` time, compared
+with roughly 8.5 seconds in the fast leveled runs. Its following no-compaction
+run was also somewhat slower than its earlier controls. This is consistent
+with storage pressure during compaction, but three pairs and one stall cannot
+separate compaction from other device activity. No compaction scheduling change
+was made from this control.
+
 ## Run manifest
 
 - Date: 2026-09-26, Asia/Chongqing
