@@ -787,3 +787,31 @@ half of baseline because the cap allowed less work to overlap, while the
 device-backed workload became slower. The eight-group cap was restored.
 Raw results are in `/tmp/rfc024-cap2-ab-tmpfs.json` and
 `/tmp/rfc024-cap2-ab-ext4.json`.
+
+### Worker-owned packing (rejected)
+
+**Run date:** 2026-09-27.
+
+An experimental runtime sent ticketed buffers directly from admission to the
+I/O worker. The worker packed up to eight contiguous tickets, preallocated the
+range, and submitted the resulting group. This removed the producer-side
+packer/group handoff while retaining the eight-group in-flight cap. The mode
+was enabled only by `TOYKV_WAL_WORKER_PACK=1`; the existing path was the
+same-binary control. Its focused parallel-WAL and failpoint tests passed
+(13/13), as did a worker packing unit test and all-feature Clippy.
+
+Three paired 100,000-put tmpfs runs with four writers and a 1-GiB SST target
+showed worker/control throughput ratios `1.440, 1.439, 1.306` (median
+`1.439`), with median process CPU ratio `0.671`. Three 10,000-put ext4 pairs
+were near parity (`1.048, 0.976, 0.999`), without a clear p99 gain. A
+profiled 20,000-put tmpfs run reduced I/O groups from 20,000 to 16,643 and
+solo groups from 20,000 to 13,431.
+
+The original 200,000-put, four-writer tmpfs case with a 1-MiB SST target
+reversed the result. Three paired worker/control throughput ratios were
+`0.891, 0.970, 0.975` (median `0.970`), and p99 ratios were `1.564, 1.002,
+1.372`. A separate profiled 20,000-put run of that workload still reduced
+groups from 20,000 to 15,359, but throughput fell from 84.8k to 64.8k
+puts/s. Thus fewer groups did not improve the end-to-end regression case.
+The prototype was reverted. Raw paired results are in
+`/tmp/rfc024-worker-pack-ab.json` and `/tmp/rfc024-worker-pack-exact.json`.
