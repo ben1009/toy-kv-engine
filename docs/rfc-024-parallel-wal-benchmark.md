@@ -7,6 +7,28 @@ still loses to the leader on tmpfs, so parallel WAL remains opt-in.
 
 ## Current ext4 bottleneck: partly filled sync barriers
 
+### Post-cutoff depth and completion-map probes (2026-09-27)
+
+After the moving admission cutoff landed, the 16-writer, 1-GiB-SST ext4
+workload used about 3,300 sync calls for 50,000 puts: roughly 15 tickets per
+sync at the existing 16-group cap. To check whether this cap now constrained
+higher concurrency, five alternating 32-writer ext4 pairs raised it from 16
+to 32. The candidate reached 32 in-flight groups and 32 outstanding write
+SQEs, but candidate/baseline throughput ratios were `1.011, 1.013, 0.904,
+1.108, 0.945` (median `1.011`). Median sampled-p99 ratio was `1.114` and
+median sync calls were nearly unchanged (2,527 versus 2,510). The extra
+depth was reverted; reaching a larger software queue did not translate into
+more useful durability work.
+
+The coordinator also receives one completion per mostly solo I/O group. Its
+small `BTreeMap` of out-of-order completions was temporarily changed to a
+`HashMap`, since it only inserts and removes by the exact frontier ticket.
+Five alternating 16-writer ext4 pairs measured candidate/baseline throughput
+ratios of `1.040, 0.992, 0.964, 0.974, 0.956` (median `0.974`) and a median
+sampled-p99 ratio of `1.255`. The map change was reverted. These probes
+leave the per-ticket producer-to-worker-to-coordinator handoff and the ordered
+sync stream as the useful targets for the next implementation experiment.
+
 ### Bounded moving admission cutoff (2026-09-27)
 
 The 200-microsecond coalescing window originally captured `next_ticket` once
