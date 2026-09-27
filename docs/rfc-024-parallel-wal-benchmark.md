@@ -1416,10 +1416,46 @@ costs almost nothing. The candidate's win is on device-backed storage, where
 it clears the gate on the WAL-isolated case (`12.9` median paired gain,
 interval `5.3`-`17.9`).
 
-That leaves this RFC's actual motivation - `wal_concurrent`'s post-PITR gap -
-unaddressed by the parallel path. Its measured cost is on the default leader
+At this stage, `wal_concurrent`'s post-PITR gap remained unaddressed by the
+parallel path. Its measured cost was on the default leader
 path, where commits are bound by the serialized submit: the elected leader
 waits for its group's writes and `fdatasync` before the next group can submit,
 which is why solo commit groups rose from 10,859 to 26,735 after the PITR
 sequencer landed. Further work on that regression should target the leader
 path's submit model rather than this pipeline.
+
+### Same-session pre-PITR ext4 comparison
+
+**Run date:** 2026-09-27. The pre-PITR `2f556ccb` release binary and current
+leader/parallel release binary ran the exact 200,000-put `wal_concurrent` case
+on ext4: four writers, 1 KiB values, 1 MiB SST target, WAL on, PITR off,
+latency sampled every 100 operations. Three triplets rotated execution order.
+The historical binary lacks the current latency fields. `/sys/block/nvme0n1/stat`
+write-time divided by completed device writes is a whole-device interval
+average, not a per-WAL or per-request latency measurement.
+
+| Triplet (run order) | pre-PITR ops/s (device ms/write) | leader ops/s (device ms/write) | parallel ops/s (device ms/write) |
+| --- | ---: | ---: | ---: |
+| 1 (pre-PITR, leader, parallel) | 3,886 (0.190) | 3,641 (0.182) | 2,174 (0.680) |
+| 2 (leader, parallel, pre-PITR) | 2,393 (0.367) | 3,620 (0.181) | 5,989 (0.179) |
+| 3 (parallel, pre-PITR, leader) | 3,840 (0.189) | 2,225 (0.336) | 5,984 (0.178) |
+
+Each mode had two runs in a fast device interval (0.178-0.190 ms/write) and
+one in a slow interval (0.336-0.680 ms/write). Among the fast runs, the
+per-mode medians were 3,863 ops/s for pre-PITR, 3,630 for the leader, and
+5,986 for parallel. Parallel was 1.55x the historical fast-run median and
+1.65x the current leader fast-run median; the current leader was about 6%
+below the historical median. These are **post-hoc device-state comparisons**,
+not paired adoption estimates. The third triplet put both parallel and
+pre-PITR in the fast interval and measured 5,984 versus 3,840 ops/s; the
+other two triplets put one of those modes in a slow interval. Device write
+counts were similar across runs (294k-316k), but this counter cannot identify
+which I/O caused the latency change.
+
+This session is consistent with the parallel path closing the apparent ext4
+pre-PITR gap under fast device conditions. It does not establish a stable
+same-session paired gain beyond the null spread: the device changed regimes
+between adjacent arms, and the historical binary supplies no comparable p99.
+Keep the leader default while the RFC's full throughput, one-writer, and p99
+gates remain unresolved. Raw records, including complete benchmark JSON, are
+in `/tmp/rfc024-pre-pitr-triplets.jsonl` (transient).
