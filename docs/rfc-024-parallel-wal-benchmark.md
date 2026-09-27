@@ -963,6 +963,33 @@ writer concurrency on this filesystem, but the eight-writer, shorter run
 does not resolve the four-writer, 200,000-put latency cliff. Raw runs are in
 `/tmp/rfc024-8writer-ext4-*`.
 
+### Device counters and buffered-I/O prototype
+
+**Run date:** 2026-09-27. A monitored 200,000-put ext4 pair showed that the
+sync cliff can also hit leader WAL: leader ran at 2,243 puts/s with 11.726-ms
+sampled p99 and 7.779-ms `fdatasync` p99, while the following parallel run
+reached 5,775 puts/s with 2.126-ms sampled p99 and 0.995-ms sync p99. The
+whole-device `/sys/block/nvme0n1/stat` samples showed average write-I/O
+latency rising from 0.179 to 0.768 ms across the first three quarters of
+the slow leader run; it stayed between 0.162 and 0.190 ms across the fast
+parallel run. These are device-wide counters, so they do not attribute the
+latency to this benchmark. They do show that a slow run is not unique to the
+parallel implementation. Raw benchmark and 250-ms device samples are in
+`/tmp/rfc024-device-counter-*`.
+
+A benchmark-only prototype opened the parallel worker's WAL handle without
+`O_DIRECT`, retaining io_uring writes and `fdatasync`. Five alternating
+50,000-put ext4 buffered/direct pairs had throughput ratios 1.040, 1.016,
+1.037, 2.091, and 2.344; the last two direct runs hit large storage-latency
+outliers. The first three pairs suggest only a 1.6-4.0% gain. Five 200,000-put
+tmpfs pairs had a median throughput ratio of 0.998 and mixed sampled p99.
+On the original 200,000-put ext4 workload, three buffered/direct throughput
+ratios were 1.034, 0.508, and 0.517. Buffered I/O hit the late-run latency
+cliff in the latter two pairs (11-13-ms sampled p99), while direct I/O did
+not. Buffered I/O therefore does not solve the adoption case; the prototype
+was reverted. Raw comparisons are in `/tmp/rfc024-buffered-ext4-*`,
+`/tmp/rfc024-buffered-tmpfs-*`, and `/tmp/rfc024-buffered-200k-ext4-*`.
+
 ### In-order completion fast path (rejected)
 
 **Run date:** 2026-09-27.
