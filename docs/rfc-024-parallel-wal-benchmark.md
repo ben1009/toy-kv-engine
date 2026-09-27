@@ -768,3 +768,22 @@ and 0.186 ms for leader WAL; measured process CPU was 2.16 times higher.
 SQPOLL therefore did not close the leader gap or satisfy the latency and CPU
 tradeoff, and the prototype was reverted. The paired screen is in
 `/tmp/rfc024-sqpoll-ab.json`.
+
+### Two in-flight groups (rejected)
+
+**Run date:** 2026-09-27.
+
+Reducing the parallel worker's group cap from eight to two was tested as a way
+to let more admitted tickets accumulate before the producer-side packer runs.
+Five paired 100,000-put, four-writer tmpfs runs had candidate/baseline
+throughput ratios `1.072, 0.828, 1.022, 0.795, 1.250` (median `1.022`).
+Measured process CPU fell by a median 23%, but throughput and p99 varied widely.
+The non-instrumented build did not report group counts, so the proposed
+group-formation mechanism was not verified.
+
+Three paired 10,000-put ext4 runs had throughput ratios `0.741, 0.785, 0.719`
+(median `0.741`), and p99 was worse in all three pairs. Process CPU was about
+half of baseline because the cap allowed less work to overlap, while the
+device-backed workload became slower. The eight-group cap was restored.
+Raw results are in `/tmp/rfc024-cap2-ab-tmpfs.json` and
+`/tmp/rfc024-cap2-ab-ext4.json`.
