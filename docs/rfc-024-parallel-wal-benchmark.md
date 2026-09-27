@@ -732,3 +732,20 @@ admission and moved some preallocation and group submission onto the sync
 coordinator's completion path. The measurements do not isolate either cost;
 they establish that this handoff design is slower. A future group-formation
 change should remove a pipeline handoff rather than wait for another one.
+
+### Dedicated packer thread (rejected)
+
+**Run date:** 2026-09-27.
+
+Moving queue draining and group submission from writers to a dedicated packer
+reduced a profiled 20,000-put run from 20,000 solo I/O groups to about 17,000
+groups on both tmpfs and ext4. The focused parallel-WAL tests passed (12/12),
+as did all-features Clippy. Three short paired screens were inconclusive:
+tmpfs median candidate/baseline throughput was `1.127`, and ext4 was `0.998`.
+
+Five pairs of the original 200,000-put, four-writer, 1-MiB-SST tmpfs workload
+were decisive: throughput ratios were `0.796, 0.800, 0.817, 0.849, 0.798`
+(median `0.800`); median p99 and process-CPU ratios were `1.238` and `1.257`.
+The separate packer thread cost more than the modest reduction in I/O groups
+saved, so the code was reverted. Raw paired output is in
+`/tmp/rfc024-dedicated-packer-exact-tmpfs.json`.
