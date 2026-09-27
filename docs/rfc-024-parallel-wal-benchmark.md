@@ -5,6 +5,63 @@ path's dedicated packer thread improved it on tmpfs and left ext4 throughput
 near parity with the previous parallel implementation. The current candidate
 still loses to the leader on tmpfs, so parallel WAL remains opt-in.
 
+## Worker-owned asynchronous data sync (rejected, 2026-09-28)
+
+A prototype removed the sync thread from the parallel runtime. The I/O
+worker consumed group completions, captured the contiguous written prefix,
+and submitted one `IORING_OP_FSYNC` with `IORING_FSYNC_DATASYNC`. Only its
+successful CQE acknowledged the captured prefix; later writes could continue
+while it was outstanding. The moving admission cutoff and conditional
+200-microsecond coalescing deadline were retained. This tested the removal of
+an actual thread handoff, using the unchanged parallel path at `bd1dd558` as
+the control. The leader implementation was not changed.
+
+Five alternating pairs per case used release builds with `--features bench`,
+1 KiB values, and latency sampled every 100 operations. Compilation and tests
+finished before these pairs. Tmpfs used `/dev/shm`: an earlier exploratory
+series hit `/tmp`'s user quota and is excluded from this table.
+
+| Case | Puts / writers / SST target | Median paired throughput ratio, async/control | Median paired p99 ratio |
+| --- | --- | ---: | ---: |
+| Ext4, one writer | 5k / 1 / 1 GiB | 1.003 | 1.005 |
+| Ext4, rotation | 20k / 4 / 1 MiB | 1.000 | 0.920 |
+| Ext4, WAL-isolated | 50k / 16 / 1 GiB | 0.787 | 1.338 |
+| Tmpfs, one writer | 20k / 1 / 1 GiB | 0.838 | 0.972 |
+| Tmpfs, original case | 200k / 4 / 1 MiB | 0.913 | 1.007 |
+
+The one- and four-writer ext4 pairs had whole-device write-latency averages
+of roughly 0.15–0.16 ms. The 16-writer series encountered the known latency
+cliff in both arms (0.11–1.60 ms per device write across the series), so its
+ratio is not an isolated estimate of the code's cost. Neither stable ext4
+case establishes a throughput gain. The prototype reached 16 in-flight groups
+and 16 outstanding write SQEs in the high-concurrency runs.
+
+On tmpfs, the one-writer median fell from 67,548 to 56,808 puts/s. The
+control spent 2.86 ms in 20,000 synchronous data-sync calls; the prototype
+spent 77.42 ms in its 20,000 submission-to-CQE-consumption intervals. These
+measure different boundaries: the asynchronous interval also includes
+scheduling and completion delivery. Removing the userspace sync thread did
+not remove the sync round trip. In the original four-writer case, median
+sync count also rose from 115,834 to 148,786, reducing useful coalescing.
+
+The prototype passed 36 focused default-feature-plus-`bench` tests, including
+recovery and WAL-full rotation. Full crash/failpoint adaptation was not
+completed after this performance screen failed. The Rust changes were
+reverted; no runtime selector or alternative production path was retained.
+This rejects this asynchronous-sync design, not all ways of reducing
+pipeline handoffs.
+
+Raw paired results are in `/tmp/rfc024-async-sync-clean-bench.jsonl` and
+`/tmp/rfc024-async-sync-16-bench.jsonl`. The temporary prototype patch is
+`/tmp/rfc024-async-sync-prototype.patch`. The benchmark commands use:
+
+```text
+write-perf --suite legacy --preset default --wal --bench wal_concurrent \
+  --num <puts> --threads <writers> --value-size 1024 \
+  --target-sst-size <bytes> --latency-sample-every 100 --output json \
+  --wal-io-mode parallel --path <disposable path on the selected filesystem>
+```
+
 ## Current ext4 bottleneck: partly filled sync barriers
 
 ### Current-binary ext4 adoption-gate check (2026-09-27)
@@ -1344,18 +1401,18 @@ measured before the change, and five one-writer pairs gave `0.237, 0.246,
 0.270, 0.290, 0.290` (median `0.270`) against `0.26`.
 
 The one-writer case is the discriminating one, and it did not move. The inline
-sync can only run when the outstanding SQE count is zero, and a lone writer
-issuing back-to-back commits almost never leaves the ring drained, so
-steady-state syncs still ran on the coordinator. The four-writer range
+sync was gated on the absence of outstanding SQEs, but this experiment did
+not report how often it actually took the inline path. A synchronous lone
+writer necessarily completes its write before it can finish its durability
+wait, so lack of an idle opportunity cannot be assumed. The four-writer range
 straddles the pre-change pairs, and leader throughput drifted from 189k to
 155k across the one-writer series, so the apparent gain is not separable from
 drift. The code was reverted.
 
-The useful result is negative: **the worker-to-coordinator handoff is not the
-bottleneck.** One writer still runs the producer -> worker -> coordinator ->
-producer relay per commit at about `0.27` of the leader, so the cost is the
-relay itself rather than where the `fdatasync` is called. Moving work between
-those threads does not help; only not being a relay at low concurrency would.
+This prototype did not demonstrate a gain. Without path-activation counts,
+it does not isolate the cost of the worker-to-coordinator handoff or prove
+that moving durability coordination cannot help. The one-writer result still
+shows substantial pipeline latency that needs a measured explanation.
 
 ## Measured bottleneck and where the work goes next
 
@@ -1409,10 +1466,10 @@ on the WAL-isolated workload and disappear on the exact case, which
 interleaves flush and compaction with commits; that reading of the pattern is
 an inference from the paired results, not a separately isolated test.
 
-The conclusion this report supports is that the exact tmpfs case is not
-reachable by this architecture. It asks a multi-threaded relay to beat an
-inline path on a filesystem where the operation the relay exists to overlap
-costs almost nothing. The candidate's win is on device-backed storage, where
+The current implementation has not met the exact tmpfs gate. Cheap syncs
+leave little I/O latency to hide, but the rejected prototypes do not prove
+that a redesigned parallel pipeline cannot meet it. The candidate's win is
+on device-backed storage, where
 it clears the gate on the WAL-isolated case (`12.9` median paired gain,
 interval `5.3`-`17.9`).
 
@@ -1421,8 +1478,9 @@ parallel path. Its measured cost was on the default leader
 path, where commits are bound by the serialized submit: the elected leader
 waits for its group's writes and `fdatasync` before the next group can submit,
 which is why solo commit groups rose from 10,859 to 26,735 after the PITR
-sequencer landed. Further work on that regression should target the leader
-path's submit model rather than this pipeline.
+sequencer landed. Further optimization should target the parallel path and
+measure it against an unchanged control; this observation does not justify
+redirecting that work into leader-path optimization.
 
 ### Same-session pre-PITR ext4 comparison
 
