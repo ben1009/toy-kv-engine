@@ -877,3 +877,29 @@ This removes a small coordinator cost; it does not fix the underlying solo-
 group count, and parallel WAL remains slower than leader WAL on the original
 tmpfs workload. The ext4 throughput result is near parity, so this is not an
 adoption-gate result.
+
+### Wake durability waiters only after durability or poison
+
+**Run date:** 2026-09-27.
+
+The coordinator previously called `notify_all` after every successful write
+group completion, when only the written frontier had advanced. Durability
+waiters cannot return until `fdatasync` advances the durable frontier. The
+candidate retains immediate notification on group failure and the existing
+notifications on successful sync, sync failure, and terminal shutdown.
+
+Five alternating pairs of the exact 200,000-put tmpfs workload compared
+normal release binaries without `--profile`. Candidate/control median ratios
+were `1.140` for throughput, `0.830` for sampled p99, and `0.847` for process
+CPU. All five throughput pairs favored the candidate. On the repository's ext4
+mount, ten 20,000-put pairs had median ratios of `1.026` for throughput,
+`1.002` for sampled p99, and `0.874` for process CPU. Ext4 had large external
+latency swings: one candidate run and three runs spanning both arms fell far
+below the usual 5.8–6.1k puts/s range. Those outliers limit the strength of
+the device-backed throughput conclusion. Raw results are in
+`/tmp/rfc024-durable-wake-tmpfs.json`, `/tmp/rfc024-durable-wake-ext4.json`,
+and `/tmp/rfc024-durable-wake-ext4-repeat.json`.
+
+The change passed 65 parallel-path tests, all-feature Clippy, and formatting
+checks. It reduces futile writer wakeups, but does not reduce the solo-group
+count or close the full tmpfs gap to leader WAL.

@@ -881,6 +881,7 @@ fn drain_ready_results(inner: &RuntimeInner, completions: &Receiver<GroupWriteRe
 fn process_group_result(inner: &RuntimeInner, result: GroupWriteResult) {
     #[cfg(feature = "chaos-testing")]
     let result_end = result.tickets.end;
+    let failed = result.error.is_some();
     let mut state = inner.durability.state.lock();
     #[cfg(feature = "chaos-testing")]
     let out_of_order_completion =
@@ -925,7 +926,11 @@ fn process_group_result(inner: &RuntimeInner, result: GroupWriteResult) {
     debug_assert!(state.durable_frontier <= state.written_frontier);
     #[cfg(feature = "chaos-testing")]
     let later_group_remains_outside_prefix = state.written_frontier < result_end;
-    inner.durability.changed.notify_all();
+    // A successful write CQE only advances the written frontier. Durability
+    // waiters can finish after fdatasync; poison must wake them immediately.
+    if failed {
+        inner.durability.changed.notify_all();
+    }
     drop(state);
 
     #[cfg(feature = "chaos-testing")]
