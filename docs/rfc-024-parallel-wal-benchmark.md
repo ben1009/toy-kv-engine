@@ -934,3 +934,90 @@ was reverted. Raw results are in `/tmp/rfc024-conditional-eventfd-tmpfs.json`,
 `/tmp/rfc024-conditional-eventfd-tmpfs-repeat.json`,
 `/tmp/rfc024-conditional-eventfd-ext4.json`, and
 `/tmp/rfc024-conditional-eventfd-ext4-repeat.json`.
+
+### Candidate CPU attribution on the exact case (measurement)
+
+**Run date:** 2026-09-27.
+
+Two alternating pairs of the exact tmpfs regression case (200,000 puts, four
+writers, 1 KiB values, 1 MiB SST target, WAL enabled, PITR disabled, normal
+release build) reproduced the normal-release row above: parallel/leader
+throughput was `99,112 / 161,684` and `110,001 / 183,389` ops/s, ratios `0.613`
+and `0.600`. Process CPU in the first pair was 2,649 ms (1,178 user / 1,471
+system) for the leader against 5,280 ms (2,537 / 2,743) for the candidate, or
+3.25x CPU per completed operation (16.4 us against 53.3 us per put); `perf
+stat` task-clock was 3,498 ms against 6,005 ms. The candidate is not
+CPU-starved but it spends far more CPU per commit than the leader for fewer
+commits.
+
+Per-thread CPU was sampled from `/proc/<pid>/task/*/stat` every 50 ms, keeping
+the largest `utime + stime` seen for each thread. This host's `perf stat
+--per-thread` cannot be combined with a command, and `perf record` collected
+only startup samples for these runs, so the sampler is the attribution used
+here. One-writer pairs of the same workload isolate pipeline overhead because
+no commit can coalesce with another:
+
+| Thread | leader | parallel |
+| --- | ---: | ---: |
+| producing writer | 0.62 s | 1.12 s |
+| engine runtime workers | 0.53 s | 1.17 s |
+| `wal-io-worker` (three threads) | - | 0.02 s each |
+| `wal-sync-coordinator` | - | below the reported set |
+
+The candidate's dedicated WAL threads are cold: the I/O worker consumes about
+0.02 s and the sync coordinator never reached the reported set, so the added
+cost is on the producing writer thread and on the engine's runtime threads
+rather than in the worker or coordinator loops. The single-writer pair lost
+183,385 to 47,039 ops/s (`0.26`), with no second writer available to overlap
+the round trip; that is the pipeline's per-commit latency showing through
+unhidden. It also matches the exact case's 200,000 solo groups: the parallel
+path pays a full handoff per commit instead of the leader's average of 2.1
+commits per group.
+
+The sampler is coarse: it polls at 50 ms and keeps per-thread maxima, so it
+cannot see threads shorter than a poll interval and its totals are lower than
+`perf stat`'s for the same runs. Leader throughput also moved between pairs
+(161,684 to 183,389 ops/s), consistent with the null spread above, so each rate
+in this section is a single pair and only the direction of the ratio repeated.
+
+Reproduce with:
+
+```text
+perf stat -e task-clock,context-switches,instructions \
+  ./target/release/write-perf --bench wal_concurrent --num 200000 --threads 4 \
+  --value-size 1024 --wal --wal-io-mode {leader,parallel} \
+  --target-sst-size 1048576 --output json --path <tmpfs path>
+```
+
+Artifacts from this session are under `/tmp/claude-perf/` and are transient;
+the command above is the durable record.
+
+### Idle-worker sync (rejected)
+
+**Run date:** 2026-09-27.
+
+The I/O worker was given the sync itself to run whenever it had nothing
+staged, in flight, or queued, guarded by a one-sync-in-flight gate and skipped
+once the worker's own poison boundary was set, which kept the poisoned path on
+the coordinator. The intent was to drop the worker -> coordinator -> waiter
+wakeup chain for batches that cannot overlap anything. All 1,232 library tests
+passed.
+
+Five paired tmpfs runs of the exact case gave parallel/leader ratios `0.573,
+0.611, 0.645, 0.674, 0.699` (median `0.645`) against `0.613` and `0.600`
+measured before the change, and five one-writer pairs gave `0.237, 0.246,
+0.270, 0.290, 0.290` (median `0.270`) against `0.26`.
+
+The one-writer case is the discriminating one, and it did not move. The inline
+sync can only run when the outstanding SQE count is zero, and a lone writer
+issuing back-to-back commits almost never leaves the ring drained, so
+steady-state syncs still ran on the coordinator. The four-writer range
+straddles the pre-change pairs, and leader throughput drifted from 189k to
+155k across the one-writer series, so the apparent gain is not separable from
+drift. The code was reverted.
+
+The useful result is negative: **the worker-to-coordinator handoff is not the
+bottleneck.** One writer still runs the producer -> worker -> coordinator ->
+producer relay per commit at about `0.27` of the leader, so the cost is the
+relay itself rather than where the `fdatasync` is called. Moving work between
+those threads does not help; only not being a relay at low concurrency would.
