@@ -7,6 +7,41 @@ still loses to the leader on tmpfs, so parallel WAL remains opt-in.
 
 ## Current ext4 bottleneck: partly filled sync barriers
 
+### Current-binary ext4 adoption-gate check (2026-09-27)
+
+After the moving admission cutoff, the same release binary alternated leader
+and parallel WAL on the device-backed ext4 mount. Each run used 1 KiB values
+and sampled latency every 100 operations. The representative WAL-isolated
+case used 50,000 puts, 16 writers, and a 1 GiB SST target (five pairs). The
+original regression case used 200,000 puts, four writers, and a 1 MiB SST
+target (five pairs). The one-writer guard used 5,000 puts and a 1 GiB target
+(five pairs).
+
+| Ext4 case | Leader median puts/s | Parallel median puts/s | Median paired throughput ratio | 95% bootstrap interval | Median paired p99 ratio |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| WAL-isolated, 16 writers | 13,128 | 20,962 | 1.595 | 1.043–1.663 | 0.723 |
+| Original, four writers | 2,825 | 5,979 | 1.650 | 1.084–2.644 | 0.811 |
+| WAL-isolated, one writer | 1,761 | 1,722 | 0.975 | 0.390–0.994 | 1.013 |
+
+The intervals are exact percentile intervals from resampling the five paired
+ratios with replacement. The 16-writer median exceeds the 10% throughput
+threshold and its interval excludes parity. The original four-writer paired
+ratios were `1.084, 1.650, 2.425, 2.644, 1.112`; the one-writer ratios were
+`0.975, 0.390, 0.994, 0.974, 0.988`. The one-writer median stays within the
+5% throughput guard, but one run suffered a severe parallel sync stall.
+
+Two same-binary leader/leader null pairs on the original workload changed
+throughput by `0.708×` and `1.226×` and sampled p99 by `4.592×` and `0.272×`.
+The worst inverse throughput swing was `1.412×`. The four-writer median
+parallel gain exceeds that observed null swing, but its bootstrap lower bound
+does not. Individual parallel/leader sampled-p99 ratios ranged from `0.149`
+to `3.988` in the four-writer case, from `0.585` to `1.190` at 16 writers,
+and from `0.984` to `7.783` at one writer. Thus the representative ext4
+throughput criterion passes, while repeatability beyond the null spread and
+the RFC's p99-within-10% matrix criterion do not have a clean passing result.
+The current build also has no same-session pre-PITR comparison. Keep the
+parallel path opt-in and the leader path as default.
+
 ### Post-cutoff depth and completion-map probes (2026-09-27)
 
 After the moving admission cutoff landed, the 16-writer, 1-GiB-SST ext4
