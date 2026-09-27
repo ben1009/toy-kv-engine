@@ -1541,3 +1541,29 @@ effect was absent. Tmpfs four-writer p99 worsened while throughput ratios
 ranged from 0.814 to 1.230. The probe was removed; no production code or
 public selector was added. Raw paired records are in
 `/tmp/rfc024-leader-yield-bench.jsonl` (transient).
+
+### Parallel WAL debug-invariant lock probe (rejected)
+
+**Run date:** 2026-09-27. The parallel packer and sync coordinator read the
+admission state for ticket/offset `debug_assert!` checks. A probe moved those
+reads inside the assertions so release builds need not acquire an admission
+mutex only to check a debug invariant. Five alternating pairs compared the
+unchanged parallel WAL with that source change. All cases used 1 KiB values,
+PITR off, and the same release profile and benchmark feature.
+
+| Case | Median candidate/baseline throughput | Median p99 ratio | Median process CPU ratio |
+| --- | ---: | ---: | ---: |
+| tmpfs, four writers, 200k puts, 1 MiB SST | 0.984 | 0.986 | 1.027 |
+| ext4, 16 writers, 50k puts, 1 GiB SST | 0.998 | 0.839 | 1.045 |
+| ext4, four writers, 20k puts, 1 MiB SST | 0.988 | 1.032 | 1.063 |
+| ext4, one writer, 5k puts, 1 GiB SST | 0.990 | 0.992 | 0.987 |
+
+The tmpfs exact-case throughput ratios were 0.989, 0.985, 0.969, 0.984,
+and 0.950. The ext4 16-writer ratios ranged from 0.971 to 1.028. Two ext4
+four-writer pairs crossed the known device-latency cliff, so they cannot
+establish a code effect. No workload showed a repeatable throughput gain;
+the change was removed. This does not prove the source-level locks were on
+the critical path: the compiler may already eliminate them in release code,
+or their cost may be too small to measure against the pipeline relay. Raw
+paired records are in `/tmp/rfc024-parallel-debug-lock-bench.jsonl`
+(transient).
