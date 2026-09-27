@@ -100,7 +100,6 @@ enum WalIoModeArg {
     #[default]
     Leader,
     Parallel,
-    Adaptive,
 }
 
 impl From<WalIoModeArg> for WalIoMode {
@@ -108,7 +107,6 @@ impl From<WalIoModeArg> for WalIoMode {
         match mode {
             WalIoModeArg::Leader => Self::Leader,
             WalIoModeArg::Parallel => Self::Parallel,
-            WalIoModeArg::Adaptive => Self::Adaptive,
         }
     }
 }
@@ -118,7 +116,6 @@ impl WalIoModeArg {
         match self {
             Self::Leader => "leader",
             Self::Parallel => "parallel",
-            Self::Adaptive => "adaptive",
         }
     }
 }
@@ -8017,19 +8014,14 @@ fn validate_run_mode(cfg: &HarnessConfig, bench_arg: Option<&str>) -> Result<()>
         !(cfg.prepare_golden && bench_arg.is_some()),
         "--prepare-golden does not support --bench"
     );
-    if cfg.wal_io_mode != WalIoModeArg::Leader {
+    if cfg.wal_io_mode == WalIoModeArg::Parallel {
         let is_supported_wal_workload =
             matches!(bench_arg, Some("wal_concurrent" | "wal_batch_concurrent"));
         anyhow::ensure!(
             is_supported_wal_workload,
-            "--wal-io-mode {} requires --bench wal_concurrent or wal_batch_concurrent",
-            cfg.wal_io_mode.as_str()
+            "--wal-io-mode parallel requires --bench wal_concurrent or wal_batch_concurrent"
         );
-        anyhow::ensure!(
-            !cfg.pitr,
-            "--wal-io-mode {} does not support --pitr",
-            cfg.wal_io_mode.as_str()
-        );
+        anyhow::ensure!(!cfg.pitr, "--wal-io-mode parallel does not support --pitr");
     }
 
     Ok(())
@@ -8058,21 +8050,19 @@ mod tests {
 
     #[test]
     fn parallel_wal_mode_is_scoped_to_concurrent_wal_workloads() {
-        for mode in ["parallel", "adaptive"] {
-            for workload in ["wal_concurrent", "wal_batch_concurrent"] {
-                let args = Args::try_parse_from([
-                    "write-perf",
-                    "--wal-io-mode",
-                    mode,
-                    "--bench",
-                    workload,
-                ])
-                .expect("parse WAL selector");
-                let cfg = HarnessConfig::from_args(args);
+        for workload in ["wal_concurrent", "wal_batch_concurrent"] {
+            let args = Args::try_parse_from([
+                "write-perf",
+                "--wal-io-mode",
+                "parallel",
+                "--bench",
+                workload,
+            ])
+            .expect("parse parallel WAL selector");
+            let cfg = HarnessConfig::from_args(args);
 
-                assert_eq!(cfg.wal_io_mode.as_str(), mode);
-                validate_run_mode(&cfg, Some(workload)).expect("supported selector scope");
-            }
+            assert_eq!(cfg.wal_io_mode, WalIoModeArg::Parallel);
+            validate_run_mode(&cfg, Some(workload)).expect("supported selector scope");
         }
 
         let args = Args::try_parse_from([
