@@ -11,7 +11,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
-use crossbeam_channel::{Receiver, Sender, TryRecvError, unbounded};
+use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
 use crossbeam_queue::ArrayQueue;
 use parking_lot::{Condvar, Mutex, MutexGuard};
 
@@ -304,7 +304,7 @@ impl ParallelWalRuntime {
         let worker_client = worker.client();
         let sync_progress = worker.sync_progress();
         let worker_completions = worker.take_completions();
-        let (packer_failures_tx, packer_failures_rx) = unbounded();
+        let packer_failures_tx = worker.failure_sender();
         let durability = Arc::new(DurabilityShared {
             state: Mutex::new(DurabilityState::default()),
             changed: Condvar::new(),
@@ -337,14 +337,8 @@ impl ParallelWalRuntime {
         let coordinator_inner = Arc::clone(&inner);
         let coordinator = match thread::Builder::new()
             .name("wal-sync-coordinator".to_owned())
-            .spawn(move || {
-                run_sync_coordinator(
-                    sync_file,
-                    worker_completions,
-                    packer_failures_rx,
-                    coordinator_inner,
-                )
-            }) {
+            .spawn(move || run_sync_coordinator(sync_file, worker_completions, coordinator_inner))
+        {
             Ok(join) => join,
             Err(error) => {
                 let _ = worker.close();
@@ -823,60 +817,18 @@ fn report_packer_failure(inner: &RuntimeInner, ticket: u64, error: &anyhow::Erro
 
 fn run_sync_coordinator(
     sync_file: Arc<File>,
-    worker_completions: Receiver<GroupWriteResult>,
-    packer_failures: Receiver<GroupWriteResult>,
+    completions: Receiver<GroupWriteResult>,
     inner: Arc<RuntimeInner>,
 ) -> Result<()> {
-    let disconnected_worker = crossbeam_channel::never::<GroupWriteResult>();
-    let disconnected_packer = crossbeam_channel::never::<GroupWriteResult>();
-    let mut worker_completions = worker_completions;
-    let mut packer_failures = packer_failures;
-    let mut worker_open = true;
-    let mut packer_open = true;
     let mut last_sync_latency = None;
 
-    while worker_open || packer_open {
-        crossbeam_channel::select! {
-            recv(worker_completions) -> result => {
-                match result {
-                    Ok(result) => process_group_result(&inner, result),
-                    Err(_) => {
-                        worker_open = false;
-                        worker_completions = disconnected_worker.clone();
-                    }
-                }
-            }
-            recv(packer_failures) -> result => {
-                match result {
-                    Ok(result) => process_group_result(&inner, result),
-                    Err(_) => {
-                        packer_open = false;
-                        packer_failures = disconnected_packer.clone();
-                    }
-                }
-            }
-        }
+    while let Ok(result) = completions.recv() {
+        process_group_result(&inner, result);
         #[cfg(all(test, feature = "chaos-testing"))]
         crate::chaos::failpoint::before_parallel_wal_result_drain();
-        drain_ready_results(
-            &inner,
-            &mut worker_completions,
-            &mut packer_failures,
-            &mut worker_open,
-            &mut packer_open,
-            &disconnected_worker,
-            &disconnected_packer,
-        );
+        drain_ready_results(&inner, &completions);
         if last_sync_latency.is_some_and(|latency| latency >= SYNC_COALESCE_MIN_SYNC) {
-            coalesce_admitted_prefix(
-                &inner,
-                &mut worker_completions,
-                &mut packer_failures,
-                &mut worker_open,
-                &mut packer_open,
-                &disconnected_worker,
-                &disconnected_packer,
-            );
+            coalesce_admitted_prefix(&inner, &completions);
         }
         if let Some(latency) = synchronize_written_prefix(&sync_file, &inner)? {
             last_sync_latency = Some(latency);
@@ -891,18 +843,7 @@ fn run_sync_coordinator(
     Ok(())
 }
 
-fn coalesce_admitted_prefix(
-    inner: &RuntimeInner,
-    worker_completions: &mut Receiver<GroupWriteResult>,
-    packer_failures: &mut Receiver<GroupWriteResult>,
-    worker_open: &mut bool,
-    packer_open: &mut bool,
-    disconnected_worker: &Receiver<GroupWriteResult>,
-    disconnected_packer: &Receiver<GroupWriteResult>,
-) {
-    if !*worker_open {
-        return;
-    }
+fn coalesce_admitted_prefix(inner: &RuntimeInner, completions: &Receiver<GroupWriteResult>) {
     let (cutoff, written) = {
         let state = inner.durability.state.lock();
         if state.poison_ticket.is_some() || state.written_frontier <= state.durable_frontier {
@@ -924,56 +865,16 @@ fn coalesce_admitted_prefix(
         let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
             return;
         };
-        crossbeam_channel::select! {
-            recv(*worker_completions) -> result => match result {
-                Ok(result) => process_group_result(inner, result),
-                Err(_) => {
-                    *worker_open = false;
-                    *worker_completions = disconnected_worker.clone();
-                    return;
-                }
-            },
-            recv(*packer_failures) -> result => match result {
-                Ok(result) => process_group_result(inner, result),
-                Err(_) => {
-                    *packer_open = false;
-                    *packer_failures = disconnected_packer.clone();
-                }
-            },
-            default(remaining) => return,
+        match completions.recv_timeout(remaining) {
+            Ok(result) => process_group_result(inner, result),
+            Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => return,
         }
     }
 }
 
-fn drain_ready_results(
-    inner: &RuntimeInner,
-    worker_completions: &mut Receiver<GroupWriteResult>,
-    packer_failures: &mut Receiver<GroupWriteResult>,
-    worker_open: &mut bool,
-    packer_open: &mut bool,
-    disconnected_worker: &Receiver<GroupWriteResult>,
-    disconnected_packer: &Receiver<GroupWriteResult>,
-) {
-    while *worker_open {
-        match worker_completions.try_recv() {
-            Ok(result) => process_group_result(inner, result),
-            Err(TryRecvError::Empty) => break,
-            Err(TryRecvError::Disconnected) => {
-                *worker_open = false;
-                *worker_completions = disconnected_worker.clone();
-            }
-        }
-    }
-
-    while *packer_open {
-        match packer_failures.try_recv() {
-            Ok(result) => process_group_result(inner, result),
-            Err(TryRecvError::Empty) => break,
-            Err(TryRecvError::Disconnected) => {
-                *packer_open = false;
-                *packer_failures = disconnected_packer.clone();
-            }
-        }
+fn drain_ready_results(inner: &RuntimeInner, completions: &Receiver<GroupWriteResult>) {
+    while let Ok(result) = completions.try_recv() {
+        process_group_result(inner, result);
     }
 }
 

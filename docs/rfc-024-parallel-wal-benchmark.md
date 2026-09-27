@@ -851,3 +851,29 @@ waiting to accumulate tickets has already failed on the exact workload, and
 removing benchmark counters is not a performance fix. Any candidate must be
 compared against the same normal release binary on this case and checked on a
 device-backed filesystem before adoption.
+
+### Shared WAL completion channel
+
+**Run date:** 2026-09-27.
+
+The parallel sync coordinator formerly selected between the I/O worker's
+completion channel and a separate packer-failure channel for each result. Both
+now send to one channel. The normal path uses one blocking receive and drains
+ready results with `try_recv`; the packer-error sender is dropped before worker
+shutdown, so channel disconnection still marks both producers finished.
+
+Ten alternating pairs of the exact 200,000-put, four-writer, 1-MiB-SST tmpfs
+workload used normal release binaries without `--profile`. Candidate/control
+throughput had a median ratio of `1.062` and favored the candidate in nine of
+ten pairs. Median sampled p99 ratio was `1.037`, with mixed individual runs.
+Five 20,000-put pairs on the repository's ext4 mount had throughput ratios
+`1.018, 1.011, 1.007, 1.023, 1.003` (median `1.011`); median sampled p99
+ratio was `0.946`. Raw results are in `/tmp/rfc024-one-channel-tmpfs.json`,
+`/tmp/rfc024-one-channel-tmpfs-repeat.json`, and
+`/tmp/rfc024-one-channel-ext4-real.json`. The change passed 65 parallel-path
+tests, all-feature Clippy, and formatting checks.
+
+This removes a small coordinator cost; it does not fix the underlying solo-
+group count, and parallel WAL remains slower than leader WAL on the original
+tmpfs workload. The ext4 throughput result is near parity, so this is not an
+adoption-gate result.

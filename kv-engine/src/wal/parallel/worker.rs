@@ -1450,6 +1450,7 @@ pub(crate) struct IoWorker<B: WorkerBuffer = DirectBuf> {
     wake: Arc<WorkerWake>,
     sync_progress: Arc<WalSyncProgress>,
     completions: Option<Receiver<GroupWriteResult>>,
+    failure_events: Sender<GroupWriteResult>,
     join: Option<JoinHandle<Result<()>>>,
     shutdown_sent: bool,
 }
@@ -1480,6 +1481,7 @@ impl<B: WorkerBuffer> IoWorker<B> {
     pub(crate) fn spawn(wal_file: Arc<File>, buffer_pool: Arc<ArrayQueue<B>>) -> Result<Self> {
         let (command_tx, command_rx) = unbounded();
         let (completion_tx, completion_rx) = unbounded::<GroupWriteResult>();
+        let failure_events = completion_tx.clone();
         let (startup_tx, startup_rx) = bounded::<Result<()>>(1);
         let slots = Arc::new(GroupSlots {
             state: Mutex::new(SlotState {
@@ -1538,6 +1540,7 @@ impl<B: WorkerBuffer> IoWorker<B> {
                 wake,
                 sync_progress,
                 completions: Some(completion_rx),
+                failure_events,
                 join: Some(join),
                 shutdown_sent: false,
             }),
@@ -1572,6 +1575,10 @@ impl<B: WorkerBuffer> IoWorker<B> {
         self.completions
             .take()
             .expect("WAL worker completions may be transferred only once")
+    }
+
+    pub(crate) fn failure_sender(&self) -> Sender<GroupWriteResult> {
+        self.failure_events.clone()
     }
 
     pub(crate) fn completions(&self) -> &Receiver<GroupWriteResult> {
@@ -3161,13 +3168,14 @@ mod tests {
             }),
             available: Condvar::new(),
         });
-        let (_completion_tx, completions) = crossbeam_channel::unbounded();
+        let (failure_events, completions) = crossbeam_channel::unbounded();
         let mut worker: IoWorker<DirectBuf> = IoWorker {
             commands: command_tx,
             slots,
             wake: Arc::new(WorkerWake::new().expect("eventfd")),
             sync_progress: Arc::new(WalSyncProgress::default()),
             completions: Some(completions),
+            failure_events,
             join: Some(join),
             shutdown_sent: false,
         };
