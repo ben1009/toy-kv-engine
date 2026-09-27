@@ -7,6 +7,38 @@ still loses to the leader on tmpfs, so parallel WAL remains opt-in.
 
 ## Current ext4 bottleneck: partly filled sync barriers
 
+### Bounded moving admission cutoff (2026-09-27)
+
+The 200-microsecond coalescing window originally captured `next_ticket` once
+at its start. Tickets admitted while it waited for write completions could
+not join that sync, even if their CQEs arrived before the fixed deadline. The
+opt-in coordinator now rereads the admission cutoff after each completion.
+The deadline remains fixed, so continuous admission cannot keep a sync waiting
+indefinitely. The group failure and contiguous written-prefix checks still
+apply before `fdatasync` captures its target.
+
+On the 50,000-put, 16-writer, 1 KiB-value ext4 workload with a 1 GiB SST
+target, five alternating pairs gave moving/fixed throughput ratios of `2.836,
+1.194, 1.164, 1.116, 1.191` (median `1.191`). The first fixed-cutoff run
+hit the known ext4 latency cliff; excluding that pair, the four ratios were
+`1.116`–`1.194`. Median sync calls fell from 4,611 to 3,314 per 50,000 puts.
+The median paired sampled-p99 ratio was `0.874`; one of five pairs had a
+slightly higher candidate p99 (`1.017`).
+
+Six alternating pairs with a 1 MiB SST target gave throughput gains of
+`6.9%`–`10.1%` (median `8.9%`). Their median paired sampled-p99 ratio was
+`1.020`, with individual ratios from `0.839` to `1.281`; tail latency is not
+yet stable enough to claim an improvement. Three four-writer ext4 pairs had
+a median throughput ratio of `1.007`, with the known device stall affecting
+both arms. Three four-writer tmpfs pairs had a median ratio of `1.008` but
+ranged from `0.832` to `1.081`, so there is no established tmpfs gain.
+
+Increasing the original fixed coalescing wait from 200 to 300 microseconds
+was rejected: five 16-writer ext4 pairs had only a `1.018` median throughput
+ratio and a `1.169` median paired sampled-p99 ratio. The moving cutoff keeps
+the accepted 200-microsecond deadline and targets unfilled barriers rather
+than adding a longer delay.
+
 The opt-in pipeline now submits multiple groups concurrently, but durable
 acknowledgement still passes through one ordered `fdatasync` coordinator. On a
 50,000-put, 16-writer, 1 KiB-value workload with a 1 GiB SST target, the

@@ -27,9 +27,9 @@ const NORMAL_ACTIVE_BUFFER_BUDGET: u64 = 64 * 1024 * 1024;
 const MAX_BUFFER_CAPACITY: u64 = 240 * 1024 * 1024;
 const WAL_HEADER_END: u64 = 4096;
 const PACKER_GROUP_MAX_TICKETS: usize = 8;
-// Wait only for tickets already admitted when a written prefix is ready to sync.
-// Skip the wait when the prior sync was cheap; new admission cannot extend the
-// deadline or the captured cutoff.
+// Wait for tickets admitted during a bounded window when a written prefix is
+// ready to sync. Skip the wait when the prior sync was cheap; new admission
+// cannot extend the deadline.
 const SYNC_COALESCE_WAIT: Duration = Duration::from_micros(200);
 const SYNC_COALESCE_MIN_SYNC: Duration = Duration::from_micros(100);
 
@@ -844,20 +844,17 @@ fn run_sync_coordinator(
 }
 
 fn coalesce_admitted_prefix(inner: &RuntimeInner, completions: &Receiver<GroupWriteResult>) {
-    let (cutoff, written) = {
+    {
         let state = inner.durability.state.lock();
         if state.poison_ticket.is_some() || state.written_frontier <= state.durable_frontier {
             return;
         }
-        (inner.admission.lock().next_ticket, state.written_frontier)
-    };
-    if cutoff <= written {
-        return;
     }
 
     let deadline = Instant::now() + SYNC_COALESCE_WAIT;
     loop {
         let state = inner.durability.state.lock();
+        let cutoff = inner.admission.lock().next_ticket;
         if state.poison_ticket.is_some() || state.written_frontier >= cutoff {
             return;
         }
