@@ -30,7 +30,7 @@ const PACKER_GROUP_MAX_TICKETS: usize = 8;
 // Wait only for tickets already admitted when a written prefix is ready to sync.
 // Skip the wait when the prior sync was cheap; new admission cannot extend the
 // deadline or the captured cutoff.
-const SYNC_COALESCE_WAIT: Duration = Duration::from_micros(100);
+const SYNC_COALESCE_WAIT: Duration = Duration::from_micros(200);
 const SYNC_COALESCE_MIN_SYNC: Duration = Duration::from_micros(100);
 
 #[derive(Debug)]

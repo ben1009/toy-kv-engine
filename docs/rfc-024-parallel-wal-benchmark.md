@@ -5,6 +5,45 @@ path's dedicated packer thread improved it on tmpfs and left ext4 throughput
 near parity with the previous parallel implementation. The current candidate
 still loses to the leader on tmpfs, so parallel WAL remains opt-in.
 
+## Current ext4 bottleneck: partly filled sync barriers
+
+The opt-in pipeline now submits multiple groups concurrently, but durable
+acknowledgement still passes through one ordered `fdatasync` coordinator. On a
+50,000-put, 16-writer, 1 KiB-value workload with a 1 GiB SST target, the
+100-microsecond sync-coalescing window took a median 2.962 seconds end to end.
+The coordinator spent 1.787 seconds inside `fdatasync` (about 60% of elapsed
+time) and made 5,087 sync calls, covering only 9.83 tickets per sync with
+16 writer threads. The parallel worker formed 50,000 solo I/O groups and
+submitted 50,000 write SQEs. Thus more outstanding SQEs alone cannot remove
+the dominant durability barrier or the per-ticket handoff cost.
+
+Increasing the conditional coalescing window from 100 to 200 microseconds let
+already-admitted writes finish before the coordinator captured its sync target.
+It still waits only after the preceding sync took at least 100 microseconds;
+the admission cutoff remains fixed. Five alternating, non-profiled ext4 pairs
+gave candidate/baseline throughput ratios of `1.082, 1.085, 1.091, 1.090,
+1.075` (median `1.085`). Median sync calls fell from 5,087 to 4,522,
+tickets per sync rose from 9.83 to 11.06, aggregate `fdatasync` time fell
+from 1.787 to 1.576 seconds, and wall time fell from 2.962 to 2.744 seconds.
+Median sampled p99 ratio was `0.874`, though one pair was 1.097. This is a
+direct throughput response to fewer partly filled sync barriers, not evidence
+that the NVMe hardware queue was full.
+
+Five pairs with a 1 MiB SST target also favored the 200-microsecond arm. Three
+fast pairs gained 9–11%; two pairs encountered the known ext4 sync-latency
+cliff, one in both arms. Three 50,000-put, four-writer ext4 guard pairs gained
+0.6–3.0%, with lower sampled p99 in all three. Five 200,000-put, four-writer
+tmpfs pairs had a 1.012 median throughput ratio but ranged from 0.844 to
+1.062; same-binary tmpfs null pairs ranged from 0.921 to 1.011. The tmpfs
+tail remains noisy, and the leader WAL stays the default.
+
+With the 200-microsecond window, three alternating same-binary ext4 pairs
+measured about 18,501 puts/s and 4,462 syncs for parallel WAL versus 13,030
+puts/s and 6,083 syncs for leader WAL (medians): a 1.42× throughput gain,
+with median sampled p99 1.966 versus 2.508 ms. Parallel WAL is faster here,
+but its ordered sync stream and solo I/O groups explain why a deeper write
+pipeline does not produce a many-fold speedup.
+
 ## In-flight depth experiment (2026-09-27)
 
 On the ext4 50,000-put, 1 KiB-value, 1 MiB-SST workload, the existing parallel
