@@ -749,3 +749,22 @@ were decisive: throughput ratios were `0.796, 0.800, 0.817, 0.849, 0.798`
 The separate packer thread cost more than the modest reduction in I/O groups
 saved, so the code was reverted. Raw paired output is in
 `/tmp/rfc024-dedicated-packer-exact-tmpfs.json`.
+
+### io_uring SQPOLL (rejected)
+
+**Run date:** 2026-09-27.
+
+This host permits SQPOLL. A prototype enabled a one-millisecond SQPOLL idle
+period for the parallel WAL ring. The worker needed SQPOLL-specific submit
+accounting: the kernel poller can consume an SQE before `submit()` samples the
+queue, so a zero return does not mean that the staged write made no progress.
+
+Three paired 100,000-put tmpfs runs favored SQPOLL, with throughput ratios
+`1.510, 1.419, 1.524`. Ext4 ratios were `1.024, 0.939, 1.261`, amid large
+device-latency swings. SQPOLL used substantially more CPU on ext4 and had
+worse p99 in most pairs. In one run of the original 200,000-put tmpfs workload,
+SQPOLL parallel WAL reached 111k puts/s and 0.374 ms p99, versus 144k puts/s
+and 0.186 ms for leader WAL; measured process CPU was 2.16 times higher.
+SQPOLL therefore did not close the leader gap or satisfy the latency and CPU
+tradeoff, and the prototype was reverted. The paired screen is in
+`/tmp/rfc024-sqpoll-ab.json`.
