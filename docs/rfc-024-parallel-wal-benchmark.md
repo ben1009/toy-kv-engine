@@ -74,6 +74,29 @@ with storage pressure during compaction, but three pairs and one stall cannot
 separate compaction from other device activity. No compaction scheduling change
 was made from this control.
 
+### Thirty-two-group depth follow-up (rejected)
+
+With 32 synchronous writers and a 1 GiB SST target, a profiled 50,000-put
+ext4 run reached the current sixteen-group/sixteen-SQE cap. A prototype that
+raised only the group cap to 32 reached 32 groups and 32 outstanding write
+SQEs, but groups per sync barely changed (16.19 → 16.41 in the profiled runs).
+Five alternating, non-profiled pairs compared the two caps:
+
+| Pair | Sixteen-group ops/s | Thirty-two-group ops/s | Candidate / baseline p99 |
+| --- | ---: | ---: | ---: |
+| 1 | 25,551 | 24,483 | 0.981 |
+| 2 | 24,882 | 24,512 | 1.176 |
+| 3 | 25,609 | 26,025 | 1.263 |
+| 4 | 25,623 | 25,056 | 0.974 |
+| 5 | 25,178 | 25,665 | 0.689 |
+
+Candidate/baseline throughput ratios were `0.958, 0.985, 1.016, 0.978,
+1.019` (median `0.985`); median sampled p99 ratio was `0.981`, with mixed
+individual tails. The extra software depth did not improve this ext4 workload.
+The prototype was reverted, leaving the opt-in path at sixteen groups. This
+does not measure the NVMe hardware queue depth or rule out a benefit for a
+different workload.
+
 ## Run manifest
 
 - Date: 2026-09-26, Asia/Chongqing
