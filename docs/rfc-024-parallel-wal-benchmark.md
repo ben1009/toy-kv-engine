@@ -1625,3 +1625,51 @@ the critical path: the compiler may already eliminate them in release code,
 or their cost may be too small to measure against the pipeline relay. Raw
 paired records are in `/tmp/rfc024-parallel-debug-lock-bench.jsonl`
 (transient).
+
+### Worker-drained admission queue (rejected)
+
+**Run date:** 2026-09-28. The MVCC write-order lock currently spans WAL
+admission and producer-side packing. A prototype shortened that critical
+section to ticket assignment and enqueue, then let the existing parallel WAL
+worker drain the admission queue directly. It removed per-group channel sends
+and producer-side packer locking; the sync coordinator remained unchanged.
+The final variant swapped queued batches into a reusable worker-local queue
+under the admission mutex and packed/preallocated outside that mutex. An idle
+worker used park/unpark; outstanding I/O retained the existing eventfd wakeup.
+No leader-path changes or public mode selector were involved.
+
+Three alternating baseline/candidate pairs per case used release builds with
+`bench`, parallel mode in both arms, 1 KiB values, PITR off, and latency sampling
+every 100 operations. Builds and tests completed before timing began.
+
+| Case | Median paired throughput ratio | Median paired p99 ratio |
+| --- | ---: | ---: |
+| ext4, one writer, 5k puts, 1 GiB SST | 1.020 | 1.663 |
+| ext4, four writers, 20k puts, 1 MiB SST | 1.003 | 1.108 |
+| ext4, 16 writers, 50k puts, 1 GiB SST | 0.949 | 1.052 |
+| tmpfs, one writer, 50k puts, 1 GiB SST | 0.979 | 0.853 |
+| tmpfs, four writers, 200k puts, 1 MiB SST | 0.876 | 1.172 |
+
+The ext4 four-writer intervals stayed near 0.154–0.164 ms/device write.
+Group count fell from 20,000 to about 12,000, but sync count stayed near 5,040
+and throughput ratios were 1.003, 1.002, and 1.017. Coalescing descriptors
+therefore did not materially reduce the durability barriers in this workload.
+The 16-writer pairs crossed device-latency regimes (0.126–2.776 ms/write),
+with throughput ratios 0.904, 0.949, and 1.260; they cannot establish a code
+benefit. The single-writer ext4 result also included a device-latency swing
+and only 50 latency samples per run, so its p99 is not a reliable gate result.
+
+The tmpfs four-writer throughput ratios were 0.915, 0.876, and 0.847. Although
+the prototype reduced both groups and syncs, all three pairs regressed. Two
+earlier variants (eventfd idle waiting and park/unpark with packing under the
+queue lock) also regressed on that workload. These screens reject this
+implementation, not the general possibility of improving admission or batching.
+
+All 46 focused parallel WAL tests passed before the final screen, including
+new prototype tests for shutdown draining more than one in-flight window and
+notification between the idle check and park. The prototype was removed and
+the baseline source restored. Transient reproduction artifacts are
+`/tmp/rfc024_ingress_swap_bench.py`, `/tmp/rfc024-ingress-swap-bench.jsonl`, and
+`/tmp/rfc024-ingress-swap-rejected.patch`; earlier variants are recorded in
+`/tmp/rfc024-ingress-screen-bench.jsonl` and
+`/tmp/rfc024-ingress-park-bench.jsonl`.
