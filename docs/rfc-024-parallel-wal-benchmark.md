@@ -36,6 +36,21 @@ results support keeping the 16-group limit for the opt-in path; they do not
 establish that the SSD itself is saturated or justify changing the default
 from the client-leader WAL.
 
+A follow-up held the workload at 50,000 puts and 16 writers but raised the SST
+target to 1 GiB to remove frequent flush/rotation. Five alternating ext4 pairs
+gave sixteen/eight-group throughput ratios of `1.123, 1.103, 1.137, 1.151,
+1.128` (median `1.128`); paired p99 ratios were `0.894, 1.004, 0.952,
+0.986, 0.955` (median `0.955`). This WAL-isolated result supports the added
+software depth independently of the rotation-heavy case.
+
+Three longer 200,000-put, 1 MiB-SST pairs exposed intermittent ext4 stalls in
+both arms. One eight-group run measured 4,812 ops/s and 21.1 ms p99 while its
+sixteen-group pair measured 15,025 ops/s and 3.6 ms; another pair reversed
+that pattern (13,298/3.8 versus 4,959/22.0). The pair without a stall measured
+13,160 versus 14,712 ops/s (an 11.8% gain). The slow runs cannot be attributed
+to the group limit from these measurements. The cap change is retained for the
+opt-in WAL; the device-backed tail-latency cliff still needs investigation.
+
 ## Run manifest
 
 - Date: 2026-09-26, Asia/Chongqing
@@ -730,7 +745,9 @@ showed a `1.248` median even though those writers cannot fill eight slots.
 Same-binary tmpfs null pairs ranged from `0.692` to `1.175` with four writers
 and `0.883` to `1.110` with sixteen. The tmpfs signal warrants a controlled
 retest, not a cap increase that leaves ext4 and the main four-writer regression
-unchanged. The limit remains eight.
+unchanged. The limit remained eight after this shorter experiment. Later
+50,000-put rotation-heavy and WAL-isolated comparisons above supported raising
+it to sixteen; the two sets of measurements used different run lengths.
 
 The principal cost remains group formation and handoff: the original
 four-writer regression recorded about 200,000 solo parallel I/O groups versus
