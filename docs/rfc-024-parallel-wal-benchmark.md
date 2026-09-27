@@ -904,6 +904,40 @@ The change passed 65 parallel-path tests, all-feature Clippy, and formatting
 checks. It reduces futile writer wakeups, but does not reduce the solo-group
 count or close the full tmpfs gap to leader WAL.
 
+### Current candidate versus leader on ext4
+
+**Run date:** 2026-09-27. After the shared completion channel and durability-
+only waiter wakeup changes, normal release builds of the same source were run
+in both WAL modes on the repository's ext4 mount. The 50,000-put, four-writer,
+1-KiB-value, 1-MiB-SST case used five alternating leader/parallel pairs. The
+parallel/leader throughput ratios were `1.602, 1.597, 1.585, 5.749, 1.569`.
+The fourth leader run fell to 1,035 puts/s while the other four leader runs
+were 3,727-3,851 puts/s; parallel stayed at 5,951-6,043 puts/s. Excluding
+that device-latency outlier, the four paired gains were 57-60%. The median
+paired sampled p99 ratio was `1.013`, with two pairs above 1.10, so this
+measurement does not establish a tail-latency improvement.
+
+Three alternating pairs of the original 200,000-put case used the same build
+and parameters apart from operation count. Throughput ratios were 1.160, 0.921,
+and 2.486; sampled p99 ratios were 3.806, 3.773, and 0.171. Leader throughput
+varied from 2,254 to 3,780 puts/s and parallel throughput from 3,480 to
+5,604 puts/s. This case has not cleared the adoption gate: one pair loses to
+leader and the tail-latency result changes direction with the storage-latency
+swings. Raw runs are under `/tmp/rfc024-current-*-sample.json`,
+`/tmp/rfc024-current-direct-*`, and `/tmp/rfc024-current-200k-ext4-*`.
+
+A separate profiled 200,000-put parallel run reached 5,770 puts/s with a
+2.016-ms sampled p99. It submitted 200,000 solo I/O groups and completed
+54,342 syncs, or 3.68 groups per sync; the maximum observed in-flight groups
+and outstanding write SQEs were both four, matching the four synchronous
+writers. Later write completions occurred during 7,246 sync calls (13.3% of
+syncs). Mean `fdatasync` time was 0.378 ms, while its p50/p95/p99 were
+0.311/0.696/0.984 ms. These counters demonstrate some write/sync overlap but
+do not identify the cause of the unprofiled 200,000-put run-to-run variance.
+The parallel path remains opt-in; further ext4 work needs paired end-to-end
+results on the original case and a stable p99 bound, with tmpfs retained as a
+regression check.
+
 ### In-order completion fast path (rejected)
 
 **Run date:** 2026-09-27.
