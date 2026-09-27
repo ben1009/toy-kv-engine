@@ -42,6 +42,33 @@ the RFC's p99-within-10% matrix criterion do not have a clean passing result.
 The current build also has no same-session pre-PITR comparison. Keep the
 parallel path opt-in and the leader path as default.
 
+### Ext4 sync-cliff device-counter check (2026-09-27)
+
+Six more alternating pairs used the current release binary with 5,000 puts,
+one writer, 1 KiB values, and a 1 GiB SST target. The benchmark driver sampled
+`/sys/block/nvme0n1/stat` every 200 milliseconds while each run executed.
+The counters cover the whole device, including unrelated I/O; they do not
+identify the process that caused a slow interval.
+
+Fast runs in both modes averaged `0.155`–`0.166` milliseconds per completed
+device write and `0.325`–`0.335` milliseconds per WAL `fdatasync`. Slow runs
+averaged `0.466`–`0.782` milliseconds per device write and `0.887`–`1.357`
+milliseconds per WAL `fdatasync`. Device writes stayed near 15,000 and
+sectors written near 110 MB per run in both regimes. Across the 12 runs, the
+device-write-latency and WAL-sync-latency series had Pearson correlation
+`0.989`; throughput moved in the opposite direction (`-0.972`). The slow
+regime affected both leader and parallel WAL. For example, pair four measured
+455 parallel versus 509 leader puts/s, while pair six measured 586 parallel
+versus 1,795 leader puts/s as the device returned to its fast regime between
+arms.
+
+These counters localize the observed cliff to device-level write latency
+experienced during the run. They do not distinguish external traffic from
+filesystem, controller, or device behavior caused by the benchmark itself.
+A code-only WAL change cannot be credited with removing this variability
+without a quieter or dedicated device-backed comparison. No pipeline change
+was made from this diagnostic.
+
 ### Post-cutoff depth and completion-map probes (2026-09-27)
 
 After the moving admission cutoff landed, the 16-writer, 1-GiB-SST ext4
