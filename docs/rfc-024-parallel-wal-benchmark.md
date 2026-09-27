@@ -5,6 +5,37 @@ path's dedicated packer thread improved it on tmpfs and left ext4 throughput
 near parity with the previous parallel implementation. The current candidate
 still loses to the leader on tmpfs, so parallel WAL remains opt-in.
 
+## In-flight depth experiment (2026-09-27)
+
+On the ext4 50,000-put, 1 KiB-value, 1 MiB-SST workload, the existing parallel
+worker reached its eight-group/eight-outstanding-SQE cap with 16 writers. With
+4 and 8 writers, the observed peaks were 4 and 8 respectively: synchronous
+client writes cannot fill more groups than there are writers. Device-wide
+weighted I/O time from `/sys/block/nvme0n1/stat` implied average I/O depths of
+about 1.8, 2.2, and 2.7 at 4, 8, and 16 writers. This is whole-device Linux
+accounting, not NVMe hardware queue depth or a WAL-only utilization measure.
+
+Raising only `MAX_INFLIGHT_GROUPS` from 8 to 16 let a profiled 16-writer run
+reach 16 in-flight groups and 16 outstanding write SQEs. Five alternating,
+non-profiled ext4 pairs with the same arguments measured:
+
+| Pair | Eight-group ops/s | Sixteen-group ops/s | Gain | p99 ms, eight → sixteen |
+| --- | ---: | ---: | ---: | ---: |
+| 1 | 13,307 | 15,242 | 14.5% | 2.813 → 3.378 |
+| 2 | 13,282 | 15,527 | 16.9% | 3.151 → 6.874 |
+| 3 | 13,512 | 14,885 | 10.2% | 3.741 → 3.492 |
+| 4 | 13,275 | 15,284 | 15.1% | 2.857 → 2.831 |
+| 5 | 13,424 | 15,186 | 13.1% | 3.365 → 3.230 |
+
+The median paired throughput gain was 14.5%; median paired p99 ratio was 0.991.
+Pair 2 had a large candidate p99 spike, so the tail-latency effect is not
+settled by these five runs. One exploratory 4-writer control measured 5,905 →
+6,012 ops/s and an 8-writer control 10,021 → 10,488 ops/s. Neither can exercise
+the higher group cap, and neither is a statistical regression test. These
+results support keeping the 16-group limit for the opt-in path; they do not
+establish that the SSD itself is saturated or justify changing the default
+from the client-leader WAL.
+
 ## Run manifest
 
 - Date: 2026-09-26, Asia/Chongqing
