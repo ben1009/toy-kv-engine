@@ -1514,3 +1514,30 @@ experimental mode in production builds. It was removed; leader remains the
 normal path, and these results do not clear the RFC adoption gate. Raw
 records are in `/tmp/rfc024-adaptive-bench.jsonl` and
 `/tmp/rfc024-adaptive-leader-bench.jsonl` (transient).
+
+### Yield before leader election after a slow sync (rejected)
+
+**Run date:** 2026-09-27. A benchmark-only probe remembered whether the
+preceding leader `fdatasync` took at least 100 microseconds. If so, a caller
+with the sole pending v4 ticket yielded once **before** trying to become the
+submit leader, allowing another writer to admit a ticket first. This moved
+the delay outside the leader's exclusive `submitting` window. Five alternating
+pairs compared it with the unchanged release build for each case; all used
+1 KiB values and PITR off.
+
+| Case | Median candidate/baseline throughput | Median p99 ratio | Median commit-group ratio |
+| --- | ---: | ---: | ---: |
+| ext4, four writers, 20k puts, 1 MiB SST | 1.009 | 0.973 | 1.008 |
+| ext4, one writer, 5k puts, 1 GiB SST | 0.999 | 0.998 | 1.000 |
+| tmpfs, four writers, 50k puts, 1 MiB SST | 1.085 | 1.282 | 1.012 |
+| tmpfs, one writer, 20k puts, 1 GiB SST | 1.035 | 0.948 | 1.000 |
+
+The three ext4 four-writer pairs where both device intervals were near
+0.175-0.183 ms/write measured throughput ratios of 0.998, 1.009, and 0.995.
+The other two pairs crossed the known device-latency cliff and cannot be
+credited to the yield. The candidate also formed slightly *more* commit
+groups in three of five ext4 four-writer pairs, so the intended coalescing
+effect was absent. Tmpfs four-writer p99 worsened while throughput ratios
+ranged from 0.814 to 1.230. The probe was removed; no production code or
+public selector was added. Raw paired records are in
+`/tmp/rfc024-leader-yield-bench.jsonl` (transient).
