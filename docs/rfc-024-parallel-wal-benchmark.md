@@ -1044,6 +1044,24 @@ relay's own per-commit cost:
   flight, writes completing during `fdatasync` - but it does not convert into
   throughput on a filesystem whose syncs are cheap.
 
+The default leader path has the same shape of limit. Three runs per writer
+count of the exact tmpfs case with the leader selected gave medians of
+`163,713` at one writer, `153,569` at two, `155,549` at four, and `170,451` at
+eight ops/s (one eight-writer run reached `204,425`). Four writers pushing at
+the leader buy no throughput over one, which is what a serialized per-group
+barrier predicts: the leader waits for its group's writes and `fdatasync`
+before the next group submits, so the run's 1.24 s across 93,978 groups - about
+13 us of wall per group - bounds it rather than the writers do. The
+WAL-isolated matrix above reports the opposite shape (`115,736` at one writer
+rising to `181,751` at four), but each of those cells is a single observation,
+and its one-writer rate sits below the three-run medians here.
+
+If the group loop is the ceiling, the only lever that raises it is more
+commits per group - `2.13` today - rather than a faster sync, which on tmpfs
+costs about `0.19` us per call (`17.749` ms over `93,978` calls). That is
+consistent with the PITR encode work, where a cheaper batch encode raised
+throughput by letting commit groups form larger rather than by saving CPU.
+
 Every attempt to remove or relocate a pipeline handoff was rejected by
 measurement: a dedicated packer thread (`0.800`), completion-triggered packing
 (`0.828`), worker-owned packing (`0.970` on this case against `1.439` on the
