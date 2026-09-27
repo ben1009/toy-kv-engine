@@ -1021,3 +1021,52 @@ bottleneck.** One writer still runs the producer -> worker -> coordinator ->
 producer relay per commit at about `0.27` of the leader, so the cost is the
 relay itself rather than where the `fdatasync` is called. Moving work between
 those threads does not help; only not being a relay at low concurrency would.
+
+## Measured bottleneck and where the work goes next
+
+The candidate is a three-thread relay: a producer admits and packs, the I/O
+worker submits and reaps, and the sync coordinator syncs and wakes. The leader
+path does all three inline on the calling thread. On tmpfs a sync is nearly
+free, so there is little for the overlap to win back, and what remains is the
+relay's own per-commit cost:
+
+- The candidate forms 200,000 solo I/O groups for 200,000 commits, against the
+  leader's 93,978 groups at 2.1 commits each, so it pays a full pipeline round
+  trip per commit rather than per group.
+- One writer, which can coalesce nothing, runs at `0.27` of the leader
+  (183,385 against 47,039 ops/s; `0.237`-`0.290` across five pairs). That is
+  the round trip with nothing hiding it.
+- The dedicated WAL threads are cold: `wal-io-worker` consumes about 0.02 s
+  and the sync coordinator stays below the reporting floor, while the added
+  cost sits on the producing writer thread and on the engine's runtime
+  threads.
+- The overlap the RFC hypothesised is real and measured - four groups in
+  flight, writes completing during `fdatasync` - but it does not convert into
+  throughput on a filesystem whose syncs are cheap.
+
+Every attempt to remove or relocate a pipeline handoff was rejected by
+measurement: a dedicated packer thread (`0.800`), completion-triggered packing
+(`0.828`), worker-owned packing (`0.970` on this case against `1.439` on the
+WAL-isolated one), a two-group cap, SQPOLL, and the idle-worker sync above.
+The changes that were kept - inline storage for single-write groups,
+coalesced worker notifications, the shared completion channel, and
+producer-side queue draining - cut per-thread cost without changing the
+relay's shape, and they did not close the gap either. Pipeline savings appear
+on the WAL-isolated workload and disappear on the exact case, which
+interleaves flush and compaction with commits; that reading of the pattern is
+an inference from the paired results, not a separately isolated test.
+
+The conclusion this report supports is that the exact tmpfs case is not
+reachable by this architecture. It asks a multi-threaded relay to beat an
+inline path on a filesystem where the operation the relay exists to overlap
+costs almost nothing. The candidate's win is on device-backed storage, where
+it clears the gate on the WAL-isolated case (`12.9` median paired gain,
+interval `5.3`-`17.9`).
+
+That leaves this RFC's actual motivation - `wal_concurrent`'s post-PITR gap -
+unaddressed by the parallel path. Its measured cost is on the default leader
+path, where commits are bound by the serialized submit: the elected leader
+waits for its group's writes and `fdatasync` before the next group can submit,
+which is why solo commit groups rose from 10,859 to 26,735 after the PITR
+sequencer landed. Further work on that regression should target the leader
+path's submit model rather than this pipeline.

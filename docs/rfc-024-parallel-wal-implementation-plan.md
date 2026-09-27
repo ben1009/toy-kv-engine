@@ -322,6 +322,13 @@ latency, and confidence gates. Keep the leader path as default. The paired
 results, controls, and measured bottleneck are recorded in the
 [Slice 7 benchmark report](rfc-024-parallel-wal-benchmark.md).
 
+The measured bottleneck is the pipeline's per-commit thread relay, not where
+the `fdatasync` is called: a lone writer, which cannot coalesce, runs at
+`0.27` of the leader, and every attempt to remove or relocate a handoff
+between the pipeline's threads was rejected by measurement. The candidate's
+win is on device-backed storage. Further work on the `wal_concurrent`
+regression should target the leader path's serialized submit.
+
 ## Review and verification cadence
 
 Slices 1-3 stayed dormant or test-only until the worker and coordinator were
