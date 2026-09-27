@@ -938,6 +938,31 @@ The parallel path remains opt-in; further ext4 work needs paired end-to-end
 results on the original case and a stable p99 bound, with tmpfs retained as a
 regression check.
 
+### Ext4 sync-latency cliff and writer concurrency
+
+**Run date:** 2026-09-27. A second profiled run of the 200,000-put,
+four-writer parallel case reproduced the slow state: 2,294 puts/s and
+25.459-ms sampled p99, against 5,770 puts/s and 2.016-ms p99 in the earlier
+profiled run. The slow run's `fdatasync` mean/p99 rose to 1.109/19.756 ms
+from 0.378/0.984 ms; 1,533 sync calls exceeded 10 ms, versus five in the
+fast run. Of those long syncs, 1,491 occurred in the eighth and ninth tenths
+of the slow run's sync sequence. A subsequent profiled leader run reached
+3,569 puts/s, 2.705-ms sampled p99, and 0.802-ms sync p99, with six syncs
+over 10 ms. This localizes the parallel slowdown to sync latency during a
+late-run interval, but does not establish whether parallel write pressure or
+external device activity caused it. Profiles are in
+`/tmp/rfc024-slow-profile-ext4-1.json` and
+`/tmp/rfc024-leader-profile-ext4.json`.
+
+The same-source benchmark build with `bench` enabled was also run without
+`--profile` for three alternating 50,000-put ext4 pairs at eight writers.
+Parallel/leader throughput ratios were 1.630, 1.638, and 1.608; sampled p99
+ratios were 0.723, 0.661, and 0.851. Parallel reached 10,235-10,417 puts/s
+versus 6,325-6,389 for leader. This confirms that the pipeline can use more
+writer concurrency on this filesystem, but the eight-writer, shorter run
+does not resolve the four-writer, 200,000-put latency cliff. Raw runs are in
+`/tmp/rfc024-8writer-ext4-*`.
+
 ### In-order completion fast path (rejected)
 
 **Run date:** 2026-09-27.
