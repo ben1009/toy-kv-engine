@@ -1121,6 +1121,8 @@ fn wal_sync_timestamp() -> Option<std::time::Instant> {
 
 /// Preallocate space and extend `i_size` so later direct writes target an
 /// already-sized range and avoid extending the WAL themselves.
+/// Only allocate the new suffix; revisiting the existing extents adds work
+/// as the WAL grows without reserving any additional space.
 fn preallocate(file: &File, end: u64) -> Result<()> {
     ensure!(
         end <= MAX_WAL_FILE_SIZE,
@@ -1135,8 +1137,8 @@ fn preallocate(file: &File, end: u64) -> Result<()> {
         libc::fallocate(
             file.as_raw_fd(),
             0,
-            0,
-            i64::try_from(end).context("WAL preallocation exceeds i64")?,
+            i64::try_from(len).context("WAL preallocation offset exceeds i64")?,
+            i64::try_from(end - len).context("WAL preallocation length exceeds i64")?,
         )
     };
     if result == 0 {
@@ -1344,6 +1346,7 @@ mod tests {
     #[test]
     fn preallocate_extends_the_file_size_for_parallel_direct_writes() {
         use std::fs::OpenOptions;
+        use std::os::unix::fs::FileExt;
 
         let directory = tempfile::tempdir().expect("create temp directory");
         let file = OpenOptions::new()
@@ -1354,6 +1357,7 @@ mod tests {
             .expect("create WAL file");
         file.set_len(WAL_HEADER_END)
             .expect("write WAL header extent");
+        file.write_all_at(b"header", 0).expect("write header");
 
         preallocate(&file, PREALLOC_BLOCK).expect("preallocate WAL extent");
 
@@ -1361,5 +1365,17 @@ mod tests {
             file.metadata().expect("read WAL metadata").len(),
             PREALLOC_BLOCK
         );
+
+        file.write_all_at(b"batch", PREALLOC_BLOCK - 5)
+            .expect("write existing batch");
+        preallocate(&file, 2 * PREALLOC_BLOCK).expect("extend WAL again");
+        preallocate(&file, PREALLOC_BLOCK).expect("ignore smaller extent");
+        assert_eq!(file.metadata().unwrap().len(), 2 * PREALLOC_BLOCK);
+        let mut header = [0; 6];
+        file.read_exact_at(&mut header, 0).unwrap();
+        assert_eq!(&header, b"header");
+        let mut batch = [0; 5];
+        file.read_exact_at(&mut batch, PREALLOC_BLOCK - 5).unwrap();
+        assert_eq!(&batch, b"batch");
     }
 }

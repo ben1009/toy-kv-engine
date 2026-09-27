@@ -1673,3 +1673,42 @@ the baseline source restored. Transient reproduction artifacts are
 `/tmp/rfc024-ingress-swap-rejected.patch`; earlier variants are recorded in
 `/tmp/rfc024-ingress-screen-bench.jsonl` and
 `/tmp/rfc024-ingress-park-bench.jsonl`.
+
+### Allocate only the growing WAL suffix (2026-09-28)
+
+The parallel preallocator called `fallocate(fd, 0, 0, end)` on every 1 MiB
+extension. It now uses the existing file length as the offset and `end - len`
+as the length. This avoids revisiting the already allocated prefix. The cap,
+file-size extension, unsupported-filesystem fallback, and poison handling are
+unchanged. The leader path was not modified.
+
+Five alternating pairs compared the parallel candidate with `75dd5f8a`, using
+release builds with `bench`, 1 KiB values, PITR off, and latency sampled every
+100 operations. No compilation or tests ran during measurement. Tmpfs used
+`/dev/shm`; ext4 used disposable directories under `target`.
+
+| Case | Puts / writers / SST target | Median paired throughput ratio | Median paired p99 ratio |
+| --- | --- | ---: | ---: |
+| ext4, one writer | 5k / 1 / 1 GiB | 1.002 | 1.003 |
+| ext4, rotation | 20k / 4 / 1 MiB | 1.000 | 0.940 |
+| ext4, growing WAL | 50k / 16 / 1 GiB | 1.005 | 1.034 |
+| tmpfs, growing WAL | 50k / 1 / 1 GiB | 1.192 | 0.915 |
+| tmpfs, original case | 200k / 4 / 1 MiB | 1.017 | 0.904 |
+
+The tmpfs growing-WAL ratios were 1.259, 1.185, 1.192, 1.332, and 1.180.
+Median preallocation time fell from 189.9 ms to 29.1 ms (84.7% less).
+The arms wrote the same 204.8 MB and ended with the same 205,520,896-byte file
+length and allocated space. Median throughput was 63,922 versus 79,684 puts/s;
+the ratio of these separate medians differs from the paired ratio above.
+
+Ext4 16-writer preallocation time fell from 42.2 ms to 27.0 ms, but throughput
+was effectively unchanged: 21,498 versus 21,677 puts/s. Device intervals stayed
+between 0.115 and 0.131 ms/write. Four-writer ext4 throughput also stayed near
+6,230 puts/s. This is a measurable allocation-cost reduction, not evidence
+that the ext4 adoption gate has been met. Short-run p99 estimates, particularly
+the 50 samples per single-writer ext4 run, are only a regression screen.
+
+The existing preallocation test now checks repeated extension, preservation
+of header and batch bytes, and that a smaller target does not shrink the file.
+Raw records and the reproduction script are available transiently at
+`/tmp/rfc024-suffix-bench.jsonl` and `/tmp/rfc024_suffix_bench.py`.
