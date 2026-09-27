@@ -1491,3 +1491,43 @@ one-writer parallel path far below the leader because each solo commit still
 crosses the worker and coordinator. Raw paired records are in
 `/tmp/rfc024-durable-spin-bench.jsonl` and
 `/tmp/rfc024-durable-spin-256-bench.jsonl` (transient).
+
+### Rotation-bound adaptive WAL mode (experimental)
+
+**Run date:** 2026-09-27. An explicit `adaptive` mode starts each v4 WAL on
+the leader path and records overlapping WAL-ticket waiters. At a memtable/WAL
+rotation, it selects parallel I/O for the successor only if the old WAL saw
+contention; otherwise it selects leader I/O. The mode is fixed for each WAL,
+and the existing default remains leader. This targets the one-writer guard
+without changing the parallel worker's solo-commit round trip. It cannot
+switch during a WAL's lifetime, so a WAL-isolated benchmark with a 1 GiB SST
+target stays on leader throughout its four-writer run.
+
+Five alternating 50,000-put pairs used the `wal_concurrent` workload, four
+writers, 1 KiB values, a 1 MiB SST target, WAL on, and PITR off. Ratios below
+are adaptive divided by leader. `inflight_groups_max` reached four in each
+adaptive four-writer run, confirming that rotation selected parallel I/O.
+
+| Filesystem | Paired throughput ratios | Median throughput ratio | Median p99 ratio |
+| --- | --- | ---: | ---: |
+| tmpfs | 0.787, 0.749, 0.885, 0.801, 0.717 | 0.787 | 1.054 |
+| ext4 | 5.850, 1.665, 1.684, 1.638, 1.657 | 1.665 | 0.613 |
+
+The first ext4 leader arm coincided with a slower whole-device interval
+(0.788 ms/write versus 0.164 for adaptive), so its 5.850 ratio is not a
+credible mode effect. The other leader intervals were 0.177-0.185 ms/write;
+adaptive intervals were 0.165-0.170 ms/write. The four remaining pairs still
+favor adaptive, but those device intervals are not perfectly matched.
+
+Separate five-pair, one-writer runs with a 1 GiB SST target measured median
+adaptive/leader throughput ratios of 0.971 on tmpfs and 1.003 on ext4. Five
+ext4 four-writer pairs against the existing parallel mode measured 0.983
+median throughput for adaptive; both modes reached four in-flight groups.
+These one-writer and parallel comparisons are from the same session but
+separate benchmark matrices, so they are not a single paired adoption test.
+
+Keep `adaptive` opt-in. It improves this ext4 rotation-heavy case but loses
+substantially on tmpfs, leaves non-rotating concurrent WALs on leader, and
+does not satisfy the RFC's full cross-workload throughput and p99 gate. Raw
+paired records are in `/tmp/rfc024-adaptive-bench.jsonl` and
+`/tmp/rfc024-adaptive-leader-bench.jsonl` (transient).

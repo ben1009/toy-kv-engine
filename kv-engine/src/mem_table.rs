@@ -1630,6 +1630,11 @@ impl MemTable {
         self.wal.as_ref().is_some_and(|wal| wal.is_v5())
     }
 
+    #[cfg(test)]
+    pub(crate) fn wal_io_mode(&self) -> Option<crate::wal::WalIoMode> {
+        self.wal.as_ref().map(crate::wal::Wal::io_mode)
+    }
+
     /// Join the background runtime owned by a candidate parallel WAL.
     ///
     /// The legacy WAL paths keep their existing close behavior; engine

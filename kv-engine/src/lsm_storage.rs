@@ -1536,6 +1536,14 @@ pub(crate) fn prefix_upper_bound(prefix: &[u8]) -> Option<Vec<u8>> {
     }
 }
 
+struct AdaptiveWalWaiter<'a>(&'a AtomicUsize);
+
+impl Drop for AdaptiveWalWaiter<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 /// The storage interface of the LSM tree.
 pub(crate) struct LsmStorageInner {
     /// Immutable memtables dropped at recovery because their WAL was missing:
@@ -1562,6 +1570,8 @@ pub(crate) struct LsmStorageInner {
     next_sst_id: AtomicUsize,
     pub(crate) options: Arc<LsmStorageOptions>,
     wal_io_mode: crate::wal::WalIoMode,
+    adaptive_wal_waiters: AtomicUsize,
+    adaptive_wal_contended: AtomicBool,
     pub(crate) compaction_controller: CompactionController,
     pub(crate) pitr_state: Mutex<crate::pitr::manifest::PitrState>,
     pub(crate) pitr_next_segment_id: AtomicU64,
@@ -7399,6 +7409,8 @@ impl LsmStorageInner {
             manifest: Some(plan.manifest),
             options: plan.options.into(),
             wal_io_mode: plan.wal_io_mode,
+            adaptive_wal_waiters: AtomicUsize::new(0),
+            adaptive_wal_contended: AtomicBool::new(false),
             mvcc: Some(Arc::new(LsmMvccInner::new(plan.max_commit_ts))),
             reserved_ssts: Mutex::new(HashSet::new()),
             compaction_filters: Mutex::new(CompactionFilterRegistry {
@@ -7504,7 +7516,18 @@ impl LsmStorageInner {
     /// installs a v5 WAL on the leader path. Async admission must use this
     /// stable choice because a later rotation can restore a parallel v4 WAL.
     pub(crate) fn selects_parallel_wal_io(&self) -> bool {
-        self.options.enable_wal && self.wal_io_mode == crate::wal::WalIoMode::Parallel
+        self.options.enable_wal && self.wal_io_mode != crate::wal::WalIoMode::Leader
+    }
+
+    fn next_wal_io_mode(&self) -> crate::wal::WalIoMode {
+        if self.wal_io_mode != crate::wal::WalIoMode::Adaptive {
+            return self.wal_io_mode;
+        }
+        if self.adaptive_wal_contended.load(Ordering::Acquire) {
+            crate::wal::WalIoMode::Parallel
+        } else {
+            crate::wal::WalIoMode::Leader
+        }
     }
 
     /// Sync the active WAL and shut down every parallel WAL runtime still
@@ -9153,11 +9176,22 @@ impl LsmStorageInner {
     }
 
     fn commit_wal_ticket_or_poison(
+        &self,
         memtable: &MemTable,
         ticket: Option<u64>,
         mvcc: Option<&crate::mvcc::LsmMvccInner>,
         commit_ts: u64,
     ) -> Result<()> {
+        let _adaptive_waiter =
+            if self.wal_io_mode == crate::wal::WalIoMode::Adaptive && ticket.is_some() {
+                let previous = self.adaptive_wal_waiters.fetch_add(1, Ordering::AcqRel);
+                if previous > 0 {
+                    self.adaptive_wal_contended.store(true, Ordering::Release);
+                }
+                Some(AdaptiveWalWaiter(&self.adaptive_wal_waiters))
+            } else {
+                None
+            };
         if let Err(error) = memtable.commit_wal_ticket(ticket) {
             if commit_ts > 0
                 && let Some(mvcc) = mvcc
@@ -9204,7 +9238,7 @@ impl LsmStorageInner {
             Self::use_owned_batch_publish(entries.len()),
         )?;
         let memtable = state.memtable.clone();
-        Self::commit_wal_ticket_or_poison(&memtable, ticket, self.mvcc.as_deref(), commit_ts)?;
+        self.commit_wal_ticket_or_poison(&memtable, ticket, self.mvcc.as_deref(), commit_ts)?;
         if !data.is_empty() {
             Self::publish_deferred_batch_or_poison(&memtable, data, mvcc, commit_ts)?;
         }
@@ -9358,7 +9392,7 @@ impl LsmStorageInner {
                 (0, ticket)
             };
             let memtable = state.memtable.clone();
-            Self::commit_wal_ticket_or_poison(&memtable, ticket, self.mvcc.as_deref(), ts)?;
+            self.commit_wal_ticket_or_poison(&memtable, ticket, self.mvcc.as_deref(), ts)?;
             if ts > 0
                 && let Some(ref mvcc) = self.mvcc
             {
@@ -9650,7 +9684,7 @@ impl LsmStorageInner {
                 Self::use_owned_batch_publish(entries.len()),
             )?;
             let memtable = guard.memtable.clone();
-            Self::commit_wal_ticket_or_poison(&memtable, ticket, self.mvcc.as_deref(), commit_ts)?;
+            self.commit_wal_ticket_or_poison(&memtable, ticket, self.mvcc.as_deref(), commit_ts)?;
             if !data.is_empty() {
                 Self::publish_deferred_batch_or_poison(&memtable, data, mvcc, commit_ts)?;
             }
@@ -10647,7 +10681,7 @@ impl LsmStorageInner {
                     .with_borrowed_refs(|refs| state.memtable.write_wal_batch_only(refs))?;
                 (state.memtable.clone(), publish_data, ticket)
             };
-            Self::commit_wal_ticket_or_poison(
+            self.commit_wal_ticket_or_poison(
                 &memtable,
                 ticket,
                 self.mvcc.as_deref(),
@@ -10942,7 +10976,7 @@ impl LsmStorageInner {
                     ticket,
                 )
             };
-            Self::commit_wal_ticket_or_poison(
+            self.commit_wal_ticket_or_poison(
                 &memtable,
                 ticket,
                 self.mvcc.as_deref(),
@@ -11040,7 +11074,7 @@ impl LsmStorageInner {
                     ticket,
                 )
             };
-            Self::commit_wal_ticket_or_poison(
+            self.commit_wal_ticket_or_poison(
                 &memtable,
                 ticket,
                 self.mvcc.as_deref(),
@@ -11130,7 +11164,7 @@ impl LsmStorageInner {
                     ticket,
                 )
             };
-            Self::commit_wal_ticket_or_poison(
+            self.commit_wal_ticket_or_poison(
                 &memtable,
                 ticket,
                 self.mvcc.as_deref(),
@@ -11567,7 +11601,7 @@ impl LsmStorageInner {
                     sst_id,
                     vlog_enabled,
                     self.path_of_wal(sst_id),
-                    self.wal_io_mode,
+                    self.next_wal_io_mode(),
                 )?
             }
         } else {
@@ -11581,6 +11615,7 @@ impl LsmStorageInner {
         // hand the memtable someone else's segment on the next open.
         let pitr_segment_id = Self::pitr_segment_of(&mem_table);
         self.force_freeze_with_new_memtable_locked(mem_table, active_memtable_guard)?;
+        self.adaptive_wal_contended.store(false, Ordering::Release);
 
         self.sync_dir()?;
 
@@ -12043,6 +12078,79 @@ mod tests {
         (0..count)
             .map(|idx| WriteBatchRecord::Put(format!("k{idx:04}").into_bytes(), b"value".to_vec()))
             .collect()
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn adaptive_wal_switches_only_at_memtable_rotation() {
+        use std::sync::{Barrier, atomic::Ordering};
+
+        let dir = tempdir().unwrap();
+        let mut options = LsmStorageOptions::default_for_test();
+        options.enable_wal = true;
+        options.target_sst_size = 1 << 30;
+        let engine = match KvEngine::open_with_wal_io_mode(
+            dir.path(),
+            options,
+            crate::wal::WalIoMode::Adaptive,
+        ) {
+            Ok(engine) => engine,
+            Err(error) if error.to_string().contains("Operation not permitted") => return,
+            Err(error) => panic!("open adaptive WAL engine: {error:#}"),
+        };
+        assert_eq!(
+            engine.inner.state.load().memtable.wal_io_mode(),
+            Some(crate::wal::WalIoMode::Leader)
+        );
+
+        engine.put(b"single", b"value").unwrap();
+        engine
+            .inner
+            .force_freeze_memtable(&engine.inner.state_lock.lock())
+            .unwrap();
+        assert_eq!(
+            engine.inner.state.load().memtable.wal_io_mode(),
+            Some(crate::wal::WalIoMode::Leader)
+        );
+
+        let barrier = Arc::new(Barrier::new(5));
+        let mut writers = Vec::new();
+        for writer in 0..4 {
+            let engine = Arc::clone(&engine);
+            let barrier = Arc::clone(&barrier);
+            writers.push(std::thread::spawn(move || {
+                barrier.wait();
+                for index in 0..50 {
+                    engine
+                        .put(format!("writer-{writer}-{index}").as_bytes(), b"value")
+                        .unwrap();
+                }
+            }));
+        }
+        barrier.wait();
+        for writer in writers {
+            writer.join().unwrap();
+        }
+        assert!(engine.inner.adaptive_wal_contended.load(Ordering::Acquire));
+        engine
+            .inner
+            .force_freeze_memtable(&engine.inner.state_lock.lock())
+            .unwrap();
+        assert_eq!(
+            engine.inner.state.load().memtable.wal_io_mode(),
+            Some(crate::wal::WalIoMode::Parallel)
+        );
+
+        engine.put(b"single-again", b"value").unwrap();
+        engine
+            .inner
+            .force_freeze_memtable(&engine.inner.state_lock.lock())
+            .unwrap();
+        assert_eq!(
+            engine.inner.state.load().memtable.wal_io_mode(),
+            Some(crate::wal::WalIoMode::Leader)
+        );
+        engine.close().unwrap();
     }
 
     #[test]

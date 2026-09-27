@@ -112,6 +112,8 @@ pub enum WalIoMode {
     Leader,
     /// Dedicated packer, io_uring worker, and durability coordinator.
     Parallel,
+    /// Select the leader or parallel path at WAL rotation from observed contention.
+    Adaptive,
 }
 
 // ── DirectBuf: page-aligned buffer for O_DIRECT I/O ───────────────────────
@@ -745,7 +747,10 @@ impl Wal {
 
         if mvcc_format {
             let io_mode = if format_version == WAL_FORMAT_VERSION_V4 {
-                requested_io_mode
+                match requested_io_mode {
+                    WalIoMode::Adaptive => WalIoMode::Leader,
+                    mode => mode,
+                }
             } else {
                 WalIoMode::Leader
             };
@@ -1072,6 +1077,10 @@ impl Wal {
     }
 
     pub(crate) fn create_with_io_mode(path: impl AsRef<Path>, io_mode: WalIoMode) -> Result<Self> {
+        let io_mode = match io_mode {
+            WalIoMode::Adaptive => WalIoMode::Leader,
+            mode => mode,
+        };
         let f = File::create_new(path.as_ref()).context("failed to create WAL")?;
         let mut w = BufWriter::new(f);
         // Write MVCC WAL header (big-endian to match Buf::get_u32/get_u16).
