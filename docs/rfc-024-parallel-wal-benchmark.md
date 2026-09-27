@@ -815,3 +815,39 @@ groups from 20,000 to 15,359, but throughput fell from 84.8k to 64.8k
 puts/s. Thus fewer groups did not improve the end-to-end regression case.
 The prototype was reverted. Raw paired results are in
 `/tmp/rfc024-worker-pack-ab.json` and `/tmp/rfc024-worker-pack-exact.json`.
+
+### Release-build check of the original tmpfs regression
+
+**Run date:** 2026-09-27.
+
+The original 200,000-put, four-writer, 1-KiB-value, 1-MiB-SST tmpfs workload
+was rerun in three pairs with both the `bench`-feature binary and a normal
+release binary. Neither binary used `--profile`. The normal release build
+removes the benchmark counters from the WAL hot path, so this comparison tests
+whether instrumentation itself explains the parallel/leader gap.
+
+| Build | Leader puts/s (three runs) | Parallel puts/s (three runs) | Median paired parallel/leader ratio |
+| --- | --- | --- | --- |
+| `bench` release | 148,738; 174,567; 155,441 | 96,015; 99,151; 104,845 | 0.646 |
+| Normal release | 169,186; 151,652; 151,676 | 91,584; 93,444; 92,987 | 0.613 |
+
+The normal release build did not close the gap. Its parallel runs consumed
+about 5.6–5.8 seconds of process CPU versus 2.4–2.9 seconds for leader WAL,
+and sampled p99 was 0.238–0.377 ms versus 0.162–0.177 ms. The paired raw
+results are in `/tmp/rfc024-build-compare.json`.
+
+A separate diagnostic run of this workload produced 200,000 solo parallel
+groups and 85,529 syncs, versus 94,036 leader groups and syncs. Aggregate
+`fdatasync` time was only 27 ms for parallel and 22 ms for leader; measured
+preallocation and memtable insertion were also much smaller than the total
+gap. User-space CPU sampling found WAL worker channel receive, request-map
+hashing, and coordinator notification work, alongside SST building and MVCC
+publication. Sampling did not cover kernel CPU, so these symbols alone cannot
+apportion the full cost.
+
+The next candidate should eliminate a per-ticket pipeline handoff while still
+packing contiguous tickets and permitting multiple groups in flight. Merely
+waiting to accumulate tickets has already failed on the exact workload, and
+removing benchmark counters is not a performance fix. Any candidate must be
+compared against the same normal release binary on this case and checked on a
+device-backed filesystem before adoption.
