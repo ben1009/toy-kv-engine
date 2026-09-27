@@ -903,3 +903,34 @@ and `/tmp/rfc024-durable-wake-ext4-repeat.json`.
 The change passed 65 parallel-path tests, all-feature Clippy, and formatting
 checks. It reduces futile writer wakeups, but does not reduce the solo-group
 count or close the full tmpfs gap to leader WAL.
+
+### In-order completion fast path (rejected)
+
+**Run date:** 2026-09-27.
+
+A prototype advanced the written frontier directly when a successful group
+completed at the current frontier, avoiding a `BTreeMap` insertion and removal.
+It kept the map for out-of-order CQEs and the existing poison boundary.
+Five pairs of the exact 200,000-put tmpfs workload had candidate/control
+throughput ratios `1.010, 1.078, 0.973, 1.024, 1.008` (median `1.010`). Five
+20,000-put ext4 pairs had ratios `0.978, 0.980, 1.004, 1.020, 1.009` (median
+`1.004`), with mixed p99. The added retirement branch did not deliver a
+repeatable throughput gain, so it was reverted. Raw results are in
+`/tmp/rfc024-direct-retire-tmpfs.json` and `/tmp/rfc024-direct-retire-ext4.json`.
+
+### Conditional idle eventfd drain (rejected)
+
+**Run date:** 2026-09-27.
+
+The idle worker's channel receive is followed by a nonblocking eventfd read.
+A prototype skipped that read when no eventfd signal was pending, retaining
+the drain for a signal racing with the ring-progress wait. In ten paired
+normal-release runs of the exact tmpfs workload, the candidate/control median
+throughput ratio was `1.014`; six pairs favored the candidate, and median
+process CPU was unchanged. Ten ext4 pairs had a `1.015` median throughput
+ratio, but both arms saw large storage-latency outliers. The effect is too
+small and inconsistent to justify changing wakeup-race handling, so the code
+was reverted. Raw results are in `/tmp/rfc024-conditional-eventfd-tmpfs.json`,
+`/tmp/rfc024-conditional-eventfd-tmpfs-repeat.json`,
+`/tmp/rfc024-conditional-eventfd-ext4.json`, and
+`/tmp/rfc024-conditional-eventfd-ext4-repeat.json`.
