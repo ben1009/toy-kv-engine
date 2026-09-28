@@ -1796,3 +1796,54 @@ All 44 focused parallel WAL tests passed before timing. After measurement,
 tests. Raw measurements and scripts are transiently available as `/tmp/rfc024-coop-bench.jsonl`,
 `/tmp/rfc024-coop-confirm-bench.jsonl`, `/tmp/rfc024_coop_bench.py`, and
 `/tmp/rfc024_coop_confirm_bench.py`.
+
+### Deferred task work with a single issuer (rejected, 2026-09-28)
+
+At the user's request, a prototype replaced cooperative task work with
+`SINGLE_ISSUER | DEFER_TASKRUN`, adding `TASKRUN_FLAG` for pending-work
+notification. The host accepted `0x3200` in an independent setup probe.
+The [io_uring setup contract](https://man7.org/linux/man-pages/man2/io_uring_setup.2.html)
+requires explicit `GETEVENTS` calls to drive deferred completions. The pinned
+io-uring 0.6.4 crate's `submit_and_wait(0)` does not normally set that flag.
+
+An initial implementation processed flagged task work with a nonblocking
+`io_uring_enter(0, 0, GETEVENTS)` but retained the external ring/eventfd `poll`.
+Some tests then progressed only after the one-second poll timeout. Making the
+nonblocking call unconditional did not fix it: a range-tombstone rotation
+test took 29.1 seconds. These stalled versions were not benchmarked.
+
+The measured version instead registered eventfd readiness through a ring
+`PollAdd` request and waited with `GETEVENTS` for either a write CQE or a
+producer wakeup, retaining a one-second timeout only as a signaling-failure
+fallback. Control CQEs were removed before write-completion accounting.
+Nonblocking `GETEVENTS` also processed flagged work before CQE consumption.
+This preserved admission wakeups while waiting and avoided per-group write
+waits. All 44 focused tests passed in 0.054 seconds; the targeted rotation
+test returned to about 0.04 seconds.
+
+Five alternating pairs compared this driver with the cooperative baseline at
+`72336a65`. Both used parallel mode, release/`bench`, 1 KiB values, PITR off,
+and latency sampling every 10 ops. Builds and tests finished before timing.
+
+| Case | Puts / writers / SST target | Median paired throughput ratio | Median paired CPU-time ratio | Median paired p99 ratio |
+| --- | --- | ---: | ---: | ---: |
+| ext4, one writer | 5k / 1 / 1 GiB | 0.995 | 0.973 | 0.991 |
+| ext4, rotation | 20k / 4 / 1 MiB | 0.999 | 1.007 | 1.051 |
+| ext4, growing WAL | 50k / 16 / 1 GiB | 1.003 | 0.995 | 0.997 |
+| tmpfs, growing WAL | 50k / 1 / 1 GiB | 1.071 | 0.943 | 1.227 |
+| tmpfs, original case | 200k / 4 / 1 MiB | 0.980 | 1.013 | 1.075 |
+
+Several ext4 rotation pairs crossed the known device-latency cliff, so their
+large individual swings cannot establish a code effect. The ext4 16-writer
+pairs showed no material throughput gain. Tmpfs single-writer throughput and
+CPU time improved, but p99 worsened. The four-writer case used a median
+112,633 sync calls versus 102,912 with cooperative task work, and its paired
+throughput ratios were 0.980, 0.933, 0.937, 1.065, and 1.084. That tradeoff
+and the additional completion-driver complexity do not justify replacing the
+current implementation. This rejects this integration, not deferred task work
+in general.
+
+The prototype was saved at `/tmp/rfc024-defer-rejected.patch` and removed from
+production source. Raw records and reproduction commands are in
+`/tmp/rfc024-defer-bench.jsonl` and `/tmp/rfc024_defer_bench.py` (transient).
+The restored release binary was compared with the saved cooperative baseline.
