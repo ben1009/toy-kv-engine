@@ -27,6 +27,7 @@ const NORMAL_ACTIVE_BUFFER_BUDGET: u64 = 64 * 1024 * 1024;
 const MAX_BUFFER_CAPACITY: u64 = 240 * 1024 * 1024;
 const WAL_HEADER_END: u64 = 4096;
 const PACKER_GROUP_MAX_TICKETS: usize = 8;
+const EXTENT_INITIALIZATION_CHUNK: usize = 128 * 1024;
 // Wait for tickets admitted during a bounded window when a written prefix is
 // ready to sync. Skip the wait when the prior sync was cheap; new admission
 // cannot extend the deadline.
@@ -270,10 +271,137 @@ struct PackerState {
     next_ticket: u64,
     reserved_end: u64,
     preallocated_end: u64,
+    initializer: Option<ExtentInitializer>,
 }
 
-/// Parallel WAL runtime with admission-driven packing, an I/O worker, and a
-/// single-owner durability coordinator.
+fn is_ext_filesystem(file: &File) -> bool {
+    // ext2/3/4 share this magic. Keep other filesystems, particularly tmpfs,
+    // on allocation only; initialization there has no measured benefit.
+    let mut stat = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    // SAFETY: file is live, and stat points to writable storage of the required size.
+    if unsafe { libc::fstatfs(file.as_raw_fd(), stat.as_mut_ptr()) } != 0 {
+        return false;
+    }
+
+    // SAFETY: a successful fstatfs initialized stat.
+    unsafe { stat.assume_init() }.f_type == libc::EXT4_SUPER_MAGIC
+}
+
+/// Owns initialization beyond the packer's ready prefix. There is at most
+/// one outstanding request/result, so stopping admission and dropping the
+/// request sender lets close join without draining the completion channel.
+/// The worker retains its file and aligned buffer until synchronous writes
+/// finish, including on initialization failure or runtime construction failure.
+struct ExtentInitializer {
+    requests: Option<Sender<u64>>,
+    completions: Receiver<std::result::Result<u64, String>>,
+    join: Option<JoinHandle<Result<()>>>,
+    ready_end: u64,
+}
+
+impl ExtentInitializer {
+    fn spawn(file: Arc<File>, start: u64) -> Result<Self> {
+        ensure!(
+            (WAL_HEADER_END..=MAX_WAL_FILE_SIZE).contains(&start) && start.is_multiple_of(4096),
+            "invalid WAL extent initialization offset"
+        );
+        let (requests, incoming) = crossbeam_channel::bounded::<u64>(1);
+        let (finished, completions) = crossbeam_channel::bounded(1);
+        let join = thread::Builder::new()
+            .name("wal-extent-initializer".to_owned())
+            .spawn(move || {
+                use std::os::unix::fs::FileExt;
+
+                let mut offset = start;
+                let mut zeros = DirectBuf::new(EXTENT_INITIALIZATION_CHUNK);
+                zeros.zero_range(0, EXTENT_INITIALIZATION_CHUNK);
+                while let Ok(end) = incoming.recv() {
+                    let result = (|| -> Result<()> {
+                        preallocate(&file, end)?;
+                        while offset < end {
+                            let len =
+                                (end - offset).min(EXTENT_INITIALIZATION_CHUNK as u64) as usize;
+                            file.write_all_at(zeros.initialized_slice(0, len), offset)
+                                .context("failed to initialize WAL extent")?;
+                            offset += len as u64;
+                        }
+
+                        Ok(())
+                    })();
+                    let _ =
+                        finished.send(result.as_ref().map(|()| end).map_err(|e| format!("{e:#}")));
+                    result?;
+                }
+
+                Ok(())
+            })
+            .context("failed to spawn WAL extent initializer")?;
+        let initializer = Self {
+            requests: Some(requests),
+            completions,
+            join: Some(join),
+            ready_end: start,
+        };
+        if start < MAX_WAL_FILE_SIZE {
+            initializer.request(round_up(start + 1, PREALLOC_BLOCK).context("extent overflow")?)?;
+        }
+
+        Ok(initializer)
+    }
+
+    fn request(&self, end: u64) -> Result<()> {
+        self.requests
+            .as_ref()
+            .context("initializer closed")?
+            .send(end)
+            .context("extent initializer stopped")
+    }
+
+    fn prepare(&mut self, end: u64) -> Result<()> {
+        ensure!(
+            end <= MAX_WAL_FILE_SIZE && end.is_multiple_of(4096),
+            "invalid WAL extent initialization target"
+        );
+        while self.ready_end < end {
+            self.ready_end = self
+                .completions
+                .recv()
+                .context("extent initializer completion disconnected")?
+                .map_err(anyhow::Error::msg)?;
+            if self.ready_end < MAX_WAL_FILE_SIZE {
+                // Start the next extent while the packer submits this one.
+                // For a large batch, first catch up to its required end.
+                self.request(
+                    end.max(self.ready_end + PREALLOC_BLOCK)
+                        .min(MAX_WAL_FILE_SIZE),
+                )?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn close(&mut self) -> Result<()> {
+        self.requests.take();
+        if let Some(join) = self.join.take() {
+            join.join()
+                .map_err(|_| anyhow!("extent initializer panicked"))??;
+        }
+
+        Ok(())
+    }
+}
+
+impl Drop for ExtentInitializer {
+    fn drop(&mut self) {
+        if let Err(error) = self.close() {
+            log::error!("failed to stop WAL extent initializer: {error:#}");
+        }
+    }
+}
+
+/// Parallel WAL runtime with admission-driven packing, an I/O worker, a
+/// single-owner durability coordinator, and ext-family extent lookahead.
 pub(crate) struct ParallelWalRuntime {
     inner: Arc<RuntimeInner>,
     threads: Mutex<RuntimeThreads>,
@@ -300,6 +428,14 @@ impl ParallelWalRuntime {
             ));
         }
 
+        let initializer = if is_ext_filesystem(&preallocator) {
+            Some(ExtentInitializer::spawn(
+                Arc::clone(&preallocator),
+                initial_file_end,
+            )?)
+        } else {
+            None
+        };
         let mut worker = IoWorker::spawn(worker_file, Arc::clone(&buffer_pool))?;
         let worker_client = worker.client();
         let sync_progress = worker.sync_progress();
@@ -322,6 +458,7 @@ impl ParallelWalRuntime {
                 next_ticket: 0,
                 reserved_end: initial_file_end,
                 preallocated_end: initial_file_end,
+                initializer,
             }),
             packer_failures: Mutex::new(Some(packer_failures_tx)),
             #[cfg(test)]
@@ -588,6 +725,14 @@ impl ParallelWalRuntime {
         }
         self.inner.packer_failures.lock().take();
 
+        // No packer can request more ranges after admission closes and drains.
+        // Join initialization before finishing the WAL worker/coordinator drain.
+        if let Some(mut initializer) = self.inner.packer_state.lock().initializer.take()
+            && let Err(error) = initializer.close()
+        {
+            close_error.get_or_insert_with(|| format!("extent initializer failed: {error:#}"));
+        }
+
         if let Some(worker) = threads.worker.take()
             && let Err(error) = worker.close()
         {
@@ -684,11 +829,17 @@ fn pack_admitted_groups(
         if target_preallocated_end > packer.preallocated_end {
             #[cfg(feature = "bench")]
             let preallocation_start = Instant::now();
-            if let Err(error) = preallocate(&inner.preallocator, target_preallocated_end) {
+            let allocation = match packer.initializer.as_mut() {
+                Some(initializer) => initializer.prepare(target_preallocated_end),
+                None => preallocate(&inner.preallocator, target_preallocated_end),
+            };
+            if let Err(error) = allocation {
                 report_packer_failure(inner, first_ticket, &error);
                 return Err(error);
             }
             #[cfg(feature = "bench")]
+            // On ext filesystems this measures readiness wait, not the
+            // initializer's background I/O time or its additional write bytes.
             inner
                 .sync_progress
                 .record_preallocation_ns(preallocation_start.elapsed().as_nanos() as u64);
@@ -1168,6 +1319,76 @@ fn round_up(value: u64, alignment: u64) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn extent_lookahead_stops_at_file_cap_and_rejects_larger_targets() {
+        use std::{os::unix::fs::FileExt, sync::Arc};
+
+        let file = Arc::new(tempfile::tempfile().unwrap());
+        let start = super::MAX_WAL_FILE_SIZE - 4096;
+        file.set_len(start).unwrap();
+        file.write_all_at(b"batch", start - 5).unwrap();
+        let mut initializer = super::ExtentInitializer::spawn(Arc::clone(&file), start).unwrap();
+        assert!(
+            initializer
+                .prepare(super::MAX_WAL_FILE_SIZE + 4096)
+                .is_err()
+        );
+        initializer.prepare(super::MAX_WAL_FILE_SIZE).unwrap();
+        initializer.close().unwrap();
+        assert_eq!(file.metadata().unwrap().len(), super::MAX_WAL_FILE_SIZE);
+        let mut batch = [0; 5];
+        file.read_exact_at(&mut batch, start - 5).unwrap();
+        assert_eq!(&batch, b"batch");
+    }
+
+    #[test]
+    fn extent_lookahead_preserves_previously_written_batches() {
+        use std::{os::unix::fs::FileExt, sync::Arc};
+
+        let file = Arc::new(tempfile::tempfile().unwrap());
+        file.set_len(super::WAL_HEADER_END).unwrap();
+        file.write_all_at(b"header", 0).unwrap();
+        let mut initializer =
+            super::ExtentInitializer::spawn(Arc::clone(&file), super::WAL_HEADER_END).unwrap();
+        initializer.prepare(super::PREALLOC_BLOCK).unwrap();
+        file.write_all_at(b"batch", super::PREALLOC_BLOCK - 5)
+            .unwrap();
+        initializer.prepare(3 * super::PREALLOC_BLOCK).unwrap();
+        initializer.close().unwrap();
+        let mut bytes = [0; 6];
+        file.read_exact_at(&mut bytes, 0).unwrap();
+        assert_eq!(&bytes, b"header");
+        file.read_exact_at(&mut bytes[..5], super::PREALLOC_BLOCK - 5)
+            .unwrap();
+        assert_eq!(&bytes[..5], b"batch");
+        file.read_exact_at(&mut bytes, 3 * super::PREALLOC_BLOCK - 6)
+            .unwrap();
+        assert_eq!(bytes, [0; 6]);
+    }
+
+    #[test]
+    fn extent_initializer_failure_is_reported_and_joined() {
+        use std::{fs::File, sync::Arc};
+
+        let file = tempfile::NamedTempFile::new().unwrap();
+        file.as_file().set_len(super::WAL_HEADER_END).unwrap();
+        let readonly = Arc::new(File::open(file.path()).unwrap());
+        let mut initializer =
+            super::ExtentInitializer::spawn(readonly, super::WAL_HEADER_END).unwrap();
+        assert!(initializer.prepare(super::PREALLOC_BLOCK).is_err());
+        assert!(initializer.close().is_err());
+    }
+
+    #[test]
+    fn extent_initializer_can_close_with_an_unconsumed_completion() {
+        use std::sync::Arc;
+
+        let file = Arc::new(tempfile::tempfile().unwrap());
+        file.set_len(super::WAL_HEADER_END).unwrap();
+        let mut initializer = super::ExtentInitializer::spawn(file, super::WAL_HEADER_END).unwrap();
+        initializer.close().unwrap();
+    }
+
     #[cfg(feature = "bench")]
     use super::validate_sync_diagnostics_transition;
     use super::{

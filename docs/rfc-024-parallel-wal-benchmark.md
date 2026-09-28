@@ -1943,3 +1943,81 @@ Transient records: `/tmp/rfc024-init-extent-bench.jsonl`,
 Reproduction scripts use the corresponding `/tmp/rfc024_init_*_bench.py`
 names. The three prototypes are saved as
 `/tmp/rfc024-init-extent-{1m,128k,8m}-rejected.patch`.
+
+## Asynchronous extent initialization (2026-09-29)
+
+The parallel v4 path now prepares its next extent on a dedicated initializer
+thread on ext-family filesystems. It retains the 1 MiB allocation increment,
+but writes zeros in 128 KiB chunks using one reusable aligned buffer. A
+bounded request/completion pair allows only one outstanding initialization
+request. The packer consumes its completion before submitting WAL batches
+into that range and requests one more extent while the current one is used.
+Large batches can request preparation through their required end. All targets
+remain bounded by the WAL file cap.
+
+The initializer owns an `Arc<File>` and its buffer until synchronous writes
+finish. Initialization never revisits the ready prefix. An initialization
+error encountered by the packer uses the existing poison boundary; close also
+reports errors from an unused lookahead request. Close drains admission and
+packing, stops and joins the initializer, then finishes the existing worker
+and sync-coordinator shutdown. Tests cover prefix preservation, initialization
+failure, shutdown with an unread completion, and the file-cap boundary.
+
+`fstatfs` selects ext2/3/4's shared filesystem magic; the measurements here are
+on ext4 only. Other filesystems, or a failed filesystem query, retain allocation
+without initialization. This avoids the measured tmpfs cost of zero-writing.
+The optimization adds one thread and one 128 KiB buffer per open parallel WAL,
+up to one extra prepared extent ahead of the packer's ready range, and extra
+zero-write traffic. Empty WAL creation can also prepare the first extent.
+`preallocation_ns` now measures readiness wait on this path, not background
+initialization time. Batch SQE/CQE counters exclude the initializer's writes.
+
+An initial all-filesystem prototype with 1 MiB initialization writes improved
+ext4 16-writer throughput by 21.6%, but its median paired p99 ratio was 1.112
+and tmpfs four-writer throughput was 0.764 of baseline. The retained variant
+uses smaller writes and filesystem selection. Both arms below use parallel
+mode; baseline is `e7a61188`. All runs use release/`bench`, 1 KiB values, PITR
+off, and latency sampling every 10 operations. No builds or tests overlap
+timing. Values are median paired ratios.
+
+| Initial series | Puts / writers / SST target | Pairs | Throughput ratio | p99 ratio |
+| --- | --- | ---: | ---: | ---: |
+| ext4, single writer | 5k / 1 / 1 GiB | 5 | 1.651 | 0.552 |
+| ext4, rotation | 20k / 4 / 1 MiB | 5 | 1.534 | 0.889 |
+| ext4, growing WAL | 50k / 16 / 1 GiB | 5 | 1.200 | 1.086 |
+| tmpfs, single writer | 50k / 1 / 1 GiB | 5 | 0.970 | 1.055 |
+| tmpfs, original case | 200k / 4 / 1 MiB | 5 | 0.907 | 1.038 |
+
+| Independent confirmation | Puts / writers / SST target | Pairs | Throughput ratio | p99 ratio |
+| --- | --- | ---: | ---: | ---: |
+| ext4, growing WAL | 50k / 16 / 1 GiB | 5 | 1.178 | 1.013 |
+| ext4, original case | 200k / 4 / 1 MiB | 3 | 1.487 | 0.884 |
+| tmpfs, original case | 200k / 4 / 1 MiB | 5 | 1.013 | 1.003 |
+
+All five 16-writer confirmation throughput ratios were above parity:
+1.157, 1.219, 1.148, 1.241, and 1.178. Their exact percentile bootstrap
+95% interval for the paired median is 1.148–1.241. The corresponding p99
+ratios were 0.940, 1.217, 0.984, 1.079, and 1.013: the median is within the
+10% guard, but one pair is outside it. The initial tmpfs regression did not
+repeat, so there is no claim of a tmpfs performance gain.
+
+Device-latency spikes remain material. The long ext4 case's three throughput
+ratios were 0.608, 1.623, and 1.487, with p99 ratios 5.174, 0.808, and 0.884.
+The first candidate run had whole-device write latency of 0.582 ms versus
+0.177 ms for baseline. A later baseline/candidate pair both had elevated
+latency. All pairs are included; this does not establish a clean long-run
+latency pass. The initial single-writer series also crossed the latency cliff.
+These results justify retaining the optimization for the opt-in parallel path,
+but do not constitute a new leader comparison or a complete adoption-gate pass.
+
+Transient scripts and raw records are `/tmp/rfc024_ahead_bench.py`,
+`/tmp/rfc024_ahead_chunk_bench.py`, `/tmp/rfc024_ahead_confirm_bench.py`, and
+their `/tmp/rfc024-ahead{,-chunk,-confirm}-bench.jsonl` outputs.
+
+Validation: `cargo make check` passed both Clippy configurations and all 1,407
+tests; five tests retried after `/tmp` quota errors. A subsequent full nextest
+run with `--retries 0` and a tmpfs temporary directory passed all 1,407 tests.
+All 48 focused WAL tests then passed with an ext4 temporary directory and
+two test threads, exercising filesystem-selected initialization. The final
+code also validates initialization offsets/targets against alignment and the
+file cap; those checks and the boundary test were added after benchmark timing.
