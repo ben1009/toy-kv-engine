@@ -2021,3 +2021,57 @@ All 48 focused WAL tests then passed with an ext4 temporary directory and
 two test threads, exercising filesystem-selected initialization. The final
 code also validates initialization offsets/targets against alignment and the
 file cap; those checks and the boundary test were added after benchmark timing.
+
+## Coalescing after asynchronous extent preparation (2026-09-29)
+
+With extent lookahead in `ec619c5e`, the 16-writer workload used roughly
+3,700 syncs per 50,000 commits, versus 3,125 if every sync covered 16 commits.
+The next experiment changed only `SYNC_COALESCE_WAIT` from 200 to 400
+microseconds. The previous-sync-latency gate remains 100 microseconds; the
+coordinator still returns immediately when the written prefix reaches the
+current admission cutoff. It does not wait for future, unadmitted writers,
+and moving admission cannot extend the deadline. A stalled admitted write
+can now delay the next sync by up to 200 additional microseconds.
+
+Five alternating pairs per case compared the candidate against `ec619c5e`,
+with both arms in parallel mode, release/`bench`, 1 KiB values, PITR off,
+and latency sampling every 10 ops. No compilation or tests overlapped timing.
+Ratios below are medians of paired ratios.
+
+| First series | Puts / writers / SST target | Throughput ratio | p99 ratio |
+| --- | --- | ---: | ---: |
+| ext4, single writer | 5k / 1 / 1 GiB | 0.993 | 0.919 |
+| ext4, rotation | 20k / 4 / 1 MiB | 1.018 | 1.063 |
+| ext4, growing WAL | 50k / 16 / 1 GiB | 1.052 | 0.826 |
+| tmpfs, single writer | 50k / 1 / 1 GiB | 0.997 | 0.966 |
+| tmpfs, original case | 200k / 4 / 1 MiB | 1.070 | 0.990 |
+
+| Fresh confirmation, same workload sizes | Throughput ratio | p99 ratio |
+| --- | ---: | ---: |
+| ext4, rotation | 1.042 | 1.071 |
+| ext4, growing WAL | 1.016 | 0.870 |
+| tmpfs, original case | 1.015 | 0.953 |
+
+The first five 16-writer throughput ratios were 1.060, 1.030, 1.051, 1.052,
+and 1.069. Median sync count fell from 3,728 to 3,510; aggregate sync time
+fell from 974 to 895 ms. Confirmation sync counts fell from 3,681 to 3,490.
+The corresponding throughput ratios were 0.971, 1.084, 1.016, 1.034, and
+0.457. The last candidate run crossed a whole-device latency spike
+(0.690 ms/write versus about 0.081 for baseline), and the following baseline
+rotation run was also slow. Every pair remains included. This is not evidence
+of a repeatable 5.2% throughput gain: confirmation is substantially noisier.
+
+Nine of ten 16-writer pairs had lower sampled p99, with median reductions of
+17.4% and 13.0% in the two series. Retain the bounded-window change for fuller
+sync batches and the repeated median tail-latency improvement. The four-writer
+rotation p99 increased about 6–7%, so this is not a universal latency win.
+There is no new full 200k-write ext4 run, leader comparison, or adoption-gate
+claim in this experiment.
+
+All 48 focused tests passed on ext4 before timing. After timing,
+`cargo make check` passed both Clippy configurations and all 1,407 tests,
+using a tmpfs temporary directory to avoid `/tmp` quota pressure.
+Transient reproduction scripts are `/tmp/rfc024_window400_bench.py` and
+`/tmp/rfc024_window400_confirm_bench.py`; raw records are
+`/tmp/rfc024-window400-chunk-bench.jsonl` and
+`/tmp/rfc024-window400-confirm-bench.jsonl`.

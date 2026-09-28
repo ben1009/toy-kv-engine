@@ -31,7 +31,7 @@ const EXTENT_INITIALIZATION_CHUNK: usize = 128 * 1024;
 // Wait for tickets admitted during a bounded window when a written prefix is
 // ready to sync. Skip the wait when the prior sync was cheap; new admission
 // cannot extend the deadline.
-const SYNC_COALESCE_WAIT: Duration = Duration::from_micros(200);
+const SYNC_COALESCE_WAIT: Duration = Duration::from_micros(400);
 const SYNC_COALESCE_MIN_SYNC: Duration = Duration::from_micros(100);
 
 #[derive(Debug)]
