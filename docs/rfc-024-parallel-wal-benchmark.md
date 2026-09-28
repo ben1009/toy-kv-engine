@@ -2075,3 +2075,48 @@ Transient reproduction scripts are `/tmp/rfc024_window400_bench.py` and
 `/tmp/rfc024_window400_confirm_bench.py`; raw records are
 `/tmp/rfc024-window400-chunk-bench.jsonl` and
 `/tmp/rfc024-window400-confirm-bench.jsonl`.
+
+### Larger allocation increments with small initialization writes (rejected, 2026-09-29)
+
+Compared against `055e7ea2`, this experiment rounded the extent initializer's
+`fallocate` target up to 8 MiB instead of 1 MiB. Zero initialization still used
+128 KiB writes and only advanced readiness/lookahead by 1 MiB. The hypothesis
+was that fewer allocation and file-length updates would improve ext4 throughput
+without the long zero-write bursts of the earlier synchronous experiment.
+
+Five alternating pairs per case used parallel mode in both arms, release/`bench`,
+1 KiB values, PITR off, and latency sampling every 10 operations. No compilation
+or tests overlapped timing. Ratios are medians of candidate/baseline paired ratios.
+
+| Workload | Puts / writers / SST target | Throughput ratio | p99 ratio |
+| --- | --- | ---: | ---: |
+| ext4, single writer | 5k / 1 / 1 GiB | 0.993 | 0.935 |
+| ext4, growing WAL | 50k / 16 / 1 GiB | 0.991 | 1.041 |
+| ext4, rotation | 20k / 4 / 1 MiB | 1.026 | 0.855 |
+| tmpfs, single writer | 50k / 1 / 1 GiB | 1.056 | 0.886 |
+| tmpfs, original case | 200k / 4 / 1 MiB | 0.995 | 1.104 |
+
+The 16-writer throughput ratios were 1.057, 0.969, 1.039, 0.991, and 0.975;
+there was no consistent throughput or latency gain. The last rotation candidate
+crossed a device-latency spike: its throughput ratio was 0.351 and p99 ratio
+4.186, with whole-device latency 0.616 ms/write versus baseline 0.089.
+That pair remains included; the counter cannot establish the cause of the spike.
+The tmpfs path does not use the changed initializer, so its variation is a
+control observation rather than evidence of an allocation optimization.
+
+Median reported allocated WAL bytes increased from 22,024,192 to 25,169,920
+for the single-writer case, from 206,573,568 to 209,719,296 for 16 writers,
+and from 10,493,952 to 16,777,216 for rotation. Packer readiness wait did not
+improve consistently either: its 16-writer median rose from 0.863 to 1.079 ms,
+and rotation rose from 14.017 to 14.222 ms. These timings exclude the background
+initializer's own work.
+
+Reject the change: the modest rotation median improvement does not justify
+extra reserved space with no gain on the growing-WAL workloads. Restore the
+1 MiB allocation increment. All 48 focused WAL tests passed on ext4 before
+benchmarking; the restored source is identical to the previously checked baseline.
+This experiment does not establish a leader comparison or pass an adoption gate.
+
+Transient reproduction script: `/tmp/rfc024_reserve8m_bench.py`.
+Raw records: `/tmp/rfc024-reserve8m-chunk-bench.jsonl`.
+Rejected patch: `/tmp/rfc024-reserve8m-rejected.patch`.
