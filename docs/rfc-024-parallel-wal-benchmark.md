@@ -1847,3 +1847,36 @@ The prototype was saved at `/tmp/rfc024-defer-rejected.patch` and removed from
 production source. Raw records and reproduction commands are in
 `/tmp/rfc024-defer-bench.jsonl` and `/tmp/rfc024_defer_bench.py` (transient).
 The restored release binary was compared with the saved cooperative baseline.
+
+## Lazy parallel buffer pool experiment (rejected)
+
+At `c0cfcfa3`, each parallel WAL eagerly allocates 64 aligned 256 KiB buffers
+when it starts. The candidate removed this prefill and let the existing
+budgeted allocation path populate the same bounded pool on demand. Buffers
+were still recycled after write completion; admission, synchronization, and
+the leader path were unchanged. This avoids allocating 16 MiB of buffer
+capacity up front, but does not imply saving 16 MiB of resident memory:
+`posix_memalign` does not initialize all those pages.
+
+All 44 focused WAL tests passed before timing. Five alternating pairs used
+parallel mode in both arms, release/`bench`, 1 KiB values, PITR off, and
+latency sampling every 10 operations. No builds or tests ran during timing.
+
+| Case | Puts / writers / SST target | Median paired throughput ratio | Median paired CPU-time ratio | Median paired p99 ratio |
+| --- | --- | ---: | ---: | ---: |
+| ext4, one writer | 5k / 1 / 1 GiB | 1.002 | 0.997 | 1.010 |
+| ext4, rotation | 20k / 4 / 1 MiB | 1.004 | 0.996 | 1.085 |
+| ext4, growing WAL | 50k / 16 / 1 GiB | 1.011 | 0.957 | 1.006 |
+| tmpfs, growing WAL | 50k / 1 / 1 GiB | 1.018 | 0.979 | 0.694 |
+| tmpfs, original case | 200k / 4 / 1 MiB | 1.024 | 1.013 | 0.974 |
+
+The targeted ext4 rotation case was effectively flat in throughput and had
+higher sampled p99. Tmpfs four-writer throughput ratios ranged from 0.954
+to 1.058; the small median gain is not compelling evidence of improvement.
+These runs do not establish eager buffer allocation as the throughput
+bottleneck or justify retaining the candidate as a performance optimization.
+The production change was reverted.
+
+Transient reproduction artifacts are `/tmp/rfc024_lazy_pool_bench.py`,
+`/tmp/rfc024-lazy-pool-bench.jsonl`, and
+`/tmp/rfc024-lazy-pool-rejected.patch`.
