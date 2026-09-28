@@ -1500,7 +1500,21 @@ impl<B: WorkerBuffer> IoWorker<B> {
         let join = thread::Builder::new()
             .name("wal-io-worker".to_owned())
             .spawn(move || {
-                let mut ring = match io_uring::IoUring::new(RING_SIZE as u32) {
+                // This thread creates, submits to, and reaps the ring. Let
+                // completion task work run at kernel transitions instead of
+                // interrupting userspace, and advertise the single issuer.
+                // Keep the existing setup on kernels without these flags.
+                let configured_ring = io_uring::IoUring::builder()
+                    .setup_coop_taskrun()
+                    .setup_single_issuer()
+                    .build(RING_SIZE as u32);
+                let configured_ring = match configured_ring {
+                    Err(error) if error.raw_os_error() == Some(libc::EINVAL) => {
+                        io_uring::IoUring::new(RING_SIZE as u32)
+                    }
+                    result => result,
+                };
+                let mut ring = match configured_ring {
                     Ok(ring) => ring,
                     Err(error) => {
                         let _ = startup_tx

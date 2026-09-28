@@ -1747,3 +1747,52 @@ artifacts are `/tmp/rfc024-growth-bench.jsonl`,
 `/tmp/rfc024-growth-confirm-bench.jsonl`,
 `/tmp/rfc024_growth_confirm_bench.py`, and
 `/tmp/rfc024-growth-rejected.patch`.
+
+### Cooperative completion task work (2026-09-28)
+
+The parallel worker owns ring creation, submission, and CQE consumption on one
+thread. Its ring setup now requests `IORING_SETUP_COOP_TASKRUN` and
+`IORING_SETUP_SINGLE_ISSUER`. Cooperative task work avoids forceful userspace
+interruption for completions; work can run at kernel transitions in the existing
+submit/poll loop. This does not enable deferred task work or SQPOLL. If setup
+returns `EINVAL`, initialization retries the previous setup for older kernels.
+Other setup errors remain errors. The benchmark host accepted both flags
+(`0x1100`) in an independent setup probe.
+
+Five alternating pairs per case compared the candidate with `51446a53`, in
+parallel mode, release builds with `bench`, 1 KiB values, and PITR off. No
+build or test ran during timing. Initial latency sampling was every 100 ops.
+
+| Case | Puts / writers / SST target | Median paired throughput ratio | Median paired CPU-time ratio | Median paired p99 ratio |
+| --- | --- | ---: | ---: | ---: |
+| ext4, one writer | 5k / 1 / 1 GiB | 1.000 | 0.997 | 0.999 |
+| ext4, rotation | 20k / 4 / 1 MiB | 0.994 | 1.007 | 1.011 |
+| ext4, growing WAL | 50k / 16 / 1 GiB | 1.002 | 0.990 | 1.180 |
+| tmpfs, growing WAL | 50k / 1 / 1 GiB | 0.992 | 1.014 | 0.983 |
+| tmpfs, original case | 200k / 4 / 1 MiB | 1.094 | 0.930 | 0.953 |
+
+Ext4 encountered the known device-latency cliff in the fifth 16-writer pair
+and three rotation pairs. The first four 16-writer pairs had throughput
+ratios 1.002, 1.035, 1.018, and 0.997. The stalled pair was 0.520, with whole-device
+write latency averaging 2.574 versus 1.771 ms; this is not an isolated code
+measurement. These results do not establish an ext4 gain.
+
+A second series used five new pairs per case and sampled every 10 ops:
+
+| Confirmation case | Median paired throughput ratio | Median paired CPU-time ratio | Median paired p99 ratio |
+| --- | ---: | ---: | ---: |
+| ext4, 16 writers | 0.996 | 0.993 | 1.021 |
+| tmpfs, original four-writer case | 1.029 | 0.964 | 0.973 |
+
+The tmpfs confirmation throughput ratios were 1.029, 0.990, 0.990, 1.213,
+and 1.049. Median sync calls fell from 111,916 to 104,731. Both series favor
+the candidate on this workload, but the magnitude varies and two confirmation
+pairs were slightly slower. Keep this as a modest tmpfs throughput/CPU
+improvement, not a claim of a universal 9.4% gain or passage of the ext4
+adoption gate. The denser ext4 series remained near parity.
+
+All 44 focused parallel WAL tests passed before timing. After measurement,
+`cargo make check` passed, including both Clippy configurations and all 1,403
+tests. Raw measurements and scripts are transiently available as `/tmp/rfc024-coop-bench.jsonl`,
+`/tmp/rfc024-coop-confirm-bench.jsonl`, `/tmp/rfc024_coop_bench.py`, and
+`/tmp/rfc024_coop_confirm_bench.py`.
