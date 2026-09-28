@@ -1880,3 +1880,66 @@ The production change was reverted.
 Transient reproduction artifacts are `/tmp/rfc024_lazy_pool_bench.py`,
 `/tmp/rfc024-lazy-pool-bench.jsonl`, and
 `/tmp/rfc024-lazy-pool-rejected.patch`.
+
+## Initializing allocated extents (rejected implementation, 2026-09-28)
+
+An experiment at `39dd63cd` wrote aligned zeros to each newly allocated suffix
+after `fallocate`, before submitting WAL batches into that suffix. Existing
+bytes were never overwritten. The hypothesis was that converting unwritten
+extents ahead of the commit writes could reduce their filesystem overhead.
+Ext4's [direct-I/O completion path converts unwritten extents](https://kernel.googlesource.com/pub/scm/linux/kernel/git/mripard/linux/+/5a838c3b60e3a36ade764cf7751b8f17d7c9c2da/fs/ext4/inode.c);
+these benchmarks test the optimization's effect, not attribution through a
+kernel trace. The ordinary sync coordinator still acknowledged only its
+captured written prefix. No leader-path or public mode-selection change was made.
+
+The original 1 MiB extent variant passed all 44 focused WAL tests. Two further
+screens changed only the extent increment, to 128 KiB and 8 MiB. Each cell
+below uses five alternating baseline/candidate pairs, both in parallel mode,
+release/`bench`, 1 KiB values, PITR off, and latency sampling every 10 ops.
+Compilation and testing did not overlap benchmark timing. Ratios are medians
+of paired ratios, not ratios of arm medians.
+
+| Extent | ext4 workload (puts / writers / SST target) | Throughput ratio | p99 ratio |
+| --- | --- | ---: | ---: |
+| 1 MiB | 5k / 1 / 1 GiB | 1.726 | 0.531 |
+| 1 MiB | 20k / 4 / 1 MiB | 1.582 | 1.106 |
+| 1 MiB | 50k / 16 / 1 GiB | 1.090 | 1.761 |
+| 128 KiB | 5k / 1 / 1 GiB | 1.661 | 0.578 |
+| 128 KiB | 20k / 4 / 1 MiB | 1.427 | 0.894 |
+| 128 KiB | 50k / 16 / 1 GiB | 0.849 | 1.400 |
+| 8 MiB | 5k / 1 / 1 GiB | 1.751 | 0.528 |
+| 8 MiB | 20k / 4 / 1 MiB | 1.552 | 1.105 |
+| 8 MiB | 50k / 16 / 1 GiB | 1.380 | 1.959 |
+
+The 1 MiB single-writer median rose from 1,738 to 3,011 puts/s. Aggregate
+`fdatasync` time fell from 1.640 to 1.250 seconds across 5,000 syncs, while
+preallocation (now including initialization) rose from 0.7 to 26.7 ms.
+This is a substantial throughput signal, unlike the earlier allocation-only
+experiments. But synchronous initialization holds the packer during extra
+writes. At 128 KiB, the 16-writer case spent 477 ms in preallocation versus
+29 ms for baseline and needed 4,156 versus 3,252 syncs. Smaller initialization
+writes reduced individual pauses but interrupted batching more frequently.
+
+Several 1 MiB and 8 MiB 16-writer runs also crossed the known whole-device
+latency cliff. All pairs remain in the table; their throughput ratios cannot
+cleanly isolate a code effect. Even a normal-device 8 MiB pair was 1.193 in
+throughput but 1.959 in p99. None of the tested sizes meets the latency guard
+across these ext4 cases.
+
+The all-filesystem 1 MiB prototype also regressed tmpfs: single-writer
+throughput was 0.894 of baseline, and the original 200k/four-writer case was
+0.882 with p99 at 1.618. Initializing storage that needs no extent conversion
+adds work. The extra zero writes are counted in preallocation time, not the
+WAL batch SQE/CQE counters; those counters alone understate total I/O here.
+
+All production edits were reverted. A follow-up would need to prepare extents
+away from the packer's critical path, with explicit initialization ownership,
+failure handling, and shutdown ordering, and avoid this work on tmpfs. The
+current results support investigating that design, not shipping the synchronous
+prototype or claiming the adoption gate has passed.
+
+Transient records: `/tmp/rfc024-init-extent-bench.jsonl`,
+`/tmp/rfc024-init-128k-bench.jsonl`, `/tmp/rfc024-init-8m-bench.jsonl`.
+Reproduction scripts use the corresponding `/tmp/rfc024_init_*_bench.py`
+names. The three prototypes are saved as
+`/tmp/rfc024-init-extent-{1m,128k,8m}-rejected.patch`.
