@@ -2120,3 +2120,47 @@ This experiment does not establish a leader comparison or pass an adoption gate.
 Transient reproduction script: `/tmp/rfc024_reserve8m_bench.py`.
 Raw records: `/tmp/rfc024-reserve8m-chunk-bench.jsonl`.
 Rejected patch: `/tmp/rfc024-reserve8m-rejected.patch`.
+
+### Larger background initialization writes (rejected, 2026-09-29)
+
+Against `6329b202` (runtime unchanged from `055e7ea2`), increase the initializer's
+zero buffer/write chunk from 128 to 256 KiB. Keep allocation and lookahead at
+1 MiB. This halves the normal number of synchronous initialization writes per
+extent without increasing initialized bytes. It also doubles the initializer's
+buffer to 256 KiB per open parallel WAL. The hypothesis was lower initialization
+I/O overhead with acceptable tail latency while batch writes and syncs proceed.
+
+Five alternating pairs per workload used release/`bench`, parallel mode in both
+arms, 1 KiB values, PITR off, and latency sampling every 10 operations. No tests
+or compilation overlapped timing. Ratios are medians of paired candidate/baseline
+ratios, not ratios of independently computed medians.
+
+| Workload | Puts / writers / SST target | Throughput ratio | p99 ratio |
+| --- | --- | ---: | ---: |
+| ext4, single writer | 5k / 1 / 1 GiB | 1.049 | 0.950 |
+| ext4, growing WAL | 50k / 16 / 1 GiB | 0.988 | 0.989 |
+| ext4, rotation | 20k / 4 / 1 MiB | 1.026 | 1.212 |
+| tmpfs, single writer | 50k / 1 / 1 GiB | 1.039 | 0.932 |
+| tmpfs, original case | 200k / 4 / 1 MiB | 0.970 | 1.030 |
+
+Single-writer ext4 runs crossed a slow-device interval in both arms. Their
+throughput ratios were 1.003, 1.325, 2.378, 1.003, and 1.049; all remain included,
+but this series does not demonstrate a stable single-writer gain. The 16-writer
+ratios were 0.988, 1.026, 0.979, 1.081, and 0.972. Rotation p99 worsened in three
+of five pairs, by 21%, 26%, and 36%. The initializer is bypassed on tmpfs, so its
+variation is a control observation rather than an intended benefit or cost.
+
+Median packer readiness wait decreased from 1.130 to 0.860 ms for 16 writers
+and from 13.426 to 7.294 ms for rotation. These aggregate waits are small beside
+sync time: 16-writer aggregate `fdatasync` time changed from 891.843 to 903.368 ms,
+and rotation from 1,357.931 to 1,345.491 ms. Background initializer time is not
+included in the readiness metric. Reducing readiness wait did not produce a
+consistent end-to-end gain and came with worse rotation tails.
+
+Reject and restore 128 KiB chunks. All 48 focused WAL tests passed on ext4 before
+timing. The restored source matches the previously checked baseline. This is
+not a leader comparison or an adoption-gate result.
+
+Transient script: `/tmp/rfc024_init256_bench.py`.
+Raw records: `/tmp/rfc024-init256-chunk-bench.jsonl`.
+Rejected patch: `/tmp/rfc024-init256-rejected.patch`.
