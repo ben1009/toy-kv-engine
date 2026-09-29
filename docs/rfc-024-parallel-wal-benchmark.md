@@ -2215,3 +2215,37 @@ Diagnostic record: `/tmp/rfc024-sync-profile-current.json`.
 Transient script: `/tmp/rfc024_syncgrace_bench.py`.
 Raw paired records: `/tmp/rfc024-syncgrace-chunk-bench.jsonl`.
 Rejected patch: `/tmp/rfc024-syncgrace-rejected.patch`.
+
+### One submission-queue handle per staged batch (rejected, 2026-09-29)
+
+Against `6ca93f36`, the worker prototype held one mutable io_uring submission
+queue handle while pushing all staged writes, instead of acquiring/dropping
+one handle per SQE. The handle dropped before the existing submit call. This
+removed repeated queue synchronization without introducing a timed wait,
+changing write order, or altering buffer/CQE ownership.
+
+Five alternating pairs per case used release/`bench`, parallel mode in both
+arms, 1 KiB values, PITR off, and latency sampling every 10 operations. No
+compilation or tests overlapped timing. Ratios are medians of paired ratios.
+
+| Workload | Puts / writers / SST target | Throughput ratio | p99 ratio |
+| --- | --- | ---: | ---: |
+| ext4, single writer | 5k / 1 / 1 GiB | 1.007 | 0.988 |
+| ext4, growing WAL | 50k / 16 / 1 GiB | 0.977 | 1.037 |
+| ext4, rotation | 20k / 4 / 1 MiB | 0.997 | 0.955 |
+| tmpfs, single writer | 50k / 1 / 1 GiB | 0.983 | 1.023 |
+| tmpfs, original case | 200k / 4 / 1 MiB | 1.042 | 0.985 |
+
+Four of five 16-writer ext4 pairs had lower throughput and higher p99. Their
+throughput ratios were 1.013, 0.946, 0.977, 0.987, and 0.962. The tmpfs
+four-writer gain did not translate to the primary ext4 workloads. Reject the
+prototype: this small reduction in queue operations has not shown an ext4
+benefit, and these measurements do not identify why the candidate was slower.
+
+All 48 focused WAL tests passed on ext4 before timing. Restore the original
+worker; no production change is retained. No leader comparison or adoption-gate
+claim is made.
+
+Transient script: `/tmp/rfc024_sqbatch_bench.py`.
+Raw records: `/tmp/rfc024-sqbatch-chunk-bench.jsonl`.
+Rejected patch: `/tmp/rfc024-sqbatch-rejected.patch`.
