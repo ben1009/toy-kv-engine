@@ -2249,3 +2249,74 @@ claim is made.
 Transient script: `/tmp/rfc024_sqbatch_bench.py`.
 Raw records: `/tmp/rfc024-sqbatch-chunk-bench.jsonl`.
 Rejected patch: `/tmp/rfc024-sqbatch-rejected.patch`.
+
+### Scheduling, sync overlap, and concurrency limit (measurement, 2026-09-29)
+
+After the rejected queue-handle experiment, profile the unchanged `5a38eb90`
+baseline rather than introduce another small timing adjustment. Sample each
+live thread's `/proc/<pid>/task/<tid>/{comm,schedstat,wchan}` every 20 ms, keeping
+its latest counters. Run the release/`bench` parallel WAL with `--profile`,
+1 KiB values, PITR off, a 1 GiB SST target, and latency sampling every 10 puts.
+Use 20k puts at one writer, 50k at four writers, and 200k at 16/32/64 writers.
+No compilation or other benchmark ran concurrently.
+
+| Writers | Profiled ops/s | Mean tickets covered per sync | Syncs with at least one write CQE during the syscall |
+| ---: | ---: | ---: | ---: |
+| 1 | 2,982 | 1.00 | 0.0% |
+| 4 | 10,770 | 3.95 | 0.2% |
+| 16 | 28,347 | 14.36 | 1.8% |
+| 32 | 33,839 | 24.55 | 24.0% |
+| 64 | 16,912 | 5.84 | 8.9% |
+
+These are diagnostic observations, not paired throughput estimates. The
+sampler and detailed sync bookkeeping add overhead. CQE overlap measures
+software completion activity, not physical device queue depth.
+
+At 16 writers, sampled I/O-worker CPU was 2.705 seconds and runnable queue
+wait 0.010 seconds; the coordinator used 1.796 seconds of CPU and 0.063 seconds
+of runnable queue wait. Its sampled wait sites included `submit_bio_wait`,
+`futex_do_wait`, and `jbd2_log_wait_commit`. Thus lack of CPU scheduling time
+for the dedicated workers does not appear to dominate this run. The low
+write/sync overlap is consistent with synchronous producers arriving in waves:
+most of the current writers are waiting for the captured sync rather than
+supplying more writes. At 32 writers, overlap and throughput increase.
+
+At 64 writers, threads named `write-perf` accumulated 126.423 seconds of CPU
+and 5,419,938 scheduling slices, compared with 10.535 seconds and 372,755 slices
+at 16 writers for the same 200k operations. This name includes the main thread
+and producer threads. The sampler can miss short-lived threads and final
+increments before exit; counters also include startup/shutdown, so these are
+approximate whole-process-run attributions, not exact benchmark-phase totals.
+
+Repeat without `--profile` or the sampler to check whether instrumentation
+caused the collapse. Three trials used writer-count orders 16/32/64, 64/32/16,
+and 32/16/64, with 200k puts and otherwise identical options. Every run remains
+included. Independently computed medians are:
+
+| Writers | Ops/s | p99 (ms) | Process CPU (s) | Sync count |
+| ---: | ---: | ---: | ---: | ---: |
+| 16 | 28,190 | 1.300 | 14.789 | 13,911 |
+| 32 | 33,016 | 2.878 | 29.895 | 8,132 |
+| 64 | 10,110 | 20.925 | 186.069 | 30,336 |
+
+The slowdown persists without diagnostics. This is not a controlled attribution
+of the entire slowdown to one mechanism: device conditions can vary, and the
+sampler does not identify individual contended mutexes. However, the large
+increase in CPU and scheduling work establishes a software scaling concern,
+not merely an absence of outstanding I/O.
+
+The runtime's successful-sync path calls `durability.changed.notify_all()`;
+all ticket waiters share that condition variable and state mutex, including
+waiters whose tickets are beyond the newly durable frontier. A targeted next
+experiment is ticket-aware notification that wakes only newly durable waiters
+while preserving poison/shutdown notifications and preventing lost wakeups.
+This is a hypothesis, not a demonstrated cause or a retained implementation.
+Do not add more timed coalescing waits or increase depth solely from these
+measurements. No runtime change, leader comparison, or adoption-gate claim is
+part of this measurement commit.
+
+Transient scripts: `/tmp/rfc024_scheduler_profile.py`,
+`/tmp/rfc024_scheduler_profile_more.py`, and `/tmp/rfc024_concurrency_check.py`.
+Per-run diagnostics and sampled threads: `/tmp/rfc024-scheduler-{1,4,16,32,64}.json`
+and matching `-threads.json` files. Uninstrumented records:
+`/tmp/rfc024-concurrency-check.jsonl`.
