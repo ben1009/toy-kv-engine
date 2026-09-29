@@ -2373,3 +2373,67 @@ Transient scripts: `/tmp/rfc024_ticketwake_bench.py` and
 Raw records: `/tmp/rfc024-ticketwake-chunk-bench.jsonl` and
 `/tmp/rfc024-ticketwake-confirm.jsonl`.
 Rejected patch: `/tmp/rfc024-ticketwake-rejected.patch`.
+
+### Publication CPU attribution and shorter contention spin (rejected, 2026-09-29)
+
+Profile `2883dcbb` with 200k puts, 64 writers, 1 KiB values, a 1 GiB SST target,
+parallel WAL, and PITR off. Start the process first, wait 0.5 seconds for ring
+startup, then attach `perf record -e cycles:u -F 99 -m 1 -p <pid>` for five
+seconds. Attaching after startup with this small buffer succeeded where earlier
+startup-time perf attempts conflicted with io_uring allocation. It collected
+8,459 samples with zero reported loss. The hybrid CPU produced separate events:
+`publish_commit_ts` accounted for 91.42% of sampled user cycles on the atom
+PMU and 96.28% on the core PMU. These percentages exclude kernel cycles and are
+not percentages of end-to-end wall time.
+
+`perf annotate` places the hot instructions in the inlined publication frontier
+spin: repeated atomic frontier loads/comparisons and `pause` instructions, with
+an initial budget of 0x4000 (16,384) iterations. This is substantially stronger
+CPU attribution than the earlier wait-site inference about WAL condition-variable
+notifications. The producer must wait for earlier timestamps before reacquiring
+the publication mutex and publishing its own timestamp; this ordered handoff
+is downstream of successful WAL durability.
+
+Test a shorter spin only under high contention: use 256 iterations when the
+existing in-flight commit counter exceeds 32; otherwise retain 16,384. There
+is no WAL mode switch, and the publication/durability predicates are unchanged.
+The prototype changes the shared MVCC publication wait, with parallel WAL as
+the performance target. An earlier unconditional reduction had hurt low-load
+tmpfs performance, hence preserving that path here.
+
+All 186 selected WAL, MVCC, and serializable transaction tests passed on ext4
+before timing. Five alternating release/`bench` pairs per case used parallel
+mode in both arms, 1 KiB values, PITR off, latency sampling every 10 operations,
+and no detailed profiling. No compilation or tests overlapped the benchmark.
+Ratios are medians of paired candidate/baseline ratios.
+
+| Workload | Puts / writers / SST target | Throughput ratio | p99 ratio |
+| --- | --- | ---: | ---: |
+| ext4, high concurrency | 50k / 64 / 1 GiB | 0.317 | 1.599 |
+| ext4, single writer | 5k / 1 / 1 GiB | 1.004 | 1.110 |
+| ext4, growing WAL | 50k / 16 / 1 GiB | 0.995 | 0.997 |
+| ext4, rotation | 20k / 4 / 1 MiB | 1.005 | 0.940 |
+| tmpfs, single writer | 50k / 1 / 1 GiB | 1.026 | 0.887 |
+| tmpfs, original case | 200k / 4 / 1 MiB | 0.986 | 0.975 |
+
+At 64 writers, median process CPU fell from 34.128 to 20.543 seconds, but median
+sync count rose from 8,765 to 30,633 per 50k writes. Throughput collapsed while
+tails worsened. The first pair crossed a slow-device interval in both arms
+(about 1.5 ms/write); later pairs still showed a large regression, including
+0.311 and 0.298 throughput ratios with much lower device latency. Keep all pairs.
+
+Reject and restore the spin budget. Merely parking sooner reduces CPU but makes
+ordered publication progress worse in this workload. A stronger next design
+hypothesis is to record completed publication work out of order, allowing one
+publisher to advance the contiguous ready prefix for multiple timestamps rather
+than requiring a separate thread handoff for every timestamp. That needs an
+explicit correctness review of visibility, retired reservations, poison, and
+barrier drain before implementation; this measurement does not change those
+contracts. The original MVCC source is restored. No adoption-gate claim is made.
+
+Transient profiler: `/tmp/rfc024_user_cpu_profile.py`.
+Samples: `/tmp/rfc024-user-cpu.perf`; annotation:
+`/tmp/rfc024-publication-annotate.txt`.
+Benchmark script: `/tmp/rfc024_pubpressure_bench.py`.
+Raw records: `/tmp/rfc024-pubpressure-chunk-bench.jsonl`.
+Rejected patch: `/tmp/rfc024-pubpressure-rejected.patch`.
