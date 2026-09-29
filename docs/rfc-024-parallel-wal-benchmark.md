@@ -2164,3 +2164,54 @@ not a leader comparison or an adoption-gate result.
 Transient script: `/tmp/rfc024_init256_bench.py`.
 Raw records: `/tmp/rfc024-init256-chunk-bench.jsonl`.
 Rejected patch: `/tmp/rfc024-init256-rejected.patch`.
+
+### Grace period for late admissions before sync (rejected, 2026-09-29)
+
+An ext4 diagnostic run at `ba953229` used 50k puts, 16 writers, 1 KiB values,
+a 1 GiB SST target, and `--profile`. Of 3,524 syncs, 2,883 covered 16 groups,
+while 445 covered fewer than eight. Only five small syncs followed a sync
+shorter than 100 microseconds. This suggested that changing the cheap-sync gate
+would not remove most small batches. This diagnostic run was separate from
+paired timing.
+
+The prototype remembered the number of tickets acknowledged by the previous
+successful sync. When the current written prefix caught up with admission but
+covered fewer tickets than that previous batch, the coordinator waited up to
+20 microseconds for another completion. It could repeat after progress, but
+never extend the existing 400-microsecond coalescing deadline. Poison and
+completion-channel disconnection still ended the wait; steady single-writer
+traffic had no reason to enter the new grace period. The prior-sync latency
+gate remained 100 microseconds. No durability target or acknowledgement rule
+changed.
+
+Five alternating pairs compared the prototype against `ba953229`, both in
+parallel mode, release/`bench`, with 1 KiB values, PITR off, latency sampling
+every 10 operations, and no detailed sync diagnostics during timing. No tests
+or compilation overlapped the benchmark. Ratios are medians of paired ratios.
+
+| Workload | Puts / writers / SST target | Throughput ratio | p99 ratio |
+| --- | --- | ---: | ---: |
+| ext4, single writer | 5k / 1 / 1 GiB | 1.007 | 1.045 |
+| ext4, growing WAL | 50k / 16 / 1 GiB | 1.005 | 1.005 |
+| ext4, rotation | 20k / 4 / 1 MiB | 0.973 | 1.172 |
+| tmpfs, single writer | 50k / 1 / 1 GiB | 0.924 | 0.941 |
+| tmpfs, original case | 200k / 4 / 1 MiB | 0.962 | 1.016 |
+
+For 16 writers, median sync count decreased from 3,503 to 3,206 (8.5%), and
+aggregate sync time from 916.774 to 847.576 ms (7.5%). Throughput improved only
+0.5%, consistent with coalescing waits consuming most of the saved time rather
+than yielding a useful end-to-end gain. This is an inference from the counters,
+not a direct measurement of the new grace-period duration or scheduler delay.
+Rotation sync count only decreased from 5,097 to 5,051. Its final three pairs
+crossed slow-device intervals in both arms; all pairs remain included. Even
+its first two pairs had worse p99 (ratios 1.172 and 1.516).
+
+Reject the prototype and restore the original admitted-prefix coalescing rule.
+Reducing sync count through additional timed waits is insufficient here. The
+candidate passed all 48 focused WAL tests on ext4 before timing; restored source
+matches the previously checked baseline. No adoption-gate claim is made.
+
+Diagnostic record: `/tmp/rfc024-sync-profile-current.json`.
+Transient script: `/tmp/rfc024_syncgrace_bench.py`.
+Raw paired records: `/tmp/rfc024-syncgrace-chunk-bench.jsonl`.
+Rejected patch: `/tmp/rfc024-syncgrace-rejected.patch`.
