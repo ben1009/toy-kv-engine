@@ -2437,3 +2437,91 @@ Samples: `/tmp/rfc024-user-cpu.perf`; annotation:
 Benchmark script: `/tmp/rfc024_pubpressure_bench.py`.
 Raw records: `/tmp/rfc024-pubpressure-chunk-bench.jsonl`.
 Rejected patch: `/tmp/rfc024-pubpressure-rejected.patch`.
+
+### Advance the contiguous ready publication prefix (retained, 2026-09-29)
+
+The user-CPU profile above identified the publication handoff as the dominant
+64-writer hotspot. Against `067d4b09`, register out-of-order completed memtable
+publication in a `ready` timestamp set before waiting. A publisher or retirement
+that closes the earliest gap advances the whole contiguous ready/retired prefix.
+Followers no longer need to be scheduled one by one to advance their timestamps.
+The existing spin budget remains unchanged; this removes dependent handoffs
+rather than merely replacing spinning with parking.
+
+Correctness boundaries:
+
+- A timestamp enters `ready` only when its caller reaches `publish_commit_ts`,
+  after WAL success and completed memtable insertion on WAL-backed write paths.
+  The in-order path avoids inserting into the set.
+- `current_ts` advances only to an actually published timestamp. Retired holes
+  advance the ordering frontier but do not invent a visible commit timestamp.
+- Every caller still waits until its own timestamp is inside the visible prefix.
+  Its reservation remains in flight until that caller finishes, even when
+  another publisher advanced its timestamp. Barrier draining is conservative.
+- Advancement stops before `poisoned_at`. Earlier ready work can finish, including
+  when retiring an earlier hole releases it; failed reservations remain unresolved.
+- The set and frontiers remain under the existing publication mutex. Acquiring
+  that mutex observes a ready publisher's preceding memtable work; publishing
+  the reader-visible timestamp uses the existing release/acquire ordering.
+
+This changes shared MVCC publication, not the WAL submission, durability, or
+recovery protocol. It introduces no WAL mode selector and leaves PITR's WAL path
+unchanged. Out-of-order publishers use a BTreeSet entry until the prefix reaches
+them; this is extra bookkeeping proportional to outstanding ready publications.
+
+Five alternating release/`bench` pairs per case used parallel WAL in both arms,
+1 KiB values, PITR off, and latency sampling every 10 operations. No profiling,
+compilation, or tests overlapped timing. Ratios are medians of paired ratios.
+
+| Initial series | Puts / writers / SST target | Throughput ratio | p99 ratio |
+| --- | --- | ---: | ---: |
+| ext4, high concurrency | 50k / 64 / 1 GiB | 1.580 | 0.538 |
+| ext4, growing WAL | 50k / 16 / 1 GiB | 1.007 | 1.004 |
+| ext4, single writer | 5k / 1 / 1 GiB | 0.992 | 1.066 |
+| ext4, rotation | 20k / 4 / 1 MiB | 1.002 | 0.905 |
+| tmpfs, single writer | 50k / 1 / 1 GiB | 1.010 | 0.876 |
+| tmpfs, original case | 200k / 4 / 1 MiB | 0.974 | 0.970 |
+
+| Full-length confirmation, three fresh pairs | Puts / writers / SST target | Throughput ratio | p99 ratio |
+| --- | --- | ---: | ---: |
+| ext4, high concurrency | 200k / 64 / 1 GiB | 1.585 | 0.578 |
+| ext4, medium concurrency | 200k / 32 / 1 GiB | 1.116 | 0.779 |
+| ext4, original case | 200k / 4 / 1 MiB | 0.516 | 6.932 |
+
+The 64-writer confirmation throughput ratios were 1.585, 1.596, and 0.976;
+p99 ratios were 0.578, 0.568, and 1.573. The last pair crossed a slow-device
+interval. Median sync count fell from 37,187 to 6,037; median process CPU fell
+from 145.840 to 129.613 seconds, with paired CPU median ratio 0.889. At 32
+writers, all three throughput ratios exceeded one (1.589, 1.116, 1.059), and
+median process CPU fell from 30.434 to 27.513 seconds. These are observations
+from this host, not a confidence-bound adoption result.
+
+The full four-writer case is materially noisy and cannot be presented as a
+clean pass. Its first two candidates crossed much slower device intervals,
+with throughput ratios 0.516 and 0.313 and p99 ratios 6.932 and 12.433. The
+third pair was near parity (0.996 throughput, 0.914 p99). To investigate, two
+same-baseline-binary pairs produced throughput ratios 2.580 and 1.005: the
+first unchanged run slowed to 3.8k ops/s, then the same binary reached 9.9k.
+Fresh candidate/baseline pairs subsequently produced 2.516, 1.006, and 1.395,
+with p99 ratios 0.142, 0.909, and 0.802. All pairs remain included. The large
+same-binary swing proves substantial variability; it does not prove every
+candidate slowdown is unrelated to the change. There is no reliable large
+four-writer gain claim, and the adoption gate remains unproven.
+
+Because publication is shared, a separate three-pair regression check used the
+leader WAL mode with otherwise matching ext4 settings. Single-writer 5k puts
+had throughput/p99 ratios 0.994/0.988; four-writer 20k rotation had 0.996/1.017.
+This checks the shared change against its baseline, not parallel versus leader.
+
+Retain the ready-prefix change for the repeated high-concurrency improvement,
+with the above variability limits. Three new tests exercise ready followers
+behind a missing head, retired gaps, poison boundaries, and a barrier draining
+64 publications. All 189 focused WAL/MVCC/transaction tests passed on ext4.
+`cargo make check` passed both Clippy configurations and all 1,410 tests, using
+`TMPDIR=/dev/shm/rfc024-ahead-check-tmp` to avoid `/tmp` quota pressure.
+
+Artifacts moved to `target/rfc024-ready-experiment/`: `bench.py`, `confirm.py`,
+`rotation-null.py`, `rotation-confirm.py`, and `leader-check.py`, with matching
+JSONL results (`bench.jsonl`, `confirm.jsonl`, `rotation-null.jsonl`,
+`rotation-confirm.jsonl`, `leader-check.jsonl`). This ignored directory also
+contains the baseline binary, original MVCC source, and validation logs.

@@ -124,9 +124,10 @@ pub(crate) struct LsmMvccInner {
     /// Mirror of `publication.next_to_publish`, stored under the publication
     /// lock and read by waiters without it. See `await_publication`.
     frontier: AtomicU64,
-    /// Commit timestamps allocated but neither published nor retired. The
-    /// barrier drains this, in both publication modes, to prove that every
-    /// commit admitted before it armed has become visible.
+    /// Live commit reservations. A ready timestamp may already be visible
+    /// while its original publisher is still returning; that reservation stays
+    /// counted until the publisher completes. Barriers conservatively wait
+    /// for every earlier attempt to finish publication or retire.
     in_flight: AtomicU64,
     pub(crate) watermark: Watermark,
     pub(crate) committed_txns: Arc<Mutex<BTreeMap<u64, CommittedTxnData>>>,
@@ -136,6 +137,9 @@ struct PublicationState {
     admission_open: bool,
     next_to_publish: u64,
     retired: BTreeSet<u64>,
+    /// Memtable publication is complete, but an earlier reservation still
+    /// prevents these timestamps from joining the visible prefix.
+    ready: BTreeSet<u64>,
     poisoned_at: Option<u64>,
     /// How many threads are waiting on `publication_condvar` - the barrier's
     /// drain and any publisher waiting for an earlier timestamp. Publishers
@@ -254,6 +258,7 @@ impl LsmMvccInner {
                 admission_open: true,
                 next_to_publish: initial_ts.saturating_add(1),
                 retired: BTreeSet::new(),
+                ready: BTreeSet::new(),
                 poisoned_at: None,
                 waiters: 0,
             }),
@@ -337,23 +342,23 @@ impl LsmMvccInner {
             .store(publication.next_to_publish, Ordering::Release);
     }
 
-    /// Wait until every commit below `commit_ts` has published.
+    /// Wait until `commit_ts` and every earlier commit have published or retired.
     ///
-    /// Spins first, on the mirrored frontier: the wait is one WAL sync long, and
-    /// parking re-acquires the publication lock on every recheck - which delays
-    /// the publisher being waited on. A predecessor that takes longer than the
-    /// spin budget falls back to parking, so a stalled writer does not burn a
-    /// core, and the park is signalled by `publish_commit_ts` as before.
+    /// Spin briefly on the mirrored frontier before parking. The caller has
+    /// already registered its completed work, so a predecessor can publish it
+    /// without another handoff to this thread. A missing predecessor cannot
+    /// cause unbounded spinning; prefix advancement or poison wakes parked
+    /// callers, which always recheck the predicate under the publication lock.
     fn await_publication(&self, commit_ts: u64) -> anyhow::Result<()> {
         for _ in 0..PUBLICATION_SPIN_LIMIT {
-            if self.frontier.load(Ordering::Acquire) >= commit_ts {
+            if self.frontier.load(Ordering::Acquire) > commit_ts {
                 return Ok(());
             }
             std::hint::spin_loop();
         }
         let mut publication = self.publication.lock();
         publication.waiters += 1;
-        while publication.next_to_publish < commit_ts {
+        while publication.next_to_publish <= commit_ts {
             if publication
                 .poisoned_at
                 .is_some_and(|poisoned| commit_ts >= poisoned)
@@ -402,29 +407,46 @@ impl LsmMvccInner {
         *high_water = Some(high_water.map_or(recorded_at, |previous| previous.max(recorded_at)));
     }
 
+    /// Advance visibility only across completed work, never across a missing
+    /// timestamp or the poison boundary. Retired timestamps carry no data.
+    fn advance_ready_publications(&self, publication: &mut PublicationState) {
+        let previous_frontier = self.frontier.load(Ordering::Relaxed);
+        let mut published = None;
+        loop {
+            let next = publication.next_to_publish;
+            if publication.poisoned_at.is_some_and(|poison| next >= poison) {
+                break;
+            }
+            if publication.retired.remove(&next) {
+                publication.next_to_publish = next.saturating_add(1);
+            } else if publication.ready.remove(&next) {
+                published = Some(next);
+                publication.next_to_publish = next.saturating_add(1);
+            } else {
+                break;
+            }
+        }
+        if let Some(timestamp) = published {
+            self.current_ts.store(timestamp, Ordering::Release);
+        }
+        self.publish_frontier(publication);
+        if publication.waiters > 0 && publication.next_to_publish != previous_frontier {
+            self.publication_condvar.notify_all();
+        }
+    }
+
     pub(crate) fn retire_commit_ts(&self, commit_ts: u64) {
         let mut publication = self.publication.lock();
         self.in_flight.fetch_sub(1, Ordering::SeqCst);
-        if publication.poisoned_at.is_some() {
-            // Published nothing, and no boundary can be taken while poisoned.
-            return;
-        }
-        if commit_ts < publication.next_to_publish {
+        if publication
+            .poisoned_at
+            .is_some_and(|poison| commit_ts >= poison)
+            || commit_ts < publication.next_to_publish
+        {
             return;
         }
         publication.retired.insert(commit_ts);
-        loop {
-            let next = publication.next_to_publish;
-            if !publication.retired.remove(&next) {
-                break;
-            }
-            publication.next_to_publish = next.saturating_add(1);
-        }
-        self.publish_frontier(&publication);
-
-        if publication.waiters > 0 {
-            self.publication_condvar.notify_all();
-        }
+        self.advance_ready_publications(&mut publication);
     }
 
     pub(crate) fn poison_commit_ts(&self, commit_ts: u64) {
@@ -446,50 +468,36 @@ impl LsmMvccInner {
             .poisoned_at
             .is_some_and(|poisoned| commit_ts >= poisoned)
         {
-            // Deliberately left in flight: a poisoned sequencer keeps refusing
-            // recovery high-water updates until the database is reopened, which
-            // is what the unresolved reservation reports.
+            // Failed reservations remain in flight until recovery.
             anyhow::bail!("commit sequencer requires recovery after unknown WAL durability");
         }
         if commit_ts < publication.next_to_publish {
             self.in_flight.fetch_sub(1, Ordering::SeqCst);
             return Ok(());
         }
-        if commit_ts != publication.next_to_publish {
-            // Wait outside the lock: parking here made every waiter re-acquire
-            // the publication lock to recheck, which is what delayed the
-            // publisher it was waiting on.
+        if commit_ts == publication.next_to_publish {
+            // Preserve the allocation-free in-order path.
+            self.current_ts.store(commit_ts, Ordering::Release);
+            publication.next_to_publish = commit_ts.saturating_add(1);
+        } else {
+            // Memtable publication is complete. An earlier publisher may now
+            // advance this timestamp without waiting for this thread to run.
+            let inserted = publication.ready.insert(commit_ts);
+            debug_assert!(inserted, "commit publication is registered once");
+        }
+        self.advance_ready_publications(&mut publication);
+        if publication.next_to_publish <= commit_ts {
             drop(publication);
             self.await_publication(commit_ts)?;
             publication = self.publication.lock();
-            if publication
-                .poisoned_at
-                .is_some_and(|poisoned| commit_ts >= poisoned)
-            {
-                anyhow::bail!("commit sequencer requires recovery after unknown WAL durability");
-            }
-            if commit_ts < publication.next_to_publish {
-                // Retired while waiting: nothing left to publish.
-                self.in_flight.fetch_sub(1, Ordering::SeqCst);
-                return Ok(());
-            }
         }
         self.in_flight.fetch_sub(1, Ordering::SeqCst);
-        self.current_ts.store(commit_ts, Ordering::Release);
-        publication.next_to_publish = publication.next_to_publish.saturating_add(1);
-        loop {
-            let next = publication.next_to_publish;
-            if !publication.retired.remove(&next) {
-                break;
-            }
-            publication.next_to_publish = next.saturating_add(1);
-        }
-        self.publish_frontier(&publication);
-        // Only when this advance can unblock somebody: the barrier, or a later
-        // timestamp parked on the condvar rather than spinning.
-        if publication.waiters > 0 {
+        // The barrier still drains callers whose ready timestamps were made
+        // visible by another publisher but whose calls have not yet finished.
+        if publication.waiters > 0 && !publication.admission_open {
             self.publication_condvar.notify_all();
         }
+
         Ok(())
     }
 
@@ -1314,6 +1322,114 @@ mod tests {
         assert_eq!(next, commit_ts + 1);
         mvcc.publish_commit_ts(next).unwrap();
         assert_eq!(mvcc.latest_commit_ts(), next);
+    }
+
+    fn wait_for_ready(mvcc: &LsmMvccInner, count: usize) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while mvcc.publication.lock().ready.len() != count {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "publishers did not become ready"
+            );
+            std::thread::yield_now();
+        }
+    }
+
+    #[test]
+    fn ready_publications_advance_together_after_a_retired_gap() {
+        let mvcc = Arc::new(LsmMvccInner::new(0));
+        for timestamp in 1..=4 {
+            assert_eq!(mvcc.reserve_commit_ts().unwrap(), timestamp);
+        }
+        let followers: Vec<_> = (3..=4)
+            .map(|timestamp| {
+                let mvcc = Arc::clone(&mvcc);
+                std::thread::spawn(move || mvcc.publish_commit_ts(timestamp).unwrap())
+            })
+            .collect();
+        wait_for_ready(&mvcc, 2);
+        assert_eq!(mvcc.latest_commit_ts(), 0);
+        assert_eq!(mvcc.in_flight.load(Ordering::SeqCst), 4);
+        mvcc.publish_commit_ts(1).unwrap();
+        assert_eq!(mvcc.latest_commit_ts(), 1);
+        mvcc.retire_commit_ts(2);
+        assert_eq!(mvcc.latest_commit_ts(), 4);
+        for follower in followers {
+            follower.join().unwrap();
+        }
+        assert_eq!(mvcc.in_flight.load(Ordering::SeqCst), 0);
+        assert_eq!(mvcc.stop_commit_admission_and_capture().unwrap(), Some(4));
+    }
+
+    #[test]
+    fn ready_publications_stop_at_poison_and_preserve_the_earlier_prefix() {
+        let mvcc = Arc::new(LsmMvccInner::new(0));
+        for _ in 0..4 {
+            mvcc.reserve_commit_ts().unwrap();
+        }
+        let earlier = {
+            let mvcc = Arc::clone(&mvcc);
+            std::thread::spawn(move || mvcc.publish_commit_ts(2))
+        };
+        let later = {
+            let mvcc = Arc::clone(&mvcc);
+            std::thread::spawn(move || mvcc.publish_commit_ts(4))
+        };
+        wait_for_ready(&mvcc, 2);
+        mvcc.poison_commit_ts(3);
+        // Retirement before the poison boundary must still release the ready prefix.
+        mvcc.retire_commit_ts(1);
+        earlier.join().unwrap().unwrap();
+        assert!(later.join().unwrap().is_err());
+        assert_eq!(mvcc.latest_commit_ts(), 2);
+        assert_eq!(mvcc.frontier.load(Ordering::Acquire), 3);
+        assert_eq!(mvcc.in_flight.load(Ordering::SeqCst), 2);
+        assert!(mvcc.stop_commit_admission_and_capture().is_err());
+    }
+
+    #[test]
+    fn ready_publication_barrier_waits_for_the_missing_head() {
+        let mvcc = Arc::new(LsmMvccInner::new(0));
+        for _ in 0..64 {
+            mvcc.reserve_commit_ts().unwrap();
+        }
+        let followers: Vec<_> = (2..=64)
+            .map(|timestamp| {
+                let mvcc = Arc::clone(&mvcc);
+                std::thread::spawn(move || mvcc.publish_commit_ts(timestamp).unwrap())
+            })
+            .collect();
+        wait_for_ready(&mvcc, 63);
+        let (captured_tx, captured_rx) = mpsc::channel();
+        let barrier = {
+            let mvcc = Arc::clone(&mvcc);
+            std::thread::spawn(move || {
+                captured_tx
+                    .send(mvcc.stop_commit_admission_and_capture())
+                    .unwrap();
+            })
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while mvcc.commit_admission_is_open() {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        assert!(captured_rx.try_recv().is_err());
+        assert_eq!(mvcc.latest_commit_ts(), 0);
+        mvcc.publish_commit_ts(1).unwrap();
+        assert_eq!(mvcc.latest_commit_ts(), 64);
+        assert_eq!(
+            captured_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap()
+                .unwrap(),
+            Some(64)
+        );
+        for follower in followers {
+            follower.join().unwrap();
+        }
+        barrier.join().unwrap();
+        assert_eq!(mvcc.in_flight.load(Ordering::SeqCst), 0);
     }
 
     #[test]
