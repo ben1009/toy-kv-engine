@@ -2320,3 +2320,56 @@ Transient scripts: `/tmp/rfc024_scheduler_profile.py`,
 Per-run diagnostics and sampled threads: `/tmp/rfc024-scheduler-{1,4,16,32,64}.json`
 and matching `-threads.json` files. Uninstrumented records:
 `/tmp/rfc024-concurrency-check.jsonl`.
+
+### Ticket-indexed durability wakeups (rejected, 2026-09-29)
+
+Test the preceding notification hypothesis against `b2aa595a`. Replace the
+single durability condition variable with 64 fixed condition variables indexed
+by ticket modulo 64. After a successful sync, notify only slots intersecting
+the newly durable ticket interval, bounded to all 64 slots for a larger advance.
+Poison and shutdown still notify every slot. Waiters continue checking durability
+and poison under the same mutex. Slot collisions can cause unrelated wakeups,
+so this is a bounded approximation of per-ticket notification, not a full
+per-ticket waiter registry. It adds no allocation per wait and no timed delay.
+
+The candidate passed all 48 focused WAL tests on ext4, including existing
+failure and shutdown coverage, before timing. Five alternating pairs per case
+used release/`bench`, parallel mode in both arms, 1 KiB values, PITR off,
+latency sampling every 10 operations, and no detailed sync diagnostics. No tests
+or compilation overlapped timing. Ratios below are medians of paired ratios.
+
+| Workload | Puts / writers / SST target | Throughput ratio | p99 ratio |
+| --- | --- | ---: | ---: |
+| ext4, high concurrency | 50k / 64 / 1 GiB | 1.016 | 0.943 |
+| ext4, single writer | 5k / 1 / 1 GiB | 0.980 | 0.944 |
+| ext4, growing WAL | 50k / 16 / 1 GiB | 1.009 | 1.001 |
+| ext4, rotation | 20k / 4 / 1 MiB | 0.982 | 0.973 |
+| tmpfs, single writer | 50k / 1 / 1 GiB | 0.956 | 1.087 |
+| tmpfs, original case | 200k / 4 / 1 MiB | 0.987 | 1.018 |
+
+The short 64-writer series reduced median process CPU from 34.734 to 33.508
+seconds, with a median paired CPU ratio of 0.987. These small changes did not
+resolve the large CPU cost. Repeat the original 200k-put, 64-writer workload
+in three fresh alternating pairs to check the longer run:
+
+| Pair | Throughput ratio | p99 ratio | Process CPU ratio |
+| ---: | ---: | ---: | ---: |
+| 0 | 0.992 | 1.029 | 1.013 |
+| 1 | 1.037 | 0.983 | 0.969 |
+| 2 | 0.815 | 1.147 | 1.195 |
+| Median | 0.992 | 1.029 | 1.013 |
+
+Median process CPU was 134.187 seconds for baseline and 135.849 seconds for the
+candidate. Whole-device latency was about 0.16 ms/write in these full-length
+runs; no pair was discarded. The result does not support retaining this
+notification scheme. It also does not prove that every form of exact waiter
+notification would fail, or identify which other shared lock dominates.
+Restore the original condition variable and keep the high-concurrency slowdown
+as an unresolved profiling target. No runtime change or adoption-gate claim
+is retained.
+
+Transient scripts: `/tmp/rfc024_ticketwake_bench.py` and
+`/tmp/rfc024_ticketwake_confirm.py`.
+Raw records: `/tmp/rfc024-ticketwake-chunk-bench.jsonl` and
+`/tmp/rfc024-ticketwake-confirm.jsonl`.
+Rejected patch: `/tmp/rfc024-ticketwake-rejected.patch`.
