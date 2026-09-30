@@ -2729,3 +2729,53 @@ Validation: `cargo make check` passed both Clippy configurations, all 1,410
 tests with zero skips, formatting, dependency checks, and typos. Tests used
 `TMPDIR=/dev/shm/rfc024-ahead-check-tmp` and four nextest threads, after all
 benchmark runs completed.
+
+### Compile worker invariant traversal only in debug builds (not retained, 2026-09-30)
+
+Profile the `ce82d01c` behavior with 400k puts, 64 writers, parallel WAL, PITR
+off, 1 KiB values, and a 1 GiB SST target on ext4. Attach a five-second
+`cycles:u` capture after 0.5 seconds of startup, at 99 Hz with a one-page
+perf buffer. The capture collected 2,334 samples without reported loss.
+`WorkerCore::assert_invariants` accounted for 2.33% of atom-PMU and 2.17% of
+core-PMU user cycles. Publication still accounted for 23.24% and 40.06%,
+respectively. These are sampled user-CPU shares, not wall-time shares.
+
+The invariant helper contains a vector allocation and adjacent-group lookups
+outside its `debug_assert!` expressions. Test guarding that traversal with
+`cfg(debug_assertions)` and using zipped iterators instead of collecting a
+temporary vector. The candidate preserves debug ordering assertions; release
+symbol inspection no longer finds the invariant helper. All 63 focused
+parallel-WAL tests passed before timing.
+
+Both benchmark arms use release/`bench`, parallel WAL, PITR off, 1 KiB values,
+and latency sampling every ten operations. Alternate arm order, with no
+profiling, builds, or tests during timing. Ratios are medians of paired
+candidate/baseline ratios; retain every observation.
+
+| Workload | Puts / writers / SST target | Pairs | Throughput ratio | p99 ratio |
+| --- | --- | ---: | ---: | ---: |
+| ext4, high concurrency | 200k / 64 / 1 GiB | 5 | 0.982 | 0.987 |
+| ext4, medium concurrency | 200k / 32 / 1 GiB | 5 | 1.001 | 0.995 |
+| ext4, growing WAL | 50k / 16 / 1 GiB | 3 | 1.005 | 1.049 |
+| ext4, single writer | 5k / 1 / 1 GiB | 3 | 1.006 | 1.008 |
+| ext4, rotation | 20k / 4 / 1 MiB | 3 | 1.013 | 0.977 |
+| tmpfs, single writer | 50k / 1 / 1 GiB | 3 | 0.933 | 0.803 |
+| tmpfs, original case | 200k / 4 / 1 MiB | 3 | 1.005 | 1.025 |
+
+The first two 64-writer pairs and the second 32-writer pair crossed slower
+device intervals in the candidate. The other three 64-writer throughput
+ratios were 1.019, 0.997, and 0.982, also offering no repeatable throughput
+gain. Median paired process CPU ratios were 1.041 at 64 writers and 1.034
+at 32 writers. Removing the profiled helper did not reduce measured total
+CPU in these runs; these measurements do not establish why. Do not retain
+the optimization based solely on an eliminated symbol or allocation when
+end-to-end evidence does not support it. Restore the original worker source.
+The existing 32-group limit remains unchanged.
+
+Artifacts: `target/rfc024-depth32-profile/` contains the baseline profiling
+script, perf capture, profiler log, and workload JSON. The experiment directory
+`target/rfc024-worker-invariants-experiment/` preserves both binaries and worker
+sources, `bench.py`, `bench.jsonl`, `guards.py`, `guards.jsonl`, benchmark logs,
+and the candidate build/test logs. No runtime change or adoption-gate claim
+is retained. Final validation checks document spelling and whitespace and
+confirms that the Rust source matches the starting revision.
