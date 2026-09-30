@@ -3068,3 +3068,48 @@ workload JSON. `target/rfc024-sync-select-experiment/` preserves baseline and
 candidate binaries and runtime sources, build and focused-test logs, benchmark
 script, `bench.jsonl`, `guards.jsonl`, and their logs. Final checks verify
 spelling, whitespace, and source identity with the starting revision.
+
+
+### Reused submission staging vector (2026-09-30)
+
+`WorkerCore::stage_writes` allocates a vector with capacity up to 256 on every
+worker pass, even when no write is ready. Test reusing one submission-metadata
+vector for the worker loop. Clear it before staging and drain it after pushing
+SQEs, preserving capacity. The vector never owns submitted buffers; request
+state and buffer ownership remain in `WorkerCore`. A test-only wrapper preserves
+the existing state-machine test interface.
+
+All 64 focused parallel-WAL tests pass before timing, including a new regression
+check for distinct staged requests, reused capacity, empty passes, reversed
+completion order, and buffer retirement. Compare against `925ed07d` runtime
+behavior with release/`bench`, parallel WAL, PITR off, 1 KiB values, latency
+sampling every ten operations, and alternating order. No builds, tests, or
+profiling overlap timing. Keep every observation and report medians of paired
+candidate/baseline ratios.
+
+| Workload | Puts / writers / SST target | Pairs | Throughput ratio | p99 ratio | CPU ratio |
+| --- | --- | ---: | ---: | ---: | ---: |
+| ext4-64-full, initial | 200k / 64 / 1 GiB | 5 | 0.987 | 0.995 | 1.012 |
+| ext4-32-full, initial | 200k / 32 / 1 GiB | 5 | 0.990 | 1.016 | 1.070 |
+| ext4-64-full, fresh | 200k / 64 / 1 GiB | 3 | 1.011 | 0.995 | 1.019 |
+| ext4-32-full, fresh | 200k / 32 / 1 GiB | 3 | 1.001 | 0.988 | 1.060 |
+| ext4-16, fresh | 50k / 16 / 1 GiB | 3 | 1.006 | 1.027 | 0.993 |
+| tmpfs-exact, fresh | 200k / 4 / 1 MiB | 3 | 1.014 | 1.080 | 0.981 |
+| ext4-64-full, combined | 200k / 64 / 1 GiB | 8 | 0.993 | 0.995 | 1.015 |
+| ext4-32-full, combined | 200k / 32 / 1 GiB | 8 | 0.994 | 1.002 | 1.065 |
+
+Some 64-writer pairs cross slow-device intervals in both arms. All observations
+remain in the medians; do not credit large throughput differences caused by
+unequal device conditions to the code. Whole-device latency counters include
+unrelated and out-of-window I/O and are contextual only.
+
+Do not retain staging-vector reuse. Both 32-writer sets have higher process CPU,
+without a repeatable throughput gain, and the tmpfs guard has worse p99.
+Removing an allocation from the source is insufficient end-to-end evidence.
+These measurements do not explain the increased CPU. Restore the worker and
+rebuild the release binary; existing runtime optimizations remain unchanged.
+
+Artifacts: `target/rfc024-stage-scratch-experiment/` preserves baseline and
+candidate binaries and worker sources, build and focused-test logs, benchmark
+script, `bench.jsonl`, `confirm.jsonl`, and their logs. Final checks verify
+spelling, whitespace, and source identity with the starting revision.
