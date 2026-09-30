@@ -3018,3 +3018,53 @@ script, and workload JSON. `target/rfc024-worker-ahash-experiment/` preserves
 both binaries and worker sources, build and focused-test logs, `bench.py`,
 `bench.jsonl`, `guards.jsonl`, and benchmark logs. Final checks verify spelling,
 whitespace, and that the Rust source matches the starting revision.
+
+
+### Sync coordinator empty-channel waiting (2026-09-30)
+
+The 4,096-iteration publication-budget profile attributes 3.11% of atom-PMU
+and 6.17% of core-PMU user cycles to the sync coordinator's Crossbeam list
+channel receive. Inspect the local Crossbeam source: ordinary receive retries
+with spin/yield backoff before registering a waiter; the selection path tries
+once before registering. Test a single-channel `select_biased!` in the outer
+coordinator receive loop. Keep coalescing receives, completion processing,
+captured sync targets, poison handling, and shutdown draining unchanged.
+
+All 63 focused parallel-WAL tests pass before timing. Compare against
+`925ed07d` runtime behavior, with release/`bench`, parallel WAL, PITR off,
+1 KiB values, latency sampling every ten operations, and alternating arm order.
+No builds, tests, or profiling overlap timing. Retain every observation;
+report medians of paired candidate/baseline ratios.
+
+| Workload | Puts / writers / SST target | Pairs | Throughput ratio | p99 ratio | CPU ratio |
+| --- | --- | ---: | ---: | ---: | ---: |
+| ext4-64-full, initial | 200k / 64 / 1 GiB | 5 | 1.013 | 0.978 | 1.037 |
+| ext4-32-full, initial | 200k / 32 / 1 GiB | 5 | 0.978 | 0.991 | 1.097 |
+| ext4-64-full, fresh | 200k / 64 / 1 GiB | 3 | 0.973 | 0.995 | 1.052 |
+| ext4-32-full, fresh | 200k / 32 / 1 GiB | 3 | 0.963 | 0.980 | 1.112 |
+| tmpfs-solo, fresh | 50k / 1 / 1 GiB | 3 | 0.968 | 1.060 | 0.994 |
+| ext4-solo, fresh | 5k / 1 / 1 GiB | 3 | 1.013 | 1.012 | 0.954 |
+| ext4-rotation, fresh | 20k / 4 / 1 MiB | 3 | 0.977 | 0.885 | 1.012 |
+| tmpfs-exact, fresh | 200k / 4 / 1 MiB | 3 | 0.973 | 1.035 | 1.019 |
+| ext4-64-full, combined | 200k / 64 / 1 GiB | 8 | 1.001 | 0.983 | 1.042 |
+| ext4-32-full, combined | 200k / 32 / 1 GiB | 8 | 0.972 | 0.985 | 1.104 |
+
+The initial 64-writer set includes slow intervals in both arms, and the final
+initial 32-writer pair crosses slow intervals in both arms. The second fresh
+rotation baseline is slower, yielding an apparent 3.568 throughput ratio.
+Do not credit these large differences to the code. Whole-device latency
+counters include unrelated and out-of-window I/O and are contextual only.
+All observations remain in the reported medians.
+
+Do not retain this scheduling change. Both 32-writer sets reduce throughput
+and increase total process CPU; the fresh 64-writer and tmpfs comparisons also
+regress. Removing a receive backoff does not establish that CPU is eliminated
+rather than shifted elsewhere. These measurements do not explain the increased
+CPU, but they do not support the candidate. Restore the original coordinator
+and rebuild the release binary. No runtime optimization is retained.
+
+Artifacts: `target/rfc024-spin4096-profile/` contains the baseline profile and
+workload JSON. `target/rfc024-sync-select-experiment/` preserves baseline and
+candidate binaries and runtime sources, build and focused-test logs, benchmark
+script, `bench.jsonl`, `guards.jsonl`, and their logs. Final checks verify
+spelling, whitespace, and source identity with the starting revision.
