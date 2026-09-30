@@ -2638,3 +2638,33 @@ Artifacts: `target/rfc024-spin-threshold-experiment/` contains both binaries,
 the original MVCC source, benchmark scripts, `bench.jsonl`, `screen.log`,
 `confirm.log`, and the candidate build log. The JSONL file appends both phases;
 pair numbers restart in the confirmation phase, so preserve record order.
+
+### Finish waiting publications without reacquiring the mutex (not retained, 2026-09-30)
+
+The post-ready-prefix profile still showed publication and mutex contention.
+Test removing the second publication-mutex acquisition after a writer has
+successfully awaited its visible timestamp. The candidate decrements its
+in-flight reservation and only reacquires the mutex to notify a drain waiter
+when the sequentially consistent admission gate is closed. It leaves the
+initial publication lock and visibility/poison predicates unchanged.
+
+All 335 selected WAL/MVCC/transaction tests passed before timing. Compare the
+saved `eb973f81` behavior against this release/`bench` candidate, with parallel
+WAL in both arms, PITR off, 200k puts, 1 KiB values, a 1 GiB SST target, and
+latency sampling every ten operations. Three pairs alternate arm order, with
+no builds or tests during timing.
+
+| Writers | Paired throughput ratios | Median throughput ratio | Median p99 ratio |
+| ---: | --- | ---: | ---: |
+| 64 | 0.991, 0.966, 1.025 | 0.991 | 0.997 |
+| 32 | 0.259, 0.413, 0.977 | 0.413 | 5.020 |
+
+The first two 32-writer pairs crossed slower device intervals in the candidate;
+the third had similar whole-device write latency (0.090 versus 0.087 ms/write)
+and still showed no gain. The 64-writer runs had similar device latency across
+arms. Every observation is retained. Revert the optimization: even the quieter
+pairs do not justify retaining the additional completion-path branch.
+
+Artifacts: `target/rfc024-publication-finish-experiment/` contains the original
+MVCC source, both binaries, `bench.py`, `bench.jsonl`, `screen.log`, and build
+and test logs. This is an unsuccessful experiment, not an adoption-gate result.
