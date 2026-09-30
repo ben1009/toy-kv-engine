@@ -2779,3 +2779,74 @@ sources, `bench.py`, `bench.jsonl`, `guards.py`, `guards.jsonl`, benchmark logs,
 and the candidate build/test logs. No runtime change or adoption-gate claim
 is retained. Final validation checks document spelling and whitespace and
 confirms that the Rust source matches the starting revision.
+
+
+### Distance-aware publication waiting (2026-09-30)
+
+The 32-group profile still attributes 23.24% of atom-PMU and 40.06% of
+core-PMU user cycles to publication. At 32 live reservations, the existing
+contention hint retains a 16,384-iteration spin budget even for a caller far
+behind a missing predecessor. Test the existing 256-iteration budget when
+more than 16 reservations are live and the caller is at least 16 timestamps
+ahead of the mirrored frontier. More than 32 reservations still selects the
+short budget as before. Acquire frontier reads and locked completion/poison
+predicates decide success; these hints only choose when to park.
+
+An initial variant checked distance at every concurrency level. Its ten
+32-writer pairs showed throughput/p99 ratios 1.073/0.796, but the original
+four-writer tmpfs case regressed in two independent five-pair sets
+(0.927/1.057 and 0.946/1.063). Do not retain that variant. The revised variant
+avoids the additional frontier read with 16 or fewer live reservations.
+
+Both arms use release/`bench`, parallel WAL, PITR off, 1 KiB values, and latency
+sampling every ten operations. Alternate arm order; no builds, tests, or
+profiling overlap timing. Compare against `ce82d01c` runtime behavior.
+Ratios are medians of paired candidate/baseline ratios; retain every observation.
+
+| Workload | Puts / writers / SST target | Pairs | Throughput ratio | p99 ratio |
+| --- | --- | ---: | ---: | ---: |
+| ext4, 32 writers, initial | 200k / 32 / 1 GiB | 5 | 1.036 | 0.823 |
+| ext4, 32 writers, fresh | 200k / 32 / 1 GiB | 3 | 1.046 | 0.840 |
+| ext4, 32 writers, combined | 200k / 32 / 1 GiB | 8 | 1.040 | 0.831 |
+| ext4, 64 writers | 200k / 64 / 1 GiB | 3 | 0.986 | 1.024 |
+| ext4, 16 writers | 50k / 16 / 1 GiB | 3 | 1.008 | 0.980 |
+| ext4, single writer | 5k / 1 / 1 GiB | 3 | 1.006 | 0.843 |
+| ext4, rotation | 20k / 4 / 1 MiB | 3 | 1.005 | 1.078 |
+| tmpfs, single writer | 50k / 1 / 1 GiB | 5 | 1.015 | 0.864 |
+| tmpfs, original case | 200k / 4 / 1 MiB | 5 | 0.981 | 1.004 |
+
+Median paired process CPU at 32 writers is 0.835, with lower CPU and p99
+in all eight pairs. Two baseline runs crossed slow-device intervals and
+produced apparent 3.48x and 2.90x throughput gains; do not credit those to the
+code. The other six throughput ratios are 0.962, 1.013, 1.045, 1.036, 1.046,
+and 1.032. The 64-writer set includes a candidate slow interval (0.259
+throughput, 8.159 p99); the other two throughput ratios are 0.996 and 0.986.
+Whole-device write latency is contextual, not a critical-path attribution.
+
+Because this changes shared MVCC code, run leader-mode regression controls.
+The first three 32-writer pairs have throughput/p99 medians 0.326/7.618,
+including two candidate slow intervals. A fresh three-pair set with reversed
+starting order has medians 2.761/0.152, including two baseline slow intervals.
+All six pairs combined have medians 1.002/1.001. The two pairs without these
+large swings are 0.999/0.999 and 1.005/1.003. An identical-baseline-binary null
+control also produces a 5.026/0.100 pair, followed by near-parity pairs; its
+three-pair medians are 1.010/0.965. These controls expose substantial device
+variability and do not establish a leader performance improvement. Leader
+single-writer and rotation controls have three-pair throughput/p99 medians
+1.002/0.954 and 1.005/0.990, respectively.
+
+Retain the revised scheduling hint for review based on the repeated 32-writer
+parallel CPU/p99 improvement and near-parity combined leader controls.
+This experiment does not prove the device-backed adoption gate: the comparison
+is candidate versus the existing parallel pipeline, and the device variability
+limits the throughput evidence. Leader remains the default.
+
+Artifacts: `target/rfc024-publication-distance-experiment/` contains the baseline
+and first-variant binaries and sources, both build logs, focused test log,
+`bench.jsonl`, `guards.jsonl`, solo/tmpfs confirmation logs, revised `v2.jsonl`
+and `v2-confirm.jsonl`, leader controls, `v2-leader-null.jsonl`, and
+`v2-leader-confirm.jsonl`. The revised candidate binary and source are preserved as `candidate-v2` and
+`candidate-v2-mvcc.rs`. `cargo make check` passed, including default- and
+all-feature Clippy checks and all 1,410 tests. A separate documentation spelling
+check and whitespace check passed. Logs are `check.log` and `docs-check.log`
+in the experiment directory.

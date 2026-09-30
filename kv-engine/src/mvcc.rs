@@ -27,6 +27,7 @@ static NEXT_MVCC_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 const PUBLICATION_SPIN_LIMIT: u32 = 1 << 14;
 const CONTENDED_PUBLICATION_SPIN_LIMIT: u32 = 256;
 const PUBLICATION_CONTENTION_THRESHOLD: u64 = 32;
+const PUBLICATION_DISTANCE_THRESHOLD: u64 = 16;
 
 /// How long the commit barrier waits before rechecking a drain, so that a
 /// signal missed by the lock-free publication path costs a bounded delay
@@ -351,15 +352,20 @@ impl LsmMvccInner {
     /// cause unbounded spinning; prefix advancement or poison wakes parked
     /// callers, which always recheck the predicate under the publication lock.
     fn await_publication(&self, commit_ts: u64) -> anyhow::Result<()> {
-        // Ready work can advance while this caller is parked. Under contention,
-        // leave CPU time for the missing predecessor and WAL workers. The count
-        // is only a scheduling hint; the frontier and locked predicate decide completion.
-        let spin_limit =
-            if self.in_flight.load(Ordering::Relaxed) > PUBLICATION_CONTENTION_THRESHOLD {
-                CONTENDED_PUBLICATION_SPIN_LIMIT
-            } else {
-                PUBLICATION_SPIN_LIMIT
-            };
+        // Ready work can advance while this caller is parked. Under contention
+        // or far behind a missing predecessor, leave CPU time for publishers
+        // and WAL workers. Counts and distance are only scheduling hints; the
+        // frontier and locked predicate still decide completion.
+        let in_flight = self.in_flight.load(Ordering::Relaxed);
+        let spin_limit = if in_flight > PUBLICATION_CONTENTION_THRESHOLD
+            || (in_flight > PUBLICATION_DISTANCE_THRESHOLD
+                && commit_ts.saturating_sub(self.frontier.load(Ordering::Acquire))
+                    >= PUBLICATION_DISTANCE_THRESHOLD)
+        {
+            CONTENDED_PUBLICATION_SPIN_LIMIT
+        } else {
+            PUBLICATION_SPIN_LIMIT
+        };
         for _ in 0..spin_limit {
             if self.frontier.load(Ordering::Acquire) > commit_ts {
                 return Ok(());
