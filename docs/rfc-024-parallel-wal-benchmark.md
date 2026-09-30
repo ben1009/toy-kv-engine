@@ -3292,7 +3292,10 @@ and IRQ-service times and no sampled persistent ready CQ backlog. Exact
 device/platform attribution remains unresolved. A controlled large-write pressure
 test also triggers the same-file stall after a sequential throughput cliff.
 Disabling APST and cooling do not prevent the stall; vendor telemetry reports
-89% SLC buffer available, so a simply full cache is not established. Keep the
-comparison scores provisional until fresh same-binary
+89% SLC buffer available, so a simply full cache is not established. An approved
+TRIM of free `/home` blocks followed by idle coincides with recovery; three
+subsequent unchanged four-writer engine samples stay at 9,851–9,917 puts/s.
+Recovery also occurred before TRIM, so this is a possible measurement mitigation,
+not a unique root-cause proof or an adoption score. Keep the comparison scores provisional until fresh same-binary
 controls establish comparable storage latency; the diagnostic samples do not
 qualify adoption.

@@ -471,11 +471,53 @@ necessarily informing the SSD immediately. Benchmark churn since the last
 scheduled trim could leave stale mappings and internal reclamation pressure.
 This is a hypothesis, not a measured stale-mapping count.
 
-A proposed `fstrim -v /home` intervention would discard currently free blocks,
-then repeat the same initialized reference and vendor telemetry. It is not
-covered by approval of APST or vendor cache flushing: discarding free blocks
-can prevent recovery of previously deleted data. Separate approval is pending;
-no manual TRIM has been executed by this investigation.
+After separate explicit approval, `fstrim -v /home` completes successfully
+from 02:10:14 to 02:12:09 CST on October 1. It reports 137,764,712,448 bytes
+(128.3 GiB) trimmed. Whole-device counters independently increase by 56,507
+discard commands and exactly the reported byte count. Allocated reference
+file data is preserved. No continuous-discard setting or timer changes are made.
+
+| Probe phase | Samples | Writes/s | Write p99, ms |
+| --- | ---: | --- | --- |
+| Immediately before TRIM | 3 | 2,954; 3,037; 3,076 | 5.795; 7.856; 7.758 |
+| Immediately after TRIM | 6 | 2,894; 3,051; 3,360; 3,375; 3,330; 3,364 | 7.096; 2.885; 0.649; 0.649; 0.654; 0.654 |
+
+TRIM does not immediately restore the 11–12k writes/s fast state. The apparent
+p99 improvement does not mean all stalls disappear: the last four probes each
+have 134 of 16,384 writes taking at least 1 ms, below the 1% percentile threshold.
+Mean direct-write time remains 0.232–0.235 ms versus roughly 0.024 ms in earlier
+fast probes; mean sync time remains 0.256–0.258 ms. Post-TRIM vendor telemetry
+still reports 89% SLC buffer available and unchanged cache-flush counters.
+
+After another 120 seconds idle, the first probe remains at 3,362 writes/s,
+p99 0.664 ms. The next two recover to 11,389 and 11,540, with p99 0.044 and
+0.043 ms, all at 47.85 Celsius. This contrasts with the earlier idle control
+that stayed slow, but recovery also occurred before TRIM during scratch cleanup.
+Therefore TRIM plus settling is a possible mitigation, not proof that stale
+mappings uniquely cause the instability. There is no randomized TRIM/sham
+comparison, and the intervention cannot restore the previous mapping state.
+
+Repeating the allocation-only control after TRIM produces four fast samples:
+11,552 before allocation; 11,371 and 11,350 with the unwritten 96 GiB file
+retained; 11,370 after removing it. Write p99 is 0.045–0.050 ms throughout.
+This contrasts with the pre-TRIM allocation control, but one before/after
+sequence does not prove a general cure or isolate the firmware mechanism.
+`trim_allocation_control_probe.py` removes its own scratch file afterward.
+
+Three unchanged parallel WAL engine samples then use four writers, 200,000
+puts, 1,024-byte values, 1 MiB target SST size, and latency sampling every ten
+puts, matching the earlier APST engine diagnostic. All three stay fast:
+9,917, 9,851, and 9,890 puts/s, with commit p99 1.255, 1.417, and 1.364 ms.
+The runtime binary is unchanged at `925ed07d`, with the previously recorded
+SHA-256. APST uses its restored original configuration. These are three
+post-intervention diagnostic samples, not an interleaved baseline/candidate
+comparison or an adoption score. Artifacts are `trim_engine_probe.py` and
+`trim-engine-capture/runs.jsonl`.
+
+Artifacts are `trim_compare.sh`, `trim_before_probe.py`, `trim_after_probe.py`,
+`trim_idle_probe.py`, `trim-result.txt`, start/end timestamps, before/after device
+counters, `trim-summary.json`, `sst-tools/cache-after-trim.json`, and the same
+`pressure-capture/runs.jsonl` containing every probe.
 
 ## Consequence for optimization decisions
 
@@ -500,5 +542,8 @@ completion visibility, with short observed submission and IRQ-service times.
 The pressure sequence reproduces the stall, but the allocation-only control
 also observes a transition without large data writes. APST is not required,
 and the slow state persists after cooling and short idle. Read-only cache telemetry rejects a simple
-currently-full SLC explanation. Exact controller, media, firmware, or PCIe/DMA
-attribution remains open.
+currently-full SLC explanation. TRIM followed by idle coincides with recovery,
+and the subsequent allocation control and three engine samples remain fast.
+This supplies a possible measurement mitigation; it does not establish a unique
+cause, given the earlier recovery without TRIM. Exact controller, media,
+firmware, or PCIe/DMA attribution remains open.
