@@ -265,6 +265,55 @@ and analyses are retained under `target/rfc024-stall-diagnosis/`:
 samples; stopping on an observed slow state is for diagnosis, not an adoption
 sampling rule.
 
+## Command flags and flush-cadence counterexamples
+
+A follow-up eBPF capture records NVMe read/write control bits and issuing PIDs.
+The direct-write workload overwrites one fully initialized 128 MiB file, using
+4 KiB synchronous `O_DIRECT` writes. It varies only the number of writes between
+`fdatasync` calls; zero means no intermediate sync, with a final sync outside
+the timed window. All eight executed samples are retained:
+
+| Run | Writes per sync | Writes/s | Write p99, ms | Mean sync, ms |
+| --- | ---: | ---: | ---: | ---: |
+| 0 | 4 | 3,008 | 5.385 | 0.271 |
+| 1 | 0 | 20,708 | 0.037 | — |
+| 2 | 16 | 9,509 | 0.642 | 0.621 |
+| 3 | 1 | 1,688 | 7.523 | 0.259 |
+| 4 | 64 | 40,500 | 0.035 | 0.249 |
+| 5 | 4 | 10,729 | 0.052 | 0.250 |
+| 6 | 0 | 82,744 | 0.016 | — |
+| 7 | 4 | 10,615 | 0.051 | 0.250 |
+
+The traced workload writes have NVMe control value zero in both fast and slow
+states; the FUA bit does not change. This rejects a change in write durability
+flags as the explanation for these samples. Slow commands also occur without
+intermediate syncs: run 1 has 88 commands taking at least 5 ms, despite write
+p99 below 0.04 ms. Again, fewer than 1% of slow operations can evade p99.
+
+The exact sync-every-four workload is slow in run 0 and fast in runs 5 and 7,
+on the same file and device. Flush frequency alone is insufficient to explain
+the operating-state change. Since the cadence sequence is not randomized or
+repeated in reverse order, this experiment does not establish that changing
+cadence causes recovery. No WAL rotation, fresh extent allocation, MVCC, or
+io_uring is required for the reproduced slow state.
+
+A read-only PCIe capability inspection finds the NVMe endpoint in D0 with
+ASPM disabled and all L1 substates disabled. Its link remains 16 GT/s, x4,
+with no exposed error-status bits. A vendor-specific additional SMART Get Log
+request, page `0xca`, returns status `0x109` (unsupported log page), so it
+provides no NAND/cache/performance-state telemetry. That diagnostic rejection
+may appear in the error information log and should not be classified as a new
+media or workload I/O failure.
+
+Artifacts are `flush_probe.py`, `nvme-flush.bt`, `capture_flush.sh`, and
+`flush-capture/` under the diagnostic directory. A device-wide APST on/off
+comparison is prepared but has **not run** pending explicit approval. Its
+protocol snapshots the current enable bit and all transition-table bytes,
+uses volatile settings only, runs ordinary-user workloads, restores the exact
+configuration, and verifies readback. Read-only guard inspection succeeds;
+compilation checks pass. No causal APST conclusion follows before executing
+that comparison in a reproduced slow state.
+
 ## Consequence for optimization decisions
 
 The benchmark mixes substantially different storage-completion latency states.
