@@ -3289,6 +3289,10 @@ reproducer. The unchanged binary enters fast and slow storage-completion
 states; WAL command setup-to-completion p99 is 0.282 versus 8.670 ms in the
 selected diagnostic intervals. Subsequent eBPF captures reproduce the slow state with short driver submission
 and IRQ-service times and no sampled persistent ready CQ backlog. Exact
-device/platform attribution remains unresolved. Keep the comparison scores provisional until fresh same-binary
+device/platform attribution remains unresolved. A controlled large-write pressure
+test also triggers the same-file stall after a sequential throughput cliff.
+Disabling APST and cooling do not prevent the stall; vendor telemetry reports
+89% SLC buffer available, so a simply full cache is not established. Keep the
+comparison scores provisional until fresh same-binary
 controls establish comparable storage latency; the diagnostic samples do not
 qualify adoption.

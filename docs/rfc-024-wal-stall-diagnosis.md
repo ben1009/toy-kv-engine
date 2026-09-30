@@ -7,8 +7,13 @@ handling. The same stalls reproduce without the engine. This explains a major
 measurement confounder, but does not identify the exact device or interrupt
 mechanism. Subsequent eBPF captures reproduce the slow state, find short
 driver submission and interrupt handling, and observe no persistent ready CQ
-backlog at millisecond sampling resolution. Small optimization gains remain unqualified until fresh controls
-show comparable storage latency.
+backlog at millisecond sampling resolution. A subsequent write-pressure test
+reproduces the slow state on the same initialized file after a large sequential
+write cliff; an allocation-only control also sees a transition without large
+data writes. Disabling APST does not prevent it. Vendor telemetry reports 89%
+SLC buffer available while the probe remains slow, so cache exhaustion alone
+is not established. Small optimization gains remain unqualified until fresh
+controls show comparable storage latency.
 
 ## What has been measured
 
@@ -20,8 +25,10 @@ The original comparison and rerun remain in
 The host uses Linux 6.18.9, ext4 on `/dev/nvme0n1p3`, and a Solidigm
 `SSDPFKNU010TZ` SSD behind Intel VMD. The same device holds `/` and `/home`.
 Its scheduler is `none`. The CPU has 32 logical CPUs with performance and
-efficiency cores. No global scheduler, affinity, mount, power, durability, or
-production WAL setting has been changed.
+efficiency cores. No global scheduler, affinity, mount, durability, or production WAL setting
+has been changed. Explicitly approved APST experiments temporarily change its
+volatile enable bit and restore the exact original bit and transition table
+with verified readback after every experiment.
 
 Eight monitored current-parallel runs record device and partition counters,
 I/O pressure, dirty/writeback pages, accessible process I/O, thread scheduling
@@ -306,13 +313,169 @@ may appear in the error information log and should not be classified as a new
 media or workload I/O failure.
 
 Artifacts are `flush_probe.py`, `nvme-flush.bt`, `capture_flush.sh`, and
-`flush-capture/` under the diagnostic directory. A device-wide APST on/off
-comparison is prepared but has **not run** pending explicit approval. Its
-protocol snapshots the current enable bit and all transition-table bytes,
-uses volatile settings only, runs ordinary-user workloads, restores the exact
-configuration, and verifies readback. Read-only guard inspection succeeds;
-compilation checks pass. No causal APST conclusion follows before executing
-that comparison in a reproduced slow state.
+`flush-capture/` under the diagnostic directory.
+
+## APST intervention and restoration
+
+After explicit approval, each root guard snapshots the APST enable bit and all
+32 transition entries, uses volatile Set Features only, runs workloads as the
+ordinary user, and restores the original configuration. Enable-bit readback and
+byte-for-byte table comparison confirm exact restoration in every experiment.
+Signal handlers also preserve restoration on interruption. No firmware or
+persistent power configuration changes are made.
+
+The first direct-write comparison alternates on/off/off/on/on/off. All six
+samples are fast, at 11,011–11,717 writes/s, so it is inconclusive. A six-sample
+four-writer engine comparison produces five fast samples at 9,866–9,945 puts/s
+and one APST-on sample at 3,706 puts/s with p99 9.978 ms. That correlation alone
+cannot establish causation.
+
+A further experiment disables APST continuously without reprogramming it between
+samples. The first engine sample reaches 9,950 puts/s; the next drops to 3,839
+with p99 10.099 ms. The guard then stops the diagnostic on the reproduced slow
+state and restores the original settings. APST is therefore not necessary for
+the recurring stall. Artifacts are the `apst*_guard.c` and `apst*_probe.py`
+scripts, `apst-capture/`, `apst-engine-capture/`, `apst-off-capture/`, and
+`apst-summary.json`.
+
+## Controlled write pressure and same-file recovery
+
+`pressure_probe.py` initializes a 64 MiB reference file once and reuses it for
+all probes: 16,384 aligned 4 KiB direct writes, syncing every four writes. A
+separate 96 GiB fallocated scratch file receives sequential 1 MiB direct writes
+in 8 GiB chunks, with a sync after each chunk. The reference probe runs between
+chunks. This is ordinary file I/O, with no device setting changes, explicit
+TRIM, cache clearing, or writes to existing user files.
+
+| Completed pressure, GiB | Chunk throughput, MiB/s | Reference writes/s | Reference write p99, ms |
+| --- | ---: | ---: | ---: |
+| 0 | — | 11,867; repeat 10,900 | 0.044; 0.046 |
+| 8 | 2,413 | 11,616 | 0.044 |
+| 16 | 2,376 | 11,366 | 0.044 |
+| 24 | 2,410 | 11,381 | 0.050 |
+| 32 | 168 | 11,436 | 0.044 |
+| 40 | 185 | 3,022 | 8.200 |
+| 48 | 181 | 3,135 | 4.842 |
+| 56 | 151 | 3,082 | 7.713 |
+| 64 | 145 | 8,528 | 0.642 |
+
+The large-write throughput cliff begins between 24 and 32 GiB. The small-write
+reference subsequently reproduces the recurring millisecond stall without the
+WAL. The 64 GiB reference sample partly recovers; the behavior is not a monotonic
+function of total bytes written, and this sample is retained rather than filtered.
+
+After the 64 GiB chunk and a partial next chunk, the diagnostic is deliberately
+interrupted to avoid further pressure and measure recovery. Both scratch inodes
+are retained through hard links before the script removes its original names.
+The completed chunks are known; the exact partial-chunk byte count is not.
+The experiment does not claim that all 96 GiB were written. All executed samples
+and the intentional stop are recorded in `pressure-capture/runs.jsonl` and
+`pressure-stop.json`.
+
+With both allocations retained, the immediate reference probe reaches 3,056
+writes/s, p99 7.775 ms, at 51.85 Celsius. After 60 seconds idle it remains at
+3,069, p99 7.676 ms, at 49.85 Celsius; a repeat reaches 2,879. A second recovery
+experiment holds APST disabled throughout 120 seconds idle. Reference throughput
+stays at 3,020–3,027 with p99 8.119–8.198 ms and temperature 47.85–48.85 Celsius.
+The APST guard restores and verifies the original configuration afterward.
+
+Temperature alone does not explain these samples: the reference is fast at
+63.85 Celsius after 32 GiB, yet slow after cooling to 47.85–51.85 Celsius.
+Short idle, including idle without autonomous power saving, does not reset the
+observed state. The pressure sequence reproduces the original stall, but does not establish
+write volume as its unique cause. It does not separate internal media management
+from other firmware or platform effects, and is not a randomized repeated
+intervention trial.
+
+## Vendor cache telemetry limits the cache-exhaustion explanation
+
+Solidigm documents a read-only `show --performancebooster` query and a separate
+command to start cache flushing. See the
+[maintenance documentation](https://www.solidigm.com/support-page/maintenance-tools/ka-00057.html)
+and [SST CLI guide](https://sdmsdfwdriver.blob.core.windows.net/files/kba-gcc/drivers-downloads/ka-00085/sst--3-1/solidigm-cli-storage-tool-user-guide-727329-019us.pdf).
+
+The official SST 3.1.346 Debian package is extracted into the ignored diagnostic
+directory, without installation. Its absolute library path is supplied through
+a private mount namespace using the extracted libraries; host mounts are
+unchanged. A library-path shim attempt fails before the working namespace query.
+The initial read-only query uses:
+
+```text
+sst show --output json --ssd /dev/nvme0n1 --performancebooster
+```
+
+The drive reports **89% SLC buffer available**, eviction completion 100%, flush
+elapsed time zero, and zero host initialize/cancel operations. The last three
+same-file probes immediately afterward remain slow at 2,004, 2,043, and 1,961
+writes/s, with p99 8.195, 8.029, and 8.660 ms. Temperature is 50.85–53.85 Celsius.
+
+Consequently, the evidence does not support saying the SLC buffer is simply
+full during this slow state. The preceding sequential-write cliff and slow
+reference are compatible with internal cache/media-management effects, but
+that mechanism remains an inference. After separate explicit approval for this device-wide intervention, the vendor
+`start --performancebooster` command reports success and the host-initialize
+counter increments to one. This acknowledges initiation, not completion. All
+24 read-only polls at five-second intervals show eviction completion zero,
+available buffer 89%, and flush elapsed time zero. After the bounded two-minute
+poll, `stop --performancebooster` reports success. The host-cancel counter
+increments to one and eviction completion returns to 100%, with elapsed time
+still zero. The operation is cancelled rather than established as a successful
+cache eviction; the final 100% status must not be used as proof of a reset.
+Consequently, this intervention cannot validate or reject an effect of a
+successfully completed cache flush. Three same-inode probes after cancellation
+reach 1,629, 1,522, and 1,444 writes/s, with write p99 14.570, 15.033, and
+15.477 ms. They do not recover. The before/after comparison is confounded by
+the uncompleted intervention and changing device state; it does not establish
+that the vendor command causes this further deterioration.
+
+After the comparison, the diagnostic's own 96 GiB pressure file is removed;
+the same 64 MiB reference remains. The first cleanup probe is still slow at
+2,509 writes/s, p99 12.128 ms. The next two recover to 11,334 and 11,658,
+both with p99 0.043 ms, at 47.85–48.85 Celsius. The host ext4 mount uses
+`rw,relatime`, without the `discard` option, and no explicit discard is issued.
+A further vendor query reports 90% buffer available, elapsed flush time zero,
+and unchanged initialize/cancel counters. Thus the slow-to-fast reversal occurs
+without a reported successful vendor flush and without allocating a new
+reference inode. A single recovery following deletion cannot attribute it to
+deleting the file rather than elapsed time or changing controller state.
+
+An allocation-only control then repeats the same reference probe around
+fallocating a separate unwritten 96 GiB file. There are no large data writes:
+before allocation it reaches 12,162 writes/s; with the allocation retained,
+11,647 and 10,410, all with p99 0.040–0.043 ms. After removing that file, the
+next probe drops to 3,036 with p99 5.772 ms. This rejects a deterministic
+explanation based solely on filesystem free space and shows that large data
+write volume is not required to observe a transition. It does not prove that
+unlink causes the stall: metadata I/O, timing, and device state are not separated
+in this sequence. Three immediate follow-up probes stay slow at 3,014–3,054 writes/s with p99
+7.775–7.819 ms. All seven samples are retained in the same JSONL log;
+`allocation_control_probe.py` cleans up its own large file in a `finally` block.
+`allocation_followup_probe.py` records the subsequent samples. Both 96 GiB
+scratch allocations are removed; only the 64 MiB reference remains.
+
+Artifacts are `sst-tools/cache-status.json`, `cache-flush-start.log`,
+`cache-flush-poll.log`, `cache-flush-stop.log`, the extracted official package,
+`show-cache.sh`, `start-cache.sh`, `poll-cache.sh`, `stop-cache.sh`,
+`vendor_cache_probe.py`, `vendor_cache_cancel_probe.py`,
+`pressure_cleanup_probe.py`, `pressure-capture/cleanup.json`, and
+`sst-tools/cache-after-cleanup.json`. No vendor package
+is installed globally and no firmware update is performed.
+
+## Remaining intervention: filesystem discard
+
+Read-only systemd inspection shows `fstrim.timer` enabled, with the last
+successful run on September 28, 2026, from 00:43:02 to 00:48:15 CST; the next
+run is October 5. The SSD supports discard, but ext4 has no continuous discard
+mount option. Thus removing scratch files frees filesystem space without
+necessarily informing the SSD immediately. Benchmark churn since the last
+scheduled trim could leave stale mappings and internal reclamation pressure.
+This is a hypothesis, not a measured stale-mapping count.
+
+A proposed `fstrim -v /home` intervention would discard currently free blocks,
+then repeat the same initialized reference and vendor telemetry. It is not
+covered by approval of APST or vendor cache flushing: discarding free blocks
+can prevent recovery of previously deleted data. Separate approval is pending;
+no manual TRIM has been executed by this investigation.
 
 ## Consequence for optimization decisions
 
@@ -334,4 +497,8 @@ software metric, not device queue depth.
 No Rust implementation or production default changes result from this
 investigation. The slow-state eBPF captures narrow attribution toward device/platform
 completion visibility, with short observed submission and IRQ-service times.
-Exact controller, media, firmware, or PCIe/DMA attribution remains open.
+The pressure sequence reproduces the stall, but the allocation-only control
+also observes a transition without large data writes. APST is not required,
+and the slow state persists after cooling and short idle. Read-only cache telemetry rejects a simple
+currently-full SLC explanation. Exact controller, media, firmware, or PCIe/DMA
+attribution remains open.
