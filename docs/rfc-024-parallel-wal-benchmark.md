@@ -2850,3 +2850,65 @@ and `v2-confirm.jsonl`, leader controls, `v2-leader-null.jsonl`, and
 all-feature Clippy checks and all 1,410 tests. A separate documentation spelling
 check and whitespace check passed. Logs are `check.log` and `docs-check.log`
 in the experiment directory.
+
+
+### Shorter low-contention publication spin budget (2026-09-30)
+
+Profile the retained distance-aware publication hint at 32 writers on ext4:
+400k puts, 1 KiB values, 1 GiB SST target, parallel WAL, PITR off. Attach perf
+after 0.5 seconds of startup, using `cycles:u`, 99 Hz, and a one-page perf
+buffer for five seconds. The capture has 2,529 samples with no reported loss.
+Publication accounts for 56.12% of atom-PMU and 62.77% of core-PMU user cycles;
+instruction annotation concentrates samples in the repeated frontier reads,
+comparisons, and spin-loop bookkeeping. These are sampled user-CPU shares,
+not wall-time shares.
+
+Test reducing the longer publication spin budget from 16,384 to 4,096 iterations.
+Keep the 256-iteration contention/distance budget and all completion, poison,
+and condition-variable predicates unchanged. Compare against `a4a6093e`, with
+release/`bench`, alternating arm order, 1 KiB values, and latency sampling every
+ten operations. No builds, tests, or profiling overlap benchmark timing.
+Ratios are medians of paired candidate/baseline ratios; keep every observation.
+
+| Workload | Puts / writers / SST target | Pairs | Throughput ratio | p99 ratio |
+| --- | --- | ---: | ---: | ---: |
+| ext4, 64 writers | 200k / 64 / 1 GiB | 5 | 1.002 | 0.997 |
+| ext4, 32 writers, initial | 200k / 32 / 1 GiB | 5 | 1.003 | 0.898 |
+| ext4, 32 writers, fresh | 200k / 32 / 1 GiB | 3 | 0.997 | 0.892 |
+| ext4, 32 writers, combined | 200k / 32 / 1 GiB | 8 | 1.000 | 0.896 |
+| ext4, 16 writers | 50k / 16 / 1 GiB | 3 | 1.001 | 0.984 |
+| ext4, single writer | 5k / 1 / 1 GiB | 3 | 1.026 | 0.872 |
+| ext4, rotation | 20k / 4 / 1 MiB | 3 | 1.012 | 0.980 |
+| tmpfs, single writer | 50k / 1 / 1 GiB | 3 | 1.136 | 1.004 |
+| tmpfs, original case | 200k / 4 / 1 MiB | 3 | 1.010 | 1.033 |
+
+Across the eight 32-writer pairs, median process CPU is 0.972. Seven pairs
+improve p99; the remaining pair crosses slow-device intervals in both arms,
+with throughput/p99 ratios 0.762/1.237, and remains included. Six pairs reduce
+CPU. At 64 writers, two candidate and two baseline runs cross slow intervals,
+producing throughput ratios 0.290, 0.269, 3.176, and 4.111; do not credit these
+swings to the code. The remaining pair is near parity. Whole-device latency
+counters include unrelated and out-of-window I/O and are contextual only.
+The tmpfs single-writer throughput difference is not established as an effect
+of this hint: an in-order publication does not enter the changed wait loop.
+
+Leader-mode regression controls compare baseline and candidate, not parallel
+versus leader. The initial three 32-writer pairs have throughput/p99 medians
+0.307/7.066, including two candidate slow intervals. A fresh reversed-order
+set has medians 0.822/1.489; two candidate runs and one baseline run cross slow
+intervals. Across all six pairs the medians are 0.678/2.862. The large
+whole-device latency differences make attribution uncertain, but the repeated
+comparison does not clear this shared change. Leader single-writer and rotation
+three-pair throughput/p99 medians are 1.005/0.980 and 1.011/1.011.
+
+Do not retain the shorter spin budget. The parallel p99 improvement is repeatable,
+but throughput remains near parity and the leader regression control is unresolved.
+Restore `a4a6093e` source and rebuild the release binary before further experiments.
+No runtime optimization or adoption-gate claim is retained.
+
+Artifacts: `target/rfc024-distance-profile/` contains the starting perf capture,
+annotation, profiling script, and workload JSON. The experiment directory
+`target/rfc024-spin4096-experiment/` preserves both binaries and MVCC sources,
+build log, `bench.jsonl`, `guards.jsonl`, `leader.jsonl`, `leader-confirm.jsonl`,
+benchmark scripts, and logs. Final checks verify spelling, whitespace, and
+that the Rust source matches the starting revision.
