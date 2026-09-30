@@ -509,7 +509,7 @@ impl WalSyncProgress {
     }
 }
 
-const MAX_INFLIGHT_GROUPS: usize = 16;
+const MAX_INFLIGHT_GROUPS: usize = 32;
 const MAX_OUTSTANDING_SQES: usize = RING_SIZE;
 const DIRECT_IO_ALIGNMENT: usize = 4096;
 
@@ -2706,15 +2706,15 @@ mod tests {
     }
 
     #[test]
-    fn worker_bounds_sixteen_groups_and_256_outstanding_sqes() {
+    fn worker_bounds_thirty_two_groups_and_256_outstanding_sqes() {
         let drops = Arc::new(AtomicUsize::new(0));
         let mut core = WorkerCore::new();
-        let bytes_per_group = 33 * 4096;
-        for group_index in 0..16 {
+        let bytes_per_group = 17 * 4096;
+        for group_index in 0..32 {
             core.enqueue(make_group(
                 group_index..group_index + 1,
                 4096 + group_index * bytes_per_group,
-                33,
+                17,
                 4096,
                 &drops,
             ))
@@ -2722,8 +2722,8 @@ mod tests {
         }
         assert!(matches!(
             core.enqueue(make_group(
-                16..17,
-                4096 + 16 * bytes_per_group,
+                32..33,
+                4096 + 32 * bytes_per_group,
                 1,
                 4096,
                 &drops
@@ -2733,8 +2733,8 @@ mod tests {
 
         let first_wave = submitted_ids(&mut core, 512);
         assert_eq!(first_wave.len(), 256);
-        assert_eq!(core.group_count(), 16);
-        assert_eq!(core.inflight_group_count(), 16);
+        assert_eq!(core.group_count(), 32);
+        assert_eq!(core.inflight_group_count(), 32);
         assert_eq!(core.outstanding_sqe_count(), 256);
         assert!(core.stage_writes(1).expect("ring at capacity").is_empty());
 
@@ -2751,7 +2751,7 @@ mod tests {
 
         let second_wave = submitted_ids(&mut core, 256);
         assert_eq!(second_wave.len(), 256);
-        assert_eq!(core.inflight_group_count(), 16);
+        assert_eq!(core.inflight_group_count(), 32);
         assert_eq!(core.outstanding_sqe_count(), 256);
         for request_id in second_wave {
             for event in core
@@ -2765,9 +2765,9 @@ mod tests {
         }
 
         let third_wave = submitted_ids(&mut core, 256);
-        assert_eq!(third_wave.len(), 16);
-        assert_eq!(core.inflight_group_count(), 16);
-        assert_eq!(core.outstanding_sqe_count(), 16);
+        assert_eq!(third_wave.len(), 32);
+        assert_eq!(core.inflight_group_count(), 32);
+        assert_eq!(core.outstanding_sqe_count(), 32);
         for request_id in third_wave {
             for event in core
                 .complete_write(request_id, 4096)
@@ -2780,7 +2780,7 @@ mod tests {
         }
 
         assert!(core.is_idle());
-        assert_eq!(drops.load(Ordering::Acquire), 16 * 33 + 1);
+        assert_eq!(drops.load(Ordering::Acquire), 32 * 17 + 1);
     }
 
     #[test]

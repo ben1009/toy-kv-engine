@@ -2668,3 +2668,64 @@ pairs do not justify retaining the additional completion-path branch.
 Artifacts: `target/rfc024-publication-finish-experiment/` contains the original
 MVCC source, both binaries, `bench.py`, `bench.jsonl`, `screen.log`, and build
 and test logs. This is an unsuccessful experiment, not an adoption-gate result.
+
+### Thirty-two groups after publication fixes (retained, 2026-09-30)
+
+Revisit the previously rejected 32-group limit after ready-prefix publication
+and the high-contention spin reduction. The current 64-writer baseline repeatedly
+reaches 16 outstanding groups and write SQEs. Raise only the parallel worker's
+group limit to 32; the shared ring limit remains 256 SQEs, and buffer budgets,
+ordered frontiers, failure handling, and the default leader WAL are unchanged.
+This changes software pipeline capacity, not a measured NVMe queue depth.
+
+Compare the saved `eb973f81` behavior against a release/`bench` candidate. Both
+arms use parallel WAL, PITR off, 1 KiB values, and latency sampling every ten
+operations. Alternate arm order and keep compilation, tests, and profiling out
+of timed runs. Ratios are medians of paired candidate/baseline ratios.
+
+| Workload | Puts / writers / SST target | Pairs | Throughput ratio | p99 ratio |
+| --- | --- | ---: | ---: | ---: |
+| ext4, initial screen | 200k / 64 / 1 GiB | 3 | 1.021 | 0.961 |
+| ext4, fresh confirmation | 200k / 64 / 1 GiB | 5 | 1.021 | 0.966 |
+| ext4, all high-concurrency observations | 200k / 64 / 1 GiB | 8 | 1.021 | 0.964 |
+| ext4, medium concurrency | 200k / 32 / 1 GiB | 3 | 1.035 | 0.980 |
+| ext4, growing WAL | 50k / 16 / 1 GiB | 5 | 0.979 | 0.999 |
+| ext4, single writer | 5k / 1 / 1 GiB | 5 | 0.992 | 0.942 |
+| ext4, rotation | 20k / 4 / 1 MiB | 5 | 1.012 | 0.920 |
+| tmpfs, single writer | 50k / 1 / 1 GiB | 5 | 0.993 | 1.021 |
+| tmpfs, original case | 200k / 4 / 1 MiB | 5 | 1.008 | 0.937 |
+
+Across all eight 64-writer pairs, median arm throughput was 46,684 versus
+48,004 puts/s, and median arm p99 was 2.618 versus 2.535 ms. Paired throughput
+ratios were 1.021, 1.059, 0.977, 1.046, 0.991, 1.039, 1.013, and 1.021;
+all eight p99 ratios improved, ranging from 0.952 to 0.974. Both the initial
+screen and fresh confirmation show the same modest effect. Outstanding groups
+and write SQEs reached 16 in baseline and 32 in candidate. Median sync count
+increased from 5,057 to 5,166 per 200k puts: the extra capacity does not mean
+more tickets per sync.
+
+Three same-baseline-binary control pairs at 64 writers had throughput ratios
+0.998, 0.970, and 0.227, with p99 ratios 1.021, 1.017, and 9.889. The last
+unchanged-binary pair slowed from 50,950 to 11,549 puts/s and reproduced the
+large device/runtime variability. The third 32-writer candidate pair had the
+opposite swing (6,511 versus 36,880 puts/s); its apparent 5.664 ratio is not
+credited to the code. Single-writer ext4 also crossed a slow interval. Keep
+all observations, including these extremes. The small throughput signal is
+close to ordinary same-binary variation; the consistent high-concurrency p99
+reduction is the stronger reason to retain this bounded tuning change.
+
+Keep this as a separate, reversible optimization on the opt-in path. It does
+not establish a 10% throughput gain, the original four-writer adoption gate,
+or a new default. Update the worker-bound test to fill 32 groups with 17
+writes each, reject a 33rd group, and complete waves of 256, 256, and 32 writes
+while checking the shared SQE bound and buffer retirement.
+
+Artifacts: `target/rfc024-postready-depth-experiment/` contains benchmark scripts,
+`bench.jsonl` (screen followed by confirmation, with pair numbers restarting),
+`null.jsonl`, `guards.jsonl`, their logs, the baseline binary, and original worker
+source. The candidate binary and validation logs are preserved there as well.
+
+Validation: `cargo make check` passed both Clippy configurations, all 1,410
+tests with zero skips, formatting, dependency checks, and typos. Tests used
+`TMPDIR=/dev/shm/rfc024-ahead-check-tmp` and four nextest threads, after all
+benchmark runs completed.
