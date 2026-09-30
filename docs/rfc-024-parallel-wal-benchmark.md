@@ -2597,3 +2597,44 @@ typos, using tmpfs for test temporary files and four nextest test threads.
 Artifacts: `target/rfc024-postready-experiment/` contains the baseline binary
 and MVCC source, profiler scripts and samples, `bench.py` and `bench.jsonl`,
 and the leader guard/null/confirmation scripts and JSONL records.
+
+### Lower publication contention threshold (not retained, 2026-09-30)
+
+Follow up on `eb973f81` by testing the shorter 256-iteration publication spin
+when more than four reservations are in flight instead of more than 32.
+The previous user-CPU profile still attributed substantial time to publication;
+this experiment asks whether parking sooner also helps moderate concurrency.
+Keep the completion, poison, and durability predicates unchanged.
+
+Compare the saved previous candidate binary (the behavior retained in
+`eb973f81`) against a release/`bench` candidate. Both arms use parallel WAL,
+PITR off, 1 KiB values, a 1 GiB SST target, and latency sampling every ten
+operations. Alternate arm order, with no compilation or tests during timing.
+Ratios are medians of paired candidate/baseline ratios.
+
+| ext4 workload | Pairs | Throughput ratio | p99 ratio |
+| --- | ---: | ---: | ---: |
+| 200k puts, 32 writers, initial screen | 3 | 0.931 | 1.490 |
+| 200k puts, 32 writers, fresh confirmation | 5 | 1.041 | 0.747 |
+| 200k puts, 32 writers, all observations | 8 | 0.986 | 1.119 |
+| 50k puts, 16 writers | 3 | 1.001 | 0.963 |
+
+The 32-writer throughput ratios, in observation order, were 0.931, 0.607,
+1.069, 1.132, 1.041, 0.525, 0.414, and 1.119. Corresponding p99 ratios were
+3.495, 1.490, 0.676, 0.684, 0.747, 5.009, 1.580, and 0.696. The four slower
+candidate observations also had higher whole-device average write latency;
+this counter is contextual and cannot establish that the change is innocent.
+Both arms reached 16 outstanding groups and write SQEs. Keep every observation,
+including the initial screen; the favorable fresh-run median alone is not a
+sufficient reason to retain the change. Sixteen writers showed no meaningful
+throughput gain.
+
+Restore the threshold of 32. This experiment does not establish a reliable
+improvement and leaves the earlier high-contention optimization intact. No
+production-code change is retained, so validation is limited to the document
+and confirming that the Rust source matches the starting revision.
+
+Artifacts: `target/rfc024-spin-threshold-experiment/` contains both binaries,
+the original MVCC source, benchmark scripts, `bench.jsonl`, `screen.log`,
+`confirm.log`, and the candidate build log. The JSONL file appends both phases;
+pair numbers restart in the confirmation phase, so preserve record order.
