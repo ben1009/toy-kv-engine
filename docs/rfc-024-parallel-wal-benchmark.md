@@ -2525,3 +2525,75 @@ Artifacts moved to `target/rfc024-ready-experiment/`: `bench.py`, `confirm.py`,
 JSONL results (`bench.jsonl`, `confirm.jsonl`, `rotation-null.jsonl`,
 `rotation-confirm.jsonl`, `leader-check.jsonl`). This ignored directory also
 contains the baseline binary, original MVCC source, and validation logs.
+
+### Shorter publication spin after ready-prefix advancement (retained, 2026-09-30)
+
+Profile `478ce6d0` again after the ready-prefix change. A five-second
+`cycles:u` capture during the 200k-put, 64-writer ext4 workload collected
+9,044 samples with no reported loss. Publication still accounted for 91.69%
+of sampled atom-PMU user cycles and 94.65% on the core PMU. Annotation places
+the hot instructions in the 16,384-iteration frontier spin. These are user-CPU
+shares, not wall-time shares.
+
+Revisit the previously rejected shorter-spin experiment on this new baseline:
+use 256 iterations when more than 32 commit reservations are in flight, and
+retain 16,384 otherwise. Ready timestamps can now advance while their owners
+are parked, so parking no longer requires every follower to resume before
+the next timestamp can advance. The relaxed in-flight count is only a
+scheduling hint; the acquire frontier load and locked completion/poison
+predicates still determine the result. No durability or visibility rule changes.
+
+A separate five-second candidate capture used 400k puts to keep writes active
+throughout sampling. It collected 2,452 samples with no reported loss;
+publication accounted for 25.05% of atom-PMU and 43.29% of core-PMU user
+cycles. An initial shorter capture included final flushing and is not used
+for this attribution. End-to-end CPU comparisons below come from unprofiled
+runs with matching operation counts.
+
+Both arms use release/`bench` builds, parallel WAL, PITR off, 1 KiB values,
+and latency sampling every 10 operations. Run arms in alternating order;
+profiling, compilation, and tests do not overlap timing. Ratios below are
+medians of paired candidate/baseline ratios.
+
+| Workload | Puts / writers / SST target | Pairs | Throughput ratio | p99 ratio |
+| --- | --- | ---: | ---: | ---: |
+| ext4, initial screen | 50k / 64 / 1 GiB | 3 | 1.837 | 0.446 |
+| ext4, full confirmation | 200k / 64 / 1 GiB | 5 | 1.773 | 0.464 |
+| ext4, medium concurrency | 200k / 32 / 1 GiB | 5 | 1.041 | 0.929 |
+| ext4, growing WAL | 50k / 16 / 1 GiB | 5 | 1.000 | 0.986 |
+| ext4, single writer | 5k / 1 / 1 GiB | 5 | 0.988 | 1.009 |
+| ext4, rotation | 20k / 4 / 1 MiB | 5 | 0.981 | 1.003 |
+| tmpfs, single writer | 50k / 1 / 1 GiB | 5 | 1.008 | 0.901 |
+| tmpfs, original case | 200k / 4 / 1 MiB | 5 | 1.006 | 1.002 |
+
+For the full 64-writer case, median arm throughput was 25,195 versus 45,694
+puts/s; median process CPU was 127.205 versus 22.528 seconds, with a paired
+CPU ratio of 0.179. Peak outstanding groups and write SQEs remained 16.
+The five throughput ratios were 1.041, 0.791, 1.841, 1.773, and 1.877.
+The first two pairs encountered slow-device intervals: their p99 ratios were
+2.104 and 1.028, versus 0.461, 0.464, and 0.456 in the remaining pairs.
+All pairs remain included. The 32-writer arm also crossed device-latency
+swings despite never selecting the shorter spin; its apparent gain is not
+evidence for this high-contention optimization.
+
+Because publication is shared, separately compare baseline and candidate
+with leader WAL. Three initial 50k-put, 64-writer pairs had throughput/p99
+ratios of 1.218/1.484, with whole-device write latencies ranging from 0.36 to
+6.0 ms. Three same-baseline-binary pairs then had p99 ratios from 0.927 to
+1.042. Five fresh candidate/baseline pairs, with similar device latency
+between arms, had median throughput/p99 ratios of 1.534/0.485. The initial
+tail regression was not reproduced, but those observations remain recorded.
+Three-pair leader guards at one writer and four-writer rotation had ratios
+of 1.011/0.985 and 0.992/1.032 respectively. These are shared-code regression
+checks, not parallel-versus-leader comparisons.
+
+Retain the change for the repeated 64-writer improvement and substantially
+lower CPU use. This does not establish the original four-writer adoption
+gate or change the default WAL path. All 335 selected WAL, MVCC, and
+transaction tests passed before timing. Final `cargo make check` passed both
+Clippy configurations, all 1,410 tests, formatting, dependency checks, and
+typos, using tmpfs for test temporary files and four nextest test threads.
+
+Artifacts: `target/rfc024-postready-experiment/` contains the baseline binary
+and MVCC source, profiler scripts and samples, `bench.py` and `bench.jsonl`,
+and the leader guard/null/confirmation scripts and JSONL records.

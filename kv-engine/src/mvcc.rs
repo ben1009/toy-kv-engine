@@ -23,13 +23,14 @@ use crate::{
 
 pub(crate) const TOMBSTONE_VALUE: &[u8] = &[crate::vlog::KvKind::Tombstone as u8];
 static NEXT_MVCC_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
+/// Spin budget before a publication waiter parks under low contention.
+const PUBLICATION_SPIN_LIMIT: u32 = 1 << 14;
+const CONTENDED_PUBLICATION_SPIN_LIMIT: u32 = 256;
+const PUBLICATION_CONTENTION_THRESHOLD: u64 = 32;
+
 /// How long the commit barrier waits before rechecking a drain, so that a
 /// signal missed by the lock-free publication path costs a bounded delay
 /// rather than a hang.
-/// Spin budget before a publication waiter parks instead. The wait is normally
-/// one WAL sync; this is generous enough to cover it without burning a core.
-const PUBLICATION_SPIN_LIMIT: u32 = 1 << 14;
-
 const DRAIN_RECHECK: std::time::Duration = std::time::Duration::from_millis(1);
 type WalPublish = (u64, Vec<u8>, Vec<u8>, Option<u64>);
 
@@ -350,7 +351,16 @@ impl LsmMvccInner {
     /// cause unbounded spinning; prefix advancement or poison wakes parked
     /// callers, which always recheck the predicate under the publication lock.
     fn await_publication(&self, commit_ts: u64) -> anyhow::Result<()> {
-        for _ in 0..PUBLICATION_SPIN_LIMIT {
+        // Ready work can advance while this caller is parked. Under contention,
+        // leave CPU time for the missing predecessor and WAL workers. The count
+        // is only a scheduling hint; the frontier and locked predicate decide completion.
+        let spin_limit =
+            if self.in_flight.load(Ordering::Relaxed) > PUBLICATION_CONTENTION_THRESHOLD {
+                CONTENDED_PUBLICATION_SPIN_LIMIT
+            } else {
+                PUBLICATION_SPIN_LIMIT
+            };
+        for _ in 0..spin_limit {
             if self.frontier.load(Ordering::Acquire) > commit_ts {
                 return Ok(());
             }
