@@ -2912,3 +2912,55 @@ annotation, profiling script, and workload JSON. The experiment directory
 build log, `bench.jsonl`, `guards.jsonl`, `leader.jsonl`, `leader-confirm.jsonl`,
 benchmark scripts, and logs. Final checks verify spelling, whitespace, and
 that the Rust source matches the starting revision.
+
+
+### Shorter spin budget confirmation (2026-09-30)
+
+Rerun the saved 4,096-iteration candidate after the initial rejection, at the
+user's request. Compare the same baseline and candidate binaries from
+`target/rfc024-spin4096-experiment/`, with fresh database paths, alternating arm
+order, 200k puts, 32 writers, 1 KiB values, and 1 GiB SST target on ext4.
+Keep PITR off and sample latency every ten operations. No builds, tests, or
+profiling overlap timing. Ratios are medians of paired candidate/baseline
+ratios; include all previous observations when reporting cumulative results.
+
+| Comparison | Pairs | Throughput ratio | p99 ratio | Process CPU ratio |
+| --- | ---: | ---: | ---: | ---: |
+| Fresh identical-baseline leader control | 3 | 0.992 | 0.996 | 1.024 |
+| Fresh leader regression control | 6 | 1.001 | 0.992 | 0.988 |
+| Fresh parallel WAL comparison | 6 | 1.040 | 0.837 | 0.910 |
+| All parallel 32-writer comparisons | 14 | 1.015 | 0.884 | 0.948 |
+
+The identical-baseline control is stable in this session. The first two fresh
+leader candidate runs still cross slow intervals, with throughput/p99 ratios
+0.341/6.642 and 0.277/7.399. Four later pairs are near parity. WAL byte counts
+are identical and sync counts nearly identical; the two slow candidates spend
+15.3 and 19.2 seconds in fdatasync versus 4.2 seconds in their paired baselines.
+This localizes the extra time but does not explain why it disproportionately
+affects the candidate. The previous six leader pairs remain in the preceding
+section. Across all twelve leader pairs, half contain slow candidate intervals;
+the cumulative median is about 0.911 throughput and 1.247 p99. A near-parity
+fresh median does not resolve that earlier regression evidence.
+
+One fresh parallel baseline crosses a slow interval, producing an apparent
+6.11x throughput gain and 0.051 p99 ratio; do not credit those magnitudes to
+the code. The remaining five fresh throughput ratios are 1.011, 1.062, 1.036,
+1.044, and 1.024, with lower p99 in every pair. Across all fourteen parallel
+pairs, thirteen improve p99 and twelve reduce process CPU. This supports the
+parallel latency improvement more strongly than the initial set alone.
+
+Retain the shorter spin budget as a separate local optimization commit for
+review, based on the repeated parallel results and the fresh near-parity leader
+median. The candidate-specific leader latency spikes remain an unresolved
+limitation, not a cleared regression or an adoption-gate result. The default
+WAL selection remains leader; no public selection control is added.
+
+Confirmation artifacts live under `target/rfc024-spin4096-confirmation/`:
+`bench.py`, `null.py`, `null.jsonl`, `leader.jsonl`, `parallel.jsonl`, and their
+logs. Baseline/candidate source and binary snapshots remain in the original
+experiment directory. Final verification runs the full local check on the
+retained candidate, with its log saved as `check.log` in the confirmation
+directory.
+
+The full local check passed, including default- and all-feature Clippy checks
+and all 1,410 tests. Documentation spelling and whitespace checks also passed.

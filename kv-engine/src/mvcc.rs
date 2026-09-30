@@ -24,7 +24,7 @@ use crate::{
 pub(crate) const TOMBSTONE_VALUE: &[u8] = &[crate::vlog::KvKind::Tombstone as u8];
 static NEXT_MVCC_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 /// Spin budget before a publication waiter parks under low contention.
-const PUBLICATION_SPIN_LIMIT: u32 = 1 << 14;
+const PUBLICATION_SPIN_LIMIT: u32 = 1 << 12;
 const CONTENDED_PUBLICATION_SPIN_LIMIT: u32 = 256;
 const PUBLICATION_CONTENTION_THRESHOLD: u64 = 32;
 const PUBLICATION_DISTANCE_THRESHOLD: u64 = 16;
