@@ -3203,3 +3203,81 @@ snapshot, `metadata.json`, `run.py`, `run.log`, all 126 records in `runs.jsonl`,
 The historical binary remains in `target/rfc024-ready-experiment/baseline`.
 Final checks verify report spelling and whitespace; no Rust tests are rerun
 because this change only records measurements.
+
+
+### Low-concurrency comparison rerun (2026-09-30)
+
+Rerun the preceding comparison at 4, 8, and 16 writers after the user questioned
+the results. Reuse the exact historical and current binaries and SHA-256 digests
+from that comparison: `067d4b09` versus `925ed07d` runtime behavior. Keep ext4,
+PITR off, release/`bench`, 200k puts, 1 KiB values, latency sampling every ten
+operations, and fresh database paths. Four writers use the 1 MiB SST rotation
+case; eight and sixteen use 1 GiB. No runtime changes are made.
+
+Collect six pairs per case for both cumulative and current-leader comparisons,
+plus three current-parallel-versus-itself null pairs at each writer count.
+Alternate arm order and comparison order, rotate writer-count order between
+rounds, and interleave null pairs in the first three rounds. All 90 runs finish
+successfully; none are excluded. No builds, tests, or profiling overlap timing.
+A host process snapshot shows no competing benchmark among the busiest
+processes; it does not establish that the device is otherwise isolated.
+
+Use the preceding paired-median ratio and exploratory bootstrap procedure
+(20,000 resamples, seed 24). Absolute throughput values are arm medians;
+ratios are medians of within-pair ratios. These can differ substantially when
+slow intervals affect different arms. Six pairs and three null pairs are too
+few for a precise variability estimate. Whole-device write-time counters
+remain contextual and cannot attribute a stall to a particular request.
+
+| Comparison | Writers | Control puts/s | Current puts/s | Throughput ratio | p99 ratio | CPU ratio | Throughput 95% interval |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | --- |
+| null | 4 (rotation) | 9,876 | 9,894 | 1.002 | 0.941 | 0.981 | 1.001–2.623 |
+| cumulative | 4 (rotation) | 4,148 | 7,028 | 1.678 | 0.351 | 0.885 | 0.397–2.531 |
+| leader | 4 (rotation) | 3,642 | 7,010 | 1.924 | 2.102 | 1.104 | 1.168–2.824 |
+| null | 8 | 18,435 | 18,525 | 0.992 | 1.023 | 1.040 | 0.382–1.139 |
+| cumulative | 8 | 18,669 | 18,554 | 0.990 | 1.019 | 1.029 | 0.726–2.516 |
+| leader | 8 | 6,937 | 18,481 | 2.661 | 0.427 | 1.161 | 2.647–6.864 |
+| null | 16 | 28,830 | 28,197 | 0.978 | 0.996 | 1.042 | 0.969–1.007 |
+| cumulative | 16 | 28,494 | 28,535 | 1.000 | 0.967 | 1.007 | 0.982–1.741 |
+| leader | 16 | 13,139 | 28,566 | 2.168 | 0.494 | 1.229 | 2.163–2.186 |
+
+The four-writer cumulative paired median flips from 0.646 in the previous
+session to 1.678 here, but its interval spans 0.397–2.531. Individual throughput
+ratios are 0.846, 0.365, 2.540, 2.521, 0.429, and 2.511: both old and current
+parallel binaries enter slow intervals. The unchanged-current null ratios are
+1.002, 1.001, and 2.623. The third null arm changes from 3,772 to 9,894 puts/s
+and from 9.92 to 1.31 ms p99 without a code change. Thus the earlier 35.4%
+regression is not a repeatable estimate; neither is this session's apparent
+67.8% gain. The four-writer result remains inconclusive and is not an adoption
+pass. Device/runtime variability is demonstrated, but its cause is not
+identified and candidate-specific bad runs must not be dismissed.
+
+Eight writers remain near cumulative parity: throughput -1.0%, p99 +1.9%,
+and CPU +2.9%. One old arm and one current arm run slowly, and the null ratios
+span 0.382–1.139. Sixteen writers also remain near cumulative parity:
+throughput effectively unchanged, p99 -3.3%, and CPU +0.7%. Five cumulative
+pairs stay close to parity; the sixth old-baseline arm slows to 11,706 puts/s,
+versus current at 28,900, widening the interval. No reliable cumulative
+low-concurrency throughput gain is established.
+
+Current parallel is faster than current leader at eight and sixteen writers:
+paired throughput gains are 166.1% and 116.8%, p99 reductions 57.3% and 50.6%,
+and CPU increases 16.1% and 22.9%. Their throughput intervals exclude parity
+in this session. These compare WAL implementations, not the incremental
+benefit of the recent retained changes. Four-writer parallel-versus-leader
+throughput improves 92.4%, but paired p99 is 110.2% worse; three pairs have
+higher parallel p99. The throughput result alone cannot clear the gate.
+
+Do not replace the original observations with this rerun or select only quiet
+pairs. Both sessions remain recorded. Adoption remains unresolved; current
+leader remains the default. Further investigation should isolate the source
+of the intermittent ext4 stalls before assigning four-writer gains or
+regressions to a retained change. This rerun does not measure the pre-PITR
+baseline or the single-writer guard.
+
+Artifacts: `target/rfc024-low-concurrency-confirmation/` contains binary
+provenance in `metadata.json`, `run.py`, `run.log`, all 90 records in
+`runs.jsonl`, `summarize.py`, and `summary.json` with individual pair ratios.
+It reuses the binaries in the preceding comparison. Final checks verify
+spelling and whitespace; no Rust tests are rerun for this measurement-only
+report.
