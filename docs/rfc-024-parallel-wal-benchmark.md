@@ -3281,3 +3281,13 @@ provenance in `metadata.json`, `run.py`, `run.log`, all 90 records in
 It reuses the binaries in the preceding comparison. Final checks verify
 spelling and whitespace; no Rust tests are rerun for this measurement-only
 report.
+
+
+Follow-up diagnosis: [unstable ext4 measurements](rfc-024-wal-stall-diagnosis.md)
+records privileged NVMe tracing and an engine-independent direct-write
+reproducer. The unchanged binary enters fast and slow storage-completion
+states; WAL command setup-to-completion p99 is 0.282 versus 8.670 ms in the
+selected diagnostic intervals. Exact device/interrupt attribution remains
+unresolved. Keep the comparison scores provisional until fresh same-binary
+controls establish comparable storage latency; the diagnostic samples do not
+qualify adoption.
