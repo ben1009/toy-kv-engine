@@ -5,7 +5,9 @@ binary. Privileged tracing now locates a large part of the recurring delay in
 the NVMe command setup-to-completion path, before userspace WAL completion
 handling. The same stalls reproduce without the engine. This explains a major
 measurement confounder, but does not identify the exact device or interrupt
-mechanism. Small optimization gains remain unqualified until fresh controls
+mechanism. Subsequent eBPF captures reproduce the slow state, find short
+driver submission and interrupt handling, and observe no persistent ready CQ
+backlog at millisecond sampling resolution. Small optimization gains remain unqualified until fresh controls
 show comparable storage latency.
 
 ## What has been measured
@@ -173,6 +175,96 @@ diagnostic artifact directory. The earlier 75-second IRQ capture also stayed
 fast. Neither is evidence that interrupt behavior during the slow state is
 normal.
 
+## eBPF capture of the slow state
+
+The two earlier IRQ captures stayed fast. A subsequent eBPF investigation
+actually captures the recurring slow state with IRQ probes active.
+Official standalone bpftrace v0.27.0 is unpacked under the ignored diagnostic
+directory; no system package or global policy is changed. Programs attach
+NVMe setup/completion tracepoints and typed driver function entry/exit probes.
+Histograms remain in kernel maps; only commands taking at least 5 ms and
+exceptional timing observations are printed. These are diagnostic workloads,
+not throughput qualifications. The WAL binary remains unchanged.
+
+The first capture alternates four-writer rotation and eight-writer large-WAL
+runs, each with 200,000 puts, and stops after two four-writer runs below
+6,000 puts/s. All seven executed runs are retained:
+
+| Run | Writers | Puts/s | Commit p99, ms |
+| --- | ---: | ---: | ---: |
+| 0 | 4 | 3,942 | 10.158 |
+| 1 | 8 | 18,802 | 0.974 |
+| 2 | 4 | 10,185 | 1.348 |
+| 3 | 8 | 18,674 | 0.998 |
+| 4 | 4 | 10,206 | 1.382 |
+| 5 | 8 | 18,794 | 0.963 |
+| 6 | 4 | 3,962 | 10.322 |
+
+Among 20,648 recorded slow commands, completion follows the most recent
+`nvme_irq` entry for that queue by a median 3 microseconds, p99 11 microseconds,
+and maximum 63 microseconds. No measured NVMe IRQ handler lasts 1 ms; its
+largest histogram bucket is [128, 256) microseconds. The slow-run commands
+alone have median setup-to-completion times of 8.438 and 8.481 ms. These are
+slow-command subset medians, not whole-run request percentiles.
+
+The second capture adds entry/exit probes for `nvme_queue_rq`,
+`nvme_queue_rqs`, and `nvme_commit_rqs`, plus sampling-cadence measurements.
+It runs four-writer rotation samples until a slow run occurs, with a maximum
+of six samples. Three samples deliver 10,064–10,197 puts/s with commit p99
+1.156–1.244 ms. The fourth delivers 5,611 puts/s with commit p99 9.774 ms.
+Its 5,499 recorded slow commands have a median lifetime of 8.513 ms.
+Across all four samples:
+
+- Neither observed submission function takes 1 ms. Both `nvme_queue_rq` and
+  `nvme_queue_rqs` have their largest histogram bucket at [128, 256)
+  microseconds; `nvme_commit_rqs` is attached but receives no calls.
+- For 5,604 recorded slow commands, IRQ-entry-to-completion has median
+  3 microseconds, p99 11 microseconds, and maximum 20 microseconds.
+- No measured IRQ handler takes 1 ms.
+
+Both programs also passively sample the current completion-queue head for
+queues 1–15 from CPU 8 at 997 Hz, after learning queue pointers from typed
+`nvme_irq` arguments. They compare the CQ entry status phase bit with the
+queue's expected phase. This only reads coherent completion memory: it does
+not consume entries, advance heads, ring doorbells, or change interrupt policy.
+The status offset, 14 bytes in a 16-byte entry, is checked against the
+[kernel completion layout](https://github.com/torvalds/linux/blob/v6.18/include/linux/nvme.h).
+The [driver](https://github.com/torvalds/linux/blob/v6.18/drivers/nvme/host/pci.c)
+uses the phase bit to recognize pending completions in its IRQ path.
+
+In the second capture, 95,810 sampling callbacks observe 2,984 ready-head
+samples. No unchanged ready head persists for the 2 ms reporting threshold.
+Fifty-five callback gaps exceed 2 ms; the largest is 2.007 ms. This provides
+coverage during a real slowdown, rather than assuming the nominal sample rate.
+Sampling is still discrete and can miss short ready intervals; queue pointers
+are unavailable before their first observed IRQ. Absence of a persistent ready
+head is evidence against an 8 ms IRQ-service backlog, not proof of a specific
+controller fault or of every individual CQ entry's DMA time.
+
+Repeated setup identifiers are marked ambiguous and excluded from latency
+histograms and slow-command records. The first capture counts 542 replacements
+and 523 unmatched/ambiguous completions; the second counts 972 and 863.
+Replacement counts need not equal completions because one identifier can be
+replaced repeatedly or remain without a terminal completion at capture end.
+No printed slow command has a nonzero completion status, and no event-loss
+warning is emitted. Pointer-read failures are not independently counted;
+nonzero ready samples validate activity but do not establish perfect sampling.
+
+The new attribution is stronger: the observed millisecond delay is not inside
+the measured driver submission calls or NVMe IRQ handler, and completed CQ
+heads are not observed waiting through it. The evidence points toward delayed
+completion visibility from the device/platform. It does not distinguish SSD
+controller/firmware/media work from PCIe/DMA visibility effects. Claiming SLC
+cache exhaustion or garbage collection would still exceed the evidence.
+
+Reproducers, decoded slow records, full maps/histograms, stderr, benchmark JSON,
+and analyses are retained under `target/rfc024-stall-diagnosis/`:
+`nvme-stall.bt`, `nvme-stall-submit.bt`, `capture_bpf.sh`,
+`capture_bpf_submit.sh`, `bpf_runs.py`, `bpf_submit_runs.py`, `analyze_bpf.py`,
+`bpf-capture/`, and `bpf-submit-capture/`. These captures preserve all executed
+samples; stopping on an observed slow state is for diagnosis, not an adoption
+sampling rule.
+
 ## Consequence for optimization decisions
 
 The benchmark mixes substantially different storage-completion latency states.
@@ -191,6 +283,6 @@ comparable controls and repeatable results. Outstanding write SQEs remain a
 software metric, not device queue depth.
 
 No Rust implementation or production default changes result from this
-investigation. The confirmed attribution is to the NVMe submission/completion
-path; exact controller, media, firmware, or interrupt-delivery attribution
-remains open.
+investigation. The slow-state eBPF captures narrow attribution toward device/platform
+completion visibility, with short observed submission and IRQ-service times.
+Exact controller, media, firmware, or PCIe/DMA attribution remains open.
