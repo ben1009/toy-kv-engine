@@ -2964,3 +2964,57 @@ directory.
 
 The full local check passed, including default- and all-feature Clippy checks
 and all 1,410 tests. Documentation spelling and whitespace checks also passed.
+
+
+### Parallel worker request-map hashing (2026-09-30)
+
+Profile the retained 4,096-iteration publication budget at 32 writers on ext4:
+400k puts, 1 KiB values, 1 GiB SST target, parallel WAL, PITR off. Attach perf
+after 0.5 seconds of startup with `cycles:u`, 99 Hz, and a one-page buffer for
+five seconds. Publication still accounts for 52.46% of atom-PMU and 56.61% of
+core-PMU user cycles. Request-ID hashing in the WAL worker accounts for
+1.29% and 1.27%, respectively. These are sampled user-CPU shares, not wall time.
+
+Test replacing only `WorkerCore::writes`'s standard hash map with the existing
+`ahash::AHashMap`. IDs are private worker-generated request identities; keep
+all group/permit maps, queue handling, completion states, ownership rules,
+and MVCC publication unchanged. All 23 focused worker tests pass before timing.
+Both benchmark arms use release/`bench`, PITR off, 1 KiB values, latency sampling
+every ten operations, and alternate order. Compare against `925ed07d` runtime
+behavior. No builds, tests, or profiling overlap timing. Retain every observation;
+report medians of paired candidate/baseline ratios.
+
+| Workload | Puts / writers / SST target | Pairs | Throughput ratio | p99 ratio | CPU ratio |
+| --- | --- | ---: | ---: | ---: | ---: |
+| ext4-64-full, initial | 200k / 64 / 1 GiB | 5 | 1.008 | 0.994 | 1.014 |
+| ext4-32-full, initial | 200k / 32 / 1 GiB | 5 | 1.012 | 0.993 | 1.021 |
+| ext4-64-full, fresh | 200k / 64 / 1 GiB | 3 | 0.996 | 1.018 | 0.994 |
+| ext4-32-full, fresh | 200k / 32 / 1 GiB | 3 | 1.014 | 0.999 | 1.016 |
+| tmpfs-solo, fresh | 50k / 1 / 1 GiB | 3 | 1.071 | 1.130 | 0.958 |
+| ext4-solo, fresh | 5k / 1 / 1 GiB | 3 | 1.022 | 0.899 | 0.988 |
+| ext4-16, fresh | 50k / 16 / 1 GiB | 3 | 0.968 | 1.006 | 1.058 |
+| ext4-rotation, fresh | 20k / 4 / 1 MiB | 3 | 0.985 | 0.909 | 1.043 |
+| tmpfs-exact, fresh | 200k / 4 / 1 MiB | 3 | 0.990 | 0.985 | 0.989 |
+| ext4-64-full, combined | 200k / 64 / 1 GiB | 8 | 1.002 | 0.995 | 1.014 |
+| ext4-32-full, combined | 200k / 32 / 1 GiB | 8 | 1.013 | 0.996 | 1.019 |
+
+The initial 64-writer set includes slow-device intervals in the second and
+third baselines; the initial 32-writer set includes a pair where both arms
+cross slow intervals. The second fresh 32-writer pair also has a slower
+baseline and an apparent 1.413 throughput ratio. Do not credit apparent large
+gains in those pairs to the code. Whole-device latency counters include unrelated and out-of-window
+I/O and provide context rather than critical-path attribution. Keep those
+observations in all medians.
+
+Do not retain the request-map change. A small 32-writer throughput difference
+comes with higher measured process CPU; the fresh 64-writer comparison is
+near parity, while the 16-writer and tmpfs single-writer guards regress.
+The sampled hash cost alone does not justify this tradeoff. Restore the worker
+source and rebuild the release binary. The retained publication spin budget,
+32-group limit, and existing parallel WAL behavior remain unchanged.
+
+Artifacts: `target/rfc024-spin4096-profile/` contains the baseline profile,
+script, and workload JSON. `target/rfc024-worker-ahash-experiment/` preserves
+both binaries and worker sources, build and focused-test logs, `bench.py`,
+`bench.jsonl`, `guards.jsonl`, and benchmark logs. Final checks verify spelling,
+whitespace, and that the Rust source matches the starting revision.
