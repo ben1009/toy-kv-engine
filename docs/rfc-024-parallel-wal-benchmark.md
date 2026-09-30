@@ -3113,3 +3113,93 @@ Artifacts: `target/rfc024-stage-scratch-experiment/` preserves baseline and
 candidate binaries and worker sources, build and focused-test logs, benchmark
 script, `bench.jsonl`, `confirm.jsonl`, and their logs. Final checks verify
 spelling, whitespace, and source identity with the starting revision.
+
+
+### Cumulative optimization and current leader comparison (2026-09-30)
+
+At the user's request, measure the complete retained optimization sequence in
+one session rather than multiplying gains from separate experiments. The saved
+pre-ready-prefix parallel binary represents `067d4b09`; the current binary
+represents `925ed07d` runtime behavior, with subsequent documentation-only
+commits. Snapshot the current binary before timing. `metadata.json` records
+both SHA-256 digests. This is the baseline before the five recent retained
+publication/group-depth changes, not the original RFC implementation or the
+pre-PITR revision.
+
+Use release/`bench`, ext4 on `/dev/nvme0n1p3`, PITR off, 1 KiB values, and latency
+sampling every ten operations. Use 200k puts per case except 5k for the
+single-writer guard. SST target is 1 MiB for four-writer rotation, otherwise
+1 GiB. Run five pairs per comparison and writer count, alternating arm order
+and also alternating the order of the two comparisons within each pair.
+Each arm starts with a fresh database path. Three current-parallel-versus-itself
+pairs at 32 writers precede the matrix. All 126 runs complete successfully;
+none are excluded. No builds, tests, or profiling overlap timing.
+
+Ratios are medians of paired current/control ratios. Absolute throughput is
+the median for each arm, which need not have the same ratio as the paired
+median. CPU is user plus system process CPU reported by the benchmark, not
+a sampled thread or wall-time measure. Throughput intervals are exploratory
+95% percentile bootstrap intervals over pairs: 20,000 resamples, seed 24.
+Five pairs provide limited precision, particularly with the observed device
+swings; these intervals do not establish reproducibility across devices.
+
+Cumulative comparison: old parallel WAL versus current parallel WAL.
+
+| Writers | Old puts/s | Current puts/s | Throughput ratio | p99 ratio | CPU ratio | Throughput 95% interval |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| 1 | 2,914 | 2,983 | 1.021 | 1.002 | 1.019 | 0.937–1.037 |
+| 4 (rotation) | 9,876 | 6,407 | 0.646 | 2.762 | 1.010 | 0.454–1.001 |
+| 8 | 18,607 | 18,438 | 0.997 | 1.020 | 1.019 | 0.980–1.000 |
+| 16 | 28,571 | 28,601 | 0.999 | 1.002 | 1.007 | 0.464–1.004 |
+| 32 | 34,248 | 40,416 | 1.184 | 0.549 | 0.699 | 1.147–4.141 |
+| 64 | 16,671 | 46,642 | 2.798 | 0.270 | 0.162 | 2.754–7.814 |
+
+Current implementation comparison: current leader WAL versus current parallel WAL.
+
+| Writers | Leader puts/s | Parallel puts/s | Throughput ratio | p99 ratio | CPU ratio | Throughput 95% interval |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| 1 | 1,748 | 1,480 | 1.674 | 0.779 | 2.460 | 0.461–2.809 |
+| 4 (rotation) | 2,496 | 9,881 | 3.959 | 0.121 | 0.968 | 0.980–5.688 |
+| 8 | 7,012 | 18,439 | 2.632 | 0.444 | 1.222 | 0.804–6.207 |
+| 16 | 13,214 | 28,706 | 2.164 | 0.503 | 1.197 | 0.752–2.908 |
+| 32 | 24,280 | 39,935 | 1.652 | 0.616 | 1.066 | 1.563–1.705 |
+| 64 | 38,731 | 46,940 | 1.216 | 0.934 | 1.197 | 1.209–1.333 |
+
+The cumulative high-concurrency improvement is substantial: 64 writers have
+2.798x throughput, 73.0% lower p99, and 83.8% lower CPU; 32 writers have 18.4%
+higher throughput, 45.1% lower p99, and 30.1% lower CPU. The cumulative 8- and
+16-writer cases offer no practical throughput gain. Against current leader,
+32- and 64-writer throughput intervals exclude parity, with paired median gains
+65.2% and 21.6%. Parallel uses 6.6% and 19.7% more CPU in those comparisons.
+
+The four-writer cumulative result is a regression, not a pass: throughput
+ratio 0.646 and p99 ratio 2.762. Its five throughput ratios are 1.001, 0.454,
+1.000, 0.646, and 0.583. Three current arms cross slow intervals while their
+old-parallel controls stay near 9.9k puts/s. The two quieter pairs are near
+parity. This does not identify a causal retained change, but the regression
+must not be dismissed or hidden behind the high-concurrency gains. The current
+leader comparison's large four-writer median gain is also qualified: its
+interval includes parity, and several leader arms cross slow intervals.
+
+The same-binary null throughput ratios are 1.013, 0.961, and 0.382; p99 ratios
+are 0.945, 1.052, and 7.326. The third unchanged-binary arm slows from 40.0k
+to 15.3k puts/s. This demonstrates device/runtime variability without a code
+change, but does not prove the candidate-specific slow intervals are harmless.
+Single-writer paired results are particularly unstable: current-versus-leader
+has a positive paired throughput median despite lower absolute parallel median
+throughput, and its interval spans 0.461–2.809. Do not claim a reliable
+single-writer improvement. Whole-device latency counters include unrelated
+and out-of-window I/O and are contextual, not per-request attribution.
+
+The cumulative comparison is not a final RFC adoption pass. The four-writer
+regression and lower-concurrency uncertainty remain unresolved. This session
+also does not rerun the pre-PITR control or a four-writer same-binary null;
+its null is at 32 writers. Current leader remains the default. No runtime
+changes are made by this comparison.
+
+Artifacts: `target/rfc024-cumulative-comparison/` contains the current binary
+snapshot, `metadata.json`, `run.py`, `run.log`, all 126 records in `runs.jsonl`,
+`summarize.py`, and `summary.json` with individual paired ratios and intervals.
+The historical binary remains in `target/rfc024-ready-experiment/baseline`.
+Final checks verify report spelling and whitespace; no Rust tests are rerun
+because this change only records measurements.
