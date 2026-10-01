@@ -1221,6 +1221,10 @@ impl<B: WorkerBuffer> WorkerCore<B> {
         self.groups.len()
     }
 
+    fn can_receive_command(&self, stopping: bool) -> bool {
+        !stopping && self.group_count() < MAX_INFLIGHT_GROUPS
+    }
+
     #[cfg(feature = "chaos-testing")]
     fn lowest_group_ticket(&self) -> Option<u64> {
         self.groups.values().map(|group| group.tickets.start).min()
@@ -1808,7 +1812,7 @@ fn run_worker_loop<B: WorkerBuffer>(
 
     loop {
         if !*stopping {
-            while core.group_count() < MAX_INFLIGHT_GROUPS {
+            while core.can_receive_command(*stopping) {
                 match commands.try_recv() {
                     Ok(WorkerCommand::Group { id, group, permit }) => {
                         enqueue_group_command(id, group, permit, core, group_permits, completions)?;
@@ -1920,8 +1924,10 @@ fn run_worker_loop<B: WorkerBuffer>(
         if completion_count == 0 && core.outstanding_sqe_count() > 0 && ring_staged.is_empty() {
             // Wake on either a later group or a CQE. Waiting only for a CQE
             // would serialize a group admitted after this wait begins.
-            wait_for_worker_progress(ring.as_raw_fd(), wake, || !commands.is_empty())
-                .context("failed while waiting for WAL I/O progress")?;
+            wait_for_worker_progress(ring.as_raw_fd(), wake, || {
+                core.can_receive_command(*stopping) && !commands.is_empty()
+            })
+            .context("failed while waiting for WAL I/O progress")?;
         }
     }
 }
@@ -3116,6 +3122,68 @@ mod tests {
         );
         assert!(!wake.waiting_for_progress.load(Ordering::SeqCst));
         assert!(!wake.pending.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn queued_shutdown_does_not_bypass_polling_when_groups_are_full() {
+        use std::io::Write as _;
+
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut core = WorkerCore::new();
+        for ticket in 0..super::MAX_INFLIGHT_GROUPS as u64 {
+            core.enqueue(make_group(
+                ticket..ticket + 1,
+                (ticket + 1) * DIRECT_IO_ALIGNMENT as u64,
+                1,
+                DIRECT_IO_ALIGNMENT,
+                &drops,
+            ))
+            .expect("fill worker groups");
+        }
+        let requests = submitted_ids(&mut core, super::MAX_INFLIGHT_GROUPS);
+        let (fake_cq, mut peer) = UnixStream::pair().expect("fake CQ socket");
+        peer.write_all(b"completion").expect("make CQ ready");
+        let wake = WorkerWake::new().expect("eventfd");
+        let (command_tx, command_rx) = crossbeam_channel::unbounded::<WorkerCommand<DropProbe>>();
+        let (reply_tx, _reply_rx) = crossbeam_channel::bounded(1);
+        command_tx
+            .send(WorkerCommand::Shutdown(reply_tx))
+            .expect("queue shutdown");
+
+        assert!(
+            !wait_for_worker_progress(fake_cq.as_raw_fd(), &wake, || {
+                core.can_receive_command(false) && !command_rx.is_empty()
+            })
+            .expect("full worker polls for CQ readiness")
+        );
+        drop(
+            core.complete_write(requests[0], DIRECT_IO_ALIGNMENT as i32)
+                .expect("complete a group to restore intake capacity"),
+        );
+        assert!(
+            wait_for_worker_progress(fake_cq.as_raw_fd(), &wake, || {
+                core.can_receive_command(false) && !command_rx.is_empty()
+            })
+            .expect("worker with capacity observes queued shutdown")
+        );
+        assert!(
+            !wait_for_worker_progress(fake_cq.as_raw_fd(), &wake, || {
+                core.can_receive_command(true) && !command_rx.is_empty()
+            })
+            .expect("stopping worker polls instead of consuming new commands")
+        );
+        assert!(matches!(
+            command_rx.try_recv().expect("shutdown remains queued"),
+            WorkerCommand::Shutdown(_)
+        ));
+        for request in requests.into_iter().skip(1) {
+            drop(
+                core.complete_write(request, DIRECT_IO_ALIGNMENT as i32)
+                    .expect("complete remaining write"),
+            );
+        }
+        assert!(core.is_idle());
+        assert_eq!(drops.load(Ordering::Acquire), super::MAX_INFLIGHT_GROUPS);
     }
 
     #[test]
