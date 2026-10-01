@@ -22,6 +22,10 @@ also reject frontier padding and skipping unchanged frontier stores after
 is also rejected after 108 scored runs: more outstanding writes did not
 improve the 64-writer ext4 result, and tmpfs rotation regressed.
 
+[Cooperative publication waiting](rfc-024-publication-yield-20261002.md)
+is rejected after 132 scored runs: its repeatable 32-writer CPU reduction
+is below the frozen threshold, and the shared-MVCC p99 guard fails.
+
 ## Worker-owned asynchronous data sync (rejected, 2026-09-28)
 
 A prototype removed the sync thread from the parallel runtime. The I/O
