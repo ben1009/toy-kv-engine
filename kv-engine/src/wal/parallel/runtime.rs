@@ -606,8 +606,12 @@ impl ParallelWalRuntime {
         // while the admission lock is still held, so work cannot be stranded.
         let packer = self.inner.packer_state.try_lock();
         drop(state);
-        if let Some(packer) = packer {
-            pack_admitted_groups(&self.inner, packer)?;
+        if let Some(packer) = packer
+            && let Err(error) = pack_admitted_groups(&self.inner, packer)
+        {
+            // This ticket is already admitted. Packing failures are reported
+            // through the poison boundary observed by wait_durable(ticket).
+            log::error!("parallel WAL packer failed: {error:#}");
         }
 
         Ok(ticket)
@@ -1319,6 +1323,100 @@ fn round_up(value: u64, alignment: u64) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn admitted_ticket_keeps_its_outcome_when_later_group_packing_fails() {
+        use std::{sync::Arc, thread, time::Duration};
+
+        use crossbeam_skiplist::SkipMap;
+
+        use super::{ExtentInitializer, PREALLOC_BLOCK, WAL_HEADER_END};
+        use crate::{tests::harness::is_io_uring_unavailable_error, wal::WalIoMode};
+
+        let directory = tempfile::tempdir().expect("create WAL directory");
+        let path = directory.path().join("packing-failure.wal");
+        let wal = match Wal::create_with_io_mode(&path, WalIoMode::Parallel) {
+            Ok(wal) => Arc::new(wal),
+            Err(error) if is_io_uring_unavailable_error(&error) => {
+                eprintln!("skipping test (io_uring unavailable): {error:#}");
+                return;
+            }
+            Err(error) => panic!("failed to create parallel WAL: {error:#}"),
+        };
+        let runtime = wal.parallel_runtime.as_ref().expect("parallel runtime");
+        let (prepared_tx, prepared_rx) = crossbeam_channel::bounded(1);
+        let (requests_tx, _requests_rx) = crossbeam_channel::unbounded();
+        {
+            let mut packer = runtime.inner.packer_state.lock();
+            if let Some(mut initializer) = packer.initializer.take() {
+                initializer.close().expect("join extent initializer");
+            }
+            super::preallocate(&runtime.inner.preallocator, PREALLOC_BLOCK)
+                .expect("prepare the test extent");
+            // Pause packing the first group after taking its ticket, without
+            // blocking later writers from admitting their ready buffers.
+            packer.initializer = Some(ExtentInitializer {
+                requests: Some(requests_tx),
+                completions: prepared_rx,
+                join: None,
+                ready_end: WAL_HEADER_END,
+            });
+        }
+        let first_wal = Arc::clone(&wal);
+        let first_writer = thread::spawn(move || {
+            first_wal.put_batch(&[(b"prefix".as_slice(), b"value".as_slice())], 1)
+        });
+        let started = std::time::Instant::now();
+        loop {
+            let admission = runtime.inner.admission.lock();
+            if admission.next_ticket == 1 && admission.queue.is_empty() {
+                break;
+            }
+            drop(admission);
+            assert!(started.elapsed() < Duration::from_secs(5));
+            thread::yield_now();
+        }
+        let later_tickets = (2..=9)
+            .map(|commit_ts| {
+                wal.put_batch(&[(b"later".as_slice(), b"value".as_slice())], commit_ts)
+                    .expect("admit later ticket while the first group is packing")
+            })
+            .collect::<Vec<_>>();
+        // Force the next group's packing to fail after the first group has
+        // been submitted. Its poison boundary must not change ticket zero.
+        runtime
+            .inner
+            .admission
+            .lock()
+            .queue
+            .front_mut()
+            .expect("later batch remains queued")
+            .file_offset += 4096;
+        prepared_tx.send(Ok(PREALLOC_BLOCK)).expect("resume packer");
+        let first_ticket = first_writer
+            .join()
+            .expect("first writer joins")
+            .expect("packing failure cannot retract an admitted ticket");
+        assert_eq!(first_ticket, 0);
+        wal.submit_and_commit(first_ticket)
+            .expect("prefix before the packing failure becomes durable");
+        for ticket in later_tickets {
+            assert!(wal.submit_and_commit(ticket).is_err());
+        }
+        assert!(wal.close().is_err());
+        drop(wal);
+
+        let skiplist = Arc::new(SkipMap::new());
+        let (recovered, max_ts) = Wal::recover(&path, &skiplist).expect("recover durable prefix");
+        assert_eq!(max_ts, 1);
+        assert_eq!(skiplist.len(), 1);
+        assert_eq!(
+            skiplist.get(b"prefix".as_slice()).unwrap().value().as_ref(),
+            b"value"
+        );
+        assert!(skiplist.get(b"later".as_slice()).is_none());
+        recovered.close().expect("close recovered WAL");
+    }
+
     #[test]
     fn extent_lookahead_stops_at_file_cap_and_rejects_larger_targets() {
         use std::{os::unix::fs::FileExt, sync::Arc};
