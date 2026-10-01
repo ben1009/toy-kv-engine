@@ -1,27 +1,23 @@
 # RFC 024: investigation of unstable ext4 measurements
 
 The low-concurrency rerun reproduced large throughput swings with an unchanged
-binary. Privileged tracing now locates a large part of the recurring delay in
-the NVMe command setup-to-completion path, before userspace WAL completion
-handling. The same stalls reproduce without the engine. This explains a major
-measurement confounder, but does not identify the exact internal device or transport
-mechanism. Subsequent eBPF captures reproduce the slow state, find short
-driver submission and interrupt handling, and observe no persistent ready CQ
-backlog at millisecond sampling resolution. A subsequent write-pressure test
-reproduces the slow state on the same initialized file after a large sequential
-write cliff; an allocation-only control also sees a transition without large
-data writes. Disabling APST does not prevent it. Vendor telemetry reports 89%
-SLC buffer available while the probe remains slow, so cache exhaustion alone
-is not established. Small optimization gains remain unqualified until fresh
-controls show comparable storage latency. A subsequent 4/8/16-writer rerun
-again shows large same-binary swings after TRIM and is stopped after 68 completed
-samples; the earlier recovery is not a reliable environmental fix. A command-specific
-completion split now reproduces 13,504 stalled commands and places their long
-wait before CQE consumption, with only 14 µs median afterward. Active SMART
-polling adds a separate, smaller interference effect. Keeping a spare CPU core
-busy and disabling volatile cache do not eliminate the observed stalls. Both
-cache-test guards verify restoration to the original enabled value. The exact
-firmware, media, or transport trigger remains unproved.
+binary. The strongest current finding is a persistence-sensitive delay before
+NVMe CQE consumption. On the same initialized file, the first write after each
+four-write flush rises from 26 µs median in the fast state to 610 µs in the slow
+state; the other three writes stay around 11–12 µs. The added mean latency of
+that first command accounts for approximately 96% of this probe's throughput gap.
+Longer stalls also follow a repeatable write/sync boundary. They persist with
+the engine paused, on one repeatedly overwritten block, and with only one
+host-visible NVMe command outstanding.
+
+These observations favor an internal SSD persistence mechanism over WAL
+coordination or host queue saturation. They do not identify the specific
+firmware/NAND operation or what switches the SSD between its fast and slow
+states; exact transport attribution is also not closed. APST, CPU activity,
+volatile cache, SMART interference, allocation, write pressure, and TRIM controls
+are recorded below. Small optimization gains remain unqualified until fresh
+controls show comparable storage latency. Neither idle nor TRIM has supplied
+a reliable way to maintain that condition.
 
 ## What has been measured
 
@@ -715,6 +711,123 @@ configuration change is performed. A final reference-file check after cache
 restoration reaches 10,523 writes/s with write p99 0.048 ms and no 1 ms write
 stalls; it does not reproduce the slow mode and therefore does not proceed to
 a write-pattern comparison. Artifacts are `post-cache-protocol-capture/`.
+
+## Stalls with the engine paused and unchanged LBAs
+
+A new trace records command LBAs, sizes, issuing threads, setup timestamps, and
+CQE consumption. During a 700,000-put run, a low-rate direct-read probe detects
+the slow state. The controller and filesystem settings remain unchanged; there
+is no SMART polling. The experiment pauses the benchmark process three times,
+quiesces the companion reader, waits 300 ms, and interleaves scratch-file write
+patterns with sequential-write controls on the retained, initialized 64 MiB file.
+It resumes the benchmark after each sequence.
+
+| Operation while the engine is paused | Operations/s across three sequences | Write stalls of at least 5 ms |
+| --- | ---: | ---: |
+| Sequential 4 KiB writes, sync every four | 2,386–3,124 | 10–12 per 1,024 writes |
+| Repeatedly overwrite the same 4 KiB block, sync every four | 2,594–2,985 | 11–12 per 1,024 writes |
+| Random 4 KiB writes, sync every four | 2,601–2,982 | 10–11 per 1,024 writes |
+| Sequential 4 KiB writes, no intermediate sync | 16,896–19,528 | 10–11 per 4,096 writes |
+| 4 KiB FUA writes | 1,363–1,801 | 42–45 per 1,024 writes |
+| Sequential direct reads | 19,587–26,606 | None in 4,096 reads |
+
+Every read-only phase has a slow sequential-write control immediately before
+and after it. Thus concurrent engine traffic is not necessary to sustain the
+write stall, and read latency on this file is not intrinsically slow. This is
+consistent with the earlier simultaneous-read test: reads can stall when
+submitted while the device is processing writes. Repeated overwrites of one
+block also reject an explanation requiring a large active LBA working set or
+repeated extent allocation. They do not distinguish data programming from FTL
+metadata work.
+
+The trace matches 1,053,804 commands, excluding 1,152 missing/ambiguous completions
+and recording 1,246 replacement events. There are no status errors, admin
+commands, or discards in the completed capture. No matched command issued by
+the paused benchmark falls inside any scratch-probe phase. Slow writes span
+many LBA regions and include WAL, extent initialization, SST, and journal I/O;
+the companion read uses exactly the same LBA in fast and slow intervals.
+
+The capture contains about 24.9 GiB of device writes. Approximately 17.62 GiB
+comes from the benchmark's SST worker, 3.41 GiB from its extent initializer,
+and 2.66 GiB from its WAL worker. Ownership is checked by issuing process ID,
+not just thread name. This makes the workload's substantial storage history
+visible; it does not prove that any one of these sources uniquely triggers
+the state transition. The deliberately paused benchmark's throughput is not
+a valid optimization comparison.
+
+The first attempt stops when the user quota on `/tmp` interrupts capture after
+two completed probe phases; its partial artifacts remain preserved. The
+completed retry compresses the trace as it streams to RAM: 261.5 MB raw becomes
+45.4 MB. Diagnostic output is not written to the tested SSD during the run.
+Artifacts are `lba-pause-partial-capture/`, `lba-pause-capture/`,
+`nvme-completion-lba.bt`, `lba_pause_probe.py`, and `analyze_lba_pause.py`.
+
+## Persistence cadence explains the throughput gap
+
+A subsequent standalone sweep varies only write size and synchronization
+cadence on the same initialized file. It pins the issuing thread to CPU 20,
+uses synchronous `O_DIRECT` writes, and runs no engine. Each treatment is
+followed by a 4 KiB, sync-every-four control. All controls through the first
+64 KiB write treatment remain slow, about 2.55–3.00k writes/s. The sweep writes
+848 MiB in total and matches all 139,305 traced commands, with no reported
+missing/replaced matches, errors, admin commands, or discards.
+
+| Write pattern in the confirmed slow state | Median spacing between write stalls of at least 5 ms |
+| --- | ---: |
+| 4 KiB, sync every write | 24 writes |
+| 4 KiB, sync every two | 48 writes |
+| 4 KiB, sync every four | 96 writes |
+| 4 KiB, sync every eight | 192 writes |
+| 4 KiB, no intermediate sync, sequential or fixed block | 378 writes |
+| 16 KiB, no intermediate sync | 94.5 writes |
+| 64 KiB, no intermediate sync | 24 writes |
+| 16 KiB, sync every write | 24 writes |
+
+Without intermediate sync, the spacing follows approximately 1.5 MiB of
+submitted data, including when repeatedly overwriting one block. With small
+synchronized writes, it follows approximately 24 persistence cycles. The
+separate paused-engine test likewise sees 24-write spacing with FUA. This
+supports a persistence-granularity explanation rather than a fixed wall-clock
+timer or a particular bad LBA. It is not a measurement of physical NAND page
+size, internal write amplification, or a named garbage-collection operation.
+
+The delay can move between command types. At sync-every-16, no write reaches
+5 ms, but 12 NVMe flushes do and flush p99 reaches 8.437 ms. At sync-every-32
+and sync-every-64, both writes and flushes stall. Looking only at write p99
+would therefore misclassify some slow treatments as recovered. The 64 KiB,
+sync-every-write phase contains 27 slow flushes and then transitions to fast
+controls; the second sweep cycle stays fast. This single transition does not
+establish that the larger synchronized writes cause recovery.
+
+For the two cycle-opening, sync-every-four controls, matched command positions
+show where the throughput gap comes from:
+
+| Setup-to-CQE latency, median | Slow control | Fast control |
+| --- | ---: | ---: |
+| First write in each four-write block, immediately after the previous sync | 610 µs | 26 µs |
+| Second write | 11 µs | 12.5 µs |
+| Third write | 11 µs | 12 µs |
+| Fourth write | 10 µs | 12 µs |
+
+These controls reach 2,957 and 9,182 writes/s. Their difference is about 917 µs
+per four-write block. The first command's mean setup-to-CQE latency, including
+the periodic long stalls, adds about 883 µs per block, accounting for approximately
+96% of that difference. This is an attribution for these diagnostic controls,
+not a claim that the same percentage applies to every WAL workload. The longer
+stalls and the routine roughly 610 µs post-flush delay both matter.
+
+Reconstructing outstanding commands from every matched setup/CQE pair finds
+that 550 of 553 long writes spend their entire wait with exactly one host-visible
+NVMe command outstanding and no other completion. The remaining three overlap
+other I/O. Thus the reproduced stall does not require host queue saturation.
+These are outstanding NVMe commands, not a measurement of the controller's
+internal queue depth. The long writes' CQE-to-request-completion interval
+remains only a few microseconds.
+
+Artifacts are `persistence-stride-capture/`, `persistence_stride_probe.py`,
+`analyze_persistence_stride.py`, and its `modulo-summary.json`,
+`decomposition.json`, and `depth-summary.json`. No production code or
+durability setting changes result from the sweep.
 
 ## Consequence for optimization decisions
 
