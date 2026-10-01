@@ -10,6 +10,13 @@ Longer stalls also follow a repeatable write/sync boundary. They persist with
 the engine paused, on one repeatedly overwritten block, and with only one
 host-visible NVMe command outstanding.
 
+Delay insertion now identifies a routine post-flush service window: for short
+inserted gaps, the next write CQE remains approximately 641 µs after the preceding
+flush CQE. Reads of untouched blocks on another queue also absorb the wait.
+Passive completion-queue sampling at approximately 100 µs intervals finds that
+the delayed commands' CQEs become visible only near driver consumption; observed
+ready CQEs wait at most 7.1 µs in the routine delayed-write sample.
+
 These observations favor an internal SSD persistence mechanism over WAL
 coordination or host queue saturation. They do not identify the specific
 firmware/NAND operation or what switches the SSD between its fast and slow
@@ -391,7 +398,7 @@ write volume as its unique cause. It does not separate internal media management
 from other firmware or platform effects, and is not a randomized repeated
 intervention trial.
 
-## Vendor cache telemetry limits the cache-exhaustion explanation
+## Vendor cache telemetry leaves cache policy unresolved
 
 Solidigm documents a read-only `show --performancebooster` query and a separate
 command to start cache flushing. See the
@@ -413,10 +420,12 @@ elapsed time zero, and zero host initialize/cancel operations. The last three
 same-file probes immediately afterward remain slow at 2,004, 2,043, and 1,961
 writes/s, with p99 8.195, 8.029, and 8.660 ms. Temperature is 50.85–53.85 Celsius.
 
-Consequently, the evidence does not support saying the SLC buffer is simply
-full during this slow state. The preceding sequential-write cliff and slow
-reference are compatible with internal cache/media-management effects, but
-that mechanism remains an inference. After separate explicit approval for this device-wide intervention, the vendor
+Consequently, the reported percentage does not support saying the SLC buffer is
+simply full during this slow state. It also does not establish whether these
+writes actually use SLC, how available space is eligible for writes, or how fresh
+the metric is. The preceding sequential-write cliff and slow reference are
+compatible with internal cache/media-management effects, but that mechanism
+remains an inference. After separate explicit approval for this device-wide intervention, the vendor
 `start --performancebooster` command reports success and the host-initialize
 counter increments to one. This acknowledges initiation, not completion. All
 24 read-only polls at five-second intervals show eviction completion zero,
@@ -829,6 +838,157 @@ Artifacts are `persistence-stride-capture/`, `persistence_stride_probe.py`,
 `decomposition.json`, and `depth-summary.json`. No production code or
 durability setting changes result from the sweep.
 
+## A fixed post-flush service window
+
+`post_flush_gap_probe.py` overwrites only the first 16 KiB of the existing
+64 MiB reference, with four synchronous 4 KiB direct writes and then `fdatasync`.
+It inserts a controlled gap or direct read after each sync. The main writer is
+pinned to CPU 20. The first four-cycle sweep remains fast; all 65,122 traced
+commands match, and its controls have first-write setup-to-CQE medians of
+21–28 µs. That capture cannot establish a slow-state treatment effect.
+
+A second capture runs the unchanged four-writer parallel-WAL rotation binary
+until the reference read detector observes stalls. At 66.5 seconds it pauses
+only that engine process, waits 300 ms, and confirms a slow reference control.
+The subsequent four randomized treatment cycles have slow controls before and
+after every treatment. No engine command starts inside these scratch-probe
+phases. The benchmark is intentionally terminated afterward; its incomplete
+output is not a throughput result.
+
+The medians below aggregate the per-phase medians across these four cycles.
+All gaps are extra work between a completed sync and the next write.
+
+| Work inserted after sync | Next write setup-to-CQE median | Inserted read setup-to-CQE median |
+| --- | ---: | ---: |
+| None, controls | 612 µs | — |
+| Busy wait, 50 µs | 561 µs | — |
+| Busy wait, 100 µs | 510 µs | — |
+| Busy wait, 250 µs | 359 µs | — |
+| Busy wait, 500 µs | 110 µs | — |
+| Busy wait, 1,000 µs | 26 µs | — |
+| One direct read of the recently written block | 14 µs | 651 µs |
+
+For 7,568 routine first writes with setup-to-CQE time below 2 ms and inserted
+gaps of at most 500 µs, the preceding flush CQE to write CQE interval has a
+641.061 µs median. Regressing write latency against the actual flush-CQE to
+write-setup gap gives a slope of -0.996 and intercept of 640.777 µs, with residual
+standard deviation 11.629 µs. This describes the routine window; periodic longer
+stalls are excluded from that regression and remain in all saved samples.
+
+The nearly one-for-one subtraction shows that the routine wait elapses while
+the host delays submission. The next write does not need to initiate all of
+that work. Inserting a read similarly moves the wait into the read. Neither
+treatment supplies a reliable end-to-end speedup, and an apparently recovered
+write percentile alone would be misleading. This is a latency observation,
+not evidence that the flush durability contract is violated.
+
+An additional two-cycle capture reads the untouched last 4 KiB of the reference,
+including submissions from CPU 10 on a different NVMe queue. During slow
+controls, these far reads have setup-to-CQE medians of 651 µs on CPU 20 and
+711–714 µs on CPU 10; the following writes are fast. The delay therefore also
+affects reads outside the just-written range and across queues. The second
+cycle transitions to fast during its 500 µs treatment; preserve that transition
+and do not attribute recovery to the treatment. Later treatments without slow
+controls cannot be scored as cures.
+
+The triggered capture has 882,170 matched commands, 1,043 missing/ambiguous
+completions, and 1,154 replaced identifiers. The far-read capture has 29,741
+matched commands without matching exclusions. Every scratch write, read, and
+sync used in the phase analysis has a matching command; matched statuses are
+successful, with no admin commands, discards, or reported event loss. All trace
+output is compressed in RAM and copied after the measurements. Artifacts are
+`post-flush-gap-capture/`, `post-flush-gap-triggered-capture/`,
+`post-flush-far-read-capture/`, `analyze_post_flush_gap.py`, and
+`routine-deadline.json`.
+
+## Completion visibility during the service window
+
+`nvme-post-flush-ready.bt` combines command matching with passive reads of the
+host completion-queue head. A profiler callback on CPU 8 samples at 9,997 Hz;
+769,744 of 770,714 observed callback gaps fall in the 64–128 µs histogram bin.
+The sampler reads queue head, phase, CQE status, and command identifier, then
+checks that the head and phase stayed unchanged. It never advances a head or
+rings a doorbell. The dedicated probe submits one synchronous request at a time.
+
+With the same bounded trigger and engine pause, the routine post-flush window
+remains reproducible. The eight no-gap controls have first-write setup-to-CQE
+medians of 608–614 µs and routine flush-to-next-write-CQE medians of 640.8–641.2 µs.
+Far reads and the gap treatments reproduce the previous pattern. These heavily
+instrumented runs measure attribution, not an optimization score.
+
+Of 1,104 routine delayed writes with setup-to-CQE durations of 500–1,000 µs,
+1,099 have at least three stable samples and no unknown queue, head/phase race,
+or unrelated ready entry. They have six samples per command at the median,
+including 6,615 not-ready samples. The last not-ready sample precedes consumed
+CQE time by 50.6 µs at the median and at most 107.1 µs. Ninety-five ready samples
+precede consumption by at most 7.073 µs. No matching CQE is observed ready more
+than 100 µs before consumption.
+
+All 96 sampled write stalls of at least 5 ms meet the same eligibility checks,
+with 78.5 samples per command at the median. Their four observed ready entries
+precede consumption by at most 3.780 µs. Another 801 eligible delayed reads show
+the same behavior. These samples exclude a long wait for interrupt handling
+after a visible CQE in the reproduced routine and long stalls. They locate the
+wait before host-visible completion, while controller/media work versus an
+upstream PCIe/DMA visibility delay still requires additional attribution.
+
+The complete capture has 904,020 matched commands, 1,618 missing/ambiguous
+completions, and 2,388 replaced identifiers, with successful matched statuses and
+no admin commands, discards, or reported event loss. All scratch operations used
+in the phase analysis match. The sampling matcher pairs 13,116 of 13,117 command
+records; the unpaired record is excluded. Runtime error reporting records 52
+map-lookup warnings around sampling/completion races and no probe-read warnings;
+eligibility excludes the recorded race categories. The warnings are retained
+alongside the capture.
+
+The first invocation used an unsupported `-kk` flag and started no workload.
+A subsequent partial invocation filled the diagnostic RAM log quota with
+expected absent-map warnings; it was stopped and retained separately, with no
+CQ timing conclusion. The successful invocation initializes sampling state,
+uses supported `-k` reporting, and compresses stdout and stderr independently.
+Verified duplicate RAM artifacts are removed after archival. Artifacts are
+`post-flush-cq-unsupported-kk-capture/`, `post-flush-cq-quota-partial-capture/`,
+`post-flush-cq-sample-capture/`, `cq-window-samples.bt`,
+`analyze_cq_window.py`, and `cq-summary.json`.
+
+## Online evidence for this SSD and firmware
+
+An independent test reports the exact `SSDPFKNU010TZ` model and `002C` firmware.
+At 10% versus 50% fill, its sequential writes fall from 1,862 to 219 MB/s and
+512-byte QD1 write p99.9 rises from 3.844 to 9.718 ms. It observes no SLC reclaim
+after up to four minutes idle following half-drive fill. These measurements
+corroborate strong occupancy/history sensitivity for this device; they do not
+report our 641 µs post-flush window or establish its cause.
+[PyNVMe P41 Plus 1TB test report](https://pynv.me/ssd/solidigm-p41-plus-1tb/).
+The platform's published design uses a userspace SPDK NVMe driver. That supplies
+a useful comparison beyond the Linux filesystem path, although the report does
+not publish enough raw traces to equate its stalls with ours.
+[PyNVMe3 design](https://pynv.me/ssd/pynvme3-design/).
+
+Solidigm's June 2026 firmware history lists a fix for premature DSLC disablement
+in `002C`, which is already installed here. Its `004C` entry concerns postponing
+info-block refresh on host shutdown to avoid data loss in an edge case; it does
+not claim a flush-latency or sustained-write performance fix.
+[SST release notes, Table 14](https://sdmsdfwdriver.blob.core.windows.net/files/kba-gcc/drivers-downloads/ka-00085/sst--3-1/solidigm-storage-tool-release-notes-727314-027us.pdf#page=13).
+Solidigm currently lists `004C` as the latest P41 Plus firmware.
+[Official firmware table](https://www.solidigm.com/support-page/drivers-downloads/ka-00099.html).
+A firmware A/B test would be a separate intervention; no update or controller
+reset has been performed.
+
+There is also a first-hand Ubuntu report of burst-then-collapse behavior on
+2 TB P41 Plus drives already running `004C`. Its copy workload and capacity
+differ from ours, so it supplies context rather than a matching reproducer or
+proof that a particular workaround succeeds.
+[Solidigm support discussion](https://community.solidigm.com/t5/solid-state-drives-nand/poor-performance-p41-plus/m-p/24606).
+
+The earlier reported 89% SLC-buffer availability cannot establish the placement
+of these writes or exclude a cache-policy issue. Filesystem free space also
+does not measure the controller's valid mappings after benchmark churn without
+continuous discard. Neither the firmware history nor the independent report
+lets us label our exact mechanism as the old DSLC bug, QLC programming, garbage
+collection, or a confirmed Linux defect. What is established locally is a
+state-dependent post-flush service window before host-visible completion.
+
 ## Consequence for optimization decisions
 
 The benchmark mixes substantially different storage-completion latency states.
@@ -851,8 +1011,9 @@ investigation. The slow-state eBPF captures narrow attribution toward device/pla
 completion visibility, with short observed submission and IRQ-service times.
 The pressure sequence reproduces the stall, but the allocation-only control
 also observes a transition without large data writes. APST is not required,
-and the slow state persists after cooling and short idle. Read-only cache telemetry rejects a simple
-currently-full SLC explanation. TRIM followed by idle coincides with recovery,
+and the slow state persists after cooling and short idle. Read-only cache telemetry
+reports available SLC space but leaves actual write placement and cache policy
+unresolved. TRIM followed by idle coincides with recovery,
 and the subsequent allocation control and three engine samples remain fast.
 The subsequent rerun again shows large identical-binary swings, so this
 recovery does not supply a reliable measurement mitigation or establish a unique
@@ -863,3 +1024,11 @@ mode. SMART polling is a measurable confounder but is absent in slow captures.
 The CPU busy-loop control and cache-disabled trace fail to prevent the long
 wait. Vendor background-processing and NLog commands are unsupported, so these
 results do not establish a specific internal maintenance mechanism.
+
+The delay-insertion and completion-head samples further identify a routine
+approximately 641 µs post-flush service window. The sampled commands do not
+spend that interval waiting for interrupt handling after a visible CQE. Known
+measurements on the same model/firmware support investigating internal cache and
+persistence policy, without establishing which policy switches the observed
+state. Inserting delays or dummy reads merely shifts the cost and is not a
+production mitigation.
