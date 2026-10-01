@@ -4,7 +4,7 @@ The low-concurrency rerun reproduced large throughput swings with an unchanged
 binary. Privileged tracing now locates a large part of the recurring delay in
 the NVMe command setup-to-completion path, before userspace WAL completion
 handling. The same stalls reproduce without the engine. This explains a major
-measurement confounder, but does not identify the exact device or interrupt
+measurement confounder, but does not identify the exact internal device or transport
 mechanism. Subsequent eBPF captures reproduce the slow state, find short
 driver submission and interrupt handling, and observe no persistent ready CQ
 backlog at millisecond sampling resolution. A subsequent write-pressure test
@@ -15,7 +15,13 @@ SLC buffer available while the probe remains slow, so cache exhaustion alone
 is not established. Small optimization gains remain unqualified until fresh
 controls show comparable storage latency. A subsequent 4/8/16-writer rerun
 again shows large same-binary swings after TRIM and is stopped after 68 completed
-samples; the earlier recovery is not a reliable environmental fix.
+samples; the earlier recovery is not a reliable environmental fix. A command-specific
+completion split now reproduces 13,504 stalled commands and places their long
+wait before CQE consumption, with only 14 µs median afterward. Active SMART
+polling adds a separate, smaller interference effect. Keeping a spare CPU core
+busy and disabling volatile cache do not eliminate the observed stalls. Both
+cache-test guards verify restoration to the original enabled value. The exact
+firmware, media, or transport trigger remains unproved.
 
 ## What has been measured
 
@@ -532,6 +538,184 @@ Its results cannot qualify optimization gains. See the
 [benchmark report](rfc-024-parallel-wal-benchmark.md) and
 `target/rfc024-post-trim-comparison/variability-summary.json`.
 
+## SMART polling introduces a separate, smaller stall
+
+A temperature read through NVMe hwmon is an active SMART Get Log Page command,
+as shown by [the Linux hwmon implementation](https://github.com/torvalds/linux/blob/v6.18/drivers/nvme/host/hwmon.c).
+The new admin-queue trace includes queue zero, which the earlier eBPF probes
+filtered out. Six ten-second phases alternate temperature polling off/on/on/off/off/on
+while the same initialized 64 MiB scratch file receives 4 KiB direct writes and
+one `fdatasync` per four writes.
+
+| Phase | Temperature polling | Median writes/s | Writes taking at least 1 ms | Overlapping an admin command |
+| --- | --- | ---: | ---: | ---: |
+| 0 | Off | 10,847 | 2 | 0 |
+| 1 | On | 9,018 | 90 | 89 |
+| 2 | On | 8,996 | 85 | 83 |
+| 3 | Off | 10,590 | 1 | 0 |
+| 4 | Off | 10,687 | 2 | 0 |
+| 5 | On | 8,919 | 86 | 85 |
+
+Admin commands have median latency 23.901 ms and p99 24.169 ms. Polling causes
+repeatable interference, roughly a 16–18% throughput reduction in this experiment.
+The trace identifies no external admin-command issuer. There is one ambiguous
+request replacement. This is a monitoring confounder, not the explanation for
+the original multi-fold throughput swings: the earlier full `perf` capture
+includes all NVMe queues and contains no queue-zero commands, and the subsequent
+slow-state capture below also contains none. Avoid active SMART polling during
+performance qualification. Artifacts are `admin_probe.py`, `nvme-admin.bt`,
+`admin-capture/`, and `analyze_admin.py`.
+
+## Reads also stall during the actual WAL slow state
+
+Eight unchanged parallel-WAL samples use four writers, 50,000 puts, 1,024-byte
+values, and 1 MiB rotation. Alternate samples add an independent 4 KiB direct-read
+probe of the retained initialized file, without temperature polling. The full
+admin-queue trace records zero admin commands in every sample.
+
+| Phase | Read probe | Engine puts/s | Commit p99, ms | Read command p99, ms | Write commands taking at least 5 ms |
+| --- | --- | ---: | ---: | ---: | ---: |
+| 0 | Off | 9,568 | 1.262 | — | 4 |
+| 1 | On | 9,298 | 1.442 | 0.795 | 14 |
+| 2 | On | 9,447 | 1.163 | 0.721 | 6 |
+| 3 | Off | 9,533 | 1.279 | — | 7 |
+| 4 | Off | 2,632 | 13.597 | — | 3,186 |
+| 5 | On | 2,246 | 12.432 | 18.334 | 3,606 |
+| 6 | On | 4,019 | 9.629 | 11.129 | 1,525 |
+| 7 | Off | 9,476 | 1.451 | — | 7 |
+
+This reproduces the original slow mode without SMART polling. Independent reads
+also slow during it; the earlier separately timed fast read tests did not
+establish that reads remain fast during stalled WAL writes. Adding reads does
+not reliably prevent the transition. All traced command statuses are successful.
+Artifacts are `read_intervention_probe.py`, `nvme-read-write.bt`,
+`read-intervention-capture/`, and `analyze_read_intervention.py`.
+
+## Keeping a spare CPU core busy does not prevent the stall
+
+A single 700,000-put parallel-WAL run has an independent direct-read probe and
+alternates five-second intervals with and without a busy loop pinned to CPU 0.
+The engine and reader use CPUs 2–31 throughout, avoiding that core's sibling.
+These are temporary per-process affinity settings. Trace output goes to `/tmp`
+(tmpfs) and is copied to the artifact directory after tracing ends.
+
+Intervals 0–12 have read command p99 0.660–0.976 ms. The slow state starts
+in interval 13 while the spare core is busy, with read p99 42.654 ms. It persists
+across subsequent on/off intervals, with p99 10.344–25.053 ms through interval 18,
+and recovers around interval 20. All intervals have zero admin commands.
+The busy-loop intervention does not prevent the slow state. The package MSR
+sampler only overlaps the earlier fast intervals and cannot supply residency
+measurements for the slow intervals.
+
+The controller-reported SQ head sometimes passes a submitted read's position
+well before that request completes. This is evidence against missed submission
+notification for those examples, but SQ progress alone cannot distinguish
+completion of that particular command from another command. The command-specific
+completion split below addresses that distinction. The first queue-progress
+capture missed submission positions because of its thread-name filter; it
+cannot support this position-based conclusion. Artifacts are
+`cpu_awake_probe.py`, `nvme-progress.bt`, `cpu-awake-capture/`, and
+`analyze_cpu_awake.py`.
+
+## Matching CQE consumption to request completion
+
+A fresh 700,000-put run records the command-specific boundary between CQE
+consumption and Linux request completion. The probe observes
+`blk_mq_complete_request_remote()` for the matching NVMe request and associates
+the immediately preceding `nvme_sq` event on the same CPU. In
+[the Linux NVMe completion path](https://github.com/torvalds/linux/blob/v6.18/drivers/nvme/host/pci.c),
+the CQE is consumed and `nvme_sq` fires before
+[`nvme_try_complete_req()` invokes this function](https://github.com/torvalds/linux/blob/v6.18/drivers/nvme/host/nvme.h).
+The subsequent `nvme_complete_rq` event supplies the final timestamp. Matching
+uses queue and command IDs; it excludes ambiguous reused IDs.
+
+| Span, for commands taking at least 5 ms overall | Median | p99 | Maximum |
+| --- | ---: | ---: | ---: |
+| Command setup to CQE consumption | 7.891 ms | 56.824 ms | 260.454 ms |
+| CQE consumption to request completion | 14 µs | 32 µs | 277 µs |
+
+There are 13,504 such stalled commands, and none spends 1 ms after CQE consumption.
+Thus deferred kernel completion or a remote CPU completing the request does not
+explain this reproduced slow mode. The long wait occurs before Linux consumes
+that command's CQE. Combined with the earlier passive-CQ and short-submit
+observations, this narrows attribution toward the device/platform completion
+path. It still does not identify a specific firmware operation, NAND maintenance
+step, or DMA mechanism.
+
+The capture matches 985,017 commands. There are 759 missing/ambiguous completions
+and 825 replacement events; every matched CQE is correlated with `nvme_sq`.
+No traced command reports an error. An earlier instrumentation attempt produced
+no matching timestamps and is excluded. Artifacts are
+`nvme-completion-split.bt`, `completion-split-v2-capture/`, and
+`analyze_completion_split.py`.
+
+## Write protocol and cache controls
+
+`RWF_DSYNC` on the initialized scratch file produces NVMe writes with the FUA bit
+(`0x4000`); ordinary writes have control zero. All four ordinary-write phases
+remain fast, 10.5–11.2k writes/s, while FUA phases reach about 4.36k writes/s.
+The original slow mode is absent, so this verifies the protocol intervention
+but cannot establish FUA as a cure. A separate attempt to trigger the slow
+reference-file mode before interleaving write patterns stays fast through ten
+engine/probe attempts; that experiment is likewise inconclusive. Artifacts are
+`fua-capture/` and `slow-protocol-capture/`.
+
+Read-only feature inspection confirms that volatile write cache and HMB are
+enabled. HMB reports 19,968 pages and 20 descriptors. The Solidigm tool's
+`show --backgroundprocessing` command returns `Feature is not implemented` on
+this device, so it supplies no internal maintenance-state evidence.
+
+## Approved volatile-cache intervention and its limit
+
+The user approves a temporary device-wide volatile-cache test. The guard flushes
+the device before changing FID `0x06`, never sets the persistent Save bit, verifies
+each value, runs the benchmark as the ordinary user, bounds child lifetime, and
+restores the exact original value on exit. The first sequence completes all six
+50,000-put phases:
+
+| Phase | Volatile cache | Puts/s | Commit p99, ms |
+| --- | --- | ---: | ---: |
+| 0 | Enabled | 9,080 | 1.446 |
+| 1 | Disabled | 3,542 | 3.514 |
+| 2 | Disabled | 3,522 | 4.169 |
+| 3 | Enabled | 9,109 | 1.357 |
+| 4 | Enabled | 9,099 | 1.363 |
+| 5 | Disabled | 3,522 | 3.918 |
+
+Disabling the cache reduces throughput; it is not a proposed mitigation. The
+cache-enabled controls stay fast, so these short phases cannot decide the
+original slow-state trigger. They do establish a repeatable cache-setting effect.
+The guard reports successful final device flush and exact restoration to enabled.
+Artifacts are `vwc_guard.c`, `vwc_probe.py`, and `vwc-capture/`.
+
+A second sequence extends each phase to 200,000 puts within the same 90-second
+child bound. The enabled phase completes at 9,344 puts/s, p99 1.252 ms. The first
+disabled phase times out at 85 seconds, so no throughput result is fabricated for
+it and the remaining phases do not run. The guard restores enabled cache and
+verifies it. The timed-out phase's command trace remains diagnostic evidence:
+
+| Issuing thread / request size | Commands taking at least 5 ms | Median setup-to-CQE | p99 setup-to-CQE | Maximum after CQE |
+| --- | ---: | ---: | ---: | ---: |
+| WAL worker / 4 KiB | 2,075 | 8.787 ms | 47.526 ms | 21 µs |
+| Extent initializer / 128 KiB | 219 | 8.609 ms | 26.202 ms | 21 µs |
+
+These delays affect small WAL writes as well as initialization, with cache
+verified disabled. Larger `tokio-rt-worker` writes in this trace belong to the
+same benchmark process; they are not an unidentified external workload.
+The incomplete run does not supply a paired cache-on/cache-off comparison of
+the original slow mode. It does show that cache disabling does not eliminate
+millisecond waits before hardware completion. Artifacts are `vwc-long-capture/`
+and `incomplete-phase-summary.json` within it.
+
+The Solidigm `dump --nlog` command subsequently returns `Device does not support
+this command set`. Together with unavailable background-processing telemetry,
+this prevents using these vendor commands to name an internal firmware or NAND
+maintenance operation. No controller reset, firmware update, or production
+configuration change is performed. A final reference-file check after cache
+restoration reaches 10,523 writes/s with write p99 0.048 ms and no 1 ms write
+stalls; it does not reproduce the slow mode and therefore does not proceed to
+a write-pattern comparison. Artifacts are `post-cache-protocol-capture/`.
+
 ## Consequence for optimization decisions
 
 The benchmark mixes substantially different storage-completion latency states.
@@ -560,4 +744,9 @@ and the subsequent allocation control and three engine samples remain fast.
 The subsequent rerun again shows large identical-binary swings, so this
 recovery does not supply a reliable measurement mitigation or establish a unique
 cause. Exact controller, media,
-firmware, or PCIe/DMA attribution remains open.
+firmware, or PCIe/DMA attribution remains open. The matched completion split
+now excludes millisecond delays after CQE consumption in the reproduced slow
+mode. SMART polling is a measurable confounder but is absent in slow captures.
+The CPU busy-loop control and cache-disabled trace fail to prevent the long
+wait. Vendor background-processing and NLog commands are unsupported, so these
+results do not establish a specific internal maintenance mechanism.
