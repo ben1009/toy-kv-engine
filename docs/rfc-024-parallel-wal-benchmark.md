@@ -6,7 +6,9 @@ shows a 171.0% paired throughput gain on the original ext4 workload, with
 48.9% lower p99 and three passing repeat-control blocks. Tmpfs single-writer
 and ext4 batch-tail regressions still fail the full RFC gate. Historical
 comparisons remain affected by stalls, and rotation diagnostics found large
-numbers of retained WAL runtimes. Parallel WAL remains opt-in.
+numbers of retained WAL runtimes. [Frozen runtime retirement](rfc-024-frozen-wal-retirement.md)
+now bounds worker and ring lifetime; its incremental measurements do not
+establish a throughput gain. Parallel WAL remains opt-in.
 
 ## Worker-owned asynchronous data sync (rejected, 2026-09-28)
 

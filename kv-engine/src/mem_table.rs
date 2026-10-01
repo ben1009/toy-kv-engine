@@ -1632,14 +1632,16 @@ impl MemTable {
 
     /// Join the background runtime owned by a candidate parallel WAL.
     ///
-    /// The legacy WAL paths keep their existing close behavior; engine
-    /// shutdown only needs to explicitly tear down the dedicated runtime.
+    /// Call after writers have finished, when freezing the memtable or
+    /// shutting down the engine. WAL data remains available for recovery;
+    /// legacy WAL paths keep their existing close behavior.
     pub(crate) fn close_parallel_wal(&self) -> Result<()> {
         if let Some(wal) = &self.wal
             && wal.is_parallel()
         {
             wal.close()?;
         }
+
         Ok(())
     }
 
