@@ -1361,6 +1361,56 @@ for the unchanged-binary 4/8/16-writer checks. `firmware-004c-artifacts.json`
 records their source and result hashes. The firmware package remains the same
 vendor package used in the earlier read-only eligibility check.
 
+## Fixed preconditioning and ABBA comparison controls
+
+A bounded follow-up tests whether the comparison can proceed without another
+hardware intervention. The protocol is frozen before timing: one 50k-put
+candidate preconditioning run per writer count, then three four-run blocks at
+each of 4/8/16 writers. Blocks alternate baseline/candidate/candidate/baseline
+and the reverse order; writer-count order rotates. Both binaries use parallel
+WAL: the baseline is `067d4b09`, and the candidate is `925ed07d`. This tests the
+recent cumulative code changes, rather than parallel WAL versus leader WAL.
+
+Each block repeats each binary twice. Its controls pass only when the
+maximum/minimum throughput ratio is at most 1.05 and the p99 ratio is at most
+1.10 for both binaries. These conservative measurement thresholds are distinct
+from the RFC adoption gates. Block comparison ratios divide the geometric mean
+of the two candidate results by the geometric mean of the two baseline results.
+All blocks remain in the report; a passing subset cannot qualify adoption.
+
+All 36 measured runs and three preconditioning runs complete in 494 seconds.
+Each uses a fresh path, 50k puts, 1 KiB values, and latency sampling every ten
+operations; four writers use 1 MiB rotation, eight and sixteen use a 1 GiB SST
+target. Logs stay on tmpfs during timing and are archived afterward. No
+build, tracing, or controller admin polling overlaps the test. Binary hashes
+and the protocol hash match their frozen values after the session.
+
+| Writers | Blocks passing repeat controls | All block throughput ratios, candidate/baseline | Worst same-binary throughput spread within a block | Worst same-binary p99 spread within a block |
+| --- | ---: | --- | ---: | ---: |
+| 4 | 0/3 | 0.989, 0.997, 1.003 | 1.067 | 1.272 |
+| 8 | 1/3 | 1.021, 0.993, 0.997 | 1.073 | 1.240 |
+| 16 | 3/3 | 1.018, 1.008, 1.039 | 1.043 | 1.092 |
+
+Fixed preconditioning does not stabilize the device: measured four-writer
+candidate rates range from 902 to 9,748 puts/s, and eight-writer rates from
+2,003 to 18,141. Sixteen-writer controls pass locally, but its 1.8% median
+throughput difference is smaller than the worst observed same-binary spread
+and below the 10% adoption threshold. Three blocks cannot establish a robust
+small gain. The four- and eight-writer matrix remains unreliable, including
+p99 after throughput returns to its faster state.
+
+Tests can continue with these controls as a check against false optimization
+claims; this experiment does not demonstrate a cure for the storage stalls or
+a complete adoption pass. Warmup alone does not establish stable measurements:
+fio likewise separates its ramp period from explicitly evaluated steady-state
+criteria. [fio steady-state documentation](https://fio.readthedocs.io/en/latest/fio_doc.html#steady-state).
+The passive sysfs counters cover the entire device and do not attribute I/O to
+the benchmark. [Linux block statistics](https://www.kernel.org/doc/html/latest/block/stat.html).
+
+`target/rfc024-controlled-abba/` retains the frozen protocol, all raw runs,
+block controls, completion metadata, and summary. Its `artifacts.json` records
+source and output hashes. No controller or WAL runtime setting is changed.
+
 ## Consequence for optimization decisions
 
 The benchmark mixes substantially different storage-completion latency states.
