@@ -18,6 +18,10 @@ current runtime. Both prototypes are rejected after paired comparisons.
 also reject frontier padding and skipping unchanged frontier stores after
 192 scored runs, including a fixed confirmation of the latter's initial gain.
 
+[Write-order release before packing](rfc-024-wal-admission-handoff-20261002.md)
+is also rejected after 108 scored runs: more outstanding writes did not
+improve the 64-writer ext4 result, and tmpfs rotation regressed.
+
 ## Worker-owned asynchronous data sync (rejected, 2026-09-28)
 
 A prototype removed the sync thread from the parallel runtime. The I/O
