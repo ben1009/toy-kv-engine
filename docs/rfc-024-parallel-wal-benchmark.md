@@ -14,6 +14,10 @@ establish a throughput gain. Parallel WAL remains opt-in.
 tests byte-limited sync coalescing and faster worker integer maps against the
 current runtime. Both prototypes are rejected after paired comparisons.
 
+[Publication cache experiments](rfc-024-publication-cache-experiments-20261001.md)
+also reject frontier padding and skipping unchanged frontier stores after
+192 scored runs, including a fixed confirmation of the latter's initial gain.
+
 ## Worker-owned asynchronous data sync (rejected, 2026-09-28)
 
 A prototype removed the sync thread from the parallel runtime. The I/O
