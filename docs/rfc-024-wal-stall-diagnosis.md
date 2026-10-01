@@ -13,7 +13,9 @@ write cliff; an allocation-only control also sees a transition without large
 data writes. Disabling APST does not prevent it. Vendor telemetry reports 89%
 SLC buffer available while the probe remains slow, so cache exhaustion alone
 is not established. Small optimization gains remain unqualified until fresh
-controls show comparable storage latency.
+controls show comparable storage latency. A subsequent 4/8/16-writer rerun
+again shows large same-binary swings after TRIM and is stopped after 68 completed
+samples; the earlier recovery is not a reliable environmental fix.
 
 ## What has been measured
 
@@ -519,6 +521,17 @@ Artifacts are `trim_compare.sh`, `trim_before_probe.py`, `trim_after_probe.py`,
 counters, `trim-summary.json`, `sst-tools/cache-after-trim.json`, and the same
 `pressure-capture/runs.jsonl` containing every probe.
 
+## Post-TRIM recovery does not persist in the comparison rerun
+
+The following 4/8/16-writer comparison reuses the unchanged binaries and retains
+all completed samples. Four-writer same-binary throughput ratios are 2.540,
+0.409, and 0.999; sixteen-writer ratios are 2.249, 0.993, and 0.997. Thus the
+previous recovery after TRIM does not establish a stable environment. At the
+user's direction, the comparison stops after 68 of 90 completed samples.
+Its results cannot qualify optimization gains. See the
+[benchmark report](rfc-024-parallel-wal-benchmark.md) and
+`target/rfc024-post-trim-comparison/variability-summary.json`.
+
 ## Consequence for optimization decisions
 
 The benchmark mixes substantially different storage-completion latency states.
@@ -544,6 +557,7 @@ also observes a transition without large data writes. APST is not required,
 and the slow state persists after cooling and short idle. Read-only cache telemetry rejects a simple
 currently-full SLC explanation. TRIM followed by idle coincides with recovery,
 and the subsequent allocation control and three engine samples remain fast.
-This supplies a possible measurement mitigation; it does not establish a unique
-cause, given the earlier recovery without TRIM. Exact controller, media,
+The subsequent rerun again shows large identical-binary swings, so this
+recovery does not supply a reliable measurement mitigation or establish a unique
+cause. Exact controller, media,
 firmware, or PCIe/DMA attribution remains open.

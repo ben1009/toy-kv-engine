@@ -3299,3 +3299,53 @@ Recovery also occurred before TRIM, so this is a possible measurement mitigation
 not a unique root-cause proof or an adoption score. Keep the comparison scores provisional until fresh same-binary
 controls establish comparable storage latency; the diagnostic samples do not
 qualify adoption.
+
+
+### Post-TRIM rerun stopped because controls remain unstable (2026-10-01)
+
+The requested 4/8/16-writer rerun uses the same unchanged binaries and workload
+as the preceding low-concurrency comparison: `067d4b09` versus `925ed07d`,
+ext4, PITR off, 200k puts, 1 KiB values, every-ten-operation latency sampling,
+1 MiB SST target at four writers, and 1 GiB at eight and sixteen. Binary
+SHA-256 digests match the earlier artifacts. It follows the separately approved
+TRIM and diagnostic recovery described in the
+[stall investigation](rfc-024-wal-stall-diagnosis.md).
+
+The planned matrix repeats six cumulative and current-leader pairs per writer
+count, plus three current-parallel-versus-itself pairs. It alternates arm and
+comparison order and rotates writer-count order. No builds, profiling, manual
+TRIM, or cache resets run alongside the matrix. Completed results are retained
+without filtering; device write-time counters cover the whole process, not
+individual WAL requests.
+
+| Writers | Three unchanged-binary throughput ratios |
+| --- | --- |
+| 4, rotation | 2.540; 0.409; 0.999 |
+| 8 | 1.004; 0.988; 1.002 |
+| 16 | 2.249; 0.993; 0.997 |
+
+At four writers, one identical-binary pair changes from 3,876 to 9,842 puts/s,
+while another changes from 9,875 to 4,043. At sixteen, one changes from 12,546
+to 28,211. Eight-writer null pairs are quiet, but comparison arms range from
+roughly 5.2k to 18.4k for current parallel; quiet controls alone do not establish
+that every later comparison has the same environment. Candidate-specific bad
+runs must not be dismissed merely because other controls fluctuate.
+
+The user rejects optimization attribution in this unstable environment. The
+matrix is intentionally stopped after **68 of 90 completed samples**, preserving
+all completed JSON and interrupting the in-progress benchmark. This is not a
+completed fixed-size comparison, an adoption score, or evidence of a reliable
+incremental gain or regression. No optimization summary is promoted from the
+incomplete matrix. Existing local optimization commits remain available for
+backtracking, with their performance claims provisional.
+
+The new observations refute treating the earlier post-TRIM recovery as a
+reliable environmental fix. Delayed NVMe completion remains a measured location
+of the stall, not an explanation of its exact cause. Establish a reproducible
+cause or a controlled measurement environment before rerunning the optimization
+comparison; more repetitions of this matrix alone do not resolve attribution.
+
+Artifacts are `target/rfc024-post-trim-comparison/`: `metadata.json`, `run.py`,
+`run.log`, all 68 completed records in `runs.jsonl`, `stopped.json`, and
+`variability-summary.json`. The original `summarize.py` is copied for provenance
+but is not run to publish gains. No Rust code or production default changes.
