@@ -17,12 +17,18 @@ Passive completion-queue sampling at approximately 100 µs intervals finds that
 the delayed commands' CQEs become visible only near driver consumption; observed
 ready CQEs wait at most 7.1 µs in the routine delayed-write sample.
 
-The narrower reproducer now needs no data writes during a phase: repeated empty
-NVMe flushes delay the next read by approximately 644 µs. Every additional flush
-restarts the window, including with APST or volatile write cache disabled.
+The narrower reproducer now needs no data writes during a phase: sequential empty
+NVMe flush/read pairs delay the next read by approximately 644 µs. An additional
+flush restarts the window in these sequences, including with APST or volatile write cache disabled.
 The driver publishes the corresponding submission tails in about 5 µs; most of
 the delay follows that publication. This identifies the flush-command path as
 the strongest lead without naming its internal firmware operation.
+
+Parallel reads on four or eight NVMe queues also absorb the window. Controlled
+read-before-flush timing does not establish a reliable bypass: an earlier read
+can complete quickly while the following read still pays the remaining delay.
+Read-only admin queries also change these timings and must stay outside measured
+windows. Neither finding establishes the controller's internal execution order.
 
 These observations favor an internal SSD flush/persistence mechanism over WAL
 coordination or host queue saturation. They do not identify the specific
@@ -1095,6 +1101,119 @@ are timing diagnostics, not benchmark scores. Artifacts are
 `nvme-flush-cq-clean.bt`, `analyze_empty_cq_clean.py`, and
 `analyze_empty_driver_clean.py`.
 
+## Parallel read queues share the empty-flush delay
+
+A state-gated capture compares one, four, and eight read threads on the existing
+reference file, opened with `O_RDONLY | O_DIRECT`. It uses namespace `FLUSH`
+commands and reads of separate 4 KiB blocks, with no scratch writes. The helper
+first checks the scalar empty-flush/read reproducer. When initially fast, it
+runs the unchanged parallel-WAL binary under a bounded pressure sequence,
+pauses that process, and checks again. The slow signature appears after about
+74 seconds. The engine remains paused throughout the queue comparison and is
+terminated afterward; its incomplete run is not a throughput score.
+
+Every treatment has a scalar control before and after it. Their 36 medians for
+flush CQE to following read CQE remain within 675.5–677.0 µs. In the two cycles,
+post-flush read command latencies are:
+
+| Read threads / distinct NVMe queues | Per-phase read medians | Median peak outstanding reads |
+| --- | ---: | ---: |
+| 1 | 642–646 µs | 1 |
+| 4 | 617–664 µs | 4 |
+| 8 | 653–679 µs | 8 |
+
+All six post-flush phases have zero global data writes and no other command
+issuers. The reads really overlap on different queues, but increasing their
+count does not multiply the delay. This supports a shared NVM service window
+rather than a stall confined to one submission queue. Host outstanding counts
+still do not measure controller execution or physical device queue depth.
+A repeat adds a final read after each group settles and preserves the same
+initial delay; its controls remain at 675.8–677.3 µs. One repeat phase has
+background writes, which remain recorded separately.
+
+## Read/flush overlap does not establish a workaround
+
+A first concurrent-read capture appears promising when classified only by
+command setup and CQE times: its 208 groups with a read spanning the flush CQE
+have a 41.6 µs median final read, while 23 groups whose read completes earlier
+have a 595.1 µs final read. The submission-publication repeat shows why that
+classification is insufficient. Of its 384 concurrent groups, 374 publish the
+read after the flush publication, and 371 of those reads themselves take at
+least 500 µs. A fast final read can simply mean the earlier read already paid
+the delay. Software overlap alone is not evidence that the window disappeared.
+
+A native helper then signals immediately before the first synchronous `pread`.
+The flush thread waits a requested 0, 2, 5, 10, 20, 30, 50, or 100 µs before
+issuing `FLUSH`; this signaling and delay run outside Python's interpreter lock.
+Sixteen shuffled phases compare a reader sharing queue 10 with the flush thread
+against a reader on queue 5. Each has 64 groups plus scalar controls before and
+after. The 32 control medians remain at 675.9–677.4 µs. Every directed phase has
+zero global data writes and no other command issuers.
+
+Five groups have inconsistent submission-tail snapshots under concurrent queue
+updates. They are excluded from publication-order analysis; their raw CQE
+records remain retained. Among the 1,019 eligible groups:
+
+| Timing class | Groups | First-read median | Final-read median |
+| --- | ---: | ---: | ---: |
+| Read CQE before flush CQE | 656 | 46.2 µs | 613.2 µs |
+| Read published before flush CQE, still pending at that CQE | 360 | 129.3 µs | 510.3 µs |
+| Read published after flush CQE | 3 | 764.3 µs | 46.8 µs |
+
+More specifically, 215 eligible reads have a matching publication marker at
+driver return before flush command setup and are still pending at its CQE.
+Their final-read median is 549.6 µs; 180 final
+reads take at least 500 µs. Thus even this earlier host publication plus a
+request spanning the flush CQE does not guarantee avoidance. Some short-delay
+queue-5 phases have fast final reads, but other delays retain the window; this
+is not a monotonic timing rule or a tested WAL mitigation. CQE timestamps and
+driver publication do not reveal when the controller starts processing a read.
+
+## Read-only admin queries perturb the measurement
+
+A separate controlled capture queries volatile-cache Feature `0x06` with the
+read-only `Get Features` opcode `0x0a`. It never changes that feature, and every
+query returns the expected enabled value. The 16 bracketing scalar controls
+remain at 675.9–676.2 µs from flush CQE to read CQE.
+
+| Concurrent reads | Read median without admin query | Read median with query while reads are outstanding | Admin setup-to-completion median |
+| --- | ---: | ---: | ---: |
+| 4 | 618.0 µs | 1,188.3 µs | 815.2 µs |
+| 8 | 652.8 µs | 1,089.5 µs | 842.9 µs |
+
+The admin command completes with at least one NVM read still pending in
+127/128 four-reader groups and 122/128 eight-reader groups. In 114 and 84 groups,
+respectively, all reads remain pending at that instant. The four-reader
+treatment has no other commands; the eight-reader treatment has three
+background commands. Admin completion during delayed data reads argues against
+a complete freeze of the controller or its PCIe path. Querying the feature
+also clearly perturbs the observation, so it must not serve as passive
+telemetry inside a performance comparison. These measurements use the admin
+completion tracepoint, not an admin hardware-CQE visibility sampler.
+
+Seven new captures and their helpers remain archived under
+`target/rfc024-stall-diagnosis/`: `flush-scope-capture/`,
+`flush-scope-gated-capture/`, `flush-scope-controlled-capture/`,
+`flush-scope-tail-capture/`, `flush-scope-admin-controlled-capture/`,
+`flush-scope-overlap-driver-capture/`, and `flush-scope-directed-capture/`.
+The first two are exploratory: the intended gate in the second did not run
+because `sudo` removed its parent environment configuration. That mistake is
+recorded in `capture-notes.json`; later wrappers set configuration inside the
+root helper. Neither exploratory capture supplies a state-controlled claim.
+
+The successful controlled pressure capture has ambiguous/unmatched records
+during warmup, including one target flush in a fast-state check; those are
+excluded. All subsequent treatment operations match. The tail, admin,
+publication-repeat, and native captures match every target operation with no
+status errors, discards, reported event loss, or runtime tracer warnings. The
+admin capture's 512 expected completions without an I/O-CQE match are separately
+paired with `ADMIN_DONE`. The native capture matches all 7,430 commands and
+driver records, while excluding the five tail-snapshot groups above. Whole-run
+background writes are recorded and are not described as scratch writes. Source,
+analysis, raw logs, summaries, and native-helper hashes are recorded in
+`flush-scope-artifacts.json`; `flush-scope-findings.json` collects the cited
+comparisons. No controller settings change in these seven captures.
+
 ## Online evidence for this SSD and firmware
 
 An independent test reports the exact `SSDPFKNU010TZ` model and `002C` firmware.
@@ -1143,6 +1262,18 @@ destructive preparation, so that suite is not run on this mounted system drive.
 No primary report found in the searched Linux/vendor material establishes a
 known fix for the reproduced empty-flush/post-CQE timing signature. This is a
 search result limitation, not proof that no relevant defect exists.
+
+The Linux 6.18 NVMe PCI driver has a deepest-power-state workaround for Solidigm
+P44 Pro, PCI `025e:f1ac`. This host's P41 Plus is `025e:f1ab`; that entry is not
+a matching-device fix, and disabling APST here already failed to remove the
+window. [Linux NVMe PCI device table](https://github.com/torvalds/linux/blob/v6.18/drivers/nvme/host/pci.c).
+
+The 2026 SIndex study also observes read-latency spikes after host writers stop,
+attributing them to internal buffer flushing on its tested devices. Its
+P4510/P4610/ZNS examples concern internal maintenance after data writes, not our
+empty namespace-FLUSH reproducer on P41 Plus. This supports an experimental
+hypothesis, without identifying our firmware task or a transferable fix.
+[SIndex, Section 3.3](https://doi.org/10.1145/3789205).
 
 ## Consequence for optimization decisions
 
@@ -1196,3 +1327,12 @@ is consequently the leading explanation; physical transport timing and the
 operation that switches the original fast/slow mode remain unproven. The separate
 data-dependent long stalls also remain unexplained. No production durability or
 WAL changes follow from these diagnostics.
+
+The queue and native-overlap captures narrow that lead to shared NVM service
+timing without proving an unconditional blackout after every flush. Requests
+published early can finish while later requests still absorb the remaining
+window. Admin commands can complete during delayed NVM reads and can extend the
+delay themselves. Neither higher outstanding depth nor read/flush overlap is
+a demonstrated cure. The exact fast/slow transition and the separate periodic
+approximately 8 ms data-writing stalls still require attribution; no safe
+production optimization or end-to-end WAL gain is established by these probes.
