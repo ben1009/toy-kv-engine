@@ -17,7 +17,14 @@ Passive completion-queue sampling at approximately 100 µs intervals finds that
 the delayed commands' CQEs become visible only near driver consumption; observed
 ready CQEs wait at most 7.1 µs in the routine delayed-write sample.
 
-These observations favor an internal SSD persistence mechanism over WAL
+The narrower reproducer now needs no data writes during a phase: repeated empty
+NVMe flushes delay the next read by approximately 644 µs. Every additional flush
+restarts the window, including with APST or volatile write cache disabled.
+The driver publishes the corresponding submission tails in about 5 µs; most of
+the delay follows that publication. This identifies the flush-command path as
+the strongest lead without naming its internal firmware operation.
+
+These observations favor an internal SSD flush/persistence mechanism over WAL
 coordination or host queue saturation. They do not identify the specific
 firmware/NAND operation or what switches the SSD between its fast and slow
 states; exact transport attribution is also not closed. APST, CPU activity,
@@ -951,6 +958,143 @@ Verified duplicate RAM artifacts are removed after archival. Artifacts are
 `post-flush-cq-sample-capture/`, `cq-window-samples.bt`,
 `analyze_cq_window.py`, and `cq-summary.json`.
 
+## Empty flushes reproduce and restart the window
+
+`flush_policy_probe.py` starts with an already slow control, so no engine is
+launched. It uses the same initialized reference and CPU 20, overwrites only
+the first 16 KiB, and reads the untouched last 4 KiB. Namespace passthrough
+commands are exclusively opcode-zero `FLUSH` for namespace 1; there are no raw
+device writes. Three randomized treatment cycles have 33 four-write/sync
+controls, whose first-write setup-to-CQE medians remain 605–609 µs throughout.
+The complete sweep writes about 163 MiB through the scratch file.
+
+The table aggregates per-phase medians across those three cycles. Times refer
+to individual command setup to consumed CQE, rather than syscall time.
+
+| Command sequence in the slow state | Relevant flush median | Following read median |
+| --- | ---: | ---: |
+| Four ordinary writes, read, no intervening sync | — | 25 µs |
+| Empty namespace flush, read; no writes in the phase | 22 µs | 645 µs |
+| Empty namespace flush, second empty flush, read | Second flush: 621 µs | 642 µs |
+| Four ordinary writes, `fdatasync`, read | 260 µs | 648 µs |
+| Four ordinary writes, namespace flush, read | 259 µs | 647 µs |
+| Four ordinary writes, 750 µs gap, `fdatasync`, read | 258 µs | 643 µs |
+
+All six empty-flush phases contain only the helper's flush/read commands: zero
+data writes from any host process, zero other command issuers, and no admin
+commands or discards. Repeated empty flushes reproduce the routine delay without
+new host data to persist. This is stronger than correlating the stall with a
+dirty WAL or a full userspace queue. It still allows controller-internal metadata
+or other maintenance work; host traces cannot establish that the controller
+performs no internal writes.
+
+The second empty flush finishes about 648 µs after the first flush's CQE.
+The subsequent read finishes another approximately 674 µs after the second
+flush's CQE. Adding two namespace flushes after a dirty `fdatasync` likewise
+makes each additional flush cost about 619–620 µs, followed by a delayed read.
+Thus another flush does not merely consume the original window: it starts
+another one. Delaying before the dirty sync also fails to remove the window.
+Direct namespace flushes reproduce it without ext4's `fdatasync` implementation.
+
+No command in the empty-flush phases reaches 5 ms. Data-writing phases retain
+the periodic longer stalls. The routine post-flush wait and the recurring
+approximately 8 ms data/persistence stalls therefore need separate attribution;
+the empty-flush result does not identify the latter's internal cause.
+
+All-four-write FUA phases verify control `0x4000` on every write. Their following
+reads have medians of 219–253 µs, but they retain 31–45 write stalls of at least
+5 ms per 1,024 writes. This is a different persistence path, not an established
+cure. A last-write-only FUA treatment is diagnostic only: FUA makes that
+command's range durable and supplies no implied ordering with other commands,
+so it cannot replace a group barrier for the preceding ordinary writes.
+[NVM command-set specification, Write FUA definition](https://nvmexpress.org/wp-content/uploads/NVM-Express-NVM-Command-Set-Specification-1.0d-2023.12.28-Ratified.pdf#page=39).
+
+The capture matches 62,260 commands without reported missing/replaced matches,
+status errors, admin commands, discards, or event loss. Two control sync
+intervals contain both the helper's flush and a journal flush; their ambiguous
+sync associations are excluded. Every targeted write, read, and raw flush
+matches. Trace output is compressed in RAM and archived after measurement.
+Artifacts are `flush-policy-capture/`, `flush_policy_probe.py`,
+`nvme-flush-policy.bt`, and `analyze_flush_policy.py`. An earlier authentication
+failure starts no workload and remains in `flush-policy-auth-failed-capture/`.
+
+## The empty-flush window survives both approved feature controls
+
+A guarded seven-phase experiment repeats the same small-file treatments under
+original settings, APST disabled twice, original settings, volatile cache
+disabled twice, and original settings again. Each change is verified by readback,
+never sets the persistent Save bit, and happens outside the measured probe
+phases. Child lifetime is bounded; final device flush, exact original cache bit,
+and exact original APST bit and transition table are successfully restored.
+
+| Feature configuration | Following read after an empty flush, per-phase medians |
+| --- | ---: |
+| APST enabled, volatile cache enabled; original/restored phases | 643–646 µs |
+| APST disabled, volatile cache enabled | 644–645 µs |
+| APST enabled, volatile cache disabled | 643–644 µs |
+
+The second empty flush also remains at 619–622 µs in every configuration.
+Cache-disabled ordinary writes become slower, as in the earlier engine test;
+neither setting supplies a mitigation. Every empty-flush phase during the two
+disabled-feature comparisons has zero global data writes and no other issuers.
+One final restored empty phase overlaps ten background writes; it remains
+recorded and is not needed for the no-competing-write conclusion.
+
+The trace matches 64,753 I/O commands with successful statuses and no discards
+or reported event loss. It records 34 expected feature-query/set admin setups
+outside the measured phases; those admin commands account for 34 completions
+without an I/O CQE match. Three control sync intervals have ambiguous associations
+with concurrent journal flushes and are excluded from that association analysis.
+All targeted reads, writes, and namespace flushes match. Artifacts are
+`flush-policy-features-capture/`, `flush_policy_feature_guard.c`, and the guard's
+verified restoration log.
+
+## Submission publication precedes the empty-flush wait
+
+A further capture records command ID and submission-queue slot at the NVMe
+driver's dispatch return. For all 1,280 commands in its two pure empty phases,
+the command is present in the submission queue, `sq_tail == last_sq_tail`, and
+the doorbell-buffer pointer is null. The
+[Linux driver](https://github.com/torvalds/linux/blob/v6.18/drivers/nvme/host/pci.c)
+sets that last-tail marker after its MMIO doorbell write. This locates driver
+publication without assuming that a software submission count measures device
+queue depth or proves when a PCIe transaction reaches the endpoint.
+
+For the 256 reads following one empty flush, command setup to driver return has
+a 5.24 µs median and 7.30 µs maximum. Driver return to consumed CQE has a 637.51 µs
+median and 640.50 µs maximum. The second-flush/read sequence shows the same
+short submission interval and long following wait. The capture matches 9,237
+commands; 9,230 of 9,233 driver records pair with commands, excluding three
+unmatched driver records. All targeted empty-phase commands pair successfully.
+Artifacts are `flush-policy-submit-capture/`, `driver-publication.bt`, and
+`analyze_driver_publication.py`.
+
+A combined submission/CQ-head capture then samples the same empty sequences at
+9,997 Hz on CPU 8, without consuming CQ entries or ringing doorbells. All 512
+delayed reads and 255 of 256 delayed second flushes meet the requirement for
+at least three stable samples, with six per command at the median. They have
+4,787 not-ready samples. Observed matching ready CQEs precede driver consumption
+by at most 4.848 µs for reads and 3.954 µs for flushes; none is observed ready
+more than 100 µs before consumption. The last not-ready observation precedes
+consumption by at most 104.868 µs. One flush with a recorded sampling race is
+excluded. Thus the empty-flush wait also precedes host-visible completion,
+rather than being a long interrupt wait after a ready CQE.
+
+All 9,230 traced commands and their driver records match in this combined
+capture. Its empty phases have no competing commands or data writes, successful
+statuses, no admin commands or discards, and no reported event loss. Adding
+sampling increases the measured setup-to-driver-return interval to about
+10 µs; the following read still waits about 627 µs after publication. The sampler
+records 47 map-lookup warnings and no probe-read warnings; warnings remain with
+the raw artifacts and recorded races are excluded by the eligibility checks.
+An earlier combined capture generated 36,963 warnings from uninitialized map
+lookups. It is retained separately; initializing matcher state removes that
+logging noise, and the repeated capture preserves the result. These captures
+are timing diagnostics, not benchmark scores. Artifacts are
+`flush-policy-cq-capture/`, `flush-policy-cq-clean-capture/`,
+`nvme-flush-cq-clean.bt`, `analyze_empty_cq_clean.py`, and
+`analyze_empty_driver_clean.py`.
+
 ## Online evidence for this SSD and firmware
 
 An independent test reports the exact `SSDPFKNU010TZ` model and `002C` firmware.
@@ -988,6 +1132,17 @@ continuous discard. Neither the firmware history nor the independent report
 lets us label our exact mechanism as the old DSLC bug, QLC programming, garbage
 collection, or a confirmed Linux defect. What is established locally is a
 state-dependent post-flush service window before host-visible completion.
+
+The broader measurement literature documents that SSD buffer policies can
+produce periodic latency spikes, that idle gaps change those spikes, and that
+some devices serialize concurrently submitted writes. It provides experimental
+methods and competing mechanisms, rather than a matching P41 Plus firmware fix.
+The studied drives predate this model, and the full probing suite requires
+destructive preparation, so that suite is not run on this mounted system drive.
+[Fantastic SSD Internals and How to Learn and Use Them](https://people.cs.vt.edu/huaicheng/p/systor22-queenie.pdf).
+No primary report found in the searched Linux/vendor material establishes a
+known fix for the reproduced empty-flush/post-CQE timing signature. This is a
+search result limitation, not proof that no relevant defect exists.
 
 ## Consequence for optimization decisions
 
@@ -1032,3 +1187,12 @@ measurements on the same model/firmware support investigating internal cache and
 persistence policy, without establishing which policy switches the observed
 state. Inserting delays or dummy reads merely shifts the cost and is not a
 production mitigation.
+
+Empty-flush tests narrow the routine mechanism further: the namespace `FLUSH`
+path itself can reproduce and restart the window without new host data writes,
+including with APST or volatile cache disabled. Command-specific submission-tail
+timestamps put the large wait after driver publication. Controller flush handling
+is consequently the leading explanation; physical transport timing and the
+operation that switches the original fast/slow mode remain unproven. The separate
+data-dependent long stalls also remain unexplained. No production durability or
+WAL changes follow from these diagnostics.
