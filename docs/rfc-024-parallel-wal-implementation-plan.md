@@ -167,7 +167,7 @@ verified after the coordinator exists.
   call; on success, advance `durable_ticket` only through that captured target
   and below `poison_ticket`. Immediately reconsider another sync if the
   written frontier moved during the call. A measured optimization permits a
-  100-microsecond wait only when the previous `fdatasync` took at least 100
+  400-microsecond wait only when the previous `fdatasync` took at least 100
   microseconds, a written prefix is ready, and tickets already admitted at
   the snapshot remain unwritten; later admission cannot extend the cutoff or
   deadline.
