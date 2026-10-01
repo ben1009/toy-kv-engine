@@ -10,6 +10,10 @@ numbers of retained WAL runtimes. [Frozen runtime retirement](rfc-024-frozen-wal
 now bounds worker and ring lifetime; its incremental measurements do not
 establish a throughput gain. Parallel WAL remains opt-in.
 
+[The 2026-10-01 optimization follow-up](rfc-024-wal-optimization-followup-20261001.md)
+tests byte-limited sync coalescing and faster worker integer maps against the
+current runtime. Both prototypes are rejected after paired comparisons.
+
 ## Worker-owned asynchronous data sync (rejected, 2026-09-28)
 
 A prototype removed the sync thread from the parallel runtime. The I/O
