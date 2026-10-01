@@ -30,6 +30,12 @@ can complete quickly while the following read still pays the remaining delay.
 Read-only admin queries also change these timings and must stay outside measured
 windows. Neither finding establishes the controller's internal execution order.
 
+An explicitly approved firmware update from `002C` to `004C` does not prevent
+the reproducer. The empty-flush/read median starts at 66 µs after the update,
+then reaches approximately 675 µs after 11.7 seconds of the unchanged WAL
+pressure sequence. The firmware test below records activation, pressure,
+and subsequent unchanged-binary controls separately.
+
 These observations favor an internal SSD flush/persistence mechanism over WAL
 coordination or host queue saturation. They do not identify the specific
 firmware/NAND operation or what switches the SSD between its fast and slow
@@ -1235,8 +1241,8 @@ not claim a flush-latency or sustained-write performance fix.
 [SST release notes, Table 14](https://sdmsdfwdriver.blob.core.windows.net/files/kba-gcc/drivers-downloads/ka-00085/sst--3-1/solidigm-storage-tool-release-notes-727314-027us.pdf#page=13).
 Solidigm currently lists `004C` as the latest P41 Plus firmware.
 [Official firmware table](https://www.solidigm.com/support-page/drivers-downloads/ka-00099.html).
-A firmware A/B test would be a separate intervention; no update or controller
-reset has been performed.
+The captures above use `002C`; no firmware update had been performed at that
+stage. The subsequent approved firmware intervention is recorded below.
 
 There is also a first-hand Ubuntu report of burst-then-collapse behavior on
 2 TB P41 Plus drives already running `004C`. Its copy workload and capacity
@@ -1274,6 +1280,86 @@ P4510/P4610/ZNS examples concern internal maintenance after data writes, not our
 empty namespace-FLUSH reproducer on P41 Plus. This supports an experimental
 hypothesis, without identifying our firmware task or a transferable fix.
 [SIndex, Section 3.3](https://doi.org/10.1145/3789205).
+
+## Approved 004C firmware intervention (2026-10-01)
+
+After explicit approval, Solidigm Storage Tool 3.1 applies its bundled firmware
+to `/dev/nvme0n1`, the `SOLIDIGM SSDPFKNU010TZ` 1 TB system SSD. Preflight verifies
+the exact model, healthy status, running `002C`, and available `004C`. The tool
+runs in a private mount namespace with its extracted firmware modules; nothing
+is installed globally. No external firmware image or erase command is used.
+
+The update finishes with exit status zero and reports successful installation,
+with a recommendation to reboot. No host reboot is performed. Subsequent NVMe
+Identify Controller and Firmware Slot Information queries independently report
+running `004C`, active slot 1 containing `004C`, and no slot pending activation
+on reset. Slot 2 retains `002C`. Linux sysfs and the vendor postflight also
+report `004C`; the controller is live and vendor status remains healthy. This
+establishes the active revision for the experiment despite the tool's reboot
+recommendation. It does not determine whether the tool internally reset the
+controller during the update.
+
+An initially faster device after firmware activation would not establish a
+fix: activation itself may change device state. The diagnostic therefore
+reuses the same initialized 64 MiB reference file and the previous pressure
+procedure. It starts the unchanged `925ed07d` parallel-WAL binary with four
+writers, 700,000 puts, 1 KiB values, and 1 MiB SST rotation. Every two seconds
+it pauses that process, waits 300 ms, and checks 128 sequential empty-FLUSH/read
+pairs. The pressure run is bounded and intentionally terminated after the
+scratch tests; its partial benchmark output is not a throughput score.
+
+The initial empty-flush/read median is 66.359 µs. Four pressure checks remain
+at 72.5–77.0 µs, but the next reaches 674.708 µs, 11.675 seconds after pressure
+starts. The process remains paused for the following two cycles, each with
+128 groups per treatment. All phase records are complete and error-free.
+
+| Concurrent readers | Direct-read median without FLUSH, µs | Direct-read median after empty FLUSH, µs | Reads per treatment |
+| --- | ---: | ---: | ---: |
+| 1 | 108.0 | 698.0 | 256 |
+| 4 | 127.9 | 660.4 | 1,024 |
+| 8 | 125.7 | 681.0 | 2,048 |
+
+The scalar controls before and after each cycle remain at 674.7–675.2 µs.
+No controller admin queries or profiling run inside these measurement phases.
+The scratch operations only issue namespace FLUSH and read-only `O_DIRECT`
+reads; the preceding WAL pressure does write data. This experiment has no
+eBPF command/CQE capture, so these numbers are syscall timings, not a new
+command-publication or hardware-completion attribution. Other host activity is
+not excluded by a whole-command trace in this run.
+
+The update does not prevent this pressure sequence from reproducing the long
+post-flush read latency. It does not show that `004C` has no other benefits,
+establish a particular internal firmware mechanism, or support a production
+durability workaround. The firmware intervention is separate from code
+optimization and cannot qualify a WAL adoption gate.
+
+The subsequent end-to-end check runs the same saved parallel-WAL binary against
+itself at 4, 8, and 16 writers. Its SHA-256 is unchanged before and after all
+18 successful runs. Each count has three adjacent A/B pairs with alternating
+arm order; writer-count order rotates between rounds. All runs use fresh paths,
+50,000 puts, 1 KiB values, and latency sampling every ten operations. Four writers
+use 1 MiB rotation; eight and sixteen use a 1 GiB SST target. No build, profiler,
+or controller admin polling overlaps timing. All samples are retained.
+
+| Writers | Median puts/s | Minimum–maximum puts/s | Minimum–maximum commit p99, ms | Same-binary B/A throughput ratios |
+| --- | ---: | ---: | ---: | --- |
+| 4 | 9,695 | 2,398–9,811 | 1.190–11.926 | 3.239, 0.995, 0.987 |
+| 8 | 18,041 | 17,775–18,311 | 1.095–1.166 | 1.016, 1.012, 0.971 |
+| 16 | 28,247 | 27,632–29,211 | 1.237–1.300 | 0.968, 0.991, 0.982 |
+
+The first four-writer pair changes from 2,398 to 7,765 puts/s without a code
+change; later samples reach about 9.8k. This reproduces substantial variability
+on active `004C`. The eight- and sixteen-writer samples are closer in this short
+session, which does not establish sustained stability at those counts. This
+is a 50k-put diagnostic, not a rerun of the prior 200k-put adoption matrix,
+a matched old/new firmware throughput comparison, or an optimization score.
+
+Artifacts are `sst-tools/firmware-004c-update-20261001/` for preflight, update,
+postflight, and activation verification; `firmware-004c-probe/` for pressure
+checks and direct-read phases; and `target/rfc024-firmware-004c-comparison/`
+for the unchanged-binary 4/8/16-writer checks. `firmware-004c-artifacts.json`
+records their source and result hashes. The firmware package remains the same
+vendor package used in the earlier read-only eligibility check.
 
 ## Consequence for optimization decisions
 
@@ -1336,3 +1422,9 @@ delay themselves. Neither higher outstanding depth nor read/flush overlap is
 a demonstrated cure. The exact fast/slow transition and the separate periodic
 approximately 8 ms data-writing stalls still require attribution; no safe
 production optimization or end-to-end WAL gain is established by these probes.
+
+The approved update activates `004C`, but the same pressure procedure still
+reproduces the post-flush read delay and an unchanged four-writer binary still
+has a 3.24x paired throughput swing. The firmware intervention consequently
+does not resolve the measurement problem. Its short comparison cannot establish
+an old/new firmware regression or qualify code gains.
