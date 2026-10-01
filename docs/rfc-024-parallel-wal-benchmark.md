@@ -1,9 +1,12 @@
 # RFC 024: Parallel WAL benchmark outcomes
 
-**Decision:** Keep the client-leader WAL as the default. Removing the parallel
-path's dedicated packer thread improved it on tmpfs and left ext4 throughput
-near parity with the previous parallel implementation. The current candidate
-still loses to the leader on tmpfs, so parallel WAL remains opt-in.
+**Decision:** Keep the client-leader WAL as the default. The latest
+[same-session qualification matrix](rfc-024-wal-qualification-20261001.md)
+shows a 171.0% paired throughput gain on the original ext4 workload, with
+48.9% lower p99 and three passing repeat-control blocks. Tmpfs single-writer
+and ext4 batch-tail regressions still fail the full RFC gate. Historical
+comparisons remain affected by stalls, and rotation diagnostics found large
+numbers of retained WAL runtimes. Parallel WAL remains opt-in.
 
 ## Worker-owned asynchronous data sync (rejected, 2026-09-28)
 
