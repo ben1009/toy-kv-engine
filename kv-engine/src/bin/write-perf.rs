@@ -3125,15 +3125,44 @@ fn run_wal_throughput(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
     Ok(results)
 }
 
+/// Bound the PITR bytes for concurrent puts or batches without relying on
+/// batching to reduce framing and alignment overhead.
+fn pitr_workload_limits(cfg: &HarnessConfig) -> Result<(u64, u64)> {
+    // Each value gets room for its key, value tag, entry framing, a batch
+    // header, and alignment even if it is committed in a batch of one. The
+    // harness's key indices fit in usize; 128 bytes covers their formatting
+    // and the current v5/v6 overhead. Batched writes need fewer padded bytes.
+    let per_value = u64::try_from(cfg.value_size)
+        .context("PITR workload value size exceeds u64")?
+        .checked_add(128)
+        .and_then(|bytes| bytes.checked_add(4095))
+        .context("PITR workload aligned value size overflow")?
+        / 4096
+        * 4096;
+    let written = u64::try_from(cfg.num)
+        .context("PITR workload value count exceeds u64")?
+        .checked_mul(per_value)
+        .context("PITR workload encoded size overflow")?;
+    // Preserve the existing minimum and headroom, which also cover the file
+    // header. Checked arithmetic rejects unrepresentable budgets.
+    let segment = written
+        .checked_mul(2)
+        .context("PITR workload segment size overflow")?
+        .max(256 * 1024 * 1024);
+    let budget = segment
+        .checked_mul(2)
+        .context("PITR workload unarchived budget overflow")?;
+
+    Ok((segment, budget))
+}
+
 /// Bootstrap a PITR repository next to the database and enable PITR on it.
 ///
-/// The limits are sized for this harness's workload rather than pitr-perf's: a
-/// `wal_concurrent` run writes `num * 4096` aligned bytes (one 4 KiB buffer per
-/// operation whatever the value size) and nothing archives during the run, so
-/// the unarchived budget has to admit the whole run or writes are refused
-/// part-way through. The archive interval is parked far out of the way so the
+/// Segment and unarchived limits cover the whole encoded workload, including
+/// larger values. The archive interval is parked far out of the way so the
 /// measurement is the write path and not a background archive.
 fn enable_pitr_for_workload(cfg: &HarnessConfig, engine: &KvEngine, path: &Path) -> Result<()> {
+    let (segment, budget) = pitr_workload_limits(cfg)?;
     let repository = path.with_extension("pitr-repository");
     let _ = std::fs::remove_dir_all(&repository);
     ensure!(
@@ -3150,9 +3179,6 @@ fn enable_pitr_for_workload(cfg: &HarnessConfig, engine: &KvEngine, path: &Path)
     // measured: crossing `max_segment_bytes` stops commit admission, and a put
     // during a barrier is a hard error rather than something a benchmark can wait
     // out. The budget has to admit the segment, which the config enforces.
-    let written = (cfg.num as u64).saturating_mul(4096);
-    let segment = written.saturating_mul(2).max(256 * 1024 * 1024);
-    let budget = segment.saturating_mul(2);
     ensure!(
         matches!(
             engine.enable_pitr(PitrOptions {
@@ -8015,8 +8041,10 @@ fn validate_run_mode(cfg: &HarnessConfig, bench_arg: Option<&str>) -> Result<()>
         "--prepare-golden does not support --bench"
     );
     if cfg.wal_io_mode == WalIoModeArg::Parallel {
-        let is_supported_wal_workload =
-            matches!(bench_arg, Some("wal_concurrent" | "wal_batch_concurrent"));
+        let is_supported_wal_workload = matches!(
+            bench_arg,
+            Some("wal_concurrent" | "wal_batch_concurrent" | "wal_batch")
+        );
         anyhow::ensure!(
             is_supported_wal_workload,
             "--wal-io-mode parallel requires --bench wal_concurrent or wal_batch_concurrent"
@@ -8049,8 +8077,39 @@ mod tests {
     }
 
     #[test]
+    fn pitr_workload_limits_cover_large_values_and_keep_small_value_budgets() {
+        let mut cfg = legacy_cfg();
+        cfg.num = 200_000;
+        cfg.value_size = 1024;
+        let (segment, budget) = pitr_workload_limits(&cfg).expect("size small-value workload");
+        assert_eq!(segment, 200_000 * 4096 * 2);
+        assert_eq!(budget, segment * 2);
+
+        cfg.value_size = 16 * 1024;
+        let (segment, budget) = pitr_workload_limits(&cfg).expect("size large-value workload");
+        // A padded batch of one needs 20 KiB, including its key and framing.
+        assert!(segment >= 4096 + 200_000 * 20 * 1024);
+        assert!(budget >= segment);
+
+        cfg.num = 1;
+        cfg.value_size = 1024;
+        assert_eq!(
+            pitr_workload_limits(&cfg).expect("keep minimum budget"),
+            (256 * 1024 * 1024, 512 * 1024 * 1024)
+        );
+    }
+
+    #[test]
+    fn pitr_workload_limits_reject_unrepresentable_encoded_sizes() {
+        let mut cfg = legacy_cfg();
+        cfg.value_size = usize::MAX;
+        cfg.num = usize::MAX;
+        assert!(pitr_workload_limits(&cfg).is_err());
+    }
+
+    #[test]
     fn parallel_wal_mode_is_scoped_to_concurrent_wal_workloads() {
-        for workload in ["wal_concurrent", "wal_batch_concurrent"] {
+        for workload in ["wal_concurrent", "wal_batch_concurrent", "wal_batch"] {
             let args = Args::try_parse_from([
                 "write-perf",
                 "--wal-io-mode",
