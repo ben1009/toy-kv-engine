@@ -123,12 +123,36 @@ blanket replacement nor a filesystem-keyed selector is the right axis.
   `runs-retry.jsonl`, `blocks.jsonl`, `summary.json`, `runner.py`,
   `analyze.py`, and both logs. Unversioned, retained on this host.
 
+## Shape-policy follow-up (rejected, same day)
+
+The follow-up named here was built and screened: groups of at most three
+buffers and at most 32 KiB submit with one `pwritev`, larger groups keep the
+ring (binary `a7a1770ffb044416`, five cases, three ABBA blocks, ring-only arm
+as the control; artifacts under
+`target/rfc024-shape-submit-screen-20261002/`).
+
+| Case | Median ratio | Block ratios | Controls | p99 ratio | Verdict |
+| --- | ---: | --- | ---: | ---: | --- |
+| tmpfs-4w-rot | 1.958 | 2.103, 1.907, 1.958 | 0/3 | 0.857 | win kept |
+| tmpfs-16w-iso | 0.818 | 0.634, 0.818, 0.896 | 0/3 | 1.338 | regression persists |
+| tmpfs-batch64-8w-red | 0.974 | 0.974, 0.928, 1.184 | 0/3 | 0.961 | parity |
+| ext4-4w-rot (50k puts) | 1.024 | 1.019, 1.024, 1.033 | 1/3 | 0.999 | parity |
+| ext4-batch64-8w | 1.012 | 1.012, 1.040, 0.967 | 0/3 | 0.985 | parity |
+
+Rejected. The sixteen-writer regression survives the shape rule because that
+case's 4.5-buffer mean hides a distribution in which most groups hold three or
+fewer buffers, so the rule keeps choosing the mechanism that loses there. On
+the device-backed filesystem the rule is at parity (1.024 at four writers,
+1.012 in the batch case) - the 1.292 this record measured for four ext4 writers
+under forced synchronous submission does not reproduce at 50,000 puts, and with
+its control screen failing in the full matrix it was most likely host noise.
+Since the optimization earns nothing on ext4, it is not pursued; the shape
+policy is preserved on the `perf/wal-sync-submit` branch only.
+
 ## Next steps
 
-The measured shape dependence suggests one follow-up if this is revisited: use
-the ring when a group holds many buffers and synchronous submission when it
-holds one or two, with the threshold measured rather than assumed, then re-run
-the sixteen-writer and batch cases. That is a new candidate with its own
-hypothesis, not a retry of this one - and adaptive selectors have been rejected
-twice in this record (rotation-bound selection, submission staging), so it
-should be qualified against an unchanged control before adoption.
+None for this line of work. A future attempt would need a signal that separates
+the two regimes better than group size - outstanding depth, not the buffers in
+one drained group - and would still have to prove itself on ext4 first:
+synchronous submission is only worth pursuing where it beats the ring on
+device-backed storage.
