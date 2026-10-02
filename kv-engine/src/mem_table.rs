@@ -1630,6 +1630,20 @@ impl MemTable {
         self.wal.as_ref().is_some_and(|wal| wal.is_v5())
     }
 
+    /// Release the io_uring ring of a drained, immutable leader WAL.
+    ///
+    /// Call after writers have finished, when freezing the memtable or after
+    /// recovering an immutable WAL. The WAL data stays available for recovery;
+    /// only the per-WAL ring is released. See [`Wal::retire_ring`].
+    pub(crate) fn retire_wal_ring(&self) -> bool {
+        self.wal.as_ref().is_some_and(|wal| wal.retire_ring())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_ring(&self) -> Option<bool> {
+        self.wal.as_ref().map(|wal| wal.has_ring())
+    }
+
     /// Join the background runtime owned by a candidate parallel WAL.
     ///
     /// Call after writers have finished, when freezing the memtable or

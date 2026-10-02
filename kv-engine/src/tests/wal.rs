@@ -703,6 +703,97 @@ fn failpoint_parallel_wal_freeze_failure_does_not_publish_a_successor() {
 }
 
 #[test]
+fn test_leader_wal_rings_do_not_accumulate_across_freezes() {
+    const ROTATIONS: usize = 6;
+
+    let dir = tempdir().unwrap();
+    let mut options = LsmStorageOptions::default_for_test();
+    options.enable_wal = true;
+    options.target_sst_size = 1 << 30;
+    options.num_memtable_limit = usize::MAX;
+    let engine = match KvEngine::open_with_wal_io_mode(dir.path(), options, WalIoMode::Leader) {
+        Ok(engine) => engine,
+        Err(error) if is_io_uring_unavailable_error(&error) => {
+            eprintln!("skipping test (io_uring unavailable): {error}");
+            return;
+        }
+        Err(error) => panic!("failed to open leader WAL engine: {error:#}"),
+    };
+
+    // The regression this pins: every frozen WAL used to keep its ring, so a
+    // rotation-heavy workload accumulated one ring per retained WAL until ring
+    // creation failed against RLIMIT_MEMLOCK.
+    for rotation in 0..ROTATIONS {
+        let key = format!("rotation/{rotation}");
+        engine.put(key.as_bytes(), b"value").unwrap();
+        let state_lock = engine.inner.state_lock.lock();
+        engine.inner.force_freeze_memtable(&state_lock).unwrap();
+        drop(state_lock);
+
+        let state = engine.inner.state.load();
+        let live_rings = std::iter::once(&state.memtable)
+            .chain(state.imm_memtables.iter())
+            .filter(|memtable| memtable.has_ring() == Some(true))
+            .count();
+        assert_eq!(
+            live_rings, 1,
+            "rotation {rotation}: only the active memtable keeps a ring"
+        );
+    }
+    engine.close().unwrap();
+}
+
+#[test]
+fn test_leader_wal_ring_retires_when_a_memtable_is_frozen() {
+    let dir = tempdir().unwrap();
+    let mut options = LsmStorageOptions::default_for_test();
+    options.enable_wal = true;
+    options.target_sst_size = 1 << 30;
+    options.num_memtable_limit = usize::MAX;
+    let engine =
+        match KvEngine::open_with_wal_io_mode(dir.path(), options.clone(), WalIoMode::Leader) {
+            Ok(engine) => engine,
+            Err(error) if is_io_uring_unavailable_error(&error) => {
+                eprintln!("skipping test (io_uring unavailable): {error}");
+                return;
+            }
+            Err(error) => panic!("failed to open leader WAL engine: {error:#}"),
+        };
+
+    engine.put(b"key", b"value").unwrap();
+    assert_eq!(engine.inner.state.load().memtable.has_ring(), Some(true));
+    let state_lock = engine.inner.state_lock.lock();
+    engine.inner.force_freeze_memtable(&state_lock).unwrap();
+    drop(state_lock);
+
+    let state = engine.inner.state.load();
+    assert_eq!(state.imm_memtables.len(), 1);
+    assert_eq!(
+        state.imm_memtables[0].has_ring(),
+        Some(false),
+        "a frozen leader WAL releases its io_uring ring"
+    );
+    assert_eq!(
+        state.memtable.has_ring(),
+        Some(true),
+        "the successor memtable keeps its own ring"
+    );
+    state.imm_memtables[0]
+        .sync_wal()
+        .expect("a retired WAL still reports durability");
+    engine.close().unwrap();
+    drop(engine);
+
+    // The WAL data outlives its ring: recovery still sees the frozen batch.
+    let reopened = KvEngine::open_with_wal_io_mode(dir.path(), options, WalIoMode::Leader).unwrap();
+    assert_eq!(
+        reopened.get(b"key").unwrap().as_deref(),
+        Some(&b"value"[..])
+    );
+    reopened.close().unwrap();
+}
+
+#[test]
 fn test_parallel_wal_engine_recovers_ttl_deletes_and_range_tombstones() {
     let dir = tempdir().unwrap();
     let mut options = LsmStorageOptions::default_for_test();
