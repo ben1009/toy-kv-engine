@@ -4,8 +4,11 @@
 //! and data locations. Acceptance gate: ≤10% p95 regression for point-get,
 //! ≤15% p95 for scan/prefix-scan at 100 non-covering tombstones.
 
+mod common;
+
 use std::{hint::black_box, ops::Bound};
 
+use common::TempEngine;
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use kv_engine::{
     compact::{CompactionOptions, LeveledCompactionOptions},
@@ -542,16 +545,13 @@ fn bench_recovery(c: &mut Criterion) {
 
     for n_tombstones in [0, 1, 100, 10_000] {
         // Prepare data directory with tombstones (WAL disabled, flushed)
-        let dir = tempfile::tempdir().unwrap();
-        {
-            let lsm = KvEngine::open(dir.path(), make_options()).unwrap();
-            load_entries(&lsm, 5000);
-            insert_noncovering_tombstones(&lsm, n_tombstones);
-            flush_all(&lsm);
-            lsm.close().unwrap();
-        }
+        let lsm = TempEngine::new(make_options());
+        load_entries(&lsm, 5000);
+        insert_noncovering_tombstones(&lsm, n_tombstones);
+        flush_all(&lsm);
+        lsm.close().unwrap();
 
-        let path = dir.path().to_path_buf();
+        let path = lsm.path().to_path_buf();
         let label = format!("tombstones={}", n_tombstones);
         group.bench_function(BenchmarkId::new("open_sst", &label), |b| {
             b.iter_batched(
@@ -565,32 +565,27 @@ fn bench_recovery(c: &mut Criterion) {
                     temp_dir
                 },
                 |temp_dir| {
-                    let lsm = KvEngine::open(temp_dir.path(), make_options()).unwrap();
+                    let lsm = TempEngine::open(temp_dir, make_options());
                     black_box(&lsm);
-                    // Drop without close() to exclude shutdown work from timing
-                    drop(lsm);
-                    temp_dir
+                    // Criterion drops the returned fixture after stopping the timer.
+
+                    lsm
                 },
-                criterion::BatchSize::SmallInput,
+                criterion::BatchSize::PerIteration,
             )
         });
-
-        drop(dir);
     }
 
     // WAL recovery: tombstones in WAL (not flushed)
-    let dir_wal = tempfile::tempdir().unwrap();
-    {
-        let lsm = KvEngine::open(dir_wal.path(), make_options_wal()).unwrap();
-        load_entries(&lsm, 5000);
-        lsm.sync().unwrap();
-        insert_noncovering_tombstones(&lsm, 100);
-        lsm.sync().unwrap();
-        // Do NOT flush — tombstones live in WAL only
-        lsm.close().unwrap();
-    }
+    let lsm = TempEngine::new(make_options_wal());
+    load_entries(&lsm, 5000);
+    lsm.sync().unwrap();
+    insert_noncovering_tombstones(&lsm, 100);
+    lsm.sync().unwrap();
+    // Do NOT flush — tombstones live in WAL only
+    lsm.close().unwrap();
 
-    let path_wal = dir_wal.path().to_path_buf();
+    let path_wal = lsm.path().to_path_buf();
     group.bench_function(BenchmarkId::new("open_wal", "tombstones=100"), |b| {
         b.iter_batched(
             || {
@@ -602,17 +597,16 @@ fn bench_recovery(c: &mut Criterion) {
                 temp_dir
             },
             |temp_dir| {
-                let lsm = KvEngine::open(temp_dir.path(), make_options_wal()).unwrap();
+                let lsm = TempEngine::open(temp_dir, make_options_wal());
                 black_box(&lsm);
-                // Drop without close() to exclude shutdown work from timing
-                drop(lsm);
-                temp_dir
+                // Criterion drops the returned fixture after stopping the timer.
+
+                lsm
             },
-            criterion::BatchSize::SmallInput,
+            criterion::BatchSize::PerIteration,
         )
     });
 
-    drop(dir_wal);
     group.finish();
 }
 

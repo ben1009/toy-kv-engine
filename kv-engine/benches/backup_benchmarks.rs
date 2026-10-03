@@ -46,9 +46,19 @@ struct Accounting {
 }
 
 struct Scenario {
-    _dir: tempfile::TempDir,
     engine: Arc<KvEngine>,
     repository: std::path::PathBuf,
+    _dir: tempfile::TempDir,
+}
+
+impl Drop for Scenario {
+    fn drop(&mut self) {
+        // Finish background work before the temporary directory is removed.
+        // MeasuredBackup owns this fixture until Criterion stops the timer.
+        if let Err(error) = self.engine.close() {
+            eprintln!("backup benchmark engine cleanup failed: {error:#}");
+        }
+    }
 }
 
 struct MeasuredBackup {
@@ -233,7 +243,7 @@ fn bench_backup(c: &mut Criterion) {
                         |scenario| {
                             run_backup(scenario, &scenario_name, value_separation, entry_count)
                         },
-                        BatchSize::SmallInput,
+                        BatchSize::PerIteration,
                     );
                 },
             );

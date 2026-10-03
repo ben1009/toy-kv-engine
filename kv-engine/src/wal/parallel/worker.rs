@@ -9,14 +9,15 @@ use std::{
     marker::PhantomData,
     ops::Range,
     os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     thread::{self, JoinHandle},
 };
 
 #[cfg(feature = "bench")]
 use std::collections::BTreeMap;
-#[cfg(feature = "bench")]
-use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(feature = "bench")]
 use std::time::Instant;
 
@@ -183,6 +184,13 @@ impl WalSyncProgress {
         #[cfg(feature = "bench")]
         if let Some(profile) = self.profile() {
             profile.record_wal_worker_eventfd_notification();
+        }
+    }
+
+    pub(crate) fn record_worker_eventfd_write(&self) {
+        #[cfg(feature = "bench")]
+        if let Some(profile) = self.profile() {
+            profile.record_wal_worker_eventfd_write();
         }
     }
 
@@ -501,7 +509,7 @@ impl WalSyncProgress {
     }
 }
 
-const MAX_INFLIGHT_GROUPS: usize = 8;
+const MAX_INFLIGHT_GROUPS: usize = 32;
 const MAX_OUTSTANDING_SQES: usize = RING_SIZE;
 const DIRECT_IO_ALIGNMENT: usize = 4096;
 
@@ -531,27 +539,89 @@ impl<B> WriteBuffer<B> {
     }
 }
 
+/// Avoid a heap allocation for the common one-write group while retaining a
+/// spill vector for groups that contain multiple writes.
+pub(crate) struct WriteGroupBuffers<B> {
+    first: Option<WriteBuffer<B>>,
+    rest: Vec<WriteBuffer<B>>,
+}
+
+impl<B> WriteGroupBuffers<B> {
+    pub(crate) fn with_capacity(capacity: usize) -> Self {
+        Self {
+            first: None,
+            rest: Vec::with_capacity(capacity.saturating_sub(1)),
+        }
+    }
+
+    pub(crate) fn push(&mut self, write: WriteBuffer<B>) {
+        if self.first.is_none() {
+            self.first = Some(write);
+        } else {
+            self.rest.push(write);
+        }
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        usize::from(self.first.is_some()) + self.rest.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.first.is_none()
+    }
+
+    fn first(&self) -> Option<&WriteBuffer<B>> {
+        self.first.as_ref()
+    }
+
+    fn last(&self) -> Option<&WriteBuffer<B>> {
+        self.rest.last().or(self.first.as_ref())
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &WriteBuffer<B>> {
+        self.first.iter().chain(self.rest.iter())
+    }
+
+    fn into_iter(self) -> impl Iterator<Item = WriteBuffer<B>> {
+        self.first.into_iter().chain(self.rest)
+    }
+}
+
+impl<B> From<Vec<WriteBuffer<B>>> for WriteGroupBuffers<B> {
+    fn from(writes: Vec<WriteBuffer<B>>) -> Self {
+        let mut writes = writes.into_iter();
+        Self {
+            first: writes.next(),
+            rest: writes.collect(),
+        }
+    }
+}
+
 /// A ticket-ordered group whose file range has already been reserved and
 /// preallocated by the packer.
 pub(crate) struct WriteGroup<B = DirectBuf> {
     tickets: Range<u64>,
-    writes: Vec<WriteBuffer<B>>,
+    writes: WriteGroupBuffers<B>,
 }
 
 impl<B> WriteGroup<B> {
     pub(crate) fn new(
         tickets: Range<u64>,
-        writes: Vec<WriteBuffer<B>>,
+        writes: impl Into<WriteGroupBuffers<B>>,
     ) -> Result<Self, WorkerError> {
         if tickets.start >= tickets.end {
             return Err(WorkerError::InvalidTicketRange);
         }
+        let writes = writes.into();
         if writes.is_empty() {
             return Err(WorkerError::EmptyGroup);
         }
 
-        let mut expected_offset = writes[0].file_offset;
-        for write in &writes {
+        let mut expected_offset = writes
+            .first()
+            .expect("nonempty group has first write")
+            .file_offset;
+        for write in writes.iter() {
             if write.write_len == 0
                 || write.write_len > i32::MAX as usize
                 || !write.write_len.is_multiple_of(DIRECT_IO_ALIGNMENT)
@@ -632,7 +702,7 @@ struct OwnedWrite<B> {
 struct GroupState {
     tickets: Range<u64>,
     file_range: Range<u64>,
-    request_ids: Vec<RequestId>,
+    request_ids: Range<u64>,
     next_ready_index: usize,
     remaining_writes: usize,
     error: Option<String>,
@@ -734,7 +804,11 @@ impl<B: WorkerBuffer> WorkerCore<B> {
             return Err(WorkerError::TooManyGroups);
         }
 
-        let file_start = group.writes[0].file_offset;
+        let file_start = group
+            .writes
+            .first()
+            .expect("validated group has writes")
+            .file_offset;
         if self
             .next_file_offset
             .is_some_and(|next_file_offset| file_start != next_file_offset)
@@ -763,13 +837,12 @@ impl<B: WorkerBuffer> WorkerCore<B> {
             .next_buffer_id
             .checked_add(request_count)
             .ok_or(WorkerError::CounterOverflow)?;
-        let mut request_ids = Vec::with_capacity(group.writes.len());
-        for write in group.writes {
+        let request_ids_start = self.next_request_id;
+        for write in group.writes.into_iter() {
             let request_id = RequestId(self.next_request_id);
             self.next_request_id += 1;
             let buffer_id = BufferId(self.next_buffer_id);
             self.next_buffer_id += 1;
-            request_ids.push(request_id);
             self.writes.insert(
                 request_id,
                 OwnedWrite {
@@ -789,12 +862,14 @@ impl<B: WorkerBuffer> WorkerCore<B> {
         self.next_ticket = Some(group.tickets.end);
         self.next_file_offset = Some(file_end);
         self.group_order.push_back(group_id);
+        let request_ids = request_ids_start..next_request_id;
         self.groups.insert(
             group_id,
             GroupState {
                 tickets: group.tickets,
                 file_range: file_start..file_end,
-                remaining_writes: request_ids.len(),
+                remaining_writes: usize::try_from(request_count)
+                    .expect("request count came from a usize"),
                 request_ids,
                 next_ready_index: 0,
                 error: None,
@@ -831,10 +906,10 @@ impl<B: WorkerBuffer> WorkerCore<B> {
                 }
                 if let Some((request_offset, request_id)) = group
                     .request_ids
-                    .iter()
-                    .copied()
+                    .clone()
                     .enumerate()
                     .skip(group.next_ready_index)
+                    .map(|(request_offset, request_id)| (request_offset, RequestId(request_id)))
                     .find(|(_, request_id)| {
                         self.writes
                             .get(request_id)
@@ -1017,16 +1092,14 @@ impl<B: WorkerBuffer> WorkerCore<B> {
                 .expect("ordered group exists")
                 .request_ids
                 .clone();
-            let group = self
-                .groups
+            self.groups
                 .get_mut(&group_id)
-                .expect("ordered group exists");
-            group
+                .expect("ordered group exists")
                 .error
                 .get_or_insert_with(|| format!("WAL poisoned at ticket {poison_ticket}"));
             let mut cancelled_writes = 0;
 
-            for request_id in request_ids {
+            for request_id in request_ids.map(RequestId) {
                 let write = self
                     .writes
                     .get_mut(&request_id)
@@ -1039,6 +1112,10 @@ impl<B: WorkerBuffer> WorkerCore<B> {
                     cancelled_writes += 1;
                 }
             }
+            let group = self
+                .groups
+                .get_mut(&group_id)
+                .expect("ordered group exists");
             group.remaining_writes = group
                 .remaining_writes
                 .checked_sub(cancelled_writes)
@@ -1066,10 +1143,10 @@ impl<B: WorkerBuffer> WorkerCore<B> {
                 .groups
                 .remove(&group_id)
                 .expect("completed group exists");
-            let write_count = group.request_ids.len() as u64;
+            let write_count = group.request_ids.end - group.request_ids.start;
             let write_bytes = group.file_range.end - group.file_range.start;
             self.group_order.retain(|queued_id| *queued_id != group_id);
-            for request_id in group.request_ids {
+            for request_id in group.request_ids.map(RequestId) {
                 let write = self.writes.remove(&request_id);
                 debug_assert!(write.is_some_and(|write| write.state.is_terminal()));
             }
@@ -1144,6 +1221,10 @@ impl<B: WorkerBuffer> WorkerCore<B> {
         self.groups.len()
     }
 
+    fn can_receive_command(&self, stopping: bool) -> bool {
+        !stopping && self.group_count() < MAX_INFLIGHT_GROUPS
+    }
+
     #[cfg(feature = "chaos-testing")]
     fn lowest_group_ticket(&self) -> Option<u64> {
         self.groups.values().map(|group| group.tickets.start).min()
@@ -1165,8 +1246,8 @@ impl<B: WorkerBuffer> WorkerCore<B> {
         self.groups
             .values()
             .filter(|group| {
-                group.request_ids.iter().any(|request_id| {
-                    self.writes.get(request_id).is_some_and(|write| {
+                group.request_ids.clone().map(RequestId).any(|request_id| {
+                    self.writes.get(&request_id).is_some_and(|write| {
                         matches!(write.state, WriteState::Submitted | WriteState::Ambiguous)
                     })
                 })
@@ -1185,7 +1266,7 @@ impl<B: WorkerBuffer> WorkerCore<B> {
                 self.groups.get(group_id).map(|group| GroupWriteResult {
                     group_id: group_id.0,
                     tickets: group.tickets.clone(),
-                    write_count: group.request_ids.len() as u64,
+                    write_count: group.request_ids.end - group.request_ids.start,
                     write_bytes: group.file_range.end - group.file_range.start,
                     error: Some(reason.to_owned()),
                 })
@@ -1265,6 +1346,8 @@ enum WorkerCommand<B = DirectBuf> {
 /// Only the worker reads the eventfd; submitters share its write side.
 struct WorkerWake {
     fd: OwnedFd,
+    pending: AtomicBool,
+    waiting_for_progress: AtomicBool,
 }
 
 impl WorkerWake {
@@ -1277,10 +1360,30 @@ impl WorkerWake {
         // SAFETY: eventfd returned a fresh descriptor, now owned by this value.
         Ok(Self {
             fd: unsafe { OwnedFd::from_raw_fd(fd) },
+            pending: AtomicBool::new(false),
+            waiting_for_progress: AtomicBool::new(false),
         })
     }
 
-    fn signal(&self) -> io::Result<()> {
+    /// Signal only when the worker is waiting for ring or command readiness.
+    /// The worker publishes that state before checking the command queue, so a
+    /// command either makes that check observe it or sees the published state
+    /// and writes the eventfd before the worker polls.
+    fn signal_if_waiting(&self) -> io::Result<bool> {
+        if !self.waiting_for_progress.load(Ordering::SeqCst) {
+            return Ok(false);
+        }
+        self.signal()
+    }
+
+    /// Set the wakeup only on the transition from no pending event to pending.
+    /// Commands are enqueued before this method is called, so one eventfd write
+    /// wakes the worker to drain every command accumulated behind it.
+    fn signal(&self) -> io::Result<bool> {
+        if self.pending.swap(true, Ordering::AcqRel) {
+            return Ok(false);
+        }
+
         let value = 1_u64;
         loop {
             // SAFETY: eventfd requires an eight-byte write; `value` remains
@@ -1293,16 +1396,20 @@ impl WorkerWake {
                 )
             };
             if written == std::mem::size_of::<u64>() as isize {
-                return Ok(());
+                return Ok(true);
             }
             if written >= 0 {
+                self.pending.store(false, Ordering::Release);
                 return Err(io::Error::other("short WAL worker wakeup write"));
             }
             let error = io::Error::last_os_error();
             match error.kind() {
                 io::ErrorKind::Interrupted => continue,
-                io::ErrorKind::WouldBlock => return Ok(()),
-                _ => return Err(error),
+                io::ErrorKind::WouldBlock => return Ok(false),
+                _ => {
+                    self.pending.store(false, Ordering::Release);
+                    return Err(error);
+                }
             }
         }
     }
@@ -1319,15 +1426,20 @@ impl WorkerWake {
                 )
             };
             if read == std::mem::size_of::<u64>() as isize {
+                self.pending.store(false, Ordering::Release);
                 return Ok(());
             }
             if read >= 0 {
+                self.pending.store(false, Ordering::Release);
                 return Err(io::Error::other("short WAL worker wakeup read"));
             }
             let error = io::Error::last_os_error();
             match error.kind() {
                 io::ErrorKind::Interrupted => continue,
-                io::ErrorKind::WouldBlock => return Ok(()),
+                io::ErrorKind::WouldBlock => {
+                    self.pending.store(false, Ordering::Release);
+                    return Ok(());
+                }
                 _ => return Err(error),
             }
         }
@@ -1342,6 +1454,7 @@ pub(crate) struct IoWorker<B: WorkerBuffer = DirectBuf> {
     wake: Arc<WorkerWake>,
     sync_progress: Arc<WalSyncProgress>,
     completions: Option<Receiver<GroupWriteResult>>,
+    failure_events: Sender<GroupWriteResult>,
     join: Option<JoinHandle<Result<()>>>,
     shutdown_sent: bool,
 }
@@ -1371,7 +1484,8 @@ impl<B: WorkerBuffer> Clone for IoWorkerClient<B> {
 impl<B: WorkerBuffer> IoWorker<B> {
     pub(crate) fn spawn(wal_file: Arc<File>, buffer_pool: Arc<ArrayQueue<B>>) -> Result<Self> {
         let (command_tx, command_rx) = unbounded();
-        let (completion_tx, completion_rx) = unbounded();
+        let (completion_tx, completion_rx) = unbounded::<GroupWriteResult>();
+        let failure_events = completion_tx.clone();
         let (startup_tx, startup_rx) = bounded::<Result<()>>(1);
         let slots = Arc::new(GroupSlots {
             state: Mutex::new(SlotState {
@@ -1390,7 +1504,21 @@ impl<B: WorkerBuffer> IoWorker<B> {
         let join = thread::Builder::new()
             .name("wal-io-worker".to_owned())
             .spawn(move || {
-                let mut ring = match io_uring::IoUring::new(RING_SIZE as u32) {
+                // This thread creates, submits to, and reaps the ring. Let
+                // completion task work run at kernel transitions instead of
+                // interrupting userspace, and advertise the single issuer.
+                // Keep the existing setup on kernels without these flags.
+                let configured_ring = io_uring::IoUring::builder()
+                    .setup_coop_taskrun()
+                    .setup_single_issuer()
+                    .build(RING_SIZE as u32);
+                let configured_ring = match configured_ring {
+                    Err(error) if error.raw_os_error() == Some(libc::EINVAL) => {
+                        io_uring::IoUring::new(RING_SIZE as u32)
+                    }
+                    result => result,
+                };
+                let mut ring = match configured_ring {
                     Ok(ring) => ring,
                     Err(error) => {
                         let _ = startup_tx
@@ -1430,6 +1558,7 @@ impl<B: WorkerBuffer> IoWorker<B> {
                 wake,
                 sync_progress,
                 completions: Some(completion_rx),
+                failure_events,
                 join: Some(join),
                 shutdown_sent: false,
             }),
@@ -1466,6 +1595,10 @@ impl<B: WorkerBuffer> IoWorker<B> {
             .expect("WAL worker completions may be transferred only once")
     }
 
+    pub(crate) fn failure_sender(&self) -> Sender<GroupWriteResult> {
+        self.failure_events.clone()
+    }
+
     pub(crate) fn completions(&self) -> &Receiver<GroupWriteResult> {
         self.completions
             .as_ref()
@@ -1491,7 +1624,8 @@ impl<B: WorkerBuffer> IoWorker<B> {
                 ack_receiver = Some(ack_rx);
                 wake_result = self
                     .wake
-                    .signal()
+                    .signal_if_waiting()
+                    .map(|_| ())
                     .context("failed to wake WAL I/O worker for shutdown");
             }
         }
@@ -1523,7 +1657,7 @@ impl<B: WorkerBuffer> IoWorkerClient<B> {
     /// groups together, not just groups already submitted to the ring.
     pub(crate) fn submit_group(&self, group: WriteGroup<B>) -> Result<u64> {
         let tickets = group.tickets.clone();
-        for write in &group.writes {
+        for write in group.writes.iter() {
             ensure!(
                 write.write_len == write.buffer.len() && write.write_len <= write.buffer.cap(),
                 "WAL write length exceeds its owned DirectBuf"
@@ -1549,11 +1683,16 @@ impl<B: WorkerBuffer> IoWorkerClient<B> {
             drop(state);
             match send_result {
                 Ok(()) => {
-                    // The group is already owned by the worker. A wakeup
-                    // failure cannot be reported as failed admission; the
-                    // bounded poll timeout still drains the queue.
-                    match self.wake.signal() {
-                        Ok(()) => self.sync_progress.record_worker_eventfd_notification(),
+                    // The channel wakes the idle receive path. Signal the
+                    // eventfd only when the worker is about to wait on ring
+                    // progress; a wakeup failure cannot undo group admission.
+                    match self.wake.signal_if_waiting() {
+                        Ok(wrote_eventfd) => {
+                            self.sync_progress.record_worker_eventfd_notification();
+                            if wrote_eventfd {
+                                self.sync_progress.record_worker_eventfd_write();
+                            }
+                        }
                         Err(error) => log::error!("failed to wake WAL I/O worker: {error}"),
                     }
                     Ok(group_id.0)
@@ -1626,8 +1765,8 @@ fn run_worker<B: WorkerBuffer>(
         }
         let reason = format!("WAL I/O worker stopped: {error:#}");
         fail_shutdown_reply(&mut shutdown_reply, &reason);
-        for failed in core.failed_group_results(&reason) {
-            let _ = completions.send(failed);
+        for result in core.failed_group_results(&reason) {
+            let _ = completions.send(result);
         }
         for command in commands.try_iter() {
             match command {
@@ -1673,7 +1812,7 @@ fn run_worker_loop<B: WorkerBuffer>(
 
     loop {
         if !*stopping {
-            while core.group_count() < MAX_INFLIGHT_GROUPS {
+            while core.can_receive_command(*stopping) {
                 match commands.try_recv() {
                     Ok(WorkerCommand::Group { id, group, permit }) => {
                         enqueue_group_command(id, group, permit, core, group_permits, completions)?;
@@ -1785,8 +1924,10 @@ fn run_worker_loop<B: WorkerBuffer>(
         if completion_count == 0 && core.outstanding_sqe_count() > 0 && ring_staged.is_empty() {
             // Wake on either a later group or a CQE. Waiting only for a CQE
             // would serialize a group admitted after this wait begins.
-            wait_for_worker_progress(ring.as_raw_fd(), wake)
-                .context("failed while waiting for WAL I/O progress")?;
+            wait_for_worker_progress(ring.as_raw_fd(), wake, || {
+                core.can_receive_command(*stopping) && !commands.is_empty()
+            })
+            .context("failed while waiting for WAL I/O progress")?;
         }
     }
 }
@@ -1884,7 +2025,17 @@ fn submit_staged_writes<B: WorkerBuffer>(
     Ok((submitted, submitted_at))
 }
 
-fn wait_for_worker_progress(ring_fd: RawFd, wake: &WorkerWake) -> io::Result<bool> {
+fn wait_for_worker_progress(
+    ring_fd: RawFd,
+    wake: &WorkerWake,
+    commands_pending: impl FnOnce() -> bool,
+) -> io::Result<bool> {
+    wake.waiting_for_progress.store(true, Ordering::SeqCst);
+    if commands_pending() {
+        wake.waiting_for_progress.store(false, Ordering::SeqCst);
+        return Ok(true);
+    }
+
     let mut fds = [
         libc::pollfd {
             fd: ring_fd,
@@ -1897,18 +2048,20 @@ fn wait_for_worker_progress(ring_fd: RawFd, wake: &WorkerWake) -> io::Result<boo
             revents: 0,
         },
     ];
-    loop {
+    let ready = loop {
         // A timeout is only a fallback if eventfd signaling fails after a
         // command was queued; normal progress is driven by readiness.
         let ready = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, 1000) };
         if ready >= 0 {
-            break;
+            break Ok(());
         }
         let error = io::Error::last_os_error();
         if error.kind() != io::ErrorKind::Interrupted {
-            return Err(error);
+            break Err(error);
         }
-    }
+    };
+    wake.waiting_for_progress.store(false, Ordering::SeqCst);
+    ready?;
     if fds
         .iter()
         .any(|fd| fd.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0)
@@ -1959,9 +2112,14 @@ fn process_completions<B: WorkerBuffer>(
 ) -> Result<()> {
     for (user_data, cqe_result) in completed {
         let request_id = RequestId(user_data);
-        let events = core
-            .complete_write(request_id, cqe_result)
-            .map_err(|error| anyhow!("invalid or stale WAL io_uring completion: {error:?}"))?;
+        let events = match core.complete_write(request_id, cqe_result) {
+            Ok(events) => events,
+            Err(error) => {
+                return Err(anyhow!(
+                    "invalid or stale WAL io_uring completion: {error:?}"
+                ));
+            }
+        };
         if core.poison_ticket.is_some() {
             close_group_admission(slots);
         }
@@ -2048,10 +2206,11 @@ mod tests {
     #[cfg(feature = "bench")]
     use super::SyncProgressSnapshot;
     use super::{
-        DirectBuf, GroupId, GroupPermit, GroupSlots, GroupWriteResult, IoWorker, RequestId,
-        SlotState, WalSyncProgress, WorkerCommand, WorkerCore, WorkerError, WorkerEvent,
-        WorkerWake, WriteBuffer, WriteGroup, close_group_admission, enqueue_group_command,
-        fail_shutdown_reply, flush_staged_writes, retry_interrupted, wait_for_worker_progress,
+        DIRECT_IO_ALIGNMENT, DirectBuf, GroupId, GroupPermit, GroupSlots, GroupWriteResult,
+        IoWorker, RequestId, SlotState, WalSyncProgress, WorkerCommand, WorkerCore, WorkerError,
+        WorkerEvent, WorkerWake, WriteBuffer, WriteGroup, WriteGroupBuffers, close_group_admission,
+        enqueue_group_command, fail_shutdown_reply, flush_staged_writes, retry_interrupted,
+        wait_for_worker_progress,
     };
     use crossbeam_queue::ArrayQueue;
     use parking_lot::{Condvar, Mutex};
@@ -2110,7 +2269,7 @@ mod tests {
         allocation_len: usize,
         drops: &Arc<AtomicUsize>,
     ) -> WriteGroup<DropProbe> {
-        let writes = (0..write_count)
+        let writes: Vec<_> = (0..write_count)
             .map(|index| {
                 WriteBuffer::new(
                     DropProbe::new(allocation_len, Arc::clone(drops)),
@@ -2151,6 +2310,30 @@ mod tests {
                 }
             })
             .expect("group completion event")
+    }
+
+    #[test]
+    fn one_write_group_stays_inline_and_multiple_writes_spill() {
+        let mut single = WriteGroupBuffers::with_capacity(1);
+        single.push(WriteBuffer::new(1_u8, 0, DIRECT_IO_ALIGNMENT));
+        assert_eq!(single.len(), 1);
+        assert_eq!(single.rest.capacity(), 0);
+        assert_eq!(single.first().map(|write| write.file_offset), Some(0));
+        assert_eq!(single.last().map(|write| write.file_offset), Some(0));
+
+        let mut multiple = WriteGroupBuffers::with_capacity(3);
+        for offset in [0, 4096, 8192] {
+            multiple.push(WriteBuffer::new(1_u8, offset, DIRECT_IO_ALIGNMENT));
+        }
+        assert_eq!(multiple.len(), 3);
+        assert!(multiple.rest.capacity() >= 2);
+        assert_eq!(
+            multiple
+                .iter()
+                .map(|write| write.file_offset)
+                .collect::<Vec<_>>(),
+            [0, 4096, 8192]
+        );
     }
 
     fn io_uring_unavailable(error: &anyhow::Error) -> bool {
@@ -2529,15 +2712,15 @@ mod tests {
     }
 
     #[test]
-    fn worker_bounds_eight_groups_and_256_outstanding_sqes() {
+    fn worker_bounds_thirty_two_groups_and_256_outstanding_sqes() {
         let drops = Arc::new(AtomicUsize::new(0));
         let mut core = WorkerCore::new();
-        let bytes_per_group = 33 * 4096;
-        for group_index in 0..8 {
+        let bytes_per_group = 17 * 4096;
+        for group_index in 0..32 {
             core.enqueue(make_group(
                 group_index..group_index + 1,
                 4096 + group_index * bytes_per_group,
-                33,
+                17,
                 4096,
                 &drops,
             ))
@@ -2545,8 +2728,8 @@ mod tests {
         }
         assert!(matches!(
             core.enqueue(make_group(
-                8..9,
-                4096 + 8 * bytes_per_group,
+                32..33,
+                4096 + 32 * bytes_per_group,
                 1,
                 4096,
                 &drops
@@ -2556,8 +2739,8 @@ mod tests {
 
         let first_wave = submitted_ids(&mut core, 512);
         assert_eq!(first_wave.len(), 256);
-        assert_eq!(core.group_count(), 8);
-        assert_eq!(core.inflight_group_count(), 8);
+        assert_eq!(core.group_count(), 32);
+        assert_eq!(core.inflight_group_count(), 32);
         assert_eq!(core.outstanding_sqe_count(), 256);
         assert!(core.stage_writes(1).expect("ring at capacity").is_empty());
 
@@ -2573,9 +2756,9 @@ mod tests {
         }
 
         let second_wave = submitted_ids(&mut core, 256);
-        assert_eq!(second_wave.len(), 8);
-        assert_eq!(core.inflight_group_count(), 8);
-        assert_eq!(core.outstanding_sqe_count(), 8);
+        assert_eq!(second_wave.len(), 256);
+        assert_eq!(core.inflight_group_count(), 32);
+        assert_eq!(core.outstanding_sqe_count(), 256);
         for request_id in second_wave {
             for event in core
                 .complete_write(request_id, 4096)
@@ -2587,8 +2770,23 @@ mod tests {
             }
         }
 
+        let third_wave = submitted_ids(&mut core, 256);
+        assert_eq!(third_wave.len(), 32);
+        assert_eq!(core.inflight_group_count(), 32);
+        assert_eq!(core.outstanding_sqe_count(), 32);
+        for request_id in third_wave {
+            for event in core
+                .complete_write(request_id, 4096)
+                .expect("complete third wave")
+            {
+                if let WorkerEvent::BufferRetired(buffer) = event {
+                    drop(buffer);
+                }
+            }
+        }
+
         assert!(core.is_idle());
-        assert_eq!(drops.load(Ordering::Acquire), 8 * 33 + 1);
+        assert_eq!(drops.load(Ordering::Acquire), 32 * 17 + 1);
     }
 
     #[test]
@@ -2873,6 +3071,122 @@ mod tests {
     }
 
     #[test]
+    fn worker_wakeup_coalesces_signals_until_the_eventfd_is_drained() {
+        let (fake_cq, _peer) = UnixStream::pair().expect("fake CQ socket");
+        let wake = WorkerWake::new().expect("eventfd");
+
+        assert!(wake.signal().expect("write first wakeup"));
+        assert!(!wake.signal().expect("coalesce second wakeup"));
+        assert!(
+            wait_for_worker_progress(fake_cq.as_raw_fd(), &wake, || false).expect("worker wakes")
+        );
+        assert!(!wake.pending.load(Ordering::Acquire));
+
+        assert!(wake.signal().expect("write wakeup after drain"));
+        assert!(
+            wait_for_worker_progress(fake_cq.as_raw_fd(), &wake, || false)
+                .expect("worker wakes again")
+        );
+    }
+
+    #[test]
+    fn worker_wakeup_skips_eventfd_when_the_worker_is_not_waiting() {
+        let wake = WorkerWake::new().expect("eventfd");
+
+        assert!(
+            !wake
+                .signal_if_waiting()
+                .expect("active worker needs no wake")
+        );
+        assert!(!wake.pending.load(Ordering::Acquire));
+
+        wake.waiting_for_progress.store(true, Ordering::SeqCst);
+        assert!(
+            wake.signal_if_waiting()
+                .expect("waiting worker is signaled")
+        );
+        wake.waiting_for_progress.store(false, Ordering::SeqCst);
+        wake.drain().expect("drain eventfd");
+    }
+
+    #[test]
+    fn worker_checks_queued_commands_before_polling() {
+        let (fake_cq, _peer) = UnixStream::pair().expect("fake CQ socket");
+        let wake = WorkerWake::new().expect("eventfd");
+        let (command_tx, command_rx) = crossbeam_channel::unbounded();
+        command_tx.send(()).expect("queue command");
+
+        assert!(
+            wait_for_worker_progress(fake_cq.as_raw_fd(), &wake, || !command_rx.is_empty())
+                .expect("queued command avoids polling")
+        );
+        assert!(!wake.waiting_for_progress.load(Ordering::SeqCst));
+        assert!(!wake.pending.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn queued_shutdown_does_not_bypass_polling_when_groups_are_full() {
+        use std::io::Write as _;
+
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut core = WorkerCore::new();
+        for ticket in 0..super::MAX_INFLIGHT_GROUPS as u64 {
+            core.enqueue(make_group(
+                ticket..ticket + 1,
+                (ticket + 1) * DIRECT_IO_ALIGNMENT as u64,
+                1,
+                DIRECT_IO_ALIGNMENT,
+                &drops,
+            ))
+            .expect("fill worker groups");
+        }
+        let requests = submitted_ids(&mut core, super::MAX_INFLIGHT_GROUPS);
+        let (fake_cq, mut peer) = UnixStream::pair().expect("fake CQ socket");
+        peer.write_all(b"completion").expect("make CQ ready");
+        let wake = WorkerWake::new().expect("eventfd");
+        let (command_tx, command_rx) = crossbeam_channel::unbounded::<WorkerCommand<DropProbe>>();
+        let (reply_tx, _reply_rx) = crossbeam_channel::bounded(1);
+        command_tx
+            .send(WorkerCommand::Shutdown(reply_tx))
+            .expect("queue shutdown");
+
+        assert!(
+            !wait_for_worker_progress(fake_cq.as_raw_fd(), &wake, || {
+                core.can_receive_command(false) && !command_rx.is_empty()
+            })
+            .expect("full worker polls for CQ readiness")
+        );
+        drop(
+            core.complete_write(requests[0], DIRECT_IO_ALIGNMENT as i32)
+                .expect("complete a group to restore intake capacity"),
+        );
+        assert!(
+            wait_for_worker_progress(fake_cq.as_raw_fd(), &wake, || {
+                core.can_receive_command(false) && !command_rx.is_empty()
+            })
+            .expect("worker with capacity observes queued shutdown")
+        );
+        assert!(
+            !wait_for_worker_progress(fake_cq.as_raw_fd(), &wake, || {
+                core.can_receive_command(true) && !command_rx.is_empty()
+            })
+            .expect("stopping worker polls instead of consuming new commands")
+        );
+        assert!(matches!(
+            command_rx.try_recv().expect("shutdown remains queued"),
+            WorkerCommand::Shutdown(_)
+        ));
+        for request in requests.into_iter().skip(1) {
+            drop(
+                core.complete_write(request, DIRECT_IO_ALIGNMENT as i32)
+                    .expect("complete remaining write"),
+            );
+        }
+        assert!(core.is_idle());
+        assert_eq!(drops.load(Ordering::Acquire), super::MAX_INFLIGHT_GROUPS);
+    }
+
+    #[test]
     fn later_group_wakes_worker_before_earlier_write_completes() {
         let drops = Arc::new(AtomicUsize::new(0));
         let mut core = WorkerCore::new();
@@ -2892,10 +3206,15 @@ mod tests {
             group_tx
                 .send(make_group(1..2, 8192, 1, 4096, &producer_drops))
                 .expect("enqueue later group");
-            producer_wake.signal().expect("signal worker");
+            producer_wake
+                .signal_if_waiting()
+                .expect("signal worker if it has reached the poll");
         });
 
-        assert!(wait_for_worker_progress(fake_cq.as_raw_fd(), &wake).expect("worker wakes"));
+        assert!(
+            wait_for_worker_progress(fake_cq.as_raw_fd(), &wake, || !group_rx.is_empty())
+                .expect("worker wakes or observes queued group")
+        );
         producer.join().expect("producer joins");
         core.enqueue(group_rx.try_recv().expect("later group queued"))
             .expect("worker accepts later group");
@@ -2946,13 +3265,14 @@ mod tests {
             }),
             available: Condvar::new(),
         });
-        let (_completion_tx, completions) = crossbeam_channel::unbounded();
+        let (failure_events, completions) = crossbeam_channel::unbounded();
         let mut worker: IoWorker<DirectBuf> = IoWorker {
             commands: command_tx,
             slots,
             wake: Arc::new(WorkerWake::new().expect("eventfd")),
             sync_progress: Arc::new(WalSyncProgress::default()),
             completions: Some(completions),
+            failure_events,
             join: Some(join),
             shutdown_sent: false,
         };

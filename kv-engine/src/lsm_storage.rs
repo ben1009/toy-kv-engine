@@ -6921,6 +6921,10 @@ impl LsmStorageInner {
                     if options.enable_wal && owns_newest_segment {
                         state.memtable = Arc::new(m);
                     } else if !m.is_empty() {
+                        m.close_parallel_wal().with_context(|| {
+                            format!("failed to close recovered immutable WAL for memtable {id}")
+                        })?;
+                        m.retire_wal_ring();
                         m.freeze_range_tombstones();
                         state.imm_memtables.insert(0, Arc::new(m));
                     }
@@ -11480,6 +11484,20 @@ impl LsmStorageInner {
         _active_memtable_guard: &RwLockWriteGuard<'_, ()>,
     ) -> Result<()> {
         let mut state = self.state.load().as_ref().clone();
+        // The active write guard waits for existing writers to finish WAL
+        // durability and MVCC publication. Keep the immutable data and WAL,
+        // but join the runtime before publishing a successor so frozen
+        // memtables do not accumulate dedicated threads and rings.
+        state.memtable.close_parallel_wal().with_context(|| {
+            format!(
+                "failed to close frozen parallel WAL for memtable {}",
+                state.memtable.id()
+            )
+        })?;
+        // The leader path has no runtime to join, but its ring is per-WAL state
+        // too: release it now that no writer can reach this WAL, so a
+        // rotation-heavy workload does not hold one ring per retained WAL.
+        state.memtable.retire_wal_ring();
 
         let m = std::mem::replace(&mut state.memtable, new_memtable.into());
         // Build immutable range-tombstone fragment cache before sharing.

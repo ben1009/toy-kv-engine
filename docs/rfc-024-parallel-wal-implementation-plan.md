@@ -2,10 +2,10 @@
 
 **RFC:** [RFC 024: Dedicated WAL I/O Pipeline](../rfcs/024-dedicated-wal-pipeline.md)
 
-**Status:** Slices 1–6 implemented for the synchronous v4 WAL path; Slice 7's
-performance and adoption gate remains open
+**Status:** Slices 1–7 complete for the synchronous v4 WAL path; the
+parallel candidate remains opt-in because it did not pass the adoption gate
 
-**Last updated:** 2026-09-26
+**Last updated:** 2026-10-03
 
 ## Purpose and boundary
 
@@ -132,9 +132,20 @@ ticket whose MVCC publication is delayed until after a later WAL failure.
 or rotation leave no ticket or offset hole. Mixed batch sizes preserve the
 stored admission lengths through packing. The accounting model verifies the
 normal-budget and exclusive oversized-batch paths, including rejection above
-the 240 MiB aligned-capacity limit. A blocked `fallocate` does not block
-producer admission. Worker notification delivery and buffer recycling are
+the 240 MiB aligned-capacity limit. A blocked `fallocate` does not hold the
+admission queue mutex. Worker notification delivery and buffer recycling are
 verified after the worker exists.
+
+**Implementation update (2026-10-03):** The retained candidate uses
+producer-side packing. Admission saves each batch's physical offset and aligned
+length; the packer validates and reuses them. The producer tries the packer
+mutex while holding admission, and the packer releases its mutex under
+admission only after observing an empty queue. This prevents stranded tickets
+without a dedicated packer thread. Extent preparation and group-slot waits
+can block the admitting caller outside the admission queue mutex. MVCC point
+puts retain `mvcc.write_lock` through packing, so these waits can delay other
+point puts. The [write-order handoff experiment](rfc-024-wal-admission-handoff-20261002.md)
+records the rejected attempt to release that guard earlier.
 
 ### 4. Dedicated write worker and buffer ownership
 
@@ -166,7 +177,11 @@ verified after the coordinator exists.
   ring worker. Capture the largest contiguous written ticket before each
   call; on success, advance `durable_ticket` only through that captured target
   and below `poison_ticket`. Immediately reconsider another sync if the
-  written frontier moved during the call. Add no fixed batching delay.
+  written frontier moved during the call. A measured optimization permits a
+  400-microsecond wait only when the previous `fdatasync` took at least 100
+  microseconds, a written prefix is ready, and tickets already admitted at
+  the snapshot remain unwritten; later admission cannot extend the cutoff or
+  deadline.
 - Make `submit_and_commit(ticket)` wait for **its own** durable result. Preserve
   an already acknowledged ticket if a later group fails. Keep `sync()`'s
   captured cutoff and empty no-op behavior.
@@ -267,7 +282,7 @@ AddressSanitizer and LeakSanitizer commands also passed.
 
 This closes Slice 6 for the synchronous v4 candidate path. Async candidate
 writes and close remain disabled until their separate lifecycle prerequisites
-are met. Slice 7's paired benchmark and adoption gate remains open.
+are met.
 
 ### 7. Paired benchmark and adoption decision
 
@@ -312,11 +327,24 @@ the same-session pre-PITR gap. Otherwise keep the leader path as default and
 publish the measured bottleneck. A second worker/ring is a later experiment
 only if the one-ring candidate demonstrably cannot sustain useful overlap.
 
+**Outcome (2026-09-26):** The candidate reached four groups in flight and
+showed writes completing during `fdatasync`, but did not pass the throughput,
+latency, and confidence gates. Keep the leader path as default. The paired
+results, controls, and measured bottleneck are recorded in the
+[Slice 7 benchmark report](rfc-024-parallel-wal-benchmark.md).
+
+The measured bottleneck is the pipeline's per-commit thread relay, not where
+the `fdatasync` is called: a lone writer, which cannot coalesce, runs at
+`0.27` of the leader, and every attempt to remove or relocate a handoff
+between the pipeline's threads was rejected by measurement. The candidate's
+win is on device-backed storage. Further work on the `wal_concurrent`
+regression should target the leader path's serialized submit.
+
 ## Review and verification cadence
 
 Slices 1-3 stayed dormant or test-only until the worker and coordinator were
-integrated. The v4 candidate is now opt-in behind the internal selector; keep
-the leader path as default until recovery and benchmark gates pass. Each
+integrated. The v4 candidate remains opt-in behind the internal selector;
+keep the leader path as default because the benchmark gate did not pass. Each
 implementation PR should state its invariant, affected WAL format, failure
 behavior, and evidence from the matching slice. Run `cargo make check` for code
 changes, focused nextest and failpoint tests while iterating, then the

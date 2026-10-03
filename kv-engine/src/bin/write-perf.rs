@@ -938,6 +938,7 @@ struct WalPipelineRecord {
     #[serde(skip_serializing_if = "Option::is_none")]
     sync_groups_total: Option<u64>,
     worker_eventfd_notifications: u64,
+    worker_eventfd_writes: u64,
     preallocation_ns: u64,
     fdatasync_ns: u64,
     wal_sync_wait_ns: u64,
@@ -989,6 +990,7 @@ fn wal_pipeline_record(engine: &KvEngine, detailed: bool) -> Result<WalPipelineR
         sync_count: profile.wal_sync_count,
         sync_groups_total: detailed.then_some(profile.wal_sync_groups_total),
         worker_eventfd_notifications: profile.wal_worker_eventfd_notifications,
+        worker_eventfd_writes: profile.wal_worker_eventfd_writes,
         preallocation_ns: profile.wal_preallocation_ns,
         fdatasync_ns: profile.wal_fdatasync_ns,
         wal_sync_wait_ns: profile.wal_sync_ns,
@@ -3123,15 +3125,44 @@ fn run_wal_throughput(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
     Ok(results)
 }
 
+/// Bound the PITR bytes for concurrent puts or batches without relying on
+/// batching to reduce framing and alignment overhead.
+fn pitr_workload_limits(cfg: &HarnessConfig) -> Result<(u64, u64)> {
+    // Each value gets room for its key, value tag, entry framing, a batch
+    // header, and alignment even if it is committed in a batch of one. The
+    // harness's key indices fit in usize; 128 bytes covers their formatting
+    // and the current v5/v6 overhead. Batched writes need fewer padded bytes.
+    let per_value = u64::try_from(cfg.value_size)
+        .context("PITR workload value size exceeds u64")?
+        .checked_add(128)
+        .and_then(|bytes| bytes.checked_add(4095))
+        .context("PITR workload aligned value size overflow")?
+        / 4096
+        * 4096;
+    let written = u64::try_from(cfg.num)
+        .context("PITR workload value count exceeds u64")?
+        .checked_mul(per_value)
+        .context("PITR workload encoded size overflow")?;
+    // Preserve the existing minimum and headroom, which also cover the file
+    // header. Checked arithmetic rejects unrepresentable budgets.
+    let segment = written
+        .checked_mul(2)
+        .context("PITR workload segment size overflow")?
+        .max(256 * 1024 * 1024);
+    let budget = segment
+        .checked_mul(2)
+        .context("PITR workload unarchived budget overflow")?;
+
+    Ok((segment, budget))
+}
+
 /// Bootstrap a PITR repository next to the database and enable PITR on it.
 ///
-/// The limits are sized for this harness's workload rather than pitr-perf's: a
-/// `wal_concurrent` run writes `num * 4096` aligned bytes (one 4 KiB buffer per
-/// operation whatever the value size) and nothing archives during the run, so
-/// the unarchived budget has to admit the whole run or writes are refused
-/// part-way through. The archive interval is parked far out of the way so the
+/// Segment and unarchived limits cover the whole encoded workload, including
+/// larger values. The archive interval is parked far out of the way so the
 /// measurement is the write path and not a background archive.
 fn enable_pitr_for_workload(cfg: &HarnessConfig, engine: &KvEngine, path: &Path) -> Result<()> {
+    let (segment, budget) = pitr_workload_limits(cfg)?;
     let repository = path.with_extension("pitr-repository");
     let _ = std::fs::remove_dir_all(&repository);
     ensure!(
@@ -3148,9 +3179,6 @@ fn enable_pitr_for_workload(cfg: &HarnessConfig, engine: &KvEngine, path: &Path)
     // measured: crossing `max_segment_bytes` stops commit admission, and a put
     // during a barrier is a hard error rather than something a benchmark can wait
     // out. The budget has to admit the segment, which the config enforces.
-    let written = (cfg.num as u64).saturating_mul(4096);
-    let segment = written.saturating_mul(2).max(256 * 1024 * 1024);
-    let budget = segment.saturating_mul(2);
     ensure!(
         matches!(
             engine.enable_pitr(PitrOptions {
@@ -3288,11 +3316,20 @@ fn run_wal_batch_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>
     let workload = "wal_batch_concurrent";
     let path = prepare_path(cfg, workload)?;
     let options = cfg.build_options(true, false);
-    let engine = KvEngine::open(&path, options.clone())?;
+    let engine = KvEngine::open_with_wal_io_mode(&path, options.clone(), cfg.wal_io_mode.into())?;
+    if cfg.pitr {
+        enable_pitr_for_workload(cfg, &engine, &path)?;
+    }
+    #[cfg(feature = "bench")]
+    {
+        engine.reset_write_profile();
+        engine.set_wal_sync_diagnostics_enabled(cfg.profile)?;
+    }
     let value = vec![b'x'; cfg.value_size];
     let num_keys = cfg.num;
     let writer_threads = cfg.threads;
     let baseline = collect_counters(&engine)?;
+    let cpu_start = process_cpu_times();
     let per_thread = num_keys / writer_threads;
     let remainder = num_keys % writer_threads;
     let batch_size = effective_wal_batch_size(num_keys, writer_threads, cfg.wal_batch_size);
@@ -3301,10 +3338,13 @@ fn run_wal_batch_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>
     for t in 0..writer_threads {
         let eng = engine.clone();
         let val = value.clone();
-        handles.push(std::thread::spawn(move || {
+        let sample_every = cfg.latency_sample_every;
+        handles.push(std::thread::spawn(move || -> Result<Vec<u64>> {
             let thread_ops = per_thread + usize::from(t < remainder);
             let start_idx = t * per_thread + remainder.min(t);
             let mut next = 0usize;
+            let mut batch_index = 0usize;
+            let mut latency_samples = Vec::new();
             while next < thread_ops {
                 let current_batch = (thread_ops - next).min(batch_size);
                 let mut keys = Vec::with_capacity(current_batch);
@@ -3315,26 +3355,55 @@ fn run_wal_batch_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>
                     .iter()
                     .map(|key| WriteBatchRecord::Put(key.as_slice(), val.as_slice()))
                     .collect();
-                eng.write_batch(&batch).expect("write_batch failed");
+                let sample_start = sample_every
+                    .filter(|every| batch_index.is_multiple_of(*every))
+                    .map(|_| Instant::now());
+                eng.write_batch(&batch)?;
+                if let Some(sample_start) = sample_start {
+                    latency_samples.push(sample_start.elapsed().as_nanos() as u64);
+                }
                 next += current_batch;
+                batch_index += 1;
             }
+            Ok(latency_samples)
         }));
     }
+    let mut latency_samples = Vec::new();
+    let mut writer_error = None;
     for handle in handles {
-        handle
-            .join()
-            .map_err(|_| anyhow!("writer thread panicked"))?;
+        let result = match handle.join() {
+            Ok(result) => result,
+            Err(_) => Err(anyhow!("writer thread panicked")),
+        };
+        match result {
+            Ok(samples) => latency_samples.extend(samples),
+            Err(error) => {
+                writer_error.get_or_insert(error);
+            }
+        }
+    }
+    if let Some(error) = writer_error {
+        let _ = engine.close();
+        return Err(error);
     }
     let elapsed = start.elapsed();
+    let (process_cpu_user_ms, process_cpu_system_ms) =
+        process_cpu_delta(cpu_start, process_cpu_times());
+    #[cfg(feature = "bench")]
+    let wal_pipeline = Some(wal_pipeline_record(&engine, cfg.profile)?);
+    #[cfg(not(feature = "bench"))]
+    let wal_pipeline = None;
     if cfg.profile {
         print_write_profile(&engine, workload);
     }
-    engine.drain_flush()?;
+    if !cfg.pitr {
+        engine.drain_flush()?;
+    }
     let counters = collect_counter_delta(&baseline, &collect_counters(&engine)?);
     engine.close()?;
     finalize_path(cfg, &path)?;
 
-    Ok(vec![make_measurement(
+    let mut measurement = make_measurement(
         cfg,
         workload,
         format!("concurrent_batch_{batch_size}"),
@@ -3345,16 +3414,28 @@ fn run_wal_batch_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>
             batch_size: Some(batch_size),
             threads: Some(writer_threads),
             seed: Some(cfg.seed),
+            latency_sample_every: cfg.latency_sample_every,
+            wal_io_mode: Some(cfg.wal_io_mode.as_str()),
             ..MeasurementParams::default()
         },
         MeasurementResult {
             measure_elapsed_ms: ms(elapsed),
             ops: Some(num_keys as u64),
             ops_per_sec: Some(rate(num_keys as u64, elapsed)),
+            process_cpu_user_ms,
+            process_cpu_system_ms,
+            wal_pipeline,
             ..MeasurementResult::default()
         },
         counters,
-    )])
+    );
+    measurement.record.latency = cfg.latency_sample_every.map(|sample_every| {
+        let completed_commits =
+            effective_wal_batch_commit_count(num_keys, writer_threads, batch_size);
+        latency_record(sample_every, completed_commits, &latency_samples)
+    });
+
+    Ok(vec![measurement])
 }
 
 fn run_wal_batch_delete_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
@@ -3542,6 +3623,18 @@ fn effective_wal_batch_size(num_keys: usize, writer_threads: usize, requested: u
 
     let max_thread_ops = per_thread + usize::from(remainder > 0);
     requested.min(max_thread_ops.max(1))
+}
+
+fn effective_wal_batch_commit_count(
+    num_keys: usize,
+    writer_threads: usize,
+    batch_size: usize,
+) -> u64 {
+    let per_thread = num_keys / writer_threads;
+    let remainder = num_keys % writer_threads;
+    (0..writer_threads)
+        .map(|thread| (per_thread + usize::from(thread < remainder)).div_ceil(batch_size) as u64)
+        .sum()
 }
 
 #[derive(Clone, Copy)]
@@ -7948,9 +8041,13 @@ fn validate_run_mode(cfg: &HarnessConfig, bench_arg: Option<&str>) -> Result<()>
         "--prepare-golden does not support --bench"
     );
     if cfg.wal_io_mode == WalIoModeArg::Parallel {
+        let is_supported_wal_workload = matches!(
+            bench_arg,
+            Some("wal_concurrent" | "wal_batch_concurrent" | "wal_batch")
+        );
         anyhow::ensure!(
-            bench_arg == Some("wal_concurrent"),
-            "--wal-io-mode parallel currently requires --bench wal_concurrent"
+            is_supported_wal_workload,
+            "--wal-io-mode parallel requires --bench wal_concurrent or wal_batch_concurrent"
         );
         anyhow::ensure!(!cfg.pitr, "--wal-io-mode parallel does not support --pitr");
     }
@@ -7980,7 +8077,53 @@ mod tests {
     }
 
     #[test]
-    fn parallel_wal_mode_is_scoped_to_wal_concurrent() {
+    fn pitr_workload_limits_cover_large_values_and_keep_small_value_budgets() {
+        let mut cfg = legacy_cfg();
+        cfg.num = 200_000;
+        cfg.value_size = 1024;
+        let (segment, budget) = pitr_workload_limits(&cfg).expect("size small-value workload");
+        assert_eq!(segment, 200_000 * 4096 * 2);
+        assert_eq!(budget, segment * 2);
+
+        cfg.value_size = 16 * 1024;
+        let (segment, budget) = pitr_workload_limits(&cfg).expect("size large-value workload");
+        // A padded batch of one needs 20 KiB, including its key and framing.
+        assert!(segment >= 4096 + 200_000 * 20 * 1024);
+        assert!(budget >= segment);
+
+        cfg.num = 1;
+        cfg.value_size = 1024;
+        assert_eq!(
+            pitr_workload_limits(&cfg).expect("keep minimum budget"),
+            (256 * 1024 * 1024, 512 * 1024 * 1024)
+        );
+    }
+
+    #[test]
+    fn pitr_workload_limits_reject_unrepresentable_encoded_sizes() {
+        let mut cfg = legacy_cfg();
+        cfg.value_size = usize::MAX;
+        cfg.num = usize::MAX;
+        assert!(pitr_workload_limits(&cfg).is_err());
+    }
+
+    #[test]
+    fn parallel_wal_mode_is_scoped_to_concurrent_wal_workloads() {
+        for workload in ["wal_concurrent", "wal_batch_concurrent", "wal_batch"] {
+            let args = Args::try_parse_from([
+                "write-perf",
+                "--wal-io-mode",
+                "parallel",
+                "--bench",
+                workload,
+            ])
+            .expect("parse parallel WAL selector");
+            let cfg = HarnessConfig::from_args(args);
+
+            assert_eq!(cfg.wal_io_mode, WalIoModeArg::Parallel);
+            validate_run_mode(&cfg, Some(workload)).expect("supported selector scope");
+        }
+
         let args = Args::try_parse_from([
             "write-perf",
             "--wal-io-mode",
@@ -7990,15 +8133,12 @@ mod tests {
         ])
         .expect("parse parallel WAL selector");
         let cfg = HarnessConfig::from_args(args);
-
-        assert_eq!(cfg.wal_io_mode, WalIoModeArg::Parallel);
-        validate_run_mode(&cfg, Some("wal_concurrent")).expect("supported selector scope");
         let error = validate_run_mode(&cfg, Some("fillseq"))
             .expect_err("parallel selector must not spill into unrelated workloads");
         assert!(
             error
                 .to_string()
-                .contains("requires --bench wal_concurrent")
+                .contains("requires --bench wal_concurrent or wal_batch_concurrent")
         );
 
         let pitr_args = Args::try_parse_from([
@@ -9160,6 +9300,12 @@ mod tests {
         assert_eq!(effective_wal_batch_size(100, 4, 100), 25);
         assert_eq!(effective_wal_batch_size(101, 4, 100), 26);
         assert_eq!(effective_wal_batch_size(1000, 4, 100), 100);
+    }
+
+    #[test]
+    fn effective_wal_batch_commit_count_sums_each_writer_partition() {
+        assert_eq!(effective_wal_batch_commit_count(29, 4, 4), 8);
+        assert_eq!(effective_wal_batch_commit_count(10, 4, 3), 4);
     }
 
     #[test]
@@ -11765,12 +11911,14 @@ mod tests {
             sync_count: 3,
             sync_groups_total: None,
             worker_eventfd_notifications: 5,
+            worker_eventfd_writes: 3,
             sync_observations: None,
             ..WalPipelineRecord::default()
         };
         let ordinary_json = serde_json::to_value(ordinary).expect("serialize ordinary WAL metrics");
         assert_eq!(ordinary_json["sync_count"], 3);
         assert_eq!(ordinary_json["worker_eventfd_notifications"], 5);
+        assert_eq!(ordinary_json["worker_eventfd_writes"], 3);
         assert!(ordinary_json.get("sync_groups_total").is_none());
         assert!(ordinary_json.get("sync_observations").is_none());
 

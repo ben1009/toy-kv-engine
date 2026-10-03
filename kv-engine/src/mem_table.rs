@@ -87,9 +87,12 @@ pub struct WriteProfile {
     /// Number of fdatasync attempts and total groups covered by those syncs.
     pub wal_sync_count: AtomicU64,
     pub wal_sync_groups_total: AtomicU64,
-    /// Number of queued groups whose eventfd notification call completed.
-    /// Notifications may coalesce, so this is not a count of worker wakeups.
+    /// Number of queued groups for which a worker wake was requested.
+    /// Requests may be skipped while the worker is active or coalesced into
+    /// one eventfd write, so this is not a count of syscalls or worker wakeups.
     pub wal_worker_eventfd_notifications: AtomicU64,
+    /// Number of eventfd write syscalls used to signal queued worker commands.
+    pub wal_worker_eventfd_writes: AtomicU64,
     /// Time spent extending WAL preallocation, kept separate from write time.
     pub wal_preallocation_ns: AtomicU64,
     /// Time from the previous group releasing `submitting` to the next leader
@@ -209,6 +212,7 @@ impl WriteProfile {
         #[cfg(feature = "bench")]
         self.wal_sync_diagnostics_enabled.store(false, o);
         self.wal_worker_eventfd_notifications.store(0, o);
+        self.wal_worker_eventfd_writes.store(0, o);
         self.wal_preallocation_ns.store(0, o);
         self.wal_group_gap_ns.store(0, o);
         self.wal_leader_prepare_ns.store(0, o);
@@ -262,6 +266,7 @@ impl WriteProfile {
             wal_sync_count: self.wal_sync_count.load(o),
             wal_sync_groups_total: self.wal_sync_groups_total.load(o),
             wal_worker_eventfd_notifications: self.wal_worker_eventfd_notifications.load(o),
+            wal_worker_eventfd_writes: self.wal_worker_eventfd_writes.load(o),
             wal_preallocation_ns: self.wal_preallocation_ns.load(o),
             wal_group_gap_ns: self.wal_group_gap_ns.load(o),
             wal_leader_prepare_ns: self.wal_leader_prepare_ns.load(o),
@@ -410,6 +415,12 @@ impl WriteProfile {
     }
 
     #[cfg(feature = "bench")]
+    pub(crate) fn record_wal_worker_eventfd_write(&self) {
+        self.wal_worker_eventfd_writes
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[cfg(feature = "bench")]
     pub(crate) fn record_wal_preallocation_ns(&self, nanos: u64) {
         self.wal_preallocation_ns
             .fetch_add(nanos, std::sync::atomic::Ordering::Relaxed);
@@ -539,6 +550,7 @@ pub struct WriteProfileSnapshot {
     pub wal_sync_count: u64,
     pub wal_sync_groups_total: u64,
     pub wal_worker_eventfd_notifications: u64,
+    pub wal_worker_eventfd_writes: u64,
     pub wal_preallocation_ns: u64,
     pub wal_group_gap_ns: u64,
     pub wal_leader_prepare_ns: u64,
@@ -607,6 +619,9 @@ impl WriteProfileSnapshot {
             wal_worker_eventfd_notifications: self
                 .wal_worker_eventfd_notifications
                 .saturating_sub(before.wal_worker_eventfd_notifications),
+            wal_worker_eventfd_writes: self
+                .wal_worker_eventfd_writes
+                .saturating_sub(before.wal_worker_eventfd_writes),
             wal_preallocation_ns: self
                 .wal_preallocation_ns
                 .saturating_sub(before.wal_preallocation_ns),
@@ -836,7 +851,7 @@ impl WriteProfileSnapshot {
              submit_parts: ring_lock={:>7.2} ms  sqe_fill={:>7.2} ms  uring_enter={:>7.2} ms  cqe_reap={:>7.2} ms\n  \
              cqe_count:    {:>7}  (clean run: equal to commit buffers)\n  \
              pipeline_peak: groups={} outstanding_write_sqes={} (software depth; not device queue depth)\n  \
-             syncs:        count={} groups={} avg_groups={:.2} worker_eventfd_notifications={}\n  \
+             syncs:        count={} groups={} avg_groups={:.2} worker_eventfd_notifications={} writes={}\n  \
              preallocation:{:>8.2} ms\n  \
              group_gap:    {:>8.2} ms  (previous release -> next leader enters; includes idle)\n  \
              leader_prep:  {:>8.2} ms  (enter -> first SQE: drain, peer spin, accounting)\n  \
@@ -885,6 +900,7 @@ impl WriteProfileSnapshot {
                 self.wal_sync_groups_total as f64 / self.wal_sync_count as f64
             },
             self.wal_worker_eventfd_notifications,
+            self.wal_worker_eventfd_writes,
             self.wal_preallocation_ns as f64 / 1_000_000.0,
             self.wal_group_gap_ms(),
             self.wal_leader_prepare_ms(),
@@ -1614,16 +1630,32 @@ impl MemTable {
         self.wal.as_ref().is_some_and(|wal| wal.is_v5())
     }
 
+    /// Release the io_uring ring of a drained, immutable leader WAL.
+    ///
+    /// Call after writers have finished, when freezing the memtable or after
+    /// recovering an immutable WAL. The WAL data stays available for recovery;
+    /// only the per-WAL ring is released. See [`Wal::retire_ring`].
+    pub(crate) fn retire_wal_ring(&self) -> bool {
+        self.wal.as_ref().is_some_and(|wal| wal.retire_ring())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_ring(&self) -> Option<bool> {
+        self.wal.as_ref().map(|wal| wal.has_ring())
+    }
+
     /// Join the background runtime owned by a candidate parallel WAL.
     ///
-    /// The legacy WAL paths keep their existing close behavior; engine
-    /// shutdown only needs to explicitly tear down the dedicated runtime.
+    /// Call after writers have finished, when freezing the memtable or
+    /// shutting down the engine. WAL data remains available for recovery;
+    /// legacy WAL paths keep their existing close behavior.
     pub(crate) fn close_parallel_wal(&self) -> Result<()> {
         if let Some(wal) = &self.wal
             && wal.is_parallel()
         {
             wal.close()?;
         }
+
         Ok(())
     }
 

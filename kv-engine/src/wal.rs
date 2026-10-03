@@ -470,8 +470,9 @@ pub struct Wal {
     // ── io_uring + O_DIRECT fields ───────────────────────────────────────
     /// O_DIRECT file handle for io_uring writes (None for legacy buffered WALs).
     direct_file: Option<File>,
-    /// io_uring ring for parallel WAL writes (None for legacy buffered WALs).
-    ring: Option<Mutex<io_uring::IoUring>>,
+    /// io_uring ring for MVCC batch writes. `None` for legacy buffered WALs and
+    /// after `retire_ring` releases a drained WAL's ring.
+    ring: Mutex<Option<io_uring::IoUring>>,
     /// Lock-free pool of page-aligned buffers for O_DIRECT I/O.
     direct_buf_pool: ArrayQueue<DirectBuf>,
     /// Encoded DirectBuf buffers waiting for io_uring submission.
@@ -766,7 +767,7 @@ impl Wal {
                     (None, direct_file, alloc_offset, Some(runtime))
                 } else {
                     let (ring, direct_file, alloc_offset) = Self::try_init_io_uring(path)?;
-                    (Some(Mutex::new(ring)), direct_file, alloc_offset, None)
+                    (Some(ring), direct_file, alloc_offset, None)
                 };
             let pitr_seal = if crate::pitr::is_v5_family(format_version) {
                 let wal = std::fs::read(path)?;
@@ -784,7 +785,7 @@ impl Wal {
                 parallel_runtime,
                 is_v3,
                 direct_file: Some(direct_file),
-                ring,
+                ring: Mutex::new(ring),
                 direct_buf_pool: Self::new_direct_buf_pool(io_mode == WalIoMode::Leader),
                 pending: Mutex::new(Vec::new()),
                 next_ticket: AtomicU64::new(0),
@@ -814,7 +815,7 @@ impl Wal {
                 parallel_runtime: None,
                 is_v3,
                 direct_file: None,
-                ring: None,
+                ring: Mutex::new(None),
                 direct_buf_pool: Self::new_direct_buf_pool(true),
                 pending: Mutex::new(Vec::new()),
                 next_ticket: AtomicU64::new(0),
@@ -1104,7 +1105,7 @@ impl Wal {
                 .inspect_err(|_| {
                     let _ = std::fs::remove_file(path.as_ref());
                 })?;
-            (Some(Mutex::new(ring)), direct_file, alloc_offset, None)
+            (Some(ring), direct_file, alloc_offset, None)
         };
 
         // Re-open buffered handle for recovery reads and legacy put().
@@ -1124,7 +1125,7 @@ impl Wal {
             parallel_runtime,
             is_v3: true,
             direct_file: Some(direct_file),
-            ring,
+            ring: Mutex::new(ring),
             direct_buf_pool: Self::new_direct_buf_pool(io_mode == WalIoMode::Leader),
             pending: Mutex::new(Vec::new()),
             next_ticket: AtomicU64::new(0),
@@ -1166,7 +1167,7 @@ impl Wal {
             parallel_runtime: None,
             is_v3: true,
             direct_file: Some(direct_file),
-            ring: Some(Mutex::new(ring)),
+            ring: Mutex::new(Some(ring)),
             direct_buf_pool: Self::new_direct_buf_pool(true),
             pending: Mutex::new(Vec::new()),
             next_ticket: AtomicU64::new(0),
@@ -2471,8 +2472,7 @@ impl Wal {
             self.submit_and_commit(ticket - 1)?;
         }
 
-        if let Some(ref ring) = self.ring {
-            let mut ring = ring.lock();
+        if let Some(ring) = self.ring.lock().as_mut() {
             let cq = ring.completion();
             for cqe in cq {
                 if cqe.result() < 0 {
@@ -2792,6 +2792,36 @@ impl Wal {
         Ok(stats)
     }
 
+    /// Release the io_uring ring of a drained WAL.
+    ///
+    /// The leader path creates one ring per WAL and keeps it until the WAL is
+    /// dropped, so a rotation-heavy workload can hold hundreds of rings at
+    /// once - about 28 KiB of locked memory each against `RLIMIT_MEMLOCK`,
+    /// which a low limit turns into `ENOMEM` at ring creation. A frozen WAL
+    /// never submits again: every later `submit_and_commit` takes the durable
+    /// fast path before touching the ring, and `sync()` and `close()` tolerate
+    /// a missing ring.
+    ///
+    /// Returns whether a ring was released.
+    pub(crate) fn retire_ring(&self) -> bool {
+        if !self.mvcc_format {
+            return false;
+        }
+        let drained = self.pending.lock().is_empty()
+            && self.completion_state.durable_ticket.load(Ordering::SeqCst)
+                >= self.next_ticket.load(Ordering::SeqCst);
+        if !drained {
+            return false;
+        }
+
+        self.ring.lock().take().is_some()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_ring(&self) -> bool {
+        self.ring.lock().is_some()
+    }
+
     /// Submit DirectBuf buffers as io_uring SQEs, poll CQEs for completion.
     ///
     /// Handles chunked submission when the batch exceeds ring capacity (64 SQEs).
@@ -2805,16 +2835,14 @@ impl Wal {
         #[cfg(not(feature = "bench"))]
         let _ = (captured_target, profile);
 
-        // SAFETY: only called for MVCC WALs which always have a ring.
-        let ring_ref = self.ring.as_ref().unwrap();
-
         // Compute total aligned size first, then preallocate to cover the full batch.
         //
-        // This preallocation is outside every profile span: `wal_submit` opens at
-        // the ring lock below, and the leader's `wal_leader_prepare` span closed
-        // before this function was called. It is also not per-group work - it
-        // extends the file only when the offset crosses a `PREALLOC_BLOCK`
-        // boundary - so nothing else should be read as having absorbed it.
+        // This preallocation sits outside the `wal_submit` span, which opens
+        // below, and outside the ring guard, which is taken just before the
+        // submit loop. The leader's `wal_leader_prepare` span closed before
+        // this function was called. It is also not per-group work - it extends
+        // the file only when the offset crosses a `PREALLOC_BLOCK` boundary -
+        // so nothing else should be read as having absorbed it.
         let total_size: u64 = bufs
             .iter()
             .map(|b| DirectBuf::align_up(b.buf.len()) as u64)
@@ -2856,6 +2884,20 @@ impl Wal {
         #[cfg(feature = "bench")]
         let submit_start = Instant::now();
 
+        // The guard covers the submit loop only: preallocation above and the
+        // sync below stay outside it. A retired ring cannot be needed here -
+        // a drained WAL takes the durable fast path in `submit_and_commit`.
+        #[cfg(feature = "bench")]
+        let ring_lock_start = Instant::now();
+        let mut ring_guard = self.ring.lock();
+        #[cfg(feature = "bench")]
+        if let Some(profile) = profile {
+            profile.record_wal_ring_lock_ns(ring_lock_start.elapsed().as_nanos() as u64);
+        }
+        let Some(ring) = ring_guard.as_mut() else {
+            anyhow::bail!("WAL submit reached a retired io_uring ring");
+        };
+
         for &(chunk_start, chunk_end) in &chunk_ranges {
             let chunk_len = chunk_end - chunk_start;
             #[cfg(feature = "bench")]
@@ -2868,15 +2910,7 @@ impl Wal {
             // the gap between submit and poll.
             let mut write_err: Option<i32> = None;
             let chunk_start_idx = global_idx;
-            // Timed outside the lock it waits on: this is queueing, not work.
-            #[cfg(feature = "bench")]
-            let lock_start = Instant::now();
             {
-                let mut ring = ring_ref.lock();
-                #[cfg(feature = "bench")]
-                if let Some(profile) = profile {
-                    profile.record_wal_ring_lock_ns(lock_start.elapsed().as_nanos() as u64);
-                }
                 #[cfg(feature = "bench")]
                 let fill_start = Instant::now();
                 for i in 0..chunk_len {
