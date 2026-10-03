@@ -30,6 +30,10 @@ is below the frozen threshold, and the shared-MVCC p99 guard fails.
 does not establish a one-writer batch64 tail improvement in 96 scored runs.
 The cooperative-taskwork prototype is reverted.
 
+[The deferred-taskwork follow-up](rfc-024-deferred-ring-wait-20261003.md)
+also fails its fixed batch64 target and guard limits after 96 scored runs.
+Both October 3 completion-wait prototypes are reverted.
+
 ## Worker-owned asynchronous data sync (rejected, 2026-09-28)
 
 A prototype removed the sync thread from the parallel runtime. The I/O
