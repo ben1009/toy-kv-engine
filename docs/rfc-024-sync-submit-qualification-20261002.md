@@ -68,17 +68,19 @@ median p99; all blocks stay in the score.
 
 | Case | A (io_uring) | B (sync) | Median ratio | Block ratios | 95% interval | Controls | p99 ratio | Verdict |
 | --- | ---: | ---: | ---: | --- | --- | ---: | ---: | --- |
-| tmpfs-4w-rot | 166,863 | 351,148 | **2.092** | 2.256, 2.051, 2.092 | [2.051, 2.256] | 1/3 | 0.862 | no decision |
-| tmpfs-1w-iso | 97,245 | 322,480 | **3.200** | 3.542, 3.200, 2.922 | [2.922, 3.542] | 0/3 | 0.313 | no decision |
-| tmpfs-16w-iso | 159,614 | 120,046 | **0.752** | 0.647, 0.936, 0.752 | [0.647, 0.936] | 0/3 | 1.305 | **regression** |
-| ext4-4w-rot | 2,822 | 3,753 | **1.292** | 1.345, 1.060, 1.292 | [1.060, 1.345] | 0/3 | 0.444 | no decision |
-| ext4-16w-iso | 13,202 | 14,221 | **1.068** | 1.068, 1.060, 1.590 | [1.060, 1.590] | 1/3 | 0.995 | no decision |
-| ext4-1w-iso | 1,777 | 1,794 | **1.018** | 1.018, 1.001, 1.021 | [1.001, 1.021] | 1/3 | 0.955 | no decision |
-| ext4-batch64-8w | 150,008 | 150,463 | **0.988** | 1.082, 0.988, 0.975 | [0.975, 1.082] | 1/3 | 1.349 | **regression** |
-| tmpfs-batch64-8w-red | 333,615 | 340,342 | **1.056** | 0.967, 1.057, 1.056 | [0.967, 1.057] | 0/3 | 1.301 | **regression** |
+| tmpfs-4w-rot | 166,863 | 351,148 | **2.092** | 2.256, 2.051, 2.092 | [2.051, 2.256] | 1/3 | 0.875 | no decision |
+| tmpfs-1w-iso | 97,245 | 322,480 | **3.200** | 3.542, 3.200, 2.922 | [2.922, 3.542] | 0/3 | 0.308 | no decision |
+| tmpfs-16w-iso | 159,614 | 120,046 | **0.752** | 0.647, 0.936, 0.752 | [0.647, 0.936] | 0/3 | 1.318 | **regression** |
+| ext4-4w-rot | 2,822 | 3,753 | **1.292** | 1.345, 1.060, 1.292 | [1.060, 1.345] | 0/3 | 0.475 | no decision |
+| ext4-16w-iso | 13,202 | 14,221 | **1.068** | 1.068, 1.060, 1.590 | [1.060, 1.590] | 1/3 | 1.028 | no decision |
+| ext4-1w-iso | 1,777 | 1,794 | **1.018** | 1.018, 1.001, 1.021 | [1.001, 1.021] | 1/3 | 0.987 | no decision |
+| ext4-batch64-8w | 150,008 | 150,463 | **0.988** | 1.082, 0.988, 0.975 | [0.975, 1.082] | 1/3 | 1.304 | **regression** |
+| tmpfs-batch64-8w-red | 333,615 | 340,342 | **1.056** | 0.967, 1.057, 1.056 | [0.967, 1.057] | 0/3 | 1.359 | **regression** |
 
 Median absolute values are medians of the three block geometric means, in
-puts/s. `tmpfs-batch64-8w-red` is the 65,536-put substitute described below.
+puts/s. The p99 ratio is the median of the three per-block geometric-mean B/A
+ratios, including blocks that fail control screens. `tmpfs-batch64-8w-red` is
+the 65,536-put substitute described below.
 
 ### Per-case findings
 
