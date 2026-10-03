@@ -13,9 +13,13 @@ the remaining levers are flush-event count (SST size) and nothing else tried.
 | compaction `leveled` vs `none` (1 MiB) | p99 19.2 vs 18.6 ms | compaction |
 | memtable limit 2 vs 16 (1 MiB) | p99 16.9 vs 34.9 ms | writer blocked on the memtable limit - more flush backlog is worse |
 
-**Conclusion:** the tail is device-latency amplification from concurrent flush
-I/O. It is arm-independent, so the RFC 024 gate line "ext4 batch64 p99
-+42%/+16.7% (parallel vs leader)" is void. The engine's default SST target
+**Conclusion:** these rotating-workload measurements support device-latency
+amplification from concurrent flush I/O in both arms. They do not invalidate
+the qualification's isolated batch64 results: that matrix used a 1 GiB SST
+target, while the flush-pressure experiments here use smaller targets. The
+one-writer +42.1% and eight-writer +16.7% qualification results remain recorded
+with their original repeat controls; attribution of the latter is unresolved.
+The engine's default SST target
 (2 MiB) sits near the non-monotone part of the curve, so raising the default to
 8 MiB was measured and rejected (p99 28.9 ms vs 23.2 ms, max 42.2 vs 24.7 ms).
 
