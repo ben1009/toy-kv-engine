@@ -39,6 +39,11 @@ records 22.1% lower CPU per put at 32 writers across 156 scored runs, but
 fails the required repeat-control count and rotation p99 guard. The prototype
 is reverted; the full qualification gate remains unmet.
 
+[Release-mode worker invariant bookkeeping](rfc-024-worker-invariants-20261003.md)
+is also rejected after 144 scored runs: removing its diagnostic allocation
+and lookups does not reach the frozen improvement threshold, and the short
+one-writer batch64 p99 guard fails. The retained runtime is restored.
+
 ## Worker-owned asynchronous data sync (rejected, 2026-09-28)
 
 A prototype removed the sync thread from the parallel runtime. The I/O
