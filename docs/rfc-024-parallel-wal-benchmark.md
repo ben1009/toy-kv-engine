@@ -17,6 +17,13 @@ sixteen writers show regressions of 16.8% and 15.4%; rotation still has large
 slow intervals. No case passes the full throughput-and-latency stability
 screen, and no incremental gain or adoption pass is established.
 
+[The sync-cutoff investigation](rfc-024-sync-cutoff-investigation-20261003.md)
+isolates the subsequent fixed-cutoff change: a one-line diagnostic reduces
+sync calls in every block and restores larger sync batches. Its throughput
+medians improve, but stalls and failed controls prevent qualification.
+The diagnostic is reverted; the retained implementation and default remain
+unchanged.
+
 [The 2026-10-01 optimization follow-up](rfc-024-wal-optimization-followup-20261001.md)
 tests byte-limited sync coalescing and faster worker integer maps against the
 current runtime. Both prototypes are rejected after paired comparisons.
