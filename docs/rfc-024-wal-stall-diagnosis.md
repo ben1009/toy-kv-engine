@@ -198,9 +198,11 @@ are `smi-runs.jsonl` and `smi-long.log`.
 
 These checks narrow the hypotheses; healthy SMART does not prove consistent
 latency. Cache exhaustion, garbage collection, and a firmware fault remain
-unproven. The burst, layout, CPU-placement, and migration experiments above did
-not establish them. Firmware updates or changes to APST, IRQ affinity, mount
-options, and durability are outside this investigation's changes.
+unproven. The initial burst, layout, CPU-placement, migration, and SMI checks
+in this section did not establish them. Firmware updates or changes to APST,
+IRQ affinity, mount options, and durability were outside those initial checks.
+Subsequent user-approved APST, volatile-write-cache, and firmware interventions
+are recorded below.
 
 An additional 100-second capture includes IRQ and softirq entry/exit events.
 Its three 200,000-put four-writer samples stay fast at 9,425–9,447 puts/s,
@@ -775,13 +777,15 @@ the paused benchmark falls inside any scratch-probe phase. Slow writes span
 many LBA regions and include WAL, extent initialization, SST, and journal I/O;
 the companion read uses exactly the same LBA in fast and slow intervals.
 
-The capture contains about 24.9 GiB of device writes. Approximately 17.62 GiB
-comes from the benchmark's SST worker, 3.41 GiB from its extent initializer,
-and 2.66 GiB from its WAL worker. Ownership is checked by issuing process ID,
-not just thread name. This makes the workload's substantial storage history
-visible; it does not prove that any one of these sources uniquely triggers
-the state transition. The deliberately paused benchmark's throughput is not
-a valid optimization comparison.
+The capture contains about 24.9 GiB of device writes, including journal and
+scratch-probe I/O. Approximately 17.62 GiB comes from the benchmark's SST
+worker, 3.41 GiB from its extent initializer, and 2.66 GiB from its WAL worker.
+Benchmark ownership is checked by issuing process ID, not just thread name.
+Another 0.93 GiB comes from journal I/O and 0.16 GiB from the scratch probe;
+the remainder comes from kernel workers and other issuers. This makes the
+workload's substantial storage history visible; it does not prove that any
+one of these sources uniquely triggers the state transition. The deliberately
+paused benchmark's throughput is not a valid optimization comparison.
 
 The first attempt stops when the user quota on `/tmp` interrupts capture after
 two completed probe phases; its partial artifacts remain preserved. The
