@@ -34,6 +34,11 @@ The cooperative-taskwork prototype is reverted.
 also fails its fixed batch64 target and guard limits after 96 scored runs.
 Both October 3 completion-wait prototypes are reverted.
 
+[Progress-aware publication waiting](rfc-024-publication-progress-20261003.md)
+records 22.1% lower CPU per put at 32 writers across 156 scored runs, but
+fails the required repeat-control count and rotation p99 guard. The prototype
+is reverted; the full qualification gate remains unmet.
+
 ## Worker-owned asynchronous data sync (rejected, 2026-09-28)
 
 A prototype removed the sync thread from the parallel runtime. The I/O
