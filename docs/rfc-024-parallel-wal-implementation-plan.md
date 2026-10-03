@@ -5,7 +5,7 @@
 **Status:** Slices 1–7 complete for the synchronous v4 WAL path; the
 parallel candidate remains opt-in because it did not pass the adoption gate
 
-**Last updated:** 2026-09-26
+**Last updated:** 2026-10-03
 
 ## Purpose and boundary
 
@@ -132,9 +132,20 @@ ticket whose MVCC publication is delayed until after a later WAL failure.
 or rotation leave no ticket or offset hole. Mixed batch sizes preserve the
 stored admission lengths through packing. The accounting model verifies the
 normal-budget and exclusive oversized-batch paths, including rejection above
-the 240 MiB aligned-capacity limit. A blocked `fallocate` does not block
-producer admission. Worker notification delivery and buffer recycling are
+the 240 MiB aligned-capacity limit. A blocked `fallocate` does not hold the
+admission queue mutex. Worker notification delivery and buffer recycling are
 verified after the worker exists.
+
+**Implementation update (2026-10-03):** The retained candidate uses
+producer-side packing. Admission saves each batch's physical offset and aligned
+length; the packer validates and reuses them. The producer tries the packer
+mutex while holding admission, and the packer releases its mutex under
+admission only after observing an empty queue. This prevents stranded tickets
+without a dedicated packer thread. Extent preparation and group-slot waits
+can block the admitting caller outside the admission queue mutex. MVCC point
+puts retain `mvcc.write_lock` through packing, so these waits can delay other
+point puts. The [write-order handoff experiment](rfc-024-wal-admission-handoff-20261002.md)
+records the rejected attempt to release that guard earlier.
 
 ### 4. Dedicated write worker and buffer ownership
 

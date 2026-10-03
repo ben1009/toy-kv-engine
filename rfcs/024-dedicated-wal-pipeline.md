@@ -198,6 +198,17 @@ that. A group descriptor records its ticket interval, file range, outstanding
 buffer references, and state (`assigned`, `writing`, `written`, `durable`, or
 `failed`). A group never contains a ticket gap.
 
+**Implementation update (2026-10-03):** The retained candidate packs on an
+admitting writer, without a separate packer thread. Admission stores each
+batch's physical offset and aligned length; packing validates and reuses them.
+The producer tries the packer mutex while holding admission. A draining packer
+releases its mutex while still holding admission after finding the queue empty,
+so queued work cannot be stranded waiting for another client. Extent preparation
+and group-slot waits run outside the admission mutex, but may block the admitting
+writer. MVCC point puts still hold `mvcc.write_lock` through packing, so other
+point puts may wait. The [write-order handoff experiment](../docs/rfc-024-wal-admission-handoff-20261002.md)
+records why releasing that guard before packing was rejected.
+
 Buffer admission reserves **resident `DirectBuf` capacity**, not just encoded WAL
 bytes, against an initial 64 MiB queued-and-in-flight budget, plus a separate
 initial limit of 256 queued batches. Today even a 4 KiB write normally owns
@@ -216,8 +227,9 @@ fixed allocation. Only 256 KiB buffers may return to the bounded 64-slot pool;
 larger buffers are freed after their write CQE and are never retained
 idle. The worker is independent of blocked producers, so backpressure cannot
 wait for an uncalled `submit_and_commit`.
-Pressure also wakes the packer; it must not rely on a client arriving to
-trigger dispatch.
+The original design wakes a dedicated packer under pressure. The retained
+producer-side implementation uses the handoff above to dispatch admitted work
+without requiring a subsequent client.
 Release each buffer's budget when its full-length write CQE confirms that the
 kernel has finished reading it. Recycle its `DirectBuf` immediately, even if
 the group is still waiting for `fdatasync`; the group descriptor retains only
@@ -519,6 +531,10 @@ report the measured bottleneck rather than claiming the regression is fixed.
 
 - [Implementation plan](../docs/rfc-024-parallel-wal-implementation-plan.md):
   reviewable implementation slices and validation order.
+- [Parallel WAL benchmark outcomes](../docs/rfc-024-parallel-wal-benchmark.md):
+  historical measurements and retained or rejected optimizations.
+- [Qualification matrix](../docs/rfc-024-wal-qualification-20261001.md):
+  same-session adoption checks and remaining gate failures.
 - [RFC 012](012-parallel-wal.md): original parallel-WAL proposal and historical sketches.
 - [RFC 023](023-point-in-time-recovery.md): PITR WAL format, commit ordering, and recovery contract.
 - [SpanDB paper](https://www.usenix.org/system/files/fast21-chen-hao.pdf):

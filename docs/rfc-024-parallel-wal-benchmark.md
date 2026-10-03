@@ -513,15 +513,20 @@ The historical binary did not emit the current latency and CPU fields.
 
 ## Adoption decision
 
-Keep the leader path as default and leave the candidate opt-in. It misses the
-required device-backed gain: the paired ext4 median ratio is below parity and
-its 95% interval includes parity. It also loses consistently on tmpfs, has a
-large p99 regression in the exact case, and fails the one-writer batch
-throughput bound. The pipeline is real, but not beneficial enough to adopt.
+**Historical Slice 7 checkpoint (2026-09-26):** These conclusions apply to the
+original exact 200k-put case above, before the optimization follow-ups.
 
-The follow-up below explores adjacent-ticket packing and coalesced worker
-notifications. It remains below the adoption gate on the exact workload; repeat
-that case in a five-pair series before considering another worker or ring.
+At this checkpoint, the candidate missed the required device-backed gain:
+the paired ext4 median ratio was 0.835 with a 95% interval of 0.682–1.814.
+It also lost consistently on tmpfs, had a large p99 regression in the exact
+case, and failed the one-writer batch throughput bound. The recommendation
+was to keep the leader as default and leave the candidate opt-in.
+
+The adjacent-ticket packing and coalesced-notification follow-up below
+includes a later five-pair exact-case rerun, which supersedes these checkpoint
+metrics. The [qualification matrix](rfc-024-wal-qualification-20261001.md)
+supersedes this checkpoint's performance assessment; the opening **Decision**
+states the current adoption status.
 
 ## Exploratory optimization follow-up
 
@@ -732,10 +737,10 @@ the default because the parallel path is still much slower on tmpfs. Raw
 `target/rfc024-sync-window-rotation` and `target/rfc024-sync-window-exact`;
 the 200k-put tmpfs JSON is under `/tmp/rfc024-sync-window-exact`.
 
-### Current 100-microsecond path and next optimization target
+### Historical 100-microsecond path and next optimization target
 
 Five alternating leader/parallel pairs reran the 50k-put, four-writer,
-1-KiB-value, 1-MiB-SST workload with the current 100-microsecond parallel
+1-KiB-value, 1-MiB-SST workload with a 100-microsecond parallel
 window. The same binary was used for both modes. On ext4, paired parallel /
 leader throughput ratios were 1.580, 2.927, 1.570, 1.591, and 1.585 (median
 1.585). The second leader run was a slow device outlier; the other four pairs
