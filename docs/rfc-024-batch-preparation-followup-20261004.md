@@ -1,8 +1,10 @@
 # RFC 024: batch preparation follow-up, 2026-10-04
 
-No additional production change is retained. Three isolated experiments
-targeted allocation and synchronization costs in parallel WAL batch writes.
-None passed the frozen incremental retention rule. The
+The initial screening retained no additional production change. Three
+isolated experiments targeted allocation and synchronization costs in
+parallel WAL batch writes. None passed the frozen incremental retention rule.
+A subsequent code inspection retains the debug-only-lock cleanup described
+below, without claiming a throughput gain. The
 [validated extent-preparation improvement](rfc-024-large-batch-preallocation-20261004.md)
 from `422d6616` remains intact. These screens establish neither another
 throughput gain nor the RFC adoption gate relative to leader WAL.
@@ -18,7 +20,7 @@ Executables run from RAM, output is captured in memory during execution,
 and five seconds idle follows each run. Builds, tests, profiling, and
 device administration do not overlap scored timing.
 
-| Candidate | Paired median throughput | Paired median batch p99 | Passing repeat controls | Decision |
+| Candidate | Paired median throughput | Paired median batch p99 | Passing repeat controls | Initial decision |
 | --- | ---: | ---: | ---: | --- |
 | Defer `Bytes` shared metadata until the first clone | +0.8% | -2.4% | 0/3 | Revert |
 | Remove release-mode admission reads used only by debug assertions | -0.8% | +0.9% | 0/3 | Revert |
@@ -71,6 +73,31 @@ and **267/287 ms**, respectively. These are instrumented aggregate phase
 wall times, including concurrent threads and waiting; they are diagnostic
 observations, not paired CPU savings or scored throughput results.
 
+### Follow-up inspection: retain debug-only-lock cleanup
+
+The three admission-mutex reads serve only invariant checks. Queue draining
+already reads admission under its mutex, worker submission and completion
+use synchronized channels, and frontier updates hold the durability mutex.
+The extra reads mutate no admission state and establish no required release
+synchronization. Admission, barrier cutoffs, poison handling, unassigned-ticket
+validation, and durability notification retain their existing locks.
+
+The cleanup removes one extra acquisition per packed group, processed group
+completion, and successful sync in release builds. Debug builds retain the
+same invariant reads under the admission mutex. Release disassembly confirms
+two fewer `lock cmpxchg` instructions in each of the three functions: one
+acquisition and one release per removed mutex guard.
+
+This narrow cleanup is retained separately after inspection. The earlier
+**-0.8% throughput, 0/3 controls** remains the recorded screening result;
+it establishes neither a repeatable throughput gain nor a regression.
+
+The retained cleanup passes `cargo make check`, including default and all-feature
+Clippy and **1,421 tests with no skips**. Another **104 selected tests** pass in
+release mode, exercising the paths with debug assertions disabled; 1,144
+unselected tests are filtered out. Inspection and check artifacts are saved
+under `target/rfc024-debug-admission-locks-20261004/`.
+
 ## One-second regression retries
 
 All originals and retries remain in the artifacts. Retries do not replace
@@ -107,10 +134,10 @@ and close/recovery. It is archived with the rejected patch.
 
 All raw records, reported rates, completed CQEs, commit buffers, mode
 settings, fixed block calculations, source snapshots, and binary checksums
-were verified. All **118 Rust files** match the baseline manifest. The
-normal release executable was rebuilt and matches the saved baseline;
-`cargo fmt --all --check` passes. Disposable databases and RAM staging
-directories were removed. Each candidate has a unified rejected patch
+were verified. At the end of screening, all **118 Rust files** matched the
+baseline manifest. The normal release executable was rebuilt and matched
+the saved baseline; `cargo fmt --all --check` passed. Disposable databases and
+RAM staging directories were removed. Each candidate has a unified rejected patch
 that applies cleanly to the restored baseline.
 
 Baseline executable SHA-256:
@@ -127,5 +154,4 @@ outputs, test logs, profiles or disassembly, and rejected patches under:
 - `target/rfc024-batch-repeated-value-screen-20261004/`
 
 The final directory also contains the record/provenance validator and
-restoration checksum. No new comparison against leader WAL was run in
-this session.
+restoration checksum. These three screens did not compare against leader WAL.

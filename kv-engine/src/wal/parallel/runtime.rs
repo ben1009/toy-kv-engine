@@ -868,10 +868,13 @@ fn pack_admitted_groups(
                 .record_preallocation_ns(preallocation_start.elapsed().as_nanos() as u64);
             packer.preallocated_end = target_preallocated_end;
         }
-        let admitted_end = inner.admission.lock().admitted_end;
         debug_assert!(WAL_HEADER_END <= packer.reserved_end);
-        debug_assert!(packer.reserved_end <= admitted_end);
-        debug_assert!(admitted_end <= MAX_WAL_FILE_SIZE);
+        #[cfg(debug_assertions)]
+        {
+            let admitted_end = inner.admission.lock().admitted_end;
+            debug_assert!(packer.reserved_end <= admitted_end);
+            debug_assert!(admitted_end <= MAX_WAL_FILE_SIZE);
+        }
         debug_assert!(packer.preallocated_end >= packer.reserved_end);
         debug_assert!(packer.preallocated_end <= MAX_WAL_FILE_SIZE);
         if packer.reserved_end > packer.preallocated_end {
@@ -1097,8 +1100,7 @@ fn process_group_result(inner: &RuntimeInner, result: GroupWriteResult) {
     if let Some(poison) = state.poison_ticket {
         debug_assert!(state.durable_frontier <= poison);
     }
-    let assigned = inner.admission.lock().next_ticket;
-    debug_assert!(state.written_frontier <= assigned);
+    debug_assert!(state.written_frontier <= inner.admission.lock().next_ticket);
     debug_assert!(state.durable_frontier <= state.written_frontier);
     #[cfg(feature = "chaos-testing")]
     let later_group_remains_outside_prefix = state.written_frontier < result_end;
@@ -1241,8 +1243,7 @@ fn synchronize_written_prefix(sync_file: &File, inner: &RuntimeInner) -> Result<
         if let Some(poison) = state.poison_ticket {
             debug_assert!(state.durable_frontier <= poison);
         }
-        let assigned = inner.admission.lock().next_ticket;
-        debug_assert!(state.written_frontier <= assigned);
+        debug_assert!(state.written_frontier <= inner.admission.lock().next_ticket);
         inner.durability.changed.notify_all();
         drop(state);
         inner.sync_progress.mark_durable(acknowledged);
