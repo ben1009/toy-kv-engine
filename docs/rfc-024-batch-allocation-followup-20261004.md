@@ -72,9 +72,10 @@ throughput or +10% p99. This is separate from RFC adoption. It failed.
 | Single puts, 16 writers | 23,724 | 24,072 | 0.0% | -4.0% | -0.5% | 1/3 |
 
 Absolute columns use six-run medians; paired changes use all three block
-ratios. Process CPU includes setup and post-timing cleanup/flush work and
-is normalized by logical puts. It does not isolate CPU in the timed write
-window. Lower-concurrency results do not replace the predeclared target.
+ratios. Process CPU covers the concurrent-write interval, including writer
+startup and any worker or background activity during that interval, and
+is normalized by logical puts. It excludes engine setup and post-timing
+flush/close work. Lower-concurrency results do not replace the predeclared target.
 
 The first target block stalled in every arm. Baseline measured 95,136 and
 371,461 puts/s; candidate 94,534 and 37,682; leader 34,178 and 24,212.
