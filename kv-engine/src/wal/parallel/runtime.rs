@@ -28,6 +28,9 @@ const MAX_BUFFER_CAPACITY: u64 = 240 * 1024 * 1024;
 const WAL_HEADER_END: u64 = 4096;
 const PACKER_GROUP_MAX_TICKETS: usize = 8;
 const EXTENT_INITIALIZATION_CHUNK: usize = 128 * 1024;
+// Large writes amortize extent conversion themselves. Zero-filling their
+// allocated space adds a second write of the same bytes on ext4.
+const ALLOCATION_ONLY_MIN_BATCH_BYTES: usize = 64 * 1024;
 // Wait for an already-admitted ticket cutoff when a written prefix is ready
 // to sync. Skip the wait when the prior sync was cheap; new admission cannot
 // extend the captured cutoff or deadline.
@@ -221,6 +224,7 @@ struct PackedGroup {
     next_ticket: u64,
     reserved_end: u64,
     writes: WriteGroupBuffers<ParallelBuffer>,
+    initialize_extents: bool,
 }
 
 struct AdmissionState {
@@ -287,13 +291,18 @@ fn is_ext_filesystem(file: &File) -> bool {
     unsafe { stat.assume_init() }.f_type == libc::EXT4_SUPER_MAGIC
 }
 
-/// Owns initialization beyond the packer's ready prefix. There is at most
+struct ExtentPreparation {
+    end: u64,
+    zero_fill: bool,
+}
+
+/// Owns preparation beyond the packer's ready prefix. There is at most
 /// one outstanding request/result, so stopping admission and dropping the
 /// request sender lets close join without draining the completion channel.
 /// The worker retains its file and aligned buffer until synchronous writes
 /// finish, including on initialization failure or runtime construction failure.
 struct ExtentInitializer {
-    requests: Option<Sender<u64>>,
+    requests: Option<Sender<ExtentPreparation>>,
     completions: Receiver<std::result::Result<u64, String>>,
     join: Option<JoinHandle<Result<()>>>,
     ready_end: u64,
@@ -305,7 +314,7 @@ impl ExtentInitializer {
             (WAL_HEADER_END..=MAX_WAL_FILE_SIZE).contains(&start) && start.is_multiple_of(4096),
             "invalid WAL extent initialization offset"
         );
-        let (requests, incoming) = crossbeam_channel::bounded::<u64>(1);
+        let (requests, incoming) = crossbeam_channel::bounded::<ExtentPreparation>(1);
         let (finished, completions) = crossbeam_channel::bounded(1);
         let join = thread::Builder::new()
             .name("wal-extent-initializer".to_owned())
@@ -315,16 +324,20 @@ impl ExtentInitializer {
                 let mut offset = start;
                 let mut zeros = DirectBuf::new(EXTENT_INITIALIZATION_CHUNK);
                 zeros.zero_range(0, EXTENT_INITIALIZATION_CHUNK);
-                while let Ok(end) = incoming.recv() {
+                while let Ok(ExtentPreparation { end, zero_fill }) = incoming.recv() {
                     let result = (|| -> Result<()> {
                         preallocate(&file, end)?;
-                        while offset < end {
+                        while zero_fill && offset < end {
                             let len =
                                 (end - offset).min(EXTENT_INITIALIZATION_CHUNK as u64) as usize;
                             file.write_all_at(zeros.initialized_slice(0, len), offset)
                                 .context("failed to initialize WAL extent")?;
                             offset += len as u64;
                         }
+                        // Skipped initialization is still a prepared prefix.
+                        // Later small writes must never zero-fill it again:
+                        // the packer may already have submitted WAL data there.
+                        offset = end;
 
                         Ok(())
                     })();
@@ -343,21 +356,24 @@ impl ExtentInitializer {
             ready_end: start,
         };
         if start < MAX_WAL_FILE_SIZE {
-            initializer.request(round_up(start + 1, PREALLOC_BLOCK).context("extent overflow")?)?;
+            initializer.request(
+                round_up(start + 1, PREALLOC_BLOCK).context("extent overflow")?,
+                true,
+            )?;
         }
 
         Ok(initializer)
     }
 
-    fn request(&self, end: u64) -> Result<()> {
+    fn request(&self, end: u64, zero_fill: bool) -> Result<()> {
         self.requests
             .as_ref()
             .context("initializer closed")?
-            .send(end)
+            .send(ExtentPreparation { end, zero_fill })
             .context("extent initializer stopped")
     }
 
-    fn prepare(&mut self, end: u64) -> Result<()> {
+    fn prepare(&mut self, end: u64, zero_fill: bool) -> Result<()> {
         ensure!(
             end <= MAX_WAL_FILE_SIZE && end.is_multiple_of(4096),
             "invalid WAL extent initialization target"
@@ -374,6 +390,7 @@ impl ExtentInitializer {
                 self.request(
                     end.max(self.ready_end + PREALLOC_BLOCK)
                         .min(MAX_WAL_FILE_SIZE),
+                    zero_fill,
                 )?;
             }
         }
@@ -834,7 +851,9 @@ fn pack_admitted_groups(
             #[cfg(feature = "bench")]
             let preallocation_start = Instant::now();
             let allocation = match packer.initializer.as_mut() {
-                Some(initializer) => initializer.prepare(target_preallocated_end),
+                Some(initializer) => {
+                    initializer.prepare(target_preallocated_end, packed.initialize_extents)
+                }
                 None => preallocate(&inner.preallocator, target_preallocated_end),
             };
             if let Err(error) = allocation {
@@ -899,6 +918,7 @@ fn take_admitted_group(
     let first_ticket = first.ticket;
     let group_capacity = admission.queue.len().min(max_tickets);
     let mut writes = WriteGroupBuffers::with_capacity(group_capacity);
+    let mut initialize_extents = false;
     let mut expected_ticket = next_ticket;
     let mut packed_end = reserved_end;
     while writes.len() < max_tickets {
@@ -917,6 +937,9 @@ fn take_admitted_group(
             .queue
             .pop_front()
             .expect("front WAL batch remains queued");
+        // Keep zero-fill for groups containing small writes. Only extent
+        // preparation changes; every batch still uses the parallel pipeline.
+        initialize_extents |= batch.aligned_len < ALLOCATION_ONLY_MIN_BATCH_BYTES;
         ensure!(
             batch.ticket == expected_ticket && batch.file_offset == packed_end,
             "parallel WAL admission queue is not ticket/offset contiguous"
@@ -941,6 +964,7 @@ fn take_admitted_group(
         next_ticket: expected_ticket,
         reserved_end: packed_end,
         writes,
+        initialize_extents,
     }))
 }
 
@@ -1428,10 +1452,10 @@ mod tests {
         let mut initializer = super::ExtentInitializer::spawn(Arc::clone(&file), start).unwrap();
         assert!(
             initializer
-                .prepare(super::MAX_WAL_FILE_SIZE + 4096)
+                .prepare(super::MAX_WAL_FILE_SIZE + 4096, true)
                 .is_err()
         );
-        initializer.prepare(super::MAX_WAL_FILE_SIZE).unwrap();
+        initializer.prepare(super::MAX_WAL_FILE_SIZE, true).unwrap();
         initializer.close().unwrap();
         assert_eq!(file.metadata().unwrap().len(), super::MAX_WAL_FILE_SIZE);
         let mut batch = [0; 5];
@@ -1448,10 +1472,12 @@ mod tests {
         file.write_all_at(b"header", 0).unwrap();
         let mut initializer =
             super::ExtentInitializer::spawn(Arc::clone(&file), super::WAL_HEADER_END).unwrap();
-        initializer.prepare(super::PREALLOC_BLOCK).unwrap();
+        initializer.prepare(super::PREALLOC_BLOCK, true).unwrap();
         file.write_all_at(b"batch", super::PREALLOC_BLOCK - 5)
             .unwrap();
-        initializer.prepare(3 * super::PREALLOC_BLOCK).unwrap();
+        initializer
+            .prepare(3 * super::PREALLOC_BLOCK, true)
+            .unwrap();
         initializer.close().unwrap();
         let mut bytes = [0; 6];
         file.read_exact_at(&mut bytes, 0).unwrap();
@@ -1465,6 +1491,36 @@ mod tests {
     }
 
     #[test]
+    fn extent_preparation_never_zero_fills_a_skipped_prefix_after_small_writes_resume() {
+        use std::{os::unix::fs::FileExt, sync::Arc};
+
+        let file = Arc::new(tempfile::tempfile().unwrap());
+        let block = super::PREALLOC_BLOCK;
+        file.set_len(5 * block).unwrap();
+        // Markers prove allocation-only requests don't write zeros, rather
+        // than merely reading as zeros from an unwritten extent.
+        file.write_all_at(b"large", block + 4096).unwrap();
+        file.write_all_at(b"mixed", 2 * block + 4096).unwrap();
+        file.write_all_at(b"stale", 4 * block - 5).unwrap();
+        let mut initializer =
+            super::ExtentInitializer::spawn(Arc::clone(&file), super::WAL_HEADER_END).unwrap();
+
+        initializer.prepare(block, false).unwrap();
+        initializer.prepare(2 * block, false).unwrap();
+        initializer.prepare(3 * block, true).unwrap();
+        initializer.prepare(4 * block, true).unwrap();
+        initializer.close().unwrap();
+
+        let mut bytes = [0; 5];
+        file.read_exact_at(&mut bytes, block + 4096).unwrap();
+        assert_eq!(&bytes, b"large");
+        file.read_exact_at(&mut bytes, 2 * block + 4096).unwrap();
+        assert_eq!(&bytes, b"mixed");
+        file.read_exact_at(&mut bytes, 4 * block - 5).unwrap();
+        assert_eq!(bytes, [0; 5]);
+    }
+
+    #[test]
     fn extent_initializer_failure_is_reported_and_joined() {
         use std::{fs::File, sync::Arc};
 
@@ -1473,7 +1529,7 @@ mod tests {
         let readonly = Arc::new(File::open(file.path()).unwrap());
         let mut initializer =
             super::ExtentInitializer::spawn(readonly, super::WAL_HEADER_END).unwrap();
-        assert!(initializer.prepare(super::PREALLOC_BLOCK).is_err());
+        assert!(initializer.prepare(super::PREALLOC_BLOCK, true).is_err());
         assert!(initializer.close().is_err());
     }
 
@@ -1501,15 +1557,68 @@ mod tests {
         ticket: u64,
         file_offset: u64,
     ) -> AdmittedBatch {
-        budget.reserve(4096).expect("reserve test buffer");
-        let mut direct = DirectBuf::new(4096);
-        direct.set_len(4096);
+        admitted_batch_of_size(budget, ticket, file_offset, 4096)
+    }
+
+    fn admitted_batch_of_size(
+        budget: &std::sync::Arc<BufferBudget>,
+        ticket: u64,
+        file_offset: u64,
+        aligned_len: usize,
+    ) -> AdmittedBatch {
+        budget
+            .reserve(aligned_len as u64)
+            .expect("reserve test buffer");
+        let mut direct = DirectBuf::new(aligned_len);
+        direct.set_len(aligned_len);
+
         AdmittedBatch {
             ticket,
             file_offset,
-            aligned_len: 4096,
-            buffer: ParallelBuffer::activate(direct, std::sync::Arc::clone(budget), 4096),
+            aligned_len,
+            buffer: ParallelBuffer::activate(
+                direct,
+                std::sync::Arc::clone(budget),
+                aligned_len as u64,
+            ),
         }
+    }
+
+    #[test]
+    fn packer_preserves_zero_fill_for_mixed_groups_and_skips_large_only_groups() {
+        let budget = std::sync::Arc::new(BufferBudget::new());
+        let large = super::ALLOCATION_ONLY_MIN_BATCH_BYTES;
+        let mut admission = AdmissionState {
+            open: true,
+            close_cutoff: None,
+            poison: None,
+            next_ticket: 4,
+            admitted_end: WAL_HEADER_END + 3 * large as u64 + 4096,
+            queue: std::collections::VecDeque::from([
+                admitted_batch_of_size(&budget, 0, WAL_HEADER_END, large),
+                admitted_batch_of_size(&budget, 1, WAL_HEADER_END + large as u64, large),
+                admitted_batch(&budget, 2, WAL_HEADER_END + 2 * large as u64),
+                admitted_batch_of_size(&budget, 3, WAL_HEADER_END + 2 * large as u64 + 4096, large),
+            ]),
+        };
+
+        let large_group = take_admitted_group(&mut admission, 0, WAL_HEADER_END, 2)
+            .unwrap()
+            .unwrap();
+        assert!(!large_group.initialize_extents);
+        let mixed_group = take_admitted_group(
+            &mut admission,
+            large_group.next_ticket,
+            large_group.reserved_end,
+            2,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(mixed_group.initialize_extents);
+        assert_eq!(mixed_group.reserved_end, admission.admitted_end);
+        assert!(admission.queue.is_empty());
+        drop((large_group, mixed_group));
+        assert_eq!(budget.state.lock().active_bytes, 0);
     }
 
     #[test]
