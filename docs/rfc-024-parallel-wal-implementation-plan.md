@@ -144,16 +144,25 @@ the 240 MiB aligned-capacity limit. A blocked `fallocate` does not hold the
 admission queue mutex. Worker notification delivery and buffer recycling are
 verified after the worker exists.
 
-**Implementation update (2026-10-03):** The retained candidate uses
-producer-side packing. Admission saves each batch's physical offset and aligned
-length; the packer validates and reuses them. The producer tries the packer
-mutex while holding admission, and the packer releases its mutex under
-admission only after observing an empty queue. This prevents stranded tickets
+**Historical implementation (2026-10-03):** The candidate used
+producer-side packing. Admission saved each batch's physical offset and aligned
+length; the packer validated and reused them. The producer tried the packer
+mutex while holding admission, and the packer released its mutex under
+admission only after observing an empty queue. This prevented stranded tickets
 without a dedicated packer thread. Extent preparation and group-slot waits
-can block the admitting caller outside the admission queue mutex. MVCC point
-puts retain `mvcc.write_lock` through packing, so these waits can delay other
+could block the admitting caller outside the admission queue mutex. MVCC point
+puts retained `mvcc.write_lock` through packing, so these waits could delay other
 point puts. The [write-order handoff experiment](rfc-024-wal-admission-handoff-20261002.md)
-records the rejected attempt to release that guard earlier.
+records the rejected attempt to release that guard earlier in that version.
+
+**Implementation update (2026-10-05):** The native async integration replaces
+producer-side packing with one dedicated `wal-ordered-packer` thread per
+parallel WAL. Synchronous and native producers atomically assign tickets and
+physical ranges, enqueue their ready buffers, and send a coalesced wakeup.
+The packer drains that queue using the stored offsets and aligned lengths;
+extent preparation and group-slot waits no longer run on producers or retain
+their `mvcc.write_lock`. See the
+[integration report](rfc-024-native-async-integration-20261005.md).
 
 ### 4. Dedicated write worker and buffer ownership
 

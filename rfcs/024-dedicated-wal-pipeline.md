@@ -198,16 +198,24 @@ that. A group descriptor records its ticket interval, file range, outstanding
 buffer references, and state (`assigned`, `writing`, `written`, `durable`, or
 `failed`). A group never contains a ticket gap.
 
-**Implementation update (2026-10-03):** The retained candidate packs on an
-admitting writer, without a separate packer thread. Admission stores each
-batch's physical offset and aligned length; packing validates and reuses them.
-The producer tries the packer mutex while holding admission. A draining packer
-releases its mutex while still holding admission after finding the queue empty,
-so queued work cannot be stranded waiting for another client. Extent preparation
-and group-slot waits run outside the admission mutex, but may block the admitting
-writer. MVCC point puts still hold `mvcc.write_lock` through packing, so other
-point puts may wait. The [write-order handoff experiment](../docs/rfc-024-wal-admission-handoff-20261002.md)
-records why releasing that guard before packing was rejected.
+**Historical implementation (2026-10-03):** The candidate packed on an
+admitting writer, without a separate packer thread. Admission stored each
+batch's physical offset and aligned length; packing validated and reused them.
+The producer tried the packer mutex while holding admission. A draining packer
+released its mutex while still holding admission after finding the queue empty,
+so queued work could not be stranded waiting for another client. Extent preparation
+and group-slot waits ran outside the admission mutex, but could block the admitting
+writer. MVCC point puts held `mvcc.write_lock` through packing, so other
+point puts could wait. The [write-order handoff experiment](../docs/rfc-024-wal-admission-handoff-20261002.md)
+records why releasing that guard before packing was rejected in that version.
+
+**Implementation update (2026-10-05):** The
+[native async integration](../docs/rfc-024-native-async-integration-20261005.md)
+uses a dedicated `wal-ordered-packer` thread for both synchronous and native
+async admissions. Admission still stores the physical offset and aligned
+length atomically with the ticket and ready buffer. Producers enqueue and
+notify the packer; extent preparation and group-slot waits run on that thread.
+The sequencer no longer holds `mvcc.write_lock` through packing.
 
 Buffer admission reserves **resident `DirectBuf` capacity**, not just encoded WAL
 bytes, against an initial 64 MiB queued-and-in-flight budget, plus a separate
@@ -227,9 +235,9 @@ fixed allocation. Only 256 KiB buffers may return to the bounded 64-slot pool;
 larger buffers are freed after their write CQE and are never retained
 idle. The worker is independent of blocked producers, so backpressure cannot
 wait for an uncalled `submit_and_commit`.
-The original design wakes a dedicated packer under pressure. The retained
-producer-side implementation uses the handoff above to dispatch admitted work
-without requiring a subsequent client.
+The current implementation wakes its dedicated packer on admission; one queued
+notification suffices because the packer drains admitted work without requiring
+a subsequent client.
 Release each buffer's budget when its full-length write CQE confirms that the
 kernel has finished reading it. Recycle its `DirectBuf` immediately, even if
 the group is still waiting for `fdatasync`; the group descriptor retains only

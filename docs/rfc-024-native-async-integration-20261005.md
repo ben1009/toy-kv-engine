@@ -45,6 +45,11 @@ CAS wait for pending publication without holding a blocking read guard across
 an await. WAL-full retry releases the lease, performs rotation on the bounded
 blocking executor, and reserves a fresh timestamp on the successor.
 
+After those leases drain, freeze and checkpoint reject a poisoned publication
+sequencer, including when the active memtable is empty. A healthy WAL does not
+make a hidden successor commit safe to persist in an SST or checkpoint. The
+active WAL remains available for recovery, and close still drains its runtime.
+
 Range batches, transaction commits, and actual PITR v5/v6 WALs use the bounded
 blocking path. Async transaction commit now owns the synchronous commit
 protocol: it claims the attempt before collecting writes/OCC sets, retains the
@@ -88,10 +93,10 @@ separately labelled retry; original observations always remain primary.
 
 The retained reference is the unchanged `ca4cfcca` parallel-WAL executable.
 The integrated synchronous and native arms use the same measured binary and
-public engine API. Its archived inputs precede the shutdown and transaction
-review fixes described above; these measurements have not been rerun with those
-fixes. Reference comparisons include packing and lifecycle changes; they do not
-isolate async waits. Each paired estimate below is the median of three fixed
+public engine API. Its archived inputs precede the shutdown, transaction, and
+checkpoint-publication review fixes described above; these measurements have not
+been rerun with those fixes. Reference comparisons include packing and lifecycle
+changes; they do not isolate async waits. Each paired estimate below is the median of three fixed
 block geometric-mean ratios.
 
 | Native async compared with | Throughput | Batch p99 | CPU per put | Switches per batch | Repeat controls |
@@ -168,6 +173,15 @@ original `Arc`, including caller cancellation and drop. The async WAL frontier
 test now handles unavailable `io_uring` consistently with the other WAL tests;
 it executes on the unrestricted host during this check.
 
+The checkpoint-publication review passes `cargo make check` with all 1,464 tests
+and no skips. One existing simple-leveled compaction integration test timed out
+once and passed on its next attempt. Both new checkpoint regressions fail on
+the old source and pass with the fix: cancellation while capture waits for
+writers cannot persist a hidden successor, and an empty poisoned memtable
+cannot bypass rejection. Failed freeze leaves the old WAL available; explicit
+close still drains its runtime, and reopening replays the complete WAL history.
+Scoped subagent verification found no further issue in the fix.
+
 ## Reproduction artifacts
 
 - [Fair-run protocol](../target/rfc024-native-async-integration-20261005/fair-comparison/protocol.json), [raw observations](../target/rfc024-native-async-integration-20261005/fair-comparison/records.json), [analysis](../target/rfc024-native-async-integration-20261005/fair-comparison/analysis.json), and [input integrity](../target/rfc024-native-async-integration-20261005/fair-comparison/final-integrity.json).
@@ -175,6 +189,7 @@ it executes on the unrestricted host during this check.
 - [Public-API probe](../target/rfc024-native-async-integration-20261005/probe/src/main.rs), [runner](../target/rfc024-native-async-integration-20261005/fair-comparison/run.py), and [compiled input hashes](../target/rfc024-native-async-integration-20261005/fair-comparison/compiled-input-hashes.json).
 - [Full local check after review](../target/rfc024-native-async-integration-20261005/full-check-review.log), [default-feature tests](../target/rfc024-native-async-integration-20261005/default-tests-review.log), [native AddressSanitizer](../target/rfc024-native-async-integration-20261005/asan-native-review.log), [transaction AddressSanitizer](../target/rfc024-native-async-integration-20261005/asan-transaction-review.log), and [shutdown AddressSanitizer](../target/rfc024-native-async-integration-20261005/asan-close-review.log).
 - [Review validation and source hashes](../target/rfc024-native-async-integration-20261005/review-validation.json), [probe Clippy](../target/rfc024-native-async-integration-20261005/probe-clippy-review.log), and [probe tests](../target/rfc024-native-async-integration-20261005/probe-tests-review.log).
+- [Full local check after checkpoint-publication review](../target/rfc024-native-async-integration-20261005/round4-check.log).
 
 Artifacts are local and ignored by Git. Both executable versions and all
 observations are preserved. Source hashes remained unchanged during each run;
