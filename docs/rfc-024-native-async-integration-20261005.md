@@ -62,6 +62,14 @@ including errors, for subsequent callers; a rejected precondition that leaves
 admission open permits a later retry. A background join failure still allows
 safe WAL teardown.
 
+For a non-PITR engine moved out of its original `Arc`, shutdown retains shared
+storage and worker handles independently. Dropping its caller leaves the owned
+shutdown running until it has drained work and saved the final result. Async
+close exposes `AsyncCloseErrorKind` even when a synchronous caller settled close
+first: that caller receives its original error, while subsequent callers use a
+cached classification and formatted chain. An async shutdown owner instead
+retains the original error chain for its waiters.
+
 ## Ext4 measurements
 
 Fresh databases on `/dev/nvme0n1p3`, ext4, 16 clients, 64 puts per batch,

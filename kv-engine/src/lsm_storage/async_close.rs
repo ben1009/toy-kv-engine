@@ -16,7 +16,7 @@ use anyhow::{Result, anyhow};
 use parking_lot::Mutex;
 use tokio::sync::Notify;
 
-use super::KvEngine;
+use super::LifecycleHandle;
 
 #[derive(Default)]
 pub(super) struct AsyncClose {
@@ -29,7 +29,7 @@ pub(super) struct CloseAttempt {
     completed: Notify,
 }
 
-/// Classification for a failure returned by [`KvEngine::close_async`].
+/// Classification for a failure returned by [`super::KvEngine::close_async`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum AsyncCloseErrorKind {
@@ -43,7 +43,7 @@ pub enum AsyncCloseErrorKind {
     Other,
 }
 
-/// Shared async-close failure with a typed classification and its original error chain.
+/// Shared async-close failure with a typed classification and its underlying close error.
 #[derive(Debug)]
 pub struct AsyncCloseError {
     kind: AsyncCloseErrorKind,
@@ -52,7 +52,17 @@ pub struct AsyncCloseError {
 
 impl AsyncCloseError {
     fn new(source: Arc<anyhow::Error>) -> Self {
-        let kind = match source.downcast_ref::<super::PitrManifestPublicationError>() {
+        let kind = Self::classify(&source);
+
+        Self { kind, source }
+    }
+
+    fn classify(source: &anyhow::Error) -> AsyncCloseErrorKind {
+        if let Some(cached) = source.downcast_ref::<CachedCloseError>() {
+            return cached.kind;
+        }
+
+        match source.downcast_ref::<super::PitrManifestPublicationError>() {
             Some(super::PitrManifestPublicationError::PublishedButNotDurable(_)) => {
                 AsyncCloseErrorKind::PitrManifestPublishedButNotDurable
             }
@@ -64,8 +74,7 @@ impl AsyncCloseError {
                 .map_or(AsyncCloseErrorKind::Other, |error| {
                     AsyncCloseErrorKind::Io(error.kind())
                 }),
-        };
-        Self { kind, source }
+        }
     }
 
     /// Returns the stable classification for this close failure.
@@ -73,7 +82,12 @@ impl AsyncCloseError {
         self.kind
     }
 
-    /// Returns the original close error chain for detailed inspection.
+    /// Returns the underlying close error for detailed inspection.
+    ///
+    /// An async shutdown owner retains the original error chain. When a
+    /// synchronous caller settles close first, its cache instead retains the
+    /// typed classification and the formatted chain so that the first caller
+    /// can receive its original error.
     pub fn source_error(&self) -> &anyhow::Error {
         &self.source
     }
@@ -91,15 +105,41 @@ impl StdError for AsyncCloseError {
     }
 }
 
+#[derive(Clone, Debug)]
+pub(super) struct CachedCloseError {
+    kind: AsyncCloseErrorKind,
+    detail: String,
+}
+
+impl CachedCloseError {
+    pub(super) fn new(error: &anyhow::Error) -> Self {
+        Self {
+            kind: AsyncCloseError::classify(error),
+            detail: format!("{error:#}"),
+        }
+    }
+}
+
+impl Display for CachedCloseError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.detail)
+    }
+}
+
+impl StdError for CachedCloseError {}
+
 impl AsyncClose {
-    pub(super) fn start(&self, engine: Arc<KvEngine>) -> Arc<CloseAttempt> {
+    pub(super) fn start<F>(&self, lifecycle: &LifecycleHandle, close: F) -> Arc<CloseAttempt>
+    where
+        F: Fn() -> Result<()> + Send + 'static,
+    {
         let mut current = self.attempt.lock();
         if let Some(attempt) = current.as_ref() {
             let failed = attempt.result.lock().as_ref().is_some_and(Result::is_err);
             // A rejected PITR precondition or thread-spawn failure can leave
             // admission open. Permit a later retry after that error; a real
             // shutdown attempt instead retains its terminal outcome.
-            if !failed || engine.inner.lifecycle.ensure_open().is_err() {
+            if !failed || lifecycle.ensure_open().is_err() {
                 return Arc::clone(attempt);
             }
         }
@@ -109,7 +149,9 @@ impl AsyncClose {
         let owner = std::thread::Builder::new()
             .name("kv-engine-close".into())
             .spawn(move || {
-                let result = match catch_unwind(AssertUnwindSafe(|| engine.close())) {
+                // Borrow the closure so its shutdown owner remains alive until
+                // the attempt's terminal result has been saved.
+                let result = match catch_unwind(AssertUnwindSafe(&close)) {
                     Ok(result) => result,
                     Err(_) => Err(anyhow!("engine shutdown owner panicked")),
                 };
@@ -120,6 +162,13 @@ impl AsyncClose {
         }
 
         attempt
+    }
+
+    pub(super) fn owns_shutdown(&self) -> bool {
+        self.attempt
+            .lock()
+            .as_ref()
+            .is_some_and(|attempt| attempt.result.lock().is_none())
     }
 }
 
@@ -150,7 +199,91 @@ impl CloseAttempt {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::lsm_storage::LsmStorageOptions;
+    use crate::lsm_storage::{KvEngine, LsmStorageOptions};
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn async_close_preserves_error_kind_after_synchronous_close() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("database");
+        let moved_path = directory.path().join("moved-database");
+        let engine = KvEngine::open(&path, LsmStorageOptions::default_for_test()).unwrap();
+        engine.put(b"key", b"value").unwrap();
+        std::fs::rename(&path, &moved_path).unwrap();
+
+        let synchronous_error = engine.close().expect_err("flush cannot use the old path");
+        assert_eq!(
+            synchronous_error
+                .downcast_ref::<std::io::Error>()
+                .unwrap()
+                .kind(),
+            std::io::ErrorKind::NotFound
+        );
+        let error = engine
+            .close_async()
+            .await
+            .expect_err("close failure is terminal");
+        let close_error = error.downcast_ref::<AsyncCloseError>().unwrap();
+        assert_eq!(
+            close_error.kind(),
+            AsyncCloseErrorKind::Io(std::io::ErrorKind::NotFound)
+        );
+        assert!(format!("{error:#}").contains(&synchronous_error.to_string()));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn async_close_supports_moved_engine() {
+        let directory = tempfile::tempdir().unwrap();
+        let options = LsmStorageOptions::default_for_test();
+        let engine = Arc::try_unwrap(KvEngine::open(directory.path(), options.clone()).unwrap())
+            .ok()
+            .expect("engine has one public owner");
+        engine.put(b"key", b"value").unwrap();
+
+        engine.close_async().await.unwrap();
+
+        let reopened = KvEngine::open(directory.path(), options).unwrap();
+        assert_eq!(reopened.get(b"key").unwrap().unwrap().as_ref(), b"value");
+        reopened.close().unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn async_close_of_moved_engine_finishes_after_caller_drop() {
+        let directory = tempfile::tempdir().unwrap();
+        let options = LsmStorageOptions::default_for_test();
+        let engine = Arc::try_unwrap(KvEngine::open(directory.path(), options.clone()).unwrap())
+            .ok()
+            .expect("engine has one public owner");
+        // A new Arc does not repair the constructor-time weak reference.
+        let engine = Arc::new(engine);
+        engine.put(b"key", b"value").unwrap();
+        let lifecycle = engine.inner.lifecycle.clone();
+        let guard = lifecycle.admit_write().unwrap();
+        let mut close = Box::pin(engine.close_async());
+        std::future::poll_fn(|context| {
+            assert!(std::future::Future::poll(close.as_mut(), context).is_pending());
+
+            std::task::Poll::Ready(())
+        })
+        .await;
+        drop(close);
+        drop(engine);
+        assert!(
+            !lifecycle.is_closed(),
+            "owned shutdown still has work to drain"
+        );
+        drop(guard);
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while !lifecycle.is_closed() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("owned shutdown finishes after its caller is dropped");
+
+        let reopened = KvEngine::open(directory.path(), options).unwrap();
+        assert_eq!(reopened.get(b"key").unwrap().unwrap().as_ref(), b"value");
+        reopened.close().unwrap();
+    }
 
     #[tokio::test(flavor = "current_thread")]
     async fn async_close_retries_a_rejected_pitr_precondition() {

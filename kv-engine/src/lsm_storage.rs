@@ -1697,16 +1697,17 @@ impl LifecycleHandle {
     }
 
     fn finish_close_with_result(&self, result: &Result<()>) {
-        *self.0.close_error.lock() = result.as_ref().err().map(|error| format!("{error:#}"));
+        *self.0.close_error.lock() = result
+            .as_ref()
+            .err()
+            .map(async_close::CachedCloseError::new);
         self.finish_close();
     }
 
     fn close_result(&self) -> Result<()> {
-        self.0
-            .close_error
-            .lock()
-            .as_ref()
-            .map_or(Ok(()), |error| Err(anyhow!("engine close failed: {error}")))
+        self.0.close_error.lock().as_ref().map_or(Ok(()), |error| {
+            Err(anyhow::Error::new(error.clone()).context("engine close failed"))
+        })
     }
 
     pub(crate) fn is_closed(&self) -> bool {
@@ -1722,7 +1723,7 @@ struct LifecycleState {
     active_txns: AtomicU64,
     wait_lock: Mutex<()>,
     wait_cv: Condvar,
-    close_error: Mutex<Option<String>>,
+    close_error: Mutex<Option<async_close::CachedCloseError>>,
 }
 
 impl LifecycleState {
@@ -1792,10 +1793,11 @@ impl Drop for AdmissionGuard {
     }
 }
 
+#[derive(Clone)]
 struct BackgroundWorkers {
     shutdown: Arc<AtomicU8>,
     shutdown_notify: Arc<tokio::sync::Notify>,
-    runtime_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
+    runtime_thread: Arc<Mutex<Option<std::thread::JoinHandle<()>>>>,
 }
 
 impl BackgroundWorkers {
@@ -1911,7 +1913,7 @@ impl BackgroundWorkers {
         Ok(Self {
             shutdown,
             shutdown_notify,
-            runtime_thread: Mutex::new(Some(runtime_thread)),
+            runtime_thread: Arc::new(Mutex::new(Some(runtime_thread))),
         })
     }
 
@@ -2168,36 +2170,43 @@ impl KvEngine {
     }
 
     fn close_storage(&self) -> Result<()> {
+        Self::close_storage_parts(&self.inner, &self.background_workers)
+    }
+
+    fn close_storage_parts(
+        inner: &LsmStorageInner,
+        background_workers: &BackgroundWorkers,
+    ) -> Result<()> {
         // Route the synchronous close through the same lifecycle transition as
         // `close_async`: reject new admission, wait for in-flight scans/txns/
         // snapshots to drain, then finish. Idempotent: a second call observes
         // CLOSED (or CLOSING) and receives the saved outcome without
         // re-running shutdown.
-        match self.inner.lifecycle.begin_close() {
-            CloseState::AlreadyClosed => return self.inner.lifecycle.close_result(),
+        match inner.lifecycle.begin_close() {
+            CloseState::AlreadyClosed => return inner.lifecycle.close_result(),
             CloseState::AlreadyClosing => {
-                self.inner.lifecycle.wait_for_closed();
-                return self.inner.lifecycle.close_result();
+                inner.lifecycle.wait_for_closed();
+                return inner.lifecycle.close_result();
             }
             CloseState::Started => {}
         }
-        self.background_workers.begin_shutdown(&self.inner);
-        let background_result = self.background_workers.join_blocking();
+        background_workers.begin_shutdown(inner);
+        let background_result = background_workers.join_blocking();
         // Wait for admitted readers (snapshots, async scans/txns) to release
         // before tearing down state. Sync `scan`/`new_txn` do not take a
         // lifecycle guard, so they do not block here.
-        self.inner.lifecycle.wait_for_quiescence();
+        inner.lifecycle.wait_for_quiescence();
         let result = (|| -> Result<()> {
-            if self.inner.options.enable_wal {
-                self.inner.sync_and_close_parallel_wals()?;
+            if inner.options.enable_wal {
+                inner.sync_and_close_parallel_wals()?;
             } else {
                 // flush memtable to imm_memtable
-                let new_id = self.inner.next_sst_id();
-                let new_mt = MemTable::create(new_id, self.inner.vlog.is_some());
-                self.inner.force_freeze_with_new_memtable(new_mt)?;
+                let new_id = inner.next_sst_id();
+                let new_mt = MemTable::create(new_id, inner.vlog.is_some());
+                inner.force_freeze_with_new_memtable(new_mt)?;
                 // flush all imm_memtable to disk
-                while !self.inner.state.load().imm_memtables.is_empty() {
-                    self.inner.force_flush_next_imm_memtable()?;
+                while !inner.state.load().imm_memtables.is_empty() {
+                    inner.force_flush_next_imm_memtable()?;
                 }
             }
 
@@ -2206,7 +2215,7 @@ impl KvEngine {
         // Always finish close, including join and sync errors. Later close
         // callers receive the same terminal outcome.
         let result = background_result.and(result);
-        self.inner.lifecycle.finish_close_with_result(&result);
+        inner.lifecycle.finish_close_with_result(&result);
 
         result
     }
@@ -5160,15 +5169,35 @@ impl KvEngine {
     /// even if the caller cancels, including settling a terminal close error.
     /// Callers share one independent engine-owned thread: shutdown must not
     /// occupy the blocking pool that admitted writes need to finish rotation.
+    /// Non-PITR shutdown also supports an engine moved out of its original
+    /// `Arc`; shared storage and worker handles retain the shutdown owner.
     pub async fn close_async(&self) -> Result<()> {
-        let engine = self
+        let owner = self
             .inner
             .weak_engine
             .get()
-            .and_then(std::sync::Weak::upgrade)
-            .ok_or_else(|| anyhow!("engine handle is no longer available"))?;
+            .and_then(std::sync::Weak::upgrade);
+        let attempt = match owner {
+            Some(engine) => self
+                .async_close
+                .start(&self.inner.lifecycle, move || engine.close()),
+            None => {
+                ensure!(
+                    self.pitr_manifest_state.lock().mode
+                        == crate::pitr::manifest::PitrMode::Disabled,
+                    "engine handle is no longer available for PITR shutdown"
+                );
+                // A moved engine has no canonical Arc to retain. Storage and
+                // background-worker ownership can outlive it independently.
+                let inner = Arc::clone(&self.inner);
+                let background_workers = self.background_workers.clone();
+                self.async_close.start(&self.inner.lifecycle, move || {
+                    Self::close_storage_parts(&inner, &background_workers)
+                })
+            }
+        };
 
-        self.async_close.start(engine).wait().await
+        attempt.wait().await
     }
 
     /// Async point get.
@@ -5521,6 +5550,11 @@ impl KvEngine {
 
     /// Async close for the Drop path — best-effort, uses sync path.
     pub(crate) fn drop_close(&self) {
+        // The shutdown thread retains either the public engine or its storage
+        // and worker handles. Let it drain and publish the final close result.
+        if self.async_close.owns_shutdown() {
+            return;
+        }
         let _ = self.inner.lifecycle.begin_close();
         self.background_workers.begin_shutdown(&self.inner);
         // Detach instead of joining — Drop must not block the executor thread
