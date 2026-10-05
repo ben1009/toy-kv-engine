@@ -2004,11 +2004,17 @@ mod native_async_tests {
     #[tokio::test(flavor = "current_thread")]
     async fn native_async_wal_waits_for_durability_and_wakes_at_the_poison_boundary() {
         let directory = tempfile::tempdir().unwrap();
-        let wal = crate::wal::Wal::create_with_io_mode(
+        let wal = match crate::wal::Wal::create_with_io_mode(
             directory.path().join("probe.wal"),
             crate::wal::WalIoMode::Parallel,
-        )
-        .unwrap();
+        ) {
+            Ok(wal) => wal,
+            Err(error) if crate::tests::harness::is_io_uring_unavailable_error(&error) => {
+                eprintln!("skipping test (io_uring unavailable): {error:#}");
+                return;
+            }
+            Err(error) => panic!("failed to create parallel WAL: {error:#}"),
+        };
         let runtime = wal.parallel_runtime.as_ref().unwrap();
         // Drive only the frontier model in a live runtime with no submitted I/O.
         runtime.inner.admission.lock().next_ticket = 2;
