@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 use sha2::Digest;
 
 mod async_close;
+pub use async_close::{AsyncCloseError, AsyncCloseErrorKind};
 mod native_write;
 mod write_gate;
 
@@ -5278,6 +5279,8 @@ impl KvEngine {
         let inner = self.inner.clone();
         let (has_range, _) = LsmStorageInner::validate_and_classify_write_batch(batch)?;
         if inner.uses_native_async_writes() && !has_range {
+            let runtime = tokio::runtime::Handle::try_current()
+                .context("native async writes require an active Tokio runtime")?;
             let shared = LsmStorageInner::use_owned_batch_publish(batch.len());
             #[cfg(feature = "bench")]
             let started = std::time::Instant::now();
@@ -5296,14 +5299,15 @@ impl KvEngine {
                 .get()
                 .and_then(std::sync::Weak::upgrade)
                 .context("engine handle is no longer available")?;
-            return tokio::spawn(async move {
-                owner
-                    .inner
-                    .write_entries_native(entries, shared, guard)
-                    .await
-            })
-            .await
-            .context("native async commit task failed")?;
+            return runtime
+                .spawn(async move {
+                    owner
+                        .inner
+                        .write_entries_native(entries, shared, guard)
+                        .await
+                })
+                .await
+                .context("native async commit task failed")?;
         }
         let owned: Vec<WriteBatchRecord<Vec<u8>>> = batch
             .iter()

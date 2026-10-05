@@ -1,7 +1,9 @@
 #[cfg(feature = "chaos-testing")]
 use std::time::Instant;
 use std::{
+    future::Future,
     sync::{Arc, Barrier},
+    task::{Context, Poll, Waker},
     thread,
     time::Duration,
 };
@@ -534,6 +536,39 @@ fn test_parallel_wal_engine_publishes_point_and_transaction_commits() {
     engine.close().expect("close parallel WAL engine");
     assert_eq!(state.memtable.parallel_wal_is_closed(), Some(true));
     assert_eq!(state.imm_memtables[0].parallel_wal_is_closed(), Some(true));
+}
+
+#[test]
+fn test_parallel_async_batch_without_tokio_runtime_returns_error() {
+    let dir = tempdir().unwrap();
+    let mut options = LsmStorageOptions::default_for_test();
+    options.enable_wal = true;
+    options.target_sst_size = 1 << 30;
+
+    let engine = match KvEngine::open_with_wal_io_mode(dir.path(), options, WalIoMode::Parallel) {
+        Ok(engine) => engine,
+        Err(error) if is_io_uring_unavailable_error(&error) => {
+            eprintln!("skipping test (io_uring unavailable): {error:#}");
+            return;
+        }
+        Err(error) => panic!("failed to open parallel WAL engine: {error:#}"),
+    };
+
+    let batch = [WriteBatchRecord::Put(
+        b"key".as_slice(),
+        b"value".as_slice(),
+    )];
+    let mut future = Box::pin(engine.write_batch_async(&batch));
+    let mut context = Context::from_waker(Waker::noop());
+    let result = match future.as_mut().poll(&mut context) {
+        Poll::Ready(result) => result,
+        Poll::Pending => panic!("runtime validation should finish before awaiting"),
+    };
+    drop(future);
+
+    let error = result.expect_err("native async writes require a Tokio runtime");
+    assert!(error.to_string().contains("active Tokio runtime"));
+    engine.close().expect("close parallel WAL engine");
 }
 
 #[test]
