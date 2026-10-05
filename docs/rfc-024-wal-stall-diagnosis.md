@@ -1482,3 +1482,145 @@ reproduces the post-flush read delay and an unchanged four-writer binary still
 has a 3.24x paired throughput swing. The firmware intervention consequently
 does not resolve the measurement problem. Its short comparison cannot establish
 an old/new firmware regression or qualify code gains.
+
+### October 3 follow-up: PCI completion visibility and retained-data controls
+
+This follow-up did **not** reproduce the established slow state, so it cannot
+identify its root cause or qualify a mitigation. Artifacts, helper sources,
+protocols, operation timestamps, and complete results are retained under
+`target/rfc024-pcie-stall-20261003-lqx8ncto/`.
+
+A recent upstream [VMD posted-write visibility fix](https://lore-kernel.gnuweeb.org/linux-pci/178835209832.79920.2886314748680261549.b4-ty@b4/T/)
+provided a diagnostic lead: reading a downstream PCI configuration register can
+flush preceding posted writes. That fix targets Meteor Lake VMD `8086:7d0b`;
+this host has Raptor Lake VMD `8086:a77f`. It is not a matching erratum diagnosis.
+
+The standalone helper performed four aligned 4 KiB direct writes to its own
+scratch file, `fdatasync`, then a direct read. An observer alternated no register
+access, a `/dev/zero` sham, VMD identity reads, and SSD endpoint identity reads.
+Each treatment had adjacent untreated controls, with three rotated cycles.
+No device configuration, firmware, kernel, or production Rust code was changed.
+
+| Diagnostic | Result |
+| --- | --- |
+| Fresh-file controls before/after two bounded 150,000-put pressure runs | Read medians 66.871–67.726 µs; no control crossed the predetermined 400 µs gate |
+| Fresh-file 27-phase register-access sweep | Phase read medians 66.874–67.286 µs |
+| Alternating retained/fresh data, six cycles with and without per-group sync | 6,144 groups; post-sync retained-data phase medians 135.763–140.722 µs versus fresh-data 74.571–77.208 µs |
+| Historical pressure binary, paused at 24 checkpoints before standalone probes | No slow-state gate passed; retained-file median changed from about 131 µs to 68 µs, while fresh-file medians remained near 68 µs |
+| Retained-file 27-phase register-access sweep after paused pressure | Phase read medians 67.798–68.032 µs |
+
+The C-helper CSVs contain 27,648 groups across 56 runs; the independent
+`verified-summary.json` recomputes phase medians from raw timestamps. The
+retained reference was opened read-only and its recorded metadata remained
+unchanged. Owned scratch files, pressure databases, and RAM staging directories
+were removed after the runs.
+
+These are non-reproducing diagnostics, not evidence that PCI/VMD visibility is
+innocent. Unlike the earlier raw namespace empty-`FLUSH` reproducer, this helper
+uses dirty-file `fdatasync`; those paths must not be treated as interchangeable.
+The retained/fresh difference and subsequent convergence establish another
+latency change under unchanged code, but do not establish NAND placement,
+garbage collection, or the cause of the earlier 640 µs–8 ms stalls. User-space
+timestamps also cannot substitute for the earlier NVMe publication/CQE trace.
+
+The next discriminating capture needs the actual slow state and synchronized
+NVMe command/CQE tracing while testing endpoint configuration reads. Until then,
+controller flush handling remains the leading explanation from the earlier
+traces, with PCIe completion visibility and the internal state transition still
+unresolved. Repeating WAL throughput measurements alone cannot settle this.
+
+### October 4 privileged follow-up: slow-state capture and PCIe intervention
+
+After sudo authentication was available, the slow state was captured with NVMe
+submission, completion, and passive CQ-head sampling. This supersedes the
+preceding follow-up's lack of a slow-state capture, but does not establish an
+internal firmware mechanism. Sources, scripts, raw CSVs, traces, and the
+timestamp-matching analyzer are in `target/rfc024-pcie-traced-l_dlq24q/`.
+
+The initial tracer in `target/rfc024-pcie-traced-7_dshb7g/` aborted with
+`std::bad_alloc`; its pressure workload was interrupted and its incomplete
+results retained. The successful retry reduced the map limit from 65,536 to
+1,024 and restricted command tracking to the probe process. It records probe
+commands, not a complete device-wide command inventory.
+
+The paused-pressure probe reached the slow-state gate at checkpoint 10:
+
+| Probe | Read median | Read p99 | Maximum |
+| --- | ---: | ---: | ---: |
+| Retained file, after scratch-file writes and sync | 683.173 µs | 8,103.348 µs | 14,971.112 µs |
+| Adjacent fresh-file control | 72.280 µs | 77.281 µs | 79.164 µs |
+
+All 256 reads in each control matched one NVMe command and one CQ polling
+record. The retained-file command with the 14.97 ms read had 150 observations
+of a not-ready CQ head and no ready observation. Its last not-ready observation
+was 3.836 µs before the completion marker. The slow read consequently did not
+spend that interval waiting behind an already-visible completion.
+
+The initial untreated phase of the following retained-file sweep remained
+slow, then subsequent phase medians returned to approximately 72 µs. The first
+treatment was the `/dev/zero` sham. This transient recovery is not evidence
+that either PCIe treatment cured the state. Adjacent old/new controls are also
+not simultaneous and cannot establish physical NAND placement.
+
+A separate, privileged helper opened the reference and namespace read-only,
+issued namespace `FLUSH` commands, and read the retained reference without
+data writes. The tracer remained active throughout its 27-phase sweep:
+
+| Treatment during pending reads | Reads | Median read | Median intervention duration |
+| --- | ---: | ---: | ---: |
+| No register access | 4,608 | 676.097 µs | — |
+| `/dev/zero` sham | 768 | 676.149 µs | 0.144 µs |
+| VMD PCI identity read | 768 | 676.203 µs | 1.015 µs |
+| SSD endpoint PCI identity read | 768 | 676.154 µs | 0.712 µs |
+
+All 6,912 reads matched a successful NVMe read, a driver-publication marker,
+and a CQ sampling record. Median publication-to-completion-marker time was
+662.045 µs; the median completion-marker-to-request-completion interval was
+1 µs (maximum 4 µs). CQ polling recorded 45,849 not-ready and 218 ready samples.
+These are sampled observations, not an exact timestamp for the first visible
+CQE. The completion marker is derived from the existing driver tracing hooks.
+
+The paired namespace `FLUSH` command itself had an 18 µs median and 23 µs p99,
+with an 8,150 µs maximum. The following retained-file read was submitted a
+median 8.1 µs after the prior flush completion and still took 676.1 µs median.
+This separates the common read delay from waiting for the preceding flush
+command: the delayed interval is in the subsequent read's device service, while
+some flush commands also have separate long outliers.
+
+Every endpoint-treated read contained a completed configuration read. Across
+those reads, 8,925 endpoint accesses completed with more than 400 µs still
+remaining before the direct read returned. The intervention did not collapse
+the delay. This weighs against the tested hypothesis of a completed command
+whose preceding posted completion writes become visible upon endpoint config
+access; it does not exclude every PCIe/platform mechanism.
+
+The state subsequently returned to fast. Fifteen no-flush/flush/delayed-read
+control phases could not reproduce it: ordinary reads had phase medians
+19.114–27.567 µs, empty-flush reads 64.798–64.914 µs, and reads after an explicit
+700 µs post-flush wait 55.719–56.197 µs. The inserted wait is additional latency,
+not an optimization, and these fast-state controls do not explain the transition.
+
+Two additional fixed-order controls checked instrumentation effects:
+
+- With logs in RAM, traced/untraced/untraced/traced sweeps had read medians
+  66.405 / 64.624 / 64.663 / 66.456 µs.
+- With tracing enabled, SSD/RAM/RAM/SSD log destinations had read medians
+  66.505 / 66.426 / 66.456 / 66.437 µs.
+
+Each sweep contained 6,912 reads. Neither control reproduced the slow state;
+they establish modest instrumentation overhead in the fast state, not proof
+that tracing cannot perturb a pressure-induced transition. A failed initial
+RAM-control attempt lacked `rg` in root's PATH and ran no probe; its logs were
+preserved before retrying with `grep`.
+
+The supported root-cause level is the NVMe device service path: **the long read
+stalls occur before completion becomes visible to the host, and repeated
+successful endpoint configuration reads do not release them.** In the empty
+flush sweep, the common ~676 µs wait is serviced by the read after a normally
+quick flush; a smaller set of flush commands also has multi-millisecond
+outliers. This rules out WAL scheduling, ext4 alone, userspace wakeup delay, and
+late handling of an already-visible CQE as explanations for the captured
+interval. It does not reveal the controller's internal cause or prove that
+`FLUSH` causes each slow read. The transition from slow to fast remains
+unexplained. No production WAL code, durability policy, firmware, or device
+setting was changed, and these diagnostics do not qualify throughput gains.

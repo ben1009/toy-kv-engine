@@ -17,6 +17,14 @@ sixteen writers show regressions of 16.8% and 15.4%; rotation still has large
 slow intervals. No case passes the full throughput-and-latency stability
 screen, and no incremental gain or adoption pass is established.
 
+[The October 4 controlled comparison](rfc-024-controlled-comparison-20261004.md)
+adds an identical-binary control pair after each balanced comparison block.
+All 114 runs complete. Paired throughput changes at four, eight, and sixteen
+writers are -17.6%, -17.8%, and -14.6%; every case fails the full stability
+screen. Eight and sixteen writers also show about 60% and 54% more sync calls
+in the retained candidate. These descriptive results do not qualify a gain or
+an adoption pass.
+
 [The sync-cutoff investigation](rfc-024-sync-cutoff-investigation-20261003.md)
 isolates the subsequent fixed-cutoff change: a one-line diagnostic reduces
 sync calls in every block and restores larger sync batches. Its throughput
