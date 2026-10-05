@@ -955,6 +955,17 @@ fn test_parallel_wal_full_rotates_point_transaction_and_batch_writes() {
 #[cfg(feature = "chaos-testing")]
 #[test]
 fn failpoint_parallel_wal_rotation_reruns_transaction_conflict_check() {
+    parallel_wal_rotation_reruns_transaction_conflict_check(false);
+}
+
+#[cfg(feature = "chaos-testing")]
+#[test]
+fn failpoint_parallel_async_wal_rotation_reruns_transaction_conflict_check() {
+    parallel_wal_rotation_reruns_transaction_conflict_check(true);
+}
+
+#[cfg(feature = "chaos-testing")]
+fn parallel_wal_rotation_reruns_transaction_conflict_check(async_commit: bool) {
     const TEST_WAL_CAP: u64 = 1 << 20;
     const LARGE_VALUE_LEN: usize = 60 * 1024;
 
@@ -991,7 +1002,13 @@ fn failpoint_parallel_wal_rotation_reruns_transaction_conflict_check() {
     transaction.put(b"transaction-only", &large_value).unwrap();
 
     let rotation_gate = crate::chaos::failpoint::arm_parallel_wal_txn_rotation_gate();
-    let commit = thread::spawn(move || transaction.commit());
+    let commit = thread::spawn(move || {
+        if async_commit {
+            crate::future_ext::block_on(transaction.commit_async())
+        } else {
+            transaction.commit()
+        }
+    });
     assert!(
         rotation_gate.wait_until_entered(Duration::from_secs(10)),
         "transaction should pause after WAL-full admission and before rotation"
@@ -1151,11 +1168,22 @@ fn test_parallel_wal_full_rotates_range_tombstone_write() {
 
 #[cfg(target_os = "linux")]
 #[test]
-fn test_parallel_selector_rejects_async_writes_during_v5_successor() {
+fn test_parallel_async_writes_preserve_the_v5_successor_path() {
+    for serializable in [false, true] {
+        for version in [
+            crate::pitr::WAL_V5_VERSION_LEGACY,
+            crate::pitr::WAL_V5_VERSION,
+        ] {
+            parallel_async_writes_preserve_the_pitr_successor_path(serializable, version);
+        }
+    }
+}
+
+fn parallel_async_writes_preserve_the_pitr_successor_path(serializable: bool, version: u16) {
     let dir = tempdir().unwrap();
     let mut options = LsmStorageOptions::default_for_test();
     options.enable_wal = true;
-    options.serializable = true;
+    options.serializable = serializable;
     let engine = match KvEngine::open_with_wal_io_mode(dir.path(), options, WalIoMode::Parallel) {
         Ok(engine) => engine,
         Err(error) if is_io_uring_unavailable_error(&error) => {
@@ -1166,7 +1194,7 @@ fn test_parallel_selector_rejects_async_writes_during_v5_successor() {
     };
 
     let header = crate::pitr::WalV5Header {
-        wal_format_version: crate::pitr::WAL_V5_VERSION,
+        wal_format_version: version,
         timeline_id: crate::pitr::TimelineId([1; 16]),
         archive_epoch_id: crate::pitr::ArchiveEpochId([2; 16]),
         segment_id: crate::pitr::SegmentId(3),
@@ -1184,17 +1212,26 @@ fn test_parallel_selector_rejects_async_writes_during_v5_successor() {
     assert!(engine.inner.state.load().memtable.uses_wal_v5());
     assert!(engine.inner.selects_parallel_wal_io());
 
-    let error = crate::future_ext::block_on(engine.put_async(b"async", b"value"))
-        .expect_err("async write must remain disabled while v5 is active");
-    assert!(error.to_string().contains("parallel WAL"));
+    crate::future_ext::block_on(engine.put_async(b"async", b"value"))
+        .expect("async write uses the existing v5 blocking path");
+    assert_eq!(
+        engine.get(b"async").unwrap().as_deref(),
+        Some(b"value".as_slice())
+    );
+    assert!(engine.inner.state.load().memtable.uses_wal_v5());
 
     let txn = engine.new_txn().expect("start transaction");
     txn.put(b"txn", b"value").unwrap();
-    let error = crate::future_ext::block_on(txn.commit_async())
-        .expect_err("async transaction must remain disabled while v5 is active");
-    assert!(error.to_string().contains("parallel WAL"));
+    crate::future_ext::block_on(txn.commit_async())
+        .expect("async transaction preserves v5 OCC and WAL semantics");
+    assert_eq!(
+        engine.get(b"txn").unwrap().as_deref(),
+        Some(b"value".as_slice())
+    );
+    assert!(engine.inner.state.load().memtable.uses_wal_v5());
 
-    engine.close().expect("close parallel WAL engine");
+    crate::future_ext::block_on(engine.close_async())
+        .expect("close parallel selector with v5 active");
 }
 
 #[test]

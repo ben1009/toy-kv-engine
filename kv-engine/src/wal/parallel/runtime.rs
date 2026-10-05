@@ -52,6 +52,7 @@ impl std::error::Error for WalFull {}
 struct BufferBudget {
     state: Mutex<BufferBudgetState>,
     available: Condvar,
+    async_available: tokio::sync::Notify,
 }
 
 #[derive(Debug)]
@@ -72,6 +73,7 @@ impl BufferBudget {
                 closed: false,
             }),
             available: Condvar::new(),
+            async_available: tokio::sync::Notify::new(),
         }
     }
 
@@ -120,6 +122,59 @@ impl BufferBudget {
         }
     }
 
+    async fn reserve_async(&self, bytes: u64) -> Result<()> {
+        ensure!(
+            bytes <= MAX_BUFFER_CAPACITY,
+            "WAL batch exceeds the direct-buffer capacity limit"
+        );
+        let oversized = bytes > NORMAL_ACTIVE_BUFFER_BUDGET;
+        let mut waiter = OversizedBudgetWaiter {
+            budget: self,
+            registered: false,
+        };
+        if oversized {
+            let mut state = self.state.lock();
+            state.oversized_waiters = state
+                .oversized_waiters
+                .checked_add(1)
+                .ok_or_else(|| anyhow!("oversized WAL buffer waiter count overflow"))?;
+            waiter.registered = true;
+        }
+        let notification = self.async_available.notified();
+        tokio::pin!(notification);
+        loop {
+            notification.as_mut().enable();
+            {
+                let mut state = self.state.lock();
+                ensure!(!state.closed, "parallel WAL is closed");
+                let fits = if oversized {
+                    state.active_bytes == 0 && !state.oversized_active
+                } else {
+                    !state.oversized_active
+                        && state.oversized_waiters == 0
+                        && state
+                            .active_bytes
+                            .checked_add(bytes)
+                            .is_some_and(|active| active <= NORMAL_ACTIVE_BUFFER_BUDGET)
+                };
+                if fits {
+                    if oversized {
+                        state.oversized_waiters -= 1;
+                        waiter.registered = false;
+                    }
+                    state.active_bytes = state
+                        .active_bytes
+                        .checked_add(bytes)
+                        .ok_or_else(|| anyhow!("WAL buffer budget overflow"))?;
+                    state.oversized_active = oversized;
+                    return Ok(());
+                }
+            }
+            notification.as_mut().await;
+            notification.set(self.async_available.notified());
+        }
+    }
+
     fn release(&self, bytes: u64) {
         let mut state = self.state.lock();
         state.active_bytes = state
@@ -131,11 +186,30 @@ impl BufferBudget {
             state.oversized_active = false;
         }
         self.available.notify_all();
+        self.async_available.notify_waiters();
     }
 
     fn close(&self) {
         self.state.lock().closed = true;
         self.available.notify_all();
+        self.async_available.notify_waiters();
+    }
+}
+
+/// Cancellation before allocation must not leave ordinary producers behind
+/// an oversized waiter that no longer exists.
+struct OversizedBudgetWaiter<'a> {
+    budget: &'a BufferBudget,
+    registered: bool,
+}
+
+impl Drop for OversizedBudgetWaiter<'_> {
+    fn drop(&mut self) {
+        if self.registered {
+            self.budget.state.lock().oversized_waiters -= 1;
+            self.budget.available.notify_all();
+            self.budget.async_available.notify_waiters();
+        }
     }
 }
 
@@ -248,12 +322,21 @@ struct DurabilityState {
 struct DurabilityShared {
     state: Mutex<DurabilityState>,
     changed: Condvar,
+    async_changed: tokio::sync::Notify,
+}
+
+impl DurabilityShared {
+    fn notify_change(&self) {
+        self.changed.notify_all();
+        self.async_changed.notify_waiters();
+    }
 }
 
 struct RuntimeInner {
     admission: Mutex<AdmissionState>,
     packer_state: Mutex<PackerState>,
     packer_failures: Mutex<Option<Sender<GroupWriteResult>>>,
+    packer_wake: Sender<bool>,
     #[cfg(test)]
     file_size_limit: std::sync::atomic::AtomicU64,
     buffer_budget: Arc<BufferBudget>,
@@ -265,6 +348,7 @@ struct RuntimeInner {
 }
 
 struct RuntimeThreads {
+    packer: Option<JoinHandle<Result<()>>>,
     worker: Option<IoWorker<ParallelBuffer>>,
     coordinator: Option<JoinHandle<Result<()>>>,
     closed: bool,
@@ -461,7 +545,9 @@ impl ParallelWalRuntime {
         let durability = Arc::new(DurabilityShared {
             state: Mutex::new(DurabilityState::default()),
             changed: Condvar::new(),
+            async_changed: tokio::sync::Notify::new(),
         });
+        let (packer_wake, packer_requests) = crossbeam_channel::bounded(1);
         let inner = Arc::new(RuntimeInner {
             admission: Mutex::new(AdmissionState {
                 open: true,
@@ -478,6 +564,7 @@ impl ParallelWalRuntime {
                 initializer,
             }),
             packer_failures: Mutex::new(Some(packer_failures_tx)),
+            packer_wake,
             #[cfg(test)]
             file_size_limit: std::sync::atomic::AtomicU64::new(MAX_WAL_FILE_SIZE),
             buffer_budget,
@@ -491,8 +578,21 @@ impl ParallelWalRuntime {
         let coordinator_inner = Arc::clone(&inner);
         let coordinator = match thread::Builder::new()
             .name("wal-sync-coordinator".to_owned())
-            .spawn(move || run_sync_coordinator(sync_file, worker_completions, coordinator_inner))
-        {
+            .spawn(move || {
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    run_sync_coordinator(
+                        sync_file,
+                        worker_completions,
+                        Arc::clone(&coordinator_inner),
+                    )
+                })) {
+                    Ok(result) => result,
+                    Err(_) => {
+                        poison_unacknowledged(&coordinator_inner, "WAL sync coordinator panicked");
+                        Err(anyhow!("WAL sync coordinator panicked"))
+                    }
+                }
+            }) {
             Ok(join) => join,
             Err(error) => {
                 let _ = worker.close();
@@ -500,9 +600,36 @@ impl ParallelWalRuntime {
             }
         };
 
+        let packer_inner = Arc::clone(&inner);
+        let packer = match thread::Builder::new()
+            .name("wal-ordered-packer".to_owned())
+            .spawn(move || {
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    while let Ok(true) = packer_requests.recv() {
+                        pack_admitted_groups(&packer_inner, packer_inner.packer_state.lock())?;
+                    }
+                    Ok(())
+                })) {
+                    Ok(result) => result,
+                    Err(_) => {
+                        poison_unacknowledged(&packer_inner, "WAL ordered packer panicked");
+                        Err(anyhow!("WAL ordered packer panicked"))
+                    }
+                }
+            }) {
+            Ok(join) => join,
+            Err(error) => {
+                inner.packer_failures.lock().take();
+                let _ = worker.close();
+                let _ = coordinator.join();
+                return Err(error).context("failed to spawn WAL ordered packer");
+            }
+        };
+
         Ok(Self {
             inner,
             threads: Mutex::new(RuntimeThreads {
+                packer: Some(packer),
                 worker: Some(worker),
                 coordinator: Some(coordinator),
                 closed: false,
@@ -516,6 +643,18 @@ impl ParallelWalRuntime {
         let capacity_u64 = u64::try_from(capacity).context("WAL buffer capacity exceeds u64")?;
         self.inner.buffer_budget.reserve(capacity_u64)?;
 
+        Ok(self.activate_buffer(capacity, capacity_u64))
+    }
+
+    pub(crate) async fn allocate_buffer_async(&self, capacity: usize) -> Result<ParallelBuffer> {
+        let capacity = DirectBuf::align_up(capacity.max(BUFFER_POOL_BUF_SIZE));
+        let capacity_u64 = u64::try_from(capacity).context("WAL buffer capacity exceeds u64")?;
+        self.inner.buffer_budget.reserve_async(capacity_u64).await?;
+
+        Ok(self.activate_buffer(capacity, capacity_u64))
+    }
+
+    fn activate_buffer(&self, capacity: usize, capacity_u64: u64) -> ParallelBuffer {
         let direct_buffer = match self.inner.buffer_pool.pop() {
             Some(mut pooled) if pooled.cap() >= capacity => {
                 pooled.release_budget();
@@ -531,11 +670,11 @@ impl ParallelWalRuntime {
             None => DirectBuf::new(capacity),
         };
 
-        Ok(ParallelBuffer::activate(
+        ParallelBuffer::activate(
             direct_buffer,
             Arc::clone(&self.inner.buffer_budget),
             capacity_u64,
-        ))
+        )
     }
 
     pub(crate) fn admit(&self, buffer: ParallelBuffer, aligned_len: usize) -> Result<u64> {
@@ -618,18 +757,10 @@ impl ParallelWalRuntime {
         debug_assert!(state.admitted_end <= MAX_WAL_FILE_SIZE);
         debug_assert_eq!(state.next_ticket, ticket + 1);
 
-        // If no other writer is packing, this writer drains the queue. A
-        // current packer observes this ticket before releasing its mutex,
-        // while the admission lock is still held, so work cannot be stranded.
-        let packer = self.inner.packer_state.try_lock();
         drop(state);
-        if let Some(packer) = packer
-            && let Err(error) = pack_admitted_groups(&self.inner, packer)
-        {
-            // This ticket is already admitted. Packing failures are reported
-            // through the poison boundary observed by wait_durable(ticket).
-            log::error!("parallel WAL packer failed: {error:#}");
-        }
+        // One queued wake is sufficient: the dedicated packer drains admission.
+        // Disk allocation and extent initialization never run on a producer.
+        let _ = self.inner.packer_wake.try_send(true);
 
         Ok(ticket)
     }
@@ -696,6 +827,33 @@ impl ParallelWalRuntime {
         self.wait_durable(cutoff - 1)
     }
 
+    pub(crate) async fn wait_durable_async(&self, ticket: u64) -> Result<()> {
+        let assigned = self.inner.admission.lock().next_ticket;
+        ensure!(ticket < assigned, "unassigned parallel WAL ticket {ticket}");
+        let notification = self.inner.durability.async_changed.notified();
+        tokio::pin!(notification);
+        loop {
+            // Register before reading the predicate; completion may race with
+            // this check and the subsequent await without losing the wakeup.
+            notification.as_mut().enable();
+            {
+                let state = self.inner.durability.state.lock();
+                if state.durable_frontier > ticket {
+                    return Ok(());
+                }
+                if state.poison_ticket.is_some_and(|poison| ticket >= poison) {
+                    let message = state
+                        .poison_error
+                        .as_deref()
+                        .unwrap_or("WAL durability failed");
+                    bail!("WAL ticket {ticket} failed at poison boundary: {message}");
+                }
+            }
+            notification.as_mut().await;
+            notification.set(self.inner.durability.async_changed.notified());
+        }
+    }
+
     pub(crate) fn wait_durable(&self, ticket: u64) -> Result<()> {
         let mut state = self.inner.durability.state.lock();
         let assigned = self.inner.admission.lock().next_ticket;
@@ -740,6 +898,18 @@ impl ParallelWalRuntime {
         self.inner.buffer_budget.close();
 
         let mut close_error = None;
+        let _ = self.inner.packer_wake.send(false);
+        if let Some(packer) = threads.packer.take() {
+            match packer.join() {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    close_error = Some(format!("packer failed: {error:#}"));
+                }
+                Err(_) => {
+                    close_error = Some("WAL ordered packer panicked".to_owned());
+                }
+            }
+        }
         let packer = self.inner.packer_state.lock();
         if let Err(error) = pack_admitted_groups(&self.inner, packer) {
             close_error = Some(format!("packer failed: {error:#}"));
@@ -817,8 +987,8 @@ fn pack_admitted_groups(
                         packer.next_ticket
                     );
                 }
-                // Release in this lock order to pair with admission's
-                // nonblocking packer try_lock and prevent stranded tickets.
+                // The dedicated packer drains all admitted work before
+                // returning to its coalesced wake channel.
                 drop(packer);
                 return Ok(());
             }
@@ -997,6 +1167,20 @@ fn report_packer_failure(inner: &RuntimeInner, ticket: u64, error: &anyhow::Erro
     }
 }
 
+/// A task panic has an unknown boundary. Preserve every acknowledged ticket,
+/// stop admission and wake both kinds of waiter before the task terminates.
+fn poison_unacknowledged(inner: &RuntimeInner, message: &str) {
+    let mut state = inner.durability.state.lock();
+    let boundary = state.durable_frontier;
+    set_poison(&mut state, boundary, message.to_owned());
+    let mut admission = inner.admission.lock();
+    admission.open = false;
+    admission.poison = Some((boundary, message.to_owned()));
+    admission.queue.clear();
+    inner.buffer_budget.close();
+    inner.durability.notify_change();
+}
+
 fn run_sync_coordinator(
     sync_file: Arc<File>,
     completions: Receiver<GroupWriteResult>,
@@ -1107,7 +1291,7 @@ fn process_group_result(inner: &RuntimeInner, result: GroupWriteResult) {
     // A successful write CQE only advances the written frontier. Durability
     // waiters can finish after fdatasync; poison must wake them immediately.
     if failed {
-        inner.durability.changed.notify_all();
+        inner.durability.notify_change();
     }
     drop(state);
 
@@ -1138,7 +1322,7 @@ fn terminalize_unresolved_prefix(inner: &RuntimeInner) {
         }
         inner.buffer_budget.close();
     }
-    inner.durability.changed.notify_all();
+    inner.durability.notify_change();
 }
 
 fn set_poison(state: &mut DurabilityState, ticket: u64, error: String) {
@@ -1244,7 +1428,7 @@ fn synchronize_written_prefix(sync_file: &File, inner: &RuntimeInner) -> Result<
             debug_assert!(state.durable_frontier <= poison);
         }
         debug_assert!(state.written_frontier <= inner.admission.lock().next_ticket);
-        inner.durability.changed.notify_all();
+        inner.durability.notify_change();
         drop(state);
         inner.sync_progress.mark_durable(acknowledged);
 
@@ -1268,7 +1452,7 @@ fn synchronize_written_prefix(sync_file: &File, inner: &RuntimeInner) -> Result<
     // Publish the admission poison before waking writers that are waiting on
     // this failed sync. Otherwise a waiter can return `Err` and race a new
     // batch into the still-open admission queue.
-    inner.durability.changed.notify_all();
+    inner.durability.notify_change();
 
     Ok(Some(sync_latency))
 }
@@ -1806,5 +1990,113 @@ mod tests {
         let mut batch = [0; 5];
         file.read_exact_at(&mut batch, PREALLOC_BLOCK - 5).unwrap();
         assert_eq!(&batch, b"batch");
+    }
+}
+
+#[cfg(test)]
+mod native_async_tests {
+    use super::*;
+    use std::{
+        future::{Future, poll_fn},
+        task::Poll,
+    };
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn native_async_wal_waits_for_durability_and_wakes_at_the_poison_boundary() {
+        let directory = tempfile::tempdir().unwrap();
+        let wal = crate::wal::Wal::create_with_io_mode(
+            directory.path().join("probe.wal"),
+            crate::wal::WalIoMode::Parallel,
+        )
+        .unwrap();
+        let runtime = wal.parallel_runtime.as_ref().unwrap();
+        // Drive only the frontier model in a live runtime with no submitted I/O.
+        runtime.inner.admission.lock().next_ticket = 2;
+        let first = runtime.wait_durable_async(0);
+        let second = runtime.wait_durable_async(1);
+        tokio::pin!(first, second);
+        poll_fn(|cx| {
+            assert!(first.as_mut().poll(cx).is_pending());
+            assert!(second.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        runtime.inner.durability.state.lock().written_frontier = 2;
+        runtime.inner.durability.notify_change();
+        poll_fn(|cx| {
+            assert!(
+                first.as_mut().poll(cx).is_pending(),
+                "written is not durable"
+            );
+            assert!(second.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        {
+            let mut state = runtime.inner.durability.state.lock();
+            set_poison(&mut state, 1, "injected later-group failure".to_owned());
+        }
+        runtime.inner.durability.notify_change();
+        assert!(second.await.is_err());
+        poll_fn(|cx| {
+            assert!(
+                first.as_mut().poll(cx).is_pending(),
+                "earlier written prefix can still sync"
+            );
+            Poll::Ready(())
+        })
+        .await;
+        runtime.inner.durability.state.lock().durable_frontier = 1;
+        runtime.inner.durability.notify_change();
+        first.await.unwrap();
+        assert!(runtime.wait_durable_async(2).await.is_err());
+        assert!(wal.close().is_err());
+    }
+}
+
+#[cfg(test)]
+mod async_budget_tests {
+    use super::*;
+    use std::{
+        future::{Future, poll_fn},
+        task::Poll,
+    };
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn native_async_cancelled_oversized_budget_waiter_does_not_starve_ordinary_writes() {
+        let budget = BufferBudget::new();
+        budget.reserve(4096).unwrap();
+        let mut oversized = Box::pin(budget.reserve_async(NORMAL_ACTIVE_BUFFER_BUDGET + 4096));
+        let mut ordinary = Box::pin(budget.reserve_async(4096));
+        poll_fn(|cx| {
+            assert!(oversized.as_mut().poll(cx).is_pending());
+            assert!(ordinary.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        drop(oversized);
+        ordinary.await.unwrap();
+        assert_eq!(budget.state.lock().active_bytes, 8192);
+        assert_eq!(budget.state.lock().oversized_waiters, 0);
+        budget.release(8192);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn native_async_budget_close_wakes_ordinary_and_oversized_waiters() {
+        let budget = BufferBudget::new();
+        budget.reserve(NORMAL_ACTIVE_BUFFER_BUDGET).unwrap();
+        let mut ordinary = Box::pin(budget.reserve_async(4096));
+        let mut oversized = Box::pin(budget.reserve_async(NORMAL_ACTIVE_BUFFER_BUDGET + 4096));
+        poll_fn(|cx| {
+            assert!(ordinary.as_mut().poll(cx).is_pending());
+            assert!(oversized.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        budget.close();
+        assert!(ordinary.await.is_err());
+        assert!(oversized.await.is_err());
+        assert_eq!(budget.state.lock().oversized_waiters, 0);
+        budget.release(NORMAL_ACTIVE_BUFFER_BUDGET);
     }
 }

@@ -1626,6 +1626,86 @@ impl MemTable {
         Ok(Some(ticket))
     }
 
+    pub(crate) fn uses_parallel_wal(&self) -> bool {
+        self.wal.as_ref().is_some_and(Wal::is_parallel)
+    }
+
+    pub(crate) async fn prepare_wal_buffer_async(
+        &self,
+        entries_size: usize,
+    ) -> Result<crate::wal::EncodedWalBuffer> {
+        let wal = self
+            .wal
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("memtable has no WAL"))?;
+        #[cfg(feature = "bench")]
+        let started = Instant::now();
+        let buffer = wal.prepare_point_buffer_async(entries_size).await?;
+        #[cfg(feature = "bench")]
+        self.write_profile
+            .load()
+            .record_wal_prepare_ns(started.elapsed().as_nanos() as u64);
+
+        Ok(buffer)
+    }
+
+    pub(crate) fn write_wal_prepared_batch_only(
+        &self,
+        data: &[(Bytes, Bytes)],
+        buffer: crate::wal::EncodedWalBuffer,
+    ) -> Result<Option<u64>> {
+        let wal = self
+            .wal
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("memtable has no WAL"))?;
+        let commit_ts = data
+            .first()
+            .and_then(|(key, _)| crate::key::extract_ts(key))
+            .unwrap_or(0);
+        debug_assert!(
+            data.iter()
+                .all(|(key, _)| crate::key::extract_ts(key).unwrap_or(0) == commit_ts)
+        );
+        #[cfg(feature = "bench")]
+        let started = Instant::now();
+        #[cfg(feature = "bench")]
+        let ticket = wal.put_owned_prepared_batch(
+            data,
+            commit_ts,
+            buffer,
+            Some(&self.write_profile.load()),
+        )?;
+        #[cfg(not(feature = "bench"))]
+        let ticket = wal.put_owned_prepared_batch(data, commit_ts, buffer, None)?;
+        self.last_ticket
+            .fetch_max(ticket + 1, std::sync::atomic::Ordering::Release);
+        #[cfg(feature = "bench")]
+        self.write_profile.load().wal_write_ns.fetch_add(
+            started.elapsed().as_nanos() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+
+        Ok(Some(ticket))
+    }
+
+    pub(crate) async fn commit_wal_ticket_async(&self, ticket: Option<u64>) -> Result<()> {
+        let Some(ticket) = ticket else {
+            return Ok(());
+        };
+        let wal = self
+            .wal
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("memtable has no WAL"))?;
+        let started = Instant::now();
+        let result = wal.wait_durable_async(ticket).await;
+        self.write_profile.load().wal_sync_ns.fetch_add(
+            started.elapsed().as_nanos() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+
+        result
+    }
+
     pub(crate) fn uses_wal_v5(&self) -> bool {
         self.wal.as_ref().is_some_and(|wal| wal.is_v5())
     }

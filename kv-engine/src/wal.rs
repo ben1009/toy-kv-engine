@@ -10,7 +10,7 @@ use std::{
 #[cfg(feature = "bench")]
 use std::time::Instant;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 use bytes::{Buf, BufMut, Bytes};
 use crossbeam_queue::ArrayQueue;
 use crossbeam_skiplist::SkipMap;
@@ -282,7 +282,7 @@ struct TicketedBuf {
     pitr_entry: Option<crate::pitr::seal::SealEntry>,
 }
 
-enum EncodedWalBuffer {
+pub(crate) enum EncodedWalBuffer {
     Leader(DirectBuf),
     Parallel(parallel_runtime::ParallelBuffer),
 }
@@ -294,6 +294,12 @@ impl EncodedWalBuffer {
             Self::Parallel(buffer) => buffer.direct_mut(),
         }
     }
+}
+
+struct PointBatchLayout<'a> {
+    validated: &'a [(u16, u16)],
+    entries_size: usize,
+    entry_count: u32,
 }
 
 struct PitrSealAccumulator {
@@ -882,12 +888,16 @@ impl Wal {
     fn encode_and_push_direct_buf<T: WalPointEntry>(
         &self,
         data: &[T],
-        validated: &[(u16, u16)],
-        entries_size: usize,
+        layout: PointBatchLayout<'_>,
         commit_ts: u64,
-        entry_count: u32,
         profile: Option<&crate::mem_table::WriteProfile>,
+        prepared: Option<EncodedWalBuffer>,
     ) -> Result<u64> {
+        let PointBatchLayout {
+            validated,
+            entries_size,
+            entry_count,
+        } = layout;
         anyhow::ensure!(
             self.format_version == WAL_FORMAT_VERSION_V4,
             "v4 WAL encoder selected for format {}",
@@ -926,7 +936,14 @@ impl Wal {
         );
         let alloc_size = DirectBuf::align_up(total_size).max(BUFFER_POOL_BUF_SIZE);
 
-        let mut buf = self.allocate_encoded_buffer(alloc_size)?;
+        let mut buf = match prepared {
+            Some(buffer) => buffer,
+            None => self.allocate_encoded_buffer(alloc_size)?,
+        };
+        ensure!(
+            buf.direct_mut().cap() >= alloc_size,
+            "prepared WAL buffer is too small"
+        );
         buf.direct_mut().clear();
         #[cfg(feature = "bench")]
         if let Some(profile) = profile {
@@ -2261,7 +2278,7 @@ impl Wal {
         data: &[(KeySlice<'_>, &[u8])],
         commit_ts: u64,
     ) -> Result<u64> {
-        self.put_batch_entries_inner(data, commit_ts, None)
+        self.put_batch_entries_inner(data, commit_ts, None, None)
     }
 
     #[cfg(feature = "bench")]
@@ -2271,7 +2288,7 @@ impl Wal {
         commit_ts: u64,
         profile: &crate::mem_table::WriteProfile,
     ) -> Result<u64> {
-        self.put_batch_entries_inner(data, commit_ts, Some(profile))
+        self.put_batch_entries_inner(data, commit_ts, Some(profile), None)
     }
 
     #[cfg(not(feature = "bench"))]
@@ -2280,7 +2297,7 @@ impl Wal {
         data: &[(bytes::Bytes, bytes::Bytes)],
         commit_ts: u64,
     ) -> Result<u64> {
-        self.put_batch_entries_inner(data, commit_ts, None)
+        self.put_batch_entries_inner(data, commit_ts, None, None)
     }
 
     #[cfg(feature = "bench")]
@@ -2290,11 +2307,59 @@ impl Wal {
         commit_ts: u64,
         profile: &crate::mem_table::WriteProfile,
     ) -> Result<u64> {
-        self.put_batch_entries_inner(data, commit_ts, Some(profile))
+        self.put_batch_entries_inner(data, commit_ts, Some(profile), None)
+    }
+
+    /// Prepare resident memory before consuming an MVCC timestamp or WAL ticket.
+    pub(crate) async fn prepare_point_buffer_async(
+        &self,
+        entries_size: usize,
+    ) -> Result<EncodedWalBuffer> {
+        ensure!(
+            entries_size <= u32::MAX as usize,
+            "batch entries_size exceeds u32::MAX"
+        );
+        let total = entries_size
+            .checked_add(V4_BATCH_HEADER_SIZE)
+            .context("batch size overflow")?;
+        ensure!(
+            total as u64 <= MAX_WAL_FILE_SIZE,
+            "batch total_size exceeds maximum WAL file size"
+        );
+        let runtime = self
+            .parallel_runtime
+            .as_ref()
+            .context("native admission requires a parallel v4 WAL")?;
+        let buffer = runtime.allocate_buffer_async(total).await?;
+
+        Ok(EncodedWalBuffer::Parallel(buffer))
+    }
+
+    pub(crate) fn put_owned_prepared_batch(
+        &self,
+        data: &[(bytes::Bytes, bytes::Bytes)],
+        commit_ts: u64,
+        buffer: EncodedWalBuffer,
+        profile: Option<&crate::mem_table::WriteProfile>,
+    ) -> Result<u64> {
+        ensure!(
+            self.is_parallel(),
+            "prepared admission requires a parallel v4 WAL"
+        );
+
+        self.put_batch_entries_inner(data, commit_ts, profile, Some(buffer))
+    }
+
+    pub(crate) async fn wait_durable_async(&self, ticket: u64) -> Result<()> {
+        self.parallel_runtime
+            .as_ref()
+            .context("native durability waits require a parallel v4 WAL")?
+            .wait_durable_async(ticket)
+            .await
     }
 
     fn put_batch_entries<T: WalPointEntry>(&self, data: &[T], commit_ts: u64) -> Result<u64> {
-        self.put_batch_entries_inner(data, commit_ts, None)
+        self.put_batch_entries_inner(data, commit_ts, None, None)
     }
 
     fn put_batch_entries_inner<T: WalPointEntry>(
@@ -2302,6 +2367,7 @@ impl Wal {
         data: &[T],
         commit_ts: u64,
         profile: Option<&crate::mem_table::WriteProfile>,
+        prepared: Option<EncodedWalBuffer>,
     ) -> Result<u64> {
         for entry in data {
             let key = entry.key();
@@ -2368,11 +2434,14 @@ impl Wal {
 
         self.encode_and_push_direct_buf(
             data,
-            &validated,
-            entries_size,
+            PointBatchLayout {
+                validated: &validated,
+                entries_size,
+                entry_count,
+            },
             commit_ts,
-            entry_count,
             profile,
+            prepared,
         )
     }
 

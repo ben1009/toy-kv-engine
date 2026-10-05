@@ -105,6 +105,10 @@ impl DeferredBatchPublish {
 pub(crate) struct LsmMvccInner {
     instance_id: u64,
     pub(crate) write_lock: Mutex<()>,
+    /// Fairly serialize native preparation without holding the sequencer lock
+    /// across buffer backpressure. Release before durability or publication so
+    /// multiple admitted groups remain in flight.
+    native_preparation: tokio::sync::Semaphore,
     pub(crate) commit_lock: Mutex<()>,
     pub(crate) reader_lock: RwLock<()>,
     pub(crate) current_ts: AtomicU64,
@@ -113,6 +117,7 @@ pub(crate) struct LsmMvccInner {
     recorded_at_high_water: Mutex<Option<crate::pitr::RecordedAt>>,
     publication: Mutex<PublicationState>,
     publication_condvar: Condvar,
+    async_publication_changed: tokio::sync::Notify,
     /// Mirror of `publication.{admission_open, poisoned_at}`, so the write path
     /// can reject a reservation without taking the publication lock.
     ///
@@ -164,6 +169,12 @@ pub(crate) enum BatchEntryKind {
 }
 
 impl LsmMvccInner {
+    pub(crate) async fn native_preparation_permit(
+        &self,
+    ) -> anyhow::Result<tokio::sync::SemaphorePermit<'_>> {
+        Ok(self.native_preparation.acquire().await?)
+    }
+
     pub(crate) fn instance_id(&self) -> u64 {
         self.instance_id
     }
@@ -195,6 +206,7 @@ impl LsmMvccInner {
             // The gate stays closed: a poisoned sequencer refuses writes until
             // the database is reopened, whether or not the barrier was armed.
             self.publication_condvar.notify_all();
+            self.async_publication_changed.notify_waiters();
             anyhow::bail!("commit publication barrier requires recovery");
         }
         // Every commit admitted so far has now published or been retired, so
@@ -227,6 +239,7 @@ impl LsmMvccInner {
             self.commit_gate.store(false, Ordering::SeqCst);
         }
         self.publication_condvar.notify_all();
+        self.async_publication_changed.notify_waiters();
     }
 
     #[cfg(test)]
@@ -251,6 +264,7 @@ impl LsmMvccInner {
         Self {
             instance_id,
             write_lock: Mutex::new(()),
+            native_preparation: tokio::sync::Semaphore::new(1),
             commit_lock: Mutex::new(()),
             reader_lock: RwLock::new(()),
             current_ts: AtomicU64::new(initial_ts),
@@ -268,6 +282,7 @@ impl LsmMvccInner {
             frontier: AtomicU64::new(initial_ts.saturating_add(1)),
             in_flight: AtomicU64::new(0),
             publication_condvar: Condvar::new(),
+            async_publication_changed: tokio::sync::Notify::new(),
             watermark: Watermark::new(),
             committed_txns: Arc::new(Mutex::new(BTreeMap::new())),
         }
@@ -299,6 +314,7 @@ impl LsmMvccInner {
 
         if publication.waiters > 0 {
             self.publication_condvar.notify_all();
+            self.async_publication_changed.notify_waiters();
         }
         true
     }
@@ -446,8 +462,12 @@ impl LsmMvccInner {
             self.current_ts.store(timestamp, Ordering::Release);
         }
         self.publish_frontier(publication);
+        if publication.next_to_publish != previous_frontier {
+            self.async_publication_changed.notify_waiters();
+        }
         if publication.waiters > 0 && publication.next_to_publish != previous_frontier {
             self.publication_condvar.notify_all();
+            self.async_publication_changed.notify_waiters();
         }
     }
 
@@ -476,6 +496,82 @@ impl LsmMvccInner {
         // otherwise take the lock-free reservation path.
         self.commit_gate.store(true, Ordering::SeqCst);
         self.publication_condvar.notify_all();
+        self.async_publication_changed.notify_waiters();
+    }
+
+    pub(crate) async fn publish_commit_ts_async(&self, commit_ts: u64) -> anyhow::Result<()> {
+        {
+            let mut publication = self.publication.lock();
+            anyhow::ensure!(
+                !publication
+                    .poisoned_at
+                    .is_some_and(|poison| commit_ts >= poison),
+                "commit sequencer requires recovery after unknown WAL durability"
+            );
+            if commit_ts < publication.next_to_publish {
+                self.in_flight.fetch_sub(1, Ordering::SeqCst);
+                return Ok(());
+            }
+            if commit_ts == publication.next_to_publish {
+                self.current_ts.store(commit_ts, Ordering::Release);
+                publication.next_to_publish = commit_ts.saturating_add(1);
+            } else {
+                let inserted = publication.ready.insert(commit_ts);
+                debug_assert!(inserted, "commit publication is registered once");
+            }
+            self.advance_ready_publications(&mut publication);
+        }
+        let notification = self.async_publication_changed.notified();
+        tokio::pin!(notification);
+        loop {
+            notification.as_mut().enable();
+            {
+                let publication = self.publication.lock();
+                if publication.next_to_publish > commit_ts {
+                    self.in_flight.fetch_sub(1, Ordering::SeqCst);
+                    if publication.waiters > 0 && !publication.admission_open {
+                        self.publication_condvar.notify_all();
+                    }
+                    return Ok(());
+                }
+                anyhow::ensure!(
+                    !publication
+                        .poisoned_at
+                        .is_some_and(|poison| commit_ts >= poison),
+                    "commit sequencer requires recovery after unknown WAL durability"
+                );
+            }
+            notification.as_mut().await;
+            notification.set(self.async_publication_changed.notified());
+        }
+    }
+
+    /// Cancellation can race a predecessor making this ready commit visible.
+    /// Preserve that prefix and retire only the caller's remaining reservation.
+    /// Otherwise its admitted WAL outcome is unknown and requires recovery.
+    pub(crate) fn cancel_admitted_commit(&self, commit_ts: u64) {
+        let mut publication = self.publication.lock();
+        if commit_ts < publication.next_to_publish {
+            self.in_flight.fetch_sub(1, Ordering::SeqCst);
+        } else {
+            publication.poisoned_at = Some(
+                publication
+                    .poisoned_at
+                    .map_or(commit_ts, |poison| poison.min(commit_ts)),
+            );
+            self.commit_gate.store(true, Ordering::SeqCst);
+        }
+        self.publication_condvar.notify_all();
+        self.async_publication_changed.notify_waiters();
+    }
+
+    pub(crate) fn ensure_publication_healthy(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.publication.lock().poisoned_at.is_none(),
+            "commit sequencer requires recovery after unknown WAL durability"
+        );
+
+        Ok(())
     }
 
     pub(crate) fn publish_commit_ts(&self, commit_ts: u64) -> anyhow::Result<()> {
@@ -512,6 +608,7 @@ impl LsmMvccInner {
         // visible by another publisher but whose calls have not yet finished.
         if publication.waiters > 0 && !publication.admission_open {
             self.publication_condvar.notify_all();
+            self.async_publication_changed.notify_waiters();
         }
 
         Ok(())
@@ -829,10 +926,87 @@ impl LsmMvccInner {
         memtable: &MemTable,
         shared_publish_bytes: bool,
     ) -> Result<(u64, DeferredBatchPublish, Option<u64>), anyhow::Error> {
+        self.write_batch_wal_only_inner(entries, memtable, shared_publish_bytes, None, None)
+    }
+
+    /// Buffer preparation precedes timestamp allocation. Encoding/admission stay
+    /// under the same short sequencer operation as synchronous writers.
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn write_batch_wal_only_prepared(
+        &self,
+        entries: &[(Bytes, Bytes, BatchEntryKind)],
+        memtable: &MemTable,
+        shared_publish_bytes: bool,
+        buffer: crate::wal::EncodedWalBuffer,
+    ) -> anyhow::Result<Option<(u64, DeferredBatchPublish, Option<u64>)>> {
+        anyhow::ensure!(
+            memtable.uses_parallel_wal(),
+            "native admission requires a parallel v4 WAL"
+        );
+        // A synchronous producer may hold write_lock while waiting for buffer
+        // budget. Never block that lock with prepared memory: release it and
+        // retry before consuming a timestamp. The async caller yields between
+        // attempts, so another owner can allocate/admit and make progress.
+        let Some(guard) = self.write_lock.try_lock() else {
+            return Ok(None);
+        };
+
+        self.write_batch_wal_only_inner(
+            entries,
+            memtable,
+            shared_publish_bytes,
+            Some(buffer),
+            Some(guard),
+        )
+        .map(Some)
+    }
+
+    /// The exact v4 entry size, before assigning a timestamp. Internal key length
+    /// does not depend on the timestamp's value.
+    pub(crate) fn point_batch_wal_size(
+        entries: &[(Bytes, Bytes, BatchEntryKind)],
+    ) -> anyhow::Result<usize> {
+        u32::try_from(entries.len())
+            .map_err(|_| anyhow::anyhow!("batch entry count exceeds u32::MAX"))?;
+        entries
+            .iter()
+            .try_fold(0usize, |total, (key, value, kind)| {
+                let key_len = encoded_internal_key_len(key.len());
+                let value_len = match kind {
+                    BatchEntryKind::Delete => 1,
+                    BatchEntryKind::PutRaw => value
+                        .len()
+                        .checked_add(1)
+                        .ok_or_else(|| anyhow::anyhow!("value size overflow"))?,
+                    BatchEntryKind::PutPrefixed => value.len(),
+                };
+                anyhow::ensure!(
+                    key_len <= u16::MAX as usize,
+                    "WAL batch key too large: {key_len} bytes"
+                );
+                anyhow::ensure!(
+                    value_len <= u16::MAX as usize,
+                    "WAL batch value too large: {value_len} bytes"
+                );
+
+                total
+                    .checked_add(5 + key_len + value_len)
+                    .ok_or_else(|| anyhow::anyhow!("batch size overflow"))
+            })
+    }
+
+    fn write_batch_wal_only_inner(
+        &self,
+        entries: &[(Bytes, Bytes, BatchEntryKind)],
+        memtable: &MemTable,
+        shared_publish_bytes: bool,
+        prepared: Option<crate::wal::EncodedWalBuffer>,
+        write_guard: Option<parking_lot::MutexGuard<'_, ()>>,
+    ) -> anyhow::Result<(u64, DeferredBatchPublish, Option<u64>)> {
         if entries.is_empty() {
             return Ok((0, DeferredBatchPublish::from_entries(Vec::new()), None));
         }
-        let _write_guard = self.write_lock.lock();
+        let _write_guard = write_guard.unwrap_or_else(|| self.write_lock.lock());
         let commit_ts = self.reserve_commit_ts()?;
         let publish_data: Vec<(Bytes, Bytes)> = entries
             .iter()
@@ -905,7 +1079,21 @@ impl LsmMvccInner {
             return Ok((commit_ts, publish_data, ticket));
         }
         // Write to WAL buffer only — do NOT publish to skiplist yet.
-        let (publish_data, ticket) = if shared_publish_bytes {
+        let (publish_data, ticket) = if let Some(buffer) = prepared {
+            let ticket = match memtable.write_wal_prepared_batch_only(&publish_data, buffer) {
+                Ok(ticket) => ticket,
+                Err(error) => {
+                    self.retire_commit_ts(commit_ts);
+                    return Err(error);
+                }
+            };
+            let data = if shared_publish_bytes {
+                DeferredBatchPublish::from_entries_without_refs(publish_data)
+            } else {
+                DeferredBatchPublish::from_entries(publish_data)
+            };
+            (data, ticket)
+        } else if shared_publish_bytes {
             let ticket = match memtable.write_wal_owned_batch_only(&publish_data) {
                 Ok(ticket) => ticket,
                 Err(error) => {
@@ -1052,6 +1240,7 @@ impl LsmMvccInner {
 
         if publication.waiters > 0 {
             self.publication_condvar.notify_all();
+            self.async_publication_changed.notify_waiters();
         }
         true
     }
@@ -1076,10 +1265,11 @@ impl LsmMvccInner {
         #[allow(clippy::arc_with_non_send_sync)]
         Arc::new(Transaction {
             read_ts,
-            read_guard: Arc::new(Mutex::new(Some(read_guard))),
+            read_guard: Arc::new(Mutex::new(Some(Arc::new(read_guard)))),
             inner,
             local_storage: Arc::new(SkipMap::new()),
             committed: Arc::new(AtomicBool::new(false)),
+            operation_lock: Arc::new(Mutex::new(())),
             read_set: occ_sets.0,
             write_set: occ_sets.1,
             lifecycle_guard: Arc::new(Mutex::new(None)),
@@ -1856,5 +2046,89 @@ mod tests {
         assert!(txn2.commit().is_ok());
         txn1.put(b"k", b"v1").unwrap();
         assert!(txn1.commit().is_err());
+    }
+}
+
+#[cfg(test)]
+mod native_async_tests {
+    use super::*;
+    use std::{
+        future::{Future, poll_fn},
+        task::Poll,
+    };
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn native_async_publication_waits_for_the_contiguous_prefix() {
+        for retire in [false, true] {
+            let mvcc = LsmMvccInner::new(0);
+            assert_eq!(mvcc.reserve_commit_ts().unwrap(), 1);
+            assert_eq!(mvcc.reserve_commit_ts().unwrap(), 2);
+            let publish = mvcc.publish_commit_ts_async(2);
+            tokio::pin!(publish);
+            poll_fn(|cx| {
+                assert!(publish.as_mut().poll(cx).is_pending());
+                Poll::Ready(())
+            })
+            .await;
+            assert_eq!(mvcc.latest_commit_ts(), 0);
+            if retire {
+                mvcc.retire_commit_ts(1);
+            } else {
+                mvcc.publish_commit_ts(1).unwrap();
+            }
+            publish.await.unwrap();
+            assert_eq!(mvcc.latest_commit_ts(), 2);
+            assert_eq!(mvcc.in_flight.load(Ordering::Acquire), 0);
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn native_async_publication_poison_wakes_later_waiters_and_preserves_predecessors() {
+        let mvcc = LsmMvccInner::new(0);
+        mvcc.reserve_commit_ts().unwrap();
+        mvcc.reserve_commit_ts().unwrap();
+        let publish = mvcc.publish_commit_ts_async(2);
+        tokio::pin!(publish);
+        poll_fn(|cx| {
+            assert!(publish.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        mvcc.poison_commit_ts(2);
+        mvcc.publish_commit_ts(1).unwrap();
+        assert!(publish.await.is_err());
+        assert_eq!(mvcc.latest_commit_ts(), 1);
+        assert_eq!(mvcc.in_flight.load(Ordering::Acquire), 1);
+    }
+}
+
+#[cfg(test)]
+mod async_cancellation_tests {
+    use super::*;
+    use std::{
+        future::{Future, poll_fn},
+        task::Poll,
+    };
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn native_async_cancel_after_predecessor_publishes_preserves_visible_commit() {
+        let mvcc = LsmMvccInner::new(0);
+        assert_eq!(mvcc.reserve_commit_ts().unwrap(), 1);
+        assert_eq!(mvcc.reserve_commit_ts().unwrap(), 2);
+        let mut later = Box::pin(mvcc.publish_commit_ts_async(2));
+        poll_fn(|cx| {
+            assert!(later.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        mvcc.publish_commit_ts(1).unwrap();
+        assert_eq!(mvcc.latest_commit_ts(), 2);
+        drop(later);
+        mvcc.cancel_admitted_commit(2);
+        mvcc.ensure_publication_healthy().unwrap();
+        assert_eq!(mvcc.in_flight.load(Ordering::Acquire), 0);
+        assert_eq!(mvcc.reserve_commit_ts().unwrap(), 3);
+        mvcc.publish_commit_ts_async(3).await.unwrap();
+        assert_eq!(mvcc.latest_commit_ts(), 3);
     }
 }

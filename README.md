@@ -105,6 +105,9 @@ The CLI supports basic manual operations such as `fill`, `get`, `del`, `scan`,
   write_batch, sync, scan, prefix_scan, flush, compaction, and transactions.
 - Engine-owned `BlockingExecutor` for cancellation-safe async wrappers around
   the synchronous engine.
+- Native async durability and MVCC publication waits for non-serializable point
+  writes with the opt-in parallel v4 WAL; see the
+  [integration report](docs/rfc-024-native-async-integration-20261005.md).
 - Chunk-first parallel async scan with shard planning, concurrent worker drain,
   `try_next_chunk`, `try_next_batch`, and execution stats.
 
@@ -172,6 +175,10 @@ db.close_async().await?;
 
 ## Architecture
 
+The diagram shows the blocking-wrapper path. Opt-in parallel v4 point writes
+use owned async commit tasks and await durability and publication directly;
+rotation and maintenance continue on the blocking executor.
+
 ```text
                         ┌─────────────────────────────┐
                         │       Public API Surface    │
@@ -234,6 +241,9 @@ db.close_async().await?;
 
 - `kv-engine/src/lsm_storage.rs` - core engine API, state management, reads,
   writes, scans, async wrappers, and parallel scan.
+- `kv-engine/src/lsm_storage/` - native async point commits, shared shutdown,
+  and memtable leases that protect pending publication during freeze,
+  checkpoint, and GC.
 - `kv-engine/src/wal.rs` - WAL, group commit, and `io_uring` durable writes.
 - `kv-engine/src/mem_table.rs` - lock-free skip-list memtable.
 - `kv-engine/src/block.rs`, `kv-engine/src/table.rs` - SST block and table

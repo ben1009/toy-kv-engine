@@ -2,10 +2,11 @@
 
 **RFC:** [RFC 024: Dedicated WAL I/O Pipeline](../rfcs/024-dedicated-wal-pipeline.md)
 
-**Status:** Slices 1–7 complete for the synchronous v4 WAL path; the
-parallel candidate remains opt-in because it did not pass the adoption gate
+**Status:** Slices 1–7 complete for the synchronous v4 WAL path, with a native
+async follow-up for non-serializable point writes. The parallel candidate
+remains opt-in because the performance adoption gate is still unqualified.
 
-**Last updated:** 2026-10-03
+**Last updated:** 2026-10-05
 
 ## Purpose and boundary
 
@@ -42,18 +43,25 @@ and PITR control runs need independent choices.
 
 Keep the parallel WAL work focused on ticket admission, ordered offsets,
 concurrent I/O, durability, recovery, and WAL-full rotation. The reviews also
-found existing async/lifecycle defects on the current leader path. Fix these in
-separate PRs with their own tests; they are not evidence that the RFC's WAL
-state machine is incomplete.
+found existing async/lifecycle defects on the leader path. These prerequisites
+are addressed by the native async integration and have dedicated regression
+tests; they are not evidence that the RFC's WAL state machine is incomplete.
 
-| Existing defect | Separate fix and gate |
+| Historical defect | Integration resolution and tests |
 | --- | --- |
-| [`Transaction::commit_async`](../kv-engine/src/mvcc/txn.rs) takes its MVCC snapshot guard and copies writes/OCC sets when the future is created, before it claims the commit on first poll. | Move ownership and state capture to the winning attempt. An unpolled/losing future must not unpin the snapshot; a cancelled, spawned commit must retain its snapshot and engine admission until its outcome is known. Verify mutation before first poll, two competing futures, cancellation, and close. Required before exposing the candidate through async transactions. |
-| Async engine methods in [`lsm_storage.rs`](../kv-engine/src/lsm_storage.rs) can leave admission guards in cancellable futures while detached blocking closures continue; `batch_get_async` discards its guard. | Audit all blocking engine APIs and transfer each guard to the spawned task or returned cursor. Test cancellation against close for a write, maintenance task, and batch read. Required before exposing the candidate through async APIs. |
-| Async lifecycle waits can lose a [`Notify` wakeup](../kv-engine/src/lsm_storage.rs); `close_async` cancellation or a background-worker join error can leave `Closing` unresolved. | Use state-aware wait registration and a shutdown owner that records a terminal success or error after safe teardown. Test cancellation at each await, failed joins, and a second close caller. Required before relying on async close for candidate teardown. |
+| [`Transaction::commit_async`](../kv-engine/src/mvcc/txn.rs) took its MVCC snapshot guard and copied writes/OCC sets before claiming the commit. | An owned blocking transaction now calls the synchronous commit protocol, fences its claim against local mutations before reading inputs, retains the snapshot/admission through cancellation, and repeats OCC after WAL-full rotation. Accepted reads/cursors retain independent snapshot pins across commit. Tests cover unpolled and competing futures, mutation during dispatch, snapshot retention, cancellation, conflict during rotation, and close. |
+| Async engine methods left admission guards in cancellable futures while detached blocking closures continued; `batch_get_async` discarded its guard. | Blocking closures and returned cursors now own their admission. Tests cancel a native write, maintenance operation, and batch read while close waits for their owners. |
+| Async lifecycle waits could lose a `Notify` wakeup; cancelled close or a background-worker join error could leave `Closing` unresolved. | `close_async` shares one owned storage/PITR shutdown thread independently of the caller's blocking pool, allowing admitted rotation/freeze to finish. It drains work, joins workers, safely closes WALs, and records a terminal result for later callers, including join/sync errors. Tests cover a one-thread blocking pool, concurrent/cancelled close, rejected precondition retry, failed joins, and repeated close. |
 
-The candidate now runs through synchronous v4 WAL and engine paths. Do not
-expose it through engine async APIs until the prerequisite tests pass.
+Ordinary parallel v4 point writes now also await buffer capacity, WAL durability,
+and MVCC publication natively. A fair native preparation permit is released
+after sequencer admission, before durability and publication waits. Owned
+memtable leases make freeze, checkpoint,
+and GC CAS drain pending publication. A busy sequencer releases prepared memory
+and retries before timestamp assignment, avoiding a budget/lock deadlock with
+synchronous writers. Range writes, OCC transaction commits, and actual PITR
+v5/v6 WALs retain their bounded blocking path. The default remains leader WAL;
+see the [integration report](rfc-024-native-async-integration-20261005.md).
 
 ## Implementation slices
 

@@ -6,6 +6,9 @@ the repository root examples, tests, benchmarks, and RFCs.
 ## What Lives Here
 
 - `src/lsm_storage.rs` holds the main engine API and async wrappers.
+- `src/lsm_storage/` implements shared async shutdown, native point commits,
+  and memtable leases for opt-in parallel v4 WALs; see the
+  [integration report](../docs/rfc-024-native-async-integration-20261005.md).
 - `src/pitr/` contains point-in-time recovery, archive, and restore modules.
 - `src/checkpoint.rs` implements sync/async checkpoint creation, target locks,
   stale-temp validation, and atomic no-replace publication.

@@ -1599,6 +1599,256 @@ fn txn_commit_async_is_send() {
 }
 
 #[test]
+fn txn_unpolled_async_commit_preserves_the_snapshot_and_can_still_commit() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = KvEngine::open(dir.path(), LsmStorageOptions::default_for_test()).expect("open");
+    engine.put(b"snapshot", b"old").expect("initial put");
+    let txn = engine.new_txn_async().expect("new_txn");
+    txn.put(b"committed", b"value").expect("local put");
+    drop(txn.commit_async());
+    engine.put(b"snapshot", b"new").expect("later put");
+    assert_eq!(
+        engine.inner.mvcc.as_ref().expect("MVCC").watermark(),
+        txn.read_ts,
+        "dropping an unpolled commit must keep the old snapshot pinned"
+    );
+    assert_eq!(
+        txn.get(b"snapshot").expect("snapshot read").as_deref(),
+        Some(&b"old"[..])
+    );
+    crate::future_ext::block_on(txn.commit_async()).expect("commit after cancelled future");
+    assert_eq!(
+        engine.get(b"committed").expect("committed read").as_deref(),
+        Some(&b"value"[..])
+    );
+    drop(txn);
+    engine.close().expect("close");
+}
+
+#[test]
+fn txn_async_commit_claims_current_inputs_once_on_dispatch() {
+    for serializable in [false, true] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut options = LsmStorageOptions::default_for_test();
+        options.serializable = serializable;
+        let engine = KvEngine::open(dir.path(), options).expect("open");
+        let txn = engine.new_txn_async().expect("new_txn");
+        txn.put(b"key", b"before").expect("put before creation");
+        let first = txn.commit_async();
+        let second = txn.commit_async();
+        txn.put(b"key", b"after").expect("put before first poll");
+        crate::future_ext::block_on(first).expect("winning attempt");
+        let error = crate::future_ext::block_on(second).expect_err("only one attempt can win");
+        assert!(error.to_string().contains("already committed"));
+        assert_eq!(
+            engine.get(b"key").expect("read").as_deref(),
+            Some(&b"after"[..])
+        );
+        drop(txn);
+        engine.close().expect("close");
+    }
+}
+
+#[test]
+fn txn_async_commit_includes_reads_added_before_first_poll_in_occ() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut options = LsmStorageOptions::default_for_test();
+    options.serializable = true;
+    let engine = KvEngine::open(dir.path(), options).expect("open");
+    engine.put(b"conflict", b"old").expect("initial value");
+    let txn = engine.new_txn_async().expect("new_txn");
+    txn.put(b"unpublished", b"value").expect("local write");
+    let commit = txn.commit_async();
+    txn.get(b"conflict")
+        .expect("read after creating the future");
+    engine.put(b"conflict", b"new").expect("competing write");
+    let error = crate::future_ext::block_on(commit).expect_err("the late-added read must conflict");
+    assert!(error.to_string().contains("serializable conflict"));
+    assert_eq!(engine.get(b"unpublished").expect("read"), None);
+    drop(txn);
+    engine.close().expect("close");
+}
+
+#[test]
+fn txn_async_commit_waits_for_an_admitted_mutation_before_capturing_inputs() {
+    use std::time::{Duration, Instant};
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .max_blocking_threads(1)
+        .build()
+        .expect("runtime");
+    for delete in [false, true] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut options = LsmStorageOptions::default_for_test();
+        options.serializable = true;
+        let engine = KvEngine::open(dir.path(), options).expect("open");
+        engine.put(b"key", b"old").expect("initial value");
+        let txn = Arc::try_unwrap(engine.new_txn_async().expect("new_txn"))
+            .unwrap_or_else(|_| panic!("new transaction must have one owner"));
+        let mut commit = Box::pin(txn.commit_async());
+        let operation_lock = Arc::clone(&txn.operation_lock);
+        let write_set = txn.write_set.as_ref().expect("serializable").clone();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let blocker = std::thread::spawn(move || {
+            let _write_set = write_set.lock();
+            entered_tx.send(()).expect("ready");
+            release_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("release write-set lock");
+        });
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("blocked write set");
+        let mutation = std::thread::spawn(move || {
+            if delete {
+                txn.delete(b"key")
+            } else {
+                txn.put(b"key", b"new")
+            }
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !operation_lock.is_locked() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            operation_lock.is_locked(),
+            "the mutation must hold its fence while its OCC insertion is blocked"
+        );
+        let waiting_for_mutation = runtime.block_on(async {
+            tokio::time::timeout(Duration::from_millis(50), commit.as_mut())
+                .await
+                .is_err()
+        });
+        // Release controlled work before assertions so even a regression can
+        // settle its threads and the caller's blocking runtime.
+        release_tx.send(()).expect("release blocker");
+        blocker.join().expect("blocker");
+        mutation.join().expect("mutation thread").expect("mutation");
+        assert!(
+            waiting_for_mutation,
+            "commit must not claim/capture before a checked mutation finishes"
+        );
+        runtime.block_on(commit).expect("commit");
+        assert_eq!(
+            engine.get(b"key").expect("read").as_deref(),
+            (!delete).then_some(&b"new"[..]),
+            "a successful mutation must be included in the owned commit"
+        );
+        engine.close().expect("close");
+    }
+}
+
+async fn poll_async_operation_to_pending<F: std::future::Future>(
+    mut future: std::pin::Pin<&mut F>,
+) {
+    std::future::poll_fn(|context| {
+        assert!(future.as_mut().poll(context).is_pending());
+
+        std::task::Poll::Ready(())
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn txn_async_accepted_reads_and_cursors_keep_their_snapshot_after_commit() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = KvEngine::open(dir.path(), LsmStorageOptions::default_for_test()).expect("open");
+    engine.put(b"key", b"old").expect("initial value");
+    let txn = engine.new_txn_async().expect("new_txn");
+    let read_ts = txn.read_ts;
+    let mvcc = Arc::clone(engine.inner.mvcc.as_ref().expect("MVCC"));
+    let held_slots = engine.inner.blocking.hold_all_slots_for_test();
+    let mut read = Box::pin(txn.get_async(b"key"));
+    let mut scan = Box::pin(txn.scan_async(std::ops::Bound::Unbounded, std::ops::Bound::Unbounded));
+    let mut prefix = Box::pin(txn.prefix_scan_async(b"key"));
+    poll_async_operation_to_pending(read.as_mut()).await;
+    poll_async_operation_to_pending(scan.as_mut()).await;
+    poll_async_operation_to_pending(prefix.as_mut()).await;
+    txn.commit().expect("read-only commit");
+    engine.put(b"key", b"new").expect("later value");
+    drop(txn);
+    assert_eq!(
+        mvcc.watermark(),
+        read_ts,
+        "accepted operations must retain the actual pin after the commit clears its slot"
+    );
+    drop(held_slots);
+    assert_eq!(
+        read.await.expect("snapshot read").as_deref(),
+        Some(&b"old"[..])
+    );
+    let mut scan = scan.await.expect("snapshot scan");
+    let mut prefix = prefix.await.expect("snapshot prefix scan");
+    for cursor in [&mut scan, &mut prefix] {
+        let row = cursor.try_next().await.expect("next").expect("row");
+        assert_eq!(
+            row,
+            (Bytes::from_static(b"key"), Bytes::from_static(b"old"))
+        );
+    }
+    assert_eq!(mvcc.watermark(), read_ts);
+    drop(scan);
+    assert_eq!(
+        mvcc.watermark(),
+        read_ts,
+        "the prefix cursor still owns its pin"
+    );
+    drop(prefix);
+    assert_eq!(mvcc.watermark(), mvcc.latest_commit_ts());
+    engine.close_async().await.expect("close");
+}
+
+#[test]
+fn txn_sync_cursors_keep_their_snapshot_after_commit() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = KvEngine::open(dir.path(), LsmStorageOptions::default_for_test()).expect("open");
+    engine.put(b"key", b"old").expect("initial value");
+    let txn = engine.new_txn_async().expect("new_txn");
+    let read_ts = txn.read_ts;
+    let mvcc = Arc::clone(engine.inner.mvcc.as_ref().expect("MVCC"));
+    let scan = txn
+        .scan(std::ops::Bound::Unbounded, std::ops::Bound::Unbounded)
+        .expect("scan");
+    let prefix = txn.prefix_scan(b"key").expect("prefix");
+    txn.commit().expect("read-only commit");
+    engine.put(b"key", b"new").expect("later value");
+    drop(txn);
+    for cursor in [&scan, &prefix] {
+        assert!(cursor.is_valid());
+        assert_eq!(cursor.key(), b"key");
+        assert_eq!(cursor.value(), b"old");
+    }
+    assert_eq!(mvcc.watermark(), read_ts);
+    drop(scan);
+    assert_eq!(mvcc.watermark(), read_ts);
+    drop(prefix);
+    assert_eq!(mvcc.watermark(), mvcc.latest_commit_ts());
+    engine.close().expect("close");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn txn_async_unpolled_reads_and_cursors_reject_after_commit() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = KvEngine::open(dir.path(), LsmStorageOptions::default_for_test()).expect("open");
+    engine.put(b"key", b"old").expect("initial value");
+    let txn = engine.new_txn_async().expect("new_txn");
+    let read = txn.get_async(b"key");
+    let scan = txn.scan_async(std::ops::Bound::Unbounded, std::ops::Bound::Unbounded);
+    let prefix = txn.prefix_scan_async(b"key");
+    txn.commit().expect("read-only commit");
+    engine.put(b"key", b"new").expect("later value");
+    drop(txn);
+    let mvcc = engine.inner.mvcc.as_ref().expect("MVCC");
+    assert_eq!(mvcc.watermark(), mvcc.latest_commit_ts());
+    assert!(read.await.is_err());
+    assert!(scan.await.is_err());
+    assert!(prefix.await.is_err());
+    engine.close_async().await.expect("close");
+}
+
+#[test]
 fn txn_scan_async_is_send() {
     fn assert_send<T: Send>(_: T) {}
 
