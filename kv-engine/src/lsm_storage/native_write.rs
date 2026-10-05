@@ -445,6 +445,118 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn native_async_checkpoint_rejects_hidden_entries_after_publication_poison() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("db");
+        let target = directory.path().join("checkpoint");
+        let engine = open(&path);
+        engine.put_async(b"prefix", b"success").await.unwrap();
+        let memtable = engine.inner.state.load().memtable.clone();
+        let pause = NativeWritePause::new(NativeWriteStage::Durable);
+        *engine.inner.native_write_pause.lock() = Some(Arc::clone(&pause));
+        let admission = engine.inner.lifecycle.admit_write().unwrap();
+        let task_inner = Arc::clone(&engine.inner);
+        let predecessor = tokio::spawn(async move {
+            task_inner
+                .write_entries_native(
+                    vec![(
+                        Bytes::from_static(b"aborted"),
+                        Bytes::from_static(b"unknown"),
+                        BatchEntryKind::PutRaw,
+                    )],
+                    false,
+                    admission,
+                )
+                .await
+        });
+        pause.reached.notified().await;
+        assert_eq!(pause.timestamp.load(Ordering::Acquire), 2);
+        let writer_engine = Arc::clone(&engine);
+        let successor =
+            tokio::spawn(async move { writer_engine.put_async(b"hidden", b"value").await });
+        until(|| memtable.get_versioned_raw(b"hidden", 3).is_some()).await;
+        assert_eq!(engine.get(b"hidden").unwrap(), None);
+
+        let checkpoint_engine = Arc::clone(&engine);
+        let checkpoint_target = target.clone();
+        let checkpoint = tokio::spawn(async move {
+            checkpoint_engine
+                .create_checkpoint_async(checkpoint_target)
+                .await
+        });
+        until(|| {
+            engine
+                .inner
+                .active_memtable_lock
+                .exclusive_pending_for_test()
+        })
+        .await;
+        assert!(!checkpoint.is_finished());
+        predecessor.abort();
+        assert!(predecessor.await.unwrap_err().is_cancelled());
+        assert!(successor.await.unwrap().is_err());
+        let error = checkpoint.await.unwrap().unwrap_err();
+        assert!(format!("{error:#}").contains("requires recovery"));
+        assert!(!target.exists());
+        assert_eq!(engine.inner.mvcc.as_ref().unwrap().latest_commit_ts(), 1);
+        assert_eq!(engine.get(b"hidden").unwrap(), None);
+        assert!(engine.force_flush_async().await.is_err());
+        assert_eq!(engine.inner.state.load().memtable.id(), memtable.id());
+        assert!(engine.inner.state.load().imm_memtables.is_empty());
+        assert!(engine.inner.state.load().sstables.is_empty());
+        assert_eq!(memtable.parallel_wal_is_closed(), Some(false));
+
+        assert!(engine.close_async().await.is_err());
+        assert_eq!(memtable.parallel_wal_is_closed(), Some(true));
+        drop(memtable);
+        drop(engine);
+        // Recovery may replay unacknowledged commits, but must retain the
+        // complete WAL history rather than a checkpoint missing its predecessor.
+        let recovered = open(&path);
+        for (key, value) in [
+            (b"prefix".as_slice(), b"success".as_slice()),
+            (b"aborted".as_slice(), b"unknown".as_slice()),
+            (b"hidden".as_slice(), b"value".as_slice()),
+        ] {
+            assert_eq!(recovered.get(key).unwrap().as_deref(), Some(value));
+        }
+        recovered.close_async().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn native_async_checkpoint_rejects_publication_poison_with_an_empty_memtable() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("db");
+        let target = directory.path().join("checkpoint");
+        let engine = open(&path);
+        let pause = NativeWritePause::new(NativeWriteStage::Durable);
+        *engine.inner.native_write_pause.lock() = Some(Arc::clone(&pause));
+        let admission = engine.inner.lifecycle.admit_write().unwrap();
+        let task_inner = Arc::clone(&engine.inner);
+        let writer = tokio::spawn(async move {
+            task_inner
+                .write_entries_native(
+                    vec![(
+                        Bytes::from_static(b"aborted"),
+                        Bytes::from_static(b"unknown"),
+                        BatchEntryKind::PutRaw,
+                    )],
+                    false,
+                    admission,
+                )
+                .await
+        });
+        pause.reached.notified().await;
+        writer.abort();
+        assert!(writer.await.unwrap_err().is_cancelled());
+        assert!(engine.inner.state.load().memtable.is_empty());
+        let error = engine.create_checkpoint_async(&target).await.unwrap_err();
+        assert!(format!("{error:#}").contains("requires recovery"));
+        assert!(!target.exists());
+        assert!(engine.close_async().await.is_err());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn native_async_owned_task_cancellation_poison_preserves_prefix_and_drains_wal() {
         for stage in [NativeWriteStage::Admitted, NativeWriteStage::Durable] {
             let directory = tempfile::tempdir().unwrap();

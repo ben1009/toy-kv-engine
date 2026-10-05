@@ -11546,6 +11546,12 @@ impl LsmStorageInner {
         new_memtable: mem_table::MemTable,
         _active_memtable_guard: &ActiveMemtableWriteGuard<'_>,
     ) -> Result<()> {
+        // Drained native leases may have ended through cancellation. A healthy
+        // WAL alone does not prove all memtable entries became visible; keep
+        // the active WAL for recovery instead of persisting that hidden data.
+        if let Some(mvcc) = &self.mvcc {
+            mvcc.ensure_publication_healthy()?;
+        }
         let mut state = self.state.load().as_ref().clone();
         // The active write guard waits for existing writers to finish WAL
         // durability and MVCC publication. Keep the immutable data and WAL,
@@ -11593,6 +11599,11 @@ impl LsmStorageInner {
         _state_lock_observer: &MutexGuard<'_, ()>,
         active_memtable_guard: &ActiveMemtableWriteGuard<'_>,
     ) -> Result<()> {
+        // Reject poison before allocating a successor WAL. The central swap
+        // repeats this check for callers that supply their own successor.
+        if let Some(mvcc) = &self.mvcc {
+            mvcc.ensure_publication_healthy()?;
+        }
         let sst_id = self.next_sst_id();
         let vlog_enabled = self.vlog.is_some();
         let mem_table = if self.options.enable_wal {

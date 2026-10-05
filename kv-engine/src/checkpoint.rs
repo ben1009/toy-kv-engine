@@ -492,6 +492,11 @@ impl LsmStorageInner {
         {
             let state_lock = self.state_lock.lock();
             let active_memtable_guard = self.active_memtable_lock.write();
+            // Check after draining native leases, including when cancellation
+            // left the active memtable empty and no freeze would run.
+            if let Some(mvcc) = &self.mvcc {
+                mvcc.ensure_publication_healthy()?;
+            }
             self.sync().context("failed to sync active WAL")?;
             if !self.state.load().memtable.is_empty() {
                 self.force_freeze_memtable_with_active_guard(&state_lock, &active_memtable_guard)?;

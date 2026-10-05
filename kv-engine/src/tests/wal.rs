@@ -723,17 +723,16 @@ fn failpoint_parallel_wal_freeze_failure_does_not_publish_a_successor() {
     let state_lock = engine.inner.state_lock.lock();
     let error = engine.inner.force_freeze_memtable(&state_lock).unwrap_err();
     drop(state_lock);
-    assert!(
-        error
-            .to_string()
-            .contains("failed to close frozen parallel WAL")
-    );
+    assert!(error.to_string().contains("requires recovery"));
     let after = engine.inner.state.load_full();
     assert!(Arc::ptr_eq(&before.memtable, &after.memtable));
     assert!(after.imm_memtables.is_empty());
-    assert_eq!(after.memtable.parallel_wal_is_closed(), Some(true));
+    // Publication poison now rejects freeze before runtime teardown; explicit
+    // close must still drain it even though close returns the WAL failure.
+    assert_eq!(after.memtable.parallel_wal_is_closed(), Some(false));
     assert!(after.memtable.wal_path().unwrap().exists());
     assert!(engine.close().is_err());
+    assert_eq!(after.memtable.parallel_wal_is_closed(), Some(true));
     scenario.teardown();
 }
 
