@@ -53,10 +53,10 @@ runs must reach at least two in-flight groups. Include every block and stall.
 
 Only a passing initial screen would trigger one predefined confirmation:
 three additional blocks for ext4 16/32/64 writers, ext4 batch64 with eight
-writers, ext4 rotation, and tmpfs solo/rotation. The qualifying metric must
-improve in every confirmation block, at least four of six target controls
-must pass, and combined medians must pass the same guards. The initial
-screen fails, so confirmation is not run. There is no selective rerun or
+writers, ext4 rotation, and tmpfs solo/rotation. At least four of these seven
+workload cases must improve the qualifying metric in all three confirmation
+blocks, and the combined medians must pass the same guards. The initial screen
+fails, so confirmation is not run. There is no selective rerun or
 confidence-interval qualification claim.
 
 | Case | Puts | Throughput change | p99 change | CPU/put change | Passing controls |
