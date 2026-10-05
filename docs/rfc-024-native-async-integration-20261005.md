@@ -140,7 +140,7 @@ throughput confidence interval, or passing repeatability screen in this study.
 
 ## Validation
 
-The final version passes `cargo make check`: formatting, dependency order,
+The integration review passes `cargo make check`: formatting, dependency order,
 Clippy with default and all features using `-D warnings`, unused-dependency and
 typo checks, and 1,457 tests with no skips. A default-feature nextest selection
 passes 90 async API, native-write, and memtable-gate tests. AddressSanitizer
@@ -160,6 +160,13 @@ with one caller blocking thread, checked mutations racing commit dispatch,
 accepted reads/cursors retaining their pins across commit, and first-poll OCC
 registration after a real recoverable rotation failure. Existing crash-prefix
 and buffer-lifetime tests also run in the full suite.
+
+A subsequent shutdown review passes `cargo make check` with all 1,462 tests
+and no skips. Added regressions preserve I/O error classification after a
+synchronous close and verify graceful close after moving the engine out of its
+original `Arc`, including caller cancellation and drop. The async WAL frontier
+test now handles unavailable `io_uring` consistently with the other WAL tests;
+it executes on the unrestricted host during this check.
 
 ## Reproduction artifacts
 
