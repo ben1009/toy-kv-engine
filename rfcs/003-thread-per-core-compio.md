@@ -1,7 +1,7 @@
 # RFC 003: Thread-per-Core with compio — Moving to Async io_uring
 
 **Date:** 2026-06-02
-**Status:** Proposal — see [perf-profile.md](../docs/perf-profile.md) for bottleneck analysis
+**Status:** Proposal — see [perf-profile.md](../docs/benchmarks/perf-profile.md) for bottleneck analysis
 
 ## 1. Why This Document
 
@@ -51,7 +51,7 @@ Before proposing a full async migration, consider what can be done with `std::fs
 
 ### Profiling
 
-See [docs/perf-profile.md](../docs/perf-profile.md) for full profiling results across sequential, random, mixed read/write, and concurrent workloads.
+See [docs/benchmarks/perf-profile.md](../docs/benchmarks/perf-profile.md) for full profiling results across sequential, random, mixed read/write, and concurrent workloads.
 
 ## 3. What Is compio?
 
@@ -433,7 +433,7 @@ Based on RFC 002 benchmark data (kernel 6.18.9, `io-uring` 0.7.12). Note: the 30
 
 ## 14. Decision
 
-**Status: Proposal.** Profiling (see [perf-profile.md](../docs/perf-profile.md)) shows the engine is currently CPU-bound, not I/O-bound. The RFC remains as documentation for when CPU bottlenecks are resolved and I/O becomes the dominant cost.
+**Status: Proposal.** Profiling (see [perf-profile.md](../docs/benchmarks/perf-profile.md)) shows the engine is currently CPU-bound, not I/O-bound. The RFC remains as documentation for when CPU bottlenecks are resolved and I/O becomes the dominant cost.
 
 **Prerequisites before implementing:**
 1. Optimize CPU bottlenecks (SST building, moka overhead, skiplist ops)
@@ -445,6 +445,6 @@ Based on RFC 002 benchmark data (kernel 6.18.9, `io-uring` 0.7.12). Note: the 30
 ## 15. References
 
 - [RFC 002: io_uring for Disk Writes](./002-io-uring-disk-writes.md) — research and crate comparison
-- [io_uring Benchmark Results](../docs/io-uring-bench.md) — why per-operation io_uring is slower
-- [Performance Profiling Report](../docs/perf-profile.md) — bottleneck analysis across all workloads
+- [io_uring Benchmark Results](../docs/benchmarks/io-uring-bench.md) — why per-operation io_uring is slower
+- [Performance Profiling Report](../docs/benchmarks/perf-profile.md) — bottleneck analysis across all workloads
 - [compio GitHub](https://github.com/compio-rs/compio) — runtime source and docs

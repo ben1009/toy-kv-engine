@@ -767,5 +767,5 @@ are buffered for instant delivery.
 
 ### Benchmark Results
 
-See `docs/parallel-scan-findings.md` for full results.  Parallel + Bypass is
+See `docs/async/parallel-scan-findings.md` for full results.  Parallel + Bypass is
 1.3-1.5× faster than sync scan at 50K-100K rows with balanced shards.

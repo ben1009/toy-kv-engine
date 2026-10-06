@@ -17,7 +17,7 @@
 Ordinary v4 WALs now default to the dedicated pipeline in
 [RFC 024](024-dedicated-wal-pipeline.md). PITR v5/v6 continue using leader I/O
 and their existing strict recovery, sealing, and hash-chain rules. The
-[default adoption note](../docs/rfc-024-parallel-wal-default-20261005.md)
+[default adoption note](../docs/wal/rfc-024-parallel-wal-default-20261005.md)
 records the format boundary; this change does not enable parallel PITR writes.
 
 ## 1. Summary

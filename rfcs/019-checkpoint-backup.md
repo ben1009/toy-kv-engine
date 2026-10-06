@@ -11,7 +11,7 @@
 - RFC 014: Async Operations
 - RFC 016: Native Time-To-Live Support
 - RFC 017: Standalone MVCC Garbage Collection
-- `docs/bench-report-crud-bench-rocksdb.md`
+- `docs/benchmarks/bench-report-crud-bench-rocksdb.md`
 
 ---
 
@@ -281,7 +281,7 @@ With the default parallel v4 WAL, checkpoint capture drains native memtable
 leases before freeze, retires the old WAL runtime, and rejects a poisoned
 MVCC publication sequencer. A durable but hidden successor cannot bypass a
 cancelled predecessor in a checkpoint. See
-[the native integration contract](../docs/rfc-024-native-async-integration-20261005.md).
+[the native integration contract](../docs/wal/rfc-024-native-async-integration-20261005.md).
 
 ### 6.3 CLI Hook
 

@@ -913,5 +913,5 @@ The RFC is implemented when:
     reverse iteration exists.
 11. Smoke tests cover parser, registry, lifecycle, reuse validation,
     multi-measurement output, and JSON output shape.
-12. `docs/perf-profile.md` documents the new benchmark commands and replaces
+12. `docs/benchmarks/perf-profile.md` documents the new benchmark commands and replaces
     stale fixed-run instructions.

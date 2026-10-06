@@ -13,7 +13,7 @@ buffered path.
 
 Ordinary v4 WALs now default to the dedicated parallel pipeline described in
 [RFC 024](024-dedicated-wal-pipeline.md). PITR v5/v6 retain the leader path; see
-the [default adoption note](../docs/rfc-024-parallel-wal-default-20261005.md).
+the [default adoption note](../docs/wal/rfc-024-parallel-wal-default-20261005.md).
 
 The remaining sections preserve the original proposal. For shipped behavior,
 see `kv-engine/src/wal.rs` and the WAL tests under `kv-engine/src/tests/`.
@@ -973,7 +973,7 @@ channels; enterprise drives have 4-8+. The primary source of throughput gain
 is write-phase parallelism (kernel dispatches to NVMe channels), not syscall
 reduction (fsync dominates total latency).
 
-Note: Per-operation io_uring is slower than std::fs (see `docs/io-uring-bench.md`).
+Note: Per-operation io_uring is slower than std::fs (see `docs/benchmarks/io-uring-bench.md`).
 The gain comes entirely from batching — amortizing `io_uring_enter` overhead
 across N SQEs.
 

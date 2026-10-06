@@ -11,7 +11,7 @@
 Ordinary v4 WALs now use the parallel pipeline by default, including native
 async waits for non-serializable point writes. PITR v5/v6 and legacy formats
 retain their existing paths; leader is still an explicit v4 control. The
-[default adoption note](../docs/rfc-024-parallel-wal-default-20261005.md) records
+[default adoption note](../docs/wal/rfc-024-parallel-wal-default-20261005.md) records
 the maintainer decision and its scope. The original performance gate remains
 unqualified; the proposal and benchmark criteria below are retained as the
 historical design, not evidence that the gate passed. The current limits are
@@ -55,7 +55,7 @@ baseline, not inferred from time spent in WAL follower waits.
 
 ## Regression and scope
 
-[The PITR performance study](../docs/pitr-performance.md) compared 25
+[The PITR performance study](../docs/pitr/pitr-performance.md) compared 25
 interleaved `wal_concurrent` runs: the pre-PITR revision `2f556ccb` had a
 177,411 ops/s median, and the post-PITR head `494a20ab` had 159,336 ops/s,
 or 10.2% less. Both legs had PITR **disabled**, four writers, 1 KiB values,
@@ -118,9 +118,9 @@ storage device, and the no-leader design lost the current group's sync
 coalescing. Four synchronous writers can have at most four operations awaiting
 durability, so this regression workload cannot exercise eight groups in
 flight; eight is a ceiling for higher-concurrency workloads. The earlier
-[single-operation io_uring benchmark](../docs/io-uring-bench.md) likewise does
+[single-operation io_uring benchmark](../docs/benchmarks/io-uring-bench.md) likewise does
 not measure the batched WAL path. The
-[CRUD benchmark report](../docs/bench-report-crud-bench-fjall.md) compares named
+[CRUD benchmark report](../docs/benchmarks/bench-report-crud-bench-fjall.md) compares named
 historical revisions; it does not isolate concurrent commit groups.
 
 RFC 012 preserves the original proposal. Its no-leader, `IOSQE_IO_DRAIN`, and
@@ -217,11 +217,11 @@ released its mutex while still holding admission after finding the queue empty,
 so queued work could not be stranded waiting for another client. Extent preparation
 and group-slot waits ran outside the admission mutex, but could block the admitting
 writer. MVCC point puts held `mvcc.write_lock` through packing, so other
-point puts could wait. The [write-order handoff experiment](../docs/rfc-024-wal-admission-handoff-20261002.md)
+point puts could wait. The [write-order handoff experiment](../docs/wal/experiments/rfc-024-wal-admission-handoff-20261002.md)
 records why releasing that guard before packing was rejected in that version.
 
 **Implementation update (2026-10-05):** The
-[native async integration](../docs/rfc-024-native-async-integration-20261005.md)
+[native async integration](../docs/wal/rfc-024-native-async-integration-20261005.md)
 uses a dedicated `wal-ordered-packer` thread for both synchronous and native
 async admissions. Admission still stores the physical offset and aligned
 length atomically with the ticket and ready buffer. Producers enqueue and
@@ -552,29 +552,29 @@ report the measured bottleneck rather than claiming the regression is fixed.
 
 ## Related documents
 
-- [Default adoption](../docs/rfc-024-parallel-wal-default-20261005.md):
+- [Default adoption](../docs/wal/rfc-024-parallel-wal-default-20261005.md):
   current v4 default, explicit leader control, format compatibility, and
   accepted performance limits.
 
-- [Implementation plan](../docs/rfc-024-parallel-wal-implementation-plan.md):
+- [Implementation plan](../docs/wal/rfc-024-parallel-wal-implementation-plan.md):
   reviewable implementation slices and validation order.
-- [Parallel WAL benchmark outcomes](../docs/rfc-024-parallel-wal-benchmark.md):
+- [Parallel WAL benchmark outcomes](../docs/wal/benchmarks/rfc-024-parallel-wal-benchmark.md):
   historical measurements and retained or rejected optimizations.
-- [October 5 native async versus leader matrix](../docs/rfc-024-native-async-vs-leader-20261005.md):
+- [October 5 native async versus leader matrix](../docs/wal/benchmarks/rfc-024-native-async-vs-leader-20261005.md):
   measured implementation's one-put and batch64 results, peak and paired
   estimates, CPU cost, actual pipeline depth, and repeatability limits.
-- [Latest batch64 versus leader rerun](../docs/rfc-024-native-batch64-leader-rerun-20261006.md):
+- [Latest batch64 versus leader rerun](../docs/wal/benchmarks/rfc-024-native-batch64-leader-rerun-20261006.md):
   retained backend's eight- and sixteen-writer observations, source provenance,
   and failed stability controls.
-- [Qualification matrix](../docs/rfc-024-wal-qualification-20261001.md):
+- [Qualification matrix](../docs/wal/benchmarks/rfc-024-wal-qualification-20261001.md):
   same-session adoption checks and remaining gate failures.
 - [RFC 012](012-parallel-wal.md): original parallel-WAL proposal and historical sketches.
 - [RFC 023](023-point-in-time-recovery.md): PITR WAL format, commit ordering, and recovery contract.
 - [SpanDB paper](https://www.usenix.org/system/files/fast21-chen-hao.pdf):
   dedicated loggers and multiple outstanding WAL groups on raw NVMe.
-- [PITR performance study](../docs/pitr-performance.md): measured default-path regression and publication fix.
-- [WAL group-commit profile](../docs/perf-profile.md): measured submit shapes and limits.
-- [io_uring benchmark](../docs/io-uring-bench.md): earlier single-operation comparison.
+- [PITR performance study](../docs/pitr/pitr-performance.md): measured default-path regression and publication fix.
+- [WAL group-commit profile](../docs/benchmarks/perf-profile.md): measured submit shapes and limits.
+- [io_uring benchmark](../docs/benchmarks/io-uring-bench.md): earlier single-operation comparison.
 - [WAL tests](../kv-engine/src/tests/wal.rs) and
   [chaos failpoint tests](../kv-engine/integration_tests/chaos_failpoint.rs):
   current recovery and crash-test coverage.
