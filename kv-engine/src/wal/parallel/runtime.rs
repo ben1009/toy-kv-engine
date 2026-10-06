@@ -427,7 +427,12 @@ impl ExtentInitializer {
                     })();
                     let _ =
                         finished.send(result.as_ref().map(|()| end).map_err(|e| format!("{e:#}")));
-                    result?;
+                    if result.is_err() {
+                        // A failed speculative suffix must not fail close for
+                        // the prepared prefix. If a group needs that suffix,
+                        // prepare consumes this error and poisons its tickets.
+                        break;
+                    }
                 }
 
                 Ok(())
@@ -1728,6 +1733,100 @@ mod tests {
     }
 
     #[test]
+    fn unused_extent_lookahead_failure_does_not_fail_close() {
+        use std::{fs::File, os::unix::fs::FileExt, sync::Arc};
+
+        let file = tempfile::NamedTempFile::new().unwrap();
+        file.as_file().set_len(super::PREALLOC_BLOCK).unwrap();
+        file.as_file().write_all_at(b"batch", 4096).unwrap();
+        let readonly = Arc::new(File::open(file.path()).unwrap());
+        let mut initializer =
+            super::ExtentInitializer::spawn(Arc::clone(&readonly), super::PREALLOC_BLOCK).unwrap();
+
+        // The prepared prefix is available. Only the unused next extent fails
+        // because its descriptor cannot allocate or write additional bytes.
+        initializer.prepare(super::PREALLOC_BLOCK, true).unwrap();
+        initializer
+            .close()
+            .expect("unused lookahead cannot fail close");
+
+        let mut batch = [0; 5];
+        readonly.read_exact_at(&mut batch, 4096).unwrap();
+        assert_eq!(&batch, b"batch");
+    }
+
+    #[test]
+    fn unused_extent_lookahead_failure_preserves_durable_wal_close_and_recovery() {
+        use std::{fs::File, sync::Arc};
+
+        use crossbeam_skiplist::SkipMap;
+
+        use crate::{tests::harness::is_io_uring_unavailable_error, wal::WalIoMode};
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("unused-lookahead.wal");
+        let wal = match Wal::create_with_io_mode(&path, WalIoMode::Parallel) {
+            Ok(wal) => wal,
+            Err(error) if is_io_uring_unavailable_error(&error) => {
+                eprintln!("skipping test (io_uring unavailable): {error:#}");
+                return;
+            }
+            Err(error) => panic!("failed to create parallel WAL: {error:#}"),
+        };
+        let runtime = wal.parallel_runtime.as_ref().unwrap();
+        {
+            let mut packer = runtime.inner.packer_state.lock();
+            if let Some(mut initializer) = packer.initializer.take() {
+                initializer.close().unwrap();
+            }
+            super::preallocate(&runtime.inner.preallocator, super::PREALLOC_BLOCK).unwrap();
+            packer.preallocated_end = super::PREALLOC_BLOCK;
+            packer.initializer = Some(
+                super::ExtentInitializer::spawn(
+                    Arc::new(File::open(&path).unwrap()),
+                    super::PREALLOC_BLOCK,
+                )
+                .unwrap(),
+            );
+        }
+        let ticket = wal
+            .put_batch(&[(b"prefix".as_slice(), b"durable".as_slice())], 1)
+            .unwrap();
+        wal.submit_and_commit(ticket).unwrap();
+        wal.close()
+            .expect("unused lookahead cannot fail durable WAL close");
+        drop(wal);
+
+        let skiplist = Arc::new(SkipMap::new());
+        let (recovered, max_ts) = Wal::recover(&path, &skiplist).unwrap();
+        assert_eq!(max_ts, 1);
+        assert_eq!(skiplist.len(), 1);
+        assert_eq!(
+            skiplist.get(b"prefix".as_slice()).unwrap().value().as_ref(),
+            b"durable"
+        );
+        recovered.close().unwrap();
+    }
+
+    #[test]
+    fn extent_lookahead_failure_is_reported_when_suffix_is_required() {
+        use std::{fs::File, sync::Arc};
+
+        let file = tempfile::NamedTempFile::new().unwrap();
+        file.as_file().set_len(super::PREALLOC_BLOCK).unwrap();
+        let readonly = Arc::new(File::open(file.path()).unwrap());
+        let mut initializer =
+            super::ExtentInitializer::spawn(readonly, super::PREALLOC_BLOCK).unwrap();
+
+        initializer.prepare(super::PREALLOC_BLOCK, true).unwrap();
+        let error = initializer
+            .prepare(2 * super::PREALLOC_BLOCK, true)
+            .expect_err("a required suffix must report its allocation failure");
+        assert!(format!("{error:#}").contains("fallocate failed during WAL preallocation"));
+        initializer.close().unwrap();
+    }
+
+    #[test]
     fn extent_initializer_failure_is_reported_and_joined() {
         use std::{fs::File, sync::Arc};
 
@@ -1737,7 +1836,9 @@ mod tests {
         let mut initializer =
             super::ExtentInitializer::spawn(readonly, super::WAL_HEADER_END).unwrap();
         assert!(initializer.prepare(super::PREALLOC_BLOCK, true).is_err());
-        assert!(initializer.close().is_err());
+        initializer
+            .close()
+            .expect("reported failure still joins safely");
     }
 
     #[test]
