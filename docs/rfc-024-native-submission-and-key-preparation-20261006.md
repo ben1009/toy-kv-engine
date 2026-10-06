@@ -139,3 +139,8 @@ A executable:
 `d981a0c5299869f27939fc4806e4149e161c8a513034e79b43f7b194414e62a6`.
 B executable:
 `f0cdfc7c3fb507c479b1ab229f6e4c418d620f6c539e97f4b272f058eb4263a9`.
+
+The subsequent [kernel dispatch diagnostic](rfc-024-native-async-kernel-dispatch-20261006.md)
+uses these exact baseline/A binaries. It confirms shorter submission calls
+but no corresponding CQE latency reduction in healthy sixteen-writer pairs.
+Traced measurements remain descriptive and do not revise this failed screen.
