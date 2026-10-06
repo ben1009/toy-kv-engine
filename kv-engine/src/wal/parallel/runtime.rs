@@ -1195,6 +1195,12 @@ fn run_sync_coordinator(
         drain_ready_results(&inner, &completions);
         if last_sync_latency.is_some_and(|latency| latency >= SYNC_COALESCE_MIN_SYNC) {
             coalesce_admitted_prefix(&inner, &completions);
+            // Coalescing may return at its captured admission cutoff while
+            // later groups have already completed. Include the results that
+            // are queued now before capturing the next durability target.
+            // Bound this drain to its initial queue length so new completions
+            // cannot extend the coalescing window indefinitely.
+            drain_results_at_capture(&inner, &completions);
         }
         if let Some(latency) = synchronize_written_prefix(&sync_file, &inner)? {
             last_sync_latency = Some(latency);
@@ -1232,6 +1238,15 @@ fn coalesce_admitted_prefix(inner: &RuntimeInner, completions: &Receiver<GroupWr
             Ok(result) => process_group_result(inner, result),
             Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => return,
         }
+    }
+}
+
+fn drain_results_at_capture(inner: &RuntimeInner, completions: &Receiver<GroupWriteResult>) {
+    for _ in 0..completions.len() {
+        let Ok(result) = completions.try_recv() else {
+            break;
+        };
+        process_group_result(inner, result);
     }
 }
 
