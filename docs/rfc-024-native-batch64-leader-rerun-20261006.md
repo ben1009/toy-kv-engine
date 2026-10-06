@@ -12,8 +12,12 @@ unqualified.
 
 Both arms use the same freshly staged benchmark executable,
 SHA-256 `7f113ba4b8c116ea7adfb3bc058b983f7b10ad64db4023a5e93ecc62f8ecef76`.
-Its 115 recorded production inputs match the current source tree, including the
-400-microsecond cutoff. Leader calls public `KvEngine::write_batch()` from one
+Its 115 recorded input hashes identify the measurement working tree based on
+`9e11e522`, including the 400-microsecond cutoff. That tree also contains pending
+default-selection edits in `lsm_storage.rs`, `mem_table.rs`, `wal.rs`,
+`bin/write-perf.rs` and `tests/wal.rs`; it is not an unmodified committed PR
+head. Both arms select their WAL mode explicitly, so the default selector is
+not the comparison variable. Leader calls public `KvEngine::write_batch()` from one
 OS thread per client with `WalIoMode::Leader`. Parallel calls public
 `write_batch_async()` from client tasks, using eight Tokio workers and
 `WalIoMode::Parallel`. The result compares the public APIs, execution models,
@@ -23,8 +27,11 @@ Each scored observation writes 524,288 values of 1 KiB, in batches of 64.
 PITR and serializable transactions are off, compaction is disabled, and a 1 GiB
 memtable target prevents timed rotation. Five blocks alternate ABBA and BAAB;
 each arm has two observations per block. Client-count order rotates between
-eight and sixteen writers. Each arm has two warmups per case, followed by
-one Leader/Leader control pair per case. Each fresh database is removed after
+eight and sixteen writers. Each arm has two warmups per case. One Leader/Leader
+control pair per case runs after all scored blocks, rather than after block 2
+as stated in the frozen protocol; the frozen driver and raw records establish
+the actual order. These end-of-session controls cannot establish stability
+during each earlier block. Each fresh database is removed after
 its run, followed by five seconds idle. No build, test, profiler, or trace runs
 during measurement.
 
@@ -95,7 +102,10 @@ All 86 observations are preserved: eight warmups, 40 primaries, ten single
 retries, 24 reversed-block retries and four Leader null observations. An
 independent audit rechecks modes, workload counters, all 643,072 write CQEs,
 block and null estimates, input hashes, and cleanup. The probe, 115 production
-inputs, 251 source-manifest inputs and frozen driver remain unchanged. The
+inputs, 251 source-manifest inputs and frozen driver remain unchanged throughout
+measurement. The source manifests are archived under
+`target/rfc024-native-sync-batching-20261006/` as
+`production-input-hashes.json` and `candidate-input-hashes.json`. The
 ext4 databases and RAM executable stage are removed.
 
 Archive: `target/rfc024-native-leader-batch-rerun-20261006/`. It contains the

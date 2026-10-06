@@ -10,6 +10,13 @@ numbers of retained WAL runtimes. [Frozen runtime retirement](rfc-024-frozen-wal
 now bounds worker and ring lifetime; its incremental measurements do not
 establish a throughput gain. Parallel WAL remains opt-in.
 
+The [October 6 native batch64 comparison with Leader](rfc-024-native-batch64-leader-rerun-20261006.md)
+records -32.4% and +6.9% paired throughput at eight and sixteen writers, with
+only one of five repeat-control blocks passing in each case. Independently
+selected peak throughputs differ by -7.5% and +10.4%; those maxima do not
+establish a repeatable gain. This comparison includes the public API and client
+execution model as well as the WAL mode, and does not qualify the full RFC gate.
+
 [The October 3 low-concurrency rerun](rfc-024-parallel-comparison-20261003.md)
 compares the latest retained parallel executable with the earlier `067d4b09`
 parallel executable in six blocks per case. Throughput repeats at eight and
