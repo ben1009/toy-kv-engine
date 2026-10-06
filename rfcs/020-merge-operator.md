@@ -716,7 +716,7 @@ until every persistence and compaction guard in this phase is complete.
 2. Integrate merge writes with serializable conflict detection.
 3. Add merge workloads to `write-perf`.
 4. Optionally add `crud-bench` merge rows for ToyKV vs RocksDB comparison.
-5. Update `docs/bench-report-crud-bench-rocksdb.md` if cross-backend merge
+5. Update `docs/benchmarks/bench-report-crud-bench-rocksdb.md` if cross-backend merge
    measurements are added.
 
 ---

@@ -31,7 +31,7 @@ current-thread caller runtime.
 ## RFC 022: Incremental Backup and Restore
 
 **RFC:** [rfcs/022-incremental-backup.md](rfcs/022-incremental-backup.md)
-**Implementation plan:** [docs/rfc-022-incremental-backup-plan.md](docs/rfc-022-incremental-backup-plan.md)
+**Implementation plan:** [docs/backup/rfc-022-incremental-backup-plan.md](docs/backup/rfc-022-incremental-backup-plan.md)
 **Status:** RFC and implementation landed on `main` via PRs #243, #284–#286;
 remaining work is limited to explicitly tracked follow-ups.
 
@@ -392,7 +392,7 @@ PR #85 (merged 2026-06-10). Version-aware GC with internal key storage in vLog.
 
 ### Pending: Production sync performance
 
-See `docs/bench-report-crud-bench-fjall.md` for benchmark details.
+See `docs/benchmarks/bench-report-crud-bench-fjall.md` for benchmark details.
 
 - [x] **Batch reads** — Closed 5× gap to ~1.06× (tied). `batch_get` with shared state, sorted keys, reusable encode buffer (PR #127).
 - [x] **Durable create/delete target rows** — Post-optimization focused rerun wins all targeted sync cases:
@@ -747,7 +747,7 @@ See `docs/bench-report-crud-bench-fjall.md` for benchmark details.
   arguments. The CSV schema is owned there.
 - [x] **Add durable RocksDB comparison** — Ran the existing `crud-bench` embedded RocksDB backend alongside ToyKV and
   Fjall with `--sync --samples 100000 --clients 4 --threads 4`, then filled in
-  `docs/bench-report-crud-bench-rocksdb.md`. ToyKV wins point reads and large durable batch writes; RocksDB wins
+  `docs/benchmarks/bench-report-crud-bench-rocksdb.md`. ToyKV wins point reads and large durable batch writes; RocksDB wins
   scan rows and `batch_read_100` in the initial full run; the PR #170 focused scan rerun moves ToyKV ahead on four of
   five scan rows, while a 10,000-iteration focused batch rerun moves `batch_read_100` back ahead and keeps
   `batch_read_1000` ahead of RocksDB.

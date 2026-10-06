@@ -5,7 +5,7 @@
 **Author:** kv-engine Contributors
 **References:**
 - RFC 011: db_bench-Style Benchmark Harness
-- `docs/bench-report-crud-bench-rocksdb.md`
+- `docs/benchmarks/bench-report-crud-bench-rocksdb.md`
 - SlateDB benchmark suite at commit `15564e675fe960a48dd3747ff43f5493506ea753`
 - SlateDB 0.15.0 `balanced` workload results
 
@@ -958,7 +958,7 @@ Status: complete for local artifact validation and documentation.
 2. Cross-database comparison gates remain in the sibling `crud-bench`
    repository, where the comparison CSV and row schema live.
 3. Recommended steady-state gate rows are documented in
-   `docs/bench-report-crud-bench-rocksdb.md`.
+   `docs/benchmarks/bench-report-crud-bench-rocksdb.md`.
 4. Normal CI remains free of long benchmark requirements.
 
 ---

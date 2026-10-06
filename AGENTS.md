@@ -35,7 +35,16 @@ Key dependencies:
 ├── .config/nextest.toml    # nextest profile (retries, timeouts)
 ├── .typos.toml             # Spell-check allowlist
 ├── lsan-suppressions.txt   # LeakSanitizer suppressions
-├── docs/                   # Benchmark reports and implementation notes
+├── docs/                   # Documentation grouped by topic
+│   ├── README.md           # Documentation index
+│   ├── async/              # Async lifecycle and scan measurements
+│   ├── backup/             # Incremental backup plan and benchmarks
+│   ├── benchmarks/         # General benchmarks and profiling reports
+│   ├── pitr/               # PITR implementation plan and performance
+│   └── wal/                # Parallel WAL implementation and adoption
+│       ├── benchmarks/     # WAL comparisons and qualification
+│       ├── environment/    # Storage stalls and environment mitigations
+│       └── experiments/    # WAL optimization reports
 ├── rfcs/                   # RFCs 001–024
 └── kv-engine/
     ├── Cargo.toml
@@ -311,10 +320,10 @@ Write-ahead logging is optional (`enable_wal: bool`). When enabled, each memtabl
 Ordinary v4 WALs default to the parallel pipeline (`WalIoMode::Parallel`); PITR
 v5/v6 and older MVCC WALs retain leader I/O, and legacy unframed WALs remain
 buffered. The explicit leader selector remains available for comparison. See
-[the default adoption note](docs/rfc-024-parallel-wal-default-20261005.md).
+[the default adoption note](docs/wal/rfc-024-parallel-wal-default-20261005.md).
 The pipeline has 32 in-flight group slots and 256 ring entries. The maintainer
 selected the default despite the still-unqualified RFC performance gate; see
-[the benchmark overview](docs/rfc-024-parallel-wal-benchmark.md) for evidence.
+[the benchmark overview](docs/wal/benchmarks/rfc-024-parallel-wal-benchmark.md) for evidence.
 
 ### Block Cache
 

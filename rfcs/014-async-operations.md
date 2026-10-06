@@ -6,7 +6,7 @@
 **References:**
 - RFC 003: Thread-per-Core with compio
 - RFC 012: Parallel WAL
-- `docs/perf-profile.md`
+- `docs/benchmarks/perf-profile.md`
 
 ---
 
@@ -17,7 +17,7 @@ Ordinary v4 WALs now default to the dedicated pipeline in
 use owned native waits for buffer capacity, durability, and ordered MVCC
 publication. Range writes, transaction commits, serializable writes, and
 PITR v5/v6 keep the bounded blocking boundary. Async close has an independent
-shared shutdown owner. The [integration report](../docs/rfc-024-native-async-integration-20261005.md)
+shared shutdown owner. The [integration report](../docs/wal/rfc-024-native-async-integration-20261005.md)
 records lifecycle and cancellation behavior; the proposal below preserves
 the original async design.
 
@@ -110,7 +110,7 @@ to waiting.
 
 The repository's own measurements matter here.
 
-`docs/perf-profile.md` explicitly concludes that:
+`docs/benchmarks/perf-profile.md` explicitly concludes that:
 
 1. I/O is not the main bottleneck in the profiled workloads;
 2. a full async rewrite is not justified on throughput alone;
@@ -886,7 +886,7 @@ recovery plus parallel SST open, while periodic flush/compaction and
 post-compaction vLog GC run under the engine-owned runtime instead of ad hoc
 background threads. The remaining work is measurement and any follow-on
 internal async overlap that benchmarks justify. See
-`docs/async-phase3-measurement.md` for the measurement plan.
+`docs/async/async-phase3-measurement.md` for the measurement plan.
 
 ### Phase 4: Internal Iterator Rework
 

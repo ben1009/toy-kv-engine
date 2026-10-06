@@ -61,7 +61,7 @@ The CLI supports basic manual operations such as `fill`, `get`, `del`, `scan`,
 
 - Write-ahead logging with ticket-based group commit. Ordinary v4 WALs default
   to the parallel pipeline; PITR v5/v6 retain leader I/O and legacy unframed
-  WALs retain buffered I/O. See the [default adoption note](docs/rfc-024-parallel-wal-default-20261005.md).
+  WALs retain buffered I/O. See the [default adoption note](docs/wal/rfc-024-parallel-wal-default-20261005.md).
 - `io_uring` + `O_DIRECT` WAL write path for durable writes.
 - Point-in-time recovery from archived WAL segments, with timeline-aware
   restore support.
@@ -109,9 +109,9 @@ The CLI supports basic manual operations such as `fill`, `get`, `del`, `scan`,
   the synchronous engine.
 - Native async durability and MVCC publication waits for non-serializable point
   writes with the default parallel v4 WAL; see the
-  [integration report](docs/rfc-024-native-async-integration-20261005.md) and
-  the [one-put and batch64 matrix](docs/rfc-024-native-async-vs-leader-20261005.md).
-  The [latest batch64 rerun](docs/rfc-024-native-batch64-leader-rerun-20261006.md)
+  [integration report](docs/wal/rfc-024-native-async-integration-20261005.md) and
+  the [one-put and batch64 matrix](docs/wal/benchmarks/rfc-024-native-async-vs-leader-20261005.md).
+  The [latest batch64 rerun](docs/wal/benchmarks/rfc-024-native-batch64-leader-rerun-20261006.md)
   records the retained backend's eight- and sixteen-writer results. The full
   RFC performance gate remains unqualified.
 - Chunk-first parallel async scan with shard planning, concurrent worker drain,
@@ -273,7 +273,8 @@ rotation and maintenance continue on the blocking executor.
 - `kv-engine/benches/` - Criterion benchmarks for vLog, WAL, memtable, and
   range deletion paths.
 - `rfcs/` - design notes for major features.
-- `docs/` - benchmark reports and focused performance notes.
+- [docs/](docs/README.md) - documentation index, benchmark reports, and
+  implementation notes grouped by topic.
 
 ## Testing And Benchmarks
 
@@ -359,7 +360,7 @@ TOYKV_COMPACTION_SETSUM=1 cargo nextest run --workspace --all-features --lib
 
 ## Performance Notes
 
-The [parallel WAL overview](docs/rfc-024-parallel-wal-benchmark.md) records
+The [parallel WAL overview](docs/wal/benchmarks/rfc-024-parallel-wal-benchmark.md) records
 the current default, retained optimizations, and failed qualification controls.
 Its direct Leader comparisons distinguish the October 5 one-put matrix from
 the October 6 batch64 rerun. Earlier benchmark reports describe their measured
@@ -380,9 +381,9 @@ run. Focused scan reruns still put ToyKV ahead on all five no-index scan watch
 rows, including the repeated `select(*) limit(100)` row from PR #173 where
 ToyKV leads RocksDB by 28.3%.
 
-See [ToyKV vs Fjall Benchmark Report](docs/bench-report-crud-bench-fjall.md)
+See [ToyKV vs Fjall Benchmark Report](docs/benchmarks/bench-report-crud-bench-fjall.md)
 for the full numbers, caveats, and artifact names. See
-[ToyKV vs RocksDB Benchmark Report](docs/bench-report-crud-bench-rocksdb.md) for
+[ToyKV vs RocksDB Benchmark Report](docs/benchmarks/bench-report-crud-bench-rocksdb.md) for
 the RocksDB comparison numbers, parity notes, gates, and next target.
 
 When evaluating a write-path performance patch, run the
@@ -407,27 +408,27 @@ requires both p95 and p99 to pass, and allows at most 5% regression per metric.
 
 ### Reports
 
-- [ToyKV vs Fjall Benchmark Report](docs/bench-report-crud-bench-fjall.md)
-- [ToyKV vs RocksDB Benchmark Report](docs/bench-report-crud-bench-rocksdb.md)
-- [Incremental Backup Benchmarks](docs/backup-benchmarks.md)
-- [vLog Benchmark Report](docs/bench-report-vlog.md)
-- [DeleteRange Benchmark Report](docs/bench-report-deleterange.md)
-- [PITR Performance Baseline](docs/pitr-performance.md)
-- [Parallel WAL Benchmark Outcomes](docs/rfc-024-parallel-wal-benchmark.md)
-- [Native Async Versus Leader: One Put and Batch64](docs/rfc-024-native-async-vs-leader-20261005.md)
-- [Latest Native Batch64 Versus Leader Rerun](docs/rfc-024-native-batch64-leader-rerun-20261006.md)
-- [io_uring Benchmark Notes](docs/io-uring-bench.md)
-- [Performance Profiling Report](docs/perf-profile.md)
-- [Async Scan Findings](docs/async-scan-findings.md)
-- [Parallel Scan Findings](docs/parallel-scan-findings.md)
-- [Async Phase 3 Measurement Plan](docs/async-phase3-measurement.md)
+- [ToyKV vs Fjall Benchmark Report](docs/benchmarks/bench-report-crud-bench-fjall.md)
+- [ToyKV vs RocksDB Benchmark Report](docs/benchmarks/bench-report-crud-bench-rocksdb.md)
+- [Incremental Backup Benchmarks](docs/backup/backup-benchmarks.md)
+- [vLog Benchmark Report](docs/benchmarks/bench-report-vlog.md)
+- [DeleteRange Benchmark Report](docs/benchmarks/bench-report-deleterange.md)
+- [PITR Performance Baseline](docs/pitr/pitr-performance.md)
+- [Parallel WAL Benchmark Outcomes](docs/wal/benchmarks/rfc-024-parallel-wal-benchmark.md)
+- [Native Async Versus Leader: One Put and Batch64](docs/wal/benchmarks/rfc-024-native-async-vs-leader-20261005.md)
+- [Latest Native Batch64 Versus Leader Rerun](docs/wal/benchmarks/rfc-024-native-batch64-leader-rerun-20261006.md)
+- [io_uring Benchmark Notes](docs/benchmarks/io-uring-bench.md)
+- [Performance Profiling Report](docs/benchmarks/perf-profile.md)
+- [Async Scan Findings](docs/async/async-scan-findings.md)
+- [Parallel Scan Findings](docs/async/parallel-scan-findings.md)
+- [Async Phase 3 Measurement Plan](docs/async/async-phase3-measurement.md)
 
 ### Implementation Records
 
-- [RFC 022 Incremental Backup Implementation Plan](docs/rfc-022-incremental-backup-plan.md)
-- [RFC 023 PITR Implementation Plan](docs/rfc-023-pitr-implementation-plan.md)
-- [RFC 024 Parallel WAL Implementation Plan](docs/rfc-024-parallel-wal-implementation-plan.md)
-- [Parallel v4 WAL Default Adoption](docs/rfc-024-parallel-wal-default-20261005.md)
+- [RFC 022 Incremental Backup Implementation Plan](docs/backup/rfc-022-incremental-backup-plan.md)
+- [RFC 023 PITR Implementation Plan](docs/pitr/rfc-023-pitr-implementation-plan.md)
+- [RFC 024 Parallel WAL Implementation Plan](docs/wal/rfc-024-parallel-wal-implementation-plan.md)
+- [Parallel v4 WAL Default Adoption](docs/wal/rfc-024-parallel-wal-default-20261005.md)
 
 ### RFCs
 

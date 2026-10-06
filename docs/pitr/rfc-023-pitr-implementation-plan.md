@@ -1,0 +1,459 @@
+# RFC 023: Point-in-Time Recovery Implementation Plan
+
+**RFC:** [RFC 023: Point-in-Time Recovery](../../rfcs/023-point-in-time-recovery.md)
+**Status:** Complete (implementation and validation)
+**Last updated:** 2026-09-24
+
+> This document preserves the implementation sequence and progress history.
+> All planned implementation and validation slices are complete. Current
+> behavior is specified in RFC 023. Remote archives, encryption, compression,
+> standby tailing, export/import, and timeline continuation remain follow-ups.
+
+## Purpose
+
+This document records the reviewable implementation slices used to deliver
+RFC 023. Commit ordering and the WAL format were made independently correct
+before PITR lifecycle state, repository publication, backup integration, and
+the public API depended on them.
+
+The release gate required the synchronous lifecycle, status, verification,
+retention, restore compatibility, and publication outcomes to be complete
+before the public PITR API shipped; that gate is now closed.
+
+## Pre-Implementation Constraints
+
+These constraints guided the design before implementation and are retained here
+as historical context.
+
+1. MVCC commit timestamps are currently calculated as `current_ts + 1` while a
+   short write lock is held, but `current_ts` advances only after WAL durability
+   and memtable publication. Concurrent writers can therefore reserve the same
+   timestamp. The ordered commit sequencer is a correctness prerequisite.
+2. The WAL already supplies tickets, parallel direct-I/O submission, group
+   `fdatasync`, poisoning, and ordered ticket completion. The sequencer must
+   extend those mechanisms without serializing WAL I/O.
+3. Point entries and range tombstones currently use separate WAL encoders and
+   recovery aggregation. WAL v5 requires one canonical mixed-operation batch
+   representation shared by live recovery and PITR replay.
+4. WAL files are named using memtable/SST IDs and are removed after a durable
+   flush. PITR segment identity must be independent, and reclamation must become
+   archive-pin aware.
+5. Manifest v6 contained immutable SST/vLog identities but no PITR source
+   lifecycle. Manifest v7 preserves the complete PITR state in every snapshot.
+6. RFC 022 already provides descriptor-relative repository access, immutable
+   object publication, catalog recovery, pinned-descriptor restore handoff, and
+   explicit publication outcomes. PITR extends those primitives rather than
+   adding a second filesystem safety layer.
+
+## Pre-Implementation RFC Clarifications
+
+Resolve these points before the corresponding format code lands:
+
+1. Record configured maximum key, value, entry-count, batch, seal-index, and
+   catalog-frame sizes in one normative limits table so encoders, decoders,
+   admission, status, and verification use identical bounds.
+2. Define the archive limiter's exact I/O scope. Charge source WAL/seal reads
+   and repository WAL/seal writes performed by the background archiver; do not
+   charge repository catalog replay, verification, publication revalidation,
+   restore, or `verify_pitr` reads to that bucket.
+3. Resolved: automatic reopen and `resume_pitr` install
+   `PitrRuntimeOptions::default()` (unlimited aggregate archive I/O, one-MiB
+   burst/chunks, and `Background` priority). An immediate online update may
+   replace those scheduling defaults without changing the archive epoch.
+
+RFC 023 now defines the slice-1 wire decisions: canonicalization preserves the
+relative caller order of all retained point and range entries after removing
+earlier duplicate point operations, and `header_crc32` covers batch-header bytes
+`0..28`. The codec and golden vectors implement those normative choices; these
+two items no longer block live WAL activation in a later slice.
+
+## Implementation Slices
+
+### 1. Canonical contracts and WAL v5 fixtures
+
+Add crate-private types without changing live writes:
+
+- `CommitTs`, `CommitTicket`, and `CommitReservation`;
+- canonical `WalBatch` and `WalEntry::{Put, PointDelete, RangeDelete}`;
+- `WalV5Header` and `WalV5BatchHeader`;
+- `TimelineId`, `ArchiveEpochId`, and `SegmentId`;
+- `ChainAnchor`, `SegmentAnchor`, and `CommitTimeHighWater`.
+
+Add golden byte fixtures for file headers, all entry kinds, batch headers,
+negative system times, CRCs, zero alignment gaps, and malformed inputs. Keep
+decoding bounded before allocation.
+
+**Acceptance:** encoder/decoder round trips and exact golden bytes pass; live
+WAL behavior is unchanged.
+
+### 2. Ordered commit sequencer
+
+Replace `current_ts + 1` allocation with a sequencer that owns:
+
+- unique commit timestamp and ticket reservation;
+- definite pre-durability failure retirement;
+- unknown-durability poisoning;
+- per-ticket durable and published completion state;
+- contiguous reader-visible publication frontier;
+- admission cutoff and drain for rotation/barriers.
+
+Canonicalize and checksum the payload before reservation. Preserve parallel WAL
+submission and group `fdatasync`; only reservation, recorded-time finalization,
+and frontier advancement are logically ordered.
+
+Migrate every MVCC write path in the same slice: single writes, public batches,
+range deletes, serializable transactions, and async transactions.
+
+**Acceptance:** concurrent reservations are unique; out-of-order completion
+cannot expose a later timestamp first; unknown durability blocks admission;
+recovery reconstructs a safe next timestamp; `cargo make check` passes. Capture
+a 1/4/8/16/32-writer performance baseline before WAL v5.
+
+### 3. Dormant WAL v5 codec and recovery substrate
+
+Implement WAL v5 behind crate-private, explicitly selected test paths. Do not
+make v5 the live WAL format or create a v5 file until manifest v7 enablement has
+persisted its timeline, epoch, segment, and predecessor identity.
+
+Route the dormant encoder and decoder through `WalBatch` and implement:
+
+- the fixed v5 file and batch headers;
+- mixed point/range entry encoding;
+- ticket-ordered `recorded_at` clamping and header finalization;
+- logical length independent of preallocated file size;
+- incremental WAL digest and bounded seal-index accumulation;
+- strict flags, reserved-byte, length, CRC, alignment, and trailing-byte checks;
+- retained v2-v4 normal recovery, with those formats ineligible for PITR.
+
+The v5 recovery substrate must return whole validated batches rather than
+separate point and range collections. Existing live writes and ordinary v2-v4
+recovery remain unchanged in this slice.
+
+**Acceptance:** normal recovery and a model applier produce identical state for
+v5 fixture WALs containing puts, deletes, TTL values, range deletes, duplicate
+keys, and mixed batches. No production open or write path can select v5 yet.
+
+### 4. Manifest v7 PITR state machine
+
+Introduce one persisted `PitrState` structure embedded in every v7 snapshot. It
+contains configuration, repository/timeline/epoch identity, active segment,
+predecessor anchor, recorded-time high-water, last commit anchor, obligations,
+and enabled/disabled/reconciliation state.
+
+Add serialization, validation, replay reduction, and snapshot preservation for:
+
+- enable intent and finalization;
+- sealing intent;
+- sealed segment and successor installation;
+- archive completion;
+- source reclamation completion;
+- clean disable;
+- forced coverage gap.
+
+Manifest replay must validate and reduce these records before the live engine
+is constructed. This slice is a dormant persistence substrate: it does not
+expose or execute `enable_pitr`, create a v5 successor WAL, start archival, or
+advertise a recovery interval.
+
+**Acceptance:** failpoints at every transition recover exactly one active
+segment and preserve all obligations in synthetic manifest fixtures. Existing
+databases continue writing their current manifest and WAL formats, and no live
+v3-v6 to v7 enable transition is reachable.
+
+### 5. Segment manager and pin-aware source reclamation
+
+Add an engine-owned `PitrSegmentManager` responsible for rotation, sealing,
+source pins, and spool reservations. Segment IDs are independent of SST IDs,
+even when rotation also freezes the current memtable.
+
+Use one coalescing rotation path for size, timer, backup, explicit barrier, and
+shutdown requests. The admission pause must not rescan or rehash the WAL.
+
+Replace unconditional post-flush WAL deletion with:
+
+```text
+ordinary WAL and unpinned       -> delete after durable flush
+PITR obligation present        -> retain WAL and seal
+archive + source state durable -> delete pair, fsync directory, release space
+```
+
+Treat the source WAL and `.seal` as one reclamation unit.
+
+**Acceptance:** concurrent write/freeze/flush/rotation tests show no missing or
+duplicate batch, two active segments, or premature WAL deletion. Reopen retries
+partial cleanup without releasing its reservation early. These tests use an
+internal lifecycle harness over the dormant v5/v7 substrate; no production
+enable or reopen path selects PITR yet.
+
+### 6. Backpressure and seal-boundary barrier
+
+Implement accounting for:
+
+- logical active/sealed/unarchived WAL bytes;
+- physical WAL preallocation and allocated extents;
+- seal files and temporary files;
+- manifest obligations and snapshot replacement;
+- one shared terminal-maintenance reserve.
+
+All source-manifest writers use the shared physical-spool allocator with the
+RFC-defined lock ordering. Reject writes before WAL admission when their atomic
+reservation would exceed a bound.
+
+Add a crate-private seal-boundary barrier primitive:
+
+1. stop admission at a sequencer boundary;
+2. drain earlier reservations and publication;
+3. seal and install the successor;
+4. release later writes;
+5. return the sealed boundary to a caller-owned test harness.
+
+This is not yet `create_recovery_point`: repository archival and its typed
+publication decision are completed in slice 7.
+
+**Acceptance:** bounds cannot be exceeded by concurrent writers; oversized
+batches fail without a gap; terminal maintenance can always seal or reclaim;
+concurrent seal boundaries coalesce without weakening their individual
+boundaries. No public durability claim is made from sealing alone.
+
+### 7. PITR repository catalog and archiver
+
+Extend `BackupRepository` with immutable WAL/seal objects and a framed
+`PITR_CATALOG`. Reuse RFC 022 locking, descriptor validation, object staging,
+no-replace publication, fsync, replay, and ambiguous-publication revalidation.
+
+Implement:
+
+- prepare/commit and coverage-break catalog records;
+- predecessor-chain and timestamp validation;
+- bounded retry with the runtime token-bucket limiter;
+- exact charging of archive source reads and repository writes, including
+  retry I/O, while excluding verification/revalidation reads;
+- immediate application of online limiter changes to the next bounded I/O
+  chunk, including while a larger WAL/seal object remains in flight;
+- source-manifest `Archived` publication before pin release;
+- catalog snapshot/compaction and orphan accounting;
+- repository/source identity reconciliation after reopen.
+
+Complete the crate-private `create_recovery_point` state machine by composing
+the slice 6 seal boundary with archive object/catalog publication and the
+source-manifest `Archived` transition. Only its durable outcome closes the
+reported archive gap.
+
+**Acceptance:** reopen reconstructs the same longest valid chain and rejects
+forks, gaps, overlaps, regressions, corruption, duplicate commits, and mixed
+timeline/epoch identities. Limiter tests account for every charged archive I/O
+path and prove catalog replay, verification, and revalidation reads are not
+charged. A runtime update leaves only an already granted bounded chunk under the
+old policy; every later chunk uses the new limiter.
+
+### 8. PITR enablement and PITR-aware base backup
+
+Extend RFC 022 generation metadata with repository, timeline, epoch, included
+commit high-water, boundary anchor, base time anchor, WAL replay version, and
+persistence-affecting compatibility metadata.
+
+Integrate the previously dormant components into the executable `enable_pitr`
+transition. Under stopped admission, persist the enable intent, freeze legacy
+state, create and fsync the identity-bound v5 successor, and publish manifest v7
+before writes resume. Start the archiver, but advertise no recovery interval
+until the mandatory first base commits. Crash or ambiguity handling must never
+allocate a second identity while the first enable decision is unknown.
+
+At backup capture:
+
+1. stop admission and rotate the boundary segment;
+2. flush all boundary memtables while state mutation is excluded;
+3. capture canonical state and immutable-file pins;
+4. release exclusion before long object copies;
+5. publish the base and its PITR binding consistently.
+
+Existing RFC 022 generations remain ordinary backups but are never selected as
+PITR bases.
+
+**Acceptance:** a base restores independently to exactly its included boundary,
+contains no later commit, and binds the exact next segment predecessor. Kill
+tests at every v3-v6 to v7 enable step recover either the legacy state or exactly
+one timeline/epoch/v5 successor, with no advertised pre-base interval.
+
+### 9. Exact `CommitTs` restore prototype
+
+Implement crate-private exact-timestamp restore before the public API:
+
+1. validate the selector, catalogs, base, and complete required chain;
+2. pin all required descriptors before releasing the repository lock;
+3. validate every required segment fully, including the final segment tail;
+4. restore the base through RFC 022 staging;
+5. assign a new timeline and sanitize inherited PITR lifecycle state;
+6. apply whole batches through the target with a private recovery applier;
+7. flush, persist the timestamp frontier, remove recovery WALs, and close;
+8. write `RECOVERY_INFO` and atomically publish the destination.
+
+The private applier preserves commit timestamps and encoded TTL expiration, but
+does not allocate timestamps, run OCC, call user code, or append archived bytes
+to a live WAL.
+
+**Acceptance:** restores at the base, every commit, and numeric timestamp gaps
+match model snapshots. No transaction, batch, or range operation is partially
+visible. Corruption and gaps fail before publication.
+
+This is the Phase 1 prototype milestone. It remains crate-private.
+
+### 10. Complete synchronous public operations
+
+Expose the RFC's public types and synchronous operations only after the exact
+prototype is stable:
+
+- enable, resume, clean disable, and forced-gap disable;
+- recovery-point creation;
+- exact, `Latest`, and wall-clock restore;
+- bounded paginated status;
+- shallow and deep verification;
+- paired backup/PITR retention;
+- compatibility resolution through `ImplementationRegistry`;
+- all durable, non-durable, unknown, and cleanup-incomplete outcomes.
+
+Before implementing automatic reopen or `resume_pitr`, resolve the runtime
+option contract tracked in the pre-implementation decisions. Tests then cover
+the chosen behavior before and after `set_pitr_runtime_options` and verify that
+neither operation changes the archive epoch.
+
+RFC 022 `purge(retain)` must reject PITR repositories without mutating them.
+
+**Acceptance:** all supported formats and features validate before staging;
+status never advertises an unbased or broken interval; paired retention cannot
+expose mixed catalogs or delete an object needed by an advertised target.
+
+### 11. Async APIs and cancellation
+
+Wrap the proven synchronous state machines in engine-owned tasks. Cancellation
+is checked only between bounded streaming operations, never during a catalog
+commit, source-manifest transition, or final rename decision.
+
+Make `close()` and `close_async()` delegate to PITR close semantics when PITR is
+active. Drop remains best effort and makes no durability claim.
+
+**Acceptance:** cancellation has one typed terminal outcome; a possibly
+published destination or catalog is never automatically retried or removed.
+
+### 12. Chaos, compatibility, and performance gate
+
+Complete the RFC 023 test matrix with emphasis on:
+
+- process kills around every seal, manifest, object, catalog, cleanup, and
+  rename durability boundary;
+- external durable-operation oracle comparison at every recovery target;
+- source loss at every reported archive-lag state;
+- ENOSPC, repository unavailability, clock rollback, and cleanup failure;
+- weak-memory sequencer publication tests;
+- bounded catalog/status/verification allocation;
+- vLog, TTL, range tombstone, compaction-filter, and future-format rejection.
+
+Run the benchmark matrix with 1, 4, 8, 16, and 32 writers for PITR disabled and
+enabled/caught-up modes. Separately measure archive lag/backpressure, same-device
+and separate-device repositories, configured rate limits, and rotation pause
+components.
+
+**Acceptance:** the complete RFC acceptance criteria pass, benchmark baselines
+are reported honestly, and `cargo make check` succeeds.
+
+## Pull Request Sequence
+
+Keep the review surface narrow with this approximate sequence:
+
+1. canonical batch contracts and WAL v5 fixtures;
+2. ordered commit sequencer;
+3. dormant WAL v5 codec and recovery substrate;
+4. manifest v7 state machine;
+5. segment manager and pin-aware reclamation;
+6. backpressure and seal-boundary barrier;
+7. PITR repository catalog and archiver;
+8. PITR enablement and PITR-aware base backups;
+9. exact restore prototype;
+10. public synchronous operations and compatibility;
+11. async operations and cancellation;
+12. chaos completion, benchmarks, and documentation.
+
+Each PR must include its own crash/recovery tests and pass the normal repository
+gate. Format- or durability-changing PRs must not be merged with knowingly
+uncovered recovery windows deferred to a later PR.
+
+## Progress Checkpoint (2026-09-16)
+
+Slices 1 through 10 are integrated into the live Linux engine. Live writes use
+identity-bound WAL v5 after durable enable, and reopen/resume recovers enabling,
+sealed, uncertain-publication, reclaimable, and post-unlink states before
+reopening write admission. Size/timer maintenance archives in the background;
+explicit recovery points, close, clean disable, and forced-gap disable share the
+same coalesced boundary path. WAL admission reserves aligned bytes before ticket
+allocation, and source WAL/sidecar reclamation is gated by the durable archive
+and flush state.
+
+Enable publishes the mandatory first base before admitting writes. Subsequent
+synchronous and asynchronous RFC 022 backup entry points publish indexed PITR
+bases. Restore supports exact commit timestamps, `Latest`, wall-clock selection,
+and automatic newest-usable base selection. Status and verification expose full
+base-plus-WAL interval bounds with cursors bound to both repository catalogs.
+Paired retention publishes crash-recoverable backup/PITR successors, applies
+minimum-window, timeline, and base-count policy, emits retained chain starts,
+and reclaims unreferenced backup and WAL objects.
+
+The archive limiter now charges source WAL/seal reads and repository writes in
+bounded burst-sized chunks, so a runtime update takes effect at the next chunk
+boundary. At this checkpoint, the remaining work was the slice 11/12 completion
+gate: audit typed ambiguous publication outcomes and cancellation boundaries,
+add process-kill and resource-failure coverage, run the required PITR performance
+matrix, and perform an independent requirement-by-requirement review before
+declaring RFC 023 complete.
+
+On 2026-09-17 the current branch passed `cargo make check` (1,261 tests) and
+`cargo make test-all-targets` (1,364 targets). The required fresh three-run
+1/4/8/16/32-writer
+PITR-enabled/disabled matrix is recorded in `docs/pitr/pitr-performance.md`.
+
+Engine-owned async task dispatch is now present for PITR lifecycle, barrier,
+restore, verification, retention, and status operations. Cancellation is
+fail-safe before durable-operation entry, restore checks cancellation between
+each bounded segment/batch replay unit, and archive streams check cancellation
+between source/repository chunks. Representative process-level boundary tests
+and the exact-target restore model oracle cover the durable operation paths.
+
+A Linux child-process crash test now covers both object-rename-before-catalog
+commit (the object is not advertised) and catalog-rename-before-directory-sync
+(the segment recovers exactly once) boundaries.
+
+The catalog crash coverage includes both pre-directory-sync and post-directory-
+sync child exits, with exact-once replay checks after reopen.
+
+Source-loss handling is also covered: a missing source WAL fails closed without
+adding a PITR catalog record.
+
+Repository path loss during catalog persistence now returns the typed
+`PublicationUnknown` outcome rather than claiming a durable commit.
+
+Purge cleanup coverage now asserts that the incomplete outcome reports bounded
+actual progress (`deleted_*`) without exceeding its pre-publication reclaim
+plan, including the valid zero-reclaim case.
+
+An end-to-end restore oracle now seals and archives three commits, restores each
+exact returned target, and compares all restored keys with the committed model.
+
+Manifest append-before-sync is covered by a child-process crash test that
+reopens and replays a `SegmentArchived` source-manifest record. Manifest
+snapshot rename is covered by a second child-process test. A child crash after
+paired purge catalogs become durable verifies reopen-and-retry cleanup.
+Repository outage and ENOSPC identity handling are covered by deterministic
+resource-failure tests.
+
+The final audit confirms all six implementation blocks are live, public
+contracts are wired, RFC 022 backup integration is paired, Linux validation and
+all-targets checks are green, and the required performance matrix is recorded.
+
+## Completion Record (2026-09-24)
+
+The remaining chaos, compatibility, cancellation, and performance gates closed
+after the 2026-09-16 checkpoint. Process-kill and resource-failure coverage,
+the independent requirements audit, and the 1/4/8/16/32-writer PITR matrix are
+complete; results are recorded in [the PITR performance baseline](pitr-performance.md).
+The full `cargo make check` gate passed with 1,324 tests on 2026-09-24. No
+implementation slices remain open in this plan; RFC 023's explicitly listed
+Phase 3 features remain separate follow-up work.
