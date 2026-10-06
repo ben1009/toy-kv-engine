@@ -183,3 +183,8 @@ Baseline timing executable SHA-256:
 `b7ab24282c690bd7289d586b13885d2d3325aa48e3787a585acbbcb89160b817`.
 Retained candidate SHA-256:
 `7f113ba4b8c116ea7adfb3bc058b983f7b10ad64db4023a5e93ecc62f8ecef76`.
+
+The subsequent [submission and key-preparation experiments](rfc-024-native-submission-and-key-preparation-20261006.md)
+retain this baseline. Neither additional candidate passes its frozen
+incremental screen; their failed controls and original observations remain
+reported separately.
