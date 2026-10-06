@@ -31,9 +31,9 @@ const EXTENT_INITIALIZATION_CHUNK: usize = 128 * 1024;
 // Large writes amortize extent conversion themselves. Zero-filling their
 // allocated space adds a second write of the same bytes on ext4.
 const ALLOCATION_ONLY_MIN_BATCH_BYTES: usize = 64 * 1024;
-// Wait for an already-admitted ticket cutoff when a written prefix is ready
-// to sync. Skip the wait when the prior sync was cheap; new admission cannot
-// extend the captured cutoff or deadline.
+// Coalesce already-admitted tickets with one fixed deadline. Refresh the
+// batching cutoff only when the written prefix catches it; a refresh cannot
+// extend the deadline. Skip the wait when the prior sync was cheap.
 const SYNC_COALESCE_WAIT: Duration = Duration::from_micros(400);
 const SYNC_COALESCE_MIN_SYNC: Duration = Duration::from_micros(100);
 
@@ -1224,13 +1224,20 @@ fn coalesce_admitted_prefix(inner: &RuntimeInner, completions: &Receiver<GroupWr
     }
 
     let deadline = Instant::now() + SYNC_COALESCE_WAIT;
-    let cutoff = inner.admission.lock().next_ticket;
+    let mut cutoff = inner.admission.lock().next_ticket;
     loop {
         let state = inner.durability.state.lock();
-        if state.poison_ticket.is_some() || state.written_frontier >= cutoff {
+        if state.poison_ticket.is_some() {
             return;
         }
+        let written = state.written_frontier;
         drop(state);
+        if written >= cutoff {
+            cutoff = inner.admission.lock().next_ticket;
+            if written >= cutoff {
+                return;
+            }
+        }
         let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
             return;
         };
