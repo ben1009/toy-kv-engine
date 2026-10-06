@@ -321,7 +321,11 @@ design. The coordinator may coalesce several completed groups into one call.
 When a written prefix is ready and already-admitted tickets remain unwritten,
 it may wait up to 400 microseconds for that captured ticket cutoff before
 syncing, but only after the preceding `fdatasync` took at least 100
-microseconds. New admission cannot extend the cutoff or deadline. A lone
+microseconds. When the written frontier reaches the cutoff, the coordinator
+may refresh that optional batching cutoff from current admission, using only
+the time remaining on the original deadline. New admission cannot extend or
+reset that deadline. This optional cutoff is separate from the fixed public
+barrier cutoffs and the target captured before each `fdatasync`. A lone
 writer does not incur this wait. The latency check avoids adding the wait on
 cheap-sync filesystems. This bounded wait is specific to the parallel
 pipeline; a widened solo-leader batching window reduced throughput.

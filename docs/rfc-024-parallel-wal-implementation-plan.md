@@ -197,8 +197,11 @@ verified after the coordinator exists.
   written frontier moved during the call. A measured optimization permits a
   400-microsecond wait only when the previous `fdatasync` took at least 100
   microseconds, a written prefix is ready, and tickets already admitted at
-  the snapshot remain unwritten; later admission cannot extend the cutoff or
-  deadline.
+  the snapshot remain unwritten. When the written frontier reaches that
+  optional batching cutoff, refresh it from current admission using only the
+  time remaining on the original deadline. Later admission cannot extend or
+  reset the deadline; public barrier cutoffs and the actual `fdatasync` target
+  remain fixed.
 - Make `submit_and_commit(ticket)` wait for **its own** durable result. Preserve
   an already acknowledged ticket if a later group fails. Keep `sync()`'s
   captured cutoff and empty no-op behavior.
