@@ -5310,33 +5310,33 @@ impl KvEngine {
         if inner.uses_native_async_writes() && !has_range {
             let runtime = tokio::runtime::Handle::try_current()
                 .context("native async writes require an active Tokio runtime")?;
-            let shared = LsmStorageInner::use_owned_batch_publish(batch.len());
-            #[cfg(feature = "bench")]
-            let started = std::time::Instant::now();
-            let (entries, _) =
-                LsmStorageInner::build_unique_point_batch_entries_or_dedup(batch, shared);
-            #[cfg(feature = "bench")]
-            inner
-                .write_profile
-                .record_batch_build_ns(started.elapsed().as_nanos() as u64);
-            // Dropping the JoinHandle detaches the owned commit. Close drains
-            // its admission guard; runtime cancellation settles its reservation.
-            // Retain the public owner too: its synchronous Drop must not wait
-            // for a native task on the same executor that still needs polling.
-            let owner = inner
-                .weak_engine
-                .get()
-                .and_then(std::sync::Weak::upgrade)
-                .context("engine handle is no longer available")?;
-            return runtime
-                .spawn(async move {
-                    owner
-                        .inner
-                        .write_entries_native(entries, shared, guard)
-                        .await
-                })
-                .await
-                .context("native async commit task failed")?;
+            if let Some(owner) = inner.weak_engine.get().and_then(std::sync::Weak::upgrade) {
+                let shared = LsmStorageInner::use_owned_batch_publish(batch.len());
+                #[cfg(feature = "bench")]
+                let started = std::time::Instant::now();
+                let (entries, _) =
+                    LsmStorageInner::build_unique_point_batch_entries_or_dedup(batch, shared);
+                #[cfg(feature = "bench")]
+                inner
+                    .write_profile
+                    .record_batch_build_ns(started.elapsed().as_nanos() as u64);
+                // Dropping the JoinHandle detaches the owned commit. Close drains
+                // its admission guard; runtime cancellation settles its reservation.
+                // Retain the public owner too: its synchronous Drop must not wait
+                // for a native task on the same executor that still needs polling.
+                return runtime
+                    .spawn(async move {
+                        owner
+                            .inner
+                            .write_entries_native(entries, shared, guard)
+                            .await
+                    })
+                    .await
+                    .context("native async commit task failed")?;
+            }
+            // Moving out of the original Arc invalidates its weak owner. The
+            // blocking path keeps storage and admission alive without making
+            // the moved handle's Drop depend on native executor progress.
         }
         let owned: Vec<WriteBatchRecord<Vec<u8>>> = batch
             .iter()

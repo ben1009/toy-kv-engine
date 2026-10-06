@@ -234,6 +234,41 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn native_async_moved_engine_point_writes_recover() {
+        let directory = tempfile::tempdir().unwrap();
+        let engine = Arc::try_unwrap(open(directory.path()))
+            .ok()
+            .expect("engine has one public owner");
+        engine
+            .put_async(b"point", b"before")
+            .await
+            .expect("a moved engine must still accept async point writes");
+        engine
+            .write_batch_async(&[
+                WriteBatchRecord::Put(b"batch".as_slice(), b"value".as_slice()),
+                WriteBatchRecord::Del(b"point".as_slice()),
+            ])
+            .await
+            .unwrap();
+
+        // Rewrapping cannot revive the constructor's original weak owner.
+        let engine = Arc::new(engine);
+        engine.put_async(b"rewrapped", b"survives").await.unwrap();
+        engine.delete_async(b"batch").await.unwrap();
+        engine.close_async().await.unwrap();
+        drop(engine);
+
+        let recovered = open(directory.path());
+        assert_eq!(recovered.get(b"point").unwrap(), None);
+        assert_eq!(recovered.get(b"batch").unwrap(), None);
+        assert_eq!(
+            recovered.get(b"rewrapped").unwrap().as_deref(),
+            Some(b"survives".as_slice())
+        );
+        recovered.close_async().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn native_async_queued_preparation_does_not_pin_the_old_memtable() {
         let directory = tempfile::tempdir().unwrap();
         let engine = open(directory.path());
