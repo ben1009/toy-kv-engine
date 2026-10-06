@@ -2,9 +2,20 @@
 
 | Field | Value |
 | --- | --- |
-| Status | Proposal (benchmark gated) |
+| Status | Implemented; default for ordinary v4 WALs by maintainer decision |
 | Date | 2026-09-24 |
 | Author | kv-engine Contributors |
+
+## Current adoption status
+
+Ordinary v4 WALs now use the parallel pipeline by default, including native
+async waits for non-serializable point writes. PITR v5/v6 and legacy formats
+retain their existing paths; leader is still an explicit v4 control. The
+[default adoption note](../docs/rfc-024-parallel-wal-default-20261005.md) records
+the maintainer decision and its scope. The original performance gate remains
+unqualified; the proposal and benchmark criteria below are retained as the
+historical design, not evidence that the gate passed. The current limits are
+32 in-flight groups and 256 ring entries.
 
 ## Summary
 
@@ -75,7 +86,7 @@ The experiment must therefore measure `wal_concurrent` end to end, including
 commit-group formation and publication wait, before claiming to address the
 regression.
 
-## Current design and evidence
+## Baseline design and evidence at proposal time
 
 [`Wal::put_batch`](../kv-engine/src/wal.rs) and the PITR batch encoder prepare
 4096-byte-aligned buffers, then assign monotonically increasing tickets under
@@ -198,6 +209,25 @@ that. A group descriptor records its ticket interval, file range, outstanding
 buffer references, and state (`assigned`, `writing`, `written`, `durable`, or
 `failed`). A group never contains a ticket gap.
 
+**Historical implementation (2026-10-03):** The candidate packed on an
+admitting writer, without a separate packer thread. Admission stored each
+batch's physical offset and aligned length; packing validated and reused them.
+The producer tried the packer mutex while holding admission. A draining packer
+released its mutex while still holding admission after finding the queue empty,
+so queued work could not be stranded waiting for another client. Extent preparation
+and group-slot waits ran outside the admission mutex, but could block the admitting
+writer. MVCC point puts held `mvcc.write_lock` through packing, so other
+point puts could wait. The [write-order handoff experiment](../docs/rfc-024-wal-admission-handoff-20261002.md)
+records why releasing that guard before packing was rejected in that version.
+
+**Implementation update (2026-10-05):** The
+[native async integration](../docs/rfc-024-native-async-integration-20261005.md)
+uses a dedicated `wal-ordered-packer` thread for both synchronous and native
+async admissions. Admission still stores the physical offset and aligned
+length atomically with the ticket and ready buffer. Producers enqueue and
+notify the packer; extent preparation and group-slot waits run on that thread.
+The sequencer no longer holds `mvcc.write_lock` through packing.
+
 Buffer admission reserves **resident `DirectBuf` capacity**, not just encoded WAL
 bytes, against an initial 64 MiB queued-and-in-flight budget, plus a separate
 initial limit of 256 queued batches. Today even a 4 KiB write normally owns
@@ -216,8 +246,9 @@ fixed allocation. Only 256 KiB buffers may return to the bounded 64-slot pool;
 larger buffers are freed after their write CQE and are never retained
 idle. The worker is independent of blocked producers, so backpressure cannot
 wait for an uncalled `submit_and_commit`.
-Pressure also wakes the packer; it must not rely on a client arriving to
-trigger dispatch.
+The current implementation wakes its dedicated packer on admission; one queued
+notification suffices because the packer drains admitted work without requiring
+a subsequent client.
 Release each buffer's budget when its full-length write CQE confirms that the
 kernel has finished reading it. Recycle its `DirectBuf` immediately, even if
 the group is still waiting for `fdatasync`; the group descriptor retains only
@@ -297,9 +328,18 @@ at most one sync in flight. The I/O worker continues submitting later groups
 while that call runs; this is why the coordinator cannot block the ring worker
 on `fdatasync`. Whether a filesystem lets the sync overlap later direct
 writes efficiently is a device-backed measurement, not a guarantee of this
-design. The coordinator may coalesce several completed groups into one call but
-does not add a fixed batching delay: the measured widened solo-leader window
-reduced throughput.
+design. The coordinator may coalesce several completed groups into one call.
+When a written prefix is ready and already-admitted tickets remain unwritten,
+it may wait up to 400 microseconds for that captured ticket cutoff before
+syncing, but only after the preceding `fdatasync` took at least 100
+microseconds. When the written frontier reaches the cutoff, the coordinator
+may refresh that optional batching cutoff from current admission, using only
+the time remaining on the original deadline. New admission cannot extend or
+reset that deadline. This optional cutoff is separate from the fixed public
+barrier cutoffs and the target captured before each `fdatasync`. A lone
+writer does not incur this wait. The latency check avoids adding the wait on
+cheap-sync filesystems. This bounded wait is specific to the parallel
+pipeline; a widened solo-leader batching window reduced throughput.
 
 On successful sync, the coordinator advances `durable_ticket` to one past the
 captured ticket and wakes only tickets now covered. A later group may also
@@ -512,8 +552,22 @@ report the measured bottleneck rather than claiming the regression is fixed.
 
 ## Related documents
 
+- [Default adoption](../docs/rfc-024-parallel-wal-default-20261005.md):
+  current v4 default, explicit leader control, format compatibility, and
+  accepted performance limits.
+
 - [Implementation plan](../docs/rfc-024-parallel-wal-implementation-plan.md):
   reviewable implementation slices and validation order.
+- [Parallel WAL benchmark outcomes](../docs/rfc-024-parallel-wal-benchmark.md):
+  historical measurements and retained or rejected optimizations.
+- [October 5 native async versus leader matrix](../docs/rfc-024-native-async-vs-leader-20261005.md):
+  measured implementation's one-put and batch64 results, peak and paired
+  estimates, CPU cost, actual pipeline depth, and repeatability limits.
+- [Latest batch64 versus leader rerun](../docs/rfc-024-native-batch64-leader-rerun-20261006.md):
+  retained backend's eight- and sixteen-writer observations, source provenance,
+  and failed stability controls.
+- [Qualification matrix](../docs/rfc-024-wal-qualification-20261001.md):
+  same-session adoption checks and remaining gate failures.
 - [RFC 012](012-parallel-wal.md): original parallel-WAL proposal and historical sketches.
 - [RFC 023](023-point-in-time-recovery.md): PITR WAL format, commit ordering, and recovery contract.
 - [SpanDB paper](https://www.usenix.org/system/files/fast21-chen-hao.pdf):

@@ -13,6 +13,7 @@
 use kv_engine::chaos::failpoint::{self, FailScenario};
 use kv_engine::compact::{CompactionOptions, LeveledCompactionOptions};
 use kv_engine::lsm_storage::{KvEngine, LsmStorageOptions};
+use kv_engine::wal::WalIoMode;
 
 fn is_io_uring_unavailable_error(e: &anyhow::Error) -> bool {
     e.chain().any(|cause| {
@@ -53,6 +54,12 @@ fn run_failpoint_test(
     if skip_if_io_uring_unavailable(&opts) {
         return;
     }
+    // These hooks are inside client-led submission. Other failpoints exercise
+    // the engine's default pipeline, including producer and manifest boundaries.
+    let mode = match fp_name {
+        "wal.after_submit_before_wait" | "wal.after_fsync_before_publish" => WalIoMode::Leader,
+        _ => WalIoMode::default(),
+    };
     let scenario = FailScenario::setup();
     failpoint::cfg(fp_name, "panic").expect("failpoint cfg");
 
@@ -61,7 +68,7 @@ fn run_failpoint_test(
 
     // Phase 1: run the body — the failpoint must panic here.
     let phase1 = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let engine = KvEngine::open(&db_path, opts.clone()).expect("open");
+        let engine = KvEngine::open_with_wal_io_mode(&db_path, opts.clone(), mode).expect("open");
         body(&engine);
         engine.close().expect("close");
     }));
@@ -75,12 +82,14 @@ fn run_failpoint_test(
 
     // Phase 2: reopen and verify.
     if durable {
-        let engine = KvEngine::open(&db_path, opts.clone()).expect("reopen after failpoint");
+        let engine = KvEngine::open_with_wal_io_mode(&db_path, opts.clone(), mode)
+            .expect("reopen after failpoint");
         verify(&engine);
         engine.close().expect("close after verify");
     } else {
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let engine = KvEngine::open(&db_path, opts.clone()).expect("reopen after failpoint");
+            let engine = KvEngine::open_with_wal_io_mode(&db_path, opts.clone(), mode)
+                .expect("reopen after failpoint");
             verify(&engine);
             engine.close().expect("close after verify");
         }));

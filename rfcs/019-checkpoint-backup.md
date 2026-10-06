@@ -270,10 +270,18 @@ impl KvEngine {
 }
 ```
 
-The async methods use the same `BlockingExecutor` pattern as `open_async`,
-`close_async`, `force_flush_async`, and `force_full_compaction_async`. The
+The async methods use the same bounded `BlockingExecutor` pattern as recovery,
+`force_flush_async`, and `force_full_compaction_async`. `close_async` now uses
+an independent shared shutdown thread so admitted work can still use the
+blocking pool while close drains it. The
 checkpoint algorithm is filesystem-heavy and should not run on Tokio worker
 threads directly.
+
+With the default parallel v4 WAL, checkpoint capture drains native memtable
+leases before freeze, retires the old WAL runtime, and rejects a poisoned
+MVCC publication sequencer. A durable but hidden successor cannot bypass a
+cancelled predecessor in a checkpoint. See
+[the native integration contract](../docs/rfc-024-native-async-integration-20261005.md).
 
 ### 6.3 CLI Hook
 

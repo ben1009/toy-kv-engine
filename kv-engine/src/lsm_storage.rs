@@ -14,9 +14,16 @@ use ahash::{AHashMap, AHashSet};
 use anyhow::{Context, Result, anyhow, ensure};
 use arc_swap::ArcSwap;
 use bytes::Bytes;
-use parking_lot::{Condvar, Mutex, MutexGuard, RwLock, RwLockWriteGuard};
+use parking_lot::{Condvar, Mutex, MutexGuard};
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
+
+mod async_close;
+pub use async_close::{AsyncCloseError, AsyncCloseErrorKind};
+mod native_write;
+mod write_gate;
+
+use write_gate::{ActiveMemtableGate, ActiveMemtableWriteGuard};
 
 use crate::blocking_executor::BlockingExecutor;
 use crate::{
@@ -1553,10 +1560,12 @@ pub(crate) struct LsmStorageInner {
     // imm_memtables, flush to l0, so the foreground tasks are not blocked
     // kind of similar to https://twitter.com/MarkCallaghanDB/status/1574425353564475394
     pub(crate) state_lock: Mutex<()>,
-    /// Protects the active memtable during writes. `put()` holds a read lock (concurrent
-    /// writes OK), `force_freeze_with_new_memtable()` holds a write lock (blocks writes
-    /// during swap). Prevents writes to a memtable that has already been frozen+flushed.
-    pub(crate) active_memtable_lock: parking_lot::RwLock<()>,
+    /// Synchronous writers hold read guards; native async writers own leases.
+    /// Exclusive operations stop both admissions and drain every writer before
+    /// swapping, flushing or conditionally rewriting the active memtable.
+    pub(crate) active_memtable_lock: ActiveMemtableGate,
+    #[cfg(test)]
+    native_write_pause: Mutex<Option<Arc<native_write::NativeWritePause>>>,
     path: PathBuf,
     pub(crate) block_cache: Arc<BlockCache>,
     next_sst_id: AtomicUsize,
@@ -1674,15 +1683,6 @@ impl LifecycleHandle {
         }
     }
 
-    pub(crate) async fn wait_for_quiescence_async(&self) {
-        loop {
-            if self.0.is_quiescent() {
-                return;
-            }
-            self.0.close_notify.notified().await;
-        }
-    }
-
     pub(crate) fn wait_for_closed(&self) {
         let mut lock = self.0.wait_lock.lock();
         while !self.is_closed() {
@@ -1690,20 +1690,24 @@ impl LifecycleHandle {
         }
     }
 
-    pub(crate) async fn wait_for_closed_async(&self) {
-        loop {
-            if self.is_closed() {
-                return;
-            }
-            self.0.close_notify.notified().await;
-        }
-    }
-
     pub(crate) fn finish_close(&self) {
         self.0.state.store(LIFECYCLE_CLOSED, Ordering::Release);
         let _lock = self.0.wait_lock.lock();
         self.0.wait_cv.notify_all();
-        self.0.close_notify.notify_waiters();
+    }
+
+    fn finish_close_with_result(&self, result: &Result<()>) {
+        *self.0.close_error.lock() = result
+            .as_ref()
+            .err()
+            .map(async_close::CachedCloseError::new);
+        self.finish_close();
+    }
+
+    fn close_result(&self) -> Result<()> {
+        self.0.close_error.lock().as_ref().map_or(Ok(()), |error| {
+            Err(anyhow::Error::new(error.clone()).context("engine close failed"))
+        })
     }
 
     pub(crate) fn is_closed(&self) -> bool {
@@ -1719,7 +1723,7 @@ struct LifecycleState {
     active_txns: AtomicU64,
     wait_lock: Mutex<()>,
     wait_cv: Condvar,
-    close_notify: tokio::sync::Notify,
+    close_error: Mutex<Option<async_close::CachedCloseError>>,
 }
 
 impl LifecycleState {
@@ -1757,7 +1761,6 @@ impl LifecycleState {
         {
             let _lock = self.wait_lock.lock();
             self.wait_cv.notify_all();
-            self.close_notify.notify_waiters();
         }
     }
 }
@@ -1790,10 +1793,11 @@ impl Drop for AdmissionGuard {
     }
 }
 
+#[derive(Clone)]
 struct BackgroundWorkers {
     shutdown: Arc<AtomicU8>,
     shutdown_notify: Arc<tokio::sync::Notify>,
-    runtime_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
+    runtime_thread: Arc<Mutex<Option<std::thread::JoinHandle<()>>>>,
 }
 
 impl BackgroundWorkers {
@@ -1909,7 +1913,7 @@ impl BackgroundWorkers {
         Ok(Self {
             shutdown,
             shutdown_notify,
-            runtime_thread: Mutex::new(Some(runtime_thread)),
+            runtime_thread: Arc::new(Mutex::new(Some(runtime_thread))),
         })
     }
 
@@ -1922,17 +1926,6 @@ impl BackgroundWorkers {
     fn join_blocking(&self) -> Result<()> {
         if let Some(handle) = self.runtime_thread.lock().take() {
             handle.join().map_err(|e| anyhow!("{:?}", e))?;
-        }
-
-        Ok(())
-    }
-
-    async fn join_async(&self, blocking: &BlockingExecutor) -> Result<()> {
-        let handle = self.runtime_thread.lock().take();
-        if let Some(handle) = handle {
-            blocking
-                .run_result(move || handle.join().map_err(|e| anyhow!("{:?}", e)))
-                .await?;
         }
 
         Ok(())
@@ -2110,6 +2103,8 @@ pub struct KvEngine {
     pub(crate) inner: Arc<LsmStorageInner>,
     /// Engine-owned runtime hosting periodic background maintenance tasks.
     background_workers: BackgroundWorkers,
+    /// One independent shutdown owner shared by all async close waiters.
+    async_close: async_close::AsyncClose,
     /// Runtime PITR scheduling state, attached only after durable enable/resume.
     pitr_runtime: Mutex<Option<Arc<crate::pitr::api::PitrRuntimeController>>>,
     /// Serializes PITR lifecycle transitions that span durable manifest writes.
@@ -2175,60 +2170,73 @@ impl KvEngine {
     }
 
     fn close_storage(&self) -> Result<()> {
+        Self::close_storage_parts(&self.inner, &self.background_workers)
+    }
+
+    fn close_storage_parts(
+        inner: &LsmStorageInner,
+        background_workers: &BackgroundWorkers,
+    ) -> Result<()> {
         // Route the synchronous close through the same lifecycle transition as
         // `close_async`: reject new admission, wait for in-flight scans/txns/
         // snapshots to drain, then finish. Idempotent: a second call observes
-        // CLOSED (or CLOSING) and returns Ok without re-running shutdown.
-        match self.inner.lifecycle.begin_close() {
-            CloseState::AlreadyClosed => return Ok(()),
+        // CLOSED (or CLOSING) and receives the saved outcome without
+        // re-running shutdown.
+        match inner.lifecycle.begin_close() {
+            CloseState::AlreadyClosed => return inner.lifecycle.close_result(),
             CloseState::AlreadyClosing => {
-                self.inner.lifecycle.wait_for_closed();
-                return Ok(());
+                inner.lifecycle.wait_for_closed();
+                return inner.lifecycle.close_result();
             }
             CloseState::Started => {}
         }
-        self.background_workers.begin_shutdown(&self.inner);
-        self.background_workers.join_blocking()?;
+        background_workers.begin_shutdown(inner);
+        let background_result = background_workers.join_blocking();
         // Wait for admitted readers (snapshots, async scans/txns) to release
         // before tearing down state. Sync `scan`/`new_txn` do not take a
         // lifecycle guard, so they do not block here.
-        self.inner.lifecycle.wait_for_quiescence();
+        inner.lifecycle.wait_for_quiescence();
         let result = (|| -> Result<()> {
-            if self.inner.options.enable_wal {
-                self.inner.sync_and_close_parallel_wals()?;
+            if inner.options.enable_wal {
+                inner.sync_and_close_parallel_wals()?;
             } else {
                 // flush memtable to imm_memtable
-                let new_id = self.inner.next_sst_id();
-                let new_mt = MemTable::create(new_id, self.inner.vlog.is_some());
-                self.inner.force_freeze_with_new_memtable(new_mt)?;
+                let new_id = inner.next_sst_id();
+                let new_mt = MemTable::create(new_id, inner.vlog.is_some());
+                inner.force_freeze_with_new_memtable(new_mt)?;
                 // flush all imm_memtable to disk
-                while !self.inner.state.load().imm_memtables.is_empty() {
-                    self.inner.force_flush_next_imm_memtable()?;
+                while !inner.state.load().imm_memtables.is_empty() {
+                    inner.force_flush_next_imm_memtable()?;
                 }
             }
 
             Ok(())
         })();
-        // Always finish close so the lifecycle does not stay stuck in CLOSING
-        // even if the final sync/flush fails (mirrors `close_async`).
-        self.inner.lifecycle.finish_close();
+        // Always finish close, including join and sync errors. Later close
+        // callers receive the same terminal outcome.
+        let result = background_result.and(result);
+        inner.lifecycle.finish_close_with_result(&result);
 
         result
     }
 
     /// Start the storage engine by either loading an existing directory or creating a new one if
     /// the directory does not exist.
+    ///
+    /// When WAL is enabled, ordinary v4 WALs use the parallel pipeline by default.
+    /// PITR and older WAL formats retain their compatible I/O paths.
     pub fn open(path: impl AsRef<Path>, options: LsmStorageOptions) -> Result<Arc<Self>> {
-        Self::open_with_wal_io_mode(path, options, crate::wal::WalIoMode::Leader)
+        Self::open_with_wal_io_mode(path, options, crate::wal::WalIoMode::default())
     }
 
     /// Open an engine with a selected WAL I/O path.
     ///
     /// This hidden selector is used by `write-perf` to compare paths in one
-    /// binary. `Parallel` opts ordinary v4 WALs into the dedicated pipeline;
-    /// legacy and PITR WALs retain their existing path. Async writes and close
-    /// remain unavailable with the candidate until their lifecycle prerequisites
-    /// are complete.
+    /// binary. Ordinary v4 WALs use `Parallel` by default; `Leader` selects
+    /// the client-led control path. The dedicated pipeline applies only to v4;
+    /// legacy and PITR WALs retain their existing path. Non-serializable async
+    /// point writes await v4 durability and MVCC publication natively. Other
+    /// write shapes keep their engine-owned blocking boundary.
     #[doc(hidden)]
     pub fn open_with_wal_io_mode(
         path: impl AsRef<Path>,
@@ -2245,6 +2253,7 @@ impl KvEngine {
     /// gone — so refusing to open preserves nothing. Each dropped id is logged
     /// and returned. Repair is refused when PITR owns the segments, where a
     /// missing WAL means lost archive coverage and must stay fail-closed.
+    /// Ordinary v4 WALs use the same parallel default as [`Self::open`].
     pub fn open_repairing(
         path: impl AsRef<Path>,
         options: LsmStorageOptions,
@@ -2257,7 +2266,7 @@ impl KvEngine {
             options.enable_wal,
             "repairing requires enable_wal: a database opened without WAL does not recover memtables"
         );
-        Self::open_inner(path, options, true, crate::wal::WalIoMode::Leader)
+        Self::open_inner(path, options, true, crate::wal::WalIoMode::default())
     }
 
     fn open_inner(
@@ -2306,6 +2315,7 @@ impl KvEngine {
         let engine = Arc::new(Self {
             inner,
             background_workers,
+            async_close: async_close::AsyncClose::default(),
             pitr_runtime: Mutex::new(None),
             pitr_operation_lock: Mutex::new(()),
             pitr_publication_unknown: AtomicBool::new(false),
@@ -4594,7 +4604,7 @@ impl KvEngine {
     /// this drains the entire queue.
     ///
     /// # Warning
-    /// Inherits the same race conditions as [`force_flush`] — only use in
+    /// Inherits the same race conditions as [`Self::force_flush`] — only use in
     /// tests or when no concurrent writes are happening.
     pub fn drain_flush(&self) -> Result<()> {
         self.force_flush()?;
@@ -4980,14 +4990,6 @@ impl KvEngine {
 // ── Async API (RFC 014 Phase 1) ─────────────────────────────────────
 
 impl KvEngine {
-    fn ensure_async_wal_path_supported(&self) -> Result<()> {
-        ensure!(
-            !self.inner.selects_parallel_wal_io(),
-            "parallel WAL is not available through async APIs yet"
-        );
-        Ok(())
-    }
-
     /// Eagerly dispatches the PITR enable transition to the blocking pool.
     #[cfg(target_os = "linux")]
     pub fn enable_pitr_async(
@@ -5078,6 +5080,7 @@ impl KvEngine {
 
     /// Async open. Recovery work runs on the blocking thread pool.
     /// SST files are opened concurrently to reduce cold-start latency.
+    /// WAL selection follows [`Self::open`], including the ordinary-v4 parallel default.
     pub async fn open_async(
         path: impl AsRef<Path>,
         options: LsmStorageOptions,
@@ -5088,7 +5091,12 @@ impl KvEngine {
         let plan = {
             let p = path_buf.clone();
             tokio::task::spawn_blocking(move || {
-                LsmStorageInner::recover_phase1(&p, options, false, crate::wal::WalIoMode::Leader)
+                LsmStorageInner::recover_phase1(
+                    &p,
+                    options,
+                    false,
+                    crate::wal::WalIoMode::default(),
+                )
             })
             .await
             .expect("recovery phase 1 panicked")?
@@ -5139,6 +5147,7 @@ impl KvEngine {
         let engine = Arc::new(Self {
             inner,
             background_workers,
+            async_close: async_close::AsyncClose::default(),
             pitr_runtime: Mutex::new(None),
             pitr_operation_lock: Mutex::new(()),
             pitr_publication_unknown: AtomicBool::new(false),
@@ -5167,92 +5176,72 @@ impl KvEngine {
         Ok(engine)
     }
 
-    /// Async graceful shutdown.
+    /// Async graceful shutdown. Once dispatched, the shutdown owner completes
+    /// even if the caller cancels, including settling a terminal close error.
+    /// Callers share one independent engine-owned thread: shutdown must not
+    /// occupy the blocking pool that admitted writes need to finish rotation.
+    /// Non-PITR shutdown also supports an engine moved out of its original
+    /// `Arc`; shared storage and worker handles retain the shutdown owner.
     pub async fn close_async(&self) -> Result<()> {
-        self.ensure_async_wal_path_supported()?;
-        let pitr_mode = self.pitr_manifest_state.lock().mode;
-        if pitr_mode != crate::pitr::manifest::PitrMode::Disabled {
-            // The PITR close joins worker threads and waits for lifecycle
-            // quiescence, exactly like the storage close below, so it has to run
-            // off the executor: an in-flight async scan or transaction needs this
-            // thread to release the guards that wait is for. Running it inline
-            // deadlocks a `current_thread` runtime, whose only thread is the one
-            // blocked in here.
-            let blocking = self.inner.blocking.clone();
-            let inner = self.inner.clone();
-            return blocking
-                .run_result(move || -> Result<()> {
-                    let engine = inner
-                        .weak_engine
-                        .get()
-                        .and_then(std::sync::Weak::upgrade)
-                        .ok_or_else(|| anyhow!("engine handle is no longer available"))?;
-                    engine.close()
+        let owner = self
+            .inner
+            .weak_engine
+            .get()
+            .and_then(std::sync::Weak::upgrade);
+        let attempt = match owner {
+            Some(engine) => self
+                .async_close
+                .start(&self.inner.lifecycle, move || engine.close()),
+            None => {
+                ensure!(
+                    self.pitr_manifest_state.lock().mode
+                        == crate::pitr::manifest::PitrMode::Disabled,
+                    "engine handle is no longer available for PITR shutdown"
+                );
+                // A moved engine has no canonical Arc to retain. Storage and
+                // background-worker ownership can outlive it independently.
+                let inner = Arc::clone(&self.inner);
+                let background_workers = self.background_workers.clone();
+                self.async_close.start(&self.inner.lifecycle, move || {
+                    Self::close_storage_parts(&inner, &background_workers)
                 })
-                .await;
-        }
-        match self.inner.lifecycle.begin_close() {
-            CloseState::AlreadyClosed => return Ok(()),
-            CloseState::AlreadyClosing => {
-                self.inner.lifecycle.wait_for_closed_async().await;
-                return Ok(());
             }
-            CloseState::Started => {}
-        }
-        self.background_workers.begin_shutdown(&self.inner);
-        let b = self.inner.blocking.clone();
-        self.background_workers.join_async(&b).await?;
-        self.inner.lifecycle.wait_for_quiescence_async().await;
-        let inner = self.inner.clone();
-        let wal = inner.options.enable_wal;
-        // Always call finish_close even if the final sync/flush fails,
-        // so the lifecycle does not stay stuck in CLOSING.
-        let result = b
-            .run_result(move || -> anyhow::Result<()> {
-                if wal {
-                    inner.sync_and_close_parallel_wals()?;
-                } else {
-                    let id = inner.next_sst_id();
-                    let mt = MemTable::create(id, inner.vlog.is_some());
-                    inner.force_freeze_with_new_memtable(mt)?;
-                    while !inner.state.load().imm_memtables.is_empty() {
-                        inner.force_flush_next_imm_memtable()?;
-                    }
-                }
+        };
 
-                Ok(())
-            })
-            .await;
-        self.inner.lifecycle.finish_close();
-        result?;
-
-        Ok(())
+        attempt.wait().await
     }
 
     /// Async point get.
     pub async fn get_async(&self, key: &[u8]) -> Result<Option<Bytes>> {
-        let _guard = self.inner.lifecycle.admit_write()?;
+        let guard = self.inner.lifecycle.admit_write()?;
         let inner = self.inner.clone();
         let key = Bytes::copy_from_slice(key);
         self.inner
             .blocking
-            .run_result(move || inner.get(&key))
+            .run_result(move || {
+                let _guard = guard;
+                inner.get(&key)
+            })
             .await
     }
 
     /// Async batch point get.
     pub async fn batch_get_async(&self, keys: &[&[u8]]) -> Vec<Result<Option<Bytes>>> {
         // Propagate admission failure to every key result.
-        if let Err(e) = self.inner.lifecycle.admit_write() {
-            return std::iter::repeat_with(|| Err(anyhow::anyhow!("{}", e)))
-                .take(keys.len())
-                .collect();
-        }
+        let guard = match self.inner.lifecycle.admit_write() {
+            Ok(guard) => guard,
+            Err(error) => {
+                return std::iter::repeat_with(|| Err(anyhow!("{error}")))
+                    .take(keys.len())
+                    .collect();
+            }
+        };
         let inner = self.inner.clone();
         let kk: Vec<Vec<u8>> = keys.iter().map(|k| k.to_vec()).collect();
         self.inner
             .blocking
             .run(move || {
+                let _guard = guard;
                 let refs: Vec<&[u8]> = kk.iter().map(|k| k.as_slice()).collect();
                 inner.batch_get(&refs)
             })
@@ -5261,50 +5250,105 @@ impl KvEngine {
 
     /// Async put.
     pub async fn put_async(&self, key: &[u8], value: &[u8]) -> Result<()> {
-        self.ensure_async_wal_path_supported()?;
-        let _guard = self.inner.lifecycle.admit_write()?;
+        if self.inner.uses_native_async_writes() {
+            ensure!(
+                value != crate::mvcc::TOMBSTONE_VALUE,
+                "value must not be the tombstone marker byte (0x02)"
+            );
+            return self
+                .write_batch_async(&[WriteBatchRecord::Put(key, value)])
+                .await;
+        }
+        let guard = self.inner.lifecycle.admit_write()?;
         let inner = self.inner.clone();
         let key = key.to_vec();
         let value = value.to_vec();
         self.inner
             .blocking
-            .run_result(move || inner.put(&key, &value))
+            .run_result(move || {
+                let _guard = guard;
+                inner.put(&key, &value)
+            })
             .await
     }
 
     /// Async delete.
     pub async fn delete_async(&self, key: &[u8]) -> Result<()> {
-        self.ensure_async_wal_path_supported()?;
-        let _guard = self.inner.lifecycle.admit_write()?;
+        if self.inner.uses_native_async_writes() {
+            return self.write_batch_async(&[WriteBatchRecord::Del(key)]).await;
+        }
+        let guard = self.inner.lifecycle.admit_write()?;
         let inner = self.inner.clone();
         let key = key.to_vec();
         self.inner
             .blocking
-            .run_result(move || inner.delete(&key))
+            .run_result(move || {
+                let _guard = guard;
+                inner.delete(&key)
+            })
             .await
     }
 
     /// Async delete range.
     pub async fn delete_range_async(&self, start: &[u8], end: &[u8]) -> Result<()> {
-        self.ensure_async_wal_path_supported()?;
-        let _guard = self.inner.lifecycle.admit_write()?;
+        let guard = self.inner.lifecycle.admit_write()?;
         let inner = self.inner.clone();
         let start = start.to_vec();
         let end = end.to_vec();
         self.inner
             .blocking
-            .run_result(move || inner.delete_range_internal(&start, &end))
+            .run_result(move || {
+                let _guard = guard;
+                inner.delete_range_internal(&start, &end)
+            })
             .await
     }
 
     /// Async write batch.
+    ///
+    /// With an ordinary parallel v4 WAL, non-serializable point batches await
+    /// durability and ordered publication without occupying a blocking thread.
+    /// After dispatch, cancelling the caller's wait does not cancel its owned
+    /// commit; its outcome can remain unknown to that caller. Shutdown drains
+    /// the commit before closing the WAL.
     pub async fn write_batch_async<T: AsRef<[u8]>>(
         &self,
         batch: &[WriteBatchRecord<T>],
     ) -> Result<()> {
-        self.ensure_async_wal_path_supported()?;
-        let _guard = self.inner.lifecycle.admit_write()?;
+        let guard = self.inner.lifecycle.admit_write()?;
         let inner = self.inner.clone();
+        let (has_range, _) = LsmStorageInner::validate_and_classify_write_batch(batch)?;
+        if inner.uses_native_async_writes() && !has_range {
+            let runtime = tokio::runtime::Handle::try_current()
+                .context("native async writes require an active Tokio runtime")?;
+            if let Some(owner) = inner.weak_engine.get().and_then(std::sync::Weak::upgrade) {
+                let shared = LsmStorageInner::use_owned_batch_publish(batch.len());
+                #[cfg(feature = "bench")]
+                let started = std::time::Instant::now();
+                let (entries, _) =
+                    LsmStorageInner::build_unique_point_batch_entries_or_dedup(batch, shared);
+                #[cfg(feature = "bench")]
+                inner
+                    .write_profile
+                    .record_batch_build_ns(started.elapsed().as_nanos() as u64);
+                // Dropping the JoinHandle detaches the owned commit. Close drains
+                // its admission guard; runtime cancellation settles its reservation.
+                // Retain the public owner too: its synchronous Drop must not wait
+                // for a native task on the same executor that still needs polling.
+                return runtime
+                    .spawn(async move {
+                        owner
+                            .inner
+                            .write_entries_native(entries, shared, guard)
+                            .await
+                    })
+                    .await
+                    .context("native async commit task failed")?;
+            }
+            // Moving out of the original Arc invalidates its weak owner. The
+            // blocking path keeps storage and admission alive without making
+            // the moved handle's Drop depend on native executor progress.
+        }
         let owned: Vec<WriteBatchRecord<Vec<u8>>> = batch
             .iter()
             .map(|r| match r {
@@ -5323,16 +5367,24 @@ impl KvEngine {
             .collect();
         self.inner
             .blocking
-            .run_result(move || inner.write_batch(&owned))
+            .run_result(move || {
+                let _guard = guard;
+                inner.write_batch(&owned)
+            })
             .await
     }
 
     /// Async sync.
     pub async fn sync_async(&self) -> Result<()> {
-        self.ensure_async_wal_path_supported()?;
-        let _guard = self.inner.lifecycle.admit_write()?;
+        let guard = self.inner.lifecycle.admit_write()?;
         let inner = self.inner.clone();
-        self.inner.blocking.run_result(move || inner.sync()).await
+        self.inner
+            .blocking
+            .run_result(move || {
+                let _guard = guard;
+                inner.sync()
+            })
+            .await
     }
 
     /// Async scan.
@@ -5433,11 +5485,12 @@ impl KvEngine {
 
     /// Async force flush.
     pub async fn force_flush_async(&self) -> Result<()> {
-        let _guard = self.inner.lifecycle.admit_write()?;
+        let guard = self.inner.lifecycle.admit_write()?;
         let inner = self.inner.clone();
         self.inner
             .blocking
             .run_result(move || {
+                let _guard = guard;
                 let _checkpoint_guard = inner.checkpoint_lock.lock();
                 if !inner.state.load().memtable.is_empty() {
                     inner.force_freeze_memtable(&inner.state_lock.lock())?;
@@ -5453,11 +5506,12 @@ impl KvEngine {
 
     /// Async drain flush.
     pub async fn drain_flush_async(&self) -> Result<()> {
-        let _guard = self.inner.lifecycle.admit_write()?;
+        let guard = self.inner.lifecycle.admit_write()?;
         let inner = self.inner.clone();
         self.inner
             .blocking
             .run_result(move || {
+                let _guard = guard;
                 let _checkpoint_guard = inner.checkpoint_lock.lock();
                 if !inner.state.load().memtable.is_empty() {
                     inner.force_freeze_memtable(&inner.state_lock.lock())?;
@@ -5481,26 +5535,37 @@ impl KvEngine {
 
     /// Async full compaction.
     pub async fn force_full_compaction_async(&self) -> Result<()> {
-        let _guard = self.inner.lifecycle.admit_write()?;
+        let guard = self.inner.lifecycle.admit_write()?;
         let inner = self.inner.clone();
         self.inner
             .blocking
-            .run_result(move || inner.force_full_compaction())
+            .run_result(move || {
+                let _guard = guard;
+                inner.force_full_compaction()
+            })
             .await
     }
 
     /// Async remove compaction filter.
     pub async fn remove_compaction_filter_async(&self, id: u64) -> Result<bool> {
-        let _guard = self.inner.lifecycle.admit_write()?;
+        let guard = self.inner.lifecycle.admit_write()?;
         let inner = self.inner.clone();
         self.inner
             .blocking
-            .run_result(move || inner.remove_compaction_filter(id))
+            .run_result(move || {
+                let _guard = guard;
+                inner.remove_compaction_filter(id)
+            })
             .await
     }
 
     /// Async close for the Drop path — best-effort, uses sync path.
     pub(crate) fn drop_close(&self) {
+        // The shutdown thread retains either the public engine or its storage
+        // and worker handles. Let it drain and publish the final close result.
+        if self.async_close.owns_shutdown() {
+            return;
+        }
         let _ = self.inner.lifecycle.begin_close();
         self.background_workers.begin_shutdown(&self.inner);
         // Detach instead of joining — Drop must not block the executor thread
@@ -6921,6 +6986,10 @@ impl LsmStorageInner {
                     if options.enable_wal && owns_newest_segment {
                         state.memtable = Arc::new(m);
                     } else if !m.is_empty() {
+                        m.close_parallel_wal().with_context(|| {
+                            format!("failed to close recovered immutable WAL for memtable {id}")
+                        })?;
+                        m.retire_wal_ring();
                         m.freeze_range_tombstones();
                         state.imm_memtables.insert(0, Arc::new(m));
                     }
@@ -7388,7 +7457,9 @@ impl LsmStorageInner {
         let storage = Self {
             state: ArcSwap::from_pointee(plan.state),
             state_lock: Mutex::new(()),
-            active_memtable_lock: RwLock::new(()),
+            active_memtable_lock: ActiveMemtableGate::default(),
+            #[cfg(test)]
+            native_write_pause: Mutex::new(None),
             path: plan.path,
             block_cache: plan.block_cache,
             next_sst_id: AtomicUsize::new(plan.max_id + 1),
@@ -7461,7 +7532,7 @@ impl LsmStorageInner {
     /// the directory does not exist.
     #[cfg(test)]
     pub(crate) fn open(path: impl AsRef<Path>, options: LsmStorageOptions) -> Result<Self> {
-        Self::open_with_wal_io_mode(path, options, crate::wal::WalIoMode::Leader)
+        Self::open_with_wal_io_mode(path, options, crate::wal::WalIoMode::default())
     }
 
     pub(crate) fn open_with_wal_io_mode(
@@ -7515,8 +7586,15 @@ impl LsmStorageInner {
         let sync_result = self.sync();
         let close_result = self.close_parallel_wals();
         let dir_sync_result = self.sync_dir();
+        let publication_result = self
+            .mvcc
+            .as_ref()
+            .map_or(Ok(()), |mvcc| mvcc.ensure_publication_healthy());
 
-        sync_result.and(close_result).and(dir_sync_result)
+        sync_result
+            .and(close_result)
+            .and(dir_sync_result)
+            .and(publication_result)
     }
 
     fn close_parallel_wals(&self) -> Result<()> {
@@ -11477,9 +11555,29 @@ impl LsmStorageInner {
     fn force_freeze_with_new_memtable_locked(
         &self,
         new_memtable: mem_table::MemTable,
-        _active_memtable_guard: &RwLockWriteGuard<'_, ()>,
+        _active_memtable_guard: &ActiveMemtableWriteGuard<'_>,
     ) -> Result<()> {
+        // Drained native leases may have ended through cancellation. A healthy
+        // WAL alone does not prove all memtable entries became visible; keep
+        // the active WAL for recovery instead of persisting that hidden data.
+        if let Some(mvcc) = &self.mvcc {
+            mvcc.ensure_publication_healthy()?;
+        }
         let mut state = self.state.load().as_ref().clone();
+        // The active write guard waits for existing writers to finish WAL
+        // durability and MVCC publication. Keep the immutable data and WAL,
+        // but join the runtime before publishing a successor so frozen
+        // memtables do not accumulate dedicated threads and rings.
+        state.memtable.close_parallel_wal().with_context(|| {
+            format!(
+                "failed to close frozen parallel WAL for memtable {}",
+                state.memtable.id()
+            )
+        })?;
+        // The leader path has no runtime to join, but its ring is per-WAL state
+        // too: release it now that no writer can reach this WAL, so a
+        // rotation-heavy workload does not hold one ring per retained WAL.
+        state.memtable.retire_wal_ring();
 
         let m = std::mem::replace(&mut state.memtable, new_memtable.into());
         // Build immutable range-tombstone fragment cache before sharing.
@@ -11510,8 +11608,13 @@ impl LsmStorageInner {
     pub(crate) fn force_freeze_memtable_with_active_guard(
         &self,
         _state_lock_observer: &MutexGuard<'_, ()>,
-        active_memtable_guard: &RwLockWriteGuard<'_, ()>,
+        active_memtable_guard: &ActiveMemtableWriteGuard<'_>,
     ) -> Result<()> {
+        // Reject poison before allocating a successor WAL. The central swap
+        // repeats this check for callers that supply their own successor.
+        if let Some(mvcc) = &self.mvcc {
+            mvcc.ensure_publication_healthy()?;
+        }
         let sst_id = self.next_sst_id();
         let vlog_enabled = self.vlog.is_some();
         let mem_table = if self.options.enable_wal {

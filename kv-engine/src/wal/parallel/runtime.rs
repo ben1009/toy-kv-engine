@@ -7,27 +7,35 @@ use std::{
     os::fd::AsRawFd,
     sync::Arc,
     thread::{self, JoinHandle},
+    time::{Duration, Instant},
 };
 
-#[cfg(feature = "bench")]
-use std::time::Instant;
-
 use anyhow::{Context, Result, anyhow, bail, ensure};
-use crossbeam_channel::{Receiver, Sender, TryRecvError, unbounded};
+use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
 use crossbeam_queue::ArrayQueue;
-use parking_lot::{Condvar, Mutex};
+use parking_lot::{Condvar, Mutex, MutexGuard};
 
 use super::{
     BUFFER_POOL_BUF_SIZE, BUFFER_POOL_CAPACITY, DirectBuf, MAX_WAL_FILE_SIZE, PREALLOC_BLOCK,
     parallel_worker::{
         GroupWriteResult, IoWorker, IoWorkerClient, WalSyncProgress, WorkerBuffer, WriteBuffer,
-        WriteGroup,
+        WriteGroup, WriteGroupBuffers,
     },
 };
 
 const NORMAL_ACTIVE_BUFFER_BUDGET: u64 = 64 * 1024 * 1024;
 const MAX_BUFFER_CAPACITY: u64 = 240 * 1024 * 1024;
 const WAL_HEADER_END: u64 = 4096;
+const PACKER_GROUP_MAX_TICKETS: usize = 8;
+const EXTENT_INITIALIZATION_CHUNK: usize = 128 * 1024;
+// Large writes amortize extent conversion themselves. Zero-filling their
+// allocated space adds a second write of the same bytes on ext4.
+const ALLOCATION_ONLY_MIN_BATCH_BYTES: usize = 64 * 1024;
+// Coalesce already-admitted tickets with one fixed deadline. Refresh the
+// batching cutoff only when the written prefix catches it; a refresh cannot
+// extend the deadline. Skip the wait when the prior sync was cheap.
+const SYNC_COALESCE_WAIT: Duration = Duration::from_micros(400);
+const SYNC_COALESCE_MIN_SYNC: Duration = Duration::from_micros(100);
 
 #[derive(Debug)]
 pub(crate) struct WalFull;
@@ -44,6 +52,7 @@ impl std::error::Error for WalFull {}
 struct BufferBudget {
     state: Mutex<BufferBudgetState>,
     available: Condvar,
+    async_available: tokio::sync::Notify,
 }
 
 #[derive(Debug)]
@@ -64,6 +73,7 @@ impl BufferBudget {
                 closed: false,
             }),
             available: Condvar::new(),
+            async_available: tokio::sync::Notify::new(),
         }
     }
 
@@ -112,6 +122,59 @@ impl BufferBudget {
         }
     }
 
+    async fn reserve_async(&self, bytes: u64) -> Result<()> {
+        ensure!(
+            bytes <= MAX_BUFFER_CAPACITY,
+            "WAL batch exceeds the direct-buffer capacity limit"
+        );
+        let oversized = bytes > NORMAL_ACTIVE_BUFFER_BUDGET;
+        let mut waiter = OversizedBudgetWaiter {
+            budget: self,
+            registered: false,
+        };
+        if oversized {
+            let mut state = self.state.lock();
+            state.oversized_waiters = state
+                .oversized_waiters
+                .checked_add(1)
+                .ok_or_else(|| anyhow!("oversized WAL buffer waiter count overflow"))?;
+            waiter.registered = true;
+        }
+        let notification = self.async_available.notified();
+        tokio::pin!(notification);
+        loop {
+            notification.as_mut().enable();
+            {
+                let mut state = self.state.lock();
+                ensure!(!state.closed, "parallel WAL is closed");
+                let fits = if oversized {
+                    state.active_bytes == 0 && !state.oversized_active
+                } else {
+                    !state.oversized_active
+                        && state.oversized_waiters == 0
+                        && state
+                            .active_bytes
+                            .checked_add(bytes)
+                            .is_some_and(|active| active <= NORMAL_ACTIVE_BUFFER_BUDGET)
+                };
+                if fits {
+                    if oversized {
+                        state.oversized_waiters -= 1;
+                        waiter.registered = false;
+                    }
+                    state.active_bytes = state
+                        .active_bytes
+                        .checked_add(bytes)
+                        .ok_or_else(|| anyhow!("WAL buffer budget overflow"))?;
+                    state.oversized_active = oversized;
+                    return Ok(());
+                }
+            }
+            notification.as_mut().await;
+            notification.set(self.async_available.notified());
+        }
+    }
+
     fn release(&self, bytes: u64) {
         let mut state = self.state.lock();
         state.active_bytes = state
@@ -123,11 +186,30 @@ impl BufferBudget {
             state.oversized_active = false;
         }
         self.available.notify_all();
+        self.async_available.notify_waiters();
     }
 
     fn close(&self) {
         self.state.lock().closed = true;
         self.available.notify_all();
+        self.async_available.notify_waiters();
+    }
+}
+
+/// Cancellation before allocation must not leave ordinary producers behind
+/// an oversized waiter that no longer exists.
+struct OversizedBudgetWaiter<'a> {
+    budget: &'a BufferBudget,
+    registered: bool,
+}
+
+impl Drop for OversizedBudgetWaiter<'_> {
+    fn drop(&mut self) {
+        if self.registered {
+            self.budget.state.lock().oversized_waiters -= 1;
+            self.budget.available.notify_all();
+            self.budget.async_available.notify_waiters();
+        }
     }
 }
 
@@ -211,6 +293,14 @@ struct AdmittedBatch {
     buffer: ParallelBuffer,
 }
 
+struct PackedGroup {
+    first_ticket: u64,
+    next_ticket: u64,
+    reserved_end: u64,
+    writes: WriteGroupBuffers<ParallelBuffer>,
+    initialize_extents: bool,
+}
+
 struct AdmissionState {
     open: bool,
     close_cutoff: Option<u64>,
@@ -232,11 +322,21 @@ struct DurabilityState {
 struct DurabilityShared {
     state: Mutex<DurabilityState>,
     changed: Condvar,
+    async_changed: tokio::sync::Notify,
+}
+
+impl DurabilityShared {
+    fn notify_change(&self) {
+        self.changed.notify_all();
+        self.async_changed.notify_waiters();
+    }
 }
 
 struct RuntimeInner {
     admission: Mutex<AdmissionState>,
-    admission_changed: Condvar,
+    packer_state: Mutex<PackerState>,
+    packer_failures: Mutex<Option<Sender<GroupWriteResult>>>,
+    packer_wake: Sender<bool>,
     #[cfg(test)]
     file_size_limit: std::sync::atomic::AtomicU64,
     buffer_budget: Arc<BufferBudget>,
@@ -255,7 +355,159 @@ struct RuntimeThreads {
     close_error: Option<String>,
 }
 
-/// Dedicated packer, I/O worker, and single-owner durability coordinator.
+struct PackerState {
+    next_ticket: u64,
+    reserved_end: u64,
+    preallocated_end: u64,
+    initializer: Option<ExtentInitializer>,
+}
+
+fn is_ext_filesystem(file: &File) -> bool {
+    // ext2/3/4 share this magic. Keep other filesystems, particularly tmpfs,
+    // on allocation only; initialization there has no measured benefit.
+    let mut stat = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    // SAFETY: file is live, and stat points to writable storage of the required size.
+    if unsafe { libc::fstatfs(file.as_raw_fd(), stat.as_mut_ptr()) } != 0 {
+        return false;
+    }
+
+    // SAFETY: a successful fstatfs initialized stat.
+    unsafe { stat.assume_init() }.f_type == libc::EXT4_SUPER_MAGIC
+}
+
+struct ExtentPreparation {
+    end: u64,
+    zero_fill: bool,
+}
+
+/// Owns preparation beyond the packer's ready prefix. There is at most
+/// one outstanding request/result, so stopping admission and dropping the
+/// request sender lets close join without draining the completion channel.
+/// The worker retains its file and aligned buffer until synchronous writes
+/// finish, including on initialization failure or runtime construction failure.
+struct ExtentInitializer {
+    requests: Option<Sender<ExtentPreparation>>,
+    completions: Receiver<std::result::Result<u64, String>>,
+    join: Option<JoinHandle<Result<()>>>,
+    ready_end: u64,
+}
+
+impl ExtentInitializer {
+    fn spawn(file: Arc<File>, start: u64) -> Result<Self> {
+        ensure!(
+            (WAL_HEADER_END..=MAX_WAL_FILE_SIZE).contains(&start) && start.is_multiple_of(4096),
+            "invalid WAL extent initialization offset"
+        );
+        let (requests, incoming) = crossbeam_channel::bounded::<ExtentPreparation>(1);
+        let (finished, completions) = crossbeam_channel::bounded(1);
+        let join = thread::Builder::new()
+            .name("wal-extent-initializer".to_owned())
+            .spawn(move || {
+                use std::os::unix::fs::FileExt;
+
+                let mut offset = start;
+                let mut zeros = DirectBuf::new(EXTENT_INITIALIZATION_CHUNK);
+                zeros.zero_range(0, EXTENT_INITIALIZATION_CHUNK);
+                while let Ok(ExtentPreparation { end, zero_fill }) = incoming.recv() {
+                    let result = (|| -> Result<()> {
+                        preallocate(&file, end)?;
+                        while zero_fill && offset < end {
+                            let len =
+                                (end - offset).min(EXTENT_INITIALIZATION_CHUNK as u64) as usize;
+                            file.write_all_at(zeros.initialized_slice(0, len), offset)
+                                .context("failed to initialize WAL extent")?;
+                            offset += len as u64;
+                        }
+                        // Skipped initialization is still a prepared prefix.
+                        // Later small writes must never zero-fill it again:
+                        // the packer may already have submitted WAL data there.
+                        offset = end;
+
+                        Ok(())
+                    })();
+                    let _ =
+                        finished.send(result.as_ref().map(|()| end).map_err(|e| format!("{e:#}")));
+                    if result.is_err() {
+                        // A failed speculative suffix must not fail close for
+                        // the prepared prefix. If a group needs that suffix,
+                        // prepare consumes this error and poisons its tickets.
+                        break;
+                    }
+                }
+
+                Ok(())
+            })
+            .context("failed to spawn WAL extent initializer")?;
+        let initializer = Self {
+            requests: Some(requests),
+            completions,
+            join: Some(join),
+            ready_end: start,
+        };
+        if start < MAX_WAL_FILE_SIZE {
+            initializer.request(
+                round_up(start + 1, PREALLOC_BLOCK).context("extent overflow")?,
+                true,
+            )?;
+        }
+
+        Ok(initializer)
+    }
+
+    fn request(&self, end: u64, zero_fill: bool) -> Result<()> {
+        self.requests
+            .as_ref()
+            .context("initializer closed")?
+            .send(ExtentPreparation { end, zero_fill })
+            .context("extent initializer stopped")
+    }
+
+    fn prepare(&mut self, end: u64, zero_fill: bool) -> Result<()> {
+        ensure!(
+            end <= MAX_WAL_FILE_SIZE && end.is_multiple_of(4096),
+            "invalid WAL extent initialization target"
+        );
+        while self.ready_end < end {
+            self.ready_end = self
+                .completions
+                .recv()
+                .context("extent initializer completion disconnected")?
+                .map_err(anyhow::Error::msg)?;
+            if self.ready_end < MAX_WAL_FILE_SIZE {
+                // Start the next extent while the packer submits this one.
+                // For a large batch, first catch up to its required end.
+                self.request(
+                    end.max(self.ready_end + PREALLOC_BLOCK)
+                        .min(MAX_WAL_FILE_SIZE),
+                    zero_fill,
+                )?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn close(&mut self) -> Result<()> {
+        self.requests.take();
+        if let Some(join) = self.join.take() {
+            join.join()
+                .map_err(|_| anyhow!("extent initializer panicked"))??;
+        }
+
+        Ok(())
+    }
+}
+
+impl Drop for ExtentInitializer {
+    fn drop(&mut self) {
+        if let Err(error) = self.close() {
+            log::error!("failed to stop WAL extent initializer: {error:#}");
+        }
+    }
+}
+
+/// Parallel WAL runtime with admission-driven packing, an I/O worker, a
+/// single-owner durability coordinator, and ext-family extent lookahead.
 pub(crate) struct ParallelWalRuntime {
     inner: Arc<RuntimeInner>,
     threads: Mutex<RuntimeThreads>,
@@ -282,15 +534,25 @@ impl ParallelWalRuntime {
             ));
         }
 
+        let initializer = if is_ext_filesystem(&preallocator) {
+            Some(ExtentInitializer::spawn(
+                Arc::clone(&preallocator),
+                initial_file_end,
+            )?)
+        } else {
+            None
+        };
         let mut worker = IoWorker::spawn(worker_file, Arc::clone(&buffer_pool))?;
         let worker_client = worker.client();
         let sync_progress = worker.sync_progress();
         let worker_completions = worker.take_completions();
-        let (packer_failures_tx, packer_failures_rx) = unbounded();
+        let packer_failures_tx = worker.failure_sender();
         let durability = Arc::new(DurabilityShared {
             state: Mutex::new(DurabilityState::default()),
             changed: Condvar::new(),
+            async_changed: tokio::sync::Notify::new(),
         });
+        let (packer_wake, packer_requests) = crossbeam_channel::bounded(1);
         let inner = Arc::new(RuntimeInner {
             admission: Mutex::new(AdmissionState {
                 open: true,
@@ -300,7 +562,14 @@ impl ParallelWalRuntime {
                 admitted_end: initial_file_end,
                 queue: VecDeque::new(),
             }),
-            admission_changed: Condvar::new(),
+            packer_state: Mutex::new(PackerState {
+                next_ticket: 0,
+                reserved_end: initial_file_end,
+                preallocated_end: initial_file_end,
+                initializer,
+            }),
+            packer_failures: Mutex::new(Some(packer_failures_tx)),
+            packer_wake,
             #[cfg(test)]
             file_size_limit: std::sync::atomic::AtomicU64::new(MAX_WAL_FILE_SIZE),
             buffer_budget,
@@ -315,12 +584,19 @@ impl ParallelWalRuntime {
         let coordinator = match thread::Builder::new()
             .name("wal-sync-coordinator".to_owned())
             .spawn(move || {
-                run_sync_coordinator(
-                    sync_file,
-                    worker_completions,
-                    packer_failures_rx,
-                    coordinator_inner,
-                )
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    run_sync_coordinator(
+                        sync_file,
+                        worker_completions,
+                        Arc::clone(&coordinator_inner),
+                    )
+                })) {
+                    Ok(result) => result,
+                    Err(_) => {
+                        poison_unacknowledged(&coordinator_inner, "WAL sync coordinator panicked");
+                        Err(anyhow!("WAL sync coordinator panicked"))
+                    }
+                }
             }) {
             Ok(join) => join,
             Err(error) => {
@@ -332,16 +608,23 @@ impl ParallelWalRuntime {
         let packer_inner = Arc::clone(&inner);
         let packer = match thread::Builder::new()
             .name("wal-ordered-packer".to_owned())
-            .spawn(move || run_packer(packer_inner, packer_failures_tx, initial_file_end))
-        {
+            .spawn(move || {
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    while let Ok(true) = packer_requests.recv() {
+                        pack_admitted_groups(&packer_inner, packer_inner.packer_state.lock())?;
+                    }
+                    Ok(())
+                })) {
+                    Ok(result) => result,
+                    Err(_) => {
+                        poison_unacknowledged(&packer_inner, "WAL ordered packer panicked");
+                        Err(anyhow!("WAL ordered packer panicked"))
+                    }
+                }
+            }) {
             Ok(join) => join,
             Err(error) => {
-                inner.buffer_budget.close();
-                {
-                    let mut admission = inner.admission.lock();
-                    admission.open = false;
-                    inner.admission_changed.notify_all();
-                }
+                inner.packer_failures.lock().take();
                 let _ = worker.close();
                 let _ = coordinator.join();
                 return Err(error).context("failed to spawn WAL ordered packer");
@@ -365,6 +648,18 @@ impl ParallelWalRuntime {
         let capacity_u64 = u64::try_from(capacity).context("WAL buffer capacity exceeds u64")?;
         self.inner.buffer_budget.reserve(capacity_u64)?;
 
+        Ok(self.activate_buffer(capacity, capacity_u64))
+    }
+
+    pub(crate) async fn allocate_buffer_async(&self, capacity: usize) -> Result<ParallelBuffer> {
+        let capacity = DirectBuf::align_up(capacity.max(BUFFER_POOL_BUF_SIZE));
+        let capacity_u64 = u64::try_from(capacity).context("WAL buffer capacity exceeds u64")?;
+        self.inner.buffer_budget.reserve_async(capacity_u64).await?;
+
+        Ok(self.activate_buffer(capacity, capacity_u64))
+    }
+
+    fn activate_buffer(&self, capacity: usize, capacity_u64: u64) -> ParallelBuffer {
         let direct_buffer = match self.inner.buffer_pool.pop() {
             Some(mut pooled) if pooled.cap() >= capacity => {
                 pooled.release_budget();
@@ -380,11 +675,11 @@ impl ParallelWalRuntime {
             None => DirectBuf::new(capacity),
         };
 
-        Ok(ParallelBuffer::activate(
+        ParallelBuffer::activate(
             direct_buffer,
             Arc::clone(&self.inner.buffer_budget),
             capacity_u64,
-        ))
+        )
     }
 
     pub(crate) fn admit(&self, buffer: ParallelBuffer, aligned_len: usize) -> Result<u64> {
@@ -466,7 +761,11 @@ impl ParallelWalRuntime {
         debug_assert!(WAL_HEADER_END <= state.admitted_end);
         debug_assert!(state.admitted_end <= MAX_WAL_FILE_SIZE);
         debug_assert_eq!(state.next_ticket, ticket + 1);
-        self.inner.admission_changed.notify_one();
+
+        drop(state);
+        // One queued wake is sufficient: the dedicated packer drains admission.
+        // Disk allocation and extent initialization never run on a producer.
+        let _ = self.inner.packer_wake.try_send(true);
 
         Ok(ticket)
     }
@@ -533,6 +832,33 @@ impl ParallelWalRuntime {
         self.wait_durable(cutoff - 1)
     }
 
+    pub(crate) async fn wait_durable_async(&self, ticket: u64) -> Result<()> {
+        let assigned = self.inner.admission.lock().next_ticket;
+        ensure!(ticket < assigned, "unassigned parallel WAL ticket {ticket}");
+        let notification = self.inner.durability.async_changed.notified();
+        tokio::pin!(notification);
+        loop {
+            // Register before reading the predicate; completion may race with
+            // this check and the subsequent await without losing the wakeup.
+            notification.as_mut().enable();
+            {
+                let state = self.inner.durability.state.lock();
+                if state.durable_frontier > ticket {
+                    return Ok(());
+                }
+                if state.poison_ticket.is_some_and(|poison| ticket >= poison) {
+                    let message = state
+                        .poison_error
+                        .as_deref()
+                        .unwrap_or("WAL durability failed");
+                    bail!("WAL ticket {ticket} failed at poison boundary: {message}");
+                }
+            }
+            notification.as_mut().await;
+            notification.set(self.inner.durability.async_changed.notified());
+        }
+    }
+
     pub(crate) fn wait_durable(&self, ticket: u64) -> Result<()> {
         let mut state = self.inner.durability.state.lock();
         let assigned = self.inner.admission.lock().next_ticket;
@@ -573,17 +899,34 @@ impl ParallelWalRuntime {
             let mut admission = self.inner.admission.lock();
             admission.open = false;
             admission.close_cutoff = Some(admission.next_ticket);
-            self.inner.admission_changed.notify_all();
         }
         self.inner.buffer_budget.close();
 
         let mut close_error = None;
+        let _ = self.inner.packer_wake.send(false);
         if let Some(packer) = threads.packer.take() {
             match packer.join() {
                 Ok(Ok(())) => {}
-                Ok(Err(error)) => close_error = Some(format!("packer failed: {error:#}")),
-                Err(_) => close_error = Some("WAL packer panicked".to_owned()),
+                Ok(Err(error)) => {
+                    close_error = Some(format!("packer failed: {error:#}"));
+                }
+                Err(_) => {
+                    close_error = Some("WAL ordered packer panicked".to_owned());
+                }
             }
+        }
+        let packer = self.inner.packer_state.lock();
+        if let Err(error) = pack_admitted_groups(&self.inner, packer) {
+            close_error = Some(format!("packer failed: {error:#}"));
+        }
+        self.inner.packer_failures.lock().take();
+
+        // No packer can request more ranges after admission closes and drains.
+        // Join initialization before finishing the WAL worker/coordinator drain.
+        if let Some(mut initializer) = self.inner.packer_state.lock().initializer.take()
+            && let Err(error) = initializer.close()
+        {
+            close_error.get_or_insert_with(|| format!("extent initializer failed: {error:#}"));
         }
 
         if let Some(worker) = threads.worker.take()
@@ -632,118 +975,178 @@ impl Drop for ParallelWalRuntime {
     }
 }
 
-fn run_packer(
-    inner: Arc<RuntimeInner>,
-    failures: Sender<GroupWriteResult>,
-    initial_file_end: u64,
+fn pack_admitted_groups(
+    inner: &RuntimeInner,
+    mut packer: MutexGuard<'_, PackerState>,
 ) -> Result<()> {
-    let mut next_ticket = 0_u64;
-    let mut reserved_end = initial_file_end;
-    let mut preallocated_end = initial_file_end;
-
     loop {
-        let batch = {
+        let packed_result = {
             let mut admission = inner.admission.lock();
-            while admission.queue.is_empty() && admission.open {
-                inner.admission_changed.wait(&mut admission);
-            }
-            if admission.queue.is_empty() && !admission.open {
+            if admission.queue.is_empty() {
                 if admission.poison.is_none()
                     && let Some(cutoff) = admission.close_cutoff
                 {
                     ensure!(
-                        next_ticket == cutoff,
-                        "parallel WAL packer stopped at ticket {next_ticket} before close cutoff {cutoff}"
+                        packer.next_ticket == cutoff,
+                        "parallel WAL packer stopped at ticket {} before close cutoff {cutoff}",
+                        packer.next_ticket
                     );
                 }
-                break;
+                // The dedicated packer drains all admitted work before
+                // returning to its coalesced wake channel.
+                drop(packer);
+                return Ok(());
             }
-            let batch = admission
-                .queue
-                .pop_front()
-                .expect("nonempty WAL admission queue has a first batch");
-            if admission
-                .poison
-                .as_ref()
-                .is_some_and(|(poison, _)| batch.ticket >= *poison)
-            {
-                admission.queue.clear();
-                inner.admission_changed.notify_all();
-                None
-            } else {
-                Some(batch)
+            take_admitted_group(
+                &mut admission,
+                packer.next_ticket,
+                packer.reserved_end,
+                PACKER_GROUP_MAX_TICKETS,
+            )
+        };
+        let packed = match packed_result {
+            Ok(Some(packed)) => packed,
+            Ok(None) => continue,
+            Err(error) => {
+                report_packer_failure(inner, packer.next_ticket, &error);
+                return Err(error);
             }
         };
-        let Some(batch) = batch else {
-            break;
-        };
+        let first_ticket = packed.first_ticket;
+        let expected_ticket = packed.next_ticket;
+        packer.reserved_end = packed.reserved_end;
+        let writes = packed.writes;
 
-        if batch.ticket != next_ticket || batch.file_offset != reserved_end {
-            let error = anyhow!("parallel WAL admission queue is not ticket/offset contiguous");
-            report_packer_failure(&inner, &failures, batch.ticket, &error);
+        let Some(target_preallocated_end) = round_up(packer.reserved_end, PREALLOC_BLOCK) else {
+            let error = anyhow!("parallel WAL preallocation offset overflow");
+            report_packer_failure(inner, first_ticket, &error);
             return Err(error);
-        }
-        let file_end = batch
-            .file_offset
-            .checked_add(batch.aligned_len as u64)
-            .ok_or_else(|| anyhow!("parallel WAL offset overflow"))?;
-        reserved_end = file_end;
-        #[cfg(feature = "chaos-testing")]
-        crate::chaos::failpoint::parallel_wal_crash_point("parallel_wal.offset_reserved");
-
-        let target_preallocated_end = round_up(file_end, PREALLOC_BLOCK)
-            .ok_or_else(|| anyhow!("parallel WAL preallocation offset overflow"))?;
-        if target_preallocated_end > preallocated_end {
+        };
+        if target_preallocated_end > packer.preallocated_end {
             #[cfg(feature = "bench")]
             let preallocation_start = Instant::now();
-            if let Err(error) = preallocate(&inner.preallocator, target_preallocated_end) {
-                report_packer_failure(&inner, &failures, batch.ticket, &error);
+            let allocation = match packer.initializer.as_mut() {
+                Some(initializer) => {
+                    initializer.prepare(target_preallocated_end, packed.initialize_extents)
+                }
+                None => preallocate(&inner.preallocator, target_preallocated_end),
+            };
+            if let Err(error) = allocation {
+                report_packer_failure(inner, first_ticket, &error);
                 return Err(error);
             }
             #[cfg(feature = "bench")]
+            // On ext filesystems this measures readiness wait, not the
+            // initializer's background I/O time or its additional write bytes.
             inner
                 .sync_progress
                 .record_preallocation_ns(preallocation_start.elapsed().as_nanos() as u64);
-            preallocated_end = target_preallocated_end;
+            packer.preallocated_end = target_preallocated_end;
         }
-        let admitted_end = inner.admission.lock().admitted_end;
-        debug_assert!(WAL_HEADER_END <= reserved_end);
-        debug_assert!(reserved_end <= admitted_end);
-        debug_assert!(admitted_end <= MAX_WAL_FILE_SIZE);
-        debug_assert!(preallocated_end >= reserved_end);
-        debug_assert!(preallocated_end <= MAX_WAL_FILE_SIZE);
-        ensure!(
-            file_end <= preallocated_end,
-            "WAL write extends beyond preallocation"
-        );
+        debug_assert!(WAL_HEADER_END <= packer.reserved_end);
+        #[cfg(debug_assertions)]
+        {
+            let admitted_end = inner.admission.lock().admitted_end;
+            debug_assert!(packer.reserved_end <= admitted_end);
+            debug_assert!(admitted_end <= MAX_WAL_FILE_SIZE);
+        }
+        debug_assert!(packer.preallocated_end >= packer.reserved_end);
+        debug_assert!(packer.preallocated_end <= MAX_WAL_FILE_SIZE);
+        if packer.reserved_end > packer.preallocated_end {
+            let error = anyhow!("WAL write extends beyond preallocation");
+            report_packer_failure(inner, first_ticket, &error);
+            return Err(error);
+        }
 
-        let write = WriteBuffer::new(batch.buffer, batch.file_offset, batch.aligned_len);
-        let group = match WriteGroup::new(batch.ticket..batch.ticket + 1, vec![write]) {
+        let group = match WriteGroup::new(packer.next_ticket..expected_ticket, writes) {
             Ok(group) => group,
             Err(error) => {
                 let error = anyhow!("invalid packed WAL group: {error:?}");
-                report_packer_failure(&inner, &failures, batch.ticket, &error);
+                report_packer_failure(inner, first_ticket, &error);
                 return Err(error);
             }
         };
         if let Err(error) = inner.worker.submit_group(group) {
-            report_packer_failure(&inner, &failures, batch.ticket, &error);
+            report_packer_failure(inner, first_ticket, &error);
             return Err(error).context("failed to submit packed WAL group");
         }
-        next_ticket = next_ticket
-            .checked_add(1)
-            .ok_or_else(|| anyhow!("parallel WAL ticket counter overflow"))?;
+        packer.next_ticket = expected_ticket;
     }
-
-    Ok(())
 }
 
-fn report_packer_failure(
-    inner: &RuntimeInner,
-    failures: &Sender<GroupWriteResult>,
-    ticket: u64,
-    error: &anyhow::Error,
-) {
+fn take_admitted_group(
+    admission: &mut AdmissionState,
+    next_ticket: u64,
+    reserved_end: u64,
+    max_tickets: usize,
+) -> Result<Option<PackedGroup>> {
+    debug_assert!(max_tickets > 0);
+    let Some(first) = admission.queue.front() else {
+        return Ok(None);
+    };
+    if admission
+        .poison
+        .as_ref()
+        .is_some_and(|(poison_ticket, _)| first.ticket >= *poison_ticket)
+    {
+        admission.queue.clear();
+        return Ok(None);
+    }
+
+    let first_ticket = first.ticket;
+    let group_capacity = admission.queue.len().min(max_tickets);
+    let mut writes = WriteGroupBuffers::with_capacity(group_capacity);
+    let mut initialize_extents = false;
+    let mut expected_ticket = next_ticket;
+    let mut packed_end = reserved_end;
+    while writes.len() < max_tickets {
+        let Some(next) = admission.queue.front() else {
+            break;
+        };
+        if admission
+            .poison
+            .as_ref()
+            .is_some_and(|(poison_ticket, _)| next.ticket >= *poison_ticket)
+        {
+            admission.queue.clear();
+            break;
+        }
+        let batch = admission
+            .queue
+            .pop_front()
+            .expect("front WAL batch remains queued");
+        // Keep zero-fill for groups containing small writes. Only extent
+        // preparation changes; every batch still uses the parallel pipeline.
+        initialize_extents |= batch.aligned_len < ALLOCATION_ONLY_MIN_BATCH_BYTES;
+        ensure!(
+            batch.ticket == expected_ticket && batch.file_offset == packed_end,
+            "parallel WAL admission queue is not ticket/offset contiguous"
+        );
+        packed_end = batch
+            .file_offset
+            .checked_add(batch.aligned_len as u64)
+            .ok_or_else(|| anyhow!("parallel WAL offset overflow"))?;
+        expected_ticket = expected_ticket
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("parallel WAL ticket counter overflow"))?;
+        #[cfg(feature = "chaos-testing")]
+        crate::chaos::failpoint::parallel_wal_crash_point("parallel_wal.offset_reserved");
+        writes.push(WriteBuffer::new(
+            batch.buffer,
+            batch.file_offset,
+            batch.aligned_len,
+        ));
+    }
+    Ok(Some(PackedGroup {
+        first_ticket,
+        next_ticket: expected_ticket,
+        reserved_end: packed_end,
+        writes,
+        initialize_extents,
+    }))
+}
+
+fn report_packer_failure(inner: &RuntimeInner, ticket: u64, error: &anyhow::Error) {
     let message = format!("{error:#}");
     {
         let mut admission = inner.admission.lock();
@@ -756,62 +1159,57 @@ fn report_packer_failure(
             admission.poison = Some((ticket, message.clone()));
         }
         admission.queue.clear();
-        inner.admission_changed.notify_all();
     }
     inner.buffer_budget.close();
-    let _ = failures.send(GroupWriteResult {
-        group_id: u64::MAX,
-        tickets: ticket..ticket.saturating_add(1),
-        write_count: 0,
-        write_bytes: 0,
-        error: Some(message),
-    });
+    if let Some(failures) = inner.packer_failures.lock().as_ref() {
+        let _ = failures.send(GroupWriteResult {
+            group_id: u64::MAX,
+            tickets: ticket..ticket.saturating_add(1),
+            write_count: 0,
+            write_bytes: 0,
+            error: Some(message),
+        });
+    }
+}
+
+/// A task panic has an unknown boundary. Preserve every acknowledged ticket,
+/// stop admission and wake both kinds of waiter before the task terminates.
+fn poison_unacknowledged(inner: &RuntimeInner, message: &str) {
+    let mut state = inner.durability.state.lock();
+    let boundary = state.durable_frontier;
+    set_poison(&mut state, boundary, message.to_owned());
+    let mut admission = inner.admission.lock();
+    admission.open = false;
+    admission.poison = Some((boundary, message.to_owned()));
+    admission.queue.clear();
+    inner.buffer_budget.close();
+    inner.durability.notify_change();
 }
 
 fn run_sync_coordinator(
     sync_file: Arc<File>,
-    worker_completions: Receiver<GroupWriteResult>,
-    packer_failures: Receiver<GroupWriteResult>,
+    completions: Receiver<GroupWriteResult>,
     inner: Arc<RuntimeInner>,
 ) -> Result<()> {
-    let disconnected = crossbeam_channel::never();
-    let mut worker_completions = worker_completions;
-    let mut packer_failures = packer_failures;
-    let mut worker_open = true;
-    let mut packer_open = true;
+    let mut last_sync_latency = None;
 
-    while worker_open || packer_open {
-        crossbeam_channel::select! {
-            recv(worker_completions) -> result => {
-                match result {
-                    Ok(result) => process_group_result(&inner, result),
-                    Err(_) => {
-                        worker_open = false;
-                        worker_completions = disconnected.clone();
-                    }
-                }
-            }
-            recv(packer_failures) -> result => {
-                match result {
-                    Ok(result) => process_group_result(&inner, result),
-                    Err(_) => {
-                        packer_open = false;
-                        packer_failures = disconnected.clone();
-                    }
-                }
-            }
-        }
+    while let Ok(result) = completions.recv() {
+        process_group_result(&inner, result);
         #[cfg(all(test, feature = "chaos-testing"))]
         crate::chaos::failpoint::before_parallel_wal_result_drain();
-        drain_ready_results(
-            &inner,
-            &mut worker_completions,
-            &mut packer_failures,
-            &mut worker_open,
-            &mut packer_open,
-            &disconnected,
-        );
-        synchronize_written_prefix(&sync_file, &inner)?;
+        drain_ready_results(&inner, &completions);
+        if last_sync_latency.is_some_and(|latency| latency >= SYNC_COALESCE_MIN_SYNC) {
+            coalesce_admitted_prefix(&inner, &completions);
+            // Coalescing may return at its captured admission cutoff while
+            // later groups have already completed. Include the results that
+            // are queued now before capturing the next durability target.
+            // Bound this drain to its initial queue length so new completions
+            // cannot extend the coalescing window indefinitely.
+            drain_results_at_capture(&inner, &completions);
+        }
+        if let Some(latency) = synchronize_written_prefix(&sync_file, &inner)? {
+            last_sync_latency = Some(latency);
+        }
     }
 
     // Both producers have terminated. Freeze the final written prefix and
@@ -822,40 +1220,58 @@ fn run_sync_coordinator(
     Ok(())
 }
 
-fn drain_ready_results(
-    inner: &RuntimeInner,
-    worker_completions: &mut Receiver<GroupWriteResult>,
-    packer_failures: &mut Receiver<GroupWriteResult>,
-    worker_open: &mut bool,
-    packer_open: &mut bool,
-    disconnected: &Receiver<GroupWriteResult>,
-) {
-    while *worker_open {
-        match worker_completions.try_recv() {
-            Ok(result) => process_group_result(inner, result),
-            Err(TryRecvError::Empty) => break,
-            Err(TryRecvError::Disconnected) => {
-                *worker_open = false;
-                *worker_completions = disconnected.clone();
-            }
+fn coalesce_admitted_prefix(inner: &RuntimeInner, completions: &Receiver<GroupWriteResult>) {
+    {
+        let state = inner.durability.state.lock();
+        if state.poison_ticket.is_some() || state.written_frontier <= state.durable_frontier {
+            return;
         }
     }
 
-    while *packer_open {
-        match packer_failures.try_recv() {
-            Ok(result) => process_group_result(inner, result),
-            Err(TryRecvError::Empty) => break,
-            Err(TryRecvError::Disconnected) => {
-                *packer_open = false;
-                *packer_failures = disconnected.clone();
+    let deadline = Instant::now() + SYNC_COALESCE_WAIT;
+    let mut cutoff = inner.admission.lock().next_ticket;
+    loop {
+        let state = inner.durability.state.lock();
+        if state.poison_ticket.is_some() {
+            return;
+        }
+        let written = state.written_frontier;
+        drop(state);
+        if written >= cutoff {
+            cutoff = inner.admission.lock().next_ticket;
+            if written >= cutoff {
+                return;
             }
         }
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            return;
+        };
+        match completions.recv_timeout(remaining) {
+            Ok(result) => process_group_result(inner, result),
+            Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => return,
+        }
+    }
+}
+
+fn drain_results_at_capture(inner: &RuntimeInner, completions: &Receiver<GroupWriteResult>) {
+    for _ in 0..completions.len() {
+        let Ok(result) = completions.try_recv() else {
+            break;
+        };
+        process_group_result(inner, result);
+    }
+}
+
+fn drain_ready_results(inner: &RuntimeInner, completions: &Receiver<GroupWriteResult>) {
+    while let Ok(result) = completions.try_recv() {
+        process_group_result(inner, result);
     }
 }
 
 fn process_group_result(inner: &RuntimeInner, result: GroupWriteResult) {
     #[cfg(feature = "chaos-testing")]
     let result_end = result.tickets.end;
+    let failed = result.error.is_some();
     let mut state = inner.durability.state.lock();
     #[cfg(feature = "chaos-testing")]
     let out_of_order_completion =
@@ -872,7 +1288,6 @@ fn process_group_result(inner: &RuntimeInner, result: GroupWriteResult) {
             admission.poison = Some((result.tickets.start, error.clone()));
         }
         admission.queue.clear();
-        inner.admission_changed.notify_all();
         inner.buffer_budget.close();
     } else {
         let previous = state.completed.insert(result.tickets.start, result);
@@ -896,12 +1311,15 @@ fn process_group_result(inner: &RuntimeInner, result: GroupWriteResult) {
     if let Some(poison) = state.poison_ticket {
         debug_assert!(state.durable_frontier <= poison);
     }
-    let assigned = inner.admission.lock().next_ticket;
-    debug_assert!(state.written_frontier <= assigned);
+    debug_assert!(state.written_frontier <= inner.admission.lock().next_ticket);
     debug_assert!(state.durable_frontier <= state.written_frontier);
     #[cfg(feature = "chaos-testing")]
     let later_group_remains_outside_prefix = state.written_frontier < result_end;
-    inner.durability.changed.notify_all();
+    // A successful write CQE only advances the written frontier. Durability
+    // waiters can finish after fdatasync; poison must wake them immediately.
+    if failed {
+        inner.durability.notify_change();
+    }
     drop(state);
 
     #[cfg(feature = "chaos-testing")]
@@ -929,10 +1347,9 @@ fn terminalize_unresolved_prefix(inner: &RuntimeInner) {
         {
             admission.poison = Some((poison, error));
         }
-        inner.admission_changed.notify_all();
         inner.buffer_budget.close();
     }
-    inner.durability.changed.notify_all();
+    inner.durability.notify_change();
 }
 
 fn set_poison(state: &mut DurabilityState, ticket: u64, error: String) {
@@ -955,7 +1372,7 @@ fn validate_sync_diagnostics_transition(
     Ok(())
 }
 
-fn synchronize_written_prefix(sync_file: &File, inner: &RuntimeInner) -> Result<()> {
+fn synchronize_written_prefix(sync_file: &File, inner: &RuntimeInner) -> Result<Option<Duration>> {
     let (target, durable) = {
         let state = inner.durability.state.lock();
         let target = state
@@ -970,7 +1387,7 @@ fn synchronize_written_prefix(sync_file: &File, inner: &RuntimeInner) -> Result<
         (target, state.durable_frontier)
     };
     if target <= durable {
-        return Ok(());
+        return Ok(None);
     }
 
     #[cfg(feature = "chaos-testing")]
@@ -979,19 +1396,14 @@ fn synchronize_written_prefix(sync_file: &File, inner: &RuntimeInner) -> Result<
     crate::chaos::failpoint::before_parallel_wal_fdatasync_call();
     let _sync_start = inner.sync_progress.begin_sync(target, durable);
     inner.sync_progress.start_sync_activity();
+    let started_at = Instant::now();
     #[cfg(feature = "bench")]
-    let mut syscall_started_at = None;
+    let syscall_started_at = Some(started_at);
     #[cfg(not(feature = "bench"))]
     let syscall_started_at = None;
     let (sync_error, syscall_finished_at) = loop {
-        #[cfg(feature = "bench")]
-        let call_started_at = Instant::now();
         let error = fdatasync_file(sync_file).err();
         let call_finished_at = wal_sync_timestamp();
-        #[cfg(feature = "bench")]
-        if syscall_started_at.is_none() {
-            syscall_started_at = Some(call_started_at);
-        }
         if let Some(error) = error {
             if error.kind() == io::ErrorKind::Interrupted {
                 continue;
@@ -1000,13 +1412,14 @@ fn synchronize_written_prefix(sync_file: &File, inner: &RuntimeInner) -> Result<
         }
         break (None, call_finished_at);
     };
+    let sync_latency = started_at.elapsed();
     let (_sync_end, finished_at) = inner
         .sync_progress
         .finish_sync(syscall_started_at, syscall_finished_at);
     #[cfg(feature = "bench")]
     let duration_ns = finished_at
         .expect("benchmark WAL sync completion has a timestamp")
-        .duration_since(syscall_started_at.expect("fdatasync call records its start timestamp"))
+        .duration_since(started_at)
         .as_nanos() as u64;
     #[cfg(not(feature = "bench"))]
     let _ = finished_at;
@@ -1041,13 +1454,12 @@ fn synchronize_written_prefix(sync_file: &File, inner: &RuntimeInner) -> Result<
         if let Some(poison) = state.poison_ticket {
             debug_assert!(state.durable_frontier <= poison);
         }
-        let assigned = inner.admission.lock().next_ticket;
-        debug_assert!(state.written_frontier <= assigned);
-        inner.durability.changed.notify_all();
+        debug_assert!(state.written_frontier <= inner.admission.lock().next_ticket);
+        inner.durability.notify_change();
         drop(state);
         inner.sync_progress.mark_durable(acknowledged);
 
-        return Ok(());
+        return Ok(Some(sync_latency));
     };
 
     let message = format!("fdatasync failed: {error}");
@@ -1063,14 +1475,13 @@ fn synchronize_written_prefix(sync_file: &File, inner: &RuntimeInner) -> Result<
     {
         admission.poison = Some((durable, message));
     }
-    inner.admission_changed.notify_all();
     inner.buffer_budget.close();
     // Publish the admission poison before waking writers that are waiting on
     // this failed sync. Otherwise a waiter can return `Err` and race a new
     // batch into the still-open admission queue.
-    inner.durability.changed.notify_all();
+    inner.durability.notify_change();
 
-    Ok(())
+    Ok(Some(sync_latency))
 }
 
 fn fdatasync_file(sync_file: &File) -> io::Result<()> {
@@ -1101,6 +1512,8 @@ fn wal_sync_timestamp() -> Option<std::time::Instant> {
 
 /// Preallocate space and extend `i_size` so later direct writes target an
 /// already-sized range and avoid extending the WAL themselves.
+/// Only allocate the new suffix; revisiting the existing extents adds work
+/// as the WAL grows without reserving any additional space.
 fn preallocate(file: &File, end: u64) -> Result<()> {
     ensure!(
         end <= MAX_WAL_FILE_SIZE,
@@ -1115,8 +1528,8 @@ fn preallocate(file: &File, end: u64) -> Result<()> {
         libc::fallocate(
             file.as_raw_fd(),
             0,
-            0,
-            i64::try_from(end).context("WAL preallocation exceeds i64")?,
+            i64::try_from(len).context("WAL preallocation offset exceeds i64")?,
+            i64::try_from(end - len).context("WAL preallocation length exceeds i64")?,
         )
     };
     if result == 0 {
@@ -1146,13 +1559,405 @@ fn round_up(value: u64, alignment: u64) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn admitted_ticket_keeps_its_outcome_when_later_group_packing_fails() {
+        use std::{sync::Arc, thread, time::Duration};
+
+        use crossbeam_skiplist::SkipMap;
+
+        use super::{ExtentInitializer, PREALLOC_BLOCK, WAL_HEADER_END};
+        use crate::{tests::harness::is_io_uring_unavailable_error, wal::WalIoMode};
+
+        let directory = tempfile::tempdir().expect("create WAL directory");
+        let path = directory.path().join("packing-failure.wal");
+        let wal = match Wal::create_with_io_mode(&path, WalIoMode::Parallel) {
+            Ok(wal) => Arc::new(wal),
+            Err(error) if is_io_uring_unavailable_error(&error) => {
+                eprintln!("skipping test (io_uring unavailable): {error:#}");
+                return;
+            }
+            Err(error) => panic!("failed to create parallel WAL: {error:#}"),
+        };
+        let runtime = wal.parallel_runtime.as_ref().expect("parallel runtime");
+        let (prepared_tx, prepared_rx) = crossbeam_channel::bounded(1);
+        let (requests_tx, _requests_rx) = crossbeam_channel::unbounded();
+        {
+            let mut packer = runtime.inner.packer_state.lock();
+            if let Some(mut initializer) = packer.initializer.take() {
+                initializer.close().expect("join extent initializer");
+            }
+            super::preallocate(&runtime.inner.preallocator, PREALLOC_BLOCK)
+                .expect("prepare the test extent");
+            // Pause packing the first group after taking its ticket, without
+            // blocking later writers from admitting their ready buffers.
+            packer.initializer = Some(ExtentInitializer {
+                requests: Some(requests_tx),
+                completions: prepared_rx,
+                join: None,
+                ready_end: WAL_HEADER_END,
+            });
+        }
+        let first_wal = Arc::clone(&wal);
+        let first_writer = thread::spawn(move || {
+            first_wal.put_batch(&[(b"prefix".as_slice(), b"value".as_slice())], 1)
+        });
+        let started = std::time::Instant::now();
+        loop {
+            let admission = runtime.inner.admission.lock();
+            if admission.next_ticket == 1 && admission.queue.is_empty() {
+                break;
+            }
+            drop(admission);
+            assert!(started.elapsed() < Duration::from_secs(5));
+            thread::yield_now();
+        }
+        let later_tickets = (2..=9)
+            .map(|commit_ts| {
+                wal.put_batch(&[(b"later".as_slice(), b"value".as_slice())], commit_ts)
+                    .expect("admit later ticket while the first group is packing")
+            })
+            .collect::<Vec<_>>();
+        // Force the next group's packing to fail after the first group has
+        // been submitted. Its poison boundary must not change ticket zero.
+        runtime
+            .inner
+            .admission
+            .lock()
+            .queue
+            .front_mut()
+            .expect("later batch remains queued")
+            .file_offset += 4096;
+        prepared_tx.send(Ok(PREALLOC_BLOCK)).expect("resume packer");
+        let first_ticket = first_writer
+            .join()
+            .expect("first writer joins")
+            .expect("packing failure cannot retract an admitted ticket");
+        assert_eq!(first_ticket, 0);
+        wal.submit_and_commit(first_ticket)
+            .expect("prefix before the packing failure becomes durable");
+        for ticket in later_tickets {
+            assert!(wal.submit_and_commit(ticket).is_err());
+        }
+        assert!(wal.close().is_err());
+        drop(wal);
+
+        let skiplist = Arc::new(SkipMap::new());
+        let (recovered, max_ts) = Wal::recover(&path, &skiplist).expect("recover durable prefix");
+        assert_eq!(max_ts, 1);
+        assert_eq!(skiplist.len(), 1);
+        assert_eq!(
+            skiplist.get(b"prefix".as_slice()).unwrap().value().as_ref(),
+            b"value"
+        );
+        assert!(skiplist.get(b"later".as_slice()).is_none());
+        recovered.close().expect("close recovered WAL");
+    }
+
+    #[test]
+    fn extent_lookahead_stops_at_file_cap_and_rejects_larger_targets() {
+        use std::{os::unix::fs::FileExt, sync::Arc};
+
+        let file = Arc::new(tempfile::tempfile().unwrap());
+        let start = super::MAX_WAL_FILE_SIZE - 4096;
+        file.set_len(start).unwrap();
+        file.write_all_at(b"batch", start - 5).unwrap();
+        let mut initializer = super::ExtentInitializer::spawn(Arc::clone(&file), start).unwrap();
+        assert!(
+            initializer
+                .prepare(super::MAX_WAL_FILE_SIZE + 4096, true)
+                .is_err()
+        );
+        initializer.prepare(super::MAX_WAL_FILE_SIZE, true).unwrap();
+        initializer.close().unwrap();
+        assert_eq!(file.metadata().unwrap().len(), super::MAX_WAL_FILE_SIZE);
+        let mut batch = [0; 5];
+        file.read_exact_at(&mut batch, start - 5).unwrap();
+        assert_eq!(&batch, b"batch");
+    }
+
+    #[test]
+    fn extent_lookahead_preserves_previously_written_batches() {
+        use std::{os::unix::fs::FileExt, sync::Arc};
+
+        let file = Arc::new(tempfile::tempfile().unwrap());
+        file.set_len(super::WAL_HEADER_END).unwrap();
+        file.write_all_at(b"header", 0).unwrap();
+        let mut initializer =
+            super::ExtentInitializer::spawn(Arc::clone(&file), super::WAL_HEADER_END).unwrap();
+        initializer.prepare(super::PREALLOC_BLOCK, true).unwrap();
+        file.write_all_at(b"batch", super::PREALLOC_BLOCK - 5)
+            .unwrap();
+        initializer
+            .prepare(3 * super::PREALLOC_BLOCK, true)
+            .unwrap();
+        initializer.close().unwrap();
+        let mut bytes = [0; 6];
+        file.read_exact_at(&mut bytes, 0).unwrap();
+        assert_eq!(&bytes, b"header");
+        file.read_exact_at(&mut bytes[..5], super::PREALLOC_BLOCK - 5)
+            .unwrap();
+        assert_eq!(&bytes[..5], b"batch");
+        file.read_exact_at(&mut bytes, 3 * super::PREALLOC_BLOCK - 6)
+            .unwrap();
+        assert_eq!(bytes, [0; 6]);
+    }
+
+    #[test]
+    fn extent_preparation_never_zero_fills_a_skipped_prefix_after_small_writes_resume() {
+        use std::{os::unix::fs::FileExt, sync::Arc};
+
+        let file = Arc::new(tempfile::tempfile().unwrap());
+        let block = super::PREALLOC_BLOCK;
+        file.set_len(5 * block).unwrap();
+        // Markers prove allocation-only requests don't write zeros, rather
+        // than merely reading as zeros from an unwritten extent.
+        file.write_all_at(b"large", block + 4096).unwrap();
+        file.write_all_at(b"mixed", 2 * block + 4096).unwrap();
+        file.write_all_at(b"stale", 4 * block - 5).unwrap();
+        let mut initializer =
+            super::ExtentInitializer::spawn(Arc::clone(&file), super::WAL_HEADER_END).unwrap();
+
+        initializer.prepare(block, false).unwrap();
+        initializer.prepare(2 * block, false).unwrap();
+        initializer.prepare(3 * block, true).unwrap();
+        initializer.prepare(4 * block, true).unwrap();
+        initializer.close().unwrap();
+
+        let mut bytes = [0; 5];
+        file.read_exact_at(&mut bytes, block + 4096).unwrap();
+        assert_eq!(&bytes, b"large");
+        file.read_exact_at(&mut bytes, 2 * block + 4096).unwrap();
+        assert_eq!(&bytes, b"mixed");
+        file.read_exact_at(&mut bytes, 4 * block - 5).unwrap();
+        assert_eq!(bytes, [0; 5]);
+    }
+
+    #[test]
+    fn unused_extent_lookahead_failure_does_not_fail_close() {
+        use std::{fs::File, os::unix::fs::FileExt, sync::Arc};
+
+        let file = tempfile::NamedTempFile::new().unwrap();
+        file.as_file().set_len(super::PREALLOC_BLOCK).unwrap();
+        file.as_file().write_all_at(b"batch", 4096).unwrap();
+        let readonly = Arc::new(File::open(file.path()).unwrap());
+        let mut initializer =
+            super::ExtentInitializer::spawn(Arc::clone(&readonly), super::PREALLOC_BLOCK).unwrap();
+
+        // The prepared prefix is available. Only the unused next extent fails
+        // because its descriptor cannot allocate or write additional bytes.
+        initializer.prepare(super::PREALLOC_BLOCK, true).unwrap();
+        initializer
+            .close()
+            .expect("unused lookahead cannot fail close");
+
+        let mut batch = [0; 5];
+        readonly.read_exact_at(&mut batch, 4096).unwrap();
+        assert_eq!(&batch, b"batch");
+    }
+
+    #[test]
+    fn unused_extent_lookahead_failure_preserves_durable_wal_close_and_recovery() {
+        use std::{fs::File, sync::Arc};
+
+        use crossbeam_skiplist::SkipMap;
+
+        use crate::{tests::harness::is_io_uring_unavailable_error, wal::WalIoMode};
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("unused-lookahead.wal");
+        let wal = match Wal::create_with_io_mode(&path, WalIoMode::Parallel) {
+            Ok(wal) => wal,
+            Err(error) if is_io_uring_unavailable_error(&error) => {
+                eprintln!("skipping test (io_uring unavailable): {error:#}");
+                return;
+            }
+            Err(error) => panic!("failed to create parallel WAL: {error:#}"),
+        };
+        let runtime = wal.parallel_runtime.as_ref().unwrap();
+        {
+            let mut packer = runtime.inner.packer_state.lock();
+            if let Some(mut initializer) = packer.initializer.take() {
+                initializer.close().unwrap();
+            }
+            super::preallocate(&runtime.inner.preallocator, super::PREALLOC_BLOCK).unwrap();
+            packer.preallocated_end = super::PREALLOC_BLOCK;
+            packer.initializer = Some(
+                super::ExtentInitializer::spawn(
+                    Arc::new(File::open(&path).unwrap()),
+                    super::PREALLOC_BLOCK,
+                )
+                .unwrap(),
+            );
+        }
+        let ticket = wal
+            .put_batch(&[(b"prefix".as_slice(), b"durable".as_slice())], 1)
+            .unwrap();
+        wal.submit_and_commit(ticket).unwrap();
+        wal.close()
+            .expect("unused lookahead cannot fail durable WAL close");
+        drop(wal);
+
+        let skiplist = Arc::new(SkipMap::new());
+        let (recovered, max_ts) = Wal::recover(&path, &skiplist).unwrap();
+        assert_eq!(max_ts, 1);
+        assert_eq!(skiplist.len(), 1);
+        assert_eq!(
+            skiplist.get(b"prefix".as_slice()).unwrap().value().as_ref(),
+            b"durable"
+        );
+        recovered.close().unwrap();
+    }
+
+    #[test]
+    fn extent_lookahead_failure_is_reported_when_suffix_is_required() {
+        use std::{fs::File, sync::Arc};
+
+        let file = tempfile::NamedTempFile::new().unwrap();
+        file.as_file().set_len(super::PREALLOC_BLOCK).unwrap();
+        let readonly = Arc::new(File::open(file.path()).unwrap());
+        let mut initializer =
+            super::ExtentInitializer::spawn(readonly, super::PREALLOC_BLOCK).unwrap();
+
+        initializer.prepare(super::PREALLOC_BLOCK, true).unwrap();
+        let error = initializer
+            .prepare(2 * super::PREALLOC_BLOCK, true)
+            .expect_err("a required suffix must report its allocation failure");
+        assert!(format!("{error:#}").contains("fallocate failed during WAL preallocation"));
+        initializer.close().unwrap();
+    }
+
+    #[test]
+    fn extent_initializer_failure_is_reported_and_joined() {
+        use std::{fs::File, sync::Arc};
+
+        let file = tempfile::NamedTempFile::new().unwrap();
+        file.as_file().set_len(super::WAL_HEADER_END).unwrap();
+        let readonly = Arc::new(File::open(file.path()).unwrap());
+        let mut initializer =
+            super::ExtentInitializer::spawn(readonly, super::WAL_HEADER_END).unwrap();
+        assert!(initializer.prepare(super::PREALLOC_BLOCK, true).is_err());
+        initializer
+            .close()
+            .expect("reported failure still joins safely");
+    }
+
+    #[test]
+    fn extent_initializer_can_close_with_an_unconsumed_completion() {
+        use std::sync::Arc;
+
+        let file = Arc::new(tempfile::tempfile().unwrap());
+        file.set_len(super::WAL_HEADER_END).unwrap();
+        let mut initializer = super::ExtentInitializer::spawn(file, super::WAL_HEADER_END).unwrap();
+        initializer.close().unwrap();
+    }
+
     #[cfg(feature = "bench")]
     use super::validate_sync_diagnostics_transition;
     use super::{
-        BufferBudget, MAX_BUFFER_CAPACITY, NORMAL_ACTIVE_BUFFER_BUDGET, PREALLOC_BLOCK,
-        WAL_HEADER_END, WalFull, preallocate, round_up,
+        AdmissionState, AdmittedBatch, BufferBudget, MAX_BUFFER_CAPACITY,
+        NORMAL_ACTIVE_BUFFER_BUDGET, PREALLOC_BLOCK, ParallelBuffer, WAL_HEADER_END, WalFull,
+        preallocate, round_up, take_admitted_group,
     };
-    use crate::wal::Wal;
+    use crate::wal::{DirectBuf, Wal};
+
+    fn admitted_batch(
+        budget: &std::sync::Arc<BufferBudget>,
+        ticket: u64,
+        file_offset: u64,
+    ) -> AdmittedBatch {
+        admitted_batch_of_size(budget, ticket, file_offset, 4096)
+    }
+
+    fn admitted_batch_of_size(
+        budget: &std::sync::Arc<BufferBudget>,
+        ticket: u64,
+        file_offset: u64,
+        aligned_len: usize,
+    ) -> AdmittedBatch {
+        budget
+            .reserve(aligned_len as u64)
+            .expect("reserve test buffer");
+        let mut direct = DirectBuf::new(aligned_len);
+        direct.set_len(aligned_len);
+
+        AdmittedBatch {
+            ticket,
+            file_offset,
+            aligned_len,
+            buffer: ParallelBuffer::activate(
+                direct,
+                std::sync::Arc::clone(budget),
+                aligned_len as u64,
+            ),
+        }
+    }
+
+    #[test]
+    fn packer_preserves_zero_fill_for_mixed_groups_and_skips_large_only_groups() {
+        let budget = std::sync::Arc::new(BufferBudget::new());
+        let large = super::ALLOCATION_ONLY_MIN_BATCH_BYTES;
+        let mut admission = AdmissionState {
+            open: true,
+            close_cutoff: None,
+            poison: None,
+            next_ticket: 4,
+            admitted_end: WAL_HEADER_END + 3 * large as u64 + 4096,
+            queue: std::collections::VecDeque::from([
+                admitted_batch_of_size(&budget, 0, WAL_HEADER_END, large),
+                admitted_batch_of_size(&budget, 1, WAL_HEADER_END + large as u64, large),
+                admitted_batch(&budget, 2, WAL_HEADER_END + 2 * large as u64),
+                admitted_batch_of_size(&budget, 3, WAL_HEADER_END + 2 * large as u64 + 4096, large),
+            ]),
+        };
+
+        let large_group = take_admitted_group(&mut admission, 0, WAL_HEADER_END, 2)
+            .unwrap()
+            .unwrap();
+        assert!(!large_group.initialize_extents);
+        let mixed_group = take_admitted_group(
+            &mut admission,
+            large_group.next_ticket,
+            large_group.reserved_end,
+            2,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(mixed_group.initialize_extents);
+        assert_eq!(mixed_group.reserved_end, admission.admitted_end);
+        assert!(admission.queue.is_empty());
+        drop((large_group, mixed_group));
+        assert_eq!(budget.state.lock().active_bytes, 0);
+    }
+
+    #[test]
+    fn packer_coalesces_contiguous_tickets_but_stops_before_poison() {
+        let budget = std::sync::Arc::new(BufferBudget::new());
+        let mut admission = AdmissionState {
+            open: false,
+            close_cutoff: Some(4),
+            poison: Some((3, "write failure".to_owned())),
+            next_ticket: 4,
+            admitted_end: WAL_HEADER_END + 4 * 4096,
+            queue: std::collections::VecDeque::from([
+                admitted_batch(&budget, 0, WAL_HEADER_END),
+                admitted_batch(&budget, 1, WAL_HEADER_END + 4096),
+                admitted_batch(&budget, 2, WAL_HEADER_END + 2 * 4096),
+                admitted_batch(&budget, 3, WAL_HEADER_END + 3 * 4096),
+            ]),
+        };
+
+        let group = take_admitted_group(&mut admission, 0, WAL_HEADER_END, 8)
+            .expect("contiguous tickets form a valid I/O group")
+            .expect("tickets below the poison boundary remain packable");
+
+        assert_eq!(group.first_ticket, 0);
+        assert_eq!(group.next_ticket, 3);
+        assert_eq!(group.reserved_end, WAL_HEADER_END + 3 * 4096);
+        assert_eq!(group.writes.len(), 3);
+        assert!(admission.queue.is_empty());
+        drop(group);
+        assert_eq!(budget.state.lock().active_bytes, 0);
+    }
 
     #[test]
     fn buffer_budget_allows_one_exclusive_oversized_batch() {
@@ -1277,6 +2082,7 @@ mod tests {
     #[test]
     fn preallocate_extends_the_file_size_for_parallel_direct_writes() {
         use std::fs::OpenOptions;
+        use std::os::unix::fs::FileExt;
 
         let directory = tempfile::tempdir().expect("create temp directory");
         let file = OpenOptions::new()
@@ -1287,6 +2093,7 @@ mod tests {
             .expect("create WAL file");
         file.set_len(WAL_HEADER_END)
             .expect("write WAL header extent");
+        file.write_all_at(b"header", 0).expect("write header");
 
         preallocate(&file, PREALLOC_BLOCK).expect("preallocate WAL extent");
 
@@ -1294,5 +2101,131 @@ mod tests {
             file.metadata().expect("read WAL metadata").len(),
             PREALLOC_BLOCK
         );
+
+        file.write_all_at(b"batch", PREALLOC_BLOCK - 5)
+            .expect("write existing batch");
+        preallocate(&file, 2 * PREALLOC_BLOCK).expect("extend WAL again");
+        preallocate(&file, PREALLOC_BLOCK).expect("ignore smaller extent");
+        assert_eq!(file.metadata().unwrap().len(), 2 * PREALLOC_BLOCK);
+        let mut header = [0; 6];
+        file.read_exact_at(&mut header, 0).unwrap();
+        assert_eq!(&header, b"header");
+        let mut batch = [0; 5];
+        file.read_exact_at(&mut batch, PREALLOC_BLOCK - 5).unwrap();
+        assert_eq!(&batch, b"batch");
+    }
+}
+
+#[cfg(test)]
+mod native_async_tests {
+    use super::*;
+    use std::{
+        future::{Future, poll_fn},
+        task::Poll,
+    };
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn native_async_wal_waits_for_durability_and_wakes_at_the_poison_boundary() {
+        let directory = tempfile::tempdir().unwrap();
+        let wal = match crate::wal::Wal::create_with_io_mode(
+            directory.path().join("probe.wal"),
+            crate::wal::WalIoMode::Parallel,
+        ) {
+            Ok(wal) => wal,
+            Err(error) if crate::tests::harness::is_io_uring_unavailable_error(&error) => {
+                eprintln!("skipping test (io_uring unavailable): {error:#}");
+                return;
+            }
+            Err(error) => panic!("failed to create parallel WAL: {error:#}"),
+        };
+        let runtime = wal.parallel_runtime.as_ref().unwrap();
+        // Drive only the frontier model in a live runtime with no submitted I/O.
+        runtime.inner.admission.lock().next_ticket = 2;
+        let first = runtime.wait_durable_async(0);
+        let second = runtime.wait_durable_async(1);
+        tokio::pin!(first, second);
+        poll_fn(|cx| {
+            assert!(first.as_mut().poll(cx).is_pending());
+            assert!(second.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        runtime.inner.durability.state.lock().written_frontier = 2;
+        runtime.inner.durability.notify_change();
+        poll_fn(|cx| {
+            assert!(
+                first.as_mut().poll(cx).is_pending(),
+                "written is not durable"
+            );
+            assert!(second.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        {
+            let mut state = runtime.inner.durability.state.lock();
+            set_poison(&mut state, 1, "injected later-group failure".to_owned());
+        }
+        runtime.inner.durability.notify_change();
+        assert!(second.await.is_err());
+        poll_fn(|cx| {
+            assert!(
+                first.as_mut().poll(cx).is_pending(),
+                "earlier written prefix can still sync"
+            );
+            Poll::Ready(())
+        })
+        .await;
+        runtime.inner.durability.state.lock().durable_frontier = 1;
+        runtime.inner.durability.notify_change();
+        first.await.unwrap();
+        assert!(runtime.wait_durable_async(2).await.is_err());
+        assert!(wal.close().is_err());
+    }
+}
+
+#[cfg(test)]
+mod async_budget_tests {
+    use super::*;
+    use std::{
+        future::{Future, poll_fn},
+        task::Poll,
+    };
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn native_async_cancelled_oversized_budget_waiter_does_not_starve_ordinary_writes() {
+        let budget = BufferBudget::new();
+        budget.reserve(4096).unwrap();
+        let mut oversized = Box::pin(budget.reserve_async(NORMAL_ACTIVE_BUFFER_BUDGET + 4096));
+        let mut ordinary = Box::pin(budget.reserve_async(4096));
+        poll_fn(|cx| {
+            assert!(oversized.as_mut().poll(cx).is_pending());
+            assert!(ordinary.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        drop(oversized);
+        ordinary.await.unwrap();
+        assert_eq!(budget.state.lock().active_bytes, 8192);
+        assert_eq!(budget.state.lock().oversized_waiters, 0);
+        budget.release(8192);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn native_async_budget_close_wakes_ordinary_and_oversized_waiters() {
+        let budget = BufferBudget::new();
+        budget.reserve(NORMAL_ACTIVE_BUFFER_BUDGET).unwrap();
+        let mut ordinary = Box::pin(budget.reserve_async(4096));
+        let mut oversized = Box::pin(budget.reserve_async(NORMAL_ACTIVE_BUFFER_BUDGET + 4096));
+        poll_fn(|cx| {
+            assert!(ordinary.as_mut().poll(cx).is_pending());
+            assert!(oversized.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        budget.close();
+        assert!(ordinary.await.is_err());
+        assert!(oversized.await.is_err());
+        assert_eq!(budget.state.lock().oversized_waiters, 0);
+        budget.release(NORMAL_ACTIVE_BUFFER_BUDGET);
     }
 }

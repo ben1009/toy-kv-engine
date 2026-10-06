@@ -36,7 +36,7 @@ Key dependencies:
 ├── .typos.toml             # Spell-check allowlist
 ├── lsan-suppressions.txt   # LeakSanitizer suppressions
 ├── docs/                   # Benchmark reports and implementation notes
-├── rfcs/                   # RFCs 001–023
+├── rfcs/                   # RFCs 001–024
 └── kv-engine/
     ├── Cargo.toml
     ├── README.md
@@ -276,7 +276,7 @@ Note: Miri is disabled because `crossbeam-skiplist` uses epoch-based GC incompat
 - `levels` — L1+ tiers or levels
 - `sstables` — map of SST ID → `Arc<SsTable>`
 
-State mutations follow a copy-on-write pattern: the state is behind `ArcSwap<LsmStorageState>` so readers get lock-free snapshots via atomic load. Background tasks (flush, compaction) produce new state versions under a `state_lock` mutex. An `active_memtable_lock: RwLock<()>` prevents write-loss during memtable freeze.
+State mutations follow a copy-on-write pattern: the state is behind `ArcSwap<LsmStorageState>` so readers get lock-free snapshots via atomic load. Background tasks (flush, compaction) produce new state versions under a `state_lock` mutex. The `active_memtable_lock` gate combines blocking read guards and owned async memtable leases; freeze drains both before installing a successor.
 
 ### Key-Value Separation (vLog)
 
@@ -308,6 +308,13 @@ Enable via `LsmStorageOptions::value_separation`.
 ### WAL
 
 Write-ahead logging is optional (`enable_wal: bool`). When enabled, each memtable has an associated WAL file for crash recovery.
+Ordinary v4 WALs default to the parallel pipeline (`WalIoMode::Parallel`); PITR
+v5/v6 and older MVCC WALs retain leader I/O, and legacy unframed WALs remain
+buffered. The explicit leader selector remains available for comparison. See
+[the default adoption note](docs/rfc-024-parallel-wal-default-20261005.md).
+The pipeline has 32 in-flight group slots and 256 ring entries. The maintainer
+selected the default despite the still-unqualified RFC performance gate; see
+[the benchmark overview](docs/rfc-024-parallel-wal-benchmark.md) for evidence.
 
 ### Block Cache
 

@@ -6,8 +6,11 @@
 //! - Read latency (point get + scan)
 //! - Write amplification ratio
 
-use std::{hint::black_box, ops::Bound, path::Path, sync::Arc};
+mod common;
 
+use std::{hint::black_box, ops::Bound, path::Path};
+
+use common::TempEngine;
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use kv_engine::{
     compact::{CompactionOptions, LeveledCompactionOptions},
@@ -132,20 +135,13 @@ fn make_options_with_cache(min_value_size: usize, cache_bytes: u64) -> LsmStorag
     }
 }
 
-fn setup_instance(
-    vlog_enabled: bool,
-    min_value_size: usize,
-    compaction: bool,
-) -> (tempfile::TempDir, Arc<KvEngine>) {
-    let dir = tempfile::tempdir().unwrap();
+fn setup_instance(vlog_enabled: bool, min_value_size: usize, compaction: bool) -> TempEngine {
     let options = if compaction {
         make_options_with_compaction(vlog_enabled, min_value_size)
     } else {
         make_options(vlog_enabled, min_value_size)
     };
-    let lsm = KvEngine::open(dir.path(), options).unwrap();
-
-    (dir, lsm)
+    TempEngine::new(options)
 }
 
 fn setup_instance_with_data(
@@ -154,11 +150,11 @@ fn setup_instance_with_data(
     num_entries: usize,
     value_size: usize,
     compaction: bool,
-) -> (tempfile::TempDir, Arc<KvEngine>) {
-    let (dir, lsm) = setup_instance(vlog_enabled, min_value_size, compaction);
+) -> TempEngine {
+    let lsm = setup_instance(vlog_enabled, min_value_size, compaction);
     load_data(&lsm, num_entries, value_size);
 
-    (dir, lsm)
+    lsm
 }
 
 // ---------------------------------------------------------------------------
@@ -177,12 +173,12 @@ fn bench_write_throughput(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::new("inline", &label), &value_size, |b, &vs| {
             b.iter_batched(
                 || {
-                    let dir = tempfile::tempdir().unwrap();
                     let options = make_options(false, 1024);
-                    let lsm = KvEngine::open(dir.path(), options).unwrap();
-                    (dir, lsm, 0usize)
+
+                    TempEngine::new(options)
                 },
-                |(_dir, lsm, mut i)| {
+                |lsm| {
+                    let mut i = 0usize;
                     let value = vec![0xABu8; vs];
                     for _ in 0..1000 {
                         let key = format!("key{:08}", i);
@@ -191,20 +187,22 @@ fn bench_write_throughput(c: &mut Criterion) {
                     }
                     black_box(i);
                     lsm.close().unwrap();
+
+                    lsm
                 },
-                criterion::BatchSize::SmallInput,
+                criterion::BatchSize::PerIteration,
             )
         });
 
         group.bench_with_input(BenchmarkId::new("vlog", &label), &value_size, |b, &vs| {
             b.iter_batched(
                 || {
-                    let dir = tempfile::tempdir().unwrap();
                     let options = make_options(true, 16);
-                    let lsm = KvEngine::open(dir.path(), options).unwrap();
-                    (dir, lsm, 0usize)
+
+                    TempEngine::new(options)
                 },
-                |(_dir, lsm, mut i)| {
+                |lsm| {
+                    let mut i = 0usize;
                     let value = vec![0xABu8; vs];
                     for _ in 0..1000 {
                         let key = format!("key{:08}", i);
@@ -213,8 +211,10 @@ fn bench_write_throughput(c: &mut Criterion) {
                     }
                     black_box(i);
                     lsm.close().unwrap();
+
+                    lsm
                 },
-                criterion::BatchSize::SmallInput,
+                criterion::BatchSize::PerIteration,
             )
         });
     }
@@ -237,14 +237,10 @@ fn bench_compaction(c: &mut Criterion) {
     for (label, vlog_enabled) in [("inline", false), ("vlog", true)] {
         group.bench_function(label, |b| {
             b.iter_batched(
-                || {
-                    let (dir, lsm) =
-                        setup_instance_with_data(vlog_enabled, 16, num_entries, value_size, true);
-                    (dir, lsm)
-                },
-                |(dir, lsm)| {
+                || setup_instance_with_data(vlog_enabled, 16, num_entries, value_size, true),
+                |lsm| {
                     lsm.force_full_compaction().unwrap();
-                    let sst_bytes = dir_size(dir.path(), "sst");
+                    let sst_bytes = dir_size(lsm.path(), "sst");
                     let vlog_bytes = lsm.vlog_stats().map(|s| s.vlog_total_bytes).unwrap_or(0);
                     eprintln!(
                         "[{label}] post-compaction SST={sst_bytes} vLog={vlog_bytes} total={}",
@@ -252,8 +248,10 @@ fn bench_compaction(c: &mut Criterion) {
                     );
                     black_box(());
                     lsm.close().unwrap();
+
+                    lsm
                 },
-                criterion::BatchSize::SmallInput,
+                criterion::BatchSize::PerIteration,
             )
         });
     }
@@ -273,7 +271,7 @@ fn bench_read_point_get(c: &mut Criterion) {
     group.sample_size(50);
 
     for (label, vlog_enabled) in [("inline", false), ("vlog", true)] {
-        let (dir, lsm) = setup_instance_with_data(vlog_enabled, 16, num_entries, value_size, true);
+        let lsm = setup_instance_with_data(vlog_enabled, 16, num_entries, value_size, true);
         lsm.force_full_compaction().unwrap();
 
         let keys: Vec<Vec<u8>> = (0..1000)
@@ -290,14 +288,12 @@ fn bench_read_point_get(c: &mut Criterion) {
         });
 
         lsm.close().unwrap();
-        drop(dir);
     }
 
     // vlog with value cache (10K entries)
     {
-        let dir = tempfile::tempdir().unwrap();
         let options = make_options_with_cache(16, 256 << 20); // 256MB cache
-        let lsm = KvEngine::open(dir.path(), options).unwrap();
+        let lsm = TempEngine::new(options);
         load_data(&lsm, num_entries, value_size);
         lsm.force_full_compaction().unwrap();
 
@@ -327,7 +323,6 @@ fn bench_read_point_get(c: &mut Criterion) {
         );
 
         lsm.close().unwrap();
-        drop(dir);
     }
 
     group.finish();
@@ -346,7 +341,7 @@ fn bench_read_scan(c: &mut Criterion) {
     group.measurement_time(std::time::Duration::from_secs(10));
 
     for (label, vlog_enabled) in [("inline", false), ("vlog", true)] {
-        let (dir, lsm) = setup_instance_with_data(vlog_enabled, 16, num_entries, value_size, true);
+        let lsm = setup_instance_with_data(vlog_enabled, 16, num_entries, value_size, true);
         lsm.force_full_compaction().unwrap();
 
         group.bench_function(label, |b| {
@@ -360,7 +355,6 @@ fn bench_read_scan(c: &mut Criterion) {
         });
 
         lsm.close().unwrap();
-        drop(dir);
     }
 
     group.finish();
@@ -384,7 +378,6 @@ fn bench_prefix_scan(c: &mut Criterion) {
     group.measurement_time(std::time::Duration::from_secs(30));
 
     for (label, bloom_enabled) in [("no_bloom", false), ("bloom", true)] {
-        let dir = tempfile::tempdir().unwrap();
         let options = LsmStorageOptions {
             block_size: 4096,
             target_sst_size: 2 << 20,
@@ -403,7 +396,7 @@ fn bench_prefix_scan(c: &mut Criterion) {
                 false_positive_rate: 0.01,
             },
         };
-        let lsm = KvEngine::open(dir.path(), options).unwrap();
+        let lsm = TempEngine::new(options);
 
         // Interleave prefixes: write round-robin so each SST has many prefixes.
         let value = vec![0xABu8; value_size];
@@ -420,7 +413,7 @@ fn bench_prefix_scan(c: &mut Criterion) {
             b.iter_custom(|iters| {
                 let mut total = std::time::Duration::ZERO;
                 for _ in 0..iters {
-                    drop_os_page_cache(dir.path());
+                    drop_os_page_cache(lsm.path());
                     let start = std::time::Instant::now();
                     let mut scan = lsm.prefix_scan(b"user005000").unwrap();
                     while scan.is_valid() {
@@ -434,7 +427,6 @@ fn bench_prefix_scan(c: &mut Criterion) {
         });
 
         lsm.close().unwrap();
-        drop(dir);
     }
 
     group.finish();
@@ -450,16 +442,15 @@ fn measure_write_amplification(vlog_enabled: bool, min_value_size: usize) {
     let value_size = 16384;
     let key_size = 12; // "key" + 8 digits
 
-    let (dir, lsm) =
-        setup_instance_with_data(vlog_enabled, min_value_size, num_entries, value_size, true);
+    let lsm = setup_instance_with_data(vlog_enabled, min_value_size, num_entries, value_size, true);
 
     // Measure SST size before compaction (data is in L0 SSTs).
-    let sst_before = dir_size(dir.path(), "sst") as f64;
+    let sst_before = dir_size(lsm.path(), "sst") as f64;
 
     lsm.force_full_compaction().unwrap();
     flush_all(&lsm);
 
-    let sst_after = dir_size(dir.path(), "sst") as f64;
+    let sst_after = dir_size(lsm.path(), "sst") as f64;
     let vlog_bytes = lsm
         .vlog_stats()
         .map(|s| s.vlog_total_bytes as f64)
@@ -480,7 +471,6 @@ fn measure_write_amplification(vlog_enabled: bool, min_value_size: usize) {
     );
 
     lsm.close().unwrap();
-    drop(dir);
 }
 
 fn bench_write_amplification(_c: &mut Criterion) {
@@ -547,9 +537,8 @@ fn bench_cold_point_get(c: &mut Criterion) {
         .collect();
 
     for (label, vlog_enabled) in [("inline", false), ("vlog", true)] {
-        let dir = tempfile::tempdir().unwrap();
         let options = make_cold_options(vlog_enabled);
-        let lsm = KvEngine::open(dir.path(), options).unwrap();
+        let lsm = TempEngine::new(options);
         load_data(&lsm, num_entries, value_size);
 
         group.bench_function(label, |b| {
@@ -562,7 +551,6 @@ fn bench_cold_point_get(c: &mut Criterion) {
         });
 
         drop(lsm);
-        drop(dir);
     }
 
     group.finish();
@@ -587,7 +575,6 @@ fn bench_flush_throughput(c: &mut Criterion) {
         group.bench_function(label, |b| {
             b.iter_batched(
                 || {
-                    let dir = tempfile::tempdir().unwrap();
                     let options = LsmStorageOptions {
                         block_size: 4096,
                         target_sst_size: 64 << 10, // 64KB → frequent flushes
@@ -611,10 +598,10 @@ fn bench_flush_throughput(c: &mut Criterion) {
                         enable_cache_backfill: true,
                         prefix_bloom: PrefixBloomOptions::default(),
                     };
-                    let lsm = KvEngine::open(dir.path(), options).unwrap();
-                    (dir, lsm, 0usize)
+                    TempEngine::new(options)
                 },
-                |(_dir, lsm, mut i)| {
+                |lsm| {
+                    let mut i = 0usize;
                     let value = vec![0xABu8; value_size];
                     // 2500 puts → ~100 flushes at 64KB target
                     for _ in 0..2500 {
@@ -623,9 +610,10 @@ fn bench_flush_throughput(c: &mut Criterion) {
                         i += 1;
                     }
                     black_box(i);
-                    drop(lsm);
+
+                    lsm
                 },
-                criterion::BatchSize::SmallInput,
+                criterion::BatchSize::PerIteration,
             )
         });
     }
@@ -681,9 +669,8 @@ fn bench_cold_scan(c: &mut Criterion) {
     };
 
     for (label, vlog_enabled) in [("inline", false), ("vlog", true)] {
-        let dir = tempfile::tempdir().unwrap();
         let options = make_cold_scan_options(vlog_enabled);
-        let lsm = KvEngine::open(dir.path(), options).unwrap();
+        let lsm = TempEngine::new(options);
         load_data(&lsm, num_entries, value_size);
         lsm.force_full_compaction().unwrap();
 
@@ -698,7 +685,6 @@ fn bench_cold_scan(c: &mut Criterion) {
         });
 
         drop(lsm);
-        drop(dir);
     }
 
     group.finish();
@@ -775,9 +761,8 @@ fn bench_backfill_comparison(c: &mut Criterion) {
         group.bench_function(label, |b| {
             b.iter_batched(
                 || {
-                    let dir = tempfile::tempdir().unwrap();
                     let options = make_options(backfill);
-                    let lsm = KvEngine::open(dir.path(), options).unwrap();
+                    let lsm = TempEngine::new(options);
                     let value = vec![0xABu8; value_size];
                     for key in &keys {
                         lsm.put(key, &value).unwrap();
@@ -789,16 +774,17 @@ fn bench_backfill_comparison(c: &mut Criterion) {
                         }
                     }
                     // Drop OS page cache so reads are genuinely cold
-                    drop_os_page_cache(dir.path());
-                    (dir, lsm)
+                    drop_os_page_cache(lsm.path());
+
+                    lsm
                 },
-                |pair| {
-                    let lsm = &pair.1;
+                |lsm| {
                     for key in &keys {
                         let result = lsm.get(key).unwrap();
                         black_box(result);
                     }
-                    pair
+
+                    lsm
                 },
                 criterion::BatchSize::PerIteration,
             )
@@ -856,9 +842,8 @@ fn bench_compaction_backfill(c: &mut Criterion) {
         group.bench_function(label, |b| {
             b.iter_batched(
                 || {
-                    let dir = tempfile::tempdir().unwrap();
                     let options = make_options(backfill);
-                    let lsm = KvEngine::open(dir.path(), options).unwrap();
+                    let lsm = TempEngine::new(options);
                     let value = vec![0xABu8; value_size];
                     for key in &keys {
                         lsm.put(key, &value).unwrap();
@@ -874,16 +859,17 @@ fn bench_compaction_backfill(c: &mut Criterion) {
                     // sets compact_to_bottom_level=true, disabling cache backfill.
                     // The compaction thread ticks every 50ms; 3s is generous.
                     std::thread::sleep(std::time::Duration::from_secs(3));
-                    drop_os_page_cache(dir.path());
-                    (dir, lsm)
+                    drop_os_page_cache(lsm.path());
+
+                    lsm
                 },
-                |pair| {
-                    let lsm = &pair.1;
+                |lsm| {
                     for key in &keys {
                         let result = lsm.get(key).unwrap();
                         black_box(result);
                     }
-                    pair
+
+                    lsm
                 },
                 criterion::BatchSize::PerIteration,
             )

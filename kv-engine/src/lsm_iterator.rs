@@ -317,8 +317,10 @@ impl StorageIterator for LsmIterator {
 
 /// A wrapper around existing iterator, will prevent users from calling `next` when the iterator is
 /// invalid. If an iterator is already invalid, `next` does not do anything. If `next` returns an
-/// error, `is_valid` should return false, and `next` should always return an error. ref: https://doc.rust-lang.org/std/iter/trait.FusedIterator.html,
-/// about the naming, https://www.reddit.com/r/rust/comments/sbdb9t/i_finally_understand_the_naming_of_iteratorfuse/
+/// error, `is_valid` should return false, and `next` should always return an error. See
+/// [`std::iter::FusedIterator`] for the standard iterator contract and
+/// <https://www.reddit.com/r/rust/comments/sbdb9t/i_finally_understand_the_naming_of_iteratorfuse/>
+/// for discussion of the name.
 pub struct FusedIterator<I: StorageIterator> {
     iter: I,
     has_errored: bool,
@@ -384,7 +386,7 @@ impl<I: StorageIterator> StorageIterator for FusedIterator<I> {
     }
 }
 
-/// Iterator wrapper that holds a [`ReadGuard`] for the duration of a scan.
+/// Iterator wrapper that pins the MVCC snapshot for the duration of a scan.
 /// This ensures the MVCC watermark reflects the active reader so compaction
 /// does not GC versions the iterator might still need.
 ///

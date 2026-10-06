@@ -10,7 +10,7 @@ use std::{
 #[cfg(feature = "bench")]
 use std::time::Instant;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 use bytes::{Buf, BufMut, Bytes};
 use crossbeam_queue::ArrayQueue;
 use crossbeam_skiplist::SkipMap;
@@ -22,8 +22,8 @@ use crate::{key::KeySlice, range_tombstone::RangeTombstone};
 #[cfg(test)]
 mod parallel;
 
-// Parallel WAL components are selected only for ordinary v4 WALs. The leader
-// path remains the default, while legacy and PITR WALs keep their existing I/O.
+// Parallel WAL is the default for ordinary v4 WALs. Legacy and PITR WALs
+// keep their existing I/O paths.
 #[allow(dead_code)]
 #[path = "wal/parallel/worker.rs"]
 mod parallel_worker;
@@ -102,15 +102,15 @@ const GROUP_COMMIT_MIN_SOLO_BYTES: usize = 512 * 1024;
 /// Runtime WAL I/O path selector.
 ///
 /// This is exposed only so the benchmark binary can select the path on an
-/// individual engine. The parallel path currently applies to ordinary v4 WALs;
-/// legacy and PITR WALs continue to use the leader path.
+/// individual engine. Parallel is the default for ordinary v4 WALs. Older
+/// MVCC and PITR WALs use leader I/O; legacy unframed WALs use buffered I/O.
 #[doc(hidden)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum WalIoMode {
     /// Existing client-leader submission and sync path.
-    #[default]
     Leader,
-    /// Dedicated packer, io_uring worker, and durability coordinator.
+    /// Default v4 path: dedicated packer, io_uring worker, and durability coordinator.
+    #[default]
     Parallel,
 }
 
@@ -282,7 +282,7 @@ struct TicketedBuf {
     pitr_entry: Option<crate::pitr::seal::SealEntry>,
 }
 
-enum EncodedWalBuffer {
+pub(crate) enum EncodedWalBuffer {
     Leader(DirectBuf),
     Parallel(parallel_runtime::ParallelBuffer),
 }
@@ -294,6 +294,12 @@ impl EncodedWalBuffer {
             Self::Parallel(buffer) => buffer.direct_mut(),
         }
     }
+}
+
+struct PointBatchLayout<'a> {
+    validated: &'a [(u16, u16)],
+    entries_size: usize,
+    entry_count: u32,
 }
 
 struct PitrSealAccumulator {
@@ -456,10 +462,10 @@ pub struct Wal {
     mvcc_format: bool,
     /// Explicit on-disk WAL format version. Zero denotes the legacy unframed format.
     format_version: u16,
-    /// Effective I/O path. Only ordinary v4 WALs can retain a non-default
-    /// requested mode; legacy and PITR WAL constructors use the leader path.
+    /// Effective I/O path. Ordinary v4 WALs use the requested mode; legacy
+    /// and PITR WAL constructors use the leader path.
     io_mode: WalIoMode,
-    /// Dedicated packer/worker/sync coordinator for candidate v4 WALs.
+    /// Dedicated packer/worker/sync coordinator for parallel v4 WALs.
     parallel_runtime: Option<parallel_runtime::ParallelWalRuntime>,
     /// Whether this WAL uses v3 typed entries (kind prefix).
     /// Only meaningful when `mvcc_format` is true. When false, the WAL uses v2
@@ -470,8 +476,9 @@ pub struct Wal {
     // ── io_uring + O_DIRECT fields ───────────────────────────────────────
     /// O_DIRECT file handle for io_uring writes (None for legacy buffered WALs).
     direct_file: Option<File>,
-    /// io_uring ring for parallel WAL writes (None for legacy buffered WALs).
-    ring: Option<Mutex<io_uring::IoUring>>,
+    /// io_uring ring for MVCC batch writes. `None` for legacy buffered WALs and
+    /// after `retire_ring` releases a drained WAL's ring.
+    ring: Mutex<Option<io_uring::IoUring>>,
     /// Lock-free pool of page-aligned buffers for O_DIRECT I/O.
     direct_buf_pool: ArrayQueue<DirectBuf>,
     /// Encoded DirectBuf buffers waiting for io_uring submission.
@@ -766,7 +773,7 @@ impl Wal {
                     (None, direct_file, alloc_offset, Some(runtime))
                 } else {
                     let (ring, direct_file, alloc_offset) = Self::try_init_io_uring(path)?;
-                    (Some(Mutex::new(ring)), direct_file, alloc_offset, None)
+                    (Some(ring), direct_file, alloc_offset, None)
                 };
             let pitr_seal = if crate::pitr::is_v5_family(format_version) {
                 let wal = std::fs::read(path)?;
@@ -784,7 +791,7 @@ impl Wal {
                 parallel_runtime,
                 is_v3,
                 direct_file: Some(direct_file),
-                ring,
+                ring: Mutex::new(ring),
                 direct_buf_pool: Self::new_direct_buf_pool(io_mode == WalIoMode::Leader),
                 pending: Mutex::new(Vec::new()),
                 next_ticket: AtomicU64::new(0),
@@ -814,7 +821,7 @@ impl Wal {
                 parallel_runtime: None,
                 is_v3,
                 direct_file: None,
-                ring: None,
+                ring: Mutex::new(None),
                 direct_buf_pool: Self::new_direct_buf_pool(true),
                 pending: Mutex::new(Vec::new()),
                 next_ticket: AtomicU64::new(0),
@@ -881,12 +888,16 @@ impl Wal {
     fn encode_and_push_direct_buf<T: WalPointEntry>(
         &self,
         data: &[T],
-        validated: &[(u16, u16)],
-        entries_size: usize,
+        layout: PointBatchLayout<'_>,
         commit_ts: u64,
-        entry_count: u32,
         profile: Option<&crate::mem_table::WriteProfile>,
+        prepared: Option<EncodedWalBuffer>,
     ) -> Result<u64> {
+        let PointBatchLayout {
+            validated,
+            entries_size,
+            entry_count,
+        } = layout;
         anyhow::ensure!(
             self.format_version == WAL_FORMAT_VERSION_V4,
             "v4 WAL encoder selected for format {}",
@@ -925,7 +936,14 @@ impl Wal {
         );
         let alloc_size = DirectBuf::align_up(total_size).max(BUFFER_POOL_BUF_SIZE);
 
-        let mut buf = self.allocate_encoded_buffer(alloc_size)?;
+        let mut buf = match prepared {
+            Some(buffer) => buffer,
+            None => self.allocate_encoded_buffer(alloc_size)?,
+        };
+        ensure!(
+            buf.direct_mut().cap() >= alloc_size,
+            "prepared WAL buffer is too small"
+        );
         buf.direct_mut().clear();
         #[cfg(feature = "bench")]
         if let Some(profile) = profile {
@@ -1067,8 +1085,11 @@ impl Wal {
         Ok(ticket)
     }
 
+    /// Create an ordinary v4 WAL using the default parallel pipeline.
+    ///
+    /// Creation fails if io_uring or `O_DIRECT` initialization is unavailable.
     pub fn create(path: impl AsRef<Path>) -> Result<Self> {
-        Self::create_with_io_mode(path, WalIoMode::Leader)
+        Self::create_with_io_mode(path, WalIoMode::default())
     }
 
     pub(crate) fn create_with_io_mode(path: impl AsRef<Path>, io_mode: WalIoMode) -> Result<Self> {
@@ -1104,7 +1125,7 @@ impl Wal {
                 .inspect_err(|_| {
                     let _ = std::fs::remove_file(path.as_ref());
                 })?;
-            (Some(Mutex::new(ring)), direct_file, alloc_offset, None)
+            (Some(ring), direct_file, alloc_offset, None)
         };
 
         // Re-open buffered handle for recovery reads and legacy put().
@@ -1124,7 +1145,7 @@ impl Wal {
             parallel_runtime,
             is_v3: true,
             direct_file: Some(direct_file),
-            ring,
+            ring: Mutex::new(ring),
             direct_buf_pool: Self::new_direct_buf_pool(io_mode == WalIoMode::Leader),
             pending: Mutex::new(Vec::new()),
             next_ticket: AtomicU64::new(0),
@@ -1166,7 +1187,7 @@ impl Wal {
             parallel_runtime: None,
             is_v3: true,
             direct_file: Some(direct_file),
-            ring: Some(Mutex::new(ring)),
+            ring: Mutex::new(Some(ring)),
             direct_buf_pool: Self::new_direct_buf_pool(true),
             pending: Mutex::new(Vec::new()),
             next_ticket: AtomicU64::new(0),
@@ -2112,7 +2133,7 @@ impl Wal {
                 wal_version,
                 file_len_after,
                 path.as_ref(),
-                WalIoMode::Leader,
+                WalIoMode::default(),
             )?,
             max_ts,
         ))
@@ -2132,7 +2153,7 @@ impl Wal {
             path,
             skiplist,
             range_tombstones,
-            WalIoMode::Leader,
+            WalIoMode::default(),
         )
     }
 
@@ -2260,7 +2281,7 @@ impl Wal {
         data: &[(KeySlice<'_>, &[u8])],
         commit_ts: u64,
     ) -> Result<u64> {
-        self.put_batch_entries_inner(data, commit_ts, None)
+        self.put_batch_entries_inner(data, commit_ts, None, None)
     }
 
     #[cfg(feature = "bench")]
@@ -2270,7 +2291,7 @@ impl Wal {
         commit_ts: u64,
         profile: &crate::mem_table::WriteProfile,
     ) -> Result<u64> {
-        self.put_batch_entries_inner(data, commit_ts, Some(profile))
+        self.put_batch_entries_inner(data, commit_ts, Some(profile), None)
     }
 
     #[cfg(not(feature = "bench"))]
@@ -2279,7 +2300,7 @@ impl Wal {
         data: &[(bytes::Bytes, bytes::Bytes)],
         commit_ts: u64,
     ) -> Result<u64> {
-        self.put_batch_entries_inner(data, commit_ts, None)
+        self.put_batch_entries_inner(data, commit_ts, None, None)
     }
 
     #[cfg(feature = "bench")]
@@ -2289,11 +2310,59 @@ impl Wal {
         commit_ts: u64,
         profile: &crate::mem_table::WriteProfile,
     ) -> Result<u64> {
-        self.put_batch_entries_inner(data, commit_ts, Some(profile))
+        self.put_batch_entries_inner(data, commit_ts, Some(profile), None)
+    }
+
+    /// Prepare resident memory before consuming an MVCC timestamp or WAL ticket.
+    pub(crate) async fn prepare_point_buffer_async(
+        &self,
+        entries_size: usize,
+    ) -> Result<EncodedWalBuffer> {
+        ensure!(
+            entries_size <= u32::MAX as usize,
+            "batch entries_size exceeds u32::MAX"
+        );
+        let total = entries_size
+            .checked_add(V4_BATCH_HEADER_SIZE)
+            .context("batch size overflow")?;
+        ensure!(
+            total as u64 <= MAX_WAL_FILE_SIZE,
+            "batch total_size exceeds maximum WAL file size"
+        );
+        let runtime = self
+            .parallel_runtime
+            .as_ref()
+            .context("native admission requires a parallel v4 WAL")?;
+        let buffer = runtime.allocate_buffer_async(total).await?;
+
+        Ok(EncodedWalBuffer::Parallel(buffer))
+    }
+
+    pub(crate) fn put_owned_prepared_batch(
+        &self,
+        data: &[(bytes::Bytes, bytes::Bytes)],
+        commit_ts: u64,
+        buffer: EncodedWalBuffer,
+        profile: Option<&crate::mem_table::WriteProfile>,
+    ) -> Result<u64> {
+        ensure!(
+            self.is_parallel(),
+            "prepared admission requires a parallel v4 WAL"
+        );
+
+        self.put_batch_entries_inner(data, commit_ts, profile, Some(buffer))
+    }
+
+    pub(crate) async fn wait_durable_async(&self, ticket: u64) -> Result<()> {
+        self.parallel_runtime
+            .as_ref()
+            .context("native durability waits require a parallel v4 WAL")?
+            .wait_durable_async(ticket)
+            .await
     }
 
     fn put_batch_entries<T: WalPointEntry>(&self, data: &[T], commit_ts: u64) -> Result<u64> {
-        self.put_batch_entries_inner(data, commit_ts, None)
+        self.put_batch_entries_inner(data, commit_ts, None, None)
     }
 
     fn put_batch_entries_inner<T: WalPointEntry>(
@@ -2301,6 +2370,7 @@ impl Wal {
         data: &[T],
         commit_ts: u64,
         profile: Option<&crate::mem_table::WriteProfile>,
+        prepared: Option<EncodedWalBuffer>,
     ) -> Result<u64> {
         for entry in data {
             let key = entry.key();
@@ -2367,11 +2437,14 @@ impl Wal {
 
         self.encode_and_push_direct_buf(
             data,
-            &validated,
-            entries_size,
+            PointBatchLayout {
+                validated: &validated,
+                entries_size,
+                entry_count,
+            },
             commit_ts,
-            entry_count,
             profile,
+            prepared,
         )
     }
 
@@ -2381,7 +2454,7 @@ impl Wal {
     /// The `commit_ts` is shared across all entries in the batch.
     ///
     /// The encoded buffer is pushed to the pending queue for io_uring submission.
-    /// The caller must call [`submit_and_commit`] (or [`sync`]) afterward to
+    /// The caller must call [`Self::submit_and_commit`] (or [`Self::sync`]) afterward to
     /// durably flush the data to disk.
     pub fn put_range_tombstone_batch(
         &self,
@@ -2471,8 +2544,7 @@ impl Wal {
             self.submit_and_commit(ticket - 1)?;
         }
 
-        if let Some(ref ring) = self.ring {
-            let mut ring = ring.lock();
+        if let Some(ring) = self.ring.lock().as_mut() {
             let cq = ring.completion();
             for cqe in cq {
                 if cqe.result() < 0 {
@@ -2792,6 +2864,36 @@ impl Wal {
         Ok(stats)
     }
 
+    /// Release the io_uring ring of a drained WAL.
+    ///
+    /// The leader path creates one ring per WAL and keeps it until the WAL is
+    /// dropped, so a rotation-heavy workload can hold hundreds of rings at
+    /// once - about 28 KiB of locked memory each against `RLIMIT_MEMLOCK`,
+    /// which a low limit turns into `ENOMEM` at ring creation. A frozen WAL
+    /// never submits again: every later `submit_and_commit` takes the durable
+    /// fast path before touching the ring, and `sync()` and `close()` tolerate
+    /// a missing ring.
+    ///
+    /// Returns whether a ring was released.
+    pub(crate) fn retire_ring(&self) -> bool {
+        if !self.mvcc_format {
+            return false;
+        }
+        let drained = self.pending.lock().is_empty()
+            && self.completion_state.durable_ticket.load(Ordering::SeqCst)
+                >= self.next_ticket.load(Ordering::SeqCst);
+        if !drained {
+            return false;
+        }
+
+        self.ring.lock().take().is_some()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_ring(&self) -> bool {
+        self.ring.lock().is_some()
+    }
+
     /// Submit DirectBuf buffers as io_uring SQEs, poll CQEs for completion.
     ///
     /// Handles chunked submission when the batch exceeds ring capacity (64 SQEs).
@@ -2805,16 +2907,14 @@ impl Wal {
         #[cfg(not(feature = "bench"))]
         let _ = (captured_target, profile);
 
-        // SAFETY: only called for MVCC WALs which always have a ring.
-        let ring_ref = self.ring.as_ref().unwrap();
-
         // Compute total aligned size first, then preallocate to cover the full batch.
         //
-        // This preallocation is outside every profile span: `wal_submit` opens at
-        // the ring lock below, and the leader's `wal_leader_prepare` span closed
-        // before this function was called. It is also not per-group work - it
-        // extends the file only when the offset crosses a `PREALLOC_BLOCK`
-        // boundary - so nothing else should be read as having absorbed it.
+        // This preallocation sits outside the `wal_submit` span, which opens
+        // below, and outside the ring guard, which is taken just before the
+        // submit loop. The leader's `wal_leader_prepare` span closed before
+        // this function was called. It is also not per-group work - it extends
+        // the file only when the offset crosses a `PREALLOC_BLOCK` boundary -
+        // so nothing else should be read as having absorbed it.
         let total_size: u64 = bufs
             .iter()
             .map(|b| DirectBuf::align_up(b.buf.len()) as u64)
@@ -2856,6 +2956,20 @@ impl Wal {
         #[cfg(feature = "bench")]
         let submit_start = Instant::now();
 
+        // The guard covers the submit loop only: preallocation above and the
+        // sync below stay outside it. A retired ring cannot be needed here -
+        // a drained WAL takes the durable fast path in `submit_and_commit`.
+        #[cfg(feature = "bench")]
+        let ring_lock_start = Instant::now();
+        let mut ring_guard = self.ring.lock();
+        #[cfg(feature = "bench")]
+        if let Some(profile) = profile {
+            profile.record_wal_ring_lock_ns(ring_lock_start.elapsed().as_nanos() as u64);
+        }
+        let Some(ring) = ring_guard.as_mut() else {
+            anyhow::bail!("WAL submit reached a retired io_uring ring");
+        };
+
         for &(chunk_start, chunk_end) in &chunk_ranges {
             let chunk_len = chunk_end - chunk_start;
             #[cfg(feature = "bench")]
@@ -2868,15 +2982,7 @@ impl Wal {
             // the gap between submit and poll.
             let mut write_err: Option<i32> = None;
             let chunk_start_idx = global_idx;
-            // Timed outside the lock it waits on: this is queueing, not work.
-            #[cfg(feature = "bench")]
-            let lock_start = Instant::now();
             {
-                let mut ring = ring_ref.lock();
-                #[cfg(feature = "bench")]
-                if let Some(profile) = profile {
-                    profile.record_wal_ring_lock_ns(lock_start.elapsed().as_nanos() as u64);
-                }
                 #[cfg(feature = "bench")]
                 let fill_start = Instant::now();
                 for i in 0..chunk_len {

@@ -1,7 +1,9 @@
 #[cfg(feature = "chaos-testing")]
 use std::time::Instant;
 use std::{
+    future::Future,
     sync::{Arc, Barrier},
+    task::{Context, Poll, Waker},
     thread,
     time::Duration,
 };
@@ -66,6 +68,17 @@ fn fill_parallel_wal_below_sst_limit(
     assert!(memtable.approximate_size() < engine.inner.options.target_sst_size);
 
     memtable
+}
+
+fn create_leader_wal_or_skip(path: &std::path::Path) -> Option<Wal> {
+    match Wal::create_with_io_mode(path, WalIoMode::Leader) {
+        Ok(wal) => Some(wal),
+        Err(error) if is_io_uring_unavailable_error(&error) => {
+            eprintln!("skipping test (io_uring unavailable): {error:#}");
+            None
+        }
+        Err(error) => panic!("failed to create leader WAL: {error:#}"),
+    }
 }
 
 #[cfg(feature = "chaos-testing")]
@@ -143,11 +156,77 @@ fn test_wal_v5_create_preserves_identity_header() {
     assert!(wal.put_v5_batch(&batch, limits, None).is_err());
 }
 
+#[tokio::test]
+async fn test_default_engine_open_rotation_async_and_repair_use_parallel_wal() {
+    let dir = tempdir().unwrap();
+    let mut options = LsmStorageOptions::default_for_test();
+    options.enable_wal = true;
+    options.target_sst_size = 1 << 30;
+    let engine = match KvEngine::open(dir.path(), options.clone()) {
+        Ok(engine) => engine,
+        Err(error) if is_io_uring_unavailable_error(&error) => {
+            eprintln!("skipping test (io_uring unavailable): {error:#}");
+            return;
+        }
+        Err(error) => panic!("failed to open default WAL engine: {error:#}"),
+    };
+    assert!(engine.inner.selects_parallel_wal_io());
+    assert_eq!(
+        engine.inner.state.load().memtable.parallel_wal_is_closed(),
+        Some(false)
+    );
+    engine.put(b"before-rotation", b"value").unwrap();
+    {
+        let lock = engine.inner.state_lock.lock();
+        engine.inner.force_freeze_memtable(&lock).unwrap();
+    }
+    assert_eq!(
+        engine.inner.state.load().memtable.parallel_wal_is_closed(),
+        Some(false)
+    );
+    engine.put_async(b"after-rotation", b"value").await.unwrap();
+    engine.close_async().await.unwrap();
+    drop(engine);
+
+    let engine = KvEngine::open_async(dir.path(), options.clone())
+        .await
+        .unwrap();
+    assert!(engine.inner.selects_parallel_wal_io());
+    assert_eq!(
+        engine.inner.state.load().memtable.parallel_wal_is_closed(),
+        Some(false)
+    );
+    assert_eq!(
+        engine.get(b"before-rotation").unwrap().as_deref(),
+        Some(b"value".as_slice())
+    );
+    assert_eq!(
+        engine.get(b"after-rotation").unwrap().as_deref(),
+        Some(b"value".as_slice())
+    );
+    engine.put_async(b"after-reopen", b"value").await.unwrap();
+    engine.close_async().await.unwrap();
+    drop(engine);
+
+    let (engine, repaired) = KvEngine::open_repairing(dir.path(), options).unwrap();
+    assert!(repaired.is_empty());
+    assert!(engine.inner.selects_parallel_wal_io());
+    assert_eq!(
+        engine.inner.state.load().memtable.parallel_wal_is_closed(),
+        Some(false)
+    );
+    assert_eq!(
+        engine.get(b"after-reopen").unwrap().as_deref(),
+        Some(b"value".as_slice())
+    );
+    engine.close().unwrap();
+}
+
 #[test]
-fn test_parallel_v4_wal_writes_syncs_and_recovers() {
+fn test_default_v4_wal_writes_syncs_and_recovers() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("candidate-v4.wal");
-    let wal = match Wal::create_with_io_mode(&path, WalIoMode::Parallel) {
+    let wal = match Wal::create(&path) {
         Ok(wal) => wal,
         Err(error) if is_io_uring_unavailable_error(&error) => {
             eprintln!("skipping test (io_uring unavailable): {error}");
@@ -178,13 +257,8 @@ fn test_parallel_v4_wal_writes_syncs_and_recovers() {
 
     let skiplist = new_skiplist();
     let range_tombstones = crate::range_tombstone::RangeTombstoneSet::new();
-    let (recovered, batch) = Wal::recover_with_range_tombstones_and_mode(
-        &path,
-        &skiplist,
-        &range_tombstones,
-        WalIoMode::Parallel,
-    )
-    .unwrap();
+    let (recovered, batch) =
+        Wal::recover_with_range_tombstones(&path, &skiplist, &range_tombstones).unwrap();
     assert_eq!(recovered.io_mode(), WalIoMode::Parallel);
     assert_eq!(batch.max_ts, 3);
     assert_eq!(
@@ -198,6 +272,63 @@ fn test_parallel_v4_wal_writes_syncs_and_recovers() {
     assert_eq!(batch.range_tombstones.len(), 1);
     assert_eq!(batch.range_tombstones[0].start.as_ref(), b"range-start");
     assert_eq!(batch.range_tombstones[0].end.as_ref(), b"range-end");
+}
+
+#[test]
+fn test_parallel_v4_wal_concurrent_admission_drains_on_close() {
+    const WRITERS: usize = 4;
+    const WRITES_PER_WRITER: usize = 64;
+    const TOTAL_WRITES: usize = WRITERS * WRITES_PER_WRITER;
+
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("concurrent-admission.wal");
+    let wal = match Wal::create_with_io_mode(&path, WalIoMode::Parallel) {
+        Ok(wal) => Arc::new(wal),
+        Err(error) if is_io_uring_unavailable_error(&error) => {
+            eprintln!("skipping test (io_uring unavailable): {error}");
+            return;
+        }
+        Err(error) => panic!("failed to create WAL: {error:#}"),
+    };
+    let barrier = Arc::new(Barrier::new(WRITERS + 1));
+    let writers = (0..WRITERS)
+        .map(|writer| {
+            let wal = Arc::clone(&wal);
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                barrier.wait();
+                for write in 0..WRITES_PER_WRITER {
+                    let commit_ts = (writer * WRITES_PER_WRITER + write + 1) as u64;
+                    let key = format!("{writer}/{write}");
+                    let batch = [(key.as_bytes(), b"value".as_slice())];
+                    let ticket = wal.put_batch(&batch, commit_ts).expect("admit WAL batch");
+                    wal.submit_and_commit(ticket)
+                        .expect("wait for WAL durability");
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+
+    barrier.wait();
+    for writer in writers {
+        writer.join().expect("WAL writer thread joins");
+    }
+    assert_eq!(wal.assigned_ticket_count(), TOTAL_WRITES as u64);
+    wal.close().expect("drain queued tickets and close WAL");
+    drop(wal);
+
+    let skiplist = new_skiplist();
+    let range_tombstones = crate::range_tombstone::RangeTombstoneSet::new();
+    let (recovered, batch) = Wal::recover_with_range_tombstones_and_mode(
+        &path,
+        &skiplist,
+        &range_tombstones,
+        WalIoMode::Parallel,
+    )
+    .expect("recover all concurrently admitted batches");
+    assert_eq!(batch.max_ts, TOTAL_WRITES as u64);
+    assert_eq!(skiplist.len(), TOTAL_WRITES);
+    recovered.close().expect("close recovered WAL");
 }
 
 #[cfg(feature = "chaos-testing")]
@@ -472,11 +603,300 @@ fn test_parallel_wal_engine_publishes_point_and_transaction_commits() {
     let state = engine.inner.state.load_full();
     assert_eq!(state.memtable.parallel_wal_is_closed(), Some(false));
     assert_eq!(state.imm_memtables.len(), 1);
-    assert_eq!(state.imm_memtables[0].parallel_wal_is_closed(), Some(false));
+    assert_eq!(state.imm_memtables[0].parallel_wal_is_closed(), Some(true));
 
     engine.close().expect("close parallel WAL engine");
     assert_eq!(state.memtable.parallel_wal_is_closed(), Some(true));
     assert_eq!(state.imm_memtables[0].parallel_wal_is_closed(), Some(true));
+}
+
+#[test]
+fn test_parallel_async_batch_without_tokio_runtime_returns_error() {
+    let dir = tempdir().unwrap();
+    let mut options = LsmStorageOptions::default_for_test();
+    options.enable_wal = true;
+    options.target_sst_size = 1 << 30;
+
+    let engine = match KvEngine::open_with_wal_io_mode(dir.path(), options, WalIoMode::Parallel) {
+        Ok(engine) => engine,
+        Err(error) if is_io_uring_unavailable_error(&error) => {
+            eprintln!("skipping test (io_uring unavailable): {error:#}");
+            return;
+        }
+        Err(error) => panic!("failed to open parallel WAL engine: {error:#}"),
+    };
+
+    let batch = [WriteBatchRecord::Put(
+        b"key".as_slice(),
+        b"value".as_slice(),
+    )];
+    let mut future = Box::pin(engine.write_batch_async(&batch));
+    let mut context = Context::from_waker(Waker::noop());
+    let result = match future.as_mut().poll(&mut context) {
+        Poll::Ready(result) => result,
+        Poll::Pending => panic!("runtime validation should finish before awaiting"),
+    };
+    drop(future);
+
+    let error = result.expect_err("native async writes require a Tokio runtime");
+    assert!(error.to_string().contains("active Tokio runtime"));
+    engine.close().expect("close parallel WAL engine");
+}
+
+#[test]
+fn test_parallel_wal_frozen_runtimes_close_before_memtables_are_reclaimed() {
+    const ROTATIONS: usize = 8;
+
+    let dir = tempdir().unwrap();
+    let mut options = LsmStorageOptions::default_for_test();
+    options.enable_wal = true;
+    options.target_sst_size = 1 << 30;
+    options.num_memtable_limit = usize::MAX;
+    let engine =
+        match KvEngine::open_with_wal_io_mode(dir.path(), options.clone(), WalIoMode::Parallel) {
+            Ok(engine) => engine,
+            Err(error) if is_io_uring_unavailable_error(&error) => {
+                eprintln!("skipping test (io_uring unavailable): {error:#}");
+                return;
+            }
+            Err(error) => panic!("failed to open parallel WAL engine: {error:#}"),
+        };
+
+    // Keep state snapshots alive across every rotation, as scans can do.
+    let mut snapshots = Vec::with_capacity(ROTATIONS);
+    for index in 0..ROTATIONS {
+        let key = format!("frozen/{index}");
+        engine.put(key.as_bytes(), b"value").unwrap();
+        snapshots.push(engine.inner.state.load_full());
+        let state_lock = engine.inner.state_lock.lock();
+        engine.inner.force_freeze_memtable(&state_lock).unwrap();
+        let state = engine.inner.state.load_full();
+        assert_eq!(state.memtable.parallel_wal_is_closed(), Some(false));
+        assert_eq!(state.imm_memtables.len(), index + 1);
+        for frozen in &state.imm_memtables {
+            assert_eq!(frozen.parallel_wal_is_closed(), Some(true));
+            frozen
+                .sync_wal()
+                .expect("closed durable WAL remains synced");
+            assert!(frozen.wal_path().unwrap().exists());
+        }
+    }
+    for snapshot in &snapshots {
+        assert_eq!(snapshot.memtable.parallel_wal_is_closed(), Some(true));
+        assert!(!snapshot.memtable.is_empty());
+    }
+    engine.close().unwrap();
+    drop(snapshots);
+    drop(engine);
+
+    // Recovery must not retain a dedicated runtime for every immutable WAL.
+    let reopened =
+        KvEngine::open_with_wal_io_mode(dir.path(), options, WalIoMode::Parallel).unwrap();
+    let state = reopened.inner.state.load_full();
+    assert_eq!(state.imm_memtables.len(), ROTATIONS);
+    assert_eq!(state.memtable.parallel_wal_is_closed(), Some(false));
+    for frozen in &state.imm_memtables {
+        assert_eq!(frozen.parallel_wal_is_closed(), Some(true));
+    }
+    for index in 0..ROTATIONS {
+        let key = format!("frozen/{index}");
+        assert_eq!(
+            reopened.get(key.as_bytes()).unwrap().as_deref(),
+            Some(&b"value"[..])
+        );
+    }
+    reopened.put(b"successor", b"value").unwrap();
+    reopened.close().unwrap();
+}
+
+#[cfg(feature = "chaos-testing")]
+#[test]
+fn failpoint_parallel_wal_freeze_waits_for_writer_durability_and_publication() {
+    let dir = tempdir().unwrap();
+    let mut options = LsmStorageOptions::default_for_test();
+    options.enable_wal = true;
+    options.target_sst_size = 1 << 30;
+    let engine = match KvEngine::open_with_wal_io_mode(dir.path(), options, WalIoMode::Parallel) {
+        Ok(engine) => engine,
+        Err(error) if is_io_uring_unavailable_error(&error) => {
+            eprintln!("skipping failpoint test (io_uring unavailable): {error:#}");
+            return;
+        }
+        Err(error) => panic!("failed to open parallel WAL engine: {error:#}"),
+    };
+    let frozen = Arc::clone(&engine.inner.state.load().memtable);
+    let sync_gate = crate::chaos::failpoint::arm_parallel_wal_sync_gate();
+    let writer_engine = Arc::clone(&engine);
+    let writer = thread::spawn(move || writer_engine.put(b"before-freeze", b"value"));
+    assert!(sync_gate.wait_until_entered(Duration::from_secs(10)));
+    assert!(engine.inner.active_memtable_lock.try_write().is_none());
+
+    let (started_tx, started_rx) = bounded(1);
+    let (finished_tx, finished_rx) = bounded(1);
+    let freeze_engine = Arc::clone(&engine);
+    let freezer = thread::spawn(move || {
+        let state_lock = freeze_engine.inner.state_lock.lock();
+        started_tx.send(()).unwrap();
+        let result = freeze_engine.inner.force_freeze_memtable(&state_lock);
+        finished_tx.send(()).unwrap();
+
+        result
+    });
+    started_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    assert!(finished_rx.try_recv().is_err());
+    assert_eq!(frozen.parallel_wal_is_closed(), Some(false));
+
+    sync_gate.release();
+    writer
+        .join()
+        .unwrap()
+        .expect("writer commits before freeze");
+    freezer
+        .join()
+        .unwrap()
+        .expect("freeze joins the old runtime");
+    assert_eq!(frozen.parallel_wal_is_closed(), Some(true));
+    assert!(
+        !frozen.is_empty(),
+        "durable data must be published before freeze"
+    );
+    assert_eq!(
+        engine.get(b"before-freeze").unwrap().as_deref(),
+        Some(&b"value"[..])
+    );
+    engine.put(b"after-freeze", b"value").unwrap();
+    engine.close().unwrap();
+}
+
+#[cfg(feature = "chaos-testing")]
+#[test]
+fn failpoint_parallel_wal_freeze_failure_does_not_publish_a_successor() {
+    use crate::chaos::failpoint::{self, FailScenario};
+
+    let scenario = FailScenario::setup();
+    let dir = tempdir().unwrap();
+    let mut options = LsmStorageOptions::default_for_test();
+    options.enable_wal = true;
+    options.target_sst_size = 1 << 30;
+    let engine = match KvEngine::open_with_wal_io_mode(dir.path(), options, WalIoMode::Parallel) {
+        Ok(engine) => engine,
+        Err(error) if is_io_uring_unavailable_error(&error) => {
+            eprintln!("skipping failpoint test (io_uring unavailable): {error:#}");
+            return;
+        }
+        Err(error) => panic!("failed to open parallel WAL engine: {error:#}"),
+    };
+    engine.put(b"durable", b"value").unwrap();
+    let before = engine.inner.state.load_full();
+    failpoint::cfg("parallel_wal.fdatasync_failure", "return").unwrap();
+    assert!(engine.put(b"failed", b"value").is_err());
+    failpoint::cfg("parallel_wal.fdatasync_failure", "off").unwrap();
+
+    let state_lock = engine.inner.state_lock.lock();
+    let error = engine.inner.force_freeze_memtable(&state_lock).unwrap_err();
+    drop(state_lock);
+    assert!(error.to_string().contains("requires recovery"));
+    let after = engine.inner.state.load_full();
+    assert!(Arc::ptr_eq(&before.memtable, &after.memtable));
+    assert!(after.imm_memtables.is_empty());
+    // Publication poison now rejects freeze before runtime teardown; explicit
+    // close must still drain it even though close returns the WAL failure.
+    assert_eq!(after.memtable.parallel_wal_is_closed(), Some(false));
+    assert!(after.memtable.wal_path().unwrap().exists());
+    assert!(engine.close().is_err());
+    assert_eq!(after.memtable.parallel_wal_is_closed(), Some(true));
+    scenario.teardown();
+}
+
+#[test]
+fn test_leader_wal_rings_do_not_accumulate_across_freezes() {
+    const ROTATIONS: usize = 6;
+
+    let dir = tempdir().unwrap();
+    let mut options = LsmStorageOptions::default_for_test();
+    options.enable_wal = true;
+    options.target_sst_size = 1 << 30;
+    options.num_memtable_limit = usize::MAX;
+    let engine = match KvEngine::open_with_wal_io_mode(dir.path(), options, WalIoMode::Leader) {
+        Ok(engine) => engine,
+        Err(error) if is_io_uring_unavailable_error(&error) => {
+            eprintln!("skipping test (io_uring unavailable): {error}");
+            return;
+        }
+        Err(error) => panic!("failed to open leader WAL engine: {error:#}"),
+    };
+
+    // The regression this pins: every frozen WAL used to keep its ring, so a
+    // rotation-heavy workload accumulated one ring per retained WAL until ring
+    // creation failed against RLIMIT_MEMLOCK.
+    for rotation in 0..ROTATIONS {
+        let key = format!("rotation/{rotation}");
+        engine.put(key.as_bytes(), b"value").unwrap();
+        let state_lock = engine.inner.state_lock.lock();
+        engine.inner.force_freeze_memtable(&state_lock).unwrap();
+        drop(state_lock);
+
+        let state = engine.inner.state.load();
+        let live_rings = std::iter::once(&state.memtable)
+            .chain(state.imm_memtables.iter())
+            .filter(|memtable| memtable.has_ring() == Some(true))
+            .count();
+        assert_eq!(
+            live_rings, 1,
+            "rotation {rotation}: only the active memtable keeps a ring"
+        );
+    }
+    engine.close().unwrap();
+}
+
+#[test]
+fn test_leader_wal_ring_retires_when_a_memtable_is_frozen() {
+    let dir = tempdir().unwrap();
+    let mut options = LsmStorageOptions::default_for_test();
+    options.enable_wal = true;
+    options.target_sst_size = 1 << 30;
+    options.num_memtable_limit = usize::MAX;
+    let engine =
+        match KvEngine::open_with_wal_io_mode(dir.path(), options.clone(), WalIoMode::Leader) {
+            Ok(engine) => engine,
+            Err(error) if is_io_uring_unavailable_error(&error) => {
+                eprintln!("skipping test (io_uring unavailable): {error}");
+                return;
+            }
+            Err(error) => panic!("failed to open leader WAL engine: {error:#}"),
+        };
+
+    engine.put(b"key", b"value").unwrap();
+    assert_eq!(engine.inner.state.load().memtable.has_ring(), Some(true));
+    let state_lock = engine.inner.state_lock.lock();
+    engine.inner.force_freeze_memtable(&state_lock).unwrap();
+    drop(state_lock);
+
+    let state = engine.inner.state.load();
+    assert_eq!(state.imm_memtables.len(), 1);
+    assert_eq!(
+        state.imm_memtables[0].has_ring(),
+        Some(false),
+        "a frozen leader WAL releases its io_uring ring"
+    );
+    assert_eq!(
+        state.memtable.has_ring(),
+        Some(true),
+        "the successor memtable keeps its own ring"
+    );
+    state.imm_memtables[0]
+        .sync_wal()
+        .expect("a retired WAL still reports durability");
+    engine.close().unwrap();
+    drop(engine);
+
+    // The WAL data outlives its ring: recovery still sees the frozen batch.
+    let reopened = KvEngine::open_with_wal_io_mode(dir.path(), options, WalIoMode::Leader).unwrap();
+    assert_eq!(
+        reopened.get(b"key").unwrap().as_deref(),
+        Some(&b"value"[..])
+    );
+    reopened.close().unwrap();
 }
 
 #[test]
@@ -641,6 +1061,17 @@ fn test_parallel_wal_full_rotates_point_transaction_and_batch_writes() {
 #[cfg(feature = "chaos-testing")]
 #[test]
 fn failpoint_parallel_wal_rotation_reruns_transaction_conflict_check() {
+    parallel_wal_rotation_reruns_transaction_conflict_check(false);
+}
+
+#[cfg(feature = "chaos-testing")]
+#[test]
+fn failpoint_parallel_async_wal_rotation_reruns_transaction_conflict_check() {
+    parallel_wal_rotation_reruns_transaction_conflict_check(true);
+}
+
+#[cfg(feature = "chaos-testing")]
+fn parallel_wal_rotation_reruns_transaction_conflict_check(async_commit: bool) {
     const TEST_WAL_CAP: u64 = 1 << 20;
     const LARGE_VALUE_LEN: usize = 60 * 1024;
 
@@ -677,7 +1108,13 @@ fn failpoint_parallel_wal_rotation_reruns_transaction_conflict_check() {
     transaction.put(b"transaction-only", &large_value).unwrap();
 
     let rotation_gate = crate::chaos::failpoint::arm_parallel_wal_txn_rotation_gate();
-    let commit = thread::spawn(move || transaction.commit());
+    let commit = thread::spawn(move || {
+        if async_commit {
+            crate::future_ext::block_on(transaction.commit_async())
+        } else {
+            transaction.commit()
+        }
+    });
     assert!(
         rotation_gate.wait_until_entered(Duration::from_secs(10)),
         "transaction should pause after WAL-full admission and before rotation"
@@ -837,11 +1274,22 @@ fn test_parallel_wal_full_rotates_range_tombstone_write() {
 
 #[cfg(target_os = "linux")]
 #[test]
-fn test_parallel_selector_rejects_async_writes_during_v5_successor() {
+fn test_parallel_async_writes_preserve_the_v5_successor_path() {
+    for serializable in [false, true] {
+        for version in [
+            crate::pitr::WAL_V5_VERSION_LEGACY,
+            crate::pitr::WAL_V5_VERSION,
+        ] {
+            parallel_async_writes_preserve_the_pitr_successor_path(serializable, version);
+        }
+    }
+}
+
+fn parallel_async_writes_preserve_the_pitr_successor_path(serializable: bool, version: u16) {
     let dir = tempdir().unwrap();
     let mut options = LsmStorageOptions::default_for_test();
     options.enable_wal = true;
-    options.serializable = true;
+    options.serializable = serializable;
     let engine = match KvEngine::open_with_wal_io_mode(dir.path(), options, WalIoMode::Parallel) {
         Ok(engine) => engine,
         Err(error) if is_io_uring_unavailable_error(&error) => {
@@ -852,7 +1300,7 @@ fn test_parallel_selector_rejects_async_writes_during_v5_successor() {
     };
 
     let header = crate::pitr::WalV5Header {
-        wal_format_version: crate::pitr::WAL_V5_VERSION,
+        wal_format_version: version,
         timeline_id: crate::pitr::TimelineId([1; 16]),
         archive_epoch_id: crate::pitr::ArchiveEpochId([2; 16]),
         segment_id: crate::pitr::SegmentId(3),
@@ -870,17 +1318,26 @@ fn test_parallel_selector_rejects_async_writes_during_v5_successor() {
     assert!(engine.inner.state.load().memtable.uses_wal_v5());
     assert!(engine.inner.selects_parallel_wal_io());
 
-    let error = crate::future_ext::block_on(engine.put_async(b"async", b"value"))
-        .expect_err("async write must remain disabled while v5 is active");
-    assert!(error.to_string().contains("parallel WAL"));
+    crate::future_ext::block_on(engine.put_async(b"async", b"value"))
+        .expect("async write uses the existing v5 blocking path");
+    assert_eq!(
+        engine.get(b"async").unwrap().as_deref(),
+        Some(b"value".as_slice())
+    );
+    assert!(engine.inner.state.load().memtable.uses_wal_v5());
 
     let txn = engine.new_txn().expect("start transaction");
     txn.put(b"txn", b"value").unwrap();
-    let error = crate::future_ext::block_on(txn.commit_async())
-        .expect_err("async transaction must remain disabled while v5 is active");
-    assert!(error.to_string().contains("parallel WAL"));
+    crate::future_ext::block_on(txn.commit_async())
+        .expect("async transaction preserves v5 OCC and WAL semantics");
+    assert_eq!(
+        engine.get(b"txn").unwrap().as_deref(),
+        Some(b"value".as_slice())
+    );
+    assert!(engine.inner.state.load().memtable.uses_wal_v5());
 
-    engine.close().expect("close parallel WAL engine");
+    crate::future_ext::block_on(engine.close_async())
+        .expect("close parallel selector with v5 active");
 }
 
 #[test]
@@ -1719,7 +2176,7 @@ fn test_wal_group_commit_handles_late_arrival() {
 fn test_wal_profiled_group_commit_records_follower_wait_events() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("profiled_group_commit.wal");
-    let Some(wal) = create_wal_or_skip(&path) else {
+    let Some(wal) = create_leader_wal_or_skip(&path) else {
         return;
     };
     let wal = Arc::new(wal);
@@ -2553,7 +3010,7 @@ fn test_wal_submit_and_commit_flushes_legacy_wal() {
 fn test_wal_submit_and_commit_empty_wal_is_noop() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("empty_submit_and_commit.wal");
-    let Some(wal) = create_wal_or_skip(&path) else {
+    let Some(wal) = create_leader_wal_or_skip(&path) else {
         return;
     };
 
@@ -2571,7 +3028,7 @@ fn test_wal_submit_and_commit_rejects_unassigned_ticket() {
     wal.put_batch(&[(b"k", b"v")], 1).unwrap();
     let err = wal.submit_and_commit(1).unwrap_err();
     assert!(
-        err.to_string().contains("unassigned ticket"),
+        err.to_string().contains("unassigned"),
         "unexpected error: {err:#}"
     );
 }

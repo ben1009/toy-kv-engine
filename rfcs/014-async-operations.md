@@ -10,6 +10,17 @@
 
 ---
 
+## Current implementation (2026-10-06)
+
+Ordinary v4 WALs now default to the dedicated pipeline in
+[RFC 024](024-dedicated-wal-pipeline.md). Non-serializable async point writes
+use owned native waits for buffer capacity, durability, and ordered MVCC
+publication. Range writes, transaction commits, serializable writes, and
+PITR v5/v6 keep the bounded blocking boundary. Async close has an independent
+shared shutdown owner. The [integration report](../docs/rfc-024-native-async-integration-20261005.md)
+records lifecycle and cancellation behavior; the proposal below preserves
+the original async design.
+
 ## 1. Summary
 
 This RFC proposes changing kv-engine's **user-visible operation surface** from

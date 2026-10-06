@@ -152,10 +152,33 @@ impl BlockingExecutor {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn hold_all_slots_for_test(&self) -> HeldBlockingSlots {
+        self.active.fetch_add(self.max_blocking, Ordering::AcqRel);
+
+        HeldBlockingSlots {
+            active: Arc::clone(&self.active),
+            slots: self.max_blocking,
+        }
+    }
+
     /// Check available slots without blocking.
     #[allow(dead_code)]
     pub fn available_permits(&self) -> usize {
         self.max_blocking
             .saturating_sub(self.active.load(Ordering::Acquire))
+    }
+}
+
+#[cfg(test)]
+pub(crate) struct HeldBlockingSlots {
+    active: Arc<AtomicUsize>,
+    slots: usize,
+}
+
+#[cfg(test)]
+impl Drop for HeldBlockingSlots {
+    fn drop(&mut self) {
+        self.active.fetch_sub(self.slots, Ordering::Release);
     }
 }

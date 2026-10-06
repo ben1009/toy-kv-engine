@@ -2,12 +2,31 @@
 
 **RFC:** [RFC 024: Dedicated WAL I/O Pipeline](../rfcs/024-dedicated-wal-pipeline.md)
 
-**Status:** Slices 1–6 implemented for the synchronous v4 WAL path; Slice 7's
-performance and adoption gate remains open
+**Status:** Slices 1–7 complete for the synchronous v4 WAL path, with a native
+async follow-up for non-serializable point writes. Ordinary v4 WALs now default
+to parallel by maintainer decision; the performance adoption gate is still
+unqualified. See the [default adoption note](rfc-024-parallel-wal-default-20261005.md).
+The [October 5 native async versus leader matrix](rfc-024-native-async-vs-leader-20261005.md)
+records one-put and batch64 observations at 1, 4, 8, and 16 writers. The
+[latest batch64 rerun](rfc-024-native-batch64-leader-rerun-20261006.md) measures
+the retained backend at eight and sixteen writers. Both keep peak results,
+paired estimates, and failed controls separate.
 
-**Last updated:** 2026-09-26
+**Last updated:** 2026-10-06
 
-## Purpose and boundary
+The retained pipeline uses 32 group slots and 256 ring entries. After a sync
+takes at least 100 microseconds, it may coalesce for up to 400 microseconds,
+refreshing the optional cutoff without resetting that deadline. It then
+drains a bounded snapshot of queued completion results and captures the
+actual sync target once. Ext-family extent initialization runs ahead of
+the I/O worker. An unused speculative suffix failure does not invalidate
+healthy close; requiring that suffix still poisons the affected tickets.
+
+## Original rollout purpose and boundary
+
+The rollout instructions and slice outcomes below preserve the original
+benchmark-gated plan. The current default and 32-group limit are documented
+in the adoption note above.
 
 Implement the RFC as a sequence of reviewable changes. The first candidate is
 an internal, opt-in path for ordinary v4 MVCC WALs: one dedicated io_uring
@@ -20,9 +39,9 @@ The write result still means **WAL durable**, followed by memtable insertion
 and ordered MVCC publication. Do not make the WAL worker publish commit
 timestamps or weaken the sequencer's `poisoned_at` rule.
 
-## Current code seams
+## Original code seams and planned changes
 
-| Seam | Current behavior | Planned change |
+| Seam | Baseline behavior at proposal time | Planned change |
 | --- | --- | --- |
 | [`Wal::put_batch`](../kv-engine/src/wal.rs) and range-batch encoding | Encode into `DirectBuf`, then assign a ticket and append to `pending`. | The opt-in path shares the v4 encoder, reserves buffer capacity before ticket assignment, and atomically assigns ticket/file offset and enqueues. |
 | [`Wal::submit_and_commit`](../kv-engine/src/wal.rs) | A client wins `submitting`, drains one group, submits and waits for its CQEs, calls `fdatasync`, then wakes followers. | The opt-in path waits for its ticket on the dedicated worker's durable frontier; the old branch remains the control and PITR path. |
@@ -31,7 +50,7 @@ timestamps or weaken the sequencer's `poisoned_at` rule.
 | Memtable WAL creation/recovery in [`mem_table.rs`](../kv-engine/src/mem_table.rs) and rotation in [`lsm_storage.rs`](../kv-engine/src/lsm_storage.rs) | Create or reopen a WAL, freeze a full memtable, and install a successor. | Carry the per-WAL selector through create/reopen; retry the explicit `WAL full` result after releasing the active-memtable guard, forcing and coalescing v4 rotations. |
 | [`write-perf`](../kv-engine/src/bin/write-perf.rs) | Measures `wal_concurrent` and existing WAL profile fields. | Select either path in the same binary and report actual group/SQE overlap and sync behavior. |
 
-The current `pending` queue, `next_ticket`, `alloc_offset`, ring lock,
+The baseline `pending` queue, `next_ticket`, `alloc_offset`, ring lock,
 `CompletionState`, and `submitting` flag are coupled to the leader path. Keep
 that path intact while adding a private v4 pipeline module (for example,
 `wal/parallel/`) with a separately testable state machine. A per-WAL selector
@@ -42,18 +61,25 @@ and PITR control runs need independent choices.
 
 Keep the parallel WAL work focused on ticket admission, ordered offsets,
 concurrent I/O, durability, recovery, and WAL-full rotation. The reviews also
-found existing async/lifecycle defects on the current leader path. Fix these in
-separate PRs with their own tests; they are not evidence that the RFC's WAL
-state machine is incomplete.
+found existing async/lifecycle defects on the leader path. These prerequisites
+are addressed by the native async integration and have dedicated regression
+tests; they are not evidence that the RFC's WAL state machine is incomplete.
 
-| Existing defect | Separate fix and gate |
+| Historical defect | Integration resolution and tests |
 | --- | --- |
-| [`Transaction::commit_async`](../kv-engine/src/mvcc/txn.rs) takes its MVCC snapshot guard and copies writes/OCC sets when the future is created, before it claims the commit on first poll. | Move ownership and state capture to the winning attempt. An unpolled/losing future must not unpin the snapshot; a cancelled, spawned commit must retain its snapshot and engine admission until its outcome is known. Verify mutation before first poll, two competing futures, cancellation, and close. Required before exposing the candidate through async transactions. |
-| Async engine methods in [`lsm_storage.rs`](../kv-engine/src/lsm_storage.rs) can leave admission guards in cancellable futures while detached blocking closures continue; `batch_get_async` discards its guard. | Audit all blocking engine APIs and transfer each guard to the spawned task or returned cursor. Test cancellation against close for a write, maintenance task, and batch read. Required before exposing the candidate through async APIs. |
-| Async lifecycle waits can lose a [`Notify` wakeup](../kv-engine/src/lsm_storage.rs); `close_async` cancellation or a background-worker join error can leave `Closing` unresolved. | Use state-aware wait registration and a shutdown owner that records a terminal success or error after safe teardown. Test cancellation at each await, failed joins, and a second close caller. Required before relying on async close for candidate teardown. |
+| [`Transaction::commit_async`](../kv-engine/src/mvcc/txn.rs) took its MVCC snapshot guard and copied writes/OCC sets before claiming the commit. | An owned blocking transaction now calls the synchronous commit protocol, fences its claim against local mutations before reading inputs, retains the snapshot/admission through cancellation, and repeats OCC after WAL-full rotation. Accepted reads/cursors retain independent snapshot pins across commit. Tests cover unpolled and competing futures, mutation during dispatch, snapshot retention, cancellation, conflict during rotation, and close. |
+| Async engine methods left admission guards in cancellable futures while detached blocking closures continued; `batch_get_async` discarded its guard. | Blocking closures and returned cursors now own their admission. Tests cancel a native write, maintenance operation, and batch read while close waits for their owners. |
+| Async lifecycle waits could lose a `Notify` wakeup; cancelled close or a background-worker join error could leave `Closing` unresolved. | `close_async` shares one owned storage/PITR shutdown thread independently of the caller's blocking pool, allowing admitted rotation/freeze to finish. It drains work, joins workers, safely closes WALs, and records a terminal result for later callers, including join/sync errors. Tests cover a one-thread blocking pool, concurrent/cancelled close, rejected precondition retry, failed joins, and repeated close. |
 
-The candidate now runs through synchronous v4 WAL and engine paths. Do not
-expose it through engine async APIs until the prerequisite tests pass.
+Ordinary parallel v4 point writes now also await buffer capacity, WAL durability,
+and MVCC publication natively. A fair native preparation permit is released
+after sequencer admission, before durability and publication waits. Owned
+memtable leases make freeze, checkpoint,
+and GC CAS drain pending publication. A busy sequencer releases prepared memory
+and retries before timestamp assignment, avoiding a budget/lock deadlock with
+synchronous writers. Range writes, OCC transaction commits, and actual PITR
+v5/v6 WALs retain their bounded blocking path. Ordinary v4 WALs default to parallel;
+see the [integration report](rfc-024-native-async-integration-20261005.md).
 
 ## Implementation slices
 
@@ -132,9 +158,29 @@ ticket whose MVCC publication is delayed until after a later WAL failure.
 or rotation leave no ticket or offset hole. Mixed batch sizes preserve the
 stored admission lengths through packing. The accounting model verifies the
 normal-budget and exclusive oversized-batch paths, including rejection above
-the 240 MiB aligned-capacity limit. A blocked `fallocate` does not block
-producer admission. Worker notification delivery and buffer recycling are
+the 240 MiB aligned-capacity limit. A blocked `fallocate` does not hold the
+admission queue mutex. Worker notification delivery and buffer recycling are
 verified after the worker exists.
+
+**Historical implementation (2026-10-03):** The candidate used
+producer-side packing. Admission saved each batch's physical offset and aligned
+length; the packer validated and reused them. The producer tried the packer
+mutex while holding admission, and the packer released its mutex under
+admission only after observing an empty queue. This prevented stranded tickets
+without a dedicated packer thread. Extent preparation and group-slot waits
+could block the admitting caller outside the admission queue mutex. MVCC point
+puts retained `mvcc.write_lock` through packing, so these waits could delay other
+point puts. The [write-order handoff experiment](rfc-024-wal-admission-handoff-20261002.md)
+records the rejected attempt to release that guard earlier in that version.
+
+**Implementation update (2026-10-05):** The native async integration replaces
+producer-side packing with one dedicated `wal-ordered-packer` thread per
+parallel WAL. Synchronous and native producers atomically assign tickets and
+physical ranges, enqueue their ready buffers, and send a coalesced wakeup.
+The packer drains that queue using the stored offsets and aligned lengths;
+extent preparation and group-slot waits no longer run on producers or retain
+their `mvcc.write_lock`. See the
+[integration report](rfc-024-native-async-integration-20261005.md).
 
 ### 4. Dedicated write worker and buffer ownership
 
@@ -166,7 +212,14 @@ verified after the coordinator exists.
   ring worker. Capture the largest contiguous written ticket before each
   call; on success, advance `durable_ticket` only through that captured target
   and below `poison_ticket`. Immediately reconsider another sync if the
-  written frontier moved during the call. Add no fixed batching delay.
+  written frontier moved during the call. A measured optimization permits a
+  400-microsecond wait only when the previous `fdatasync` took at least 100
+  microseconds, a written prefix is ready, and tickets already admitted at
+  the snapshot remain unwritten. When the written frontier reaches that
+  optional batching cutoff, refresh it from current admission using only the
+  time remaining on the original deadline. Later admission cannot extend or
+  reset the deadline; public barrier cutoffs and the actual `fdatasync` target
+  remain fixed.
 - Make `submit_and_commit(ticket)` wait for **its own** durable result. Preserve
   an already acknowledged ticket if a later group fails. Keep `sync()`'s
   captured cutoff and empty no-op behavior.
@@ -267,7 +320,7 @@ AddressSanitizer and LeakSanitizer commands also passed.
 
 This closes Slice 6 for the synchronous v4 candidate path. Async candidate
 writes and close remain disabled until their separate lifecycle prerequisites
-are met. Slice 7's paired benchmark and adoption gate remains open.
+are met.
 
 ### 7. Paired benchmark and adoption decision
 
@@ -312,11 +365,31 @@ the same-session pre-PITR gap. Otherwise keep the leader path as default and
 publish the measured bottleneck. A second worker/ring is a later experiment
 only if the one-ring candidate demonstrably cannot sustain useful overlap.
 
+**Outcome (2026-09-26):** The candidate reached four groups in flight and
+showed writes completing during `fdatasync`, but did not pass the throughput,
+latency, and confidence gates. Keep the leader path as default. The paired
+results, controls, and measured bottleneck are recorded in the
+[Slice 7 benchmark report](rfc-024-parallel-wal-benchmark.md).
+
+In that September 26 study, the measured bottleneck was the pipeline's
+per-commit thread relay, not where
+the `fdatasync` is called: a lone writer, which cannot coalesce, runs at
+`0.27` of the leader, and every attempt to remove or relocate a handoff
+between the pipeline's threads was rejected by measurement. The candidate's
+win was on device-backed storage. The later native async integration changes
+the client wait path; the [October 5 matrix](rfc-024-native-async-vs-leader-20261005.md)
+shows one-put gains alongside batch64 regressions and failed controls. The
+[October 6 batch64 rerun](rfc-024-native-batch64-leader-rerun-20261006.md)
+also fails stability controls. The
+September measurements do not establish the latest implementation's bottleneck.
+
 ## Review and verification cadence
 
 Slices 1-3 stayed dormant or test-only until the worker and coordinator were
-integrated. The v4 candidate is now opt-in behind the internal selector; keep
-the leader path as default until recovery and benchmark gates pass. Each
+integrated. The completed v4 pipeline now defaults to parallel by maintainer
+decision despite the unqualified benchmark gate. Leader remains an explicit
+control. The slice instructions and outcomes above preserve the original
+rollout order and benchmark requirements. Each
 implementation PR should state its invariant, affected WAL format, failure
 behavior, and evidence from the matching slice. Run `cargo make check` for code
 changes, focused nextest and failpoint tests while iterating, then the

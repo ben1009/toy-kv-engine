@@ -11,6 +11,10 @@ implemented: if io_uring or O_DIRECT initialization fails for an MVCC WAL,
 creation or reopen returns an error. Legacy non-MVCC WALs continue using the
 buffered path.
 
+Ordinary v4 WALs now default to the dedicated parallel pipeline described in
+[RFC 024](024-dedicated-wal-pipeline.md). PITR v5/v6 retain the leader path; see
+the [default adoption note](../docs/rfc-024-parallel-wal-default-20261005.md).
+
 The remaining sections preserve the original proposal. For shipped behavior,
 see `kv-engine/src/wal.rs` and the WAL tests under `kv-engine/src/tests/`.
 

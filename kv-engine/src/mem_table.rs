@@ -87,9 +87,12 @@ pub struct WriteProfile {
     /// Number of fdatasync attempts and total groups covered by those syncs.
     pub wal_sync_count: AtomicU64,
     pub wal_sync_groups_total: AtomicU64,
-    /// Number of queued groups whose eventfd notification call completed.
-    /// Notifications may coalesce, so this is not a count of worker wakeups.
+    /// Number of queued groups for which a worker wake was requested.
+    /// Requests may be skipped while the worker is active or coalesced into
+    /// one eventfd write, so this is not a count of syscalls or worker wakeups.
     pub wal_worker_eventfd_notifications: AtomicU64,
+    /// Number of eventfd write syscalls used to signal queued worker commands.
+    pub wal_worker_eventfd_writes: AtomicU64,
     /// Time spent extending WAL preallocation, kept separate from write time.
     pub wal_preallocation_ns: AtomicU64,
     /// Time from the previous group releasing `submitting` to the next leader
@@ -209,6 +212,7 @@ impl WriteProfile {
         #[cfg(feature = "bench")]
         self.wal_sync_diagnostics_enabled.store(false, o);
         self.wal_worker_eventfd_notifications.store(0, o);
+        self.wal_worker_eventfd_writes.store(0, o);
         self.wal_preallocation_ns.store(0, o);
         self.wal_group_gap_ns.store(0, o);
         self.wal_leader_prepare_ns.store(0, o);
@@ -262,6 +266,7 @@ impl WriteProfile {
             wal_sync_count: self.wal_sync_count.load(o),
             wal_sync_groups_total: self.wal_sync_groups_total.load(o),
             wal_worker_eventfd_notifications: self.wal_worker_eventfd_notifications.load(o),
+            wal_worker_eventfd_writes: self.wal_worker_eventfd_writes.load(o),
             wal_preallocation_ns: self.wal_preallocation_ns.load(o),
             wal_group_gap_ns: self.wal_group_gap_ns.load(o),
             wal_leader_prepare_ns: self.wal_leader_prepare_ns.load(o),
@@ -410,6 +415,12 @@ impl WriteProfile {
     }
 
     #[cfg(feature = "bench")]
+    pub(crate) fn record_wal_worker_eventfd_write(&self) {
+        self.wal_worker_eventfd_writes
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[cfg(feature = "bench")]
     pub(crate) fn record_wal_preallocation_ns(&self, nanos: u64) {
         self.wal_preallocation_ns
             .fetch_add(nanos, std::sync::atomic::Ordering::Relaxed);
@@ -539,6 +550,7 @@ pub struct WriteProfileSnapshot {
     pub wal_sync_count: u64,
     pub wal_sync_groups_total: u64,
     pub wal_worker_eventfd_notifications: u64,
+    pub wal_worker_eventfd_writes: u64,
     pub wal_preallocation_ns: u64,
     pub wal_group_gap_ns: u64,
     pub wal_leader_prepare_ns: u64,
@@ -607,6 +619,9 @@ impl WriteProfileSnapshot {
             wal_worker_eventfd_notifications: self
                 .wal_worker_eventfd_notifications
                 .saturating_sub(before.wal_worker_eventfd_notifications),
+            wal_worker_eventfd_writes: self
+                .wal_worker_eventfd_writes
+                .saturating_sub(before.wal_worker_eventfd_writes),
             wal_preallocation_ns: self
                 .wal_preallocation_ns
                 .saturating_sub(before.wal_preallocation_ns),
@@ -836,7 +851,7 @@ impl WriteProfileSnapshot {
              submit_parts: ring_lock={:>7.2} ms  sqe_fill={:>7.2} ms  uring_enter={:>7.2} ms  cqe_reap={:>7.2} ms\n  \
              cqe_count:    {:>7}  (clean run: equal to commit buffers)\n  \
              pipeline_peak: groups={} outstanding_write_sqes={} (software depth; not device queue depth)\n  \
-             syncs:        count={} groups={} avg_groups={:.2} worker_eventfd_notifications={}\n  \
+             syncs:        count={} groups={} avg_groups={:.2} worker_eventfd_notifications={} writes={}\n  \
              preallocation:{:>8.2} ms\n  \
              group_gap:    {:>8.2} ms  (previous release -> next leader enters; includes idle)\n  \
              leader_prep:  {:>8.2} ms  (enter -> first SQE: drain, peer spin, accounting)\n  \
@@ -885,6 +900,7 @@ impl WriteProfileSnapshot {
                 self.wal_sync_groups_total as f64 / self.wal_sync_count as f64
             },
             self.wal_worker_eventfd_notifications,
+            self.wal_worker_eventfd_writes,
             self.wal_preallocation_ns as f64 / 1_000_000.0,
             self.wal_group_gap_ms(),
             self.wal_leader_prepare_ms(),
@@ -1066,9 +1082,9 @@ impl MemTable {
         Self::create(id, true)
     }
 
-    /// Create a new mem-table with WAL.
+    /// Create a new mem-table with the default parallel v4 WAL.
     pub fn create_with_wal(id: usize, vlog_enabled: bool, path: impl AsRef<Path>) -> Result<Self> {
-        Self::create_with_wal_and_mode(id, vlog_enabled, path, WalIoMode::Leader)
+        Self::create_with_wal_and_mode(id, vlog_enabled, path, WalIoMode::default())
     }
 
     pub(crate) fn create_with_wal_and_mode(
@@ -1109,7 +1125,7 @@ impl MemTable {
     ///
     /// Uses [`Wal::recover`] which replays point entries into the skiplist but
     /// silently discards range tombstones. For full recovery including range
-    /// tombstones, use [`recover_from_wal_with_range_tombstones`].
+    /// tombstones, use [`Self::recover_from_wal_with_range_tombstones`].
     pub fn recover_from_wal(
         id: usize,
         vlog_enabled: bool,
@@ -1133,7 +1149,7 @@ impl MemTable {
 
     /// Create a memtable from WAL with full range-tombstone recovery.
     ///
-    /// Unlike [`recover_from_wal`], this method uses
+    /// Unlike [`Self::recover_from_wal`], this method uses
     /// [`Wal::recover_with_range_tombstones`] to also populate the memtable's
     /// [`RangeTombstoneSet`] from WAL v3 range-tombstone entries.
     pub fn recover_from_wal_with_range_tombstones(
@@ -1145,7 +1161,7 @@ impl MemTable {
             id,
             vlog_enabled,
             path,
-            WalIoMode::Leader,
+            WalIoMode::default(),
         )
     }
 
@@ -1298,7 +1314,7 @@ impl MemTable {
 
     /// Exact lookup by encoded internal key with a pre-computed bloom hash.
     ///
-    /// Avoids the thread-local buffer overhead of [`get_raw_exact`] by
+    /// Avoids the thread-local buffer overhead of [`Self::get_raw_exact`] by
     /// accepting a pre-computed `hash_key(user_key)` from the caller. This
     /// eliminates the per-call `thread_local!` + `RefCell` + `decode_user_key`
     /// overhead that dominates the `get_raw_exact` profile.
@@ -1520,7 +1536,7 @@ impl MemTable {
 
     /// Put a key-value pair into the mem-table without syncing the WAL.
     ///
-    /// Caller must call [`commit_wal`] after releasing write locks.
+    /// Caller must call [`Self::commit_wal`] after releasing write locks.
     /// Write a tombstone (deletion marker) for the given key.
     ///
     /// When vlog_enabled, stores `[KvKind::Tombstone]` as a single-byte value.
@@ -1560,8 +1576,8 @@ impl MemTable {
     /// Returns the WAL ticket assigned to this batch, if WAL is enabled.
     ///
     /// The caller must subsequently call:
-    /// 1. [`commit_wal_ticket`] with the returned ticket to durably sync the WAL.
-    /// 2. [`publish_raw_batch`] to insert into the skiplist + bloom filter.
+    /// 1. [`Self::commit_wal_ticket`] with the returned ticket to durably sync the WAL.
+    /// 2. The engine's `publish_raw_batch` to insert into the skiplist + bloom filter.
     ///
     /// This split ensures data is not visible to readers until the WAL sync
     /// succeeds, preventing ghost entries on fsync failure.
@@ -1610,20 +1626,116 @@ impl MemTable {
         Ok(Some(ticket))
     }
 
+    pub(crate) fn uses_parallel_wal(&self) -> bool {
+        self.wal.as_ref().is_some_and(Wal::is_parallel)
+    }
+
+    pub(crate) async fn prepare_wal_buffer_async(
+        &self,
+        entries_size: usize,
+    ) -> Result<crate::wal::EncodedWalBuffer> {
+        let wal = self
+            .wal
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("memtable has no WAL"))?;
+        #[cfg(feature = "bench")]
+        let started = Instant::now();
+        let buffer = wal.prepare_point_buffer_async(entries_size).await?;
+        #[cfg(feature = "bench")]
+        self.write_profile
+            .load()
+            .record_wal_prepare_ns(started.elapsed().as_nanos() as u64);
+
+        Ok(buffer)
+    }
+
+    pub(crate) fn write_wal_prepared_batch_only(
+        &self,
+        data: &[(Bytes, Bytes)],
+        buffer: crate::wal::EncodedWalBuffer,
+    ) -> Result<Option<u64>> {
+        let wal = self
+            .wal
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("memtable has no WAL"))?;
+        let commit_ts = data
+            .first()
+            .and_then(|(key, _)| crate::key::extract_ts(key))
+            .unwrap_or(0);
+        debug_assert!(
+            data.iter()
+                .all(|(key, _)| crate::key::extract_ts(key).unwrap_or(0) == commit_ts)
+        );
+        #[cfg(feature = "bench")]
+        let started = Instant::now();
+        #[cfg(feature = "bench")]
+        let ticket = wal.put_owned_prepared_batch(
+            data,
+            commit_ts,
+            buffer,
+            Some(&self.write_profile.load()),
+        )?;
+        #[cfg(not(feature = "bench"))]
+        let ticket = wal.put_owned_prepared_batch(data, commit_ts, buffer, None)?;
+        self.last_ticket
+            .fetch_max(ticket + 1, std::sync::atomic::Ordering::Release);
+        #[cfg(feature = "bench")]
+        self.write_profile.load().wal_write_ns.fetch_add(
+            started.elapsed().as_nanos() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+
+        Ok(Some(ticket))
+    }
+
+    pub(crate) async fn commit_wal_ticket_async(&self, ticket: Option<u64>) -> Result<()> {
+        let Some(ticket) = ticket else {
+            return Ok(());
+        };
+        let wal = self
+            .wal
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("memtable has no WAL"))?;
+        let started = Instant::now();
+        let result = wal.wait_durable_async(ticket).await;
+        self.write_profile.load().wal_sync_ns.fetch_add(
+            started.elapsed().as_nanos() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+
+        result
+    }
+
     pub(crate) fn uses_wal_v5(&self) -> bool {
         self.wal.as_ref().is_some_and(|wal| wal.is_v5())
     }
 
+    /// Release the io_uring ring of a drained, immutable leader WAL.
+    ///
+    /// Call after writers have finished, when freezing the memtable or after
+    /// recovering an immutable WAL. The WAL data stays available for recovery;
+    /// only the per-WAL ring is released. See [`Wal::retire_ring`].
+    pub(crate) fn retire_wal_ring(&self) -> bool {
+        self.wal.as_ref().is_some_and(|wal| wal.retire_ring())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_ring(&self) -> Option<bool> {
+        self.wal.as_ref().map(|wal| wal.has_ring())
+    }
+
     /// Join the background runtime owned by a candidate parallel WAL.
     ///
-    /// The legacy WAL paths keep their existing close behavior; engine
-    /// shutdown only needs to explicitly tear down the dedicated runtime.
+    /// Call after writers have finished, when freezing the memtable or
+    /// shutting down the engine. WAL data remains available for recovery;
+    /// legacy WAL paths keep their existing close behavior.
     pub(crate) fn close_parallel_wal(&self) -> Result<()> {
         if let Some(wal) = &self.wal
             && wal.is_parallel()
         {
             wal.close()?;
         }
+
         Ok(())
     }
 
@@ -2363,7 +2475,7 @@ impl MemTable {
 
     /// Write a range tombstone into the memtable.
     ///
-    /// Convenience wrapper around [`put_range_tombstone_batch`] for a single entry.
+    /// Convenience wrapper around [`Self::put_range_tombstone_batch`] for a single entry.
     pub fn put_range_tombstone(
         &self,
         start: &[u8],
@@ -2409,7 +2521,7 @@ impl MemTable {
     }
 
     /// Write a batch of range tombstones into the memtable without syncing
-    /// the WAL. The caller must call [`commit_wal`] after releasing write
+    /// the WAL. The caller must call [`Self::commit_wal`] after releasing write
     /// locks so that concurrent writers can batch their fsyncs together.
     pub fn put_range_tombstone_batch_no_sync(
         &self,
@@ -2437,8 +2549,8 @@ impl MemTable {
     /// Write a batch of range tombstones to the WAL buffer only (no skiplist
     /// insert, no sync). Returns the WAL ticket assigned to this batch, if WAL
     /// is enabled. The caller must subsequently call:
-    /// 1. [`commit_wal_ticket`] with the returned ticket to durably sync the WAL.
-    /// 2. [`publish_range_tombstones`] to insert into the in-memory set.
+    /// 1. [`Self::commit_wal_ticket`] with the returned ticket to durably sync the WAL.
+    /// 2. The engine's `publish_range_tombstones` to insert into the in-memory set.
     ///
     /// This ensures tombstones are not visible to readers until the WAL sync
     /// succeeds, preventing ghost entries on fsync failure.
