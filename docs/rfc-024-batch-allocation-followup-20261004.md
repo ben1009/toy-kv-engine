@@ -1,5 +1,10 @@
 # RFC 024: batch allocation follow-up, 2026-10-04
 
+**Historical report:** Measurements and default/opt-in recommendations below
+describe the revision tested. Ordinary v4 WALs now default to parallel by
+maintainer decision; see the [current adoption note](rfc-024-parallel-wal-default-20261005.md).
+The original performance gate remains unqualified.
+
 No additional production change is retained. Four experiments targeted the
 remaining batch cost after commit `422d6616`. The most promising candidate
 pooled publication copies, but its separate confirmation failed the frozen

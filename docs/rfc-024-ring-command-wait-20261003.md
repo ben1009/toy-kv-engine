@@ -1,5 +1,10 @@
 # RFC 024: Ring command and completion waiting
 
+**Historical report:** Measurements and default/opt-in recommendations below
+describe the revision tested. Ordinary v4 WALs now default to parallel by
+maintainer decision; see the [current adoption note](rfc-024-parallel-wal-default-20261005.md).
+The original performance gate remains unqualified.
+
 **Decision:** Reject the cooperative-taskwork prototype. Waiting inside
 io_uring does not establish the targeted one-writer batch64 tail improvement.
 Restore the retained runtime; the full RFC performance gate remains unmet.

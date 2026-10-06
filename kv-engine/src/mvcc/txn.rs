@@ -95,7 +95,7 @@ impl Transaction {
     /// Get a value by key, asynchronously.
     ///
     /// Checks local writes first (CPU-only), then offloads the
-    /// engine read (may do SST pread) to the [`BlockingExecutor`].
+    /// engine read (may do SST pread) to the bounded blocking executor.
     ///
     /// Returns `impl Future + Send` — all state extracted from `&self`
     /// before the async block (Transaction is `!Sync`, so `async fn(&self)`
@@ -585,7 +585,7 @@ impl Transaction {
     /// Commit the transaction asynchronously.
     ///
     /// Runs the same OCC, WAL rotation and publication protocol as
-    /// [`commit`](Self::commit) on the bounded [`BlockingExecutor`].
+    /// [`commit`](Self::commit) on the bounded blocking executor.
     /// Once dispatched, the owned commit retains its snapshot and shutdown
     /// registration until it settles, even if the caller cancels the wait.
     pub fn commit_async(&self) -> impl std::future::Future<Output = Result<()>> + Send + use<> {

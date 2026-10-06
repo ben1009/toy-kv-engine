@@ -4,8 +4,18 @@ Ordinary v4 parallel WAL point writes now use cooperative waits through the
 public `put_async`, `delete_async`, and `write_batch_async` APIs. This replaces
 the restricted [native-wait prototype](rfc-024-native-async-waits-20261005.md)
 with engine lifecycle, memtable freeze, rotation, and cancellation support.
-Parallel WAL remains opt-in; leader WAL remains the default. The RFC performance
-adoption gate is still unqualified.
+Parallel WAL is now the default for ordinary v4 WALs; PITR and legacy formats
+retain their existing paths. See the [default adoption note](rfc-024-parallel-wal-default-20261005.md).
+The RFC performance adoption gate is still unqualified.
+
+The [October 5 direct leader comparison](rfc-024-native-async-vs-leader-20261005.md)
+measures reviewed revision `d7d124b8` at 1, 4, 8, and 16 writers for one put
+and 64 puts per commit. It records peak results, paired estimates, CPU cost,
+pipeline depth, and repeatability separately. The integration measurements
+below use earlier inputs and parallel-WAL controls; they remain historical.
+The [October 6 batch64 rerun](rfc-024-native-batch64-leader-rerun-20261006.md)
+measures the retained completion-drain and cutoff-refresh backend; it also
+leaves the full performance gate unqualified.
 
 ## Commit and lifetime rules
 
@@ -75,6 +85,11 @@ first: that caller receives its original error, while subsequent callers use a
 cached classification and formatted chain. An async shutdown owner instead
 retains the original error chain for its waiters.
 
+Point writes from a `KvEngine` moved out of its constructor `Arc`, or rewrapped
+in another `Arc`, use the owned blocking compatibility path. Their lifecycle
+admission and storage stay owned until completion; losing the original weak
+public owner does not make a valid handle unusable.
+
 ## Ext4 measurements
 
 Fresh databases on `/dev/nvme0n1p3`, ext4, 16 clients, 64 puts per batch,
@@ -94,8 +109,10 @@ separately labelled retry; original observations always remain primary.
 The retained reference is the unchanged `ca4cfcca` parallel-WAL executable.
 The integrated synchronous and native arms use the same measured binary and
 public engine API. Its archived inputs precede the shutdown, transaction, and
-checkpoint-publication review fixes described above; these measurements have not
-been rerun with those fixes. Reference comparisons include packing and lifecycle
+checkpoint-publication review fixes described above. The later
+[direct leader study](rfc-024-native-async-vs-leader-20261005.md) includes those
+fixes with a different control; it does not repeat this three-arm study.
+Reference comparisons include packing and lifecycle
 changes; they do not isolate async waits. Each paired estimate below is the median of three fixed
 block geometric-mean ratios.
 
@@ -139,9 +156,11 @@ that preparation fairness explains every latency difference. The first run
 retains one same-arm retry and 18 block-retry observations, including severe
 slow intervals; the fair run triggered no retries.
 
-These results support keeping the integration opt-in for further review. They
-do not qualify a stable production gain: there is no leader workload matrix,
-throughput confidence interval, or passing repeatability screen in this study.
+At measurement time, these results supported keeping the integration opt-in
+for further review. They
+do not qualify a stable production gain: this historical study has no leader
+workload matrix or passing repeatability screen. The later direct leader matrix
+also leaves the full RFC adoption gate unqualified.
 
 ## Validation
 
@@ -184,12 +203,12 @@ Scoped subagent verification found no further issue in the fix.
 
 ## Reproduction artifacts
 
-- [Fair-run protocol](../target/rfc024-native-async-integration-20261005/fair-comparison/protocol.json), [raw observations](../target/rfc024-native-async-integration-20261005/fair-comparison/records.json), [analysis](../target/rfc024-native-async-integration-20261005/fair-comparison/analysis.json), and [input integrity](../target/rfc024-native-async-integration-20261005/fair-comparison/final-integrity.json).
-- [First-run protocol](../target/rfc024-native-async-integration-20261005/comparison/protocol.json), [observations including retries](../target/rfc024-native-async-integration-20261005/comparison/records.json), and [analysis](../target/rfc024-native-async-integration-20261005/comparison/analysis.json).
-- [Public-API probe](../target/rfc024-native-async-integration-20261005/probe/src/main.rs), [runner](../target/rfc024-native-async-integration-20261005/fair-comparison/run.py), and [compiled input hashes](../target/rfc024-native-async-integration-20261005/fair-comparison/compiled-input-hashes.json).
-- [Full local check after review](../target/rfc024-native-async-integration-20261005/full-check-review.log), [default-feature tests](../target/rfc024-native-async-integration-20261005/default-tests-review.log), [native AddressSanitizer](../target/rfc024-native-async-integration-20261005/asan-native-review.log), [transaction AddressSanitizer](../target/rfc024-native-async-integration-20261005/asan-transaction-review.log), and [shutdown AddressSanitizer](../target/rfc024-native-async-integration-20261005/asan-close-review.log).
-- [Review validation and source hashes](../target/rfc024-native-async-integration-20261005/review-validation.json), [probe Clippy](../target/rfc024-native-async-integration-20261005/probe-clippy-review.log), and [probe tests](../target/rfc024-native-async-integration-20261005/probe-tests-review.log).
-- [Full local check after checkpoint-publication review](../target/rfc024-native-async-integration-20261005/round4-check.log).
+- Fair-run protocol: `target/rfc024-native-async-integration-20261005/fair-comparison/protocol.json`, raw observations: `target/rfc024-native-async-integration-20261005/fair-comparison/records.json`, analysis: `target/rfc024-native-async-integration-20261005/fair-comparison/analysis.json`, and input integrity: `target/rfc024-native-async-integration-20261005/fair-comparison/final-integrity.json`.
+- First-run protocol: `target/rfc024-native-async-integration-20261005/comparison/protocol.json`, observations including retries: `target/rfc024-native-async-integration-20261005/comparison/records.json`, and analysis: `target/rfc024-native-async-integration-20261005/comparison/analysis.json`.
+- Public-API probe: `target/rfc024-native-async-integration-20261005/probe/src/main.rs`, runner: `target/rfc024-native-async-integration-20261005/fair-comparison/run.py`, and compiled input hashes: `target/rfc024-native-async-integration-20261005/fair-comparison/compiled-input-hashes.json`.
+- Full local check after review: `target/rfc024-native-async-integration-20261005/full-check-review.log`, default-feature tests: `target/rfc024-native-async-integration-20261005/default-tests-review.log`, native AddressSanitizer: `target/rfc024-native-async-integration-20261005/asan-native-review.log`, transaction AddressSanitizer: `target/rfc024-native-async-integration-20261005/asan-transaction-review.log`, and shutdown AddressSanitizer: `target/rfc024-native-async-integration-20261005/asan-close-review.log`.
+- Review validation and source hashes: `target/rfc024-native-async-integration-20261005/review-validation.json`, probe Clippy: `target/rfc024-native-async-integration-20261005/probe-clippy-review.log`, and probe tests: `target/rfc024-native-async-integration-20261005/probe-tests-review.log`.
+- Full local check after checkpoint-publication review: `target/rfc024-native-async-integration-20261005/round4-check.log`.
 
 Artifacts are local and ignored by Git. Both executable versions and all
 observations are preserved. Source hashes remained unchanged during each run;

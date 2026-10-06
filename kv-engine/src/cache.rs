@@ -92,7 +92,7 @@ impl BlockCache {
     /// Concurrent misses on the same key are coalesced: only the first
     /// thread runs `f`; others wait and read from cache.
     ///
-    /// Delegates to [`try_get_with`] so the single-flight miss-coalescing
+    /// Delegates to [`Self::try_get_with`] so the single-flight miss-coalescing
     /// logic lives in one place.
     pub fn get_or_insert<F>(&self, sst_id: usize, block_idx: usize, f: F) -> Arc<Block>
     where
@@ -104,7 +104,7 @@ impl BlockCache {
         }
     }
 
-    /// Like [`get_or_insert`], but the closure returns `Result`.
+    /// Like [`Self::get_or_insert`], but the closure returns `Result`.
     /// On error the cache is left unchanged and the error is propagated.
     ///
     /// Concurrent misses on the same key are coalesced: only the first
@@ -187,7 +187,7 @@ impl BlockCache {
     /// Approximate number of cached entries.  O(1), lock-free.
     ///
     /// **Drift:** This counter is incremented on insert but only decremented on
-    /// [`invalidate_ssts`], not on TinyUFO eviction.  With cache backfill enabled
+    /// [`Self::invalidate_ssts`], not on TinyUFO eviction.  With cache backfill enabled
     /// (inserting many blocks per flush/compaction), the drift can grow faster
     /// because `force_put` evictions are invisible.  Treat the return value as an
     /// upper bound, not an exact count.
@@ -211,7 +211,7 @@ impl BlockCache {
     }
 
     /// Cache-through read with configurable admission policy.
-    /// Unlike [`try_get_with`], does not use single-flight coalescing.
+    /// Unlike [`Self::try_get_with`], does not use single-flight coalescing.
     pub fn try_get_with_admission<F, E>(
         &self,
         sst_id: usize,

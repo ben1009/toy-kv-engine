@@ -478,7 +478,7 @@ impl SsTableBuilder {
     /// Builds the SSTable and writes it to the given path. Use the `FileObject` structure to
     /// manipulate the disk objects.
     ///
-    /// Delegates to [`build_with_backfill`] and discards the collected blocks.
+    /// Delegates to [`Self::build_with_backfill`] and discards the collected blocks.
     pub fn build(
         self,
         id: usize,

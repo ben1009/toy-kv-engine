@@ -1,5 +1,10 @@
 # RFC 024: Release write ordering before producer packing
 
+**Historical report:** Measurements and default/opt-in recommendations below
+describe the revision tested. Ordinary v4 WALs now default to parallel by
+maintainer decision; see the [current adoption note](rfc-024-parallel-wal-default-20261005.md).
+The original performance gate remains unqualified.
+
 **Decision:** Reject this prototype and restore the runtime at `2cd59bbb`.
 Across 108 scored runs, the 64-writer ext4 case loses throughput in every
 block, and tmpfs rotation loses 9.1–14.4%. Parallel WAL remains opt-in; the

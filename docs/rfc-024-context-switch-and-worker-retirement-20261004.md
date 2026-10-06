@@ -1,5 +1,10 @@
 # RFC 024: context switches and worker retirement, 2026-10-04
 
+**Historical report:** Measurements and default/opt-in recommendations below
+describe the revision tested. Ordinary v4 WALs now default to parallel by
+maintainer decision; see the [current adoption note](rfc-024-parallel-wal-default-20261005.md).
+The original performance gate remains unqualified.
+
 The measurements do not establish context-switch overhead as the main bottleneck.
 They show substantial resource waiting, including futex waits and ext4 journal
 commit waits. A separate worker-bookkeeping optimization did not pass its frozen

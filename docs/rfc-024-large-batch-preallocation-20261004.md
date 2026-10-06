@@ -1,5 +1,10 @@
 # RFC 024: extent preparation for large batches
 
+**Historical report:** Measurements and default/opt-in recommendations below
+describe the revision tested. Ordinary v4 WALs now default to parallel by
+maintainer decision; see the [current adoption note](rfc-024-parallel-wal-default-20261005.md).
+The original performance gate remains unqualified.
+
 Retain the large-batch extent-preparation change. The frozen confirmation
 screen passed: ext4 batch64 at 16 writers improved paired median throughput
 by **18.3%**, reduced p99 by **18.5%**, and reduced CPU per put by **16.6%**.

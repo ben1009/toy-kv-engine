@@ -1,5 +1,10 @@
 # RFC 024: ext4 batch tail — attribution and the gate design
 
+**Historical report:** Measurements and default/opt-in recommendations below
+describe the revision tested. Ordinary v4 WALs now default to parallel by
+maintainer decision; see the [current adoption note](rfc-024-parallel-wal-default-20261005.md).
+The original performance gate remains unqualified.
+
 **Status:** attribution complete; the gate was built, measured, and rejected — see
 [the gate record](rfc-024-bg-io-gate-20261002.md). The attribution below stands:
 the remaining levers are flush-event count (SST size) and nothing else tried.

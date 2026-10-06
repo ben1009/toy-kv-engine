@@ -1,5 +1,10 @@
 # RFC 024: batch serialization follow-up, 2026-10-04
 
+**Historical report:** Measurements and default/opt-in recommendations below
+describe the revision tested. Ordinary v4 WALs now default to parallel by
+maintainer decision; see the [current adoption note](rfc-024-parallel-wal-default-20261005.md).
+The original performance gate remains unqualified.
+
 No additional production change is retained. Three isolated experiments
 targeted batch preparation, ordered packing, and skip-list publication. None
 produced a qualified throughput gain. The previously validated

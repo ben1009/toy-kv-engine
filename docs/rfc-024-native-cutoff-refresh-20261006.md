@@ -1,5 +1,10 @@
 # RFC 024: native WAL coalescing cutoff refresh, 2026-10-06
 
+**Historical report:** Measurements and default/opt-in recommendations below
+describe the revision tested. Ordinary v4 WALs now default to parallel by
+maintainer decision; see the [current adoption note](rfc-024-parallel-wal-default-20261005.md).
+The original performance gate remains unqualified.
+
 Retain the coalescing cutoff refresh on top of the
 [bounded completion drain](rfc-024-native-completion-drain-20261006.md).
 The maintainer explicitly selected provisional retention after the frozen

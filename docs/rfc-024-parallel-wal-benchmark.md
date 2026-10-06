@@ -1,6 +1,92 @@
 # RFC 024: Parallel WAL benchmark outcomes
 
-**Decision:** Keep the client-leader WAL as the default. The latest
+**Current status (2026-10-06):** Ordinary v4 WALs use parallel I/O by
+maintainer decision; PITR and legacy formats retain their existing paths.
+The [default adoption note](rfc-024-parallel-wal-default-20261005.md) records
+the scope and accepted limits. The retained backend has 32 in-flight group
+slots, 256 ring entries, bounded completion drain, and optional cutoff refresh
+within the unchanged 400-microsecond deadline. The full RFC performance gate
+remains **UNQUALIFIED**.
+
+## Latest direct comparisons
+
+The [October 5 matrix](rfc-024-native-async-vs-leader-20261005.md) measures
+revision `d7d124b8` on ext4 at 1, 4, 8, and 16 writers, for one put and batch64.
+One-put peaks improve by 36.3%–129.8%, with lower p99 in the selected runs;
+paired CPU per put increases. Batch64 peak changes range from -8.8% to +8.9%.
+Its single-writer throughput and eight-writer p99 guards fail.
+
+The [October 6 batch64 rerun](rfc-024-native-batch64-leader-rerun-20261006.md)
+measures the retained backend at eight and sixteen writers:
+
+| Writers | Leader median puts/s | Native Parallel median puts/s | Paired throughput | Paired p99 | Passing repeat blocks |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 8 | 382,095 | 325,524 | -32.4% | +138.6% | 1/5 |
+| 16 | 535,594 | 536,402 | +6.9% | -0.7% | 1/5 |
+
+Independently selected primary-run peaks change by -7.5% and +10.4%.
+The eight-writer Leader null fails; both null pairs run after all scored
+blocks, a recorded deviation from the frozen protocol. Original stalls
+and failed controls remain in the evidence. The measurement input contains
+then-pending default-selector edits, and both modes are selected explicitly.
+These comparisons include the public API and execution model as well as WAL
+mode. Neither peaks nor the paired point estimates establish a qualified
+Leader-relative gain. The later review correctness fixes have not been
+performance-measured.
+
+## Retained and rejected follow-ups
+
+The [native batch ownership follow-up](rfc-024-native-batch-ownership-followup-20261005.md)
+tests three ways to remove the post-durability publication copy. None is
+retained. The final sixteen-writer candidate shows +4.1% paired throughput,
+-5.2% p99, and +2.0% CPU per put, below its frozen retention threshold and
+with only one of three repeatability blocks passing.
+
+The [bounded native batch pooling follow-up](rfc-024-native-batch-pooling-20261006.md)
+then reduces allocation calls by 58.0% and 77.1% in two experiments.
+Sixteen-writer paired throughput still regresses by 3.9% and 3.0%, with
+higher preparation and insertion costs. Both fail their frozen retention
+rule and are reverted; the existing default and measured implementation
+remain intact.
+
+The [pooling root-cause investigation](rfc-024-native-batch-pooling-cause-20261006.md)
+then isolates contention in the skip-list metadata. Separating its fields
+improves isolated eight-thread insertion by 88.2%, while the native insertion
+phase falls 28.6%. Native throughput remains unqualified; all dependency
+variants stay private. First-touch samples also explain part of the larger
+preparation timer.
+
+The [metadata-only native screen](rfc-024-native-metadata-padding-20261006.md)
+then tests padding without pooling or an external profiler. Sixteen-writer
+insertion falls 11.7%, but paired throughput changes by -1.5%, with all three
+target repeat controls passing. Eight-writer stability controls fail. The
+dependency patch is rejected; production and the full gate status are unchanged.
+
+The [native completion-drain follow-up](rfc-024-native-completion-drain-20261006.md)
+then traces the commit critical path and processes queued completions before
+sync target capture. The maintainer retains this bounded drain provisionally:
+sixteen-writer paired throughput changes by +2.1% and p99 by -2.4%, with weak
+repeat controls. Its original retention screen remains failed. A separate
+moving-cutoff rerun reports +3.1% at sixteen writers and remains private.
+Neither experiment qualifies the full gate or replaces the leader comparison.
+
+The [native durability-wakeup investigation](rfc-024-native-durable-wake-20261006.md)
+then eliminates premature resumptions in a private diagnostic, but ticket-indexed
+notifications fail their throughput screen. Notifying after mutex release
+initially reports +2.4% at sixteen writers; independent confirmation reports
+-0.4%, with all three target repeat controls passing. Both candidates remain
+private, and the existing leader comparison and full gate status retain their
+recorded results.
+
+The [native cutoff-refresh follow-up](rfc-024-native-cutoff-refresh-20261006.md)
+then refreshes the optional batching cutoff when the written frontier catches it,
+without extending the coalescing deadline. The maintainer retains it provisionally:
+confirmation reports +4.2% sixteen-writer batch64 throughput with three passing
+repeat blocks, but a failed null control. Independent one-put guards report
++13.4% throughput; single-writer batch64 stays near parity. The full gate remains
+unqualified, and these parallel-to-parallel results do not replace the leader data.
+
+The earlier
 [same-session qualification matrix](rfc-024-wal-qualification-20261001.md)
 shows a 171.0% paired throughput gain on the original ext4 workload, with
 48.9% lower p99 and three passing repeat-control blocks. Tmpfs single-writer
@@ -8,14 +94,8 @@ and ext4 batch-tail regressions still fail the full RFC gate. Historical
 comparisons remain affected by stalls, and rotation diagnostics found large
 numbers of retained WAL runtimes. [Frozen runtime retirement](rfc-024-frozen-wal-retirement.md)
 now bounds worker and ring lifetime; its incremental measurements do not
-establish a throughput gain. Parallel WAL remains opt-in.
-
-The [October 6 native batch64 comparison with Leader](rfc-024-native-batch64-leader-rerun-20261006.md)
-records -32.4% and +6.9% paired throughput at eight and sixteen writers, with
-only one of five repeat-control blocks passing in each case. Independently
-selected peak throughputs differ by -7.5% and +10.4%; those maxima do not
-establish a repeatable gain. This comparison includes the public API and client
-execution model as well as the WAL mode, and does not qualify the full RFC gate.
+establish a throughput gain. The sections below preserve the historical
+experiments and their original opt-in recommendations.
 
 [The October 3 low-concurrency rerun](rfc-024-parallel-comparison-20261003.md)
 compares the latest retained parallel executable with the earlier `067d4b09`
@@ -130,7 +210,7 @@ write-perf --suite legacy --preset default --wal --bench wal_concurrent \
   --wal-io-mode parallel --path <disposable path on the selected filesystem>
 ```
 
-## Current ext4 bottleneck: partly filled sync barriers
+## Historical ext4 bottleneck: partly filled sync barriers
 
 ### Current-binary ext4 adoption-gate check (2026-09-27)
 

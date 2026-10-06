@@ -1,5 +1,10 @@
 # RFC 024: Cooperative publication wait
 
+**Historical report:** Measurements and default/opt-in recommendations below
+describe the revision tested. Ordinary v4 WALs now default to parallel by
+maintainer decision; see the [current adoption note](rfc-024-parallel-wal-default-20261005.md).
+The original performance gate remains unqualified.
+
 **Decision:** Reject the prototype and restore `67dd7554`'s runtime. A
 cooperative yield gives only a small 32-writer improvement, below the frozen
 retention threshold, and fails the shared-MVCC p99 guard. Parallel WAL

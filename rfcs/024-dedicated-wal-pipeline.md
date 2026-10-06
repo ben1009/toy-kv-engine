@@ -2,9 +2,20 @@
 
 | Field | Value |
 | --- | --- |
-| Status | Proposal (benchmark gated) |
+| Status | Implemented; default for ordinary v4 WALs by maintainer decision |
 | Date | 2026-09-24 |
 | Author | kv-engine Contributors |
+
+## Current adoption status
+
+Ordinary v4 WALs now use the parallel pipeline by default, including native
+async waits for non-serializable point writes. PITR v5/v6 and legacy formats
+retain their existing paths; leader is still an explicit v4 control. The
+[default adoption note](../docs/rfc-024-parallel-wal-default-20261005.md) records
+the maintainer decision and its scope. The original performance gate remains
+unqualified; the proposal and benchmark criteria below are retained as the
+historical design, not evidence that the gate passed. The current limits are
+32 in-flight groups and 256 ring entries.
 
 ## Summary
 
@@ -75,7 +86,7 @@ The experiment must therefore measure `wal_concurrent` end to end, including
 commit-group formation and publication wait, before claiming to address the
 regression.
 
-## Current design and evidence
+## Baseline design and evidence at proposal time
 
 [`Wal::put_batch`](../kv-engine/src/wal.rs) and the PITR batch encoder prepare
 4096-byte-aligned buffers, then assign monotonically increasing tickets under
@@ -541,10 +552,20 @@ report the measured bottleneck rather than claiming the regression is fixed.
 
 ## Related documents
 
+- [Default adoption](../docs/rfc-024-parallel-wal-default-20261005.md):
+  current v4 default, explicit leader control, format compatibility, and
+  accepted performance limits.
+
 - [Implementation plan](../docs/rfc-024-parallel-wal-implementation-plan.md):
   reviewable implementation slices and validation order.
 - [Parallel WAL benchmark outcomes](../docs/rfc-024-parallel-wal-benchmark.md):
   historical measurements and retained or rejected optimizations.
+- [October 5 native async versus leader matrix](../docs/rfc-024-native-async-vs-leader-20261005.md):
+  measured implementation's one-put and batch64 results, peak and paired
+  estimates, CPU cost, actual pipeline depth, and repeatability limits.
+- [Latest batch64 versus leader rerun](../docs/rfc-024-native-batch64-leader-rerun-20261006.md):
+  retained backend's eight- and sixteen-writer observations, source provenance,
+  and failed stability controls.
 - [Qualification matrix](../docs/rfc-024-wal-qualification-20261001.md):
   same-session adoption checks and remaining gate failures.
 - [RFC 012](012-parallel-wal.md): original parallel-WAL proposal and historical sketches.

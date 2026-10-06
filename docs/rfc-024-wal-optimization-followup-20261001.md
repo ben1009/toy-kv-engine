@@ -1,5 +1,10 @@
 # RFC 024: WAL optimization follow-up, 2026-10-01
 
+**Historical report:** Measurements and default/opt-in recommendations below
+describe the revision tested. Ordinary v4 WALs now default to parallel by
+maintainer decision; see the [current adoption note](rfc-024-parallel-wal-default-20261005.md).
+The original performance gate remains unqualified.
+
 **Decision:** Reject both the byte-limited sync-coalescing prototype and the
 worker integer-map prototype. Neither establishes an improvement across its
 measured workloads. Restore the `d7171c80` runtime and worker sources. Parallel

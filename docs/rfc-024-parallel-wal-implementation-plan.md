@@ -3,12 +3,30 @@
 **RFC:** [RFC 024: Dedicated WAL I/O Pipeline](../rfcs/024-dedicated-wal-pipeline.md)
 
 **Status:** Slices 1–7 complete for the synchronous v4 WAL path, with a native
-async follow-up for non-serializable point writes. The parallel candidate
-remains opt-in because the performance adoption gate is still unqualified.
+async follow-up for non-serializable point writes. Ordinary v4 WALs now default
+to parallel by maintainer decision; the performance adoption gate is still
+unqualified. See the [default adoption note](rfc-024-parallel-wal-default-20261005.md).
+The [October 5 native async versus leader matrix](rfc-024-native-async-vs-leader-20261005.md)
+records one-put and batch64 observations at 1, 4, 8, and 16 writers. The
+[latest batch64 rerun](rfc-024-native-batch64-leader-rerun-20261006.md) measures
+the retained backend at eight and sixteen writers. Both keep peak results,
+paired estimates, and failed controls separate.
 
-**Last updated:** 2026-10-05
+**Last updated:** 2026-10-06
 
-## Purpose and boundary
+The retained pipeline uses 32 group slots and 256 ring entries. After a sync
+takes at least 100 microseconds, it may coalesce for up to 400 microseconds,
+refreshing the optional cutoff without resetting that deadline. It then
+drains a bounded snapshot of queued completion results and captures the
+actual sync target once. Ext-family extent initialization runs ahead of
+the I/O worker. An unused speculative suffix failure does not invalidate
+healthy close; requiring that suffix still poisons the affected tickets.
+
+## Original rollout purpose and boundary
+
+The rollout instructions and slice outcomes below preserve the original
+benchmark-gated plan. The current default and 32-group limit are documented
+in the adoption note above.
 
 Implement the RFC as a sequence of reviewable changes. The first candidate is
 an internal, opt-in path for ordinary v4 MVCC WALs: one dedicated io_uring
@@ -21,9 +39,9 @@ The write result still means **WAL durable**, followed by memtable insertion
 and ordered MVCC publication. Do not make the WAL worker publish commit
 timestamps or weaken the sequencer's `poisoned_at` rule.
 
-## Current code seams
+## Original code seams and planned changes
 
-| Seam | Current behavior | Planned change |
+| Seam | Baseline behavior at proposal time | Planned change |
 | --- | --- | --- |
 | [`Wal::put_batch`](../kv-engine/src/wal.rs) and range-batch encoding | Encode into `DirectBuf`, then assign a ticket and append to `pending`. | The opt-in path shares the v4 encoder, reserves buffer capacity before ticket assignment, and atomically assigns ticket/file offset and enqueues. |
 | [`Wal::submit_and_commit`](../kv-engine/src/wal.rs) | A client wins `submitting`, drains one group, submits and waits for its CQEs, calls `fdatasync`, then wakes followers. | The opt-in path waits for its ticket on the dedicated worker's durable frontier; the old branch remains the control and PITR path. |
@@ -32,7 +50,7 @@ timestamps or weaken the sequencer's `poisoned_at` rule.
 | Memtable WAL creation/recovery in [`mem_table.rs`](../kv-engine/src/mem_table.rs) and rotation in [`lsm_storage.rs`](../kv-engine/src/lsm_storage.rs) | Create or reopen a WAL, freeze a full memtable, and install a successor. | Carry the per-WAL selector through create/reopen; retry the explicit `WAL full` result after releasing the active-memtable guard, forcing and coalescing v4 rotations. |
 | [`write-perf`](../kv-engine/src/bin/write-perf.rs) | Measures `wal_concurrent` and existing WAL profile fields. | Select either path in the same binary and report actual group/SQE overlap and sync behavior. |
 
-The current `pending` queue, `next_ticket`, `alloc_offset`, ring lock,
+The baseline `pending` queue, `next_ticket`, `alloc_offset`, ring lock,
 `CompletionState`, and `submitting` flag are coupled to the leader path. Keep
 that path intact while adding a private v4 pipeline module (for example,
 `wal/parallel/`) with a separately testable state machine. A per-WAL selector
@@ -60,7 +78,7 @@ memtable leases make freeze, checkpoint,
 and GC CAS drain pending publication. A busy sequencer releases prepared memory
 and retries before timestamp assignment, avoiding a budget/lock deadlock with
 synchronous writers. Range writes, OCC transaction commits, and actual PITR
-v5/v6 WALs retain their bounded blocking path. The default remains leader WAL;
+v5/v6 WALs retain their bounded blocking path. Ordinary v4 WALs default to parallel;
 see the [integration report](rfc-024-native-async-integration-20261005.md).
 
 ## Implementation slices
@@ -353,18 +371,25 @@ latency, and confidence gates. Keep the leader path as default. The paired
 results, controls, and measured bottleneck are recorded in the
 [Slice 7 benchmark report](rfc-024-parallel-wal-benchmark.md).
 
-The measured bottleneck is the pipeline's per-commit thread relay, not where
+In that September 26 study, the measured bottleneck was the pipeline's
+per-commit thread relay, not where
 the `fdatasync` is called: a lone writer, which cannot coalesce, runs at
 `0.27` of the leader, and every attempt to remove or relocate a handoff
 between the pipeline's threads was rejected by measurement. The candidate's
-win is on device-backed storage. Further work on the `wal_concurrent`
-regression should target the leader path's serialized submit.
+win was on device-backed storage. The later native async integration changes
+the client wait path; the [October 5 matrix](rfc-024-native-async-vs-leader-20261005.md)
+shows one-put gains alongside batch64 regressions and failed controls. The
+[October 6 batch64 rerun](rfc-024-native-batch64-leader-rerun-20261006.md)
+also fails stability controls. The
+September measurements do not establish the latest implementation's bottleneck.
 
 ## Review and verification cadence
 
 Slices 1-3 stayed dormant or test-only until the worker and coordinator were
-integrated. The v4 candidate remains opt-in behind the internal selector;
-keep the leader path as default because the benchmark gate did not pass. Each
+integrated. The completed v4 pipeline now defaults to parallel by maintainer
+decision despite the unqualified benchmark gate. Leader remains an explicit
+control. The slice instructions and outcomes above preserve the original
+rollout order and benchmark requirements. Each
 implementation PR should state its invariant, affected WAL format, failure
 behavior, and evidence from the matching slice. Run `cargo make check` for code
 changes, focused nextest and failpoint tests while iterating, then the

@@ -1,5 +1,10 @@
 # RFC 024: retire frozen parallel WAL runtimes
 
+**Historical report:** Measurements and default/opt-in recommendations below
+describe the revision tested. Ordinary v4 WALs now default to parallel by
+maintainer decision; see the [current adoption note](rfc-024-parallel-wal-default-20261005.md).
+The original performance gate remains unqualified.
+
 The parallel WAL now closes its dedicated runtime when its memtable freezes,
 and after recovery classifies a memtable as immutable. This fixes the worker
 and ring buildup found in the [qualification run](rfc-024-wal-qualification-20261001.md).

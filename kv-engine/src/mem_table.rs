@@ -1082,9 +1082,9 @@ impl MemTable {
         Self::create(id, true)
     }
 
-    /// Create a new mem-table with WAL.
+    /// Create a new mem-table with the default parallel v4 WAL.
     pub fn create_with_wal(id: usize, vlog_enabled: bool, path: impl AsRef<Path>) -> Result<Self> {
-        Self::create_with_wal_and_mode(id, vlog_enabled, path, WalIoMode::Leader)
+        Self::create_with_wal_and_mode(id, vlog_enabled, path, WalIoMode::default())
     }
 
     pub(crate) fn create_with_wal_and_mode(
@@ -1125,7 +1125,7 @@ impl MemTable {
     ///
     /// Uses [`Wal::recover`] which replays point entries into the skiplist but
     /// silently discards range tombstones. For full recovery including range
-    /// tombstones, use [`recover_from_wal_with_range_tombstones`].
+    /// tombstones, use [`Self::recover_from_wal_with_range_tombstones`].
     pub fn recover_from_wal(
         id: usize,
         vlog_enabled: bool,
@@ -1149,7 +1149,7 @@ impl MemTable {
 
     /// Create a memtable from WAL with full range-tombstone recovery.
     ///
-    /// Unlike [`recover_from_wal`], this method uses
+    /// Unlike [`Self::recover_from_wal`], this method uses
     /// [`Wal::recover_with_range_tombstones`] to also populate the memtable's
     /// [`RangeTombstoneSet`] from WAL v3 range-tombstone entries.
     pub fn recover_from_wal_with_range_tombstones(
@@ -1161,7 +1161,7 @@ impl MemTable {
             id,
             vlog_enabled,
             path,
-            WalIoMode::Leader,
+            WalIoMode::default(),
         )
     }
 
@@ -1314,7 +1314,7 @@ impl MemTable {
 
     /// Exact lookup by encoded internal key with a pre-computed bloom hash.
     ///
-    /// Avoids the thread-local buffer overhead of [`get_raw_exact`] by
+    /// Avoids the thread-local buffer overhead of [`Self::get_raw_exact`] by
     /// accepting a pre-computed `hash_key(user_key)` from the caller. This
     /// eliminates the per-call `thread_local!` + `RefCell` + `decode_user_key`
     /// overhead that dominates the `get_raw_exact` profile.
@@ -1536,7 +1536,7 @@ impl MemTable {
 
     /// Put a key-value pair into the mem-table without syncing the WAL.
     ///
-    /// Caller must call [`commit_wal`] after releasing write locks.
+    /// Caller must call [`Self::commit_wal`] after releasing write locks.
     /// Write a tombstone (deletion marker) for the given key.
     ///
     /// When vlog_enabled, stores `[KvKind::Tombstone]` as a single-byte value.
@@ -1576,8 +1576,8 @@ impl MemTable {
     /// Returns the WAL ticket assigned to this batch, if WAL is enabled.
     ///
     /// The caller must subsequently call:
-    /// 1. [`commit_wal_ticket`] with the returned ticket to durably sync the WAL.
-    /// 2. [`publish_raw_batch`] to insert into the skiplist + bloom filter.
+    /// 1. [`Self::commit_wal_ticket`] with the returned ticket to durably sync the WAL.
+    /// 2. The engine's `publish_raw_batch` to insert into the skiplist + bloom filter.
     ///
     /// This split ensures data is not visible to readers until the WAL sync
     /// succeeds, preventing ghost entries on fsync failure.
@@ -2475,7 +2475,7 @@ impl MemTable {
 
     /// Write a range tombstone into the memtable.
     ///
-    /// Convenience wrapper around [`put_range_tombstone_batch`] for a single entry.
+    /// Convenience wrapper around [`Self::put_range_tombstone_batch`] for a single entry.
     pub fn put_range_tombstone(
         &self,
         start: &[u8],
@@ -2521,7 +2521,7 @@ impl MemTable {
     }
 
     /// Write a batch of range tombstones into the memtable without syncing
-    /// the WAL. The caller must call [`commit_wal`] after releasing write
+    /// the WAL. The caller must call [`Self::commit_wal`] after releasing write
     /// locks so that concurrent writers can batch their fsyncs together.
     pub fn put_range_tombstone_batch_no_sync(
         &self,
@@ -2549,8 +2549,8 @@ impl MemTable {
     /// Write a batch of range tombstones to the WAL buffer only (no skiplist
     /// insert, no sync). Returns the WAL ticket assigned to this batch, if WAL
     /// is enabled. The caller must subsequently call:
-    /// 1. [`commit_wal_ticket`] with the returned ticket to durably sync the WAL.
-    /// 2. [`publish_range_tombstones`] to insert into the in-memory set.
+    /// 1. [`Self::commit_wal_ticket`] with the returned ticket to durably sync the WAL.
+    /// 2. The engine's `publish_range_tombstones` to insert into the in-memory set.
     ///
     /// This ensures tombstones are not visible to readers until the WAL sync
     /// succeeds, preventing ghost entries on fsync failure.

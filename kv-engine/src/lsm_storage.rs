@@ -2222,14 +2222,18 @@ impl KvEngine {
 
     /// Start the storage engine by either loading an existing directory or creating a new one if
     /// the directory does not exist.
+    ///
+    /// When WAL is enabled, ordinary v4 WALs use the parallel pipeline by default.
+    /// PITR and older WAL formats retain their compatible I/O paths.
     pub fn open(path: impl AsRef<Path>, options: LsmStorageOptions) -> Result<Arc<Self>> {
-        Self::open_with_wal_io_mode(path, options, crate::wal::WalIoMode::Leader)
+        Self::open_with_wal_io_mode(path, options, crate::wal::WalIoMode::default())
     }
 
     /// Open an engine with a selected WAL I/O path.
     ///
     /// This hidden selector is used by `write-perf` to compare paths in one
-    /// binary. `Parallel` opts ordinary v4 WALs into the dedicated pipeline;
+    /// binary. Ordinary v4 WALs use `Parallel` by default; `Leader` selects
+    /// the client-led control path. The dedicated pipeline applies only to v4;
     /// legacy and PITR WALs retain their existing path. Non-serializable async
     /// point writes await v4 durability and MVCC publication natively. Other
     /// write shapes keep their engine-owned blocking boundary.
@@ -2249,6 +2253,7 @@ impl KvEngine {
     /// gone — so refusing to open preserves nothing. Each dropped id is logged
     /// and returned. Repair is refused when PITR owns the segments, where a
     /// missing WAL means lost archive coverage and must stay fail-closed.
+    /// Ordinary v4 WALs use the same parallel default as [`Self::open`].
     pub fn open_repairing(
         path: impl AsRef<Path>,
         options: LsmStorageOptions,
@@ -2261,7 +2266,7 @@ impl KvEngine {
             options.enable_wal,
             "repairing requires enable_wal: a database opened without WAL does not recover memtables"
         );
-        Self::open_inner(path, options, true, crate::wal::WalIoMode::Leader)
+        Self::open_inner(path, options, true, crate::wal::WalIoMode::default())
     }
 
     fn open_inner(
@@ -4599,7 +4604,7 @@ impl KvEngine {
     /// this drains the entire queue.
     ///
     /// # Warning
-    /// Inherits the same race conditions as [`force_flush`] — only use in
+    /// Inherits the same race conditions as [`Self::force_flush`] — only use in
     /// tests or when no concurrent writes are happening.
     pub fn drain_flush(&self) -> Result<()> {
         self.force_flush()?;
@@ -5075,6 +5080,7 @@ impl KvEngine {
 
     /// Async open. Recovery work runs on the blocking thread pool.
     /// SST files are opened concurrently to reduce cold-start latency.
+    /// WAL selection follows [`Self::open`], including the ordinary-v4 parallel default.
     pub async fn open_async(
         path: impl AsRef<Path>,
         options: LsmStorageOptions,
@@ -5085,7 +5091,12 @@ impl KvEngine {
         let plan = {
             let p = path_buf.clone();
             tokio::task::spawn_blocking(move || {
-                LsmStorageInner::recover_phase1(&p, options, false, crate::wal::WalIoMode::Leader)
+                LsmStorageInner::recover_phase1(
+                    &p,
+                    options,
+                    false,
+                    crate::wal::WalIoMode::default(),
+                )
             })
             .await
             .expect("recovery phase 1 panicked")?
@@ -7521,7 +7532,7 @@ impl LsmStorageInner {
     /// the directory does not exist.
     #[cfg(test)]
     pub(crate) fn open(path: impl AsRef<Path>, options: LsmStorageOptions) -> Result<Self> {
-        Self::open_with_wal_io_mode(path, options, crate::wal::WalIoMode::Leader)
+        Self::open_with_wal_io_mode(path, options, crate::wal::WalIoMode::default())
     }
 
     pub(crate) fn open_with_wal_io_mode(

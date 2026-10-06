@@ -1,5 +1,10 @@
 # RFC 024: native durability wakeups, 2026-10-06
 
+**Historical report:** Measurements and default/opt-in recommendations below
+describe the revision tested. Ordinary v4 WALs now default to parallel by
+maintainer decision; see the [current adoption note](rfc-024-parallel-wal-default-20261005.md).
+The original performance gate remains unqualified.
+
 Neither notification experiment is retained. Ticket-indexed Tokio notifications
 remove premature durability resumptions in the diagnostic, but the uninstrumented
 sixteen-writer screen reports **-4.6% paired throughput**, with failed repeat

@@ -22,8 +22,8 @@ use crate::{key::KeySlice, range_tombstone::RangeTombstone};
 #[cfg(test)]
 mod parallel;
 
-// Parallel WAL components are selected only for ordinary v4 WALs. The leader
-// path remains the default, while legacy and PITR WALs keep their existing I/O.
+// Parallel WAL is the default for ordinary v4 WALs. Legacy and PITR WALs
+// keep their existing I/O paths.
 #[allow(dead_code)]
 #[path = "wal/parallel/worker.rs"]
 mod parallel_worker;
@@ -102,15 +102,15 @@ const GROUP_COMMIT_MIN_SOLO_BYTES: usize = 512 * 1024;
 /// Runtime WAL I/O path selector.
 ///
 /// This is exposed only so the benchmark binary can select the path on an
-/// individual engine. The parallel path currently applies to ordinary v4 WALs;
-/// legacy and PITR WALs continue to use the leader path.
+/// individual engine. Parallel is the default for ordinary v4 WALs. Older
+/// MVCC and PITR WALs use leader I/O; legacy unframed WALs use buffered I/O.
 #[doc(hidden)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum WalIoMode {
     /// Existing client-leader submission and sync path.
-    #[default]
     Leader,
-    /// Dedicated packer, io_uring worker, and durability coordinator.
+    /// Default v4 path: dedicated packer, io_uring worker, and durability coordinator.
+    #[default]
     Parallel,
 }
 
@@ -462,10 +462,10 @@ pub struct Wal {
     mvcc_format: bool,
     /// Explicit on-disk WAL format version. Zero denotes the legacy unframed format.
     format_version: u16,
-    /// Effective I/O path. Only ordinary v4 WALs can retain a non-default
-    /// requested mode; legacy and PITR WAL constructors use the leader path.
+    /// Effective I/O path. Ordinary v4 WALs use the requested mode; legacy
+    /// and PITR WAL constructors use the leader path.
     io_mode: WalIoMode,
-    /// Dedicated packer/worker/sync coordinator for candidate v4 WALs.
+    /// Dedicated packer/worker/sync coordinator for parallel v4 WALs.
     parallel_runtime: Option<parallel_runtime::ParallelWalRuntime>,
     /// Whether this WAL uses v3 typed entries (kind prefix).
     /// Only meaningful when `mvcc_format` is true. When false, the WAL uses v2
@@ -1085,8 +1085,11 @@ impl Wal {
         Ok(ticket)
     }
 
+    /// Create an ordinary v4 WAL using the default parallel pipeline.
+    ///
+    /// Creation fails if io_uring or `O_DIRECT` initialization is unavailable.
     pub fn create(path: impl AsRef<Path>) -> Result<Self> {
-        Self::create_with_io_mode(path, WalIoMode::Leader)
+        Self::create_with_io_mode(path, WalIoMode::default())
     }
 
     pub(crate) fn create_with_io_mode(path: impl AsRef<Path>, io_mode: WalIoMode) -> Result<Self> {
@@ -2130,7 +2133,7 @@ impl Wal {
                 wal_version,
                 file_len_after,
                 path.as_ref(),
-                WalIoMode::Leader,
+                WalIoMode::default(),
             )?,
             max_ts,
         ))
@@ -2150,7 +2153,7 @@ impl Wal {
             path,
             skiplist,
             range_tombstones,
-            WalIoMode::Leader,
+            WalIoMode::default(),
         )
     }
 
@@ -2451,7 +2454,7 @@ impl Wal {
     /// The `commit_ts` is shared across all entries in the batch.
     ///
     /// The encoded buffer is pushed to the pending queue for io_uring submission.
-    /// The caller must call [`submit_and_commit`] (or [`sync`]) afterward to
+    /// The caller must call [`Self::submit_and_commit`] (or [`Self::sync`]) afterward to
     /// durably flush the data to disk.
     pub fn put_range_tombstone_batch(
         &self,

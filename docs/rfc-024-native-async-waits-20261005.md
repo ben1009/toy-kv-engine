@@ -1,5 +1,10 @@
 # RFC 024: cooperative WAL durability and publication experiment
 
+**Historical report:** Measurements and default/opt-in recommendations below
+describe the revision tested. Ordinary v4 WALs now default to parallel by
+maintainer decision; see the [current adoption note](rfc-024-parallel-wal-default-20261005.md).
+The original performance gate remains unqualified.
+
 Experiment started October 4, 2026; corrected-teardown confirmation completed October 5 (Asia/Chongqing).
 
 The native wait prototype is promising, but its confirmation did not pass the frozen repeatability screen. At confirmation time it was isolated: the retained engine, dependency manifests, toolchain, async API guards, and normal `write-perf` binary were unchanged. The later engine integration is tracked in the [integration report](rfc-024-native-async-integration-20261005.md); all measurements below describe the archived prototype.
@@ -57,8 +62,8 @@ Process switch counts increased despite lower CPU use. Counts alone therefore do
 
 ## Reproduction artifacts
 
-- [Initial protocol](../target/rfc024-native-async-ca4cfcca-20261004/protocol.json), [analysis](../target/rfc024-native-async-ca4cfcca-20261004/analysis.json), [raw observations](../target/rfc024-native-async-ca4cfcca-20261004/records.json), and [initial patch](../target/rfc024-native-async-ca4cfcca-20261004/candidate.patch).
-- [Corrected confirmation protocol](../target/rfc024-native-async-ca4cfcca-20261004/confirmation/protocol.json), [analysis](../target/rfc024-native-async-ca4cfcca-20261004/confirmation/analysis.json), [raw observations](../target/rfc024-native-async-ca4cfcca-20261004/confirmation/records.json), and [prototype patch](../target/rfc024-native-async-ca4cfcca-20261004/confirmation/candidate.patch).
-- [Prototype source](../target/rfc024-native-async-ca4cfcca-20261004/fork/kv-engine/src/lsm_storage/native_async_probe.rs), [probe harness](../target/rfc024-native-async-ca4cfcca-20261004/probe/src/main.rs), [compiled source hashes](../target/rfc024-native-async-ca4cfcca-20261004/confirmation/source-hashes.json), and [production integrity](../target/rfc024-native-async-ca4cfcca-20261004/final-integrity.json).
+- Initial protocol: `target/rfc024-native-async-ca4cfcca-20261004/protocol.json`, analysis: `target/rfc024-native-async-ca4cfcca-20261004/analysis.json`, raw observations: `target/rfc024-native-async-ca4cfcca-20261004/records.json`, and initial patch: `target/rfc024-native-async-ca4cfcca-20261004/candidate.patch`.
+- Corrected confirmation protocol: `target/rfc024-native-async-ca4cfcca-20261004/confirmation/protocol.json`, analysis: `target/rfc024-native-async-ca4cfcca-20261004/confirmation/analysis.json`, raw observations: `target/rfc024-native-async-ca4cfcca-20261004/confirmation/records.json`, and prototype patch: `target/rfc024-native-async-ca4cfcca-20261004/confirmation/candidate.patch`.
+- Prototype source: `target/rfc024-native-async-ca4cfcca-20261004/fork/kv-engine/src/lsm_storage/native_async_probe.rs`, probe harness: `target/rfc024-native-async-ca4cfcca-20261004/probe/src/main.rs`, compiled source hashes: `target/rfc024-native-async-ca4cfcca-20261004/confirmation/source-hashes.json`, and production integrity: `target/rfc024-native-async-ca4cfcca-20261004/final-integrity.json`.
 
 Artifacts are local and ignored by Git. Initial and corrected binaries are preserved separately; the normal production benchmark binary retains SHA-256 `72891a06445b1e08a5ec187b4cbed8c41cbf0377c80b0e2aa5fc4748c40b0eb3`.

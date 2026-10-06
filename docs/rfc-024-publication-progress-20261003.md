@@ -1,5 +1,10 @@
 # RFC 024: Progress-aware publication waiting
 
+**Historical report:** Measurements and default/opt-in recommendations below
+describe the revision tested. Ordinary v4 WALs now default to parallel by
+maintainer decision; see the [current adoption note](rfc-024-parallel-wal-default-20261005.md).
+The original performance gate remains unqualified.
+
 **Decision:** Reject the prototype and restore the retained runtime. The
 32-writer comparison records 22.1% lower CPU per put, but only one of three
 blocks passes the required repeat controls. The rotation p99 guard also fails.

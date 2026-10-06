@@ -1,5 +1,10 @@
 # RFC 024: native submission and key preparation, 2026-10-06
 
+**Historical report:** Measurements and default/opt-in recommendations below
+describe the revision tested. Ordinary v4 WALs now default to parallel by
+maintainer decision; see the [current adoption note](rfc-024-parallel-wal-default-20261005.md).
+The original performance gate remains unqualified.
+
 Neither candidate is retained. The baseline includes the retained
 [coalescing cutoff refresh](rfc-024-native-cutoff-refresh-20261006.md) and
 the current working-tree default selection. Both scored arms explicitly

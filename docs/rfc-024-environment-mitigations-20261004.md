@@ -1,5 +1,10 @@
 # RFC 024: physical SSD environment mitigation attempts, 2026-10-04
 
+**Historical report:** Measurements and default/opt-in recommendations below
+describe the revision tested. Ordinary v4 WALs now default to parallel by
+maintainer decision; see the [current adoption note](rfc-024-parallel-wal-default-20261005.md).
+The original performance gate remains unqualified.
+
 Neither of two additional reversible interventions stabilized the unchanged
 parallel-WAL benchmark on this physical SSD. All 30 runs completed and their
 original system settings were restored. No mitigation is retained as a fix.

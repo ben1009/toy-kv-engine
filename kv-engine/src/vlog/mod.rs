@@ -550,7 +550,7 @@ pub struct ValueLog {
     /// number of concurrent in-flight opens (typically 1-2).
     open_locks: Mutex<AHashMap<u32, Arc<Mutex<()>>>>,
     /// In-memory per-file vLog indices for GC optimization.
-    /// Maps file_id → Arc<VlogIndex>. Loaded lazily on first access;
+    /// Maps file_id → `Arc<VlogIndex>`. Loaded lazily on first access;
     /// rebuilt from vLog headers if the `.vidx` file is missing.
     indices: RwLock<AHashMap<u32, Arc<VlogIndex>>>,
 }

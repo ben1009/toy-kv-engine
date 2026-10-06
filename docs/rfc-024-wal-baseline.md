@@ -1,5 +1,10 @@
 # RFC 024 WAL Baseline
 
+**Historical report:** Measurements and default/opt-in recommendations below
+describe the revision tested. Ordinary v4 WALs now default to parallel by
+maintainer decision; see the [current adoption note](rfc-024-parallel-wal-default-20261005.md).
+The original performance gate remains unqualified.
+
 This records the current client-leader `wal_concurrent` control before any
 parallel scheduling change. It is the Slice 1 baseline for the
 [RFC 024 implementation plan](rfc-024-parallel-wal-implementation-plan.md),

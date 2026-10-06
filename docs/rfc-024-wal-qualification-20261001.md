@@ -1,5 +1,10 @@
 # RFC 024: WAL qualification matrix, 2026-10-01
 
+**Historical report:** Measurements and default/opt-in recommendations below
+describe the revision tested. Ordinary v4 WALs now default to parallel by
+maintainer decision; see the [current adoption note](rfc-024-parallel-wal-default-20261005.md).
+The original performance gate remains unqualified.
+
 Parallel WAL remains opt-in. The original ext4 workload improved by **171.0%**
 in this session's paired blocks, with **48.9% lower p99**, but the full RFC
 performance gate is not met: tmpfs single-writer throughput regressed, ext4

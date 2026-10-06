@@ -1,5 +1,10 @@
 # RFC 024: low-concurrency parallel comparison, 2026-10-03
 
+**Historical report:** Measurements and default/opt-in recommendations below
+describe the revision tested. Ordinary v4 WALs now default to parallel by
+maintainer decision; see the [current adoption note](rfc-024-parallel-wal-default-20261005.md).
+The original performance gate remains unqualified.
+
 Eight- and sixteen-writer throughput repeats consistently below the archived
 parallel implementation: **-16.8%** and **-15.4%**, respectively. Four-writer
 rotation still swings between fast and slow intervals. No case passes the

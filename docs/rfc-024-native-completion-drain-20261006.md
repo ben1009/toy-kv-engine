@@ -1,5 +1,10 @@
 # RFC 024: native commit waits and completion drain, 2026-10-06
 
+**Historical report:** Measurements and default/opt-in recommendations below
+describe the revision tested. Ordinary v4 WALs now default to parallel by
+maintainer decision; see the [current adoption note](rfc-024-parallel-wal-default-20261005.md).
+The original performance gate remains unqualified.
+
 The parallel WAL coordinator now processes a bounded snapshot of queued
 completions after coalescing and before capturing its next sync target.
 The maintainer selected this change for provisional retention: the native

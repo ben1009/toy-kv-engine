@@ -185,7 +185,7 @@ struct Args {
     #[arg(long, conflicts_with = "wal")]
     no_wal: bool,
     /// Select the v4 WAL path for wal_concurrent comparisons.
-    #[arg(long, value_enum, default_value = "leader")]
+    #[arg(long, value_enum, default_value = "parallel")]
     wal_io_mode: WalIoModeArg,
     #[arg(long)]
     vlog: bool,
@@ -365,7 +365,12 @@ impl HarnessConfig {
                 .unwrap_or_else(|| "bypass".to_string()),
             compaction: args.compaction,
             wal_override,
-            wal_io_mode: args.wal_io_mode,
+            // PITR v5/v6 uses the leader path regardless of the v4 default.
+            wal_io_mode: if args.pitr {
+                WalIoModeArg::Leader
+            } else {
+                args.wal_io_mode
+            },
             vlog_override: args.vlog,
             profile: args.profile,
             pitr: args.pitr,
@@ -8040,17 +8045,6 @@ fn validate_run_mode(cfg: &HarnessConfig, bench_arg: Option<&str>) -> Result<()>
         !(cfg.prepare_golden && bench_arg.is_some()),
         "--prepare-golden does not support --bench"
     );
-    if cfg.wal_io_mode == WalIoModeArg::Parallel {
-        let is_supported_wal_workload = matches!(
-            bench_arg,
-            Some("wal_concurrent" | "wal_batch_concurrent" | "wal_batch")
-        );
-        anyhow::ensure!(
-            is_supported_wal_workload,
-            "--wal-io-mode parallel requires --bench wal_concurrent or wal_batch_concurrent"
-        );
-        anyhow::ensure!(!cfg.pitr, "--wal-io-mode parallel does not support --pitr");
-    }
 
     Ok(())
 }
@@ -8108,52 +8102,27 @@ mod tests {
     }
 
     #[test]
-    fn parallel_wal_mode_is_scoped_to_concurrent_wal_workloads() {
-        for workload in ["wal_concurrent", "wal_batch_concurrent", "wal_batch"] {
-            let args = Args::try_parse_from([
-                "write-perf",
-                "--wal-io-mode",
-                "parallel",
-                "--bench",
-                workload,
-            ])
-            .expect("parse parallel WAL selector");
-            let cfg = HarnessConfig::from_args(args);
+    fn default_wal_mode_and_pitr_control_are_reported_correctly() {
+        let cfg = legacy_cfg();
+        assert_eq!(cfg.wal_io_mode, WalIoModeArg::Parallel);
+        validate_run_mode(&cfg, None).expect("default mode supports ordinary workloads");
 
-            assert_eq!(cfg.wal_io_mode, WalIoModeArg::Parallel);
-            validate_run_mode(&cfg, Some(workload)).expect("supported selector scope");
-        }
-
-        let args = Args::try_parse_from([
-            "write-perf",
-            "--wal-io-mode",
-            "parallel",
-            "--bench",
-            "wal_concurrent",
-        ])
-        .expect("parse parallel WAL selector");
-        let cfg = HarnessConfig::from_args(args);
-        let error = validate_run_mode(&cfg, Some("fillseq"))
-            .expect_err("parallel selector must not spill into unrelated workloads");
-        assert!(
-            error
-                .to_string()
-                .contains("requires --bench wal_concurrent or wal_batch_concurrent")
+        let args = Args::try_parse_from(["write-perf", "--wal-io-mode", "leader"])
+            .expect("parse explicit leader control");
+        assert_eq!(
+            HarnessConfig::from_args(args).wal_io_mode,
+            WalIoModeArg::Leader
         );
 
-        let pitr_args = Args::try_parse_from([
-            "write-perf",
-            "--wal-io-mode",
-            "parallel",
-            "--bench",
-            "wal_concurrent",
-            "--pitr",
-        ])
-        .expect("parse PITR with parallel WAL selector");
-        let pitr_cfg = HarnessConfig::from_args(pitr_args);
-        let error = validate_run_mode(&pitr_cfg, Some("wal_concurrent"))
-            .expect_err("parallel selector must not label PITR's leader path as parallel");
-        assert!(error.to_string().contains("does not support --pitr"));
+        for args in [
+            vec!["write-perf", "--pitr"],
+            vec!["write-perf", "--pitr", "--wal-io-mode", "parallel"],
+        ] {
+            let args = Args::try_parse_from(args).expect("parse PITR workload");
+            let cfg = HarnessConfig::from_args(args);
+            assert_eq!(cfg.wal_io_mode, WalIoModeArg::Leader);
+            validate_run_mode(&cfg, Some("wal_concurrent")).expect("PITR keeps leader WAL");
+        }
     }
 
     #[derive(Debug, Deserialize)]

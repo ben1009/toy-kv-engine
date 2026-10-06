@@ -1,5 +1,10 @@
 # RFC 024: Synchronous `pwritev` group submission — rejected
 
+**Historical report:** Measurements and default/opt-in recommendations below
+describe the revision tested. Ordinary v4 WALs now default to parallel by
+maintainer decision; see the [current adoption note](rfc-024-parallel-wal-default-20261005.md).
+The original performance gate remains unqualified.
+
 **Decision:** Reject. The synchronous submit path is reverted from the tree; it
 wins at low concurrency and loses at high concurrency and in the batch tails,
 so it does not qualify as a replacement for the ring on the leader path. The

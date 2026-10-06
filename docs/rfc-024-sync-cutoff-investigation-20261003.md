@@ -1,5 +1,10 @@
 # RFC 024: sync cutoff regression investigation, 2026-10-03
 
+**Historical report:** Measurements and default/opt-in recommendations below
+describe the revision tested. Ordinary v4 WALs now default to parallel by
+maintainer decision; see the [current adoption note](rfc-024-parallel-wal-default-20261005.md).
+The original performance gate remains unqualified.
+
 The current parallel WAL has a synchronization batching regression.
 Commit `233a8a85` moved the coalescing cutoff snapshot outside the
 completion loop. A single-variable diagnostic restores larger sync batches

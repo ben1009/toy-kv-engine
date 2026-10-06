@@ -1,5 +1,10 @@
 # RFC 024: Tokio client experiment, 2026-10-04
 
+**Historical report:** Measurements and default/opt-in recommendations below
+describe the revision tested. Ordinary v4 WALs now default to parallel by
+maintainer decision; see the [current adoption note](rfc-024-parallel-wal-default-20261005.md).
+The original performance gate remains unqualified.
+
 The Tokio blocking bridge did not establish a repeatable performance improvement.
 An initial +5.8% paired throughput result failed all repeat controls; an independent
 confirmation was -0.8%, with one passing control. Both runs showed substantially

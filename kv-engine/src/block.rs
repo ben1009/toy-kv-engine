@@ -41,7 +41,7 @@ impl Block {
         Ok(buf.freeze())
     }
 
-    /// Encode without consuming self. Slightly less efficient than [`encode`]
+    /// Encode without consuming self. Slightly less efficient than [`Self::encode`]
     /// (copies `data` instead of moving it), but avoids cloning the block when
     /// the caller needs to keep the original for cache backfill.
     ///

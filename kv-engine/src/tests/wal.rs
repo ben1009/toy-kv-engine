@@ -70,6 +70,17 @@ fn fill_parallel_wal_below_sst_limit(
     memtable
 }
 
+fn create_leader_wal_or_skip(path: &std::path::Path) -> Option<Wal> {
+    match Wal::create_with_io_mode(path, WalIoMode::Leader) {
+        Ok(wal) => Some(wal),
+        Err(error) if is_io_uring_unavailable_error(&error) => {
+            eprintln!("skipping test (io_uring unavailable): {error:#}");
+            None
+        }
+        Err(error) => panic!("failed to create leader WAL: {error:#}"),
+    }
+}
+
 #[cfg(feature = "chaos-testing")]
 fn create_parallel_wal_or_skip(path: &std::path::Path) -> Option<Wal> {
     match Wal::create_with_io_mode(path, WalIoMode::Parallel) {
@@ -145,11 +156,77 @@ fn test_wal_v5_create_preserves_identity_header() {
     assert!(wal.put_v5_batch(&batch, limits, None).is_err());
 }
 
+#[tokio::test]
+async fn test_default_engine_open_rotation_async_and_repair_use_parallel_wal() {
+    let dir = tempdir().unwrap();
+    let mut options = LsmStorageOptions::default_for_test();
+    options.enable_wal = true;
+    options.target_sst_size = 1 << 30;
+    let engine = match KvEngine::open(dir.path(), options.clone()) {
+        Ok(engine) => engine,
+        Err(error) if is_io_uring_unavailable_error(&error) => {
+            eprintln!("skipping test (io_uring unavailable): {error:#}");
+            return;
+        }
+        Err(error) => panic!("failed to open default WAL engine: {error:#}"),
+    };
+    assert!(engine.inner.selects_parallel_wal_io());
+    assert_eq!(
+        engine.inner.state.load().memtable.parallel_wal_is_closed(),
+        Some(false)
+    );
+    engine.put(b"before-rotation", b"value").unwrap();
+    {
+        let lock = engine.inner.state_lock.lock();
+        engine.inner.force_freeze_memtable(&lock).unwrap();
+    }
+    assert_eq!(
+        engine.inner.state.load().memtable.parallel_wal_is_closed(),
+        Some(false)
+    );
+    engine.put_async(b"after-rotation", b"value").await.unwrap();
+    engine.close_async().await.unwrap();
+    drop(engine);
+
+    let engine = KvEngine::open_async(dir.path(), options.clone())
+        .await
+        .unwrap();
+    assert!(engine.inner.selects_parallel_wal_io());
+    assert_eq!(
+        engine.inner.state.load().memtable.parallel_wal_is_closed(),
+        Some(false)
+    );
+    assert_eq!(
+        engine.get(b"before-rotation").unwrap().as_deref(),
+        Some(b"value".as_slice())
+    );
+    assert_eq!(
+        engine.get(b"after-rotation").unwrap().as_deref(),
+        Some(b"value".as_slice())
+    );
+    engine.put_async(b"after-reopen", b"value").await.unwrap();
+    engine.close_async().await.unwrap();
+    drop(engine);
+
+    let (engine, repaired) = KvEngine::open_repairing(dir.path(), options).unwrap();
+    assert!(repaired.is_empty());
+    assert!(engine.inner.selects_parallel_wal_io());
+    assert_eq!(
+        engine.inner.state.load().memtable.parallel_wal_is_closed(),
+        Some(false)
+    );
+    assert_eq!(
+        engine.get(b"after-reopen").unwrap().as_deref(),
+        Some(b"value".as_slice())
+    );
+    engine.close().unwrap();
+}
+
 #[test]
-fn test_parallel_v4_wal_writes_syncs_and_recovers() {
+fn test_default_v4_wal_writes_syncs_and_recovers() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("candidate-v4.wal");
-    let wal = match Wal::create_with_io_mode(&path, WalIoMode::Parallel) {
+    let wal = match Wal::create(&path) {
         Ok(wal) => wal,
         Err(error) if is_io_uring_unavailable_error(&error) => {
             eprintln!("skipping test (io_uring unavailable): {error}");
@@ -180,13 +257,8 @@ fn test_parallel_v4_wal_writes_syncs_and_recovers() {
 
     let skiplist = new_skiplist();
     let range_tombstones = crate::range_tombstone::RangeTombstoneSet::new();
-    let (recovered, batch) = Wal::recover_with_range_tombstones_and_mode(
-        &path,
-        &skiplist,
-        &range_tombstones,
-        WalIoMode::Parallel,
-    )
-    .unwrap();
+    let (recovered, batch) =
+        Wal::recover_with_range_tombstones(&path, &skiplist, &range_tombstones).unwrap();
     assert_eq!(recovered.io_mode(), WalIoMode::Parallel);
     assert_eq!(batch.max_ts, 3);
     assert_eq!(
@@ -2104,7 +2176,7 @@ fn test_wal_group_commit_handles_late_arrival() {
 fn test_wal_profiled_group_commit_records_follower_wait_events() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("profiled_group_commit.wal");
-    let Some(wal) = create_wal_or_skip(&path) else {
+    let Some(wal) = create_leader_wal_or_skip(&path) else {
         return;
     };
     let wal = Arc::new(wal);
@@ -2938,7 +3010,7 @@ fn test_wal_submit_and_commit_flushes_legacy_wal() {
 fn test_wal_submit_and_commit_empty_wal_is_noop() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("empty_submit_and_commit.wal");
-    let Some(wal) = create_wal_or_skip(&path) else {
+    let Some(wal) = create_leader_wal_or_skip(&path) else {
         return;
     };
 
@@ -2956,7 +3028,7 @@ fn test_wal_submit_and_commit_rejects_unassigned_ticket() {
     wal.put_batch(&[(b"k", b"v")], 1).unwrap();
     let err = wal.submit_and_commit(1).unwrap_err();
     assert!(
-        err.to_string().contains("unassigned ticket"),
+        err.to_string().contains("unassigned"),
         "unexpected error: {err:#}"
     );
 }

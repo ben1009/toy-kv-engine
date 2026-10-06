@@ -1,5 +1,10 @@
 # RFC 024: Publication cache experiments, 2026-10-01
 
+**Historical report:** Measurements and default/opt-in recommendations below
+describe the revision tested. Ordinary v4 WALs now default to parallel by
+maintainer decision; see the [current adoption note](rfc-024-parallel-wal-default-20261005.md).
+The original performance gate remains unqualified.
+
 **Decision:** Reject both publication-frontier prototypes. Padding does not
 establish an ext4 gain and has an unresolved tmpfs throughput regression.
 Skipping unchanged frontier stores shows a small initial 64-writer gain that

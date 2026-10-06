@@ -1,5 +1,10 @@
 # RFC 024: batch64 publication and packing follow-up, 2026-10-04
 
+**Historical report:** Measurements and default/opt-in recommendations below
+describe the revision tested. Ordinary v4 WALs now default to parallel by
+maintainer decision; see the [current adoption note](rfc-024-parallel-wal-default-20261005.md).
+The original performance gate remains unqualified.
+
 No additional production change is retained. Three isolated candidates targeted
 publication ownership, publication spinning, and packing under the MVCC ordering
 mutex. None passed the frozen incremental retention rule. Existing optimizations,

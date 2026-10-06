@@ -1,5 +1,10 @@
 # RFC 024: native forced-async kernel dispatch, 2026-10-06
 
+**Historical report:** Measurements and default/opt-in recommendations below
+describe the revision tested. Ordinary v4 WALs now default to parallel by
+maintainer decision; see the [current adoption note](rfc-024-parallel-wal-default-20261005.md).
+The original performance gate remains unqualified.
+
 `IOSQE_ASYNC` makes the submission syscall shorter, but it moves filesystem
 write issuance to io-wq helpers. Ordinary SQEs already issue asynchronous
 direct I/O successfully without helpers for most writes. In the two healthy

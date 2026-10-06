@@ -1,5 +1,10 @@
 # RFC 024: controlled ext4 comparison, 2026-10-04
 
+**Historical report:** Measurements and default/opt-in recommendations below
+describe the revision tested. Ordinary v4 WALs now default to parallel by
+maintainer decision; see the [current adoption note](rfc-024-parallel-wal-default-20261005.md).
+The original performance gate remains unqualified.
+
 The fixed comparison completed all 114 runs in 37.7 minutes. The retained
 optimized parallel WAL showed no improvement over the archived `067d4b09`
 parallel executable in this session. Eight- and sixteen-writer throughput

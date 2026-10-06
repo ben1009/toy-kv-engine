@@ -1,5 +1,10 @@
 # RFC 024: batch64 parallel WAL versus Leader rerun, 2026-10-06
 
+**Historical report:** Measurements and default/opt-in recommendations below
+describe the revision tested. Ordinary v4 WALs now default to parallel by
+maintainer decision; see the [current adoption note](rfc-024-parallel-wal-default-20261005.md).
+The original performance gate remains unqualified.
+
 The current parallel WAL was rerun against Leader using batch64 at eight and
 sixteen writers. This session **does not establish a reliable parallel-WAL
 win**. Only one of five blocks passes repeat controls at each writer count;

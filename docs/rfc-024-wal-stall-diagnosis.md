@@ -1,5 +1,10 @@
 # RFC 024: investigation of unstable ext4 measurements
 
+**Historical report:** Measurements and default/opt-in recommendations below
+describe the revision tested. Ordinary v4 WALs now default to parallel by
+maintainer decision; see the [current adoption note](rfc-024-parallel-wal-default-20261005.md).
+The original performance gate remains unqualified.
+
 The low-concurrency rerun reproduced large throughput swings with an unchanged
 binary. The strongest current finding is a persistence-sensitive delay before
 NVMe CQE consumption. On the same initialized file, the first write after each
