@@ -2617,6 +2617,9 @@ impl Wal {
                 anyhow::bail!("WAL is poisoned due to a previous I/O error");
             }
 
+            #[cfg(feature = "chaos-testing")]
+            crate::chaos::failpoint::fail_point!("wal.before_leader_cas");
+
             // Try to become the leader via CAS.
             let is_leader = self
                 .submitting
@@ -2624,6 +2627,25 @@ impl Wal {
                 .is_ok();
 
             if is_leader {
+                // A previous leader can publish this ticket and release
+                // `submitting` after our loop checks above but before this
+                // CAS. Recheck while holding leadership so a stale caller
+                // does not drain an already-empty queue and report a false
+                // invariant failure.
+                if self.completion_state.durable_ticket.load(Ordering::Acquire) > ticket {
+                    self.release_leadership_without_submit();
+                    return Ok(());
+                }
+
+                // A previous leader may also have failed in that window.
+                // Preserve its error and wake followers instead of letting a
+                // stale leader overwrite it with an empty-drain error.
+                if self.poisoned.load(Ordering::Acquire) {
+                    let error = self.poisoned_error();
+                    self.release_leadership_without_submit();
+                    return Err(error);
+                }
+
                 self.submit_as_leader(ticket, profile)?;
             } else {
                 // Follower path: wait until the leader commits our ticket.
@@ -2826,6 +2848,23 @@ impl Wal {
         Err(anyhow::anyhow!("{err_msg}"))
     }
 
+    fn release_leadership_without_submit(&self) {
+        // Serialize the release with waiters' condition-variable checks so a
+        // notification cannot be lost between their predicate check and wait.
+        let _state = self.completion_state.mutex.lock();
+        self.submitting.store(false, Ordering::Release);
+        self.completion_state.cond.notify_all();
+    }
+
+    fn poisoned_error(&self) -> anyhow::Error {
+        let state = self.completion_state.mutex.lock();
+        state
+            .last_error
+            .as_ref()
+            .map(|error| anyhow::anyhow!("{error}"))
+            .unwrap_or_else(|| anyhow::anyhow!("WAL is poisoned due to a previous I/O error"))
+    }
+
     fn publish_submit_result<T>(&self, max_ticket: u64, result: &Result<T>) {
         if result.is_err() {
             self.poisoned.store(true, Ordering::Release);
@@ -2904,6 +2943,13 @@ impl Wal {
         captured_target: u64,
         profile: Option<&crate::mem_table::WriteProfile>,
     ) -> Result<Vec<TicketedBuf>> {
+        // Inject before any SQE submission so the drained buffers can be
+        // dropped safely while exercising normal leader error publication.
+        #[cfg(feature = "chaos-testing")]
+        crate::chaos::failpoint::fail_point!("wal.leader_group_io_failure", |_| Err(
+            anyhow::anyhow!("injected leader WAL group I/O failure")
+        ));
+
         #[cfg(not(feature = "bench"))]
         let _ = (captured_target, profile);
 
