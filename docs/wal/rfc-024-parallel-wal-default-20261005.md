@@ -7,6 +7,11 @@ when WAL is enabled; it does not enable WAL for configurations that disable it.
 The change follows the maintainer's explicit adoption decision on 2026-10-05.
 It is not a claim that the original RFC performance gate passed.
 
+The proposed [RFC 025](../../rfcs/025-parallel-wal-all-new-formats.md) extends
+the policy to every future WAL format and specifies a PITR v7 frontier journal.
+It requires a new recovery protocol before enabling Parallel for PITR; the
+runtime selection documented here remains the implemented behavior.
+
 ## Runtime selection
 
 `WalIoMode::default()` is `Parallel`. Synchronous `KvEngine::open`,

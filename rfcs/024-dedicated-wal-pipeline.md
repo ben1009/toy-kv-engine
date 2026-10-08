@@ -18,6 +18,10 @@ remains unqualified; the proposal and benchmark criteria below are retained as
 the historical design, not evidence that the gate passed. The current limits
 are 32 in-flight groups and 256 ring entries.
 
+[RFC 025](025-parallel-wal-all-new-formats.md) proposes Parallel as the default
+for all future formats. Its PITR v7 frontier journal addresses the recovery
+restriction below while preserving existing v5/v6 semantics.
+
 ## Summary
 
 After the PITR commit-sequencer work, the PITR-disabled, four-writer

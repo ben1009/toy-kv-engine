@@ -7,6 +7,11 @@ v5/v6 and older MVCC WALs retain leader I/O; legacy unframed WALs retain
 buffered I/O. The full RFC performance gate remains unqualified; the reports
 retain measured revisions and failed controls.
 
+[RFC 025](../../rfcs/025-parallel-wal-all-new-formats.md) proposes Parallel as
+the default for every future WAL format, including PITR v7 with a persisted
+durable frontier. It specifies recovery, migration, and validation requirements;
+it has not changed the current format defaults above.
+
 Dated filenames identify individual measurements and follow-ups. The
 [benchmark overview](benchmarks/rfc-024-parallel-wal-benchmark.md) connects
 the retained and rejected experiments.
@@ -17,6 +22,10 @@ the retained and rejected experiments.
 - [Parallel WAL Implementation Plan](rfc-024-parallel-wal-implementation-plan.md)
 - [Native async point-write integration](rfc-024-native-async-integration-20261005.md)
 - [Retire frozen parallel WAL runtimes](rfc-024-frozen-wal-retirement.md)
+
+## Proposed extensions
+
+- [RFC 025: Parallel WAL by Default for All New Formats](../../rfcs/025-parallel-wal-all-new-formats.md)
 
 ## Benchmarks and qualification
 
