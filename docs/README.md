@@ -16,6 +16,11 @@ in the [RFC directory](../rfcs/).
 Start with the [WAL documentation index](wal/README.md) for the current
 parallel WAL policy and its measured results.
 
+## WAL implementation
+
+- [RFC 024: Parallel WAL Implementation Plan](wal/rfc-024-parallel-wal-implementation-plan.md)
+- [RFC 025 Implementation Plan: Parallel WAL with Embedded Frontiers and One Sync](wal/rfc-025-parallel-wal-embedded-frontiers-implementation-plan.md)
+
 ## Benchmark reports
 
 - [Crud-bench: ToyKV vs Fjall (matched config)](benchmarks/bench-report-crud-bench-fjall.md)
