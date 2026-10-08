@@ -120,6 +120,11 @@ incarnation; bytes `144..148` contain CRC32 over `0..144`; all remaining
 header bytes are zero. The incarnation is created once. All digest preimages
 use raw bytes without text encoding.
 
+Unless a field is explicitly defined as raw bytes, all multi-byte integer
+fields in v7 frame, fragment, logical-batch, and FRONTIER layouts MUST use
+big-endian encoding. Fixed byte arrays, digests, magic bytes, and padding
+remain raw bytes.
+
 Every following physical frame is exactly 4096 bytes, starts at a 4096-byte
 aligned offset, and has this 64-byte common header:
 
