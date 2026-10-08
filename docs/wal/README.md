@@ -26,6 +26,7 @@ the retained and rejected experiments.
 
 - [Parallel WAL default adoption](rfc-024-parallel-wal-default-20261005.md)
 - [Parallel WAL Implementation Plan](rfc-024-parallel-wal-implementation-plan.md)
+- [RFC 025 Implementation Plan: Parallel WAL with Embedded Frontiers and One Sync](rfc-025-parallel-wal-embedded-frontiers-implementation-plan.md)
 - [Native async point-write integration](rfc-024-native-async-integration-20261005.md)
 - [Retire frozen parallel WAL runtimes](rfc-024-frozen-wal-retirement.md)
 
