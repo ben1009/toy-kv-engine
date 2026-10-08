@@ -3450,6 +3450,11 @@ impl KvEngine {
                 .ok_or_else(|| anyhow!("PITR state has no active segment"))?;
             let successor_segment_id = state.next_segment_id;
             let (seal, wal_path, seal_path) = self.inner.write_pitr_seal_for_active_wal()?;
+            #[cfg(feature = "chaos-testing")]
+            crate::chaos::failpoint::fail_point!(
+                "pitr.after_active_seal_before_seal_started",
+                |_| Err(anyhow!("injected PITR failure after active WAL seal"))
+            );
             ensure!(
                 seal.header.segment_id.0 == active_segment_id,
                 "active WAL segment identity does not match PITR state"
@@ -4246,6 +4251,19 @@ impl KvEngine {
         repository: &std::path::Path,
         use_hard_links: bool,
     ) -> Result<crate::backup::BackupInfo> {
+        let metadata = self.prepare_pitr_base_locked()?;
+
+        self.create_pitr_base_backup(
+            crate::backup::BackupOptions {
+                repository: repository.to_path_buf(),
+                use_hard_links,
+            },
+            metadata,
+        )
+    }
+
+    #[cfg(target_os = "linux")]
+    fn prepare_pitr_base_locked(&self) -> Result<crate::pitr::base::PitrBaseMetadata> {
         // Callers can decide to publish before acquiring the barrier. A
         // disable in that gap must be rejected before stopping admission,
         // because the disabled engine is already allowed to accept writes.
@@ -4388,13 +4406,8 @@ impl KvEngine {
             wal_replay_version: crate::pitr::base::PITR_BASE_WAL_REPLAY_VERSION,
             compatibility_digest,
         };
-        self.create_pitr_base_backup(
-            crate::backup::BackupOptions {
-                repository: repository.to_path_buf(),
-                use_hard_links,
-            },
-            metadata,
-        )
+
+        Ok(metadata)
     }
 
     #[cfg(target_os = "linux")]
@@ -4504,11 +4517,15 @@ impl KvEngine {
                 return Err(anyhow!("PITR backup boundary publication is unknown"));
             }
         }
-        let result = self.publish_pitr_base_locked(&options.repository, options.use_hard_links);
-        // A clean base-capture failure does not invalidate a durable boundary.
-        // Publication can establish another boundary if GC rewrites populate
-        // the successor, so recheck that all archive work is settled before
-        // reopening admission after either result.
+        #[cfg(feature = "chaos-testing")]
+        crate::chaos::failpoint::fail_point!("pitr.before_backup_base_boundary");
+        // GC can populate the successor while ordinary admission is stopped.
+        // Preparation then seals another boundary; its failures must propagate
+        // without reopening admission, even if SealStarted is not persisted.
+        let metadata = self.prepare_pitr_base_locked()?;
+        let result = self.create_pitr_base_backup(options.clone(), metadata);
+        // A clean physical capture failure does not invalidate the prepared
+        // durable boundary. Reopen admission only when archive work is settled.
         let state = self.pitr_manifest_state.lock();
         if state.mode == crate::pitr::manifest::PitrMode::Enabled
             && !self.pitr_publication_unknown.load(Ordering::Acquire)
@@ -13842,6 +13859,80 @@ mod tests {
         );
         engine.put(b"after-backup-error", b"value").unwrap();
         engine.close().unwrap();
+    }
+
+    #[cfg(all(target_os = "linux", feature = "chaos-testing"))]
+    #[test]
+    fn failpoint_pitr_backup_failed_second_boundary_keeps_admission_closed() {
+        use crate::{chaos::failpoint::FailScenario, vlog::KvKind};
+        use std::sync::atomic::Ordering;
+
+        let scenario = FailScenario::setup();
+        let dir = tempdir().unwrap();
+        let engine = pitr_flush_test_engine(dir.path());
+        engine.put(b"before-backup", b"value").unwrap();
+        let commit_ts = engine.inner.mvcc.as_ref().unwrap().latest_commit_ts();
+        let gc_engine = Arc::clone(&engine);
+        fail::cfg_callback("pitr.before_backup_base_boundary", move || {
+            // GC can rewrite an existing version into the empty successor
+            // through CAS while ordinary commit admission remains stopped.
+            assert_eq!(
+                gc_engine
+                    .inner
+                    .compare_and_set_batch_at_ts(&[(
+                        b"before-backup".to_vec(),
+                        commit_ts,
+                        b"value".to_vec(),
+                        KvKind::Inline,
+                        b"value".to_vec(),
+                        KvKind::Inline,
+                    )])
+                    .unwrap(),
+                vec![true]
+            );
+            fail::cfg("pitr.after_active_seal_before_seal_started", "return").unwrap();
+        })
+        .unwrap();
+
+        let error = engine
+            .create_pitr_base_for_backup(&crate::backup::BackupOptions {
+                repository: dir.path().join("repository"),
+                use_hard_links: false,
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("failure after active WAL seal"));
+        let active = engine.inner.state.load().memtable.clone();
+        assert!(active.wal_path().unwrap().with_extension("seal").exists());
+        let state = engine.pitr_manifest_state.lock().clone();
+        assert_eq!(state.mode, crate::pitr::manifest::PitrMode::Enabled);
+        assert!(state.obligations.values().all(|obligation| {
+            obligation.state == crate::pitr::manifest::ObligationState::Reclaimable
+        }));
+        assert!(!engine.pitr_publication_unknown.load(Ordering::Acquire));
+        assert!(
+            !engine
+                .inner
+                .mvcc
+                .as_ref()
+                .unwrap()
+                .commit_admission_is_open(),
+            "a failed second boundary must keep admission closed even before SealStarted"
+        );
+        assert!(engine.put(b"after-failed-boundary", b"value").is_err());
+
+        fail::remove("pitr.before_backup_base_boundary");
+        fail::remove("pitr.after_active_seal_before_seal_started");
+        assert!(matches!(
+            engine.create_recovery_point().unwrap(),
+            crate::pitr::api::RecoveryPointOutcome::Durable(_)
+        ));
+        engine.put(b"after-retry", b"value").unwrap();
+        assert_eq!(
+            engine.get(b"before-backup").unwrap().as_deref(),
+            Some(b"value".as_slice())
+        );
+        engine.close().unwrap();
+        scenario.teardown();
     }
 
     #[cfg(all(target_os = "linux", feature = "chaos-testing"))]
