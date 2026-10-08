@@ -379,13 +379,117 @@ fn failpoint_leader_wal_stale_submitter_skips_empty_drain() {
         .send(())
         .expect("resume stale caller after the leader publishes durability");
     let stale_result = stale_caller.join().expect("stale caller thread joins");
-    let close_result = wal.close();
-    scenario.teardown();
-
     leader_result.expect("leader makes both tickets durable");
     stale_result.expect("stale caller observes its already-durable ticket");
-    close_result.expect("close the WAL after both tickets are durable");
-    assert_eq!(wal.assigned_ticket_count(), 2);
+
+    // The stale caller must release leadership so a later ticket can elect a
+    // new leader and make progress, rather than waiting on a leaked flag.
+    let later_ticket = wal
+        .put_batch(&[(b"later".as_slice(), b"value".as_slice())], 3)
+        .expect("admit a later WAL batch");
+    let (finished_tx, finished_rx) = bounded(1);
+    let later_wal = Arc::clone(&wal);
+    let later_caller = thread::spawn(move || {
+        finished_tx
+            .send(later_wal.submit_and_commit(later_ticket))
+            .expect("report later ticket durability");
+    });
+    finished_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("later ticket makes progress after stale leadership is released")
+        .expect("later ticket becomes durable");
+    later_caller.join().expect("later caller thread joins");
+    wal.close()
+        .expect("close the WAL after all tickets are durable");
+    scenario.teardown();
+    assert_eq!(wal.assigned_ticket_count(), 3);
+}
+
+#[cfg(feature = "chaos-testing")]
+#[test]
+fn failpoint_leader_wal_stale_submitters_preserve_io_error() {
+    use crate::chaos::failpoint::{self, FailScenario};
+
+    let scenario = FailScenario::setup();
+    let dir = tempdir().expect("create temporary WAL directory");
+    let Some(wal) = create_leader_wal_or_skip(&dir.path().join("stale-poison.wal")) else {
+        return;
+    };
+    let wal = Arc::new(wal);
+    let durable_ticket = wal
+        .put_batch(&[(b"prefix".as_slice(), b"value".as_slice())], 1)
+        .expect("admit durable prefix ticket");
+    wal.submit_and_commit(durable_ticket)
+        .expect("prefix ticket becomes durable");
+    let failed_ticket = wal
+        .put_batch(&[(b"failed".as_slice(), b"value".as_slice())], 2)
+        .expect("admit ticket whose leader will fail");
+
+    let (paused_tx, paused_rx) = bounded(2);
+    let (resume_tx, resume_rx) = bounded(0);
+    fail::cfg_callback("wal.before_leader_cas", move || {
+        if thread::current().name() == Some("stale-poison-wal-caller") {
+            paused_tx.send(()).expect("report stale caller before CAS");
+            resume_rx.recv().expect("wait to resume stale caller");
+        }
+    })
+    .expect("pause stale callers before leader CAS");
+
+    let (finished_tx, finished_rx) = bounded(2);
+    let stale_callers = (0..2)
+        .map(|_| {
+            let caller_wal = Arc::clone(&wal);
+            let finished_tx = finished_tx.clone();
+            thread::Builder::new()
+                .name("stale-poison-wal-caller".to_owned())
+                .spawn(move || {
+                    finished_tx
+                        .send(caller_wal.submit_and_commit(failed_ticket))
+                        .expect("report stale caller result");
+                })
+                .expect("spawn stale WAL caller")
+        })
+        .collect::<Vec<_>>();
+    for _ in 0..2 {
+        paused_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("stale caller reaches pre-CAS failpoint");
+    }
+
+    failpoint::cfg("wal.leader_group_io_failure", "return").expect("inject leader I/O failure");
+    let leader_error = wal
+        .submit_and_commit(failed_ticket)
+        .expect_err("leader reports the injected I/O failure");
+    failpoint::cfg("wal.leader_group_io_failure", "off").expect("disable leader I/O failure");
+    assert_eq!(
+        leader_error.to_string(),
+        "injected leader WAL group I/O failure"
+    );
+
+    // Resume one caller at a time so the second checks the error preserved
+    // after the first stale caller has relinquished leadership.
+    for _ in 0..2 {
+        resume_tx
+            .send(())
+            .expect("resume stale caller after poison");
+        let error = finished_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("stale caller completes after the leader failure")
+            .expect_err("stale caller reports the poisoned ticket");
+        assert_eq!(error.to_string(), leader_error.to_string());
+    }
+    for caller in stale_callers {
+        caller.join().expect("stale caller thread joins");
+    }
+    wal.submit_and_commit(durable_ticket)
+        .expect("later poison must preserve the already-durable prefix");
+    assert!(
+        wal.put_batch(&[(b"rejected".as_slice(), b"value".as_slice())], 3)
+            .is_err(),
+        "poison must reject new writes"
+    );
+    assert!(wal.close().is_err(), "close reports the leader I/O poison");
+    scenario.teardown();
 }
 
 #[cfg(feature = "chaos-testing")]

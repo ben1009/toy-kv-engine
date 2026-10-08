@@ -2943,6 +2943,13 @@ impl Wal {
         captured_target: u64,
         profile: Option<&crate::mem_table::WriteProfile>,
     ) -> Result<Vec<TicketedBuf>> {
+        // Inject before any SQE submission so the drained buffers can be
+        // dropped safely while exercising normal leader error publication.
+        #[cfg(feature = "chaos-testing")]
+        crate::chaos::failpoint::fail_point!("wal.leader_group_io_failure", |_| Err(
+            anyhow::anyhow!("injected leader WAL group I/O failure")
+        ));
+
         #[cfg(not(feature = "bench"))]
         let _ = (captured_target, profile);
 
