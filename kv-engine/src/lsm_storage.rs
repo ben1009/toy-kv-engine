@@ -14640,11 +14640,13 @@ mod tests {
         engine.put(b"one", b"1").unwrap();
         engine.create_recovery_point().unwrap();
         engine.create_recovery_point().unwrap();
-        // Flush both frozen memtables: the one holding records is retired by a
-        // `FlushV3`, the empty one is dropped from the list without a record and
-        // keeps only its `NewPitrMemtable`.
-        engine.inner.force_flush_next_imm_memtable().unwrap();
-        engine.inner.force_flush_next_imm_memtable().unwrap();
+        // Flush all frozen memtables: those holding records are retired by a
+        // `FlushV3`, while empty ones keep only their `NewPitrMemtable` record.
+        // Size-triggered maintenance can rotate the segment before the explicit
+        // recovery points, leaving more than two frozen memtables.
+        while !engine.inner.state.load().imm_memtables.is_empty() {
+            engine.inner.force_flush_next_imm_memtable().unwrap();
+        }
         assert!(engine.inner.state.load().imm_memtables.is_empty());
         // Now the cleanup's live-memtable check cannot see it any more, so the
         // deferred reclaim is free to unlink the WAL its record still needs.
