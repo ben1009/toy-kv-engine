@@ -35,8 +35,11 @@ tradeoff, described in section 6.
 Existing files keep their format-specific recovery semantics: ordinary v4
 already defaults to Parallel; PITR v5/v6 and older MVCC files retain Leader;
 unframed files retain buffered I/O. New PITR segments use v7 after a durable
-rotation. This is a proposed format and adoption policy; the current writer
-still creates PITR v6. WAL remains optional through `enable_wal`.
+rotation when persisted capacity can support its recovery workspace. A healthy
+legacy database with insufficient capacity remains writable using v5/v6 Leader
+until an explicit capacity change permits migration (section 7.2). This is a
+proposed format and adoption policy; the current writer still creates PITR v6.
+WAL remains optional through `enable_wal`.
 
 ## 2. Findings from the existing RFCs and implementation
 
@@ -79,7 +82,7 @@ an equivalent generation protocol before extending the pipeline to PITR.
 | Legacy unframed | Buffered | Preserve legacy recovery. |
 | Older MVCC v2/v3 | Leader | Recover with the existing codec; successors use the current writer format. |
 | Ordinary v4 | Parallel | Preserve the existing contiguous valid-prefix recovery rule. |
-| PITR v5/v6 | Leader | Preserve strict recovery and each version's digest rule; seal before installing a v7 successor. |
+| PITR v5/v6 | Leader | Preserve strict recovery and each version's digest rule; preflight capacity before migration, or continue legacy Leader writes and rotations (section 7.2). |
 | PITR v7 | Parallel | Use typed frames and the single-sync frontier protocol specified here. |
 | Future registered formats | Parallel, unless an explicit RFC exception is accepted | Define and qualify parallel recovery, or the alternative protocol required by the documented constraint. |
 | Unknown versions | Reject | A higher version number is not evidence of compatibility. |
@@ -151,9 +154,11 @@ batch_bytes:u64 | batch_fragment[...]
 ```
 
 The fragment header leaves 4008 bytes per frame for logical batch bytes.
-A batch owns a contiguous, noninterleaved range of DATA frames. Fragment
-indices are exactly `0..fragment_count`; all fragments repeat its ticket,
-count, and total length. The count equals `ceil(batch_bytes / 4008)`; every
+A batch owns a contiguous, noninterleaved range of DATA frames. Each
+`fragment_index` MUST satisfy `0 <= fragment_index < fragment_count`, and
+the indices in physical order MUST cover `[0, fragment_count)` exactly once.
+All fragments repeat the batch's ticket, count, and total length.
+The count equals `ceil(batch_bytes / 4008)`; every
 nonfinal fragment carries 4008 batch bytes and the final one carries the exact
 remainder. `body_len` includes the 24-byte fragment header. The implementation
 checks all lengths before allocating or slicing and preserves the existing
@@ -179,8 +184,20 @@ The logical `prefix_digest(T)` is SHA-256 over the complete WAL header and
 each covered logical batch header/payload in ticket order. Fragment headers,
 FRONTIER frames, and alignment padding are excluded from this logical hash,
 but their canonical encoding and CRCs are validated separately.
-`E(T)`, named `durable_end` on disk, is the aligned end of the last covered
-DATA frame; `E(0) = 4096`. Earlier control frames can lie inside that range.
+`D(T)` is the aligned end of the last covered DATA frame. For a nonempty
+frontier, `E(T)`, named `durable_end` on disk, is the end of its verified
+physical prefix:
+
+```text
+E(T) = max(D(T), previous_frontier_offset + 4096)
+```
+
+The prefix `[4096, E(T))` MUST contain exactly the complete DATA batches with
+tickets in `[0, T)` and canonical earlier FRONTIER frames. It MUST NOT contain
+an incomplete batch or any DATA ticket at or above `T`. It may end with an
+earlier FRONTIER rather than DATA; those control bytes do not change the
+logical digest. Generation zero covers only the immutable header, so
+`E(0) = 4096`. Section 4.3 defines the required physical ordering.
 
 ### 4.3 FRONTIER frames and physical allocation
 
@@ -199,11 +216,24 @@ Generation zero is mandatory at offset 4096: `ticket_end = 0`,
 wal_header_digest`, and both previous-frontier fields are zero. The first
 DATA allocation therefore starts at 8192; an empty v7 image is 8192 bytes.
 
-During normal append, each frontier increments generation by one, binds the
-preceding frontier's offset and record digest, and strictly increases ticket
-end, durable end, and last commit timestamp. Every nonempty durable end must
-be the end of its last covered batch. The previous offset is aligned, names
-an earlier FRONTIER, and never forms a cycle.
+For every non-generation-zero FRONTIER `F`, the writer, decoder, and recovery
+validator MUST enforce all of the following against its named predecessor:
+
+```text
+F.previous_frontier_offset + 4096 <= F.durable_end <= F.frame_offset
+F.generation == prev.generation + 1
+F.ticket_end > prev.ticket_end
+F.durable_end > prev.durable_end
+F.last_commit_ts > prev.last_commit_ts
+```
+
+The previous offset MUST be aligned and name an earlier canonical FRONTIER
+in the same WAL incarnation; `previous_frontier_digest` MUST equal that
+frame's record digest. All arithmetic MUST be checked. The chain MUST terminate
+at the mandatory generation-zero frame and cannot contain a cycle.
+The `durable_end` formula and exact-prefix rules in section 4.2 also apply.
+In particular, the entire previous frontier MUST lie inside the current
+verified prefix; monotonic tickets or a valid CRC alone are insufficient.
 
 DATA ranges and FRONTIER slots use one checked physical allocator.
 Reservation of a frontier slot at the current allocation tail is serialized
@@ -226,6 +256,21 @@ Only D0 is covered. Neither `M` nor the physical EOF is the replay boundary.
 The marker's physical end, `M + 4096`, is the extent needed to retain its
 recovery evidence. Section 6 defines how to remove speculative DATA without
 destroying that evidence.
+
+A later frontier can retain the preceding marker at the end of its prefix:
+
+```text
+D0 | D1 | F_A(ticket_end=1, durable_end=end(D0)) |
+          F_B(ticket_end=2, durable_end=end(F_A))
+```
+
+After D1 completes, `F_B` covers D0 and D1 and retains all of `F_A`, even
+though D1's DATA end precedes `F_A`. This permits freeze/close to drain after
+admission has stopped without requiring a new DATA allocation. Until D1 is
+complete, no candidate covering it is eligible. More generally, a target
+whose required retained prefix includes DATA at or above its ticket end is
+ineligible; section 5.2 requires waiting for those already admitted tickets,
+or failing them under section 5.3.
 
 At most one nonempty frontier is appended per newly covered batch, giving
 `frontier_bytes <= 4096 * (1 + batch_count)` during normal append, including
@@ -275,11 +320,18 @@ No payload rescan is permitted in the stop-admission rotation section.
 ### 5.2 One ordered sync stage
 
 Let `T` be a captured exclusive ticket end no greater than the contiguous
-written frontier, and `E(T)` its aligned DATA end. The coordinator:
+written frontier, and `E(T)` its verified physical-prefix end from section 4.2.
+The coordinator:
 
 1. Confirms full write completion for every DATA fragment of every ticket
    below `T`. Short writes, missing CQEs, and ambiguous submission do not
-   count as completion.
+   count as completion. It MUST also verify that `[4096, E(T))` contains
+   exactly those tickets and canonical control frames, including the complete
+   previous FRONTIER, using ordered allocation/codec/completion metadata.
+   A target whose required retained prefix includes a ticket at or above `T`
+   is ineligible. Wait for the necessary already admitted tickets to complete
+   and capture an eligible target; never rely on future admission to make a
+   stopped-admission drain possible.
 2. Reserves a FRONTIER frame at the current physical allocation tail and
    writes exactly `(T, E(T), prefix_digest(T))` with the saved metadata and
    previous-frontier binding. It verifies full marker write completion.
@@ -298,6 +350,9 @@ runs. Incidental persistence of later bytes does not extend `T`.
 Capture the final `T` before marker construction; coalescing cannot enlarge
 its coverage during sync. Public sync, freeze, checkpoint, recovery-point,
 and close barriers retain fixed admission cutoffs.
+An eligible marker may cover additional already admitted tickets needed to
+retain its predecessor; this does not change a barrier's captured cutoff.
+An ineligible target cannot be acknowledged merely to satisfy that cutoff.
 
 One advance SHOULD cover multiple completed groups when available, sharing
 one marker and one WAL sync. The normal coalescing policy MUST document a
@@ -329,11 +384,15 @@ an active marker as a candidate until its covered prefix validates.
 
 An earlier durable boundary remains valid when a later DATA group fails.
 A healthy contiguous prefix below the earliest failed ticket may complete a
-marker/sync cycle under RFC 024's poison rules; it cannot cross a failed or
-uncertain group. A failed marker/sync cycle cannot be followed by another
-acknowledged cycle in that runtime. Buffers remain owned until terminal CQEs
-or proven safe teardown and until any required hash consumption completes.
-A later failure never changes acknowledged outcomes.
+marker/sync cycle under RFC 024's poison rules only if it also satisfies the
+retained-prefix eligibility rule in section 5.2. It cannot cross a failed or
+uncertain group. If retaining the previous FRONTIER would include such a
+group, fail the remaining unacknowledged waiters; do not wait indefinitely
+for an eligible marker after admission has stopped. A failed marker/sync
+cycle cannot be followed by another acknowledged cycle in that runtime.
+Buffers remain owned until terminal CQEs or proven safe teardown and until
+any required hash consumption completes. A later failure never changes
+acknowledged outcomes.
 
 After a process-only restart, complete DATA and FRONTIER bytes may still be
 readable in cache without having reached stable storage. Buffered writeback
@@ -367,9 +426,12 @@ optimizations, not recovery authority.
 
 A candidate must be a complete canonical FRONTIER with the correct header
 binding, actual offset, CRC, valid bounds, and a valid previous-frontier chain
-back to generation zero. Follow previous offsets only after validating the
-current frame; they accelerate chain checks but cannot locate a torn last
-marker whose pointer is unreadable. Backward discovery remains the fallback.
+back to generation zero. Decoder and recovery MUST enforce section 4.3's
+physical-prefix containment, generation, ticket, end, timestamp, and predecessor
+digest invariants for every nonzero generation. Follow previous offsets only
+after validating the current frame; they accelerate chain checks but cannot
+locate a torn last marker whose pointer is unreadable. Backward discovery
+remains the fallback.
 Never accept a foreign frame or marker-shaped DATA payload.
 Memoize chain checks by physical offset rather than walking the complete
 chain anew for every candidate.
@@ -377,17 +439,20 @@ chain anew for every candidate.
 For each candidate, validate the complete physical prefix `[0, durable_end)`:
 all DATA fragments, exact ticket order, logical batch CRCs and canonical
 operation encoding, zero padding, timestamp/recorded-time ordering, and every
-interspersed control frame. Compare its exact covered count, DATA end,
-last timestamp, and logical prefix digest. Validate intermediate frontiers
-against their own named DATA prefixes, even when speculative DATA physically
-precedes those markers. Every frontier in a candidate's chain must have a
-valid covered DATA prefix, including chain frames outside its DATA end.
+interspersed control frame. Compare its exact covered count, verified
+physical-prefix end, last timestamp, and logical prefix digest, including
+section 4.2's `E(T)` formula. Validate intermediate frontiers against their
+own named prefixes, even when speculative DATA physically precedes those
+markers. Every frontier in a candidate's chain must have a valid covered
+prefix; all predecessors lie wholly within the candidate's retained prefix.
 
-Use bounded candidate metadata sorted by named DATA boundary and one streaming
-forward verification pass with incremental hashes. Stop usable DATA-prefix
-advancement at the first invalid physical frame; no candidate crossing it can
-validate. Do not rescan the whole prefix separately for every marker. Bound
-metadata by the maximum frame count and use checked allocations.
+Use bounded candidate metadata sorted by named physical-prefix boundary and
+one streaming forward verification pass with incremental hashes. Track prefix
+ends after complete control frames as well as DATA batches; a trailing FRONTIER
+advances the verified physical end without feeding the logical digest. Stop
+usable prefix advancement at the first invalid physical frame; no candidate
+crossing it can validate. Do not rescan the whole prefix separately for every
+marker. Bound metadata by the maximum frame count and use checked allocations.
 
 Choose the newest fully validated candidate by physical marker offset.
 A checksum-invalid/torn marker or a complete marker with an invalid covered
@@ -399,11 +464,38 @@ permission to reinterpret unread bytes as an interrupted suffix.
 
 ### 6.2 Durable anchors and the explicit fault model
 
-A durable source-manifest or checkpoint reference that claims a WAL boundary
-is a hard floor. Validate its segment identity, ticket/count, covered end,
-timestamp, and digest as applicable; a candidate below or conflicting with
-that claim cannot be accepted. Durable Sealing intent fixes its complete
-physical image, including `sealed_end` and terminal frontier binding.
+A durable source-manifest or checkpoint reference that claims an Active WAL
+boundary MUST persist a logical anchor with these fields:
+
+```text
+ActiveDurableAnchor = (
+    timeline, archive_epoch, segment_id, incarnation,
+    ticket_end, durable_end, last_commit_ts, prefix_digest
+)
+```
+
+This is a hard floor. Recovery MUST validate the exact anchored boundary,
+including its identity and logical digest, within any accepted candidate's
+prefix. A later candidate must contain that verified boundary; merely having
+a greater ticket or timestamp is insufficient. A candidate below or
+conflicting with the anchor cannot be accepted.
+An Active durable anchor MUST NOT require a physical `frontier_offset`,
+generation, or frontier record digest. Section 6.3 can relocate and rechain
+the selected marker while preserving the immutable header and exact logical
+anchor; those physical marker fields are not stable Active identity.
+
+Durable Sealing intent and Sealed/immutable references instead bind the
+frozen physical image:
+
+```text
+ImmutableBoundary = (
+    ActiveDurableAnchor, sealed_end, terminal_frontier_digest, wal_digest
+)
+```
+
+The terminal marker offset is `sealed_end - 4096`. These references MUST
+validate the complete image and terminal certificate, forbid fallback and
+normalization, and retain the strict archive/index checks in section 7.1.
 A conflicting durable seal/catalog reference is corruption, never an excuse
 to lower the boundary. Allocation-only timestamp high-water marks still
 prevent timestamp reuse and do not invent a claim that an unmarked DATA batch
@@ -432,7 +524,9 @@ The selected boundary remains provisional. Stop new admission, retire old
 I/O ownership, and hold the exclusive recovery lock. Never truncate the
 original file to `durable_end` and sync it before installing a replacement
 certificate: its selected FRONTIER may lie after speculative DATA and would
-be erased, leaving a second crash with no certificate for acknowledged data.
+be erased, leaving a second crash with no certificate for the selected boundary.
+A retained predecessor certifies an older ticket end; it cannot prove the
+newly selected boundary on its own.
 
 Normalize an Active image in a fresh temporary inode in the same directory:
 
@@ -441,9 +535,12 @@ Normalize an Active image in a fresh temporary inode in the same directory:
    DATA offsets and all complete control frames inside the retained prefix.
 2. Append a recovery FRONTIER at `durable_end` naming the accepted ticket
    end, last timestamp, and logical digest. Link it to the last retained
-   frontier, with generation one greater than that retained frame. If empty,
+   frontier, with generation one greater than that retained frame. Its complete
+   predecessor MUST be inside the copied prefix, and the replacement MUST
+   satisfy section 4.3 while preserving the exact `ActiveDurableAnchor`.
+   The prefix may end with that predecessor rather than DATA. If empty,
    emit the original generation-zero frame at 4096 instead.
-   Older markers outside the retained prefix and all speculative DATA are
+   The old selected marker and every frame outside the retained prefix are
    omitted. Generation numbers may be reused only by this exclusive
    replacement of discarded frames; tickets and commit timestamps retain
    their recovered meaning.
@@ -515,13 +612,12 @@ selection, and index validation must become format-specific. The v7 WAL digest
 is the exact physical-image hash from section 4.4; its count equals the
 terminal ticket end and its index names the first DATA frame of each batch.
 
-Sealing intent must persist enough versioned metadata to fix the logical
-boundary and physical certificate: ticket end, DATA end, last timestamp,
-logical prefix digest, sealed end, terminal frontier digest, and final WAL
-digest. Extend source-manifest records/versioning explicitly if the current
-schema cannot represent them. A recovered Sealing obligation validates all
-frames and its terminal marker against this intent and any durable seal; it
-cannot fall back, promote an unmarked suffix, or rewrite that physical image.
+Sealing intent MUST persist the complete `ImmutableBoundary` from section 6.2:
+the logical `ActiveDurableAnchor`, sealed end, terminal frontier digest, and
+final WAL digest. Extend source-manifest records/versioning explicitly if the
+current schema cannot represent them. A recovered Sealing obligation validates
+all frames and its terminal marker against this intent and any durable seal;
+it cannot fall back, promote an unmarked suffix, or rewrite that physical image.
 
 After seal and Sealed source-manifest publication are durable, the immutable
 WAL/seal pair supplies the recovery boundary. FRONTIER frames stay in the WAL;
@@ -535,14 +631,50 @@ an Active WAL must pin its identity and selected certificate consistently,
 copy through that marker's physical end, and include all its covered DATA.
 A bare copy stopping at `durable_end` is insufficient. Prefer the existing
 freeze/seal capture protocol; a seal temporary cannot bypass Active recovery.
+Any physical marker offset/digest pinned by an Active-copy helper is transient
+copy bookkeeping, not a persisted Active durable anchor. Persisted Active
+references MUST use section 6.2's logical tuple; physical-image authority
+requires the durable Sealing/immutable transition.
 
 ### 7.2 Existing databases
 
-Reopen reads v5/v6 with their current strict scanners and digest rules. Before
-accepting a new PITR write, it completes recovery and sealing of the old active
-segment using Leader, installs a v7 successor durably, then starts Parallel.
-The successor names the predecessor's actual WAL/seal digests, allowing mixed
-v5/v6/v7 archive chains without rewriting old bytes or beginning a new epoch.
+Reopen reads v5/v6 with their current strict scanners and digest rules.
+Before committing a migration, it MUST preflight the persisted capacity
+configuration and reserve the transition's maintenance space. The budget
+must support the largest permitted v7 physical image and its fresh-inode
+recovery workspace, existing obligations and pinned/orphan allocations, and
+successor, seal/index, and terminal manifest headroom. Checking only the
+current short WAL or an empty 8192-byte successor is insufficient. This
+preflight and the transition reservations MUST precede durable migration
+Sealing intent; section 7.3 governs ongoing reservations.
+
+If a healthy legacy database's capacity cannot support v7, reopen MUST succeed
+with the existing v5/v6 Active WAL using Leader, subject to its existing
+recovery and capacity rules. PITR writes remain enabled; normal legacy
+rotations create v6 Leader successors until v7 capacity becomes eligible.
+Report migration deferral, its reason, and required/available capacity in
+status. Do not silently raise spool limits, lower the configured segment
+maximum, or disable PITR writes to force an upgrade.
+For example, a persisted 1 GiB segment maximum and 1.3 GiB source-spool limit
+cannot budget two maximum-size images plus maintenance; upgrading the binary
+alone MUST leave that otherwise healthy legacy database on Leader.
+
+Capacity changes follow RFC 023's persisted safety-configuration rules:
+limits are immutable within an archive epoch, and `resume_pitr` cannot override
+them. Increasing them requires clean disable followed by enablement with a
+new epoch and base. Once suitable capacity is durably configured, enablement
+or the next eligible rotation/migration installs v7. With unchanged eligible
+capacity, migration completes recovery and sealing of the old active segment
+using Leader, installs a v7 successor durably, then accepts new PITR writes
+using Parallel. That successor names the predecessor's actual WAL/seal
+digests, allowing mixed v5/v6/v7 archive chains without rewriting old bytes
+or beginning a new epoch solely for the format change.
+
+New PITR enablement MUST reject insufficient v7 capacity before durable enable
+or migration intent; it does not create a legacy fallback writer. An already
+installed Active v7 WAL MUST fail reopen if its required recovery workspace
+cannot be obtained, rather than downgrade to v6 or skip recovery installation.
+Legacy capacity deferral is not an exception to the v7 Parallel default.
 Enablement on an ordinary database retains RFC 023's epoch/base requirements.
 
 Interrupted migration follows the source-manifest Active/Sealing/Sealed state
@@ -583,10 +715,14 @@ A fully occupied spool cannot make recovery depend on unreserved space.
 Per-segment/maintenance headroom also includes generation zero, successor
 creation, seal/index temporary files, and terminal manifest work. Configurations
 unable to represent one admissible batch plus marker, recovery workspace, and
-successor/terminal headroom fail explicitly. Migration cannot silently enlarge
+successor/terminal headroom MUST reject new v7 enablement/migration explicitly.
+For a healthy v5/v6 database, migration preflight failure instead defers the
+upgrade and retains legacy Leader service as specified in section 7.2.
+Insufficient workspace for an already installed v7 recovery fails reopen;
+it cannot trigger a legacy downgrade. Migration cannot silently enlarge
 persisted limits. Count/capacity exhaustion triggers rotation before admission.
-Physical reservation release follows existing allocation verification,
-durable cleanup, and pin-release rules.
+Physical reservation release follows existing allocation verification, durable
+cleanup, and pin-release rules.
 
 ## 8. Implementation and default activation
 
@@ -602,10 +738,12 @@ Implement in reviewable stages:
    single-sync coordinator, marker/recovery reservations, fixed sync/close/
    freeze cutoffs, and async ownership.
 4. Extend Sealing intent, archive/catalog verification, restore, backup,
-   repair, and crash-safe v5/v6-to-v7 migration.
+   repair, logical Active anchors, and crash-safe v5/v6-to-v7 migration with
+   capacity preflight and writable legacy deferral.
 5. After correctness coverage is complete, switch the current PITR writer to
-   v7 and activate Parallel in every default constructor and successor path.
-   Update current-behavior docs and record the new adoption measurements.
+   v7 and activate Parallel in every eligible default constructor and successor
+   path, preserving section 7.2's legacy capacity deferral. Update
+   current-behavior docs and record the new adoption measurements.
 
 Intermediate commits may expose v7 through a development selector.
 A released default writer must support Parallel or name the accepted format
@@ -626,6 +764,13 @@ Correctness is an activation requirement. Cover at least:
   noncanonical/foreign frames, overflow checks, multi-SQE groups, and physical
   allocation races between DATA and FRONTIER, including a marker separating
   two DATA ranges in one group without being overwritten by packing.
+- FRONTIER physical-prefix containment, exact generation increments, strict
+  ticket/end/timestamp monotonicity, and predecessor digest binding. Recompute
+  CRCs on malformed fixtures so rejection exercises the explicit invariants.
+  Cover prefixes ending with an earlier FRONTIER and the stopped-admission
+  `D0 | D1 | F_A(D0) | F_B(D0,D1)` drain without a new ticket. Exercise
+  ineligible targets that would retain speculative DATA and terminal failure
+  of unacknowledged waiters when poison prevents an eligible marker.
 - Out-of-order groups; short/negative/stale/missing CQEs; partial/ambiguous
   submission; an earlier healthy prefix finishing while a later group fails;
   buffer ownership and poisoned close.
@@ -641,6 +786,11 @@ Correctness is an activation requirement. Cover at least:
 - Hard manifest/Sealing floors, conflicting seals, and strict immutable
   validation; no fallback on read errors or below known durable boundaries.
   Include post-sync damage cases documenting Active v7's detection limits.
+- Logical Active anchors surviving marker relocation/rechaining and repeated
+  normalization. Reject wrong identity/incarnation, ticket, physical-prefix
+  end, timestamp, or logical digest, including a higher candidate that does
+  not verify an anchored prefix. Sealing/Sealed references must reject any
+  physical image or terminal-marker mismatch and prohibit normalization.
 - Recovery after a failed sync with cached complete DATA/FRONTIER and clean
   page state: force fresh writes, including the unchanged-length case.
   Fail copy/sync/replace/directory-sync and crash at each recovery step.
@@ -653,6 +803,14 @@ Correctness is an activation requirement. Cover at least:
   seal-index exhaustion, marker reservations, recovery temporary/orphan
   allocation, and no full-spool maintenance/reopen deadlock.
   Tests arming failpoints follow the repository's `failpoint_*` rule.
+- Insufficient legacy persisted capacity: successful reopen, continued PITR
+  writes, v6 Leader rotations, and visible migration-deferral reasons. Cover
+  the 1 GiB/1.3 GiB case, maximum-image rather than current-length preflight,
+  pinned/orphan obligations, and all transition reservations. Verify eligible
+  migration after an explicit RFC 023 capacity transition, rejection of
+  insufficient new v7 enablement before durable intent, no implicit limit
+  overrides, and no legacy downgrade after durable Sealing intent or v7
+  installation. Missing workspace for installed v7 must fail reopen.
 
 The normal protocol adds a marker write but retains **one** WAL sync per
 durability advance. Physical framing, two hash streams, marker allocation,
@@ -730,8 +888,9 @@ results before activation, following the
 - **Scan raw aligned payload for magic without typed DATA frames.** User bytes
   can resemble a marker. Codec-owned frame headers disambiguate physical
   control records.
-- **Truncate the original WAL to the accepted DATA end immediately.** This can
-  erase the only valid certificate before another crash. The initial protocol
+- **Truncate the original WAL to the accepted prefix end immediately.** This
+  erases the selected boundary's certificate before another crash; a retained
+  predecessor certifies only an older boundary. The initial protocol
   replaces a synced fresh image; its recovery latency and workspace cost are
   explicit. An alternative that retains old certificates or avoids full copying
   needs its own failure/writeback proof and crash qualification.

@@ -12,6 +12,10 @@ the default for future WAL formats, with narrowly documented exceptions. PITR
 v7 embeds DATA/FRONTIER frames in the WAL and uses one sync per durability
 advance. Active recovery validates candidate prefixes and permits fallback
 above durable manifest boundaries; sealing/archive validation remains strict.
+Active anchors bind the logical boundary and survive marker relocation;
+Sealing binds the frozen physical image. Legacy PITR databases lacking v7
+recovery capacity keep Leader writes and rotations until an explicit capacity
+transition permits migration.
 The proposal has not changed the current format defaults above.
 
 Dated filenames identify individual measurements and follow-ups. The
