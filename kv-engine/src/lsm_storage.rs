@@ -3450,6 +3450,11 @@ impl KvEngine {
                 .ok_or_else(|| anyhow!("PITR state has no active segment"))?;
             let successor_segment_id = state.next_segment_id;
             let (seal, wal_path, seal_path) = self.inner.write_pitr_seal_for_active_wal()?;
+            #[cfg(feature = "chaos-testing")]
+            crate::chaos::failpoint::fail_point!(
+                "pitr.after_active_seal_before_seal_started",
+                |_| Err(anyhow!("injected PITR failure after active WAL seal"))
+            );
             ensure!(
                 seal.header.segment_id.0 == active_segment_id,
                 "active WAL segment identity does not match PITR state"
@@ -3803,6 +3808,76 @@ impl KvEngine {
                 Err(anyhow!("background PITR publication is unknown"))
             }
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn archive_active_pitr_segment_before_forced_freeze(&self) -> Result<()> {
+        #[cfg(feature = "chaos-testing")]
+        crate::chaos::failpoint::fail_point!("pitr.before_forced_freeze_boundary");
+        let _operation_guard = self.pitr_operation_lock.lock();
+        let active = self.inner.state.load();
+        if !active.memtable.uses_wal_v5() || active.memtable.is_empty() {
+            return Ok(());
+        }
+        drop(active);
+
+        let state = self.pitr_manifest_state.lock().clone();
+        match state.mode {
+            crate::pitr::manifest::PitrMode::Disabled => return Ok(()),
+            crate::pitr::manifest::PitrMode::Enabled
+            | crate::pitr::manifest::PitrMode::PublicationUncertain => {}
+            _ => {
+                return Err(anyhow!(
+                    "PITR must be resumed before forcing a freeze of its active segment"
+                ));
+            }
+        }
+        let segment_id = state
+            .active_segment_id
+            .ok_or_else(|| anyhow!("PITR state has no active segment"))?;
+        self.run_pitr_maintenance(segment_id)?;
+
+        // A concurrent maintenance pass may have advanced the active ID just
+        // before this call acquired the barrier. In that case its first call is
+        // a no-op, so give the current boundary one chance to reconcile any
+        // obligation the other pass left behind.
+        let state = self.pitr_manifest_state.lock().clone();
+        if matches!(
+            state.mode,
+            crate::pitr::manifest::PitrMode::Enabled
+                | crate::pitr::manifest::PitrMode::PublicationUncertain
+        ) && (state.mode == crate::pitr::manifest::PitrMode::PublicationUncertain
+            || state.obligations.values().any(|obligation| {
+                obligation.state != crate::pitr::manifest::ObligationState::Reclaimable
+            }))
+        {
+            let current_segment_id = state
+                .active_segment_id
+                .ok_or_else(|| anyhow!("PITR state has no active segment"))?;
+            self.run_pitr_maintenance(current_segment_id)?;
+        }
+
+        // A v5 WAL can only be rotated together with its recovery-point
+        // boundary. If maintenance returned without sealing this non-empty
+        // segment, do not let the caller fall through to a plain memtable
+        // freeze and strand the segment outside the archive chain.
+        let active = self.inner.state.load();
+        let state = self.pitr_manifest_state.lock().clone();
+        ensure!(
+            !active.memtable.uses_wal_v5()
+                || active.memtable.is_empty()
+                || state.mode == crate::pitr::manifest::PitrMode::Disabled
+                || state.active_segment_id != Some(segment_id),
+            "PITR maintenance did not establish a segment boundary before forced freeze"
+        );
+        ensure!(
+            state.mode == crate::pitr::manifest::PitrMode::Disabled
+                || state.obligations.values().all(|obligation| {
+                    obligation.state == crate::pitr::manifest::ObligationState::Reclaimable
+                }),
+            "PITR archive obligations remain pending before forced freeze"
+        );
+        Ok(())
     }
 
     /// Close the engine only after the final PITR boundary is durable.
@@ -4166,7 +4241,48 @@ impl KvEngine {
         use_hard_links: bool,
     ) -> Result<crate::backup::BackupInfo> {
         let _barrier = self.pitr_barrier_lock.lock();
-        let mut state = self.pitr_manifest_state.lock().clone();
+
+        self.publish_pitr_base_locked(repository, use_hard_links)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn publish_pitr_base_locked(
+        &self,
+        repository: &std::path::Path,
+        use_hard_links: bool,
+    ) -> Result<crate::backup::BackupInfo> {
+        let metadata = self.prepare_pitr_base_locked()?;
+
+        self.create_pitr_base_backup(
+            crate::backup::BackupOptions {
+                repository: repository.to_path_buf(),
+                use_hard_links,
+            },
+            metadata,
+        )
+    }
+
+    #[cfg(target_os = "linux")]
+    fn prepare_pitr_base_locked(&self) -> Result<crate::pitr::base::PitrBaseMetadata> {
+        // Callers can decide to publish before acquiring the barrier. A
+        // disable in that gap must be rejected before stopping admission,
+        // because the disabled engine is already allowed to accept writes.
+        let state = self.pitr_manifest_state.lock().clone();
+        ensure!(
+            state.mode == crate::pitr::manifest::PitrMode::Enabled
+                && state.repository_id.is_some()
+                && state.timeline_id.is_some()
+                && state.archive_epoch_id.is_some()
+                && state.active_segment_id.is_some()
+                && state.predecessor_anchor.is_some(),
+            "PITR base cannot be published: the lifecycle is now {:?} and no longer carries \
+             the segment the base is anchored to",
+            state.mode
+        );
+        ensure!(
+            !self.pitr_publication_unknown.load(Ordering::Acquire),
+            "PITR base cannot be published while a manifest transition has an unknown outcome"
+        );
         let observed = crate::pitr::RecordedAt::from_system_time(std::time::SystemTime::now())?;
         let observed = crate::pitr::manifest::PersistedRecordedAt {
             secs: observed.secs,
@@ -4191,7 +4307,24 @@ impl KvEngine {
                 return Err(error);
             }
         };
-        sequencer.resume_commit_admission();
+        // A resumed engine can still have committed data in its active v5
+        // WAL when its first base is missing. Seal it under the barrier we
+        // already own, rather than letting checkpoint capture enter a second
+        // lifecycle operation. Keep admission closed through physical capture
+        // so the base metadata and SST contents describe the same boundary.
+        if !self.inner.state.load().memtable.is_empty() {
+            match self.create_recovery_point_locked(false)? {
+                crate::pitr::api::RecoveryPointOutcome::Durable(_) => {}
+                crate::pitr::api::RecoveryPointOutcome::CommitPublishedButNotDurable {
+                    error,
+                    ..
+                } => return Err(anyhow!(error)),
+                crate::pitr::api::RecoveryPointOutcome::PublicationUnknown { .. } => {
+                    return Err(anyhow!("PITR base boundary publication is unknown"));
+                }
+            }
+        }
+        let mut state = self.pitr_manifest_state.lock().clone();
         let included_commit_ts = (latest_commit_ts != 0).then_some(latest_commit_ts);
         let indexed_anchor = state
             .last_commit_anchor
@@ -4236,11 +4369,9 @@ impl KvEngine {
             self.inner.options.serializable,
             self.inner.vlog.is_some(),
         );
-        // The identity is read under the barrier, but the decision to publish was
-        // taken before it - by callers that had released the barrier, or that
-        // never held it. A disable landing in that gap clears all of this, and a
-        // base cannot be published for an engine that is no longer enabled, so
-        // report that rather than unwrapping a state the transition emptied.
+        // Read the boundary identity from the refreshed lifecycle after sealing
+        // any recovered active WAL. It must describe the empty successor that
+        // checkpoint capture validates under the same barrier.
         let (
             Some(repository_id),
             Some(timeline_id),
@@ -4275,13 +4406,8 @@ impl KvEngine {
             wal_replay_version: crate::pitr::base::PITR_BASE_WAL_REPLAY_VERSION,
             compatibility_digest,
         };
-        self.create_pitr_base_backup(
-            crate::backup::BackupOptions {
-                repository: repository.to_path_buf(),
-                use_hard_links,
-            },
-            metadata,
-        )
+
+        Ok(metadata)
     }
 
     #[cfg(target_os = "linux")]
@@ -4375,10 +4501,12 @@ impl KvEngine {
         &self,
         options: &crate::backup::BackupOptions,
     ) -> Result<Option<crate::backup::BackupInfo>> {
+        let _operation_guard = self.pitr_operation_lock.lock();
+        let _barrier = self.pitr_barrier_lock.lock();
         if self.pitr_manifest_state.lock().mode != crate::pitr::manifest::PitrMode::Enabled {
             return Ok(None);
         }
-        match self.create_recovery_point_inner(false)? {
+        match self.create_recovery_point_locked(false)? {
             crate::pitr::api::RecoveryPointOutcome::Durable(_) => {}
             crate::pitr::api::RecoveryPointOutcome::CommitPublishedButNotDurable {
                 error, ..
@@ -4389,19 +4517,28 @@ impl KvEngine {
                 return Err(anyhow!("PITR backup boundary publication is unknown"));
             }
         }
-        let result = self.publish_pitr_base(&options.repository, options.use_hard_links);
-        // The recovery point above is durable whichever way this went - the match
-        // refuses every other outcome - so admission reopens either way. What
-
-        // failed is the base capture, and `resume_pitr` publishes a base for an
-        // engine that has none. Leaving admission stopped instead would reject
-        // every write until the database is reopened, over a lifecycle that is
-        // otherwise settled and needs no reconciliation.
-        self.inner
-            .mvcc
-            .as_ref()
-            .ok_or_else(|| anyhow!("PITR backup requires MVCC"))?
-            .resume_commit_admission();
+        #[cfg(feature = "chaos-testing")]
+        crate::chaos::failpoint::fail_point!("pitr.before_backup_base_boundary");
+        // GC can populate the successor while ordinary admission is stopped.
+        // Preparation then seals another boundary; its failures must propagate
+        // without reopening admission, even if SealStarted is not persisted.
+        let metadata = self.prepare_pitr_base_locked()?;
+        let result = self.create_pitr_base_backup(options.clone(), metadata);
+        // A clean physical capture failure does not invalidate the prepared
+        // durable boundary. Reopen admission only when archive work is settled.
+        let state = self.pitr_manifest_state.lock();
+        if state.mode == crate::pitr::manifest::PitrMode::Enabled
+            && !self.pitr_publication_unknown.load(Ordering::Acquire)
+            && state.obligations.values().all(|obligation| {
+                obligation.state == crate::pitr::manifest::ObligationState::Reclaimable
+            })
+        {
+            self.inner
+                .mvcc
+                .as_ref()
+                .ok_or_else(|| anyhow!("PITR backup requires MVCC"))?
+                .resume_commit_admission();
+        }
         result.map(Some)
     }
 
@@ -4581,27 +4718,18 @@ impl KvEngine {
     }
 
     /// Only call this in test cases due to race conditions
+    ///
+    /// When PITR is enabled, an active v5 WAL is sealed and archived as a
+    /// recovery-point boundary before its memtable is flushed.
     pub fn force_flush(&self) -> Result<()> {
-        crate::profile_scope!("kv.force_flush", {
-            if self.inner.state.load().immutable_file_metadata.is_empty() {
-                self.inner.ensure_manifest_v7()?;
-            }
-            let _checkpoint_guard = self.inner.checkpoint_lock.lock();
-            if !self.inner.state.load().memtable.is_empty() {
-                self.inner
-                    .force_freeze_memtable(&self.inner.state_lock.lock())?;
-            }
-            if !self.inner.state.load().imm_memtables.is_empty() {
-                self.inner.force_flush_next_imm_memtable()?;
-            }
-
-            Ok(())
-        })
+        crate::profile_scope!("kv.force_flush", self.inner.force_flush())
     }
 
     /// Flush all memtables (current + all immutable) to SSTs.
     /// Unlike `force_flush()` which only flushes one immutable memtable,
     /// this drains the entire queue.
+    /// When PITR is enabled, each active v5 WAL is sealed and archived before
+    /// its memtable is flushed.
     ///
     /// # Warning
     /// Inherits the same race conditions as [`Self::force_flush`] — only use in
@@ -5491,15 +5619,8 @@ impl KvEngine {
             .blocking
             .run_result(move || {
                 let _guard = guard;
-                let _checkpoint_guard = inner.checkpoint_lock.lock();
-                if !inner.state.load().memtable.is_empty() {
-                    inner.force_freeze_memtable(&inner.state_lock.lock())?;
-                }
-                if !inner.state.load().imm_memtables.is_empty() {
-                    inner.force_flush_next_imm_memtable()?;
-                }
 
-                Ok(())
+                inner.force_flush()
             })
             .await
     }
@@ -5512,20 +5633,9 @@ impl KvEngine {
             .blocking
             .run_result(move || {
                 let _guard = guard;
-                let _checkpoint_guard = inner.checkpoint_lock.lock();
-                if !inner.state.load().memtable.is_empty() {
-                    inner.force_freeze_memtable(&inner.state_lock.lock())?;
-                }
-                if !inner.state.load().imm_memtables.is_empty() {
-                    inner.force_flush_next_imm_memtable()?;
-                }
+                inner.force_flush()?;
                 while !inner.state.load().imm_memtables.is_empty() {
-                    if !inner.state.load().memtable.is_empty() {
-                        inner.force_freeze_memtable(&inner.state_lock.lock())?;
-                    }
-                    if !inner.state.load().imm_memtables.is_empty() {
-                        inner.force_flush_next_imm_memtable()?;
-                    }
+                    inner.force_flush()?;
                 }
 
                 Ok(())
@@ -10878,13 +10988,22 @@ impl LsmStorageInner {
         }
         *retries += 1;
 
-        let _checkpoint_guard = self.checkpoint_lock.lock();
-        let state_lock = self.state_lock.lock();
-        let active = self.state.load_full();
+        let active = self.state.load();
         if Arc::ptr_eq(&active.memtable, expected_memtable) {
             drop(active);
-            self.force_freeze_memtable(&state_lock)
+            self.prepare_forced_memtable_freeze()
+                .context("failed to establish a PITR boundary before WAL rotation")?;
+            let _checkpoint_guard = self.checkpoint_lock.lock();
+            let state_lock = self.state_lock.lock();
+            let active_memtable_guard = self.active_memtable_lock.write();
+            let active = self.state.load();
+            if Arc::ptr_eq(&active.memtable, expected_memtable) {
+                self.force_freeze_memtable_for_explicit_flush_with_active_guard(
+                    &state_lock,
+                    &active_memtable_guard,
+                )
                 .context("failed to rotate full active WAL")?;
+            }
         }
 
         Ok(())
@@ -11603,6 +11722,77 @@ impl LsmStorageInner {
     pub fn force_freeze_memtable(&self, _state_lock_observer: &MutexGuard<'_, ()>) -> Result<()> {
         let active_memtable_guard = self.active_memtable_lock.write();
         self.force_freeze_memtable_with_active_guard(_state_lock_observer, &active_memtable_guard)
+    }
+
+    pub(crate) fn prepare_forced_memtable_freeze(&self) -> Result<()> {
+        #[cfg(target_os = "linux")]
+        {
+            let active = self.state.load();
+            if active.memtable.uses_wal_v5() && !active.memtable.is_empty() {
+                drop(active);
+                let engine = self
+                    .weak_engine
+                    .get()
+                    .and_then(std::sync::Weak::upgrade)
+                    .ok_or_else(|| anyhow!("PITR engine owner is not installed"))?;
+                engine.archive_active_pitr_segment_before_forced_freeze()?;
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let active = self.state.load();
+            if active.memtable.uses_wal_v5()
+                && !active.memtable.is_empty()
+                && self.pitr_state.lock().mode != crate::pitr::manifest::PitrMode::Disabled
+            {
+                return Err(anyhow!(
+                    "PITR boundary archival before forced freeze requires Linux"
+                ));
+            }
+        }
+
+        Ok(())
+    }
+
+    fn force_flush(&self) -> Result<()> {
+        if self.state.load().immutable_file_metadata.is_empty() {
+            self.ensure_manifest_v7()?;
+        }
+        // PITR base publication takes its lifecycle locks before checkpoint_lock.
+        // Establish our boundary in the same order, then recheck the active WAL
+        // under the state and writer guards before attempting a plain freeze.
+        self.prepare_forced_memtable_freeze()?;
+        let _checkpoint_guard = self.checkpoint_lock.lock();
+        {
+            let state_lock = self.state_lock.lock();
+            let active_memtable_guard = self.active_memtable_lock.write();
+            self.force_freeze_memtable_for_explicit_flush_with_active_guard(
+                &state_lock,
+                &active_memtable_guard,
+            )?;
+        }
+        if !self.state.load().imm_memtables.is_empty() {
+            self.force_flush_next_imm_memtable()?;
+        }
+
+        Ok(())
+    }
+
+    pub(crate) fn force_freeze_memtable_for_explicit_flush_with_active_guard(
+        &self,
+        state_lock_observer: &MutexGuard<'_, ()>,
+        active_memtable_guard: &ActiveMemtableWriteGuard<'_>,
+    ) -> Result<()> {
+        let state = self.state.load();
+        let should_force_freeze = !state.memtable.is_empty()
+            && (!state.memtable.uses_wal_v5()
+                || self.pitr_state.lock().mode == crate::pitr::manifest::PitrMode::Disabled);
+        drop(state);
+        if !should_force_freeze {
+            return Ok(());
+        }
+
+        self.force_freeze_memtable_with_active_guard(state_lock_observer, active_memtable_guard)
     }
 
     pub(crate) fn force_freeze_memtable_with_active_guard(
@@ -13518,6 +13708,357 @@ mod tests {
         .unwrap();
         reopened.put(b"after-resume", b"value").unwrap();
         reopened.close().unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    fn pitr_flush_test_engine(dir: &std::path::Path) -> Arc<KvEngine> {
+        let engine = KvEngine::open(
+            dir.join("db"),
+            LsmStorageOptions {
+                enable_wal: true,
+                ..LsmStorageOptions::default_for_test()
+            },
+        )
+        .unwrap();
+        engine
+            .enable_pitr(crate::pitr::api::PitrOptions {
+                repository: dir.join("repository"),
+                config: crate::pitr::api::PersistedPitrConfig {
+                    archive_interval: std::time::Duration::from_secs(3600),
+                    max_segment_bytes: 1 << 20,
+                    max_unarchived_bytes: 2 << 20,
+                    max_source_spool_bytes: 4 << 20,
+                },
+                runtime: crate::pitr::api::PitrRuntimeOptions::default(),
+            })
+            .unwrap();
+
+        engine
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pitr_forced_flush_and_checkpoint_preserve_archive_chain_on_reopen() {
+        let dir = tempdir().unwrap();
+        let engine = pitr_flush_test_engine(dir.path());
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        for operation in 0..4 {
+            let key = format!("flush-{operation}");
+            engine.put(key.as_bytes(), b"value").unwrap();
+            let before = engine.pitr_manifest_state.lock().active_segment_id;
+            match operation {
+                0 => engine.force_flush().unwrap(),
+                1 => engine.drain_flush().unwrap(),
+                2 => runtime.block_on(engine.force_flush_async()).unwrap(),
+                3 => runtime.block_on(engine.drain_flush_async()).unwrap(),
+                _ => unreachable!(),
+            }
+            assert_ne!(engine.pitr_manifest_state.lock().active_segment_id, before);
+            assert!(engine.inner.state.load().imm_memtables.is_empty());
+            assert_eq!(
+                LsmStorageInner::pitr_segment_of(&engine.inner.state.load().memtable),
+                engine.pitr_manifest_state.lock().active_segment_id
+            );
+        }
+        engine.put(b"checkpoint-key", b"checkpoint-value").unwrap();
+        let checkpoint_path = dir.path().join("checkpoint");
+        engine.create_checkpoint(&checkpoint_path).unwrap();
+        let checkpoint =
+            KvEngine::open(&checkpoint_path, LsmStorageOptions::default_for_test()).unwrap();
+        assert_eq!(
+            checkpoint.get(b"checkpoint-key").unwrap().as_deref(),
+            Some(b"checkpoint-value".as_slice())
+        );
+        checkpoint.close().unwrap();
+        engine.close().unwrap();
+        drop(engine);
+
+        let reopened = KvEngine::open(
+            dir.path().join("db"),
+            LsmStorageOptions {
+                enable_wal: true,
+                ..LsmStorageOptions::default_for_test()
+            },
+        )
+        .unwrap();
+        reopened.resume_pitr(dir.path().join("repository")).unwrap();
+        for operation in 0..4 {
+            assert_eq!(
+                reopened
+                    .get(format!("flush-{operation}").as_bytes())
+                    .unwrap()
+                    .as_deref(),
+                Some(b"value".as_slice())
+            );
+        }
+        assert_eq!(
+            reopened.get(b"checkpoint-key").unwrap().as_deref(),
+            Some(b"checkpoint-value".as_slice())
+        );
+        assert!(matches!(
+            reopened.create_recovery_point().unwrap(),
+            crate::pitr::api::RecoveryPointOutcome::Durable(_)
+        ));
+        reopened.close().unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pitr_base_publish_after_disable_keeps_write_admission_open() {
+        let dir = tempdir().unwrap();
+        let engine = pitr_flush_test_engine(dir.path());
+        engine.disable_pitr().unwrap();
+
+        // Model a publisher that made its decision before disable won the
+        // barrier. Reject that stale decision without pausing normal writes.
+        assert!(
+            engine
+                .publish_pitr_base(&dir.path().join("repository"), false)
+                .is_err()
+        );
+        assert!(
+            engine
+                .inner
+                .mvcc
+                .as_ref()
+                .unwrap()
+                .commit_admission_is_open()
+        );
+        engine.put(b"after-disable", b"value").unwrap();
+        assert_eq!(
+            engine.get(b"after-disable").unwrap().as_deref(),
+            Some(b"value".as_slice())
+        );
+        engine.close().unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pitr_backup_capture_error_reopens_admission_after_durable_boundary() {
+        let dir = tempdir().unwrap();
+        let engine = pitr_flush_test_engine(dir.path());
+        engine.put(b"before-backup", b"value").unwrap();
+        assert!(
+            engine
+                .create_pitr_base_for_backup(&crate::backup::BackupOptions {
+                    repository: dir.path().join("missing-repository"),
+                    use_hard_links: false,
+                })
+                .is_err()
+        );
+        assert!(
+            engine
+                .inner
+                .mvcc
+                .as_ref()
+                .unwrap()
+                .commit_admission_is_open()
+        );
+        engine.put(b"after-backup-error", b"value").unwrap();
+        engine.close().unwrap();
+    }
+
+    #[cfg(all(target_os = "linux", feature = "chaos-testing"))]
+    #[test]
+    fn failpoint_pitr_backup_failed_second_boundary_keeps_admission_closed() {
+        use crate::{chaos::failpoint::FailScenario, vlog::KvKind};
+        use std::sync::atomic::Ordering;
+
+        let scenario = FailScenario::setup();
+        let dir = tempdir().unwrap();
+        let engine = pitr_flush_test_engine(dir.path());
+        engine.put(b"before-backup", b"value").unwrap();
+        let commit_ts = engine.inner.mvcc.as_ref().unwrap().latest_commit_ts();
+        let gc_engine = Arc::clone(&engine);
+        fail::cfg_callback("pitr.before_backup_base_boundary", move || {
+            // GC can rewrite an existing version into the empty successor
+            // through CAS while ordinary commit admission remains stopped.
+            assert_eq!(
+                gc_engine
+                    .inner
+                    .compare_and_set_batch_at_ts(&[(
+                        b"before-backup".to_vec(),
+                        commit_ts,
+                        b"value".to_vec(),
+                        KvKind::Inline,
+                        b"value".to_vec(),
+                        KvKind::Inline,
+                    )])
+                    .unwrap(),
+                vec![true]
+            );
+            fail::cfg("pitr.after_active_seal_before_seal_started", "return").unwrap();
+        })
+        .unwrap();
+
+        let error = engine
+            .create_pitr_base_for_backup(&crate::backup::BackupOptions {
+                repository: dir.path().join("repository"),
+                use_hard_links: false,
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("failure after active WAL seal"));
+        let active = engine.inner.state.load().memtable.clone();
+        assert!(active.wal_path().unwrap().with_extension("seal").exists());
+        let state = engine.pitr_manifest_state.lock().clone();
+        assert_eq!(state.mode, crate::pitr::manifest::PitrMode::Enabled);
+        assert!(state.obligations.values().all(|obligation| {
+            obligation.state == crate::pitr::manifest::ObligationState::Reclaimable
+        }));
+        assert!(!engine.pitr_publication_unknown.load(Ordering::Acquire));
+        assert!(
+            !engine
+                .inner
+                .mvcc
+                .as_ref()
+                .unwrap()
+                .commit_admission_is_open(),
+            "a failed second boundary must keep admission closed even before SealStarted"
+        );
+        assert!(engine.put(b"after-failed-boundary", b"value").is_err());
+
+        fail::remove("pitr.before_backup_base_boundary");
+        fail::remove("pitr.after_active_seal_before_seal_started");
+        assert!(matches!(
+            engine.create_recovery_point().unwrap(),
+            crate::pitr::api::RecoveryPointOutcome::Durable(_)
+        ));
+        engine.put(b"after-retry", b"value").unwrap();
+        assert_eq!(
+            engine.get(b"before-backup").unwrap().as_deref(),
+            Some(b"value".as_slice())
+        );
+        engine.close().unwrap();
+        scenario.teardown();
+    }
+
+    #[cfg(all(target_os = "linux", feature = "chaos-testing"))]
+    #[test]
+    fn failpoint_pitr_flush_and_checkpoint_prepare_before_checkpoint_lock() {
+        use crate::chaos::failpoint::FailScenario;
+        use std::{sync::mpsc, time::Duration};
+
+        let scenario = FailScenario::setup();
+        let dir = tempdir().unwrap();
+        let engine = pitr_flush_test_engine(dir.path());
+        for checkpoint in [false, true] {
+            engine.put(b"before-capture", b"value").unwrap();
+            let (entered_tx, entered_rx) = mpsc::channel();
+            let (release_tx, release_rx) = mpsc::channel();
+            let release_rx = parking_lot::Mutex::new(release_rx);
+            fail::cfg_callback("pitr.before_forced_freeze_boundary", move || {
+                entered_tx.send(()).unwrap();
+                let _ = release_rx.lock().recv();
+            })
+            .unwrap();
+
+            // Model a base publisher that owns the lifecycle operation and
+            // still needs checkpoint_lock. The forced capture must leave that
+            // lock available while waiting to establish its PITR boundary.
+            let operation_guard = engine.pitr_operation_lock.lock();
+            let worker_engine = Arc::clone(&engine);
+            let checkpoint_path = dir.path().join("checkpoint");
+            let worker = std::thread::spawn(move || {
+                if checkpoint {
+                    worker_engine.create_checkpoint(checkpoint_path).map(|_| ())
+                } else {
+                    worker_engine.force_flush()
+                }
+            });
+            entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            let checkpoint_guard = engine
+                .inner
+                .checkpoint_lock
+                .try_lock()
+                .expect("PITR preparation must precede checkpoint_lock");
+            drop(checkpoint_guard);
+            drop(operation_guard);
+            release_tx.send(()).unwrap();
+            worker.join().unwrap().unwrap();
+            fail::remove("pitr.before_forced_freeze_boundary");
+        }
+        engine.close().unwrap();
+        scenario.teardown();
+    }
+
+    #[cfg(all(target_os = "linux", feature = "chaos-testing"))]
+    #[test]
+    fn failpoint_pitr_base_capture_seals_active_wal_without_reentering_locks() {
+        use crate::chaos::failpoint::FailScenario;
+        use std::{sync::mpsc, time::Duration};
+
+        let scenario = FailScenario::setup();
+        let dir = tempdir().unwrap();
+        let engine = pitr_flush_test_engine(dir.path());
+        engine.put(b"before-base", b"value").unwrap();
+        let before = engine.pitr_manifest_state.lock().active_segment_id;
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let release_rx = parking_lot::Mutex::new(release_rx);
+        fail::cfg_callback("checkpoint.after_sst_pin_before_copy", move || {
+            entered_tx.send(()).unwrap();
+            let _ = release_rx.lock().recv();
+        })
+        .unwrap();
+        let worker_engine = Arc::clone(&engine);
+        let repository_path = dir.path().join("repository");
+        let worker = std::thread::spawn(move || {
+            // resume_pitr owns this lock when publishing a missing base from
+            // recovered data in a nonempty v5 WAL.
+            let _operation_guard = worker_engine.pitr_operation_lock.lock();
+
+            worker_engine.publish_pitr_base(&repository_path, false)
+        });
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("base capture must not reenter PITR lifecycle locks");
+        assert!(engine.inner.state.load().memtable.is_empty());
+        assert_ne!(engine.pitr_manifest_state.lock().active_segment_id, before);
+        assert!(engine.put(b"during-base", b"value").is_err());
+        assert!(
+            !engine
+                .inner
+                .mvcc
+                .as_ref()
+                .unwrap()
+                .commit_admission_is_open()
+        );
+        release_tx.send(()).unwrap();
+        let info = worker.join().unwrap().unwrap();
+        fail::remove("checkpoint.after_sst_pin_before_copy");
+        engine
+            .inner
+            .mvcc
+            .as_ref()
+            .unwrap()
+            .resume_commit_admission();
+        engine.put(b"after-base", b"value").unwrap();
+
+        let repository =
+            crate::backup::BackupRepository::open(dir.path().join("repository")).unwrap();
+        let restored_path = dir.path().join("restored-base");
+        repository
+            .restore(
+                info.backup_id,
+                &restored_path,
+                LsmStorageOptions::default_for_test(),
+            )
+            .unwrap();
+        let restored =
+            KvEngine::open(&restored_path, LsmStorageOptions::default_for_test()).unwrap();
+        assert_eq!(
+            restored.get(b"before-base").unwrap().as_deref(),
+            Some(b"value".as_slice())
+        );
+        assert_eq!(restored.get(b"during-base").unwrap(), None);
+        assert_eq!(restored.get(b"after-base").unwrap(), None);
+        restored.close().unwrap();
+        drop(repository);
+        engine.close().unwrap();
+        scenario.teardown();
     }
 
     #[cfg(target_os = "linux")]
