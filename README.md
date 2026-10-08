@@ -457,6 +457,7 @@ requires both p95 and p99 to pass, and allows at most 5% regression per metric.
 - [022: Incremental Backup and Restore](rfcs/022-incremental-backup.md)
 - [023: Point-in-Time Recovery](rfcs/023-point-in-time-recovery.md)
 - [024: Dedicated WAL I/O Pipeline](rfcs/024-dedicated-wal-pipeline.md)
+- [025: Parallel WAL with Embedded Frontiers and One Sync (proposed)](rfcs/025-parallel-wal-embedded-frontiers.md)
 
 ## License
 

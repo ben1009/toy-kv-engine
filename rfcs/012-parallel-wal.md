@@ -17,6 +17,10 @@ v5/v6 and older MVCC formats retain leader I/O; legacy unframed WALs retain
 buffered I/O. See the
 [default adoption note](../docs/wal/rfc-024-parallel-wal-default-20261005.md).
 
+[RFC 025](025-parallel-wal-embedded-frontiers.md) proposes Parallel as the default
+for future formats, with narrowly documented exceptions. Its PITR v7 protocol
+embeds frontier frames and uses one WAL sync per durability advance.
+
 The remaining sections preserve the original proposal. For shipped behavior,
 see `kv-engine/src/wal.rs` and the WAL tests under `kv-engine/src/tests/`.
 

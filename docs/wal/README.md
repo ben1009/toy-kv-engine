@@ -7,6 +7,17 @@ v5/v6 and older MVCC WALs retain leader I/O; legacy unframed WALs retain
 buffered I/O. The full RFC performance gate remains unqualified; the reports
 retain measured revisions and failed controls.
 
+[RFC 025](../../rfcs/025-parallel-wal-embedded-frontiers.md) proposes Parallel as
+the default for future WAL formats, with narrowly documented exceptions. PITR
+v7 embeds DATA/FRONTIER frames in the WAL and uses one sync per durability
+advance. Active recovery validates candidate prefixes and permits fallback
+above durable manifest boundaries; sealing/archive validation remains strict.
+Active anchors bind the logical boundary and survive marker relocation;
+Sealing binds the frozen physical image. Legacy PITR databases lacking v7
+recovery capacity keep Leader writes and rotations until an explicit capacity
+transition permits migration.
+The proposal has not changed the current format defaults above.
+
 Dated filenames identify individual measurements and follow-ups. The
 [benchmark overview](benchmarks/rfc-024-parallel-wal-benchmark.md) connects
 the retained and rejected experiments.
@@ -17,6 +28,10 @@ the retained and rejected experiments.
 - [Parallel WAL Implementation Plan](rfc-024-parallel-wal-implementation-plan.md)
 - [Native async point-write integration](rfc-024-native-async-integration-20261005.md)
 - [Retire frozen parallel WAL runtimes](rfc-024-frozen-wal-retirement.md)
+
+## Proposed extensions
+
+- [RFC 025: Parallel WAL with Embedded Frontiers and One Sync](../../rfcs/025-parallel-wal-embedded-frontiers.md)
 
 ## Benchmarks and qualification
 
