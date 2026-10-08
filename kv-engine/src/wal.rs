@@ -2617,6 +2617,9 @@ impl Wal {
                 anyhow::bail!("WAL is poisoned due to a previous I/O error");
             }
 
+            #[cfg(feature = "chaos-testing")]
+            crate::chaos::failpoint::fail_point!("wal.before_leader_cas");
+
             // Try to become the leader via CAS.
             let is_leader = self
                 .submitting

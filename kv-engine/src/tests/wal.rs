@@ -333,6 +333,63 @@ fn test_parallel_v4_wal_concurrent_admission_drains_on_close() {
 
 #[cfg(feature = "chaos-testing")]
 #[test]
+fn failpoint_leader_wal_stale_submitter_skips_empty_drain() {
+    use crate::chaos::failpoint::FailScenario;
+
+    let scenario = FailScenario::setup();
+    let dir = tempdir().expect("create temporary WAL directory");
+    let Some(wal) = create_leader_wal_or_skip(&dir.path().join("stale-submitter.wal")) else {
+        return;
+    };
+    let wal = Arc::new(wal);
+    let first_ticket = wal
+        .put_batch(&[(b"first".as_slice(), b"value".as_slice())], 1)
+        .expect("admit first WAL batch");
+    let stale_ticket = wal
+        .put_batch(&[(b"stale".as_slice(), b"value".as_slice())], 2)
+        .expect("admit ticket for stale submitter");
+
+    let (paused_tx, paused_rx) = bounded(0);
+    let (resume_tx, resume_rx) = bounded(0);
+    fail::cfg_callback("wal.before_leader_cas", move || {
+        if thread::current().name() == Some("stale-wal-caller") {
+            paused_tx
+                .send(())
+                .expect("notify test that stale caller reached the CAS");
+            resume_rx
+                .recv()
+                .expect("wait for the test to resume the stale caller");
+        }
+    })
+    .expect("pause stale caller before leader CAS");
+
+    let stale_wal = Arc::clone(&wal);
+    let stale_caller = thread::Builder::new()
+        .name("stale-wal-caller".to_owned())
+        .spawn(move || stale_wal.submit_and_commit(stale_ticket))
+        .expect("spawn stale WAL caller");
+    paused_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("stale caller reaches the pre-CAS failpoint");
+
+    let leader_wal = Arc::clone(&wal);
+    let leader = thread::spawn(move || leader_wal.submit_and_commit(first_ticket));
+    let leader_result = leader.join().expect("leader thread joins");
+    resume_tx
+        .send(())
+        .expect("resume stale caller after the leader publishes durability");
+    let stale_result = stale_caller.join().expect("stale caller thread joins");
+    let close_result = wal.close();
+    scenario.teardown();
+
+    leader_result.expect("leader makes both tickets durable");
+    stale_result.expect("stale caller observes its already-durable ticket");
+    close_result.expect("close the WAL after both tickets are durable");
+    assert_eq!(wal.assigned_ticket_count(), 2);
+}
+
+#[cfg(feature = "chaos-testing")]
+#[test]
 fn failpoint_parallel_wal_fdatasync_failure_preserves_durable_prefix() {
     use crate::chaos::failpoint::{self, FailScenario};
 
