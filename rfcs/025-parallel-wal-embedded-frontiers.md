@@ -466,6 +466,17 @@ Active fallback may select an older valid candidate whose retained prefix
 excludes the offending frame, subject to all durable anchors. Sealing and
 immutable-image violations remain fatal under their strict validation rules.
 
+For an Active candidate, `[durable_end, candidate.frame_offset)` is speculative
+physical tail outside its retained prefix. DATA or canonical FRONTIER frames
+there MUST NOT participate in that candidate's prefix or single-chain validation;
+a stray FRONTIER in this interval does not by itself invalidate the candidate.
+Backward discovery may still evaluate that stray marker independently as another
+candidate. Normalization discards the entire interval and replaces the selected
+certificate at `durable_end` (section 6.3). This rule cannot bypass a durable
+anchor, ignore a read/I/O error, skip a FRONTIER inside the retained prefix,
+or relax strict Sealing/immutable-image validation. It does not authorize a
+live runtime to append another FRONTIER after a failed cycle (section 5.3).
+
 Use bounded candidate metadata sorted by named physical-prefix boundary and
 one streaming forward verification pass with incremental hashes. Track prefix
 ends after complete control frames as well as DATA batches; a trailing FRONTIER
@@ -810,6 +821,12 @@ Correctness is an activation requirement. Cover at least:
   and maximum preallocation. Torn final markers, invalid chains/pointers,
   bad covered DATA, and explicit fallback to older valid candidates.
   Verify that no acknowledged batch is lost under the stated sync guarantees.
+- A stray canonical FRONTIER in `[durable_end, candidate.frame_offset)`,
+  including otherwise valid frame CRC/digest fields: evaluate it independently
+  during discovery, allow an otherwise valid Active candidate whose prefix
+  excludes it, and omit it during normalization. Contrast with a fork/orphan
+  inside the retained prefix, a conflicting durable anchor, a read/I/O error,
+  and strict Sealing/archive validation; none may be bypassed by this rule.
 - Hard manifest/Sealing floors, conflicting seals, and strict immutable
   validation; no fallback on read errors or below known durable boundaries.
   Include post-sync damage cases documenting Active v7's detection limits.
