@@ -519,7 +519,7 @@ the captured prefix must survive even if no publication or ACK followed.
 | Successful sync before publication/ACK | Crash after WAL sync but before durable-ticket, memtable/MVCC publication, or ACK; recovery must include the captured prefix and choose the newest fully verified candidate. |
 | Discovery damage and tail controls | Scan beyond broken DATA, zero/hole/preallocation and partial EOF; stray speculative control may be discarded, interior fork/orphan may not be skipped. |
 | Chain invariants | Duplicate generation, sibling/orphan/skip-predecessor, wrong binding/digest, and physical containment fail even after fixture CRCs are recomputed. |
-| Fixed targets and stopped admission | Continuous work cannot change API cutoff `C` for sync/close/freeze/checkpoint/recovery points; predecessor containment may require marker `T > C`, fixed before construction. `D0 | D1 | F_A(D0)` drains; ineligible poisoned targets terminate. |
+| Fixed targets and stopped admission | Continuous work cannot change API cutoff `C` for sync/close/freeze/checkpoint/recovery points; predecessor containment may require marker `T > C`, fixed before construction. `D0 \| D1 \| F_A(D0)` drains; ineligible poisoned targets terminate. |
 | Real CQEs and ownership | Short/negative, reversed, stale, missing, and ambiguous completions cannot publish beyond a proven prefix or release kernel/hash-owned buffers. |
 | Failed marker cycle | No further FRONTIER append in that runtime, including attempts that would not ACK; all waiters/leases reach terminal outcomes. |
 | Durable floors | Validate every exact logical anchor; never fall below it, reuse required timestamps, or reinterpret allocation watermarks as committed coordinates. |
