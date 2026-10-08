@@ -2,9 +2,10 @@
 
 Start with [RFC 024](../../rfcs/024-dedicated-wal-pipeline.md) and the
 [default adoption note](rfc-024-parallel-wal-default-20261005.md). Ordinary
-v4 WALs default to parallel by maintainer decision. The full RFC performance
-gate remains unqualified; the reports retain measured revisions and failed
-controls.
+v4 WALs default to ticket-ordered parallel I/O by maintainer decision. PITR
+v5/v6 and older MVCC WALs retain leader I/O; legacy unframed WALs retain
+buffered I/O. The full RFC performance gate remains unqualified; the reports
+retain measured revisions and failed controls.
 
 Dated filenames identify individual measurements and follow-ups. The
 [benchmark overview](benchmarks/rfc-024-parallel-wal-benchmark.md) connects
