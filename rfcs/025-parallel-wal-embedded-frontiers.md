@@ -235,6 +235,17 @@ The `durable_end` formula and exact-prefix rules in section 4.2 also apply.
 In particular, the entire previous frontier MUST lie inside the current
 verified prefix; monotonic tickets or a valid CRC alone are insufficient.
 
+For an accepted candidate, all canonical FRONTIER frames within
+`[4096, durable_end)`, followed by the candidate frame itself, MUST form
+exactly one linear chain in increasing physical-offset order, rooted at the
+mandatory generation-zero frame. Each non-generation-zero frame's
+`previous_frontier_offset` MUST name the immediately preceding canonical
+FRONTIER in this ordered sequence. Duplicate generations, sibling frontiers,
+or orphan canonical frontiers inside the covered prefix are corruption;
+the candidate MUST NOT be accepted even when the individual frames' CRCs,
+prefix digests, and predecessor bindings otherwise validate. An empty
+generation-zero candidate forms the single-frame chain by itself.
+
 DATA ranges and FRONTIER slots use one checked physical allocator.
 Reservation of a frontier slot at the current allocation tail is serialized
 with DATA admission; no previously assigned offset moves. At marker offset
@@ -389,7 +400,8 @@ retained-prefix eligibility rule in section 5.2. It cannot cross a failed or
 uncertain group. If retaining the previous FRONTIER would include such a
 group, fail the remaining unacknowledged waiters; do not wait indefinitely
 for an eligible marker after admission has stopped. A failed marker/sync
-cycle cannot be followed by another acknowledged cycle in that runtime.
+cycle MUST NOT be followed by another FRONTIER append in that runtime;
+reconciliation and marker replacement require exclusive recovery (section 6.3).
 Buffers remain owned until terminal CQEs or proven safe teardown and until
 any required hash consumption completes. A later failure never changes
 acknowledged outcomes.
@@ -445,6 +457,14 @@ section 4.2's `E(T)` formula. Validate intermediate frontiers against their
 own named prefixes, even when speculative DATA physically precedes those
 markers. Every frontier in a candidate's chain must have a valid covered
 prefix; all predecessors lie wholly within the candidate's retained prefix.
+Recovery MUST also compare every canonical FRONTIER encountered in that prefix
+against section 4.3's single chain, and require a non-generation-zero candidate
+to extend the last retained frontier. Checking only the candidate's reachable
+ancestors is insufficient. A fork/orphan rejects that candidate; recovery MUST NOT filter
+out, skip, or relink an offending interior control frame to accept its prefix.
+Active fallback may select an older valid candidate whose retained prefix
+excludes the offending frame, subject to all durable anchors. Sealing and
+immutable-image violations remain fatal under their strict validation rules.
 
 Use bounded candidate metadata sorted by named physical-prefix boundary and
 one streaming forward verification pass with incremental hashes. Track prefix
@@ -767,6 +787,13 @@ Correctness is an activation requirement. Cover at least:
 - FRONTIER physical-prefix containment, exact generation increments, strict
   ticket/end/timestamp monotonicity, and predecessor digest binding. Recompute
   CRCs on malformed fixtures so rejection exercises the explicit invariants.
+  Include duplicate generations, siblings, orphan canonical frontiers, and
+  skipped immediate predecessors with otherwise valid CRCs/digests, including
+  `F0 | D0 | F1a->F0 | D1 | F1b->F0 | D2 | F2->F1a`. Reject every candidate
+  containing the fork; allow Active fallback only to a valid prefix excluding
+  it and satisfying all durable anchors. Verify strict Sealing/archive failure,
+  the empty generation-zero chain, and preservation of the complete single
+  chain through recovery replacement.
   Cover prefixes ending with an earlier FRONTIER and the stopped-admission
   `D0 | D1 | F_A(D0) | F_B(D0,D1)` drain without a new ticket. Exercise
   ineligible targets that would retain speculative DATA and terminal failure
