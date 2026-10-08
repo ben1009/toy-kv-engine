@@ -424,11 +424,34 @@ Correctness is an activation requirement. Cover at least:
   deadlock. Tests arming failpoints follow the repository's `failpoint_*` rule.
 
 The new protocol normally adds a frontier write and a second file sync per
-durability advance. Its cost must be visible. Measure identical v7 binaries
-with explicit Parallel and Leader modes on tmpfs and a named physical device,
-with PITR on/off where applicable, 1/4/8/16 writers, single puts and batch64,
-small and large values, rotation, checkpoints, and archive backpressure.
-Keep a v6 Leader leg to measure format/protocol cost separately from scheduling.
+durability advance. Its cost must be visible. Ordinary v4 Parallel is the
+current default without PITR and MUST be included as a baseline. Retain all
+of these comparisons:
+
+| Comparison | Purpose |
+| --- | --- |
+| Baseline v4 Parallel vs candidate v4 Parallel, PITR off | Detect regressions in ordinary reads, writes, and mixed workloads caused by shared runtime/format-registry changes. |
+| Candidate v7 Parallel, PITR on, vs candidate v4 Parallel, PITR off | Measure the total cost of enabling PITR relative to the ordinary default. |
+| Candidate v7 Parallel vs candidate v7 Leader, PITR on | Measure scheduling and group-overlap benefits with the same format and durability protocol. |
+| Candidate v7 Leader vs candidate v6 Leader, PITR on | Measure the format/frontier-protocol cost with Leader scheduling in both legs. |
+| Candidate v7 Parallel vs baseline v6 Leader, PITR on | Measure the end-to-end PITR upgrade against the currently shipped PITR path. |
+
+The v7-versus-v4 comparison includes PITR framing, recorded times, hashing,
+seal indexing, frontier persistence, and archive work when active. Report it
+as total PITR overhead; it cannot isolate the second sync or establish a
+performance gain from parallel scheduling. Specify archive activity for each
+run and retain separate controlled cases with and without competing archive
+I/O. Ordinary v4 stays on its existing protocol and incurs no journal sync.
+
+Use the same candidate binary and explicit modes for comparisons within the
+candidate, plus a recorded baseline revision for comparisons across revisions.
+The benchmark harness may retain an explicit v6 creation selector in isolated
+databases; production writers still follow the v7 adoption policy. Never
+reinterpret a file's version to manufacture a benchmark leg. Run on tmpfs and
+a named physical device with 1/4/8/16 writers, single puts and batch64, small
+and large values, rotation, checkpoints, and archive backpressure. Include
+point reads, scans, and mixed read/write ratios in the ordinary regression
+checks and in measurements of contention while PITR is active.
 
 Report throughput, p50/p99 latency, group occupancy, measured overlap between
 groups, both sync counts/latencies, marker bytes per batch, CPU, buffer/spool
