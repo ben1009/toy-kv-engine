@@ -20,8 +20,9 @@ the repository root examples, tests, benchmarks, and RFCs.
 - `../rfcs/022-incremental-backup.md` documents the implemented incremental
   backup repository built on immutable SST/vLog object identity and checkpoint
   capture.
-- `src/wal.rs` implements the WAL, including the default parallel v4 io_uring
-  durable path. PITR and legacy formats retain their existing paths; see the
+- `src/wal.rs` implements the WAL. Ordinary v4 WALs use the ticket-ordered
+  parallel io_uring durable path by default. PITR v5/v6 and older MVCC formats
+  retain leader I/O; legacy unframed WALs retain buffered I/O. See the
   [default adoption note](../docs/wal/rfc-024-parallel-wal-default-20261005.md).
 - `src/vlog/` contains value-separation storage, indexing, and GC.
 - `src/tests/` contains in-crate test coverage for MVCC, compaction,

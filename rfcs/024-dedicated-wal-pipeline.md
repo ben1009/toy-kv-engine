@@ -8,14 +8,15 @@
 
 ## Current adoption status
 
-Ordinary v4 WALs now use the parallel pipeline by default, including native
-async waits for non-serializable point writes. PITR v5/v6 and legacy formats
-retain their existing paths; leader is still an explicit v4 control. The
-[default adoption note](../docs/wal/rfc-024-parallel-wal-default-20261005.md) records
-the maintainer decision and its scope. The original performance gate remains
-unqualified; the proposal and benchmark criteria below are retained as the
-historical design, not evidence that the gate passed. The current limits are
-32 in-flight groups and 256 ring entries.
+Ordinary v4 WALs now use ticket-ordered parallel I/O by default, including
+native async waits for non-serializable point writes. PITR v5/v6 and older
+MVCC formats retain leader I/O; legacy unframed WALs retain buffered I/O.
+Leader remains available as an explicit v4 control. The
+[default adoption note](../docs/wal/rfc-024-parallel-wal-default-20261005.md)
+records the maintainer decision and its scope. The original performance gate
+remains unqualified; the proposal and benchmark criteria below are retained as
+the historical design, not evidence that the gate passed. The current limits
+are 32 in-flight groups and 256 ring entries.
 
 ## Summary
 

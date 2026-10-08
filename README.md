@@ -59,10 +59,11 @@ The CLI supports basic manual operations such as `fill`, `get`, `del`, `scan`,
 
 ### Durability And Writes
 
-- Write-ahead logging with ticket-based group commit. Ordinary v4 WALs default
-  to the parallel pipeline; PITR v5/v6 retain leader I/O and legacy unframed
-  WALs retain buffered I/O. See the [default adoption note](docs/wal/rfc-024-parallel-wal-default-20261005.md).
-- `io_uring` + `O_DIRECT` WAL write path for durable writes.
+- Write-ahead logging is optional. Ordinary v4 WALs use ticket-based group
+  commit with parallel I/O by default. PITR v5/v6 and older MVCC WALs retain
+  leader I/O; legacy unframed WALs retain buffered I/O. See the
+  [default adoption note](docs/wal/rfc-024-parallel-wal-default-20261005.md).
+- Framed MVCC WAL writes use `io_uring` + `O_DIRECT` for durability.
 - Point-in-time recovery from archived WAL segments, with timeline-aware
   restore support.
 - Batched writes through `write_batch`, including optimized same-batch publish

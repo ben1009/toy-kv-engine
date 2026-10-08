@@ -18,11 +18,14 @@ The default pipeline uses a dedicated ordered packer, one io_uring worker,
 and an independent durability coordinator, with 32 in-flight group slots and
 256 ring entries. Ext-family filesystems also use an extent-initialization
 thread to prepare allocation ahead of writes. Ticket order, physical offset
-order, contiguous durability, and ordered MVCC publication remain the same. Non-serializable async point
-writes await buffer budget, durability, and publication natively. Range writes
-and transaction commits retain their blocking async boundary while their v4
-WAL uses the parallel pipeline. A handle moved out of its constructor `Arc`,
-or rewrapped in another `Arc`, uses the owned blocking compatibility path.
+order, contiguous durability, and ordered MVCC publication remain the same.
+Each admitted batch gets a monotonic ticket; the packer combines contiguous
+tickets into ordered I/O groups. Durability advances only across a contiguous
+ticket prefix. Non-serializable async point writes await buffer budget,
+durability, and publication natively. Range writes and transaction commits
+retain their blocking async boundary while their v4 WAL uses the parallel
+pipeline. A handle moved out of its constructor `Arc`, or rewrapped in another
+`Arc`, uses the owned blocking compatibility path.
 
 After a sync takes at least 100 microseconds, the coordinator may coalesce
 for at most 400 microseconds. It refreshes the optional admission cutoff when
