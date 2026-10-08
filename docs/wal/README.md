@@ -8,9 +8,11 @@ buffered I/O. The full RFC performance gate remains unqualified; the reports
 retain measured revisions and failed controls.
 
 [RFC 025](../../rfcs/025-parallel-wal-all-new-formats.md) proposes Parallel as
-the default for every future WAL format, including PITR v7 with a persisted
-durable frontier. It specifies recovery, migration, and validation requirements;
-it has not changed the current format defaults above.
+the default for future WAL formats, with narrowly documented exceptions. PITR
+v7 embeds DATA/FRONTIER frames in the WAL and uses one sync per durability
+advance. Active recovery validates candidate prefixes and permits fallback
+above durable manifest boundaries; sealing/archive validation remains strict.
+The proposal has not changed the current format defaults above.
 
 Dated filenames identify individual measurements and follow-ups. The
 [benchmark overview](benchmarks/rfc-024-parallel-wal-benchmark.md) connects

@@ -11,14 +11,26 @@
 
 Every WAL format introduced after this RFC MUST support the dedicated,
 ticket-ordered parallel pipeline and select `WalIoMode::Parallel` by default.
-This includes new PITR formats. Parallel support is a requirement for shipping
-a new writer format.
+This includes new PITR formats. A narrow exception is permitted only when the
+format's RFC documents a correctness or format constraint, an alternative
+durability/recovery protocol and default mode, and explicit maintainer
+acceptance. An unimplemented pipeline or a performance preference alone is
+insufficient. PITR v7 has no exception.
 
 The first extension is PITR WAL **v7**. It adds persistent batch tickets and
-an append-only durable-frontier journal, allowing recovery to distinguish
-data covered by a durable boundary from an unfinished out-of-order suffix.
-The coordinator syncs the covered WAL data, writes and syncs the boundary,
-then publishes durability. Group submission remains parallel throughout.
+fixed-size `DATA` and `FRONTIER` frames inside the WAL. The coordinator writes
+a frontier for a contiguous completed ticket prefix, then one successful
+`fdatasync(WAL)` covers both data and marker before durability is published.
+Group submission remains parallel throughout; there is no `.frontier` file
+or second steady-state sync.
+
+Active recovery locates markers independently of the forward data scanner
+and selects the newest candidate whose complete covered prefix validates.
+A marker's CRC alone does not prove that its sync succeeded. Active v7 may
+fall back when an interrupted sync left a complete marker but incomplete
+data; durable manifest/sealing boundaries and immutable archive objects
+remain strict. This is an explicit v7 recovery contract and fault-model
+tradeoff, described in section 6.
 
 Existing files keep their format-specific recovery semantics: ordinary v4
 already defaults to Parallel; PITR v5/v6 and older MVCC files retain Leader;
@@ -68,16 +80,19 @@ an equivalent generation protocol before extending the pipeline to PITR.
 | Older MVCC v2/v3 | Leader | Recover with the existing codec; successors use the current writer format. |
 | Ordinary v4 | Parallel | Preserve the existing contiguous valid-prefix recovery rule. |
 | PITR v5/v6 | Leader | Preserve strict recovery and each version's digest rule; seal before installing a v7 successor. |
-| PITR v7 | Parallel | Use the prefix-journal protocol specified here. |
-| Future registered formats | Parallel | Their format RFC must define and qualify recovery under out-of-order writes. |
+| PITR v7 | Parallel | Use typed frames and the single-sync frontier protocol specified here. |
+| Future registered formats | Parallel, unless an explicit RFC exception is accepted | Define and qualify parallel recovery, or the alternative protocol required by the documented constraint. |
 | Unknown versions | Reject | A higher version number is not evidence of compatibility. |
 
 Replace scattered `version == 4` runtime checks with a checked format
 descriptor shared by creation, reopen, encoding, recovery, sealing, and
 restore. It supplies framing/alignment, data-start offset, digest rule,
 recovery policy, and supported I/O modes. A new writer descriptor cannot be
-registered without Parallel support and its recovery coverage. Readers still
-recognize only explicitly supported versions and reject unknown flags.
+registered without Parallel support and its recovery coverage, or a reference
+to the accepted exception RFC and coverage of its alternative protocol. An
+exception must be scoped to named formats and cannot silently change v4/v7 or
+other registered defaults. Readers still recognize only explicitly supported
+versions and reject unknown flags.
 
 The policy applies to direct WAL/memtable constructors, `open`, `open_async`,
 `open_repairing`, PITR enable/resume, and successor creation during rotation.
@@ -92,18 +107,59 @@ whether it keeps v4-style prefix recovery or adopts a stricter boundary rule.
 
 ## 4. PITR v7 representation
 
-### 4.1 WAL header and batches
+### 4.1 Immutable header and typed frames
 
-The v7 WAL keeps a 4096-byte big-endian file header and 4096-byte batch
-alignment. WAL format versions are independent of source-manifest versions.
-Header bytes `0..128` retain the v5/v6 identity and predecessor
-layout from RFC 023, with version `7` and flags `0`. Bytes `128..144` contain
-a fresh, nonzero 128-bit segment incarnation; bytes `144..148` contain CRC32
-over `0..144`; all remaining header bytes are zero. An incarnation is created
-once and prevents a frontier file from being reused for a replacement WAL.
-All digest preimages in this RFC use raw bytes without text encoding.
+The v7 WAL keeps a 4096-byte big-endian file header. WAL format versions are
+independent of source-manifest versions. Header bytes `0..128` retain the
+v5/v6 identity and predecessor layout from RFC 023, with version `7` and
+flags `0`. Bytes `128..144` contain a fresh, nonzero 128-bit segment
+incarnation; bytes `144..148` contain CRC32 over `0..144`; all remaining
+header bytes are zero. The incarnation is created once. All digest preimages
+use raw bytes without text encoding.
 
-Each batch has this 48-byte header:
+Every following physical frame is exactly 4096 bytes, starts at a 4096-byte
+aligned offset, and has this 64-byte common header:
+
+```text
+magic[8] = "TKVW7FR1" | frame_version:u16 = 1 |
+kind:u16 = 1 (DATA) or 2 (FRONTIER) | header_len:u16 = 64 |
+flags:u16 = 0 | wal_header_digest[32] | frame_offset:u64 |
+body_len:u32 | frame_crc32:u32
+```
+
+`wal_header_digest` is SHA-256 of the complete immutable WAL header and binds
+the timeline, archive epoch, segment ID, and incarnation. `frame_offset` must
+equal the actual offset. `frame_crc32` covers `0..60` followed by
+`64..4096`, including the body and zero padding. CRC32 uses RFC 023's
+`crc32fast` definition. Unknown versions/kinds/flags, noncanonical lengths,
+nonzero padding, and arithmetic overflow reject.
+
+The common header belongs to the codec; a value can never occupy a frame
+header. Recovery considers FRONTIER only at these aligned header positions.
+Searching arbitrary payload bytes for marker magic is forbidden. This avoids
+mistaking a user value containing an entire marker-shaped byte string for a
+physical control frame. Checksums and hashes detect accidental damage and
+provide no keyed authentication.
+
+### 4.2 DATA fragmentation and logical batches
+
+A DATA body begins with this 24-byte fragment header:
+
+```text
+segment_ticket:u64 | fragment_index:u32 | fragment_count:u32 |
+batch_bytes:u64 | batch_fragment[...]
+```
+
+The fragment header leaves 4008 bytes per frame for logical batch bytes.
+A batch owns a contiguous, noninterleaved range of DATA frames. Fragment
+indices are exactly `0..fragment_count`; all fragments repeat its ticket,
+count, and total length. The count equals `ceil(batch_bytes / 4008)`; every
+nonfinal fragment carries 4008 batch bytes and the final one carries the exact
+remainder. `body_len` includes the 24-byte fragment header. The implementation
+checks all lengths before allocating or slicing and preserves the existing
+batch/value limits after allowing for frame overhead.
+
+The reassembled logical batch has this 48-byte header and its payload:
 
 ```text
 segment_ticket:u64 | commit_ts:u64 | recorded_at_secs:i64 |
@@ -111,230 +167,374 @@ recorded_at_nanos:u32 | entry_count:u32 | data_len:u32 |
 data_crc32:u32 | header_crc32:u32 | reserved:u32
 ```
 
-`header_crc32` covers bytes `0..40`, including `data_crc32`; `reserved` is zero.
-Payload encoding, canonical mixed-operation ordering, nonempty-batch rules,
-recorded-time validation, and zero padding follow RFC 023. Tickets are
-segment-local ordinals `0, 1, ...`; commit timestamps are strictly increasing
-but need not be numerically consecutive. Tickets never substitute for MVCC
-timestamps or range-operation ordinals.
+`header_crc32` covers bytes `0..40`, including `data_crc32`; `reserved`
+is zero, and `batch_bytes` equals `48 + data_len`. Payload encoding, canonical
+mixed-operation ordering, nonempty-batch rules, and recorded-time validation
+follow RFC 023. The logical ticket must match every fragment header.
+Tickets are segment-local ordinals `0, 1, ...`;
+commit timestamps are strictly increasing but may have gaps. Control frames
+consume physical offsets and never consume a ticket or commit timestamp.
 
-The v7 prefix digest is SHA-256 over the full immutable WAL header followed
-by each covered batch header and payload in ticket order. Alignment padding
-is excluded from the hash, following v6, but is still validated as zero.
-The covered `logical_end` includes each batch's padding and excludes the
-preallocated tail. An empty prefix ends at offset 4096.
+The logical `prefix_digest(T)` is SHA-256 over the complete WAL header and
+each covered logical batch header/payload in ticket order. Fragment headers,
+FRONTIER frames, and alignment padding are excluded from this logical hash,
+but their canonical encoding and CRCs are validated separately.
+`E(T)`, named `durable_end` on disk, is the aligned end of the last covered
+DATA frame; `E(0) = 4096`. Earlier control frames can lie inside that range.
 
-### 4.2 Active frontier journal
+### 4.3 FRONTIER frames and physical allocation
 
-Every active v7 WAL has a required `<segment>.frontier` companion. It has a
-4096-byte header followed by fixed 4096-byte records. All fields are big-endian;
-unknown versions, nonzero reserved bytes, invalid lengths, and arithmetic
-overflow reject. CRC32 uses RFC 023's `crc32fast` definition.
-
-The journal header fields, in order, are:
+A FRONTIER body is exactly 104 bytes:
 
 ```text
-magic[8] = "TKVPFX01" | version:u16 = 1 | header_len:u16 = 4096 |
-record_len:u32 = 4096 | wal_header_digest[32] |
-timeline_id[16] | archive_epoch_id[16] | segment_id:u64 |
-incarnation[16] | header_crc32:u32 | zero padding to 4096
+generation:u64 | ticket_end:u64 | durable_end:u64 |
+last_commit_ts:u64 | prefix_digest[32] |
+previous_frontier_offset:u64 | previous_frontier_digest[32]
 ```
 
-`wal_header_digest` is SHA-256 of the complete v7 WAL header. `header_crc32`
-covers the preceding 104 bytes. All identities must match the WAL header.
+The record digest is SHA-256 of the complete canonical 4096-byte frame.
+`ticket_end` is exclusive and equals the covered batch count.
+Generation zero is mandatory at offset 4096: `ticket_end = 0`,
+`durable_end = 4096`, `last_commit_ts = 0`, `prefix_digest =
+wal_header_digest`, and both previous-frontier fields are zero. The first
+DATA allocation therefore starts at 8192; an empty v7 image is 8192 bytes.
 
-Each frontier record has these fields, in order:
+During normal append, each frontier increments generation by one, binds the
+preceding frontier's offset and record digest, and strictly increases ticket
+end, durable end, and last commit timestamp. Every nonempty durable end must
+be the end of its last covered batch. The previous offset is aligned, names
+an earlier FRONTIER, and never forms a cycle.
+
+DATA ranges and FRONTIER slots use one checked physical allocator.
+Reservation of a frontier slot at the current allocation tail is serialized
+with DATA admission; no previously assigned offset moves. At marker offset
+`M`, all already allocated DATA ranges end at or before `M`, and
+`durable_end <= M`. Later DATA can be allocated at or beyond `M + 4096`.
+There is at most one frontier write/sync cycle in progress per WAL; prior
+frontier frames remain immutable.
+One ticket group can span DATA ranges separated by a control frame. Split its
+write SQEs at those boundaries; a packed DATA write must never cover or
+overwrite a FRONTIER slot. Group completion still accounts for every DATA SQE.
+
+A frontier can follow speculative DATA:
 
 ```text
-magic[8] = "TKVPFXR1" | version:u16 = 1 | reserved:u16 = 0 |
-wal_header_digest[32] | generation:u64 | ticket_end:u64 |
-logical_end:u64 | last_commit_ts:u64 | prefix_digest[32] |
-previous_record_digest[32] | record_crc32:u32 | zero padding to 4096
+D0 | D1 incomplete | D2 complete | FRONTIER(ticket_end=1, durable_end=end(D0))
 ```
 
-`record_crc32` covers the preceding 140 bytes. The record digest is SHA-256
-of the complete canonical 4096-byte record, including checksum and padding.
-`ticket_end` is exclusive and equals the covered batch count. Generation zero
-covers the empty WAL header: `ticket_end = 0`, `logical_end = 4096`,
-`last_commit_ts = 0`, `prefix_digest = wal_header_digest`, and an all-zero
-previous-record digest. Subsequent records increment generation by one, bind
-the preceding record digest, and strictly increase ticket end, logical end,
-and last commit timestamp. Every end must coincide with a complete batch end.
+Only D0 is covered. Neither `M` nor the physical EOF is the replay boundary.
+The marker's physical end, `M + 4096`, is the extent needed to retain its
+recovery evidence. Section 6 defines how to remove speculative DATA without
+destroying that evidence.
 
-There is at most one frontier-record write/sync in progress per WAL. Records
-are appended serially and never overwrite previous records. The journal is
-not preallocated, so an interrupted append cannot create nonzero later
-records after a torn record. At most one nonempty record is added per batch;
-with generation zero and the header, journal logical bytes are bounded by
-`8192 + 4096 * batch_count`. Coalescing normally uses fewer records.
+At most one nonempty frontier is appended per newly covered batch, giving
+`frontier_bytes <= 4096 * (1 + batch_count)` during normal append, including
+generation zero. Recovery replaces discarded markers as described below and
+does not grow the image on every reopen. Marker slots must be reserved before
+admission; preallocation of WAL capacity is not evidence of a marker or data.
 
-Checksums and the hash chain detect accidental damage; they provide no keyed
-authentication. The source manifest and archive catalog retain their existing
-authority; a file copied from another segment cannot supply its frontier
-merely because its byte offsets look plausible.
+### 4.4 Seal digest
+
+The v7 logical prefix digest verifies the selected DATA sequence. Its archive
+`wal_digest` is a separate SHA-256 over the entire final immutable WAL image
+`[0, sealed_end)`, including frame headers, all retained FRONTIER frames,
+checksums, and padding. `sealed_end` ends immediately after the terminal
+frontier, which covers every DATA batch in the sealed image.
+
+This distinct rule binds the physical archive representation as well as its
+logical history. v5 continues hashing its aligned prefix and v6 continues
+hashing its header and logical batches without padding. The version registry
+must select these rules explicitly.
 
 ## 5. Admission and durability
 
 ### 5.1 Admission and ordered metadata
 
-Preparation reserves buffer memory, aligned WAL capacity, PITR spool space,
-seal-index capacity, and worst-case frontier-record allocation before ticket
-assignment. Rejection creates no ticket or offset hole. Admission atomically
-assigns the ticket and nonoverlapping physical range and publishes the batch
-to the ordered queue, following RFC 024's handoff rules.
+Preparation reserves buffer memory, framed DATA capacity, PITR spool space,
+seal-index capacity, worst-case marker allocation, and the recovery workspace
+growth required by section 7.3 before ticket assignment. Rejection creates
+no ticket or offset hole. Admission atomically assigns a ticket and a
+nonoverlapping DATA range and publishes the batch to the ordered queue,
+following RFC 024's handoff rules. FRONTIER reservation uses the same allocator
+and does not enter the data-ticket queue.
 
-The ordered packer finalizes the recorded-time clamp and v7 batch header,
-then incrementally advances the prefix hash and seal index in ticket order.
-Hash/index state for prepared or written tickets is tentative. Pending group
-boundaries and fixed barrier cutoffs retain bounded digest snapshots and index
-ends, including a cutoff inside a group. Sealing and publication can access
-only the state covered by the durable frontier.
+The ordered packer finalizes the recorded-time clamp, logical batch header,
+and fragment headers, then advances logical prefix hash and seal index state
+in ticket order. Hash/index state for prepared or written tickets is tentative.
+Pending group boundaries and fixed barrier cutoffs retain bounded digest
+snapshots and index ends, including a cutoff inside a group. Sealing and
+publication can access only state covered by the durable frontier.
+
+Maintain a separate physical-image hash in allocation order, including control
+frames, so the final seal digest is ready after drain. Gaps in frame preparation
+may defer that hash's advancement; they must not block earlier writes or marker
+completion. Bounded pending state follows the in-flight/memory limits.
+Recovery rebuilds both hashes in a streaming pass.
 No payload rescan is permitted in the stop-admission rotation section.
 
-### 5.2 Two ordered sync stages
+### 5.2 One ordered sync stage
 
 Let `T` be a captured exclusive ticket end no greater than the contiguous
-written frontier, and `E(T)` its aligned byte end. The coordinator:
+written frontier, and `E(T)` its aligned DATA end. The coordinator:
 
-1. Confirms full write completion for every ticket below `T`. Short writes,
-   missing CQEs, or ambiguous submission cannot count as completion.
-2. Calls `fdatasync` on the WAL and waits for success.
-3. Appends one frontier record for exactly `(T, E(T), digest(T))`, using the
-   saved ordered metadata, and verifies the full record write.
-4. Calls `fdatasync` on the frontier journal and waits for success.
-5. Publishes the durable ticket end and corresponding seal metadata with the
-   existing synchronization rules, then wakes covered waiters.
+1. Confirms full write completion for every DATA fragment of every ticket
+   below `T`. Short writes, missing CQEs, and ambiguous submission do not
+   count as completion.
+2. Reserves a FRONTIER frame at the current physical allocation tail and
+   writes exactly `(T, E(T), prefix_digest(T))` with the saved metadata and
+   previous-frontier binding. It verifies full marker write completion.
+3. Calls `fdatasync(WAL)` and waits for success, covering the previously
+   completed DATA writes and FRONTIER write on that same file.
+4. Publishes the durable ticket end and corresponding seal metadata with
+   the existing synchronization rules, then wakes covered waiters.
 
-Writers may submit later groups while either sync runs. Incidental persistence
-of later WAL bytes does not extend the captured boundary. A marker cannot name
-bytes admitted during the WAL sync unless a later WAL sync covers them.
-Normal coalescing may choose `T` before step 2; public sync, freeze, checkpoint,
-recovery-point, and close barriers retain their fixed admission cutoffs.
+```text
+DATA writes complete -> FRONTIER write complete -> fdatasync(WAL) -> publish
+```
 
-The ordering relies on successful file syncs and explicitly synced directory
-publication, as described by
-[fsync(2)](https://man7.org/linux/man-pages/man2/fsync.2.html). Syncing a new WAL
-and journal is insufficient to publish their directory entries: creation must
-sync both headers and generation zero, sync the directory, then durably install
-the active pair in the source manifest before any batch can be acknowledged.
+No live durable/publication frontier advances merely because a marker write
+completed. Writers may submit later groups while the marker write or sync
+runs. Incidental persistence of later bytes does not extend `T`.
+Capture the final `T` before marker construction; coalescing cannot enlarge
+its coverage during sync. Public sync, freeze, checkpoint, recovery-point,
+and close barriers retain fixed admission cutoffs.
 
-After both sync stages, the existing memtable insertion and ordered MVCC
-publication steps still precede API success. Native async waiters wait through
-both sync stages and publication. Cancellation after admission leaves owned
-batch resources and memtable leases alive until the commit protocol retires
-them; PITR backpressure never waits for archival while holding admission locks.
+One advance SHOULD cover multiple completed groups when available, sharing
+one marker and one WAL sync. The normal coalescing policy MUST document a
+finite maximum wait and batch/byte bounds; arrivals cannot repeatedly extend
+its deadline. It must make progress with one writer and cannot wait
+indefinitely for a target occupancy. Deliberate wait is charged to latency.
+
+The durability guarantee relies on a successful file sync, as described by
+[fsync(2)](https://man7.org/linux/man-pages/man2/fsync.2.html). Creation writes
+the immutable header and generation-zero frame, successfully syncs the WAL,
+syncs its directory entry, and durably installs Active source-manifest state
+before any batch can be acknowledged. Directory and manifest syncs also remain
+required for rotation and other metadata transitions; the one-sync claim is
+per normal durability advance.
+
+Existing memtable insertion and ordered MVCC publication still precede API
+success. Native async waiters wait through marker write, WAL sync, and
+publication. Cancellation after admission leaves owned buffers and memtable
+leases alive until retirement; PITR backpressure never waits for archival
+while holding admission locks.
 
 ### 5.3 Errors and ownership
 
-A failed WAL sync cannot create a new frontier record. A short frontier write
-or failed frontier sync cannot advance the live durable frontier. These errors
-poison new admission; reopen reconciles their unknown outcome. A complete
-record may survive even if its sync returned an error or the client saw no
-success, so recovery may include that complete, safely data-synced prefix.
+A short/failed marker write or failed WAL sync cannot advance the live durable
+frontier and poisons new admission. Reopen reconciles the unknown outcome.
+A complete marker may survive while its covered DATA did not persist, because
+both preceded the same interrupted or failed sync. Section 6 therefore treats
+an active marker as a candidate until its covered prefix validates.
 
-An earlier durable boundary remains valid when a later group fails. A healthy
-contiguous prefix below the earliest failed ticket may complete both sync
-stages, following RFC 024's poison rules; no failed or uncertain group is
-crossed. Buffers remain owned until terminal CQEs or proven safe teardown.
-Acknowledged outcomes are never changed by a later failure.
+An earlier durable boundary remains valid when a later DATA group fails.
+A healthy contiguous prefix below the earliest failed ticket may complete a
+marker/sync cycle under RFC 024's poison rules; it cannot cross a failed or
+uncertain group. A failed marker/sync cycle cannot be followed by another
+acknowledged cycle in that runtime. Buffers remain owned until terminal CQEs
+or proven safe teardown and until any required hash consumption completes.
+A later failure never changes acknowledged outcomes.
+
+After a process-only restart, complete DATA and FRONTIER bytes may still be
+readable in cache without having reached stable storage. Buffered writeback
+errors can clear dirty-page state and be missed by a reopened descriptor;
+merely retrying sync is insufficient in that case. See
+[Linux writeback error handling](https://docs.kernel.org/filesystems/vfs.html#handling-errors-during-writeback)
+and the [fsync failure study](https://www.usenix.org/conference/atc20/presentation/rebello).
+Recovery MUST rewrite the accepted image to a fresh inode, successfully
+`fdatasync` it even when no length change was needed, and durably install it
+before service. This recovery barrier is specified in section 6.3.
 
 ## 6. Active recovery and corruption rules
 
-Recovery first validates the WAL header, frontier header, identity binding,
-and mandatory generation-zero record. Missing or mismatched frontier metadata
-for a manifest-installed Active v7 segment is an error, including for an empty
-segment. Only a pair never installed in durable manifest state can be treated
-as incomplete creation and cleaned up through the normal orphan protocol.
+### 6.1 Independent marker discovery and prefix validation
 
-Recovery scans the journal serially, checking record checksums, generation,
-previous-record hashes, increasing boundaries, and format limits. A short,
-zero-filled, or checksum-invalid **final append** may be discarded only when
-EOF falls within or exactly at the end of that one record slot. Any bytes
-after an invalid slot make it interior corruption, including extra zero pages;
-the journal has no preallocated tail. A complete checksummed record with
-an invalid identity, generation, chain, or boundary is corruption even at the
-tail. Generation zero cannot be discarded. The journal's append ordering is
-essential to these rules.
+Recovery obtains Active/Sealing/Sealed status from durable source-manifest
+state or a verified backup/catalog reference. Finding a seal sidecar cannot
+upgrade an Active WAL to Sealed. Validate the immutable header and mandatory
+generation-zero frame first. Missing or damaged generation zero in a
+manifest-installed segment is an error, including for an empty segment.
+Only a file never installed in durable manifest state can be incomplete
+creation and cleaned up through the normal orphan protocol.
 
-In one streaming WAL pass, recovery verifies every covered batch, exact ticket
-order, CRC, canonical operation encoding, zero alignment padding, timestamp
-and recorded-time ordering, and the digest/count/timestamp at each accepted
-journal boundary. Any mismatch inside the final covered prefix is fatal;
-recovery cannot fall back to an older marker to hide damaged covered data.
-Persisted sealing intent or manifest high-water state requiring a newer
-boundary also makes an older recovered boundary an error.
+For an Active segment, inspect fixed aligned frame headers from the bounded
+physical tail toward offset 4096, independently of DATA decoding. EOF may
+include preallocation, zeros, holes, or one partial final frame. Discovery
+cannot stop at a broken DATA frame and cannot treat preallocated length as a
+logical boundary. Batched backward reads bound I/O overhead; the 1 GiB limit
+bounds total discovery work. Any optional allocation/offset hints are
+optimizations, not recovery authority.
 
-All WAL bytes after the accepted boundary are unacknowledged suffix bytes.
-They may contain valid later batches or holes and are discarded together;
-they are never replayed or archived independently. Before append resumes,
-recovery durably truncates the WAL to `logical_end` and the journal to its
-accepted record end, with all old I/O ownership retired. The next v7 ticket
-is the recovered `ticket_end`. MVCC timestamps and the recorded-time clamp are
-reconstructed from retained batches and existing manifest anchors.
+A candidate must be a complete canonical FRONTIER with the correct header
+binding, actual offset, CRC, valid bounds, and a valid previous-frontier chain
+back to generation zero. Follow previous offsets only after validating the
+current frame; they accelerate chain checks but cannot locate a torn last
+marker whose pointer is unreadable. Backward discovery remains the fallback.
+Never accept a foreign frame or marker-shaped DATA payload.
+Memoize chain checks by physical offset rather than walking the complete
+chain anew for every candidate.
 
-For v7, a durable commit coordinate requires a complete batch covered by an
-accepted frontier record. A complete but unmarked batch has never reached
-MVCC publication and does not by itself consume a permanent coordinate after
-restart. This refines RFC 023's timestamp-reconciliation rule for v7 only;
-existing v5/v6 coordinates and all persisted manifest high-water anchors keep
-their current meaning. Never reuse a timestamp required by those anchors.
+For each candidate, validate the complete physical prefix `[0, durable_end)`:
+all DATA fragments, exact ticket order, logical batch CRCs and canonical
+operation encoding, zero padding, timestamp/recorded-time ordering, and every
+interspersed control frame. Compare its exact covered count, DATA end,
+last timestamp, and logical prefix digest. Validate intermediate frontiers
+against their own named DATA prefixes, even when speculative DATA physically
+precedes those markers. Every frontier in a candidate's chain must have a
+valid covered DATA prefix, including chain frames outside its DATA end.
 
-| Crash point | Recovery result |
+Use bounded candidate metadata sorted by named DATA boundary and one streaming
+forward verification pass with incremental hashes. Stop usable DATA-prefix
+advancement at the first invalid physical frame; no candidate crossing it can
+validate. Do not rescan the whole prefix separately for every marker. Bound
+metadata by the maximum frame count and use checked allocations.
+
+Choose the newest fully validated candidate by physical marker offset.
+A checksum-invalid/torn marker or a complete marker with an invalid covered
+prefix can be rejected in favor of an older fully validated candidate.
+DATA above the accepted ticket end is discarded even when its bytes are
+complete and lie before the selected marker. Rejected candidate ranges and
+reasons must be reported. An actual read/I/O error fails recovery; it is not
+permission to reinterpret unread bytes as an interrupted suffix.
+
+### 6.2 Durable anchors and the explicit fault model
+
+A durable source-manifest or checkpoint reference that claims a WAL boundary
+is a hard floor. Validate its segment identity, ticket/count, covered end,
+timestamp, and digest as applicable; a candidate below or conflicting with
+that claim cannot be accepted. Durable Sealing intent fixes its complete
+physical image, including `sealed_end` and terminal frontier binding.
+A conflicting durable seal/catalog reference is corruption, never an excuse
+to lower the boundary. Allocation-only timestamp high-water marks still
+prevent timestamp reuse and do not invent a claim that an unmarked DATA batch
+was durably committed.
+
+The normal guarantee assumes bytes covered by a successful sync and synced
+directory publication survive subsequent crashes. Because no newer cycle
+can be acknowledged after a marker/sync failure, a previous successfully
+synced frontier and its DATA remain recoverable under that assumption.
+A complete marker and valid covered DATA may also survive without an API
+success; recovery may include that unknown client outcome.
+
+One sync does not record whether the syscall returned success. An interrupted
+sync can persist the marker before its covered DATA. Without an independent
+durable anchor, this has the same on-disk appearance as later storage damage
+to a successfully synced active prefix. Active v7 deliberately permits
+fallback to a fully validated older frontier and cannot promise detection of
+all such post-sync loss. Checksums do not remove this ambiguity. Sealing,
+sealed archives, and durable manifest claims remain strict. v5/v6 retain
+their current corruption contract; `open_repairing` must not lower a known
+durable anchor or apply v7 fallback to historical formats.
+
+### 6.3 Durable recovery installation
+
+The selected boundary remains provisional. Stop new admission, retire old
+I/O ownership, and hold the exclusive recovery lock. Never truncate the
+original file to `durable_end` and sync it before installing a replacement
+certificate: its selected FRONTIER may lie after speculative DATA and would
+be erased, leaving a second crash with no certificate for acknowledged data.
+
+Normalize an Active image in a fresh temporary inode in the same directory:
+
+1. Copy the immutable header and the verified exact bytes
+   `[4096, durable_end)` with bounded streaming reads/writes. This preserves
+   DATA offsets and all complete control frames inside the retained prefix.
+2. Append a recovery FRONTIER at `durable_end` naming the accepted ticket
+   end, last timestamp, and logical digest. Link it to the last retained
+   frontier, with generation one greater than that retained frame. If empty,
+   emit the original generation-zero frame at 4096 instead.
+   Older markers outside the retained prefix and all speculative DATA are
+   omitted. Generation numbers may be reused only by this exclusive
+   replacement of discarded frames; tickets and commit timestamps retain
+   their recovered meaning.
+3. Verify every write and MUST successfully `fdatasync` the fresh complete
+   image before treating its frontier as the recovered durable boundary.
+   This is mandatory even when the original file already had exactly this
+   length or no truncation was necessary. A no-op sync of the old inode
+   cannot satisfy the requirement.
+4. Atomically replace the canonical WAL pathname, successfully sync the
+   containing directory, then install recovered durability/publication state
+   and permit service, append, seal, archive, or backup to depend on it.
+
+The normalized physical end is `durable_end + 4096`; new physical allocations
+start there, after the retained recovery marker. The next data ticket is the
+accepted `ticket_end`, and MVCC timestamps/recorded-time clamps are rebuilt
+from retained batches and existing manifest anchors. Repeating recovery on
+the normalized image does not append an extra marker or change its bytes.
+
+For a fixed Sealing obligation, copy and validate the exact intent-bound
+image through its terminal frontier without changing frame bytes, generations,
+or seal digest; sync and replace it through the same installation barrier.
+Sealed immutable objects use strict validation and are never normalized.
+
+A copy/write, required sync, replacement, or directory-sync failure fails
+reopen and exposes no provisional state. Do not retry by silently choosing an
+older boundary after such a failure. The original canonical file remains
+the authority until replacement; temporary filenames are never candidates.
+A crash during replacement recovers from the old or new canonical image under
+the qualified filesystem's atomic replacement guarantees and repeats the
+installation barrier. Orphan temporary files are accounted and durably
+cleaned only after canonical validation. Old inodes/pins remain charged until
+their readers and I/O owners are gone.
+
+A v7 permanent commit coordinate requires DATA covered by an accepted frontier.
+A complete unmarked batch has never reached publication and does not by itself
+consume a permanent coordinate after restart. This refines RFC 023 for v7
+only; never reuse a timestamp required by an existing manifest anchor.
+
+| Crash point or observed state | Recovery result |
 | --- | --- |
-| A and C written, B incomplete, no newer marker | Replay the previous marked prefix; discard the unmarked suffix. |
-| WAL sync succeeds, marker not written | Replay the previous marked prefix. |
-| Final marker append is torn | Replay the previous marked prefix after validating the journal tail. |
-| Complete marker reaches storage before acknowledgement | Replay its complete covered prefix; the client outcome may have been unknown. |
-| Marker sync and publication complete | Every acknowledged batch is within the recoverable prefix. |
-| Covered WAL data or an interior journal record is damaged | Report corruption; do not truncate through it. |
-| Wrong or missing frontier for a manifest-installed active WAL | Report corruption; do not reconstruct acknowledgement from later valid batches. |
-
-The guarantee assumes successful syncs preserve their covered bytes and
-directory entries across a crash. CRCs/hashes detect damage in an intact
-marked prefix; they cannot prove acknowledgement if storage later erases or
-rolls back the newest synced frontier records themselves. As with an
-interrupted final batch in existing WAL recovery, such loss can be
-indistinguishable from an unfinished append. This RFC does not claim repair
-of post-sync storage loss. `open_repairing` must preserve these boundaries and
-report a conflicting manifest or seal rather than silently lowering it.
+| D0 and D2 complete, D1 incomplete, marker covers only D0 | Find the marker independently and retain only D0. |
+| Complete newest marker covers DATA missing after interrupted sync | Reject the candidate; choose the newest fully validated older one above all durable anchors. |
+| Newest marker torn, zeros/preallocation or later DATA at physical tail | Continue aligned discovery; validate an older marker and its DATA prefix. |
+| Marker and its covered DATA complete before acknowledgement | May retain that candidate after validation and durable recovery installation. |
+| WAL sync and ordered publication complete | Every acknowledged batch is within a recoverable prefix under the stated storage assumptions. |
+| Valid cached image after a failed sync, even with unchanged length | Rewrite to a fresh inode, sync, atomically replace, and sync the directory before service. |
+| Recovery crashes before replacement | The original certificate remains available; temporary images are not authority. |
+| Recovery crashes during/after replacement | Validate the canonical old/new image and repeat the installation barrier. |
+| Copy, recovery sync, replacement, or directory sync fails | Fail reopen; no provisional publication and no fallback through the error. |
+| No candidate satisfies a durable manifest/Sealing floor | Report corruption. |
+| Sealed object has any length, frame, index, or digest mismatch | Report corruption; no active fallback. |
 
 ## 7. PITR integration and migration
 
 ### 7.1 Freeze, seal, archive, and backup
 
 Freeze stops admission, drains blocking guards and async memtable leases,
-completes the two-stage frontier through its cutoff, and drains ordered
-publication. Sealing captures that exact boundary, finalizes the saved digest
-and index, and durably records `Sealing` intent before installing a successor.
-An empty segment still has a real header, generation-zero frontier, and
-predecessor anchor; it does not invent a commit coordinate.
+completes marker/write/sync through its fixed ticket cutoff, and drains ordered
+publication. Before durable Sealing intent, every admitted DATA batch must be
+covered by the terminal frontier. Its end is `sealed_end`; preallocated tail
+bytes are excluded. Finalize saved logical/physical hashes and the index,
+then durably record Sealing intent before installing a successor.
 
-Seal sidecar v1 can retain its existing byte layout with an explicitly
-registered `wal_format_version = 7`. Its WAL digest uses the v7 rule, its batch
-count equals the frontier ticket end, and its index must match those batches.
-The WAL digest also binds the incarnation in the v7 header. No v5/v6 digest
-interpretation is changed. Recovery of a fixed `Sealing` obligation validates
-the frontier against the intent and any durable seal; the journal remains
-required until `Sealed` is durable. Recovery cannot promote an unmarked suffix
-when rebuilding a seal.
+An empty segment has a real header, generation-zero frame, and predecessor
+anchor. Its sealed length is 8192, batch count zero, and it invents no commit
+coordinate. Seal sidecar v1 may retain its byte layout with an explicitly
+registered `wal_format_version = 7`, but readers, empty-length checks, digest
+selection, and index validation must become format-specific. The v7 WAL digest
+is the exact physical-image hash from section 4.4; its count equals the
+terminal ticket end and its index names the first DATA frame of each batch.
 
-Once the seal is durable and `Sealed` is durable in the source manifest, the
-immutable WAL/seal pair supplies the recovery boundary. The active journal may
-be deleted only after that transition and all journal readers release their
-pins; deletion and directory sync precede accounting release. Before this
-transition it remains required, even if a seal temporary exists.
+Sealing intent must persist enough versioned metadata to fix the logical
+boundary and physical certificate: ticket end, DATA end, last timestamp,
+logical prefix digest, sealed end, terminal frontier digest, and final WAL
+digest. Extend source-manifest records/versioning explicitly if the current
+schema cannot represent them. A recovered Sealing obligation validates all
+frames and its terminal marker against this intent and any durable seal; it
+cannot fall back, promote an unmarked suffix, or rewrite that physical image.
 
-Recovery obtains Active/Sealing/Sealed status from durable source-manifest
-state or a verified backup/catalog reference. Merely finding a seal sidecar
-does not authorize treating an Active WAL as sealed and bypassing its journal.
+After seal and Sealed source-manifest publication are durable, the immutable
+WAL/seal pair supplies the recovery boundary. FRONTIER frames stay in the WAL;
+there is no companion journal to delete. The archived WAL is exactly
+`[0, sealed_end)` with its seal. Strict archive/restore verifies every frame,
+terminal coverage, exact length, count/index, identity, predecessor, and whole
+image digest. Do not apply Active fallback to immutable objects.
 
-Archive objects remain the exact WAL prefix `[0, logical_end)` and its seal;
-the active frontier journal is not a third archive object. Archived v7 objects
-are verified strictly to the seal's length, count, index, identity, predecessor,
-and digest. Restore does not apply active-tail truncation to immutable objects.
-Checkpoint/backup capture uses the drained sealed boundary. Any helper that
-copies an Active v7 WAL must capture its frontier consistently and include it
-in the recoverable artifact; copying the WAL alone is insufficient.
+Checkpoint/backup capture uses drained sealed boundaries. A helper copying
+an Active WAL must pin its identity and selected certificate consistently,
+copy through that marker's physical end, and include all its covered DATA.
+A bare copy stopping at `durable_end` is insufficient. Prefer the existing
+freeze/seal capture protocol; a seal temporary cannot bypass Active recovery.
 
 ### 7.2 Existing databases
 
@@ -353,136 +553,190 @@ compatible backup/restore path, not a scheduler toggle.
 
 ### 7.3 Bounds and reservations
 
-The existing 1 GiB WAL cap and configured `max_segment_bytes` apply to the
-aligned WAL prefix, including its header. `max_unarchived_bytes` retains its
-RFC 023 meaning as WAL logical bytes. The journal is charged separately under
-the hard `max_source_spool_bytes` bound, including actual filesystem allocation
-and outstanding reservations. Report journal bytes separately in status.
+The 1 GiB WAL cap and configured `max_segment_bytes` bound the whole physical
+image: header, every DATA/control frame, terminal marker, and rounded
+preallocation. `max_unarchived_bytes` retains its meaning as WAL logical bytes;
+v7 includes its embedded markers. Actual filesystem allocation, outstanding
+reservations, and temporary/pinned images remain charged under the hard
+`max_source_spool_bytes` bound. Report DATA, marker, and recovery workspace
+bytes separately in status.
 
-Each batch reserves at least one journal record's worst-case physical
-allocation before receiving a ticket. A coalesced boundary releases unused
-record reservations only when the covered protocol completes. Per-segment
-and maintenance reserves include the journal header, generation zero,
-successor creation, seal/index temporary files, and terminal manifest work.
-No sync or final seal may need an unreserved allocation at a full spool.
-Journal growth is additionally bounded by batch count and the formula in
-section 4.2; capacity/count exhaustion triggers rotation before admission.
+Before assigning a ticket, each batch reserves its fragmented DATA range and
+one marker frame's worst-case physical allocation and logical capacity.
+The allocator consumes marker reservations when placing coalesced frontiers;
+release unused reservations only when the covered protocol completes.
+A 4 KiB DATA batch can temporarily require another 4 KiB marker reservation.
+Coalescing reduces actual marker bytes but does not remove admission pressure
+until reservations are safely released. The final marker must fit without
+a fresh allocation at full capacity.
 
-Configurations that cannot represent the v7 empty segment, one admissible
-batch, and successor/terminal headroom fail explicitly. Migration does not
-silently enlarge persisted limits. Release of physical reservations continues
-to require the existing allocation verification and durable cleanup rules.
+Recovery installation additionally requires temporary space for the largest
+Active or Sealing image that must be copied. Maintain a shared maintenance
+workspace reservation sufficient for that worst-case image's filesystem
+allocation, growing it before admission or preallocation increases the bound.
+Recovery processes replacements sequentially and may reuse the workspace only
+after old/orphan images are durably cleaned and accounting is released.
+This can reserve roughly another full active image; it is a recovery-space
+cost of the fresh-inode protocol, separate from marker bytes.
+A fully occupied spool cannot make recovery depend on unreserved space.
+
+Per-segment/maintenance headroom also includes generation zero, successor
+creation, seal/index temporary files, and terminal manifest work. Configurations
+unable to represent one admissible batch plus marker, recovery workspace, and
+successor/terminal headroom fail explicitly. Migration cannot silently enlarge
+persisted limits. Count/capacity exhaustion triggers rotation before admission.
+Physical reservation release follows existing allocation verification,
+durable cleanup, and pin-release rules.
 
 ## 8. Implementation and default activation
 
 Implement in reviewable stages:
 
-1. Add the format registry, parameterize encoding/alignment/runtime startup,
-   and preserve the complete legacy behavior matrix.
-2. Add the v7 codec, frontier journal, creation protocol, strict boundary
-   recovery, and a deterministic durability-state model.
-3. Integrate ordered hash/index snapshots, the two-stage coordinator, spool
-   reservations, sync/close/freeze cutoffs, and async ownership.
-4. Extend sealing, archive/catalog verification, restore, backup, repair, and
-   crash-safe v5/v6-to-v7 migration.
+1. Add the format registry, parameterize framing/data-start/digest/runtime
+   startup, and preserve the complete legacy behavior matrix.
+2. Add the v7 DATA/FRONTIER codec, discovery/validation, durable recovery
+   replacement, creation protocol, and deterministic persistence model with a
+   serial I/O driver. Qualify the crash matrix and Active fallback contract
+   before connecting Parallel.
+3. Integrate ordered logical/physical hashes, seal-index snapshots, the
+   single-sync coordinator, marker/recovery reservations, fixed sync/close/
+   freeze cutoffs, and async ownership.
+4. Extend Sealing intent, archive/catalog verification, restore, backup,
+   repair, and crash-safe v5/v6-to-v7 migration.
 5. After correctness coverage is complete, switch the current PITR writer to
    v7 and activate Parallel in every default constructor and successor path.
    Update current-behavior docs and record the new adoption measurements.
 
-Intermediate implementation commits may expose v7 only through a development
-selector. A released default writer must not create a new format that still
-depends on Leader for correctness. Future format RFCs inherit this rule and
-must specify their recovery/frontier/digest compatibility before activation.
+Intermediate commits may expose v7 through a development selector.
+A released default writer must support Parallel or name the accepted format
+exception from sections 1 and 3. PITR v7 must not depend on Leader for
+correctness. Future format RFCs must specify their recovery/frontier/digest
+compatibility before activation.
 
 ## 9. Required validation and performance evidence
 
 Correctness is an activation requirement. Cover at least:
 
-- Default-mode assertions for all constructors, reopen/repair, PITR
-  enable/resume, ordinary and PITR rotation, and explicit Leader controls.
-- Legacy v2/v3/v4/v5/v6 fixtures and mixed-version archive chains, including
-  empty segments, timestamp gaps, backward wall-clock movement, TTL bytes,
-  canonical point/range ordering, and serializable transactions.
-- Out-of-order groups and multi-SQE groups; short/negative/stale/missing CQEs;
-  partial or ambiguous submission; errors while an earlier healthy prefix
-  finishes; buffer ownership and poisoned close.
-- A crash after every creation, migration, data-sync, marker-write,
-  marker-sync, publication, seal, journal deletion, and manifest transition.
-  Model crashes that preserve C but not B. A process kill alone cannot simulate
-  every allowed persistence order; use a storage model or controlled fault
-  injection in addition to process tests.
-- Torn trailing versus damaged interior journal records; valid-checksum
-  malformed markers; foreign/stale journals; corruption before/after the
-  marked WAL boundary; no marker-based downgrade of a covered corruption.
-- Recovery followed by append using the recovered ticket ordinal, repeated
-  recovery/truncation, both sync failures, and unacknowledged complete markers.
-- Archive/restore digest and index agreement, strict sealed-length checks,
-  recovery-point/checkpoint boundaries, concurrent freeze/close/cancellation,
-  and immutable-object pins during frontier cleanup.
-- Tiny configured limits, simultaneous admissions, maximum batches, seal-index
-  exhaustion, journal allocation overhead, and no full-spool maintenance
-  deadlock. Tests arming failpoints follow the repository's `failpoint_*` rule.
+- Default-mode assertions for constructors, reopen/repair, PITR enable/resume,
+  ordinary/PITR rotation, and explicit Leader controls.
+- Legacy v2/v3/v4/v5/v6 fixtures and mixed-version archive chains; empty
+  segments, timestamp gaps, backward wall-clock movement, TTL bytes, canonical
+  point/range ordering, and serializable transactions.
+- DATA fragmentation, boundary lengths, forged marker-shaped value bytes,
+  noncanonical/foreign frames, overflow checks, multi-SQE groups, and physical
+  allocation races between DATA and FRONTIER, including a marker separating
+  two DATA ranges in one group without being overwritten by packing.
+- Out-of-order groups; short/negative/stale/missing CQEs; partial/ambiguous
+  submission; an earlier healthy prefix finishing while a later group fails;
+  buffer ownership and poisoned close.
+- Crashes after every creation/migration, marker write, WAL sync, publication,
+  copy, replacement/directory sync, seal, and manifest transition. Model
+  persistence of C without B and a complete marker without covered DATA.
+  Process kills alone cannot simulate every allowed persistence order; use
+  a storage model or controlled fault injection.
+- Backward discovery across holes, speculative DATA, partial frames, zeros,
+  and maximum preallocation. Torn final markers, invalid chains/pointers,
+  bad covered DATA, and explicit fallback to older valid candidates.
+  Verify that no acknowledged batch is lost under the stated sync guarantees.
+- Hard manifest/Sealing floors, conflicting seals, and strict immutable
+  validation; no fallback on read errors or below known durable boundaries.
+  Include post-sync damage cases documenting Active v7's detection limits.
+- Recovery after a failed sync with cached complete DATA/FRONTIER and clean
+  page state: force fresh writes, including the unchanged-length case.
+  Fail copy/sync/replace/directory-sync and crash at each recovery step.
+  No service/publication before the installation barrier; repeat recovery
+  must retain the certificate and stable ticket/physical-offset allocation.
+- Archive/restore logical/physical digest and index agreement, v7 empty seal
+  length, recovery-point/checkpoint boundaries, concurrent freeze/close/
+  cancellation, and pinned image cleanup.
+- Tiny limits, simultaneous admissions, maximum batches/frame counts,
+  seal-index exhaustion, marker reservations, recovery temporary/orphan
+  allocation, and no full-spool maintenance/reopen deadlock.
+  Tests arming failpoints follow the repository's `failpoint_*` rule.
 
-The new protocol normally adds a frontier write and a second file sync per
-durability advance. Its cost must be visible. Ordinary v4 Parallel is the
-current default without PITR and MUST be included as a baseline. Retain all
-of these comparisons:
+The normal protocol adds a marker write but retains **one** WAL sync per
+durability advance. Physical framing, two hash streams, marker allocation,
+recovery copying, and contention still have costs. Ordinary v4 Parallel is
+the current default without PITR and MUST be included as a baseline.
+Retain all of these comparisons:
 
 | Comparison | Purpose |
 | --- | --- |
 | Baseline v4 Parallel vs candidate v4 Parallel, PITR off | Detect regressions in ordinary reads, writes, and mixed workloads caused by shared runtime/format-registry changes. |
 | Candidate v7 Parallel, PITR on, vs candidate v4 Parallel, PITR off | Measure the total cost of enabling PITR relative to the ordinary default. |
 | Candidate v7 Parallel vs candidate v7 Leader, PITR on | Measure scheduling and group-overlap benefits with the same format and durability protocol. |
-| Candidate v7 Leader vs candidate v6 Leader, PITR on | Measure the format/frontier-protocol cost with Leader scheduling in both legs. |
+| Candidate v7 Leader vs candidate v6 Leader, PITR on | Measure format/frontier-protocol cost with Leader scheduling in both legs. |
 | Candidate v7 Parallel vs baseline v6 Leader, PITR on | Measure the end-to-end PITR upgrade against the currently shipped PITR path. |
 
-The v7-versus-v4 comparison includes PITR framing, recorded times, hashing,
-seal indexing, frontier persistence, and archive work when active. Report it
-as total PITR overhead; it cannot isolate the second sync or establish a
-performance gain from parallel scheduling. Specify archive activity for each
-run and retain separate controlled cases with and without competing archive
-I/O. Ordinary v4 stays on its existing protocol and incurs no journal sync.
+The v7-versus-v4 comparison includes PITR recorded times, fragmentation,
+logical/physical hashes, indexing, markers, and archive work when active.
+Report total PITR overhead; it cannot isolate marker cost or establish a
+parallel-scheduling gain. Specify archive activity and retain controlled
+cases with and without competing archive I/O. Ordinary v4 keeps its current
+protocol and receives no v7 frames or recovery-copy requirement.
 
-Use the same candidate binary and explicit modes for comparisons within the
-candidate, plus a recorded baseline revision for comparisons across revisions.
-The benchmark harness may retain an explicit v6 creation selector in isolated
-databases; production writers still follow the v7 adoption policy. Never
-reinterpret a file's version to manufacture a benchmark leg. Run on tmpfs and
-a named physical device with 1/4/8/16 writers, single puts and batch64, small
-and large values, rotation, checkpoints, and archive backpressure. Include
-point reads, scans, and mixed read/write ratios in the ordinary regression
-checks and in measurements of contention while PITR is active.
+Use the same candidate binary and explicit modes for comparisons within it,
+plus a recorded baseline revision for comparisons across revisions.
+The harness may retain an explicit v6 creation selector in isolated databases;
+production writers follow v7 adoption policy. Never reinterpret a file's
+version to manufacture a benchmark leg. Run on tmpfs and a named physical
+device with 1/4/8/16 writers, single puts/batch64, small/large values, rotation,
+checkpoints, and archive backpressure. Include point reads, scans, and mixed
+read/write ratios in ordinary regression checks and PITR contention runs.
 
-Report throughput, p50/p99 latency, group occupancy, measured overlap between
-groups, both sync counts/latencies, marker bytes per batch, CPU, buffer/spool
-peaks, and rotation pause. Retain paired runs, confidence intervals, failed
-runs, controls, binary revisions, device/kernel details, and command lines.
-Software outstanding SQEs are not a claim about physical device queue depth.
+Retain a zero-added-wait coalescing control and bounded-wait candidates with
+exact deadlines and batch/byte limits. Measure one-writer device latency
+separately from concurrent throughput and retain p50/p99 regressions even when
+throughput improves. Tmpfs alone cannot qualify physical-device latency;
+one sync per advance does not establish parity with v4 or v6.
 
-RFC 024's original performance gate remains unqualified; its historical
-benchmarks do not qualify v7. This RFC makes Parallel the architectural default
-for new formats after correctness qualification, without claiming a universal
-speedup. Material measured regressions require an explicit maintainer adoption
-decision and documented results before activation, following the
+Report throughput, p50/p99 latency, group occupancy, measured group overlap,
+batches/groups per frontier, coalescing wait, marker-write and WAL-sync
+counts/latencies, DATA/marker bytes per batch, CPU/hash cost, buffer/spool
+peaks, and rotation pause. Report reserved marker/workspace bytes alongside
+actual allocated bytes and admission rejections from each reservation.
+Measure backward discovery bytes/latency, recovery-copy bytes/latency, peak
+temporary/orphan allocation, and replacement syncs separately from normal
+commit latency. A fresh-inode recovery can copy nearly a full active WAL;
+this cost and its reserved workspace must be visible.
+
+Retain paired runs, confidence intervals, failed runs, controls, binary
+revisions, device/kernel details, and command lines. Outstanding SQEs are not
+a claim about physical device queue depth.
+
+RFC 024's original performance gate remains unqualified; historical results
+do not qualify v7. Parallel is the architectural default for new formats after
+correctness qualification, with no universal speedup claim. Material measured
+regressions require an explicit maintainer adoption decision and documented
+results before activation, following the
 [existing adoption note](../docs/wal/rfc-024-parallel-wal-default-20261005.md).
 
 ## 10. Alternatives considered
 
-- **Enable Parallel on v5/v6 without a format change.** Their recovery scanner
-  and seal builder cannot distinguish interrupted overlap from interior
-  corruption. Preserve those formats and introduce v7.
-- **Stop at the first invalid v7 batch without a persisted boundary.** This
-  permits ordinary prefix recovery but cannot enforce the stricter PITR
-  validation of the recorded durable prefix.
-- **Write data and its frontier before their durability barrier.** A crash may
-  persist the boundary before the covered data, even if the marker is embedded
-  in the WAL and both are later covered by one sync. The WAL sync must succeed
-  before the marker is submitted; reducing the two stages needs a separately
-  justified ordering protocol.
+- **Enable Parallel on v5/v6 without a format change.** Their scanners cannot
+  distinguish interrupted overlap from interior corruption. Preserve those
+  formats and introduce v7 with an explicit recovery contract.
+- **Two serial barriers with a side frontier journal.** Syncing DATA before
+  submitting a marker lets a complete marker imply that covered DATA was
+  previously synced. It retains stronger Active corruption classification
+  under the storage assumptions but adds a second serial sync, another file
+  lifecycle, and journal reservations. RFC 025 chooses one WAL barrier with
+  prefix-validated candidate fallback instead.
+- **Accept an in-WAL marker from its CRC alone.** A failed/interrupted sync may
+  persist the marker first. Validate all covered DATA and the logical digest
+  before acceptance; any durable external floor still applies.
+- **Use a forward DATA scanner to discover markers.** It cannot reach a
+  frontier behind an earlier hole. Independent aligned discovery is required.
+- **Scan raw aligned payload for magic without typed DATA frames.** User bytes
+  can resemble a marker. Codec-owned frame headers disambiguate physical
+  control records.
+- **Truncate the original WAL to the accepted DATA end immediately.** This can
+  erase the only valid certificate before another crash. The initial protocol
+  replaces a synced fresh image; its recovery latency and workspace cost are
+  explicit. An alternative that retains old certificates or avoids full copying
+  needs its own failure/writeback proof and crash qualification.
 - **Overwrite alternating frontier pages.** This bounds metadata size, but
-  recovery must reason about overwritten generations and stale fallback.
-  The initial design keeps previous boundaries immutable and charges the
-  resulting journal growth explicitly.
-- **Keep Leader as the permanent PITR default.** This retains the current
-  format restriction and prevents new formats from sharing the pipeline.
-  Leader remains an explicit comparison mode on v7 with the same safety rule.
+  introduces overwritten-generation and stale-slot recovery rules.
+  Initial v7 keeps normal marker writes append-only and reserves their growth.
+- **Keep Leader as the permanent PITR default.** Leader remains an explicit
+  comparison mode with the same v7 protocol; new defaults use Parallel.

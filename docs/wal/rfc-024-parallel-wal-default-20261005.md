@@ -1,6 +1,6 @@
 # RFC 024: parallel WAL default adoption
 
-**Decision:** 2026-10-05. **Last updated:** 2026-10-06.
+**Decision:** 2026-10-05. **Last updated:** 2026-10-08.
 
 Ordinary v4 MVCC WALs now use the parallel pipeline by default. This applies
 when WAL is enabled; it does not enable WAL for configurations that disable it.
@@ -8,9 +8,11 @@ The change follows the maintainer's explicit adoption decision on 2026-10-05.
 It is not a claim that the original RFC performance gate passed.
 
 The proposed [RFC 025](../../rfcs/025-parallel-wal-all-new-formats.md) extends
-the policy to every future WAL format and specifies a PITR v7 frontier journal.
-It requires a new recovery protocol before enabling Parallel for PITR; the
-runtime selection documented here remains the implemented behavior.
+the default policy to future formats, with narrowly documented exceptions.
+PITR v7 embeds DATA/FRONTIER frames, with one WAL sync per advance and an
+explicit Active candidate-validation/fallback contract. Durable manifest and
+sealed archive boundaries remain strict. The proposal requires implementation
+and qualification; the runtime selection below remains the shipped behavior.
 
 ## Runtime selection
 
