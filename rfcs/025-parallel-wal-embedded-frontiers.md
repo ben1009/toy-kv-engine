@@ -122,7 +122,8 @@ use raw bytes without text encoding.
 
 Unless a field is explicitly defined as raw bytes, all multi-byte integer
 fields in v7 frame, fragment, logical-batch, and FRONTIER layouts MUST use
-big-endian encoding. Fixed byte arrays, digests, magic bytes, and padding
+big-endian encoding. Signed integers MUST use two's complement representation
+in big-endian byte order. Fixed byte arrays, digests, magic bytes, and padding
 remain raw bytes.
 
 Every following physical frame is exactly 4096 bytes, starts at a 4096-byte
@@ -791,6 +792,13 @@ compatibility before activation.
 
 Correctness is an activation requirement. Cover at least:
 
+- Byte-exact golden vectors for the immutable header, complete DATA/FRONTIER
+  frames, fragment headers, and reassembled logical batches. Fix expected
+  field offsets, big-endian integer bytes, signed two's complement encoding,
+  zero padding, CRC coverage, and SHA-256 digest preimages independently of
+  the codec under test. For example, `generation = 0x0102030405060708` MUST
+  encode as `01 02 03 04 05 06 07 08`. Check encoding and decoding against
+  fixed bytes; round-trip checks alone do not qualify the wire format.
 - Default-mode assertions for constructors, reopen/repair, PITR enable/resume,
   ordinary/PITR rotation, and explicit Leader controls.
 - Legacy v2/v3/v4/v5/v6 fixtures and mixed-version archive chains; empty
