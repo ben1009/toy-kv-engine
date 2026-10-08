@@ -314,6 +314,7 @@ impl LsmStorageInner {
         cleanup_checkpoint_tmps_for_target(&target_dir)?;
 
         let result = (|| {
+            self.prepare_forced_memtable_freeze()?;
             let _checkpoint_guard = self.checkpoint_lock.lock();
             let prepared = self.prepare_checkpoint(&target_dir, &tmp_dir)?;
             drop(_checkpoint_guard);
@@ -489,7 +490,6 @@ impl LsmStorageInner {
     }
 
     fn flush_all_memtables_for_checkpoint(&self) -> Result<()> {
-        self.prepare_forced_memtable_freeze()?;
         {
             let state_lock = self.state_lock.lock();
             let active_memtable_guard = self.active_memtable_lock.write();
@@ -520,7 +520,43 @@ impl LsmStorageInner {
     /// for the potentially much longer copy/link phase.
     #[allow(dead_code)] // consumed by the forthcoming backup publisher
     pub(crate) fn capture_checkpoint_state(&self) -> Result<CheckpointCapture<'_>> {
+        self.prepare_forced_memtable_freeze()?;
         let _checkpoint_guard = self.checkpoint_lock.lock();
+
+        self.capture_checkpoint_state_locked()
+    }
+
+    /// Capture a PITR base while the caller owns the PITR barrier and keeps
+    /// commit admission stopped. Revalidate that boundary without entering a
+    /// second lifecycle operation under the caller's locks.
+    pub(crate) fn capture_checkpoint_state_after_pitr_boundary(
+        &self,
+        base: &crate::pitr::base::PitrBaseMetadata,
+    ) -> Result<CheckpointCapture<'_>> {
+        let _checkpoint_guard = self.checkpoint_lock.lock();
+        {
+            let _state_lock = self.state_lock.lock();
+            let _active_memtable_guard = self.active_memtable_lock.write();
+            ensure!(
+                self.state.load().memtable.is_empty(),
+                "PITR base capture requires an empty successor memtable"
+            );
+            let state = self.pitr_state.lock();
+            ensure!(
+                state.active_segment_id == Some(base.boundary_segment_id)
+                    && state.predecessor_anchor == Some(base.boundary_anchor),
+                "PITR base capture boundary does not match the active segment"
+            );
+            let commit_ts = self
+                .mvcc
+                .as_ref()
+                .ok_or_else(|| anyhow!("PITR base capture requires MVCC"))?
+                .latest_commit_ts();
+            ensure!(
+                (commit_ts != 0).then_some(commit_ts) == base.included_commit_ts,
+                "PITR base capture commit frontier changed after its boundary"
+            );
+        }
 
         self.capture_checkpoint_state_locked()
     }

@@ -5163,7 +5163,10 @@ impl crate::lsm_storage::LsmStorageInner {
                 "PITR base compatibility does not match the engine"
             );
         }
-        let capture = self.prepare_checkpoint_capture()?;
+        let capture = match pitr_base.as_ref() {
+            Some(base) => self.prepare_pitr_base_checkpoint_capture(base)?,
+            None => self.prepare_checkpoint_capture()?,
+        };
         let BackupOptions {
             repository: repository_path,
             use_hard_links,
@@ -5758,7 +5761,20 @@ impl crate::lsm_storage::LsmStorageInner {
     pub(crate) fn prepare_checkpoint_capture(
         &self,
     ) -> Result<crate::checkpoint::CheckpointCapture<'_>> {
-        let mut capture = self.capture_checkpoint_state()?;
+        self.hash_checkpoint_capture(self.capture_checkpoint_state()?)
+    }
+
+    fn prepare_pitr_base_checkpoint_capture(
+        &self,
+        base: &crate::pitr::base::PitrBaseMetadata,
+    ) -> Result<crate::checkpoint::CheckpointCapture<'_>> {
+        self.hash_checkpoint_capture(self.capture_checkpoint_state_after_pitr_boundary(base)?)
+    }
+
+    fn hash_checkpoint_capture<'a>(
+        &'a self,
+        mut capture: crate::checkpoint::CheckpointCapture<'a>,
+    ) -> Result<crate::checkpoint::CheckpointCapture<'a>> {
         let metadata = self.hash_immutable_file_metadata(&capture.sst_ids, &capture.vlog_ids)?;
         if let crate::manifest::ManifestRecord::Snapshot {
             immutable_file_metadata,
