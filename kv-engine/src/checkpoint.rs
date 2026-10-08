@@ -489,6 +489,7 @@ impl LsmStorageInner {
     }
 
     fn flush_all_memtables_for_checkpoint(&self) -> Result<()> {
+        self.prepare_forced_memtable_freeze()?;
         {
             let state_lock = self.state_lock.lock();
             let active_memtable_guard = self.active_memtable_lock.write();
@@ -498,9 +499,10 @@ impl LsmStorageInner {
                 mvcc.ensure_publication_healthy()?;
             }
             self.sync().context("failed to sync active WAL")?;
-            if !self.state.load().memtable.is_empty() {
-                self.force_freeze_memtable_with_active_guard(&state_lock, &active_memtable_guard)?;
-            }
+            self.force_freeze_memtable_for_explicit_flush_with_active_guard(
+                &state_lock,
+                &active_memtable_guard,
+            )?;
         }
         while !self.state.load().imm_memtables.is_empty() {
             self.force_flush_next_imm_memtable()?;

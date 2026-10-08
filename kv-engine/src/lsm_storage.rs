@@ -3805,6 +3805,74 @@ impl KvEngine {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    fn archive_active_pitr_segment_before_forced_freeze(&self) -> Result<()> {
+        let _operation_guard = self.pitr_operation_lock.lock();
+        let active = self.inner.state.load();
+        if !active.memtable.uses_wal_v5() || active.memtable.is_empty() {
+            return Ok(());
+        }
+        drop(active);
+
+        let state = self.pitr_manifest_state.lock().clone();
+        match state.mode {
+            crate::pitr::manifest::PitrMode::Disabled => return Ok(()),
+            crate::pitr::manifest::PitrMode::Enabled
+            | crate::pitr::manifest::PitrMode::PublicationUncertain => {}
+            _ => {
+                return Err(anyhow!(
+                    "PITR must be resumed before forcing a freeze of its active segment"
+                ));
+            }
+        }
+        let segment_id = state
+            .active_segment_id
+            .ok_or_else(|| anyhow!("PITR state has no active segment"))?;
+        self.run_pitr_maintenance(segment_id)?;
+
+        // A concurrent maintenance pass may have advanced the active ID just
+        // before this call acquired the barrier. In that case its first call is
+        // a no-op, so give the current boundary one chance to reconcile any
+        // obligation the other pass left behind.
+        let state = self.pitr_manifest_state.lock().clone();
+        if matches!(
+            state.mode,
+            crate::pitr::manifest::PitrMode::Enabled
+                | crate::pitr::manifest::PitrMode::PublicationUncertain
+        ) && (state.mode == crate::pitr::manifest::PitrMode::PublicationUncertain
+            || state.obligations.values().any(|obligation| {
+                obligation.state != crate::pitr::manifest::ObligationState::Reclaimable
+            }))
+        {
+            let current_segment_id = state
+                .active_segment_id
+                .ok_or_else(|| anyhow!("PITR state has no active segment"))?;
+            self.run_pitr_maintenance(current_segment_id)?;
+        }
+
+        // A v5 WAL can only be rotated together with its recovery-point
+        // boundary. If maintenance returned without sealing this non-empty
+        // segment, do not let the caller fall through to a plain memtable
+        // freeze and strand the segment outside the archive chain.
+        let active = self.inner.state.load();
+        let state = self.pitr_manifest_state.lock().clone();
+        ensure!(
+            !active.memtable.uses_wal_v5()
+                || active.memtable.is_empty()
+                || state.mode == crate::pitr::manifest::PitrMode::Disabled
+                || state.active_segment_id != Some(segment_id),
+            "PITR maintenance did not establish a segment boundary before forced freeze"
+        );
+        ensure!(
+            state.mode == crate::pitr::manifest::PitrMode::Disabled
+                || state.obligations.values().all(|obligation| {
+                    obligation.state == crate::pitr::manifest::ObligationState::Reclaimable
+                }),
+            "PITR archive obligations remain pending before forced freeze"
+        );
+        Ok(())
+    }
+
     /// Close the engine only after the final PITR boundary is durable.
     #[cfg(target_os = "linux")]
     pub fn close_pitr(&self) -> Result<crate::pitr::api::PitrCloseOutcome> {
@@ -4581,16 +4649,16 @@ impl KvEngine {
     }
 
     /// Only call this in test cases due to race conditions
+    ///
+    /// When PITR is enabled, an active v5 WAL is sealed and archived as a
+    /// recovery-point boundary before its memtable is flushed.
     pub fn force_flush(&self) -> Result<()> {
         crate::profile_scope!("kv.force_flush", {
             if self.inner.state.load().immutable_file_metadata.is_empty() {
                 self.inner.ensure_manifest_v7()?;
             }
             let _checkpoint_guard = self.inner.checkpoint_lock.lock();
-            if !self.inner.state.load().memtable.is_empty() {
-                self.inner
-                    .force_freeze_memtable(&self.inner.state_lock.lock())?;
-            }
+            self.inner.force_freeze_memtable_for_explicit_flush()?;
             if !self.inner.state.load().imm_memtables.is_empty() {
                 self.inner.force_flush_next_imm_memtable()?;
             }
@@ -4602,6 +4670,8 @@ impl KvEngine {
     /// Flush all memtables (current + all immutable) to SSTs.
     /// Unlike `force_flush()` which only flushes one immutable memtable,
     /// this drains the entire queue.
+    /// When PITR is enabled, each active v5 WAL is sealed and archived before
+    /// its memtable is flushed.
     ///
     /// # Warning
     /// Inherits the same race conditions as [`Self::force_flush`] — only use in
@@ -5492,9 +5562,7 @@ impl KvEngine {
             .run_result(move || {
                 let _guard = guard;
                 let _checkpoint_guard = inner.checkpoint_lock.lock();
-                if !inner.state.load().memtable.is_empty() {
-                    inner.force_freeze_memtable(&inner.state_lock.lock())?;
-                }
+                inner.force_freeze_memtable_for_explicit_flush()?;
                 if !inner.state.load().imm_memtables.is_empty() {
                     inner.force_flush_next_imm_memtable()?;
                 }
@@ -5513,15 +5581,13 @@ impl KvEngine {
             .run_result(move || {
                 let _guard = guard;
                 let _checkpoint_guard = inner.checkpoint_lock.lock();
-                if !inner.state.load().memtable.is_empty() {
-                    inner.force_freeze_memtable(&inner.state_lock.lock())?;
-                }
+                inner.force_freeze_memtable_for_explicit_flush()?;
                 if !inner.state.load().imm_memtables.is_empty() {
                     inner.force_flush_next_imm_memtable()?;
                 }
                 while !inner.state.load().imm_memtables.is_empty() {
                     if !inner.state.load().memtable.is_empty() {
-                        inner.force_freeze_memtable(&inner.state_lock.lock())?;
+                        inner.force_freeze_memtable_for_explicit_flush()?;
                     }
                     if !inner.state.load().imm_memtables.is_empty() {
                         inner.force_flush_next_imm_memtable()?;
@@ -10879,12 +10945,21 @@ impl LsmStorageInner {
         *retries += 1;
 
         let _checkpoint_guard = self.checkpoint_lock.lock();
-        let state_lock = self.state_lock.lock();
-        let active = self.state.load_full();
+        let active = self.state.load();
         if Arc::ptr_eq(&active.memtable, expected_memtable) {
             drop(active);
-            self.force_freeze_memtable(&state_lock)
+            self.prepare_forced_memtable_freeze()
+                .context("failed to establish a PITR boundary before WAL rotation")?;
+            let state_lock = self.state_lock.lock();
+            let active_memtable_guard = self.active_memtable_lock.write();
+            let active = self.state.load();
+            if Arc::ptr_eq(&active.memtable, expected_memtable) {
+                self.force_freeze_memtable_for_explicit_flush_with_active_guard(
+                    &state_lock,
+                    &active_memtable_guard,
+                )
                 .context("failed to rotate full active WAL")?;
+            }
         }
 
         Ok(())
@@ -11603,6 +11678,65 @@ impl LsmStorageInner {
     pub fn force_freeze_memtable(&self, _state_lock_observer: &MutexGuard<'_, ()>) -> Result<()> {
         let active_memtable_guard = self.active_memtable_lock.write();
         self.force_freeze_memtable_with_active_guard(_state_lock_observer, &active_memtable_guard)
+    }
+
+    pub(crate) fn prepare_forced_memtable_freeze(&self) -> Result<()> {
+        #[cfg(target_os = "linux")]
+        {
+            let active = self.state.load();
+            if active.memtable.uses_wal_v5() && !active.memtable.is_empty() {
+                drop(active);
+                let engine = self
+                    .weak_engine
+                    .get()
+                    .and_then(std::sync::Weak::upgrade)
+                    .ok_or_else(|| anyhow!("PITR engine owner is not installed"))?;
+                engine.archive_active_pitr_segment_before_forced_freeze()?;
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let active = self.state.load();
+            if active.memtable.uses_wal_v5()
+                && !active.memtable.is_empty()
+                && self.pitr_state.lock().mode != crate::pitr::manifest::PitrMode::Disabled
+            {
+                return Err(anyhow!(
+                    "PITR boundary archival before forced freeze requires Linux"
+                ));
+            }
+        }
+
+        Ok(())
+    }
+
+    pub(crate) fn force_freeze_memtable_for_explicit_flush(&self) -> Result<()> {
+        // Caller holds checkpoint_lock so explicit freezes stay ordered with
+        // checkpoint capture and WAL rotation.
+        self.prepare_forced_memtable_freeze()?;
+        let state_lock = self.state_lock.lock();
+        let active_memtable_guard = self.active_memtable_lock.write();
+        self.force_freeze_memtable_for_explicit_flush_with_active_guard(
+            &state_lock,
+            &active_memtable_guard,
+        )
+    }
+
+    pub(crate) fn force_freeze_memtable_for_explicit_flush_with_active_guard(
+        &self,
+        state_lock_observer: &MutexGuard<'_, ()>,
+        active_memtable_guard: &ActiveMemtableWriteGuard<'_>,
+    ) -> Result<()> {
+        let state = self.state.load();
+        let should_force_freeze = !state.memtable.is_empty()
+            && (!state.memtable.uses_wal_v5()
+                || self.pitr_state.lock().mode == crate::pitr::manifest::PitrMode::Disabled);
+        drop(state);
+        if !should_force_freeze {
+            return Ok(());
+        }
+
+        self.force_freeze_memtable_with_active_guard(state_lock_observer, active_memtable_guard)
     }
 
     pub(crate) fn force_freeze_memtable_with_active_guard(
