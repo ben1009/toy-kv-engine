@@ -324,7 +324,7 @@ buffered. The explicit leader selector remains available for comparison. See
 The pipeline has 32 in-flight group slots and 256 ring entries. The maintainer
 selected the default despite the still-unqualified RFC performance gate; see
 [the benchmark overview](docs/wal/benchmarks/rfc-024-parallel-wal-benchmark.md) for evidence.
-[RFC 025](rfcs/025-parallel-wal-all-new-formats.md) proposes Parallel as the
+[RFC 025](rfcs/025-parallel-wal-embedded-frontiers.md) proposes Parallel as the
 default for future formats, with narrowly documented format exceptions. PITR
 v7 uses in-WAL DATA/FRONTIER frames and one WAL sync per durability advance.
 Active v7 recovery validates candidate prefixes and may fall back above durable

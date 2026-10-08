@@ -18,7 +18,7 @@ remains unqualified; the proposal and benchmark criteria below are retained as
 the historical design, not evidence that the gate passed. The current limits
 are 32 in-flight groups and 256 ring entries.
 
-[RFC 025](025-parallel-wal-all-new-formats.md) proposes Parallel as the default
+[RFC 025](025-parallel-wal-embedded-frontiers.md) proposes Parallel as the default
 for future formats, with narrowly documented exceptions. Its PITR v7 in-WAL
 frontier frames use one sync and an explicit candidate-validation/fallback
 contract for Active recovery. Durable manifest/sealing boundaries stay strict,
@@ -453,7 +453,7 @@ the marked prefix. A sidecar may add a second sync per frontier advance.
 This RFC does not assume that an in-memory frontier or a later valid batch
 alone proves which writes were acknowledged before a crash.
 
-The follow-on [RFC 025](025-parallel-wal-all-new-formats.md) selects a single
+The follow-on [RFC 025](025-parallel-wal-embedded-frontiers.md) selects a single
 WAL sync covering DATA and an embedded FRONTIER. A complete marker is a
 candidate until its covered DATA and digest validate; Active v7 may fall back
 to an older validated candidate above durable manifest floors. This explicitly

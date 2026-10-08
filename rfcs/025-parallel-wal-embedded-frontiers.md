@@ -1,4 +1,4 @@
-# RFC 025: Parallel WAL by Default for All New Formats
+# RFC 025: Parallel WAL with Embedded Frontiers and One Sync
 
 | Field | Value |
 | --- | --- |

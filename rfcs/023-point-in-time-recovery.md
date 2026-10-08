@@ -20,7 +20,7 @@ and their existing strict recovery, sealing, and hash-chain rules. The
 [default adoption note](../docs/wal/rfc-024-parallel-wal-default-20261005.md)
 records the format boundary; this change does not enable parallel PITR writes.
 
-[RFC 025](025-parallel-wal-all-new-formats.md) proposes PITR v7 with persistent
+[RFC 025](025-parallel-wal-embedded-frontiers.md) proposes PITR v7 with persistent
 batch tickets and in-WAL DATA/FRONTIER frames so new PITR segments can default
 to Parallel with one WAL sync per advance. Active v7 validates candidate
 prefixes and may fall back above durable manifest boundaries; sealing and
