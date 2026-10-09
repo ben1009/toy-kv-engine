@@ -888,44 +888,19 @@ fn encode_model_entry_stream(value: &[u8], commit_ts: u64) -> Result<Vec<u8>> {
     Ok(encoded[data_start..data_end].to_vec())
 }
 
-/// Re-wraps a v7 logical entry stream in a temporary v5 envelope so the
-/// production RFC 023 decoder validates kinds, lengths, flags, and exact use of
-/// the declared entry count before the model accepts it.
+/// Use the shared RFC 023 entry-stream decoder after the v7 logical header has
+/// validated its own length and checksum fields.
 fn decode_model_entry_stream(header: WalV7LogicalBatchHeader, data: &[u8]) -> Result<WalBatch> {
-    let header_len = crate::pitr::WAL_V5_BATCH_HEADER_LEN;
-    let data_end = header_len
-        .checked_add(data.len())
-        .ok_or_else(|| anyhow::anyhow!("model v5 batch length overflows"))?;
-    let alignment = crate::pitr::WAL_V5_ALIGNMENT;
-    let aligned_len = data_end
-        .checked_add(alignment - 1)
-        .ok_or_else(|| anyhow::anyhow!("model v5 batch alignment overflows"))?
-        / alignment
-        * alignment;
-    let mut encoded = vec![0; aligned_len];
-    encoded[0..8].copy_from_slice(&header.commit_ts.to_be_bytes());
-    encoded[8..16].copy_from_slice(&header.recorded_at_secs.to_be_bytes());
-    encoded[16..20].copy_from_slice(&header.recorded_at_nanos.to_be_bytes());
-    encoded[20..24].copy_from_slice(&header.entry_count.to_be_bytes());
-    encoded[24..28].copy_from_slice(&u32::try_from(data.len())?.to_be_bytes());
-    encoded[28..32].copy_from_slice(&crc32fast::hash(data).to_be_bytes());
-    let header_crc = crc32fast::hash(&encoded[..28]);
-    encoded[32..36].copy_from_slice(&header_crc.to_be_bytes());
-    encoded[header_len..data_end].copy_from_slice(data);
-
-    let decoded = crate::pitr::decode_v5_batch(&encoded, 0, LIVE_WAL_V5_LIMITS)?;
-    ensure!(
-        decoded.data_end == data_end && decoded.logical_end == aligned_len,
-        "model RFC 023 decoder consumed an unexpected entry-stream length"
-    );
-    ensure!(
-        decoded.batch.commit_ts == header.commit_ts
-            && decoded.batch.recorded_at.secs == header.recorded_at_secs
-            && decoded.batch.recorded_at.nanos == header.recorded_at_nanos
-            && decoded.batch.entries.len() == usize::try_from(header.entry_count)?,
-        "model RFC 023 decoded batch metadata disagrees with v7 header"
-    );
-    Ok(decoded.batch)
+    crate::pitr::decode_wal_entry_stream(
+        header.commit_ts,
+        RecordedAt {
+            secs: header.recorded_at_secs,
+            nanos: header.recorded_at_nanos,
+        },
+        header.entry_count,
+        data,
+        LIVE_WAL_V5_LIMITS,
+    )
 }
 
 fn validate_recorded_time_order(

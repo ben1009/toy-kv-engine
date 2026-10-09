@@ -1,4 +1,4 @@
-//! Bounded backward discovery of v7 WAL frontier candidates.
+//! Bounded v7 WAL frontier discovery and candidate-prefix verification.
 //!
 //! Discovery is deliberately independent of DATA decoding. Its results are
 //! structural candidates only; recovery must still verify each candidate's
@@ -8,11 +8,15 @@
 use std::io::{Read, Seek, SeekFrom};
 
 use anyhow::{Context, Result, ensure};
+use sha2::{Digest, Sha256};
 
 use super::codec::{
-    DecodedWalV7Frame, WAL_V7_FRAME_LEN, WAL_V7_HEADER_LEN, WalV7FrameKind, WalV7Frontier,
-    decode_frame_structural, frame_record_digest, is_frontier_frame_header,
+    DecodedWalV7Frame, WAL_V7_FRAME_LEN, WAL_V7_HEADER_LEN, WAL_V7_LOGICAL_BATCH_HEADER_LEN,
+    WalV7DataFragmentHeader, WalV7FrameKind, WalV7Frontier, WalV7Header, WalV7LogicalBatchHeader,
+    decode_frame_structural, decode_frontier_successor, encode_frontier_successor,
+    encode_generation_zero_frontier, frame_record_digest, is_frontier_frame_header,
 };
+use crate::pitr::{LIVE_WAL_V5_LIMITS, RecordedAt, decode_wal_entry_stream};
 use crate::wal::MAX_WAL_FILE_SIZE;
 
 const DISCOVERY_BATCH_FRAMES: usize = 64;
@@ -85,6 +89,65 @@ impl WalV7FrontierDiscovery {
 
         Ok(())
     }
+}
+
+/// Candidate prefix verification results from one bounded forward pass.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct WalV7FrontierPrefixVerification {
+    /// Candidates whose exact DATA and control prefixes verified.
+    pub(crate) verified_candidates: Vec<WalV7FrontierCandidate>,
+    /// A bounded sample of candidates rejected during prefix verification.
+    pub(crate) rejected_candidates: Vec<WalV7RejectedFrontier>,
+    pub(crate) rejected_candidate_count: u64,
+    /// The end of the forward prefix verified before corruption stopped scanning.
+    pub(crate) verified_prefix_end: u64,
+    /// The first invalid physical frame, if scanning stopped before the longest
+    /// candidate prefix requested.
+    pub(crate) stopped_at: Option<WalV7RejectedFrontier>,
+}
+
+impl WalV7FrontierPrefixVerification {
+    fn reject(&mut self, frame_offset: u64, error: impl std::fmt::Display) -> Result<()> {
+        self.rejected_candidate_count = self
+            .rejected_candidate_count
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("v7 rejected-candidate count overflows"))?;
+        if self.rejected_candidates.len() < MAX_REJECTED_FRONTIER_DIAGNOSTICS {
+            self.rejected_candidates
+                .try_reserve(1)
+                .context("reserve v7 rejected-candidate diagnostic")?;
+            self.rejected_candidates.push(WalV7RejectedFrontier {
+                frame_offset,
+                reason: bounded_reason(error),
+            });
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct WalV7PrefixCheckpoint {
+    /// DATA extent for this ticket, or 4096 for the empty prefix.
+    data_start: u64,
+    data_end: u64,
+    last_commit_ts: u64,
+    prefix_digest: [u8; 32],
+}
+
+#[derive(Clone, Copy, Debug)]
+struct WalV7PrefixFrontier {
+    frame_offset: u64,
+    frontier: WalV7Frontier,
+    frame_digest: [u8; 32],
+    chain_breaks_through: u64,
+}
+
+fn bounded_reason(error: impl std::fmt::Display) -> String {
+    error
+        .to_string()
+        .chars()
+        .take(MAX_REJECTION_REASON_CHARS)
+        .collect()
 }
 
 /// Scan aligned frame slots backward and collect structurally valid FRONTIERs.
@@ -182,6 +245,531 @@ pub(crate) fn discover_frontier_candidates<R: Read + Seek>(
     Ok(discovery)
 }
 
+/// Verify every discovered candidate using a single bounded forward pass.
+///
+/// The caller must hold exclusive recovery ownership of the image between
+/// discovery and verification. `candidates` must come from discovery on this
+/// same unchanged image, and `file_len` must be that same stable length snapshot.
+/// Structural candidates beyond a corrupt physical prefix can still verify if
+/// their named `durable_end` excludes the corrupt bytes.
+pub(crate) fn verify_frontier_candidate_prefixes<R: Read + Seek>(
+    reader: &mut R,
+    file_len: u64,
+    candidates: &[WalV7FrontierCandidate],
+) -> Result<WalV7FrontierPrefixVerification> {
+    ensure!(
+        file_len >= HEADER_LEN_U64 + FRAME_LEN_U64,
+        "installed v7 WAL image is missing generation-zero FRONTIER"
+    );
+    ensure!(
+        file_len <= MAX_WAL_FILE_SIZE,
+        "v7 WAL image exceeds the 1 GiB recovery limit"
+    );
+
+    reader
+        .seek(SeekFrom::Start(0))
+        .context("seek v7 WAL immutable header")?;
+    let mut header_bytes = [0_u8; WAL_V7_HEADER_LEN];
+    reader
+        .read_exact(&mut header_bytes)
+        .context("read v7 WAL immutable header")?;
+    let header = WalV7Header::decode(&header_bytes)?;
+    ensure!(
+        header.encode()? == header_bytes,
+        "v7 WAL immutable header is not canonical"
+    );
+    let header_digest: [u8; 32] = Sha256::digest(header_bytes).into();
+
+    let mut verification = WalV7FrontierPrefixVerification::default();
+    let generation_zero_bytes = read_frame(reader, HEADER_LEN_U64)?;
+    let generation_zero =
+        decode_frame_structural(&generation_zero_bytes, HEADER_LEN_U64, &header_digest)?;
+    ensure!(
+        generation_zero.kind == WalV7FrameKind::Frontier,
+        "v7 generation-zero slot is not a FRONTIER"
+    );
+    let generation_zero_frontier = WalV7Frontier::decode_body(&generation_zero.body)?;
+    generation_zero_frontier.validate_generation_zero(&header_digest, HEADER_LEN_U64)?;
+    let generation_zero_digest = frame_record_digest(&generation_zero_bytes)?;
+    let canonical_generation_zero = encode_generation_zero_frontier(header_digest)?;
+    ensure!(
+        generation_zero_bytes == canonical_generation_zero,
+        "v7 generation-zero FRONTIER is not canonical"
+    );
+
+    let mut logical_hasher = Sha256::new();
+    logical_hasher.update(header_bytes);
+    let mut checkpoints = Vec::new();
+    checkpoints
+        .try_reserve(
+            candidates
+                .len()
+                .min(usize::try_from(file_len / FRAME_LEN_U64)?),
+        )
+        .context("reserve v7 prefix checkpoints")?;
+    checkpoints
+        .try_reserve(1)
+        .context("reserve initial v7 prefix checkpoint")?;
+    checkpoints.push(WalV7PrefixCheckpoint {
+        data_start: HEADER_LEN_U64,
+        data_end: HEADER_LEN_U64,
+        last_commit_ts: 0,
+        prefix_digest: header_digest,
+    });
+    let mut frontiers = Vec::new();
+    frontiers
+        .try_reserve(
+            candidates
+                .len()
+                .min(usize::try_from(file_len / FRAME_LEN_U64)?),
+        )
+        .context("reserve v7 prefix FRONTIER metadata")?;
+    frontiers
+        .try_reserve(1)
+        .context("reserve generation-zero FRONTIER metadata")?;
+    frontiers.push(WalV7PrefixFrontier {
+        frame_offset: HEADER_LEN_U64,
+        frontier: generation_zero_frontier,
+        frame_digest: generation_zero_digest,
+        chain_breaks_through: 0,
+    });
+
+    let mut maximum_candidate_end = HEADER_LEN_U64;
+    for candidate in candidates {
+        if !candidate_has_valid_frame_bounds(candidate, file_len) {
+            verification.reject(
+                candidate.frame_offset,
+                "candidate marker or covered-prefix bounds are invalid",
+            )?;
+            continue;
+        }
+        maximum_candidate_end = maximum_candidate_end.max(candidate.frontier.durable_end);
+    }
+
+    let mut cursor = HEADER_LEN_U64 + FRAME_LEN_U64;
+    let mut last_commit_ts = 0_u64;
+    let mut last_recorded_at = None;
+    let mut stopped_at = None;
+
+    while cursor < maximum_candidate_end {
+        let frame_offset = cursor;
+        let encoded_frame = read_frame(reader, frame_offset)?;
+        let decoded = match decode_frame_structural(&encoded_frame, frame_offset, &header_digest) {
+            Ok(frame) => frame,
+            Err(error) => {
+                stopped_at = Some(rejected_prefix(frame_offset, error));
+                break;
+            }
+        };
+
+        match decoded.kind {
+            WalV7FrameKind::Data => {
+                let (first_fragment, first_payload) =
+                    match WalV7DataFragmentHeader::decode_body(&decoded.body) {
+                        Ok(fragment) => fragment,
+                        Err(error) => {
+                            stopped_at = Some(rejected_prefix(frame_offset, error));
+                            break;
+                        }
+                    };
+                let expected_ticket = u64::try_from(checkpoints.len() - 1)?;
+                if first_fragment.segment_ticket != expected_ticket
+                    || first_fragment.fragment_index != 0
+                {
+                    stopped_at = Some(rejected_prefix(
+                        frame_offset,
+                        anyhow::anyhow!("v7 DATA ticket order or first fragment index is invalid"),
+                    ));
+                    break;
+                }
+
+                let batch_len = match usize::try_from(first_fragment.batch_bytes) {
+                    Ok(length) => length,
+                    Err(error) => {
+                        stopped_at = Some(rejected_prefix(frame_offset, error));
+                        break;
+                    }
+                };
+                let max_batch_len = WAL_V7_LOGICAL_BATCH_HEADER_LEN
+                    .checked_add(LIVE_WAL_V5_LIMITS.max_batch_data_bytes)
+                    .ok_or_else(|| anyhow::anyhow!("v7 logical batch limit overflows"))?;
+                if batch_len > max_batch_len {
+                    stopped_at = Some(rejected_prefix(
+                        frame_offset,
+                        anyhow::anyhow!("v7 DATA batch exceeds configured byte limit"),
+                    ));
+                    break;
+                }
+
+                let fragment_count = u64::from(first_fragment.fragment_count);
+                let batch_end = match fragment_count
+                    .checked_mul(FRAME_LEN_U64)
+                    .and_then(|span| frame_offset.checked_add(span))
+                {
+                    Some(end) if end <= maximum_candidate_end => end,
+                    _ => {
+                        stopped_at = Some(rejected_prefix(
+                            frame_offset,
+                            anyhow::anyhow!("v7 DATA batch extends beyond the verified prefix"),
+                        ));
+                        break;
+                    }
+                };
+
+                let mut batch_bytes = Vec::new();
+                batch_bytes
+                    .try_reserve_exact(batch_len)
+                    .context("reserve v7 logical batch buffer")?;
+                batch_bytes.extend_from_slice(first_payload);
+                let fragment_count = usize::try_from(first_fragment.fragment_count)?;
+                let mut fragment_error = None;
+                for fragment_index in 1..fragment_count {
+                    let fragment_offset = frame_offset
+                        .checked_add(
+                            u64::try_from(fragment_index)?
+                                .checked_mul(FRAME_LEN_U64)
+                                .ok_or_else(|| anyhow::anyhow!("v7 fragment offset overflows"))?,
+                        )
+                        .ok_or_else(|| anyhow::anyhow!("v7 fragment offset overflows"))?;
+                    let encoded_fragment = read_frame(reader, fragment_offset)?;
+                    let fragment_frame = match decode_frame_structural(
+                        &encoded_fragment,
+                        fragment_offset,
+                        &header_digest,
+                    ) {
+                        Ok(frame) => frame,
+                        Err(error) => {
+                            fragment_error = Some(error);
+                            break;
+                        }
+                    };
+                    if fragment_frame.kind != WalV7FrameKind::Data {
+                        fragment_error = Some(anyhow::anyhow!("v7 DATA batch is interleaved"));
+                        break;
+                    }
+                    let (fragment, payload) =
+                        match WalV7DataFragmentHeader::decode_body(&fragment_frame.body) {
+                            Ok(fragment) => fragment,
+                            Err(error) => {
+                                fragment_error = Some(error);
+                                break;
+                            }
+                        };
+                    if fragment.segment_ticket != first_fragment.segment_ticket
+                        || fragment.fragment_index != u32::try_from(fragment_index)?
+                        || fragment.fragment_count != first_fragment.fragment_count
+                        || fragment.batch_bytes != first_fragment.batch_bytes
+                    {
+                        fragment_error = Some(anyhow::anyhow!("v7 DATA fragments disagree"));
+                        break;
+                    }
+                    batch_bytes.extend_from_slice(payload);
+                }
+                if let Some(error) = fragment_error {
+                    stopped_at = Some(rejected_prefix(frame_offset, error));
+                    break;
+                }
+                if batch_bytes.len() != batch_len
+                    || batch_bytes.len() < WAL_V7_LOGICAL_BATCH_HEADER_LEN
+                {
+                    stopped_at = Some(rejected_prefix(
+                        frame_offset,
+                        anyhow::anyhow!("v7 DATA fragments have an invalid total length"),
+                    ));
+                    break;
+                }
+
+                let data = &batch_bytes[WAL_V7_LOGICAL_BATCH_HEADER_LEN..];
+                let logical_header = match WalV7LogicalBatchHeader::decode(
+                    &batch_bytes[..WAL_V7_LOGICAL_BATCH_HEADER_LEN],
+                    data,
+                    first_fragment.segment_ticket,
+                    first_fragment.batch_bytes,
+                    LIVE_WAL_V5_LIMITS,
+                ) {
+                    Ok(header) => header,
+                    Err(error) => {
+                        stopped_at = Some(rejected_prefix(frame_offset, error));
+                        break;
+                    }
+                };
+                let recorded_at = RecordedAt {
+                    secs: logical_header.recorded_at_secs,
+                    nanos: logical_header.recorded_at_nanos,
+                };
+                let batch = match decode_wal_entry_stream(
+                    logical_header.commit_ts,
+                    recorded_at,
+                    logical_header.entry_count,
+                    data,
+                    LIVE_WAL_V5_LIMITS,
+                ) {
+                    Ok(batch) => batch,
+                    Err(error) => {
+                        stopped_at = Some(rejected_prefix(frame_offset, error));
+                        break;
+                    }
+                };
+                if batch.commit_ts <= last_commit_ts
+                    || last_recorded_at.is_some_and(|previous| batch.recorded_at < previous)
+                {
+                    stopped_at = Some(rejected_prefix(
+                        frame_offset,
+                        anyhow::anyhow!("v7 commit timestamps or recorded times are out of order"),
+                    ));
+                    break;
+                }
+
+                logical_hasher.update(&batch_bytes);
+                checkpoints
+                    .try_reserve(1)
+                    .context("grow v7 prefix checkpoint metadata")?;
+                checkpoints.push(WalV7PrefixCheckpoint {
+                    data_start: frame_offset,
+                    data_end: batch_end,
+                    last_commit_ts: batch.commit_ts,
+                    prefix_digest: logical_hasher.clone().finalize().into(),
+                });
+                last_commit_ts = batch.commit_ts;
+                last_recorded_at = Some(batch.recorded_at);
+                cursor = batch_end;
+            }
+            WalV7FrameKind::Frontier => {
+                let frontier = match WalV7Frontier::decode_body(&decoded.body) {
+                    Ok(frontier) => frontier,
+                    Err(error) => {
+                        stopped_at = Some(rejected_prefix(frame_offset, error));
+                        break;
+                    }
+                };
+                let frame_digest = frame_record_digest(&encoded_frame)?;
+                let predecessor = match prefix_predecessor(&frontiers, frontier.durable_end) {
+                    Ok(predecessor) => predecessor,
+                    Err(error) => {
+                        stopped_at = Some(rejected_prefix(frame_offset, error));
+                        break;
+                    }
+                };
+                if let Err(error) =
+                    validate_named_frontier_prefix(frontier, predecessor, &checkpoints)
+                {
+                    stopped_at = Some(rejected_prefix(frame_offset, error));
+                    break;
+                }
+                if let Err(error) = decode_frontier_successor(
+                    &encoded_frame,
+                    frame_offset,
+                    &header_digest,
+                    predecessor.frontier,
+                    predecessor.frame_offset,
+                    &predecessor.frame_digest,
+                ) {
+                    stopped_at = Some(rejected_prefix(frame_offset, error));
+                    break;
+                }
+
+                let previous_physical = frontiers
+                    .last()
+                    .context("v7 frontier prefix lost generation zero")?;
+                let follows_physical_chain = frontier.previous_frontier_offset
+                    == previous_physical.frame_offset
+                    && frontier.previous_frontier_digest == previous_physical.frame_digest
+                    && previous_physical.frontier.generation.checked_add(1)
+                        == Some(frontier.generation);
+                let chain_breaks_through = previous_physical
+                    .chain_breaks_through
+                    .checked_add(u64::from(!follows_physical_chain))
+                    .ok_or_else(|| anyhow::anyhow!("v7 FRONTIER chain-break count overflows"))?;
+                frontiers
+                    .try_reserve(1)
+                    .context("grow v7 prefix FRONTIER metadata")?;
+                frontiers.push(WalV7PrefixFrontier {
+                    frame_offset,
+                    frontier,
+                    frame_digest,
+                    chain_breaks_through,
+                });
+                cursor = cursor
+                    .checked_add(FRAME_LEN_U64)
+                    .ok_or_else(|| anyhow::anyhow!("v7 prefix offset overflows"))?;
+            }
+        }
+    }
+
+    verification.verified_prefix_end = cursor;
+    verification.stopped_at = stopped_at.clone();
+    for candidate in candidates {
+        if !candidate_has_valid_frame_bounds(candidate, file_len) {
+            continue;
+        }
+        if candidate.frontier.durable_end > cursor {
+            let reason = stopped_at.as_ref().map_or_else(
+                || "candidate prefix was not scanned".to_owned(),
+                |stop| {
+                    format!(
+                        "candidate prefix extends past invalid frame at {}: {}",
+                        stop.frame_offset, stop.reason
+                    )
+                },
+            );
+            verification.reject(candidate.frame_offset, reason)?;
+            continue;
+        }
+        match verify_candidate_prefix(
+            candidate,
+            &header_digest,
+            generation_zero_frontier,
+            generation_zero_digest,
+            &frontiers,
+            &checkpoints,
+        ) {
+            Ok(()) => {
+                verification
+                    .verified_candidates
+                    .try_reserve(1)
+                    .context("grow verified v7 candidate metadata")?;
+                verification.verified_candidates.push(candidate.clone());
+            }
+            Err(error) => verification.reject(candidate.frame_offset, error)?,
+        }
+    }
+
+    Ok(verification)
+}
+
+fn candidate_has_valid_frame_bounds(candidate: &WalV7FrontierCandidate, file_len: u64) -> bool {
+    candidate.frame_offset >= HEADER_LEN_U64
+        && candidate.frame_offset.is_multiple_of(FRAME_LEN_U64)
+        && candidate
+            .frame_offset
+            .checked_add(FRAME_LEN_U64)
+            .is_some_and(|end| end <= file_len)
+        && candidate.frontier.durable_end >= HEADER_LEN_U64
+        && candidate.frontier.durable_end <= candidate.frame_offset
+        && candidate.frontier.durable_end.is_multiple_of(FRAME_LEN_U64)
+}
+
+fn verify_candidate_prefix(
+    candidate: &WalV7FrontierCandidate,
+    header_digest: &[u8; 32],
+    generation_zero: WalV7Frontier,
+    generation_zero_digest: [u8; 32],
+    frontiers: &[WalV7PrefixFrontier],
+    checkpoints: &[WalV7PrefixCheckpoint],
+) -> Result<()> {
+    if candidate.frontier.generation == 0 {
+        ensure!(
+            candidate.frame_offset == HEADER_LEN_U64
+                && candidate.frontier == generation_zero
+                && candidate.frame_digest == generation_zero_digest,
+            "v7 generation-zero candidate does not match its canonical frame"
+        );
+        return Ok(());
+    }
+    ensure!(
+        candidate.frame_offset != HEADER_LEN_U64,
+        "v7 generation-zero FRONTIER is not at offset 4096"
+    );
+
+    let predecessor = prefix_predecessor(frontiers, candidate.frontier.durable_end)?;
+    validate_named_frontier_prefix(candidate.frontier, predecessor, checkpoints)?;
+    let encoded = encode_frontier_successor(
+        candidate.frontier,
+        predecessor.frontier,
+        predecessor.frame_offset,
+        &predecessor.frame_digest,
+        candidate.frame_offset,
+        *header_digest,
+    )?;
+    ensure!(
+        frame_record_digest(&encoded)? == candidate.frame_digest,
+        "v7 candidate marker digest does not match its canonical frontier"
+    );
+    Ok(())
+}
+
+fn prefix_predecessor(
+    frontiers: &[WalV7PrefixFrontier],
+    durable_end: u64,
+) -> Result<&WalV7PrefixFrontier> {
+    let count = frontiers.partition_point(|frontier| {
+        frontier
+            .frame_offset
+            .checked_add(FRAME_LEN_U64)
+            .is_some_and(|end| end <= durable_end)
+    });
+    ensure!(count > 0, "v7 FRONTIER prefix omits generation zero");
+    let predecessor = &frontiers[count - 1];
+    ensure!(
+        predecessor.chain_breaks_through == 0,
+        "v7 FRONTIER prefix contains a fork or orphan control frame"
+    );
+    Ok(predecessor)
+}
+
+fn validate_named_frontier_prefix(
+    frontier: WalV7Frontier,
+    predecessor: &WalV7PrefixFrontier,
+    checkpoints: &[WalV7PrefixCheckpoint],
+) -> Result<()> {
+    let ticket_end = usize::try_from(frontier.ticket_end)?;
+    ensure!(
+        ticket_end < checkpoints.len(),
+        "v7 FRONTIER ticket end exceeds verified DATA"
+    );
+    let checkpoint = checkpoints[ticket_end];
+    ensure!(
+        checkpoint.last_commit_ts == frontier.last_commit_ts
+            && checkpoint.prefix_digest == frontier.prefix_digest,
+        "v7 FRONTIER logical timestamp or prefix digest mismatch"
+    );
+
+    let covered_batches = &checkpoints[1..];
+    let complete_batch_count =
+        covered_batches.partition_point(|batch| batch.data_end <= frontier.durable_end);
+    if let Some(partial_batch) = covered_batches.get(complete_batch_count) {
+        ensure!(
+            partial_batch.data_start >= frontier.durable_end,
+            "v7 FRONTIER durable_end splits a DATA batch"
+        );
+    }
+    ensure!(
+        u64::try_from(complete_batch_count)? == frontier.ticket_end,
+        "v7 FRONTIER prefix contains a different DATA ticket count"
+    );
+
+    let data_end = if ticket_end == 0 {
+        HEADER_LEN_U64
+    } else {
+        checkpoint.data_end
+    };
+    let predecessor_end = predecessor
+        .frame_offset
+        .checked_add(FRAME_LEN_U64)
+        .ok_or_else(|| anyhow::anyhow!("v7 predecessor frame end overflows"))?;
+    let expected_durable_end = data_end.max(predecessor_end);
+    ensure!(
+        frontier.durable_end == expected_durable_end,
+        "v7 FRONTIER durable_end does not match its DATA and control prefix"
+    );
+    Ok(())
+}
+
+fn read_frame<R: Read>(reader: &mut R, frame_offset: u64) -> Result<[u8; WAL_V7_FRAME_LEN]> {
+    let mut frame = [0_u8; WAL_V7_FRAME_LEN];
+    reader
+        .read_exact(&mut frame)
+        .with_context(|| format!("read v7 WAL frame at {frame_offset}"))?;
+    Ok(frame)
+}
+
+fn rejected_prefix(frame_offset: u64, error: impl std::fmt::Display) -> WalV7RejectedFrontier {
+    WalV7RejectedFrontier {
+        frame_offset,
+        reason: bounded_reason(error),
+    }
+}
+
 fn frontier_candidate(
     frame: DecodedWalV7Frame,
     encoded_frame: &[u8],
@@ -202,10 +790,16 @@ mod tests {
     use std::io::{self, Cursor, Read, Seek, SeekFrom};
 
     use anyhow::Result;
+    use sha2::{Digest, Sha256};
 
     use super::*;
+    use crate::pitr::{
+        ArchiveEpochId, ChainAnchor, LIVE_WAL_V5_LIMITS, RecordedAt, SegmentId, TimelineId,
+        WalBatch, WalEntry, encode_v5_batch,
+    };
     use crate::wal::v7::codec::{
-        WalV7Frontier, decode_frame_structural, encode_frontier_successor,
+        WAL_V7_DATA_FRAGMENT_PAYLOAD_CAPACITY, WalV7Frontier, WalV7LogicalBatchHeader,
+        decode_frame_structural, encode_data_frame, encode_frontier_successor,
         encode_generation_zero_frontier,
     };
 
@@ -258,6 +852,467 @@ mod tests {
             HEADER_DIGEST,
         )?;
         Ok((frame, frontier))
+    }
+
+    fn test_header() -> WalV7Header {
+        let archive_epoch_id = ArchiveEpochId([0x22; 16]);
+        WalV7Header {
+            timeline_id: TimelineId([0x11; 16]),
+            archive_epoch_id,
+            segment_id: SegmentId(7),
+            predecessor: ChainAnchor::Genesis { archive_epoch_id },
+            incarnation: [0x44; 16],
+        }
+    }
+
+    struct TestWalImage {
+        image: Vec<u8>,
+        header_digest: [u8; 32],
+        frontier_zero: WalV7Frontier,
+        frontier_zero_digest: [u8; 32],
+    }
+
+    struct SuccessorSpec {
+        previous: WalV7Frontier,
+        previous_offset: u64,
+        previous_digest: [u8; 32],
+        frame_offset: u64,
+        ticket_end: u64,
+        durable_end: u64,
+        last_commit_ts: u64,
+        prefix_digest: [u8; 32],
+    }
+
+    fn test_image() -> Result<TestWalImage> {
+        let header_bytes = test_header().encode()?;
+        let header_digest: [u8; 32] = Sha256::digest(header_bytes).into();
+        let generation_zero_frame = encode_generation_zero_frontier(header_digest)?;
+        let generation_zero = WalV7Frontier {
+            generation: 0,
+            ticket_end: 0,
+            durable_end: WAL_V7_HEADER_LEN as u64,
+            last_commit_ts: 0,
+            prefix_digest: header_digest,
+            previous_frontier_offset: 0,
+            previous_frontier_digest: [0; 32],
+        };
+        let generation_zero_digest = frame_record_digest(&generation_zero_frame)?;
+        let mut image = header_bytes.to_vec();
+        install_frame(&mut image, HEADER_LEN_U64, &generation_zero_frame)?;
+        Ok(TestWalImage {
+            image,
+            header_digest,
+            frontier_zero: generation_zero,
+            frontier_zero_digest: generation_zero_digest,
+        })
+    }
+
+    fn append_data_batch(
+        image: &mut Vec<u8>,
+        frame_offset: u64,
+        header_digest: [u8; 32],
+        ticket: u64,
+        commit_ts: u64,
+        recorded_at_secs: i64,
+        value: &[u8],
+    ) -> Result<(u64, Vec<u8>)> {
+        let batch = WalBatch {
+            commit_ts,
+            recorded_at: RecordedAt {
+                secs: recorded_at_secs,
+                nanos: 123,
+            },
+            entries: vec![WalEntry::Put {
+                key: format!("key-{ticket}").into_bytes(),
+                value: value.to_vec(),
+            }],
+        };
+        let encoded_v5 = encode_v5_batch(&batch, LIVE_WAL_V5_LIMITS)?;
+        let data_len = usize::try_from(u32::from_be_bytes(
+            encoded_v5[24..28]
+                .try_into()
+                .expect("v5 data length is four bytes"),
+        ))?;
+        let data_end = crate::pitr::WAL_V5_BATCH_HEADER_LEN
+            .checked_add(data_len)
+            .ok_or_else(|| anyhow::anyhow!("test entry stream end overflows"))?;
+        let data = &encoded_v5[crate::pitr::WAL_V5_BATCH_HEADER_LEN..data_end];
+        let logical_header = WalV7LogicalBatchHeader {
+            segment_ticket: ticket,
+            commit_ts,
+            recorded_at_secs,
+            recorded_at_nanos: batch.recorded_at.nanos,
+            entry_count: u32::try_from(batch.entries.len())?,
+        }
+        .encode(data, LIVE_WAL_V5_LIMITS)?;
+        let mut logical_batch = Vec::with_capacity(logical_header.len() + data.len());
+        logical_batch.extend_from_slice(&logical_header);
+        logical_batch.extend_from_slice(data);
+
+        let fragment_count = logical_batch
+            .len()
+            .div_ceil(WAL_V7_DATA_FRAGMENT_PAYLOAD_CAPACITY);
+        let fragment_count_u32 = u32::try_from(fragment_count)?;
+        for (fragment_index, payload) in logical_batch
+            .chunks(WAL_V7_DATA_FRAGMENT_PAYLOAD_CAPACITY)
+            .enumerate()
+        {
+            let fragment_offset = frame_offset
+                .checked_add(
+                    u64::try_from(fragment_index)?
+                        .checked_mul(FRAME_LEN_U64)
+                        .ok_or_else(|| anyhow::anyhow!("test fragment offset overflows"))?,
+                )
+                .ok_or_else(|| anyhow::anyhow!("test fragment offset overflows"))?;
+            let body = WalV7DataFragmentHeader {
+                segment_ticket: ticket,
+                fragment_index: u32::try_from(fragment_index)?,
+                fragment_count: fragment_count_u32,
+                batch_bytes: u64::try_from(logical_batch.len())?,
+            }
+            .encode_body(payload)?;
+            let frame = encode_data_frame(header_digest, fragment_offset, &body)?;
+            install_frame(image, fragment_offset, &frame)?;
+        }
+
+        let frame_span = u64::try_from(fragment_count)?
+            .checked_mul(FRAME_LEN_U64)
+            .ok_or_else(|| anyhow::anyhow!("test batch frame span overflows"))?;
+        let batch_end = frame_offset
+            .checked_add(frame_span)
+            .ok_or_else(|| anyhow::anyhow!("test batch end overflows"))?;
+        Ok((batch_end, logical_batch))
+    }
+
+    fn append_successor(
+        image: &mut Vec<u8>,
+        header_digest: [u8; 32],
+        spec: SuccessorSpec,
+    ) -> Result<(WalV7Frontier, [u8; 32])> {
+        let frontier = WalV7Frontier {
+            generation: spec.previous.generation + 1,
+            ticket_end: spec.ticket_end,
+            durable_end: spec.durable_end,
+            last_commit_ts: spec.last_commit_ts,
+            prefix_digest: spec.prefix_digest,
+            previous_frontier_offset: spec.previous_offset,
+            previous_frontier_digest: spec.previous_digest,
+        };
+        let frame = encode_frontier_successor(
+            frontier,
+            spec.previous,
+            spec.previous_offset,
+            &spec.previous_digest,
+            spec.frame_offset,
+            header_digest,
+        )?;
+        let digest = frame_record_digest(&frame)?;
+        install_frame(image, spec.frame_offset, &frame)?;
+        Ok((frontier, digest))
+    }
+
+    fn logical_prefix_digest(header: &[u8], batches: &[&[u8]]) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        hasher.update(header);
+        for batch in batches {
+            hasher.update(batch);
+        }
+        hasher.finalize().into()
+    }
+
+    fn discover_and_verify(image: &[u8]) -> Result<WalV7FrontierPrefixVerification> {
+        let header_digest = test_header().digest()?;
+        let mut reader = Cursor::new(image);
+        let discovery =
+            discover_frontier_candidates(&mut reader, u64::try_from(image.len())?, &header_digest)?;
+        verify_frontier_candidate_prefixes(
+            &mut reader,
+            u64::try_from(image.len())?,
+            &discovery.candidates,
+        )
+    }
+
+    #[test]
+    fn verifies_fragmented_batches_and_trailing_control_frames_in_one_pass() -> Result<()> {
+        let TestWalImage {
+            mut image,
+            header_digest,
+            frontier_zero,
+            frontier_zero_digest: digest_zero,
+        } = test_image()?;
+        let header_bytes = image[..WAL_V7_HEADER_LEN].to_vec();
+        let (first_data_end, first_batch) =
+            append_data_batch(&mut image, 8192, header_digest, 0, 10, 100, b"first")?;
+        let second_data_start = first_data_end;
+        let (second_data_end, second_batch) = append_data_batch(
+            &mut image,
+            second_data_start,
+            header_digest,
+            1,
+            20,
+            101,
+            &[0x9a; 5000],
+        )?;
+        let first_prefix_digest = logical_prefix_digest(&header_bytes, &[&first_batch]);
+        let first_frontier_offset = second_data_end;
+        let (frontier_one, digest_one) = append_successor(
+            &mut image,
+            header_digest,
+            SuccessorSpec {
+                previous: frontier_zero,
+                previous_offset: HEADER_LEN_U64,
+                previous_digest: digest_zero,
+                frame_offset: first_frontier_offset,
+                ticket_end: 1,
+                durable_end: first_data_end,
+                last_commit_ts: 10,
+                prefix_digest: first_prefix_digest,
+            },
+        )?;
+        let second_prefix_digest =
+            logical_prefix_digest(&header_bytes, &[&first_batch, &second_batch]);
+        let second_frontier_offset = first_frontier_offset + FRAME_LEN_U64;
+        let (frontier_two, _) = append_successor(
+            &mut image,
+            header_digest,
+            SuccessorSpec {
+                previous: frontier_one,
+                previous_offset: first_frontier_offset,
+                previous_digest: digest_one,
+                frame_offset: second_frontier_offset,
+                ticket_end: 2,
+                durable_end: second_data_end.max(second_frontier_offset),
+                last_commit_ts: 20,
+                prefix_digest: second_prefix_digest,
+            },
+        )?;
+
+        let verified = discover_and_verify(&image)?;
+
+        assert_eq!(verified.verified_candidates.len(), 3);
+        assert!(verified.rejected_candidates.is_empty());
+        assert_eq!(verified.rejected_candidate_count, 0);
+        assert_eq!(verified.verified_prefix_end, frontier_two.durable_end);
+        assert!(verified.stopped_at.is_none());
+        assert_eq!(
+            verified.verified_candidates[0].frontier, frontier_two,
+            "discovery order keeps the newest physical marker first"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn accepts_a_frontier_before_corrupt_speculative_data_and_rejects_newer_prefixes() -> Result<()>
+    {
+        let TestWalImage {
+            mut image,
+            header_digest,
+            frontier_zero,
+            frontier_zero_digest: digest_zero,
+        } = test_image()?;
+        let header_bytes = image[..WAL_V7_HEADER_LEN].to_vec();
+        let (data_end, batch) =
+            append_data_batch(&mut image, 8192, header_digest, 0, 10, 100, b"durable")?;
+        // A broken DATA slot follows the acknowledged prefix. F1 is physically
+        // after it but names only D0, so the damaged speculative slot is excluded.
+        image.resize(12_288, 0);
+        let first_prefix_digest = logical_prefix_digest(&header_bytes, &[&batch]);
+        let (frontier_one, digest_one) = append_successor(
+            &mut image,
+            header_digest,
+            SuccessorSpec {
+                previous: frontier_zero,
+                previous_offset: HEADER_LEN_U64,
+                previous_digest: digest_zero,
+                frame_offset: 16_384,
+                ticket_end: 1,
+                durable_end: data_end,
+                last_commit_ts: 10,
+                prefix_digest: first_prefix_digest,
+            },
+        )?;
+        let (frontier_two, _) = append_successor(
+            &mut image,
+            header_digest,
+            SuccessorSpec {
+                previous: frontier_one,
+                previous_offset: 16_384,
+                previous_digest: digest_one,
+                frame_offset: 24_576,
+                ticket_end: 2,
+                durable_end: 20_480,
+                last_commit_ts: 20,
+                prefix_digest: [0x77; 32],
+            },
+        )?;
+
+        let verified = discover_and_verify(&image)?;
+
+        assert_eq!(verified.verified_prefix_end, data_end);
+        assert!(verified.stopped_at.is_some());
+        assert!(
+            verified
+                .verified_candidates
+                .iter()
+                .any(|candidate| candidate.frontier == frontier_one)
+        );
+        assert!(
+            !verified
+                .verified_candidates
+                .iter()
+                .any(|candidate| candidate.frontier == frontier_two)
+        );
+        assert!(verified.rejected_candidate_count > 0);
+        Ok(())
+    }
+
+    #[test]
+    fn accepts_candidate_when_speculative_interval_contains_a_stray_frontier() -> Result<()> {
+        let TestWalImage {
+            mut image,
+            header_digest,
+            frontier_zero,
+            frontier_zero_digest: digest_zero,
+        } = test_image()?;
+        let header_bytes = image[..WAL_V7_HEADER_LEN].to_vec();
+        let (data_end, batch) =
+            append_data_batch(&mut image, 8192, header_digest, 0, 10, 100, b"durable")?;
+        let prefix_digest = logical_prefix_digest(&header_bytes, &[&batch]);
+
+        // This sibling marker is a valid candidate on its own, but it lies at
+        // durable_end and so is outside the later candidate's retained prefix.
+        let (stray_frontier, _) = append_successor(
+            &mut image,
+            header_digest,
+            SuccessorSpec {
+                previous: frontier_zero,
+                previous_offset: HEADER_LEN_U64,
+                previous_digest: digest_zero,
+                frame_offset: data_end,
+                ticket_end: 1,
+                durable_end: data_end,
+                last_commit_ts: 10,
+                prefix_digest,
+            },
+        )?;
+        let candidate_offset = data_end + FRAME_LEN_U64;
+        let (candidate_frontier, _) = append_successor(
+            &mut image,
+            header_digest,
+            SuccessorSpec {
+                previous: frontier_zero,
+                previous_offset: HEADER_LEN_U64,
+                previous_digest: digest_zero,
+                frame_offset: candidate_offset,
+                ticket_end: 1,
+                durable_end: data_end,
+                last_commit_ts: 10,
+                prefix_digest,
+            },
+        )?;
+
+        let verified = discover_and_verify(&image)?;
+
+        assert!(verified.verified_candidates.iter().any(|candidate| {
+            candidate.frame_offset == data_end && candidate.frontier == stray_frontier
+        }));
+        assert!(verified.verified_candidates.iter().any(|candidate| {
+            candidate.frame_offset == candidate_offset && candidate.frontier == candidate_frontier
+        }));
+        assert!(verified.rejected_candidates.is_empty());
+        assert_eq!(verified.rejected_candidate_count, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_a_candidate_whose_retained_prefix_contains_a_frontier_fork() -> Result<()> {
+        let TestWalImage {
+            mut image,
+            header_digest,
+            frontier_zero,
+            frontier_zero_digest: digest_zero,
+        } = test_image()?;
+        let header_bytes = image[..WAL_V7_HEADER_LEN].to_vec();
+        let (first_data_end, first_batch) =
+            append_data_batch(&mut image, 8192, header_digest, 0, 10, 100, b"first")?;
+        let first_prefix_digest = logical_prefix_digest(&header_bytes, &[&first_batch]);
+        let (frontier_one_a, digest_one_a) = append_successor(
+            &mut image,
+            header_digest,
+            SuccessorSpec {
+                previous: frontier_zero,
+                previous_offset: HEADER_LEN_U64,
+                previous_digest: digest_zero,
+                frame_offset: first_data_end,
+                ticket_end: 1,
+                durable_end: first_data_end,
+                last_commit_ts: 10,
+                prefix_digest: first_prefix_digest,
+            },
+        )?;
+        let (frontier_one_b, _) = append_successor(
+            &mut image,
+            header_digest,
+            SuccessorSpec {
+                previous: frontier_zero,
+                previous_offset: HEADER_LEN_U64,
+                previous_digest: digest_zero,
+                frame_offset: first_data_end + FRAME_LEN_U64,
+                ticket_end: 1,
+                durable_end: first_data_end,
+                last_commit_ts: 10,
+                prefix_digest: first_prefix_digest,
+            },
+        )?;
+        let (second_data_end, second_batch) = append_data_batch(
+            &mut image,
+            first_data_end + 2 * FRAME_LEN_U64,
+            header_digest,
+            1,
+            20,
+            101,
+            b"second",
+        )?;
+        let second_prefix_digest =
+            logical_prefix_digest(&header_bytes, &[&first_batch, &second_batch]);
+        let forked_frontier_offset = first_data_end + 4 * FRAME_LEN_U64;
+        let (frontier_two, _) = append_successor(
+            &mut image,
+            header_digest,
+            SuccessorSpec {
+                previous: frontier_one_a,
+                previous_offset: first_data_end,
+                previous_digest: digest_one_a,
+                frame_offset: forked_frontier_offset,
+                ticket_end: 2,
+                durable_end: second_data_end.max(first_data_end + 2 * FRAME_LEN_U64),
+                last_commit_ts: 20,
+                prefix_digest: second_prefix_digest,
+            },
+        )?;
+
+        let verified = discover_and_verify(&image)?;
+
+        assert!(
+            verified
+                .verified_candidates
+                .iter()
+                .any(|candidate| candidate.frontier == frontier_one_a)
+        );
+        assert!(
+            verified
+                .verified_candidates
+                .iter()
+                .any(|candidate| candidate.frontier == frontier_one_b)
+        );
+        assert!(
+            !verified
+                .verified_candidates
+                .iter()
+                .any(|candidate| candidate.frontier == frontier_two)
+        );
+        assert!(verified.rejected_candidate_count > 0);
+        Ok(())
     }
 
     #[test]
@@ -436,5 +1491,21 @@ mod tests {
             .expect_err("read failure must fail discovery");
 
         assert!(error.to_string().contains("read v7 WAL"));
+    }
+
+    #[test]
+    fn prefix_verification_propagates_read_errors() {
+        let mut reader = FailingReader {
+            failure: FailurePoint::Read,
+        };
+
+        let error = verify_frontier_candidate_prefixes(
+            &mut reader,
+            WAL_V7_HEADER_LEN as u64 + FRAME_LEN_U64,
+            &[],
+        )
+        .expect_err("prefix read failure must fail verification");
+
+        assert!(error.to_string().contains("read v7 WAL immutable header"));
     }
 }

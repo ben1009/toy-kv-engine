@@ -730,32 +730,13 @@ pub(crate) fn decode_v5_batch(
         u32::from_be_bytes(header[36..40].try_into().unwrap()) == 0,
         "nonzero v5 batch reserved field"
     );
-    let mut cursor: usize = 0;
-    let mut entries = Vec::with_capacity(entry_count.min(data_len / 6));
-    for _ in 0..entry_count {
-        let entry_header_end = cursor
-            .checked_add(6)
-            .context("v5 entry header length overflow")?;
-        if entry_header_end > data.len() {
-            return Err(anyhow::Error::new(V5BatchDecodeError::Truncated(
-                "entry header",
-            )));
-        }
-        let kind = data[cursor];
-        ensure!(data[cursor + 1] == 0, "unknown v5 entry flags");
-        let payload_len =
-            u32::from_be_bytes(data[cursor + 2..cursor + 6].try_into().unwrap()) as usize;
-        cursor += 6;
-        let payload_end = cursor
-            .checked_add(payload_len)
-            .context("v5 entry payload length overflow")?;
-        let payload = data
-            .get(cursor..payload_end)
-            .ok_or_else(|| anyhow::Error::new(V5BatchDecodeError::Truncated("entry payload")))?;
-        entries.push(decode_entry(kind, payload, limits)?);
-        cursor += payload_len;
-    }
-    ensure!(cursor == data.len(), "v5 batch has trailing data");
+    let decoded_batch = decode_wal_entry_stream_inner(
+        commit_ts,
+        recorded_at,
+        u32::try_from(entry_count)?,
+        data,
+        limits,
+    )?;
     let logical_end = align_up(data_end)?;
     if input.len() < logical_end {
         return Err(anyhow::Error::new(V5BatchDecodeError::Truncated(
@@ -766,20 +747,92 @@ pub(crate) fn decode_v5_batch(
         input[data_end..logical_end].iter().all(|byte| *byte == 0),
         "nonzero v5 alignment gap"
     );
-    let decoded_batch = WalBatch {
-        commit_ts,
-        recorded_at,
-        entries,
-    };
     ensure!(
         decoded_batch.canonicalized()?.entries == decoded_batch.entries,
         "v5 batch is not canonical"
     );
-
     Ok(DecodedBatch {
         batch: decoded_batch,
         data_end,
         logical_end,
+    })
+}
+
+/// Decode the RFC 023 operation stream shared by v5-family and v7 logical
+/// batches. The caller validates the surrounding format-specific header and
+/// checksum before passing the exact declared data bytes here.
+pub(crate) fn decode_wal_entry_stream(
+    commit_ts: u64,
+    recorded_at: RecordedAt,
+    entry_count: u32,
+    data: &[u8],
+    limits: WalV5Limits,
+) -> Result<WalBatch> {
+    let decoded_batch =
+        decode_wal_entry_stream_inner(commit_ts, recorded_at, entry_count, data, limits)?;
+    ensure!(
+        decoded_batch.canonicalized()?.entries == decoded_batch.entries,
+        "WAL batch is not canonical"
+    );
+    Ok(decoded_batch)
+}
+
+// Keep parsing separate from canonicality so v5-family decoding can preserve
+// its entry syntax -> alignment gap -> canonicality error classification order.
+fn decode_wal_entry_stream_inner(
+    commit_ts: u64,
+    recorded_at: RecordedAt,
+    entry_count: u32,
+    data: &[u8],
+    limits: WalV5Limits,
+) -> Result<WalBatch> {
+    let limits = limits.validate()?;
+    ensure!(commit_ts != 0, "WAL batch timestamp is zero");
+    ensure!(entry_count > 0, "WAL batch entry count is zero");
+    ensure!(
+        usize::try_from(entry_count)? <= limits.max_entry_count,
+        "WAL batch entry count exceeds configured limit"
+    );
+    ensure!(
+        !data.is_empty() && data.len() <= limits.max_batch_data_bytes,
+        "WAL batch entry stream length is outside configured limits"
+    );
+    ensure!(
+        recorded_at.nanos < 1_000_000_000,
+        "recorded_at nanos out of range"
+    );
+
+    let mut cursor: usize = 0;
+    let mut entries = Vec::with_capacity(usize::try_from(entry_count)?.min(data.len() / 6));
+    for _ in 0..entry_count {
+        let entry_header_end = cursor
+            .checked_add(6)
+            .context("WAL entry header length overflow")?;
+        if entry_header_end > data.len() {
+            return Err(anyhow::Error::new(V5BatchDecodeError::Truncated(
+                "entry header",
+            )));
+        }
+        let kind = data[cursor];
+        ensure!(data[cursor + 1] == 0, "unknown WAL entry flags");
+        let payload_len =
+            u32::from_be_bytes(data[cursor + 2..cursor + 6].try_into().unwrap()) as usize;
+        cursor += 6;
+        let payload_end = cursor
+            .checked_add(payload_len)
+            .context("WAL entry payload length overflow")?;
+        let payload = data
+            .get(cursor..payload_end)
+            .ok_or_else(|| anyhow::Error::new(V5BatchDecodeError::Truncated("entry payload")))?;
+        entries.push(decode_entry(kind, payload, limits)?);
+        cursor += payload_len;
+    }
+    ensure!(cursor == data.len(), "WAL batch has trailing data");
+
+    Ok(WalBatch {
+        commit_ts,
+        recorded_at,
+        entries,
     })
 }
 
@@ -1231,6 +1284,40 @@ mod tests {
         );
         let encoded = encode_v5_batch_inner(&duplicate, limits()).unwrap();
         assert!(decode_v5_batch(&encoded, 0, limits()).is_err());
+    }
+
+    #[test]
+    fn v5_decoder_preserves_entry_alignment_and_canonicality_error_order() {
+        let duplicate = WalBatch {
+            commit_ts: 11,
+            recorded_at: batch().recorded_at,
+            entries: vec![
+                WalEntry::PointDelete { key: b"k".to_vec() },
+                WalEntry::PointDelete { key: b"k".to_vec() },
+            ],
+        };
+        let encoded = encode_v5_batch_inner(&duplicate, limits()).unwrap();
+        let data_end = encoded_v5_batch_logical_len(&encoded).unwrap();
+
+        // Recovery may discard a terminal batch with missing alignment padding.
+        // Keep that classification even when its CRC-valid entries are duplicates.
+        let truncated = decode_v5_batch(&encoded[..data_end], 0, limits()).unwrap_err();
+        assert!(matches!(
+            truncated.downcast_ref::<V5BatchDecodeError>(),
+            Some(V5BatchDecodeError::Truncated("alignment gap"))
+        ));
+
+        let complete = decode_v5_batch(&encoded, 0, limits()).unwrap_err();
+        assert!(complete.to_string().contains("batch is not canonical"));
+        assert!(complete.downcast_ref::<V5BatchDecodeError>().is_none());
+
+        // Entry syntax errors still take precedence over missing padding.
+        let mut invalid_entry = encoded;
+        invalid_entry[WAL_V5_BATCH_HEADER_LEN + 1] = 1;
+        refresh_batch_crcs(&mut invalid_entry);
+        let invalid = decode_v5_batch(&invalid_entry[..data_end], 0, limits()).unwrap_err();
+        assert!(invalid.to_string().contains("entry flags"));
+        assert!(invalid.downcast_ref::<V5BatchDecodeError>().is_none());
     }
 
     #[test]
