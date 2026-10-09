@@ -232,6 +232,11 @@ impl PersistenceModel {
         if !self.canonical_inode_matches(path, inode) {
             return false;
         }
+        // Unsynced cached bytes can expose a non-durable candidate after a
+        // process restart; service requires the active image to be fully synced.
+        if self.path_bytes(path, ImageView::Cached) != self.path_bytes(path, ImageView::Stable) {
+            return false;
+        }
         let (Some(anchor), Some(bytes)) = (
             self.stable_active_anchor,
             self.path_bytes(path, ImageView::Stable),
@@ -1794,6 +1799,11 @@ mod tests {
         // complete but unacknowledged candidate. The ACK oracle is independent.
         harness.disk.restart_process_without_reboot();
         assert_eq!(harness.disk.process_restarts, 1);
+        assert!(
+            !harness
+                .disk
+                .service_ready_for(ACTIVE_WAL_PATH, harness.writer.inode)
+        );
         let cached = harness
             .disk
             .path_bytes(ACTIVE_WAL_PATH, ImageView::Cached)
