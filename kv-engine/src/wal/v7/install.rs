@@ -22,7 +22,10 @@ use super::{
         WalV7LogicalBatchHeader, decode_frame_structural, decode_frontier_successor,
         encode_frontier_successor, encode_generation_zero_frontier, frame_record_digest,
     },
-    recovery::{WalV7RecoveryKind, WalV7RecoverySelection},
+    recovery::{
+        WalV7RecoveryAuthority, WalV7RecoveryKind, WalV7RecoverySelection,
+        discover_frontier_candidates, select_recovery_candidate,
+    },
 };
 use crate::{
     pitr::{
@@ -56,10 +59,85 @@ pub(crate) struct WalV7InstalledRecovery {
     pub(crate) physical_hasher: Sha256,
 }
 
+/// Active recovery result after authoritative selection and durable installation.
+pub(crate) struct WalV7ActiveRecovery {
+    pub(crate) selection: WalV7RecoverySelection,
+    pub(crate) installed: WalV7InstalledRecovery,
+}
+
 impl WalV7InstalledRecovery {
     pub(crate) fn image_digest(&self) -> [u8; 32] {
         self.physical_hasher.clone().finalize().into()
     }
+}
+
+/// Discover, select, and install an Active v7 WAL using caller-supplied
+/// manifest authority.
+///
+/// The caller must hold exclusive recovery ownership from before reading the
+/// authority through successful installation. This function never derives
+/// durable anchors or chain authority from the WAL file itself. It returns
+/// only after fresh-inode installation and its directory sync have completed.
+///
+/// # Errors
+/// Returns an error if the supplied authority is not Active, the header or
+/// candidate prefixes fail validation, selection cannot satisfy every durable
+/// anchor, or fresh-inode installation fails.
+pub(crate) fn recover_and_install_active(
+    path: impl AsRef<Path>,
+    authority: WalV7RecoveryAuthority,
+) -> Result<WalV7ActiveRecovery> {
+    let WalV7RecoveryAuthority::Active {
+        predecessor,
+        durable_anchors,
+    } = authority
+    else {
+        anyhow::bail!("immutable v7 recovery images cannot use Active installation")
+    };
+
+    let path = path.as_ref();
+    let path_metadata = fs::symlink_metadata(path).context("inspect Active v7 WAL path")?;
+    ensure!(
+        path_metadata.file_type().is_file(),
+        "Active v7 WAL path is not a regular file"
+    );
+
+    let mut source = File::open(path).context("open Active v7 WAL for recovery")?;
+    let file_len = source
+        .metadata()
+        .context("read Active v7 WAL metadata")?
+        .len();
+    let mut header_bytes = [0_u8; WAL_V7_HEADER_LEN];
+    source
+        .seek(SeekFrom::Start(0))
+        .context("seek Active v7 WAL header")?;
+    source
+        .read_exact(&mut header_bytes)
+        .context("read Active v7 WAL header")?;
+    let header = WalV7Header::decode(&header_bytes)?;
+    ensure!(
+        header.encode()? == header_bytes,
+        "Active v7 WAL header is not canonical"
+    );
+    let header_digest = header.digest()?;
+    let discovery = discover_frontier_candidates(&mut source, file_len, &header_digest)?;
+    let selection = select_recovery_candidate(
+        &mut source,
+        file_len,
+        &discovery,
+        WalV7RecoveryAuthority::Active {
+            predecessor,
+            durable_anchors,
+        },
+    )?;
+    drop(source);
+
+    let installed = install_active_recovery(path, &selection)?;
+
+    Ok(WalV7ActiveRecovery {
+        selection,
+        installed,
+    })
 }
 
 #[derive(Clone, Copy)]
@@ -1023,6 +1101,65 @@ mod tests {
         let second_install = install_active_recovery(&path, &selected_again)?;
         assert_eq!(fs::read(&path)?, normalized);
         assert_eq!(second_install.image_digest(), installed.image_digest());
+        Ok(())
+    }
+
+    #[test]
+    fn active_recovery_coordinator_selects_and_installs_from_manifest_authority() -> Result<()> {
+        let directory = TestDirectory::new()?;
+        let path = directory.0.join("active.wal");
+        let (header, anchor) = create_nonempty_image(&path)?;
+
+        let recovered = recover_and_install_active(
+            &path,
+            WalV7RecoveryAuthority::Active {
+                predecessor: header.predecessor,
+                durable_anchors: vec![anchor],
+            },
+        )?;
+
+        assert_eq!(recovered.selection.kind, WalV7RecoveryKind::Active);
+        assert_eq!(recovered.selection.active_boundary, anchor);
+        assert_eq!(recovered.installed.active_boundary, anchor);
+        assert_eq!(recovered.installed.next_ticket, 1);
+        assert_eq!(recovered.installed.batches.len(), 1);
+        assert_eq!(
+            recovered.installed.batches[0].entries,
+            [WalEntry::Put {
+                key: b"key".to_vec(),
+                value: b"value".to_vec(),
+            }]
+        );
+        assert_eq!(fs::metadata(&path)?.len(), recovered.installed.image_len);
+
+        Ok(())
+    }
+
+    #[test]
+    fn active_recovery_coordinator_rejects_wrong_manifest_predecessor_without_mutation()
+    -> Result<()> {
+        let directory = TestDirectory::new()?;
+        let path = directory.0.join("active.wal");
+        let (header, anchor) = create_nonempty_image(&path)?;
+        let original = fs::read(&path)?;
+        let wrong_predecessor = ChainAnchor::Genesis {
+            archive_epoch_id: ArchiveEpochId([9; 16]),
+        };
+        assert_ne!(wrong_predecessor, header.predecessor);
+
+        let error = recover_and_install_active(
+            &path,
+            WalV7RecoveryAuthority::Active {
+                predecessor: wrong_predecessor,
+                durable_anchors: vec![anchor],
+            },
+        )
+        .err()
+        .context("Active recovery accepted the wrong manifest predecessor")?;
+
+        assert!(error.to_string().contains("authoritative segment identity"));
+        assert_eq!(fs::read(&path)?, original);
+
         Ok(())
     }
 
