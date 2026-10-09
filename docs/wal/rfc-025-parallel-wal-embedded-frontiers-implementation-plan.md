@@ -5,11 +5,12 @@
 **Status:** In progress — Stage 2 codec and persistence-model implementation is
 complete. Stage 3 now includes bounded backward FRONTIER discovery, single-pass
 candidate-prefix verification, authority/anchor selection, and the Active
-fresh-inode normalization primitive. WAL-open/manifest integration remains.
-The serial persistence model now covers repeated normalization, continued
-append, and crash/reopen for empty, nonempty, fallback, and trailing-control
-prefixes, including a selected marker behind speculative DATA. The production
-writer remains v6.
+fresh-inode normalization primitive. An authority-required Active recovery
+coordinator now connects discovery, selection, and installation. Production
+WAL-open and manifest integration remain. The serial persistence model covers
+repeated normalization, continued append, and crash/reopen for empty, nonempty,
+fallback, and trailing-control prefixes, including a selected marker behind
+speculative DATA. The production writer remains v6.
 
 **Last updated:** 2026-10-09
 
@@ -176,16 +177,18 @@ a protocol oracle, not the released v7 writer.
 
 ### 3. Independent recovery and durable fresh-inode installation
 
-The first Stage 3 slice adds bounded backward discovery of structurally valid
-FRONTIER candidates. The second slice verifies all discovered candidates in one
-bounded forward pass, including complete logical batches and every retained
-control frame. The third slice selects an authoritative boundary against every
-durable Active anchor and applies strict Sealing/Sealed image checks. The current
-slice adds Active fresh-inode normalization, reconstructs the retained batches,
-append/hash state, and seal index, and exercises that installed state through
-continued writes and crash/reopen in the serial model. It is not yet wired into
-production WAL open or manifest publication, and it does not normalize
-immutable images.
+Stage 3 includes bounded backward discovery of structurally valid FRONTIER
+candidates, one bounded forward pass to verify their logical batches and
+retained control frames, authoritative selection against every durable Active
+anchor, and strict Sealing/Sealed image checks. Active recovery normalizes to a
+fresh inode, reconstructs retained batches and append/hash/index state, and the
+serial model exercises continued writes and crash/reopen. The current slice
+adds an authority-required Active recovery coordinator that runs canonical
+header validation, discovery, candidate selection, and fresh-inode installation
+as one operation, returning both diagnostics and installed state. The
+coordinator does not infer authority from the WAL and is not yet called from
+production WAL open or manifest publication. Immutable images are not
+normalized.
 
 - Add proposed `wal/v7/recovery.rs`, receiving authoritative Active/Sealing/
   Sealed context and all durable anchors. A discovered seal sidecar cannot
@@ -212,6 +215,12 @@ immutable images.
   require a higher-ticket candidate. Reject read errors, a damaged header, or
   a missing, damaged, or noncanonical generation-zero marker; reject wrong
   incarnation, conflicting anchors, and immutable-image disagreement.
+- Expose one Active recovery entry point that requires caller-supplied
+  manifest authority and composes canonical header validation, bounded
+  discovery, candidate selection, and fresh-inode installation. Return the
+  selected diagnostics with the installed state. Reject immutable authority;
+  do not derive a durable anchor or predecessor from the WAL bytes. Keep
+  database WAL-open wiring and durable manifest publication as a later slice.
 - For Sealing/Sealed, require the exact terminal marker, logical boundary,
   sealed length, and whole-image digest. Never fall back to an older marker or
   normalize an immutable image.
