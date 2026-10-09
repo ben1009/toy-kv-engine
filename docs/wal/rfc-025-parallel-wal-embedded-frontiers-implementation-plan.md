@@ -6,7 +6,10 @@
 complete. Stage 3 now includes bounded backward FRONTIER discovery, single-pass
 candidate-prefix verification, authority/anchor selection, and the Active
 fresh-inode normalization primitive. WAL-open/manifest integration remains.
-The production writer remains v6.
+The serial persistence model now covers repeated normalization, continued
+append, and crash/reopen for empty, nonempty, fallback, and trailing-control
+prefixes, including a selected marker behind speculative DATA. The production
+writer remains v6.
 
 **Last updated:** 2026-10-09
 
@@ -178,9 +181,11 @@ FRONTIER candidates. The second slice verifies all discovered candidates in one
 bounded forward pass, including complete logical batches and every retained
 control frame. The third slice selects an authoritative boundary against every
 durable Active anchor and applies strict Sealing/Sealed image checks. The current
-slice adds Active fresh-inode normalization and reconstructs the retained
-batches, append/hash state, and seal index. It is not yet wired into production
-WAL open or manifest publication, and it does not normalize immutable images.
+slice adds Active fresh-inode normalization, reconstructs the retained batches,
+append/hash state, and seal index, and exercises that installed state through
+continued writes and crash/reopen in the serial model. It is not yet wired into
+production WAL open or manifest publication, and it does not normalize
+immutable images.
 
 - Add proposed `wal/v7/recovery.rs`, receiving authoritative Active/Sealing/
   Sealed context and all durable anchors. A discovered seal sidecar cannot
@@ -245,13 +250,14 @@ WAL open or manifest publication, and it does not normalize immutable images.
   clamp, and accepted DATA. Complete unmarked batches cannot establish new
   permanent v7 recovery coordinates. Repeat normalization must be byte-identical
   without growing the frontier chain.
-- In the serial model, exercise two normalizations followed by append, sync,
-  and crash/reopen for empty, nonempty, fallback, and trailing-control prefixes.
-  Include a selected source marker behind speculative DATA. Independently
-  compare continued hashes/index, anchors, tickets/offsets/time state, contents,
-  and accounting. Extend the same cases through real seal/archive/restore in
-  stage 6 and final qualification; those integration legs are not stage 3
-  prerequisites.
+- The serial model exercises two normalizations followed by append, sync, and
+  crash/reopen for empty, nonempty, fallback, and trailing-control prefixes.
+  It includes a selected source marker behind speculative DATA and independently
+  compares continued hashes/index, anchors, tickets/offsets/time state,
+  contents, and explicit pre-crash ACK history. Recovered durable tickets do
+  not imply that the prior client observed an ACK. Extend the same cases through
+  real seal/archive/restore in stage 6 and final qualification; those integration
+  legs are not stage 3 prerequisites.
 
 **Exit:** The serial persistence model passes candidate/floor/normalization
 crash cases before Parallel is connected. Recovery uses bounded discovery plus

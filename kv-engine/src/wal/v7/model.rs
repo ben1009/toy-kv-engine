@@ -11,15 +11,16 @@ use anyhow::{Result, ensure};
 use sha2::{Digest, Sha256};
 
 use super::codec::{
-    WAL_V7_DATA_FRAGMENT_PAYLOAD_CAPACITY, WAL_V7_FRAME_LEN, WAL_V7_HEADER_LEN,
-    WAL_V7_LOGICAL_BATCH_HEADER_LEN, WalV7DataFragmentHeader, WalV7FrameKind, WalV7Frontier,
-    WalV7Header, WalV7LogicalBatchHeader, decode_frame_structural, decode_frontier_successor,
-    encode_data_frame, encode_frontier_successor, encode_generation_zero_frontier,
-    frame_record_digest,
+    WAL_V7_DATA_FRAGMENT_PAYLOAD_CAPACITY, WAL_V7_FRAME_HEADER_LEN, WAL_V7_FRAME_LEN,
+    WAL_V7_HEADER_LEN, WAL_V7_LOGICAL_BATCH_HEADER_LEN, WalV7DataFragmentHeader, WalV7FrameKind,
+    WalV7Frontier, WalV7Header, WalV7LogicalBatchHeader, decode_frame_structural,
+    decode_frontier_successor, encode_data_frame, encode_frontier_successor,
+    encode_generation_zero_frontier, frame_record_digest,
 };
+use super::install::WalV7InstalledRecovery;
 use crate::pitr::{
     ArchiveEpochId, ChainAnchor, LIVE_WAL_V5_LIMITS, RecordedAt, SegmentId, TimelineId, WalBatch,
-    WalEntry,
+    WalEntry, manifest::ActiveBoundary,
 };
 
 const ACTIVE_WAL_PATH: &str = "active.wal";
@@ -271,6 +272,7 @@ struct PendingCommit {
     frontier_frame: [u8; WAL_V7_FRAME_LEN],
     frontier: WalV7Frontier,
     next_logical_hash: Sha256,
+    next_physical_hash: Sha256,
 }
 
 #[derive(Debug, Default)]
@@ -293,6 +295,8 @@ struct SerialWriter {
     process_generation: u64,
     header_digest: [u8; 32],
     logical_hash: Sha256,
+    physical_hash: Sha256,
+    seal_index: Vec<u64>,
     previous_frontier: WalV7Frontier,
     previous_frontier_offset: u64,
     previous_frontier_digest: [u8; 32],
@@ -360,6 +364,9 @@ impl SerialHarness {
 
         let mut logical_hash = Sha256::new();
         logical_hash.update(header_bytes);
+        let mut physical_hash = Sha256::new();
+        physical_hash.update(header.encode()?);
+        physical_hash.update(generation_zero_frame);
         let process_generation = disk.process_generation;
         Ok(Self {
             disk,
@@ -368,6 +375,8 @@ impl SerialHarness {
                 process_generation,
                 header_digest,
                 logical_hash,
+                physical_hash,
+                seal_index: Vec::new(),
                 previous_frontier: generation_zero,
                 previous_frontier_offset: WAL_V7_HEADER_LEN as u64,
                 previous_frontier_digest: generation_zero_digest,
@@ -378,6 +387,93 @@ impl SerialHarness {
                 phase: CommitPhase::Idle,
             },
             history: WriteHistory::default(),
+        })
+    }
+
+    fn from_installed_recovery(
+        image: &[u8],
+        installed: WalV7InstalledRecovery,
+        acknowledged_tickets: Vec<u64>,
+    ) -> Result<Self> {
+        ensure!(
+            u64::try_from(image.len())? == installed.image_len,
+            "installed v7 image length does not match recovered state"
+        );
+        ensure!(
+            installed.active_boundary.ticket_end == installed.next_ticket
+                && installed.frontier.ticket_end == installed.next_ticket
+                && u64::try_from(installed.batches.len())? == installed.next_ticket
+                && u64::try_from(installed.seal_index.len())? == installed.next_ticket,
+            "installed v7 state has inconsistent ticket metadata"
+        );
+        ensure!(
+            image.len() >= WAL_V7_HEADER_LEN,
+            "installed v7 image is shorter than its header"
+        );
+        let header_bytes: [u8; WAL_V7_HEADER_LEN] = image[..WAL_V7_HEADER_LEN].try_into()?;
+        let header = WalV7Header::decode(&header_bytes)?;
+        let header_digest = header.digest()?;
+        ensure!(
+            installed.active_boundary.timeline_id == header.timeline_id.0
+                && installed.active_boundary.archive_epoch_id == header.archive_epoch_id.0
+                && installed.active_boundary.segment_id == header.segment_id.0
+                && installed.active_boundary.incarnation == header.incarnation,
+            "installed v7 state identifies a different WAL header"
+        );
+        let logical_digest: [u8; 32] = installed.logical_hasher.clone().finalize().into();
+        ensure!(
+            installed.active_boundary.prefix_digest == logical_digest,
+            "installed v7 logical hash does not match its Active boundary"
+        );
+        let image_digest: [u8; 32] = Sha256::digest(image).into();
+        ensure!(
+            installed.image_digest() == image_digest,
+            "installed v7 physical hash does not match its image"
+        );
+
+        let mut disk = PersistenceModel::default();
+        let inode = disk.create_file(ACTIVE_WAL_PATH)?;
+        disk.write_at(inode, 0, image)?;
+        disk.fdatasync_success(inode)?;
+        disk.sync_directory_success();
+        disk.publish_active_anchor(model_anchor(installed.active_boundary));
+        disk.sync_manifest_success();
+
+        let process_generation = disk.process_generation;
+        let next_ticket = installed.next_ticket;
+        let last_commit_ts = installed.active_boundary.last_commit_ts;
+        let published_tickets: Vec<_> = (0..next_ticket).collect();
+        ensure!(
+            acknowledged_tickets
+                .iter()
+                .all(|ticket| *ticket < next_ticket)
+                && acknowledged_tickets
+                    .windows(2)
+                    .all(|pair| pair[0] < pair[1]),
+            "recovery model ACK history is not an ordered subset of the installed prefix"
+        );
+        Ok(Self {
+            disk,
+            writer: SerialWriter {
+                inode,
+                process_generation,
+                header_digest,
+                logical_hash: installed.logical_hasher,
+                physical_hash: installed.physical_hasher,
+                seal_index: installed.seal_index,
+                previous_frontier: installed.frontier,
+                previous_frontier_offset: installed.frontier_offset,
+                previous_frontier_digest: installed.frontier_digest,
+                next_ticket,
+                next_data_offset: installed.append_offset,
+                last_commit_ts,
+                last_recorded_at: installed.last_recorded_at,
+                phase: CommitPhase::Idle,
+            },
+            history: WriteHistory {
+                published_tickets,
+                acknowledged_tickets,
+            },
         })
     }
 
@@ -440,6 +536,7 @@ impl SerialHarness {
             / WAL_V7_DATA_FRAGMENT_PAYLOAD_CAPACITY;
         let fragment_count = u32::try_from(fragment_count)?;
         let mut data_offsets = Vec::with_capacity(fragment_count as usize);
+        let mut next_physical_hash = self.writer.physical_hash.clone();
         // Any failure after writing starts leaves the runtime poisoned. Only
         // completing DATA and FRONTIER exposes a cycle awaiting sync.
         self.writer.phase = CommitPhase::Poisoned;
@@ -465,6 +562,7 @@ impl SerialHarness {
             let frame = encode_data_frame(self.writer.header_digest, frame_offset, &body)?;
             self.disk
                 .write_at(self.writer.inode, usize::try_from(frame_offset)?, &frame)?;
+            next_physical_hash.update(frame);
             data_offsets.push(frame_offset);
         }
 
@@ -514,6 +612,7 @@ impl SerialHarness {
             usize::try_from(frontier_offset)?,
             &frontier_frame,
         )?;
+        next_physical_hash.update(frontier_frame);
         self.writer.phase = CommitPhase::AwaitingSync { ticket };
 
         Ok(PendingCommit {
@@ -525,6 +624,7 @@ impl SerialHarness {
             frontier_frame,
             frontier,
             next_logical_hash,
+            next_physical_hash,
         })
     }
 
@@ -577,7 +677,13 @@ impl SerialHarness {
             .frontier_offset
             .checked_add(WAL_V7_FRAME_LEN as u64)
             .ok_or_else(|| anyhow::anyhow!("model next DATA offset overflows"))?;
+        let first_data_offset = *pending
+            .data_offsets
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("model published batch has no DATA frame"))?;
         self.writer.logical_hash = pending.next_logical_hash;
+        self.writer.physical_hash = pending.next_physical_hash;
+        self.writer.seal_index.push(first_data_offset);
         self.writer.previous_frontier = pending.frontier;
         self.writer.previous_frontier_offset = pending.frontier_offset;
         self.writer.previous_frontier_digest = frontier_digest;
@@ -1070,9 +1176,445 @@ fn model_header() -> WalV7Header {
     }
 }
 
+fn model_anchor(boundary: ActiveBoundary) -> ActiveAnchor {
+    ActiveAnchor {
+        segment_id: SegmentId(boundary.segment_id),
+        incarnation: boundary.incarnation,
+        ticket_end: boundary.ticket_end,
+        durable_end: boundary.durable_end,
+        last_commit_ts: boundary.last_commit_ts,
+        prefix_digest: boundary.prefix_digest,
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use std::{
+        fs::{self, File},
+        io::{Read, Seek, SeekFrom},
+        path::{Path, PathBuf},
+        sync::atomic::{AtomicU64, Ordering},
+    };
+
+    use super::super::{
+        install::install_active_recovery,
+        recovery::{
+            WalV7RecoveryAuthority, discover_frontier_candidates, select_recovery_candidate,
+        },
+    };
     use super::*;
+
+    static TEMP_DIRECTORY_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+    struct TestDirectory(PathBuf);
+
+    impl TestDirectory {
+        fn new() -> Result<Self> {
+            let path = std::env::temp_dir().join(format!(
+                "toy-kv-v7-model-{}-{}",
+                std::process::id(),
+                TEMP_DIRECTORY_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir(&path)?;
+            Ok(Self(path))
+        }
+    }
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn active_boundary(frontier: WalV7Frontier) -> ActiveBoundary {
+        let header = model_header();
+        ActiveBoundary {
+            timeline_id: header.timeline_id.0,
+            archive_epoch_id: header.archive_epoch_id.0,
+            segment_id: header.segment_id.0,
+            incarnation: header.incarnation,
+            ticket_end: frontier.ticket_end,
+            durable_end: frontier.durable_end,
+            last_commit_ts: frontier.last_commit_ts,
+            prefix_digest: frontier.prefix_digest,
+        }
+    }
+
+    fn manifest_boundary(anchor: ActiveAnchor) -> ActiveBoundary {
+        let header = model_header();
+        ActiveBoundary {
+            timeline_id: header.timeline_id.0,
+            archive_epoch_id: header.archive_epoch_id.0,
+            segment_id: anchor.segment_id.0,
+            incarnation: anchor.incarnation,
+            ticket_end: anchor.ticket_end,
+            durable_end: anchor.durable_end,
+            last_commit_ts: anchor.last_commit_ts,
+            prefix_digest: anchor.prefix_digest,
+        }
+    }
+
+    fn generation_zero(
+        header_digest: [u8; 32],
+    ) -> Result<([u8; WAL_V7_FRAME_LEN], WalV7Frontier, [u8; 32])> {
+        let frame = encode_generation_zero_frontier(header_digest)?;
+        let decoded = decode_frame_structural(&frame, WAL_V7_HEADER_LEN as u64, &header_digest)?;
+        let frontier = WalV7Frontier::decode_body(&decoded.body)?;
+        Ok((frame, frontier, frame_record_digest(&frame)?))
+    }
+
+    fn fixture_data_frames(
+        header_digest: [u8; 32],
+        frame_offset: u64,
+        ticket: u64,
+        commit_ts: u64,
+        value: &[u8],
+    ) -> Result<(Vec<[u8; WAL_V7_FRAME_LEN]>, Vec<u8>)> {
+        let recorded_at = RecordedAt {
+            secs: -123,
+            nanos: 456,
+        };
+        let entry_stream = encode_model_entry_stream(value, commit_ts)?;
+        let batch_header = WalV7LogicalBatchHeader {
+            segment_ticket: ticket,
+            commit_ts,
+            recorded_at_secs: recorded_at.secs,
+            recorded_at_nanos: recorded_at.nanos,
+            entry_count: 1,
+        }
+        .encode(&entry_stream, LIVE_WAL_V5_LIMITS)?;
+        let mut logical_batch = Vec::with_capacity(batch_header.len() + entry_stream.len());
+        logical_batch.extend_from_slice(&batch_header);
+        logical_batch.extend_from_slice(&entry_stream);
+        let fragment_count = logical_batch
+            .len()
+            .div_ceil(WAL_V7_DATA_FRAGMENT_PAYLOAD_CAPACITY);
+        let mut frames = Vec::new();
+        frames.try_reserve_exact(fragment_count)?;
+        for (fragment_index, payload) in logical_batch
+            .chunks(WAL_V7_DATA_FRAGMENT_PAYLOAD_CAPACITY)
+            .enumerate()
+        {
+            let fragment = WalV7DataFragmentHeader {
+                segment_ticket: ticket,
+                fragment_index: u32::try_from(fragment_index)?,
+                fragment_count: u32::try_from(fragment_count)?,
+                batch_bytes: u64::try_from(logical_batch.len())?,
+            };
+            let body = fragment.encode_body(payload)?;
+            let offset = frame_offset
+                .checked_add(
+                    u64::try_from(fragment_index)?
+                        .checked_mul(WAL_V7_FRAME_LEN as u64)
+                        .ok_or_else(|| anyhow::anyhow!("fixture DATA offset overflows"))?,
+                )
+                .ok_or_else(|| anyhow::anyhow!("fixture DATA offset overflows"))?;
+            frames.push(encode_data_frame(header_digest, offset, &body)?);
+        }
+        Ok((frames, logical_batch))
+    }
+
+    fn append_frames(image: &mut Vec<u8>, frames: &[[u8; WAL_V7_FRAME_LEN]]) {
+        for frame in frames {
+            image.extend_from_slice(frame);
+        }
+    }
+
+    fn logical_prefix_digest(header: &[u8], batches: &[&[u8]]) -> [u8; 32] {
+        let mut hash = Sha256::new();
+        hash.update(header);
+        for batch in batches {
+            hash.update(batch);
+        }
+        hash.finalize().into()
+    }
+
+    fn active_selection(
+        path: &Path,
+        anchor: ActiveBoundary,
+    ) -> Result<super::super::recovery::WalV7RecoverySelection> {
+        let mut file = File::open(path)?;
+        let file_len = file.metadata()?.len();
+        file.seek(SeekFrom::Start(0))?;
+        let mut header_bytes = [0; WAL_V7_HEADER_LEN];
+        file.read_exact(&mut header_bytes)?;
+        let header = WalV7Header::decode(&header_bytes)?;
+        let header_digest = header.digest()?;
+        let discovery = discover_frontier_candidates(&mut file, file_len, &header_digest)?;
+        select_recovery_candidate(
+            &mut file,
+            file_len,
+            &discovery,
+            WalV7RecoveryAuthority::Active {
+                predecessor: header.predecessor,
+                durable_anchors: vec![anchor],
+            },
+        )
+    }
+
+    fn empty_image_with_torn_tail() -> Result<(Vec<u8>, ActiveBoundary)> {
+        let header = model_header();
+        let header_bytes = header.encode()?;
+        let header_digest = header.digest()?;
+        let (generation_zero_frame, generation_zero, _) = generation_zero(header_digest)?;
+        let mut image = header_bytes.to_vec();
+        image.extend_from_slice(&generation_zero_frame);
+        image.extend_from_slice(b"partial tail");
+        Ok((image, active_boundary(generation_zero)))
+    }
+
+    fn marker_behind_speculative_data_image() -> Result<(Vec<u8>, ActiveBoundary)> {
+        let header = model_header();
+        let header_bytes = header.encode()?;
+        let header_digest = header.digest()?;
+        let (generation_zero_frame, generation_zero, generation_zero_digest) =
+            generation_zero(header_digest)?;
+        let mut image = header_bytes.to_vec();
+        image.extend_from_slice(&generation_zero_frame);
+
+        let (durable_data, durable_batch) =
+            fixture_data_frames(header_digest, FIRST_DATA_OFFSET, 0, 10, b"durable")?;
+        append_frames(&mut image, &durable_data);
+        let data_end = FIRST_DATA_OFFSET
+            .checked_add(u64::try_from(durable_data.len())? * WAL_V7_FRAME_LEN as u64)
+            .ok_or_else(|| anyhow::anyhow!("fixture durable DATA end overflows"))?;
+        let (speculative_data, _) =
+            fixture_data_frames(header_digest, data_end, 1, 20, b"speculative")?;
+        append_frames(&mut image, &speculative_data);
+        let speculative_end = data_end
+            .checked_add(u64::try_from(speculative_data.len())? * WAL_V7_FRAME_LEN as u64)
+            .ok_or_else(|| anyhow::anyhow!("fixture speculative DATA end overflows"))?;
+        let frontier = WalV7Frontier {
+            generation: 1,
+            ticket_end: 1,
+            durable_end: data_end,
+            last_commit_ts: 10,
+            prefix_digest: logical_prefix_digest(&header_bytes, &[&durable_batch]),
+            previous_frontier_offset: WAL_V7_HEADER_LEN as u64,
+            previous_frontier_digest: generation_zero_digest,
+        };
+        let frontier_frame = encode_frontier_successor(
+            frontier,
+            generation_zero,
+            WAL_V7_HEADER_LEN as u64,
+            &generation_zero_digest,
+            speculative_end,
+            header_digest,
+        )?;
+        image.extend_from_slice(&frontier_frame);
+        Ok((image, active_boundary(frontier)))
+    }
+
+    fn trailing_control_image() -> Result<(Vec<u8>, ActiveBoundary)> {
+        let header = model_header();
+        let header_bytes = header.encode()?;
+        let header_digest = header.digest()?;
+        let (generation_zero_frame, generation_zero, generation_zero_digest) =
+            generation_zero(header_digest)?;
+        let mut image = header_bytes.to_vec();
+        image.extend_from_slice(&generation_zero_frame);
+
+        let (first_data, first_batch) =
+            fixture_data_frames(header_digest, FIRST_DATA_OFFSET, 0, 10, b"first")?;
+        append_frames(&mut image, &first_data);
+        let first_data_end = FIRST_DATA_OFFSET
+            .checked_add(u64::try_from(first_data.len())? * WAL_V7_FRAME_LEN as u64)
+            .ok_or_else(|| anyhow::anyhow!("fixture first DATA end overflows"))?;
+        let (second_data, second_batch) =
+            fixture_data_frames(header_digest, first_data_end, 1, 20, b"second")?;
+        append_frames(&mut image, &second_data);
+        let second_data_end = first_data_end
+            .checked_add(u64::try_from(second_data.len())? * WAL_V7_FRAME_LEN as u64)
+            .ok_or_else(|| anyhow::anyhow!("fixture second DATA end overflows"))?;
+
+        // The first certificate trails ticket 1's speculative DATA physically,
+        // but still covers only ticket 0. The next certificate covers both
+        // DATA batches and the first marker as a trailing control frame.
+        let first_frontier = WalV7Frontier {
+            generation: 1,
+            ticket_end: 1,
+            durable_end: first_data_end,
+            last_commit_ts: 10,
+            prefix_digest: logical_prefix_digest(&header_bytes, &[&first_batch]),
+            previous_frontier_offset: WAL_V7_HEADER_LEN as u64,
+            previous_frontier_digest: generation_zero_digest,
+        };
+        let first_frontier_frame = encode_frontier_successor(
+            first_frontier,
+            generation_zero,
+            WAL_V7_HEADER_LEN as u64,
+            &generation_zero_digest,
+            second_data_end,
+            header_digest,
+        )?;
+        let first_frontier_digest = frame_record_digest(&first_frontier_frame)?;
+        image.extend_from_slice(&first_frontier_frame);
+        let first_frontier_end = second_data_end
+            .checked_add(WAL_V7_FRAME_LEN as u64)
+            .ok_or_else(|| anyhow::anyhow!("fixture first FRONTIER end overflows"))?;
+        let second_frontier = WalV7Frontier {
+            generation: 2,
+            ticket_end: 2,
+            durable_end: first_frontier_end.max(second_data_end),
+            last_commit_ts: 20,
+            prefix_digest: logical_prefix_digest(&header_bytes, &[&first_batch, &second_batch]),
+            previous_frontier_offset: second_data_end,
+            previous_frontier_digest: first_frontier_digest,
+        };
+        let second_frontier_frame = encode_frontier_successor(
+            second_frontier,
+            first_frontier,
+            second_data_end,
+            &first_frontier_digest,
+            first_frontier_end,
+            header_digest,
+        )?;
+        image.extend_from_slice(&second_frontier_frame);
+        Ok((image, active_boundary(second_frontier)))
+    }
+
+    fn assert_batch_values(batches: &[WalBatch], expected_values: &[&[u8]]) {
+        assert_eq!(batches.len(), expected_values.len());
+        for (batch, value) in batches.iter().zip(expected_values) {
+            assert_eq!(
+                batch.entries,
+                [WalEntry::Put {
+                    key: b"model-key".to_vec(),
+                    value: value.to_vec(),
+                }]
+            );
+        }
+    }
+
+    fn normalize_twice_continue_and_reopen(
+        image: Vec<u8>,
+        original_anchor: ActiveBoundary,
+        expected_values: &[&[u8]],
+        prior_acknowledged_tickets: &[u64],
+    ) -> Result<()> {
+        let directory = TestDirectory::new()?;
+        let path = directory.0.join("active.wal");
+        fs::write(&path, &image)?;
+
+        let first_selection = active_selection(&path, original_anchor)?;
+        assert_eq!(
+            first_selection.active_boundary.ticket_end,
+            u64::try_from(expected_values.len())?
+        );
+        let first_install = install_active_recovery(&path, &first_selection)?;
+        let first_image = fs::read(&path)?;
+        let first_image_digest: [u8; 32] = Sha256::digest(&first_image).into();
+        assert_eq!(first_install.image_len, u64::try_from(first_image.len())?);
+        assert_eq!(first_install.image_digest(), first_image_digest);
+        assert_batch_values(&first_install.batches, expected_values);
+
+        let second_selection = active_selection(&path, first_install.active_boundary)?;
+        let second_install = install_active_recovery(&path, &second_selection)?;
+        let normalized_image = fs::read(&path)?;
+        assert_eq!(normalized_image, first_image);
+        assert_eq!(
+            second_install.active_boundary,
+            first_install.active_boundary
+        );
+        assert_eq!(second_install.frontier, first_install.frontier);
+        assert_eq!(
+            second_install.frontier_offset,
+            first_install.frontier_offset
+        );
+        assert_eq!(
+            second_install.frontier_digest,
+            first_install.frontier_digest
+        );
+        assert_eq!(second_install.append_offset, first_install.append_offset);
+        assert_eq!(second_install.next_ticket, first_install.next_ticket);
+        assert_eq!(
+            second_install.last_recorded_at,
+            first_install.last_recorded_at
+        );
+        assert_eq!(second_install.batches, first_install.batches);
+        assert_eq!(second_install.seal_index, first_install.seal_index);
+        assert_eq!(second_install.image_digest(), first_install.image_digest());
+        let next_ticket = second_install.next_ticket;
+        let next_offset = second_install.append_offset;
+        let last_commit_ts = second_install.active_boundary.last_commit_ts;
+        let mut harness = SerialHarness::from_installed_recovery(
+            &normalized_image,
+            second_install,
+            prior_acknowledged_tickets.to_vec(),
+        )?;
+        assert_eq!(harness.writer.next_ticket, next_ticket);
+        assert_eq!(harness.writer.next_data_offset, next_offset);
+        assert_eq!(
+            harness.writer.seal_index.len(),
+            usize::try_from(next_ticket)?
+        );
+        assert_eq!(
+            harness.history.published_tickets,
+            (0..next_ticket).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            harness.history.acknowledged_tickets,
+            prior_acknowledged_tickets
+        );
+
+        let syncs_before = harness.disk.file(harness.writer.inode)?.successful_syncs;
+        harness.commit(b"after recovery", last_commit_ts + 10)?;
+        assert_eq!(harness.writer.next_ticket, next_ticket + 1);
+        assert_eq!(
+            harness.disk.file(harness.writer.inode)?.successful_syncs,
+            syncs_before + 1
+        );
+        let mut expected_acknowledged_tickets = prior_acknowledged_tickets.to_vec();
+        expected_acknowledged_tickets.push(next_ticket);
+        assert_eq!(
+            harness.history.acknowledged_tickets,
+            expected_acknowledged_tickets
+        );
+        assert_eq!(
+            harness.writer.seal_index.len(),
+            usize::try_from(next_ticket + 1)?
+        );
+        assert_eq!(harness.writer.last_commit_ts, last_commit_ts + 10);
+
+        // Power loss retains the successful DATA+FRONTIER sync and drops any
+        // volatile runtime state. Reopen through production discovery,
+        // selection, and fresh-inode installation.
+        harness.disk.power_loss();
+        let crashed_image = harness
+            .disk
+            .path_bytes(ACTIVE_WAL_PATH, ImageView::Cached)
+            .expect("normalized Active image survives power loss")
+            .to_vec();
+        fs::write(&path, &crashed_image)?;
+        let durable_anchor = manifest_boundary(
+            harness
+                .disk
+                .stable_active_anchor()
+                .expect("recovery published an Active anchor"),
+        );
+        let reopened_selection = active_selection(&path, durable_anchor)?;
+        assert_eq!(
+            reopened_selection.active_boundary.ticket_end,
+            next_ticket + 1
+        );
+        let reopened = install_active_recovery(&path, &reopened_selection)?;
+        let reopened_image = fs::read(&path)?;
+        assert_eq!(reopened.image_len, u64::try_from(reopened_image.len())?);
+        let reopened_image_digest: [u8; 32] = Sha256::digest(&reopened_image).into();
+        assert_eq!(reopened.image_digest(), reopened_image_digest);
+        let mut all_values = expected_values.to_vec();
+        all_values.push(b"after recovery");
+        assert_batch_values(&reopened.batches, &all_values);
+        assert_eq!(reopened.next_ticket, next_ticket + 1);
+        assert_eq!(reopened.append_offset, u64::try_from(reopened_image.len())?);
+        assert_eq!(reopened.seal_index, harness.writer.seal_index);
+        let logical_digest: [u8; 32] = harness.writer.logical_hash.clone().finalize().into();
+        assert_eq!(reopened.active_boundary.prefix_digest, logical_digest);
+        let physical_digest: [u8; 32] = harness.writer.physical_hash.clone().finalize().into();
+        assert_eq!(reopened.image_digest(), physical_digest);
+        assert_eq!(reopened.last_recorded_at, harness.writer.last_recorded_at);
+        Ok(())
+    }
 
     fn frame_kind_at(image: &[u8], offset: u64, digest: &[u8; 32]) -> Result<WalV7FrameKind> {
         Ok(decode_frame_structural(frame_at(image, offset)?, offset, digest)?.kind)
@@ -1798,6 +2340,96 @@ mod tests {
         assert_eq!(recover_latest(after_power_loss)?.frontier.ticket_end, 1);
         assert_eq!(harness.history.acknowledged_tickets, [0]);
         Ok(())
+    }
+
+    #[test]
+    fn empty_recovery_normalizes_twice_then_appends_and_reopens() -> Result<()> {
+        let (image, anchor) = empty_image_with_torn_tail()?;
+        normalize_twice_continue_and_reopen(image, anchor, &[], &[])
+    }
+
+    #[test]
+    fn recovery_relocates_a_frontier_behind_speculative_data_then_continues() -> Result<()> {
+        let (image, anchor) = marker_behind_speculative_data_image()?;
+        let directory = TestDirectory::new()?;
+        let path = directory.0.join("candidate.wal");
+        fs::write(&path, &image)?;
+        let selection = active_selection(&path, anchor)?;
+        assert!(selection.candidate.frame_offset > selection.active_boundary.durable_end);
+        assert_eq!(selection.active_boundary.ticket_end, 1);
+
+        // The fixture proves ticket 0 durable, but carries no evidence that
+        // the caller observed its ACK before the process stopped.
+        normalize_twice_continue_and_reopen(image, anchor, &[b"durable"], &[])
+    }
+
+    #[test]
+    fn active_recovery_falls_back_from_a_complete_marker_with_corrupt_data() -> Result<()> {
+        let mut harness = SerialHarness::create()?;
+        harness.commit(b"durable", 10)?;
+        let pending = harness.begin_commit(b"unacknowledged", 20)?;
+        let data_offset = pending.data_offsets[0];
+        let mut corrupt_data: [u8; WAL_V7_FRAME_LEN] = frame_at(
+            harness
+                .disk
+                .path_bytes(ACTIVE_WAL_PATH, ImageView::Cached)
+                .expect("cached Active WAL exists"),
+            data_offset,
+        )?
+        .try_into()?;
+        corrupt_data[WAL_V7_FRAME_HEADER_LEN] ^= 0x80;
+        harness.disk.write_at(
+            harness.writer.inode,
+            usize::try_from(data_offset)?,
+            &corrupt_data,
+        )?;
+
+        let data_start = usize::try_from(data_offset)?;
+        let frontier_start = usize::try_from(pending.frontier_offset)?;
+        harness.interrupt_sync(&[
+            data_start..data_start + WAL_V7_FRAME_LEN,
+            frontier_start..frontier_start + WAL_V7_FRAME_LEN,
+        ])?;
+        assert_eq!(harness.history.acknowledged_tickets, [0]);
+        let image = harness
+            .disk
+            .path_bytes(ACTIVE_WAL_PATH, ImageView::Stable)
+            .expect("uncertain sync persisted its selected ranges")
+            .to_vec();
+        let anchor = manifest_boundary(
+            harness
+                .disk
+                .stable_active_anchor()
+                .expect("creation persisted the original empty Active anchor"),
+        );
+        let directory = TestDirectory::new()?;
+        let path = directory.0.join("candidate.wal");
+        fs::write(&path, &image)?;
+        let selection = active_selection(&path, anchor)?;
+        assert_eq!(selection.active_boundary.ticket_end, 1);
+        assert!(selection.diagnostics.fallback_reason.is_some());
+
+        normalize_twice_continue_and_reopen(image, anchor, &[b"durable"], &[0])
+    }
+
+    #[test]
+    fn trailing_control_prefix_normalizes_and_continues_after_reopen() -> Result<()> {
+        let (image, anchor) = trailing_control_image()?;
+        let directory = TestDirectory::new()?;
+        let path = directory.0.join("candidate.wal");
+        fs::write(&path, &image)?;
+        let selection = active_selection(&path, anchor)?;
+        assert_eq!(selection.active_boundary.ticket_end, 2);
+        assert_eq!(
+            selection.candidate.frontier.durable_end,
+            selection.candidate.frame_offset
+        );
+        assert_eq!(
+            selection.candidate.frontier.previous_frontier_offset,
+            4 * WAL_V7_FRAME_LEN as u64
+        );
+
+        normalize_twice_continue_and_reopen(image, anchor, &[b"first", b"second"], &[0, 1])
     }
 
     #[test]
