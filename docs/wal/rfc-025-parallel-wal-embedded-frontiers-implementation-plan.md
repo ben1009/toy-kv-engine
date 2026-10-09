@@ -4,13 +4,14 @@
 
 **Status:** In progress — Stage 2 codec and persistence-model implementation is
 complete. Stage 3 now includes bounded backward FRONTIER discovery, single-pass
-candidate-prefix verification, authority/anchor selection, and the Active
-fresh-inode normalization primitive. An authority-required Active recovery
-coordinator now connects discovery, selection, and installation. Production
-WAL-open and manifest integration remain. The serial persistence model covers
-repeated normalization, continued append, and crash/reopen for empty, nonempty,
-fallback, and trailing-control prefixes, including a selected marker behind
-speculative DATA. The production writer remains v6.
+candidate-prefix verification, authority/anchor selection, the Active
+fresh-inode normalization primitive, and an authority-required coordinator.
+Stage 4 begins with the v7 resource-ledger primitive; live lifecycle
+reconstruction and WAL admission integration remain. Production WAL-open and
+manifest integration also remain. The serial persistence model covers repeated
+normalization, continued append, and crash/reopen for empty, nonempty, fallback,
+and trailing-control prefixes, including a selected marker behind speculative
+DATA. The production writer remains v6.
 
 **Last updated:** 2026-10-09
 
@@ -80,9 +81,10 @@ durable anchors or the strict immutable-object rules.
 
 ## Stage dependencies
 
-Stage 2 codec and persistence-model implementation is complete. Stage 3 is in
-progress; stages 4–8 remain planned. Each stage adds its own regression
-coverage, and stage 8 assembles the complete qualification evidence.
+Stage 2 codec and persistence-model implementation is complete. Stage 4 is in
+progress; production WAL-open and manifest integration, stages 5–8, and final
+qualification remain planned. Each stage adds its own regression coverage, and
+stage 8 assembles the complete qualification evidence.
 
 | Stage | Depends on | Reviewable result | Production writer |
 | --- | --- | --- | --- |
@@ -274,6 +276,12 @@ one prefix pass, with no whole-prefix rescan per candidate and no service before
 the installation barrier.
 
 ### 4. Admission reservations and ordered metadata
+
+The current slice adds a thread-safe reservation ledger for logical WAL bytes,
+source spool and recovery workspace, buffer memory, and seal-index capacity.
+Each reservation owns all of its charges and releases them atomically. The
+ledger is not yet reconstructed from lifecycle state or connected to live WAL
+admission; those integrations remain in this stage.
 
 - Promote or replace the `PitrSpoolAccountant` helper/model with a shared live
   ledger installed by the engine's PITR lifecycle. Reconstruct its charges
