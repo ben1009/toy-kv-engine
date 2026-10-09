@@ -1190,32 +1190,16 @@ mod tests {
     #[test]
     fn immutable_selection_cannot_be_normalized() -> Result<()> {
         let directory = TestDirectory::new()?;
-        let path = directory.0.join("missing.wal");
-        let mut selection = active_selection_for_empty_fixture()?;
-        selection.kind = WalV7RecoveryKind::Immutable;
-        assert!(install_active_recovery(path, &selection).is_err());
-        Ok(())
-    }
-
-    fn active_selection_for_empty_fixture() -> Result<WalV7RecoverySelection> {
-        let directory = TestDirectory::new()?;
         let path = directory.0.join("active.wal");
-        let header = test_header();
-        let header_bytes = header.encode()?;
-        let header_digest = header.digest()?;
-        let mut image = header_bytes.to_vec();
-        image.extend_from_slice(&encode_generation_zero_frontier(header_digest)?);
-        fs::write(&path, image)?;
-        let anchor = ActiveBoundary {
-            timeline_id: header.timeline_id.0,
-            archive_epoch_id: header.archive_epoch_id.0,
-            segment_id: header.segment_id.0,
-            incarnation: header.incarnation,
-            ticket_end: 0,
-            durable_end: HEADER_LEN_U64,
-            last_commit_ts: 0,
-            prefix_digest: header_digest,
-        };
-        active_selection(&path, anchor)
+        let (_header, anchor) = create_nonempty_image(&path)?;
+        let original = fs::read(&path)?;
+        let mut selection = active_selection(&path, anchor)?;
+        selection.kind = WalV7RecoveryKind::Immutable;
+        let error = install_active_recovery(&path, &selection)
+            .err()
+            .context("Immutable selection was normalized")?;
+        assert!(error.to_string().contains("cannot be normalized"));
+        assert_eq!(fs::read(&path)?, original);
+        Ok(())
     }
 }
