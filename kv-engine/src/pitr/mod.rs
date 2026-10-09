@@ -68,15 +68,14 @@ impl WalDigestRule {
 
 /// Both v5-family versions are read forever; only [`WAL_V5_VERSION`] is written.
 pub(crate) fn is_v5_family(version: u16) -> bool {
-    matches!(version, WAL_V5_VERSION | WAL_V5_VERSION_LEGACY)
+    crate::wal::format::WalFormatDescriptor::for_version(version)
+        .is_some_and(|descriptor| descriptor.is_v5_family())
 }
 
 pub(crate) fn wal_digest_rule(version: u16) -> Result<WalDigestRule> {
-    match version {
-        WAL_V5_VERSION => Ok(WalDigestRule::LogicalBatches),
-        WAL_V5_VERSION_LEGACY => Ok(WalDigestRule::WholeAlignedPrefix),
-        other => bail!("unsupported v5-family WAL version {other}"),
-    }
+    crate::wal::format::WalFormatDescriptor::for_version(version)
+        .and_then(|descriptor| descriptor.pitr_digest_rule())
+        .ok_or_else(|| anyhow::anyhow!("unsupported v5-family WAL version {version}"))
 }
 
 pub(crate) const LIVE_WAL_V5_LIMITS: WalV5Limits = WalV5Limits {
@@ -1129,7 +1128,9 @@ mod tests {
         assert!(is_v5_family(WAL_V5_VERSION_LEGACY));
         assert!(is_v5_family(WAL_V5_VERSION));
         assert!(!is_v5_family(4));
+        assert!(!is_v5_family(7));
         assert!(wal_digest_rule(4).is_err());
+        assert!(wal_digest_rule(7).is_err());
     }
 
     #[test]
