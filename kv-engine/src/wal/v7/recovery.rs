@@ -147,6 +147,13 @@ pub(crate) struct WalV7RecoverySelection {
     pub(crate) candidate: WalV7FrontierCandidate,
     pub(crate) active_boundary: ActiveBoundary,
     pub(crate) diagnostics: WalV7RecoveryDiagnostics,
+    pub(crate) kind: WalV7RecoveryKind,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum WalV7RecoveryKind {
+    Active,
+    Immutable,
 }
 
 impl WalV7FrontierPrefixVerification {
@@ -835,6 +842,7 @@ pub(crate) fn select_recovery_candidate<R: Read + Seek>(
                 candidate: selected,
                 active_boundary,
                 diagnostics,
+                kind: WalV7RecoveryKind::Active,
             })
         }
         WalV7RecoveryAuthority::Sealing {
@@ -894,6 +902,7 @@ pub(crate) fn select_recovery_candidate<R: Read + Seek>(
                 candidate: selected,
                 active_boundary: boundary.active,
                 diagnostics,
+                kind: WalV7RecoveryKind::Immutable,
             })
         }
     }

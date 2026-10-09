@@ -4,8 +4,9 @@
 
 **Status:** In progress — Stage 2 codec and persistence-model implementation is
 complete. Stage 3 now includes bounded backward FRONTIER discovery, single-pass
-candidate-prefix verification, and authority/anchor selection. Fresh-inode
-installation remains. The production writer remains v6.
+candidate-prefix verification, authority/anchor selection, and the Active
+fresh-inode normalization primitive. WAL-open/manifest integration remains.
+The production writer remains v6.
 
 **Last updated:** 2026-10-09
 
@@ -176,8 +177,10 @@ The first Stage 3 slice adds bounded backward discovery of structurally valid
 FRONTIER candidates. The second slice verifies all discovered candidates in one
 bounded forward pass, including complete logical batches and every retained
 control frame. The third slice selects an authoritative boundary against every
-durable Active anchor and applies strict Sealing/Sealed image checks. Fresh-inode
-installation remains a separate follow-up slice.
+durable Active anchor and applies strict Sealing/Sealed image checks. The current
+slice adds Active fresh-inode normalization and reconstructs the retained
+batches, append/hash state, and seal index. It is not yet wired into production
+WAL open or manifest publication, and it does not normalize immutable images.
 
 - Add proposed `wal/v7/recovery.rs`, receiving authoritative Active/Sealing/
   Sealed context and all durable anchors. A discovered seal sidecar cannot
@@ -214,8 +217,12 @@ installation remains a separate follow-up slice.
   Drain old I/O, reserve workspace, copy the original header and
   `[4096, durable_end)` unchanged to a fresh same-directory inode, and append
   the recovery frontier at `durable_end`, extending the last retained frontier.
-  For an empty prefix retain generation zero. Omit the old selected certificate
-  and speculative suffix.
+  After canonical selection, remove only matching orphan recovery images and
+  sync the directory before reusing their space. For an empty prefix retain
+  generation zero. Omit the old selected certificate and speculative suffix.
+  On an in-process failure, remove the temporary image and sync its directory;
+  if cleanup fails, propagate both errors and leave the workspace charged for
+  later durable cleanup.
 - Verify writes and successfully sync the fresh file even when its length
   would be unchanged; atomically replace the canonical path and sync its
   directory before opening service or publishing recovered state. Creation's
@@ -258,7 +265,9 @@ the installation barrier.
   from durable obligations and filesystem allocation before reopen permits
   admission. Wire the same ledger into WAL admission, preallocation, recovery
   installation, rotation, pin release, and durable cleanup; changing the model
-  helper alone cannot enforce live limits.
+  helper alone cannot enforce live limits. Keep recovery workspace charged
+  when installer cleanup or its directory sync fails, and release it only
+  after a later durable cleanup succeeds.
 - Give the live ledger and its model owned reservations for
   framed DATA, worst-case one marker per admitted batch, seal-index capacity,
   buffer memory, and recovery-workspace growth. Maintain logical WAL usage
