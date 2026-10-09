@@ -3,7 +3,9 @@
 **RFC:** [Parallel WAL with Embedded Frontiers and One Sync](../../rfcs/025-parallel-wal-embedded-frontiers.md)
 
 **Status:** In progress — Stage 2 codec and persistence-model implementation is
-complete; the production writer remains v6. Recovery and installation are next.
+complete. Stage 3 has started with bounded backward FRONTIER discovery; prefix
+verification and fresh-inode installation remain. The production writer remains
+v6.
 
 **Last updated:** 2026-10-09
 
@@ -169,6 +171,10 @@ complete stable marker with incomplete DATA after an interrupted sync. It is
 a protocol oracle, not the released v7 writer.
 
 ### 3. Independent recovery and durable fresh-inode installation
+
+The first Stage 3 slice adds bounded backward discovery of structurally valid
+FRONTIER candidates. Prefix verification, authority/anchor selection, and
+fresh-inode installation remain separate follow-up slices.
 
 - Add proposed `wal/v7/recovery.rs`, receiving authoritative Active/Sealing/
   Sealed context and all durable anchors. A discovered seal sidecar cannot

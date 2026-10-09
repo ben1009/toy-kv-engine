@@ -415,6 +415,17 @@ pub(crate) struct DecodedWalV7Frame {
     pub(crate) body: Vec<u8>,
 }
 
+/// Return whether an aligned frame header claims to be a FRONTIER.
+///
+/// This is only a discovery hint. Callers must still use
+/// [`decode_frame_structural`] before accepting the frame; this predicate does
+/// not validate the version, offset, binding, CRC, body, or padding.
+pub(crate) fn is_frontier_frame_header(input: &[u8]) -> bool {
+    input.len() >= 12
+        && input[..8] == WAL_V7_FRAME_MAGIC
+        && u16::from_be_bytes([input[10], input[11]]) == WAL_V7_FRAME_KIND_FRONTIER
+}
+
 fn encode_frame(
     kind: WalV7FrameKind,
     header_digest: [u8; 32],
