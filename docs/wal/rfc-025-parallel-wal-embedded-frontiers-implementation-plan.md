@@ -201,9 +201,9 @@ installation remains a separate follow-up slice.
   every exact anchored prefix even if the selected candidate has a greater
   ticket. Aggregate anchor coverage requirements once, then check each candidate
   in constant time; same-ticket anchors with different physical ends still
-  require a higher-ticket candidate. Reject read errors, damaged
-  header/generation zero, wrong incarnation, conflicting anchors, and
-  immutable-image disagreement.
+  require a higher-ticket candidate. Reject read errors, a damaged header, or
+  a missing, damaged, or noncanonical generation-zero marker; reject wrong
+  incarnation, conflicting anchors, and immutable-image disagreement.
 - For Sealing/Sealed, require the exact terminal marker, logical boundary,
   sealed length, and whole-image digest. Never fall back to an older marker or
   normalize an immutable image.
