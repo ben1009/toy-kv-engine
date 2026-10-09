@@ -7,7 +7,6 @@ resolver = "3"
 version = "0.1.0"
 authors = ["ben1009"]
 edition = "2024"
-homepage = "https://github.com/ben1009/toy-kv-engine"
 keywords = ["storage", "database"]
 license = "Apache-2.0"
 repository = "https://github.com/ben1009/toy-kv-engine"
