@@ -18,9 +18,15 @@ use parking_lot::{Condvar, Mutex};
 use sha2::{Digest, Sha256};
 
 use crate::{key::KeySlice, range_tombstone::RangeTombstone};
+use format::{
+    WAL_FORMAT_VERSION_V4, WAL_HEADER_SIZE, WAL_MVCC_MAGIC, WalFormatDescriptor, WalFraming,
+    WalIoPath,
+};
 
 #[cfg(test)]
 mod parallel;
+
+pub(crate) mod format;
 
 // Parallel WAL is the default for ordinary v4 WALs. Legacy and PITR WALs
 // keep their existing I/O paths.
@@ -45,17 +51,6 @@ pub struct RecoveredWalBatch {
     pub(crate) max_recorded_at: Option<crate::pitr::RecordedAt>,
 }
 
-/// Magic number for MVCC-format WAL files: "WAL2" in ASCII.
-const WAL_MVCC_MAGIC: u32 = 0x5741_4C32;
-/// MVCC WAL format version 2: untyped entries (key_len, key, val_len, val).
-const WAL_FORMAT_VERSION_V2: u16 = 2;
-/// MVCC WAL format version 3: typed entries with kind prefix.
-const WAL_FORMAT_VERSION_V3: u16 = 3;
-/// MVCC WAL format version 4: 20-byte batch header with `data_len` for
-/// O_DIRECT alignment-gap skipping.
-const WAL_FORMAT_VERSION_V4: u16 = 4;
-/// Size of the WAL file header: magic (4) + version (2) = 6 bytes.
-const WAL_HEADER_SIZE: usize = 6;
 /// Size of a batch header (v2/v3): commit_ts (8) + entry_count (4) + data_crc32 (4) = 16 bytes.
 const BATCH_HEADER_SIZE: usize = 16;
 /// v4 batch header size: commit_ts(8) + entry_count(4) + data_crc32(4) + data_len(4) = 20 bytes.
@@ -751,10 +746,14 @@ impl Wal {
         let buf_file = File::options().read(true).append(true).open(path)?;
 
         if mvcc_format {
-            let io_mode = if format_version == WAL_FORMAT_VERSION_V4 {
-                requested_io_mode
-            } else {
-                WalIoMode::Leader
+            let descriptor = WalFormatDescriptor::reader(format_version)?;
+            let io_path = descriptor.io.resolve(requested_io_mode);
+            let io_mode = match io_path {
+                WalIoPath::Leader => WalIoMode::Leader,
+                WalIoPath::Parallel => WalIoMode::Parallel,
+                WalIoPath::Buffered => {
+                    anyhow::bail!("MVCC WAL format {} cannot use buffered I/O", format_version)
+                }
             };
             // Pad the file to a 4KB boundary if needed. Pre-v4 WALs may have
             // non-aligned file lengths; O_DIRECT requires page-aligned offsets.
@@ -775,7 +774,7 @@ impl Wal {
                     let (ring, direct_file, alloc_offset) = Self::try_init_io_uring(path)?;
                     (Some(ring), direct_file, alloc_offset, None)
                 };
-            let pitr_seal = if crate::pitr::is_v5_family(format_version) {
+            let pitr_seal = if descriptor.is_pitr() {
                 let wal = std::fs::read(path)?;
                 let header = crate::pitr::decode_v5_file_header(&wal)?;
                 Some(Mutex::new(PitrSealAccumulator::from_wal(header, &wal)?))
@@ -899,7 +898,7 @@ impl Wal {
             entry_count,
         } = layout;
         anyhow::ensure!(
-            self.format_version == WAL_FORMAT_VERSION_V4,
+            self.is_v4(),
             "v4 WAL encoder selected for format {}",
             self.format_version
         );
@@ -1089,10 +1088,22 @@ impl Wal {
     ///
     /// Creation fails if io_uring or `O_DIRECT` initialization is unavailable.
     pub fn create(path: impl AsRef<Path>) -> Result<Self> {
-        Self::create_with_io_mode(path, WalIoMode::default())
+        let descriptor = WalFormatDescriptor::writer(WAL_FORMAT_VERSION_V4)?;
+        let io_mode = match descriptor.io.default_path() {
+            WalIoPath::Leader => WalIoMode::Leader,
+            WalIoPath::Parallel => WalIoMode::Parallel,
+            WalIoPath::Buffered => anyhow::bail!("v4 WAL requires direct I/O"),
+        };
+        Self::create_with_io_mode(path, io_mode)
     }
 
     pub(crate) fn create_with_io_mode(path: impl AsRef<Path>, io_mode: WalIoMode) -> Result<Self> {
+        let descriptor = WalFormatDescriptor::writer(WAL_FORMAT_VERSION_V4)?;
+        anyhow::ensure!(
+            descriptor.io.supports(io_mode),
+            "I/O mode is not supported by WAL format v{}",
+            WAL_FORMAT_VERSION_V4
+        );
         let f = File::create_new(path.as_ref()).context("failed to create WAL")?;
         let mut w = BufWriter::new(f);
         // Write MVCC WAL header (big-endian to match Buf::get_u32/get_u16).
@@ -1171,6 +1182,20 @@ impl Wal {
         path: impl AsRef<Path>,
         header: crate::pitr::WalV5Header,
     ) -> Result<Self> {
+        let descriptor = WalFormatDescriptor::writer(header.wal_format_version)?;
+        anyhow::ensure!(
+            descriptor.is_pitr(),
+            "WAL format {} is not a PITR format",
+            header.wal_format_version
+        );
+        anyhow::ensure!(
+            descriptor.io.supports(WalIoMode::Leader),
+            "PITR WAL format {} does not support Leader I/O",
+            header.wal_format_version
+        );
+        let digest_rule = descriptor
+            .pitr_digest_rule()
+            .context("PITR WAL format descriptor has no digest rule")?;
         crate::pitr::segment::install_v5_wal_header(path.as_ref(), header)?;
         let header_bytes = crate::pitr::encode_v5_file_header(header)?;
         let (ring, direct_file, alloc_offset) = Self::try_init_io_uring(path.as_ref())?;
@@ -1208,7 +1233,7 @@ impl Wal {
                 header,
                 &header_bytes,
                 Vec::new(),
-                crate::pitr::wal_digest_rule(header.wal_format_version)?,
+                digest_rule,
             ))),
         })
     }
@@ -1219,7 +1244,12 @@ impl Wal {
     }
 
     pub(crate) fn is_v5(&self) -> bool {
-        crate::pitr::is_v5_family(self.format_version)
+        WalFormatDescriptor::for_version(self.format_version)
+            .is_some_and(|format| format.is_v5_family())
+    }
+
+    fn is_v4(&self) -> bool {
+        WalFormatDescriptor::for_version(self.format_version).is_some_and(|format| format.is_v4())
     }
 
     pub(crate) fn is_parallel(&self) -> bool {
@@ -1270,8 +1300,12 @@ pub(crate) fn is_recordless_v4_wal(path: &std::path::Path) -> bool {
     if read < 4 {
         return prefix[..read] == WAL_MVCC_MAGIC.to_be_bytes()[..read];
     }
-    if prefix[..4] != WAL_MVCC_MAGIC.to_be_bytes()
-        || (read >= 6 && u16::from_be_bytes([prefix[4], prefix[5]]) != WAL_FORMAT_VERSION_V4)
+    if prefix[..4] != WAL_MVCC_MAGIC.to_be_bytes() {
+        return false;
+    }
+    if read >= WAL_HEADER_SIZE
+        && WalFormatDescriptor::for_version(u16::from_be_bytes([prefix[4], prefix[5]]))
+            .is_none_or(|descriptor| !descriptor.is_v4())
     {
         return false;
     }
@@ -1517,12 +1551,13 @@ impl Wal {
         file_len: u64,
         handler: &mut H,
     ) -> Result<(File, u64)> {
-        if crate::pitr::is_v5_family(wal_version) {
+        let descriptor = WalFormatDescriptor::reader(wal_version)?;
+        if descriptor.is_pitr() {
             return Self::recover_v5(f, data, file_len, handler);
         }
         let data_len = data.len();
         let mut max_ts: u64 = 0;
-        let is_v4 = wal_version >= WAL_FORMAT_VERSION_V4;
+        let is_v4 = descriptor.is_v4();
         let batch_hdr_size = Self::wal_batch_header_size(is_v4);
 
         while data.remaining() >= batch_hdr_size {
@@ -2016,23 +2051,7 @@ impl Wal {
             let magic = (&data[..4]).get_u32();
             let version = (&data[4..6]).get_u16();
             if magic == WAL_MVCC_MAGIC {
-                anyhow::ensure!(
-                    matches!(
-                        version,
-                        WAL_FORMAT_VERSION_V2
-                            | WAL_FORMAT_VERSION_V3
-                            | WAL_FORMAT_VERSION_V4
-                            | crate::pitr::WAL_V5_VERSION
-                            | crate::pitr::WAL_V5_VERSION_LEGACY
-                    ),
-                    "unsupported WAL version: got {}, expected {}, {}, {}, {}, or {}",
-                    version,
-                    WAL_FORMAT_VERSION_V2,
-                    WAL_FORMAT_VERSION_V3,
-                    WAL_FORMAT_VERSION_V4,
-                    crate::pitr::WAL_V5_VERSION,
-                    crate::pitr::WAL_V5_VERSION_LEGACY
-                );
+                let descriptor = WalFormatDescriptor::reader(version)?;
                 // The version field alone selects the parser, and the parsers
                 // disagree about where the header ends: a v5 segment read as v4
                 // parses as garbage, and recovery then truncates the file to the
@@ -2049,10 +2068,10 @@ impl Wal {
                 // a real v2/v3 WAL without trusting the version field, and the two
                 // share their magic, so the version field is not enough to decide.
                 if data.len() >= crate::pitr::WAL_V5_HEADER_LEN {
-                    if crate::pitr::is_v5_family(version) {
+                    if descriptor.is_pitr() {
                         crate::pitr::decode_v5_file_header(&data[..crate::pitr::WAL_V5_HEADER_LEN])
                             .context("WAL claims the v5 format but its header does not validate")?;
-                    } else if version == WAL_FORMAT_VERSION_V4
+                    } else if descriptor.is_v4()
                         && data[WAL_HEADER_SIZE..crate::pitr::WAL_V5_HEADER_LEN]
                             .iter()
                             .any(|byte| *byte != 0)
@@ -2063,17 +2082,14 @@ impl Wal {
                         );
                     }
                 }
-                (
-                    true,
-                    matches!(
-                        version,
-                        WAL_FORMAT_VERSION_V3
-                            | WAL_FORMAT_VERSION_V4
-                            | crate::pitr::WAL_V5_VERSION
-                            | crate::pitr::WAL_V5_VERSION_LEGACY
-                    ),
-                    version,
-                )
+                let is_v3 = matches!(
+                    descriptor.framing,
+                    WalFraming::MvccV3
+                        | WalFraming::MvccV4
+                        | WalFraming::PitrBatch
+                        | WalFraming::EmbeddedFrontier
+                );
+                (true, is_v3, version)
             } else {
                 (false, false, 0)
             }
@@ -2095,26 +2111,20 @@ impl Wal {
         let mut handler = SkiplistRecovery { skiplist };
 
         let (f, max_ts) = if mvcc_format {
-            let scan_start = if wal_version >= WAL_FORMAT_VERSION_V4 {
-                DirectBuf::align_up(WAL_HEADER_SIZE)
-            } else {
-                WAL_HEADER_SIZE
-            };
+            let descriptor = WalFormatDescriptor::reader(wal_version)?;
+            let scan_start = descriptor.data_start;
             // A truncated WAL (crash after header write) may have fewer bytes
             // than the padded header size. Treat as empty rather than panicking.
             // Extend the file to scan_start so O_DIRECT writes start at an
             // aligned offset (otherwise pwrite at unaligned EOF fails EINVAL).
             if data.len() < scan_start {
-                anyhow::ensure!(
-                    !crate::pitr::is_v5_family(wal_version),
-                    "truncated v5 WAL header"
-                );
+                anyhow::ensure!(!descriptor.is_pitr(), "truncated v5 WAL header");
                 data.advance(data.len());
                 f.set_len(scan_start as u64)?;
                 f.sync_all()?;
                 (f, 0u64)
             } else {
-                if crate::pitr::is_v5_family(wal_version) {
+                if descriptor.is_pitr() {
                     crate::pitr::decode_v5_file_header(&data[..crate::pitr::WAL_V5_HEADER_LEN])?;
                 }
                 data.advance(scan_start);
@@ -2175,22 +2185,16 @@ impl Wal {
         };
 
         let (f, max_ts) = if mvcc_format {
-            let scan_start = if wal_version >= WAL_FORMAT_VERSION_V4 {
-                DirectBuf::align_up(WAL_HEADER_SIZE)
-            } else {
-                WAL_HEADER_SIZE
-            };
+            let descriptor = WalFormatDescriptor::reader(wal_version)?;
+            let scan_start = descriptor.data_start;
             if data.len() < scan_start {
-                anyhow::ensure!(
-                    !crate::pitr::is_v5_family(wal_version),
-                    "truncated v5 WAL header"
-                );
+                anyhow::ensure!(!descriptor.is_pitr(), "truncated v5 WAL header");
                 data.advance(data.len());
                 f.set_len(scan_start as u64)?;
                 f.sync_all()?;
                 (f, 0u64)
             } else {
-                if crate::pitr::is_v5_family(wal_version) {
+                if descriptor.is_pitr() {
                     crate::pitr::decode_v5_file_header(&data[..crate::pitr::WAL_V5_HEADER_LEN])?;
                 }
                 data.advance(scan_start);
@@ -2470,7 +2474,7 @@ impl Wal {
             "range tombstone batches require v3 WAL format (found v2)"
         );
         anyhow::ensure!(
-            self.format_version == WAL_FORMAT_VERSION_V4,
+            self.is_v4(),
             "legacy range tombstone batches require v4 WAL format (found {})",
             self.format_version
         );

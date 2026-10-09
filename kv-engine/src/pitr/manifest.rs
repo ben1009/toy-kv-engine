@@ -75,6 +75,87 @@ pub(crate) struct PersistedCommitAnchor {
     pub(crate) entry_digest: [u8; 32],
 }
 
+/// Logical recovery boundary for an Active v7 WAL.
+///
+/// This deliberately excludes the physical FRONTIER offset, generation, and
+/// frame digest because Active recovery may relocate and rechain its frontier.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub(crate) struct ActiveBoundary {
+    pub(crate) timeline_id: [u8; 16],
+    pub(crate) archive_epoch_id: [u8; 16],
+    pub(crate) segment_id: u64,
+    pub(crate) incarnation: [u8; 16],
+    pub(crate) ticket_end: u64,
+    pub(crate) durable_end: u64,
+    pub(crate) last_commit_ts: u64,
+    pub(crate) prefix_digest: [u8; 32],
+}
+
+impl ActiveBoundary {
+    pub(crate) fn validate(&self) -> Result<()> {
+        ensure!(
+            self.timeline_id != [0; 16],
+            "Active WAL timeline identity is empty"
+        );
+        ensure!(
+            self.archive_epoch_id != [0; 16],
+            "Active WAL archive epoch identity is empty"
+        );
+        ensure!(
+            self.incarnation != [0; 16],
+            "Active WAL incarnation is empty"
+        );
+        ensure!(
+            self.durable_end.is_multiple_of(4096),
+            "Active WAL durable boundary is not frame aligned"
+        );
+        match self.ticket_end {
+            0 => ensure!(
+                self.durable_end == 4096 && self.last_commit_ts == 0,
+                "empty Active WAL boundary is inconsistent"
+            ),
+            _ => ensure!(
+                self.durable_end >= 3 * 4096 && self.last_commit_ts != 0,
+                "nonempty Active WAL boundary is inconsistent"
+            ),
+        }
+
+        Ok(())
+    }
+}
+
+/// Physical recovery boundary for a Sealing or Sealed v7 WAL image.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub(crate) struct ImmutableBoundary {
+    pub(crate) active: ActiveBoundary,
+    pub(crate) sealed_end: u64,
+    pub(crate) terminal_frontier_digest: [u8; 32],
+    pub(crate) wal_digest: [u8; 32],
+}
+
+impl ImmutableBoundary {
+    pub(crate) fn validate(&self) -> Result<()> {
+        self.active.validate()?;
+        let min_sealed_end = self
+            .active
+            .durable_end
+            .checked_add(4096)
+            .ok_or_else(|| anyhow::anyhow!("immutable WAL boundary overflows"))?;
+        ensure!(
+            self.sealed_end.is_multiple_of(4096) && self.sealed_end >= min_sealed_end,
+            "immutable WAL boundary is inconsistent with its Active anchor"
+        );
+        if self.active.ticket_end == 0 {
+            ensure!(
+                self.sealed_end == min_sealed_end,
+                "empty immutable WAL must end immediately after the generation-zero FRONTIER"
+            );
+        }
+
+        Ok(())
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub(crate) enum CoverageBreakReason {
     RepositoryUnavailable,
@@ -1023,6 +1104,92 @@ fn apply_high_water(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn active_boundary() -> ActiveBoundary {
+        ActiveBoundary {
+            timeline_id: [1; 16],
+            archive_epoch_id: [2; 16],
+            segment_id: 3,
+            incarnation: [4; 16],
+            ticket_end: 1,
+            durable_end: 3 * 4096,
+            last_commit_ts: 5,
+            prefix_digest: [6; 32],
+        }
+    }
+
+    #[test]
+    fn v7_boundaries_validate_and_round_trip_without_active_physical_identity() {
+        let active = active_boundary();
+        active.validate().unwrap();
+        let active_bytes = serde_json::to_vec(&active).unwrap();
+        let active_json: serde_json::Value = serde_json::from_slice(&active_bytes).unwrap();
+        assert!(active_json.get("frontier_offset").is_none());
+        assert!(active_json.get("generation").is_none());
+        assert!(active_json.get("frontier_digest").is_none());
+        assert_eq!(
+            serde_json::from_slice::<ActiveBoundary>(&active_bytes).unwrap(),
+            active
+        );
+
+        let immutable = ImmutableBoundary {
+            active,
+            sealed_end: 4 * 4096,
+            terminal_frontier_digest: [7; 32],
+            wal_digest: [8; 32],
+        };
+        immutable.validate().unwrap();
+        let immutable_bytes = serde_json::to_vec(&immutable).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<ImmutableBoundary>(&immutable_bytes).unwrap(),
+            immutable
+        );
+    }
+
+    #[test]
+    fn v7_boundaries_reject_inconsistent_empty_and_sealed_ranges() {
+        let mut empty = active_boundary();
+        empty.ticket_end = 0;
+        empty.durable_end = 8192;
+        empty.last_commit_ts = 0;
+        assert!(empty.validate().is_err());
+
+        let immutable = ImmutableBoundary {
+            active: active_boundary(),
+            sealed_end: 3 * 4096,
+            terminal_frontier_digest: [7; 32],
+            wal_digest: [8; 32],
+        };
+        assert!(immutable.validate().is_err());
+    }
+
+    #[test]
+    fn v7_boundaries_empty_immutable_ends_after_generation_zero() {
+        let mut active = active_boundary();
+        active.ticket_end = 0;
+        active.durable_end = 4096;
+        active.last_commit_ts = 0;
+        let empty = ImmutableBoundary {
+            active,
+            sealed_end: 8192,
+            terminal_frontier_digest: [7; 32],
+            wal_digest: [8; 32],
+        };
+        empty.validate().unwrap();
+        let bytes = serde_json::to_vec(&empty).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<ImmutableBoundary>(&bytes).unwrap(),
+            empty
+        );
+
+        for sealed_end in [12288, 16384] {
+            let oversized = ImmutableBoundary {
+                sealed_end,
+                ..empty
+            };
+            assert!(oversized.validate().is_err());
+        }
+    }
 
     fn config() -> PersistedPitrConfig {
         PersistedPitrConfig {
