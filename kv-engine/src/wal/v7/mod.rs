@@ -2,3 +2,6 @@
 #![allow(dead_code)]
 
 pub(crate) mod codec;
+
+#[cfg(test)]
+mod model;

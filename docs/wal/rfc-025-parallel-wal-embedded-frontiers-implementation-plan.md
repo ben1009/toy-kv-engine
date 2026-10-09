@@ -2,8 +2,8 @@
 
 **RFC:** [Parallel WAL with Embedded Frontiers and One Sync](../../rfcs/025-parallel-wal-embedded-frontiers.md)
 
-**Status:** In progress — Stage 2 codec primitives. The production writer remains
-v6; the persistence model, recovery, creation, and runtime are not implemented.
+**Status:** In progress — Stage 2 codec and persistence-model implementation is
+complete; the production writer remains v6. Recovery and installation are next.
 
 **Last updated:** 2026-10-09
 
@@ -73,9 +73,9 @@ durable anchors or the strict immutable-object rules.
 
 ## Stage dependencies
 
-Stage 2 codec primitives are in progress; later stages remain planned. Each
-stage adds its own regression coverage, and stage 8 assembles the complete
-qualification evidence.
+Stage 2 codec and persistence-model implementation is complete; stages 3–8
+remain planned. Each stage adds its own regression coverage, and stage 8
+assembles the complete qualification evidence.
 
 | Stage | Depends on | Reviewable result | Production writer |
 | --- | --- | --- | --- |
