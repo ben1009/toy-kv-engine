@@ -16,12 +16,16 @@ use super::codec::{
     decode_frame_structural, decode_frontier_successor, encode_frontier_successor,
     encode_generation_zero_frontier, frame_record_digest, is_frontier_frame_header,
 };
-use crate::pitr::{LIVE_WAL_V5_LIMITS, RecordedAt, decode_wal_entry_stream};
+use crate::pitr::{
+    ChainAnchor, LIVE_WAL_V5_LIMITS, RecordedAt, decode_wal_entry_stream,
+    manifest::{ActiveBoundary, ImmutableBoundary},
+};
 use crate::wal::MAX_WAL_FILE_SIZE;
 
 const DISCOVERY_BATCH_FRAMES: usize = 64;
 const MAX_REJECTED_FRONTIER_DIAGNOSTICS: usize = 64;
 const MAX_REJECTION_REASON_CHARS: usize = 192;
+const IMMUTABLE_HASH_BUFFER_LEN: usize = 64 * 1024;
 
 const FRAME_LEN_U64: u64 = WAL_V7_FRAME_LEN as u64;
 const HEADER_LEN_U64: u64 = WAL_V7_HEADER_LEN as u64;
@@ -106,6 +110,45 @@ pub(crate) struct WalV7FrontierPrefixVerification {
     pub(crate) stopped_at: Option<WalV7RejectedFrontier>,
 }
 
+/// Durable authority supplied by the source manifest or a verified backup/catalog.
+/// A sidecar discovered beside an Active WAL must never be used to construct an
+/// immutable variant of this value.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum WalV7RecoveryAuthority {
+    Active {
+        predecessor: ChainAnchor,
+        durable_anchors: Vec<ActiveBoundary>,
+    },
+    Sealing {
+        predecessor: ChainAnchor,
+        boundary: ImmutableBoundary,
+    },
+    Sealed {
+        predecessor: ChainAnchor,
+        boundary: ImmutableBoundary,
+    },
+}
+
+/// Bounded selection diagnostics. The physical tail is the range an Active
+/// fresh-inode normalization will replace; immutable recovery never discards
+/// bytes.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct WalV7RecoveryDiagnostics {
+    pub(crate) selected_frame_offset: u64,
+    pub(crate) rejected_frontiers: Vec<WalV7RejectedFrontier>,
+    pub(crate) rejected_frontier_count: u64,
+    pub(crate) discarded_physical_tail: Option<(u64, u64)>,
+    pub(crate) fallback_reason: Option<String>,
+}
+
+/// Selected logical boundary plus the physical certificate that proved it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct WalV7RecoverySelection {
+    pub(crate) candidate: WalV7FrontierCandidate,
+    pub(crate) active_boundary: ActiveBoundary,
+    pub(crate) diagnostics: WalV7RecoveryDiagnostics,
+}
+
 impl WalV7FrontierPrefixVerification {
     fn reject(&mut self, frame_offset: u64, error: impl std::fmt::Display) -> Result<()> {
         self.rejected_candidate_count = self
@@ -140,6 +183,72 @@ struct WalV7PrefixFrontier {
     frontier: WalV7Frontier,
     frame_digest: [u8; 32],
     chain_breaks_through: u64,
+}
+
+/// Constant-size coverage constraints; every anchor still needs exact prefix
+/// validation before these constraints can authorize a candidate.
+struct WalV7ActiveAnchorRequirements {
+    maximum_ticket_anchor: ActiveBoundary,
+    maximum_durable_end: u64,
+    maximum_last_commit_ts: u64,
+    lower_ticket_floor: Option<(u64, u64)>,
+    maximum_ticket_anchors_agree: bool,
+}
+
+impl WalV7ActiveAnchorRequirements {
+    fn new(anchors: &[ActiveBoundary]) -> Result<Self> {
+        let maximum_ticket_anchor = anchors
+            .iter()
+            .max_by_key(|anchor| anchor.ticket_end)
+            .copied()
+            .context("Active v7 recovery requires at least one durable anchor")?;
+        let mut requirements = Self {
+            maximum_ticket_anchor,
+            maximum_durable_end: maximum_ticket_anchor.durable_end,
+            maximum_last_commit_ts: maximum_ticket_anchor.last_commit_ts,
+            lower_ticket_floor: None,
+            maximum_ticket_anchors_agree: true,
+        };
+        for anchor in anchors {
+            requirements.maximum_durable_end =
+                requirements.maximum_durable_end.max(anchor.durable_end);
+            requirements.maximum_last_commit_ts = requirements
+                .maximum_last_commit_ts
+                .max(anchor.last_commit_ts);
+            if anchor.ticket_end == maximum_ticket_anchor.ticket_end {
+                requirements.maximum_ticket_anchors_agree &= anchor.durable_end
+                    == maximum_ticket_anchor.durable_end
+                    && anchor.last_commit_ts == maximum_ticket_anchor.last_commit_ts
+                    && anchor.prefix_digest == maximum_ticket_anchor.prefix_digest;
+            } else {
+                let (end, timestamp) = requirements.lower_ticket_floor.unwrap_or((0, 0));
+                requirements.lower_ticket_floor = Some((
+                    end.max(anchor.durable_end),
+                    timestamp.max(anchor.last_commit_ts),
+                ));
+            }
+        }
+        Ok(requirements)
+    }
+
+    fn covers(&self, candidate: &WalV7FrontierCandidate) -> bool {
+        if !candidate_covers_anchor(candidate, &self.maximum_ticket_anchor) {
+            return false;
+        }
+        if candidate.frontier.ticket_end > self.maximum_ticket_anchor.ticket_end {
+            return candidate.frontier.durable_end > self.maximum_durable_end
+                && candidate.frontier.last_commit_ts > self.maximum_last_commit_ts;
+        }
+
+        // Same-ticket anchors can name different physical ends when an end
+        // includes a trailing control frame. A higher-ticket candidate can
+        // cover both, but an equal-ticket candidate must match every tuple.
+        self.maximum_ticket_anchors_agree
+            && self.lower_ticket_floor.is_none_or(|(end, timestamp)| {
+                candidate.frontier.durable_end > end
+                    && candidate.frontier.last_commit_ts > timestamp
+            })
+    }
 }
 
 fn bounded_reason(error: impl std::fmt::Display) -> String {
@@ -257,6 +366,16 @@ pub(crate) fn verify_frontier_candidate_prefixes<R: Read + Seek>(
     file_len: u64,
     candidates: &[WalV7FrontierCandidate],
 ) -> Result<WalV7FrontierPrefixVerification> {
+    verify_frontier_candidate_prefixes_with_anchors(reader, file_len, candidates, &[], None)
+}
+
+fn verify_frontier_candidate_prefixes_with_anchors<R: Read + Seek>(
+    reader: &mut R,
+    file_len: u64,
+    candidates: &[WalV7FrontierCandidate],
+    active_anchors: &[ActiveBoundary],
+    expected_predecessor: Option<ChainAnchor>,
+) -> Result<WalV7FrontierPrefixVerification> {
     ensure!(
         file_len >= HEADER_LEN_U64 + FRAME_LEN_U64,
         "installed v7 WAL image is missing generation-zero FRONTIER"
@@ -278,7 +397,20 @@ pub(crate) fn verify_frontier_candidate_prefixes<R: Read + Seek>(
         header.encode()? == header_bytes,
         "v7 WAL immutable header is not canonical"
     );
+    if let Some(expected_predecessor) = expected_predecessor {
+        ensure!(
+            header.predecessor == expected_predecessor,
+            "v7 WAL predecessor differs from authoritative segment identity"
+        );
+    }
     let header_digest: [u8; 32] = Sha256::digest(header_bytes).into();
+    for anchor in active_anchors {
+        validate_anchor_identity(anchor, header)?;
+        ensure!(
+            anchor.durable_end <= file_len,
+            "Active v7 durable anchor exceeds physical WAL length"
+        );
+    }
 
     let mut verification = WalV7FrontierPrefixVerification::default();
     let generation_zero_bytes = read_frame(reader, HEADER_LEN_U64)?;
@@ -344,6 +476,9 @@ pub(crate) fn verify_frontier_candidate_prefixes<R: Read + Seek>(
             continue;
         }
         maximum_candidate_end = maximum_candidate_end.max(candidate.frontier.durable_end);
+    }
+    for anchor in active_anchors {
+        maximum_candidate_end = maximum_candidate_end.max(anchor.durable_end);
     }
 
     let mut cursor = HEADER_LEN_U64 + FRAME_LEN_U64;
@@ -634,7 +769,320 @@ pub(crate) fn verify_frontier_candidate_prefixes<R: Read + Seek>(
         }
     }
 
+    for anchor in active_anchors {
+        verify_active_anchor_prefix(anchor, &frontiers, &checkpoints, cursor)?;
+    }
+
     Ok(verification)
+}
+
+/// Select an authoritative v7 recovery boundary from discovered and verified
+/// candidates. The caller must hold exclusive recovery ownership, and discovery
+/// must describe this unchanged image and `file_len` snapshot. Active recovery
+/// may fall back above every verified anchor; Sealing and Sealed recovery
+/// require the exact intent-bound terminal image.
+pub(crate) fn select_recovery_candidate<R: Read + Seek>(
+    reader: &mut R,
+    file_len: u64,
+    discovery: &WalV7FrontierDiscovery,
+    authority: WalV7RecoveryAuthority,
+) -> Result<WalV7RecoverySelection> {
+    match authority {
+        WalV7RecoveryAuthority::Active {
+            predecessor,
+            durable_anchors,
+        } => {
+            let anchor_requirements = WalV7ActiveAnchorRequirements::new(&durable_anchors)?;
+            let verification = verify_frontier_candidate_prefixes_with_anchors(
+                reader,
+                file_len,
+                &discovery.candidates,
+                &durable_anchors,
+                Some(predecessor),
+            )?;
+            let selected = verification
+                .verified_candidates
+                .iter()
+                .filter(|candidate| anchor_requirements.covers(candidate))
+                .max_by_key(|candidate| candidate.frame_offset)
+                .cloned()
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "no fully verified Active v7 FRONTIER satisfies all durable anchors"
+                    )
+                })?;
+            let identity = durable_anchors[0];
+            let active_boundary = ActiveBoundary {
+                timeline_id: identity.timeline_id,
+                archive_epoch_id: identity.archive_epoch_id,
+                segment_id: identity.segment_id,
+                incarnation: identity.incarnation,
+                ticket_end: selected.frontier.ticket_end,
+                durable_end: selected.frontier.durable_end,
+                last_commit_ts: selected.frontier.last_commit_ts,
+                prefix_digest: selected.frontier.prefix_digest,
+            };
+            active_boundary.validate()?;
+            let diagnostics = recovery_diagnostics(
+                discovery,
+                &verification,
+                &selected,
+                file_len,
+                Some(&active_boundary),
+            )?;
+
+            Ok(WalV7RecoverySelection {
+                candidate: selected,
+                active_boundary,
+                diagnostics,
+            })
+        }
+        WalV7RecoveryAuthority::Sealing {
+            predecessor,
+            boundary,
+        }
+        | WalV7RecoveryAuthority::Sealed {
+            predecessor,
+            boundary,
+        } => {
+            boundary.validate()?;
+            ensure!(
+                file_len == boundary.sealed_end,
+                "immutable v7 WAL length differs from its durable sealed boundary"
+            );
+            let verification = verify_frontier_candidate_prefixes_with_anchors(
+                reader,
+                file_len,
+                &discovery.candidates,
+                std::slice::from_ref(&boundary.active),
+                Some(predecessor),
+            )?;
+            let terminal_offset = boundary
+                .sealed_end
+                .checked_sub(FRAME_LEN_U64)
+                .ok_or_else(|| anyhow::anyhow!("immutable v7 terminal offset underflows"))?;
+            let selected = verification
+                .verified_candidates
+                .iter()
+                .find(|candidate| candidate.frame_offset == terminal_offset)
+                .cloned()
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "immutable v7 terminal FRONTIER is absent or its prefix is invalid"
+                    )
+                })?;
+            ensure!(
+                selected.frame_digest == boundary.terminal_frontier_digest,
+                "immutable v7 terminal FRONTIER digest differs from its durable boundary"
+            );
+            ensure!(
+                selected.frontier.ticket_end == boundary.active.ticket_end
+                    && selected.frontier.durable_end == boundary.active.durable_end
+                    && selected.frontier.last_commit_ts == boundary.active.last_commit_ts
+                    && selected.frontier.prefix_digest == boundary.active.prefix_digest,
+                "immutable v7 terminal FRONTIER differs from its logical durable anchor"
+            );
+            ensure!(
+                selected.frontier.durable_end == terminal_offset,
+                "immutable v7 terminal FRONTIER does not cover the complete physical image"
+            );
+            verify_immutable_wal_digest(reader, file_len, boundary.wal_digest)?;
+            let diagnostics =
+                recovery_diagnostics(discovery, &verification, &selected, file_len, None)?;
+
+            Ok(WalV7RecoverySelection {
+                candidate: selected,
+                active_boundary: boundary.active,
+                diagnostics,
+            })
+        }
+    }
+}
+
+fn validate_anchor_identity(anchor: &ActiveBoundary, header: WalV7Header) -> Result<()> {
+    anchor.validate()?;
+    ensure!(
+        anchor.timeline_id == header.timeline_id.0
+            && anchor.archive_epoch_id == header.archive_epoch_id.0
+            && anchor.segment_id == header.segment_id.0
+            && anchor.incarnation == header.incarnation,
+        "Active v7 durable anchor identifies a different WAL segment"
+    );
+    Ok(())
+}
+
+fn verify_active_anchor_prefix(
+    anchor: &ActiveBoundary,
+    frontiers: &[WalV7PrefixFrontier],
+    checkpoints: &[WalV7PrefixCheckpoint],
+    verified_prefix_end: u64,
+) -> Result<()> {
+    ensure!(
+        anchor.durable_end <= verified_prefix_end,
+        "Active v7 durable anchor extends beyond the verified physical prefix"
+    );
+    let ticket_end = usize::try_from(anchor.ticket_end)?;
+    let checkpoint = checkpoints
+        .get(ticket_end)
+        .context("Active v7 durable anchor ticket end exceeds verified DATA")?;
+
+    if ticket_end == 0 {
+        ensure!(
+            anchor.durable_end == HEADER_LEN_U64
+                && anchor.last_commit_ts == 0
+                && anchor.prefix_digest == checkpoint.prefix_digest,
+            "empty Active v7 durable anchor differs from the immutable header"
+        );
+        return Ok(());
+    }
+
+    ensure!(
+        checkpoint.last_commit_ts == anchor.last_commit_ts
+            && checkpoint.prefix_digest == anchor.prefix_digest,
+        "Active v7 durable anchor timestamp or logical prefix digest mismatch"
+    );
+    let complete_batch_count =
+        checkpoints[1..].partition_point(|batch| batch.data_end <= anchor.durable_end);
+    ensure!(
+        u64::try_from(complete_batch_count)? == anchor.ticket_end,
+        "Active v7 durable anchor covers a different DATA ticket count"
+    );
+    if let Some(partial_batch) = checkpoints[1..].get(complete_batch_count) {
+        ensure!(
+            partial_batch.data_start >= anchor.durable_end,
+            "Active v7 durable anchor splits a DATA batch"
+        );
+    }
+
+    let predecessor = prefix_predecessor(frontiers, anchor.durable_end)?;
+    let predecessor_end = predecessor
+        .frame_offset
+        .checked_add(FRAME_LEN_U64)
+        .ok_or_else(|| anyhow::anyhow!("Active v7 predecessor end overflows"))?;
+    let expected_durable_end = checkpoint.data_end.max(predecessor_end);
+    ensure!(
+        anchor.durable_end == expected_durable_end,
+        "Active v7 durable anchor does not match its exact physical prefix"
+    );
+    Ok(())
+}
+
+fn candidate_covers_anchor(candidate: &WalV7FrontierCandidate, anchor: &ActiveBoundary) -> bool {
+    if candidate.frontier.ticket_end < anchor.ticket_end
+        || candidate.frontier.durable_end < anchor.durable_end
+        || candidate.frontier.last_commit_ts < anchor.last_commit_ts
+    {
+        return false;
+    }
+    if candidate.frontier.ticket_end == anchor.ticket_end {
+        candidate.frontier.durable_end == anchor.durable_end
+            && candidate.frontier.last_commit_ts == anchor.last_commit_ts
+            && candidate.frontier.prefix_digest == anchor.prefix_digest
+    } else {
+        candidate.frontier.durable_end > anchor.durable_end
+            && candidate.frontier.last_commit_ts > anchor.last_commit_ts
+    }
+}
+
+fn verify_immutable_wal_digest<R: Read + Seek>(
+    reader: &mut R,
+    file_len: u64,
+    expected_digest: [u8; 32],
+) -> Result<()> {
+    reader
+        .seek(SeekFrom::Start(0))
+        .context("seek immutable v7 WAL image for digest")?;
+    let mut remaining = file_len;
+    let mut buffer = [0_u8; IMMUTABLE_HASH_BUFFER_LEN];
+    let mut hasher = Sha256::new();
+    while remaining > 0 {
+        let bytes_to_read = usize::try_from(remaining.min(IMMUTABLE_HASH_BUFFER_LEN as u64))?;
+        reader
+            .read_exact(&mut buffer[..bytes_to_read])
+            .context("read immutable v7 WAL image for digest")?;
+        hasher.update(&buffer[..bytes_to_read]);
+        remaining -= u64::try_from(bytes_to_read)?;
+    }
+    let actual_digest: [u8; 32] = hasher.finalize().into();
+    ensure!(
+        actual_digest == expected_digest,
+        "immutable v7 WAL image digest mismatch"
+    );
+    Ok(())
+}
+
+fn recovery_diagnostics(
+    discovery: &WalV7FrontierDiscovery,
+    verification: &WalV7FrontierPrefixVerification,
+    selected: &WalV7FrontierCandidate,
+    file_len: u64,
+    active_boundary: Option<&ActiveBoundary>,
+) -> Result<WalV7RecoveryDiagnostics> {
+    let rejected_frontier_count = discovery
+        .rejected_frontier_count
+        .checked_add(verification.rejected_candidate_count)
+        .ok_or_else(|| anyhow::anyhow!("v7 recovery rejected-frontier count overflows"))?;
+    let mut rejected_frontiers = Vec::new();
+    rejected_frontiers
+        .try_reserve(
+            discovery
+                .rejected_frontiers
+                .len()
+                .saturating_add(verification.rejected_candidates.len())
+                .min(MAX_REJECTED_FRONTIER_DIAGNOSTICS),
+        )
+        .context("reserve v7 recovery diagnostics")?;
+    for rejected in discovery
+        .rejected_frontiers
+        .iter()
+        .chain(&verification.rejected_candidates)
+    {
+        rejected_frontiers.push(rejected.clone());
+    }
+    rejected_frontiers.sort_unstable_by_key(|rejected| std::cmp::Reverse(rejected.frame_offset));
+    rejected_frontiers.truncate(MAX_REJECTED_FRONTIER_DIAGNOSTICS);
+
+    let has_newer_candidate = discovery
+        .candidates
+        .iter()
+        .any(|candidate| candidate.frame_offset > selected.frame_offset)
+        || discovery
+            .rejected_frontiers
+            .first()
+            .is_some_and(|rejected| rejected.frame_offset > selected.frame_offset)
+        || verification
+            .rejected_candidates
+            .first()
+            .is_some_and(|rejected| rejected.frame_offset > selected.frame_offset);
+    let fallback_reason = has_newer_candidate.then(|| {
+        bounded_reason(format!(
+            "selected frontier at {} after rejecting or excluding newer physical candidates",
+            selected.frame_offset
+        ))
+    });
+
+    let discarded_physical_tail = if let Some(boundary) = active_boundary {
+        let start = if boundary.ticket_end == 0 {
+            HEADER_LEN_U64 + FRAME_LEN_U64
+        } else {
+            boundary.durable_end
+        };
+        ensure!(
+            start <= file_len,
+            "Active v7 selected boundary exceeds physical WAL length"
+        );
+        (start < file_len).then_some((start, file_len))
+    } else {
+        None
+    };
+
+    Ok(WalV7RecoveryDiagnostics {
+        selected_frame_offset: selected.frame_offset,
+        rejected_frontiers,
+        rejected_frontier_count,
+        discarded_physical_tail,
+        fallback_reason,
+    })
 }
 
 fn candidate_has_valid_frame_bounds(candidate: &WalV7FrontierCandidate, file_len: u64) -> bool {
@@ -1030,6 +1478,435 @@ mod tests {
             u64::try_from(image.len())?,
             &discovery.candidates,
         )
+    }
+
+    fn boundary_for(frontier: WalV7Frontier, header: WalV7Header) -> ActiveBoundary {
+        ActiveBoundary {
+            timeline_id: header.timeline_id.0,
+            archive_epoch_id: header.archive_epoch_id.0,
+            segment_id: header.segment_id.0,
+            incarnation: header.incarnation,
+            ticket_end: frontier.ticket_end,
+            durable_end: frontier.durable_end,
+            last_commit_ts: frontier.last_commit_ts,
+            prefix_digest: frontier.prefix_digest,
+        }
+    }
+
+    fn two_batch_image() -> Result<(Vec<u8>, ActiveBoundary, ActiveBoundary)> {
+        let TestWalImage {
+            mut image,
+            header_digest,
+            frontier_zero,
+            frontier_zero_digest: digest_zero,
+        } = test_image()?;
+        let header_bytes = image[..WAL_V7_HEADER_LEN].to_vec();
+        let (first_data_end, first_batch) =
+            append_data_batch(&mut image, 8192, header_digest, 0, 10, 100, b"first")?;
+        let first_prefix_digest = logical_prefix_digest(&header_bytes, &[&first_batch]);
+        let (frontier_one, digest_one) = append_successor(
+            &mut image,
+            header_digest,
+            SuccessorSpec {
+                previous: frontier_zero,
+                previous_offset: HEADER_LEN_U64,
+                previous_digest: digest_zero,
+                frame_offset: first_data_end,
+                ticket_end: 1,
+                durable_end: first_data_end,
+                last_commit_ts: 10,
+                prefix_digest: first_prefix_digest,
+            },
+        )?;
+        let second_data_start = first_data_end + FRAME_LEN_U64;
+        let (second_data_end, second_batch) = append_data_batch(
+            &mut image,
+            second_data_start,
+            header_digest,
+            1,
+            20,
+            101,
+            b"second",
+        )?;
+        let second_prefix_digest =
+            logical_prefix_digest(&header_bytes, &[&first_batch, &second_batch]);
+        let (frontier_two, _) = append_successor(
+            &mut image,
+            header_digest,
+            SuccessorSpec {
+                previous: frontier_one,
+                previous_offset: first_data_end,
+                previous_digest: digest_one,
+                frame_offset: second_data_end,
+                ticket_end: 2,
+                durable_end: second_data_end,
+                last_commit_ts: 20,
+                prefix_digest: second_prefix_digest,
+            },
+        )?;
+
+        let header = test_header();
+        Ok((
+            image,
+            boundary_for(frontier_one, header),
+            boundary_for(frontier_two, header),
+        ))
+    }
+
+    fn discover_image(image: &[u8]) -> Result<WalV7FrontierDiscovery> {
+        let mut reader = Cursor::new(image);
+        discover_frontier_candidates(
+            &mut reader,
+            u64::try_from(image.len())?,
+            &test_header().digest()?,
+        )
+    }
+
+    #[test]
+    fn selects_newest_physical_candidate_containing_all_active_anchors() -> Result<()> {
+        let (image, first_anchor, newest_anchor) = two_batch_image()?;
+        let discovery = discover_image(&image)?;
+        let mut reader = Cursor::new(image.as_slice());
+
+        let selection = select_recovery_candidate(
+            &mut reader,
+            u64::try_from(image.len())?,
+            &discovery,
+            WalV7RecoveryAuthority::Active {
+                predecessor: test_header().predecessor,
+                durable_anchors: vec![first_anchor, newest_anchor],
+            },
+        )?;
+
+        assert_eq!(selection.active_boundary.ticket_end, 2);
+        assert_eq!(
+            selection.candidate.frame_offset,
+            u64::try_from(image.len())? - FRAME_LEN_U64
+        );
+        assert_eq!(
+            selection.diagnostics.selected_frame_offset,
+            selection.candidate.frame_offset
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn active_anchor_requirements_match_individual_coverage() -> Result<()> {
+        let (image, first_anchor, newest_anchor) = two_batch_image()?;
+        let discovery = discover_image(&image)?;
+        let mut candidate = discovery.candidates[0].clone();
+        let mut trailing_control_anchor = first_anchor;
+        trailing_control_anchor.durable_end += FRAME_LEN_U64;
+        let mut different_digest_anchor = newest_anchor;
+        different_digest_anchor.prefix_digest[0] ^= 1;
+        let mut later_physical_anchor = first_anchor;
+        later_physical_anchor.durable_end = newest_anchor.durable_end + FRAME_LEN_U64;
+        let mut later_timestamp_anchor = first_anchor;
+        later_timestamp_anchor.last_commit_ts = newest_anchor.last_commit_ts + 1;
+        let anchor_sets = [
+            vec![first_anchor],
+            vec![newest_anchor, first_anchor],
+            vec![first_anchor, first_anchor, newest_anchor, newest_anchor],
+            vec![first_anchor, trailing_control_anchor],
+            vec![trailing_control_anchor, first_anchor, newest_anchor],
+            vec![newest_anchor, different_digest_anchor],
+            vec![newest_anchor, later_physical_anchor],
+            vec![newest_anchor, later_timestamp_anchor],
+        ];
+        assert!(WalV7ActiveAnchorRequirements::new(&[]).is_err());
+
+        for anchors in &anchor_sets {
+            let requirements = WalV7ActiveAnchorRequirements::new(anchors)?;
+            for ticket_end in 0..=3 {
+                candidate.frontier.ticket_end = ticket_end;
+                for durable_end in [
+                    HEADER_LEN_U64,
+                    first_anchor.durable_end,
+                    trailing_control_anchor.durable_end,
+                    newest_anchor.durable_end,
+                    newest_anchor.durable_end + FRAME_LEN_U64,
+                ] {
+                    candidate.frontier.durable_end = durable_end;
+                    for last_commit_ts in [0, 9, 10, 19, 20, 21] {
+                        candidate.frontier.last_commit_ts = last_commit_ts;
+                        for prefix_digest in [
+                            first_anchor.prefix_digest,
+                            newest_anchor.prefix_digest,
+                            different_digest_anchor.prefix_digest,
+                        ] {
+                            candidate.frontier.prefix_digest = prefix_digest;
+                            assert_eq!(
+                                requirements.covers(&candidate),
+                                anchors
+                                    .iter()
+                                    .all(|anchor| candidate_covers_anchor(&candidate, anchor)),
+                                "coverage differs for {anchors:?} and {candidate:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn active_recovery_keeps_same_ticket_physical_end_requirements() -> Result<()> {
+        let (mut image, first_anchor, newest_anchor) = two_batch_image()?;
+        let mut trailing_control_anchor = first_anchor;
+        trailing_control_anchor.durable_end += FRAME_LEN_U64;
+        let anchors = vec![trailing_control_anchor, first_anchor];
+        let discovery = discover_image(&image)?;
+        let mut reader = Cursor::new(image.as_slice());
+
+        let selection = select_recovery_candidate(
+            &mut reader,
+            u64::try_from(image.len())?,
+            &discovery,
+            WalV7RecoveryAuthority::Active {
+                predecessor: test_header().predecessor,
+                durable_anchors: anchors.clone(),
+            },
+        )?;
+        assert_eq!(selection.active_boundary, newest_anchor);
+
+        image.truncate(usize::try_from(trailing_control_anchor.durable_end)?);
+        let discovery = discover_image(&image)?;
+        let mut reader = Cursor::new(image.as_slice());
+        let verification = verify_frontier_candidate_prefixes_with_anchors(
+            &mut reader,
+            u64::try_from(image.len())?,
+            &discovery.candidates,
+            &anchors,
+            Some(test_header().predecessor),
+        )?;
+        assert_eq!(verification.verified_candidates.len(), 2);
+        let error = select_recovery_candidate(
+            &mut reader,
+            u64::try_from(image.len())?,
+            &discovery,
+            WalV7RecoveryAuthority::Active {
+                predecessor: test_header().predecessor,
+                durable_anchors: anchors,
+            },
+        )
+        .expect_err("an equal-ticket candidate cannot satisfy different physical anchor ends");
+        assert!(error.to_string().contains("satisfies all durable anchors"));
+        Ok(())
+    }
+
+    #[test]
+    fn active_recovery_falls_back_only_above_the_exact_durable_anchor() -> Result<()> {
+        let (mut image, first_anchor, newest_anchor) = two_batch_image()?;
+        let second_data_start = first_anchor.durable_end + FRAME_LEN_U64;
+        image[usize::try_from(second_data_start)?..usize::try_from(second_data_start + 64)?]
+            .fill(0);
+        let discovery = discover_image(&image)?;
+        let mut reader = Cursor::new(image.as_slice());
+
+        let selection = select_recovery_candidate(
+            &mut reader,
+            u64::try_from(image.len())?,
+            &discovery,
+            WalV7RecoveryAuthority::Active {
+                predecessor: test_header().predecessor,
+                durable_anchors: vec![first_anchor],
+            },
+        )?;
+
+        assert_eq!(selection.active_boundary, first_anchor);
+        assert!(selection.diagnostics.fallback_reason.is_some());
+        assert!(selection.diagnostics.rejected_frontier_count > 0);
+        assert_eq!(
+            selection.diagnostics.discarded_physical_tail,
+            Some((first_anchor.durable_end, u64::try_from(image.len())?))
+        );
+
+        let mut reader = Cursor::new(image.as_slice());
+        let error = select_recovery_candidate(
+            &mut reader,
+            u64::try_from(image.len())?,
+            &discovery,
+            WalV7RecoveryAuthority::Active {
+                predecessor: test_header().predecessor,
+                durable_anchors: vec![newest_anchor],
+            },
+        )
+        .expect_err("Active recovery cannot fall below a broken durable anchor");
+        assert!(error.to_string().contains("durable anchor"));
+        Ok(())
+    }
+
+    #[test]
+    fn active_recovery_rejects_an_anchor_for_another_segment() -> Result<()> {
+        let (image, mut anchor, _) = two_batch_image()?;
+        anchor.incarnation = [0x55; 16];
+        let discovery = discover_image(&image)?;
+        let mut reader = Cursor::new(image.as_slice());
+
+        let error = select_recovery_candidate(
+            &mut reader,
+            u64::try_from(image.len())?,
+            &discovery,
+            WalV7RecoveryAuthority::Active {
+                predecessor: test_header().predecessor,
+                durable_anchors: vec![anchor],
+            },
+        )
+        .expect_err("a durable anchor cannot authorize a different WAL incarnation");
+
+        assert!(error.to_string().contains("different WAL segment"));
+        Ok(())
+    }
+
+    #[test]
+    fn active_recovery_rejects_conflicting_anchor_and_predecessor_identity() -> Result<()> {
+        let (image, anchor, newest_anchor) = two_batch_image()?;
+        let discovery = discover_image(&image)?;
+        let mut conflicting_anchor = anchor;
+        conflicting_anchor.prefix_digest[0] ^= 0x01;
+        let mut reader = Cursor::new(image.as_slice());
+
+        let error = select_recovery_candidate(
+            &mut reader,
+            u64::try_from(image.len())?,
+            &discovery,
+            WalV7RecoveryAuthority::Active {
+                predecessor: test_header().predecessor,
+                durable_anchors: vec![newest_anchor, conflicting_anchor],
+            },
+        )
+        .expect_err("Active recovery must validate the exact anchored logical prefix");
+        assert!(error.to_string().contains("logical prefix digest mismatch"));
+
+        let mut reader = Cursor::new(image.as_slice());
+        let error = select_recovery_candidate(
+            &mut reader,
+            u64::try_from(image.len())?,
+            &discovery,
+            WalV7RecoveryAuthority::Active {
+                predecessor: ChainAnchor::Genesis {
+                    archive_epoch_id: ArchiveEpochId([0x77; 16]),
+                },
+                durable_anchors: vec![anchor],
+            },
+        )
+        .expect_err("the durable source authority must bind the header predecessor");
+        assert!(error.to_string().contains("authoritative segment identity"));
+        Ok(())
+    }
+
+    #[test]
+    fn immutable_recovery_requires_the_exact_terminal_image() -> Result<()> {
+        let (image, _, active) = two_batch_image()?;
+        let discovery = discover_image(&image)?;
+        let terminal_offset = u64::try_from(image.len())? - FRAME_LEN_U64;
+        let terminal = discovery
+            .candidates
+            .iter()
+            .find(|candidate| candidate.frame_offset == terminal_offset)
+            .context("test image has no terminal candidate")?;
+        let boundary = ImmutableBoundary {
+            active,
+            sealed_end: u64::try_from(image.len())?,
+            terminal_frontier_digest: terminal.frame_digest,
+            wal_digest: Sha256::digest(&image).into(),
+        };
+        let mut reader = Cursor::new(image.as_slice());
+
+        let selection = select_recovery_candidate(
+            &mut reader,
+            u64::try_from(image.len())?,
+            &discovery,
+            WalV7RecoveryAuthority::Sealed {
+                predecessor: test_header().predecessor,
+                boundary,
+            },
+        )?;
+        assert_eq!(selection.active_boundary, active);
+        assert_eq!(selection.candidate.frame_offset, terminal_offset);
+        assert_eq!(selection.diagnostics.discarded_physical_tail, None);
+
+        let mut wrong_digest_boundary = boundary;
+        wrong_digest_boundary.wal_digest[0] ^= 0x01;
+        let mut reader = Cursor::new(image.as_slice());
+        let error = select_recovery_candidate(
+            &mut reader,
+            u64::try_from(image.len())?,
+            &discovery,
+            WalV7RecoveryAuthority::Sealing {
+                predecessor: test_header().predecessor,
+                boundary: wrong_digest_boundary,
+            },
+        )
+        .expect_err("Sealing recovery must reject an immutable-image digest mismatch");
+        assert!(error.to_string().contains("image digest mismatch"));
+
+        let mut damaged_terminal_image = image.clone();
+        damaged_terminal_image[usize::try_from(terminal_offset + 64)?] ^= 0x01;
+        let damaged_discovery = discover_image(&damaged_terminal_image)?;
+        let mut reader = Cursor::new(damaged_terminal_image.as_slice());
+        let error = select_recovery_candidate(
+            &mut reader,
+            u64::try_from(damaged_terminal_image.len())?,
+            &damaged_discovery,
+            WalV7RecoveryAuthority::Sealed {
+                predecessor: test_header().predecessor,
+                boundary,
+            },
+        )
+        .expect_err("immutable recovery must not fall back past a damaged terminal marker");
+        assert!(error.to_string().contains("terminal FRONTIER"));
+
+        let mut extended_image = image.clone();
+        extended_image.resize(extended_image.len() + WAL_V7_FRAME_LEN, 0);
+        let mut reader = Cursor::new(extended_image.as_slice());
+        let error = select_recovery_candidate(
+            &mut reader,
+            u64::try_from(extended_image.len())?,
+            &discovery,
+            WalV7RecoveryAuthority::Sealed {
+                predecessor: test_header().predecessor,
+                boundary,
+            },
+        )
+        .expect_err("Sealed recovery must reject bytes outside its fixed image");
+        assert!(error.to_string().contains("length differs"));
+        Ok(())
+    }
+
+    #[test]
+    fn immutable_recovery_accepts_the_generation_zero_empty_image() -> Result<()> {
+        let TestWalImage {
+            image,
+            header_digest,
+            frontier_zero,
+            frontier_zero_digest,
+        } = test_image()?;
+        let active = boundary_for(frontier_zero, test_header());
+        let boundary = ImmutableBoundary {
+            active,
+            sealed_end: u64::try_from(image.len())?,
+            terminal_frontier_digest: frontier_zero_digest,
+            wal_digest: Sha256::digest(&image).into(),
+        };
+        let discovery = discover_image(&image)?;
+        let mut reader = Cursor::new(image.as_slice());
+
+        let selection = select_recovery_candidate(
+            &mut reader,
+            u64::try_from(image.len())?,
+            &discovery,
+            WalV7RecoveryAuthority::Sealed {
+                predecessor: test_header().predecessor,
+                boundary,
+            },
+        )?;
+
+        assert_eq!(selection.active_boundary, active);
+        assert_eq!(selection.candidate.frontier.prefix_digest, header_digest);
+        assert_eq!(selection.candidate.frame_offset, HEADER_LEN_U64);
+        Ok(())
     }
 
     #[test]

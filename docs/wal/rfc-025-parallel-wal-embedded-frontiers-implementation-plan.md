@@ -3,9 +3,9 @@
 **RFC:** [Parallel WAL with Embedded Frontiers and One Sync](../../rfcs/025-parallel-wal-embedded-frontiers.md)
 
 **Status:** In progress — Stage 2 codec and persistence-model implementation is
-complete. Stage 3 now includes bounded backward FRONTIER discovery and
-single-pass candidate-prefix verification. Authority/anchor selection and
-fresh-inode installation remain. The production writer remains v6.
+complete. Stage 3 now includes bounded backward FRONTIER discovery, single-pass
+candidate-prefix verification, and authority/anchor selection. Fresh-inode
+installation remains. The production writer remains v6.
 
 **Last updated:** 2026-10-09
 
@@ -75,9 +75,9 @@ durable anchors or the strict immutable-object rules.
 
 ## Stage dependencies
 
-Stage 2 codec and persistence-model implementation is complete; stages 3–8
-remain planned. Each stage adds its own regression coverage, and stage 8
-assembles the complete qualification evidence.
+Stage 2 codec and persistence-model implementation is complete. Stage 3 is in
+progress; stages 4–8 remain planned. Each stage adds its own regression
+coverage, and stage 8 assembles the complete qualification evidence.
 
 | Stage | Depends on | Reviewable result | Production writer |
 | --- | --- | --- | --- |
@@ -175,8 +175,9 @@ a protocol oracle, not the released v7 writer.
 The first Stage 3 slice adds bounded backward discovery of structurally valid
 FRONTIER candidates. The second slice verifies all discovered candidates in one
 bounded forward pass, including complete logical batches and every retained
-control frame. Authority/anchor selection and fresh-inode installation remain
-separate follow-up slices.
+control frame. The third slice selects an authoritative boundary against every
+durable Active anchor and applies strict Sealing/Sealed image checks. Fresh-inode
+installation remains a separate follow-up slice.
 
 - Add proposed `wal/v7/recovery.rs`, receiving authoritative Active/Sealing/
   Sealed context and all durable anchors. A discovered seal sidecar cannot
@@ -198,8 +199,14 @@ separate follow-up slices.
 - Select by physical marker offset after full verification. Active fallback
   may discard an invalid candidate only above verified durable floors. Verify
   every exact anchored prefix even if the selected candidate has a greater
-  ticket. Reject read errors, damaged header/generation zero, wrong incarnation,
-  conflicting anchors, and immutable-image disagreement.
+  ticket. Aggregate anchor coverage requirements once, then check each candidate
+  in constant time; same-ticket anchors with different physical ends still
+  require a higher-ticket candidate. Reject read errors, a damaged header, or
+  a missing, damaged, or noncanonical generation-zero marker; reject wrong
+  incarnation, conflicting anchors, and immutable-image disagreement.
+- For Sealing/Sealed, require the exact terminal marker, logical boundary,
+  sealed length, and whole-image digest. Never fall back to an older marker or
+  normalize an immutable image.
 - Return bounded diagnostics for the selected boundary, rejected candidates,
   discarded ranges, and fallback reasons. Keep diagnostics separate from the
   authoritative recovered state and from raw payload bytes.
