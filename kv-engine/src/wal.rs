@@ -774,7 +774,7 @@ impl Wal {
                     let (ring, direct_file, alloc_offset) = Self::try_init_io_uring(path)?;
                     (Some(ring), direct_file, alloc_offset, None)
                 };
-            let pitr_seal = if descriptor.is_pitr() {
+            let pitr_seal = if descriptor.is_v5_family() {
                 let wal = std::fs::read(path)?;
                 let header = crate::pitr::decode_v5_file_header(&wal)?;
                 Some(Mutex::new(PitrSealAccumulator::from_wal(header, &wal)?))
@@ -1184,8 +1184,8 @@ impl Wal {
     ) -> Result<Self> {
         let descriptor = WalFormatDescriptor::writer(header.wal_format_version)?;
         anyhow::ensure!(
-            descriptor.is_pitr(),
-            "WAL format {} is not a PITR format",
+            descriptor.is_v5_family(),
+            "WAL format {} is not a v5-family PITR format",
             header.wal_format_version
         );
         anyhow::ensure!(
@@ -1552,9 +1552,13 @@ impl Wal {
         handler: &mut H,
     ) -> Result<(File, u64)> {
         let descriptor = WalFormatDescriptor::reader(wal_version)?;
-        if descriptor.is_pitr() {
+        if descriptor.is_v5_family() {
             return Self::recover_v5(f, data, file_len, handler);
         }
+        anyhow::ensure!(
+            !matches!(descriptor.framing, WalFraming::EmbeddedFrontier),
+            "WAL v7 recovery is not implemented"
+        );
         let data_len = data.len();
         let mut max_ts: u64 = 0;
         let is_v4 = descriptor.is_v4();
@@ -2068,7 +2072,7 @@ impl Wal {
                 // a real v2/v3 WAL without trusting the version field, and the two
                 // share their magic, so the version field is not enough to decide.
                 if data.len() >= crate::pitr::WAL_V5_HEADER_LEN {
-                    if descriptor.is_pitr() {
+                    if descriptor.is_v5_family() {
                         crate::pitr::decode_v5_file_header(&data[..crate::pitr::WAL_V5_HEADER_LEN])
                             .context("WAL claims the v5 format but its header does not validate")?;
                     } else if descriptor.is_v4()
@@ -2118,13 +2122,13 @@ impl Wal {
             // Extend the file to scan_start so O_DIRECT writes start at an
             // aligned offset (otherwise pwrite at unaligned EOF fails EINVAL).
             if data.len() < scan_start {
-                anyhow::ensure!(!descriptor.is_pitr(), "truncated v5 WAL header");
+                anyhow::ensure!(!descriptor.is_pitr(), "truncated PITR WAL header");
                 data.advance(data.len());
                 f.set_len(scan_start as u64)?;
                 f.sync_all()?;
                 (f, 0u64)
             } else {
-                if descriptor.is_pitr() {
+                if descriptor.is_v5_family() {
                     crate::pitr::decode_v5_file_header(&data[..crate::pitr::WAL_V5_HEADER_LEN])?;
                 }
                 data.advance(scan_start);
@@ -2188,13 +2192,13 @@ impl Wal {
             let descriptor = WalFormatDescriptor::reader(wal_version)?;
             let scan_start = descriptor.data_start;
             if data.len() < scan_start {
-                anyhow::ensure!(!descriptor.is_pitr(), "truncated v5 WAL header");
+                anyhow::ensure!(!descriptor.is_pitr(), "truncated PITR WAL header");
                 data.advance(data.len());
                 f.set_len(scan_start as u64)?;
                 f.sync_all()?;
                 (f, 0u64)
             } else {
-                if descriptor.is_pitr() {
+                if descriptor.is_v5_family() {
                     crate::pitr::decode_v5_file_header(&data[..crate::pitr::WAL_V5_HEADER_LEN])?;
                 }
                 data.advance(scan_start);
