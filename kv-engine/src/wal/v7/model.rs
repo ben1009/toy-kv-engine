@@ -10,12 +10,16 @@ use std::collections::{BTreeMap, BTreeSet};
 use anyhow::{Result, ensure};
 use sha2::{Digest, Sha256};
 
+use super::admission::{
+    WalV7Reservation, WalV7ReservationError, WalV7ResourceCharge, WalV7ResourceLedger,
+    WalV7ResourceLimits,
+};
 use super::codec::{
     WAL_V7_DATA_FRAGMENT_PAYLOAD_CAPACITY, WAL_V7_FRAME_HEADER_LEN, WAL_V7_FRAME_LEN,
     WAL_V7_HEADER_LEN, WAL_V7_LOGICAL_BATCH_HEADER_LEN, WalV7DataFragmentHeader, WalV7FrameKind,
-    WalV7Frontier, WalV7Header, WalV7LogicalBatchHeader, decode_frame_structural,
-    decode_frontier_successor, encode_data_frame, encode_frontier_successor,
-    encode_generation_zero_frontier, frame_record_digest,
+    WalV7Frontier, WalV7Header, WalV7LogicalBatchHeader, data_fragment_count,
+    decode_frame_structural, decode_frontier_successor, encode_data_frame,
+    encode_frontier_successor, encode_generation_zero_frontier, frame_record_digest,
 };
 use super::install::WalV7InstalledRecovery;
 use crate::pitr::{
@@ -26,6 +30,16 @@ use crate::pitr::{
 const ACTIVE_WAL_PATH: &str = "active.wal";
 const TEMP_WAL_PATH: &str = "active.wal.tmp";
 const FIRST_DATA_OFFSET: u64 = (WAL_V7_HEADER_LEN + WAL_V7_FRAME_LEN) as u64;
+
+fn model_resource_limits() -> WalV7ResourceLimits {
+    WalV7ResourceLimits {
+        max_logical_wal_bytes: u64::MAX,
+        max_source_spool_bytes: u64::MAX,
+        max_recovery_workspace_bytes: 0,
+        max_buffer_memory_bytes: u64::MAX,
+        max_seal_index_bytes: u64::MAX,
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ActiveAnchor {
@@ -305,6 +319,9 @@ struct SerialWriter {
     last_commit_ts: u64,
     last_recorded_at: Option<RecordedAt>,
     phase: CommitPhase,
+    resource_ledger: WalV7ResourceLedger,
+    pending_reservation: Option<WalV7Reservation>,
+    retained_reservations: Vec<WalV7Reservation>,
 }
 
 #[derive(Debug)]
@@ -331,6 +348,11 @@ impl SerialHarness {
     }
 
     fn create() -> Result<Self> {
+        Self::create_with_resource_limits(model_resource_limits())
+    }
+
+    fn create_with_resource_limits(limits: WalV7ResourceLimits) -> Result<Self> {
+        let resource_ledger = WalV7ResourceLedger::new(limits)?;
         let header = model_header();
         let header_bytes = header.encode()?;
         let header_digest = header.digest()?;
@@ -385,6 +407,9 @@ impl SerialHarness {
                 last_commit_ts: 0,
                 last_recorded_at: None,
                 phase: CommitPhase::Idle,
+                resource_ledger,
+                pending_reservation: None,
+                retained_reservations: Vec::new(),
             },
             history: WriteHistory::default(),
         })
@@ -394,6 +419,7 @@ impl SerialHarness {
         image: &[u8],
         installed: WalV7InstalledRecovery,
         acknowledged_tickets: Vec<u64>,
+        limits: WalV7ResourceLimits,
     ) -> Result<Self> {
         ensure!(
             u64::try_from(image.len())? == installed.image_len,
@@ -430,6 +456,30 @@ impl SerialHarness {
             installed.image_digest() == image_digest,
             "installed v7 physical hash does not match its image"
         );
+
+        let resource_ledger = WalV7ResourceLedger::new(limits)?;
+        // Startup headroom owns the immutable header and generation-zero
+        // frame. Recovered usage owns only the retained DATA/control extent,
+        // without recreating unused per-batch marker or buffer reservations.
+        let wal_bytes = installed
+            .image_len
+            .checked_sub(FIRST_DATA_OFFSET)
+            .ok_or_else(|| {
+                anyhow::anyhow!("installed model image is missing its initial frames")
+            })?;
+        let seal_index_bytes = u64::try_from(installed.seal_index.len())?
+            .checked_mul(std::mem::size_of::<u64>() as u64)
+            .ok_or_else(|| anyhow::anyhow!("installed model seal index size overflows"))?;
+        let recovered_charge = WalV7ResourceCharge {
+            logical_wal_bytes: wal_bytes,
+            source_spool_bytes: wal_bytes,
+            seal_index_bytes,
+            ..WalV7ResourceCharge::default()
+        };
+        let mut retained_reservations = Vec::new();
+        if recovered_charge != WalV7ResourceCharge::default() {
+            retained_reservations.push(resource_ledger.reserve(recovered_charge)?);
+        }
 
         let mut disk = PersistenceModel::default();
         let inode = disk.create_file(ACTIVE_WAL_PATH)?;
@@ -469,6 +519,9 @@ impl SerialHarness {
                 last_commit_ts,
                 last_recorded_at: installed.last_recorded_at,
                 phase: CommitPhase::Idle,
+                resource_ledger,
+                pending_reservation: None,
+                retained_reservations,
             },
             history: WriteHistory {
                 published_tickets,
@@ -512,8 +565,24 @@ impl SerialHarness {
         let mut recorded_at_watermark = self.writer.last_recorded_at;
         validate_recorded_time_order(&mut recorded_at_watermark, recorded_at)?;
 
-        let ticket = self.writer.next_ticket;
         let entry_stream = encode_model_entry_stream(data, commit_ts)?;
+        let batch_bytes_len = WAL_V7_LOGICAL_BATCH_HEADER_LEN
+            .checked_add(entry_stream.len())
+            .ok_or_else(|| anyhow::anyhow!("model logical batch length overflows"))?;
+        let batch_bytes_len_u64 = u64::try_from(batch_bytes_len)?;
+        let fragment_count = data_fragment_count(batch_bytes_len_u64).ok_or_else(|| {
+            anyhow::anyhow!("model logical batch length is outside v7 wire bounds")
+        })?;
+        let fragment_capacity = usize::try_from(fragment_count)?;
+        ensure!(
+            self.writer.pending_reservation.is_none(),
+            "v7 serial writer has a stale batch reservation"
+        );
+        let reservation = self
+            .writer
+            .resource_ledger
+            .reserve_batch(batch_bytes_len_u64)?;
+        let ticket = self.writer.next_ticket;
         let batch_header = WalV7LogicalBatchHeader {
             segment_ticket: ticket,
             commit_ts,
@@ -522,20 +591,12 @@ impl SerialHarness {
             entry_count: 1,
         }
         .encode(&entry_stream, LIVE_WAL_V5_LIMITS)?;
-        let batch_bytes_len = WAL_V7_LOGICAL_BATCH_HEADER_LEN
-            .checked_add(entry_stream.len())
-            .ok_or_else(|| anyhow::anyhow!("model logical batch length overflows"))?;
-        let batch_bytes_len_u64 = u64::try_from(batch_bytes_len)?;
+        self.writer.pending_reservation = Some(reservation);
         let mut logical_batch = Vec::with_capacity(batch_bytes_len);
         logical_batch.extend_from_slice(&batch_header);
         logical_batch.extend_from_slice(&entry_stream);
 
-        let fragment_count = batch_bytes_len
-            .checked_add(WAL_V7_DATA_FRAGMENT_PAYLOAD_CAPACITY - 1)
-            .ok_or_else(|| anyhow::anyhow!("model fragment count overflows"))?
-            / WAL_V7_DATA_FRAGMENT_PAYLOAD_CAPACITY;
-        let fragment_count = u32::try_from(fragment_count)?;
-        let mut data_offsets = Vec::with_capacity(fragment_count as usize);
+        let mut data_offsets = Vec::with_capacity(fragment_capacity);
         let mut next_physical_hash = self.writer.physical_hash.clone();
         // Any failure after writing starts leaves the runtime poisoned. Only
         // completing DATA and FRONTIER exposes a cycle awaiting sync.
@@ -681,6 +742,17 @@ impl SerialHarness {
             .data_offsets
             .first()
             .ok_or_else(|| anyhow::anyhow!("model published batch has no DATA frame"))?;
+        let reservation =
+            self.writer.pending_reservation.as_mut().ok_or_else(|| {
+                anyhow::anyhow!("model published batch is missing its reservation")
+            })?;
+        self.writer
+            .resource_ledger
+            .release_buffer_memory(reservation)?;
+        let reservation =
+            self.writer.pending_reservation.take().ok_or_else(|| {
+                anyhow::anyhow!("model published batch is missing its reservation")
+            })?;
         self.writer.logical_hash = pending.next_logical_hash;
         self.writer.physical_hash = pending.next_physical_hash;
         self.writer.seal_index.push(first_data_offset);
@@ -693,6 +765,7 @@ impl SerialHarness {
         self.writer.last_recorded_at = Some(pending.recorded_at);
         self.history.published_tickets.push(pending.ticket);
         self.history.acknowledged_tickets.push(pending.ticket);
+        self.writer.retained_reservations.push(reservation);
         self.writer.phase = CommitPhase::Idle;
         Ok(())
     }
@@ -978,20 +1051,29 @@ fn encode_model_entry_stream(value: &[u8], commit_ts: u64) -> Result<Vec<u8>> {
         }],
     };
     let encoded = crate::pitr::encode_v5_batch(&batch, LIVE_WAL_V5_LIMITS)?;
+    Ok(v5_entry_stream(&encoded)?.to_vec())
+}
+
+fn v5_entry_stream(encoded_batch: &[u8]) -> Result<&[u8]> {
+    const DATA_LEN_OFFSET: usize = 24;
+
+    let data_len_end = DATA_LEN_OFFSET + std::mem::size_of::<u32>();
+    ensure!(
+        encoded_batch.len() >= data_len_end,
+        "model v5 batch header is truncated"
+    );
     let data_len = usize::try_from(u32::from_be_bytes(
-        encoded[24..28]
-            .try_into()
-            .expect("v5 batch data length is four bytes"),
+        encoded_batch[DATA_LEN_OFFSET..data_len_end].try_into()?,
     ))?;
     let data_start = crate::pitr::WAL_V5_BATCH_HEADER_LEN;
     let data_end = data_start
         .checked_add(data_len)
         .ok_or_else(|| anyhow::anyhow!("model v5 entry stream range overflows"))?;
     ensure!(
-        data_end <= encoded.len(),
+        data_end <= encoded_batch.len(),
         "model v5 entry stream is truncated"
     );
-    Ok(encoded[data_start..data_end].to_vec())
+    Ok(&encoded_batch[data_start..data_end])
 }
 
 /// Use the shared RFC 023 entry-stream decoder after the v7 logical header has
@@ -1405,6 +1487,52 @@ mod tests {
         Ok((image, active_boundary(frontier)))
     }
 
+    fn coalesced_group_image() -> Result<(Vec<u8>, ActiveBoundary)> {
+        let header = model_header();
+        let header_bytes = header.encode()?;
+        let header_digest = header.digest()?;
+        let (generation_zero_frame, generation_zero, generation_zero_digest) =
+            generation_zero(header_digest)?;
+        let mut image = header_bytes.to_vec();
+        image.extend_from_slice(&generation_zero_frame);
+        let mut logical_hash = Sha256::new();
+        logical_hash.update(header_bytes);
+        for (ticket, value) in [b"first".as_slice(), b"second".as_slice()]
+            .into_iter()
+            .enumerate()
+        {
+            let ticket = u64::try_from(ticket)?;
+            let (frames, logical_batch) = fixture_data_frames(
+                header_digest,
+                u64::try_from(image.len())?,
+                ticket,
+                (ticket + 1) * 10,
+                value,
+            )?;
+            append_frames(&mut image, &frames);
+            logical_hash.update(logical_batch);
+        }
+        let frontier_offset = u64::try_from(image.len())?;
+        let frontier = WalV7Frontier {
+            generation: 1,
+            ticket_end: 2,
+            durable_end: frontier_offset,
+            last_commit_ts: 20,
+            prefix_digest: logical_hash.finalize().into(),
+            previous_frontier_offset: WAL_V7_HEADER_LEN as u64,
+            previous_frontier_digest: generation_zero_digest,
+        };
+        image.extend_from_slice(&encode_frontier_successor(
+            frontier,
+            generation_zero,
+            WAL_V7_HEADER_LEN as u64,
+            &generation_zero_digest,
+            frontier_offset,
+            header_digest,
+        )?);
+        Ok((image, active_boundary(frontier)))
+    }
+
     fn trailing_control_image() -> Result<(Vec<u8>, ActiveBoundary)> {
         let header = model_header();
         let header_bytes = header.encode()?;
@@ -1534,6 +1662,16 @@ mod tests {
         assert_eq!(second_install.batches, first_install.batches);
         assert_eq!(second_install.seal_index, first_install.seal_index);
         assert_eq!(second_install.image_digest(), first_install.image_digest());
+        let expected_wal_bytes =
+            u64::try_from(normalized_image.len() - WAL_V7_HEADER_LEN - WAL_V7_FRAME_LEN)?;
+        let expected_resource_charge = WalV7ResourceCharge {
+            logical_wal_bytes: expected_wal_bytes,
+            source_spool_bytes: expected_wal_bytes,
+            recovery_workspace_bytes: 0,
+            buffer_memory_bytes: 0,
+            seal_index_bytes: u64::try_from(first_install.seal_index.len())?
+                * std::mem::size_of::<u64>() as u64,
+        };
         let next_ticket = second_install.next_ticket;
         let next_offset = second_install.append_offset;
         let last_commit_ts = second_install.active_boundary.last_commit_ts;
@@ -1541,9 +1679,17 @@ mod tests {
             &normalized_image,
             second_install,
             prior_acknowledged_tickets.to_vec(),
+            WalV7ResourceLimits {
+                max_buffer_memory_bytes: WAL_V7_FRAME_LEN as u64,
+                ..model_resource_limits()
+            },
         )?;
         assert_eq!(harness.writer.next_ticket, next_ticket);
         assert_eq!(harness.writer.next_data_offset, next_offset);
+        assert_eq!(
+            harness.writer.resource_ledger.snapshot(),
+            expected_resource_charge
+        );
         assert_eq!(
             harness.writer.seal_index.len(),
             usize::try_from(next_ticket)?
@@ -1943,6 +2089,98 @@ mod tests {
     }
 
     #[test]
+    fn serial_admission_rejection_preserves_ticket_offset_and_wal_bytes() -> Result<()> {
+        let mut harness = SerialHarness::create_with_resource_limits(WalV7ResourceLimits {
+            max_logical_wal_bytes: u64::MAX,
+            max_source_spool_bytes: 8192,
+            max_recovery_workspace_bytes: 0,
+            max_buffer_memory_bytes: 4096,
+            max_seal_index_bytes: 16,
+        })?;
+        harness.commit(b"first", 10)?;
+
+        let expected_charge = WalV7ResourceCharge {
+            logical_wal_bytes: 8192,
+            source_spool_bytes: 8192,
+            recovery_workspace_bytes: 0,
+            buffer_memory_bytes: 0,
+            seal_index_bytes: 8,
+        };
+        assert_eq!(harness.writer.resource_ledger.snapshot(), expected_charge);
+
+        let ticket_before = harness.writer.next_ticket;
+        let offset_before = harness.writer.next_data_offset;
+        let wal_before = harness
+            .disk
+            .path_bytes(ACTIVE_WAL_PATH, ImageView::Cached)
+            .expect("serial Active WAL exists")
+            .to_vec();
+        let history_before = (
+            harness.history.published_tickets.clone(),
+            harness.history.acknowledged_tickets.clone(),
+        );
+
+        let error = harness
+            .begin_commit(b"again", 20)
+            .expect_err("the second batch exceeds the source-spool limit");
+        assert_eq!(
+            error.downcast_ref::<WalV7ReservationError>(),
+            Some(&WalV7ReservationError::SourceSpoolLimit)
+        );
+        assert_eq!(harness.writer.phase, CommitPhase::Idle);
+        assert_eq!(harness.writer.next_ticket, ticket_before);
+        assert_eq!(harness.writer.next_data_offset, offset_before);
+        assert_eq!(
+            harness
+                .disk
+                .path_bytes(ACTIVE_WAL_PATH, ImageView::Cached)
+                .expect("serial Active WAL exists after rejection"),
+            wal_before
+        );
+        assert_eq!(
+            (
+                harness.history.published_tickets.clone(),
+                harness.history.acknowledged_tickets.clone(),
+            ),
+            history_before
+        );
+        assert_eq!(harness.writer.resource_ledger.snapshot(), expected_charge);
+        Ok(())
+    }
+
+    #[test]
+    fn serial_commits_reuse_one_frame_buffer_capacity() -> Result<()> {
+        let mut harness = SerialHarness::create_with_resource_limits(WalV7ResourceLimits {
+            max_buffer_memory_bytes: WAL_V7_FRAME_LEN as u64,
+            ..model_resource_limits()
+        })?;
+        for ticket in 0..3 {
+            let pending = harness.begin_commit(b"one frame", (ticket + 1) * 10)?;
+            assert_eq!(
+                harness
+                    .writer
+                    .resource_ledger
+                    .snapshot()
+                    .buffer_memory_bytes,
+                WAL_V7_FRAME_LEN as u64
+            );
+            harness.finish_commit(pending)?;
+            assert_eq!(
+                harness.writer.resource_ledger.snapshot(),
+                WalV7ResourceCharge {
+                    logical_wal_bytes: (ticket + 1) * 2 * WAL_V7_FRAME_LEN as u64,
+                    source_spool_bytes: (ticket + 1) * 2 * WAL_V7_FRAME_LEN as u64,
+                    recovery_workspace_bytes: 0,
+                    buffer_memory_bytes: 0,
+                    seal_index_bytes: (ticket + 1) * std::mem::size_of::<u64>() as u64,
+                }
+            );
+            assert_eq!(harness.writer.next_ticket, ticket + 1);
+        }
+        Ok(())
+    }
+
+    #[test]
     fn data_and_frontier_share_one_sync_before_publication_and_ack() -> Result<()> {
         let mut harness = SerialHarness::create()?;
         let inode = harness.writer.inode;
@@ -2076,6 +2314,7 @@ mod tests {
             let mut harness = SerialHarness::create()?;
             harness.commit(b"acknowledged", 10)?;
             let pending = harness.begin_commit(b"uncertain", 20)?;
+            let charged_after_admission = harness.writer.resource_ledger.snapshot();
             harness.interrupt_sync(&[])?;
             let syncs_before = harness.disk.file(harness.writer.inode)?.sync_attempts;
 
@@ -2092,6 +2331,10 @@ mod tests {
             );
             assert_eq!(harness.history.published_tickets, [0]);
             assert_eq!(harness.history.acknowledged_tickets, [0]);
+            assert_eq!(
+                harness.writer.resource_ledger.snapshot(),
+                charged_after_admission
+            );
             assert!(harness.begin_commit(b"must not append", 30).is_err());
             let stable = harness
                 .disk
@@ -2346,6 +2589,108 @@ mod tests {
     fn empty_recovery_normalizes_twice_then_appends_and_reopens() -> Result<()> {
         let (image, anchor) = empty_image_with_torn_tail()?;
         normalize_twice_continue_and_reopen(image, anchor, &[], &[])
+    }
+
+    #[test]
+    fn recovery_of_fragmented_batches_needs_no_outstanding_data_buffers() -> Result<()> {
+        let mut harness = SerialHarness::create()?;
+        let value = vec![b'x'; WAL_V7_DATA_FRAGMENT_PAYLOAD_CAPACITY + 1];
+        harness.commit(&value, 10)?;
+        harness.commit(b"small", 20)?;
+        let image = harness
+            .disk
+            .path_bytes(ACTIVE_WAL_PATH, ImageView::Stable)
+            .expect("acknowledged Active WAL exists")
+            .to_vec();
+        let anchor = manifest_boundary(
+            harness
+                .disk
+                .stable_active_anchor()
+                .expect("creation persisted the Active anchor"),
+        );
+        // The recovery helper reopens with only one frame of buffer capacity,
+        // which must not be consumed by the larger persisted batch.
+        normalize_twice_continue_and_reopen(image, anchor, &[&value, b"small"], &[0, 1])
+    }
+
+    #[test]
+    fn recovery_charges_actual_coalesced_frames_at_capacity() -> Result<()> {
+        let (image, anchor) = coalesced_group_image()?;
+        let recovered_wal_bytes = 3 * WAL_V7_FRAME_LEN as u64;
+        let after_append_wal_bytes = recovered_wal_bytes + 2 * WAL_V7_FRAME_LEN as u64;
+        for (wal_limit, spool_limit, expected_error) in [
+            (
+                recovered_wal_bytes,
+                u64::MAX,
+                Some(WalV7ReservationError::LogicalWalLimit),
+            ),
+            (
+                u64::MAX,
+                recovered_wal_bytes,
+                Some(WalV7ReservationError::SourceSpoolLimit),
+            ),
+            (after_append_wal_bytes, after_append_wal_bytes, None),
+        ] {
+            let directory = TestDirectory::new()?;
+            let path = directory.0.join("active.wal");
+            fs::write(&path, &image)?;
+            let selection = active_selection(&path, anchor)?;
+            let installed = install_active_recovery(&path, &selection)?;
+            let normalized_image = fs::read(&path)?;
+            // Two DATA frames share one nonzero FRONTIER. The immutable
+            // header and generation-zero frame belong to startup headroom.
+            assert_eq!(normalized_image.len(), 5 * WAL_V7_FRAME_LEN);
+            let mut harness = SerialHarness::from_installed_recovery(
+                &normalized_image,
+                installed,
+                vec![0, 1],
+                WalV7ResourceLimits {
+                    max_logical_wal_bytes: wal_limit,
+                    max_source_spool_bytes: spool_limit,
+                    max_buffer_memory_bytes: WAL_V7_FRAME_LEN as u64,
+                    ..model_resource_limits()
+                },
+            )?;
+            let recovered_charge = WalV7ResourceCharge {
+                logical_wal_bytes: recovered_wal_bytes,
+                source_spool_bytes: recovered_wal_bytes,
+                seal_index_bytes: 2 * std::mem::size_of::<u64>() as u64,
+                ..WalV7ResourceCharge::default()
+            };
+            assert_eq!(harness.writer.resource_ledger.snapshot(), recovered_charge);
+            assert_eq!(harness.writer.next_ticket, 2);
+            assert_eq!(harness.writer.next_data_offset, 5 * WAL_V7_FRAME_LEN as u64);
+
+            if let Some(expected_error) = expected_error {
+                let error = harness
+                    .begin_commit(b"after recovery", 30)
+                    .expect_err("the recovered prefix fills the configured cap");
+                assert_eq!(
+                    error.downcast_ref::<WalV7ReservationError>(),
+                    Some(&expected_error)
+                );
+                assert_eq!(harness.writer.resource_ledger.snapshot(), recovered_charge);
+                assert_eq!(harness.writer.next_ticket, 2);
+                assert_eq!(harness.writer.next_data_offset, 5 * WAL_V7_FRAME_LEN as u64);
+                assert_eq!(
+                    harness.disk.path_bytes(ACTIVE_WAL_PATH, ImageView::Cached),
+                    Some(normalized_image.as_slice())
+                );
+            } else {
+                harness.commit(b"after recovery", 30)?;
+                assert_eq!(
+                    harness.writer.resource_ledger.snapshot(),
+                    WalV7ResourceCharge {
+                        logical_wal_bytes: after_append_wal_bytes,
+                        source_spool_bytes: after_append_wal_bytes,
+                        seal_index_bytes: 3 * std::mem::size_of::<u64>() as u64,
+                        ..WalV7ResourceCharge::default()
+                    }
+                );
+                assert_eq!(harness.history.acknowledged_tickets, [0, 1, 2]);
+            }
+        }
+        normalize_twice_continue_and_reopen(image, anchor, &[b"first", b"second"], &[0, 1])
     }
 
     #[test]

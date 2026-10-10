@@ -7,7 +7,8 @@
 //! reservation for admitted DATA. Recovery workspace is tracked separately
 //! and also counts against the total source-spool limit. Dropping a live token
 //! releases its charges; callers can also explicitly release it after retiring
-//! the reserved work.
+//! the reserved work. Buffer memory can retire separately after terminal I/O
+//! and hash consumption, while the token continues to own persistent resources.
 
 use std::{collections::BTreeMap, error::Error, fmt, sync::Arc};
 
@@ -26,6 +27,34 @@ pub(crate) struct WalV7ResourceCharge {
 }
 
 impl WalV7ResourceCharge {
+    /// Calculate the resources for one logical batch, including all DATA
+    /// frames, one worst-case FRONTIER, DATA buffer memory, and a seal-index
+    /// entry. `encoded_batch_bytes` includes the logical header and entry stream.
+    ///
+    /// # Errors
+    /// Returns an error for lengths outside the wire envelope or arithmetic
+    /// overflow. This calculation does not reserve resources or WAL coordinates.
+    pub(crate) fn for_batch(encoded_batch_bytes: u64) -> Result<Self, WalV7ReservationError> {
+        let fragment_count = u64::from(
+            data_fragment_count(encoded_batch_bytes)
+                .ok_or(WalV7ReservationError::InvalidBatchLength)?,
+        );
+        let data_frame_bytes = fragment_count
+            .checked_mul(WAL_V7_FRAME_LEN as u64)
+            .ok_or(WalV7ReservationError::ArithmeticOverflow)?;
+        let logical_wal_bytes = data_frame_bytes
+            .checked_add(WAL_V7_FRAME_LEN as u64)
+            .ok_or(WalV7ReservationError::ArithmeticOverflow)?;
+
+        Ok(Self {
+            logical_wal_bytes,
+            source_spool_bytes: logical_wal_bytes,
+            recovery_workspace_bytes: 0,
+            buffer_memory_bytes: data_frame_bytes,
+            seal_index_bytes: std::mem::size_of::<u64>() as u64,
+        })
+    }
+
     fn is_empty(self) -> bool {
         self == Self::default()
     }
@@ -250,25 +279,56 @@ impl WalV7ResourceLedger {
         &self,
         encoded_batch_bytes: u64,
     ) -> Result<WalV7Reservation, WalV7ReservationError> {
-        let fragment_count = u64::from(
-            data_fragment_count(encoded_batch_bytes)
-                .ok_or(WalV7ReservationError::InvalidBatchLength)?,
-        );
-        let data_frame_bytes = fragment_count
-            .checked_mul(WAL_V7_FRAME_LEN as u64)
-            .ok_or(WalV7ReservationError::ArithmeticOverflow)?;
-        let frontier_bytes = WAL_V7_FRAME_LEN as u64;
-        let logical_wal_bytes = data_frame_bytes
-            .checked_add(frontier_bytes)
-            .ok_or(WalV7ReservationError::ArithmeticOverflow)?;
+        self.reserve(WalV7ResourceCharge::for_batch(encoded_batch_bytes)?)
+    }
 
-        self.reserve(WalV7ResourceCharge {
-            logical_wal_bytes,
-            source_spool_bytes: logical_wal_bytes,
-            recovery_workspace_bytes: 0,
-            buffer_memory_bytes: data_frame_bytes,
-            seal_index_bytes: std::mem::size_of::<u64>() as u64,
-        })
+    /// Atomically retire a reservation's buffer charge after its buffers are
+    /// safe to release. Persistent resource charges remain owned by the token.
+    /// Repeating this operation on a live token with no buffers is harmless.
+    ///
+    /// # Errors
+    /// Rejects foreign, retired, or mismatched tokens without changing charges.
+    pub(crate) fn release_buffer_memory(
+        &self,
+        reservation: &mut WalV7Reservation,
+    ) -> Result<(), WalV7ReservationError> {
+        if !Arc::ptr_eq(&reservation.ledger, &self.inner) {
+            return Err(WalV7ReservationError::ForeignReservation);
+        }
+        let mut state = self.inner.state.lock();
+        let issued_charge = state
+            .reservations
+            .get(&reservation.id)
+            .copied()
+            .ok_or(WalV7ReservationError::UnknownReservation)?;
+        if issued_charge != reservation.charge {
+            return Err(WalV7ReservationError::ReservationMismatch);
+        }
+        if issued_charge.buffer_memory_bytes == 0 {
+            return Ok(());
+        }
+        let retired = WalV7ResourceCharge {
+            buffer_memory_bytes: issued_charge.buffer_memory_bytes,
+            ..WalV7ResourceCharge::default()
+        };
+        let retained = WalV7ResourceCharge {
+            buffer_memory_bytes: 0,
+            ..issued_charge
+        };
+        let next = state
+            .charged
+            .checked_sub(retired)
+            .ok_or(WalV7ReservationError::AccountingUnderflow)?;
+
+        if retained.is_empty() {
+            state.reservations.remove(&reservation.id);
+            reservation.active = false;
+        } else {
+            state.reservations.insert(reservation.id, retained);
+        }
+        state.charged = next;
+        reservation.charge = retained;
+        Ok(())
     }
 
     /// Release a reservation only after its owner has canceled or retired it.
@@ -384,6 +444,46 @@ mod tests {
             drop(reservation);
             assert_eq!(ledger.snapshot(), WalV7ResourceCharge::default());
         }
+    }
+
+    #[test]
+    fn buffer_memory_retirement_reuses_capacity_and_preserves_persistent_charges() {
+        let ledger = WalV7ResourceLedger::new(WalV7ResourceLimits {
+            max_buffer_memory_bytes: 4096,
+            ..batch_limits()
+        })
+        .unwrap();
+        let mut first = ledger.reserve_batch(49).unwrap();
+        assert_eq!(ledger.snapshot(), charge(8192, 8192, 0, 4096, 8));
+
+        ledger.release_buffer_memory(&mut first).unwrap();
+        assert_eq!(ledger.snapshot(), charge(8192, 8192, 0, 0, 8));
+        ledger.release_buffer_memory(&mut first).unwrap();
+        assert_eq!(ledger.snapshot(), charge(8192, 8192, 0, 0, 8));
+
+        let mut second = ledger.reserve_batch(49).unwrap();
+        assert_eq!(second.id, 2);
+        assert_eq!(ledger.snapshot(), charge(16384, 16384, 0, 4096, 16));
+        ledger.release_buffer_memory(&mut second).unwrap();
+        assert_eq!(ledger.snapshot(), charge(16384, 16384, 0, 0, 16));
+        drop(first);
+        assert_eq!(ledger.snapshot(), charge(8192, 8192, 0, 0, 8));
+        drop(second);
+        assert_eq!(ledger.snapshot(), WalV7ResourceCharge::default());
+    }
+
+    #[test]
+    fn buffer_only_reservation_retires_without_a_second_drop_charge() {
+        let ledger = WalV7ResourceLedger::new(limits()).unwrap();
+        let mut reservation = ledger.reserve(charge(0, 0, 0, 8, 0)).unwrap();
+        ledger.release_buffer_memory(&mut reservation).unwrap();
+        assert_eq!(ledger.snapshot(), WalV7ResourceCharge::default());
+        assert_eq!(
+            ledger.release_buffer_memory(&mut reservation),
+            Err(WalV7ReservationError::UnknownReservation)
+        );
+        drop(reservation);
+        assert_eq!(ledger.snapshot(), WalV7ResourceCharge::default());
     }
 
     #[test]
@@ -530,6 +630,11 @@ mod tests {
             active: true,
         };
         assert_eq!(
+            ledger.release_buffer_memory(&mut forged),
+            Err(WalV7ReservationError::ReservationMismatch)
+        );
+        assert_eq!(ledger.snapshot(), charge(10, 12, 0, 4, 4));
+        assert_eq!(
             ledger.release(&mut forged),
             Err(WalV7ReservationError::ReservationMismatch)
         );
@@ -541,6 +646,11 @@ mod tests {
             ledger: Arc::clone(&ledger.inner),
             active: true,
         };
+        assert_eq!(
+            ledger.release_buffer_memory(&mut reused),
+            Err(WalV7ReservationError::UnknownReservation)
+        );
+        assert_eq!(ledger.snapshot(), WalV7ResourceCharge::default());
         assert_eq!(
             ledger.release(&mut reused),
             Err(WalV7ReservationError::UnknownReservation)
@@ -576,6 +686,10 @@ mod tests {
         let mut first_reservation = first.reserve(charge(10, 12, 4, 8, 4)).unwrap();
         let mut second_reservation = second.reserve(charge(10, 12, 4, 8, 4)).unwrap();
 
+        assert_eq!(
+            second.release_buffer_memory(&mut first_reservation),
+            Err(WalV7ReservationError::ForeignReservation)
+        );
         assert_eq!(
             second.release(&mut first_reservation),
             Err(WalV7ReservationError::ForeignReservation)
