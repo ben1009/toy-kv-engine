@@ -2,7 +2,10 @@ use std::{
     fs::{self, File},
     io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use anyhow::{Context, Ok, Result, ensure};
@@ -17,6 +20,7 @@ use crate::{
 pub(crate) struct Manifest {
     file: Arc<Mutex<File>>,
     path: PathBuf,
+    durability_uncertain: AtomicBool,
 }
 
 #[cfg(test)]
@@ -319,6 +323,7 @@ impl Manifest {
         Ok(Self {
             file: Arc::new(Mutex::new(f)),
             path,
+            durability_uncertain: AtomicBool::new(false),
         })
     }
 
@@ -329,16 +334,45 @@ impl Manifest {
     /// to be post-snapshot records (written after the snapshot completed).
     /// If no snapshot exists, returns all records (backward compatible).
     /// If MANIFEST is missing but ENGINE_MANIFEST exists, creates a new empty MANIFEST.
+    /// Accepted bytes are durably rewritten before replay is returned. Recovery
+    /// requires exclusive database ownership with all old manifest handles closed.
     pub fn recover(path: impl AsRef<Path>) -> Result<(Self, Vec<ManifestRecord>)> {
         let path = path.as_ref();
-        let mut records = Self::recover_snapshot_record(path)?;
+        let snapshot = Self::read_recovery_snapshot(path)?;
+        let mut records = if let Some((_, bytes)) = &snapshot {
+            vec![serde_json::from_slice(bytes).context("failed to deserialize manifest snapshot")?]
+        } else {
+            Vec::new()
+        };
         let mut f = Self::open_recovery_manifest(path)?;
-        Self::recover_manifest_records(&mut f, &mut records)?;
+        let bytes = Self::recover_manifest_records(&mut f, &mut records)?;
+        drop(f);
+        if let Some((source_path, snapshot_bytes)) = &snapshot {
+            // Stabilize a pending snapshot under its pending name before making
+            // MANIFEST's empty state durable. Its final rename must wait until
+            // the accepted MANIFEST bytes are installed, or a failed truncate
+            // could restore old suffix records alongside the new snapshot.
+            drop(Self::rewrite_recovered_file(source_path, snapshot_bytes)?);
+        }
+        // A prior process may have observed an fsync error after appending a
+        // complete record. Failed writeback can leave clean, readable cache
+        // pages, and a new descriptor need not report the old error. Rewrite
+        // every accepted byte on a fresh inode before exposing replayed state.
+        let f = Self::rewrite_recovered_file(path, &bytes)?;
+        if let Some((source_path, _)) = snapshot
+            && source_path == Self::snapshot_tmp_path(path)
+        {
+            let snapshot_path = Self::snapshot_path(path);
+            fs::rename(source_path, &snapshot_path)
+                .context("failed to rename ENGINE_MANIFEST.tmp to ENGINE_MANIFEST")?;
+            Self::sync_parent_directory(&snapshot_path)?;
+        }
 
         Ok((
             Self {
                 file: Arc::new(Mutex::new(f)),
                 path: path.to_path_buf(),
+                durability_uncertain: AtomicBool::new(false),
             },
             records,
         ))
@@ -365,6 +399,7 @@ impl Manifest {
     ///   MANIFEST from the snapshot.
     /// - After step 3 durable: snapshot + empty manifest → clean recovery
     pub fn snapshot(&self, record: ManifestRecord) -> Result<()> {
+        self.ensure_durability_certain()?;
         let snapshot_path = Self::snapshot_path(&self.path);
         let tmp_path = snapshot_path.with_extension("tmp");
 
@@ -390,9 +425,16 @@ impl Manifest {
 
         {
             let mut file = self.file.lock();
-            file.set_len(0)?;
-            file.seek(SeekFrom::Start(0))?;
-            file.sync_all()
+            self.ensure_durability_certain()?;
+            if let Err(error) = file.set_len(0) {
+                self.mark_durability_uncertain();
+                return Err(error).context("failed to truncate manifest for snapshot");
+            }
+            if let Err(error) = file.seek(SeekFrom::Start(0)) {
+                self.mark_durability_uncertain();
+                return Err(error).context("failed to reposition truncated manifest");
+            }
+            self.sync_locked_file(&file)
                 .context("failed to sync truncated manifest")?;
 
             #[cfg(feature = "chaos-testing")]
@@ -401,7 +443,10 @@ impl Manifest {
             }
 
             // Step 3: Atomic rename over ENGINE_MANIFEST
-            fs::rename(&tmp_path, &snapshot_path).context("failed to rename ENGINE_MANIFEST")?;
+            if let Err(error) = fs::rename(&tmp_path, &snapshot_path) {
+                self.mark_durability_uncertain();
+                return Err(error).context("failed to rename ENGINE_MANIFEST");
+            }
 
             #[cfg(test)]
             if std::env::var_os("PITR_PROCESS_KILL_AFTER_MANIFEST_SNAPSHOT_RENAME").is_some() {
@@ -416,10 +461,16 @@ impl Manifest {
             }
 
             // Fsync parent directory to ensure rename is durable
-            File::open(dir)
-                .context("failed to open parent dir for sync")?
-                .sync_all()
-                .context("failed to sync dir after ENGINE_MANIFEST rename")?;
+            let dir_sync = File::open(dir)
+                .context("failed to open parent dir for sync")
+                .and_then(|dir| {
+                    dir.sync_all()
+                        .context("failed to sync dir after ENGINE_MANIFEST rename")
+                });
+            if let Err(error) = dir_sync {
+                self.mark_durability_uncertain();
+                return Err(error);
+            }
         }
 
         Ok(())
@@ -445,18 +496,7 @@ impl Manifest {
         Self::snapshot_path(manifest_path).with_extension("tmp")
     }
 
-    fn recover_snapshot_record(path: &Path) -> Result<Vec<ManifestRecord>> {
-        let Some(snapshot_buf) = Self::read_snapshot_buffer(path)? else {
-            return Ok(Vec::new());
-        };
-
-        let record: ManifestRecord = serde_json::from_slice(&snapshot_buf)
-            .context("failed to deserialize ENGINE_MANIFEST")?;
-
-        Ok(vec![record])
-    }
-
-    fn read_snapshot_buffer(path: &Path) -> Result<Option<Vec<u8>>> {
+    fn read_recovery_snapshot(path: &Path) -> Result<Option<(PathBuf, Vec<u8>)>> {
         let snapshot_path = Self::snapshot_path(path);
         let tmp_path = Self::snapshot_tmp_path(path);
         let manifest_empty_or_missing = match fs::metadata(path) {
@@ -469,34 +509,76 @@ impl Manifest {
         // missing. If MANIFEST still has data, the tmp file may have been
         // written before truncation and replaying both would duplicate or
         // stale snapshot history.
-        if tmp_path.exists() && manifest_empty_or_missing {
-            return Self::recover_tmp_snapshot(&tmp_path, &snapshot_path).map(Some);
-        }
-
-        if snapshot_path.exists() {
-            return Ok(Some(
-                fs::read(&snapshot_path).context("failed to read ENGINE_MANIFEST")?,
-            ));
-        }
-
-        if tmp_path.exists() {
+        let recover_tmp = tmp_path.exists() && manifest_empty_or_missing;
+        let source_path = if recover_tmp {
+            &tmp_path
+        } else if snapshot_path.exists() {
+            &snapshot_path
+        } else {
             return Ok(None);
-        }
+        };
+        let buf = fs::read(source_path).context("failed to read manifest snapshot")?;
 
-        Ok(None)
+        Ok(Some((source_path.clone(), buf)))
     }
 
-    fn recover_tmp_snapshot(tmp_path: &Path, snapshot_path: &Path) -> Result<Vec<u8>> {
-        // Tmp file exists but wasn't renamed — rename it now to complete
-        // the handoff that was interrupted by the crash.
-        let buf = fs::read(tmp_path).context("failed to read ENGINE_MANIFEST.tmp")?;
-        // Validate it's valid JSON before renaming
-        let _: ManifestRecord =
-            serde_json::from_slice(&buf).context("failed to validate ENGINE_MANIFEST.tmp")?;
-        fs::rename(tmp_path, snapshot_path)
-            .context("failed to rename ENGINE_MANIFEST.tmp to ENGINE_MANIFEST")?;
+    /// Install the exact accepted bytes without overwriting the source inode.
+    /// Recovery runs under exclusive database ownership. Leftover scratch is
+    /// never authoritative and can be recreated after an interrupted attempt.
+    fn rewrite_recovered_file(path: &Path, bytes: &[u8]) -> Result<File> {
+        let tmp_path = path.with_extension("recover");
+        match fs::remove_file(&tmp_path) {
+            std::result::Result::Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error).context("failed to remove recovery scratch"),
+        }
+        let result = (|| {
+            let mut file = File::options()
+                .read(true)
+                .append(true)
+                .create_new(true)
+                .open(&tmp_path)
+                .context("failed to create recovered manifest image")?;
+            file.set_permissions(fs::metadata(path)?.permissions())?;
+            file.write_all(bytes)
+                .context("failed to write recovered manifest image")?;
+            Self::sync_file(&file, path).context("failed to sync recovered manifest image")?;
+            #[cfg(all(test, target_os = "linux"))]
+            if std::env::var_os("PITR_PROCESS_KILL_AFTER_MANIFEST_RECOVERY_SYNC").as_deref()
+                == Some(path.as_os_str())
+            {
+                // SAFETY: this is an isolated child-process crash test after
+                // the replacement image is synced, before the canonical rename.
+                unsafe { libc::_exit(137) }
+            }
+            fs::rename(&tmp_path, path).context("failed to install recovered manifest image")?;
+            #[cfg(all(test, target_os = "linux"))]
+            if std::env::var_os("PITR_PROCESS_KILL_AFTER_MANIFEST_RECOVERY_RENAME").as_deref()
+                == Some(path.as_os_str())
+            {
+                // SAFETY: this is an isolated child-process crash test after
+                // replacement, before its directory entry is synced.
+                unsafe { libc::_exit(137) }
+            }
+            Self::sync_parent_directory(path)?;
+            Ok(file)
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(&tmp_path);
+        }
 
-        Ok(buf)
+        result
+    }
+
+    fn sync_parent_directory(path: &Path) -> Result<()> {
+        let directory = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        File::open(directory)
+            .context("failed to open recovered manifest directory")?
+            .sync_all()
+            .context("failed to sync recovered manifest directory")
     }
 
     fn open_recovery_manifest(path: &Path) -> Result<File> {
@@ -518,12 +600,15 @@ impl Manifest {
             .context("failed to create new manifest after snapshot")
     }
 
-    fn recover_manifest_records(file: &mut File, records: &mut Vec<ManifestRecord>) -> Result<()> {
+    fn recover_manifest_records(
+        file: &mut File,
+        records: &mut Vec<ManifestRecord>,
+    ) -> Result<Vec<u8>> {
         let mut buf = Vec::new();
         file.read_to_end(&mut buf)?;
 
         if buf.is_empty() {
-            return Ok(());
+            return Ok(buf);
         }
 
         let manifest_records =
@@ -533,7 +618,7 @@ impl Manifest {
             records.push(record?);
         }
 
-        Ok(())
+        Ok(buf)
     }
 
     /// take a record of the changes in the LsmStorageState
@@ -554,6 +639,13 @@ impl Manifest {
         self.add_records_when_init(records)
     }
 
+    /// Establish durability for previously appended records without changing the
+    /// manifest stream or its append position. If the sync itself fails, this
+    /// instance is poisoned and must be reopened before it can be mutated again.
+    pub(crate) fn sync(&self, _state_lock_observer: &MutexGuard<()>) -> Result<()> {
+        self.sync_locked_file(&self.file.lock())
+    }
+
     pub fn add_record_when_init(&self, record: ManifestRecord) -> Result<()> {
         self.add_records_when_init(std::slice::from_ref(&record))
     }
@@ -570,6 +662,7 @@ impl Manifest {
             serde_json::to_writer(&mut buf, record)?;
         }
         let mut file = self.file.lock();
+        self.ensure_durability_certain()?;
         file.write_all(&buf)?;
 
         #[cfg(test)]
@@ -577,15 +670,6 @@ impl Manifest {
             // SAFETY: this is an isolated child-process crash test at the
             // manifest append-before-sync boundary.
             unsafe { libc::_exit(137) }
-        }
-
-        #[cfg(test)]
-        {
-            let mut configured = MANIFEST_SYNC_FAILURE.lock().unwrap();
-            if configured.as_ref().is_some_and(|path| path == &self.path) {
-                configured.take();
-                return Err(std::io::Error::other("injected manifest sync failure").into());
-            }
         }
 
         #[cfg(feature = "chaos-testing")]
@@ -611,7 +695,48 @@ impl Manifest {
             ));
         }
 
+        self.sync_locked_file(&file)
+    }
+
+    fn sync_locked_file(&self, file: &File) -> Result<()> {
+        self.ensure_durability_certain()?;
+        let result = Self::sync_file(file, &self.path);
+        if result.is_err() {
+            // A later sync cannot prove that the old writeback error was cleared.
+            // Recovery must rewrite accepted bytes before mutations resume.
+            self.mark_durability_uncertain();
+        }
+        result
+    }
+
+    fn sync_file(file: &File, path: &Path) -> Result<()> {
+        #[cfg(test)]
+        {
+            let mut configured = MANIFEST_SYNC_FAILURE.lock().unwrap();
+            if configured
+                .as_ref()
+                .is_some_and(|configured| configured == path)
+            {
+                configured.take();
+                return Err(std::io::Error::other("injected manifest sync failure").into());
+            }
+        }
+        #[cfg(not(test))]
+        let _ = path;
+
         file.sync_all().context("failed to sync manifest")
+    }
+
+    pub(crate) fn ensure_durability_certain(&self) -> Result<()> {
+        ensure!(
+            !self.durability_uncertain.load(Ordering::Acquire),
+            "manifest durability is uncertain; reopen required"
+        );
+        Ok(())
+    }
+
+    fn mark_durability_uncertain(&self) {
+        self.durability_uncertain.store(true, Ordering::Release);
     }
 
     /// Decide whether a failed append actually landed.
@@ -651,6 +776,7 @@ impl Manifest {
             "the manifest shrank below the length it had before the failed append, so its \
              contents are unknown"
         );
+        self.ensure_durability_certain()?;
         // A short write left a proper prefix of the batch behind. Cut it back to
         // the last known-good boundary so the append really is absent, which is
         // what `Ok(false)` reports and what the caller acts on.
@@ -663,11 +789,17 @@ impl Manifest {
         // refuses to open on any parse error, so a hole in the middle is no more
         // survivable than a tear at the end.
         let mut file = self.file.lock();
-        file.set_len(length_before)
-            .context("failed to discard a partial manifest append")?;
-        file.seek(SeekFrom::Start(length_before))
-            .context("failed to reposition the manifest after discarding a partial append")?;
-        file.sync_all()
+        self.ensure_durability_certain()?;
+        if let Err(error) = file.set_len(length_before) {
+            self.mark_durability_uncertain();
+            return Err(error).context("failed to discard a partial manifest append");
+        }
+        if let Err(error) = file.seek(SeekFrom::Start(length_before)) {
+            self.mark_durability_uncertain();
+            return Err(error)
+                .context("failed to reposition the manifest after discarding a partial append");
+        }
+        self.sync_locked_file(&file)
             .context("failed to sync the manifest after discarding a partial append")?;
 
         Ok(false)
