@@ -6,14 +6,21 @@
 complete. Stage 3 now includes bounded backward FRONTIER discovery, single-pass
 candidate-prefix verification, authority/anchor selection, the Active
 fresh-inode normalization primitive, and an authority-required coordinator.
-Stage 4 now includes the v7 resource-ledger primitive and a framed-batch
-reservation helper that charges DATA frames, a worst-case FRONTIER, buffer
-memory, and seal-index capacity before coordinate assignment. Live lifecycle
-reconstruction and WAL admission integration remain. Production WAL-open and
-manifest integration also remain. The serial persistence model covers repeated
-normalization, continued append, and crash/reopen for empty, nonempty, fallback,
-and trailing-control prefixes, including a selected marker behind speculative
-DATA. The production writer remains v6.
+Stage 4 now includes the v7 resource-ledger primitive, framed-batch reservation
+helper, and serial-model integration. The model reserves before allocating
+framed DATA buffers or writing frames, retains the charge through uncertain
+sync, and retires DATA buffer memory on successful publication. It retains
+WAL/spool/index charges; recovery reconstructs actual retained DATA/FRONTIER
+bytes and seal-index capacity, counting coalesced markers only once. Serial
+commits reuse the buffer cap, and recovered batches require no outstanding
+DATA buffers. Exact-cap recovery and continued append cover coalesced groups.
+Limit rejection is checked to leave ticket/offset state and WAL bytes unchanged.
+Live lifecycle reconstruction and WAL admission integration remain. Production
+WAL-open and manifest integration also remain.
+The serial persistence model covers repeated normalization, continued append,
+and crash/reopen for empty, nonempty, fallback, and trailing-control prefixes,
+including a selected marker behind speculative DATA. The production writer
+remains v6.
 
 **Last updated:** 2026-10-10
 
@@ -341,8 +348,14 @@ in this stage.
 
 **Exit:** Ledger reconstruction, tiny-limit/concurrent-admission models, and
 serial-driver tests have no holes, cap overruns, accounting leaks, or maintenance
-deadlocks. Digest/index snapshots agree with independent codec verification;
-no stopped-admission payload rescan is required. Exact-boundary, marker-overhead,
+deadlocks. The serial persistence model reserves a batch before framed DATA
+allocation/write, retains uncertain-sync ownership, and restores charges from
+the installed verified image. Successful publication retires transient DATA
+buffer charges, and recovery charges each retained DATA/control frame once,
+including coalesced groups; rejected admission leaves its coordinates and WAL
+image untouched. Digest/index snapshots agree with independent codec
+verification; no stopped-admission payload rescan is required. Exact-boundary,
+marker-overhead,
 and seal-index tests produce rotation-required before ticket assignment, distinct
 from global spool pressure and permanent oversize. Real engine allocation checks
 belong to stage 5, and full v7 lifecycle rotation/retry checks belong to stage 6;
