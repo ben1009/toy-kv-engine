@@ -2,7 +2,10 @@ use std::{
     fs::{self, File},
     io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use anyhow::{Context, Ok, Result, ensure};
@@ -17,6 +20,7 @@ use crate::{
 pub(crate) struct Manifest {
     file: Arc<Mutex<File>>,
     path: PathBuf,
+    durability_uncertain: AtomicBool,
 }
 
 #[cfg(test)]
@@ -319,6 +323,7 @@ impl Manifest {
         Ok(Self {
             file: Arc::new(Mutex::new(f)),
             path,
+            durability_uncertain: AtomicBool::new(false),
         })
     }
 
@@ -334,11 +339,16 @@ impl Manifest {
         let mut records = Self::recover_snapshot_record(path)?;
         let mut f = Self::open_recovery_manifest(path)?;
         Self::recover_manifest_records(&mut f, &mut records)?;
+        // A prior process may have observed an fsync error after appending a
+        // complete record. Reopen is the recovery boundary for that uncertainty:
+        // make every recovered byte durable before exposing the replayed state.
+        f.sync_all().context("failed to sync recovered manifest")?;
 
         Ok((
             Self {
                 file: Arc::new(Mutex::new(f)),
                 path: path.to_path_buf(),
+                durability_uncertain: AtomicBool::new(false),
             },
             records,
         ))
@@ -365,6 +375,7 @@ impl Manifest {
     ///   MANIFEST from the snapshot.
     /// - After step 3 durable: snapshot + empty manifest → clean recovery
     pub fn snapshot(&self, record: ManifestRecord) -> Result<()> {
+        self.ensure_durability_certain()?;
         let snapshot_path = Self::snapshot_path(&self.path);
         let tmp_path = snapshot_path.with_extension("tmp");
 
@@ -390,9 +401,16 @@ impl Manifest {
 
         {
             let mut file = self.file.lock();
-            file.set_len(0)?;
-            file.seek(SeekFrom::Start(0))?;
-            file.sync_all()
+            self.ensure_durability_certain()?;
+            if let Err(error) = file.set_len(0) {
+                self.mark_durability_uncertain();
+                return Err(error).context("failed to truncate manifest for snapshot");
+            }
+            if let Err(error) = file.seek(SeekFrom::Start(0)) {
+                self.mark_durability_uncertain();
+                return Err(error).context("failed to reposition truncated manifest");
+            }
+            self.sync_locked_file(&file)
                 .context("failed to sync truncated manifest")?;
 
             #[cfg(feature = "chaos-testing")]
@@ -401,7 +419,10 @@ impl Manifest {
             }
 
             // Step 3: Atomic rename over ENGINE_MANIFEST
-            fs::rename(&tmp_path, &snapshot_path).context("failed to rename ENGINE_MANIFEST")?;
+            if let Err(error) = fs::rename(&tmp_path, &snapshot_path) {
+                self.mark_durability_uncertain();
+                return Err(error).context("failed to rename ENGINE_MANIFEST");
+            }
 
             #[cfg(test)]
             if std::env::var_os("PITR_PROCESS_KILL_AFTER_MANIFEST_SNAPSHOT_RENAME").is_some() {
@@ -416,10 +437,16 @@ impl Manifest {
             }
 
             // Fsync parent directory to ensure rename is durable
-            File::open(dir)
-                .context("failed to open parent dir for sync")?
-                .sync_all()
-                .context("failed to sync dir after ENGINE_MANIFEST rename")?;
+            let dir_sync = File::open(dir)
+                .context("failed to open parent dir for sync")
+                .and_then(|dir| {
+                    dir.sync_all()
+                        .context("failed to sync dir after ENGINE_MANIFEST rename")
+                });
+            if let Err(error) = dir_sync {
+                self.mark_durability_uncertain();
+                return Err(error);
+            }
         }
 
         Ok(())
@@ -554,8 +581,9 @@ impl Manifest {
         self.add_records_when_init(records)
     }
 
-    /// Retry durability of previously appended records without changing the
-    /// manifest stream or its append position.
+    /// Establish durability for previously appended records without changing the
+    /// manifest stream or its append position. If the sync itself fails, this
+    /// instance is poisoned and must be reopened before it can be mutated again.
     pub(crate) fn sync(&self, _state_lock_observer: &MutexGuard<()>) -> Result<()> {
         self.sync_locked_file(&self.file.lock())
     }
@@ -576,6 +604,7 @@ impl Manifest {
             serde_json::to_writer(&mut buf, record)?;
         }
         let mut file = self.file.lock();
+        self.ensure_durability_certain()?;
         file.write_all(&buf)?;
 
         #[cfg(test)]
@@ -612,16 +641,37 @@ impl Manifest {
     }
 
     fn sync_locked_file(&self, file: &File) -> Result<()> {
+        self.ensure_durability_certain()?;
         #[cfg(test)]
         {
             let mut configured = MANIFEST_SYNC_FAILURE.lock().unwrap();
             if configured.as_ref().is_some_and(|path| path == &self.path) {
                 configured.take();
+                self.mark_durability_uncertain();
                 return Err(std::io::Error::other("injected manifest sync failure").into());
             }
         }
 
-        file.sync_all().context("failed to sync manifest")
+        let result = file.sync_all().context("failed to sync manifest");
+        if result.is_err() {
+            // After a failed durability barrier, another sync on this descriptor
+            // cannot prove that the earlier writeback error was cleared. Reopen
+            // and sync the recovered stream before allowing further mutations.
+            self.mark_durability_uncertain();
+        }
+        result
+    }
+
+    fn ensure_durability_certain(&self) -> Result<()> {
+        ensure!(
+            !self.durability_uncertain.load(Ordering::Acquire),
+            "manifest durability is uncertain; reopen required"
+        );
+        Ok(())
+    }
+
+    fn mark_durability_uncertain(&self) {
+        self.durability_uncertain.store(true, Ordering::Release);
     }
 
     /// Decide whether a failed append actually landed.
@@ -661,6 +711,7 @@ impl Manifest {
             "the manifest shrank below the length it had before the failed append, so its \
              contents are unknown"
         );
+        self.ensure_durability_certain()?;
         // A short write left a proper prefix of the batch behind. Cut it back to
         // the last known-good boundary so the append really is absent, which is
         // what `Ok(false)` reports and what the caller acts on.
@@ -673,11 +724,17 @@ impl Manifest {
         // refuses to open on any parse error, so a hole in the middle is no more
         // survivable than a tear at the end.
         let mut file = self.file.lock();
-        file.set_len(length_before)
-            .context("failed to discard a partial manifest append")?;
-        file.seek(SeekFrom::Start(length_before))
-            .context("failed to reposition the manifest after discarding a partial append")?;
-        file.sync_all()
+        self.ensure_durability_certain()?;
+        if let Err(error) = file.set_len(length_before) {
+            self.mark_durability_uncertain();
+            return Err(error).context("failed to discard a partial manifest append");
+        }
+        if let Err(error) = file.seek(SeekFrom::Start(length_before)) {
+            self.mark_durability_uncertain();
+            return Err(error)
+                .context("failed to reposition the manifest after discarding a partial append");
+        }
+        self.sync_locked_file(&file)
             .context("failed to sync the manifest after discarding a partial append")?;
 
         Ok(false)

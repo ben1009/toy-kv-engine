@@ -2450,12 +2450,25 @@ impl KvEngine {
         let length_before = manifest.current_length()?;
         let publication = if records.is_empty() {
             // The projection may have advanced after an append whose sync
-            // failed. Settle that durability without adding a lifecycle record.
+            // failed. Attempt to settle it without adding a lifecycle record.
             manifest.sync(&state_lock)
         } else {
             manifest.add_records(&state_lock, &records)
         };
         if let Err(error) = publication {
+            if records.is_empty() {
+                // This retries durability for a transition already published in
+                // memory and in the manifest stream. A failed sync is not proof
+                // that another sync on this handle can settle it; keep the
+                // reservation deferred until reopen replays and syncs the stream.
+                drop(state_lock);
+                *self.inner.pitr_state.lock() = state.clone();
+                *self.pitr_manifest_state.lock() = state;
+                return Err(anyhow::Error::new(
+                    PitrManifestPublicationError::PublishedButNotDurable(error),
+                ));
+            }
+
             // The append may be durable even though its fsync failed. Publishing
             // the state in that case makes a retry hit the caller's own guard
             // instead of drawing a second timeline/epoch. Write admission stays
@@ -12789,7 +12802,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn failpoint_reconciled_spool_charge_waits_for_successful_retry_sync() {
+    fn failpoint_reconciled_spool_charge_waits_for_reopen_after_sync_failure() {
         let dir = tempdir().unwrap();
         let database = dir.path().join("db");
         let repository = dir.path().join("repository");
@@ -12835,9 +12848,8 @@ mod tests {
                 .join(format!("pitr-{segment_id:020}.seal"))
                 .exists()
         );
-        // Repeating the sync failure must retain the charge even though no
-        // obligation remains in the manifest projection to drive the retry.
-        crate::manifest::set_manifest_sync_failure(&database.join("MANIFEST"));
+        // A second attempt on this Manifest handle cannot establish durability:
+        // the previous sync failed, so reconciliation must wait for reopen.
         assert!(engine.resume_pitr(&repository).is_err());
         {
             let segments = engine.pitr_segments.lock();
@@ -12845,39 +12857,23 @@ mod tests {
             assert_eq!(segments.source_spool_reserved(), 12 * 1024);
             assert!(segments.has_pending_obligation_reconciliation());
         }
-        let manifest_length = engine
-            .inner
-            .manifest
-            .as_ref()
-            .unwrap()
-            .current_length()
-            .unwrap();
-        assert!(matches!(
-            engine.resume_pitr(&repository).unwrap(),
-            crate::pitr::api::PitrResumeOutcome::Resumed
-        ));
-        {
-            let segments = engine.pitr_segments.lock();
-            let segments = segments.as_ref().unwrap();
-            assert!(segments.segment(segment_id).is_none());
-            assert_eq!(segments.source_spool_reserved(), 4096);
-            assert!(!segments.has_pending_obligation_reconciliation());
-        }
-        // The retry settles durability without appending a lifecycle record.
-        assert_eq!(
-            std::fs::metadata(database.join("MANIFEST")).unwrap().len(),
-            manifest_length
-        );
         engine.close_storage().unwrap();
         drop(engine);
 
         let reopened = KvEngine::open(&database, options)
-            .expect("a successful reconciliation retry must survive cold manifest replay");
+            .expect("reopen must sync the recovered manifest before replaying it");
         assert!(matches!(
             reopened.resume_pitr(&repository).unwrap(),
             crate::pitr::api::PitrResumeOutcome::Resumed
         ));
         assert!(reopened.pitr_manifest_state.lock().obligations.is_empty());
+        {
+            let segments = reopened.pitr_segments.lock();
+            let segments = segments.as_ref().unwrap();
+            assert!(segments.segment(segment_id).is_none());
+            assert_eq!(segments.source_spool_reserved(), 4096);
+            assert!(!segments.has_pending_obligation_reconciliation());
+        }
         let status = reopened
             .pitr_status(crate::pitr::api::PitrStatusOptions {
                 cursor: None,
@@ -12889,7 +12885,7 @@ mod tests {
     }
 
     #[test]
-    fn resumed_pitr_rejects_recovered_spool_usage_over_limit_before_attach() {
+    fn resumed_pitr_attaches_when_recovered_spool_estimate_exceeds_limit() {
         let dir = tempdir().unwrap();
         let engine = KvEngine::open(&dir, LsmStorageOptions::default_for_test()).unwrap();
         let state = enabled_pitr_state_with_sealed_segment(
@@ -12903,18 +12899,23 @@ mod tests {
         );
         write_empty_active_pitr_wal(&dir, &state).unwrap();
 
-        let error = engine.resume_pitr_lifecycle(state).unwrap_err();
+        engine.resume_pitr_lifecycle(state).unwrap();
+        let status = engine
+            .pitr_status(crate::pitr::api::PitrStatusOptions {
+                cursor: None,
+                page_size: crate::pitr::api::MAX_STATUS_PAGE_SIZE,
+            })
+            .unwrap();
+        assert_eq!(status.source_spool_bytes, 12 * 1024);
+        let mut segments = engine.pitr_segments.lock();
         assert!(
-            error
-                .to_string()
-                .contains("recovered PITR source-spool reservation estimate")
+            segments
+                .as_mut()
+                .unwrap()
+                .begin_sealing(4096, 4096)
+                .is_err()
         );
-        assert!(engine.pitr_runtime.lock().is_none());
-        assert!(engine.pitr_segments.lock().is_none());
-        assert_eq!(
-            *engine.pitr_manifest_state.lock(),
-            crate::pitr::manifest::PitrState::default()
-        );
+        drop(segments);
         engine.close().unwrap();
     }
 

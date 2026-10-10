@@ -219,11 +219,6 @@ impl PitrSegmentManager {
         }
 
         manager.recompute_reserved()?;
-        ensure!(
-            manager.source_spool_reserved <= source_spool_limit,
-            "recovered PITR source-spool reservation estimate exceeds its configured limit"
-        );
-
         Ok(manager)
     }
 
@@ -1196,7 +1191,7 @@ mod tests {
     }
 
     #[test]
-    fn recovered_obligations_must_fit_the_persisted_spool_limit() {
+    fn recovered_over_limit_estimate_attaches_but_blocks_new_growth() {
         let obligations = std::collections::BTreeMap::from([(
             1,
             crate::pitr::manifest::PitrObligation {
@@ -1205,7 +1200,11 @@ mod tests {
                 logical_length: 4096,
             },
         )]);
-        assert!(PitrSegmentManager::from_recovered_state(2, 3, 4096, 8192, &obligations).is_err());
+        let mut manager =
+            PitrSegmentManager::from_recovered_state(2, 3, 4096, 8192, &obligations).unwrap();
+
+        assert_eq!(manager.source_spool_reserved(), 12 * 1024);
+        assert!(manager.begin_sealing(4096, 4096).is_err());
     }
 
     #[cfg(target_os = "linux")]
