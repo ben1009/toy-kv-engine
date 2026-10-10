@@ -167,6 +167,24 @@ pub(crate) struct SyncProgressSnapshot {
 }
 
 impl WalSyncProgress {
+    /// Seed diagnostic ticket coordinates after recovery and before any group
+    /// can be submitted to the worker.
+    pub(crate) fn initialize_frontiers(&self, ticket: u64) {
+        #[cfg(feature = "bench")]
+        {
+            let mut state = self.state.lock();
+            debug_assert!(state.completed_groups.is_empty());
+            debug_assert_eq!(state.written_frontier, 0);
+            debug_assert_eq!(state.durable_frontier, 0);
+            state.written_frontier = ticket;
+            state.durable_frontier = ticket;
+            state.sync_written_frontier_start = ticket;
+            state.sync_written_frontier_end = ticket;
+        }
+        #[cfg(not(feature = "bench"))]
+        let _ = ticket;
+    }
+
     #[cfg(feature = "bench")]
     pub(crate) fn set_profile(&self, profile: std::sync::Arc<crate::mem_table::WriteProfile>) {
         self.profile.store(Some(profile));

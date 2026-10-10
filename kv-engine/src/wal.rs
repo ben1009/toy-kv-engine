@@ -726,7 +726,7 @@ impl Wal {
             worker_file,
             sync_file,
             preallocator,
-            alloc_offset,
+            parallel_runtime::ParallelWalRuntimeStart::v4(alloc_offset)?,
         )
     }
 
