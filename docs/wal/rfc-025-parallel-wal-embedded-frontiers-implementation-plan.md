@@ -6,14 +6,16 @@
 complete. Stage 3 now includes bounded backward FRONTIER discovery, single-pass
 candidate-prefix verification, authority/anchor selection, the Active
 fresh-inode normalization primitive, and an authority-required coordinator.
-Stage 4 begins with the v7 resource-ledger primitive; live lifecycle
+Stage 4 now includes the v7 resource-ledger primitive and a framed-batch
+reservation helper that charges DATA frames, a worst-case FRONTIER, buffer
+memory, and seal-index capacity before coordinate assignment. Live lifecycle
 reconstruction and WAL admission integration remain. Production WAL-open and
 manifest integration also remain. The serial persistence model covers repeated
 normalization, continued append, and crash/reopen for empty, nonempty, fallback,
 and trailing-control prefixes, including a selected marker behind speculative
 DATA. The production writer remains v6.
 
-**Last updated:** 2026-10-09
+**Last updated:** 2026-10-10
 
 **Source baseline:** `30a64fa855126596316ab6b9237e6348b0e41fd2`, which merged RFC 025 in PR #379.
 
@@ -277,11 +279,14 @@ the installation barrier.
 
 ### 4. Admission reservations and ordered metadata
 
-The current slice adds a thread-safe reservation ledger for logical WAL bytes,
+The current slices add a thread-safe reservation ledger for logical WAL bytes,
 source spool and recovery workspace, buffer memory, and seal-index capacity.
 Each reservation owns all of its charges and releases them atomically. The
-ledger is not yet reconstructed from lifecycle state or connected to live WAL
-admission; those integrations remain in this stage.
+framed-batch helper derives DATA frame count from the codec, reserves one
+worst-case FRONTIER per admitted batch, and returns the owned reservation before
+the caller assigns a ticket or offset. The ledger is not yet reconstructed from
+lifecycle state or connected to live WAL admission; those integrations remain
+in this stage.
 
 - Promote or replace the `PitrSpoolAccountant` helper/model with a shared live
   ledger installed by the engine's PITR lifecycle. Reconstruct its charges

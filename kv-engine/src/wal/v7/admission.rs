@@ -13,6 +13,8 @@ use std::{collections::BTreeMap, error::Error, fmt, sync::Arc};
 
 use parking_lot::Mutex;
 
+use super::codec::{WAL_V7_FRAME_LEN, data_fragment_count};
+
 /// Resource amounts charged atomically by one reservation.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct WalV7ResourceCharge {
@@ -79,6 +81,7 @@ pub(crate) struct WalV7ResourceLimits {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum WalV7ReservationError {
     InvalidLimits,
+    InvalidBatchLength,
     EmptyReservation,
     ArithmeticOverflow,
     LogicalWalLimit,
@@ -97,6 +100,7 @@ impl fmt::Display for WalV7ReservationError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
             Self::InvalidLimits => "invalid v7 resource limits",
+            Self::InvalidBatchLength => "invalid v7 logical batch length",
             Self::EmptyReservation => "v7 resource reservation is empty",
             Self::ArithmeticOverflow => "v7 resource accounting overflow",
             Self::LogicalWalLimit => "v7 logical WAL limit exceeded",
@@ -228,6 +232,45 @@ impl WalV7ResourceLedger {
         })
     }
 
+    /// Reserve the worst-case resources for one framed DATA batch before its
+    /// caller assigns a ticket or file offset.
+    ///
+    /// The reservation includes all fixed-size DATA frames, one FRONTIER
+    /// frame, frame-buffer memory for DATA, and one first-DATA seal-index
+    /// entry. FRONTIER reservations are per admitted batch even when a later
+    /// group commit coalesces several batches into one marker.
+    /// `encoded_batch_bytes` includes the logical batch header and entry stream.
+    /// The caller must validate batch contents and reserve any additional
+    /// maintenance resources before assigning WAL coordinates.
+    ///
+    /// # Errors
+    /// Returns an error for lengths outside the wire envelope, accounting
+    /// overflow, or a resource limit exceeded. Rejection changes no charges.
+    pub(crate) fn reserve_batch(
+        &self,
+        encoded_batch_bytes: u64,
+    ) -> Result<WalV7Reservation, WalV7ReservationError> {
+        let fragment_count = u64::from(
+            data_fragment_count(encoded_batch_bytes)
+                .ok_or(WalV7ReservationError::InvalidBatchLength)?,
+        );
+        let data_frame_bytes = fragment_count
+            .checked_mul(WAL_V7_FRAME_LEN as u64)
+            .ok_or(WalV7ReservationError::ArithmeticOverflow)?;
+        let frontier_bytes = WAL_V7_FRAME_LEN as u64;
+        let logical_wal_bytes = data_frame_bytes
+            .checked_add(frontier_bytes)
+            .ok_or(WalV7ReservationError::ArithmeticOverflow)?;
+
+        self.reserve(WalV7ResourceCharge {
+            logical_wal_bytes,
+            source_spool_bytes: logical_wal_bytes,
+            recovery_workspace_bytes: 0,
+            buffer_memory_bytes: data_frame_bytes,
+            seal_index_bytes: std::mem::size_of::<u64>() as u64,
+        })
+    }
+
     /// Release a reservation only after its owner has canceled or retired it.
     pub(crate) fn release(
         &self,
@@ -310,6 +353,102 @@ mod tests {
             recovery_workspace_bytes: workspace,
             buffer_memory_bytes: buffers,
             seal_index_bytes: index,
+        }
+    }
+
+    fn batch_limits() -> WalV7ResourceLimits {
+        WalV7ResourceLimits {
+            max_logical_wal_bytes: 16384,
+            max_source_spool_bytes: 20480,
+            max_recovery_workspace_bytes: 4096,
+            max_buffer_memory_bytes: 12288,
+            max_seal_index_bytes: 16,
+        }
+    }
+
+    #[test]
+    fn batch_reservation_charges_fragment_rounding_and_one_frontier() {
+        let ledger = WalV7ResourceLedger::new(batch_limits()).unwrap();
+        for (batch_bytes, data_bytes, wal_bytes) in [
+            (49, 4096, 8192),
+            (4008, 4096, 8192),
+            (4009, 8192, 12288),
+            (8016, 8192, 12288),
+            (8017, 12288, 16384),
+        ] {
+            let reservation = ledger.reserve_batch(batch_bytes).unwrap();
+            assert_eq!(
+                ledger.snapshot(),
+                charge(wal_bytes, wal_bytes, 0, data_bytes, 8)
+            );
+            drop(reservation);
+            assert_eq!(ledger.snapshot(), WalV7ResourceCharge::default());
+        }
+    }
+
+    #[test]
+    fn invalid_batch_lengths_consume_no_resources_or_reservation_ids() {
+        let ledger = WalV7ResourceLedger::new(batch_limits()).unwrap();
+        for batch_bytes in [0, 48, 4_294_967_344, u64::MAX] {
+            assert_eq!(
+                ledger.reserve_batch(batch_bytes),
+                Err(WalV7ReservationError::InvalidBatchLength)
+            );
+            assert_eq!(ledger.snapshot(), WalV7ResourceCharge::default());
+        }
+        let reservation = ledger.reserve_batch(49).unwrap();
+        assert_eq!(reservation.id, 1);
+    }
+
+    #[test]
+    fn rejected_batch_reservation_preserves_usage_and_reserved_workspace() {
+        let exact_limits = WalV7ResourceLimits {
+            max_buffer_memory_bytes: 8192,
+            ..batch_limits()
+        };
+        for (limits, expected_error) in [
+            (
+                WalV7ResourceLimits {
+                    max_logical_wal_bytes: 16383,
+                    ..exact_limits
+                },
+                WalV7ReservationError::LogicalWalLimit,
+            ),
+            (
+                WalV7ResourceLimits {
+                    max_source_spool_bytes: 20479,
+                    ..exact_limits
+                },
+                WalV7ReservationError::SourceSpoolLimit,
+            ),
+            (
+                WalV7ResourceLimits {
+                    max_buffer_memory_bytes: 8191,
+                    ..exact_limits
+                },
+                WalV7ReservationError::BufferMemoryLimit,
+            ),
+            (
+                WalV7ResourceLimits {
+                    max_seal_index_bytes: 15,
+                    ..exact_limits
+                },
+                WalV7ReservationError::SealIndexLimit,
+            ),
+        ] {
+            let ledger = WalV7ResourceLedger::new(limits).unwrap();
+            let existing = ledger.reserve_batch(49).unwrap();
+            let workspace = ledger.reserve(charge(0, 0, 4096, 0, 0)).unwrap();
+            assert_eq!(ledger.snapshot(), charge(8192, 8192, 4096, 4096, 8));
+
+            assert_eq!(ledger.reserve_batch(49), Err(expected_error));
+            assert_eq!(ledger.snapshot(), charge(8192, 8192, 4096, 4096, 8));
+            assert_eq!(ledger.inner.state.lock().next_id, 3);
+
+            drop(existing);
+            assert_eq!(ledger.snapshot(), charge(0, 0, 4096, 0, 0));
+            drop(workspace);
+            assert_eq!(ledger.snapshot(), WalV7ResourceCharge::default());
         }
     }
 

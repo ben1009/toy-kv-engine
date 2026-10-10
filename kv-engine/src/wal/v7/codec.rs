@@ -22,6 +22,24 @@ pub(crate) const WAL_V7_DATA_FRAGMENT_PAYLOAD_CAPACITY: usize =
 const WAL_V7_MIN_LOGICAL_BATCH_LEN: u64 = WAL_V7_LOGICAL_BATCH_HEADER_LEN as u64 + 1;
 const WAL_V7_MAX_LOGICAL_BATCH_LEN: u64 = u32::MAX as u64 + WAL_V7_LOGICAL_BATCH_HEADER_LEN as u64;
 
+/// Count DATA frames for the complete logical batch, including its header.
+/// Returns `None` when the length is outside the v7 wire envelope.
+pub(crate) fn data_fragment_count(batch_bytes: u64) -> Option<u32> {
+    if !(WAL_V7_MIN_LOGICAL_BATCH_LEN..=WAL_V7_MAX_LOGICAL_BATCH_LEN).contains(&batch_bytes) {
+        return None;
+    }
+
+    let fragment_capacity = WAL_V7_DATA_FRAGMENT_PAYLOAD_CAPACITY as u64;
+    let remainder = if batch_bytes.is_multiple_of(fragment_capacity) {
+        0
+    } else {
+        1
+    };
+    let fragment_count = batch_bytes / fragment_capacity + remainder;
+
+    u32::try_from(fragment_count).ok()
+}
+
 const WAL_V7_FRAME_MAGIC: [u8; 8] = *b"TKVW7FR1";
 const WAL_V7_FRAME_VERSION: u16 = 1;
 const WAL_V7_FRAME_KIND_DATA: u16 = 1;
@@ -249,15 +267,14 @@ impl WalV7DataFragmentHeader {
             "v7 logical batch length is outside wire bounds"
         );
 
-        let fragment_capacity = WAL_V7_DATA_FRAGMENT_PAYLOAD_CAPACITY as u64;
-        let full_fragments = self.batch_bytes / fragment_capacity;
-        let has_remainder = !self.batch_bytes.is_multiple_of(fragment_capacity);
-        let expected_count = full_fragments + if has_remainder { 1 } else { 0 };
+        let expected_count = data_fragment_count(self.batch_bytes)
+            .ok_or_else(|| anyhow::anyhow!("v7 logical batch length is outside wire bounds"))?;
         ensure!(
-            u64::from(self.fragment_count) == expected_count,
+            self.fragment_count == expected_count,
             "v7 DATA fragment count does not match logical batch length"
         );
 
+        let fragment_capacity = WAL_V7_DATA_FRAGMENT_PAYLOAD_CAPACITY as u64;
         let batch_offset = u64::from(self.fragment_index)
             .checked_mul(fragment_capacity)
             .ok_or_else(|| anyhow::anyhow!("v7 DATA fragment offset overflows"))?;
@@ -1127,6 +1144,25 @@ mod tests {
         assert!(decode_frame_structural(&misplaced_frontier, 8192, &header_digest).is_err());
 
         Ok(())
+    }
+
+    #[test]
+    fn data_fragment_count_matches_wire_boundaries() {
+        // Fixed RFC 025 sizes keep these expectations independent of the
+        // production ceiling calculation and framing constants.
+        for (batch_bytes, expected_count) in [
+            (49, 1),
+            (4008, 1),
+            (4009, 2),
+            (8016, 2),
+            (8017, 3),
+            (4_294_967_343, 1_071_599),
+        ] {
+            assert_eq!(data_fragment_count(batch_bytes), Some(expected_count));
+        }
+        for batch_bytes in [0, 48, 4_294_967_344, u64::MAX] {
+            assert_eq!(data_fragment_count(batch_bytes), None);
+        }
     }
 
     #[test]
