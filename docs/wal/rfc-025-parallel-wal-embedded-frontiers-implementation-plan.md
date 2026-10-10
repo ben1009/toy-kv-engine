@@ -16,7 +16,12 @@ commits reuse the buffer cap, and recovered batches require no outstanding
 DATA buffers. Exact-cap recovery and continued append cover coalesced groups.
 Limit rejection is checked to leave ticket/offset state and WAL bytes unchanged.
 Live lifecycle reconstruction and WAL admission integration remain. Production
-WAL-open and manifest integration also remain.
+WAL-open and manifest integration also remain. Stage 5 has started with
+recovered-runtime cursor bootstrap: an installed Active image supplies the v7
+DATA start, append offset, and next ticket, and the shared runtime seeds its
+admission, packer, and durability coordinates from that state. V7 startup stays
+closed and performs no extent initialization or buffer-pool warmup until later
+runtime slices provide live reservations and the v7 writer path.
 The serial persistence model covers repeated normalization, continued append,
 and crash/reopen for empty, nonempty, fallback, and trailing-control prefixes,
 including a selected marker behind speculative DATA. The production writer
@@ -363,6 +368,13 @@ neither is a prerequisite for this stage.
 
 ### 5. Parallel runtime, one-sync coordinator, and API barriers
 
+- Derive a checked `WalV7RuntimeSeed` from the installed Active image and the
+  format descriptor. Validate its final recovery marker, logical boundary,
+  ticket count, append offset, and DATA start. Seed the shared runtime's next
+  admission/packer ticket and written/durable frontiers from it. Keep this v7
+  runtime closed, with no extent initialization or prewarmed direct buffers;
+  runtime admission opens only after later slices install the live reservations
+  and v7 write protocol. The existing v4 startup keeps its current behavior.
 - Initialize the runtime from the descriptor and recovered state, including
   v7's DATA start and continued segment ticket numbering. Retain the existing
   32 group slots and 256 ring entries unless a separately measured change is

@@ -31,7 +31,10 @@ use crate::{
     pitr::{
         LIVE_WAL_V5_LIMITS, RecordedAt, WalBatch, decode_wal_entry_stream, manifest::ActiveBoundary,
     },
-    wal::MAX_WAL_FILE_SIZE,
+    wal::{
+        MAX_WAL_FILE_SIZE,
+        format::{WAL_FORMAT_VERSION_V7, WalFormatDescriptor, WalFraming},
+    },
 };
 
 const FRAME_LEN_U64: u64 = WAL_V7_FRAME_LEN as u64;
@@ -59,6 +62,16 @@ pub(crate) struct WalV7InstalledRecovery {
     pub(crate) physical_hasher: Sha256,
 }
 
+/// The append cursor needed to initialize a v7 WAL runtime after recovery has
+/// durably installed its normalized image. This intentionally carries no
+/// authority or hash state: those remain owned by the recovered WAL lifecycle.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct WalV7RuntimeSeed {
+    pub(crate) data_start: u64,
+    pub(crate) append_offset: u64,
+    pub(crate) next_ticket: u64,
+}
+
 /// Active recovery result after authoritative selection and durable installation.
 pub(crate) struct WalV7ActiveRecovery {
     pub(crate) selection: WalV7RecoverySelection,
@@ -68,6 +81,80 @@ pub(crate) struct WalV7ActiveRecovery {
 impl WalV7InstalledRecovery {
     pub(crate) fn image_digest(&self) -> [u8; 32] {
         self.physical_hasher.clone().finalize().into()
+    }
+
+    /// Build the runtime cursor only from a self-consistent, installed Active
+    /// image. In particular, never reset the segment ticket sequence to zero
+    /// or derive its append offset from the pre-normalization source tail.
+    pub(crate) fn runtime_seed(&self) -> Result<WalV7RuntimeSeed> {
+        let descriptor = WalFormatDescriptor::for_version(WAL_FORMAT_VERSION_V7)
+            .context("v7 WAL format descriptor is missing")?;
+        ensure!(
+            descriptor.framing == WalFraming::EmbeddedFrontier
+                && descriptor.alignment == WAL_V7_FRAME_LEN,
+            "v7 WAL format descriptor disagrees with its runtime framing"
+        );
+        let data_start =
+            u64::try_from(descriptor.data_start).context("v7 DATA start exceeds u64")?;
+
+        self.active_boundary.validate()?;
+        ensure!(
+            self.image_len == self.append_offset
+                && self.image_len <= MAX_WAL_FILE_SIZE
+                && self.image_len >= data_start
+                && self.image_len.is_multiple_of(WAL_V7_FRAME_LEN as u64),
+            "installed v7 image has an invalid append offset"
+        );
+        let expected_image_len = self
+            .frontier_offset
+            .checked_add(WAL_V7_FRAME_LEN as u64)
+            .context("installed v7 frontier end overflows")?;
+        ensure!(
+            self.frontier_offset == self.active_boundary.durable_end
+                && expected_image_len == self.image_len,
+            "installed v7 recovery frontier is not the final image frame"
+        );
+        ensure!(
+            self.frontier.ticket_end == self.next_ticket
+                && self.active_boundary.ticket_end == self.next_ticket
+                && self.frontier.durable_end == self.active_boundary.durable_end
+                && self.frontier.last_commit_ts == self.active_boundary.last_commit_ts
+                && self.frontier.prefix_digest == self.active_boundary.prefix_digest,
+            "installed v7 frontier disagrees with its logical boundary"
+        );
+
+        if self.next_ticket == 0 {
+            ensure!(
+                self.frontier.generation == 0
+                    && self.frontier_offset == WAL_V7_HEADER_LEN as u64
+                    && self.frontier.last_commit_ts == 0
+                    && self.batches.is_empty()
+                    && self.seal_index.is_empty(),
+                "empty installed v7 image has noncanonical runtime state"
+            );
+        } else {
+            let previous_frontier_end = self
+                .frontier
+                .previous_frontier_offset
+                .checked_add(WAL_V7_FRAME_LEN as u64)
+                .context("installed v7 predecessor end overflows")?;
+            ensure!(
+                self.frontier.generation > 0
+                    && self.frontier_offset >= data_start
+                    && previous_frontier_end <= self.frontier_offset
+                    && u64::try_from(self.batches.len()).ok() == Some(self.next_ticket)
+                    && u64::try_from(self.seal_index.len()).ok() == Some(self.next_ticket)
+                    && self.batches.last().map(|batch| batch.commit_ts)
+                        == Some(self.frontier.last_commit_ts),
+                "nonempty installed v7 image has inconsistent runtime cursors"
+            );
+        }
+
+        Ok(WalV7RuntimeSeed {
+            data_start,
+            append_offset: self.append_offset,
+            next_ticket: self.next_ticket,
+        })
     }
 }
 
@@ -1110,7 +1197,7 @@ mod tests {
         let path = directory.0.join("active.wal");
         let (header, anchor) = create_nonempty_image(&path)?;
 
-        let recovered = recover_and_install_active(
+        let mut recovered = recover_and_install_active(
             &path,
             WalV7RecoveryAuthority::Active {
                 predecessor: header.predecessor,
@@ -1131,6 +1218,13 @@ mod tests {
             }]
         );
         assert_eq!(fs::metadata(&path)?.len(), recovered.installed.image_len);
+
+        let seed = recovered.installed.runtime_seed()?;
+        assert_eq!(seed.data_start, 2 * FRAME_LEN_U64);
+        assert_eq!(seed.append_offset, recovered.installed.image_len);
+        assert_eq!(seed.next_ticket, 1);
+        recovered.installed.append_offset += FRAME_LEN_U64;
+        assert!(recovered.installed.runtime_seed().is_err());
 
         Ok(())
     }
@@ -1321,6 +1415,10 @@ mod tests {
         assert!(installed.batches.is_empty());
         assert!(installed.seal_index.is_empty());
         assert_eq!(fs::read(&path)?.len(), installed.image_len as usize);
+        let seed = installed.runtime_seed()?;
+        assert_eq!(seed.data_start, 2 * FRAME_LEN_U64);
+        assert_eq!(seed.append_offset, 2 * FRAME_LEN_U64);
+        assert_eq!(seed.next_ticket, 0);
         Ok(())
     }
 

@@ -1,4 +1,4 @@
-//! Runtime admission, ordered packing, and durability coordination for v4 WALs.
+//! Runtime admission, ordered packing, and durability coordination for parallel WALs.
 
 use std::{
     collections::{BTreeMap, VecDeque},
@@ -10,6 +10,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use crate::wal::v7::install::WalV7RuntimeSeed;
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
 use crossbeam_queue::ArrayQueue;
@@ -47,6 +48,61 @@ impl std::fmt::Display for WalFull {
 }
 
 impl std::error::Error for WalFull {}
+
+/// Coordinates from which a parallel runtime begins admission.
+///
+/// A v7 runtime is deliberately constructed paused: until later runtime slices
+/// install its marker writer and live resource reservations, it must not admit
+/// v4-shaped writes or allocate speculative extents.
+pub(crate) struct ParallelWalRuntimeStart {
+    append_offset: u64,
+    next_ticket: u64,
+    min_append_offset: u64,
+    admission_open: bool,
+    initialize_extents: bool,
+    prewarm_buffers: bool,
+}
+
+impl ParallelWalRuntimeStart {
+    pub(crate) fn v4(append_offset: u64) -> Result<Self> {
+        let start = Self {
+            append_offset,
+            next_ticket: 0,
+            min_append_offset: WAL_HEADER_END,
+            admission_open: true,
+            initialize_extents: true,
+            prewarm_buffers: true,
+        };
+        start.validate()?;
+        Ok(start)
+    }
+
+    #[allow(dead_code)] // Production v7 open wiring follows in a later runtime slice.
+    pub(crate) fn v7(seed: WalV7RuntimeSeed) -> Result<Self> {
+        let start = Self {
+            append_offset: seed.append_offset,
+            next_ticket: seed.next_ticket,
+            min_append_offset: seed.data_start,
+            admission_open: false,
+            initialize_extents: false,
+            prewarm_buffers: false,
+        };
+        start.validate()?;
+        Ok(start)
+    }
+
+    fn validate(&self) -> Result<()> {
+        ensure!(
+            self.min_append_offset >= WAL_HEADER_END
+                && self.min_append_offset.is_multiple_of(4096)
+                && (self.min_append_offset..=MAX_WAL_FILE_SIZE).contains(&self.append_offset)
+                && self.append_offset.is_multiple_of(4096),
+            "invalid initial WAL append offset {}",
+            self.append_offset
+        );
+        Ok(())
+    }
+}
 
 #[derive(Debug)]
 struct BufferBudget {
@@ -305,6 +361,8 @@ struct AdmissionState {
     open: bool,
     close_cutoff: Option<u64>,
     poison: Option<(u64, String)>,
+    #[cfg(feature = "bench")]
+    initial_ticket: u64,
     next_ticket: u64,
     admitted_end: u64,
     queue: VecDeque<AdmittedBatch>,
@@ -518,23 +576,28 @@ impl ParallelWalRuntime {
         worker_file: Arc<File>,
         sync_file: Arc<File>,
         preallocator: Arc<File>,
-        initial_file_end: u64,
+        start: ParallelWalRuntimeStart,
     ) -> Result<Self> {
+        start.validate()?;
+        let initial_file_end = start.append_offset;
+
         ensure!(
-            (WAL_HEADER_END..=MAX_WAL_FILE_SIZE).contains(&initial_file_end),
+            (start.min_append_offset..=MAX_WAL_FILE_SIZE).contains(&initial_file_end),
             "invalid initial WAL append offset {initial_file_end}"
         );
 
         let buffer_budget = Arc::new(BufferBudget::new());
         let buffer_pool = Arc::new(ArrayQueue::new(BUFFER_POOL_CAPACITY));
-        for _ in 0..BUFFER_POOL_CAPACITY {
-            let _ = buffer_pool.push(ParallelBuffer::pooled(
-                DirectBuf::new(BUFFER_POOL_BUF_SIZE),
-                Arc::clone(&buffer_budget),
-            ));
+        if start.prewarm_buffers {
+            for _ in 0..BUFFER_POOL_CAPACITY {
+                let _ = buffer_pool.push(ParallelBuffer::pooled(
+                    DirectBuf::new(BUFFER_POOL_BUF_SIZE),
+                    Arc::clone(&buffer_budget),
+                ));
+            }
         }
 
-        let initializer = if is_ext_filesystem(&preallocator) {
+        let initializer = if start.initialize_extents && is_ext_filesystem(&preallocator) {
             Some(ExtentInitializer::spawn(
                 Arc::clone(&preallocator),
                 initial_file_end,
@@ -545,25 +608,32 @@ impl ParallelWalRuntime {
         let mut worker = IoWorker::spawn(worker_file, Arc::clone(&buffer_pool))?;
         let worker_client = worker.client();
         let sync_progress = worker.sync_progress();
+        sync_progress.initialize_frontiers(start.next_ticket);
         let worker_completions = worker.take_completions();
         let packer_failures_tx = worker.failure_sender();
         let durability = Arc::new(DurabilityShared {
-            state: Mutex::new(DurabilityState::default()),
+            state: Mutex::new(DurabilityState {
+                written_frontier: start.next_ticket,
+                durable_frontier: start.next_ticket,
+                ..DurabilityState::default()
+            }),
             changed: Condvar::new(),
             async_changed: tokio::sync::Notify::new(),
         });
         let (packer_wake, packer_requests) = crossbeam_channel::bounded(1);
         let inner = Arc::new(RuntimeInner {
             admission: Mutex::new(AdmissionState {
-                open: true,
+                open: start.admission_open,
                 close_cutoff: None,
                 poison: None,
-                next_ticket: 0,
+                #[cfg(feature = "bench")]
+                initial_ticket: start.next_ticket,
+                next_ticket: start.next_ticket,
                 admitted_end: initial_file_end,
                 queue: VecDeque::new(),
             }),
             packer_state: Mutex::new(PackerState {
-                next_ticket: 0,
+                next_ticket: start.next_ticket,
                 reserved_end: initial_file_end,
                 preallocated_end: initial_file_end,
                 initializer,
@@ -815,7 +885,7 @@ impl ParallelWalRuntime {
         validate_sync_diagnostics_transition(
             enabled,
             profile.wal_sync_diagnostics_enabled(),
-            admission.next_ticket,
+            admission.next_ticket != admission.initial_ticket,
         )?;
         profile.set_wal_sync_diagnostics_enabled(enabled);
         Ok(())
@@ -1363,10 +1433,10 @@ fn set_poison(state: &mut DurabilityState, ticket: u64, error: String) {
 fn validate_sync_diagnostics_transition(
     enabled: bool,
     currently_enabled: bool,
-    next_ticket: u64,
+    has_admitted_ticket: bool,
 ) -> Result<()> {
     ensure!(
-        !enabled || currently_enabled || next_ticket == 0,
+        !enabled || currently_enabled || !has_admitted_ticket,
         "WAL sync diagnostics must be enabled before the first WAL ticket"
     );
     Ok(())
@@ -1559,6 +1629,91 @@ fn round_up(value: u64, alignment: u64) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn recovered_v7_runtime_keeps_its_ticket_and_append_cursors_paused() {
+        use std::{fs::File, os::unix::fs::OpenOptionsExt, sync::Arc};
+
+        use super::{ParallelWalRuntime, ParallelWalRuntimeStart};
+        use crate::{
+            tests::harness::is_io_uring_unavailable_error, wal::v7::install::WalV7RuntimeSeed,
+        };
+
+        const DATA_START: u64 = 2 * 4096;
+        const APPEND_OFFSET: u64 = 4 * 4096;
+        const NEXT_TICKET: u64 = 7;
+
+        let directory = tempfile::tempdir().expect("create WAL directory");
+        let path = directory.path().join("recovered-v7.wal");
+        let file = File::create(&path).expect("create recovered WAL image");
+        file.set_len(APPEND_OFFSET)
+            .expect("size recovered WAL image");
+        drop(file);
+
+        let direct_file = File::options()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_DIRECT)
+            .open(&path)
+            .expect("open recovered WAL with direct I/O");
+        let direct_file = Arc::new(direct_file);
+        let start = ParallelWalRuntimeStart::v7(WalV7RuntimeSeed {
+            data_start: DATA_START,
+            append_offset: APPEND_OFFSET,
+            next_ticket: NEXT_TICKET,
+        })
+        .expect("validate recovered runtime cursor");
+        let runtime = match ParallelWalRuntime::spawn(
+            Arc::clone(&direct_file),
+            Arc::clone(&direct_file),
+            direct_file,
+            start,
+        ) {
+            Ok(runtime) => runtime,
+            Err(error) if is_io_uring_unavailable_error(&error) => {
+                eprintln!("skipping test (io_uring unavailable): {error:#}");
+                return;
+            }
+            Err(error) => panic!("failed to start recovered v7 runtime: {error:#}"),
+        };
+
+        {
+            let admission = runtime.inner.admission.lock();
+            assert!(!admission.open);
+            assert_eq!(admission.next_ticket, NEXT_TICKET);
+            assert_eq!(admission.admitted_end, APPEND_OFFSET);
+        }
+        {
+            let packer = runtime.inner.packer_state.lock();
+            assert_eq!(packer.next_ticket, NEXT_TICKET);
+            assert_eq!(packer.reserved_end, APPEND_OFFSET);
+            assert_eq!(packer.preallocated_end, APPEND_OFFSET);
+            assert!(packer.initializer.is_none());
+        }
+        {
+            let durability = runtime.inner.durability.state.lock();
+            assert_eq!(durability.written_frontier, NEXT_TICKET);
+            assert_eq!(durability.durable_frontier, NEXT_TICKET);
+        }
+        assert!(runtime.inner.buffer_pool.is_empty());
+        assert_eq!(
+            std::fs::metadata(&path)
+                .expect("inspect recovered WAL image")
+                .len(),
+            APPEND_OFFSET
+        );
+        #[cfg(feature = "bench")]
+        {
+            let profile = crate::mem_table::WriteProfile::default();
+            runtime
+                .set_wal_sync_diagnostics_enabled(&profile, true)
+                .expect("enable diagnostics before any post-recovery ticket is admitted");
+            assert!(profile.wal_sync_diagnostics_enabled());
+        }
+        assert!(runtime.wait_durable(NEXT_TICKET - 1).is_ok());
+        assert!(runtime.wait_durable(NEXT_TICKET).is_err());
+        runtime.close().expect("close paused recovered runtime");
+    }
+
     #[test]
     fn admitted_ticket_keeps_its_outcome_when_later_group_packing_fails() {
         use std::{sync::Arc, thread, time::Duration};
@@ -1900,6 +2055,8 @@ mod tests {
             open: true,
             close_cutoff: None,
             poison: None,
+            #[cfg(feature = "bench")]
+            initial_ticket: 0,
             next_ticket: 4,
             admitted_end: WAL_HEADER_END + 3 * large as u64 + 4096,
             queue: std::collections::VecDeque::from([
@@ -1936,6 +2093,8 @@ mod tests {
             open: false,
             close_cutoff: Some(4),
             poison: Some((3, "write failure".to_owned())),
+            #[cfg(feature = "bench")]
+            initial_ticket: 0,
             next_ticket: 4,
             admitted_end: WAL_HEADER_END + 4 * 4096,
             queue: std::collections::VecDeque::from([
@@ -2073,10 +2232,10 @@ mod tests {
     #[cfg(feature = "bench")]
     #[test]
     fn sync_diagnostics_can_only_be_enabled_before_wal_admission() {
-        assert!(validate_sync_diagnostics_transition(false, false, 10).is_ok());
-        assert!(validate_sync_diagnostics_transition(true, false, 0).is_ok());
-        assert!(validate_sync_diagnostics_transition(true, true, 10).is_ok());
-        assert!(validate_sync_diagnostics_transition(true, false, 10).is_err());
+        assert!(validate_sync_diagnostics_transition(false, false, true).is_ok());
+        assert!(validate_sync_diagnostics_transition(true, false, false).is_ok());
+        assert!(validate_sync_diagnostics_transition(true, true, true).is_ok());
+        assert!(validate_sync_diagnostics_transition(true, false, true).is_err());
     }
 
     #[test]
