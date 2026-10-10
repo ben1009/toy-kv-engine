@@ -7,6 +7,273 @@ use crate::{
     manifest::{MANIFEST_FORMAT_VERSION, Manifest, ManifestRecord},
 };
 
+fn empty_manifest_snapshot(next_sst_id: usize) -> ManifestRecord {
+    ManifestRecord::Snapshot {
+        l0_sstables: vec![],
+        levels: vec![],
+        range_only_ssts: vec![],
+        next_sst_id,
+        vlog_references: vec![],
+        imm_memtable_ids: vec![],
+        pitr_memtable_segments: vec![],
+        active_compaction_filters: vec![],
+        next_compaction_filter_id: 0,
+        format_version: MANIFEST_FORMAT_VERSION,
+        immutable_file_metadata: vec![],
+        pitr_state: Some(crate::pitr::manifest::PitrState::default()),
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn failpoint_manifest_recovery_rewrites_uncertain_stream_on_a_fresh_inode() {
+    use std::os::unix::fs::MetadataExt;
+
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("MANIFEST");
+    let manifest = Manifest::create(&path).unwrap();
+    manifest
+        .add_record_when_init(ManifestRecord::FormatVersion(MANIFEST_FORMAT_VERSION))
+        .unwrap();
+    crate::manifest::set_manifest_sync_failure(&path);
+    assert!(
+        manifest
+            .add_record_when_init(ManifestRecord::NewMemtable(1))
+            .is_err()
+    );
+    let accepted_bytes = std::fs::read(&path).unwrap();
+    let old_file = std::fs::File::open(&path).unwrap();
+    drop(manifest);
+
+    let (recovered, records) = Manifest::recover(&path).unwrap();
+    assert_ne!(
+        old_file.metadata().unwrap().ino(),
+        std::fs::metadata(&path).unwrap().ino(),
+        "recovery must rewrite bytes rather than retry sync on the old inode"
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), accepted_bytes);
+    assert!(matches!(
+        records.as_slice(),
+        [
+            ManifestRecord::FormatVersion(_),
+            ManifestRecord::NewMemtable(1)
+        ]
+    ));
+    recovered
+        .add_record_when_init(ManifestRecord::NewMemtable(2))
+        .unwrap();
+    drop(recovered);
+    let (_, records) = Manifest::recover(&path).unwrap();
+    assert!(matches!(
+        records.as_slice(),
+        [
+            ManifestRecord::FormatVersion(_),
+            ManifestRecord::NewMemtable(1),
+            ManifestRecord::NewMemtable(2)
+        ]
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn failpoint_manifest_recovery_sync_failure_preserves_original_stream() {
+    use std::os::unix::fs::MetadataExt;
+
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("MANIFEST");
+    let manifest = Manifest::create(&path).unwrap();
+    manifest
+        .add_record_when_init(ManifestRecord::FormatVersion(MANIFEST_FORMAT_VERSION))
+        .unwrap();
+    let bytes = std::fs::read(&path).unwrap();
+    let old_file = std::fs::File::open(&path).unwrap();
+    drop(manifest);
+
+    crate::manifest::set_manifest_sync_failure(&path);
+    assert!(Manifest::recover(&path).is_err());
+    assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    assert_eq!(
+        old_file.metadata().unwrap().ino(),
+        std::fs::metadata(&path).unwrap().ino()
+    );
+    let (_, records) = Manifest::recover(&path).unwrap();
+    assert!(matches!(
+        records.as_slice(),
+        [ManifestRecord::FormatVersion(_)]
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn manifest_recovery_rewrites_snapshot_and_preserves_exact_suffix() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    for pending in [false, true] {
+        let dir = tempdir().unwrap();
+        let manifest_path = dir.path().join("MANIFEST");
+        let snapshot_path = dir.path().join("ENGINE_MANIFEST");
+        let source_path = if pending {
+            snapshot_path.with_extension("tmp")
+        } else {
+            snapshot_path.clone()
+        };
+        let snapshot_bytes = serde_json::to_vec_pretty(&empty_manifest_snapshot(4)).unwrap();
+        std::fs::write(&source_path, &snapshot_bytes).unwrap();
+        std::fs::set_permissions(&source_path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let old_snapshot = std::fs::File::open(&source_path).unwrap();
+        let suffix = if pending {
+            vec![]
+        } else {
+            let mut bytes = serde_json::to_vec_pretty(&ManifestRecord::NewMemtable(4)).unwrap();
+            bytes.push(b'\n');
+            bytes
+        };
+        // Missing MANIFEST is also allowed after a pending snapshot handoff.
+        if !pending {
+            std::fs::write(&manifest_path, &suffix).unwrap();
+        }
+        std::fs::write(manifest_path.with_extension("recover"), b"stale scratch").unwrap();
+        std::fs::write(snapshot_path.with_extension("recover"), b"stale scratch").unwrap();
+
+        let (manifest, records) = Manifest::recover(&manifest_path).unwrap();
+        assert_ne!(
+            old_snapshot.metadata().unwrap().ino(),
+            std::fs::metadata(&snapshot_path).unwrap().ino()
+        );
+        assert_eq!(std::fs::read(&snapshot_path).unwrap(), snapshot_bytes);
+        assert_eq!(
+            std::fs::metadata(&snapshot_path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o640
+        );
+        assert_eq!(std::fs::read(&manifest_path).unwrap(), suffix);
+        assert!(matches!(
+            &records[0],
+            ManifestRecord::Snapshot { next_sst_id: 4, .. }
+        ));
+        assert_eq!(records.len(), if pending { 1 } else { 2 });
+        assert!(!snapshot_path.with_extension("tmp").exists());
+        assert!(!snapshot_path.with_extension("recover").exists());
+        assert!(!manifest_path.with_extension("recover").exists());
+        manifest
+            .add_record_when_init(ManifestRecord::NewMemtable(5))
+            .unwrap();
+        drop(manifest);
+        let (_, records) = Manifest::recover(&manifest_path).unwrap();
+        assert!(matches!(
+            records.last(),
+            Some(ManifestRecord::NewMemtable(5))
+        ));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn failpoint_manifest_snapshot_recovery_sync_failure_preserves_authoritative_files() {
+    use std::os::unix::fs::MetadataExt;
+
+    for pending in [false, true] {
+        let dir = tempdir().unwrap();
+        let manifest_path = dir.path().join("MANIFEST");
+        let snapshot_path = dir.path().join("ENGINE_MANIFEST");
+        let source_path = if pending {
+            snapshot_path.with_extension("tmp")
+        } else {
+            snapshot_path.clone()
+        };
+        let snapshot_bytes = serde_json::to_vec(&empty_manifest_snapshot(4)).unwrap();
+        std::fs::write(&source_path, &snapshot_bytes).unwrap();
+        std::fs::write(&manifest_path, b"").unwrap();
+        let old_snapshot = std::fs::File::open(&source_path).unwrap();
+        crate::manifest::set_manifest_sync_failure(&source_path);
+
+        assert!(Manifest::recover(&manifest_path).is_err());
+        assert_eq!(std::fs::read(&source_path).unwrap(), snapshot_bytes);
+        assert_eq!(
+            old_snapshot.metadata().unwrap().ino(),
+            std::fs::metadata(&source_path).unwrap().ino()
+        );
+        assert!(std::fs::read(&manifest_path).unwrap().is_empty());
+        if pending {
+            assert!(!snapshot_path.exists());
+        }
+        let (_, records) = Manifest::recover(&manifest_path).unwrap();
+        assert!(matches!(
+            records.as_slice(),
+            [ManifestRecord::Snapshot { next_sst_id: 4, .. }]
+        ));
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn manifest_recovery_crash_retries_exact_snapshot_and_suffix() {
+    if let Some(path) = std::env::var_os("PITR_MANIFEST_RECOVERY_CHILD_PATH") {
+        Manifest::recover(path).unwrap();
+        unreachable!("child must exit during manifest recovery");
+    }
+    for (target, pending) in [
+        ("MANIFEST", false),
+        ("ENGINE_MANIFEST", false),
+        ("MANIFEST", true),
+        ("ENGINE_MANIFEST.tmp", true),
+    ] {
+        for boundary in [
+            "PITR_PROCESS_KILL_AFTER_MANIFEST_RECOVERY_SYNC",
+            "PITR_PROCESS_KILL_AFTER_MANIFEST_RECOVERY_RENAME",
+        ] {
+            let dir = tempdir().unwrap();
+            let manifest_path = dir.path().join("MANIFEST");
+            let snapshot_path = dir.path().join("ENGINE_MANIFEST");
+            let source_path = if pending {
+                snapshot_path.with_extension("tmp")
+            } else {
+                snapshot_path.clone()
+            };
+            let snapshot_bytes = serde_json::to_vec(&empty_manifest_snapshot(4)).unwrap();
+            std::fs::write(&source_path, &snapshot_bytes).unwrap();
+            let old_snapshot_bytes = serde_json::to_vec(&empty_manifest_snapshot(2)).unwrap();
+            if pending {
+                std::fs::write(&snapshot_path, &old_snapshot_bytes).unwrap();
+            }
+            let suffix = if pending {
+                vec![]
+            } else {
+                serde_json::to_vec(&ManifestRecord::NewMemtable(4)).unwrap()
+            };
+            std::fs::write(&manifest_path, &suffix).unwrap();
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .arg("--exact")
+                .arg("tests::manifest::manifest_recovery_crash_retries_exact_snapshot_and_suffix")
+                .arg("--nocapture")
+                .env("PITR_MANIFEST_RECOVERY_CHILD_PATH", &manifest_path)
+                .env(boundary, dir.path().join(target))
+                .status()
+                .unwrap();
+            assert_eq!(status.code(), Some(137));
+            if pending {
+                assert_eq!(
+                    std::fs::read(&snapshot_path).unwrap(),
+                    old_snapshot_bytes,
+                    "pending snapshot must not be promoted before MANIFEST is durable"
+                );
+                assert!(source_path.exists());
+            }
+            let (_, records) = Manifest::recover(&manifest_path).unwrap();
+            assert_eq!(std::fs::read(&snapshot_path).unwrap(), snapshot_bytes);
+            assert_eq!(std::fs::read(&manifest_path).unwrap(), suffix);
+            assert!(matches!(
+                &records[0],
+                ManifestRecord::Snapshot { next_sst_id: 4, .. }
+            ));
+            assert_eq!(records.len(), if pending { 1 } else { 2 });
+        }
+    }
+}
+
 /// A fresh database must write FormatVersion as the first manifest record.
 #[test]
 fn test_fresh_db_writes_format_version() {

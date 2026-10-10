@@ -111,7 +111,7 @@ impl std::fmt::Display for PitrManifestPublicationError {
                 write!(
                     formatter,
                     "PITR manifest published but not durable: {error}; write admission stays \
-                     closed, call resume_pitr to finish the transition"
+                     closed, reopen the database and call resume_pitr to finish the transition"
                 )
             }
             Self::Unknown {
@@ -2460,7 +2460,8 @@ impl KvEngine {
                 // This retries durability for a transition already published in
                 // memory and in the manifest stream. A failed sync is not proof
                 // that another sync on this handle can settle it; keep the
-                // reservation deferred until reopen replays and syncs the stream.
+                // reservation deferred until reopen rewrites and syncs the
+                // accepted manifest bytes before replaying the transition.
                 drop(state_lock);
                 *self.inner.pitr_state.lock() = state.clone();
                 *self.pitr_manifest_state.lock() = state;
@@ -11840,6 +11841,17 @@ impl LsmStorageInner {
         Ok(())
     }
 
+    fn ensure_memtable_rotation_healthy(&self) -> Result<()> {
+        if let Some(mvcc) = &self.mvcc {
+            mvcc.ensure_publication_healthy()?;
+        }
+        if let Some(manifest) = &self.manifest {
+            manifest.ensure_durability_certain()?;
+        }
+
+        Ok(())
+    }
+
     fn force_freeze_with_new_memtable_locked(
         &self,
         new_memtable: mem_table::MemTable,
@@ -11848,9 +11860,7 @@ impl LsmStorageInner {
         // Drained native leases may have ended through cancellation. A healthy
         // WAL alone does not prove all memtable entries became visible; keep
         // the active WAL for recovery instead of persisting that hidden data.
-        if let Some(mvcc) = &self.mvcc {
-            mvcc.ensure_publication_healthy()?;
-        }
+        self.ensure_memtable_rotation_healthy()?;
         let mut state = self.state.load().as_ref().clone();
         // The active write guard waits for existing writers to finish WAL
         // durability and MVCC publication. Keep the immutable data and WAL,
@@ -11971,9 +11981,7 @@ impl LsmStorageInner {
     ) -> Result<()> {
         // Reject poison before allocating a successor WAL. The central swap
         // repeats this check for callers that supply their own successor.
-        if let Some(mvcc) = &self.mvcc {
-            mvcc.ensure_publication_healthy()?;
-        }
+        self.ensure_memtable_rotation_healthy()?;
         let sst_id = self.next_sst_id();
         let vlog_enabled = self.vlog.is_some();
         let mem_table = if self.options.enable_wal {
@@ -12042,8 +12050,6 @@ impl LsmStorageInner {
         // segment WAL for it would leave that claim unreachable — or, worse,
         // hand the memtable someone else's segment on the next open.
         let pitr_segment_id = Self::pitr_segment_of(&mem_table);
-        self.force_freeze_with_new_memtable_locked(mem_table, active_memtable_guard)?;
-
         self.sync_dir()?;
 
         // A memtable created without a WAL is not recoverable, so recording it
@@ -12062,6 +12068,9 @@ impl LsmStorageInner {
                 .expect("manifest initialized")
                 .add_record(_state_lock_observer, record)?;
         }
+        // Registration must be durable before a writer can reach the successor.
+        // On an append/sync failure, keep writing to the registered active WAL.
+        self.force_freeze_with_new_memtable_locked(mem_table, active_memtable_guard)?;
         if let Some(segment_id) = pitr_segment_id {
             self.pitr_next_segment_id
                 .fetch_max(segment_id.saturating_add(1), Ordering::AcqRel);
@@ -12076,6 +12085,7 @@ impl LsmStorageInner {
         state_lock: &MutexGuard<'_, ()>,
     ) -> Result<()> {
         ensure!(self.options.enable_wal, "PITR successor requires WAL");
+        self.ensure_memtable_rotation_healthy()?;
         let sst_id = self.next_sst_id();
         let memtable = mem_table::MemTable::create_with_wal_v5(
             sst_id,
@@ -12090,7 +12100,6 @@ impl LsmStorageInner {
         }
         memtable.set_write_profile(self.write_profile.clone());
         let active_guard = self.active_memtable_lock.write();
-        self.force_freeze_with_new_memtable_locked(memtable, &active_guard)?;
         self.sync_dir()?;
         self.manifest
             .as_ref()
@@ -12102,6 +12111,7 @@ impl LsmStorageInner {
                     segment_id: header.segment_id.0,
                 },
             )?;
+        self.force_freeze_with_new_memtable_locked(memtable, &active_guard)?;
         self.pitr_next_segment_id
             .fetch_max(header.segment_id.0.saturating_add(1), Ordering::AcqRel);
 
@@ -12112,6 +12122,7 @@ impl LsmStorageInner {
     fn install_post_pitr_wal(&self) -> Result<()> {
         ensure!(self.options.enable_wal, "PITR disable requires WAL");
         let state_lock = self.state_lock.lock();
+        self.ensure_memtable_rotation_healthy()?;
         let sst_id = self.next_sst_id();
         let memtable = mem_table::MemTable::create_with_wal_and_mode(
             sst_id,
@@ -12121,12 +12132,12 @@ impl LsmStorageInner {
         )?;
         memtable.set_write_profile(self.write_profile.clone());
         let active_guard = self.active_memtable_lock.write();
-        self.force_freeze_with_new_memtable_locked(memtable, &active_guard)?;
         self.sync_dir()?;
         self.manifest
             .as_ref()
             .ok_or_else(|| anyhow!("manifest is not initialized"))?
             .add_record(&state_lock, ManifestRecord::NewMemtable(sst_id))?;
+        self.force_freeze_with_new_memtable_locked(memtable, &active_guard)?;
 
         Ok(())
     }
@@ -12499,6 +12510,160 @@ mod tests {
         )));
         assert_eq!(error.kind(), std::io::ErrorKind::StorageFull);
         assert_eq!(error.raw_os_error(), Some(libc::ENOSPC));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn failpoint_poisoned_manifest_freeze_keeps_registered_memtable() {
+        let dir = tempdir().unwrap();
+        let options = LsmStorageOptions {
+            enable_wal: true,
+            ..LsmStorageOptions::default_for_test()
+        };
+        let engine = KvEngine::open(&dir, options.clone()).unwrap();
+        engine.inner.ensure_manifest_v7().unwrap();
+        engine.put(b"before-error", b"value").unwrap();
+        let active_id = engine.inner.state.load().memtable.id();
+
+        crate::manifest::set_manifest_sync_failure(&dir.path().join("MANIFEST"));
+        assert!(engine.inner.force_flush().is_err());
+        assert!(
+            engine
+                .inner
+                .force_freeze_memtable(&engine.inner.state_lock.lock())
+                .is_err()
+        );
+        assert_eq!(engine.inner.state.load().memtable.id(), active_id);
+        engine.put(b"after-error", b"value").unwrap();
+        engine.close_storage().unwrap();
+        drop(engine);
+
+        let reopened = KvEngine::open(&dir, options).unwrap();
+        assert!(reopened.get(b"before-error").unwrap().is_some());
+        assert!(reopened.get(b"after-error").unwrap().is_some());
+        reopened.close_storage().unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn failpoint_failed_successor_registration_keeps_registered_memtable() {
+        for post_pitr in [false, true] {
+            let dir = tempdir().unwrap();
+            let options = LsmStorageOptions {
+                enable_wal: true,
+                ..LsmStorageOptions::default_for_test()
+            };
+            let engine = KvEngine::open(&dir, options.clone()).unwrap();
+            engine.put(b"before-error", b"value").unwrap();
+            let active_id = engine.inner.state.load().memtable.id();
+
+            crate::manifest::set_manifest_sync_failure(&dir.path().join("MANIFEST"));
+            let result = if post_pitr {
+                engine.inner.install_post_pitr_wal()
+            } else {
+                engine
+                    .inner
+                    .force_freeze_memtable(&engine.inner.state_lock.lock())
+            };
+            assert!(result.is_err());
+            assert_eq!(engine.inner.state.load().memtable.id(), active_id);
+            let next_sst_id = engine
+                .inner
+                .next_sst_id
+                .load(std::sync::atomic::Ordering::Acquire);
+            assert!(engine.inner.install_post_pitr_wal().is_err());
+            assert_eq!(
+                engine
+                    .inner
+                    .next_sst_id
+                    .load(std::sync::atomic::Ordering::Acquire),
+                next_sst_id,
+                "known manifest poison must be checked before allocating a successor"
+            );
+            engine.put(b"after-error", b"value").unwrap();
+            engine.close_storage().unwrap();
+            drop(engine);
+
+            let reopened = KvEngine::open(&dir, options).unwrap();
+            assert!(reopened.get(b"before-error").unwrap().is_some());
+            assert!(reopened.get(b"after-error").unwrap().is_some());
+            reopened.close_storage().unwrap();
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn failpoint_failed_pitr_successor_registration_preserves_active_until_reopen() {
+        let dir = tempdir().unwrap();
+        let options = LsmStorageOptions {
+            enable_wal: true,
+            ..LsmStorageOptions::default_for_test()
+        };
+        let engine = KvEngine::open(&dir, options.clone()).unwrap();
+        engine.put(b"before-error", b"value").unwrap();
+        let active_id = engine.inner.state.load().memtable.id();
+        let mut coordinator = crate::pitr::enable::PitrEnableCoordinator::default();
+        coordinator
+            .begin_enable_with_identities(
+                crate::pitr::enable::PitrEnableRequest {
+                    repository_id: [1; 16],
+                    config: crate::pitr::manifest::PersistedPitrConfig {
+                        archive_interval_ms: 1000,
+                        max_segment_bytes: 8192,
+                        max_unarchived_bytes: 8192,
+                        max_source_spool_bytes: 16384,
+                    },
+                },
+                [2; 16],
+                [3; 16],
+            )
+            .unwrap();
+        engine
+            .persist_pitr_lifecycle(coordinator.records(), coordinator.state().clone())
+            .unwrap();
+        let header = crate::pitr::WalV5Header {
+            wal_format_version: crate::pitr::WAL_V5_VERSION,
+            timeline_id: crate::pitr::TimelineId([2; 16]),
+            archive_epoch_id: crate::pitr::ArchiveEpochId([3; 16]),
+            segment_id: crate::pitr::SegmentId(0),
+            predecessor: crate::pitr::ChainAnchor::Genesis {
+                archive_epoch_id: crate::pitr::ArchiveEpochId([3; 16]),
+            },
+        };
+        crate::manifest::set_manifest_sync_failure(&dir.path().join("MANIFEST"));
+        assert!(
+            engine
+                .inner
+                .install_pitr_v5_successor(header, &engine.inner.state_lock.lock())
+                .is_err()
+        );
+        assert_eq!(engine.inner.state.load().memtable.id(), active_id);
+        let next_sst_id = engine
+            .inner
+            .next_sst_id
+            .load(std::sync::atomic::Ordering::Acquire);
+        assert!(
+            engine
+                .inner
+                .install_pitr_v5_successor(header, &engine.inner.state_lock.lock())
+                .is_err()
+        );
+        assert_eq!(
+            engine
+                .inner
+                .next_sst_id
+                .load(std::sync::atomic::Ordering::Acquire),
+            next_sst_id
+        );
+        assert!(engine.put(b"blocked", b"value").is_err());
+        engine.close_storage().unwrap();
+        drop(engine);
+
+        let reopened = KvEngine::open(&dir, options).unwrap();
+        assert!(reopened.get(b"before-error").unwrap().is_some());
+        assert!(reopened.inner.state.load().memtable.uses_wal_v5());
+        assert!(reopened.put(b"still-blocked", b"value").is_err());
+        reopened.close_storage().unwrap();
     }
 
     fn put_records(count: usize) -> Vec<WriteBatchRecord<Vec<u8>>> {

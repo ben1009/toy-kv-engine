@@ -19,10 +19,14 @@ Live segment lifecycle reconstruction is now wired before PITR runtime attach.
 Reconciliation updates the recovered bookkeeping after successful manifest
 sync, releases reclaimed source charges, and consumes completed sealing's
 pending successor reservation while preserving live pins and reservations.
-If a failed sync has already advanced the manifest projection, a retry retains
-the pending bookkeeping and directly syncs the existing manifest before applying
-it when no new lifecycle transitions remain. This retry does not append a PITR
-snapshot or change the manifest record stream.
+If a failed sync has already advanced the manifest projection, the poisoned
+manifest handle rejects further mutation or sync, and retries retain the pending
+bookkeeping until reopen. Recovery rewrites the exact accepted snapshot and
+manifest bytes to fresh inodes, syncs them, atomically replaces their paths, and
+syncs the directory before exposing replayed state. Reconciliation then applies
+the recovered bookkeeping without appending duplicate lifecycle records or a
+PITR snapshot. Successor WAL registration is made durable before rotation exposes
+the new memtable to writers.
 Its current source-spool check is a provisional estimate: it counts logical WAL
 lengths and a 4 KiB sidecar allowance, but does not include larger seal indexes
 or actual filesystem allocation. The shared reservation ledger and WAL admission
