@@ -15241,7 +15241,8 @@ mod tests {
             .enable_pitr(crate::pitr::api::PitrOptions {
                 repository: dir.path().join("repository"),
                 config: crate::pitr::api::PersistedPitrConfig {
-                    archive_interval: std::time::Duration::from_secs(1),
+                    // Keep timer-driven rotation out of this explicit recovery-point test.
+                    archive_interval: std::time::Duration::from_secs(3600),
                     max_segment_bytes: 8192,
                     max_unarchived_bytes: 8192,
                     max_source_spool_bytes: 16384,
