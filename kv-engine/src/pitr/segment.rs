@@ -64,7 +64,7 @@ pub(crate) enum RotationReason {
     Shutdown,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct PitrSegmentManager {
     segments: BTreeMap<u64, SegmentMetadata>,
     active_segment_id: u64,
@@ -73,6 +73,7 @@ pub(crate) struct PitrSegmentManager {
     source_spool_limit: u64,
     source_spool_reserved: u64,
     pending_rotation: Option<RotationReason>,
+    pending_obligation_reconciliation: Option<BTreeMap<u64, crate::pitr::manifest::PitrObligation>>,
 }
 
 impl PitrSegmentManager {
@@ -103,7 +104,127 @@ impl PitrSegmentManager {
             source_spool_limit,
             source_spool_reserved: 4096,
             pending_rotation: None,
+            pending_obligation_reconciliation: None,
         })
+    }
+
+    /// Rebuild the segment and source-spool reservation estimate from durable
+    /// lifecycle state. The active WAL length comes from the recovered current
+    /// or immutable memtable, falling back to validated active-WAL file recovery
+    /// when no matching memtable exists. Other retained WALs are represented by
+    /// manifest obligations. A `Sealing` obligation may still name the active
+    /// segment while its successor is pending.
+    pub(crate) fn from_recovered_state(
+        active_segment_id: u64,
+        next_segment_id: u64,
+        active_logical_length: u64,
+        source_spool_limit: u64,
+        obligations: &BTreeMap<u64, crate::pitr::manifest::PitrObligation>,
+    ) -> Result<Self> {
+        ensure!(
+            active_logical_length >= 4096 && active_logical_length.is_multiple_of(4096),
+            "invalid recovered active WAL length"
+        );
+        let first_successor = active_segment_id
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("segment ID exhausted"))?;
+        let mut manager = Self::new(active_segment_id, source_spool_limit)?;
+        manager.next_segment_id = next_segment_id.max(first_successor);
+        {
+            let active = manager
+                .segments
+                .get_mut(&active_segment_id)
+                .expect("new segment manager contains its active segment");
+            active.logical_length = active_logical_length;
+            active.source_spool_bytes = active_logical_length;
+        }
+
+        for (&segment_id, obligation) in obligations {
+            ensure!(
+                obligation.logical_length >= 4096 && obligation.logical_length.is_multiple_of(4096),
+                "invalid recovered PITR obligation length"
+            );
+            ensure!(
+                obligation.successor_segment_id > segment_id,
+                "recovered PITR successor ID is not monotonic"
+            );
+            manager.next_segment_id = manager
+                .next_segment_id
+                .max(obligation.successor_segment_id.saturating_add(1));
+
+            if segment_id == active_segment_id {
+                ensure!(
+                    obligation.state == crate::pitr::manifest::ObligationState::Sealing,
+                    "only a Sealing obligation may name the active segment"
+                );
+                ensure!(
+                    manager.pending_successor.is_none(),
+                    "multiple recovered PITR successors are pending"
+                );
+                let active = manager
+                    .segments
+                    .get_mut(&active_segment_id)
+                    .expect("active segment invariant");
+                active.state = SegmentState::Sealing;
+                active.logical_length = obligation.logical_length;
+                active.source_spool_bytes = active_logical_length.max(obligation.logical_length);
+                active.successor_segment_id = Some(obligation.successor_segment_id);
+                manager.pending_successor = Some(SegmentMetadata {
+                    segment_id: obligation.successor_segment_id,
+                    state: SegmentState::Sealing,
+                    logical_length: 4096,
+                    source_spool_bytes: 4096,
+                    source_pins: 0,
+                    archive_pin: false,
+                    successor_segment_id: None,
+                });
+                continue;
+            }
+
+            ensure!(
+                segment_id < active_segment_id,
+                "recovered PITR obligation is newer than the active segment"
+            );
+            let (state, archive_pin) = match obligation.state {
+                crate::pitr::manifest::ObligationState::Sealing => {
+                    anyhow::bail!("non-active PITR obligation is still Sealing")
+                }
+                crate::pitr::manifest::ObligationState::Sealed => (SegmentState::Sealed, true),
+                crate::pitr::manifest::ObligationState::Archived => (SegmentState::Archived, true),
+                crate::pitr::manifest::ObligationState::Reclaimable => {
+                    (SegmentState::Reclaimable, false)
+                }
+                crate::pitr::manifest::ObligationState::Abandoned => {
+                    (SegmentState::Abandoned, false)
+                }
+            };
+            ensure!(
+                manager
+                    .segments
+                    .insert(
+                        segment_id,
+                        SegmentMetadata {
+                            segment_id,
+                            state,
+                            logical_length: obligation.logical_length,
+                            source_spool_bytes: obligation.logical_length,
+                            source_pins: 0,
+                            archive_pin,
+                            successor_segment_id: Some(obligation.successor_segment_id),
+                        },
+                    )
+                    .is_none(),
+                "duplicate recovered PITR segment"
+            );
+        }
+
+        manager.recompute_reserved()?;
+        ensure!(
+            manager.source_spool_reserved <= source_spool_limit,
+            "recovered PITR source-spool reservation estimate exceeds its configured limit"
+        );
+
+        Ok(manager)
     }
 
     pub(crate) fn request_rotation(&mut self, reason: RotationReason) -> bool {
@@ -214,7 +335,7 @@ impl PitrSegmentManager {
         self.next_segment_id = self
             .next_segment_id
             .max(successor_segment_id.saturating_add(1));
-        self.recompute_reserved();
+        self.recompute_reserved()?;
 
         Ok(())
     }
@@ -238,7 +359,7 @@ impl PitrSegmentManager {
                 segment.state = SegmentState::Sealed;
                 segment.archive_pin = true;
                 segment.logical_length = logical_length;
-                segment.source_spool_bytes = logical_length;
+                segment.source_spool_bytes = segment.source_spool_bytes.max(logical_length);
                 segment.successor_segment_id = Some(successor_segment_id);
             }
             None => {
@@ -259,9 +380,17 @@ impl PitrSegmentManager {
         // The sealed segment stops being the active one the moment its
         // successor WAL exists, which is what lets it be reclaimed later.
         self.active_segment_id = successor_segment_id;
-        self.segments
-            .entry(successor_segment_id)
-            .or_insert(SegmentMetadata {
+        let successor = if self
+            .pending_successor
+            .is_some_and(|successor| successor.segment_id == successor_segment_id)
+        {
+            let successor = self.pending_successor.take().expect("matching successor");
+            SegmentMetadata {
+                state: SegmentState::Active,
+                ..successor
+            }
+        } else {
+            SegmentMetadata {
                 segment_id: successor_segment_id,
                 state: SegmentState::Active,
                 logical_length: 4096,
@@ -269,13 +398,108 @@ impl PitrSegmentManager {
                 source_pins: 0,
                 archive_pin: false,
                 successor_segment_id: None,
-            });
+            }
+        };
+        self.segments
+            .entry(successor_segment_id)
+            .or_insert(successor);
         self.next_segment_id = self
             .next_segment_id
             .max(successor_segment_id.saturating_add(1));
-        self.recompute_reserved();
+        self.recompute_reserved()?;
 
         Ok(())
+    }
+
+    /// Prepare bookkeeping for reconciled manifest obligations without losing
+    /// live pins or reservations. The caller applies this to a clone and only
+    /// publishes it after the corresponding manifest records are durable.
+    pub(crate) fn reconcile_obligations(
+        &mut self,
+        previous: &BTreeMap<u64, crate::pitr::manifest::PitrObligation>,
+        current: &BTreeMap<u64, crate::pitr::manifest::PitrObligation>,
+    ) -> Result<()> {
+        use crate::pitr::manifest::ObligationState;
+
+        let mut previous_obligations = self
+            .pending_obligation_reconciliation
+            .take()
+            .unwrap_or_default();
+        previous_obligations.extend(previous.iter().map(|(&id, &obligation)| (id, obligation)));
+        for (&segment_id, previous_obligation) in &previous_obligations {
+            if let Some(obligation) = current.get(&segment_id) {
+                if segment_id == self.active_segment_id
+                    && obligation.state != ObligationState::Sealing
+                {
+                    self.record_sealed(
+                        segment_id,
+                        obligation.logical_length,
+                        obligation.successor_segment_id,
+                    )?;
+                }
+                self.adopt_obligation(
+                    segment_id,
+                    obligation.logical_length,
+                    obligation.successor_segment_id,
+                )?;
+                let segment = self
+                    .segments
+                    .get_mut(&segment_id)
+                    .expect("adopted obligation exists");
+                segment.state = match obligation.state {
+                    ObligationState::Sealing => SegmentState::Sealing,
+                    ObligationState::Sealed => SegmentState::Sealed,
+                    ObligationState::Archived => SegmentState::Archived,
+                    ObligationState::Reclaimable => SegmentState::Reclaimable,
+                    ObligationState::Abandoned => SegmentState::Abandoned,
+                };
+                segment.archive_pin = matches!(
+                    obligation.state,
+                    ObligationState::Sealed | ObligationState::Archived
+                );
+                segment.logical_length = obligation.logical_length;
+                segment.source_spool_bytes =
+                    segment.source_spool_bytes.max(obligation.logical_length);
+                segment.successor_segment_id = Some(obligation.successor_segment_id);
+            } else {
+                ensure!(
+                    previous_obligation.state == ObligationState::Reclaimable,
+                    "reconciled PITR obligation was not reclaimable"
+                );
+                if segment_id == self.active_segment_id {
+                    self.record_sealed(
+                        segment_id,
+                        previous_obligation.logical_length,
+                        previous_obligation.successor_segment_id,
+                    )?;
+                }
+                if let Some(segment) = self.segments.get(&segment_id) {
+                    ensure!(
+                        segment.source_pins == 0 && segment_id != self.active_segment_id,
+                        "reconciled PITR segment still has source pins or is active"
+                    );
+                    self.segments.remove(&segment_id);
+                }
+            }
+        }
+
+        self.recompute_reserved()
+    }
+
+    /// Keep the previous obligations when their transition was appended but its
+    /// sync failed. The manifest projection may already have advanced, so a
+    /// retry needs these obligations even if no new lifecycle records remain.
+    pub(crate) fn defer_obligation_reconciliation(
+        &mut self,
+        previous: BTreeMap<u64, crate::pitr::manifest::PitrObligation>,
+    ) {
+        self.pending_obligation_reconciliation
+            .get_or_insert_with(BTreeMap::new)
+            .extend(previous);
+    }
+
+    pub(crate) fn has_pending_obligation_reconciliation(&self) -> bool {
+        self.pending_obligation_reconciliation.is_some()
     }
 
     /// Drop a segment whose source WAL and sidecar have been unlinked.
@@ -290,16 +514,34 @@ impl PitrSegmentManager {
             "PITR segment was not reclaimable"
         );
         self.segments.remove(&segment_id);
-        self.recompute_reserved();
+        self.recompute_reserved()?;
 
         Ok(())
     }
 
-    /// Reserved bytes are exactly what the tracked segments hold.
-    fn recompute_reserved(&mut self) {
-        self.source_spool_reserved = self.segments.values().fold(0_u64, |total, segment| {
-            total.saturating_add(segment.source_spool_bytes)
-        });
+    /// Recompute the reservation estimate from the tracked segment charges.
+    fn recompute_reserved(&mut self) -> Result<()> {
+        let segments = self.segments.values().try_fold(0_u64, |total, segment| {
+            let bytes = total
+                .checked_add(segment.source_spool_bytes)
+                .and_then(|bytes| {
+                    if segment.state == SegmentState::Active {
+                        Some(bytes)
+                    } else {
+                        bytes.checked_add(4096)
+                    }
+                })
+                .ok_or_else(|| anyhow::anyhow!("source spool accounting overflow"))?;
+            Ok::<_, anyhow::Error>(bytes)
+        })?;
+        self.source_spool_reserved = segments
+            .checked_add(
+                self.pending_successor
+                    .map_or(0, |successor| successor.source_spool_bytes),
+            )
+            .ok_or_else(|| anyhow::anyhow!("source spool accounting overflow"))?;
+
+        Ok(())
     }
 
     pub(crate) fn mark_sealed(&mut self, segment_id: u64) -> Result<()> {
@@ -791,6 +1033,179 @@ mod tests {
     #[test]
     fn segment_id_exhaustion_is_reported() {
         assert!(PitrSegmentManager::new(u64::MAX, 16 * 1024).is_err());
+    }
+
+    #[test]
+    fn recovered_obligations_restore_the_source_spool_budget() {
+        let obligations = std::collections::BTreeMap::from([(
+            1,
+            crate::pitr::manifest::PitrObligation {
+                state: crate::pitr::manifest::ObligationState::Sealed,
+                successor_segment_id: 2,
+                logical_length: 8192,
+            },
+        )]);
+        let mut manager =
+            PitrSegmentManager::from_recovered_state(2, 3, 4096, 16 * 1024, &obligations).unwrap();
+
+        assert_eq!(manager.active_segment_id(), 2);
+        assert_eq!(manager.next_segment_id, 3);
+        assert_eq!(manager.segment(1).unwrap().state, SegmentState::Sealed);
+        assert!(manager.segment(1).unwrap().archive_pin);
+        assert_eq!(manager.sealed_unarchived_bytes(), 8192);
+        assert_eq!(manager.source_spool_reserved(), 16 * 1024);
+
+        manager.mark_archived(1).unwrap();
+        manager.mark_reclaimable(1).unwrap();
+        manager.release_archive_pin(1).unwrap();
+        manager.reclaim(1).unwrap();
+        manager
+            .complete_reclaim(1, CleanupReceipt::durable())
+            .unwrap();
+        assert_eq!(manager.source_spool_reserved(), 4096);
+    }
+
+    #[test]
+    fn recovered_sealing_obligation_retains_its_pending_successor() {
+        let obligations = std::collections::BTreeMap::from([(
+            1,
+            crate::pitr::manifest::PitrObligation {
+                state: crate::pitr::manifest::ObligationState::Sealing,
+                successor_segment_id: 2,
+                logical_length: 8192,
+            },
+        )]);
+        let mut manager =
+            PitrSegmentManager::from_recovered_state(1, 3, 8192, 16 * 1024, &obligations).unwrap();
+
+        assert_eq!(manager.segment(1).unwrap().state, SegmentState::Sealing);
+        assert_eq!(manager.pending_successor_id().unwrap(), 2);
+        assert_eq!(manager.source_spool_reserved(), 16 * 1024);
+        manager.mark_sealed(1).unwrap();
+        assert_eq!(manager.install_successor().unwrap(), 2);
+        assert_eq!(manager.active_segment_id(), 2);
+        assert_eq!(manager.source_spool_reserved(), 16 * 1024);
+    }
+
+    #[test]
+    fn reconciled_reclamation_releases_recovered_spool_charge() {
+        let obligations = BTreeMap::from([(
+            1,
+            crate::pitr::manifest::PitrObligation {
+                state: crate::pitr::manifest::ObligationState::Reclaimable,
+                successor_segment_id: 2,
+                logical_length: 8192,
+            },
+        )]);
+        let mut manager =
+            PitrSegmentManager::from_recovered_state(2, 3, 4096, 16 * 1024, &obligations).unwrap();
+        assert_eq!(manager.source_spool_reserved(), 16 * 1024);
+
+        manager
+            .reconcile_obligations(&obligations, &BTreeMap::new())
+            .unwrap();
+
+        assert!(manager.segment(1).is_none());
+        assert_eq!(manager.active_segment_id(), 2);
+        assert_eq!(manager.source_spool_reserved(), 4096);
+    }
+
+    #[test]
+    fn reconciled_sealing_consumes_pending_successor_and_preserves_pins() {
+        let obligations = BTreeMap::from([(
+            1,
+            crate::pitr::manifest::PitrObligation {
+                state: crate::pitr::manifest::ObligationState::Sealing,
+                successor_segment_id: 2,
+                logical_length: 8192,
+            },
+        )]);
+        let mut manager =
+            PitrSegmentManager::from_recovered_state(1, 3, 12 * 1024, 32 * 1024, &obligations)
+                .unwrap();
+        manager.pin(1).unwrap();
+        assert_eq!(manager.source_spool_reserved(), 20 * 1024);
+        let mut reconciled = obligations.clone();
+        reconciled.get_mut(&1).unwrap().state = crate::pitr::manifest::ObligationState::Sealed;
+
+        manager
+            .reconcile_obligations(&obligations, &reconciled)
+            .unwrap();
+
+        assert_eq!(manager.active_segment_id(), 2);
+        assert!(manager.pending_successor_id().is_err());
+        let sealed = manager.segment(1).unwrap();
+        assert_eq!(sealed.state, SegmentState::Sealed);
+        assert!(sealed.archive_pin);
+        assert_eq!(sealed.source_pins, 1);
+        assert_eq!(sealed.source_spool_bytes, 12 * 1024);
+        assert_eq!(manager.segment(2).unwrap().state, SegmentState::Active);
+        assert_eq!(manager.source_spool_reserved(), 20 * 1024);
+    }
+
+    #[test]
+    fn reconciled_sealing_preserves_the_pending_successor_reservation() {
+        let mut manager = PitrSegmentManager::new(1, 32 * 1024).unwrap();
+        manager.begin_sealing(8192, 8192).unwrap();
+        let obligations = BTreeMap::from([(
+            1,
+            crate::pitr::manifest::PitrObligation {
+                state: crate::pitr::manifest::ObligationState::Sealing,
+                successor_segment_id: 2,
+                logical_length: 8192,
+            },
+        )]);
+        let mut reconciled = obligations.clone();
+        reconciled.get_mut(&1).unwrap().state = crate::pitr::manifest::ObligationState::Sealed;
+
+        manager
+            .reconcile_obligations(&obligations, &reconciled)
+            .unwrap();
+
+        assert!(manager.pending_successor_id().is_err());
+        assert_eq!(manager.segment(2).unwrap().source_spool_bytes, 8192);
+        assert_eq!(manager.source_spool_reserved(), 20 * 1024);
+    }
+
+    #[test]
+    fn deferred_sealing_reconciliation_uses_the_advanced_manifest_projection() {
+        let obligations = BTreeMap::from([(
+            1,
+            crate::pitr::manifest::PitrObligation {
+                state: crate::pitr::manifest::ObligationState::Sealing,
+                successor_segment_id: 2,
+                logical_length: 8192,
+            },
+        )]);
+        let mut manager =
+            PitrSegmentManager::from_recovered_state(1, 3, 8192, 16 * 1024, &obligations).unwrap();
+        manager.pin(1).unwrap();
+        manager.defer_obligation_reconciliation(obligations.clone());
+        let mut published = obligations;
+        published.get_mut(&1).unwrap().state = crate::pitr::manifest::ObligationState::Sealed;
+
+        manager
+            .reconcile_obligations(&published, &published)
+            .unwrap();
+
+        assert_eq!(manager.active_segment_id(), 2);
+        assert!(manager.pending_successor_id().is_err());
+        assert!(!manager.has_pending_obligation_reconciliation());
+        assert_eq!(manager.segment(1).unwrap().source_pins, 1);
+        assert_eq!(manager.source_spool_reserved(), 16 * 1024);
+    }
+
+    #[test]
+    fn recovered_obligations_must_fit_the_persisted_spool_limit() {
+        let obligations = std::collections::BTreeMap::from([(
+            1,
+            crate::pitr::manifest::PitrObligation {
+                state: crate::pitr::manifest::ObligationState::Sealed,
+                successor_segment_id: 2,
+                logical_length: 4096,
+            },
+        )]);
+        assert!(PitrSegmentManager::from_recovered_state(2, 3, 4096, 8192, &obligations).is_err());
     }
 
     #[cfg(target_os = "linux")]

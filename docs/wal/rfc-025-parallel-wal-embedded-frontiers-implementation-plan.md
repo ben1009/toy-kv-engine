@@ -15,8 +15,19 @@ bytes and seal-index capacity, counting coalesced markers only once. Serial
 commits reuse the buffer cap, and recovered batches require no outstanding
 DATA buffers. Exact-cap recovery and continued append cover coalesced groups.
 Limit rejection is checked to leave ticket/offset state and WAL bytes unchanged.
-Live lifecycle reconstruction and WAL admission integration remain. Production
-WAL-open and manifest integration also remain. Stage 5 has started with
+Live segment lifecycle reconstruction is now wired before PITR runtime attach.
+Reconciliation updates the recovered bookkeeping after successful manifest
+sync, releases reclaimed source charges, and consumes completed sealing's
+pending successor reservation while preserving live pins and reservations.
+If a failed sync has already advanced the manifest projection, a retry retains
+the pending bookkeeping and directly syncs the existing manifest before applying
+it when no new lifecycle transitions remain. This retry does not append a PITR
+snapshot or change the manifest record stream.
+Its current source-spool check is a provisional estimate: it counts logical WAL
+lengths and a 4 KiB sidecar allowance, but does not include larger seal indexes
+or actual filesystem allocation. The shared reservation ledger and WAL admission
+integration remain; this estimate is not the final hard-bound enforcement.
+Production WAL-open and manifest integration also remain. Stage 5 has started with
 recovered-runtime cursor bootstrap: an installed Active image supplies the v7
 DATA start, append offset, and next ticket, and the shared runtime seeds its
 admission, packer, and durability coordinates from that state. V7 startup stays
@@ -296,9 +307,16 @@ source spool and recovery workspace, buffer memory, and seal-index capacity.
 Each reservation owns all of its charges and releases them atomically. The
 framed-batch helper derives DATA frame count from the codec, reserves one
 worst-case FRONTIER per admitted batch, and returns the owned reservation before
-the caller assigns a ticket or offset. The ledger is not yet reconstructed from
-lifecycle state or connected to live WAL admission; those integrations remain
-in this stage.
+the caller assigns a ticket or offset. The engine now reconstructs its segment
+manager's retained obligations and a source-spool reservation estimate before
+attaching a PITR runtime. Durable reconciliation keeps this manager in step with
+completed seals and source cleanup without replacing live pins or reservations.
+The estimate uses logical WAL lengths and a 4 KiB
+sidecar allowance, so it does not yet cover larger seal indexes or actual
+filesystem allocation and must not be treated as the final hard-bound check.
+The separate reservation ledger is not yet reconstructed from filesystem
+allocation or connected to live WAL admission; those integrations remain in
+this stage.
 
 - Promote or replace the `PitrSpoolAccountant` helper/model with a shared live
   ledger installed by the engine's PITR lifecycle. Reconstruct its charges

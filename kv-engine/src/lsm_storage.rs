@@ -2047,6 +2047,27 @@ fn pitr_io_error(error: anyhow::Error) -> std::io::Error {
     }
 }
 
+fn pitr_chain_anchor_from_persisted(
+    anchor: crate::pitr::manifest::PersistedChainAnchor,
+) -> crate::pitr::ChainAnchor {
+    match anchor {
+        crate::pitr::manifest::PersistedChainAnchor::Genesis { archive_epoch_id } => {
+            crate::pitr::ChainAnchor::Genesis {
+                archive_epoch_id: crate::pitr::ArchiveEpochId(archive_epoch_id),
+            }
+        }
+        crate::pitr::manifest::PersistedChainAnchor::Segment {
+            segment_id,
+            wal_digest,
+            seal_digest,
+        } => crate::pitr::ChainAnchor::Segment(crate::pitr::SegmentAnchor {
+            segment_id: crate::pitr::SegmentId(segment_id),
+            wal_digest,
+            seal_digest,
+        }),
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn pitr_enable_request_id(state: &crate::pitr::manifest::PitrState) -> [u8; 16] {
     let mut digest = sha2::Sha256::new();
@@ -2427,7 +2448,14 @@ impl KvEngine {
             .collect::<Vec<_>>();
         let state_lock = self.inner.state_lock.lock();
         let length_before = manifest.current_length()?;
-        if let Err(error) = manifest.add_records(&state_lock, &records) {
+        let publication = if records.is_empty() {
+            // The projection may have advanced after an append whose sync
+            // failed. Settle that durability without adding a lifecycle record.
+            manifest.sync(&state_lock)
+        } else {
+            manifest.add_records(&state_lock, &records)
+        };
+        if let Err(error) = publication {
             // The append may be durable even though its fsync failed. Publishing
             // the state in that case makes a retry hit the caller's own guard
             // instead of drawing a second timeline/epoch. Write admission stays
@@ -2510,21 +2538,86 @@ impl KvEngine {
         let active_segment_id = state
             .active_segment_id
             .unwrap_or_else(|| state.next_segment_id.saturating_sub(1));
+        let timeline_id = state
+            .timeline_id
+            .ok_or_else(|| anyhow!("PITR lifecycle state is missing timeline identity"))?;
+        let archive_epoch_id = state
+            .archive_epoch_id
+            .ok_or_else(|| anyhow!("PITR lifecycle state is missing archive epoch identity"))?;
+        let predecessor = state
+            .predecessor_anchor
+            .map(pitr_chain_anchor_from_persisted)
+            .ok_or_else(|| anyhow!("PITR lifecycle state is missing predecessor anchor"))?;
         let source_spool_limit = state
             .config
             .as_ref()
             .map(|config| config.max_source_spool_bytes)
             .ok_or_else(|| anyhow!("PITR lifecycle state is missing configuration"))?;
-        if self.inner.state.load().memtable.uses_wal_v5() {
+        let recovered_storage_state = self.inner.state.load();
+        let active_source_memtable = std::iter::once(recovered_storage_state.memtable.as_ref())
+            .chain(
+                recovered_storage_state
+                    .imm_memtables
+                    .iter()
+                    .map(|memtable| memtable.as_ref()),
+            )
+            .find(|memtable| LsmStorageInner::pitr_segment_of(memtable) == Some(active_segment_id));
+        let active_logical_length = if let Some(length) =
+            active_source_memtable.and_then(mem_table::MemTable::wal_logical_length)
+        {
+            length
+        } else {
+            let wal_path = self
+                .inner
+                .path
+                .join(format!("pitr-{active_segment_id:020}.wal"));
+            match std::fs::metadata(&wal_path) {
+                Ok(_) => crate::wal::Wal::recover_v5_file_logical_length(
+                    &wal_path,
+                    crate::pitr::SegmentId(active_segment_id),
+                    crate::pitr::TimelineId(timeline_id),
+                    crate::pitr::ArchiveEpochId(archive_epoch_id),
+                    predecessor,
+                )
+                .with_context(|| {
+                    format!("failed to recover active PITR WAL {}", wal_path.display())
+                })?,
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::NotFound
+                        && state.mode == crate::pitr::manifest::PitrMode::Enabling =>
+                {
+                    // The enable intent is durable before segment 0 is installed.
+                    // Other active states must have an active source WAL: treating
+                    // its loss as an empty segment would undercount retained spool.
+                    4096
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    return Err(anyhow!(
+                        "active PITR WAL {} is missing for {:?} lifecycle state",
+                        wal_path.display(),
+                        state.mode
+                    ));
+                }
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("failed to inspect active PITR WAL {}", wal_path.display())
+                    });
+                }
+            }
+        };
+        let segments = crate::pitr::segment::PitrSegmentManager::from_recovered_state(
+            active_segment_id,
+            state.next_segment_id,
+            active_logical_length,
+            source_spool_limit,
+            &state.obligations,
+        )?;
+        if recovered_storage_state.memtable.uses_wal_v5() {
             let config = state.config.as_ref().unwrap();
-            self.inner
-                .state
-                .load()
+            recovered_storage_state
                 .memtable
                 .configure_pitr_wal_limits(config.max_segment_bytes, config.max_unarchived_bytes)?;
         }
-        let segments =
-            crate::pitr::segment::PitrSegmentManager::new(active_segment_id, source_spool_limit)?;
         self.inner
             .pitr_next_segment_id
             .store(state.next_segment_id, Ordering::Release);
@@ -2997,6 +3090,7 @@ impl KvEngine {
         mut state: crate::pitr::manifest::PitrState,
         reclaim_sources: bool,
     ) -> Result<crate::pitr::manifest::PitrState> {
+        let previous_obligations = state.obligations.clone();
         // Only the sealed obligations need the repository's committed set, so a
         // state with nothing left to resolve must not demand an archiver: the
         // lifecycle is detached while disabling, and reconciliation there has
@@ -3189,8 +3283,32 @@ impl KvEngine {
                 records.push(record);
             }
         }
-        if !records.is_empty() {
-            self.persist_pitr_lifecycle(&records, state.clone())?;
+        let mut segments = self.pitr_segments.lock();
+        let has_pending_reconciliation = segments
+            .as_ref()
+            .is_some_and(|segments| segments.has_pending_obligation_reconciliation());
+        if !records.is_empty() || has_pending_reconciliation {
+            // Keep pins and reservations stable across preparation and durable
+            // publication. A failed sync retains the original manager's charge.
+            let reconciled_segments = segments
+                .as_ref()
+                .map(|segments| {
+                    let mut reconciled = segments.clone();
+                    reconciled.reconcile_obligations(&previous_obligations, &state.obligations)?;
+                    Ok::<_, anyhow::Error>(reconciled)
+                })
+                .transpose()?;
+            if let Err(error) = self.persist_pitr_lifecycle(&records, state.clone()) {
+                if matches!(
+                    error.downcast_ref::<PitrManifestPublicationError>(),
+                    Some(PitrManifestPublicationError::PublishedButNotDurable(_))
+                ) && let Some(segments) = segments.as_mut()
+                {
+                    segments.defer_obligation_reconciliation(previous_obligations);
+                }
+                return Err(error);
+            }
+            *segments = reconciled_segments;
         }
         Ok(state)
     }
@@ -6823,6 +6941,37 @@ impl LsmStorageInner {
                         .all(|pair| pair[0].0 != pair[1].0),
                     "duplicate PITR WAL segment identity"
                 );
+                let expected_active_segment_id = pitr_state.active_segment_id.or_else(|| {
+                    (pitr_state.mode == crate::pitr::manifest::PitrMode::Enabling)
+                        .then_some(pitr_state.next_segment_id.saturating_sub(1))
+                });
+                if let Some(active_segment_id) = expected_active_segment_id
+                    && let Some((_, _, header)) = pitr_wal_fallbacks
+                        .iter()
+                        .find(|(segment_id, _, _)| *segment_id == active_segment_id)
+                {
+                    // The active WAL may be recovered through an immutable
+                    // memtable record and promoted below, bypassing the direct
+                    // active-WAL open path. Validate its manifest identity here
+                    // before either recovery path can accept it.
+                    let expected_timeline_id = pitr_state
+                        .timeline_id
+                        .ok_or_else(|| anyhow!("PITR state is missing its timeline identity"))?;
+                    let expected_archive_epoch_id = pitr_state
+                        .archive_epoch_id
+                        .ok_or_else(|| anyhow!("PITR state is missing its archive epoch"))?;
+                    let expected_predecessor = pitr_state
+                        .predecessor_anchor
+                        .map(pitr_chain_anchor_from_persisted)
+                        .ok_or_else(|| anyhow!("PITR state is missing its predecessor anchor"))?;
+                    crate::wal::Wal::validate_v5_active_header(
+                        header,
+                        crate::pitr::SegmentId(active_segment_id),
+                        crate::pitr::TimelineId(expected_timeline_id),
+                        crate::pitr::ArchiveEpochId(expected_archive_epoch_id),
+                        expected_predecessor,
+                    )?;
+                }
                 if let Some(timeline_id) = pitr_state.timeline_id {
                     pitr_wal_fallbacks.retain(|(_, _, header)| {
                         header.timeline_id.0 == timeline_id
@@ -7165,16 +7314,23 @@ impl LsmStorageInner {
                     let mut bytes = vec![0; crate::pitr::WAL_V5_HEADER_LEN];
                     std::io::Read::read_exact(&mut file, &mut bytes)?;
                     let header = crate::pitr::decode_v5_file_header(&bytes)?;
-                    ensure!(
-                        header.segment_id.0 == active_segment_id
-                            && pitr_state
-                                .timeline_id
-                                .is_some_and(|timeline| header.timeline_id.0 == timeline)
-                            && pitr_state
-                                .archive_epoch_id
-                                .is_some_and(|epoch| header.archive_epoch_id.0 == epoch),
-                        "active PITR WAL identity does not match persisted state"
-                    );
+                    let expected_timeline_id = pitr_state
+                        .timeline_id
+                        .ok_or_else(|| anyhow!("PITR state is missing its timeline identity"))?;
+                    let expected_archive_epoch_id = pitr_state
+                        .archive_epoch_id
+                        .ok_or_else(|| anyhow!("PITR state is missing its archive epoch"))?;
+                    let expected_predecessor = pitr_state
+                        .predecessor_anchor
+                        .map(pitr_chain_anchor_from_persisted)
+                        .ok_or_else(|| anyhow!("PITR state is missing its predecessor anchor"))?;
+                    crate::wal::Wal::validate_v5_active_header(
+                        &header,
+                        crate::pitr::SegmentId(active_segment_id),
+                        crate::pitr::TimelineId(expected_timeline_id),
+                        crate::pitr::ArchiveEpochId(expected_archive_epoch_id),
+                        expected_predecessor,
+                    )?;
                     let (memtable, wal_max_ts) =
                         MemTable::recover_from_wal_with_range_tombstones_and_mode(
                             max_id,
@@ -12393,6 +12549,469 @@ mod tests {
         engine.close().unwrap();
     }
 
+    fn enabled_pitr_state_with_sealed_segment(
+        config: crate::pitr::manifest::PersistedPitrConfig,
+        logical_length: u64,
+    ) -> crate::pitr::manifest::PitrState {
+        let segment_anchor = crate::pitr::manifest::PersistedChainAnchor::Segment {
+            segment_id: 1,
+            wal_digest: [4; 32],
+            seal_digest: [5; 32],
+        };
+        crate::pitr::manifest::replay_pitr_records([
+            crate::pitr::manifest::PitrManifestRecord::EnableIntent {
+                repository_id: [1; 16],
+                timeline_id: [2; 16],
+                archive_epoch_id: [3; 16],
+                config,
+            },
+            crate::pitr::manifest::PitrManifestRecord::EnableComplete {
+                active_segment_id: 1,
+            },
+            crate::pitr::manifest::PitrManifestRecord::SealStarted {
+                segment_id: 1,
+                successor_segment_id: 2,
+                logical_length,
+            },
+            crate::pitr::manifest::PitrManifestRecord::SegmentSealed {
+                segment_id: 1,
+                segment_anchor,
+                last_recorded_at: None,
+                last_commit_anchor: None,
+            },
+        ])
+        .unwrap()
+    }
+
+    fn write_empty_active_pitr_wal(
+        database: impl AsRef<std::path::Path>,
+        state: &crate::pitr::manifest::PitrState,
+    ) -> anyhow::Result<()> {
+        let active_segment_id = state
+            .active_segment_id
+            .ok_or_else(|| anyhow::anyhow!("PITR state has no active segment"))?;
+        let timeline_id = state
+            .timeline_id
+            .ok_or_else(|| anyhow::anyhow!("PITR state has no timeline identity"))?;
+        let archive_epoch_id = state
+            .archive_epoch_id
+            .ok_or_else(|| anyhow::anyhow!("PITR state has no archive epoch identity"))?;
+        let predecessor = match state
+            .predecessor_anchor
+            .ok_or_else(|| anyhow::anyhow!("PITR state has no predecessor anchor"))?
+        {
+            crate::pitr::manifest::PersistedChainAnchor::Genesis { archive_epoch_id } => {
+                crate::pitr::ChainAnchor::Genesis {
+                    archive_epoch_id: crate::pitr::ArchiveEpochId(archive_epoch_id),
+                }
+            }
+            crate::pitr::manifest::PersistedChainAnchor::Segment {
+                segment_id,
+                wal_digest,
+                seal_digest,
+            } => crate::pitr::ChainAnchor::Segment(crate::pitr::SegmentAnchor {
+                segment_id: crate::pitr::SegmentId(segment_id),
+                wal_digest,
+                seal_digest,
+            }),
+        };
+        let _wal = crate::wal::Wal::create_v5(
+            database
+                .as_ref()
+                .join(format!("pitr-{active_segment_id:020}.wal")),
+            crate::pitr::WalV5Header {
+                wal_format_version: crate::pitr::WAL_V5_VERSION,
+                timeline_id: crate::pitr::TimelineId(timeline_id),
+                archive_epoch_id: crate::pitr::ArchiveEpochId(archive_epoch_id),
+                segment_id: crate::pitr::SegmentId(active_segment_id),
+                predecessor,
+            },
+        )?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn resumed_pitr_reconstructs_sealed_source_spool_usage() {
+        let dir = tempdir().unwrap();
+        let engine = KvEngine::open(&dir, LsmStorageOptions::default_for_test()).unwrap();
+        let state = enabled_pitr_state_with_sealed_segment(
+            crate::pitr::manifest::PersistedPitrConfig {
+                archive_interval_ms: 1000,
+                max_segment_bytes: 8192,
+                max_unarchived_bytes: 8192,
+                max_source_spool_bytes: 16 * 1024,
+            },
+            8192,
+        );
+        write_empty_active_pitr_wal(&dir, &state).unwrap();
+
+        engine.resume_pitr_lifecycle(state).unwrap();
+
+        let status = engine
+            .pitr_status(crate::pitr::api::PitrStatusOptions {
+                cursor: None,
+                page_size: crate::pitr::api::MAX_STATUS_PAGE_SIZE,
+            })
+            .unwrap();
+        assert_eq!(status.source_spool_bytes, 16 * 1024);
+        assert_eq!(status.sealed_unarchived_wal_bytes, 8192);
+        engine.close_storage().unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn resumed_pitr_releases_reclaimed_source_spool_usage() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("db");
+        let repository = dir.path().join("repository");
+        let parent = crate::backup::open_directory_no_follow(dir.path()).unwrap();
+        crate::backup::bootstrap_repository(&parent, "repository").unwrap();
+        let options = LsmStorageOptions {
+            enable_wal: true,
+            ..LsmStorageOptions::default_for_test()
+        };
+        let engine = KvEngine::open(&database, options.clone()).unwrap();
+        enable_pitr_for_test(&engine, &repository, PITR_TEST_ARCHIVE_INTERVAL);
+        let segment_id = engine.pitr_manifest_state.lock().active_segment_id.unwrap();
+        assert!(matches!(
+            engine.create_recovery_point().unwrap(),
+            crate::pitr::api::RecoveryPointOutcome::Durable(_)
+        ));
+        assert_eq!(
+            engine.pitr_manifest_state.lock().obligations[&segment_id].state,
+            crate::pitr::manifest::ObligationState::Reclaimable
+        );
+        let wal_path = database.join(format!("pitr-{segment_id:020}.wal"));
+        let seal_path = database.join(format!("pitr-{segment_id:020}.seal"));
+        assert!(wal_path.exists());
+        assert!(seal_path.exists());
+        engine.close_storage().unwrap();
+        drop(engine);
+
+        let reopened = KvEngine::open(&database, options).unwrap();
+        assert!(reopened.inner.state.load().imm_memtables.is_empty());
+        assert!(matches!(
+            reopened.resume_pitr(&repository).unwrap(),
+            crate::pitr::api::PitrResumeOutcome::Resumed
+        ));
+
+        assert!(!wal_path.exists());
+        assert!(!seal_path.exists());
+        assert!(reopened.pitr_manifest_state.lock().obligations.is_empty());
+        let status = reopened
+            .pitr_status(crate::pitr::api::PitrStatusOptions {
+                cursor: None,
+                page_size: crate::pitr::api::MAX_STATUS_PAGE_SIZE,
+            })
+            .unwrap();
+        assert_eq!(status.active_wal_bytes, 4096);
+        assert_eq!(status.source_spool_bytes, status.active_wal_bytes);
+        assert!(
+            reopened
+                .pitr_segments
+                .lock()
+                .as_ref()
+                .unwrap()
+                .segment(segment_id)
+                .is_none()
+        );
+        reopened.close_storage().unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn resumed_pitr_completes_recovered_sealing_bookkeeping() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("db");
+        let repository = dir.path().join("repository");
+        let parent = crate::backup::open_directory_no_follow(dir.path()).unwrap();
+        crate::backup::bootstrap_repository(&parent, "repository").unwrap();
+        let options = LsmStorageOptions {
+            enable_wal: true,
+            ..LsmStorageOptions::default_for_test()
+        };
+        let engine = KvEngine::open(&database, options.clone()).unwrap();
+        enable_pitr_for_test(&engine, &repository, PITR_TEST_ARCHIVE_INTERVAL);
+        engine.put(b"before-tear", b"value").unwrap();
+        let segment_id = engine.pitr_manifest_state.lock().active_segment_id.unwrap();
+        let (seal, wal_path, _) = engine.inner.write_pitr_seal_for_active_wal().unwrap();
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(wal_path)
+            .unwrap();
+        file.set_len(seal.logical_length).unwrap();
+        file.sync_all().unwrap();
+        let record = crate::pitr::manifest::PitrManifestRecord::SealStarted {
+            segment_id,
+            successor_segment_id: segment_id + 1,
+            logical_length: seal.logical_length,
+        };
+        let state = crate::pitr::manifest::replay_pitr_records([
+            crate::pitr::manifest::PitrManifestRecord::Snapshot(Box::new(
+                engine.pitr_manifest_state.lock().clone(),
+            )),
+            record.clone(),
+        ])
+        .unwrap();
+        engine
+            .persist_pitr_lifecycle(std::slice::from_ref(&record), state)
+            .unwrap();
+        engine.close_storage().unwrap();
+        drop(engine);
+
+        let reopened = KvEngine::open(&database, options).unwrap();
+        assert!(matches!(
+            reopened.resume_pitr(&repository).unwrap(),
+            crate::pitr::api::PitrResumeOutcome::ReconciliationRequired(_)
+        ));
+        assert_eq!(
+            reopened.pitr_manifest_state.lock().obligations[&segment_id].state,
+            crate::pitr::manifest::ObligationState::Sealed
+        );
+        {
+            let segments = reopened.pitr_segments.lock();
+            let segments = segments.as_ref().unwrap();
+            assert_eq!(segments.active_segment_id(), segment_id + 1);
+            assert!(segments.pending_successor_id().is_err());
+            assert_eq!(
+                segments.segment(segment_id).unwrap().state,
+                crate::pitr::segment::SegmentState::Sealed
+            );
+            assert_eq!(segments.source_spool_reserved(), seal.logical_length + 8192);
+        }
+        assert_eq!(
+            reopened.get(b"before-tear").unwrap().as_deref(),
+            Some(b"value".as_slice())
+        );
+        reopened.close_storage().unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn failpoint_reconciled_spool_charge_waits_for_successful_retry_sync() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("db");
+        let repository = dir.path().join("repository");
+        let parent = crate::backup::open_directory_no_follow(dir.path()).unwrap();
+        crate::backup::bootstrap_repository(&parent, "repository").unwrap();
+        let options = LsmStorageOptions {
+            enable_wal: true,
+            ..LsmStorageOptions::default_for_test()
+        };
+        let engine = KvEngine::open(&database, options.clone()).unwrap();
+        enable_pitr_for_test(&engine, &repository, PITR_TEST_ARCHIVE_INTERVAL);
+        let segment_id = engine.pitr_manifest_state.lock().active_segment_id.unwrap();
+        assert!(matches!(
+            engine.create_recovery_point().unwrap(),
+            crate::pitr::api::RecoveryPointOutcome::Durable(_)
+        ));
+        engine.close_storage().unwrap();
+        drop(engine);
+
+        let engine = KvEngine::open(&database, options.clone()).unwrap();
+        assert!(engine.inner.state.load().imm_memtables.is_empty());
+        crate::manifest::set_manifest_sync_failure(&database.join("MANIFEST"));
+        let error = engine.resume_pitr(&repository).unwrap_err();
+
+        assert!(matches!(
+            error.downcast_ref::<super::PitrManifestPublicationError>(),
+            Some(super::PitrManifestPublicationError::PublishedButNotDurable(
+                _
+            ))
+        ));
+        {
+            let segments = engine.pitr_segments.lock();
+            let segments = segments.as_ref().unwrap();
+            assert!(segments.segment(segment_id).is_some());
+            assert_eq!(segments.source_spool_reserved(), 12 * 1024);
+            assert!(segments.has_pending_obligation_reconciliation());
+        }
+        let published_state = engine.pitr_manifest_state.lock().clone();
+        assert!(published_state.obligations.is_empty());
+        assert!(!database.join(format!("pitr-{segment_id:020}.wal")).exists());
+        assert!(
+            !database
+                .join(format!("pitr-{segment_id:020}.seal"))
+                .exists()
+        );
+        // Repeating the sync failure must retain the charge even though no
+        // obligation remains in the manifest projection to drive the retry.
+        crate::manifest::set_manifest_sync_failure(&database.join("MANIFEST"));
+        assert!(engine.resume_pitr(&repository).is_err());
+        {
+            let segments = engine.pitr_segments.lock();
+            let segments = segments.as_ref().unwrap();
+            assert_eq!(segments.source_spool_reserved(), 12 * 1024);
+            assert!(segments.has_pending_obligation_reconciliation());
+        }
+        let manifest_length = engine
+            .inner
+            .manifest
+            .as_ref()
+            .unwrap()
+            .current_length()
+            .unwrap();
+        assert!(matches!(
+            engine.resume_pitr(&repository).unwrap(),
+            crate::pitr::api::PitrResumeOutcome::Resumed
+        ));
+        {
+            let segments = engine.pitr_segments.lock();
+            let segments = segments.as_ref().unwrap();
+            assert!(segments.segment(segment_id).is_none());
+            assert_eq!(segments.source_spool_reserved(), 4096);
+            assert!(!segments.has_pending_obligation_reconciliation());
+        }
+        // The retry settles durability without appending a lifecycle record.
+        assert_eq!(
+            std::fs::metadata(database.join("MANIFEST")).unwrap().len(),
+            manifest_length
+        );
+        engine.close_storage().unwrap();
+        drop(engine);
+
+        let reopened = KvEngine::open(&database, options)
+            .expect("a successful reconciliation retry must survive cold manifest replay");
+        assert!(matches!(
+            reopened.resume_pitr(&repository).unwrap(),
+            crate::pitr::api::PitrResumeOutcome::Resumed
+        ));
+        assert!(reopened.pitr_manifest_state.lock().obligations.is_empty());
+        let status = reopened
+            .pitr_status(crate::pitr::api::PitrStatusOptions {
+                cursor: None,
+                page_size: crate::pitr::api::MAX_STATUS_PAGE_SIZE,
+            })
+            .unwrap();
+        assert_eq!(status.source_spool_bytes, 4096);
+        reopened.close_storage().unwrap();
+    }
+
+    #[test]
+    fn resumed_pitr_rejects_recovered_spool_usage_over_limit_before_attach() {
+        let dir = tempdir().unwrap();
+        let engine = KvEngine::open(&dir, LsmStorageOptions::default_for_test()).unwrap();
+        let state = enabled_pitr_state_with_sealed_segment(
+            crate::pitr::manifest::PersistedPitrConfig {
+                archive_interval_ms: 1000,
+                max_segment_bytes: 4096,
+                max_unarchived_bytes: 4096,
+                max_source_spool_bytes: 8192,
+            },
+            4096,
+        );
+        write_empty_active_pitr_wal(&dir, &state).unwrap();
+
+        let error = engine.resume_pitr_lifecycle(state).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("recovered PITR source-spool reservation estimate")
+        );
+        assert!(engine.pitr_runtime.lock().is_none());
+        assert!(engine.pitr_segments.lock().is_none());
+        assert_eq!(
+            *engine.pitr_manifest_state.lock(),
+            crate::pitr::manifest::PitrState::default()
+        );
+        engine.close().unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn resumed_pitr_counts_active_wal_file_when_reopened_without_wal() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("db");
+        let repository = dir.path().join("repository");
+        let parent = crate::backup::open_directory_no_follow(dir.path()).unwrap();
+        crate::backup::bootstrap_repository(&parent, "repository").unwrap();
+
+        let engine = KvEngine::open(
+            &database,
+            LsmStorageOptions {
+                enable_wal: true,
+                ..LsmStorageOptions::default_for_test()
+            },
+        )
+        .unwrap();
+        engine
+            .enable_pitr(crate::pitr::api::PitrOptions {
+                repository,
+                config: crate::pitr::api::PersistedPitrConfig {
+                    archive_interval: std::time::Duration::from_secs(60),
+                    max_segment_bytes: 64 * 1024,
+                    max_unarchived_bytes: 64 * 1024,
+                    max_source_spool_bytes: 128 * 1024,
+                },
+                runtime: crate::pitr::api::PitrRuntimeOptions::default(),
+            })
+            .unwrap();
+        engine.put(b"active-source", b"value").unwrap();
+        let state = engine.pitr_manifest_state.lock().clone();
+        let active_segment_id = state.active_segment_id.unwrap();
+        let active = engine.inner.state.load().memtable.clone();
+        assert_eq!(
+            LsmStorageInner::pitr_segment_of(&active),
+            Some(active_segment_id)
+        );
+        assert!(active.wal_logical_length().unwrap() > 4096);
+        engine.close().unwrap();
+
+        let wal_path = database.join(format!("pitr-{active_segment_id:020}.wal"));
+        let reopened = KvEngine::open(
+            &database,
+            LsmStorageOptions {
+                enable_wal: false,
+                ..LsmStorageOptions::default_for_test()
+            },
+        )
+        .unwrap();
+        assert!(!reopened.inner.state.load().memtable.uses_wal_v5());
+        let retained_wal_length = std::fs::metadata(&wal_path).unwrap().len();
+        assert!(retained_wal_length > 4096);
+
+        // Reproduce a state with no in-memory source WAL so lifecycle install
+        // has to recover the retained file to determine its logical length.
+        let mut recovered_state = reopened.inner.state.load_full().as_ref().clone();
+        assert!(recovered_state.imm_memtables.iter().any(|memtable| {
+            LsmStorageInner::pitr_segment_of(memtable) == Some(active_segment_id)
+        }));
+        recovered_state.imm_memtables.retain(|memtable| {
+            LsmStorageInner::pitr_segment_of(memtable) != Some(active_segment_id)
+        });
+        reopened.inner.state.store(Arc::new(recovered_state));
+
+        // Simulate a partial final batch after storage recovery but before
+        // lifecycle install; the fallback must truncate to the valid boundary.
+        let mut wal = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&wal_path)
+            .unwrap();
+        use std::io::Write as _;
+        wal.write_all(&[0xA5; 17]).unwrap();
+        wal.sync_all().unwrap();
+        assert_eq!(
+            std::fs::metadata(&wal_path).unwrap().len(),
+            retained_wal_length + 17
+        );
+
+        reopened.resume_pitr_lifecycle(state).unwrap();
+        assert_eq!(
+            std::fs::metadata(&wal_path).unwrap().len(),
+            retained_wal_length
+        );
+        let status = reopened
+            .pitr_status(crate::pitr::api::PitrStatusOptions {
+                cursor: None,
+                page_size: crate::pitr::api::MAX_STATUS_PAGE_SIZE,
+            })
+            .unwrap();
+        assert_eq!(status.active_wal_bytes, retained_wal_length);
+        assert!(status.source_spool_bytes >= retained_wal_length);
+        reopened.close_storage().unwrap();
+    }
+
     #[test]
     fn pitr_status_reflects_installed_manifest_state() {
         let dir = tempdir().unwrap();
@@ -12411,6 +13030,7 @@ mod tests {
             .begin_enable_with_identities(request, [2; 16], [3; 16])
             .unwrap();
         coordinator.complete_enable(1).unwrap();
+        write_empty_active_pitr_wal(&dir, coordinator.state()).unwrap();
         engine
             .resume_pitr_lifecycle(coordinator.state().clone())
             .unwrap();
@@ -12443,6 +13063,183 @@ mod tests {
             crate::pitr::api::PitrArchiveState::NeverEnabled
         );
         engine.close().unwrap();
+    }
+
+    #[test]
+    fn resumed_pitr_rejects_missing_active_wal_for_enabled_state() {
+        let dir = tempdir().unwrap();
+        let engine = KvEngine::open(&dir, LsmStorageOptions::default_for_test()).unwrap();
+        let mut coordinator = crate::pitr::enable::PitrEnableCoordinator::default();
+        coordinator
+            .begin_enable_with_identities(
+                crate::pitr::enable::PitrEnableRequest {
+                    repository_id: [1; 16],
+                    config: crate::pitr::manifest::PersistedPitrConfig {
+                        archive_interval_ms: 1000,
+                        max_segment_bytes: 8192,
+                        max_unarchived_bytes: 8192,
+                        max_source_spool_bytes: 16384,
+                    },
+                },
+                [2; 16],
+                [3; 16],
+            )
+            .unwrap();
+        coordinator.complete_enable(0).unwrap();
+
+        let error = engine
+            .resume_pitr_lifecycle(coordinator.state().clone())
+            .unwrap_err();
+        assert!(error.to_string().contains("active PITR WAL"));
+        assert!(engine.pitr_runtime.lock().is_none());
+        assert!(engine.pitr_segments.lock().is_none());
+        engine.close().unwrap();
+    }
+
+    #[test]
+    fn resumed_pitr_rejects_active_wal_with_mismatched_manifest_identity() {
+        let expected_header = crate::pitr::WalV5Header {
+            wal_format_version: crate::pitr::WAL_V5_VERSION,
+            timeline_id: crate::pitr::TimelineId([2; 16]),
+            archive_epoch_id: crate::pitr::ArchiveEpochId([3; 16]),
+            segment_id: crate::pitr::SegmentId(0),
+            predecessor: crate::pitr::ChainAnchor::Genesis {
+                archive_epoch_id: crate::pitr::ArchiveEpochId([3; 16]),
+            },
+        };
+        let mut wrong_segment = expected_header;
+        wrong_segment.segment_id = crate::pitr::SegmentId(1);
+        let mut wrong_timeline = expected_header;
+        wrong_timeline.timeline_id = crate::pitr::TimelineId([4; 16]);
+        let mut wrong_epoch = expected_header;
+        wrong_epoch.archive_epoch_id = crate::pitr::ArchiveEpochId([4; 16]);
+        wrong_epoch.predecessor = crate::pitr::ChainAnchor::Genesis {
+            archive_epoch_id: crate::pitr::ArchiveEpochId([4; 16]),
+        };
+        let mut wrong_predecessor = expected_header;
+        wrong_predecessor.predecessor =
+            crate::pitr::ChainAnchor::Segment(crate::pitr::SegmentAnchor {
+                segment_id: crate::pitr::SegmentId(7),
+                wal_digest: [5; 32],
+                seal_digest: [6; 32],
+            });
+        let mismatched_headers = [
+            wrong_segment,
+            wrong_timeline,
+            wrong_epoch,
+            wrong_predecessor,
+        ];
+
+        let mut coordinator = crate::pitr::enable::PitrEnableCoordinator::default();
+        coordinator
+            .begin_enable_with_identities(
+                crate::pitr::enable::PitrEnableRequest {
+                    repository_id: [1; 16],
+                    config: crate::pitr::manifest::PersistedPitrConfig {
+                        archive_interval_ms: 1000,
+                        max_segment_bytes: 8192,
+                        max_unarchived_bytes: 8192,
+                        max_source_spool_bytes: 16384,
+                    },
+                },
+                [2; 16],
+                [3; 16],
+            )
+            .unwrap();
+        coordinator.complete_enable(0).unwrap();
+
+        for header in mismatched_headers {
+            let dir = tempdir().unwrap();
+            let engine = KvEngine::open(&dir, LsmStorageOptions::default_for_test()).unwrap();
+            {
+                let _wal = crate::wal::Wal::create_v5(
+                    dir.path().join("pitr-00000000000000000000.wal"),
+                    header,
+                )
+                .unwrap();
+            }
+
+            let error = engine
+                .resume_pitr_lifecycle(coordinator.state().clone())
+                .unwrap_err();
+            assert!(format!("{error:#}").contains("does not match persisted state"));
+            assert!(engine.pitr_runtime.lock().is_none());
+            assert!(engine.pitr_segments.lock().is_none());
+            engine.close().unwrap();
+        }
+    }
+
+    #[test]
+    fn open_rejects_manifest_backed_active_wal_with_mismatched_predecessor() {
+        let dir = tempdir().unwrap();
+        let options = LsmStorageOptions {
+            enable_wal: true,
+            ..LsmStorageOptions::default_for_test()
+        };
+        let engine = KvEngine::open(&dir, options.clone()).unwrap();
+        let mut coordinator = crate::pitr::enable::PitrEnableCoordinator::default();
+        coordinator
+            .begin_enable_with_identities(
+                crate::pitr::enable::PitrEnableRequest {
+                    repository_id: [1; 16],
+                    config: crate::pitr::manifest::PersistedPitrConfig {
+                        archive_interval_ms: 1000,
+                        max_segment_bytes: 8192,
+                        max_unarchived_bytes: 8192,
+                        max_source_spool_bytes: 16384,
+                    },
+                },
+                [2; 16],
+                [3; 16],
+            )
+            .unwrap();
+        coordinator.complete_enable(0).unwrap();
+        engine
+            .persist_pitr_lifecycle(coordinator.records(), coordinator.state().clone())
+            .unwrap();
+
+        let header = crate::pitr::WalV5Header {
+            wal_format_version: crate::pitr::WAL_V5_VERSION,
+            timeline_id: crate::pitr::TimelineId([2; 16]),
+            archive_epoch_id: crate::pitr::ArchiveEpochId([3; 16]),
+            segment_id: crate::pitr::SegmentId(0),
+            predecessor: crate::pitr::ChainAnchor::Segment(crate::pitr::SegmentAnchor {
+                segment_id: crate::pitr::SegmentId(7),
+                wal_digest: [5; 32],
+                seal_digest: [6; 32],
+            }),
+        };
+        let _wal =
+            crate::wal::Wal::create_v5(dir.path().join("pitr-00000000000000000000.wal"), header)
+                .unwrap();
+        drop(_wal);
+
+        let memtable_id = engine.inner.next_sst_id();
+        let state_lock = engine.inner.state_lock.lock();
+        engine
+            .inner
+            .manifest
+            .as_ref()
+            .unwrap()
+            .add_record(
+                &state_lock,
+                crate::manifest::ManifestRecord::NewPitrMemtable {
+                    id: memtable_id,
+                    segment_id: 0,
+                },
+            )
+            .unwrap();
+        drop(state_lock);
+        engine.close_storage().unwrap();
+
+        let error = match KvEngine::open(&dir, options) {
+            Ok(engine) => {
+                engine.close().unwrap();
+                panic!("opened an active PITR WAL with the wrong predecessor anchor");
+            }
+            Err(error) => error,
+        };
+        assert!(format!("{error:#}").contains("active PITR WAL predecessor"));
     }
 
     #[test]
@@ -15639,8 +16436,27 @@ mod tests {
             sequencer,
         )
         .unwrap();
+        let timeline_id = lifecycle.state().timeline_id.unwrap();
+        let archive_epoch_id = lifecycle.state().archive_epoch_id.unwrap();
         engine
-            .complete_pitr_enable_rotation(&mut lifecycle, 1, 4096, 4096, |_| Ok(()))
+            .complete_pitr_enable_rotation(&mut lifecycle, 1, 4096, 4096, |successor_id| {
+                let _wal = crate::wal::Wal::create_v5(
+                    engine
+                        .inner
+                        .path
+                        .join(format!("pitr-{successor_id:020}.wal")),
+                    crate::pitr::WalV5Header {
+                        wal_format_version: crate::pitr::WAL_V5_VERSION,
+                        timeline_id: crate::pitr::TimelineId(timeline_id),
+                        archive_epoch_id: crate::pitr::ArchiveEpochId(archive_epoch_id),
+                        segment_id: crate::pitr::SegmentId(successor_id),
+                        predecessor: crate::pitr::ChainAnchor::Genesis {
+                            archive_epoch_id: crate::pitr::ArchiveEpochId(archive_epoch_id),
+                        },
+                    },
+                )?;
+                Ok(())
+            })
             .unwrap();
         assert_eq!(
             lifecycle.state().mode,

@@ -554,6 +554,12 @@ impl Manifest {
         self.add_records_when_init(records)
     }
 
+    /// Retry durability of previously appended records without changing the
+    /// manifest stream or its append position.
+    pub(crate) fn sync(&self, _state_lock_observer: &MutexGuard<()>) -> Result<()> {
+        self.sync_locked_file(&self.file.lock())
+    }
+
     pub fn add_record_when_init(&self, record: ManifestRecord) -> Result<()> {
         self.add_records_when_init(std::slice::from_ref(&record))
     }
@@ -579,15 +585,6 @@ impl Manifest {
             unsafe { libc::_exit(137) }
         }
 
-        #[cfg(test)]
-        {
-            let mut configured = MANIFEST_SYNC_FAILURE.lock().unwrap();
-            if configured.as_ref().is_some_and(|path| path == &self.path) {
-                configured.take();
-                return Err(std::io::Error::other("injected manifest sync failure").into());
-            }
-        }
-
         #[cfg(feature = "chaos-testing")]
         {
             let retirement_batch = records
@@ -609,6 +606,19 @@ impl Manifest {
             crate::chaos::failpoint::fail_point!("manifest.after_append_before_sync", |_| Err(
                 anyhow::anyhow!("injected manifest sync failure")
             ));
+        }
+
+        self.sync_locked_file(&file)
+    }
+
+    fn sync_locked_file(&self, file: &File) -> Result<()> {
+        #[cfg(test)]
+        {
+            let mut configured = MANIFEST_SYNC_FAILURE.lock().unwrap();
+            if configured.as_ref().is_some_and(|path| path == &self.path) {
+                configured.take();
+                return Err(std::io::Error::other("injected manifest sync failure").into());
+            }
         }
 
         file.sync_all().context("failed to sync manifest")

@@ -1636,6 +1636,118 @@ impl Wal {
         handler: &mut H,
     ) -> Result<(File, u64)> {
         let bytes = data.as_ref();
+        let (offset, max_ts) = Self::scan_recoverable_v5_batches(bytes, |decoded| {
+            handler.observe_recorded_at(decoded.batch.recorded_at);
+            handler.reset_range_ordinals();
+            for entry in decoded.batch.entries {
+                match entry {
+                    crate::pitr::WalEntry::Put { key, value } => {
+                        let key = crate::key::encode_internal_key(&key, decoded.batch.commit_ts);
+                        handler.handle_put(Bytes::from(key), Bytes::from(value))?
+                    }
+                    crate::pitr::WalEntry::PointDelete { key } => {
+                        let key = crate::key::encode_internal_key(&key, decoded.batch.commit_ts);
+                        handler.handle_point_tombstone(Bytes::from(key))?
+                    }
+                    crate::pitr::WalEntry::RangeDelete { start, end } => handler
+                        .handle_range_tombstone(
+                            Bytes::from(start),
+                            Bytes::from(end),
+                            decoded.batch.commit_ts,
+                        )?,
+                }
+            }
+            Ok(())
+        })?;
+        let valid_file_len = crate::pitr::WAL_V5_HEADER_LEN + offset;
+
+        if valid_file_len < file_len as usize {
+            f.set_len(valid_file_len as u64)?;
+            f.sync_all()?;
+        }
+        Ok((f, max_ts))
+    }
+
+    /// Recover and durably truncate a v5-family WAL file, returning its logical
+    /// length. This is used when lifecycle recovery needs the active WAL length
+    /// but the storage open did not attach that WAL to a memtable.
+    pub(crate) fn recover_v5_file_logical_length(
+        path: impl AsRef<Path>,
+        expected_segment_id: crate::pitr::SegmentId,
+        expected_timeline_id: crate::pitr::TimelineId,
+        expected_archive_epoch_id: crate::pitr::ArchiveEpochId,
+        expected_predecessor: crate::pitr::ChainAnchor,
+    ) -> Result<u64> {
+        let path = path.as_ref();
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .with_context(|| format!("failed to open PITR WAL {} for recovery", path.display()))?;
+        let file_len = file.metadata()?.len();
+        ensure!(
+            file_len <= MAX_WAL_FILE_SIZE,
+            "PITR WAL exceeds maximum file size"
+        );
+        ensure!(
+            file_len >= crate::pitr::WAL_V5_HEADER_LEN as u64,
+            "truncated PITR WAL header"
+        );
+        let mut bytes = Vec::with_capacity(usize::try_from(file_len)?);
+        file.read_to_end(&mut bytes)?;
+        ensure!(
+            bytes.len() as u64 == file_len,
+            "PITR WAL length changed during recovery"
+        );
+        let header = crate::pitr::decode_v5_file_header(&bytes[..crate::pitr::WAL_V5_HEADER_LEN])?;
+        Self::validate_v5_active_header(
+            &header,
+            expected_segment_id,
+            expected_timeline_id,
+            expected_archive_epoch_id,
+            expected_predecessor,
+        )?;
+
+        let (valid_data_len, _) = Self::scan_recoverable_v5_batches(
+            &bytes[crate::pitr::WAL_V5_HEADER_LEN..],
+            |_| Ok(()),
+        )?;
+        let logical_length = crate::pitr::WAL_V5_HEADER_LEN
+            .checked_add(valid_data_len)
+            .context("PITR WAL logical length overflow")?;
+        if logical_length < bytes.len() {
+            file.set_len(logical_length as u64)?;
+            file.sync_all()?;
+        }
+
+        Ok(logical_length as u64)
+    }
+
+    pub(crate) fn validate_v5_active_header(
+        header: &crate::pitr::WalV5Header,
+        expected_segment_id: crate::pitr::SegmentId,
+        expected_timeline_id: crate::pitr::TimelineId,
+        expected_archive_epoch_id: crate::pitr::ArchiveEpochId,
+        expected_predecessor: crate::pitr::ChainAnchor,
+    ) -> Result<()> {
+        ensure!(
+            header.segment_id == expected_segment_id
+                && header.timeline_id == expected_timeline_id
+                && header.archive_epoch_id == expected_archive_epoch_id,
+            "active PITR WAL identity does not match persisted state"
+        );
+        ensure!(
+            header.predecessor == expected_predecessor,
+            "active PITR WAL predecessor does not match persisted state"
+        );
+
+        Ok(())
+    }
+
+    fn scan_recoverable_v5_batches(
+        bytes: &[u8],
+        mut recover_batch: impl FnMut(crate::pitr::DecodedBatch) -> Result<()>,
+    ) -> Result<(usize, u64)> {
         let mut offset = 0;
         let mut max_ts = 0;
         while offset < bytes.len() {
@@ -1660,36 +1772,12 @@ impl Wal {
                 }
                 Err(error) => return Err(error),
             };
-            handler.observe_recorded_at(decoded.batch.recorded_at);
-            handler.reset_range_ordinals();
-            for entry in decoded.batch.entries {
-                match entry {
-                    crate::pitr::WalEntry::Put { key, value } => {
-                        let key = crate::key::encode_internal_key(&key, decoded.batch.commit_ts);
-                        handler.handle_put(Bytes::from(key), Bytes::from(value))?
-                    }
-                    crate::pitr::WalEntry::PointDelete { key } => {
-                        let key = crate::key::encode_internal_key(&key, decoded.batch.commit_ts);
-                        handler.handle_point_tombstone(Bytes::from(key))?
-                    }
-                    crate::pitr::WalEntry::RangeDelete { start, end } => handler
-                        .handle_range_tombstone(
-                            Bytes::from(start),
-                            Bytes::from(end),
-                            decoded.batch.commit_ts,
-                        )?,
-                }
-            }
             max_ts = max_ts.max(decoded.batch.commit_ts);
-            offset = decoded.logical_end;
+            let logical_end = decoded.logical_end;
+            recover_batch(decoded)?;
+            offset = logical_end;
         }
-        let valid_file_len = crate::pitr::WAL_V5_HEADER_LEN + offset;
-
-        if valid_file_len < file_len as usize {
-            f.set_len(valid_file_len as u64)?;
-            f.sync_all()?;
-        }
-        Ok((f, max_ts))
+        Ok((offset, max_ts))
     }
 
     fn has_valid_v5_batch_after(bytes: &[u8], offset: usize) -> bool {
