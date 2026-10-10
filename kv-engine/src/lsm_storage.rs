@@ -2436,6 +2436,26 @@ impl KvEngine {
             // let this epoch accept writes it may never archive.
             sequencer.stop_commit_admission_and_capture()?;
         }
+        let state_lock = self.inner.state_lock.lock();
+
+        self.persist_pitr_lifecycle_locked(records, state, state_lock)
+    }
+
+    /// Persist while retaining the caller's serialization with other manifest
+    /// mutations. Enablement callers must drain admission before taking the guard.
+    fn persist_pitr_lifecycle_locked(
+        &self,
+        records: &[crate::pitr::manifest::PitrManifestRecord],
+        state: crate::pitr::manifest::PitrState,
+        state_lock: MutexGuard<'_, ()>,
+    ) -> Result<()> {
+        state.validate_for_status()?;
+        let stopped_for_enable = state.mode == crate::pitr::manifest::PitrMode::Enabling;
+        let sequencer = self
+            .inner
+            .mvcc
+            .as_ref()
+            .ok_or_else(|| anyhow!("PITR lifecycle persistence requires MVCC"))?;
         let manifest = self
             .inner
             .manifest
@@ -2446,7 +2466,6 @@ impl KvEngine {
             .cloned()
             .map(ManifestRecord::Pitr)
             .collect::<Vec<_>>();
-        let state_lock = self.inner.state_lock.lock();
         let length_before = manifest.current_length()?;
         let publication = if records.is_empty() {
             // The projection may have advanced after an append whose sync
@@ -3104,6 +3123,9 @@ impl KvEngine {
         mut state: crate::pitr::manifest::PitrState,
         reclaim_sources: bool,
     ) -> Result<crate::pitr::manifest::PitrState> {
+        if let Some(manifest) = self.inner.manifest.as_ref() {
+            manifest.ensure_durability_certain()?;
+        }
         let previous_obligations = state.obligations.clone();
         // Only the sealed obligations need the repository's committed set, so a
         // state with nothing left to resolve must not demand an archiver: the
@@ -3124,6 +3146,7 @@ impl KvEngine {
             );
         }
         let mut records = Vec::new();
+        let mut reclaimable_sources = Vec::new();
         if state.mode == crate::pitr::manifest::PitrMode::PublicationUncertain {
             let segment_id = state
                 .uncertain_segment_id
@@ -3271,15 +3294,8 @@ impl KvEngine {
                     .is_some_and(|obligation| {
                         obligation.state == crate::pitr::manifest::ObligationState::Reclaimable
                     })
-                && self.cleanup_flushed_pitr_source(segment_id)?
             {
-                let record =
-                    crate::pitr::manifest::PitrManifestRecord::SegmentReclaimed { segment_id };
-                state = crate::pitr::manifest::replay_pitr_records([
-                    crate::pitr::manifest::PitrManifestRecord::Snapshot(Box::new(state)),
-                    record.clone(),
-                ])?;
-                records.push(record);
+                reclaimable_sources.push(segment_id);
             }
             if state
                 .obligations
@@ -3301,6 +3317,26 @@ impl KvEngine {
         let has_pending_reconciliation = segments
             .as_ref()
             .is_some_and(|segments| segments.has_pending_obligation_reconciliation());
+        let state_lock = self.inner.state_lock.lock();
+        // A flush or compaction can fail its manifest sync during archival I/O.
+        // Recheck under the shared mutation lock, then keep that guard through
+        // source deletion and SegmentReclaimed publication. Otherwise poison
+        // could reject the record after an empty registered WAL was removed,
+        // leaving reopen unable to retire its memtable registration.
+        if let Some(manifest) = self.inner.manifest.as_ref() {
+            manifest.ensure_durability_certain()?;
+        }
+        for segment_id in reclaimable_sources {
+            if self.cleanup_flushed_pitr_source(segment_id)? {
+                let record =
+                    crate::pitr::manifest::PitrManifestRecord::SegmentReclaimed { segment_id };
+                state = crate::pitr::manifest::replay_pitr_records([
+                    crate::pitr::manifest::PitrManifestRecord::Snapshot(Box::new(state)),
+                    record.clone(),
+                ])?;
+                records.push(record);
+            }
+        }
         if !records.is_empty() || has_pending_reconciliation {
             // Keep pins and reservations stable across preparation and durable
             // publication. A failed sync retains the original manager's charge.
@@ -3312,7 +3348,9 @@ impl KvEngine {
                     Ok::<_, anyhow::Error>(reconciled)
                 })
                 .transpose()?;
-            if let Err(error) = self.persist_pitr_lifecycle(&records, state.clone()) {
+            if let Err(error) =
+                self.persist_pitr_lifecycle_locked(&records, state.clone(), state_lock)
+            {
                 if matches!(
                     error.downcast_ref::<PitrManifestPublicationError>(),
                     Some(PitrManifestPublicationError::PublishedButNotDurable(_))
@@ -12962,6 +13000,211 @@ mod tests {
             reopened.get(b"before-tear").unwrap().as_deref(),
             Some(b"value".as_slice())
         );
+        reopened.close_storage().unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn failpoint_reconciliation_preserves_empty_source_after_manifest_poison() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("db");
+        let repository = dir.path().join("repository");
+        let parent = crate::backup::open_directory_no_follow(dir.path()).unwrap();
+        crate::backup::bootstrap_repository(&parent, "repository").unwrap();
+        let options = LsmStorageOptions {
+            enable_wal: true,
+            ..LsmStorageOptions::default_for_test()
+        };
+        let engine = KvEngine::open(&database, options.clone()).unwrap();
+        enable_pitr_for_test(&engine, &repository, PITR_TEST_ARCHIVE_INTERVAL);
+        let segment_id = engine.pitr_manifest_state.lock().active_segment_id.unwrap();
+        assert!(matches!(
+            engine.create_recovery_point().unwrap(),
+            crate::pitr::api::RecoveryPointOutcome::Durable(_)
+        ));
+        engine.close_storage().unwrap();
+        drop(engine);
+
+        // Model a crash after SegmentArchived became durable, before the
+        // following SegmentReclaimable append. The empty source still has a
+        // NewPitrMemtable registration, so reopen needs its WAL until a durable
+        // SegmentReclaimed record retires that registration.
+        let manifest_path = database.join("MANIFEST");
+        let manifest_bytes = std::fs::read(&manifest_path).unwrap();
+        let mut records = serde_json::Deserializer::from_slice(&manifest_bytes)
+            .into_iter::<crate::manifest::ManifestRecord>()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let original_count = records.len();
+        records.retain(|record| {
+            !matches!(
+                record,
+                crate::manifest::ManifestRecord::Pitr(
+                    crate::pitr::manifest::PitrManifestRecord::SegmentReclaimable {
+                        segment_id: recorded_id,
+                    }
+                ) if *recorded_id == segment_id
+            )
+        });
+        assert_eq!(records.len() + 1, original_count);
+        let mut file = std::fs::File::create(&manifest_path).unwrap();
+        for record in records {
+            serde_json::to_writer(&mut file, &record).unwrap();
+        }
+        file.sync_all().unwrap();
+        drop(file);
+
+        let wal_path = database.join(format!("pitr-{segment_id:020}.wal"));
+        let seal_path = wal_path.with_extension("seal");
+        let engine = KvEngine::open(&database, options.clone()).unwrap();
+        assert!(engine.inner.state.load().imm_memtables.is_empty());
+        assert_eq!(
+            engine.pitr_manifest_state.lock().obligations[&segment_id].state,
+            crate::pitr::manifest::ObligationState::Archived
+        );
+        crate::manifest::set_manifest_sync_failure(&manifest_path);
+        let error = engine.resume_pitr(&repository).unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<super::PitrManifestPublicationError>(),
+            Some(super::PitrManifestPublicationError::PublishedButNotDurable(
+                _
+            ))
+        ));
+        assert_eq!(
+            engine.pitr_manifest_state.lock().obligations[&segment_id].state,
+            crate::pitr::manifest::ObligationState::Reclaimable
+        );
+        assert!(wal_path.exists());
+        assert!(seal_path.exists());
+        let manifest_before_retry = std::fs::read(&manifest_path).unwrap();
+
+        let retry_error = engine.resume_pitr(&repository).unwrap_err();
+        assert!(format!("{retry_error:#}").contains("reopen required"));
+        assert!(
+            wal_path.exists(),
+            "poisoned reconciliation must keep the WAL"
+        );
+        assert!(
+            seal_path.exists(),
+            "poisoned reconciliation must keep the seal"
+        );
+        assert_eq!(
+            std::fs::read(&manifest_path).unwrap(),
+            manifest_before_retry
+        );
+        {
+            let segments = engine.pitr_segments.lock();
+            let segments = segments.as_ref().unwrap();
+            assert_eq!(segments.source_spool_reserved(), 12 * 1024);
+            assert!(segments.has_pending_obligation_reconciliation());
+        }
+        engine.close_storage().unwrap();
+        drop(engine);
+
+        let reopened = KvEngine::open(&database, options).unwrap();
+        assert!(matches!(
+            reopened.resume_pitr(&repository).unwrap(),
+            crate::pitr::api::PitrResumeOutcome::Resumed
+        ));
+        assert!(!wal_path.exists());
+        assert!(!seal_path.exists());
+        assert!(reopened.pitr_manifest_state.lock().obligations.is_empty());
+        {
+            let segments = reopened.pitr_segments.lock();
+            let segments = segments.as_ref().unwrap();
+            assert_eq!(segments.source_spool_reserved(), 4096);
+            assert!(!segments.has_pending_obligation_reconciliation());
+        }
+        reopened.close_storage().unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn failpoint_reconciliation_rechecks_manifest_poison_under_state_lock() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("db");
+        let repository = dir.path().join("repository");
+        let parent = crate::backup::open_directory_no_follow(dir.path()).unwrap();
+        crate::backup::bootstrap_repository(&parent, "repository").unwrap();
+        let options = LsmStorageOptions {
+            enable_wal: true,
+            ..LsmStorageOptions::default_for_test()
+        };
+        let engine = KvEngine::open(&database, options.clone()).unwrap();
+        enable_pitr_for_test(&engine, &repository, PITR_TEST_ARCHIVE_INTERVAL);
+        let segment_id = engine.pitr_manifest_state.lock().active_segment_id.unwrap();
+        assert!(matches!(
+            engine.create_recovery_point().unwrap(),
+            crate::pitr::api::RecoveryPointOutcome::Durable(_)
+        ));
+        engine.close_storage().unwrap();
+        drop(engine);
+
+        let engine = KvEngine::open(&database, options.clone()).unwrap();
+        assert!(engine.inner.state.load().imm_memtables.is_empty());
+        let state = engine.pitr_manifest_state.lock().clone();
+        engine.resume_pitr_lifecycle(state.clone()).unwrap();
+        let manifest = engine.inner.manifest.as_ref().unwrap();
+        let wal_path = database.join(format!("pitr-{segment_id:020}.wal"));
+        let seal_path = wal_path.with_extension("seal");
+        let manifest_path = database.join("MANIFEST");
+        let manifest_before_retry = std::fs::read(&manifest_path).unwrap();
+        let state_guard = engine.inner.state_lock.lock();
+        std::thread::scope(|scope| {
+            let reconciliation = scope.spawn(|| {
+                let _barrier = engine.pitr_barrier_lock.lock();
+                engine.reconcile_durable_archive_obligations(state)
+            });
+            // Reconciliation takes the manager lock after its first health
+            // check, then waits for the state guard held by this thread. Model
+            // an unrelated flush/compaction sync failing in that interval.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let reached_cleanup = loop {
+                if engine.pitr_segments.try_lock().is_none() {
+                    break true;
+                }
+                if std::time::Instant::now() >= deadline {
+                    break false;
+                }
+                std::thread::yield_now();
+            };
+            crate::manifest::set_manifest_sync_failure(&manifest_path);
+            let sync_result = manifest.sync(&state_guard);
+            // Release even on timeout so a failed assertion cannot strand the
+            // worker and deadlock the scoped-thread join.
+            drop(state_guard);
+            let result = reconciliation.join().unwrap();
+            assert!(
+                reached_cleanup,
+                "reconciliation did not reach the cleanup gate"
+            );
+            assert!(sync_result.is_err());
+            let error = result.unwrap_err();
+            assert!(format!("{error:#}").contains("reopen required"));
+        });
+        assert!(wal_path.exists());
+        assert!(seal_path.exists());
+        assert_eq!(
+            std::fs::read(&manifest_path).unwrap(),
+            manifest_before_retry
+        );
+        {
+            let segments = engine.pitr_segments.lock();
+            let segments = segments.as_ref().unwrap();
+            assert_eq!(segments.source_spool_reserved(), 12 * 1024);
+            assert!(!segments.has_pending_obligation_reconciliation());
+        }
+        engine.close_storage().unwrap();
+        drop(engine);
+
+        let reopened = KvEngine::open(&database, options).unwrap();
+        assert!(matches!(
+            reopened.resume_pitr(&repository).unwrap(),
+            crate::pitr::api::PitrResumeOutcome::Resumed
+        ));
+        assert!(!wal_path.exists());
+        assert!(!seal_path.exists());
+        assert!(reopened.pitr_manifest_state.lock().obligations.is_empty());
         reopened.close_storage().unwrap();
     }
 

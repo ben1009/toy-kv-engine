@@ -21,7 +21,10 @@ sync, releases reclaimed source charges, and consumes completed sealing's
 pending successor reservation while preserving live pins and reservations.
 If a failed sync has already advanced the manifest projection, the poisoned
 manifest handle rejects further mutation or sync, and retries retain the pending
-bookkeeping until reopen. Recovery rewrites the exact accepted snapshot and
+bookkeeping and unreclaimed source files until reopen. Source cleanup checks
+manifest health under the shared state lock and retains that guard through the
+reclamation append, excluding concurrent manifest failures between those steps.
+Recovery rewrites the exact accepted snapshot and
 manifest bytes to fresh inodes, syncs them, atomically replaces their paths, and
 syncs the directory before exposing replayed state. Reconciliation then applies
 the recovered bookkeeping without appending duplicate lifecycle records or a
