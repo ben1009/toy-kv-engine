@@ -2481,7 +2481,6 @@ impl KvEngine {
                 // that another sync on this handle can settle it; keep the
                 // reservation deferred until reopen rewrites and syncs the
                 // accepted manifest bytes before replaying the transition.
-                drop(state_lock);
                 *self.inner.pitr_state.lock() = state.clone();
                 *self.pitr_manifest_state.lock() = state;
                 return Err(anyhow::Error::new(
@@ -2496,7 +2495,6 @@ impl KvEngine {
             // accept writes it can no longer archive.
             match manifest.revalidate_appended_records(&records, length_before) {
                 Ok(true) => {
-                    drop(state_lock);
                     *self.inner.pitr_state.lock() = state.clone();
                     *self.pitr_manifest_state.lock() = state;
                     return Err(anyhow::Error::new(
@@ -2521,8 +2519,9 @@ impl KvEngine {
                 }
             }
         }
-        *self.inner.pitr_state.lock() = state.clone();
-        drop(state_lock);
+        // Both projections must be visible before a flush can append another
+        // lifecycle record under this guard. Publishing after releasing it can
+        // overwrite that flush's newer reclamation with our older snapshot.
         *self.inner.pitr_state.lock() = state.clone();
         *self.pitr_manifest_state.lock() = state;
 
@@ -3870,22 +3869,46 @@ impl KvEngine {
                 }],
                 archived_state,
             )?;
-            let reclaimable_state = crate::pitr::manifest::replay_pitr_records([
-                crate::pitr::manifest::PitrManifestRecord::Snapshot(Box::new(
-                    self.pitr_manifest_state.lock().clone(),
-                )),
-                crate::pitr::manifest::PitrManifestRecord::SegmentReclaimable {
+            {
+                // Publish the durable transition and its bookkeeping together.
+                // A background flush can reclaim the source as soon as the
+                // projection becomes Reclaimable, so it must not observe the
+                // manager still naming this segment as Active afterwards.
+                // Reconciliation uses the same manager-before-state lock order.
+                let mut segments = self.pitr_segments.lock();
+                let reclaimed_segments = segments
+                    .as_ref()
+                    .map(|segments| {
+                        let mut reclaimed = segments.clone();
+                        reclaimed.record_sealed(
+                            active_segment_id,
+                            seal.logical_length,
+                            successor_segment_id,
+                        )?;
+                        reclaimed.mark_archived(active_segment_id)?;
+                        reclaimed.mark_reclaimable(active_segment_id)?;
+                        reclaimed.release_archive_pin(active_segment_id)?;
+                        reclaimed.record_reclaimed(active_segment_id)?;
+                        Ok::<_, anyhow::Error>(reclaimed)
+                    })
+                    .transpose()?;
+                let state_lock = self.inner.state_lock.lock();
+                let reclaimable = crate::pitr::manifest::PitrManifestRecord::SegmentReclaimable {
                     segment_id: active_segment_id,
-                },
-            ])?;
-            self.persist_pitr_lifecycle(
-                &[
-                    crate::pitr::manifest::PitrManifestRecord::SegmentReclaimable {
-                        segment_id: active_segment_id,
-                    },
-                ],
-                reclaimable_state,
-            )?;
+                };
+                let reclaimable_state = crate::pitr::manifest::replay_pitr_records([
+                    crate::pitr::manifest::PitrManifestRecord::Snapshot(Box::new(
+                        self.inner.pitr_state.lock().clone(),
+                    )),
+                    reclaimable.clone(),
+                ])?;
+                self.persist_pitr_lifecycle_locked(&[reclaimable], reclaimable_state, state_lock)?;
+                #[cfg(feature = "chaos-testing")]
+                crate::chaos::failpoint::fail_point!(
+                    "pitr.after_reclaimable_manifest_before_bookkeeping"
+                );
+                *segments = reclaimed_segments;
+            }
             if resume_admission_on_success {
                 let config = state.config.as_ref().unwrap();
                 self.inner.state.load().memtable.configure_pitr_wal_limits(
@@ -3893,20 +3916,6 @@ impl KvEngine {
                     config.max_unarchived_bytes,
                 )?;
             }
-            // Keep the existing bookkeeping in step rather than replacing it:
-            // a fresh manager knows nothing about the segments it superseded,
-            // so reported status would understate sealed and spool bytes.
-            self.record_segment_bookkeeping(|segments| {
-                segments.record_sealed(
-                    active_segment_id,
-                    seal.logical_length,
-                    successor_segment_id,
-                )?;
-                segments.mark_archived(active_segment_id)?;
-                segments.mark_reclaimable(active_segment_id)?;
-                segments.release_archive_pin(active_segment_id)?;
-                segments.record_reclaimed(active_segment_id)
-            })?;
 
             Ok(crate::pitr::api::RecoveryPointOutcome::Durable(point))
         })();
@@ -7087,13 +7096,25 @@ impl LsmStorageInner {
                 // none, and `SegmentReclaimed` proves the segment was archived -
                 // unlike a heuristic from the frontier, it cannot be produced by
                 // a file deleted from under a live segment.
+                // If cleanup completed before that record could be appended,
+                // a durable Reclaimable obligation with a header-only logical
+                // length also proves the registered memtable was empty. Archive
+                // durability alone cannot retire a nonempty, unflushed source.
                 let retired: Vec<usize> = missing_ids
                     .iter()
                     .copied()
                     .filter(|id| {
-                        pitr_memtable_segments
-                            .get(id)
-                            .is_some_and(|segment_id| reclaimed_pitr_segments.contains(segment_id))
+                        pitr_memtable_segments.get(id).is_some_and(|segment_id| {
+                            reclaimed_pitr_segments.contains(segment_id)
+                                || pitr_state.obligations.get(segment_id).is_some_and(
+                                    |obligation| {
+                                        obligation.state
+                                            == crate::pitr::manifest::ObligationState::Reclaimable
+                                            && obligation.logical_length
+                                                == crate::pitr::WAL_V5_HEADER_LEN as u64
+                                    },
+                                )
+                        })
                     })
                     .collect();
                 if !retired.is_empty() {
@@ -12378,6 +12399,7 @@ impl LsmStorageInner {
             }
             self.sync_dir()?;
             let record = crate::pitr::manifest::PitrManifestRecord::SegmentReclaimed { segment_id };
+            let source_identity = (pitr_state.timeline_id, pitr_state.archive_epoch_id);
             let next_pitr_state = crate::pitr::manifest::replay_pitr_records([
                 crate::pitr::manifest::PitrManifestRecord::Snapshot(Box::new(pitr_state)),
                 record.clone(),
@@ -12389,6 +12411,27 @@ impl LsmStorageInner {
             *self.pitr_state.lock() = next_pitr_state.clone();
             if let Some(engine) = self.weak_engine.get().and_then(std::sync::Weak::upgrade) {
                 *engine.pitr_manifest_state.lock() = next_pitr_state;
+                // Reconciliation takes the manager lock before state_lock, so
+                // release the state guard before retiring the recovered charge.
+                // The reclamation record is already durable; another reconciler
+                // may have removed this segment by the time we reach the manager.
+                drop(state_lock);
+                #[cfg(feature = "chaos-testing")]
+                crate::chaos::failpoint::fail_point!("pitr.after_reclamation_before_bookkeeping");
+                engine.record_segment_bookkeeping(|segments| {
+                    // Segment IDs can be reused after disable/re-enable. Check
+                    // identity while holding the manager: installation publishes
+                    // the new identity before replacing its segment bookkeeping.
+                    let current = engine.pitr_manifest_state.lock();
+                    if source_identity == (current.timeline_id, current.archive_epoch_id)
+                        && segments.segment(segment_id).is_some_and(|segment| {
+                            segment.state == crate::pitr::segment::SegmentState::Reclaimable
+                        })
+                    {
+                        segments.record_reclaimed(segment_id)?;
+                    }
+                    Ok(())
+                })?;
             }
             return Ok(());
         }
@@ -12933,6 +12976,355 @@ mod tests {
                 .is_none()
         );
         reopened.close_storage().unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pitr_reopens_after_empty_source_cleanup_before_reclamation_record() {
+        for remove_seal in [false, true] {
+            let dir = tempdir().unwrap();
+            let database = dir.path().join("db");
+            let repository = dir.path().join("repository");
+            let parent = crate::backup::open_directory_no_follow(dir.path()).unwrap();
+            crate::backup::bootstrap_repository(&parent, "repository").unwrap();
+            let options = LsmStorageOptions {
+                enable_wal: true,
+                ..LsmStorageOptions::default_for_test()
+            };
+            let engine = KvEngine::open(&database, options.clone()).unwrap();
+            enable_pitr_for_test(&engine, &repository, PITR_TEST_ARCHIVE_INTERVAL);
+            let segment_id = engine.pitr_manifest_state.lock().active_segment_id.unwrap();
+            assert!(matches!(
+                engine.create_recovery_point().unwrap(),
+                crate::pitr::api::RecoveryPointOutcome::Durable(_)
+            ));
+            let obligation = engine.pitr_manifest_state.lock().obligations[&segment_id];
+            assert_eq!(
+                obligation.state,
+                crate::pitr::manifest::ObligationState::Reclaimable
+            );
+            assert_eq!(
+                obligation.logical_length,
+                crate::pitr::WAL_V5_HEADER_LEN as u64
+            );
+            engine.close_storage().unwrap();
+            drop(engine);
+
+            // A crash or failed reclamation append can leave either deletion
+            // durable without any SegmentReclaimed record. The header-only
+            // length in the durable obligation proves there were no records
+            // behind the remaining NewPitrMemtable registration.
+            let wal_path = database.join(format!("pitr-{segment_id:020}.wal"));
+            let seal_path = wal_path.with_extension("seal");
+            std::fs::remove_file(&wal_path).unwrap();
+            if remove_seal {
+                std::fs::remove_file(&seal_path).unwrap();
+            }
+            std::fs::File::open(&database).unwrap().sync_all().unwrap();
+            let reopened = KvEngine::open(&database, options.clone())
+                .expect("a durable empty Reclaimable obligation can retire the missing source");
+            assert_eq!(reopened.inner.repaired_memtable_ids.len(), 1);
+            assert_eq!(
+                reopened.pitr_manifest_state.lock().obligations[&segment_id],
+                obligation
+            );
+            // Retirement is snapshotted before open returns; a second reopen
+            // must not require the missing WAL or repeat the retirement.
+            reopened.close_storage().unwrap();
+            drop(reopened);
+            let reopened = KvEngine::open(&database, options).unwrap();
+            assert!(reopened.inner.repaired_memtable_ids.is_empty());
+            assert!(matches!(
+                reopened.resume_pitr(&repository).unwrap(),
+                crate::pitr::api::PitrResumeOutcome::Resumed
+            ));
+            assert!(reopened.pitr_manifest_state.lock().obligations.is_empty());
+            assert!(!seal_path.exists());
+            let status = reopened
+                .pitr_status(crate::pitr::api::PitrStatusOptions {
+                    cursor: None,
+                    page_size: crate::pitr::api::MAX_STATUS_PAGE_SIZE,
+                })
+                .unwrap();
+            assert_eq!(
+                status.source_spool_bytes,
+                crate::pitr::WAL_V5_HEADER_LEN as u64
+            );
+            reopened.close_storage().unwrap();
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pitr_rejects_missing_reclaimable_source_with_unflushed_records() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("db");
+        let repository = dir.path().join("repository");
+        let parent = crate::backup::open_directory_no_follow(dir.path()).unwrap();
+        crate::backup::bootstrap_repository(&parent, "repository").unwrap();
+        let options = LsmStorageOptions {
+            enable_wal: true,
+            ..LsmStorageOptions::default_for_test()
+        };
+        let engine = KvEngine::open(&database, options.clone()).unwrap();
+        enable_pitr_for_test(&engine, &repository, PITR_TEST_ARCHIVE_INTERVAL);
+        engine.put(b"unflushed", b"value").unwrap();
+        let segment_id = engine.pitr_manifest_state.lock().active_segment_id.unwrap();
+        assert!(matches!(
+            engine.create_recovery_point().unwrap(),
+            crate::pitr::api::RecoveryPointOutcome::Durable(_)
+        ));
+        let obligation = engine.pitr_manifest_state.lock().obligations[&segment_id];
+        assert_eq!(
+            obligation.state,
+            crate::pitr::manifest::ObligationState::Reclaimable
+        );
+        assert!(obligation.logical_length > crate::pitr::WAL_V5_HEADER_LEN as u64);
+        assert!(engine.inner.state.load().l0_sstables.is_empty());
+        engine.close_storage().unwrap();
+        drop(engine);
+
+        let wal_path = database.join(format!("pitr-{segment_id:020}.wal"));
+        std::fs::remove_file(&wal_path).unwrap();
+        std::fs::remove_file(wal_path.with_extension("seal")).unwrap();
+        std::fs::File::open(&database).unwrap().sync_all().unwrap();
+        let error = KvEngine::open(&database, options)
+            .err()
+            .expect("archive durability cannot replace an unflushed local WAL");
+        assert!(
+            format!("{error:#}").contains("segment WAL")
+                || format!("{error:#}").contains("not enough identity-matched PITR WALs"),
+            "unexpected recovery error: {error:#}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn resumed_pitr_releases_recovered_source_charge_after_flush() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("db");
+        let repository = dir.path().join("repository");
+        let parent = crate::backup::open_directory_no_follow(dir.path()).unwrap();
+        crate::backup::bootstrap_repository(&parent, "repository").unwrap();
+        let options = LsmStorageOptions {
+            enable_wal: true,
+            ..LsmStorageOptions::default_for_test()
+        };
+        let engine = KvEngine::open(&database, options.clone()).unwrap();
+        enable_pitr_for_test(&engine, &repository, PITR_TEST_ARCHIVE_INTERVAL);
+        engine.put(b"recovered", b"value").unwrap();
+        let segment_id = engine.pitr_manifest_state.lock().active_segment_id.unwrap();
+        assert!(matches!(
+            engine.create_recovery_point().unwrap(),
+            crate::pitr::api::RecoveryPointOutcome::Durable(_)
+        ));
+        let logical_length =
+            engine.pitr_manifest_state.lock().obligations[&segment_id].logical_length;
+        engine.close_storage().unwrap();
+        drop(engine);
+
+        let reopened = KvEngine::open(&database, options.clone()).unwrap();
+        assert!(matches!(
+            reopened.resume_pitr(&repository).unwrap(),
+            crate::pitr::api::PitrResumeOutcome::Resumed
+        ));
+        assert_eq!(reopened.inner.state.load().imm_memtables.len(), 1);
+        assert_eq!(
+            reopened
+                .pitr_segments
+                .lock()
+                .as_ref()
+                .unwrap()
+                .source_spool_reserved(),
+            logical_length + 8192
+        );
+        reopened.force_flush().unwrap();
+        assert!(reopened.pitr_manifest_state.lock().obligations.is_empty());
+        assert!(!database.join(format!("pitr-{segment_id:020}.wal")).exists());
+        let status = reopened
+            .pitr_status(crate::pitr::api::PitrStatusOptions {
+                cursor: None,
+                page_size: crate::pitr::api::MAX_STATUS_PAGE_SIZE,
+            })
+            .unwrap();
+        assert_eq!(status.source_spool_bytes, status.active_wal_bytes);
+        assert!(
+            reopened
+                .pitr_segments
+                .lock()
+                .as_ref()
+                .unwrap()
+                .segment(segment_id)
+                .is_none()
+        );
+        reopened.resume_pitr(&repository).unwrap();
+        assert_eq!(
+            reopened.get(b"recovered").unwrap().as_deref(),
+            Some(b"value".as_slice())
+        );
+        reopened.close_storage().unwrap();
+        drop(reopened);
+        let reopened = KvEngine::open(&database, options).unwrap();
+        reopened.resume_pitr(&repository).unwrap();
+        assert_eq!(
+            reopened.get(b"recovered").unwrap().as_deref(),
+            Some(b"value".as_slice())
+        );
+        reopened.close_storage().unwrap();
+    }
+
+    #[cfg(all(target_os = "linux", feature = "chaos-testing"))]
+    #[test]
+    fn failpoint_pitr_flush_waits_for_boundary_bookkeeping() {
+        use crate::chaos::failpoint::FailScenario;
+        use std::{sync::mpsc, time::Duration};
+
+        let scenario = FailScenario::setup();
+        let dir = tempdir().unwrap();
+        let engine = pitr_flush_test_engine(dir.path());
+        engine.put(b"boundary", b"value").unwrap();
+        let segment_id = engine.pitr_manifest_state.lock().active_segment_id.unwrap();
+        let (boundary_entered_tx, boundary_entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let release_rx = parking_lot::Mutex::new(release_rx);
+        fail::cfg_callback(
+            "pitr.after_reclaimable_manifest_before_bookkeeping",
+            move || {
+                boundary_entered_tx.send(()).unwrap();
+                release_rx
+                    .lock()
+                    .recv_timeout(Duration::from_secs(10))
+                    .unwrap();
+            },
+        )
+        .unwrap();
+        let (flush_entered_tx, flush_entered_rx) = mpsc::channel();
+        fail::cfg_callback("pitr.after_reclamation_before_bookkeeping", move || {
+            flush_entered_tx.send(()).unwrap();
+        })
+        .unwrap();
+
+        let boundary_engine = Arc::clone(&engine);
+        let boundary = std::thread::spawn(move || boundary_engine.create_recovery_point());
+        boundary_entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+        let flush_engine = Arc::clone(&engine);
+        let (flushed_tx, flushed_rx) = mpsc::channel();
+        let flush = std::thread::spawn(move || {
+            let result = flush_engine.inner.force_flush_next_imm_memtable();
+            flushed_tx.send(()).unwrap();
+
+            result
+        });
+        flush_entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+        // Flushing and manifest reclamation are already durable, but their
+        // bookkeeping must wait until the boundary publishes its prepared
+        // manager. Before serialization this saw an Active segment and failed.
+        let manager_is_locked = engine.pitr_segments.try_lock().is_none();
+        let flush_is_waiting = matches!(flushed_rx.try_recv(), Err(mpsc::TryRecvError::Empty));
+        let projection = engine.pitr_manifest_state.lock().clone();
+        release_tx.send(()).unwrap();
+        let boundary_result = boundary.join().unwrap();
+        let flush_result = flush.join().unwrap();
+        fail::remove("pitr.after_reclaimable_manifest_before_bookkeeping");
+        fail::remove("pitr.after_reclamation_before_bookkeeping");
+
+        assert!(manager_is_locked);
+        assert!(flush_is_waiting);
+        assert!(!projection.obligations.contains_key(&segment_id));
+        assert!(matches!(
+            boundary_result.unwrap(),
+            crate::pitr::api::RecoveryPointOutcome::Durable(_)
+        ));
+        flush_result.unwrap();
+        assert!(engine.pitr_manifest_state.lock().obligations.is_empty());
+        assert_eq!(
+            engine
+                .pitr_segments
+                .lock()
+                .as_ref()
+                .unwrap()
+                .source_spool_reserved(),
+            crate::pitr::WAL_V5_HEADER_LEN as u64
+        );
+        assert_eq!(
+            engine.get(b"boundary").unwrap().as_deref(),
+            Some(b"value".as_slice())
+        );
+        engine.close_storage().unwrap();
+        scenario.teardown();
+    }
+
+    #[cfg(all(target_os = "linux", feature = "chaos-testing"))]
+    #[test]
+    fn failpoint_pitr_flush_does_not_retire_replacement_epoch_charge() {
+        use crate::chaos::failpoint::FailScenario;
+        use std::{sync::mpsc, time::Duration};
+
+        let scenario = FailScenario::setup();
+        let dir = tempdir().unwrap();
+        let engine = pitr_flush_test_engine(dir.path());
+        engine.put(b"source", b"value").unwrap();
+        let segment_id = engine.pitr_manifest_state.lock().active_segment_id.unwrap();
+        assert!(matches!(
+            engine.create_recovery_point().unwrap(),
+            crate::pitr::api::RecoveryPointOutcome::Durable(_)
+        ));
+        let mut replacement = engine.pitr_manifest_state.lock().clone();
+        let mut new_epoch = replacement.archive_epoch_id.unwrap();
+        new_epoch[0] ^= 1;
+        replacement.archive_epoch_id = Some(new_epoch);
+        let replacement_segments = crate::pitr::segment::PitrSegmentManager::from_recovered_state(
+            replacement.active_segment_id.unwrap(),
+            replacement.next_segment_id,
+            crate::pitr::WAL_V5_HEADER_LEN as u64,
+            replacement.config.as_ref().unwrap().max_source_spool_bytes,
+            &replacement.obligations,
+        )
+        .unwrap();
+        let expected_charge = replacement_segments.source_spool_reserved();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let release_rx = parking_lot::Mutex::new(release_rx);
+        fail::cfg_callback("pitr.after_reclamation_before_bookkeeping", move || {
+            entered_tx.send(()).unwrap();
+            release_rx
+                .lock()
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap();
+        })
+        .unwrap();
+
+        let flush_engine = Arc::clone(&engine);
+        let flush = std::thread::spawn(move || flush_engine.inner.force_flush_next_imm_memtable());
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(engine.pitr_manifest_state.lock().obligations.is_empty());
+        // Model lifecycle installation with a reused segment ID in another
+        // epoch. As in install_pitr_lifecycle, identity is published before the
+        // manager is replaced; this fixture does not change on-disk WAL identity.
+        {
+            let _barrier = engine.pitr_barrier_lock.lock();
+            *engine.inner.pitr_state.lock() = replacement.clone();
+            *engine.pitr_manifest_state.lock() = replacement;
+            *engine.pitr_segments.lock() = Some(replacement_segments);
+        }
+        release_tx.send(()).unwrap();
+        flush.join().unwrap().unwrap();
+        fail::remove("pitr.after_reclamation_before_bookkeeping");
+        {
+            let segments = engine.pitr_segments.lock();
+            let segments = segments.as_ref().unwrap();
+            assert_eq!(segments.source_spool_reserved(), expected_charge);
+            assert_eq!(
+                segments.segment(segment_id).unwrap().state,
+                crate::pitr::segment::SegmentState::Reclaimable
+            );
+        }
+        engine.close_storage().unwrap();
+        scenario.teardown();
     }
 
     #[cfg(target_os = "linux")]

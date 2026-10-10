@@ -19,6 +19,15 @@ Live segment lifecycle reconstruction is now wired before PITR runtime attach.
 Reconciliation updates the recovered bookkeeping after successful manifest
 sync, releases reclaimed source charges, and consumes completed sealing's
 pending successor reservation while preserving live pins and reservations.
+Flush-driven reclamation also releases recovered source charges after its
+manifest record is durable, with delayed retirement scoped to the same archive
+epoch. Recovery-point publication serializes its manager transition with the
+durable Reclaimable record, and both manifest projections publish under the
+state lock before concurrent flushes can advance them.
+If cleanup loses an empty source before reclamation
+is recorded, recovery can retire its memtable registration only with a durable
+Reclaimable obligation whose logical length proves it was header-only; missing
+nonempty sources still fail recovery.
 If a failed sync has already advanced the manifest projection, the poisoned
 manifest handle rejects further mutation or sync, and retries retain the pending
 bookkeeping and unreclaimed source files until reopen. Source cleanup checks
