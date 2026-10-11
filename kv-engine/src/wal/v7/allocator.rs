@@ -252,17 +252,25 @@ impl WalV7PhysicalAllocator {
                     .expect("the first allocation added a range")
                     .end = allocation.frame_range.end;
             } else {
-                let frontier_end = prior
-                    .frame_range
-                    .end
-                    .checked_add(FRAME_LEN_U64)
-                    .ok_or_else(|| anyhow::anyhow!("v7 control-frame end overflows"))?;
+                let first_frontier = self
+                    .frontier_offsets
+                    .partition_point(|offset| *offset < prior.frame_range.end);
+                let after_last_frontier = self
+                    .frontier_offsets
+                    .partition_point(|offset| *offset < allocation.frame_range.start);
+                let mut control_offset = prior.frame_range.end;
+                for &frontier_offset in &self.frontier_offsets[first_frontier..after_last_frontier]
+                {
+                    ensure!(
+                        frontier_offset == control_offset,
+                        "v7 DATA allocations are separated by an unreserved control gap"
+                    );
+                    control_offset = control_offset
+                        .checked_add(FRAME_LEN_U64)
+                        .ok_or_else(|| anyhow::anyhow!("v7 control-frame end overflows"))?;
+                }
                 ensure!(
-                    allocation.frame_range.start == frontier_end
-                        && self
-                            .frontier_offsets
-                            .binary_search(&prior.frame_range.end)
-                            .is_ok(),
+                    control_offset == allocation.frame_range.start,
                     "v7 DATA allocations are separated by an unreserved control gap"
                 );
                 ranges.push(allocation.frame_range.clone());
@@ -364,6 +372,31 @@ mod tests {
             [
                 START..START + 2 * FRAME,
                 START + 3 * FRAME..START + 4 * FRAME
+            ]
+        );
+    }
+
+    #[test]
+    fn group_ranges_split_at_multiple_consecutive_frontiers() {
+        let mut allocator = allocator(START + 6 * FRAME);
+        let first = allocator.reserve_data(1).unwrap();
+        let second = allocator.reserve_data(1).unwrap();
+
+        let first_frontier = allocator.reserve_frontier(1).unwrap();
+        allocator.complete_frontier_sync(first_frontier).unwrap();
+        let second_frontier = allocator.reserve_frontier(2).unwrap();
+        allocator.complete_frontier_sync(second_frontier).unwrap();
+
+        let third = allocator.reserve_data(1).unwrap();
+
+        assert_eq!(first.ticket(), 0);
+        assert_eq!(second.ticket(), 1);
+        assert_eq!(third.ticket(), 2);
+        assert_eq!(
+            allocator.data_write_ranges(&[second, third]).unwrap(),
+            [
+                START + FRAME..START + 2 * FRAME,
+                START + 4 * FRAME..START + 5 * FRAME,
             ]
         );
     }
@@ -488,7 +521,7 @@ mod tests {
     }
 
     #[test]
-    fn group_rejects_unaccounted_gaps_and_noncontiguous_tickets() {
+    fn group_rejects_noncontiguous_tickets() {
         let mut allocator = allocator(START + 8 * FRAME);
         let first = allocator.reserve_data(1).unwrap();
         let _second = allocator.reserve_data(1).unwrap();
