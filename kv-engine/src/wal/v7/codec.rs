@@ -1,10 +1,11 @@
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use sha2::{Digest, Sha256};
 
 use crate::{
     pitr::{
-        ArchiveEpochId, ChainAnchor, SegmentId, TimelineId, WAL_V5_HEADER_LEN, WAL_V5_MAGIC,
-        WAL_V5_VERSION, WalV5Header, WalV5Limits, decode_v5_file_header, encode_v5_file_header,
+        ArchiveEpochId, CanonicalWalEntryStream, ChainAnchor, SegmentId, TimelineId,
+        WAL_V5_HEADER_LEN, WAL_V5_MAGIC, WAL_V5_VERSION, WalBatch, WalV5Header, WalV5Limits,
+        decode_v5_file_header, encode_v5_file_header,
     },
     wal::format::WAL_FORMAT_VERSION_V7,
 };
@@ -314,7 +315,18 @@ impl WalV7LogicalBatchHeader {
     ) -> Result<[u8; WAL_V7_LOGICAL_BATCH_HEADER_LEN]> {
         validate_v7_batch_limits(limits)?;
         self.validate(data.len(), limits)?;
-        let data_len = u32::try_from(data.len())?;
+        self.encode_with_data_crc(data.len(), crc32fast::hash(data), limits)
+    }
+
+    fn encode_with_data_crc(
+        self,
+        data_len: usize,
+        data_crc: u32,
+        limits: WalV5Limits,
+    ) -> Result<[u8; WAL_V7_LOGICAL_BATCH_HEADER_LEN]> {
+        validate_v7_batch_limits(limits)?;
+        self.validate(data_len, limits)?;
+        let data_len = u32::try_from(data_len)?;
 
         let mut output = [0_u8; WAL_V7_LOGICAL_BATCH_HEADER_LEN];
         output[0..8].copy_from_slice(&self.segment_ticket.to_be_bytes());
@@ -323,7 +335,7 @@ impl WalV7LogicalBatchHeader {
         output[24..28].copy_from_slice(&self.recorded_at_nanos.to_be_bytes());
         output[28..32].copy_from_slice(&self.entry_count.to_be_bytes());
         output[32..36].copy_from_slice(&data_len.to_be_bytes());
-        output[36..40].copy_from_slice(&crc32fast::hash(data).to_be_bytes());
+        output[36..40].copy_from_slice(&data_crc.to_be_bytes());
         let header_crc = crc32fast::hash(&output[..40]);
         output[40..44].copy_from_slice(&header_crc.to_be_bytes());
         Ok(output)
@@ -406,6 +418,46 @@ impl WalV7LogicalBatchHeader {
         );
         Ok(())
     }
+}
+
+/// Encode the canonical logical-batch byte sequence carried by v7 DATA
+/// fragments. The returned bytes start with the ticketed 48-byte v7 header,
+/// followed by the existing RFC 023 entry stream.
+pub(crate) fn encode_logical_batch(
+    segment_ticket: u64,
+    batch: &WalBatch,
+    limits: WalV5Limits,
+) -> Result<Vec<u8>> {
+    let canonical = CanonicalWalEntryStream::new(batch, limits)?;
+    let entry_stream_len = canonical.data_len();
+    let logical_len = WAL_V7_LOGICAL_BATCH_HEADER_LEN
+        .checked_add(entry_stream_len)
+        .context("v7 logical batch length overflows")?;
+    let logical_len_u64 =
+        u64::try_from(logical_len).context("v7 logical batch length exceeds u64")?;
+    ensure!(
+        data_fragment_count(logical_len_u64).is_some(),
+        "v7 logical batch length is outside wire bounds"
+    );
+
+    let mut output = vec![0; logical_len];
+    let entry_stream = &mut output[WAL_V7_LOGICAL_BATCH_HEADER_LEN..];
+    let (written, entry_stream_crc) = canonical.encode_into(entry_stream)?;
+    ensure!(
+        written == entry_stream_len,
+        "v7 logical batch entry stream length changed while encoding"
+    );
+    let header = WalV7LogicalBatchHeader {
+        segment_ticket,
+        commit_ts: batch.commit_ts,
+        recorded_at_secs: batch.recorded_at.secs,
+        recorded_at_nanos: batch.recorded_at.nanos,
+        entry_count: canonical.entry_count(),
+    }
+    .encode_with_data_crc(entry_stream.len(), entry_stream_crc, limits)?;
+    output[..WAL_V7_LOGICAL_BATCH_HEADER_LEN].copy_from_slice(&header);
+
+    Ok(output)
 }
 
 fn validate_v7_batch_limits(limits: WalV5Limits) -> Result<()> {
@@ -774,7 +826,7 @@ fn frame_crc(frame: &[u8]) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pitr::{ArchiveEpochId, ChainAnchor, SegmentId, TimelineId};
+    use crate::pitr::{ArchiveEpochId, ChainAnchor, SegmentId, TimelineId, WalEntry};
 
     const HEADER_DIGEST_HEX: &str =
         "0120a7cbc450e3206a68a9e1923c6a0d89158b0afcdb9c34f67e9f58597f2a50";
@@ -994,6 +1046,22 @@ mod tests {
         let logical_header = &batch[..WAL_V7_LOGICAL_BATCH_HEADER_LEN];
         let entry_stream = &batch[WAL_V7_LOGICAL_BATCH_HEADER_LEN..];
         assert_eq!(
+            encode_logical_batch(
+                batch_header.segment_ticket,
+                &WalBatch {
+                    commit_ts: batch_header.commit_ts,
+                    recorded_at: crate::pitr::RecordedAt {
+                        secs: batch_header.recorded_at_secs,
+                        nanos: batch_header.recorded_at_nanos,
+                    },
+                    entries: vec![WalEntry::PointDelete { key: b"k".to_vec() }],
+                },
+                crate::pitr::LIVE_WAL_V5_LIMITS,
+            )?
+            .as_slice(),
+            batch
+        );
+        assert_eq!(
             batch_header
                 .encode(entry_stream, crate::pitr::LIVE_WAL_V5_LIMITS)?
                 .as_slice(),
@@ -1017,6 +1085,146 @@ mod tests {
             decode_frame_structural(&data_frame, 8192, &header_digest)?.body,
             data_body
         );
+        Ok(())
+    }
+
+    #[test]
+    fn production_logical_batch_encoder_uses_canonical_shared_entry_stream() -> Result<()> {
+        let batch = WalBatch {
+            commit_ts: 23,
+            recorded_at: crate::pitr::RecordedAt {
+                secs: -17,
+                nanos: 321,
+            },
+            entries: vec![
+                WalEntry::Put {
+                    key: b"duplicate".to_vec(),
+                    value: b"superseded".to_vec(),
+                },
+                WalEntry::Put {
+                    key: b"duplicate".to_vec(),
+                    value: b"latest".to_vec(),
+                },
+                WalEntry::PointDelete {
+                    key: b"deleted".to_vec(),
+                },
+                WalEntry::RangeDelete {
+                    start: b"a".to_vec(),
+                    end: b"z".to_vec(),
+                },
+            ],
+        };
+
+        let encoded = encode_logical_batch(41, &batch, crate::pitr::LIVE_WAL_V5_LIMITS)?;
+        let header_bytes = &encoded[..WAL_V7_LOGICAL_BATCH_HEADER_LEN];
+        let entry_stream = &encoded[WAL_V7_LOGICAL_BATCH_HEADER_LEN..];
+        let header = WalV7LogicalBatchHeader::decode(
+            header_bytes,
+            entry_stream,
+            41,
+            u64::try_from(encoded.len())?,
+            crate::pitr::LIVE_WAL_V5_LIMITS,
+        )?;
+        assert_eq!(header.commit_ts, 23);
+        assert_eq!(header.recorded_at_secs, -17);
+        assert_eq!(header.recorded_at_nanos, 321);
+        assert_eq!(header.entry_count, 3);
+        assert_eq!(
+            crate::pitr::decode_wal_entry_stream(
+                header.commit_ts,
+                crate::pitr::RecordedAt {
+                    secs: header.recorded_at_secs,
+                    nanos: header.recorded_at_nanos,
+                },
+                header.entry_count,
+                entry_stream,
+                crate::pitr::LIVE_WAL_V5_LIMITS,
+            )?
+            .entries,
+            vec![
+                WalEntry::Put {
+                    key: b"duplicate".to_vec(),
+                    value: b"latest".to_vec(),
+                },
+                WalEntry::PointDelete {
+                    key: b"deleted".to_vec(),
+                },
+                WalEntry::RangeDelete {
+                    start: b"a".to_vec(),
+                    end: b"z".to_vec(),
+                },
+            ]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn production_logical_batch_encoder_checks_canonical_limits_before_emission() -> Result<()> {
+        let limits = WalV5Limits {
+            max_input_entry_count: 4,
+            max_batch_data_bytes: 32,
+            max_entry_count: 2,
+            max_key_bytes: 8,
+            max_value_bytes: 4,
+        };
+        let mut batch = WalBatch {
+            commit_ts: 1,
+            recorded_at: crate::pitr::RecordedAt { secs: 0, nanos: 0 },
+            entries: vec![
+                WalEntry::Put {
+                    key: b"a".to_vec(),
+                    value: vec![1; 5],
+                },
+                WalEntry::Put {
+                    key: b"b".to_vec(),
+                    value: vec![2; 4],
+                },
+            ],
+        };
+        // Surviving over-limit values must fail during borrowed preparation,
+        // before the logical-batch output is allocated.
+        assert!(CanonicalWalEntryStream::new(&batch, limits).is_err());
+        assert!(encode_logical_batch(0, &batch, limits).is_err());
+
+        batch.entries[0] = WalEntry::Put {
+            key: b"a".to_vec(),
+            value: vec![1; 4],
+        };
+        // Both values now satisfy their own limit, but their 38-byte canonical
+        // entry stream exceeds the 32-byte aggregate limit.
+        assert!(CanonicalWalEntryStream::new(&batch, limits).is_err());
+        assert!(encode_logical_batch(0, &batch, limits).is_err());
+
+        batch.entries = vec![
+            WalEntry::Put {
+                key: b"a".to_vec(),
+                value: vec![1; 5],
+            },
+            WalEntry::RangeDelete {
+                start: b"a".to_vec(),
+                end: b"z".to_vec(),
+            },
+            WalEntry::PointDelete { key: b"a".to_vec() },
+        ];
+        // The superseded value does not participate in canonical limits; the
+        // retained range and point delete still appear in their input order.
+        let canonical = CanonicalWalEntryStream::new(&batch, limits)?;
+        assert_eq!(canonical.entry_count(), 2);
+        let encoded = encode_logical_batch(0, &batch, limits)?;
+        assert_eq!(encoded.len(), WAL_V7_LOGICAL_BATCH_HEADER_LEN + 27);
+        assert_eq!(
+            crate::pitr::decode_wal_entry_stream(
+                batch.commit_ts,
+                batch.recorded_at,
+                canonical.entry_count(),
+                &encoded[WAL_V7_LOGICAL_BATCH_HEADER_LEN..],
+                limits,
+            )?
+            .entries,
+            batch.entries[1..]
+        );
+
         Ok(())
     }
 

@@ -484,6 +484,116 @@ pub(crate) fn encode_v5_batch_into(
     Ok(aligned_len)
 }
 
+/// A validated, borrowed canonical RFC 023 entry stream for a v7 logical batch.
+/// Only the bounded point-operation index is allocated during preparation;
+/// surviving keys and values are checked before allocating any encoded bytes.
+pub(crate) struct CanonicalWalEntryStream<'a> {
+    batch: &'a WalBatch,
+    last_point: HashMap<&'a [u8], usize>,
+    data_len: usize,
+    entry_count: u32,
+}
+
+impl<'a> CanonicalWalEntryStream<'a> {
+    pub(crate) fn new(batch: &'a WalBatch, limits: WalV5Limits) -> Result<Self> {
+        let limits = limits.validate()?;
+        ensure!(
+            batch.entries.len() <= limits.max_input_entry_count,
+            "v5 input entry count exceeds configured limit"
+        );
+        ensure!(
+            batch.entries.len() <= u32::MAX as usize,
+            "v5 entry count exceeds wire format"
+        );
+        ensure!(batch.commit_ts != 0, "v5 commit timestamp must be nonzero");
+        ensure!(!batch.entries.is_empty(), "v5 batch must contain an entry");
+        ensure!(
+            batch.recorded_at.nanos < 1_000_000_000,
+            "recorded_at nanos out of range"
+        );
+
+        let mut last_point = HashMap::new();
+        if batch.entries.len() > 1 {
+            for (index, entry) in batch.entries.iter().enumerate() {
+                if let WalEntry::Put { key, .. } | WalEntry::PointDelete { key } = entry {
+                    last_point.insert(key.as_slice(), index);
+                }
+            }
+        }
+        let mut stream = Self {
+            batch,
+            last_point,
+            data_len: 0,
+            entry_count: 0,
+        };
+        let mut data_len = 0_usize;
+        let mut entry_count = 0_usize;
+        for entry in stream.entries() {
+            entry_count += 1;
+            ensure!(
+                entry_count <= limits.max_entry_count,
+                "v5 entry count exceeds configured limit"
+            );
+            data_len = data_len
+                .checked_add(encoded_entry_len(entry, limits)?)
+                .context("v5 batch size overflow")?;
+            ensure!(
+                data_len <= limits.max_batch_data_bytes,
+                "v5 batch data exceeds configured limit"
+            );
+        }
+        stream.data_len = data_len;
+        stream.entry_count = u32::try_from(entry_count)?;
+
+        Ok(stream)
+    }
+
+    pub(crate) fn data_len(&self) -> usize {
+        self.data_len
+    }
+
+    pub(crate) fn entry_count(&self) -> u32 {
+        self.entry_count
+    }
+
+    fn entries(&self) -> impl Iterator<Item = &WalEntry> {
+        self.batch
+            .entries
+            .iter()
+            .enumerate()
+            .filter_map(|(index, entry)| match entry {
+                WalEntry::Put { key, .. } | WalEntry::PointDelete { key }
+                    if self.batch.entries.len() > 1
+                        && self.last_point.get(key.as_slice()) != Some(&index) =>
+                {
+                    None
+                }
+                _ => Some(entry),
+            })
+    }
+
+    /// Emit the entry stream without a v5-family header or alignment padding,
+    /// returning the bytes written and their CRC.
+    pub(crate) fn encode_into(&self, dst: &mut [u8]) -> Result<(usize, u32)> {
+        ensure!(
+            dst.len() >= self.data_len,
+            "v5 entry stream output buffer is too small"
+        );
+
+        let mut hasher = crc32fast::Hasher::new();
+        let mut pos = 0;
+        for entry in self.entries() {
+            pos = write_entry_into(dst, pos, entry, &mut hasher)?;
+        }
+        ensure!(
+            pos == self.data_len,
+            "v5 entry stream length changed while encoding"
+        );
+
+        Ok((pos, hasher.finalize()))
+    }
+}
+
 /// Everything the encoder refuses before it writes a byte.
 fn validate_encoding_inputs(batch: &WalBatch, limits: WalV5Limits) -> Result<()> {
     ensure!(batch.commit_ts != 0, "v5 commit timestamp must be nonzero");
@@ -1029,6 +1139,38 @@ mod tests {
             max_key_bytes: 32,
             max_value_bytes: 128,
         }
+    }
+
+    #[test]
+    fn canonical_entry_stream_borrows_survivors_and_rejects_small_destinations() -> Result<()> {
+        let mut batch = batch();
+        batch.entries.push(WalEntry::Put {
+            key: b"a".to_vec(),
+            value: b"last".to_vec(),
+        });
+        let stream = CanonicalWalEntryStream::new(&batch, limits())?;
+        let survivors: Vec<_> = stream.entries().collect();
+        assert_eq!(survivors.len(), 3);
+        for (retained, original) in survivors.iter().zip(&batch.entries[1..]) {
+            assert!(std::ptr::eq(*retained, original));
+        }
+
+        let mut too_small = vec![0xa5; stream.data_len() - 1];
+        assert!(stream.encode_into(&mut too_small).is_err());
+        assert!(too_small.iter().all(|byte| *byte == 0xa5));
+
+        let canonical = canonical_batch(&batch, limits())?;
+        let encoded_v5 = encode_v5_batch(&canonical, limits())?;
+        let mut encoded_stream = vec![0; stream.data_len()];
+        let (written, crc) = stream.encode_into(&mut encoded_stream)?;
+        assert_eq!(written, encoded_stream.len());
+        assert_eq!(
+            encoded_stream,
+            encoded_v5[WAL_V5_BATCH_HEADER_LEN..WAL_V5_BATCH_HEADER_LEN + written]
+        );
+        assert_eq!(crc, crc32fast::hash(&encoded_stream));
+
+        Ok(())
     }
 
     fn refresh_file_header_crc(bytes: &mut [u8]) {

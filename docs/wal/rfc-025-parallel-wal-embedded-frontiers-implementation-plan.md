@@ -52,6 +52,11 @@ DATA start, append offset, and next ticket, and the shared runtime seeds its
 admission, packer, and durability coordinates from that state. V7 startup stays
 closed and performs no extent initialization or buffer-pool warmup until later
 runtime slices provide live reservations and the v7 writer path.
+The production logical-batch encoder now emits the v7 ticketed header and
+canonical RFC 023 entry stream with both v7 CRCs. It validates borrowed
+canonical survivors before allocating encoded bytes and does not copy their
+keys or values during preparation. DATA-frame emission and live runtime
+admission remain unconnected.
 The serial persistence model covers repeated normalization, continued append,
 and crash/reopen for empty, nonempty, fallback, and trailing-control prefixes,
 including a selected marker behind speculative DATA. The production writer
@@ -483,8 +488,13 @@ An ext-family reopen test proves frozen WAL bytes and length stay unchanged;
 an Active startup test proves preallocation is charged before it occurs.
 Development v7 engine writes and forced preallocation prove marker/workspace
 reservations enforce the hard spool bound before ticket assignment or growth.
-These checks use the runtime/write path without requiring the sealing/successor
-integration scheduled for stage 6.
+The production encoder now builds canonical v7 logical batches with their
+assigned segment tickets and the shared RFC 023 entry stream, including the v7
+data/header CRCs. Golden bytes and borrowed-preparation tests cover limit
+rejection before output allocation and discarding superseded oversized values.
+This primitive is not yet connected to DATA-frame writes or live runtime
+admission. These checks use the runtime/write path without requiring the
+sealing/successor integration scheduled for stage 6.
 
 ### 6. PITR sealing, archive, restore, backup, and repair
 
