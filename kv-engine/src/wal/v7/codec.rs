@@ -501,23 +501,39 @@ fn encode_frame(
     frame_offset: u64,
     body: &[u8],
 ) -> Result<[u8; WAL_V7_FRAME_LEN]> {
-    validate_frame_offset(frame_offset)?;
-    kind.validate_body_len(body.len())?;
     kind.validate_position(body, &header_digest, frame_offset)?;
 
     let mut output = [0_u8; WAL_V7_FRAME_LEN];
+    initialize_frame(&mut output, kind, header_digest, frame_offset, body.len())?;
+    output[WAL_V7_FRAME_HEADER_LEN..WAL_V7_FRAME_HEADER_LEN + body.len()].copy_from_slice(body);
+    finish_frame(&mut output);
+
+    Ok(output)
+}
+
+fn initialize_frame(
+    output: &mut [u8; WAL_V7_FRAME_LEN],
+    kind: WalV7FrameKind,
+    header_digest: [u8; 32],
+    frame_offset: u64,
+    body_len: usize,
+) -> Result<()> {
+    validate_frame_offset(frame_offset)?;
+    kind.validate_body_len(body_len)?;
+    output.fill(0);
     output[..8].copy_from_slice(&WAL_V7_FRAME_MAGIC);
     output[8..10].copy_from_slice(&WAL_V7_FRAME_VERSION.to_be_bytes());
     output[10..12].copy_from_slice(&kind.to_wire().to_be_bytes());
     output[12..14].copy_from_slice(&(WAL_V7_FRAME_HEADER_LEN as u16).to_be_bytes());
     output[16..48].copy_from_slice(&header_digest);
     output[48..56].copy_from_slice(&frame_offset.to_be_bytes());
-    output[56..60].copy_from_slice(&(body.len() as u32).to_be_bytes());
-    output[WAL_V7_FRAME_HEADER_LEN..WAL_V7_FRAME_HEADER_LEN + body.len()].copy_from_slice(body);
-    let crc = frame_crc(&output);
-    output[60..64].copy_from_slice(&crc.to_be_bytes());
+    output[56..60].copy_from_slice(&(body_len as u32).to_be_bytes());
+    Ok(())
+}
 
-    Ok(output)
+fn finish_frame(output: &mut [u8; WAL_V7_FRAME_LEN]) {
+    let crc = frame_crc(output);
+    output[60..64].copy_from_slice(&crc.to_be_bytes());
 }
 
 /// Encodes one locally valid DATA fragment frame at its assigned physical offset.
@@ -530,6 +546,108 @@ pub(crate) fn encode_data_frame(
     body: &[u8],
 ) -> Result<[u8; WAL_V7_FRAME_LEN]> {
     encode_frame(WalV7FrameKind::Data, header_digest, frame_offset, body)
+}
+
+/// Materializes one validated logical batch as consecutive, aligned DATA frames
+/// in caller-owned storage. `output` must have room for the complete frame
+/// sequence; bytes beyond the returned length are left untouched. The logical
+/// header, ticket, entry-stream CRC, and frame-range arithmetic are validated
+/// before the first output byte is changed.
+pub(crate) fn encode_data_frames_into(
+    header_digest: [u8; 32],
+    first_frame_offset: u64,
+    segment_ticket: u64,
+    logical_batch: &[u8],
+    limits: WalV5Limits,
+    output: &mut [u8],
+) -> Result<usize> {
+    ensure!(
+        logical_batch.len() >= WAL_V7_LOGICAL_BATCH_HEADER_LEN,
+        "v7 logical batch is shorter than its header"
+    );
+    let batch_bytes = u64::try_from(logical_batch.len())?;
+    let fragment_count = data_fragment_count(batch_bytes)
+        .ok_or_else(|| anyhow::anyhow!("v7 logical batch length is outside wire bounds"))?;
+    let frame_count = usize::try_from(fragment_count)?;
+    let output_len = frame_count
+        .checked_mul(WAL_V7_FRAME_LEN)
+        .ok_or_else(|| anyhow::anyhow!("v7 DATA frame sequence length overflows"))?;
+    ensure!(
+        output.len() >= output_len,
+        "v7 DATA frame output buffer is too small"
+    );
+
+    ensure!(
+        first_frame_offset >= (WAL_V7_HEADER_LEN + WAL_V7_FRAME_LEN) as u64,
+        "v7 DATA frame sequence overlaps the generation-zero FRONTIER"
+    );
+    validate_frame_offset(first_frame_offset)?;
+    let physical_len = u64::try_from(output_len)?;
+    first_frame_offset
+        .checked_add(physical_len)
+        .ok_or_else(|| anyhow::anyhow!("v7 DATA frame sequence end overflows"))?;
+
+    let entry_stream = &logical_batch[WAL_V7_LOGICAL_BATCH_HEADER_LEN..];
+    let header = WalV7LogicalBatchHeader::decode(
+        &logical_batch[..WAL_V7_LOGICAL_BATCH_HEADER_LEN],
+        entry_stream,
+        segment_ticket,
+        batch_bytes,
+        limits,
+    )?;
+    ensure!(
+        header.segment_ticket == segment_ticket,
+        "v7 logical batch ticket does not match its DATA frame assignment"
+    );
+
+    for (fragment_index, payload) in logical_batch
+        .chunks(WAL_V7_DATA_FRAGMENT_PAYLOAD_CAPACITY)
+        .enumerate()
+    {
+        let fragment_index_u32 = u32::try_from(fragment_index)?;
+        let frame_delta = u64::try_from(fragment_index)?
+            .checked_mul(WAL_V7_FRAME_LEN as u64)
+            .ok_or_else(|| anyhow::anyhow!("v7 DATA frame offset overflows"))?;
+        let frame_offset = first_frame_offset
+            .checked_add(frame_delta)
+            .ok_or_else(|| anyhow::anyhow!("v7 DATA frame offset overflows"))?;
+        let frame_start = fragment_index
+            .checked_mul(WAL_V7_FRAME_LEN)
+            .ok_or_else(|| anyhow::anyhow!("v7 DATA frame output offset overflows"))?;
+        let frame_end = frame_start
+            .checked_add(WAL_V7_FRAME_LEN)
+            .ok_or_else(|| anyhow::anyhow!("v7 DATA frame output end overflows"))?;
+        let frame: &mut [u8; WAL_V7_FRAME_LEN] = (&mut output[frame_start..frame_end])
+            .try_into()
+            .expect("frame range has the fixed v7 frame length");
+        let fragment_header = WalV7DataFragmentHeader {
+            segment_ticket,
+            fragment_index: fragment_index_u32,
+            fragment_count,
+            batch_bytes,
+        };
+        fragment_header.validate_payload_len(payload.len())?;
+        let body_len = WAL_V7_DATA_FRAGMENT_HEADER_LEN
+            .checked_add(payload.len())
+            .ok_or_else(|| anyhow::anyhow!("v7 DATA fragment body length overflows"))?;
+        initialize_frame(
+            frame,
+            WalV7FrameKind::Data,
+            header_digest,
+            frame_offset,
+            body_len,
+        )?;
+        let body_start = WAL_V7_FRAME_HEADER_LEN;
+        frame[body_start..body_start + 8].copy_from_slice(&segment_ticket.to_be_bytes());
+        frame[body_start + 8..body_start + 12].copy_from_slice(&fragment_index_u32.to_be_bytes());
+        frame[body_start + 12..body_start + 16].copy_from_slice(&fragment_count.to_be_bytes());
+        frame[body_start + 16..body_start + 24].copy_from_slice(&batch_bytes.to_be_bytes());
+        frame[body_start + WAL_V7_DATA_FRAGMENT_HEADER_LEN..body_start + body_len]
+            .copy_from_slice(payload);
+        finish_frame(frame);
+    }
+
+    Ok(output_len)
 }
 
 /// Encodes the required generation-zero FRONTIER at offset 4096.
@@ -1036,6 +1154,22 @@ mod tests {
             }
         );
         assert_eq!(batch.len(), 59);
+        let mut materialized = vec![0xa5; WAL_V7_FRAME_LEN + 17];
+        let materialized_len = encode_data_frames_into(
+            header_digest,
+            8192,
+            fragment_header.segment_ticket,
+            batch,
+            crate::pitr::LIVE_WAL_V5_LIMITS,
+            &mut materialized,
+        )?;
+        assert_eq!(materialized_len, WAL_V7_FRAME_LEN);
+        assert_eq!(materialized[..materialized_len], expected_data_frame);
+        assert!(
+            materialized[materialized_len..]
+                .iter()
+                .all(|byte| *byte == 0xa5)
+        );
         let batch_header = WalV7LogicalBatchHeader {
             segment_ticket: 0x0102_0304_0506_0708,
             commit_ts: 1,
@@ -1262,6 +1396,22 @@ mod tests {
         expected_batch.extend_from_slice(&entry_stream);
         assert_eq!(expected_batch.len(), 4063);
 
+        let mut materialized = vec![0xa5; 2 * WAL_V7_FRAME_LEN + 17];
+        let materialized_len = encode_data_frames_into(
+            header_digest,
+            8192,
+            batch_header.segment_ticket,
+            &expected_batch,
+            crate::pitr::LIVE_WAL_V5_LIMITS,
+            &mut materialized,
+        )?;
+        assert_eq!(materialized_len, 2 * WAL_V7_FRAME_LEN);
+        assert!(
+            materialized[materialized_len..]
+                .iter()
+                .all(|byte| *byte == 0xa5)
+        );
+
         let mut frames = Vec::with_capacity(2);
         let frame_crcs = [[0x88, 0xa8, 0x04, 0xbb], [0x23, 0x33, 0x4c, 0x3a]];
         let frame_digests = [
@@ -1289,15 +1439,18 @@ mod tests {
 
             let frame_offset = 8192 + u64::from(fragment_index) * WAL_V7_FRAME_LEN as u64;
             let frame = encode_data_frame(header_digest, frame_offset, &actual_body)?;
+            let expected_frame = golden_frame(
+                1,
+                &header_digest,
+                frame_offset,
+                &expected_body,
+                frame_crcs[usize::try_from(fragment_index)?],
+            );
+            assert_eq!(frame, expected_frame);
+            let materialized_start = usize::try_from(fragment_index)? * WAL_V7_FRAME_LEN;
             assert_eq!(
-                frame,
-                golden_frame(
-                    1,
-                    &header_digest,
-                    frame_offset,
-                    &expected_body,
-                    frame_crcs[usize::try_from(fragment_index)?],
-                )
+                materialized[materialized_start..materialized_start + WAL_V7_FRAME_LEN],
+                expected_frame
             );
             assert_eq!(
                 frame_record_digest(&frame)?,
@@ -1329,6 +1482,227 @@ mod tests {
             )?,
             batch_header
         );
+        Ok(())
+    }
+
+    #[test]
+    fn production_data_frame_materializer_handles_fragment_boundaries() -> Result<()> {
+        let header_digest = golden_header().digest()?;
+        let limits = crate::pitr::LIVE_WAL_V5_LIMITS;
+        let first_frame_offset = 5 * WAL_V7_FRAME_LEN as u64;
+        for (batch_len, expected_count, final_payload_len) in [
+            (4007, 1, 4007),
+            (4008, 1, 4008),
+            (4009, 2, 1),
+            (8015, 2, 4007),
+            (8016, 2, 4008),
+            (8017, 3, 1),
+        ] {
+            // A single-byte key PUT has 15 entry-stream bytes before its value.
+            let batch = WalBatch {
+                commit_ts: 23,
+                recorded_at: crate::pitr::RecordedAt { secs: -2, nanos: 3 },
+                entries: vec![WalEntry::Put {
+                    key: b"k".to_vec(),
+                    value: vec![0x5a; batch_len - WAL_V7_LOGICAL_BATCH_HEADER_LEN - 15],
+                }],
+            };
+            let logical_batch = encode_logical_batch(41, &batch, limits)?;
+            assert_eq!(logical_batch.len(), batch_len);
+            let mut output = vec![0xa5; expected_count * WAL_V7_FRAME_LEN + 17];
+            let written = encode_data_frames_into(
+                header_digest,
+                first_frame_offset,
+                41,
+                &logical_batch,
+                limits,
+                &mut output,
+            )?;
+            assert_eq!(written, expected_count * WAL_V7_FRAME_LEN);
+            assert!(output[written..].iter().all(|byte| *byte == 0xa5));
+
+            let mut reassembled_batch = Vec::with_capacity(batch_len);
+            let (frames, remainder) = output[..written].as_chunks::<WAL_V7_FRAME_LEN>();
+            assert!(remainder.is_empty());
+            for (index, frame) in frames.iter().enumerate() {
+                let frame_offset = first_frame_offset + index as u64 * WAL_V7_FRAME_LEN as u64;
+                let decoded = decode_frame_structural(frame, frame_offset, &header_digest)?;
+                assert_eq!(decoded.kind, WalV7FrameKind::Data);
+                let (fragment, payload) = WalV7DataFragmentHeader::decode_body(&decoded.body)?;
+                assert_eq!(fragment.segment_ticket, 41);
+                assert_eq!(fragment.fragment_index, index as u32);
+                assert_eq!(fragment.fragment_count, expected_count as u32);
+                assert_eq!(fragment.batch_bytes, batch_len as u64);
+                assert_eq!(
+                    payload.len(),
+                    if index + 1 == expected_count {
+                        final_payload_len
+                    } else {
+                        WAL_V7_DATA_FRAGMENT_PAYLOAD_CAPACITY
+                    }
+                );
+                reassembled_batch.extend_from_slice(payload);
+            }
+            assert_eq!(reassembled_batch, logical_batch);
+            assert_eq!(
+                crate::pitr::decode_wal_entry_stream(
+                    batch.commit_ts,
+                    batch.recorded_at,
+                    1,
+                    &reassembled_batch[WAL_V7_LOGICAL_BATCH_HEADER_LEN..],
+                    limits,
+                )?,
+                batch
+            );
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn production_data_frame_materializer_rejects_before_changing_output() -> Result<()> {
+        let header_digest = decode_digest(HEADER_DIGEST_HEX);
+        let limits = crate::pitr::LIVE_WAL_V5_LIMITS;
+        let data_body = decode_hex(DATA_BODY_HEX);
+        let logical_batch = &data_body[WAL_V7_DATA_FRAGMENT_HEADER_LEN..];
+        let ticket = 0x0102_0304_0506_0708;
+        let assert_rejected = |case: &str,
+                               offset: u64,
+                               assigned_ticket: u64,
+                               batch: &[u8],
+                               limits: WalV5Limits,
+                               output_len: usize| {
+            let mut output = vec![0xa5; output_len];
+            assert!(
+                encode_data_frames_into(
+                    header_digest,
+                    offset,
+                    assigned_ticket,
+                    batch,
+                    limits,
+                    &mut output,
+                )
+                .is_err(),
+                "{case} was accepted"
+            );
+            assert!(
+                output.iter().all(|byte| *byte == 0xa5),
+                "{case} changed output before rejecting"
+            );
+        };
+
+        for offset in [0, 4096, 8193, u64::MAX - 4095] {
+            assert_rejected(
+                "invalid offset",
+                offset,
+                ticket,
+                logical_batch,
+                limits,
+                4096,
+            );
+        }
+        for output_len in [0, 4095] {
+            assert_rejected(
+                "short output",
+                8192,
+                ticket,
+                logical_batch,
+                limits,
+                output_len,
+            );
+        }
+        for batch_len in [0, 47, 48] {
+            assert_rejected(
+                "truncated batch",
+                8192,
+                ticket,
+                &logical_batch[..batch_len],
+                limits,
+                4096,
+            );
+        }
+        assert_rejected(
+            "ticket mismatch",
+            8192,
+            ticket + 1,
+            logical_batch,
+            limits,
+            4096,
+        );
+
+        for (case, field_offset) in [("data CRC", 48), ("header CRC", 40), ("reserved field", 44)] {
+            let mut corrupt_batch = logical_batch.to_vec();
+            corrupt_batch[field_offset] ^= 1;
+            assert_rejected(case, 8192, ticket, &corrupt_batch, limits, 4096);
+        }
+        for (case, start, end) in [
+            ("zero commit timestamp", 8, 16),
+            ("zero entry count", 28, 32),
+            ("incorrect data length", 32, 36),
+        ] {
+            let mut corrupt_batch = logical_batch.to_vec();
+            corrupt_batch[start..end].fill(0);
+            recalculate_logical_batch_header_crc(&mut corrupt_batch);
+            assert_rejected(case, 8192, ticket, &corrupt_batch, limits, 4096);
+        }
+        let mut invalid_nanos = logical_batch.to_vec();
+        invalid_nanos[24..28].copy_from_slice(&1_000_000_000_u32.to_be_bytes());
+        recalculate_logical_batch_header_crc(&mut invalid_nanos);
+        assert_rejected("invalid nanos", 8192, ticket, &invalid_nanos, limits, 4096);
+
+        for configured_limits in [
+            WalV5Limits {
+                max_entry_count: 0,
+                ..limits
+            },
+            WalV5Limits {
+                max_batch_data_bytes: 0,
+                ..limits
+            },
+            WalV5Limits {
+                max_batch_data_bytes: 10,
+                ..limits
+            },
+        ] {
+            assert_rejected(
+                "invalid limits",
+                8192,
+                ticket,
+                logical_batch,
+                configured_limits,
+                4096,
+            );
+        }
+
+        let multiple_frames = encode_logical_batch(
+            ticket,
+            &WalBatch {
+                commit_ts: 1,
+                recorded_at: crate::pitr::RecordedAt { secs: 0, nanos: 0 },
+                entries: vec![WalEntry::Put {
+                    key: b"k".to_vec(),
+                    value: vec![0x5a; 4000],
+                }],
+            },
+            limits,
+        )?;
+        assert_rejected(
+            "short multi-frame output",
+            8192,
+            ticket,
+            &multiple_frames,
+            limits,
+            8191,
+        );
+        assert_rejected(
+            "multi-frame end overflow",
+            u64::MAX - 8191,
+            ticket,
+            &multiple_frames,
+            limits,
+            8192,
+        );
+
         Ok(())
     }
 
