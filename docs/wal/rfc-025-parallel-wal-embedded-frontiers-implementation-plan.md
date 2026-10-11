@@ -493,8 +493,8 @@ assigned segment tickets and the shared RFC 023 entry stream, including the v7
 data/header CRCs. Golden bytes and borrowed-preparation tests cover limit
 rejection before output allocation and discarding superseded oversized values.
 This primitive is not yet connected to DATA-frame writes or live runtime
-admission. These checks use the runtime/write path without requiring the
-sealing/successor integration scheduled for stage 6.
+admission. These tests exercise the encoder in isolation, without the
+runtime/write path or the sealing/successor integration scheduled for stage 6.
 
 ### 6. PITR sealing, archive, restore, backup, and repair
 
