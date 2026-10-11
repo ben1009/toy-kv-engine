@@ -55,8 +55,10 @@ runtime slices provide live reservations and the v7 writer path.
 The production logical-batch encoder now emits the v7 ticketed header and
 canonical RFC 023 entry stream with both v7 CRCs. It validates borrowed
 canonical survivors before allocating encoded bytes and does not copy their
-keys or values during preparation. DATA-frame emission and live runtime
-admission remain unconnected.
+keys or values during preparation. A production frame materializer now emits
+the complete aligned DATA-frame sequence into caller-owned storage after
+validating the logical header and assigned ticket. Runtime admission and
+FRONTIER writes remain unconnected.
 The serial persistence model covers repeated normalization, continued append,
 and crash/reopen for empty, nonempty, fallback, and trailing-control prefixes,
 including a selected marker behind speculative DATA. The production writer
@@ -492,9 +494,13 @@ The production encoder now builds canonical v7 logical batches with their
 assigned segment tickets and the shared RFC 023 entry stream, including the v7
 data/header CRCs. Golden bytes and borrowed-preparation tests cover limit
 rejection before output allocation and discarding superseded oversized values.
-This primitive is not yet connected to DATA-frame writes or live runtime
-admission. These tests exercise the encoder in isolation, without the
-runtime/write path or the sealing/successor integration scheduled for stage 6.
+A separate production codec materializes those logical batches into complete
+aligned DATA-frame sequences in caller-owned storage. It validates the logical
+header and ticket before changing output. Fixed single-frame and multi-frame
+golden vectors, fragmentation-boundary tests, and unchanged-output rejection
+tests cover the materializer. It is not yet connected to runtime admission,
+WAL writes, FRONTIER scheduling, or the sealing/successor integration scheduled
+for stage 6.
 
 ### 6. PITR sealing, archive, restore, backup, and repair
 
