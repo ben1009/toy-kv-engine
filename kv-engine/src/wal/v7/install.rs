@@ -16,6 +16,7 @@ use anyhow::{Context, Result, ensure};
 use sha2::{Digest, Sha256};
 
 use super::{
+    admission::{WalV7Reservation, WalV7ResourceCharge, WalV7ResourceLedger},
     codec::{
         WAL_V7_FRAME_LEN, WAL_V7_HEADER_LEN, WAL_V7_LOGICAL_BATCH_HEADER_LEN,
         WalV7DataFragmentHeader, WalV7FrameKind, WalV7Frontier, WalV7Header,
@@ -81,6 +82,47 @@ pub(crate) struct WalV7ActiveRecovery {
 impl WalV7InstalledRecovery {
     pub(crate) fn image_digest(&self) -> [u8; 32] {
         self.physical_hasher.clone().finalize().into()
+    }
+
+    /// Return the persistent resource charge represented by this normalized
+    /// image. The immutable header and generation-zero frame are startup
+    /// headroom; retained WAL usage begins at `data_start` and includes every
+    /// retained DATA and nonzero FRONTIER frame. Recovery workspace and live
+    /// buffers are separate transient reservations.
+    pub(crate) fn recovered_resource_charge(&self) -> Result<WalV7ResourceCharge> {
+        let seed = self.runtime_seed()?;
+        ensure!(
+            self.image_len >= seed.data_start && self.image_len.is_multiple_of(FRAME_LEN_U64),
+            "installed v7 image length is not a valid frame boundary"
+        );
+        let retained_wal_bytes = self
+            .image_len
+            .checked_sub(seed.data_start)
+            .context("installed v7 image is shorter than its DATA start")?;
+        let seal_index_bytes = u64::try_from(self.seal_index.len())?
+            .checked_mul(std::mem::size_of::<u64>() as u64)
+            .context("installed v7 seal-index size overflows")?;
+
+        Ok(WalV7ResourceCharge {
+            logical_wal_bytes: retained_wal_bytes,
+            source_spool_bytes: retained_wal_bytes,
+            seal_index_bytes,
+            ..WalV7ResourceCharge::default()
+        })
+    }
+
+    /// Rebuild the installed image's persistent ledger charge before runtime
+    /// admission opens. Empty v7 images have no post-generation-zero charge.
+    pub(crate) fn reserve_recovered_resources(
+        &self,
+        ledger: &WalV7ResourceLedger,
+    ) -> Result<Option<WalV7Reservation>> {
+        let charge = self.recovered_resource_charge()?;
+        if charge == WalV7ResourceCharge::default() {
+            return Ok(None);
+        }
+
+        Ok(Some(ledger.reserve(charge)?))
     }
 
     /// Build the runtime cursor only from a self-consistent, installed Active
@@ -929,6 +971,7 @@ mod tests {
             encode_v5_batch,
         },
         wal::v7::{
+            admission::WalV7ResourceLimits,
             codec::{
                 WAL_V7_DATA_FRAGMENT_PAYLOAD_CAPACITY, WalV7DataFragmentHeader,
                 WalV7LogicalBatchHeader, encode_data_frame, encode_generation_zero_frontier,
@@ -1378,6 +1421,54 @@ mod tests {
         assert_eq!(installed.seal_index, [2 * FRAME_LEN_U64]);
         let logical_digest: [u8; 32] = installed.logical_hasher.clone().finalize().into();
         assert_eq!(logical_digest, anchor.prefix_digest);
+        let retained_wal_bytes = installed.image_len - 2 * FRAME_LEN_U64;
+        let recovered_charge = installed.recovered_resource_charge()?;
+        assert_eq!(
+            recovered_charge,
+            WalV7ResourceCharge {
+                logical_wal_bytes: retained_wal_bytes,
+                source_spool_bytes: retained_wal_bytes,
+                seal_index_bytes: std::mem::size_of::<u64>() as u64,
+                ..WalV7ResourceCharge::default()
+            }
+        );
+        let ledger = WalV7ResourceLedger::new(WalV7ResourceLimits {
+            max_logical_wal_bytes: retained_wal_bytes,
+            max_source_spool_bytes: retained_wal_bytes,
+            max_recovery_workspace_bytes: 0,
+            max_buffer_memory_bytes: 0,
+            max_seal_index_bytes: std::mem::size_of::<u64>() as u64,
+        })?;
+        let reservation = installed
+            .reserve_recovered_resources(&ledger)?
+            .context("nonempty installed WAL returned no resource reservation")?;
+        assert_eq!(ledger.snapshot(), recovered_charge);
+        drop(reservation);
+        assert_eq!(ledger.snapshot(), WalV7ResourceCharge::default());
+        for limits in [
+            WalV7ResourceLimits {
+                max_logical_wal_bytes: retained_wal_bytes - 1,
+                max_source_spool_bytes: retained_wal_bytes,
+                max_recovery_workspace_bytes: 0,
+                max_buffer_memory_bytes: 0,
+                max_seal_index_bytes: std::mem::size_of::<u64>() as u64,
+            },
+            WalV7ResourceLimits {
+                max_logical_wal_bytes: retained_wal_bytes,
+                max_source_spool_bytes: retained_wal_bytes - 1,
+                max_recovery_workspace_bytes: 0,
+                max_buffer_memory_bytes: 0,
+                max_seal_index_bytes: std::mem::size_of::<u64>() as u64,
+            },
+        ] {
+            let undersized_ledger = WalV7ResourceLedger::new(limits)?;
+            assert!(
+                installed
+                    .reserve_recovered_resources(&undersized_ledger)
+                    .is_err()
+            );
+            assert_eq!(undersized_ledger.snapshot(), WalV7ResourceCharge::default());
+        }
         Ok(())
     }
 
@@ -1419,6 +1510,23 @@ mod tests {
         assert_eq!(seed.data_start, 2 * FRAME_LEN_U64);
         assert_eq!(seed.append_offset, 2 * FRAME_LEN_U64);
         assert_eq!(seed.next_ticket, 0);
+        assert_eq!(
+            installed.recovered_resource_charge()?,
+            WalV7ResourceCharge::default()
+        );
+        let empty_ledger = WalV7ResourceLedger::new(WalV7ResourceLimits {
+            max_logical_wal_bytes: 1,
+            max_source_spool_bytes: 1,
+            max_recovery_workspace_bytes: 0,
+            max_buffer_memory_bytes: 0,
+            max_seal_index_bytes: 0,
+        })?;
+        assert!(
+            installed
+                .reserve_recovered_resources(&empty_ledger)?
+                .is_none()
+        );
+        assert_eq!(empty_ledger.snapshot(), WalV7ResourceCharge::default());
         Ok(())
     }
 

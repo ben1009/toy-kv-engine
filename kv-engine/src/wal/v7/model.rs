@@ -458,27 +458,9 @@ impl SerialHarness {
         );
 
         let resource_ledger = WalV7ResourceLedger::new(limits)?;
-        // Startup headroom owns the immutable header and generation-zero
-        // frame. Recovered usage owns only the retained DATA/control extent,
-        // without recreating unused per-batch marker or buffer reservations.
-        let wal_bytes = installed
-            .image_len
-            .checked_sub(FIRST_DATA_OFFSET)
-            .ok_or_else(|| {
-                anyhow::anyhow!("installed model image is missing its initial frames")
-            })?;
-        let seal_index_bytes = u64::try_from(installed.seal_index.len())?
-            .checked_mul(std::mem::size_of::<u64>() as u64)
-            .ok_or_else(|| anyhow::anyhow!("installed model seal index size overflows"))?;
-        let recovered_charge = WalV7ResourceCharge {
-            logical_wal_bytes: wal_bytes,
-            source_spool_bytes: wal_bytes,
-            seal_index_bytes,
-            ..WalV7ResourceCharge::default()
-        };
         let mut retained_reservations = Vec::new();
-        if recovered_charge != WalV7ResourceCharge::default() {
-            retained_reservations.push(resource_ledger.reserve(recovered_charge)?);
+        if let Some(reservation) = installed.reserve_recovered_resources(&resource_ledger)? {
+            retained_reservations.push(reservation);
         }
 
         let mut disk = PersistenceModel::default();

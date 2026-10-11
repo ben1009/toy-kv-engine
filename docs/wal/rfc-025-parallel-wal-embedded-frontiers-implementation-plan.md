@@ -15,6 +15,9 @@ bytes and seal-index capacity, counting coalesced markers only once. Serial
 commits reuse the buffer cap, and recovered batches require no outstanding
 DATA buffers. Exact-cap recovery and continued append cover coalesced groups.
 Limit rejection is checked to leave ticket/offset state and WAL bytes unchanged.
+Installed Active recovery now computes its retained WAL and seal-index charge
+from the normalized image, and the persistence model reserves that exact charge
+before resuming writes. Production WAL-open and live admission wiring remain.
 Live segment lifecycle reconstruction is now wired before PITR runtime attach.
 Reconciliation updates the recovered bookkeeping after successful manifest
 sync, releases reclaimed source charges, and consumes completed sealing's
@@ -54,7 +57,7 @@ and crash/reopen for empty, nonempty, fallback, and trailing-control prefixes,
 including a selected marker behind speculative DATA. The production writer
 remains v6.
 
-**Last updated:** 2026-10-10
+**Last updated:** 2026-10-11
 
 **Source baseline:** `30a64fa855126596316ab6b9237e6348b0e41fd2`, which merged RFC 025 in PR #379.
 
