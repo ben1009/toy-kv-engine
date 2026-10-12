@@ -318,6 +318,16 @@ impl WalV7LeaderWriter {
         })
     }
 
+    pub(crate) fn try_clone_sync_file(&self) -> Result<File> {
+        self.sync_file
+            .try_clone()
+            .context("clone v7 WAL sync file handle")
+    }
+
+    pub(crate) fn is_poisoned(&self) -> bool {
+        self.poisoned
+    }
+
     fn append_assigned_batch(
         &mut self,
         allocation: super::allocator::WalV7DataAllocation,
@@ -588,7 +598,13 @@ fn fdatasync_once(file: &File) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, fs::OpenOptions, os::unix::fs::OpenOptionsExt, path::Path, sync::Arc};
+    use std::{
+        fs,
+        fs::OpenOptions,
+        os::unix::fs::OpenOptionsExt,
+        path::Path,
+        sync::{Arc, atomic::Ordering},
+    };
 
     use super::*;
     use crate::{
@@ -596,14 +612,17 @@ mod tests {
             ArchiveEpochId, ChainAnchor, LIVE_WAL_V5_LIMITS, SegmentId, TimelineId, WalEntry,
             manifest::ActiveBoundary,
         },
-        wal::v7::{
-            admission::{
-                WalV7ReservationError, WalV7ReservationOwner, WalV7ResourceCharge,
-                WalV7ResourceLedger, WalV7ResourceLimits,
+        wal::{
+            Wal,
+            v7::{
+                admission::{
+                    WalV7ReservationError, WalV7ReservationOwner, WalV7ResourceCharge,
+                    WalV7ResourceLedger, WalV7ResourceLimits,
+                },
+                codec::{WAL_V7_DATA_FRAGMENT_PAYLOAD_CAPACITY, WAL_V7_FRAME_LEN},
+                install::{WalV7InstalledRecovery, recover_and_install_active},
+                recovery::WalV7RecoveryAuthority,
             },
-            codec::WAL_V7_DATA_FRAGMENT_PAYLOAD_CAPACITY,
-            install::{WalV7InstalledRecovery, recover_and_install_active},
-            recovery::WalV7RecoveryAuthority,
         },
     };
 
@@ -696,6 +715,243 @@ mod tests {
                 value: vec![0x5a; value_len],
             }],
         }
+    }
+
+    #[test]
+    fn wal_adapter_dispatches_v7_batches_as_already_durable() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("active.wal");
+        let initial = install_empty(&path)?;
+        let initial_anchor = initial.active_boundary;
+        let first = batch(10, 100, 4);
+        let mut first_writer = open_writer(&path, &initial, MAX_WAL_FILE_SIZE)?;
+        first_writer.append_batch(&first, LIVE_WAL_V5_LIMITS)?;
+        drop(first_writer);
+
+        let recovered = recover(&path, initial_anchor)?;
+        assert_eq!(recovered.next_ticket, 1);
+        let recovered_anchor = recovered.active_boundary;
+        let writer = open_writer(&path, &recovered, MAX_WAL_FILE_SIZE)?;
+        let wal = Wal::from_v7_leader(writer)?;
+        assert_eq!(wal.next_ticket.load(Ordering::Acquire), 1);
+        assert_eq!(
+            wal.completion_state.durable_ticket.load(Ordering::Acquire),
+            1
+        );
+
+        let mut second = batch(20, 90, 8);
+        assert_eq!(wal.put_v5_batch(&second, LIVE_WAL_V5_LIMITS, None)?, 1);
+        assert_eq!(wal.next_ticket.load(Ordering::Acquire), 2);
+        assert_eq!(
+            wal.completion_state.durable_ticket.load(Ordering::Acquire),
+            2
+        );
+        let committed_end = wal.alloc_offset.load(Ordering::Acquire);
+
+        // The v7 append already wrote and synced its FRONTIER. Ticket barriers
+        // take the durable fast path; sync/close drain the serial writer, with
+        // none of these barriers touching an absent ring.
+        wal.submit_and_commit(1)?;
+        wal.sync()?;
+        wal.close()?;
+        drop(wal);
+
+        second.recorded_at = first.recorded_at;
+        let installed = recover(&path, recovered_anchor)?;
+        assert_eq!(installed.batches, [first, second]);
+        assert_eq!(installed.next_ticket, 2);
+        assert_eq!(installed.append_offset, committed_end);
+        Ok(())
+    }
+
+    #[test]
+    fn wal_adapter_keeps_v7_cursor_unchanged_on_pre_admission_rejection() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("active.wal");
+        let installed = install_empty(&path)?;
+        let original_image = fs::read(&path)?;
+        let writer = open_writer(&path, &installed, 3 * WAL_V7_FRAME_LEN as u64)?;
+        let wal = Wal::from_v7_leader(writer)?;
+
+        let error = wal
+            .put_v5_batch(&batch(10, 100, 4), LIVE_WAL_V5_LIMITS, None)
+            .expect_err("batch plus FRONTIER cannot fit this segment");
+        assert_eq!(
+            error.downcast_ref::<WalV7LeaderCapacityError>(),
+            Some(&WalV7LeaderCapacityError::BatchTooLarge)
+        );
+        assert_eq!(wal.next_ticket.load(Ordering::Acquire), 0);
+        assert_eq!(
+            wal.completion_state.durable_ticket.load(Ordering::Acquire),
+            0
+        );
+        assert_eq!(
+            wal.alloc_offset.load(Ordering::Acquire),
+            installed.append_offset
+        );
+        wal.sync()?;
+        wal.close()?;
+        assert_eq!(fs::read(&path)?, original_image);
+        Ok(())
+    }
+
+    #[test]
+    fn wal_adapter_preserves_durable_ticket_after_later_sync_failure() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("active.wal");
+        let installed = install_empty(&path)?;
+        let writer = open_writer(&path, &installed, MAX_WAL_FILE_SIZE)?;
+        let wal = Wal::from_v7_leader(writer)?;
+        let durable_ticket = wal.put_v5_batch(&batch(10, 100, 4), LIVE_WAL_V5_LIMITS, None)?;
+        wal.v7_leader
+            .as_ref()
+            .context("adapter has a v7 writer")?
+            .lock()
+            .sync_file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_PATH)
+            .open(&path)?;
+
+        let error = wal
+            .put_v5_batch(&batch(20, 101, 4), LIVE_WAL_V5_LIMITS, None)
+            .expect_err("later fdatasync must reject an O_PATH descriptor");
+        assert!(format!("{error:#}").contains("fdatasync"));
+        wal.submit_and_commit(durable_ticket)?;
+        assert!(wal.submit_and_commit(durable_ticket + 1).is_err());
+        assert!(wal.sync().is_err());
+        assert!(wal.close().is_err());
+        let uncertain_image = fs::read(&path)?;
+        assert!(
+            wal.put_v5_batch(&batch(30, 102, 4), LIVE_WAL_V5_LIMITS, None)
+                .is_err()
+        );
+        assert_eq!(fs::read(&path)?, uncertain_image);
+        Ok(())
+    }
+
+    #[cfg(feature = "chaos-testing")]
+    #[test]
+    fn failpoint_wal_adapter_barriers_reject_poison_after_append_unwind() -> Result<()> {
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+
+        use crate::chaos::failpoint::{self, FailScenario};
+
+        for barrier in ["sync", "close", "ticket"] {
+            let scenario = FailScenario::setup();
+            let directory = tempfile::tempdir()?;
+            let path = directory.path().join("active.wal");
+            let installed = install_empty(&path)?;
+            let writer = open_writer(&path, &installed, MAX_WAL_FILE_SIZE)?;
+            let wal = Wal::from_v7_leader(writer)?;
+            failpoint::cfg("wal.v7.leader.after_data_write", "panic")
+                .expect("arm v7 adapter unwind failpoint");
+            let result = catch_unwind(AssertUnwindSafe(|| {
+                wal.put_v5_batch(&batch(10, 100, 4), LIVE_WAL_V5_LIMITS, None)
+            }));
+            scenario.teardown();
+
+            assert!(result.is_err());
+            assert_eq!(wal.next_ticket.load(Ordering::Acquire), 0);
+            assert_eq!(
+                wal.completion_state.durable_ticket.load(Ordering::Acquire),
+                0
+            );
+            let barrier_result = match barrier {
+                "sync" => wal.sync(),
+                "close" => wal.close(),
+                "ticket" => wal.submit_and_commit(0),
+                _ => unreachable!(),
+            };
+            assert!(barrier_result.is_err(), "{barrier} observes writer poison");
+            let uncertain_image = fs::read(&path)?;
+            assert!(
+                wal.put_v5_batch(&batch(20, 101, 4), LIVE_WAL_V5_LIMITS, None)
+                    .is_err()
+            );
+            assert_eq!(fs::read(&path)?, uncertain_image);
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "chaos-testing")]
+    #[test]
+    fn failpoint_wal_adapter_sync_and_close_wait_for_admitted_append() -> Result<()> {
+        use std::{thread, time::Duration};
+
+        use crossbeam_channel::{RecvTimeoutError, bounded};
+
+        use crate::chaos::failpoint::FailScenario;
+
+        for close in [false, true] {
+            for fail_sync in [false, true] {
+                let scenario = FailScenario::setup();
+                let directory = tempfile::tempdir()?;
+                let path = directory.path().join("active.wal");
+                let installed = install_empty(&path)?;
+                let mut writer = open_writer(&path, &installed, MAX_WAL_FILE_SIZE)?;
+                if fail_sync {
+                    writer.sync_file = OpenOptions::new()
+                        .read(true)
+                        .custom_flags(libc::O_PATH)
+                        .open(&path)?;
+                }
+                let wal = Arc::new(Wal::from_v7_leader(writer)?);
+                let (admitted_tx, admitted_rx) = bounded(1);
+                let (resume_tx, resume_rx) = bounded(1);
+                fail::cfg_callback("wal.v7.leader.after_data_write", move || {
+                    admitted_tx.send(()).expect("report admitted v7 append");
+                    resume_rx
+                        .recv_timeout(Duration::from_secs(10))
+                        .expect("resume admitted v7 append");
+                })
+                .expect("pause v7 append after DATA write");
+                let append_wal = Arc::clone(&wal);
+                let append = thread::spawn(move || {
+                    append_wal.put_v5_batch(&batch(10, 100, 4), LIVE_WAL_V5_LIMITS, None)
+                });
+                admitted_rx
+                    .recv_timeout(Duration::from_secs(10))
+                    .expect("append reaches its admitted DATA write");
+
+                let (started_tx, started_rx) = bounded(1);
+                let (finished_tx, finished_rx) = bounded(1);
+                let barrier_wal = Arc::clone(&wal);
+                let barrier = thread::spawn(move || {
+                    started_tx.send(()).expect("report barrier start");
+                    let result = if close {
+                        barrier_wal.close()
+                    } else {
+                        barrier_wal.sync()
+                    };
+                    finished_tx.send(result).expect("report barrier result");
+                });
+                started_rx
+                    .recv_timeout(Duration::from_secs(10))
+                    .expect("barrier thread starts");
+                let early_result = finished_rx.recv_timeout(Duration::from_millis(100));
+                let returned_early = early_result.is_ok();
+                resume_tx.send(()).expect("release admitted append");
+                let append_result = append.join().expect("append thread joins");
+                let barrier_result = match early_result {
+                    Ok(result) => result,
+                    Err(RecvTimeoutError::Timeout) => finished_rx
+                        .recv_timeout(Duration::from_secs(10))
+                        .expect("barrier completes after append"),
+                    Err(RecvTimeoutError::Disconnected) => panic!("barrier result disconnected"),
+                };
+                barrier.join().expect("barrier thread joins");
+                scenario.teardown();
+
+                assert!(!returned_early, "close={close}, fail_sync={fail_sync}");
+                assert_eq!(append_result.is_err(), fail_sync);
+                assert_eq!(barrier_result.is_err(), fail_sync);
+                assert_eq!(
+                    wal.next_ticket.load(Ordering::Acquire),
+                    u64::from(!fail_sync)
+                );
+            }
+        }
+        Ok(())
     }
 
     #[test]
