@@ -10,7 +10,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::wal::v7::install::WalV7RuntimeSeed;
+use crate::wal::v7::{
+    allocator::{WalV7DataAllocation, WalV7PhysicalAllocator},
+    install::WalV7RuntimeSeed,
+};
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
 use crossbeam_queue::ArrayQueue;
@@ -57,6 +60,7 @@ impl std::error::Error for WalFull {}
 pub(crate) struct ParallelWalRuntimeStart {
     append_offset: u64,
     next_ticket: u64,
+    v7_allocator: Option<WalV7PhysicalAllocator>,
     min_append_offset: u64,
     admission_open: bool,
     initialize_extents: bool,
@@ -68,6 +72,7 @@ impl ParallelWalRuntimeStart {
         let start = Self {
             append_offset,
             next_ticket: 0,
+            v7_allocator: None,
             min_append_offset: WAL_HEADER_END,
             admission_open: true,
             initialize_extents: true,
@@ -79,9 +84,12 @@ impl ParallelWalRuntimeStart {
 
     #[allow(dead_code)] // Production v7 open wiring follows in a later runtime slice.
     pub(crate) fn v7(seed: WalV7RuntimeSeed) -> Result<Self> {
+        let v7_allocator =
+            WalV7PhysicalAllocator::new(seed.next_ticket, seed.append_offset, MAX_WAL_FILE_SIZE)?;
         let start = Self {
             append_offset: seed.append_offset,
             next_ticket: seed.next_ticket,
+            v7_allocator: Some(v7_allocator),
             min_append_offset: seed.data_start,
             admission_open: false,
             initialize_extents: false,
@@ -346,13 +354,17 @@ struct AdmittedBatch {
     ticket: u64,
     file_offset: u64,
     aligned_len: usize,
+    v7_allocation: Option<WalV7DataAllocation>,
     buffer: ParallelBuffer,
 }
 
 struct PackedGroup {
     first_ticket: u64,
     next_ticket: u64,
+    allocation_start: u64,
     reserved_end: u64,
+    frontier_offsets: Vec<u64>,
+    v7_layout: bool,
     writes: WriteGroupBuffers<ParallelBuffer>,
     initialize_extents: bool,
 }
@@ -365,6 +377,7 @@ struct AdmissionState {
     initial_ticket: u64,
     next_ticket: u64,
     admitted_end: u64,
+    v7_allocator: Option<WalV7PhysicalAllocator>,
     queue: VecDeque<AdmittedBatch>,
 }
 
@@ -630,6 +643,7 @@ impl ParallelWalRuntime {
                 initial_ticket: start.next_ticket,
                 next_ticket: start.next_ticket,
                 admitted_end: initial_file_end,
+                v7_allocator: start.v7_allocator,
                 queue: VecDeque::new(),
             }),
             packer_state: Mutex::new(PackerState {
@@ -789,6 +803,11 @@ impl ParallelWalRuntime {
             self.recycle(buffer);
             bail!("parallel WAL is closed");
         }
+        if state.v7_allocator.is_some() {
+            drop(state);
+            self.recycle(buffer);
+            bail!("v7 WAL admission requires a reserved DATA allocation");
+        }
 
         let Some(file_end) = state.admitted_end.checked_add(aligned_len_u64) else {
             drop(state);
@@ -824,6 +843,7 @@ impl ParallelWalRuntime {
             ticket,
             file_offset,
             aligned_len,
+            v7_allocation: None,
             buffer,
         });
         #[cfg(feature = "chaos-testing")]
@@ -1084,8 +1104,11 @@ fn pack_admitted_groups(
         };
         let first_ticket = packed.first_ticket;
         let expected_ticket = packed.next_ticket;
+        let allocation_start = packed.allocation_start;
         packer.reserved_end = packed.reserved_end;
         let writes = packed.writes;
+        let frontier_offsets = packed.frontier_offsets;
+        let v7_layout = packed.v7_layout;
 
         let Some(target_preallocated_end) = round_up(packer.reserved_end, PREALLOC_BLOCK) else {
             let error = anyhow!("parallel WAL preallocation offset overflow");
@@ -1128,7 +1151,16 @@ fn pack_admitted_groups(
             return Err(error);
         }
 
-        let group = match WriteGroup::new(packer.next_ticket..expected_ticket, writes) {
+        let group = match if v7_layout {
+            WriteGroup::new_with_frontiers(
+                packer.next_ticket..expected_ticket,
+                writes,
+                allocation_start..packer.reserved_end,
+                &frontier_offsets,
+            )
+        } else {
+            WriteGroup::new(packer.next_ticket..expected_ticket, writes)
+        } {
             Ok(group) => group,
             Err(error) => {
                 let error = anyhow!("invalid packed WAL group: {error:?}");
@@ -1164,8 +1196,10 @@ fn take_admitted_group(
     }
 
     let first_ticket = first.ticket;
+    let v7_layout = admission.v7_allocator.is_some();
     let group_capacity = admission.queue.len().min(max_tickets);
     let mut writes = WriteGroupBuffers::with_capacity(group_capacity);
+    let mut data_allocations = v7_layout.then(|| Vec::with_capacity(group_capacity));
     let mut initialize_extents = false;
     let mut expected_ticket = next_ticket;
     let mut packed_end = reserved_end;
@@ -1185,32 +1219,79 @@ fn take_admitted_group(
             .queue
             .pop_front()
             .expect("front WAL batch remains queued");
+        let AdmittedBatch {
+            ticket,
+            file_offset,
+            aligned_len,
+            v7_allocation,
+            buffer,
+        } = batch;
         // Keep zero-fill for groups containing small writes. Only extent
         // preparation changes; every batch still uses the parallel pipeline.
-        initialize_extents |= batch.aligned_len < ALLOCATION_ONLY_MIN_BATCH_BYTES;
+        initialize_extents |= aligned_len < ALLOCATION_ONLY_MIN_BATCH_BYTES;
         ensure!(
-            batch.ticket == expected_ticket && batch.file_offset == packed_end,
-            "parallel WAL admission queue is not ticket/offset contiguous"
+            ticket == expected_ticket,
+            "parallel WAL admission queue is not ticket contiguous"
         );
-        packed_end = batch
-            .file_offset
-            .checked_add(batch.aligned_len as u64)
-            .ok_or_else(|| anyhow!("parallel WAL offset overflow"))?;
+        match (v7_layout, v7_allocation) {
+            (true, Some(allocation)) => {
+                ensure!(
+                    allocation.ticket() == ticket
+                        && allocation.frame_range().start == file_offset
+                        && allocation.frame_range().end.checked_sub(file_offset)
+                            == Some(aligned_len as u64)
+                        && file_offset >= packed_end,
+                    "parallel v7 WAL batch disagrees with its physical allocation"
+                );
+                packed_end = allocation.frame_range().end;
+                data_allocations
+                    .as_mut()
+                    .expect("v7 layout has allocation metadata")
+                    .push(allocation);
+            }
+            (false, None) => {
+                ensure!(
+                    file_offset == packed_end,
+                    "parallel WAL admission queue is not offset contiguous"
+                );
+                packed_end = file_offset
+                    .checked_add(aligned_len as u64)
+                    .ok_or_else(|| anyhow!("parallel WAL offset overflow"))?;
+            }
+            (true, None) => bail!("v7 WAL admission batch has no physical allocation"),
+            (false, Some(_)) => bail!("legacy WAL admission batch has a v7 physical allocation"),
+        }
         expected_ticket = expected_ticket
             .checked_add(1)
             .ok_or_else(|| anyhow!("parallel WAL ticket counter overflow"))?;
         #[cfg(feature = "chaos-testing")]
         crate::chaos::failpoint::parallel_wal_crash_point("parallel_wal.offset_reserved");
-        writes.push(WriteBuffer::new(
-            batch.buffer,
-            batch.file_offset,
-            batch.aligned_len,
-        ));
+        writes.push(WriteBuffer::new(buffer, file_offset, aligned_len));
     }
+
+    let frontier_offsets = if v7_layout {
+        let allocator = admission
+            .v7_allocator
+            .as_ref()
+            .expect("v7 layout has a physical allocator");
+        // Validate allocator ownership, ticket order, and every DATA gap.
+        allocator.validate_data_group(
+            data_allocations
+                .as_deref()
+                .expect("v7 layout has allocation metadata"),
+        )?;
+        allocator.frontier_offsets_in(reserved_end..packed_end)?
+    } else {
+        Vec::new()
+    };
+
     Ok(Some(PackedGroup {
         first_ticket,
         next_ticket: expected_ticket,
+        allocation_start: reserved_end,
         reserved_end: packed_end,
+        frontier_offsets,
+        v7_layout,
         writes,
         initialize_extents,
     }))
@@ -1639,7 +1720,7 @@ mod tests {
         };
 
         const DATA_START: u64 = 2 * 4096;
-        const APPEND_OFFSET: u64 = 4 * 4096;
+        const APPEND_OFFSET: u64 = 9 * 4096;
         const NEXT_TICKET: u64 = 7;
 
         let directory = tempfile::tempdir().expect("create WAL directory");
@@ -2009,9 +2090,9 @@ mod tests {
     #[cfg(feature = "bench")]
     use super::validate_sync_diagnostics_transition;
     use super::{
-        AdmissionState, AdmittedBatch, BufferBudget, MAX_BUFFER_CAPACITY,
+        AdmissionState, AdmittedBatch, BufferBudget, MAX_BUFFER_CAPACITY, MAX_WAL_FILE_SIZE,
         NORMAL_ACTIVE_BUFFER_BUDGET, PREALLOC_BLOCK, ParallelBuffer, WAL_HEADER_END, WalFull,
-        preallocate, round_up, take_admitted_group,
+        WalV7DataAllocation, preallocate, round_up, take_admitted_group,
     };
     use crate::wal::{DirectBuf, Wal};
 
@@ -2039,6 +2120,33 @@ mod tests {
             ticket,
             file_offset,
             aligned_len,
+            v7_allocation: None,
+            buffer: ParallelBuffer::activate(
+                direct,
+                std::sync::Arc::clone(budget),
+                aligned_len as u64,
+            ),
+        }
+    }
+
+    fn admitted_v7_batch(
+        budget: &std::sync::Arc<BufferBudget>,
+        allocation: WalV7DataAllocation,
+    ) -> AdmittedBatch {
+        let ticket = allocation.ticket();
+        let range = allocation.frame_range().clone();
+        let aligned_len = usize::try_from(range.end - range.start).expect("v7 batch fits usize");
+        budget
+            .reserve(aligned_len as u64)
+            .expect("reserve test v7 buffer");
+        let mut direct = DirectBuf::new(aligned_len);
+        direct.set_len(aligned_len);
+
+        AdmittedBatch {
+            ticket,
+            file_offset: range.start,
+            aligned_len,
+            v7_allocation: Some(allocation),
             buffer: ParallelBuffer::activate(
                 direct,
                 std::sync::Arc::clone(budget),
@@ -2059,6 +2167,7 @@ mod tests {
             initial_ticket: 0,
             next_ticket: 4,
             admitted_end: WAL_HEADER_END + 3 * large as u64 + 4096,
+            v7_allocator: None,
             queue: std::collections::VecDeque::from([
                 admitted_batch_of_size(&budget, 0, WAL_HEADER_END, large),
                 admitted_batch_of_size(&budget, 1, WAL_HEADER_END + large as u64, large),
@@ -2097,6 +2206,7 @@ mod tests {
             initial_ticket: 0,
             next_ticket: 4,
             admitted_end: WAL_HEADER_END + 4 * 4096,
+            v7_allocator: None,
             queue: std::collections::VecDeque::from([
                 admitted_batch(&budget, 0, WAL_HEADER_END),
                 admitted_batch(&budget, 1, WAL_HEADER_END + 4096),
@@ -2115,6 +2225,79 @@ mod tests {
         assert_eq!(group.writes.len(), 3);
         assert!(admission.queue.is_empty());
         drop(group);
+        assert_eq!(budget.state.lock().active_bytes, 0);
+    }
+
+    #[test]
+    fn v7_packer_carries_frontier_gap_into_the_following_worker_group() {
+        use crate::wal::v7::allocator::WalV7PhysicalAllocator;
+
+        const DATA_START: u64 = 8 * 1024;
+        const FRAME: u64 = 4 * 1024;
+
+        let mut allocator = WalV7PhysicalAllocator::new(0, DATA_START, MAX_WAL_FILE_SIZE)
+            .expect("create v7 allocator");
+        let first = allocator
+            .reserve_data(1)
+            .expect("reserve first DATA ticket");
+        let frontier = allocator
+            .reserve_frontier(1)
+            .expect("reserve marker after first ticket");
+        let second = allocator
+            .reserve_data(2)
+            .expect("reserve second DATA ticket");
+        assert_eq!(frontier.frame_offset(), DATA_START + FRAME);
+
+        let budget = std::sync::Arc::new(BufferBudget::new());
+        let mut admission = AdmissionState {
+            open: false,
+            close_cutoff: Some(2),
+            poison: None,
+            #[cfg(feature = "bench")]
+            initial_ticket: 0,
+            next_ticket: 2,
+            admitted_end: allocator.allocation_tail(),
+            v7_allocator: Some(allocator),
+            queue: std::collections::VecDeque::from([
+                admitted_v7_batch(&budget, first),
+                admitted_v7_batch(&budget, second),
+            ]),
+        };
+
+        let first_group = take_admitted_group(&mut admission, 0, DATA_START, 1)
+            .expect("pack first v7 ticket")
+            .expect("first ticket is queued");
+        assert_eq!(first_group.allocation_start, DATA_START);
+        assert_eq!(first_group.reserved_end, DATA_START + FRAME);
+        assert!(first_group.frontier_offsets.is_empty());
+        super::WriteGroup::new_with_frontiers(
+            first_group.first_ticket..first_group.next_ticket,
+            first_group.writes,
+            first_group.allocation_start..first_group.reserved_end,
+            &first_group.frontier_offsets,
+        )
+        .expect("first group ends immediately before the reserved marker");
+
+        let second_group = take_admitted_group(
+            &mut admission,
+            first_group.next_ticket,
+            first_group.reserved_end,
+            1,
+        )
+        .expect("pack second v7 ticket across marker")
+        .expect("second ticket is queued");
+        assert_eq!(second_group.allocation_start, DATA_START + FRAME);
+        assert_eq!(second_group.reserved_end, DATA_START + 4 * FRAME);
+        assert_eq!(second_group.frontier_offsets, [DATA_START + FRAME]);
+        super::WriteGroup::new_with_frontiers(
+            second_group.first_ticket..second_group.next_ticket,
+            second_group.writes,
+            second_group.allocation_start..second_group.reserved_end,
+            &second_group.frontier_offsets,
+        )
+        .expect("second group accounts for the leading marker frame");
+
+        assert!(admission.queue.is_empty());
         assert_eq!(budget.state.lock().active_bytes, 0);
     }
 

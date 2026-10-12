@@ -217,18 +217,33 @@ impl WalV7PhysicalAllocator {
         &self,
         allocations: &[WalV7DataAllocation],
     ) -> Result<Vec<Range<u64>>> {
-        self.ensure_healthy()?;
-        ensure!(!allocations.is_empty(), "v7 DATA write group is empty");
-
         let mut ranges = Vec::new();
         ranges
             .try_reserve_exact(allocations.len())
             .context("reserve v7 DATA group range metadata")?;
+        self.visit_data_write_ranges(allocations, |range| ranges.push(range))?;
+        Ok(ranges)
+    }
+
+    /// Validate a ticket group without allocating the coalesced DATA ranges.
+    pub(crate) fn validate_data_group(&self, allocations: &[WalV7DataAllocation]) -> Result<()> {
+        self.visit_data_write_ranges(allocations, |_| {})
+    }
+
+    fn visit_data_write_ranges(
+        &self,
+        allocations: &[WalV7DataAllocation],
+        mut visit: impl FnMut(Range<u64>),
+    ) -> Result<()> {
+        self.ensure_healthy()?;
+        ensure!(!allocations.is_empty(), "v7 DATA write group is empty");
+
         let mut previous: Option<&WalV7DataAllocation> = None;
+        let mut current_range: Option<Range<u64>> = None;
         for allocation in allocations {
             self.validate_data_allocation(allocation)?;
             let Some(prior) = previous else {
-                ranges.push(allocation.frame_range.clone());
+                current_range = Some(allocation.frame_range.clone());
                 previous = Some(allocation);
                 continue;
             };
@@ -247,9 +262,9 @@ impl WalV7PhysicalAllocator {
             );
 
             if prior.frame_range.end == allocation.frame_range.start {
-                ranges
-                    .last_mut()
-                    .expect("the first allocation added a range")
+                current_range
+                    .as_mut()
+                    .expect("the first allocation starts a range")
                     .end = allocation.frame_range.end;
             } else {
                 let first_frontier = self
@@ -273,12 +288,46 @@ impl WalV7PhysicalAllocator {
                     control_offset == allocation.frame_range.start,
                     "v7 DATA allocations are separated by an unreserved control gap"
                 );
-                ranges.push(allocation.frame_range.clone());
+                visit(
+                    current_range
+                        .take()
+                        .expect("the prior allocation has a DATA range"),
+                );
+                current_range = Some(allocation.frame_range.clone());
             }
             previous = Some(allocation);
         }
 
-        Ok(ranges)
+        visit(current_range.expect("nonempty allocation group has a DATA range"));
+        Ok(())
+    }
+
+    /// Return every reserved FRONTIER frame intersecting a worker allocation
+    /// span. The worker validates that DATA writes and these control frames
+    /// tile the full span without holes or overlaps.
+    pub(crate) fn frontier_offsets_in(&self, physical_range: Range<u64>) -> Result<Vec<u64>> {
+        self.ensure_healthy()?;
+        ensure!(
+            physical_range.start.is_multiple_of(FRAME_LEN_U64)
+                && physical_range.end.is_multiple_of(FRAME_LEN_U64)
+                && physical_range.start <= physical_range.end
+                && physical_range.end <= self.allocation_tail,
+            "invalid v7 physical allocation span"
+        );
+
+        let first = self
+            .frontier_offsets
+            .partition_point(|offset| *offset < physical_range.start);
+        let after_last = self
+            .frontier_offsets
+            .partition_point(|offset| *offset < physical_range.end);
+        let offsets = &self.frontier_offsets[first..after_last];
+        let mut result = Vec::new();
+        result
+            .try_reserve_exact(offsets.len())
+            .context("reserve v7 worker FRONTIER metadata")?;
+        result.extend_from_slice(offsets);
+        Ok(result)
     }
 
     pub(crate) fn next_ticket(&self) -> u64 {
