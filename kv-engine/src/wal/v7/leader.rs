@@ -7,6 +7,8 @@
 //! canonical FRONTIER, calls `fdatasync` once, and only then returns success.
 
 use std::{
+    error::Error,
+    fmt,
     fs::File,
     io,
     os::unix::{
@@ -26,7 +28,7 @@ use crate::{
 
 use super::{
     admission::WalV7ReservationOwner,
-    allocator::{WalV7FrontierCursor, WalV7PhysicalAllocator},
+    allocator::{WalV7DataCapacityStatus, WalV7FrontierCursor, WalV7PhysicalAllocator},
     codec::{
         WAL_V7_FRAME_LEN, WAL_V7_HEADER_LEN, WalV7FrameKind, WalV7Frontier, WalV7Header,
         data_fragment_count, decode_frame_structural, encode_data_frames_into,
@@ -35,6 +37,23 @@ use super::{
     },
     install::{WalV7RuntimeMetadata, WalV7RuntimeSeed},
 };
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum WalV7LeaderCapacityError {
+    RotationRequired,
+    BatchTooLarge,
+}
+
+impl fmt::Display for WalV7LeaderCapacityError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::RotationRequired => "v7 WAL segment rotation required before retrying batch",
+            Self::BatchTooLarge => "v7 WAL batch cannot fit a fresh segment",
+        })
+    }
+}
+
+impl Error for WalV7LeaderCapacityError {}
 
 /// The result of one durably committed v7 Leader batch.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -158,9 +177,11 @@ impl WalV7LeaderWriter {
     /// permit batches that the live v7 decoder would reject.
     ///
     /// # Errors
-    /// Returns an error if the batch is invalid, the segment lacks capacity,
+    /// Returns an error if the batch is invalid, resource admission fails,
+    /// capacity requires rotation or the batch cannot fit a fresh segment,
     /// any DATA or FRONTIER write is short or fails, the sync fails, or the
-    /// post-sync frontier cursor cannot be validated.
+    /// post-sync frontier cursor cannot be validated. Capacity errors are
+    /// available as [`WalV7LeaderCapacityError`] through the anyhow chain.
     pub(crate) fn append_batch(
         &mut self,
         batch: &WalBatch,
@@ -204,7 +225,17 @@ impl WalV7LeaderWriter {
         let encoded_batch_bytes = u64::try_from(prepared_batch.encoded_len())?;
         let fragment_count = data_fragment_count(encoded_batch_bytes)
             .context("v7 logical batch has no valid DATA fragment count")?;
-        self.allocator.check_data_capacity(fragment_count)?;
+        match self.allocator.data_capacity_status(fragment_count)? {
+            WalV7DataCapacityStatus::Fits => {}
+            WalV7DataCapacityStatus::RotationRequired => {
+                return Err(anyhow::Error::new(
+                    WalV7LeaderCapacityError::RotationRequired,
+                ));
+            }
+            WalV7DataCapacityStatus::BatchTooLarge => {
+                return Err(anyhow::Error::new(WalV7LeaderCapacityError::BatchTooLarge));
+            }
+        }
         let data_buffer_len = usize::try_from(fragment_count)?
             .checked_mul(WAL_V7_FRAME_LEN)
             .context("v7 DATA buffer length overflows")?;
@@ -732,13 +763,15 @@ mod tests {
         let original_image = fs::read(&path)?;
         let mut writer = open_writer(&path, &installed, 4 * WAL_V7_FRAME_LEN as u64)?;
 
-        assert!(
-            writer
-                .append_batch(
-                    &batch(10, 100, 2 * WAL_V7_DATA_FRAGMENT_PAYLOAD_CAPACITY),
-                    LIVE_WAL_V5_LIMITS,
-                )
-                .is_err()
+        let error = writer
+            .append_batch(
+                &batch(10, 100, 2 * WAL_V7_DATA_FRAGMENT_PAYLOAD_CAPACITY),
+                LIVE_WAL_V5_LIMITS,
+            )
+            .expect_err("batch cannot fit a fresh segment");
+        assert_eq!(
+            error.downcast_ref::<WalV7LeaderCapacityError>(),
+            Some(&WalV7LeaderCapacityError::BatchTooLarge)
         );
         assert_eq!(fs::read(&path)?, original_image);
         assert_eq!(writer.runtime_seed()?.next_ticket, 0);
@@ -752,6 +785,76 @@ mod tests {
                 .ticket,
             0
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn leader_reports_rotation_before_assigning_coordinates() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("active.wal");
+        let installed = install_empty(&path)?;
+        let mut writer = open_writer(&path, &installed, 4 * WAL_V7_FRAME_LEN as u64)?;
+        writer.append_batch(&batch(10, 100, 4), LIVE_WAL_V5_LIMITS)?;
+        let image_before_retry = fs::read(&path)?;
+        let seed_before_retry = writer.runtime_seed()?;
+        let resources_before_retry = writer.reservation_owner.snapshot();
+
+        let error = writer
+            .append_batch(&batch(20, 101, 4), LIVE_WAL_V5_LIMITS)
+            .expect_err("the next batch requires a fresh segment");
+        assert_eq!(
+            error.downcast_ref::<WalV7LeaderCapacityError>(),
+            Some(&WalV7LeaderCapacityError::RotationRequired)
+        );
+        assert_eq!(fs::read(&path)?, image_before_retry);
+        assert_eq!(
+            writer.runtime_seed()?.next_ticket,
+            seed_before_retry.next_ticket
+        );
+        assert_eq!(
+            writer.runtime_seed()?.append_offset,
+            seed_before_retry.append_offset
+        );
+        assert_eq!(writer.reservation_owner.snapshot(), resources_before_retry);
+
+        Ok(())
+    }
+
+    #[test]
+    fn leader_reports_rotation_when_only_the_frontier_does_not_fit() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("active.wal");
+        let installed = install_empty(&path)?;
+        let segment_limit = 5 * WAL_V7_FRAME_LEN as u64;
+        let mut writer = open_writer(&path, &installed, segment_limit)?;
+        writer.append_batch(&batch(10, 100, 4), LIVE_WAL_V5_LIMITS)?;
+
+        let seed_before_retry = writer.runtime_seed()?;
+        let data_end = seed_before_retry.append_offset + WAL_V7_FRAME_LEN as u64;
+        let marker_end = data_end + WAL_V7_FRAME_LEN as u64;
+        assert!(data_end <= segment_limit);
+        assert!(marker_end > segment_limit);
+        let image_before_retry = fs::read(&path)?;
+        let resources_before_retry = writer.reservation_owner.snapshot();
+
+        let error = writer
+            .append_batch(&batch(20, 101, 4), LIVE_WAL_V5_LIMITS)
+            .expect_err("DATA fits but its required FRONTIER does not");
+        assert_eq!(
+            error.downcast_ref::<WalV7LeaderCapacityError>(),
+            Some(&WalV7LeaderCapacityError::RotationRequired)
+        );
+        assert_eq!(fs::read(&path)?, image_before_retry);
+        assert_eq!(
+            writer.runtime_seed()?.next_ticket,
+            seed_before_retry.next_ticket
+        );
+        assert_eq!(
+            writer.runtime_seed()?.append_offset,
+            seed_before_retry.append_offset
+        );
+        assert_eq!(writer.reservation_owner.snapshot(), resources_before_retry);
 
         Ok(())
     }
