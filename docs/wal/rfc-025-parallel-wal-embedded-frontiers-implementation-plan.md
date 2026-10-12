@@ -61,17 +61,20 @@ validating the logical header and assigned ticket. Runtime admission and
 FRONTIER writes remain unconnected.
 A checked physical allocator now assigns DATA tickets and ranges and reserves
 FRONTIER slots at the allocation tail. It splits a ticket group's DATA ranges
-only across a reserved FRONTIER frame and poisons further allocation after an
+across every reserved FRONTIER frame and poisons further allocation after an
 uncertain marker cycle. Each uncovered ticket retains one marker frame's
 capacity; placement consumes one credit and successful sync releases only the
-unused credits of its captured prefix. The live runtime does not use it yet;
-v7 admission remains closed.
+unused credits of its captured prefix. The parallel worker now accepts an
+explicit physical allocation span tiled by DATA writes and reserved FRONTIER
+offsets, advances its ordering cursor across those controls, and reports DATA
+bytes separately from physical span length. Existing runtime submissions still
+use contiguous groups; live allocator/runtime wiring and marker I/O remain.
 The serial persistence model covers repeated normalization, continued append,
 and crash/reopen for empty, nonempty, fallback, and trailing-control prefixes,
 including a selected marker behind speculative DATA. The production writer
 remains v6.
 
-**Last updated:** 2026-10-11
+**Last updated:** 2026-10-12
 
 **Source baseline:** `30a64fa855126596316ab6b9237e6348b0e41fd2`, which merged RFC 025 in PR #379.
 
@@ -443,11 +446,14 @@ neither is a prerequisite for this stage.
 - Serialize DATA and FRONTIER reservations through one physical allocator.
   Reserve each FRONTIER at the current allocation tail and never move existing
   DATA. Permit a ticket group to contain DATA ranges separated by a marker;
-  split its write buffers/SQEs at the gap. Remove the live packer's
+  split its write buffers/SQEs at the gap. The worker now validates explicit
+  physical spans tiled by DATA buffers and reserved FRONTIER offsets while
+  retaining strict contiguous groups for legacy submissions. Remove the live packer's
   unconditional ticket-and-offset contiguity assumption only where a verified
   control allocation accounts for the gap. The checked allocator primitive,
-  per-ticket marker headroom, and accounted-gap range splitter are implemented;
-  attaching them to the runtime's live admission and write-group paths remains.
+  per-ticket marker headroom, accounted-gap range splitter, and worker group
+  validation are implemented; attaching them to runtime admission, marker
+  writes, and the one-sync coordinator remains.
 - After bounded optional coalescing, choose an eligible exclusive marker target
   `T` no greater than the contiguous written frontier and prove its exact `E(T)`
   from metadata. Capture the final `T` before constructing its canonical marker,
