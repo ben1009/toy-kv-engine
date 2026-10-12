@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, bail, ensure};
 
-use super::codec::{WAL_V7_FRAME_LEN, WAL_V7_HEADER_LEN};
+use super::codec::{WAL_V7_FRAME_LEN, WAL_V7_HEADER_LEN, WalV7Frontier};
 
 const FRAME_LEN_U64: u64 = WAL_V7_FRAME_LEN as u64;
 const FIRST_DATA_OFFSET: u64 = (WAL_V7_HEADER_LEN + WAL_V7_FRAME_LEN) as u64;
@@ -37,6 +37,17 @@ pub(crate) struct WalV7FrontierReservation {
     ticket_end: u64,
     frame_end: u64,
     owner: Arc<WalV7AllocatorIdentity>,
+}
+
+/// Verified predecessor coordinates needed to encode the next FRONTIER.
+///
+/// Recovery constructs this from the installed image. The digest identifies
+/// the exact predecessor frame, while `frontier` carries its logical boundary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct WalV7FrontierCursor {
+    pub(crate) frontier: WalV7Frontier,
+    pub(crate) frame_offset: u64,
+    pub(crate) frame_digest: [u8; 32],
 }
 
 /// Unique identity shared only by tokens issued by one allocator instance.
@@ -76,14 +87,19 @@ pub(crate) struct WalV7PhysicalAllocator {
     max_file_size: u64,
     identity: Arc<WalV7AllocatorIdentity>,
     frontier_offsets: Vec<u64>,
-    last_frontier_ticket_end: u64,
+    last_frontier: WalV7FrontierCursor,
     in_flight_frontier: Option<WalV7FrontierReservation>,
     poisoned: bool,
 }
 
 impl WalV7PhysicalAllocator {
     /// Resume allocation after an installed Active image.
-    pub(crate) fn new(next_ticket: u64, allocation_tail: u64, max_file_size: u64) -> Result<Self> {
+    pub(crate) fn new(
+        next_ticket: u64,
+        allocation_tail: u64,
+        max_file_size: u64,
+        last_frontier: WalV7FrontierCursor,
+    ) -> Result<Self> {
         ensure!(
             allocation_tail >= FIRST_DATA_OFFSET && allocation_tail.is_multiple_of(FRAME_LEN_U64),
             "invalid v7 allocation tail {allocation_tail}"
@@ -96,6 +112,7 @@ impl WalV7PhysicalAllocator {
             next_ticket <= (allocation_tail - FIRST_DATA_OFFSET) / FRAME_LEN_U64,
             "v7 ticket cursor exceeds the physical DATA capacity"
         );
+        validate_frontier_cursor(last_frontier, next_ticket, allocation_tail)?;
 
         Ok(Self {
             next_ticket,
@@ -103,7 +120,7 @@ impl WalV7PhysicalAllocator {
             max_file_size,
             identity: Arc::new(WalV7AllocatorIdentity),
             frontier_offsets: Vec::new(),
-            last_frontier_ticket_end: next_ticket,
+            last_frontier,
             in_flight_frontier: None,
             poisoned: false,
         })
@@ -164,7 +181,7 @@ impl WalV7PhysicalAllocator {
             "a v7 FRONTIER write/sync cycle is already in flight"
         );
         ensure!(
-            ticket_end > self.last_frontier_ticket_end && ticket_end <= self.next_ticket,
+            ticket_end > self.last_frontier.frontier.ticket_end && ticket_end <= self.next_ticket,
             "v7 FRONTIER ticket target does not advance within admitted tickets"
         );
         let frame_end = self
@@ -196,9 +213,17 @@ impl WalV7PhysicalAllocator {
     pub(crate) fn complete_frontier_sync(
         &mut self,
         reservation: WalV7FrontierReservation,
+        next_frontier: WalV7FrontierCursor,
     ) -> Result<()> {
         self.validate_in_flight_frontier(&reservation)?;
-        self.last_frontier_ticket_end = reservation.ticket_end;
+        if let Err(error) =
+            validate_frontier_successor(self.last_frontier, &reservation, next_frontier)
+        {
+            self.in_flight_frontier = None;
+            self.poisoned = true;
+            return Err(error);
+        }
+        self.last_frontier = next_frontier;
         self.in_flight_frontier = None;
         Ok(())
     }
@@ -342,9 +367,14 @@ impl WalV7PhysicalAllocator {
     /// except for the credit already consumed by the in-flight physical marker.
     fn reserved_marker_frames(&self) -> Result<u64> {
         self.next_ticket
-            .checked_sub(self.last_frontier_ticket_end)
+            .checked_sub(self.last_frontier.frontier.ticket_end)
             .and_then(|pending| pending.checked_sub(u64::from(self.in_flight_frontier.is_some())))
             .ok_or_else(|| anyhow::anyhow!("invalid v7 marker reservation accounting"))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn last_frontier(&self) -> WalV7FrontierCursor {
+        self.last_frontier
     }
 
     fn validate_in_flight_frontier(&self, reservation: &WalV7FrontierReservation) -> Result<()> {
@@ -390,6 +420,82 @@ impl WalV7PhysicalAllocator {
     }
 }
 
+fn validate_frontier_cursor(
+    cursor: WalV7FrontierCursor,
+    next_ticket: u64,
+    allocation_tail: u64,
+) -> Result<()> {
+    let frontier_end = cursor
+        .frame_offset
+        .checked_add(FRAME_LEN_U64)
+        .ok_or_else(|| anyhow::anyhow!("v7 FRONTIER cursor end overflows"))?;
+    ensure!(
+        cursor.frontier.ticket_end == next_ticket
+            && cursor.frontier.durable_end == cursor.frame_offset
+            && frontier_end == allocation_tail,
+        "v7 FRONTIER cursor disagrees with the normalized append state"
+    );
+    if cursor.frontier.generation == 0 {
+        ensure!(
+            cursor.frame_offset == WAL_V7_HEADER_LEN as u64
+                && next_ticket == 0
+                && cursor.frontier.durable_end == WAL_V7_HEADER_LEN as u64
+                && cursor.frontier.last_commit_ts == 0
+                && cursor.frontier.previous_frontier_offset == 0
+                && cursor.frontier.previous_frontier_digest == [0; 32],
+            "invalid v7 generation-zero runtime cursor"
+        );
+    } else {
+        let predecessor_end = cursor
+            .frontier
+            .previous_frontier_offset
+            .checked_add(FRAME_LEN_U64)
+            .ok_or_else(|| anyhow::anyhow!("v7 predecessor FRONTIER end overflows"))?;
+        ensure!(
+            next_ticket > 0
+                && cursor.frontier.previous_frontier_offset < cursor.frame_offset
+                && predecessor_end <= cursor.frontier.durable_end,
+            "invalid v7 nonzero runtime FRONTIER cursor"
+        );
+    }
+    Ok(())
+}
+
+fn validate_frontier_successor(
+    previous: WalV7FrontierCursor,
+    reservation: &WalV7FrontierReservation,
+    next: WalV7FrontierCursor,
+) -> Result<()> {
+    let next_frame_end = next
+        .frame_offset
+        .checked_add(FRAME_LEN_U64)
+        .ok_or_else(|| anyhow::anyhow!("v7 successor FRONTIER end overflows"))?;
+    let expected_generation = previous
+        .frontier
+        .generation
+        .checked_add(1)
+        .ok_or_else(|| anyhow::anyhow!("v7 FRONTIER generation overflows"))?;
+    let previous_end = previous
+        .frame_offset
+        .checked_add(FRAME_LEN_U64)
+        .ok_or_else(|| anyhow::anyhow!("previous v7 FRONTIER end overflows"))?;
+    ensure!(
+        next.frame_offset == reservation.frame_offset
+            && next_frame_end == reservation.frame_end
+            && next.frontier.generation == expected_generation
+            && next.frontier.ticket_end == reservation.ticket_end
+            && next.frontier.ticket_end > previous.frontier.ticket_end
+            && next.frontier.last_commit_ts > previous.frontier.last_commit_ts
+            && previous_end <= next.frontier.durable_end
+            && next.frontier.durable_end.is_multiple_of(FRAME_LEN_U64)
+            && next.frontier.durable_end <= next.frame_offset
+            && next.frontier.previous_frontier_offset == previous.frame_offset
+            && next.frontier.previous_frontier_digest == previous.frame_digest,
+        "v7 FRONTIER does not extend the captured predecessor"
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -397,8 +503,51 @@ mod tests {
     const START: u64 = FIRST_DATA_OFFSET;
     const FRAME: u64 = FRAME_LEN_U64;
 
+    fn genesis_cursor() -> WalV7FrontierCursor {
+        WalV7FrontierCursor {
+            frontier: WalV7Frontier {
+                generation: 0,
+                ticket_end: 0,
+                durable_end: WAL_V7_HEADER_LEN as u64,
+                last_commit_ts: 0,
+                prefix_digest: [0x11; 32],
+                previous_frontier_offset: 0,
+                previous_frontier_digest: [0; 32],
+            },
+            frame_offset: WAL_V7_HEADER_LEN as u64,
+            frame_digest: [0x22; 32],
+        }
+    }
+
     fn allocator(limit: u64) -> WalV7PhysicalAllocator {
-        WalV7PhysicalAllocator::new(0, START, limit).expect("create v7 physical allocator")
+        WalV7PhysicalAllocator::new(0, START, limit, genesis_cursor())
+            .expect("create v7 physical allocator")
+    }
+
+    fn complete_frontier_sync(
+        allocator: &mut WalV7PhysicalAllocator,
+        reservation: WalV7FrontierReservation,
+    ) -> Result<()> {
+        let previous = allocator.last_frontier();
+        let generation = previous
+            .frontier
+            .generation
+            .checked_add(1)
+            .expect("test generation fits");
+        let next = WalV7FrontierCursor {
+            frontier: WalV7Frontier {
+                generation,
+                ticket_end: reservation.ticket_end(),
+                durable_end: reservation.frame_offset(),
+                last_commit_ts: reservation.ticket_end(),
+                prefix_digest: [generation.to_be_bytes()[7]; 32],
+                previous_frontier_offset: previous.frame_offset,
+                previous_frontier_digest: previous.frame_digest,
+            },
+            frame_offset: reservation.frame_offset(),
+            frame_digest: [generation.wrapping_add(0x40).to_be_bytes()[7]; 32],
+        };
+        allocator.complete_frontier_sync(reservation, next)
     }
 
     #[test]
@@ -432,9 +581,9 @@ mod tests {
         let second = allocator.reserve_data(1).unwrap();
 
         let first_frontier = allocator.reserve_frontier(1).unwrap();
-        allocator.complete_frontier_sync(first_frontier).unwrap();
+        complete_frontier_sync(&mut allocator, first_frontier).unwrap();
         let second_frontier = allocator.reserve_frontier(2).unwrap();
-        allocator.complete_frontier_sync(second_frontier).unwrap();
+        complete_frontier_sync(&mut allocator, second_frontier).unwrap();
 
         let third = allocator.reserve_data(1).unwrap();
 
@@ -469,7 +618,7 @@ mod tests {
         let second = allocator.reserve_data(1).unwrap();
 
         assert!(allocator.reserve_frontier(2).is_err());
-        allocator.complete_frontier_sync(frontier).unwrap();
+        complete_frontier_sync(&mut allocator, frontier).unwrap();
         assert!(allocator.reserve_frontier(1).is_err());
         let next_frontier = allocator.reserve_frontier(2).unwrap();
 
@@ -501,7 +650,7 @@ mod tests {
         assert_eq!(frontier.frame_offset(), data.frame_range().end);
         assert_eq!(allocator.allocation_tail(), START + 2 * FRAME);
 
-        allocator.complete_frontier_sync(frontier).unwrap();
+        complete_frontier_sync(&mut allocator, frontier).unwrap();
         assert!(allocator.reserve_frontier(2).is_err());
         assert!(allocator.reserve_data(1).is_err());
         assert_eq!(allocator.next_ticket(), 1);
@@ -516,7 +665,7 @@ mod tests {
         assert_eq!(single.allocation_tail(), START);
         let _data = single.reserve_data(1).unwrap();
         let terminal = single.reserve_frontier(1).unwrap();
-        single.complete_frontier_sync(terminal).unwrap();
+        complete_frontier_sync(&mut single, terminal).unwrap();
         assert_eq!(single.allocation_tail(), START + 2 * FRAME);
 
         let mut pending = allocator(START + 4 * FRAME);
@@ -526,10 +675,10 @@ mod tests {
         assert_eq!(pending.next_ticket(), 2);
         assert_eq!(pending.allocation_tail(), START + 2 * FRAME);
         let first_frontier = pending.reserve_frontier(1).unwrap();
-        pending.complete_frontier_sync(first_frontier).unwrap();
+        complete_frontier_sync(&mut pending, first_frontier).unwrap();
         assert!(pending.reserve_data(1).is_err());
         let terminal = pending.reserve_frontier(2).unwrap();
-        pending.complete_frontier_sync(terminal).unwrap();
+        complete_frontier_sync(&mut pending, terminal).unwrap();
         assert_eq!(pending.allocation_tail(), START + 4 * FRAME);
     }
 
@@ -545,17 +694,108 @@ mod tests {
         assert_eq!(allocator.next_ticket(), 4);
         assert_eq!(allocator.allocation_tail(), START + 5 * FRAME);
 
-        allocator.complete_frontier_sync(coalesced).unwrap();
+        complete_frontier_sync(&mut allocator, coalesced).unwrap();
         let _later = allocator.reserve_data(1).unwrap();
         assert!(allocator.reserve_data(1).is_err());
         assert_eq!(allocator.next_ticket(), 5);
         assert_eq!(allocator.allocation_tail(), START + 6 * FRAME);
 
         let next = allocator.reserve_frontier(4).unwrap();
-        allocator.complete_frontier_sync(next).unwrap();
+        complete_frontier_sync(&mut allocator, next).unwrap();
         let terminal = allocator.reserve_frontier(5).unwrap();
-        allocator.complete_frontier_sync(terminal).unwrap();
+        complete_frontier_sync(&mut allocator, terminal).unwrap();
         assert_eq!(allocator.allocation_tail(), START + 8 * FRAME);
+    }
+
+    #[test]
+    fn invalid_synced_frontier_cursor_poisons_allocator() {
+        let mut allocator = allocator(START + 8 * FRAME);
+        let _data = allocator.reserve_data(1).unwrap();
+        let reservation = allocator.reserve_frontier(1).unwrap();
+        let previous = allocator.last_frontier();
+
+        let mut fork = WalV7FrontierCursor {
+            frontier: WalV7Frontier {
+                generation: 1,
+                ticket_end: 1,
+                durable_end: reservation.frame_offset(),
+                last_commit_ts: 1,
+                prefix_digest: [0x33; 32],
+                previous_frontier_offset: previous.frame_offset,
+                previous_frontier_digest: previous.frame_digest,
+            },
+            frame_offset: reservation.frame_offset(),
+            frame_digest: [0x44; 32],
+        };
+        fork.frontier.previous_frontier_digest[0] ^= 1;
+        assert!(
+            allocator
+                .complete_frontier_sync(reservation.clone(), fork)
+                .is_err()
+        );
+        assert_eq!(allocator.last_frontier(), previous);
+        assert!(allocator.reserve_data(1).is_err());
+        assert!(allocator.reserve_frontier(1).is_err());
+    }
+
+    #[test]
+    fn unaligned_synced_frontier_boundary_poisons_allocator() {
+        let mut allocator = allocator(START + 8 * FRAME);
+        let _data = allocator.reserve_data(1).unwrap();
+        let reservation = allocator.reserve_frontier(1).unwrap();
+        let previous = allocator.last_frontier();
+        let next = WalV7FrontierCursor {
+            frontier: WalV7Frontier {
+                generation: previous.frontier.generation + 1,
+                ticket_end: reservation.ticket_end(),
+                durable_end: reservation.frame_offset() - 1,
+                last_commit_ts: 1,
+                prefix_digest: [0x33; 32],
+                previous_frontier_offset: previous.frame_offset,
+                previous_frontier_digest: previous.frame_digest,
+            },
+            frame_offset: reservation.frame_offset(),
+            frame_digest: [0x44; 32],
+        };
+
+        assert!(allocator.complete_frontier_sync(reservation, next).is_err());
+        assert_eq!(allocator.last_frontier(), previous);
+        assert!(allocator.reserve_data(1).is_err());
+        assert!(allocator.reserve_frontier(1).is_err());
+    }
+
+    #[test]
+    fn resumed_allocator_continues_from_the_installed_frontier_cursor() {
+        let mut original = allocator(START + 6 * FRAME);
+        let _data = original.reserve_data(1).unwrap();
+        let frontier = original.reserve_frontier(1).unwrap();
+        complete_frontier_sync(&mut original, frontier).unwrap();
+
+        let installed_cursor = original.last_frontier();
+        let mut resumed = WalV7PhysicalAllocator::new(
+            original.next_ticket(),
+            original.allocation_tail(),
+            START + 6 * FRAME,
+            installed_cursor,
+        )
+        .unwrap();
+        let next_data = resumed.reserve_data(1).unwrap();
+        assert_eq!(next_data.ticket(), 1);
+
+        let next_frontier = resumed.reserve_frontier(2).unwrap();
+        complete_frontier_sync(&mut resumed, next_frontier).unwrap();
+
+        let advanced_cursor = resumed.last_frontier();
+        assert_eq!(advanced_cursor.frontier.generation, 2);
+        assert_eq!(advanced_cursor.frontier.ticket_end, 2);
+        assert_eq!(
+            advanced_cursor.frontier.previous_frontier_offset,
+            installed_cursor.frame_offset
+        );
+        assert_eq!(
+            advanced_cursor.frontier.previous_frontier_digest,
+            installed_cursor.frame_digest
+        );
     }
 
     #[test]
@@ -592,10 +832,21 @@ mod tests {
 
     #[test]
     fn malformed_start_and_foreign_frontier_reservation_are_rejected() {
-        assert!(WalV7PhysicalAllocator::new(0, START + 1, START + 4 * FRAME).is_err());
-        assert!(WalV7PhysicalAllocator::new(4, START + 3 * FRAME, START + 4 * FRAME).is_err());
         assert!(
-            WalV7PhysicalAllocator::new(0, START, crate::wal::MAX_WAL_FILE_SIZE + FRAME).is_err()
+            WalV7PhysicalAllocator::new(0, START + 1, START + 4 * FRAME, genesis_cursor()).is_err()
+        );
+        assert!(
+            WalV7PhysicalAllocator::new(4, START + 3 * FRAME, START + 4 * FRAME, genesis_cursor())
+                .is_err()
+        );
+        assert!(
+            WalV7PhysicalAllocator::new(
+                0,
+                START,
+                crate::wal::MAX_WAL_FILE_SIZE + FRAME,
+                genesis_cursor(),
+            )
+            .is_err()
         );
 
         let mut first = allocator(START + 8 * FRAME);
@@ -609,7 +860,7 @@ mod tests {
             matching_reservation.frame_offset()
         );
         assert_eq!(reservation.ticket_end(), matching_reservation.ticket_end());
-        assert!(second.complete_frontier_sync(reservation).is_err());
-        second.complete_frontier_sync(matching_reservation).unwrap();
+        assert!(complete_frontier_sync(&mut second, reservation).is_err());
+        complete_frontier_sync(&mut second, matching_reservation).unwrap();
     }
 }

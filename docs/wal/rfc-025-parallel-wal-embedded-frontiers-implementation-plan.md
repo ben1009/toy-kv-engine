@@ -49,9 +49,13 @@ integration remain; this estimate is not the final hard-bound enforcement.
 Production WAL-open and manifest integration also remain. Stage 5 has started with
 recovered-runtime cursor bootstrap: an installed Active image supplies the v7
 DATA start, append offset, and next ticket, and the shared runtime seeds its
-admission, packer, and durability coordinates from that state. V7 startup stays
-closed and performs no extent initialization or buffer-pool warmup until later
-runtime slices provide live reservations and the v7 writer path.
+admission, packer, and durability coordinates from that state. The seed now
+preserves the verified terminal FRONTIER body, frame offset, and frame digest;
+the allocator accepts a synced successor only when its generation, ticket and
+timestamp ordering, physical bounds, predecessor offset, and predecessor digest
+continue that cursor. V7 startup stays closed and performs no extent
+initialization or buffer-pool warmup until later runtime slices provide live
+reservations and the v7 writer path.
 The production logical-batch encoder now emits the v7 ticketed header and
 canonical RFC 023 entry stream with both v7 CRCs. It validates borrowed
 canonical survivors before allocating encoded bytes and does not copy their
@@ -72,7 +76,12 @@ physical allocator, and its ordered packer can consume allocator-issued DATA
 tokens and build worker spans that account for marker gaps, including a marker
 at the beginning of a later group. Runtime admission still cannot assign and
 queue live v7 batches, the v7 runtime remains paused, and marker writes plus the
-one-sync coordinator remain unconnected.
+one-sync coordinator remain unconnected. Active recovery transfers its verified
+terminal FRONTIER cursor into that paused runtime, and allocator completion
+advances the cursor only after validating the next marker's canonical chain
+link. Tests cover resuming allocation from an installed nonzero cursor and
+poisoning further allocations when a post-sync cursor has a mismatched
+predecessor digest or unaligned durable boundary.
 The serial persistence model covers repeated normalization, continued append,
 and crash/reopen for empty, nonempty, fallback, and trailing-control prefixes,
 including a selected marker behind speculative DATA. The production writer
@@ -428,11 +437,15 @@ neither is a prerequisite for this stage.
 
 - Derive a checked `WalV7RuntimeSeed` from the installed Active image and the
   format descriptor. Validate its final recovery marker, logical boundary,
-  ticket count, append offset, and DATA start. Seed the shared runtime's next
-  admission/packer ticket and written/durable frontiers from it. Keep this v7
-  runtime closed, with no extent initialization or prewarmed direct buffers;
-  runtime admission opens only after later slices install the live reservations
-  and v7 write protocol. The existing v4 startup keeps its current behavior.
+  ticket count, append offset, DATA start, and verified terminal FRONTIER
+  cursor. Seed the shared runtime's next admission/packer ticket, written/durable
+  frontiers, and physical allocator predecessor from it. Validate each later
+  successfully synced FRONTIER as the immediate canonical successor, including
+  generation and ticket/timestamp ordering, physical bounds, and predecessor
+  offset/digest. Keep this v7 runtime closed, with no extent initialization or
+  prewarmed direct buffers; runtime admission opens only after later slices
+  install the live reservations and v7 write protocol. The existing v4 startup
+  keeps its current behavior.
 - Initialize the runtime from the descriptor and recovered state, including
   v7's DATA start and continued segment ticket numbering. Retain the existing
   32 group slots and 256 ring entries unless a separately measured change is
@@ -480,7 +493,8 @@ neither is a prerequisite for this stage.
   Never rely on future admission, or change `T` during marker write/sync.
   Poison must terminate otherwise impossible waits.
 - On DATA failure, finish a healthy earlier prefix only if it remains marker
-  eligible below poison. On a failed/short/uncertain marker write or failed sync,
+  eligible below poison. On a failed/short/uncertain marker write, failed sync,
+  or failed post-sync cursor validation,
   close admission and prohibit every subsequent FRONTIER append in that runtime.
   Fail/wake unresolved waiters and settle CQE/hash ownership before teardown.
   Exclusive recovery alone may reconcile the uncertain image.

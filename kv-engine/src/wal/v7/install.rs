@@ -17,6 +17,7 @@ use sha2::{Digest, Sha256};
 
 use super::{
     admission::{WalV7Reservation, WalV7ResourceCharge, WalV7ResourceLedger},
+    allocator::WalV7FrontierCursor,
     codec::{
         WAL_V7_FRAME_LEN, WAL_V7_HEADER_LEN, WAL_V7_LOGICAL_BATCH_HEADER_LEN,
         WalV7DataFragmentHeader, WalV7FrameKind, WalV7Frontier, WalV7Header,
@@ -63,14 +64,16 @@ pub(crate) struct WalV7InstalledRecovery {
     pub(crate) physical_hasher: Sha256,
 }
 
-/// The append cursor needed to initialize a v7 WAL runtime after recovery has
-/// durably installed its normalized image. This intentionally carries no
-/// authority or hash state: those remain owned by the recovered WAL lifecycle.
+/// The append cursor and verified FRONTIER predecessor needed to initialize a
+/// v7 WAL runtime after recovery has durably installed its normalized image.
+/// This carries no manifest authority or incremental hash state; those remain
+/// owned by the recovered WAL lifecycle.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct WalV7RuntimeSeed {
     pub(crate) data_start: u64,
     pub(crate) append_offset: u64,
     pub(crate) next_ticket: u64,
+    pub(crate) frontier_cursor: WalV7FrontierCursor,
 }
 
 /// Active recovery result after authoritative selection and durable installation.
@@ -196,6 +199,11 @@ impl WalV7InstalledRecovery {
             data_start,
             append_offset: self.append_offset,
             next_ticket: self.next_ticket,
+            frontier_cursor: WalV7FrontierCursor {
+                frontier: self.frontier,
+                frame_offset: self.frontier_offset,
+                frame_digest: self.frontier_digest,
+            },
         })
     }
 }
@@ -1266,6 +1274,15 @@ mod tests {
         assert_eq!(seed.data_start, 2 * FRAME_LEN_U64);
         assert_eq!(seed.append_offset, recovered.installed.image_len);
         assert_eq!(seed.next_ticket, 1);
+        assert_eq!(seed.frontier_cursor.frontier, recovered.installed.frontier);
+        assert_eq!(
+            seed.frontier_cursor.frame_offset,
+            recovered.installed.frontier_offset
+        );
+        assert_eq!(
+            seed.frontier_cursor.frame_digest,
+            recovered.installed.frontier_digest
+        );
         recovered.installed.append_offset += FRAME_LEN_U64;
         assert!(recovered.installed.runtime_seed().is_err());
 
@@ -1510,6 +1527,9 @@ mod tests {
         assert_eq!(seed.data_start, 2 * FRAME_LEN_U64);
         assert_eq!(seed.append_offset, 2 * FRAME_LEN_U64);
         assert_eq!(seed.next_ticket, 0);
+        assert_eq!(seed.frontier_cursor.frontier, installed.frontier);
+        assert_eq!(seed.frontier_cursor.frame_offset, HEADER_LEN_U64);
+        assert_eq!(seed.frontier_cursor.frame_digest, installed.frontier_digest);
         assert_eq!(
             installed.recovered_resource_charge()?,
             WalV7ResourceCharge::default()

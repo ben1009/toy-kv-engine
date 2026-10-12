@@ -84,8 +84,12 @@ impl ParallelWalRuntimeStart {
 
     #[allow(dead_code)] // Production v7 open wiring follows in a later runtime slice.
     pub(crate) fn v7(seed: WalV7RuntimeSeed) -> Result<Self> {
-        let v7_allocator =
-            WalV7PhysicalAllocator::new(seed.next_ticket, seed.append_offset, MAX_WAL_FILE_SIZE)?;
+        let v7_allocator = WalV7PhysicalAllocator::new(
+            seed.next_ticket,
+            seed.append_offset,
+            MAX_WAL_FILE_SIZE,
+            seed.frontier_cursor,
+        )?;
         let start = Self {
             append_offset: seed.append_offset,
             next_ticket: seed.next_ticket,
@@ -1716,12 +1720,29 @@ mod tests {
 
         use super::{ParallelWalRuntime, ParallelWalRuntimeStart};
         use crate::{
-            tests::harness::is_io_uring_unavailable_error, wal::v7::install::WalV7RuntimeSeed,
+            tests::harness::is_io_uring_unavailable_error,
+            wal::v7::{
+                allocator::WalV7FrontierCursor, codec::WalV7Frontier, install::WalV7RuntimeSeed,
+            },
         };
 
         const DATA_START: u64 = 2 * 4096;
         const APPEND_OFFSET: u64 = 9 * 4096;
-        const NEXT_TICKET: u64 = 7;
+        const FRONTIER_OFFSET: u64 = 8 * 4096;
+        const NEXT_TICKET: u64 = 6;
+        let frontier_cursor = WalV7FrontierCursor {
+            frontier: WalV7Frontier {
+                generation: 3,
+                ticket_end: NEXT_TICKET,
+                durable_end: FRONTIER_OFFSET,
+                last_commit_ts: 60,
+                prefix_digest: [0xA1; 32],
+                previous_frontier_offset: 6 * 4096,
+                previous_frontier_digest: [0xB2; 32],
+            },
+            frame_offset: FRONTIER_OFFSET,
+            frame_digest: [0xC3; 32],
+        };
 
         let directory = tempfile::tempdir().expect("create WAL directory");
         let path = directory.path().join("recovered-v7.wal");
@@ -1741,6 +1762,7 @@ mod tests {
             data_start: DATA_START,
             append_offset: APPEND_OFFSET,
             next_ticket: NEXT_TICKET,
+            frontier_cursor,
         })
         .expect("validate recovered runtime cursor");
         let runtime = match ParallelWalRuntime::spawn(
@@ -1762,6 +1784,14 @@ mod tests {
             assert!(!admission.open);
             assert_eq!(admission.next_ticket, NEXT_TICKET);
             assert_eq!(admission.admitted_end, APPEND_OFFSET);
+            assert_eq!(
+                admission
+                    .v7_allocator
+                    .as_ref()
+                    .expect("v7 runtime owns its physical allocator")
+                    .last_frontier(),
+                frontier_cursor
+            );
         }
         {
             let packer = runtime.inner.packer_state.lock();
@@ -2230,13 +2260,30 @@ mod tests {
 
     #[test]
     fn v7_packer_carries_frontier_gap_into_the_following_worker_group() {
-        use crate::wal::v7::allocator::WalV7PhysicalAllocator;
+        use crate::wal::v7::{
+            allocator::{WalV7FrontierCursor, WalV7PhysicalAllocator},
+            codec::WalV7Frontier,
+        };
 
         const DATA_START: u64 = 8 * 1024;
         const FRAME: u64 = 4 * 1024;
 
-        let mut allocator = WalV7PhysicalAllocator::new(0, DATA_START, MAX_WAL_FILE_SIZE)
-            .expect("create v7 allocator");
+        let genesis_cursor = WalV7FrontierCursor {
+            frontier: WalV7Frontier {
+                generation: 0,
+                ticket_end: 0,
+                durable_end: 4096,
+                last_commit_ts: 0,
+                prefix_digest: [0x11; 32],
+                previous_frontier_offset: 0,
+                previous_frontier_digest: [0; 32],
+            },
+            frame_offset: 4096,
+            frame_digest: [0x22; 32],
+        };
+        let mut allocator =
+            WalV7PhysicalAllocator::new(0, DATA_START, MAX_WAL_FILE_SIZE, genesis_cursor)
+                .expect("create v7 allocator");
         let first = allocator
             .reserve_data(1)
             .expect("reserve first DATA ticket");
