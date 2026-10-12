@@ -140,11 +140,19 @@ poisoning, stale recovery descriptors, and invalid descriptor/physical caps.
 The writer caps caller-supplied batch bounds to the live recovery limits before
 admission, while retaining stricter bounds. Seed snapshots require a clean
 ownership handoff without any subsequent admission; failed write/sync outcomes
-require a fresh recovery installation.
-Engine WAL-open/write dispatch, live resource-ledger ownership, Parallel
-admission, and the production v6 to v7 transition remain unconnected.
+require a fresh recovery installation. A serial v7 Leader adapter now connects
+that primitive to `Wal`'s PITR batch append API: it seeds assigned and durable
+ticket cursors from the installed image, publishes each ticket only after the
+DATA/FRONTIER sync, and routes submit/sync/close through serial barriers without
+an io_uring ring. Whole-WAL sync/close wait for in-flight appends and inspect
+writer poison, including after unwind; later failures preserve success for
+earlier durable ticket barriers. Focused tests cover resumed ticket state,
+recovery, pre-admission capacity rejection, concurrent sync/close, caught
+panics, and durable-prefix preservation after sync failure.
+Production engine WAL-open selection, live resource-ledger lifecycle ownership,
+Parallel admission, and the v6 to v7 transition remain unconnected.
 
-**Last updated:** 2026-10-12
+**Last updated:** 2026-10-13
 
 **Source baseline:** `30a64fa855126596316ab6b9237e6348b0e41fd2`, which merged RFC 025 in PR #379.
 

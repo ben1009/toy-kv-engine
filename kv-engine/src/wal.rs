@@ -19,9 +19,10 @@ use sha2::{Digest, Sha256};
 
 use crate::{key::KeySlice, range_tombstone::RangeTombstone};
 use format::{
-    WAL_FORMAT_VERSION_V4, WAL_HEADER_SIZE, WAL_MVCC_MAGIC, WalFormatDescriptor, WalFraming,
-    WalIoPath,
+    WAL_FORMAT_VERSION_V4, WAL_FORMAT_VERSION_V7, WAL_HEADER_SIZE, WAL_MVCC_MAGIC,
+    WalFormatDescriptor, WalFraming, WalIoPath,
 };
+use v7::{codec::WAL_V7_FRAME_LEN, leader::WalV7LeaderWriter};
 
 #[cfg(test)]
 mod parallel;
@@ -442,10 +443,14 @@ struct WaitForTicketStats {
 
 impl CompletionState {
     fn new() -> Self {
+        Self::with_durable_ticket(0)
+    }
+
+    fn with_durable_ticket(durable_ticket: u64) -> Self {
         Self {
             mutex: parking_lot::Mutex::new(CompletionInner { last_error: None }),
             cond: Condvar::new(),
-            durable_ticket: AtomicU64::new(0),
+            durable_ticket: AtomicU64::new(durable_ticket),
         }
     }
 }
@@ -463,6 +468,9 @@ pub struct Wal {
     io_mode: WalIoMode,
     /// Dedicated packer/worker/sync coordinator for parallel v4 WALs.
     parallel_runtime: Option<parallel_runtime::ParallelWalRuntime>,
+    /// Serial v7 writer. Each append performs DATA + FRONTIER + one WAL sync
+    /// before returning, so its completion watermark is already durable.
+    v7_leader: Option<Mutex<WalV7LeaderWriter>>,
     /// Whether this WAL uses v3 typed entries (kind prefix).
     /// Only meaningful when `mvcc_format` is true. When false, the WAL uses v2
     /// untyped entries. Preserved from recovery so appended records match the
@@ -789,6 +797,7 @@ impl Wal {
                 format_version,
                 io_mode,
                 parallel_runtime,
+                v7_leader: None,
                 is_v3,
                 direct_file: Some(direct_file),
                 ring: Mutex::new(ring),
@@ -819,6 +828,7 @@ impl Wal {
                 format_version: 0,
                 io_mode: WalIoMode::Leader,
                 parallel_runtime: None,
+                v7_leader: None,
                 is_v3,
                 direct_file: None,
                 ring: Mutex::new(None),
@@ -1155,6 +1165,7 @@ impl Wal {
             format_version: WAL_FORMAT_VERSION_V4,
             io_mode,
             parallel_runtime,
+            v7_leader: None,
             is_v3: true,
             direct_file: Some(direct_file),
             ring: Mutex::new(ring),
@@ -1211,6 +1222,7 @@ impl Wal {
             format_version: header.wal_format_version,
             io_mode: WalIoMode::Leader,
             parallel_runtime: None,
+            v7_leader: None,
             is_v3: true,
             direct_file: Some(direct_file),
             ring: Mutex::new(Some(ring)),
@@ -1236,6 +1248,46 @@ impl Wal {
                 Vec::new(),
                 digest_rule,
             ))),
+        })
+    }
+
+    /// Adapt an installed serial v7 writer to the WAL ticket/barrier API.
+    ///
+    /// The writer owns the authoritative append cursor and has already synced
+    /// every ticket it reports. The cloned sync handle is retained only for
+    /// the legacy buffered-file field; v7 reads and writes use dedicated paths.
+    #[allow(dead_code)]
+    pub(crate) fn from_v7_leader(writer: WalV7LeaderWriter) -> Result<Self> {
+        let seed = writer.runtime_seed()?;
+        let buffered_file = writer.try_clone_sync_file()?;
+
+        Ok(Self {
+            buffered_file: Arc::new(Mutex::new(BufWriter::new(buffered_file))),
+            mvcc_format: true,
+            format_version: WAL_FORMAT_VERSION_V7,
+            io_mode: WalIoMode::Leader,
+            parallel_runtime: None,
+            v7_leader: Some(Mutex::new(writer)),
+            is_v3: true,
+            direct_file: None,
+            ring: Mutex::new(None),
+            direct_buf_pool: Self::new_direct_buf_pool(false),
+            pending: Mutex::new(Vec::new()),
+            next_ticket: AtomicU64::new(seed.next_ticket),
+            alloc_offset: AtomicU64::new(seed.append_offset),
+            preallocated_size: AtomicU64::new(seed.append_offset),
+            completion_state: CompletionState::with_durable_ticket(seed.next_ticket),
+            submitting: AtomicBool::new(false),
+            #[cfg(feature = "bench")]
+            last_release_ns: AtomicU64::new(0),
+            poisoned: AtomicBool::new(false),
+            pitr_max_segment_bytes: AtomicU64::new(u64::MAX),
+            pitr_max_unarchived_bytes: AtomicU64::new(u64::MAX),
+            pitr_segment_start: AtomicU64::new(seed.data_start),
+            pitr_reserved_end: Mutex::new(seed.append_offset),
+            pitr_rotation_needed: AtomicBool::new(false),
+            pitr_seal: None,
+            pitr_seal_append: Mutex::new(()),
         })
     }
 
@@ -1417,7 +1469,8 @@ impl Wal {
     }
 
     #[allow(dead_code)]
-    /// Append a v5 (PITR) batch.
+    /// Append a PITR batch. v5/v6 enqueue for the Leader barrier; serial v7
+    /// commits DATA and FRONTIER together before returning.
     ///
     /// `profile` receives the same phase counters the v4 path records, on the
     /// same fields: on this path they time the v5 encoder, the batch-budget
@@ -1428,6 +1481,10 @@ impl Wal {
         limits: crate::pitr::WalV5Limits,
         profile: Option<&crate::mem_table::WriteProfile>,
     ) -> Result<u64> {
+        if self.format_version == WAL_FORMAT_VERSION_V7 {
+            return self.put_v7_leader_batch(batch, limits);
+        }
+
         anyhow::ensure!(
             crate::pitr::is_v5_family(self.format_version),
             "v5 WAL append selected for format {}",
@@ -1540,6 +1597,142 @@ impl Wal {
             profile.record_wal_enqueue_ns(enqueue_start.elapsed().as_nanos() as u64);
         }
         Ok(ticket)
+    }
+
+    fn put_v7_leader_batch(
+        &self,
+        batch: &crate::pitr::WalBatch,
+        limits: crate::pitr::WalV5Limits,
+    ) -> Result<u64> {
+        anyhow::ensure!(
+            !self.poisoned.load(Ordering::Acquire),
+            "WAL is poisoned due to a previous I/O error"
+        );
+        let writer = self
+            .v7_leader
+            .as_ref()
+            .context("v7 WAL has no serial Leader writer")?;
+        let mut writer = writer.lock();
+        anyhow::ensure!(
+            !self.poisoned.load(Ordering::Acquire),
+            "WAL is poisoned due to a previous I/O error"
+        );
+        let previous_ticket_end = self.next_ticket.load(Ordering::Acquire);
+
+        match writer.append_batch(batch, limits) {
+            Ok(commit) => {
+                let ticket_end = commit
+                    .ticket
+                    .checked_add(1)
+                    .context("v7 WAL ticket end overflows")?;
+                let append_offset = commit
+                    .frontier
+                    .frame_offset
+                    .checked_add(WAL_V7_FRAME_LEN as u64)
+                    .context("v7 WAL append offset overflows")?;
+                if commit.ticket != previous_ticket_end {
+                    self.poisoned.store(true, Ordering::Release);
+                    anyhow::bail!("v7 Leader ticket disagrees with the WAL completion cursor");
+                }
+                if let Err(error) = self.publish_v7_durable_cursor(ticket_end, append_offset) {
+                    self.poisoned.store(true, Ordering::Release);
+                    return Err(error);
+                }
+                Ok(commit.ticket)
+            }
+            Err(error) => {
+                if writer.is_poisoned() {
+                    self.poisoned.store(true, Ordering::Release);
+                } else {
+                    // An unpoisoned append error is pre-admission, so the
+                    // writer's runtime cursor remains the next valid cursor.
+                    // Mirror it before allowing another append.
+                    match writer.runtime_seed() {
+                        Ok(seed) => {
+                            if let Err(publish_error) =
+                                self.publish_v7_durable_cursor(seed.next_ticket, seed.append_offset)
+                            {
+                                self.poisoned.store(true, Ordering::Release);
+                                return Err(error.context(format!(
+                                    "also failed to publish the v7 WAL cursor: {publish_error:#}"
+                                )));
+                            }
+                        }
+                        Err(seed_error) => {
+                            self.poisoned.store(true, Ordering::Release);
+                            return Err(error.context(format!(
+                                "also failed to inspect the v7 WAL cursor: {seed_error:#}"
+                            )));
+                        }
+                    }
+                }
+                Err(error)
+            }
+        }
+    }
+
+    fn publish_v7_durable_cursor(&self, ticket_end: u64, append_offset: u64) -> Result<()> {
+        let previous_ticket_end = self.next_ticket.load(Ordering::Acquire);
+        let previous_append_offset = self.alloc_offset.load(Ordering::Acquire);
+        anyhow::ensure!(
+            ticket_end == previous_ticket_end
+                || previous_ticket_end.checked_add(1) == Some(ticket_end),
+            "v7 Leader completion cursor skipped a ticket"
+        );
+        anyhow::ensure!(
+            append_offset >= previous_append_offset
+                && append_offset.is_multiple_of(WAL_V7_FRAME_LEN as u64),
+            "v7 Leader append cursor moved backwards or is unaligned"
+        );
+        anyhow::ensure!(
+            (ticket_end == previous_ticket_end) == (append_offset == previous_append_offset),
+            "v7 Leader ticket and append cursors advanced inconsistently"
+        );
+
+        self.alloc_offset.store(append_offset, Ordering::Release);
+        self.preallocated_size
+            .store(append_offset, Ordering::Release);
+        *self.pitr_reserved_end.lock() = append_offset;
+        // A concurrent sync that observes the new ticket count must also see
+        // that ticket as durable, so publish the watermark first.
+        self.completion_state
+            .durable_ticket
+            .store(ticket_end, Ordering::Release);
+        self.next_ticket.store(ticket_end, Ordering::Release);
+        Ok(())
+    }
+
+    fn wait_for_v7_leader(
+        &self,
+        writer: &Mutex<WalV7LeaderWriter>,
+        ticket: Option<u64>,
+    ) -> Result<()> {
+        // Appends hold this admission gate through DATA/FRONTIER sync and
+        // cursor publication. Whole-WAL barriers must wait for that work even
+        // though next_ticket still describes the previous durable prefix.
+        let writer = writer.lock();
+        let durable_ticket = self.completion_state.durable_ticket.load(Ordering::Acquire);
+        if ticket.is_some_and(|ticket| ticket < durable_ticket) {
+            // Recheck under the gate: a ticket can become durable while this
+            // caller waits, and a subsequent failure cannot retract it.
+            return Ok(());
+        }
+        if writer.is_poisoned() {
+            // An unwind bypasses the append error arm. parking_lot does not
+            // poison its mutex, so inspect the writer's persistent poison too.
+            self.poisoned.store(true, Ordering::Release);
+        }
+        anyhow::ensure!(
+            !self.poisoned.load(Ordering::Acquire),
+            "WAL is poisoned due to a previous I/O error"
+        );
+        if let Some(ticket) = ticket {
+            anyhow::bail!(
+                "submit_and_commit called with unassigned ticket {ticket} (next_ticket={durable_ticket})"
+            );
+        }
+
+        Ok(())
     }
 
     /// Parse an MVCC-format WAL file, delegating each recovered entry to the
@@ -2593,11 +2786,15 @@ impl Wal {
 
     /// Durably sync the WAL to disk.
     ///
-    /// For MVCC WALs: delegates to `submit_and_commit` (io_uring path).
+    /// Serial v7 WALs wait for any in-flight append and check writer health.
+    /// Other MVCC WALs delegate to `submit_and_commit` (io_uring path).
     /// For legacy WALs: flushes and fsyncs the BufWriter directly.
     pub fn sync(&self) -> Result<()> {
         if let Some(runtime) = &self.parallel_runtime {
             return runtime.sync();
+        }
+        if let Some(writer) = &self.v7_leader {
+            return self.wait_for_v7_leader(writer, None);
         }
 
         if !self.mvcc_format {
@@ -2622,6 +2819,9 @@ impl Wal {
     pub fn close(&self) -> Result<()> {
         if let Some(runtime) = &self.parallel_runtime {
             return runtime.close();
+        }
+        if let Some(writer) = &self.v7_leader {
+            return self.wait_for_v7_leader(writer, None);
         }
 
         // Flush legacy buffered writes before draining io_uring.
@@ -2693,6 +2893,9 @@ impl Wal {
         // and the CAS loop entirely.
         if self.completion_state.durable_ticket.load(Ordering::Acquire) > ticket {
             return Ok(());
+        }
+        if let Some(writer) = &self.v7_leader {
+            return self.wait_for_v7_leader(writer, Some(ticket));
         }
 
         let next_ticket = self.next_ticket.load(Ordering::Acquire);
