@@ -4,7 +4,7 @@ use std::{
     collections::{BTreeMap, VecDeque},
     fs::File,
     io,
-    os::fd::AsRawFd,
+    os::{fd::AsRawFd, unix::fs::MetadataExt},
     sync::Arc,
     thread::{self, JoinHandle},
     time::{Duration, Instant},
@@ -62,6 +62,7 @@ pub(crate) struct ParallelWalRuntimeStart {
     next_ticket: u64,
     v7_allocator: Option<WalV7PhysicalAllocator>,
     v7_metadata: Option<WalV7RuntimeMetadata>,
+    expected_v7_inode: Option<(u64, u64)>,
     min_append_offset: u64,
     admission_open: bool,
     initialize_extents: bool,
@@ -75,6 +76,7 @@ impl ParallelWalRuntimeStart {
             next_ticket: 0,
             v7_allocator: None,
             v7_metadata: None,
+            expected_v7_inode: None,
             min_append_offset: WAL_HEADER_END,
             admission_open: true,
             initialize_extents: true,
@@ -86,6 +88,7 @@ impl ParallelWalRuntimeStart {
 
     #[allow(dead_code)] // Production v7 open wiring follows in a later runtime slice.
     pub(crate) fn v7(seed: WalV7RuntimeSeed) -> Result<Self> {
+        let expected_v7_inode = Some((seed.installed_dev, seed.installed_ino));
         let v7_allocator = WalV7PhysicalAllocator::new(
             seed.next_ticket,
             seed.append_offset,
@@ -97,6 +100,7 @@ impl ParallelWalRuntimeStart {
             next_ticket: seed.next_ticket,
             v7_allocator: Some(v7_allocator),
             v7_metadata: Some(seed.metadata),
+            expected_v7_inode,
             min_append_offset: seed.data_start,
             admission_open: false,
             initialize_extents: false,
@@ -123,6 +127,33 @@ impl ParallelWalRuntimeStart {
             (None, None) => {}
             _ => bail!("parallel WAL startup has incomplete v7 recovery metadata"),
         }
+        Ok(())
+    }
+
+    fn validate_file_identity(
+        &self,
+        worker_file: &File,
+        sync_file: &File,
+        preallocator: &File,
+    ) -> Result<()> {
+        let Some(expected) = self.expected_v7_inode else {
+            return Ok(());
+        };
+
+        for (role, file) in [
+            ("worker", worker_file),
+            ("sync", sync_file),
+            ("preallocator", preallocator),
+        ] {
+            let metadata = file
+                .metadata()
+                .with_context(|| format!("inspect v7 WAL {role} handle identity"))?;
+            ensure!(
+                (metadata.dev(), metadata.ino()) == expected,
+                "v7 WAL {role} handle does not refer to the installed Active inode"
+            );
+        }
+
         Ok(())
     }
 }
@@ -611,6 +642,7 @@ impl ParallelWalRuntime {
         start: ParallelWalRuntimeStart,
     ) -> Result<Self> {
         start.validate()?;
+        start.validate_file_identity(&worker_file, &sync_file, &preallocator)?;
         let initial_file_end = start.append_offset;
 
         ensure!(
@@ -1763,12 +1795,6 @@ mod tests {
         physical_hasher.update(b"normalized physical image");
         let physical_digest: [u8; 32] = physical_hasher.clone().finalize().into();
         let last_recorded_at = Some(RecordedAt { secs: 60, nanos: 0 });
-        let metadata = WalV7RuntimeMetadata {
-            logical_hasher,
-            physical_hasher,
-            physical_hashed_end: APPEND_OFFSET,
-            last_recorded_at,
-        };
         let frontier_cursor = WalV7FrontierCursor {
             frontier: WalV7Frontier {
                 generation: 3,
@@ -1798,16 +1824,23 @@ mod tests {
             .expect("open recovered WAL with direct I/O");
         let direct_metadata = direct_file.metadata().expect("inspect recovered WAL inode");
         let direct_file = Arc::new(direct_file);
-        let mut start = ParallelWalRuntimeStart::v7(WalV7RuntimeSeed {
-            data_start: DATA_START,
-            append_offset: APPEND_OFFSET,
-            next_ticket: NEXT_TICKET,
-            installed_dev: direct_metadata.dev(),
-            installed_ino: direct_metadata.ino(),
-            frontier_cursor,
-            metadata,
-        })
-        .expect("validate recovered runtime cursor");
+        let make_start = || {
+            ParallelWalRuntimeStart::v7(WalV7RuntimeSeed {
+                data_start: DATA_START,
+                append_offset: APPEND_OFFSET,
+                next_ticket: NEXT_TICKET,
+                installed_dev: direct_metadata.dev(),
+                installed_ino: direct_metadata.ino(),
+                frontier_cursor,
+                metadata: WalV7RuntimeMetadata {
+                    logical_hasher: logical_hasher.clone(),
+                    physical_hasher: physical_hasher.clone(),
+                    physical_hashed_end: APPEND_OFFSET,
+                    last_recorded_at,
+                },
+            })
+        };
+        let mut start = make_start().expect("validate recovered runtime cursor");
         start
             .v7_metadata
             .as_mut()
@@ -1842,6 +1875,46 @@ mod tests {
             .as_mut()
             .expect("v7 startup metadata")
             .last_recorded_at = last_recorded_at;
+
+        let wrong_sync_path = directory.path().join("different-inode.wal");
+        let wrong_sync_file =
+            File::create(&wrong_sync_path).expect("create mismatched sync handle inode");
+        wrong_sync_file
+            .set_len(APPEND_OFFSET)
+            .expect("size mismatched sync handle inode");
+        let wrong_sync_file = Arc::new(wrong_sync_file);
+        let error = match ParallelWalRuntime::spawn(
+            Arc::clone(&direct_file),
+            Arc::clone(&wrong_sync_file),
+            Arc::clone(&direct_file),
+            make_start().expect("validate recovered runtime cursor for mismatch check"),
+        ) {
+            Ok(runtime) => {
+                runtime.close().expect("close unexpectedly started runtime");
+                panic!("v7 runtime accepted a sync handle for a different inode");
+            }
+            Err(error) => error,
+        };
+        assert!(
+            format!("{error:#}")
+                .contains("v7 WAL sync handle does not refer to the installed Active inode"),
+            "unexpected mismatched-inode error: {error:#}"
+        );
+        assert_eq!(
+            direct_file
+                .metadata()
+                .expect("inspect installed WAL after failed startup")
+                .len(),
+            APPEND_OFFSET
+        );
+        assert_eq!(
+            wrong_sync_file
+                .metadata()
+                .expect("inspect mismatched inode after failed startup")
+                .len(),
+            APPEND_OFFSET
+        );
+
         let runtime = match ParallelWalRuntime::spawn(
             Arc::clone(&direct_file),
             Arc::clone(&direct_file),

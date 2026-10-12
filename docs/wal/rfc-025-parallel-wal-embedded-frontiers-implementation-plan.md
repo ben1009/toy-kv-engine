@@ -106,6 +106,10 @@ advances the cursor only after validating the next marker's canonical chain
 link. Tests cover resuming allocation from an installed nonzero cursor and
 poisoning further allocations when a post-sync cursor has a mismatched
 predecessor digest or unaligned durable boundary.
+Paused v7 runtime startup now checks that the worker, sync, and preallocator
+descriptors all refer to the recovered Active device/inode before allocating
+buffers, initializing extents, or spawning workers. A mismatched descriptor is
+rejected without changing either file; runtime admission remains closed.
 The allocator now derives the exact captured physical prefix `E(T)` from
 pending per-ticket DATA ends and the previous FRONTIER end. Each marker
 reservation stores that value, and successful sync retires only DATA-end cursors
