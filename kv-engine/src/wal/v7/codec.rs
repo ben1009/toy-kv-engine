@@ -441,10 +441,69 @@ pub(crate) fn encode_logical_batch_with_recorded_at(
     recorded_at: RecordedAt,
     limits: WalV5Limits,
 ) -> Result<Vec<u8>> {
+    prepare_logical_batch(batch, limits)?.encode_with_recorded_at(segment_ticket, recorded_at)
+}
+
+/// A validated logical batch whose encoded size is known before allocating its
+/// output buffer. Admission can reserve that memory, plus the physical frame
+/// buffers, before materializing the batch bytes.
+pub(crate) struct PreparedWalV7LogicalBatch<'a> {
+    batch: &'a WalBatch,
+    canonical: CanonicalWalEntryStream<'a>,
+    logical_len: usize,
+    limits: WalV5Limits,
+}
+
+impl PreparedWalV7LogicalBatch<'_> {
+    pub(crate) fn encoded_len(&self) -> usize {
+        self.logical_len
+    }
+
+    pub(crate) fn encode_with_recorded_at(
+        self,
+        segment_ticket: u64,
+        recorded_at: RecordedAt,
+    ) -> Result<Vec<u8>> {
+        let Self {
+            batch,
+            canonical,
+            logical_len,
+            limits,
+        } = self;
+        let entry_stream_len = logical_len - WAL_V7_LOGICAL_BATCH_HEADER_LEN;
+        debug_assert_eq!(
+            logical_len,
+            WAL_V7_LOGICAL_BATCH_HEADER_LEN + entry_stream_len
+        );
+
+        let mut output = vec![0; logical_len];
+        let entry_stream = &mut output[WAL_V7_LOGICAL_BATCH_HEADER_LEN..];
+        let (written, entry_stream_crc) = canonical.encode_into(entry_stream)?;
+        ensure!(
+            written == entry_stream_len,
+            "v7 logical batch entry stream length changed while encoding"
+        );
+        let header = WalV7LogicalBatchHeader {
+            segment_ticket,
+            commit_ts: batch.commit_ts,
+            recorded_at_secs: recorded_at.secs,
+            recorded_at_nanos: recorded_at.nanos,
+            entry_count: canonical.entry_count(),
+        }
+        .encode_with_data_crc(entry_stream.len(), entry_stream_crc, limits)?;
+        output[..WAL_V7_LOGICAL_BATCH_HEADER_LEN].copy_from_slice(&header);
+
+        Ok(output)
+    }
+}
+
+pub(crate) fn prepare_logical_batch(
+    batch: &WalBatch,
+    limits: WalV5Limits,
+) -> Result<PreparedWalV7LogicalBatch<'_>> {
     let canonical = CanonicalWalEntryStream::new(batch, limits)?;
-    let entry_stream_len = canonical.data_len();
     let logical_len = WAL_V7_LOGICAL_BATCH_HEADER_LEN
-        .checked_add(entry_stream_len)
+        .checked_add(canonical.data_len())
         .context("v7 logical batch length overflows")?;
     let logical_len_u64 =
         u64::try_from(logical_len).context("v7 logical batch length exceeds u64")?;
@@ -453,24 +512,12 @@ pub(crate) fn encode_logical_batch_with_recorded_at(
         "v7 logical batch length is outside wire bounds"
     );
 
-    let mut output = vec![0; logical_len];
-    let entry_stream = &mut output[WAL_V7_LOGICAL_BATCH_HEADER_LEN..];
-    let (written, entry_stream_crc) = canonical.encode_into(entry_stream)?;
-    ensure!(
-        written == entry_stream_len,
-        "v7 logical batch entry stream length changed while encoding"
-    );
-    let header = WalV7LogicalBatchHeader {
-        segment_ticket,
-        commit_ts: batch.commit_ts,
-        recorded_at_secs: recorded_at.secs,
-        recorded_at_nanos: recorded_at.nanos,
-        entry_count: canonical.entry_count(),
-    }
-    .encode_with_data_crc(entry_stream.len(), entry_stream_crc, limits)?;
-    output[..WAL_V7_LOGICAL_BATCH_HEADER_LEN].copy_from_slice(&header);
-
-    Ok(output)
+    Ok(PreparedWalV7LogicalBatch {
+        batch,
+        canonical,
+        logical_len,
+        limits,
+    })
 }
 
 fn validate_v7_batch_limits(limits: WalV5Limits) -> Result<()> {
@@ -514,14 +561,23 @@ fn encode_frame(
     frame_offset: u64,
     body: &[u8],
 ) -> Result<[u8; WAL_V7_FRAME_LEN]> {
-    kind.validate_position(body, &header_digest, frame_offset)?;
-
     let mut output = [0_u8; WAL_V7_FRAME_LEN];
-    initialize_frame(&mut output, kind, header_digest, frame_offset, body.len())?;
-    output[WAL_V7_FRAME_HEADER_LEN..WAL_V7_FRAME_HEADER_LEN + body.len()].copy_from_slice(body);
-    finish_frame(&mut output);
-
+    encode_frame_into(&mut output, kind, header_digest, frame_offset, body)?;
     Ok(output)
+}
+
+fn encode_frame_into(
+    output: &mut [u8; WAL_V7_FRAME_LEN],
+    kind: WalV7FrameKind,
+    header_digest: [u8; 32],
+    frame_offset: u64,
+    body: &[u8],
+) -> Result<()> {
+    kind.validate_position(body, &header_digest, frame_offset)?;
+    initialize_frame(output, kind, header_digest, frame_offset, body.len())?;
+    output[WAL_V7_FRAME_HEADER_LEN..WAL_V7_FRAME_HEADER_LEN + body.len()].copy_from_slice(body);
+    finish_frame(output);
+    Ok(())
 }
 
 fn initialize_frame(
@@ -695,6 +751,36 @@ pub(crate) fn encode_frontier_successor(
     frame_offset: u64,
     header_digest: [u8; 32],
 ) -> Result<[u8; WAL_V7_FRAME_LEN]> {
+    let mut output = [0_u8; WAL_V7_FRAME_LEN];
+    encode_frontier_successor_into(
+        &mut output,
+        frontier,
+        previous,
+        previous_frame_offset,
+        previous_frame_digest,
+        frame_offset,
+        header_digest,
+    )?;
+    Ok(output)
+}
+
+/// Encodes a nonzero FRONTIER directly into caller-owned frame storage.
+pub(crate) fn encode_frontier_successor_into(
+    output: &mut [u8],
+    frontier: WalV7Frontier,
+    previous: WalV7Frontier,
+    previous_frame_offset: u64,
+    previous_frame_digest: &[u8; 32],
+    frame_offset: u64,
+    header_digest: [u8; 32],
+) -> Result<()> {
+    ensure!(
+        output.len() == WAL_V7_FRAME_LEN,
+        "v7 FRONTIER output buffer has the wrong length"
+    );
+    let output: &mut [u8; WAL_V7_FRAME_LEN] = output
+        .try_into()
+        .context("convert v7 FRONTIER output to its fixed frame size")?;
     frontier.validate_successor(
         previous,
         previous_frame_offset,
@@ -702,7 +788,8 @@ pub(crate) fn encode_frontier_successor(
         frame_offset,
         &header_digest,
     )?;
-    encode_frame(
+    encode_frame_into(
+        output,
         WalV7FrameKind::Frontier,
         header_digest,
         frame_offset,

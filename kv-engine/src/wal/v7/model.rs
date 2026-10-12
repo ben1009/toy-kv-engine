@@ -1596,6 +1596,13 @@ mod tests {
         }
     }
 
+    fn batch_buffer_bytes(value: &[u8]) -> Result<u64> {
+        let logical_len = WAL_V7_LOGICAL_BATCH_HEADER_LEN
+            .checked_add(encode_model_entry_stream(value, 1)?.len())
+            .ok_or_else(|| anyhow::anyhow!("model logical batch length overflows"))?;
+        Ok(WalV7ResourceCharge::for_batch(u64::try_from(logical_len)?)?.buffer_memory_bytes)
+    }
+
     fn normalize_twice_continue_and_reopen(
         image: Vec<u8>,
         original_anchor: ActiveBoundary,
@@ -1662,7 +1669,7 @@ mod tests {
             second_install,
             prior_acknowledged_tickets.to_vec(),
             WalV7ResourceLimits {
-                max_buffer_memory_bytes: WAL_V7_FRAME_LEN as u64,
+                max_buffer_memory_bytes: batch_buffer_bytes(b"after recovery")?,
                 ..model_resource_limits()
             },
         )?;
@@ -2076,7 +2083,7 @@ mod tests {
             max_logical_wal_bytes: u64::MAX,
             max_source_spool_bytes: 8192,
             max_recovery_workspace_bytes: 0,
-            max_buffer_memory_bytes: 4096,
+            max_buffer_memory_bytes: batch_buffer_bytes(b"first")?,
             max_seal_index_bytes: 16,
         })?;
         harness.commit(b"first", 10)?;
@@ -2131,9 +2138,10 @@ mod tests {
     }
 
     #[test]
-    fn serial_commits_reuse_one_frame_buffer_capacity() -> Result<()> {
+    fn serial_commits_reuse_one_batch_buffer_capacity() -> Result<()> {
+        let buffer_capacity = batch_buffer_bytes(b"one frame")?;
         let mut harness = SerialHarness::create_with_resource_limits(WalV7ResourceLimits {
-            max_buffer_memory_bytes: WAL_V7_FRAME_LEN as u64,
+            max_buffer_memory_bytes: buffer_capacity,
             ..model_resource_limits()
         })?;
         for ticket in 0..3 {
@@ -2144,7 +2152,7 @@ mod tests {
                     .resource_ledger
                     .snapshot()
                     .buffer_memory_bytes,
-                WAL_V7_FRAME_LEN as u64
+                buffer_capacity
             );
             harness.finish_commit(pending)?;
             assert_eq!(
@@ -2629,7 +2637,7 @@ mod tests {
                 WalV7ResourceLimits {
                     max_logical_wal_bytes: wal_limit,
                     max_source_spool_bytes: spool_limit,
-                    max_buffer_memory_bytes: WAL_V7_FRAME_LEN as u64,
+                    max_buffer_memory_bytes: batch_buffer_bytes(b"after recovery")?,
                     ..model_resource_limits()
                 },
             )?;
