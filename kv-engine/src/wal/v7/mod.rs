@@ -5,6 +5,7 @@ pub(crate) mod admission;
 pub(crate) mod allocator;
 pub(crate) mod codec;
 pub(crate) mod install;
+pub(crate) mod leader;
 pub(crate) mod recovery;
 
 #[cfg(test)]

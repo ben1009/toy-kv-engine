@@ -633,20 +633,23 @@ fn test_vlog_gc_rewritten_file_survives_compaction_of_referencing_sst() {
 
     storage.put(b"foo", &[b'B'; 64]).unwrap();
     force_flush(&storage.inner);
-    storage.inner.force_full_compaction().unwrap();
 
     let vlog = storage.inner.vlog.as_ref().unwrap();
     let gc = GarbageCollector::new(vlog, &storage.inner, 0.0);
-    let results = gc.gc_all().unwrap();
-    let rewritten = results
-        .iter()
-        .find(|result| result.new_file_id != u32::MAX)
-        .expect("GC should have rewritten a file with live entries");
+    // The first value is in file 0 in this fresh vLog directory. Target it
+    // directly before compaction queues asynchronous post-compaction GC for
+    // the same source file.
+    let rewritten = gc
+        .gc_file(0)
+        .unwrap()
+        .expect("GC should have rewritten the pinned live value");
+    assert!(rewritten.keys_rewritten > 0);
 
     // Premise: the rewrite is registered against the SSTs holding the old
     // pointers, not against the memtable that now resolves into it.
     assert!(
-        vlog.get_ssts_referencing(rewritten.new_file_id).is_some(),
+        vlog.get_ssts_referencing(rewritten.new_file_id)
+            .is_some_and(|sst_ids| !sst_ids.is_empty()),
         "rewrite should be registered against the SSTs holding the old pointers"
     );
 

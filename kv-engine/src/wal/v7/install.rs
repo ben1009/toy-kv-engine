@@ -8,6 +8,7 @@ use std::{
     ffi::OsStr,
     fs::{self, File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
+    os::unix::fs::MetadataExt,
     path::Path,
     sync::atomic::{AtomicU64, Ordering},
 };
@@ -57,6 +58,8 @@ pub(crate) struct WalV7InstalledRecovery {
     pub(crate) image_len: u64,
     pub(crate) append_offset: u64,
     pub(crate) next_ticket: u64,
+    pub(crate) installed_dev: u64,
+    pub(crate) installed_ino: u64,
     pub(crate) last_recorded_at: Option<RecordedAt>,
     pub(crate) batches: Vec<WalBatch>,
     pub(crate) seal_index: Vec<u64>,
@@ -104,6 +107,8 @@ pub(crate) struct WalV7RuntimeSeed {
     pub(crate) data_start: u64,
     pub(crate) append_offset: u64,
     pub(crate) next_ticket: u64,
+    pub(crate) installed_dev: u64,
+    pub(crate) installed_ino: u64,
     pub(crate) frontier_cursor: WalV7FrontierCursor,
     pub(crate) metadata: WalV7RuntimeMetadata,
 }
@@ -163,6 +168,10 @@ impl WalV7InstalledRecovery {
     /// Build the runtime cursor only from a self-consistent, installed Active
     /// image. In particular, never reset the segment ticket sequence to zero
     /// or derive its append offset from the pre-normalization source tail.
+    /// This installed snapshot is valid for writer startup only before any
+    /// subsequent DATA admission on the installed inode. Further startup must
+    /// use the latest healthy writer state, or a newly installed recovery image
+    /// after an uncertain write or sync.
     pub(crate) fn runtime_seed(&self) -> Result<WalV7RuntimeSeed> {
         let descriptor = WalFormatDescriptor::for_version(WAL_FORMAT_VERSION_V7)
             .context("v7 WAL format descriptor is missing")?;
@@ -257,6 +266,8 @@ impl WalV7InstalledRecovery {
             data_start,
             append_offset: self.append_offset,
             next_ticket: self.next_ticket,
+            installed_dev: self.installed_dev,
+            installed_ino: self.installed_ino,
             frontier_cursor: WalV7FrontierCursor {
                 frontier: self.frontier,
                 frame_offset: self.frontier_offset,
@@ -529,6 +540,12 @@ pub(crate) fn install_active_recovery(
         parent_dir
             .sync_all()
             .context("sync Active v7 WAL directory after replacement")?;
+        let installed_metadata =
+            fs::symlink_metadata(&source_path).context("inspect installed Active v7 WAL inode")?;
+        ensure!(
+            installed_metadata.file_type().is_file() && installed_metadata.len() == image_len,
+            "installed Active v7 WAL has an unexpected file type or length"
+        );
 
         Ok(WalV7InstalledRecovery {
             active_boundary: selection.active_boundary,
@@ -538,6 +555,8 @@ pub(crate) fn install_active_recovery(
             image_len,
             append_offset: image_len,
             next_ticket: rebuilt.next_ticket,
+            installed_dev: installed_metadata.dev(),
+            installed_ino: installed_metadata.ino(),
             last_recorded_at: rebuilt.last_recorded_at,
             batches: rebuilt.batches,
             seal_index: rebuilt.seal_index,

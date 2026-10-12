@@ -102,7 +102,24 @@ or include excluded DATA, preserving the prior frontier and poisoning admission.
 The serial persistence model covers repeated normalization, continued append,
 and crash/reopen for empty, nonempty, fallback, and trailing-control prefixes,
 including a selected marker behind speculative DATA. The production writer
-remains v6.
+remains v6. Stage 5 now also has a low-level serial v7 Leader writer primitive:
+it resumes from installed metadata, preflights DATA-plus-FRONTIER segment
+capacity, writes one ticket's DATA and linked FRONTIER frames, performs one
+WAL `fdatasync`, and advances hash/cursor state only after success. Any failure
+after physical allocation poisons that writer. Recovery seeds carry the
+installed device/inode identity, which the writer checks alongside the terminal
+FRONTIER; preallocated tail bytes remain excluded by the seed append cursor
+and bounded by the segment's physical cap. Append-mode descriptors are rejected
+before admission because Linux positional writes on those handles ignore their
+offsets. Focused Leader tests cover fragmented commit/recovery/resume, time
+clamping and image hashing, preallocated tails, capacity rejection, failed-sync
+poisoning, stale recovery descriptors, and invalid descriptor/physical caps.
+The writer caps caller-supplied batch bounds to the live recovery limits before
+admission, while retaining stricter bounds. Seed snapshots require a clean
+ownership handoff without any subsequent admission; failed write/sync outcomes
+require a fresh recovery installation.
+Engine WAL-open/write dispatch, live resource-ledger ownership, Parallel
+admission, and the production v6 to v7 transition remain unconnected.
 
 **Last updated:** 2026-10-12
 

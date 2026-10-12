@@ -1732,7 +1732,11 @@ fn round_up(value: u64, alignment: u64) -> Option<u64> {
 mod tests {
     #[test]
     fn recovered_v7_runtime_keeps_its_metadata_and_cursors_paused() {
-        use std::{fs::File, os::unix::fs::OpenOptionsExt, sync::Arc};
+        use std::{
+            fs::File,
+            os::unix::fs::{MetadataExt, OpenOptionsExt},
+            sync::Arc,
+        };
 
         use sha2::{Digest, Sha256};
 
@@ -1792,11 +1796,14 @@ mod tests {
             .custom_flags(libc::O_DIRECT)
             .open(&path)
             .expect("open recovered WAL with direct I/O");
+        let direct_metadata = direct_file.metadata().expect("inspect recovered WAL inode");
         let direct_file = Arc::new(direct_file);
         let mut start = ParallelWalRuntimeStart::v7(WalV7RuntimeSeed {
             data_start: DATA_START,
             append_offset: APPEND_OFFSET,
             next_ticket: NEXT_TICKET,
+            installed_dev: direct_metadata.dev(),
+            installed_ino: direct_metadata.ino(),
             frontier_cursor,
             metadata,
         })

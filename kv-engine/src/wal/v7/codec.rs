@@ -3,7 +3,7 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     pitr::{
-        ArchiveEpochId, CanonicalWalEntryStream, ChainAnchor, SegmentId, TimelineId,
+        ArchiveEpochId, CanonicalWalEntryStream, ChainAnchor, RecordedAt, SegmentId, TimelineId,
         WAL_V5_HEADER_LEN, WAL_V5_MAGIC, WAL_V5_VERSION, WalBatch, WalV5Header, WalV5Limits,
         decode_v5_file_header, encode_v5_file_header,
     },
@@ -428,6 +428,19 @@ pub(crate) fn encode_logical_batch(
     batch: &WalBatch,
     limits: WalV5Limits,
 ) -> Result<Vec<u8>> {
+    encode_logical_batch_with_recorded_at(segment_ticket, batch, batch.recorded_at, limits)
+}
+
+/// Encode a v7 logical batch with the ordered runtime's clamped recorded time.
+/// The batch entries and MVCC timestamp remain borrowed from the prepared
+/// request; only the physical ticket and final recorded-time value are chosen
+/// by the WAL writer.
+pub(crate) fn encode_logical_batch_with_recorded_at(
+    segment_ticket: u64,
+    batch: &WalBatch,
+    recorded_at: RecordedAt,
+    limits: WalV5Limits,
+) -> Result<Vec<u8>> {
     let canonical = CanonicalWalEntryStream::new(batch, limits)?;
     let entry_stream_len = canonical.data_len();
     let logical_len = WAL_V7_LOGICAL_BATCH_HEADER_LEN
@@ -450,8 +463,8 @@ pub(crate) fn encode_logical_batch(
     let header = WalV7LogicalBatchHeader {
         segment_ticket,
         commit_ts: batch.commit_ts,
-        recorded_at_secs: batch.recorded_at.secs,
-        recorded_at_nanos: batch.recorded_at.nanos,
+        recorded_at_secs: recorded_at.secs,
+        recorded_at_nanos: recorded_at.nanos,
         entry_count: canonical.entry_count(),
     }
     .encode_with_data_crc(entry_stream.len(), entry_stream_crc, limits)?;
