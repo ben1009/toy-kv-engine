@@ -138,34 +138,7 @@ impl WalV7PhysicalAllocator {
     /// frames plus one worst-case FRONTIER's capacity. Call only after the
     /// batch's resource reservations succeed.
     pub(crate) fn reserve_data(&mut self, frame_count: u32) -> Result<WalV7DataAllocation> {
-        self.ensure_healthy()?;
-        ensure!(frame_count > 0, "v7 DATA allocation has no frames");
-
-        let next_ticket = self
-            .next_ticket
-            .checked_add(1)
-            .ok_or_else(|| anyhow::anyhow!("v7 ticket counter overflows"))?;
-        let byte_len = u64::from(frame_count)
-            .checked_mul(FRAME_LEN_U64)
-            .ok_or_else(|| anyhow::anyhow!("v7 DATA allocation length overflows"))?;
-        let end = self
-            .allocation_tail
-            .checked_add(byte_len)
-            .ok_or_else(|| anyhow::anyhow!("v7 DATA allocation end overflows"))?;
-        let marker_frames = self
-            .reserved_marker_frames()?
-            .checked_add(1)
-            .ok_or_else(|| anyhow::anyhow!("v7 marker reservation count overflows"))?;
-        let reserved_marker_bytes = marker_frames
-            .checked_mul(FRAME_LEN_U64)
-            .ok_or_else(|| anyhow::anyhow!("v7 marker reservation capacity overflows"))?;
-        let reserved_end = end
-            .checked_add(reserved_marker_bytes)
-            .ok_or_else(|| anyhow::anyhow!("v7 DATA and marker reservation end overflows"))?;
-        ensure!(
-            reserved_end <= self.max_file_size,
-            "v7 DATA and marker reservations exceed the segment limit"
-        );
+        let (next_ticket, end) = self.data_reservation_end(frame_count)?;
         self.ticket_data_ends
             .try_reserve(1)
             .context("reserve v7 DATA boundary cursor")?;
@@ -179,6 +152,13 @@ impl WalV7PhysicalAllocator {
         self.allocation_tail = end;
         self.ticket_data_ends.push_back(end);
         Ok(allocation)
+    }
+
+    /// Check DATA-plus-marker capacity without assigning a ticket or offset.
+    /// A serialized owner may use this before allocating a potentially large
+    /// frame buffer, then call `reserve_data` after all preparation succeeds.
+    pub(crate) fn check_data_capacity(&self, frame_count: u32) -> Result<()> {
+        self.data_reservation_end(frame_count).map(|_| ())
     }
 
     /// Reserve one FRONTIER frame at the current tail without assigning a
@@ -520,6 +500,39 @@ impl WalV7PhysicalAllocator {
             bail!("v7 WAL physical allocator is poisoned")
         }
         Ok(())
+    }
+
+    fn data_reservation_end(&self, frame_count: u32) -> Result<(u64, u64)> {
+        self.ensure_healthy()?;
+        ensure!(frame_count > 0, "v7 DATA allocation has no frames");
+
+        let next_ticket = self
+            .next_ticket
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("v7 ticket counter overflows"))?;
+        let byte_len = u64::from(frame_count)
+            .checked_mul(FRAME_LEN_U64)
+            .ok_or_else(|| anyhow::anyhow!("v7 DATA allocation length overflows"))?;
+        let end = self
+            .allocation_tail
+            .checked_add(byte_len)
+            .ok_or_else(|| anyhow::anyhow!("v7 DATA allocation end overflows"))?;
+        let marker_frames = self
+            .reserved_marker_frames()?
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("v7 marker reservation count overflows"))?;
+        let reserved_marker_bytes = marker_frames
+            .checked_mul(FRAME_LEN_U64)
+            .ok_or_else(|| anyhow::anyhow!("v7 marker reservation capacity overflows"))?;
+        let reserved_end = end
+            .checked_add(reserved_marker_bytes)
+            .ok_or_else(|| anyhow::anyhow!("v7 DATA and marker reservation end overflows"))?;
+        ensure!(
+            reserved_end <= self.max_file_size,
+            "v7 DATA and marker reservations exceed the segment limit"
+        );
+
+        Ok((next_ticket, end))
     }
 }
 
