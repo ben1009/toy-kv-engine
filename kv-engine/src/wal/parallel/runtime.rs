@@ -130,7 +130,7 @@ impl ParallelWalRuntimeStart {
         Ok(())
     }
 
-    fn validate_file_identity(
+    fn validate_v7_file_handles(
         &self,
         worker_file: &File,
         sync_file: &File,
@@ -151,6 +151,14 @@ impl ParallelWalRuntimeStart {
             ensure!(
                 (metadata.dev(), metadata.ino()) == expected,
                 "v7 WAL {role} handle does not refer to the installed Active inode"
+            );
+            ensure!(
+                metadata.len() >= self.append_offset,
+                "v7 WAL {role} handle is shorter than the installed append cursor"
+            );
+            ensure!(
+                metadata.len() <= MAX_WAL_FILE_SIZE,
+                "v7 WAL {role} handle exceeds the maximum physical size"
             );
         }
 
@@ -642,7 +650,7 @@ impl ParallelWalRuntime {
         start: ParallelWalRuntimeStart,
     ) -> Result<Self> {
         start.validate()?;
-        start.validate_file_identity(&worker_file, &sync_file, &preallocator)?;
+        start.validate_v7_file_handles(&worker_file, &sync_file, &preallocator)?;
         let initial_file_end = start.append_offset;
 
         ensure!(
@@ -1883,6 +1891,55 @@ mod tests {
             .set_len(APPEND_OFFSET)
             .expect("size mismatched sync handle inode");
         let wrong_sync_file = Arc::new(wrong_sync_file);
+
+        let assert_start_rejected = |expected: &str| {
+            let error = match ParallelWalRuntime::spawn(
+                Arc::clone(&direct_file),
+                Arc::clone(&direct_file),
+                Arc::clone(&direct_file),
+                make_start().expect("validate recovered runtime cursor for length check"),
+            ) {
+                Ok(runtime) => {
+                    runtime.close().expect("close unexpectedly started runtime");
+                    panic!("v7 runtime accepted a WAL file with an invalid physical length");
+                }
+                Err(error) => error,
+            };
+            assert!(
+                format!("{error:#}").contains(expected),
+                "unexpected invalid-length error: {error:#}"
+            );
+        };
+
+        direct_file
+            .set_len(APPEND_OFFSET - 4096)
+            .expect("truncate recovered WAL below append cursor");
+        assert_start_rejected("v7 WAL worker handle is shorter than the installed append cursor");
+        assert_eq!(
+            direct_file
+                .metadata()
+                .expect("inspect truncated recovered WAL")
+                .len(),
+            APPEND_OFFSET - 4096
+        );
+        direct_file
+            .set_len(APPEND_OFFSET)
+            .expect("restore recovered WAL length after short-file check");
+
+        direct_file
+            .set_len(crate::wal::MAX_WAL_FILE_SIZE + 4096)
+            .expect("extend recovered WAL beyond the segment cap");
+        assert_start_rejected("v7 WAL worker handle exceeds the maximum physical size");
+        assert_eq!(
+            direct_file
+                .metadata()
+                .expect("inspect oversized recovered WAL")
+                .len(),
+            crate::wal::MAX_WAL_FILE_SIZE + 4096
+        );
+        direct_file
+            .set_len(APPEND_OFFSET)
+            .expect("restore recovered WAL length after cap check");
         let error = match ParallelWalRuntime::spawn(
             Arc::clone(&direct_file),
             Arc::clone(&wrong_sync_file),
