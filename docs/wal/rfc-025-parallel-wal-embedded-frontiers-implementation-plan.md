@@ -67,8 +67,12 @@ capacity; placement consumes one credit and successful sync releases only the
 unused credits of its captured prefix. The parallel worker now accepts an
 explicit physical allocation span tiled by DATA writes and reserved FRONTIER
 offsets, advances its ordering cursor across those controls, and reports DATA
-bytes separately from physical span length. Existing runtime submissions still
-use contiguous groups; live allocator/runtime wiring and marker I/O remain.
+bytes separately from physical span length. The recovered v7 runtime now owns a
+physical allocator, and its ordered packer can consume allocator-issued DATA
+tokens and build worker spans that account for marker gaps, including a marker
+at the beginning of a later group. Runtime admission still cannot assign and
+queue live v7 batches, the v7 runtime remains paused, and marker writes plus the
+one-sync coordinator remain unconnected.
 The serial persistence model covers repeated normalization, continued append,
 and crash/reopen for empty, nonempty, fallback, and trailing-control prefixes,
 including a selected marker behind speculative DATA. The production writer
@@ -451,9 +455,10 @@ neither is a prerequisite for this stage.
   retaining strict contiguous groups for legacy submissions. Remove the live packer's
   unconditional ticket-and-offset contiguity assumption only where a verified
   control allocation accounts for the gap. The checked allocator primitive,
-  per-ticket marker headroom, accounted-gap range splitter, and worker group
-  validation are implemented; attaching them to runtime admission, marker
-  writes, and the one-sync coordinator remains.
+  per-ticket marker headroom, accounted-gap range splitter, worker group
+  validation, and allocator-backed packer-to-worker span translation are
+  implemented. Live producer admission, marker writes, and the one-sync
+  coordinator remain.
 - After bounded optional coalescing, choose an eligible exclusive marker target
   `T` no greater than the contiguous written frontier and prove its exact `E(T)`
   from metadata. Capture the final `T` before constructing its canonical marker,
