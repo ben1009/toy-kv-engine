@@ -56,7 +56,14 @@ charges before materializing the logical batch or advancing the allocator. It
 retains persistent charges through errors and unwinds across writer-handle
 replacement until the lifecycle releases the owner after cleanup. Fresh-inode
 recovery creates a replacement owner from the installed prefix. Engine WAL-open and
-manifest integration still need to install and retain that owner. Stage 5 has
+manifest integration still need to install and retain that owner. The serial Leader
+classifies DATA-plus-FRONTIER segment exhaustion before the persistent batch
+reservation or coordinate assignment. It may first reserve temporary canonicalization
+scratch, which is released when preparation or capacity admission fails. Batches that
+fit a fresh segment return `RotationRequired`, while batches that cannot fit any fresh
+legal segment return `BatchTooLarge`; shared-ledger failures retain their distinct
+reservation errors. Engine retry/rotation and seal-index-triggered rotation remain
+outstanding. Stage 5 has
 started with recovered-runtime cursor bootstrap: an installed Active image
 supplies the v7 DATA start, append offset, and next ticket. The shared runtime
 seeds its admission, packer, and durability coordinates from that state. The seed now
@@ -446,6 +453,11 @@ ownership of that ledger remain in this stage.
   in the serial driver here; connect full v7 lifecycle rotation/retry in stage 6.
   Distinguish this result from global spool backpressure and a batch that
   cannot fit any legal segment; oversized input must not cause endless rotation.
+  The serial Leader currently classifies DATA-plus-marker segment exhaustion
+  before the persistent batch reservation or coordinate assignment; temporary
+  canonicalization scratch may be reserved first and is released on rejection.
+  Live seal-index classification and the engine retry/rotation handoff remain
+  outstanding.
 - Document the lock/reservation order across the sequencer, memtable leases,
   spool accounting, admission, and durability. Release admission/publication
   locks before waiting for archive progress or new budget; inject full-spool
@@ -472,12 +484,13 @@ the installed verified image. Successful publication retires transient DATA
 buffer charges, and recovery charges each retained DATA/control frame once,
 including coalesced groups; rejected admission leaves its coordinates and WAL
 image untouched. Digest/index snapshots agree with independent codec
-verification; no stopped-admission payload rescan is required. Exact-boundary,
-marker-overhead,
-and seal-index tests produce rotation-required before ticket assignment, distinct
-from global spool pressure and permanent oversize. Real engine allocation checks
-belong to stage 5, and full v7 lifecycle rotation/retry checks belong to stage 6;
-neither is a prerequisite for this stage.
+verification; no stopped-admission payload rescan is required. Exact-boundary
+and marker-overhead cases in the serial Leader produce rotation-required before
+ticket assignment; a batch too large for a fresh segment and shared-ledger resource
+pressure remain distinct. Seal-index-triggered rotation and the real engine retry
+path remain outstanding. Real engine allocation checks belong to stage 5, and full
+v7 lifecycle rotation/retry checks belong to stage 6; neither is a prerequisite for
+this stage.
 
 ### 5. Parallel runtime, one-sync coordinator, and API barriers
 

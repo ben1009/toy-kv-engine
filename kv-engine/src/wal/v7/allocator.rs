@@ -98,6 +98,13 @@ pub(crate) struct WalV7PhysicalAllocator {
     poisoned: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum WalV7DataCapacityStatus {
+    Fits,
+    RotationRequired,
+    BatchTooLarge,
+}
+
 impl WalV7PhysicalAllocator {
     /// Resume allocation after an installed Active image.
     pub(crate) fn new(
@@ -154,11 +161,25 @@ impl WalV7PhysicalAllocator {
         Ok(allocation)
     }
 
-    /// Check DATA-plus-marker capacity without assigning a ticket or offset.
-    /// A serialized owner may use this before allocating a potentially large
-    /// frame buffer, then call `reserve_data` after all preparation succeeds.
-    pub(crate) fn check_data_capacity(&self, frame_count: u32) -> Result<()> {
-        self.data_reservation_end(frame_count).map(|_| ())
+    /// Classify the batch's DATA-plus-marker capacity without consuming a
+    /// ticket or physical offset. A batch that does not fit this allocation
+    /// state is rotation-required only when it would fit after a fresh v7
+    /// header and generation-zero FRONTIER.
+    pub(crate) fn data_capacity_status(&self, frame_count: u32) -> Result<WalV7DataCapacityStatus> {
+        let (_, _, reserved_end, data_bytes) = self.data_reservation_bounds(frame_count)?;
+        if reserved_end <= self.max_file_size {
+            return Ok(WalV7DataCapacityStatus::Fits);
+        }
+
+        let fresh_reserved_end = FIRST_DATA_OFFSET
+            .checked_add(data_bytes)
+            .and_then(|end| end.checked_add(FRAME_LEN_U64))
+            .ok_or_else(|| anyhow::anyhow!("v7 fresh-segment DATA capacity overflows"))?;
+        Ok(if fresh_reserved_end <= self.max_file_size {
+            WalV7DataCapacityStatus::RotationRequired
+        } else {
+            WalV7DataCapacityStatus::BatchTooLarge
+        })
     }
 
     /// Reserve one FRONTIER frame at the current tail without assigning a
@@ -503,6 +524,16 @@ impl WalV7PhysicalAllocator {
     }
 
     fn data_reservation_end(&self, frame_count: u32) -> Result<(u64, u64)> {
+        let (next_ticket, end, reserved_end, _) = self.data_reservation_bounds(frame_count)?;
+        ensure!(
+            reserved_end <= self.max_file_size,
+            "v7 DATA and marker reservations exceed the segment limit"
+        );
+
+        Ok((next_ticket, end))
+    }
+
+    fn data_reservation_bounds(&self, frame_count: u32) -> Result<(u64, u64, u64, u64)> {
         self.ensure_healthy()?;
         ensure!(frame_count > 0, "v7 DATA allocation has no frames");
 
@@ -527,12 +558,7 @@ impl WalV7PhysicalAllocator {
         let reserved_end = end
             .checked_add(reserved_marker_bytes)
             .ok_or_else(|| anyhow::anyhow!("v7 DATA and marker reservation end overflows"))?;
-        ensure!(
-            reserved_end <= self.max_file_size,
-            "v7 DATA and marker reservations exceed the segment limit"
-        );
-
-        Ok((next_ticket, end))
+        Ok((next_ticket, end, reserved_end, byte_len))
     }
 }
 
