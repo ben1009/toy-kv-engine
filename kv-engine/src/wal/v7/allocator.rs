@@ -10,8 +10,7 @@
 //! a marker consumes one credit; successful sync releases the unused credits
 //! of its captured prefix while retaining those of later admissions.
 
-use std::ops::Range;
-use std::sync::Arc;
+use std::{collections::VecDeque, ops::Range, sync::Arc};
 
 use anyhow::{Context, Result, bail, ensure};
 
@@ -35,6 +34,7 @@ pub(crate) struct WalV7DataAllocation {
 pub(crate) struct WalV7FrontierReservation {
     frame_offset: u64,
     ticket_end: u64,
+    durable_end: u64,
     frame_end: u64,
     owner: Arc<WalV7AllocatorIdentity>,
 }
@@ -72,6 +72,10 @@ impl WalV7FrontierReservation {
     pub(crate) fn ticket_end(&self) -> u64 {
         self.ticket_end
     }
+
+    pub(crate) fn durable_end(&self) -> u64 {
+        self.durable_end
+    }
 }
 
 /// One owner serializes all v7 physical allocations for a WAL incarnation.
@@ -85,6 +89,8 @@ pub(crate) struct WalV7PhysicalAllocator {
     next_ticket: u64,
     allocation_tail: u64,
     max_file_size: u64,
+    tracked_ticket_start: u64,
+    ticket_data_ends: VecDeque<u64>,
     identity: Arc<WalV7AllocatorIdentity>,
     frontier_offsets: Vec<u64>,
     last_frontier: WalV7FrontierCursor,
@@ -118,6 +124,8 @@ impl WalV7PhysicalAllocator {
             next_ticket,
             allocation_tail,
             max_file_size,
+            tracked_ticket_start: next_ticket,
+            ticket_data_ends: VecDeque::new(),
             identity: Arc::new(WalV7AllocatorIdentity),
             frontier_offsets: Vec::new(),
             last_frontier,
@@ -158,6 +166,9 @@ impl WalV7PhysicalAllocator {
             reserved_end <= self.max_file_size,
             "v7 DATA and marker reservations exceed the segment limit"
         );
+        self.ticket_data_ends
+            .try_reserve(1)
+            .context("reserve v7 DATA boundary cursor")?;
 
         let allocation = WalV7DataAllocation {
             ticket: self.next_ticket,
@@ -166,6 +177,7 @@ impl WalV7PhysicalAllocator {
         };
         self.next_ticket = next_ticket;
         self.allocation_tail = end;
+        self.ticket_data_ends.push_back(end);
         Ok(allocation)
     }
 
@@ -184,6 +196,7 @@ impl WalV7PhysicalAllocator {
             ticket_end > self.last_frontier.frontier.ticket_end && ticket_end <= self.next_ticket,
             "v7 FRONTIER ticket target does not advance within admitted tickets"
         );
+        let durable_end = self.durable_end_for(ticket_end)?;
         let frame_end = self
             .allocation_tail
             .checked_add(FRAME_LEN_U64)
@@ -199,6 +212,7 @@ impl WalV7PhysicalAllocator {
         let reservation = WalV7FrontierReservation {
             frame_offset: self.allocation_tail,
             ticket_end,
+            durable_end,
             frame_end,
             owner: Arc::clone(&self.identity),
         };
@@ -215,14 +229,32 @@ impl WalV7PhysicalAllocator {
         reservation: WalV7FrontierReservation,
         next_frontier: WalV7FrontierCursor,
     ) -> Result<()> {
+        // A stale or foreign token is a caller error and must not consume the
+        // valid in-flight cycle owned by this allocator.
         self.validate_in_flight_frontier(&reservation)?;
-        if let Err(error) =
-            validate_frontier_successor(self.last_frontier, &reservation, next_frontier)
-        {
+        let validation = self
+            .validate_captured_frontier_target(&reservation)
+            .and_then(|()| {
+                validate_frontier_successor(self.last_frontier, &reservation, next_frontier)
+            });
+        if let Err(error) = validation {
             self.in_flight_frontier = None;
             self.poisoned = true;
             return Err(error);
         }
+        let covered_ticket_count = usize::try_from(
+            reservation
+                .ticket_end
+                .checked_sub(self.tracked_ticket_start)
+                .expect("validated frontier target is after the tracked ticket cursor"),
+        )
+        .expect("tracked frontier ticket count fits usize");
+        for _ in 0..covered_ticket_count {
+            self.ticket_data_ends
+                .pop_front()
+                .expect("validated frontier target has tracked DATA ends");
+        }
+        self.tracked_ticket_start = reservation.ticket_end;
         self.last_frontier = next_frontier;
         self.in_flight_frontier = None;
         Ok(())
@@ -363,6 +395,53 @@ impl WalV7PhysicalAllocator {
         self.allocation_tail
     }
 
+    /// Return the exact physical prefix end `E(T)` for an admitted ticket
+    /// target. An earlier FRONTIER can extend the prefix past the final DATA
+    /// frame covered by `T`. Reject targets whose retained predecessor would
+    /// include DATA at or above `T`.
+    pub(crate) fn durable_end_for(&self, ticket_end: u64) -> Result<u64> {
+        self.ensure_healthy()?;
+        ensure!(
+            ticket_end > self.last_frontier.frontier.ticket_end && ticket_end <= self.next_ticket,
+            "v7 FRONTIER ticket target does not advance within admitted tickets"
+        );
+        let tracked_count = usize::try_from(
+            ticket_end
+                .checked_sub(self.tracked_ticket_start)
+                .ok_or_else(|| {
+                    anyhow::anyhow!("v7 frontier target precedes its tracked DATA cursor")
+                })?,
+        )
+        .context("v7 frontier target exceeds tracked DATA cursor capacity")?;
+        let data_end =
+            *self
+                .ticket_data_ends
+                .get(tracked_count.checked_sub(1).ok_or_else(|| {
+                    anyhow::anyhow!("v7 frontier target has no newly covered DATA")
+                })?)
+                .ok_or_else(|| anyhow::anyhow!("v7 frontier target has no tracked DATA end"))?;
+        let previous_frontier_end = self
+            .last_frontier
+            .frame_offset
+            .checked_add(FRAME_LEN_U64)
+            .ok_or_else(|| anyhow::anyhow!("previous v7 FRONTIER end overflows"))?;
+        let durable_end = data_end.max(previous_frontier_end);
+        ensure!(
+            previous_frontier_end <= durable_end && durable_end <= self.allocation_tail,
+            "v7 durable prefix end is outside the allocated physical prefix"
+        );
+        // DATA ranges are ordered and never cross a FRONTIER slot. If the
+        // first excluded ticket ends within E(T), retaining the predecessor
+        // also retains speculative DATA outside the captured ticket prefix.
+        ensure!(
+            self.ticket_data_ends
+                .get(tracked_count)
+                .is_none_or(|next_data_end| *next_data_end > durable_end),
+            "v7 FRONTIER target retains DATA at or above its ticket end"
+        );
+        Ok(durable_end)
+    }
+
     /// Each ticket beyond the last synced frontier retains one marker credit,
     /// except for the credit already consumed by the in-flight physical marker.
     fn reserved_marker_frames(&self) -> Result<u64> {
@@ -386,8 +465,32 @@ impl WalV7PhysicalAllocator {
                 && Arc::ptr_eq(&reservation.owner, &in_flight.owner)
                 && reservation.frame_offset == in_flight.frame_offset
                 && reservation.ticket_end == in_flight.ticket_end
+                && reservation.durable_end == in_flight.durable_end
                 && reservation.frame_end == in_flight.frame_end,
             "v7 FRONTIER reservation is stale or belongs to another cycle"
+        );
+        Ok(())
+    }
+
+    fn validate_captured_frontier_target(
+        &self,
+        reservation: &WalV7FrontierReservation,
+    ) -> Result<()> {
+        ensure!(
+            self.durable_end_for(reservation.ticket_end)? == reservation.durable_end,
+            "v7 FRONTIER captured physical prefix changed before sync completion"
+        );
+        let tracked_count = reservation
+            .ticket_end
+            .checked_sub(self.tracked_ticket_start)
+            .ok_or_else(|| {
+                anyhow::anyhow!("v7 FRONTIER target precedes its tracked DATA cursor")
+            })?;
+        ensure!(
+            usize::try_from(tracked_count)
+                .ok()
+                .is_some_and(|count| count <= self.ticket_data_ends.len()),
+            "v7 FRONTIER target exceeds tracked DATA cursor"
         );
         Ok(())
     }
@@ -484,6 +587,7 @@ fn validate_frontier_successor(
             && next_frame_end == reservation.frame_end
             && next.frontier.generation == expected_generation
             && next.frontier.ticket_end == reservation.ticket_end
+            && next.frontier.durable_end == reservation.durable_end
             && next.frontier.ticket_end > previous.frontier.ticket_end
             && next.frontier.last_commit_ts > previous.frontier.last_commit_ts
             && previous_end <= next.frontier.durable_end
@@ -538,7 +642,7 @@ mod tests {
             frontier: WalV7Frontier {
                 generation,
                 ticket_end: reservation.ticket_end(),
-                durable_end: reservation.frame_offset(),
+                durable_end: reservation.durable_end(),
                 last_commit_ts: reservation.ticket_end(),
                 prefix_digest: [generation.to_be_bytes()[7]; 32],
                 previous_frontier_offset: previous.frame_offset,
@@ -572,6 +676,78 @@ mod tests {
                 START + 3 * FRAME..START + 4 * FRAME
             ]
         );
+    }
+
+    #[test]
+    fn captured_durable_end_includes_previous_frontier_after_covered_data() {
+        let mut allocator = allocator(START + 8 * FRAME);
+        let first = allocator.reserve_data(1).unwrap();
+        let second = allocator.reserve_data(1).unwrap();
+        let first_frontier = allocator.reserve_frontier(1).unwrap();
+
+        assert_eq!(first_frontier.durable_end(), first.frame_range().end);
+        assert!(first_frontier.durable_end() < first_frontier.frame_offset());
+        assert_eq!(
+            allocator.durable_end_for(1).unwrap(),
+            first.frame_range().end
+        );
+
+        let first_frontier_offset = first_frontier.frame_offset();
+        complete_frontier_sync(&mut allocator, first_frontier).unwrap();
+        assert_eq!(allocator.tracked_ticket_start, 1);
+        assert_eq!(allocator.ticket_data_ends.len(), 1);
+
+        let second_frontier = allocator.reserve_frontier(2).unwrap();
+        assert_eq!(second_frontier.durable_end(), first_frontier_offset + FRAME);
+        assert_eq!(
+            second_frontier.durable_end(),
+            second.frame_range().end.max(first_frontier_offset + FRAME)
+        );
+        assert_eq!(
+            second_frontier.durable_end(),
+            second_frontier.frame_offset()
+        );
+    }
+
+    #[test]
+    fn retained_frontier_rejects_targets_that_include_excluded_data() {
+        let mut allocator = allocator(START + 10 * FRAME);
+        let _first = allocator.reserve_data(1).unwrap();
+        let _second = allocator.reserve_data(2).unwrap();
+        let _third = allocator.reserve_data(1).unwrap();
+        let first_frontier = allocator.reserve_frontier(1).unwrap();
+        let predecessor_end = first_frontier.frame_offset() + FRAME;
+        complete_frontier_sync(&mut allocator, first_frontier).unwrap();
+
+        // A later admission after F_A may remain speculative, but the DATA
+        // already before F_A must be covered when retaining that marker.
+        let fourth = allocator.reserve_data(2).unwrap();
+        let tail = allocator.allocation_tail();
+        let previous = allocator.last_frontier();
+        let frontier_count = allocator.frontier_offsets.len();
+        assert!(allocator.durable_end_for(2).is_err());
+        assert!(allocator.reserve_frontier(2).is_err());
+        assert_eq!(allocator.allocation_tail(), tail);
+        assert_eq!(allocator.next_ticket(), 4);
+        assert_eq!(allocator.last_frontier(), previous);
+        assert_eq!(allocator.frontier_offsets.len(), frontier_count);
+        assert!(allocator.in_flight_frontier.is_none());
+        assert_eq!(allocator.tracked_ticket_start, 1);
+        assert_eq!(allocator.ticket_data_ends.len(), 3);
+
+        // Recapturing T=3 covers all pre-marker DATA using the same admitted
+        // tickets, while leaving the post-marker fourth ticket uncovered.
+        let recaptured = allocator.reserve_frontier(3).unwrap();
+        assert_eq!(recaptured.durable_end(), predecessor_end);
+        assert_eq!(recaptured.durable_end(), fourth.frame_range().start);
+        complete_frontier_sync(&mut allocator, recaptured).unwrap();
+        assert_eq!(allocator.tracked_ticket_start, 3);
+        assert_eq!(allocator.ticket_data_ends.len(), 1);
+
+        let terminal = allocator.reserve_frontier(4).unwrap();
+        complete_frontier_sync(&mut allocator, terminal).unwrap();
+        assert_eq!(allocator.tracked_ticket_start, 4);
+        assert!(allocator.ticket_data_ends.is_empty());
     }
 
     #[test]
@@ -736,6 +912,40 @@ mod tests {
         assert_eq!(allocator.last_frontier(), previous);
         assert!(allocator.reserve_data(1).is_err());
         assert!(allocator.reserve_frontier(1).is_err());
+    }
+
+    #[test]
+    fn aligned_synced_frontier_boundary_must_match_captured_target() {
+        // The smaller end omits a covered DATA fragment; the larger end
+        // includes an excluded ticket. Both satisfy alignment and bounds.
+        for mismatched_end in [START + FRAME, START + 3 * FRAME] {
+            let mut allocator = allocator(START + 8 * FRAME);
+            let _covered = allocator.reserve_data(2).unwrap();
+            let _excluded = allocator.reserve_data(1).unwrap();
+            let reservation = allocator.reserve_frontier(1).unwrap();
+            assert_eq!(reservation.durable_end(), START + 2 * FRAME);
+            let previous = allocator.last_frontier();
+            let next = WalV7FrontierCursor {
+                frontier: WalV7Frontier {
+                    generation: previous.frontier.generation + 1,
+                    ticket_end: reservation.ticket_end(),
+                    durable_end: mismatched_end,
+                    last_commit_ts: 1,
+                    prefix_digest: [0x33; 32],
+                    previous_frontier_offset: previous.frame_offset,
+                    previous_frontier_digest: previous.frame_digest,
+                },
+                frame_offset: reservation.frame_offset(),
+                frame_digest: [0x44; 32],
+            };
+
+            assert!(allocator.complete_frontier_sync(reservation, next).is_err());
+            assert_eq!(allocator.last_frontier(), previous);
+            assert_eq!(allocator.tracked_ticket_start, 0);
+            assert_eq!(allocator.ticket_data_ends.len(), 2);
+            assert!(allocator.reserve_data(1).is_err());
+            assert!(allocator.reserve_frontier(1).is_err());
+        }
     }
 
     #[test]

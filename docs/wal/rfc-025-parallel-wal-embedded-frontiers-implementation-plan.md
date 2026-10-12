@@ -89,6 +89,16 @@ advances the cursor only after validating the next marker's canonical chain
 link. Tests cover resuming allocation from an installed nonzero cursor and
 poisoning further allocations when a post-sync cursor has a mismatched
 predecessor digest or unaligned durable boundary.
+The allocator now derives the exact captured physical prefix `E(T)` from
+pending per-ticket DATA ends and the previous FRONTIER end. Each marker
+reservation stores that value, and successful sync retires only DATA-end cursors
+covered by its ticket target. The stopped-admission `D0 | D1 | F_A(D0)` case
+proves the next target includes `F_A` even though D1 ends before it.
+Targets whose retained predecessor also includes excluded DATA are rejected
+before reserving a marker. Tests cover recapturing a larger eligible target
+without requiring further admission, while leaving post-marker DATA speculative.
+Post-sync cursor tests also reject aligned cutoffs that omit covered fragments
+or include excluded DATA, preserving the prior frontier and poisoning admission.
 The serial persistence model covers repeated normalization, continued append,
 and crash/reopen for empty, nonempty, fallback, and trailing-control prefixes,
 including a selected marker behind speculative DATA. The production writer
@@ -477,8 +487,11 @@ neither is a prerequisite for this stage.
   control allocation accounts for the gap. The checked allocator primitive,
   per-ticket marker headroom, accounted-gap range splitter, worker group
   validation, and allocator-backed packer-to-worker span translation are
-  implemented. Live producer admission, marker writes, and the one-sync
-  coordinator remain.
+  implemented. The allocator captures exact `E(T)` in the marker reservation
+  and rejects targets whose predecessor retention includes excluded DATA.
+  Tests cover predecessor containment and recapturing an eligible target.
+  Live producer admission,
+  marker writes, and the one-sync coordinator remain.
 - After bounded optional coalescing, choose an eligible exclusive marker target
   `T` no greater than the contiguous written frontier and prove its exact `E(T)`
   from metadata. Capture the final `T` before constructing its canonical marker,
