@@ -507,7 +507,9 @@ this stage.
   frontiers, and physical allocator predecessor from it. Validate each later
   successfully synced FRONTIER as the immediate canonical successor, including
   generation and ticket/timestamp ordering, physical bounds, and predecessor
-  offset/digest. Keep this v7 runtime closed, with no extent initialization or
+  offset/digest. Carry the verified immutable-header digest in the runtime
+  seed, and reread/canonical-decode the installed worker inode's header before
+  starting workers. Keep this v7 runtime closed, with no extent initialization or
   prewarmed direct buffers; runtime admission opens only after later slices
   install the live reservations and v7 write protocol. The existing v4 startup
   keeps its current behavior.

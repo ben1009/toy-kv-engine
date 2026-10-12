@@ -136,6 +136,10 @@ impl WalV7LeaderWriter {
         );
         let header_digest = read_header_digest(&write_file)?;
         ensure!(
+            header_digest == seed.header_digest,
+            "v7 WAL immutable header digest does not match the recovered runtime seed"
+        );
+        ensure!(
             seed.data_start >= (WAL_V7_HEADER_LEN + WAL_V7_FRAME_LEN) as u64
                 && seed.data_start <= MAX_WAL_FILE_SIZE
                 && (seed.data_start..=MAX_WAL_FILE_SIZE).contains(&seed.append_offset)
@@ -301,6 +305,7 @@ impl WalV7LeaderWriter {
             data_start: self.data_start,
             append_offset: self.append_offset,
             next_ticket: self.allocator.next_ticket(),
+            header_digest: self.header_digest,
             installed_dev: self.installed_dev,
             installed_ino: self.installed_ino,
             frontier_cursor: self.allocator.last_frontier(),
@@ -1090,6 +1095,38 @@ mod tests {
                 .is_err()
         );
         assert_eq!(fs::read(&path)?, uncertain_image);
+
+        Ok(())
+    }
+
+    #[test]
+    fn leader_rejects_seed_header_digest_mismatch_without_mutating_image() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("active.wal");
+        let installed = install_empty(&path)?;
+        let original_image = fs::read(&path)?;
+        let owner = resource_owner(&installed)?;
+        let original_charge = owner.snapshot();
+        let mut seed = installed.runtime_seed()?;
+        seed.header_digest[0] ^= 1;
+
+        let result = WalV7LeaderWriter::new(
+            write_handle(&path)?,
+            File::open(&path)?,
+            seed,
+            MAX_WAL_FILE_SIZE,
+            Arc::clone(&owner),
+        );
+        let error = result
+            .err()
+            .expect("a mismatched seed header digest must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("immutable header digest does not match the recovered runtime seed")
+        );
+        assert_eq!(fs::read(&path)?, original_image);
+        assert_eq!(owner.snapshot(), original_charge);
 
         Ok(())
     }

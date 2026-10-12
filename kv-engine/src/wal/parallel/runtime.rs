@@ -4,7 +4,10 @@ use std::{
     collections::{BTreeMap, VecDeque},
     fs::File,
     io,
-    os::{fd::AsRawFd, unix::fs::MetadataExt},
+    os::{
+        fd::AsRawFd,
+        unix::fs::{FileExt, MetadataExt},
+    },
     sync::Arc,
     thread::{self, JoinHandle},
     time::{Duration, Instant},
@@ -12,12 +15,14 @@ use std::{
 
 use crate::wal::v7::{
     allocator::{WalV7DataAllocation, WalV7PhysicalAllocator},
+    codec::{WAL_V7_HEADER_LEN, WalV7Header},
     install::{WalV7RuntimeMetadata, WalV7RuntimeSeed},
 };
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
 use crossbeam_queue::ArrayQueue;
 use parking_lot::{Condvar, Mutex, MutexGuard};
+use sha2::{Digest, Sha256};
 
 use super::{
     BUFFER_POOL_BUF_SIZE, BUFFER_POOL_CAPACITY, DirectBuf, MAX_WAL_FILE_SIZE, PREALLOC_BLOCK,
@@ -62,6 +67,7 @@ pub(crate) struct ParallelWalRuntimeStart {
     next_ticket: u64,
     v7_allocator: Option<WalV7PhysicalAllocator>,
     v7_metadata: Option<WalV7RuntimeMetadata>,
+    v7_header_digest: Option<[u8; 32]>,
     expected_v7_inode: Option<(u64, u64)>,
     min_append_offset: u64,
     admission_open: bool,
@@ -76,6 +82,7 @@ impl ParallelWalRuntimeStart {
             next_ticket: 0,
             v7_allocator: None,
             v7_metadata: None,
+            v7_header_digest: None,
             expected_v7_inode: None,
             min_append_offset: WAL_HEADER_END,
             admission_open: true,
@@ -100,6 +107,7 @@ impl ParallelWalRuntimeStart {
             next_ticket: seed.next_ticket,
             v7_allocator: Some(v7_allocator),
             v7_metadata: Some(seed.metadata),
+            v7_header_digest: Some(seed.header_digest),
             expected_v7_inode,
             min_append_offset: seed.data_start,
             admission_open: false,
@@ -119,12 +127,12 @@ impl ParallelWalRuntimeStart {
             "invalid initial WAL append offset {}",
             self.append_offset
         );
-        match (&self.v7_allocator, &self.v7_metadata) {
-            (Some(allocator), Some(metadata)) => {
+        match (&self.v7_allocator, &self.v7_metadata, self.v7_header_digest) {
+            (Some(allocator), Some(metadata), Some(_)) => {
                 metadata
                     .validate_frontier(allocator.last_frontier().frontier, self.append_offset)?;
             }
-            (None, None) => {}
+            (None, None, None) => {}
             _ => bail!("parallel WAL startup has incomplete v7 recovery metadata"),
         }
         Ok(())
@@ -162,8 +170,47 @@ impl ParallelWalRuntimeStart {
             );
         }
 
+        let expected_header_digest = self
+            .v7_header_digest
+            .context("v7 WAL runtime startup has no recovered header digest")?;
+        validate_v7_header_digest(worker_file, expected_header_digest)?;
+
         Ok(())
     }
+}
+
+fn read_v7_header_digest(file: &File) -> Result<[u8; 32]> {
+    let mut header_buffer = DirectBuf::new(WAL_V7_HEADER_LEN);
+    let header_bytes = header_buffer.as_mut_slice();
+    let read = loop {
+        match file.read_at(header_bytes, 0) {
+            Ok(read) if read == WAL_V7_HEADER_LEN => break read,
+            Ok(read) => {
+                bail!("short v7 WAL immutable header read: {read} of {WAL_V7_HEADER_LEN} bytes");
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error).context("read v7 WAL immutable header"),
+        }
+    };
+    header_buffer.set_len(read);
+
+    let header_bytes = header_buffer.initialized_slice(0, read);
+    let header = WalV7Header::decode(header_bytes).context("decode v7 WAL immutable header")?;
+    ensure!(
+        header.encode()?.as_slice() == header_bytes,
+        "v7 WAL immutable header is not canonically encoded"
+    );
+
+    Ok(Sha256::digest(header_bytes).into())
+}
+
+fn validate_v7_header_digest(file: &File, expected_digest: [u8; 32]) -> Result<()> {
+    let actual_digest = read_v7_header_digest(file)?;
+    ensure!(
+        actual_digest == expected_digest,
+        "v7 WAL immutable header digest does not match the recovered runtime seed"
+    );
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -1774,7 +1821,7 @@ mod tests {
     fn recovered_v7_runtime_keeps_its_metadata_and_cursors_paused() {
         use std::{
             fs::File,
-            os::unix::fs::{MetadataExt, OpenOptionsExt},
+            os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt},
             sync::Arc,
         };
 
@@ -1782,11 +1829,11 @@ mod tests {
 
         use super::{ParallelWalRuntime, ParallelWalRuntimeStart};
         use crate::{
-            pitr::RecordedAt,
+            pitr::{ArchiveEpochId, ChainAnchor, RecordedAt, SegmentId, TimelineId},
             tests::harness::is_io_uring_unavailable_error,
             wal::v7::{
                 allocator::WalV7FrontierCursor,
-                codec::WalV7Frontier,
+                codec::{WalV7Frontier, WalV7Header},
                 install::{WalV7RuntimeMetadata, WalV7RuntimeSeed},
             },
         };
@@ -1819,7 +1866,19 @@ mod tests {
 
         let directory = tempfile::tempdir().expect("create WAL directory");
         let path = directory.path().join("recovered-v7.wal");
+        let archive_epoch_id = ArchiveEpochId([0x22; 16]);
+        let header = WalV7Header {
+            timeline_id: TimelineId([0x11; 16]),
+            archive_epoch_id,
+            segment_id: SegmentId(7),
+            predecessor: ChainAnchor::Genesis { archive_epoch_id },
+            incarnation: [0x44; 16],
+        };
+        let header_bytes = header.encode().expect("encode v7 WAL header");
+        let header_digest: [u8; 32] = Sha256::digest(header_bytes).into();
         let file = File::create(&path).expect("create recovered WAL image");
+        file.write_all_at(&header_bytes, 0)
+            .expect("write recovered WAL header");
         file.set_len(APPEND_OFFSET)
             .expect("size recovered WAL image");
         drop(file);
@@ -1837,6 +1896,7 @@ mod tests {
                 data_start: DATA_START,
                 append_offset: APPEND_OFFSET,
                 next_ticket: NEXT_TICKET,
+                header_digest,
                 installed_dev: direct_metadata.dev(),
                 installed_ino: direct_metadata.ino(),
                 frontier_cursor,
@@ -1940,6 +2000,41 @@ mod tests {
         direct_file
             .set_len(APPEND_OFFSET)
             .expect("restore recovered WAL length after cap check");
+
+        let alternate_header = WalV7Header {
+            incarnation: [0x55; 16],
+            ..header
+        }
+        .encode()
+        .expect("encode alternate valid v7 WAL header");
+        let buffered_file = File::options()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .expect("open recovered WAL header for mismatch check");
+        buffered_file
+            .write_all_at(&alternate_header, 0)
+            .expect("replace header with another valid v7 header");
+        let error = match ParallelWalRuntime::spawn(
+            Arc::clone(&direct_file),
+            Arc::clone(&direct_file),
+            Arc::clone(&direct_file),
+            make_start().expect("validate recovered runtime cursor for header check"),
+        ) {
+            Ok(runtime) => {
+                runtime.close().expect("close unexpectedly started runtime");
+                panic!("v7 runtime accepted a different immutable WAL header");
+            }
+            Err(error) => error,
+        };
+        assert!(
+            format!("{error:#}").contains("v7 WAL immutable header digest does not match"),
+            "unexpected mismatched-header error: {error:#}"
+        );
+        buffered_file
+            .write_all_at(&header_bytes, 0)
+            .expect("restore recovered WAL header after mismatch check");
+
         let error = match ParallelWalRuntime::spawn(
             Arc::clone(&direct_file),
             Arc::clone(&wrong_sync_file),

@@ -52,6 +52,7 @@ static TEMP_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 /// the accepted logical prefix and the normalized physical image respectively.
 pub(crate) struct WalV7InstalledRecovery {
     pub(crate) active_boundary: ActiveBoundary,
+    pub(crate) header_digest: [u8; 32],
     pub(crate) frontier: WalV7Frontier,
     pub(crate) frontier_offset: u64,
     pub(crate) frontier_digest: [u8; 32],
@@ -107,6 +108,7 @@ pub(crate) struct WalV7RuntimeSeed {
     pub(crate) data_start: u64,
     pub(crate) append_offset: u64,
     pub(crate) next_ticket: u64,
+    pub(crate) header_digest: [u8; 32],
     pub(crate) installed_dev: u64,
     pub(crate) installed_ino: u64,
     pub(crate) frontier_cursor: WalV7FrontierCursor,
@@ -266,6 +268,7 @@ impl WalV7InstalledRecovery {
             data_start,
             append_offset: self.append_offset,
             next_ticket: self.next_ticket,
+            header_digest: self.header_digest,
             installed_dev: self.installed_dev,
             installed_ino: self.installed_ino,
             frontier_cursor: WalV7FrontierCursor {
@@ -549,6 +552,7 @@ pub(crate) fn install_active_recovery(
 
         Ok(WalV7InstalledRecovery {
             active_boundary: selection.active_boundary,
+            header_digest,
             frontier,
             frontier_offset,
             frontier_digest,
