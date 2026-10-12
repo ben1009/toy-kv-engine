@@ -64,16 +64,48 @@ pub(crate) struct WalV7InstalledRecovery {
     pub(crate) physical_hasher: Sha256,
 }
 
-/// The append cursor and verified FRONTIER predecessor needed to initialize a
-/// v7 WAL runtime after recovery has durably installed its normalized image.
-/// This carries no manifest authority or incremental hash state; those remain
-/// owned by the recovered WAL lifecycle.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Incremental metadata state positioned at an installed v7 Active image.
+/// The seal index remains owned by the recovered WAL lifecycle so seeding the
+/// runtime does not duplicate a potentially large vector.
+pub(crate) struct WalV7RuntimeMetadata {
+    pub(crate) logical_hasher: Sha256,
+    pub(crate) physical_hasher: Sha256,
+    pub(crate) physical_hashed_end: u64,
+    pub(crate) last_recorded_at: Option<RecordedAt>,
+}
+
+impl WalV7RuntimeMetadata {
+    pub(crate) fn validate_frontier(
+        &self,
+        frontier: WalV7Frontier,
+        append_offset: u64,
+    ) -> Result<()> {
+        let logical_digest: [u8; 32] = self.logical_hasher.clone().finalize().into();
+        ensure!(
+            logical_digest == frontier.prefix_digest,
+            "v7 runtime logical hash does not match its recovered FRONTIER"
+        );
+        ensure!(
+            self.physical_hashed_end == append_offset,
+            "v7 runtime physical hash cursor does not reach the installed image end"
+        );
+        ensure!(
+            self.last_recorded_at.is_some() == (frontier.ticket_end > 0),
+            "v7 runtime recorded-time cursor disagrees with its recovered ticket frontier"
+        );
+        Ok(())
+    }
+}
+
+/// The append cursor, verified FRONTIER predecessor, and ordered metadata
+/// needed to initialize a v7 WAL runtime after recovery has durably installed
+/// its normalized image. Manifest authority remains owned by recovery.
 pub(crate) struct WalV7RuntimeSeed {
     pub(crate) data_start: u64,
     pub(crate) append_offset: u64,
     pub(crate) next_ticket: u64,
     pub(crate) frontier_cursor: WalV7FrontierCursor,
+    pub(crate) metadata: WalV7RuntimeMetadata,
 }
 
 /// Active recovery result after authoritative selection and durable installation.
@@ -195,6 +227,32 @@ impl WalV7InstalledRecovery {
             );
         }
 
+        let logical_digest: [u8; 32] = self.logical_hasher.clone().finalize().into();
+        ensure!(
+            logical_digest == self.active_boundary.prefix_digest,
+            "installed v7 logical hash does not match its Active boundary"
+        );
+        ensure!(
+            self.last_recorded_at == self.batches.last().map(|batch| batch.recorded_at),
+            "installed v7 recorded-time cursor disagrees with its final batch"
+        );
+        ensure!(
+            self.seal_index.iter().all(|offset| {
+                *offset >= data_start
+                    && *offset < self.frontier_offset
+                    && offset.is_multiple_of(WAL_V7_FRAME_LEN as u64)
+            }) && self.seal_index.windows(2).all(|pair| pair[0] < pair[1]),
+            "installed v7 seal index is not strictly ordered within its DATA prefix"
+        );
+
+        let metadata = WalV7RuntimeMetadata {
+            logical_hasher: self.logical_hasher.clone(),
+            physical_hasher: self.physical_hasher.clone(),
+            physical_hashed_end: self.image_len,
+            last_recorded_at: self.last_recorded_at,
+        };
+        metadata.validate_frontier(self.frontier, self.append_offset)?;
+
         Ok(WalV7RuntimeSeed {
             data_start,
             append_offset: self.append_offset,
@@ -204,6 +262,7 @@ impl WalV7InstalledRecovery {
                 frame_offset: self.frontier_offset,
                 frame_digest: self.frontier_digest,
             },
+            metadata,
         })
     }
 }
@@ -983,6 +1042,7 @@ mod tests {
             codec::{
                 WAL_V7_DATA_FRAGMENT_PAYLOAD_CAPACITY, WalV7DataFragmentHeader,
                 WalV7LogicalBatchHeader, encode_data_frame, encode_generation_zero_frontier,
+                encode_logical_batch,
             },
             recovery::{
                 WalV7RecoveryAuthority, discover_frontier_candidates, select_recovery_candidate,
@@ -1290,6 +1350,101 @@ mod tests {
     }
 
     #[test]
+    fn runtime_seed_resumes_hashes_from_the_normalized_image() -> Result<()> {
+        let directory = TestDirectory::new()?;
+        let path = directory.0.join("active.wal");
+        let (header, anchor) = create_nonempty_image(&path)?;
+        let source_image = fs::read(&path)?;
+        let selection = active_selection(&path, anchor)?;
+        let installed = install_active_recovery(&path, &selection)?;
+        let normalized_image = fs::read(&path)?;
+        assert!(normalized_image.len() < source_image.len());
+
+        let mut seed = installed.runtime_seed()?;
+        assert_eq!(seed.metadata.physical_hashed_end, installed.image_len);
+        assert_eq!(seed.metadata.last_recorded_at, installed.last_recorded_at);
+        let next_batch = WalBatch {
+            commit_ts: 20,
+            recorded_at: RecordedAt {
+                secs: 101,
+                nanos: 0,
+            },
+            entries: vec![WalEntry::Put {
+                key: b"next".to_vec(),
+                value: b"accepted".to_vec(),
+            }],
+        };
+        let next_logical = encode_logical_batch(seed.next_ticket, &next_batch, LIVE_WAL_V5_LIMITS)?;
+        seed.metadata.logical_hasher.update(&next_logical);
+        let mut expected_logical = Sha256::new();
+        expected_logical.update(header.encode()?);
+        expected_logical.update(encode_logical_batch(
+            0,
+            &installed.batches[0],
+            LIVE_WAL_V5_LIMITS,
+        )?);
+        expected_logical.update(next_logical);
+        assert_eq!(
+            seed.metadata.logical_hasher.finalize(),
+            expected_logical.finalize()
+        );
+
+        let (next_frames, _) = data_frames(
+            header.digest()?,
+            seed.append_offset,
+            seed.next_ticket,
+            &next_batch,
+        )?;
+        let mut expected_physical = normalized_image;
+        for frame in next_frames {
+            seed.metadata.physical_hasher.update(frame);
+            expected_physical.extend_from_slice(&frame);
+        }
+        assert_eq!(
+            seed.metadata.physical_hasher.finalize(),
+            Sha256::digest(expected_physical)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_seed_rejects_inconsistent_installed_metadata() -> Result<()> {
+        let directory = TestDirectory::new()?;
+        let path = directory.0.join("active.wal");
+        let (_header, anchor) = create_nonempty_image(&path)?;
+        let selection = active_selection(&path, anchor)?;
+        let mut installed = install_active_recovery(&path, &selection)?;
+        let normalized_image = fs::read(&path)?;
+
+        let recovered_logical_hasher = installed.logical_hasher.clone();
+        installed.logical_hasher.update(b"unaccepted suffix");
+        assert!(installed.runtime_seed().is_err());
+        installed.logical_hasher = recovered_logical_hasher;
+
+        let last_recorded_at = installed.last_recorded_at;
+        for invalid_recorded_at in [None, Some(RecordedAt { secs: 99, nanos: 0 })] {
+            installed.last_recorded_at = invalid_recorded_at;
+            assert!(installed.runtime_seed().is_err());
+        }
+        installed.last_recorded_at = last_recorded_at;
+
+        let first_data_offset = installed.seal_index[0];
+        for invalid_data_offset in [
+            HEADER_LEN_U64,
+            first_data_offset + 1,
+            installed.frontier_offset,
+            installed.append_offset,
+        ] {
+            installed.seal_index[0] = invalid_data_offset;
+            assert!(installed.runtime_seed().is_err());
+        }
+        installed.seal_index[0] = first_data_offset;
+        assert!(installed.runtime_seed().is_ok());
+        assert_eq!(fs::read(&path)?, normalized_image);
+        Ok(())
+    }
+
+    #[test]
     fn active_recovery_coordinator_rejects_wrong_manifest_predecessor_without_mutation()
     -> Result<()> {
         let directory = TestDirectory::new()?;
@@ -1530,6 +1685,12 @@ mod tests {
         assert_eq!(seed.frontier_cursor.frontier, installed.frontier);
         assert_eq!(seed.frontier_cursor.frame_offset, HEADER_LEN_U64);
         assert_eq!(seed.frontier_cursor.frame_digest, installed.frontier_digest);
+        let logical_digest: [u8; 32] = seed.metadata.logical_hasher.clone().finalize().into();
+        let physical_digest: [u8; 32] = seed.metadata.physical_hasher.clone().finalize().into();
+        assert_eq!(logical_digest, header_digest);
+        assert_eq!(physical_digest, installed.image_digest());
+        assert_eq!(seed.metadata.physical_hashed_end, installed.image_len);
+        assert_eq!(seed.metadata.last_recorded_at, None);
         assert_eq!(
             installed.recovered_resource_charge()?,
             WalV7ResourceCharge::default()

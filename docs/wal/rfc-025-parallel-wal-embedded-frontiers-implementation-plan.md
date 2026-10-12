@@ -50,12 +50,19 @@ Production WAL-open and manifest integration also remain. Stage 5 has started wi
 recovered-runtime cursor bootstrap: an installed Active image supplies the v7
 DATA start, append offset, and next ticket, and the shared runtime seeds its
 admission, packer, and durability coordinates from that state. The seed now
-preserves the verified terminal FRONTIER body, frame offset, and frame digest;
-the allocator accepts a synced successor only when its generation, ticket and
-timestamp ordering, physical bounds, predecessor offset, and predecessor digest
-continue that cursor. V7 startup stays closed and performs no extent
-initialization or buffer-pool warmup until later runtime slices provide live
-reservations and the v7 writer path.
+preserves the verified terminal FRONTIER body, frame offset, frame digest,
+logical/physical hash states, and recorded-time clamp. Seed validation checks
+the logical digest against the recovered frontier, verifies the physical hash
+cursor reaches the normalized image end, and validates the recorded-time and
+seal-index cursors against recovered batches. The allocator accepts a synced
+successor only when its generation, ticket and timestamp ordering, physical
+bounds, predecessor offset, and predecessor digest continue that cursor. V7
+startup stays closed and performs no extent initialization or buffer-pool
+warmup until later runtime slices provide live reservations and the v7 writer
+path. The potentially large seal index remains owned by the recovered WAL
+lifecycle rather than being copied into the runtime seed.
+Recovery hash-continuation, malformed-metadata rejection, and paused-runtime
+retention tests cover this handoff for both empty and nonempty installed images.
 The production logical-batch encoder now emits the v7 ticketed header and
 canonical RFC 023 entry stream with both v7 CRCs. It validates borrowed
 canonical survivors before allocating encoded bytes and does not copy their

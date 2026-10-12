@@ -372,7 +372,7 @@ impl WalV7PhysicalAllocator {
             .ok_or_else(|| anyhow::anyhow!("invalid v7 marker reservation accounting"))
     }
 
-    #[cfg(test)]
+    /// The verified FRONTIER from recovery or the last successful marker sync.
     pub(crate) fn last_frontier(&self) -> WalV7FrontierCursor {
         self.last_frontier
     }

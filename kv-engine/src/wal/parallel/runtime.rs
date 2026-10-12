@@ -12,7 +12,7 @@ use std::{
 
 use crate::wal::v7::{
     allocator::{WalV7DataAllocation, WalV7PhysicalAllocator},
-    install::WalV7RuntimeSeed,
+    install::{WalV7RuntimeMetadata, WalV7RuntimeSeed},
 };
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
@@ -61,6 +61,7 @@ pub(crate) struct ParallelWalRuntimeStart {
     append_offset: u64,
     next_ticket: u64,
     v7_allocator: Option<WalV7PhysicalAllocator>,
+    v7_metadata: Option<WalV7RuntimeMetadata>,
     min_append_offset: u64,
     admission_open: bool,
     initialize_extents: bool,
@@ -73,6 +74,7 @@ impl ParallelWalRuntimeStart {
             append_offset,
             next_ticket: 0,
             v7_allocator: None,
+            v7_metadata: None,
             min_append_offset: WAL_HEADER_END,
             admission_open: true,
             initialize_extents: true,
@@ -94,6 +96,7 @@ impl ParallelWalRuntimeStart {
             append_offset: seed.append_offset,
             next_ticket: seed.next_ticket,
             v7_allocator: Some(v7_allocator),
+            v7_metadata: Some(seed.metadata),
             min_append_offset: seed.data_start,
             admission_open: false,
             initialize_extents: false,
@@ -112,6 +115,14 @@ impl ParallelWalRuntimeStart {
             "invalid initial WAL append offset {}",
             self.append_offset
         );
+        match (&self.v7_allocator, &self.v7_metadata) {
+            (Some(allocator), Some(metadata)) => {
+                metadata
+                    .validate_frontier(allocator.last_frontier().frontier, self.append_offset)?;
+            }
+            (None, None) => {}
+            _ => bail!("parallel WAL startup has incomplete v7 recovery metadata"),
+        }
         Ok(())
     }
 }
@@ -420,6 +431,10 @@ struct RuntimeInner {
     sync_progress: Arc<WalSyncProgress>,
     preallocator: Arc<File>,
     durability: Arc<DurabilityShared>,
+    // The ordered v7 packer and Frontier coordinator will consume this state
+    // when their live admission and marker-write protocol is connected.
+    #[allow(dead_code)]
+    v7_metadata: Mutex<Option<WalV7RuntimeMetadata>>,
 }
 
 struct RuntimeThreads {
@@ -666,6 +681,7 @@ impl ParallelWalRuntime {
             sync_progress,
             preallocator,
             durability: Arc::clone(&durability),
+            v7_metadata: Mutex::new(start.v7_metadata),
         });
 
         let coordinator_inner = Arc::clone(&inner);
@@ -1715,14 +1731,19 @@ fn round_up(value: u64, alignment: u64) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn recovered_v7_runtime_keeps_its_ticket_and_append_cursors_paused() {
+    fn recovered_v7_runtime_keeps_its_metadata_and_cursors_paused() {
         use std::{fs::File, os::unix::fs::OpenOptionsExt, sync::Arc};
+
+        use sha2::{Digest, Sha256};
 
         use super::{ParallelWalRuntime, ParallelWalRuntimeStart};
         use crate::{
+            pitr::RecordedAt,
             tests::harness::is_io_uring_unavailable_error,
             wal::v7::{
-                allocator::WalV7FrontierCursor, codec::WalV7Frontier, install::WalV7RuntimeSeed,
+                allocator::WalV7FrontierCursor,
+                codec::WalV7Frontier,
+                install::{WalV7RuntimeMetadata, WalV7RuntimeSeed},
             },
         };
 
@@ -1730,13 +1751,27 @@ mod tests {
         const APPEND_OFFSET: u64 = 9 * 4096;
         const FRONTIER_OFFSET: u64 = 8 * 4096;
         const NEXT_TICKET: u64 = 6;
+        let mut logical_hasher = Sha256::new();
+        logical_hasher.update(b"accepted logical prefix");
+        let recovered_logical_hasher = logical_hasher.clone();
+        let prefix_digest = logical_hasher.clone().finalize().into();
+        let mut physical_hasher = Sha256::new();
+        physical_hasher.update(b"normalized physical image");
+        let physical_digest: [u8; 32] = physical_hasher.clone().finalize().into();
+        let last_recorded_at = Some(RecordedAt { secs: 60, nanos: 0 });
+        let metadata = WalV7RuntimeMetadata {
+            logical_hasher,
+            physical_hasher,
+            physical_hashed_end: APPEND_OFFSET,
+            last_recorded_at,
+        };
         let frontier_cursor = WalV7FrontierCursor {
             frontier: WalV7Frontier {
                 generation: 3,
                 ticket_end: NEXT_TICKET,
                 durable_end: FRONTIER_OFFSET,
                 last_commit_ts: 60,
-                prefix_digest: [0xA1; 32],
+                prefix_digest,
                 previous_frontier_offset: 6 * 4096,
                 previous_frontier_digest: [0xB2; 32],
             },
@@ -1758,13 +1793,48 @@ mod tests {
             .open(&path)
             .expect("open recovered WAL with direct I/O");
         let direct_file = Arc::new(direct_file);
-        let start = ParallelWalRuntimeStart::v7(WalV7RuntimeSeed {
+        let mut start = ParallelWalRuntimeStart::v7(WalV7RuntimeSeed {
             data_start: DATA_START,
             append_offset: APPEND_OFFSET,
             next_ticket: NEXT_TICKET,
             frontier_cursor,
+            metadata,
         })
         .expect("validate recovered runtime cursor");
+        start
+            .v7_metadata
+            .as_mut()
+            .expect("v7 startup metadata")
+            .physical_hashed_end -= 4096;
+        assert!(start.validate().is_err());
+        start
+            .v7_metadata
+            .as_mut()
+            .expect("v7 startup metadata")
+            .physical_hashed_end = APPEND_OFFSET;
+        start
+            .v7_metadata
+            .as_mut()
+            .expect("v7 startup metadata")
+            .logical_hasher
+            .update(b"unaccepted suffix");
+        assert!(start.validate().is_err());
+        start
+            .v7_metadata
+            .as_mut()
+            .expect("v7 startup metadata")
+            .logical_hasher = recovered_logical_hasher;
+        start
+            .v7_metadata
+            .as_mut()
+            .expect("v7 startup metadata")
+            .last_recorded_at = None;
+        assert!(start.validate().is_err());
+        start
+            .v7_metadata
+            .as_mut()
+            .expect("v7 startup metadata")
+            .last_recorded_at = last_recorded_at;
         let runtime = match ParallelWalRuntime::spawn(
             Arc::clone(&direct_file),
             Arc::clone(&direct_file),
@@ -1804,6 +1874,17 @@ mod tests {
             let durability = runtime.inner.durability.state.lock();
             assert_eq!(durability.written_frontier, NEXT_TICKET);
             assert_eq!(durability.durable_frontier, NEXT_TICKET);
+        }
+        {
+            let metadata = runtime.inner.v7_metadata.lock();
+            let metadata = metadata.as_ref().expect("runtime retains v7 metadata");
+            let logical_digest: [u8; 32] = metadata.logical_hasher.clone().finalize().into();
+            let retained_physical_digest: [u8; 32] =
+                metadata.physical_hasher.clone().finalize().into();
+            assert_eq!(logical_digest, prefix_digest);
+            assert_eq!(retained_physical_digest, physical_digest);
+            assert_eq!(metadata.physical_hashed_end, APPEND_OFFSET);
+            assert_eq!(metadata.last_recorded_at, last_recorded_at);
         }
         assert!(runtime.inner.buffer_pool.is_empty());
         assert_eq!(
