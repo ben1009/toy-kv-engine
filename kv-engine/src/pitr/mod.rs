@@ -489,13 +489,26 @@ pub(crate) fn encode_v5_batch_into(
 /// surviving keys and values are checked before allocating any encoded bytes.
 pub(crate) struct CanonicalWalEntryStream<'a> {
     batch: &'a WalBatch,
-    last_point: HashMap<&'a [u8], usize>,
+    last_point: Vec<(&'a [u8], usize)>,
     data_len: usize,
     entry_count: u32,
 }
 
 impl<'a> CanonicalWalEntryStream<'a> {
-    pub(crate) fn new(batch: &'a WalBatch, limits: WalV5Limits) -> Result<Self> {
+    /// Calculate the temporary point-operation index memory without allocating
+    /// it. The v7 Leader charges this amount before constructing the stream.
+    pub(crate) fn preparation_buffer_bytes(batch: &WalBatch, limits: WalV5Limits) -> Result<u64> {
+        let point_count = Self::point_index_capacity(batch, limits)?;
+        if point_count <= 1 {
+            return Ok(0);
+        }
+        let bytes = point_count
+            .checked_mul(std::mem::size_of::<(&[u8], usize)>())
+            .context("v5 canonical point index size overflows")?;
+        u64::try_from(bytes).context("v5 canonical point index size exceeds u64")
+    }
+
+    fn point_index_capacity(batch: &WalBatch, limits: WalV5Limits) -> Result<usize> {
         let limits = limits.validate()?;
         ensure!(
             batch.entries.len() <= limits.max_input_entry_count,
@@ -512,13 +525,52 @@ impl<'a> CanonicalWalEntryStream<'a> {
             "recorded_at nanos out of range"
         );
 
-        let mut last_point = HashMap::new();
-        if batch.entries.len() > 1 {
+        if batch.entries.len() <= 1 {
+            return Ok(0);
+        }
+        Ok(batch
+            .entries
+            .iter()
+            .filter(|entry| matches!(entry, WalEntry::Put { .. } | WalEntry::PointDelete { .. }))
+            .count())
+    }
+
+    pub(crate) fn new(batch: &'a WalBatch, limits: WalV5Limits) -> Result<Self> {
+        let limits = limits.validate()?;
+        let point_index_capacity = Self::point_index_capacity(batch, limits)?;
+        let mut last_point = Vec::new();
+        if point_index_capacity > 1 {
+            last_point
+                .try_reserve_exact(point_index_capacity)
+                .context("reserve v5 canonical point index")?;
             for (index, entry) in batch.entries.iter().enumerate() {
                 if let WalEntry::Put { key, .. } | WalEntry::PointDelete { key } = entry {
-                    last_point.insert(key.as_slice(), index);
+                    last_point.push((key.as_slice(), index));
                 }
             }
+            last_point.sort_unstable_by(|(left_key, left_index), (right_key, right_index)| {
+                left_key
+                    .cmp(right_key)
+                    .then_with(|| left_index.cmp(right_index))
+            });
+
+            // Keep the final point operation for each key. Swapping only into
+            // already-scanned slots preserves the sorted groups still ahead.
+            let mut read = 0;
+            let mut write = 0;
+            while read < last_point.len() {
+                let group_start = read;
+                read += 1;
+                while read < last_point.len() && last_point[read].0 == last_point[group_start].0 {
+                    read += 1;
+                }
+                let latest = read - 1;
+                if latest != write {
+                    last_point.swap(write, latest);
+                }
+                write += 1;
+            }
+            last_point.truncate(write);
         }
         let mut stream = Self {
             batch,
@@ -563,8 +615,11 @@ impl<'a> CanonicalWalEntryStream<'a> {
             .enumerate()
             .filter_map(|(index, entry)| match entry {
                 WalEntry::Put { key, .. } | WalEntry::PointDelete { key }
-                    if self.batch.entries.len() > 1
-                        && self.last_point.get(key.as_slice()) != Some(&index) =>
+                    if !self.last_point.is_empty()
+                        && self
+                            .last_point
+                            .binary_search_by(|(indexed_key, _)| (*indexed_key).cmp(key.as_slice()))
+                            .map_or(true, |position| self.last_point[position].1 != index) =>
                 {
                     None
                 }

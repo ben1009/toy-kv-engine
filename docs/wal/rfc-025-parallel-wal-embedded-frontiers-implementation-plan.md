@@ -9,7 +9,7 @@ fresh-inode normalization primitive, and an authority-required coordinator.
 Stage 4 now includes the v7 resource-ledger primitive, framed-batch reservation
 helper, and serial-model integration. The model reserves before allocating
 framed DATA buffers or writing frames, retains the charge through uncertain
-sync, and retires DATA buffer memory on successful publication. It retains
+sync, and retires transient batch-buffer memory on successful publication. It retains
 WAL/spool/index charges; recovery reconstructs actual retained DATA/FRONTIER
 bytes and seal-index capacity, counting coalesced markers only once. Serial
 commits reuse the buffer cap, and recovered batches require no outstanding
@@ -43,13 +43,23 @@ the recovered bookkeeping without appending duplicate lifecycle records or a
 PITR snapshot. Successor WAL registration is made durable before rotation exposes
 the new memtable to writers.
 Its current source-spool check is a provisional estimate: it counts logical WAL
-lengths and a 4 KiB sidecar allowance, but does not include larger seal indexes
+lengths and one 4 KiB control-frame allowance per segment, but does not account
+for worst-case per-batch embedded FRONTIER reservations, larger seal indexes,
 or actual filesystem allocation. The shared reservation ledger and WAL admission
 integration remain; this estimate is not the final hard-bound enforcement.
-Production WAL-open and manifest integration also remain. Stage 5 has started with
-recovered-runtime cursor bootstrap: an installed Active image supplies the v7
-DATA start, append offset, and next ticket, and the shared runtime seeds its
-admission, packer, and durability coordinates from that state. The seed now
+The low-level serial Leader writer now requires a reservation owner for its
+installed inode. Creating the owner charges the recovered prefix exactly once. The writer
+validates that the owner belongs to its installed image, precharges the
+temporary canonical point-operation index before allocating it, then reserves
+DATA/FRONTIER/index and encoded/frame-buffer
+charges before materializing the logical batch or advancing the allocator. It
+retains persistent charges through errors and unwinds across writer-handle
+replacement until the lifecycle releases the owner after cleanup. Fresh-inode
+recovery creates a replacement owner from the installed prefix. Engine WAL-open and
+manifest integration still need to install and retain that owner. Stage 5 has
+started with recovered-runtime cursor bootstrap: an installed Active image
+supplies the v7 DATA start, append offset, and next ticket. The shared runtime
+seeds its admission, packer, and durability coordinates from that state. The seed now
 preserves the verified terminal FRONTIER body, frame offset, frame digest,
 logical/physical hash states, and recorded-time clamp. Seed validation checks
 the logical digest against the recovered frontier, verifies the physical hash
@@ -394,12 +404,14 @@ the caller assigns a ticket or offset. The engine now reconstructs its segment
 manager's retained obligations and a source-spool reservation estimate before
 attaching a PITR runtime. Durable reconciliation keeps this manager in step with
 completed seals and source cleanup without replacing live pins or reservations.
-The estimate uses logical WAL lengths and a 4 KiB
-sidecar allowance, so it does not yet cover larger seal indexes or actual
-filesystem allocation and must not be treated as the final hard-bound check.
-The separate reservation ledger is not yet reconstructed from filesystem
-allocation or connected to live WAL admission; those integrations remain in
-this stage.
+The estimate uses logical WAL lengths and one 4 KiB control-frame allowance per
+segment, so it does not yet cover worst-case per-batch embedded FRONTIER
+reservations, larger seal indexes, or actual filesystem allocation and must not
+be treated as the final hard-bound check.
+The separate reservation ledger now gates the low-level serial v7 Leader
+writer's batch admission and retains persistent charges in an inode-bound
+owner. Engine WAL admission, filesystem-allocation reconstruction, and lifecycle
+ownership of that ledger remain in this stage.
 
 - Promote or replace the `PitrSpoolAccountant` helper/model with a shared live
   ledger installed by the engine's PITR lifecycle. Reconstruct its charges

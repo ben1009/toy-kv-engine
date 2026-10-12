@@ -28,8 +28,9 @@ pub(crate) struct WalV7ResourceCharge {
 
 impl WalV7ResourceCharge {
     /// Calculate the resources for one logical batch, including all DATA
-    /// frames, one worst-case FRONTIER, DATA buffer memory, and a seal-index
-    /// entry. `encoded_batch_bytes` includes the logical header and entry stream.
+    /// frames, one worst-case FRONTIER, logical-batch and DATA/FRONTIER write
+    /// buffers, and a seal-index entry. `encoded_batch_bytes` includes the
+    /// logical header and entry stream.
     ///
     /// # Errors
     /// Returns an error for lengths outside the wire envelope or arithmetic
@@ -45,12 +46,16 @@ impl WalV7ResourceCharge {
         let logical_wal_bytes = data_frame_bytes
             .checked_add(WAL_V7_FRAME_LEN as u64)
             .ok_or(WalV7ReservationError::ArithmeticOverflow)?;
+        let buffer_memory_bytes = encoded_batch_bytes
+            .checked_add(data_frame_bytes)
+            .and_then(|bytes| bytes.checked_add(WAL_V7_FRAME_LEN as u64))
+            .ok_or(WalV7ReservationError::ArithmeticOverflow)?;
 
         Ok(Self {
             logical_wal_bytes,
             source_spool_bytes: logical_wal_bytes,
             recovery_workspace_bytes: 0,
-            buffer_memory_bytes: data_frame_bytes,
+            buffer_memory_bytes,
             seal_index_bytes: std::mem::size_of::<u64>() as u64,
         })
     }
@@ -187,6 +192,145 @@ pub(crate) struct WalV7ResourceLedger {
     inner: Arc<WalV7ResourceLedgerInner>,
 }
 
+/// Keeps persistent reservations alive for one installed WAL image,
+/// independently of the writer handle that admitted them.
+///
+/// Recovery and segment lifecycle code retain a clone of this owner until the
+/// corresponding source image is durably reclaimed. The writer can therefore
+/// be replaced after an uncertain I/O outcome without releasing the charges
+/// for bytes that may still be present in the active file. Fresh-inode recovery
+/// creates a new owner from the replacement image, retiring the old owner only
+/// after the old image is durably removed.
+#[derive(Debug)]
+pub(crate) struct WalV7ReservationOwner {
+    ledger: WalV7ResourceLedger,
+    installed_dev: u64,
+    installed_ino: u64,
+    reservations: Mutex<BTreeMap<u64, WalV7Reservation>>,
+}
+
+/// A batch reservation already held by its image owner. Declare this guard
+/// before allocating the batch and frame buffers so they drop before its
+/// buffer charge retires, including when an assigned append unwinds.
+pub(crate) struct WalV7OwnedBatchReservation {
+    owner: Arc<WalV7ReservationOwner>,
+    id: u64,
+    admitted: bool,
+    finished: bool,
+}
+
+impl WalV7ReservationOwner {
+    /// Charge an installed Active image exactly once when creating its owner.
+    /// Reopening handles on this inode reuses the owner; fresh-inode recovery
+    /// must create a replacement owner rather than add another prefix charge.
+    pub(crate) fn new(
+        ledger: WalV7ResourceLedger,
+        installed: &super::install::WalV7InstalledRecovery,
+    ) -> anyhow::Result<Self> {
+        let seed = installed.runtime_seed()?;
+        let mut reservations = BTreeMap::new();
+        if let Some(reservation) = installed.reserve_recovered_resources(&ledger)? {
+            reservations.insert(reservation.id, reservation);
+        }
+        Ok(Self {
+            ledger,
+            installed_dev: seed.installed_dev,
+            installed_ino: seed.installed_ino,
+            reservations: Mutex::new(reservations),
+        })
+    }
+
+    pub(crate) fn validate_image(&self, dev: u64, ino: u64) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            (self.installed_dev, self.installed_ino) == (dev, ino),
+            "v7 resource owner belongs to a different installed WAL image"
+        );
+        Ok(())
+    }
+
+    /// Reserve one batch before materializing its logical bytes or frame
+    /// buffers, and before assigning its ticket and physical offsets.
+    pub(crate) fn reserve_batch(
+        self: &Arc<Self>,
+        encoded_batch_bytes: u64,
+    ) -> Result<WalV7OwnedBatchReservation, WalV7ReservationError> {
+        let reservation = self.ledger.reserve_batch(encoded_batch_bytes)?;
+        let id = reservation.id;
+        self.reservations.lock().insert(id, reservation);
+        Ok(WalV7OwnedBatchReservation {
+            owner: Arc::clone(self),
+            id,
+            admitted: false,
+            finished: false,
+        })
+    }
+
+    /// Reserve temporary canonicalization memory before the point-operation
+    /// index is allocated. The caller drops this token as soon as preparation
+    /// has consumed the index.
+    pub(crate) fn reserve_preparation_buffer(
+        &self,
+        buffer_memory_bytes: u64,
+    ) -> Result<Option<WalV7Reservation>, WalV7ReservationError> {
+        if buffer_memory_bytes == 0 {
+            return Ok(None);
+        }
+        self.ledger
+            .reserve(WalV7ResourceCharge {
+                buffer_memory_bytes,
+                ..WalV7ResourceCharge::default()
+            })
+            .map(Some)
+    }
+
+    fn retire_batch_buffers(&self, id: u64) -> Result<(), WalV7ReservationError> {
+        let mut reservations = self.reservations.lock();
+        let reservation = reservations
+            .get_mut(&id)
+            .ok_or(WalV7ReservationError::UnknownReservation)?;
+        self.ledger.release_buffer_memory(reservation)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn snapshot(&self) -> WalV7ResourceCharge {
+        self.ledger.snapshot()
+    }
+}
+
+impl WalV7OwnedBatchReservation {
+    /// Mark the reservation persistent immediately after coordinates advance.
+    pub(crate) fn mark_admitted(&mut self) {
+        self.admitted = true;
+    }
+
+    /// Retire buffers after synchronous I/O and hashing stop using them.
+    /// Persistent charges remain in the image owner on success or failure.
+    pub(crate) fn finish_after_io(mut self) -> Result<(), WalV7ReservationError> {
+        if !self.admitted {
+            return Err(WalV7ReservationError::ReservationMismatch);
+        }
+        let result = self.owner.retire_batch_buffers(self.id);
+        self.finished = true;
+        result
+    }
+}
+
+impl Drop for WalV7OwnedBatchReservation {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        if self.admitted {
+            // The buffers declared after this guard have already dropped.
+            // Keep persistent charges even if accounting rejects retirement.
+            let _ = self.owner.retire_batch_buffers(self.id);
+        } else {
+            let reservation = self.owner.reservations.lock().remove(&self.id);
+            drop(reservation);
+        }
+    }
+}
+
 impl WalV7ResourceLedger {
     pub(crate) fn new(limits: WalV7ResourceLimits) -> Result<Self, WalV7ReservationError> {
         if limits.max_logical_wal_bytes == 0
@@ -265,8 +409,8 @@ impl WalV7ResourceLedger {
     /// caller assigns a ticket or file offset.
     ///
     /// The reservation includes all fixed-size DATA frames, one FRONTIER
-    /// frame, frame-buffer memory for DATA, and one first-DATA seal-index
-    /// entry. FRONTIER reservations are per admitted batch even when a later
+    /// frame, logical-batch and DATA/FRONTIER write-buffer memory, and one
+    /// first-DATA seal-index entry. FRONTIER reservations are per admitted batch even when a later
     /// group commit coalesces several batches into one marker.
     /// `encoded_batch_bytes` includes the logical batch header and entry stream.
     /// The caller must validate batch contents and reserve any additional
@@ -421,7 +565,7 @@ mod tests {
             max_logical_wal_bytes: 16384,
             max_source_spool_bytes: 20480,
             max_recovery_workspace_bytes: 4096,
-            max_buffer_memory_bytes: 12288,
+            max_buffer_memory_bytes: 32768,
             max_seal_index_bytes: 16,
         }
     }
@@ -439,7 +583,13 @@ mod tests {
             let reservation = ledger.reserve_batch(batch_bytes).unwrap();
             assert_eq!(
                 ledger.snapshot(),
-                charge(wal_bytes, wal_bytes, 0, data_bytes, 8)
+                charge(
+                    wal_bytes,
+                    wal_bytes,
+                    0,
+                    batch_bytes + data_bytes + WAL_V7_FRAME_LEN as u64,
+                    8,
+                )
             );
             drop(reservation);
             assert_eq!(ledger.snapshot(), WalV7ResourceCharge::default());
@@ -449,12 +599,16 @@ mod tests {
     #[test]
     fn buffer_memory_retirement_reuses_capacity_and_preserves_persistent_charges() {
         let ledger = WalV7ResourceLedger::new(WalV7ResourceLimits {
-            max_buffer_memory_bytes: 4096,
+            max_buffer_memory_bytes: 49 + 4096 + WAL_V7_FRAME_LEN as u64,
             ..batch_limits()
         })
         .unwrap();
         let mut first = ledger.reserve_batch(49).unwrap();
-        assert_eq!(ledger.snapshot(), charge(8192, 8192, 0, 4096, 8));
+        let batch_buffer_bytes = 49 + 4096 + WAL_V7_FRAME_LEN as u64;
+        assert_eq!(
+            ledger.snapshot(),
+            charge(8192, 8192, 0, batch_buffer_bytes, 8)
+        );
 
         ledger.release_buffer_memory(&mut first).unwrap();
         assert_eq!(ledger.snapshot(), charge(8192, 8192, 0, 0, 8));
@@ -463,7 +617,10 @@ mod tests {
 
         let mut second = ledger.reserve_batch(49).unwrap();
         assert_eq!(second.id, 2);
-        assert_eq!(ledger.snapshot(), charge(16384, 16384, 0, 4096, 16));
+        assert_eq!(
+            ledger.snapshot(),
+            charge(16384, 16384, 0, batch_buffer_bytes, 16)
+        );
         ledger.release_buffer_memory(&mut second).unwrap();
         assert_eq!(ledger.snapshot(), charge(16384, 16384, 0, 0, 16));
         drop(first);
@@ -503,7 +660,7 @@ mod tests {
     #[test]
     fn rejected_batch_reservation_preserves_usage_and_reserved_workspace() {
         let exact_limits = WalV7ResourceLimits {
-            max_buffer_memory_bytes: 8192,
+            max_buffer_memory_bytes: 2 * (49 + 4096 + WAL_V7_FRAME_LEN as u64),
             ..batch_limits()
         };
         for (limits, expected_error) in [
@@ -523,7 +680,7 @@ mod tests {
             ),
             (
                 WalV7ResourceLimits {
-                    max_buffer_memory_bytes: 8191,
+                    max_buffer_memory_bytes: 2 * (49 + 4096 + WAL_V7_FRAME_LEN as u64) - 1,
                     ..exact_limits
                 },
                 WalV7ReservationError::BufferMemoryLimit,
@@ -539,10 +696,17 @@ mod tests {
             let ledger = WalV7ResourceLedger::new(limits).unwrap();
             let existing = ledger.reserve_batch(49).unwrap();
             let workspace = ledger.reserve(charge(0, 0, 4096, 0, 0)).unwrap();
-            assert_eq!(ledger.snapshot(), charge(8192, 8192, 4096, 4096, 8));
+            let batch_buffer_bytes = 49 + 4096 + WAL_V7_FRAME_LEN as u64;
+            assert_eq!(
+                ledger.snapshot(),
+                charge(8192, 8192, 4096, batch_buffer_bytes, 8)
+            );
 
             assert_eq!(ledger.reserve_batch(49), Err(expected_error));
-            assert_eq!(ledger.snapshot(), charge(8192, 8192, 4096, 4096, 8));
+            assert_eq!(
+                ledger.snapshot(),
+                charge(8192, 8192, 4096, batch_buffer_bytes, 8)
+            );
             assert_eq!(ledger.inner.state.lock().next_id, 3);
 
             drop(existing);

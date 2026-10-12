@@ -13,23 +13,25 @@ use std::{
         fs::{FileExt, MetadataExt},
         io::AsRawFd,
     },
+    sync::Arc,
 };
 
 use anyhow::{Context, Result, ensure};
 use sha2::{Digest, Sha256};
 
 use crate::{
-    pitr::{LIVE_WAL_V5_LIMITS, RecordedAt, WalBatch, WalV5Limits},
+    pitr::{CanonicalWalEntryStream, LIVE_WAL_V5_LIMITS, RecordedAt, WalBatch, WalV5Limits},
     wal::{DirectBuf, MAX_WAL_FILE_SIZE},
 };
 
 use super::{
+    admission::WalV7ReservationOwner,
     allocator::{WalV7FrontierCursor, WalV7PhysicalAllocator},
     codec::{
         WAL_V7_FRAME_LEN, WAL_V7_HEADER_LEN, WalV7FrameKind, WalV7Frontier, WalV7Header,
         data_fragment_count, decode_frame_structural, encode_data_frames_into,
-        encode_frontier_successor, encode_generation_zero_frontier,
-        encode_logical_batch_with_recorded_at, frame_record_digest,
+        encode_frontier_successor_into, encode_generation_zero_frontier, frame_record_digest,
+        prepare_logical_batch,
     },
     install::{WalV7RuntimeMetadata, WalV7RuntimeSeed},
 };
@@ -61,7 +63,13 @@ pub(crate) struct WalV7LeaderWriter {
     installed_ino: u64,
     allocator: WalV7PhysicalAllocator,
     metadata: WalV7RuntimeMetadata,
+    reservation_owner: Arc<WalV7ReservationOwner>,
     poisoned: bool,
+}
+
+struct WalV7LeaderBuffers {
+    data: DirectBuf,
+    frontier: DirectBuf,
 }
 
 impl WalV7LeaderWriter {
@@ -73,12 +81,16 @@ impl WalV7LeaderWriter {
     /// The caller must provide the current seed: no DATA admission may have
     /// followed its capture on this inode. After an uncertain write or sync,
     /// exclusive recovery must install a fresh image before another writer starts.
+    /// The reservation owner must cover this installed inode; constructing it
+    /// charges the recovered prefix before the writer can open.
     pub(crate) fn new(
         write_file: File,
         sync_file: File,
         seed: WalV7RuntimeSeed,
         max_file_size: u64,
+        reservation_owner: Arc<WalV7ReservationOwner>,
     ) -> Result<Self> {
+        reservation_owner.validate_image(seed.installed_dev, seed.installed_ino)?;
         validate_positional_write_handle(&write_file)
             .context("validate v7 WAL positional write handle")?;
         let write_metadata = write_file
@@ -132,6 +144,7 @@ impl WalV7LeaderWriter {
             installed_ino: seed.installed_ino,
             allocator,
             metadata: seed.metadata,
+            reservation_owner,
             poisoned: false,
         })
     }
@@ -182,32 +195,66 @@ impl WalV7LeaderWriter {
             .map_or(batch.recorded_at, |previous| {
                 previous.max(batch.recorded_at)
             });
-        let logical_batch =
-            encode_logical_batch_with_recorded_at(ticket, batch, recorded_at, limits)?;
-        let fragment_count = data_fragment_count(u64::try_from(logical_batch.len())?)
+        let preparation_buffer_bytes =
+            CanonicalWalEntryStream::preparation_buffer_bytes(batch, limits)?;
+        let preparation_reservation = self
+            .reservation_owner
+            .reserve_preparation_buffer(preparation_buffer_bytes)?;
+        let prepared_batch = prepare_logical_batch(batch, limits)?;
+        let encoded_batch_bytes = u64::try_from(prepared_batch.encoded_len())?;
+        let fragment_count = data_fragment_count(encoded_batch_bytes)
             .context("v7 logical batch has no valid DATA fragment count")?;
         self.allocator.check_data_capacity(fragment_count)?;
         let data_buffer_len = usize::try_from(fragment_count)?
             .checked_mul(WAL_V7_FRAME_LEN)
             .context("v7 DATA buffer length overflows")?;
-        let mut data_buffer = DirectBuf::new(data_buffer_len);
+
+        // Charge every admitted DATA/control/index byte before advancing the
+        // physical allocator or allocating the potentially large frame buffer.
+        // A capacity rejection below drops this token without consuming a WAL
+        // ticket or offset.
+        let mut reservation = self.reservation_owner.reserve_batch(encoded_batch_bytes)?;
+        let logical_batch = prepared_batch.encode_with_recorded_at(ticket, recorded_at)?;
+        drop(preparation_reservation);
 
         // A capacity rejection here is still pre-admission: reserve_data does
         // not advance either cursor unless the full DATA-plus-marker budget
         // fits the segment.
+        // Allocate both charged direct buffers before assigning a ticket or
+        // physical range, so allocation failure cannot consume coordinates.
+        let mut buffers = WalV7LeaderBuffers {
+            data: DirectBuf::new(data_buffer_len),
+            frontier: DirectBuf::new(WAL_V7_FRAME_LEN),
+        };
         let allocation = self.allocator.reserve_data(fragment_count)?;
+        reservation.mark_admitted();
+        // From this point a panic or error must force exclusive recovery: the
+        // physical allocator has consumed the ticket and range.
+        self.poisoned = true;
         let result = self.append_assigned_batch(
             allocation,
             &logical_batch,
             batch.commit_ts,
             recorded_at,
             limits,
-            &mut data_buffer,
+            &mut buffers,
         );
-        if result.is_err() {
-            self.poisoned = true;
+        drop(buffers);
+        drop(logical_batch);
+        let retain_result = reservation.finish_after_io();
+        match (result, retain_result) {
+            (Ok(commit), Ok(())) => {
+                self.poisoned = false;
+                Ok(commit)
+            }
+            (Err(error), Ok(())) => Err(error),
+            (Ok(_), Err(error)) => {
+                Err(anyhow::Error::new(error).context("retire v7 WAL transient buffer reservation"))
+            }
+            (Err(error), Err(retain_error)) => Err(error.context(format!(
+                "also failed to retire v7 transient buffer reservation: {retain_error:#}"
+            ))),
         }
-        result
     }
 
     /// Return the cursor and hash state after the last successful commit.
@@ -242,8 +289,12 @@ impl WalV7LeaderWriter {
         commit_ts: u64,
         recorded_at: RecordedAt,
         limits: WalV5Limits,
-        data_buffer: &mut DirectBuf,
+        buffers: &mut WalV7LeaderBuffers,
     ) -> Result<WalV7LeaderCommit> {
+        let WalV7LeaderBuffers {
+            data: data_buffer,
+            frontier: frontier_buffer,
+        } = buffers;
         let ticket = allocation.ticket();
         let previous_cursor = self.allocator.last_frontier();
         let mut frontier_reservation = None;
@@ -288,7 +339,8 @@ impl WalV7LeaderWriter {
                 previous_frontier_offset: previous_cursor.frame_offset,
                 previous_frontier_digest: previous_cursor.frame_digest,
             };
-            let frontier_frame = encode_frontier_successor(
+            encode_frontier_successor_into(
+                frontier_buffer.as_mut_slice(),
                 frontier,
                 previous_cursor.frontier,
                 previous_cursor.frame_offset,
@@ -296,14 +348,13 @@ impl WalV7LeaderWriter {
                 reservation.frame_offset(),
                 self.header_digest,
             )?;
-
-            let mut frontier_buffer = DirectBuf::new(WAL_V7_FRAME_LEN);
-            frontier_buffer.as_mut_slice()[..WAL_V7_FRAME_LEN].copy_from_slice(&frontier_frame);
             frontier_buffer.set_len(WAL_V7_FRAME_LEN);
+            let frontier_bytes = frontier_buffer.initialized_slice(0, WAL_V7_FRAME_LEN);
+            let frontier_digest = frame_record_digest(frontier_bytes)?;
 
             let mut physical_hasher = self.metadata.physical_hasher.clone();
             physical_hasher.update(data_buffer.initialized_slice(0, encoded_len));
-            physical_hasher.update(frontier_buffer.initialized_slice(0, WAL_V7_FRAME_LEN));
+            physical_hasher.update(frontier_bytes);
             let append_offset = reservation
                 .frame_offset()
                 .checked_add(WAL_V7_FRAME_LEN as u64)
@@ -319,6 +370,8 @@ impl WalV7LeaderWriter {
                 allocation.frame_range().start,
             )
             .context("write v7 Leader DATA frames")?;
+            #[cfg(feature = "chaos-testing")]
+            crate::chaos::failpoint::fail_point!("wal.v7.leader.after_data_write");
             write_aligned_once(
                 &self.write_file,
                 frontier_buffer.initialized_slice(0, WAL_V7_FRAME_LEN),
@@ -330,7 +383,7 @@ impl WalV7LeaderWriter {
             let frontier_cursor = WalV7FrontierCursor {
                 frontier,
                 frame_offset: reservation.frame_offset(),
-                frame_digest: frame_record_digest(&frontier_frame)?,
+                frame_digest: frontier_digest,
             };
             self.allocator.complete_frontier_sync(
                 frontier_reservation
@@ -499,7 +552,7 @@ fn fdatasync_once(file: &File) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, fs::OpenOptions, os::unix::fs::OpenOptionsExt, path::Path};
+    use std::{fs, fs::OpenOptions, os::unix::fs::OpenOptionsExt, path::Path, sync::Arc};
 
     use super::*;
     use crate::{
@@ -508,6 +561,10 @@ mod tests {
             manifest::ActiveBoundary,
         },
         wal::v7::{
+            admission::{
+                WalV7ReservationError, WalV7ReservationOwner, WalV7ResourceCharge,
+                WalV7ResourceLedger, WalV7ResourceLimits,
+            },
             codec::WAL_V7_DATA_FRAGMENT_PAYLOAD_CAPACITY,
             install::{WalV7InstalledRecovery, recover_and_install_active},
             recovery::WalV7RecoveryAuthority,
@@ -565,6 +622,21 @@ mod tests {
             .open(path)?)
     }
 
+    fn resource_limits() -> WalV7ResourceLimits {
+        WalV7ResourceLimits {
+            max_logical_wal_bytes: u64::MAX,
+            max_source_spool_bytes: u64::MAX,
+            max_recovery_workspace_bytes: u64::MAX,
+            max_buffer_memory_bytes: u64::MAX,
+            max_seal_index_bytes: u64::MAX,
+        }
+    }
+
+    fn resource_owner(installed: &WalV7InstalledRecovery) -> Result<Arc<WalV7ReservationOwner>> {
+        let ledger = WalV7ResourceLedger::new(resource_limits())?;
+        Ok(Arc::new(WalV7ReservationOwner::new(ledger, installed)?))
+    }
+
     fn open_writer(
         path: &Path,
         installed: &WalV7InstalledRecovery,
@@ -575,6 +647,7 @@ mod tests {
             File::open(path)?,
             installed.runtime_seed()?,
             max_file_size,
+            resource_owner(installed)?,
         )
     }
 
@@ -684,6 +757,205 @@ mod tests {
     }
 
     #[test]
+    fn leader_resource_rejection_preserves_image_and_admission_state() -> Result<()> {
+        let request = batch(10, 100, 2 * WAL_V7_DATA_FRAGMENT_PAYLOAD_CAPACITY);
+        let required = WalV7ResourceCharge::for_batch(u64::try_from(
+            prepare_logical_batch(&request, LIVE_WAL_V5_LIMITS)?.encoded_len(),
+        )?)?;
+        for (limits, expected_error) in [
+            (
+                WalV7ResourceLimits {
+                    max_logical_wal_bytes: required.logical_wal_bytes - 1,
+                    ..resource_limits()
+                },
+                WalV7ReservationError::LogicalWalLimit,
+            ),
+            (
+                WalV7ResourceLimits {
+                    max_source_spool_bytes: required.source_spool_bytes - 1,
+                    max_recovery_workspace_bytes: 0,
+                    ..resource_limits()
+                },
+                WalV7ReservationError::SourceSpoolLimit,
+            ),
+            (
+                WalV7ResourceLimits {
+                    max_buffer_memory_bytes: required.buffer_memory_bytes - 1,
+                    ..resource_limits()
+                },
+                WalV7ReservationError::BufferMemoryLimit,
+            ),
+            (
+                WalV7ResourceLimits {
+                    max_seal_index_bytes: 0,
+                    ..resource_limits()
+                },
+                WalV7ReservationError::SealIndexLimit,
+            ),
+        ] {
+            let directory = tempfile::tempdir()?;
+            let path = directory.path().join("active.wal");
+            let installed = install_empty(&path)?;
+            let original_image = fs::read(&path)?;
+            let ledger = WalV7ResourceLedger::new(limits)?;
+            let owner = Arc::new(WalV7ReservationOwner::new(ledger, &installed)?);
+            let mut writer = WalV7LeaderWriter::new(
+                write_handle(&path)?,
+                File::open(&path)?,
+                installed.runtime_seed()?,
+                MAX_WAL_FILE_SIZE,
+                Arc::clone(&owner),
+            )?;
+
+            let error = writer
+                .append_batch(&request, LIVE_WAL_V5_LIMITS)
+                .expect_err("the requested resource exceeds its cap");
+            assert_eq!(
+                error.downcast_ref::<WalV7ReservationError>(),
+                Some(&expected_error)
+            );
+            assert_eq!(owner.snapshot(), WalV7ResourceCharge::default());
+            assert_eq!(fs::read(&path)?, original_image);
+            assert_eq!(writer.runtime_seed()?.next_ticket, 0);
+            assert_eq!(
+                writer.runtime_seed()?.append_offset,
+                installed.append_offset
+            );
+            if expected_error != WalV7ReservationError::SealIndexLimit {
+                assert_eq!(
+                    writer
+                        .append_batch(&batch(10, 100, 4), LIVE_WAL_V5_LIMITS)?
+                        .ticket,
+                    0
+                );
+                assert_eq!(owner.snapshot().buffer_memory_bytes, 0);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn leader_owner_survives_handle_replacement_and_recovery_rebinds_exact_charge() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("active.wal");
+        let installed = install_empty(&path)?;
+        let request = batch(10, 100, 4);
+        let mut expected = WalV7ResourceCharge::for_batch(u64::try_from(
+            prepare_logical_batch(&request, LIVE_WAL_V5_LIMITS)?.encoded_len(),
+        )?)?;
+        let ledger = WalV7ResourceLedger::new(WalV7ResourceLimits {
+            max_logical_wal_bytes: expected.logical_wal_bytes,
+            max_source_spool_bytes: expected.source_spool_bytes,
+            max_recovery_workspace_bytes: 0,
+            max_buffer_memory_bytes: expected.buffer_memory_bytes,
+            max_seal_index_bytes: expected.seal_index_bytes,
+        })?;
+        let owner = Arc::new(WalV7ReservationOwner::new(ledger.clone(), &installed)?);
+        let mut writer = WalV7LeaderWriter::new(
+            write_handle(&path)?,
+            File::open(&path)?,
+            installed.runtime_seed()?,
+            MAX_WAL_FILE_SIZE,
+            Arc::clone(&owner),
+        )?;
+        writer.append_batch(&request, LIVE_WAL_V5_LIMITS)?;
+        expected.buffer_memory_bytes = 0;
+        let seed = writer.runtime_seed()?;
+        drop(writer);
+        assert_eq!(ledger.snapshot(), expected);
+        let mut reopened = WalV7LeaderWriter::new(
+            write_handle(&path)?,
+            File::open(&path)?,
+            seed,
+            MAX_WAL_FILE_SIZE,
+            Arc::clone(&owner),
+        )?;
+        let error = reopened
+            .append_batch(&batch(20, 101, 4), LIVE_WAL_V5_LIMITS)
+            .expect_err("retained prefix fills the WAL cap");
+        assert_eq!(
+            error.downcast_ref::<WalV7ReservationError>(),
+            Some(&WalV7ReservationError::LogicalWalLimit)
+        );
+        assert_eq!(ledger.snapshot(), expected);
+        drop(reopened);
+
+        let recovered = recover(&path, installed.active_boundary)?;
+        assert!(
+            WalV7LeaderWriter::new(
+                write_handle(&path)?,
+                File::open(&path)?,
+                recovered.runtime_seed()?,
+                MAX_WAL_FILE_SIZE,
+                Arc::clone(&owner),
+            )
+            .is_err()
+        );
+        drop(owner);
+        assert_eq!(ledger.snapshot(), WalV7ResourceCharge::default());
+        let replacement = Arc::new(WalV7ReservationOwner::new(ledger.clone(), &recovered)?);
+        assert_eq!(ledger.snapshot(), expected);
+        let writer = WalV7LeaderWriter::new(
+            write_handle(&path)?,
+            File::open(&path)?,
+            recovered.runtime_seed()?,
+            MAX_WAL_FILE_SIZE,
+            replacement,
+        )?;
+        assert_eq!(writer.runtime_seed()?.next_ticket, 1);
+        Ok(())
+    }
+
+    #[cfg(feature = "chaos-testing")]
+    #[test]
+    fn failpoint_leader_unwind_retains_persistent_charge_after_data_write() -> Result<()> {
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+
+        use crate::chaos::failpoint::{self, FailScenario};
+
+        let scenario = FailScenario::setup();
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("active.wal");
+        let installed = install_empty(&path)?;
+        let ledger = WalV7ResourceLedger::new(resource_limits())?;
+        let owner = Arc::new(WalV7ReservationOwner::new(ledger.clone(), &installed)?);
+        let mut writer = WalV7LeaderWriter::new(
+            write_handle(&path)?,
+            File::open(&path)?,
+            installed.runtime_seed()?,
+            MAX_WAL_FILE_SIZE,
+            Arc::clone(&owner),
+        )?;
+        let request = batch(10, 100, 4);
+        let mut expected = WalV7ResourceCharge::for_batch(u64::try_from(
+            prepare_logical_batch(&request, LIVE_WAL_V5_LIMITS)?.encoded_len(),
+        )?)?;
+        failpoint::cfg("wal.v7.leader.after_data_write", "panic")
+            .expect("arm v7 Leader unwind failpoint");
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            writer.append_batch(&request, LIVE_WAL_V5_LIMITS)
+        }));
+        scenario.teardown();
+        assert!(result.is_err());
+        expected.buffer_memory_bytes = 0;
+        assert_eq!(ledger.snapshot(), expected);
+        assert!(fs::metadata(&path)?.len() > installed.image_len);
+        assert!(writer.runtime_seed().is_err());
+        let uncertain_image = fs::read(&path)?;
+        assert!(
+            writer
+                .append_batch(&batch(20, 101, 4), LIVE_WAL_V5_LIMITS)
+                .is_err()
+        );
+        assert_eq!(fs::read(&path)?, uncertain_image);
+        drop(writer);
+        assert_eq!(ledger.snapshot(), expected);
+        drop(owner);
+        assert_eq!(ledger.snapshot(), WalV7ResourceCharge::default());
+        Ok(())
+    }
+
+    #[test]
     fn leader_sync_failure_poison_prevents_further_writes() -> Result<()> {
         let directory = tempfile::tempdir()?;
         let path = directory.path().join("active.wal");
@@ -698,6 +970,7 @@ mod tests {
             sync_handle,
             installed.runtime_seed()?,
             MAX_WAL_FILE_SIZE,
+            resource_owner(&installed)?,
         )?;
         let previous = writer.allocator.last_frontier();
 
@@ -734,6 +1007,7 @@ mod tests {
             stale_sync,
             installed.runtime_seed()?,
             MAX_WAL_FILE_SIZE,
+            resource_owner(&installed)?,
         );
         let error = result.err().expect("stale recovery descriptors must fail");
         assert!(error.to_string().contains("installed recovery inode"));
@@ -760,6 +1034,7 @@ mod tests {
             File::open(&path)?,
             installed.runtime_seed()?,
             MAX_WAL_FILE_SIZE,
+            resource_owner(&installed)?,
         );
         assert!(result.is_err(), "O_APPEND ignores positional write offsets");
         assert_eq!(fs::read(&path)?, original_image);
