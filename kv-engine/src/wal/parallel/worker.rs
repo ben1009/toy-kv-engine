@@ -615,11 +615,13 @@ impl<B> From<Vec<WriteBuffer<B>>> for WriteGroupBuffers<B> {
     }
 }
 
-/// A ticket-ordered group whose file range has already been reserved and
-/// preallocated by the packer.
+/// A ticket-ordered group whose physical allocation span is accounted for by
+/// DATA writes and any explicitly reserved FRONTIER frames.
 pub(crate) struct WriteGroup<B = DirectBuf> {
     tickets: Range<u64>,
     writes: WriteGroupBuffers<B>,
+    allocation_range: Range<u64>,
+    write_bytes: u64,
 }
 
 impl<B> WriteGroup<B> {
@@ -627,36 +629,111 @@ impl<B> WriteGroup<B> {
         tickets: Range<u64>,
         writes: impl Into<WriteGroupBuffers<B>>,
     ) -> Result<Self, WorkerError> {
+        let writes = writes.into();
         if tickets.start >= tickets.end {
             return Err(WorkerError::InvalidTicketRange);
         }
-        let writes = writes.into();
         if writes.is_empty() {
             return Err(WorkerError::EmptyGroup);
         }
 
-        let mut expected_offset = writes
+        let first_offset = writes
             .first()
             .expect("nonempty group has first write")
             .file_offset;
+        let last_write = writes.last().expect("nonempty group has last write");
+        let allocation_end = last_write
+            .file_offset
+            .checked_add(last_write.write_len as u64)
+            .ok_or(WorkerError::InvalidWriteRange)?;
+        Self::new_with_frontiers(tickets, writes, first_offset..allocation_end, &[])
+    }
+
+    /// Build a group whose reserved physical span is tiled by DATA writes and
+    /// the listed FRONTIER frames. The offsets must be the complete reserved
+    /// marker list for this span. Marker writes are completed separately by the
+    /// durability coordinator; they are included here to validate physical
+    /// ordering and advance the worker's allocation cursor across the gap.
+    pub(crate) fn new_with_frontiers(
+        tickets: Range<u64>,
+        writes: impl Into<WriteGroupBuffers<B>>,
+        allocation_range: Range<u64>,
+        frontier_offsets: &[u64],
+    ) -> Result<Self, WorkerError> {
+        let writes = writes.into();
+        if tickets.start >= tickets.end {
+            return Err(WorkerError::InvalidTicketRange);
+        }
+        if writes.is_empty() {
+            return Err(WorkerError::EmptyGroup);
+        }
+        if allocation_range.start >= allocation_range.end
+            || !allocation_range
+                .start
+                .is_multiple_of(DIRECT_IO_ALIGNMENT as u64)
+            || !allocation_range
+                .end
+                .is_multiple_of(DIRECT_IO_ALIGNMENT as u64)
+            || allocation_range.end > MAX_WAL_FILE_SIZE
+        {
+            return Err(WorkerError::InvalidWriteRange);
+        }
+
+        let mut expected_offset = allocation_range.start;
+        let mut frontier_index = 0;
+        let mut write_bytes = 0_u64;
         for write in writes.iter() {
             if write.write_len == 0
                 || write.write_len > i32::MAX as usize
                 || !write.write_len.is_multiple_of(DIRECT_IO_ALIGNMENT)
                 || !write.file_offset.is_multiple_of(DIRECT_IO_ALIGNMENT as u64)
-                || write.file_offset != expected_offset
             {
                 return Err(WorkerError::InvalidWriteRange);
             }
-            expected_offset = expected_offset
-                .checked_add(write.write_len as u64)
-                .ok_or(WorkerError::InvalidWriteRange)?;
-            if expected_offset > MAX_WAL_FILE_SIZE {
+            while frontier_index < frontier_offsets.len()
+                && frontier_offsets[frontier_index] < write.file_offset
+            {
+                if frontier_offsets[frontier_index] != expected_offset {
+                    return Err(WorkerError::InvalidWriteRange);
+                }
+                expected_offset = expected_offset
+                    .checked_add(DIRECT_IO_ALIGNMENT as u64)
+                    .ok_or(WorkerError::InvalidWriteRange)?;
+                frontier_index += 1;
+            }
+            if write.file_offset != expected_offset {
                 return Err(WorkerError::InvalidWriteRange);
             }
+            expected_offset = write
+                .file_offset
+                .checked_add(write.write_len as u64)
+                .ok_or(WorkerError::InvalidWriteRange)?;
+            if expected_offset > allocation_range.end || expected_offset > MAX_WAL_FILE_SIZE {
+                return Err(WorkerError::InvalidWriteRange);
+            }
+            write_bytes = write_bytes
+                .checked_add(write.write_len as u64)
+                .ok_or(WorkerError::InvalidWriteRange)?;
+        }
+        while frontier_index < frontier_offsets.len() {
+            if frontier_offsets[frontier_index] != expected_offset {
+                return Err(WorkerError::InvalidWriteRange);
+            }
+            expected_offset = expected_offset
+                .checked_add(DIRECT_IO_ALIGNMENT as u64)
+                .ok_or(WorkerError::InvalidWriteRange)?;
+            frontier_index += 1;
+        }
+        if expected_offset != allocation_range.end {
+            return Err(WorkerError::InvalidWriteRange);
         }
 
-        Ok(Self { tickets, writes })
+        Ok(Self {
+            tickets,
+            writes,
+            allocation_range,
+            write_bytes,
+        })
     }
 }
 
@@ -720,6 +797,7 @@ struct OwnedWrite<B> {
 struct GroupState {
     tickets: Range<u64>,
     file_range: Range<u64>,
+    write_bytes: u64,
     request_ids: Range<u64>,
     next_ready_index: usize,
     remaining_writes: usize,
@@ -822,22 +900,14 @@ impl<B: WorkerBuffer> WorkerCore<B> {
             return Err(WorkerError::TooManyGroups);
         }
 
-        let file_start = group
-            .writes
-            .first()
-            .expect("validated group has writes")
-            .file_offset;
+        let file_start = group.allocation_range.start;
         if self
             .next_file_offset
             .is_some_and(|next_file_offset| file_start != next_file_offset)
         {
             return Err(WorkerError::InvalidWriteRange);
         }
-        let last_write = group.writes.last().expect("validated group has writes");
-        let file_end = last_write
-            .file_offset
-            .checked_add(last_write.write_len as u64)
-            .ok_or(WorkerError::InvalidWriteRange)?;
+        let file_end = group.allocation_range.end;
 
         let group_id = GroupId(self.next_group_id);
         let next_group_id = self
@@ -885,7 +955,8 @@ impl<B: WorkerBuffer> WorkerCore<B> {
             group_id,
             GroupState {
                 tickets: group.tickets,
-                file_range: file_start..file_end,
+                file_range: group.allocation_range,
+                write_bytes: group.write_bytes,
                 remaining_writes: usize::try_from(request_count)
                     .expect("request count came from a usize"),
                 request_ids,
@@ -1162,7 +1233,7 @@ impl<B: WorkerBuffer> WorkerCore<B> {
                 .remove(&group_id)
                 .expect("completed group exists");
             let write_count = group.request_ids.end - group.request_ids.start;
-            let write_bytes = group.file_range.end - group.file_range.start;
+            let write_bytes = group.write_bytes;
             self.group_order.retain(|queued_id| *queued_id != group_id);
             for request_id in group.request_ids.map(RequestId) {
                 let write = self.writes.remove(&request_id);
@@ -1285,7 +1356,7 @@ impl<B: WorkerBuffer> WorkerCore<B> {
                     group_id: group_id.0,
                     tickets: group.tickets.clone(),
                     write_count: group.request_ids.end - group.request_ids.start,
-                    write_bytes: group.file_range.end - group.file_range.start,
+                    write_bytes: group.write_bytes,
                     error: Some(reason.to_owned()),
                 })
             })
@@ -2450,6 +2521,71 @@ mod tests {
         }
         assert!(core.is_idle());
         assert_eq!(drops.load(Ordering::Acquire), 4);
+    }
+
+    #[test]
+    fn worker_accepts_data_groups_split_by_multiple_frontier_frames() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut core = WorkerCore::new();
+        core.enqueue(make_group(0..1, 4096, 1, 4096, &drops))
+            .expect("enqueue the first DATA ticket");
+
+        let split_group = WriteGroup::new_with_frontiers(
+            1..3,
+            vec![
+                WriteBuffer::new(DropProbe::new(4096, Arc::clone(&drops)), 8192, 4096),
+                WriteBuffer::new(DropProbe::new(4096, Arc::clone(&drops)), 20_480, 4096),
+            ],
+            8192..24_576,
+            &[12_288, 16_384],
+        )
+        .expect("build DATA group across two reserved FRONTIER frames");
+        core.enqueue(split_group)
+            .expect("enqueue DATA group after the prior physical allocation");
+
+        let requests = submitted_ids(&mut core, 256);
+        assert_eq!(requests.len(), 3);
+
+        let mut results = Vec::new();
+        for request_id in requests.into_iter().rev() {
+            for event in core
+                .complete_write(request_id, 4096)
+                .expect("complete full-length DATA write")
+            {
+                match event {
+                    WorkerEvent::BufferRetired(buffer) => drop(buffer),
+                    WorkerEvent::GroupFinished(result) => results.push(result),
+                }
+            }
+        }
+        results.sort_by_key(|result| result.tickets.start);
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].tickets, 0..1);
+        assert_eq!(results[0].write_bytes, 4096);
+        assert_eq!(results[1].tickets, 1..3);
+        assert_eq!(results[1].write_count, 2);
+        assert_eq!(results[1].write_bytes, 8192);
+        assert_eq!(core.next_file_offset, Some(24_576));
+        assert!(core.is_idle());
+        assert_eq!(drops.load(Ordering::Acquire), 3);
+    }
+
+    #[test]
+    fn worker_rejects_unreserved_frontier_gaps_in_v7_group() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let result = WriteGroup::new_with_frontiers(
+            0..2,
+            vec![
+                WriteBuffer::new(DropProbe::new(4096, Arc::clone(&drops)), 4096, 4096),
+                WriteBuffer::new(DropProbe::new(4096, Arc::clone(&drops)), 16_384, 4096),
+            ],
+            4096..20_480,
+            &[12_288],
+        );
+
+        assert!(matches!(result, Err(super::WorkerError::InvalidWriteRange)));
+        assert_eq!(drops.load(Ordering::Acquire), 2);
     }
 
     #[cfg(feature = "bench")]
