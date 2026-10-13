@@ -17,7 +17,8 @@ DATA buffers. Exact-cap recovery and continued append cover coalesced groups.
 Limit rejection is checked to leave ticket/offset state and WAL bytes unchanged.
 Installed Active recovery now computes its retained WAL and seal-index charge
 from the normalized image, and the persistence model reserves that exact charge
-before resuming writes. Production WAL-open and live admission wiring remain.
+before resuming writes. Production manifest-authority WAL selection and live
+admission wiring remain.
 Live segment lifecycle reconstruction is now wired before PITR runtime attach.
 Reconciliation updates the recovered bookkeeping after successful manifest
 sync, releases reclaimed source charges, and consumes completed sealing's
@@ -55,8 +56,18 @@ DATA/FRONTIER/index and encoded/frame-buffer
 charges before materializing the logical batch or advancing the allocator. It
 retains persistent charges through errors and unwinds across writer-handle
 replacement until the lifecycle releases the owner after cleanup. Fresh-inode
-recovery creates a replacement owner from the installed prefix. Engine WAL-open and
-manifest integration still need to install and retain that owner. The serial Leader
+recovery creates a replacement owner from the installed prefix. An installed
+Active image can now be attached to a recovered `MemTable`: its point and range
+operations replay, ticket and recorded-time state resume, and ordinary MVCC
+point writes use the v7 batch adapter. The retained seal index advances in
+ticket order with each resumed append, and the image-bound reservation owner
+remains reachable for segment lifecycle retention. MVCC poisons its publication
+sequencer when a v7 append fails after admission, including write/sync or
+post-sync cursor-publication failures; pre-admission rejections remain retryable.
+An unwind guard also poisons an outstanding v7 commit reservation on panic,
+so a caller that catches the panic cannot leave commit capture waiting forever.
+Engine manifest-authority selection, shared-ledger reconstruction, and retention
+of owners across durable source cleanup still remain. The serial Leader
 classifies DATA-plus-FRONTIER segment exhaustion before the persistent batch
 reservation or coordinate assignment. It may first reserve temporary canonicalization
 scratch, which is released when preparation or capacity admission fails. Batches that
@@ -148,9 +159,17 @@ an io_uring ring. Whole-WAL sync/close wait for in-flight appends and inspect
 writer poison, including after unwind; later failures preserve success for
 earlier durable ticket barriers. Focused tests cover resumed ticket state,
 recovery, pre-admission capacity rejection, concurrent sync/close, caught
-panics, and durable-prefix preservation after sync failure.
-Production engine WAL-open selection, live resource-ledger lifecycle ownership,
-Parallel admission, and the v6 to v7 transition remain unconnected.
+panics, and durable-prefix preservation after sync failure. `MemTable` can now
+attach an already installed Active image, replay its recovered entries, route
+ordinary MVCC point writes through the v7 batch adapter, and extend its seal
+index in ticket order while retaining the image-bound reservation owner.
+MemTable tests cover replay and reopen, resumed MVCC tickets and seal indexes,
+retryable validation/capacity rejection, and returned errors or caught panics
+during v7 sync across all seven MVCC write paths. Uncertain append failures
+poison MVCC before returning or unwinding.
+Production manifest-authority selection and shared-ledger reconstruction, owner retention
+through durable source cleanup, Parallel admission, and the v6 to v7 transition
+remain unconnected.
 
 **Last updated:** 2026-10-13
 

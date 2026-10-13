@@ -583,6 +583,10 @@ fn validate_seed_frontier(
 }
 
 fn fdatasync_once(file: &File) -> io::Result<()> {
+    #[cfg(feature = "chaos-testing")]
+    crate::chaos::failpoint::fail_point!("wal.v7.leader.fdatasync", |_| Err(io::Error::other(
+        "injected v7 WAL sync failure"
+    )));
     loop {
         // SAFETY: the file descriptor is live and owned by `file`.
         let result = unsafe { libc::fdatasync(file.as_raw_fd()) };

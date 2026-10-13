@@ -13,7 +13,6 @@ use anyhow::{Context, Ok, Result};
 use bytes::Bytes;
 use crossbeam_skiplist::SkipMap;
 use ouroboros::self_referencing;
-#[cfg(feature = "bench")]
 use parking_lot::Mutex;
 
 use crate::{
@@ -25,6 +24,10 @@ use crate::{
     },
     table::{SsTableBuilder, bloom::IncrementalBloom},
     vlog::{KvKind, ValueLog, ValuePointer},
+    wal::v7::{
+        admission::WalV7ReservationOwner, install::WalV7InstalledRecovery,
+        leader::WalV7LeaderWriter,
+    },
     wal::{Wal, WalIoMode},
 };
 
@@ -1023,6 +1026,8 @@ pub struct MemTable {
     map: Arc<SkipMap<Bytes, Bytes>>,
     wal: Option<Wal>,
     wal_path: Option<PathBuf>,
+    wal_v7_reservation_owner: Option<Arc<WalV7ReservationOwner>>,
+    wal_v7_seal_index: Option<Mutex<Vec<u64>>>,
     id: usize,
     approximate_size: Arc<AtomicUsize>,
     /// One-past the highest ticket assigned by WAL writes in this memtable.
@@ -1064,6 +1069,8 @@ impl MemTable {
             map: Arc::new(SkipMap::new()),
             wal: None,
             wal_path: None,
+            wal_v7_reservation_owner: None,
+            wal_v7_seal_index: None,
             id,
             approximate_size: Arc::new(AtomicUsize::new(0)),
             last_ticket: AtomicU64::new(0),
@@ -1185,6 +1192,110 @@ impl MemTable {
         ret.rebuild_bloom();
 
         Ok((ret, batch.max_ts))
+    }
+
+    /// Attach an installed, authority-verified v7 Active WAL to a recovered
+    /// memtable and resume its serial Leader writer.
+    ///
+    /// The caller must recover and durably install the Active image before
+    /// calling this method. It must also retain a clone of `reservation_owner`
+    /// for the source segment lifecycle until that WAL image is durably
+    /// reclaimed.
+    #[allow(dead_code)]
+    pub(crate) fn recover_from_v7_active(
+        id: usize,
+        vlog_enabled: bool,
+        path: impl AsRef<Path>,
+        installed: WalV7InstalledRecovery,
+        max_file_size: u64,
+        reservation_owner: Arc<WalV7ReservationOwner>,
+    ) -> Result<(Self, u64)> {
+        let path = path.as_ref().to_path_buf();
+        let seed = installed.runtime_seed()?;
+        reservation_owner.validate_image(seed.installed_dev, seed.installed_ino)?;
+        let next_ticket = installed.next_ticket;
+        let max_commit_ts = installed.active_boundary.last_commit_ts;
+        let recovered_recorded_at = installed.last_recorded_at;
+
+        let mut ret = Self::create(id, vlog_enabled);
+        for batch in &installed.batches {
+            let mut range_ordinal = 0_u32;
+            for entry in &batch.entries {
+                match entry {
+                    crate::pitr::WalEntry::Put { key, value } => {
+                        let internal_key =
+                            Bytes::from(crate::key::encode_internal_key(key, batch.commit_ts));
+                        let value = Bytes::copy_from_slice(value);
+                        ret.approximate_size.fetch_add(
+                            internal_key.len() + value.len(),
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
+                        ret.map.insert(internal_key, value);
+                    }
+                    crate::pitr::WalEntry::PointDelete { key } => {
+                        let internal_key =
+                            Bytes::from(crate::key::encode_internal_key(key, batch.commit_ts));
+                        let value = Bytes::from_static(&[KvKind::Tombstone as u8]);
+                        ret.approximate_size.fetch_add(
+                            internal_key.len() + value.len(),
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
+                        ret.map.insert(internal_key, value);
+                    }
+                    crate::pitr::WalEntry::RangeDelete { start, end } => {
+                        ret.range_tombstones.add(
+                            crate::range_tombstone::RangeTombstone {
+                                start: Bytes::copy_from_slice(start),
+                                end: Bytes::copy_from_slice(end),
+                                ts: batch.commit_ts,
+                            },
+                            range_ordinal,
+                        );
+                        range_ordinal = range_ordinal
+                            .checked_add(1)
+                            .context("v7 WAL range-tombstone ordinal overflows")?;
+                    }
+                }
+            }
+        }
+
+        let write_file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .with_context(|| format!("open installed v7 Active WAL {}", path.display()))?;
+        let sync_file = write_file
+            .try_clone()
+            .context("clone installed v7 Active WAL sync handle")?;
+        let writer = WalV7LeaderWriter::new(
+            write_file,
+            sync_file,
+            seed,
+            max_file_size,
+            Arc::clone(&reservation_owner),
+        )?;
+        ret.wal = Some(Wal::from_v7_leader(writer)?);
+        ret.wal_path = Some(path);
+        ret.wal_v7_reservation_owner = Some(reservation_owner);
+        ret.wal_v7_seal_index = Some(Mutex::new(installed.seal_index));
+        ret.last_ticket
+            .store(next_ticket, std::sync::atomic::Ordering::Release);
+        ret.recovered_recorded_at = recovered_recorded_at;
+        ret.rebuild_bloom();
+
+        Ok((ret, max_commit_ts))
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn wal_v7_reservation_owner(&self) -> Option<Arc<WalV7ReservationOwner>> {
+        self.wal_v7_reservation_owner.clone()
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn wal_v7_seal_index(&self) -> Option<Vec<u64>> {
+        self.wal_v7_seal_index
+            .as_ref()
+            .map(|seal_index| seal_index.lock().clone())
     }
 
     pub(crate) fn recovered_recorded_at(&self) -> Option<crate::pitr::RecordedAt> {
@@ -1609,14 +1720,39 @@ impl MemTable {
             .wal
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("PITR WAL is not configured"))?;
+        let mut v7_seal_index = self
+            .wal_v7_seal_index
+            .as_ref()
+            .map(|seal_index| seal_index.lock());
+        if let Some(seal_index) = &mut v7_seal_index {
+            anyhow::ensure!(wal.is_v7(), "v7 seal index is attached to a non-v7 WAL");
+            anyhow::ensure!(
+                u64::try_from(seal_index.len())? == wal.next_ticket(),
+                "v7 seal index does not match the WAL next-ticket cursor"
+            );
+            seal_index
+                .try_reserve(1)
+                .context("reserve v7 WAL seal-index entry")?;
+        } else {
+            anyhow::ensure!(!wal.is_v7(), "v7 WAL has no retained seal index");
+        }
         #[cfg(feature = "bench")]
         let started = Instant::now();
         #[cfg(feature = "bench")]
         let profile = self.write_profile.load();
-        #[cfg(feature = "bench")]
-        let ticket = wal.put_v5_batch(batch, limits, Some(&profile))?;
-        #[cfg(not(feature = "bench"))]
-        let ticket = wal.put_v5_batch(batch, limits, None)?;
+        let ticket = if let Some(seal_index) = &mut v7_seal_index {
+            let (ticket, first_data_offset) = wal.put_v7_batch_with_index(batch, limits)?;
+            seal_index.push(first_data_offset);
+            self.last_ticket
+                .fetch_max(ticket + 1, std::sync::atomic::Ordering::Release);
+            ticket
+        } else {
+            #[cfg(feature = "bench")]
+            let ticket = wal.put_v5_batch(batch, limits, Some(&profile))?;
+            #[cfg(not(feature = "bench"))]
+            let ticket = wal.put_v5_batch(batch, limits, None)?;
+            ticket
+        };
         #[cfg(feature = "bench")]
         self.write_profile.load().wal_write_ns.fetch_add(
             started.elapsed().as_nanos() as u64,
@@ -1708,6 +1844,18 @@ impl MemTable {
 
     pub(crate) fn uses_wal_v5(&self) -> bool {
         self.wal.as_ref().is_some_and(|wal| wal.is_v5())
+    }
+
+    pub(crate) fn uses_pitr_batch_wal(&self) -> bool {
+        self.wal.as_ref().is_some_and(Wal::is_pitr)
+    }
+
+    pub(crate) fn uses_v7_wal(&self) -> bool {
+        self.wal.as_ref().is_some_and(Wal::is_v7)
+    }
+
+    pub(crate) fn v7_wal_requires_recovery(&self) -> bool {
+        self.wal.as_ref().is_some_and(Wal::v7_requires_recovery)
     }
 
     /// Release the io_uring ring of a drained, immutable leader WAL.
@@ -2872,9 +3020,389 @@ impl MemTableIterator {
 
 #[cfg(test)]
 mod tests {
+    use std::{fs, path::Path, sync::Arc};
+
+    use anyhow::Result;
     use bytes::Bytes;
 
     use super::MemTable;
+    use crate::{
+        mvcc::{BatchEntryKind, LsmMvccInner},
+        pitr::{
+            ArchiveEpochId, ChainAnchor, LIVE_WAL_V5_LIMITS, RecordedAt, SegmentId, TimelineId,
+            WalBatch, WalEntry, manifest::ActiveBoundary,
+        },
+        wal::v7::{
+            admission::{WalV7ReservationOwner, WalV7ResourceLedger, WalV7ResourceLimits},
+            codec::{
+                WAL_V7_FRAME_LEN, WAL_V7_HEADER_LEN, WalV7Header, encode_generation_zero_frontier,
+            },
+            install::{WalV7InstalledRecovery, recover_and_install_active},
+            recovery::WalV7RecoveryAuthority,
+        },
+    };
+
+    const TEST_V7_MAX_FILE_SIZE: u64 = 1 << 30;
+
+    fn recover_v7(path: &Path, anchor: ActiveBoundary) -> Result<WalV7InstalledRecovery> {
+        Ok(recover_and_install_active(
+            path,
+            WalV7RecoveryAuthority::Active {
+                predecessor: ChainAnchor::Genesis {
+                    archive_epoch_id: ArchiveEpochId(anchor.archive_epoch_id),
+                },
+                durable_anchors: vec![anchor],
+            },
+        )?
+        .installed)
+    }
+
+    fn install_empty_v7(path: &Path) -> Result<WalV7InstalledRecovery> {
+        let header = WalV7Header {
+            timeline_id: TimelineId([1; 16]),
+            archive_epoch_id: ArchiveEpochId([2; 16]),
+            segment_id: SegmentId(7),
+            predecessor: ChainAnchor::Genesis {
+                archive_epoch_id: ArchiveEpochId([2; 16]),
+            },
+            incarnation: [3; 16],
+        };
+        let mut image = header.encode()?.to_vec();
+        image.extend_from_slice(&encode_generation_zero_frontier(header.digest()?)?);
+        fs::write(path, image)?;
+        recover_v7(
+            path,
+            ActiveBoundary {
+                timeline_id: header.timeline_id.0,
+                archive_epoch_id: header.archive_epoch_id.0,
+                segment_id: header.segment_id.0,
+                incarnation: header.incarnation,
+                ticket_end: 0,
+                durable_end: WAL_V7_HEADER_LEN as u64,
+                last_commit_ts: 0,
+                prefix_digest: header.digest()?,
+            },
+        )
+    }
+
+    fn attach_v7(
+        path: &Path,
+        installed: WalV7InstalledRecovery,
+        max_file_size: u64,
+    ) -> Result<(MemTable, u64)> {
+        let ledger = WalV7ResourceLedger::new(WalV7ResourceLimits {
+            max_logical_wal_bytes: u64::MAX,
+            max_source_spool_bytes: u64::MAX,
+            max_recovery_workspace_bytes: u64::MAX,
+            max_buffer_memory_bytes: u64::MAX,
+            max_seal_index_bytes: u64::MAX,
+        })?;
+        let owner = Arc::new(WalV7ReservationOwner::new(ledger, &installed)?);
+        MemTable::recover_from_v7_active(7, false, path, installed, max_file_size, owner)
+    }
+
+    #[test]
+    fn v7_active_attach_replays_and_resumes_mvcc_and_seal_index() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("active.wal");
+        let installed = install_empty_v7(&path)?;
+        let empty_anchor = installed.active_boundary;
+        let (source, _) = attach_v7(&path, installed, TEST_V7_MAX_FILE_SIZE)?;
+        let recorded_at = RecordedAt {
+            secs: 4_000_000_000,
+            nanos: 5,
+        };
+        let raw_value = vec![crate::vlog::KvKind::Inline as u8, b'v'];
+        let ttl_value =
+            crate::vlog::encode_ttl_value(crate::vlog::KvKind::TtlInline, u64::MAX, b"ttl-value");
+        let ticket = source.write_pitr_wal_batch_only(
+            &WalBatch {
+                commit_ts: 10,
+                recorded_at,
+                entries: vec![
+                    WalEntry::Put {
+                        key: b"point".to_vec(),
+                        value: raw_value.clone(),
+                    },
+                    WalEntry::Put {
+                        key: b"ttl".to_vec(),
+                        value: ttl_value.clone(),
+                    },
+                    WalEntry::PointDelete {
+                        key: b"deleted".to_vec(),
+                    },
+                    WalEntry::RangeDelete {
+                        start: b"a".to_vec(),
+                        end: b"y".to_vec(),
+                    },
+                    WalEntry::RangeDelete {
+                        start: b"a".to_vec(),
+                        end: b"z".to_vec(),
+                    },
+                ],
+            },
+            LIVE_WAL_V5_LIMITS,
+        )?;
+        source.commit_wal_ticket(ticket)?;
+        drop(source);
+
+        let installed = recover_v7(&path, empty_anchor)?;
+        let anchor = installed.active_boundary;
+        let recovered_index = installed.seal_index.clone();
+        let (memtable, max_ts) = attach_v7(&path, installed, TEST_V7_MAX_FILE_SIZE)?;
+        assert_eq!(max_ts, 10);
+        assert_eq!(
+            memtable.get_raw_exact(&crate::key::encode_internal_key(b"point", 10)),
+            Some(Bytes::from(raw_value))
+        );
+        assert_eq!(
+            memtable.get_raw_exact(&crate::key::encode_internal_key(b"ttl", 10)),
+            Some(Bytes::from(ttl_value))
+        );
+        assert_eq!(
+            memtable.get_raw_exact(&crate::key::encode_internal_key(b"deleted", 10)),
+            Some(Bytes::from_static(crate::mvcc::TOMBSTONE_VALUE))
+        );
+        assert!(memtable.has_ttl_entries());
+        assert_eq!(memtable.range_tombstones().len(), 2);
+        assert_eq!(
+            memtable
+                .range_tombstones()
+                .raw()
+                .iter()
+                .map(|entry| entry.key().ordinal)
+                .collect::<Vec<_>>(),
+            [0, 1],
+        );
+        assert_eq!(memtable.recovered_recorded_at(), Some(recorded_at));
+        assert_eq!(
+            memtable
+                .last_ticket
+                .load(std::sync::atomic::Ordering::Acquire),
+            1
+        );
+        assert_eq!(memtable.wal_v7_seal_index(), Some(recovered_index.clone()));
+        assert!(memtable.wal_v7_reservation_owner().is_some());
+
+        let mvcc = LsmMvccInner::new(max_ts);
+        mvcc.seed_pitr_recorded_at(memtable.recovered_recorded_at());
+        let (commit_ts, key, value, ticket) = mvcc.write_wal_only(b"new", b"value", &memtable)?;
+        assert_eq!((commit_ts, ticket), (11, Some(1)));
+        memtable.commit_wal_ticket(ticket)?;
+        memtable.publish_raw_batch(&[(crate::key::KeySlice::from_slice(&key), &value)])?;
+        mvcc.publish_commit_ts(commit_ts)?;
+
+        let (commit_ts, publish_data, ticket) = mvcc.write_batch_wal_only(
+            &[
+                (
+                    Bytes::from_static(b"point"),
+                    Bytes::new(),
+                    BatchEntryKind::Delete,
+                ),
+                (
+                    Bytes::from_static(b"batch"),
+                    Bytes::from_static(b"value"),
+                    BatchEntryKind::PutRaw,
+                ),
+            ],
+            &memtable,
+            false,
+        )?;
+        assert_eq!((commit_ts, ticket), (12, Some(2)));
+        memtable.commit_wal_ticket(ticket)?;
+        publish_data.with_borrowed_refs(|entries| memtable.publish_raw_batch(entries))?;
+        mvcc.publish_commit_ts(commit_ts)?;
+        assert_eq!(
+            memtable
+                .last_ticket
+                .load(std::sync::atomic::Ordering::Acquire),
+            3
+        );
+        let seal_index = memtable
+            .wal_v7_seal_index()
+            .expect("v7 retains a seal index");
+        assert_eq!(&seal_index[..1], &recovered_index);
+        assert_eq!(seal_index.len(), 3);
+        assert!(seal_index.windows(2).all(|offsets| offsets[0] < offsets[1]));
+        drop(memtable);
+
+        let installed = recover_v7(&path, anchor)?;
+        assert_eq!(installed.next_ticket, 3);
+        assert_eq!(installed.seal_index, seal_index);
+        assert!(
+            installed
+                .batches
+                .iter()
+                .all(|batch| batch.recorded_at == recorded_at)
+        );
+        let (reopened, max_ts) = attach_v7(&path, installed, TEST_V7_MAX_FILE_SIZE)?;
+        assert_eq!(max_ts, 12);
+        assert_eq!(
+            reopened.get_versioned_raw(b"point", max_ts),
+            Some(Bytes::from_static(crate::mvcc::TOMBSTONE_VALUE)),
+        );
+        let mut expected_value = vec![crate::vlog::KvKind::Inline as u8];
+        expected_value.extend_from_slice(b"value");
+        assert_eq!(
+            reopened.get_versioned_raw(b"new", max_ts),
+            Some(Bytes::copy_from_slice(&expected_value))
+        );
+        assert_eq!(
+            reopened.get_versioned_raw(b"batch", max_ts),
+            Some(Bytes::from(expected_value))
+        );
+        assert_eq!(reopened.range_tombstones().len(), 2);
+
+        Ok(())
+    }
+
+    #[test]
+    fn v7_pre_admission_rejections_leave_mvcc_retryable() -> Result<()> {
+        for rejection in ["validation", "capacity"] {
+            let directory = tempfile::tempdir()?;
+            let path = directory.path().join("active.wal");
+            let installed = install_empty_v7(&path)?;
+            let original_image = fs::read(&path)?;
+            let max_file_size = if rejection == "capacity" {
+                3 * WAL_V7_FRAME_LEN as u64
+            } else {
+                TEST_V7_MAX_FILE_SIZE
+            };
+            let (memtable, max_ts) = attach_v7(&path, installed, max_file_size)?;
+            let mvcc = LsmMvccInner::new(max_ts);
+            let key = if rejection == "validation" {
+                vec![b'k'; LIVE_WAL_V5_LIMITS.max_key_bytes + 1]
+            } else {
+                b"key".to_vec()
+            };
+            assert!(mvcc.write_wal_only(&key, b"value", &memtable).is_err());
+            assert_eq!(memtable.wal_batch_count(), Some(0));
+            assert_eq!(memtable.wal_v7_seal_index(), Some(Vec::new()));
+            assert_eq!(fs::read(&path)?, original_image);
+            memtable.sync_wal()?;
+            assert_eq!(mvcc.stop_commit_admission_and_capture()?, None);
+            mvcc.resume_commit_admission();
+
+            let successor = if rejection == "capacity" {
+                let successor_path = directory.path().join("successor.wal");
+                let installed = install_empty_v7(&successor_path)?;
+                Some(attach_v7(&successor_path, installed, TEST_V7_MAX_FILE_SIZE)?.0)
+            } else {
+                None
+            };
+            let retry_memtable = successor.as_ref().unwrap_or(&memtable);
+            let (commit_ts, key, value, ticket) =
+                mvcc.write_wal_only(b"retry", b"value", retry_memtable)?;
+            assert_eq!((commit_ts, ticket), (2, Some(0)));
+            retry_memtable.commit_wal_ticket(ticket)?;
+            retry_memtable
+                .publish_raw_batch(&[(crate::key::KeySlice::from_slice(&key), &value)])?;
+            mvcc.publish_commit_ts(commit_ts)?;
+            assert_eq!(mvcc.latest_commit_ts(), 2);
+            assert_eq!(
+                retry_memtable
+                    .wal_v7_seal_index()
+                    .expect("v7 retains its index")
+                    .len(),
+                1
+            );
+        }
+
+        Ok(())
+    }
+
+    #[cfg(feature = "chaos-testing")]
+    #[test]
+    fn failpoint_v7_sync_failures_poison_mvcc_for_every_write_path() -> Result<()> {
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+
+        use crate::chaos::failpoint::{self, FailScenario};
+
+        for action in ["return", "panic"] {
+            for operation in [
+                "put", "delete", "ttl", "range", "ranges", "batch", "deletes",
+            ] {
+                let scenario = FailScenario::setup();
+                let directory = tempfile::tempdir()?;
+                let path = directory.path().join("active.wal");
+                let installed = install_empty_v7(&path)?;
+                let anchor = installed.active_boundary;
+                let (memtable, max_ts) = attach_v7(&path, installed, TEST_V7_MAX_FILE_SIZE)?;
+                let mvcc = LsmMvccInner::new(max_ts);
+                failpoint::cfg("wal.v7.leader.fdatasync", action).expect("arm v7 sync failure");
+                let result = catch_unwind(AssertUnwindSafe(|| match operation {
+                    "put" => mvcc.write_wal_only(b"key", b"value", &memtable).map(|_| ()),
+                    "delete" => mvcc.write_tombstone_wal_only(b"key", &memtable).map(|_| ()),
+                    "ttl" => mvcc
+                        .write_ttl_wal_only(
+                            b"key",
+                            b"value",
+                            std::time::Duration::from_secs(60),
+                            &memtable,
+                        )
+                        .map(|_| ()),
+                    "range" => mvcc
+                        .write_range_tombstone(b"a", b"z", &memtable)
+                        .map(|_| ()),
+                    "ranges" => mvcc
+                        .write_range_batch_wal_only(&[(b"a", b"z")], &memtable)
+                        .map(|_| ()),
+                    "batch" => mvcc
+                        .write_batch_wal_only(
+                            &[(
+                                Bytes::from_static(b"key"),
+                                Bytes::from_static(b"value"),
+                                BatchEntryKind::PutRaw,
+                            )],
+                            &memtable,
+                            false,
+                        )
+                        .map(|_| ()),
+                    "deletes" => mvcc
+                        .write_delete_batch_wal_only(
+                            &[Bytes::from_static(b"key")],
+                            &memtable,
+                            false,
+                        )
+                        .map(|_| ()),
+                    _ => unreachable!(),
+                }));
+                scenario.teardown();
+
+                if action == "panic" {
+                    assert!(
+                        result.is_err(),
+                        "v7 sync panics after DATA and FRONTIER writes"
+                    );
+                } else {
+                    let error = result
+                        .expect("v7 sync returns an error")
+                        .expect_err("v7 sync fails after DATA and FRONTIER writes");
+                    assert!(format!("{error:#}").contains("fdatasync"), "{operation}");
+                }
+                assert!(
+                    mvcc.reserve_commit_ts().is_err(),
+                    "{operation}/{action} must close MVCC admission"
+                );
+                assert!(
+                    mvcc.stop_commit_admission_and_capture().is_err(),
+                    "{operation} must reject capture"
+                );
+                assert!(memtable.is_empty());
+                assert_eq!(memtable.wal_batch_count(), Some(0));
+                assert_eq!(memtable.wal_v7_seal_index(), Some(Vec::new()));
+                drop(memtable);
+
+                // A complete certificate can survive a failed sync. This timestamp
+                // therefore cannot be retired as a gap with no recoverable data.
+                let recovered = recover_v7(&path, anchor)?;
+                assert_eq!(recovered.next_ticket, 1, "{operation}");
+                assert_eq!(recovered.active_boundary.last_commit_ts, 1, "{operation}");
+            }
+        }
+
+        Ok(())
+    }
 
     #[test]
     fn publish_raw_batch_owned_inserts_entries() {
