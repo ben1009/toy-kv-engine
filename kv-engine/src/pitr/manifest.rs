@@ -209,6 +209,10 @@ pub(crate) struct PitrState {
     pub(crate) archive_epoch_id: Option<[u8; 16]>,
     pub(crate) config: Option<PersistedPitrConfig>,
     pub(crate) active_segment_id: Option<u64>,
+    /// Logical durable floor for an Active v7 WAL. This excludes physical
+    /// FRONTIER identity so recovery may relocate and rechain the marker.
+    #[serde(default)]
+    pub(crate) active_boundary: Option<ActiveBoundary>,
     pub(crate) next_segment_id: u64,
     pub(crate) epoch_genesis_anchor: Option<PersistedChainAnchor>,
     pub(crate) predecessor_anchor: Option<PersistedChainAnchor>,
@@ -229,6 +233,7 @@ impl Default for PitrState {
             archive_epoch_id: None,
             config: None,
             active_segment_id: None,
+            active_boundary: None,
             next_segment_id: 0,
             epoch_genesis_anchor: None,
             predecessor_anchor: None,
@@ -255,6 +260,7 @@ impl PitrState {
             let is_legacy = self.database_timeline_id.is_none();
             ensure!(
                 self.active_segment_id.is_none()
+                    && self.active_boundary.is_none()
                     && self.obligations.is_empty()
                     && self.uncertain_segment_id.is_none(),
                 "disabled PITR state is not canonical"
@@ -271,6 +277,7 @@ impl PitrState {
                     self.timeline_id.is_none()
                         && self.archive_epoch_id.is_none()
                         && self.config.is_none()
+                        && self.active_boundary.is_none()
                         && self.next_segment_id == 0
                         && self.epoch_genesis_anchor.is_none()
                         && self.predecessor_anchor.is_none()
@@ -309,7 +316,9 @@ impl PitrState {
 
         if self.mode == PitrMode::Enabling {
             ensure!(
-                self.active_segment_id.is_none() && self.obligations.is_empty(),
+                self.active_segment_id.is_none()
+                    && self.active_boundary.is_none()
+                    && self.obligations.is_empty(),
                 "enabling PITR state has live segments"
             );
             ensure!(
@@ -353,6 +362,37 @@ impl PitrState {
                 );
             }
         }
+        if let Some(boundary) = self.active_boundary {
+            boundary.validate()?;
+            ensure!(
+                self.mode != PitrMode::Disabled && self.mode != PitrMode::Enabling,
+                "inactive PITR state retains an Active WAL boundary"
+            );
+            ensure!(
+                Some(boundary.timeline_id) == self.timeline_id
+                    && Some(boundary.archive_epoch_id) == self.archive_epoch_id
+                    && Some(boundary.segment_id) == self.active_segment_id,
+                "Active WAL boundary does not match the PITR frontier"
+            );
+            ensure!(
+                boundary.ticket_end == 0
+                    || self
+                        .last_commit_anchor
+                        .is_none_or(|anchor| boundary.last_commit_ts > anchor.commit_ts),
+                "Active WAL commit boundary does not advance the sealed high-water"
+            );
+            if let Some(obligation) = self.obligations.get(&boundary.segment_id) {
+                ensure!(
+                    obligation.state == ObligationState::Sealing
+                        || (self.mode == PitrMode::ReconciliationRequired
+                            && obligation.state == ObligationState::Abandoned),
+                    "Active WAL boundary has an incompatible segment obligation"
+                );
+                if obligation.state == ObligationState::Sealing {
+                    validate_active_sealing_length(boundary, obligation.logical_length)?;
+                }
+            }
+        }
         ensure!(
             self.mode == PitrMode::PublicationUncertain || self.uncertain_segment_id.is_none(),
             "non-uncertain PITR state retains uncertainty"
@@ -375,11 +415,7 @@ impl PitrState {
             ) || self.recovery_gap.is_none(),
             "non-reconciliation PITR state retains gap"
         );
-        if matches!(
-            self.mode,
-            PitrMode::ReconciliationRequired | PitrMode::Disabled
-        ) && self.recovery_gap.is_some()
-        {
+        if self.mode == PitrMode::ReconciliationRequired || self.recovery_gap.is_some() {
             let gap = self
                 .recovery_gap
                 .as_ref()
@@ -408,6 +444,15 @@ impl PitrState {
                 ensure!(
                     archived <= anchor.commit_ts,
                     "recovery gap exceeds commit high-water"
+                );
+            }
+            if let Some(boundary) = self.active_boundary
+                && boundary.ticket_end != 0
+            {
+                ensure!(
+                    gap.first_uncovered_commit_ts
+                        .is_some_and(|first| first != 0 && first <= boundary.last_commit_ts),
+                    "recovery gap omits known uncovered Active WAL commits"
                 );
             }
             ensure!(
@@ -475,6 +520,11 @@ pub(crate) enum PitrManifestRecord {
     },
     EnableComplete {
         active_segment_id: u64,
+    },
+    /// Durably advance the logical recovery floor for the current Active v7
+    /// WAL. The first boundary for a segment must be its empty header prefix.
+    ActiveBoundaryAdvanced {
+        boundary: ActiveBoundary,
     },
     SealStarted {
         segment_id: u64,
@@ -588,6 +638,37 @@ pub(crate) fn replay_pitr_records(
                 state.active_segment_id = Some(active_segment_id);
                 state.mode = PitrMode::Enabled;
             }
+            PitrManifestRecord::ActiveBoundaryAdvanced { boundary } => {
+                ensure!(
+                    state.mode == PitrMode::Enabled,
+                    "Active WAL boundary advanced while PITR is not enabled"
+                );
+                boundary.validate()?;
+                ensure!(
+                    Some(boundary.timeline_id) == state.timeline_id
+                        && Some(boundary.archive_epoch_id) == state.archive_epoch_id
+                        && Some(boundary.segment_id) == state.active_segment_id,
+                    "Active WAL boundary does not match the PITR frontier"
+                );
+                ensure!(
+                    state
+                        .obligations
+                        .get(&boundary.segment_id)
+                        .is_none_or(|obligation| obligation.state != ObligationState::Sealing),
+                    "Active WAL boundary advanced after sealing started"
+                );
+                if let Some(previous) = state.active_boundary {
+                    validate_active_boundary_advance(previous, boundary)?;
+                } else {
+                    ensure!(
+                        boundary.ticket_end == 0
+                            && boundary.durable_end == 4096
+                            && boundary.last_commit_ts == 0,
+                        "first Active WAL boundary is not the empty prefix"
+                    );
+                }
+                state.active_boundary = Some(boundary);
+            }
             PitrManifestRecord::SealStarted {
                 segment_id,
                 successor_segment_id,
@@ -613,6 +694,9 @@ pub(crate) fn replay_pitr_records(
                     logical_length >= 4096 && logical_length.is_multiple_of(4096),
                     "sealing logical length is invalid"
                 );
+                if let Some(boundary) = state.active_boundary {
+                    validate_active_sealing_length(boundary, logical_length)?;
+                }
                 state.next_segment_id = successor_segment_id
                     .checked_add(1)
                     .ok_or_else(|| anyhow::anyhow!("successor segment ID exhausted"))?;
@@ -650,8 +734,21 @@ pub(crate) fn replay_pitr_records(
                     matches!(segment_anchor, PersistedChainAnchor::Segment { segment_id: id, .. } if id == segment_id),
                     "sealed anchor does not bind segment"
                 );
+                if let Some(boundary) = state.active_boundary {
+                    ensure!(
+                        boundary.segment_id == segment_id,
+                        "sealed segment does not contain the Active WAL boundary"
+                    );
+                    ensure!(
+                        boundary.ticket_end == 0
+                            || last_commit_anchor
+                                .is_some_and(|anchor| anchor.commit_ts >= boundary.last_commit_ts),
+                        "sealed segment is below its Active WAL commit boundary"
+                    );
+                }
                 let successor = obligation.successor_segment_id;
                 state.active_segment_id = Some(successor);
+                state.active_boundary = None;
                 state.predecessor_anchor = Some(segment_anchor);
                 apply_high_water(&mut state, segment_id, last_recorded_at, last_commit_anchor)?;
                 state.obligations.get_mut(&segment_id).unwrap().state = ObligationState::Sealed;
@@ -748,6 +845,12 @@ pub(crate) fn replay_pitr_records(
                 ensure!(
                     state.mode == PitrMode::Enabled && state.obligations.is_empty(),
                     "clean disable has outstanding work"
+                );
+                ensure!(
+                    state
+                        .active_boundary
+                        .is_none_or(|boundary| boundary.ticket_end == 0),
+                    "clean disable has an unsealed Active WAL commit boundary"
                 );
                 state = disabled_lifecycle_state(&state);
             }
@@ -1023,10 +1126,53 @@ fn disabled_lifecycle_state(state: &PitrState) -> PitrState {
     let mut disabled = state.clone();
     disabled.mode = PitrMode::Disabled;
     disabled.active_segment_id = None;
+    disabled.active_boundary = None;
     disabled.obligations.clear();
     disabled.uncertain_segment_id = None;
 
     disabled
+}
+
+fn validate_active_boundary_advance(previous: ActiveBoundary, next: ActiveBoundary) -> Result<()> {
+    ensure!(
+        previous.timeline_id == next.timeline_id
+            && previous.archive_epoch_id == next.archive_epoch_id
+            && previous.segment_id == next.segment_id
+            && previous.incarnation == next.incarnation,
+        "Active WAL boundary changes segment identity"
+    );
+    ensure!(
+        next.ticket_end >= previous.ticket_end
+            && next.durable_end >= previous.durable_end
+            && next.last_commit_ts >= previous.last_commit_ts,
+        "Active WAL boundary regresses"
+    );
+    if next.ticket_end == previous.ticket_end {
+        ensure!(
+            next == previous,
+            "Active WAL boundary changes without advancing its ticket"
+        );
+    } else {
+        ensure!(
+            next.durable_end > previous.durable_end
+                && next.last_commit_ts > previous.last_commit_ts,
+            "Active WAL boundary ticket advance lacks a larger durable prefix"
+        );
+    }
+    Ok(())
+}
+
+fn validate_active_sealing_length(boundary: ActiveBoundary, logical_length: u64) -> Result<()> {
+    let minimum_length = boundary
+        .durable_end
+        .checked_add(4096)
+        .ok_or_else(|| anyhow::anyhow!("Active WAL boundary and terminal frontier overflow"))?;
+    ensure!(
+        logical_length >= minimum_length,
+        "sealing length omits the Active WAL boundary or terminal frontier"
+    );
+
+    Ok(())
 }
 
 fn transition_obligation(
@@ -1118,6 +1264,19 @@ mod tests {
         }
     }
 
+    fn empty_active_boundary_for_enabled_segment() -> ActiveBoundary {
+        ActiveBoundary {
+            timeline_id: [2; 16],
+            archive_epoch_id: [3; 16],
+            segment_id: 1,
+            incarnation: [4; 16],
+            ticket_end: 0,
+            durable_end: 4096,
+            last_commit_ts: 0,
+            prefix_digest: [6; 32],
+        }
+    }
+
     #[test]
     fn v7_boundaries_validate_and_round_trip_without_active_physical_identity() {
         let active = active_boundary();
@@ -1191,6 +1350,102 @@ mod tests {
         }
     }
 
+    #[test]
+    fn active_boundaries_are_durably_replayed_as_logical_floors() {
+        let first = empty_active_boundary_for_enabled_segment();
+        let advanced = ActiveBoundary {
+            ticket_end: 1,
+            durable_end: 3 * 4096,
+            last_commit_ts: 7,
+            prefix_digest: [9; 32],
+            ..first
+        };
+        let records = [
+            enable()[0].clone(),
+            enable()[1].clone(),
+            PitrManifestRecord::ActiveBoundaryAdvanced { boundary: first },
+            PitrManifestRecord::ActiveBoundaryAdvanced { boundary: advanced },
+            PitrManifestRecord::ActiveBoundaryAdvanced { boundary: advanced },
+        ];
+        let state = replay_pitr_records(records.clone()).unwrap();
+        assert_eq!(state.active_boundary, Some(advanced));
+
+        let encoded = encode_pitr_record_stream(&records).unwrap();
+        assert_eq!(replay_pitr_record_stream(&encoded).unwrap(), state);
+    }
+
+    #[test]
+    fn active_boundary_updates_reject_missing_initial_floor_and_regressions() {
+        let first = empty_active_boundary_for_enabled_segment();
+        let nonempty = ActiveBoundary {
+            ticket_end: 1,
+            durable_end: 3 * 4096,
+            last_commit_ts: 7,
+            prefix_digest: [9; 32],
+            ..first
+        };
+        let prefix = [enable()[0].clone(), enable()[1].clone()];
+
+        let mut records = prefix.to_vec();
+        records.push(PitrManifestRecord::ActiveBoundaryAdvanced { boundary: nonempty });
+        assert!(replay_pitr_records(records).is_err());
+
+        for invalid in [
+            ActiveBoundary {
+                incarnation: [10; 16],
+                ticket_end: 2,
+                durable_end: 4 * 4096,
+                last_commit_ts: 8,
+                prefix_digest: [10; 32],
+                ..nonempty
+            },
+            ActiveBoundary {
+                ticket_end: 0,
+                durable_end: 4096,
+                last_commit_ts: 0,
+                prefix_digest: first.prefix_digest,
+                ..nonempty
+            },
+            ActiveBoundary {
+                prefix_digest: [10; 32],
+                ..nonempty
+            },
+            ActiveBoundary {
+                durable_end: 4 * 4096,
+                ..nonempty
+            },
+            ActiveBoundary {
+                ticket_end: 2,
+                durable_end: nonempty.durable_end,
+                last_commit_ts: 8,
+                prefix_digest: [10; 32],
+                ..nonempty
+            },
+        ] {
+            let mut records = prefix.to_vec();
+            records.extend([
+                PitrManifestRecord::ActiveBoundaryAdvanced { boundary: first },
+                PitrManifestRecord::ActiveBoundaryAdvanced { boundary: nonempty },
+                PitrManifestRecord::ActiveBoundaryAdvanced { boundary: invalid },
+            ]);
+            assert!(replay_pitr_records(records).is_err());
+        }
+    }
+
+    #[test]
+    fn old_pitr_snapshots_default_to_no_active_v7_boundary() {
+        let state = replay_pitr_records(enable()).unwrap();
+        let mut serialized = serde_json::to_value(&state).unwrap();
+        serialized
+            .as_object_mut()
+            .unwrap()
+            .remove("active_boundary");
+
+        let decoded: PitrState = serde_json::from_value(serialized).unwrap();
+        assert_eq!(decoded, state);
+        assert_eq!(decoded.active_boundary, None);
+    }
+
     fn config() -> PersistedPitrConfig {
         PersistedPitrConfig {
             archive_interval_ms: 1000,
@@ -1223,13 +1478,32 @@ mod tests {
     #[test]
     fn sealing_intent_does_not_install_successor_until_sealed() {
         let mut records = enable();
+        let active_boundary = empty_active_boundary_for_enabled_segment();
+        records.push(PitrManifestRecord::ActiveBoundaryAdvanced {
+            boundary: active_boundary,
+        });
         records.push(PitrManifestRecord::SealStarted {
             segment_id: 1,
             successor_segment_id: 2,
-            logical_length: 4096,
+            logical_length: 8192,
         });
         let sealing = replay_pitr_records(records.clone()).unwrap();
         assert_eq!(sealing.active_segment_id, Some(1));
+        assert_eq!(sealing.active_boundary, Some(active_boundary));
+
+        let terminal_boundary = ActiveBoundary {
+            ticket_end: 1,
+            durable_end: 3 * 4096,
+            last_commit_ts: 7,
+            prefix_digest: [9; 32],
+            ..active_boundary
+        };
+        let mut invalid_records = records.clone();
+        invalid_records.push(PitrManifestRecord::ActiveBoundaryAdvanced {
+            boundary: terminal_boundary,
+        });
+        assert!(replay_pitr_records(invalid_records).is_err());
+
         records.push(PitrManifestRecord::SegmentSealed {
             segment_id: 1,
             segment_anchor: anchor(1),
@@ -1238,7 +1512,386 @@ mod tests {
         });
         let sealed = replay_pitr_records(records).unwrap();
         assert_eq!(sealed.active_segment_id, Some(2));
+        assert_eq!(sealed.active_boundary, None);
         assert_eq!(sealed.predecessor_anchor, Some(anchor(1)));
+    }
+
+    #[test]
+    fn sealing_handoff_preserves_the_active_boundary() {
+        let first = empty_active_boundary_for_enabled_segment();
+        let durable = ActiveBoundary {
+            ticket_end: 1,
+            durable_end: 3 * 4096,
+            last_commit_ts: 7,
+            prefix_digest: [9; 32],
+            ..first
+        };
+        let mut records = enable();
+        records.extend([
+            PitrManifestRecord::ActiveBoundaryAdvanced { boundary: first },
+            PitrManifestRecord::ActiveBoundaryAdvanced { boundary: durable },
+        ]);
+
+        for logical_length in [4096, durable.durable_end] {
+            let mut invalid_records = records.clone();
+            invalid_records.push(PitrManifestRecord::SealStarted {
+                segment_id: 1,
+                successor_segment_id: 2,
+                logical_length,
+            });
+            assert!(replay_pitr_records(invalid_records).is_err());
+        }
+
+        records.push(PitrManifestRecord::SealStarted {
+            segment_id: 1,
+            successor_segment_id: 2,
+            logical_length: 4 * 4096,
+        });
+        let sealing = replay_pitr_records(records.clone()).unwrap();
+        let mut invalid_snapshot = sealing.clone();
+        invalid_snapshot
+            .obligations
+            .get_mut(&1)
+            .unwrap()
+            .logical_length = durable.durable_end;
+        assert!(encode_pitr_snapshot(&invalid_snapshot).is_err());
+        assert!(
+            replay_pitr_records([PitrManifestRecord::Snapshot(Box::new(invalid_snapshot))])
+                .is_err()
+        );
+
+        let mut overflow_snapshot = sealing;
+        overflow_snapshot
+            .active_boundary
+            .as_mut()
+            .unwrap()
+            .durable_end = u64::MAX - 4095;
+        assert!(encode_pitr_snapshot(&overflow_snapshot).is_err());
+
+        let commit_anchor = PersistedCommitAnchor {
+            segment_id: 1,
+            commit_ts: durable.last_commit_ts,
+            recorded_at: PersistedRecordedAt { secs: 1, nanos: 0 },
+            entry_digest: [10; 32],
+        };
+        for last_commit_anchor in [
+            None,
+            Some(PersistedCommitAnchor {
+                commit_ts: durable.last_commit_ts - 1,
+                ..commit_anchor
+            }),
+        ] {
+            let mut invalid_records = records.clone();
+            invalid_records.push(PitrManifestRecord::SegmentSealed {
+                segment_id: 1,
+                segment_anchor: anchor(1),
+                last_recorded_at: last_commit_anchor.map(|anchor| anchor.recorded_at),
+                last_commit_anchor,
+            });
+            assert!(replay_pitr_records(invalid_records).is_err());
+        }
+
+        for commit_ts in [durable.last_commit_ts, durable.last_commit_ts + 1] {
+            let mut sealed_records = records.clone();
+            let last_commit_anchor = PersistedCommitAnchor {
+                commit_ts,
+                ..commit_anchor
+            };
+            sealed_records.push(PitrManifestRecord::SegmentSealed {
+                segment_id: 1,
+                segment_anchor: anchor(1),
+                last_recorded_at: Some(last_commit_anchor.recorded_at),
+                last_commit_anchor: Some(last_commit_anchor),
+            });
+            let sealed = replay_pitr_records(sealed_records).unwrap();
+            assert_eq!(sealed.active_boundary, None);
+            assert_eq!(sealed.last_commit_anchor, Some(last_commit_anchor));
+            assert_eq!(sealed.active_segment_id, Some(2));
+        }
+    }
+
+    #[test]
+    fn active_boundaries_follow_the_sealed_commit_high_water() {
+        let mut records = enable();
+        let sealed_commit = PersistedCommitAnchor {
+            segment_id: 1,
+            commit_ts: 10,
+            recorded_at: PersistedRecordedAt { secs: 1, nanos: 0 },
+            entry_digest: [10; 32],
+        };
+        records.extend([
+            PitrManifestRecord::SealStarted {
+                segment_id: 1,
+                successor_segment_id: 2,
+                logical_length: 8192,
+            },
+            PitrManifestRecord::SegmentSealed {
+                segment_id: 1,
+                segment_anchor: anchor(1),
+                last_recorded_at: Some(sealed_commit.recorded_at),
+                last_commit_anchor: Some(sealed_commit),
+            },
+        ]);
+        let empty = ActiveBoundary {
+            segment_id: 2,
+            incarnation: [11; 16],
+            ..empty_active_boundary_for_enabled_segment()
+        };
+        records.push(PitrManifestRecord::ActiveBoundaryAdvanced { boundary: empty });
+        let empty_state = replay_pitr_records(records.clone()).unwrap();
+
+        for last_commit_ts in [9, 10, 11] {
+            let boundary = ActiveBoundary {
+                ticket_end: 1,
+                durable_end: 3 * 4096,
+                last_commit_ts,
+                prefix_digest: [12; 32],
+                ..empty
+            };
+            let mut candidate_records = records.clone();
+            candidate_records.push(PitrManifestRecord::ActiveBoundaryAdvanced { boundary });
+            let mut candidate_snapshot = empty_state.clone();
+            candidate_snapshot.active_boundary = Some(boundary);
+            if last_commit_ts <= sealed_commit.commit_ts {
+                assert!(replay_pitr_records(candidate_records).is_err());
+                assert!(encode_pitr_snapshot(&candidate_snapshot).is_err());
+                assert!(
+                    replay_pitr_records([PitrManifestRecord::Snapshot(Box::new(
+                        candidate_snapshot
+                    ))])
+                    .is_err()
+                );
+            } else {
+                assert_eq!(
+                    replay_pitr_records(candidate_records).unwrap(),
+                    candidate_snapshot
+                );
+                assert_eq!(
+                    decode_pitr_snapshot(&encode_pitr_snapshot(&candidate_snapshot).unwrap())
+                        .unwrap(),
+                    candidate_snapshot
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn clean_disable_preserves_an_unsealed_active_boundary() {
+        let first = empty_active_boundary_for_enabled_segment();
+        let durable = ActiveBoundary {
+            ticket_end: 1,
+            durable_end: 3 * 4096,
+            last_commit_ts: 7,
+            prefix_digest: [9; 32],
+            ..first
+        };
+        let mut records = enable();
+        records.extend([
+            PitrManifestRecord::ActiveBoundaryAdvanced { boundary: first },
+            PitrManifestRecord::ActiveBoundaryAdvanced { boundary: durable },
+        ]);
+        let mut clean_records = records.clone();
+        clean_records.push(PitrManifestRecord::DisableClean);
+        assert!(replay_pitr_records(clean_records).is_err());
+
+        for boundary in [None, Some(first)] {
+            let mut empty_records = enable();
+            if let Some(boundary) = boundary {
+                empty_records.push(PitrManifestRecord::ActiveBoundaryAdvanced { boundary });
+            }
+            empty_records.push(PitrManifestRecord::DisableClean);
+            let disabled = replay_pitr_records(empty_records).unwrap();
+            assert_eq!(disabled.mode, PitrMode::Disabled);
+            assert_eq!(disabled.active_boundary, None);
+        }
+
+        records.extend([
+            PitrManifestRecord::CoverageGap(PersistedRecoveryGap {
+                repository_id: [1; 16],
+                timeline_id: [2; 16],
+                archive_epoch_id: [3; 16],
+                after: PersistedChainAnchor::Genesis {
+                    archive_epoch_id: [3; 16],
+                },
+                last_archived_commit_ts: None,
+                first_uncovered_commit_ts: Some(durable.last_commit_ts),
+                reason: CoverageBreakReason::ForcedDisable,
+            }),
+            PitrManifestRecord::ReconciliationComplete,
+        ]);
+        let disabled = replay_pitr_records(records).unwrap();
+        assert_eq!(disabled.mode, PitrMode::Disabled);
+        assert_eq!(disabled.active_boundary, None);
+        assert_eq!(
+            disabled.recovery_gap.unwrap().first_uncovered_commit_ts,
+            Some(durable.last_commit_ts)
+        );
+    }
+
+    #[test]
+    fn reconciliation_snapshots_and_gaps_preserve_the_active_floor() {
+        let first = empty_active_boundary_for_enabled_segment();
+        let durable = ActiveBoundary {
+            ticket_end: 1,
+            durable_end: 3 * 4096,
+            last_commit_ts: 7,
+            prefix_digest: [9; 32],
+            ..first
+        };
+        let mut log = PitrManifestLog::default();
+        for record in enable().into_iter().chain([
+            PitrManifestRecord::ActiveBoundaryAdvanced { boundary: first },
+            PitrManifestRecord::ActiveBoundaryAdvanced { boundary: durable },
+        ]) {
+            log.append(record).unwrap();
+        }
+        let active = log.state().clone();
+        let encoded_before = log.encoded().to_vec();
+        let snapshot_before = encode_pitr_snapshot(&active).unwrap();
+        let valid_gap = PersistedRecoveryGap {
+            repository_id: [1; 16],
+            timeline_id: [2; 16],
+            archive_epoch_id: [3; 16],
+            after: PersistedChainAnchor::Genesis {
+                archive_epoch_id: [3; 16],
+            },
+            last_archived_commit_ts: None,
+            first_uncovered_commit_ts: Some(durable.last_commit_ts),
+            reason: CoverageBreakReason::ForcedDisable,
+        };
+        let invalid_gaps = [
+            None,
+            Some(PersistedRecoveryGap {
+                first_uncovered_commit_ts: None,
+                ..valid_gap.clone()
+            }),
+            Some(PersistedRecoveryGap {
+                first_uncovered_commit_ts: Some(0),
+                ..valid_gap.clone()
+            }),
+            Some(PersistedRecoveryGap {
+                first_uncovered_commit_ts: Some(durable.last_commit_ts + 1),
+                ..valid_gap.clone()
+            }),
+        ];
+        for recovery_gap in invalid_gaps {
+            let mut snapshot = active.clone();
+            snapshot.mode = PitrMode::ReconciliationRequired;
+            snapshot.recovery_gap = recovery_gap.clone();
+            assert!(encode_pitr_snapshot(&snapshot).is_err());
+            assert!(
+                replay_pitr_records([PitrManifestRecord::Snapshot(Box::new(snapshot.clone()))])
+                    .is_err()
+            );
+
+            // Recompute the envelope digest so decoding must reject the state
+            // itself rather than a checksum mismatch.
+            let payload = serde_json::to_vec(&snapshot).unwrap();
+            let payload_len = u32::try_from(payload.len()).unwrap().to_be_bytes();
+            let mut digest = Sha256::new();
+            digest.update(b"TOYKV-PITR-SNAPSHOT-V1");
+            digest.update(payload_len);
+            digest.update(&payload);
+            let mut encoded_snapshot = snapshot_before[..PITR_SNAPSHOT_HEADER_LEN].to_vec();
+            encoded_snapshot[9..13].copy_from_slice(&payload_len);
+            encoded_snapshot[13..PITR_SNAPSHOT_HEADER_LEN]
+                .copy_from_slice(digest.finalize().as_slice());
+            encoded_snapshot.extend_from_slice(&payload);
+            assert!(decode_pitr_snapshot(&encoded_snapshot).is_err());
+
+            if let Some(gap) = recovery_gap {
+                assert!(log.append(PitrManifestRecord::CoverageGap(gap)).is_err());
+                assert_eq!(log.state(), &active);
+                assert_eq!(log.encoded(), encoded_before.as_slice());
+            }
+        }
+
+        log.append(PitrManifestRecord::CoverageGap(valid_gap.clone()))
+            .unwrap();
+        let snapshot = encode_pitr_snapshot(log.state()).unwrap();
+        assert_eq!(&decode_pitr_snapshot(&snapshot).unwrap(), log.state());
+        log.append(PitrManifestRecord::ReconciliationComplete)
+            .unwrap();
+        assert_eq!(log.state().mode, PitrMode::Disabled);
+        assert_eq!(log.state().active_boundary, None);
+        assert_eq!(log.state().recovery_gap, Some(valid_gap));
+    }
+
+    #[test]
+    fn active_wal_cannot_be_reclaimed_through_a_snapshot_obligation() {
+        let first = empty_active_boundary_for_enabled_segment();
+        let durable = ActiveBoundary {
+            ticket_end: 1,
+            durable_end: 3 * 4096,
+            last_commit_ts: 7,
+            prefix_digest: [9; 32],
+            ..first
+        };
+        let mut records = enable();
+        records.extend([
+            PitrManifestRecord::ActiveBoundaryAdvanced { boundary: first },
+            PitrManifestRecord::ActiveBoundaryAdvanced { boundary: durable },
+        ]);
+        let active = replay_pitr_records(records.clone()).unwrap();
+        for state in [
+            ObligationState::Sealed,
+            ObligationState::Archived,
+            ObligationState::Reclaimable,
+        ] {
+            let mut invalid = active.clone();
+            invalid.next_segment_id = 3;
+            invalid.obligations.insert(
+                durable.segment_id,
+                PitrObligation {
+                    state,
+                    successor_segment_id: 2,
+                    logical_length: durable.durable_end + 4096,
+                },
+            );
+            assert!(encode_pitr_snapshot(&invalid).is_err());
+            let mut reclaim_records = vec![PitrManifestRecord::Snapshot(Box::new(invalid))];
+            if state == ObligationState::Sealed {
+                reclaim_records.push(PitrManifestRecord::SegmentArchived { segment_id: 1 });
+            }
+            if state != ObligationState::Reclaimable {
+                reclaim_records.push(PitrManifestRecord::SegmentReclaimable { segment_id: 1 });
+            }
+            reclaim_records.push(PitrManifestRecord::SegmentReclaimed { segment_id: 1 });
+            let encoded = encode_pitr_record_stream(&reclaim_records).unwrap();
+            assert!(PitrManifestLog::recover(&encoded).is_err());
+        }
+
+        records.extend([
+            PitrManifestRecord::SealStarted {
+                segment_id: 1,
+                successor_segment_id: 2,
+                logical_length: durable.durable_end + 4096,
+            },
+            PitrManifestRecord::CoverageGap(PersistedRecoveryGap {
+                repository_id: [1; 16],
+                timeline_id: [2; 16],
+                archive_epoch_id: [3; 16],
+                after: PersistedChainAnchor::Genesis {
+                    archive_epoch_id: [3; 16],
+                },
+                last_archived_commit_ts: None,
+                first_uncovered_commit_ts: Some(durable.last_commit_ts),
+                reason: CoverageBreakReason::ForcedDisable,
+            }),
+        ]);
+        let abandoned = replay_pitr_records(records.clone()).unwrap();
+        assert_eq!(abandoned.obligations[&1].state, ObligationState::Abandoned);
+        assert_eq!(
+            decode_pitr_snapshot(&encode_pitr_snapshot(&abandoned).unwrap()).unwrap(),
+            abandoned
+        );
+        records.extend([
+            PitrManifestRecord::SegmentAbandoned { segment_id: 1 },
+            PitrManifestRecord::ReconciliationComplete,
+        ]);
+        let disabled = replay_pitr_records(records).unwrap();
+        assert_eq!(disabled.mode, PitrMode::Disabled);
+        assert_eq!(disabled.active_boundary, None);
     }
 
     #[test]

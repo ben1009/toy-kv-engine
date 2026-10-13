@@ -5,7 +5,10 @@
 **Status:** In progress — Stage 2 codec and persistence-model implementation is
 complete. Stage 3 now includes bounded backward FRONTIER discovery, single-pass
 candidate-prefix verification, authority/anchor selection, the Active
-fresh-inode normalization primitive, and an authority-required coordinator.
+fresh-inode normalization primitive, an authority-required coordinator, and
+durable replay of logical Active v7 manifest boundaries. Old PITR snapshots
+default to having no v7 Active boundary. Production boundary publication and
+WAL-open selection remain.
 Stage 4 now includes the v7 resource-ledger primitive, framed-batch reservation
 helper, and serial-model integration. The model reserves before allocating
 framed DATA buffers or writing frames, retains the charge through uncertain
@@ -348,7 +351,28 @@ header validation, discovery, candidate selection, and fresh-inode installation
 as one operation, returning both diagnostics and installed state. The
 coordinator does not infer authority from the WAL and is not yet called from
 production WAL open or manifest publication. Immutable images are not
-normalized.
+normalized. PITR manifest state now represents the current Active v7 logical
+boundary and validates monotonic updates against its segment identity; the
+boundary intentionally omits physical FRONTIER identity. Production publication
+and selection do not use this state yet.
+
+- Persist `ActiveBoundaryAdvanced` as a PITR manifest record. Require the first
+  boundary for a segment to be its empty header prefix, then accept only exact
+  duplicate records or strict ticket/end/timestamp advances for the same
+  segment incarnation. Require Sealing records and snapshots to retain space
+  through that boundary and a terminal FRONTIER; a sealed commit anchor must
+  cover any nonempty Active timestamp floor before the boundary is cleared.
+  Nonempty Active timestamps must advance the preceding sealed high-water, and
+  clean disable cannot discard a nonempty Active boundary before sealing.
+  Reconciliation snapshots require a persisted gap whose start covers any
+  known nonempty Active commit floor before that floor can be discarded.
+  An obligation naming that Active segment may be Sealing, or Abandoned during
+  explicit gap reconciliation; immutable/reclaimable obligations cannot name it.
+  Production gap emission must derive the exact first uncovered timestamp from
+  verified WAL/seal data; the manifest timestamp check supplies only a bound.
+  Preserve old snapshots by defaulting the new boundary field to absent, and
+  clear it when a sealed successor becomes active. Production record emission
+  and WAL-open consumption remain later integration work.
 
 - Add proposed `wal/v7/recovery.rs`, receiving authoritative Active/Sealing/
   Sealed context and all durable anchors. A discovered seal sidecar cannot
