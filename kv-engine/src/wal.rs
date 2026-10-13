@@ -1300,6 +1300,7 @@ impl Wal {
     pub(crate) fn from_v7_parallel(
         path: impl AsRef<Path>,
         seed: v7::install::WalV7RuntimeSeed,
+        max_file_size: u64,
     ) -> Result<Self> {
         let path = path.as_ref();
         let next_ticket = seed.next_ticket;
@@ -1330,7 +1331,7 @@ impl Wal {
             worker_file,
             sync_file,
             preallocator,
-            parallel_runtime::ParallelWalRuntimeStart::v7(seed)?,
+            parallel_runtime::ParallelWalRuntimeStart::v7(seed, max_file_size)?,
         )?;
         let buffered_file = File::options()
             .read(true)

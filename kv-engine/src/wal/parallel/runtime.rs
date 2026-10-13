@@ -65,6 +65,7 @@ impl std::error::Error for WalFull {}
 pub(crate) struct ParallelWalRuntimeStart {
     append_offset: u64,
     next_ticket: u64,
+    max_file_size: u64,
     v7_allocator: Option<WalV7PhysicalAllocator>,
     v7_metadata: Option<WalV7RuntimeMetadata>,
     v7_header_digest: Option<[u8; 32]>,
@@ -80,6 +81,7 @@ impl ParallelWalRuntimeStart {
         let start = Self {
             append_offset,
             next_ticket: 0,
+            max_file_size: MAX_WAL_FILE_SIZE,
             v7_allocator: None,
             v7_metadata: None,
             v7_header_digest: None,
@@ -93,17 +95,18 @@ impl ParallelWalRuntimeStart {
         Ok(start)
     }
 
-    pub(crate) fn v7(seed: WalV7RuntimeSeed) -> Result<Self> {
+    pub(crate) fn v7(seed: WalV7RuntimeSeed, max_file_size: u64) -> Result<Self> {
         let expected_v7_inode = Some((seed.installed_dev, seed.installed_ino));
         let v7_allocator = WalV7PhysicalAllocator::new(
             seed.next_ticket,
             seed.append_offset,
-            MAX_WAL_FILE_SIZE,
+            max_file_size,
             seed.frontier_cursor,
         )?;
         let start = Self {
             append_offset: seed.append_offset,
             next_ticket: seed.next_ticket,
+            max_file_size,
             v7_allocator: Some(v7_allocator),
             v7_metadata: Some(seed.metadata),
             v7_header_digest: Some(seed.header_digest),
@@ -119,9 +122,14 @@ impl ParallelWalRuntimeStart {
 
     fn validate(&self) -> Result<()> {
         ensure!(
+            self.max_file_size >= self.min_append_offset && self.max_file_size <= MAX_WAL_FILE_SIZE,
+            "invalid WAL runtime physical size limit {}",
+            self.max_file_size
+        );
+        ensure!(
             self.min_append_offset >= WAL_HEADER_END
                 && self.min_append_offset.is_multiple_of(4096)
-                && (self.min_append_offset..=MAX_WAL_FILE_SIZE).contains(&self.append_offset)
+                && (self.min_append_offset..=self.max_file_size).contains(&self.append_offset)
                 && self.append_offset.is_multiple_of(4096),
             "invalid initial WAL append offset {}",
             self.append_offset
@@ -164,8 +172,8 @@ impl ParallelWalRuntimeStart {
                 "v7 WAL {role} handle is shorter than the installed append cursor"
             );
             ensure!(
-                metadata.len() <= MAX_WAL_FILE_SIZE,
-                "v7 WAL {role} handle exceeds the maximum physical size"
+                metadata.len() <= self.max_file_size,
+                "v7 WAL {role} handle exceeds the configured maximum physical size"
             );
         }
 
@@ -515,6 +523,7 @@ struct RuntimeInner {
     worker: IoWorkerClient<ParallelBuffer>,
     sync_progress: Arc<WalSyncProgress>,
     preallocator: Arc<File>,
+    max_file_size: u64,
     durability: Arc<DurabilityShared>,
     // The ordered v7 packer and Frontier coordinator will consume this state
     // when their live admission and marker-write protocol is connected.
@@ -700,7 +709,7 @@ impl ParallelWalRuntime {
         let initial_file_end = start.append_offset;
 
         ensure!(
-            (start.min_append_offset..=MAX_WAL_FILE_SIZE).contains(&initial_file_end),
+            (start.min_append_offset..=start.max_file_size).contains(&initial_file_end),
             "invalid initial WAL append offset {initial_file_end}"
         );
 
@@ -766,6 +775,7 @@ impl ParallelWalRuntime {
             worker: worker_client,
             sync_progress,
             preallocator,
+            max_file_size: start.max_file_size,
             durability: Arc::clone(&durability),
             v7_metadata: Mutex::new(start.v7_metadata),
         });
@@ -894,9 +904,10 @@ impl ParallelWalRuntime {
         let file_size_limit = self
             .inner
             .file_size_limit
-            .load(std::sync::atomic::Ordering::Acquire);
+            .load(std::sync::atomic::Ordering::Acquire)
+            .min(self.inner.max_file_size);
         #[cfg(not(test))]
-        let file_size_limit = MAX_WAL_FILE_SIZE;
+        let file_size_limit = self.inner.max_file_size;
 
         if let Some((ticket, error)) = &state.poison {
             let error = anyhow!("parallel WAL is poisoned at ticket {ticket}: {error}");
@@ -925,7 +936,7 @@ impl ParallelWalRuntime {
             self.recycle(buffer);
             bail!("WAL preallocation offset overflow");
         };
-        if preallocation_end > file_size_limit {
+        if file_end > file_size_limit || preallocation_end > file_size_limit {
             let empty_file_end = WAL_HEADER_END.checked_add(aligned_len_u64);
             let empty_end = empty_file_end.and_then(|end| round_up(end, PREALLOC_BLOCK));
             drop(state);
@@ -955,7 +966,7 @@ impl ParallelWalRuntime {
         #[cfg(feature = "chaos-testing")]
         crate::chaos::failpoint::note_parallel_wal_admission();
         debug_assert!(WAL_HEADER_END <= state.admitted_end);
-        debug_assert!(state.admitted_end <= MAX_WAL_FILE_SIZE);
+        debug_assert!(state.admitted_end <= self.inner.max_file_size);
         debug_assert_eq!(state.next_ticket, ticket + 1);
 
         drop(state);
@@ -1226,6 +1237,12 @@ fn pack_admitted_groups(
             report_packer_failure(inner, first_ticket, &error);
             return Err(error);
         };
+        let target_preallocated_end = target_preallocated_end.min(inner.max_file_size);
+        if target_preallocated_end < packer.reserved_end {
+            let error = anyhow!("WAL write exceeds the configured physical size limit");
+            report_packer_failure(inner, first_ticket, &error);
+            return Err(error);
+        }
         if target_preallocated_end > packer.preallocated_end {
             #[cfg(feature = "bench")]
             let preallocation_start = Instant::now();
@@ -1252,10 +1269,10 @@ fn pack_admitted_groups(
         {
             let admitted_end = inner.admission.lock().admitted_end;
             debug_assert!(packer.reserved_end <= admitted_end);
-            debug_assert!(admitted_end <= MAX_WAL_FILE_SIZE);
+            debug_assert!(admitted_end <= inner.max_file_size);
         }
         debug_assert!(packer.preallocated_end >= packer.reserved_end);
-        debug_assert!(packer.preallocated_end <= MAX_WAL_FILE_SIZE);
+        debug_assert!(packer.preallocated_end <= inner.max_file_size);
         if packer.reserved_end > packer.preallocated_end {
             let error = anyhow!("WAL write extends beyond preallocation");
             report_packer_failure(inner, first_ticket, &error);
@@ -1895,24 +1912,51 @@ mod tests {
             .expect("open recovered WAL with direct I/O");
         let direct_metadata = direct_file.metadata().expect("inspect recovered WAL inode");
         let direct_file = Arc::new(direct_file);
-        let make_start = || {
-            ParallelWalRuntimeStart::v7(WalV7RuntimeSeed {
-                data_start: DATA_START,
-                append_offset: APPEND_OFFSET,
-                next_ticket: NEXT_TICKET,
-                header_digest,
-                installed_dev: direct_metadata.dev(),
-                installed_ino: direct_metadata.ino(),
-                frontier_cursor,
-                metadata: WalV7RuntimeMetadata {
-                    logical_hasher: logical_hasher.clone(),
-                    physical_hasher: physical_hasher.clone(),
-                    physical_hashed_end: APPEND_OFFSET,
-                    last_recorded_at,
-                },
-            })
+        let make_seed = || WalV7RuntimeSeed {
+            data_start: DATA_START,
+            append_offset: APPEND_OFFSET,
+            next_ticket: NEXT_TICKET,
+            header_digest,
+            installed_dev: direct_metadata.dev(),
+            installed_ino: direct_metadata.ino(),
+            frontier_cursor,
+            metadata: WalV7RuntimeMetadata {
+                logical_hasher: logical_hasher.clone(),
+                physical_hasher: physical_hasher.clone(),
+                physical_hashed_end: APPEND_OFFSET,
+                last_recorded_at,
+            },
         };
-        let mut start = make_start().expect("validate recovered runtime cursor");
+        let make_start = || ParallelWalRuntimeStart::v7(make_seed(), crate::wal::MAX_WAL_FILE_SIZE);
+        let configured_limit = APPEND_OFFSET + 4096;
+        let limited_start = ParallelWalRuntimeStart::v7(make_seed(), configured_limit)
+            .expect("accept configured v7 segment limit");
+        assert_eq!(limited_start.max_file_size, configured_limit);
+        assert_eq!(
+            limited_start
+                .v7_allocator
+                .as_ref()
+                .expect("limited start owns its v7 allocator")
+                .data_capacity_status(1)
+                .expect("classify limited v7 segment capacity"),
+            crate::wal::v7::allocator::WalV7DataCapacityStatus::RotationRequired
+        );
+        assert!(ParallelWalRuntimeStart::v7(make_seed(), APPEND_OFFSET - 4096).is_err());
+
+        direct_file
+            .set_len(configured_limit + 4096)
+            .expect("extend recovered WAL beyond configured segment limit");
+        let configured_limit_error = limited_start
+            .validate_v7_file_handles(&direct_file, &direct_file, &direct_file)
+            .expect_err("reject a WAL image larger than its configured segment limit");
+        assert!(
+            format!("{configured_limit_error:#}")
+                .contains("exceeds the configured maximum physical size")
+        );
+        direct_file
+            .set_len(APPEND_OFFSET)
+            .expect("restore recovered WAL length after configured-cap check");
+        let mut start = limited_start;
         start
             .v7_metadata
             .as_mut()
@@ -1993,7 +2037,7 @@ mod tests {
         direct_file
             .set_len(crate::wal::MAX_WAL_FILE_SIZE + 4096)
             .expect("extend recovered WAL beyond the segment cap");
-        assert_start_rejected("v7 WAL worker handle exceeds the maximum physical size");
+        assert_start_rejected("v7 WAL worker handle exceeds the configured maximum physical size");
         assert_eq!(
             direct_file
                 .metadata()
@@ -2085,6 +2129,7 @@ mod tests {
             Err(error) => panic!("failed to start recovered v7 runtime: {error:#}"),
         };
 
+        assert_eq!(runtime.inner.max_file_size, configured_limit);
         {
             let admission = runtime.inner.admission.lock();
             assert!(!admission.open);
@@ -2097,6 +2142,15 @@ mod tests {
                     .expect("v7 runtime owns its physical allocator")
                     .last_frontier(),
                 frontier_cursor
+            );
+            assert_eq!(
+                admission
+                    .v7_allocator
+                    .as_ref()
+                    .expect("attached v7 allocator retains the configured cap")
+                    .data_capacity_status(1)
+                    .expect("classify attached v7 segment capacity"),
+                crate::wal::v7::allocator::WalV7DataCapacityStatus::RotationRequired
             );
         }
         {
@@ -2140,6 +2194,116 @@ mod tests {
         assert!(runtime.wait_durable(NEXT_TICKET - 1).is_ok());
         assert!(runtime.wait_durable(NEXT_TICKET).is_err());
         runtime.close().expect("close paused recovered runtime");
+    }
+
+    #[test]
+    fn v7_packer_preallocation_respects_small_segment_limits() -> anyhow::Result<()> {
+        use std::{fs::File, os::unix::fs::FileExt};
+
+        use crate::{
+            pitr::{ArchiveEpochId, ChainAnchor, SegmentId, TimelineId, manifest::ActiveBoundary},
+            tests::harness::is_io_uring_unavailable_error,
+            wal::v7::{
+                codec::{
+                    WAL_V7_FRAME_LEN, WAL_V7_HEADER_LEN, WalV7Header,
+                    encode_generation_zero_frontier,
+                },
+                install::recover_and_install_active,
+                recovery::WalV7RecoveryAuthority,
+            },
+        };
+
+        let directory = tempfile::tempdir()?;
+        let archive_epoch_id = ArchiveEpochId([0x22; 16]);
+        let header = WalV7Header {
+            timeline_id: TimelineId([0x11; 16]),
+            archive_epoch_id,
+            segment_id: SegmentId(7),
+            predecessor: ChainAnchor::Genesis { archive_epoch_id },
+            incarnation: [0x44; 16],
+        };
+        let header_digest = header.digest()?;
+        let mut empty_image = header.encode()?.to_vec();
+        empty_image.extend_from_slice(&encode_generation_zero_frontier(header_digest)?);
+        let empty_boundary = ActiveBoundary {
+            timeline_id: header.timeline_id.0,
+            archive_epoch_id: header.archive_epoch_id.0,
+            segment_id: header.segment_id.0,
+            incarnation: header.incarnation,
+            ticket_end: 0,
+            durable_end: WAL_V7_HEADER_LEN as u64,
+            last_commit_ts: 0,
+            prefix_digest: header_digest,
+        };
+        let data_bytes = [0x5A; WAL_V7_FRAME_LEN];
+
+        for extra_bytes in [0, 1] {
+            let path = directory
+                .path()
+                .join(format!("small-cap-{extra_bytes}.wal"));
+            std::fs::write(&path, &empty_image)?;
+            let recovered = recover_and_install_active(
+                &path,
+                WalV7RecoveryAuthority::Active {
+                    predecessor: header.predecessor,
+                    durable_anchors: vec![empty_boundary],
+                },
+            )?;
+            let seed = recovered.installed.runtime_seed()?;
+            let configured_limit = seed.append_offset + 2 * WAL_V7_FRAME_LEN as u64 + extra_bytes;
+            assert!(configured_limit < super::PREALLOC_BLOCK);
+            let wal = match Wal::from_v7_parallel(&path, seed, configured_limit) {
+                Ok(wal) => wal,
+                Err(error) if is_io_uring_unavailable_error(&error) => {
+                    eprintln!("skipping test (io_uring unavailable): {error:#}");
+                    return Ok(());
+                }
+                Err(error) => return Err(error),
+            };
+            let runtime = wal.parallel_runtime.as_ref().expect("v7 Parallel runtime");
+            assert_eq!(runtime.inner.max_file_size, configured_limit);
+            let mut buffer = runtime.allocate_buffer(WAL_V7_FRAME_LEN)?;
+            let direct_buffer = buffer.buffer.as_mut().expect("owned DATA buffer");
+            direct_buffer.write_at(0, &data_bytes);
+            direct_buffer.set_len(WAL_V7_FRAME_LEN);
+
+            // Exercise the physical packer with an allocator-issued range;
+            // producer admission remains paused until v7 marker scheduling is wired.
+            let data_range = {
+                let mut admission = runtime.inner.admission.lock();
+                assert!(!admission.open);
+                let allocator = admission.v7_allocator.as_mut().expect("v7 allocator");
+                let allocation = allocator.reserve_data(1)?;
+                let data_range = allocation.frame_range().clone();
+                admission.next_ticket = allocator.next_ticket();
+                admission.admitted_end = data_range.end;
+                admission.queue.push_back(super::AdmittedBatch {
+                    ticket: allocation.ticket(),
+                    file_offset: data_range.start,
+                    aligned_len: WAL_V7_FRAME_LEN,
+                    v7_allocation: Some(allocation),
+                    buffer,
+                });
+
+                data_range
+            };
+            super::pack_admitted_groups(&runtime.inner, runtime.inner.packer_state.lock())?;
+            {
+                let packer = runtime.inner.packer_state.lock();
+                assert_eq!(packer.reserved_end, data_range.end);
+                assert_eq!(packer.preallocated_end, configured_limit);
+                assert!(packer.initializer.is_none());
+            }
+            assert_eq!(std::fs::metadata(&path)?.len(), configured_limit);
+            wal.close()?;
+            let file = File::open(&path)?;
+            assert_eq!(file.metadata()?.len(), configured_limit);
+            let mut written_data = [0; WAL_V7_FRAME_LEN];
+            file.read_exact_at(&mut written_data, data_range.start)?;
+            assert_eq!(written_data, data_bytes);
+        }
+
+        Ok(())
     }
 
     #[test]

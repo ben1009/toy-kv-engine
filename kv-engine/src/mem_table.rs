@@ -1279,7 +1279,7 @@ impl MemTable {
                 )?;
                 Wal::from_v7_leader(writer)?
             }
-            WalIoMode::Parallel => Wal::from_v7_parallel(&path, seed)?,
+            WalIoMode::Parallel => Wal::from_v7_parallel(&path, seed, max_file_size)?,
         });
         ret.wal_path = Some(path);
         ret.wal_v7_reservation_owner = Some(reservation_owner);

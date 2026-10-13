@@ -147,6 +147,11 @@ Recovered Active v7 attachment now selects the requested I/O mode: Leader uses
 the serial v7 writer, while Parallel starts from the installed runtime seed
 without extent initialization or buffer prewarming. Parallel admission remains
 closed until live reservations and the v7 marker coordinator are connected.
+The paused runtime now carries persisted `max_segment_bytes` into its physical
+allocator, file-length validation, and preallocation bounds, rather than
+inheriting the larger global WAL cap. Tests cover capacity classification,
+rejection of installed images larger than their configured segment, and actual
+packer preallocation under small and unaligned segment limits.
 The allocator now derives the exact captured physical prefix `E(T)` from
 pending per-ticket DATA ends and the previous FRONTIER end. Each marker
 reservation stores that value, and successful sync retires only DATA-end cursors
@@ -598,7 +603,9 @@ this stage.
   starting workers. Keep this v7 runtime closed, with no extent initialization or
   prewarmed direct buffers; runtime admission opens only after later slices
   install the live reservations and v7 write protocol. The existing v4 startup
-  keeps its current behavior.
+  keeps its current behavior. V7 startup also receives persisted
+  `max_segment_bytes` and applies it to physical allocation, file validation,
+  and preallocation bounds.
 - Initialize the runtime from the descriptor and recovered state, including
   v7's DATA start and continued segment ticket numbering. Retain the existing
   32 group slots and 256 ring entries unless a separately measured change is
