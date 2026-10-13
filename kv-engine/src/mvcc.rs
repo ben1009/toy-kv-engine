@@ -35,6 +35,23 @@ const PUBLICATION_DISTANCE_THRESHOLD: u64 = 16;
 const DRAIN_RECHECK: std::time::Duration = std::time::Duration::from_millis(1);
 type WalPublish = (u64, Vec<u8>, Vec<u8>, Option<u64>);
 
+/// A caught v7 panic cannot leave an outstanding reservation without closing
+/// admission. The synchronous append may already have written or synced its
+/// batch, so conservatively require recovery even if the panic preceded I/O.
+struct V7CommitUnwindGuard<'a> {
+    mvcc: &'a LsmMvccInner,
+    commit_ts: u64,
+    enabled: bool,
+}
+
+impl Drop for V7CommitUnwindGuard<'_> {
+    fn drop(&mut self) {
+        if self.enabled && std::thread::panicking() {
+            self.mvcc.poison_commit_ts(self.commit_ts);
+        }
+    }
+}
+
 pub(crate) struct CommittedTxnData {
     pub(crate) write_set: HashSet<Bytes>,
     // Stored for watermark/GC purposes; currently only write_set is read during
@@ -471,6 +488,44 @@ impl LsmMvccInner {
         }
     }
 
+    fn guard_v7_commit_unwind(
+        &self,
+        memtable: &MemTable,
+        commit_ts: u64,
+    ) -> V7CommitUnwindGuard<'_> {
+        V7CommitUnwindGuard {
+            mvcc: self,
+            commit_ts,
+            enabled: memtable.uses_v7_wal(),
+        }
+    }
+
+    /// The serial v7 adapter includes its sync in append. An append error after
+    /// admission can therefore leave a recoverable batch, just like a failed
+    /// ticket barrier; only a pre-admission rejection can retire a data-free gap.
+    fn record_wal_append_failure(&self, memtable: &MemTable, commit_ts: u64) {
+        if memtable.v7_wal_requires_recovery() {
+            self.poison_commit_ts(commit_ts);
+        } else {
+            self.retire_commit_ts(commit_ts);
+        }
+    }
+
+    /// Record the PITR timestamp for an admitted commit, retiring the commit if
+    /// timestamp conversion fails before any WAL append has been attempted.
+    fn pitr_recorded_at_for_commit(
+        &self,
+        commit_ts: u64,
+    ) -> anyhow::Result<crate::pitr::RecordedAt> {
+        match self.next_pitr_recorded_at(std::time::SystemTime::now()) {
+            Ok(recorded_at) => Ok(recorded_at),
+            Err(error) => {
+                self.retire_commit_ts(commit_ts);
+                Err(error)
+            }
+        }
+    }
+
     pub(crate) fn retire_commit_ts(&self, commit_ts: u64) {
         let mut publication = self.publication.lock();
         self.in_flight.fetch_sub(1, Ordering::SeqCst);
@@ -676,12 +731,13 @@ impl LsmMvccInner {
         );
         let _write_guard = self.write_lock.lock();
         let commit_ts = self.reserve_commit_ts()?;
+        let _unwind_guard = self.guard_v7_commit_unwind(memtable, commit_ts);
         let encoded_key = encode_internal_key(user_key, commit_ts);
         let mut prefixed = Vec::with_capacity(1 + value.len());
         prefixed.push(crate::vlog::KvKind::Inline as u8);
         prefixed.extend_from_slice(value);
-        let ticket = match if memtable.uses_wal_v5() {
-            let recorded_at = self.next_pitr_recorded_at(std::time::SystemTime::now())?;
+        let ticket = match if memtable.uses_pitr_batch_wal() {
+            let recorded_at = self.pitr_recorded_at_for_commit(commit_ts)?;
             memtable.write_pitr_wal_batch_only(
                 &crate::pitr::WalBatch {
                     commit_ts,
@@ -701,7 +757,7 @@ impl LsmMvccInner {
         } {
             Ok(ticket) => ticket,
             Err(error) => {
-                self.retire_commit_ts(commit_ts);
+                self.record_wal_append_failure(memtable, commit_ts);
                 return Err(error);
             }
         };
@@ -722,10 +778,11 @@ impl LsmMvccInner {
     ) -> Result<WalPublish, anyhow::Error> {
         let _write_guard = self.write_lock.lock();
         let commit_ts = self.reserve_commit_ts()?;
+        let _unwind_guard = self.guard_v7_commit_unwind(memtable, commit_ts);
         let encoded_key = encode_internal_key(user_key, commit_ts);
         let tombstone_val = vec![crate::vlog::KvKind::Tombstone as u8];
-        let ticket = match if memtable.uses_wal_v5() {
-            let recorded_at = self.next_pitr_recorded_at(std::time::SystemTime::now())?;
+        let ticket = match if memtable.uses_pitr_batch_wal() {
+            let recorded_at = self.pitr_recorded_at_for_commit(commit_ts)?;
             memtable.write_pitr_wal_batch_only(
                 &crate::pitr::WalBatch {
                     commit_ts,
@@ -744,7 +801,7 @@ impl LsmMvccInner {
         } {
             Ok(ticket) => ticket,
             Err(error) => {
-                self.retire_commit_ts(commit_ts);
+                self.record_wal_append_failure(memtable, commit_ts);
                 return Err(error);
             }
         };
@@ -770,12 +827,13 @@ impl LsmMvccInner {
         );
         let _write_guard = self.write_lock.lock();
         let commit_ts = self.reserve_commit_ts()?;
+        let _unwind_guard = self.guard_v7_commit_unwind(memtable, commit_ts);
         let encoded_key = encode_internal_key(user_key, commit_ts);
         let expire_at = crate::vlog::compute_expire_at(ttl);
         let prefixed =
             crate::vlog::encode_ttl_value(crate::vlog::KvKind::TtlInline, expire_at, value);
-        let ticket = match if memtable.uses_wal_v5() {
-            let recorded_at = self.next_pitr_recorded_at(std::time::SystemTime::now())?;
+        let ticket = match if memtable.uses_pitr_batch_wal() {
+            let recorded_at = self.pitr_recorded_at_for_commit(commit_ts)?;
             memtable.write_pitr_wal_batch_only(
                 &crate::pitr::WalBatch {
                     commit_ts,
@@ -795,7 +853,7 @@ impl LsmMvccInner {
         } {
             Ok(ticket) => ticket,
             Err(error) => {
-                self.retire_commit_ts(commit_ts);
+                self.record_wal_append_failure(memtable, commit_ts);
                 return Err(error);
             }
         };
@@ -814,8 +872,9 @@ impl LsmMvccInner {
         let (commit_ts, ticket) = {
             let _write_guard = self.write_lock.lock();
             let commit_ts = self.reserve_commit_ts()?;
-            let ticket = match if memtable.uses_wal_v5() {
-                let recorded_at = self.next_pitr_recorded_at(std::time::SystemTime::now())?;
+            let _unwind_guard = self.guard_v7_commit_unwind(memtable, commit_ts);
+            let ticket = match if memtable.uses_pitr_batch_wal() {
+                let recorded_at = self.pitr_recorded_at_for_commit(commit_ts)?;
                 memtable.write_pitr_wal_batch_only(
                     &crate::pitr::WalBatch {
                         commit_ts,
@@ -832,7 +891,7 @@ impl LsmMvccInner {
             } {
                 Ok(ticket) => ticket,
                 Err(error) => {
-                    self.retire_commit_ts(commit_ts);
+                    self.record_wal_append_failure(memtable, commit_ts);
                     return Err(error);
                 }
             };
@@ -871,8 +930,9 @@ impl LsmMvccInner {
         );
         let _write_guard = self.write_lock.lock();
         let commit_ts = self.reserve_commit_ts()?;
-        let ticket = match if memtable.uses_wal_v5() {
-            let recorded_at = self.next_pitr_recorded_at(std::time::SystemTime::now())?;
+        let _unwind_guard = self.guard_v7_commit_unwind(memtable, commit_ts);
+        let ticket = match if memtable.uses_pitr_batch_wal() {
+            let recorded_at = self.pitr_recorded_at_for_commit(commit_ts)?;
             memtable.write_pitr_wal_batch_only(
                 &crate::pitr::WalBatch {
                     commit_ts,
@@ -892,7 +952,7 @@ impl LsmMvccInner {
         } {
             Ok(ticket) => ticket,
             Err(error) => {
-                self.retire_commit_ts(commit_ts);
+                self.record_wal_append_failure(memtable, commit_ts);
                 return Err(error);
             }
         };
@@ -1008,6 +1068,7 @@ impl LsmMvccInner {
         }
         let _write_guard = write_guard.unwrap_or_else(|| self.write_lock.lock());
         let commit_ts = self.reserve_commit_ts()?;
+        let _unwind_guard = self.guard_v7_commit_unwind(memtable, commit_ts);
         let publish_data: Vec<(Bytes, Bytes)> = entries
             .iter()
             .map(|(key, value, kind)| match kind {
@@ -1031,8 +1092,8 @@ impl LsmMvccInner {
                 }
             })
             .collect();
-        if memtable.uses_wal_v5() {
-            let recorded_at = self.next_pitr_recorded_at(std::time::SystemTime::now())?;
+        if memtable.uses_pitr_batch_wal() {
+            let recorded_at = self.pitr_recorded_at_for_commit(commit_ts)?;
             let wal_entries = entries
                 .iter()
                 .map(|(key, value, kind)| match kind {
@@ -1067,7 +1128,7 @@ impl LsmMvccInner {
             ) {
                 Ok(ticket) => ticket,
                 Err(error) => {
-                    self.retire_commit_ts(commit_ts);
+                    self.record_wal_append_failure(memtable, commit_ts);
                     return Err(error);
                 }
             };
@@ -1144,6 +1205,7 @@ impl LsmMvccInner {
         }
         let _write_guard = self.write_lock.lock();
         let commit_ts = self.reserve_commit_ts()?;
+        let _unwind_guard = self.guard_v7_commit_unwind(memtable, commit_ts);
         let publish_data: Vec<(Bytes, Bytes)> = keys
             .iter()
             .map(|key| {
@@ -1153,8 +1215,8 @@ impl LsmMvccInner {
                 )
             })
             .collect();
-        if memtable.uses_wal_v5() {
-            let recorded_at = self.next_pitr_recorded_at(std::time::SystemTime::now())?;
+        if memtable.uses_pitr_batch_wal() {
+            let recorded_at = self.pitr_recorded_at_for_commit(commit_ts)?;
             let ticket = match memtable.write_pitr_wal_batch_only(
                 &crate::pitr::WalBatch {
                     commit_ts,
@@ -1168,7 +1230,7 @@ impl LsmMvccInner {
             ) {
                 Ok(ticket) => ticket,
                 Err(error) => {
-                    self.retire_commit_ts(commit_ts);
+                    self.record_wal_append_failure(memtable, commit_ts);
                     return Err(error);
                 }
             };

@@ -1301,6 +1301,39 @@ impl Wal {
             .is_some_and(|format| format.is_v5_family())
     }
 
+    pub(crate) fn is_pitr(&self) -> bool {
+        WalFormatDescriptor::for_version(self.format_version).is_some_and(|format| format.is_pitr())
+    }
+
+    pub(crate) fn is_v7(&self) -> bool {
+        self.format_version == WAL_FORMAT_VERSION_V7
+    }
+
+    /// Whether a failed v7 append can contain recoverable data. Inspect both
+    /// flags because cursor-publication errors poison the adapter, while an
+    /// unwind can leave only the serial writer poisoned.
+    pub(crate) fn v7_requires_recovery(&self) -> bool {
+        if !self.is_v7() {
+            return false;
+        }
+        if self.poisoned.load(Ordering::Acquire) {
+            return true;
+        }
+        if self
+            .v7_leader
+            .as_ref()
+            .is_some_and(|writer| writer.lock().is_poisoned())
+        {
+            self.poisoned.store(true, Ordering::Release);
+        }
+
+        self.poisoned.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn next_ticket(&self) -> u64 {
+        self.next_ticket.load(Ordering::Acquire)
+    }
+
     fn is_v4(&self) -> bool {
         WalFormatDescriptor::for_version(self.format_version).is_some_and(|format| format.is_v4())
     }
@@ -1482,7 +1515,9 @@ impl Wal {
         profile: Option<&crate::mem_table::WriteProfile>,
     ) -> Result<u64> {
         if self.format_version == WAL_FORMAT_VERSION_V7 {
-            return self.put_v7_leader_batch(batch, limits);
+            return self
+                .put_v7_leader_batch(batch, limits)
+                .map(|(ticket, _)| ticket);
         }
 
         anyhow::ensure!(
@@ -1599,11 +1634,26 @@ impl Wal {
         Ok(ticket)
     }
 
+    /// Append a v7 PITR batch and return the first DATA frame offset for its
+    /// seal index. Callers must serialize this with their seal-index update.
+    pub(crate) fn put_v7_batch_with_index(
+        &self,
+        batch: &crate::pitr::WalBatch,
+        limits: crate::pitr::WalV5Limits,
+    ) -> Result<(u64, u64)> {
+        anyhow::ensure!(
+            self.format_version == WAL_FORMAT_VERSION_V7,
+            "v7 WAL append selected for format {}",
+            self.format_version
+        );
+        self.put_v7_leader_batch(batch, limits)
+    }
+
     fn put_v7_leader_batch(
         &self,
         batch: &crate::pitr::WalBatch,
         limits: crate::pitr::WalV5Limits,
-    ) -> Result<u64> {
+    ) -> Result<(u64, u64)> {
         anyhow::ensure!(
             !self.poisoned.load(Ordering::Acquire),
             "WAL is poisoned due to a previous I/O error"
@@ -1638,7 +1688,7 @@ impl Wal {
                     self.poisoned.store(true, Ordering::Release);
                     return Err(error);
                 }
-                Ok(commit.ticket)
+                Ok((commit.ticket, commit.first_data_offset))
             }
             Err(error) => {
                 if writer.is_poisoned() {
