@@ -13,10 +13,22 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::wal::v7::{
-    allocator::{WalV7DataAllocation, WalV7PhysicalAllocator},
-    codec::{WAL_V7_HEADER_LEN, WalV7Header},
-    install::{WalV7RuntimeMetadata, WalV7RuntimeSeed},
+use crate::{
+    pitr::{CanonicalWalEntryStream, LIVE_WAL_V5_LIMITS, WalBatch, WalV5Limits},
+    wal::v7::{
+        admission::{WalV7BatchBufferPin, WalV7OwnedBatchReservation, WalV7ReservationOwner},
+        allocator::{
+            WalV7DataAllocation, WalV7DataCapacityStatus, WalV7FrontierCursor,
+            WalV7FrontierReservation, WalV7PhysicalAllocator,
+        },
+        codec::{
+            WAL_V7_FRAME_LEN, WAL_V7_HEADER_LEN, WalV7Frontier, WalV7Header, data_fragment_count,
+            encode_data_frames_into, encode_frontier_successor_into, frame_record_digest,
+            prepare_logical_batch,
+        },
+        install::{WalV7RuntimeMetadata, WalV7RuntimeSeed},
+        leader::WalV7LeaderCapacityError,
+    },
 };
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
@@ -57,11 +69,7 @@ impl std::fmt::Display for WalFull {
 
 impl std::error::Error for WalFull {}
 
-/// Coordinates from which a parallel runtime begins admission.
-///
-/// A v7 runtime is deliberately constructed paused: until later runtime slices
-/// install its marker writer and live resource reservations, it must not admit
-/// v4-shaped writes or allocate speculative extents.
+/// Coordinates and resource owner from which a parallel runtime begins admission.
 pub(crate) struct ParallelWalRuntimeStart {
     append_offset: u64,
     next_ticket: u64,
@@ -70,6 +78,7 @@ pub(crate) struct ParallelWalRuntimeStart {
     v7_metadata: Option<WalV7RuntimeMetadata>,
     v7_header_digest: Option<[u8; 32]>,
     expected_v7_inode: Option<(u64, u64)>,
+    v7_reservation_owner: Option<Arc<WalV7ReservationOwner>>,
     min_append_offset: u64,
     admission_open: bool,
     initialize_extents: bool,
@@ -86,6 +95,7 @@ impl ParallelWalRuntimeStart {
             v7_metadata: None,
             v7_header_digest: None,
             expected_v7_inode: None,
+            v7_reservation_owner: None,
             min_append_offset: WAL_HEADER_END,
             admission_open: true,
             initialize_extents: true,
@@ -95,14 +105,22 @@ impl ParallelWalRuntimeStart {
         Ok(start)
     }
 
-    pub(crate) fn v7(seed: WalV7RuntimeSeed, max_file_size: u64) -> Result<Self> {
+    pub(crate) fn v7(
+        seed: WalV7RuntimeSeed,
+        max_file_size: u64,
+        reservation_owner: Option<Arc<WalV7ReservationOwner>>,
+    ) -> Result<Self> {
         let expected_v7_inode = Some((seed.installed_dev, seed.installed_ino));
+        if let Some(owner) = &reservation_owner {
+            owner.validate_image(seed.installed_dev, seed.installed_ino)?;
+        }
         let v7_allocator = WalV7PhysicalAllocator::new(
             seed.next_ticket,
             seed.append_offset,
             max_file_size,
             seed.frontier_cursor,
         )?;
+        let admission_open = reservation_owner.is_some();
         let start = Self {
             append_offset: seed.append_offset,
             next_ticket: seed.next_ticket,
@@ -111,8 +129,9 @@ impl ParallelWalRuntimeStart {
             v7_metadata: Some(seed.metadata),
             v7_header_digest: Some(seed.header_digest),
             expected_v7_inode,
+            v7_reservation_owner: reservation_owner,
             min_append_offset: seed.data_start,
-            admission_open: false,
+            admission_open,
             initialize_extents: false,
             prewarm_buffers: false,
         };
@@ -134,12 +153,21 @@ impl ParallelWalRuntimeStart {
             "invalid initial WAL append offset {}",
             self.append_offset
         );
-        match (&self.v7_allocator, &self.v7_metadata, self.v7_header_digest) {
-            (Some(allocator), Some(metadata), Some(_)) => {
+        match (
+            &self.v7_allocator,
+            &self.v7_metadata,
+            self.v7_header_digest,
+            &self.v7_reservation_owner,
+        ) {
+            (Some(allocator), Some(metadata), Some(_), Some(_)) => {
                 metadata
                     .validate_frontier(allocator.last_frontier().frontier, self.append_offset)?;
             }
-            (None, None, None) => {}
+            (Some(allocator), Some(metadata), Some(_), None) if !self.admission_open => {
+                metadata
+                    .validate_frontier(allocator.last_frontier().frontier, self.append_offset)?;
+            }
+            (None, None, None, None) => {}
             _ => bail!("parallel WAL startup has incomplete v7 recovery metadata"),
         }
         Ok(())
@@ -390,6 +418,9 @@ pub(crate) struct ParallelBuffer {
     buffer: Option<DirectBuf>,
     budget: Arc<BufferBudget>,
     active_bytes: Option<u64>,
+    poolable: bool,
+    // Field order frees the DATA allocation before retiring its ledger pin.
+    _v7_reservation_pin: Option<WalV7BatchBufferPin>,
 }
 
 impl ParallelBuffer {
@@ -398,6 +429,8 @@ impl ParallelBuffer {
             buffer: Some(buffer),
             budget,
             active_bytes: None,
+            poolable: true,
+            _v7_reservation_pin: None,
         }
     }
 
@@ -406,6 +439,23 @@ impl ParallelBuffer {
             buffer: Some(buffer),
             budget,
             active_bytes: Some(active_bytes),
+            poolable: true,
+            _v7_reservation_pin: None,
+        }
+    }
+
+    fn activate_unpooled(
+        buffer: DirectBuf,
+        budget: Arc<BufferBudget>,
+        active_bytes: u64,
+        reservation_pin: WalV7BatchBufferPin,
+    ) -> Self {
+        Self {
+            buffer: Some(buffer),
+            budget,
+            active_bytes: Some(active_bytes),
+            poolable: false,
+            _v7_reservation_pin: Some(reservation_pin),
         }
     }
 
@@ -446,7 +496,7 @@ impl WorkerBuffer for ParallelBuffer {
 
     fn retire(mut self, pool: &ArrayQueue<Self>) {
         self.release_budget();
-        if self.cap() == BUFFER_POOL_BUF_SIZE {
+        if self.poolable && self.cap() == BUFFER_POOL_BUF_SIZE {
             let _ = pool.push(self);
         }
     }
@@ -486,7 +536,23 @@ struct AdmissionState {
     next_ticket: u64,
     admitted_end: u64,
     v7_allocator: Option<WalV7PhysicalAllocator>,
+    v7_header_digest: Option<[u8; 32]>,
+    v7_reservation_owner: Option<Arc<WalV7ReservationOwner>>,
+    v7_metadata: Option<WalV7RuntimeMetadata>,
+    v7_prefixes: BTreeMap<u64, WalV7PrefixMetadata>,
+    v7_reservations: BTreeMap<u64, WalV7OwnedBatchReservation>,
     queue: VecDeque<AdmittedBatch>,
+}
+
+#[derive(Clone, Copy)]
+struct WalV7PrefixMetadata {
+    last_commit_ts: u64,
+    prefix_digest: [u8; 32],
+}
+
+struct WalV7FrontierCycle {
+    reservation: WalV7FrontierReservation,
+    cursor: WalV7FrontierCursor,
 }
 
 #[derive(Default)]
@@ -523,12 +589,9 @@ struct RuntimeInner {
     worker: IoWorkerClient<ParallelBuffer>,
     sync_progress: Arc<WalSyncProgress>,
     preallocator: Arc<File>,
+    preallocation_lock: Mutex<()>,
     max_file_size: u64,
     durability: Arc<DurabilityShared>,
-    // The ordered v7 packer and Frontier coordinator will consume this state
-    // when their live admission and marker-write protocol is connected.
-    #[allow(dead_code)]
-    v7_metadata: Mutex<Option<WalV7RuntimeMetadata>>,
 }
 
 struct RuntimeThreads {
@@ -758,6 +821,11 @@ impl ParallelWalRuntime {
                 next_ticket: start.next_ticket,
                 admitted_end: initial_file_end,
                 v7_allocator: start.v7_allocator,
+                v7_header_digest: start.v7_header_digest,
+                v7_reservation_owner: start.v7_reservation_owner,
+                v7_metadata: start.v7_metadata,
+                v7_prefixes: BTreeMap::new(),
+                v7_reservations: BTreeMap::new(),
                 queue: VecDeque::new(),
             }),
             packer_state: Mutex::new(PackerState {
@@ -775,9 +843,9 @@ impl ParallelWalRuntime {
             worker: worker_client,
             sync_progress,
             preallocator,
+            preallocation_lock: Mutex::new(()),
             max_file_size: start.max_file_size,
             durability: Arc::clone(&durability),
-            v7_metadata: Mutex::new(start.v7_metadata),
         });
 
         let coordinator_inner = Arc::clone(&inner);
@@ -857,6 +925,234 @@ impl ParallelWalRuntime {
         self.inner.buffer_budget.reserve_async(capacity_u64).await?;
 
         Ok(self.activate_buffer(capacity, capacity_u64))
+    }
+
+    fn allocate_v7_buffer(
+        &self,
+        capacity: usize,
+        reservation: &WalV7OwnedBatchReservation,
+    ) -> Result<ParallelBuffer> {
+        ensure!(
+            capacity > 0 && capacity.is_multiple_of(WAL_V7_FRAME_LEN),
+            "v7 DATA buffer capacity is not a positive frame multiple"
+        );
+        let capacity_u64 =
+            u64::try_from(capacity).context("v7 DATA buffer capacity exceeds u64")?;
+        self.inner.buffer_budget.reserve(capacity_u64)?;
+
+        Ok(ParallelBuffer::activate_unpooled(
+            DirectBuf::new(capacity),
+            Arc::clone(&self.inner.buffer_budget),
+            capacity_u64,
+            reservation.pin_buffer(),
+        ))
+    }
+
+    /// Prepare and admit one v7 ticket into the ordered parallel DATA packer.
+    /// The caller publishes the returned ticket only after `wait_durable`.
+    pub(crate) fn put_v7_batch(&self, batch: &WalBatch, limits: WalV5Limits) -> Result<(u64, u64)> {
+        ensure!(!batch.entries.is_empty(), "v7 WAL batch is empty");
+        let limits = WalV5Limits {
+            max_input_entry_count: limits
+                .max_input_entry_count
+                .min(LIVE_WAL_V5_LIMITS.max_input_entry_count),
+            max_batch_data_bytes: limits
+                .max_batch_data_bytes
+                .min(LIVE_WAL_V5_LIMITS.max_batch_data_bytes),
+            max_entry_count: limits
+                .max_entry_count
+                .min(LIVE_WAL_V5_LIMITS.max_entry_count),
+            max_key_bytes: limits.max_key_bytes.min(LIVE_WAL_V5_LIMITS.max_key_bytes),
+            max_value_bytes: limits
+                .max_value_bytes
+                .min(LIVE_WAL_V5_LIMITS.max_value_bytes),
+        };
+        let owner = self
+            .inner
+            .admission
+            .lock()
+            .v7_reservation_owner
+            .clone()
+            .context("v7 Parallel runtime has no reservation owner")?;
+        {
+            let admission = self.inner.admission.lock();
+            ensure!(admission.open, "v7 Parallel WAL admission is closed");
+            ensure!(admission.v7_allocator.is_some(), "WAL runtime is not v7");
+        }
+
+        let preparation_bytes = CanonicalWalEntryStream::preparation_buffer_bytes(batch, limits)?;
+        let preparation = owner.reserve_preparation_buffer(preparation_bytes)?;
+        let prepared = prepare_logical_batch(batch, limits)?;
+
+        let encoded_batch_bytes =
+            u64::try_from(prepared.encoded_len()).context("v7 logical batch length exceeds u64")?;
+        let fragment_count = data_fragment_count(encoded_batch_bytes)
+            .context("v7 logical batch has no valid DATA fragment count")?;
+        let frame_count =
+            usize::try_from(fragment_count).context("v7 DATA fragment count exceeds usize")?;
+        let frame_bytes = frame_count
+            .checked_mul(WAL_V7_FRAME_LEN)
+            .context("v7 DATA frame buffer length overflows")?;
+
+        {
+            let admission = self.inner.admission.lock();
+            ensure!(admission.open, "v7 Parallel WAL admission is closed");
+            validate_v7_data_capacity(&admission, fragment_count)?;
+        }
+
+        // Charge persistent frames, marker headroom, seal index, and all batch
+        // buffers before allocating a direct buffer or assigning coordinates.
+        let mut reservation = match owner.reserve_batch(encoded_batch_bytes) {
+            Ok(reservation) => reservation,
+            Err(resource_error) => {
+                // Concurrent producers can consume the remaining segment space
+                // after preflight. Preserve rotation as the actionable result
+                // when that happened while resource accounting was in flight.
+                let admission = self.inner.admission.lock();
+                ensure!(admission.open, "v7 Parallel WAL admission is closed");
+                validate_v7_data_capacity(&admission, fragment_count)?;
+                return Err(resource_error).context("reserve v7 Parallel batch resources");
+            }
+        };
+        let mut buffer = self.allocate_v7_buffer(frame_bytes, &reservation)?;
+        let mut post_admission_failure = None;
+        let (ticket, first_data_offset) = {
+            let mut admission = self.inner.admission.lock();
+            ensure!(admission.open, "v7 Parallel WAL admission is closed");
+            validate_v7_data_capacity(&admission, fragment_count)?;
+            let allocator = admission
+                .v7_allocator
+                .as_ref()
+                .context("v7 Parallel runtime has no physical allocator")?;
+
+            let ticket = allocator.next_ticket();
+            ensure!(
+                ticket == admission.next_ticket,
+                "v7 Parallel admission ticket cursor disagrees with its allocator"
+            );
+            let previous = allocator.last_frontier();
+            let allocation_tail = allocator.allocation_tail();
+            let physical_hashed_end = admission
+                .v7_metadata
+                .as_ref()
+                .map(|metadata| metadata.physical_hashed_end)
+                .context("v7 Parallel runtime has no hash metadata")?;
+            ensure!(
+                physical_hashed_end == allocation_tail,
+                "v7 Parallel physical hash cursor disagrees with DATA allocator"
+            );
+            let last_commit_ts = admission
+                .v7_prefixes
+                .last_key_value()
+                .map_or(previous.frontier.last_commit_ts, |(_, metadata)| {
+                    metadata.last_commit_ts
+                });
+            ensure!(
+                batch.commit_ts > last_commit_ts,
+                "v7 Parallel batch commit timestamp does not advance"
+            );
+            let recorded_at = admission
+                .v7_metadata
+                .as_ref()
+                .and_then(|metadata| metadata.last_recorded_at)
+                .map_or(batch.recorded_at, |previous| {
+                    previous.max(batch.recorded_at)
+                });
+            let logical_batch = prepared.encode_with_recorded_at(ticket, recorded_at)?;
+            drop(preparation);
+            let next_ticket = ticket
+                .checked_add(1)
+                .context("v7 Parallel ticket counter overflows")?;
+            let header_digest = admission
+                .v7_header_digest
+                .context("v7 Parallel runtime has no immutable-header digest")?;
+            ensure!(
+                !admission.v7_reservations.contains_key(&ticket),
+                "v7 Parallel admission reused a reservation ticket"
+            );
+            // All expected fallible work is complete before reserve_data. If
+            // frame materialization fails after coordinate assignment, poison
+            // the runtime and leave the persistent charge with its image owner.
+            let allocation = admission
+                .v7_allocator
+                .as_mut()
+                .context("v7 Parallel runtime has no physical allocator")?
+                .reserve_data(fragment_count)?;
+            let first_data_offset = allocation.frame_range().start;
+            let data_end = allocation.frame_range().end;
+            reservation.mark_admitted();
+            let previous_reservation = admission.v7_reservations.insert(ticket, reservation);
+            debug_assert!(previous_reservation.is_none());
+            admission.next_ticket = next_ticket;
+            admission.admitted_end = data_end;
+
+            let encoded_len = encode_data_frames_into(
+                header_digest,
+                first_data_offset,
+                ticket,
+                &logical_batch,
+                limits,
+                buffer.direct_mut().as_mut_slice(),
+            );
+            match encoded_len {
+                Ok(encoded_len) if encoded_len == frame_bytes => {
+                    buffer.direct_mut().set_len(encoded_len);
+                    let metadata = admission
+                        .v7_metadata
+                        .as_mut()
+                        .expect("v7 runtime metadata is present for a v7 allocator");
+                    metadata.logical_hasher.update(&logical_batch);
+                    let prefix_digest: [u8; 32] = metadata.logical_hasher.clone().finalize().into();
+                    metadata
+                        .physical_hasher
+                        .update(buffer.direct_mut().initialized_slice(0, encoded_len));
+                    metadata.physical_hashed_end = data_end;
+                    metadata.last_recorded_at = Some(recorded_at);
+                    admission.v7_prefixes.insert(
+                        next_ticket,
+                        WalV7PrefixMetadata {
+                            last_commit_ts: batch.commit_ts,
+                            prefix_digest,
+                        },
+                    );
+                    admission.queue.push_back(AdmittedBatch {
+                        ticket,
+                        file_offset: first_data_offset,
+                        aligned_len: encoded_len,
+                        v7_allocation: Some(allocation),
+                        buffer,
+                    });
+                    #[cfg(feature = "chaos-testing")]
+                    crate::chaos::failpoint::note_parallel_wal_admission();
+                }
+                Ok(_) => {
+                    post_admission_failure = Some((
+                        ticket,
+                        anyhow!("v7 DATA materializer returned an unexpected frame length"),
+                    ));
+                }
+                Err(error) => post_admission_failure = Some((ticket, error)),
+            }
+            if let Some((failed_ticket, error)) = &post_admission_failure {
+                admission.open = false;
+                if admission
+                    .poison
+                    .as_ref()
+                    .is_none_or(|(current, _)| failed_ticket < current)
+                {
+                    admission.poison = Some((*failed_ticket, format!("{error:#}")));
+                }
+            }
+            (ticket, first_data_offset)
+        };
+
+        if let Some((ticket, error)) = post_admission_failure {
+            report_packer_failure(&self.inner, ticket, &error);
+            return Err(error).context("materialize admitted v7 Parallel DATA frames");
+        }
+
+        let _ = self.inner.packer_wake.try_send(true);
+        Ok((ticket, first_data_offset))
     }
 
     fn activate_buffer(&self, capacity: usize, capacity_u64: u64) -> ParallelBuffer {
@@ -1006,6 +1302,13 @@ impl ParallelWalRuntime {
 
     pub(crate) fn batch_count(&self) -> u64 {
         self.inner.admission.lock().next_ticket
+    }
+
+    pub(crate) fn is_poisoned(&self) -> bool {
+        if self.inner.durability.state.lock().poison_ticket.is_some() {
+            return true;
+        }
+        self.inner.admission.lock().poison.is_some()
     }
 
     pub(crate) fn set_write_profile(&self, profile: Arc<crate::mem_table::WriteProfile>) {
@@ -1160,6 +1463,23 @@ impl ParallelWalRuntime {
             }
         }
 
+        // Stop owning failed/discarded batch operations after worker and
+        // coordinator drain. A DATA buffer retained for ambiguous submission
+        // keeps its own reservation pin, so only freed buffers lose their
+        // charges. Persistent charges stay with the image until cleanup.
+        let remaining_reservations = {
+            let mut admission = self.inner.admission.lock();
+            admission.queue.clear();
+            std::mem::take(&mut admission.v7_reservations)
+        };
+        for reservation in remaining_reservations.into_values() {
+            if let Err(error) = reservation.finish_after_io() {
+                close_error.get_or_insert_with(|| {
+                    format!("failed to retire v7 WAL buffer reservation: {error}")
+                });
+            }
+        }
+
         if close_error.is_none()
             && let Some(error) = self.inner.durability.state.lock().poison_error.clone()
         {
@@ -1183,6 +1503,22 @@ impl Drop for ParallelWalRuntime {
     fn drop(&mut self) {
         if let Err(error) = self.close() {
             log::error!("failed to close parallel WAL runtime: {error:#}");
+        }
+    }
+}
+
+fn validate_v7_data_capacity(admission: &AdmissionState, fragment_count: u32) -> Result<()> {
+    let allocator = admission
+        .v7_allocator
+        .as_ref()
+        .context("v7 Parallel runtime has no physical allocator")?;
+    match allocator.data_capacity_status(fragment_count)? {
+        WalV7DataCapacityStatus::Fits => Ok(()),
+        WalV7DataCapacityStatus::RotationRequired => Err(anyhow::Error::new(
+            WalV7LeaderCapacityError::RotationRequired,
+        )),
+        WalV7DataCapacityStatus::BatchTooLarge => {
+            Err(anyhow::Error::new(WalV7LeaderCapacityError::BatchTooLarge))
         }
     }
 }
@@ -1250,7 +1586,7 @@ fn pack_admitted_groups(
                 Some(initializer) => {
                     initializer.prepare(target_preallocated_end, packed.initialize_extents)
                 }
-                None => preallocate(&inner.preallocator, target_preallocated_end),
+                None => preallocate_runtime(inner, target_preallocated_end),
             };
             if let Err(error) = allocation {
                 report_packer_failure(inner, first_ticket, &error);
@@ -1437,8 +1773,13 @@ fn report_packer_failure(inner: &RuntimeInner, ticket: u64, error: &anyhow::Erro
         {
             admission.poison = Some((ticket, message.clone()));
         }
-        admission.queue.clear();
+        let poison_ticket = admission
+            .poison
+            .as_ref()
+            .map_or(ticket, |(poison_ticket, _)| *poison_ticket);
+        admission.queue.retain(|batch| batch.ticket < poison_ticket);
     }
+    let _ = inner.packer_wake.try_send(true);
     inner.buffer_budget.close();
     if let Some(failures) = inner.packer_failures.lock().as_ref() {
         let _ = failures.send(GroupWriteResult {
@@ -1557,6 +1898,7 @@ fn process_group_result(inner: &RuntimeInner, result: GroupWriteResult) {
         result.error.is_none() && result.tickets.start > state.written_frontier;
     if let Some(error) = &result.error {
         set_poison(&mut state, result.tickets.start, error.clone());
+        let durability_poison_ticket = state.poison_ticket.unwrap_or(result.tickets.start);
         let mut admission = inner.admission.lock();
         admission.open = false;
         if admission
@@ -1566,7 +1908,13 @@ fn process_group_result(inner: &RuntimeInner, result: GroupWriteResult) {
         {
             admission.poison = Some((result.tickets.start, error.clone()));
         }
-        admission.queue.clear();
+        let poison_ticket = admission
+            .poison
+            .as_ref()
+            .map_or(durability_poison_ticket, |(poison_ticket, _)| {
+                durability_poison_ticket.min(*poison_ticket)
+            });
+        admission.queue.retain(|batch| batch.ticket < poison_ticket);
         inner.buffer_budget.close();
     } else {
         let previous = state.completed.insert(result.tickets.start, result);
@@ -1638,6 +1986,231 @@ fn set_poison(state: &mut DurabilityState, ticket: u64, error: String) {
     }
 }
 
+fn poison_v7_runtime(
+    inner: &RuntimeInner,
+    reservation: Option<WalV7FrontierReservation>,
+    durable_ticket: u64,
+    message: impl Into<String>,
+) {
+    let mut message = message.into();
+    let mut state = inner.durability.state.lock();
+    set_poison(&mut state, durable_ticket, message.clone());
+    let mut admission = inner.admission.lock();
+    if let Some(reservation) = reservation
+        && let Some(allocator) = admission.v7_allocator.as_mut()
+        && let Err(error) = allocator.poison_frontier(reservation)
+    {
+        message.push_str(&format!(
+            "; also failed to poison frontier allocator: {error:#}"
+        ));
+    }
+    admission.open = false;
+    admission.queue.clear();
+    if admission
+        .poison
+        .as_ref()
+        .is_none_or(|(ticket, _)| durable_ticket < *ticket)
+    {
+        admission.poison = Some((durable_ticket, message.clone()));
+    }
+    inner.buffer_budget.close();
+    inner.durability.notify_change();
+}
+
+fn append_v7_frontier(
+    sync_file: &File,
+    inner: &RuntimeInner,
+    target: u64,
+    durable_ticket: u64,
+    poison_ticket: Option<u64>,
+) -> Result<Option<WalV7FrontierCycle>> {
+    let mut frontier_reservation = None;
+    let result = (|| -> Result<Option<WalV7FrontierCycle>> {
+        let mut admission = inner.admission.lock();
+        let allocator = admission
+            .v7_allocator
+            .as_ref()
+            .context("v7 Parallel runtime has no physical allocator")?;
+        if allocator.eligible_durable_end_for(target)?.is_none() {
+            if let Some(poison) = poison_ticket {
+                ensure!(
+                    allocator.eligible_durable_end_for(poison)?.is_some(),
+                    "v7 DATA failure prevents an eligible FRONTIER below poison"
+                );
+            }
+            return Ok(None);
+        }
+        let mut frame = DirectBuf::new(WAL_V7_FRAME_LEN);
+        let previous = allocator.last_frontier();
+        let allocation_tail = allocator.allocation_tail();
+        let previous_frontier_end = previous
+            .frame_offset
+            .checked_add(WAL_V7_FRAME_LEN as u64)
+            .context("previous v7 FRONTIER end overflows")?;
+        let physical_hashed_end = admission
+            .v7_metadata
+            .as_ref()
+            .map(|metadata| metadata.physical_hashed_end)
+            .context("v7 Parallel runtime has no hash metadata")?;
+        ensure!(
+            physical_hashed_end == allocation_tail,
+            "v7 Parallel physical hash cursor disagrees with FRONTIER allocation tail"
+        );
+        let prefix = admission
+            .v7_prefixes
+            .get(&target)
+            .copied()
+            .context("v7 Parallel runtime has no digest snapshot for FRONTIER target")?;
+        let header_digest = admission
+            .v7_header_digest
+            .context("v7 Parallel runtime has no immutable-header digest")?;
+        let reservation = admission
+            .v7_allocator
+            .as_mut()
+            .context("v7 Parallel runtime has no physical allocator")?
+            .reserve_frontier(target)?;
+        frontier_reservation = Some(reservation.clone());
+
+        let frontier = WalV7Frontier {
+            generation: previous
+                .frontier
+                .generation
+                .checked_add(1)
+                .context("v7 Parallel FRONTIER generation overflows")?,
+            ticket_end: target,
+            durable_end: reservation.durable_end(),
+            last_commit_ts: prefix.last_commit_ts,
+            prefix_digest: prefix.prefix_digest,
+            previous_frontier_offset: previous.frame_offset,
+            previous_frontier_digest: previous.frame_digest,
+        };
+        encode_frontier_successor_into(
+            frame.as_mut_slice(),
+            frontier,
+            previous.frontier,
+            previous.frame_offset,
+            &previous.frame_digest,
+            reservation.frame_offset(),
+            header_digest,
+        )
+        .context("encode v7 Parallel FRONTIER")?;
+        frame.set_len(WAL_V7_FRAME_LEN);
+        let frontier_bytes = frame.initialized_slice(0, WAL_V7_FRAME_LEN);
+        let frontier_digest = frame_record_digest(frontier_bytes)?;
+        ensure!(
+            previous_frontier_end <= reservation.durable_end()
+                && reservation.durable_end() <= reservation.frame_offset(),
+            "v7 Parallel FRONTIER has invalid physical prefix bounds"
+        );
+        let frame_end = reservation
+            .frame_offset()
+            .checked_add(WAL_V7_FRAME_LEN as u64)
+            .context("v7 Parallel FRONTIER end overflows")?;
+        let preallocation_end = round_up(frame_end, PREALLOC_BLOCK)
+            .context("v7 Parallel FRONTIER preallocation end overflows")?
+            .min(inner.max_file_size);
+        ensure!(
+            preallocation_end >= frame_end,
+            "v7 Parallel FRONTIER exceeds the configured segment cap"
+        );
+        let metadata = admission
+            .v7_metadata
+            .as_mut()
+            .context("v7 Parallel runtime lost its hash metadata")?;
+        metadata.physical_hasher.update(frontier_bytes);
+        metadata.physical_hashed_end = frame_end;
+        admission.admitted_end = frame_end;
+        // Record the marker in the shared hash cursor before producers can
+        // append after it. Any failure in the I/O below poisons this runtime.
+        drop(admission);
+
+        preallocate_runtime(inner, preallocation_end)
+            .context("preallocate v7 Parallel FRONTIER frame")?;
+        write_v7_frontier_once(sync_file, frontier_bytes, reservation.frame_offset())
+            .context("write v7 Parallel FRONTIER")?;
+
+        Ok(Some(WalV7FrontierCycle {
+            reservation,
+            cursor: WalV7FrontierCursor {
+                frontier,
+                frame_offset: frontier_reservation
+                    .as_ref()
+                    .expect("the encoded FRONTIER has a reservation")
+                    .frame_offset(),
+                frame_digest: frontier_digest,
+            },
+        }))
+    })();
+
+    if let Err(error) = &result {
+        poison_v7_runtime(
+            inner,
+            frontier_reservation,
+            durable_ticket,
+            format!("v7 Parallel FRONTIER write failed: {error:#}"),
+        );
+    }
+    result
+}
+
+fn write_v7_frontier_once(file: &File, bytes: &[u8], offset: u64) -> io::Result<()> {
+    loop {
+        match file.write_at(bytes, offset) {
+            Ok(written) if written == bytes.len() => return Ok(()),
+            Ok(written) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    format!(
+                        "short v7 FRONTIER write: wrote {written} of {} bytes",
+                        bytes.len()
+                    ),
+                ));
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn complete_v7_frontier_cycle(inner: &RuntimeInner, cycle: WalV7FrontierCycle) -> Result<()> {
+    let ticket_end = cycle.reservation.ticket_end();
+    let retained_marker_ticket = ticket_end
+        .checked_sub(1)
+        .context("v7 FRONTIER target has no ticket to retain its marker credit")?;
+    let covered_reservations = {
+        let mut admission = inner.admission.lock();
+        let allocator = admission
+            .v7_allocator
+            .as_mut()
+            .context("v7 Parallel runtime has no physical allocator")?;
+        allocator.complete_frontier_sync(cycle.reservation.clone(), cycle.cursor)?;
+
+        let mut covered = std::mem::take(&mut admission.v7_reservations);
+        let later = covered.split_off(&ticket_end);
+        ensure!(
+            covered.contains_key(&retained_marker_ticket),
+            "v7 FRONTIER target has no owned batch reservation"
+        );
+        for (ticket, reservation) in &mut covered {
+            if *ticket != retained_marker_ticket {
+                reservation.release_unused_frontier_credit()?;
+            }
+        }
+        admission.v7_reservations = later;
+        admission
+            .v7_prefixes
+            .retain(|prefix_end, _| *prefix_end > ticket_end);
+        covered
+    };
+
+    for reservation in covered_reservations.into_values() {
+        reservation
+            .finish_after_io()
+            .context("retire v7 Parallel transient buffer reservation")?;
+    }
+    Ok(())
+}
+
 #[cfg(feature = "bench")]
 fn validate_sync_diagnostics_transition(
     enabled: bool,
@@ -1652,7 +2225,7 @@ fn validate_sync_diagnostics_transition(
 }
 
 fn synchronize_written_prefix(sync_file: &File, inner: &RuntimeInner) -> Result<Option<Duration>> {
-    let (target, durable) = {
+    let (target, durable, poison_ticket) = {
         let state = inner.durability.state.lock();
         let target = state
             .poison_ticket
@@ -1663,11 +2236,24 @@ fn synchronize_written_prefix(sync_file: &File, inner: &RuntimeInner) -> Result<
         if state.poison_ticket.is_some() && target > state.durable_frontier {
             crate::chaos::failpoint::note_parallel_wal_sync_with_poison();
         }
-        (target, state.durable_frontier)
+        (target, state.durable_frontier, state.poison_ticket)
     };
     if target <= durable {
         return Ok(None);
     }
+
+    let frontier_cycle = if inner.admission.lock().v7_allocator.is_some() {
+        let cycle = append_v7_frontier(sync_file, inner, target, durable, poison_ticket)?;
+        if cycle.is_none() {
+            // Retaining the preceding marker includes later DATA. Completion
+            // of those already admitted tickets will make a larger target
+            // eligible; no marker slot or sync is consumed while waiting.
+            return Ok(None);
+        }
+        cycle
+    } else {
+        None
+    };
 
     #[cfg(feature = "chaos-testing")]
     crate::chaos::failpoint::parallel_wal_crash_point("parallel_wal.before_fdatasync");
@@ -1724,6 +2310,18 @@ fn synchronize_written_prefix(sync_file: &File, inner: &RuntimeInner) -> Result<
         #[cfg(feature = "chaos-testing")]
         crate::chaos::failpoint::parallel_wal_crash_point("parallel_wal.after_fdatasync");
 
+        if let Some(cycle) = frontier_cycle
+            && let Err(error) = complete_v7_frontier_cycle(inner, cycle)
+        {
+            poison_v7_runtime(
+                inner,
+                None,
+                durable,
+                format!("v7 Parallel post-sync frontier publication failed: {error:#}"),
+            );
+            return Err(error).context("complete v7 Parallel FRONTIER sync cycle");
+        }
+
         let mut state = inner.durability.state.lock();
         let acknowledged = state
             .poison_ticket
@@ -1742,6 +2340,10 @@ fn synchronize_written_prefix(sync_file: &File, inner: &RuntimeInner) -> Result<
     };
 
     let message = format!("fdatasync failed: {error}");
+    if let Some(cycle) = frontier_cycle {
+        poison_v7_runtime(inner, Some(cycle.reservation), durable, message);
+        return Ok(Some(sync_latency));
+    }
     let mut state = inner.durability.state.lock();
     let poison = state.durable_frontier;
     set_poison(&mut state, poison, message.clone());
@@ -1793,6 +2395,11 @@ fn wal_sync_timestamp() -> Option<std::time::Instant> {
 /// already-sized range and avoid extending the WAL themselves.
 /// Only allocate the new suffix; revisiting the existing extents adds work
 /// as the WAL grows without reserving any additional space.
+fn preallocate_runtime(inner: &RuntimeInner, end: u64) -> Result<()> {
+    let _guard = inner.preallocation_lock.lock();
+    preallocate(&inner.preallocator, end)
+}
+
 fn preallocate(file: &File, end: u64) -> Result<()> {
     ensure!(
         end <= MAX_WAL_FILE_SIZE,
@@ -1838,6 +2445,494 @@ fn round_up(value: u64, alignment: u64) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
+    use std::{collections::BTreeMap, os::unix::fs::FileExt, path::Path, sync::Arc};
+
+    use crate::{
+        pitr::{LIVE_WAL_V5_LIMITS, RecordedAt, WalBatch, WalEntry, manifest::ActiveBoundary},
+        wal::v7::admission::{
+            WalV7ReservationOwner, WalV7ResourceCharge, WalV7ResourceLedger, WalV7ResourceLimits,
+        },
+    };
+
+    struct V7RuntimeTestWal {
+        wal: Wal,
+        owner: Arc<WalV7ReservationOwner>,
+        anchor: ActiveBoundary,
+    }
+
+    fn v7_test_resource_limits() -> WalV7ResourceLimits {
+        WalV7ResourceLimits {
+            max_logical_wal_bytes: u64::MAX,
+            max_source_spool_bytes: u64::MAX,
+            max_recovery_workspace_bytes: u64::MAX,
+            max_buffer_memory_bytes: u64::MAX,
+            max_seal_index_bytes: u64::MAX,
+        }
+    }
+
+    fn live_v7_test_wal(
+        path: &Path,
+        max_file_size: u64,
+        limits: WalV7ResourceLimits,
+    ) -> anyhow::Result<Option<V7RuntimeTestWal>> {
+        use crate::{
+            pitr::{ArchiveEpochId, ChainAnchor, SegmentId, TimelineId},
+            tests::harness::is_io_uring_unavailable_error,
+            wal::v7::{
+                codec::{WAL_V7_HEADER_LEN, WalV7Header, encode_generation_zero_frontier},
+                install::recover_and_install_active,
+                recovery::WalV7RecoveryAuthority,
+            },
+        };
+
+        let archive_epoch_id = ArchiveEpochId([0x22; 16]);
+        let header = WalV7Header {
+            timeline_id: TimelineId([0x11; 16]),
+            archive_epoch_id,
+            segment_id: SegmentId(7),
+            predecessor: ChainAnchor::Genesis { archive_epoch_id },
+            incarnation: [0x44; 16],
+        };
+        let header_digest = header.digest()?;
+        let mut empty_image = header.encode()?.to_vec();
+        empty_image.extend_from_slice(&encode_generation_zero_frontier(header_digest)?);
+        let anchor = ActiveBoundary {
+            timeline_id: header.timeline_id.0,
+            archive_epoch_id: header.archive_epoch_id.0,
+            segment_id: header.segment_id.0,
+            incarnation: header.incarnation,
+            ticket_end: 0,
+            durable_end: WAL_V7_HEADER_LEN as u64,
+            last_commit_ts: 0,
+            prefix_digest: header_digest,
+        };
+        std::fs::write(path, empty_image)?;
+        let recovered = recover_and_install_active(
+            path,
+            WalV7RecoveryAuthority::Active {
+                predecessor: header.predecessor,
+                durable_anchors: vec![anchor],
+            },
+        )?;
+        let ledger = WalV7ResourceLedger::new(limits)?;
+        let owner = Arc::new(WalV7ReservationOwner::new(ledger, &recovered.installed)?);
+        let wal = match Wal::from_v7_parallel(
+            path,
+            recovered.installed.runtime_seed()?,
+            max_file_size,
+            Some(Arc::clone(&owner)),
+        ) {
+            Ok(wal) => wal,
+            Err(error) if is_io_uring_unavailable_error(&error) => {
+                eprintln!("skipping test (io_uring unavailable): {error:#}");
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        };
+
+        Ok(Some(V7RuntimeTestWal { wal, owner, anchor }))
+    }
+
+    fn v7_test_batch(commit_ts: u64, value_len: usize) -> WalBatch {
+        WalBatch {
+            commit_ts,
+            recorded_at: RecordedAt { secs: 50, nanos: 0 },
+            entries: vec![WalEntry::Put {
+                key: format!("key-{commit_ts}").into_bytes(),
+                value: vec![0x5A; value_len],
+            }],
+        }
+    }
+
+    fn complete_test_v7_data(
+        inner: &super::RuntimeInner,
+        batch: AdmittedBatch,
+        error: Option<String>,
+    ) -> anyhow::Result<()> {
+        let AdmittedBatch {
+            ticket,
+            file_offset,
+            aligned_len,
+            buffer,
+            ..
+        } = batch;
+        if error.is_none() {
+            inner.preallocator.write_all_at(
+                buffer
+                    .buffer
+                    .as_ref()
+                    .expect("test owns the encoded DATA buffer")
+                    .initialized_slice(0, aligned_len),
+                file_offset,
+            )?;
+        }
+        super::WorkerBuffer::retire(buffer, &inner.buffer_pool);
+        super::process_group_result(
+            inner,
+            super::GroupWriteResult {
+                group_id: ticket,
+                tickets: ticket..ticket + 1,
+                write_count: 1,
+                write_bytes: aligned_len as u64,
+                error,
+            },
+        );
+
+        Ok(())
+    }
+
+    fn check_v7_frontier_recapture(failed_ticket: Option<u64>) -> anyhow::Result<()> {
+        use crate::wal::v7::{
+            install::recover_and_install_active, recovery::WalV7RecoveryAuthority,
+        };
+
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("recapture.wal");
+        let Some(V7RuntimeTestWal { wal, owner, anchor }) =
+            live_v7_test_wal(&path, super::MAX_WAL_FILE_SIZE, v7_test_resource_limits())?
+        else {
+            return Ok(());
+        };
+        let runtime = wal.parallel_runtime.as_ref().expect("v7 Parallel runtime");
+        // Hold the automatic packer so completion order and each intermediate
+        // target are deterministic. Feed real encoded writes and their CQEs to
+        // the coordinator state machine instead of relying on device timing.
+        let mut packer = runtime.inner.packer_state.lock();
+        let mut batches = (1..=3).map(|ts| v7_test_batch(ts, 10)).collect::<Vec<_>>();
+        for (ticket, batch) in batches.iter().enumerate() {
+            assert_eq!(
+                wal.put_v7_batch_with_index(batch, LIVE_WAL_V5_LIMITS)?.0,
+                ticket as u64
+            );
+        }
+        let (mut pending, data_end) = {
+            let mut admission = runtime.inner.admission.lock();
+            (std::mem::take(&mut admission.queue), admission.admitted_end)
+        };
+        complete_test_v7_data(&runtime.inner, pending.pop_front().unwrap(), None)?;
+        assert!(
+            super::synchronize_written_prefix(&runtime.inner.preallocator, &runtime.inner)?
+                .is_some()
+        );
+        runtime.wait_durable(0)?;
+        let first_frontier = runtime
+            .inner
+            .admission
+            .lock()
+            .v7_allocator
+            .as_ref()
+            .unwrap()
+            .last_frontier();
+        assert_eq!(first_frontier.frontier.ticket_end, 1);
+        assert_eq!(first_frontier.frame_offset, data_end);
+
+        if failed_ticket == Some(3) {
+            // A failed post-marker ticket does not prevent the pre-marker
+            // tickets from completing an eligible frontier at T=3.
+            batches.push(v7_test_batch(4, 10));
+            assert_eq!(
+                wal.put_v7_batch_with_index(batches.last().unwrap(), LIVE_WAL_V5_LIMITS)?
+                    .0,
+                3
+            );
+            let failed = runtime.inner.admission.lock().queue.pop_front().unwrap();
+            complete_test_v7_data(
+                &runtime.inner,
+                failed,
+                Some("injected later DATA failure".to_owned()),
+            )?;
+        }
+
+        complete_test_v7_data(&runtime.inner, pending.pop_front().unwrap(), None)?;
+        let tail_before_wait = runtime.logical_length();
+        assert!(
+            super::synchronize_written_prefix(&runtime.inner.preallocator, &runtime.inner)?
+                .is_none()
+        );
+        assert_eq!(runtime.is_poisoned(), failed_ticket == Some(3));
+        assert_eq!(
+            runtime.inner.durability.state.lock().poison_ticket,
+            failed_ticket.filter(|ticket| *ticket == 3)
+        );
+        assert_eq!(runtime.logical_length(), tail_before_wait);
+        assert_eq!(runtime.inner.durability.state.lock().durable_frontier, 1);
+
+        complete_test_v7_data(
+            &runtime.inner,
+            pending.pop_front().unwrap(),
+            (failed_ticket == Some(2)).then(|| "injected third DATA failure".to_owned()),
+        )?;
+        let sync = super::synchronize_written_prefix(&runtime.inner.preallocator, &runtime.inner);
+        let expected_ticket_end = if failed_ticket == Some(2) {
+            assert!(sync.is_err());
+            assert!(runtime.is_poisoned());
+            assert!(runtime.wait_durable(1).is_err());
+            assert!(runtime.wait_durable(2).is_err());
+            runtime.wait_durable(0)?;
+            1
+        } else {
+            assert!(sync?.is_some());
+            assert_eq!(runtime.is_poisoned(), failed_ticket.is_some());
+            runtime.wait_durable(2)?;
+            if failed_ticket == Some(3) {
+                assert!(runtime.wait_durable(3).is_err());
+            }
+            let frontier = runtime
+                .inner
+                .admission
+                .lock()
+                .v7_allocator
+                .as_ref()
+                .unwrap()
+                .last_frontier();
+            assert_eq!(frontier.frontier.ticket_end, 3);
+            assert_eq!(
+                frontier.frontier.durable_end,
+                first_frontier.frame_offset + 4096
+            );
+            3
+        };
+        packer.next_ticket = wal.next_ticket();
+        packer.reserved_end = runtime.logical_length();
+        packer.preallocated_end = std::fs::metadata(&path)?.len();
+        drop(packer);
+        let closed = wal.close();
+        if failed_ticket.is_some() {
+            assert!(closed.is_err());
+        } else {
+            closed?;
+        }
+        assert_eq!(owner.snapshot().buffer_memory_bytes, 0);
+        assert!(runtime.inner.admission.lock().v7_reservations.is_empty());
+        let retained_charge = owner.snapshot();
+        assert!(retained_charge.logical_wal_bytes > 0);
+        assert_eq!(wal.close().is_err(), failed_ticket.is_some());
+        assert_eq!(owner.snapshot(), retained_charge);
+        drop(wal);
+
+        let recovered = recover_and_install_active(
+            &path,
+            WalV7RecoveryAuthority::Active {
+                predecessor: crate::pitr::ChainAnchor::Genesis {
+                    archive_epoch_id: crate::pitr::ArchiveEpochId(anchor.archive_epoch_id),
+                },
+                durable_anchors: vec![anchor],
+            },
+        )?;
+        assert_eq!(recovered.installed.next_ticket, expected_ticket_end);
+        assert_eq!(
+            recovered.installed.batches,
+            batches[..expected_ticket_end as usize]
+        );
+        owner.retire_after_durable_cleanup()?;
+        assert_eq!(owner.snapshot(), WalV7ResourceCharge::default());
+
+        Ok(())
+    }
+
+    #[test]
+    fn v7_frontier_recaptures_after_retained_marker_covers_pending_data() -> anyhow::Result<()> {
+        check_v7_frontier_recapture(None)
+    }
+
+    #[test]
+    fn v7_frontier_poison_terminates_waiters_when_recapture_is_impossible() -> anyhow::Result<()> {
+        check_v7_frontier_recapture(Some(2))
+    }
+
+    #[test]
+    fn v7_frontier_recaptures_healthy_prefix_below_a_later_poison() -> anyhow::Result<()> {
+        check_v7_frontier_recapture(Some(3))
+    }
+
+    #[cfg(feature = "chaos-testing")]
+    #[test]
+    fn failpoint_v7_parallel_close_retires_buffers_after_sync_failure() -> anyhow::Result<()> {
+        use crate::chaos::failpoint::{self, FailScenario};
+
+        let _scenario = FailScenario::setup();
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("sync-failure.wal");
+        let Some(V7RuntimeTestWal { wal, owner, .. }) =
+            live_v7_test_wal(&path, super::MAX_WAL_FILE_SIZE, v7_test_resource_limits())?
+        else {
+            return Ok(());
+        };
+        let (durable_ticket, _) =
+            wal.put_v7_batch_with_index(&v7_test_batch(1, 10), LIVE_WAL_V5_LIMITS)?;
+        wal.submit_and_commit(durable_ticket)?;
+        assert_eq!(owner.snapshot().buffer_memory_bytes, 0);
+
+        failpoint::cfg("parallel_wal.fdatasync_failure", "return")
+            .expect("inject v7 Parallel sync failure");
+        let (failed_ticket, _) =
+            wal.put_v7_batch_with_index(&v7_test_batch(2, 10), LIVE_WAL_V5_LIMITS)?;
+        let failed = wal.submit_and_commit(failed_ticket);
+        failpoint::cfg("parallel_wal.fdatasync_failure", "off").expect("disable sync failure");
+        assert!(failed.is_err());
+        let before_close = owner.snapshot();
+        assert!(before_close.buffer_memory_bytes > 0);
+        wal.submit_and_commit(durable_ticket)?;
+
+        assert!(wal.close().is_err());
+        let after_close = owner.snapshot();
+        assert_eq!(after_close.buffer_memory_bytes, 0);
+        assert_eq!(
+            after_close.logical_wal_bytes,
+            before_close.logical_wal_bytes
+        );
+        assert_eq!(
+            after_close.source_spool_bytes,
+            before_close.source_spool_bytes
+        );
+        assert_eq!(after_close.seal_index_bytes, before_close.seal_index_bytes);
+        assert!(after_close.logical_wal_bytes > 0);
+        assert!(
+            wal.parallel_runtime
+                .as_ref()
+                .unwrap()
+                .inner
+                .admission
+                .lock()
+                .v7_reservations
+                .is_empty()
+        );
+        assert!(wal.close().is_err());
+        assert_eq!(owner.snapshot(), after_close);
+
+        Ok(())
+    }
+
+    #[test]
+    fn v7_unresolved_buffer_keeps_its_charge_after_close_and_handle_drop() -> anyhow::Result<()> {
+        use crate::wal::v7::admission::WalV7ReservationError;
+
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("unresolved-buffer.wal");
+        let batch = v7_test_batch(1, 10);
+        let encoded_len = super::prepare_logical_batch(&batch, LIVE_WAL_V5_LIMITS)?.encoded_len();
+        let charge = WalV7ResourceCharge::for_batch(encoded_len as u64)?;
+        let preparation_bytes =
+            super::CanonicalWalEntryStream::preparation_buffer_bytes(&batch, LIVE_WAL_V5_LIMITS)?;
+        let mut limits = v7_test_resource_limits();
+        limits.max_buffer_memory_bytes = charge.buffer_memory_bytes + preparation_bytes;
+        let Some(V7RuntimeTestWal { wal, owner, .. }) =
+            live_v7_test_wal(&path, super::MAX_WAL_FILE_SIZE, limits)?
+        else {
+            return Ok(());
+        };
+        let runtime = wal.parallel_runtime.as_ref().unwrap();
+        let mut packer = runtime.inner.packer_state.lock();
+        let (ticket, _) = wal.put_v7_batch_with_index(&batch, LIVE_WAL_V5_LIMITS)?;
+        let AdmittedBatch {
+            buffer: unresolved_buffer,
+            file_offset,
+            aligned_len,
+            ..
+        } = runtime.inner.admission.lock().queue.pop_front().unwrap();
+        let data_end = file_offset + aligned_len as u64;
+        super::preallocate_runtime(&runtime.inner, data_end)?;
+        // Retain the allocation just as WorkerCore::drop does for an ambiguous
+        // submission. No SQE is actually submitted here, allowing the test to
+        // release it safely after checking accounting across close/retirement.
+        super::process_group_result(
+            &runtime.inner,
+            super::GroupWriteResult {
+                group_id: 0,
+                tickets: ticket..ticket + 1,
+                write_count: 1,
+                write_bytes: aligned_len as u64,
+                error: Some("ambiguous DATA submission".to_owned()),
+            },
+        );
+        packer.next_ticket = ticket + 1;
+        packer.reserved_end = data_end;
+        packer.preallocated_end = data_end;
+        drop(packer);
+
+        let before_close = owner.snapshot();
+        assert!(wal.close().is_err());
+        assert!(runtime.inner.admission.lock().v7_reservations.is_empty());
+        assert_eq!(owner.snapshot(), before_close);
+        drop(wal);
+        assert_eq!(owner.snapshot(), before_close);
+        assert_eq!(
+            owner.reserve_batch(encoded_len as u64).err(),
+            Some(WalV7ReservationError::BufferMemoryLimit)
+        );
+        assert_eq!(owner.snapshot(), before_close);
+
+        std::fs::remove_file(&path)?;
+        std::fs::File::open(directory.path())?.sync_all()?;
+        owner.retire_after_durable_cleanup()?;
+        assert_eq!(owner.snapshot(), before_close);
+        drop(unresolved_buffer);
+        assert_eq!(owner.snapshot(), WalV7ResourceCharge::default());
+
+        Ok(())
+    }
+
+    #[test]
+    fn v7_admission_uses_exact_buffers_and_never_retires_them_into_the_v4_pool()
+    -> anyhow::Result<()> {
+        use crate::wal::v7::codec::WAL_V7_DATA_FRAGMENT_PAYLOAD_CAPACITY;
+
+        let directory = tempfile::tempdir()?;
+        let large_value_len = 64 * WAL_V7_DATA_FRAGMENT_PAYLOAD_CAPACITY - 128;
+        for (value_len, expected_capacity) in
+            [(10, 4096), (large_value_len, super::BUFFER_POOL_BUF_SIZE)]
+        {
+            let path = directory.path().join(format!("buffer-{value_len}.wal"));
+            let mut batch = v7_test_batch(1, value_len.min(LIVE_WAL_V5_LIMITS.max_value_bytes));
+            if value_len > LIVE_WAL_V5_LIMITS.max_value_bytes {
+                batch.entries = (0..4)
+                    .map(|index| WalEntry::Put {
+                        key: format!("key-{index}").into_bytes(),
+                        value: vec![0x5A; value_len / 4],
+                    })
+                    .collect();
+            }
+            let encoded_len =
+                super::prepare_logical_batch(&batch, LIVE_WAL_V5_LIMITS)?.encoded_len();
+            let charge = WalV7ResourceCharge::for_batch(encoded_len as u64)?;
+            let preparation_bytes = super::CanonicalWalEntryStream::preparation_buffer_bytes(
+                &batch,
+                LIVE_WAL_V5_LIMITS,
+            )?;
+            let mut limits = v7_test_resource_limits();
+            limits.max_buffer_memory_bytes = charge.buffer_memory_bytes + preparation_bytes;
+            let Some(V7RuntimeTestWal { wal, owner, .. }) =
+                live_v7_test_wal(&path, super::MAX_WAL_FILE_SIZE, limits)?
+            else {
+                return Ok(());
+            };
+            let runtime = wal.parallel_runtime.as_ref().unwrap();
+            let packer = runtime.inner.packer_state.lock();
+            let (ticket, _) = wal.put_v7_batch_with_index(&batch, LIVE_WAL_V5_LIMITS)?;
+            let admission = runtime.inner.admission.lock();
+            let queued = admission.queue.front().unwrap();
+            assert_eq!(super::WorkerBuffer::cap(&queued.buffer), expected_capacity);
+            assert_eq!(queued.aligned_len, expected_capacity);
+            assert!(!queued.buffer.poolable);
+            assert_eq!(
+                runtime.inner.buffer_budget.state.lock().active_bytes,
+                expected_capacity as u64
+            );
+            assert_eq!(
+                owner.snapshot().buffer_memory_bytes,
+                charge.buffer_memory_bytes
+            );
+            drop(admission);
+            drop(packer);
+            wal.submit_and_commit(ticket)?;
+            wal.close()?;
+            assert!(runtime.inner.buffer_pool.is_empty());
+            assert_eq!(owner.snapshot().buffer_memory_bytes, 0);
+        }
+
+        Ok(())
+    }
+
     #[test]
     fn recovered_v7_runtime_keeps_its_metadata_and_cursors_paused() {
         use std::{
@@ -1927,9 +3022,10 @@ mod tests {
                 last_recorded_at,
             },
         };
-        let make_start = || ParallelWalRuntimeStart::v7(make_seed(), crate::wal::MAX_WAL_FILE_SIZE);
+        let make_start =
+            || ParallelWalRuntimeStart::v7(make_seed(), crate::wal::MAX_WAL_FILE_SIZE, None);
         let configured_limit = APPEND_OFFSET + 4096;
-        let limited_start = ParallelWalRuntimeStart::v7(make_seed(), configured_limit)
+        let limited_start = ParallelWalRuntimeStart::v7(make_seed(), configured_limit, None)
             .expect("accept configured v7 segment limit");
         assert_eq!(limited_start.max_file_size, configured_limit);
         assert_eq!(
@@ -1941,7 +3037,7 @@ mod tests {
                 .expect("classify limited v7 segment capacity"),
             crate::wal::v7::allocator::WalV7DataCapacityStatus::RotationRequired
         );
-        assert!(ParallelWalRuntimeStart::v7(make_seed(), APPEND_OFFSET - 4096).is_err());
+        assert!(ParallelWalRuntimeStart::v7(make_seed(), APPEND_OFFSET - 4096, None).is_err());
 
         direct_file
             .set_len(configured_limit + 4096)
@@ -2166,8 +3262,11 @@ mod tests {
             assert_eq!(durability.durable_frontier, NEXT_TICKET);
         }
         {
-            let metadata = runtime.inner.v7_metadata.lock();
-            let metadata = metadata.as_ref().expect("runtime retains v7 metadata");
+            let admission = runtime.inner.admission.lock();
+            let metadata = admission
+                .v7_metadata
+                .as_ref()
+                .expect("runtime retains v7 metadata");
             let logical_digest: [u8; 32] = metadata.logical_hasher.clone().finalize().into();
             let retained_physical_digest: [u8; 32] =
                 metadata.physical_hasher.clone().finalize().into();
@@ -2198,109 +3297,67 @@ mod tests {
 
     #[test]
     fn v7_packer_preallocation_respects_small_segment_limits() -> anyhow::Result<()> {
-        use std::{fs::File, os::unix::fs::FileExt};
-
-        use crate::{
-            pitr::{ArchiveEpochId, ChainAnchor, SegmentId, TimelineId, manifest::ActiveBoundary},
-            tests::harness::is_io_uring_unavailable_error,
-            wal::v7::{
-                codec::{
-                    WAL_V7_FRAME_LEN, WAL_V7_HEADER_LEN, WalV7Header,
-                    encode_generation_zero_frontier,
-                },
-                install::recover_and_install_active,
-                recovery::WalV7RecoveryAuthority,
-            },
+        use crate::wal::v7::{
+            codec::WAL_V7_FRAME_LEN, install::recover_and_install_active,
+            leader::WalV7LeaderCapacityError, recovery::WalV7RecoveryAuthority,
         };
 
         let directory = tempfile::tempdir()?;
-        let archive_epoch_id = ArchiveEpochId([0x22; 16]);
-        let header = WalV7Header {
-            timeline_id: TimelineId([0x11; 16]),
-            archive_epoch_id,
-            segment_id: SegmentId(7),
-            predecessor: ChainAnchor::Genesis { archive_epoch_id },
-            incarnation: [0x44; 16],
-        };
-        let header_digest = header.digest()?;
-        let mut empty_image = header.encode()?.to_vec();
-        empty_image.extend_from_slice(&encode_generation_zero_frontier(header_digest)?);
-        let empty_boundary = ActiveBoundary {
-            timeline_id: header.timeline_id.0,
-            archive_epoch_id: header.archive_epoch_id.0,
-            segment_id: header.segment_id.0,
-            incarnation: header.incarnation,
-            ticket_end: 0,
-            durable_end: WAL_V7_HEADER_LEN as u64,
-            last_commit_ts: 0,
-            prefix_digest: header_digest,
-        };
-        let data_bytes = [0x5A; WAL_V7_FRAME_LEN];
-
         for extra_bytes in [0, 1] {
             let path = directory
                 .path()
                 .join(format!("small-cap-{extra_bytes}.wal"));
-            std::fs::write(&path, &empty_image)?;
-            let recovered = recover_and_install_active(
-                &path,
-                WalV7RecoveryAuthority::Active {
-                    predecessor: header.predecessor,
-                    durable_anchors: vec![empty_boundary],
-                },
-            )?;
-            let seed = recovered.installed.runtime_seed()?;
-            let configured_limit = seed.append_offset + 2 * WAL_V7_FRAME_LEN as u64 + extra_bytes;
+            let configured_limit = 4 * WAL_V7_FRAME_LEN as u64 + extra_bytes;
             assert!(configured_limit < super::PREALLOC_BLOCK);
-            let wal = match Wal::from_v7_parallel(&path, seed, configured_limit) {
-                Ok(wal) => wal,
-                Err(error) if is_io_uring_unavailable_error(&error) => {
-                    eprintln!("skipping test (io_uring unavailable): {error:#}");
-                    return Ok(());
-                }
-                Err(error) => return Err(error),
+            let mut limits = v7_test_resource_limits();
+            limits.max_logical_wal_bytes = 2 * WAL_V7_FRAME_LEN as u64;
+            limits.max_source_spool_bytes = 2 * WAL_V7_FRAME_LEN as u64;
+            limits.max_recovery_workspace_bytes = 0;
+            let Some(V7RuntimeTestWal { wal, owner, anchor }) =
+                live_v7_test_wal(&path, configured_limit, limits)?
+            else {
+                return Ok(());
             };
             let runtime = wal.parallel_runtime.as_ref().expect("v7 Parallel runtime");
             assert_eq!(runtime.inner.max_file_size, configured_limit);
-            let mut buffer = runtime.allocate_buffer(WAL_V7_FRAME_LEN)?;
-            let direct_buffer = buffer.buffer.as_mut().expect("owned DATA buffer");
-            direct_buffer.write_at(0, &data_bytes);
-            direct_buffer.set_len(WAL_V7_FRAME_LEN);
-
-            // Exercise the physical packer with an allocator-issued range;
-            // producer admission remains paused until v7 marker scheduling is wired.
-            let data_range = {
-                let mut admission = runtime.inner.admission.lock();
-                assert!(!admission.open);
-                let allocator = admission.v7_allocator.as_mut().expect("v7 allocator");
-                let allocation = allocator.reserve_data(1)?;
-                let data_range = allocation.frame_range().clone();
-                admission.next_ticket = allocator.next_ticket();
-                admission.admitted_end = data_range.end;
-                admission.queue.push_back(super::AdmittedBatch {
-                    ticket: allocation.ticket(),
-                    file_offset: data_range.start,
-                    aligned_len: WAL_V7_FRAME_LEN,
-                    v7_allocation: Some(allocation),
-                    buffer,
-                });
-
-                data_range
-            };
-            super::pack_admitted_groups(&runtime.inner, runtime.inner.packer_state.lock())?;
-            {
-                let packer = runtime.inner.packer_state.lock();
-                assert_eq!(packer.reserved_end, data_range.end);
-                assert_eq!(packer.preallocated_end, configured_limit);
-                assert!(packer.initializer.is_none());
-            }
+            let batch = v7_test_batch(1, 10);
+            let (ticket, first_data_offset) =
+                wal.put_v7_batch_with_index(&batch, LIVE_WAL_V5_LIMITS)?;
+            assert_eq!(
+                (ticket, first_data_offset),
+                (0, 2 * WAL_V7_FRAME_LEN as u64)
+            );
+            wal.submit_and_commit(ticket)?;
+            assert_eq!(
+                owner.snapshot().logical_wal_bytes,
+                2 * WAL_V7_FRAME_LEN as u64
+            );
             assert_eq!(std::fs::metadata(&path)?.len(), configured_limit);
+            // A full persistent ledger must not mask the segment's actionable
+            // rotation result or consume another ticket/offset.
+            let error = wal
+                .put_v7_batch_with_index(&v7_test_batch(2, 10), LIVE_WAL_V5_LIMITS)
+                .expect_err("the next batch requires rotation");
+            assert_eq!(
+                error.downcast_ref::<WalV7LeaderCapacityError>(),
+                Some(&WalV7LeaderCapacityError::RotationRequired)
+            );
+            assert_eq!(wal.next_ticket(), 1);
+            assert!(!wal.v7_requires_recovery());
             wal.close()?;
-            let file = File::open(&path)?;
-            assert_eq!(file.metadata()?.len(), configured_limit);
-            let mut written_data = [0; WAL_V7_FRAME_LEN];
-            file.read_exact_at(&mut written_data, data_range.start)?;
-            assert_eq!(written_data, data_bytes);
+            drop(wal);
+            assert_eq!(std::fs::metadata(&path)?.len(), configured_limit);
+            let recovered = recover_and_install_active(
+                &path,
+                WalV7RecoveryAuthority::Active {
+                    predecessor: crate::pitr::ChainAnchor::Genesis {
+                        archive_epoch_id: crate::pitr::ArchiveEpochId(anchor.archive_epoch_id),
+                    },
+                    durable_anchors: vec![anchor],
+                },
+            )?;
+            assert_eq!(recovered.installed.batches, vec![batch]);
+            assert_eq!(recovered.installed.next_ticket, 1);
         }
 
         Ok(())
@@ -2679,6 +3736,11 @@ mod tests {
             next_ticket: 4,
             admitted_end: WAL_HEADER_END + 3 * large as u64 + 4096,
             v7_allocator: None,
+            v7_header_digest: None,
+            v7_reservation_owner: None,
+            v7_metadata: None,
+            v7_prefixes: BTreeMap::new(),
+            v7_reservations: BTreeMap::new(),
             queue: std::collections::VecDeque::from([
                 admitted_batch_of_size(&budget, 0, WAL_HEADER_END, large),
                 admitted_batch_of_size(&budget, 1, WAL_HEADER_END + large as u64, large),
@@ -2718,6 +3780,11 @@ mod tests {
             next_ticket: 4,
             admitted_end: WAL_HEADER_END + 4 * 4096,
             v7_allocator: None,
+            v7_header_digest: None,
+            v7_reservation_owner: None,
+            v7_metadata: None,
+            v7_prefixes: BTreeMap::new(),
+            v7_reservations: BTreeMap::new(),
             queue: std::collections::VecDeque::from([
                 admitted_batch(&budget, 0, WAL_HEADER_END),
                 admitted_batch(&budget, 1, WAL_HEADER_END + 4096),
@@ -2786,6 +3853,11 @@ mod tests {
             next_ticket: 2,
             admitted_end: allocator.allocation_tail(),
             v7_allocator: Some(allocator),
+            v7_header_digest: None,
+            v7_reservation_owner: None,
+            v7_metadata: None,
+            v7_prefixes: BTreeMap::new(),
+            v7_reservations: BTreeMap::new(),
             queue: std::collections::VecDeque::from([
                 admitted_v7_batch(&budget, first),
                 admitted_v7_batch(&budget, second),

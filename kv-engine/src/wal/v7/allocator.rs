@@ -401,6 +401,15 @@ impl WalV7PhysicalAllocator {
     /// frame covered by `T`. Reject targets whose retained predecessor would
     /// include DATA at or above `T`.
     pub(crate) fn durable_end_for(&self, ticket_end: u64) -> Result<u64> {
+        self.eligible_durable_end_for(ticket_end)?
+            .context("v7 FRONTIER target retains DATA at or above its ticket end")
+    }
+
+    /// Return `E(T)` only when retaining the preceding marker does not also
+    /// retain an excluded DATA ticket. An ineligible target is healthy: the
+    /// coordinator must wait for already admitted DATA and recapture a larger
+    /// written target. Invalid coordinates and poisoned state remain errors.
+    pub(crate) fn eligible_durable_end_for(&self, ticket_end: u64) -> Result<Option<u64>> {
         self.ensure_healthy()?;
         ensure!(
             ticket_end > self.last_frontier.frontier.ticket_end && ticket_end <= self.next_ticket,
@@ -434,13 +443,11 @@ impl WalV7PhysicalAllocator {
         // DATA ranges are ordered and never cross a FRONTIER slot. If the
         // first excluded ticket ends within E(T), retaining the predecessor
         // also retains speculative DATA outside the captured ticket prefix.
-        ensure!(
-            self.ticket_data_ends
-                .get(tracked_count)
-                .is_none_or(|next_data_end| *next_data_end > durable_end),
-            "v7 FRONTIER target retains DATA at or above its ticket end"
-        );
-        Ok(durable_end)
+        Ok(self
+            .ticket_data_ends
+            .get(tracked_count)
+            .is_none_or(|next_data_end| *next_data_end > durable_end)
+            .then_some(durable_end))
     }
 
     /// Each ticket beyond the last synced frontier retains one marker credit,
