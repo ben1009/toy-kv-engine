@@ -6932,8 +6932,10 @@ impl LsmStorageInner {
     /// obligations reduce the capacity available to this Active segment.
     fn reserve_v7_active_recovery_workspace(
         state: &crate::pitr::manifest::PitrState,
+        database_path: &Path,
         active_segment_id: u64,
         source_file_len: u64,
+        source_file_allocated_bytes: u64,
     ) -> Result<(
         crate::wal::v7::admission::WalV7ResourceLedger,
         crate::wal::v7::admission::WalV7Reservation,
@@ -6962,11 +6964,11 @@ impl LsmStorageInner {
             "v7 Active recovery cannot install a segment with a pending sealing obligation"
         );
 
-        let (other_logical_wal_bytes, other_source_spool_bytes) = state
+        let other_logical_wal_bytes = state
             .obligations
             .iter()
             .filter(|(segment_id, _)| **segment_id != active_segment_id)
-            .try_fold((0_u64, 0_u64), |(logical, spool), (_, obligation)| {
+            .try_fold(0_u64, |logical, (_, obligation)| {
                 let unarchived_bytes = if matches!(
                     obligation.state,
                     ObligationState::Sealing | ObligationState::Sealed
@@ -6975,17 +6977,12 @@ impl LsmStorageInner {
                 } else {
                     0
                 };
-                let logical = logical
+                logical
                     .checked_add(unarchived_bytes)
-                    .ok_or_else(|| anyhow!("PITR obligation WAL accounting overflows"))?;
-                // The segment manager keeps one frame of lifecycle headroom for
-                // every retained non-Active source.
-                let spool = spool
-                    .checked_add(obligation.logical_length)
-                    .and_then(|bytes| bytes.checked_add(WAL_V7_FRAME_LEN as u64))
-                    .ok_or_else(|| anyhow!("PITR obligation spool accounting overflows"))?;
-                Ok::<_, anyhow::Error>((logical, spool))
+                    .ok_or_else(|| anyhow!("PITR obligation WAL accounting overflows"))
             })?;
+        let other_source_spool_bytes =
+            Self::pitr_other_source_allocated_bytes(database_path, active_segment_id)?;
         let active_fixed_bytes = (WAL_V7_HEADER_LEN + WAL_V7_FRAME_LEN) as u64;
         let max_logical_wal_bytes = config
             .max_unarchived_bytes
@@ -7024,12 +7021,102 @@ impl LsmStorageInner {
         let retained_source_bytes = source_file_len.saturating_sub(active_fixed_bytes);
         let workspace = ledger.reserve(WalV7ResourceCharge {
             logical_wal_bytes: retained_source_bytes,
-            source_spool_bytes: retained_source_bytes,
+            source_spool_bytes: source_file_allocated_bytes.saturating_sub(active_fixed_bytes),
             recovery_workspace_bytes: max_segment_bytes,
             ..WalV7ResourceCharge::default()
         })?;
 
         Ok((ledger, workspace, max_seal_index_bytes))
+    }
+
+    /// Reconstruct retained PITR source-spool usage from source and staging
+    /// files that still occupy the database filesystem. Manifest lengths remain
+    /// authoritative for logical WAL limits; spool limits account allocated
+    /// blocks for obligation files, orphaned sources, and interrupted installs.
+    /// Same-WAL stale recovery images reuse the reserved workspace: the
+    /// installer durably removes them before allocating a replacement.
+    fn pitr_other_source_allocated_bytes(
+        database_path: &Path,
+        active_segment_id: u64,
+    ) -> Result<u64> {
+        let active_wal_name = format!("pitr-{active_segment_id:020}.wal");
+        let active_recovery_prefix =
+            crate::wal::v7::install::recovery_temp_prefix(std::ffi::OsStr::new(&active_wal_name));
+        let mut allocated_bytes = 0_u64;
+        for entry in fs::read_dir(database_path)? {
+            let entry = entry?;
+            let file_name = entry.file_name();
+            let Some(name) = file_name.to_str() else {
+                continue;
+            };
+            let normal_source = Self::parse_pitr_source_filename(name);
+            let temporary_source = crate::pitr::segment::pitr_install_temp_object_name(name)
+                .filter(|object| object.starts_with("pitr-"))
+                .and_then(Self::parse_pitr_source_filename);
+            let is_recovery_temp = crate::wal::v7::install::is_recovery_temp_name(&file_name);
+            if normal_source.is_none() && temporary_source.is_none() && !is_recovery_temp {
+                continue;
+            }
+            if normal_source
+                .is_some_and(|(id, extension)| id == active_segment_id && extension == "wal")
+            {
+                continue;
+            }
+
+            let file_type = entry.file_type()?;
+            ensure!(
+                !file_type.is_symlink(),
+                "PITR source path {} is a symbolic link",
+                entry.path().display()
+            );
+            ensure!(
+                file_type.is_file(),
+                "PITR source path {} is not a regular file",
+                entry.path().display()
+            );
+            if is_recovery_temp && name.starts_with(&active_recovery_prefix) {
+                continue;
+            }
+            let metadata = fs::symlink_metadata(entry.path())?;
+            allocated_bytes = allocated_bytes
+                .checked_add(Self::filesystem_allocated_bytes(&metadata)?)
+                .ok_or_else(|| anyhow!("PITR source allocation accounting overflows"))?;
+        }
+
+        Ok(allocated_bytes)
+    }
+
+    fn parse_pitr_source_filename(name: &str) -> Option<(u64, &str)> {
+        let stem = name.strip_prefix("pitr-")?;
+        let (segment_id, extension) = stem.split_once('.')?;
+        if segment_id.len() != 20
+            || !segment_id.bytes().all(|byte| byte.is_ascii_digit())
+            || !matches!(extension, "wal" | "seal")
+        {
+            return None;
+        }
+
+        Some((segment_id.parse().ok()?, extension))
+    }
+
+    #[cfg(test)]
+    fn filesystem_file_allocated_bytes(path: &Path) -> Result<u64> {
+        let metadata = fs::symlink_metadata(path)?;
+        ensure!(
+            metadata.file_type().is_file(),
+            "PITR source path {} is not a regular file",
+            path.display()
+        );
+        Self::filesystem_allocated_bytes(&metadata)
+    }
+
+    fn filesystem_allocated_bytes(metadata: &fs::Metadata) -> Result<u64> {
+        use std::os::unix::fs::MetadataExt;
+
+        metadata
+            .blocks()
+            .checked_mul(512)
+            .ok_or_else(|| anyhow!("filesystem allocation accounting overflows"))
     }
 
     /// Phase 1 of open: validation, directory creation, vLog init, manifest
@@ -7771,13 +7858,18 @@ impl LsmStorageInner {
                         })?;
                         let predecessor = header.predecessor;
 
-                        let source_file_len = file.metadata()?.len();
+                        let source_metadata = file.metadata()?;
+                        let source_file_len = source_metadata.len();
+                        let source_file_allocated_bytes =
+                            Self::filesystem_allocated_bytes(&source_metadata)?;
                         drop(file);
                         let (ledger, recovery_workspace, max_seal_index_bytes) =
                             Self::reserve_v7_active_recovery_workspace(
                                 &pitr_state,
+                                path,
                                 active_segment_id,
                                 source_file_len,
+                                source_file_allocated_bytes,
                             )?;
                         let max_segment_bytes = pitr_state
                             .config
@@ -13045,6 +13137,7 @@ impl LsmStorageInner {
 #[cfg(test)]
 mod tests {
     use bytes::Bytes;
+    use rand::{RngCore, SeedableRng, rngs::StdRng};
     use std::{
         num::{NonZeroU64, NonZeroUsize},
         sync::Arc,
@@ -13060,6 +13153,17 @@ mod tests {
         (0..count)
             .map(|idx| WriteBatchRecord::Del(format!("k{idx:04}").into_bytes()))
             .collect()
+    }
+
+    fn write_random_file(path: &std::path::Path, len: usize, seed: u64) -> anyhow::Result<()> {
+        use std::io::Write;
+
+        let mut bytes = vec![0; len];
+        StdRng::seed_from_u64(seed).fill_bytes(&mut bytes);
+        let mut file = std::fs::File::create(path)?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        Ok(())
     }
 
     #[cfg(target_os = "linux")]
@@ -15087,37 +15191,141 @@ mod tests {
     }
 
     #[test]
-    fn v7_recovery_archived_sources_charge_spool_without_unarchived_bytes() -> anyhow::Result<()> {
+    fn v7_recovery_reconstructs_source_spool_from_allocated_wal_and_seal_files()
+    -> anyhow::Result<()> {
         use crate::pitr::manifest::{ObligationState, PersistedPitrConfig};
 
-        let config = PersistedPitrConfig {
-            archive_interval_ms: 1000,
-            max_segment_bytes: 32 * 1024,
-            max_unarchived_bytes: 32 * 1024,
-            max_source_spool_bytes: 256 * 1024,
-        };
+        const ACTIVE_SOURCE_LEN: usize = 16 * 1024;
+        const LEGACY_WAL_LEN: usize = 32 * 1024;
+        const LEGACY_SEAL_LEN: usize = 12 * 1024;
+        const MAX_SEGMENT_BYTES: u64 = 32 * 1024;
+
         for archived_state in [ObligationState::Archived, ObligationState::Reclaimable] {
+            let directory = tempdir()?;
+            let database_path = directory.path();
+            let active_path = database_path.join("pitr-00000000000000000002.wal");
+            let legacy_wal_path = database_path.join("pitr-00000000000000000001.wal");
+            let legacy_seal_path = database_path.join("pitr-00000000000000000001.seal");
+            let orphan_wal_path = database_path.join("pitr-00000000000000000003.wal");
+            let staged_wal_path = database_path.join(".pitr-00000000000000000004.wal.tmp-123-1");
+            let active_recovery_prefix =
+                crate::wal::v7::install::recovery_temp_prefix(active_path.file_name().unwrap());
+            let active_recovery_path = database_path.join(format!("{active_recovery_prefix}123-2"));
+            let orphan_recovery_prefix = crate::wal::v7::install::recovery_temp_prefix(
+                std::ffi::OsStr::new("pitr-00000000000000000006.wal"),
+            );
+            let orphan_recovery_path = database_path.join(format!("{orphan_recovery_prefix}123-3"));
+            write_random_file(&active_path, ACTIVE_SOURCE_LEN, 1)?;
+            write_random_file(&legacy_wal_path, LEGACY_WAL_LEN, 2)?;
+            write_random_file(&legacy_seal_path, LEGACY_SEAL_LEN, 3)?;
+            write_random_file(&orphan_wal_path, 4096, 4)?;
+            write_random_file(&staged_wal_path, 4096, 5)?;
+            write_random_file(&active_recovery_path, 8192, 6)?;
+            write_random_file(&orphan_recovery_path, 4096, 7)?;
+
+            let active_allocated = LsmStorageInner::filesystem_file_allocated_bytes(&active_path)?;
+            let legacy_allocated =
+                LsmStorageInner::filesystem_file_allocated_bytes(&legacy_wal_path)?
+                    .checked_add(LsmStorageInner::filesystem_file_allocated_bytes(
+                        &legacy_seal_path,
+                    )?)
+                    .unwrap();
+            assert!(
+                legacy_allocated > LEGACY_WAL_LEN as u64 + 4096,
+                "the multi-page seal allocation must exceed the old one-frame estimate"
+            );
+            let other_source_allocated =
+                LsmStorageInner::pitr_other_source_allocated_bytes(database_path, 2)?;
+            let orphan_allocated =
+                LsmStorageInner::filesystem_file_allocated_bytes(&orphan_wal_path)?;
+            let staged_allocated =
+                LsmStorageInner::filesystem_file_allocated_bytes(&staged_wal_path)?;
+            let orphan_recovery_allocated =
+                LsmStorageInner::filesystem_file_allocated_bytes(&orphan_recovery_path)?;
+            let expected_other_source_allocated = legacy_allocated
+                .checked_add(orphan_allocated)
+                .and_then(|bytes| bytes.checked_add(staged_allocated))
+                .and_then(|bytes| bytes.checked_add(orphan_recovery_allocated))
+                .unwrap();
+            assert_eq!(other_source_allocated, expected_other_source_allocated);
+
+            let required_source_spool = active_allocated
+                .checked_add(other_source_allocated)
+                .and_then(|bytes| bytes.checked_add(MAX_SEGMENT_BYTES))
+                .unwrap();
+            let config = PersistedPitrConfig {
+                archive_interval_ms: 1000,
+                max_segment_bytes: MAX_SEGMENT_BYTES,
+                max_unarchived_bytes: 32 * 1024,
+                max_source_spool_bytes: required_source_spool,
+            };
             let mut state = enabled_pitr_state_with_sealed_segment(config.clone(), 32 * 1024);
             state.obligations.get_mut(&1).unwrap().state = archived_state;
             state.validate_for_status()?;
-            let (ledger, workspace, _) =
-                LsmStorageInner::reserve_v7_active_recovery_workspace(&state, 2, 16 * 1024)?;
+            let (ledger, workspace, _) = LsmStorageInner::reserve_v7_active_recovery_workspace(
+                &state,
+                database_path,
+                2,
+                ACTIVE_SOURCE_LEN as u64,
+                active_allocated,
+            )?;
             assert_eq!(ledger.snapshot().logical_wal_bytes, 8 * 1024);
+            assert_eq!(
+                ledger.snapshot().source_spool_bytes,
+                active_allocated.saturating_sub(8 * 1024)
+            );
             assert_eq!(ledger.snapshot().recovery_workspace_bytes, 32 * 1024);
             drop(workspace);
 
-            // Archived sources still occupy local disk until reclamation, so
-            // reducing spool capacity must continue to reject this recovery.
-            state.config.as_mut().unwrap().max_source_spool_bytes = 64 * 1024;
+            // Archived/reclaimable sources remain charged while their files are
+            // still allocated. The multi-page seal is included in that charge.
+            state.config.as_mut().unwrap().max_source_spool_bytes =
+                required_source_spool.saturating_sub(1);
             assert!(
-                LsmStorageInner::reserve_v7_active_recovery_workspace(&state, 2, 16 * 1024)
-                    .is_err()
-            );
-        }
-        let unarchived = enabled_pitr_state_with_sealed_segment(config, 32 * 1024);
-        assert!(
-            LsmStorageInner::reserve_v7_active_recovery_workspace(&unarchived, 2, 16 * 1024)
+                LsmStorageInner::reserve_v7_active_recovery_workspace(
+                    &state,
+                    database_path,
+                    2,
+                    ACTIVE_SOURCE_LEN as u64,
+                    active_allocated,
+                )
                 .is_err()
+            );
+
+            for malformed_name in [
+                ".pitr-00000000000000000005.seal.tmp-123-4".to_owned(),
+                format!("{active_recovery_prefix}123-4"),
+            ] {
+                let malformed_staging_dir = database_path.join(malformed_name);
+                std::fs::create_dir(&malformed_staging_dir)?;
+                write_random_file(&malformed_staging_dir.join("payload"), 4096, 8)?;
+                assert!(
+                    LsmStorageInner::pitr_other_source_allocated_bytes(database_path, 2).is_err(),
+                    "a recognized staging path must be a regular file"
+                );
+                std::fs::remove_dir_all(malformed_staging_dir)?;
+            }
+        }
+
+        let directory = tempdir()?;
+        let unarchived = enabled_pitr_state_with_sealed_segment(
+            PersistedPitrConfig {
+                archive_interval_ms: 1000,
+                max_segment_bytes: MAX_SEGMENT_BYTES,
+                max_unarchived_bytes: 32 * 1024,
+                max_source_spool_bytes: 256 * 1024,
+            },
+            32 * 1024,
+        );
+        assert!(
+            LsmStorageInner::reserve_v7_active_recovery_workspace(
+                &unarchived,
+                directory.path(),
+                2,
+                ACTIVE_SOURCE_LEN as u64,
+                0,
+            )
+            .is_err()
         );
 
         Ok(())

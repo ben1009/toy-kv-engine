@@ -54,11 +54,17 @@ syncs the directory before exposing replayed state. Reconciliation then applies
 the recovered bookkeeping without appending duplicate lifecycle records or a
 PITR snapshot. Successor WAL registration is made durable before rotation exposes
 the new memtable to writers.
-Its current source-spool check is a provisional estimate: it counts logical WAL
-lengths and one 4 KiB control-frame allowance per segment, but does not account
-for worst-case per-batch embedded FRONTIER reservations, larger seal indexes,
-or actual filesystem allocation. The shared reservation ledger and WAL admission
-integration remain; this estimate is not the final hard-bound enforcement.
+Active v7 recovery now budgets the Active source and other durable, orphaned,
+and interrupted-install PITR WAL/seal files, including orphaned recovery images
+for other WALs, by their allocated filesystem blocks before reserving the
+fresh-inode workspace. Same-WAL stale recovery images reuse that workspace:
+the installer durably removes them before allocating the replacement.
+Manifest logical lengths still determine the unarchived-WAL charge. The general
+segment manager remains a provisional estimate: it does not account for
+worst-case per-batch embedded
+FRONTIER reservations, larger seal indexes, or ongoing pinned allocations. The
+shared reservation ledger and live WAL admission integration remain; this
+recovery preflight is not the final hard-bound enforcement.
 The low-level serial Leader writer now requires a reservation owner for its
 installed inode. Creating the owner charges the recovered prefix exactly once. The writer
 validates that the owner belongs to its installed image, precharges the
@@ -493,12 +499,18 @@ reservations, larger seal indexes, or actual filesystem allocation and must not
 be treated as the final hard-bound check.
 The separate reservation ledger now gates the low-level serial v7 Leader
 writer's batch admission and retains persistent charges in an inode-bound
-owner. Engine WAL admission, filesystem-allocation reconstruction, and lifecycle
-ownership of that ledger remain in this stage.
+owner. Active v7 recovery reconstructs filesystem allocation for existing
+obligation, orphan, and install-staging WAL/seal files and other-WAL recovery
+images, and charges the Active source plus recovery workspace before
+normalization. Same-WAL stale recovery images are durably reclaimed before
+workspace reuse. Engine-wide shared-ledger ownership, ongoing pin lifecycle
+charges, and live WAL admission remain.
 
 - Promote or replace the `PitrSpoolAccountant` helper/model with a shared live
-  ledger installed by the engine's PITR lifecycle. Reconstruct its charges
-  from durable obligations and filesystem allocation before reopen permits
+  ledger installed by the engine's PITR lifecycle. Extend the current Active
+  recovery preflight, which accounts allocated blocks for obligation, orphan,
+  install-staging WAL/seal files, and other-WAL recovery images, to owned
+  reservations for durable obligations and pinned images before reopen permits
   admission. Wire the same ledger into WAL admission, preallocation, recovery
   installation, rotation, pin release, and durable cleanup; changing the model
   helper alone cannot enforce live limits. Keep recovery workspace charged
