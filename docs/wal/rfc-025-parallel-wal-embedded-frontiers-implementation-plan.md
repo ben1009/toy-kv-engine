@@ -14,9 +14,12 @@ limits checked before installation. An exclusive process lock covers manifest
 authority replay and remains held while the v7 Active WAL is open. A manifest
 v7 boundary requires a canonical v7 Active header before legacy WAL recovery
 can run; replacing that file with a legacy image cannot bypass its durable
-floor. The recovered Active image remains commit-fenced until live v7 runtime
-admission and PITR rotation are implemented. Active boundary publication and immutable
-Sealing/Sealed v7 recovery remain.
+floor. The recovered Active image remains fenced from ordinary engine writes
+until public descriptor routing, lifecycle rotation, and publication barriers
+are implemented. Active boundary publication and immutable Sealing/Sealed v7
+recovery remain. The live v7 Parallel runtime now admits reserved DATA batches
+and writes embedded FRONTIERs before the single WAL sync; API barriers,
+Leader-parity work, and full Active lifecycle integration remain.
 Stage 4 now includes the v7 resource-ledger primitive, framed-batch reservation
 helper, and serial-model integration. The model reserves before allocating
 framed DATA buffers or writing frames, retains the charge through uncertain
@@ -28,8 +31,8 @@ DATA buffers. Exact-cap recovery and continued append cover coalesced groups.
 Limit rejection is checked to leave ticket/offset state and WAL bytes unchanged.
 Installed Active recovery now computes its retained WAL and seal-index charge
 from the normalized image, and the persistence model reserves that exact charge
-before resuming writes. Production manifest-authority WAL selection and live
-admission wiring remain.
+before resuming writes. Engine manifest-authority WAL selection and live
+admission are connected; shared-ledger reconstruction remains outstanding.
 Live segment lifecycle reconstruction is now wired before PITR runtime attach.
 Reconciliation updates the recovered bookkeeping after successful manifest
 sync, releases reclaimed source charges, and consumes completed sealing's
@@ -83,8 +86,7 @@ sequencer when a v7 append fails after admission, including write/sync or
 post-sync cursor-publication failures; pre-admission rejections remain retryable.
 An unwind guard also poisons an outstanding v7 commit reservation on panic,
 so a caller that catches the panic cannot leave commit capture waiting forever.
-Engine manifest-authority selection and shared-ledger reconstruction remain
-unconnected. Recovered Active v7 owners are now retained by PITR segment bookkeeping
+Shared-ledger reconstruction remains unconnected. Recovered Active v7 owners are now retained by PITR segment bookkeeping
 through durable WAL/seal cleanup; retirement fences new admission and retains
 charges for in-flight admission or preparation guards until they finish.
 The serial Leader
@@ -105,9 +107,9 @@ cursor reaches the normalized image end, and validates the recorded-time and
 seal-index cursors against recovered batches. The allocator accepts a synced
 successor only when its generation, ticket and timestamp ordering, physical
 bounds, predecessor offset, and predecessor digest continue that cursor. V7
-startup stays closed and performs no extent initialization or buffer-pool
-warmup until later runtime slices provide live reservations and the v7 writer
-path. The potentially large seal index remains owned by the recovered WAL
+startup performs no extent initialization or buffer-pool warmup. Admission
+opens only when the validated image-bound reservation owner is attached;
+ownerless diagnostic runtimes remain closed. The potentially large seal index remains owned by the recovered WAL
 lifecycle rather than being copied into the runtime seed.
 Recovery hash-continuation, malformed-metadata rejection, and paused-runtime
 retention tests cover this handoff for both empty and nonempty installed images.
@@ -116,8 +118,9 @@ canonical RFC 023 entry stream with both v7 CRCs. It validates borrowed
 canonical survivors before allocating encoded bytes and does not copy their
 keys or values during preparation. A production frame materializer now emits
 the complete aligned DATA-frame sequence into caller-owned storage after
-validating the logical header and assigned ticket. Runtime admission and
-FRONTIER writes remain unconnected.
+validating the logical header and assigned ticket. Live Parallel admission now
+uses this materializer and accounts for each batch's persistent DATA, marker,
+index, and transient-buffer reservations before assigning its ticket.
 A checked physical allocator now assigns DATA tickets and ranges and reserves
 FRONTIER slots at the allocation tail. It splits a ticket group's DATA ranges
 across every reserved FRONTIER frame and poisons further allocation after an
@@ -129,24 +132,42 @@ offsets, advances its ordering cursor across those controls, and reports DATA
 bytes separately from physical span length. The recovered v7 runtime now owns a
 physical allocator, and its ordered packer can consume allocator-issued DATA
 tokens and build worker spans that account for marker gaps, including a marker
-at the beginning of a later group. Runtime admission still cannot assign and
-queue live v7 batches, the v7 runtime remains paused, and marker writes plus the
-one-sync coordinator remain unconnected. Active recovery transfers its verified
-terminal FRONTIER cursor into that paused runtime, and allocator completion
-advances the cursor only after validating the next marker's canonical chain
-link. Tests cover resuming allocation from an installed nonzero cursor and
-poisoning further allocations when a post-sync cursor has a mismatched
-predecessor digest or unaligned durable boundary.
-Paused v7 runtime startup now checks that the worker, sync, and preallocator
+at the beginning of a later group. Live admission now assigns and queues v7
+batches against those allocations. The coordinator appends a canonical
+FRONTIER, performs one WAL `fdatasync`, advances the allocator cursor only after
+success, and poisons the runtime after an uncertain marker cycle. Active
+recovery transfers its verified terminal FRONTIER cursor into the runtime.
+The coordinator defers an ineligible written prefix without consuming a marker
+slot or sync, then recaptures a larger target after already admitted DATA
+completes. DATA poison that prevents an eligible target fails every remaining
+unacknowledged waiter. V7 DATA buffers use their exact reserved frame capacity
+and retire without entering the v4 buffer pool. Deterministic runtime tests
+cover recapture, a healthy prefix below later DATA poison, impossible recapture
+after DATA failure, exact buffer caps, and live append/recovery with a full
+ledger at small segment limits.
+Close drains the worker and coordinator before retiring their failed/discarded
+batch operation guards. Each v7 DATA allocation pins its batch reservation:
+terminal buffer retirement releases transient charges while the image keeps
+persistent reservations, but an allocation retained for ambiguous submission
+keeps its charge and owner alive across close, WAL-handle drop, and image
+retirement. Failure tests retain the closed WAL handle and verify terminal
+retirement and repeated close after DATA and sync errors. A nonterminal buffer
+test verifies that the memory cap remains enforced until the allocation is
+actually released.
+Tests cover resuming allocation from an installed nonzero cursor and poisoning
+further allocations when a post-sync cursor has a mismatched predecessor digest
+or unaligned durable boundary.
+V7 runtime startup now checks that the worker, sync, and preallocator
 descriptors all refer to the recovered Active device/inode, that the installed
 append cursor fits the current file length, and that the physical length stays
 within the segment cap before allocating buffers, initializing extents, or
 spawning workers. A mismatched descriptor or invalid file length is rejected
-without changing the WAL; runtime admission remains closed.
+without changing the WAL; admission opens only when the validated image-bound
+reservation owner is supplied.
 Recovered Active v7 attachment now selects the requested I/O mode: Leader uses
 the serial v7 writer, while Parallel starts from the installed runtime seed
-without extent initialization or buffer prewarming. Parallel admission remains
-closed until live reservations and the v7 marker coordinator are connected.
+without extent initialization or buffer prewarming, using the retained
+image-bound reservation owner.
 The paused runtime now carries persisted `max_segment_bytes` into its physical
 allocator, file-length validation, and preallocation bounds, rather than
 inheriting the larger global WAL cap. Tests cover capacity classification,
@@ -196,8 +217,8 @@ MemTable tests cover replay and reopen, resumed MVCC tickets and seal indexes,
 retryable validation/capacity rejection, and returned errors or caught panics
 during v7 sync across all seven MVCC write paths. Uncertain append failures
 poison MVCC before returning or unwinding.
-Production manifest-authority selection and shared-ledger reconstruction, Parallel
-admission, and the v6 to v7 transition remain unconnected. Active v7 reservation
+Shared-ledger reconstruction, public Parallel write routing and barriers, and
+the v6 to v7 transition remain unconnected. Active v7 reservation
 owners are retained through durable source cleanup and then retired from segment
 bookkeeping.
 
@@ -383,8 +404,8 @@ source and a full-segment fresh-inode workspace within the remaining spool
 allowance, checks normalized image and seal-index bounds before replacement,
 and attaches recovered batches and the inode-bound owner to the active
 memtable. The lock remains held until close or drop. Active v7 open stays
-commit-fenced until live v7 admission and lifecycle rotation can safely handle
-capacity and freeze. Immutable images are not normalized. PITR manifest state
+commit-fenced until public Parallel write routing and lifecycle rotation can
+safely handle capacity and freeze. Immutable images are not normalized. PITR manifest state
 represents the current Active v7 logical boundary and validates monotonic
 updates against its segment identity; the boundary intentionally omits
 physical FRONTIER identity.
@@ -487,7 +508,7 @@ physical FRONTIER identity.
   legs are not stage 3 prerequisites.
 
 **Exit:** The serial persistence model passes candidate/floor/normalization
-crash cases before Parallel is connected. Recovery uses bounded discovery plus
+crash cases before Parallel is activated for engine writes. Recovery uses bounded discovery plus
 one prefix pass, with no whole-prefix rescan per candidate and no service before
 the installation barrier.
 
@@ -600,10 +621,10 @@ this stage.
   generation and ticket/timestamp ordering, physical bounds, and predecessor
   offset/digest. Carry the verified immutable-header digest in the runtime
   seed, and reread/canonical-decode the installed worker inode's header before
-  starting workers. Keep this v7 runtime closed, with no extent initialization or
-  prewarmed direct buffers; runtime admission opens only after later slices
-  install the live reservations and v7 write protocol. The existing v4 startup
-  keeps its current behavior. V7 startup also receives persisted
+  starting workers. Keep extent initialization and direct-buffer prewarming
+  disabled for this recovered runtime. Open admission only when a validated,
+  image-bound live reservation owner is attached; ownerless diagnostic runtimes
+  stay closed. The existing v4 startup keeps its current behavior. V7 startup also receives persisted
   `max_segment_bytes` and applies it to physical allocation, file validation,
   and preallocation bounds.
 - Initialize the runtime from the descriptor and recovered state, including
@@ -633,8 +654,18 @@ this stage.
   implemented. The allocator captures exact `E(T)` in the marker reservation
   and rejects targets whose predecessor retention includes excluded DATA.
   Tests cover predecessor containment and recapturing an eligible target.
-  Live producer admission,
-  marker writes, and the one-sync coordinator remain.
+  The live producer now reserves resources before buffer allocation and ticket
+  assignment, materializes and queues ticketed DATA, and tracks logical/physical
+  digest snapshots. The sync coordinator appends one canonical FRONTIER at the
+  allocation tail before the WAL `fdatasync`, completes the allocator cursor
+  only after sync, retires covered transient reservations, and poisons the
+  runtime after marker or sync uncertainty. Public API routing, fixed-cutoff
+  barriers, v7 Leader parity, and full Active lifecycle integration remain.
+  Written targets are checked for eligibility before reserving or writing a
+  marker: later completions recapture a larger target, and impossible recapture
+  below a DATA poison boundary terminates unacknowledged waiters. Runtime tests
+  exercise both paths using real DATA/FRONTIER bytes and verify the resulting
+  Active recovery boundary. Exact-sized v7 DATA buffers bypass the v4 pool.
 - After bounded optional coalescing, choose an eligible exclusive marker target
   `T` no greater than the contiguous written frontier and prove its exact `E(T)`
   from metadata. Capture the final `T` before constructing its canonical marker,
@@ -695,9 +726,9 @@ A separate production codec materializes those logical batches into complete
 aligned DATA-frame sequences in caller-owned storage. It validates the logical
 header and ticket before changing output. Fixed single-frame and multi-frame
 golden vectors, fragmentation-boundary tests, and unchanged-output rejection
-tests cover the materializer. It is not yet connected to runtime admission,
-WAL writes, FRONTIER scheduling, or the sealing/successor integration scheduled
-for stage 6.
+tests cover the materializer. It is connected to live Parallel admission and
+FRONTIER scheduling; public engine barriers and sealing/successor integration
+remain in later stage 5/6 work.
 
 ### 6. PITR sealing, archive, restore, backup, and repair
 

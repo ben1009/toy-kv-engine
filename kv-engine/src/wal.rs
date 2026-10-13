@@ -1291,16 +1291,15 @@ impl Wal {
         })
     }
 
-    /// Attach a recovered v7 Active WAL to a paused Parallel runtime.
+    /// Attach a recovered v7 Active WAL to a Parallel runtime.
     ///
-    /// The runtime validates the installed inode and immutable header, but
-    /// starts without speculative extent initialization or buffer prewarming.
-    /// Admission remains closed until the v7 marker writer and live resource
-    /// reservations are wired into the producer path.
+    /// The runtime validates the installed inode and immutable header and
+    /// opens admission only when the image's live reservation owner is attached.
     pub(crate) fn from_v7_parallel(
         path: impl AsRef<Path>,
         seed: v7::install::WalV7RuntimeSeed,
         max_file_size: u64,
+        reservation_owner: Option<Arc<v7::admission::WalV7ReservationOwner>>,
     ) -> Result<Self> {
         let path = path.as_ref();
         let next_ticket = seed.next_ticket;
@@ -1331,7 +1330,7 @@ impl Wal {
             worker_file,
             sync_file,
             preallocator,
-            parallel_runtime::ParallelWalRuntimeStart::v7(seed, max_file_size)?,
+            parallel_runtime::ParallelWalRuntimeStart::v7(seed, max_file_size, reservation_owner)?,
         )?;
         let buffered_file = File::options()
             .read(true)
@@ -1393,6 +1392,13 @@ impl Wal {
     pub(crate) fn v7_requires_recovery(&self) -> bool {
         if !self.is_v7() {
             return false;
+        }
+        if self
+            .parallel_runtime
+            .as_ref()
+            .is_some_and(parallel_runtime::ParallelWalRuntime::is_poisoned)
+        {
+            self.poisoned.store(true, Ordering::Release);
         }
         if self.poisoned.load(Ordering::Acquire) {
             return true;
@@ -1731,7 +1737,43 @@ impl Wal {
             "v7 WAL append selected for format {}",
             self.format_version
         );
-        self.put_v7_leader_batch(batch, limits)
+        if self.v7_leader.is_some() {
+            return self.put_v7_leader_batch(batch, limits);
+        }
+
+        let runtime = self
+            .parallel_runtime
+            .as_ref()
+            .context("v7 WAL has neither a Leader nor a Parallel writer")?;
+        anyhow::ensure!(
+            !self.poisoned.load(Ordering::Acquire),
+            "WAL is poisoned due to a previous I/O error"
+        );
+        let previous_ticket = self.next_ticket.load(Ordering::Acquire);
+        match runtime.put_v7_batch(batch, limits) {
+            Ok((ticket, first_data_offset)) => {
+                if ticket != previous_ticket {
+                    self.poisoned.store(true, Ordering::Release);
+                    anyhow::bail!("v7 Parallel ticket disagrees with the WAL admission cursor");
+                }
+                let ticket_end = ticket
+                    .checked_add(1)
+                    .context("v7 Parallel ticket end overflows")?;
+                self.next_ticket.store(ticket_end, Ordering::Release);
+                let append_offset = runtime.logical_length();
+                self.alloc_offset
+                    .fetch_max(append_offset, Ordering::Release);
+                self.preallocated_size
+                    .fetch_max(append_offset, Ordering::Release);
+                Ok((ticket, first_data_offset))
+            }
+            Err(error) => {
+                if runtime.is_poisoned() {
+                    self.poisoned.store(true, Ordering::Release);
+                }
+                Err(error)
+            }
+        }
     }
 
     fn put_v7_leader_batch(

@@ -1200,8 +1200,8 @@ impl MemTable {
     /// The caller must recover and durably install the Active image before
     /// calling this method. It must also retain a clone of `reservation_owner`
     /// for the source segment lifecycle until that WAL image is durably
-    /// reclaimed. Parallel startup remains admission-closed until live v7
-    /// resource reservations and marker scheduling are connected.
+    /// reclaimed. Parallel startup opens admission only after the runtime has
+    /// the validated image-bound owner used for DATA and FRONTIER reservations.
     pub(crate) fn recover_from_v7_active(
         id: usize,
         vlog_enabled: bool,
@@ -1279,7 +1279,12 @@ impl MemTable {
                 )?;
                 Wal::from_v7_leader(writer)?
             }
-            WalIoMode::Parallel => Wal::from_v7_parallel(&path, seed, max_file_size)?,
+            WalIoMode::Parallel => Wal::from_v7_parallel(
+                &path,
+                seed,
+                max_file_size,
+                Some(Arc::clone(&reservation_owner)),
+            )?,
         });
         ret.wal_path = Some(path);
         ret.wal_v7_reservation_owner = Some(reservation_owner);
@@ -3118,7 +3123,7 @@ mod tests {
     }
 
     #[test]
-    fn v7_parallel_active_attach_starts_paused_without_changing_the_image() -> Result<()> {
+    fn v7_parallel_active_attach_opens_admission_without_changing_the_idle_image() -> Result<()> {
         let directory = tempfile::tempdir()?;
         let path = directory.path().join("active.wal");
         let installed = install_empty_v7(&path)?;
@@ -3129,7 +3134,7 @@ mod tests {
         let wal = memtable.wal.as_ref().expect("recovered memtable has a WAL");
         assert!(wal.is_parallel());
         assert_eq!(wal.io_mode(), WalIoMode::Parallel);
-        assert!(!wal.parallel_runtime_admission_is_open());
+        assert!(wal.parallel_runtime_admission_is_open());
         assert_eq!(wal.assigned_ticket_count(), 0);
         assert_eq!(fs::metadata(&path)?.len(), 2 * WAL_V7_FRAME_LEN as u64);
 

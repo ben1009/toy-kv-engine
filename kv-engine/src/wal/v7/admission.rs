@@ -10,7 +10,15 @@
 //! the reserved work. Buffer memory can retire separately after terminal I/O
 //! and hash consumption, while the token continues to own persistent resources.
 
-use std::{collections::BTreeMap, error::Error, fmt, sync::Arc};
+use std::{
+    collections::BTreeMap,
+    error::Error,
+    fmt,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
 use parking_lot::Mutex;
 
@@ -222,10 +230,21 @@ struct WalV7ReservationOwnerState {
 /// before allocating the batch and frame buffers so they drop before its
 /// buffer charge retires, including when an assigned append unwinds.
 pub(crate) struct WalV7OwnedBatchReservation {
+    operation: Arc<WalV7BatchOperation>,
+    frontier_credit_held: bool,
+}
+
+struct WalV7BatchOperation {
     owner: Arc<WalV7ReservationOwner>,
     id: u64,
-    admitted: bool,
+    admitted: AtomicBool,
     finished: bool,
+}
+
+/// Keeps a batch's buffer charge alive while its DATA allocation is owned by
+/// the worker, including when ambiguous submission requires leaking it.
+pub(crate) struct WalV7BatchBufferPin {
+    _operation: Arc<WalV7BatchOperation>,
 }
 
 /// Temporary preparation memory held while a caller builds a logical batch.
@@ -289,10 +308,13 @@ impl WalV7ReservationOwner {
         state.active_operations = active_operations;
         drop(state);
         Ok(WalV7OwnedBatchReservation {
-            owner: Arc::clone(self),
-            id,
-            admitted: false,
-            finished: false,
+            operation: Arc::new(WalV7BatchOperation {
+                owner: Arc::clone(self),
+                id,
+                admitted: AtomicBool::new(false),
+                finished: false,
+            }),
+            frontier_credit_held: true,
         })
     }
 
@@ -363,6 +385,15 @@ impl WalV7ReservationOwner {
         result.and(operation_result)
     }
 
+    fn release_frontier_credit(&self, id: u64) -> Result<(), WalV7ReservationError> {
+        let mut state = self.state.lock();
+        let reservation = state
+            .reservations
+            .get_mut(&id)
+            .ok_or(WalV7ReservationError::UnknownReservation)?;
+        self.ledger.release_frontier_credit(reservation)
+    }
+
     #[cfg(test)]
     pub(crate) fn snapshot(&self) -> WalV7ResourceCharge {
         self.ledger.snapshot()
@@ -372,30 +403,68 @@ impl WalV7ReservationOwner {
 impl WalV7OwnedBatchReservation {
     /// Mark the reservation persistent immediately after coordinates advance.
     pub(crate) fn mark_admitted(&mut self) {
-        self.admitted = true;
+        self.operation.admitted.store(true, Ordering::Release);
     }
 
-    /// Retire buffers after synchronous I/O and hashing stop using them.
-    /// Persistent charges remain in the image owner on success or failure.
-    pub(crate) fn finish_after_io(mut self) -> Result<(), WalV7ReservationError> {
-        if !self.admitted {
+    pub(crate) fn pin_buffer(&self) -> WalV7BatchBufferPin {
+        WalV7BatchBufferPin {
+            _operation: Arc::clone(&self.operation),
+        }
+    }
+
+    /// Retire this ticket's unused marker credit after a coalesced frontier
+    /// has durably consumed another ticket's reserved marker frame.
+    pub(crate) fn release_unused_frontier_credit(&mut self) -> Result<(), WalV7ReservationError> {
+        if !self.operation.admitted.load(Ordering::Acquire) {
             return Err(WalV7ReservationError::ReservationMismatch);
         }
-        let result = self.owner.finish_batch_operation(self.id, true);
+        if !self.frontier_credit_held {
+            return Ok(());
+        }
+        self.operation
+            .owner
+            .release_frontier_credit(self.operation.id)?;
+        self.frontier_credit_held = false;
+        Ok(())
+    }
+
+    /// Retire the coordinator's operation ownership after I/O and hashing.
+    /// Any remaining buffer pin defers transient retirement until that DATA
+    /// allocation is released. Persistent charges remain in the image owner.
+    pub(crate) fn finish_after_io(self) -> Result<(), WalV7ReservationError> {
+        if !self.operation.admitted.load(Ordering::Acquire) {
+            return Err(WalV7ReservationError::ReservationMismatch);
+        }
+        match Arc::try_unwrap(self.operation) {
+            Ok(operation) => operation.finish(),
+            Err(operation) => {
+                drop(operation);
+                Ok(())
+            }
+        }
+    }
+}
+
+impl WalV7BatchOperation {
+    fn finish(mut self) -> Result<(), WalV7ReservationError> {
+        let result = self
+            .owner
+            .finish_batch_operation(self.id, self.admitted.load(Ordering::Acquire));
         self.finished = true;
         result
     }
 }
 
-impl Drop for WalV7OwnedBatchReservation {
+impl Drop for WalV7BatchOperation {
     fn drop(&mut self) {
         if self.finished {
             return;
         }
-        // The buffers declared after this guard have already dropped. Keep
-        // persistent charges for admitted work even if accounting rejects
-        // transient-buffer retirement.
-        let _ = self.owner.finish_batch_operation(self.id, self.admitted);
+        // Only the last coordinator/buffer owner retires this operation.
+        // A leaked DATA allocation retains its pin and therefore its charge.
+        let _ = self
+            .owner
+            .finish_batch_operation(self.id, self.admitted.load(Ordering::Acquire));
     }
 }
 
@@ -561,6 +630,41 @@ impl WalV7ResourceLedger {
         } else {
             state.reservations.insert(reservation.id, retained);
         }
+        state.charged = next;
+        reservation.charge = retained;
+        Ok(())
+    }
+
+    fn release_frontier_credit(
+        &self,
+        reservation: &mut WalV7Reservation,
+    ) -> Result<(), WalV7ReservationError> {
+        if !Arc::ptr_eq(&reservation.ledger, &self.inner) {
+            return Err(WalV7ReservationError::ForeignReservation);
+        }
+        let credit = WAL_V7_FRAME_LEN as u64;
+        let mut state = self.inner.state.lock();
+        let issued_charge = state
+            .reservations
+            .get(&reservation.id)
+            .copied()
+            .ok_or(WalV7ReservationError::UnknownReservation)?;
+        if issued_charge != reservation.charge {
+            return Err(WalV7ReservationError::ReservationMismatch);
+        }
+        let retired = WalV7ResourceCharge {
+            logical_wal_bytes: credit,
+            source_spool_bytes: credit,
+            ..WalV7ResourceCharge::default()
+        };
+        let retained = issued_charge
+            .checked_sub(retired)
+            .ok_or(WalV7ReservationError::AccountingUnderflow)?;
+        let next = state
+            .charged
+            .checked_sub(retired)
+            .ok_or(WalV7ReservationError::AccountingUnderflow)?;
+        state.reservations.insert(reservation.id, retained);
         state.charged = next;
         reservation.charge = retained;
         Ok(())
