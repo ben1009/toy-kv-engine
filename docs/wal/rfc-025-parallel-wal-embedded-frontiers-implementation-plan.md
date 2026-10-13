@@ -385,8 +385,8 @@ physical FRONTIER identity.
   Production gap emission must derive the exact first uncovered timestamp from
   verified WAL/seal data; the manifest timestamp check supplies only a bound.
   Preserve old snapshots by defaulting the new boundary field to absent, and
-  clear it when a sealed successor becomes active. Production record emission
-  and WAL-open consumption remain later integration work.
+  clear it when a sealed successor becomes active. WAL open now consumes the
+  boundary; production record emission remains later integration work.
 
 - Add proposed `wal/v7/recovery.rs`, receiving authoritative Active/Sealing/
   Sealed context and all durable anchors. A discovered seal sidecar cannot
@@ -418,7 +418,8 @@ physical FRONTIER identity.
   discovery, candidate selection, and fresh-inode installation. Return the
   selected diagnostics with the installed state. Reject immutable authority;
   do not derive a durable anchor or predecessor from the WAL bytes. Keep
-  database WAL-open wiring and durable manifest publication as a later slice.
+  database WAL-open wiring is implemented; durable manifest publication
+  remains a later slice.
 - For Sealing/Sealed, require the exact terminal marker, logical boundary,
   sealed length, and whole-image digest. Never fall back to an older marker or
   normalize an immutable image.
