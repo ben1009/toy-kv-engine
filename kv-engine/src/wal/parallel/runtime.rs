@@ -2113,11 +2113,6 @@ fn append_v7_frontier(
             preallocation_end >= frame_end,
             "v7 Parallel FRONTIER exceeds the configured segment cap"
         );
-        preallocate_runtime(inner, preallocation_end)
-            .context("preallocate v7 Parallel FRONTIER frame")?;
-        write_v7_frontier_once(sync_file, frontier_bytes, reservation.frame_offset())
-            .context("write v7 Parallel FRONTIER")?;
-
         let metadata = admission
             .v7_metadata
             .as_mut()
@@ -2125,6 +2120,15 @@ fn append_v7_frontier(
         metadata.physical_hasher.update(frontier_bytes);
         metadata.physical_hashed_end = frame_end;
         admission.admitted_end = frame_end;
+        // Record the marker in the shared hash cursor before producers can
+        // append after it. Any failure in the I/O below poisons this runtime.
+        drop(admission);
+
+        preallocate_runtime(inner, preallocation_end)
+            .context("preallocate v7 Parallel FRONTIER frame")?;
+        write_v7_frontier_once(sync_file, frontier_bytes, reservation.frame_offset())
+            .context("write v7 Parallel FRONTIER")?;
+
         Ok(Some(WalV7FrontierCycle {
             reservation,
             cursor: WalV7FrontierCursor {
