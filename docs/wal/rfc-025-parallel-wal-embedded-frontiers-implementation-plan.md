@@ -7,8 +7,16 @@ complete. Stage 3 now includes bounded backward FRONTIER discovery, single-pass
 candidate-prefix verification, authority/anchor selection, the Active
 fresh-inode normalization primitive, an authority-required coordinator, and
 durable replay of logical Active v7 manifest boundaries. Old PITR snapshots
-default to having no v7 Active boundary. Production boundary publication and
-WAL-open selection remain.
+default to having no v7 Active boundary. Production Active v7 selection and
+fresh-inode installation are now wired into WAL open using the persisted
+manifest anchor, with recovery workspace charged and normalized image/index
+limits checked before installation. An exclusive process lock covers manifest
+authority replay and remains held while the v7 Active WAL is open. A manifest
+v7 boundary requires a canonical v7 Active header before legacy WAL recovery
+can run; replacing that file with a legacy image cannot bypass its durable
+floor. The recovered Active image remains commit-fenced until live v7 runtime
+admission and PITR rotation are implemented. Active boundary publication and immutable
+Sealing/Sealed v7 recovery remain.
 Stage 4 now includes the v7 resource-ledger primitive, framed-batch reservation
 helper, and serial-model integration. The model reserves before allocating
 framed DATA buffers or writing frames, retains the charge through uncertain
@@ -349,12 +357,18 @@ serial model exercises continued writes and crash/reopen. The current slice
 adds an authority-required Active recovery coordinator that runs canonical
 header validation, discovery, candidate selection, and fresh-inode installation
 as one operation, returning both diagnostics and installed state. The
-coordinator does not infer authority from the WAL and is not yet called from
-production WAL open or manifest publication. Immutable images are not
-normalized. PITR manifest state now represents the current Active v7 logical
-boundary and validates monotonic updates against its segment identity; the
-boundary intentionally omits physical FRONTIER identity. Production publication
-and selection do not use this state yet.
+coordinator does not infer authority from the WAL. LSM WAL open now builds
+Active authority only from the persisted logical boundary and predecessor,
+holds an exclusive process lock from before manifest replay, reserves the
+source and a full-segment fresh-inode workspace within the remaining spool
+allowance, checks normalized image and seal-index bounds before replacement,
+and attaches recovered batches and the inode-bound owner to the active
+memtable. The lock remains held until close or drop. Active v7 open stays
+commit-fenced until live v7 admission and lifecycle rotation can safely handle
+capacity and freeze. Immutable images are not normalized. PITR manifest state
+represents the current Active v7 logical boundary and validates monotonic
+updates against its segment identity; the boundary intentionally omits
+physical FRONTIER identity.
 
 - Persist `ActiveBoundaryAdvanced` as a PITR manifest record. Require the first
   boundary for a segment to be its empty header prefix, then accept only exact
@@ -371,8 +385,8 @@ and selection do not use this state yet.
   Production gap emission must derive the exact first uncovered timestamp from
   verified WAL/seal data; the manifest timestamp check supplies only a bound.
   Preserve old snapshots by defaulting the new boundary field to absent, and
-  clear it when a sealed successor becomes active. Production record emission
-  and WAL-open consumption remain later integration work.
+  clear it when a sealed successor becomes active. WAL open now consumes the
+  boundary; production record emission remains later integration work.
 
 - Add proposed `wal/v7/recovery.rs`, receiving authoritative Active/Sealing/
   Sealed context and all durable anchors. A discovered seal sidecar cannot
@@ -404,7 +418,8 @@ and selection do not use this state yet.
   discovery, candidate selection, and fresh-inode installation. Return the
   selected diagnostics with the installed state. Reject immutable authority;
   do not derive a durable anchor or predecessor from the WAL bytes. Keep
-  database WAL-open wiring and durable manifest publication as a later slice.
+  database WAL-open wiring is implemented; durable manifest publication
+  remains a later slice.
 - For Sealing/Sealed, require the exact terminal marker, logical boundary,
   sealed length, and whole-image digest. Never fall back to an older marker or
   normalize an immutable image.
