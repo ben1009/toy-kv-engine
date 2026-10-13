@@ -127,6 +127,7 @@ pub(crate) enum WalV7ReservationError {
     ForeignReservation,
     UnknownReservation,
     ReservationMismatch,
+    ReservationOwnerRetired,
     AccountingUnderflow,
 }
 
@@ -146,6 +147,7 @@ impl fmt::Display for WalV7ReservationError {
             Self::ForeignReservation => "v7 reservation belongs to another resource ledger",
             Self::UnknownReservation => "unknown or already released v7 reservation",
             Self::ReservationMismatch => "v7 reservation identity mismatch",
+            Self::ReservationOwnerRetired => "v7 reservation owner has been retired",
             Self::AccountingUnderflow => "v7 resource accounting underflow",
         })
     }
@@ -206,7 +208,14 @@ pub(crate) struct WalV7ReservationOwner {
     ledger: WalV7ResourceLedger,
     installed_dev: u64,
     installed_ino: u64,
-    reservations: Mutex<BTreeMap<u64, WalV7Reservation>>,
+    state: Mutex<WalV7ReservationOwnerState>,
+}
+
+#[derive(Debug)]
+struct WalV7ReservationOwnerState {
+    retired: bool,
+    active_operations: u64,
+    reservations: BTreeMap<u64, WalV7Reservation>,
 }
 
 /// A batch reservation already held by its image owner. Declare this guard
@@ -217,6 +226,14 @@ pub(crate) struct WalV7OwnedBatchReservation {
     id: u64,
     admitted: bool,
     finished: bool,
+}
+
+/// Temporary preparation memory held while a caller builds a logical batch.
+/// Retiring the source image waits for this guard to drop.
+#[must_use = "the preparation reservation must live through batch preparation"]
+pub(crate) struct WalV7OwnedPreparationReservation {
+    owner: Arc<WalV7ReservationOwner>,
+    reservation: Option<WalV7Reservation>,
 }
 
 impl WalV7ReservationOwner {
@@ -236,7 +253,11 @@ impl WalV7ReservationOwner {
             ledger,
             installed_dev: seed.installed_dev,
             installed_ino: seed.installed_ino,
-            reservations: Mutex::new(reservations),
+            state: Mutex::new(WalV7ReservationOwnerState {
+                retired: false,
+                active_operations: 0,
+                reservations,
+            }),
         })
     }
 
@@ -254,9 +275,19 @@ impl WalV7ReservationOwner {
         self: &Arc<Self>,
         encoded_batch_bytes: u64,
     ) -> Result<WalV7OwnedBatchReservation, WalV7ReservationError> {
+        let mut state = self.state.lock();
+        if state.retired {
+            return Err(WalV7ReservationError::ReservationOwnerRetired);
+        }
+        let active_operations = state
+            .active_operations
+            .checked_add(1)
+            .ok_or(WalV7ReservationError::ArithmeticOverflow)?;
         let reservation = self.ledger.reserve_batch(encoded_batch_bytes)?;
         let id = reservation.id;
-        self.reservations.lock().insert(id, reservation);
+        state.reservations.insert(id, reservation);
+        state.active_operations = active_operations;
+        drop(state);
         Ok(WalV7OwnedBatchReservation {
             owner: Arc::clone(self),
             id,
@@ -269,26 +300,67 @@ impl WalV7ReservationOwner {
     /// index is allocated. The caller drops this token as soon as preparation
     /// has consumed the index.
     pub(crate) fn reserve_preparation_buffer(
-        &self,
+        self: &Arc<Self>,
         buffer_memory_bytes: u64,
-    ) -> Result<Option<WalV7Reservation>, WalV7ReservationError> {
+    ) -> Result<Option<WalV7OwnedPreparationReservation>, WalV7ReservationError> {
         if buffer_memory_bytes == 0 {
             return Ok(None);
         }
-        self.ledger
-            .reserve(WalV7ResourceCharge {
-                buffer_memory_bytes,
-                ..WalV7ResourceCharge::default()
-            })
-            .map(Some)
+        let mut state = self.state.lock();
+        if state.retired {
+            return Err(WalV7ReservationError::ReservationOwnerRetired);
+        }
+        let active_operations = state
+            .active_operations
+            .checked_add(1)
+            .ok_or(WalV7ReservationError::ArithmeticOverflow)?;
+        let reservation = self.ledger.reserve(WalV7ResourceCharge {
+            buffer_memory_bytes,
+            ..WalV7ResourceCharge::default()
+        })?;
+        state.active_operations = active_operations;
+        drop(state);
+        Ok(Some(WalV7OwnedPreparationReservation {
+            owner: Arc::clone(self),
+            reservation: Some(reservation),
+        }))
     }
 
-    fn retire_batch_buffers(&self, id: u64) -> Result<(), WalV7ReservationError> {
-        let mut reservations = self.reservations.lock();
-        let reservation = reservations
-            .get_mut(&id)
-            .ok_or(WalV7ReservationError::UnknownReservation)?;
-        self.ledger.release_buffer_memory(reservation)
+    /// Stop admission and release this image's persistent charges after its WAL
+    /// and seal have been durably removed. Existing operation guards retain
+    /// their charges until their work and buffer use finish.
+    pub(crate) fn retire_after_durable_cleanup(&self) -> Result<(), WalV7ReservationError> {
+        let mut state = self.state.lock();
+        state.retired = true;
+        release_retired_reservations(&mut state);
+        Ok(())
+    }
+
+    fn finish_batch_operation(&self, id: u64, admitted: bool) -> Result<(), WalV7ReservationError> {
+        let mut state = self.state.lock();
+        let result = if admitted {
+            match state.reservations.get_mut(&id) {
+                Some(reservation) => self.ledger.release_buffer_memory(reservation),
+                None => Err(WalV7ReservationError::UnknownReservation),
+            }
+        } else {
+            match state.reservations.remove(&id) {
+                Some(reservation) => {
+                    // Drop under the owner lock so retirement cannot pass the
+                    // active operation before its pre-admission charge is released.
+                    drop(reservation);
+                    Ok(())
+                }
+                None => Err(WalV7ReservationError::UnknownReservation),
+            }
+        };
+        let operation_result = state
+            .active_operations
+            .checked_sub(1)
+            .map(|active_operations| state.active_operations = active_operations)
+            .ok_or(WalV7ReservationError::AccountingUnderflow);
+        release_retired_reservations(&mut state);
+        result.and(operation_result)
     }
 
     #[cfg(test)]
@@ -309,7 +381,7 @@ impl WalV7OwnedBatchReservation {
         if !self.admitted {
             return Err(WalV7ReservationError::ReservationMismatch);
         }
-        let result = self.owner.retire_batch_buffers(self.id);
+        let result = self.owner.finish_batch_operation(self.id, true);
         self.finished = true;
         result
     }
@@ -320,14 +392,33 @@ impl Drop for WalV7OwnedBatchReservation {
         if self.finished {
             return;
         }
-        if self.admitted {
-            // The buffers declared after this guard have already dropped.
-            // Keep persistent charges even if accounting rejects retirement.
-            let _ = self.owner.retire_batch_buffers(self.id);
+        // The buffers declared after this guard have already dropped. Keep
+        // persistent charges for admitted work even if accounting rejects
+        // transient-buffer retirement.
+        let _ = self.owner.finish_batch_operation(self.id, self.admitted);
+    }
+}
+
+impl Drop for WalV7OwnedPreparationReservation {
+    fn drop(&mut self) {
+        // Release the temporary ledger token before allowing image retirement.
+        drop(self.reservation.take());
+        let mut state = self.owner.state.lock();
+        if let Some(active_operations) = state.active_operations.checked_sub(1) {
+            state.active_operations = active_operations;
         } else {
-            let reservation = self.owner.reservations.lock().remove(&self.id);
-            drop(reservation);
+            debug_assert!(false, "v7 preparation-operation accounting underflow");
         }
+        release_retired_reservations(&mut state);
+    }
+}
+
+fn release_retired_reservations(state: &mut WalV7ReservationOwnerState) {
+    if state.retired && state.active_operations == 0 {
+        let reservations = std::mem::take(&mut state.reservations);
+        // Release under the owner lock so another idempotent retirement cannot
+        // return before the ledger charges have actually been dropped.
+        drop(reservations);
     }
 }
 
