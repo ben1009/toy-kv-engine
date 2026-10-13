@@ -93,7 +93,6 @@ impl ParallelWalRuntimeStart {
         Ok(start)
     }
 
-    #[allow(dead_code)] // Production v7 open wiring follows in a later runtime slice.
     pub(crate) fn v7(seed: WalV7RuntimeSeed) -> Result<Self> {
         let expected_v7_inode = Some((seed.installed_dev, seed.installed_ino));
         let v7_allocator = WalV7PhysicalAllocator::new(
@@ -1081,6 +1080,11 @@ impl ParallelWalRuntime {
     #[cfg(test)]
     pub(crate) fn is_closed(&self) -> bool {
         self.threads.lock().closed
+    }
+
+    #[cfg(test)]
+    pub(crate) fn admission_is_open(&self) -> bool {
+        self.inner.admission.lock().open
     }
 
     pub(crate) fn close(&self) -> Result<()> {

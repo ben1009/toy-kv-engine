@@ -1195,13 +1195,13 @@ impl MemTable {
     }
 
     /// Attach an installed, authority-verified v7 Active WAL to a recovered
-    /// memtable and resume its serial Leader writer.
+    /// memtable and initialize the requested scheduler.
     ///
     /// The caller must recover and durably install the Active image before
     /// calling this method. It must also retain a clone of `reservation_owner`
     /// for the source segment lifecycle until that WAL image is durably
-    /// reclaimed.
-    #[allow(dead_code)]
+    /// reclaimed. Parallel startup remains admission-closed until live v7
+    /// resource reservations and marker scheduling are connected.
     pub(crate) fn recover_from_v7_active(
         id: usize,
         vlog_enabled: bool,
@@ -1209,6 +1209,7 @@ impl MemTable {
         installed: WalV7InstalledRecovery,
         max_file_size: u64,
         reservation_owner: Arc<WalV7ReservationOwner>,
+        io_mode: WalIoMode,
     ) -> Result<(Self, u64)> {
         let path = path.as_ref().to_path_buf();
         let seed = installed.runtime_seed()?;
@@ -1259,22 +1260,27 @@ impl MemTable {
             }
         }
 
-        let write_file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&path)
-            .with_context(|| format!("open installed v7 Active WAL {}", path.display()))?;
-        let sync_file = write_file
-            .try_clone()
-            .context("clone installed v7 Active WAL sync handle")?;
-        let writer = WalV7LeaderWriter::new(
-            write_file,
-            sync_file,
-            seed,
-            max_file_size,
-            Arc::clone(&reservation_owner),
-        )?;
-        ret.wal = Some(Wal::from_v7_leader(writer)?);
+        ret.wal = Some(match io_mode {
+            WalIoMode::Leader => {
+                let write_file = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(&path)
+                    .with_context(|| format!("open installed v7 Active WAL {}", path.display()))?;
+                let sync_file = write_file
+                    .try_clone()
+                    .context("clone installed v7 Active WAL sync handle")?;
+                let writer = WalV7LeaderWriter::new(
+                    write_file,
+                    sync_file,
+                    seed,
+                    max_file_size,
+                    Arc::clone(&reservation_owner),
+                )?;
+                Wal::from_v7_leader(writer)?
+            }
+            WalIoMode::Parallel => Wal::from_v7_parallel(&path, seed)?,
+        });
         ret.wal_path = Some(path);
         ret.wal_v7_reservation_owner = Some(reservation_owner);
         ret.wal_v7_seal_index = Some(Mutex::new(installed.seal_index));
@@ -3032,6 +3038,7 @@ mod tests {
             ArchiveEpochId, ChainAnchor, LIVE_WAL_V5_LIMITS, RecordedAt, SegmentId, TimelineId,
             WalBatch, WalEntry, manifest::ActiveBoundary,
         },
+        wal::WalIoMode,
         wal::v7::{
             admission::{WalV7ReservationOwner, WalV7ResourceLedger, WalV7ResourceLimits},
             codec::{
@@ -3090,6 +3097,15 @@ mod tests {
         installed: WalV7InstalledRecovery,
         max_file_size: u64,
     ) -> Result<(MemTable, u64)> {
+        attach_v7_with_mode(path, installed, max_file_size, WalIoMode::Leader)
+    }
+
+    fn attach_v7_with_mode(
+        path: &Path,
+        installed: WalV7InstalledRecovery,
+        max_file_size: u64,
+        io_mode: WalIoMode,
+    ) -> Result<(MemTable, u64)> {
         let ledger = WalV7ResourceLedger::new(WalV7ResourceLimits {
             max_logical_wal_bytes: u64::MAX,
             max_source_spool_bytes: u64::MAX,
@@ -3098,7 +3114,31 @@ mod tests {
             max_seal_index_bytes: u64::MAX,
         })?;
         let owner = Arc::new(WalV7ReservationOwner::new(ledger, &installed)?);
-        MemTable::recover_from_v7_active(7, false, path, installed, max_file_size, owner)
+        MemTable::recover_from_v7_active(7, false, path, installed, max_file_size, owner, io_mode)
+    }
+
+    #[test]
+    fn v7_parallel_active_attach_starts_paused_without_changing_the_image() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("active.wal");
+        let installed = install_empty_v7(&path)?;
+        let original_image = fs::read(&path)?;
+
+        let (memtable, _) =
+            attach_v7_with_mode(&path, installed, TEST_V7_MAX_FILE_SIZE, WalIoMode::Parallel)?;
+        let wal = memtable.wal.as_ref().expect("recovered memtable has a WAL");
+        assert!(wal.is_parallel());
+        assert_eq!(wal.io_mode(), WalIoMode::Parallel);
+        assert!(!wal.parallel_runtime_admission_is_open());
+        assert_eq!(wal.assigned_ticket_count(), 0);
+        assert_eq!(fs::metadata(&path)?.len(), 2 * WAL_V7_FRAME_LEN as u64);
+
+        wal.sync()?;
+        wal.close()?;
+        assert_eq!(fs::metadata(&path)?.len(), 2 * WAL_V7_FRAME_LEN as u64);
+        assert_eq!(fs::read(&path)?, original_image);
+
+        Ok(())
     }
 
     #[test]

@@ -463,10 +463,11 @@ pub struct Wal {
     mvcc_format: bool,
     /// Explicit on-disk WAL format version. Zero denotes the legacy unframed format.
     format_version: u16,
-    /// Effective I/O path. Ordinary v4 WALs use the requested mode; legacy
-    /// and PITR WAL constructors use the leader path.
+    /// Effective I/O path. Ordinary v4 WALs and recovered v7 WALs use the
+    /// requested mode; legacy and v5/v6 PITR WALs use the leader path.
     io_mode: WalIoMode,
-    /// Dedicated packer/worker/sync coordinator for parallel v4 WALs.
+    /// Dedicated packer/worker/sync coordinator for parallel v4 and recovered
+    /// v7 WALs.
     parallel_runtime: Option<parallel_runtime::ParallelWalRuntime>,
     /// Serial v7 writer. Each append performs DATA + FRONTIER + one WAL sync
     /// before returning, so its completion watermark is already durable.
@@ -1256,7 +1257,6 @@ impl Wal {
     /// The writer owns the authoritative append cursor and has already synced
     /// every ticket it reports. The cloned sync handle is retained only for
     /// the legacy buffered-file field; v7 reads and writes use dedicated paths.
-    #[allow(dead_code)]
     pub(crate) fn from_v7_leader(writer: WalV7LeaderWriter) -> Result<Self> {
         let seed = writer.runtime_seed()?;
         let buffered_file = writer.try_clone_sync_file()?;
@@ -1285,6 +1285,83 @@ impl Wal {
             pitr_max_unarchived_bytes: AtomicU64::new(u64::MAX),
             pitr_segment_start: AtomicU64::new(seed.data_start),
             pitr_reserved_end: Mutex::new(seed.append_offset),
+            pitr_rotation_needed: AtomicBool::new(false),
+            pitr_seal: None,
+            pitr_seal_append: Mutex::new(()),
+        })
+    }
+
+    /// Attach a recovered v7 Active WAL to a paused Parallel runtime.
+    ///
+    /// The runtime validates the installed inode and immutable header, but
+    /// starts without speculative extent initialization or buffer prewarming.
+    /// Admission remains closed until the v7 marker writer and live resource
+    /// reservations are wired into the producer path.
+    pub(crate) fn from_v7_parallel(
+        path: impl AsRef<Path>,
+        seed: v7::install::WalV7RuntimeSeed,
+    ) -> Result<Self> {
+        let path = path.as_ref();
+        let next_ticket = seed.next_ticket;
+        let append_offset = seed.append_offset;
+        let data_start = seed.data_start;
+        let (direct_file, alloc_offset) = Self::open_direct_file(path)?;
+        ensure!(
+            alloc_offset == append_offset,
+            "installed v7 WAL length changed before Parallel runtime startup"
+        );
+
+        let worker_file = Arc::new(
+            direct_file
+                .try_clone()
+                .context("clone installed v7 WAL worker file")?,
+        );
+        let sync_file = Arc::new(
+            direct_file
+                .try_clone()
+                .context("clone installed v7 WAL sync file")?,
+        );
+        let preallocator = Arc::new(
+            direct_file
+                .try_clone()
+                .context("clone installed v7 WAL preallocator file")?,
+        );
+        let parallel_runtime = parallel_runtime::ParallelWalRuntime::spawn(
+            worker_file,
+            sync_file,
+            preallocator,
+            parallel_runtime::ParallelWalRuntimeStart::v7(seed)?,
+        )?;
+        let buffered_file = File::options()
+            .read(true)
+            .append(true)
+            .open(path)
+            .with_context(|| format!("open installed v7 WAL {}", path.display()))?;
+
+        Ok(Self {
+            buffered_file: Arc::new(Mutex::new(BufWriter::new(buffered_file))),
+            mvcc_format: true,
+            format_version: WAL_FORMAT_VERSION_V7,
+            io_mode: WalIoMode::Parallel,
+            parallel_runtime: Some(parallel_runtime),
+            v7_leader: None,
+            is_v3: true,
+            direct_file: Some(direct_file),
+            ring: Mutex::new(None),
+            direct_buf_pool: Self::new_direct_buf_pool(false),
+            pending: Mutex::new(Vec::new()),
+            next_ticket: AtomicU64::new(next_ticket),
+            alloc_offset: AtomicU64::new(append_offset),
+            preallocated_size: AtomicU64::new(append_offset),
+            completion_state: CompletionState::with_durable_ticket(next_ticket),
+            submitting: AtomicBool::new(false),
+            #[cfg(feature = "bench")]
+            last_release_ns: AtomicU64::new(0),
+            poisoned: AtomicBool::new(false),
+            pitr_max_segment_bytes: AtomicU64::new(u64::MAX),
+            pitr_max_unarchived_bytes: AtomicU64::new(u64::MAX),
+            pitr_segment_start: AtomicU64::new(data_start),
+            pitr_reserved_end: Mutex::new(append_offset),
             pitr_rotation_needed: AtomicBool::new(false),
             pitr_seal: None,
             pitr_seal_append: Mutex::new(()),
@@ -1347,6 +1424,13 @@ impl Wal {
         self.parallel_runtime
             .as_ref()
             .map(parallel_runtime::ParallelWalRuntime::is_closed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn parallel_runtime_admission_is_open(&self) -> bool {
+        self.parallel_runtime
+            .as_ref()
+            .is_some_and(parallel_runtime::ParallelWalRuntime::admission_is_open)
     }
 
     #[cfg(test)]

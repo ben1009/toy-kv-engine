@@ -143,6 +143,10 @@ append cursor fits the current file length, and that the physical length stays
 within the segment cap before allocating buffers, initializing extents, or
 spawning workers. A mismatched descriptor or invalid file length is rejected
 without changing the WAL; runtime admission remains closed.
+Recovered Active v7 attachment now selects the requested I/O mode: Leader uses
+the serial v7 writer, while Parallel starts from the installed runtime seed
+without extent initialization or buffer prewarming. Parallel admission remains
+closed until live reservations and the v7 marker coordinator are connected.
 The allocator now derives the exact captured physical prefix `E(T)` from
 pending per-ticket DATA ends and the previous FRONTIER end. Each marker
 reservation stores that value, and successful sync retires only DATA-end cursors

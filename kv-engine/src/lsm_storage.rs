@@ -7914,6 +7914,7 @@ impl LsmStorageInner {
                                 .ok_or_else(|| anyhow!("PITR state is missing configuration"))?
                                 .max_segment_bytes,
                             owner,
+                            wal_io_mode,
                         )?;
                         max_commit_ts = max_commit_ts.max(wal_max_ts);
                         if let Some(current) = memtable.recovered_recorded_at() {
