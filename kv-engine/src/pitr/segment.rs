@@ -2,7 +2,9 @@
 #![allow(dead_code)]
 
 use anyhow::{Result, ensure};
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, sync::Arc};
+
+use crate::wal::v7::admission::WalV7ReservationOwner;
 
 #[cfg(target_os = "linux")]
 use std::{
@@ -67,6 +69,7 @@ pub(crate) enum RotationReason {
 #[derive(Clone, Debug)]
 pub(crate) struct PitrSegmentManager {
     segments: BTreeMap<u64, SegmentMetadata>,
+    v7_reservation_owners: BTreeMap<u64, Arc<WalV7ReservationOwner>>,
     active_segment_id: u64,
     next_segment_id: u64,
     pending_successor: Option<SegmentMetadata>,
@@ -96,6 +99,7 @@ impl PitrSegmentManager {
 
         Ok(Self {
             segments,
+            v7_reservation_owners: BTreeMap::new(),
             active_segment_id,
             next_segment_id: active_segment_id
                 .checked_add(1)
@@ -514,6 +518,43 @@ impl PitrSegmentManager {
         Ok(())
     }
 
+    /// Keep the installed v7 image's reservations alive for as long as its
+    /// source segment can still be needed by recovery or archive work.
+    pub(crate) fn retain_v7_reservation_owner(
+        &mut self,
+        segment_id: u64,
+        owner: Arc<WalV7ReservationOwner>,
+    ) -> Result<()> {
+        ensure!(
+            self.segments.contains_key(&segment_id),
+            "cannot retain a v7 reservation owner for an unknown PITR segment"
+        );
+        if let Some(existing) = self.v7_reservation_owners.get(&segment_id) {
+            ensure!(
+                Arc::ptr_eq(existing, &owner),
+                "PITR segment already has a different v7 reservation owner"
+            );
+            return Ok(());
+        }
+        self.v7_reservation_owners.insert(segment_id, owner);
+        Ok(())
+    }
+
+    /// Release an image owner's persistent charges only after its source WAL
+    /// and seal have been durably removed. The owner map intentionally
+    /// outlives segment metadata removed by manifest reconciliation.
+    pub(crate) fn retire_v7_reservation_owner_after_cleanup(
+        &mut self,
+        segment_id: u64,
+    ) -> Result<()> {
+        let Some(owner) = self.v7_reservation_owners.get(&segment_id) else {
+            return Ok(());
+        };
+        owner.retire_after_durable_cleanup()?;
+        self.v7_reservation_owners.remove(&segment_id);
+        Ok(())
+    }
+
     /// Recompute the reservation estimate from the tracked segment charges.
     fn recompute_reserved(&mut self) -> Result<()> {
         let segments = self.segments.values().try_fold(0_u64, |total, segment| {
@@ -733,6 +774,7 @@ impl PitrSegmentManager {
             .source_spool_reserved
             .checked_sub(released)
             .ok_or_else(|| anyhow::anyhow!("source spool accounting underflow"))?;
+        self.retire_v7_reservation_owner_after_cleanup(segment_id)?;
         let removed = self
             .segments
             .remove(&segment_id)

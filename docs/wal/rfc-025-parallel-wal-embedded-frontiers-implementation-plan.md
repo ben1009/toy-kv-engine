@@ -77,8 +77,11 @@ sequencer when a v7 append fails after admission, including write/sync or
 post-sync cursor-publication failures; pre-admission rejections remain retryable.
 An unwind guard also poisons an outstanding v7 commit reservation on panic,
 so a caller that catches the panic cannot leave commit capture waiting forever.
-Engine manifest-authority selection, shared-ledger reconstruction, and retention
-of owners across durable source cleanup still remain. The serial Leader
+Engine manifest-authority selection and shared-ledger reconstruction remain
+unconnected. Recovered Active v7 owners are now retained by PITR segment bookkeeping
+through durable WAL/seal cleanup; retirement fences new admission and retains
+charges for in-flight admission or preparation guards until they finish.
+The serial Leader
 classifies DATA-plus-FRONTIER segment exhaustion before the persistent batch
 reservation or coordinate assignment. It may first reserve temporary canonicalization
 scratch, which is released when preparation or capacity admission fails. Batches that
@@ -178,9 +181,10 @@ MemTable tests cover replay and reopen, resumed MVCC tickets and seal indexes,
 retryable validation/capacity rejection, and returned errors or caught panics
 during v7 sync across all seven MVCC write paths. Uncertain append failures
 poison MVCC before returning or unwinding.
-Production manifest-authority selection and shared-ledger reconstruction, owner retention
-through durable source cleanup, Parallel admission, and the v6 to v7 transition
-remain unconnected.
+Production manifest-authority selection and shared-ledger reconstruction, Parallel
+admission, and the v6 to v7 transition remain unconnected. Active v7 reservation
+owners are retained through durable source cleanup and then retired from segment
+bookkeeping.
 
 **Last updated:** 2026-10-13
 

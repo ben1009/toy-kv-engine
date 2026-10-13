@@ -2687,13 +2687,26 @@ impl KvEngine {
                 }
             }
         };
-        let segments = crate::pitr::segment::PitrSegmentManager::from_recovered_state(
+        let mut segments = crate::pitr::segment::PitrSegmentManager::from_recovered_state(
             active_segment_id,
             state.next_segment_id,
             active_logical_length,
             source_spool_limit,
             &state.obligations,
         )?;
+        for memtable in std::iter::once(recovered_storage_state.memtable.as_ref()).chain(
+            recovered_storage_state
+                .imm_memtables
+                .iter()
+                .map(AsRef::as_ref),
+        ) {
+            if let (Some(segment_id), Some(owner)) = (
+                LsmStorageInner::pitr_segment_of(memtable),
+                memtable.wal_v7_reservation_owner(),
+            ) {
+                segments.retain_v7_reservation_owner(segment_id, owner)?;
+            }
+        }
         if recovered_storage_state.memtable.uses_wal_v5() {
             let config = state.config.as_ref().unwrap();
             recovered_storage_state
@@ -3209,6 +3222,7 @@ impl KvEngine {
         }
         let mut records = Vec::new();
         let mut reclaimable_sources = Vec::new();
+        let mut durably_cleaned_sources = Vec::new();
         if state.mode == crate::pitr::manifest::PitrMode::PublicationUncertain {
             let segment_id = state
                 .uncertain_segment_id
@@ -3390,6 +3404,7 @@ impl KvEngine {
         }
         for segment_id in reclaimable_sources {
             if self.cleanup_flushed_pitr_source(segment_id)? {
+                durably_cleaned_sources.push(segment_id);
                 let record =
                     crate::pitr::manifest::PitrManifestRecord::SegmentReclaimed { segment_id };
                 state = crate::pitr::manifest::replay_pitr_records([
@@ -3402,7 +3417,7 @@ impl KvEngine {
         if !records.is_empty() || has_pending_reconciliation {
             // Keep pins and reservations stable across preparation and durable
             // publication. A failed sync retains the original manager's charge.
-            let reconciled_segments = segments
+            let mut reconciled_segments = segments
                 .as_ref()
                 .map(|segments| {
                     let mut reconciled = segments.clone();
@@ -3422,6 +3437,11 @@ impl KvEngine {
                 }
                 return Err(error);
             }
+            if let Some(reconciled_segments) = reconciled_segments.as_mut() {
+                for segment_id in durably_cleaned_sources {
+                    reconciled_segments.retire_v7_reservation_owner_after_cleanup(segment_id)?;
+                }
+            }
             *segments = reconciled_segments;
         }
         Ok(state)
@@ -3429,39 +3449,27 @@ impl KvEngine {
 
     #[cfg(target_os = "linux")]
     fn cleanup_flushed_pitr_source(&self, segment_id: u64) -> Result<bool> {
-        for memtable in &self.inner.state.load().imm_memtables {
-            let Some(path) = memtable.wal_path() else {
-                continue;
-            };
-            let bytes = std::fs::read(path)?;
-            if memtable.uses_wal_v5()
-                && crate::pitr::decode_v5_file_header(&bytes)?.segment_id.0 == segment_id
-            {
-                return Ok(false);
-            }
+        let storage_state = self.inner.state.load();
+        if std::iter::once(storage_state.memtable.as_ref())
+            .chain(storage_state.imm_memtables.iter().map(AsRef::as_ref))
+            .any(|memtable| LsmStorageInner::pitr_segment_of(memtable) == Some(segment_id))
+        {
+            return Ok(false);
         }
-        let mut removed = false;
+        let wal_name = format!("pitr-{segment_id:020}.wal");
+        let seal_name = format!("pitr-{segment_id:020}.seal");
         for entry in std::fs::read_dir(&self.inner.path)? {
             let path = entry?.path();
-            let matches_segment = match path.extension().and_then(|extension| extension.to_str()) {
-                Some("wal") => std::fs::read(&path)
-                    .ok()
-                    .and_then(|bytes| crate::pitr::decode_v5_file_header(&bytes).ok())
-                    .is_some_and(|header| header.segment_id.0 == segment_id),
-                Some("seal") => std::fs::read(&path)
-                    .ok()
-                    .and_then(|bytes| crate::pitr::seal::V5Seal::decode(&bytes).ok())
-                    .is_some_and(|seal| seal.header.segment_id.0 == segment_id),
-                _ => false,
-            };
-            if matches_segment {
+            if path
+                .file_name()
+                .is_some_and(|name| name == wal_name.as_str() || name == seal_name.as_str())
+            {
                 std::fs::remove_file(path)?;
-                removed = true;
             }
         }
-        if removed {
-            self.inner.sync_dir()?;
-        }
+        // Also sync on retry when a previous pass unlinked the files but failed
+        // before its directory sync. Absence alone does not prove durable cleanup.
+        self.inner.sync_dir()?;
         Ok(true)
     }
 
@@ -12897,6 +12905,9 @@ impl LsmStorageInner {
                         })
                     {
                         segments.record_reclaimed(segment_id)?;
+                    }
+                    if source_identity == (current.timeline_id, current.archive_epoch_id) {
+                        segments.retire_v7_reservation_owner_after_cleanup(segment_id)?;
                     }
                     Ok(())
                 })?;
