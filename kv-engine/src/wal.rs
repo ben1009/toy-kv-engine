@@ -58,7 +58,7 @@ const BATCH_HEADER_SIZE: usize = 16;
 /// v4 batch header size: commit_ts(8) + entry_count(4) + data_crc32(4) + data_len(4) = 20 bytes.
 const V4_BATCH_HEADER_SIZE: usize = 20;
 /// Maximum WAL file size to prevent unbounded allocation during recovery (1 GB).
-const MAX_WAL_FILE_SIZE: u64 = 1 << 30;
+pub(crate) const MAX_WAL_FILE_SIZE: u64 = 1 << 30;
 
 /// Entry kind tags for WAL v3 typed entries.
 #[repr(u8)]

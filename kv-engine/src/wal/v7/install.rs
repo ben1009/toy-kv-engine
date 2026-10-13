@@ -297,6 +297,19 @@ pub(crate) fn recover_and_install_active(
     path: impl AsRef<Path>,
     authority: WalV7RecoveryAuthority,
 ) -> Result<WalV7ActiveRecovery> {
+    recover_and_install_active_with_limits(path, authority, MAX_WAL_FILE_SIZE, u64::MAX)
+}
+
+/// Select and install an Active v7 recovery image only when its normalized
+/// image and rebuilt in-memory seal index fit the caller's configured limits.
+/// These bounds are checked after authoritative selection but before the
+/// replacement inode is created or renamed into place.
+pub(crate) fn recover_and_install_active_with_limits(
+    path: impl AsRef<Path>,
+    authority: WalV7RecoveryAuthority,
+    max_image_len: u64,
+    max_seal_index_bytes: u64,
+) -> Result<WalV7ActiveRecovery> {
     let WalV7RecoveryAuthority::Active {
         predecessor,
         durable_anchors,
@@ -340,6 +353,29 @@ pub(crate) fn recover_and_install_active(
             durable_anchors,
         },
     )?;
+
+    let normalized_image_len = if selection.active_boundary.ticket_end == 0 {
+        HEADER_LEN_U64 + FRAME_LEN_U64
+    } else {
+        selection
+            .active_boundary
+            .durable_end
+            .checked_add(FRAME_LEN_U64)
+            .ok_or_else(|| anyhow::anyhow!("normalized Active v7 image length overflows"))?
+    };
+    ensure!(
+        normalized_image_len <= max_image_len,
+        "normalized Active v7 WAL exceeds the configured segment limit"
+    );
+    let seal_index_bytes = selection
+        .active_boundary
+        .ticket_end
+        .checked_mul(std::mem::size_of::<u64>() as u64)
+        .ok_or_else(|| anyhow::anyhow!("normalized Active v7 seal-index size overflows"))?;
+    ensure!(
+        seal_index_bytes <= max_seal_index_bytes,
+        "normalized Active v7 seal index exceeds its configured limit"
+    );
     drop(source);
 
     let installed = install_active_recovery(path, &selection)?;
