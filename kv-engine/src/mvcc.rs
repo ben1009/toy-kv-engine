@@ -511,6 +511,21 @@ impl LsmMvccInner {
         }
     }
 
+    /// Record the PITR timestamp for an admitted commit, retiring the commit if
+    /// timestamp conversion fails before any WAL append has been attempted.
+    fn pitr_recorded_at_for_commit(
+        &self,
+        commit_ts: u64,
+    ) -> anyhow::Result<crate::pitr::RecordedAt> {
+        match self.next_pitr_recorded_at(std::time::SystemTime::now()) {
+            Ok(recorded_at) => Ok(recorded_at),
+            Err(error) => {
+                self.retire_commit_ts(commit_ts);
+                Err(error)
+            }
+        }
+    }
+
     pub(crate) fn retire_commit_ts(&self, commit_ts: u64) {
         let mut publication = self.publication.lock();
         self.in_flight.fetch_sub(1, Ordering::SeqCst);
@@ -722,7 +737,7 @@ impl LsmMvccInner {
         prefixed.push(crate::vlog::KvKind::Inline as u8);
         prefixed.extend_from_slice(value);
         let ticket = match if memtable.uses_pitr_batch_wal() {
-            let recorded_at = self.next_pitr_recorded_at(std::time::SystemTime::now())?;
+            let recorded_at = self.pitr_recorded_at_for_commit(commit_ts)?;
             memtable.write_pitr_wal_batch_only(
                 &crate::pitr::WalBatch {
                     commit_ts,
@@ -767,7 +782,7 @@ impl LsmMvccInner {
         let encoded_key = encode_internal_key(user_key, commit_ts);
         let tombstone_val = vec![crate::vlog::KvKind::Tombstone as u8];
         let ticket = match if memtable.uses_pitr_batch_wal() {
-            let recorded_at = self.next_pitr_recorded_at(std::time::SystemTime::now())?;
+            let recorded_at = self.pitr_recorded_at_for_commit(commit_ts)?;
             memtable.write_pitr_wal_batch_only(
                 &crate::pitr::WalBatch {
                     commit_ts,
@@ -818,7 +833,7 @@ impl LsmMvccInner {
         let prefixed =
             crate::vlog::encode_ttl_value(crate::vlog::KvKind::TtlInline, expire_at, value);
         let ticket = match if memtable.uses_pitr_batch_wal() {
-            let recorded_at = self.next_pitr_recorded_at(std::time::SystemTime::now())?;
+            let recorded_at = self.pitr_recorded_at_for_commit(commit_ts)?;
             memtable.write_pitr_wal_batch_only(
                 &crate::pitr::WalBatch {
                     commit_ts,
@@ -859,7 +874,7 @@ impl LsmMvccInner {
             let commit_ts = self.reserve_commit_ts()?;
             let _unwind_guard = self.guard_v7_commit_unwind(memtable, commit_ts);
             let ticket = match if memtable.uses_pitr_batch_wal() {
-                let recorded_at = self.next_pitr_recorded_at(std::time::SystemTime::now())?;
+                let recorded_at = self.pitr_recorded_at_for_commit(commit_ts)?;
                 memtable.write_pitr_wal_batch_only(
                     &crate::pitr::WalBatch {
                         commit_ts,
@@ -917,7 +932,7 @@ impl LsmMvccInner {
         let commit_ts = self.reserve_commit_ts()?;
         let _unwind_guard = self.guard_v7_commit_unwind(memtable, commit_ts);
         let ticket = match if memtable.uses_pitr_batch_wal() {
-            let recorded_at = self.next_pitr_recorded_at(std::time::SystemTime::now())?;
+            let recorded_at = self.pitr_recorded_at_for_commit(commit_ts)?;
             memtable.write_pitr_wal_batch_only(
                 &crate::pitr::WalBatch {
                     commit_ts,
@@ -1078,7 +1093,7 @@ impl LsmMvccInner {
             })
             .collect();
         if memtable.uses_pitr_batch_wal() {
-            let recorded_at = self.next_pitr_recorded_at(std::time::SystemTime::now())?;
+            let recorded_at = self.pitr_recorded_at_for_commit(commit_ts)?;
             let wal_entries = entries
                 .iter()
                 .map(|(key, value, kind)| match kind {
@@ -1201,7 +1216,7 @@ impl LsmMvccInner {
             })
             .collect();
         if memtable.uses_pitr_batch_wal() {
-            let recorded_at = self.next_pitr_recorded_at(std::time::SystemTime::now())?;
+            let recorded_at = self.pitr_recorded_at_for_commit(commit_ts)?;
             let ticket = match memtable.write_pitr_wal_batch_only(
                 &crate::pitr::WalBatch {
                     commit_ts,
