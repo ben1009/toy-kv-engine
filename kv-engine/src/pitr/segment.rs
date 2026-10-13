@@ -932,14 +932,14 @@ pub(crate) fn cleanup_pitr_temp_files(dir: impl AsRef<std::path::Path>) -> Resul
 
 #[cfg(target_os = "linux")]
 fn is_pitr_install_temp_name(name: &str) -> bool {
-    let Some(rest) = name.strip_prefix('.') else {
-        return false;
-    };
-    let Some((object, suffix)) = rest.split_once(".tmp-") else {
-        return false;
-    };
+    pitr_install_temp_object_name(name).is_some()
+}
+
+pub(crate) fn pitr_install_temp_object_name(name: &str) -> Option<&str> {
+    let rest = name.strip_prefix('.')?;
+    let (object, suffix) = rest.split_once(".tmp-")?;
     if !object.ends_with(".wal") && !object.ends_with(".seal") {
-        return false;
+        return None;
     }
     let mut fields = suffix.split('-');
 
@@ -951,6 +951,7 @@ fn is_pitr_install_temp_name(name: &str) -> bool {
                 && !sequence.is_empty()
                 && sequence.bytes().all(|byte| byte.is_ascii_digit())
     )
+    .then_some(object)
 }
 
 impl RotationReason {

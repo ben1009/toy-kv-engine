@@ -618,7 +618,7 @@ pub(crate) fn install_active_recovery(
     }
 }
 
-fn recovery_temp_prefix(file_name: &OsStr) -> String {
+pub(crate) fn recovery_temp_prefix(file_name: &OsStr) -> String {
     let digest = Sha256::digest(file_name.as_encoded_bytes());
     let mut encoded_digest = String::with_capacity(digest.len() * 2);
     const HEX: &[u8; 16] = b"0123456789abcdef";
@@ -637,7 +637,9 @@ fn recovery_temp_prefix(file_name: &OsStr) -> String {
 fn cleanup_stale_recovery_images(parent: &Path, parent_dir: &File, prefix: &str) -> Result<()> {
     for entry in fs::read_dir(parent).context("scan for stale Active v7 recovery images")? {
         let entry = entry.context("read Active v7 recovery directory entry")?;
-        if !is_recovery_temp_name(&entry.file_name(), prefix) {
+        let name = entry.file_name();
+        if !name.as_encoded_bytes().starts_with(prefix.as_bytes()) || !is_recovery_temp_name(&name)
+        {
             continue;
         }
         let file_type = entry
@@ -671,8 +673,25 @@ fn cleanup_failed_recovery_image(temp_path: &Path, parent_dir: &File) -> Result<
     }
 }
 
-fn is_recovery_temp_name(name: &OsStr, prefix: &str) -> bool {
-    let Some(suffix) = name.as_encoded_bytes().strip_prefix(prefix.as_bytes()) else {
+/// Recognize recovery images for any WAL basename, including orphaned images
+/// whose original WAL is no longer present.
+pub(crate) fn is_recovery_temp_name(name: &OsStr) -> bool {
+    let Some(rest) = name
+        .as_encoded_bytes()
+        .strip_prefix(b".toy-kv-v7-recovery-")
+    else {
+        return false;
+    };
+    let Some((digest, suffix)) = rest.split_at_checked(64) else {
+        return false;
+    };
+    if !digest
+        .iter()
+        .all(|byte| byte.is_ascii_digit() || matches!(*byte, b'a'..=b'f'))
+    {
+        return false;
+    }
+    let Some(suffix) = suffix.strip_prefix(b".tmp-") else {
         return false;
     };
     let Some(separator) = suffix.iter().position(|byte| *byte == b'-') else {
