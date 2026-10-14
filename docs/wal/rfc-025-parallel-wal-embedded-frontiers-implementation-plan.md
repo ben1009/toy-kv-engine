@@ -16,10 +16,21 @@ v7 boundary requires a canonical v7 Active header before legacy WAL recovery
 can run; replacing that file with a legacy image cannot bypass its durable
 floor. The recovered Active image remains fenced from ordinary engine writes
 until public descriptor routing, lifecycle rotation, and publication barriers
-are implemented. Active boundary publication and immutable Sealing/Sealed v7
-recovery remain. The live v7 Parallel runtime now admits reserved DATA batches
-and writes embedded FRONTIERs before the single WAL sync; API barriers,
+are implemented. PITR manifest replay and snapshots now retain and validate a
+v7 format marker and the full immutable boundary in Sealing obligations;
+seal completion checks the WAL digest against that boundary. Production v7
+freeze/seal emission and immutable Sealing/Sealed recovery remain. The live
+v7 Parallel runtime now admits reserved DATA batches and writes embedded
+FRONTIERs before the single WAL sync; API barriers,
 Leader-parity work, and full Active lifecycle integration remain.
+Version 8 engine manifests and standalone PITR envelopes require explicit
+obligation format markers. Production recovery selects legacy snapshot migration
+from the persisted engine version and publishes a v8 snapshot before new writes.
+Ambiguous pre-v8 snapshots or event logs with outstanding obligations fail
+closed; reopen them with a v7-compatible build, drain seal/archive/reclaim
+work, publish a compacted canonical snapshot, then retry the upgrade. Snapshot
+replacement also removes incompatible historical Sealing records from drained
+pre-v8 v7 event logs.
 Stage 4 now includes the v7 resource-ledger primitive, framed-batch reservation
 helper, and serial-model integration. The model reserves before allocating
 framed DATA buffers or writing frames, retains the charge through uncertain
@@ -293,7 +304,7 @@ durable anchors or the strict immutable-object rules.
 | [`wal/parallel/worker.rs`](../../kv-engine/src/wal/parallel/worker.rs): `WriteBuffer`, write groups, CQE handling | Submit noncontiguous DATA ranges without overwriting intervening FRONTIER frames; track full marker completion and ownership. |
 | [`wal.rs`](../../kv-engine/src/wal.rs): `PitrSealAccumulator` | Replace the single append/hash assumption with ordered logical and physical hash streams plus bounded cutoff/index snapshots. |
 | [`pitr/backpressure.rs`](../../kv-engine/src/pitr/backpressure.rs), [`pitr/segment.rs`](../../kv-engine/src/pitr/segment.rs), [`wal.rs`](../../kv-engine/src/wal.rs) | The spool accountant currently provides helper/model contracts; live batch limits are checked in `Wal::put_v5_batch` and segment accounting grows at lifecycle boundaries. Install and reconstruct a shared live ledger for admission, preallocation, recovery, pins, and cleanup. |
-| [`manifest.rs`](../../kv-engine/src/manifest.rs), [`pitr/manifest.rs`](../../kv-engine/src/pitr/manifest.rs) | Version Active logical anchors and immutable Sealing boundaries; extend replay, snapshots, validation, and interrupted-transition recovery. |
+| [`manifest.rs`](../../kv-engine/src/manifest.rs), [`pitr/manifest.rs`](../../kv-engine/src/pitr/manifest.rs) | Active logical anchors and v7 immutable Sealing boundaries are versioned, serialized, and validated in manifest replay/snapshots; interrupted-transition recovery remains. |
 | [`mem_table.rs`](../../kv-engine/src/mem_table.rs), [`lsm_storage.rs`](../../kv-engine/src/lsm_storage.rs), [`lsm_storage/write_gate.rs`](../../kv-engine/src/lsm_storage/write_gate.rs) | Carry the descriptor and owned reservations through writes, freeze, successors, reopen, and async ownership. |
 | [`mvcc.rs`](../../kv-engine/src/mvcc.rs), [`mvcc/txn.rs`](../../kv-engine/src/mvcc/txn.rs) | Replace v5-only PITR write routing with descriptor-aware preparation; hand sampled v7 recorded time to the ordered packer and preserve legacy clamping, OCC, and timestamp retirement. |
 | [`pitr/seal.rs`](../../kv-engine/src/pitr/seal.rs), [`pitr/archive.rs`](../../kv-engine/src/pitr/archive.rs), [`pitr/catalog.rs`](../../kv-engine/src/pitr/catalog.rs), [`pitr/restore.rs`](../../kv-engine/src/pitr/restore.rs) | Add strict v7 physical-image verification, DATA offsets in seal indexes, explicit format metadata, and mixed-chain restore. |

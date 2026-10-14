@@ -417,6 +417,9 @@ struct ManifestRecoveryState<'a> {
     input_ids_buf: Vec<usize>,
     pitr_records: Vec<crate::pitr::manifest::PitrManifestRecord>,
     pitr_state: crate::pitr::manifest::PitrState,
+    /// The version of the persisted stream selects compatibility migration for
+    /// raw PITR snapshots, which do not use the standalone PITR envelope.
+    manifest_format_version: u32,
     /// Segments whose source WAL a `SegmentReclaimed` record retired. Recovery
     /// uses this as the durable proof that a segment was archived and its file
     /// unlinked, which is what makes an immutable memtable mapped to it
@@ -449,7 +452,7 @@ struct RecoveryPlan {
     recovered_compaction_filters: BTreeMap<u64, InstalledCompactionFilter>,
     next_compaction_filter_id: u64,
     needs_v3_to_v4_upgrade: bool,
-    needs_manifest_v7_upgrade: bool,
+    needs_manifest_upgrade: bool,
     /// Immutable memtables dropped by an explicit repair because their WAL is
     /// missing and their data is unrecoverable. Empty unless repair was asked
     /// for.
@@ -725,16 +728,35 @@ impl ManifestRecoveryState<'_> {
             ManifestRecord::FormatVersion(_) => {
                 // Already validated above; nothing to replay.
             }
-            ManifestRecord::Pitr(record) => {
+            ManifestRecord::Pitr(mut record) => {
+                let is_snapshot = matches!(
+                    record,
+                    crate::pitr::manifest::PitrManifestRecord::Snapshot(_)
+                );
+                ensure!(
+                    !is_snapshot
+                        || (self.pitr_records.is_empty()
+                            && self.pitr_state == crate::pitr::manifest::PitrState::default()),
+                    "PITR snapshot would replace previously recovered lifecycle state"
+                );
+                if self.manifest_format_version < 8
+                    && let crate::pitr::manifest::PitrManifestRecord::Snapshot(state) = &mut record
+                {
+                    crate::pitr::manifest::migrate_legacy_snapshot_obligations(state)?;
+                }
                 if let crate::pitr::manifest::PitrManifestRecord::SegmentReclaimed { segment_id } =
                     &record
                 {
                     self.reclaimed_pitr_segments.insert(*segment_id);
                 }
                 self.pitr_records.push(record.clone());
-                let mut records = vec![crate::pitr::manifest::PitrManifestRecord::Snapshot(
-                    Box::new(self.pitr_state.clone()),
-                )];
+                let mut records = if is_snapshot {
+                    Vec::new()
+                } else {
+                    vec![crate::pitr::manifest::PitrManifestRecord::Snapshot(
+                        Box::new(self.pitr_state.clone()),
+                    )]
+                };
                 records.push(record);
                 self.pitr_state = crate::pitr::manifest::replay_pitr_records(records)?;
             }
@@ -1047,10 +1069,14 @@ impl ManifestRecoveryState<'_> {
         self.next_compaction_filter_id = snapshot.next_compaction_filter_id;
         self.state
             .set_immutable_file_metadata(snapshot.immutable_file_metadata)?;
-        if let Some(pitr_state) = snapshot.pitr_state {
+        if let Some(mut pitr_state) = snapshot.pitr_state {
+            if snapshot.format_version < 8 {
+                crate::pitr::manifest::migrate_legacy_snapshot_obligations(&mut pitr_state)?;
+            }
             pitr_state.validate_for_status()?;
             self.pitr_state = pitr_state;
         }
+        self.manifest_format_version = snapshot.format_version;
         Ok(())
     }
 }
@@ -3762,6 +3788,7 @@ impl KvEngine {
                     segment_id: active_segment_id,
                     successor_segment_id,
                     logical_length: seal.logical_length,
+                    immutable_boundary: None,
                 },
             ])?;
             self.persist_pitr_lifecycle(
@@ -3769,6 +3796,7 @@ impl KvEngine {
                     segment_id: active_segment_id,
                     successor_segment_id,
                     logical_length: seal.logical_length,
+                    immutable_boundary: None,
                 }],
                 sealing_state.clone(),
             )?;
@@ -7246,9 +7274,9 @@ impl LsmStorageInner {
         let mut next_compaction_filter_id: u64 = 0;
         // Maximum commit timestamp recovered from WAL batches and SST metadata.
         let mut max_commit_ts: u64 = 0;
-        // Whether we need to upgrade a legacy manifest to v7.
+        // Whether we need to upgrade a legacy manifest to the current version.
         let mut needs_v3_to_v4_upgrade = false;
-        let mut needs_manifest_v7_upgrade = false;
+        let mut needs_manifest_upgrade = false;
         // Immutable memtables dropped by an explicit repair (empty otherwise).
         let mut repaired_memtable_ids: Vec<usize> = Vec::new();
         // A completed or pending snapshot can carry recovery authority after
@@ -7299,9 +7327,10 @@ impl LsmStorageInner {
             // Validate format version: the first record must be FormatVersion(v)
             // or a Snapshot with format_version == v. Pre-MVCC directories (no
             // format marker) are rejected to prevent silent data corruption.
-            // Accept v3–v7. Version 6 carries complete immutable-file identity
+            // Accept v3–v8. Version 6 carries complete immutable-file identity
             // metadata in snapshots and metadata-bearing manifest records.
             // Version 7 additionally requires PITR state in every snapshot.
+            // Version 8 requires explicit PITR obligation WAL formats.
             let detected_version = match ret.1.first() {
                 Some(ManifestRecord::FormatVersion(v)) => *v,
                 Some(ManifestRecord::Snapshot { format_version, .. }) => *format_version,
@@ -7316,16 +7345,17 @@ impl LsmStorageInner {
                 ),
             };
             anyhow::ensure!(
-                (3..=7).contains(&detected_version),
-                "unsupported manifest format version: got {}, expected 3, 4, 5, 6, or 7; \
+                (3..=crate::manifest::MANIFEST_FORMAT_VERSION).contains(&detected_version),
+                "unsupported manifest format version: got {}, expected 3 through {}; \
                  please start with a fresh database",
-                detected_version
+                detected_version,
+                crate::manifest::MANIFEST_FORMAT_VERSION
             );
-            // Track whether we need to upgrade a legacy manifest to v7.
+            // Publish the current schema before admitting new writes.
             if detected_version == 3 {
                 needs_v3_to_v4_upgrade = true;
             }
-            needs_manifest_v7_upgrade = detected_version <= 6;
+            needs_manifest_upgrade = detected_version < crate::manifest::MANIFEST_FORMAT_VERSION;
 
             // Replay manifest records using the recovery state helper.
             let mut recovery = ManifestRecoveryState {
@@ -7340,6 +7370,7 @@ impl LsmStorageInner {
                 input_ids_buf: Vec::new(),
                 pitr_records: Vec::new(),
                 pitr_state: crate::pitr::manifest::PitrState::default(),
+                manifest_format_version: detected_version,
                 reclaimed_pitr_segments: BTreeSet::new(),
             };
             for record in ret.1 {
@@ -7587,7 +7618,7 @@ impl LsmStorageInner {
                     // Force the canonical snapshot below so the repair is
                     // persisted; otherwise the records we just ignored would
                     // make the next open fail in the same way.
-                    needs_manifest_v7_upgrade = true;
+                    needs_manifest_upgrade = true;
                 }
                 // A memtable the barrier froze into a segment that has since been
                 // reclaimed outlives its own WAL, and the record of it outlives
@@ -7641,7 +7672,7 @@ impl LsmStorageInner {
                     // until a snapshot destroys it - but the manifest would go
                     // on naming a memtable whose WAL is gone, and every open
                     // would warn about it.
-                    needs_manifest_v7_upgrade = true;
+                    needs_manifest_upgrade = true;
                 }
                 ensure!(
                     missing_ids.len() <= pitr_wal_fallbacks.len(),
@@ -8069,7 +8100,7 @@ impl LsmStorageInner {
             recovered_compaction_filters,
             next_compaction_filter_id,
             needs_v3_to_v4_upgrade,
-            needs_manifest_v7_upgrade,
+            needs_manifest_upgrade,
             repaired_memtable_ids,
             is_new_database,
             max_id,
@@ -8138,9 +8169,17 @@ impl LsmStorageInner {
             }
         }
 
-        // Legacy snapshots have no immutable-file checksums. Backfill the
-        // currently live set before publishing an upgrade snapshot.
-        if plan.needs_v3_to_v4_upgrade || plan.needs_manifest_v7_upgrade {
+        // Backfill missing legacy identities before publishing the upgrade.
+        // Preserve recovered checksums: a schema upgrade must not turn changed
+        // source bytes into a newly trusted immutable-file identity.
+        if plan.needs_v3_to_v4_upgrade || plan.needs_manifest_upgrade {
+            let mut recovered_metadata = plan
+                .state
+                .immutable_file_metadata
+                .iter()
+                .cloned()
+                .map(|entry| (entry.identity(), entry))
+                .collect::<HashMap<_, _>>();
             let live_sst_ids = plan
                 .state
                 .l0_sstables
@@ -8151,27 +8190,37 @@ impl LsmStorageInner {
                 .collect::<HashSet<_>>();
             let mut metadata = Vec::with_capacity(live_sst_ids.len());
             for sst_id in &live_sst_ids {
-                metadata.push(hash_immutable_file(
-                    ImmutableFileKind::Sst,
-                    *sst_id as u64,
-                    &plan.path.join(format!("{sst_id:05}.sst")),
-                )?);
+                let entry =
+                    match recovered_metadata.remove(&(ImmutableFileKind::Sst, *sst_id as u64)) {
+                        Some(entry) => entry,
+                        None => hash_immutable_file(
+                            ImmutableFileKind::Sst,
+                            *sst_id as u64,
+                            &plan.path.join(format!("{sst_id:05}.sst")),
+                        )?,
+                    };
+                metadata.push(entry);
             }
-            if let Some(vlog) = &plan.vlog {
-                let vlog_ids = plan
-                    .recovered_vlog_refs
-                    .iter()
-                    .filter(|(sst_id, _)| live_sst_ids.contains(sst_id))
-                    .flat_map(|(_, ids)| ids)
-                    .copied()
-                    .collect::<HashSet<_>>();
-                for vlog_id in vlog_ids {
-                    metadata.push(hash_immutable_file(
-                        ImmutableFileKind::Vlog,
-                        vlog_id as u64,
-                        &vlog.path_of_file(vlog_id),
-                    )?);
-                }
+            // Durable vLog references remain live even when this opener
+            // disables value separation and has no runtime vLog manager.
+            let vlog_ids = plan
+                .recovered_vlog_refs
+                .iter()
+                .filter(|(sst_id, _)| live_sst_ids.contains(sst_id))
+                .flat_map(|(_, ids)| ids)
+                .copied()
+                .collect::<HashSet<_>>();
+            for vlog_id in vlog_ids {
+                let entry =
+                    match recovered_metadata.remove(&(ImmutableFileKind::Vlog, vlog_id as u64)) {
+                        Some(entry) => entry,
+                        None => hash_immutable_file(
+                            ImmutableFileKind::Vlog,
+                            vlog_id as u64,
+                            &plan.path.join("vlog").join(format!("{vlog_id}.vlog")),
+                        )?,
+                    };
+                metadata.push(entry);
             }
             metadata.sort_by_key(|entry| entry.identity());
             plan.state.set_immutable_file_metadata(metadata)?;
@@ -8238,8 +8287,8 @@ impl LsmStorageInner {
             plan.manifest.snapshot(snapshot)?;
         }
 
-        // Legacy manifest upgrade: write a v7 snapshot before new writes.
-        if plan.needs_manifest_v7_upgrade {
+        // Legacy manifest upgrade: write the current snapshot before new writes.
+        if plan.needs_manifest_upgrade {
             let snapshot = ManifestRecord::Snapshot {
                 l0_sstables: plan.state.l0_sstables.clone(),
                 levels: plan.state.levels.clone(),
@@ -12440,7 +12489,7 @@ impl LsmStorageInner {
         Ok(())
     }
 
-    /// Publish a canonical v7 snapshot containing metadata for the current
+    /// Publish a canonical current-version snapshot containing metadata for the
     /// live immutable file set. Safe to call repeatedly; each call replaces
     /// the manifest snapshot atomically.
     #[allow(dead_code)]
@@ -13491,6 +13540,7 @@ mod tests {
                 segment_id: 1,
                 successor_segment_id: 2,
                 logical_length,
+                immutable_boundary: None,
             },
             crate::pitr::manifest::PitrManifestRecord::SegmentSealed {
                 segment_id: 1,
@@ -14014,6 +14064,7 @@ mod tests {
             segment_id,
             successor_segment_id: segment_id + 1,
             logical_length: seal.logical_length,
+            immutable_boundary: None,
         };
         let state = crate::pitr::manifest::replay_pitr_records([
             crate::pitr::manifest::PitrManifestRecord::Snapshot(Box::new(
@@ -17870,6 +17921,7 @@ mod tests {
             segment_id,
             successor_segment_id: segment_id + 1,
             logical_length: seal.logical_length,
+            immutable_boundary: None,
         }];
         let torn_state = crate::pitr::manifest::replay_pitr_records([
             crate::pitr::manifest::PitrManifestRecord::Snapshot(Box::new(
@@ -18048,6 +18100,7 @@ mod tests {
             segment_id,
             successor_segment_id: segment_id + 1,
             logical_length: seal.logical_length,
+            immutable_boundary: None,
         }];
         let torn = crate::pitr::manifest::replay_pitr_records([
             crate::pitr::manifest::PitrManifestRecord::Snapshot(Box::new(

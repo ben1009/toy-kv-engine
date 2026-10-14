@@ -24,6 +24,272 @@ fn empty_manifest_snapshot(next_sst_id: usize) -> ManifestRecord {
     }
 }
 
+fn legacy_pitr_sealing_state() -> crate::pitr::manifest::PitrState {
+    use crate::pitr::manifest::{PersistedPitrConfig, PitrManifestRecord, replay_pitr_records};
+
+    replay_pitr_records([
+        PitrManifestRecord::EnableIntent {
+            repository_id: [1; 16],
+            timeline_id: [2; 16],
+            archive_epoch_id: [3; 16],
+            config: PersistedPitrConfig {
+                archive_interval_ms: 1000,
+                max_segment_bytes: 8192,
+                max_unarchived_bytes: 8192,
+                max_source_spool_bytes: 16384,
+            },
+        },
+        PitrManifestRecord::EnableComplete {
+            active_segment_id: 1,
+        },
+        PitrManifestRecord::SealStarted {
+            segment_id: 1,
+            successor_segment_id: 2,
+            logical_length: 4096,
+            immutable_boundary: None,
+        },
+    ])
+    .unwrap()
+}
+
+fn untagged_pitr_snapshot(state: &crate::pitr::manifest::PitrState) -> serde_json::Value {
+    let mut state = serde_json::to_value(state).unwrap();
+    let obligation = state["obligations"]["1"].as_object_mut().unwrap();
+    obligation.remove("wal_format").unwrap();
+    obligation.remove("immutable_boundary").unwrap();
+
+    state
+}
+
+fn write_pitr_snapshot_fixture(
+    directory: &std::path::Path,
+    version: u32,
+    state: serde_json::Value,
+    engine_snapshot: bool,
+) {
+    if engine_snapshot {
+        let mut snapshot = serde_json::to_value(empty_manifest_snapshot(1)).unwrap();
+        snapshot["Snapshot"]["format_version"] = serde_json::json!(version);
+        snapshot["Snapshot"]["pitr_state"] = state;
+        std::fs::write(
+            directory.join("ENGINE_MANIFEST"),
+            serde_json::to_vec(&snapshot).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(directory.join("MANIFEST"), []).unwrap();
+    } else {
+        let mut records = serde_json::to_vec(&ManifestRecord::FormatVersion(version)).unwrap();
+        records.extend_from_slice(
+            &serde_json::to_vec(&serde_json::json!({ "Pitr": { "Snapshot": state } })).unwrap(),
+        );
+        std::fs::write(directory.join("MANIFEST"), records).unwrap();
+    }
+}
+
+#[test]
+fn pitr_snapshot_migration_uses_the_persisted_engine_version() {
+    let state = untagged_pitr_snapshot(&legacy_pitr_sealing_state());
+    for version in [7, MANIFEST_FORMAT_VERSION] {
+        for engine_snapshot in [false, true] {
+            let directory = tempdir().unwrap();
+            write_pitr_snapshot_fixture(directory.path(), version, state.clone(), engine_snapshot);
+            let result = LsmStorageInner::open(&directory, LsmStorageOptions::default_for_test());
+            if version == 7 {
+                let storage = result.unwrap();
+                assert_eq!(
+                    storage.pitr_state.lock().obligations[&1].wal_format,
+                    crate::pitr::manifest::PitrWalFormat::LegacyV5V6
+                );
+                drop(storage);
+                let (_, records) = Manifest::recover(directory.path().join("MANIFEST")).unwrap();
+                assert!(matches!(
+                    &records[0],
+                    ManifestRecord::Snapshot { format_version, pitr_state: Some(state), .. }
+                        if *format_version == MANIFEST_FORMAT_VERSION
+                            && state.obligations[&1].wal_format
+                                == crate::pitr::manifest::PitrWalFormat::LegacyV5V6
+                ));
+                drop(
+                    LsmStorageInner::open(&directory, LsmStorageOptions::default_for_test())
+                        .unwrap(),
+                );
+            } else {
+                let error = result
+                    .err()
+                    .expect("current snapshots require explicit format markers");
+                assert!(format!("{error:#}").contains("missing its WAL format marker"));
+            }
+        }
+    }
+}
+
+#[test]
+fn pitr_ambiguous_legacy_engine_snapshots_report_upgrade_guidance() {
+    use crate::pitr::manifest::{PersistedChainAnchor, PitrManifestRecord, replay_pitr_records};
+
+    let sealed = replay_pitr_records([
+        PitrManifestRecord::Snapshot(Box::new(legacy_pitr_sealing_state())),
+        PitrManifestRecord::SegmentSealed {
+            segment_id: 1,
+            segment_anchor: PersistedChainAnchor::Segment {
+                segment_id: 1,
+                wal_digest: [4; 32],
+                seal_digest: [5; 32],
+            },
+            last_recorded_at: None,
+            last_commit_anchor: None,
+        },
+    ])
+    .unwrap();
+    for engine_snapshot in [false, true] {
+        let directory = tempdir().unwrap();
+        write_pitr_snapshot_fixture(
+            directory.path(),
+            7,
+            untagged_pitr_snapshot(&sealed),
+            engine_snapshot,
+        );
+        let error = LsmStorageInner::open(&directory, LsmStorageOptions::default_for_test())
+            .err()
+            .expect("ambiguous legacy obligations must fail closed");
+        assert!(format!("{error:#}").contains("v7-compatible build"));
+        assert!(format!("{error:#}").contains("drain seal, archive, and reclaim work"));
+    }
+}
+
+#[test]
+fn pitr_snapshot_cannot_replace_previously_recovered_lifecycle_state() {
+    use crate::pitr::manifest::PitrManifestRecord;
+
+    for engine_snapshot in [false, true] {
+        let directory = tempdir().unwrap();
+        write_pitr_snapshot_fixture(
+            directory.path(),
+            MANIFEST_FORMAT_VERSION,
+            serde_json::to_value(legacy_pitr_sealing_state()).unwrap(),
+            engine_snapshot,
+        );
+        let mut manifest = std::fs::OpenOptions::new()
+            .append(true)
+            .open(directory.path().join("MANIFEST"))
+            .unwrap();
+        serde_json::to_writer(
+            &mut manifest,
+            &ManifestRecord::Pitr(PitrManifestRecord::Snapshot(Box::default())),
+        )
+        .unwrap();
+        drop(manifest);
+        let error = LsmStorageInner::open(&directory, LsmStorageOptions::default_for_test())
+            .err()
+            .expect("a later snapshot must not discard recovered lifecycle state");
+        assert!(format!("{error:#}").contains("replace previously recovered lifecycle state"));
+    }
+}
+
+#[test]
+fn manifest_schema_upgrade_preserves_persisted_immutable_checksums() {
+    let directory = tempdir().unwrap();
+    let engine =
+        crate::lsm_storage::KvEngine::open(&directory, LsmStorageOptions::default_for_test())
+            .unwrap();
+    engine.put(b"key", b"value").unwrap();
+    engine.force_flush().unwrap();
+    engine.inner.ensure_manifest_v7().unwrap();
+    let metadata = engine.inner.state.load().immutable_file_metadata.clone();
+    let sst = metadata
+        .iter()
+        .find(|entry| entry.kind == crate::manifest::ImmutableFileKind::Sst)
+        .unwrap();
+    let sst_path = directory.path().join(format!("{:05}.sst", sst.file_id));
+    engine.close().unwrap();
+    drop(engine);
+
+    let snapshot_path = directory.path().join("ENGINE_MANIFEST");
+    let mut snapshot: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&snapshot_path).unwrap()).unwrap();
+    snapshot["Snapshot"]["format_version"] = serde_json::json!(7);
+    std::fs::write(&snapshot_path, serde_json::to_vec(&snapshot).unwrap()).unwrap();
+    // Damage a data-block byte without changing the metadata read by SST open.
+    let mut sst_bytes = std::fs::read(&sst_path).unwrap();
+    sst_bytes[0] ^= 1;
+    std::fs::write(&sst_path, sst_bytes).unwrap();
+
+    let storage = LsmStorageInner::open(&directory, LsmStorageOptions::default_for_test()).unwrap();
+    assert_eq!(storage.state.load().immutable_file_metadata, metadata);
+    drop(storage);
+    let (_, records) = Manifest::recover(directory.path().join("MANIFEST")).unwrap();
+    assert!(matches!(
+        &records[0],
+        ManifestRecord::Snapshot { format_version, immutable_file_metadata, .. }
+            if *format_version == MANIFEST_FORMAT_VERSION && *immutable_file_metadata == metadata
+    ));
+}
+
+#[test]
+fn manifest_schema_upgrade_preserves_vlog_identities_with_value_separation_disabled() {
+    use crate::{lsm_storage::KvEngine, manifest::ImmutableFileKind, vlog::ValueSeparationOptions};
+
+    for version in [5, 7] {
+        for explicitly_disabled in [false, true] {
+            let directory = tempdir().unwrap();
+            let options = LsmStorageOptions {
+                value_separation: Some(ValueSeparationOptions {
+                    enabled: true,
+                    min_value_size: 16,
+                    ..Default::default()
+                }),
+                ..LsmStorageOptions::default_for_test()
+            };
+            let engine = KvEngine::open(&directory, options.clone()).unwrap();
+            let value = vec![b'v'; 256];
+            engine.put(b"key", &value).unwrap();
+            engine.force_flush().unwrap();
+            engine.inner.ensure_manifest_v7().unwrap();
+            let metadata = engine.inner.state.load().immutable_file_metadata.clone();
+            assert!(
+                metadata
+                    .iter()
+                    .any(|entry| entry.kind == ImmutableFileKind::Vlog)
+            );
+            engine.close().unwrap();
+            drop(engine);
+
+            let snapshot_path = directory.path().join("ENGINE_MANIFEST");
+            let mut snapshot: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&snapshot_path).unwrap()).unwrap();
+            snapshot["Snapshot"]["format_version"] = serde_json::json!(version);
+            if version == 5 {
+                snapshot["Snapshot"]["immutable_file_metadata"]
+                    .as_array_mut()
+                    .unwrap()
+                    .retain(|entry| entry["kind"].as_str() != Some("Vlog"));
+            }
+            std::fs::write(&snapshot_path, serde_json::to_vec(&snapshot).unwrap()).unwrap();
+
+            let disabled_options = LsmStorageOptions {
+                value_separation: explicitly_disabled.then(ValueSeparationOptions::default),
+                ..LsmStorageOptions::default_for_test()
+            };
+            let storage = LsmStorageInner::open(&directory, disabled_options).unwrap();
+            assert!(storage.vlog.is_none());
+            assert_eq!(storage.state.load().immutable_file_metadata, metadata);
+            drop(storage);
+            let (_, records) = Manifest::recover(directory.path().join("MANIFEST")).unwrap();
+            assert!(matches!(
+                &records[0],
+                ManifestRecord::Snapshot { format_version, immutable_file_metadata, .. }
+                    if *format_version == MANIFEST_FORMAT_VERSION && *immutable_file_metadata == metadata
+            ));
+            let reopened = KvEngine::open(&directory, options).unwrap();
+            assert_eq!(
+                reopened.get(b"key").unwrap().as_deref(),
+                Some(value.as_slice())
+            );
+            reopened.close().unwrap();
+        }
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn failpoint_manifest_recovery_rewrites_uncertain_stream_on_a_fresh_inode() {
@@ -503,10 +769,10 @@ fn test_reject_snapshot_without_format_version() {
     );
 }
 
-/// A database written at v6 must be upgraded in place to a v7 snapshot on open,
+/// A database written at v6 must be upgraded in place to the current snapshot on open,
 /// and the upgrade must preserve PITR state (RFC 023).
 #[test]
-fn test_manifest_v6_upgrades_to_v7() {
+fn test_manifest_v6_upgrades_to_current_version() {
     let dir = tempdir().unwrap();
     let manifest_path = dir.path().join("MANIFEST");
 
@@ -522,7 +788,7 @@ fn test_manifest_v6_upgrades_to_v7() {
         Arc::new(LsmStorageInner::open(&dir, LsmStorageOptions::default_for_test()).unwrap());
     drop(storage);
 
-    // The upgrade rewrote the manifest as a v7 snapshot carrying PITR state.
+    // The upgrade rewrote the manifest as a current snapshot carrying PITR state.
     let (_, records) = Manifest::recover(&manifest_path).unwrap();
     match &records[0] {
         ManifestRecord::Snapshot {
@@ -537,7 +803,7 @@ fn test_manifest_v6_upgrades_to_v7() {
             );
             assert!(
                 pitr_state.is_some(),
-                "upgraded v7 snapshot must carry PITR state"
+                "upgraded snapshot must carry PITR state"
             );
         }
         other => panic!(
