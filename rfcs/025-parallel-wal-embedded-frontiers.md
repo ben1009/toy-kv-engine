@@ -643,11 +643,98 @@ then durably record Sealing intent before installing a successor.
 
 An empty segment has a real header, generation-zero frame, and predecessor
 anchor. Its sealed length is 8192, batch count zero, and it invents no commit
-coordinate. Seal sidecar v1 may retain its byte layout with an explicitly
-registered `wal_format_version = 7`, but readers, empty-length checks, digest
-selection, and index validation must become format-specific. The v7 WAL digest
-is the exact physical-image hash from section 4.4; its count equals the
-terminal ticket end and its index names the first DATA frame of each batch.
+coordinate. v5/v6 seals retain sidecar version 1. v7 seals use sidecar version 2
+as specified below because v1 has no field for a 64-bit DATA-frame offset. The
+v7 WAL digest is the exact physical-image hash from section 4.4; its count
+equals the terminal ticket end and its index names the first DATA frame of
+each batch.
+
+#### v7 seal sidecar version 2
+
+The `.seal` sidecar version 2 is valid only for WAL format version 7. It uses
+big-endian multi-byte integers; signed integers use two's-complement
+representation. There is no padding except the reserved bytes shown below. The
+header is exactly 320 bytes:
+
+```text
+offset  size  field
+0       8     magic = ASCII("TKVSEAL2")
+8       2     seal_version = 2
+10      2     header_len = 320
+12      2     wal_format_version = 7
+14      2     flags = 0
+16      16    timeline_id
+32      16    archive_epoch_id
+48      8     segment_id
+56      1     predecessor_kind: 0 = Genesis, 1 = Segment
+57      7     reserved = 0
+64      8     predecessor_segment_id
+72      32    predecessor_wal_digest
+104     32    predecessor_seal_digest
+136     16    incarnation
+152     8     ticket_end
+160     8     durable_end
+168     8     last_commit_ts
+176     32    prefix_digest
+208     8     sealed_end
+216     32    terminal_frontier_digest
+248     32    wal_digest
+280     8     batch_count
+288     8     first_commit_ts, or 0 when empty
+296     8     last_commit_ts, or 0 when empty
+304     8     index_bytes
+312     4     index_crc32
+316     4     header_crc32
+```
+
+`header_crc32` covers header bytes `[8,316)`, including `index_crc32`, and
+excludes the magic and `header_crc32` field. `index_crc32` covers exactly the
+index bytes beginning at offset 320. Both use the WAL v5 CRC-32 definition.
+The complete sidecar length is exactly `320 + index_bytes`; trailing bytes are
+invalid. The catalog's `seal_digest` is SHA-256 over the complete canonical
+sidecar bytes.
+
+For `predecessor_kind = 0`, the predecessor segment ID and both predecessor
+digests are zero, and the Genesis epoch equals `archive_epoch_id`. For
+`predecessor_kind = 1`, those fields encode the complete preceding
+`SegmentAnchor`; both digests are nonzero. Unknown predecessor kinds, nonzero
+flags, or nonzero reserved bytes reject. The WAL header identity and
+predecessor must match the sidecar. The boundary fields at offsets 152 through
+279 encode the complete immutable v7 boundary from section 6.2. The terminal
+FRONTIER is at `sealed_end - 4096`, and its logical fields must equal that
+boundary; `durable_end` equals the terminal FRONTIER offset.
+
+The index contains exactly `batch_count` fixed 40-byte entries:
+
+```text
+ticket:u64 | first_data_frame_offset:u64 | commit_ts:u64 |
+recorded_at_secs:i64 | recorded_at_nanos:u32 | reserved:u32
+```
+
+`batch_count` equals `ticket_end`; entry tickets are exactly `[0,batch_count)`.
+`index_bytes` equals `batch_count * 40` without overflow. The first DATA frame
+offsets are 4096-aligned, strictly increasing, at or after the first DATA slot,
+and before the terminal FRONTIER. Every entry must match the corresponding
+decoded DATA batch. Commit timestamps are nonzero and strictly increasing;
+recorded times are nondecreasing and `recorded_at_nanos < 1_000_000_000`.
+The first and last commit fields equal the first and final entries, or are both
+zero for an empty index. An empty v7 segment has `ticket_end = batch_count = 0`,
+`last_commit_ts = 0`, and `sealed_end = 8192`.
+
+Before allocating decoded entries, a reader MUST bound the sidecar by both the
+persisted `max_segment_bytes` and the global WAL file limit. The limit must be
+at least 8192 and no greater than the global limit. The maximum entry count is
+`floor(max(0, min(max_segment_bytes, global_wal_limit) - 12288) / 4096)`, since
+the image needs a 4096-byte header, generation-zero FRONTIER, terminal
+FRONTIER, and at least one DATA frame per ticket. The reader MUST also require
+`sealed_end <= max_segment_bytes`; the maximum sidecar allocation is then
+`320 + maximum_entry_count * 40` bytes. These bounds apply before entry-vector
+allocation.
+
+`wal_digest` is SHA-256 over the exact physical WAL image `[0,sealed_end)`,
+including every retained frame and its padding. Seal verification MUST perform
+strict Sealed recovery against that exact image and validate its terminal
+FRONTIER, identity, predecessor, logical boundary, DATA index, and digests.
 
 Sealing intent MUST persist the complete `ImmutableBoundary` from section 6.2:
 the logical `ActiveDurableAnchor`, sealed end, terminal frontier digest, and
