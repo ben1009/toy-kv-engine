@@ -215,10 +215,9 @@ pub(crate) struct PitrRestoreSourceObject {
     pub(crate) name: String,
     pub(crate) digest: [u8; 32],
     pub(crate) bytes: Option<u64>,
-    /// The segment's WAL digest rule. Both objects describe the same segment, so
-    /// both carry it; only the WAL object's bytes are digested with it, since the
-    /// sidecar is not a WAL and is always hashed whole.
-    pub(crate) wal_digest_rule: crate::pitr::WalDigestRule,
+    /// The segment's WAL digest policy. Both objects describe the same segment,
+    /// but the seal sidecar is always hashed as a whole object.
+    pub(crate) wal_digest_policy: crate::pitr::archive::SourceObjectDigest,
 }
 
 pub(crate) fn required_source_objects(
@@ -251,7 +250,8 @@ pub(crate) fn required_source_objects(
                 && segment.key.archive_epoch_id.0 == base.archive_epoch_id,
             "PITR restore source segment identity mismatch"
         );
-        let wal_digest_rule = segment.wal_digest_rule()?;
+        let wal_digest_policy =
+            crate::pitr::archive::SourceObjectDigest::for_wal_format(segment.wal_format_version)?;
         objects.push(PitrRestoreSourceObject {
             segment_id: *segment_id,
             kind: ArchiveObjectKind::Wal,
@@ -264,7 +264,7 @@ pub(crate) fn required_source_objects(
             ),
             digest: segment.wal_digest,
             bytes: Some(segment.wal_bytes),
-            wal_digest_rule,
+            wal_digest_policy,
         });
         objects.push(PitrRestoreSourceObject {
             segment_id: *segment_id,
@@ -278,7 +278,7 @@ pub(crate) fn required_source_objects(
             ),
             digest: segment.seal_digest,
             bytes: None,
-            wal_digest_rule,
+            wal_digest_policy,
         });
     }
     Ok(objects)
@@ -294,7 +294,7 @@ pub(crate) fn verify_source_object(object: &PitrRestoreSourceObject, bytes: &[u8
     let digest = match object.kind {
         // The sidecar is not a WAL; its name is bound to a plain whole-object digest.
         ArchiveObjectKind::Seal => Sha256::digest(bytes).into(),
-        ArchiveObjectKind::Wal => crate::pitr::seal::wal_digest(bytes, object.wal_digest_rule)?,
+        ArchiveObjectKind::Wal => object.wal_digest_policy.digest(bytes)?,
     };
     ensure!(
         digest.as_slice() == object.digest,
@@ -1324,6 +1324,25 @@ mod tests {
         .unwrap();
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].1, wal);
+    }
+
+    #[test]
+    fn restore_verifies_v7_wal_source_with_whole_image_digest() {
+        let wal = b"frozen v7 WAL image";
+        let object = PitrRestoreSourceObject {
+            segment_id: SegmentId(4),
+            kind: ArchiveObjectKind::Wal,
+            name: "v7.wal".to_owned(),
+            digest: Sha256::digest(wal).into(),
+            bytes: Some(wal.len() as u64),
+            wal_digest_policy: crate::pitr::archive::SourceObjectDigest::WholeObject,
+        };
+
+        verify_source_object(&object, wal).unwrap();
+        let mut corrupt_wal = *wal;
+        corrupt_wal[0] ^= 1;
+        let error = verify_source_object(&object, &corrupt_wal).unwrap_err();
+        assert!(error.to_string().contains("digest mismatch"));
     }
 
     #[test]

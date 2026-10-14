@@ -53,17 +53,16 @@ pub(crate) struct PreparedArchiveObjects {
     seal_name: String,
     wal_bytes: u64,
     seal_bytes: u64,
-    segment_key: crate::pitr::catalog::SegmentKey,
-    wal_digest: [u8; 32],
-    seal_digest: [u8; 32],
+    segment_metadata: SegmentMetadata,
     /// The rule the segment's `wal_digest` follows. Carried from the metadata the
     /// objects were prepared from so publishing re-checks the WAL under the same
     /// rule the catalog recorded.
-    wal_digest_rule: crate::pitr::WalDigestRule,
+    wal_digest_policy: SourceObjectDigest,
 }
 
-/// How a source object's bytes are digested. A WAL follows the rule its own
-/// segment records; the seal sidecar is not a WAL and is always hashed whole.
+/// How a source object's bytes are digested. v5/v6 WALs use their recorded
+/// coverage rule, v7 WALs use the frozen image's whole-object digest, and seal
+/// sidecars are always hashed whole.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SourceObjectDigest {
     WholeObject,
@@ -71,6 +70,15 @@ pub(crate) enum SourceObjectDigest {
 }
 
 impl SourceObjectDigest {
+    /// Select the digest policy recorded by a segment's WAL format.
+    pub(crate) fn for_wal_format(version: u16) -> anyhow::Result<Self> {
+        if version == crate::wal::format::WAL_FORMAT_VERSION_V7 {
+            Ok(Self::WholeObject)
+        } else {
+            Ok(Self::Wal(crate::pitr::wal_digest_rule(version)?))
+        }
+    }
+
     /// Digest `bytes` the way this object's name was derived.
     pub(crate) fn digest(self, bytes: &[u8]) -> anyhow::Result<[u8; 32]> {
         match self {
@@ -346,14 +354,12 @@ impl ArchiveObjectStager {
             "prepared seal length mismatch"
         );
         anyhow::ensure!(
-            SourceObjectDigest::Wal(prepared.wal_digest_rule)
-                .digest(wal)?
-                .as_slice()
-                == prepared.wal_digest,
+            prepared.wal_digest_policy.digest(wal)?.as_slice()
+                == prepared.segment_metadata.wal_digest,
             "prepared WAL digest mismatch"
         );
         anyhow::ensure!(
-            Sha256::digest(seal).as_slice() == prepared.seal_digest,
+            Sha256::digest(seal).as_slice() == prepared.segment_metadata.seal_digest,
             "prepared seal digest mismatch"
         );
         let mut before_chunk = |_: u64| {
@@ -404,11 +410,10 @@ impl ArchiveObjectStager {
             "prepared archive object length mismatch"
         );
         anyhow::ensure!(
-            SourceObjectDigest::Wal(prepared.wal_digest_rule)
-                .digest(wal)?
-                .as_slice()
-                == prepared.wal_digest
-                && SourceObjectDigest::WholeObject.digest(seal)?.as_slice() == prepared.seal_digest,
+            prepared.wal_digest_policy.digest(wal)?.as_slice()
+                == prepared.segment_metadata.wal_digest
+                && SourceObjectDigest::WholeObject.digest(seal)?.as_slice()
+                    == prepared.segment_metadata.seal_digest,
             "prepared archive object digest mismatch"
         );
         publish_one_chunked(
@@ -713,23 +718,24 @@ impl PitrArchiveCatalog {
         wal: &[u8],
         seal: &[u8],
     ) -> anyhow::Result<PreparedArchiveObjects> {
+        metadata.validate()?;
         anyhow::ensure!(!seal.is_empty(), "archived seal must be nonempty");
         anyhow::ensure!(
             metadata.wal_bytes == wal.len() as u64,
             "archived WAL length mismatch"
         );
-        let wal_digest_rule = metadata.wal_digest_rule()?;
+        let wal_digest_policy = SourceObjectDigest::for_wal_format(metadata.wal_format_version)?;
         anyhow::ensure!(
-            SourceObjectDigest::Wal(wal_digest_rule)
-                .digest(wal)?
-                .as_slice()
-                == metadata.wal_digest,
+            wal_digest_policy.digest(wal)?.as_slice() == metadata.wal_digest,
             "archived WAL digest mismatch"
         );
         anyhow::ensure!(
             Sha256::digest(seal).as_slice() == metadata.seal_digest,
             "archived seal digest mismatch"
         );
+        if metadata.wal_format_version == crate::wal::format::WAL_FORMAT_VERSION_V7 {
+            verify_v7_archive_objects(metadata, wal, seal)?;
+        }
 
         Ok(PreparedArchiveObjects {
             wal_name: archive_object_name(
@@ -748,10 +754,8 @@ impl PitrArchiveCatalog {
             ),
             wal_bytes: wal.len() as u64,
             seal_bytes: seal.len() as u64,
-            segment_key: metadata.key,
-            wal_digest: metadata.wal_digest,
-            seal_digest: metadata.seal_digest,
-            wal_digest_rule,
+            segment_metadata: metadata.clone(),
+            wal_digest_policy,
         })
     }
 
@@ -788,16 +792,8 @@ impl PitrArchiveCatalog {
         );
         anyhow::ensure!(prepared.seal_bytes > 0, "prepared seal must be nonempty");
         anyhow::ensure!(
-            prepared.segment_key == metadata.key,
-            "prepared segment key does not match segment"
-        );
-        anyhow::ensure!(
-            prepared.wal_digest == metadata.wal_digest,
-            "prepared WAL digest does not match segment"
-        );
-        anyhow::ensure!(
-            prepared.seal_digest == metadata.seal_digest,
-            "prepared seal digest does not match segment"
+            prepared.segment_metadata == metadata,
+            "prepared segment metadata does not match segment"
         );
         let replay = replay_catalog(&self.bytes)?;
         anyhow::ensure!(
@@ -835,6 +831,38 @@ impl PitrArchiveCatalog {
     pub(crate) fn bytes(&self) -> &[u8] {
         &self.bytes
     }
+}
+
+fn verify_v7_archive_objects(
+    metadata: &SegmentMetadata,
+    wal: &[u8],
+    seal_bytes: &[u8],
+) -> anyhow::Result<()> {
+    let boundary = metadata
+        .immutable_boundary
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("v7 archive descriptor has no immutable boundary"))?;
+    let seal = crate::pitr::seal::V7Seal::decode(seal_bytes, metadata.wal_bytes)?;
+    anyhow::ensure!(
+        seal.boundary == *boundary,
+        "v7 archive seal boundary mismatch"
+    );
+    anyhow::ensure!(
+        seal.header.timeline_id == metadata.key.timeline_id
+            && seal.header.archive_epoch_id == metadata.key.archive_epoch_id
+            && seal.header.segment_id == metadata.key.segment_id
+            && seal.header.predecessor == metadata.predecessor,
+        "v7 archive seal identity mismatch"
+    );
+    anyhow::ensure!(
+        seal.entries.len() as u64 == metadata.batch_count
+            && seal.entries.first().map(|entry| entry.commit_ts) == metadata.first_commit_ts
+            && seal.entries.last().map(|entry| entry.commit_ts) == metadata.last_commit_ts,
+        "v7 archive seal commit range mismatch"
+    );
+    seal.verify_wal(wal)?;
+
+    Ok(())
 }
 
 fn replay_first_sequence(records: &[PitrCatalogRecord]) -> anyhow::Result<u64> {
@@ -907,6 +935,68 @@ mod tests {
             seal_digest,
             source_identity: [4; 32],
         }
+    }
+
+    fn v7_archive_objects() -> (SegmentMetadata, Vec<u8>, Vec<u8>) {
+        use crate::wal::v7::codec::{
+            WAL_V7_HEADER_LEN, WalV7Header, encode_generation_zero_frontier,
+        };
+
+        let key = crate::pitr::catalog::SegmentKey {
+            repository_id: [1; 16],
+            timeline_id: TimelineId([2; 16]),
+            archive_epoch_id: ArchiveEpochId([3; 16]),
+            segment_id: SegmentId(4),
+        };
+        let predecessor = ChainAnchor::Genesis {
+            archive_epoch_id: key.archive_epoch_id,
+        };
+        let header = WalV7Header {
+            timeline_id: key.timeline_id,
+            archive_epoch_id: key.archive_epoch_id,
+            segment_id: key.segment_id,
+            predecessor,
+            incarnation: [5; 16],
+        };
+        let header_digest = header.digest().unwrap();
+        let mut wal = header.encode().unwrap().to_vec();
+        wal.extend_from_slice(&encode_generation_zero_frontier(header_digest).unwrap());
+        let active = crate::pitr::manifest::ActiveBoundary {
+            timeline_id: key.timeline_id.0,
+            archive_epoch_id: key.archive_epoch_id.0,
+            segment_id: key.segment_id.0,
+            incarnation: header.incarnation,
+            ticket_end: 0,
+            durable_end: WAL_V7_HEADER_LEN as u64,
+            last_commit_ts: 0,
+            prefix_digest: header_digest,
+        };
+        let (seal, seal_bytes) =
+            crate::pitr::seal::build_v7_seal(&wal, active, predecessor).unwrap();
+        let wal_digest = seal.boundary.wal_digest;
+        let seal_digest = Sha256::digest(&seal_bytes).into();
+        let metadata = SegmentMetadata {
+            key,
+            wal_format_version: crate::wal::format::WAL_FORMAT_VERSION_V7,
+            seal_format_version: 2,
+            immutable_boundary: Some(Box::new(seal.boundary)),
+            anchor: SegmentAnchor {
+                segment_id: key.segment_id,
+                wal_digest,
+                seal_digest,
+            },
+            predecessor,
+            first_commit_ts: None,
+            last_commit_ts: None,
+            batch_count: 0,
+            logical_bytes: 0,
+            wal_bytes: wal.len() as u64,
+            wal_digest,
+            seal_digest,
+            source_identity: [6; 32],
+        };
+
+        (metadata, wal, seal_bytes)
     }
 
     /// Construction must not wait on a repository lock somebody else holds. A
@@ -984,6 +1074,119 @@ mod tests {
             catalog
                 .prepare_objects(&metadata(), b"wrong", b"seal")
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn prepares_v7_objects_after_verifying_the_seal_against_the_frozen_image() {
+        let (metadata, wal, seal) = v7_archive_objects();
+        let prepared = PitrArchiveCatalog::default()
+            .prepare_objects(&metadata, &wal, &seal)
+            .unwrap();
+
+        assert_eq!(prepared.wal_digest_policy, SourceObjectDigest::WholeObject);
+        assert_eq!(
+            SourceObjectDigest::for_wal_format(metadata.wal_format_version)
+                .unwrap()
+                .digest(&wal)
+                .unwrap(),
+            metadata.wal_digest
+        );
+    }
+
+    #[test]
+    fn rejects_a_v7_seal_that_disagrees_with_the_catalog_boundary() {
+        let (mut metadata, wal, seal_bytes) = v7_archive_objects();
+        let mut seal = crate::pitr::seal::V7Seal::decode(&seal_bytes, metadata.wal_bytes).unwrap();
+        seal.boundary.terminal_frontier_digest[0] ^= 1;
+        let seal_bytes = seal.encode().unwrap();
+        metadata.seal_digest = Sha256::digest(&seal_bytes).into();
+        metadata.anchor.seal_digest = metadata.seal_digest;
+
+        assert!(
+            PitrArchiveCatalog::default()
+                .prepare_objects(&metadata, &wal, &seal_bytes)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn commit_rejects_v7_metadata_changed_after_object_verification() {
+        let (mut metadata, wal, seal) = v7_archive_objects();
+        let prepared = PitrArchiveCatalog::default()
+            .prepare_objects(&metadata, &wal, &seal)
+            .unwrap();
+        metadata
+            .immutable_boundary
+            .as_mut()
+            .unwrap()
+            .terminal_frontier_digest[0] ^= 1;
+
+        assert!(
+            PitrArchiveCatalog::default()
+                .commit_segment(metadata, &prepared)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn rejects_a_corrupt_v7_image_even_when_its_new_digest_is_cataloged() {
+        let (mut metadata, mut wal, seal_bytes) = v7_archive_objects();
+        wal[0] ^= 1;
+        let mut seal = crate::pitr::seal::V7Seal::decode(&seal_bytes, metadata.wal_bytes).unwrap();
+        seal.boundary.wal_digest = Sha256::digest(&wal).into();
+        let seal_bytes = seal.encode().unwrap();
+        metadata.wal_digest = seal.boundary.wal_digest;
+        metadata.anchor.wal_digest = metadata.wal_digest;
+        metadata.immutable_boundary = Some(Box::new(seal.boundary));
+        metadata.seal_digest = Sha256::digest(&seal_bytes).into();
+        metadata.anchor.seal_digest = metadata.seal_digest;
+
+        assert!(
+            PitrArchiveCatalog::default()
+                .prepare_objects(&metadata, &wal, &seal_bytes)
+                .is_err()
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn shallow_repository_verification_hashes_v7_objects_without_base_intervals() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("objects")).unwrap();
+        std::fs::create_dir(root.path().join("backups")).unwrap();
+        std::fs::write(root.path().join("BACKUP_CATALOG_LOG"), []).unwrap();
+        let (metadata, wal, seal) = v7_archive_objects();
+        let mut catalog = PitrArchiveCatalog::default();
+        let prepared = catalog.prepare_objects(&metadata, &wal, &seal).unwrap();
+        let stager = ArchiveObjectStager::new(root.path()).unwrap();
+        stager.publish(&prepared, &wal, &seal).unwrap();
+        catalog.commit_segment(metadata, &prepared).unwrap();
+        std::fs::write(root.path().join("PITR_CATALOG_LOG"), catalog.bytes()).unwrap();
+        drop(stager);
+        let repository = crate::backup::BackupRepository::open(root.path()).unwrap();
+        let options = crate::pitr::api::VerifyPitrOptions {
+            depth: crate::pitr::api::VerifyPitrDepth::Shallow,
+            selector: None,
+            cursor: None,
+            page_size: crate::pitr::api::MAX_VERIFY_PAGE_SIZE,
+        };
+
+        let report = repository.verify_pitr(options).unwrap();
+        assert!(report.first_failure.is_none());
+        assert!(report.verified_intervals.is_empty());
+
+        let mut corrupt_wal = wal;
+        corrupt_wal[0] ^= 1;
+        std::fs::write(
+            root.path().join("wal").join(&prepared.wal_name),
+            corrupt_wal,
+        )
+        .unwrap();
+        let report = repository.verify_pitr(options).unwrap();
+        assert_eq!(
+            report.first_failure.unwrap().kind,
+            crate::pitr::api::SegmentFailureKind::Corrupt
         );
     }
 
