@@ -2003,7 +2003,9 @@ impl BackupRepository {
                     wal_name,
                     Some(metadata.wal_bytes),
                     metadata.wal_digest,
-                    crate::pitr::archive::SourceObjectDigest::Wal(metadata.wal_digest_rule()?),
+                    crate::pitr::archive::SourceObjectDigest::for_wal_format(
+                        metadata.wal_format_version,
+                    )?,
                     crate::pitr::api::SegmentFailureKind::Missing,
                 ),
                 (

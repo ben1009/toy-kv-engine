@@ -294,7 +294,7 @@ impl PitrArchiver {
             wal_path.as_ref(),
             metadata.wal_bytes,
             metadata.wal_digest,
-            crate::pitr::archive::SourceObjectDigest::Wal(metadata.wal_digest_rule()?),
+            crate::pitr::archive::SourceObjectDigest::for_wal_format(metadata.wal_format_version)?,
             chunk_bytes,
             &self.limiter,
             &self.priority,
@@ -789,7 +789,10 @@ mod tests {
                 name,
                 digest: metadata.wal_digest,
                 bytes: Some(metadata.wal_bytes),
-                wal_digest_rule: metadata.wal_digest_rule().unwrap(),
+                wal_digest_policy: crate::pitr::archive::SourceObjectDigest::for_wal_format(
+                    metadata.wal_format_version,
+                )
+                .unwrap(),
             };
             crate::pitr::restore::verify_source_object(&object, &stored).unwrap();
             // A flipped padding byte is refused here under either rule - the parser
@@ -820,7 +823,10 @@ mod tests {
             name,
             digest: committed[1].wal_digest,
             bytes: Some(committed[1].wal_bytes),
-            wal_digest_rule: committed[1].wal_digest_rule().unwrap(),
+            wal_digest_policy: crate::pitr::archive::SourceObjectDigest::for_wal_format(
+                committed[1].wal_format_version,
+            )
+            .unwrap(),
         };
         assert!(crate::pitr::restore::verify_source_object(&object, &tampered).is_err());
     }

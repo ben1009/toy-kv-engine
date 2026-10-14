@@ -28,8 +28,13 @@ catalog records retain their original byte layout. Catalog encode/replay checks
 the v7 boundary's identity, ticket/time coordinates, exact terminal position,
 image size and ticket capacity, and required digests. V7 boundary allocations
 count toward decoded-state limits without storing the full extension inline
-in legacy records. Production source discovery/publication, archive-object
-verification, and restore integration remain. The live
+in legacy records. Production source discovery/publication and restore
+integration remain. Archive preparation now validates v7 seal descriptors
+against catalog metadata and strictly verifies the exact frozen WAL image;
+source-object digest checks use whole-image SHA-256 for v7 while retaining the
+recorded v5/v6 digest rules. Repository base-interval seal loading and Deep/restore
+decoding still require v7 integration before public verification can cover v7
+segments that extend a PITR base. The live
 v7 Parallel runtime now admits reserved DATA batches and writes embedded
 FRONTIERs before the single WAL sync; API barriers,
 Leader-parity work, and full Active lifecycle integration remain.
