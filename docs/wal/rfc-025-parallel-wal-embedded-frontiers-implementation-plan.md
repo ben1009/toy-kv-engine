@@ -32,14 +32,24 @@ Limit rejection is checked to leave ticket/offset state and WAL bytes unchanged.
 Installed Active recovery now computes its retained WAL and seal-index charge
 from the normalized image, and the persistence model reserves that exact charge
 before resuming writes. Engine manifest-authority WAL selection and live
-admission are connected; shared-ledger reconstruction remains outstanding.
+admission are connected. Active recovery now reconstructs obligation logical
+bytes, allocated source bytes grouped by segment, startup staging files,
+unattributed recovery images, and its Active image/workspace on one ledger
+before installing the normalized inode. The recovered reservation owner shares
+that ledger with segment bookkeeping; source charges retire after durable
+cleanup, obligation charges after durable manifest transitions, and startup
+staging charges after unlink plus directory sync. Public Parallel write routing
+and full Active lifecycle integration remain outstanding.
+Prepared resource releases include deferred manifest obligations, so a successful
+retry after a complete append before sync retires already-cleaned source charges.
 Live segment lifecycle reconstruction is now wired before PITR runtime attach.
 Reconciliation updates the recovered bookkeeping after successful manifest
 sync, releases reclaimed source charges, and consumes completed sealing's
 pending successor reservation while preserving live pins and reservations.
 Flush-driven reclamation also releases recovered source charges after its
-manifest record is durable, with delayed retirement scoped to the same archive
-epoch. Recovery-point publication serializes its manager transition with the
+manifest record is durable, including opens with no segment manager attached.
+Delayed image-owner retirement remains scoped to the same archive epoch.
+Recovery-point publication serializes its manager transition with the
 durable Reclaimable record, and both manifest projections publish under the
 state lock before concurrent flushes can advance them.
 If cleanup loses an empty source before reclamation
@@ -66,8 +76,9 @@ Manifest logical lengths still determine the unarchived-WAL charge. The general
 segment manager remains a provisional estimate: it does not account for
 worst-case per-batch embedded
 FRONTIER reservations, larger seal indexes, or ongoing pinned allocations. The
-shared reservation ledger and live WAL admission integration remain; this
-recovery preflight is not the final hard-bound enforcement.
+recovered Active v7 owner now restores its source, obligation, staging, and
+recovery-workspace charges on one shared ledger before admission opens. Public
+Parallel write routing and full Active lifecycle integration remain.
 The low-level serial Leader writer now requires a reservation owner for its
 installed inode. Creating the owner charges the recovered prefix exactly once. The writer
 validates that the owner belongs to its installed image, precharges the
@@ -86,9 +97,11 @@ sequencer when a v7 append fails after admission, including write/sync or
 post-sync cursor-publication failures; pre-admission rejections remain retryable.
 An unwind guard also poisons an outstanding v7 commit reservation on panic,
 so a caller that catches the panic cannot leave commit capture waiting forever.
-Shared-ledger reconstruction remains unconnected. Recovered Active v7 owners are now retained by PITR segment bookkeeping
-through durable WAL/seal cleanup; retirement fences new admission and retains
-charges for in-flight admission or preparation guards until they finish.
+Public Parallel write routing and the v6 to v7 transition remain unconnected.
+Recovered Active v7 owners and their shared ledger are retained by PITR segment
+bookkeeping through durable WAL/seal cleanup; retirement fences new admission
+and retains charges for in-flight admission or preparation guards until they
+finish.
 The serial Leader
 classifies DATA-plus-FRONTIER segment exhaustion before the persistent batch
 reservation or coordinate assignment. It may first reserve temporary canonicalization
@@ -217,12 +230,11 @@ MemTable tests cover replay and reopen, resumed MVCC tickets and seal indexes,
 retryable validation/capacity rejection, and returned errors or caught panics
 during v7 sync across all seven MVCC write paths. Uncertain append failures
 poison MVCC before returning or unwinding.
-Shared-ledger reconstruction, public Parallel write routing and barriers, and
-the v6 to v7 transition remain unconnected. Active v7 reservation
-owners are retained through durable source cleanup and then retired from segment
-bookkeeping.
+Public Parallel write routing and barriers, and the v6 to v7 transition remain
+unconnected. Active v7 reservation owners and their shared ledger are retained
+through durable source cleanup and then retired from segment bookkeeping.
 
-**Last updated:** 2026-10-13
+**Last updated:** 2026-10-14
 
 **Source baseline:** `30a64fa855126596316ab6b9237e6348b0e41fd2`, which merged RFC 025 in PR #379.
 
@@ -533,8 +545,10 @@ owner. Active v7 recovery reconstructs filesystem allocation for existing
 obligation, orphan, and install-staging WAL/seal files and other-WAL recovery
 images, and charges the Active source plus recovery workspace before
 normalization. Same-WAL stale recovery images are durably reclaimed before
-workspace reuse. Engine-wide shared-ledger ownership, ongoing pin lifecycle
-charges, and live WAL admission remain.
+workspace reuse. The recovered Active owner and PITR segment manager share
+the reconstructed ledger, and durable manifest/source transitions release
+their associated charges. Public Parallel write routing and the v6 to v7
+transition remain.
 
 - Promote or replace the `PitrSpoolAccountant` helper/model with a shared live
   ledger installed by the engine's PITR lifecycle. Extend the current Active

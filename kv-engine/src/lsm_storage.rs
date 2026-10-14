@@ -2379,7 +2379,9 @@ impl KvEngine {
         // Staging files from an interrupted PITR install are never referenced
         // again, so collect them before the engine starts writing new segments.
         #[cfg(target_os = "linux")]
-        crate::pitr::segment::cleanup_pitr_temp_files(&inner.path)?;
+        if crate::pitr::segment::cleanup_pitr_temp_files(&inner.path)? > 0 {
+            inner.release_recovered_v7_startup_staging();
+        }
         Self::stop_commits_for_pitr_recovery(&inner, &pitr_state)?;
         let background_workers = BackgroundWorkers::start(Arc::clone(&inner))?;
 
@@ -3222,7 +3224,6 @@ impl KvEngine {
         }
         let mut records = Vec::new();
         let mut reclaimable_sources = Vec::new();
-        let mut durably_cleaned_sources = Vec::new();
         if state.mode == crate::pitr::manifest::PitrMode::PublicationUncertain {
             let segment_id = state
                 .uncertain_segment_id
@@ -3404,7 +3405,6 @@ impl KvEngine {
         }
         for segment_id in reclaimable_sources {
             if self.cleanup_flushed_pitr_source(segment_id)? {
-                durably_cleaned_sources.push(segment_id);
                 let record =
                     crate::pitr::manifest::PitrManifestRecord::SegmentReclaimed { segment_id };
                 state = crate::pitr::manifest::replay_pitr_records([
@@ -3417,12 +3417,13 @@ impl KvEngine {
         if !records.is_empty() || has_pending_reconciliation {
             // Keep pins and reservations stable across preparation and durable
             // publication. A failed sync retains the original manager's charge.
-            let mut reconciled_segments = segments
+            let reconciled_segments = segments
                 .as_ref()
                 .map(|segments| {
                     let mut reconciled = segments.clone();
-                    reconciled.reconcile_obligations(&previous_obligations, &state.obligations)?;
-                    Ok::<_, anyhow::Error>(reconciled)
+                    let releases = reconciled
+                        .reconcile_obligations(&previous_obligations, &state.obligations)?;
+                    Ok::<_, anyhow::Error>((reconciled, releases))
                 })
                 .transpose()?;
             if let Err(error) =
@@ -3437,12 +3438,10 @@ impl KvEngine {
                 }
                 return Err(error);
             }
-            if let Some(reconciled_segments) = reconciled_segments.as_mut() {
-                for segment_id in durably_cleaned_sources {
-                    reconciled_segments.retire_v7_reservation_owner_after_cleanup(segment_id)?;
-                }
+            if let Some((mut reconciled, releases)) = reconciled_segments {
+                reconciled.apply_v7_obligation_reconciliation(releases)?;
+                *segments = Some(reconciled);
             }
-            *segments = reconciled_segments;
         }
         Ok(state)
     }
@@ -5513,7 +5512,9 @@ impl KvEngine {
         // Staging files from an interrupted PITR install are never referenced
         // again, so collect them before the engine starts writing new segments.
         #[cfg(target_os = "linux")]
-        crate::pitr::segment::cleanup_pitr_temp_files(&inner.path)?;
+        if crate::pitr::segment::cleanup_pitr_temp_files(&inner.path)? > 0 {
+            inner.release_recovered_v7_startup_staging();
+        }
         Self::stop_commits_for_pitr_recovery(&inner, &pitr_state)?;
         let background_workers = BackgroundWorkers::start(Arc::clone(&inner))?;
 
@@ -6937,13 +6938,16 @@ impl LsmStorageInner {
         source_file_len: u64,
         source_file_allocated_bytes: u64,
     ) -> Result<(
-        crate::wal::v7::admission::WalV7ResourceLedger,
+        Arc<crate::wal::v7::admission::WalV7RetainedResources>,
         crate::wal::v7::admission::WalV7Reservation,
         u64,
     )> {
         use crate::pitr::manifest::ObligationState;
         use crate::wal::v7::{
-            admission::{WalV7ResourceCharge, WalV7ResourceLedger, WalV7ResourceLimits},
+            admission::{
+                WalV7ResourceCharge, WalV7ResourceLedger, WalV7ResourceLimits,
+                WalV7RetainedResources,
+            },
             codec::{WAL_V7_FRAME_LEN, WAL_V7_HEADER_LEN},
         };
 
@@ -6964,37 +6968,9 @@ impl LsmStorageInner {
             "v7 Active recovery cannot install a segment with a pending sealing obligation"
         );
 
-        let other_logical_wal_bytes = state
-            .obligations
-            .iter()
-            .filter(|(segment_id, _)| **segment_id != active_segment_id)
-            .try_fold(0_u64, |logical, (_, obligation)| {
-                let unarchived_bytes = if matches!(
-                    obligation.state,
-                    ObligationState::Sealing | ObligationState::Sealed
-                ) {
-                    obligation.logical_length
-                } else {
-                    0
-                };
-                logical
-                    .checked_add(unarchived_bytes)
-                    .ok_or_else(|| anyhow!("PITR obligation WAL accounting overflows"))
-            })?;
-        let other_source_spool_bytes =
-            Self::pitr_other_source_allocated_bytes(database_path, active_segment_id)?;
+        let (source_allocations, staging_bytes, unattributed_bytes) =
+            Self::pitr_source_allocations(database_path, active_segment_id)?;
         let active_fixed_bytes = (WAL_V7_HEADER_LEN + WAL_V7_FRAME_LEN) as u64;
-        let max_logical_wal_bytes = config
-            .max_unarchived_bytes
-            .checked_sub(other_logical_wal_bytes)
-            .ok_or_else(|| {
-                anyhow!("PITR obligations exceed the configured unarchived WAL limit")
-            })?;
-        let max_source_spool_bytes = config
-            .max_source_spool_bytes
-            .checked_sub(other_source_spool_bytes)
-            .and_then(|bytes| bytes.checked_sub(active_fixed_bytes))
-            .ok_or_else(|| anyhow!("PITR obligations leave no v7 Active source-spool capacity"))?;
         let max_segment_bytes = config.max_segment_bytes;
         let max_buffer_memory_bytes = max_segment_bytes
             .checked_mul(2)
@@ -7011,12 +6987,49 @@ impl LsmStorageInner {
             .checked_mul(std::mem::size_of::<u64>() as u64)
             .ok_or_else(|| anyhow!("v7 seal-index limit overflows"))?;
         let ledger = WalV7ResourceLedger::new(WalV7ResourceLimits {
-            max_logical_wal_bytes,
-            max_source_spool_bytes,
+            max_logical_wal_bytes: config.max_unarchived_bytes,
+            max_source_spool_bytes: config.max_source_spool_bytes,
             max_recovery_workspace_bytes: max_segment_bytes,
             max_buffer_memory_bytes,
             max_seal_index_bytes,
         })?;
+        let retained = WalV7RetainedResources::new(ledger.clone());
+
+        // Restore durable logical obligations before reserving the Active WAL.
+        // Archived sources still consume physical spool while present, but no
+        // longer consume the unarchived WAL budget.
+        for (&segment_id, obligation) in &state.obligations {
+            if matches!(
+                obligation.state,
+                ObligationState::Sealing | ObligationState::Sealed
+            ) {
+                retained.reserve_obligation_logical(segment_id, obligation.logical_length)?;
+            }
+        }
+        for (segment_id, allocated_bytes) in source_allocations {
+            retained.reserve_segment(
+                segment_id,
+                WalV7ResourceCharge {
+                    source_spool_bytes: allocated_bytes,
+                    ..WalV7ResourceCharge::default()
+                },
+            )?;
+        }
+        retained.reserve_startup_staging(WalV7ResourceCharge {
+            source_spool_bytes: staging_bytes,
+            ..WalV7ResourceCharge::default()
+        })?;
+        retained.reserve_unattributed(WalV7ResourceCharge {
+            source_spool_bytes: unattributed_bytes,
+            ..WalV7ResourceCharge::default()
+        })?;
+        retained.reserve_segment(
+            active_segment_id,
+            WalV7ResourceCharge {
+                source_spool_bytes: active_fixed_bytes,
+                ..WalV7ResourceCharge::default()
+            },
+        )?;
 
         let retained_source_bytes = source_file_len.saturating_sub(active_fixed_bytes);
         let workspace = ledger.reserve(WalV7ResourceCharge {
@@ -7026,7 +7039,7 @@ impl LsmStorageInner {
             ..WalV7ResourceCharge::default()
         })?;
 
-        Ok((ledger, workspace, max_seal_index_bytes))
+        Ok((retained, workspace, max_seal_index_bytes))
     }
 
     /// Reconstruct retained PITR source-spool usage from source and staging
@@ -7035,14 +7048,35 @@ impl LsmStorageInner {
     /// blocks for obligation files, orphaned sources, and interrupted installs.
     /// Same-WAL stale recovery images reuse the reserved workspace: the
     /// installer durably removes them before allocating a replacement.
+    #[cfg(test)]
     fn pitr_other_source_allocated_bytes(
         database_path: &Path,
         active_segment_id: u64,
     ) -> Result<u64> {
+        let (segments, staging, unattributed) =
+            Self::pitr_source_allocations(database_path, active_segment_id)?;
+        segments.values().try_fold(
+            staging
+                .checked_add(unattributed)
+                .ok_or_else(|| anyhow!("PITR source allocation accounting overflows"))?,
+            |total, bytes| {
+                total
+                    .checked_add(*bytes)
+                    .ok_or_else(|| anyhow!("PITR source allocation accounting overflows"))
+            },
+        )
+    }
+
+    fn pitr_source_allocations(
+        database_path: &Path,
+        active_segment_id: u64,
+    ) -> Result<(BTreeMap<u64, u64>, u64, u64)> {
         let active_wal_name = format!("pitr-{active_segment_id:020}.wal");
         let active_recovery_prefix =
             crate::wal::v7::install::recovery_temp_prefix(std::ffi::OsStr::new(&active_wal_name));
-        let mut allocated_bytes = 0_u64;
+        let mut by_segment = BTreeMap::new();
+        let mut staging_bytes = 0_u64;
+        let mut unattributed_bytes = 0_u64;
         for entry in fs::read_dir(database_path)? {
             let entry = entry?;
             let file_name = entry.file_name();
@@ -7078,12 +7112,24 @@ impl LsmStorageInner {
                 continue;
             }
             let metadata = fs::symlink_metadata(entry.path())?;
-            allocated_bytes = allocated_bytes
-                .checked_add(Self::filesystem_allocated_bytes(&metadata)?)
-                .ok_or_else(|| anyhow!("PITR source allocation accounting overflows"))?;
+            let bytes = Self::filesystem_allocated_bytes(&metadata)?;
+            if let Some((segment_id, _)) = normal_source {
+                let segment_bytes = by_segment.entry(segment_id).or_insert(0_u64);
+                *segment_bytes = segment_bytes
+                    .checked_add(bytes)
+                    .ok_or_else(|| anyhow!("PITR source allocation accounting overflows"))?;
+            } else if temporary_source.is_some() {
+                staging_bytes = staging_bytes
+                    .checked_add(bytes)
+                    .ok_or_else(|| anyhow!("PITR source allocation accounting overflows"))?;
+            } else {
+                unattributed_bytes = unattributed_bytes
+                    .checked_add(bytes)
+                    .ok_or_else(|| anyhow!("PITR source allocation accounting overflows"))?;
+            }
         }
 
-        Ok(allocated_bytes)
+        Ok((by_segment, staging_bytes, unattributed_bytes))
     }
 
     fn parse_pitr_source_filename(name: &str) -> Option<(u64, &str)> {
@@ -7117,6 +7163,18 @@ impl LsmStorageInner {
             .blocks()
             .checked_mul(512)
             .ok_or_else(|| anyhow!("filesystem allocation accounting overflows"))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn release_recovered_v7_startup_staging(&self) {
+        let state = self.state.load();
+        for memtable in std::iter::once(state.memtable.as_ref())
+            .chain(state.imm_memtables.iter().map(AsRef::as_ref))
+        {
+            if let Some(owner) = memtable.wal_v7_reservation_owner() {
+                owner.release_startup_staging_resources();
+            }
+        }
     }
 
     /// Phase 1 of open: validation, directory creation, vLog init, manifest
@@ -7898,10 +7956,12 @@ impl LsmStorageInner {
                             );
                         }
                         let owner =
-                            Arc::new(crate::wal::v7::admission::WalV7ReservationOwner::new(
+                            Arc::new(
+                                crate::wal::v7::admission::WalV7ReservationOwner::new_with_retained_resources(
                                 ledger,
                                 &recovery.installed,
-                            )?);
+                            )?,
+                            );
                         let memtable_id = recovered_v7_active_memtable_id.unwrap_or(max_id);
                         let (memtable, wal_max_ts) = MemTable::recover_from_v7_active(
                             memtable_id,
@@ -12958,6 +13018,19 @@ impl LsmStorageInner {
             {
                 return Ok(());
             }
+            // Capture this epoch's recovered ledger before publication. Flush
+            // can run before PITR bookkeeping is attached, and a later epoch
+            // replacement must not redirect this release to its resources.
+            let retained_v7_resources = {
+                let state = self.state.load();
+                std::iter::once(state.memtable.as_ref())
+                    .chain(state.imm_memtables.iter().map(AsRef::as_ref))
+                    .find_map(|memtable| {
+                        memtable
+                            .wal_v7_reservation_owner()
+                            .and_then(|owner| owner.retained_resources())
+                    })
+            };
             let seal_path = wal_path.with_extension("seal");
             for path in [&wal_path, &seal_path] {
                 match std::fs::remove_file(path) {
@@ -12978,6 +13051,9 @@ impl LsmStorageInner {
                 .ok_or_else(|| anyhow!("manifest is not initialized"))?
                 .add_record(&state_lock, ManifestRecord::Pitr(record))?;
             *self.pitr_state.lock() = next_pitr_state.clone();
+            if let Some(resources) = retained_v7_resources {
+                resources.release_segment(segment_id);
+            }
             if let Some(engine) = self.weak_engine.get().and_then(std::sync::Weak::upgrade) {
                 *engine.pitr_manifest_state.lock() = next_pitr_state;
                 // Reconciliation takes the manager lock before state_lock, so
@@ -14939,9 +15015,26 @@ mod tests {
         let directory = tempdir()?;
         let options = v7_recovery_test_database(directory.path())?;
         let database = directory.path().join("db");
+        let (active_segment_id, _) = pitr_segment_wals(&database)
+            .into_iter()
+            .last()
+            .ok_or_else(|| anyhow::anyhow!("v7 fixture has no Active WAL"))?;
+        let staged_path = database.join(format!(".pitr-{active_segment_id:020}.seal.tmp-123-1"));
+        std::fs::write(&staged_path, vec![0x5a; 4096])?;
         let engine = KvEngine::open_async(&database, options.clone()).await?;
         let active = engine.inner.state.load().memtable.clone();
         assert!(active.uses_v7_wal());
+        assert!(!staged_path.exists());
+        let active_allocated =
+            LsmStorageInner::filesystem_file_allocated_bytes(active.wal_path().unwrap())?;
+        assert_eq!(
+            active
+                .wal_v7_reservation_owner()
+                .unwrap()
+                .snapshot()
+                .source_spool_bytes,
+            active_allocated
+        );
         assert_eq!(engine.get(b"v7-key")?, Some(Bytes::from_static(b"v")));
         let wal_path = active.wal_path().unwrap();
         let before = std::fs::read(wal_path)?;
@@ -15191,6 +15284,193 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn v7_flush_releases_recovered_source_without_segment_manager() -> anyhow::Result<()> {
+        for with_engine in [true, false] {
+            let directory = tempdir()?;
+            let database = directory.path().join("db");
+            let engine = pitr_flush_test_engine(directory.path());
+            engine.put(b"legacy-key", b"legacy-value")?;
+            let legacy_segment = engine.pitr_manifest_state.lock().active_segment_id.unwrap();
+            assert!(matches!(
+                engine.create_recovery_point()?,
+                crate::pitr::api::RecoveryPointOutcome::Durable(_)
+            ));
+            let state = engine.pitr_manifest_state.lock().clone();
+            assert_eq!(
+                state.obligations[&legacy_segment].state,
+                crate::pitr::manifest::ObligationState::Reclaimable
+            );
+            engine.close_storage()?;
+            drop(engine);
+
+            let mut options = install_v7_recovery_test_database(directory.path(), state)?;
+            options.pitr_repository = None;
+            let reopened = with_engine
+                .then(|| KvEngine::open(&database, options.clone()))
+                .transpose()?;
+            let storage = match &reopened {
+                Some(engine) => {
+                    assert!(engine.pitr_segments.lock().is_none());
+                    Arc::clone(&engine.inner)
+                }
+                None => Arc::new(LsmStorageInner::open_with_wal_io_mode(
+                    &database,
+                    options,
+                    crate::wal::WalIoMode::Leader,
+                )?),
+            };
+            let active = storage.state.load().memtable.clone();
+            let owner = active.wal_v7_reservation_owner().unwrap();
+            let active_allocated =
+                LsmStorageInner::filesystem_file_allocated_bytes(active.wal_path().unwrap())?;
+            assert!(owner.snapshot().source_spool_bytes > active_allocated);
+            assert!(!storage.state.load().imm_memtables.is_empty());
+
+            storage.force_flush_next_imm_memtable()?;
+            let legacy_path = database.join(format!("pitr-{legacy_segment:020}.wal"));
+            assert!(!legacy_path.exists());
+            assert!(!legacy_path.with_extension("seal").exists());
+            assert!(
+                !storage
+                    .pitr_state
+                    .lock()
+                    .obligations
+                    .contains_key(&legacy_segment)
+            );
+            assert_eq!(owner.snapshot().source_spool_bytes, active_allocated);
+            assert_eq!(
+                storage.get(b"legacy-key")?,
+                Some(Bytes::from_static(b"legacy-value"))
+            );
+            if let Some(engine) = reopened {
+                assert!(engine.pitr_segments.lock().is_none());
+                assert!(
+                    !engine
+                        .pitr_manifest_state
+                        .lock()
+                        .obligations
+                        .contains_key(&legacy_segment)
+                );
+                engine.close_storage()?;
+            }
+        }
+
+        Ok(())
+    }
+
+    #[cfg(all(target_os = "linux", feature = "chaos-testing"))]
+    #[test]
+    fn failpoint_v7_reconciliation_retry_releases_durably_cleaned_source_charge()
+    -> anyhow::Result<()> {
+        use crate::{
+            chaos::failpoint::FailScenario,
+            pitr::manifest::{ObligationState, PitrManifestRecord},
+        };
+
+        let scenario = FailScenario::setup();
+        let directory = tempdir()?;
+        let database = directory.path().join("db");
+        let engine = pitr_flush_test_engine(directory.path());
+        engine.put(b"legacy-key", b"legacy-value")?;
+        let legacy_segment = engine.pitr_manifest_state.lock().active_segment_id.unwrap();
+        assert!(matches!(
+            engine.create_recovery_point()?,
+            crate::pitr::api::RecoveryPointOutcome::Durable(_)
+        ));
+        engine.close_storage()?;
+        drop(engine);
+
+        // Flush the legacy memtable while retaining its archived source, then
+        // durably mark it reclaimable without running source cleanup yet.
+        let storage = LsmStorageInner::open_with_wal_io_mode(
+            &database,
+            LsmStorageOptions {
+                enable_wal: true,
+                manifest_snapshot_threshold_bytes: 1,
+                ..LsmStorageOptions::default_for_test()
+            },
+            crate::wal::WalIoMode::Leader,
+        )?;
+        let mut state = storage.pitr_state.lock().clone();
+        state.obligations.get_mut(&legacy_segment).unwrap().state = ObligationState::Archived;
+        state.validate_for_status()?;
+        *storage.pitr_state.lock() = state.clone();
+        while !storage.state.load().imm_memtables.is_empty() {
+            storage.force_flush_next_imm_memtable()?;
+        }
+        drop(storage);
+        let reclaimable = PitrManifestRecord::SegmentReclaimable {
+            segment_id: legacy_segment,
+        };
+        crate::manifest::Manifest::recover(database.join("MANIFEST"))?
+            .0
+            .add_record_when_init(crate::manifest::ManifestRecord::Pitr(reclaimable.clone()))?;
+        state = crate::pitr::manifest::replay_pitr_records([
+            PitrManifestRecord::Snapshot(Box::new(state)),
+            reclaimable,
+        ])?;
+
+        let mut options = install_v7_recovery_test_database(directory.path(), state)?;
+        options.pitr_repository = None;
+        let reopened = KvEngine::open(&database, options)?;
+        let state = reopened.pitr_manifest_state.lock().clone();
+        reopened.install_pitr_lifecycle(
+            state.clone(),
+            &crate::pitr::api::PitrRuntimeOptions::default(),
+        )?;
+        let active = reopened.inner.state.load().memtable.clone();
+        let owner = active.wal_v7_reservation_owner().unwrap();
+        let active_allocated =
+            LsmStorageInner::filesystem_file_allocated_bytes(active.wal_path().unwrap())?;
+        let before = owner.snapshot();
+        assert!(before.source_spool_bytes > active_allocated);
+
+        fail::cfg("manifest.after_append_before_sync", "return").unwrap();
+        let result = reopened.reconcile_durable_archive_obligations(state);
+        fail::remove("manifest.after_append_before_sync");
+        assert!(matches!(
+            result
+                .unwrap_err()
+                .downcast_ref::<super::PitrManifestPublicationError>(),
+            Some(super::PitrManifestPublicationError::PublishedButNotDurable(
+                _
+            ))
+        ));
+        let legacy_path = database.join(format!("pitr-{legacy_segment:020}.wal"));
+        assert!(!legacy_path.exists());
+        assert!(!legacy_path.with_extension("seal").exists());
+        let state = reopened.pitr_manifest_state.lock().clone();
+        assert!(state.obligations.is_empty());
+        assert_eq!(
+            owner.snapshot(),
+            before,
+            "failed publication must retain source charges"
+        );
+        assert!(
+            reopened
+                .pitr_segments
+                .lock()
+                .as_ref()
+                .unwrap()
+                .has_pending_obligation_reconciliation()
+        );
+
+        reopened.reconcile_durable_archive_obligations(state)?;
+        assert_eq!(owner.snapshot().source_spool_bytes, active_allocated);
+        {
+            let segments = reopened.pitr_segments.lock();
+            let segments = segments.as_ref().unwrap();
+            assert!(segments.segment(legacy_segment).is_none());
+            assert!(!segments.has_pending_obligation_reconciliation());
+        }
+        reopened.close_storage()?;
+        scenario.teardown();
+
+        Ok(())
+    }
+
     #[test]
     fn v7_recovery_reconstructs_source_spool_from_allocated_wal_and_seal_files()
     -> anyhow::Result<()> {
@@ -15263,19 +15543,19 @@ mod tests {
             let mut state = enabled_pitr_state_with_sealed_segment(config.clone(), 32 * 1024);
             state.obligations.get_mut(&1).unwrap().state = archived_state;
             state.validate_for_status()?;
-            let (ledger, workspace, _) = LsmStorageInner::reserve_v7_active_recovery_workspace(
+            let (retained, workspace, _) = LsmStorageInner::reserve_v7_active_recovery_workspace(
                 &state,
                 database_path,
                 2,
                 ACTIVE_SOURCE_LEN as u64,
                 active_allocated,
             )?;
-            assert_eq!(ledger.snapshot().logical_wal_bytes, 8 * 1024);
+            assert_eq!(retained.snapshot().logical_wal_bytes, 8 * 1024);
             assert_eq!(
-                ledger.snapshot().source_spool_bytes,
-                active_allocated.saturating_sub(8 * 1024)
+                retained.snapshot().source_spool_bytes,
+                active_allocated + other_source_allocated
             );
-            assert_eq!(ledger.snapshot().recovery_workspace_bytes, 32 * 1024);
+            assert_eq!(retained.snapshot().recovery_workspace_bytes, 32 * 1024);
             drop(workspace);
 
             // Archived/reclaimable sources remain charged while their files are
