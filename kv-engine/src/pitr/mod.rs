@@ -96,7 +96,7 @@ pub(crate) struct WalV5Limits {
 }
 
 impl WalV5Limits {
-    fn validate(self) -> Result<Self> {
+    pub(crate) fn validate(self) -> Result<Self> {
         ensure!(
             self.max_input_entry_count > 0,
             "v5 input entry count limit must be nonzero"

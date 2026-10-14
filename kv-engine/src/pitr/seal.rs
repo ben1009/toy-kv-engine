@@ -11,8 +11,8 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     pitr::{
-        ChainAnchor, RecordedAt, WAL_V5_ALIGNMENT, WAL_V5_HEADER_LEN, WalV5Header,
-        decode_wal_entry_stream,
+        ChainAnchor, RecordedAt, WAL_V5_ALIGNMENT, WAL_V5_HEADER_LEN, WalBatch, WalV5Header,
+        WalV5Limits, decode_wal_entry_stream,
         manifest::{ActiveBoundary, ImmutableBoundary},
     },
     wal::v7::{
@@ -23,6 +23,7 @@ use crate::{
         },
         recovery::{
             WalV7RecoveryAuthority, discover_frontier_candidates, select_recovery_candidate,
+            select_recovery_candidate_with_limits,
         },
     },
 };
@@ -546,6 +547,32 @@ impl V7Seal {
     /// Verify the sidecar against a frozen v7 WAL image, including the terminal
     /// FRONTIER, complete physical digest, and every ticket/index entry.
     pub(crate) fn verify_wal(&self, wal: &[u8]) -> Result<()> {
+        self.verify_wal_with_batch_visitor(wal, crate::pitr::LIVE_WAL_V5_LIMITS, |_| Ok(()))
+    }
+
+    /// Verify the frozen image and decode its ticket-ordered replay batches.
+    pub(crate) fn decode_wal_batches(
+        &self,
+        wal: &[u8],
+        limits: WalV5Limits,
+    ) -> Result<Vec<WalBatch>> {
+        let mut batches = Vec::new();
+        self.verify_wal_with_batch_visitor(wal, limits, |batch| {
+            batches
+                .try_reserve(1)
+                .map_err(|error| anyhow::anyhow!("reserve v7 PITR restore batches: {error}"))?;
+            batches.push(batch);
+            Ok(())
+        })?;
+        Ok(batches)
+    }
+
+    fn verify_wal_with_batch_visitor(
+        &self,
+        wal: &[u8],
+        limits: WalV5Limits,
+        mut visit_batch: impl FnMut(WalBatch) -> Result<()>,
+    ) -> Result<()> {
         self.validate()?;
         ensure!(
             u64::try_from(wal.len())? == self.boundary.sealed_end,
@@ -563,7 +590,7 @@ impl V7Seal {
         let header_digest = header.digest()?;
         let discovery =
             discover_frontier_candidates(&mut reader, u64::try_from(wal.len())?, &header_digest)?;
-        let selection = select_recovery_candidate(
+        let selection = select_recovery_candidate_with_limits(
             &mut reader,
             u64::try_from(wal.len())?,
             &discovery,
@@ -571,13 +598,25 @@ impl V7Seal {
                 predecessor: header.predecessor,
                 boundary: self.boundary,
             },
+            limits,
         )?;
         ensure!(
             selection.candidate.frame_digest == self.boundary.terminal_frontier_digest,
             "v7 PITR WAL terminal FRONTIER differs from its seal"
         );
+        let mut entry_index = 0_usize;
+        walk_v7_seal_entries(wal, header, limits, |entry, batch| {
+            ensure!(
+                self.entries.get(entry_index) == Some(&entry),
+                "v7 PITR WAL batches or seal index differ from the sidecar"
+            );
+            entry_index = entry_index
+                .checked_add(1)
+                .ok_or_else(|| anyhow::anyhow!("v7 PITR seal entry index overflows"))?;
+            visit_batch(batch)
+        })?;
         ensure!(
-            collect_v7_seal_entries(wal, header)? == self.entries,
+            entry_index == self.entries.len(),
             "v7 PITR WAL batches or seal index differ from the sidecar"
         );
 
@@ -777,6 +816,27 @@ pub(crate) fn build_v7_seal(
 }
 
 fn collect_v7_seal_entries(wal: &[u8], header: WalV7Header) -> Result<Vec<V7SealEntry>> {
+    let mut entries = Vec::new();
+    walk_v7_seal_entries(wal, header, crate::pitr::LIVE_WAL_V5_LIMITS, |entry, _| {
+        entries
+            .try_reserve(1)
+            .map_err(|error| anyhow::anyhow!("grow v7 PITR seal index: {error}"))?;
+        entries.push(entry);
+        Ok(())
+    })?;
+    Ok(entries)
+}
+
+fn walk_v7_seal_entries(
+    wal: &[u8],
+    header: WalV7Header,
+    limits: WalV5Limits,
+    mut visit_batch: impl FnMut(V7SealEntry, WalBatch) -> Result<()>,
+) -> Result<()> {
+    let limits = limits.validate()?;
+    let max_batch_len = WAL_V7_LOGICAL_BATCH_HEADER_LEN
+        .checked_add(limits.max_batch_data_bytes)
+        .ok_or_else(|| anyhow::anyhow!("v7 PITR batch byte limit overflows"))?;
     let sealed_end = u64::try_from(wal.len())?;
     ensure!(
         sealed_end >= WAL_V7_HEADER_LEN as u64 + WAL_V7_FRAME_LEN as u64
@@ -785,18 +845,16 @@ fn collect_v7_seal_entries(wal: &[u8], header: WalV7Header) -> Result<Vec<V7Seal
     );
     let terminal_offset = sealed_end - WAL_V7_FRAME_LEN as u64;
     let header_digest = header.digest()?;
-    let mut entries = Vec::new();
     let data_start = WAL_V7_HEADER_LEN as u64 + WAL_V7_FRAME_LEN as u64;
     if terminal_offset < data_start {
         ensure!(
             terminal_offset == WAL_V7_HEADER_LEN as u64,
             "empty v7 PITR WAL has an invalid terminal FRONTIER offset"
         );
-        return Ok(entries);
+        return Ok(());
     }
     let mut offset = data_start;
     let mut expected_ticket = 0_u64;
-    let limits = crate::pitr::LIVE_WAL_V5_LIMITS;
     while offset < terminal_offset {
         let frame_start = usize::try_from(offset)?;
         let frame_end = frame_start
@@ -824,6 +882,10 @@ fn collect_v7_seal_entries(wal: &[u8], header: WalV7Header) -> Result<Vec<V7Seal
                     "v7 PITR DATA tickets are not contiguous"
                 );
                 let batch_len = usize::try_from(first.batch_bytes)?;
+                ensure!(
+                    batch_len <= max_batch_len,
+                    "v7 PITR DATA batch exceeds configured byte limit"
+                );
                 let mut logical = Vec::new();
                 logical
                     .try_reserve_exact(batch_len)
@@ -892,15 +954,15 @@ fn collect_v7_seal_entries(wal: &[u8], header: WalV7Header) -> Result<Vec<V7Seal
                     data,
                     limits,
                 )?;
-                entries
-                    .try_reserve(1)
-                    .map_err(|error| anyhow::anyhow!("grow v7 PITR seal index: {error}"))?;
-                entries.push(V7SealEntry {
-                    ticket: expected_ticket,
-                    first_data_offset: offset,
-                    commit_ts: batch.commit_ts,
-                    recorded_at: batch.recorded_at,
-                });
+                visit_batch(
+                    V7SealEntry {
+                        ticket: expected_ticket,
+                        first_data_offset: offset,
+                        commit_ts: batch.commit_ts,
+                        recorded_at: batch.recorded_at,
+                    },
+                    batch,
+                )?;
                 expected_ticket = expected_ticket
                     .checked_add(1)
                     .ok_or_else(|| anyhow::anyhow!("v7 PITR ticket count overflows"))?;
@@ -918,7 +980,7 @@ fn collect_v7_seal_entries(wal: &[u8], header: WalV7Header) -> Result<Vec<V7Seal
         offset == terminal_offset,
         "v7 PITR WAL has bytes between batches and terminal FRONTIER"
     );
-    Ok(entries)
+    Ok(())
 }
 
 /// Walk a v5-family segment: collect its seal entries, extend `hasher` with
@@ -1001,7 +1063,33 @@ pub(crate) fn build_v5_seal(wal: &[u8]) -> Result<(V5Seal, Vec<u8>)> {
 
 #[cfg(test)]
 mod tests {
+    use std::io::{Cursor, Read, Seek, SeekFrom};
+
     use super::*;
+
+    struct PrefixReader<'a> {
+        cursor: Cursor<&'a [u8]>,
+        read_limit: u64,
+        read_beyond_limit: bool,
+    }
+
+    impl Read for PrefixReader<'_> {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            if self.cursor.position() + buffer.len() as u64 > self.read_limit {
+                self.read_beyond_limit = true;
+                return Err(std::io::Error::other(
+                    "read beyond first oversized DATA fragment",
+                ));
+            }
+            self.cursor.read(buffer)
+        }
+    }
+
+    impl Seek for PrefixReader<'_> {
+        fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
+            self.cursor.seek(position)
+        }
+    }
 
     fn hex(bytes: &[u8]) -> String {
         bytes.iter().map(|byte| format!("{byte:02x}")).collect()
@@ -1548,6 +1636,45 @@ mod tests {
         );
         assert_eq!(V7Seal::decode(&bytes, seal.boundary.sealed_end)?, seal);
         seal.verify_wal(&wal)?;
+
+        let limits = WalV5Limits {
+            max_batch_data_bytes: 1024,
+            ..crate::pitr::LIVE_WAL_V5_LIMITS
+        };
+        assert!(seal.decode_wal_batches(&wal, limits).is_err());
+        let discovery = discover_frontier_candidates(
+            &mut Cursor::new(wal.as_slice()),
+            wal.len() as u64,
+            &header_digest,
+        )?;
+        let mut reader = PrefixReader {
+            cursor: Cursor::new(wal.as_slice()),
+            read_limit: first_data_offsets[1] + WAL_V7_FRAME_LEN as u64,
+            read_beyond_limit: false,
+        };
+        assert!(
+            select_recovery_candidate_with_limits(
+                &mut reader,
+                wal.len() as u64,
+                &discovery,
+                WalV7RecoveryAuthority::Sealed {
+                    predecessor: header.predecessor,
+                    boundary: seal.boundary,
+                },
+                limits,
+            )
+            .is_err()
+        );
+        assert!(
+            !reader.read_beyond_limit,
+            "byte-limit rejection must precede reading continuation fragments"
+        );
+
+        // The replay walker must also reject from the first fragment's length,
+        // before inspecting or copying a damaged continuation fragment.
+        wal[usize::try_from(first_data_offsets[1])? + WAL_V7_FRAME_LEN] ^= 1;
+        let error = walk_v7_seal_entries(&wal, header, limits, |_, _| Ok(())).unwrap_err();
+        assert!(error.to_string().contains("exceeds configured byte limit"));
         Ok(())
     }
 

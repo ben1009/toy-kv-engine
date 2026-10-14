@@ -3447,8 +3447,9 @@ impl BackupRepository {
                 Sha256::digest(&seal).as_slice() == metadata.seal_digest,
                 "PITR restore seal digest mismatch"
             );
-            crate::pitr::restore::decode_restore_wal_batches_for_segment(
+            crate::pitr::restore::decode_restore_segment_batches(
                 &wal,
+                &seal,
                 metadata,
                 crate::pitr::LIVE_WAL_V5_LIMITS,
             )

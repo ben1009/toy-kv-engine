@@ -343,6 +343,10 @@ pub(crate) fn decode_restore_wal_batches_for_segment(
     expected: &SegmentMetadata,
     limits: crate::pitr::WalV5Limits,
 ) -> Result<Vec<WalBatch>> {
+    ensure!(
+        expected.wal_format_version != crate::wal::format::WAL_FORMAT_VERSION_V7,
+        "v7 PITR restore requires the segment seal object"
+    );
     let header = crate::pitr::decode_v5_file_header(wal)?;
     ensure!(
         header.timeline_id.0 == expected.key.timeline_id.0
@@ -356,6 +360,22 @@ pub(crate) fn decode_restore_wal_batches_for_segment(
     );
 
     decode_restore_wal_batches(wal, limits)
+}
+
+pub(crate) fn decode_restore_segment_batches(
+    wal: &[u8],
+    seal_bytes: &[u8],
+    expected: &SegmentMetadata,
+    limits: crate::pitr::WalV5Limits,
+) -> Result<Vec<WalBatch>> {
+    expected.validate()?;
+    let batches = if expected.wal_format_version == crate::wal::format::WAL_FORMAT_VERSION_V7 {
+        crate::pitr::archive::decode_v7_archive_batches(expected, wal, seal_bytes, limits)?
+    } else {
+        decode_restore_wal_batches_for_segment(wal, expected, limits)?
+    };
+    validate_segment_batch_range(expected, &batches)?;
+    Ok(batches)
 }
 
 fn validate_segment_batch_range(metadata: &SegmentMetadata, batches: &[WalBatch]) -> Result<()> {
@@ -587,13 +607,18 @@ impl ExactRestoreExecutor {
                 .iter()
                 .find(|(object, _)| object == expected_wal)
                 .ok_or_else(|| anyhow::anyhow!("PITR restore proof WAL is missing"))?;
-            let batches = decode_restore_wal_batches_for_segment(wal, metadata, limits)?;
-            ensure!(
-                batches.len() as u64 == metadata.batch_count
-                    && batches.first().map(|batch| batch.commit_ts) == metadata.first_commit_ts
-                    && batches.last().map(|batch| batch.commit_ts) == metadata.last_commit_ts,
-                "PITR restore proof WAL commit range mismatch"
-            );
+            let expected_seal = expected
+                .iter()
+                .find(|object| {
+                    object.segment_id == metadata.key.segment_id
+                        && object.kind == ArchiveObjectKind::Seal
+                })
+                .ok_or_else(|| anyhow::anyhow!("PITR restore proof seal descriptor is missing"))?;
+            let (_, seal) = objects
+                .iter()
+                .find(|(object, _)| object == expected_seal)
+                .ok_or_else(|| anyhow::anyhow!("PITR restore proof seal is missing"))?;
+            decode_restore_segment_batches(wal, seal, metadata, limits)?;
             if let PitrRestoreTarget::CommitTs(target) = self.plan.target
                 && let Some(first) = metadata.first_commit_ts
             {
@@ -699,6 +724,7 @@ impl ExactRestoreExecutor {
         &mut self,
         metadata: &SegmentMetadata,
         wal: &[u8],
+        seal_bytes: &[u8],
         limits: crate::pitr::WalV5Limits,
     ) -> Result<()> {
         ensure!(
@@ -706,8 +732,7 @@ impl ExactRestoreExecutor {
             "PITR restore proof segment cannot be replayed"
         );
         self.validate_plan_segment(metadata)?;
-        let batches = decode_restore_wal_batches_for_segment(wal, metadata, limits)?;
-        validate_segment_batch_range(metadata, &batches)?;
+        let batches = decode_restore_segment_batches(wal, seal_bytes, metadata, limits)?;
 
         self.apply_batches_through_target(batches)
     }
@@ -911,8 +936,15 @@ impl ExactRestoreExecutor {
                 })
                 .map(|(_, bytes)| bytes.as_slice())
                 .ok_or_else(|| anyhow::anyhow!("PITR restore canonical WAL object is missing"))?;
-            let segment_batches = decode_restore_wal_batches_for_segment(wal, metadata, limits)?;
-            validate_segment_batch_range(metadata, &segment_batches)?;
+            let seal = source_objects
+                .iter()
+                .find(|(object, _)| {
+                    object.segment_id == metadata.key.segment_id
+                        && object.kind == ArchiveObjectKind::Seal
+                })
+                .map(|(_, bytes)| bytes.as_slice())
+                .ok_or_else(|| anyhow::anyhow!("PITR restore canonical seal object is missing"))?;
+            let segment_batches = decode_restore_segment_batches(wal, seal, metadata, limits)?;
             batches.extend(segment_batches);
         }
         self.validate_proof_wals(source_objects, limits)?;
