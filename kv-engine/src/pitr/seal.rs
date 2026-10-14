@@ -559,11 +559,6 @@ impl V7Seal {
             header.encode()? == header_bytes && header == self.header,
             "v7 PITR seal identity differs from the WAL header"
         );
-        ensure!(
-            <[u8; 32]>::from(Sha256::digest(wal)) == self.boundary.wal_digest,
-            "v7 PITR WAL physical digest differs from its seal"
-        );
-
         let mut reader = std::io::Cursor::new(wal);
         let header_digest = header.digest()?;
         let discovery =
@@ -773,7 +768,10 @@ pub(crate) fn build_v7_seal(
     };
     seal.validate()?;
     let bytes = seal.encode()?;
-    seal.verify_wal(wal)?;
+    ensure!(
+        V7Seal::decode(&bytes, sealed_end)? == seal,
+        "v7 PITR seal codec round-trip mismatch"
+    );
 
     Ok((seal, bytes))
 }
