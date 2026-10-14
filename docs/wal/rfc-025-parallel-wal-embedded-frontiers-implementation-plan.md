@@ -18,8 +18,11 @@ floor. The recovered Active image remains fenced from ordinary engine writes
 until public descriptor routing, lifecycle rotation, and publication barriers
 are implemented. PITR manifest replay and snapshots now retain and validate a
 v7 format marker and the full immutable boundary in Sealing obligations;
-seal completion checks the WAL digest against that boundary. Production v7
-freeze/seal emission and immutable Sealing/Sealed recovery remain. The live
+seal completion checks the WAL digest against that boundary. A v7 v2 seal
+sidecar codec now persists the immutable boundary and each ticket's first DATA
+offset; building and verifying a seal runs strict Sealed recovery against the
+exact WAL image. Production freeze emission, lifecycle rotation, and immutable
+Sealing/Sealed recovery integration remain. The live
 v7 Parallel runtime now admits reserved DATA batches and writes embedded
 FRONTIERs before the single WAL sync; API barriers,
 Leader-parity work, and full Active lifecycle integration remain.
@@ -772,11 +775,20 @@ remain in later stage 5/6 work.
   snapshot validation with the versioned immutable boundary. Persist Active
   references using only logical anchors. Allocation-only timestamp watermarks
   must not be interpreted as durable batch claims.
-- Make the seal codec and verifier format-aware. Retain seal sidecar version 1
-  only if its existing fields can represent v7 explicitly and readers are
-  updated consistently. An empty v7 segment is 8192 bytes with zero index entries;
-  a nonempty index names each batch's first DATA frame. Its count equals the
-  terminal ticket end, and its physical digest covers `[0, sealed_end)`.
+- The standalone v7 seal codec uses sidecar version 2 because v1 has no field
+  for a 64-bit first-DATA-frame offset. It persists the full immutable boundary,
+  explicit WAL version, physical identity, and one ticket/index/time entry per
+  batch. Its builder and verifier require the exact terminal FRONTIER and a
+  successful strict Sealed recovery check against `[0, sealed_end)`. Keep v5/v6
+  sidecar version 1 byte-compatible. Production seal publication, catalog
+  readers, and restore integration remain outstanding. An empty v7 segment is
+  8192 bytes with zero index entries; a nonempty index names each batch's first
+  DATA frame, and its count equals the terminal ticket end. Decoding bounds the
+  entry count and total sidecar bytes by both the persisted segment limit and
+  the global WAL file limit before allocating the decoded entries. The builder
+  checks the global image cap before hashing. Seal-path regression coverage
+  includes fragmented DATA followed by a retained frontier whose physical
+  offset is after later covered DATA.
 - Update segment metadata, archive preparation/completion, catalog verification,
   and `decode_restore_wal_batches_for_segment` to use explicit descriptors.
   Archive only the exact frozen WAL image and seal; verify marker chain,

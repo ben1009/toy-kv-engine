@@ -1,20 +1,70 @@
-//! Checksummed PITR v5 WAL seal sidecars.
+//! Checksummed PITR WAL seal sidecars.
 //!
-//! A seal records the exact logical WAL prefix and the ordered commit-time
-//! index derived from its batches. The WAL remains independently recoverable;
-//! the sidecar is only accepted when it binds to the supplied v5 header and
-//! source digest.
+//! A v5-family seal records the exact logical WAL prefix and ordered commit-time
+//! index. A v7 seal binds the immutable physical image and records each batch's
+//! first DATA frame offset. The WAL remains independently recoverable; a sidecar
+//! is accepted only when it binds to the supplied header and source image.
 #![allow(dead_code)]
 
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use sha2::{Digest, Sha256};
 
-use crate::pitr::{ChainAnchor, RecordedAt, WAL_V5_ALIGNMENT, WAL_V5_HEADER_LEN, WalV5Header};
+use crate::{
+    pitr::{
+        ChainAnchor, RecordedAt, WAL_V5_ALIGNMENT, WAL_V5_HEADER_LEN, WalV5Header,
+        decode_wal_entry_stream,
+        manifest::{ActiveBoundary, ImmutableBoundary},
+    },
+    wal::v7::{
+        codec::{
+            WAL_V7_FRAME_LEN, WAL_V7_HEADER_LEN, WAL_V7_LOGICAL_BATCH_HEADER_LEN,
+            WalV7DataFragmentHeader, WalV7FrameKind, WalV7Header, WalV7LogicalBatchHeader,
+            decode_frame_structural,
+        },
+        recovery::{
+            WalV7RecoveryAuthority, discover_frontier_candidates, select_recovery_candidate,
+        },
+    },
+};
+
+#[cfg(test)]
+use crate::wal::v7::codec::{
+    WAL_V7_DATA_FRAGMENT_PAYLOAD_CAPACITY, WalV7Frontier, encode_data_frames_into,
+    encode_frontier_successor, encode_generation_zero_frontier, encode_logical_batch,
+    frame_record_digest,
+};
 
 const MAGIC: &[u8; 8] = b"TKVSEAL1";
 const VERSION: u16 = 1;
 const HEADER_BYTES: usize = 224;
 const ENTRY_BYTES: usize = 24;
+const V7_MAGIC: &[u8; 8] = b"TKVSEAL2";
+const V7_VERSION: u16 = 2;
+const V7_HEADER_BYTES: usize = 320;
+const V7_ENTRY_BYTES: usize = 40;
+// A v7 WAL needs one frame for its header, generation-zero frontier, and
+// terminal frontier. Every ticket needs at least one DATA frame. This bounds
+// both the ticket index and decoded sidecar size at the global WAL file limit.
+const V7_MAX_ENTRY_COUNT: usize =
+    (crate::wal::MAX_WAL_FILE_SIZE as usize - WAL_V7_HEADER_LEN - 2 * WAL_V7_FRAME_LEN)
+        / WAL_V7_FRAME_LEN;
+const V7_MAX_SEAL_BYTES: usize = V7_HEADER_BYTES + V7_MAX_ENTRY_COUNT * V7_ENTRY_BYTES;
+
+fn v7_max_entry_count(wal_bytes: u64) -> Result<usize> {
+    let fixed_bytes = u64::try_from(WAL_V7_HEADER_LEN + 2 * WAL_V7_FRAME_LEN)?;
+    let data_bytes = wal_bytes.saturating_sub(fixed_bytes);
+    usize::try_from(data_bytes / WAL_V7_FRAME_LEN as u64).map_err(Into::into)
+}
+
+fn v7_max_seal_bytes(entry_count: usize) -> Result<usize> {
+    V7_HEADER_BYTES
+        .checked_add(
+            entry_count
+                .checked_mul(V7_ENTRY_BYTES)
+                .ok_or_else(|| anyhow::anyhow!("v7 PITR seal index length overflows"))?,
+        )
+        .ok_or_else(|| anyhow::anyhow!("v7 PITR seal length overflows"))
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct SealEntry {
@@ -252,6 +302,627 @@ impl V5Seal {
     }
 }
 
+/// One ticket's immutable v7 seal-index entry.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct V7SealEntry {
+    pub(crate) ticket: u64,
+    pub(crate) first_data_offset: u64,
+    pub(crate) commit_ts: u64,
+    pub(crate) recorded_at: RecordedAt,
+}
+
+/// Seal metadata for one frozen v7 WAL physical image.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct V7Seal {
+    pub(crate) header: WalV7Header,
+    pub(crate) boundary: ImmutableBoundary,
+    pub(crate) entries: Vec<V7SealEntry>,
+}
+
+impl V7Seal {
+    pub(crate) fn encode(&self) -> Result<Vec<u8>> {
+        self.validate()?;
+        let count = u64::try_from(self.entries.len())?;
+        let body_len = count
+            .checked_mul(V7_ENTRY_BYTES as u64)
+            .ok_or_else(|| anyhow::anyhow!("v7 PITR seal index length overflows"))?;
+        let total_len = V7_HEADER_BYTES
+            .checked_add(usize::try_from(body_len)?)
+            .ok_or_else(|| anyhow::anyhow!("v7 PITR seal length overflows"))?;
+        let mut output = vec![0_u8; total_len];
+        output[..8].copy_from_slice(V7_MAGIC);
+        output[8..10].copy_from_slice(&V7_VERSION.to_be_bytes());
+        output[10..12].copy_from_slice(&(V7_HEADER_BYTES as u16).to_be_bytes());
+        output[12..14].copy_from_slice(&crate::wal::format::WAL_FORMAT_VERSION_V7.to_be_bytes());
+        output[16..32].copy_from_slice(&self.header.timeline_id.0);
+        output[32..48].copy_from_slice(&self.header.archive_epoch_id.0);
+        output[48..56].copy_from_slice(&self.header.segment_id.0.to_be_bytes());
+        match self.header.predecessor {
+            ChainAnchor::Genesis { archive_epoch_id } => ensure!(
+                archive_epoch_id == self.header.archive_epoch_id,
+                "v7 seal genesis predecessor epoch mismatch"
+            ),
+            ChainAnchor::Segment(anchor) => {
+                output[56] = 1;
+                output[64..72].copy_from_slice(&anchor.segment_id.0.to_be_bytes());
+                output[72..104].copy_from_slice(&anchor.wal_digest);
+                output[104..136].copy_from_slice(&anchor.seal_digest);
+            }
+        }
+        output[136..152].copy_from_slice(&self.header.incarnation);
+        output[152..160].copy_from_slice(&self.boundary.active.ticket_end.to_be_bytes());
+        output[160..168].copy_from_slice(&self.boundary.active.durable_end.to_be_bytes());
+        output[168..176].copy_from_slice(&self.boundary.active.last_commit_ts.to_be_bytes());
+        output[176..208].copy_from_slice(&self.boundary.active.prefix_digest);
+        output[208..216].copy_from_slice(&self.boundary.sealed_end.to_be_bytes());
+        output[216..248].copy_from_slice(&self.boundary.terminal_frontier_digest);
+        output[248..280].copy_from_slice(&self.boundary.wal_digest);
+        output[280..288].copy_from_slice(&count.to_be_bytes());
+        output[288..296].copy_from_slice(
+            &self
+                .entries
+                .first()
+                .map_or(0, |entry| entry.commit_ts)
+                .to_be_bytes(),
+        );
+        output[296..304].copy_from_slice(
+            &self
+                .entries
+                .last()
+                .map_or(0, |entry| entry.commit_ts)
+                .to_be_bytes(),
+        );
+        output[304..312].copy_from_slice(&body_len.to_be_bytes());
+
+        let mut offset = V7_HEADER_BYTES;
+        for entry in &self.entries {
+            output[offset..offset + 8].copy_from_slice(&entry.ticket.to_be_bytes());
+            output[offset + 8..offset + 16].copy_from_slice(&entry.first_data_offset.to_be_bytes());
+            output[offset + 16..offset + 24].copy_from_slice(&entry.commit_ts.to_be_bytes());
+            output[offset + 24..offset + 32].copy_from_slice(&entry.recorded_at.secs.to_be_bytes());
+            output[offset + 32..offset + 36]
+                .copy_from_slice(&entry.recorded_at.nanos.to_be_bytes());
+            offset += V7_ENTRY_BYTES;
+        }
+        let index_crc = crc32fast::hash(&output[V7_HEADER_BYTES..]);
+        output[312..316].copy_from_slice(&index_crc.to_be_bytes());
+        let header_crc = crc32fast::hash(&output[8..316]);
+        output[316..320].copy_from_slice(&header_crc.to_be_bytes());
+
+        Ok(output)
+    }
+
+    pub(crate) fn decode(bytes: &[u8], max_segment_bytes: u64) -> Result<Self> {
+        ensure!(
+            max_segment_bytes >= (WAL_V7_HEADER_LEN + WAL_V7_FRAME_LEN) as u64,
+            "persisted v7 PITR segment limit is too small"
+        );
+        ensure!(
+            max_segment_bytes <= crate::wal::MAX_WAL_FILE_SIZE,
+            "persisted v7 PITR segment limit exceeds the WAL format limit"
+        );
+        let max_entry_count = v7_max_entry_count(max_segment_bytes)?;
+        let max_sidecar_bytes = v7_max_seal_bytes(max_entry_count)?;
+        ensure!(
+            bytes.len() <= max_sidecar_bytes && bytes.len() <= V7_MAX_SEAL_BYTES,
+            "v7 PITR seal exceeds the persisted segment sidecar limit"
+        );
+        ensure!(bytes.len() >= V7_HEADER_BYTES, "v7 PITR seal is truncated");
+        ensure!(&bytes[..8] == V7_MAGIC, "invalid v7 PITR seal magic");
+        ensure!(
+            u16::from_be_bytes(bytes[8..10].try_into()?) == V7_VERSION,
+            "unsupported v7 PITR seal version"
+        );
+        ensure!(
+            u16::from_be_bytes(bytes[10..12].try_into()?) as usize == V7_HEADER_BYTES,
+            "invalid v7 PITR seal header length"
+        );
+        ensure!(
+            u16::from_be_bytes(bytes[12..14].try_into()?)
+                == crate::wal::format::WAL_FORMAT_VERSION_V7,
+            "invalid v7 PITR seal WAL format"
+        );
+        ensure!(
+            bytes[14..16].iter().all(|byte| *byte == 0)
+                && bytes[57..64].iter().all(|byte| *byte == 0),
+            "nonzero v7 PITR seal reserved field"
+        );
+        ensure!(
+            crc32fast::hash(&bytes[8..316]) == u32::from_be_bytes(bytes[316..320].try_into()?),
+            "v7 PITR seal header checksum mismatch"
+        );
+
+        let count = usize::try_from(u64::from_be_bytes(bytes[280..288].try_into()?))?;
+        ensure!(
+            count <= max_entry_count,
+            "v7 PITR seal entry count exceeds the persisted segment limit"
+        );
+        let body_len = count
+            .checked_mul(V7_ENTRY_BYTES)
+            .ok_or_else(|| anyhow::anyhow!("v7 PITR seal index length overflows"))?;
+        ensure!(
+            u64::from_be_bytes(bytes[304..312].try_into()?) == u64::try_from(body_len)?,
+            "v7 PITR seal index length field mismatch"
+        );
+        let total_len = V7_HEADER_BYTES
+            .checked_add(body_len)
+            .ok_or_else(|| anyhow::anyhow!("v7 PITR seal length overflows"))?;
+        ensure!(bytes.len() == total_len, "v7 PITR seal length mismatch");
+        ensure!(
+            crc32fast::hash(&bytes[V7_HEADER_BYTES..])
+                == u32::from_be_bytes(bytes[312..316].try_into()?),
+            "v7 PITR seal index checksum mismatch"
+        );
+
+        let timeline_id = crate::pitr::TimelineId(bytes[16..32].try_into()?);
+        let archive_epoch_id = crate::pitr::ArchiveEpochId(bytes[32..48].try_into()?);
+        let segment_id = crate::pitr::SegmentId(u64::from_be_bytes(bytes[48..56].try_into()?));
+        let predecessor = match bytes[56] {
+            0 => {
+                ensure!(
+                    bytes[64..136].iter().all(|byte| *byte == 0),
+                    "nonzero v7 seal genesis predecessor fields"
+                );
+                ChainAnchor::Genesis { archive_epoch_id }
+            }
+            1 => ChainAnchor::Segment(crate::pitr::SegmentAnchor {
+                segment_id: crate::pitr::SegmentId(u64::from_be_bytes(bytes[64..72].try_into()?)),
+                wal_digest: bytes[72..104].try_into()?,
+                seal_digest: bytes[104..136].try_into()?,
+            }),
+            _ => anyhow::bail!("unknown v7 PITR seal predecessor kind"),
+        };
+        let header = WalV7Header {
+            timeline_id,
+            archive_epoch_id,
+            segment_id,
+            predecessor,
+            incarnation: bytes[136..152].try_into()?,
+        };
+        let active = ActiveBoundary {
+            timeline_id: timeline_id.0,
+            archive_epoch_id: archive_epoch_id.0,
+            segment_id: segment_id.0,
+            incarnation: header.incarnation,
+            ticket_end: u64::from_be_bytes(bytes[152..160].try_into()?),
+            durable_end: u64::from_be_bytes(bytes[160..168].try_into()?),
+            last_commit_ts: u64::from_be_bytes(bytes[168..176].try_into()?),
+            prefix_digest: bytes[176..208].try_into()?,
+        };
+        let boundary = ImmutableBoundary {
+            active,
+            sealed_end: u64::from_be_bytes(bytes[208..216].try_into()?),
+            terminal_frontier_digest: bytes[216..248].try_into()?,
+            wal_digest: bytes[248..280].try_into()?,
+        };
+        ensure!(
+            boundary.sealed_end <= max_segment_bytes,
+            "v7 PITR sealed image exceeds the persisted segment limit"
+        );
+        ensure!(
+            count <= v7_max_entry_count(boundary.sealed_end)?,
+            "v7 PITR seal entry count exceeds its sealed image capacity"
+        );
+        let mut entries = Vec::new();
+        entries
+            .try_reserve_exact(count)
+            .map_err(|error| anyhow::anyhow!("reserve v7 PITR seal entries: {error}"))?;
+        let mut offset = V7_HEADER_BYTES;
+        for _ in 0..count {
+            entries.push(V7SealEntry {
+                ticket: u64::from_be_bytes(bytes[offset..offset + 8].try_into()?),
+                first_data_offset: u64::from_be_bytes(bytes[offset + 8..offset + 16].try_into()?),
+                commit_ts: u64::from_be_bytes(bytes[offset + 16..offset + 24].try_into()?),
+                recorded_at: RecordedAt {
+                    secs: i64::from_be_bytes(bytes[offset + 24..offset + 32].try_into()?),
+                    nanos: u32::from_be_bytes(bytes[offset + 32..offset + 36].try_into()?),
+                },
+            });
+            ensure!(
+                bytes[offset + 36..offset + 40]
+                    .iter()
+                    .all(|byte| *byte == 0),
+                "nonzero v7 PITR seal index reserved field"
+            );
+            offset += V7_ENTRY_BYTES;
+        }
+        ensure!(
+            u64::from_be_bytes(bytes[288..296].try_into()?)
+                == entries.first().map_or(0, |entry| entry.commit_ts)
+                && u64::from_be_bytes(bytes[296..304].try_into()?)
+                    == entries.last().map_or(0, |entry| entry.commit_ts),
+            "v7 PITR seal commit range mismatch"
+        );
+        let seal = Self {
+            header,
+            boundary,
+            entries,
+        };
+        seal.validate()?;
+
+        Ok(seal)
+    }
+
+    /// Verify the sidecar against a frozen v7 WAL image, including the terminal
+    /// FRONTIER, complete physical digest, and every ticket/index entry.
+    pub(crate) fn verify_wal(&self, wal: &[u8]) -> Result<()> {
+        self.validate()?;
+        ensure!(
+            u64::try_from(wal.len())? == self.boundary.sealed_end,
+            "v7 PITR WAL length differs from its immutable seal"
+        );
+        let header_bytes = wal
+            .get(..WAL_V7_HEADER_LEN)
+            .context("v7 PITR WAL is shorter than its header")?;
+        let header = WalV7Header::decode(header_bytes)?;
+        ensure!(
+            header.encode()? == header_bytes && header == self.header,
+            "v7 PITR seal identity differs from the WAL header"
+        );
+        ensure!(
+            <[u8; 32]>::from(Sha256::digest(wal)) == self.boundary.wal_digest,
+            "v7 PITR WAL physical digest differs from its seal"
+        );
+
+        let mut reader = std::io::Cursor::new(wal);
+        let header_digest = header.digest()?;
+        let discovery =
+            discover_frontier_candidates(&mut reader, u64::try_from(wal.len())?, &header_digest)?;
+        let selection = select_recovery_candidate(
+            &mut reader,
+            u64::try_from(wal.len())?,
+            &discovery,
+            WalV7RecoveryAuthority::Sealed {
+                predecessor: header.predecessor,
+                boundary: self.boundary,
+            },
+        )?;
+        ensure!(
+            selection.candidate.frame_digest == self.boundary.terminal_frontier_digest,
+            "v7 PITR WAL terminal FRONTIER differs from its seal"
+        );
+        ensure!(
+            collect_v7_seal_entries(wal, header)? == self.entries,
+            "v7 PITR WAL batches or seal index differ from the sidecar"
+        );
+
+        Ok(())
+    }
+
+    fn validate(&self) -> Result<()> {
+        self.boundary.validate()?;
+        let active = self.boundary.active;
+        ensure!(
+            active.timeline_id == self.header.timeline_id.0
+                && active.archive_epoch_id == self.header.archive_epoch_id.0
+                && active.segment_id == self.header.segment_id.0
+                && active.incarnation == self.header.incarnation,
+            "v7 PITR seal identity differs from its immutable boundary"
+        );
+        ensure!(
+            self.header.incarnation != [0; 16],
+            "v7 PITR seal incarnation is empty"
+        );
+        let expected_sealed_end = active
+            .durable_end
+            .checked_add(WAL_V7_FRAME_LEN as u64)
+            .ok_or_else(|| anyhow::anyhow!("v7 PITR seal length overflows"))?;
+        ensure!(
+            self.boundary.sealed_end == expected_sealed_end,
+            "v7 PITR seal does not end immediately after its terminal FRONTIER"
+        );
+        ensure!(
+            self.boundary.sealed_end <= crate::wal::MAX_WAL_FILE_SIZE,
+            "v7 PITR sealed image exceeds the WAL format limit"
+        );
+        ensure!(
+            self.boundary.wal_digest != [0; 32]
+                && self.boundary.terminal_frontier_digest != [0; 32]
+                && active.prefix_digest != [0; 32],
+            "v7 PITR seal digest is empty"
+        );
+        ensure!(
+            u64::try_from(self.entries.len())? == active.ticket_end,
+            "v7 PITR seal index count differs from its terminal ticket"
+        );
+        ensure!(
+            self.entries.len() <= V7_MAX_ENTRY_COUNT,
+            "v7 PITR seal index exceeds the WAL format limit"
+        );
+        ensure!(
+            self.entries.len() <= v7_max_entry_count(self.boundary.sealed_end)?,
+            "v7 PITR seal index exceeds its sealed image capacity"
+        );
+        ensure!(
+            active.last_commit_ts == self.entries.last().map_or(0, |entry| entry.commit_ts),
+            "v7 PITR seal final timestamp differs from its index"
+        );
+        if active.ticket_end == 0 {
+            ensure!(
+                self.boundary.sealed_end == 2 * WAL_V7_FRAME_LEN as u64,
+                "empty v7 PITR seal has an invalid image length"
+            );
+            ensure!(
+                active.prefix_digest == self.header.digest()?,
+                "empty v7 PITR seal prefix digest differs from its header"
+            );
+        }
+
+        let terminal_offset = self
+            .boundary
+            .sealed_end
+            .checked_sub(WAL_V7_FRAME_LEN as u64)
+            .ok_or_else(|| anyhow::anyhow!("v7 PITR terminal offset underflows"))?;
+        let mut previous_offset = None;
+        let mut previous_commit_ts = 0;
+        let mut previous_recorded_at = None;
+        for (index, entry) in self.entries.iter().enumerate() {
+            ensure!(
+                entry.ticket == u64::try_from(index)?,
+                "v7 PITR seal tickets are not contiguous"
+            );
+            ensure!(
+                entry.first_data_offset >= (WAL_V7_HEADER_LEN + WAL_V7_FRAME_LEN) as u64
+                    && entry
+                        .first_data_offset
+                        .is_multiple_of(WAL_V7_FRAME_LEN as u64)
+                    && entry.first_data_offset < terminal_offset,
+                "v7 PITR seal DATA index offset is invalid"
+            );
+            ensure!(
+                previous_offset.is_none_or(|previous| previous < entry.first_data_offset),
+                "v7 PITR seal DATA index offsets are not increasing"
+            );
+            ensure!(
+                entry.commit_ts > previous_commit_ts,
+                "v7 PITR seal commit timestamps are not increasing"
+            );
+            ensure!(
+                entry.recorded_at.nanos < 1_000_000_000,
+                "v7 PITR seal recorded time is invalid"
+            );
+            ensure!(
+                previous_recorded_at.is_none_or(|previous| entry.recorded_at >= previous),
+                "v7 PITR seal recorded times are decreasing"
+            );
+            previous_offset = Some(entry.first_data_offset);
+            previous_commit_ts = entry.commit_ts;
+            previous_recorded_at = Some(entry.recorded_at);
+        }
+        match self.header.predecessor {
+            ChainAnchor::Genesis { archive_epoch_id } => ensure!(
+                archive_epoch_id == self.header.archive_epoch_id,
+                "v7 PITR seal genesis predecessor epoch mismatch"
+            ),
+            ChainAnchor::Segment(anchor) => ensure!(
+                anchor.wal_digest != [0; 32] && anchor.seal_digest != [0; 32],
+                "v7 PITR seal predecessor digest is empty"
+            ),
+        }
+        Ok(())
+    }
+}
+
+/// Build the v7 seal only from a complete image whose final frame is the
+/// authority-bound terminal FRONTIER. Recovery revalidates every frame and the
+/// logical anchor before the sidecar is encoded.
+pub(crate) fn build_v7_seal(
+    wal: &[u8],
+    active: ActiveBoundary,
+    predecessor: ChainAnchor,
+) -> Result<(V7Seal, Vec<u8>)> {
+    ensure!(
+        wal.len() >= WAL_V7_HEADER_LEN + WAL_V7_FRAME_LEN,
+        "v7 PITR WAL is truncated"
+    );
+    ensure!(
+        wal.len().is_multiple_of(WAL_V7_FRAME_LEN),
+        "v7 PITR WAL length is unaligned"
+    );
+    let sealed_end = u64::try_from(wal.len())?;
+    ensure!(
+        sealed_end <= crate::wal::MAX_WAL_FILE_SIZE,
+        "v7 PITR sealed image exceeds the WAL format limit"
+    );
+    let terminal_offset = sealed_end
+        .checked_sub(WAL_V7_FRAME_LEN as u64)
+        .ok_or_else(|| anyhow::anyhow!("v7 PITR terminal offset underflows"))?;
+    let header_bytes = &wal[..WAL_V7_HEADER_LEN];
+    let header = WalV7Header::decode(header_bytes)?;
+    ensure!(
+        header.encode()? == header_bytes,
+        "v7 PITR WAL header is not canonical"
+    );
+    ensure!(
+        header.predecessor == predecessor,
+        "v7 PITR WAL predecessor differs from the manifest"
+    );
+    let header_digest = header.digest()?;
+    let wal_digest: [u8; 32] = Sha256::digest(wal).into();
+    let mut reader = std::io::Cursor::new(wal);
+    let discovery = discover_frontier_candidates(&mut reader, sealed_end, &header_digest)?;
+    let terminal = discovery
+        .candidates
+        .iter()
+        .find(|candidate| candidate.frame_offset == terminal_offset)
+        .context("v7 PITR WAL has no canonical terminal FRONTIER")?;
+    let boundary = ImmutableBoundary {
+        active,
+        sealed_end,
+        terminal_frontier_digest: terminal.frame_digest,
+        wal_digest,
+    };
+    let selection = select_recovery_candidate(
+        &mut reader,
+        sealed_end,
+        &discovery,
+        WalV7RecoveryAuthority::Sealed {
+            predecessor,
+            boundary,
+        },
+    )?;
+    ensure!(
+        selection.candidate.frame_offset == terminal_offset,
+        "v7 PITR terminal FRONTIER is not at the end of the sealed image"
+    );
+
+    let seal = V7Seal {
+        header,
+        boundary,
+        entries: collect_v7_seal_entries(wal, header)?,
+    };
+    seal.validate()?;
+    let bytes = seal.encode()?;
+    seal.verify_wal(wal)?;
+
+    Ok((seal, bytes))
+}
+
+fn collect_v7_seal_entries(wal: &[u8], header: WalV7Header) -> Result<Vec<V7SealEntry>> {
+    let sealed_end = u64::try_from(wal.len())?;
+    ensure!(
+        sealed_end >= WAL_V7_HEADER_LEN as u64 + WAL_V7_FRAME_LEN as u64
+            && sealed_end.is_multiple_of(WAL_V7_FRAME_LEN as u64),
+        "v7 PITR WAL image has an invalid length"
+    );
+    let terminal_offset = sealed_end - WAL_V7_FRAME_LEN as u64;
+    let header_digest = header.digest()?;
+    let mut entries = Vec::new();
+    let data_start = WAL_V7_HEADER_LEN as u64 + WAL_V7_FRAME_LEN as u64;
+    if terminal_offset < data_start {
+        ensure!(
+            terminal_offset == WAL_V7_HEADER_LEN as u64,
+            "empty v7 PITR WAL has an invalid terminal FRONTIER offset"
+        );
+        return Ok(entries);
+    }
+    let mut offset = data_start;
+    let mut expected_ticket = 0_u64;
+    let limits = crate::pitr::LIVE_WAL_V5_LIMITS;
+    while offset < terminal_offset {
+        let frame_start = usize::try_from(offset)?;
+        let frame_end = frame_start
+            .checked_add(WAL_V7_FRAME_LEN)
+            .ok_or_else(|| anyhow::anyhow!("v7 PITR frame range overflows"))?;
+        let encoded = wal
+            .get(frame_start..frame_end)
+            .context("v7 PITR frame is truncated before terminal FRONTIER")?;
+        let frame = decode_frame_structural(encoded, offset, &header_digest)?;
+        match frame.kind {
+            WalV7FrameKind::Frontier => {
+                let frontier = crate::wal::v7::codec::WalV7Frontier::decode_body(&frame.body)?;
+                if frontier.generation != 0 {
+                    ensure!(
+                        frontier.ticket_end <= expected_ticket,
+                        "v7 PITR FRONTIER covers a batch absent from its physical prefix"
+                    );
+                }
+                offset += WAL_V7_FRAME_LEN as u64;
+            }
+            WalV7FrameKind::Data => {
+                let (first, payload) = WalV7DataFragmentHeader::decode_body(&frame.body)?;
+                ensure!(
+                    first.segment_ticket == expected_ticket && first.fragment_index == 0,
+                    "v7 PITR DATA tickets are not contiguous"
+                );
+                let batch_len = usize::try_from(first.batch_bytes)?;
+                let mut logical = Vec::new();
+                logical
+                    .try_reserve_exact(batch_len)
+                    .map_err(|error| anyhow::anyhow!("reserve v7 PITR batch: {error}"))?;
+                logical.extend_from_slice(payload);
+                for fragment_index in 1..usize::try_from(first.fragment_count)? {
+                    let fragment_offset = offset
+                        .checked_add(
+                            u64::try_from(fragment_index)?
+                                .checked_mul(WAL_V7_FRAME_LEN as u64)
+                                .ok_or_else(|| anyhow::anyhow!("v7 fragment offset overflows"))?,
+                        )
+                        .ok_or_else(|| anyhow::anyhow!("v7 fragment offset overflows"))?;
+                    ensure!(
+                        fragment_offset < terminal_offset,
+                        "v7 PITR DATA batch extends into terminal FRONTIER"
+                    );
+                    let fragment_start = usize::try_from(fragment_offset)?;
+                    let fragment_end = fragment_start
+                        .checked_add(WAL_V7_FRAME_LEN)
+                        .ok_or_else(|| anyhow::anyhow!("v7 fragment range overflows"))?;
+                    let fragment_encoded = wal
+                        .get(fragment_start..fragment_end)
+                        .context("v7 PITR DATA fragment is truncated")?;
+                    let fragment_frame =
+                        decode_frame_structural(fragment_encoded, fragment_offset, &header_digest)?;
+                    ensure!(
+                        fragment_frame.kind == WalV7FrameKind::Data,
+                        "v7 PITR DATA batch is interleaved"
+                    );
+                    let (fragment, fragment_payload) =
+                        WalV7DataFragmentHeader::decode_body(&fragment_frame.body)?;
+                    ensure!(
+                        fragment.segment_ticket == first.segment_ticket
+                            && fragment.fragment_index == u32::try_from(fragment_index)?
+                            && fragment.fragment_count == first.fragment_count
+                            && fragment.batch_bytes == first.batch_bytes,
+                        "v7 PITR DATA fragments disagree"
+                    );
+                    logical.extend_from_slice(fragment_payload);
+                }
+                ensure!(
+                    logical.len() == batch_len,
+                    "v7 PITR DATA batch length mismatch"
+                );
+                ensure!(
+                    batch_len >= WAL_V7_LOGICAL_BATCH_HEADER_LEN,
+                    "v7 PITR DATA batch is shorter than its logical header"
+                );
+                let data = &logical[WAL_V7_LOGICAL_BATCH_HEADER_LEN..];
+                let logical_header = WalV7LogicalBatchHeader::decode(
+                    &logical[..WAL_V7_LOGICAL_BATCH_HEADER_LEN],
+                    data,
+                    first.segment_ticket,
+                    first.batch_bytes,
+                    limits,
+                )?;
+                let recorded_at = RecordedAt {
+                    secs: logical_header.recorded_at_secs,
+                    nanos: logical_header.recorded_at_nanos,
+                };
+                let batch = decode_wal_entry_stream(
+                    logical_header.commit_ts,
+                    recorded_at,
+                    logical_header.entry_count,
+                    data,
+                    limits,
+                )?;
+                entries
+                    .try_reserve(1)
+                    .map_err(|error| anyhow::anyhow!("grow v7 PITR seal index: {error}"))?;
+                entries.push(V7SealEntry {
+                    ticket: expected_ticket,
+                    first_data_offset: offset,
+                    commit_ts: batch.commit_ts,
+                    recorded_at: batch.recorded_at,
+                });
+                expected_ticket = expected_ticket
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow::anyhow!("v7 PITR ticket count overflows"))?;
+                offset = offset
+                    .checked_add(
+                        u64::from(first.fragment_count)
+                            .checked_mul(WAL_V7_FRAME_LEN as u64)
+                            .ok_or_else(|| anyhow::anyhow!("v7 DATA batch span overflows"))?,
+                    )
+                    .ok_or_else(|| anyhow::anyhow!("v7 DATA batch end overflows"))?;
+            }
+        }
+    }
+    ensure!(
+        offset == terminal_offset,
+        "v7 PITR WAL has bytes between batches and terminal FRONTIER"
+    );
+    Ok(entries)
+}
+
 /// Walk a v5-family segment: collect its seal entries, extend `hasher` with
 /// exactly the bytes `rule` covers, and return the aligned logical length the walk
 /// ended at. One implementation serves both rules, so a rebuild and a live
@@ -343,6 +1014,117 @@ mod tests {
             concat!(env!("CARGO_MANIFEST_DIR"), "/src/tests/fixtures/",).to_string() + name,
         )
         .unwrap()
+    }
+
+    fn v7_fixture(batches: &[(u64, RecordedAt)]) -> Result<(Vec<u8>, WalV7Header, ActiveBoundary)> {
+        let epoch = crate::pitr::ArchiveEpochId([2; 16]);
+        let header = WalV7Header {
+            timeline_id: crate::pitr::TimelineId([1; 16]),
+            archive_epoch_id: epoch,
+            segment_id: crate::pitr::SegmentId(3),
+            predecessor: ChainAnchor::Genesis {
+                archive_epoch_id: epoch,
+            },
+            incarnation: [4; 16],
+        };
+        let header_bytes = header.encode()?;
+        let header_digest = header.digest()?;
+        let generation_zero = encode_generation_zero_frontier(header_digest)?;
+        let mut previous_frontier = WalV7Frontier {
+            generation: 0,
+            ticket_end: 0,
+            durable_end: WAL_V7_HEADER_LEN as u64,
+            last_commit_ts: 0,
+            prefix_digest: header_digest,
+            previous_frontier_offset: 0,
+            previous_frontier_digest: [0; 32],
+        };
+        let mut previous_frontier_offset = WAL_V7_HEADER_LEN as u64;
+        let mut previous_frontier_digest = frame_record_digest(&generation_zero)?;
+        let mut image = header_bytes.to_vec();
+        image.extend_from_slice(&generation_zero);
+        let mut logical_hasher = Sha256::new();
+        logical_hasher.update(header_bytes);
+        let limits = crate::pitr::LIVE_WAL_V5_LIMITS;
+
+        for (ticket, &(commit_ts, recorded_at)) in batches.iter().enumerate() {
+            let ticket = u64::try_from(ticket)?;
+            let batch = crate::pitr::WalBatch {
+                commit_ts,
+                recorded_at,
+                entries: vec![crate::pitr::WalEntry::Put {
+                    key: format!("key-{ticket}").into_bytes(),
+                    value: format!("value-{ticket}").into_bytes(),
+                }],
+            };
+            let logical = encode_logical_batch(ticket, &batch, limits)?;
+            let fragment_count =
+                crate::wal::v7::codec::data_fragment_count(u64::try_from(logical.len())?)
+                    .context("v7 test batch has no valid fragment count")?;
+            let frame_bytes = usize::try_from(fragment_count)?
+                .checked_mul(WAL_V7_FRAME_LEN)
+                .context("v7 test frame length overflows")?;
+            let first_data_offset = u64::try_from(image.len())?;
+            let mut frames = vec![0; frame_bytes];
+            let written = encode_data_frames_into(
+                header_digest,
+                first_data_offset,
+                ticket,
+                &logical,
+                limits,
+                &mut frames,
+            )?;
+            ensure!(
+                written == frame_bytes,
+                "v7 test batch frame length mismatch"
+            );
+            image.extend_from_slice(&frames);
+            logical_hasher.update(&logical);
+
+            let frame_offset = u64::try_from(image.len())?;
+            let frontier = WalV7Frontier {
+                generation: ticket + 1,
+                ticket_end: ticket + 1,
+                durable_end: frame_offset,
+                last_commit_ts: commit_ts,
+                prefix_digest: logical_hasher.clone().finalize().into(),
+                previous_frontier_offset,
+                previous_frontier_digest,
+            };
+            let frame = encode_frontier_successor(
+                frontier,
+                previous_frontier,
+                previous_frontier_offset,
+                &previous_frontier_digest,
+                frame_offset,
+                header_digest,
+            )?;
+            previous_frontier_digest = frame_record_digest(&frame)?;
+            previous_frontier_offset = frame_offset;
+            previous_frontier = frontier;
+            image.extend_from_slice(&frame);
+        }
+
+        let active = ActiveBoundary {
+            timeline_id: header.timeline_id.0,
+            archive_epoch_id: header.archive_epoch_id.0,
+            segment_id: header.segment_id.0,
+            incarnation: header.incarnation,
+            ticket_end: u64::try_from(batches.len())?,
+            durable_end: if batches.is_empty() {
+                WAL_V7_HEADER_LEN as u64
+            } else {
+                previous_frontier_offset
+            },
+            last_commit_ts: batches.last().map_or(0, |(commit_ts, _)| *commit_ts),
+            prefix_digest: logical_hasher.finalize().into(),
+        };
+        Ok((image, header, active))
+    }
+
+    fn refresh_v7_seal_header_crc(bytes: &mut [u8]) {
+        let header_crc = crc32fast::hash(&bytes[8..316]);
+        bytes[316..320].copy_from_slice(&header_crc.to_be_bytes());
     }
 
     /// A v6 digest against a preimage written out by hand.
@@ -556,5 +1338,374 @@ mod tests {
         assert_eq!(seal.last_commit_ts(), Some(7));
         assert_eq!(seal.entries.len(), 1);
         assert_eq!(V5Seal::decode(&bytes).unwrap(), seal);
+    }
+
+    #[test]
+    fn v7_seal_round_trips_and_verifies_ticket_offsets() -> Result<()> {
+        let batches = [
+            (
+                10,
+                RecordedAt {
+                    secs: 100,
+                    nanos: 2,
+                },
+            ),
+            (
+                20,
+                RecordedAt {
+                    secs: 101,
+                    nanos: 3,
+                },
+            ),
+        ];
+        let (wal, header, active) = v7_fixture(&batches)?;
+        let (seal, bytes) = build_v7_seal(&wal, active, header.predecessor)?;
+
+        assert_eq!(seal.entries.len(), 2);
+        assert_eq!(seal.entries[0].ticket, 0);
+        assert_eq!(
+            seal.entries[0].first_data_offset,
+            2 * WAL_V7_FRAME_LEN as u64
+        );
+        assert_eq!(seal.entries[0].commit_ts, 10);
+        assert_eq!(seal.entries[1].ticket, 1);
+        assert_eq!(
+            seal.entries[1].first_data_offset,
+            4 * WAL_V7_FRAME_LEN as u64
+        );
+        assert_eq!(seal.entries[1].commit_ts, 20);
+        assert_eq!(&bytes[..8], V7_MAGIC);
+        assert_eq!(u16::from_be_bytes(bytes[8..10].try_into()?), V7_VERSION);
+        assert_eq!(
+            u16::from_be_bytes(bytes[10..12].try_into()?) as usize,
+            V7_HEADER_BYTES
+        );
+        assert_eq!(
+            u16::from_be_bytes(bytes[12..14].try_into()?),
+            crate::wal::format::WAL_FORMAT_VERSION_V7
+        );
+        assert_eq!(u64::from_be_bytes(bytes[152..160].try_into()?), 2);
+        assert_eq!(
+            u64::from_be_bytes(bytes[160..168].try_into()?),
+            active.durable_end
+        );
+        assert_eq!(
+            u64::from_be_bytes(bytes[V7_HEADER_BYTES..V7_HEADER_BYTES + 8].try_into()?),
+            0
+        );
+        assert_eq!(
+            u64::from_be_bytes(bytes[V7_HEADER_BYTES + 8..V7_HEADER_BYTES + 16].try_into()?),
+            2 * WAL_V7_FRAME_LEN as u64
+        );
+        assert_eq!(V7Seal::decode(&bytes, crate::wal::MAX_WAL_FILE_SIZE)?, seal);
+        seal.verify_wal(&wal)?;
+
+        let mut wrong_index = seal.clone();
+        // This points at the valid interleaved FRONTIER between the two batches.
+        wrong_index.entries[0].first_data_offset = 3 * WAL_V7_FRAME_LEN as u64;
+        assert!(wrong_index.encode().is_ok());
+        assert!(wrong_index.verify_wal(&wal).is_err());
+
+        let mut damaged_wal = wal.clone();
+        damaged_wal[2 * WAL_V7_FRAME_LEN + 100] ^= 1;
+        assert!(seal.verify_wal(&damaged_wal).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn empty_v7_seal_preserves_the_generation_zero_image() -> Result<()> {
+        let (wal, header, active) = v7_fixture(&[])?;
+        assert_eq!(wal.len(), 2 * WAL_V7_FRAME_LEN);
+        let (seal, bytes) = build_v7_seal(&wal, active, header.predecessor)?;
+        assert!(seal.entries.is_empty());
+        assert_eq!(seal.boundary.sealed_end, 2 * WAL_V7_FRAME_LEN as u64);
+        assert_eq!(V7Seal::decode(&bytes, crate::wal::MAX_WAL_FILE_SIZE)?, seal);
+        seal.verify_wal(&wal)?;
+        Ok(())
+    }
+
+    #[test]
+    fn v7_seal_indexes_fragmented_data_before_a_retained_frontier() -> Result<()> {
+        let (mut wal, header, empty_active) = v7_fixture(&[])?;
+        let header_digest = header.digest()?;
+        let batches = [
+            crate::pitr::WalBatch {
+                commit_ts: 10,
+                recorded_at: RecordedAt { secs: 10, nanos: 0 },
+                entries: vec![crate::pitr::WalEntry::Put {
+                    key: b"first".to_vec(),
+                    value: b"small".to_vec(),
+                }],
+            },
+            crate::pitr::WalBatch {
+                commit_ts: 20,
+                recorded_at: RecordedAt { secs: 20, nanos: 0 },
+                entries: vec![crate::pitr::WalEntry::Put {
+                    key: b"second".to_vec(),
+                    value: vec![0x5a; 2 * WAL_V7_DATA_FRAGMENT_PAYLOAD_CAPACITY],
+                }],
+            },
+        ];
+        let mut logical_hasher = Sha256::new();
+        logical_hasher.update(header.encode()?);
+        let mut first_data_offsets = [0_u64; 2];
+        let mut data_ends = [0_u64; 2];
+        let mut prefix_digests = [[0_u8; 32]; 2];
+        for (index, batch) in batches.iter().enumerate() {
+            let ticket = u64::try_from(index)?;
+            let logical = encode_logical_batch(ticket, batch, crate::pitr::LIVE_WAL_V5_LIMITS)?;
+            let fragment_count =
+                crate::wal::v7::codec::data_fragment_count(u64::try_from(logical.len())?)
+                    .context("fragmented seal fixture has an invalid batch length")?;
+            first_data_offsets[index] = u64::try_from(wal.len())?;
+            let mut frames = vec![0; usize::try_from(fragment_count)? * WAL_V7_FRAME_LEN];
+            assert_eq!(
+                encode_data_frames_into(
+                    header_digest,
+                    first_data_offsets[index],
+                    ticket,
+                    &logical,
+                    crate::pitr::LIVE_WAL_V5_LIMITS,
+                    &mut frames,
+                )?,
+                frames.len()
+            );
+            wal.extend_from_slice(&frames);
+            data_ends[index] = u64::try_from(wal.len())?;
+            logical_hasher.update(&logical);
+            prefix_digests[index] = logical_hasher.clone().finalize().into();
+        }
+        assert!(data_ends[1] - first_data_offsets[1] > WAL_V7_FRAME_LEN as u64);
+
+        // D0 | fragmented D1 | F_A(D0) | F_B(D0,D1): F_B retains F_A,
+        // even though all D1 fragments physically precede F_A.
+        let retained_frontier_offset = u64::try_from(wal.len())?;
+        let mut previous_frontier = WalV7Frontier {
+            generation: 0,
+            ticket_end: 0,
+            durable_end: empty_active.durable_end,
+            last_commit_ts: 0,
+            prefix_digest: header_digest,
+            previous_frontier_offset: 0,
+            previous_frontier_digest: [0; 32],
+        };
+        let mut previous_frontier_offset = WAL_V7_HEADER_LEN as u64;
+        let mut previous_frontier_digest =
+            frame_record_digest(&wal[WAL_V7_HEADER_LEN..2 * WAL_V7_FRAME_LEN])?;
+        for (index, batch) in batches.iter().enumerate() {
+            let frame_offset = u64::try_from(wal.len())?;
+            let frontier = WalV7Frontier {
+                generation: u64::try_from(index)? + 1,
+                ticket_end: u64::try_from(index)? + 1,
+                durable_end: data_ends[index]
+                    .max(previous_frontier_offset + WAL_V7_FRAME_LEN as u64),
+                last_commit_ts: batch.commit_ts,
+                prefix_digest: prefix_digests[index],
+                previous_frontier_offset,
+                previous_frontier_digest,
+            };
+            let frame = encode_frontier_successor(
+                frontier,
+                previous_frontier,
+                previous_frontier_offset,
+                &previous_frontier_digest,
+                frame_offset,
+                header_digest,
+            )?;
+            previous_frontier = frontier;
+            previous_frontier_offset = frame_offset;
+            previous_frontier_digest = frame_record_digest(&frame)?;
+            wal.extend_from_slice(&frame);
+        }
+        let active = ActiveBoundary {
+            ticket_end: previous_frontier.ticket_end,
+            durable_end: previous_frontier.durable_end,
+            last_commit_ts: previous_frontier.last_commit_ts,
+            prefix_digest: previous_frontier.prefix_digest,
+            ..empty_active
+        };
+        assert!(retained_frontier_offset > data_ends[0]);
+        assert_eq!(
+            active.durable_end,
+            retained_frontier_offset + WAL_V7_FRAME_LEN as u64
+        );
+
+        let (seal, bytes) = build_v7_seal(&wal, active, header.predecessor)?;
+        assert_eq!(
+            seal.entries,
+            vec![
+                V7SealEntry {
+                    ticket: 0,
+                    first_data_offset: first_data_offsets[0],
+                    commit_ts: batches[0].commit_ts,
+                    recorded_at: batches[0].recorded_at,
+                },
+                V7SealEntry {
+                    ticket: 1,
+                    first_data_offset: first_data_offsets[1],
+                    commit_ts: batches[1].commit_ts,
+                    recorded_at: batches[1].recorded_at,
+                },
+            ]
+        );
+        assert_eq!(V7Seal::decode(&bytes, seal.boundary.sealed_end)?, seal);
+        seal.verify_wal(&wal)?;
+        Ok(())
+    }
+
+    #[test]
+    fn v7_seal_rejects_corrupt_checksums_and_reserved_index_bytes() -> Result<()> {
+        let (wal, header, active) = v7_fixture(&[(1, RecordedAt { secs: 1, nanos: 0 })])?;
+        let (_, bytes) = build_v7_seal(&wal, active, header.predecessor)?;
+
+        let mut corrupt_crc = bytes.clone();
+        corrupt_crc[316] ^= 1;
+        assert!(V7Seal::decode(&corrupt_crc, crate::wal::MAX_WAL_FILE_SIZE).is_err());
+
+        let mut nonzero_reserved = bytes;
+        nonzero_reserved[V7_HEADER_BYTES + 36] = 1;
+        let index_crc = crc32fast::hash(&nonzero_reserved[V7_HEADER_BYTES..]);
+        nonzero_reserved[312..316].copy_from_slice(&index_crc.to_be_bytes());
+        let header_crc = crc32fast::hash(&nonzero_reserved[8..316]);
+        nonzero_reserved[316..320].copy_from_slice(&header_crc.to_be_bytes());
+        assert!(V7Seal::decode(&nonzero_reserved, crate::wal::MAX_WAL_FILE_SIZE).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn v7_seal_rejects_entry_count_length_overflow() -> Result<()> {
+        let (wal, header, active) = v7_fixture(&[])?;
+        let (_, mut bytes) = build_v7_seal(&wal, active, header.predecessor)?;
+        let count = usize::MAX / V7_ENTRY_BYTES;
+        let body_len = count * V7_ENTRY_BYTES;
+        bytes[280..288].copy_from_slice(&u64::try_from(count)?.to_be_bytes());
+        bytes[304..312].copy_from_slice(&u64::try_from(body_len)?.to_be_bytes());
+        let index_crc = crc32fast::hash(&bytes[V7_HEADER_BYTES..]);
+        bytes[312..316].copy_from_slice(&index_crc.to_be_bytes());
+        let header_crc = crc32fast::hash(&bytes[8..316]);
+        bytes[316..320].copy_from_slice(&header_crc.to_be_bytes());
+
+        assert!(V7Seal::decode(&bytes, crate::wal::MAX_WAL_FILE_SIZE).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn v7_seal_rejects_entry_count_above_wal_limit_before_allocation() -> Result<()> {
+        let (wal, header, active) = v7_fixture(&[])?;
+        let (_, mut bytes) = build_v7_seal(&wal, active, header.predecessor)?;
+        let count = V7_MAX_ENTRY_COUNT + 1;
+        let body_len = count * V7_ENTRY_BYTES;
+        bytes[280..288].copy_from_slice(&u64::try_from(count)?.to_be_bytes());
+        bytes[304..312].copy_from_slice(&u64::try_from(body_len)?.to_be_bytes());
+        let header_crc = crc32fast::hash(&bytes[8..316]);
+        bytes[316..320].copy_from_slice(&header_crc.to_be_bytes());
+
+        let error = V7Seal::decode(&bytes, crate::wal::MAX_WAL_FILE_SIZE)
+            .expect_err("entry count exceeds the WAL limit");
+        assert!(
+            error
+                .to_string()
+                .contains("entry count exceeds the persisted segment limit")
+        );
+
+        let oversized = vec![0; V7_MAX_SEAL_BYTES + 1];
+        let error = V7Seal::decode(&oversized, crate::wal::MAX_WAL_FILE_SIZE)
+            .expect_err("sidecar exceeds the byte limit");
+        assert!(
+            error
+                .to_string()
+                .contains("persisted segment sidecar limit")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn v7_seal_encoding_obeys_global_image_and_index_capacity() -> Result<()> {
+        let (wal, header, active) = v7_fixture(&[(1, RecordedAt { secs: 1, nanos: 0 })])?;
+        let (seal, _) = build_v7_seal(&wal, active, header.predecessor)?;
+
+        let mut oversized_image = seal.clone();
+        oversized_image.boundary.active.durable_end = crate::wal::MAX_WAL_FILE_SIZE;
+        oversized_image.boundary.sealed_end =
+            crate::wal::MAX_WAL_FILE_SIZE + WAL_V7_FRAME_LEN as u64;
+        let error = oversized_image
+            .encode()
+            .expect_err("image exceeds the global WAL format limit");
+        assert!(
+            error
+                .to_string()
+                .contains("sealed image exceeds the WAL format limit")
+        );
+
+        let mut oversized_index = seal;
+        oversized_index.boundary.active.ticket_end = 2;
+        oversized_index.boundary.active.last_commit_ts = 2;
+        oversized_index.entries.push(V7SealEntry {
+            ticket: 1,
+            first_data_offset: WAL_V7_HEADER_LEN as u64 + WAL_V7_FRAME_LEN as u64,
+            commit_ts: 2,
+            recorded_at: RecordedAt { secs: 2, nanos: 0 },
+        });
+        let error = oversized_index
+            .encode()
+            .expect_err("index has more tickets than its sealed image can contain");
+        assert!(
+            error
+                .to_string()
+                .contains("seal index exceeds its sealed image capacity")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn v7_seal_decode_obeys_the_persisted_segment_limit() -> Result<()> {
+        let (wal, header, active) = v7_fixture(&[(1, RecordedAt { secs: 1, nanos: 0 })])?;
+        let (seal, bytes) = build_v7_seal(&wal, active, header.predecessor)?;
+        let minimum_segment_limit = (WAL_V7_HEADER_LEN + WAL_V7_FRAME_LEN) as u64;
+        let persisted_segment_limit = seal.boundary.sealed_end;
+
+        let error = V7Seal::decode(&bytes, minimum_segment_limit)
+            .expect_err("one-batch seal exceeds an empty-only persisted segment limit");
+        assert!(
+            error
+                .to_string()
+                .contains("persisted segment sidecar limit")
+        );
+
+        assert!(
+            bytes.len() <= v7_max_seal_bytes(v7_max_entry_count(persisted_segment_limit)?)?,
+            "the malformed sidecars below must pass the early persisted sidecar cap"
+        );
+
+        let mut sealed_end_over_limit = bytes.clone();
+        sealed_end_over_limit[208..216]
+            .copy_from_slice(&(persisted_segment_limit + WAL_V7_FRAME_LEN as u64).to_be_bytes());
+        refresh_v7_seal_header_crc(&mut sealed_end_over_limit);
+        let error = V7Seal::decode(&sealed_end_over_limit, persisted_segment_limit)
+            .expect_err("sealed image exceeds the persisted segment limit");
+        assert!(
+            error
+                .to_string()
+                .contains("sealed image exceeds the persisted segment limit")
+        );
+
+        let mut index_exceeds_sealed_capacity = bytes.clone();
+        index_exceeds_sealed_capacity[208..216]
+            .copy_from_slice(&(2 * WAL_V7_FRAME_LEN as u64).to_be_bytes());
+        refresh_v7_seal_header_crc(&mut index_exceeds_sealed_capacity);
+        let error = V7Seal::decode(&index_exceeds_sealed_capacity, persisted_segment_limit)
+            .expect_err("index count exceeds the claimed sealed image capacity");
+        assert!(
+            error
+                .to_string()
+                .contains("entry count exceeds its sealed image capacity")
+        );
+
+        assert_eq!(
+            V7Seal::decode(&bytes, persisted_segment_limit)?,
+            seal,
+            "the exact sealed image length permits the one-batch seal"
+        );
+        Ok(())
     }
 }
