@@ -34,8 +34,12 @@ against catalog metadata and strictly verifies the exact frozen WAL image;
 source-object digest checks use whole-image SHA-256 for v7 while retaining the
 recorded v5/v6 digest rules. Repository base-interval derivation now decodes
 v7 seal indexes and binds them to their catalog descriptors, while retaining
-the v5/v6 sidecar path. Deep verification and restore batch decoding still
-require v7 integration before public verification can cover v7 segment contents.
+the v5/v6 sidecar path. Deep repository verification now validates v7 seal
+sidecars against the exact frozen WAL images and reports structural corruption
+with the segment locator and last verified commit in the page. Deep interval
+derivation uses the verified segment prefix, including when a base is attached,
+without reading failing or later seals. V7 restore batch decoding remains before
+restore can replay v7 segment contents.
 The live
 v7 Parallel runtime now admits reserved DATA batches and writes embedded
 FRONTIERs before the single WAL sync; API barriers,
