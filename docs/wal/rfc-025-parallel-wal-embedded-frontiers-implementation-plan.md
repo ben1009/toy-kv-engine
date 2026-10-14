@@ -38,8 +38,9 @@ the v5/v6 sidecar path. Deep repository verification now validates v7 seal
 sidecars against the exact frozen WAL images and reports structural corruption
 with the segment locator and last verified commit in the page. Deep interval
 derivation uses the verified segment prefix, including when a base is attached,
-without reading failing or later seals. V7 restore batch decoding remains before
-restore can replay v7 segment contents.
+without reading failing or later seals. Exact restore now validates each v7 WAL
+and seal pair against its immutable descriptor, then decodes ticket-ordered
+batches before replay; v5/v6 continue to use their legacy decoder.
 The live
 v7 Parallel runtime now admits reserved DATA batches and writes embedded
 FRONTIERs before the single WAL sync; API barriers,
@@ -799,7 +800,9 @@ remain in later stage 5/6 work.
   batch. Its builder and verifier require the exact terminal FRONTIER and a
   successful strict Sealed recovery check against `[0, sealed_end)`. Keep v5/v6
   sidecar version 1 byte-compatible. Production seal publication, catalog
-  readers, and restore integration remain outstanding. An empty v7 segment is
+  descriptor readers, strict archive verification, and restore batch decoding
+  are connected. Restore validates the immutable WAL/seal pair and applies its
+  DATA decode limits before allocating logical batch buffers. An empty v7 segment is
   8192 bytes with zero index entries; a nonempty index names each batch's first
   DATA frame, and its count equals the terminal ticket end. Decoding bounds the
   entry count and total sidecar bytes by both the persisted segment limit and
@@ -810,7 +813,7 @@ remain in later stage 5/6 work.
 - Catalog metadata now supports the explicit v7 immutable descriptor while
   retaining the v5/v6 seal-format-1 layout. Update production segment discovery,
   archive preparation/completion, catalog object verification, and
-  `decode_restore_wal_batches_for_segment` to consume these descriptors.
+  `decode_restore_segment_batches` to consume these descriptors.
   Archive only the exact frozen WAL image and seal; verify marker chain,
   logical/physical digests, index, identity, predecessor, and timestamps.
   Preserve each legacy predecessor's actual digest rule in mixed chains.

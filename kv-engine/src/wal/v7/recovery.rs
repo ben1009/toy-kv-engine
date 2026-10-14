@@ -17,7 +17,7 @@ use super::codec::{
     encode_generation_zero_frontier, frame_record_digest, is_frontier_frame_header,
 };
 use crate::pitr::{
-    ChainAnchor, LIVE_WAL_V5_LIMITS, RecordedAt, decode_wal_entry_stream,
+    ChainAnchor, LIVE_WAL_V5_LIMITS, RecordedAt, WalV5Limits, decode_wal_entry_stream,
     manifest::{ActiveBoundary, ImmutableBoundary},
 };
 use crate::wal::MAX_WAL_FILE_SIZE;
@@ -373,7 +373,14 @@ pub(crate) fn verify_frontier_candidate_prefixes<R: Read + Seek>(
     file_len: u64,
     candidates: &[WalV7FrontierCandidate],
 ) -> Result<WalV7FrontierPrefixVerification> {
-    verify_frontier_candidate_prefixes_with_anchors(reader, file_len, candidates, &[], None)
+    verify_frontier_candidate_prefixes_with_anchors(
+        reader,
+        file_len,
+        candidates,
+        &[],
+        None,
+        LIVE_WAL_V5_LIMITS,
+    )
 }
 
 fn verify_frontier_candidate_prefixes_with_anchors<R: Read + Seek>(
@@ -382,7 +389,9 @@ fn verify_frontier_candidate_prefixes_with_anchors<R: Read + Seek>(
     candidates: &[WalV7FrontierCandidate],
     active_anchors: &[ActiveBoundary],
     expected_predecessor: Option<ChainAnchor>,
+    limits: WalV5Limits,
 ) -> Result<WalV7FrontierPrefixVerification> {
+    let limits = limits.validate()?;
     ensure!(
         file_len >= HEADER_LEN_U64 + FRAME_LEN_U64,
         "installed v7 WAL image is missing generation-zero FRONTIER"
@@ -533,7 +542,7 @@ fn verify_frontier_candidate_prefixes_with_anchors<R: Read + Seek>(
                     }
                 };
                 let max_batch_len = WAL_V7_LOGICAL_BATCH_HEADER_LEN
-                    .checked_add(LIVE_WAL_V5_LIMITS.max_batch_data_bytes)
+                    .checked_add(limits.max_batch_data_bytes)
                     .ok_or_else(|| anyhow::anyhow!("v7 logical batch limit overflows"))?;
                 if batch_len > max_batch_len {
                     stopped_at = Some(rejected_prefix(
@@ -627,7 +636,7 @@ fn verify_frontier_candidate_prefixes_with_anchors<R: Read + Seek>(
                     data,
                     first_fragment.segment_ticket,
                     first_fragment.batch_bytes,
-                    LIVE_WAL_V5_LIMITS,
+                    limits,
                 ) {
                     Ok(header) => header,
                     Err(error) => {
@@ -644,7 +653,7 @@ fn verify_frontier_candidate_prefixes_with_anchors<R: Read + Seek>(
                     recorded_at,
                     logical_header.entry_count,
                     data,
-                    LIVE_WAL_V5_LIMITS,
+                    limits,
                 ) {
                     Ok(batch) => batch,
                     Err(error) => {
@@ -794,6 +803,24 @@ pub(crate) fn select_recovery_candidate<R: Read + Seek>(
     discovery: &WalV7FrontierDiscovery,
     authority: WalV7RecoveryAuthority,
 ) -> Result<WalV7RecoverySelection> {
+    select_recovery_candidate_with_limits(
+        reader,
+        file_len,
+        discovery,
+        authority,
+        LIVE_WAL_V5_LIMITS,
+    )
+}
+
+/// Select a boundary with explicit DATA decode limits. Restore uses this to
+/// reject oversized batches before allocating their reassembly buffers.
+pub(crate) fn select_recovery_candidate_with_limits<R: Read + Seek>(
+    reader: &mut R,
+    file_len: u64,
+    discovery: &WalV7FrontierDiscovery,
+    authority: WalV7RecoveryAuthority,
+    limits: WalV5Limits,
+) -> Result<WalV7RecoverySelection> {
     match authority {
         WalV7RecoveryAuthority::Active {
             predecessor,
@@ -806,6 +833,7 @@ pub(crate) fn select_recovery_candidate<R: Read + Seek>(
                 &discovery.candidates,
                 &durable_anchors,
                 Some(predecessor),
+                limits,
             )?;
             let selected = verification
                 .verified_candidates
@@ -864,6 +892,7 @@ pub(crate) fn select_recovery_candidate<R: Read + Seek>(
                 &discovery.candidates,
                 std::slice::from_ref(&boundary.active),
                 Some(predecessor),
+                limits,
             )?;
             let terminal_offset = boundary
                 .sealed_end
@@ -1688,6 +1717,7 @@ mod tests {
             &discovery.candidates,
             &anchors,
             Some(test_header().predecessor),
+            LIVE_WAL_V5_LIMITS,
         )?;
         assert_eq!(verification.verified_candidates.len(), 2);
         let error = select_recovery_candidate(

@@ -844,6 +844,17 @@ pub(crate) fn verify_v7_archive_objects(
     Ok(())
 }
 
+/// Validate a frozen v7 archive pair and decode its ticket-ordered batches.
+pub(crate) fn decode_v7_archive_batches(
+    metadata: &SegmentMetadata,
+    wal: &[u8],
+    seal_bytes: &[u8],
+    limits: crate::pitr::WalV5Limits,
+) -> anyhow::Result<Vec<crate::pitr::WalBatch>> {
+    let seal = decode_v7_archive_seal(metadata, seal_bytes)?;
+    seal.decode_wal_batches(wal, limits)
+}
+
 /// Decode and bind a v7 seal sidecar to its catalog descriptor.
 ///
 /// Repository metadata consumers can use this when they need the seal index
@@ -1246,6 +1257,227 @@ mod tests {
                 .prepare_objects(&metadata, &wal, &seal_bytes)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn restore_decodes_v7_batches_from_the_verified_sealed_image() {
+        use crate::wal::v7::codec::WAL_V7_DATA_FRAGMENT_PAYLOAD_CAPACITY;
+
+        let batches = vec![
+            crate::pitr::WalBatch {
+                commit_ts: 10,
+                recorded_at: crate::pitr::RecordedAt { secs: 10, nanos: 1 },
+                entries: vec![
+                    crate::pitr::WalEntry::Put {
+                        key: b"large".to_vec(),
+                        value: vec![0x5a; 2 * WAL_V7_DATA_FRAGMENT_PAYLOAD_CAPACITY],
+                    },
+                    crate::pitr::WalEntry::PointDelete {
+                        key: b"deleted".to_vec(),
+                    },
+                ],
+            },
+            crate::pitr::WalBatch {
+                commit_ts: 12,
+                recorded_at: crate::pitr::RecordedAt { secs: 12, nanos: 2 },
+                entries: vec![crate::pitr::WalEntry::RangeDelete {
+                    start: b"a".to_vec(),
+                    end: b"z".to_vec(),
+                }],
+            },
+        ];
+        let (metadata, wal, seal) = v7_archive_objects_with_batches(
+            SegmentId(4),
+            ChainAnchor::Genesis {
+                archive_epoch_id: ArchiveEpochId([3; 16]),
+            },
+            &batches,
+        );
+
+        let decoded = crate::pitr::restore::decode_restore_segment_batches(
+            &wal,
+            &seal,
+            &metadata,
+            crate::pitr::LIVE_WAL_V5_LIMITS,
+        )
+        .unwrap();
+        assert_eq!(decoded, batches);
+        assert!(
+            crate::pitr::restore::decode_restore_wal_batches_for_segment(
+                &wal,
+                &metadata,
+                crate::pitr::LIVE_WAL_V5_LIMITS,
+            )
+            .is_err()
+        );
+
+        let mut corrupt_wal = wal;
+        corrupt_wal[0] ^= 1;
+        assert!(
+            crate::pitr::restore::decode_restore_segment_batches(
+                &corrupt_wal,
+                &seal,
+                &metadata,
+                crate::pitr::LIVE_WAL_V5_LIMITS,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn exact_restore_replays_v7_segments_and_validates_gap_proofs() {
+        use crate::pitr::{
+            WalBatch, WalEntry,
+            base::{PITR_BASE_WAL_REPLAY_VERSION, PitrBaseMetadata, PitrBaseTimeAnchor},
+            manifest::{PersistedChainAnchor, PersistedRecordedAt},
+            restore::{
+                ExactRestoreExecutor, ExactRestoreState, PitrRestoreTarget, plan_exact_restore,
+                required_source_objects,
+            },
+        };
+
+        let value = vec![0x5a; 2 * crate::wal::v7::codec::WAL_V7_DATA_FRAGMENT_PAYLOAD_CAPACITY];
+        let batches = [
+            WalBatch {
+                commit_ts: 10,
+                recorded_at: crate::pitr::RecordedAt { secs: 10, nanos: 0 },
+                entries: vec![
+                    WalEntry::Put {
+                        key: b"zz-large".to_vec(),
+                        value: value.clone(),
+                    },
+                    WalEntry::Put {
+                        key: b"gone".to_vec(),
+                        value: b"point".to_vec(),
+                    },
+                    WalEntry::Put {
+                        key: b"range".to_vec(),
+                        value: b"range".to_vec(),
+                    },
+                ],
+            },
+            WalBatch {
+                commit_ts: 12,
+                recorded_at: crate::pitr::RecordedAt { secs: 12, nanos: 0 },
+                entries: vec![
+                    WalEntry::PointDelete {
+                        key: b"gone".to_vec(),
+                    },
+                    WalEntry::RangeDelete {
+                        start: b"a".to_vec(),
+                        end: b"z".to_vec(),
+                    },
+                ],
+            },
+        ];
+        let (metadata, wal, seal) = v7_archive_objects_with_batches(
+            SegmentId(4),
+            ChainAnchor::Genesis {
+                archive_epoch_id: ArchiveEpochId([3; 16]),
+            },
+            &batches,
+        );
+        let (proof_metadata, proof_wal, proof_seal) = v7_archive_objects_with_batches(
+            SegmentId(5),
+            ChainAnchor::Segment(metadata.anchor),
+            &[WalBatch {
+                commit_ts: 20,
+                recorded_at: crate::pitr::RecordedAt { secs: 20, nanos: 0 },
+                entries: vec![WalEntry::Put {
+                    key: b"proof".to_vec(),
+                    value: b"must not replay".to_vec(),
+                }],
+            }],
+        );
+        let base_time = PersistedRecordedAt { secs: 1, nanos: 0 };
+        let base = PitrBaseMetadata {
+            repository_id: metadata.key.repository_id,
+            timeline_id: metadata.key.timeline_id.0,
+            archive_epoch_id: metadata.key.archive_epoch_id.0,
+            included_commit_ts: Some(7),
+            boundary_segment_id: metadata.key.segment_id.0,
+            boundary_anchor: PersistedChainAnchor::Genesis {
+                archive_epoch_id: metadata.key.archive_epoch_id.0,
+            },
+            base_recorded_at: base_time,
+            time_anchor: PitrBaseTimeAnchor::Observed {
+                commit_ts: Some(7),
+                observed_at: base_time,
+            },
+            wal_replay_version: PITR_BASE_WAL_REPLAY_VERSION,
+            compatibility_digest: [7; 32],
+        };
+        let segments = [metadata, proof_metadata];
+        let plan =
+            plan_exact_restore(&base, segments.to_vec(), PitrRestoreTarget::CommitTs(15)).unwrap();
+        assert_eq!(plan.segments, vec![SegmentId(4)]);
+        assert_eq!(plan.proof_segments, vec![SegmentId(5)]);
+        let expected = required_source_objects(&base, &segments, &plan).unwrap();
+        let loaded = expected
+            .iter()
+            .cloned()
+            .map(|object| {
+                let bytes = match (object.segment_id.0, object.kind) {
+                    (4, ArchiveObjectKind::Wal) => wal.clone(),
+                    (4, ArchiveObjectKind::Seal) => seal.clone(),
+                    (5, ArchiveObjectKind::Wal) => proof_wal.clone(),
+                    (5, ArchiveObjectKind::Seal) => proof_seal.clone(),
+                    _ => unreachable!("unexpected restore source"),
+                };
+                (object, bytes)
+            })
+            .collect::<Vec<_>>();
+
+        let mut executor =
+            ExactRestoreExecutor::new_with_sources(plan.clone(), Some(expected.clone()));
+        let info = executor
+            .run_exact_restore_with_segments(|| Ok(()), &loaded, crate::pitr::LIVE_WAL_V5_LIMITS)
+            .unwrap();
+        assert_eq!(info.last_commit_ts, Some(12));
+        assert_eq!(info.applied_batches, 2);
+        assert_eq!(executor.get(b"zz-large"), Some(value.as_slice()));
+        for key in [b"gone".as_slice(), b"range".as_slice(), b"proof".as_slice()] {
+            assert!(executor.get(key).is_none());
+        }
+
+        let mut missing_seal = loaded.clone();
+        missing_seal.retain(|(object, _)| {
+            object.segment_id != SegmentId(5) || object.kind != ArchiveObjectKind::Seal
+        });
+        let mut rejected =
+            ExactRestoreExecutor::new_with_sources(plan.clone(), Some(expected.clone()));
+        assert!(
+            rejected
+                .run_exact_restore_with_segments(
+                    || Ok(()),
+                    &missing_seal,
+                    crate::pitr::LIVE_WAL_V5_LIMITS
+                )
+                .is_err()
+        );
+        assert_eq!(rejected.state(), ExactRestoreState::Planned);
+        assert_eq!(rejected.applied_batches(), 0);
+
+        let mut corrupt_proof = loaded;
+        let (_, proof) = corrupt_proof
+            .iter_mut()
+            .find(|(object, _)| {
+                object.segment_id == SegmentId(5) && object.kind == ArchiveObjectKind::Wal
+            })
+            .unwrap();
+        proof[2 * crate::wal::v7::codec::WAL_V7_FRAME_LEN + 100] ^= 1;
+        let mut rejected = ExactRestoreExecutor::new_with_sources(plan, Some(expected));
+        assert!(
+            rejected
+                .run_exact_restore_with_segments(
+                    || Ok(()),
+                    &corrupt_proof,
+                    crate::pitr::LIVE_WAL_V5_LIMITS
+                )
+                .is_err()
+        );
+        assert_eq!(rejected.state(), ExactRestoreState::Planned);
+        assert_eq!(rejected.applied_batches(), 0);
     }
 
     #[cfg(target_os = "linux")]
