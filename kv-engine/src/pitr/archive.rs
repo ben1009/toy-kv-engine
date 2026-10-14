@@ -838,6 +838,30 @@ fn verify_v7_archive_objects(
     wal: &[u8],
     seal_bytes: &[u8],
 ) -> anyhow::Result<()> {
+    let seal = decode_v7_archive_seal(metadata, seal_bytes)?;
+    seal.verify_wal(wal)?;
+
+    Ok(())
+}
+
+/// Decode and bind a v7 seal sidecar to its catalog descriptor.
+///
+/// Repository metadata consumers can use this when they need the seal index
+/// without loading the whole WAL image. Archive preparation additionally calls
+/// `verify_wal` before publishing or accepting the frozen object pair.
+pub(crate) fn decode_v7_archive_seal(
+    metadata: &SegmentMetadata,
+    seal_bytes: &[u8],
+) -> anyhow::Result<crate::pitr::seal::V7Seal> {
+    metadata.validate()?;
+    anyhow::ensure!(
+        metadata.wal_format_version == crate::wal::format::WAL_FORMAT_VERSION_V7,
+        "segment is not a v7 WAL"
+    );
+    anyhow::ensure!(
+        Sha256::digest(seal_bytes).as_slice() == metadata.seal_digest,
+        "v7 archive seal digest mismatch"
+    );
     let boundary = metadata
         .immutable_boundary
         .as_deref()
@@ -860,9 +884,8 @@ fn verify_v7_archive_objects(
             && seal.entries.last().map(|entry| entry.commit_ts) == metadata.last_commit_ts,
         "v7 archive seal commit range mismatch"
     );
-    seal.verify_wal(wal)?;
 
-    Ok(())
+    Ok(seal)
 }
 
 fn replay_first_sequence(records: &[PitrCatalogRecord]) -> anyhow::Result<u64> {
