@@ -4,7 +4,7 @@
 use anyhow::{Result, ensure};
 use std::{collections::BTreeMap, sync::Arc};
 
-use crate::wal::v7::admission::WalV7ReservationOwner;
+use crate::wal::v7::admission::{WalV7ReservationOwner, WalV7RetainedResources};
 
 #[cfg(target_os = "linux")]
 use std::{
@@ -70,6 +70,7 @@ pub(crate) enum RotationReason {
 pub(crate) struct PitrSegmentManager {
     segments: BTreeMap<u64, SegmentMetadata>,
     v7_reservation_owners: BTreeMap<u64, Arc<WalV7ReservationOwner>>,
+    v7_retained_resources: Option<Arc<WalV7RetainedResources>>,
     active_segment_id: u64,
     next_segment_id: u64,
     pending_successor: Option<SegmentMetadata>,
@@ -77,6 +78,14 @@ pub(crate) struct PitrSegmentManager {
     source_spool_reserved: u64,
     pending_rotation: Option<RotationReason>,
     pending_obligation_reconciliation: Option<BTreeMap<u64, crate::pitr::manifest::PitrObligation>>,
+}
+
+/// Prepared releases from both the current pass and deferred manifest work.
+/// Apply them only after the corresponding manifest projection is durable.
+#[derive(Debug, Default)]
+pub(crate) struct PitrObligationReconciliation {
+    logical_releases: Vec<u64>,
+    reclaimed_sources: Vec<u64>,
 }
 
 impl PitrSegmentManager {
@@ -100,6 +109,7 @@ impl PitrSegmentManager {
         Ok(Self {
             segments,
             v7_reservation_owners: BTreeMap::new(),
+            v7_retained_resources: None,
             active_segment_id,
             next_segment_id: active_segment_id
                 .checked_add(1)
@@ -412,14 +422,16 @@ impl PitrSegmentManager {
 
     /// Prepare bookkeeping for reconciled manifest obligations without losing
     /// live pins or reservations. The caller applies this to a clone and only
-    /// publishes it after the corresponding manifest records are durable.
+    /// publishes it and applies the returned releases after the corresponding
+    /// manifest records are durable.
     pub(crate) fn reconcile_obligations(
         &mut self,
         previous: &BTreeMap<u64, crate::pitr::manifest::PitrObligation>,
         current: &BTreeMap<u64, crate::pitr::manifest::PitrObligation>,
-    ) -> Result<()> {
+    ) -> Result<PitrObligationReconciliation> {
         use crate::pitr::manifest::ObligationState;
 
+        let mut reconciliation = PitrObligationReconciliation::default();
         let mut previous_obligations = self
             .pending_obligation_reconciliation
             .take()
@@ -460,6 +472,12 @@ impl PitrSegmentManager {
                 segment.source_spool_bytes =
                     segment.source_spool_bytes.max(obligation.logical_length);
                 segment.successor_segment_id = Some(obligation.successor_segment_id);
+                if !matches!(
+                    obligation.state,
+                    ObligationState::Sealing | ObligationState::Sealed
+                ) {
+                    reconciliation.logical_releases.push(segment_id);
+                }
             } else {
                 ensure!(
                     previous_obligation.state == ObligationState::Reclaimable,
@@ -479,10 +497,33 @@ impl PitrSegmentManager {
                     );
                     self.segments.remove(&segment_id);
                 }
+                reconciliation.logical_releases.push(segment_id);
+                reconciliation.reclaimed_sources.push(segment_id);
             }
         }
 
-        self.recompute_reserved()
+        self.recompute_reserved()?;
+
+        Ok(reconciliation)
+    }
+
+    /// Retire charges after the reconciled manifest projection is durable.
+    /// A removed Reclaimable obligation also certifies prior durable source
+    /// cleanup, including when this pass only syncs a deferred append.
+    pub(crate) fn apply_v7_obligation_reconciliation(
+        &mut self,
+        reconciliation: PitrObligationReconciliation,
+    ) -> Result<()> {
+        if let Some(resources) = &self.v7_retained_resources {
+            for segment_id in reconciliation.logical_releases {
+                resources.release_obligation_logical(segment_id);
+            }
+        }
+        for segment_id in reconciliation.reclaimed_sources {
+            self.retire_v7_reservation_owner_after_cleanup(segment_id)?;
+        }
+
+        Ok(())
     }
 
     /// Keep the previous obligations when their transition was appended but its
@@ -536,6 +577,16 @@ impl PitrSegmentManager {
             );
             return Ok(());
         }
+        if let Some(resources) = owner.retained_resources() {
+            if let Some(existing) = &self.v7_retained_resources {
+                ensure!(
+                    Arc::ptr_eq(existing, &resources),
+                    "PITR v7 segments use different reconstructed resource ledgers"
+                );
+            } else {
+                self.v7_retained_resources = Some(resources);
+            }
+        }
         self.v7_reservation_owners.insert(segment_id, owner);
         Ok(())
     }
@@ -547,11 +598,13 @@ impl PitrSegmentManager {
         &mut self,
         segment_id: u64,
     ) -> Result<()> {
-        let Some(owner) = self.v7_reservation_owners.get(&segment_id) else {
-            return Ok(());
-        };
-        owner.retire_after_durable_cleanup()?;
-        self.v7_reservation_owners.remove(&segment_id);
+        if let Some(owner) = self.v7_reservation_owners.get(&segment_id) {
+            owner.retire_after_durable_cleanup()?;
+            self.v7_reservation_owners.remove(&segment_id);
+        }
+        if let Some(resources) = &self.v7_retained_resources {
+            resources.release_segment(segment_id);
+        }
         Ok(())
     }
 
@@ -906,9 +959,10 @@ pub(crate) fn install_pitr_file_no_replace(
 /// the directory is left alone.
 #[cfg(target_os = "linux")]
 pub(crate) fn cleanup_pitr_temp_files(dir: impl AsRef<std::path::Path>) -> Result<u64> {
+    let dir = dir.as_ref();
     let mut removed = 0u64;
 
-    for entry in std::fs::read_dir(dir.as_ref())? {
+    for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
@@ -926,6 +980,9 @@ pub(crate) fn cleanup_pitr_temp_files(dir: impl AsRef<std::path::Path>) -> Resul
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error.into()),
         }
+    }
+    if removed > 0 {
+        std::fs::File::open(dir)?.sync_all()?;
     }
     Ok(removed)
 }

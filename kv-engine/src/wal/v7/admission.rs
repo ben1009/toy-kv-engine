@@ -202,6 +202,24 @@ pub(crate) struct WalV7ResourceLedger {
     inner: Arc<WalV7ResourceLedgerInner>,
 }
 
+/// Keeps reconstructed charges for PITR source files on the same ledger used
+/// by the Active v7 writer. Segment charges stay owned until durable source
+/// cleanup; startup staging and unattributed recovery images have separate
+/// lifetimes because they do not necessarily correspond to a manifest segment.
+#[derive(Debug)]
+pub(crate) struct WalV7RetainedResources {
+    ledger: WalV7ResourceLedger,
+    state: Mutex<WalV7RetainedResourceState>,
+}
+
+#[derive(Debug, Default)]
+struct WalV7RetainedResourceState {
+    by_segment: BTreeMap<u64, Vec<WalV7Reservation>>,
+    obligation_logical: BTreeMap<u64, WalV7Reservation>,
+    startup_staging: Vec<WalV7Reservation>,
+    unattributed: Vec<WalV7Reservation>,
+}
+
 /// Keeps persistent reservations alive for one installed WAL image,
 /// independently of the writer handle that admitted them.
 ///
@@ -214,6 +232,7 @@ pub(crate) struct WalV7ResourceLedger {
 #[derive(Debug)]
 pub(crate) struct WalV7ReservationOwner {
     ledger: WalV7ResourceLedger,
+    retained_resources: Option<Arc<WalV7RetainedResources>>,
     installed_dev: u64,
     installed_ino: u64,
     state: Mutex<WalV7ReservationOwnerState>,
@@ -263,6 +282,27 @@ impl WalV7ReservationOwner {
         ledger: WalV7ResourceLedger,
         installed: &super::install::WalV7InstalledRecovery,
     ) -> anyhow::Result<Self> {
+        Self::new_inner(ledger, installed, None)
+    }
+
+    /// Create an image owner on the reconstructed PITR ledger so live Active
+    /// admission shares capacity with recovered source and pin reservations.
+    pub(crate) fn new_with_retained_resources(
+        retained_resources: Arc<WalV7RetainedResources>,
+        installed: &super::install::WalV7InstalledRecovery,
+    ) -> anyhow::Result<Self> {
+        Self::new_inner(
+            retained_resources.ledger(),
+            installed,
+            Some(retained_resources),
+        )
+    }
+
+    fn new_inner(
+        ledger: WalV7ResourceLedger,
+        installed: &super::install::WalV7InstalledRecovery,
+        retained_resources: Option<Arc<WalV7RetainedResources>>,
+    ) -> anyhow::Result<Self> {
         let seed = installed.runtime_seed()?;
         let mut reservations = BTreeMap::new();
         if let Some(reservation) = installed.reserve_recovered_resources(&ledger)? {
@@ -270,6 +310,7 @@ impl WalV7ReservationOwner {
         }
         Ok(Self {
             ledger,
+            retained_resources,
             installed_dev: seed.installed_dev,
             installed_ino: seed.installed_ino,
             state: Mutex::new(WalV7ReservationOwnerState {
@@ -278,6 +319,16 @@ impl WalV7ReservationOwner {
                 reservations,
             }),
         })
+    }
+
+    pub(crate) fn retained_resources(&self) -> Option<Arc<WalV7RetainedResources>> {
+        self.retained_resources.as_ref().map(Arc::clone)
+    }
+
+    pub(crate) fn release_startup_staging_resources(&self) {
+        if let Some(resources) = &self.retained_resources {
+            resources.release_startup_staging();
+        }
     }
 
     pub(crate) fn validate_image(&self, dev: u64, ino: u64) -> anyhow::Result<()> {
@@ -688,6 +739,105 @@ impl WalV7ResourceLedger {
     }
 }
 
+impl WalV7RetainedResources {
+    pub(crate) fn new(ledger: WalV7ResourceLedger) -> Arc<Self> {
+        Arc::new(Self {
+            ledger,
+            state: Mutex::new(WalV7RetainedResourceState::default()),
+        })
+    }
+
+    pub(crate) fn ledger(&self) -> WalV7ResourceLedger {
+        self.ledger.clone()
+    }
+
+    pub(crate) fn reserve_segment(
+        &self,
+        segment_id: u64,
+        charge: WalV7ResourceCharge,
+    ) -> Result<(), WalV7ReservationError> {
+        if charge.is_empty() {
+            return Ok(());
+        }
+        let reservation = self.ledger.reserve(charge)?;
+        self.state
+            .lock()
+            .by_segment
+            .entry(segment_id)
+            .or_default()
+            .push(reservation);
+        Ok(())
+    }
+
+    pub(crate) fn reserve_startup_staging(
+        &self,
+        charge: WalV7ResourceCharge,
+    ) -> Result<(), WalV7ReservationError> {
+        if charge.is_empty() {
+            return Ok(());
+        }
+        let reservation = self.ledger.reserve(charge)?;
+        self.state.lock().startup_staging.push(reservation);
+        Ok(())
+    }
+
+    pub(crate) fn reserve_obligation_logical(
+        &self,
+        segment_id: u64,
+        logical_wal_bytes: u64,
+    ) -> Result<(), WalV7ReservationError> {
+        if logical_wal_bytes == 0 {
+            return Ok(());
+        }
+        let reservation = self.ledger.reserve(WalV7ResourceCharge {
+            logical_wal_bytes,
+            ..WalV7ResourceCharge::default()
+        })?;
+        let previous = self
+            .state
+            .lock()
+            .obligation_logical
+            .insert(segment_id, reservation);
+        debug_assert!(previous.is_none());
+        Ok(())
+    }
+
+    pub(crate) fn release_obligation_logical(&self, segment_id: u64) {
+        drop(self.state.lock().obligation_logical.remove(&segment_id));
+    }
+
+    pub(crate) fn reserve_unattributed(
+        &self,
+        charge: WalV7ResourceCharge,
+    ) -> Result<(), WalV7ReservationError> {
+        if charge.is_empty() {
+            return Ok(());
+        }
+        let reservation = self.ledger.reserve(charge)?;
+        self.state.lock().unattributed.push(reservation);
+        Ok(())
+    }
+
+    /// Release a segment's reconstructed charges only after its source files
+    /// and directory entry have been durably removed.
+    pub(crate) fn release_segment(&self, segment_id: u64) {
+        let mut state = self.state.lock();
+        drop(state.by_segment.remove(&segment_id));
+        drop(state.obligation_logical.remove(&segment_id));
+    }
+
+    /// Startup install staging files are removed and the directory synced
+    /// before this is called. Their temporary reservations can then retire.
+    pub(crate) fn release_startup_staging(&self) {
+        drop(std::mem::take(&mut self.state.lock().startup_staging));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn snapshot(&self) -> WalV7ResourceCharge {
+        self.ledger.snapshot()
+    }
+}
+
 impl Drop for WalV7Reservation {
     fn drop(&mut self) {
         if !self.active {
@@ -763,6 +913,35 @@ mod tests {
             max_buffer_memory_bytes: 32768,
             max_seal_index_bytes: 16,
         }
+    }
+
+    #[test]
+    fn retained_recovery_resources_release_by_durable_lifetime() {
+        let ledger = WalV7ResourceLedger::new(WalV7ResourceLimits {
+            max_logical_wal_bytes: 100,
+            max_source_spool_bytes: 100,
+            max_recovery_workspace_bytes: 80,
+            max_buffer_memory_bytes: 40,
+            max_seal_index_bytes: 32,
+        })
+        .unwrap();
+        let retained = WalV7RetainedResources::new(ledger.clone());
+        retained.reserve_segment(7, charge(0, 15, 0, 0, 0)).unwrap();
+        retained.reserve_obligation_logical(7, 20).unwrap();
+        retained
+            .reserve_startup_staging(charge(0, 10, 0, 0, 0))
+            .unwrap();
+        retained
+            .reserve_unattributed(charge(0, 5, 0, 0, 0))
+            .unwrap();
+
+        assert_eq!(retained.snapshot(), charge(20, 30, 0, 0, 0));
+        retained.release_startup_staging();
+        retained.release_obligation_logical(7);
+        assert_eq!(retained.snapshot(), charge(0, 20, 0, 0, 0));
+
+        retained.release_segment(7);
+        assert_eq!(retained.snapshot(), charge(0, 5, 0, 0, 0));
     }
 
     #[test]
