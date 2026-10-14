@@ -38,9 +38,11 @@ pub(crate) fn set_manifest_sync_failure(path: &Path) {
 /// identities for incremental backup and is published only once every immutable
 /// write path maintains that metadata. Version 7 requires every snapshot to
 /// carry PITR state, so manifest snapshot replacement cannot discard it.
+/// Version 8 requires explicit PITR obligation WAL-format markers and retains
+/// immutable v7 sealing boundaries. Earlier snapshots select legacy migration.
 /// Version 0 is reserved to mean "legacy/field-absent" and must never be
 /// assigned as a valid format version.
-pub const MANIFEST_FORMAT_VERSION: u32 = 7;
+pub const MANIFEST_FORMAT_VERSION: u32 = 8;
 
 /// The immutable file kinds that can be referenced by a physical backup.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -229,7 +231,8 @@ mod immutable_file_metadata_tests {
 pub(crate) enum ManifestRecord {
     /// Written as the first record in a new database to identify the format
     /// version. Version 5 = MVCC + compaction filters + range tombstones + TTL,
-    /// 6 = immutable-file identities, 7 = mandatory PITR state in snapshots.
+    /// 6 = immutable-file identities, 7 = mandatory PITR state in snapshots,
+    /// 8 = explicit PITR obligation formats and immutable v7 boundaries.
     /// Absence of this record means pre-MVCC.
     FormatVersion(u32),
     /// Dormant PITR v7 transition record. Replayed only when PITR is enabled.
@@ -299,7 +302,8 @@ pub(crate) enum ManifestRecord {
         next_compaction_filter_id: u64,
         /// Manifest format version. 0 = pre-MVCC (legacy/field-absent),
         /// 2 = MVCC, 3 = MVCC + compaction filters, 6 = immutable-file
-        /// identities, 7 = mandatory PITR state.
+        /// identities, 7 = mandatory PITR state, 8 = explicit PITR obligation
+        /// formats and immutable v7 boundaries.
         /// Defaults to 0 when the field is missing from old snapshots written
         /// before this field existed. Version 0 is rejected on open — it is
         /// not a valid format version, only a sentinel for "field absent".

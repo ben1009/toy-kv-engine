@@ -1138,6 +1138,8 @@ mod tests {
                 state: crate::pitr::manifest::ObligationState::Sealed,
                 successor_segment_id: 2,
                 logical_length: 8192,
+                wal_format: crate::pitr::manifest::PitrWalFormat::LegacyV5V6,
+                immutable_boundary: None,
             },
         )]);
         let mut manager =
@@ -1168,6 +1170,8 @@ mod tests {
                 state: crate::pitr::manifest::ObligationState::Sealing,
                 successor_segment_id: 2,
                 logical_length: 8192,
+                wal_format: crate::pitr::manifest::PitrWalFormat::LegacyV5V6,
+                immutable_boundary: None,
             },
         )]);
         let mut manager =
@@ -1190,6 +1194,8 @@ mod tests {
                 state: crate::pitr::manifest::ObligationState::Reclaimable,
                 successor_segment_id: 2,
                 logical_length: 8192,
+                wal_format: crate::pitr::manifest::PitrWalFormat::LegacyV5V6,
+                immutable_boundary: None,
             },
         )]);
         let mut manager =
@@ -1213,6 +1219,8 @@ mod tests {
                 state: crate::pitr::manifest::ObligationState::Sealing,
                 successor_segment_id: 2,
                 logical_length: 8192,
+                wal_format: crate::pitr::manifest::PitrWalFormat::LegacyV5V6,
+                immutable_boundary: None,
             },
         )]);
         let mut manager =
@@ -1248,6 +1256,8 @@ mod tests {
                 state: crate::pitr::manifest::ObligationState::Sealing,
                 successor_segment_id: 2,
                 logical_length: 8192,
+                wal_format: crate::pitr::manifest::PitrWalFormat::LegacyV5V6,
+                immutable_boundary: None,
             },
         )]);
         let mut reconciled = obligations.clone();
@@ -1270,6 +1280,8 @@ mod tests {
                 state: crate::pitr::manifest::ObligationState::Sealing,
                 successor_segment_id: 2,
                 logical_length: 8192,
+                wal_format: crate::pitr::manifest::PitrWalFormat::LegacyV5V6,
+                immutable_boundary: None,
             },
         )]);
         let mut manager =
@@ -1298,6 +1310,8 @@ mod tests {
                 state: crate::pitr::manifest::ObligationState::Sealed,
                 successor_segment_id: 2,
                 logical_length: 4096,
+                wal_format: crate::pitr::manifest::PitrWalFormat::LegacyV5V6,
+                immutable_boundary: None,
             },
         )]);
         let mut manager =
