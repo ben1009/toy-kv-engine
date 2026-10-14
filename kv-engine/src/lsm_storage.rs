@@ -3558,6 +3558,7 @@ impl KvEngine {
                 },
                 wal_format_version: seal.header.wal_format_version,
                 seal_format_version: 1,
+                immutable_boundary: None,
                 anchor: crate::pitr::SegmentAnchor {
                     segment_id: crate::pitr::SegmentId(segment_id),
                     wal_digest,
@@ -3767,6 +3768,7 @@ impl KvEngine {
                 },
                 wal_format_version: seal.header.wal_format_version,
                 seal_format_version: 1,
+                immutable_boundary: None,
                 anchor: crate::pitr::SegmentAnchor {
                     segment_id: crate::pitr::SegmentId(active_segment_id),
                     wal_digest: anchor.wal_digest,

@@ -22,7 +22,14 @@ seal completion checks the WAL digest against that boundary. A v7 v2 seal
 sidecar codec now persists the immutable boundary and each ticket's first DATA
 offset; building and verifying a seal runs strict Sealed recovery against the
 exact WAL image. Production freeze emission, lifecycle rotation, and immutable
-Sealing/Sealed recovery integration remain. The live
+Sealing/Sealed recovery integration remain. PITR catalog metadata now has a v7
+seal-format-2 descriptor carrying the immutable boundary; v5/v6 seal-format-1
+catalog records retain their original byte layout. Catalog encode/replay checks
+the v7 boundary's identity, ticket/time coordinates, exact terminal position,
+image size and ticket capacity, and required digests. V7 boundary allocations
+count toward decoded-state limits without storing the full extension inline
+in legacy records. Production source discovery/publication, archive-object
+verification, and restore integration remain. The live
 v7 Parallel runtime now admits reserved DATA batches and writes embedded
 FRONTIERs before the single WAL sync; API barriers,
 Leader-parity work, and full Active lifecycle integration remain.
@@ -789,8 +796,10 @@ remain in later stage 5/6 work.
   checks the global image cap before hashing. Seal-path regression coverage
   includes fragmented DATA followed by a retained frontier whose physical
   offset is after later covered DATA.
-- Update segment metadata, archive preparation/completion, catalog verification,
-  and `decode_restore_wal_batches_for_segment` to use explicit descriptors.
+- Catalog metadata now supports the explicit v7 immutable descriptor while
+  retaining the v5/v6 seal-format-1 layout. Update production segment discovery,
+  archive preparation/completion, catalog object verification, and
+  `decode_restore_wal_batches_for_segment` to consume these descriptors.
   Archive only the exact frozen WAL image and seal; verify marker chain,
   logical/physical digests, index, identity, predecessor, and timestamps.
   Preserve each legacy predecessor's actual digest rule in mixed chains.

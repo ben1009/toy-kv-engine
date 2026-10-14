@@ -601,6 +601,7 @@ mod tests {
             },
             wal_format_version: crate::pitr::WAL_V5_VERSION,
             seal_format_version: 1,
+            immutable_boundary: None,
             anchor: SegmentAnchor {
                 segment_id: SegmentId(1),
                 wal_digest,
@@ -669,6 +670,7 @@ mod tests {
             },
             wal_format_version: legacy_header.wal_format_version,
             seal_format_version: 1,
+            immutable_boundary: None,
             anchor: SegmentAnchor {
                 segment_id: legacy_header.segment_id,
                 wal_digest: legacy_wal_digest,
@@ -712,6 +714,7 @@ mod tests {
             },
             wal_format_version: successor_header.wal_format_version,
             seal_format_version: 1,
+            immutable_boundary: None,
             anchor: SegmentAnchor {
                 segment_id: successor_id,
                 wal_digest: successor_seal_parsed.wal_digest,

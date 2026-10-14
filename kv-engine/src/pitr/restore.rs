@@ -1180,6 +1180,7 @@ mod tests {
             },
             wal_format_version: crate::pitr::WAL_V5_VERSION,
             seal_format_version: 1,
+            immutable_boundary: None,
             anchor: SegmentAnchor {
                 segment_id: SegmentId(id),
                 wal_digest: [id as u8; 32],
