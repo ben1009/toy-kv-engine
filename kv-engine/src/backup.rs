@@ -1933,7 +1933,15 @@ impl BackupRepository {
         let mut catalog_bytes = Vec::new();
         catalog_file.read_to_end(&mut catalog_bytes)?;
         let replay = crate::pitr::catalog::replay_catalog(&catalog_bytes)?;
-        let verified_intervals = self.load_pitr_base_intervals(options.selector)?;
+        let deep = matches!(
+            options.depth,
+            crate::pitr::api::VerifyPitrDepth::Deep { .. }
+        );
+        let shallow_intervals = if deep {
+            Vec::new()
+        } else {
+            self.load_pitr_base_intervals(options.selector)?
+        };
         let catalog_digest =
             pitr_repository_view_digest(replay.prefix_digest, &self.load_replay()?);
         let query_digest = crate::pitr::api::verification_query_digest(options)?;
@@ -1981,9 +1989,24 @@ impl BackupRepository {
         let end = start
             .saturating_add(options.page_size.get())
             .min(segments.len());
+        // Deep reports can extend bases only through verified segments. Loading
+        // every seal before verification would bypass structured corruption
+        // reporting and inspect objects beyond the current page.
+        let intervals_through = |verified_end: usize| {
+            if deep {
+                self.load_pitr_base_intervals_for_segments(
+                    options.selector,
+                    &segments[..verified_end],
+                )
+            } else {
+                Ok(shallow_intervals.clone())
+            }
+        };
         let wal_dir = openat_no_follow(&self.root, "wal", libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
         let mut last_verified_commit_ts = None;
-        for metadata in &segments[start..end] {
+        for (page_index, metadata) in segments[start..end].iter().enumerate() {
+            let verified_end = start + page_index;
+            let v7 = metadata.wal_format_version == crate::wal::format::WAL_FORMAT_VERSION_V7;
             let wal_name = crate::pitr::archive::archive_object_name(
                 metadata.key.timeline_id,
                 metadata.key.archive_epoch_id,
@@ -1998,7 +2021,9 @@ impl BackupRepository {
                 crate::pitr::archive::ArchiveObjectKind::Seal,
                 metadata.seal_digest,
             );
-            for (name, expected_bytes, expected_digest, digest, kind) in [
+            let mut v7_wal_bytes = None;
+            let mut v7_seal_bytes = None;
+            for (name, expected_bytes, expected_digest, digest, kind, object_kind) in [
                 (
                     wal_name,
                     Some(metadata.wal_bytes),
@@ -2007,6 +2032,7 @@ impl BackupRepository {
                         metadata.wal_format_version,
                     )?,
                     crate::pitr::api::SegmentFailureKind::Missing,
+                    crate::pitr::archive::ArchiveObjectKind::Wal,
                 ),
                 (
                     seal_name,
@@ -2014,13 +2040,14 @@ impl BackupRepository {
                     metadata.seal_digest,
                     crate::pitr::archive::SourceObjectDigest::WholeObject,
                     crate::pitr::api::SegmentFailureKind::Missing,
+                    crate::pitr::archive::ArchiveObjectKind::Seal,
                 ),
             ] {
                 let fd = match openat_no_follow(&wal_dir, &name, libc::O_RDONLY, 0) {
                     Ok(fd) => fd,
                     Err(_) => {
                         return Ok(crate::pitr::api::VerifyPitrReport {
-                            verified_intervals: verified_intervals.clone(),
+                            verified_intervals: intervals_through(verified_end)?,
                             next_cursor: None,
                             first_failure: Some(crate::pitr::api::SegmentFailureLocator {
                                 expected_segment_id: Some(metadata.key.segment_id.0),
@@ -2043,7 +2070,7 @@ impl BackupRepository {
                         .is_ok_and(|actual| actual.as_slice() == expected_digest)
                 {
                     return Ok(crate::pitr::api::VerifyPitrReport {
-                        verified_intervals: verified_intervals.clone(),
+                        verified_intervals: intervals_through(verified_end)?,
                         next_cursor: None,
                         first_failure: Some(crate::pitr::api::SegmentFailureLocator {
                             expected_segment_id: Some(metadata.key.segment_id.0),
@@ -2054,16 +2081,46 @@ impl BackupRepository {
                         last_verified_commit_ts,
                     });
                 }
-                if matches!(
-                    options.depth,
-                    crate::pitr::api::VerifyPitrDepth::Deep { .. }
-                ) && name.ends_with(".wal")
-                {
+                if deep && !v7 && object_kind == crate::pitr::archive::ArchiveObjectKind::Wal {
                     crate::pitr::restore::decode_restore_wal_batches_for_segment(
                         &bytes,
                         metadata,
                         crate::pitr::LIVE_WAL_V5_LIMITS,
                     )?;
+                }
+                if deep && v7 {
+                    match object_kind {
+                        crate::pitr::archive::ArchiveObjectKind::Wal => {
+                            v7_wal_bytes = Some(bytes);
+                        }
+                        crate::pitr::archive::ArchiveObjectKind::Seal => {
+                            v7_seal_bytes = Some(bytes);
+                        }
+                    }
+                }
+            }
+            if deep && v7 {
+                let verification = crate::pitr::archive::verify_v7_archive_objects(
+                    metadata,
+                    v7_wal_bytes
+                        .as_deref()
+                        .context("deep v7 PITR verification did not load the WAL object")?,
+                    v7_seal_bytes
+                        .as_deref()
+                        .context("deep v7 PITR verification did not load the seal object")?,
+                );
+                if verification.is_err() {
+                    return Ok(crate::pitr::api::VerifyPitrReport {
+                        verified_intervals: intervals_through(verified_end)?,
+                        next_cursor: None,
+                        first_failure: Some(crate::pitr::api::SegmentFailureLocator {
+                            expected_segment_id: Some(metadata.key.segment_id.0),
+                            decoded_anchor: None,
+                            catalog_sequence: None,
+                            kind: crate::pitr::api::SegmentFailureKind::Corrupt,
+                        }),
+                        last_verified_commit_ts,
+                    });
                 }
             }
             last_verified_commit_ts = metadata.last_commit_ts.or(last_verified_commit_ts);
@@ -2077,7 +2134,7 @@ impl BackupRepository {
         });
 
         Ok(crate::pitr::api::VerifyPitrReport {
-            verified_intervals,
+            verified_intervals: intervals_through(end)?,
             next_cursor,
             first_failure: None,
             last_verified_commit_ts,
@@ -2229,6 +2286,45 @@ impl BackupRepository {
         &self,
         selector: Option<crate::pitr::api::RecoverySelector>,
     ) -> Result<Vec<crate::pitr::api::RecoveryInterval>> {
+        let catalog_bytes =
+            match openat_no_follow(&self.root, "PITR_CATALOG_LOG", libc::O_RDONLY, 0) {
+                Ok(fd) => {
+                    let mut file = File::from(fd);
+                    let mut bytes = Vec::new();
+                    file.read_to_end(&mut bytes)?;
+                    bytes
+                }
+                Err(error)
+                    if error
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+                {
+                    Vec::new()
+                }
+                Err(error) => return Err(error),
+            };
+        let catalog = crate::pitr::catalog::replay_catalog(&catalog_bytes)?;
+        let mut segments = Vec::new();
+        for record in &catalog.records {
+            match record {
+                crate::pitr::catalog::PitrCatalogRecord::CommitSegment { metadata } => {
+                    segments.push(metadata);
+                }
+                crate::pitr::catalog::PitrCatalogRecord::RetentionSnapshot(snapshot) => {
+                    segments.extend(&snapshot.segments);
+                }
+                crate::pitr::catalog::PitrCatalogRecord::CoverageBreak(_) => {}
+            }
+        }
+        self.load_pitr_base_intervals_for_segments(selector, &segments)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn load_pitr_base_intervals_for_segments(
+        &self,
+        selector: Option<crate::pitr::api::RecoverySelector>,
+        segments: &[&crate::pitr::catalog::SegmentMetadata],
+    ) -> Result<Vec<crate::pitr::api::RecoveryInterval>> {
         let replay = self.load_replay()?;
         let backups =
             openat_no_follow(&self.root, "backups", libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
@@ -2262,36 +2358,7 @@ impl BackupRepository {
             }
             intervals.push(public_pitr_base_interval(&base, committed.backup_id)?);
         }
-        let catalog_bytes =
-            match openat_no_follow(&self.root, "PITR_CATALOG_LOG", libc::O_RDONLY, 0) {
-                Ok(fd) => {
-                    let mut file = File::from(fd);
-                    let mut bytes = Vec::new();
-                    file.read_to_end(&mut bytes)?;
-                    bytes
-                }
-                Err(error)
-                    if error
-                        .downcast_ref::<std::io::Error>()
-                        .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
-                {
-                    Vec::new()
-                }
-                Err(error) => return Err(error),
-            };
-        let catalog = crate::pitr::catalog::replay_catalog(&catalog_bytes)?;
-        let mut segments = Vec::new();
-        for record in catalog.records {
-            match record {
-                crate::pitr::catalog::PitrCatalogRecord::CommitSegment { metadata } => {
-                    segments.push(metadata);
-                }
-                crate::pitr::catalog::PitrCatalogRecord::RetentionSnapshot(snapshot) => {
-                    segments.extend(snapshot.segments);
-                }
-                crate::pitr::catalog::PitrCatalogRecord::CoverageBreak(_) => {}
-            }
-        }
+        let mut segments = segments.to_vec();
         segments.sort_by_key(|metadata| metadata.key.segment_id.0);
         segments.dedup_by_key(|metadata| metadata.key);
         let wal_dir =
