@@ -32,9 +32,11 @@ in legacy records. Production source discovery/publication and restore
 integration remain. Archive preparation now validates v7 seal descriptors
 against catalog metadata and strictly verifies the exact frozen WAL image;
 source-object digest checks use whole-image SHA-256 for v7 while retaining the
-recorded v5/v6 digest rules. Repository base-interval seal loading and Deep/restore
-decoding still require v7 integration before public verification can cover v7
-segments that extend a PITR base. The live
+recorded v5/v6 digest rules. Repository base-interval derivation now decodes
+v7 seal indexes and binds them to their catalog descriptors, while retaining
+the v5/v6 sidecar path. Deep verification and restore batch decoding still
+require v7 integration before public verification can cover v7 segment contents.
+The live
 v7 Parallel runtime now admits reserved DATA batches and writes embedded
 FRONTIERs before the single WAL sync; API barriers,
 Leader-parity work, and full Active lifecycle integration remain.

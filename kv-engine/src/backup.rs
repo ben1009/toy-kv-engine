@@ -2364,13 +2364,27 @@ impl BackupRepository {
                 )?;
                 let mut seal_bytes = Vec::new();
                 File::from(seal_fd).read_to_end(&mut seal_bytes)?;
-                let seal = crate::pitr::seal::V5Seal::decode(&seal_bytes)?;
-                if let Some(first) = seal.entries.first() {
-                    let first = first.recorded_at.as_system_time()?;
+                let (first_recorded_at, last_recorded_at) = if metadata.wal_format_version
+                    == crate::wal::format::WAL_FORMAT_VERSION_V7
+                {
+                    let seal = crate::pitr::archive::decode_v7_archive_seal(metadata, &seal_bytes)?;
+                    (
+                        seal.entries.first().map(|entry| entry.recorded_at),
+                        seal.entries.last().map(|entry| entry.recorded_at),
+                    )
+                } else {
+                    let seal = crate::pitr::seal::V5Seal::decode(&seal_bytes)?;
+                    (
+                        seal.entries.first().map(|entry| entry.recorded_at),
+                        seal.entries.last().map(|entry| entry.recorded_at),
+                    )
+                };
+                if let Some(first) = first_recorded_at {
+                    let first = first.as_system_time()?;
                     recorded_start = Some(recorded_start.map_or(first, |old| old.min(first)));
                 }
-                if let Some(last) = seal.entries.last() {
-                    let last = last.recorded_at.as_system_time()?;
+                if let Some(last) = last_recorded_at {
+                    let last = last.as_system_time()?;
                     recorded_end = Some(recorded_end.map_or(last, |old| old.max(last)));
                 }
                 predecessor = crate::pitr::ChainAnchor::Segment(metadata.anchor);
@@ -7271,6 +7285,172 @@ mod tests {
         let mut expected_base = base;
         expected_base.compatibility_digest = pitr_compatibility_digest(&compatibility);
         assert_eq!(metadata.pitr_base, Some(expected_base));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pitr_base_intervals_include_v7_seal_recorded_time_bounds() {
+        use crate::pitr::catalog::{PitrCatalogRecord, SegmentKey, SegmentMetadata};
+        use crate::pitr::manifest::{ActiveBoundary, ImmutableBoundary};
+        use crate::pitr::seal::{V7Seal, V7SealEntry};
+        use crate::pitr::{ArchiveEpochId, ChainAnchor, RecordedAt, SegmentId, TimelineId};
+        use crate::wal::v7::codec::WalV7Header;
+
+        let dir = tempfile::tempdir().unwrap();
+        let parent = open_directory_no_follow(dir.path()).unwrap();
+        bootstrap_repository(&parent, "repository").unwrap();
+        let repository_path = dir.path().join("repository");
+        let mut repository = BackupRepository::open(&repository_path).unwrap();
+        let repository_id = repository.ensure_pitr_repository_identity().unwrap();
+        let timeline_id = TimelineId([2; 16]);
+        let archive_epoch_id = ArchiveEpochId([3; 16]);
+        let predecessor = ChainAnchor::Genesis { archive_epoch_id };
+        let segment_id = SegmentId(1);
+        let header = WalV7Header {
+            timeline_id,
+            archive_epoch_id,
+            segment_id,
+            predecessor,
+            incarnation: [5; 16],
+        };
+        let wal_digest = [6; 32];
+        let boundary = ImmutableBoundary {
+            active: ActiveBoundary {
+                timeline_id: timeline_id.0,
+                archive_epoch_id: archive_epoch_id.0,
+                segment_id: segment_id.0,
+                incarnation: header.incarnation,
+                ticket_end: 1,
+                durable_end: 3 * 4096,
+                last_commit_ts: 20,
+                prefix_digest: [7; 32],
+            },
+            sealed_end: 4 * 4096,
+            terminal_frontier_digest: [8; 32],
+            wal_digest,
+        };
+        let seal_bytes = V7Seal {
+            header,
+            boundary,
+            entries: vec![V7SealEntry {
+                ticket: 0,
+                first_data_offset: 2 * 4096,
+                commit_ts: 20,
+                recorded_at: RecordedAt { secs: 10, nanos: 0 },
+            }],
+        }
+        .encode()
+        .unwrap();
+        let seal_digest = Sha256::digest(&seal_bytes).into();
+        let metadata = SegmentMetadata {
+            key: SegmentKey {
+                repository_id,
+                timeline_id,
+                archive_epoch_id,
+                segment_id,
+            },
+            wal_format_version: crate::wal::format::WAL_FORMAT_VERSION_V7,
+            seal_format_version: 2,
+            immutable_boundary: Some(Box::new(boundary)),
+            anchor: crate::pitr::SegmentAnchor {
+                segment_id,
+                wal_digest,
+                seal_digest,
+            },
+            predecessor,
+            first_commit_ts: Some(20),
+            last_commit_ts: Some(20),
+            batch_count: 1,
+            logical_bytes: 100,
+            wal_bytes: boundary.sealed_end,
+            wal_digest,
+            seal_digest,
+            source_identity: [9; 32],
+        };
+
+        let base_recorded_at = crate::pitr::manifest::PersistedRecordedAt { secs: 1, nanos: 0 };
+        let base = crate::pitr::base::PitrBaseMetadata {
+            repository_id,
+            timeline_id: timeline_id.0,
+            archive_epoch_id: archive_epoch_id.0,
+            included_commit_ts: None,
+            boundary_segment_id: segment_id.0,
+            boundary_anchor: crate::pitr::manifest::PersistedChainAnchor::Genesis {
+                archive_epoch_id: archive_epoch_id.0,
+            },
+            base_recorded_at,
+            time_anchor: crate::pitr::base::PitrBaseTimeAnchor::Observed {
+                commit_ts: None,
+                observed_at: base_recorded_at,
+            },
+            wal_replay_version: crate::pitr::base::PITR_BASE_WAL_REPLAY_VERSION,
+            compatibility_digest: [10; 32],
+        };
+        let compatibility = RestoreCompatibility {
+            manifest_format_version: crate::manifest::MANIFEST_FORMAT_VERSION,
+            value_separation_enabled: false,
+            vlog_format_version: None,
+            ttl_records_present: false,
+            serializable_at_capture: false,
+        };
+        repository
+            .create_backup_with_pitr_base(b"backup", b"snapshot", base, compatibility)
+            .unwrap();
+
+        let seal_name = crate::pitr::archive::archive_object_name(
+            timeline_id,
+            archive_epoch_id,
+            segment_id,
+            crate::pitr::archive::ArchiveObjectKind::Seal,
+            seal_digest,
+        );
+        std::fs::create_dir(repository_path.join("wal")).unwrap();
+        std::fs::write(repository_path.join("wal").join(&seal_name), &seal_bytes).unwrap();
+        let catalog =
+            crate::pitr::catalog::encode_catalog(&[PitrCatalogRecord::CommitSegment { metadata }])
+                .unwrap();
+        std::fs::write(repository_path.join("PITR_CATALOG_LOG"), catalog).unwrap();
+
+        let intervals = repository
+            .load_pitr_base_intervals(Some(crate::pitr::api::RecoverySelector {
+                timeline_id: timeline_id.0,
+                archive_epoch_id: Some(archive_epoch_id.0),
+                base_backup_id: None,
+            }))
+            .unwrap();
+        assert_eq!(intervals.len(), 1);
+        assert_eq!(intervals[0].commit_bounds, Some(20..=20));
+        assert_eq!(
+            intervals[0].recorded_time_bounds,
+            Some(
+                std::time::UNIX_EPOCH + std::time::Duration::from_secs(1)
+                    ..=std::time::UNIX_EPOCH + std::time::Duration::from_secs(10)
+            )
+        );
+
+        // Keep codec validation valid so rejection proves that the catalog
+        // digest is enforced, rather than just detecting a malformed seal.
+        let mut altered_seal = V7Seal::decode(&seal_bytes, boundary.sealed_end).unwrap();
+        altered_seal.entries[0].recorded_at.secs = 11;
+        let altered_seal_bytes = altered_seal.encode().unwrap();
+        assert_eq!(altered_seal_bytes.len(), seal_bytes.len());
+        std::fs::write(
+            repository_path.join("wal").join(seal_name),
+            altered_seal_bytes,
+        )
+        .unwrap();
+        let error = repository
+            .load_pitr_base_intervals(Some(crate::pitr::api::RecoverySelector {
+                timeline_id: timeline_id.0,
+                archive_epoch_id: Some(archive_epoch_id.0),
+                base_backup_id: None,
+            }))
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("v7 archive seal digest mismatch")
+        );
     }
 
     #[cfg(target_os = "linux")]
