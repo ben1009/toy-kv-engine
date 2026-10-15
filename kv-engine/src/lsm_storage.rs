@@ -15247,6 +15247,87 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn v7_sync_async_cancellation_keeps_cutoff_owned_by_blocking_worker() -> anyhow::Result<()> {
+        use std::{sync::atomic::Ordering, time::Duration};
+
+        let directory = tempdir()?;
+        let options = v7_recovery_test_database(directory.path())?;
+        let engine = KvEngine::open(directory.path().join("db"), options)?;
+        let sequencer = engine.inner.mvcc.as_ref().unwrap();
+        let pending_commit = sequencer.reserve_commit_ts()?;
+        let lifecycle = &engine.inner.lifecycle.0.active_writes;
+        let active_writes_before = lifecycle.load(Ordering::Acquire);
+        let sync_engine = Arc::clone(&engine);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+
+        let sync_task = runtime.spawn(async move { sync_engine.sync_async().await });
+        let admission_stopped = runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while sequencer.commit_admission_is_open() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .is_ok()
+        });
+
+        // Cancellation drops the async waiter, but the dispatched blocking
+        // worker must retain its lifecycle guard while it drains this commit.
+        sync_task.abort();
+        let was_cancelled = runtime
+            .block_on(sync_task)
+            .is_err_and(|error| error.is_cancelled());
+        let lifecycle_guard_retained = lifecycle.load(Ordering::Acquire) > active_writes_before;
+        let admission_stayed_closed = !sequencer.commit_admission_is_open();
+
+        // Release the reservation even if an assertion would fail, so the
+        // worker cannot be stranded while the test unwinds.
+        sequencer.retire_commit_ts(pending_commit);
+        let worker_drained = runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while lifecycle.load(Ordering::Acquire) > active_writes_before {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .is_ok()
+        });
+        if !worker_drained {
+            // close() waits for admitted lifecycle guards, including this
+            // worker's guard. Bound runtime shutdown before failing so a
+            // broken drain cannot turn the regression into a hung test.
+            runtime.shutdown_timeout(Duration::from_secs(1));
+            anyhow::bail!("blocking sync worker did not drain after commit release");
+        }
+        let admission_resumed = sequencer.commit_admission_is_open();
+        let close_result = engine.close();
+
+        assert!(
+            admission_stopped,
+            "sync_async never stopped commit admission"
+        );
+        assert!(was_cancelled, "sync_async caller task was not cancelled");
+        assert!(
+            lifecycle_guard_retained,
+            "cancelling sync_async released the worker's lifecycle admission"
+        );
+        assert!(
+            admission_stayed_closed,
+            "cancelled sync reopened admission before drain"
+        );
+        assert!(
+            admission_resumed,
+            "successful sync worker did not resume admission"
+        );
+        close_result?;
+
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn v7_admitted_sync_finishes_after_close_begins() -> anyhow::Result<()> {
         let directory = tempdir()?;
         let options = v7_recovery_test_database(directory.path())?;
