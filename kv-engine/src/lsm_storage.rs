@@ -15294,6 +15294,13 @@ mod tests {
             .await
             .is_ok()
         });
+        if !worker_drained {
+            // close() waits for admitted lifecycle guards, including this
+            // worker's guard. Bound runtime shutdown before failing so a
+            // broken drain cannot turn the regression into a hung test.
+            runtime.shutdown_timeout(Duration::from_secs(1));
+            anyhow::bail!("blocking sync worker did not drain after commit release");
+        }
         let admission_resumed = sequencer.commit_admission_is_open();
         let close_result = engine.close();
 
@@ -15309,10 +15316,6 @@ mod tests {
         assert!(
             admission_stayed_closed,
             "cancelled sync reopened admission before drain"
-        );
-        assert!(
-            worker_drained,
-            "blocking sync worker did not drain after commit release"
         );
         assert!(
             admission_resumed,
