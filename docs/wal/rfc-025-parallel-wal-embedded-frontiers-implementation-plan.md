@@ -790,7 +790,10 @@ later lifecycle work.
 Regression tests exercise both public sync APIs with a commit reserved before
 its WAL ticket exists and preserve an existing admission pause. A separate test
 gives the shared helper a fully admitted lifecycle guard, begins close before
-executing sync, and verifies that sync finishes without reopening writes.
+executing sync, and verifies that sync finishes without reopening writes. An
+async cancellation test aborts the caller after its blocking worker stops
+admission, then verifies that the worker retains its lifecycle guard until the
+pending commit drains and only then resumes admission.
 
 **Exit:** Out-of-order/multi-SQE groups, captured-target races, stopped-admission
 drain, poison, lost-wakeup, and cancellation tests pass with the actual worker.
