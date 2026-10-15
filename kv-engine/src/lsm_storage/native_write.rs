@@ -1152,6 +1152,69 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn async_ttl_convenience_write_uses_parallel_and_leader_paths() {
+        let directory = tempfile::tempdir().unwrap();
+        let engine = open(directory.path());
+        engine
+            .put_with_ttl_async(b"ttl", b"live", Duration::from_secs(3_600))
+            .await
+            .unwrap();
+        engine
+            .put_with_ttl_async(b"expired", b"gone", Duration::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(
+            engine.get(b"ttl").unwrap().as_deref(),
+            Some(b"live".as_slice())
+        );
+        assert_eq!(engine.get(b"expired").unwrap(), None);
+        engine.close_async().await.unwrap();
+        drop(engine);
+
+        let engine = open(directory.path());
+        assert_eq!(
+            engine.get(b"ttl").unwrap().as_deref(),
+            Some(b"live".as_slice())
+        );
+        assert_eq!(engine.get(b"expired").unwrap(), None);
+        engine.close_async().await.unwrap();
+        drop(engine);
+
+        let engine =
+            KvEngine::open_with_wal_io_mode(directory.path(), options(), WalIoMode::Leader)
+                .unwrap();
+        engine
+            .put_with_ttl_async(b"leader-ttl", b"live", Duration::from_secs(3_600))
+            .await
+            .unwrap();
+        assert_eq!(
+            engine.get(b"leader-ttl").unwrap().as_deref(),
+            Some(b"live".as_slice())
+        );
+        engine.close_async().await.unwrap();
+    }
+
+    #[test]
+    fn async_ttl_duration_rounds_fractional_seconds_up() {
+        assert_eq!(
+            super::super::ttl_duration_secs_rounded_up(Duration::from_millis(1)),
+            1
+        );
+        assert_eq!(
+            super::super::ttl_duration_secs_rounded_up(Duration::from_millis(1_500)),
+            2
+        );
+        assert_eq!(
+            super::super::ttl_duration_secs_rounded_up(Duration::from_secs(2)),
+            2
+        );
+        assert_eq!(
+            super::super::ttl_duration_secs_rounded_up(Duration::MAX),
+            u64::MAX
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn native_async_cancelled_close_keeps_a_shutdown_owner_and_a_second_caller_finishes() {
         let directory = tempfile::tempdir().unwrap();
         let engine = open(directory.path());
