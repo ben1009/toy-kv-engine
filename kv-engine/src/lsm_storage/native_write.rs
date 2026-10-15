@@ -54,9 +54,10 @@ impl LsmStorageInner {
             let preparation = mvcc.native_preparation_permit().await?;
             let lease = self.active_memtable_lock.read_async().await;
             let memtable = self.state.load().memtable.clone();
-            if !memtable.uses_parallel_wal() {
-                // PITR may temporarily install a v5/v6 WAL. Preserve its
-                // existing I/O and seal protocol on the blocking executor.
+            if !memtable.uses_parallel_wal() || memtable.uses_pitr_batch_wal() {
+                // Native preparation builds v4 buffers. PITR batches manage
+                // their own buffers, including Parallel v7, so perform their
+                // preparation and admission on the blocking executor.
                 drop(lease);
                 drop(preparation);
                 let inner = Arc::clone(self);
