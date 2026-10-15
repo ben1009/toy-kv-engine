@@ -2220,13 +2220,21 @@ impl Drop for KvEngine {
 }
 
 impl KvEngine {
+    /// Gracefully close storage after syncing admitted work.
+    ///
+    /// When the active WAL is v7, PITR remains enabled and its Active segment
+    /// is retained for recovery. Reopening with the same repository resumes
+    /// PITR; v7 sealing and successor rotation are not part of close yet.
     pub fn close(&self) -> Result<()> {
-        // A recovery point can only be sealed from an active PITR v5 WAL. When
-
-        // the engine was opened without WAL, or without a repository binding the
-        // PITR lifecycle, there is no segment to seal, so the plain storage close
-        // applies and the persisted obligations stay for a later resume.
+        // V7 cannot yet be sealed into a PITR recovery point. A storage close
+        // drains and syncs the active WAL while retaining its enabled lifecycle
+        // and Active segment for recovery on the next open.
         let pitr_mode = self.pitr_manifest_state.lock().mode;
+        if pitr_mode == crate::pitr::manifest::PitrMode::Enabled
+            && self.inner.state.load().memtable.uses_v7_wal()
+        {
+            return self.close_active_v7_pitr_storage();
+        }
         match pitr_mode {
             crate::pitr::manifest::PitrMode::Enabled
                 if self.inner.state.load().memtable.uses_wal_v5()
@@ -2255,6 +2263,38 @@ impl KvEngine {
         Self::close_storage_parts(&self.inner, &self.background_workers)
     }
 
+    fn close_active_v7_pitr_storage(&self) -> Result<()> {
+        #[cfg(target_os = "linux")]
+        {
+            // Serialize the admission fence and lifecycle transition with PITR
+            // resume. Release both locks before joining workers: a worker may be
+            // waiting for the PITR barrier while shutdown waits for that worker.
+            let operation_guard = self.pitr_operation_lock.lock();
+            let barrier = self.pitr_barrier_lock.lock();
+            let admission_error = self
+                .inner
+                .mvcc
+                .as_ref()
+                .ok_or_else(|| anyhow!("PITR close requires MVCC"))
+                .and_then(|sequencer| sequencer.stop_commit_admission_and_capture().map(|_| ()))
+                .err();
+            let close_state = self.inner.lifecycle.begin_close();
+            drop(barrier);
+            drop(operation_guard);
+
+            Self::close_storage_parts_after_begin(
+                &self.inner,
+                &self.background_workers,
+                close_state,
+                admission_error,
+            )
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            self.close_storage()
+        }
+    }
+
     fn close_storage_parts(
         inner: &LsmStorageInner,
         background_workers: &BackgroundWorkers,
@@ -2264,7 +2304,21 @@ impl KvEngine {
         // snapshots to drain, then finish. Idempotent: a second call observes
         // CLOSED (or CLOSING) and receives the saved outcome without
         // re-running shutdown.
-        match inner.lifecycle.begin_close() {
+        Self::close_storage_parts_after_begin(
+            inner,
+            background_workers,
+            inner.lifecycle.begin_close(),
+            None,
+        )
+    }
+
+    fn close_storage_parts_after_begin(
+        inner: &LsmStorageInner,
+        background_workers: &BackgroundWorkers,
+        close_state: CloseState,
+        admission_error: Option<anyhow::Error>,
+    ) -> Result<()> {
+        match close_state {
             CloseState::AlreadyClosed => return inner.lifecycle.close_result(),
             CloseState::AlreadyClosing => {
                 inner.lifecycle.wait_for_closed();
@@ -2296,7 +2350,13 @@ impl KvEngine {
         })();
         // Always finish close, including join and sync errors. Later close
         // callers receive the same terminal outcome.
-        let result = background_result.and(result);
+        let result = match (admission_error, background_result.and(result)) {
+            (None, close_result) => close_result,
+            (Some(admission_error), Ok(())) => Err(admission_error),
+            (Some(admission_error), Err(close_error)) => Err(close_error.context(format!(
+                "failed to drain MVCC admission before close: {admission_error:#}; storage close also failed"
+            ))),
+        };
         // A close waiter may reopen immediately after observing completion.
         // Transfer ownership before publishing CLOSED and waking those callers.
         inner.wal_v7_open_lock.lock().take();
@@ -2963,6 +3023,7 @@ impl KvEngine {
         repository: impl AsRef<std::path::Path>,
     ) -> Result<crate::pitr::api::PitrResumeOutcome> {
         let _operation_guard = self.pitr_operation_lock.lock();
+        self.inner.lifecycle.ensure_open()?;
         let mut state = self.pitr_manifest_state.lock().clone();
         ensure!(
             matches!(
@@ -3126,8 +3187,7 @@ impl KvEngine {
             let _barrier = self.pitr_barrier_lock.lock();
             let reopening_permitted = self.pitr_manifest_state.lock().mode
                 == crate::pitr::manifest::PitrMode::Enabled
-                && !self.pitr_publication_unknown.load(Ordering::Acquire)
-                && !self.inner.state.load().memtable.uses_v7_wal();
+                && !self.pitr_publication_unknown.load(Ordering::Acquire);
             if reopening_permitted {
                 self.inner
                     .mvcc
@@ -3170,18 +3230,6 @@ impl KvEngine {
                     path: repository_path,
                     kind: crate::pitr::api::PitrArchiveErrorKind::Unavailable,
                     source: anyhow!("PITR left the enabled lifecycle while resume was completing"),
-                },
-            ));
-        }
-        if self.inner.state.load().memtable.uses_v7_wal() {
-            return Ok(crate::pitr::api::PitrResumeOutcome::ReconciliationRequired(
-                crate::pitr::api::PitrArchiveError {
-                    operation: crate::pitr::api::PitrOperation::Reconcile,
-                    path: repository_path,
-                    kind: crate::pitr::api::PitrArchiveErrorKind::Unavailable,
-                    source: anyhow!(
-                        "v7 Active WAL recovery is available, but commit admission remains closed until v7 lifecycle rotation is implemented"
-                    ),
                 },
             ));
         }
@@ -3681,6 +3729,10 @@ impl KvEngine {
         ensure!(
             state.mode == crate::pitr::manifest::PitrMode::Enabled,
             "PITR is not actively enabled"
+        );
+        ensure!(
+            !self.inner.state.load().memtable.uses_v7_wal(),
+            "cannot create a PITR recovery point for a v7 Active WAL before v7 sealing and rotation are implemented"
         );
         let sequencer = self
             .inner
@@ -11853,7 +11905,10 @@ impl LsmStorageInner {
 
     pub(crate) fn try_freeze_memtable(&self) -> Result<()> {
         let state = self.state.load();
-        if state.memtable.uses_wal_v5() {
+        // PITR WALs rotate through a segment boundary. In particular, a v7
+        // commit must not reach ordinary freeze after publishing its data:
+        // v7 sealing/rotation is pending, and admission enforces its hard limits.
+        if state.memtable.uses_pitr_batch_wal() {
             if !state.memtable.is_empty() {
                 self.pitr_active_started_at
                     .lock()
@@ -15064,9 +15119,11 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
-    async fn v7_async_open_keeps_write_admission_closed() -> anyhow::Result<()> {
+    async fn v7_async_open_resumes_admission_and_publishes_sync_and_async_writes()
+    -> anyhow::Result<()> {
         let directory = tempdir()?;
-        let options = v7_recovery_test_database(directory.path())?;
+        let mut options = v7_recovery_test_database(directory.path())?;
+        options.target_sst_size = 1;
         let database = directory.path().join("db");
         let (active_segment_id, _) = pitr_segment_wals(&database)
             .into_iter()
@@ -15077,6 +15134,7 @@ mod tests {
         let engine = KvEngine::open_async(&database, options.clone()).await?;
         let active = engine.inner.state.load().memtable.clone();
         assert!(active.uses_v7_wal());
+        assert!(active.approximate_size() >= options.target_sst_size);
         assert!(!staged_path.exists());
         let active_allocated =
             LsmStorageInner::filesystem_file_allocated_bytes(active.wal_path().unwrap())?;
@@ -15089,24 +15147,108 @@ mod tests {
             active_allocated
         );
         assert_eq!(engine.get(b"v7-key")?, Some(Bytes::from_static(b"v")));
+        assert!(
+            engine
+                .inner
+                .mvcc
+                .as_ref()
+                .unwrap()
+                .commit_admission_is_open()
+        );
+        let recovery_point_error = engine.create_recovery_point().unwrap_err();
+        assert!(recovery_point_error.to_string().contains("v7 Active WAL"));
+        assert!(
+            engine
+                .inner
+                .mvcc
+                .as_ref()
+                .unwrap()
+                .commit_admission_is_open()
+        );
         let wal_path = active.wal_path().unwrap();
         let before = std::fs::read(wal_path)?;
-        let error = engine.put(b"blocked-sync", b"write").unwrap_err();
-        assert!(error.to_string().contains("commit admission is stopped"));
-        let error = engine
-            .put_async(b"blocked-async", b"write")
-            .await
-            .unwrap_err();
-        assert!(error.to_string().contains("commit admission is stopped"));
-        assert_eq!(std::fs::read(wal_path)?, before);
-        engine.close_storage()?;
+        engine.put(b"sync-write", b"durable")?;
+        engine.put_async(b"async-write", b"durable").await?;
+        assert_eq!(
+            engine.get(b"sync-write")?,
+            Some(Bytes::from_static(b"durable"))
+        );
+        assert_eq!(
+            engine.get(b"async-write")?,
+            Some(Bytes::from_static(b"durable"))
+        );
+        assert!(Arc::ptr_eq(&engine.inner.state.load().memtable, &active));
+        assert_ne!(std::fs::read(wal_path)?, before);
+        engine.close_async().await?;
         drop(engine);
 
         let reopened = KvEngine::open(&database, options)?;
         assert_eq!(reopened.get(b"v7-key")?, Some(Bytes::from_static(b"v")));
+        assert_eq!(
+            reopened.get(b"sync-write")?,
+            Some(Bytes::from_static(b"durable"))
+        );
+        assert_eq!(
+            reopened.get(b"async-write")?,
+            Some(Bytes::from_static(b"durable"))
+        );
         reopened.close_storage()?;
 
         Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn v7_async_large_batch_does_not_deadlock_on_buffer_budget() -> anyhow::Result<()> {
+        let directory = tempdir()?;
+        let root = directory.path().to_path_buf();
+        let (finished, completion) = std::sync::mpsc::channel();
+        // A regression blocks synchronously inside buffer admission, so run the
+        // operation off the test thread to bound failure independently of Tokio.
+        let worker = std::thread::spawn(move || {
+            let result = (|| -> anyhow::Result<()> {
+                let fixture = pitr_flush_test_engine_with_segment_limit(&root, 128 << 20);
+                let state = fixture.pitr_manifest_state.lock().clone();
+                fixture.close_storage()?;
+                drop(fixture);
+
+                let options = install_v7_recovery_test_database(&root, state)?;
+                let database = root.join("db");
+                let engine = KvEngine::open(&database, options.clone())?;
+                // One encoding fits the 64 MiB runtime buffer budget. Holding
+                // both v4 preparation and v7 DATA buffers cannot fit.
+                let value = vec![b'v'; 60 * 1024];
+                let keys = (0..640)
+                    .map(|index| format!("large-{index:04}").into_bytes())
+                    .collect::<Vec<_>>();
+                let batch = keys
+                    .iter()
+                    .map(|key| WriteBatchRecord::Put(key.as_slice(), value.as_slice()))
+                    .collect::<Vec<_>>();
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()?;
+                runtime.block_on(engine.write_batch_async(&batch))?;
+                assert_eq!(engine.get(&keys[0])?.as_deref(), Some(value.as_slice()));
+                assert_eq!(engine.get(&keys[639])?.as_deref(), Some(value.as_slice()));
+                engine.close()?;
+                drop(engine);
+
+                let reopened = KvEngine::open(&database, options)?;
+                assert_eq!(reopened.get(&keys[0])?.as_deref(), Some(value.as_slice()));
+                assert_eq!(reopened.get(&keys[639])?.as_deref(), Some(value.as_slice()));
+                reopened.close()?;
+
+                Ok(())
+            })();
+            let _ = finished.send(result);
+        });
+        let result = completion
+            .recv_timeout(std::time::Duration::from_secs(20))
+            .map_err(|error| anyhow::anyhow!("v7 async batch did not complete: {error}"))?;
+        worker.join().unwrap();
+
+        result
     }
 
     #[cfg(target_os = "linux")]
@@ -15141,12 +15283,20 @@ mod tests {
         assert!(Arc::ptr_eq(&engine.inner.state.load().memtable, &active));
         assert!(engine.inner.state.load().imm_memtables.is_empty());
         assert_eq!(std::fs::read(wal_path)?, wal_before);
-        assert!(engine.put(b"blocked", b"write").is_err());
-        engine.close_storage()?;
+        engine.put(b"after-failed-freeze", b"durable")?;
+        assert_eq!(
+            engine.get(b"after-failed-freeze")?,
+            Some(Bytes::from_static(b"durable"))
+        );
+        engine.close()?;
         drop(engine);
 
         let reopened = KvEngine::open(&database, options)?;
         assert_eq!(reopened.get(b"v7-key")?, Some(Bytes::from_static(b"v")));
+        assert_eq!(
+            reopened.get(b"after-failed-freeze")?,
+            Some(Bytes::from_static(b"durable"))
+        );
         reopened.close_storage()?;
 
         Ok(())
@@ -15257,7 +15407,6 @@ mod tests {
                 boundary
             );
             assert_eq!(reopened.get(b"v7-key")?, Some(Bytes::from_static(b"v")));
-            assert!(reopened.put(b"blocked", b"write").is_err());
             assert!(database.join("MANIFEST").exists());
             assert!(database.join("ENGINE_MANIFEST").exists());
             assert!(!database.join("ENGINE_MANIFEST.tmp").exists());
@@ -15666,6 +15815,42 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn v7_async_close_preserves_io_error_after_admission_failure() -> anyhow::Result<()> {
+        use super::async_close::{AsyncCloseError, AsyncCloseErrorKind};
+
+        let directory = tempdir()?;
+        let options = v7_recovery_test_database(directory.path())?;
+        let database = directory.path().join("db");
+        let engine = KvEngine::open(&database, options)?;
+        let sequencer = engine.inner.mvcc.as_ref().unwrap();
+        sequencer.poison_commit_ts(sequencer.latest_commit_ts() + 1);
+        std::fs::rename(&database, directory.path().join("moved-db"))?;
+
+        let error = engine.close_async().await.unwrap_err();
+        let error = error.downcast_ref::<AsyncCloseError>().unwrap();
+        assert_eq!(
+            error.kind(),
+            AsyncCloseErrorKind::Io(std::io::ErrorKind::NotFound)
+        );
+        assert_eq!(
+            error
+                .source_error()
+                .downcast_ref::<std::io::Error>()
+                .unwrap()
+                .kind(),
+            std::io::ErrorKind::NotFound
+        );
+        let repeated = engine.close_async().await.unwrap_err();
+        assert_eq!(
+            repeated.downcast_ref::<AsyncCloseError>().unwrap().kind(),
+            error.kind()
+        );
+
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
     #[test]
     fn v7_close_waiters_observe_released_open_lock() -> anyhow::Result<()> {
         use std::{sync::mpsc, time::Duration};
@@ -15706,6 +15891,24 @@ mod tests {
             early_completion,
             Err(mpsc::RecvTimeoutError::Timeout)
         ));
+        assert!(
+            !engine
+                .inner
+                .mvcc
+                .as_ref()
+                .unwrap()
+                .commit_admission_is_open()
+        );
+        assert!(engine.put(b"after-close", b"rejected").is_err());
+        assert!(engine.resume_pitr(database.join("repository")).is_err());
+        assert!(
+            !engine
+                .inner
+                .mvcc
+                .as_ref()
+                .unwrap()
+                .commit_admission_is_open()
+        );
         drop(engine);
 
         let reopened = KvEngine::open(&database, options)?;
@@ -16797,6 +17000,14 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     fn pitr_flush_test_engine(dir: &std::path::Path) -> Arc<KvEngine> {
+        pitr_flush_test_engine_with_segment_limit(dir, 1 << 20)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn pitr_flush_test_engine_with_segment_limit(
+        dir: &std::path::Path,
+        max_segment_bytes: u64,
+    ) -> Arc<KvEngine> {
         let engine = KvEngine::open(
             dir.join("db"),
             LsmStorageOptions {
@@ -16810,9 +17021,9 @@ mod tests {
                 repository: dir.join("repository"),
                 config: crate::pitr::api::PersistedPitrConfig {
                     archive_interval: std::time::Duration::from_secs(3600),
-                    max_segment_bytes: 1 << 20,
-                    max_unarchived_bytes: 2 << 20,
-                    max_source_spool_bytes: 4 << 20,
+                    max_segment_bytes,
+                    max_unarchived_bytes: max_segment_bytes * 2,
+                    max_source_spool_bytes: max_segment_bytes * 4,
                 },
                 runtime: crate::pitr::api::PitrRuntimeOptions::default(),
             })

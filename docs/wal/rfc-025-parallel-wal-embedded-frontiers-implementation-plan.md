@@ -14,9 +14,20 @@ limits checked before installation. An exclusive process lock covers manifest
 authority replay and remains held while the v7 Active WAL is open. A manifest
 v7 boundary requires a canonical v7 Active header before legacy WAL recovery
 can run; replacing that file with a legacy image cannot bypass its durable
-floor. The recovered Active image remains fenced from ordinary engine writes
-until public descriptor routing, lifecycle rotation, and publication barriers
-are implemented. PITR manifest replay and snapshots now retain and validate a
+floor. At startup, the recovered Active image remains commit-fenced until PITR
+resume validates repository identity and reconciles archive obligations.
+Successful resume now opens admission for synchronous and asynchronous public
+point writes through the v7 batch durability path. Async v7 commits use the
+engine's blocking executor and the selected WAL pipeline, avoiding unused v4
+preparation buffers; native v7 preparation remains future work. The ordinary
+memtable size target does not freeze the Active v7 memtable; segment and spool admission limits
+still apply while v7 rotation remains pending. Public close drains and syncs
+the Active v7 WAL for recovery without emitting a final recovery point. It stops
+and drains MVCC commit admission before closing, and a concurrent resume cannot
+reopen admission after close begins. Unsupported v7 recovery-point requests now
+fail before changing admission. Fixed-cutoff barriers, remaining public write
+shapes, sealing, and lifecycle rotation remain. PITR manifest replay and
+snapshots now retain and validate a
 v7 format marker and the full immutable boundary in Sealing obligations;
 seal completion checks the WAL digest against that boundary. A v7 v2 seal
 sidecar codec now persists the immutable boundary and each ticket's first DATA
@@ -43,7 +54,7 @@ and seal pair against its immutable descriptor, then decodes ticket-ordered
 batches before replay; v5/v6 continue to use their legacy decoder.
 The live
 v7 Parallel runtime now admits reserved DATA batches and writes embedded
-FRONTIERs before the single WAL sync; API barriers,
+FRONTIERs before the single WAL sync; fixed-cutoff API barriers,
 Leader-parity work, and full Active lifecycle integration remain.
 Version 8 engine manifests and standalone PITR envelopes require explicit
 obligation format markers. Production recovery selects legacy snapshot migration
@@ -110,8 +121,10 @@ segment manager remains a provisional estimate: it does not account for
 worst-case per-batch embedded
 FRONTIER reservations, larger seal indexes, or ongoing pinned allocations. The
 recovered Active v7 owner now restores its source, obligation, staging, and
-recovery-workspace charges on one shared ledger before admission opens. Public
-Parallel write routing and full Active lifecycle integration remain.
+recovery-workspace charges on one shared ledger before admission opens.
+Successful PITR resume now reopens admission for synchronous and asynchronous
+public point writes through the recovered v7 batch writer. Public Parallel
+barriers and full Active lifecycle integration remain.
 The low-level serial Leader writer now requires a reservation owner for its
 installed inode. Creating the owner charges the recovered prefix exactly once. The writer
 validates that the owner belongs to its installed image, precharges the
@@ -130,7 +143,12 @@ sequencer when a v7 append fails after admission, including write/sync or
 post-sync cursor-publication failures; pre-admission rejections remain retryable.
 An unwind guard also poisons an outstanding v7 commit reservation on panic,
 so a caller that catches the panic cannot leave commit capture waiting forever.
-Public Parallel write routing and the v6 to v7 transition remain unconnected.
+Engine startup now keeps recovered Active v7 admission closed until PITR resume
+validates repository identity and reconciles obligations. Successful resume
+enables synchronous and asynchronous public point writes through the v7 batch
+writer. Public close drains and syncs the retained Active WAL, leaving PITR
+enabled for recovery on reopen; v7 sealing and successor rotation remain
+unconnected.
 Recovered Active v7 owners and their shared ledger are retained by PITR segment
 bookkeeping through durable WAL/seal cleanup; retirement fences new admission
 and retains charges for in-flight admission or preparation guards until they
@@ -263,11 +281,13 @@ MemTable tests cover replay and reopen, resumed MVCC tickets and seal indexes,
 retryable validation/capacity rejection, and returned errors or caught panics
 during v7 sync across all seven MVCC write paths. Uncertain append failures
 poison MVCC before returning or unwinding.
-Public Parallel write routing and barriers, and the v6 to v7 transition remain
-unconnected. Active v7 reservation owners and their shared ledger are retained
-through durable source cleanup and then retired from segment bookkeeping.
+Successful PITR resume now enables synchronous and asynchronous public point
+writes through the recovered v7 batch writer. Public Parallel barriers and the
+v6 to v7 transition remain unconnected. Active v7 reservation owners and their
+shared ledger are retained through durable source cleanup and then retired from
+segment bookkeeping.
 
-**Last updated:** 2026-10-14
+**Last updated:** 2026-10-15
 
 **Source baseline:** `30a64fa855126596316ab6b9237e6348b0e41fd2`, which merged RFC 025 in PR #379.
 
@@ -448,9 +468,11 @@ holds an exclusive process lock from before manifest replay, reserves the
 source and a full-segment fresh-inode workspace within the remaining spool
 allowance, checks normalized image and seal-index bounds before replacement,
 and attaches recovered batches and the inode-bound owner to the active
-memtable. The lock remains held until close or drop. Active v7 open stays
-commit-fenced until public Parallel write routing and lifecycle rotation can
-safely handle capacity and freeze. Immutable images are not normalized. PITR manifest state
+memtable. The lock remains held until close or drop. Engine startup keeps
+admission closed until PITR resume validates repository identity and
+reconciles obligations; successful resume enables sync/async public point
+writes through the v7 batch writer. Capacity-driven rotation and freeze
+remain later lifecycle work. Immutable images are not normalized. PITR manifest state
 represents the current Active v7 logical boundary and validates monotonic
 updates against its segment identity; the boundary intentionally omits
 physical FRONTIER identity.
