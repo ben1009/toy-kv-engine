@@ -1792,6 +1792,22 @@ impl MemTable {
         wal.prepare_v7_parallel_batch(batch, limits)
     }
 
+    /// Reserve temporary memory for an owned v7 batch before allocating it.
+    pub(crate) fn reserve_v7_preparation_buffer(
+        &self,
+        buffer_memory_bytes: u64,
+    ) -> Result<Option<crate::wal::v7::admission::WalV7OwnedPreparationReservation>> {
+        anyhow::ensure!(
+            self.uses_v7_wal() && self.uses_parallel_wal(),
+            "preparation reservation requires v7 Parallel WAL"
+        );
+        let owner = self
+            .wal_v7_reservation_owner
+            .as_ref()
+            .context("v7 WAL has no reservation owner")?;
+        Ok(owner.reserve_preparation_buffer(buffer_memory_bytes)?)
+    }
+
     /// Admit a prevalidated v7 Parallel batch and retain its first DATA offset
     /// in the seal index only after WAL admission succeeds.
     pub(crate) fn write_prepared_v7_pitr_wal_batch_only(
@@ -2882,6 +2898,26 @@ impl MemTable {
         ts: u64,
         base_ordinal: u32,
     ) -> Result<()> {
+        self.publish_range_tombstones_iter(tombstones.iter().copied(), ts, base_ordinal)
+    }
+
+    /// Insert range tombstones from an exact-size iterator without building a
+    /// temporary reference vector.
+    pub(crate) fn publish_range_tombstones_iter<'a>(
+        &self,
+        tombstones: impl ExactSizeIterator<Item = (&'a [u8], &'a [u8])>,
+        ts: u64,
+        base_ordinal: u32,
+    ) -> Result<()> {
+        let count = tombstones.len();
+        anyhow::ensure!(count <= u32::MAX as usize, "too many range tombstones");
+        if count > 0 {
+            let last_offset = u32::try_from(count - 1).context("too many range tombstones")?;
+            base_ordinal
+                .checked_add(last_offset)
+                .context("range tombstone ordinal overflows")?;
+        }
+
         struct AbortOnPanic;
         impl Drop for AbortOnPanic {
             fn drop(&mut self) {
@@ -2896,7 +2932,7 @@ impl MemTable {
         let _abort_guard = AbortOnPanic;
 
         use crate::range_tombstone::RangeTombstone;
-        for (i, (start, end)) in tombstones.iter().enumerate() {
+        for (i, (start, end)) in tombstones.enumerate() {
             let ordinal = base_ordinal
                 .checked_add(u32::try_from(i).expect("pre-validated"))
                 .expect("pre-validated");

@@ -419,7 +419,12 @@ pub(crate) fn canonical_batch(batch: &WalBatch, limits: WalV5Limits) -> Result<C
         "v5 input entry count exceeds configured limit"
     );
 
-    if batch.entries.len() <= 1 {
+    if batch.entries.len() <= 1
+        || batch
+            .entries
+            .iter()
+            .all(|entry| matches!(entry, WalEntry::RangeDelete { .. }))
+    {
         return Ok(Cow::Borrowed(batch));
     }
     Ok(Cow::Owned(batch.canonicalized()?))
@@ -1428,6 +1433,29 @@ mod tests {
         let decoded = decode_v5_batch(&encoded, 0, limits()).unwrap();
         assert_eq!(decoded.batch.entries[0], duplicate.entries[1]);
         assert_eq!(decoded.batch.entries.len(), 3);
+    }
+
+    #[test]
+    fn range_only_canonical_batch_borrows_without_copying_entries() {
+        let range_only = WalBatch {
+            commit_ts: 12,
+            recorded_at: batch().recorded_at,
+            entries: vec![
+                WalEntry::RangeDelete {
+                    start: b"a".to_vec(),
+                    end: b"c".to_vec(),
+                },
+                WalEntry::RangeDelete {
+                    start: b"d".to_vec(),
+                    end: b"f".to_vec(),
+                },
+            ],
+        };
+
+        assert!(matches!(
+            canonical_batch(&range_only, limits()).unwrap(),
+            Cow::Borrowed(_)
+        ));
     }
 
     #[test]
