@@ -18,9 +18,12 @@ floor. At startup, the recovered Active image remains commit-fenced until PITR
 resume validates repository identity and reconciles archive obligations.
 Successful resume now opens admission for synchronous and asynchronous public
 point writes through the v7 batch durability path. Async v7 Parallel point
-commits use the bounded blocking executor for batch encoding and admission,
-then await WAL durability and ordered MVCC publication asynchronously; native
-v7 preparation remains future work. The ordinary
+commits use the bounded preparation permit to build and validate canonical PITR
+entries, and reserve their scratch memory, before waiting for the MVCC write
+sequencer. Ordered admission assigns the commit timestamp and clamps the sampled
+recorded time before final encoding; async callers then await WAL durability and
+ordered MVCC publication. Synchronous writes and v7 Leader retain serialized
+preparation. The ordinary
 memtable size target does not freeze the Active v7 memtable; segment and spool admission limits
 still apply while v7 rotation remains pending. Public close drains and syncs
 the Active v7 WAL for recovery without emitting a final recovery point. It stops
@@ -779,9 +782,12 @@ this stage.
   behavior for v5/v6. Preserve timestamp/ticket ordering and retire sequencer
   timestamp reservations on pre-admission rejection without creating WAL holes.
 - Wire synchronous and async durability waits through `MemTable` and the engine
-  sequencer. Extend native async point preparation where v7 eligibility permits;
-  keep range/OCC paths using their owned bounded blocking protocol until a native
-  path is separately qualified. Every path uses the same v7 durability contract.
+  sequencer. Native async v7 Parallel point preparation now runs under its
+  bounded preparation permit before the MVCC write lock; the ordered sequencer
+  supplies the commit timestamp, and the ordered WAL packer clamps the sampled
+  recorded time. Keep range/OCC paths using their owned bounded blocking protocol
+  until a native path is separately qualified. Every path uses the same v7
+  durability contract.
   Preserve memtable insertion followed by ordered MVCC publication, leases,
   preparation permits, cancellation ownership, and close/freeze draining.
 

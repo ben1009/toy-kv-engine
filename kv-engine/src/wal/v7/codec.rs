@@ -464,8 +464,20 @@ impl PreparedWalV7LogicalBatch<'_> {
         segment_ticket: u64,
         recorded_at: RecordedAt,
     ) -> Result<Vec<u8>> {
+        let commit_ts = self.batch.commit_ts;
+        self.encode_with_metadata(segment_ticket, commit_ts, recorded_at)
+    }
+
+    /// Encode a prepared entry stream after ordered admission assigns its
+    /// commit timestamp and the WAL packer clamps its sampled recorded time.
+    pub(crate) fn encode_with_metadata(
+        self,
+        segment_ticket: u64,
+        commit_ts: u64,
+        recorded_at: RecordedAt,
+    ) -> Result<Vec<u8>> {
         let Self {
-            batch,
+            batch: _,
             canonical,
             logical_len,
             limits,
@@ -485,7 +497,7 @@ impl PreparedWalV7LogicalBatch<'_> {
         );
         let header = WalV7LogicalBatchHeader {
             segment_ticket,
-            commit_ts: batch.commit_ts,
+            commit_ts,
             recorded_at_secs: recorded_at.secs,
             recorded_at_nanos: recorded_at.nanos,
             entry_count: canonical.entry_count(),
@@ -1389,6 +1401,36 @@ mod tests {
                 },
             ]
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn prepared_logical_batch_uses_ordered_commit_metadata() -> Result<()> {
+        let batch = WalBatch {
+            commit_ts: 1,
+            recorded_at: crate::pitr::RecordedAt { secs: 0, nanos: 0 },
+            entries: vec![WalEntry::PointDelete {
+                key: b"prepared".to_vec(),
+            }],
+        };
+        let sampled_recorded_at = crate::pitr::RecordedAt {
+            secs: 1_800_000_000,
+            nanos: 42,
+        };
+        let encoded = prepare_logical_batch(&batch, crate::pitr::LIVE_WAL_V5_LIMITS)?
+            .encode_with_metadata(7, 91, sampled_recorded_at)?;
+        let header = WalV7LogicalBatchHeader::decode(
+            &encoded[..WAL_V7_LOGICAL_BATCH_HEADER_LEN],
+            &encoded[WAL_V7_LOGICAL_BATCH_HEADER_LEN..],
+            7,
+            u64::try_from(encoded.len())?,
+            crate::pitr::LIVE_WAL_V5_LIMITS,
+        )?;
+
+        assert_eq!(header.commit_ts, 91);
+        assert_eq!(header.recorded_at_secs, sampled_recorded_at.secs);
+        assert_eq!(header.recorded_at_nanos, sampled_recorded_at.nanos);
 
         Ok(())
     }

@@ -64,8 +64,9 @@ impl LsmStorageInner {
             {
                 // v5/v6 use their blocking Leader barrier; v7 Leader also has
                 // no async durability waiter. V7 Parallel uses the common
-                // async completion path below, but keeps encoding and resource
-                // admission on the bounded blocking executor.
+                // async completion path below, with canonical preparation and
+                // resource admission on the bounded blocking executor before
+                // the MVCC write lock is acquired.
                 drop(lease);
                 drop(preparation);
                 let inner = Arc::clone(self);
@@ -88,7 +89,7 @@ impl LsmStorageInner {
                     .run_result(move || {
                         let _admission = append_admission;
                         append_mvcc
-                            .write_batch_wal_only(
+                            .write_batch_wal_only_native(
                                 &append_entries,
                                 &append_memtable,
                                 shared_publish_bytes,

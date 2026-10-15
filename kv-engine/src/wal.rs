@@ -39,6 +39,8 @@ mod parallel_worker;
 #[path = "wal/parallel/runtime.rs"]
 mod parallel_runtime;
 
+pub(crate) use parallel_runtime::WalV7PreparedBatch;
+
 /// Result of recovering a WAL file, containing both point entries and range tombstones.
 pub struct RecoveredWalBatch {
     /// Point key-value entries recovered from the WAL.
@@ -1741,6 +1743,82 @@ impl Wal {
 
     /// Append a v7 PITR batch and return the first DATA frame offset for its
     /// seal index. Callers must serialize this with their seal-index update.
+    pub(crate) fn prepare_v7_parallel_batch<'a>(
+        &self,
+        batch: &'a crate::pitr::WalBatch,
+        limits: crate::pitr::WalV5Limits,
+    ) -> Result<WalV7PreparedBatch<'a>> {
+        anyhow::ensure!(
+            self.format_version == WAL_FORMAT_VERSION_V7,
+            "v7 WAL preparation selected for format {}",
+            self.format_version
+        );
+        anyhow::ensure!(
+            self.v7_leader.is_none(),
+            "v7 Leader WAL does not support prepared Parallel batches"
+        );
+        anyhow::ensure!(
+            !self.poisoned.load(Ordering::Acquire),
+            "WAL is poisoned due to a previous I/O error"
+        );
+        self.parallel_runtime
+            .as_ref()
+            .context("v7 WAL has no Parallel runtime")?
+            .prepare_v7_batch(batch, limits)
+    }
+
+    /// Admit a prepared v7 PITR batch and return its first DATA frame offset
+    /// for the seal index. Callers serialize this with their seal-index update.
+    pub(crate) fn put_v7_prepared_batch_with_index(
+        &self,
+        prepared: WalV7PreparedBatch<'_>,
+        commit_ts: u64,
+        recorded_at: crate::pitr::RecordedAt,
+    ) -> Result<(u64, u64)> {
+        anyhow::ensure!(
+            self.format_version == WAL_FORMAT_VERSION_V7,
+            "v7 WAL append selected for format {}",
+            self.format_version
+        );
+        anyhow::ensure!(
+            self.v7_leader.is_none(),
+            "v7 Leader WAL does not support prepared Parallel batches"
+        );
+        anyhow::ensure!(
+            !self.poisoned.load(Ordering::Acquire),
+            "WAL is poisoned due to a previous I/O error"
+        );
+        let runtime = self
+            .parallel_runtime
+            .as_ref()
+            .context("v7 WAL has no Parallel runtime")?;
+        let previous_ticket = self.next_ticket.load(Ordering::Acquire);
+        match runtime.put_v7_prepared_batch(prepared, commit_ts, recorded_at) {
+            Ok((ticket, first_data_offset)) => {
+                if ticket != previous_ticket {
+                    self.poisoned.store(true, Ordering::Release);
+                    anyhow::bail!("v7 Parallel ticket disagrees with the WAL admission cursor");
+                }
+                let ticket_end = ticket
+                    .checked_add(1)
+                    .context("v7 Parallel ticket end overflows")?;
+                self.next_ticket.store(ticket_end, Ordering::Release);
+                let append_offset = runtime.logical_length();
+                self.alloc_offset
+                    .fetch_max(append_offset, Ordering::Release);
+                self.preallocated_size
+                    .fetch_max(append_offset, Ordering::Release);
+                Ok((ticket, first_data_offset))
+            }
+            Err(error) => {
+                if runtime.is_poisoned() {
+                    self.poisoned.store(true, Ordering::Release);
+                }
+                Err(error)
+            }
+        }
+    }
+
     pub(crate) fn put_v7_batch_with_index(
         &self,
         batch: &crate::pitr::WalBatch,

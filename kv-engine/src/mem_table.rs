@@ -1775,6 +1775,70 @@ impl MemTable {
         Ok(Some(ticket))
     }
 
+    /// Prepare a v7 Parallel point batch before entering the MVCC sequencer.
+    pub(crate) fn prepare_v7_pitr_wal_batch<'a>(
+        &self,
+        batch: &'a crate::pitr::WalBatch,
+        limits: crate::pitr::WalV5Limits,
+    ) -> Result<crate::wal::WalV7PreparedBatch<'a>> {
+        let wal = self
+            .wal
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("PITR WAL is not configured"))?;
+        anyhow::ensure!(
+            wal.is_v7() && wal.is_parallel(),
+            "prepared v7 batch requires Parallel WAL"
+        );
+        wal.prepare_v7_parallel_batch(batch, limits)
+    }
+
+    /// Admit a prevalidated v7 Parallel batch and retain its first DATA offset
+    /// in the seal index only after WAL admission succeeds.
+    pub(crate) fn write_prepared_v7_pitr_wal_batch_only(
+        &self,
+        prepared: crate::wal::WalV7PreparedBatch<'_>,
+        commit_ts: u64,
+        recorded_at: crate::pitr::RecordedAt,
+    ) -> Result<Option<u64>> {
+        let wal = self
+            .wal
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("PITR WAL is not configured"))?;
+        anyhow::ensure!(
+            wal.is_v7() && wal.is_parallel(),
+            "prepared v7 batch requires Parallel WAL"
+        );
+        let mut seal_index = self
+            .wal_v7_seal_index
+            .as_ref()
+            .map(|seal_index| seal_index.lock());
+        let seal_index = seal_index
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("v7 WAL has no retained seal index"))?;
+        anyhow::ensure!(
+            u64::try_from(seal_index.len())? == wal.next_ticket(),
+            "v7 seal index does not match the WAL next-ticket cursor"
+        );
+        seal_index
+            .try_reserve(1)
+            .context("reserve v7 WAL seal-index entry")?;
+
+        #[cfg(feature = "bench")]
+        let started = Instant::now();
+        let (ticket, first_data_offset) =
+            wal.put_v7_prepared_batch_with_index(prepared, commit_ts, recorded_at)?;
+        seal_index.push(first_data_offset);
+        self.last_ticket
+            .fetch_max(ticket + 1, std::sync::atomic::Ordering::Release);
+        #[cfg(feature = "bench")]
+        self.write_profile.load().wal_write_ns.fetch_add(
+            started.elapsed().as_nanos() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+
+        Ok(Some(ticket))
+    }
+
     pub(crate) fn uses_parallel_wal(&self) -> bool {
         self.wal.as_ref().is_some_and(Wal::is_parallel)
     }
