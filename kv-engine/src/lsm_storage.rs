@@ -6026,7 +6026,6 @@ impl KvEngine {
             if let Some(owner) = inner.weak_engine.get().and_then(std::sync::Weak::upgrade) {
                 let runtime = tokio::runtime::Handle::try_current()
                     .context("native async writes require an active Tokio runtime")?;
-                let lease = inner.active_memtable_lock.read_async().await;
                 let memtable = inner.state.load().memtable.clone();
                 if memtable.uses_v7_wal() && memtable.uses_parallel_wal() {
                     let preparation_reservation = memtable
@@ -6041,7 +6040,6 @@ impl KvEngine {
                             ));
                         }
                     }
-                    drop(lease);
                     return runtime
                         .spawn(async move {
                             owner
@@ -6052,7 +6050,6 @@ impl KvEngine {
                         .await
                         .context("native async range commit task failed")?;
                 }
-                drop(lease);
             }
             // A moved engine has no public weak owner to retain. Continue on
             // the blocking path so dropping this handle cannot wait on its own
