@@ -5967,27 +5967,18 @@ impl KvEngine {
 
     /// Async delete range.
     pub async fn delete_range_async(&self, start: &[u8], end: &[u8]) -> Result<()> {
-        let guard = self.inner.lifecycle.admit_write()?;
-        let inner = self.inner.clone();
-        let start = start.to_vec();
-        let end = end.to_vec();
-        self.inner
-            .blocking
-            .run_result(move || {
-                let _guard = guard;
-                inner.delete_range_internal(&start, &end)
-            })
+        self.write_batch_async(&[WriteBatchRecord::DelRange(start, end)])
             .await
     }
 
     /// Async write batch.
     ///
-    /// With a parallel WAL, non-serializable point batches await durability and
-    /// ordered publication without occupying a blocking thread. V7 encoding
-    /// and admission still run on the bounded blocking executor. After dispatch,
-    /// cancelling the caller's wait does not cancel its owned commit; its
-    /// outcome can remain unknown to that caller. Shutdown drains the commit
-    /// before closing the WAL.
+    /// With a parallel WAL, non-serializable point batches and v7 range-delete
+    /// batches await durability and ordered publication without occupying a
+    /// blocking thread. V7 encoding and admission still run on the bounded
+    /// blocking executor. After dispatch, cancelling the caller's wait does not
+    /// cancel its owned commit; its outcome can remain unknown to that caller.
+    /// Shutdown drains the commit before closing the WAL.
     pub async fn write_batch_async<T: AsRef<[u8]>>(
         &self,
         batch: &[WriteBatchRecord<T>],
@@ -5995,6 +5986,10 @@ impl KvEngine {
         let guard = self.inner.lifecycle.admit_write()?;
         let inner = self.inner.clone();
         let (has_range, _) = LsmStorageInner::validate_and_classify_write_batch(batch)?;
+        let native_v7_range = has_range && inner.uses_native_async_writes() && {
+            let state = inner.state.load();
+            state.memtable.uses_v7_wal() && state.memtable.uses_parallel_wal()
+        };
         if inner.uses_native_async_writes() && !has_range {
             let runtime = tokio::runtime::Handle::try_current()
                 .context("native async writes require an active Tokio runtime")?;
@@ -6025,6 +6020,40 @@ impl KvEngine {
             // Moving out of the original Arc invalidates its weak owner. The
             // blocking path keeps storage and admission alive without making
             // the moved handle's Drop depend on native executor progress.
+        }
+        if native_v7_range {
+            let preparation_bytes = inner.v7_parallel_range_preparation_bytes(batch)?;
+            if let Some(owner) = inner.weak_engine.get().and_then(std::sync::Weak::upgrade) {
+                let runtime = tokio::runtime::Handle::try_current()
+                    .context("native async writes require an active Tokio runtime")?;
+                let memtable = inner.state.load().memtable.clone();
+                if memtable.uses_v7_wal() && memtable.uses_parallel_wal() {
+                    let preparation_reservation = memtable
+                        .reserve_v7_preparation_buffer(preparation_bytes)?
+                        .context("v7 range batch preparation reservation is empty")?;
+                    let mut ranges = Vec::with_capacity(batch.len());
+                    for record in batch {
+                        if let WriteBatchRecord::DelRange(start, end) = record {
+                            ranges.push((
+                                Bytes::copy_from_slice(start.as_ref()),
+                                Bytes::copy_from_slice(end.as_ref()),
+                            ));
+                        }
+                    }
+                    return runtime
+                        .spawn(async move {
+                            owner
+                                .inner
+                                .write_ranges_native(ranges, guard, preparation_reservation)
+                                .await
+                        })
+                        .await
+                        .context("native async range commit task failed")?;
+                }
+            }
+            // A moved engine has no public weak owner to retain. Continue on
+            // the blocking path so dropping this handle cannot wait on its own
+            // runtime thread.
         }
         let owned: Vec<WriteBatchRecord<Vec<u8>>> = batch
             .iter()
@@ -10519,13 +10548,13 @@ impl LsmStorageInner {
         Ok(())
     }
 
-    fn publish_range_tombstones_or_poison(
+    fn publish_range_tombstones_or_poison<'a>(
         memtable: &MemTable,
-        entries: &[(&[u8], &[u8])],
+        entries: impl ExactSizeIterator<Item = (&'a [u8], &'a [u8])>,
         ts: u64,
         mvcc: &crate::mvcc::LsmMvccInner,
     ) -> Result<()> {
-        if let Err(error) = memtable.publish_range_tombstones(entries, ts, 0) {
+        if let Err(error) = memtable.publish_range_tombstones_iter(entries, ts, 0) {
             mvcc.poison_commit_ts(ts);
             return Err(error);
         }
@@ -10684,19 +10713,16 @@ impl LsmStorageInner {
     fn collect_range_batch_entries<T: AsRef<[u8]>>(
         batch: &[WriteBatchRecord<T>],
     ) -> Vec<(&[u8], &[u8])> {
-        batch
-            .iter()
-            .filter_map(|r| {
-                if let WriteBatchRecord::DelRange(start, end) = r {
-                    Some((start.as_ref(), end.as_ref()))
-                } else {
-                    None
-                }
-            })
-            .collect()
+        let mut entries = Vec::with_capacity(batch.len());
+        for record in batch {
+            if let WriteBatchRecord::DelRange(start, end) = record {
+                entries.push((start.as_ref(), end.as_ref()));
+            }
+        }
+        entries
     }
 
-    fn range_batch_write<T: AsRef<[u8]>>(&self, batch: &[WriteBatchRecord<T>]) -> Result<()> {
+    fn validate_range_batch_entries(&self, entries: &[(&[u8], &[u8])]) -> Result<()> {
         anyhow::ensure!(
             !self.options.serializable,
             "delete_range is not supported with serializable mode in the MVP"
@@ -10705,9 +10731,13 @@ impl LsmStorageInner {
             self.vlog.is_none(),
             "delete_range is not supported when value-log (vlog) is enabled in the MVP"
         );
+        anyhow::ensure!(
+            entries.len() <= u32::MAX as usize,
+            "range tombstone batch too large: {} entries",
+            entries.len()
+        );
 
-        let entries = Self::collect_range_batch_entries(batch);
-        for (start, end) in &entries {
+        for (start, end) in entries {
             Self::validate_key_size(start)?;
             Self::validate_key_size(end)?;
             anyhow::ensure!(
@@ -10717,6 +10747,119 @@ impl LsmStorageInner {
                 end
             );
         }
+
+        Ok(())
+    }
+
+    /// Validate a v7 range batch and calculate the temporary memory needed to
+    /// own its input and PITR entries before either buffer is allocated.
+    fn v7_parallel_range_preparation_bytes<T: AsRef<[u8]>>(
+        &self,
+        batch: &[WriteBatchRecord<T>],
+    ) -> Result<u64> {
+        anyhow::ensure!(
+            !self.options.serializable,
+            "delete_range is not supported with serializable mode in the MVP"
+        );
+        anyhow::ensure!(
+            self.vlog.is_none(),
+            "delete_range is not supported when value-log (vlog) is enabled in the MVP"
+        );
+
+        let limits = crate::pitr::LIVE_WAL_V5_LIMITS;
+        let mut entry_count = 0_usize;
+        let mut data_bytes = 0_usize;
+        let mut payload_bytes = 0_usize;
+        for record in batch {
+            let WriteBatchRecord::DelRange(start, end) = record else {
+                continue;
+            };
+            let start = start.as_ref();
+            let end = end.as_ref();
+            Self::validate_key_size(start)?;
+            Self::validate_key_size(end)?;
+            anyhow::ensure!(
+                start < end,
+                "invalid range: start ({:?}) must be less than end ({:?})",
+                start,
+                end
+            );
+
+            entry_count = entry_count
+                .checked_add(1)
+                .context("range tombstone count overflows")?;
+            anyhow::ensure!(
+                entry_count <= limits.max_input_entry_count.min(limits.max_entry_count),
+                "v5 input entry count exceeds configured limit"
+            );
+            let entry_bytes = 14_usize
+                .checked_add(start.len())
+                .and_then(|bytes| bytes.checked_add(end.len()))
+                .context("range tombstone encoded size overflows")?;
+            data_bytes = data_bytes
+                .checked_add(entry_bytes)
+                .context("range tombstone batch size overflows")?;
+            anyhow::ensure!(
+                data_bytes <= limits.max_batch_data_bytes,
+                "v5 batch data exceeds configured limit"
+            );
+            payload_bytes = payload_bytes
+                .checked_add(start.len())
+                .and_then(|bytes| bytes.checked_add(end.len()))
+                .context("range tombstone payload size overflows")?;
+        }
+        anyhow::ensure!(entry_count > 0, "range tombstone batch is empty");
+
+        // The detached task owns Bytes copies of each boundary and either
+        // constructs Vec-backed WalEntry copies for canonical preparation or
+        // falls back to a WriteBatchRecord vector, range-reference vector, and
+        // encoded DirectBuf if rotation changes formats. The fallback keeps
+        // those allocations alive while it builds the WalEntry batch, so charge
+        // the full overlapping set until publish.
+        let payload_buffer_bytes = payload_bytes
+            .checked_mul(2)
+            .context("range tombstone preparation size overflows")?;
+        let encoded_logical_bytes = data_bytes
+            .checked_add(crate::pitr::WAL_V5_BATCH_HEADER_LEN)
+            .context("encoded range batch size overflows")?;
+        let encoded_buffer_bytes = encoded_logical_bytes
+            .checked_add(crate::pitr::WAL_V5_ALIGNMENT - 1)
+            .map(|bytes| bytes / crate::pitr::WAL_V5_ALIGNMENT)
+            .and_then(|frames| frames.checked_mul(crate::pitr::WAL_V5_ALIGNMENT))
+            .context("encoded range buffer size overflows")?;
+        let range_container_bytes = entry_count
+            .checked_mul(std::mem::size_of::<(Bytes, Bytes)>())
+            .context("owned range vector size overflows")?;
+        let wal_entry_bytes = entry_count
+            .checked_mul(std::mem::size_of::<crate::pitr::WalEntry>())
+            .context("owned PITR entry vector size overflows")?;
+        let fallback_entry_bytes = entry_count
+            .checked_mul(std::mem::size_of::<WriteBatchRecord<Bytes>>())
+            .context("fallback range batch vector size overflows")?;
+        let range_ref_bytes = entry_count
+            .checked_mul(std::mem::size_of::<(&[u8], &[u8])>())
+            .context("range reference vector size overflows")?;
+        let fixed_container_bytes = std::mem::size_of::<Vec<(Bytes, Bytes)>>()
+            .checked_add(std::mem::size_of::<crate::pitr::WalBatch>())
+            .and_then(|bytes| {
+                bytes.checked_add(std::mem::size_of::<Vec<WriteBatchRecord<Bytes>>>())
+            })
+            .and_then(|bytes| bytes.checked_add(std::mem::size_of::<Vec<(&[u8], &[u8])>>()))
+            .context("owned range batch size overflows")?;
+        let total = payload_buffer_bytes
+            .checked_add(encoded_buffer_bytes)
+            .and_then(|bytes| bytes.checked_add(range_container_bytes))
+            .and_then(|bytes| bytes.checked_add(wal_entry_bytes))
+            .and_then(|bytes| bytes.checked_add(fallback_entry_bytes))
+            .and_then(|bytes| bytes.checked_add(range_ref_bytes))
+            .and_then(|bytes| bytes.checked_add(fixed_container_bytes))
+            .context("range tombstone preparation size overflows")?;
+        u64::try_from(total).context("range tombstone preparation size exceeds u64")
+    }
+
+    fn range_batch_write<T: AsRef<[u8]>>(&self, batch: &[WriteBatchRecord<T>]) -> Result<()> {
+        let entries = Self::collect_range_batch_entries(batch);
+        self.validate_range_batch_entries(&entries)?;
 
         let mut retries = 0;
         loop {
@@ -10747,7 +10890,12 @@ impl LsmStorageInner {
             if ts > 0
                 && let Some(ref mvcc) = self.mvcc
             {
-                Self::publish_range_tombstones_or_poison(&memtable, entries, ts, mvcc)?;
+                Self::publish_range_tombstones_or_poison(
+                    &memtable,
+                    entries.iter().copied(),
+                    ts,
+                    mvcc,
+                )?;
                 mvcc.publish_commit_ts(ts)?;
             } else {
                 memtable.publish_range_tombstones(entries, ts, 0)?;
@@ -15807,6 +15955,66 @@ mod tests {
             Some(Bytes::from_static(b"durable"))
         );
         reopened.close_storage()?;
+
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn v7_native_async_range_commit_is_owned_through_close_and_recovery() -> anyhow::Result<()>
+    {
+        let directory = tempdir()?;
+        let options = v7_recovery_test_database(directory.path())?;
+        let database = directory.path().join("db");
+        let engine = KvEngine::open_with_wal_io_mode(
+            &database,
+            options.clone(),
+            crate::wal::WalIoMode::Parallel,
+        )?;
+        for key in [b"a".as_slice(), b"b", b"c", b"z"] {
+            engine.put_async(key, b"value").await?;
+        }
+
+        let active = engine.inner.state.load().memtable.clone();
+        let pause = crate::lsm_storage::native_write::NativeWritePause::new(
+            crate::lsm_storage::native_write::NativeWriteStage::Admitted,
+        );
+        *engine.inner.native_write_pause.lock() = Some(Arc::clone(&pause));
+        let writer_engine = Arc::clone(&engine);
+        let writer =
+            tokio::spawn(async move { writer_engine.delete_range_async(b"a", b"c").await });
+        pause.reached.notified().await;
+        assert_eq!(engine.get(b"a")?, Some(Bytes::from_static(b"value")));
+        assert_eq!(engine.get(b"b")?, Some(Bytes::from_static(b"value")));
+        writer.abort();
+        assert!(writer.await.unwrap_err().is_cancelled());
+
+        let sequencer = engine.inner.mvcc.as_ref().unwrap();
+        let close_engine = Arc::clone(&engine);
+        let close = tokio::spawn(async move { close_engine.close_async().await });
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while sequencer.commit_admission_is_open() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("close must stop commit admission before draining the range commit");
+        assert!(
+            !close.is_finished(),
+            "close must wait for the owned range commit"
+        );
+        assert_eq!(active.parallel_wal_is_closed(), Some(false));
+        pause.release.notify_one();
+        close.await.unwrap()?;
+        drop(engine);
+
+        let reopened =
+            KvEngine::open_with_wal_io_mode(&database, options, crate::wal::WalIoMode::Parallel)?;
+        assert_eq!(reopened.get(b"a")?, None);
+        assert_eq!(reopened.get(b"b")?, None);
+        assert_eq!(reopened.get(b"c")?, Some(Bytes::from_static(b"value")));
+        assert_eq!(reopened.get(b"z")?, Some(Bytes::from_static(b"value")));
+        reopened.close_async().await?;
 
         Ok(())
     }

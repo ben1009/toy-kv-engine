@@ -125,7 +125,7 @@ pub(crate) struct LsmMvccInner {
     /// Fairly serialize native preparation without holding the sequencer lock
     /// across buffer backpressure. Release before durability or publication so
     /// multiple admitted groups remain in flight.
-    native_preparation: tokio::sync::Semaphore,
+    native_preparation: Arc<tokio::sync::Semaphore>,
     pub(crate) commit_lock: Mutex<()>,
     pub(crate) reader_lock: RwLock<()>,
     pub(crate) current_ts: AtomicU64,
@@ -188,8 +188,8 @@ pub(crate) enum BatchEntryKind {
 impl LsmMvccInner {
     pub(crate) async fn native_preparation_permit(
         &self,
-    ) -> anyhow::Result<tokio::sync::SemaphorePermit<'_>> {
-        Ok(self.native_preparation.acquire().await?)
+    ) -> anyhow::Result<tokio::sync::OwnedSemaphorePermit> {
+        Ok(Arc::clone(&self.native_preparation).acquire_owned().await?)
     }
 
     pub(crate) fn instance_id(&self) -> u64 {
@@ -281,7 +281,7 @@ impl LsmMvccInner {
         Self {
             instance_id,
             write_lock: Mutex::new(()),
-            native_preparation: tokio::sync::Semaphore::new(1),
+            native_preparation: Arc::new(tokio::sync::Semaphore::new(1)),
             commit_lock: Mutex::new(()),
             reader_lock: RwLock::new(()),
             current_ts: AtomicU64::new(initial_ts),
@@ -933,17 +933,18 @@ impl LsmMvccInner {
         let _unwind_guard = self.guard_v7_commit_unwind(memtable, commit_ts);
         let ticket = match if memtable.uses_pitr_batch_wal() {
             let recorded_at = self.pitr_recorded_at_for_commit(commit_ts)?;
+            let mut wal_entries = Vec::with_capacity(entries.len());
+            for (start, end) in entries {
+                wal_entries.push(crate::pitr::WalEntry::RangeDelete {
+                    start: (*start).to_vec(),
+                    end: (*end).to_vec(),
+                });
+            }
             memtable.write_pitr_wal_batch_only(
                 &crate::pitr::WalBatch {
                     commit_ts,
                     recorded_at,
-                    entries: entries
-                        .iter()
-                        .map(|(start, end)| crate::pitr::WalEntry::RangeDelete {
-                            start: (*start).to_vec(),
-                            end: (*end).to_vec(),
-                        })
-                        .collect(),
+                    entries: wal_entries,
                 },
                 crate::pitr::LIVE_WAL_V5_LIMITS,
             )
@@ -959,6 +960,64 @@ impl LsmMvccInner {
         // Do NOT advance current_ts here — see write_wal_only comment.
 
         Ok((commit_ts, ticket))
+    }
+
+    /// Prepare a v7 Parallel range-delete batch before contending for the
+    /// ordered MVCC writer lock. `None` asks the async caller to yield and
+    /// retry; no timestamp or WAL ticket has been reserved in that case.
+    pub(crate) fn write_range_batch_wal_only_native(
+        &self,
+        entries: &[(bytes::Bytes, bytes::Bytes)],
+        memtable: &MemTable,
+    ) -> Result<Option<(u64, Option<u64>)>, anyhow::Error> {
+        if entries.is_empty() {
+            return Ok(Some((0, None)));
+        }
+        anyhow::ensure!(
+            entries.len() <= u32::MAX as usize,
+            "range tombstone batch too large: {} entries",
+            entries.len()
+        );
+        anyhow::ensure!(
+            memtable.uses_v7_wal() && memtable.uses_parallel_wal(),
+            "native range preparation requires v7 Parallel WAL"
+        );
+
+        let recorded_at = self.next_pitr_recorded_at(std::time::SystemTime::now())?;
+        let mut wal_entries = Vec::with_capacity(entries.len());
+        for (start, end) in entries {
+            wal_entries.push(crate::pitr::WalEntry::RangeDelete {
+                start: start.to_vec(),
+                end: end.to_vec(),
+            });
+        }
+        let batch = crate::pitr::WalBatch {
+            // The prepared encoder substitutes the ordered timestamp on append.
+            commit_ts: 1,
+            recorded_at,
+            entries: wal_entries,
+        };
+        let prepared =
+            memtable.prepare_v7_pitr_wal_batch(&batch, crate::pitr::LIVE_WAL_V5_LIMITS)?;
+
+        let Some(_write_guard) = self.write_lock.try_lock() else {
+            return Ok(None);
+        };
+        let commit_ts = self.reserve_commit_ts()?;
+        let _unwind_guard = self.guard_v7_commit_unwind(memtable, commit_ts);
+        let ticket = match memtable.write_prepared_v7_pitr_wal_batch_only(
+            prepared,
+            commit_ts,
+            recorded_at,
+        ) {
+            Ok(ticket) => ticket,
+            Err(error) => {
+                self.record_wal_append_failure(memtable, commit_ts);
+                return Err(error);
+            }
+        };
+
+        Ok(Some((commit_ts, ticket)))
     }
 
     /// Write a batch to the WAL buffer only — no skiplist insert, no sync.

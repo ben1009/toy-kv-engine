@@ -23,17 +23,22 @@ entries, and reserve their scratch memory, before waiting for the MVCC write
 sequencer. Ordered admission assigns the commit timestamp and clamps the sampled
 recorded time before final encoding; async callers then await WAL durability and
 ordered MVCC publication. Synchronous writes and v7 Leader retain serialized
-preparation. The ordinary
-memtable size target does not freeze the Active v7 memtable; segment and spool admission limits
-still apply while v7 rotation remains pending. Public close drains and syncs
+preparation. Async v7 Parallel range-delete batches now use the same bounded
+preparation and ordered durability/publication path. V7 batch limits are checked
+before copying caller ranges, and the temporary owned range/PITR buffers are
+charged before allocation. Cancellation ownership is covered through close and
+recovery. Other range formats and OCC retain their existing blocking paths.
+The ordinary memtable size target does not freeze the
+Active v7 memtable; segment and spool admission limits still apply while v7
+rotation remains pending. Public close drains and syncs
 the Active v7 WAL for recovery without emitting a final recovery point. It stops
 and drains MVCC commit admission before closing, and a concurrent resume cannot
 reopen admission after close begins. Unsupported v7 recovery-point requests now
 fail before changing admission. Public `sync()` and `sync_async()` now share a
 fixed-cutoff barrier that drains MVCC admission, preserves an existing pause,
-and persist the empty floor plus latest synced logical boundary in the PITR
-manifest. Freeze, checkpoint, and recovery-point barriers, remaining public write shapes,
-sealing, and lifecycle rotation remain. PITR manifest replay and
+and persists the empty floor plus latest synced logical boundary in the PITR
+manifest. Freeze, checkpoint, and recovery-point barriers, remaining public
+write shapes, OCC, sealing, and lifecycle rotation remain. PITR manifest replay and
 snapshots now retain and validate a
 v7 format marker and the full immutable boundary in Sealing obligations;
 seal completion checks the WAL digest against that boundary. A v7 v2 seal
@@ -785,9 +790,13 @@ this stage.
   sequencer. Native async v7 Parallel point preparation now runs under its
   bounded preparation permit before the MVCC write lock; the ordered sequencer
   supplies the commit timestamp, and the ordered WAL packer clamps the sampled
-  recorded time. Keep range/OCC paths using their owned bounded blocking protocol
-  until a native path is separately qualified. Every path uses the same v7
-  durability contract.
+  recorded time. Native async v7 Parallel range-delete batches now follow the
+  same bounded preparation, ordered durability, and publication protocol. They
+  preflight encoded limits and reserve input/PITR temporary memory before
+  copying. A cancellation test verifies that close drains an admitted range
+  commit and recovery preserves its tombstones. Other range formats and OCC
+  remain on their existing blocking paths pending qualification. Every path
+  uses the same v7 durability contract.
   Preserve memtable insertion followed by ordered MVCC publication, leases,
   preparation permits, cancellation ownership, and close/freeze draining.
 

@@ -202,6 +202,160 @@ impl LsmStorageInner {
             return Ok(());
         }
     }
+
+    /// Write v7 Parallel range tombstones with asynchronous durability and
+    /// ordered publication. Range payload preparation and WAL admission stay
+    /// on the bounded blocking executor; the async task owns the commit through
+    /// publication if its caller cancels.
+    pub(super) async fn write_ranges_native(
+        self: &Arc<Self>,
+        mut ranges: Vec<(Bytes, Bytes)>,
+        admission: AdmissionGuard,
+        mut range_preparation_reservation: crate::wal::v7::admission::WalV7OwnedPreparationReservation,
+    ) -> Result<()> {
+        let admission = Arc::new(admission);
+        if ranges.is_empty() {
+            return Ok(());
+        }
+        let mvcc = self
+            .mvcc
+            .as_ref()
+            .context("native range writes require MVCC")?;
+        let mut retries = 0;
+
+        loop {
+            let preparation = mvcc.native_preparation_permit().await?;
+            let lease = self.active_memtable_lock.read_async().await;
+            let memtable = self.state.load().memtable.clone();
+            if !memtable.uses_v7_wal() || !memtable.uses_parallel_wal() {
+                drop(lease);
+                drop(preparation);
+                let inner = Arc::clone(self);
+                let mut batch = Vec::with_capacity(ranges.len());
+                for (start, end) in &ranges {
+                    batch.push(super::WriteBatchRecord::DelRange(
+                        start.clone(),
+                        end.clone(),
+                    ));
+                }
+                return self
+                    .blocking
+                    .run_result(move || {
+                        let _admission = admission;
+                        inner.write_batch(&batch)
+                    })
+                    .await;
+            }
+
+            #[cfg(feature = "bench")]
+            let started = std::time::Instant::now();
+            let append_mvcc = Arc::clone(mvcc);
+            let append_memtable = Arc::clone(&memtable);
+            let append_admission = Arc::clone(&admission);
+            let (
+                result,
+                returned_ranges,
+                returned_reservation,
+                lease,
+                returned_admission,
+                preparation,
+            ) = self
+                .blocking
+                .run(move || {
+                    let result = append_mvcc
+                        .write_range_batch_wal_only_native(&ranges, &append_memtable)
+                        .map(|prepared| {
+                            prepared.map(|(timestamp, ticket)| {
+                                (
+                                    AdmittedCommit {
+                                        mvcc: Arc::clone(&append_mvcc),
+                                        timestamp,
+                                        finished: false,
+                                    },
+                                    timestamp,
+                                    ticket,
+                                )
+                            })
+                        });
+                    // Keep commit poisoning first, then release its buffers,
+                    // memtable lease, and lifecycle admission if the async
+                    // waiter disappears before receiving this result.
+                    (
+                        result,
+                        ranges,
+                        range_preparation_reservation,
+                        lease,
+                        append_admission,
+                        preparation,
+                    )
+                })
+                .await;
+            ranges = returned_ranges;
+            range_preparation_reservation = returned_reservation;
+            drop(returned_admission);
+            drop(preparation);
+            #[cfg(feature = "bench")]
+            self.write_profile
+                .record_mvcc_wal_only_ns(started.elapsed().as_nanos() as u64);
+
+            let (mut commit, timestamp, ticket) = match result {
+                Ok(Some(prepared)) => prepared,
+                Ok(None) => {
+                    drop(lease);
+                    tokio::task::yield_now().await;
+                    continue;
+                }
+                Err(error) => {
+                    drop(lease);
+                    if !crate::wal::Wal::is_retryable_full_error(&error) {
+                        return Err(error);
+                    }
+                    let inner = Arc::clone(self);
+                    let rotation_admission = Arc::clone(&admission);
+                    retries = self
+                        .blocking
+                        .run_result(move || {
+                            let _admission = rotation_admission;
+                            inner.retry_after_wal_full(error, &memtable, &mut retries)?;
+                            Ok::<_, anyhow::Error>(retries)
+                        })
+                        .await?;
+                    continue;
+                }
+            };
+
+            #[cfg(test)]
+            self.pause_native_write(NativeWriteStage::Admitted, timestamp)
+                .await;
+            memtable.commit_wal_ticket_async(ticket).await?;
+            #[cfg(test)]
+            self.pause_native_write(NativeWriteStage::Durable, timestamp)
+                .await;
+            Self::publish_range_tombstones_or_poison(
+                &memtable,
+                ranges
+                    .iter()
+                    .map(|(start, end)| (start.as_ref(), end.as_ref())),
+                timestamp,
+                mvcc,
+            )?;
+            mvcc.publish_commit_ts_async(timestamp).await?;
+            commit.finished = true;
+            drop(commit);
+            drop(lease);
+            drop(ranges);
+            drop(range_preparation_reservation);
+
+            let inner = Arc::clone(self);
+            return self
+                .blocking
+                .run_result(move || {
+                    let _admission = admission;
+                    inner.try_freeze_memtable()
+                })
+                .await;
+        }
+    }
 }
 
 #[cfg(test)]
