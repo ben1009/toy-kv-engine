@@ -986,7 +986,19 @@ impl LsmMvccInner {
         memtable: &MemTable,
         shared_publish_bytes: bool,
     ) -> Result<(u64, DeferredBatchPublish, Option<u64>), anyhow::Error> {
-        self.write_batch_wal_only_inner(entries, memtable, shared_publish_bytes, None, None)
+        self.write_batch_wal_only_inner(entries, memtable, shared_publish_bytes, false, None, None)
+    }
+
+    /// Native async point writes prepare v7 batches while holding the bounded
+    /// preparation permit, before waiting for the ordered MVCC sequencer.
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn write_batch_wal_only_native(
+        &self,
+        entries: &[(bytes::Bytes, bytes::Bytes, BatchEntryKind)],
+        memtable: &MemTable,
+        shared_publish_bytes: bool,
+    ) -> Result<(u64, DeferredBatchPublish, Option<u64>), anyhow::Error> {
+        self.write_batch_wal_only_inner(entries, memtable, shared_publish_bytes, true, None, None)
     }
 
     /// Buffer preparation precedes timestamp allocation. Encoding/admission stay
@@ -1015,6 +1027,7 @@ impl LsmMvccInner {
             entries,
             memtable,
             shared_publish_bytes,
+            false,
             Some(buffer),
             Some(guard),
         )
@@ -1060,12 +1073,54 @@ impl LsmMvccInner {
         entries: &[(Bytes, Bytes, BatchEntryKind)],
         memtable: &MemTable,
         shared_publish_bytes: bool,
+        prepare_v7_before_lock: bool,
         prepared: Option<crate::wal::EncodedWalBuffer>,
         write_guard: Option<parking_lot::MutexGuard<'_, ()>>,
     ) -> anyhow::Result<(u64, DeferredBatchPublish, Option<u64>)> {
         if entries.is_empty() {
             return Ok((0, DeferredBatchPublish::from_entries(Vec::new()), None));
         }
+
+        let v7_sampled_recorded_at =
+            if prepare_v7_before_lock && memtable.uses_v7_wal() && memtable.uses_parallel_wal() {
+                Some(self.next_pitr_recorded_at(std::time::SystemTime::now())?)
+            } else {
+                None
+            };
+        let v7_wal_batch = v7_sampled_recorded_at.map(|recorded_at| crate::pitr::WalBatch {
+            // Canonical entry preparation does not depend on the commit
+            // timestamp. The actual timestamp is substituted at admission.
+            commit_ts: 1,
+            recorded_at,
+            entries: entries
+                .iter()
+                .map(|(key, value, kind)| match kind {
+                    BatchEntryKind::Delete => {
+                        crate::pitr::WalEntry::PointDelete { key: key.to_vec() }
+                    }
+                    BatchEntryKind::PutPrefixed => crate::pitr::WalEntry::Put {
+                        key: key.to_vec(),
+                        value: value.to_vec(),
+                    },
+                    BatchEntryKind::PutRaw => {
+                        let mut prefixed = Vec::with_capacity(1 + value.len());
+                        prefixed.push(crate::vlog::KvKind::Inline as u8);
+                        prefixed.extend_from_slice(value);
+                        crate::pitr::WalEntry::Put {
+                            key: key.to_vec(),
+                            value: prefixed,
+                        }
+                    }
+                })
+                .collect(),
+        });
+        let prepared_v7 = match v7_wal_batch.as_ref() {
+            Some(batch) => {
+                Some(memtable.prepare_v7_pitr_wal_batch(batch, crate::pitr::LIVE_WAL_V5_LIMITS)?)
+            }
+            None => None,
+        };
+
         let _write_guard = write_guard.unwrap_or_else(|| self.write_lock.lock());
         let commit_ts = self.reserve_commit_ts()?;
         let _unwind_guard = self.guard_v7_commit_unwind(memtable, commit_ts);
@@ -1093,39 +1148,46 @@ impl LsmMvccInner {
             })
             .collect();
         if memtable.uses_pitr_batch_wal() {
-            let recorded_at = self.pitr_recorded_at_for_commit(commit_ts)?;
-            let wal_entries = entries
-                .iter()
-                .map(|(key, value, kind)| match kind {
-                    BatchEntryKind::Delete => {
-                        crate::pitr::WalEntry::PointDelete { key: key.to_vec() }
-                    }
-                    BatchEntryKind::PutPrefixed | BatchEntryKind::PutRaw => {
-                        let value = match kind {
-                            BatchEntryKind::PutPrefixed => value.to_vec(),
-                            BatchEntryKind::PutRaw => {
-                                let mut prefixed = Vec::with_capacity(1 + value.len());
-                                prefixed.push(crate::vlog::KvKind::Inline as u8);
-                                prefixed.extend_from_slice(value);
-                                prefixed
-                            }
-                            BatchEntryKind::Delete => unreachable!(),
-                        };
-                        crate::pitr::WalEntry::Put {
-                            key: key.to_vec(),
-                            value,
+            let ticket_result = if let Some(prepared) = prepared_v7 {
+                let recorded_at =
+                    v7_sampled_recorded_at.expect("prepared v7 batch has a sampled recorded time");
+                memtable.write_prepared_v7_pitr_wal_batch_only(prepared, commit_ts, recorded_at)
+            } else {
+                let recorded_at = self.pitr_recorded_at_for_commit(commit_ts)?;
+                let wal_entries = entries
+                    .iter()
+                    .map(|(key, value, kind)| match kind {
+                        BatchEntryKind::Delete => {
+                            crate::pitr::WalEntry::PointDelete { key: key.to_vec() }
                         }
-                    }
-                })
-                .collect();
-            let ticket = match memtable.write_pitr_wal_batch_only(
-                &crate::pitr::WalBatch {
-                    commit_ts,
-                    recorded_at,
-                    entries: wal_entries,
-                },
-                crate::pitr::LIVE_WAL_V5_LIMITS,
-            ) {
+                        BatchEntryKind::PutPrefixed | BatchEntryKind::PutRaw => {
+                            let value = match kind {
+                                BatchEntryKind::PutPrefixed => value.to_vec(),
+                                BatchEntryKind::PutRaw => {
+                                    let mut prefixed = Vec::with_capacity(1 + value.len());
+                                    prefixed.push(crate::vlog::KvKind::Inline as u8);
+                                    prefixed.extend_from_slice(value);
+                                    prefixed
+                                }
+                                BatchEntryKind::Delete => unreachable!(),
+                            };
+                            crate::pitr::WalEntry::Put {
+                                key: key.to_vec(),
+                                value,
+                            }
+                        }
+                    })
+                    .collect();
+                memtable.write_pitr_wal_batch_only(
+                    &crate::pitr::WalBatch {
+                        commit_ts,
+                        recorded_at,
+                        entries: wal_entries,
+                    },
+                    crate::pitr::LIVE_WAL_V5_LIMITS,
+                )
+            };
+            let ticket = match ticket_result {
                 Ok(ticket) => ticket,
                 Err(error) => {
                     self.record_wal_append_failure(memtable, commit_ts);

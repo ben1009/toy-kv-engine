@@ -22,9 +22,9 @@ use crate::{
             WalV7FrontierReservation, WalV7PhysicalAllocator,
         },
         codec::{
-            WAL_V7_FRAME_LEN, WAL_V7_HEADER_LEN, WalV7Frontier, WalV7Header, data_fragment_count,
-            encode_data_frames_into, encode_frontier_successor_into, frame_record_digest,
-            prepare_logical_batch,
+            PreparedWalV7LogicalBatch, WAL_V7_FRAME_LEN, WAL_V7_HEADER_LEN, WalV7Frontier,
+            WalV7Header, data_fragment_count, encode_data_frames_into,
+            encode_frontier_successor_into, frame_record_digest, prepare_logical_batch,
         },
         install::{WalV7RuntimeMetadata, WalV7RuntimeSeed},
         leader::WalV7LeaderCapacityError,
@@ -68,6 +68,15 @@ impl std::fmt::Display for WalFull {
 }
 
 impl std::error::Error for WalFull {}
+
+/// A v7 batch whose canonical entry stream and scratch reservation were
+/// prepared before the caller enters the MVCC write sequencer.
+pub(crate) struct WalV7PreparedBatch<'a> {
+    prepared: PreparedWalV7LogicalBatch<'a>,
+    owner: Arc<WalV7ReservationOwner>,
+    preparation: Option<crate::wal::v7::admission::WalV7OwnedPreparationReservation>,
+    limits: WalV5Limits,
+}
 
 /// Coordinates and resource owner from which a parallel runtime begins admission.
 pub(crate) struct ParallelWalRuntimeStart {
@@ -970,9 +979,13 @@ impl ParallelWalRuntime {
         ))
     }
 
-    /// Prepare and admit one v7 ticket into the ordered parallel DATA packer.
-    /// The caller publishes the returned ticket only after `wait_durable`.
-    pub(crate) fn put_v7_batch(&self, batch: &WalBatch, limits: WalV5Limits) -> Result<(u64, u64)> {
+    /// Validate a v7 batch and hold its temporary preparation charge. Callers
+    /// may retain this value while assigning ordered MVCC metadata.
+    pub(crate) fn prepare_v7_batch<'a>(
+        &self,
+        batch: &'a WalBatch,
+        limits: WalV5Limits,
+    ) -> Result<WalV7PreparedBatch<'a>> {
         ensure!(!batch.entries.is_empty(), "v7 WAL batch is empty");
         let limits = WalV5Limits {
             max_input_entry_count: limits
@@ -1005,6 +1018,37 @@ impl ParallelWalRuntime {
         let preparation_bytes = CanonicalWalEntryStream::preparation_buffer_bytes(batch, limits)?;
         let preparation = owner.reserve_preparation_buffer(preparation_bytes)?;
         let prepared = prepare_logical_batch(batch, limits)?;
+
+        Ok(WalV7PreparedBatch {
+            prepared,
+            owner,
+            preparation,
+            limits,
+        })
+    }
+
+    /// Prepare and admit one v7 ticket into the ordered parallel DATA packer.
+    /// The caller publishes the returned ticket only after `wait_durable`.
+    pub(crate) fn put_v7_batch(&self, batch: &WalBatch, limits: WalV5Limits) -> Result<(u64, u64)> {
+        let commit_ts = batch.commit_ts;
+        let recorded_at = batch.recorded_at;
+        let prepared = self.prepare_v7_batch(batch, limits)?;
+        self.put_v7_prepared_batch(prepared, commit_ts, recorded_at)
+    }
+
+    /// Admit a previously prepared batch with ordered MVCC metadata.
+    pub(crate) fn put_v7_prepared_batch(
+        &self,
+        prepared_batch: WalV7PreparedBatch<'_>,
+        commit_ts: u64,
+        sampled_recorded_at: crate::pitr::RecordedAt,
+    ) -> Result<(u64, u64)> {
+        let WalV7PreparedBatch {
+            prepared,
+            owner,
+            preparation,
+            limits,
+        } = prepared_batch;
 
         let encoded_batch_bytes =
             u64::try_from(prepared.encoded_len()).context("v7 logical batch length exceeds u64")?;
@@ -1070,17 +1114,17 @@ impl ParallelWalRuntime {
                     metadata.last_commit_ts
                 });
             ensure!(
-                batch.commit_ts > last_commit_ts,
+                commit_ts > last_commit_ts,
                 "v7 Parallel batch commit timestamp does not advance"
             );
             let recorded_at = admission
                 .v7_metadata
                 .as_ref()
                 .and_then(|metadata| metadata.last_recorded_at)
-                .map_or(batch.recorded_at, |previous| {
-                    previous.max(batch.recorded_at)
+                .map_or(sampled_recorded_at, |previous| {
+                    previous.max(sampled_recorded_at)
                 });
-            let logical_batch = prepared.encode_with_recorded_at(ticket, recorded_at)?;
+            let logical_batch = prepared.encode_with_metadata(ticket, commit_ts, recorded_at)?;
             drop(preparation);
             let next_ticket = ticket
                 .checked_add(1)
@@ -1133,7 +1177,7 @@ impl ParallelWalRuntime {
                     admission.v7_prefixes.insert(
                         next_ticket,
                         WalV7PrefixMetadata {
-                            last_commit_ts: batch.commit_ts,
+                            last_commit_ts: commit_ts,
                             prefix_digest,
                         },
                     );
