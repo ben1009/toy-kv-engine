@@ -129,6 +129,28 @@ impl std::fmt::Display for PitrManifestPublicationError {
 
 impl std::error::Error for PitrManifestPublicationError {}
 
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+struct V7ActiveBoundaryNotPublished(anyhow::Error);
+
+#[cfg(target_os = "linux")]
+impl std::fmt::Display for V7ActiveBoundaryNotPublished {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "Active v7 manifest boundary was not published: {}",
+            self.0
+        )
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl std::error::Error for V7ActiveBoundaryNotPublished {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.0.as_ref())
+    }
+}
+
 /// Holds the PITR archiver while a call needs it exclusively, and returns it to
 /// its slot on the way out - including when the call unwinds. Without the guard
 /// a panic would leave the slot empty, and every later archival path treats an
@@ -2194,9 +2216,9 @@ pub struct KvEngine {
     /// Set when a PITR manifest transition failed in a way that could not be
     /// resolved to durable-or-absent. Retrying an enable would then risk a
     /// second timeline/epoch, so a reopen must re-read the manifest first.
-    pitr_publication_unknown: AtomicBool,
+    pitr_publication_unknown: Arc<AtomicBool>,
     /// Persisted PITR state snapshot used by the status projection.
-    pitr_manifest_state: Mutex<crate::pitr::manifest::PitrState>,
+    pitr_manifest_state: Arc<Mutex<crate::pitr::manifest::PitrState>>,
     /// Independent PITR segment lifecycle, reconstructed from persisted state.
     pitr_segments: Mutex<Option<crate::pitr::segment::PitrSegmentManager>>,
     #[cfg(target_os = "linux")]
@@ -2477,8 +2499,8 @@ impl KvEngine {
             async_close: async_close::AsyncClose::default(),
             pitr_runtime: Mutex::new(None),
             pitr_operation_lock: Mutex::new(()),
-            pitr_publication_unknown: AtomicBool::new(false),
-            pitr_manifest_state: Mutex::new(pitr_state),
+            pitr_publication_unknown: Arc::new(AtomicBool::new(false)),
+            pitr_manifest_state: Arc::new(Mutex::new(pitr_state)),
             pitr_segments: Mutex::new(None),
             #[cfg(target_os = "linux")]
             pitr_archiver: Mutex::new(None),
@@ -5046,8 +5068,9 @@ impl KvEngine {
     /// Sync the active WAL to a fixed admission cutoff.
     ///
     /// For an Active v7 PITR WAL, this drains currently admitted commits before
-    /// syncing the WAL, then resumes admission only when it was open before the
-    /// barrier and the sync succeeds.
+    /// syncing the WAL and persisting the resulting logical boundary in the
+    /// PITR manifest. It resumes previously open admission after success or a
+    /// manifest append confirmed absent. Uncertain outcomes keep admission closed.
     pub fn sync(&self) -> Result<()> {
         crate::profile_scope!("kv.sync", self.sync_inner())
     }
@@ -5055,7 +5078,13 @@ impl KvEngine {
     fn sync_inner(&self) -> Result<()> {
         #[cfg(target_os = "linux")]
         {
-            Self::sync_inner_with_admission(&self.inner, &self.pitr_barrier_lock, None)
+            Self::sync_inner_with_admission(
+                &self.inner,
+                &self.pitr_barrier_lock,
+                Arc::clone(&self.pitr_manifest_state),
+                Arc::clone(&self.pitr_publication_unknown),
+                None,
+            )
         }
 
         #[cfg(not(target_os = "linux"))]
@@ -5068,6 +5097,8 @@ impl KvEngine {
     fn sync_inner_with_admission(
         inner: &LsmStorageInner,
         pitr_barrier_lock: &Mutex<()>,
+        pitr_manifest_state: Arc<Mutex<crate::pitr::manifest::PitrState>>,
+        pitr_publication_unknown: Arc<AtomicBool>,
         mut lifecycle_guard: Option<AdmissionGuard>,
     ) -> Result<()> {
         if inner.state.load().memtable.uses_v7_wal() {
@@ -5075,6 +5106,10 @@ impl KvEngine {
                 lifecycle_guard = Some(inner.lifecycle.admit_write()?);
             }
             let _pitr_barrier = pitr_barrier_lock.lock();
+            ensure!(
+                !pitr_publication_unknown.load(Ordering::Acquire),
+                "Active v7 sync cannot append a manifest boundary while a PITR transition has an unknown outcome; reopen the database first"
+            );
             // The lifecycle guard is the admission point. If close begins
             // while this operation waits on the PITR barrier, close must drain
             // this admitted sync instead of rejecting it here.
@@ -5087,17 +5122,149 @@ impl KvEngine {
                     .ok_or_else(|| anyhow!("Active v7 PITR sync requires MVCC"))?;
                 let admission_was_open = sequencer.commit_admission_is_open();
                 sequencer.stop_commit_admission_and_capture()?;
-                let result = active_memtable.sync_wal();
-                if result.is_ok() && admission_was_open {
+                active_memtable.sync_wal()?;
+                let boundaries = active_memtable.v7_active_boundaries()?;
+                drop(_active_memtable_guard);
+                let publication = Self::persist_v7_active_boundary(
+                    inner,
+                    &pitr_manifest_state,
+                    &pitr_publication_unknown,
+                    boundaries,
+                );
+                if let Err(error) = publication {
+                    if admission_was_open
+                        && error
+                            .downcast_ref::<V7ActiveBoundaryNotPublished>()
+                            .is_some()
+                    {
+                        sequencer.resume_commit_admission();
+                    }
+                    return Err(error);
+                }
+                if admission_was_open {
                     sequencer.resume_commit_admission();
                 }
-                return result;
+                return Ok(());
             }
         }
 
         let result = inner.sync();
         drop(lifecycle_guard);
         result
+    }
+
+    #[cfg(target_os = "linux")]
+    fn persist_v7_active_boundary(
+        inner: &LsmStorageInner,
+        pitr_manifest_state: &Mutex<crate::pitr::manifest::PitrState>,
+        pitr_publication_unknown: &AtomicBool,
+        boundaries: (
+            crate::pitr::manifest::ActiveBoundary,
+            crate::pitr::manifest::ActiveBoundary,
+        ),
+    ) -> Result<()> {
+        let (empty_boundary, active_boundary) = boundaries;
+        let state_lock = inner.state_lock.lock();
+        let current_state = pitr_manifest_state.lock().clone();
+        ensure!(
+            current_state == *inner.pitr_state.lock(),
+            "PITR manifest state projections diverged before Active boundary publication"
+        );
+        ensure!(
+            current_state.mode == crate::pitr::manifest::PitrMode::Enabled,
+            "Active v7 boundary publication requires enabled PITR"
+        );
+        ensure!(
+            current_state.active_segment_id == Some(active_boundary.segment_id)
+                && current_state.timeline_id == Some(active_boundary.timeline_id)
+                && current_state.archive_epoch_id == Some(active_boundary.archive_epoch_id),
+            "Active v7 boundary identity disagrees with PITR manifest state"
+        );
+        let manifest = inner
+            .manifest
+            .as_ref()
+            .ok_or_else(|| anyhow!("manifest is not initialized"))?;
+
+        let mut boundary_records = Vec::with_capacity(2);
+        match current_state.active_boundary {
+            Some(previous) => {
+                ensure!(
+                    previous.timeline_id == empty_boundary.timeline_id
+                        && previous.archive_epoch_id == empty_boundary.archive_epoch_id
+                        && previous.segment_id == empty_boundary.segment_id
+                        && previous.incarnation == empty_boundary.incarnation,
+                    "Active v7 boundary incarnation changed during sync"
+                );
+                if active_boundary == previous {
+                    manifest.ensure_durability_certain()?;
+                    return Ok(());
+                }
+                boundary_records.push(
+                    crate::pitr::manifest::PitrManifestRecord::ActiveBoundaryAdvanced {
+                        boundary: active_boundary,
+                    },
+                );
+            }
+            None => {
+                boundary_records.push(
+                    crate::pitr::manifest::PitrManifestRecord::ActiveBoundaryAdvanced {
+                        boundary: empty_boundary,
+                    },
+                );
+                if active_boundary != empty_boundary {
+                    boundary_records.push(
+                        crate::pitr::manifest::PitrManifestRecord::ActiveBoundaryAdvanced {
+                            boundary: active_boundary,
+                        },
+                    );
+                }
+            }
+        }
+
+        let next_state = crate::pitr::manifest::replay_pitr_records(
+            std::iter::once(crate::pitr::manifest::PitrManifestRecord::Snapshot(
+                Box::new(current_state.clone()),
+            ))
+            .chain(boundary_records.iter().cloned()),
+        )?;
+        next_state.validate_for_status()?;
+        let records = boundary_records
+            .into_iter()
+            .map(ManifestRecord::Pitr)
+            .collect::<Vec<_>>();
+        let length_before = manifest.current_length()?;
+        if let Err(error) = manifest.add_records(&state_lock, &records) {
+            match manifest.revalidate_appended_records(&records, length_before) {
+                Ok(true) => {
+                    // Readable appended bytes do not prove durability. Keep
+                    // retries blocked even if the failure occurred before the
+                    // manifest sync helper could poison its own descriptor.
+                    pitr_publication_unknown.store(true, Ordering::Release);
+                    *inner.pitr_state.lock() = next_state.clone();
+                    *pitr_manifest_state.lock() = next_state;
+                    return Err(anyhow::Error::new(
+                        PitrManifestPublicationError::PublishedButNotDurable(error),
+                    ));
+                }
+                Ok(false) => {
+                    // Absence of this append cannot clear manifest poison
+                    // left by an earlier operation.
+                    manifest.ensure_durability_certain()?;
+                    return Err(anyhow::Error::new(V7ActiveBoundaryNotPublished(error)));
+                }
+                Err(revalidation_error) => {
+                    pitr_publication_unknown.store(true, Ordering::Release);
+                    return Err(anyhow::Error::new(PitrManifestPublicationError::Unknown {
+                        source: error,
+                        revalidation_error,
+                    }));
+                }
+            }
+        }
+
+        *inner.pitr_state.lock() = next_state.clone();
+        *pitr_manifest_state.lock() = next_state;
+        Ok(())
     }
 
     pub fn scan(&self, lower: Bound<&[u8]>, upper: Bound<&[u8]>) -> Result<ScanIterator> {
@@ -5659,8 +5826,8 @@ impl KvEngine {
             async_close: async_close::AsyncClose::default(),
             pitr_runtime: Mutex::new(None),
             pitr_operation_lock: Mutex::new(()),
-            pitr_publication_unknown: AtomicBool::new(false),
-            pitr_manifest_state: Mutex::new(pitr_state),
+            pitr_publication_unknown: Arc::new(AtomicBool::new(false)),
+            pitr_manifest_state: Arc::new(Mutex::new(pitr_state)),
             pitr_segments: Mutex::new(None),
             #[cfg(target_os = "linux")]
             pitr_archiver: Mutex::new(None),
@@ -5889,12 +6056,22 @@ impl KvEngine {
         let inner = self.inner.clone();
         #[cfg(target_os = "linux")]
         let pitr_barrier_lock = Arc::clone(&self.pitr_barrier_lock);
+        #[cfg(target_os = "linux")]
+        let pitr_manifest_state = Arc::clone(&self.pitr_manifest_state);
+        #[cfg(target_os = "linux")]
+        let pitr_publication_unknown = Arc::clone(&self.pitr_publication_unknown);
         self.inner
             .blocking
             .run_result(move || {
                 #[cfg(target_os = "linux")]
                 {
-                    Self::sync_inner_with_admission(&inner, &pitr_barrier_lock, Some(guard))
+                    Self::sync_inner_with_admission(
+                        &inner,
+                        &pitr_barrier_lock,
+                        pitr_manifest_state,
+                        pitr_publication_unknown,
+                        Some(guard),
+                    )
                 }
 
                 #[cfg(not(target_os = "linux"))]
@@ -15194,6 +15371,113 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn failpoint_v7_sync_keeps_admission_closed_after_prior_manifest_poison() -> anyhow::Result<()>
+    {
+        for asynchronous in [false, true] {
+            let directory = tempdir()?;
+            let options = v7_recovery_test_database(directory.path())?;
+            let database = directory.path().join("db");
+            let engine = KvEngine::open(&database, options)?;
+            engine.put(b"before-manifest-poison", b"durable")?;
+            let state_before = engine.pitr_manifest_state.lock().clone();
+            let manifest_path = database.join("MANIFEST");
+            let manifest_before = std::fs::read(&manifest_path)?;
+            let manifest = engine.inner.manifest.as_ref().unwrap();
+
+            // An independent manifest sync can fail while commit admission is
+            // still open. The next boundary append is absent because this
+            // poisoned handle rejects it before writing any bytes.
+            crate::manifest::set_manifest_sync_failure(&manifest_path);
+            assert!(manifest.sync(&engine.inner.state_lock.lock()).is_err());
+            let sequencer = engine.inner.mvcc.as_ref().unwrap();
+            assert!(sequencer.commit_admission_is_open());
+
+            for _ in 0..2 {
+                let error = sync_for_test(&engine, asynchronous).unwrap_err();
+                assert!(
+                    error
+                        .to_string()
+                        .contains("manifest durability is uncertain")
+                );
+                assert!(
+                    !sequencer.commit_admission_is_open(),
+                    "an absent append must not reopen a poisoned manifest"
+                );
+                assert_eq!(*engine.pitr_manifest_state.lock(), state_before);
+                assert_eq!(*engine.inner.pitr_state.lock(), state_before);
+                assert_eq!(std::fs::read(&manifest_path)?, manifest_before);
+            }
+            assert!(engine.put(b"after-manifest-poison", b"rejected").is_err());
+            engine.close_storage()?;
+        }
+
+        Ok(())
+    }
+
+    #[cfg(all(target_os = "linux", feature = "chaos-testing"))]
+    #[test]
+    fn failpoint_v7_sync_unsynced_boundary_requires_reopen_before_retry() -> anyhow::Result<()> {
+        let scenario = crate::chaos::failpoint::FailScenario::setup();
+        for asynchronous in [false, true] {
+            let directory = tempdir()?;
+            let options = v7_recovery_test_database(directory.path())?;
+            let database = directory.path().join("db");
+            let engine = KvEngine::open(&database, options.clone())?;
+            engine.put(b"before-unsynced-boundary", b"durable")?;
+            let previous = engine.pitr_manifest_state.lock().active_boundary.unwrap();
+
+            // The complete append is visible, but this failure occurs before
+            // Manifest's sync helper can set its own poison flag.
+            fail::cfg("manifest.after_append_before_sync", "return").map_err(anyhow::Error::msg)?;
+            let publication = sync_for_test(&engine, asynchronous);
+            fail::remove("manifest.after_append_before_sync");
+            let error = publication.unwrap_err();
+            assert!(matches!(
+                error.downcast_ref::<super::PitrManifestPublicationError>(),
+                Some(super::PitrManifestPublicationError::PublishedButNotDurable(
+                    _
+                ))
+            ));
+            let published = engine.pitr_manifest_state.lock().active_boundary.unwrap();
+            assert!(published.ticket_end > previous.ticket_end);
+            let manifest_after = std::fs::read(database.join("MANIFEST"))?;
+
+            assert!(
+                sync_for_test(&engine, asynchronous).is_err(),
+                "a visible unsynced boundary must not make a retry report success"
+            );
+            assert!(
+                !engine
+                    .inner
+                    .mvcc
+                    .as_ref()
+                    .unwrap()
+                    .commit_admission_is_open()
+            );
+            assert_eq!(std::fs::read(database.join("MANIFEST"))?, manifest_after);
+            assert!(engine.put(b"after-unsynced-boundary", b"rejected").is_err());
+            engine.close_storage()?;
+            drop(engine);
+
+            let reopened = KvEngine::open(&database, options)?;
+            assert_eq!(
+                reopened.pitr_manifest_state.lock().active_boundary,
+                Some(published)
+            );
+            assert_eq!(
+                reopened.get(b"before-unsynced-boundary")?,
+                Some(Bytes::from_static(b"durable"))
+            );
+            reopened.put(b"after-reopen", b"accepted")?;
+            reopened.close()?;
+        }
+        scenario.teardown();
+
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn v7_sync_apis_drain_admitted_commits_and_preserve_paused_admission() -> anyhow::Result<()> {
         use std::{sync::mpsc, time::Duration};
 
@@ -15343,6 +15627,8 @@ mod tests {
         let sync_result = KvEngine::sync_inner_with_admission(
             &engine.inner,
             &engine.pitr_barrier_lock,
+            Arc::clone(&engine.pitr_manifest_state),
+            Arc::clone(&engine.pitr_publication_unknown),
             Some(admission),
         );
         let admission_reopened = sequencer.commit_admission_is_open();
