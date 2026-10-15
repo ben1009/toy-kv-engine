@@ -28,6 +28,9 @@ preparation and ordered durability/publication path. V7 batch limits are checked
 before copying caller ranges, and the temporary owned range/PITR buffers are
 charged before allocation. Cancellation ownership is covered through close and
 recovery. Other range formats and OCC retain their existing blocking paths.
+The `put_with_ttl_async` convenience API now uses the same native point-batch
+path where available and preserves whole-second TTL rounding; Leader and legacy
+formats continue through the existing blocking write path.
 The ordinary memtable size target does not freeze the
 Active v7 memtable; segment and spool admission limits still apply while v7
 rotation remains pending. Public close drains and syncs

@@ -5680,6 +5680,11 @@ impl KvEngine {
 
 // ── Async API (RFC 014 Phase 1) ─────────────────────────────────────
 
+fn ttl_duration_secs_rounded_up(ttl: Duration) -> u64 {
+    ttl.as_secs()
+        .saturating_add(u64::from(ttl.subsec_nanos() > 0))
+}
+
 impl KvEngine {
     /// Eagerly dispatches the PITR enable transition to the blocking pool.
     #[cfg(target_os = "linux")]
@@ -5944,6 +5949,44 @@ impl KvEngine {
             .run_result(move || {
                 let _guard = guard;
                 inner.put(&key, &value)
+            })
+            .await
+    }
+
+    /// Write a key-value pair with a time-to-live duration asynchronously.
+    /// Stored expiration times have whole-second precision, so sub-second TTLs
+    /// are rounded up to the next second.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the value is the tombstone marker, the key exceeds
+    /// the configured limit, or the write cannot be admitted or made durable.
+    pub async fn put_with_ttl_async(
+        &self,
+        key: &[u8],
+        value: &[u8],
+        ttl: std::time::Duration,
+    ) -> Result<()> {
+        ensure!(
+            !(value.len() == 1 && value[0] == crate::vlog::KvKind::Tombstone as u8),
+            "value must not be the tombstone marker byte (0x02)"
+        );
+        if self.inner.uses_native_async_writes() {
+            let ttl_secs = ttl_duration_secs_rounded_up(ttl);
+            return self
+                .write_batch_async(&[WriteBatchRecord::PutWithTtl(key, value, ttl_secs)])
+                .await;
+        }
+
+        let guard = self.inner.lifecycle.admit_write()?;
+        let inner = self.inner.clone();
+        let key = key.to_vec();
+        let value = value.to_vec();
+        self.inner
+            .blocking
+            .run_result(move || {
+                let _guard = guard;
+                inner.put_with_ttl(&key, &value, ttl)
             })
             .await
     }
@@ -15872,6 +15915,46 @@ mod tests {
             Some(Bytes::from_static(b"durable"))
         );
         reopened.close_storage()?;
+
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn v7_async_ttl_convenience_writes_survive_close_and_recovery() -> anyhow::Result<()> {
+        for mode in [
+            crate::wal::WalIoMode::Parallel,
+            crate::wal::WalIoMode::Leader,
+        ] {
+            let directory = tempdir()?;
+            let options = v7_recovery_test_database(directory.path())?;
+            let database = directory.path().join("db");
+            let engine = KvEngine::open_with_wal_io_mode(&database, options.clone(), mode)?;
+            let active = engine.inner.state.load().memtable.clone();
+            assert!(active.uses_v7_wal());
+            assert_eq!(
+                active.uses_parallel_wal(),
+                matches!(mode, crate::wal::WalIoMode::Parallel)
+            );
+
+            engine
+                .put_with_ttl_async(b"ttl", b"live", std::time::Duration::from_secs(3_600))
+                .await?;
+            engine
+                .put_with_ttl_async(b"expired", b"gone", std::time::Duration::ZERO)
+                .await?;
+            assert_eq!(engine.get(b"ttl")?, Some(Bytes::from_static(b"live")));
+            assert_eq!(engine.get(b"expired")?, None);
+            engine.close_async().await?;
+            drop(active);
+            drop(engine);
+
+            let reopened = KvEngine::open_with_wal_io_mode(&database, options, mode)?;
+            assert!(reopened.inner.state.load().memtable.uses_v7_wal());
+            assert_eq!(reopened.get(b"ttl")?, Some(Bytes::from_static(b"live")));
+            assert_eq!(reopened.get(b"expired")?, None);
+            reopened.close_async().await?;
+        }
 
         Ok(())
     }
