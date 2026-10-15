@@ -6,6 +6,8 @@
 //! is accepted only when it binds to the supplied header and source image.
 #![allow(dead_code)]
 
+use std::io::{Read, Seek, SeekFrom};
+
 use anyhow::{Context, Result, ensure};
 use sha2::{Digest, Sha256};
 
@@ -745,15 +747,31 @@ pub(crate) fn build_v7_seal(
     active: ActiveBoundary,
     predecessor: ChainAnchor,
 ) -> Result<(V7Seal, Vec<u8>)> {
+    let mut reader = std::io::Cursor::new(wal);
+    build_v7_seal_from_reader(&mut reader, u64::try_from(wal.len())?, active, predecessor)
+}
+
+/// Build a v7 seal from exactly `[0, sealed_end)` of a seekable WAL image.
+///
+/// The caller supplies the terminal marker end captured after stopping
+/// admission. Bytes beyond it, such as unused preallocation, are neither
+/// hashed nor validated as part of the immutable image. Recovery, digest
+/// calculation, and ticket-index construction read bounded chunks from the
+/// source instead of requiring a whole-WAL allocation.
+pub(crate) fn build_v7_seal_from_reader<R: Read + Seek>(
+    reader: &mut R,
+    sealed_end: u64,
+    active: ActiveBoundary,
+    predecessor: ChainAnchor,
+) -> Result<(V7Seal, Vec<u8>)> {
     ensure!(
-        wal.len() >= WAL_V7_HEADER_LEN + WAL_V7_FRAME_LEN,
+        sealed_end >= (WAL_V7_HEADER_LEN + WAL_V7_FRAME_LEN) as u64,
         "v7 PITR WAL is truncated"
     );
     ensure!(
-        wal.len().is_multiple_of(WAL_V7_FRAME_LEN),
+        sealed_end.is_multiple_of(WAL_V7_FRAME_LEN as u64),
         "v7 PITR WAL length is unaligned"
     );
-    let sealed_end = u64::try_from(wal.len())?;
     ensure!(
         sealed_end <= crate::wal::MAX_WAL_FILE_SIZE,
         "v7 PITR sealed image exceeds the WAL format limit"
@@ -761,8 +779,14 @@ pub(crate) fn build_v7_seal(
     let terminal_offset = sealed_end
         .checked_sub(WAL_V7_FRAME_LEN as u64)
         .ok_or_else(|| anyhow::anyhow!("v7 PITR terminal offset underflows"))?;
-    let header_bytes = &wal[..WAL_V7_HEADER_LEN];
-    let header = WalV7Header::decode(header_bytes)?;
+    let mut header_bytes = [0; WAL_V7_HEADER_LEN];
+    reader
+        .seek(SeekFrom::Start(0))
+        .context("seek v7 PITR WAL to its immutable header")?;
+    reader
+        .read_exact(&mut header_bytes)
+        .context("read v7 PITR WAL immutable header")?;
+    let header = WalV7Header::decode(&header_bytes)?;
     ensure!(
         header.encode()? == header_bytes,
         "v7 PITR WAL header is not canonical"
@@ -772,9 +796,8 @@ pub(crate) fn build_v7_seal(
         "v7 PITR WAL predecessor differs from the manifest"
     );
     let header_digest = header.digest()?;
-    let wal_digest: [u8; 32] = Sha256::digest(wal).into();
-    let mut reader = std::io::Cursor::new(wal);
-    let discovery = discover_frontier_candidates(&mut reader, sealed_end, &header_digest)?;
+    let wal_digest = digest_v7_prefix(reader, sealed_end)?;
+    let discovery = discover_frontier_candidates(reader, sealed_end, &header_digest)?;
     let terminal = discovery
         .candidates
         .iter()
@@ -787,7 +810,7 @@ pub(crate) fn build_v7_seal(
         wal_digest,
     };
     let selection = select_recovery_candidate(
-        &mut reader,
+        reader,
         sealed_end,
         &discovery,
         WalV7RecoveryAuthority::Sealed {
@@ -803,7 +826,7 @@ pub(crate) fn build_v7_seal(
     let seal = V7Seal {
         header,
         boundary,
-        entries: collect_v7_seal_entries(wal, header)?,
+        entries: collect_v7_seal_entries(reader, sealed_end, header)?,
     };
     seal.validate()?;
     let bytes = seal.encode()?;
@@ -815,20 +838,68 @@ pub(crate) fn build_v7_seal(
     Ok((seal, bytes))
 }
 
-fn collect_v7_seal_entries(wal: &[u8], header: WalV7Header) -> Result<Vec<V7SealEntry>> {
+fn digest_v7_prefix<R: Read + Seek>(reader: &mut R, sealed_end: u64) -> Result<[u8; 32]> {
+    const HASH_BUFFER_BYTES: usize = 64 * 1024;
+
+    reader
+        .seek(SeekFrom::Start(0))
+        .context("seek v7 PITR WAL to hash its sealed prefix")?;
+    let mut remaining = sealed_end;
+    let mut buffer = [0_u8; HASH_BUFFER_BYTES];
+    let mut hasher = Sha256::new();
+    while remaining > 0 {
+        let read_len = usize::try_from(remaining.min(HASH_BUFFER_BYTES as u64))?;
+        reader
+            .read_exact(&mut buffer[..read_len])
+            .context("read v7 PITR WAL while hashing its sealed prefix")?;
+        hasher.update(&buffer[..read_len]);
+        remaining -= u64::try_from(read_len)?;
+    }
+
+    Ok(hasher.finalize().into())
+}
+
+fn collect_v7_seal_entries<R: Read + Seek>(
+    reader: &mut R,
+    sealed_end: u64,
+    header: WalV7Header,
+) -> Result<Vec<V7SealEntry>> {
     let mut entries = Vec::new();
-    walk_v7_seal_entries(wal, header, crate::pitr::LIVE_WAL_V5_LIMITS, |entry, _| {
-        entries
-            .try_reserve(1)
-            .map_err(|error| anyhow::anyhow!("grow v7 PITR seal index: {error}"))?;
-        entries.push(entry);
-        Ok(())
-    })?;
+    walk_v7_seal_entries_from_reader(
+        reader,
+        sealed_end,
+        header,
+        crate::pitr::LIVE_WAL_V5_LIMITS,
+        |entry, _| {
+            entries
+                .try_reserve(1)
+                .map_err(|error| anyhow::anyhow!("grow v7 PITR seal index: {error}"))?;
+            entries.push(entry);
+            Ok(())
+        },
+    )?;
     Ok(entries)
 }
 
 fn walk_v7_seal_entries(
     wal: &[u8],
+    header: WalV7Header,
+    limits: WalV5Limits,
+    visit_batch: impl FnMut(V7SealEntry, WalBatch) -> Result<()>,
+) -> Result<()> {
+    let mut reader = std::io::Cursor::new(wal);
+    walk_v7_seal_entries_from_reader(
+        &mut reader,
+        u64::try_from(wal.len())?,
+        header,
+        limits,
+        visit_batch,
+    )
+}
+
+fn walk_v7_seal_entries_from_reader<R: Read + Seek>(
+    reader: &mut R,
+    sealed_end: u64,
     header: WalV7Header,
     limits: WalV5Limits,
     mut visit_batch: impl FnMut(V7SealEntry, WalBatch) -> Result<()>,
@@ -837,9 +908,8 @@ fn walk_v7_seal_entries(
     let max_batch_len = WAL_V7_LOGICAL_BATCH_HEADER_LEN
         .checked_add(limits.max_batch_data_bytes)
         .ok_or_else(|| anyhow::anyhow!("v7 PITR batch byte limit overflows"))?;
-    let sealed_end = u64::try_from(wal.len())?;
     ensure!(
-        sealed_end >= WAL_V7_HEADER_LEN as u64 + WAL_V7_FRAME_LEN as u64
+        sealed_end >= (WAL_V7_HEADER_LEN + WAL_V7_FRAME_LEN) as u64
             && sealed_end.is_multiple_of(WAL_V7_FRAME_LEN as u64),
         "v7 PITR WAL image has an invalid length"
     );
@@ -856,14 +926,8 @@ fn walk_v7_seal_entries(
     let mut offset = data_start;
     let mut expected_ticket = 0_u64;
     while offset < terminal_offset {
-        let frame_start = usize::try_from(offset)?;
-        let frame_end = frame_start
-            .checked_add(WAL_V7_FRAME_LEN)
-            .ok_or_else(|| anyhow::anyhow!("v7 PITR frame range overflows"))?;
-        let encoded = wal
-            .get(frame_start..frame_end)
-            .context("v7 PITR frame is truncated before terminal FRONTIER")?;
-        let frame = decode_frame_structural(encoded, offset, &header_digest)?;
+        let encoded = read_v7_seal_frame(reader, offset, terminal_offset)?;
+        let frame = decode_frame_structural(&encoded, offset, &header_digest)?;
         match frame.kind {
             WalV7FrameKind::Frontier => {
                 let frontier = crate::wal::v7::codec::WalV7Frontier::decode_body(&frame.body)?;
@@ -903,15 +967,13 @@ fn walk_v7_seal_entries(
                         fragment_offset < terminal_offset,
                         "v7 PITR DATA batch extends into terminal FRONTIER"
                     );
-                    let fragment_start = usize::try_from(fragment_offset)?;
-                    let fragment_end = fragment_start
-                        .checked_add(WAL_V7_FRAME_LEN)
-                        .ok_or_else(|| anyhow::anyhow!("v7 fragment range overflows"))?;
-                    let fragment_encoded = wal
-                        .get(fragment_start..fragment_end)
-                        .context("v7 PITR DATA fragment is truncated")?;
-                    let fragment_frame =
-                        decode_frame_structural(fragment_encoded, fragment_offset, &header_digest)?;
+                    let fragment_encoded =
+                        read_v7_seal_frame(reader, fragment_offset, terminal_offset)?;
+                    let fragment_frame = decode_frame_structural(
+                        &fragment_encoded,
+                        fragment_offset,
+                        &header_digest,
+                    )?;
                     ensure!(
                         fragment_frame.kind == WalV7FrameKind::Data,
                         "v7 PITR DATA batch is interleaved"
@@ -981,6 +1043,28 @@ fn walk_v7_seal_entries(
         "v7 PITR WAL has bytes between batches and terminal FRONTIER"
     );
     Ok(())
+}
+
+fn read_v7_seal_frame<R: Read + Seek>(
+    reader: &mut R,
+    frame_offset: u64,
+    exclusive_end: u64,
+) -> Result<[u8; WAL_V7_FRAME_LEN]> {
+    let frame_end = frame_offset
+        .checked_add(WAL_V7_FRAME_LEN as u64)
+        .ok_or_else(|| anyhow::anyhow!("v7 PITR frame range overflows"))?;
+    ensure!(
+        frame_end <= exclusive_end,
+        "v7 PITR frame extends past the sealed DATA prefix"
+    );
+    reader
+        .seek(SeekFrom::Start(frame_offset))
+        .with_context(|| format!("seek v7 PITR WAL to frame {frame_offset}"))?;
+    let mut frame = [0; WAL_V7_FRAME_LEN];
+    reader
+        .read_exact(&mut frame)
+        .with_context(|| format!("read v7 PITR WAL frame at {frame_offset}"))?;
+    Ok(frame)
 }
 
 /// Walk a v5-family segment: collect its seal entries, extend `hasher` with

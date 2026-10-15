@@ -922,7 +922,7 @@ impl ParallelWalRuntime {
 
     /// Return the last successfully synced v7 FRONTIER after a caller has
     /// stopped admission and drained its fixed ticket cutoff.
-    pub(crate) fn v7_frontier(&self) -> Result<WalV7Frontier> {
+    pub(crate) fn v7_frontier_cursor(&self) -> Result<WalV7FrontierCursor> {
         let admission = self.inner.admission.lock();
         let allocator = admission
             .v7_allocator
@@ -939,7 +939,7 @@ impl ParallelWalRuntime {
             .context("v7 Parallel runtime has no hash metadata")?
             .validate_frontier(cursor.frontier, frontier_end)?;
 
-        Ok(cursor.frontier)
+        Ok(cursor)
     }
 
     pub(crate) fn allocate_buffer(&self, capacity: usize) -> Result<ParallelBuffer> {
