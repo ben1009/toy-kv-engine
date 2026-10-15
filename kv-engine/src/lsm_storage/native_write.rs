@@ -1,10 +1,12 @@
-//! Native async waits for ordinary, non-serializable v4 point commits.
+//! Native async waits for non-serializable parallel point commits.
 //!
-//! The caller prepares owned entries; an owned task finishes admission,
-//! durability and publication even when the caller drops its response future.
-//! Memtable leases exclude freeze and GC CAS until publication is finished.
-//! Runtime cancellation after admission poisons the unknown commit, while a
-//! ready commit that a predecessor already made visible remains successful.
+//! The caller prepares owned entries; v4 buffers are prepared asynchronously,
+//! while v7 batch encoding stays on the bounded blocking executor. An owned
+//! task finishes admission, durability and publication even when the caller
+//! drops its response future. Memtable leases exclude freeze and GC CAS until
+//! publication is finished. Runtime cancellation after admission poisons the
+//! unknown commit, while a ready commit that a predecessor already made visible
+//! remains successful.
 
 use std::sync::Arc;
 
@@ -14,13 +16,16 @@ use bytes::Bytes;
 use super::{AdmissionGuard, LsmStorageInner};
 use crate::mvcc::{BatchEntryKind, LsmMvccInner};
 
-struct AdmittedCommit<'a> {
-    mvcc: &'a LsmMvccInner,
+/// Owns an admitted timestamp until async durability and publication take over.
+/// V7 returns this guard from the blocking executor so cancellation while
+/// awaiting the worker result poisons the sequencer instead of leaking a gap.
+struct AdmittedCommit {
+    mvcc: Arc<LsmMvccInner>,
     timestamp: u64,
     finished: bool,
 }
 
-impl Drop for AdmittedCommit<'_> {
+impl Drop for AdmittedCommit {
     fn drop(&mut self) {
         if !self.finished {
             self.mvcc.cancel_admitted_commit(self.timestamp);
@@ -54,10 +59,13 @@ impl LsmStorageInner {
             let preparation = mvcc.native_preparation_permit().await?;
             let lease = self.active_memtable_lock.read_async().await;
             let memtable = self.state.load().memtable.clone();
-            if !memtable.uses_parallel_wal() || memtable.uses_pitr_batch_wal() {
-                // Native preparation builds v4 buffers. PITR batches manage
-                // their own buffers, including Parallel v7, so perform their
-                // preparation and admission on the blocking executor.
+            if !memtable.uses_parallel_wal()
+                || (memtable.uses_pitr_batch_wal() && !memtable.uses_v7_wal())
+            {
+                // v5/v6 use their blocking Leader barrier; v7 Leader also has
+                // no async durability waiter. V7 Parallel uses the common
+                // async completion path below, but keeps encoding and resource
+                // admission on the bounded blocking executor.
                 drop(lease);
                 drop(preparation);
                 let inner = Arc::clone(self);
@@ -69,29 +77,72 @@ impl LsmStorageInner {
                     })
                     .await;
             }
-            let entries_size = match encoded_size {
-                Some(size) => size,
-                None => {
-                    let size = LsmMvccInner::point_batch_wal_size(&entries)?;
-                    encoded_size = Some(size);
-                    size
-                }
-            };
-            let buffer = memtable.prepare_wal_buffer_async(entries_size).await?;
             #[cfg(feature = "bench")]
             let started = std::time::Instant::now();
-            let result = mvcc.write_batch_wal_only_prepared(
-                &entries,
-                &memtable,
-                shared_publish_bytes,
-                buffer,
-            );
+            let result = if memtable.uses_v7_wal() {
+                let append_mvcc = Arc::clone(mvcc);
+                let append_memtable = Arc::clone(&memtable);
+                let append_entries = entries.clone();
+                let append_admission = Arc::clone(&admission);
+                self.blocking
+                    .run_result(move || {
+                        let _admission = append_admission;
+                        append_mvcc
+                            .write_batch_wal_only(
+                                &append_entries,
+                                &append_memtable,
+                                shared_publish_bytes,
+                            )
+                            .map(|(timestamp, data, ticket)| {
+                                (
+                                    AdmittedCommit {
+                                        mvcc: Arc::clone(&append_mvcc),
+                                        timestamp,
+                                        finished: false,
+                                    },
+                                    data,
+                                    ticket,
+                                )
+                            })
+                    })
+                    .await
+                    .map(Some)
+            } else {
+                let entries_size = match encoded_size {
+                    Some(size) => size,
+                    None => {
+                        let size = LsmMvccInner::point_batch_wal_size(&entries)?;
+                        encoded_size = Some(size);
+                        size
+                    }
+                };
+                let buffer = memtable.prepare_wal_buffer_async(entries_size).await?;
+                mvcc.write_batch_wal_only_prepared(
+                    &entries,
+                    &memtable,
+                    shared_publish_bytes,
+                    buffer,
+                )
+                .map(|prepared| {
+                    prepared.map(|(timestamp, data, ticket)| {
+                        (
+                            AdmittedCommit {
+                                mvcc: Arc::clone(mvcc),
+                                timestamp,
+                                finished: false,
+                            },
+                            data,
+                            ticket,
+                        )
+                    })
+                })
+            };
             drop(preparation);
             #[cfg(feature = "bench")]
             self.write_profile
                 .record_mvcc_wal_only_ns(started.elapsed().as_nanos() as u64);
 
-            let (timestamp, data, ticket) = match result {
+            let (mut commit, data, ticket) = match result {
                 Ok(Some(prepared)) => prepared,
                 Ok(None) => {
                     drop(lease);
@@ -118,11 +169,7 @@ impl LsmStorageInner {
                 }
             };
 
-            let mut commit = AdmittedCommit {
-                mvcc,
-                timestamp,
-                finished: false,
-            };
+            let timestamp = commit.timestamp;
             #[cfg(test)]
             self.pause_native_write(NativeWriteStage::Admitted, timestamp)
                 .await;
@@ -130,15 +177,17 @@ impl LsmStorageInner {
             #[cfg(test)]
             self.pause_native_write(NativeWriteStage::Durable, timestamp)
                 .await;
-            Self::publish_deferred_batch_or_poison(&memtable, data, mvcc, timestamp)?;
-            mvcc.publish_commit_ts_async(timestamp).await?;
+            Self::publish_deferred_batch_or_poison(&memtable, data, &commit.mvcc, timestamp)?;
+            commit.mvcc.publish_commit_ts_async(timestamp).await?;
             commit.finished = true;
             drop(commit);
             drop(lease);
 
-            // Freeze may create files, drain writers and join WAL threads.
-            // Keep it off the executor and keep close waiting for its owner.
-            if self.state.load().memtable.approximate_size() >= self.options.target_sst_size {
+            // PITR uses this hook to start/check active-segment maintenance after
+            // every write. Ordinary WALs only need a freeze check at the size threshold.
+            if memtable.uses_pitr_batch_wal()
+                || self.state.load().memtable.approximate_size() >= self.options.target_sst_size
+            {
                 let inner = Arc::clone(self);
                 return self
                     .blocking
@@ -232,6 +281,20 @@ mod tests {
         })
         .await
         .expect("condition must become true");
+    }
+
+    #[test]
+    fn dropped_worker_admission_poisons_the_commit_sequencer() {
+        let mvcc = Arc::new(LsmMvccInner::new(0));
+        let timestamp = mvcc.reserve_commit_ts().unwrap();
+        drop(AdmittedCommit {
+            mvcc: Arc::clone(&mvcc),
+            timestamp,
+            finished: false,
+        });
+
+        assert!(mvcc.reserve_commit_ts().is_err());
+        assert_eq!(mvcc.latest_commit_ts(), 0);
     }
 
     #[tokio::test(flavor = "current_thread")]

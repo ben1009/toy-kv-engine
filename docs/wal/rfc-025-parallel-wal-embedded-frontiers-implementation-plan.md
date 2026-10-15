@@ -17,9 +17,10 @@ can run; replacing that file with a legacy image cannot bypass its durable
 floor. At startup, the recovered Active image remains commit-fenced until PITR
 resume validates repository identity and reconciles archive obligations.
 Successful resume now opens admission for synchronous and asynchronous public
-point writes through the v7 batch durability path. Async v7 commits use the
-engine's blocking executor and the selected WAL pipeline, avoiding unused v4
-preparation buffers; native v7 preparation remains future work. The ordinary
+point writes through the v7 batch durability path. Async v7 Parallel point
+commits use the bounded blocking executor for batch encoding and admission,
+then await WAL durability and ordered MVCC publication asynchronously; native
+v7 preparation remains future work. The ordinary
 memtable size target does not freeze the Active v7 memtable; segment and spool admission limits
 still apply while v7 rotation remains pending. Public close drains and syncs
 the Active v7 WAL for recovery without emitting a final recovery point. It stops

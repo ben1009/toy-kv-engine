@@ -5982,11 +5982,12 @@ impl KvEngine {
 
     /// Async write batch.
     ///
-    /// With an ordinary parallel v4 WAL, non-serializable point batches await
-    /// durability and ordered publication without occupying a blocking thread.
-    /// After dispatch, cancelling the caller's wait does not cancel its owned
-    /// commit; its outcome can remain unknown to that caller. Shutdown drains
-    /// the commit before closing the WAL.
+    /// With a parallel WAL, non-serializable point batches await durability and
+    /// ordered publication without occupying a blocking thread. V7 encoding
+    /// and admission still run on the bounded blocking executor. After dispatch,
+    /// cancelling the caller's wait does not cancel its owned commit; its
+    /// outcome can remain unknown to that caller. Shutdown drains the commit
+    /// before closing the WAL.
     pub async fn write_batch_async<T: AsRef<[u8]>>(
         &self,
         batch: &[WriteBatchRecord<T>],
@@ -15720,6 +15721,89 @@ mod tests {
         );
         assert_eq!(
             reopened.get(b"async-write")?,
+            Some(Bytes::from_static(b"durable"))
+        );
+        reopened.close_storage()?;
+
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn v7_async_write_checks_pitr_maintenance_below_sst_size_threshold() -> anyhow::Result<()>
+    {
+        let directory = tempdir()?;
+        let mut options = v7_recovery_test_database(directory.path())?;
+        options.target_sst_size = usize::MAX;
+        let engine = KvEngine::open_async(directory.path().join("db"), options).await?;
+
+        assert!(engine.inner.pitr_active_started_at.lock().is_none());
+        assert!(engine.inner.state.load().memtable.approximate_size() < usize::MAX);
+
+        engine.put_async(b"low-volume", b"value").await?;
+
+        assert!(
+            engine.inner.pitr_active_started_at.lock().is_some(),
+            "a low-volume v7 write must initialize the PITR maintenance timer"
+        );
+        engine.close_async().await?;
+
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn v7_native_async_cancelled_caller_keeps_commit_owned_and_close_drains_it()
+    -> anyhow::Result<()> {
+        let directory = tempdir()?;
+        let options = v7_recovery_test_database(directory.path())?;
+        let database = directory.path().join("db");
+        let engine = KvEngine::open_with_wal_io_mode(
+            &database,
+            options.clone(),
+            crate::wal::WalIoMode::Parallel,
+        )?;
+        let active = engine.inner.state.load().memtable.clone();
+        assert!(active.uses_v7_wal());
+        assert!(active.uses_parallel_wal());
+        let sequencer = engine.inner.mvcc.as_ref().unwrap();
+
+        let pause = crate::lsm_storage::native_write::NativeWritePause::new(
+            crate::lsm_storage::native_write::NativeWriteStage::Admitted,
+        );
+        *engine.inner.native_write_pause.lock() = Some(Arc::clone(&pause));
+        let writer_engine = Arc::clone(&engine);
+        let writer = tokio::spawn(async move {
+            writer_engine
+                .put_async(b"detached-v7-commit", b"durable")
+                .await
+        });
+        pause.reached.notified().await;
+        assert_eq!(engine.get(b"detached-v7-commit")?, None);
+        writer.abort();
+        assert!(writer.await.unwrap_err().is_cancelled());
+
+        let close_engine = Arc::clone(&engine);
+        let close = tokio::spawn(async move { close_engine.close_async().await });
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while sequencer.commit_admission_is_open() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("close must stop commit admission before draining the v7 commit");
+        assert!(
+            !close.is_finished(),
+            "close must wait for the owned v7 commit"
+        );
+        pause.release.notify_one();
+        close.await.unwrap()?;
+        drop(engine);
+
+        let reopened =
+            KvEngine::open_with_wal_io_mode(&database, options, crate::wal::WalIoMode::Parallel)?;
+        assert_eq!(
+            reopened.get(b"detached-v7-commit")?,
             Some(Bytes::from_static(b"durable"))
         );
         reopened.close_storage()?;
