@@ -1386,6 +1386,20 @@ impl Wal {
         self.format_version == WAL_FORMAT_VERSION_V7
     }
 
+    /// Return the writer's latest v7 FRONTIER after its durability barrier
+    /// completes. The caller must stop admission before capturing this value.
+    pub(crate) fn v7_frontier(&self) -> Result<v7::codec::WalV7Frontier> {
+        ensure!(self.is_v7(), "WAL is not v7");
+        if let Some(runtime) = &self.parallel_runtime {
+            return runtime.v7_frontier();
+        }
+        if let Some(writer) = &self.v7_leader {
+            return Ok(writer.lock().runtime_seed()?.frontier_cursor.frontier);
+        }
+
+        anyhow::bail!("v7 WAL has no writer runtime")
+    }
+
     /// Whether a failed v7 append can contain recoverable data. Inspect both
     /// flags because cursor-publication errors poison the adapter, while an
     /// unwind can leave only the serial writer poisoned.

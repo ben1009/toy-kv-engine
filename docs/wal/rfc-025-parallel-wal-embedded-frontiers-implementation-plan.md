@@ -26,8 +26,9 @@ the Active v7 WAL for recovery without emitting a final recovery point. It stops
 and drains MVCC commit admission before closing, and a concurrent resume cannot
 reopen admission after close begins. Unsupported v7 recovery-point requests now
 fail before changing admission. Public `sync()` and `sync_async()` now share a
-fixed-cutoff barrier that drains MVCC admission and preserves an existing pause.
-Freeze, checkpoint, and recovery-point barriers, remaining public write shapes,
+fixed-cutoff barrier that drains MVCC admission, preserves an existing pause,
+and persist the empty floor plus latest synced logical boundary in the PITR
+manifest. Freeze, checkpoint, and recovery-point barriers, remaining public write shapes,
 sealing, and lifecycle rotation remain. PITR manifest replay and
 snapshots now retain and validate a
 v7 format marker and the full immutable boundary in Sealing obligations;
@@ -494,8 +495,12 @@ physical FRONTIER identity.
   Production gap emission must derive the exact first uncovered timestamp from
   verified WAL/seal data; the manifest timestamp check supplies only a bound.
   Preserve old snapshots by defaulting the new boundary field to absent, and
-  clear it when a sealed successor becomes active. WAL open now consumes the
-  boundary; production record emission remains later integration work.
+  clear it when a sealed successor becomes active. WAL open consumes the
+  boundary, and explicit Active v7 `sync()`/`sync_async()` now persist the
+  empty floor and latest synced logical boundary. A confirmed-absent append
+  may resume previously open admission only while the manifest remains healthy;
+  unresolved boundary durability blocks retries until reopen. Automatic
+  publication from other lifecycle transitions remains later integration work.
 
 - Add proposed `wal/v7/recovery.rs`, receiving authoritative Active/Sealing/
   Sealed context and all durable anchors. A discovered seal sidecar cannot

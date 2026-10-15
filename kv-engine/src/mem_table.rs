@@ -1,5 +1,7 @@
 use std::{
     cell::OnceCell,
+    fs::File,
+    io::Read,
     ops::Bound,
     path::{Path, PathBuf},
     sync::{
@@ -1863,6 +1865,75 @@ impl MemTable {
 
     pub(crate) fn uses_v7_wal(&self) -> bool {
         self.wal.as_ref().is_some_and(Wal::is_v7)
+    }
+
+    /// Capture both the canonical empty floor and the writer's latest v7
+    /// frontier. The caller must have stopped commit admission and synced the
+    /// WAL before using the returned active boundary as manifest authority.
+    pub(crate) fn v7_active_boundaries(
+        &self,
+    ) -> Result<(
+        crate::pitr::manifest::ActiveBoundary,
+        crate::pitr::manifest::ActiveBoundary,
+    )> {
+        let wal = self
+            .wal
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("memtable has no WAL"))?;
+        anyhow::ensure!(wal.is_v7(), "memtable WAL is not v7");
+        let path = self
+            .wal_path
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("v7 memtable has no WAL path"))?;
+        let mut file = File::open(path).with_context(|| {
+            format!("open Active v7 WAL {} for boundary capture", path.display())
+        })?;
+        let mut header_bytes = [0; crate::wal::v7::codec::WAL_V7_HEADER_LEN];
+        file.read_exact(&mut header_bytes)
+            .context("read Active v7 WAL header for boundary capture")?;
+        let header = crate::wal::v7::codec::WalV7Header::decode(&header_bytes)
+            .context("decode Active v7 WAL header for boundary capture")?;
+        let header_digest = header.digest()?;
+
+        let mut frontier_bytes = [0; crate::wal::v7::codec::WAL_V7_FRAME_LEN];
+        file.read_exact(&mut frontier_bytes)
+            .context("read generation-zero v7 FRONTIER for boundary capture")?;
+        let genesis_offset = crate::wal::v7::codec::WAL_V7_HEADER_LEN as u64;
+        let genesis_frame = crate::wal::v7::codec::decode_frame_structural(
+            &frontier_bytes,
+            genesis_offset,
+            &header_digest,
+        )
+        .context("decode generation-zero v7 FRONTIER for boundary capture")?;
+        anyhow::ensure!(
+            genesis_frame.kind == crate::wal::v7::codec::WalV7FrameKind::Frontier,
+            "generation-zero v7 slot is not a FRONTIER"
+        );
+        let genesis = crate::wal::v7::codec::WalV7Frontier::decode_body(&genesis_frame.body)?;
+        genesis.validate_generation_zero(&header_digest, genesis_offset)?;
+
+        let active_boundary = |frontier: crate::wal::v7::codec::WalV7Frontier| {
+            crate::pitr::manifest::ActiveBoundary {
+                timeline_id: header.timeline_id.0,
+                archive_epoch_id: header.archive_epoch_id.0,
+                segment_id: header.segment_id.0,
+                incarnation: header.incarnation,
+                ticket_end: frontier.ticket_end,
+                durable_end: frontier.durable_end,
+                last_commit_ts: frontier.last_commit_ts,
+                prefix_digest: frontier.prefix_digest,
+            }
+        };
+        let empty = active_boundary(genesis);
+        let current = active_boundary(wal.v7_frontier()?);
+        empty.validate()?;
+        current.validate()?;
+        anyhow::ensure!(
+            current.ticket_end >= empty.ticket_end,
+            "Active v7 frontier regresses behind generation zero"
+        );
+
+        Ok((empty, current))
     }
 
     pub(crate) fn v7_wal_requires_recovery(&self) -> bool {

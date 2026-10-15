@@ -911,6 +911,28 @@ impl ParallelWalRuntime {
         })
     }
 
+    /// Return the last successfully synced v7 FRONTIER after a caller has
+    /// stopped admission and drained its fixed ticket cutoff.
+    pub(crate) fn v7_frontier(&self) -> Result<WalV7Frontier> {
+        let admission = self.inner.admission.lock();
+        let allocator = admission
+            .v7_allocator
+            .as_ref()
+            .context("parallel WAL runtime is not v7")?;
+        let cursor = allocator.last_frontier();
+        let frontier_end = cursor
+            .frame_offset
+            .checked_add(WAL_V7_FRAME_LEN as u64)
+            .context("v7 FRONTIER end overflows")?;
+        admission
+            .v7_metadata
+            .as_ref()
+            .context("v7 Parallel runtime has no hash metadata")?
+            .validate_frontier(cursor.frontier, frontier_end)?;
+
+        Ok(cursor.frontier)
+    }
+
     pub(crate) fn allocate_buffer(&self, capacity: usize) -> Result<ParallelBuffer> {
         let capacity = DirectBuf::align_up(capacity.max(BUFFER_POOL_BUF_SIZE));
         let capacity_u64 = u64::try_from(capacity).context("WAL buffer capacity exceeds u64")?;
