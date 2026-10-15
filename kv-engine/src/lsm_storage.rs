@@ -2204,7 +2204,7 @@ pub struct KvEngine {
     #[cfg(target_os = "linux")]
     pitr_repository_path: Mutex<Option<std::path::PathBuf>>,
     #[cfg(target_os = "linux")]
-    pitr_barrier_lock: Mutex<()>,
+    pitr_barrier_lock: Arc<Mutex<()>>,
     #[cfg(target_os = "linux")]
     pitr_scheduler_delay: Mutex<Duration>,
     #[cfg(target_os = "linux")]
@@ -2485,7 +2485,7 @@ impl KvEngine {
             #[cfg(target_os = "linux")]
             pitr_repository_path: Mutex::new(None),
             #[cfg(target_os = "linux")]
-            pitr_barrier_lock: Mutex::new(()),
+            pitr_barrier_lock: Arc::new(Mutex::new(())),
             #[cfg(target_os = "linux")]
             pitr_scheduler_delay: Mutex::new(Duration::ZERO),
 
@@ -5043,8 +5043,61 @@ impl KvEngine {
         )
     }
 
+    /// Sync the active WAL to a fixed admission cutoff.
+    ///
+    /// For an Active v7 PITR WAL, this drains currently admitted commits before
+    /// syncing the WAL, then resumes admission only when it was open before the
+    /// barrier and the sync succeeds.
     pub fn sync(&self) -> Result<()> {
-        crate::profile_scope!("kv.sync", self.inner.sync())
+        crate::profile_scope!("kv.sync", self.sync_inner())
+    }
+
+    fn sync_inner(&self) -> Result<()> {
+        #[cfg(target_os = "linux")]
+        {
+            Self::sync_inner_with_admission(&self.inner, &self.pitr_barrier_lock, None)
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        {
+            self.inner.sync()
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn sync_inner_with_admission(
+        inner: &LsmStorageInner,
+        pitr_barrier_lock: &Mutex<()>,
+        mut lifecycle_guard: Option<AdmissionGuard>,
+    ) -> Result<()> {
+        if inner.state.load().memtable.uses_v7_wal() {
+            if lifecycle_guard.is_none() {
+                lifecycle_guard = Some(inner.lifecycle.admit_write()?);
+            }
+            let _pitr_barrier = pitr_barrier_lock.lock();
+            // The lifecycle guard is the admission point. If close begins
+            // while this operation waits on the PITR barrier, close must drain
+            // this admitted sync instead of rejecting it here.
+            let _active_memtable_guard = inner.active_memtable_lock.read();
+            let active_memtable = inner.state.load().memtable.clone();
+            if active_memtable.uses_v7_wal() {
+                let sequencer = inner
+                    .mvcc
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("Active v7 PITR sync requires MVCC"))?;
+                let admission_was_open = sequencer.commit_admission_is_open();
+                sequencer.stop_commit_admission_and_capture()?;
+                let result = active_memtable.sync_wal();
+                if result.is_ok() && admission_was_open {
+                    sequencer.resume_commit_admission();
+                }
+                return result;
+            }
+        }
+
+        let result = inner.sync();
+        drop(lifecycle_guard);
+        result
     }
 
     pub fn scan(&self, lower: Bound<&[u8]>, upper: Bound<&[u8]>) -> Result<ScanIterator> {
@@ -5614,7 +5667,7 @@ impl KvEngine {
             #[cfg(target_os = "linux")]
             pitr_repository_path: Mutex::new(None),
             #[cfg(target_os = "linux")]
-            pitr_barrier_lock: Mutex::new(()),
+            pitr_barrier_lock: Arc::new(Mutex::new(())),
             #[cfg(target_os = "linux")]
             pitr_scheduler_delay: Mutex::new(Duration::ZERO),
             #[cfg(target_os = "linux")]
@@ -5830,15 +5883,25 @@ impl KvEngine {
             .await
     }
 
-    /// Async sync.
+    /// Async sync, using the same fixed admission cutoff as [`Self::sync`].
     pub async fn sync_async(&self) -> Result<()> {
         let guard = self.inner.lifecycle.admit_write()?;
         let inner = self.inner.clone();
+        #[cfg(target_os = "linux")]
+        let pitr_barrier_lock = Arc::clone(&self.pitr_barrier_lock);
         self.inner
             .blocking
             .run_result(move || {
-                let _guard = guard;
-                inner.sync()
+                #[cfg(target_os = "linux")]
+                {
+                    Self::sync_inner_with_admission(&inner, &pitr_barrier_lock, Some(guard))
+                }
+
+                #[cfg(not(target_os = "linux"))]
+                {
+                    let _guard = guard;
+                    inner.sync()
+                }
             })
             .await
     }
@@ -15115,6 +15178,106 @@ mod tests {
             pitr_repository: Some(directory.join("repository")),
             ..LsmStorageOptions::default_for_test()
         })
+    }
+
+    #[cfg(target_os = "linux")]
+    fn sync_for_test(engine: &KvEngine, asynchronous: bool) -> anyhow::Result<()> {
+        if asynchronous {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?
+                .block_on(engine.sync_async())
+        } else {
+            engine.sync()
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn v7_sync_apis_drain_admitted_commits_and_preserve_paused_admission() -> anyhow::Result<()> {
+        use std::{sync::mpsc, time::Duration};
+
+        let directory = tempdir()?;
+        let options = v7_recovery_test_database(directory.path())?;
+        let engine = KvEngine::open(directory.path().join("db"), options)?;
+        let sequencer = engine.inner.mvcc.as_ref().unwrap();
+        for asynchronous in [false, true] {
+            // Model a commit admitted before it has reserved a WAL ticket.
+            // Sync must drain it even though the WAL itself has nothing pending.
+            let pending_commit = sequencer.reserve_commit_ts()?;
+            let sync_engine = Arc::clone(&engine);
+            let (completed, completion) = mpsc::channel();
+            let worker = std::thread::spawn(move || {
+                let _ = completed.send(sync_for_test(&sync_engine, asynchronous));
+            });
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while sequencer.commit_admission_is_open()
+                && !worker.is_finished()
+                && std::time::Instant::now() < deadline
+            {
+                std::thread::yield_now();
+            }
+            let admission_stopped = !sequencer.commit_admission_is_open();
+            let early_completion = completion.try_recv();
+            // Always release the reservation before reporting an assertion
+            // failure, so a failed test cannot strand the draining worker.
+            sequencer.retire_commit_ts(pending_commit);
+            let returned_early = early_completion.is_ok();
+            let result = match early_completion {
+                Ok(result) => result,
+                Err(_) => completion.recv_timeout(Duration::from_secs(5))?,
+            };
+            worker.join().unwrap();
+            assert!(admission_stopped, "sync never stopped commit admission");
+            assert!(!returned_early, "sync returned before its cutoff drained");
+            result?;
+            assert!(sequencer.commit_admission_is_open());
+
+            sequencer.stop_commit_admission_and_capture()?;
+            sync_for_test(&engine, asynchronous)?;
+            assert!(!sequencer.commit_admission_is_open());
+            assert!(engine.put(b"paused", b"rejected").is_err());
+            sequencer.resume_commit_admission();
+            engine.put(b"after-sync", b"accepted")?;
+        }
+        engine.close()?;
+
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn v7_admitted_sync_finishes_after_close_begins() -> anyhow::Result<()> {
+        let directory = tempdir()?;
+        let options = v7_recovery_test_database(directory.path())?;
+        let engine = KvEngine::open(directory.path().join("db"), options)?;
+        let sequencer = engine.inner.mvcc.as_ref().unwrap();
+        let admission = engine.inner.lifecycle.admit_write()?;
+
+        // Model close winning the PITR barrier after sync's admission has
+        // completed. Observing active_writes alone is insufficient: that count
+        // increments before admission's final open check can still reject it.
+        sequencer.stop_commit_admission_and_capture()?;
+        let close_state = engine.inner.lifecycle.begin_close();
+        let sync_result = KvEngine::sync_inner_with_admission(
+            &engine.inner,
+            &engine.pitr_barrier_lock,
+            Some(admission),
+        );
+        let admission_reopened = sequencer.commit_admission_is_open();
+        // Complete the modeled close before propagating an error or asserting,
+        // so a failed expectation cannot leave its lifecycle transition unfinished.
+        let close_result = KvEngine::close_storage_parts_after_begin(
+            &engine.inner,
+            &engine.background_workers,
+            close_state,
+            None,
+        );
+        assert!(!admission_reopened, "sync reopened admission during close");
+        sync_result?;
+        close_result?;
+
+        Ok(())
     }
 
     #[cfg(target_os = "linux")]

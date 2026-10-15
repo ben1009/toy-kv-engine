@@ -259,7 +259,7 @@ impl LsmMvccInner {
         self.async_publication_changed.notify_waiters();
     }
 
-    #[cfg(test)]
+    #[cfg(any(target_os = "linux", test))]
     pub(crate) fn commit_admission_is_open(&self) -> bool {
         self.publication.lock().admission_open
     }

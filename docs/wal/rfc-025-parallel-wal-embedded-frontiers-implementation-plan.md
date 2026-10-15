@@ -25,8 +25,10 @@ still apply while v7 rotation remains pending. Public close drains and syncs
 the Active v7 WAL for recovery without emitting a final recovery point. It stops
 and drains MVCC commit admission before closing, and a concurrent resume cannot
 reopen admission after close begins. Unsupported v7 recovery-point requests now
-fail before changing admission. Fixed-cutoff barriers, remaining public write
-shapes, sealing, and lifecycle rotation remain. PITR manifest replay and
+fail before changing admission. Public `sync()` and `sync_async()` now share a
+fixed-cutoff barrier that drains MVCC admission and preserves an existing pause.
+Freeze, checkpoint, and recovery-point barriers, remaining public write shapes,
+sealing, and lifecycle rotation remain. PITR manifest replay and
 snapshots now retain and validate a
 v7 format marker and the full immutable boundary in Sealing obligations;
 seal completion checks the WAL digest against that boundary. A v7 v2 seal
@@ -776,6 +778,19 @@ this stage.
   path is separately qualified. Every path uses the same v7 durability contract.
   Preserve memtable insertion followed by ordered MVCC publication, leases,
   preparation permits, cancellation ownership, and close/freeze draining.
+
+The public `KvEngine::sync()` and `sync_async()` APIs share a barrier that stops
+and drains MVCC commit admission for an Active v7 WAL before syncing that
+memtable. The asynchronous path carries its lifecycle admission into the blocking
+worker. The barrier resumes commit admission only if the sequencer was open
+beforehand and the WAL sync succeeds; a failed sync leaves admission closed for
+recovery. Freeze, checkpoint, and recovery-point barriers remain part of the
+later lifecycle work.
+
+Regression tests exercise both public sync APIs with a commit reserved before
+its WAL ticket exists and preserve an existing admission pause. A separate test
+gives the shared helper a fully admitted lifecycle guard, begins close before
+executing sync, and verifies that sync finishes without reopening writes.
 
 **Exit:** Out-of-order/multi-SQE groups, captured-target races, stopped-admission
 drain, poison, lost-wakeup, and cancellation tests pass with the actual worker.
