@@ -22,7 +22,7 @@ use format::{
     WAL_FORMAT_VERSION_V4, WAL_FORMAT_VERSION_V7, WAL_HEADER_SIZE, WAL_MVCC_MAGIC,
     WalFormatDescriptor, WalFraming, WalIoPath,
 };
-use v7::{codec::WAL_V7_FRAME_LEN, leader::WalV7LeaderWriter};
+use v7::{allocator::WalV7FrontierCursor, codec::WAL_V7_FRAME_LEN, leader::WalV7LeaderWriter};
 
 #[cfg(test)]
 mod parallel;
@@ -1390,13 +1390,13 @@ impl Wal {
 
     /// Return the writer's latest v7 FRONTIER after its durability barrier
     /// completes. The caller must stop admission before capturing this value.
-    pub(crate) fn v7_frontier(&self) -> Result<v7::codec::WalV7Frontier> {
+    pub(crate) fn v7_frontier_cursor(&self) -> Result<WalV7FrontierCursor> {
         ensure!(self.is_v7(), "WAL is not v7");
         if let Some(runtime) = &self.parallel_runtime {
-            return runtime.v7_frontier();
+            return runtime.v7_frontier_cursor();
         }
         if let Some(writer) = &self.v7_leader {
-            return Ok(writer.lock().runtime_seed()?.frontier_cursor.frontier);
+            return Ok(writer.lock().runtime_seed()?.frontier_cursor);
         }
 
         anyhow::bail!("v7 WAL has no writer runtime")

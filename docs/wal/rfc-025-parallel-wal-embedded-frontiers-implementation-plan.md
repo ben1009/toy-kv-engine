@@ -865,8 +865,14 @@ remain in later stage 5/6 work.
   for a 64-bit first-DATA-frame offset. It persists the full immutable boundary,
   explicit WAL version, physical identity, and one ticket/index/time entry per
   batch. Its builder and verifier require the exact terminal FRONTIER and a
-  successful strict Sealed recovery check against `[0, sealed_end)`. Keep v5/v6
-  sidecar version 1 byte-compatible. Production seal publication, catalog
+  successful strict Sealed recovery check against `[0, sealed_end)`. The builder
+  accepts a seekable source and exact terminal-marker end, streaming the digest,
+  strict recovery verification, and ticket-index construction without staging
+  the whole WAL in memory; unused preallocation is excluded. Active boundary
+  capture obtains the physical terminal cursor from either writer mode and
+  verifies it against the on-disk FRONTIER before persisting the logical
+  boundary. The v5/v6 sidecar version 1 layout remains byte-compatible.
+  Production seal publication, catalog
   descriptor readers, strict archive verification, and restore batch decoding
   are connected. Restore validates the immutable WAL/seal pair and applies its
   DATA decode limits before allocating logical batch buffers. An empty v7 segment is

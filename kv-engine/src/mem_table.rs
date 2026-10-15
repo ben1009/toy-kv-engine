@@ -1,7 +1,7 @@
 use std::{
     cell::OnceCell,
     fs::File,
-    io::Read,
+    io::{Read, Seek, SeekFrom},
     ops::Bound,
     path::{Path, PathBuf},
     sync::{
@@ -2005,7 +2005,31 @@ impl MemTable {
             }
         };
         let empty = active_boundary(genesis);
-        let current = active_boundary(wal.v7_frontier()?);
+        let cursor = wal.v7_frontier_cursor()?;
+        let mut terminal_frame = [0; crate::wal::v7::codec::WAL_V7_FRAME_LEN];
+        file.seek(SeekFrom::Start(cursor.frame_offset))
+            .context("seek Active v7 WAL to its terminal FRONTIER")?;
+        file.read_exact(&mut terminal_frame)
+            .context("read Active v7 WAL terminal FRONTIER")?;
+        let decoded_terminal = crate::wal::v7::codec::decode_frame_structural(
+            &terminal_frame,
+            cursor.frame_offset,
+            &header_digest,
+        )
+        .context("decode Active v7 WAL terminal FRONTIER")?;
+        anyhow::ensure!(
+            decoded_terminal.kind == crate::wal::v7::codec::WalV7FrameKind::Frontier,
+            "Active v7 writer cursor does not name a FRONTIER frame"
+        );
+        let terminal_frontier =
+            crate::wal::v7::codec::WalV7Frontier::decode_body(&decoded_terminal.body)?;
+        anyhow::ensure!(
+            terminal_frontier == cursor.frontier
+                && crate::wal::v7::codec::frame_record_digest(&terminal_frame)?
+                    == cursor.frame_digest,
+            "Active v7 writer cursor differs from its terminal FRONTIER frame"
+        );
+        let current = active_boundary(cursor.frontier);
         empty.validate()?;
         current.validate()?;
         anyhow::ensure!(
