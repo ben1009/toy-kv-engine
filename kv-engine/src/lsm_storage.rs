@@ -2246,11 +2246,13 @@ impl KvEngine {
     ///
     /// When the active WAL is v7, PITR remains enabled and its Active segment
     /// is retained for recovery. Reopening with the same repository resumes
-    /// PITR; v7 sealing and successor rotation are not part of close yet.
+    /// PITR. Close drains admission, syncs the active WAL, and persists its
+    /// latest logical Active boundary; v7 sealing and successor rotation are
+    /// not part of close yet.
     pub fn close(&self) -> Result<()> {
         // V7 cannot yet be sealed into a PITR recovery point. A storage close
-        // drains and syncs the active WAL while retaining its enabled lifecycle
-        // and Active segment for recovery on the next open.
+        // drains and syncs the active WAL, persists its logical Active boundary,
+        // and retains its enabled lifecycle and Active segment for recovery.
         let pitr_mode = self.pitr_manifest_state.lock().mode;
         if pitr_mode == crate::pitr::manifest::PitrMode::Enabled
             && self.inner.state.load().memtable.uses_v7_wal()
@@ -2293,6 +2295,19 @@ impl KvEngine {
             // waiting for the PITR barrier while shutdown waits for that worker.
             let operation_guard = self.pitr_operation_lock.lock();
             let barrier = self.pitr_barrier_lock.lock();
+            let close_state = self.inner.lifecycle.begin_close();
+            if !matches!(&close_state, CloseState::Started) {
+                drop(barrier);
+                drop(operation_guard);
+                return Self::close_storage_parts_after_begin(
+                    &self.inner,
+                    &self.background_workers,
+                    close_state,
+                    None,
+                    false,
+                );
+            }
+
             let admission_error = self
                 .inner
                 .mvcc
@@ -2300,7 +2315,40 @@ impl KvEngine {
                 .ok_or_else(|| anyhow!("PITR close requires MVCC"))
                 .and_then(|sequencer| sequencer.stop_commit_admission_and_capture().map(|_| ()))
                 .err();
-            let close_state = self.inner.lifecycle.begin_close();
+            let (boundary_error, active_wal_synced) = if admission_error.is_none() {
+                let active_memtable_guard = self.inner.active_memtable_lock.read();
+                let active_memtable = self.inner.state.load().memtable.clone();
+                if active_memtable.uses_v7_wal() {
+                    if self.pitr_publication_unknown.load(Ordering::Acquire) {
+                        (
+                            Some(anyhow!(
+                                "Active v7 close cannot publish a manifest boundary while a PITR transition has an unknown outcome; reopen the database first"
+                            )),
+                            false,
+                        )
+                    } else {
+                        let sync_result = active_memtable.sync_wal();
+                        let active_wal_synced = sync_result.is_ok();
+                        let boundary_result = sync_result
+                            .and_then(|()| active_memtable.v7_active_boundaries())
+                            .and_then(|boundaries| {
+                                drop(active_memtable_guard);
+                                Self::persist_v7_active_boundary(
+                                    &self.inner,
+                                    &self.pitr_manifest_state,
+                                    &self.pitr_publication_unknown,
+                                    boundaries,
+                                )
+                            });
+                        (boundary_result.err(), active_wal_synced)
+                    }
+                } else {
+                    (None, false)
+                }
+            } else {
+                (None, false)
+            };
+            let barrier_error = admission_error.or(boundary_error);
             drop(barrier);
             drop(operation_guard);
 
@@ -2308,7 +2356,8 @@ impl KvEngine {
                 &self.inner,
                 &self.background_workers,
                 close_state,
-                admission_error,
+                barrier_error,
+                active_wal_synced,
             )
         }
         #[cfg(not(target_os = "linux"))]
@@ -2331,6 +2380,7 @@ impl KvEngine {
             background_workers,
             inner.lifecycle.begin_close(),
             None,
+            false,
         )
     }
 
@@ -2338,7 +2388,8 @@ impl KvEngine {
         inner: &LsmStorageInner,
         background_workers: &BackgroundWorkers,
         close_state: CloseState,
-        admission_error: Option<anyhow::Error>,
+        barrier_error: Option<anyhow::Error>,
+        active_wal_synced: bool,
     ) -> Result<()> {
         match close_state {
             CloseState::AlreadyClosed => return inner.lifecycle.close_result(),
@@ -2356,7 +2407,7 @@ impl KvEngine {
         inner.lifecycle.wait_for_quiescence();
         let result = (|| -> Result<()> {
             if inner.options.enable_wal {
-                inner.sync_and_close_parallel_wals()?;
+                inner.sync_and_close_parallel_wals(active_wal_synced)?;
             } else {
                 // flush memtable to imm_memtable
                 let new_id = inner.next_sst_id();
@@ -2372,11 +2423,11 @@ impl KvEngine {
         })();
         // Always finish close, including join and sync errors. Later close
         // callers receive the same terminal outcome.
-        let result = match (admission_error, background_result.and(result)) {
+        let result = match (barrier_error, background_result.and(result)) {
             (None, close_result) => close_result,
-            (Some(admission_error), Ok(())) => Err(admission_error),
-            (Some(admission_error), Err(close_error)) => Err(close_error.context(format!(
-                "failed to drain MVCC admission before close: {admission_error:#}; storage close also failed"
+            (Some(barrier_error), Ok(())) => Err(barrier_error),
+            (Some(barrier_error), Err(close_error)) => Err(close_error.context(format!(
+                "v7 close barrier failed before storage shutdown: {barrier_error:#}; storage close also failed"
             ))),
         };
         // A close waiter may reopen immediately after observing completion.
@@ -8957,12 +9008,20 @@ impl LsmStorageInner {
         self.options.enable_wal && self.wal_io_mode == crate::wal::WalIoMode::Parallel
     }
 
-    /// Sync the active WAL and shut down every parallel WAL runtime still
-    /// reachable from the active or immutable memtables. Evaluate all cleanup
-    /// steps even if an earlier sync fails so a returned close error cannot
-    /// leave dedicated WAL threads running.
-    pub(crate) fn sync_and_close_parallel_wals(&self) -> Result<()> {
-        let sync_result = self.sync();
+    /// Sync the active WAL unless its caller already did so, then shut down
+    /// every parallel WAL runtime still reachable from the active or immutable
+    /// memtables. Evaluate all cleanup steps even if an earlier sync fails so a
+    /// returned close error cannot leave dedicated WAL threads running.
+    pub(crate) fn sync_and_close_parallel_wals(&self, active_wal_synced: bool) -> Result<()> {
+        ensure!(
+            !active_wal_synced || self.state.load().memtable.uses_v7_wal(),
+            "only an already-synced Active v7 WAL may skip the close sync"
+        );
+        let sync_result = if active_wal_synced {
+            Ok(())
+        } else {
+            self.sync()
+        };
         let close_result = self.close_parallel_wals();
         let dir_sync_result = self.sync_dir();
         let publication_result = self
@@ -15831,6 +15890,7 @@ mod tests {
             &engine.background_workers,
             close_state,
             None,
+            false,
         );
         assert!(!admission_reopened, "sync reopened admission during close");
         sync_result?;

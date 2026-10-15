@@ -35,13 +35,14 @@ The ordinary memtable size target does not freeze the
 Active v7 memtable; segment and spool admission limits still apply while v7
 rotation remains pending. Public close drains and syncs
 the Active v7 WAL for recovery without emitting a final recovery point. It stops
-and drains MVCC commit admission before closing, and a concurrent resume cannot
-reopen admission after close begins. Unsupported v7 recovery-point requests now
-fail before changing admission. Public `sync()` and `sync_async()` now share a
-fixed-cutoff barrier that drains MVCC admission, preserves an existing pause,
-and persists the empty floor plus latest synced logical boundary in the PITR
-manifest. Freeze, checkpoint, and recovery-point barriers, remaining public
-write shapes, OCC, sealing, and lifecycle rotation remain. PITR manifest replay and
+and drains MVCC commit admission, persists the latest synced logical boundary in
+the PITR manifest, and a concurrent resume cannot reopen admission after close
+begins. Unsupported v7 recovery-point requests now fail before changing
+admission. Public `sync()` and `sync_async()` now share a fixed-cutoff barrier
+that drains MVCC admission, preserves an existing pause, and persists the empty
+floor plus latest synced logical boundary in the PITR manifest. Freeze,
+checkpoint, and recovery-point barriers, remaining public write shapes, OCC,
+sealing, and lifecycle rotation remain. PITR manifest replay and
 snapshots now retain and validate a
 v7 format marker and the full immutable boundary in Sealing obligations;
 seal completion checks the WAL digest against that boundary. A v7 v2 seal
@@ -808,8 +809,10 @@ and drains MVCC commit admission for an Active v7 WAL before syncing that
 memtable. The asynchronous path carries its lifecycle admission into the blocking
 worker. The barrier resumes commit admission only if the sequencer was open
 beforehand and the WAL sync succeeds; a failed sync leaves admission closed for
-recovery. Freeze, checkpoint, and recovery-point barriers remain part of the
-later lifecycle work.
+recovery. Public close applies the same fixed-cutoff rule while keeping
+admission closed: it syncs the Active WAL and persists its resulting logical
+boundary before tearing down storage. Freeze, checkpoint, and recovery-point
+barriers remain part of the later lifecycle work.
 
 Regression tests exercise both public sync APIs with a commit reserved before
 its WAL ticket exists and preserve an existing admission pause. A separate test
