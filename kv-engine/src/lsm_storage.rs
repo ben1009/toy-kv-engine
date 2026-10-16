@@ -127,6 +127,13 @@ struct SnapshotReplayData {
     pitr_state: Option<crate::pitr::manifest::PitrState>,
 }
 
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy)]
+struct PitrSourceSealSummary {
+    logical_length: u64,
+    last_commit: Option<(u64, crate::pitr::RecordedAt)>,
+}
+
 struct LookupSstRawMvccParams<'a> {
     key: &'a [u8],
     bloom_hash: u32,
@@ -811,6 +818,13 @@ impl ManifestRecoveryState<'_> {
                 {
                     crate::pitr::manifest::migrate_legacy_snapshot_obligations(state)?;
                 }
+                if let crate::pitr::manifest::PitrManifestRecord::Snapshot(state) = &mut record {
+                    if self.manifest_format_version >= 9 {
+                        state.validate_for_status()?;
+                    } else {
+                        state.validate_for_snapshot_recovery()?;
+                    }
+                }
                 if let crate::pitr::manifest::PitrManifestRecord::SegmentReclaimed { segment_id } =
                     &record
                 {
@@ -825,7 +839,11 @@ impl ManifestRecoveryState<'_> {
                     )]
                 };
                 records.push(record);
-                self.pitr_state = crate::pitr::manifest::replay_pitr_records(records)?;
+                self.pitr_state = if self.manifest_format_version < 9 {
+                    crate::pitr::manifest::replay_pitr_records_for_engine_recovery(records)?
+                } else {
+                    crate::pitr::manifest::replay_pitr_records(records)?
+                };
             }
             ManifestRecord::Snapshot {
                 l0_sstables: snap_l0,
@@ -1140,7 +1158,11 @@ impl ManifestRecoveryState<'_> {
             if snapshot.format_version < 8 {
                 crate::pitr::manifest::migrate_legacy_snapshot_obligations(&mut pitr_state)?;
             }
-            pitr_state.validate_for_status()?;
+            if snapshot.format_version >= 9 {
+                pitr_state.validate_for_status()?;
+            } else {
+                pitr_state.validate_for_snapshot_recovery()?;
+            }
             self.pitr_state = pitr_state;
         }
         self.manifest_format_version = snapshot.format_version;
@@ -3494,6 +3516,7 @@ impl KvEngine {
             .collect::<Vec<_>>();
         for (segment_id, obligation_state) in obligations {
             if obligation_state == crate::pitr::manifest::ObligationState::Sealing {
+                let mut successor_active_boundary = None;
                 let sealing_obligation = state
                     .obligations
                     .get(&segment_id)
@@ -3501,10 +3524,21 @@ impl KvEngine {
                 if sealing_obligation.wal_format == crate::pitr::manifest::PitrWalFormat::V7 {
                     let active = self.inner.state.load().memtable.clone();
                     ensure!(
-                        !(active.uses_v7_wal()
-                            && LsmStorageInner::pitr_segment_of(&active) == Some(segment_id)),
+                        active.uses_v7_wal()
+                            && LsmStorageInner::pitr_segment_of(&active)
+                                == Some(sealing_obligation.successor_segment_id),
                         "v7 Sealing obligation cannot advance until its successor WAL is installed"
                     );
+                    let (empty_boundary, current_boundary) = active.v7_active_boundaries()?;
+                    ensure!(
+                        empty_boundary == current_boundary
+                            && empty_boundary.ticket_end == 0
+                            && empty_boundary.durable_end
+                                == crate::wal::v7::codec::WAL_V7_HEADER_LEN as u64
+                            && empty_boundary.last_commit_ts == 0,
+                        "v7 Sealing successor advanced before its boundary was published"
+                    );
+                    successor_active_boundary = Some(empty_boundary);
                 }
                 // A sealing batch torn at the record boundary leaves `SealStarted`
                 // durable without the `SegmentSealed` that finishes it, so the
@@ -3537,34 +3571,61 @@ impl KvEngine {
                 // Both high-water fields travel together: a seal with entries
                 // carries the commit it covers, and an empty one leaves both
                 // `None` rather than a time with no anchor.
-                let last_recorded_at =
-                    seal.entries
-                        .last()
-                        .map(|entry| crate::pitr::manifest::PersistedRecordedAt {
-                            secs: entry.recorded_at.secs,
-                            nanos: entry.recorded_at.nanos,
-                        });
-                let last_commit_anchor =
-                    seal.entries
-                        .last()
-                        .map(|entry| crate::pitr::manifest::PersistedCommitAnchor {
-                            segment_id,
-                            commit_ts: entry.commit_ts,
-                            recorded_at: crate::pitr::manifest::PersistedRecordedAt {
-                                secs: entry.recorded_at.secs,
-                                nanos: entry.recorded_at.nanos,
+                let last_recorded_at = seal.last_commit.map(|(_, recorded_at)| {
+                    crate::pitr::manifest::PersistedRecordedAt {
+                        secs: recorded_at.secs,
+                        nanos: recorded_at.nanos,
+                    }
+                });
+                let last_commit_anchor = seal.last_commit.map(|(commit_ts, recorded_at)| {
+                    crate::pitr::manifest::PersistedCommitAnchor {
+                        segment_id,
+                        commit_ts,
+                        recorded_at: crate::pitr::manifest::PersistedRecordedAt {
+                            secs: recorded_at.secs,
+                            nanos: recorded_at.nanos,
+                        },
+                        entry_digest: crate::pitr::commit_time_entry_digest(
+                            crate::pitr::CommitTimeHighWater {
+                                archive_epoch_id: crate::pitr::ArchiveEpochId(archive_epoch_id),
+                                segment_id: crate::pitr::SegmentId(segment_id),
+                                commit_ts,
+                                recorded_at,
+                                entry_digest: [0; 32],
                             },
-                            entry_digest: crate::pitr::commit_time_entry_digest(
-                                crate::pitr::CommitTimeHighWater {
-                                    archive_epoch_id: crate::pitr::ArchiveEpochId(archive_epoch_id),
-                                    segment_id: crate::pitr::SegmentId(segment_id),
-                                    commit_ts: entry.commit_ts,
-                                    recorded_at: entry.recorded_at,
-                                    entry_digest: [0; 32],
-                                },
-                            ),
-                        });
+                        ),
+                    }
+                });
                 let (metadata, _, _) = self.load_pitr_source_segment(&state, segment_id)?;
+                if let Some(boundary) = successor_active_boundary {
+                    let active = self.inner.state.load().memtable.clone();
+                    let successor_path = active
+                        .wal_path()
+                        .ok_or_else(|| anyhow!("v7 successor has no WAL path"))?;
+                    let mut file = File::open(successor_path).with_context(|| {
+                        format!(
+                            "open v7 successor WAL {} for Sealing reconciliation",
+                            successor_path.display()
+                        )
+                    })?;
+                    let mut header_bytes = [0; crate::wal::v7::codec::WAL_V7_HEADER_LEN];
+                    std::io::Read::read_exact(&mut file, &mut header_bytes)?;
+                    let header = crate::wal::v7::codec::WalV7Header::decode(&header_bytes)?;
+                    ensure!(
+                        header.timeline_id.0 == boundary.timeline_id
+                            && header.archive_epoch_id.0 == boundary.archive_epoch_id
+                            && header.segment_id.0 == boundary.segment_id
+                            && header.incarnation == boundary.incarnation
+                            && boundary.prefix_digest == header.digest()?
+                            && header.predecessor
+                                == crate::pitr::ChainAnchor::Segment(crate::pitr::SegmentAnchor {
+                                    segment_id: crate::pitr::SegmentId(segment_id),
+                                    wal_digest: metadata.wal_digest,
+                                    seal_digest: metadata.seal_digest,
+                                },),
+                        "v7 Sealing successor identity differs from its sealed predecessor"
+                    );
+                }
                 let record = crate::pitr::manifest::PitrManifestRecord::SegmentSealed {
                     segment_id,
                     segment_anchor: crate::pitr::manifest::PersistedChainAnchor::Segment {
@@ -3574,6 +3635,7 @@ impl KvEngine {
                     },
                     last_recorded_at,
                     last_commit_anchor,
+                    successor_active_boundary,
                 };
                 state = crate::pitr::manifest::replay_pitr_records([
                     crate::pitr::manifest::PitrManifestRecord::Snapshot(Box::new(state)),
@@ -3931,7 +3993,7 @@ impl KvEngine {
         &self,
         segment_id: u64,
         max_v7_segment_bytes: Option<u64>,
-    ) -> Result<crate::pitr::seal::V5Seal> {
+    ) -> Result<PitrSourceSealSummary> {
         let expected_seal_name = format!("pitr-{segment_id:020}.seal");
         for entry in std::fs::read_dir(&self.inner.path)? {
             let path = entry?.path();
@@ -3945,7 +4007,13 @@ impl KvEngine {
                 crate::pitr::seal::SealSidecarFormat::V5 => {
                     let seal = crate::pitr::seal::V5Seal::decode(&bytes)?;
                     if seal.header.segment_id.0 == segment_id {
-                        return Ok(seal);
+                        return Ok(PitrSourceSealSummary {
+                            logical_length: seal.logical_length,
+                            last_commit: seal
+                                .entries
+                                .last()
+                                .map(|entry| (entry.commit_ts, entry.recorded_at)),
+                        });
                     }
                 }
                 crate::pitr::seal::SealSidecarFormat::V7 => {
@@ -3953,9 +4021,13 @@ impl KvEngine {
                         .ok_or_else(|| anyhow!("PITR v7 source has no persisted segment limit"))?;
                     let seal = crate::pitr::seal::V7Seal::decode(&bytes, max_segment_bytes)?;
                     if seal.header.segment_id.0 == segment_id {
-                        anyhow::bail!(
-                            "cannot complete an interrupted v7 PITR seal from a v5 seal index"
-                        );
+                        return Ok(PitrSourceSealSummary {
+                            logical_length: seal.boundary.sealed_end,
+                            last_commit: seal
+                                .entries
+                                .last()
+                                .map(|entry| (entry.commit_ts, entry.recorded_at)),
+                        });
                     }
                 }
             }
@@ -4220,6 +4292,7 @@ impl KvEngine {
                     segment_anchor: persisted_anchor,
                     last_recorded_at,
                     last_commit_anchor,
+                    successor_active_boundary: None,
                 },
             ])?;
             self.persist_pitr_lifecycle(
@@ -4228,6 +4301,7 @@ impl KvEngine {
                     segment_anchor: persisted_anchor,
                     last_recorded_at,
                     last_commit_anchor,
+                    successor_active_boundary: None,
                 }],
                 sealed_state.clone(),
             )?;
@@ -7600,16 +7674,13 @@ impl LsmStorageInner {
         segments
     }
 
-    /// Bind a v7 Active header to its persisted logical recovery authority.
-    /// The manifest boundary requires v7 even if the physical file advertises
-    /// a legacy format that could otherwise bypass the boundary checks.
-    fn validate_v7_active_recovery_header(
+    /// Decode a canonical v7 Active header and bind its identity to the PITR
+    /// state. A missing boundary is accepted only during the explicitly marked
+    /// legacy snapshot migration below.
+    fn decode_v7_active_header_for_state(
         state: &crate::pitr::manifest::PitrState,
         bytes: &[u8],
     ) -> Result<crate::wal::v7::codec::WalV7Header> {
-        let boundary = state
-            .active_boundary
-            .ok_or_else(|| anyhow!("PITR manifest is missing the Active v7 boundary"))?;
         let header = crate::wal::v7::codec::WalV7Header::decode(bytes)
             .context("persisted Active v7 boundary requires a canonical v7 WAL header")?;
         ensure!(
@@ -7633,15 +7704,63 @@ impl LsmStorageInner {
             header.timeline_id.0 == timeline_id
                 && header.archive_epoch_id.0 == archive_epoch_id
                 && header.segment_id.0 == active_segment_id
-                && header.predecessor == predecessor
-                && boundary.timeline_id == timeline_id
-                && boundary.archive_epoch_id == archive_epoch_id
-                && boundary.segment_id == active_segment_id
-                && boundary.incarnation == header.incarnation,
+                && header.predecessor == predecessor,
             "Active v7 WAL header differs from its manifest identity"
         );
+        if let Some(boundary) = state.active_boundary {
+            ensure!(
+                boundary.timeline_id == timeline_id
+                    && boundary.archive_epoch_id == archive_epoch_id
+                    && boundary.segment_id == active_segment_id
+                    && boundary.incarnation == header.incarnation,
+                "Active v7 WAL header differs from its manifest boundary"
+            );
+        } else {
+            ensure!(
+                state.needs_legacy_v7_boundary_recovery(),
+                "PITR manifest is missing the Active v7 boundary"
+            );
+        }
 
         Ok(header)
+    }
+
+    /// Bind a v7 Active header to its persisted logical recovery authority. The
+    /// manifest boundary requires v7 even if the physical file advertises a
+    /// legacy format that could otherwise bypass the boundary checks.
+    fn validate_v7_active_recovery_header(
+        state: &crate::pitr::manifest::PitrState,
+        bytes: &[u8],
+    ) -> Result<crate::wal::v7::codec::WalV7Header> {
+        ensure!(
+            state.active_boundary.is_some(),
+            "PITR manifest is missing the Active v7 boundary"
+        );
+        Self::decode_v7_active_header_for_state(state, bytes)
+    }
+
+    fn restore_legacy_v7_active_boundary(
+        state: &mut crate::pitr::manifest::PitrState,
+        bytes: &[u8],
+    ) -> Result<()> {
+        ensure!(
+            state.needs_legacy_v7_boundary_recovery() && state.active_boundary.is_none(),
+            "PITR state is not awaiting legacy v7 boundary recovery"
+        );
+        let header = Self::decode_v7_active_header_for_state(state, bytes)?;
+        state.active_boundary = Some(crate::pitr::manifest::ActiveBoundary {
+            timeline_id: header.timeline_id.0,
+            archive_epoch_id: header.archive_epoch_id.0,
+            segment_id: header.segment_id.0,
+            incarnation: header.incarnation,
+            ticket_end: 0,
+            durable_end: crate::wal::v7::codec::WAL_V7_HEADER_LEN as u64,
+            last_commit_ts: 0,
+            prefix_digest: header.digest()?,
+        });
+        state.legacy_v7_boundary_recovery = false;
+        state.validate_for_status()?;
+        Ok(())
     }
 
     /// Load a retained v7 source only when its exact immutable boundary is
@@ -8137,10 +8256,11 @@ impl LsmStorageInner {
             // Validate format version: the first record must be FormatVersion(v)
             // or a Snapshot with format_version == v. Pre-MVCC directories (no
             // format marker) are rejected to prevent silent data corruption.
-            // Accept v3–v8. Version 6 carries complete immutable-file identity
+            // Accept v3–v9. Version 6 carries complete immutable-file identity
             // metadata in snapshots and metadata-bearing manifest records.
             // Version 7 additionally requires PITR state in every snapshot.
-            // Version 8 requires explicit PITR obligation WAL formats.
+            // Version 8 requires explicit PITR obligation WAL formats. Version
+            // 9 requires durable successor Active boundaries for v7 handoffs.
             let detected_version = match ret.1.first() {
                 Some(ManifestRecord::FormatVersion(v)) => *v,
                 Some(ManifestRecord::Snapshot { format_version, .. }) => *format_version,
@@ -8200,6 +8320,48 @@ impl LsmStorageInner {
                     next_compaction_filter_id.max(max_filter_id.saturating_add(1));
             }
             max_id += 1;
+            let inspect_legacy_active_wal_header = pitr_state.active_segment_id.is_some()
+                && pitr_state.active_boundary.is_none()
+                && (detected_version == 8 || pitr_state.needs_legacy_v7_boundary_recovery());
+            if inspect_legacy_active_wal_header {
+                let active_segment_id = pitr_state
+                    .active_segment_id
+                    .ok_or_else(|| anyhow!("PITR state is missing its Active segment"))?;
+                let wal_path = path.join(format!("pitr-{active_segment_id:020}.wal"));
+                if wal_path.try_exists()? {
+                    let mut file = File::open(&wal_path).with_context(|| {
+                        format!(
+                            "failed to inspect legacy Active PITR WAL {}",
+                            wal_path.display()
+                        )
+                    })?;
+                    let mut version_bytes = [0; 6];
+                    std::io::Read::read_exact(&mut file, &mut version_bytes)?;
+                    let format_version = u16::from_be_bytes(version_bytes[4..6].try_into()?);
+                    if format_version == crate::wal::format::WAL_FORMAT_VERSION_V7 {
+                        // A v8 snapshot can omit the initial v7 boundary even
+                        // after the transition obligation has been reclaimed.
+                        // Mark only after the header confirms this is a v7 WAL;
+                        // ordinary v5/v6 Active snapshots remain replayable.
+                        pitr_state.legacy_v7_boundary_recovery = true;
+                        ensure!(
+                            options.enable_wal,
+                            "opening a v7 Active PITR WAL requires enable_wal"
+                        );
+                        std::io::Seek::seek(&mut file, std::io::SeekFrom::Start(0))?;
+                        let mut bytes = vec![0; crate::wal::v7::codec::WAL_V7_HEADER_LEN];
+                        std::io::Read::read_exact(&mut file, &mut bytes)?;
+                        Self::restore_legacy_v7_active_boundary(&mut pitr_state, &bytes)?;
+                    } else {
+                        // Replay can prove this successor is v7 even after its
+                        // predecessor obligation has been reclaimed. Preserve
+                        // that marker so a legacy replacement is rejected.
+                        pitr_state.validate_for_status()?;
+                    }
+                } else {
+                    pitr_state.validate_for_status()?;
+                }
+            }
             if let Some(boundary) = pitr_state.active_boundary {
                 ensure!(
                     options.enable_wal,
@@ -14928,6 +15090,88 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn v8_legacy_active_snapshot_replays_recorded_at_advance() -> anyhow::Result<()> {
+        use crate::{
+            manifest::ManifestRecord,
+            pitr::manifest::{
+                PersistedPitrConfig, PersistedRecordedAt, PitrManifestRecord, PitrState,
+                replay_pitr_records,
+            },
+        };
+
+        let legacy_active_state = || {
+            replay_pitr_records([
+                PitrManifestRecord::EnableIntent {
+                    repository_id: [1; 16],
+                    timeline_id: [2; 16],
+                    archive_epoch_id: [3; 16],
+                    config: PersistedPitrConfig {
+                        archive_interval_ms: 1_000,
+                        max_segment_bytes: 8_192,
+                        max_unarchived_bytes: 8_192,
+                        max_source_spool_bytes: 16_384,
+                    },
+                },
+                PitrManifestRecord::EnableComplete {
+                    active_segment_id: 0,
+                },
+            ])
+        };
+
+        for global_snapshot in [false, true] {
+            let mut lsm_state =
+                super::LsmStorageState::create(&LsmStorageOptions::default_for_test(), false);
+            let compaction_controller = crate::compact::CompactionController::NoCompaction;
+            let mut recovery = super::ManifestRecoveryState {
+                state: &mut lsm_state,
+                compaction_controller: &compaction_controller,
+                max_id: 0,
+                im_memtables: Default::default(),
+                pitr_memtable_segments: Default::default(),
+                recovered_vlog_refs: Default::default(),
+                recovered_compaction_filters: Default::default(),
+                next_compaction_filter_id: 0,
+                input_ids_buf: Vec::new(),
+                pitr_records: Vec::new(),
+                pitr_state: PitrState::default(),
+                manifest_format_version: 8,
+                reclaimed_pitr_segments: Default::default(),
+            };
+
+            let snapshot = legacy_active_state()?;
+            let record = if global_snapshot {
+                ManifestRecord::Snapshot {
+                    l0_sstables: Vec::new(),
+                    levels: vec![(1, Vec::new())],
+                    range_only_ssts: Vec::new(),
+                    next_sst_id: 1,
+                    vlog_references: Vec::new(),
+                    imm_memtable_ids: Vec::new(),
+                    pitr_memtable_segments: Vec::new(),
+                    active_compaction_filters: Vec::new(),
+                    next_compaction_filter_id: 0,
+                    format_version: 8,
+                    immutable_file_metadata: Vec::new(),
+                    pitr_state: Some(snapshot),
+                }
+            } else {
+                ManifestRecord::Pitr(PitrManifestRecord::Snapshot(Box::new(snapshot)))
+            };
+            recovery.replay_manifest_record(record)?;
+            assert!(!recovery.pitr_state.legacy_v7_boundary_recovery);
+
+            let recorded_at = PersistedRecordedAt { secs: 1, nanos: 0 };
+            recovery.replay_manifest_record(ManifestRecord::Pitr(
+                PitrManifestRecord::RecordedAtAdvanced { recorded_at },
+            ))?;
+            assert_eq!(recovery.pitr_state.last_recorded_at, Some(recorded_at));
+            assert!(!recovery.pitr_state.legacy_v7_boundary_recovery);
+        }
+
+        Ok(())
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn pitr_io_error_preserves_storage_full_errno() {
@@ -15183,6 +15427,7 @@ mod tests {
                 segment_anchor,
                 last_recorded_at: None,
                 last_commit_anchor: None,
+                successor_active_boundary: None,
             },
         ])
         .unwrap()
@@ -16780,6 +17025,14 @@ mod tests {
     fn v7_sealed_recovery_test_database(
         directory: &std::path::Path,
     ) -> anyhow::Result<(LsmStorageOptions, std::path::PathBuf)> {
+        v7_sealed_recovery_test_database_with_legacy_interstitial(directory, false)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn v7_sealed_recovery_test_database_with_legacy_interstitial(
+        directory: &std::path::Path,
+        legacy_interstitial: bool,
+    ) -> anyhow::Result<(LsmStorageOptions, std::path::PathBuf)> {
         use sha2::Digest;
 
         use crate::{
@@ -16839,7 +17092,17 @@ mod tests {
             secs: last.recorded_at.secs,
             nanos: last.recorded_at.nanos,
         };
-        let records = [
+        let successor_active_boundary = ActiveBoundary {
+            timeline_id: successor_header.timeline_id.0,
+            archive_epoch_id: successor_header.archive_epoch_id.0,
+            segment_id: successor_header.segment_id.0,
+            incarnation: successor_header.incarnation,
+            ticket_end: 0,
+            durable_end: WAL_V7_HEADER_LEN as u64,
+            last_commit_ts: 0,
+            prefix_digest: successor_header.digest()?,
+        };
+        let mut records = vec![
             ManifestRecord::Pitr(PitrManifestRecord::SealStarted {
                 segment_id: header.segment_id.0,
                 successor_segment_id: state.next_segment_id,
@@ -16870,28 +17133,254 @@ mod tests {
                         entry_digest: [0; 32],
                     }),
                 }),
-            }),
-            ManifestRecord::Pitr(PitrManifestRecord::ActiveBoundaryAdvanced {
-                boundary: ActiveBoundary {
-                    timeline_id: successor_header.timeline_id.0,
-                    archive_epoch_id: successor_header.archive_epoch_id.0,
-                    segment_id: successor_header.segment_id.0,
-                    incarnation: successor_header.incarnation,
-                    ticket_end: 0,
-                    durable_end: WAL_V7_HEADER_LEN as u64,
-                    last_commit_ts: 0,
-                    prefix_digest: successor_header.digest()?,
-                },
+                successor_active_boundary: (!legacy_interstitial)
+                    .then_some(successor_active_boundary),
             }),
         ];
+        if legacy_interstitial {
+            records.extend([
+                ManifestRecord::Pitr(PitrManifestRecord::SegmentArchived {
+                    segment_id: header.segment_id.0,
+                }),
+                ManifestRecord::Pitr(PitrManifestRecord::SegmentReclaimable {
+                    segment_id: header.segment_id.0,
+                }),
+                ManifestRecord::Pitr(PitrManifestRecord::SegmentReclaimed {
+                    segment_id: header.segment_id.0,
+                }),
+                ManifestRecord::Pitr(PitrManifestRecord::ActiveBoundaryAdvanced {
+                    boundary: successor_active_boundary,
+                }),
+            ]);
+        }
         crate::manifest::Manifest::recover(database.join("MANIFEST"))?
             .0
             .add_records_when_init(&records)?;
+        if legacy_interstitial {
+            let manifest_path = database.join("MANIFEST");
+            let (manifest, mut persisted_records) =
+                crate::manifest::Manifest::recover(&manifest_path)?;
+            drop(manifest);
+            for record in &mut persisted_records {
+                match record {
+                    ManifestRecord::FormatVersion(version) if *version == 9 => *version = 8,
+                    ManifestRecord::Snapshot { format_version, .. } if *format_version == 9 => {
+                        *format_version = 8;
+                    }
+                    _ => {}
+                }
+            }
+            let mut bytes = Vec::new();
+            for record in persisted_records {
+                serde_json::to_writer(&mut bytes, &record)?;
+            }
+            std::fs::write(manifest_path, bytes)?;
+        }
         // Exercise restart replay before repository resume can archive and
         // reclaim the source whose on-disk state the test is inspecting.
         options.pitr_repository = None;
 
         Ok((options, source_wal))
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn v8_manifest_replays_cleanup_between_legacy_seal_and_boundary() -> anyhow::Result<()> {
+        let directory = tempdir()?;
+        let (options, source_wal) =
+            v7_sealed_recovery_test_database_with_legacy_interstitial(directory.path(), true)?;
+        let database = directory.path().join("db");
+        std::fs::remove_file(&source_wal)?;
+        std::fs::remove_file(source_wal.with_extension("seal"))?;
+
+        let engine = KvEngine::open(&database, options)?;
+        let recovered = engine.inner.pitr_state.lock().clone();
+        let boundary = recovered.active_boundary.unwrap();
+        assert_eq!(boundary.segment_id, recovered.active_segment_id.unwrap());
+        assert_eq!(boundary.ticket_end, 0);
+        assert_eq!(
+            boundary.durable_end,
+            crate::wal::v7::codec::WAL_V7_HEADER_LEN as u64
+        );
+        assert!(!recovered.obligations.contains_key(&1));
+        assert!(!recovered.legacy_v7_boundary_recovery);
+        engine.close()?;
+
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn v8_reclaimed_v7_successor_requires_its_v7_wal() -> anyhow::Result<()> {
+        use crate::{
+            manifest::{Manifest, ManifestRecord},
+            pitr::manifest::PitrManifestRecord,
+            wal::v7::codec::WalV7Header,
+        };
+
+        for format_version in [
+            Some(crate::wal::format::WAL_FORMAT_VERSION_V7),
+            Some(crate::pitr::WAL_V5_VERSION_LEGACY),
+            Some(crate::pitr::WAL_V5_VERSION),
+            None,
+        ] {
+            let directory = tempdir()?;
+            let (options, source_wal) =
+                v7_sealed_recovery_test_database_with_legacy_interstitial(directory.path(), true)?;
+            let database = directory.path().join("db");
+            let manifest_path = database.join("MANIFEST");
+            let (manifest, mut records) = Manifest::recover(&manifest_path)?;
+            drop(manifest);
+            let Some(ManifestRecord::Pitr(PitrManifestRecord::ActiveBoundaryAdvanced { boundary })) =
+                records.pop()
+            else {
+                anyhow::bail!("fixture is missing the successor boundary record");
+            };
+            // The legacy stream ends after reclamation, before its separate
+            // successor boundary record. Replay must retain its v7 authority.
+            let mut bytes = Vec::new();
+            for record in records {
+                serde_json::to_writer(&mut bytes, &record)?;
+            }
+            std::fs::write(&manifest_path, &bytes)?;
+            std::fs::remove_file(&source_wal)?;
+            std::fs::remove_file(source_wal.with_extension("seal"))?;
+
+            let wal_path = database.join(format!("pitr-{:020}.wal", boundary.segment_id));
+            let header = WalV7Header::decode(&std::fs::read(&wal_path)?)?;
+            match format_version {
+                Some(version) if version == crate::wal::format::WAL_FORMAT_VERSION_V7 => {}
+                Some(version) => {
+                    let replacement =
+                        crate::pitr::encode_v5_file_header(crate::pitr::WalV5Header {
+                            wal_format_version: version,
+                            timeline_id: header.timeline_id,
+                            archive_epoch_id: header.archive_epoch_id,
+                            segment_id: header.segment_id,
+                            predecessor: header.predecessor,
+                        })?;
+                    std::fs::write(&wal_path, replacement)?;
+                }
+                None => std::fs::remove_file(&wal_path)?,
+            }
+            let wal_before = wal_path
+                .try_exists()?
+                .then(|| std::fs::read(&wal_path))
+                .transpose()?;
+            let opened = KvEngine::open(&database, options);
+            if format_version == Some(crate::wal::format::WAL_FORMAT_VERSION_V7) {
+                let engine = opened?;
+                let recovered = engine.inner.pitr_state.lock().clone();
+                assert_eq!(recovered.active_boundary, Some(boundary));
+                assert!(recovered.obligations.is_empty());
+                assert!(!recovered.legacy_v7_boundary_recovery);
+                engine.close_storage()?;
+            } else {
+                if let Ok(engine) = &opened {
+                    engine.close_storage()?;
+                }
+                assert!(
+                    opened.is_err(),
+                    "accepted replacement format {format_version:?} for a known v7 successor"
+                );
+                let error = opened.err().unwrap();
+                assert!(format!("{error:#}").contains(
+                    "legacy v7 Active boundary has not been verified against its WAL header"
+                ));
+                assert_eq!(std::fs::read(&manifest_path)?, bytes);
+                assert_eq!(
+                    wal_path
+                        .try_exists()?
+                        .then(|| std::fs::read(&wal_path))
+                        .transpose()?,
+                    wal_before
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn v8_global_snapshot_recovers_the_empty_v7_successor_boundary() -> anyhow::Result<()> {
+        use crate::manifest::ManifestRecord;
+
+        let directory = tempdir()?;
+        let (options, _) = v7_sealed_recovery_test_database(directory.path())?;
+        let database = directory.path().join("db");
+        let engine = KvEngine::open(&database, options.clone())?;
+        let current_pitr = engine.inner.pitr_state.lock().clone();
+        let active_segment_id = current_pitr.active_segment_id.unwrap();
+        assert!(current_pitr.active_boundary.is_some());
+
+        let state = engine.inner.state.load();
+        let mut imm_memtable_ids = state
+            .imm_memtables
+            .iter()
+            .filter(|memtable| memtable.wal_path().is_some())
+            .map(|memtable| memtable.id())
+            .collect::<Vec<_>>();
+        if state.memtable.wal_path().is_some() {
+            imm_memtable_ids.push(state.memtable.id());
+        }
+        imm_memtable_ids.sort_unstable();
+        imm_memtable_ids.dedup();
+        let pitr_memtable_segments = LsmStorageInner::snapshot_pitr_memtable_segments(
+            state
+                .imm_memtables
+                .iter()
+                .map(|memtable| memtable.as_ref())
+                .chain(std::iter::once(state.memtable.as_ref())),
+        );
+        let mut legacy_pitr_state = current_pitr;
+        legacy_pitr_state.active_boundary = None;
+        let snapshot = ManifestRecord::Snapshot {
+            l0_sstables: state.l0_sstables.clone(),
+            levels: state.levels.clone(),
+            range_only_ssts: state.range_only_ssts.clone(),
+            next_sst_id: engine
+                .inner
+                .next_sst_id
+                .load(std::sync::atomic::Ordering::Acquire),
+            vlog_references: Vec::new(),
+            imm_memtable_ids,
+            pitr_memtable_segments,
+            active_compaction_filters: Vec::new(),
+            next_compaction_filter_id: 0,
+            format_version: 8,
+            immutable_file_metadata: state.immutable_file_metadata.clone(),
+            pitr_state: Some(legacy_pitr_state),
+        };
+        drop(state);
+        engine.close()?;
+        engine.inner.manifest.as_ref().unwrap().snapshot(snapshot)?;
+        drop(engine);
+
+        let reopened = KvEngine::open(&database, options)?;
+        let recovered = reopened.inner.pitr_state.lock().clone();
+        let boundary = recovered.active_boundary.unwrap();
+        assert_eq!(boundary.segment_id, active_segment_id);
+        assert_eq!(boundary.ticket_end, 0);
+        assert_eq!(
+            boundary.durable_end,
+            crate::wal::v7::codec::WAL_V7_HEADER_LEN as u64
+        );
+        assert!(!recovered.legacy_v7_boundary_recovery);
+        drop(reopened);
+
+        let persisted_snapshot: ManifestRecord =
+            serde_json::from_slice(&std::fs::read(database.join("ENGINE_MANIFEST"))?)?;
+        assert!(matches!(
+            persisted_snapshot,
+            ManifestRecord::Snapshot {
+                format_version: crate::manifest::MANIFEST_FORMAT_VERSION,
+                pitr_state: Some(state),
+                ..
+            } if state.active_boundary == Some(boundary)
+        ));
+
+        Ok(())
     }
 
     #[cfg(target_os = "linux")]
@@ -17342,16 +17831,14 @@ mod tests {
             metadata.wal_format_version == crate::wal::format::WAL_FORMAT_VERSION_V7,
             "an unrelated malformed sidecar must not shadow the canonical source"
         );
-        let interrupted_seal_error = engine
-            .load_pitr_source_seal(
-                segment_id,
-                state.config.as_ref().map(|config| config.max_segment_bytes),
-            )
-            .expect_err("v7 seals cannot use the v5 interrupted-seal recovery path");
-        assert!(
-            interrupted_seal_error
-                .to_string()
-                .contains("cannot complete an interrupted v7 PITR seal")
+        let seal_summary = engine.load_pitr_source_seal(
+            segment_id,
+            state.config.as_ref().map(|config| config.max_segment_bytes),
+        )?;
+        assert_eq!(seal_summary.logical_length, sealed_end);
+        assert_eq!(
+            seal_summary.last_commit.map(|(commit_ts, _)| commit_ts),
+            seal.entries.last().map(|entry| entry.commit_ts)
         );
         std::fs::remove_file(malformed_seal_path)?;
 
@@ -17551,10 +18038,19 @@ mod tests {
             );
             assert_eq!(std::fs::read(&source_seal_path)?, source_seal_bytes);
             assert_eq!(successor_owner.snapshot(), after_install);
+
+            let sealing_state = engine.pitr_manifest_state.lock().clone();
+            let completed =
+                engine.reconcile_durable_archive_obligations_with_reclaim(sealing_state, false)?;
             assert_eq!(
-                engine.pitr_manifest_state.lock().obligations[&boundary.active.segment_id].state,
-                ObligationState::Sealing
+                completed.obligations[&boundary.active.segment_id].state,
+                ObligationState::Sealed
             );
+            assert_eq!(completed.active_segment_id, Some(state.next_segment_id));
+            let successor = engine.inner.state.load().memtable.clone();
+            let (empty_boundary, current_boundary) = successor.v7_active_boundaries()?;
+            assert_eq!(empty_boundary, current_boundary);
+            assert_eq!(completed.active_boundary, Some(empty_boundary));
             assert_eq!(engine.get(b"v7-key")?, Some(Bytes::from_static(b"v")));
             engine.close_storage()?;
         }
@@ -21441,6 +21937,7 @@ mod tests {
                 },
                 last_recorded_at: None,
                 last_commit_anchor: None,
+                successor_active_boundary: None,
             };
             let next = crate::pitr::manifest::replay_pitr_records([
                 crate::pitr::manifest::PitrManifestRecord::Snapshot(Box::new(state)),

@@ -80,8 +80,13 @@ and Archived obligations, including their required v7 format after memtable
 flush. Reclaimable sources remain strictly verified and replayed while a
 nonempty memtable awaits its durable flush; partial source cleanup is accepted
 once replay is no longer needed. Ticket-ordered batches recover into read-only
-immutable memtables. The pre-`SegmentSealed` successor-install crash window,
-transition completion, and public recovery-point publication remain gated. Seal preparation
+immutable memtables. Reconciliation now completes a v7 Sealing transition after
+its empty successor is installed: it verifies the successor identity and
+predecessor anchor, then stores the successor's initial Active boundary inside
+the same `SegmentSealed` manifest record. A recovered manifest prefix cannot
+expose the sealed state without that boundary. Recovery from the pre-
+`SegmentSealed` successor-install crash window and public recovery-point
+publication remain gated. Seal preparation
 now additionally reserves the successor's persistent image and atomic-install
 staging extents before `SealStarted`; the installed sidecar transition retains
 those charges until successor installation or cleanup. The guarded
@@ -110,13 +115,16 @@ v7 Parallel runtime now admits reserved DATA batches and writes embedded
 FRONTIERs before the single WAL sync; fixed-cutoff API barriers,
 Leader-parity work, and full Active lifecycle integration remain.
 Version 8 engine manifests and standalone PITR envelopes require explicit
-obligation format markers. Production recovery selects legacy snapshot migration
-from the persisted engine version and publishes a v8 snapshot before new writes.
-Ambiguous pre-v8 snapshots or event logs with outstanding obligations fail
-closed; reopen them with a v7-compatible build, drain seal/archive/reclaim
-work, publish a compacted canonical snapshot, then retry the upgrade. Snapshot
-replacement also removes incompatible historical Sealing records from drained
-pre-v8 v7 event logs.
+obligation format markers. Version 9 engine manifests require the empty Active
+boundary for every sealed v7 successor. Production recovery selects legacy
+snapshot migration from the persisted engine version and publishes a v9
+snapshot before new writes. A v8 snapshot that predates the embedded successor
+boundary is accepted only after the actual Active v7 WAL header validates; its
+empty boundary is reconstructed before service resumes. Ambiguous pre-v8
+snapshots or event logs with outstanding obligations fail closed; reopen them
+with a v7-compatible build, drain seal/archive/reclaim work, publish a compacted
+canonical snapshot, then retry the upgrade. Snapshot replacement also removes
+incompatible historical Sealing records from drained pre-v8 v7 event logs.
 Stage 4 now includes the v7 resource-ledger primitive, framed-batch reservation
 helper, and serial-model integration. The model reserves before allocating
 framed DATA buffers or writing frames, retains the charge through uncertain

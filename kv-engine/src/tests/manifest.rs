@@ -138,6 +138,7 @@ fn pitr_ambiguous_legacy_engine_snapshots_report_upgrade_guidance() {
             },
             last_recorded_at: None,
             last_commit_anchor: None,
+            successor_active_boundary: None,
         },
     ])
     .unwrap();
