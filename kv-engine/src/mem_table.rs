@@ -1031,6 +1031,9 @@ pub struct MemTable {
     map: Arc<SkipMap<Bytes, Bytes>>,
     wal: Option<Wal>,
     wal_path: Option<PathBuf>,
+    /// True when this memtable's source image is an immutable or active v7
+    /// PITR WAL. Sealed recovery retains the source without attaching a writer.
+    wal_v7_source: bool,
     wal_v7_reservation_owner: Option<Arc<WalV7ReservationOwner>>,
     wal_v7_seal_index: Option<Mutex<Vec<u64>>>,
     id: usize,
@@ -1074,6 +1077,7 @@ impl MemTable {
             map: Arc::new(SkipMap::new()),
             wal: None,
             wal_path: None,
+            wal_v7_source: false,
             wal_v7_reservation_owner: None,
             wal_v7_seal_index: None,
             id,
@@ -1299,6 +1303,7 @@ impl MemTable {
         let recovered_recorded_at = installed.last_recorded_at;
 
         let mut ret = Self::create(id, vlog_enabled);
+        ret.wal_v7_source = true;
         for batch in &installed.batches {
             let mut range_ordinal = 0_u32;
             for entry in &batch.entries {
@@ -1375,6 +1380,75 @@ impl MemTable {
         ret.rebuild_bloom();
 
         Ok((ret, max_commit_ts))
+    }
+
+    /// Recover a frozen v7 PITR source as a read-only memtable. The caller
+    /// must first bind the sidecar to the manifest obligation; this method
+    /// verifies the exact sealed WAL image while streaming batches into the
+    /// memtable and deliberately attaches no writer.
+    pub(crate) fn recover_from_v7_sealed(
+        id: usize,
+        vlog_enabled: bool,
+        path: impl AsRef<Path>,
+        seal: &crate::pitr::seal::V7Seal,
+        limits: crate::pitr::WalV5Limits,
+    ) -> Result<(Self, u64)> {
+        let path = path.as_ref().to_path_buf();
+        let mut reader = File::open(&path)
+            .with_context(|| format!("open sealed v7 PITR WAL {}", path.display()))?;
+        let wal_len = reader
+            .metadata()
+            .with_context(|| format!("inspect sealed v7 PITR WAL {}", path.display()))?
+            .len();
+        let mut ret = Self::create(id, vlog_enabled);
+        seal.visit_wal_batches_from_reader(&mut reader, wal_len, limits, |batch| {
+            let mut range_ordinal = 0_u32;
+            for entry in &batch.entries {
+                match entry {
+                    crate::pitr::WalEntry::Put { key, value } => {
+                        let internal_key =
+                            Bytes::from(crate::key::encode_internal_key(key, batch.commit_ts));
+                        let value = Bytes::copy_from_slice(value);
+                        ret.approximate_size.fetch_add(
+                            internal_key.len() + value.len(),
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
+                        ret.map.insert(internal_key, value);
+                    }
+                    crate::pitr::WalEntry::PointDelete { key } => {
+                        let internal_key =
+                            Bytes::from(crate::key::encode_internal_key(key, batch.commit_ts));
+                        let value = Bytes::from_static(&[KvKind::Tombstone as u8]);
+                        ret.approximate_size.fetch_add(
+                            internal_key.len() + value.len(),
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
+                        ret.map.insert(internal_key, value);
+                    }
+                    crate::pitr::WalEntry::RangeDelete { start, end } => {
+                        ret.range_tombstones.add(
+                            crate::range_tombstone::RangeTombstone {
+                                start: Bytes::copy_from_slice(start),
+                                end: Bytes::copy_from_slice(end),
+                                ts: batch.commit_ts,
+                            },
+                            range_ordinal,
+                        );
+                        range_ordinal = range_ordinal
+                            .checked_add(1)
+                            .context("v7 WAL range-tombstone ordinal overflows")?;
+                    }
+                }
+            }
+            Ok(())
+        })?;
+
+        ret.wal_path = Some(path);
+        ret.wal_v7_source = true;
+        ret.recovered_recorded_at = seal.entries.last().map(|entry| entry.recorded_at);
+        ret.rebuild_bloom();
+
+        Ok((ret, seal.boundary.active.last_commit_ts))
     }
 
     #[allow(dead_code)]
@@ -2018,11 +2092,11 @@ impl MemTable {
     }
 
     pub(crate) fn uses_pitr_batch_wal(&self) -> bool {
-        self.wal.as_ref().is_some_and(Wal::is_pitr)
+        self.wal_v7_source || self.wal.as_ref().is_some_and(Wal::is_pitr)
     }
 
     pub(crate) fn uses_v7_wal(&self) -> bool {
-        self.wal.as_ref().is_some_and(Wal::is_v7)
+        self.wal_v7_source || self.wal.as_ref().is_some_and(Wal::is_v7)
     }
 
     /// Capture both the canonical empty floor and the writer's latest v7

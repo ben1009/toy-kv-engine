@@ -75,9 +75,13 @@ Restart recovery now strictly verifies a durable v7 Sealing source against its
 immutable boundary and any existing canonical seal sidecar, copies the exact
 frozen bytes to a fresh inode, syncs and atomically installs that image, and
 keeps commit admission closed while that source is still the active engine
-WAL. Recovery of Sealed obligations and the post-successor-install crash
-window, along with transition completion and
-public recovery-point publication, remain gated. Seal preparation
+WAL. Restart recovery now verifies retained v7 sources against durable Sealed
+and Archived obligations, including their required v7 format after memtable
+flush. Reclaimable sources remain strictly verified and replayed while a
+nonempty memtable awaits its durable flush; partial source cleanup is accepted
+once replay is no longer needed. Ticket-ordered batches recover into read-only
+immutable memtables. The pre-`SegmentSealed` successor-install crash window,
+transition completion, and public recovery-point publication remain gated. Seal preparation
 now additionally reserves the successor's persistent image and atomic-install
 staging extents before `SealStarted`; the installed sidecar transition retains
 those charges until successor installation or cleanup. The guarded
@@ -86,9 +90,8 @@ FRONTIER, consumes the pre-reserved extents, registers the successor in the
 engine manifest, and swaps it in only after commit admission is stopped. Before
 successor publication it reserves its own bounded verification workspace,
 rebuilds the seal from the exact frozen WAL image, and compares the installed
-sidecar in fixed-size chunks for byte-for-byte agreement. Recovery-point
-publication, recovery after successor installation, and Sealed recovery remain
-gated for the next lifecycle slice. Frozen v7 WALs remain archive sources after
+sidecar in fixed-size chunks for byte-for-byte agreement.
+Frozen v7 WALs remain archive sources after
 their memtables flush and are deleted only through PITR reclamation.
 Archive preparation now validates v7 seal descriptors
 against catalog metadata and strictly verifies the exact frozen WAL image;

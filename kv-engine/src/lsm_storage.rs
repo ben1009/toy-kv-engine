@@ -7644,6 +7644,96 @@ impl LsmStorageInner {
         Ok(header)
     }
 
+    /// Load a retained v7 source only when its exact immutable boundary is
+    /// backed by a completed manifest sealing obligation. The sidecar is rebuilt
+    /// against the frozen WAL before callers replay any batch from it.
+    fn load_v7_sealed_recovery_source(
+        database_path: &Path,
+        state: &crate::pitr::manifest::PitrState,
+        segment_id: u64,
+        wal_path: &Path,
+        header: crate::wal::v7::codec::WalV7Header,
+    ) -> Result<crate::pitr::seal::V7Seal> {
+        use crate::pitr::manifest::{ObligationState, PitrWalFormat};
+
+        let obligation = state
+            .obligations
+            .get(&segment_id)
+            .ok_or_else(|| anyhow!("v7 PITR source has no manifest sealing obligation"))?;
+        ensure!(
+            matches!(
+                obligation.state,
+                ObligationState::Sealed | ObligationState::Archived | ObligationState::Reclaimable
+            ) && obligation.wal_format == PitrWalFormat::V7,
+            "v7 PITR source is not covered by a durable Sealed obligation"
+        );
+        let boundary = obligation
+            .immutable_boundary
+            .ok_or_else(|| anyhow!("v7 PITR Sealed obligation has no immutable boundary"))?;
+        ensure!(
+            obligation.logical_length == boundary.sealed_end
+                && boundary.active.segment_id == segment_id
+                && header.segment_id.0 == segment_id
+                && header.timeline_id.0 == boundary.active.timeline_id
+                && header.archive_epoch_id.0 == boundary.active.archive_epoch_id,
+            "v7 PITR source identity differs from its Sealed obligation"
+        );
+        if let Some(timeline_id) = state.timeline_id {
+            ensure!(
+                header.timeline_id.0 == timeline_id,
+                "sealed v7 PITR source timeline differs from its manifest"
+            );
+        }
+        if let Some(archive_epoch_id) = state.archive_epoch_id {
+            ensure!(
+                header.archive_epoch_id.0 == archive_epoch_id,
+                "sealed v7 PITR source archive epoch differs from its manifest"
+            );
+        }
+        let max_segment_bytes = state
+            .config
+            .as_ref()
+            .ok_or_else(|| anyhow!("PITR state is missing its persisted configuration"))?
+            .max_segment_bytes;
+        ensure!(
+            boundary.sealed_end <= max_segment_bytes,
+            "sealed v7 PITR source exceeds the persisted segment limit"
+        );
+
+        let seal_path = database_path.join(format!("pitr-{segment_id:020}.seal"));
+        let (format, bytes) =
+            crate::pitr::seal::read_seal_sidecar(&seal_path, Some(max_segment_bytes))?;
+        ensure!(
+            format == crate::pitr::seal::SealSidecarFormat::V7,
+            "v7 PITR source has a non-v7 seal sidecar"
+        );
+        let seal = crate::pitr::seal::V7Seal::decode(&bytes, max_segment_bytes)?;
+        ensure!(
+            seal.header == header && seal.boundary == boundary,
+            "v7 PITR seal differs from its manifest obligation or WAL header"
+        );
+
+        let mut wal = File::open(wal_path)
+            .with_context(|| format!("open sealed v7 PITR WAL {}", wal_path.display()))?;
+        let wal_len = wal.metadata()?.len();
+        ensure!(
+            wal_len == boundary.sealed_end,
+            "sealed v7 PITR source length differs from its immutable boundary"
+        );
+        let (verified_seal, verified_bytes) = crate::pitr::seal::build_v7_seal_from_reader(
+            &mut wal,
+            wal_len,
+            boundary.active,
+            header.predecessor,
+        )?;
+        ensure!(
+            verified_seal == seal && verified_bytes == bytes,
+            "sealed v7 PITR WAL does not match its immutable sidecar"
+        );
+
+        Ok(seal)
+    }
+
     /// Build a v7 recovery ledger whose Active image has room for both the
     /// recovered source and a fresh-inode replacement. Existing PITR
     /// obligations reduce the capacity available to this Active segment.
@@ -8135,44 +8225,98 @@ impl LsmStorageInner {
             }
             let mut recovered_v7_active_segment_id = None;
             let mut recovered_v7_active_memtable_id = None;
-            // V7 currently supports recovery only for the manifest Active
-            // segment. Check for unsupported immutable/sealed v7 images even
-            // when there are no immutable memtables to trigger the fallback
-            // scanner below; silently ignoring one would lose WAL data.
-            if im_memtables.is_empty() {
-                for entry in std::fs::read_dir(path)? {
-                    let candidate = entry?.path();
-                    let is_pitr_wal = candidate
-                        .file_name()
-                        .and_then(|name| name.to_str())
-                        .is_some_and(|name| name.starts_with("pitr-") && name.ends_with(".wal"));
-                    if !is_pitr_wal {
-                        continue;
-                    }
+            let mut v7_pitr_sealed_sources: BTreeMap<u64, (PathBuf, crate::pitr::seal::V7Seal)> =
+                BTreeMap::new();
+            // Manifest authority decides the required format before dispatching
+            // on untrusted file bytes. Sealed/Archived sources remain required
+            // after their memtables flush. A Reclaimable source is still needed
+            // while a nonempty memtable awaits its durable Flush record.
+            for (&segment_id, obligation) in &pitr_state.obligations {
+                use crate::pitr::manifest::{ObligationState, PitrWalFormat};
 
-                    let mut file = std::fs::File::open(&candidate)?;
-                    let mut version_bytes = [0; 6];
-                    std::io::Read::read_exact(&mut file, &mut version_bytes)?;
-                    let format_version = u16::from_be_bytes(version_bytes[4..6].try_into()?);
-                    if format_version != crate::wal::format::WAL_FORMAT_VERSION_V7 {
-                        continue;
-                    }
-
-                    let mut bytes = vec![0; crate::pitr::WAL_V5_HEADER_LEN];
-                    std::io::Seek::seek(&mut file, std::io::SeekFrom::Start(0))?;
-                    std::io::Read::read_exact(&mut file, &mut bytes)?;
-                    let header = crate::wal::v7::codec::WalV7Header::decode(&bytes)?;
-                    let expected_name = format!("pitr-{:020}.wal", header.segment_id.0);
-                    ensure!(
-                        candidate.file_name().and_then(|name| name.to_str())
-                            == Some(expected_name.as_str()),
-                        "PITR WAL filename does not match its segment identity"
-                    );
-                    ensure!(
-                        pitr_state.active_segment_id == Some(header.segment_id.0),
-                        "v7 PITR recovery currently supports only the manifest Active segment"
-                    );
+                let needs_reclaimable_replay = obligation.state == ObligationState::Reclaimable
+                    && obligation.logical_length
+                        != (crate::wal::v7::codec::WAL_V7_HEADER_LEN
+                            + crate::wal::v7::codec::WAL_V7_FRAME_LEN)
+                            as u64
+                    && pitr_memtable_segments.iter().any(|(id, mapped_segment)| {
+                        *mapped_segment == segment_id && im_memtables.contains(id)
+                    });
+                if obligation.wal_format != PitrWalFormat::V7
+                    || !(matches!(
+                        obligation.state,
+                        ObligationState::Sealed | ObligationState::Archived
+                    ) || needs_reclaimable_replay)
+                {
+                    continue;
                 }
+
+                let candidate = path.join(format!("pitr-{segment_id:020}.wal"));
+                let mut file = File::open(&candidate).with_context(|| {
+                    format!(
+                        "open manifest-bound sealed v7 PITR WAL {}",
+                        candidate.display()
+                    )
+                })?;
+                let mut bytes = [0; crate::wal::v7::codec::WAL_V7_HEADER_LEN];
+                std::io::Read::read_exact(&mut file, &mut bytes)?;
+                let header = crate::wal::v7::codec::WalV7Header::decode(&bytes)
+                    .context("persisted sealed v7 obligation requires a canonical v7 WAL header")?;
+                let seal = Self::load_v7_sealed_recovery_source(
+                    path,
+                    &pitr_state,
+                    segment_id,
+                    &candidate,
+                    header,
+                )?;
+                v7_pitr_sealed_sources.insert(segment_id, (candidate, seal));
+            }
+            for entry in std::fs::read_dir(path)? {
+                let candidate = entry?.path();
+                let is_pitr_wal = candidate
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("pitr-") && name.ends_with(".wal"));
+                if !is_pitr_wal {
+                    continue;
+                }
+
+                let mut file = std::fs::File::open(&candidate)?;
+                let mut version_bytes = [0; 6];
+                std::io::Read::read_exact(&mut file, &mut version_bytes)?;
+                let format_version = u16::from_be_bytes(version_bytes[4..6].try_into()?);
+                if format_version != crate::wal::format::WAL_FORMAT_VERSION_V7 {
+                    continue;
+                }
+
+                let mut bytes = vec![0; crate::wal::v7::codec::WAL_V7_HEADER_LEN];
+                std::io::Seek::seek(&mut file, std::io::SeekFrom::Start(0))?;
+                std::io::Read::read_exact(&mut file, &mut bytes)?;
+                let header = crate::wal::v7::codec::WalV7Header::decode(&bytes)?;
+                let segment_id = header.segment_id.0;
+                let expected_name = format!("pitr-{segment_id:020}.wal");
+                ensure!(
+                    candidate.file_name().and_then(|name| name.to_str())
+                        == Some(expected_name.as_str()),
+                    "PITR WAL filename does not match its segment identity"
+                );
+                if pitr_state.active_segment_id == Some(segment_id) {
+                    continue;
+                }
+
+                let obligation = pitr_state.obligations.get(&segment_id);
+                if obligation.is_some_and(|obligation| {
+                    obligation.state == crate::pitr::manifest::ObligationState::Reclaimable
+                }) {
+                    // Reclamation may have crashed after unlinking either half
+                    // of a flushed source's pair. Sources still needed for
+                    // replay were strictly validated above.
+                    continue;
+                }
+                ensure!(
+                    v7_pitr_sealed_sources.contains_key(&segment_id),
+                    "v7 PITR source is not covered by a durable Sealed obligation"
+                );
             }
             // build imm_memtables and memtable
             if !im_memtables.is_empty() {
@@ -8203,23 +8347,30 @@ impl LsmStorageInner {
                                     == Some(expected_name.as_str()),
                                 "PITR WAL filename does not match its segment identity"
                             );
-                            let active_segment_id = pitr_state.active_segment_id.ok_or_else(|| {
-                                anyhow!("v7 PITR WAL exists without a manifest Active segment")
-                            })?;
-                            ensure!(
-                                header.segment_id.0 == active_segment_id,
-                                "v7 PITR recovery currently supports only the manifest Active segment"
-                            );
-                            ensure!(
-                                options.enable_wal,
-                                "opening a v7 Active PITR WAL requires enable_wal"
-                            );
-                            ensure!(
-                                recovered_v7_active_segment_id
-                                    .replace(active_segment_id)
-                                    .is_none(),
-                                "duplicate v7 Active PITR WAL"
-                            );
+                            let segment_id = header.segment_id.0;
+                            if pitr_state.active_segment_id == Some(segment_id) {
+                                ensure!(
+                                    options.enable_wal,
+                                    "opening a v7 Active PITR WAL requires enable_wal"
+                                );
+                                ensure!(
+                                    recovered_v7_active_segment_id
+                                        .replace(segment_id)
+                                        .is_none(),
+                                    "duplicate v7 Active PITR WAL"
+                                );
+                            } else {
+                                ensure!(
+                                    v7_pitr_sealed_sources.contains_key(&segment_id)
+                                        || pitr_state.obligations.get(&segment_id).is_some_and(
+                                            |obligation| {
+                                                obligation.state
+                                                    == crate::pitr::manifest::ObligationState::Reclaimable
+                                            }
+                                        ),
+                                    "v7 PITR WAL has no Active or Sealed manifest authority"
+                                );
+                            }
 
                             return Ok(None);
                         }
@@ -8291,6 +8442,16 @@ impl LsmStorageInner {
                 // freeze has started since, and filtering by it drops exactly the
                 // WALs the newest memtables were written to.
                 let mut im_memtables = im_memtables;
+                for (&id, &segment_id) in &pitr_memtable_segments {
+                    if !im_memtables.contains(&id) {
+                        continue;
+                    }
+                    let legacy_path = Self::path_of_wal_static(path, id);
+                    ensure!(
+                        !legacy_path.try_exists()?,
+                        "memtable {id} is mapped to PITR segment {segment_id}, but its ordinary WAL also exists"
+                    );
+                }
                 if let Some(active_segment_id) = recovered_v7_active_segment_id {
                     let active_ids = pitr_memtable_segments
                         .iter()
@@ -8313,6 +8474,14 @@ impl LsmStorageInner {
                     .copied()
                     .filter(|id| !Self::path_of_wal_static(path, *id).exists())
                     .collect::<Vec<_>>();
+                let mut selected_v7 = BTreeMap::new();
+                for id in &missing_ids {
+                    if let Some(segment_id) = pitr_memtable_segments.get(id)
+                        && let Some((wal_path, seal)) = v7_pitr_sealed_sources.get(segment_id)
+                    {
+                        selected_v7.insert(*id, (*segment_id, wal_path.clone(), seal.clone()));
+                    }
+                }
                 // A memtable whose WAL is gone cannot be recovered from anything
                 // else, so refusing to open preserves nothing. When the caller
                 // has explicitly asked for repair, drop the entries that have no
@@ -8323,7 +8492,7 @@ impl LsmStorageInner {
                 // stays fail-closed.
                 if repair_unrecoverable
                     && pitr_state.timeline_id.is_none()
-                    && missing_ids.len() > pitr_wal_fallbacks.len()
+                    && missing_ids.len() > pitr_wal_fallbacks.len() + selected_v7.len()
                 {
                     let dropped_ids: Vec<_> = missing_ids
                         .drain(..missing_ids.len() - pitr_wal_fallbacks.len())
@@ -8340,6 +8509,7 @@ impl LsmStorageInner {
                     // make the next open fail in the same way.
                     needs_manifest_upgrade = true;
                 }
+                selected_v7.retain(|id, _| missing_ids.contains(id));
                 // A memtable the barrier froze into a segment that has since been
                 // reclaimed outlives its own WAL, and the record of it outlives
                 // the memtable. An *empty* memtable is dropped from the
@@ -8369,8 +8539,14 @@ impl LsmStorageInner {
                                     |obligation| {
                                         obligation.state
                                             == crate::pitr::manifest::ObligationState::Reclaimable
-                                            && obligation.logical_length
+                                            && (obligation.logical_length
                                                 == crate::pitr::WAL_V5_HEADER_LEN as u64
+                                                || (obligation.wal_format
+                                                    == crate::pitr::manifest::PitrWalFormat::V7
+                                                    && obligation.logical_length
+                                                        == (crate::wal::v7::codec::WAL_V7_HEADER_LEN
+                                                            + crate::wal::v7::codec::WAL_V7_FRAME_LEN)
+                                                            as u64))
                                     },
                                 )
                         })
@@ -8394,8 +8570,14 @@ impl LsmStorageInner {
                     // would warn about it.
                     needs_manifest_upgrade = true;
                 }
+                selected_v7.retain(|id, _| missing_ids.contains(id));
+                let legacy_missing_ids = missing_ids
+                    .iter()
+                    .copied()
+                    .filter(|id| !selected_v7.contains_key(id))
+                    .collect::<Vec<_>>();
                 ensure!(
-                    missing_ids.len() <= pitr_wal_fallbacks.len(),
+                    legacy_missing_ids.len() <= pitr_wal_fallbacks.len(),
                     "not enough identity-matched PITR WALs for immutable memtables"
                 );
                 let mut by_segment = pitr_wal_fallbacks
@@ -8410,7 +8592,13 @@ impl LsmStorageInner {
                 let mut selected: BTreeMap<usize, (u64, PathBuf, _)> = BTreeMap::new();
                 let mut unrecorded_ids = Vec::new();
                 let mut recorded_segments: BTreeMap<u64, usize> = BTreeMap::new();
-                for id in &missing_ids {
+                for (&id, (segment_id, _, _)) in &selected_v7 {
+                    ensure!(
+                        recorded_segments.insert(*segment_id, id).is_none(),
+                        "two memtables record the same PITR segment {segment_id}"
+                    );
+                }
+                for id in &legacy_missing_ids {
                     match pitr_memtable_segments.get(id) {
                         Some(segment_id) => {
                             ensure!(
@@ -8459,9 +8647,14 @@ impl LsmStorageInner {
                 // the segment files no longer line up, and recovering would hand
                 // a memtable writes that are not its own.
                 ensure!(
-                    selected
-                        .values()
-                        .map(|(segment_id, ..)| *segment_id)
+                    missing_ids
+                        .iter()
+                        .filter_map(|id| {
+                            selected_v7
+                                .get(id)
+                                .map(|(segment_id, ..)| *segment_id)
+                                .or_else(|| selected.get(id).map(|(segment_id, ..)| *segment_id))
+                        })
                         .is_sorted(),
                     "recorded PITR segments do not follow the memtables' order"
                 );
@@ -8481,6 +8674,7 @@ impl LsmStorageInner {
                 let newest_claimed = selected
                     .values()
                     .map(|(segment_id, ..)| *segment_id)
+                    .chain(selected_v7.values().map(|(segment_id, ..)| *segment_id))
                     .chain(recovered_v7_active_segment_id)
                     .max();
                 let unowned = newest_claimed.map_or(0, |newest| newest + 1);
@@ -8502,8 +8696,11 @@ impl LsmStorageInner {
                         )
                     })?;
                 }
-                recovered_pitr_segment_id =
-                    selected.values().map(|(segment_id, ..)| *segment_id).max();
+                recovered_pitr_segment_id = selected
+                    .values()
+                    .map(|(segment_id, ..)| *segment_id)
+                    .chain(selected_v7.values().map(|(segment_id, ..)| *segment_id))
+                    .max();
                 if recovered_v7_active_segment_id.is_some() {
                     recovered_pitr_segment_id = recovered_v7_active_segment_id;
                 }
@@ -8524,6 +8721,8 @@ impl LsmStorageInner {
                                 && pitr_state.obligations.get(&newest).is_some_and(
                                     |obligation| {
                                         obligation.successor_segment_id == frontier
+                                            && obligation.wal_format
+                                                == crate::pitr::manifest::PitrWalFormat::LegacyV5V6
                                             && matches!(
                                                 obligation.state,
                                                 crate::pitr::manifest::ObligationState::Sealing
@@ -8545,22 +8744,36 @@ impl LsmStorageInner {
                     );
                 }
                 for id in im_memtables {
-                    let legacy_path = Self::path_of_wal_static(path, id);
-                    let (wal_path, pitr_segment_id) = if legacy_path.exists() {
-                        (legacy_path, None)
-                    } else {
-                        let (segment_id, path, _) = selected
-                            .remove(&id)
-                            .ok_or_else(|| anyhow!("missing WAL for immutable memtable {id}"))?;
-                        (path, Some(segment_id))
-                    };
-                    let (m, wal_max_ts) =
-                        MemTable::recover_from_wal_with_range_tombstones_and_mode(
-                            id,
-                            vlog_enabled,
-                            wal_path,
-                            wal_io_mode,
-                        )?;
+                    let (m, wal_max_ts, pitr_segment_id) =
+                        if let Some((segment_id, wal_path, seal)) = selected_v7.remove(&id) {
+                            let (memtable, max_ts) = MemTable::recover_from_v7_sealed(
+                                id,
+                                vlog_enabled,
+                                wal_path,
+                                &seal,
+                                crate::pitr::LIVE_WAL_V5_LIMITS,
+                            )?;
+                            (memtable, max_ts, Some(segment_id))
+                        } else {
+                            let legacy_path = Self::path_of_wal_static(path, id);
+                            let (wal_path, segment_id) = if legacy_path.exists() {
+                                (legacy_path, None)
+                            } else {
+                                let (segment_id, wal_path, _) =
+                                    selected.remove(&id).ok_or_else(|| {
+                                        anyhow!("missing WAL for immutable memtable {id}")
+                                    })?;
+                                (wal_path, Some(segment_id))
+                            };
+                            let (memtable, max_ts) =
+                                MemTable::recover_from_wal_with_range_tombstones_and_mode(
+                                    id,
+                                    vlog_enabled,
+                                    wal_path,
+                                    wal_io_mode,
+                                )?;
+                            (memtable, max_ts, segment_id)
+                        };
                     if wal_max_ts > max_commit_ts {
                         max_commit_ts = wal_max_ts;
                     }
@@ -8595,6 +8808,10 @@ impl LsmStorageInner {
                     }
                 }
                 ensure!(selected.is_empty(), "unused PITR WAL recovery mapping");
+                ensure!(
+                    selected_v7.is_empty(),
+                    "unused v7 PITR WAL recovery mapping"
+                );
             }
 
             if options.enable_wal
@@ -16555,6 +16772,315 @@ mod tests {
             pitr_repository: Some(directory.join("repository")),
             ..LsmStorageOptions::default_for_test()
         })
+    }
+
+    /// Model a crash after SegmentSealed and the successor's empty boundary
+    /// became durable, with the source memtable still awaiting its Flush record.
+    #[cfg(target_os = "linux")]
+    fn v7_sealed_recovery_test_database(
+        directory: &std::path::Path,
+    ) -> anyhow::Result<(LsmStorageOptions, std::path::PathBuf)> {
+        use sha2::Digest;
+
+        use crate::{
+            manifest::ManifestRecord,
+            pitr::{
+                ChainAnchor, CommitTimeHighWater, SegmentAnchor, SegmentId,
+                manifest::{
+                    ActiveBoundary, PersistedChainAnchor, PersistedCommitAnchor,
+                    PersistedRecordedAt, PitrManifestRecord,
+                },
+            },
+            wal::v7::codec::{WAL_V7_HEADER_LEN, WalV7Header},
+        };
+
+        let mut options = v7_recovery_test_database(directory)?;
+        let database = directory.join("db");
+        let engine = KvEngine::open(&database, options.clone())?;
+        engine.sync()?;
+        let state = engine.pitr_manifest_state.lock().clone();
+        let source_wal = engine
+            .inner
+            .state
+            .load()
+            .memtable
+            .wal_path()
+            .unwrap()
+            .to_path_buf();
+        let successor_memtable_id = engine.inner.next_sst_id();
+        engine.close_storage()?;
+        drop(engine);
+
+        let source_bytes = std::fs::read(&source_wal)?;
+        let header = WalV7Header::decode(&source_bytes[..WAL_V7_HEADER_LEN])?;
+        let (seal, seal_bytes) = crate::pitr::seal::build_v7_seal(
+            &source_bytes,
+            state.active_boundary.unwrap(),
+            header.predecessor,
+        )?;
+        std::fs::write(source_wal.with_extension("seal"), &seal_bytes)?;
+        let seal_digest = sha2::Sha256::digest(&seal_bytes).into();
+        let successor_header = WalV7Header {
+            segment_id: SegmentId(state.next_segment_id),
+            incarnation: [9; 16],
+            predecessor: ChainAnchor::Segment(SegmentAnchor {
+                segment_id: header.segment_id,
+                wal_digest: seal.boundary.wal_digest,
+                seal_digest,
+            }),
+            ..header
+        };
+        crate::wal::v7::install::create_empty_active_image(
+            database.join(format!("pitr-{:020}.wal", state.next_segment_id)),
+            successor_header,
+        )?;
+        let last = seal.entries.last().unwrap();
+        let recorded_at = PersistedRecordedAt {
+            secs: last.recorded_at.secs,
+            nanos: last.recorded_at.nanos,
+        };
+        let records = [
+            ManifestRecord::Pitr(PitrManifestRecord::SealStarted {
+                segment_id: header.segment_id.0,
+                successor_segment_id: state.next_segment_id,
+                logical_length: seal.boundary.sealed_end,
+                immutable_boundary: Some(seal.boundary),
+            }),
+            ManifestRecord::NewPitrMemtable {
+                id: successor_memtable_id,
+                segment_id: state.next_segment_id,
+            },
+            ManifestRecord::Pitr(PitrManifestRecord::SegmentSealed {
+                segment_id: header.segment_id.0,
+                segment_anchor: PersistedChainAnchor::Segment {
+                    segment_id: header.segment_id.0,
+                    wal_digest: seal.boundary.wal_digest,
+                    seal_digest,
+                },
+                last_recorded_at: Some(recorded_at),
+                last_commit_anchor: Some(PersistedCommitAnchor {
+                    segment_id: header.segment_id.0,
+                    commit_ts: last.commit_ts,
+                    recorded_at,
+                    entry_digest: crate::pitr::commit_time_entry_digest(CommitTimeHighWater {
+                        archive_epoch_id: header.archive_epoch_id,
+                        segment_id: header.segment_id,
+                        commit_ts: last.commit_ts,
+                        recorded_at: last.recorded_at,
+                        entry_digest: [0; 32],
+                    }),
+                }),
+            }),
+            ManifestRecord::Pitr(PitrManifestRecord::ActiveBoundaryAdvanced {
+                boundary: ActiveBoundary {
+                    timeline_id: successor_header.timeline_id.0,
+                    archive_epoch_id: successor_header.archive_epoch_id.0,
+                    segment_id: successor_header.segment_id.0,
+                    incarnation: successor_header.incarnation,
+                    ticket_end: 0,
+                    durable_end: WAL_V7_HEADER_LEN as u64,
+                    last_commit_ts: 0,
+                    prefix_digest: successor_header.digest()?,
+                },
+            }),
+        ];
+        crate::manifest::Manifest::recover(database.join("MANIFEST"))?
+            .0
+            .add_records_when_init(&records)?;
+        // Exercise restart replay before repository resume can archive and
+        // reclaim the source whose on-disk state the test is inspecting.
+        options.pitr_repository = None;
+
+        Ok((options, source_wal))
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn v7_sealed_recovery_rejects_legacy_source_replacements() -> anyhow::Result<()> {
+        for flush_source in [false, true] {
+            for version in [
+                crate::pitr::WAL_V5_VERSION_LEGACY,
+                crate::pitr::WAL_V5_VERSION,
+            ] {
+                let directory = tempdir()?;
+                let (options, source_wal) = v7_sealed_recovery_test_database(directory.path())?;
+                let database = directory.path().join("db");
+                if flush_source {
+                    let engine = KvEngine::open(&database, options.clone())?;
+                    assert!(!engine.inner.state.load().imm_memtables.is_empty());
+                    while !engine.inner.state.load().imm_memtables.is_empty() {
+                        engine.inner.force_flush_next_imm_memtable()?;
+                    }
+                    engine.close_storage()?;
+                }
+                let header =
+                    crate::wal::v7::codec::WalV7Header::decode(&std::fs::read(&source_wal)?)?;
+                let replacement = crate::pitr::encode_v5_file_header(crate::pitr::WalV5Header {
+                    wal_format_version: version,
+                    timeline_id: header.timeline_id,
+                    archive_epoch_id: header.archive_epoch_id,
+                    segment_id: header.segment_id,
+                    predecessor: header.predecessor,
+                })?;
+                std::fs::write(&source_wal, replacement)?;
+                let manifest_before = std::fs::read(database.join("MANIFEST"))?;
+                let opened = KvEngine::open(&database, options);
+                if let Ok(engine) = &opened {
+                    engine.close_storage()?;
+                }
+                assert!(
+                    opened.is_err(),
+                    "accepted legacy v{version} over a sealed v7 obligation with flush_source={flush_source}"
+                );
+                assert_eq!(std::fs::read(&source_wal)?, replacement);
+                assert_eq!(std::fs::read(database.join("MANIFEST"))?, manifest_before);
+            }
+        }
+
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn v7_sealed_recovery_requires_retained_source_pair_after_flush() -> anyhow::Result<()> {
+        use crate::manifest::ManifestRecord;
+
+        for archived in [false, true] {
+            for missing_wal in [false, true] {
+                let directory = tempdir()?;
+                let (options, source_wal) = v7_sealed_recovery_test_database(directory.path())?;
+                let database = directory.path().join("db");
+                let engine = KvEngine::open(&database, options.clone())?;
+                while !engine.inner.state.load().imm_memtables.is_empty() {
+                    engine.inner.force_flush_next_imm_memtable()?;
+                }
+                engine.close_storage()?;
+                drop(engine);
+                if archived {
+                    let header =
+                        crate::wal::v7::codec::WalV7Header::decode(&std::fs::read(&source_wal)?)?;
+                    crate::manifest::Manifest::recover(database.join("MANIFEST"))?
+                        .0
+                        .add_record_when_init(ManifestRecord::Pitr(
+                            crate::pitr::manifest::PitrManifestRecord::SegmentArchived {
+                                segment_id: header.segment_id.0,
+                            },
+                        ))?;
+                }
+                let missing = if missing_wal {
+                    source_wal.clone()
+                } else {
+                    source_wal.with_extension("seal")
+                };
+                std::fs::remove_file(&missing)?;
+                let manifest_before = std::fs::read(database.join("MANIFEST"))?;
+                let opened = KvEngine::open(&database, options);
+                if let Ok(engine) = &opened {
+                    engine.close_storage()?;
+                }
+                assert!(
+                    opened.is_err(),
+                    "accepted a missing retained v7 source: archived={archived}, missing_wal={missing_wal}"
+                );
+                assert!(!missing.exists());
+                assert_eq!(std::fs::read(database.join("MANIFEST"))?, manifest_before);
+            }
+        }
+
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn v7_reclaimable_unflushed_source_replays_before_cleanup() -> anyhow::Result<()> {
+        use crate::{
+            manifest::ManifestRecord,
+            pitr::manifest::{ObligationState, PitrManifestRecord},
+        };
+
+        let directory = tempdir()?;
+        let (options, source_wal) = v7_sealed_recovery_test_database(directory.path())?;
+        let database = directory.path().join("db");
+        let source_bytes = std::fs::read(&source_wal)?;
+        let source_header = crate::wal::v7::codec::WalV7Header::decode(&source_bytes)?;
+        let segment_id = source_header.segment_id.0;
+        crate::manifest::Manifest::recover(database.join("MANIFEST"))?
+            .0
+            .add_records_when_init(&[
+                ManifestRecord::Pitr(PitrManifestRecord::SegmentArchived { segment_id }),
+                ManifestRecord::Pitr(PitrManifestRecord::SegmentReclaimable { segment_id }),
+            ])?;
+
+        let engine = KvEngine::open(&database, options.clone())?;
+        assert_eq!(engine.get(b"v7-key")?, Some(Bytes::from_static(b"v")));
+        assert_eq!(std::fs::read(&source_wal)?, source_bytes);
+        assert_eq!(
+            engine.pitr_manifest_state.lock().obligations[&segment_id].state,
+            ObligationState::Reclaimable
+        );
+        let source = engine.inner.state.load().imm_memtables[0].clone();
+        assert!(source.uses_v7_wal());
+        assert!(source.uses_pitr_batch_wal());
+        assert!(source.wal_v7_reservation_owner().is_none());
+        drop(source);
+        while !engine.inner.state.load().imm_memtables.is_empty() {
+            engine.inner.force_flush_next_imm_memtable()?;
+        }
+        assert!(!source_wal.exists());
+        assert!(!source_wal.with_extension("seal").exists());
+        assert!(
+            !engine
+                .pitr_manifest_state
+                .lock()
+                .obligations
+                .contains_key(&segment_id)
+        );
+        engine.close_storage()?;
+        drop(engine);
+
+        let reopened = KvEngine::open(&database, options)?;
+        assert_eq!(reopened.get(b"v7-key")?, Some(Bytes::from_static(b"v")));
+        reopened.close_storage()?;
+
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn v7_reclaimable_flushed_source_allows_partial_cleanup() -> anyhow::Result<()> {
+        use crate::{manifest::ManifestRecord, pitr::manifest::PitrManifestRecord};
+
+        for missing_wal in [false, true] {
+            let directory = tempdir()?;
+            let (options, source_wal) = v7_sealed_recovery_test_database(directory.path())?;
+            let database = directory.path().join("db");
+            let header = crate::wal::v7::codec::WalV7Header::decode(&std::fs::read(&source_wal)?)?;
+            let segment_id = header.segment_id.0;
+            let engine = KvEngine::open(&database, options.clone())?;
+            while !engine.inner.state.load().imm_memtables.is_empty() {
+                engine.inner.force_flush_next_imm_memtable()?;
+            }
+            engine.close_storage()?;
+            drop(engine);
+            crate::manifest::Manifest::recover(database.join("MANIFEST"))?
+                .0
+                .add_records_when_init(&[
+                    ManifestRecord::Pitr(PitrManifestRecord::SegmentArchived { segment_id }),
+                    ManifestRecord::Pitr(PitrManifestRecord::SegmentReclaimable { segment_id }),
+                ])?;
+            std::fs::remove_file(if missing_wal {
+                source_wal.clone()
+            } else {
+                source_wal.with_extension("seal")
+            })?;
+
+            let reopened = KvEngine::open(&database, options)?;
+            assert_eq!(reopened.get(b"v7-key")?, Some(Bytes::from_static(b"v")));
+            assert!(reopened.inner.state.load().imm_memtables.is_empty());
+            reopened.close_storage()?;
+        }
+
+        Ok(())
     }
 
     #[cfg(target_os = "linux")]
