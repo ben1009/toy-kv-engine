@@ -70,7 +70,20 @@ bounded decode/canonicalization workspace, recovery scan metadata, sidecar
 memory, and sidecar source-spool bytes before building. The Active resource
 ledger's transient-memory cap is sized for the maximum preparation estimate
 under its persisted segment limit. Wiring this primitive into successor
-rotation/publication and interrupted v7 Sealing/Sealed recovery remain.
+rotation/publication is not yet connected to the public recovery-point path;
+interrupted v7 Sealing/Sealed recovery also remains gated. Seal preparation
+now additionally reserves the successor's persistent image and atomic-install
+staging extents before `SealStarted`; the installed sidecar transition retains
+those charges until successor installation or cleanup. The guarded
+successor-install primitive creates a fresh v7 header plus generation-zero
+FRONTIER, consumes the pre-reserved extents, registers the successor in the
+engine manifest, and swaps it in only after commit admission is stopped. Before
+successor publication it reserves its own bounded verification workspace,
+rebuilds the seal from the exact frozen WAL image, and compares the installed
+sidecar in fixed-size chunks for byte-for-byte agreement. Recovery-point
+publication and interrupted v7 Sealing/Sealed recovery remain gated for the
+next lifecycle slice. Frozen v7 WALs remain archive sources after their
+memtables flush and are deleted only through PITR reclamation.
 Archive preparation now validates v7 seal descriptors
 against catalog metadata and strictly verifies the exact frozen WAL image;
 source-object digest checks use whole-image SHA-256 for v7 while retaining the

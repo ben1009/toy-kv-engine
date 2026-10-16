@@ -281,6 +281,84 @@ impl WalV7InstalledRecovery {
     }
 }
 
+/// Durably create and describe the canonical empty Active image for a new v7
+/// segment. This is a creation path, not recovery: the caller must have a
+/// durable manifest transition authorizing the segment identity and
+/// predecessor before publishing the returned image to writers.
+#[cfg(target_os = "linux")]
+pub(crate) fn create_empty_active_image(
+    path: impl AsRef<Path>,
+    header: WalV7Header,
+) -> Result<WalV7InstalledRecovery> {
+    let path = path.as_ref();
+    let header_bytes = header.encode()?;
+    let header_digest = header.digest()?;
+    let generation_zero = encode_generation_zero_frontier(header_digest)?;
+    let mut image = [0_u8; WAL_V7_HEADER_LEN + WAL_V7_FRAME_LEN];
+    image[..WAL_V7_HEADER_LEN].copy_from_slice(&header_bytes);
+    image[WAL_V7_HEADER_LEN..].copy_from_slice(&generation_zero);
+
+    crate::pitr::segment::install_pitr_file_no_replace(path, &image)?;
+
+    let mut file = File::open(path).context("open newly installed empty v7 Active WAL")?;
+    let metadata = file.metadata().context("inspect empty v7 Active WAL")?;
+    ensure!(
+        metadata.len() == image.len() as u64,
+        "new empty v7 Active WAL has an unexpected length"
+    );
+    let mut installed_bytes = [0_u8; WAL_V7_HEADER_LEN + WAL_V7_FRAME_LEN];
+    file.read_exact(&mut installed_bytes)
+        .context("verify newly installed empty v7 Active WAL")?;
+    ensure!(
+        installed_bytes == image,
+        "new empty v7 Active WAL differs from its canonical image"
+    );
+
+    let frame_offset = WAL_V7_HEADER_LEN as u64;
+    let decoded = decode_frame_structural(&generation_zero, frame_offset, &header_digest)?;
+    ensure!(
+        decoded.kind == WalV7FrameKind::Frontier,
+        "new empty v7 Active WAL does not begin with generation-zero FRONTIER"
+    );
+    let frontier = WalV7Frontier::decode_body(&decoded.body)?;
+    frontier.validate_generation_zero(&header_digest, frame_offset)?;
+
+    let mut logical_hasher = Sha256::new();
+    logical_hasher.update(header_bytes);
+    let mut physical_hasher = Sha256::new();
+    physical_hasher.update(header_bytes);
+    physical_hasher.update(generation_zero);
+    let frontier_digest = frame_record_digest(&generation_zero)?;
+    let active_boundary = ActiveBoundary {
+        timeline_id: header.timeline_id.0,
+        archive_epoch_id: header.archive_epoch_id.0,
+        segment_id: header.segment_id.0,
+        incarnation: header.incarnation,
+        ticket_end: 0,
+        durable_end: frame_offset,
+        last_commit_ts: 0,
+        prefix_digest: header_digest,
+    };
+
+    Ok(WalV7InstalledRecovery {
+        active_boundary,
+        header_digest,
+        frontier,
+        frontier_offset: frame_offset,
+        frontier_digest,
+        image_len: image.len() as u64,
+        append_offset: image.len() as u64,
+        next_ticket: 0,
+        installed_dev: metadata.dev(),
+        installed_ino: metadata.ino(),
+        last_recorded_at: None,
+        batches: Vec::new(),
+        seal_index: Vec::new(),
+        logical_hasher,
+        physical_hasher,
+    })
+}
+
 /// Discover, select, and install an Active v7 WAL using caller-supplied
 /// manifest authority.
 ///

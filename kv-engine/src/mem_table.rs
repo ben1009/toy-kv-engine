@@ -33,6 +33,9 @@ use crate::{
     wal::{Wal, WalIoMode},
 };
 
+#[cfg(target_os = "linux")]
+use crate::wal::v7::admission::WalV7RetainedResources;
+
 /// Expected number of entries per memtable for bloom filter sizing.
 /// At 1KB values and 1MB SST target, ~1000 entries. We size generously.
 const BLOOM_EXPECTED_ENTRIES: usize = 4096;
@@ -1123,6 +1126,62 @@ impl MemTable {
         ret.wal_path = Some(path);
 
         Ok(ret)
+    }
+
+    /// Create a fresh v7 Active segment with its canonical header and
+    /// generation-zero FRONTIER, then attach the selected writer runtime.
+    /// The caller must first persist the manifest obligation authorizing this
+    /// segment and its predecessor, and reserve both the installed image and
+    /// atomic-install staging extent before the predecessor's Sealing intent.
+    #[cfg(target_os = "linux")]
+    #[allow(dead_code)] // Connected to the v7 recovery-point successor transition next.
+    pub(crate) fn create_with_wal_v7_active(
+        id: usize,
+        vlog_enabled: bool,
+        path: impl AsRef<Path>,
+        header: crate::wal::v7::codec::WalV7Header,
+        max_file_size: u64,
+        retained_resources: Arc<WalV7RetainedResources>,
+        io_mode: WalIoMode,
+    ) -> Result<Self> {
+        let path = path.as_ref().to_path_buf();
+        let image_len = u64::try_from(
+            crate::wal::v7::codec::WAL_V7_HEADER_LEN + crate::wal::v7::codec::WAL_V7_FRAME_LEN,
+        )?;
+        anyhow::ensure!(
+            image_len <= max_file_size,
+            "v7 segment limit cannot hold an empty Active image"
+        );
+        anyhow::ensure!(
+            !path.try_exists()?,
+            "v7 successor WAL already exists; recovery must reconcile it before creation"
+        );
+        anyhow::ensure!(
+            retained_resources.has_pending_successor(header.segment_id.0),
+            "v7 successor capacity was not reserved before its Sealing intent"
+        );
+
+        let installed = crate::wal::v7::install::create_empty_active_image(&path, header)?;
+        retained_resources.activate_pending_successor(header.segment_id.0)?;
+        let reservation_owner = Arc::new(WalV7ReservationOwner::new_with_retained_resources(
+            retained_resources,
+            &installed,
+        )?);
+        let (memtable, recovered_commit_ts) = Self::recover_from_v7_active(
+            id,
+            vlog_enabled,
+            &path,
+            installed,
+            max_file_size,
+            reservation_owner,
+            io_mode,
+        )?;
+        anyhow::ensure!(
+            recovered_commit_ts == 0,
+            "new empty v7 successor unexpectedly contains committed batches"
+        );
+
+        Ok(memtable)
     }
 
     /// Create a new mem-table with WAL and vLog (kind-prefixed values).
