@@ -11,7 +11,7 @@
 //! and hash consumption, while the token continues to own persistent resources.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     error::Error,
     fmt,
     sync::{
@@ -136,6 +136,7 @@ pub(crate) enum WalV7ReservationError {
     UnknownReservation,
     ReservationMismatch,
     ReservationOwnerRetired,
+    ActiveOperationsOutstanding,
     AccountingUnderflow,
 }
 
@@ -156,6 +157,7 @@ impl fmt::Display for WalV7ReservationError {
             Self::UnknownReservation => "unknown or already released v7 reservation",
             Self::ReservationMismatch => "v7 reservation identity mismatch",
             Self::ReservationOwnerRetired => "v7 reservation owner has been retired",
+            Self::ActiveOperationsOutstanding => "v7 reservation owner still has active operations",
             Self::AccountingUnderflow => "v7 resource accounting underflow",
         })
     }
@@ -215,6 +217,7 @@ pub(crate) struct WalV7RetainedResources {
 #[derive(Debug, Default)]
 struct WalV7RetainedResourceState {
     by_segment: BTreeMap<u64, Vec<WalV7Reservation>>,
+    seal_sidecars_charged: BTreeSet<u64>,
     pending_successors: BTreeMap<u64, WalV7SuccessorReservation>,
     obligation_logical: BTreeMap<u64, WalV7Reservation>,
     startup_staging: Vec<WalV7Reservation>,
@@ -448,6 +451,27 @@ impl WalV7ReservationOwner {
         let mut state = self.state.lock();
         state.retired = true;
         release_retired_reservations(&mut state);
+        Ok(())
+    }
+
+    /// Release logical WAL quota after the segment is durably archived while
+    /// keeping its source-spool and seal-index charges until source cleanup.
+    pub(crate) fn release_logical_after_archive(
+        &self,
+        segment_id: u64,
+    ) -> Result<(), WalV7ReservationError> {
+        let mut state = self.state.lock();
+        if state.active_operations != 0 {
+            return Err(WalV7ReservationError::ActiveOperationsOutstanding);
+        }
+        for reservation in state.reservations.values_mut() {
+            self.ledger.release_logical_wal_bytes(reservation)?;
+        }
+        drop(state);
+
+        if let Some(resources) = &self.retained_resources {
+            resources.release_obligation_logical(segment_id);
+        }
         Ok(())
     }
 
@@ -739,6 +763,52 @@ impl WalV7ResourceLedger {
         Ok(())
     }
 
+    /// Retire a reservation's logical WAL quota after durable archive
+    /// publication. Physical source-spool and seal-index charges remain owned
+    /// by the token until durable local cleanup.
+    pub(crate) fn release_logical_wal_bytes(
+        &self,
+        reservation: &mut WalV7Reservation,
+    ) -> Result<(), WalV7ReservationError> {
+        if !Arc::ptr_eq(&reservation.ledger, &self.inner) {
+            return Err(WalV7ReservationError::ForeignReservation);
+        }
+        let mut state = self.inner.state.lock();
+        let issued_charge = state
+            .reservations
+            .get(&reservation.id)
+            .copied()
+            .ok_or(WalV7ReservationError::UnknownReservation)?;
+        if issued_charge != reservation.charge {
+            return Err(WalV7ReservationError::ReservationMismatch);
+        }
+        if issued_charge.logical_wal_bytes == 0 {
+            return Ok(());
+        }
+        let retired = WalV7ResourceCharge {
+            logical_wal_bytes: issued_charge.logical_wal_bytes,
+            ..WalV7ResourceCharge::default()
+        };
+        let retained = WalV7ResourceCharge {
+            logical_wal_bytes: 0,
+            ..issued_charge
+        };
+        let next = state
+            .charged
+            .checked_sub(retired)
+            .ok_or(WalV7ReservationError::AccountingUnderflow)?;
+
+        if retained.is_empty() {
+            state.reservations.remove(&reservation.id);
+            reservation.active = false;
+        } else {
+            state.reservations.insert(reservation.id, retained);
+        }
+        state.charged = next;
+        reservation.charge = retained;
+        Ok(())
+    }
+
     fn release_frontier_credit(
         &self,
         reservation: &mut WalV7Reservation,
@@ -820,6 +890,84 @@ impl WalV7RetainedResources {
             .or_default()
             .push(reservation);
         Ok(())
+    }
+
+    /// Transfer a seal's persistent spool charge to the source segment and
+    /// retire its temporary memory charge once the prepared seal is dropped.
+    pub(crate) fn retain_preparation_reservation(
+        &self,
+        segment_id: u64,
+        mut reservation: WalV7OwnedPreparationReservation,
+    ) -> Result<(), WalV7ReservationError> {
+        if !Arc::ptr_eq(&reservation.owner.ledger.inner, &self.ledger.inner) {
+            return Err(WalV7ReservationError::ForeignReservation);
+        }
+        let token = reservation
+            .reservation
+            .as_ref()
+            .ok_or(WalV7ReservationError::UnknownReservation)?;
+        if !Arc::ptr_eq(&token.ledger, &self.ledger.inner) {
+            return Err(WalV7ReservationError::ForeignReservation);
+        }
+        reservation.release_buffer_memory()?;
+        let token = reservation
+            .reservation
+            .take()
+            .ok_or(WalV7ReservationError::UnknownReservation)?;
+        let mut state = self.state.lock();
+        state.seal_sidecars_charged.insert(segment_id);
+        if token.charge.is_empty() {
+            drop(token);
+        } else {
+            state.by_segment.entry(segment_id).or_default().push(token);
+        }
+        drop(state);
+        // The preparation operation is complete, while its ledger token now
+        // remains owned by the source segment through durable reclamation.
+        drop(reservation);
+
+        Ok(())
+    }
+
+    /// Mark a recovered seal sidecar as included in its segment's reconstructed
+    /// source-spool reservation.
+    pub(crate) fn mark_seal_sidecar_charged(&self, segment_id: u64) {
+        self.state.lock().seal_sidecars_charged.insert(segment_id);
+    }
+
+    /// Retain the source-spool allocation of an already installed seal
+    /// sidecar. The marker and reservation are installed atomically so a
+    /// preparation failure cannot leave an on-disk sidecar uncharged.
+    pub(crate) fn retain_existing_seal_sidecar_charge(
+        &self,
+        segment_id: u64,
+        source_spool_bytes: u64,
+    ) -> Result<(), WalV7ReservationError> {
+        let mut state = self.state.lock();
+        if state.seal_sidecars_charged.contains(&segment_id) {
+            return Ok(());
+        }
+
+        let reservation = self.ledger.reserve(WalV7ResourceCharge {
+            source_spool_bytes,
+            ..WalV7ResourceCharge::default()
+        })?;
+        state
+            .by_segment
+            .entry(segment_id)
+            .or_default()
+            .push(reservation);
+        state.seal_sidecars_charged.insert(segment_id);
+        Ok(())
+    }
+
+    /// Whether the current resource ledger already owns the canonical seal
+    /// sidecar's source-spool charge for this segment.
+    pub(crate) fn has_seal_sidecar_charge(&self, segment_id: u64) -> bool {
+        self.state
+            .lock()
+            .seal_sidecars_charged
+            .contains(&segment_id)
     }
 
     /// Reserve both the successor's empty installed image and its atomic
@@ -978,6 +1126,7 @@ impl WalV7RetainedResources {
     pub(crate) fn release_segment(&self, segment_id: u64) {
         let mut state = self.state.lock();
         drop(state.by_segment.remove(&segment_id));
+        state.seal_sidecars_charged.remove(&segment_id);
         drop(state.pending_successors.remove(&segment_id));
         drop(state.obligation_logical.remove(&segment_id));
     }
@@ -1098,6 +1247,40 @@ mod tests {
 
         retained.release_segment(7);
         assert_eq!(retained.snapshot(), charge(0, 5, 0, 0, 0));
+    }
+
+    #[test]
+    fn archived_image_releases_logical_quota_but_retains_source_spool() {
+        let ledger = WalV7ResourceLedger::new(WalV7ResourceLimits {
+            max_logical_wal_bytes: 8192,
+            max_source_spool_bytes: 16384,
+            max_recovery_workspace_bytes: 4096,
+            max_buffer_memory_bytes: 4096,
+            max_seal_index_bytes: 32,
+        })
+        .unwrap();
+        let retained = WalV7RetainedResources::new(ledger.clone());
+        retained.reserve_obligation_logical(7, 4096).unwrap();
+        let reservation = ledger.reserve(charge(4096, 4096, 0, 0, 8)).unwrap();
+        let owner = WalV7ReservationOwner {
+            ledger: ledger.clone(),
+            retained_resources: Some(Arc::clone(&retained)),
+            installed_dev: 0,
+            installed_ino: 0,
+            state: Mutex::new(WalV7ReservationOwnerState {
+                retired: false,
+                active_operations: 0,
+                reservations: BTreeMap::from([(reservation.id, reservation)]),
+            }),
+        };
+
+        assert_eq!(ledger.snapshot(), charge(8192, 4096, 0, 0, 8));
+        owner.release_logical_after_archive(7).unwrap();
+        assert_eq!(ledger.snapshot(), charge(0, 4096, 0, 0, 8));
+
+        let successor = ledger.reserve(charge(8192, 8192, 0, 0, 8)).unwrap();
+        assert_eq!(ledger.snapshot(), charge(8192, 12288, 0, 0, 16));
+        drop(successor);
     }
 
     #[test]
