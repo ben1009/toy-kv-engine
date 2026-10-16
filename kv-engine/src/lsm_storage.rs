@@ -62,13 +62,16 @@ type LookupResult = (Option<Bytes>, KvKind, Bytes, u64, Option<u64>);
 type VersionedCasCandidate = Option<(Vec<u8>, u32)>;
 
 #[cfg(target_os = "linux")]
-#[must_use = "install only after durable SealStarted and retain its reservation until reclamation"]
+#[must_use = "install only after durable SealStarted and retain all reservations through reclamation"]
 pub(crate) struct PreparedV7PitrSeal<'guard> {
     seal: crate::pitr::seal::V7Seal,
     wal_path: PathBuf,
     seal_path: PathBuf,
     bytes: Vec<u8>,
     reservation: Option<crate::wal::v7::admission::WalV7OwnedPreparationReservation>,
+    successor_segment_id: u64,
+    retained_resources: Arc<crate::wal::v7::admission::WalV7RetainedResources>,
+    successor_reservation: Option<crate::wal::v7::admission::WalV7SuccessorReservation>,
     installed: bool,
     _lifecycle_guards: std::marker::PhantomData<&'guard ()>,
 }
@@ -13359,8 +13362,12 @@ impl LsmStorageInner {
     fn ensure_memtable_rotation_healthy(&self) -> Result<()> {
         ensure!(
             !self.state.load().memtable.uses_v7_wal(),
-            "cannot freeze a v7 Active PITR WAL before v7 sealing and rotation are implemented"
+            "ordinary memtable freeze cannot rotate a v7 Active PITR WAL"
         );
+        self.ensure_memtable_rotation_runtime_healthy()
+    }
+
+    fn ensure_memtable_rotation_runtime_healthy(&self) -> Result<()> {
         if let Some(mvcc) = &self.mvcc {
             mvcc.ensure_publication_healthy()?;
         }
@@ -13380,6 +13387,45 @@ impl LsmStorageInner {
         // WAL alone does not prove all memtable entries became visible; keep
         // the active WAL for recovery instead of persisting that hidden data.
         self.ensure_memtable_rotation_healthy()?;
+        self.install_memtable_successor_locked(new_memtable)
+    }
+
+    /// Install a v7 successor only after the old Active image is durably
+    /// sealed and commit admission is stopped. Ordinary freezes remain unable
+    /// to rotate a v7 Active WAL.
+    #[cfg(target_os = "linux")]
+    fn force_freeze_with_sealed_v7_successor_locked(
+        &self,
+        source_segment_id: u64,
+        successor_segment_id: u64,
+        new_memtable: mem_table::MemTable,
+        _active_memtable_guard: &ActiveMemtableWriteGuard<'_>,
+    ) -> Result<()> {
+        let active_memtable = self.state.load().memtable.clone();
+        ensure!(
+            active_memtable.uses_v7_wal()
+                && Self::pitr_segment_of(&active_memtable) == Some(source_segment_id),
+            "v7 Sealing source is not the active memtable"
+        );
+        ensure!(
+            new_memtable.uses_v7_wal(),
+            "v7 Sealing transition requires a v7 successor WAL"
+        );
+        ensure!(
+            Self::pitr_segment_of(&new_memtable) == Some(successor_segment_id),
+            "v7 successor memtable has a different segment identity"
+        );
+        ensure!(
+            self.mvcc
+                .as_ref()
+                .is_some_and(|sequencer| !sequencer.commit_admission_is_open()),
+            "v7 Sealing transition requires stopped commit admission"
+        );
+        self.ensure_memtable_rotation_runtime_healthy()?;
+        self.install_memtable_successor_locked(new_memtable)
+    }
+
+    fn install_memtable_successor_locked(&self, new_memtable: mem_table::MemTable) -> Result<()> {
         let mut state = self.state.load().as_ref().clone();
         // The active write guard waits for existing writers to finish WAL
         // durability and MVCC publication. Keep the immutable data and WAL,
@@ -13638,6 +13684,218 @@ impl LsmStorageInner {
         Ok(())
     }
 
+    /// Install a fresh v7 Active successor after its predecessor's durable
+    /// Sealing obligation and sidecar exist. The source manifest's
+    /// `SegmentSealed` transition still belongs to the caller, so commit
+    /// admission must remain closed until that transition is durable.
+    #[cfg(target_os = "linux")]
+    #[allow(dead_code)] // Connected to recovery-point publication in the next lifecycle step.
+    pub(crate) fn install_pitr_v7_successor(
+        &self,
+        header: crate::wal::v7::codec::WalV7Header,
+        state_lock: &MutexGuard<'_, ()>,
+        retained_resources: Arc<crate::wal::v7::admission::WalV7RetainedResources>,
+    ) -> Result<Arc<crate::wal::v7::admission::WalV7ReservationOwner>> {
+        ensure!(self.options.enable_wal, "PITR successor requires WAL");
+        self.ensure_memtable_rotation_runtime_healthy()?;
+
+        let state = self.pitr_state.lock().clone();
+        ensure!(
+            state.mode == crate::pitr::manifest::PitrMode::Enabled,
+            "v7 PITR successor requires enabled PITR"
+        );
+        ensure!(
+            self.mvcc
+                .as_ref()
+                .is_some_and(|sequencer| !sequencer.commit_admission_is_open()),
+            "v7 PITR successor requires stopped commit admission"
+        );
+        let segment_id = state
+            .active_segment_id
+            .ok_or_else(|| anyhow!("PITR state has no active segment"))?;
+        let successor_segment_id = state
+            .obligations
+            .get(&segment_id)
+            .filter(|obligation| {
+                obligation.state == crate::pitr::manifest::ObligationState::Sealing
+                    && obligation.wal_format == crate::pitr::manifest::PitrWalFormat::V7
+            })
+            .map(|obligation| obligation.successor_segment_id)
+            .ok_or_else(|| anyhow!("v7 PITR successor has no durable Sealing obligation"))?;
+        let immutable_boundary = state.obligations[&segment_id]
+            .immutable_boundary
+            .ok_or_else(|| anyhow!("v7 Sealing obligation has no immutable boundary"))?;
+        ensure!(
+            state.active_boundary == Some(immutable_boundary.active)
+                && header.segment_id.0 == successor_segment_id
+                && header.timeline_id.0 == immutable_boundary.active.timeline_id
+                && header.archive_epoch_id.0 == immutable_boundary.active.archive_epoch_id
+                && header.incarnation != immutable_boundary.active.incarnation,
+            "v7 successor identity differs from its Sealing obligation"
+        );
+        ensure!(
+            retained_resources.has_pending_successor(successor_segment_id)
+                || retained_resources.has_segment_reservation(successor_segment_id),
+            "v7 successor capacity was not reserved before its Sealing intent"
+        );
+        let next_segment_id = successor_segment_id
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("PITR segment ID exhausted"))?;
+        let active_guard = self.active_memtable_lock.write();
+        self.manifest
+            .as_ref()
+            .ok_or_else(|| anyhow!("manifest is not initialized"))?
+            .ensure_durability_certain()?;
+
+        let seal_path = self.path.join(format!("pitr-{segment_id:020}.seal"));
+        let config = state
+            .config
+            .as_ref()
+            .ok_or_else(|| anyhow!("PITR state has no persisted configuration"))?;
+        let max_segment_bytes = config.max_segment_bytes;
+        let current_memtable = self.state.load().memtable.clone();
+        ensure!(
+            current_memtable.uses_v7_wal()
+                && Self::pitr_segment_of(&current_memtable) == Some(segment_id),
+            "v7 Sealing source is not the active memtable"
+        );
+        let (_, current_boundary) = current_memtable.v7_active_boundaries()?;
+        ensure!(
+            current_boundary == immutable_boundary.active,
+            "active v7 WAL differs from its immutable Sealing boundary"
+        );
+        let current_owner = current_memtable
+            .wal_v7_reservation_owner()
+            .ok_or_else(|| anyhow!("active v7 PITR WAL has no reservation owner"))?;
+        let current_resources = current_owner
+            .retained_resources()
+            .ok_or_else(|| anyhow!("active v7 PITR WAL has no retained resource ledger"))?;
+        ensure!(
+            Arc::ptr_eq(&current_resources, &retained_resources),
+            "v7 successor does not share the active PITR resource ledger"
+        );
+        let expected_predecessor = {
+            use std::io::Read;
+
+            ensure!(
+                immutable_boundary.sealed_end <= max_segment_bytes,
+                "frozen v7 PITR WAL exceeds the persisted segment limit"
+            );
+            let verification_memory = crate::pitr::seal::V7Seal::preparation_memory_bytes(
+                immutable_boundary.sealed_end,
+                immutable_boundary.active.ticket_end,
+            )?;
+            // This helper is independently callable after seal preparation's
+            // temporary memory has retired. Keep its own reservation until all
+            // rebuilt seal and verification buffers have been dropped.
+            let _verification_reservation = current_owner
+                .reserve_preparation_buffer(verification_memory)?
+                .ok_or_else(|| anyhow!("v7 successor verification reservation is empty"))?;
+            let mut installed_seal = File::open(&seal_path)
+                .with_context(|| format!("open v7 predecessor seal {}", seal_path.display()))?;
+            ensure!(
+                installed_seal.metadata()?.len()
+                    == crate::pitr::seal::V7Seal::encoded_len_for_entry_count(
+                        immutable_boundary.active.ticket_end,
+                    )?,
+                "v7 predecessor seal length differs from its Sealing boundary"
+            );
+            let source_wal_path = current_memtable
+                .wal_path()
+                .ok_or_else(|| anyhow!("v7 Sealing source has no WAL path"))?;
+            let mut source_wal = File::open(source_wal_path).with_context(|| {
+                format!(
+                    "open frozen v7 PITR WAL {} for successor verification",
+                    source_wal_path.display()
+                )
+            })?;
+            let source_wal_len = source_wal.metadata()?.len();
+            ensure!(
+                source_wal_len == immutable_boundary.sealed_end,
+                "frozen v7 PITR WAL length differs from its Sealing boundary"
+            );
+            let source_predecessor = pitr_chain_anchor_from_persisted(
+                state
+                    .predecessor_anchor
+                    .ok_or_else(|| anyhow!("v7 PITR state has no predecessor anchor"))?,
+            );
+            let (verified_seal, verified_seal_bytes) =
+                crate::pitr::seal::build_v7_seal_from_reader(
+                    &mut source_wal,
+                    source_wal_len,
+                    immutable_boundary.active,
+                    source_predecessor,
+                )?;
+            ensure!(
+                verified_seal.boundary == immutable_boundary,
+                "frozen v7 PITR WAL differs from its durable Sealing boundary"
+            );
+            // Compare against the canonical rebuilt sidecar without holding a
+            // second encoded sidecar and decoded index outside the estimate.
+            let mut buffer = [0_u8; crate::wal::v7::codec::WAL_V7_FRAME_LEN];
+            for expected in verified_seal_bytes.chunks(buffer.len()) {
+                installed_seal.read_exact(&mut buffer[..expected.len()])?;
+                ensure!(
+                    &buffer[..expected.len()] == expected,
+                    "frozen v7 PITR WAL does not match its installed seal"
+                );
+            }
+            let mut trailing = [0_u8; 1];
+            ensure!(
+                installed_seal.read(&mut trailing)? == 0,
+                "v7 predecessor seal changed while verifying its frozen WAL"
+            );
+            crate::pitr::ChainAnchor::Segment(crate::pitr::SegmentAnchor {
+                segment_id: crate::pitr::SegmentId(segment_id),
+                wal_digest: immutable_boundary.wal_digest,
+                seal_digest: sha2::Sha256::digest(&verified_seal_bytes).into(),
+            })
+        };
+        ensure!(
+            header.predecessor == expected_predecessor,
+            "v7 successor predecessor differs from its installed seal"
+        );
+
+        let sst_id = self.next_sst_id();
+        let memtable = mem_table::MemTable::create_with_wal_v7_active(
+            sst_id,
+            self.vlog.is_some(),
+            self.path
+                .join(format!("pitr-{successor_segment_id:020}.wal")),
+            header,
+            config.max_segment_bytes,
+            retained_resources,
+            self.wal_io_mode,
+        )?;
+        // The v7 runtime enforces the physical segment limit, and its shared
+        // ledger enforces the persisted unarchived and source-spool budgets.
+        memtable.set_write_profile(self.write_profile.clone());
+        let owner = memtable
+            .wal_v7_reservation_owner()
+            .ok_or_else(|| anyhow!("new v7 PITR successor has no reservation owner"))?;
+        self.sync_dir()?;
+        self.manifest
+            .as_ref()
+            .ok_or_else(|| anyhow!("manifest is not initialized"))?
+            .add_record(
+                state_lock,
+                ManifestRecord::NewPitrMemtable {
+                    id: sst_id,
+                    segment_id: successor_segment_id,
+                },
+            )?;
+        self.force_freeze_with_sealed_v7_successor_locked(
+            segment_id,
+            successor_segment_id,
+            memtable,
+            &active_guard,
+        )?;
+        self.pitr_next_segment_id
+            .fetch_max(next_segment_id, Ordering::AcqRel);
+
+        Ok(owner)
+    }
+
     #[cfg(target_os = "linux")]
     fn install_post_pitr_wal(&self) -> Result<()> {
         ensure!(self.options.enable_wal, "PITR disable requires WAL");
@@ -13688,9 +13946,10 @@ impl LsmStorageInner {
     /// publishing it or mutating the source WAL. After stopping commit admission, the caller must
     /// acquire `state_lock` before the active-memtable write guard and hold both through
     /// the durable `SealStarted` transition and the subsequent installation.
-    /// The returned object borrows both guards. The returned reservation
-    /// accounts for both preparation memory and the sidecar's persistent spool
-    /// bytes; retain it until that sidecar is reclaimed.
+    /// The returned object borrows both guards. Preparation reserves the
+    /// sidecar's persistent spool bytes and decode memory, plus both the
+    /// successor's installed-image and atomic-install staging extents, before
+    /// the caller may persist `SealStarted`.
     #[cfg(target_os = "linux")]
     #[allow(dead_code)] // Wired into recovery-point rotation in the next lifecycle slice.
     pub(crate) fn prepare_v7_pitr_seal_for_active_wal<'guard>(
@@ -13706,6 +13965,23 @@ impl LsmStorageInner {
         let segment_id = state
             .active_segment_id
             .ok_or_else(|| anyhow!("PITR state has no active segment"))?;
+        let successor_segment_id = state
+            .obligations
+            .get(&segment_id)
+            .filter(|obligation| {
+                obligation.state == crate::pitr::manifest::ObligationState::Sealing
+                    && obligation.wal_format == crate::pitr::manifest::PitrWalFormat::V7
+            })
+            .map_or(state.next_segment_id, |obligation| {
+                obligation.successor_segment_id
+            });
+        ensure!(
+            successor_segment_id > segment_id,
+            "v7 successor segment ID does not advance the active segment"
+        );
+        successor_segment_id
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("PITR segment ID exhausted"))?;
         let active_boundary = state
             .active_boundary
             .ok_or_else(|| anyhow!("v7 PITR state has no persisted Active boundary"))?;
@@ -13764,6 +14040,38 @@ impl LsmStorageInner {
             .wal_path()
             .ok_or_else(|| anyhow!("active v7 PITR WAL has no source path"))?
             .to_path_buf();
+        let retained_resources = reservation_owner
+            .retained_resources()
+            .ok_or_else(|| anyhow!("active v7 PITR WAL has no retained resource ledger"))?;
+        let successor_image_len = u64::try_from(
+            crate::wal::v7::codec::WAL_V7_HEADER_LEN + crate::wal::v7::codec::WAL_V7_FRAME_LEN,
+        )?;
+        ensure!(
+            successor_image_len <= max_segment_bytes,
+            "v7 segment limit cannot hold an empty Active successor image"
+        );
+        let successor_wal_path = self
+            .path
+            .join(format!("pitr-{successor_segment_id:020}.wal"));
+        ensure!(
+            !successor_wal_path.try_exists()?,
+            "v7 successor WAL already exists; recovery must reconcile it before sealing"
+        );
+        let successor_spool_reservation = crate::pitr::segment::filesystem_allocation_reservation(
+            successor_wal_path
+                .parent()
+                .ok_or_else(|| anyhow!("v7 successor WAL has no parent directory"))?,
+            successor_image_len,
+        )?;
+        let successor_reservation =
+            if retained_resources.has_pending_successor(successor_segment_id) {
+                None
+            } else {
+                Some(
+                    retained_resources
+                        .reserve_successor(successor_segment_id, successor_spool_reservation)?,
+                )
+            };
         let sidecar_memory =
             crate::pitr::seal::V7Seal::encoded_len_for_entry_count(active_boundary.ticket_end)?;
         let source_spool_reservation = crate::pitr::segment::filesystem_allocation_reservation(
@@ -13821,6 +14129,9 @@ impl LsmStorageInner {
             seal_path,
             bytes,
             reservation: Some(seal_reservation),
+            successor_segment_id,
+            retained_resources,
+            successor_reservation,
             installed: false,
             _lifecycle_guards: std::marker::PhantomData,
         })
@@ -13863,9 +14174,22 @@ impl LsmStorageInner {
             obligation.state == crate::pitr::manifest::ObligationState::Sealing
                 && obligation.wal_format == crate::pitr::manifest::PitrWalFormat::V7
                 && obligation.logical_length == prepared.seal.boundary.sealed_end
-                && obligation.immutable_boundary == Some(prepared.seal.boundary),
+                && obligation.immutable_boundary == Some(prepared.seal.boundary)
+                && obligation.successor_segment_id == prepared.successor_segment_id,
             "v7 PITR seal differs from its manifest sealing obligation"
         );
+        if let Some(reservation) = prepared.successor_reservation.take() {
+            prepared
+                .retained_resources
+                .retain_pending_successor(prepared.successor_segment_id, reservation)?;
+        } else {
+            ensure!(
+                prepared
+                    .retained_resources
+                    .has_pending_successor(prepared.successor_segment_id),
+                "v7 Sealing obligation has no reserved successor capacity"
+            );
+        }
         self.manifest
             .as_ref()
             .ok_or_else(|| anyhow!("manifest is not initialized"))?
@@ -13889,9 +14213,9 @@ impl LsmStorageInner {
         if physical_len != sealed_end {
             wal.set_len(sealed_end)
                 .context("truncate Active v7 WAL after durable SealStarted")?;
-            wal.sync_all()
-                .context("sync exact frozen v7 WAL image after durable SealStarted")?;
         }
+        wal.sync_all()
+            .context("sync exact frozen v7 WAL image after durable SealStarted")?;
         crate::pitr::segment::install_pitr_file_no_replace(&prepared.seal_path, &prepared.bytes)?;
         prepared.installed = true;
         Ok(())
@@ -13920,9 +14244,13 @@ impl LsmStorageInner {
         // Unlinking it here would destroy archive coverage and leave the next
         // open unable to satisfy the identity-matched WAL it requires for this
         // memtable. Capture this before the memtable is dropped below.
-        let is_pitr_segment_wal = memtable_to_flush.uses_wal_v5();
+        let is_pitr_segment_wal = memtable_to_flush.uses_pitr_batch_wal();
         #[cfg(target_os = "linux")]
-        let pitr_segment_id = if memtable_to_flush.uses_wal_v5() {
+        let pitr_segment_id = if memtable_to_flush.uses_v7_wal() {
+            Some(Self::pitr_segment_of(&memtable_to_flush).ok_or_else(|| {
+                anyhow!("frozen v7 memtable has no canonical PITR segment WAL path")
+            })?)
+        } else if memtable_to_flush.uses_wal_v5() {
             let wal = std::fs::read(&wal_path)?;
             Some(crate::pitr::decode_v5_file_header(&wal)?.segment_id.0)
         } else {
@@ -16212,13 +16540,24 @@ mod tests {
             wal_path.parent().unwrap(),
             sidecar_bytes,
         )?;
+        let successor_source_spool_bytes = crate::pitr::segment::filesystem_allocation_reservation(
+            wal_path.parent().unwrap(),
+            u64::try_from(
+                crate::wal::v7::codec::WAL_V7_HEADER_LEN + crate::wal::v7::codec::WAL_V7_FRAME_LEN,
+            )?,
+        )?;
+        let successor_reservation_bytes = successor_source_spool_bytes
+            .checked_mul(2)
+            .ok_or_else(|| anyhow::anyhow!("v7 successor reservation size overflows"))?;
         let preparation_memory =
             crate::pitr::seal::V7Seal::preparation_memory_bytes(sealed_end, active.ticket_end)?;
         let prepared_resources = reservation_owner.snapshot();
         assert_eq!(
             prepared_resources.source_spool_bytes,
-            baseline_resources.source_spool_bytes + sidecar_source_spool_bytes,
-            "the not-yet-installed sidecar reserves its filesystem allocation"
+            baseline_resources.source_spool_bytes
+                + sidecar_source_spool_bytes
+                + successor_reservation_bytes,
+            "seal preparation reserves the sidecar and both successor extents before Sealing"
         );
         assert_eq!(
             prepared_resources.buffer_memory_bytes,
@@ -16298,9 +16637,65 @@ mod tests {
         );
         assert_eq!(
             installed_resources.source_spool_bytes,
-            baseline_resources.source_spool_bytes + sidecar_source_spool_bytes,
-            "the source sidecar remains charged after temporary memory is released"
+            baseline_resources.source_spool_bytes
+                + sidecar_source_spool_bytes
+                + successor_reservation_bytes,
+            "the source sidecar and pending successor remain charged after temporary memory retires"
         );
+        let retained_resources = reservation_owner.retained_resources().unwrap();
+        let config = state.config.as_ref().unwrap();
+        let buffer_limit = config.max_segment_bytes.checked_mul(2).unwrap().max(
+            crate::pitr::seal::V7Seal::max_preparation_memory_bytes(config.max_segment_bytes)?,
+        );
+        let memory_blocker = reservation_owner
+            .reserve_preparation_buffer(
+                buffer_limit
+                    .checked_sub(installed_resources.buffer_memory_bytes)
+                    .unwrap(),
+            )?
+            .unwrap();
+        let mut successor_header = crate::wal::v7::codec::WalV7Header {
+            segment_id: crate::pitr::SegmentId(state.next_segment_id),
+            ..seal.header
+        };
+        successor_header.incarnation[15] ^= 1;
+        let successor_path = database.join(format!("pitr-{:020}.wal", state.next_segment_id));
+        let state_lock = engine.inner.state_lock.lock();
+        let budget_error = engine
+            .inner
+            .install_pitr_v7_successor(
+                successor_header,
+                &state_lock,
+                Arc::clone(&retained_resources),
+            )
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("successor verification bypassed its memory budget"))?;
+        assert_eq!(
+            budget_error.downcast_ref::<crate::wal::v7::admission::WalV7ReservationError>(),
+            Some(&crate::wal::v7::admission::WalV7ReservationError::BufferMemoryLimit)
+        );
+        assert!(!successor_path.exists());
+        drop(memory_blocker);
+        // The old source predecessor deliberately differs from the required
+        // sealed-segment anchor, so this verifies and drops all temporary
+        // buffers without creating or publishing a successor.
+        let predecessor_error = engine
+            .inner
+            .install_pitr_v7_successor(
+                successor_header,
+                &state_lock,
+                Arc::clone(&retained_resources),
+            )
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("successor accepted the source predecessor anchor"))?;
+        assert!(
+            predecessor_error
+                .to_string()
+                .contains("successor predecessor differs")
+        );
+        assert_eq!(reservation_owner.snapshot(), installed_resources);
+        assert!(!successor_path.exists());
+        drop(state_lock);
         let (metadata, loaded_wal_path, loaded_seal_path) =
             engine.load_pitr_source_segment(&sealing_state, segment_id)?;
         assert_eq!(loaded_wal_path, wal_path);
@@ -16380,10 +16775,169 @@ mod tests {
         drop(seal_reservation);
         assert_eq!(
             reservation_owner.snapshot().source_spool_bytes,
+            baseline_resources.source_spool_bytes + successor_reservation_bytes,
+            "sidecar reclamation must retain the pending successor's reservations"
+        );
+        retained_resources.release_segment(state.next_segment_id);
+        assert_eq!(
+            reservation_owner.snapshot().source_spool_bytes,
             baseline_resources.source_spool_bytes,
-            "reclaiming the sidecar releases its persistent spool reservation"
+            "reclaiming both the sidecar and pending successor releases their spool reservations"
         );
         engine.close_storage()?;
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn v7_successor_installation_retains_archive_source_after_flush() -> anyhow::Result<()> {
+        use sha2::Digest;
+
+        use crate::{
+            pitr::{
+                ChainAnchor, SegmentAnchor, SegmentId,
+                manifest::{ObligationState, PitrManifestRecord},
+            },
+            wal::{
+                WalIoMode,
+                v7::codec::{WAL_V7_FRAME_LEN, WAL_V7_HEADER_LEN, WalV7Header},
+            },
+        };
+
+        for mode in [WalIoMode::Leader, WalIoMode::Parallel] {
+            let directory = tempdir()?;
+            let options = v7_recovery_test_database(directory.path())?;
+            let database = directory.path().join("db");
+            let engine = KvEngine::open_with_wal_io_mode(&database, options, mode)?;
+            engine.sync()?;
+            let state = engine.pitr_manifest_state.lock().clone();
+            let source = engine.inner.state.load().memtable.clone();
+            let source_owner = source.wal_v7_reservation_owner().unwrap();
+            let resources = source_owner.retained_resources().unwrap();
+            engine
+                .inner
+                .mvcc
+                .as_ref()
+                .unwrap()
+                .stop_commit_admission_and_capture()?;
+            let state_lock = engine.inner.state_lock.lock();
+            let active_guard = engine.inner.active_memtable_lock.write();
+            let mut prepared = engine
+                .inner
+                .prepare_v7_pitr_seal_for_active_wal(&state_lock, &active_guard)?;
+            let boundary = prepared.boundary();
+            let seal_started = PitrManifestRecord::SealStarted {
+                segment_id: boundary.active.segment_id,
+                successor_segment_id: state.next_segment_id,
+                logical_length: boundary.sealed_end,
+                immutable_boundary: Some(boundary),
+            };
+            let sealing_state = crate::pitr::manifest::replay_pitr_records([
+                PitrManifestRecord::Snapshot(Box::new(state.clone())),
+                seal_started.clone(),
+            ])?;
+            engine.persist_pitr_lifecycle_with_state_guard(
+                &[seal_started],
+                sealing_state,
+                &state_lock,
+            )?;
+            engine
+                .inner
+                .install_v7_pitr_seal_for_sealing_obligation(&mut prepared)?;
+            let seal_digest = sha2::Sha256::digest(prepared.encoded_bytes()).into();
+            let (seal, source_wal_path, source_seal_path, mut seal_reservation) =
+                prepared.into_installed()?;
+            seal_reservation.release_buffer_memory()?;
+            drop(active_guard);
+            let successor_header = WalV7Header {
+                segment_id: SegmentId(state.next_segment_id),
+                incarnation: [8; 16],
+                predecessor: ChainAnchor::Segment(SegmentAnchor {
+                    segment_id: seal.header.segment_id,
+                    wal_digest: boundary.wal_digest,
+                    seal_digest,
+                }),
+                ..seal.header
+            };
+            let mut installed_successor_header = successor_header;
+            installed_successor_header.incarnation[15] ^= 1;
+            let successor_path = database.join(format!("pitr-{:020}.wal", state.next_segment_id));
+            crate::wal::v7::install::create_empty_active_image(
+                &successor_path,
+                installed_successor_header,
+            )?;
+            let before_install = source_owner.snapshot();
+            let successor_owner = engine.inner.install_pitr_v7_successor(
+                successor_header,
+                &state_lock,
+                Arc::clone(&resources),
+            )?;
+            drop(state_lock);
+
+            let successor = engine.inner.state.load().memtable.clone();
+            assert!(successor.uses_v7_wal());
+            assert_eq!(successor.uses_parallel_wal(), mode == WalIoMode::Parallel);
+            assert_eq!(
+                super::LsmStorageInner::pitr_segment_of(&successor),
+                Some(state.next_segment_id)
+            );
+            assert!(
+                !engine
+                    .inner
+                    .mvcc
+                    .as_ref()
+                    .unwrap()
+                    .commit_admission_is_open(),
+                "successor publication must keep commit admission stopped until SegmentSealed"
+            );
+            let (empty, latest) = successor.v7_active_boundaries()?;
+            assert_eq!(empty, latest);
+            assert_eq!(latest.ticket_end, 0);
+            assert_eq!(latest.durable_end, WAL_V7_HEADER_LEN as u64);
+            assert_eq!(latest.incarnation, installed_successor_header.incarnation);
+            let successor_image = std::fs::read(successor.wal_path().unwrap())?;
+            assert_eq!(successor_image.len(), WAL_V7_HEADER_LEN + WAL_V7_FRAME_LEN);
+            assert_eq!(
+                WalV7Header::decode(&successor_image[..WAL_V7_HEADER_LEN])?,
+                installed_successor_header
+            );
+            assert!(!resources.has_pending_successor(state.next_segment_id));
+            let successor_extent = crate::pitr::segment::filesystem_allocation_reservation(
+                &database,
+                (WAL_V7_HEADER_LEN + WAL_V7_FRAME_LEN) as u64,
+            )?;
+            let after_install = successor_owner.snapshot();
+            assert_eq!(
+                after_install.source_spool_bytes,
+                before_install.source_spool_bytes - successor_extent,
+                "only the successor's staging reservation retires at installation"
+            );
+            assert_eq!(after_install.buffer_memory_bytes, 0);
+            let source_wal_bytes = std::fs::read(&source_wal_path)?;
+            let source_seal_bytes = std::fs::read(&source_seal_path)?;
+
+            while !engine.inner.state.load().imm_memtables.is_empty() {
+                engine.inner.force_flush_next_imm_memtable()?;
+            }
+            assert!(
+                source_wal_path.is_file(),
+                "flushing a frozen v7 memtable must retain its unreclaimed WAL"
+            );
+            assert_eq!(
+                std::fs::read(&source_wal_path)?,
+                source_wal_bytes,
+                "flushing a frozen v7 memtable must preserve its PITR archive source"
+            );
+            assert_eq!(std::fs::read(&source_seal_path)?, source_seal_bytes);
+            assert_eq!(successor_owner.snapshot(), after_install);
+            assert_eq!(
+                engine.pitr_manifest_state.lock().obligations[&boundary.active.segment_id].state,
+                ObligationState::Sealing
+            );
+            assert_eq!(engine.get(b"v7-key")?, Some(Bytes::from_static(b"v")));
+            engine.close_storage()?;
+        }
+
         Ok(())
     }
 

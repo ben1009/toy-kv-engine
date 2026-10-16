@@ -215,6 +215,7 @@ pub(crate) struct WalV7RetainedResources {
 #[derive(Debug, Default)]
 struct WalV7RetainedResourceState {
     by_segment: BTreeMap<u64, Vec<WalV7Reservation>>,
+    pending_successors: BTreeMap<u64, WalV7SuccessorReservation>,
     obligation_logical: BTreeMap<u64, WalV7Reservation>,
     startup_staging: Vec<WalV7Reservation>,
     unattributed: Vec<WalV7Reservation>,
@@ -273,6 +274,15 @@ pub(crate) struct WalV7BatchBufferPin {
 pub(crate) struct WalV7OwnedPreparationReservation {
     owner: Arc<WalV7ReservationOwner>,
     reservation: Option<WalV7Reservation>,
+}
+
+/// Capacity reserved before a durable Sealing intent for a successor's
+/// canonical image and its atomic-install staging image.
+#[must_use = "retain both successor reservations through durable Sealing and installation"]
+#[derive(Debug)]
+pub(crate) struct WalV7SuccessorReservation {
+    persistent: WalV7Reservation,
+    staging: WalV7Reservation,
 }
 
 impl WalV7ReservationOwner {
@@ -790,6 +800,108 @@ impl WalV7RetainedResources {
         Ok(())
     }
 
+    /// Reserve both the successor's empty installed image and its atomic
+    /// install staging extent before the predecessor's Sealing intent is
+    /// durable. The returned token releases both charges if preparation is
+    /// abandoned before that intent.
+    pub(crate) fn reserve_successor(
+        &self,
+        segment_id: u64,
+        source_spool_bytes: u64,
+    ) -> Result<WalV7SuccessorReservation, WalV7ReservationError> {
+        if source_spool_bytes == 0 {
+            return Err(WalV7ReservationError::EmptyReservation);
+        }
+        {
+            let state = self.state.lock();
+            if state.pending_successors.contains_key(&segment_id)
+                || state.by_segment.contains_key(&segment_id)
+            {
+                return Err(WalV7ReservationError::ReservationMismatch);
+            }
+        }
+        let charge = WalV7ResourceCharge {
+            source_spool_bytes,
+            ..WalV7ResourceCharge::default()
+        };
+        let persistent = self.ledger.reserve(charge)?;
+        let staging = self.ledger.reserve(charge)?;
+        Ok(WalV7SuccessorReservation {
+            persistent,
+            staging,
+        })
+    }
+
+    /// Retain a pre-Sealing reservation after the manifest has recorded the
+    /// durable Sealing obligation. Pending successor charges survive prepared
+    /// object drop and remain charged until installation or source cleanup.
+    pub(crate) fn retain_pending_successor(
+        &self,
+        segment_id: u64,
+        reservation: WalV7SuccessorReservation,
+    ) -> Result<(), WalV7ReservationError> {
+        if !Arc::ptr_eq(&reservation.persistent.ledger, &self.ledger.inner)
+            || !Arc::ptr_eq(&reservation.staging.ledger, &self.ledger.inner)
+        {
+            return Err(WalV7ReservationError::ForeignReservation);
+        }
+        let mut state = self.state.lock();
+        if state.pending_successors.contains_key(&segment_id)
+            || state.by_segment.contains_key(&segment_id)
+        {
+            return Err(WalV7ReservationError::ReservationMismatch);
+        }
+        state.pending_successors.insert(segment_id, reservation);
+        Ok(())
+    }
+
+    pub(crate) fn has_pending_successor(&self, segment_id: u64) -> bool {
+        self.state
+            .lock()
+            .pending_successors
+            .contains_key(&segment_id)
+    }
+
+    pub(crate) fn has_segment_reservation(&self, segment_id: u64) -> bool {
+        self.state
+            .lock()
+            .by_segment
+            .get(&segment_id)
+            .is_some_and(|reservations| !reservations.is_empty())
+    }
+
+    /// Promote a successfully installed successor's permanent image charge
+    /// to its segment lifetime and release its now-clean staging charge.
+    pub(crate) fn activate_pending_successor(
+        &self,
+        segment_id: u64,
+    ) -> Result<(), WalV7ReservationError> {
+        let mut state = self.state.lock();
+        if state.by_segment.contains_key(&segment_id) {
+            return if state.pending_successors.contains_key(&segment_id) {
+                Err(WalV7ReservationError::ReservationMismatch)
+            } else {
+                Ok(())
+            };
+        }
+        let reservation = state
+            .pending_successors
+            .remove(&segment_id)
+            .ok_or(WalV7ReservationError::UnknownReservation)?;
+        let WalV7SuccessorReservation {
+            persistent,
+            staging,
+        } = reservation;
+        state
+            .by_segment
+            .entry(segment_id)
+            .or_default()
+            .push(persistent);
+        drop(state);
+        drop(staging);
+        Ok(())
+    }
+
     pub(crate) fn reserve_startup_staging(
         &self,
         charge: WalV7ResourceCharge,
@@ -844,6 +956,7 @@ impl WalV7RetainedResources {
     pub(crate) fn release_segment(&self, segment_id: u64) {
         let mut state = self.state.lock();
         drop(state.by_segment.remove(&segment_id));
+        drop(state.pending_successors.remove(&segment_id));
         drop(state.obligation_logical.remove(&segment_id));
     }
 

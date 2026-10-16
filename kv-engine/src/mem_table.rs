@@ -33,6 +33,9 @@ use crate::{
     wal::{Wal, WalIoMode},
 };
 
+#[cfg(target_os = "linux")]
+use crate::wal::v7::admission::WalV7RetainedResources;
+
 /// Expected number of entries per memtable for bloom filter sizing.
 /// At 1KB values and 1MB SST target, ~1000 entries. We size generously.
 const BLOOM_EXPECTED_ENTRIES: usize = 4096;
@@ -1123,6 +1126,81 @@ impl MemTable {
         ret.wal_path = Some(path);
 
         Ok(ret)
+    }
+
+    /// Create a fresh v7 Active segment with its canonical header and
+    /// generation-zero FRONTIER, then attach the selected writer runtime.
+    /// The caller must first persist the manifest obligation authorizing this
+    /// segment and its predecessor, and reserve both the installed image and
+    /// atomic-install staging extent before the predecessor's Sealing intent.
+    #[cfg(target_os = "linux")]
+    #[allow(dead_code)] // Connected to the v7 recovery-point successor transition next.
+    pub(crate) fn create_with_wal_v7_active(
+        id: usize,
+        vlog_enabled: bool,
+        path: impl AsRef<Path>,
+        mut header: crate::wal::v7::codec::WalV7Header,
+        max_file_size: u64,
+        retained_resources: Arc<WalV7RetainedResources>,
+        io_mode: WalIoMode,
+    ) -> Result<Self> {
+        let path = path.as_ref().to_path_buf();
+        let image_len = u64::try_from(
+            crate::wal::v7::codec::WAL_V7_HEADER_LEN + crate::wal::v7::codec::WAL_V7_FRAME_LEN,
+        )?;
+        anyhow::ensure!(
+            image_len <= max_file_size,
+            "v7 segment limit cannot hold an empty Active image"
+        );
+        anyhow::ensure!(
+            retained_resources.has_pending_successor(header.segment_id.0)
+                || retained_resources.has_segment_reservation(header.segment_id.0),
+            "v7 successor capacity was not reserved before its Sealing intent"
+        );
+
+        // A prior attempt may have installed and synced the canonical empty
+        // image before failing while attaching its writer runtime. Reuse its
+        // incarnation after checking the manifest-authorized identity; the
+        // installer below then verifies the complete image byte-for-byte.
+        if path.try_exists()? {
+            let mut file = File::open(&path)
+                .with_context(|| format!("open existing v7 successor WAL {}", path.display()))?;
+            let mut bytes = [0; crate::wal::v7::codec::WAL_V7_HEADER_LEN];
+            file.read_exact(&mut bytes)
+                .context("read existing v7 successor WAL header")?;
+            let existing = crate::wal::v7::codec::WalV7Header::decode(&bytes)
+                .context("decode existing v7 successor WAL header")?;
+            anyhow::ensure!(
+                existing.timeline_id == header.timeline_id
+                    && existing.archive_epoch_id == header.archive_epoch_id
+                    && existing.segment_id == header.segment_id
+                    && existing.predecessor == header.predecessor,
+                "existing v7 successor WAL identity differs from its Sealing obligation"
+            );
+            header = existing;
+        }
+
+        let installed = crate::wal::v7::install::create_empty_active_image(&path, header)?;
+        let reservation_owner = Arc::new(WalV7ReservationOwner::new_with_retained_resources(
+            Arc::clone(&retained_resources),
+            &installed,
+        )?);
+        let (memtable, recovered_commit_ts) = Self::recover_from_v7_active(
+            id,
+            vlog_enabled,
+            &path,
+            installed,
+            max_file_size,
+            reservation_owner,
+            io_mode,
+        )?;
+        anyhow::ensure!(
+            recovered_commit_ts == 0,
+            "new empty v7 successor unexpectedly contains committed batches"
+        );
+        retained_resources.activate_pending_successor(header.segment_id.0)?;
+
+        Ok(memtable)
     }
 
     /// Create a new mem-table with WAL and vLog (kind-prefixed values).
@@ -3258,6 +3336,9 @@ mod tests {
         },
     };
 
+    #[cfg(target_os = "linux")]
+    use crate::wal::v7::admission::{WalV7ResourceCharge, WalV7RetainedResources};
+
     const TEST_V7_MAX_FILE_SIZE: u64 = 1 << 30;
 
     fn recover_v7(path: &Path, anchor: ActiveBoundary) -> Result<WalV7InstalledRecovery> {
@@ -3299,6 +3380,21 @@ mod tests {
                 prefix_digest: header.digest()?,
             },
         )
+    }
+
+    #[cfg(target_os = "linux")]
+    fn successor_header(
+        segment_id: u64,
+        incarnation: u8,
+        archive_epoch_id: ArchiveEpochId,
+    ) -> WalV7Header {
+        WalV7Header {
+            timeline_id: TimelineId([11; 16]),
+            archive_epoch_id,
+            segment_id: SegmentId(segment_id),
+            predecessor: ChainAnchor::Genesis { archive_epoch_id },
+            incarnation: [incarnation; 16],
+        }
     }
 
     fn attach_v7(
@@ -3347,6 +3443,103 @@ mod tests {
         assert_eq!(fs::metadata(&path)?.len(), 2 * WAL_V7_FRAME_LEN as u64);
         assert_eq!(fs::read(&path)?, original_image);
 
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn v7_successor_attach_retry_preserves_reservation_and_incarnation() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("successor.wal");
+        let segment_id = 8;
+        let archive_epoch_id = ArchiveEpochId([12; 16]);
+        let header = successor_header(segment_id, 13, archive_epoch_id);
+        let image_len = (WAL_V7_HEADER_LEN + WAL_V7_FRAME_LEN) as u64;
+        let spool_extent =
+            crate::pitr::segment::filesystem_allocation_reservation(directory.path(), image_len)?;
+        let ledger = WalV7ResourceLedger::new(WalV7ResourceLimits {
+            max_logical_wal_bytes: u64::MAX,
+            max_source_spool_bytes: u64::MAX,
+            max_recovery_workspace_bytes: u64::MAX,
+            max_buffer_memory_bytes: u64::MAX,
+            max_seal_index_bytes: u64::MAX,
+        })?;
+        let retained = WalV7RetainedResources::new(ledger.clone());
+        let reservation = retained.reserve_successor(segment_id, spool_extent)?;
+        retained.retain_pending_successor(segment_id, reservation)?;
+
+        // The invalid cap is checked by runtime construction, after the
+        // canonical empty image has been durably installed.
+        let failed = MemTable::create_with_wal_v7_active(
+            8,
+            false,
+            &path,
+            header,
+            crate::wal::MAX_WAL_FILE_SIZE + WAL_V7_FRAME_LEN as u64,
+            Arc::clone(&retained),
+            WalIoMode::Leader,
+        );
+        assert!(failed.is_err());
+        assert!(path.exists());
+        assert_eq!(fs::metadata(&path)?.len(), image_len);
+        assert!(retained.has_pending_successor(segment_id));
+        assert!(!retained.has_segment_reservation(segment_id));
+        assert_eq!(
+            ledger.snapshot().source_spool_bytes,
+            spool_extent * 2,
+            "failed attachment must retain both installed-image and staging extents"
+        );
+
+        // A retry may request a fresh incarnation, but it must adopt the
+        // installed image's original incarnation after validating its logical
+        // identity and complete canonical bytes.
+        let mut retry_header = header;
+        retry_header.incarnation = [14; 16];
+        let memtable = MemTable::create_with_wal_v7_active(
+            8,
+            false,
+            &path,
+            retry_header,
+            TEST_V7_MAX_FILE_SIZE,
+            Arc::clone(&retained),
+            WalIoMode::Leader,
+        )?;
+        let installed_header = WalV7Header::decode(&fs::read(&path)?[..WAL_V7_HEADER_LEN])?;
+        assert_eq!(installed_header.incarnation, header.incarnation);
+        assert!(!retained.has_pending_successor(segment_id));
+        assert!(retained.has_segment_reservation(segment_id));
+        assert_eq!(ledger.snapshot().source_spool_bytes, spool_extent);
+        drop(memtable);
+
+        // Reopening after promotion uses the permanent segment reservation
+        // idempotently and does not charge or release another extent.
+        let mut reopen_header = header;
+        reopen_header.incarnation = [15; 16];
+        let reopened = MemTable::create_with_wal_v7_active(
+            8,
+            false,
+            &path,
+            reopen_header,
+            TEST_V7_MAX_FILE_SIZE,
+            Arc::clone(&retained),
+            WalIoMode::Leader,
+        )?;
+        assert_eq!(
+            WalV7Header::decode(&fs::read(&path)?[..WAL_V7_HEADER_LEN])?.incarnation,
+            header.incarnation
+        );
+        assert_eq!(ledger.snapshot().source_spool_bytes, spool_extent);
+        drop(reopened);
+
+        // Keep this import meaningful in the test: only the source-spool
+        // component is expected to remain charged for this empty image.
+        assert_eq!(
+            ledger.snapshot(),
+            WalV7ResourceCharge {
+                source_spool_bytes: spool_extent,
+                ..WalV7ResourceCharge::default()
+            }
+        );
         Ok(())
     }
 
