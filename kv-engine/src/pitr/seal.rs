@@ -23,9 +23,9 @@ use crate::{
     },
     wal::v7::{
         codec::{
-            WAL_V7_FRAME_LEN, WAL_V7_HEADER_LEN, WAL_V7_LOGICAL_BATCH_HEADER_LEN,
-            WalV7DataFragmentHeader, WalV7FrameKind, WalV7Header, WalV7LogicalBatchHeader,
-            decode_frame_structural,
+            WAL_V7_DATA_FRAGMENT_PAYLOAD_CAPACITY, WAL_V7_FRAME_LEN, WAL_V7_HEADER_LEN,
+            WAL_V7_LOGICAL_BATCH_HEADER_LEN, WalV7DataFragmentHeader, WalV7FrameKind, WalV7Header,
+            WalV7LogicalBatchHeader, decode_frame_structural,
         },
         recovery::{
             WalV7RecoveryAuthority, discover_frontier_candidates, select_recovery_candidate,
@@ -36,9 +36,8 @@ use crate::{
 
 #[cfg(test)]
 use crate::wal::v7::codec::{
-    WAL_V7_DATA_FRAGMENT_PAYLOAD_CAPACITY, WalV7Frontier, encode_data_frames_into,
-    encode_frontier_successor, encode_generation_zero_frontier, encode_logical_batch,
-    frame_record_digest,
+    WalV7Frontier, encode_data_frames_into, encode_frontier_successor,
+    encode_generation_zero_frontier, encode_logical_batch, frame_record_digest,
 };
 
 const MAGIC: &[u8; 8] = b"TKVSEAL1";
@@ -412,6 +411,110 @@ pub(crate) struct V7Seal {
 }
 
 impl V7Seal {
+    pub(crate) fn encoded_len_for_entry_count(entry_count: u64) -> Result<u64> {
+        let entry_count = usize::try_from(entry_count)?;
+        u64::try_from(v7_max_seal_bytes(entry_count)?).map_err(Into::into)
+    }
+
+    /// Conservatively estimate the peak memory needed to build and retain a
+    /// seal for one bounded Active WAL image. This includes frontier discovery
+    /// and prefix checkpoints, one worst-case decoded/canonicalized logical
+    /// batch, the returned index and encoded sidecar, and the codec round-trip.
+    pub(crate) fn preparation_memory_bytes(sealed_end: u64, ticket_end: u64) -> Result<u64> {
+        ensure!(
+            sealed_end >= (WAL_V7_HEADER_LEN + WAL_V7_FRAME_LEN) as u64
+                && sealed_end <= crate::wal::MAX_WAL_FILE_SIZE
+                && sealed_end.is_multiple_of(WAL_V7_FRAME_LEN as u64),
+            "v7 seal preparation image length is outside its bounds"
+        );
+
+        let frame_count = (sealed_end - WAL_V7_HEADER_LEN as u64) / WAL_V7_FRAME_LEN as u64;
+        let maximum_data_frames = frame_count.saturating_sub(2);
+        ensure!(
+            ticket_end <= maximum_data_frames,
+            "v7 seal ticket count exceeds its physical DATA-frame bound"
+        );
+
+        let max_batch_bytes = maximum_data_frames
+            .checked_mul(WAL_V7_DATA_FRAGMENT_PAYLOAD_CAPACITY as u64)
+            .ok_or_else(|| anyhow::anyhow!("v7 seal batch workspace overflows"))?
+            .min(u64::try_from(
+                WAL_V7_LOGICAL_BATCH_HEADER_LEN
+                    .checked_add(crate::pitr::LIVE_WAL_V5_LIMITS.max_batch_data_bytes)
+                    .ok_or_else(|| anyhow::anyhow!("v7 seal batch limit overflows"))?,
+            )?);
+        let max_entry_count = usize::try_from(
+            max_batch_bytes.saturating_sub(WAL_V7_LOGICAL_BATCH_HEADER_LEN as u64) / 6,
+        )?
+        .min(crate::pitr::LIVE_WAL_V5_LIMITS.max_entry_count);
+        let batch_decode_workspace = max_batch_bytes
+            .checked_mul(3)
+            .and_then(|bytes| {
+                u64::try_from(max_entry_count)
+                    .ok()
+                    .and_then(|count| count.checked_mul(256))
+                    .and_then(|entries| bytes.checked_add(entries))
+            })
+            .ok_or_else(|| anyhow::anyhow!("v7 seal decode workspace overflows"))?;
+
+        // Recovery can retain candidates, verified prefix metadata, and one
+        // checkpoint per ticket. One KiB per on-disk frame intentionally
+        // overestimates all of those bounded vectors and their spare capacity.
+        let recovery_scan_workspace = frame_count
+            .checked_mul(1024)
+            .and_then(|bytes| bytes.checked_add(64 * 1024))
+            .ok_or_else(|| anyhow::anyhow!("v7 seal recovery workspace overflows"))?;
+
+        let entry_count = usize::try_from(ticket_end)?;
+        let seal_entry_workspace = entry_count
+            .checked_mul(
+                3usize
+                    .checked_mul(std::mem::size_of::<V7SealEntry>())
+                    .and_then(|bytes| bytes.checked_add(V7_ENTRY_BYTES))
+                    .ok_or_else(|| anyhow::anyhow!("v7 seal index workspace overflows"))?,
+            )
+            .ok_or_else(|| anyhow::anyhow!("v7 seal index workspace overflows"))?;
+        let sidecar_bytes = usize::try_from(Self::encoded_len_for_entry_count(ticket_end)?)?;
+        let total = batch_decode_workspace
+            .checked_add(recovery_scan_workspace)
+            .and_then(|bytes| {
+                u64::try_from(seal_entry_workspace)
+                    .ok()
+                    .and_then(|index_bytes| bytes.checked_add(index_bytes))
+            })
+            .and_then(|bytes| {
+                u64::try_from(sidecar_bytes)
+                    .ok()
+                    .and_then(|sidecar_bytes| bytes.checked_add(sidecar_bytes))
+            })
+            .ok_or_else(|| anyhow::anyhow!("v7 seal preparation memory overflows"))?;
+
+        Ok(total)
+    }
+
+    /// Return a memory cap sufficient for any sealable image within the
+    /// persisted segment limit. The estimate is used when constructing the
+    /// Active WAL's shared resource ledger.
+    pub(crate) fn max_preparation_memory_bytes(max_segment_bytes: u64) -> Result<u64> {
+        ensure!(
+            max_segment_bytes >= (WAL_V7_HEADER_LEN + WAL_V7_FRAME_LEN) as u64
+                && max_segment_bytes <= crate::wal::MAX_WAL_FILE_SIZE,
+            "persisted v7 PITR segment limit is outside its bounds"
+        );
+        // Configured limits are byte counts and need not be frame-aligned. A
+        // seal can only end on a frame boundary, so base the upper bound on
+        // the largest representable image that fits below the configured cap.
+        let max_sealable_end = max_segment_bytes - max_segment_bytes % WAL_V7_FRAME_LEN as u64;
+        ensure!(
+            max_sealable_end >= (WAL_V7_HEADER_LEN + WAL_V7_FRAME_LEN) as u64,
+            "persisted v7 PITR segment limit cannot hold a sealable image"
+        );
+        let maximum_ticket_end = max_sealable_end
+            .saturating_sub((WAL_V7_HEADER_LEN + 2 * WAL_V7_FRAME_LEN) as u64)
+            / WAL_V7_FRAME_LEN as u64;
+        Self::preparation_memory_bytes(max_sealable_end, maximum_ticket_end)
+    }
+
     pub(crate) fn max_encoded_len(max_segment_bytes: u64) -> Result<usize> {
         ensure!(
             max_segment_bytes >= (WAL_V7_HEADER_LEN + WAL_V7_FRAME_LEN) as u64,
