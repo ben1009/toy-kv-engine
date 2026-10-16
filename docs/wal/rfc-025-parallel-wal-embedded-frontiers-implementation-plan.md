@@ -57,8 +57,19 @@ count toward decoded-state limits without storing the full extension inline
 in legacy records. Production source discovery now recognizes v7 v2 sidecars,
 requires a matching manifest sealing obligation, rebuilds them against the
 exact frozen WAL through the seekable verifier, and returns the validated
-immutable catalog descriptor. Production freeze/seal emission, lifecycle
-rotation/publication, and interrupted v7 Sealing/Sealed recovery remain.
+immutable catalog descriptor. A guarded v7 Active seal-emission primitive now
+requires stopped commit admission, retains the state and active-memtable guards
+in the established lock order, matches the persisted logical boundary to
+the writer cursor, truncates an unused tail, and prepares a strict v7 seal
+without publishing its sidecar. Installation requires a matching durable
+`SealStarted` obligation and certain manifest durability; its sidecar spool
+reservation rounds up to the destination filesystem allocation unit and remains
+held through reclamation. Seal preparation reserves
+bounded decode/canonicalization workspace, recovery scan metadata, sidecar
+memory, and sidecar source-spool bytes before building. The Active resource
+ledger's transient-memory cap is sized for the maximum preparation estimate
+under its persisted segment limit. Wiring this primitive into successor
+rotation/publication and interrupted v7 Sealing/Sealed recovery remain.
 Archive preparation now validates v7 seal descriptors
 against catalog metadata and strictly verifies the exact frozen WAL image;
 source-object digest checks use whole-image SHA-256 for v7 while retaining the

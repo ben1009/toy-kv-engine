@@ -2040,6 +2040,15 @@ impl MemTable {
         Ok((empty, current))
     }
 
+    pub(crate) fn v7_frontier_cursor(
+        &self,
+    ) -> Result<crate::wal::v7::allocator::WalV7FrontierCursor> {
+        self.wal
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("memtable has no WAL"))?
+            .v7_frontier_cursor()
+    }
+
     pub(crate) fn v7_wal_requires_recovery(&self) -> bool {
         self.wal.as_ref().is_some_and(Wal::v7_requires_recovery)
     }

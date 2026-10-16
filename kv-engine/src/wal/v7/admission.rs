@@ -266,9 +266,10 @@ pub(crate) struct WalV7BatchBufferPin {
     _operation: Arc<WalV7BatchOperation>,
 }
 
-/// Temporary preparation memory held while a caller builds a logical batch.
+/// Temporary resources held while preparing v7 PITR data. A returned source
+/// spool charge can outlive its buffer charge until the sidecar is reclaimed.
 /// Retiring the source image waits for this guard to drop.
-#[must_use = "the preparation reservation must live through batch preparation"]
+#[must_use = "retain the reservation until its PITR seal sidecar is reclaimed"]
 pub(crate) struct WalV7OwnedPreparationReservation {
     owner: Arc<WalV7ReservationOwner>,
     reservation: Option<WalV7Reservation>,
@@ -376,7 +377,19 @@ impl WalV7ReservationOwner {
         self: &Arc<Self>,
         buffer_memory_bytes: u64,
     ) -> Result<Option<WalV7OwnedPreparationReservation>, WalV7ReservationError> {
-        if buffer_memory_bytes == 0 {
+        self.reserve_preparation_resources(WalV7ResourceCharge {
+            buffer_memory_bytes,
+            ..WalV7ResourceCharge::default()
+        })
+    }
+
+    /// Reserve temporary memory and/or persistent source bytes before
+    /// preparing and installing a PITR seal sidecar.
+    pub(crate) fn reserve_preparation_resources(
+        self: &Arc<Self>,
+        charge: WalV7ResourceCharge,
+    ) -> Result<Option<WalV7OwnedPreparationReservation>, WalV7ReservationError> {
+        if charge.is_empty() {
             return Ok(None);
         }
         let mut state = self.state.lock();
@@ -387,10 +400,7 @@ impl WalV7ReservationOwner {
             .active_operations
             .checked_add(1)
             .ok_or(WalV7ReservationError::ArithmeticOverflow)?;
-        let reservation = self.ledger.reserve(WalV7ResourceCharge {
-            buffer_memory_bytes,
-            ..WalV7ResourceCharge::default()
-        })?;
+        let reservation = self.ledger.reserve(charge)?;
         state.active_operations = active_operations;
         drop(state);
         Ok(Some(WalV7OwnedPreparationReservation {
@@ -530,6 +540,17 @@ impl Drop for WalV7OwnedPreparationReservation {
             debug_assert!(false, "v7 preparation-operation accounting underflow");
         }
         release_retired_reservations(&mut state);
+    }
+}
+
+impl WalV7OwnedPreparationReservation {
+    /// Retire only the temporary-memory part of this preparation reservation.
+    /// Persistent source-spool bytes stay charged until the guard is dropped.
+    pub(crate) fn release_buffer_memory(&mut self) -> Result<(), WalV7ReservationError> {
+        let Some(reservation) = self.reservation.as_mut() else {
+            return Ok(());
+        };
+        self.owner.ledger.release_buffer_memory(reservation)
     }
 }
 

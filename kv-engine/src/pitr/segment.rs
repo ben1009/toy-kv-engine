@@ -908,12 +908,21 @@ pub(crate) fn install_pitr_file_no_replace(
     let temp_path = parent.join(&temp_name);
     let result = (|| -> Result<()> {
         let parent_file = std::fs::File::open(parent)?;
+        match std::fs::File::open(path) {
+            Ok(existing_file) => {
+                return verify_existing_pitr_file(existing_file, &parent_file, bytes);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+
         let mut file = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(&temp_path)?;
         file.write_all(bytes)?;
         file.sync_all()?;
+        drop(file);
         let from = CString::new(temp_name.as_bytes())?;
         let to = CString::new(file_name.as_bytes())?;
         let rename = unsafe {
@@ -929,16 +938,9 @@ pub(crate) fn install_pitr_file_no_replace(
         if rename != 0 {
             let error = std::io::Error::last_os_error();
             if error.kind() == std::io::ErrorKind::AlreadyExists {
-                let mut existing_file = std::fs::File::open(path)?;
-                ensure!(
-                    existing_file.metadata()?.len() == bytes.len() as u64,
-                    "existing PITR file length mismatch"
-                );
-                let mut existing = vec![0; bytes.len()];
-                existing_file.read_exact(&mut existing)?;
-                ensure!(existing == bytes, "existing PITR file identity mismatch");
-                parent_file.sync_all()?;
-                return Ok(());
+                std::fs::remove_file(&temp_path)?;
+                let existing_file = std::fs::File::open(path)?;
+                return verify_existing_pitr_file(existing_file, &parent_file, bytes);
             }
             return Err(error.into());
         }
@@ -949,6 +951,65 @@ pub(crate) fn install_pitr_file_no_replace(
     let _ = std::fs::remove_file(&temp_path);
 
     result
+}
+
+#[cfg(target_os = "linux")]
+fn verify_existing_pitr_file(
+    mut existing_file: std::fs::File,
+    parent_file: &std::fs::File,
+    bytes: &[u8],
+) -> Result<()> {
+    ensure!(
+        existing_file.metadata()?.len() == bytes.len() as u64,
+        "existing PITR file length mismatch"
+    );
+    let mut existing = vec![0; bytes.len()];
+    existing_file.read_exact(&mut existing)?;
+    ensure!(existing == bytes, "existing PITR file identity mismatch");
+    existing_file.sync_all()?;
+    parent_file.sync_all()?;
+
+    Ok(())
+}
+
+/// Reserve source-spool bytes using the allocation unit of the destination
+/// filesystem, matching the `st_blocks * 512` accounting used during recovery.
+#[cfg(target_os = "linux")]
+pub(crate) fn filesystem_allocation_reservation(
+    directory: impl AsRef<std::path::Path>,
+    logical_bytes: u64,
+) -> Result<u64> {
+    let directory = CString::new(directory.as_ref().as_os_str().as_bytes())?;
+    let mut stats = std::mem::MaybeUninit::<libc::statvfs>::zeroed();
+    // SAFETY: `directory` is a valid NUL-terminated path and `stats` points to
+    // writable storage for the duration of the syscall.
+    let result = unsafe { libc::statvfs(directory.as_ptr(), stats.as_mut_ptr()) };
+    if result != 0 {
+        return Err(anyhow::Error::new(std::io::Error::last_os_error())
+            .context("inspect PITR source filesystem allocation unit"));
+    }
+    // SAFETY: statvfs initialized `stats` when it returned success.
+    let stats = unsafe { stats.assume_init() };
+    let allocation_unit = if stats.f_frsize == 0 {
+        stats.f_bsize
+    } else {
+        stats.f_frsize
+    };
+    // statvfs uses c_ulong, which is narrower on 32-bit Linux.
+    #[cfg(target_pointer_width = "32")]
+    let allocation_unit = u64::from(allocation_unit);
+    ensure!(
+        allocation_unit > 0,
+        "PITR filesystem allocation unit is zero"
+    );
+
+    let blocks = logical_bytes
+        .checked_add(allocation_unit - 1)
+        .ok_or_else(|| anyhow::anyhow!("PITR source allocation reservation overflows"))?
+        / allocation_unit;
+    blocks
+        .checked_mul(allocation_unit)
+        .ok_or_else(|| anyhow::anyhow!("PITR source allocation reservation overflows"))
 }
 
 /// Remove staging files left behind by an interrupted PITR file installation.
