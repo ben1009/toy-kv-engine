@@ -2993,36 +2993,60 @@ impl KvEngine {
                     .and_then(|wal| crate::pitr::seal::build_v5_seal(&wal).ok())
                     .and_then(|(seal, _)| seal.entries.first().copied())
                     .and_then(|entry| entry.recorded_at.as_system_time().ok());
-                for entry in std::fs::read_dir(&self.inner.path)?.filter_map(Result::ok) {
-                    let path = entry.path();
-                    if path.extension().is_none_or(|extension| extension != "seal") {
+                for (&expected_segment_id, obligation) in &state.obligations {
+                    if !matches!(
+                        obligation.state,
+                        crate::pitr::manifest::ObligationState::Sealing
+                            | crate::pitr::manifest::ObligationState::Sealed
+                    ) {
                         continue;
                     }
-                    let Ok(seal) = std::fs::read(&path).and_then(|bytes| {
-                        crate::pitr::seal::V5Seal::decode(&bytes).map_err(std::io::Error::other)
-                    }) else {
+                    let path = self
+                        .inner
+                        .path
+                        .join(format!("pitr-{expected_segment_id:020}.seal"));
+                    let Ok((format, bytes)) = crate::pitr::seal::read_seal_sidecar(
+                        &path,
+                        state.config.as_ref().map(|config| config.max_segment_bytes),
+                    ) else {
                         continue;
                     };
-                    if !state
-                        .obligations
-                        .get(&seal.header.segment_id.0)
-                        .is_some_and(|obligation| {
-                            matches!(
-                                obligation.state,
-                                crate::pitr::manifest::ObligationState::Sealing
-                                    | crate::pitr::manifest::ObligationState::Sealed
+                    let (segment_id, entry_count, first_recorded_at) = match format {
+                        crate::pitr::seal::SealSidecarFormat::V5 => {
+                            let Ok(seal) = crate::pitr::seal::V5Seal::decode(&bytes) else {
+                                continue;
+                            };
+                            (
+                                seal.header.segment_id.0,
+                                seal.entries.len() as u64,
+                                seal.entries.first().map(|entry| entry.recorded_at),
                             )
-                        })
-                    {
+                        }
+                        crate::pitr::seal::SealSidecarFormat::V7 => {
+                            let Some(max_segment_bytes) =
+                                state.config.as_ref().map(|config| config.max_segment_bytes)
+                            else {
+                                continue;
+                            };
+                            let Ok(seal) =
+                                crate::pitr::seal::V7Seal::decode(&bytes, max_segment_bytes)
+                            else {
+                                continue;
+                            };
+                            (
+                                seal.header.segment_id.0,
+                                seal.entries.len() as u64,
+                                seal.entries.first().map(|entry| entry.recorded_at),
+                            )
+                        }
+                    };
+                    if segment_id != expected_segment_id {
                         continue;
                     }
-                    status.archive_lag_commits = status
-                        .archive_lag_commits
-                        .saturating_add(seal.entries.len() as u64);
-                    if let Some(recorded_at) = seal
-                        .entries
-                        .first()
-                        .and_then(|entry| entry.recorded_at.as_system_time().ok())
+                    status.archive_lag_commits =
+                        status.archive_lag_commits.saturating_add(entry_count);
+                    if let Some(recorded_at) =
+                        first_recorded_at.and_then(|recorded_at| recorded_at.as_system_time().ok())
                     {
                         oldest_unarchived =
                             Some(oldest_unarchived.map_or(recorded_at, |old| old.min(recorded_at)));
@@ -3398,7 +3422,10 @@ impl KvEngine {
                 // refused while it is outstanding - including the one `close`
                 // runs. That is terminal in both directions: nothing completes the
                 // record, and nothing may proceed until something does.
-                let seal = self.load_pitr_source_seal(segment_id)?;
+                let seal = self.load_pitr_source_seal(
+                    segment_id,
+                    state.config.as_ref().map(|config| config.max_segment_bytes),
+                )?;
                 let sealing = state
                     .obligations
                     .get(&segment_id)
@@ -3626,78 +3653,183 @@ impl KvEngine {
         segment_id: u64,
     ) -> Result<(crate::pitr::catalog::SegmentMetadata, PathBuf, PathBuf)> {
         let mut selected = None;
+        let expected_seal_name = format!("pitr-{segment_id:020}.seal");
         for entry in std::fs::read_dir(&self.inner.path)? {
             let path = entry?.path();
-            if path.extension().is_none_or(|extension| extension != "seal") {
+            if path.file_name().and_then(|name| name.to_str()) != Some(expected_seal_name.as_str())
+            {
                 continue;
             }
-            let bytes = std::fs::read(&path)?;
+            let (format, bytes) = crate::pitr::seal::read_seal_sidecar(
+                &path,
+                state.config.as_ref().map(|config| config.max_segment_bytes),
+            )?;
+            if format == crate::pitr::seal::SealSidecarFormat::V7 {
+                let max_segment_bytes = state
+                    .config
+                    .as_ref()
+                    .map(|config| config.max_segment_bytes)
+                    .ok_or_else(|| anyhow!("PITR v7 source has no persisted segment limit"))?;
+                let seal = crate::pitr::seal::V7Seal::decode(&bytes, max_segment_bytes)?;
+                if seal.header.segment_id.0 != segment_id {
+                    continue;
+                }
+                ensure!(selected.is_none(), "duplicate PITR source seal for segment");
+                let obligation = state
+                    .obligations
+                    .get(&segment_id)
+                    .ok_or_else(|| anyhow!("v7 PITR source has no manifest sealing obligation"))?;
+                ensure!(
+                    obligation.wal_format == crate::pitr::manifest::PitrWalFormat::V7
+                        && obligation.logical_length == seal.boundary.sealed_end
+                        && obligation.immutable_boundary == Some(seal.boundary),
+                    "v7 PITR source seal differs from its manifest sealing authority"
+                );
+
+                let wal_path = path.with_extension("wal");
+                let mut wal = File::open(&wal_path)
+                    .with_context(|| format!("open frozen v7 PITR WAL {}", wal_path.display()))?;
+                let wal_bytes = wal.metadata()?.len();
+                ensure!(
+                    wal_bytes == seal.boundary.sealed_end,
+                    "sealed v7 PITR source WAL length differs from its immutable boundary"
+                );
+                ensure!(
+                    wal_bytes <= max_segment_bytes,
+                    "sealed v7 PITR source WAL exceeds the persisted segment limit"
+                );
+
+                // Rebuild the sidecar from the exact frozen image. This streams
+                // the physical digest and strict recovery verification instead
+                // of reading a potentially large WAL into a single allocation.
+                let (verified_seal, verified_bytes) = crate::pitr::seal::build_v7_seal_from_reader(
+                    &mut wal,
+                    wal_bytes,
+                    seal.boundary.active,
+                    seal.header.predecessor,
+                )?;
+                ensure!(
+                    verified_seal == seal && verified_bytes == bytes,
+                    "sealed v7 PITR source WAL does not match its seal"
+                );
+
+                let repository_id = state
+                    .repository_id
+                    .ok_or_else(|| anyhow!("PITR repository identity is missing"))?;
+                let timeline_id = state
+                    .timeline_id
+                    .ok_or_else(|| anyhow!("PITR timeline identity is missing"))?;
+                let archive_epoch_id = state
+                    .archive_epoch_id
+                    .ok_or_else(|| anyhow!("PITR archive epoch identity is missing"))?;
+                ensure!(
+                    seal.header.timeline_id.0 == timeline_id
+                        && seal.header.archive_epoch_id.0 == archive_epoch_id,
+                    "sealed v7 PITR source identity mismatch"
+                );
+                let wal_digest = seal.boundary.wal_digest;
+                let seal_digest: [u8; 32] = sha2::Sha256::digest(&bytes).into();
+                let source_identity: [u8; 32] =
+                    sha2::Sha256::digest([wal_digest.as_slice(), seal_digest.as_slice()].concat())
+                        .into();
+                let metadata = crate::pitr::catalog::SegmentMetadata {
+                    key: crate::pitr::catalog::SegmentKey {
+                        repository_id,
+                        timeline_id: crate::pitr::TimelineId(timeline_id),
+                        archive_epoch_id: crate::pitr::ArchiveEpochId(archive_epoch_id),
+                        segment_id: crate::pitr::SegmentId(segment_id),
+                    },
+                    wal_format_version: crate::wal::format::WAL_FORMAT_VERSION_V7,
+                    seal_format_version: 2,
+                    immutable_boundary: Some(Box::new(seal.boundary)),
+                    anchor: crate::pitr::SegmentAnchor {
+                        segment_id: crate::pitr::SegmentId(segment_id),
+                        wal_digest,
+                        seal_digest,
+                    },
+                    predecessor: seal.header.predecessor,
+                    first_commit_ts: seal.entries.first().map(|entry| entry.commit_ts),
+                    last_commit_ts: seal.entries.last().map(|entry| entry.commit_ts),
+                    batch_count: u64::try_from(seal.entries.len())?,
+                    logical_bytes: seal.boundary.sealed_end,
+                    wal_bytes: seal.boundary.sealed_end,
+                    wal_digest,
+                    seal_digest,
+                    source_identity,
+                };
+                metadata.validate()?;
+                selected = Some((metadata, wal_path, path));
+                continue;
+            }
+
             let seal = crate::pitr::seal::V5Seal::decode(&bytes)?;
             if seal.header.segment_id.0 == segment_id {
                 ensure!(selected.is_none(), "duplicate PITR source seal for segment");
-                selected = Some((path, bytes, seal));
-            }
-        }
-        let (seal_path, seal_bytes, seal) =
-            selected.ok_or_else(|| anyhow!("sealed PITR source sidecar is missing"))?;
-        let wal_path = seal_path.with_extension("wal");
-        let wal = std::fs::read(&wal_path)?;
-        ensure!(
-            wal.len() == seal.logical_length as usize,
-            "sealed PITR source WAL length mismatch"
-        );
-        // Derive the digest under the rule the segment itself records, and hold it
-        // to the seal's own value. This used to recompute unconditionally under a
-        // whole-file hash and overwrite whatever the seal said; the value becomes
-        // the successor's predecessor anchor, so a silent divergence here would
-        // only surface later, as a chain that no longer verifies.
-        let wal_digest_rule = crate::pitr::wal_digest_rule(seal.header.wal_format_version)?;
-        let wal_digest = crate::pitr::seal::wal_digest(&wal, wal_digest_rule)?;
-        ensure!(
-            wal_digest == seal.wal_digest,
-            "sealed PITR source WAL digest does not match its seal"
-        );
-        let seal_digest: [u8; 32] = sha2::Sha256::digest(&seal_bytes).into();
-        let source_identity: [u8; 32] =
-            sha2::Sha256::digest([wal_digest.as_slice(), seal_digest.as_slice()].concat()).into();
-        let repository_id = state.repository_id.unwrap();
-        let timeline_id = state.timeline_id.unwrap();
-        let archive_epoch_id = state.archive_epoch_id.unwrap();
-        ensure!(
-            seal.header.timeline_id.0 == timeline_id
-                && seal.header.archive_epoch_id.0 == archive_epoch_id,
-            "sealed PITR source identity mismatch"
-        );
-
-        Ok((
-            crate::pitr::catalog::SegmentMetadata {
-                key: crate::pitr::catalog::SegmentKey {
-                    repository_id,
-                    timeline_id: crate::pitr::TimelineId(timeline_id),
-                    archive_epoch_id: crate::pitr::ArchiveEpochId(archive_epoch_id),
-                    segment_id: crate::pitr::SegmentId(segment_id),
-                },
-                wal_format_version: seal.header.wal_format_version,
-                seal_format_version: 1,
-                immutable_boundary: None,
-                anchor: crate::pitr::SegmentAnchor {
-                    segment_id: crate::pitr::SegmentId(segment_id),
+                let wal_path = path.with_extension("wal");
+                let wal = std::fs::read(&wal_path)?;
+                ensure!(
+                    wal.len() == seal.logical_length as usize,
+                    "sealed PITR source WAL length mismatch"
+                );
+                // Derive the digest under the rule the segment itself records,
+                // then hold it to the seal's own value. A silent divergence
+                // here would only surface later as a broken chain.
+                let wal_digest = crate::pitr::seal::wal_digest(
+                    &wal,
+                    crate::pitr::wal_digest_rule(seal.header.wal_format_version)?,
+                )?;
+                ensure!(
+                    wal_digest == seal.wal_digest,
+                    "sealed PITR source WAL digest does not match its seal"
+                );
+                let seal_digest: [u8; 32] = sha2::Sha256::digest(&bytes).into();
+                let source_identity: [u8; 32] =
+                    sha2::Sha256::digest([wal_digest.as_slice(), seal_digest.as_slice()].concat())
+                        .into();
+                let repository_id = state
+                    .repository_id
+                    .ok_or_else(|| anyhow!("PITR repository identity is missing"))?;
+                let timeline_id = state
+                    .timeline_id
+                    .ok_or_else(|| anyhow!("PITR timeline identity is missing"))?;
+                let archive_epoch_id = state
+                    .archive_epoch_id
+                    .ok_or_else(|| anyhow!("PITR archive epoch identity is missing"))?;
+                ensure!(
+                    seal.header.timeline_id.0 == timeline_id
+                        && seal.header.archive_epoch_id.0 == archive_epoch_id,
+                    "sealed PITR source identity mismatch"
+                );
+                let metadata = crate::pitr::catalog::SegmentMetadata {
+                    key: crate::pitr::catalog::SegmentKey {
+                        repository_id,
+                        timeline_id: crate::pitr::TimelineId(timeline_id),
+                        archive_epoch_id: crate::pitr::ArchiveEpochId(archive_epoch_id),
+                        segment_id: crate::pitr::SegmentId(segment_id),
+                    },
+                    wal_format_version: seal.header.wal_format_version,
+                    seal_format_version: 1,
+                    immutable_boundary: None,
+                    anchor: crate::pitr::SegmentAnchor {
+                        segment_id: crate::pitr::SegmentId(segment_id),
+                        wal_digest,
+                        seal_digest,
+                    },
+                    predecessor: seal.header.predecessor,
+                    first_commit_ts: seal.first_commit_ts(),
+                    last_commit_ts: seal.last_commit_ts(),
+                    batch_count: seal.entries.len() as u64,
+                    logical_bytes: seal.logical_length,
+                    wal_bytes: seal.logical_length,
                     wal_digest,
                     seal_digest,
-                },
-                predecessor: seal.header.predecessor,
-                first_commit_ts: seal.first_commit_ts(),
-                last_commit_ts: seal.last_commit_ts(),
-                batch_count: seal.entries.len() as u64,
-                logical_bytes: seal.logical_length,
-                wal_bytes: seal.logical_length,
-                wal_digest,
-                seal_digest,
-                source_identity,
-            },
-            wal_path,
-            seal_path,
-        ))
+                    source_identity,
+                };
+                metadata.validate()?;
+                selected = Some((metadata, wal_path, path));
+            }
+        }
+        selected.ok_or_else(|| anyhow!("sealed PITR source sidecar is missing"))
     }
 
     /// The seal sidecar a sealed segment wrote. Split out from
@@ -3705,15 +3837,37 @@ impl KvEngine {
     /// the seal's own entries - the recorded time and commit high-water travel
     /// with them - and the catalog metadata carries neither.
     #[cfg(target_os = "linux")]
-    fn load_pitr_source_seal(&self, segment_id: u64) -> Result<crate::pitr::seal::V5Seal> {
+    fn load_pitr_source_seal(
+        &self,
+        segment_id: u64,
+        max_v7_segment_bytes: Option<u64>,
+    ) -> Result<crate::pitr::seal::V5Seal> {
+        let expected_seal_name = format!("pitr-{segment_id:020}.seal");
         for entry in std::fs::read_dir(&self.inner.path)? {
             let path = entry?.path();
-            if path.extension().is_none_or(|extension| extension != "seal") {
+            if path.file_name().and_then(|name| name.to_str()) != Some(expected_seal_name.as_str())
+            {
                 continue;
             }
-            let seal = crate::pitr::seal::V5Seal::decode(&std::fs::read(&path)?)?;
-            if seal.header.segment_id.0 == segment_id {
-                return Ok(seal);
+            let (format, bytes) =
+                crate::pitr::seal::read_seal_sidecar(&path, max_v7_segment_bytes)?;
+            match format {
+                crate::pitr::seal::SealSidecarFormat::V5 => {
+                    let seal = crate::pitr::seal::V5Seal::decode(&bytes)?;
+                    if seal.header.segment_id.0 == segment_id {
+                        return Ok(seal);
+                    }
+                }
+                crate::pitr::seal::SealSidecarFormat::V7 => {
+                    let max_segment_bytes = max_v7_segment_bytes
+                        .ok_or_else(|| anyhow!("PITR v7 source has no persisted segment limit"))?;
+                    let seal = crate::pitr::seal::V7Seal::decode(&bytes, max_segment_bytes)?;
+                    if seal.header.segment_id.0 == segment_id {
+                        anyhow::bail!(
+                            "cannot complete an interrupted v7 PITR seal from a v5 seal index"
+                        );
+                    }
+                }
             }
         }
 
@@ -4400,19 +4554,44 @@ impl KvEngine {
                 }),
                 "PITR source reclamation introduced a non-reclaimable obligation"
             );
-            for entry in std::fs::read_dir(&self.inner.path)? {
-                let entry = entry?;
-                let seal_path = entry.path();
-                if !seal_path
-                    .extension()
-                    .is_some_and(|extension| extension == "seal")
-                {
+            for &expected_segment_id in state.obligations.keys() {
+                let seal_path = self
+                    .inner
+                    .path
+                    .join(format!("pitr-{expected_segment_id:020}.seal"));
+                if !seal_path.try_exists()? {
                     continue;
                 }
-                let seal = crate::pitr::seal::V5Seal::decode(&std::fs::read(&seal_path)?)?;
-                if state.obligations.contains_key(&seal.header.segment_id.0) {
-                    std::fs::remove_file(&seal_path)?;
-                }
+                let (format, bytes) = crate::pitr::seal::read_seal_sidecar(
+                    &seal_path,
+                    state.config.as_ref().map(|config| config.max_segment_bytes),
+                )?;
+                let segment_id = match format {
+                    crate::pitr::seal::SealSidecarFormat::V5 => {
+                        crate::pitr::seal::V5Seal::decode(&bytes)?
+                            .header
+                            .segment_id
+                            .0
+                    }
+                    crate::pitr::seal::SealSidecarFormat::V7 => {
+                        let max_segment_bytes = state
+                            .config
+                            .as_ref()
+                            .map(|config| config.max_segment_bytes)
+                            .ok_or_else(|| {
+                                anyhow!("PITR v7 source has no persisted segment limit")
+                            })?;
+                        crate::pitr::seal::V7Seal::decode(&bytes, max_segment_bytes)?
+                            .header
+                            .segment_id
+                            .0
+                    }
+                };
+                ensure!(
+                    segment_id == expected_segment_id,
+                    "PITR source seal filename does not match its segment ID"
+                );
+                std::fs::remove_file(&seal_path)?;
             }
             self.inner.sync_dir()?;
 
@@ -14178,6 +14357,84 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn pitr_status_counts_only_canonical_seal_sidecars() {
+        let dir = tempdir().unwrap();
+        let parent = crate::backup::open_directory_no_follow(dir.path()).unwrap();
+        crate::backup::bootstrap_repository(&parent, "repository").unwrap();
+        let database = dir.path().join("db");
+        let engine = KvEngine::open(
+            &database,
+            LsmStorageOptions {
+                enable_wal: true,
+                ..LsmStorageOptions::default_for_test()
+            },
+        )
+        .unwrap();
+        enable_pitr_for_test(
+            &engine,
+            &dir.path().join("repository"),
+            PITR_TEST_ARCHIVE_INTERVAL,
+        );
+        let mut state = engine.pitr_manifest_state.lock().clone();
+        let segment_id = 1_000_000;
+        state.obligations.insert(
+            segment_id,
+            crate::pitr::manifest::PitrObligation {
+                state: crate::pitr::manifest::ObligationState::Sealed,
+                successor_segment_id: segment_id + 1,
+                logical_length: 8192,
+                wal_format: crate::pitr::manifest::PitrWalFormat::LegacyV5V6,
+                immutable_boundary: None,
+            },
+        );
+        *engine.pitr_manifest_state.lock() = state.clone();
+
+        let archive_epoch_id = crate::pitr::ArchiveEpochId(
+            state
+                .archive_epoch_id
+                .expect("sealed PITR state has an archive epoch"),
+        );
+        let seal = crate::pitr::seal::V5Seal {
+            header: crate::pitr::WalV5Header {
+                wal_format_version: crate::pitr::WAL_V5_VERSION,
+                timeline_id: crate::pitr::TimelineId(
+                    state.timeline_id.expect("sealed PITR state has a timeline"),
+                ),
+                archive_epoch_id,
+                segment_id: crate::pitr::SegmentId(segment_id),
+                predecessor: crate::pitr::ChainAnchor::Genesis { archive_epoch_id },
+            },
+            wal_digest: [7; 32],
+            logical_length: 8192,
+            entries: vec![crate::pitr::seal::SealEntry {
+                commit_ts: 1,
+                recorded_at: crate::pitr::RecordedAt { secs: 1, nanos: 0 },
+            }],
+        };
+        let canonical_path = database.join(format!("pitr-{segment_id:020}.seal"));
+        std::fs::write(&canonical_path, seal.encode().unwrap()).unwrap();
+        let canonical_status = engine
+            .pitr_status(crate::pitr::api::PitrStatusOptions {
+                cursor: None,
+                page_size: crate::pitr::api::MAX_STATUS_PAGE_SIZE,
+            })
+            .unwrap();
+        assert_eq!(canonical_status.archive_lag_commits, 1);
+
+        let unbound_path = database.join("unbound-valid.seal");
+        std::fs::rename(canonical_path, &unbound_path).unwrap();
+        let unbound_status = engine
+            .pitr_status(crate::pitr::api::PitrStatusOptions {
+                cursor: None,
+                page_size: crate::pitr::api::MAX_STATUS_PAGE_SIZE,
+            })
+            .unwrap();
+        assert_eq!(unbound_status.archive_lag_commits, 0);
+        engine.close_storage().unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn resumed_pitr_releases_reclaimed_source_spool_usage() {
         let dir = tempdir().unwrap();
         let database = dir.path().join("db");
@@ -15606,6 +15863,142 @@ mod tests {
             pitr_repository: Some(directory.join("repository")),
             ..LsmStorageOptions::default_for_test()
         })
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn v7_source_discovery_requires_manifest_authority_and_verifies_streamed_wal()
+    -> anyhow::Result<()> {
+        use std::io::{Read, Seek, SeekFrom, Write};
+
+        let directory = tempdir()?;
+        let options = v7_recovery_test_database(directory.path())?;
+        let database = directory.path().join("db");
+        let engine = KvEngine::open(&database, options)?;
+        engine.sync()?;
+
+        let state = engine.pitr_manifest_state.lock().clone();
+        let segment_id = state
+            .active_segment_id
+            .ok_or_else(|| anyhow::anyhow!("v7 recovery fixture has no active segment"))?;
+        let active = state
+            .active_boundary
+            .ok_or_else(|| anyhow::anyhow!("v7 recovery fixture has no Active boundary"))?;
+        let predecessor = super::pitr_chain_anchor_from_persisted(
+            state
+                .predecessor_anchor
+                .ok_or_else(|| anyhow::anyhow!("v7 recovery fixture has no predecessor"))?,
+        );
+        let memtable = engine.inner.state.load().memtable.clone();
+        let wal_path = memtable
+            .wal_path()
+            .ok_or_else(|| anyhow::anyhow!("v7 recovery fixture has no WAL path"))?
+            .to_path_buf();
+        let sealed_end = std::fs::metadata(&wal_path)?.len();
+        let (seal, seal_bytes) = crate::pitr::seal::build_v7_seal_from_reader(
+            &mut std::fs::File::open(&wal_path)?,
+            sealed_end,
+            active,
+            predecessor,
+        )?;
+        let seal_path = wal_path.with_extension("seal");
+        std::fs::write(&seal_path, &seal_bytes)?;
+
+        let orphan_error = engine
+            .load_pitr_source_segment(&state, segment_id)
+            .expect_err("a v7 sidecar without a manifest obligation must not be authoritative");
+        assert!(
+            orphan_error
+                .to_string()
+                .contains("manifest sealing obligation")
+        );
+
+        let sealing_state = crate::pitr::manifest::replay_pitr_records([
+            crate::pitr::manifest::PitrManifestRecord::Snapshot(Box::new(state.clone())),
+            crate::pitr::manifest::PitrManifestRecord::SealStarted {
+                segment_id,
+                successor_segment_id: state.next_segment_id,
+                logical_length: seal.boundary.sealed_end,
+                immutable_boundary: Some(seal.boundary),
+            },
+        ])?;
+        let (metadata, loaded_wal_path, loaded_seal_path) =
+            engine.load_pitr_source_segment(&sealing_state, segment_id)?;
+        assert_eq!(loaded_wal_path, wal_path);
+        assert_eq!(loaded_seal_path, seal_path);
+        assert_eq!(
+            metadata.wal_format_version,
+            crate::wal::format::WAL_FORMAT_VERSION_V7
+        );
+        assert_eq!(metadata.seal_format_version, 2);
+        assert_eq!(metadata.immutable_boundary.as_deref(), Some(&seal.boundary));
+        assert_eq!(metadata.wal_bytes, sealed_end);
+        assert_eq!(metadata.batch_count, u64::try_from(seal.entries.len())?);
+
+        let malformed_seal_path = database.join("malformed.seal");
+        let mut malformed_seal = std::fs::File::create(&malformed_seal_path)?;
+        malformed_seal.write_all(b"NOTSEAL!")?;
+        malformed_seal
+            .set_len(u64::try_from(crate::pitr::seal::V5Seal::max_encoded_len()?)? + 1)?;
+        malformed_seal.sync_all()?;
+        drop(malformed_seal);
+        let (metadata, _, _) = engine.load_pitr_source_segment(&sealing_state, segment_id)?;
+        assert!(
+            metadata.wal_format_version == crate::wal::format::WAL_FORMAT_VERSION_V7,
+            "an unrelated malformed sidecar must not shadow the canonical source"
+        );
+        let interrupted_seal_error = engine
+            .load_pitr_source_seal(
+                segment_id,
+                state.config.as_ref().map(|config| config.max_segment_bytes),
+            )
+            .expect_err("v7 seals cannot use the v5 interrupted-seal recovery path");
+        assert!(
+            interrupted_seal_error
+                .to_string()
+                .contains("cannot complete an interrupted v7 PITR seal")
+        );
+        std::fs::remove_file(malformed_seal_path)?;
+
+        let oversized_v5_seal_path = database.join("oversized-v5.seal");
+        let mut oversized_v5_seal = std::fs::File::create(&oversized_v5_seal_path)?;
+        oversized_v5_seal.write_all(b"TKVSEAL1")?;
+        oversized_v5_seal
+            .set_len(u64::try_from(crate::pitr::seal::V5Seal::max_encoded_len()?)? + 1)?;
+        oversized_v5_seal.sync_all()?;
+        drop(oversized_v5_seal);
+        let oversized_error = crate::pitr::seal::read_seal_sidecar(&oversized_v5_seal_path, None)
+            .expect_err("oversized v5 sidecars must be rejected before allocating their body");
+        assert!(oversized_error.to_string().contains("format size limit"));
+        std::fs::remove_file(oversized_v5_seal_path)?;
+
+        let mut wal = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&wal_path)?;
+        let data_offset = seal
+            .entries
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("v7 recovery fixture has no indexed ticket"))?
+            .first_data_offset;
+        let body_offset = data_offset
+            .checked_add(crate::wal::v7::codec::WAL_V7_FRAME_HEADER_LEN as u64)
+            .ok_or_else(|| anyhow::anyhow!("v7 DATA body offset overflows"))?;
+        wal.seek(SeekFrom::Start(body_offset))?;
+        let mut byte = [0];
+        wal.read_exact(&mut byte)?;
+        wal.seek(SeekFrom::Start(body_offset))?;
+        wal.write_all(&[byte[0] ^ 1])?;
+        wal.sync_all()?;
+        assert!(
+            engine
+                .load_pitr_source_segment(&sealing_state, segment_id)
+                .is_err(),
+            "source discovery must reject a WAL image that no longer matches its seal"
+        );
+
+        engine.close_storage()?;
+        Ok(())
     }
 
     #[cfg(target_os = "linux")]
@@ -18555,12 +18948,18 @@ mod tests {
             })
             .unwrap();
         engine.put(b"before-disable", b"value").unwrap();
+        let unbound_seal_path = dir.path().join("db/unbound.seal");
+        std::fs::write(&unbound_seal_path, b"NOTSEAL!").unwrap();
         assert!(matches!(
             engine.disable_pitr().unwrap(),
             crate::pitr::api::DisablePitrOutcome::Disabled {
                 final_point: Some(_)
             }
         ));
+        assert!(
+            unbound_seal_path.exists(),
+            "disable must leave unrelated sidecars quarantined"
+        );
         assert!(matches!(
             engine
                 .pitr_status(crate::pitr::api::PitrStatusOptions {

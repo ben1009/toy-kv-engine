@@ -2429,8 +2429,10 @@ impl BackupRepository {
                     libc::O_RDONLY,
                     0,
                 )?;
-                let mut seal_bytes = Vec::new();
-                File::from(seal_fd).read_to_end(&mut seal_bytes)?;
+                let (_, seal_bytes) = crate::pitr::seal::read_seal_file(
+                    File::from(seal_fd),
+                    Some(metadata.wal_bytes),
+                )?;
                 let (first_recorded_at, last_recorded_at) = if metadata.wal_format_version
                     == crate::wal::format::WAL_FORMAT_VERSION_V7
                 {
@@ -3440,9 +3442,8 @@ impl BackupRepository {
                 metadata.seal_digest,
             );
             let seal_fd = openat_no_follow(&wal_dir, &seal_name, libc::O_RDONLY, 0)?;
-            let mut seal_file = File::from(seal_fd);
-            let mut seal = Vec::new();
-            seal_file.read_to_end(&mut seal)?;
+            let (_, seal) =
+                crate::pitr::seal::read_seal_file(File::from(seal_fd), Some(metadata.wal_bytes))?;
             ensure!(
                 Sha256::digest(&seal).as_slice() == metadata.seal_digest,
                 "PITR restore seal digest mismatch"

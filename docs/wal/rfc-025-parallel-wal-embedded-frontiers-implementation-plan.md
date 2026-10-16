@@ -48,15 +48,18 @@ v7 format marker and the full immutable boundary in Sealing obligations;
 seal completion checks the WAL digest against that boundary. A v7 v2 seal
 sidecar codec now persists the immutable boundary and each ticket's first DATA
 offset; building and verifying a seal runs strict Sealed recovery against the
-exact WAL image. Production freeze emission, lifecycle rotation, and immutable
-Sealing/Sealed recovery integration remain. PITR catalog metadata now has a v7
+exact WAL image. PITR catalog metadata now has a v7
 seal-format-2 descriptor carrying the immutable boundary; v5/v6 seal-format-1
 catalog records retain their original byte layout. Catalog encode/replay checks
 the v7 boundary's identity, ticket/time coordinates, exact terminal position,
 image size and ticket capacity, and required digests. V7 boundary allocations
 count toward decoded-state limits without storing the full extension inline
-in legacy records. Production source discovery/publication and restore
-integration remain. Archive preparation now validates v7 seal descriptors
+in legacy records. Production source discovery now recognizes v7 v2 sidecars,
+requires a matching manifest sealing obligation, rebuilds them against the
+exact frozen WAL through the seekable verifier, and returns the validated
+immutable catalog descriptor. Production freeze/seal emission, lifecycle
+rotation/publication, and interrupted v7 Sealing/Sealed recovery remain.
+Archive preparation now validates v7 seal descriptors
 against catalog metadata and strictly verifies the exact frozen WAL image;
 source-object digest checks use whole-image SHA-256 for v7 while retaining the
 recorded v5/v6 digest rules. Repository base-interval derivation now decodes
@@ -303,7 +306,7 @@ v6 to v7 transition remain unconnected. Active v7 reservation owners and their
 shared ledger are retained through durable source cleanup and then retired from
 segment bookkeeping.
 
-**Last updated:** 2026-10-15
+**Last updated:** 2026-10-16
 
 **Source baseline:** `30a64fa855126596316ab6b9237e6348b0e41fd2`, which merged RFC 025 in PR #379.
 
@@ -887,6 +890,13 @@ remain in later stage 5/6 work.
   retaining the v5/v6 seal-format-1 layout. Update production segment discovery,
   archive preparation/completion, catalog object verification, and
   `decode_restore_segment_batches` to consume these descriptors.
+  Production source discovery now recognizes v7 v2 sidecars, requires their
+  matching manifest immutable boundary, checks the exact frozen source length
+  and persisted segment limit, rebuilds the seal through the seekable verifier,
+  and returns a v7 descriptor bound to that boundary. WAL verification streams
+  from the seekable source without loading the full image. Local and archived
+  sidecar readers validate magic and format-specific size caps before allocating
+  the body, then perform a bounded read for both v5 and v7 seals.
   Archive only the exact frozen WAL image and seal; verify marker chain,
   logical/physical digests, index, identity, predecessor, and timestamps.
   Preserve each legacy predecessor's actual digest rule in mixed chains.
