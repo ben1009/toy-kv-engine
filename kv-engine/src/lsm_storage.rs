@@ -13734,7 +13734,8 @@ impl LsmStorageInner {
             "v7 successor identity differs from its Sealing obligation"
         );
         ensure!(
-            retained_resources.has_pending_successor(successor_segment_id),
+            retained_resources.has_pending_successor(successor_segment_id)
+                || retained_resources.has_segment_reservation(successor_segment_id),
             "v7 successor capacity was not reserved before its Sealing intent"
         );
         let next_segment_id = successor_segment_id
@@ -16858,6 +16859,13 @@ mod tests {
                 }),
                 ..seal.header
             };
+            let mut installed_successor_header = successor_header;
+            installed_successor_header.incarnation[15] ^= 1;
+            let successor_path = database.join(format!("pitr-{:020}.wal", state.next_segment_id));
+            crate::wal::v7::install::create_empty_active_image(
+                &successor_path,
+                installed_successor_header,
+            )?;
             let before_install = source_owner.snapshot();
             let successor_owner = engine.inner.install_pitr_v7_successor(
                 successor_header,
@@ -16886,12 +16894,12 @@ mod tests {
             assert_eq!(empty, latest);
             assert_eq!(latest.ticket_end, 0);
             assert_eq!(latest.durable_end, WAL_V7_HEADER_LEN as u64);
-            assert_eq!(latest.incarnation, successor_header.incarnation);
+            assert_eq!(latest.incarnation, installed_successor_header.incarnation);
             let successor_image = std::fs::read(successor.wal_path().unwrap())?;
             assert_eq!(successor_image.len(), WAL_V7_HEADER_LEN + WAL_V7_FRAME_LEN);
             assert_eq!(
                 WalV7Header::decode(&successor_image[..WAL_V7_HEADER_LEN])?,
-                successor_header
+                installed_successor_header
             );
             assert!(!resources.has_pending_successor(state.next_segment_id));
             let successor_extent = crate::pitr::segment::filesystem_allocation_reservation(

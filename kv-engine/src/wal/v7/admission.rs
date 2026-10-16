@@ -862,6 +862,14 @@ impl WalV7RetainedResources {
             .contains_key(&segment_id)
     }
 
+    pub(crate) fn has_segment_reservation(&self, segment_id: u64) -> bool {
+        self.state
+            .lock()
+            .by_segment
+            .get(&segment_id)
+            .is_some_and(|reservations| !reservations.is_empty())
+    }
+
     /// Promote a successfully installed successor's permanent image charge
     /// to its segment lifetime and release its now-clean staging charge.
     pub(crate) fn activate_pending_successor(
@@ -870,7 +878,11 @@ impl WalV7RetainedResources {
     ) -> Result<(), WalV7ReservationError> {
         let mut state = self.state.lock();
         if state.by_segment.contains_key(&segment_id) {
-            return Err(WalV7ReservationError::ReservationMismatch);
+            return if state.pending_successors.contains_key(&segment_id) {
+                Err(WalV7ReservationError::ReservationMismatch)
+            } else {
+                Ok(())
+            };
         }
         let reservation = state
             .pending_successors
