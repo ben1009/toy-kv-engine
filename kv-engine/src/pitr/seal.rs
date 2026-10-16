@@ -6,7 +6,11 @@
 //! is accepted only when it binds to the supplied header and source image.
 #![allow(dead_code)]
 
-use std::io::{Read, Seek, SeekFrom};
+use std::{
+    fs::File,
+    io::{Read, Seek, SeekFrom},
+    path::Path,
+};
 
 use anyhow::{Context, Result, ensure};
 use sha2::{Digest, Sha256};
@@ -53,6 +57,73 @@ const V7_MAX_ENTRY_COUNT: usize =
         / WAL_V7_FRAME_LEN;
 const V7_MAX_SEAL_BYTES: usize = V7_HEADER_BYTES + V7_MAX_ENTRY_COUNT * V7_ENTRY_BYTES;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SealSidecarFormat {
+    V5,
+    V7,
+}
+
+/// Read a local seal sidecar only after checking its format-specific size cap.
+/// The cap is checked against file metadata before reserving the body, and the
+/// bounded read detects concurrent resizing or mutation of the opened file.
+pub(crate) fn read_seal_sidecar(
+    path: &Path,
+    max_v7_segment_bytes: Option<u64>,
+) -> Result<(SealSidecarFormat, Vec<u8>)> {
+    let file =
+        File::open(path).with_context(|| format!("open PITR seal sidecar {}", path.display()))?;
+    read_seal_file(file, max_v7_segment_bytes)
+}
+
+/// Read a seal object only after checking its format-specific size cap.
+///
+/// This is also used for repository files opened relative to a trusted
+/// directory descriptor, where reopening by path would weaken path validation.
+pub(crate) fn read_seal_file(
+    mut file: File,
+    max_v7_segment_bytes: Option<u64>,
+) -> Result<(SealSidecarFormat, Vec<u8>)> {
+    let sidecar_len = file.metadata()?.len();
+    let mut magic = [0; 8];
+    ensure!(
+        sidecar_len >= magic.len() as u64,
+        "PITR source seal is truncated"
+    );
+    file.read_exact(&mut magic)?;
+    let (format, max_sidecar_bytes) = match &magic {
+        b"TKVSEAL1" => (SealSidecarFormat::V5, V5Seal::max_encoded_len()?),
+        b"TKVSEAL2" => {
+            let max_segment_bytes = max_v7_segment_bytes
+                .ok_or_else(|| anyhow::anyhow!("PITR v7 source has no persisted segment limit"))?;
+            (
+                SealSidecarFormat::V7,
+                V7Seal::max_encoded_len(max_segment_bytes)?,
+            )
+        }
+        _ => anyhow::bail!("unknown PITR source seal magic"),
+    };
+    ensure!(
+        sidecar_len <= u64::try_from(max_sidecar_bytes)?,
+        "PITR source seal exceeds its format size limit"
+    );
+
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(usize::try_from(sidecar_len)?)
+        .map_err(|error| anyhow::anyhow!("reserve PITR source seal sidecar: {error}"))?;
+    bytes.extend_from_slice(&magic);
+    let bounded_read = u64::try_from(max_sidecar_bytes)?
+        .checked_add(1)
+        .and_then(|limit| limit.checked_sub(magic.len() as u64))
+        .ok_or_else(|| anyhow::anyhow!("PITR source seal sidecar limit overflows"))?;
+    file.take(bounded_read).read_to_end(&mut bytes)?;
+    ensure!(
+        bytes.len() <= max_sidecar_bytes && u64::try_from(bytes.len())? == sidecar_len,
+        "PITR source seal sidecar changed while reading"
+    );
+    Ok((format, bytes))
+}
+
 fn v7_max_entry_count(wal_bytes: u64) -> Result<usize> {
     let fixed_bytes = u64::try_from(WAL_V7_HEADER_LEN + 2 * WAL_V7_FRAME_LEN)?;
     let data_bytes = wal_bytes.saturating_sub(fixed_bytes);
@@ -84,6 +155,20 @@ pub(crate) struct V5Seal {
 }
 
 impl V5Seal {
+    pub(crate) fn max_encoded_len() -> Result<usize> {
+        let max_wal_bytes = crate::wal::MAX_WAL_FILE_SIZE
+            .checked_sub(WAL_V5_HEADER_LEN as u64)
+            .ok_or_else(|| anyhow::anyhow!("maximum PITR WAL size is below its header"))?;
+        let max_entries = usize::try_from(max_wal_bytes / WAL_V5_ALIGNMENT as u64)?;
+        HEADER_BYTES
+            .checked_add(
+                max_entries
+                    .checked_mul(ENTRY_BYTES)
+                    .ok_or_else(|| anyhow::anyhow!("PITR seal entry limit overflows"))?,
+            )
+            .ok_or_else(|| anyhow::anyhow!("PITR seal size limit overflows"))
+    }
+
     pub(crate) fn first_commit_ts(&self) -> Option<u64> {
         self.entries.first().map(|entry| entry.commit_ts)
     }
@@ -153,6 +238,10 @@ impl V5Seal {
     }
 
     pub(crate) fn decode(bytes: &[u8]) -> Result<Self> {
+        ensure!(
+            bytes.len() <= Self::max_encoded_len()?,
+            "PITR seal exceeds the WAL format sidecar limit"
+        );
         ensure!(bytes.len() >= HEADER_BYTES, "PITR seal is truncated");
         ensure!(&bytes[..8] == MAGIC, "invalid PITR seal magic");
         ensure!(
@@ -323,6 +412,18 @@ pub(crate) struct V7Seal {
 }
 
 impl V7Seal {
+    pub(crate) fn max_encoded_len(max_segment_bytes: u64) -> Result<usize> {
+        ensure!(
+            max_segment_bytes >= (WAL_V7_HEADER_LEN + WAL_V7_FRAME_LEN) as u64,
+            "persisted v7 PITR segment limit is too small"
+        );
+        ensure!(
+            max_segment_bytes <= crate::wal::MAX_WAL_FILE_SIZE,
+            "persisted v7 PITR segment limit exceeds the WAL format limit"
+        );
+        v7_max_seal_bytes(v7_max_entry_count(max_segment_bytes)?)
+    }
+
     pub(crate) fn encode(&self) -> Result<Vec<u8>> {
         self.validate()?;
         let count = u64::try_from(self.entries.len())?;
@@ -405,7 +506,7 @@ impl V7Seal {
             "persisted v7 PITR segment limit exceeds the WAL format limit"
         );
         let max_entry_count = v7_max_entry_count(max_segment_bytes)?;
-        let max_sidecar_bytes = v7_max_seal_bytes(max_entry_count)?;
+        let max_sidecar_bytes = Self::max_encoded_len(max_segment_bytes)?;
         ensure!(
             bytes.len() <= max_sidecar_bytes && bytes.len() <= V7_MAX_SEAL_BYTES,
             "v7 PITR seal exceeds the persisted segment sidecar limit"
