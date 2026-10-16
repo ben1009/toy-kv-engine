@@ -1,4 +1,4 @@
-//! Crash-safe fresh-inode installation for an Active v7 recovery boundary.
+//! Crash-safe fresh-inode installation for Active and Sealing v7 recovery boundaries.
 //!
 //! The caller must hold exclusive recovery ownership: all descriptors and
 //! workers for the previous WAL image must be drained, and no writer may
@@ -464,6 +464,264 @@ pub(crate) fn recover_and_install_active_with_limits(
     })
 }
 
+/// Recover an Active v7 WAL whose durable manifest already has a Sealing
+/// obligation. The immutable boundary is strict authority: recovery verifies
+/// the complete sealed image and never falls back to an earlier frontier or
+/// changes any accepted bytes while installing the image on a fresh inode.
+///
+/// A crash may leave bytes after the durable `sealed_end` (for example, an
+/// interrupted source trim). They are ignored during strict verification and
+/// omitted from the replacement only after the complete immutable prefix has
+/// been checked.
+#[cfg(target_os = "linux")]
+pub(crate) fn recover_sealing_active_with_limits(
+    path: impl AsRef<Path>,
+    predecessor: crate::pitr::ChainAnchor,
+    boundary: crate::pitr::manifest::ImmutableBoundary,
+    max_image_len: u64,
+    max_seal_index_bytes: u64,
+) -> Result<WalV7ActiveRecovery> {
+    let path = path.as_ref();
+    boundary.validate()?;
+    ensure!(
+        boundary.sealed_end <= max_image_len,
+        "immutable v7 WAL exceeds its configured segment limit"
+    );
+
+    let path_metadata = fs::symlink_metadata(path).context("inspect Sealing v7 WAL path")?;
+    ensure!(
+        path_metadata.file_type().is_file(),
+        "Sealing v7 WAL path is not a regular file"
+    );
+    let mut source = OpenOptions::new()
+        .read(true)
+        .open(path)
+        .context("open Sealing v7 WAL for strict recovery")?;
+    let source_len = source.metadata()?.len();
+    ensure!(
+        source_len >= boundary.sealed_end && source_len <= max_image_len,
+        "Sealing v7 WAL length is outside its durable boundary and configured limit"
+    );
+
+    let mut header_bytes = [0_u8; WAL_V7_HEADER_LEN];
+    source
+        .seek(SeekFrom::Start(0))
+        .context("seek Sealing v7 WAL header")?;
+    source
+        .read_exact(&mut header_bytes)
+        .context("read Sealing v7 WAL header")?;
+    let header = WalV7Header::decode(&header_bytes)?;
+    ensure!(
+        header.encode()? == header_bytes && header.predecessor == predecessor,
+        "Sealing v7 WAL header is noncanonical or has the wrong predecessor"
+    );
+    validate_boundary_identity(boundary.active, header)?;
+    let header_digest = header.digest()?;
+    let discovery = discover_frontier_candidates(&mut source, boundary.sealed_end, &header_digest)?;
+    let selection = select_recovery_candidate(
+        &mut source,
+        boundary.sealed_end,
+        &discovery,
+        WalV7RecoveryAuthority::Sealing {
+            predecessor,
+            boundary,
+        },
+    )?;
+    ensure!(
+        selection.kind == WalV7RecoveryKind::Immutable
+            && selection.active_boundary == boundary.active,
+        "strict Sealing recovery selected the wrong v7 authority"
+    );
+
+    let terminal_offset = boundary
+        .sealed_end
+        .checked_sub(FRAME_LEN_U64)
+        .context("Sealing v7 terminal frontier offset underflows")?;
+    let mut physical_hasher = Sha256::new();
+    physical_hasher.update(header_bytes);
+    let mut logical_hasher = Sha256::new();
+    logical_hasher.update(header_bytes);
+    let mut prefix = PrefixRebuilder::new(header_digest, logical_hasher)?;
+    let mut offset = HEADER_LEN_U64;
+    let mut terminal_frontier = None;
+    while offset < boundary.sealed_end {
+        let mut encoded = [0_u8; WAL_V7_FRAME_LEN];
+        source
+            .seek(SeekFrom::Start(offset))
+            .with_context(|| format!("seek Sealing v7 frame at {offset}"))?;
+        source
+            .read_exact(&mut encoded)
+            .with_context(|| format!("read Sealing v7 frame at {offset}"))?;
+        physical_hasher.update(encoded);
+
+        if offset == terminal_offset {
+            let (frontier, digest) = if boundary.active.ticket_end == 0 {
+                let decoded = decode_frame_structural(&encoded, offset, &header_digest)?;
+                ensure!(
+                    decoded.kind == WalV7FrameKind::Frontier,
+                    "empty Sealing v7 image does not end in generation-zero FRONTIER"
+                );
+                let frontier = WalV7Frontier::decode_body(&decoded.body)?;
+                frontier.validate_generation_zero(&header_digest, offset)?;
+                ensure!(
+                    encoded == encode_generation_zero_frontier(header_digest)?,
+                    "empty Sealing v7 generation-zero FRONTIER is not canonical"
+                );
+                (frontier, frame_record_digest(&encoded)?)
+            } else {
+                let previous = prefix
+                    .last_frontier
+                    .context("Sealing v7 image has no predecessor frontier")?;
+                decode_frontier_successor(
+                    &encoded,
+                    offset,
+                    &header_digest,
+                    previous.frontier,
+                    previous.offset,
+                    &previous.digest,
+                )?
+            };
+            ensure!(
+                frontier == selection.candidate.frontier
+                    && digest == selection.candidate.frame_digest,
+                "Sealing v7 terminal frontier changed after verification"
+            );
+            terminal_frontier = Some((frontier, digest));
+        } else {
+            prefix.accept_frame(&encoded, offset)?;
+        }
+        offset = offset
+            .checked_add(FRAME_LEN_U64)
+            .context("Sealing v7 frame offset overflows")?;
+    }
+    let (next_ticket, last_recorded_at, batches, seal_index, logical_hasher) =
+        if boundary.active.ticket_end == 0 {
+            ensure!(
+                terminal_offset == HEADER_LEN_U64 && boundary.active.prefix_digest == header_digest,
+                "empty Sealing v7 image has an invalid logical boundary"
+            );
+            (0, None, Vec::new(), Vec::new(), prefix.logical_hasher)
+        } else {
+            let rebuilt = prefix.finish(boundary.active)?;
+            (
+                rebuilt.next_ticket,
+                rebuilt.last_recorded_at,
+                rebuilt.batches,
+                rebuilt.seal_index,
+                rebuilt.logical_hasher,
+            )
+        };
+    ensure!(
+        terminal_offset == boundary.active.durable_end,
+        "Sealing v7 terminal frontier does not immediately follow its durable prefix"
+    );
+    let (frontier, frontier_digest) =
+        terminal_frontier.context("Sealing v7 image has no terminal frontier")?;
+    let image_digest: [u8; 32] = physical_hasher.clone().finalize().into();
+    ensure!(
+        image_digest == boundary.wal_digest,
+        "Sealing v7 WAL digest differs from its immutable boundary"
+    );
+    let seal_index_bytes = u64::try_from(seal_index.len())?
+        .checked_mul(std::mem::size_of::<u64>() as u64)
+        .context("Sealing v7 index size overflows")?;
+    ensure!(
+        seal_index_bytes <= max_seal_index_bytes,
+        "Sealing v7 index exceeds its configured limit"
+    );
+
+    // Validate all runtime cursors before installation. The canonical pathname
+    // remains bound to the old image until the exact replacement is synced and
+    // atomically installed below.
+    let source_metadata = source.metadata()?;
+    let mut installed = WalV7InstalledRecovery {
+        active_boundary: boundary.active,
+        header_digest,
+        frontier,
+        frontier_offset: terminal_offset,
+        frontier_digest,
+        image_len: boundary.sealed_end,
+        append_offset: boundary.sealed_end,
+        next_ticket,
+        installed_dev: source_metadata.dev(),
+        installed_ino: source_metadata.ino(),
+        last_recorded_at,
+        batches,
+        seal_index,
+        logical_hasher,
+        physical_hasher,
+    };
+    installed.runtime_seed()?;
+    validate_existing_sealing_sidecar(path, header, boundary, &installed, max_image_len)?;
+
+    let metadata = install_exact_v7_recovery_image(
+        path,
+        &mut source,
+        source_len,
+        boundary.sealed_end,
+        boundary.wal_digest,
+    )?;
+    installed.installed_dev = metadata.dev();
+    installed.installed_ino = metadata.ino();
+    installed.runtime_seed()?;
+
+    Ok(WalV7ActiveRecovery {
+        selection,
+        installed,
+    })
+}
+
+/// A canonical sidecar may have been installed before the crash. Its contents
+/// remain strict authority alongside the Sealing intent; only absence is
+/// permitted when the crash preceded sidecar installation.
+fn validate_existing_sealing_sidecar(
+    wal_path: &Path,
+    header: WalV7Header,
+    boundary: crate::pitr::manifest::ImmutableBoundary,
+    installed: &WalV7InstalledRecovery,
+    max_image_len: u64,
+) -> Result<()> {
+    let seal_path = wal_path.with_extension("seal");
+    match fs::symlink_metadata(&seal_path) {
+        Ok(metadata) => ensure!(
+            metadata.file_type().is_file(),
+            "Sealing v7 seal sidecar is not a regular file"
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error).context("inspect Sealing v7 seal sidecar"),
+    }
+    let (format, bytes) = crate::pitr::seal::read_seal_sidecar(&seal_path, Some(max_image_len))?;
+    ensure!(
+        format == crate::pitr::seal::SealSidecarFormat::V7,
+        "Sealing v7 sidecar has the wrong seal format"
+    );
+    let seal = crate::pitr::seal::V7Seal::decode(&bytes, max_image_len)?;
+    ensure!(
+        seal.header == header && seal.boundary == boundary,
+        "Sealing v7 sidecar differs from its immutable WAL authority"
+    );
+    ensure!(
+        seal.entries.len() == installed.batches.len()
+            && seal.entries.len() == installed.seal_index.len(),
+        "Sealing v7 sidecar index count differs from its recovered WAL"
+    );
+    for ((entry, batch), &first_data_offset) in seal
+        .entries
+        .iter()
+        .zip(&installed.batches)
+        .zip(&installed.seal_index)
+    {
+        ensure!(
+            entry.first_data_offset == first_data_offset
+                && entry.commit_ts == batch.commit_ts
+                && entry.recorded_at == batch.recorded_at,
+            "Sealing v7 sidecar index differs from its recovered WAL"
+        );
+    }
+
+    Ok(())
+}
+
 #[derive(Clone, Copy)]
 struct RetainedFrontier {
     offset: u64,
@@ -713,8 +971,8 @@ pub(crate) fn recovery_temp_prefix(file_name: &OsStr) -> String {
 /// directory before allocating the replacement image so reclaimed space is
 /// durable before it is reused.
 fn cleanup_stale_recovery_images(parent: &Path, parent_dir: &File, prefix: &str) -> Result<()> {
-    for entry in fs::read_dir(parent).context("scan for stale Active v7 recovery images")? {
-        let entry = entry.context("read Active v7 recovery directory entry")?;
+    for entry in fs::read_dir(parent).context("scan for stale v7 recovery images")? {
+        let entry = entry.context("read v7 recovery directory entry")?;
         let name = entry.file_name();
         if !name.as_encoded_bytes().starts_with(prefix.as_bytes()) || !is_recovery_temp_name(&name)
         {
@@ -722,32 +980,146 @@ fn cleanup_stale_recovery_images(parent: &Path, parent_dir: &File, prefix: &str)
         }
         let file_type = entry
             .file_type()
-            .context("inspect stale Active v7 recovery image")?;
+            .context("inspect stale v7 recovery image")?;
         if !file_type.is_file() {
             continue;
         }
         match fs::remove_file(entry.path()) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error).context("remove stale Active v7 recovery image"),
+            Err(error) => return Err(error).context("remove stale v7 recovery image"),
         }
     }
     // A prior attempt may have unlinked every image before its directory sync
     // failed. An empty scan does not establish durable absence on retry.
     parent_dir
         .sync_all()
-        .context("sync directory after checking stale Active v7 recovery images")
+        .context("sync directory after checking stale v7 recovery images")
 }
 
 fn cleanup_failed_recovery_image(temp_path: &Path, parent_dir: &File) -> Result<()> {
     match fs::remove_file(temp_path) {
         Ok(()) => parent_dir
             .sync_all()
-            .context("sync directory after removing failed Active v7 recovery image"),
+            .context("sync directory after removing failed v7 recovery image"),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => parent_dir
             .sync_all()
-            .context("sync directory after confirming failed Active v7 recovery image is absent"),
-        Err(error) => Err(error).context("remove failed Active v7 recovery image"),
+            .context("sync directory after confirming failed v7 recovery image is absent"),
+        Err(error) => Err(error).context("remove failed v7 recovery image"),
+    }
+}
+
+/// Copy a previously validated immutable image to a fresh inode and durably
+/// replace its canonical pathname without changing any image bytes.
+fn install_exact_v7_recovery_image(
+    source_path: &Path,
+    source: &mut File,
+    source_len: u64,
+    image_len: u64,
+    expected_digest: [u8; 32],
+) -> Result<fs::Metadata> {
+    ensure!(
+        image_len <= source_len,
+        "immutable v7 image exceeds its source length"
+    );
+
+    let file_name = source_path
+        .file_name()
+        .filter(|name| !name.is_empty())
+        .context("immutable v7 WAL path has no file name")?;
+    let parent = source_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let source_metadata = source
+        .metadata()
+        .context("read immutable v7 WAL metadata")?;
+    ensure!(
+        source_metadata.is_file(),
+        "immutable v7 WAL is not a regular file"
+    );
+
+    let parent_dir = File::open(parent).context("open immutable v7 WAL directory")?;
+    let temp_prefix = recovery_temp_prefix(file_name);
+    cleanup_stale_recovery_images(parent, &parent_dir, &temp_prefix)?;
+    let temp_path = parent.join(format!(
+        "{temp_prefix}{}-{}",
+        std::process::id(),
+        TEMP_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    ));
+
+    let mut temp_created = false;
+    let result = (|| -> Result<fs::Metadata> {
+        let mut temp = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)
+            .context("create immutable v7 recovery image")?;
+        temp_created = true;
+        fs::set_permissions(&temp_path, source_metadata.permissions())
+            .context("preserve immutable v7 WAL permissions")?;
+
+        source
+            .seek(SeekFrom::Start(0))
+            .context("seek immutable v7 WAL for copy")?;
+        let mut copied_hasher = Sha256::new();
+        let mut remaining = image_len;
+        let mut buffer = [0_u8; COPY_BUFFER_LEN];
+        while remaining > 0 {
+            let chunk_len = usize::try_from(remaining.min(COPY_BUFFER_LEN as u64))?;
+            source
+                .read_exact(&mut buffer[..chunk_len])
+                .context("read immutable v7 WAL for copy")?;
+            temp.write_all(&buffer[..chunk_len])
+                .context("write immutable v7 recovery image")?;
+            copied_hasher.update(&buffer[..chunk_len]);
+            remaining -= u64::try_from(chunk_len)?;
+        }
+        let copied_digest: [u8; 32] = copied_hasher.finalize().into();
+        ensure!(
+            copied_digest == expected_digest,
+            "copied immutable v7 image differs from its Sealing digest"
+        );
+        ensure!(
+            source.metadata()?.len() == source_len,
+            "immutable v7 WAL changed during exclusive recovery"
+        );
+        let temp_metadata = temp.metadata()?;
+        ensure!(
+            temp_metadata.len() == image_len && temp_metadata.dev() == source_metadata.dev(),
+            "immutable v7 recovery image has an unexpected size or device"
+        );
+        temp.sync_all()
+            .context("sync exact immutable v7 recovery image")?;
+        drop(temp);
+
+        fs::rename(&temp_path, source_path)
+            .context("atomically replace immutable v7 WAL with recovery image")?;
+        parent_dir
+            .sync_all()
+            .context("sync immutable v7 WAL directory after replacement")?;
+
+        let installed_metadata = fs::symlink_metadata(source_path)
+            .context("inspect installed immutable v7 WAL inode")?;
+        ensure!(
+            installed_metadata.file_type().is_file()
+                && installed_metadata.len() == image_len
+                && installed_metadata.dev() == source_metadata.dev(),
+            "installed immutable v7 WAL has an unexpected file type, size, or device"
+        );
+        Ok(installed_metadata)
+    })();
+
+    match result {
+        Err(operation_error) if temp_created => {
+            match cleanup_failed_recovery_image(&temp_path, &parent_dir) {
+                Ok(()) => Err(operation_error),
+                Err(cleanup_error) => Err(anyhow::anyhow!(
+                    "{operation_error:#}; additionally, failed to durably clean the temporary immutable v7 recovery image: {cleanup_error:#}"
+                )),
+            }
+        }
+        other => other,
     }
 }
 
@@ -1502,6 +1874,251 @@ mod tests {
         recovered.installed.append_offset += FRAME_LEN_U64;
         assert!(recovered.installed.runtime_seed().is_err());
 
+        Ok(())
+    }
+
+    fn create_sealing_image(
+        path: &Path,
+    ) -> Result<(WalV7Header, crate::pitr::manifest::ImmutableBoundary)> {
+        let (header, active_boundary) = create_nonempty_image(path)?;
+        let active = recover_and_install_active(
+            path,
+            WalV7RecoveryAuthority::Active {
+                predecessor: header.predecessor,
+                durable_anchors: vec![active_boundary],
+            },
+        )?;
+        let boundary = crate::pitr::manifest::ImmutableBoundary {
+            active: active_boundary,
+            sealed_end: active.installed.image_len,
+            terminal_frontier_digest: active.installed.frontier_digest,
+            wal_digest: active.installed.image_digest(),
+        };
+        Ok((header, boundary))
+    }
+
+    #[test]
+    fn sealing_recovery_preserves_the_exact_immutable_image() -> Result<()> {
+        let directory = TestDirectory::new()?;
+        let path = directory.0.join("active.wal");
+        let (header, boundary) = create_sealing_image(&path)?;
+        let original = fs::read(&path)?;
+        let original_inode = fs::metadata(&path)?.ino();
+
+        let recovered = recover_sealing_active_with_limits(
+            &path,
+            header.predecessor,
+            boundary,
+            MAX_WAL_FILE_SIZE,
+            u64::MAX,
+        )?;
+
+        assert_eq!(recovered.selection.kind, WalV7RecoveryKind::Immutable);
+        assert_eq!(recovered.installed.active_boundary, boundary.active);
+        assert_eq!(recovered.installed.image_len, boundary.sealed_end);
+        assert_eq!(recovered.installed.image_digest(), boundary.wal_digest);
+        assert_eq!(
+            recovered.installed.frontier_digest,
+            boundary.terminal_frontier_digest
+        );
+        assert_ne!(
+            recovered.installed.installed_ino, original_inode,
+            "strict Sealing recovery must install a fresh inode even at exact length"
+        );
+        assert_eq!(fs::read(&path)?, original);
+        recovered.installed.runtime_seed()?;
+        Ok(())
+    }
+
+    #[test]
+    fn sealing_recovery_accepts_the_canonical_empty_image() -> Result<()> {
+        let directory = TestDirectory::new()?;
+        let path = directory.0.join("active.wal");
+        let header = test_header();
+        let empty = create_empty_active_image(&path, header)?;
+        let boundary = crate::pitr::manifest::ImmutableBoundary {
+            active: empty.active_boundary,
+            sealed_end: empty.image_len,
+            terminal_frontier_digest: empty.frontier_digest,
+            wal_digest: empty.image_digest(),
+        };
+        let original = fs::read(&path)?;
+
+        let recovered = recover_sealing_active_with_limits(
+            &path,
+            header.predecessor,
+            boundary,
+            MAX_WAL_FILE_SIZE,
+            u64::MAX,
+        )?;
+
+        assert!(recovered.installed.batches.is_empty());
+        assert_eq!(recovered.installed.next_ticket, 0);
+        assert_eq!(recovered.installed.image_digest(), boundary.wal_digest);
+        assert_eq!(fs::read(&path)?, original);
+        Ok(())
+    }
+
+    #[test]
+    fn sealing_recovery_discards_only_a_suffix_after_full_validation() -> Result<()> {
+        let directory = TestDirectory::new()?;
+        let path = directory.0.join("active.wal");
+        let (header, boundary) = create_sealing_image(&path)?;
+        let original = fs::read(&path)?;
+        let original_inode = fs::metadata(&path)?.ino();
+        let mut with_suffix = original.clone();
+        with_suffix.extend_from_slice(&[0xA5; 37]);
+        fs::write(&path, &with_suffix)?;
+
+        let recovered = recover_sealing_active_with_limits(
+            &path,
+            header.predecessor,
+            boundary,
+            MAX_WAL_FILE_SIZE,
+            u64::MAX,
+        )?;
+
+        assert_eq!(fs::read(&path)?, original);
+        assert_ne!(recovered.installed.installed_ino, original_inode);
+        Ok(())
+    }
+
+    #[test]
+    fn sealing_recovery_accepts_a_matching_existing_sidecar() -> Result<()> {
+        let directory = TestDirectory::new()?;
+        let path = directory.0.join("active.wal");
+        let (header, boundary) = create_sealing_image(&path)?;
+        let mut source = File::open(&path)?;
+        let (_, bytes) = crate::pitr::seal::build_v7_seal_from_reader(
+            &mut source,
+            boundary.sealed_end,
+            boundary.active,
+            header.predecessor,
+        )?;
+        let seal_path = path.with_extension("seal");
+        fs::write(&seal_path, &bytes)?;
+        let original_inode = source.metadata()?.ino();
+        drop(source);
+
+        let recovered = recover_sealing_active_with_limits(
+            &path,
+            header.predecessor,
+            boundary,
+            MAX_WAL_FILE_SIZE,
+            u64::MAX,
+        )?;
+
+        assert_eq!(recovered.installed.image_digest(), boundary.wal_digest);
+        assert_ne!(recovered.installed.installed_ino, original_inode);
+        assert_eq!(fs::read(&seal_path)?, bytes);
+        Ok(())
+    }
+
+    #[test]
+    fn sealing_recovery_rejects_conflicting_sidecars_before_replacing_wal() -> Result<()> {
+        for case in ["magic", "crc", "format", "header", "boundary", "index"] {
+            let directory = TestDirectory::new()?;
+            let path = directory.0.join("active.wal");
+            let (header, boundary) = create_sealing_image(&path)?;
+            let original = fs::read(&path)?;
+            let original_inode = fs::metadata(&path)?.ino();
+            let mut source = File::open(&path)?;
+            let (mut seal, mut bytes) = crate::pitr::seal::build_v7_seal_from_reader(
+                &mut source,
+                boundary.sealed_end,
+                boundary.active,
+                header.predecessor,
+            )?;
+            drop(source);
+            match case {
+                "magic" => bytes[0] ^= 1,
+                "crc" => bytes[316] ^= 1,
+                "format" => bytes = b"TKVSEAL1".to_vec(),
+                "header" => {
+                    seal.header.predecessor = ChainAnchor::Segment(crate::pitr::SegmentAnchor {
+                        segment_id: SegmentId(0),
+                        wal_digest: [4; 32],
+                        seal_digest: [5; 32],
+                    });
+                    bytes = seal.encode()?;
+                }
+                "boundary" => {
+                    seal.boundary.wal_digest[0] ^= 1;
+                    bytes = seal.encode()?;
+                }
+                "index" => {
+                    seal.entries[0].recorded_at.secs += 1;
+                    bytes = seal.encode()?;
+                }
+                _ => unreachable!(),
+            }
+            let seal_path = path.with_extension("seal");
+            fs::write(&seal_path, &bytes)?;
+
+            assert!(
+                recover_sealing_active_with_limits(
+                    &path,
+                    header.predecessor,
+                    boundary,
+                    MAX_WAL_FILE_SIZE,
+                    u64::MAX,
+                )
+                .is_err(),
+                "Sealing recovery accepted the {case} sidecar conflict"
+            );
+            assert_eq!(fs::read(&path)?, original, "case={case}");
+            assert_eq!(fs::metadata(&path)?.ino(), original_inode, "case={case}");
+            assert_eq!(fs::read(&seal_path)?, bytes, "case={case}");
+            assert_eq!(fs::read_dir(&directory.0)?.count(), 2, "case={case}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn failed_immutable_image_install_keeps_the_canonical_inode() -> Result<()> {
+        let directory = TestDirectory::new()?;
+        let path = directory.0.join("active.wal");
+        create_nonempty_image(&path)?;
+        let original = fs::read(&path)?;
+        let original_inode = fs::metadata(&path)?.ino();
+        let mut source = OpenOptions::new().read(true).open(&path)?;
+        let source_len = source.metadata()?.len();
+
+        let error =
+            install_exact_v7_recovery_image(&path, &mut source, source_len, source_len, [0; 32])
+                .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("differs from its Sealing digest")
+        );
+        assert_eq!(fs::read(&path)?, original);
+        assert_eq!(fs::metadata(&path)?.ino(), original_inode);
+        assert_eq!(fs::read_dir(&directory.0)?.count(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn sealing_recovery_rejects_corruption_without_mutating_the_source() -> Result<()> {
+        let directory = TestDirectory::new()?;
+        let path = directory.0.join("active.wal");
+        let (header, boundary) = create_sealing_image(&path)?;
+        let mut corrupted = fs::read(&path)?;
+        corrupted[2 * WAL_V7_FRAME_LEN + 64] ^= 1;
+        fs::write(&path, &corrupted)?;
+
+        assert!(
+            recover_sealing_active_with_limits(
+                &path,
+                header.predecessor,
+                boundary,
+                MAX_WAL_FILE_SIZE,
+                u64::MAX,
+            )
+            .is_err()
+        );
+        assert_eq!(fs::read(&path)?, corrupted);
         Ok(())
     }
 

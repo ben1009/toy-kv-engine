@@ -293,7 +293,7 @@ impl WalV7ReservationOwner {
         ledger: WalV7ResourceLedger,
         installed: &super::install::WalV7InstalledRecovery,
     ) -> anyhow::Result<Self> {
-        Self::new_inner(ledger, installed, None)
+        Self::new_inner(ledger, None, installed, false)
     }
 
     /// Create an image owner on the reconstructed PITR ledger so live Active
@@ -304,19 +304,41 @@ impl WalV7ReservationOwner {
     ) -> anyhow::Result<Self> {
         Self::new_inner(
             retained_resources.ledger(),
-            installed,
             Some(retained_resources),
+            installed,
+            false,
+        )
+    }
+
+    /// Create the frozen Active image owner for a durable Sealing obligation.
+    /// Its logical bytes are already charged by the retained obligation, so
+    /// only physical source and in-memory index usage are charged here.
+    pub(crate) fn new_sealing_with_retained_resources(
+        retained_resources: Arc<WalV7RetainedResources>,
+        installed: &super::install::WalV7InstalledRecovery,
+    ) -> anyhow::Result<Self> {
+        Self::new_inner(
+            retained_resources.ledger(),
+            Some(retained_resources),
+            installed,
+            true,
         )
     }
 
     fn new_inner(
         ledger: WalV7ResourceLedger,
-        installed: &super::install::WalV7InstalledRecovery,
         retained_resources: Option<Arc<WalV7RetainedResources>>,
+        installed: &super::install::WalV7InstalledRecovery,
+        sealing: bool,
     ) -> anyhow::Result<Self> {
         let seed = installed.runtime_seed()?;
         let mut reservations = BTreeMap::new();
-        if let Some(reservation) = installed.reserve_recovered_resources(&ledger)? {
+        let mut recovered_charge = installed.recovered_resource_charge()?;
+        if sealing {
+            recovered_charge.logical_wal_bytes = 0;
+        }
+        if recovered_charge != WalV7ResourceCharge::default() {
+            let reservation = ledger.reserve(recovered_charge)?;
             reservations.insert(reservation.id, reservation);
         }
         Ok(Self {

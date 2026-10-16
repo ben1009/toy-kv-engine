@@ -70,8 +70,14 @@ bounded decode/canonicalization workspace, recovery scan metadata, sidecar
 memory, and sidecar source-spool bytes before building. The Active resource
 ledger's transient-memory cap is sized for the maximum preparation estimate
 under its persisted segment limit. Wiring this primitive into successor
-rotation/publication is not yet connected to the public recovery-point path;
-interrupted v7 Sealing/Sealed recovery also remains gated. Seal preparation
+rotation/publication is not yet connected to the public recovery-point path.
+Restart recovery now strictly verifies a durable v7 Sealing source against its
+immutable boundary and any existing canonical seal sidecar, copies the exact
+frozen bytes to a fresh inode, syncs and atomically installs that image, and
+keeps commit admission closed while that source is still the active engine
+WAL. Recovery of Sealed obligations and the post-successor-install crash
+window, along with transition completion and
+public recovery-point publication, remain gated. Seal preparation
 now additionally reserves the successor's persistent image and atomic-install
 staging extents before `SealStarted`; the installed sidecar transition retains
 those charges until successor installation or cleanup. The guarded
@@ -81,9 +87,9 @@ engine manifest, and swaps it in only after commit admission is stopped. Before
 successor publication it reserves its own bounded verification workspace,
 rebuilds the seal from the exact frozen WAL image, and compares the installed
 sidecar in fixed-size chunks for byte-for-byte agreement. Recovery-point
-publication and interrupted v7 Sealing/Sealed recovery remain gated for the
-next lifecycle slice. Frozen v7 WALs remain archive sources after their
-memtables flush and are deleted only through PITR reclamation.
+publication, recovery after successor installation, and Sealed recovery remain
+gated for the next lifecycle slice. Frozen v7 WALs remain archive sources after
+their memtables flush and are deleted only through PITR reclamation.
 Archive preparation now validates v7 seal descriptors
 against catalog metadata and strictly verifies the exact frozen WAL image;
 source-object digest checks use whole-image SHA-256 for v7 while retaining the
