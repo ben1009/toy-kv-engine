@@ -1278,6 +1278,48 @@ impl MemTable {
         Ok((ret, batch.max_ts))
     }
 
+    fn apply_recovered_batch(&self, batch: &crate::pitr::WalBatch) -> Result<()> {
+        let mut range_ordinal = 0_u32;
+        for entry in &batch.entries {
+            match entry {
+                crate::pitr::WalEntry::Put { key, value } => {
+                    let internal_key =
+                        Bytes::from(crate::key::encode_internal_key(key, batch.commit_ts));
+                    let value = Bytes::copy_from_slice(value);
+                    self.approximate_size.fetch_add(
+                        internal_key.len() + value.len(),
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                    self.map.insert(internal_key, value);
+                }
+                crate::pitr::WalEntry::PointDelete { key } => {
+                    let internal_key =
+                        Bytes::from(crate::key::encode_internal_key(key, batch.commit_ts));
+                    let value = Bytes::from_static(&[KvKind::Tombstone as u8]);
+                    self.approximate_size.fetch_add(
+                        internal_key.len() + value.len(),
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                    self.map.insert(internal_key, value);
+                }
+                crate::pitr::WalEntry::RangeDelete { start, end } => {
+                    self.range_tombstones.add(
+                        crate::range_tombstone::RangeTombstone {
+                            start: Bytes::copy_from_slice(start),
+                            end: Bytes::copy_from_slice(end),
+                            ts: batch.commit_ts,
+                        },
+                        range_ordinal,
+                    );
+                    range_ordinal = range_ordinal
+                        .checked_add(1)
+                        .context("v7 WAL range-tombstone ordinal overflows")?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Attach an installed, authority-verified v7 Active WAL to a recovered
     /// memtable and initialize the requested scheduler.
     ///
@@ -1305,44 +1347,7 @@ impl MemTable {
         let mut ret = Self::create(id, vlog_enabled);
         ret.wal_v7_source = true;
         for batch in &installed.batches {
-            let mut range_ordinal = 0_u32;
-            for entry in &batch.entries {
-                match entry {
-                    crate::pitr::WalEntry::Put { key, value } => {
-                        let internal_key =
-                            Bytes::from(crate::key::encode_internal_key(key, batch.commit_ts));
-                        let value = Bytes::copy_from_slice(value);
-                        ret.approximate_size.fetch_add(
-                            internal_key.len() + value.len(),
-                            std::sync::atomic::Ordering::Relaxed,
-                        );
-                        ret.map.insert(internal_key, value);
-                    }
-                    crate::pitr::WalEntry::PointDelete { key } => {
-                        let internal_key =
-                            Bytes::from(crate::key::encode_internal_key(key, batch.commit_ts));
-                        let value = Bytes::from_static(&[KvKind::Tombstone as u8]);
-                        ret.approximate_size.fetch_add(
-                            internal_key.len() + value.len(),
-                            std::sync::atomic::Ordering::Relaxed,
-                        );
-                        ret.map.insert(internal_key, value);
-                    }
-                    crate::pitr::WalEntry::RangeDelete { start, end } => {
-                        ret.range_tombstones.add(
-                            crate::range_tombstone::RangeTombstone {
-                                start: Bytes::copy_from_slice(start),
-                                end: Bytes::copy_from_slice(end),
-                                ts: batch.commit_ts,
-                            },
-                            range_ordinal,
-                        );
-                        range_ordinal = range_ordinal
-                            .checked_add(1)
-                            .context("v7 WAL range-tombstone ordinal overflows")?;
-                    }
-                }
-            }
+            ret.apply_recovered_batch(batch)?;
         }
 
         ret.wal = Some(match io_mode {
@@ -1402,45 +1407,7 @@ impl MemTable {
             .len();
         let mut ret = Self::create(id, vlog_enabled);
         seal.visit_wal_batches_from_reader(&mut reader, wal_len, limits, |batch| {
-            let mut range_ordinal = 0_u32;
-            for entry in &batch.entries {
-                match entry {
-                    crate::pitr::WalEntry::Put { key, value } => {
-                        let internal_key =
-                            Bytes::from(crate::key::encode_internal_key(key, batch.commit_ts));
-                        let value = Bytes::copy_from_slice(value);
-                        ret.approximate_size.fetch_add(
-                            internal_key.len() + value.len(),
-                            std::sync::atomic::Ordering::Relaxed,
-                        );
-                        ret.map.insert(internal_key, value);
-                    }
-                    crate::pitr::WalEntry::PointDelete { key } => {
-                        let internal_key =
-                            Bytes::from(crate::key::encode_internal_key(key, batch.commit_ts));
-                        let value = Bytes::from_static(&[KvKind::Tombstone as u8]);
-                        ret.approximate_size.fetch_add(
-                            internal_key.len() + value.len(),
-                            std::sync::atomic::Ordering::Relaxed,
-                        );
-                        ret.map.insert(internal_key, value);
-                    }
-                    crate::pitr::WalEntry::RangeDelete { start, end } => {
-                        ret.range_tombstones.add(
-                            crate::range_tombstone::RangeTombstone {
-                                start: Bytes::copy_from_slice(start),
-                                end: Bytes::copy_from_slice(end),
-                                ts: batch.commit_ts,
-                            },
-                            range_ordinal,
-                        );
-                        range_ordinal = range_ordinal
-                            .checked_add(1)
-                            .context("v7 WAL range-tombstone ordinal overflows")?;
-                    }
-                }
-            }
-            Ok(())
+            ret.apply_recovered_batch(&batch)
         })?;
 
         ret.wal_path = Some(path);
