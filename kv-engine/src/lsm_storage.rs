@@ -13685,8 +13685,8 @@ impl LsmStorageInner {
     }
 
     /// Prepare the immutable v7 sidecar for a stopped Active WAL without
-    /// publishing it. After stopping commit admission, the caller must acquire
-    /// `state_lock` before the active-memtable write guard and hold both through
+    /// publishing it or mutating the source WAL. After stopping commit admission, the caller must
+    /// acquire `state_lock` before the active-memtable write guard and hold both through
     /// the durable `SealStarted` transition and the subsequent installation.
     /// The returned object borrows both guards. The returned reservation
     /// accounts for both preparation memory and the sidecar's persistent spool
@@ -13786,7 +13786,6 @@ impl LsmStorageInner {
 
         let mut wal = std::fs::OpenOptions::new()
             .read(true)
-            .write(true)
             .open(&wal_path)
             .with_context(|| format!("open Active v7 WAL {} for sealing", wal_path.display()))?;
         let physical_len = wal.metadata()?.len();
@@ -13794,12 +13793,6 @@ impl LsmStorageInner {
             physical_len >= sealed_end,
             "Active v7 WAL is shorter than its persisted terminal frontier"
         );
-        if physical_len != sealed_end {
-            wal.set_len(sealed_end)
-                .context("truncate unused Active v7 WAL tail before sealing")?;
-            wal.sync_all()
-                .context("sync exact frozen v7 WAL image before sealing")?;
-        }
 
         let (seal, bytes) = crate::pitr::seal::build_v7_seal_from_reader(
             &mut wal,
@@ -13835,8 +13828,10 @@ impl LsmStorageInner {
 
     /// Install a prepared v7 sidecar only after the matching `SealStarted`
     /// obligation is present in the manifest projection and manifest durability
-    /// is certain. The caller retains the prepared object on failure so its
-    /// spool reservation remains live if installation had an ambiguous result.
+    /// is certain. This freezes and syncs the source WAL before sidecar install.
+    /// After the durable obligation exists, failures must leave commit admission
+    /// closed for recovery. The caller retains the prepared object on failure so
+    /// its spool reservation remains live if installation had an ambiguous result.
     #[cfg(target_os = "linux")]
     #[allow(dead_code)] // Wired into recovery-point rotation in the next lifecycle slice.
     pub(crate) fn install_v7_pitr_seal_for_sealing_obligation(
@@ -13875,6 +13870,28 @@ impl LsmStorageInner {
             .as_ref()
             .ok_or_else(|| anyhow!("manifest is not initialized"))?
             .ensure_durability_certain()?;
+
+        let sealed_end = prepared.seal.boundary.sealed_end;
+        let wal = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&prepared.wal_path)
+            .with_context(|| {
+                format!(
+                    "open Active v7 WAL {} to finish its durable seal",
+                    prepared.wal_path.display()
+                )
+            })?;
+        let physical_len = wal.metadata()?.len();
+        ensure!(
+            physical_len >= sealed_end,
+            "Active v7 WAL is shorter than its durable Sealing boundary"
+        );
+        if physical_len != sealed_end {
+            wal.set_len(sealed_end)
+                .context("truncate Active v7 WAL after durable SealStarted")?;
+            wal.sync_all()
+                .context("sync exact frozen v7 WAL image after durable SealStarted")?;
+        }
         crate::pitr::segment::install_pitr_file_no_replace(&prepared.seal_path, &prepared.bytes)?;
         prepared.installed = true;
         Ok(())
@@ -16176,11 +16193,16 @@ mod tests {
         let mut prepared = engine
             .inner
             .prepare_v7_pitr_seal_for_active_wal(&state_lock, &active_memtable_guard)?;
-        let sealed_end = std::fs::metadata(&wal_path)?.len();
+        let padded_len_after_prepare = std::fs::metadata(&wal_path)?.len();
         let seal_boundary = prepared.boundary();
+        let sealed_end = seal_boundary.sealed_end;
         let seal_path = wal_path.with_extension("seal");
         assert_eq!(seal_boundary.active, active);
-        assert_eq!(seal_boundary.sealed_end, sealed_end);
+        assert_eq!(padded_len_after_prepare, padded_len);
+        assert!(
+            padded_len_after_prepare > sealed_end,
+            "preparation must leave the source WAL extent unchanged until SealStarted is durable"
+        );
         assert!(
             !seal_path.exists(),
             "preparation must not publish a sidecar"
@@ -16216,6 +16238,11 @@ mod tests {
                 .to_string()
                 .contains("no manifest sealing obligation")
         );
+        assert_eq!(
+            std::fs::metadata(&wal_path)?.len(),
+            padded_len,
+            "an unauthorized install attempt must not trim the source WAL"
+        );
         assert!(!seal_path.exists());
 
         // Model an orphan left by an older/incorrect writer. Active source
@@ -16250,6 +16277,11 @@ mod tests {
         engine
             .inner
             .install_v7_pitr_seal_for_sealing_obligation(&mut prepared)?;
+        assert_eq!(
+            std::fs::metadata(&wal_path)?.len(),
+            sealed_end,
+            "installation trims the source WAL only after the durable Sealing obligation"
+        );
         let (seal, emitted_wal_path, installed_seal_path, mut seal_reservation) =
             prepared.into_installed()?;
         drop(active_memtable_guard);

@@ -60,11 +60,12 @@ exact frozen WAL through the seekable verifier, and returns the validated
 immutable catalog descriptor. A guarded v7 Active seal-emission primitive now
 requires stopped commit admission, retains the state and active-memtable guards
 in the established lock order, matches the persisted logical boundary to
-the writer cursor, truncates an unused tail, and prepares a strict v7 seal
-without publishing its sidecar. Installation requires a matching durable
-`SealStarted` obligation and certain manifest durability; its sidecar spool
-reservation rounds up to the destination filesystem allocation unit and remains
-held through reclamation. Seal preparation reserves
+the writer cursor, and prepares a strict v7 seal from the exact terminal-
+frontier prefix without mutating the source WAL. Only after a matching durable
+`SealStarted` obligation and certain manifest durability does installation
+truncate and sync the source WAL to the immutable seal length before installing
+the sidecar. Its spool reservation rounds up to the destination filesystem
+allocation unit and remains held through reclamation. Seal preparation reserves
 bounded decode/canonicalization workspace, recovery scan metadata, sidecar
 memory, and sidecar source-spool bytes before building. The Active resource
 ledger's transient-memory cap is sized for the maximum preparation estimate
@@ -177,8 +178,9 @@ Engine startup now keeps recovered Active v7 admission closed until PITR resume
 validates repository identity and reconciles obligations. Successful resume
 enables synchronous and asynchronous public point writes through the v7 batch
 writer. Public close drains and syncs the retained Active WAL, leaving PITR
-enabled for recovery on reopen; v7 sealing and successor rotation remain
-unconnected.
+enabled for recovery on reopen; guarded v7 seal preparation and installation
+exist but are not yet connected to recovery-point sealing and successor
+rotation/publication.
 Recovered Active v7 owners and their shared ledger are retained by PITR segment
 bookkeeping through durable WAL/seal cleanup; retirement fences new admission
 and retains charges for in-flight admission or preparation guards until they
@@ -886,9 +888,9 @@ remain in later stage 5/6 work.
   capture obtains the physical terminal cursor from either writer mode and
   verifies it against the on-disk FRONTIER before persisting the logical
   boundary. The v5/v6 sidecar version 1 layout remains byte-compatible.
-  Production seal publication, catalog
-  descriptor readers, strict archive verification, and restore batch decoding
-  are connected. Restore validates the immutable WAL/seal pair and applies its
+  Production v5/v6 seal publication, catalog descriptor readers, strict archive
+  verification, and restore batch decoding are connected. Restore validates
+  the immutable WAL/seal pair and applies its
   DATA decode limits before allocating logical batch buffers. An empty v7 segment is
   8192 bytes with zero index entries; a nonempty index names each batch's first
   DATA frame, and its count equals the terminal ticket end. Decoding bounds the
