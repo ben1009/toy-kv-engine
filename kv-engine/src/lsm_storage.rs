@@ -2611,30 +2611,37 @@ impl KvEngine {
             pitr_last_archive_error: Mutex::new(None),
         });
         let _ = engine.inner.weak_engine.set(Arc::downgrade(&engine));
-        let active_memtable = engine.inner.state.load().memtable.clone();
-        let active_segment_id = LsmStorageInner::pitr_segment_of(&active_memtable);
-        let active_v7_sealing_source = active_memtable.uses_v7_wal()
-            && active_segment_id.is_some_and(|segment_id| {
-                engine
-                    .pitr_manifest_state
-                    .lock()
-                    .obligations
-                    .get(&segment_id)
-                    .is_some_and(|obligation| {
-                        obligation.state == crate::pitr::manifest::ObligationState::Sealing
-                            && obligation.wal_format == crate::pitr::manifest::PitrWalFormat::V7
-                    })
-            });
         if matches!(
             engine.pitr_manifest_state.lock().mode,
             crate::pitr::manifest::PitrMode::Enabled
                 | crate::pitr::manifest::PitrMode::PublicationUncertain
         ) && let Some(repository) = engine.inner.options.pitr_repository.clone()
-            && !active_v7_sealing_source
+            && !engine.has_active_v7_sealing_source()
         {
             engine.resume_pitr(repository)?;
         }
         Ok((engine, repaired_memtable_ids))
+    }
+
+    /// Whether the active v7 WAL is still owned by a durable Sealing
+    /// obligation. Reopen must leave this source fenced until its successor is
+    /// installed, on both synchronous and asynchronous open paths.
+    fn has_active_v7_sealing_source(&self) -> bool {
+        let active_memtable = self.inner.state.load().memtable.clone();
+        if !active_memtable.uses_v7_wal() {
+            return false;
+        }
+        let Some(segment_id) = LsmStorageInner::pitr_segment_of(&active_memtable) else {
+            return false;
+        };
+        self.pitr_manifest_state
+            .lock()
+            .obligations
+            .get(&segment_id)
+            .is_some_and(|obligation| {
+                obligation.state == crate::pitr::manifest::ObligationState::Sealing
+                    && obligation.wal_format == crate::pitr::manifest::PitrWalFormat::V7
+            })
     }
 
     /// Update PITR scheduling options without changing persisted safety state.
@@ -6164,6 +6171,7 @@ impl KvEngine {
             crate::pitr::manifest::PitrMode::Enabled
                 | crate::pitr::manifest::PitrMode::PublicationUncertain
         ) && let Some(repository) = engine.inner.options.pitr_repository.clone()
+            && !engine.has_active_v7_sealing_source()
         {
             engine.resume_pitr(repository)?;
         }
@@ -7722,7 +7730,21 @@ impl LsmStorageInner {
                 obligation.state,
                 ObligationState::Sealing | ObligationState::Sealed
             ) {
-                retained.reserve_obligation_logical(segment_id, obligation.logical_length)?;
+                let logical_wal_bytes = if obligation.wal_format
+                    == crate::pitr::manifest::PitrWalFormat::V7
+                {
+                    obligation
+                            .logical_length
+                            .checked_sub(active_fixed_bytes)
+                            .ok_or_else(|| {
+                                anyhow!(
+                                    "v7 PITR obligation {segment_id} is shorter than its header and generation-zero frontier"
+                                )
+                            })?
+                } else {
+                    obligation.logical_length
+                };
+                retained.reserve_obligation_logical(segment_id, logical_wal_bytes)?;
             }
         }
         for (segment_id, allocated_bytes) in source_allocations {
@@ -17074,7 +17096,14 @@ mod tests {
             let frozen_image = std::fs::read(&wal_path)?;
             drop(engine);
 
-            let reopened = KvEngine::open_with_wal_io_mode(&database, options.clone(), mode)?;
+            let reopened = if mode == WalIoMode::Leader {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()?
+                    .block_on(KvEngine::open_async(&database, options.clone()))?
+            } else {
+                KvEngine::open_with_wal_io_mode(&database, options.clone(), mode)?
+            };
             let recovered_state = reopened.pitr_manifest_state.lock().clone();
             let obligation = recovered_state
                 .obligations
@@ -17082,6 +17111,22 @@ mod tests {
                 .ok_or_else(|| anyhow::anyhow!("recovered v7 Sealing obligation is missing"))?;
             assert_eq!(obligation.state, ObligationState::Sealing);
             assert_eq!(obligation.wal_format, PitrWalFormat::V7);
+            let active_fixed_bytes = (crate::wal::v7::codec::WAL_V7_HEADER_LEN
+                + crate::wal::v7::codec::WAL_V7_FRAME_LEN)
+                as u64;
+            let retained_resources = reopened
+                .inner
+                .state
+                .load()
+                .memtable
+                .wal_v7_reservation_owner()
+                .and_then(|owner| owner.retained_resources())
+                .ok_or_else(|| anyhow::anyhow!("recovered v7 Sealing resources are missing"))?;
+            assert_eq!(
+                retained_resources.snapshot().logical_wal_bytes,
+                boundary.sealed_end - active_fixed_bytes,
+                "v7 obligation accounting excludes the header and generation-zero frontier"
+            );
             assert_eq!(
                 std::fs::read(&wal_path)?,
                 frozen_image,
