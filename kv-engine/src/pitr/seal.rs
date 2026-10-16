@@ -777,28 +777,59 @@ impl V7Seal {
         &self,
         wal: &[u8],
         limits: WalV5Limits,
+        visit_batch: impl FnMut(WalBatch) -> Result<()>,
+    ) -> Result<()> {
+        let mut reader = std::io::Cursor::new(wal);
+        self.verify_wal_reader_with_batch_visitor(
+            &mut reader,
+            u64::try_from(wal.len())?,
+            limits,
+            visit_batch,
+        )
+    }
+
+    /// Verify the immutable source image and stream its ticket-ordered batches
+    /// from a seekable WAL file. This keeps restart recovery from allocating a
+    /// second copy of a potentially large sealed segment.
+    pub(crate) fn visit_wal_batches_from_reader<R: Read + Seek>(
+        &self,
+        reader: &mut R,
+        wal_len: u64,
+        limits: WalV5Limits,
+        visit_batch: impl FnMut(WalBatch) -> Result<()>,
+    ) -> Result<()> {
+        self.verify_wal_reader_with_batch_visitor(reader, wal_len, limits, visit_batch)
+    }
+
+    fn verify_wal_reader_with_batch_visitor<R: Read + Seek>(
+        &self,
+        reader: &mut R,
+        wal_len: u64,
+        limits: WalV5Limits,
         mut visit_batch: impl FnMut(WalBatch) -> Result<()>,
     ) -> Result<()> {
         self.validate()?;
         ensure!(
-            u64::try_from(wal.len())? == self.boundary.sealed_end,
+            wal_len == self.boundary.sealed_end,
             "v7 PITR WAL length differs from its immutable seal"
         );
-        let header_bytes = wal
-            .get(..WAL_V7_HEADER_LEN)
-            .context("v7 PITR WAL is shorter than its header")?;
-        let header = WalV7Header::decode(header_bytes)?;
+        let mut header_bytes = [0; WAL_V7_HEADER_LEN];
+        reader
+            .seek(SeekFrom::Start(0))
+            .context("seek v7 PITR WAL to its immutable header")?;
+        reader
+            .read_exact(&mut header_bytes)
+            .context("read v7 PITR WAL immutable header")?;
+        let header = WalV7Header::decode(&header_bytes)?;
         ensure!(
-            header.encode()? == header_bytes && header == self.header,
+            header.encode()?.as_slice() == header_bytes && header == self.header,
             "v7 PITR seal identity differs from the WAL header"
         );
-        let mut reader = std::io::Cursor::new(wal);
         let header_digest = header.digest()?;
-        let discovery =
-            discover_frontier_candidates(&mut reader, u64::try_from(wal.len())?, &header_digest)?;
+        let discovery = discover_frontier_candidates(reader, wal_len, &header_digest)?;
         let selection = select_recovery_candidate_with_limits(
-            &mut reader,
-            u64::try_from(wal.len())?,
+            reader,
+            wal_len,
             &discovery,
             WalV7RecoveryAuthority::Sealed {
                 predecessor: header.predecessor,
@@ -811,7 +842,7 @@ impl V7Seal {
             "v7 PITR WAL terminal FRONTIER differs from its seal"
         );
         let mut entry_index = 0_usize;
-        walk_v7_seal_entries(wal, header, limits, |entry, batch| {
+        walk_v7_seal_entries_from_reader(reader, wal_len, header, limits, |entry, batch| {
             ensure!(
                 self.entries.get(entry_index) == Some(&entry),
                 "v7 PITR WAL batches or seal index differ from the sidecar"
