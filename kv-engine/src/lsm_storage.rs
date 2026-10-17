@@ -5365,6 +5365,10 @@ impl KvEngine {
     #[cfg(target_os = "linux")]
     pub fn disable_pitr(&self) -> Result<crate::pitr::api::DisablePitrOutcome> {
         let _barrier = self.pitr_barrier_lock.lock();
+        ensure!(
+            !self.inner.state.load().memtable.uses_v7_wal(),
+            "cannot disable PITR with an Active v7 WAL because post-PITR WAL rotation is not supported"
+        );
         let final_point = match self.create_recovery_point_locked(false)? {
             crate::pitr::api::RecoveryPointOutcome::Durable(point) => point,
             crate::pitr::api::RecoveryPointOutcome::CommitPublishedButNotDurable {
@@ -5515,7 +5519,7 @@ impl KvEngine {
         let _barrier = self.pitr_barrier_lock.lock();
         ensure!(
             !self.inner.state.load().memtable.uses_v7_wal(),
-            "cannot disable a v7 Active PITR WAL before v7 sealing and rotation are implemented"
+            "cannot disable PITR with an Active v7 WAL because post-PITR WAL rotation is not supported"
         );
         let state = self.pitr_manifest_state.lock().clone();
         ensure!(
@@ -20641,7 +20645,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn v7_gap_disable_preserves_active_manifest_and_wal() -> anyhow::Result<()> {
+    fn v7_disable_preserves_active_manifest_and_wal() -> anyhow::Result<()> {
         let directory = tempdir()?;
         let options = v7_recovery_test_database(directory.path())?;
         let database = directory.path().join("db");
@@ -20654,8 +20658,13 @@ mod tests {
         let manifest_before = std::fs::read(database.join("MANIFEST"))?;
         let pitr_before = engine.pitr_manifest_state.lock().clone();
 
+        let error = engine.disable_pitr().unwrap_err();
+        assert!(error.to_string().contains("post-PITR WAL rotation"));
+        assert_eq!(*engine.pitr_manifest_state.lock(), pitr_before);
+        assert_eq!(std::fs::read(database.join("MANIFEST"))?, manifest_before);
+        assert_eq!(std::fs::read(wal_path)?, wal_before);
         let error = engine.disable_pitr_allow_gap().unwrap_err();
-        assert!(error.to_string().contains("v7 Active"));
+        assert!(error.to_string().contains("post-PITR WAL rotation"));
         assert_eq!(*engine.pitr_manifest_state.lock(), pitr_before);
         assert_eq!(std::fs::read(database.join("MANIFEST"))?, manifest_before);
         assert_eq!(std::fs::read(wal_path)?, wal_before);

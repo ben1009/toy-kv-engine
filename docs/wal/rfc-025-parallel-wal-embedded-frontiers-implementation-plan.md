@@ -58,8 +58,10 @@ recovery-point requests reject unknown manifest publication before mutation,
 including when the Active v7 WAL is empty. Uncertain archive publication requires
 explicit PITR resume before another forced flush, regardless of successor writes.
 Empty successors also reject unresolved archive obligations until PITR resume
-settles the boundary. V7 checkpoint and backup capture, remaining public write
-shapes, OCC, and broader lifecycle rotation remain. PITR manifest replay and
+settles the boundary. Clean and gap disable reject Active v7 WALs before
+publishing new boundaries; ordinary post-PITR WAL rotation remains unsupported.
+V7 checkpoint and backup capture, remaining public write shapes, OCC, and
+broader lifecycle rotation remain. PITR manifest replay and
 snapshots now retain and validate a v7 format marker and the full immutable
 boundary in Sealing obligations;
 seal completion checks the WAL digest against that boundary. A v7 v2 seal
