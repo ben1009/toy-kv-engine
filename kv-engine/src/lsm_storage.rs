@@ -3943,8 +3943,9 @@ impl KvEngine {
                 return Err(error);
             }
             if let Some((mut reconciled, releases)) = reconciled_segments {
-                reconciled.apply_v7_obligation_reconciliation(releases)?;
+                let application = reconciled.apply_v7_obligation_reconciliation(releases);
                 *segments = Some(reconciled);
+                application?;
             }
         }
         Ok(state)
