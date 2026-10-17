@@ -5198,7 +5198,10 @@ impl KvEngine {
     }
 
     #[cfg(target_os = "linux")]
-    fn archive_active_pitr_segment_before_forced_freeze(&self) -> Result<()> {
+    fn archive_active_pitr_segment_before_forced_freeze(
+        &self,
+        expected_memtable: Option<&Arc<MemTable>>,
+    ) -> Result<()> {
         #[cfg(feature = "chaos-testing")]
         crate::chaos::failpoint::fail_point!("pitr.before_forced_freeze_boundary");
         let _operation_guard = self.pitr_operation_lock.lock();
@@ -5225,6 +5228,11 @@ impl KvEngine {
                 "v7 forced flush cannot proceed in PITR state {:?}; resume PITR first",
                 state.mode
             );
+            let active = self.inner.state.load();
+            if expected_memtable.is_some_and(|expected| !Arc::ptr_eq(&active.memtable, expected)) {
+                return Ok(());
+            }
+            drop(active);
             if source_is_empty {
                 ensure!(
                     state.obligations.values().all(|obligation| {
@@ -14106,7 +14114,7 @@ impl LsmStorageInner {
         let active = self.state.load();
         if Arc::ptr_eq(&active.memtable, expected_memtable) {
             drop(active);
-            self.prepare_forced_memtable_freeze()
+            self.prepare_forced_memtable_freeze(Some(expected_memtable))
                 .context("failed to establish a PITR boundary before WAL rotation")?;
             let _checkpoint_guard = self.checkpoint_lock.lock();
             let state_lock = self.state_lock.lock();
@@ -14895,7 +14903,10 @@ impl LsmStorageInner {
         self.force_freeze_memtable_with_active_guard(_state_lock_observer, &active_memtable_guard)
     }
 
-    pub(crate) fn prepare_forced_memtable_freeze(&self) -> Result<()> {
+    pub(crate) fn prepare_forced_memtable_freeze(
+        &self,
+        _expected_memtable: Option<&Arc<MemTable>>,
+    ) -> Result<()> {
         #[cfg(target_os = "linux")]
         {
             let active = self.state.load();
@@ -14908,7 +14919,7 @@ impl LsmStorageInner {
                     .get()
                     .and_then(std::sync::Weak::upgrade)
                     .ok_or_else(|| anyhow!("PITR engine owner is not installed"))?;
-                engine.archive_active_pitr_segment_before_forced_freeze()?;
+                engine.archive_active_pitr_segment_before_forced_freeze(_expected_memtable)?;
                 #[cfg(feature = "chaos-testing")]
                 if has_data {
                     crate::chaos::failpoint::fail_point!("pitr.after_forced_freeze_boundary");
@@ -14936,7 +14947,7 @@ impl LsmStorageInner {
         // Establish our boundary in the same order before changing the manifest,
         // then recheck the active WAL under the state and writer guards before
         // attempting a plain freeze.
-        self.prepare_forced_memtable_freeze()?;
+        self.prepare_forced_memtable_freeze(None)?;
         if self.state.load().immutable_file_metadata.is_empty() {
             self.ensure_manifest_v7()?;
         }
@@ -20119,6 +20130,48 @@ mod tests {
             reopened.close_storage()?;
         }
 
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn stale_expected_memtable_skips_v7_forced_freeze_boundary() -> anyhow::Result<()> {
+        let directory = tempdir()?;
+        let options = v7_recovery_test_database(directory.path())?;
+        let database = directory.path().join("db");
+        let engine = KvEngine::open(&database, options.clone())?;
+        let stale_memtable = engine.inner.state.load().memtable.clone();
+
+        assert!(matches!(
+            engine.create_recovery_point()?,
+            crate::pitr::api::RecoveryPointOutcome::Durable(_)
+        ));
+        let successor = engine.inner.state.load().memtable.clone();
+        assert!(!Arc::ptr_eq(&stale_memtable, &successor));
+        let successor_segment_id = LsmStorageInner::pitr_segment_of(&successor).unwrap();
+
+        engine.put(b"successor-write", b"durable")?;
+        let successor_frontier = successor.v7_frontier_cursor()?;
+        engine
+            .inner
+            .prepare_forced_memtable_freeze(Some(&stale_memtable))?;
+
+        assert!(Arc::ptr_eq(&engine.inner.state.load().memtable, &successor));
+        assert_eq!(
+            engine.pitr_manifest_state.lock().active_segment_id,
+            Some(successor_segment_id)
+        );
+        assert_eq!(successor.v7_frontier_cursor()?, successor_frontier);
+
+        engine.close_storage()?;
+        drop(engine);
+
+        let reopened = KvEngine::open(&database, options)?;
+        assert_eq!(
+            reopened.get(b"successor-write")?,
+            Some(Bytes::from_static(b"durable"))
+        );
+        reopened.close_storage()?;
         Ok(())
     }
 
