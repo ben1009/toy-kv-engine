@@ -525,19 +525,19 @@ impl PitrSegmentManager {
         let mut first_error = None;
         if let Some(resources) = &self.v7_retained_resources {
             for segment_id in logical_releases {
-                if let Some(owner) = self.v7_reservation_owners.get(&segment_id) {
-                    if let Err(error) = owner.release_logical_after_archive(segment_id) {
-                        first_error.get_or_insert_with(|| anyhow::Error::new(error));
-                    }
+                if let Some(owner) = self.v7_reservation_owners.get(&segment_id)
+                    && let Err(error) = owner.release_logical_after_archive(segment_id)
+                {
+                    first_error.get_or_insert_with(|| anyhow::Error::new(error));
                 }
                 resources.release_obligation_logical(segment_id);
             }
         } else {
             for segment_id in logical_releases {
-                if let Some(owner) = self.v7_reservation_owners.get(&segment_id) {
-                    if let Err(error) = owner.release_logical_after_archive(segment_id) {
-                        first_error.get_or_insert_with(|| anyhow::Error::new(error));
-                    }
+                if let Some(owner) = self.v7_reservation_owners.get(&segment_id)
+                    && let Err(error) = owner.release_logical_after_archive(segment_id)
+                {
+                    first_error.get_or_insert_with(|| anyhow::Error::new(error));
                 }
             }
         }
