@@ -303,6 +303,10 @@ impl LsmStorageInner {
         target_dir: impl AsRef<Path>,
         options: CheckpointOptions,
     ) -> Result<CheckpointStats> {
+        ensure!(
+            !self.state.load().memtable.uses_v7_wal(),
+            "checkpoint capture for an Active v7 PITR WAL is not supported"
+        );
         self.validate_checkpoint_options(target_dir.as_ref(), &options)?;
 
         let target_dir = absolute_path(target_dir.as_ref())?;
@@ -520,6 +524,10 @@ impl LsmStorageInner {
     /// for the potentially much longer copy/link phase.
     #[allow(dead_code)] // consumed by the forthcoming backup publisher
     pub(crate) fn capture_checkpoint_state(&self) -> Result<CheckpointCapture<'_>> {
+        ensure!(
+            !self.state.load().memtable.uses_v7_wal(),
+            "checkpoint capture for an Active v7 PITR WAL is not supported"
+        );
         self.prepare_forced_memtable_freeze()?;
         let _checkpoint_guard = self.checkpoint_lock.lock();
 

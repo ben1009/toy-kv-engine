@@ -82,10 +82,12 @@ pub(crate) struct PitrSegmentManager {
 
 /// Prepared releases from both the current pass and deferred manifest work.
 /// Apply them only after the corresponding manifest projection is durable.
+/// The previous projection is retained if application is only partially successful.
 #[derive(Debug, Default)]
 pub(crate) struct PitrObligationReconciliation {
     logical_releases: Vec<u64>,
     reclaimed_sources: Vec<u64>,
+    retry_obligations: BTreeMap<u64, crate::pitr::manifest::PitrObligation>,
 }
 
 impl PitrSegmentManager {
@@ -503,6 +505,7 @@ impl PitrSegmentManager {
         }
 
         self.recompute_reserved()?;
+        reconciliation.retry_obligations = previous_obligations;
 
         Ok(reconciliation)
     }
@@ -514,13 +517,39 @@ impl PitrSegmentManager {
         &mut self,
         reconciliation: PitrObligationReconciliation,
     ) -> Result<()> {
+        let PitrObligationReconciliation {
+            logical_releases,
+            reclaimed_sources,
+            retry_obligations,
+        } = reconciliation;
+        let mut first_error = None;
         if let Some(resources) = &self.v7_retained_resources {
-            for segment_id in reconciliation.logical_releases {
+            for segment_id in logical_releases {
+                if let Some(owner) = self.v7_reservation_owners.get(&segment_id)
+                    && let Err(error) = owner.release_logical_after_archive(segment_id)
+                {
+                    first_error.get_or_insert_with(|| anyhow::Error::new(error));
+                }
                 resources.release_obligation_logical(segment_id);
             }
+        } else {
+            for segment_id in logical_releases {
+                if let Some(owner) = self.v7_reservation_owners.get(&segment_id)
+                    && let Err(error) = owner.release_logical_after_archive(segment_id)
+                {
+                    first_error.get_or_insert_with(|| anyhow::Error::new(error));
+                }
+            }
         }
-        for segment_id in reconciliation.reclaimed_sources {
-            self.retire_v7_reservation_owner_after_cleanup(segment_id)?;
+        for segment_id in reclaimed_sources {
+            if let Err(error) = self.retire_v7_reservation_owner_after_cleanup(segment_id) {
+                first_error.get_or_insert(error);
+            }
+        }
+
+        if let Some(error) = first_error {
+            self.defer_obligation_reconciliation(retry_obligations);
+            return Err(error);
         }
 
         Ok(())
@@ -1087,6 +1116,127 @@ impl RotationReason {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn v7_obligation_reconciliation_continues_releases_and_retries_failures() {
+        use crate::{
+            pitr::manifest::{ActiveBoundary, ObligationState, PitrObligation, PitrWalFormat},
+            pitr::{ArchiveEpochId, ChainAnchor, SegmentId, TimelineId},
+            wal::v7::{
+                admission::{
+                    WalV7ReservationOwner, WalV7ResourceCharge, WalV7ResourceLedger,
+                    WalV7ResourceLimits, WalV7RetainedResources,
+                },
+                codec::{WAL_V7_HEADER_LEN, WalV7Header, encode_generation_zero_frontier},
+                install::recover_and_install_active,
+                recovery::WalV7RecoveryAuthority,
+            },
+        };
+
+        let directory = tempfile::tempdir().unwrap();
+        let archive_epoch_id = ArchiveEpochId([2; 16]);
+        let header = WalV7Header {
+            timeline_id: TimelineId([1; 16]),
+            archive_epoch_id,
+            segment_id: SegmentId(1),
+            predecessor: ChainAnchor::Genesis { archive_epoch_id },
+            incarnation: [3; 16],
+        };
+        let wal_path = directory.path().join("pitr-00000000000000000001.wal");
+        let mut image = header.encode().unwrap().to_vec();
+        image
+            .extend_from_slice(&encode_generation_zero_frontier(header.digest().unwrap()).unwrap());
+        std::fs::write(&wal_path, image).unwrap();
+        let active_boundary = ActiveBoundary {
+            timeline_id: header.timeline_id.0,
+            archive_epoch_id: header.archive_epoch_id.0,
+            segment_id: header.segment_id.0,
+            incarnation: header.incarnation,
+            ticket_end: 0,
+            durable_end: WAL_V7_HEADER_LEN as u64,
+            last_commit_ts: 0,
+            prefix_digest: header.digest().unwrap(),
+        };
+        let installed = recover_and_install_active(
+            &wal_path,
+            WalV7RecoveryAuthority::Active {
+                predecessor: header.predecessor,
+                durable_anchors: vec![active_boundary],
+            },
+        )
+        .unwrap()
+        .installed;
+
+        let ledger = WalV7ResourceLedger::new(WalV7ResourceLimits {
+            max_logical_wal_bytes: 64 * 1024,
+            max_source_spool_bytes: 64 * 1024,
+            max_recovery_workspace_bytes: 64 * 1024,
+            max_buffer_memory_bytes: 64 * 1024,
+            max_seal_index_bytes: 64 * 1024,
+        })
+        .unwrap();
+        let retained = WalV7RetainedResources::new(ledger);
+        retained.reserve_obligation_logical(1, 4096).unwrap();
+        retained.reserve_obligation_logical(2, 4096).unwrap();
+        retained
+            .reserve_segment(
+                2,
+                WalV7ResourceCharge {
+                    source_spool_bytes: 4096,
+                    ..WalV7ResourceCharge::default()
+                },
+            )
+            .unwrap();
+        let owner = Arc::new(
+            WalV7ReservationOwner::new_with_retained_resources(Arc::clone(&retained), &installed)
+                .unwrap(),
+        );
+        let batch = owner.reserve_batch(128).unwrap();
+
+        let archived = PitrObligation {
+            state: ObligationState::Archived,
+            successor_segment_id: 2,
+            logical_length: 4096,
+            wal_format: PitrWalFormat::V7,
+            immutable_boundary: None,
+        };
+        let reclaimable = PitrObligation {
+            state: ObligationState::Reclaimable,
+            successor_segment_id: 3,
+            logical_length: 4096,
+            wal_format: PitrWalFormat::V7,
+            immutable_boundary: None,
+        };
+        let previous = BTreeMap::from([(1, archived), (2, reclaimable)]);
+        let current = BTreeMap::from([(1, archived)]);
+        let mut manager =
+            PitrSegmentManager::from_recovered_state(3, 4, 4096, 64 * 1024, &previous).unwrap();
+        manager
+            .retain_v7_reservation_owner(1, Arc::clone(&owner))
+            .unwrap();
+
+        let releases = manager.reconcile_obligations(&previous, &current).unwrap();
+        let error = manager
+            .apply_v7_obligation_reconciliation(releases)
+            .unwrap_err();
+
+        assert!(error.to_string().contains("active batch operations"));
+        assert!(manager.has_pending_obligation_reconciliation());
+        assert!(manager.segment(2).is_none());
+        assert_eq!(
+            retained.snapshot(),
+            WalV7ResourceCharge::for_batch(128).unwrap(),
+            "later logical and reclaimed-source releases must run after the first error"
+        );
+
+        drop(batch);
+        let retry = manager.reconcile_obligations(&current, &current).unwrap();
+        manager.apply_v7_obligation_reconciliation(retry).unwrap();
+
+        assert!(!manager.has_pending_obligation_reconciliation());
+        assert_eq!(retained.snapshot(), WalV7ResourceCharge::default());
+    }
 
     #[test]
     fn rotation_keeps_old_segment_authoritative_until_install() {

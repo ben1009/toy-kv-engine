@@ -32,19 +32,61 @@ The `put_with_ttl_async` convenience API now uses the same native point-batch
 path where available and preserves whole-second TTL rounding; Leader and legacy
 formats continue through the existing blocking write path.
 The ordinary memtable size target does not freeze the
-Active v7 memtable; segment and spool admission limits still apply while v7
-rotation remains pending. Public close drains and syncs
+Active v7 memtable; segment and spool admission limits still apply while automatic
+v7 rotation remains pending. Public close drains and syncs
 the Active v7 WAL for recovery without emitting a final recovery point. It stops
 and drains MVCC commit admission, persists the latest synced logical boundary in
 the PITR manifest, and a concurrent resume cannot reopen admission after close
-begins. Unsupported v7 recovery-point requests now fail before changing
-admission. Public `sync()` and `sync_async()` now share a fixed-cutoff barrier
+begins. Public `sync()` and `sync_async()` now share a fixed-cutoff barrier
 that drains MVCC admission, preserves an existing pause, and persists the empty
-floor plus latest synced logical boundary in the PITR manifest. Freeze,
-checkpoint, and recovery-point barriers, remaining public write shapes, OCC,
-sealing, and lifecycle rotation remain. PITR manifest replay and
-snapshots now retain and validate a
-v7 format marker and the full immutable boundary in Sealing obligations;
+floor plus latest synced logical boundary in the PITR manifest. Explicit
+recovery-point creation now seals and rotates Active v7 WALs, durably records
+the successor boundary, archives the sealed source, and advances it to
+Reclaimable. Tests cover recovery-point rotation and reopen in both Leader and
+Parallel modes. Resume now completes a durable `Sealing` obligation from its
+Active source, including rebuilding a missing sidecar. `SegmentSealed` records
+the exact empty successor boundary before the successor WAL is installed; if a
+crash lands between those steps, startup validates the sealed source and
+recreates the authorized successor. Archived v7 sources release logical WAL
+quota at the durable `Archived` transition while retaining physical spool
+charges until cleanup. Queued async range preparations retain their scratch
+charges across rotation without blocking archived logical-quota release.
+Source reservation retirement waits for batch I/O; preparation guards own their
+scratch charges independently and do not retain reclaimed spool or index quota.
+Async range scratch reservation pins the sampled Active memtable until its token
+owns the charge, so concurrent rotation cannot retire that owner between lookup
+and reservation. The pin is released before waiting for native preparation.
+Archive completion reclaims sources already flushed during publication, including
+empty sources, and releases their retained spool and seal-index charges.
+Resume also completes cleanup of already-flushed v7 sources after making their
+Reclaimable transitions durable, releasing spool and seal-index quota before
+reporting success.
+Segment bookkeeping retains each installed successor's
+reservation owner across later rotations and flushes; archive and reconciliation
+transitions replay from the latest manifest projection under the shared mutation
+lock, so concurrent reclamation cannot be resurrected. V7 forced flush now
+establishes an archive boundary before flushing its source. Forced flush and
+recovery-point requests reject unknown manifest publication before mutation,
+including when the Active v7 WAL is empty. Uncertain archive publication requires
+explicit PITR resume before another forced flush, regardless of successor writes.
+Empty successors also reject unresolved archive obligations until PITR resume
+settles the boundary. Clean and gap disable reject Active v7 WALs before
+publishing new boundaries; ordinary post-PITR WAL rotation remains unsupported.
+Recovery-point and forced-flush boundaries recheck the lifecycle under the PITR
+barrier before mutation. Closed handles remain unable to modify a v7 database
+after its exclusive open lock is released, including once another engine reopens
+the directory. Synchronous flush and drain also retain lifecycle admission until
+their work completes, matching the asynchronous APIs.
+Explicit PITR close holds the operation and barrier locks through its final
+recovery point and transition to Closing, then releases them before shutdown
+drains admitted operations. Repeated PITR close calls reuse the cached final
+archived point and storage-close result without another boundary. An ordinary
+v7 storage close does not certify archive durability; a later `close_pitr`
+requires reopening before it can publish the final archived boundary.
+V7 checkpoint and backup capture, remaining public write shapes, OCC, and
+broader lifecycle rotation remain. PITR manifest replay and
+snapshots now retain and validate a v7 format marker and the full immutable
+boundary in Sealing obligations;
 seal completion checks the WAL digest against that boundary. A v7 v2 seal
 sidecar codec now persists the immutable boundary and each ticket's first DATA
 offset; building and verifying a seal runs strict Sealed recovery against the
@@ -69,8 +111,9 @@ allocation unit and remains held through reclamation. Seal preparation reserves
 bounded decode/canonicalization workspace, recovery scan metadata, sidecar
 memory, and sidecar source-spool bytes before building. The Active resource
 ledger's transient-memory cap is sized for the maximum preparation estimate
-under its persisted segment limit. Wiring this primitive into successor
-rotation/publication is not yet connected to the public recovery-point path.
+under its persisted segment limit. Public recovery-point creation now uses this
+primitive to persist `SealStarted`, install the v7 sidecar and successor, and
+publish the source through `SegmentSealed`, archive, and `Reclaimable`.
 Restart recovery now strictly verifies a durable v7 Sealing source against its
 immutable boundary and any existing canonical seal sidecar, copies the exact
 frozen bytes to a fresh inode, syncs and atomically installs that image, and
@@ -84,16 +127,28 @@ immutable memtables. Reconciliation now completes a v7 Sealing transition after
 its empty successor is installed: it verifies the successor identity and
 predecessor anchor, then stores the successor's initial Active boundary inside
 the same `SegmentSealed` manifest record. A recovered manifest prefix cannot
-expose the sealed state without that boundary. Recovery from the pre-
-`SegmentSealed` successor-install crash window and public recovery-point
-publication remain gated. Seal preparation
+expose the sealed state without that boundary. Rotation publishes the record
+before successor creation; resume finishes `Sealing`, and Active startup
+recreates a missing successor only when it has no durable memtable registration
+and after strict source and sidecar validation. A missing registered Active WAL
+causes open to fail instead of synthesizing an empty image.
+Seal preparation
 now additionally reserves the successor's persistent image and atomic-install
 staging extents before `SealStarted`; the installed sidecar transition retains
-those charges until successor installation or cleanup. The guarded
+those charges until successor installation or cleanup. An ambiguous sidecar
+install retains its spool reservation, and retries reuse the per-segment charge
+marker. A pre-existing sidecar without a marker is charged into retained segment
+resources before further preparation; reopen reconstructs that marker from an
+allocated v7 seal sidecar. The guarded
 successor-install primitive creates a fresh v7 header plus generation-zero
 FRONTIER, consumes the pre-reserved extents, registers the successor in the
-engine manifest, and swaps it in only after commit admission is stopped. Before
-successor publication it reserves its own bounded verification workspace,
+engine manifest, and swaps it in only after commit admission is stopped. The
+sealed source's Parallel runtime shuts down before successor creation or
+registration, so a shutdown failure cannot create duplicate Active registrations
+on retry. Before
+registration, a successor already authorized by `SegmentSealed` must match its
+persisted Active boundary, including the incarnation of any existing image.
+Before successor publication it reserves its own bounded verification workspace,
 rebuilds the seal from the exact frozen WAL image, and compares the installed
 sidecar in fixed-size chunks for byte-for-byte agreement.
 Frozen v7 WALs remain archive sources after
@@ -112,8 +167,9 @@ and seal pair against its immutable descriptor, then decodes ticket-ordered
 batches before replay; v5/v6 continue to use their legacy decoder.
 The live
 v7 Parallel runtime now admits reserved DATA batches and writes embedded
-FRONTIERs before the single WAL sync; fixed-cutoff API barriers,
-Leader-parity work, and full Active lifecycle integration remain.
+FRONTIERs before the single WAL sync. Public recovery-point creation now
+performs v7 seal/rotation/archive in both Leader and Parallel modes; fixed-cutoff
+barriers for the remaining APIs and broader Active lifecycle integration remain.
 Version 8 engine manifests and standalone PITR envelopes require explicit
 obligation format markers. Version 9 engine manifests require the empty Active
 boundary for every sealed v7 successor. Production recovery selects legacy
@@ -208,13 +264,16 @@ Engine startup now keeps recovered Active v7 admission closed until PITR resume
 validates repository identity and reconciles obligations. Successful resume
 enables synchronous and asynchronous public point writes through the v7 batch
 writer. Public close drains and syncs the retained Active WAL, leaving PITR
-enabled for recovery on reopen; guarded v7 seal preparation and installation
-exist but are not yet connected to recovery-point sealing and successor
-rotation/publication.
-Recovered Active v7 owners and their shared ledger are retained by PITR segment
-bookkeeping through durable WAL/seal cleanup; retirement fences new admission
-and retains charges for in-flight admission or preparation guards until they
-finish.
+enabled for recovery on reopen. Guarded v7 seal preparation and installation
+are connected to explicit recovery-point sealing and successor
+rotation/publication. Recovery covers crashes after `SealStarted` and after
+`SegmentSealed` but before successor installation. Logical quota release is
+coupled to durable archive publication; source-spool reservations remain until
+durable local cleanup.
+Recovered and rotated Active v7 owners and their shared ledger are retained by
+PITR segment bookkeeping through durable WAL/seal cleanup; retirement fences new
+admission and retains charges for in-flight admission or preparation guards
+until they finish.
 The serial Leader
 classifies DATA-plus-FRONTIER segment exhaustion before the persistent batch
 reservation or coordinate assignment. It may first reserve temporary canonicalization
@@ -349,7 +408,7 @@ v6 to v7 transition remain unconnected. Active v7 reservation owners and their
 shared ledger are retained through durable source cleanup and then retired from
 segment bookkeeping.
 
-**Last updated:** 2026-10-16
+**Last updated:** 2026-10-17
 
 **Source baseline:** `30a64fa855126596316ab6b9237e6348b0e41fd2`, which merged RFC 025 in PR #379.
 
@@ -408,7 +467,7 @@ durable anchors or the strict immutable-object rules.
 | [`wal/parallel/worker.rs`](../../kv-engine/src/wal/parallel/worker.rs): `WriteBuffer`, write groups, CQE handling | Submit noncontiguous DATA ranges without overwriting intervening FRONTIER frames; track full marker completion and ownership. |
 | [`wal.rs`](../../kv-engine/src/wal.rs): `PitrSealAccumulator` | Replace the single append/hash assumption with ordered logical and physical hash streams plus bounded cutoff/index snapshots. |
 | [`pitr/backpressure.rs`](../../kv-engine/src/pitr/backpressure.rs), [`pitr/segment.rs`](../../kv-engine/src/pitr/segment.rs), [`wal.rs`](../../kv-engine/src/wal.rs) | The spool accountant currently provides helper/model contracts; live batch limits are checked in `Wal::put_v5_batch` and segment accounting grows at lifecycle boundaries. Install and reconstruct a shared live ledger for admission, preallocation, recovery, pins, and cleanup. |
-| [`manifest.rs`](../../kv-engine/src/manifest.rs), [`pitr/manifest.rs`](../../kv-engine/src/pitr/manifest.rs) | Active logical anchors and v7 immutable Sealing boundaries are versioned, serialized, and validated in manifest replay/snapshots; interrupted-transition recovery remains. |
+| [`manifest.rs`](../../kv-engine/src/manifest.rs), [`pitr/manifest.rs`](../../kv-engine/src/pitr/manifest.rs) | Active logical anchors and v7 immutable Sealing boundaries are versioned, serialized, and validated in manifest replay/snapshots; recovery now resumes interrupted Sealing and successor installation. |
 | [`mem_table.rs`](../../kv-engine/src/mem_table.rs), [`lsm_storage.rs`](../../kv-engine/src/lsm_storage.rs), [`lsm_storage/write_gate.rs`](../../kv-engine/src/lsm_storage/write_gate.rs) | Carry the descriptor and owned reservations through writes, freeze, successors, reopen, and async ownership. |
 | [`mvcc.rs`](../../kv-engine/src/mvcc.rs), [`mvcc/txn.rs`](../../kv-engine/src/mvcc/txn.rs) | Replace v5-only PITR write routing with descriptor-aware preparation; hand sampled v7 recorded time to the ordered packer and preserve legacy clamping, OCC, and timestamp retirement. |
 | [`pitr/seal.rs`](../../kv-engine/src/pitr/seal.rs), [`pitr/archive.rs`](../../kv-engine/src/pitr/archive.rs), [`pitr/catalog.rs`](../../kv-engine/src/pitr/catalog.rs), [`pitr/restore.rs`](../../kv-engine/src/pitr/restore.rs) | Add strict v7 physical-image verification, DATA offsets in seal indexes, explicit format metadata, and mixed-chain restore. |
@@ -857,8 +916,11 @@ worker. The barrier resumes commit admission only if the sequencer was open
 beforehand and the WAL sync succeeds; a failed sync leaves admission closed for
 recovery. Public close applies the same fixed-cutoff rule while keeping
 admission closed: it syncs the Active WAL and persists its resulting logical
-boundary before tearing down storage. Freeze, checkpoint, and recovery-point
-barriers remain part of the later lifecycle work.
+boundary before tearing down storage. Explicit recovery-point creation and v7
+forced flush use the sealing and successor-rotation path. Ordinary checkpoint
+and backup capture reject Active v7 WALs until they can preserve the sealed
+source chain. PITR base-backup capture follows a separate path and remains
+unqualified for v7.
 
 Regression tests exercise both public sync APIs with a commit reserved before
 its WAL ticket exists and preserve an existing admission pause. A separate test
