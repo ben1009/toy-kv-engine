@@ -4202,7 +4202,7 @@ impl KvEngine {
         ))
     }
 
-    /// Seal, archive, and publish the current active v5 WAL boundary.
+    /// Seal, archive, and publish the current active PITR WAL boundary.
     #[cfg(target_os = "linux")]
     pub fn create_recovery_point(&self) -> Result<crate::pitr::api::RecoveryPointOutcome> {
         // Serialize with the other lifecycle transitions. Archival removes the
@@ -4716,6 +4716,11 @@ impl KvEngine {
             );
             *segments = reclaimable_segments;
         }
+        // A background flush can finish while the source is still Sealed,
+        // leaving its files for archival. Reclaim those already-flushed sources
+        // once Reclaimable is durable, without waiting for resume or reopen.
+        let reclaim_state = self.pitr_manifest_state.lock().clone();
+        self.reconcile_durable_archive_obligations(reclaim_state)?;
         if resume_admission_on_success && !self.inner.state.load().memtable.uses_v7_wal() {
             let config = state.config.as_ref().unwrap();
             self.inner
@@ -20060,6 +20065,89 @@ mod tests {
                 Some(Bytes::from_static(b"writable"))
             );
             reopened.close_storage()?;
+        }
+
+        Ok(())
+    }
+
+    #[cfg(all(target_os = "linux", feature = "chaos-testing"))]
+    #[test]
+    fn failpoint_v7_archive_reclaims_source_flushed_during_publication() -> anyhow::Result<()> {
+        let _scenario = crate::chaos::failpoint::FailScenario::setup();
+        for mode in [
+            crate::wal::WalIoMode::Leader,
+            crate::wal::WalIoMode::Parallel,
+        ] {
+            for empty_source in [false, true] {
+                let directory = tempdir()?;
+                let options = v7_recovery_test_database(directory.path())?;
+                let database = directory.path().join("db");
+                let engine = KvEngine::open_with_wal_io_mode(&database, options.clone(), mode)?;
+                if empty_source {
+                    engine.drain_flush()?;
+                }
+                let source = engine.inner.state.load().memtable.clone();
+                assert_eq!(source.is_empty(), empty_source);
+                let source_id = LsmStorageInner::pitr_segment_of(&source).unwrap();
+                let source_wal = source.wal_path().unwrap().to_path_buf();
+                let owner = source.wal_v7_reservation_owner().unwrap();
+                drop(source);
+
+                let flushing = Arc::clone(&engine);
+                let retained_wal = source_wal.clone();
+                fail::cfg_callback("pitr.before_recovery_point_archive", move || {
+                    while !flushing.inner.state.load().imm_memtables.is_empty() {
+                        flushing.inner.force_flush_next_imm_memtable().unwrap();
+                    }
+                    assert_eq!(
+                        flushing.pitr_manifest_state.lock().obligations[&source_id].state,
+                        crate::pitr::manifest::ObligationState::Sealed
+                    );
+                    assert!(retained_wal.is_file());
+                    assert!(retained_wal.with_extension("seal").is_file());
+                })
+                .unwrap();
+                let boundary = engine.create_recovery_point();
+                fail::remove("pitr.before_recovery_point_archive");
+                assert!(matches!(
+                    boundary?,
+                    crate::pitr::api::RecoveryPointOutcome::Durable(_)
+                ));
+                assert!(
+                    !engine
+                        .pitr_manifest_state
+                        .lock()
+                        .obligations
+                        .contains_key(&source_id)
+                );
+                assert!(!source_wal.exists());
+                assert!(!source_wal.with_extension("seal").exists());
+                let active_wal = engine
+                    .inner
+                    .state
+                    .load()
+                    .memtable
+                    .wal_path()
+                    .unwrap()
+                    .to_path_buf();
+                assert_eq!(
+                    owner.snapshot().source_spool_bytes,
+                    LsmStorageInner::filesystem_file_allocated_bytes(&active_wal)?
+                );
+                assert_eq!(owner.snapshot().seal_index_bytes, 0);
+                drop(owner);
+                engine.put(b"after-archive-cleanup", b"durable")?;
+                engine.close_storage()?;
+                drop(engine);
+
+                let reopened = KvEngine::open_with_wal_io_mode(&database, options, mode)?;
+                assert_eq!(reopened.get(b"v7-key")?, Some(Bytes::from_static(b"v")));
+                assert_eq!(
+                    reopened.get(b"after-archive-cleanup")?,
+                    Some(Bytes::from_static(b"durable"))
+                );
+                reopened.close_storage()?;
+            }
         }
 
         Ok(())

@@ -32,8 +32,8 @@ The `put_with_ttl_async` convenience API now uses the same native point-batch
 path where available and preserves whole-second TTL rounding; Leader and legacy
 formats continue through the existing blocking write path.
 The ordinary memtable size target does not freeze the
-Active v7 memtable; segment and spool admission limits still apply while v7
-rotation remains pending. Public close drains and syncs
+Active v7 memtable; segment and spool admission limits still apply while automatic
+v7 rotation remains pending. Public close drains and syncs
 the Active v7 WAL for recovery without emitting a final recovery point. It stops
 and drains MVCC commit admission, persists the latest synced logical boundary in
 the PITR manifest, and a concurrent resume cannot reopen admission after close
@@ -52,6 +52,8 @@ quota at the durable `Archived` transition while retaining physical spool
 charges until cleanup. Queued async range preparations retain their scratch
 charges across rotation without blocking archived logical-quota release.
 Source reservation retirement still waits for both batch I/O and preparation guards.
+Archive completion reclaims sources already flushed during publication, including
+empty sources, and releases their retained spool and seal-index charges.
 Segment bookkeeping retains each installed successor's
 reservation owner across later rotations and flushes; archive and reconciliation
 transitions replay from the latest manifest projection under the shared mutation
