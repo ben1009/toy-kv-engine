@@ -4739,6 +4739,10 @@ impl KvEngine {
         resume_admission_on_success: bool,
         cancellation: Option<&std::sync::atomic::AtomicBool>,
     ) -> Result<crate::pitr::api::RecoveryPointOutcome> {
+        // V7 close holds this same PITR barrier until shutdown begins. Recheck
+        // after acquiring it so a queued request cannot mutate a closed image
+        // after close has released the database's exclusive open lock.
+        self.inner.lifecycle.ensure_open()?;
         ensure!(
             !self.pitr_publication_unknown.load(Ordering::Acquire),
             "PITR recovery point cannot proceed while a manifest transition has an unknown outcome; reopen the database first"
@@ -5195,6 +5199,7 @@ impl KvEngine {
             // boundary as recovery-point creation, so the frozen source is
             // already archived before the flush can reclaim its WAL and seal.
             let _barrier = self.pitr_barrier_lock.lock();
+            self.inner.lifecycle.ensure_open()?;
             ensure!(
                 !self.pitr_publication_unknown.load(Ordering::Acquire),
                 "v7 forced freeze cannot proceed while a PITR manifest transition has an unknown outcome; reopen the database first"
@@ -6390,6 +6395,7 @@ impl KvEngine {
     /// When PITR is enabled, an active v5 or v7 WAL is sealed and archived as
     /// a recovery-point boundary before its memtable is flushed.
     pub fn force_flush(&self) -> Result<()> {
+        let _guard = self.inner.lifecycle.admit_write()?;
         crate::profile_scope!("kv.force_flush", self.inner.force_flush())
     }
 
@@ -6403,9 +6409,10 @@ impl KvEngine {
     /// Inherits the same race conditions as [`Self::force_flush`] — only use in
     /// tests or when no concurrent writes are happening.
     pub fn drain_flush(&self) -> Result<()> {
-        self.force_flush()?;
+        let _guard = self.inner.lifecycle.admit_write()?;
+        self.inner.force_flush()?;
         while !self.inner.state.load().imm_memtables.is_empty() {
-            self.force_flush()?;
+            self.inner.force_flush()?;
         }
 
         Ok(())
@@ -7175,11 +7182,27 @@ impl KvEngine {
             if let Some(owner) = inner.weak_engine.get().and_then(std::sync::Weak::upgrade) {
                 let runtime = tokio::runtime::Handle::try_current()
                     .context("native async writes require an active Tokio runtime")?;
-                let memtable = inner.state.load().memtable.clone();
-                if memtable.uses_v7_wal() && memtable.uses_parallel_wal() {
-                    let preparation_reservation = memtable
-                        .reserve_v7_preparation_buffer(preparation_bytes)?
-                        .context("v7 range batch preparation reservation is empty")?;
+                let preparation_reservation = {
+                    // Pin the sampled image until its preparation token owns
+                    // the scratch charge. Rotation can then retire the source
+                    // while preparation queues for admission to its successor.
+                    let _active_memtable = inner.active_memtable_lock.read_async().await;
+                    let memtable = inner.state.load().memtable.clone();
+                    if memtable.uses_v7_wal() && memtable.uses_parallel_wal() {
+                        #[cfg(feature = "chaos-testing")]
+                        crate::chaos::failpoint::fail_point!(
+                            "pitr.v7_range_before_scratch_reservation"
+                        );
+                        Some(
+                            memtable
+                                .reserve_v7_preparation_buffer(preparation_bytes)?
+                                .context("v7 range batch preparation reservation is empty")?,
+                        )
+                    } else {
+                        None
+                    }
+                };
+                if let Some(preparation_reservation) = preparation_reservation {
                     let mut ranges = Vec::with_capacity(batch.len());
                     for record in batch {
                         if let WriteBatchRecord::DelRange(start, end) = record {
@@ -19991,6 +20014,144 @@ mod tests {
             );
             reopened.close_storage()?;
         }
+
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn v7_boundaries_reject_closed_handles_for_each_io_mode() -> anyhow::Result<()> {
+        for mode in [
+            crate::wal::WalIoMode::Leader,
+            crate::wal::WalIoMode::Parallel,
+        ] {
+            for empty_source in [false, true] {
+                let directory = tempdir()?;
+                let options = v7_recovery_test_database(directory.path())?;
+                let database = directory.path().join("db");
+                let engine = KvEngine::open_with_wal_io_mode(&database, options.clone(), mode)?;
+                if empty_source {
+                    engine.drain_flush()?;
+                }
+                engine.close_async().await?;
+                let closed_memtable = engine.inner.state.load().memtable.clone();
+                let closed_state = engine.pitr_manifest_state.lock().clone();
+
+                for reopened in [false, true] {
+                    // Close releases the exclusive v7 lock, so a stale handle must
+                    // also remain harmless once another engine owns this directory.
+                    let current = reopened
+                        .then(|| KvEngine::open_with_wal_io_mode(&database, options.clone(), mode))
+                        .transpose()?;
+                    let manifest_before = std::fs::read(database.join("MANIFEST"))?;
+                    let wal_before = std::fs::read(closed_memtable.wal_path().unwrap())?;
+                    let segments_before = pitr_segment_wals(&database);
+
+                    let error = engine.create_recovery_point().unwrap_err();
+                    assert!(error.to_string().contains("closed"), "{error:#}");
+                    let error = engine.create_recovery_point_async().await.unwrap_err();
+                    assert!(error.to_string().contains("closed"), "{error:#}");
+                    let error = engine.force_flush().unwrap_err();
+                    assert!(error.to_string().contains("closed"), "{error:#}");
+                    let error = engine.drain_flush().unwrap_err();
+                    assert!(error.to_string().contains("closed"), "{error:#}");
+
+                    assert_eq!(std::fs::read(database.join("MANIFEST"))?, manifest_before);
+                    assert_eq!(
+                        std::fs::read(closed_memtable.wal_path().unwrap())?,
+                        wal_before
+                    );
+                    assert_eq!(pitr_segment_wals(&database), segments_before);
+                    assert_eq!(*engine.pitr_manifest_state.lock(), closed_state);
+                    assert!(Arc::ptr_eq(
+                        &engine.inner.state.load().memtable,
+                        &closed_memtable
+                    ));
+                    assert!(
+                        !engine
+                            .inner
+                            .mvcc
+                            .as_ref()
+                            .unwrap()
+                            .commit_admission_is_open()
+                    );
+                    if let Some(current) = current {
+                        assert_eq!(current.get(b"v7-key")?, Some(Bytes::from_static(b"v")));
+                        current.close_async().await?;
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    #[cfg(all(target_os = "linux", feature = "chaos-testing"))]
+    #[tokio::test(flavor = "current_thread")]
+    async fn failpoint_v7_range_preparation_pins_sampled_memtable() -> anyhow::Result<()> {
+        use std::{
+            future::Future,
+            sync::{
+                atomic::{AtomicBool, Ordering},
+                mpsc,
+            },
+            time::Duration,
+        };
+
+        let _scenario = crate::chaos::failpoint::FailScenario::setup();
+        let directory = tempdir()?;
+        let options = v7_recovery_test_database(directory.path())?;
+        let engine = KvEngine::open_with_wal_io_mode(
+            directory.path().join("db"),
+            options,
+            crate::wal::WalIoMode::Parallel,
+        )?;
+        let sampled = Arc::clone(&engine.inner);
+        let observed = Arc::new(AtomicBool::new(false));
+        let observed_callback = Arc::clone(&observed);
+        fail::cfg_callback("pitr.v7_range_before_scratch_reservation", move || {
+            // Rotation must not retire the sampled owner between its lookup
+            // and scratch reservation. Once reserved, the token keeps its
+            // resources alive independently of this short lease.
+            assert!(sampled.active_memtable_lock.try_write().is_none());
+            observed_callback.store(true, Ordering::Release);
+        })
+        .unwrap();
+        let (held_tx, held_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let exclusive_inner = Arc::clone(&engine.inner);
+        let exclusive = std::thread::spawn(move || {
+            let _guard = exclusive_inner.active_memtable_lock.write();
+            held_tx.send(()).unwrap();
+            // Bound a regression that blocks the current-thread executor while
+            // trying to acquire a synchronous read guard behind this writer.
+            release_rx.recv_timeout(Duration::from_secs(5))
+        });
+        held_rx.recv_timeout(Duration::from_secs(5))?;
+        let mut writing = Box::pin(engine.delete_range_async(b"v7-key", b"v7-key\xff"));
+        let yielded = writing
+            .as_mut()
+            .poll(&mut std::task::Context::from_waker(std::task::Waker::noop()))
+            .is_pending();
+        let exclusive_still_held = engine
+            .inner
+            .active_memtable_lock
+            .exclusive_pending_for_test();
+        let released = release_tx.send(());
+        let exclusive_result = exclusive.join().unwrap();
+        let result = writing.await;
+        fail::remove("pitr.v7_range_before_scratch_reservation");
+        released?;
+        exclusive_result?;
+        result?;
+        assert!(
+            yielded && exclusive_still_held,
+            "range preparation blocked the executor"
+        );
+        assert!(observed.load(Ordering::Acquire));
+        assert_eq!(engine.get(b"v7-key")?, None);
+        assert!(engine.inner.active_memtable_lock.try_write().is_some());
+        engine.close_async().await?;
 
         Ok(())
     }

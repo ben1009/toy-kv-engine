@@ -52,6 +52,9 @@ quota at the durable `Archived` transition while retaining physical spool
 charges until cleanup. Queued async range preparations retain their scratch
 charges across rotation without blocking archived logical-quota release.
 Source reservation retirement still waits for both batch I/O and preparation guards.
+Async range scratch reservation pins the sampled Active memtable until its token
+owns the charge, so concurrent rotation cannot retire that owner between lookup
+and reservation. The pin is released before waiting for native preparation.
 Archive completion reclaims sources already flushed during publication, including
 empty sources, and releases their retained spool and seal-index charges.
 Segment bookkeeping retains each installed successor's
@@ -65,6 +68,11 @@ explicit PITR resume before another forced flush, regardless of successor writes
 Empty successors also reject unresolved archive obligations until PITR resume
 settles the boundary. Clean and gap disable reject Active v7 WALs before
 publishing new boundaries; ordinary post-PITR WAL rotation remains unsupported.
+Recovery-point and forced-flush boundaries recheck the lifecycle under the PITR
+barrier before mutation. Closed handles remain unable to modify a v7 database
+after its exclusive open lock is released, including once another engine reopens
+the directory. Synchronous flush and drain also retain lifecycle admission until
+their work completes, matching the asynchronous APIs.
 V7 checkpoint and backup capture, remaining public write shapes, OCC, and
 broader lifecycle rotation remain. PITR manifest replay and
 snapshots now retain and validate a v7 format marker and the full immutable
