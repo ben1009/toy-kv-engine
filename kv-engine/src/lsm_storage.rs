@@ -19982,6 +19982,81 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[tokio::test(flavor = "current_thread")]
+    async fn v7_rotation_allows_queued_range_preparation() -> anyhow::Result<()> {
+        use std::time::Duration;
+
+        for forced_flush in [false, true] {
+            let directory = tempdir()?;
+            let options = v7_recovery_test_database(directory.path())?;
+            let database = directory.path().join("db");
+            let engine = KvEngine::open_with_wal_io_mode(
+                &database,
+                options.clone(),
+                crate::wal::WalIoMode::Parallel,
+            )?;
+            let source = engine.inner.state.load().memtable.clone();
+            let owner = source.wal_v7_reservation_owner().unwrap();
+            let buffer_before = owner.snapshot().buffer_memory_bytes;
+            let sequencer = engine.inner.mvcc.as_ref().unwrap();
+            let preparation = sequencer.native_preparation_permit().await?;
+            let writer_engine = Arc::clone(&engine);
+            let writer = tokio::spawn(async move {
+                writer_engine
+                    .write_batch_async(&[WriteBatchRecord::DelRange(
+                        b"v7-key".as_slice(),
+                        b"v7-key\xff".as_slice(),
+                    )])
+                    .await
+            });
+            let queued = tokio::time::timeout(Duration::from_secs(5), async {
+                while owner.snapshot().buffer_memory_bytes == buffer_before {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await;
+            let boundary = if queued.is_err() {
+                Err(anyhow::anyhow!(
+                    "range preparation never reserved its buffer"
+                ))
+            } else if forced_flush {
+                engine.force_flush()
+            } else {
+                engine.create_recovery_point().and_then(|outcome| {
+                    anyhow::ensure!(
+                        matches!(outcome, crate::pitr::api::RecoveryPointOutcome::Durable(_)),
+                        "recovery point was not durable"
+                    );
+                    Ok(())
+                })
+            };
+            // Let the queued task settle before propagating any boundary
+            // failure, so an assertion cannot strand the native preparer.
+            drop(preparation);
+            let write_result = writer.await?;
+            boundary?;
+            write_result?;
+            assert!(!Arc::ptr_eq(&source, &engine.inner.state.load().memtable));
+            assert!(sequencer.commit_admission_is_open());
+            assert_eq!(owner.snapshot().buffer_memory_bytes, buffer_before);
+            assert_eq!(engine.get(b"v7-key")?, None);
+            engine.put(b"after-rotation", b"writable")?;
+            engine.close_async().await?;
+            drop(engine);
+
+            let reopened = KvEngine::open(&database, options)?;
+            assert_eq!(reopened.get(b"v7-key")?, None);
+            assert_eq!(
+                reopened.get(b"after-rotation")?,
+                Some(Bytes::from_static(b"writable"))
+            );
+            reopened.close_storage()?;
+        }
+
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "current_thread")]
     async fn v7_forced_flush_rotates_before_reclaim_for_each_io_mode() -> anyhow::Result<()> {
         for mode in [
             crate::wal::WalIoMode::Leader,

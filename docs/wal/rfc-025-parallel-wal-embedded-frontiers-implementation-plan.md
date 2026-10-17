@@ -49,7 +49,10 @@ the exact empty successor boundary before the successor WAL is installed; if a
 crash lands between those steps, startup validates the sealed source and
 recreates the authorized successor. Archived v7 sources release logical WAL
 quota at the durable `Archived` transition while retaining physical spool
-charges until cleanup. Segment bookkeeping retains each installed successor's
+charges until cleanup. Queued async range preparations retain their scratch
+charges across rotation without blocking archived logical-quota release.
+Source reservation retirement still waits for both batch I/O and preparation guards.
+Segment bookkeeping retains each installed successor's
 reservation owner across later rotations and flushes; archive and reconciliation
 transitions replay from the latest manifest projection under the shared mutation
 lock, so concurrent reclamation cannot be resurrected. V7 forced flush now
