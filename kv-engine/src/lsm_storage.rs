@@ -9187,6 +9187,16 @@ impl LsmStorageInner {
                 // legacy recovery path can adopt or truncate a replacement WAL.
                 let wal_path = path.join(format!("pitr-{:020}.wal", boundary.segment_id));
                 if !wal_path.try_exists()? {
+                    // Registration follows durable image installation. Once it
+                    // exists, a missing WAL may contain acknowledged writes;
+                    // it cannot be the pre-install crash gap repaired below.
+                    ensure!(
+                        !pitr_memtable_segments
+                            .values()
+                            .any(|segment_id| *segment_id == boundary.segment_id),
+                        "manifest-registered Active v7 WAL {} is missing",
+                        boundary.segment_id
+                    );
                     Self::recreate_missing_sealed_v7_successor(path, &pitr_state, boundary)?;
                 }
                 let mut file = File::open(&wal_path).with_context(|| {
@@ -18457,6 +18467,42 @@ mod tests {
         ));
         assert_eq!(engine.get(b"v7-key")?, Some(Bytes::from_static(b"v")));
         engine.close_storage()?;
+
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn v7_sealed_recovery_rejects_missing_registered_successor() -> anyhow::Result<()> {
+        let directory = tempdir()?;
+        let (options, source_wal) = v7_sealed_recovery_test_database(directory.path())?;
+        let database = directory.path().join("db");
+        let successor_path = database.join("pitr-00000000000000000001.wal");
+        std::fs::remove_file(&successor_path)?;
+        let manifest_before = std::fs::read(database.join("MANIFEST"))?;
+        let source_before = std::fs::read(&source_wal)?;
+        let seal_before = std::fs::read(source_wal.with_extension("seal"))?;
+
+        let opened = KvEngine::open(&database, options);
+        if let Ok(engine) = &opened {
+            engine.close_storage()?;
+        }
+        let error = match opened {
+            Ok(_) => anyhow::bail!("recreated a missing registered v7 successor"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("manifest-registered Active v7 WAL")
+        );
+        assert!(!successor_path.exists());
+        assert_eq!(std::fs::read(database.join("MANIFEST"))?, manifest_before);
+        assert_eq!(std::fs::read(&source_wal)?, source_before);
+        assert_eq!(
+            std::fs::read(source_wal.with_extension("seal"))?,
+            seal_before
+        );
 
         Ok(())
     }

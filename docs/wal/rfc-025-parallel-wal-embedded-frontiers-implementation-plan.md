@@ -106,7 +106,9 @@ predecessor anchor, then stores the successor's initial Active boundary inside
 the same `SegmentSealed` manifest record. A recovered manifest prefix cannot
 expose the sealed state without that boundary. Rotation publishes the record
 before successor creation; resume finishes `Sealing`, and Active startup
-recreates a missing successor only after strict source and sidecar validation.
+recreates a missing successor only when it has no durable memtable registration
+and after strict source and sidecar validation. A missing registered Active WAL
+causes open to fail instead of synthesizing an empty image.
 Seal preparation
 now additionally reserves the successor's persistent image and atomic-install
 staging extents before `SealStarted`; the installed sidecar transition retains
