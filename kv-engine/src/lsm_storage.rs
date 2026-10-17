@@ -2316,6 +2316,9 @@ pub struct KvEngine {
     pitr_scheduler_delay: Mutex<Duration>,
     #[cfg(target_os = "linux")]
     pitr_last_archive_error: Mutex<Option<crate::pitr::api::PitrArchiveErrorSummary>>,
+    /// Final archived boundary established by this handle's PITR close.
+    #[cfg(target_os = "linux")]
+    pitr_close_point: Mutex<Option<crate::pitr::api::RecoveryPoint>>,
 }
 
 impl Drop for KvEngine {
@@ -2332,12 +2335,12 @@ impl KvEngine {
     /// When the active WAL is v7, PITR remains enabled and its Active segment
     /// is retained for recovery. Reopening with the same repository resumes
     /// PITR. Close drains admission, syncs the active WAL, and persists its
-    /// latest logical Active boundary; v7 sealing and successor rotation are
-    /// not part of close yet.
+    /// latest logical Active boundary. Use `close_pitr` to archive the final
+    /// boundary before closing storage.
     pub fn close(&self) -> Result<()> {
-        // V7 cannot yet be sealed into a PITR recovery point. A storage close
-        // drains and syncs the active WAL, persists its logical Active boundary,
-        // and retains its enabled lifecycle and Active segment for recovery.
+        // A v7 storage close drains and syncs the active WAL, persists its
+        // logical Active boundary, and retains its enabled lifecycle and Active
+        // segment for recovery without establishing a final archive boundary.
         let pitr_mode = self.pitr_manifest_state.lock().mode;
         if pitr_mode == crate::pitr::manifest::PitrMode::Enabled
             && self.inner.state.load().memtable.uses_v7_wal()
@@ -2649,6 +2652,8 @@ impl KvEngine {
 
             #[cfg(target_os = "linux")]
             pitr_last_archive_error: Mutex::new(None),
+            #[cfg(target_os = "linux")]
+            pitr_close_point: Mutex::new(None),
         });
         let _ = engine.inner.weak_engine.set(Arc::downgrade(&engine));
         if matches!(
@@ -3404,6 +3409,15 @@ impl KvEngine {
         drop(archiver);
         state = self.resume_v7_successor_install(state)?;
         state = self.reconcile_durable_archive_obligations(state)?;
+        if state.obligations.values().any(|obligation| {
+            obligation.wal_format == crate::pitr::manifest::PitrWalFormat::V7
+                && obligation.state == crate::pitr::manifest::ObligationState::Reclaimable
+        }) {
+            // The first pass makes newly archived sources durably Reclaimable.
+            // Only then may cleanup unlink already-flushed sources and release
+            // their spool/index quota before reporting a successful resume.
+            state = self.reconcile_durable_archive_obligations(state)?;
+        }
         drop(barrier);
         if state.mode == crate::pitr::manifest::PitrMode::PublicationUncertain {
             return Ok(crate::pitr::api::PitrResumeOutcome::ReconciliationRequired(
@@ -5323,17 +5337,25 @@ impl KvEngine {
     }
 
     /// Close the engine only after the final PITR boundary is durable.
-    /// Repeated calls return the cached storage-close result without emitting
-    /// another recovery point; their `final_point` is `None`.
+    /// Repeated calls return the cached final PITR point after successful storage
+    /// shutdown. A storage-only close requires reopen before a PITR close.
     #[cfg(target_os = "linux")]
     pub fn close_pitr(&self) -> Result<crate::pitr::api::PitrCloseOutcome> {
         let operation_guard = self.pitr_operation_lock.lock();
         let barrier = self.pitr_barrier_lock.lock();
         if self.inner.lifecycle.ensure_open().is_err() {
+            let final_point = *self.pitr_close_point.lock();
             drop(barrier);
             drop(operation_guard);
             self.close_storage()?;
-            return Ok(crate::pitr::api::PitrCloseOutcome::ClosedDurably { final_point: None });
+            let point = final_point.ok_or_else(|| {
+                anyhow!(
+                    "storage closed without a final archived PITR boundary; reopen the database before PITR close"
+                )
+            })?;
+            return Ok(crate::pitr::api::PitrCloseOutcome::ClosedDurably {
+                final_point: Some(point),
+            });
         }
         let point = match self.create_recovery_point_locked(false)? {
             crate::pitr::api::RecoveryPointOutcome::Durable(point) => point,
@@ -5359,6 +5381,7 @@ impl KvEngine {
                 });
             }
         };
+        *self.pitr_close_point.lock() = Some(point);
         #[cfg(feature = "chaos-testing")]
         crate::chaos::failpoint::fail_point!("pitr.after_close_recovery_point");
         // Keep resume and other boundary operations excluded until Closing is
@@ -6978,6 +7001,8 @@ impl KvEngine {
             pitr_scheduler_delay: Mutex::new(Duration::ZERO),
             #[cfg(target_os = "linux")]
             pitr_last_archive_error: Mutex::new(None),
+            #[cfg(target_os = "linux")]
+            pitr_close_point: Mutex::new(None),
         });
         let _ = engine.inner.weak_engine.set(Arc::downgrade(&engine));
         if matches!(
@@ -20042,6 +20067,58 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[tokio::test(flavor = "current_thread")]
+    async fn v7_storage_close_does_not_satisfy_pitr_close() -> anyhow::Result<()> {
+        for mode in [
+            crate::wal::WalIoMode::Leader,
+            crate::wal::WalIoMode::Parallel,
+        ] {
+            for async_storage_close in [false, true] {
+                let directory = tempdir()?;
+                let options = v7_recovery_test_database(directory.path())?;
+                let database = directory.path().join("db");
+                let engine = KvEngine::open_with_wal_io_mode(&database, options.clone(), mode)?;
+                if async_storage_close {
+                    engine.close_async().await?;
+                } else {
+                    engine.close()?;
+                }
+                let manifest_before = std::fs::read(database.join("MANIFEST"))?;
+                let wal_path = engine
+                    .inner
+                    .state
+                    .load()
+                    .memtable
+                    .wal_path()
+                    .unwrap()
+                    .to_path_buf();
+                let wal_before = std::fs::read(&wal_path)?;
+                let error = engine.close_pitr().unwrap_err();
+                assert!(error.to_string().contains("reopen"), "{error:#}");
+                let error = engine.close_pitr_async().await.unwrap_err();
+                assert!(error.to_string().contains("reopen"), "{error:#}");
+                engine.close()?;
+                engine.close_async().await?;
+                assert_eq!(std::fs::read(database.join("MANIFEST"))?, manifest_before);
+                assert_eq!(std::fs::read(&wal_path)?, wal_before);
+
+                let reopened = KvEngine::open_with_wal_io_mode(&database, options, mode)?;
+                let point = match reopened.close_pitr()? {
+                    crate::pitr::api::PitrCloseOutcome::ClosedDurably {
+                        final_point: Some(point),
+                    } => point,
+                    outcome => {
+                        anyhow::bail!("reopened PITR close did not publish a boundary: {outcome:?}")
+                    }
+                };
+                assert_eq!(point.commit_ts, Some(7));
+            }
+        }
+
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "current_thread")]
     async fn pitr_repeated_close_preserves_the_cached_result() -> anyhow::Result<()> {
         for v7_mode in [
             None,
@@ -20057,27 +20134,44 @@ mod tests {
                 } else {
                     pitr_flush_test_engine(directory.path())
                 };
-                if explicit_pitr_close {
-                    assert!(matches!(
-                        engine.close_pitr()?,
-                        crate::pitr::api::PitrCloseOutcome::ClosedDurably { .. }
-                    ));
+                let initial_point = if explicit_pitr_close {
+                    match engine.close_pitr()? {
+                        crate::pitr::api::PitrCloseOutcome::ClosedDurably {
+                            final_point: Some(point),
+                        } => Some(point),
+                        outcome => anyhow::bail!("initial PITR close failed: {outcome:?}"),
+                    }
                 } else {
                     engine.close()?;
-                }
+                    None
+                };
                 let manifest_before = std::fs::read(database.join("MANIFEST"))?;
                 let state_before = engine.pitr_manifest_state.lock().clone();
                 let segments_before = pitr_segment_wals(&database);
                 engine.close()?;
                 engine.close_async().await?;
-                assert!(matches!(
-                    engine.close_pitr()?,
-                    crate::pitr::api::PitrCloseOutcome::ClosedDurably { final_point: None }
-                ));
-                assert!(matches!(
-                    engine.close_pitr_async().await?,
-                    crate::pitr::api::PitrCloseOutcome::ClosedDurably { final_point: None }
-                ));
+                if v7_mode.is_some() && !explicit_pitr_close {
+                    let error = engine.close_pitr().unwrap_err();
+                    assert!(error.to_string().contains("reopen"), "{error:#}");
+                    let error = engine.close_pitr_async().await.unwrap_err();
+                    assert!(error.to_string().contains("reopen"), "{error:#}");
+                } else {
+                    let point = match engine.close_pitr()? {
+                        crate::pitr::api::PitrCloseOutcome::ClosedDurably {
+                            final_point: Some(point),
+                        } => point,
+                        outcome => anyhow::bail!("repeated PITR close lost its point: {outcome:?}"),
+                    };
+                    if let Some(initial_point) = initial_point {
+                        assert_eq!(point, initial_point);
+                    }
+                    assert!(matches!(
+                        engine.close_pitr_async().await?,
+                        crate::pitr::api::PitrCloseOutcome::ClosedDurably {
+                            final_point: Some(async_point)
+                        } if async_point == point
+                    ));
+                }
                 assert_eq!(std::fs::read(database.join("MANIFEST"))?, manifest_before);
                 assert_eq!(*engine.pitr_manifest_state.lock(), state_before);
                 assert_eq!(pitr_segment_wals(&database), segments_before);
@@ -20952,54 +21046,88 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn v7_rotated_owner_keeps_sealed_quota_after_source_flush() -> anyhow::Result<()> {
-        let directory = tempdir()?;
-        let options = v7_recovery_test_database(directory.path())?;
-        let database = directory.path().join("db");
-        let repository = directory.path().join("repository");
-        let engine = KvEngine::open(&database, options)?;
-        assert!(matches!(
-            engine.create_recovery_point()?,
-            crate::pitr::api::RecoveryPointOutcome::Durable(_)
-        ));
+        for mode in [
+            crate::wal::WalIoMode::Leader,
+            crate::wal::WalIoMode::Parallel,
+        ] {
+            let directory = tempdir()?;
+            let options = v7_recovery_test_database(directory.path())?;
+            let database = directory.path().join("db");
+            let repository = directory.path().join("repository");
+            let engine = KvEngine::open_with_wal_io_mode(&database, options.clone(), mode)?;
+            assert!(matches!(
+                engine.create_recovery_point()?,
+                crate::pitr::api::RecoveryPointOutcome::Durable(_)
+            ));
 
-        let first_source = engine.inner.state.load().memtable.clone();
-        let first_source_segment = LsmStorageInner::pitr_segment_of(&first_source).unwrap();
-        let sealed_wal_path = first_source.wal_path().unwrap().to_path_buf();
-        drop(first_source);
-        engine.put(b"rotated-source", b"retained-until-archive")?;
-        engine
-            .inner
-            .mvcc
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("test engine has no MVCC sequencer"))?
-            .stop_commit_admission_and_capture()?;
+            let first_source = engine.inner.state.load().memtable.clone();
+            let first_source_segment = LsmStorageInner::pitr_segment_of(&first_source).unwrap();
+            let sealed_wal_path = first_source.wal_path().unwrap().to_path_buf();
+            drop(first_source);
+            engine.put(b"rotated-source", b"retained-until-archive")?;
+            engine
+                .inner
+                .mvcc
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("test engine has no MVCC sequencer"))?
+                .stop_commit_admission_and_capture()?;
 
-        let prepared =
-            engine.seal_rotate_v7_active_wal(first_source_segment, first_source_segment + 1)?;
-        drop(prepared);
+            let prepared =
+                engine.seal_rotate_v7_active_wal(first_source_segment, first_source_segment + 1)?;
+            drop(prepared);
 
-        let successor = engine.inner.state.load().memtable.clone();
-        let retained = successor
-            .wal_v7_reservation_owner()
-            .and_then(|owner| owner.retained_resources())
-            .ok_or_else(|| anyhow::anyhow!("successor has no retained v7 resource ledger"))?;
-        while !engine.inner.state.load().imm_memtables.is_empty() {
-            engine.inner.force_flush_next_imm_memtable()?;
+            let successor = engine.inner.state.load().memtable.clone();
+            let retained = successor
+                .wal_v7_reservation_owner()
+                .and_then(|owner| owner.retained_resources())
+                .ok_or_else(|| anyhow::anyhow!("successor has no retained v7 resource ledger"))?;
+            while !engine.inner.state.load().imm_memtables.is_empty() {
+                engine.inner.force_flush_next_imm_memtable()?;
+            }
+
+            assert!(sealed_wal_path.is_file());
+            assert!(sealed_wal_path.with_extension("seal").is_file());
+            assert!(
+                retained.ledger().snapshot().logical_wal_bytes > 0,
+                "flushing a still-sealed source released its logical WAL reservation"
+            );
+
+            assert!(matches!(
+                engine.resume_pitr(repository)?,
+                crate::pitr::api::PitrResumeOutcome::Resumed
+            ));
+            assert!(
+                !engine
+                    .pitr_manifest_state
+                    .lock()
+                    .obligations
+                    .contains_key(&first_source_segment)
+            );
+            assert!(!sealed_wal_path.exists());
+            assert!(!sealed_wal_path.with_extension("seal").exists());
+            let after_resume = retained.ledger().snapshot();
+            assert_eq!(after_resume.logical_wal_bytes, 0);
+            assert_eq!(after_resume.seal_index_bytes, 0);
+            assert_eq!(
+                after_resume.source_spool_bytes,
+                LsmStorageInner::filesystem_file_allocated_bytes(successor.wal_path().unwrap())?
+            );
+            engine.put(b"after-archive-resume", b"writable")?;
+            engine.close_storage()?;
+            drop(successor);
+            drop(engine);
+
+            let reopened = KvEngine::open_with_wal_io_mode(&database, options, mode)?;
+            assert_eq!(
+                reopened.get(b"rotated-source")?,
+                Some(Bytes::from_static(b"retained-until-archive"))
+            );
+            assert_eq!(
+                reopened.get(b"after-archive-resume")?,
+                Some(Bytes::from_static(b"writable"))
+            );
+            reopened.close_storage()?;
         }
-
-        assert!(sealed_wal_path.is_file());
-        assert!(sealed_wal_path.with_extension("seal").is_file());
-        assert!(
-            retained.ledger().snapshot().logical_wal_bytes > 0,
-            "flushing a still-sealed source released its logical WAL reservation"
-        );
-
-        assert!(matches!(
-            engine.resume_pitr(repository)?,
-            crate::pitr::api::PitrResumeOutcome::Resumed
-        ));
-        assert_eq!(retained.ledger().snapshot().logical_wal_bytes, 0);
-        engine.close_storage()?;
 
         Ok(())
     }

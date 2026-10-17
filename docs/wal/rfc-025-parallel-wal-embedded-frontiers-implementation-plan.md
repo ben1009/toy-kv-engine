@@ -58,6 +58,9 @@ owns the charge, so concurrent rotation cannot retire that owner between lookup
 and reservation. The pin is released before waiting for native preparation.
 Archive completion reclaims sources already flushed during publication, including
 empty sources, and releases their retained spool and seal-index charges.
+Resume also completes cleanup of already-flushed v7 sources after making their
+Reclaimable transitions durable, releasing spool and seal-index quota before
+reporting success.
 Segment bookkeeping retains each installed successor's
 reservation owner across later rotations and flushes; archive and reconciliation
 transitions replay from the latest manifest projection under the shared mutation
@@ -76,8 +79,10 @@ the directory. Synchronous flush and drain also retain lifecycle admission until
 their work completes, matching the asynchronous APIs.
 Explicit PITR close holds the operation and barrier locks through its final
 recovery point and transition to Closing, then releases them before shutdown
-drains admitted operations. Repeated close calls reuse the cached storage-close
-result without another boundary; repeated `close_pitr` returns no new final point.
+drains admitted operations. Repeated PITR close calls reuse the cached final
+archived point and storage-close result without another boundary. An ordinary
+v7 storage close does not certify archive durability; a later `close_pitr`
+requires reopening before it can publish the final archived boundary.
 V7 checkpoint and backup capture, remaining public write shapes, OCC, and
 broader lifecycle rotation remain. PITR manifest replay and
 snapshots now retain and validate a v7 format marker and the full immutable
