@@ -1550,6 +1550,15 @@ impl Wal {
         error.downcast_ref::<parallel_runtime::WalFull>().is_some()
     }
 
+    pub(crate) fn is_v7_capacity_retry_error(error: &anyhow::Error) -> bool {
+        error
+            .downcast_ref::<v7::leader::WalV7LeaderCapacityError>()
+            .is_some_and(|error| *error == v7::leader::WalV7LeaderCapacityError::RotationRequired)
+            || error
+                .downcast_ref::<v7::admission::WalV7ReservationError>()
+                .is_some_and(|error| *error == v7::admission::WalV7ReservationError::SealIndexLimit)
+    }
+
     pub(crate) fn set_write_profile(&self, profile: Arc<crate::mem_table::WriteProfile>) {
         if let Some(runtime) = &self.parallel_runtime {
             runtime.set_write_profile(profile);

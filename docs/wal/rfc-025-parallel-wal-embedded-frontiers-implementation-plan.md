@@ -32,8 +32,12 @@ The `put_with_ttl_async` convenience API now uses the same native point-batch
 path where available and preserves whole-second TTL rounding; Leader and legacy
 formats continue through the existing blocking write path.
 The ordinary memtable size target does not freeze the
-Active v7 memtable; segment and spool admission limits still apply while automatic
-v7 rotation remains pending. Public close drains and syncs
+Active v7 memtable. Synchronous public point writes now retry pre-ticket v7
+segment-capacity rejections by sealing, archiving, and rotating through the
+durable recovery-point path; Leader and Parallel modes share this bounded
+retry, with regression coverage at an exact segment boundary. Native async and
+transaction capacity retries, proactive target/interval rotation, and global
+spool backpressure remain pending. Public close drains and syncs
 the Active v7 WAL for recovery without emitting a final recovery point. It stops
 and drains MVCC commit admission, persists the latest synced logical boundary in
 the PITR manifest, and a concurrent resume cannot reopen admission after close
@@ -959,12 +963,18 @@ remain in later stage 5/6 work.
   Sealing intent. Persist the full immutable boundary, then install one durable
   successor. Finalize hashes/indexes from saved metadata; omit unused
   preallocation from `sealed_end`.
-- Connect stage 4's rotation-required outcome to the complete v7 lifecycle:
-  release unadmitted preparation and memtable ownership, rotate without holding
-  admission locks, then retry against the durable successor. Retire any reserved
-  timestamp and repeat required OCC validation. Exercise exact-boundary,
-  marker-overhead, and seal-index exhaustion through real engine APIs, including
-  concurrent/cancelled retries and distinct global-backpressure/oversize outcomes.
+- Synchronous public point writes now connect the pre-ticket segment-capacity
+  rejection to the durable v7 sealing/archive/successor path and retry against
+  the successor in Leader and Parallel modes. Exact-segment-boundary regression
+  coverage exercises `put`, point `write_batch`, and `delete`, including reopen.
+  Native async and transaction capacity retries remain deferred: their shared
+  v4 retry classifier does not opt into v7 rotation. Rotating on the async
+  blocking pool must first quiesce queued preparers without occupying the worker
+  those preparers need. Regression coverage verifies that native point/range
+  writes and async transactions return v7 capacity errors without rotating on a
+  runtime with one blocking worker. Seal-index exhaustion through real engine
+  APIs, concurrent/cancelled retries, OCC revalidation, and distinct global
+  backpressure and oversize outcomes remain outstanding.
 - Extend `PitrManifestRecord::SealStarted`, its obligation state, replay, and
   snapshot validation with the versioned immutable boundary. Persist Active
   references using only logical anchors. Allocation-only timestamp watermarks
