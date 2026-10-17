@@ -5323,9 +5323,18 @@ impl KvEngine {
     }
 
     /// Close the engine only after the final PITR boundary is durable.
+    /// Repeated calls return the cached storage-close result without emitting
+    /// another recovery point; their `final_point` is `None`.
     #[cfg(target_os = "linux")]
     pub fn close_pitr(&self) -> Result<crate::pitr::api::PitrCloseOutcome> {
+        let operation_guard = self.pitr_operation_lock.lock();
         let barrier = self.pitr_barrier_lock.lock();
+        if self.inner.lifecycle.ensure_open().is_err() {
+            drop(barrier);
+            drop(operation_guard);
+            self.close_storage()?;
+            return Ok(crate::pitr::api::PitrCloseOutcome::ClosedDurably { final_point: None });
+        }
         let point = match self.create_recovery_point_locked(false)? {
             crate::pitr::api::RecoveryPointOutcome::Durable(point) => point,
             crate::pitr::api::RecoveryPointOutcome::CommitPublishedButNotDurable {
@@ -5350,8 +5359,21 @@ impl KvEngine {
                 });
             }
         };
+        #[cfg(feature = "chaos-testing")]
+        crate::chaos::failpoint::fail_point!("pitr.after_close_recovery_point");
+        // Keep resume and other boundary operations excluded until Closing is
+        // visible. Release the lifecycle locks before joining workers or waiting
+        // for admitted operations that may themselves need those locks.
+        let close_state = self.inner.lifecycle.begin_close();
         drop(barrier);
-        self.close_storage()?;
+        drop(operation_guard);
+        Self::close_storage_parts_after_begin(
+            &self.inner,
+            &self.background_workers,
+            close_state,
+            None,
+            false,
+        )?;
 
         Ok(crate::pitr::api::PitrCloseOutcome::ClosedDurably {
             final_point: Some(point),
@@ -20013,6 +20035,128 @@ mod tests {
                 Some(Bytes::from_static(b"durable"))
             );
             reopened.close_storage()?;
+        }
+
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn pitr_repeated_close_preserves_the_cached_result() -> anyhow::Result<()> {
+        for v7_mode in [
+            None,
+            Some(crate::wal::WalIoMode::Leader),
+            Some(crate::wal::WalIoMode::Parallel),
+        ] {
+            for explicit_pitr_close in [false, true] {
+                let directory = tempdir()?;
+                let database = directory.path().join("db");
+                let engine = if let Some(mode) = v7_mode {
+                    let options = v7_recovery_test_database(directory.path())?;
+                    KvEngine::open_with_wal_io_mode(&database, options, mode)?
+                } else {
+                    pitr_flush_test_engine(directory.path())
+                };
+                if explicit_pitr_close {
+                    assert!(matches!(
+                        engine.close_pitr()?,
+                        crate::pitr::api::PitrCloseOutcome::ClosedDurably { .. }
+                    ));
+                } else {
+                    engine.close()?;
+                }
+                let manifest_before = std::fs::read(database.join("MANIFEST"))?;
+                let state_before = engine.pitr_manifest_state.lock().clone();
+                let segments_before = pitr_segment_wals(&database);
+                engine.close()?;
+                engine.close_async().await?;
+                assert!(matches!(
+                    engine.close_pitr()?,
+                    crate::pitr::api::PitrCloseOutcome::ClosedDurably { final_point: None }
+                ));
+                assert!(matches!(
+                    engine.close_pitr_async().await?,
+                    crate::pitr::api::PitrCloseOutcome::ClosedDurably { final_point: None }
+                ));
+                assert_eq!(std::fs::read(database.join("MANIFEST"))?, manifest_before);
+                assert_eq!(*engine.pitr_manifest_state.lock(), state_before);
+                assert_eq!(pitr_segment_wals(&database), segments_before);
+            }
+        }
+
+        Ok(())
+    }
+
+    #[cfg(all(target_os = "linux", feature = "chaos-testing"))]
+    #[test]
+    fn failpoint_v7_pitr_close_serializes_resume_through_shutdown() -> anyhow::Result<()> {
+        use std::{sync::mpsc, time::Duration};
+
+        let _scenario = crate::chaos::failpoint::FailScenario::setup();
+        for mode in [
+            crate::wal::WalIoMode::Leader,
+            crate::wal::WalIoMode::Parallel,
+        ] {
+            let directory = tempdir()?;
+            let options = v7_recovery_test_database(directory.path())?;
+            let database = directory.path().join("db");
+            let repository = directory.path().join("repository");
+            let engine = KvEngine::open_with_wal_io_mode(&database, options.clone(), mode)?;
+            let (entered_tx, entered_rx) = mpsc::channel();
+            let (release_tx, release_rx) = mpsc::channel();
+            let release_rx = parking_lot::Mutex::new(release_rx);
+            let closing_engine = Arc::clone(&engine);
+            fail::cfg_callback("pitr.after_close_recovery_point", move || {
+                // Neither resume nor another boundary may enter between the
+                // final recovery point and the transition to Closing.
+                assert!(closing_engine.pitr_operation_lock.try_lock().is_none());
+                assert!(closing_engine.pitr_barrier_lock.try_lock().is_none());
+                entered_tx.send(()).unwrap();
+                release_rx
+                    .lock()
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap();
+            })
+            .unwrap();
+            let closing_engine = Arc::clone(&engine);
+            let closing = std::thread::spawn(move || closing_engine.close_pitr());
+            entered_rx.recv_timeout(Duration::from_secs(5))?;
+            let resuming_engine = Arc::clone(&engine);
+            let (resume_started_tx, resume_started_rx) = mpsc::channel();
+            let resuming = std::thread::spawn(move || {
+                resume_started_tx.send(()).unwrap();
+                resuming_engine.resume_pitr(repository)
+            });
+            resume_started_rx.recv_timeout(Duration::from_secs(5))?;
+            release_tx.send(())?;
+            let close_result = closing.join().unwrap();
+            let resume_result = resuming.join().unwrap();
+            fail::remove("pitr.after_close_recovery_point");
+            assert!(matches!(
+                close_result?,
+                crate::pitr::api::PitrCloseOutcome::ClosedDurably {
+                    final_point: Some(_)
+                }
+            ));
+            let error = resume_result.unwrap_err();
+            assert!(
+                error.to_string().contains("closing") || error.to_string().contains("closed"),
+                "{error:#}"
+            );
+            assert!(
+                !engine
+                    .inner
+                    .mvcc
+                    .as_ref()
+                    .unwrap()
+                    .commit_admission_is_open()
+            );
+            assert!(engine.inner.lifecycle.is_closed());
+
+            let reopened = KvEngine::open_with_wal_io_mode(&database, options, mode)?;
+            assert_eq!(reopened.get(b"v7-key")?, Some(Bytes::from_static(b"v")));
+            reopened.put(b"after-pitr-close", b"durable")?;
+            reopened.close()?;
         }
 
         Ok(())

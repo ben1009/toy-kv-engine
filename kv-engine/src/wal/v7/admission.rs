@@ -275,7 +275,7 @@ pub(crate) struct WalV7BatchBufferPin {
 
 /// Temporary resources held while preparing v7 PITR data. A returned source
 /// spool charge can outlive its buffer charge until the sidecar is reclaimed.
-/// Retiring the source image waits for this guard to drop.
+/// This guard owns its charges independently of source-image retirement.
 #[must_use = "retain the reservation until its PITR seal sidecar is reclaimed"]
 pub(crate) struct WalV7OwnedPreparationReservation {
     owner: Arc<WalV7ReservationOwner>,
@@ -617,7 +617,10 @@ impl WalV7OwnedPreparationReservation {
 }
 
 fn release_retired_reservations(state: &mut WalV7ReservationOwnerState) {
-    if state.retired && state.active_batch_operations == 0 && state.active_preparations == 0 {
+    if state.retired && state.active_batch_operations == 0 {
+        // Batch I/O may still use the image's buffers and reservations.
+        // Preparers own separate tokens; keeping those tokens alive must not
+        // retain a durably reclaimed image's spool or seal-index quota.
         let reservations = std::mem::take(&mut state.reservations);
         // Release under the owner lock so another idempotent retirement cannot
         // return before the ledger charges have actually been dropped.
@@ -1297,7 +1300,12 @@ mod tests {
         assert_eq!(ledger.snapshot(), charge(8192, 12288, 0, 128, 16));
         drop(successor);
         owner.retire_after_durable_cleanup().unwrap();
-        assert_eq!(ledger.snapshot(), charge(0, 4096, 0, 128, 8));
+        assert_eq!(ledger.snapshot(), charge(0, 0, 0, 128, 0));
+        // Independent queued scratch must not consume a reclaimed image's
+        // index budget and reject a batch in its writable successor.
+        let successor = ledger.reserve(charge(8192, 8192, 0, 0, 32)).unwrap();
+        assert_eq!(ledger.snapshot(), charge(8192, 8192, 0, 128, 32));
+        drop(successor);
         drop(preparation);
         assert_eq!(ledger.snapshot(), WalV7ResourceCharge::default());
     }
