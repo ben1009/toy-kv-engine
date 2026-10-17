@@ -122,7 +122,10 @@ resources before further preparation; reopen reconstructs that marker from an
 allocated v7 seal sidecar. The guarded
 successor-install primitive creates a fresh v7 header plus generation-zero
 FRONTIER, consumes the pre-reserved extents, registers the successor in the
-engine manifest, and swaps it in only after commit admission is stopped. Before
+engine manifest, and swaps it in only after commit admission is stopped. The
+sealed source's Parallel runtime shuts down before successor creation or
+registration, so a shutdown failure cannot create duplicate Active registrations
+on retry. Before
 registration, a successor already authorized by `SegmentSealed` must match its
 persisted Active boundary, including the incarnation of any existing image.
 Before successor publication it reserves its own bounded verification workspace,

@@ -15222,6 +15222,16 @@ impl LsmStorageInner {
             "v7 successor predecessor differs from its installed seal"
         );
 
+        // Finish fallible source shutdown before publishing a successor
+        // registration. Otherwise a failed swap and resume would register
+        // the same Active segment under another memtable ID.
+        current_memtable.close_parallel_wal().with_context(|| {
+            format!(
+                "failed to close sealed v7 WAL for memtable {}",
+                current_memtable.id()
+            )
+        })?;
+
         let sst_id = self.next_sst_id();
         let memtable = mem_table::MemTable::create_with_wal_v7_active(
             sst_id,
@@ -20051,6 +20061,80 @@ mod tests {
             );
             reopened.close_storage()?;
         }
+
+        Ok(())
+    }
+
+    #[cfg(all(target_os = "linux", feature = "chaos-testing"))]
+    #[test]
+    fn failpoint_v7_source_close_failure_does_not_register_successor() -> anyhow::Result<()> {
+        let _scenario = crate::chaos::failpoint::FailScenario::setup();
+        let directory = tempdir()?;
+        let options = v7_recovery_test_database(directory.path())?;
+        let database = directory.path().join("db");
+        let repository = directory.path().join("repository");
+        let engine = KvEngine::open_with_wal_io_mode(
+            &database,
+            options.clone(),
+            crate::wal::WalIoMode::Parallel,
+        )?;
+        let source = engine.inner.state.load().memtable.clone();
+        let successor_segment_id = engine.pitr_manifest_state.lock().next_segment_id;
+
+        fail::cfg("parallel_wal.close_failure", "return").unwrap();
+        let boundary = engine.create_recovery_point();
+        let retry = engine.resume_pitr(&repository);
+        fail::remove("parallel_wal.close_failure");
+        assert!(
+            format!("{:#}", boundary.unwrap_err()).contains("injected parallel WAL close failure")
+        );
+        assert!(
+            format!("{:#}", retry.unwrap_err()).contains("injected parallel WAL close failure")
+        );
+        assert!(Arc::ptr_eq(&source, &engine.inner.state.load().memtable));
+        assert!(
+            !engine
+                .inner
+                .mvcc
+                .as_ref()
+                .unwrap()
+                .commit_admission_is_open()
+        );
+
+        let (_, records) = crate::manifest::Manifest::recover(database.join("MANIFEST"))?;
+        let successor_registrations = records
+            .iter()
+            .filter(|record| {
+                matches!(record,
+                    crate::manifest::ManifestRecord::NewPitrMemtable { segment_id, .. }
+                        if *segment_id == successor_segment_id
+                )
+            })
+            .count();
+        assert_eq!(successor_registrations, 0);
+
+        // Shutdown errors are cached by the runtime. Reopen must finish the
+        // authorized successor without encountering duplicate registrations.
+        assert!(engine.close_storage().is_err());
+        drop(source);
+        drop(engine);
+
+        let reopened = KvEngine::open(&database, options.clone())?;
+        assert!(matches!(
+            reopened.resume_pitr(&repository)?,
+            crate::pitr::api::PitrResumeOutcome::Resumed
+        ));
+        reopened.put(b"after-close-retry", b"durable")?;
+        reopened.close_storage()?;
+        drop(reopened);
+
+        let reopened = KvEngine::open(&database, options)?;
+        assert_eq!(reopened.get(b"v7-key")?, Some(Bytes::from_static(b"v")));
+        assert_eq!(
+            reopened.get(b"after-close-retry")?,
+            Some(Bytes::from_static(b"durable"))
+        );
+        reopened.close_storage()?;
 
         Ok(())
     }

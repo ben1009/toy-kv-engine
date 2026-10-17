@@ -1552,12 +1552,23 @@ impl ParallelWalRuntime {
             close_error = Some(format!("parallel WAL is poisoned: {error}"));
         }
 
+        #[cfg(feature = "chaos-testing")]
+        if Self::close_failure_is_injected() {
+            close_error.get_or_insert_with(|| "injected parallel WAL close failure".to_owned());
+        }
+
         threads.closed = true;
         threads.close_error.clone_from(&close_error);
         match close_error {
             Some(error) => Err(anyhow!(error)),
             None => Ok(()),
         }
+    }
+
+    #[cfg(feature = "chaos-testing")]
+    fn close_failure_is_injected() -> bool {
+        crate::chaos::failpoint::fail_point!("parallel_wal.close_failure", |_| true);
+        false
     }
 
     fn recycle(&self, buffer: ParallelBuffer) {
