@@ -5198,7 +5198,10 @@ impl KvEngine {
     }
 
     #[cfg(target_os = "linux")]
-    fn archive_active_pitr_segment_before_forced_freeze(&self) -> Result<()> {
+    fn archive_active_pitr_segment_before_forced_freeze(
+        &self,
+        expected_memtable: Option<&Arc<MemTable>>,
+    ) -> Result<()> {
         #[cfg(feature = "chaos-testing")]
         crate::chaos::failpoint::fail_point!("pitr.before_forced_freeze_boundary");
         let _operation_guard = self.pitr_operation_lock.lock();
@@ -5225,6 +5228,11 @@ impl KvEngine {
                 "v7 forced flush cannot proceed in PITR state {:?}; resume PITR first",
                 state.mode
             );
+            let active = self.inner.state.load();
+            if expected_memtable.is_some_and(|expected| !Arc::ptr_eq(&active.memtable, expected)) {
+                return Ok(());
+            }
+            drop(active);
             if source_is_empty {
                 ensure!(
                     state.obligations.values().all(|obligation| {
@@ -13794,7 +13802,7 @@ impl LsmStorageInner {
                 match self.write_point_batch_once(batch, delete_only) {
                     Ok(()) => break,
                     Err(error) => {
-                        self.retry_after_wal_full(error, &expected_memtable, &mut retries)?;
+                        self.retry_after_point_wal_full(error, &expected_memtable, &mut retries)?;
                     }
                 }
             }
@@ -14050,6 +14058,54 @@ impl LsmStorageInner {
         if !crate::wal::Wal::is_retryable_full_error(&error) {
             return Err(error);
         }
+
+        self.rotate_after_wal_full(error, expected_memtable, retries)
+    }
+
+    /// V7 rotation is currently enabled only for direct synchronous point
+    /// writes. Native async and transaction retries must first coordinate
+    /// queued preparers without occupying their blocking executor.
+    fn retry_after_point_wal_full(
+        &self,
+        error: anyhow::Error,
+        expected_memtable: &Arc<MemTable>,
+        retries: &mut usize,
+    ) -> Result<()> {
+        if crate::wal::Wal::is_v7_capacity_retry_error(&error) {
+            return self.rotate_after_wal_full(error, expected_memtable, retries);
+        }
+
+        self.retry_after_wal_full(error, expected_memtable, retries)
+    }
+
+    fn rotate_after_wal_full(
+        &self,
+        error: anyhow::Error,
+        expected_memtable: &Arc<MemTable>,
+        retries: &mut usize,
+    ) -> Result<()> {
+        let is_v7_seal_index_limit = error
+            .downcast_ref::<crate::wal::v7::admission::WalV7ReservationError>()
+            .is_some_and(|error| {
+                *error == crate::wal::v7::admission::WalV7ReservationError::SealIndexLimit
+            });
+        if is_v7_seal_index_limit {
+            // Parallel writes reserve seal-index capacity before they publish
+            // into the memtable. Drain active writers before treating an empty
+            // memtable as permanent: an in-flight reservation may still
+            // publish and make a rotation reclaim capacity.
+            let active_memtable_guard = self.active_memtable_lock.write();
+            let active = self.state.load();
+            let empty_active_segment = Arc::ptr_eq(&active.memtable, expected_memtable)
+                && active.memtable.uses_v7_wal()
+                && active.memtable.is_empty();
+            drop(active);
+            drop(active_memtable_guard);
+            if empty_active_segment {
+                return Err(error
+                    .context("v7 seal-index capacity is exhausted with an empty active segment"));
+            }
+        }
         if *retries >= Self::MAX_WAL_FULL_ROTATION_RETRIES {
             return Err(error.context("WAL remained full after bounded rotations"));
         }
@@ -14058,7 +14114,7 @@ impl LsmStorageInner {
         let active = self.state.load();
         if Arc::ptr_eq(&active.memtable, expected_memtable) {
             drop(active);
-            self.prepare_forced_memtable_freeze()
+            self.prepare_forced_memtable_freeze(Some(expected_memtable))
                 .context("failed to establish a PITR boundary before WAL rotation")?;
             let _checkpoint_guard = self.checkpoint_lock.lock();
             let state_lock = self.state_lock.lock();
@@ -14156,7 +14212,7 @@ impl LsmStorageInner {
             match self.put_once(key, value) {
                 Ok(()) => return Ok(()),
                 Err(error) => {
-                    self.retry_after_wal_full(error, &expected_memtable, &mut retries)?;
+                    self.retry_after_point_wal_full(error, &expected_memtable, &mut retries)?;
                 }
             }
         }
@@ -14258,7 +14314,7 @@ impl LsmStorageInner {
             match self.put_with_ttl_once(key, value, ttl) {
                 Ok(()) => return Ok(()),
                 Err(error) => {
-                    self.retry_after_wal_full(error, &expected_memtable, &mut retries)?;
+                    self.retry_after_point_wal_full(error, &expected_memtable, &mut retries)?;
                 }
             }
         }
@@ -14353,7 +14409,7 @@ impl LsmStorageInner {
             match self.delete_once(key) {
                 Ok(()) => return Ok(()),
                 Err(error) => {
-                    self.retry_after_wal_full(error, &expected_memtable, &mut retries)?;
+                    self.retry_after_point_wal_full(error, &expected_memtable, &mut retries)?;
                 }
             }
         }
@@ -14847,7 +14903,10 @@ impl LsmStorageInner {
         self.force_freeze_memtable_with_active_guard(_state_lock_observer, &active_memtable_guard)
     }
 
-    pub(crate) fn prepare_forced_memtable_freeze(&self) -> Result<()> {
+    pub(crate) fn prepare_forced_memtable_freeze(
+        &self,
+        _expected_memtable: Option<&Arc<MemTable>>,
+    ) -> Result<()> {
         #[cfg(target_os = "linux")]
         {
             let active = self.state.load();
@@ -14860,7 +14919,7 @@ impl LsmStorageInner {
                     .get()
                     .and_then(std::sync::Weak::upgrade)
                     .ok_or_else(|| anyhow!("PITR engine owner is not installed"))?;
-                engine.archive_active_pitr_segment_before_forced_freeze()?;
+                engine.archive_active_pitr_segment_before_forced_freeze(_expected_memtable)?;
                 #[cfg(feature = "chaos-testing")]
                 if has_data {
                     crate::chaos::failpoint::fail_point!("pitr.after_forced_freeze_boundary");
@@ -14888,7 +14947,7 @@ impl LsmStorageInner {
         // Establish our boundary in the same order before changing the manifest,
         // then recheck the active WAL under the state and writer guards before
         // attempting a plain freeze.
-        self.prepare_forced_memtable_freeze()?;
+        self.prepare_forced_memtable_freeze(None)?;
         if self.state.load().immutable_file_metadata.is_empty() {
             self.ensure_manifest_v7()?;
         }
@@ -17975,7 +18034,15 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     fn v7_recovery_test_database(directory: &std::path::Path) -> anyhow::Result<LsmStorageOptions> {
-        let engine = pitr_flush_test_engine(directory);
+        v7_recovery_test_database_with_segment_limit(directory, 1 << 20)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn v7_recovery_test_database_with_segment_limit(
+        directory: &std::path::Path,
+        max_segment_bytes: u64,
+    ) -> anyhow::Result<LsmStorageOptions> {
+        let engine = pitr_flush_test_engine_with_segment_limit(directory, max_segment_bytes);
         let state = engine.pitr_manifest_state.lock().clone();
         assert!(state.obligations.is_empty());
         engine.close_storage()?;
@@ -20062,6 +20129,311 @@ mod tests {
             );
             reopened.close_storage()?;
         }
+
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn stale_expected_memtable_skips_v7_forced_freeze_boundary() -> anyhow::Result<()> {
+        let directory = tempdir()?;
+        let options = v7_recovery_test_database(directory.path())?;
+        let database = directory.path().join("db");
+        let engine = KvEngine::open(&database, options.clone())?;
+        let stale_memtable = engine.inner.state.load().memtable.clone();
+
+        assert!(matches!(
+            engine.create_recovery_point()?,
+            crate::pitr::api::RecoveryPointOutcome::Durable(_)
+        ));
+        let successor = engine.inner.state.load().memtable.clone();
+        assert!(!Arc::ptr_eq(&stale_memtable, &successor));
+        let successor_segment_id = LsmStorageInner::pitr_segment_of(&successor).unwrap();
+
+        engine.put(b"successor-write", b"durable")?;
+        let successor_frontier = successor.v7_frontier_cursor()?;
+        engine
+            .inner
+            .prepare_forced_memtable_freeze(Some(&stale_memtable))?;
+
+        assert!(Arc::ptr_eq(&engine.inner.state.load().memtable, &successor));
+        assert_eq!(
+            engine.pitr_manifest_state.lock().active_segment_id,
+            Some(successor_segment_id)
+        );
+        assert_eq!(successor.v7_frontier_cursor()?, successor_frontier);
+
+        engine.close_storage()?;
+        drop(engine);
+
+        let reopened = KvEngine::open(&database, options)?;
+        assert_eq!(
+            reopened.get(b"successor-write")?,
+            Some(Bytes::from_static(b"durable"))
+        );
+        reopened.close_storage()?;
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn v7_sync_writes_retry_after_segment_capacity_rotation() -> anyhow::Result<()> {
+        for mode in [
+            crate::wal::WalIoMode::Leader,
+            crate::wal::WalIoMode::Parallel,
+        ] {
+            for operation in 0..3 {
+                let directory = tempdir()?;
+                let options =
+                    v7_recovery_test_database_with_segment_limit(directory.path(), 32 * 1024)?;
+                let database = directory.path().join("db");
+                let engine = KvEngine::open_with_wal_io_mode(&database, options.clone(), mode)?;
+                let initial_segment_id = engine
+                    .pitr_manifest_state
+                    .lock()
+                    .active_segment_id
+                    .expect("v7 Active segment is installed");
+
+                engine.put(b"fill-one", b"value")?;
+                engine.put(b"fill-two", b"value")?;
+                assert_eq!(
+                    engine.pitr_manifest_state.lock().active_segment_id,
+                    Some(initial_segment_id)
+                );
+                let frontier = engine.inner.state.load().memtable.v7_frontier_cursor()?;
+                let frame_len = crate::wal::v7::codec::WAL_V7_FRAME_LEN as u64;
+                let physical_end = frontier.frame_offset + frame_len;
+                assert!(physical_end <= 32 * 1024);
+                assert!(physical_end + 2 * frame_len > 32 * 1024);
+
+                match operation {
+                    0 => engine.put(b"retry-put", b"value")?,
+                    1 => engine.write_batch(&[WriteBatchRecord::Put(
+                        b"retry-batch".as_slice(),
+                        b"value".as_slice(),
+                    )])?,
+                    2 => engine.delete(b"v7-key")?,
+                    _ => unreachable!(),
+                }
+                assert_eq!(
+                    engine.pitr_manifest_state.lock().active_segment_id,
+                    Some(initial_segment_id + 1)
+                );
+
+                engine.close_storage()?;
+                drop(engine);
+
+                let reopened = KvEngine::open_with_wal_io_mode(&database, options, mode)?;
+                assert_eq!(
+                    reopened.get(b"fill-one")?,
+                    Some(Bytes::from_static(b"value"))
+                );
+                assert_eq!(
+                    reopened.get(b"fill-two")?,
+                    Some(Bytes::from_static(b"value"))
+                );
+                match operation {
+                    0 => assert_eq!(
+                        reopened.get(b"retry-put")?,
+                        Some(Bytes::from_static(b"value"))
+                    ),
+                    1 => assert_eq!(
+                        reopened.get(b"retry-batch")?,
+                        Some(Bytes::from_static(b"value"))
+                    ),
+                    2 => assert_eq!(reopened.get(b"v7-key")?, None),
+                    _ => unreachable!(),
+                }
+                reopened.close_storage()?;
+            }
+        }
+
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn v7_async_capacity_errors_preserve_active_segment() -> anyhow::Result<()> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()?;
+        for serializable in [false, true] {
+            let directory = tempdir()?;
+            let mut options =
+                v7_recovery_test_database_with_segment_limit(directory.path(), 32 * 1024)?;
+            options.serializable = serializable;
+            let database = directory.path().join("db");
+            let engine = KvEngine::open_with_wal_io_mode(
+                &database,
+                options.clone(),
+                crate::wal::WalIoMode::Parallel,
+            )?;
+            engine.put(b"fill-one", b"value")?;
+            engine.put(b"fill-two", b"value")?;
+            let source = engine.inner.state.load().memtable.clone();
+            let source_segment = LsmStorageInner::pitr_segment_of(&source).unwrap();
+            let source_frontier = source.v7_frontier_cursor()?;
+
+            runtime.block_on(async {
+                tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    for operation in 0..3 {
+                        if serializable && operation != 2 {
+                            continue;
+                        }
+                        let error = match operation {
+                            0 => engine.put_async(b"deferred-point", b"value").await,
+                            1 => engine.delete_range_async(b"r", b"s").await,
+                            2 => {
+                                let transaction = engine.new_txn()?;
+                                transaction.put(b"deferred-transaction", b"value")?;
+                                transaction.commit_async().await
+                            }
+                            _ => unreachable!(),
+                        }
+                        .expect_err("v7 async capacity rotation is deferred");
+                        assert_eq!(
+                            error
+                                .downcast_ref::<crate::wal::v7::leader::WalV7LeaderCapacityError>(),
+                            Some(
+                                &crate::wal::v7::leader::WalV7LeaderCapacityError::RotationRequired
+                            ),
+                            "unexpected capacity error: {error:#}"
+                        );
+                        assert!(Arc::ptr_eq(&engine.inner.state.load().memtable, &source));
+                        assert_eq!(source.v7_frontier_cursor()?, source_frontier);
+                    }
+
+                    Ok::<_, anyhow::Error>(())
+                })
+                .await
+                .expect("capacity errors must return with one blocking worker")
+            })?;
+            assert_eq!(engine.get(b"deferred-point")?, None);
+            assert_eq!(engine.get(b"deferred-transaction")?, None);
+
+            // Failed attempts retire their timestamps without poisoning the
+            // sequencer, so a supported synchronous point retry can rotate.
+            engine.put(b"after-deferred-errors", b"durable")?;
+            assert_eq!(
+                engine.pitr_manifest_state.lock().active_segment_id,
+                Some(source_segment + 1)
+            );
+            engine.close_storage()?;
+            drop(source);
+            drop(engine);
+
+            let reopened = KvEngine::open_with_wal_io_mode(
+                &database,
+                options,
+                crate::wal::WalIoMode::Parallel,
+            )?;
+            assert_eq!(
+                reopened.get(b"after-deferred-errors")?,
+                Some(Bytes::from_static(b"durable"))
+            );
+            assert_eq!(reopened.get(b"deferred-point")?, None);
+            assert_eq!(reopened.get(b"deferred-transaction")?, None);
+            reopened.close_storage()?;
+        }
+
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn v7_seal_index_limit_waits_for_active_writer_before_empty_check() -> anyhow::Result<()> {
+        let directory = tempdir()?;
+        let options = v7_recovery_test_database(directory.path())?;
+        let database = directory.path().join("db");
+        let engine = KvEngine::open_with_wal_io_mode(
+            &database,
+            options.clone(),
+            crate::wal::WalIoMode::Parallel,
+        )?;
+        assert!(matches!(
+            engine.create_recovery_point()?,
+            crate::pitr::api::RecoveryPointOutcome::Durable(_)
+        ));
+        let expected_memtable = engine.inner.state.load().memtable.clone();
+        assert!(expected_memtable.uses_v7_wal());
+        assert!(expected_memtable.is_empty());
+
+        // Hold an active-writer guard to model a parallel write that has a
+        // reservation but has not yet published into the memtable.
+        let active_writer_guard = engine.inner.active_memtable_lock.read();
+        let inner = Arc::clone(&engine.inner);
+        let expected_for_retry = Arc::clone(&expected_memtable);
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let retry = std::thread::spawn(move || {
+            started_tx.send(()).expect("test receiver is alive");
+            let mut retries = LsmStorageInner::MAX_WAL_FULL_ROTATION_RETRIES;
+            inner.retry_after_point_wal_full(
+                anyhow::Error::new(
+                    crate::wal::v7::admission::WalV7ReservationError::SealIndexLimit,
+                ),
+                &expected_for_retry,
+                &mut retries,
+            )
+        });
+        started_rx.recv()?;
+
+        let gate_wait_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !engine
+            .inner
+            .active_memtable_lock
+            .exclusive_pending_for_test()
+            && !retry.is_finished()
+            && std::time::Instant::now() < gate_wait_deadline
+        {
+            std::thread::yield_now();
+        }
+        assert!(
+            engine
+                .inner
+                .active_memtable_lock
+                .exclusive_pending_for_test(),
+            "seal-index empty check must wait for active writers to drain"
+        );
+
+        let value = [crate::vlog::KvKind::Inline as u8, b'v'];
+        let batch = crate::pitr::WalBatch {
+            commit_ts: 8,
+            recorded_at: crate::pitr::RecordedAt {
+                secs: 4_000_000_000,
+                nanos: 0,
+            },
+            entries: vec![crate::pitr::WalEntry::Put {
+                key: b"in-flight".to_vec(),
+                value: value.to_vec(),
+            }],
+        };
+        let ticket =
+            expected_memtable.write_pitr_wal_batch_only(&batch, crate::pitr::LIVE_WAL_V5_LIMITS)?;
+        expected_memtable.commit_wal_ticket(ticket)?;
+        expected_memtable
+            .publish_raw_batch(&[(crate::key::KeySlice::from_slice(b"in-flight"), &value)])?;
+        drop(active_writer_guard);
+
+        let error = retry
+            .join()
+            .map_err(|_| anyhow::anyhow!("retry worker panicked"))?
+            .expect_err("bounded retry count should stop before rotating");
+        assert!(
+            error.to_string().contains("bounded rotations"),
+            "unexpected retry error: {error:#}"
+        );
+        assert!(
+            !format!("{error:#}").contains("empty active segment"),
+            "the in-flight write should make the active segment non-empty"
+        );
+
+        engine.close_storage()?;
+        drop(engine);
+        let reopened =
+            KvEngine::open_with_wal_io_mode(&database, options, crate::wal::WalIoMode::Parallel)?;
+        assert_eq!(reopened.get(b"in-flight")?, Some(Bytes::from_static(b"v")));
+        reopened.close_storage()?;
 
         Ok(())
     }

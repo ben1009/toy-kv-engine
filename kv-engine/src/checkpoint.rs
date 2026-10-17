@@ -318,7 +318,7 @@ impl LsmStorageInner {
         cleanup_checkpoint_tmps_for_target(&target_dir)?;
 
         let result = (|| {
-            self.prepare_forced_memtable_freeze()?;
+            self.prepare_forced_memtable_freeze(None)?;
             let _checkpoint_guard = self.checkpoint_lock.lock();
             let prepared = self.prepare_checkpoint(&target_dir, &tmp_dir)?;
             drop(_checkpoint_guard);
@@ -528,7 +528,7 @@ impl LsmStorageInner {
             !self.state.load().memtable.uses_v7_wal(),
             "checkpoint capture for an Active v7 PITR WAL is not supported"
         );
-        self.prepare_forced_memtable_freeze()?;
+        self.prepare_forced_memtable_freeze(None)?;
         let _checkpoint_guard = self.checkpoint_lock.lock();
 
         self.capture_checkpoint_state_locked()
