@@ -4625,6 +4625,8 @@ impl KvEngine {
             *admission_released_for_archive = true;
         }
 
+        #[cfg(feature = "chaos-testing")]
+        crate::chaos::failpoint::fail_point!("pitr.before_recovery_point_archive");
         check_pitr_cancellation(cancellation)?;
         let archive = self.archive_pitr_segment_from_paths_cancellable(
             metadata,
@@ -4732,6 +4734,10 @@ impl KvEngine {
         resume_admission_on_success: bool,
         cancellation: Option<&std::sync::atomic::AtomicBool>,
     ) -> Result<crate::pitr::api::RecoveryPointOutcome> {
+        ensure!(
+            !self.pitr_publication_unknown.load(Ordering::Acquire),
+            "PITR recovery point cannot proceed while a manifest transition has an unknown outcome; reopen the database first"
+        );
         let mut state = self.pitr_manifest_state.lock().clone();
         ensure!(
             state.mode == crate::pitr::manifest::PitrMode::Enabled,
@@ -5174,9 +5180,73 @@ impl KvEngine {
         let _operation_guard = self.pitr_operation_lock.lock();
         let active = self.inner.state.load();
         if active.memtable.uses_v7_wal() {
-            anyhow::bail!(
-                "cannot freeze a v7 Active PITR WAL before v7 sealing and rotation are implemented"
+            let source_is_empty = active.memtable.is_empty();
+            let source_segment_id = LsmStorageInner::pitr_segment_of(&active.memtable)
+                .ok_or_else(|| anyhow!("Active v7 PITR WAL has no segment identity"))?;
+            drop(active);
+
+            // Explicit flush and checkpoint capture use this barrier before
+            // taking checkpoint_lock. Rotate through the same durable v7
+            // boundary as recovery-point creation, so the frozen source is
+            // already archived before the flush can reclaim its WAL and seal.
+            let _barrier = self.pitr_barrier_lock.lock();
+            ensure!(
+                !self.pitr_publication_unknown.load(Ordering::Acquire),
+                "v7 forced freeze cannot proceed while a PITR manifest transition has an unknown outcome; reopen the database first"
             );
+            let state = self.pitr_manifest_state.lock().clone();
+            ensure!(
+                state.mode == crate::pitr::manifest::PitrMode::Enabled,
+                "v7 forced flush cannot proceed in PITR state {:?}; resume PITR first",
+                state.mode
+            );
+            if source_is_empty {
+                ensure!(
+                    state.obligations.values().all(|obligation| {
+                        obligation.state == crate::pitr::manifest::ObligationState::Reclaimable
+                    }),
+                    "v7 forced flush has unresolved archive obligations; resume PITR first"
+                );
+                return Ok(());
+            }
+            ensure!(
+                state.active_segment_id == Some(source_segment_id),
+                "Active v7 WAL segment differs from the PITR manifest before forced freeze"
+            );
+            match self.create_recovery_point_locked(true)? {
+                crate::pitr::api::RecoveryPointOutcome::Durable(_) => {}
+                crate::pitr::api::RecoveryPointOutcome::CommitPublishedButNotDurable {
+                    error,
+                    ..
+                } => return Err(anyhow!(error)),
+                crate::pitr::api::RecoveryPointOutcome::PublicationUnknown { .. } => {
+                    return Err(anyhow!("v7 forced-freeze boundary publication is unknown"));
+                }
+            }
+
+            let state = self.pitr_manifest_state.lock().clone();
+            let active = self.inner.state.load();
+            ensure!(
+                state.active_segment_id != Some(source_segment_id)
+                    && active.memtable.uses_v7_wal()
+                    && LsmStorageInner::pitr_segment_of(&active.memtable)
+                        == state.active_segment_id,
+                "v7 forced-freeze boundary did not install its durable successor"
+            );
+            // A background flush may already have durably reclaimed the source
+            // and removed its obligation. The lifecycle locks exclude abandon
+            // and epoch replacement, so absence after this durable boundary is
+            // also a successful outcome.
+            ensure!(
+                state
+                    .obligations
+                    .get(&source_segment_id)
+                    .is_none_or(|obligation| {
+                        obligation.state == crate::pitr::manifest::ObligationState::Reclaimable
+                    }),
+                "v7 forced-freeze source still has an incomplete archive obligation"
+            );
+            return Ok(());
         }
         if !active.memtable.uses_wal_v5() || active.memtable.is_empty() {
             return Ok(());
@@ -6308,8 +6378,8 @@ impl KvEngine {
 
     /// Only call this in test cases due to race conditions
     ///
-    /// When PITR is enabled, an active v5 WAL is sealed and archived as a
-    /// recovery-point boundary before its memtable is flushed.
+    /// When PITR is enabled, an active v5 or v7 WAL is sealed and archived as
+    /// a recovery-point boundary before its memtable is flushed.
     pub fn force_flush(&self) -> Result<()> {
         crate::profile_scope!("kv.force_flush", self.inner.force_flush())
     }
@@ -6317,8 +6387,8 @@ impl KvEngine {
     /// Flush all memtables (current + all immutable) to SSTs.
     /// Unlike `force_flush()` which only flushes one immutable memtable,
     /// this drains the entire queue.
-    /// When PITR is enabled, each active v5 WAL is sealed and archived before
-    /// its memtable is flushed.
+    /// When PITR is enabled, each active v5 or v7 WAL is sealed and archived
+    /// before its memtable is flushed.
     ///
     /// # Warning
     /// Inherits the same race conditions as [`Self::force_flush`] — only use in
@@ -14691,7 +14761,9 @@ impl LsmStorageInner {
         #[cfg(target_os = "linux")]
         {
             let active = self.state.load();
-            if active.memtable.uses_pitr_batch_wal() && !active.memtable.is_empty() {
+            let has_data = !active.memtable.is_empty();
+            if active.memtable.uses_v7_wal() || (active.memtable.uses_pitr_batch_wal() && has_data)
+            {
                 drop(active);
                 let engine = self
                     .weak_engine
@@ -14699,6 +14771,10 @@ impl LsmStorageInner {
                     .and_then(std::sync::Weak::upgrade)
                     .ok_or_else(|| anyhow!("PITR engine owner is not installed"))?;
                 engine.archive_active_pitr_segment_before_forced_freeze()?;
+                #[cfg(feature = "chaos-testing")]
+                if has_data {
+                    crate::chaos::failpoint::fail_point!("pitr.after_forced_freeze_boundary");
+                }
             }
         }
         #[cfg(not(target_os = "linux"))]
@@ -14718,13 +14794,14 @@ impl LsmStorageInner {
     }
 
     fn force_flush(&self) -> Result<()> {
+        // PITR base publication takes its lifecycle locks before checkpoint_lock.
+        // Establish our boundary in the same order before changing the manifest,
+        // then recheck the active WAL under the state and writer guards before
+        // attempting a plain freeze.
+        self.prepare_forced_memtable_freeze()?;
         if self.state.load().immutable_file_metadata.is_empty() {
             self.ensure_manifest_v7()?;
         }
-        // PITR base publication takes its lifecycle locks before checkpoint_lock.
-        // Establish our boundary in the same order, then recheck the active WAL
-        // under the state and writer guards before attempting a plain freeze.
-        self.prepare_forced_memtable_freeze()?;
         let _checkpoint_guard = self.checkpoint_lock.lock();
         {
             let state_lock = self.state_lock.lock();
@@ -14747,9 +14824,16 @@ impl LsmStorageInner {
         active_memtable_guard: &ActiveMemtableWriteGuard<'_>,
     ) -> Result<()> {
         let state = self.state.load();
-        let should_force_freeze = !state.memtable.is_empty()
-            && (!state.memtable.uses_wal_v5()
-                || self.pitr_state.lock().mode == crate::pitr::manifest::PitrMode::Disabled);
+        // A v7 successor remains the Active WAL after the forced boundary. A
+        // concurrent commit may reach it before this freeze lock is acquired;
+        // never detach that WAL from the PITR manifest with a generic freeze.
+        let must_remain_active = if state.memtable.uses_v7_wal() {
+            true
+        } else {
+            state.memtable.uses_wal_v5()
+                && self.pitr_state.lock().mode != crate::pitr::manifest::PitrMode::Disabled
+        };
+        let should_force_freeze = !state.memtable.is_empty() && !must_remain_active;
         drop(state);
         if !should_force_freeze {
             return Ok(());
@@ -19448,11 +19532,51 @@ mod tests {
             let published = engine.pitr_manifest_state.lock().active_boundary.unwrap();
             assert!(published.ticket_end > previous.ticket_end);
             let manifest_after = std::fs::read(database.join("MANIFEST"))?;
+            engine
+                .inner
+                .manifest
+                .as_ref()
+                .unwrap()
+                .ensure_durability_certain()?;
+            let active = engine.inner.state.load().memtable.clone();
+            let wal_path = active.wal_path().unwrap();
+            let wal_after = std::fs::read(wal_path)?;
+            let state_after = engine.pitr_manifest_state.lock().clone();
 
             assert!(
                 sync_for_test(&engine, asynchronous).is_err(),
                 "a visible unsynced boundary must not make a retry report success"
             );
+            for drain in [false, true] {
+                let result = if asynchronous {
+                    tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()?
+                        .block_on(async {
+                            if drain {
+                                engine.drain_flush_async().await
+                            } else {
+                                engine.force_flush_async().await
+                            }
+                        })
+                } else if drain {
+                    engine.drain_flush()
+                } else {
+                    engine.force_flush()
+                };
+                assert!(result.unwrap_err().to_string().contains("unknown outcome"));
+            }
+            assert!(
+                engine
+                    .create_recovery_point()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("unknown outcome")
+            );
+            assert!(Arc::ptr_eq(&active, &engine.inner.state.load().memtable));
+            assert_eq!(*engine.pitr_manifest_state.lock(), state_after);
+            assert_eq!(*engine.inner.pitr_state.lock(), state_after);
+            assert_eq!(std::fs::read(wal_path)?, wal_after);
             assert!(
                 !engine
                     .inner
@@ -19802,6 +19926,423 @@ mod tests {
             );
             reopened.close_storage()?;
         }
+
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn v7_forced_flush_rotates_before_reclaim_for_each_io_mode() -> anyhow::Result<()> {
+        for mode in [
+            crate::wal::WalIoMode::Leader,
+            crate::wal::WalIoMode::Parallel,
+        ] {
+            for operation in [
+                "force_flush",
+                "drain_flush",
+                "force_flush_async",
+                "drain_flush_async",
+            ] {
+                let directory = tempdir()?;
+                let options = v7_recovery_test_database(directory.path())?;
+                let database = directory.path().join("db");
+                let engine = KvEngine::open_with_wal_io_mode(&database, options.clone(), mode)?;
+                let source = engine.inner.state.load().memtable.clone();
+                assert!(source.uses_v7_wal());
+                let source_segment_id = LsmStorageInner::pitr_segment_of(&source).unwrap();
+                let source_wal_path = source.wal_path().unwrap().to_path_buf();
+                drop(source);
+
+                engine.put(b"forced-flush-key", b"durable")?;
+                match operation {
+                    "force_flush" => engine.force_flush()?,
+                    "drain_flush" => engine.drain_flush()?,
+                    "force_flush_async" => engine.force_flush_async().await?,
+                    "drain_flush_async" => engine.drain_flush_async().await?,
+                    _ => unreachable!(),
+                }
+
+                let state = engine.pitr_manifest_state.lock().clone();
+                assert_eq!(state.active_segment_id, Some(source_segment_id + 1));
+                assert!(
+                    !state.obligations.contains_key(&source_segment_id),
+                    "{operation} left a reclaimed v7 source obligation behind"
+                );
+                assert!(!source_wal_path.exists());
+                assert!(!source_wal_path.with_extension("seal").exists());
+                let active = engine.inner.state.load();
+                assert!(active.memtable.uses_v7_wal());
+                assert!(active.imm_memtables.is_empty());
+                assert_eq!(
+                    LsmStorageInner::pitr_segment_of(&active.memtable),
+                    state.active_segment_id
+                );
+                assert_eq!(engine.get(b"v7-key")?, Some(Bytes::from_static(b"v")));
+                assert_eq!(
+                    engine.get(b"forced-flush-key")?,
+                    Some(Bytes::from_static(b"durable"))
+                );
+
+                engine.close_storage()?;
+                drop(engine);
+
+                let reopened = KvEngine::open_with_wal_io_mode(&database, options, mode)?;
+                assert_eq!(reopened.get(b"v7-key")?, Some(Bytes::from_static(b"v")));
+                assert_eq!(
+                    reopened.get(b"forced-flush-key")?,
+                    Some(Bytes::from_static(b"durable"))
+                );
+                reopened.close_storage()?;
+            }
+        }
+
+        Ok(())
+    }
+
+    #[cfg(all(target_os = "linux", feature = "chaos-testing"))]
+    #[tokio::test(flavor = "current_thread")]
+    async fn failpoint_v7_forced_flush_retry_keeps_unresolved_archive_fenced() -> anyhow::Result<()>
+    {
+        let scenario = crate::chaos::failpoint::FailScenario::setup();
+        for mode in [
+            crate::wal::WalIoMode::Leader,
+            crate::wal::WalIoMode::Parallel,
+        ] {
+            for successor_write in [false, true] {
+                let directory = tempdir()?;
+                let options = v7_recovery_test_database(directory.path())?;
+                let database = directory.path().join("db");
+                let repository = directory.path().join("repository");
+                let engine = KvEngine::open_with_wal_io_mode(&database, options.clone(), mode)?;
+                engine.put(b"before-archive-failure", b"durable")?;
+                let source_wal = engine
+                    .inner
+                    .state
+                    .load()
+                    .memtable
+                    .wal_path()
+                    .unwrap()
+                    .to_path_buf();
+
+                if successor_write {
+                    let writer = Arc::clone(&engine);
+                    fail::cfg_callback("pitr.before_recovery_point_archive", move || {
+                        writer
+                            .put(b"during-archive-failure", b"durable")
+                            .expect("commit in the successor while archival is in progress");
+                    })
+                    .unwrap();
+                }
+                crate::pitr::archiver::set_catalog_publication_test_mode(&repository, 1);
+                let first_flush = engine.force_flush();
+                fail::remove("pitr.before_recovery_point_archive");
+                let error = first_flush.unwrap_err();
+                assert!(
+                    error
+                        .to_string()
+                        .contains("catalog directory fsync failure")
+                );
+                let state_after = engine.pitr_manifest_state.lock().clone();
+                assert_eq!(
+                    state_after.mode,
+                    crate::pitr::manifest::PitrMode::PublicationUncertain
+                );
+                let active = engine.inner.state.load().memtable.clone();
+                assert!(active.uses_v7_wal());
+                assert_eq!(active.is_empty(), !successor_write);
+                assert_eq!(engine.inner.state.load().imm_memtables.len(), 1);
+                let manifest_after = std::fs::read(database.join("MANIFEST"))?;
+                let source_after = std::fs::read(&source_wal)?;
+                let successor_wal = active.wal_path().unwrap();
+                let successor_after = std::fs::read(successor_wal)?;
+
+                for operation in [
+                    "force_flush",
+                    "drain_flush",
+                    "force_flush_async",
+                    "drain_flush_async",
+                ] {
+                    let result = match operation {
+                        "force_flush" => engine.force_flush(),
+                        "drain_flush" => engine.drain_flush(),
+                        "force_flush_async" => engine.force_flush_async().await,
+                        "drain_flush_async" => engine.drain_flush_async().await,
+                        _ => unreachable!(),
+                    };
+                    assert!(
+                        result
+                            .unwrap_err()
+                            .to_string()
+                            .contains("resume PITR first")
+                    );
+                    assert!(Arc::ptr_eq(&active, &engine.inner.state.load().memtable));
+                    assert_eq!(engine.inner.state.load().imm_memtables.len(), 1);
+                    assert_eq!(*engine.pitr_manifest_state.lock(), state_after);
+                    assert_eq!(*engine.inner.pitr_state.lock(), state_after);
+                    assert_eq!(std::fs::read(database.join("MANIFEST"))?, manifest_after);
+                    assert_eq!(std::fs::read(&source_wal)?, source_after);
+                    assert_eq!(std::fs::read(successor_wal)?, successor_after);
+                    assert!(source_wal.with_extension("seal").exists());
+                    assert!(engine.put(b"must-stay-fenced", b"rejected").is_err());
+                }
+
+                assert!(matches!(
+                    engine.resume_pitr(&repository)?,
+                    crate::pitr::api::PitrResumeOutcome::Resumed
+                ));
+                engine.force_flush()?;
+                assert!(!source_wal.exists());
+                assert!(!source_wal.with_extension("seal").exists());
+                engine.put(b"after-archive-resume", b"writable")?;
+                engine.close_storage()?;
+                drop(engine);
+
+                let reopened = KvEngine::open_with_wal_io_mode(&database, options, mode)?;
+                assert_eq!(
+                    reopened.get(b"before-archive-failure")?,
+                    Some(Bytes::from_static(b"durable"))
+                );
+                assert_eq!(
+                    reopened.get(b"after-archive-resume")?,
+                    Some(Bytes::from_static(b"writable"))
+                );
+                if successor_write {
+                    assert_eq!(
+                        reopened.get(b"during-archive-failure")?,
+                        Some(Bytes::from_static(b"durable"))
+                    );
+                }
+                reopened.close_storage()?;
+            }
+        }
+        scenario.teardown();
+
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn v7_checkpoint_capture_rejects_before_changing_active_boundary() -> anyhow::Result<()> {
+        for mode in [
+            crate::wal::WalIoMode::Leader,
+            crate::wal::WalIoMode::Parallel,
+        ] {
+            for asynchronous in [false, true] {
+                let directory = tempdir()?;
+                let options = v7_recovery_test_database(directory.path())?;
+                let database = directory.path().join("db");
+                let checkpoint_path = directory.path().join("checkpoint");
+                let engine = KvEngine::open_with_wal_io_mode(&database, options, mode)?;
+                engine.put(b"checkpoint-key", b"value")?;
+
+                let active = engine.inner.state.load().memtable.clone();
+                let wal_path = active.wal_path().unwrap().to_path_buf();
+                let wal_before = std::fs::read(&wal_path)?;
+                let manifest_before = std::fs::read(database.join("MANIFEST"))?;
+                let state_before = engine.pitr_manifest_state.lock().clone();
+                let error = if asynchronous {
+                    engine
+                        .create_checkpoint_async(&checkpoint_path)
+                        .await
+                        .unwrap_err()
+                } else {
+                    engine.create_checkpoint(&checkpoint_path).unwrap_err()
+                };
+
+                assert!(
+                    error
+                        .to_string()
+                        .contains("checkpoint capture for an Active v7 PITR WAL is not supported")
+                );
+                assert!(Arc::ptr_eq(&active, &engine.inner.state.load().memtable));
+                assert_eq!(*engine.pitr_manifest_state.lock(), state_before);
+                assert_eq!(std::fs::read(&wal_path)?, wal_before);
+                assert_eq!(std::fs::read(database.join("MANIFEST"))?, manifest_before);
+                assert!(!checkpoint_path.exists());
+                assert!(
+                    engine
+                        .inner
+                        .mvcc
+                        .as_ref()
+                        .unwrap()
+                        .commit_admission_is_open()
+                );
+                engine.put(b"after-checkpoint-rejection", b"accepted")?;
+                engine.close_storage()?;
+            }
+        }
+
+        Ok(())
+    }
+
+    #[cfg(all(target_os = "linux", feature = "chaos-testing"))]
+    #[test]
+    fn failpoint_v7_forced_flush_keeps_concurrent_successor_writes() {
+        use crate::chaos::failpoint::FailScenario;
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let scenario = FailScenario::setup();
+        let directory = tempdir().unwrap();
+        let options = v7_recovery_test_database(directory.path()).unwrap();
+        let database = directory.path().join("db");
+        let engine = KvEngine::open_with_wal_io_mode(
+            &database,
+            options.clone(),
+            crate::wal::WalIoMode::Parallel,
+        )
+        .unwrap();
+        engine.put(b"forced-flush-source", b"durable").unwrap();
+
+        let source = engine.inner.state.load().memtable.clone();
+        let source_segment_id = LsmStorageInner::pitr_segment_of(&source).unwrap();
+        drop(source);
+
+        let (boundary_tx, boundary_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let resume_rx = parking_lot::Mutex::new(resume_rx);
+        fail::cfg_callback("pitr.after_forced_freeze_boundary", move || {
+            boundary_tx
+                .send(())
+                .expect("notify test after the durable forced-flush boundary");
+            resume_rx
+                .lock()
+                .recv()
+                .expect("wait for test to resume forced flush");
+        })
+        .unwrap();
+
+        let worker_engine = engine.clone();
+        let worker = std::thread::spawn(move || worker_engine.force_flush());
+        boundary_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("forced flush reaches the post-boundary window");
+        engine
+            .put(b"forced-flush-successor", b"also-durable")
+            .expect("successor remains writable after the boundary");
+        resume_tx
+            .send(())
+            .expect("resume forced flush after concurrent commit");
+        worker
+            .join()
+            .expect("forced flush worker joins")
+            .expect("forced flush succeeds");
+        fail::remove("pitr.after_forced_freeze_boundary");
+
+        let active = engine.inner.state.load();
+        assert!(active.memtable.uses_v7_wal());
+        assert_eq!(
+            LsmStorageInner::pitr_segment_of(&active.memtable),
+            Some(source_segment_id + 1)
+        );
+        assert!(active.imm_memtables.is_empty());
+        assert_eq!(
+            engine.get(b"forced-flush-successor").unwrap(),
+            Some(Bytes::from_static(b"also-durable"))
+        );
+        engine.close_storage().unwrap();
+        drop(engine);
+
+        let reopened =
+            KvEngine::open_with_wal_io_mode(&database, options, crate::wal::WalIoMode::Parallel)
+                .unwrap();
+        assert_eq!(
+            reopened.get(b"forced-flush-source").unwrap(),
+            Some(Bytes::from_static(b"durable"))
+        );
+        assert_eq!(
+            reopened.get(b"forced-flush-successor").unwrap(),
+            Some(Bytes::from_static(b"also-durable"))
+        );
+        reopened.close_storage().unwrap();
+        scenario.teardown();
+    }
+
+    #[cfg(all(target_os = "linux", feature = "chaos-testing"))]
+    #[test]
+    fn failpoint_v7_forced_flush_accepts_concurrent_source_reclamation() -> anyhow::Result<()> {
+        use crate::chaos::failpoint::FailScenario;
+        use std::{sync::mpsc, time::Duration};
+
+        let scenario = FailScenario::setup();
+        for mode in [
+            crate::wal::WalIoMode::Leader,
+            crate::wal::WalIoMode::Parallel,
+        ] {
+            let directory = tempdir()?;
+            let options = v7_recovery_test_database(directory.path())?;
+            let database = directory.path().join("db");
+            let engine = KvEngine::open_with_wal_io_mode(&database, options.clone(), mode)?;
+            engine.put(b"reclaimed-during-forced-flush", b"durable")?;
+            let source = engine.inner.state.load().memtable.clone();
+            let source_segment_id = LsmStorageInner::pitr_segment_of(&source).unwrap();
+            let source_wal = source.wal_path().unwrap().to_path_buf();
+            drop(source);
+
+            let (boundary_tx, boundary_rx) = mpsc::channel();
+            let (release_tx, release_rx) = mpsc::channel();
+            let release_rx = parking_lot::Mutex::new(release_rx);
+            fail::cfg_callback(
+                "pitr.after_reclaimable_manifest_before_bookkeeping",
+                move || {
+                    boundary_tx.send(()).unwrap();
+                    release_rx
+                        .lock()
+                        .recv_timeout(Duration::from_secs(10))
+                        .expect("release the forced-flush boundary after reclamation");
+                },
+            )
+            .unwrap();
+            let (reclaimed_tx, reclaimed_rx) = mpsc::channel();
+            fail::cfg_callback("pitr.after_reclamation_before_bookkeeping", move || {
+                reclaimed_tx.send(()).unwrap();
+            })
+            .unwrap();
+
+            let forced_engine = Arc::clone(&engine);
+            let forced = std::thread::spawn(move || forced_engine.force_flush());
+            boundary_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("forced flush publishes its Reclaimable source boundary");
+            let background_engine = Arc::clone(&engine);
+            let background =
+                std::thread::spawn(move || background_engine.inner.force_flush_next_imm_memtable());
+            reclaimed_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("background flush durably reclaims the source");
+            let reclaimed_before_validation = !engine
+                .pitr_manifest_state
+                .lock()
+                .obligations
+                .contains_key(&source_segment_id);
+            release_tx.send(())?;
+            let forced_result = forced.join().expect("forced flush worker joins");
+            let background_result = background.join().expect("background flush worker joins");
+            fail::remove("pitr.after_reclaimable_manifest_before_bookkeeping");
+            fail::remove("pitr.after_reclamation_before_bookkeeping");
+
+            assert!(reclaimed_before_validation);
+            background_result?;
+            forced_result?;
+            assert!(!source_wal.exists());
+            assert!(!source_wal.with_extension("seal").exists());
+            assert!(engine.inner.state.load().imm_memtables.is_empty());
+            engine.put(b"after-concurrent-reclamation", b"writable")?;
+            engine.close_storage()?;
+            drop(engine);
+
+            let reopened = KvEngine::open_with_wal_io_mode(&database, options, mode)?;
+            assert_eq!(
+                reopened.get(b"reclaimed-during-forced-flush")?,
+                Some(Bytes::from_static(b"durable"))
+            );
+            assert_eq!(
+                reopened.get(b"after-concurrent-reclamation")?,
+                Some(Bytes::from_static(b"writable"))
+            );
+            reopened.close_storage()?;
+        }
+        scenario.teardown();
 
         Ok(())
     }

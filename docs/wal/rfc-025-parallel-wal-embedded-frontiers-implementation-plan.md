@@ -52,10 +52,16 @@ quota at the durable `Archived` transition while retaining physical spool
 charges until cleanup. Segment bookkeeping retains each installed successor's
 reservation owner across later rotations and flushes; archive and reconciliation
 transitions replay from the latest manifest projection under the shared mutation
-lock, so concurrent reclamation cannot be resurrected. Forced-freeze and
-checkpoint/backup barriers, remaining public write shapes, OCC, and broader
-lifecycle rotation remain. PITR manifest replay and snapshots now retain and validate a
-v7 format marker and the full immutable boundary in Sealing obligations;
+lock, so concurrent reclamation cannot be resurrected. V7 forced flush now
+establishes an archive boundary before flushing its source. Forced flush and
+recovery-point requests reject unknown manifest publication before mutation,
+including when the Active v7 WAL is empty. Uncertain archive publication requires
+explicit PITR resume before another forced flush, regardless of successor writes.
+Empty successors also reject unresolved archive obligations until PITR resume
+settles the boundary. V7 checkpoint and backup capture, remaining public write
+shapes, OCC, and broader lifecycle rotation remain. PITR manifest replay and
+snapshots now retain and validate a v7 format marker and the full immutable
+boundary in Sealing obligations;
 seal completion checks the WAL digest against that boundary. A v7 v2 seal
 sidecar codec now persists the immutable boundary and each ticket's first DATA
 offset; building and verifying a seal runs strict Sealed recovery against the
@@ -880,9 +886,11 @@ worker. The barrier resumes commit admission only if the sequencer was open
 beforehand and the WAL sync succeeds; a failed sync leaves admission closed for
 recovery. Public close applies the same fixed-cutoff rule while keeping
 admission closed: it syncs the Active WAL and persists its resulting logical
-boundary before tearing down storage. Explicit recovery-point creation now uses
-the v7 sealing and successor-rotation path; forced-freeze and checkpoint/backup
-barriers remain later lifecycle work.
+boundary before tearing down storage. Explicit recovery-point creation and v7
+forced flush use the sealing and successor-rotation path. Ordinary checkpoint
+and backup capture reject Active v7 WALs until they can preserve the sealed
+source chain. PITR base-backup capture follows a separate path and remains
+unqualified for v7.
 
 Regression tests exercise both public sync APIs with a commit reserved before
 its WAL ticket exists and preserve an existing admission pause. A separate test
