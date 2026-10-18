@@ -38,6 +38,9 @@ durable recovery-point path; Leader and Parallel modes share this bounded
 retry, with regression coverage at an exact segment boundary. Native async v7
 Parallel point writes now retain the exclusive preparation permit while their
 blocking rotation runs, then retry against the installed successor. Native
+async Parallel point writes also have a public API regression for a seal-index
+reservation rejection on a nonempty Active WAL; the test restores the configured
+limit before rotation and verifies successor retry and reopen durability. Native
 range and transaction capacity retries, proactive target/interval rotation,
 and global spool backpressure remain pending. Public close drains and syncs
 the Active v7 WAL for recovery without emitting a final recovery point. It stops
@@ -286,8 +289,10 @@ reservation or coordinate assignment. It may first reserve temporary canonicaliz
 scratch, which is released when preparation or capacity admission fails. Batches that
 fit a fresh segment return `RotationRequired`, while batches that cannot fit any fresh
 legal segment return `BatchTooLarge`; shared-ledger failures retain their distinct
-reservation errors. Engine retry/rotation and seal-index-triggered rotation remain
-outstanding. Stage 5 has
+reservation errors. Point-write retry and rotation are now wired in Stage 6, with
+public API coverage for physical segment capacity and Parallel seal-index
+reservation errors. Range and transaction retries plus broader shared-ledger
+pressure handling remain outstanding. Stage 5 has
 started with recovered-runtime cursor bootstrap: an installed Active image
 supplies the v7 DATA start, append offset, and next ticket. The shared runtime
 seeds its admission, packer, and durability coordinates from that state. The seed now
@@ -805,10 +810,11 @@ image untouched. Digest/index snapshots agree with independent codec
 verification; no stopped-admission payload rescan is required. Exact-boundary
 and marker-overhead cases in the serial Leader produce rotation-required before
 ticket assignment; a batch too large for a fresh segment and shared-ledger resource
-pressure remain distinct. Seal-index-triggered rotation and the real engine retry
-path remain outstanding. Real engine allocation checks belong to stage 5, and full
-v7 lifecycle rotation/retry checks belong to stage 6; neither is a prerequisite for
-this stage.
+pressure remain distinct. Stage 6 now exercises the real point-write retry path for
+both physical segment capacity and Parallel seal-index reservation errors. Range
+and transaction retries, cancellation, and shared-ledger pressure remain
+outstanding. Full lifecycle rotation/retry checks belong to Stage 6; they are not
+prerequisites for this stage.
 
 ### 5. Parallel runtime, one-sync coordinator, and API barriers
 
@@ -976,8 +982,10 @@ remain in later stage 5/6 work.
   concurrent native async point writes at the segment boundary and checks
   rotation, retries, and reopen durability; a separate existing regression
   continues to cover range and transaction no-rotation errors.
-  Seal-index exhaustion through real engine APIs, simultaneous capacity
-  rejections, cancelled retries, OCC revalidation, and distinct global
+  A test-only ledger limit override now forces `SealIndexLimit` through the real
+  Parallel reservation path for `put_async` on a nonempty Active segment; the
+  retry rotates, succeeds against the successor, and survives reopen. Simultaneous
+  capacity rejections, cancelled retries, OCC revalidation, and distinct global
   backpressure and oversize outcomes remain outstanding.
 - Extend `PitrManifestRecord::SealStarted`, its obligation state, replay, and
   snapshot validation with the versioned immutable boundary. Persist Active

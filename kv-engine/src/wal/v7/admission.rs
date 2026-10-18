@@ -20,6 +20,9 @@ use std::{
     },
 };
 
+#[cfg(test)]
+use std::sync::atomic::AtomicU64;
+
 use parking_lot::Mutex;
 
 use super::codec::{WAL_V7_FRAME_LEN, data_fragment_count};
@@ -197,6 +200,8 @@ struct LedgerState {
 #[derive(Debug)]
 struct WalV7ResourceLedgerInner {
     limits: WalV7ResourceLimits,
+    #[cfg(test)]
+    test_max_seal_index_bytes: AtomicU64,
     state: Mutex<LedgerState>,
 }
 
@@ -640,6 +645,8 @@ impl WalV7ResourceLedger {
         Ok(Self {
             inner: Arc::new(WalV7ResourceLedgerInner {
                 limits,
+                #[cfg(test)]
+                test_max_seal_index_bytes: AtomicU64::new(u64::MAX),
                 state: Mutex::new(LedgerState {
                     next_id: 1,
                     charged: WalV7ResourceCharge::default(),
@@ -680,7 +687,11 @@ impl WalV7ResourceLedger {
         if next.buffer_memory_bytes > self.inner.limits.max_buffer_memory_bytes {
             return Err(WalV7ReservationError::BufferMemoryLimit);
         }
-        if next.seal_index_bytes > self.inner.limits.max_seal_index_bytes {
+        let max_seal_index_bytes = self.inner.limits.max_seal_index_bytes;
+        #[cfg(test)]
+        let max_seal_index_bytes =
+            max_seal_index_bytes.min(self.inner.test_max_seal_index_bytes.load(Ordering::Acquire));
+        if next.seal_index_bytes > max_seal_index_bytes {
             return Err(WalV7ReservationError::SealIndexLimit);
         }
         let next_id = state
@@ -868,6 +879,13 @@ impl WalV7ResourceLedger {
 
     pub(crate) fn snapshot(&self) -> WalV7ResourceCharge {
         self.inner.state.lock().charged
+    }
+
+    #[cfg(test)]
+    fn set_max_seal_index_bytes_for_test(&self, max_seal_index_bytes: u64) {
+        self.inner
+            .test_max_seal_index_bytes
+            .store(max_seal_index_bytes, Ordering::Release);
     }
 }
 
@@ -1149,6 +1167,12 @@ impl WalV7RetainedResources {
     #[cfg(test)]
     pub(crate) fn snapshot(&self) -> WalV7ResourceCharge {
         self.ledger.snapshot()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_max_seal_index_bytes_for_test(&self, max_seal_index_bytes: u64) {
+        self.ledger
+            .set_max_seal_index_bytes_for_test(max_seal_index_bytes);
     }
 }
 
