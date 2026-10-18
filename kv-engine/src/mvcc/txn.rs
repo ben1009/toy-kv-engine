@@ -446,6 +446,13 @@ impl Transaction {
     /// timestamp. Returns an error if the transaction was already committed.
     /// For serializable transactions, performs OCC conflict detection.
     pub fn commit(&self) -> Result<()> {
+        self.commit_with_native_preparation(None)
+    }
+
+    fn commit_with_native_preparation(
+        &self,
+        preparation: Option<tokio::sync::OwnedSemaphorePermit>,
+    ) -> Result<()> {
         {
             // A mutation that passed its committed check must finish both its
             // local write and OCC metadata before this owner can claim inputs.
@@ -546,11 +553,14 @@ impl Transaction {
                             self.inner.try_freeze_memtable()?;
                             return Ok(());
                         }
-                        Err(error) if crate::wal::Wal::is_retryable_full_error(&error) => {
+                        Err(error)
+                            if crate::wal::Wal::is_retryable_full_error(&error)
+                                || crate::wal::Wal::is_v7_capacity_retry_error(&error) =>
+                        {
                             drop(_commit_guard);
                             #[cfg(all(test, feature = "chaos-testing"))]
                             crate::chaos::failpoint::before_parallel_wal_transaction_rotation();
-                            if let Err(rotation_error) = self.inner.retry_after_wal_full(
+                            if let Err(rotation_error) = self.inner.retry_after_capacity_error(
                                 error,
                                 &expected_memtable,
                                 &mut retries,
@@ -570,7 +580,10 @@ impl Transaction {
             .iter()
             .map(|(k, v, t)| (k.clone(), v.clone(), *t))
             .collect();
-        if let Err(e) = self.inner.mvcc_write_batch(&owned) {
+        if let Err(e) = self
+            .inner
+            .mvcc_write_batch_with_native_preparation(&owned, preparation)
+        {
             // Revert committed flag so caller can retry.
             self.committed
                 .store(false, std::sync::atomic::Ordering::SeqCst);
@@ -606,7 +619,32 @@ impl Transaction {
         };
         let blocking = self.blocking.clone();
 
-        async move { blocking.run_result(move || owned.commit()).await }
+        async move {
+            let uses_native_v7 = !owned.inner.options.serializable && {
+                let state = owned.inner.state.load();
+                state.memtable.uses_v7_wal() && state.memtable.uses_parallel_wal()
+            };
+            let preparation = if uses_native_v7 {
+                // Wait before dispatch: a queued native preparer can hold a
+                // memtable lease and need this same worker to finish admission.
+                // V7 remains the Active format for this process; after admission
+                // its maintenance hook does not take an exclusive memtable gate.
+                Some(
+                    owned
+                        .inner
+                        .mvcc
+                        .as_ref()
+                        .expect("v7 transactions require MVCC")
+                        .native_preparation_permit()
+                        .await?,
+                )
+            } else {
+                None
+            };
+            blocking
+                .run_result(move || owned.commit_with_native_preparation(preparation))
+                .await
+        }
     }
 }
 

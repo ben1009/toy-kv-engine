@@ -12321,15 +12321,26 @@ impl LsmStorageInner {
         &self,
         entries: &[(bytes::Bytes, bytes::Bytes, crate::mvcc::BatchEntryKind)],
     ) -> Result<()> {
+        self.mvcc_write_batch_with_native_preparation(entries, None)
+    }
+
+    /// Async v7 transactions acquire this permit before worker dispatch. Keep
+    /// it through capacity rotation, then release at admission so queued native
+    /// writers cannot pin the source while waiting for the same blocking worker.
+    pub(crate) fn mvcc_write_batch_with_native_preparation(
+        &self,
+        entries: &[(bytes::Bytes, bytes::Bytes, crate::mvcc::BatchEntryKind)],
+        mut preparation: Option<tokio::sync::OwnedSemaphorePermit>,
+    ) -> Result<()> {
         let mvcc = self.mvcc.as_ref().expect("mvcc_write_batch requires MVCC");
         let mut retries = 0;
         loop {
             let expected_memtable = self.state.load().memtable.clone();
-            let result = self.mvcc_write_batch_attempt(entries, mvcc);
+            let result = self.mvcc_write_batch_attempt(entries, mvcc, &mut preparation);
             match result {
                 Ok(()) => break,
                 Err(error) => {
-                    self.retry_after_wal_full(error, &expected_memtable, &mut retries)?;
+                    self.retry_after_capacity_error(error, &expected_memtable, &mut retries)?;
                 }
             }
         }
@@ -12342,6 +12353,7 @@ impl LsmStorageInner {
         &self,
         entries: &[(bytes::Bytes, bytes::Bytes, crate::mvcc::BatchEntryKind)],
         mvcc: &crate::mvcc::LsmMvccInner,
+        preparation: &mut Option<tokio::sync::OwnedSemaphorePermit>,
     ) -> Result<()> {
         let _read_guard = self.active_memtable_lock.read();
         let state = self.state.load();
@@ -12351,6 +12363,9 @@ impl LsmStorageInner {
             Self::use_owned_batch_publish(entries.len()),
         )?;
         let memtable = state.memtable.clone();
+        // Admission succeeded, so this attempt cannot rotate. Let subsequent
+        // preparers proceed while the WAL's own worker handles durability.
+        drop(preparation.take());
         Self::commit_wal_ticket_or_poison(&memtable, ticket, self.mvcc.as_deref(), commit_ts)?;
         if !data.is_empty() {
             Self::publish_deferred_batch_or_poison(&memtable, data, mvcc, commit_ts)?;
@@ -14070,9 +14085,9 @@ impl LsmStorageInner {
 
     /// Native async point and range writers keep their exclusive preparation
     /// permit while this blocking rotation runs, so queued preparers cannot
-    /// acquire active-memtable leases ahead of the freeze. Transaction retry
-    /// routing remains separate.
-    fn retry_after_capacity_error(
+    /// acquire active-memtable leases ahead of the freeze. Transactions call
+    /// this after releasing any OCC commit lock and revalidate before retry.
+    pub(crate) fn retry_after_capacity_error(
         &self,
         error: anyhow::Error,
         expected_memtable: &Arc<MemTable>,
@@ -20586,12 +20601,175 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
-    #[test]
-    fn v7_async_transaction_capacity_error_preserves_active_segment() -> anyhow::Result<()> {
+    fn v7_transaction_capacity_retry_succeeds(
+        serializable: bool,
+        async_commit: bool,
+    ) -> anyhow::Result<()> {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .max_blocking_threads(1)
             .enable_all()
             .build()?;
+        let directory = tempdir()?;
+        let mut options =
+            v7_recovery_test_database_with_segment_limit(directory.path(), 32 * 1024)?;
+        options.serializable = serializable;
+        let database = directory.path().join("db");
+        let engine = KvEngine::open_with_wal_io_mode(
+            &database,
+            options.clone(),
+            crate::wal::WalIoMode::Parallel,
+        )?;
+        engine.put(b"fill-one", b"value")?;
+        engine.put(b"fill-two", b"value")?;
+        let source = engine.inner.state.load().memtable.clone();
+        let source_batches = source.wal_batch_count();
+        let source_segment = LsmStorageInner::pitr_segment_of(&source).unwrap();
+        let transaction = Arc::try_unwrap(engine.new_txn()?)
+            .unwrap_or_else(|_| panic!("transaction should have a unique owner"));
+        transaction.put(b"deferred-transaction", b"value")?;
+        if async_commit {
+            runtime.block_on(transaction.commit_async())?;
+        } else {
+            transaction.commit()?;
+        }
+
+        let successor = engine.inner.state.load().memtable.clone();
+        assert!(!Arc::ptr_eq(&successor, &source));
+        assert_eq!(
+            engine.pitr_manifest_state.lock().active_segment_id,
+            Some(source_segment + 1)
+        );
+        assert_eq!(source.wal_batch_count(), source_batches);
+        assert_eq!(successor.wal_batch_count(), Some(1));
+        assert_eq!(
+            engine.get(b"deferred-transaction")?,
+            Some(Bytes::from_static(b"value"))
+        );
+        engine.close_storage()?;
+        drop(source);
+        drop(engine);
+
+        let reopened =
+            KvEngine::open_with_wal_io_mode(&database, options, crate::wal::WalIoMode::Parallel)?;
+        assert_eq!(
+            reopened.get(b"deferred-transaction")?,
+            Some(Bytes::from_static(b"value"))
+        );
+        reopened.close_storage()?;
+
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn v7_transactions_retry_capacity_by_rotating_active_segment() -> anyhow::Result<()> {
+        v7_transaction_capacity_retry_succeeds(false, false)?;
+        v7_transaction_capacity_retry_succeeds(true, true)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn v7_async_transaction_capacity_retry_allows_queued_native_write() -> anyhow::Result<()> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()?;
+        let directory = tempdir()?;
+        let options = v7_recovery_test_database_with_segment_limit(directory.path(), 32 * 1024)?;
+        let database = directory.path().join("db");
+        let engine = KvEngine::open_with_wal_io_mode(
+            &database,
+            options.clone(),
+            crate::wal::WalIoMode::Parallel,
+        )?;
+        engine.put(b"fill-one", b"value")?;
+        engine.put(b"fill-two", b"value")?;
+        let source = engine.inner.state.load().memtable.clone();
+        let transaction = engine.new_txn()?;
+        transaction.put(b"deferred-transaction", b"value")?;
+        let commit = transaction.commit_async();
+        drop(transaction);
+
+        runtime.block_on(async {
+            // Queue the commit before the native writer on the sole worker.
+            // The worker stays occupied until both futures have been polled.
+            let (entered, started) = tokio::sync::oneshot::channel();
+            let (release, wait) = std::sync::mpsc::channel();
+            let worker = tokio::task::spawn_blocking(move || {
+                let _ = entered.send(());
+                let _ = wait.recv();
+            });
+            started.await?;
+            let mut commit = Box::pin(commit);
+            std::future::poll_fn(|context| {
+                assert!(commit.as_mut().poll(context).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+
+            let blocked_slots = engine.inner.blocking.hold_all_slots_for_test();
+            let queued_inner = Arc::clone(&engine.inner);
+            let queued_admission = queued_inner.lifecycle.admit_write()?;
+            let mut queued = Box::pin(async move {
+                queued_inner
+                    .write_entries_native(
+                        vec![(
+                            Bytes::from_static(b"queued-native-write"),
+                            Bytes::from_static(b"value"),
+                            crate::mvcc::BatchEntryKind::PutRaw,
+                        )],
+                        false,
+                        queued_admission,
+                    )
+                    .await
+            });
+            std::future::poll_fn(|context| {
+                assert!(queued.as_mut().poll(context).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+            let source_is_unleased = engine.inner.active_memtable_lock.try_write().is_some();
+            drop(blocked_slots);
+            release.send(())?;
+            if !source_is_unleased {
+                // Drop the queued lease before awaiting the commit so a failed
+                // regression does not leave a deadlocked blocking worker.
+                drop(queued);
+                commit.await?;
+                worker.await?;
+                anyhow::bail!(
+                    "queued native writer leased the source ahead of transaction rotation"
+                );
+            }
+
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                let (commit_result, queued_result) = tokio::join!(commit, queued);
+                commit_result?;
+                queued_result?;
+                Ok::<_, anyhow::Error>(())
+            })
+            .await
+            .expect("transaction rotation and queued native write must finish on one worker")?;
+            worker.await?;
+            Ok::<_, anyhow::Error>(())
+        })?;
+        assert!(!Arc::ptr_eq(&engine.inner.state.load().memtable, &source));
+        engine.close_storage()?;
+        drop(source);
+        drop(engine);
+
+        let reopened =
+            KvEngine::open_with_wal_io_mode(&database, options, crate::wal::WalIoMode::Parallel)?;
+        for key in [b"deferred-transaction".as_slice(), b"queued-native-write"] {
+            assert_eq!(reopened.get(key)?, Some(Bytes::from_static(b"value")));
+        }
+        reopened.close_storage()?;
+
+        Ok(())
+    }
+
+    #[cfg(all(target_os = "linux", feature = "chaos-testing"))]
+    fn v7_transaction_capacity_rotation_reruns_occ(async_commit: bool) -> anyhow::Result<()> {
         let directory = tempdir()?;
         let mut options =
             v7_recovery_test_database_with_segment_limit(directory.path(), 32 * 1024)?;
@@ -20602,51 +20780,71 @@ mod tests {
             options.clone(),
             crate::wal::WalIoMode::Parallel,
         )?;
-        engine.put(b"fill-one", b"value")?;
+        engine.put(b"conflict", b"initial")?;
         engine.put(b"fill-two", b"value")?;
         let source = engine.inner.state.load().memtable.clone();
-        let source_segment = LsmStorageInner::pitr_segment_of(&source).unwrap();
-        let source_frontier = source.v7_frontier_cursor()?;
+        let source_batches = source.wal_batch_count();
 
-        runtime.block_on(async {
-            let transaction = engine.new_txn()?;
-            transaction.put(b"deferred-transaction", b"value")?;
-            let error = transaction
-                .commit_async()
-                .await
-                .expect_err("v7 async transaction capacity retry remains deferred");
-            assert_eq!(
-                error.downcast_ref::<crate::wal::v7::leader::WalV7LeaderCapacityError>(),
-                Some(&crate::wal::v7::leader::WalV7LeaderCapacityError::RotationRequired),
-                "unexpected capacity error: {error:#}"
-            );
-            assert!(Arc::ptr_eq(&engine.inner.state.load().memtable, &source));
-            assert_eq!(source.v7_frontier_cursor()?, source_frontier);
-            Ok::<_, anyhow::Error>(())
-        })?;
-        assert_eq!(engine.get(b"deferred-transaction")?, None);
-
-        // The failed attempt retires its timestamp without poisoning the
-        // sequencer, so a supported synchronous point retry can rotate.
-        engine.put(b"after-deferred-error", b"durable")?;
+        let transaction = Arc::try_unwrap(engine.new_txn()?)
+            .unwrap_or_else(|_| panic!("transaction should have a unique owner"));
         assert_eq!(
-            engine.pitr_manifest_state.lock().active_segment_id,
-            Some(source_segment + 1)
+            transaction.get(b"conflict")?,
+            Some(Bytes::from_static(b"initial"))
         );
+        transaction.put(b"deferred-transaction", b"value")?;
+        let rotation_gate = crate::chaos::failpoint::arm_parallel_wal_txn_rotation_gate();
+        let commit = std::thread::spawn(move || {
+            if async_commit {
+                crate::future_ext::block_on(transaction.commit_async())
+            } else {
+                transaction.commit()
+            }
+        });
+        assert!(rotation_gate.wait_until_entered(std::time::Duration::from_secs(10)));
+
+        engine.put(b"conflict", b"replacement")?;
+        let successor = engine.inner.state.load().memtable.clone();
+        assert!(!Arc::ptr_eq(&successor, &source));
+        assert_eq!(source.wal_batch_count(), source_batches);
+        assert_eq!(successor.wal_batch_count(), Some(1));
+
+        rotation_gate.release();
+        let error = commit
+            .join()
+            .expect("transaction commit thread joins")
+            .expect_err("the retried transaction must detect the newer conflicting write");
+        assert!(
+            error.to_string().contains("serializable conflict"),
+            "unexpected transaction error: {error:#}"
+        );
+        assert_eq!(successor.wal_batch_count(), Some(1));
+        assert_eq!(engine.get(b"deferred-transaction")?, None);
+        assert_eq!(
+            engine.get(b"conflict")?,
+            Some(Bytes::from_static(b"replacement"))
+        );
+
         engine.close_storage()?;
         drop(source);
+        drop(successor);
         drop(engine);
-
         let reopened =
             KvEngine::open_with_wal_io_mode(&database, options, crate::wal::WalIoMode::Parallel)?;
-        assert_eq!(
-            reopened.get(b"after-deferred-error")?,
-            Some(Bytes::from_static(b"durable"))
-        );
         assert_eq!(reopened.get(b"deferred-transaction")?, None);
+        assert_eq!(
+            reopened.get(b"conflict")?,
+            Some(Bytes::from_static(b"replacement"))
+        );
         reopened.close_storage()?;
 
         Ok(())
+    }
+
+    #[cfg(all(target_os = "linux", feature = "chaos-testing"))]
+    #[test]
+    fn failpoint_v7_transaction_capacity_rotation_reruns_occ() -> anyhow::Result<()> {
+        v7_transaction_capacity_rotation_reruns_occ(false)?;
+        v7_transaction_capacity_rotation_reruns_occ(true)
     }
 
     #[cfg(target_os = "linux")]
