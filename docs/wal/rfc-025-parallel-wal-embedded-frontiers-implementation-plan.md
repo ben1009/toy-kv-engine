@@ -54,9 +54,12 @@ competing conflicting write during rotation. Nonserializable v7 Parallel async
 transactions acquire the native preparation permit before worker dispatch and
 retain it through capacity rotation, then release it after admission. A regression
 queues a native point writer behind such a transaction on one blocking worker
-and verifies successor retry and reopen durability. Proactive target/interval rotation,
-simultaneous capacity retries, cancellation during retry, and global spool
-backpressure remain pending.
+and verifies successor retry and reopen durability. A synchronized failpoint
+test also makes two synchronous Parallel writers reject the same full Active
+segment before either enters the lifecycle boundary lock; they share one
+successor rotation and both writes survive reopen. Proactive target/interval
+rotation, cancellation during retry, and global spool backpressure remain
+pending.
 Public close drains and syncs
 the Active v7 WAL for recovery without emitting a final recovery point. It stops
 and drains MVCC commit admission, persists the latest synced logical boundary in
@@ -1009,9 +1012,11 @@ remain in later stage 5/6 work.
   both writes finish against the successor and survive reopen.
   A test-only ledger limit override now forces `SealIndexLimit` through the real
   Parallel reservation path for `put_async` on a nonempty Active segment; the
-  retry rotates, succeeds against the successor, and survives reopen. Simultaneous
-  capacity rejections, cancelled retries, and distinct global backpressure and
-  oversize outcomes remain outstanding.
+  retry rotates, succeeds against the successor, and survives reopen. A
+  synchronized failpoint test forces two synchronous Parallel writers to
+  reject the same full Active segment before rotation; stale-source retries
+  share one successor and both writes survive reopen. Cancelled retries and
+  distinct global backpressure and oversize outcomes remain outstanding.
 - Extend `PitrManifestRecord::SealStarted`, its obligation state, replay, and
   snapshot validation with the versioned immutable boundary. Persist Active
   references using only logical anchors. Allocation-only timestamp watermarks
