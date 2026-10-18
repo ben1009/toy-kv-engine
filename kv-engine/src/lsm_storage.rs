@@ -14062,9 +14062,10 @@ impl LsmStorageInner {
         self.rotate_after_wal_full(error, expected_memtable, retries)
     }
 
-    /// V7 rotation is currently enabled only for direct synchronous point
-    /// writes. Native async and transaction retries must first coordinate
-    /// queued preparers without occupying their blocking executor.
+    /// Native async point writers keep their exclusive preparation permit
+    /// while this blocking rotation runs, so queued preparers cannot acquire
+    /// active-memtable leases ahead of the freeze. Transaction retry routing
+    /// remains separate.
     fn retry_after_point_wal_full(
         &self,
         error: anyhow::Error,
@@ -16145,6 +16146,7 @@ mod tests {
     use bytes::Bytes;
     use rand::{RngCore, SeedableRng, rngs::StdRng};
     use std::{
+        future::Future as _,
         num::{NonZeroU64, NonZeroUsize},
         sync::Arc,
     };
@@ -20253,7 +20255,125 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn v7_async_capacity_errors_preserve_active_segment() -> anyhow::Result<()> {
+    fn v7_native_async_point_writes_retry_after_segment_capacity_rotation() -> anyhow::Result<()> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()?;
+        let directory = tempdir()?;
+        let options = v7_recovery_test_database_with_segment_limit(directory.path(), 32 * 1024)?;
+        let database = directory.path().join("db");
+        let engine = KvEngine::open_with_wal_io_mode(
+            &database,
+            options.clone(),
+            crate::wal::WalIoMode::Parallel,
+        )?;
+        let initial_segment_id = engine
+            .pitr_manifest_state
+            .lock()
+            .active_segment_id
+            .expect("v7 Active segment is installed");
+
+        engine.put(b"fill-one", b"value")?;
+        engine.put(b"fill-two", b"value")?;
+        assert_eq!(
+            engine.pitr_manifest_state.lock().active_segment_id,
+            Some(initial_segment_id)
+        );
+        let frontier = engine.inner.state.load().memtable.v7_frontier_cursor()?;
+        let frame_len = crate::wal::v7::codec::WAL_V7_FRAME_LEN as u64;
+        let physical_end = frontier.frame_offset + frame_len;
+        assert!(physical_end <= 32 * 1024);
+        assert!(physical_end + 2 * frame_len > 32 * 1024);
+
+        runtime.block_on(async {
+            let pause = crate::lsm_storage::native_write::NativeWritePause::new(
+                crate::lsm_storage::native_write::NativeWriteStage::CapacityRetry,
+            );
+            *engine.inner.native_write_pause.lock() = Some(Arc::clone(&pause));
+            let first_engine = Arc::clone(&engine);
+            let first =
+                tokio::spawn(
+                    async move { first_engine.put_async(b"retry-async-put", b"value").await },
+                );
+            tokio::time::timeout(std::time::Duration::from_secs(5), pause.reached.notified())
+                .await
+                .expect("first point writer must reach the capacity retry before rotation");
+
+            let blocked_slots = engine.inner.blocking.hold_all_slots_for_test();
+            let queued_inner = Arc::clone(&engine.inner);
+            let queued_admission = queued_inner.lifecycle.admit_write()?;
+            // Poll the native future itself: put_async spawns an owned task.
+            // Held blocking slots expose any prematurely acquired memtable lease.
+            let mut queued = Box::pin(async move {
+                queued_inner
+                    .write_entries_native(
+                        vec![(
+                            Bytes::from_static(b"queued-async-put"),
+                            Bytes::from_static(b"value"),
+                            crate::mvcc::BatchEntryKind::PutRaw,
+                        )],
+                        false,
+                        queued_admission,
+                    )
+                    .await
+            });
+            std::future::poll_fn(|context| {
+                assert!(queued.as_mut().poll(context).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+            assert!(
+                engine.inner.active_memtable_lock.try_write().is_some(),
+                "queued native preparation must not hold an active-memtable lease"
+            );
+            drop(blocked_slots);
+            pause.release.notify_one();
+
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                let (first_result, queued_result) = tokio::join!(first, queued);
+                first_result??;
+                queued_result?;
+                Ok::<_, anyhow::Error>(())
+            })
+            .await
+            .expect("queued native async point retry must finish with one blocking worker")?;
+            Ok::<_, anyhow::Error>(())
+        })?;
+        assert_eq!(
+            engine.pitr_manifest_state.lock().active_segment_id,
+            Some(initial_segment_id + 1)
+        );
+
+        engine.close_storage()?;
+        drop(engine);
+
+        let reopened =
+            KvEngine::open_with_wal_io_mode(&database, options, crate::wal::WalIoMode::Parallel)?;
+        assert_eq!(
+            reopened.get(b"fill-one")?,
+            Some(Bytes::from_static(b"value"))
+        );
+        assert_eq!(
+            reopened.get(b"fill-two")?,
+            Some(Bytes::from_static(b"value"))
+        );
+        assert_eq!(
+            reopened.get(b"retry-async-put")?,
+            Some(Bytes::from_static(b"value"))
+        );
+        assert_eq!(
+            reopened.get(b"queued-async-put")?,
+            Some(Bytes::from_static(b"value"))
+        );
+        reopened.close_storage()?;
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn v7_async_range_and_transaction_capacity_errors_preserve_active_segment() -> anyhow::Result<()>
+    {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .max_blocking_threads(1)
             .enable_all()
@@ -20278,6 +20398,12 @@ mod tests {
             runtime.block_on(async {
                 tokio::time::timeout(std::time::Duration::from_secs(5), async {
                     for operation in 0..3 {
+                        // Native async point writes now rotate and retry. Keep
+                        // this test focused on range and transaction paths,
+                        // whose v7 capacity retries remain unsupported.
+                        if !serializable && operation == 0 {
+                            continue;
+                        }
                         if serializable && operation != 2 {
                             continue;
                         }

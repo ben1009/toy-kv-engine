@@ -35,9 +35,11 @@ The ordinary memtable size target does not freeze the
 Active v7 memtable. Synchronous public point writes now retry pre-ticket v7
 segment-capacity rejections by sealing, archiving, and rotating through the
 durable recovery-point path; Leader and Parallel modes share this bounded
-retry, with regression coverage at an exact segment boundary. Native async and
-transaction capacity retries, proactive target/interval rotation, and global
-spool backpressure remain pending. Public close drains and syncs
+retry, with regression coverage at an exact segment boundary. Native async v7
+Parallel point writes now retain the exclusive preparation permit while their
+blocking rotation runs, then retry against the installed successor. Native
+range and transaction capacity retries, proactive target/interval rotation,
+and global spool backpressure remain pending. Public close drains and syncs
 the Active v7 WAL for recovery without emitting a final recovery point. It stops
 and drains MVCC commit admission, persists the latest synced logical boundary in
 the PITR manifest, and a concurrent resume cannot reopen admission after close
@@ -412,7 +414,7 @@ v6 to v7 transition remain unconnected. Active v7 reservation owners and their
 shared ledger are retained through durable source cleanup and then retired from
 segment bookkeeping.
 
-**Last updated:** 2026-10-17
+**Last updated:** 2026-10-18
 
 **Source baseline:** `30a64fa855126596316ab6b9237e6348b0e41fd2`, which merged RFC 025 in PR #379.
 
@@ -967,13 +969,15 @@ remain in later stage 5/6 work.
   rejection to the durable v7 sealing/archive/successor path and retry against
   the successor in Leader and Parallel modes. Exact-segment-boundary regression
   coverage exercises `put`, point `write_batch`, and `delete`, including reopen.
-  Native async and transaction capacity retries remain deferred: their shared
-  v4 retry classifier does not opt into v7 rotation. Rotating on the async
-  blocking pool must first quiesce queued preparers without occupying the worker
-  those preparers need. Regression coverage verifies that native point/range
-  writes and async transactions return v7 capacity errors without rotating on a
-  runtime with one blocking worker. Seal-index exhaustion through real engine
-  APIs, concurrent/cancelled retries, OCC revalidation, and distinct global
+  Native async v7 Parallel point retries now keep the sole preparation permit
+  through the blocking rotation, leaving queued preparers without active
+  memtable leases while the exclusive freeze runs. Native range and transaction
+  capacity retries remain deferred. A one-blocking-worker regression now queues
+  concurrent native async point writes at the segment boundary and checks
+  rotation, retries, and reopen durability; a separate existing regression
+  continues to cover range and transaction no-rotation errors.
+  Seal-index exhaustion through real engine APIs, simultaneous capacity
+  rejections, cancelled retries, OCC revalidation, and distinct global
   backpressure and oversize outcomes remain outstanding.
 - Extend `PitrManifestRecord::SealStarted`, its obligation state, replay, and
   snapshot validation with the versioned immutable boundary. Persist Active
