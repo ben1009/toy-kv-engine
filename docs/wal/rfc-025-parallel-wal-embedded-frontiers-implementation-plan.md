@@ -41,8 +41,14 @@ blocking rotation runs, then retry against the installed successor. Native
 async Parallel point writes also have a public API regression for a seal-index
 reservation rejection on a nonempty Active WAL; the test restores the configured
 limit before rotation and verifies successor retry and reopen durability. Native
-range and transaction capacity retries, proactive target/interval rotation,
-and global spool backpressure remain pending. Public close drains and syncs
+async v7 Parallel range deletes now retry capacity rejections through the same
+sealing and successor rotation while retaining the exclusive preparation permit.
+A one-blocking-worker regression verifies queued point writers cannot lease the
+source during rotation and confirms range deletion and reopen durability. Native
+seal and successor-verification buffers have protected ledger headroom separate
+from ordinary batch/range buffers. Native transaction capacity retries,
+proactive target/interval rotation, and global spool backpressure remain pending.
+Public close drains and syncs
 the Active v7 WAL for recovery without emitting a final recovery point. It stops
 and drains MVCC commit admission, persists the latest synced logical boundary in
 the PITR manifest, and a concurrent resume cannot reopen admission after close
@@ -291,8 +297,9 @@ fit a fresh segment return `RotationRequired`, while batches that cannot fit any
 legal segment return `BatchTooLarge`; shared-ledger failures retain their distinct
 reservation errors. Point-write retry and rotation are now wired in Stage 6, with
 public API coverage for physical segment capacity and Parallel seal-index
-reservation errors. Range and transaction retries plus broader shared-ledger
-pressure handling remain outstanding. Stage 5 has
+reservation errors. Native async range retries are now wired through rotation
+and covered for queued-writer exclusion and reopen durability. Native transaction
+retries and broader shared-ledger pressure handling remain outstanding. Stage 5 has
 started with recovered-runtime cursor bootstrap: an installed Active image
 supplies the v7 DATA start, append offset, and next ticket. The shared runtime
 seeds its admission, packer, and durability coordinates from that state. The seed now
@@ -977,11 +984,11 @@ remain in later stage 5/6 work.
   coverage exercises `put`, point `write_batch`, and `delete`, including reopen.
   Native async v7 Parallel point retries now keep the sole preparation permit
   through the blocking rotation, leaving queued preparers without active
-  memtable leases while the exclusive freeze runs. Native range and transaction
-  capacity retries remain deferred. A one-blocking-worker regression now queues
-  concurrent native async point writes at the segment boundary and checks
-  rotation, retries, and reopen durability; a separate existing regression
-  continues to cover range and transaction no-rotation errors.
+  memtable leases while the exclusive freeze runs. Native async v7 Parallel
+  range retries now retain that permit through rotation as well. One-blocking-
+  worker regressions queue point writers during point and range capacity retries,
+  then verify successor writes and reopen durability. Native transaction capacity
+  retries remain deferred and retain their no-rotation error coverage.
   A test-only ledger limit override now forces `SealIndexLimit` through the real
   Parallel reservation path for `put_async` on a nonempty Active segment; the
   retry rotates, succeeds against the successor, and survives reopen. Simultaneous

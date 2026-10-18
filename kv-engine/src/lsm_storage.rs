@@ -8793,10 +8793,13 @@ impl LsmStorageInner {
         let max_segment_bytes = config.max_segment_bytes;
         let max_seal_preparation_memory_bytes =
             crate::pitr::seal::V7Seal::max_preparation_memory_bytes(max_segment_bytes)?;
-        let max_buffer_memory_bytes = max_segment_bytes
+        let ordinary_buffer_memory_bytes = max_segment_bytes
             .checked_mul(2)
             .ok_or_else(|| anyhow!("v7 buffer-memory limit overflows"))?
             .max(max_seal_preparation_memory_bytes);
+        let max_buffer_memory_bytes = ordinary_buffer_memory_bytes
+            .checked_add(max_seal_preparation_memory_bytes)
+            .ok_or_else(|| anyhow!("v7 maintenance buffer-memory limit overflows"))?;
         // A coalesced group can share one terminal FRONTIER across every
         // one-frame DATA batch. Reserve the index for that physical maximum:
         // header + generation zero + DATA frames + one terminal FRONTIER.
@@ -8808,13 +8811,16 @@ impl LsmStorageInner {
             .unwrap_or_default()
             .checked_mul(std::mem::size_of::<u64>() as u64)
             .ok_or_else(|| anyhow!("v7 seal-index limit overflows"))?;
-        let ledger = WalV7ResourceLedger::new(WalV7ResourceLimits {
-            max_logical_wal_bytes: config.max_unarchived_bytes,
-            max_source_spool_bytes: config.max_source_spool_bytes,
-            max_recovery_workspace_bytes: max_segment_bytes,
-            max_buffer_memory_bytes,
-            max_seal_index_bytes,
-        })?;
+        let ledger = WalV7ResourceLedger::new_with_maintenance_buffer_reserve(
+            WalV7ResourceLimits {
+                max_logical_wal_bytes: config.max_unarchived_bytes,
+                max_source_spool_bytes: config.max_source_spool_bytes,
+                max_recovery_workspace_bytes: max_segment_bytes,
+                max_buffer_memory_bytes,
+                max_seal_index_bytes,
+            },
+            max_seal_preparation_memory_bytes,
+        )?;
         let retained = WalV7RetainedResources::new(ledger.clone());
 
         // Restore durable logical obligations before reserving the Active WAL.
@@ -13802,7 +13808,7 @@ impl LsmStorageInner {
                 match self.write_point_batch_once(batch, delete_only) {
                     Ok(()) => break,
                     Err(error) => {
-                        self.retry_after_point_wal_full(error, &expected_memtable, &mut retries)?;
+                        self.retry_after_capacity_error(error, &expected_memtable, &mut retries)?;
                     }
                 }
             }
@@ -14062,11 +14068,11 @@ impl LsmStorageInner {
         self.rotate_after_wal_full(error, expected_memtable, retries)
     }
 
-    /// Native async point writers keep their exclusive preparation permit
-    /// while this blocking rotation runs, so queued preparers cannot acquire
-    /// active-memtable leases ahead of the freeze. Transaction retry routing
-    /// remains separate.
-    fn retry_after_point_wal_full(
+    /// Native async point and range writers keep their exclusive preparation
+    /// permit while this blocking rotation runs, so queued preparers cannot
+    /// acquire active-memtable leases ahead of the freeze. Transaction retry
+    /// routing remains separate.
+    fn retry_after_capacity_error(
         &self,
         error: anyhow::Error,
         expected_memtable: &Arc<MemTable>,
@@ -14213,7 +14219,7 @@ impl LsmStorageInner {
             match self.put_once(key, value) {
                 Ok(()) => return Ok(()),
                 Err(error) => {
-                    self.retry_after_point_wal_full(error, &expected_memtable, &mut retries)?;
+                    self.retry_after_capacity_error(error, &expected_memtable, &mut retries)?;
                 }
             }
         }
@@ -14315,7 +14321,7 @@ impl LsmStorageInner {
             match self.put_with_ttl_once(key, value, ttl) {
                 Ok(()) => return Ok(()),
                 Err(error) => {
-                    self.retry_after_point_wal_full(error, &expected_memtable, &mut retries)?;
+                    self.retry_after_capacity_error(error, &expected_memtable, &mut retries)?;
                 }
             }
         }
@@ -14410,7 +14416,7 @@ impl LsmStorageInner {
             match self.delete_once(key) {
                 Ok(()) => return Ok(()),
                 Err(error) => {
-                    self.retry_after_point_wal_full(error, &expected_memtable, &mut retries)?;
+                    self.retry_after_capacity_error(error, &expected_memtable, &mut retries)?;
                 }
             }
         }
@@ -15299,7 +15305,12 @@ impl LsmStorageInner {
             // temporary memory has retired. Keep its own reservation until all
             // rebuilt seal and verification buffers have been dropped.
             let _verification_reservation = current_owner
-                .reserve_preparation_buffer(verification_memory)?
+                .reserve_maintenance_preparation_resources(
+                    crate::wal::v7::admission::WalV7ResourceCharge {
+                        buffer_memory_bytes: verification_memory,
+                        ..crate::wal::v7::admission::WalV7ResourceCharge::default()
+                    },
+                )?
                 .ok_or_else(|| anyhow!("v7 successor verification reservation is empty"))?;
             let mut installed_seal = File::open(&seal_path)
                 .with_context(|| format!("open v7 predecessor seal {}", seal_path.display()))?;
@@ -15645,11 +15656,13 @@ impl LsmStorageInner {
             active_boundary.ticket_end,
         )?;
         let seal_reservation = reservation_owner
-            .reserve_preparation_resources(crate::wal::v7::admission::WalV7ResourceCharge {
-                source_spool_bytes: source_spool_reservation,
-                buffer_memory_bytes: preparation_memory,
-                ..crate::wal::v7::admission::WalV7ResourceCharge::default()
-            })?
+            .reserve_maintenance_preparation_resources(
+                crate::wal::v7::admission::WalV7ResourceCharge {
+                    source_spool_bytes: source_spool_reservation,
+                    buffer_memory_bytes: preparation_memory,
+                    ..crate::wal::v7::admission::WalV7ResourceCharge::default()
+                },
+            )?
             .ok_or_else(|| anyhow!("v7 seal reservation was unexpectedly empty"))?;
 
         let mut wal = std::fs::OpenOptions::new()
@@ -19050,24 +19063,11 @@ mod tests {
         successor_header.incarnation[15] ^= 1;
         let successor_path = database.join(format!("pitr-{:020}.wal", state.next_segment_id));
         let state_lock = engine.inner.state_lock.lock();
-        let budget_error = engine
-            .inner
-            .install_pitr_v7_successor(
-                successor_header,
-                &state_lock,
-                Arc::clone(&retained_resources),
-            )
-            .err()
-            .ok_or_else(|| anyhow::anyhow!("successor verification bypassed its memory budget"))?;
-        assert_eq!(
-            budget_error.downcast_ref::<crate::wal::v7::admission::WalV7ReservationError>(),
-            Some(&crate::wal::v7::admission::WalV7ReservationError::BufferMemoryLimit)
-        );
-        assert!(!successor_path.exists());
-        drop(memory_blocker);
-        // The old source predecessor deliberately differs from the required
-        // sealed-segment anchor, so this verifies and drops all temporary
-        // buffers without creating or publishing a successor.
+        // Ordinary work has consumed its full budget, but verification must
+        // still be able to use the protected maintenance reserve. The old
+        // source predecessor deliberately differs from the required sealed
+        // segment anchor, so this attempt reaches that validation without
+        // creating or publishing a successor.
         let predecessor_error = engine
             .inner
             .install_pitr_v7_successor(
@@ -19082,8 +19082,9 @@ mod tests {
                 .to_string()
                 .contains("successor predecessor differs")
         );
-        assert_eq!(reservation_owner.snapshot(), installed_resources);
         assert!(!successor_path.exists());
+        drop(memory_blocker);
+        assert_eq!(reservation_owner.snapshot(), installed_resources);
         drop(state_lock);
         let (metadata, loaded_wal_path, loaded_seal_path) =
             engine.load_pitr_source_segment(&sealing_state, segment_id)?;
@@ -20461,96 +20462,189 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn v7_async_range_and_transaction_capacity_errors_preserve_active_segment() -> anyhow::Result<()>
-    {
+    fn v7_native_async_range_writes_retry_after_segment_capacity_rotation() -> anyhow::Result<()> {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .max_blocking_threads(1)
             .enable_all()
             .build()?;
-        for serializable in [false, true] {
-            let directory = tempdir()?;
-            let mut options =
-                v7_recovery_test_database_with_segment_limit(directory.path(), 32 * 1024)?;
-            options.serializable = serializable;
-            let database = directory.path().join("db");
-            let engine = KvEngine::open_with_wal_io_mode(
-                &database,
-                options.clone(),
-                crate::wal::WalIoMode::Parallel,
-            )?;
-            engine.put(b"fill-one", b"value")?;
-            engine.put(b"fill-two", b"value")?;
-            let source = engine.inner.state.load().memtable.clone();
-            let source_segment = LsmStorageInner::pitr_segment_of(&source).unwrap();
-            let source_frontier = source.v7_frontier_cursor()?;
+        let directory = tempdir()?;
+        let options = v7_recovery_test_database_with_segment_limit(directory.path(), 32 * 1024)?;
+        let database = directory.path().join("db");
+        let engine = KvEngine::open_with_wal_io_mode(
+            &database,
+            options.clone(),
+            crate::wal::WalIoMode::Parallel,
+        )?;
+        let initial_segment_id = engine
+            .pitr_manifest_state
+            .lock()
+            .active_segment_id
+            .expect("v7 Active segment is installed");
 
-            runtime.block_on(async {
-                tokio::time::timeout(std::time::Duration::from_secs(5), async {
-                    for operation in 0..3 {
-                        // Native async point writes now rotate and retry. Keep
-                        // this test focused on range and transaction paths,
-                        // whose v7 capacity retries remain unsupported.
-                        if !serializable && operation == 0 {
-                            continue;
-                        }
-                        if serializable && operation != 2 {
-                            continue;
-                        }
-                        let error = match operation {
-                            0 => engine.put_async(b"deferred-point", b"value").await,
-                            1 => engine.delete_range_async(b"r", b"s").await,
-                            2 => {
-                                let transaction = engine.new_txn()?;
-                                transaction.put(b"deferred-transaction", b"value")?;
-                                transaction.commit_async().await
-                            }
-                            _ => unreachable!(),
-                        }
-                        .expect_err("v7 async capacity rotation is deferred");
-                        assert_eq!(
-                            error
-                                .downcast_ref::<crate::wal::v7::leader::WalV7LeaderCapacityError>(),
-                            Some(
-                                &crate::wal::v7::leader::WalV7LeaderCapacityError::RotationRequired
-                            ),
-                            "unexpected capacity error: {error:#}"
-                        );
-                        assert!(Arc::ptr_eq(&engine.inner.state.load().memtable, &source));
-                        assert_eq!(source.v7_frontier_cursor()?, source_frontier);
-                    }
+        engine.put(b"fill-one", b"value")?;
+        engine.put(b"fill-two", b"value")?;
+        assert_eq!(
+            engine.pitr_manifest_state.lock().active_segment_id,
+            Some(initial_segment_id)
+        );
+        assert_eq!(engine.get(b"v7-key")?, Some(Bytes::from_static(b"v")));
+        let source = engine.inner.state.load().memtable.clone();
+        let frontier = source.v7_frontier_cursor()?;
+        let frame_len = crate::wal::v7::codec::WAL_V7_FRAME_LEN as u64;
+        let physical_end = frontier.frame_offset + frame_len;
+        assert!(physical_end <= 32 * 1024);
+        assert!(physical_end + 2 * frame_len > 32 * 1024);
 
-                    Ok::<_, anyhow::Error>(())
-                })
+        runtime.block_on(async {
+            let pause = crate::lsm_storage::native_write::NativeWritePause::new(
+                crate::lsm_storage::native_write::NativeWriteStage::CapacityRetry,
+            );
+            *engine.inner.native_write_pause.lock() = Some(Arc::clone(&pause));
+            let range_engine = Arc::clone(&engine);
+            let range = tokio::spawn(async move {
+                range_engine
+                    .delete_range_async(b"v7-key", b"v7-key\xff")
+                    .await
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(5), pause.reached.notified())
                 .await
-                .expect("capacity errors must return with one blocking worker")
-            })?;
-            assert_eq!(engine.get(b"deferred-point")?, None);
-            assert_eq!(engine.get(b"deferred-transaction")?, None);
+                .expect("range writer must reach capacity retry before rotation");
 
-            // Failed attempts retire their timestamps without poisoning the
-            // sequencer, so a supported synchronous point retry can rotate.
-            engine.put(b"after-deferred-errors", b"durable")?;
-            assert_eq!(
-                engine.pitr_manifest_state.lock().active_segment_id,
-                Some(source_segment + 1)
+            let blocked_slots = engine.inner.blocking.hold_all_slots_for_test();
+            let queued_inner = Arc::clone(&engine.inner);
+            let queued_admission = queued_inner.lifecycle.admit_write()?;
+            // Poll the native future itself: public point writes spawn an owned
+            // task. Held blocking slots expose any premature active-memtable lease.
+            let mut queued = Box::pin(async move {
+                queued_inner
+                    .write_entries_native(
+                        vec![(
+                            Bytes::from_static(b"queued-after-range"),
+                            Bytes::from_static(b"value"),
+                            crate::mvcc::BatchEntryKind::PutRaw,
+                        )],
+                        false,
+                        queued_admission,
+                    )
+                    .await
+            });
+            std::future::poll_fn(|context| {
+                assert!(queued.as_mut().poll(context).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+            assert!(
+                engine.inner.active_memtable_lock.try_write().is_some(),
+                "queued native preparation must not hold an active-memtable lease"
             );
-            engine.close_storage()?;
-            drop(source);
-            drop(engine);
 
-            let reopened = KvEngine::open_with_wal_io_mode(
-                &database,
-                options,
-                crate::wal::WalIoMode::Parallel,
-            )?;
+            drop(blocked_slots);
+            pause.release.notify_one();
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                let (range_result, queued_result) = tokio::join!(range, queued);
+                range_result??;
+                queued_result?;
+                Ok::<_, anyhow::Error>(())
+            })
+            .await
+            .expect("range retry and queued writer must finish with one blocking worker")?;
+            Ok::<_, anyhow::Error>(())
+        })?;
+
+        assert_eq!(
+            engine.pitr_manifest_state.lock().active_segment_id,
+            Some(initial_segment_id + 1)
+        );
+        assert_eq!(engine.get(b"v7-key")?, None);
+        assert_eq!(
+            engine.get(b"queued-after-range")?,
+            Some(Bytes::from_static(b"value"))
+        );
+
+        engine.close_storage()?;
+        drop(source);
+        drop(engine);
+
+        let reopened =
+            KvEngine::open_with_wal_io_mode(&database, options, crate::wal::WalIoMode::Parallel)?;
+        assert_eq!(
+            reopened.get(b"fill-one")?,
+            Some(Bytes::from_static(b"value"))
+        );
+        assert_eq!(
+            reopened.get(b"fill-two")?,
+            Some(Bytes::from_static(b"value"))
+        );
+        assert_eq!(reopened.get(b"v7-key")?, None);
+        assert_eq!(
+            reopened.get(b"queued-after-range")?,
+            Some(Bytes::from_static(b"value"))
+        );
+        reopened.close_storage()?;
+
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn v7_async_transaction_capacity_error_preserves_active_segment() -> anyhow::Result<()> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()?;
+        let directory = tempdir()?;
+        let mut options =
+            v7_recovery_test_database_with_segment_limit(directory.path(), 32 * 1024)?;
+        options.serializable = true;
+        let database = directory.path().join("db");
+        let engine = KvEngine::open_with_wal_io_mode(
+            &database,
+            options.clone(),
+            crate::wal::WalIoMode::Parallel,
+        )?;
+        engine.put(b"fill-one", b"value")?;
+        engine.put(b"fill-two", b"value")?;
+        let source = engine.inner.state.load().memtable.clone();
+        let source_segment = LsmStorageInner::pitr_segment_of(&source).unwrap();
+        let source_frontier = source.v7_frontier_cursor()?;
+
+        runtime.block_on(async {
+            let transaction = engine.new_txn()?;
+            transaction.put(b"deferred-transaction", b"value")?;
+            let error = transaction
+                .commit_async()
+                .await
+                .expect_err("v7 async transaction capacity retry remains deferred");
             assert_eq!(
-                reopened.get(b"after-deferred-errors")?,
-                Some(Bytes::from_static(b"durable"))
+                error.downcast_ref::<crate::wal::v7::leader::WalV7LeaderCapacityError>(),
+                Some(&crate::wal::v7::leader::WalV7LeaderCapacityError::RotationRequired),
+                "unexpected capacity error: {error:#}"
             );
-            assert_eq!(reopened.get(b"deferred-point")?, None);
-            assert_eq!(reopened.get(b"deferred-transaction")?, None);
-            reopened.close_storage()?;
-        }
+            assert!(Arc::ptr_eq(&engine.inner.state.load().memtable, &source));
+            assert_eq!(source.v7_frontier_cursor()?, source_frontier);
+            Ok::<_, anyhow::Error>(())
+        })?;
+        assert_eq!(engine.get(b"deferred-transaction")?, None);
+
+        // The failed attempt retires its timestamp without poisoning the
+        // sequencer, so a supported synchronous point retry can rotate.
+        engine.put(b"after-deferred-error", b"durable")?;
+        assert_eq!(
+            engine.pitr_manifest_state.lock().active_segment_id,
+            Some(source_segment + 1)
+        );
+        engine.close_storage()?;
+        drop(source);
+        drop(engine);
+
+        let reopened =
+            KvEngine::open_with_wal_io_mode(&database, options, crate::wal::WalIoMode::Parallel)?;
+        assert_eq!(
+            reopened.get(b"after-deferred-error")?,
+            Some(Bytes::from_static(b"durable"))
+        );
+        assert_eq!(reopened.get(b"deferred-transaction")?, None);
+        reopened.close_storage()?;
 
         Ok(())
     }
@@ -20583,7 +20677,7 @@ mod tests {
         let retry = std::thread::spawn(move || {
             started_tx.send(()).expect("test receiver is alive");
             let mut retries = LsmStorageInner::MAX_WAL_FULL_ROTATION_RETRIES;
-            inner.retry_after_point_wal_full(
+            inner.retry_after_capacity_error(
                 anyhow::Error::new(
                     crate::wal::v7::admission::WalV7ReservationError::SealIndexLimit,
                 ),

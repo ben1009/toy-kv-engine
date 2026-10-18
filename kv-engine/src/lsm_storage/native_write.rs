@@ -176,7 +176,7 @@ impl LsmStorageInner {
                             // preparers without active-memtable leases while the
                             // exclusive freeze runs.
                             let _preparation = preparation;
-                            inner.retry_after_point_wal_full(error, &memtable, &mut retries)?;
+                            inner.retry_after_capacity_error(error, &memtable, &mut retries)?;
 
                             Ok::<_, anyhow::Error>(retries)
                         })
@@ -308,22 +308,32 @@ impl LsmStorageInner {
             ranges = returned_ranges;
             range_preparation_reservation = returned_reservation;
             drop(returned_admission);
-            drop(preparation);
             #[cfg(feature = "bench")]
             self.write_profile
                 .record_mvcc_wal_only_ns(started.elapsed().as_nanos() as u64);
 
             let (mut commit, timestamp, ticket) = match result {
-                Ok(Some(prepared)) => prepared,
+                Ok(Some(prepared)) => {
+                    drop(preparation);
+                    prepared
+                }
                 Ok(None) => {
+                    drop(preparation);
                     drop(lease);
                     tokio::task::yield_now().await;
                     continue;
                 }
                 Err(error) => {
                     drop(lease);
-                    if !crate::wal::Wal::is_retryable_full_error(&error) {
+                    let v7_capacity = crate::wal::Wal::is_v7_capacity_retry_error(&error);
+                    if !v7_capacity && !crate::wal::Wal::is_retryable_full_error(&error) {
+                        drop(preparation);
                         return Err(error);
+                    }
+                    #[cfg(test)]
+                    if v7_capacity {
+                        self.pause_native_write(NativeWriteStage::CapacityRetry, 0)
+                            .await;
                     }
                     let inner = Arc::clone(self);
                     let rotation_admission = Arc::clone(&admission);
@@ -331,7 +341,11 @@ impl LsmStorageInner {
                         .blocking
                         .run_result(move || {
                             let _admission = rotation_admission;
-                            inner.retry_after_wal_full(error, &memtable, &mut retries)?;
+                            // Keep the native preparation permit through rotation so
+                            // queued writers cannot lease the source memtable before
+                            // the exclusive freeze has installed its successor.
+                            let _preparation = preparation;
+                            inner.retry_after_capacity_error(error, &memtable, &mut retries)?;
                             Ok::<_, anyhow::Error>(retries)
                         })
                         .await?;
