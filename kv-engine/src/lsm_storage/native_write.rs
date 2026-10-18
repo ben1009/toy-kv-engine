@@ -176,7 +176,11 @@ impl LsmStorageInner {
                             // preparers without active-memtable leases while the
                             // exclusive freeze runs.
                             let _preparation = preparation;
-                            inner.retry_after_capacity_error(error, &memtable, &mut retries)?;
+                            inner.retry_after_capacity_error_admitted(
+                                error,
+                                &memtable,
+                                &mut retries,
+                            )?;
 
                             Ok::<_, anyhow::Error>(retries)
                         })
@@ -345,7 +349,11 @@ impl LsmStorageInner {
                             // queued writers cannot lease the source memtable before
                             // the exclusive freeze has installed its successor.
                             let _preparation = preparation;
-                            inner.retry_after_capacity_error(error, &memtable, &mut retries)?;
+                            inner.retry_after_capacity_error_admitted(
+                                error,
+                                &memtable,
+                                &mut retries,
+                            )?;
                             Ok::<_, anyhow::Error>(retries)
                         })
                         .await?;

@@ -1851,6 +1851,18 @@ impl LifecycleHandle {
         }
     }
 
+    pub(crate) fn wait_for_writes(&self) {
+        #[cfg(test)]
+        self.0
+            .wait_for_writes_started
+            .store(true, Ordering::Release);
+
+        let mut lock = self.0.wait_lock.lock();
+        while self.0.active_writes.load(Ordering::Acquire) != 0 {
+            self.0.wait_cv.wait(&mut lock);
+        }
+    }
+
     pub(crate) fn wait_for_closed(&self) {
         let mut lock = self.0.wait_lock.lock();
         while !self.is_closed() {
@@ -1892,6 +1904,8 @@ struct LifecycleState {
     wait_lock: Mutex<()>,
     wait_cv: Condvar,
     close_error: Mutex<Option<async_close::CachedCloseError>>,
+    #[cfg(test)]
+    wait_for_writes_started: AtomicBool,
 }
 
 impl LifecycleState {
@@ -1925,8 +1939,7 @@ impl LifecycleState {
             AdmissionKind::Scan => self.active_scans.fetch_sub(1, Ordering::AcqRel) == 1,
             AdmissionKind::Txn => self.active_txns.fetch_sub(1, Ordering::AcqRel) == 1,
         };
-        if notify && self.state.load(Ordering::Acquire) == LIFECYCLE_CLOSING && self.is_quiescent()
-        {
+        if notify && self.state.load(Ordering::Acquire) == LIFECYCLE_CLOSING {
             let _lock = self.wait_lock.lock();
             self.wait_cv.notify_all();
         }
@@ -2378,15 +2391,15 @@ impl KvEngine {
     fn close_active_v7_pitr_storage(&self) -> Result<()> {
         #[cfg(target_os = "linux")]
         {
-            // Serialize the admission fence and lifecycle transition with PITR
-            // resume. Release both locks before joining workers: a worker may be
-            // waiting for the PITR barrier while shutdown waits for that worker.
+            // Serialize lifecycle close with PITR resume. An admitted writer
+            // may still need these locks to rotate a full Active WAL, so close
+            // releases them and drains admitted writes before fencing MVCC.
             let operation_guard = self.pitr_operation_lock.lock();
             let barrier = self.pitr_barrier_lock.lock();
             let close_state = self.inner.lifecycle.begin_close();
+            drop(barrier);
+            drop(operation_guard);
             if !matches!(&close_state, CloseState::Started) {
-                drop(barrier);
-                drop(operation_guard);
                 return Self::close_storage_parts_after_begin(
                     &self.inner,
                     &self.background_workers,
@@ -2396,6 +2409,14 @@ impl KvEngine {
                 );
             }
 
+            self.inner.lifecycle.wait_for_writes();
+
+            // No new lifecycle writes can enter, and every previously
+            // admitted write (including capacity-retry rotation) has finished.
+            // Reacquire the PITR locks before closing MVCC admission so resume
+            // and boundary work cannot race the final Active cut.
+            let operation_guard = self.pitr_operation_lock.lock();
+            let barrier = self.pitr_barrier_lock.lock();
             let admission_error = self
                 .inner
                 .mvcc
@@ -4276,7 +4297,11 @@ impl KvEngine {
         cancellation: Option<&std::sync::atomic::AtomicBool>,
     ) -> Result<crate::pitr::api::RecoveryPointOutcome> {
         let _barrier = self.pitr_barrier_lock.lock();
-        self.create_recovery_point_locked_cancellable(resume_admission_on_success, cancellation)
+        self.create_recovery_point_locked_cancellable(
+            resume_admission_on_success,
+            cancellation,
+            false,
+        )
     }
 
     #[cfg(target_os = "linux")]
@@ -4284,7 +4309,7 @@ impl KvEngine {
         &self,
         resume_admission_on_success: bool,
     ) -> Result<crate::pitr::api::RecoveryPointOutcome> {
-        self.create_recovery_point_locked_cancellable(resume_admission_on_success, None)
+        self.create_recovery_point_locked_cancellable(resume_admission_on_success, None, false)
     }
 
     #[cfg(target_os = "linux")]
@@ -4753,11 +4778,15 @@ impl KvEngine {
         &self,
         resume_admission_on_success: bool,
         cancellation: Option<&std::sync::atomic::AtomicBool>,
+        allow_lifecycle_closing: bool,
     ) -> Result<crate::pitr::api::RecoveryPointOutcome> {
-        // V7 close holds this same PITR barrier until shutdown begins. Recheck
-        // after acquiring it so a queued request cannot mutate a closed image
-        // after close has released the database's exclusive open lock.
-        self.inner.lifecycle.ensure_open()?;
+        // Recheck after acquiring the barrier so a queued public request
+        // cannot mutate a closed image after close releases the exclusive open
+        // lock. Forced rotation opts in only when its caller already owns
+        // lifecycle admission and close is draining that accepted write.
+        if !allow_lifecycle_closing {
+            self.inner.lifecycle.ensure_open()?;
+        }
         ensure!(
             !self.pitr_publication_unknown.load(Ordering::Acquire),
             "PITR recovery point cannot proceed while a manifest transition has an unknown outcome; reopen the database first"
@@ -5201,6 +5230,7 @@ impl KvEngine {
     fn archive_active_pitr_segment_before_forced_freeze(
         &self,
         expected_memtable: Option<&Arc<MemTable>>,
+        allow_lifecycle_closing: bool,
     ) -> Result<()> {
         #[cfg(feature = "chaos-testing")]
         crate::chaos::failpoint::fail_point!("pitr.before_forced_freeze_boundary");
@@ -5217,7 +5247,9 @@ impl KvEngine {
             // boundary as recovery-point creation, so the frozen source is
             // already archived before the flush can reclaim its WAL and seal.
             let _barrier = self.pitr_barrier_lock.lock();
-            self.inner.lifecycle.ensure_open()?;
+            if !allow_lifecycle_closing {
+                self.inner.lifecycle.ensure_open()?;
+            }
             ensure!(
                 !self.pitr_publication_unknown.load(Ordering::Acquire),
                 "v7 forced freeze cannot proceed while a PITR manifest transition has an unknown outcome; reopen the database first"
@@ -5246,7 +5278,11 @@ impl KvEngine {
                 state.active_segment_id == Some(source_segment_id),
                 "Active v7 WAL segment differs from the PITR manifest before forced freeze"
             );
-            match self.create_recovery_point_locked(true)? {
+            match self.create_recovery_point_locked_cancellable(
+                true,
+                None,
+                allow_lifecycle_closing,
+            )? {
                 crate::pitr::api::RecoveryPointOutcome::Durable(_) => {}
                 crate::pitr::api::RecoveryPointOutcome::CommitPublishedButNotDurable {
                     error,
@@ -7117,7 +7153,7 @@ impl KvEngine {
             .blocking
             .run_result(move || {
                 let _guard = guard;
-                inner.put(&key, &value)
+                inner.put_admitted(&key, &value)
             })
             .await
     }
@@ -7155,7 +7191,7 @@ impl KvEngine {
             .blocking
             .run_result(move || {
                 let _guard = guard;
-                inner.put_with_ttl(&key, &value, ttl)
+                inner.put_with_ttl_admitted(&key, &value, ttl)
             })
             .await
     }
@@ -7172,7 +7208,7 @@ impl KvEngine {
             .blocking
             .run_result(move || {
                 let _guard = guard;
-                inner.delete(&key)
+                inner.delete_admitted(&key)
             })
             .await
     }
@@ -7303,7 +7339,7 @@ impl KvEngine {
             .blocking
             .run_result(move || {
                 let _guard = guard;
-                inner.write_batch(&owned)
+                inner.write_batch_admitted(&owned)
             })
             .await
     }
@@ -12605,7 +12641,11 @@ impl LsmStorageInner {
         u64::try_from(total).context("range tombstone preparation size exceeds u64")
     }
 
-    fn range_batch_write<T: AsRef<[u8]>>(&self, batch: &[WriteBatchRecord<T>]) -> Result<()> {
+    fn range_batch_write_with_lifecycle_admission<T: AsRef<[u8]>>(
+        &self,
+        batch: &[WriteBatchRecord<T>],
+        allow_lifecycle_closing: bool,
+    ) -> Result<()> {
         let entries = Self::collect_range_batch_entries(batch);
         self.validate_range_batch_entries(&entries)?;
 
@@ -12615,7 +12655,12 @@ impl LsmStorageInner {
             match self.range_batch_write_attempt(&entries) {
                 Ok(()) => return self.try_freeze_memtable(),
                 Err(error) => {
-                    self.retry_after_wal_full(error, &expected_memtable, &mut retries)?;
+                    self.retry_after_capacity_error_with_admission(
+                        error,
+                        &expected_memtable,
+                        &mut retries,
+                        allow_lifecycle_closing,
+                    )?;
                 }
             }
         }
@@ -13810,12 +13855,28 @@ impl LsmStorageInner {
     /// commit timestamp.
     #[allow(clippy::type_complexity)]
     pub fn write_batch<T: AsRef<[u8]>>(&self, batch: &[WriteBatchRecord<T>]) -> Result<()> {
+        self.write_batch_with_lifecycle_admission(batch, false)
+    }
+
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn write_batch_admitted<T: AsRef<[u8]>>(
+        &self,
+        batch: &[WriteBatchRecord<T>],
+    ) -> Result<()> {
+        self.write_batch_with_lifecycle_admission(batch, true)
+    }
+
+    fn write_batch_with_lifecycle_admission<T: AsRef<[u8]>>(
+        &self,
+        batch: &[WriteBatchRecord<T>],
+        allow_lifecycle_closing: bool,
+    ) -> Result<()> {
         let (has_range, delete_only) = Self::validate_and_classify_write_batch(batch)?;
         #[cfg(feature = "bench")]
         self.maybe_start_write_batch_profile_window();
 
         if has_range {
-            self.range_batch_write(batch)?;
+            self.range_batch_write_with_lifecycle_admission(batch, allow_lifecycle_closing)?;
         } else {
             let mut retries = 0;
             loop {
@@ -13823,7 +13884,12 @@ impl LsmStorageInner {
                 match self.write_point_batch_once(batch, delete_only) {
                     Ok(()) => break,
                     Err(error) => {
-                        self.retry_after_capacity_error(error, &expected_memtable, &mut retries)?;
+                        self.retry_after_capacity_error_with_admission(
+                            error,
+                            &expected_memtable,
+                            &mut retries,
+                            allow_lifecycle_closing,
+                        )?;
                     }
                 }
             }
@@ -14080,7 +14146,7 @@ impl LsmStorageInner {
             return Err(error);
         }
 
-        self.rotate_after_wal_full(error, expected_memtable, retries)
+        self.rotate_after_wal_full(error, expected_memtable, retries, false)
     }
 
     /// Native async point and range writers keep their exclusive preparation
@@ -14093,11 +14159,40 @@ impl LsmStorageInner {
         expected_memtable: &Arc<MemTable>,
         retries: &mut usize,
     ) -> Result<()> {
+        self.retry_after_capacity_error_with_admission(error, expected_memtable, retries, false)
+    }
+
+    /// Retry a write whose lifecycle admission is already owned. This variant
+    /// may finish the required PITR rotation while close drains accepted writes.
+    pub(crate) fn retry_after_capacity_error_admitted(
+        &self,
+        error: anyhow::Error,
+        expected_memtable: &Arc<MemTable>,
+        retries: &mut usize,
+    ) -> Result<()> {
+        self.retry_after_capacity_error_with_admission(error, expected_memtable, retries, true)
+    }
+
+    fn retry_after_capacity_error_with_admission(
+        &self,
+        error: anyhow::Error,
+        expected_memtable: &Arc<MemTable>,
+        retries: &mut usize,
+        allow_lifecycle_closing: bool,
+    ) -> Result<()> {
         if crate::wal::Wal::is_v7_capacity_retry_error(&error) {
-            return self.rotate_after_wal_full(error, expected_memtable, retries);
+            return self.rotate_after_wal_full(
+                error,
+                expected_memtable,
+                retries,
+                allow_lifecycle_closing,
+            );
         }
 
-        self.retry_after_wal_full(error, expected_memtable, retries)
+        if !crate::wal::Wal::is_retryable_full_error(&error) {
+            return Err(error);
+        }
+        self.rotate_after_wal_full(error, expected_memtable, retries, allow_lifecycle_closing)
     }
 
     fn rotate_after_wal_full(
@@ -14105,6 +14200,7 @@ impl LsmStorageInner {
         error: anyhow::Error,
         expected_memtable: &Arc<MemTable>,
         retries: &mut usize,
+        allow_lifecycle_closing: bool,
     ) -> Result<()> {
         let is_v7_seal_index_limit = error
             .downcast_ref::<crate::wal::v7::admission::WalV7ReservationError>()
@@ -14136,7 +14232,7 @@ impl LsmStorageInner {
         let active = self.state.load();
         if Arc::ptr_eq(&active.memtable, expected_memtable) {
             drop(active);
-            self.prepare_forced_memtable_freeze(Some(expected_memtable))
+            self.prepare_forced_memtable_freeze(Some(expected_memtable), allow_lifecycle_closing)
                 .context("failed to establish a PITR boundary before WAL rotation")?;
             let _checkpoint_guard = self.checkpoint_lock.lock();
             let state_lock = self.state_lock.lock();
@@ -14228,13 +14324,31 @@ impl LsmStorageInner {
     /// Rejects values that are exactly the tombstone marker byte (`[0x02]`),
     /// since those would be indistinguishable from a deletion marker.
     pub fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
+        self.put_with_lifecycle_admission(key, value, false)
+    }
+
+    pub(crate) fn put_admitted(&self, key: &[u8], value: &[u8]) -> Result<()> {
+        self.put_with_lifecycle_admission(key, value, true)
+    }
+
+    fn put_with_lifecycle_admission(
+        &self,
+        key: &[u8],
+        value: &[u8],
+        allow_lifecycle_closing: bool,
+    ) -> Result<()> {
         let mut retries = 0;
         loop {
             let expected_memtable = self.state.load().memtable.clone();
             match self.put_once(key, value) {
                 Ok(()) => return Ok(()),
                 Err(error) => {
-                    self.retry_after_capacity_error(error, &expected_memtable, &mut retries)?;
+                    self.retry_after_capacity_error_with_admission(
+                        error,
+                        &expected_memtable,
+                        &mut retries,
+                        allow_lifecycle_closing,
+                    )?;
                 }
             }
         }
@@ -14330,13 +14444,37 @@ impl LsmStorageInner {
 
     /// Write a key-value pair with a time-to-live duration.
     pub fn put_with_ttl(&self, key: &[u8], value: &[u8], ttl: std::time::Duration) -> Result<()> {
+        self.put_with_ttl_lifecycle_admission(key, value, ttl, false)
+    }
+
+    pub(crate) fn put_with_ttl_admitted(
+        &self,
+        key: &[u8],
+        value: &[u8],
+        ttl: std::time::Duration,
+    ) -> Result<()> {
+        self.put_with_ttl_lifecycle_admission(key, value, ttl, true)
+    }
+
+    fn put_with_ttl_lifecycle_admission(
+        &self,
+        key: &[u8],
+        value: &[u8],
+        ttl: std::time::Duration,
+        allow_lifecycle_closing: bool,
+    ) -> Result<()> {
         let mut retries = 0;
         loop {
             let expected_memtable = self.state.load().memtable.clone();
             match self.put_with_ttl_once(key, value, ttl) {
                 Ok(()) => return Ok(()),
                 Err(error) => {
-                    self.retry_after_capacity_error(error, &expected_memtable, &mut retries)?;
+                    self.retry_after_capacity_error_with_admission(
+                        error,
+                        &expected_memtable,
+                        &mut retries,
+                        allow_lifecycle_closing,
+                    )?;
                 }
             }
         }
@@ -14425,13 +14563,30 @@ impl LsmStorageInner {
 
     /// Remove a key from the storage by writing a tombstone marker.
     pub fn delete(&self, key: &[u8]) -> Result<()> {
+        self.delete_with_lifecycle_admission(key, false)
+    }
+
+    pub(crate) fn delete_admitted(&self, key: &[u8]) -> Result<()> {
+        self.delete_with_lifecycle_admission(key, true)
+    }
+
+    fn delete_with_lifecycle_admission(
+        &self,
+        key: &[u8],
+        allow_lifecycle_closing: bool,
+    ) -> Result<()> {
         let mut retries = 0;
         loop {
             let expected_memtable = self.state.load().memtable.clone();
             match self.delete_once(key) {
                 Ok(()) => return Ok(()),
                 Err(error) => {
-                    self.retry_after_capacity_error(error, &expected_memtable, &mut retries)?;
+                    self.retry_after_capacity_error_with_admission(
+                        error,
+                        &expected_memtable,
+                        &mut retries,
+                        allow_lifecycle_closing,
+                    )?;
                 }
             }
         }
@@ -14928,6 +15083,7 @@ impl LsmStorageInner {
     pub(crate) fn prepare_forced_memtable_freeze(
         &self,
         _expected_memtable: Option<&Arc<MemTable>>,
+        allow_lifecycle_closing: bool,
     ) -> Result<()> {
         #[cfg(target_os = "linux")]
         {
@@ -14941,7 +15097,10 @@ impl LsmStorageInner {
                     .get()
                     .and_then(std::sync::Weak::upgrade)
                     .ok_or_else(|| anyhow!("PITR engine owner is not installed"))?;
-                engine.archive_active_pitr_segment_before_forced_freeze(_expected_memtable)?;
+                engine.archive_active_pitr_segment_before_forced_freeze(
+                    _expected_memtable,
+                    allow_lifecycle_closing,
+                )?;
                 #[cfg(feature = "chaos-testing")]
                 if has_data {
                     crate::chaos::failpoint::fail_point!("pitr.after_forced_freeze_boundary");
@@ -14950,6 +15109,7 @@ impl LsmStorageInner {
         }
         #[cfg(not(target_os = "linux"))]
         {
+            let _ = allow_lifecycle_closing;
             let active = self.state.load();
             if active.memtable.uses_pitr_batch_wal()
                 && !active.memtable.is_empty()
@@ -14969,7 +15129,7 @@ impl LsmStorageInner {
         // Establish our boundary in the same order before changing the manifest,
         // then recheck the active WAL under the state and writer guards before
         // attempting a plain freeze.
-        self.prepare_forced_memtable_freeze(None)?;
+        self.prepare_forced_memtable_freeze(None, false)?;
         if self.state.load().immutable_file_metadata.is_empty() {
             self.ensure_manifest_v7()?;
         }
@@ -20172,7 +20332,7 @@ mod tests {
         let successor_frontier = successor.v7_frontier_cursor()?;
         engine
             .inner
-            .prepare_forced_memtable_freeze(Some(&stale_memtable))?;
+            .prepare_forced_memtable_freeze(Some(&stale_memtable), false)?;
 
         assert!(Arc::ptr_eq(&engine.inner.state.load().memtable, &successor));
         assert_eq!(
@@ -20508,6 +20668,121 @@ mod tests {
             Some(Bytes::from_static(b"value"))
         );
         reopened.close_storage()?;
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn v7_native_async_caller_cancellation_during_capacity_retry_keeps_commit_owned()
+    -> anyhow::Result<()> {
+        let directory = tempdir()?;
+        let max_segment_bytes = 32 * 1024;
+        let options =
+            v7_recovery_test_database_with_segment_limit(directory.path(), max_segment_bytes)?;
+        let database = directory.path().join("db");
+        let engine = KvEngine::open_with_wal_io_mode(
+            &database,
+            options.clone(),
+            crate::wal::WalIoMode::Parallel,
+        )?;
+        let initial_segment_id = engine
+            .pitr_manifest_state
+            .lock()
+            .active_segment_id
+            .expect("v7 Active segment is installed");
+
+        engine.put(b"fill-one", b"value")?;
+        engine.put(b"fill-two", b"value")?;
+        let active = engine.inner.state.load().memtable.clone();
+        let frontier = active.v7_frontier_cursor()?;
+        let frame_len = crate::wal::v7::codec::WAL_V7_FRAME_LEN as u64;
+        let physical_end = frontier.frame_offset + frame_len;
+        assert!(physical_end <= max_segment_bytes);
+        assert!(physical_end + 2 * frame_len > max_segment_bytes);
+
+        let pause = crate::lsm_storage::native_write::NativeWritePause::new(
+            crate::lsm_storage::native_write::NativeWriteStage::CapacityRetry,
+        );
+        *engine.inner.native_write_pause.lock() = Some(Arc::clone(&pause));
+        let writer_engine = Arc::clone(&engine);
+        let writer = tokio::spawn(async move {
+            writer_engine
+                .put_async(b"cancelled-capacity-retry", b"durable")
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), pause.reached.notified())
+            .await
+            .expect("point writer must reach capacity retry before rotation");
+
+        assert_eq!(
+            engine.pitr_manifest_state.lock().active_segment_id,
+            Some(initial_segment_id),
+            "the retry pause must happen before source rotation"
+        );
+        assert_eq!(engine.get(b"cancelled-capacity-retry")?, None);
+        writer.abort();
+        assert!(writer.await.unwrap_err().is_cancelled());
+
+        let sequencer = engine.inner.mvcc.as_ref().expect("v7 storage has MVCC");
+        let close_engine = Arc::clone(&engine);
+        let close = tokio::spawn(async move { close_engine.close_async().await });
+        let close_entered_write_drain =
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while engine.inner.lifecycle.ensure_open().is_ok()
+                    || !engine
+                        .inner
+                        .lifecycle
+                        .0
+                        .wait_for_writes_started
+                        .load(std::sync::atomic::Ordering::Acquire)
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .is_ok();
+        let admission_stayed_open = sequencer.commit_admission_is_open();
+        let retry_admission_retained = engine
+            .inner
+            .lifecycle
+            .0
+            .active_writes
+            .load(std::sync::atomic::Ordering::Acquire)
+            > 0;
+        let close_waited_for_retry = !close.is_finished();
+
+        pause.release.notify_one();
+        close.await.unwrap()?;
+        drop(engine);
+
+        assert!(
+            close_entered_write_drain,
+            "close did not begin draining admitted writes while the retry was paused"
+        );
+        assert!(
+            admission_stayed_open,
+            "close must preserve MVCC admission until accepted writes drain"
+        );
+        assert!(
+            retry_admission_retained,
+            "the owned retry must retain lifecycle admission during close"
+        );
+        assert!(
+            close_waited_for_retry,
+            "close must wait for the capacity retry to finish"
+        );
+
+        let reopened =
+            KvEngine::open_with_wal_io_mode(&database, options, crate::wal::WalIoMode::Parallel)?;
+        for key in [b"fill-one".as_slice(), b"fill-two"] {
+            assert_eq!(reopened.get(key)?, Some(Bytes::from_static(b"value")));
+        }
+        assert_eq!(
+            reopened.get(b"cancelled-capacity-retry")?,
+            Some(Bytes::from_static(b"durable"))
+        );
+        reopened.close_async().await?;
+
         Ok(())
     }
 
@@ -21067,6 +21342,119 @@ mod tests {
         assert_eq!(reopened.get(b"in-flight")?, Some(Bytes::from_static(b"v")));
         reopened.close_storage()?;
 
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn v7_leader_async_write_finishes_capacity_retry_during_close() -> anyhow::Result<()> {
+        let directory = tempdir()?;
+        let max_segment_bytes = 32 * 1024;
+        let options =
+            v7_recovery_test_database_with_segment_limit(directory.path(), max_segment_bytes)?;
+        let database = directory.path().join("db");
+        let engine = KvEngine::open_with_wal_io_mode(
+            &database,
+            options.clone(),
+            crate::wal::WalIoMode::Leader,
+        )?;
+        let initial_segment_id = engine
+            .pitr_manifest_state
+            .lock()
+            .active_segment_id
+            .expect("v7 Active segment is installed");
+
+        engine.put(b"fill-one", b"value")?;
+        engine.put(b"fill-two", b"value")?;
+        let active = engine.inner.state.load().memtable.clone();
+        let frontier = active.v7_frontier_cursor()?;
+        let frame_len = crate::wal::v7::codec::WAL_V7_FRAME_LEN as u64;
+        let physical_end = frontier.frame_offset + frame_len;
+        assert!(physical_end <= max_segment_bytes);
+        assert!(physical_end + 2 * frame_len > max_segment_bytes);
+
+        // Hold the active memtable gate until close has started draining the
+        // already-admitted Leader-mode write. Releasing it then forces the
+        // write through the capacity retry while lifecycle admission is closed.
+        let active_memtable_guard = engine.inner.active_memtable_lock.write();
+        let writer_engine = Arc::clone(&engine);
+        let writer = tokio::spawn(async move {
+            writer_engine
+                .write_batch_async(&[WriteBatchRecord::Put(
+                    b"leader-retry".as_slice(),
+                    b"durable".as_slice(),
+                )])
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while engine
+                .inner
+                .lifecycle
+                .0
+                .active_writes
+                .load(std::sync::atomic::Ordering::Acquire)
+                == 0
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("Leader-mode async writer must acquire lifecycle admission");
+
+        let close_engine = Arc::clone(&engine);
+        let close = tokio::spawn(async move { close_engine.close_async().await });
+        let close_entered_write_drain =
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while engine.inner.lifecycle.ensure_open().is_ok()
+                    || !engine
+                        .inner
+                        .lifecycle
+                        .0
+                        .wait_for_writes_started
+                        .load(std::sync::atomic::Ordering::Acquire)
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .is_ok();
+        let admission_stayed_open = engine
+            .inner
+            .mvcc
+            .as_ref()
+            .expect("v7 storage has MVCC")
+            .commit_admission_is_open();
+        drop(active_memtable_guard);
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), writer)
+            .await
+            .expect("admitted Leader-mode async write must finish while close drains it")??;
+        close.await??;
+        assert!(
+            close_entered_write_drain,
+            "close must drain the admitted Leader-mode async write"
+        );
+        assert!(
+            admission_stayed_open,
+            "close must preserve MVCC admission until the Leader-mode write finishes"
+        );
+        assert_ne!(
+            engine.pitr_manifest_state.lock().active_segment_id,
+            Some(initial_segment_id),
+            "capacity retry must rotate the full Active segment"
+        );
+        drop(engine);
+
+        let reopened =
+            KvEngine::open_with_wal_io_mode(&database, options, crate::wal::WalIoMode::Leader)?;
+        for key in [b"fill-one".as_slice(), b"fill-two"] {
+            assert_eq!(reopened.get(key)?, Some(Bytes::from_static(b"value")));
+        }
+        assert_eq!(
+            reopened.get(b"leader-retry")?,
+            Some(Bytes::from_static(b"durable"))
+        );
+        reopened.close_async().await?;
         Ok(())
     }
 
@@ -22234,13 +22622,22 @@ mod tests {
 
         let close_engine = Arc::clone(&engine);
         let close = tokio::spawn(async move { close_engine.close_async().await });
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            while sequencer.commit_admission_is_open() {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("close must stop commit admission before draining the v7 commit");
+        let close_entered_write_drain =
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while engine.inner.lifecycle.ensure_open().is_ok()
+                    || !engine
+                        .inner
+                        .lifecycle
+                        .0
+                        .wait_for_writes_started
+                        .load(std::sync::atomic::Ordering::Acquire)
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .is_ok();
+        let admission_stayed_open = sequencer.commit_admission_is_open();
         assert!(
             !close.is_finished(),
             "close must wait for the owned v7 commit"
@@ -22248,6 +22645,14 @@ mod tests {
         pause.release.notify_one();
         close.await.unwrap()?;
         drop(engine);
+        assert!(
+            close_entered_write_drain,
+            "close did not begin draining the admitted v7 commit"
+        );
+        assert!(
+            admission_stayed_open,
+            "close must preserve MVCC admission until the accepted v7 commit drains"
+        );
 
         let reopened =
             KvEngine::open_with_wal_io_mode(&database, options, crate::wal::WalIoMode::Parallel)?;
@@ -22293,21 +22698,43 @@ mod tests {
         let sequencer = engine.inner.mvcc.as_ref().unwrap();
         let close_engine = Arc::clone(&engine);
         let close = tokio::spawn(async move { close_engine.close_async().await });
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            while sequencer.commit_admission_is_open() {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("close must stop commit admission before draining the range commit");
-        assert!(
-            !close.is_finished(),
-            "close must wait for the owned range commit"
-        );
-        assert_eq!(active.parallel_wal_is_closed(), Some(false));
+        let close_entered_write_drain =
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while engine.inner.lifecycle.ensure_open().is_ok()
+                    || !engine
+                        .inner
+                        .lifecycle
+                        .0
+                        .wait_for_writes_started
+                        .load(std::sync::atomic::Ordering::Acquire)
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .is_ok();
+        let admission_stayed_open = sequencer.commit_admission_is_open();
+        let close_waits_for_commit = !close.is_finished();
+        let wal_stays_open_during_drain = active.parallel_wal_is_closed() == Some(false);
         pause.release.notify_one();
         close.await.unwrap()?;
         drop(engine);
+        assert!(
+            close_entered_write_drain,
+            "close did not begin draining the admitted range commit"
+        );
+        assert!(
+            admission_stayed_open,
+            "close must preserve MVCC admission until the accepted range commit drains"
+        );
+        assert!(
+            close_waits_for_commit,
+            "close must wait for the owned range commit"
+        );
+        assert!(
+            wal_stays_open_during_drain,
+            "the active parallel WAL must stay open while close drains the accepted commit"
+        );
 
         let reopened =
             KvEngine::open_with_wal_io_mode(&database, options, crate::wal::WalIoMode::Parallel)?;
