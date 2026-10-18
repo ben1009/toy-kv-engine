@@ -119,6 +119,7 @@ pub(crate) struct WalV7ResourceLimits {
     /// Includes both source spool bytes and recovery workspace bytes.
     pub(crate) max_source_spool_bytes: u64,
     pub(crate) max_recovery_workspace_bytes: u64,
+    /// Total memory cap, including any protected maintenance reserve.
     pub(crate) max_buffer_memory_bytes: u64,
     pub(crate) max_seal_index_bytes: u64,
 }
@@ -200,6 +201,8 @@ struct LedgerState {
 #[derive(Debug)]
 struct WalV7ResourceLedgerInner {
     limits: WalV7ResourceLimits,
+    /// Buffer headroom ordinary admissions cannot consume.
+    maintenance_buffer_memory_reserve: u64,
     #[cfg(test)]
     test_max_seal_index_bytes: AtomicU64,
     state: Mutex<LedgerState>,
@@ -433,6 +436,23 @@ impl WalV7ReservationOwner {
         self: &Arc<Self>,
         charge: WalV7ResourceCharge,
     ) -> Result<Option<WalV7OwnedPreparationReservation>, WalV7ReservationError> {
+        self.reserve_preparation_resources_with_priority(charge, false)
+    }
+
+    /// Reserve bounded maintenance memory without consuming capacity protected
+    /// from ordinary batch and range preparation.
+    pub(crate) fn reserve_maintenance_preparation_resources(
+        self: &Arc<Self>,
+        charge: WalV7ResourceCharge,
+    ) -> Result<Option<WalV7OwnedPreparationReservation>, WalV7ReservationError> {
+        self.reserve_preparation_resources_with_priority(charge, true)
+    }
+
+    fn reserve_preparation_resources_with_priority(
+        self: &Arc<Self>,
+        charge: WalV7ResourceCharge,
+        maintenance: bool,
+    ) -> Result<Option<WalV7OwnedPreparationReservation>, WalV7ReservationError> {
         if charge.is_empty() {
             return Ok(None);
         }
@@ -444,7 +464,11 @@ impl WalV7ReservationOwner {
             .active_preparations
             .checked_add(1)
             .ok_or(WalV7ReservationError::ArithmeticOverflow)?;
-        let reservation = self.ledger.reserve(charge)?;
+        let reservation = if maintenance {
+            self.ledger.reserve_maintenance(charge)?
+        } else {
+            self.ledger.reserve(charge)?
+        };
         state.active_preparations = active_preparations;
         drop(state);
         Ok(Some(WalV7OwnedPreparationReservation {
@@ -635,9 +659,19 @@ fn release_retired_reservations(state: &mut WalV7ReservationOwnerState) {
 
 impl WalV7ResourceLedger {
     pub(crate) fn new(limits: WalV7ResourceLimits) -> Result<Self, WalV7ReservationError> {
+        Self::new_with_maintenance_buffer_reserve(limits, 0)
+    }
+
+    /// Construct a ledger with buffer capacity protected for bounded
+    /// maintenance work such as sealing an Active WAL during rotation.
+    pub(crate) fn new_with_maintenance_buffer_reserve(
+        limits: WalV7ResourceLimits,
+        maintenance_buffer_memory_reserve: u64,
+    ) -> Result<Self, WalV7ReservationError> {
         if limits.max_logical_wal_bytes == 0
             || limits.max_source_spool_bytes == 0
             || limits.max_recovery_workspace_bytes > limits.max_source_spool_bytes
+            || maintenance_buffer_memory_reserve > limits.max_buffer_memory_bytes
         {
             return Err(WalV7ReservationError::InvalidLimits);
         }
@@ -645,6 +679,7 @@ impl WalV7ResourceLedger {
         Ok(Self {
             inner: Arc::new(WalV7ResourceLedgerInner {
                 limits,
+                maintenance_buffer_memory_reserve,
                 #[cfg(test)]
                 test_max_seal_index_bytes: AtomicU64::new(u64::MAX),
                 state: Mutex::new(LedgerState {
@@ -660,6 +695,21 @@ impl WalV7ResourceLedger {
     pub(crate) fn reserve(
         &self,
         charge: WalV7ResourceCharge,
+    ) -> Result<WalV7Reservation, WalV7ReservationError> {
+        self.reserve_with_priority(charge, false)
+    }
+
+    fn reserve_maintenance(
+        &self,
+        charge: WalV7ResourceCharge,
+    ) -> Result<WalV7Reservation, WalV7ReservationError> {
+        self.reserve_with_priority(charge, true)
+    }
+
+    fn reserve_with_priority(
+        &self,
+        charge: WalV7ResourceCharge,
+        maintenance: bool,
     ) -> Result<WalV7Reservation, WalV7ReservationError> {
         if charge.is_empty() {
             return Err(WalV7ReservationError::EmptyReservation);
@@ -684,7 +734,12 @@ impl WalV7ResourceLedger {
         if next.recovery_workspace_bytes > self.inner.limits.max_recovery_workspace_bytes {
             return Err(WalV7ReservationError::RecoveryWorkspaceLimit);
         }
-        if next.buffer_memory_bytes > self.inner.limits.max_buffer_memory_bytes {
+        let buffer_limit = if maintenance {
+            self.inner.limits.max_buffer_memory_bytes
+        } else {
+            self.inner.limits.max_buffer_memory_bytes - self.inner.maintenance_buffer_memory_reserve
+        };
+        if next.buffer_memory_bytes > buffer_limit {
             return Err(WalV7ReservationError::BufferMemoryLimit);
         }
         let max_seal_index_bytes = self.inner.limits.max_seal_index_bytes;
@@ -1251,6 +1306,32 @@ mod tests {
             max_buffer_memory_bytes: 32768,
             max_seal_index_bytes: 16,
         }
+    }
+
+    #[test]
+    fn ordinary_reservations_preserve_maintenance_buffer_headroom() {
+        let limits = WalV7ResourceLimits {
+            max_buffer_memory_bytes: 100,
+            ..limits()
+        };
+        let ledger = WalV7ResourceLedger::new_with_maintenance_buffer_reserve(limits, 40).unwrap();
+
+        let ordinary = ledger.reserve(charge(0, 0, 0, 60, 0)).unwrap();
+        assert_eq!(
+            ledger.reserve(charge(0, 0, 0, 1, 0)).err(),
+            Some(WalV7ReservationError::BufferMemoryLimit)
+        );
+
+        let maintenance = ledger.reserve_maintenance(charge(0, 0, 0, 40, 0)).unwrap();
+        assert_eq!(ledger.snapshot().buffer_memory_bytes, 100);
+        assert_eq!(
+            ledger.reserve_maintenance(charge(0, 0, 0, 1, 0)).err(),
+            Some(WalV7ReservationError::BufferMemoryLimit)
+        );
+
+        drop(maintenance);
+        drop(ordinary);
+        assert_eq!(ledger.snapshot(), WalV7ResourceCharge::default());
     }
 
     #[test]
