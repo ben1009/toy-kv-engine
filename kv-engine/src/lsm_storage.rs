@@ -20193,6 +20193,131 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(all(target_os = "linux", feature = "chaos-testing"))]
+    #[test]
+    fn failpoint_v7_simultaneous_capacity_retries_share_one_rotation() -> anyhow::Result<()> {
+        use crate::chaos::failpoint::FailScenario;
+        use std::time::{Duration, Instant};
+
+        let scenario = FailScenario::setup();
+        let directory = tempdir()?;
+        let max_segment_bytes = 32 * 1024;
+        let options =
+            v7_recovery_test_database_with_segment_limit(directory.path(), max_segment_bytes)?;
+        let database = directory.path().join("db");
+        let engine = KvEngine::open_with_wal_io_mode(
+            &database,
+            options.clone(),
+            crate::wal::WalIoMode::Parallel,
+        )?;
+        let frame_len = u64::try_from(crate::wal::v7::codec::WAL_V7_FRAME_LEN)?;
+        let mut filler = 0;
+        loop {
+            let active = engine.inner.state.load().memtable.clone();
+            let physical_end = active.v7_frontier_cursor()?.frame_offset + frame_len;
+            if physical_end + 2 * frame_len > max_segment_bytes {
+                assert_eq!(physical_end, max_segment_bytes);
+                break;
+            }
+            drop(active);
+            let key = format!("capacity-filler-{filler}");
+            engine.put(key.as_bytes(), b"value")?;
+            filler += 1;
+        }
+
+        let source = engine.inner.state.load().memtable.clone();
+        let source_segment_id = LsmStorageInner::pitr_segment_of(&source).unwrap();
+        assert_eq!(
+            source.v7_frontier_cursor()?.frame_offset + frame_len,
+            max_segment_bytes
+        );
+
+        // Hold both capacity-rejected writers immediately before the serialized
+        // PITR boundary operation. This forces both to carry the same stale
+        // source into the rotation path instead of relying on scheduler timing.
+        let gate = Arc::new((
+            std::sync::Mutex::new((0_usize, false)),
+            std::sync::Condvar::new(),
+        ));
+        let callback_gate = Arc::clone(&gate);
+        fail::cfg_callback("pitr.before_forced_freeze_boundary", move || {
+            let (state_lock, changed) = &*callback_gate;
+            let mut state = state_lock
+                .lock()
+                .expect("simultaneous capacity retry gate mutex poisoned");
+            state.0 += 1;
+            changed.notify_all();
+            while !state.1 {
+                state = changed
+                    .wait(state)
+                    .expect("simultaneous capacity retry gate mutex poisoned");
+            }
+        })
+        .map_err(anyhow::Error::msg)?;
+
+        let first_engine = Arc::clone(&engine);
+        let first = std::thread::spawn(move || first_engine.put(b"simultaneous-first", b"value"));
+        let second_engine = Arc::clone(&engine);
+        let second =
+            std::thread::spawn(move || second_engine.put(b"simultaneous-second", b"value"));
+
+        let both_rejected = {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let (state_lock, changed) = &*gate;
+            let mut state = state_lock
+                .lock()
+                .expect("simultaneous capacity retry gate mutex poisoned");
+            while state.0 < 2 {
+                let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                    break;
+                };
+                let (next_state, wait) = changed
+                    .wait_timeout(state, remaining)
+                    .expect("simultaneous capacity retry gate mutex poisoned");
+                state = next_state;
+                if wait.timed_out() && state.0 < 2 {
+                    break;
+                }
+            }
+            let both_rejected = state.0 == 2;
+            state.1 = true;
+            changed.notify_all();
+            both_rejected
+        };
+
+        let first_result = first
+            .join()
+            .map_err(|_| anyhow::anyhow!("first simultaneous writer panicked"))?;
+        let second_result = second
+            .join()
+            .map_err(|_| anyhow::anyhow!("second simultaneous writer panicked"))?;
+        fail::remove("pitr.before_forced_freeze_boundary");
+        scenario.teardown();
+        anyhow::ensure!(
+            both_rejected,
+            "both concurrent writes must reject the same full Active segment"
+        );
+        first_result?;
+        second_result?;
+
+        assert_eq!(
+            engine.pitr_manifest_state.lock().active_segment_id,
+            Some(source_segment_id + 1),
+            "one shared source boundary should install exactly one successor"
+        );
+        engine.close_storage()?;
+        drop(source);
+        drop(engine);
+
+        let reopened =
+            KvEngine::open_with_wal_io_mode(&database, options, crate::wal::WalIoMode::Parallel)?;
+        for key in [b"simultaneous-first".as_slice(), b"simultaneous-second"] {
+            assert_eq!(reopened.get(key)?, Some(Bytes::from_static(b"value")));
+        }
+        reopened.close_storage()?;
+        Ok(())
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn v7_sync_writes_retry_after_segment_capacity_rotation() -> anyhow::Result<()> {
