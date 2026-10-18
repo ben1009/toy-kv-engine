@@ -57,9 +57,15 @@ queues a native point writer behind such a transaction on one blocking worker
 and verifies successor retry and reopen durability. A synchronized failpoint
 test also makes two synchronous Parallel writers reject the same full Active
 segment before either enters the lifecycle boundary lock; they share one
-successor rotation and both writes survive reopen. Proactive target/interval
-rotation, cancellation during retry, and global spool backpressure remain
-pending.
+successor rotation and both writes survive reopen. A native point-write
+regression aborts the caller while its owned capacity retry is paused, verifies
+close drains it before closing MVCC admission, and checks reopen durability. The
+retry retains its original lifecycle admission while it rotates the Active WAL.
+Leader-mode async retries use the same close-drain allowance; a forced-capacity
+regression verifies rotation, close, and reopen durability.
+Proactive target/
+interval rotation, range/transaction cancellation during retry, and global
+spool backpressure remain pending.
 Public close drains and syncs
 the Active v7 WAL for recovery without emitting a final recovery point. It stops
 and drains MVCC commit admission, persists the latest synced logical boundary in
@@ -1015,8 +1021,13 @@ remain in later stage 5/6 work.
   retry rotates, succeeds against the successor, and survives reopen. A
   synchronized failpoint test forces two synchronous Parallel writers to
   reject the same full Active segment before rotation; stale-source retries
-  share one successor and both writes survive reopen. Cancelled retries and
-  distinct global backpressure and oversize outcomes remain outstanding.
+  share one successor and both writes survive reopen. A native point-write
+  regression aborts the caller while the owned retry is paused, verifies close
+  waits for it, and checks reopen durability. A Leader-mode async batch held at
+  the active-memtable gate finishes its capacity retry after close starts and
+  survives reopen. Range/transaction retry
+  cancellation and distinct global backpressure and oversize outcomes remain
+  outstanding.
 - Extend `PitrManifestRecord::SealStarted`, its obligation state, replay, and
   snapshot validation with the versioned immutable boundary. Persist Active
   references using only logical anchors. Allocation-only timestamp watermarks
