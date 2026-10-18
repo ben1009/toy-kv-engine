@@ -46,8 +46,17 @@ sealing and successor rotation while retaining the exclusive preparation permit.
 A one-blocking-worker regression verifies queued point writers cannot lease the
 source during rotation and confirms range deletion and reopen durability. Native
 seal and successor-verification buffers have protected ledger headroom separate
-from ordinary batch/range buffers. Native transaction capacity retries,
-proactive target/interval rotation, and global spool backpressure remain pending.
+from ordinary batch/range buffers. Synchronous and asynchronous transaction
+commits now retry v7 capacity rejections through bounded sealing
+and successor rotation. Serializable commits retain their snapshot and repeat
+OCC validation after rotation; tests cover successful sync/async retries and a
+competing conflicting write during rotation. Nonserializable v7 Parallel async
+transactions acquire the native preparation permit before worker dispatch and
+retain it through capacity rotation, then release it after admission. A regression
+queues a native point writer behind such a transaction on one blocking worker
+and verifies successor retry and reopen durability. Proactive target/interval rotation,
+simultaneous capacity retries, cancellation during retry, and global spool
+backpressure remain pending.
 Public close drains and syncs
 the Active v7 WAL for recovery without emitting a final recovery point. It stops
 and drains MVCC commit admission, persists the latest synced logical boundary in
@@ -98,8 +107,8 @@ drains admitted operations. Repeated PITR close calls reuse the cached final
 archived point and storage-close result without another boundary. An ordinary
 v7 storage close does not certify archive durability; a later `close_pitr`
 requires reopening before it can publish the final archived boundary.
-V7 checkpoint and backup capture, remaining public write shapes, OCC, and
-broader lifecycle rotation remain. PITR manifest replay and
+V7 checkpoint and backup capture, remaining public write shapes (including
+other OCC APIs), and broader lifecycle rotation remain. PITR manifest replay and
 snapshots now retain and validate a v7 format marker and the full immutable
 boundary in Sealing obligations;
 seal completion checks the WAL digest against that boundary. A v7 v2 seal
@@ -987,13 +996,22 @@ remain in later stage 5/6 work.
   memtable leases while the exclusive freeze runs. Native async v7 Parallel
   range retries now retain that permit through rotation as well. One-blocking-
   worker regressions queue point writers during point and range capacity retries,
-  then verify successor writes and reopen durability. Native transaction capacity
-  retries remain deferred and retain their no-rotation error coverage.
+  then verify successor writes and reopen durability. Synchronous and
+  asynchronous transaction commits now route v7 capacity rejections through the
+  same bounded rotation path. Serializable transactions repeat OCC validation
+  after rotation while retaining their snapshot; regressions cover successful
+  sync/async commits and a conflicting write during the retry window.
+  Nonserializable v7 Parallel async transactions also acquire the native
+  preparation permit before blocking dispatch and retain it across capacity
+  rotation. Successful admission releases it before durability, preserving
+  concurrent groups. A one-blocking-worker regression verifies that a queued
+  native point writer cannot lease the source ahead of transaction rotation;
+  both writes finish against the successor and survive reopen.
   A test-only ledger limit override now forces `SealIndexLimit` through the real
   Parallel reservation path for `put_async` on a nonempty Active segment; the
   retry rotates, succeeds against the successor, and survives reopen. Simultaneous
-  capacity rejections, cancelled retries, OCC revalidation, and distinct global
-  backpressure and oversize outcomes remain outstanding.
+  capacity rejections, cancelled retries, and distinct global backpressure and
+  oversize outcomes remain outstanding.
 - Extend `PitrManifestRecord::SealStarted`, its obligation state, replay, and
   snapshot validation with the versioned immutable boundary. Persist Active
   references using only logical anchors. Allocation-only timestamp watermarks
