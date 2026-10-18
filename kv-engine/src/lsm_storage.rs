@@ -20372,6 +20372,95 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn v7_native_async_point_writes_retry_after_seal_index_limit() -> anyhow::Result<()> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()?;
+        let directory = tempdir()?;
+        let max_segment_bytes = 64 * 1024;
+        let options =
+            v7_recovery_test_database_with_segment_limit(directory.path(), max_segment_bytes)?;
+        let database = directory.path().join("db");
+        let engine = KvEngine::open_with_wal_io_mode(
+            &database,
+            options.clone(),
+            crate::wal::WalIoMode::Parallel,
+        )?;
+        let initial_segment_id = engine
+            .pitr_manifest_state
+            .lock()
+            .active_segment_id
+            .expect("v7 Active segment is installed");
+        let source = engine.inner.state.load().memtable.clone();
+        let source_owner = source
+            .wal_v7_reservation_owner()
+            .expect("active v7 WAL has a reservation owner");
+        let retained_resources = source_owner
+            .retained_resources()
+            .expect("active v7 WAL shares its retained-resource ledger");
+        let existing_seal_index_bytes = retained_resources.snapshot().seal_index_bytes;
+        assert!(existing_seal_index_bytes > 0);
+        let frontier = source.v7_frontier_cursor()?;
+        let frame_len = crate::wal::v7::codec::WAL_V7_FRAME_LEN as u64;
+        let physical_end = frontier.frame_offset + frame_len;
+        assert!(
+            physical_end + 2 * frame_len <= max_segment_bytes,
+            "the active segment has room for a DATA frame and terminal frontier"
+        );
+
+        // Tighten the test ledger to its current index charge so the real
+        // Parallel admission path returns SealIndexLimit for this write.
+        retained_resources.set_max_seal_index_bytes_for_test(existing_seal_index_bytes);
+        runtime.block_on(async {
+            let pause = crate::lsm_storage::native_write::NativeWritePause::new(
+                crate::lsm_storage::native_write::NativeWriteStage::CapacityRetry,
+            );
+            *engine.inner.native_write_pause.lock() = Some(Arc::clone(&pause));
+            let first_engine = Arc::clone(&engine);
+            let first = tokio::spawn(async move {
+                first_engine
+                    .put_async(b"retry-seal-index-put", b"value")
+                    .await
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(5), pause.reached.notified())
+                .await
+                .expect("seal-index rejection must reach the retry handoff before rotation");
+
+            // Let the successor use the persisted production limit after this
+            // injected Active-image reservation rejection has been observed.
+            retained_resources.set_max_seal_index_bytes_for_test(u64::MAX);
+            pause.release.notify_one();
+            tokio::time::timeout(std::time::Duration::from_secs(5), first)
+                .await
+                .expect("seal-index retry must rotate and complete")??;
+            Ok::<_, anyhow::Error>(())
+        })?;
+
+        assert_eq!(
+            engine.pitr_manifest_state.lock().active_segment_id,
+            Some(initial_segment_id + 1)
+        );
+        assert_eq!(
+            engine.get(b"retry-seal-index-put")?,
+            Some(Bytes::from_static(b"value"))
+        );
+
+        engine.close_storage()?;
+        drop(engine);
+
+        let reopened =
+            KvEngine::open_with_wal_io_mode(&database, options, crate::wal::WalIoMode::Parallel)?;
+        assert_eq!(
+            reopened.get(b"retry-seal-index-put")?,
+            Some(Bytes::from_static(b"value"))
+        );
+        reopened.close_storage()?;
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn v7_async_range_and_transaction_capacity_errors_preserve_active_segment() -> anyhow::Result<()>
     {
         let runtime = tokio::runtime::Builder::new_current_thread()
