@@ -279,6 +279,7 @@ fn round_up_to_allocation_unit(bytes: u64, allocation_unit: u64) -> Result<u64> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::wal::v7::admission::WalV7ResourceLimits;
 
     fn config(max_segment_bytes: u64, max_source_spool_bytes: u64) -> PersistedPitrConfig {
         PersistedPitrConfig {
@@ -287,6 +288,183 @@ mod tests {
             max_unarchived_bytes: max_segment_bytes,
             max_source_spool_bytes,
         }
+    }
+
+    fn eligible_migration_capacity() -> V7MigrationCapacity {
+        let segment_bytes = MINIMUM_NONEMPTY_V7_SEGMENT_BYTES;
+        assess_v7_migration_capacity(
+            &config(segment_bytes, 256 * 1024),
+            WAL_V5_HEADER_LEN as u64,
+            0,
+            4096,
+        )
+        .unwrap()
+    }
+
+    fn resource_ledger(
+        max_source_spool_bytes: u64,
+        max_recovery_workspace_bytes: u64,
+    ) -> WalV7ResourceLedger {
+        WalV7ResourceLedger::new(WalV7ResourceLimits {
+            max_logical_wal_bytes: 1,
+            max_source_spool_bytes,
+            max_recovery_workspace_bytes,
+            max_buffer_memory_bytes: 0,
+            max_seal_index_bytes: 0,
+        })
+        .unwrap()
+    }
+
+    fn invalid_assessment_error(capacity: V7MigrationCapacity) -> V7MigrationReservationError {
+        let ledger = resource_ledger(u64::MAX, u64::MAX);
+        reserve_v7_migration_transition(capacity, &ledger)
+            .err()
+            .unwrap()
+    }
+
+    #[test]
+    fn migration_reservation_owns_both_charges_until_drop() {
+        let capacity = eligible_migration_capacity();
+        assert_eq!(capacity.decision, V7MigrationCapacityDecision::Eligible);
+        let source_spool_bytes =
+            capacity.required_transition_bytes - capacity.recovery_workspace_bytes;
+        let ledger = resource_ledger(
+            capacity.source_spool_limit_bytes,
+            capacity.recovery_workspace_bytes,
+        );
+
+        let reservation = reserve_v7_migration_transition(capacity, &ledger).unwrap();
+        assert_eq!(
+            ledger.snapshot(),
+            WalV7ResourceCharge {
+                source_spool_bytes,
+                recovery_workspace_bytes: capacity.recovery_workspace_bytes,
+                ..WalV7ResourceCharge::default()
+            }
+        );
+
+        drop(reservation);
+        assert_eq!(ledger.snapshot(), WalV7ResourceCharge::default());
+    }
+
+    #[test]
+    fn migration_reservation_reports_deferred_assessment_without_charging() {
+        let segment_bytes = MINIMUM_NONEMPTY_V7_SEGMENT_BYTES;
+        let capacity = assess_v7_migration_capacity(
+            &config(segment_bytes, segment_bytes),
+            WAL_V5_HEADER_LEN as u64,
+            0,
+            4096,
+        )
+        .unwrap();
+        assert_eq!(
+            capacity.decision,
+            V7MigrationCapacityDecision::Deferred(
+                V7MigrationDeferralReason::InsufficientSourceSpool
+            )
+        );
+        let ledger = resource_ledger(segment_bytes, capacity.recovery_workspace_bytes);
+
+        let error = reserve_v7_migration_transition(capacity, &ledger).unwrap_err();
+        assert!(matches!(
+            error,
+            V7MigrationReservationError::Deferred(
+                V7MigrationDeferralReason::InsufficientSourceSpool
+            )
+        ));
+        assert_eq!(
+            error.to_string(),
+            "PITR v7 migration is deferred: InsufficientSourceSpool"
+        );
+        assert!(error.source().is_none());
+        assert_eq!(ledger.snapshot(), WalV7ResourceCharge::default());
+    }
+
+    #[test]
+    fn migration_reservation_rejects_malformed_assessments() {
+        let valid = eligible_migration_capacity();
+
+        let mut subtraction_underflow = valid;
+        subtraction_underflow.required_transition_bytes =
+            subtraction_underflow.recovery_workspace_bytes - 1;
+        let error = invalid_assessment_error(subtraction_underflow);
+        assert!(matches!(
+            error,
+            V7MigrationReservationError::InvalidAssessment
+        ));
+        assert_eq!(
+            error.to_string(),
+            "invalid PITR v7 migration capacity assessment"
+        );
+        assert!(error.source().is_none());
+
+        let mut total_overflow = valid;
+        total_overflow.retained_source_spool_bytes = u64::MAX;
+        total_overflow.required_transition_bytes = 2;
+        total_overflow.recovery_workspace_bytes = 1;
+        assert!(matches!(
+            invalid_assessment_error(total_overflow),
+            V7MigrationReservationError::InvalidAssessment
+        ));
+
+        let mut zero_source_spool = valid;
+        zero_source_spool.required_transition_bytes = zero_source_spool.recovery_workspace_bytes;
+        zero_source_spool.required_total_bytes = zero_source_spool
+            .retained_source_spool_bytes
+            .checked_add(zero_source_spool.required_transition_bytes)
+            .unwrap();
+        assert!(matches!(
+            invalid_assessment_error(zero_source_spool),
+            V7MigrationReservationError::InvalidAssessment
+        ));
+
+        let mut inconsistent_total = valid;
+        inconsistent_total.required_total_bytes += 1;
+        assert!(matches!(
+            invalid_assessment_error(inconsistent_total),
+            V7MigrationReservationError::InvalidAssessment
+        ));
+
+        let mut inconsistent_available = valid;
+        inconsistent_available.available_capacity_bytes -= 1;
+        assert!(matches!(
+            invalid_assessment_error(inconsistent_available),
+            V7MigrationReservationError::InvalidAssessment
+        ));
+
+        let mut insufficient_snapshot = valid;
+        insufficient_snapshot.source_spool_limit_bytes =
+            insufficient_snapshot.required_transition_bytes - 1;
+        insufficient_snapshot.available_capacity_bytes = insufficient_snapshot
+            .source_spool_limit_bytes
+            .saturating_sub(insufficient_snapshot.retained_source_spool_bytes);
+        assert!(matches!(
+            invalid_assessment_error(insufficient_snapshot),
+            V7MigrationReservationError::InvalidAssessment
+        ));
+    }
+
+    #[test]
+    fn migration_reservation_reports_live_ledger_rejection() {
+        let capacity = eligible_migration_capacity();
+        let ledger = resource_ledger(
+            capacity.required_transition_bytes - 1,
+            capacity.recovery_workspace_bytes,
+        );
+
+        let error = reserve_v7_migration_transition(capacity, &ledger).unwrap_err();
+        assert!(matches!(
+            error,
+            V7MigrationReservationError::Ledger(WalV7ReservationError::SourceSpoolLimit {
+                generation: 0
+            })
+        ));
+        assert_eq!(
+            error.to_string(),
+            "could not reserve PITR v7 migration capacity: v7 source spool limit exceeded"
+        );
+        assert!(error.source().is_some());
+        assert_eq!(ledger.snapshot(), WalV7ResourceCharge::default());
     }
 
     #[test]
