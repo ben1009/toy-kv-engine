@@ -4370,6 +4370,94 @@ impl KvEngine {
         self.create_recovery_point_locked_cancellable(resume_admission_on_success, None, false)
     }
 
+    /// Capture a v7 checkpoint at a fixed MVCC cutoff while serializing PITR
+    /// lifecycle changes. Admission stays stopped through the source flush and
+    /// manifest snapshot; it resumes only after the pinned checkpoint view is
+    /// complete.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn with_v7_checkpoint_boundary<T>(
+        &self,
+        capture: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        let _operation_guard = self.pitr_operation_lock.lock();
+        let _barrier = self.pitr_barrier_lock.lock();
+        self.inner.lifecycle.ensure_open()?;
+        ensure!(
+            self.inner.state.load().memtable.uses_v7_wal(),
+            "v7 checkpoint boundary requires an Active v7 PITR WAL"
+        );
+        ensure!(
+            !self.pitr_publication_unknown.load(Ordering::Acquire),
+            "v7 checkpoint capture cannot proceed while a PITR manifest transition has an unknown outcome; reopen the database first"
+        );
+
+        let sequencer = self
+            .inner
+            .mvcc
+            .as_ref()
+            .ok_or_else(|| anyhow!("v7 checkpoint capture requires MVCC"))?;
+        let admission_was_open = sequencer.commit_admission_is_open();
+        sequencer.stop_commit_admission_and_capture()?;
+
+        // Stop-and-drain first, then inspect the active image. A commit that
+        // was already admitted before the checkpoint cutoff must be included
+        // in the recovery point and flushed into the captured SST set.
+        let active = self.inner.state.load().memtable.clone();
+        ensure!(
+            active.uses_v7_wal(),
+            "Active WAL changed during v7 checkpoint admission drain"
+        );
+        if !active.is_empty() {
+            match self.create_recovery_point_locked(false)? {
+                crate::pitr::api::RecoveryPointOutcome::Durable(_) => {}
+                crate::pitr::api::RecoveryPointOutcome::CommitPublishedButNotDurable {
+                    error,
+                    ..
+                } => {
+                    return Err(anyhow!(
+                        "v7 checkpoint boundary archive is not durable: {error}"
+                    ));
+                }
+                crate::pitr::api::RecoveryPointOutcome::PublicationUnknown { .. } => {
+                    return Err(anyhow!(
+                        "v7 checkpoint boundary archive publication is unknown"
+                    ));
+                }
+            }
+        }
+
+        let captured = capture();
+        if admission_was_open {
+            let health = (|| -> Result<()> {
+                ensure!(
+                    !self.pitr_publication_unknown.load(Ordering::Acquire),
+                    "v7 checkpoint capture cannot reopen writes after uncertain PITR publication"
+                );
+                sequencer.ensure_publication_healthy()?;
+                self.inner
+                    .manifest
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("v7 checkpoint capture requires a manifest"))?
+                    .ensure_durability_certain()?;
+                ensure!(
+                    !self.inner.state.load().memtable.v7_wal_requires_recovery(),
+                    "Active v7 WAL is poisoned; reopen the database before writing"
+                );
+                Ok(())
+            })();
+            if let Err(health_error) = health {
+                return match captured {
+                    Ok(_) => Err(health_error),
+                    Err(capture_error) => Err(capture_error.context(format!(
+                        "commit admission remains closed because v7 checkpoint state is unhealthy: {health_error:#}"
+                    ))),
+                };
+            }
+            sequencer.resume_commit_admission();
+        }
+        captured
+    }
+
     #[cfg(target_os = "linux")]
     fn seal_rotate_v7_active_wal(
         &self,
@@ -24313,7 +24401,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[tokio::test(flavor = "current_thread")]
-    async fn v7_checkpoint_capture_rejects_before_changing_active_boundary() -> anyhow::Result<()> {
+    async fn v7_checkpoint_capture_seals_and_flushes_the_fixed_cutoff() -> anyhow::Result<()> {
         for mode in [
             crate::wal::WalIoMode::Leader,
             crate::wal::WalIoMode::Parallel,
@@ -24326,30 +24414,22 @@ mod tests {
                 let engine = KvEngine::open_with_wal_io_mode(&database, options, mode)?;
                 engine.put(b"checkpoint-key", b"value")?;
 
-                let active = engine.inner.state.load().memtable.clone();
-                let wal_path = active.wal_path().unwrap().to_path_buf();
-                let wal_before = std::fs::read(&wal_path)?;
-                let manifest_before = std::fs::read(database.join("MANIFEST"))?;
-                let state_before = engine.pitr_manifest_state.lock().clone();
-                let error = if asynchronous {
-                    engine
-                        .create_checkpoint_async(&checkpoint_path)
-                        .await
-                        .unwrap_err()
+                let active_before = engine.inner.state.load().memtable.clone();
+                let segment_before = engine.pitr_manifest_state.lock().active_segment_id;
+                if asynchronous {
+                    engine.create_checkpoint_async(&checkpoint_path).await?;
                 } else {
-                    engine.create_checkpoint(&checkpoint_path).unwrap_err()
-                };
+                    engine.create_checkpoint(&checkpoint_path)?;
+                }
 
-                assert!(
-                    error
-                        .to_string()
-                        .contains("checkpoint capture for an Active v7 PITR WAL is not supported")
+                let active_after = engine.inner.state.load().memtable.clone();
+                assert!(!Arc::ptr_eq(&active_before, &active_after));
+                assert!(active_after.uses_v7_wal());
+                assert!(active_after.is_empty());
+                assert_ne!(
+                    engine.pitr_manifest_state.lock().active_segment_id,
+                    segment_before
                 );
-                assert!(Arc::ptr_eq(&active, &engine.inner.state.load().memtable));
-                assert_eq!(*engine.pitr_manifest_state.lock(), state_before);
-                assert_eq!(std::fs::read(&wal_path)?, wal_before);
-                assert_eq!(std::fs::read(database.join("MANIFEST"))?, manifest_before);
-                assert!(!checkpoint_path.exists());
                 assert!(
                     engine
                         .inner
@@ -24358,12 +24438,126 @@ mod tests {
                         .unwrap()
                         .commit_admission_is_open()
                 );
-                engine.put(b"after-checkpoint-rejection", b"accepted")?;
+
+                let checkpoint =
+                    KvEngine::open(&checkpoint_path, LsmStorageOptions::default_for_test())?;
+                assert_eq!(
+                    checkpoint.get(b"checkpoint-key")?,
+                    Some(Bytes::from_static(b"value"))
+                );
+                engine.put(b"after-checkpoint", b"newer")?;
+                assert_eq!(checkpoint.get(b"after-checkpoint")?, None);
+                checkpoint.close()?;
                 engine.close_storage()?;
             }
         }
 
         Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn v7_checkpoint_capture_error_reopens_healthy_admission() -> anyhow::Result<()> {
+        for mode in [
+            crate::wal::WalIoMode::Leader,
+            crate::wal::WalIoMode::Parallel,
+        ] {
+            let directory = tempdir()?;
+            let options = v7_recovery_test_database(directory.path())?;
+            let database = directory.path().join("db");
+            let engine = KvEngine::open_with_wal_io_mode(&database, options.clone(), mode)?;
+            engine.put(b"before-failed-checkpoint", b"durable")?;
+
+            let error = engine
+                .with_v7_checkpoint_boundary(|| -> anyhow::Result<()> {
+                    anyhow::bail!("injected checkpoint capture failure")
+                })
+                .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("injected checkpoint capture failure")
+            );
+            assert!(
+                engine
+                    .inner
+                    .mvcc
+                    .as_ref()
+                    .unwrap()
+                    .commit_admission_is_open()
+            );
+            engine.put(b"after-failed-checkpoint", b"writable")?;
+            engine.close_storage()?;
+            drop(engine);
+
+            let reopened = KvEngine::open_with_wal_io_mode(&database, options, mode)?;
+            assert_eq!(
+                reopened.get(b"before-failed-checkpoint")?,
+                Some(Bytes::from_static(b"durable"))
+            );
+            assert_eq!(
+                reopened.get(b"after-failed-checkpoint")?,
+                Some(Bytes::from_static(b"writable"))
+            );
+            reopened.close_storage()?;
+        }
+
+        Ok(())
+    }
+
+    #[cfg(all(target_os = "linux", feature = "chaos-testing"))]
+    #[test]
+    fn failpoint_v7_checkpoint_reopens_admission_after_pinning_cutoff() {
+        use crate::chaos::failpoint::FailScenario;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let scenario = FailScenario::setup();
+        for mode in [
+            crate::wal::WalIoMode::Leader,
+            crate::wal::WalIoMode::Parallel,
+        ] {
+            let directory = tempdir().unwrap();
+            let options = v7_recovery_test_database(directory.path()).unwrap();
+            let database = directory.path().join("db");
+            let checkpoint_path = directory.path().join("checkpoint");
+            let engine = KvEngine::open_with_wal_io_mode(&database, options, mode).unwrap();
+            engine.put(b"captured", b"value").unwrap();
+
+            let callback_ran = Arc::new(AtomicBool::new(false));
+            let callback_ran_in_failpoint = Arc::clone(&callback_ran);
+            let writer = Arc::clone(&engine);
+            fail::cfg_callback("checkpoint.after_file_copy", move || {
+                if !callback_ran_in_failpoint.swap(true, Ordering::AcqRel) {
+                    assert!(
+                        writer
+                            .inner
+                            .mvcc
+                            .as_ref()
+                            .unwrap()
+                            .commit_admission_is_open()
+                    );
+                    writer
+                        .put(b"after-capture", b"newer")
+                        .expect("checkpoint copy runs after v7 admission resumes");
+                }
+            })
+            .unwrap();
+
+            engine.create_checkpoint(&checkpoint_path).unwrap();
+            fail::remove("checkpoint.after_file_copy");
+            assert!(callback_ran.load(Ordering::Acquire));
+
+            let checkpoint =
+                KvEngine::open(&checkpoint_path, LsmStorageOptions::default_for_test()).unwrap();
+            assert_eq!(
+                checkpoint.get(b"captured").unwrap(),
+                Some(Bytes::from_static(b"value"))
+            );
+            assert_eq!(checkpoint.get(b"after-capture").unwrap(), None);
+            checkpoint.close().unwrap();
+            engine.close_storage().unwrap();
+        }
+        scenario.teardown();
     }
 
     #[cfg(all(target_os = "linux", feature = "chaos-testing"))]

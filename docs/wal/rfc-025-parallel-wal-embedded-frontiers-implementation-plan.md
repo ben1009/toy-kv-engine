@@ -159,8 +159,13 @@ drains admitted operations. Repeated PITR close calls reuse the cached final
 archived point and storage-close result without another boundary. An ordinary
 v7 storage close does not certify archive durability; a later `close_pitr`
 requires reopening before it can publish the final archived boundary.
-V7 checkpoint and backup capture, remaining public write shapes (including
-other OCC APIs), and broader lifecycle rotation remain. PITR manifest replay and
+Standalone checkpoint capture now supports Active v7 WALs: it establishes a
+fixed cutoff, seals and rotates a nonempty source WAL, flushes the captured
+state, then pins the immutable file set before reopening admission. The
+checkpoint manifest is detached from the source PITR repository because the
+checkpoint omits that repository and source WAL. Incremental-backup capture,
+remaining public write shapes (including other OCC APIs), and broader lifecycle
+rotation remain. PITR manifest replay and
 snapshots now retain and validate a v7 format marker and the full immutable
 boundary in Sealing obligations;
 seal completion checks the WAL digest against that boundary. A v7 v2 seal
@@ -1022,10 +1027,16 @@ beforehand and the WAL sync succeeds; a failed sync leaves admission closed for
 recovery. Public close applies the same fixed-cutoff rule while keeping
 admission closed: it syncs the Active WAL and persists its resulting logical
 boundary before tearing down storage. Explicit recovery-point creation and v7
-forced flush use the sealing and successor-rotation path. Ordinary checkpoint
-and backup capture reject Active v7 WALs until they can preserve the sealed
-source chain. PITR base-backup capture follows a separate path and remains
-unqualified for v7.
+forced flush use the sealing and successor-rotation path. Standalone checkpoint
+capture now uses the v7 sealing and successor-rotation path, flushes the fixed
+cutoff, and pins its immutable file set before reopening admission. Its
+manifest snapshot is detached from the source PITR repository because the
+checkpoint omits that repository and source WAL. Incremental-backup capture
+still rejects Active v7 WALs until it can preserve the sealed source chain.
+PITR base-backup capture follows a separate path and remains unqualified for v7.
+If checkpoint capture fails, commit admission resumes only when the sequencer,
+manifest durability, active WAL, and PITR publication state remain healthy;
+uncertain state stays fail-closed for recovery.
 
 Regression tests exercise both public sync APIs with a commit reserved before
 its WAL ticket exists and preserve an existing admission pause. A separate test

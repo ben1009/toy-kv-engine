@@ -257,8 +257,7 @@ struct CheckpointMarker {
 
 impl KvEngine {
     pub fn create_checkpoint(&self, target_dir: impl AsRef<Path>) -> Result<CheckpointStats> {
-        self.inner
-            .create_checkpoint_with_options(target_dir, CheckpointOptions::default())
+        self.create_checkpoint_with_options(target_dir, CheckpointOptions::default())
     }
 
     pub fn create_checkpoint_with_options(
@@ -266,6 +265,7 @@ impl KvEngine {
         target_dir: impl AsRef<Path>,
         options: CheckpointOptions,
     ) -> Result<CheckpointStats> {
+        let _lifecycle_guard = self.inner.lifecycle.admit_write()?;
         self.inner
             .create_checkpoint_with_options(target_dir, options)
     }
@@ -303,10 +303,6 @@ impl LsmStorageInner {
         target_dir: impl AsRef<Path>,
         options: CheckpointOptions,
     ) -> Result<CheckpointStats> {
-        ensure!(
-            !self.state.load().memtable.uses_v7_wal(),
-            "checkpoint capture for an Active v7 PITR WAL is not supported"
-        );
         self.validate_checkpoint_options(target_dir.as_ref(), &options)?;
 
         let target_dir = absolute_path(target_dir.as_ref())?;
@@ -318,10 +314,18 @@ impl LsmStorageInner {
         cleanup_checkpoint_tmps_for_target(&target_dir)?;
 
         let result = (|| {
-            self.prepare_forced_memtable_freeze(None, false)?;
-            let _checkpoint_guard = self.checkpoint_lock.lock();
-            let prepared = self.prepare_checkpoint(&target_dir, &tmp_dir)?;
-            drop(_checkpoint_guard);
+            let prepared = if self.state.load().memtable.uses_v7_wal() {
+                // Create the target staging directory before changing the
+                // active WAL boundary. The v7 capture helper stops admission,
+                // seals a nonempty active segment, and keeps admission stopped
+                // until the immutable checkpoint file set has been pinned.
+                self.prepare_checkpoint_staging(&target_dir, &tmp_dir)?;
+                self.capture_checkpoint_state_with_v7_boundary()?
+            } else {
+                self.prepare_forced_memtable_freeze(None, false)?;
+                let _checkpoint_guard = self.checkpoint_lock.lock();
+                self.prepare_checkpoint(&target_dir, &tmp_dir)?
+            };
             self.publish_prepared_checkpoint(&target_dir, &tmp_dir, &options, prepared)
         })();
 
@@ -382,6 +386,11 @@ impl LsmStorageInner {
         target_dir: &Path,
         tmp_dir: &Path,
     ) -> Result<CheckpointCapture<'a>> {
+        self.prepare_checkpoint_staging(target_dir, tmp_dir)?;
+        self.capture_checkpoint_state_locked()
+    }
+
+    fn prepare_checkpoint_staging(&self, target_dir: &Path, tmp_dir: &Path) -> Result<()> {
         let staging_tmp_dir = checkpoint_staging_tmp_dir(tmp_dir);
         fs::create_dir_all(&staging_tmp_dir).with_context(|| {
             format!(
@@ -417,7 +426,33 @@ impl LsmStorageInner {
             crate::chaos::failpoint::fail_point!("checkpoint.after_in_progress_marker");
         }
 
-        self.capture_checkpoint_state_locked()
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn capture_checkpoint_state_with_v7_boundary(&self) -> Result<CheckpointCapture<'_>> {
+        let engine = self
+            .weak_engine
+            .get()
+            .and_then(std::sync::Weak::upgrade)
+            .ok_or_else(|| anyhow!("PITR engine owner is not installed"))?;
+        engine.with_v7_checkpoint_boundary(|| {
+            let _checkpoint_guard = self.checkpoint_lock.lock();
+            let mut capture = self.capture_checkpoint_state_locked()?;
+            // This checkpoint contains the complete committed state in its
+            // pinned immutable files. It does not copy the source PITR WAL or
+            // repository, so do not make the standalone checkpoint depend on
+            // the source's Active v7 boundary.
+            if let ManifestRecord::Snapshot { pitr_state, .. } = &mut capture.snapshot_record {
+                *pitr_state = Some(crate::pitr::manifest::PitrState::default());
+            }
+            Ok(capture)
+        })
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn capture_checkpoint_state_with_v7_boundary(&self) -> Result<CheckpointCapture<'_>> {
+        bail!("v7 PITR checkpoint capture requires Linux")
     }
 
     fn publish_prepared_checkpoint(
@@ -518,15 +553,17 @@ impl LsmStorageInner {
     /// Flush committed state, then capture and pin the exact immutable file
     /// set named by a canonical manifest snapshot.
     ///
-    /// Checkpoints and RFC 022 incremental backups share this physical
-    /// consistency boundary. The `checkpoint_lock` is intentionally held only
-    /// while the boundary is created; the returned capture owns the file pins
-    /// for the potentially much longer copy/link phase.
+    /// Legacy checkpoints and RFC 022 incremental backups share this physical
+    /// consistency boundary. Active v7 standalone checkpoints use their sealed
+    /// PITR boundary before calling the locked capture helper. The
+    /// `checkpoint_lock` is intentionally held only while the boundary is
+    /// created; the returned capture owns the file pins for the potentially
+    /// much longer copy/link phase.
     #[allow(dead_code)] // consumed by the forthcoming backup publisher
     pub(crate) fn capture_checkpoint_state(&self) -> Result<CheckpointCapture<'_>> {
         ensure!(
             !self.state.load().memtable.uses_v7_wal(),
-            "checkpoint capture for an Active v7 PITR WAL is not supported"
+            "backup capture for an Active v7 PITR WAL is not supported"
         );
         self.prepare_forced_memtable_freeze(None, false)?;
         let _checkpoint_guard = self.checkpoint_lock.lock();
