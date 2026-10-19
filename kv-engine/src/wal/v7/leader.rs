@@ -1144,7 +1144,7 @@ mod tests {
                     max_recovery_workspace_bytes: 0,
                     ..resource_limits()
                 },
-                WalV7ReservationError::SourceSpoolLimit,
+                WalV7ReservationError::SourceSpoolLimit { generation: 0 },
             ),
             (
                 WalV7ResourceLimits {

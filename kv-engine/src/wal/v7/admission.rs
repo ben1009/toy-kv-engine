@@ -18,12 +18,13 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
+    time::Duration,
 };
 
 #[cfg(test)]
 use std::sync::atomic::AtomicU64;
 
-use parking_lot::Mutex;
+use parking_lot::{Condvar, Mutex};
 
 use super::codec::{WAL_V7_FRAME_LEN, data_fragment_count};
 
@@ -131,7 +132,7 @@ pub(crate) enum WalV7ReservationError {
     EmptyReservation,
     ArithmeticOverflow,
     LogicalWalLimit,
-    SourceSpoolLimit,
+    SourceSpoolLimit { generation: u64 },
     RecoveryWorkspaceLimit,
     BufferMemoryLimit,
     SealIndexLimit,
@@ -152,7 +153,7 @@ impl fmt::Display for WalV7ReservationError {
             Self::EmptyReservation => "v7 resource reservation is empty",
             Self::ArithmeticOverflow => "v7 resource accounting overflow",
             Self::LogicalWalLimit => "v7 logical WAL limit exceeded",
-            Self::SourceSpoolLimit => "v7 source spool limit exceeded",
+            Self::SourceSpoolLimit { .. } => "v7 source spool limit exceeded",
             Self::RecoveryWorkspaceLimit => "v7 recovery workspace limit exceeded",
             Self::BufferMemoryLimit => "v7 buffer memory limit exceeded",
             Self::SealIndexLimit => "v7 seal index limit exceeded",
@@ -196,6 +197,7 @@ struct LedgerState {
     next_id: u64,
     charged: WalV7ResourceCharge,
     reservations: BTreeMap<u64, WalV7ResourceCharge>,
+    source_spool_generation: u64,
 }
 
 #[derive(Debug)]
@@ -206,6 +208,10 @@ struct WalV7ResourceLedgerInner {
     #[cfg(test)]
     test_max_seal_index_bytes: AtomicU64,
     state: Mutex<LedgerState>,
+    source_spool_changed: Condvar,
+    async_source_spool_changed: tokio::sync::Notify,
+    #[cfg(test)]
+    source_spool_waiters: AtomicU64,
 }
 
 /// Thread-safe ledger for owned, multi-resource reservations.
@@ -550,6 +556,48 @@ impl WalV7ReservationOwner {
     pub(crate) fn snapshot(&self) -> WalV7ResourceCharge {
         self.ledger.snapshot()
     }
+
+    /// Wait until source-spool capacity changes or `should_wait` becomes false.
+    /// The predicate is polled while blocked so callers can cancel a wait even
+    /// when no reservation is released.
+    pub(crate) fn wait_for_source_spool_change_while(
+        &self,
+        generation: u64,
+        should_wait: impl Fn() -> bool,
+    ) -> bool {
+        self.ledger
+            .wait_for_source_spool_change_while(generation, should_wait)
+    }
+
+    /// Wait for one bounded interval for a source-spool release.
+    pub(crate) fn wait_for_source_spool_change_for(
+        &self,
+        generation: u64,
+        timeout: Duration,
+    ) -> bool {
+        self.ledger
+            .wait_for_source_spool_change_for(generation, timeout)
+    }
+
+    /// Async counterpart to [`Self::wait_for_source_spool_change_while`].
+    pub(crate) async fn wait_for_source_spool_change_async_while<F>(
+        &self,
+        generation: u64,
+        closing: &tokio::sync::Notify,
+        should_wait: F,
+    ) -> bool
+    where
+        F: Fn() -> bool,
+    {
+        self.ledger
+            .wait_for_source_spool_change_async_while(generation, closing, should_wait)
+            .await
+    }
+
+    #[cfg(test)]
+    pub(crate) fn source_spool_waiter_count(&self) -> u64 {
+        self.ledger.source_spool_waiter_count()
+    }
 }
 
 impl WalV7OwnedBatchReservation {
@@ -686,7 +734,12 @@ impl WalV7ResourceLedger {
                     next_id: 1,
                     charged: WalV7ResourceCharge::default(),
                     reservations: BTreeMap::new(),
+                    source_spool_generation: 0,
                 }),
+                source_spool_changed: Condvar::new(),
+                async_source_spool_changed: tokio::sync::Notify::new(),
+                #[cfg(test)]
+                source_spool_waiters: AtomicU64::new(0),
             }),
         })
     }
@@ -729,7 +782,9 @@ impl WalV7ResourceLedger {
             .ok_or(WalV7ReservationError::ArithmeticOverflow)?
             > self.inner.limits.max_source_spool_bytes
         {
-            return Err(WalV7ReservationError::SourceSpoolLimit);
+            return Err(WalV7ReservationError::SourceSpoolLimit {
+                generation: state.source_spool_generation,
+            });
         }
         if next.recovery_workspace_bytes > self.inner.limits.max_recovery_workspace_bytes {
             return Err(WalV7ReservationError::RecoveryWorkspaceLimit);
@@ -916,6 +971,10 @@ impl WalV7ResourceLedger {
         state.reservations.insert(reservation.id, retained);
         state.charged = next;
         reservation.charge = retained;
+        state.source_spool_generation = state.source_spool_generation.wrapping_add(1);
+        drop(state);
+        self.inner.source_spool_changed.notify_all();
+        self.inner.async_source_spool_changed.notify_waiters();
         Ok(())
     }
 
@@ -934,6 +993,97 @@ impl WalV7ResourceLedger {
 
     pub(crate) fn snapshot(&self) -> WalV7ResourceCharge {
         self.inner.state.lock().charged
+    }
+
+    /// Wait for a release that may make a failed source-spool reservation fit.
+    /// The generation comes from the failed reservation check, preventing a
+    /// release between rejection and waiting from being lost.
+    pub(crate) fn wait_for_source_spool_change(&self, generation: u64) {
+        self.wait_for_source_spool_change_while(generation, || true);
+    }
+
+    pub(crate) fn wait_for_source_spool_change_while(
+        &self,
+        generation: u64,
+        should_wait: impl Fn() -> bool,
+    ) -> bool {
+        #[cfg(test)]
+        let _waiter = SourceSpoolWaiter::new(&self.inner.source_spool_waiters);
+        let mut state = self.inner.state.lock();
+        while state.source_spool_generation == generation && should_wait() {
+            self.inner
+                .source_spool_changed
+                .wait_for(&mut state, Duration::from_millis(50));
+        }
+        state.source_spool_generation != generation
+    }
+
+    pub(crate) fn wait_for_source_spool_change_for(
+        &self,
+        generation: u64,
+        timeout: Duration,
+    ) -> bool {
+        #[cfg(test)]
+        let _waiter = SourceSpoolWaiter::new(&self.inner.source_spool_waiters);
+        let mut state = self.inner.state.lock();
+        let started = std::time::Instant::now();
+        while state.source_spool_generation == generation {
+            let remaining = timeout.saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                break;
+            }
+            self.inner
+                .source_spool_changed
+                .wait_for(&mut state, remaining);
+        }
+        state.source_spool_generation != generation
+    }
+
+    /// Async counterpart to [`Self::wait_for_source_spool_change`].
+    pub(crate) async fn wait_for_source_spool_change_async(&self, generation: u64) {
+        let closing = tokio::sync::Notify::new();
+        self.wait_for_source_spool_change_async_while(generation, &closing, || true)
+            .await;
+    }
+
+    pub(crate) async fn wait_for_source_spool_change_async_while<F>(
+        &self,
+        generation: u64,
+        closing: &tokio::sync::Notify,
+        should_wait: F,
+    ) -> bool
+    where
+        F: Fn() -> bool,
+    {
+        #[cfg(test)]
+        let _waiter = SourceSpoolWaiter::new(&self.inner.source_spool_waiters);
+        let notification = self.inner.async_source_spool_changed.notified();
+        tokio::pin!(notification);
+        let closing_notification = closing.notified();
+        tokio::pin!(closing_notification);
+        loop {
+            notification.as_mut().enable();
+            closing_notification.as_mut().enable();
+            if self.inner.state.lock().source_spool_generation != generation {
+                return true;
+            }
+            if !should_wait() {
+                return false;
+            }
+            tokio::select! {
+                () = notification.as_mut() => {
+                    notification.set(self.inner.async_source_spool_changed.notified());
+                }
+                () = closing_notification.as_mut() => {
+                    return self.inner.state.lock().source_spool_generation != generation;
+                }
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn source_spool_waiter_count(&self) -> u64 {
+        self.inner.source_spool_waiters.load(Ordering::Acquire)
     }
 
     #[cfg(test)]
@@ -1263,7 +1413,37 @@ fn release_reservation(
 
     state.reservations.remove(&id);
     state.charged = next;
+    let source_spool_released =
+        charge.source_spool_bytes > 0 || charge.recovery_workspace_bytes > 0;
+    if source_spool_released {
+        state.source_spool_generation = state.source_spool_generation.wrapping_add(1);
+    }
+    drop(state);
+    if source_spool_released {
+        ledger.source_spool_changed.notify_all();
+        ledger.async_source_spool_changed.notify_waiters();
+    }
     Ok(())
+}
+
+#[cfg(test)]
+struct SourceSpoolWaiter<'a> {
+    waiters: &'a AtomicU64,
+}
+
+#[cfg(test)]
+impl<'a> SourceSpoolWaiter<'a> {
+    fn new(waiters: &'a AtomicU64) -> Self {
+        waiters.fetch_add(1, Ordering::AcqRel);
+        Self { waiters }
+    }
+}
+
+#[cfg(test)]
+impl Drop for SourceSpoolWaiter<'_> {
+    fn drop(&mut self) {
+        self.waiters.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 #[cfg(test)]
@@ -1280,6 +1460,67 @@ mod tests {
             max_buffer_memory_bytes: 40,
             max_seal_index_bytes: 32,
         }
+    }
+
+    #[test]
+    fn source_spool_wait_wakes_after_a_quota_release() {
+        let ledger = WalV7ResourceLedger::new(limits()).unwrap();
+        let held = ledger.reserve(charge(0, 100, 0, 0, 0)).unwrap();
+        let generation = match ledger.reserve(charge(0, 1, 0, 0, 0)) {
+            Err(WalV7ReservationError::SourceSpoolLimit { generation }) => generation,
+            other => panic!("expected source-spool rejection, got {other:?}"),
+        };
+
+        let waiting_ledger = ledger.clone();
+        let waiter = std::thread::spawn(move || {
+            waiting_ledger.wait_for_source_spool_change(generation);
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while ledger.source_spool_waiter_count() == 0 && std::time::Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        let registered = ledger.source_spool_waiter_count() > 0;
+
+        drop(held);
+        waiter.join().unwrap();
+        assert!(registered, "the synchronous waiter was not registered");
+        let retry = ledger.reserve(charge(0, 1, 0, 0, 0)).unwrap();
+        assert_eq!(ledger.snapshot().source_spool_bytes, 1);
+        drop(retry);
+    }
+
+    #[tokio::test]
+    async fn async_source_spool_wait_wakes_after_a_quota_release() {
+        let ledger = WalV7ResourceLedger::new(limits()).unwrap();
+        let held = ledger.reserve(charge(0, 100, 0, 0, 0)).unwrap();
+        let generation = match ledger.reserve(charge(0, 1, 0, 0, 0)) {
+            Err(WalV7ReservationError::SourceSpoolLimit { generation }) => generation,
+            other => panic!("expected source-spool rejection, got {other:?}"),
+        };
+
+        let waiting_ledger = ledger.clone();
+        let waiter = tokio::spawn(async move {
+            waiting_ledger
+                .wait_for_source_spool_change_async(generation)
+                .await;
+        });
+        let registered = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while ledger.source_spool_waiter_count() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .is_ok();
+
+        drop(held);
+        tokio::time::timeout(std::time::Duration::from_secs(5), waiter)
+            .await
+            .expect("async quota waiter did not wake")
+            .unwrap();
+        assert!(registered, "the asynchronous waiter was not registered");
+        let retry = ledger.reserve(charge(0, 1, 0, 0, 0)).unwrap();
+        assert_eq!(ledger.snapshot().source_spool_bytes, 1);
+        drop(retry);
     }
 
     fn charge(
@@ -1521,7 +1762,7 @@ mod tests {
                     max_source_spool_bytes: 20479,
                     ..exact_limits
                 },
-                WalV7ReservationError::SourceSpoolLimit,
+                WalV7ReservationError::SourceSpoolLimit { generation: 0 },
             ),
             (
                 WalV7ResourceLimits {
@@ -1593,7 +1834,7 @@ mod tests {
         let ledger = WalV7ResourceLedger::new(limits()).unwrap();
         assert_eq!(
             ledger.reserve(charge(0, 40, 61, 0, 0)),
-            Err(WalV7ReservationError::SourceSpoolLimit)
+            Err(WalV7ReservationError::SourceSpoolLimit { generation: 0 })
         );
         assert_eq!(
             ledger.reserve(charge(0, 0, 81, 0, 0)),
@@ -1741,7 +1982,7 @@ mod tests {
                     matches!(
                         error,
                         WalV7ReservationError::LogicalWalLimit
-                            | WalV7ReservationError::SourceSpoolLimit
+                            | WalV7ReservationError::SourceSpoolLimit { .. }
                             | WalV7ReservationError::BufferMemoryLimit
                             | WalV7ReservationError::SealIndexLimit
                     ),

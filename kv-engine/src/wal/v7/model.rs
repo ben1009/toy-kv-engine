@@ -2114,7 +2114,7 @@ mod tests {
             .expect_err("the second batch exceeds the source-spool limit");
         assert_eq!(
             error.downcast_ref::<WalV7ReservationError>(),
-            Some(&WalV7ReservationError::SourceSpoolLimit)
+            Some(&WalV7ReservationError::SourceSpoolLimit { generation: 0 })
         );
         assert_eq!(harness.writer.phase, CommitPhase::Idle);
         assert_eq!(harness.writer.next_ticket, ticket_before);
@@ -2617,7 +2617,7 @@ mod tests {
             (
                 u64::MAX,
                 recovered_wal_bytes,
-                Some(WalV7ReservationError::SourceSpoolLimit),
+                Some(WalV7ReservationError::SourceSpoolLimit { generation: 0 }),
             ),
             (after_append_wal_bytes, after_append_wal_bytes, None),
         ] {

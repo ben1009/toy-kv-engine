@@ -155,6 +155,35 @@ impl LsmStorageInner {
                 }
                 Err(error) => {
                     drop(lease);
+                    if let Some(generation) =
+                        crate::wal::Wal::v7_source_spool_wait_generation(&error)
+                    {
+                        drop(preparation);
+                        let owner = memtable
+                            .wal_v7_reservation_owner()
+                            .context("v7 source-spool rejection has no reservation owner")?;
+                        let flush_inner = Arc::clone(self);
+                        let flush_admission = Arc::clone(&admission);
+                        self.blocking
+                            .run_result_with_reserved_capacity(move || {
+                                let _admission = flush_admission;
+                                flush_inner.flush_immutable_for_source_spool_pressure()
+                            })
+                            .await
+                            .context(
+                                "failed to dispatch immutable flush under v7 source-spool pressure",
+                            )?;
+                        let closing = self.lifecycle.close_notify();
+                        if !owner
+                            .wait_for_source_spool_change_async_while(generation, closing, || {
+                                self.lifecycle.ensure_open().is_ok()
+                            })
+                            .await
+                        {
+                            self.lifecycle.ensure_open()?;
+                        }
+                        continue;
+                    }
                     let v7_capacity = crate::wal::Wal::is_v7_capacity_retry_error(&error);
                     if !v7_capacity && !crate::wal::Wal::is_retryable_full_error(&error) {
                         drop(preparation);
@@ -329,6 +358,35 @@ impl LsmStorageInner {
                 }
                 Err(error) => {
                     drop(lease);
+                    if let Some(generation) =
+                        crate::wal::Wal::v7_source_spool_wait_generation(&error)
+                    {
+                        drop(preparation);
+                        let owner = memtable
+                            .wal_v7_reservation_owner()
+                            .context("v7 source-spool rejection has no reservation owner")?;
+                        let flush_inner = Arc::clone(self);
+                        let flush_admission = Arc::clone(&admission);
+                        self.blocking
+                            .run_result_with_reserved_capacity(move || {
+                                let _admission = flush_admission;
+                                flush_inner.flush_immutable_for_source_spool_pressure()
+                            })
+                            .await
+                            .context(
+                                "failed to dispatch immutable flush under v7 source-spool pressure",
+                            )?;
+                        let closing = self.lifecycle.close_notify();
+                        if !owner
+                            .wait_for_source_spool_change_async_while(generation, closing, || {
+                                self.lifecycle.ensure_open().is_ok()
+                            })
+                            .await
+                        {
+                            self.lifecycle.ensure_open()?;
+                        }
+                        continue;
+                    }
                     let v7_capacity = crate::wal::Wal::is_v7_capacity_retry_error(&error);
                     if !v7_capacity && !crate::wal::Wal::is_retryable_full_error(&error) {
                         drop(preparation);

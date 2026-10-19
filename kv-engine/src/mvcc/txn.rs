@@ -10,7 +10,7 @@ use crate::{
     blocking_executor::BlockingExecutor,
     iterators::{StorageIterator, two_merge_iterator::TwoMergeIterator},
     lsm_iterator::{FusedIterator, LsmIterator},
-    lsm_storage::{AdmissionGuard, LsmStorageInner, prefix_upper_bound},
+    lsm_storage::{AdmissionGuard, LsmStorageInner, MvccWriteBatchOutcome, prefix_upper_bound},
     mem_table::map_bound,
     mvcc::ReadGuard,
 };
@@ -453,8 +453,24 @@ impl Transaction {
         &self,
         preparation: Option<tokio::sync::OwnedSemaphorePermit>,
     ) -> Result<()> {
+        let mut preparation = preparation;
+        self.commit_with_native_preparation_mode(&mut preparation, false, false)?
+            .into_result()
+    }
+
+    fn commit_with_native_preparation_mode(
+        &self,
+        preparation: &mut Option<tokio::sync::OwnedSemaphorePermit>,
+        defer_source_spool_wait: bool,
+        already_claimed: bool,
+    ) -> Result<MvccWriteBatchOutcome> {
         let allow_lifecycle_closing = self.lifecycle_guard.lock().is_some();
-        {
+        if already_claimed {
+            anyhow::ensure!(
+                self.committed.load(std::sync::atomic::Ordering::SeqCst),
+                "transaction claim was released before an owned retry"
+            );
+        } else {
             // A mutation that passed its committed check must finish both its
             // local write and OCC metadata before this owner can claim inputs.
             let _operation = self.operation_lock.lock();
@@ -490,7 +506,7 @@ impl Transaction {
         if entries.is_empty() {
             // Release the read guard to unpin the watermark.
             self.read_guard.lock().take();
-            return Ok(());
+            return Ok(MvccWriteBatchOutcome::Complete);
         }
         // For serializable transactions, perform OCC conflict detection.
         if let (Some(read_set), Some(write_set)) = (&self.read_set, &self.write_set) {
@@ -552,12 +568,23 @@ impl Transaction {
                             self.read_guard.lock().take();
                             drop(_commit_guard);
                             self.inner.try_freeze_memtable()?;
-                            return Ok(());
+                            return Ok(MvccWriteBatchOutcome::Complete);
                         }
                         Err(error)
                             if crate::wal::Wal::is_retryable_full_error(&error)
-                                || crate::wal::Wal::is_v7_capacity_retry_error(&error) =>
+                                || crate::wal::Wal::is_v7_capacity_retry_error(&error)
+                                || crate::wal::Wal::v7_source_spool_wait_generation(&error)
+                                    .is_some() =>
                         {
+                            if defer_source_spool_wait
+                                && let Some(generation) =
+                                    crate::wal::Wal::v7_source_spool_wait_generation(&error)
+                            {
+                                return Ok(MvccWriteBatchOutcome::SourceSpoolWait {
+                                    generation,
+                                    error,
+                                });
+                            }
                             drop(_commit_guard);
                             #[cfg(all(test, feature = "chaos-testing"))]
                             crate::chaos::failpoint::before_parallel_wal_transaction_rotation();
@@ -598,32 +625,100 @@ impl Transaction {
             .iter()
             .map(|(k, v, t)| (k.clone(), v.clone(), *t))
             .collect();
-        if let Err(e) = self.inner.mvcc_write_batch_with_native_preparation(
+        let outcome = match self.inner.mvcc_write_batch_with_native_preparation(
             &owned,
             preparation,
             allow_lifecycle_closing,
+            defer_source_spool_wait,
         ) {
-            // Revert committed flag so caller can retry.
-            self.committed
-                .store(false, std::sync::atomic::Ordering::SeqCst);
-            return Err(e);
+            Ok(outcome) => outcome,
+            Err(error) => {
+                // Revert committed flag so caller can retry.
+                self.committed
+                    .store(false, std::sync::atomic::Ordering::SeqCst);
+                return Err(error);
+            }
+        };
+        if matches!(&outcome, MvccWriteBatchOutcome::Complete) {
+            // A deferred wait retains the claim and snapshot for the owned retry.
+            self.read_guard.lock().take();
         }
-        // Release the read guard to unpin the watermark.
-        self.read_guard.lock().take();
 
-        Ok(())
+        Ok(outcome)
     }
 
     /// Commit the transaction asynchronously.
     ///
     /// Runs the same OCC, WAL rotation and publication protocol as
     /// [`commit`](Self::commit) on the bounded blocking executor.
-    /// Once dispatched, the owned commit retains its snapshot and shutdown
-    /// registration until it settles, even if the caller cancels the wait.
+    /// Once the owned coordinator is spawned, it retains its snapshot and
+    /// shutdown registration until it settles, even if the caller cancels the wait.
     pub fn commit_async(&self) -> impl std::future::Future<Output = Result<()>> + Send + use<> {
-        // Retain the state without consuming the snapshot or copying writes.
-        // The blocking owner claims the commit first, then reads its inputs.
-        let owned = Self {
+        let owned = self.clone_for_async_commit();
+        let blocking = self.blocking.clone();
+
+        async move {
+            // A detached coordinator may still need PITR maintenance or close
+            // reconciliation. Keep the public owner alive so dropping the last
+            // caller cannot shut that work down before this commit settles.
+            let engine_owner = owned
+                .inner
+                .weak_engine
+                .get()
+                .and_then(std::sync::Weak::upgrade);
+            // Preserve the existing pre-dispatch admission point. Once the
+            // coordinator is spawned, it owns the transaction across quota
+            // waits and retries even if the caller drops its JoinHandle.
+            let preparation = acquire_native_preparation(Arc::clone(&owned.inner)).await?;
+            tokio::spawn(async move {
+                let _engine_owner = engine_owner;
+                let mut preparation = preparation;
+                let mut already_claimed = false;
+                loop {
+                    let attempt = owned.clone_for_async_commit();
+                    let mut attempt_preparation = preparation.take();
+                    let (attempt_result, returned_preparation) = blocking
+                        .run(move || {
+                            let result = attempt.commit_with_native_preparation_mode(
+                                &mut attempt_preparation,
+                                true,
+                                already_claimed,
+                            );
+                            (result, attempt_preparation)
+                        })
+                        .await;
+                    preparation = returned_preparation;
+                    match attempt_result {
+                        Ok(MvccWriteBatchOutcome::Complete) => return Ok(()),
+                        Ok(MvccWriteBatchOutcome::SourceSpoolWait { generation, error }) => {
+                            already_claimed = true;
+                            let allow_lifecycle_closing = owned.lifecycle_guard.lock().is_some();
+                            if let Err(wait_error) = wait_for_v7_source_spool_capacity(
+                                Arc::clone(&owned.inner),
+                                blocking.clone(),
+                                generation,
+                                allow_lifecycle_closing,
+                                error,
+                            )
+                            .await
+                            {
+                                owned
+                                    .committed
+                                    .store(false, std::sync::atomic::Ordering::SeqCst);
+                                return Err(wait_error);
+                            }
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
+            })
+            .await
+            .expect("transaction commit coordinator panicked")
+        }
+    }
+
+    fn clone_for_async_commit(&self) -> Self {
+        Self {
             read_ts: self.read_ts,
             read_guard: Arc::clone(&self.read_guard),
             inner: Arc::clone(&self.inner),
@@ -635,35 +730,104 @@ impl Transaction {
             lifecycle_guard: Arc::clone(&self.lifecycle_guard),
             blocking: self.blocking.clone(),
             _not_sync: std::marker::PhantomData,
-        };
-        let blocking = self.blocking.clone();
-
-        async move {
-            let uses_native_v7 = !owned.inner.options.serializable && {
-                let state = owned.inner.state.load();
-                state.memtable.uses_v7_wal() && state.memtable.uses_parallel_wal()
-            };
-            let preparation = if uses_native_v7 {
-                // Wait before dispatch: a queued native preparer can hold a
-                // memtable lease and need this same worker to finish admission.
-                // V7 remains the Active format for this process; after admission
-                // its maintenance hook does not take an exclusive memtable gate.
-                Some(
-                    owned
-                        .inner
-                        .mvcc
-                        .as_ref()
-                        .expect("v7 transactions require MVCC")
-                        .native_preparation_permit()
-                        .await?,
-                )
-            } else {
-                None
-            };
-            blocking
-                .run_result(move || owned.commit_with_native_preparation(preparation))
-                .await
         }
+    }
+}
+
+async fn acquire_native_preparation(
+    inner: Arc<LsmStorageInner>,
+) -> Result<Option<tokio::sync::OwnedSemaphorePermit>> {
+    let uses_native_v7 = !inner.options.serializable && {
+        let state = inner.state.load();
+        state.memtable.uses_v7_wal() && state.memtable.uses_parallel_wal()
+    };
+    if uses_native_v7 {
+        Ok(Some(
+            inner
+                .mvcc
+                .as_ref()
+                .expect("v7 transactions require MVCC")
+                .native_preparation_permit()
+                .await?,
+        ))
+    } else {
+        Ok(None)
+    }
+}
+
+async fn wait_for_v7_source_spool_capacity(
+    inner: Arc<LsmStorageInner>,
+    blocking: BlockingExecutor,
+    generation: u64,
+    allow_lifecycle_closing: bool,
+    source_spool_error: anyhow::Error,
+) -> Result<()> {
+    let active_memtable = inner.state.load().memtable.clone();
+    let owner = active_memtable
+        .wal_v7_reservation_owner()
+        .context("v7 source-spool rejection has no reservation owner")?;
+
+    let flush_inner = Arc::clone(&inner);
+    blocking
+        .run_result_with_reserved_capacity(move || {
+            flush_inner.flush_immutable_for_source_spool_pressure()
+        })
+        .await
+        .context("failed to flush an immutable memtable under v7 source-spool pressure")?;
+
+    let closing = inner.lifecycle.close_notify();
+    if owner
+        .wait_for_source_spool_change_async_while(generation, closing, || {
+            inner.lifecycle.ensure_open().is_ok()
+        })
+        .await
+    {
+        return Ok(());
+    }
+
+    if !allow_lifecycle_closing {
+        inner.lifecycle.ensure_open()?;
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let close_inner = Arc::clone(&inner);
+        let engine = close_inner
+            .weak_engine
+            .get()
+            .and_then(std::sync::Weak::upgrade)
+            .ok_or_else(|| {
+                anyhow::anyhow!("engine handle is unavailable for source-spool recovery")
+            })?;
+        let quota_reclaimed = blocking
+            .run_result_with_reserved_capacity(move || {
+                while !close_inner.state.load().imm_memtables.is_empty() {
+                    close_inner
+                        .flush_immutable_for_source_spool_pressure()
+                        .context("failed to flush immutable memtables during close-time source-spool recovery")?;
+                }
+                engine.reconcile_pitr_obligations_for_source_spool_wait()?;
+                // Keep the bounded close-time check with cleanup so the caller's
+                // runtime does not need a timer driver.
+                Ok::<_, anyhow::Error>(owner.wait_for_source_spool_change_for(
+                    generation,
+                    std::time::Duration::from_secs(1),
+                ))
+            })
+            .await
+            .context("failed to reconcile PITR obligations while close drained an admitted transaction")?;
+
+        if !quota_reclaimed {
+            return Err(source_spool_error.context(
+                "source-spool capacity was not reclaimed while close drained the admitted transaction",
+            ));
+        }
+        Ok(())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Err(source_spool_error
+            .context("source-spool capacity cannot be reclaimed during close on this platform"))
     }
 }
 

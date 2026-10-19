@@ -61,6 +61,25 @@ pub type VersionedCasEntry = (Vec<u8>, u64, Vec<u8>, KvKind, Vec<u8>, KvKind);
 type LookupResult = (Option<Bytes>, KvKind, Bytes, u64, Option<u64>);
 type VersionedCasCandidate = Option<(Vec<u8>, u32)>;
 
+/// Only a direct batch reservation may defer to the async quota coordinator.
+/// Rotation and seal failures remain errors, even when their cause is spool pressure.
+pub(crate) enum MvccWriteBatchOutcome {
+    Complete,
+    SourceSpoolWait {
+        generation: u64,
+        error: anyhow::Error,
+    },
+}
+
+impl MvccWriteBatchOutcome {
+    pub(crate) fn into_result(self) -> Result<()> {
+        match self {
+            Self::Complete => Ok(()),
+            Self::SourceSpoolWait { error, .. } => Err(error),
+        }
+    }
+}
+
 #[cfg(target_os = "linux")]
 #[must_use = "install only after durable SealStarted and retain all reservations through reclamation"]
 pub(crate) struct PreparedV7PitrSeal<'guard> {
@@ -1837,11 +1856,18 @@ impl LifecycleHandle {
             Ordering::AcqRel,
             Ordering::Acquire,
         ) {
-            Ok(_) => CloseState::Started,
+            Ok(_) => {
+                self.0.close_notify.notify_waiters();
+                CloseState::Started
+            }
             Err(LIFECYCLE_CLOSING) => CloseState::AlreadyClosing,
             Err(LIFECYCLE_CLOSED) => CloseState::AlreadyClosed,
             Err(other) => panic!("invalid lifecycle state {other}"),
         }
+    }
+
+    pub(crate) fn close_notify(&self) -> &tokio::sync::Notify {
+        &self.0.close_notify
     }
 
     pub(crate) fn wait_for_quiescence(&self) {
@@ -1908,6 +1934,7 @@ struct LifecycleState {
     active_writes: AtomicU64,
     active_scans: AtomicU64,
     active_txns: AtomicU64,
+    close_notify: tokio::sync::Notify,
     wait_lock: Mutex<()>,
     wait_cv: Condvar,
     close_error: Mutex<Option<async_close::CachedCloseError>>,
@@ -2020,6 +2047,7 @@ impl BackgroundWorkers {
                                 compaction_shutdown,
                                 compaction_notify,
                                 "compaction",
+                                false,
                                 |inner| inner.trigger_compaction().map(|_| ()),
                             )
                             .await;
@@ -2030,11 +2058,14 @@ impl BackgroundWorkers {
                     let flush_shutdown = Arc::clone(&thread_shutdown);
                     let flush_notify = Arc::clone(&thread_notify);
                     tasks.spawn(async move {
+                        // Flush can drop the immutable-memtable pin that blocks
+                        // source-spool reclamation.
                         run_periodic_background_task(
                             flush_inner,
                             flush_shutdown,
                             flush_notify,
                             "flush",
+                            true,
                             |inner| inner.trigger_flush(),
                         )
                         .await;
@@ -2049,6 +2080,7 @@ impl BackgroundWorkers {
                             pitr_shutdown,
                             pitr_notify,
                             "pitr maintenance",
+                            true,
                             |inner| inner.maybe_queue_pitr_maintenance(true),
                         )
                         .await;
@@ -2132,6 +2164,7 @@ async fn run_periodic_background_task<F>(
     shutdown: Arc<AtomicU8>,
     shutdown_notify: Arc<tokio::sync::Notify>,
     task_name: &'static str,
+    use_reserved_capacity: bool,
     tick_fn: F,
 ) where
     F: Fn(Arc<LsmStorageInner>) -> Result<()> + Copy + Send + Sync + 'static,
@@ -2155,10 +2188,14 @@ async fn run_periodic_background_task<F>(
                 }
                 let blocking = inner.blocking.clone();
                 let task_inner = Arc::clone(&inner);
-                if let Err(e) = blocking
-                    .run_result(move || tick_fn(task_inner))
-                    .await
-                {
+                let result = if use_reserved_capacity {
+                    blocking
+                        .run_result_with_reserved_capacity(move || tick_fn(task_inner))
+                        .await
+                } else {
+                    blocking.run_result(move || tick_fn(task_inner)).await
+                };
+                if let Err(e) = result {
                     log::error!("{} failed: {}", task_name, e);
                 }
             }
@@ -2204,7 +2241,7 @@ async fn run_pitr_maintenance_task(
     let inner = Arc::clone(&engine.inner);
     let worker = Arc::clone(&engine);
     match blocking
-        .run_result(move || worker.run_pitr_maintenance(segment_id))
+        .run_result_with_reserved_capacity(move || worker.run_pitr_maintenance(segment_id))
         .await
     {
         Ok(()) => *engine.pitr_last_archive_error.lock() = None,
@@ -5193,6 +5230,59 @@ impl KvEngine {
             let _ = sequencer.stop_commit_admission_and_capture();
         }
         result
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn reconcile_pitr_obligations_for_source_spool_wait(&self) -> Result<()> {
+        let _barrier = self.pitr_barrier_lock.lock();
+        let mut state = self.pitr_manifest_state.lock().clone();
+        if !matches!(
+            state.mode,
+            crate::pitr::manifest::PitrMode::Enabled
+                | crate::pitr::manifest::PitrMode::PublicationUncertain
+        ) || !self.inner.pitr_maintenance_needs_reconciliation(&state)
+        {
+            return Ok(());
+        }
+
+        ensure!(
+            !self.pitr_publication_unknown.load(Ordering::Acquire),
+            "PITR source cleanup cannot proceed while a manifest transition has an unknown outcome; reopen the database first"
+        );
+        if let Some(manifest) = self.inner.manifest.as_ref() {
+            manifest.ensure_durability_certain()?;
+        }
+        // Finish only obligations already authorized by durable manifest
+        // records. This path can archive/reclaim sealed sources and complete a
+        // previously authorized successor install, but never begins a new
+        // recovery point or Active rotation.
+        state = self.resume_v7_successor_install(state)?;
+        state = self.reconcile_durable_archive_obligations(state)?;
+        if state.obligations.values().any(|obligation| {
+            obligation.wal_format == crate::pitr::manifest::PitrWalFormat::V7
+                && obligation.state == crate::pitr::manifest::ObligationState::Reclaimable
+        }) {
+            state = self.reconcile_durable_archive_obligations(state)?;
+        }
+        if state.obligations.values().any(|obligation| {
+            obligation.state != crate::pitr::manifest::ObligationState::Reclaimable
+        }) {
+            return Err(anyhow!("PITR archive obligations remain pending"));
+        }
+        let active_memtable = self.inner.state.load().memtable.clone();
+        if active_memtable.uses_wal_v5()
+            && let Some(config) = state.config.as_ref()
+        {
+            active_memtable
+                .configure_pitr_wal_limits(config.max_segment_bytes, config.max_unarchived_bytes)?;
+        }
+        self.inner
+            .mvcc
+            .as_ref()
+            .ok_or_else(|| anyhow!("PITR maintenance requires MVCC"))?
+            .resume_commit_admission();
+
+        Ok(())
     }
 
     #[cfg(target_os = "linux")]
@@ -12413,7 +12503,9 @@ impl LsmStorageInner {
         &self,
         entries: &[(bytes::Bytes, bytes::Bytes, crate::mvcc::BatchEntryKind)],
     ) -> Result<()> {
-        self.mvcc_write_batch_with_native_preparation(entries, None, false)
+        let mut preparation = None;
+        self.mvcc_write_batch_with_native_preparation(entries, &mut preparation, false, false)?
+            .into_result()
     }
 
     /// Async v7 transactions acquire this permit before worker dispatch. Keep
@@ -12422,17 +12514,29 @@ impl LsmStorageInner {
     pub(crate) fn mvcc_write_batch_with_native_preparation(
         &self,
         entries: &[(bytes::Bytes, bytes::Bytes, crate::mvcc::BatchEntryKind)],
-        mut preparation: Option<tokio::sync::OwnedSemaphorePermit>,
+        preparation: &mut Option<tokio::sync::OwnedSemaphorePermit>,
         allow_lifecycle_closing: bool,
-    ) -> Result<()> {
+        defer_source_spool_wait: bool,
+    ) -> Result<MvccWriteBatchOutcome> {
         let mvcc = self.mvcc.as_ref().expect("mvcc_write_batch requires MVCC");
         let mut retries = 0;
         loop {
             let expected_memtable = self.state.load().memtable.clone();
-            let result = self.mvcc_write_batch_attempt(entries, mvcc, &mut preparation);
+            let result = self.mvcc_write_batch_attempt(entries, mvcc, preparation);
             match result {
                 Ok(()) => break,
                 Err(error) => {
+                    if defer_source_spool_wait
+                        && let Some(generation) =
+                            crate::wal::Wal::v7_source_spool_wait_generation(&error)
+                    {
+                        return Ok(MvccWriteBatchOutcome::SourceSpoolWait { generation, error });
+                    }
+                    // This synchronous adapter may still need to rotate after
+                    // the quota wait. Keep its queueing permit so a native
+                    // preparer cannot pin the Active memtable before that
+                    // retry; maintenance does not acquire this permit, and the
+                    // failed attempt has already released the memtable gate.
                     if crate::wal::Wal::is_retryable_full_error(&error)
                         || crate::wal::Wal::is_v7_capacity_retry_error(&error)
                     {
@@ -12453,7 +12557,7 @@ impl LsmStorageInner {
         }
         self.try_freeze_memtable()?;
 
-        Ok(())
+        Ok(MvccWriteBatchOutcome::Complete)
     }
 
     fn mvcc_write_batch_attempt(
@@ -14252,6 +14356,59 @@ impl LsmStorageInner {
         retries: &mut usize,
         allow_lifecycle_closing: bool,
     ) -> Result<()> {
+        if let Some(generation) = crate::wal::Wal::v7_source_spool_wait_generation(&error)
+            && let Some(owner) = expected_memtable.wal_v7_reservation_owner()
+        {
+            // A reclaimed source can stay charged while its immutable memtable
+            // pins the WAL. Flush one immutable table below the normal count
+            // threshold before waiting for the source-spool release.
+            self.flush_immutable_for_source_spool_pressure()
+                .context("failed to flush an immutable memtable under v7 source-spool pressure")?;
+            // The failed attempt has already released its memtable and MVCC
+            // guards. Wait for actual source-spool reclamation, then retry the
+            // reservation without rotating the Active segment. If close
+            // interrupts an admitted transaction's wait, the close path below
+            // reconciles existing PITR obligations before retrying.
+            if !owner.wait_for_source_spool_change_while(generation, || {
+                self.lifecycle.ensure_open().is_ok()
+            }) {
+                if !allow_lifecycle_closing {
+                    self.lifecycle.ensure_open()?;
+                }
+
+                // Close fences ordinary maintenance before draining admitted
+                // transactions. Finish already-durable PITR source cleanup
+                // here, without establishing another Active boundary.
+                #[cfg(target_os = "linux")]
+                {
+                    while !self.state.load().imm_memtables.is_empty() {
+                        self.flush_immutable_for_source_spool_pressure().context(
+                        "failed to flush immutable memtables during close-time source-spool recovery",
+                    )?;
+                    }
+                    let engine = self
+                        .weak_engine
+                        .get()
+                        .and_then(std::sync::Weak::upgrade)
+                        .ok_or_else(|| {
+                            anyhow!("engine handle is unavailable for source-spool recovery")
+                        })?;
+                    engine.reconcile_pitr_obligations_for_source_spool_wait()?;
+
+                    if !owner.wait_for_source_spool_change_for(generation, Duration::from_secs(1)) {
+                        return Err(error.context(
+                        "source-spool capacity was not reclaimed while close drained the admitted transaction",
+                    ));
+                    }
+                }
+                #[cfg(not(target_os = "linux"))]
+                return Err(error.context(
+                    "source-spool capacity cannot be reclaimed during close on this platform",
+                ));
+            }
+            return Ok(());
+        }
+
         match crate::wal::Wal::v7_capacity_failure(&error) {
             Some(crate::wal::WalV7CapacityFailure::SegmentRotation) => {
                 return self.rotate_after_wal_full(
@@ -14276,6 +14433,13 @@ impl LsmStorageInner {
             return Err(error);
         }
         self.rotate_after_wal_full(error, expected_memtable, retries, allow_lifecycle_closing)
+    }
+
+    pub(crate) fn flush_immutable_for_source_spool_pressure(&self) -> Result<()> {
+        if self.state.load().imm_memtables.is_empty() {
+            return Ok(());
+        }
+        self.force_flush_next_imm_memtable()
     }
 
     fn rotate_after_wal_full(
@@ -20611,7 +20775,9 @@ mod tests {
             Some(WalV7CapacityFailure::SharedResourcePressure)
         );
         assert_eq!(
-            Wal::v7_capacity_failure(&anyhow::Error::new(WalV7ReservationError::SourceSpoolLimit,)),
+            Wal::v7_capacity_failure(&anyhow::Error::new(
+                WalV7ReservationError::SourceSpoolLimit { generation: 0 },
+            )),
             Some(WalV7CapacityFailure::SharedResourcePressure)
         );
         assert_eq!(
@@ -20727,43 +20893,953 @@ mod tests {
             .lock()
             .active_segment_id
             .expect("v7 Active segment is installed");
-        for capacity_error in [
-            crate::wal::v7::admission::WalV7ReservationError::SourceSpoolLimit,
-            crate::wal::v7::admission::WalV7ReservationError::SealIndexLimit,
-        ] {
-            let mut retries = 0;
-            let error = engine
-                .inner
-                .retry_after_capacity_error(
-                    anyhow::Error::new(capacity_error),
-                    &expected_memtable,
-                    &mut retries,
-                )
-                .expect_err("shared resource pressure cannot be fixed by rotating the segment");
+        let capacity_error = crate::wal::v7::admission::WalV7ReservationError::SealIndexLimit;
+        let mut retries = 0;
+        let error = engine
+            .inner
+            .retry_after_capacity_error(
+                anyhow::Error::new(capacity_error),
+                &expected_memtable,
+                &mut retries,
+            )
+            .expect_err("shared resource pressure cannot be fixed by rotating the segment");
 
-            assert!(
-                error
-                    .to_string()
-                    .contains("shared resource capacity is exhausted"),
-                "unexpected capacity error: {error:#}"
-            );
-            assert_eq!(
-                retries, 0,
-                "shared pressure must not consume rotation retries"
-            );
-            assert_eq!(
-                engine.pitr_manifest_state.lock().active_segment_id,
-                Some(initial_segment_id),
-                "shared pressure must not install an empty successor"
-            );
-            let active_memtable = engine.inner.state.load().memtable.clone();
-            assert!(
-                Arc::ptr_eq(&active_memtable, &expected_memtable),
-                "shared pressure must keep the same Active memtable"
-            );
-        }
+        assert!(
+            error
+                .to_string()
+                .contains("shared resource capacity is exhausted"),
+            "unexpected capacity error: {error:#}"
+        );
+        assert_eq!(
+            retries, 0,
+            "shared pressure must not consume rotation retries"
+        );
+        assert_eq!(
+            engine.pitr_manifest_state.lock().active_segment_id,
+            Some(initial_segment_id),
+            "shared pressure must not install an empty successor"
+        );
+        let active_memtable = engine.inner.state.load().memtable.clone();
+        assert!(
+            Arc::ptr_eq(&active_memtable, &expected_memtable),
+            "shared pressure must keep the same Active memtable"
+        );
 
         engine.close_storage()?;
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn reserve_all_but_one_v7_batch_of_source_spool(
+        engine: &KvEngine,
+        owner: &Arc<crate::wal::v7::admission::WalV7ReservationOwner>,
+    ) -> anyhow::Result<crate::wal::v7::admission::WalV7OwnedPreparationReservation> {
+        use crate::wal::v7::admission::WalV7ResourceCharge;
+
+        let next_batch = WalV7ResourceCharge::for_batch(128)?.source_spool_bytes;
+        reserve_v7_source_spool_headroom(engine, owner, next_batch - 1)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn reserve_v7_source_spool_headroom(
+        engine: &KvEngine,
+        owner: &Arc<crate::wal::v7::admission::WalV7ReservationOwner>,
+        headroom_bytes: u64,
+    ) -> anyhow::Result<crate::wal::v7::admission::WalV7OwnedPreparationReservation> {
+        use crate::wal::v7::admission::WalV7ResourceCharge;
+
+        let limit = engine
+            .pitr_manifest_state
+            .lock()
+            .config
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("v7 fixture has no persisted PITR config"))?
+            .max_source_spool_bytes;
+        let snapshot = owner.snapshot();
+        let charged = snapshot
+            .source_spool_bytes
+            .checked_add(snapshot.recovery_workspace_bytes)
+            .ok_or_else(|| anyhow::anyhow!("v7 source-spool usage overflows"))?;
+        let reservation_bytes = limit
+            .checked_sub(charged)
+            .and_then(|remaining| remaining.checked_sub(headroom_bytes))
+            .ok_or_else(|| anyhow::anyhow!("v7 fixture has insufficient source-spool headroom"))?;
+        owner
+            .reserve_preparation_resources(WalV7ResourceCharge {
+                source_spool_bytes: reservation_bytes,
+                ..WalV7ResourceCharge::default()
+            })?
+            .ok_or_else(|| anyhow::anyhow!("source-spool reservation was empty"))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn reclaimable_v7_imm_with_source_spool_pressure(
+        engine: &KvEngine,
+    ) -> anyhow::Result<(
+        Arc<crate::wal::v7::admission::WalV7ReservationOwner>,
+        std::path::PathBuf,
+        crate::wal::v7::admission::WalV7OwnedPreparationReservation,
+    )> {
+        suspend_pitr_maintenance_for_test(engine);
+        engine.put(b"spool-pinned-source", b"source-value")?;
+
+        let source = engine.inner.state.load().memtable.clone();
+        let source_segment_id = LsmStorageInner::pitr_segment_of(&source)
+            .ok_or_else(|| anyhow::anyhow!("source v7 memtable has no segment id"))?;
+        let source_wal = source
+            .wal_path()
+            .ok_or_else(|| anyhow::anyhow!("source v7 memtable has no WAL path"))?
+            .to_path_buf();
+        let source_owner = source
+            .wal_v7_reservation_owner()
+            .ok_or_else(|| anyhow::anyhow!("source v7 memtable has no reservation owner"))?;
+
+        let outcome = engine.create_recovery_point()?;
+        anyhow::ensure!(
+            matches!(outcome, crate::pitr::api::RecoveryPointOutcome::Durable(_)),
+            "source segment was not archived"
+        );
+        anyhow::ensure!(
+            engine
+                .inner
+                .state
+                .load()
+                .imm_memtables
+                .iter()
+                .any(|memtable| Arc::ptr_eq(memtable, &source)),
+            "archived source was not retained as an immutable memtable"
+        );
+        anyhow::ensure!(
+            engine
+                .pitr_manifest_state
+                .lock()
+                .obligations
+                .get(&source_segment_id)
+                .is_some_and(|obligation| {
+                    obligation.state == crate::pitr::manifest::ObligationState::Reclaimable
+                }),
+            "archived source is not durably reclaimable"
+        );
+
+        let active_owner = engine
+            .inner
+            .state
+            .load()
+            .memtable
+            .wal_v7_reservation_owner()
+            .ok_or_else(|| anyhow::anyhow!("Active v7 memtable has no reservation owner"))?;
+        let source_resources = source_owner
+            .retained_resources()
+            .ok_or_else(|| anyhow::anyhow!("source v7 memtable has no retained resources"))?;
+        let active_resources = active_owner
+            .retained_resources()
+            .ok_or_else(|| anyhow::anyhow!("Active v7 memtable has no retained resources"))?;
+        anyhow::ensure!(
+            Arc::ptr_eq(&source_resources, &active_resources),
+            "source and Active v7 memtables do not share source-spool accounting"
+        );
+        drop(source);
+
+        let held = reserve_all_but_one_v7_batch_of_source_spool(engine, &active_owner)?;
+        Ok((active_owner, source_wal, held))
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn v7_sync_point_write_flushes_reclaimable_imm_under_source_spool_pressure()
+    -> anyhow::Result<()> {
+        let directory = tempdir()?;
+        let mut options = v7_recovery_test_database(directory.path())?;
+        options.num_memtable_limit = 50;
+        let database = directory.path().join("db");
+        let engine =
+            KvEngine::open_with_wal_io_mode(&database, options, crate::wal::WalIoMode::Parallel)?;
+        let (_, source_wal, held) = reclaimable_v7_imm_with_source_spool_pressure(&engine)?;
+
+        let writer_engine = Arc::clone(&engine);
+        let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
+        let writer = std::thread::spawn(move || {
+            let _ = done_tx.send(writer_engine.put(b"spool-pressure-sync", b"value"));
+        });
+        let write_result = done_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("source-spool pressure did not trigger an immutable flush");
+        writer.join().expect("source-spool writer thread panicked");
+        write_result?;
+
+        assert!(
+            !source_wal.exists(),
+            "flushed Reclaimable source WAL remains on disk"
+        );
+        assert!(
+            engine.inner.state.load().imm_memtables.is_empty(),
+            "source-spool pressure did not flush the immutable memtable"
+        );
+        assert_eq!(
+            engine.get(b"spool-pressure-sync")?,
+            Some(Bytes::from_static(b"value"))
+        );
+        drop(held);
+        engine.close_storage()?;
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn v7_native_async_point_write_flushes_reclaimable_imm_under_source_spool_pressure()
+    -> anyhow::Result<()> {
+        let directory = tempdir()?;
+        let mut options = v7_recovery_test_database(directory.path())?;
+        options.num_memtable_limit = 50;
+        let database = directory.path().join("db");
+        let engine =
+            KvEngine::open_with_wal_io_mode(&database, options, crate::wal::WalIoMode::Parallel)?;
+        let (_, source_wal, held) = reclaimable_v7_imm_with_source_spool_pressure(&engine)?;
+
+        let writer_engine = Arc::clone(&engine);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            writer_engine.put_async(b"spool-pressure-async", b"value"),
+        )
+        .await
+        .expect("source-spool pressure did not trigger an immutable flush")?;
+
+        assert!(
+            !source_wal.exists(),
+            "flushed Reclaimable source WAL remains on disk"
+        );
+        assert!(
+            engine.inner.state.load().imm_memtables.is_empty(),
+            "source-spool pressure did not flush the immutable memtable"
+        );
+        assert_eq!(
+            engine.get(b"spool-pressure-async")?,
+            Some(Bytes::from_static(b"value"))
+        );
+        drop(held);
+        engine.close_async().await?;
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn v7_sync_point_write_waits_for_source_spool_release_without_rotation() -> anyhow::Result<()> {
+        let directory = tempdir()?;
+        let options = v7_recovery_test_database(directory.path())?;
+        let database = directory.path().join("db");
+        let engine =
+            KvEngine::open_with_wal_io_mode(&database, options, crate::wal::WalIoMode::Parallel)?;
+        suspend_pitr_maintenance_for_test(&engine);
+        let active = engine.inner.state.load().memtable.clone();
+        let initial_segment_id = engine
+            .pitr_manifest_state
+            .lock()
+            .active_segment_id
+            .expect("v7 Active segment is installed");
+        let initial_ticket = active.wal_batch_count().expect("Active WAL has tickets");
+        let owner = active.wal_v7_reservation_owner().unwrap();
+        let held = reserve_all_but_one_v7_batch_of_source_spool(&engine, &owner)?;
+
+        let writer_engine = Arc::clone(&engine);
+        let writer = std::thread::spawn(move || writer_engine.put(b"spool-wait-sync", b"value"));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while owner.source_spool_waiter_count() == 0 && std::time::Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        let waiter_registered = owner.source_spool_waiter_count() > 0;
+        let ticket_unchanged = active.wal_batch_count() == Some(initial_ticket);
+        let segment_unchanged =
+            engine.pitr_manifest_state.lock().active_segment_id == Some(initial_segment_id);
+        let admission_gate_available = engine.inner.active_memtable_lock.try_write().is_some();
+
+        drop(held);
+        writer.join().unwrap()?;
+        assert!(
+            waiter_registered,
+            "sync write did not wait for source-spool capacity"
+        );
+        assert!(ticket_unchanged, "source-spool rejection consumed a ticket");
+        assert!(
+            segment_unchanged,
+            "source-spool pressure rotated the Active segment"
+        );
+        assert!(
+            admission_gate_available,
+            "sync source-spool wait held the active-memtable admission gate"
+        );
+        assert_eq!(
+            engine.get(b"spool-wait-sync")?,
+            Some(Bytes::from_static(b"value"))
+        );
+        assert_eq!(
+            engine.pitr_manifest_state.lock().active_segment_id,
+            Some(initial_segment_id),
+            "source-spool retry must reuse the Active segment"
+        );
+        assert_eq!(active.wal_batch_count(), Some(initial_ticket + 1));
+        engine.close_storage()?;
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn v7_native_async_point_write_waits_for_source_spool_release_without_rotation()
+    -> anyhow::Result<()> {
+        let directory = tempdir()?;
+        let options = v7_recovery_test_database(directory.path())?;
+        let database = directory.path().join("db");
+        let engine = KvEngine::open_with_wal_io_mode(
+            &database,
+            options.clone(),
+            crate::wal::WalIoMode::Parallel,
+        )?;
+        suspend_pitr_maintenance_for_test(&engine);
+        let active = engine.inner.state.load().memtable.clone();
+        let initial_segment_id = engine
+            .pitr_manifest_state
+            .lock()
+            .active_segment_id
+            .expect("v7 Active segment is installed");
+        let initial_ticket = active.wal_batch_count().expect("Active WAL has tickets");
+        let owner = active.wal_v7_reservation_owner().unwrap();
+        let held = reserve_all_but_one_v7_batch_of_source_spool(&engine, &owner)?;
+
+        let writer_engine = Arc::clone(&engine);
+        let writer =
+            tokio::spawn(
+                async move { writer_engine.put_async(b"spool-wait-async", b"value").await },
+            );
+        let waiter_registered = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while owner.source_spool_waiter_count() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .is_ok();
+        let ticket_unchanged = active.wal_batch_count() == Some(initial_ticket);
+        let segment_unchanged =
+            engine.pitr_manifest_state.lock().active_segment_id == Some(initial_segment_id);
+        let admission_gate_available = engine.inner.active_memtable_lock.try_write().is_some();
+
+        drop(held);
+        tokio::time::timeout(std::time::Duration::from_secs(5), writer)
+            .await
+            .expect("native async source-spool waiter did not resume")??;
+        assert!(
+            waiter_registered,
+            "async write did not wait for source-spool capacity"
+        );
+        assert!(ticket_unchanged, "source-spool rejection consumed a ticket");
+        assert!(
+            segment_unchanged,
+            "source-spool pressure rotated the Active segment"
+        );
+        assert!(
+            admission_gate_available,
+            "async source-spool wait held the active-memtable admission gate"
+        );
+        assert_eq!(
+            engine.get(b"spool-wait-async")?,
+            Some(Bytes::from_static(b"value"))
+        );
+
+        assert_eq!(
+            engine.pitr_manifest_state.lock().active_segment_id,
+            Some(initial_segment_id),
+            "source-spool retry must reuse the Active segment"
+        );
+        assert_eq!(active.wal_batch_count(), Some(initial_ticket + 1));
+        engine.close_storage()?;
+        drop(engine);
+        let reopened =
+            KvEngine::open_with_wal_io_mode(&database, options, crate::wal::WalIoMode::Parallel)?;
+        assert_eq!(
+            reopened.get(b"spool-wait-async")?,
+            Some(Bytes::from_static(b"value"))
+        );
+        reopened.close_storage()?;
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn v7_sync_source_spool_wait_does_not_block_close() -> anyhow::Result<()> {
+        let directory = tempdir()?;
+        let options = v7_recovery_test_database(directory.path())?;
+        let database = directory.path().join("db");
+        let engine =
+            KvEngine::open_with_wal_io_mode(&database, options, crate::wal::WalIoMode::Parallel)?;
+        suspend_pitr_maintenance_for_test(&engine);
+        let active = engine.inner.state.load().memtable.clone();
+        let owner = active.wal_v7_reservation_owner().unwrap();
+        let held = reserve_all_but_one_v7_batch_of_source_spool(&engine, &owner)?;
+
+        let writer_engine = Arc::clone(&engine);
+        let writer = std::thread::spawn(move || writer_engine.put(b"spool-close-sync", b"value"));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while owner.source_spool_waiter_count() == 0 && std::time::Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert!(
+            owner.source_spool_waiter_count() > 0,
+            "sync write did not wait for source-spool capacity"
+        );
+
+        let close_engine = Arc::clone(&engine);
+        let (close_tx, close_rx) = std::sync::mpsc::sync_channel(1);
+        let closer = std::thread::spawn(move || {
+            let _ = close_tx.send(close_engine.close());
+        });
+        close_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("v7 close waited indefinitely for a source-spool writer")?;
+        let write_result = writer.join().expect("sync writer thread panicked");
+        closer.join().expect("close thread panicked");
+        assert!(
+            write_result.is_err(),
+            "source-spool waiter should unwind after close begins"
+        );
+        drop(held);
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn v7_native_async_source_spool_wait_does_not_block_close_without_time_driver()
+    -> anyhow::Result<()> {
+        let runtime = tokio::runtime::Builder::new_current_thread().build()?;
+        runtime.block_on(async {
+            let directory = tempdir()?;
+            let options = v7_recovery_test_database(directory.path())?;
+            let database = directory.path().join("db");
+            let engine = KvEngine::open_with_wal_io_mode(
+                &database,
+                options,
+                crate::wal::WalIoMode::Parallel,
+            )?;
+            suspend_pitr_maintenance_for_test(&engine);
+            let active = engine.inner.state.load().memtable.clone();
+            let owner = active.wal_v7_reservation_owner().unwrap();
+            let held = reserve_all_but_one_v7_batch_of_source_spool(&engine, &owner)?;
+
+            let writer_engine = Arc::clone(&engine);
+            let writer = tokio::spawn(async move {
+                writer_engine
+                    .put_async(b"spool-close-async", b"value")
+                    .await
+            });
+            while owner.source_spool_waiter_count() == 0 && !writer.is_finished() {
+                tokio::task::yield_now().await;
+            }
+            anyhow::ensure!(
+                owner.source_spool_waiter_count() > 0,
+                "native async write did not wait for source-spool capacity"
+            );
+
+            let close_engine = Arc::clone(&engine);
+            let (close_tx, close_rx) = std::sync::mpsc::sync_channel(1);
+            let closer = std::thread::spawn(move || {
+                let _ = close_tx.send(close_engine.close());
+            });
+            let close_result = tokio::task::spawn_blocking(move || {
+                let close_result = close_rx
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .map_err(|_| anyhow::anyhow!("v7 close waited for a source-spool writer"))?;
+                Ok::<_, anyhow::Error>(close_result)
+            })
+            .await??;
+            let write_result = writer.await?;
+            closer.join().expect("close thread panicked");
+            close_result?;
+            anyhow::ensure!(
+                write_result.is_err(),
+                "source-spool waiter should unwind after close begins"
+            );
+            drop(held);
+            Ok(())
+        })
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn v7_async_transaction_source_spool_wait_closes_without_time_driver() -> anyhow::Result<()> {
+        let runtime = tokio::runtime::Builder::new_current_thread().build()?;
+        for serializable in [false, true] {
+            runtime.block_on(async {
+                let directory = tempdir()?;
+                let mut options = v7_recovery_test_database(directory.path())?;
+                options.serializable = serializable;
+                let database = directory.path().join("db");
+                let engine = KvEngine::open_with_wal_io_mode(
+                    &database,
+                    options,
+                    crate::wal::WalIoMode::Parallel,
+                )?;
+                suspend_pitr_maintenance_for_test(&engine);
+                let active = engine.inner.state.load().memtable.clone();
+                let owner = active.wal_v7_reservation_owner().unwrap();
+                let held = reserve_all_but_one_v7_batch_of_source_spool(&engine, &owner)?;
+                let transaction = Arc::try_unwrap(engine.new_txn_async()?)
+                    .unwrap_or_else(|_| panic!("transaction should have a unique owner"));
+                transaction.put(b"transaction-spool-no-timer", b"value")?;
+                let writer = tokio::spawn(async move { transaction.commit_async().await });
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                while owner.source_spool_waiter_count() == 0
+                    && !writer.is_finished()
+                    && std::time::Instant::now() < deadline
+                {
+                    tokio::task::yield_now().await;
+                }
+                anyhow::ensure!(
+                    owner.source_spool_waiter_count() > 0,
+                    "async transaction did not wait for source-spool capacity"
+                );
+
+                let close_engine = Arc::clone(&engine);
+                let (close_tx, close_rx) = std::sync::mpsc::sync_channel(1);
+                let closer = std::thread::spawn(move || {
+                    let _ = close_tx.send(close_engine.close());
+                });
+                let close_result = tokio::task::spawn_blocking(move || {
+                    close_rx
+                        .recv_timeout(std::time::Duration::from_secs(5))
+                        .map_err(|_| {
+                            anyhow::anyhow!("close did not drain the quota-blocked transaction")
+                        })
+                })
+                .await??;
+                closer.join().expect("close thread panicked");
+                close_result?;
+                let error = writer.await?.expect_err(
+                    "close must return a capacity error when no quota can be reclaimed",
+                );
+                anyhow::ensure!(
+                    crate::wal::Wal::v7_source_spool_wait_generation(&error).is_some(),
+                    "unexpected transaction error: {error:#}"
+                );
+                assert_eq!(engine.get(b"transaction-spool-no-timer")?, None);
+                drop(held);
+                Ok::<_, anyhow::Error>(())
+            })?;
+        }
+
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn v7_async_transaction_source_spool_wait_finishes_during_close() -> anyhow::Result<()> {
+        let directory = tempdir()?;
+        let options = v7_recovery_test_database(directory.path())?;
+        let database = directory.path().join("db");
+        let engine = KvEngine::open_with_wal_io_mode(
+            &database,
+            options.clone(),
+            crate::wal::WalIoMode::Parallel,
+        )?;
+        suspend_pitr_maintenance_for_test(&engine);
+        let active = engine.inner.state.load().memtable.clone();
+        let owner = active.wal_v7_reservation_owner().unwrap();
+        let held = reserve_all_but_one_v7_batch_of_source_spool(&engine, &owner)?;
+
+        let transaction = Arc::try_unwrap(engine.new_txn_async()?)
+            .unwrap_or_else(|_| panic!("transaction should have a unique owner"));
+        transaction.put(b"transaction-spool-close", b"durable")?;
+        let writer = tokio::spawn(async move { transaction.commit_async().await });
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while owner.source_spool_waiter_count() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("async transaction did not wait for source-spool capacity");
+
+        let close_engine = Arc::clone(&engine);
+        let closer = tokio::spawn(async move { close_engine.close_async().await });
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while engine.inner.lifecycle.ensure_open().is_ok() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("close did not start while the transaction waited for source-spool capacity");
+        anyhow::ensure!(
+            !writer.is_finished(),
+            "admitted transaction was cancelled when close began"
+        );
+        anyhow::ensure!(
+            !closer.is_finished(),
+            "close must wait for the admitted transaction"
+        );
+
+        drop(held);
+        tokio::time::timeout(std::time::Duration::from_secs(5), writer)
+            .await
+            .expect("transaction did not resume after source-spool capacity was released")??;
+        tokio::time::timeout(std::time::Duration::from_secs(5), closer)
+            .await
+            .expect("close did not finish after the admitted transaction committed")??;
+        drop(active);
+        drop(engine);
+
+        let reopened =
+            KvEngine::open_with_wal_io_mode(&database, options, crate::wal::WalIoMode::Parallel)?;
+        assert_eq!(
+            reopened.get(b"transaction-spool-close")?,
+            Some(Bytes::from_static(b"durable"))
+        );
+        reopened.close_async().await?;
+
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn v7_async_transaction_source_spool_wait_releases_tokio_blocking_worker() -> anyhow::Result<()>
+    {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()?;
+        for serializable in [false, true] {
+            let directory = tempdir()?;
+            let mut options = v7_recovery_test_database(directory.path())?;
+            options.serializable = serializable;
+            let database = directory.path().join("db");
+            let engine = KvEngine::open_with_wal_io_mode(
+                &database,
+                options,
+                crate::wal::WalIoMode::Parallel,
+            )?;
+            suspend_pitr_maintenance_for_test(&engine);
+            let active = engine.inner.state.load().memtable.clone();
+            let owner = active.wal_v7_reservation_owner().unwrap();
+            let held = reserve_all_but_one_v7_batch_of_source_spool(&engine, &owner)?;
+
+            runtime.block_on(async {
+                let transaction = Arc::try_unwrap(engine.new_txn_async()?)
+                    .unwrap_or_else(|_| panic!("transaction should have a unique owner"));
+                transaction.put(b"transaction-spool-worker", b"durable")?;
+                let writer = tokio::spawn(transaction.commit_async());
+                tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    while owner.source_spool_waiter_count() == 0 {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("async transaction did not wait for source-spool capacity");
+                anyhow::ensure!(
+                    transaction
+                        .put(b"transaction-spool-late", b"must-not-commit")
+                        .is_err(),
+                    "transaction accepted a mutation while its owned commit was waiting"
+                );
+
+                // Model background PITR cleanup: it needs the sole Tokio blocking
+                // worker to release the source-spool charge while the transaction waits.
+                let blocking = engine.inner.blocking.clone();
+                let cleanup = tokio::spawn(async move {
+                    blocking
+                        .run_result_with_reserved_capacity(move || {
+                            drop(held);
+                            Ok::<_, anyhow::Error>(())
+                        })
+                        .await
+                });
+                tokio::time::timeout(std::time::Duration::from_secs(5), writer)
+                    .await
+                    .expect("transaction starved the blocking worker needed for cleanup")??;
+                cleanup.await??;
+                Ok::<_, anyhow::Error>(())
+            })?;
+
+            assert_eq!(
+                engine.get(b"transaction-spool-worker")?,
+                Some(Bytes::from_static(b"durable"))
+            );
+            engine.close()?;
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn v7_async_transaction_source_spool_wait_retains_engine_after_cancellation()
+    -> anyhow::Result<()> {
+        for serializable in [false, true] {
+            let directory = tempdir()?;
+            let mut options = v7_recovery_test_database(directory.path())?;
+            options.serializable = serializable;
+            let database = directory.path().join("db");
+            let engine = KvEngine::open_with_wal_io_mode(
+                &database,
+                options.clone(),
+                crate::wal::WalIoMode::Parallel,
+            )?;
+            suspend_pitr_maintenance_for_test(&engine);
+            let active = engine.inner.state.load().memtable.clone();
+            let owner = active.wal_v7_reservation_owner().unwrap();
+            let held = reserve_all_but_one_v7_batch_of_source_spool(&engine, &owner)?;
+            let weak_engine = Arc::downgrade(&engine);
+
+            let transaction = Arc::try_unwrap(engine.new_txn_async()?)
+                .unwrap_or_else(|_| panic!("transaction should have a unique owner"));
+            transaction.put(b"transaction-spool-detached", b"durable")?;
+            let writer = tokio::spawn(transaction.commit_async());
+            drop(transaction);
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while owner.source_spool_waiter_count() == 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("async transaction did not wait for source-spool capacity");
+
+            writer.abort();
+            anyhow::ensure!(writer.await.unwrap_err().is_cancelled());
+            drop(engine);
+            let retained_engine = weak_engine.upgrade();
+            drop(held);
+            let retained_engine = retained_engine.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "detached transaction did not retain its engine during a quota wait"
+                )
+            })?;
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while retained_engine.get(b"transaction-spool-detached")?
+                    != Some(Bytes::from_static(b"durable"))
+                {
+                    tokio::task::yield_now().await;
+                }
+                Ok::<_, anyhow::Error>(())
+            })
+            .await
+            .expect("detached transaction did not finish after source-spool release")?;
+            retained_engine.close_async().await?;
+            drop(retained_engine);
+            drop(active);
+            drop(owner);
+
+            let reopened = KvEngine::open_with_wal_io_mode(
+                &database,
+                options,
+                crate::wal::WalIoMode::Parallel,
+            )?;
+            assert_eq!(
+                reopened.get(b"transaction-spool-detached")?,
+                Some(Bytes::from_static(b"durable"))
+            );
+            reopened.close_async().await?;
+        }
+
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn v7_async_transaction_rotation_spool_error_is_not_deferred() -> anyhow::Result<()> {
+        for mode in [
+            crate::wal::WalIoMode::Leader,
+            crate::wal::WalIoMode::Parallel,
+        ] {
+            for serializable in [true, false] {
+                let directory = tempdir()?;
+                let mut options =
+                    v7_recovery_test_database_with_segment_limit(directory.path(), 32 * 1024)?;
+                options.serializable = serializable;
+                let database = directory.path().join("db");
+                let engine = KvEngine::open_with_wal_io_mode(&database, options, mode)?;
+                suspend_pitr_maintenance_for_test(&engine);
+                engine.put(b"fill-one", b"value")?;
+                engine.put(b"fill-two", b"value")?;
+                let source = engine.inner.state.load().memtable.clone();
+                let owner = source.wal_v7_reservation_owner().unwrap();
+                let initial_batches = source.wal_batch_count();
+                let held = reserve_all_but_one_v7_batch_of_source_spool(&engine, &owner)?;
+
+                let transaction = Arc::try_unwrap(engine.new_txn_async()?)
+                    .unwrap_or_else(|_| panic!("transaction should have a unique owner"));
+                assert_eq!(
+                    transaction.get(b"fill-one")?,
+                    Some(Bytes::from_static(b"value"))
+                );
+                transaction.put(b"transaction-spool-rotation", b"durable")?;
+                let error = tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    transaction.commit_async(),
+                )
+                .await
+                .expect("rotation spool failure was incorrectly deferred to a quota wait")
+                .expect_err("successor preparation must fail under source-spool pressure");
+                anyhow::ensure!(
+                    crate::wal::Wal::v7_source_spool_wait_generation(&error).is_some(),
+                    "unexpected rotation error: {error:#}"
+                );
+                assert_eq!(owner.source_spool_waiter_count(), 0);
+                assert_eq!(source.wal_batch_count(), initial_batches);
+                assert!(Arc::ptr_eq(&engine.inner.state.load().memtable, &source));
+                assert_eq!(engine.get(b"transaction-spool-rotation")?, None);
+                assert_eq!(
+                    transaction.get(b"fill-one")?,
+                    Some(Bytes::from_static(b"value"))
+                );
+                transaction.put(b"transaction-spool-caller-retry", b"durable")?;
+
+                drop(held);
+                assert!(matches!(
+                    engine.resume_pitr(directory.path().join("repository"))?,
+                    crate::pitr::api::PitrResumeOutcome::Resumed
+                ));
+                transaction.commit_async().await?;
+                assert_eq!(
+                    engine.get(b"transaction-spool-rotation")?,
+                    Some(Bytes::from_static(b"durable"))
+                );
+                assert_eq!(
+                    engine.get(b"transaction-spool-caller-retry")?,
+                    Some(Bytes::from_static(b"durable"))
+                );
+                drop(transaction);
+                engine.close_async().await?;
+            }
+        }
+
+        Ok(())
+    }
+
+    #[cfg(all(target_os = "linux", feature = "chaos-testing"))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn failpoint_v7_async_transaction_reconciles_failed_source_cleanup_during_close()
+    -> anyhow::Result<()> {
+        use crate::pitr::manifest::ObligationState;
+
+        let _scenario = crate::chaos::failpoint::FailScenario::setup();
+        let directory = tempdir()?;
+        let options = v7_recovery_test_database(directory.path())?;
+        let database = directory.path().join("db");
+        let engine = KvEngine::open_with_wal_io_mode(
+            &database,
+            options.clone(),
+            crate::wal::WalIoMode::Parallel,
+        )?;
+        suspend_pitr_maintenance_for_test(&engine);
+        engine.put(b"cleanup-source", b"durable")?;
+
+        let source = engine.inner.state.load().memtable.clone();
+        let source_segment_id = LsmStorageInner::pitr_segment_of(&source)
+            .ok_or_else(|| anyhow::anyhow!("v7 fixture has no Active segment"))?;
+        let source_wal = source
+            .wal_path()
+            .ok_or_else(|| anyhow::anyhow!("v7 source has no WAL path"))?
+            .to_path_buf();
+        drop(source);
+
+        let transaction = Arc::try_unwrap(engine.new_txn_async()?)
+            .unwrap_or_else(|_| panic!("transaction should have a unique owner"));
+        for index in 0..200 {
+            let key = format!("transaction-spool-close-cleanup-{index:04}");
+            transaction.put(key.as_bytes(), &[b'd'; 128])?;
+        }
+
+        let flushing = Arc::clone(&engine);
+        fail::cfg_callback("pitr.before_recovery_point_archive", move || {
+            while !flushing.inner.state.load().imm_memtables.is_empty() {
+                flushing.inner.force_flush_next_imm_memtable().unwrap();
+            }
+        })
+        .map_err(anyhow::Error::msg)?;
+        fail::cfg("pitr.before_flushed_source_cleanup", "return").map_err(anyhow::Error::msg)?;
+        let maintenance_engine = Arc::clone(&engine);
+        let maintenance = tokio::task::spawn_blocking(move || {
+            maintenance_engine.run_pitr_maintenance(source_segment_id)
+        })
+        .await?;
+        fail::remove("pitr.before_recovery_point_archive");
+        fail::remove("pitr.before_flushed_source_cleanup");
+        anyhow::ensure!(
+            maintenance.is_err(),
+            "source cleanup failpoint did not interrupt maintenance"
+        );
+        anyhow::ensure!(engine.inner.state.load().imm_memtables.is_empty());
+        anyhow::ensure!(
+            engine
+                .pitr_manifest_state
+                .lock()
+                .obligations
+                .get(&source_segment_id)
+                .is_some_and(|obligation| obligation.state == ObligationState::Reclaimable),
+            "failed cleanup did not leave a durable Reclaimable source: maintenance={maintenance:?}, obligation={:?}",
+            engine
+                .pitr_manifest_state
+                .lock()
+                .obligations
+                .get(&source_segment_id)
+                .map(|obligation| obligation.state)
+        );
+        anyhow::ensure!(
+            source_wal.exists(),
+            "failed cleanup unexpectedly removed the source WAL"
+        );
+
+        let active = engine.inner.state.load().memtable.clone();
+        let owner = active
+            .wal_v7_reservation_owner()
+            .ok_or_else(|| anyhow::anyhow!("Active v7 memtable has no reservation owner"))?;
+        let held = reserve_v7_source_spool_headroom(&engine, &owner, 32 * 1024)?;
+        // The interrupted maintenance attempt left commit admission fenced.
+        // This transaction was registered before that attempt. Reopen the
+        // sequencer so the registered transaction can reach the source-spool wait.
+        engine
+            .inner
+            .mvcc
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("v7 transaction fixture has no MVCC"))?
+            .resume_commit_admission();
+        let writer = tokio::spawn(async move { transaction.commit_async().await });
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while owner.source_spool_waiter_count() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("transaction did not wait for source-spool capacity");
+
+        let close_engine = Arc::clone(&engine);
+        let closer = tokio::spawn(async move { close_engine.close_async().await });
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while engine.inner.lifecycle.ensure_open().is_ok() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("close did not start while the transaction waited for source-spool capacity");
+
+        let writer_result = tokio::time::timeout(std::time::Duration::from_secs(5), writer)
+            .await
+            .expect("transaction did not resume after close reconciled source cleanup")?;
+        writer_result.map_err(|error| {
+            anyhow::anyhow!("transaction failed after close-time source reconciliation: {error:#}")
+        })?;
+        tokio::time::timeout(std::time::Duration::from_secs(5), closer)
+            .await
+            .expect("close did not finish after the admitted transaction committed")??;
+        anyhow::ensure!(
+            !source_wal.exists(),
+            "close-time reconciliation left the source WAL behind"
+        );
+
+        drop(held);
+        drop(owner);
+        drop(active);
+        drop(engine);
+        let reopened =
+            KvEngine::open_with_wal_io_mode(&database, options, crate::wal::WalIoMode::Parallel)?;
+        assert_eq!(
+            reopened.get(b"transaction-spool-close-cleanup-0000")?,
+            Some(Bytes::from(vec![b'd'; 128]))
+        );
+        reopened.close_async().await?;
+
         Ok(())
     }
 

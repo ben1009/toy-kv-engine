@@ -1575,7 +1575,7 @@ impl Wal {
         let error = error.downcast_ref::<v7::admission::WalV7ReservationError>()?;
         Some(match error {
             v7::admission::WalV7ReservationError::LogicalWalLimit
-            | v7::admission::WalV7ReservationError::SourceSpoolLimit
+            | v7::admission::WalV7ReservationError::SourceSpoolLimit { .. }
             | v7::admission::WalV7ReservationError::RecoveryWorkspaceLimit
             | v7::admission::WalV7ReservationError::BufferMemoryLimit
             | v7::admission::WalV7ReservationError::SealIndexLimit => {
@@ -1587,6 +1587,15 @@ impl Wal {
 
     pub(crate) fn is_v7_capacity_retry_error(error: &anyhow::Error) -> bool {
         Self::v7_capacity_failure(error) == Some(WalV7CapacityFailure::SegmentRotation)
+    }
+
+    pub(crate) fn v7_source_spool_wait_generation(error: &anyhow::Error) -> Option<u64> {
+        match error.downcast_ref::<v7::admission::WalV7ReservationError>()? {
+            v7::admission::WalV7ReservationError::SourceSpoolLimit { generation } => {
+                Some(*generation)
+            }
+            _ => None,
+        }
     }
 
     pub(crate) fn set_write_profile(&self, profile: Arc<crate::mem_table::WriteProfile>) {
