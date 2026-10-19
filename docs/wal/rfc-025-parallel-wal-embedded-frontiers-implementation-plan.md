@@ -72,8 +72,9 @@ the Active WAL or reopen admission after close establishes its final boundary.
 Already-flushed v7 sources remain schedulable while cleanup is outstanding,
 including after unlink or directory-sync errors; archive reconciliation finishes
 their durable cleanup and releases source-spool/index quota before resuming writes.
-Range/transaction cancellation during retry and global spool backpressure remain
-pending.
+Canceled v7 range and asynchronous transaction callers retain their accepted
+capacity retries through close, and the committed updates survive reopen.
+Distinct global spool backpressure and oversize outcomes remain pending.
 Public close drains and syncs
 the Active v7 WAL for recovery without emitting a final recovery point. It stops
 and drains MVCC commit admission, persists the latest synced logical boundary in
@@ -452,7 +453,7 @@ v6 to v7 transition remain unconnected. Active v7 reservation owners and their
 shared ledger are retained through durable source cleanup and then retired from
 segment bookkeeping.
 
-**Last updated:** 2026-10-18
+**Last updated:** 2026-10-19
 
 **Source baseline:** `30a64fa855126596316ab6b9237e6348b0e41fd2`, which merged RFC 025 in PR #379.
 
@@ -1046,7 +1047,8 @@ remain in later stage 5/6 work.
   Reclaimable sources without a live memtable remain maintenance work even with
   an empty successor; injected publication, unlink, and directory-sync failures
   verify automatic retry, quota release, and resumed writes in both I/O modes.
-  Range/transaction retry cancellation and distinct global backpressure and
+  Canceled native v7 range and async transaction callers retain their accepted
+  capacity retries through close and recovery. Distinct global backpressure and
   oversize outcomes remain outstanding.
 - Extend `PitrManifestRecord::SealStarted`, its obligation state, replay, and
   snapshot validation with the versioned immutable boundary. Persist Active

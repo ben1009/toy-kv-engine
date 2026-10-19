@@ -1863,6 +1863,13 @@ impl LifecycleHandle {
         }
     }
 
+    pub(crate) fn wait_for_transactions(&self) {
+        let mut lock = self.0.wait_lock.lock();
+        while self.0.active_txns.load(Ordering::Acquire) != 0 {
+            self.0.wait_cv.wait(&mut lock);
+        }
+    }
+
     pub(crate) fn wait_for_closed(&self) {
         let mut lock = self.0.wait_lock.lock();
         while !self.is_closed() {
@@ -2410,9 +2417,15 @@ impl KvEngine {
             }
 
             self.inner.lifecycle.wait_for_writes();
+            // Async transactions hold lifecycle admission from construction.
+            // Drain them before stopping MVCC commit admission so a commit
+            // already dispatched to the blocking worker can finish a capacity
+            // rotation and publish its accepted batch during close.
+            self.inner.lifecycle.wait_for_transactions();
 
             // No new lifecycle writes can enter, and every previously
-            // admitted write (including capacity-retry rotation) has finished.
+            // admitted write or async transaction (including capacity-retry
+            // rotation) has finished.
             // Reacquire the PITR locks before closing MVCC admission so resume
             // and boundary work cannot race the final Active cut.
             let operation_guard = self.pitr_operation_lock.lock();
@@ -12400,7 +12413,7 @@ impl LsmStorageInner {
         &self,
         entries: &[(bytes::Bytes, bytes::Bytes, crate::mvcc::BatchEntryKind)],
     ) -> Result<()> {
-        self.mvcc_write_batch_with_native_preparation(entries, None)
+        self.mvcc_write_batch_with_native_preparation(entries, None, false)
     }
 
     /// Async v7 transactions acquire this permit before worker dispatch. Keep
@@ -12410,6 +12423,7 @@ impl LsmStorageInner {
         &self,
         entries: &[(bytes::Bytes, bytes::Bytes, crate::mvcc::BatchEntryKind)],
         mut preparation: Option<tokio::sync::OwnedSemaphorePermit>,
+        allow_lifecycle_closing: bool,
     ) -> Result<()> {
         let mvcc = self.mvcc.as_ref().expect("mvcc_write_batch requires MVCC");
         let mut retries = 0;
@@ -12419,7 +12433,21 @@ impl LsmStorageInner {
             match result {
                 Ok(()) => break,
                 Err(error) => {
-                    self.retry_after_capacity_error(error, &expected_memtable, &mut retries)?;
+                    if crate::wal::Wal::is_retryable_full_error(&error)
+                        || crate::wal::Wal::is_v7_capacity_retry_error(&error)
+                    {
+                        #[cfg(all(test, feature = "chaos-testing"))]
+                        crate::chaos::failpoint::before_parallel_wal_transaction_rotation();
+                    }
+                    if allow_lifecycle_closing {
+                        self.retry_after_capacity_error_admitted(
+                            error,
+                            &expected_memtable,
+                            &mut retries,
+                        )?;
+                    } else {
+                        self.retry_after_capacity_error(error, &expected_memtable, &mut retries)?;
+                    }
                 }
             }
         }
@@ -20890,6 +20918,118 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn v7_native_async_range_cancellation_during_capacity_retry_keeps_commit_owned()
+    -> anyhow::Result<()> {
+        let directory = tempdir()?;
+        let max_segment_bytes = 32 * 1024;
+        let options =
+            v7_recovery_test_database_with_segment_limit(directory.path(), max_segment_bytes)?;
+        let database = directory.path().join("db");
+        let engine = KvEngine::open_with_wal_io_mode(
+            &database,
+            options.clone(),
+            crate::wal::WalIoMode::Parallel,
+        )?;
+        suspend_pitr_maintenance_for_test(&engine);
+        let initial_segment_id = engine
+            .pitr_manifest_state
+            .lock()
+            .active_segment_id
+            .expect("v7 Active segment is installed");
+
+        engine.put(b"fill-one", b"value")?;
+        engine.put(b"fill-two", b"value")?;
+        assert_eq!(engine.get(b"v7-key")?, Some(Bytes::from_static(b"v")));
+        assert_eq!(
+            engine.pitr_manifest_state.lock().active_segment_id,
+            Some(initial_segment_id)
+        );
+
+        let pause = crate::lsm_storage::native_write::NativeWritePause::new(
+            crate::lsm_storage::native_write::NativeWriteStage::CapacityRetry,
+        );
+        *engine.inner.native_write_pause.lock() = Some(Arc::clone(&pause));
+        let range_engine = Arc::clone(&engine);
+        let range = tokio::spawn(async move {
+            range_engine
+                .delete_range_async(b"v7-key", b"v7-key\xff")
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), pause.reached.notified())
+            .await
+            .expect("range writer must reach capacity retry before rotation");
+
+        assert_eq!(
+            engine.pitr_manifest_state.lock().active_segment_id,
+            Some(initial_segment_id),
+            "the retry pause must happen before source rotation"
+        );
+        assert_eq!(engine.get(b"v7-key")?, Some(Bytes::from_static(b"v")));
+        range.abort();
+        assert!(range.await.unwrap_err().is_cancelled());
+
+        let sequencer = engine.inner.mvcc.as_ref().expect("v7 storage has MVCC");
+        let close_engine = Arc::clone(&engine);
+        let close = tokio::spawn(async move { close_engine.close_async().await });
+        let close_entered_write_drain =
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while engine.inner.lifecycle.ensure_open().is_ok()
+                    || !engine
+                        .inner
+                        .lifecycle
+                        .0
+                        .wait_for_writes_started
+                        .load(std::sync::atomic::Ordering::Acquire)
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .is_ok();
+        let admission_stayed_open = sequencer.commit_admission_is_open();
+        let retry_admission_retained = engine
+            .inner
+            .lifecycle
+            .0
+            .active_writes
+            .load(std::sync::atomic::Ordering::Acquire)
+            > 0;
+        let close_waited_for_retry = !close.is_finished();
+
+        pause.release.notify_one();
+        close.await.unwrap()?;
+        drop(engine);
+
+        assert!(
+            close_entered_write_drain,
+            "close did not begin draining the admitted range retry"
+        );
+        assert!(
+            admission_stayed_open,
+            "close must preserve MVCC admission until accepted range retries drain"
+        );
+        assert!(
+            retry_admission_retained,
+            "the owned range retry must retain lifecycle admission during close"
+        );
+        assert!(
+            close_waited_for_retry,
+            "close must wait for the capacity retry to finish"
+        );
+
+        let reopened =
+            KvEngine::open_with_wal_io_mode(&database, options, crate::wal::WalIoMode::Parallel)?;
+        for key in [b"fill-one".as_slice(), b"fill-two"] {
+            assert_eq!(reopened.get(key)?, Some(Bytes::from_static(b"value")));
+        }
+        assert_eq!(reopened.get(b"v7-key")?, None);
+        reopened.close_async().await?;
+
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
     #[test]
     fn v7_native_async_point_writes_retry_after_seal_index_limit() -> anyhow::Result<()> {
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -21353,6 +21493,121 @@ mod tests {
     fn failpoint_v7_transaction_capacity_rotation_reruns_occ() -> anyhow::Result<()> {
         v7_transaction_capacity_rotation_reruns_occ(false)?;
         v7_transaction_capacity_rotation_reruns_occ(true)
+    }
+
+    #[cfg(all(target_os = "linux", feature = "chaos-testing"))]
+    fn v7_async_transaction_capacity_retry_is_owned_through_close(
+        serializable: bool,
+    ) -> anyhow::Result<()> {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()?;
+        let directory = tempdir()?;
+        let mut options =
+            v7_recovery_test_database_with_segment_limit(directory.path(), 32 * 1024)?;
+        options.serializable = serializable;
+        let database = directory.path().join("db");
+        let engine = KvEngine::open_with_wal_io_mode(
+            &database,
+            options.clone(),
+            crate::wal::WalIoMode::Parallel,
+        )?;
+        suspend_pitr_maintenance_for_test(&engine);
+        engine.put(b"fill-one", b"value")?;
+        engine.put(b"fill-two", b"value")?;
+        let initial_segment_id = engine
+            .pitr_manifest_state
+            .lock()
+            .active_segment_id
+            .expect("v7 Active segment is installed");
+
+        let transaction = Arc::try_unwrap(engine.new_txn_async()?)
+            .unwrap_or_else(|_| panic!("transaction should have a unique owner"));
+        transaction.put(b"cancelled-transaction-retry", b"durable")?;
+        let rotation_gate = crate::chaos::failpoint::arm_parallel_wal_txn_rotation_gate();
+        runtime.block_on(async {
+            let commit = tokio::spawn(async move { transaction.commit_async().await });
+            assert!(rotation_gate.wait_until_entered(std::time::Duration::from_secs(10)));
+            assert_eq!(
+                engine.pitr_manifest_state.lock().active_segment_id,
+                Some(initial_segment_id),
+                "the transaction retry must pause before source rotation"
+            );
+            commit.abort();
+            assert!(commit.await.unwrap_err().is_cancelled());
+
+            let sequencer = engine.inner.mvcc.as_ref().expect("v7 storage has MVCC");
+            let close_engine = Arc::clone(&engine);
+            let close = tokio::spawn(async move { close_engine.close_async().await });
+            let close_started = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while engine.inner.lifecycle.ensure_open().is_ok()
+                    || !engine
+                        .inner
+                        .lifecycle
+                        .0
+                        .wait_for_writes_started
+                        .load(std::sync::atomic::Ordering::Acquire)
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .is_ok();
+            let transaction_admission_retained = engine
+                .inner
+                .lifecycle
+                .0
+                .active_txns
+                .load(std::sync::atomic::Ordering::Acquire)
+                > 0;
+            let commit_admission_stayed_open = sequencer.commit_admission_is_open();
+            let close_waited_for_transaction = !close.is_finished();
+
+            rotation_gate.release();
+            close.await.unwrap()?;
+
+            assert!(
+                close_started,
+                "close did not start draining the transaction"
+            );
+            assert!(
+                transaction_admission_retained,
+                "the owned transaction retry must retain lifecycle admission during close"
+            );
+            assert!(
+                commit_admission_stayed_open,
+                "close must keep MVCC commit admission open until accepted transactions drain"
+            );
+            assert!(
+                close_waited_for_transaction,
+                "close must wait for the accepted transaction retry"
+            );
+            Ok::<_, anyhow::Error>(())
+        })?;
+        drop(engine);
+
+        let reopened =
+            KvEngine::open_with_wal_io_mode(&database, options, crate::wal::WalIoMode::Parallel)?;
+        for key in [b"fill-one".as_slice(), b"fill-two"] {
+            assert_eq!(reopened.get(key)?, Some(Bytes::from_static(b"value")));
+        }
+        assert_eq!(
+            reopened.get(b"cancelled-transaction-retry")?,
+            Some(Bytes::from_static(b"durable"))
+        );
+        runtime.block_on(reopened.close_async())?;
+
+        Ok(())
+    }
+
+    #[cfg(all(target_os = "linux", feature = "chaos-testing"))]
+    #[test]
+    fn failpoint_v7_async_transaction_cancellation_during_capacity_retry_keeps_commit_owned()
+    -> anyhow::Result<()> {
+        v7_async_transaction_capacity_retry_is_owned_through_close(false)?;
+        v7_async_transaction_capacity_retry_is_owned_through_close(true)
     }
 
     #[cfg(target_os = "linux")]
