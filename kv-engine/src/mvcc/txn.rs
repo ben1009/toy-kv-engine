@@ -580,7 +580,15 @@ impl Transaction {
                                 return Err(rotation_error);
                             }
                         }
-                        Err(error) => return Err(error),
+                        Err(error) => {
+                            if crate::wal::Wal::v7_capacity_failure(&error).is_some() {
+                                // Capacity rejection precedes WAL admission. Retain
+                                // the snapshot and buffered writes for caller retry.
+                                self.committed
+                                    .store(false, std::sync::atomic::Ordering::SeqCst);
+                            }
+                            return Err(error);
+                        }
                     }
                 }
             }

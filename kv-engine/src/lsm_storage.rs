@@ -21469,6 +21469,105 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn v7_serializable_transactions_retry_after_shared_seal_index_pressure() -> anyhow::Result<()> {
+        use crate::wal::v7::admission::WalV7ReservationError;
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()?;
+        for mode in [
+            crate::wal::WalIoMode::Leader,
+            crate::wal::WalIoMode::Parallel,
+        ] {
+            for async_commit in [false, true] {
+                for conflicting_write in [false, true] {
+                    let directory = tempdir()?;
+                    let mut options = v7_recovery_test_database(directory.path())?;
+                    options.serializable = true;
+                    let database = directory.path().join("db");
+                    let engine = KvEngine::open_with_wal_io_mode(&database, options.clone(), mode)?;
+                    suspend_pitr_maintenance_for_test(&engine);
+                    let source = engine.inner.state.load().memtable.clone();
+                    let source_segment = LsmStorageInner::pitr_segment_of(&source).unwrap();
+                    let source_batches = source.wal_batch_count().unwrap();
+                    let retained = source
+                        .wal_v7_reservation_owner()
+                        .unwrap()
+                        .retained_resources()
+                        .unwrap();
+                    let existing_index_bytes = retained.snapshot().seal_index_bytes;
+                    assert!(existing_index_bytes > 0);
+
+                    let transaction = Arc::try_unwrap(engine.new_txn()?)
+                        .unwrap_or_else(|_| panic!("transaction should have a unique owner"));
+                    assert_eq!(transaction.get(b"v7-key")?, Some(Bytes::from_static(b"v")));
+                    transaction.put(b"retry-after-index-pressure", b"value")?;
+                    retained.set_max_seal_index_bytes_for_test(existing_index_bytes);
+                    let result = if async_commit {
+                        runtime.block_on(transaction.commit_async())
+                    } else {
+                        transaction.commit()
+                    };
+                    retained.set_max_seal_index_bytes_for_test(u64::MAX);
+                    let error =
+                        result.expect_err("shared seal-index pressure must reject the commit");
+                    assert_eq!(
+                        error.downcast_ref::<WalV7ReservationError>(),
+                        Some(&WalV7ReservationError::SealIndexLimit),
+                        "unexpected commit rejection: {error:#}"
+                    );
+                    assert_eq!(source.wal_batch_count(), Some(source_batches));
+                    assert!(Arc::ptr_eq(&engine.inner.state.load().memtable, &source));
+                    assert_eq!(engine.get(b"retry-after-index-pressure")?, None);
+                    assert_eq!(
+                        transaction.get(b"v7-key")?,
+                        Some(Bytes::from_static(b"v")),
+                        "a pre-admission rejection must retain the transaction snapshot"
+                    );
+
+                    if conflicting_write {
+                        engine.put(b"v7-key", b"replacement")?;
+                    }
+                    let result = if async_commit {
+                        runtime.block_on(transaction.commit_async())
+                    } else {
+                        transaction.commit()
+                    };
+                    if conflicting_write {
+                        let error = result.expect_err("the retry must repeat OCC validation");
+                        assert!(
+                            error.to_string().contains("serializable conflict"),
+                            "unexpected retry rejection: {error:#}"
+                        );
+                    } else {
+                        result?;
+                    }
+                    let expected = (!conflicting_write).then(|| Bytes::from_static(b"value"));
+                    assert_eq!(engine.get(b"retry-after-index-pressure")?, expected);
+                    assert_eq!(source.wal_batch_count(), Some(source_batches + 1));
+                    assert_eq!(
+                        engine.pitr_manifest_state.lock().active_segment_id,
+                        Some(source_segment),
+                        "shared pressure must not rotate the Active segment"
+                    );
+
+                    drop(transaction);
+                    engine.close_storage()?;
+                    drop(source);
+                    drop(engine);
+                    let reopened = KvEngine::open_with_wal_io_mode(&database, options, mode)?;
+                    assert_eq!(reopened.get(b"retry-after-index-pressure")?, expected);
+                    reopened.close_storage()?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn v7_async_transaction_capacity_retry_allows_queued_native_write() -> anyhow::Result<()> {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .max_blocking_threads(1)
