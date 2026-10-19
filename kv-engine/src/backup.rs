@@ -4987,6 +4987,17 @@ fn sync_outcome(outcome: BackupOutcome) -> Result<CreateBackupOutcome> {
 }
 
 #[cfg(target_os = "linux")]
+fn ensure_backup_without_engine_owner_can_use_generic_path(
+    pitr_mode: crate::pitr::manifest::PitrMode,
+) -> Result<()> {
+    ensure!(
+        pitr_mode != crate::pitr::manifest::PitrMode::Enabled,
+        "enabled PITR backup boundary capture requires the retained KvEngine owner"
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
 impl crate::lsm_storage::KvEngine {
     #[allow(dead_code)]
     pub(crate) fn create_pitr_base_backup(
@@ -4996,8 +5007,26 @@ impl crate::lsm_storage::KvEngine {
     ) -> Result<BackupInfo> {
         let _lifecycle_guard = self.inner.lifecycle.admit_write()?;
 
-        self.inner
-            .create_backup_inner_with_pitr_base(options, pitr_base)
+        self.create_pitr_base_backup_admitted(options, pitr_base, None, None, None)
+    }
+
+    /// Publishes a PITR base while the caller holds lifecycle admission.
+    #[allow(dead_code)]
+    pub(crate) fn create_pitr_base_backup_admitted(
+        &self,
+        options: BackupOptions,
+        pitr_base: crate::pitr::base::PitrBaseMetadata,
+        cancelled: Option<&AtomicBool>,
+        decision: Option<&Mutex<bool>>,
+        decision_token: Option<u64>,
+    ) -> Result<BackupInfo> {
+        self.inner.create_backup_inner_with_cancellation(
+            options,
+            cancelled,
+            decision,
+            decision_token,
+            Some(pitr_base),
+        )
     }
 
     #[allow(dead_code)]
@@ -5016,6 +5045,9 @@ impl crate::lsm_storage::KvEngine {
 
     #[deprecated(note = "use create_backup")]
     pub fn create_backup_info(&self, options: BackupOptions) -> Result<BackupInfo> {
+        if let Some(info) = self.create_pitr_base_for_backup(&options)? {
+            return Ok(info);
+        }
         let _lifecycle_guard = self.inner.lifecycle.admit_write()?;
 
         self.inner.create_backup_inner(options)
@@ -5050,13 +5082,26 @@ impl crate::lsm_storage::KvEngine {
                 .blocking
                 .run_result_cancelable(&task_control.cancelled, move || {
                     let _guard = guard;
-                    if let Some(engine) = worker_inner
+                    let engine = worker_inner
                         .weak_engine
                         .get()
-                        .and_then(std::sync::Weak::upgrade)
-                        && let Some(info) = engine.create_pitr_base_for_backup(&options)?
-                    {
-                        return Ok(info);
+                        .and_then(std::sync::Weak::upgrade);
+                    if let Some(engine) = engine {
+                        if let Some(info) = engine.create_pitr_base_for_backup_admitted(
+                            &options,
+                            Some(&worker_control.cancelled),
+                            Some(&worker_control.commit_decided),
+                            #[cfg(test)]
+                            Some(worker_control.barrier_token),
+                            #[cfg(not(test))]
+                            None,
+                        )? {
+                            return Ok(info);
+                        }
+                    } else {
+                        ensure_backup_without_engine_owner_can_use_generic_path(
+                            worker_inner.pitr_state.lock().mode,
+                        )?;
                     }
                     worker_inner.create_backup_inner_with_cancellation(
                         options,
@@ -5077,8 +5122,12 @@ impl crate::lsm_storage::KvEngine {
                 }
                 Ok(Some(info)) => Ok(BackupOutcome::Committed(info)),
                 Err(error)
-                    if error.chain().count() == 1
-                        && error.to_string().starts_with("backup cancelled") =>
+                    if task_control.cancelled.load(Ordering::Acquire)
+                        && !*task_control.commit_decided.lock()
+                        // Cleanup failures add context to the cancellation;
+                        // callers must receive those errors and retry cleanup.
+                        && error.chain().count() == 1
+                        && error.to_string().contains("cancelled") =>
                 {
                     Ok(BackupOutcome::CancelledBeforeCommit)
                 }
@@ -5098,11 +5147,13 @@ impl crate::lsm_storage::KvEngine {
     }
 
     pub fn create_backup_with_outcome(&self, options: BackupOptions) -> Result<BackupOutcome> {
-        if let Some(info) = self.create_pitr_base_for_backup(&options)? {
-            return Ok(BackupOutcome::Committed(info));
+        let repository = options.repository.clone();
+        match self.create_pitr_base_for_backup(&options) {
+            Ok(Some(info)) => return Ok(BackupOutcome::Committed(info)),
+            Ok(None) => {}
+            Err(error) => return backup_outcome_from_error(repository.clone(), error),
         }
         let _guard = self.inner.lifecycle.admit_write()?;
-        let repository = options.repository.clone();
 
         match self.inner.create_backup_inner(options) {
             Ok(info) => Ok(BackupOutcome::Committed(info)),
@@ -5131,6 +5182,18 @@ impl crate::lsm_storage::KvEngine {
             .blocking
             .run_result(move || {
                 let _lifecycle_guard = lifecycle_guard;
+                let engine = inner.weak_engine.get().and_then(std::sync::Weak::upgrade);
+                if let Some(engine) = engine {
+                    if let Some(info) =
+                        engine.create_pitr_base_for_backup_admitted(&options, None, None, None)?
+                    {
+                        return Ok(info);
+                    }
+                } else {
+                    ensure_backup_without_engine_owner_can_use_generic_path(
+                        inner.pitr_state.lock().mode,
+                    )?;
+                }
                 inner.create_backup_inner(options)
             })
             .await
@@ -5148,10 +5211,19 @@ impl crate::lsm_storage::KvEngine {
             .blocking
             .run_result(move || {
                 let _guard = guard;
-                if let Some(engine) = inner.weak_engine.get().and_then(std::sync::Weak::upgrade)
-                    && let Some(info) = engine.create_pitr_base_for_backup(&options)?
-                {
-                    return Ok(BackupOutcome::Committed(info));
+                let engine = inner.weak_engine.get().and_then(std::sync::Weak::upgrade);
+                if let Some(engine) = engine {
+                    match engine.create_pitr_base_for_backup_admitted(&options, None, None, None) {
+                        Ok(Some(info)) => return Ok(BackupOutcome::Committed(info)),
+                        Ok(None) => {}
+                        Err(error) => {
+                            return backup_outcome_from_error(repository.clone(), error);
+                        }
+                    }
+                } else {
+                    ensure_backup_without_engine_owner_can_use_generic_path(
+                        inner.pitr_state.lock().mode,
+                    )?;
                 }
                 match inner.create_backup_inner(options) {
                     Ok(info) => Ok(BackupOutcome::Committed(info)),
@@ -5175,14 +5247,6 @@ impl crate::lsm_storage::KvEngine {
 impl crate::lsm_storage::LsmStorageInner {
     fn create_backup_inner(&self, options: BackupOptions) -> Result<BackupInfo> {
         self.create_backup_inner_with_cancellation(options, None, None, None, None)
-    }
-
-    pub(crate) fn create_backup_inner_with_pitr_base(
-        &self,
-        options: BackupOptions,
-        pitr_base: crate::pitr::base::PitrBaseMetadata,
-    ) -> Result<BackupInfo> {
-        self.create_backup_inner_with_cancellation(options, None, None, None, Some(pitr_base))
     }
 
     fn create_backup_inner_with_cancellation(
@@ -7219,6 +7283,28 @@ fn check_pitr_cancellation(cancellation: Option<&std::sync::atomic::AtomicBool>)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn backup_without_engine_owner_only_requires_boundary_for_enabled_pitr() {
+        for mode in [
+            crate::pitr::manifest::PitrMode::Disabled,
+            crate::pitr::manifest::PitrMode::Enabling,
+            crate::pitr::manifest::PitrMode::PublicationUncertain,
+            crate::pitr::manifest::PitrMode::ReconciliationRequired,
+        ] {
+            assert!(
+                ensure_backup_without_engine_owner_can_use_generic_path(mode).is_ok(),
+                "mode {mode:?} should retain the generic backup path"
+            );
+        }
+
+        let error = ensure_backup_without_engine_owner_can_use_generic_path(
+            crate::pitr::manifest::PitrMode::Enabled,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("retained KvEngine owner"));
+    }
 
     #[cfg(target_os = "linux")]
     #[test]
@@ -10401,6 +10487,53 @@ mod tests {
         .unwrap();
         assert!(matches!(outcome, BackupOutcome::CancelledBeforeCommit));
         engine.close().unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cancellation_before_commit_preserves_pending_cleanup_error() {
+        let _test_lock = COMMIT_DECISION_TEST_LOCK.lock();
+        let dir = tempfile::tempdir().unwrap();
+        let engine = crate::lsm_storage::KvEngine::open(
+            dir.path().join("db"),
+            crate::lsm_storage::LsmStorageOptions::default_for_test(),
+        )
+        .unwrap();
+        let repository_path = dir.path().join("repository");
+        let blocker_path = repository_path.join("backups/1/block-cleanup");
+        let result = crate::block_on(async {
+            let task = engine
+                .create_backup_task(BackupOptions {
+                    repository: repository_path.clone(),
+                    use_hard_links: false,
+                })
+                .unwrap();
+            let token = task.control.barrier_token;
+            commit_decision_test_hook::arm(token, 1);
+            let cancellation = task.cancellation_handle();
+            let join = tokio::spawn(task);
+            tokio::task::spawn_blocking(move || {
+                commit_decision_test_hook::wait_until_entered(token, 1)
+            })
+            .await
+            .unwrap();
+            // The backup directory is published before the commit decision.
+            // An unexpected child makes rollback fail with ENOTEMPTY.
+            std::fs::write(&blocker_path, b"preserve cleanup failure").unwrap();
+            cancellation.cancel();
+            commit_decision_test_hook::release(token, 1);
+            join.await.unwrap()
+        });
+        engine.close().unwrap();
+
+        let error = result.expect_err("cancellation must report incomplete rollback");
+        let detail = format!("{error:#}");
+        assert!(detail.contains("pending rollback failed"), "{detail}");
+        assert!(detail.contains("backup cancelled"), "{detail}");
+        assert!(blocker_path.exists());
+        std::fs::remove_file(blocker_path).unwrap();
+        let repository = BackupRepository::open(&repository_path).unwrap();
+        assert!(repository.list_info().unwrap().is_empty());
     }
 
     #[cfg(target_os = "linux")]
