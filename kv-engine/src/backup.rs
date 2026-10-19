@@ -5007,8 +5007,26 @@ impl crate::lsm_storage::KvEngine {
     ) -> Result<BackupInfo> {
         let _lifecycle_guard = self.inner.lifecycle.admit_write()?;
 
-        self.inner
-            .create_backup_inner_with_pitr_base(options, pitr_base)
+        self.create_pitr_base_backup_admitted(options, pitr_base, None, None, None)
+    }
+
+    /// Publishes a PITR base while the caller holds lifecycle admission.
+    #[allow(dead_code)]
+    pub(crate) fn create_pitr_base_backup_admitted(
+        &self,
+        options: BackupOptions,
+        pitr_base: crate::pitr::base::PitrBaseMetadata,
+        cancelled: Option<&AtomicBool>,
+        decision: Option<&Mutex<bool>>,
+        decision_token: Option<u64>,
+    ) -> Result<BackupInfo> {
+        self.inner.create_backup_inner_with_cancellation(
+            options,
+            cancelled,
+            decision,
+            decision_token,
+            Some(pitr_base),
+        )
     }
 
     #[allow(dead_code)]
@@ -5069,7 +5087,15 @@ impl crate::lsm_storage::KvEngine {
                         .get()
                         .and_then(std::sync::Weak::upgrade);
                     if let Some(engine) = engine {
-                        if let Some(info) = engine.create_pitr_base_for_backup(&options)? {
+                        if let Some(info) = engine.create_pitr_base_for_backup_admitted(
+                            &options,
+                            Some(&worker_control.cancelled),
+                            Some(&worker_control.commit_decided),
+                            #[cfg(test)]
+                            Some(worker_control.barrier_token),
+                            #[cfg(not(test))]
+                            None,
+                        )? {
                             return Ok(info);
                         }
                     } else {
@@ -5096,8 +5122,11 @@ impl crate::lsm_storage::KvEngine {
                 }
                 Ok(Some(info)) => Ok(BackupOutcome::Committed(info)),
                 Err(error)
-                    if error.chain().count() == 1
-                        && error.to_string().starts_with("backup cancelled") =>
+                    if task_control.cancelled.load(Ordering::Acquire)
+                        && !*task_control.commit_decided.lock()
+                        && error
+                            .chain()
+                            .any(|cause| cause.to_string().contains("cancelled")) =>
                 {
                     Ok(BackupOutcome::CancelledBeforeCommit)
                 }
@@ -5117,11 +5146,13 @@ impl crate::lsm_storage::KvEngine {
     }
 
     pub fn create_backup_with_outcome(&self, options: BackupOptions) -> Result<BackupOutcome> {
-        if let Some(info) = self.create_pitr_base_for_backup(&options)? {
-            return Ok(BackupOutcome::Committed(info));
+        let repository = options.repository.clone();
+        match self.create_pitr_base_for_backup(&options) {
+            Ok(Some(info)) => return Ok(BackupOutcome::Committed(info)),
+            Ok(None) => {}
+            Err(error) => return backup_outcome_from_error(repository.clone(), error),
         }
         let _guard = self.inner.lifecycle.admit_write()?;
-        let repository = options.repository.clone();
 
         match self.inner.create_backup_inner(options) {
             Ok(info) => Ok(BackupOutcome::Committed(info)),
@@ -5152,7 +5183,9 @@ impl crate::lsm_storage::KvEngine {
                 let _lifecycle_guard = lifecycle_guard;
                 let engine = inner.weak_engine.get().and_then(std::sync::Weak::upgrade);
                 if let Some(engine) = engine {
-                    if let Some(info) = engine.create_pitr_base_for_backup(&options)? {
+                    if let Some(info) =
+                        engine.create_pitr_base_for_backup_admitted(&options, None, None, None)?
+                    {
                         return Ok(info);
                     }
                 } else {
@@ -5179,8 +5212,12 @@ impl crate::lsm_storage::KvEngine {
                 let _guard = guard;
                 let engine = inner.weak_engine.get().and_then(std::sync::Weak::upgrade);
                 if let Some(engine) = engine {
-                    if let Some(info) = engine.create_pitr_base_for_backup(&options)? {
-                        return Ok(BackupOutcome::Committed(info));
+                    match engine.create_pitr_base_for_backup_admitted(&options, None, None, None) {
+                        Ok(Some(info)) => return Ok(BackupOutcome::Committed(info)),
+                        Ok(None) => {}
+                        Err(error) => {
+                            return backup_outcome_from_error(repository.clone(), error);
+                        }
                     }
                 } else {
                     ensure_backup_without_engine_owner_can_use_generic_path(
@@ -5209,14 +5246,6 @@ impl crate::lsm_storage::KvEngine {
 impl crate::lsm_storage::LsmStorageInner {
     fn create_backup_inner(&self, options: BackupOptions) -> Result<BackupInfo> {
         self.create_backup_inner_with_cancellation(options, None, None, None, None)
-    }
-
-    pub(crate) fn create_backup_inner_with_pitr_base(
-        &self,
-        options: BackupOptions,
-        pitr_base: crate::pitr::base::PitrBaseMetadata,
-    ) -> Result<BackupInfo> {
-        self.create_backup_inner_with_cancellation(options, None, None, None, Some(pitr_base))
     }
 
     fn create_backup_inner_with_cancellation(

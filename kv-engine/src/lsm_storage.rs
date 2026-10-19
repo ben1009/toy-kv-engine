@@ -4941,6 +4941,7 @@ impl KvEngine {
         if !allow_lifecycle_closing {
             self.inner.lifecycle.ensure_open()?;
         }
+        check_pitr_cancellation(cancellation)?;
         ensure!(
             !self.pitr_publication_unknown.load(Ordering::Acquire),
             "PITR recovery point cannot proceed while a manifest transition has an unknown outcome; reopen the database first"
@@ -6296,12 +6297,27 @@ impl KvEngine {
         &self,
         options: &crate::backup::BackupOptions,
     ) -> Result<Option<crate::backup::BackupInfo>> {
+        let _lifecycle_guard = self.inner.lifecycle.admit_write()?;
+        self.create_pitr_base_for_backup_admitted(options, None, None, None)
+    }
+
+    /// Captures an enabled-PITR base while the caller owns lifecycle admission.
+    #[cfg(target_os = "linux")]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn create_pitr_base_for_backup_admitted(
+        &self,
+        options: &crate::backup::BackupOptions,
+        cancellation: Option<&std::sync::atomic::AtomicBool>,
+        decision: Option<&parking_lot::Mutex<bool>>,
+        decision_token: Option<u64>,
+    ) -> Result<Option<crate::backup::BackupInfo>> {
+        check_pitr_cancellation(cancellation)?;
         let _operation_guard = self.pitr_operation_lock.lock();
         let _barrier = self.pitr_barrier_lock.lock();
         if self.pitr_manifest_state.lock().mode != crate::pitr::manifest::PitrMode::Enabled {
             return Ok(None);
         }
-        match self.create_recovery_point_locked(false)? {
+        match self.create_recovery_point_locked_cancellable(false, cancellation, true)? {
             crate::pitr::api::RecoveryPointOutcome::Durable(_) => {}
             crate::pitr::api::RecoveryPointOutcome::CommitPublishedButNotDurable {
                 error, ..
@@ -6317,8 +6333,15 @@ impl KvEngine {
         // GC can populate the successor while ordinary admission is stopped.
         // Preparation then seals another boundary; its failures must propagate
         // without reopening admission, even if SealStarted is not persisted.
+        check_pitr_cancellation(cancellation)?;
         let metadata = self.prepare_pitr_base_locked()?;
-        let result = self.create_pitr_base_backup(options.clone(), metadata);
+        let result = self.create_pitr_base_backup_admitted(
+            options.clone(),
+            metadata,
+            cancellation,
+            decision,
+            decision_token,
+        );
         // A clean physical capture failure does not invalidate the prepared
         // durable boundary. Reopen admission only when archive work is settled.
         let state = self.pitr_manifest_state.lock();
