@@ -81,9 +81,9 @@ regressions verify oversized batches fail before ticket assignment, do not rotat
 to empty successors, and leave the Active WAL usable. Serializable transactions
 rejected for shared capacity keep their snapshot and buffered writes for explicit
 retry; sync/async regressions verify successful retry and renewed OCC validation
-in both I/O modes. Source-spool rejection assigns no ticket and does not rotate
-the segment. Sync and async paths wait for the shared-ledger release generation
-to change before retrying admission. Failed attempts release their
+in both I/O modes. Source-spool rejection assigns no ticket. Sync and async paths
+retry admission when shared-ledger capacity is released or in-flight source work
+finishes. Failed attempts release their
 memtable/commit guards before waiting.
 Native async point/range writers also drop their preparation permits. Async
 transactions await quota in an owned coordinator, retaining their transaction
@@ -93,15 +93,22 @@ batch-reservation rejection produces a deferred quota wait.
 Rotation and seal failures return to the caller even when caused by spool
 pressure, allowing PITR resume and explicit transaction retry when commit
 admission has stopped. Under source-spool pressure,
-writers flush one immutable memtable below the normal count threshold before
-waiting for quota. PITR scheduling, reclamation, and flush use one reserved
+writers flush one immutable memtable below the normal count threshold and retry
+released quota before attempting another Active boundary. If only the populated
+Active WAL can release capacity, they archive and flush it. Independent scratch
+buffers do not block this reclamation, and batch completion wakes waiters even
+when its source bytes remain charged. Writers report a capacity error when no
+releaser exists or maintenance cannot make progress. PITR scheduling,
+reclamation, and flush use one reserved
 blocking-executor slot when the executor has more than one slot, so quota release
 can run when ordinary blocking work waits on that same quota or a live
 immutable-memtable pin. Point/range quota waiters exit when lifecycle close
 begins. Admitted transactions can flush and reconcile already-authorized PITR
 cleanup before retrying during close; they return a capacity error if that
-cleanup cannot release quota. The bounded final close-time check runs with the
-blocking cleanup task, so caller runtimes without a time driver are supported.
+cleanup cannot release quota. Reconciliation preserves stopped commit admission
+after `close_pitr` publishes its final point. The bounded final close-time check
+runs with the blocking cleanup task, so caller runtimes without a time driver
+are supported.
 Public close drains and syncs
 the Active v7 WAL for recovery without emitting a final recovery point. It stops
 and drains MVCC commit admission, persists the latest synced logical boundary in
@@ -1109,9 +1116,12 @@ remain in later stage 5/6 work.
   segment-local rotation, shared resource pressure, and batches too large for a
   fresh segment. Oversized sync and async point writes are rejected before
   ticket assignment without rotating. Sync and native async writers now wait on
-  source-spool release generations; tests verify no ticket is assigned, the
-  active-memtable gate stays available, and each write resumes on quota release
-  without rotating.
+  source-spool capacity and work-completion generations; tests verify no ticket
+  is assigned, the active-memtable gate stays available, and each write resumes on quota release
+  without rotating when released capacity suffices. Additional regressions
+  verify batch completion before waiter registration is observed, Active
+  reclamation proceeds while independent scratch stays owned, and a pressure
+  flush does not trigger an unnecessary Active rotation.
 - Extend `PitrManifestRecord::SealStarted`, its obligation state, replay, and
   snapshot validation with the versioned immutable boundary. Persist Active
   references using only logical anchors. Allocation-only timestamp watermarks

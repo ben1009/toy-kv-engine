@@ -766,6 +766,7 @@ async fn wait_for_v7_source_spool_capacity(
     let owner = active_memtable
         .wal_v7_reservation_owner()
         .context("v7 source-spool rejection has no reservation owner")?;
+    let work_generation = owner.source_spool_work_generation();
 
     let flush_inner = Arc::clone(&inner);
     blocking
@@ -775,12 +776,12 @@ async fn wait_for_v7_source_spool_capacity(
         .await
         .context("failed to flush an immutable memtable under v7 source-spool pressure")?;
 
-    if inner.lifecycle.ensure_open().is_ok() {
+    if inner.lifecycle.ensure_open().is_ok() && !owner.source_spool_generation_changed(generation) {
         let reclaim_inner = Arc::clone(&inner);
         let reclaim_owner = Arc::clone(&owner);
         let reclaim_result = blocking
             .run_result_with_reserved_capacity(move || {
-                reclaim_inner.reclaim_active_source_spool_for_pressure(&reclaim_owner)
+                reclaim_inner.reclaim_active_source_spool_for_pressure(&reclaim_owner, generation)
             })
             .await;
         let reclaimed = match reclaim_result {
@@ -806,7 +807,7 @@ async fn wait_for_v7_source_spool_capacity(
 
     let closing = inner.lifecycle.close_notify();
     if owner
-        .wait_for_source_spool_change_async_while(generation, closing, || {
+        .wait_for_source_spool_change_async_while(generation, work_generation, closing, || {
             inner.lifecycle.ensure_open().is_ok()
         })
         .await

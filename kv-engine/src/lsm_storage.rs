@@ -14361,13 +14361,17 @@ impl LsmStorageInner {
         if let Some(generation) = crate::wal::Wal::v7_source_spool_wait_generation(&error)
             && let Some(owner) = expected_memtable.wal_v7_reservation_owner()
         {
+            let work_generation = owner.source_spool_work_generation();
             // A reclaimed source can stay charged while its immutable memtable
             // pins the WAL. Flush one immutable table below the normal count
             // threshold before waiting for the source-spool release.
             self.flush_immutable_for_source_spool_pressure()
                 .context("failed to flush an immutable memtable under v7 source-spool pressure")?;
-            if self.lifecycle.ensure_open().is_ok() {
-                let reclaim_result = self.reclaim_active_source_spool_for_pressure(&owner);
+            if self.lifecycle.ensure_open().is_ok()
+                && !owner.source_spool_generation_changed(generation)
+            {
+                let reclaim_result =
+                    self.reclaim_active_source_spool_for_pressure(&owner, generation);
                 let reclaimed = match reclaim_result {
                     Ok(reclaimed) => reclaimed,
                     Err(maintenance_error) => {
@@ -14395,7 +14399,7 @@ impl LsmStorageInner {
             // for source-spool reclamation without rotating the Active segment.
             // If close interrupts an admitted transaction's wait, the close
             // path below reconciles existing PITR obligations before retrying.
-            if !owner.wait_for_source_spool_change_while(generation, || {
+            if !owner.wait_for_source_spool_change_while(generation, work_generation, || {
                 self.lifecycle.ensure_open().is_ok()
             }) {
                 if !allow_lifecycle_closing {
@@ -14505,8 +14509,13 @@ impl LsmStorageInner {
     pub(crate) fn reclaim_active_source_spool_for_pressure(
         &self,
         owner: &crate::wal::v7::admission::WalV7ReservationOwner,
+        generation: u64,
     ) -> Result<bool> {
-        if !self.source_spool_wait_needs_active_reclamation(owner) {
+        // A pressure flush or another writer can release quota while the
+        // async caller is queued for its maintenance worker.
+        if owner.source_spool_generation_changed(generation)
+            || !self.source_spool_wait_needs_active_reclamation(owner)
+        {
             return Ok(false);
         }
 
@@ -21209,6 +21218,66 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn v7_source_spool_flush_retries_without_reclaiming_populated_active()
+    -> anyhow::Result<()> {
+        use crate::wal::v7::admission::WalV7ResourceCharge;
+
+        let directory = tempdir()?;
+        let mut options = v7_recovery_test_database(directory.path())?;
+        options.num_memtable_limit = 50;
+        let engine = KvEngine::open_with_wal_io_mode(
+            directory.path().join("db"),
+            options,
+            crate::wal::WalIoMode::Parallel,
+        )?;
+        let (owner, source_wal, held) = reclaimable_v7_imm_with_source_spool_pressure(&engine)?;
+        drop(held);
+        engine.put(b"populated-active-before-pressure", b"keep")?;
+        let active_segment_id = engine.pitr_manifest_state.lock().active_segment_id;
+
+        let limit = engine
+            .pitr_manifest_state
+            .lock()
+            .config
+            .as_ref()
+            .unwrap()
+            .max_source_spool_bytes;
+        let snapshot = owner.snapshot();
+        let charged = snapshot.source_spool_bytes + snapshot.recovery_workspace_bytes;
+        let batch_bytes = WalV7ResourceCharge::for_batch(128)?.source_spool_bytes;
+        let retained_charge = limit
+            .checked_sub(charged + batch_bytes - 1)
+            .ok_or_else(|| anyhow::anyhow!("fixture has insufficient source-spool capacity"))?;
+        owner
+            .retained_resources()
+            .unwrap()
+            .reserve_unattributed(WalV7ResourceCharge {
+                source_spool_bytes: retained_charge,
+                ..WalV7ResourceCharge::default()
+            })?;
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            engine.put_async(b"spool-flush-retry", b"value"),
+        )
+        .await
+        .expect("pressure flush did not release source-spool capacity")?;
+        assert!(!source_wal.exists());
+        assert_eq!(
+            engine.pitr_manifest_state.lock().active_segment_id,
+            active_segment_id,
+            "released source-spool capacity must be retried before reclaiming Active"
+        );
+        assert_eq!(
+            engine.get(b"spool-flush-retry")?,
+            Some(Bytes::from_static(b"value"))
+        );
+        engine.close_async().await?;
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
     #[test]
     fn v7_sync_point_write_waits_for_source_spool_release_without_rotation() -> anyhow::Result<()> {
         let directory = tempdir()?;
@@ -21471,6 +21540,14 @@ mod tests {
             "test batch must exceed reserved maintenance headroom"
         );
 
+        // Model a range writer's independently retained scratch and another
+        // admitted batch whose completion retires memory, not source bytes.
+        let buffer_preparation = owner
+            .reserve_preparation_buffer(128)?
+            .ok_or_else(|| anyhow::anyhow!("buffer preparation reservation is empty"))?;
+        let mut draining_batch = owner.reserve_batch(128)?;
+        draining_batch.mark_admitted();
+
         let limit = engine
             .pitr_manifest_state
             .lock()
@@ -21499,12 +21576,35 @@ mod tests {
                 ..WalV7ResourceCharge::default()
             })?;
 
-        tokio::time::timeout(
-            std::time::Duration::from_secs(15),
-            engine.put_async(b"spool-active-reclaim", &attempted_value),
-        )
+        let writer_engine = Arc::clone(&engine);
+        let writer_value = attempted_value.clone();
+        let mut writer = tokio::spawn(async move {
+            writer_engine
+                .put_async(b"spool-active-reclaim", &writer_value)
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while owner.source_spool_waiter_count() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
         .await
-        .expect("active-only source-spool pressure did not make progress")?;
+        .expect("source-spool writer did not wait for the admitted batch");
+        let source_bytes_before_completion = owner.snapshot().source_spool_bytes;
+        draining_batch.finish_after_io()?;
+        assert_eq!(
+            owner.snapshot().source_spool_bytes,
+            source_bytes_before_completion
+        );
+        let Ok(result) = tokio::time::timeout(std::time::Duration::from_secs(5), &mut writer).await
+        else {
+            engine.close_async().await?;
+            let _ = writer.await;
+            anyhow::bail!(
+                "source-spool writer did not reassess reclamation after batch completion"
+            );
+        };
+        result??;
 
         anyhow::ensure!(
             engine.pitr_manifest_state.lock().active_segment_id == Some(source_segment_id + 1),
@@ -21515,6 +21615,7 @@ mod tests {
             "reclaimed Active source WAL remains on disk"
         );
         assert_eq!(engine.get(b"spool-active-reclaim")?, Some(attempted_value));
+        drop(buffer_preparation);
         engine.close_async().await?;
 
         Ok(())

@@ -162,6 +162,7 @@ impl LsmStorageInner {
                         let owner = memtable
                             .wal_v7_reservation_owner()
                             .context("v7 source-spool rejection has no reservation owner")?;
+                        let work_generation = owner.source_spool_work_generation();
                         let flush_inner = Arc::clone(self);
                         let flush_admission = Arc::clone(&admission);
                         self.blocking
@@ -173,14 +174,18 @@ impl LsmStorageInner {
                             .context(
                                 "failed to dispatch immutable flush under v7 source-spool pressure",
                             )?;
-                        if self.lifecycle.ensure_open().is_ok() {
+                        if self.lifecycle.ensure_open().is_ok()
+                            && !owner.source_spool_generation_changed(generation)
+                        {
                             let reclaim_inner = Arc::clone(self);
                             let reclaim_owner = Arc::clone(&owner);
                             let reclaim_result = self
                                 .blocking
                                 .run_result_with_reserved_capacity(move || {
-                                    reclaim_inner
-                                        .reclaim_active_source_spool_for_pressure(&reclaim_owner)
+                                    reclaim_inner.reclaim_active_source_spool_for_pressure(
+                                        &reclaim_owner,
+                                        generation,
+                                    )
                                 })
                                 .await;
                             let reclaimed = match reclaim_result {
@@ -206,9 +211,12 @@ impl LsmStorageInner {
                         }
                         let closing = self.lifecycle.close_notify();
                         if !owner
-                            .wait_for_source_spool_change_async_while(generation, closing, || {
-                                self.lifecycle.ensure_open().is_ok()
-                            })
+                            .wait_for_source_spool_change_async_while(
+                                generation,
+                                work_generation,
+                                closing,
+                                || self.lifecycle.ensure_open().is_ok(),
+                            )
                             .await
                         {
                             self.lifecycle.ensure_open()?;
@@ -396,6 +404,7 @@ impl LsmStorageInner {
                         let owner = memtable
                             .wal_v7_reservation_owner()
                             .context("v7 source-spool rejection has no reservation owner")?;
+                        let work_generation = owner.source_spool_work_generation();
                         let flush_inner = Arc::clone(self);
                         let flush_admission = Arc::clone(&admission);
                         self.blocking
@@ -407,14 +416,18 @@ impl LsmStorageInner {
                             .context(
                                 "failed to dispatch immutable flush under v7 source-spool pressure",
                             )?;
-                        if self.lifecycle.ensure_open().is_ok() {
+                        if self.lifecycle.ensure_open().is_ok()
+                            && !owner.source_spool_generation_changed(generation)
+                        {
                             let reclaim_inner = Arc::clone(self);
                             let reclaim_owner = Arc::clone(&owner);
                             let reclaim_result = self
                                 .blocking
                                 .run_result_with_reserved_capacity(move || {
-                                    reclaim_inner
-                                        .reclaim_active_source_spool_for_pressure(&reclaim_owner)
+                                    reclaim_inner.reclaim_active_source_spool_for_pressure(
+                                        &reclaim_owner,
+                                        generation,
+                                    )
                                 })
                                 .await;
                             let reclaimed = match reclaim_result {
@@ -440,9 +453,12 @@ impl LsmStorageInner {
                         }
                         let closing = self.lifecycle.close_notify();
                         if !owner
-                            .wait_for_source_spool_change_async_while(generation, closing, || {
-                                self.lifecycle.ensure_open().is_ok()
-                            })
+                            .wait_for_source_spool_change_async_while(
+                                generation,
+                                work_generation,
+                                closing,
+                                || self.lifecycle.ensure_open().is_ok(),
+                            )
                             .await
                         {
                             self.lifecycle.ensure_open()?;
