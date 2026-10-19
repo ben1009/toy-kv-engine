@@ -63,9 +63,17 @@ close drains it before closing MVCC admission, and checks reopen durability. The
 retry retains its original lifecycle admission while it rotates the Active WAL.
 Leader-mode async retries use the same close-drain allowance; a forced-capacity
 regression verifies rotation, close, and reopen durability.
-Proactive target/
-interval rotation, range/transaction cancellation during retry, and global
-spool backpressure remain pending.
+Background PITR maintenance now rotates Active v7 segments when they reach the
+configured segment target or archive interval; regressions cover both triggers.
+Maintenance retries also finish durable Sealing/Sealed transitions before
+reconciling their archive obligations, without requiring manual resume.
+Queued maintenance checks lifecycle under the PITR barrier and cannot replace
+the Active WAL or reopen admission after close establishes its final boundary.
+Already-flushed v7 sources remain schedulable while cleanup is outstanding,
+including after unlink or directory-sync errors; archive reconciliation finishes
+their durable cleanup and releases source-spool/index quota before resuming writes.
+Range/transaction cancellation during retry and global spool backpressure remain
+pending.
 Public close drains and syncs
 the Active v7 WAL for recovery without emitting a final recovery point. It stops
 and drains MVCC commit admission, persists the latest synced logical boundary in
@@ -1025,9 +1033,21 @@ remain in later stage 5/6 work.
   regression aborts the caller while the owned retry is paused, verifies close
   waits for it, and checks reopen durability. A Leader-mode async batch held at
   the active-memtable gate finishes its capacity retry after close starts and
-  survives reopen. Range/transaction retry
-  cancellation and distinct global backpressure and oversize outcomes remain
-  outstanding.
+  survives reopen. Background maintenance now archives and rotates Active v7
+  segments at either the configured physical segment target or archive
+  interval, including an idle reopened WAL, with regressions for both triggers.
+  A transient failure after `SealStarted` or before successor installation is
+  completed by subsequent maintenance; failure injection covers both boundaries
+  in Leader and Parallel modes and verifies writes resume and survive reopen.
+  A queued retry held until close finishes its final Active boundary preserves
+  the stopped admission fence in both I/O modes; resume after reopen completes
+  the pending rotation.
+  Already-flushed sources get a second cleanup pass after archive reconciliation.
+  Reclaimable sources without a live memtable remain maintenance work even with
+  an empty successor; injected publication, unlink, and directory-sync failures
+  verify automatic retry, quota release, and resumed writes in both I/O modes.
+  Range/transaction retry cancellation and distinct global backpressure and
+  oversize outcomes remain outstanding.
 - Extend `PitrManifestRecord::SealStarted`, its obligation state, replay, and
   snapshot validation with the versioned immutable boundary. Persist Active
   references using only logical anchors. Allocation-only timestamp watermarks

@@ -3981,6 +3981,10 @@ impl KvEngine {
         {
             return Ok(false);
         }
+        #[cfg(feature = "chaos-testing")]
+        crate::chaos::failpoint::fail_point!("pitr.before_flushed_source_cleanup", |_| Err(
+            anyhow!("injected PITR source cleanup failure")
+        ));
         let wal_name = format!("pitr-{segment_id:020}.wal");
         let seal_name = format!("pitr-{segment_id:020}.seal");
         for entry in std::fs::read_dir(&self.inner.path)? {
@@ -3992,6 +3996,10 @@ impl KvEngine {
                 std::fs::remove_file(path)?;
             }
         }
+        #[cfg(feature = "chaos-testing")]
+        crate::chaos::failpoint::fail_point!("pitr.after_flushed_source_unlink", |_| Err(anyhow!(
+            "injected PITR failure before source cleanup directory sync"
+        )));
         // Also sync on retry when a previous pass unlinked the files but failed
         // before its directory sync. Absence alone does not prove durable cleanup.
         self.inner.sync_dir()?;
@@ -4486,6 +4494,10 @@ impl KvEngine {
             )?;
             sealing_state
         };
+        #[cfg(feature = "chaos-testing")]
+        crate::chaos::failpoint::fail_point!("pitr.v7_after_seal_started", |_| Err(anyhow!(
+            "injected v7 failure after SealStarted"
+        )));
         if let Err(error) = self
             .inner
             .install_v7_pitr_seal_for_sealing_obligation(&mut prepared)
@@ -4597,6 +4609,10 @@ impl KvEngine {
             .as_mut()
             .expect("PITR segment manager was checked above") = sealed_segments;
 
+        #[cfg(feature = "chaos-testing")]
+        crate::chaos::failpoint::fail_point!("pitr.v7_before_successor_install", |_| Err(anyhow!(
+            "injected v7 failure before successor installation"
+        )));
         drop(active_memtable_guard);
         let successor_owner = self.inner.install_pitr_v7_successor(
             successor_header,
@@ -5169,9 +5185,10 @@ impl KvEngine {
     #[cfg(target_os = "linux")]
     fn run_pitr_maintenance(&self, requested_segment_id: u64) -> Result<()> {
         let _barrier = self.pitr_barrier_lock.lock();
-        if self.inner.state.load().memtable.uses_v7_wal() {
-            return Ok(());
-        }
+        // Close changes lifecycle under this barrier too. Queued maintenance
+        // must not replace the Active WAL or reopen admission after close has
+        // established its final boundary.
+        self.inner.lifecycle.ensure_open()?;
         let mut state = self.pitr_manifest_state.lock().clone();
         if !matches!(
             state.mode,
@@ -5182,18 +5199,38 @@ impl KvEngine {
         {
             return Ok(());
         }
-        if state.obligations.values().any(|obligation| {
-            obligation.state != crate::pitr::manifest::ObligationState::Reclaimable
-        }) || state.mode == crate::pitr::manifest::PitrMode::PublicationUncertain
-        {
+        if self.inner.pitr_maintenance_needs_reconciliation(&state) {
+            ensure!(
+                !self.pitr_publication_unknown.load(Ordering::Acquire),
+                "PITR maintenance cannot resume an unknown manifest transition; reopen the database first"
+            );
+            if let Some(manifest) = self.inner.manifest.as_ref() {
+                manifest.ensure_durability_certain()?;
+            }
+            // A failed rotation can leave the source installed after durable
+            // SealStarted or SegmentSealed. Finish its authorized successor
+            // before archive reconciliation, which requires that successor.
+            state = self.resume_v7_successor_install(state)?;
             state = self.reconcile_durable_archive_obligations(state)?;
+            if state.obligations.values().any(|obligation| {
+                obligation.wal_format == crate::pitr::manifest::PitrWalFormat::V7
+                    && obligation.state == crate::pitr::manifest::ObligationState::Reclaimable
+            }) {
+                // The first pass durably authorizes reclamation. A second
+                // pass can now remove sources that already finished flushing
+                // and release their spool/index quota before admission opens.
+                state = self.reconcile_durable_archive_obligations(state)?;
+            }
             if state.obligations.values().any(|obligation| {
                 obligation.state != crate::pitr::manifest::ObligationState::Reclaimable
             }) {
                 return Err(anyhow!("PITR archive obligations remain pending"));
             }
-            if let Some(config) = state.config.as_ref() {
-                self.inner.state.load().memtable.configure_pitr_wal_limits(
+            let active_memtable = self.inner.state.load().memtable.clone();
+            if active_memtable.uses_wal_v5()
+                && let Some(config) = state.config.as_ref()
+            {
+                active_memtable.configure_pitr_wal_limits(
                     config.max_segment_bytes,
                     config.max_unarchived_bytes,
                 )?;
@@ -10550,6 +10587,12 @@ impl LsmStorageInner {
                     nanos: recorded_at.nanos,
                 });
         let recovered_recorded_at = plan.max_recorded_at;
+        // `Instant` cannot be persisted across restarts. Start the interval
+        // clock when reopening a populated Active v7 WAL so idle databases
+        // still advance the archive boundary after one configured interval.
+        let pitr_active_started_at = (plan.state.memtable.uses_v7_wal()
+            && !plan.state.memtable.is_empty())
+        .then(std::time::Instant::now);
         let storage = Self {
             state: ArcSwap::from_pointee(plan.state),
             state_lock: Mutex::new(()),
@@ -10585,7 +10628,7 @@ impl LsmStorageInner {
             weak_self: std::sync::OnceLock::new(),
             weak_engine: std::sync::OnceLock::new(),
             pitr_maintenance_queued: AtomicBool::new(false),
-            pitr_active_started_at: Mutex::new(None),
+            pitr_active_started_at: Mutex::new(pitr_active_started_at),
             background_tasks: Mutex::new(None),
             write_profile: Arc::new(crate::mem_table::WriteProfile::default()),
             #[cfg(feature = "bench")]
@@ -14110,7 +14153,8 @@ impl LsmStorageInner {
         let state = self.state.load();
         // PITR WALs rotate through a segment boundary. In particular, a v7
         // commit must not reach ordinary freeze after publishing its data:
-        // v7 sealing/rotation is pending, and admission enforces its hard limits.
+        // maintenance and capacity retries establish the immutable segment
+        // boundary before installing a successor.
         if state.memtable.uses_pitr_batch_wal() {
             if !state.memtable.is_empty() {
                 self.pitr_active_started_at
@@ -14250,6 +14294,30 @@ impl LsmStorageInner {
         Ok(())
     }
 
+    fn pitr_maintenance_needs_reconciliation(
+        &self,
+        state: &crate::pitr::manifest::PitrState,
+    ) -> bool {
+        use crate::pitr::manifest::{ObligationState, PitrMode, PitrWalFormat};
+
+        if state.mode == PitrMode::PublicationUncertain {
+            return true;
+        }
+        let storage_state = self.state.load();
+        state.obligations.iter().any(|(&segment_id, obligation)| {
+            if obligation.state != ObligationState::Reclaimable {
+                return true;
+            }
+            // A flushed source may still need unlink/directory-sync retry even
+            // when archival is durable and the successor has no writes. Live
+            // memtables retain their sources until the flush path retires them.
+            obligation.wal_format == PitrWalFormat::V7
+                && !std::iter::once(storage_state.memtable.as_ref())
+                    .chain(storage_state.imm_memtables.iter().map(AsRef::as_ref))
+                    .any(|memtable| Self::pitr_segment_of(memtable) == Some(segment_id))
+        })
+    }
+
     fn maybe_queue_pitr_maintenance(&self, check_size: bool) -> Result<()> {
         let state = self.pitr_state.lock().clone();
         if !matches!(
@@ -14264,13 +14332,10 @@ impl LsmStorageInner {
             .as_ref()
             .ok_or_else(|| anyhow!("enabled PITR state has no configuration"))?;
         let memtable = self.state.load().memtable.clone();
-        if !memtable.uses_wal_v5() {
+        if !memtable.uses_pitr_batch_wal() {
             return Ok(());
         }
-        let has_pending_obligation = state.obligations.values().any(|obligation| {
-            obligation.state != crate::pitr::manifest::ObligationState::Reclaimable
-        }) || state.mode
-            == crate::pitr::manifest::PitrMode::PublicationUncertain;
+        let has_pending_obligation = self.pitr_maintenance_needs_reconciliation(&state);
         if memtable.is_empty() && !has_pending_obligation {
             return Ok(());
         }
@@ -18227,18 +18292,52 @@ mod tests {
         v7_recovery_test_database_with_segment_limit(directory, 1 << 20)
     }
 
+    /// Keep periodic target rotation and reconciliation from consuming the
+    /// boundary a test deliberately drives through capacity retry or resume.
+    #[cfg(target_os = "linux")]
+    fn suspend_pitr_maintenance_for_test(engine: &KvEngine) {
+        engine
+            .inner
+            .pitr_maintenance_queued
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
     #[cfg(target_os = "linux")]
     fn v7_recovery_test_database_with_segment_limit(
         directory: &std::path::Path,
         max_segment_bytes: u64,
     ) -> anyhow::Result<LsmStorageOptions> {
-        let engine = pitr_flush_test_engine_with_segment_limit(directory, max_segment_bytes);
+        v7_recovery_test_database_with_segment_limit_and_interval(
+            directory,
+            max_segment_bytes,
+            std::time::Duration::from_secs(3600),
+        )
+        .map(|(options, _)| options)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn v7_recovery_test_database_with_segment_limit_and_interval(
+        directory: &std::path::Path,
+        max_segment_bytes: u64,
+        archive_interval: std::time::Duration,
+    ) -> anyhow::Result<(LsmStorageOptions, u64)> {
+        let engine = pitr_flush_test_engine_with_segment_limit_and_interval(
+            directory,
+            max_segment_bytes,
+            archive_interval,
+        );
         let state = engine.pitr_manifest_state.lock().clone();
         assert!(state.obligations.is_empty());
+        let source_segment_id = state
+            .active_segment_id
+            .ok_or_else(|| anyhow::anyhow!("v7 fixture has no Active segment"))?;
         engine.close_storage()?;
         drop(engine);
 
-        install_v7_recovery_test_database(directory, state)
+        Ok((
+            install_v7_recovery_test_database(directory, state)?,
+            source_segment_id,
+        ))
     }
 
     #[cfg(target_os = "linux")]
@@ -20370,6 +20469,7 @@ mod tests {
             options.clone(),
             crate::wal::WalIoMode::Parallel,
         )?;
+        suspend_pitr_maintenance_for_test(&engine);
         let frame_len = u64::try_from(crate::wal::v7::codec::WAL_V7_FRAME_LEN)?;
         let mut filler = 0;
         loop {
@@ -20491,6 +20591,7 @@ mod tests {
                     v7_recovery_test_database_with_segment_limit(directory.path(), 32 * 1024)?;
                 let database = directory.path().join("db");
                 let engine = KvEngine::open_with_wal_io_mode(&database, options.clone(), mode)?;
+                suspend_pitr_maintenance_for_test(&engine);
                 let initial_segment_id = engine
                     .pitr_manifest_state
                     .lock()
@@ -20569,6 +20670,7 @@ mod tests {
             options.clone(),
             crate::wal::WalIoMode::Parallel,
         )?;
+        suspend_pitr_maintenance_for_test(&engine);
         let initial_segment_id = engine
             .pitr_manifest_state
             .lock()
@@ -20685,6 +20787,7 @@ mod tests {
             options.clone(),
             crate::wal::WalIoMode::Parallel,
         )?;
+        suspend_pitr_maintenance_for_test(&engine);
         let initial_segment_id = engine
             .pitr_manifest_state
             .lock()
@@ -20803,6 +20906,7 @@ mod tests {
             options.clone(),
             crate::wal::WalIoMode::Parallel,
         )?;
+        suspend_pitr_maintenance_for_test(&engine);
         let initial_segment_id = engine
             .pitr_manifest_state
             .lock()
@@ -20890,6 +20994,7 @@ mod tests {
             options.clone(),
             crate::wal::WalIoMode::Parallel,
         )?;
+        suspend_pitr_maintenance_for_test(&engine);
         let initial_segment_id = engine
             .pitr_manifest_state
             .lock()
@@ -21019,6 +21124,7 @@ mod tests {
             options.clone(),
             crate::wal::WalIoMode::Parallel,
         )?;
+        suspend_pitr_maintenance_for_test(&engine);
         engine.put(b"fill-one", b"value")?;
         engine.put(b"fill-two", b"value")?;
         let source = engine.inner.state.load().memtable.clone();
@@ -21082,6 +21188,7 @@ mod tests {
             options.clone(),
             crate::wal::WalIoMode::Parallel,
         )?;
+        suspend_pitr_maintenance_for_test(&engine);
         engine.put(b"fill-one", b"value")?;
         engine.put(b"fill-two", b"value")?;
         let source = engine.inner.state.load().memtable.clone();
@@ -21180,6 +21287,7 @@ mod tests {
             options.clone(),
             crate::wal::WalIoMode::Parallel,
         )?;
+        suspend_pitr_maintenance_for_test(&engine);
         engine.put(b"conflict", b"initial")?;
         engine.put(b"fill-two", b"value")?;
         let source = engine.inner.state.load().memtable.clone();
@@ -21358,6 +21466,7 @@ mod tests {
             options.clone(),
             crate::wal::WalIoMode::Leader,
         )?;
+        suspend_pitr_maintenance_for_test(&engine);
         let initial_segment_id = engine
             .pitr_manifest_state
             .lock()
@@ -22103,6 +22212,7 @@ mod tests {
                 let database = directory.path().join("db");
                 let repository = directory.path().join("repository");
                 let engine = KvEngine::open_with_wal_io_mode(&database, options.clone(), mode)?;
+                suspend_pitr_maintenance_for_test(&engine);
                 engine.put(b"before-archive-failure", b"durable")?;
                 let source_wal = engine
                     .inner
@@ -22574,6 +22684,11 @@ mod tests {
         options.target_sst_size = usize::MAX;
         let engine = KvEngine::open_async(directory.path().join("db"), options).await?;
 
+        assert!(matches!(
+            engine.create_recovery_point_async().await?,
+            crate::pitr::api::RecoveryPointOutcome::Durable(_)
+        ));
+        assert!(engine.inner.state.load().memtable.is_empty());
         assert!(engine.inner.pitr_active_started_at.lock().is_none());
         assert!(engine.inner.state.load().memtable.approximate_size() < usize::MAX);
 
@@ -24563,6 +24678,19 @@ mod tests {
         dir: &std::path::Path,
         max_segment_bytes: u64,
     ) -> Arc<KvEngine> {
+        pitr_flush_test_engine_with_segment_limit_and_interval(
+            dir,
+            max_segment_bytes,
+            std::time::Duration::from_secs(3600),
+        )
+    }
+
+    #[cfg(target_os = "linux")]
+    fn pitr_flush_test_engine_with_segment_limit_and_interval(
+        dir: &std::path::Path,
+        max_segment_bytes: u64,
+        archive_interval: std::time::Duration,
+    ) -> Arc<KvEngine> {
         let engine = KvEngine::open(
             dir.join("db"),
             LsmStorageOptions {
@@ -24575,7 +24703,7 @@ mod tests {
             .enable_pitr(crate::pitr::api::PitrOptions {
                 repository: dir.join("repository"),
                 config: crate::pitr::api::PersistedPitrConfig {
-                    archive_interval: std::time::Duration::from_secs(3600),
+                    archive_interval,
                     max_segment_bytes,
                     max_unarchived_bytes: max_segment_bytes * 2,
                     max_source_spool_bytes: max_segment_bytes * 4,
@@ -26074,6 +26202,449 @@ mod tests {
             }
             engine.close().unwrap();
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn wait_for_v7_background_archive(
+        engine: &KvEngine,
+        source_segment_id: u64,
+    ) -> anyhow::Result<()> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let state = engine.pitr_manifest_state.lock().clone();
+            let archived = state.active_segment_id == Some(source_segment_id + 1)
+                && state
+                    .obligations
+                    .get(&source_segment_id)
+                    .is_none_or(|obligation| {
+                        matches!(
+                            obligation.state,
+                            crate::pitr::manifest::ObligationState::Archived
+                                | crate::pitr::manifest::ObligationState::Reclaimable
+                        )
+                    });
+            if archived
+                && engine
+                    .inner
+                    .mvcc
+                    .as_ref()
+                    .is_some_and(|sequencer| sequencer.commit_admission_is_open())
+            {
+                return Ok(());
+            }
+            anyhow::ensure!(
+                std::time::Instant::now() < deadline,
+                "automatic v7 maintenance did not archive its boundary"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn v7_background_maintenance_rotates_at_segment_target() -> anyhow::Result<()> {
+        const SEGMENT_LIMIT: u64 = 16 * 1024;
+        let directory = tempdir()?;
+        let (options, source_segment_id) =
+            v7_recovery_test_database_with_segment_limit_and_interval(
+                directory.path(),
+                SEGMENT_LIMIT,
+                PITR_TEST_ARCHIVE_INTERVAL,
+            )?;
+        let database = directory.path().join("db");
+        let source_wal = database.join(format!("pitr-{source_segment_id:020}.wal"));
+        anyhow::ensure!(
+            std::fs::metadata(source_wal)?.len() >= SEGMENT_LIMIT,
+            "fixture must reach the configured segment target"
+        );
+        let engine = KvEngine::open(&database, options)?;
+
+        wait_for_v7_background_archive(&engine, source_segment_id)?;
+        assert_eq!(
+            engine
+                .pitr_status(crate::pitr::api::PitrStatusOptions {
+                    cursor: None,
+                    page_size: crate::pitr::api::MAX_STATUS_PAGE_SIZE,
+                })?
+                .latest_archived_commit_ts,
+            Some(7)
+        );
+        assert!(engine.inner.state.load().memtable.uses_v7_wal());
+        engine.close()?;
+
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn v7_reopened_active_wal_rotates_after_archive_interval() -> anyhow::Result<()> {
+        let directory = tempdir()?;
+        let (options, source_segment_id) =
+            v7_recovery_test_database_with_segment_limit_and_interval(
+                directory.path(),
+                1 << 20,
+                std::time::Duration::from_millis(10),
+            )?;
+        let database = directory.path().join("db");
+        let source_wal = database.join(format!("pitr-{source_segment_id:020}.wal"));
+        anyhow::ensure!(
+            std::fs::metadata(source_wal)?.len() < 1 << 20,
+            "fixture must stay below the segment target to exercise interval rotation"
+        );
+        let engine = KvEngine::open(&database, options)?;
+
+        wait_for_v7_background_archive(&engine, source_segment_id)?;
+        assert_eq!(
+            engine
+                .pitr_status(crate::pitr::api::PitrStatusOptions {
+                    cursor: None,
+                    page_size: crate::pitr::api::MAX_STATUS_PAGE_SIZE,
+                })?
+                .latest_archived_commit_ts,
+            Some(7)
+        );
+        assert!(engine.inner.state.load().memtable.uses_v7_wal());
+        engine.close()?;
+
+        Ok(())
+    }
+
+    #[cfg(all(target_os = "linux", feature = "chaos-testing"))]
+    #[test]
+    fn failpoint_v7_background_maintenance_retries_interrupted_rotation() -> anyhow::Result<()> {
+        let _scenario = crate::chaos::failpoint::FailScenario::setup();
+        for mode in [
+            crate::wal::WalIoMode::Leader,
+            crate::wal::WalIoMode::Parallel,
+        ] {
+            for (failpoint, expected_state) in [
+                (
+                    "pitr.v7_after_seal_started",
+                    crate::pitr::manifest::ObligationState::Sealing,
+                ),
+                (
+                    "pitr.v7_before_successor_install",
+                    crate::pitr::manifest::ObligationState::Sealed,
+                ),
+            ] {
+                let directory = tempdir()?;
+                let options = v7_recovery_test_database(directory.path())?;
+                let database = directory.path().join("db");
+                let engine = KvEngine::open_with_wal_io_mode(&database, options.clone(), mode)?;
+                let source_segment_id = engine
+                    .pitr_manifest_state
+                    .lock()
+                    .active_segment_id
+                    .ok_or_else(|| anyhow::anyhow!("v7 fixture has no Active segment"))?;
+
+                // Hold periodic dispatch until the first maintenance attempt
+                // has stopped at the durable transition being exercised.
+                engine
+                    .inner
+                    .pitr_maintenance_queued
+                    .store(true, std::sync::atomic::Ordering::Release);
+                fail::cfg(failpoint, "return").map_err(anyhow::Error::msg)?;
+                let first_attempt = engine.run_pitr_maintenance(source_segment_id);
+                fail::remove(failpoint);
+                assert!(
+                    first_attempt.is_err(),
+                    "{failpoint} did not interrupt maintenance"
+                );
+                assert_eq!(
+                    engine
+                        .pitr_manifest_state
+                        .lock()
+                        .obligations
+                        .get(&source_segment_id)
+                        .map(|obligation| obligation.state),
+                    Some(expected_state)
+                );
+                assert_eq!(
+                    LsmStorageInner::pitr_segment_of(&engine.inner.state.load().memtable),
+                    Some(source_segment_id),
+                    "the interrupted attempt must leave its source installed"
+                );
+                assert!(
+                    !engine
+                        .inner
+                        .mvcc
+                        .as_ref()
+                        .unwrap()
+                        .commit_admission_is_open()
+                );
+                engine
+                    .inner
+                    .pitr_maintenance_queued
+                    .store(false, std::sync::atomic::Ordering::Release);
+
+                // Pending obligations must finish without manual resume or a
+                // reopen once the transient failure clears.
+                wait_for_v7_background_archive(&engine, source_segment_id)?;
+                assert_eq!(
+                    engine
+                        .pitr_status(crate::pitr::api::PitrStatusOptions {
+                            cursor: None,
+                            page_size: crate::pitr::api::MAX_STATUS_PAGE_SIZE,
+                        })?
+                        .latest_archived_commit_ts,
+                    Some(7)
+                );
+                engine.put(b"after-maintenance-retry", b"durable")?;
+                engine.close_storage()?;
+                drop(engine);
+
+                let reopened = KvEngine::open_with_wal_io_mode(&database, options, mode)?;
+                assert_eq!(reopened.get(b"v7-key")?, Some(Bytes::from_static(b"v")));
+                assert_eq!(
+                    reopened.get(b"after-maintenance-retry")?,
+                    Some(Bytes::from_static(b"durable"))
+                );
+                reopened.close_storage()?;
+            }
+        }
+
+        Ok(())
+    }
+
+    #[cfg(all(target_os = "linux", feature = "chaos-testing"))]
+    #[test]
+    fn failpoint_v7_background_maintenance_reclaims_flushed_sources_after_failure()
+    -> anyhow::Result<()> {
+        use crate::pitr::manifest::ObligationState;
+
+        let _scenario = crate::chaos::failpoint::FailScenario::setup();
+        for mode in [
+            crate::wal::WalIoMode::Leader,
+            crate::wal::WalIoMode::Parallel,
+        ] {
+            for (failure, expected_state, files_removed) in [
+                (None, ObligationState::Sealed, false),
+                (
+                    Some("pitr.before_flushed_source_cleanup"),
+                    ObligationState::Reclaimable,
+                    false,
+                ),
+                (
+                    Some("pitr.after_flushed_source_unlink"),
+                    ObligationState::Reclaimable,
+                    true,
+                ),
+            ] {
+                let directory = tempdir()?;
+                let options = v7_recovery_test_database(directory.path())?;
+                let database = directory.path().join("db");
+                let engine = KvEngine::open_with_wal_io_mode(&database, options.clone(), mode)?;
+                suspend_pitr_maintenance_for_test(&engine);
+                let source = engine.inner.state.load().memtable.clone();
+                let source_segment_id = LsmStorageInner::pitr_segment_of(&source).unwrap();
+                let source_wal = source.wal_path().unwrap().to_path_buf();
+                let owner = source.wal_v7_reservation_owner().unwrap();
+                drop(source);
+
+                let flushing = Arc::clone(&engine);
+                fail::cfg_callback("pitr.before_recovery_point_archive", move || {
+                    while !flushing.inner.state.load().imm_memtables.is_empty() {
+                        flushing.inner.force_flush_next_imm_memtable().unwrap();
+                    }
+                })
+                .map_err(anyhow::Error::msg)?;
+                if let Some(failure) = failure {
+                    fail::cfg(failure, "return").map_err(anyhow::Error::msg)?;
+                } else {
+                    crate::pitr::archiver::set_catalog_publication_test_mode(
+                        &directory.path().join("repository"),
+                        1,
+                    );
+                }
+                let first_attempt = engine.run_pitr_maintenance(source_segment_id);
+                fail::remove("pitr.before_recovery_point_archive");
+                if let Some(failure) = failure {
+                    fail::remove(failure);
+                }
+                assert!(
+                    first_attempt.is_err(),
+                    "{failure:?} did not fail maintenance"
+                );
+                assert_eq!(
+                    engine
+                        .pitr_manifest_state
+                        .lock()
+                        .obligations
+                        .get(&source_segment_id)
+                        .map(|obligation| obligation.state),
+                    Some(expected_state)
+                );
+                assert!(engine.inner.state.load().imm_memtables.is_empty());
+                let successor = engine.inner.state.load().memtable.clone();
+                assert!(successor.is_empty());
+                let active_allocated = LsmStorageInner::filesystem_file_allocated_bytes(
+                    successor.wal_path().unwrap(),
+                )?;
+                assert!(owner.snapshot().source_spool_bytes > active_allocated);
+                assert!(owner.snapshot().seal_index_bytes > 0);
+                assert_eq!(source_wal.exists(), !files_removed);
+                assert_eq!(source_wal.with_extension("seal").exists(), !files_removed);
+                assert!(
+                    !engine
+                        .inner
+                        .mvcc
+                        .as_ref()
+                        .unwrap()
+                        .commit_admission_is_open()
+                );
+                engine
+                    .inner
+                    .pitr_maintenance_queued
+                    .store(false, std::sync::atomic::Ordering::Release);
+
+                // An idle successor cannot supply another size/interval
+                // trigger. Pending source cleanup itself must schedule retry.
+                wait_for_v7_background_archive(&engine, source_segment_id)?;
+                assert!(
+                    !engine
+                        .pitr_manifest_state
+                        .lock()
+                        .obligations
+                        .contains_key(&source_segment_id)
+                );
+                assert!(!source_wal.exists());
+                assert!(!source_wal.with_extension("seal").exists());
+                assert_eq!(owner.snapshot().logical_wal_bytes, 0);
+                assert_eq!(owner.snapshot().source_spool_bytes, active_allocated);
+                assert_eq!(owner.snapshot().seal_index_bytes, 0);
+                engine.put(b"after-cleanup-retry", b"durable")?;
+                engine.close()?;
+                drop(successor);
+                drop(owner);
+                drop(engine);
+
+                let reopened = KvEngine::open_with_wal_io_mode(&database, options, mode)?;
+                assert_eq!(reopened.get(b"v7-key")?, Some(Bytes::from_static(b"v")));
+                assert_eq!(
+                    reopened.get(b"after-cleanup-retry")?,
+                    Some(Bytes::from_static(b"durable"))
+                );
+                reopened.close()?;
+            }
+        }
+
+        Ok(())
+    }
+
+    #[cfg(all(target_os = "linux", feature = "chaos-testing"))]
+    #[test]
+    fn failpoint_v7_queued_maintenance_retry_preserves_close_fence() -> anyhow::Result<()> {
+        let _scenario = crate::chaos::failpoint::FailScenario::setup();
+        for mode in [
+            crate::wal::WalIoMode::Leader,
+            crate::wal::WalIoMode::Parallel,
+        ] {
+            let directory = tempdir()?;
+            let options = v7_recovery_test_database(directory.path())?;
+            let database = directory.path().join("db");
+            let engine = KvEngine::open_with_wal_io_mode(&database, options.clone(), mode)?;
+            suspend_pitr_maintenance_for_test(&engine);
+            let source = engine.inner.state.load().memtable.clone();
+            let source_segment_id = LsmStorageInner::pitr_segment_of(&source)
+                .ok_or_else(|| anyhow::anyhow!("v7 fixture has no Active segment"))?;
+            let source_wal = source.wal_path().unwrap().to_path_buf();
+
+            fail::cfg("pitr.v7_after_seal_started", "return").map_err(anyhow::Error::msg)?;
+            let first_attempt = engine.run_pitr_maintenance(source_segment_id);
+            fail::remove("pitr.v7_after_seal_started");
+            assert!(first_attempt.is_err());
+            assert_eq!(
+                engine
+                    .pitr_manifest_state
+                    .lock()
+                    .obligations
+                    .get(&source_segment_id)
+                    .map(|obligation| obligation.state),
+                Some(crate::pitr::manifest::ObligationState::Sealing)
+            );
+
+            // Queue a real maintenance retry, but keep it off the blocking
+            // executor until close has persisted its final Active boundary.
+            let blocked_slots = engine.inner.blocking.hold_all_slots_for_test();
+            engine
+                .inner
+                .pitr_maintenance_queued
+                .store(false, std::sync::atomic::Ordering::Release);
+            engine.inner.maybe_queue_pitr_maintenance(false)?;
+            assert!(
+                engine
+                    .inner
+                    .pitr_maintenance_queued
+                    .load(std::sync::atomic::Ordering::Acquire)
+            );
+            let closing_engine = Arc::clone(&engine);
+            let closing = std::thread::spawn(move || closing_engine.close());
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while engine
+                .background_workers
+                .shutdown
+                .load(std::sync::atomic::Ordering::Acquire)
+                == 0
+                && !closing.is_finished()
+                && std::time::Instant::now() < deadline
+            {
+                std::thread::yield_now();
+            }
+            let reached_final_boundary = engine
+                .background_workers
+                .shutdown
+                .load(std::sync::atomic::Ordering::Acquire)
+                != 0;
+            // Always release and join before assertions so a failed test
+            // cannot leave close waiting for a blocked background worker.
+            drop(blocked_slots);
+            let close_result = closing
+                .join()
+                .map_err(|_| anyhow::anyhow!("v7 close thread panicked"))?;
+            anyhow::ensure!(
+                reached_final_boundary,
+                "close did not establish its boundary before the queued retry"
+            );
+            close_result?;
+
+            assert!(engine.inner.lifecycle.is_closed());
+            assert!(
+                !engine
+                    .inner
+                    .mvcc
+                    .as_ref()
+                    .unwrap()
+                    .commit_admission_is_open(),
+                "a queued retry must not reopen the final close fence"
+            );
+            assert!(Arc::ptr_eq(&source, &engine.inner.state.load().memtable));
+            assert_eq!(
+                engine.pitr_manifest_state.lock().active_segment_id,
+                Some(source_segment_id)
+            );
+            let manifest_after_close = std::fs::read(database.join("MANIFEST"))?;
+            let wal_after_close = std::fs::read(&source_wal)?;
+            assert!(engine.put(b"after-close", b"rejected").is_err());
+            assert_eq!(
+                std::fs::read(database.join("MANIFEST"))?,
+                manifest_after_close
+            );
+            assert_eq!(std::fs::read(&source_wal)?, wal_after_close);
+            drop(source);
+            drop(engine);
+
+            let reopened = KvEngine::open_with_wal_io_mode(&database, options, mode)?;
+            assert_eq!(reopened.get(b"v7-key")?, Some(Bytes::from_static(b"v")));
+            assert_eq!(reopened.get(b"after-close")?, None);
+            assert!(matches!(
+                reopened.resume_pitr(directory.path().join("repository"))?,
+                crate::pitr::api::PitrResumeOutcome::Resumed
+            ));
+            reopened.put(b"after-reopen", b"accepted")?;
+            reopened.close()?;
+        }
+
+        Ok(())
     }
 
     #[cfg(target_os = "linux")]
