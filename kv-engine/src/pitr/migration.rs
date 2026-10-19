@@ -3,15 +3,21 @@
 //! This module estimates the transition's source-spool requirement, including
 //! the next v7 seal/rotation headroom. The caller must provide the reconstructed
 //! allocation charge for every existing obligation, pin, orphan, and staging
-//! file, plus the recovered legacy Active WAL image length. Later migration
-//! wiring will pair this decision with an owned reservation before publishing
-//! durable intent.
+//! file, plus the recovered legacy Active WAL image length. The capacity result
+//! can be atomically acquired from the live v7 resource ledger as an owned
+//! reservation before publishing durable intent.
 
 use anyhow::{Result, ensure};
+use std::{error::Error, fmt};
 
 use crate::{
     pitr::{WAL_V5_HEADER_LEN, manifest::PersistedPitrConfig},
-    wal::v7::codec::{WAL_V7_FRAME_LEN, WAL_V7_HEADER_LEN},
+    wal::v7::{
+        admission::{
+            WalV7Reservation, WalV7ReservationError, WalV7ResourceCharge, WalV7ResourceLedger,
+        },
+        codec::{WAL_V7_FRAME_LEN, WAL_V7_HEADER_LEN},
+    },
 };
 
 // The image needs the header, generation-zero frontier, one DATA frame, and a
@@ -63,12 +69,108 @@ pub(crate) struct V7MigrationCapacity {
     pub(crate) terminal_manifest_headroom_bytes: u64,
 }
 
+/// Failure to acquire the whole migration charge from the live resource ledger.
+#[derive(Debug)]
+pub(crate) enum V7MigrationReservationError {
+    Deferred(V7MigrationDeferralReason),
+    InvalidAssessment,
+    Ledger(WalV7ReservationError),
+}
+
+impl fmt::Display for V7MigrationReservationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Deferred(reason) => {
+                write!(formatter, "PITR v7 migration is deferred: {reason:?}")
+            }
+            Self::InvalidAssessment => {
+                formatter.write_str("invalid PITR v7 migration capacity assessment")
+            }
+            Self::Ledger(error) => write!(
+                formatter,
+                "could not reserve PITR v7 migration capacity: {error}"
+            ),
+        }
+    }
+}
+
+impl Error for V7MigrationReservationError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Ledger(error) => Some(error),
+            Self::Deferred(_) | Self::InvalidAssessment => None,
+        }
+    }
+}
+
+/// Owns the complete migration headroom charge until the transition is safe to
+/// release. Keep this guard with the migration lifecycle after durable intent;
+/// dropping it releases both source-spool and recovery-workspace capacity.
+#[must_use = "retain the migration reservation through successor installation and cleanup"]
+#[derive(Debug)]
+pub(crate) struct V7MigrationTransitionReservation {
+    _reservation: WalV7Reservation,
+}
+
+/// Atomically reserve the capacity represented by a successful preflight.
+///
+/// The assessment is a snapshot and may become stale while other work reserves
+/// resources. Charging its complete source-spool and recovery-workspace amounts
+/// in one ledger operation closes that race before a caller publishes durable
+/// migration intent. The returned owned guard must remain alive until the
+/// transition has installed its successor, published the manifest handoff, and
+/// completed required durable cleanup.
+pub(crate) fn reserve_v7_migration_transition(
+    capacity: V7MigrationCapacity,
+    ledger: &WalV7ResourceLedger,
+) -> std::result::Result<V7MigrationTransitionReservation, V7MigrationReservationError> {
+    if let V7MigrationCapacityDecision::Deferred(reason) = capacity.decision {
+        return Err(V7MigrationReservationError::Deferred(reason));
+    }
+
+    let Some(source_spool_bytes) = capacity
+        .required_transition_bytes
+        .checked_sub(capacity.recovery_workspace_bytes)
+    else {
+        return Err(V7MigrationReservationError::InvalidAssessment);
+    };
+    let Some(required_total_bytes) = capacity
+        .retained_source_spool_bytes
+        .checked_add(capacity.required_transition_bytes)
+    else {
+        return Err(V7MigrationReservationError::InvalidAssessment);
+    };
+    if source_spool_bytes == 0
+        || required_total_bytes != capacity.required_total_bytes
+        || capacity.available_capacity_bytes
+            != capacity
+                .source_spool_limit_bytes
+                .saturating_sub(capacity.retained_source_spool_bytes)
+        || capacity.required_transition_bytes > capacity.available_capacity_bytes
+    {
+        return Err(V7MigrationReservationError::InvalidAssessment);
+    }
+
+    let reservation = ledger
+        .reserve(WalV7ResourceCharge {
+            source_spool_bytes,
+            recovery_workspace_bytes: capacity.recovery_workspace_bytes,
+            ..WalV7ResourceCharge::default()
+        })
+        .map_err(V7MigrationReservationError::Ledger)?;
+
+    Ok(V7MigrationTransitionReservation {
+        _reservation: reservation,
+    })
+}
+
 /// Decide whether a migration can reserve every source-spool resource it needs.
 ///
 /// The calculation deliberately retains the current files in the total: the
 /// old active WAL and its existing obligations remain live while the v7 image
 /// and recovery workspace are prepared. A later atomic ledger reservation must
-/// consume this exact transition charge before a Sealing intent is durable.
+/// consume this exact transition charge through [`reserve_v7_migration_transition`]
+/// before a Sealing intent is durable.
 ///
 /// `legacy_active_image_bytes` is the recovered v5/v6 WAL's validated image
 /// length, independently of its filesystem allocation charge. Legacy admission

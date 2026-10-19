@@ -1222,8 +1222,12 @@ the future v7 image and recovery workspace use the configured v7 bound.
 It compares that transition requirement with caller-reconstructed retained
 source-spool charges and reports
 eligible or deferred outcomes. Enable, reopen, and rotation do not consume this
-assessment yet; those callers must next reconstruct all live charges and
-atomically reserve the transition before durable intent.
+assessment yet. The migration module now exposes an owned reservation helper
+that atomically charges its source-spool and recovery-workspace requirements on
+one live ledger. Active v7 recovery uses the same filesystem-rounded workspace
+charge for both its reservation and ledger limit. Callers must still reconstruct
+all live charges, retain this reservation through the transition, and rebuild
+in-flight migration charges from durable obligations after a crash.
 
 - Add a shared migration/preflight decision used by enablement, reopen, and
   rotation. Calculate capacity for the largest configured v7 physical image

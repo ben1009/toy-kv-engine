@@ -9087,6 +9087,19 @@ impl LsmStorageInner {
             Self::pitr_source_allocations(database_path, active_segment_id)?;
         let active_fixed_bytes = (WAL_V7_HEADER_LEN + WAL_V7_FRAME_LEN) as u64;
         let max_segment_bytes = config.max_segment_bytes;
+        let max_recovery_workspace_bytes = {
+            #[cfg(target_os = "linux")]
+            {
+                crate::pitr::segment::filesystem_allocation_reservation(
+                    database_path,
+                    max_segment_bytes,
+                )?
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                max_segment_bytes
+            }
+        };
         let max_seal_preparation_memory_bytes =
             crate::pitr::seal::V7Seal::max_preparation_memory_bytes(max_segment_bytes)?;
         let ordinary_buffer_memory_bytes = max_segment_bytes
@@ -9111,7 +9124,7 @@ impl LsmStorageInner {
             WalV7ResourceLimits {
                 max_logical_wal_bytes: config.max_unarchived_bytes,
                 max_source_spool_bytes: config.max_source_spool_bytes,
-                max_recovery_workspace_bytes: max_segment_bytes,
+                max_recovery_workspace_bytes,
                 max_buffer_memory_bytes,
                 max_seal_index_bytes,
             },
@@ -9194,7 +9207,7 @@ impl LsmStorageInner {
                 retained_source_bytes
             },
             source_spool_bytes: source_file_allocated_bytes.saturating_sub(active_fixed_bytes),
-            recovery_workspace_bytes: max_segment_bytes,
+            recovery_workspace_bytes: max_recovery_workspace_bytes,
             ..WalV7ResourceCharge::default()
         })?;
 
