@@ -1574,13 +1574,11 @@ impl Wal {
 
         let error = error.downcast_ref::<v7::admission::WalV7ReservationError>()?;
         Some(match error {
-            v7::admission::WalV7ReservationError::SealIndexLimit => {
-                WalV7CapacityFailure::SegmentRotation
-            }
             v7::admission::WalV7ReservationError::LogicalWalLimit
             | v7::admission::WalV7ReservationError::SourceSpoolLimit
             | v7::admission::WalV7ReservationError::RecoveryWorkspaceLimit
-            | v7::admission::WalV7ReservationError::BufferMemoryLimit => {
+            | v7::admission::WalV7ReservationError::BufferMemoryLimit
+            | v7::admission::WalV7ReservationError::SealIndexLimit => {
                 WalV7CapacityFailure::SharedResourcePressure
             }
             _ => return None,
