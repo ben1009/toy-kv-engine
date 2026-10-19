@@ -6333,15 +6333,22 @@ impl KvEngine {
         // GC can populate the successor while ordinary admission is stopped.
         // Preparation then seals another boundary; its failures must propagate
         // without reopening admission, even if SealStarted is not persisted.
-        check_pitr_cancellation(cancellation)?;
-        let metadata = self.prepare_pitr_base_locked()?;
-        let result = self.create_pitr_base_backup_admitted(
-            options.clone(),
-            metadata,
-            cancellation,
-            decision,
-            decision_token,
-        );
+        let result = match check_pitr_cancellation(cancellation) {
+            // The boundary is already durable, so a clean cancellation must
+            // reach the admission cleanup below. Preparation failures still
+            // return directly: preparation may have started a second seal.
+            Err(error) => Err(error),
+            Ok(()) => {
+                let metadata = self.prepare_pitr_base_locked()?;
+                self.create_pitr_base_backup_admitted(
+                    options.clone(),
+                    metadata,
+                    cancellation,
+                    decision,
+                    decision_token,
+                )
+            }
+        };
         // A clean physical capture failure does not invalidate the prepared
         // durable boundary. Reopen admission only when archive work is settled.
         let state = self.pitr_manifest_state.lock();
@@ -19536,6 +19543,9 @@ mod tests {
         let options = v7_recovery_test_database(directory.path())?;
         let database = directory.path().join("db");
         let engine = KvEngine::open(&database, options)?;
+        // This fixture owns seal reservations locally while publishing manual
+        // lifecycle transitions; maintenance must not retry those transitions.
+        suspend_pitr_maintenance_for_test(&engine);
         engine.sync()?;
 
         let state = engine.pitr_manifest_state.lock().clone();
@@ -24576,6 +24586,66 @@ mod tests {
         );
 
         engine.close_storage()?;
+        Ok(())
+    }
+
+    #[cfg(all(target_os = "linux", feature = "chaos-testing"))]
+    #[tokio::test(flavor = "current_thread")]
+    async fn failpoint_v7_pitr_backup_cancel_after_durable_boundary_reopens_admission()
+    -> anyhow::Result<()> {
+        let scenario = crate::chaos::failpoint::FailScenario::setup();
+        for mode in [
+            crate::wal::WalIoMode::Leader,
+            crate::wal::WalIoMode::Parallel,
+        ] {
+            let directory = tempdir()?;
+            let options = v7_recovery_test_database(directory.path())?;
+            let repository_path = directory.path().join("repository");
+            let engine =
+                KvEngine::open_with_wal_io_mode(directory.path().join("db"), options, mode)?;
+            suspend_pitr_maintenance_for_test(&engine);
+            let backups_before = crate::backup::BackupRepository::open(&repository_path)?
+                .list_info()?
+                .len();
+            let task = engine.create_backup_task(crate::backup::BackupOptions {
+                repository: repository_path.clone(),
+                use_hard_links: false,
+            })?;
+            let cancellation = task.cancellation_handle();
+            // The current-thread runtime cannot dispatch the task until the
+            // await below, so the cancellation point is installed first.
+            fail::cfg_callback("pitr.before_backup_base_boundary", move || {
+                cancellation.cancel();
+            })
+            .map_err(anyhow::Error::msg)?;
+            let outcome = task.await?;
+            fail::remove("pitr.before_backup_base_boundary");
+
+            let admission_open = engine
+                .inner
+                .mvcc
+                .as_ref()
+                .unwrap()
+                .commit_admission_is_open();
+            let write_result = engine.put(b"after-cancel", b"writable");
+            let backups_after = crate::backup::BackupRepository::open(&repository_path)?
+                .list_info()?
+                .len();
+            engine.close_storage()?;
+
+            assert!(matches!(
+                outcome,
+                crate::backup::BackupOutcome::CancelledBeforeCommit
+            ));
+            assert_eq!(backups_after, backups_before);
+            assert!(
+                admission_open,
+                "clean cancellation left {mode:?} writes paused"
+            );
+            write_result?;
+        }
+        scenario.teardown();
+
         Ok(())
     }
 

@@ -5124,9 +5124,10 @@ impl crate::lsm_storage::KvEngine {
                 Err(error)
                     if task_control.cancelled.load(Ordering::Acquire)
                         && !*task_control.commit_decided.lock()
-                        && error
-                            .chain()
-                            .any(|cause| cause.to_string().contains("cancelled")) =>
+                        // Cleanup failures add context to the cancellation;
+                        // callers must receive those errors and retry cleanup.
+                        && error.chain().count() == 1
+                        && error.to_string().contains("cancelled") =>
                 {
                     Ok(BackupOutcome::CancelledBeforeCommit)
                 }
@@ -10486,6 +10487,53 @@ mod tests {
         .unwrap();
         assert!(matches!(outcome, BackupOutcome::CancelledBeforeCommit));
         engine.close().unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cancellation_before_commit_preserves_pending_cleanup_error() {
+        let _test_lock = COMMIT_DECISION_TEST_LOCK.lock();
+        let dir = tempfile::tempdir().unwrap();
+        let engine = crate::lsm_storage::KvEngine::open(
+            dir.path().join("db"),
+            crate::lsm_storage::LsmStorageOptions::default_for_test(),
+        )
+        .unwrap();
+        let repository_path = dir.path().join("repository");
+        let blocker_path = repository_path.join("backups/1/block-cleanup");
+        let result = crate::block_on(async {
+            let task = engine
+                .create_backup_task(BackupOptions {
+                    repository: repository_path.clone(),
+                    use_hard_links: false,
+                })
+                .unwrap();
+            let token = task.control.barrier_token;
+            commit_decision_test_hook::arm(token, 1);
+            let cancellation = task.cancellation_handle();
+            let join = tokio::spawn(task);
+            tokio::task::spawn_blocking(move || {
+                commit_decision_test_hook::wait_until_entered(token, 1)
+            })
+            .await
+            .unwrap();
+            // The backup directory is published before the commit decision.
+            // An unexpected child makes rollback fail with ENOTEMPTY.
+            std::fs::write(&blocker_path, b"preserve cleanup failure").unwrap();
+            cancellation.cancel();
+            commit_decision_test_hook::release(token, 1);
+            join.await.unwrap()
+        });
+        engine.close().unwrap();
+
+        let error = result.expect_err("cancellation must report incomplete rollback");
+        let detail = format!("{error:#}");
+        assert!(detail.contains("pending rollback failed"), "{detail}");
+        assert!(detail.contains("backup cancelled"), "{detail}");
+        assert!(blocker_path.exists());
+        std::fs::remove_file(blocker_path).unwrap();
+        let repository = BackupRepository::open(&repository_path).unwrap();
+        assert!(repository.list_info().unwrap().is_empty());
     }
 
     #[cfg(target_os = "linux")]
