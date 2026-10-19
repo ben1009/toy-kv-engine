@@ -38,9 +38,10 @@ durable recovery-point path; Leader and Parallel modes share this bounded
 retry, with regression coverage at an exact segment boundary. Native async v7
 Parallel point writes now retain the exclusive preparation permit while their
 blocking rotation runs, then retry against the installed successor. Native
-async Parallel point writes also have a public API regression for a seal-index
-reservation rejection on a nonempty Active WAL; the test restores the configured
-limit before rotation and verifies successor retry and reopen durability. Native
+async Parallel point writes also have a public API regression for a shared
+seal-index reservation rejection on a nonempty Active WAL; the rejected write
+consumes no ticket or successor, and a later write succeeds on the same Active
+WAL after capacity returns and survives reopen. Native
 async v7 Parallel range deletes now retry capacity rejections through the same
 sealing and successor rotation while retaining the exclusive preparation permit.
 A one-blocking-worker regression verifies queued point writers cannot lease the
@@ -74,7 +75,14 @@ including after unlink or directory-sync errors; archive reconciliation finishes
 their durable cleanup and releases source-spool/index quota before resuming writes.
 Canceled v7 range and asynchronous transaction callers retain their accepted
 capacity retries through close, and the committed updates survive reopen.
-Distinct global spool backpressure and oversize outcomes remain pending.
+V7 capacity failures now distinguish segment rotation from shared resource
+pressure and batches too large for an empty segment. Sync and async point-write
+regressions verify oversized batches fail before ticket assignment, do not rotate
+to empty successors, and leave the Active WAL usable. Serializable transactions
+rejected for shared capacity keep their snapshot and buffered writes for explicit
+retry; sync/async regressions verify successful retry and renewed OCC validation
+in both I/O modes. Waiting for global
+source-spool capacity to become available remains pending.
 Public close drains and syncs
 the Active v7 WAL for recovery without emitting a final recovery point. It stops
 and drains MVCC commit admission, persists the latest synced logical boundary in
@@ -323,10 +331,11 @@ scratch, which is released when preparation or capacity admission fails. Batches
 fit a fresh segment return `RotationRequired`, while batches that cannot fit any fresh
 legal segment return `BatchTooLarge`; shared-ledger failures retain their distinct
 reservation errors. Point-write retry and rotation are now wired in Stage 6, with
-public API coverage for physical segment capacity and Parallel seal-index
-reservation errors. Native async range retries are now wired through rotation
+public API coverage for physical segment rotation and shared Parallel seal-index
+pressure without rotation. Native async range retries are now wired through rotation
 and covered for queued-writer exclusion and reopen durability. Native transaction
-retries and broader shared-ledger pressure handling remain outstanding. Stage 5 has
+retries are also wired in Stage 6; waiting for shared-ledger capacity remains
+outstanding. Stage 5 has
 started with recovered-runtime cursor bootstrap: an installed Active image
 supplies the v7 DATA start, append offset, and next ticket. The shared runtime
 seeds its admission, packer, and durability coordinates from that state. The seed now
@@ -802,19 +811,21 @@ transition remain.
   cancellation and completion; audit accounting in both the segment manager
   and spool accountant to prevent duplicate charges or premature release.
 - Return a distinct rotation-required preparation result when the current
-  segment lacks DATA-plus-marker space or seal-index capacity but the batch
+  segment lacks DATA-plus-marker space but the batch
   fits a fresh legal segment. Define the ownership handoff for the engine's
   Wal-full retry path: release unadmitted preparation reservations and the
   active-memtable guard/lease before rotation, retire any reserved timestamp,
   and repeat required OCC validation on retry. Qualify the result and handoff
   in the serial driver here; connect full v7 lifecycle rotation/retry in stage 6.
-  Distinguish this result from global spool backpressure and a batch that
+  Distinguish this result from shared-ledger pressure, including aggregate
+  seal-index charges retained until durable source cleanup, and a batch that
   cannot fit any legal segment; oversized input must not cause endless rotation.
   The serial Leader currently classifies DATA-plus-marker segment exhaustion
   before the persistent batch reservation or coordinate assignment; temporary
   canonicalization scratch may be reserved first and is released on rejection.
-  Live seal-index classification and the engine retry/rotation handoff remain
-  outstanding.
+  The engine retry/rotation handoff is now connected in Stage 6. Shared-ledger
+  failures, including seal-index exhaustion, return capacity errors without
+  rotation; waiting for released capacity remains outstanding.
 - Document the lock/reservation order across the sequencer, memtable leases,
   spool accounting, admission, and durability. Release admission/publication
   locks before waiting for archive progress or new budget; inject full-spool
@@ -844,10 +855,11 @@ image untouched. Digest/index snapshots agree with independent codec
 verification; no stopped-admission payload rescan is required. Exact-boundary
 and marker-overhead cases in the serial Leader produce rotation-required before
 ticket assignment; a batch too large for a fresh segment and shared-ledger resource
-pressure remain distinct. Stage 6 now exercises the real point-write retry path for
-both physical segment capacity and Parallel seal-index reservation errors. Range
-and transaction retries, cancellation, and shared-ledger pressure remain
-outstanding. Full lifecycle rotation/retry checks belong to Stage 6; they are not
+pressure remain distinct. Stage 6 now exercises physical segment rotation and
+shared Parallel seal-index reservation errors without rotation. Range and
+transaction retries and cancellation are also covered in Stage 6; waiting for
+shared-ledger capacity remains outstanding. Full lifecycle rotation/retry checks
+belong to Stage 6; they are not
 prerequisites for this stage.
 
 ### 5. Parallel runtime, one-sync coordinator, and API barriers
@@ -1027,7 +1039,12 @@ remain in later stage 5/6 work.
   both writes finish against the successor and survive reopen.
   A test-only ledger limit override now forces `SealIndexLimit` through the real
   Parallel reservation path for `put_async` on a nonempty Active segment; the
-  retry rotates, succeeds against the successor, and survives reopen. A
+  write returns shared pressure without ticket assignment or rotation. After
+  the limit is restored, a later write uses the same Active WAL and survives
+  reopen. Serializable transactions also retain their snapshot and buffered
+  writes after shared-capacity rejection. Sync/async tests in both I/O modes
+  verify caller retries succeed when uncontended and repeat OCC validation
+  when another writer changes a read key. A
   synchronized failpoint test forces two synchronous Parallel writers to
   reject the same full Active segment before rotation; stale-source retries
   share one successor and both writes survive reopen. A native point-write
@@ -1048,8 +1065,11 @@ remain in later stage 5/6 work.
   an empty successor; injected publication, unlink, and directory-sync failures
   verify automatic retry, quota release, and resumed writes in both I/O modes.
   Canceled native v7 range and async transaction callers retain their accepted
-  capacity retries through close and recovery. Distinct global backpressure and
-  oversize outcomes remain outstanding.
+  capacity retries through close and recovery. V7 capacity failures distinguish
+  segment-local rotation, shared resource pressure, and batches too large for a
+  fresh segment. Oversized sync and async point writes are rejected before
+  ticket assignment without rotating; waiting for global source-spool capacity
+  to be reclaimed remains outstanding.
 - Extend `PitrManifestRecord::SealStarted`, its obligation state, replay, and
   snapshot validation with the versioned immutable boundary. Persist Active
   references using only logical anchors. Allocation-only timestamp watermarks
@@ -1222,7 +1242,7 @@ the captured prefix must survive even if no publication or ACK followed.
 | Runtime startup after recovery | Frozen Sealing/Sealed files acquire no append pipeline or initializer and retain exact bytes/length; only installed authoritative Active state starts v7 runtime, with startup allocation reserved before mutation. |
 | Async, MVCC, and capture | Public point/TTL/delete/batch/range/OCC APIs use v7 encoding and ordered time clamping; rejected timestamp reservations retire. Cancellation and freeze/close/checkpoint/recovery-point races retain owners and the correct visible prefix. |
 | Capacity and pins | Real engine admission/preallocation uses the shared ledger; full spool still permits terminal marker/recovery; workspace grows before allocation; old/temp/pinned files stay charged until durable cleanup. |
-| Segment/index exhaustion | Exact-boundary DATA-plus-marker and seal-index limits trigger rotation before ticket assignment for a batch that fits a fresh segment; retry preserves caps and ordering. Global spool pressure does not masquerade as segment-full, and oversized batches cannot loop through empty successors. |
+| Segment exhaustion and shared pressure | Exact-boundary DATA-plus-marker exhaustion triggers rotation before ticket assignment for a batch that fits a fresh segment; retry preserves caps and ordering. Shared-ledger pressure, including aggregate spool and seal-index quota, does not trigger rotation, and oversized batches cannot loop through empty successors. |
 | Legacy upgrade | Insufficient maximum-image capacity defers with writable v6 rotations; transition reservations precede intent and survive concurrent capacity consumption/replay; eligible transition installs one v7 active; new enable fails before intent; installed v7 cannot downgrade. |
 | Compatibility and ordinary workloads | Legacy fixtures keep exact behavior; ordinary v4 read/write/mixed workloads retain semantics and no v7 frames or recovery-copy requirement. |
 

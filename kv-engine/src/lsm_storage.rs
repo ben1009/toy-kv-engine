@@ -14252,13 +14252,24 @@ impl LsmStorageInner {
         retries: &mut usize,
         allow_lifecycle_closing: bool,
     ) -> Result<()> {
-        if crate::wal::Wal::is_v7_capacity_retry_error(&error) {
-            return self.rotate_after_wal_full(
-                error,
-                expected_memtable,
-                retries,
-                allow_lifecycle_closing,
-            );
+        match crate::wal::Wal::v7_capacity_failure(&error) {
+            Some(crate::wal::WalV7CapacityFailure::SegmentRotation) => {
+                return self.rotate_after_wal_full(
+                    error,
+                    expected_memtable,
+                    retries,
+                    allow_lifecycle_closing,
+                );
+            }
+            Some(crate::wal::WalV7CapacityFailure::SharedResourcePressure) => {
+                return Err(error.context(
+                    "v7 WAL shared resource capacity is exhausted; segment rotation cannot relieve it",
+                ));
+            }
+            Some(crate::wal::WalV7CapacityFailure::BatchTooLarge) => {
+                return Err(error.context("v7 WAL batch cannot fit a fresh segment"));
+            }
+            None => {}
         }
 
         if !crate::wal::Wal::is_retryable_full_error(&error) {
@@ -14274,28 +14285,6 @@ impl LsmStorageInner {
         retries: &mut usize,
         allow_lifecycle_closing: bool,
     ) -> Result<()> {
-        let is_v7_seal_index_limit = error
-            .downcast_ref::<crate::wal::v7::admission::WalV7ReservationError>()
-            .is_some_and(|error| {
-                *error == crate::wal::v7::admission::WalV7ReservationError::SealIndexLimit
-            });
-        if is_v7_seal_index_limit {
-            // Parallel writes reserve seal-index capacity before they publish
-            // into the memtable. Drain active writers before treating an empty
-            // memtable as permanent: an in-flight reservation may still
-            // publish and make a rotation reclaim capacity.
-            let active_memtable_guard = self.active_memtable_lock.write();
-            let active = self.state.load();
-            let empty_active_segment = Arc::ptr_eq(&active.memtable, expected_memtable)
-                && active.memtable.uses_v7_wal()
-                && active.memtable.is_empty();
-            drop(active);
-            drop(active_memtable_guard);
-            if empty_active_segment {
-                return Err(error
-                    .context("v7 seal-index capacity is exhausted with an empty active segment"));
-            }
-        }
         if *retries >= Self::MAX_WAL_FULL_ROTATION_RETRIES {
             return Err(error.context("WAL remained full after bounded rotations"));
         }
@@ -20606,6 +20595,178 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn v7_capacity_failures_separate_rotation_backpressure_and_oversize() {
+        use crate::wal::v7::{admission::WalV7ReservationError, leader::WalV7LeaderCapacityError};
+        use crate::wal::{Wal, WalV7CapacityFailure};
+
+        assert_eq!(
+            Wal::v7_capacity_failure(&anyhow::Error::new(
+                WalV7LeaderCapacityError::RotationRequired,
+            )),
+            Some(WalV7CapacityFailure::SegmentRotation)
+        );
+        assert_eq!(
+            Wal::v7_capacity_failure(&anyhow::Error::new(WalV7ReservationError::SealIndexLimit)),
+            Some(WalV7CapacityFailure::SharedResourcePressure)
+        );
+        assert_eq!(
+            Wal::v7_capacity_failure(&anyhow::Error::new(WalV7ReservationError::SourceSpoolLimit,)),
+            Some(WalV7CapacityFailure::SharedResourcePressure)
+        );
+        assert_eq!(
+            Wal::v7_capacity_failure(&anyhow::Error::new(
+                WalV7ReservationError::BufferMemoryLimit,
+            )),
+            Some(WalV7CapacityFailure::SharedResourcePressure)
+        );
+        assert_eq!(
+            Wal::v7_capacity_failure(&anyhow::Error::new(WalV7LeaderCapacityError::BatchTooLarge)),
+            Some(WalV7CapacityFailure::BatchTooLarge)
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn v7_oversized_point_writes_fail_without_rotating_or_assigning_tickets() -> anyhow::Result<()>
+    {
+        use crate::wal::v7::leader::WalV7LeaderCapacityError;
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()?;
+        for mode in [
+            crate::wal::WalIoMode::Leader,
+            crate::wal::WalIoMode::Parallel,
+        ] {
+            for asynchronous in [false, true] {
+                let directory = tempdir()?;
+                let options =
+                    v7_recovery_test_database_with_segment_limit(directory.path(), 32 * 1024)?;
+                let database = directory.path().join("db");
+                let engine = KvEngine::open_with_wal_io_mode(&database, options.clone(), mode)?;
+                suspend_pitr_maintenance_for_test(&engine);
+                let initial_segment_id = engine
+                    .pitr_manifest_state
+                    .lock()
+                    .active_segment_id
+                    .expect("v7 Active segment is installed");
+                let active_memtable = engine.inner.state.load().memtable.clone();
+                let initial_batch_count = active_memtable
+                    .wal_batch_count()
+                    .expect("the v7 Active memtable has a WAL");
+                let oversized_value = vec![0x5A; 32 * 1024];
+
+                let error = if asynchronous {
+                    runtime
+                        .block_on(engine.put_async(b"oversized", &oversized_value))
+                        .expect_err("a batch larger than an empty segment must be rejected")
+                } else {
+                    engine
+                        .put(b"oversized", &oversized_value)
+                        .expect_err("a batch larger than an empty segment must be rejected")
+                };
+                assert_eq!(
+                    error.downcast_ref::<WalV7LeaderCapacityError>(),
+                    Some(&WalV7LeaderCapacityError::BatchTooLarge),
+                    "unexpected rejection: {error:#}"
+                );
+                assert_eq!(
+                    active_memtable.wal_batch_count(),
+                    Some(initial_batch_count),
+                    "an oversized batch must not consume a WAL ticket"
+                );
+                assert_eq!(
+                    engine.pitr_manifest_state.lock().active_segment_id,
+                    Some(initial_segment_id),
+                    "an oversized batch must not rotate to empty successors"
+                );
+                assert_eq!(engine.get(b"oversized")?, None);
+
+                if asynchronous {
+                    runtime.block_on(engine.put_async(b"valid", b"value"))?;
+                } else {
+                    engine.put(b"valid", b"value")?;
+                }
+                assert_eq!(
+                    active_memtable.wal_batch_count(),
+                    Some(initial_batch_count + 1)
+                );
+                assert_eq!(
+                    engine.pitr_manifest_state.lock().active_segment_id,
+                    Some(initial_segment_id),
+                    "the same Active WAL must remain usable after rejection"
+                );
+
+                engine.close_storage()?;
+                drop(engine);
+                let reopened = KvEngine::open_with_wal_io_mode(&database, options, mode)?;
+                assert_eq!(reopened.get(b"oversized")?, None);
+                assert_eq!(reopened.get(b"valid")?, Some(Bytes::from_static(b"value")));
+                reopened.close_storage()?;
+            }
+        }
+
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn v7_shared_resource_pressure_does_not_rotate_active_segment() -> anyhow::Result<()> {
+        let directory = tempdir()?;
+        let options = v7_recovery_test_database(directory.path())?;
+        let database = directory.path().join("db");
+        let engine =
+            KvEngine::open_with_wal_io_mode(&database, options, crate::wal::WalIoMode::Parallel)?;
+        suspend_pitr_maintenance_for_test(&engine);
+
+        let expected_memtable = engine.inner.state.load().memtable.clone();
+        let initial_segment_id = engine
+            .pitr_manifest_state
+            .lock()
+            .active_segment_id
+            .expect("v7 Active segment is installed");
+        for capacity_error in [
+            crate::wal::v7::admission::WalV7ReservationError::SourceSpoolLimit,
+            crate::wal::v7::admission::WalV7ReservationError::SealIndexLimit,
+        ] {
+            let mut retries = 0;
+            let error = engine
+                .inner
+                .retry_after_capacity_error(
+                    anyhow::Error::new(capacity_error),
+                    &expected_memtable,
+                    &mut retries,
+                )
+                .expect_err("shared resource pressure cannot be fixed by rotating the segment");
+
+            assert!(
+                error
+                    .to_string()
+                    .contains("shared resource capacity is exhausted"),
+                "unexpected capacity error: {error:#}"
+            );
+            assert_eq!(
+                retries, 0,
+                "shared pressure must not consume rotation retries"
+            );
+            assert_eq!(
+                engine.pitr_manifest_state.lock().active_segment_id,
+                Some(initial_segment_id),
+                "shared pressure must not install an empty successor"
+            );
+            let active_memtable = engine.inner.state.load().memtable.clone();
+            assert!(
+                Arc::ptr_eq(&active_memtable, &expected_memtable),
+                "shared pressure must keep the same Active memtable"
+            );
+        }
+
+        engine.close_storage()?;
+        Ok(())
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn v7_sync_writes_retry_after_segment_capacity_rotation() -> anyhow::Result<()> {
@@ -21031,7 +21192,8 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn v7_native_async_point_writes_retry_after_seal_index_limit() -> anyhow::Result<()> {
+    fn v7_native_async_point_writes_report_seal_index_pressure_without_rotating()
+    -> anyhow::Result<()> {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .max_blocking_threads(1)
             .enable_all()
@@ -21061,49 +21223,40 @@ mod tests {
             .expect("active v7 WAL shares its retained-resource ledger");
         let existing_seal_index_bytes = retained_resources.snapshot().seal_index_bytes;
         assert!(existing_seal_index_bytes > 0);
-        let frontier = source.v7_frontier_cursor()?;
-        let frame_len = crate::wal::v7::codec::WAL_V7_FRAME_LEN as u64;
-        let physical_end = frontier.frame_offset + frame_len;
-        assert!(
-            physical_end + 2 * frame_len <= max_segment_bytes,
-            "the active segment has room for a DATA frame and terminal frontier"
-        );
+        let initial_batch_count = source
+            .wal_batch_count()
+            .expect("the active v7 memtable has a WAL");
 
         // Tighten the test ledger to its current index charge so the real
-        // Parallel admission path returns SealIndexLimit for this write.
+        // Parallel admission path reports shared seal-index pressure.
         retained_resources.set_max_seal_index_bytes_for_test(existing_seal_index_bytes);
-        runtime.block_on(async {
-            let pause = crate::lsm_storage::native_write::NativeWritePause::new(
-                crate::lsm_storage::native_write::NativeWriteStage::CapacityRetry,
-            );
-            *engine.inner.native_write_pause.lock() = Some(Arc::clone(&pause));
-            let first_engine = Arc::clone(&engine);
-            let first = tokio::spawn(async move {
-                first_engine
-                    .put_async(b"retry-seal-index-put", b"value")
-                    .await
-            });
-            tokio::time::timeout(std::time::Duration::from_secs(5), pause.reached.notified())
-                .await
-                .expect("seal-index rejection must reach the retry handoff before rotation");
-
-            // Let the successor use the persisted production limit after this
-            // injected Active-image reservation rejection has been observed.
-            retained_resources.set_max_seal_index_bytes_for_test(u64::MAX);
-            pause.release.notify_one();
-            tokio::time::timeout(std::time::Duration::from_secs(5), first)
-                .await
-                .expect("seal-index retry must rotate and complete")??;
-            Ok::<_, anyhow::Error>(())
-        })?;
-
+        let error = runtime
+            .block_on(engine.put_async(b"seal-index-pressure-put", b"value"))
+            .expect_err("seal-index pressure must be returned without rotating");
+        assert_eq!(
+            error.downcast_ref::<crate::wal::v7::admission::WalV7ReservationError>(),
+            Some(&crate::wal::v7::admission::WalV7ReservationError::SealIndexLimit),
+            "unexpected capacity error: {error:#}"
+        );
+        assert_eq!(source.wal_batch_count(), Some(initial_batch_count));
+        assert_eq!(engine.get(b"seal-index-pressure-put")?, None);
         assert_eq!(
             engine.pitr_manifest_state.lock().active_segment_id,
-            Some(initial_segment_id + 1)
+            Some(initial_segment_id)
+        );
+
+        // Once capacity is available, a later write can use the same Active
+        // segment. The rejected operation itself is not retried implicitly.
+        retained_resources.set_max_seal_index_bytes_for_test(u64::MAX);
+        runtime.block_on(engine.put_async(b"after-seal-index-pressure", b"value"))?;
+        assert_eq!(
+            engine.get(b"after-seal-index-pressure")?,
+            Some(Bytes::from_static(b"value"))
         );
         assert_eq!(
-            engine.get(b"retry-seal-index-put")?,
-            Some(Bytes::from_static(b"value"))
+            engine.pitr_manifest_state.lock().active_segment_id,
+            Some(initial_segment_id),
+            "shared pressure must not rotate the Active segment"
         );
 
         engine.close_storage()?;
@@ -21111,8 +21264,9 @@ mod tests {
 
         let reopened =
             KvEngine::open_with_wal_io_mode(&database, options, crate::wal::WalIoMode::Parallel)?;
+        assert_eq!(reopened.get(b"seal-index-pressure-put")?, None);
         assert_eq!(
-            reopened.get(b"retry-seal-index-put")?,
+            reopened.get(b"after-seal-index-pressure")?,
             Some(Bytes::from_static(b"value"))
         );
         reopened.close_storage()?;
@@ -21311,6 +21465,105 @@ mod tests {
     fn v7_transactions_retry_capacity_by_rotating_active_segment() -> anyhow::Result<()> {
         v7_transaction_capacity_retry_succeeds(false, false)?;
         v7_transaction_capacity_retry_succeeds(true, true)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn v7_serializable_transactions_retry_after_shared_seal_index_pressure() -> anyhow::Result<()> {
+        use crate::wal::v7::admission::WalV7ReservationError;
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()?;
+        for mode in [
+            crate::wal::WalIoMode::Leader,
+            crate::wal::WalIoMode::Parallel,
+        ] {
+            for async_commit in [false, true] {
+                for conflicting_write in [false, true] {
+                    let directory = tempdir()?;
+                    let mut options = v7_recovery_test_database(directory.path())?;
+                    options.serializable = true;
+                    let database = directory.path().join("db");
+                    let engine = KvEngine::open_with_wal_io_mode(&database, options.clone(), mode)?;
+                    suspend_pitr_maintenance_for_test(&engine);
+                    let source = engine.inner.state.load().memtable.clone();
+                    let source_segment = LsmStorageInner::pitr_segment_of(&source).unwrap();
+                    let source_batches = source.wal_batch_count().unwrap();
+                    let retained = source
+                        .wal_v7_reservation_owner()
+                        .unwrap()
+                        .retained_resources()
+                        .unwrap();
+                    let existing_index_bytes = retained.snapshot().seal_index_bytes;
+                    assert!(existing_index_bytes > 0);
+
+                    let transaction = Arc::try_unwrap(engine.new_txn()?)
+                        .unwrap_or_else(|_| panic!("transaction should have a unique owner"));
+                    assert_eq!(transaction.get(b"v7-key")?, Some(Bytes::from_static(b"v")));
+                    transaction.put(b"retry-after-index-pressure", b"value")?;
+                    retained.set_max_seal_index_bytes_for_test(existing_index_bytes);
+                    let result = if async_commit {
+                        runtime.block_on(transaction.commit_async())
+                    } else {
+                        transaction.commit()
+                    };
+                    retained.set_max_seal_index_bytes_for_test(u64::MAX);
+                    let error =
+                        result.expect_err("shared seal-index pressure must reject the commit");
+                    assert_eq!(
+                        error.downcast_ref::<WalV7ReservationError>(),
+                        Some(&WalV7ReservationError::SealIndexLimit),
+                        "unexpected commit rejection: {error:#}"
+                    );
+                    assert_eq!(source.wal_batch_count(), Some(source_batches));
+                    assert!(Arc::ptr_eq(&engine.inner.state.load().memtable, &source));
+                    assert_eq!(engine.get(b"retry-after-index-pressure")?, None);
+                    assert_eq!(
+                        transaction.get(b"v7-key")?,
+                        Some(Bytes::from_static(b"v")),
+                        "a pre-admission rejection must retain the transaction snapshot"
+                    );
+
+                    if conflicting_write {
+                        engine.put(b"v7-key", b"replacement")?;
+                    }
+                    let result = if async_commit {
+                        runtime.block_on(transaction.commit_async())
+                    } else {
+                        transaction.commit()
+                    };
+                    if conflicting_write {
+                        let error = result.expect_err("the retry must repeat OCC validation");
+                        assert!(
+                            error.to_string().contains("serializable conflict"),
+                            "unexpected retry rejection: {error:#}"
+                        );
+                    } else {
+                        result?;
+                    }
+                    let expected = (!conflicting_write).then(|| Bytes::from_static(b"value"));
+                    assert_eq!(engine.get(b"retry-after-index-pressure")?, expected);
+                    assert_eq!(source.wal_batch_count(), Some(source_batches + 1));
+                    assert_eq!(
+                        engine.pitr_manifest_state.lock().active_segment_id,
+                        Some(source_segment),
+                        "shared pressure must not rotate the Active segment"
+                    );
+
+                    drop(transaction);
+                    engine.close_storage()?;
+                    drop(source);
+                    drop(engine);
+                    let reopened = KvEngine::open_with_wal_io_mode(&database, options, mode)?;
+                    assert_eq!(reopened.get(b"retry-after-index-pressure")?, expected);
+                    reopened.close_storage()?;
+                }
+            }
+        }
+
+        Ok(())
     }
 
     #[cfg(target_os = "linux")]
@@ -21608,104 +21861,6 @@ mod tests {
     -> anyhow::Result<()> {
         v7_async_transaction_capacity_retry_is_owned_through_close(false)?;
         v7_async_transaction_capacity_retry_is_owned_through_close(true)
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn v7_seal_index_limit_waits_for_active_writer_before_empty_check() -> anyhow::Result<()> {
-        let directory = tempdir()?;
-        let options = v7_recovery_test_database(directory.path())?;
-        let database = directory.path().join("db");
-        let engine = KvEngine::open_with_wal_io_mode(
-            &database,
-            options.clone(),
-            crate::wal::WalIoMode::Parallel,
-        )?;
-        assert!(matches!(
-            engine.create_recovery_point()?,
-            crate::pitr::api::RecoveryPointOutcome::Durable(_)
-        ));
-        let expected_memtable = engine.inner.state.load().memtable.clone();
-        assert!(expected_memtable.uses_v7_wal());
-        assert!(expected_memtable.is_empty());
-
-        // Hold an active-writer guard to model a parallel write that has a
-        // reservation but has not yet published into the memtable.
-        let active_writer_guard = engine.inner.active_memtable_lock.read();
-        let inner = Arc::clone(&engine.inner);
-        let expected_for_retry = Arc::clone(&expected_memtable);
-        let (started_tx, started_rx) = std::sync::mpsc::channel();
-        let retry = std::thread::spawn(move || {
-            started_tx.send(()).expect("test receiver is alive");
-            let mut retries = LsmStorageInner::MAX_WAL_FULL_ROTATION_RETRIES;
-            inner.retry_after_capacity_error(
-                anyhow::Error::new(
-                    crate::wal::v7::admission::WalV7ReservationError::SealIndexLimit,
-                ),
-                &expected_for_retry,
-                &mut retries,
-            )
-        });
-        started_rx.recv()?;
-
-        let gate_wait_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-        while !engine
-            .inner
-            .active_memtable_lock
-            .exclusive_pending_for_test()
-            && !retry.is_finished()
-            && std::time::Instant::now() < gate_wait_deadline
-        {
-            std::thread::yield_now();
-        }
-        assert!(
-            engine
-                .inner
-                .active_memtable_lock
-                .exclusive_pending_for_test(),
-            "seal-index empty check must wait for active writers to drain"
-        );
-
-        let value = [crate::vlog::KvKind::Inline as u8, b'v'];
-        let batch = crate::pitr::WalBatch {
-            commit_ts: 8,
-            recorded_at: crate::pitr::RecordedAt {
-                secs: 4_000_000_000,
-                nanos: 0,
-            },
-            entries: vec![crate::pitr::WalEntry::Put {
-                key: b"in-flight".to_vec(),
-                value: value.to_vec(),
-            }],
-        };
-        let ticket =
-            expected_memtable.write_pitr_wal_batch_only(&batch, crate::pitr::LIVE_WAL_V5_LIMITS)?;
-        expected_memtable.commit_wal_ticket(ticket)?;
-        expected_memtable
-            .publish_raw_batch(&[(crate::key::KeySlice::from_slice(b"in-flight"), &value)])?;
-        drop(active_writer_guard);
-
-        let error = retry
-            .join()
-            .map_err(|_| anyhow::anyhow!("retry worker panicked"))?
-            .expect_err("bounded retry count should stop before rotating");
-        assert!(
-            error.to_string().contains("bounded rotations"),
-            "unexpected retry error: {error:#}"
-        );
-        assert!(
-            !format!("{error:#}").contains("empty active segment"),
-            "the in-flight write should make the active segment non-empty"
-        );
-
-        engine.close_storage()?;
-        drop(engine);
-        let reopened =
-            KvEngine::open_with_wal_io_mode(&database, options, crate::wal::WalIoMode::Parallel)?;
-        assert_eq!(reopened.get(b"in-flight")?, Some(Bytes::from_static(b"v")));
-        reopened.close_storage()?;
-
-        Ok(())
     }
 
     #[cfg(target_os = "linux")]
