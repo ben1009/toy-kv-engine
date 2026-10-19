@@ -379,6 +379,17 @@ impl WalV7ReservationOwner {
         self.retained_resources.as_ref().map(Arc::clone)
     }
 
+    /// Whether a prepared batch or source-spool preparation can still release
+    /// capacity without changing the active PITR boundary.
+    pub(crate) fn has_in_flight_source_spool_work(&self) -> bool {
+        let state = self.state.lock();
+        state.active_preparations != 0 || state.active_batch_operations != 0
+    }
+
+    pub(crate) fn source_spool_generation_changed(&self, generation: u64) -> bool {
+        self.ledger.source_spool_generation() != generation
+    }
+
     pub(crate) fn release_startup_staging_resources(&self) {
         if let Some(resources) = &self.retained_resources {
             resources.release_startup_staging();
@@ -993,6 +1004,10 @@ impl WalV7ResourceLedger {
 
     pub(crate) fn snapshot(&self) -> WalV7ResourceCharge {
         self.inner.state.lock().charged
+    }
+
+    fn source_spool_generation(&self) -> u64 {
+        self.inner.state.lock().source_spool_generation
     }
 
     /// Wait for a release that may make a failed source-spool reservation fit.

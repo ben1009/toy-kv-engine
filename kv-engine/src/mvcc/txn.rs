@@ -775,6 +775,35 @@ async fn wait_for_v7_source_spool_capacity(
         .await
         .context("failed to flush an immutable memtable under v7 source-spool pressure")?;
 
+    if inner.lifecycle.ensure_open().is_ok() {
+        let reclaim_inner = Arc::clone(&inner);
+        let reclaim_owner = Arc::clone(&owner);
+        let reclaim_result = blocking
+            .run_result_with_reserved_capacity(move || {
+                reclaim_inner.reclaim_active_source_spool_for_pressure(&reclaim_owner)
+            })
+            .await;
+        let reclaimed = match reclaim_result {
+            Ok(reclaimed) => reclaimed,
+            Err(maintenance_error) => {
+                return Err(source_spool_error.context(format!(
+                    "PITR maintenance under v7 source-spool pressure failed: {maintenance_error:#}"
+                )));
+            }
+        };
+        if reclaimed && !owner.source_spool_generation_changed(generation) {
+            return Err(source_spool_error
+                .context("PITR maintenance completed without releasing v7 source-spool capacity"));
+        }
+        if !owner.source_spool_generation_changed(generation)
+            && !inner.source_spool_wait_has_releaser(&owner)
+        {
+            return Err(source_spool_error.context(
+                "v7 source-spool capacity is exhausted and no active WAL, immutable source, archive obligation, or in-flight preparation can release it",
+            ));
+        }
+    }
+
     let closing = inner.lifecycle.close_notify();
     if owner
         .wait_for_source_spool_change_async_while(generation, closing, || {
