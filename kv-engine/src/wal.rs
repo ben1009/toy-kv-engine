@@ -525,6 +525,16 @@ pub struct Wal {
     pitr_seal_append: Mutex<()>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum WalV7CapacityFailure {
+    /// Capacity local to the Active segment can be reclaimed by rotation.
+    SegmentRotation,
+    /// A shared resource budget is exhausted; rotation alone is not a remedy.
+    SharedResourcePressure,
+    /// The batch cannot fit any legal fresh v7 segment.
+    BatchTooLarge,
+}
+
 /// Abstraction over WAL entry recovery actions.
 ///
 /// Implementors decide what to do with each recovered entry (e.g., replay into
@@ -1550,13 +1560,35 @@ impl Wal {
         error.downcast_ref::<parallel_runtime::WalFull>().is_some()
     }
 
+    pub(crate) fn v7_capacity_failure(error: &anyhow::Error) -> Option<WalV7CapacityFailure> {
+        if let Some(error) = error.downcast_ref::<v7::leader::WalV7LeaderCapacityError>() {
+            return Some(match error {
+                v7::leader::WalV7LeaderCapacityError::RotationRequired => {
+                    WalV7CapacityFailure::SegmentRotation
+                }
+                v7::leader::WalV7LeaderCapacityError::BatchTooLarge => {
+                    WalV7CapacityFailure::BatchTooLarge
+                }
+            });
+        }
+
+        let error = error.downcast_ref::<v7::admission::WalV7ReservationError>()?;
+        Some(match error {
+            v7::admission::WalV7ReservationError::SealIndexLimit => {
+                WalV7CapacityFailure::SegmentRotation
+            }
+            v7::admission::WalV7ReservationError::LogicalWalLimit
+            | v7::admission::WalV7ReservationError::SourceSpoolLimit
+            | v7::admission::WalV7ReservationError::RecoveryWorkspaceLimit
+            | v7::admission::WalV7ReservationError::BufferMemoryLimit => {
+                WalV7CapacityFailure::SharedResourcePressure
+            }
+            _ => return None,
+        })
+    }
+
     pub(crate) fn is_v7_capacity_retry_error(error: &anyhow::Error) -> bool {
-        error
-            .downcast_ref::<v7::leader::WalV7LeaderCapacityError>()
-            .is_some_and(|error| *error == v7::leader::WalV7LeaderCapacityError::RotationRequired)
-            || error
-                .downcast_ref::<v7::admission::WalV7ReservationError>()
-                .is_some_and(|error| *error == v7::admission::WalV7ReservationError::SealIndexLimit)
+        Self::v7_capacity_failure(error) == Some(WalV7CapacityFailure::SegmentRotation)
     }
 
     pub(crate) fn set_write_profile(&self, profile: Arc<crate::mem_table::WriteProfile>) {

@@ -74,7 +74,11 @@ including after unlink or directory-sync errors; archive reconciliation finishes
 their durable cleanup and releases source-spool/index quota before resuming writes.
 Canceled v7 range and asynchronous transaction callers retain their accepted
 capacity retries through close, and the committed updates survive reopen.
-Distinct global spool backpressure and oversize outcomes remain pending.
+V7 capacity failures now distinguish segment rotation from shared resource
+pressure and batches too large for an empty segment. Sync and async point-write
+regressions verify oversized batches fail before ticket assignment, do not rotate
+to empty successors, and leave the Active WAL usable. Waiting for global
+source-spool capacity to become available remains pending.
 Public close drains and syncs
 the Active v7 WAL for recovery without emitting a final recovery point. It stops
 and drains MVCC commit admission, persists the latest synced logical boundary in
@@ -1048,8 +1052,11 @@ remain in later stage 5/6 work.
   an empty successor; injected publication, unlink, and directory-sync failures
   verify automatic retry, quota release, and resumed writes in both I/O modes.
   Canceled native v7 range and async transaction callers retain their accepted
-  capacity retries through close and recovery. Distinct global backpressure and
-  oversize outcomes remain outstanding.
+  capacity retries through close and recovery. V7 capacity failures distinguish
+  segment-local rotation, shared resource pressure, and batches too large for a
+  fresh segment. Oversized sync and async point writes are rejected before
+  ticket assignment without rotating; waiting for global source-spool capacity
+  to be reclaimed remains outstanding.
 - Extend `PitrManifestRecord::SealStarted`, its obligation state, replay, and
   snapshot validation with the versioned immutable boundary. Persist Active
   references using only logical anchors. Allocation-only timestamp watermarks

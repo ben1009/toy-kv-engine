@@ -14252,13 +14252,24 @@ impl LsmStorageInner {
         retries: &mut usize,
         allow_lifecycle_closing: bool,
     ) -> Result<()> {
-        if crate::wal::Wal::is_v7_capacity_retry_error(&error) {
-            return self.rotate_after_wal_full(
-                error,
-                expected_memtable,
-                retries,
-                allow_lifecycle_closing,
-            );
+        match crate::wal::Wal::v7_capacity_failure(&error) {
+            Some(crate::wal::WalV7CapacityFailure::SegmentRotation) => {
+                return self.rotate_after_wal_full(
+                    error,
+                    expected_memtable,
+                    retries,
+                    allow_lifecycle_closing,
+                );
+            }
+            Some(crate::wal::WalV7CapacityFailure::SharedResourcePressure) => {
+                return Err(error.context(
+                    "v7 WAL shared resource capacity is exhausted; segment rotation cannot relieve it",
+                ));
+            }
+            Some(crate::wal::WalV7CapacityFailure::BatchTooLarge) => {
+                return Err(error.context("v7 WAL batch cannot fit a fresh segment"));
+            }
+            None => {}
         }
 
         if !crate::wal::Wal::is_retryable_full_error(&error) {
@@ -20603,6 +20614,175 @@ mod tests {
             assert_eq!(reopened.get(key)?, Some(Bytes::from_static(b"value")));
         }
         reopened.close_storage()?;
+        Ok(())
+    }
+
+    #[test]
+    fn v7_capacity_failures_separate_rotation_backpressure_and_oversize() {
+        use crate::wal::v7::{admission::WalV7ReservationError, leader::WalV7LeaderCapacityError};
+        use crate::wal::{Wal, WalV7CapacityFailure};
+
+        assert_eq!(
+            Wal::v7_capacity_failure(&anyhow::Error::new(
+                WalV7LeaderCapacityError::RotationRequired,
+            )),
+            Some(WalV7CapacityFailure::SegmentRotation)
+        );
+        assert_eq!(
+            Wal::v7_capacity_failure(&anyhow::Error::new(WalV7ReservationError::SealIndexLimit)),
+            Some(WalV7CapacityFailure::SegmentRotation)
+        );
+        assert_eq!(
+            Wal::v7_capacity_failure(&anyhow::Error::new(WalV7ReservationError::SourceSpoolLimit,)),
+            Some(WalV7CapacityFailure::SharedResourcePressure)
+        );
+        assert_eq!(
+            Wal::v7_capacity_failure(&anyhow::Error::new(
+                WalV7ReservationError::BufferMemoryLimit,
+            )),
+            Some(WalV7CapacityFailure::SharedResourcePressure)
+        );
+        assert_eq!(
+            Wal::v7_capacity_failure(&anyhow::Error::new(WalV7LeaderCapacityError::BatchTooLarge)),
+            Some(WalV7CapacityFailure::BatchTooLarge)
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn v7_oversized_point_writes_fail_without_rotating_or_assigning_tickets() -> anyhow::Result<()>
+    {
+        use crate::wal::v7::leader::WalV7LeaderCapacityError;
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()?;
+        for mode in [
+            crate::wal::WalIoMode::Leader,
+            crate::wal::WalIoMode::Parallel,
+        ] {
+            for asynchronous in [false, true] {
+                let directory = tempdir()?;
+                let options =
+                    v7_recovery_test_database_with_segment_limit(directory.path(), 32 * 1024)?;
+                let database = directory.path().join("db");
+                let engine = KvEngine::open_with_wal_io_mode(&database, options.clone(), mode)?;
+                suspend_pitr_maintenance_for_test(&engine);
+                let initial_segment_id = engine
+                    .pitr_manifest_state
+                    .lock()
+                    .active_segment_id
+                    .expect("v7 Active segment is installed");
+                let active_memtable = engine.inner.state.load().memtable.clone();
+                let initial_batch_count = active_memtable
+                    .wal_batch_count()
+                    .expect("the v7 Active memtable has a WAL");
+                let oversized_value = vec![0x5A; 32 * 1024];
+
+                let error = if asynchronous {
+                    runtime
+                        .block_on(engine.put_async(b"oversized", &oversized_value))
+                        .expect_err("a batch larger than an empty segment must be rejected")
+                } else {
+                    engine
+                        .put(b"oversized", &oversized_value)
+                        .expect_err("a batch larger than an empty segment must be rejected")
+                };
+                assert_eq!(
+                    error.downcast_ref::<WalV7LeaderCapacityError>(),
+                    Some(&WalV7LeaderCapacityError::BatchTooLarge),
+                    "unexpected rejection: {error:#}"
+                );
+                assert_eq!(
+                    active_memtable.wal_batch_count(),
+                    Some(initial_batch_count),
+                    "an oversized batch must not consume a WAL ticket"
+                );
+                assert_eq!(
+                    engine.pitr_manifest_state.lock().active_segment_id,
+                    Some(initial_segment_id),
+                    "an oversized batch must not rotate to empty successors"
+                );
+                assert_eq!(engine.get(b"oversized")?, None);
+
+                if asynchronous {
+                    runtime.block_on(engine.put_async(b"valid", b"value"))?;
+                } else {
+                    engine.put(b"valid", b"value")?;
+                }
+                assert_eq!(
+                    active_memtable.wal_batch_count(),
+                    Some(initial_batch_count + 1)
+                );
+                assert_eq!(
+                    engine.pitr_manifest_state.lock().active_segment_id,
+                    Some(initial_segment_id),
+                    "the same Active WAL must remain usable after rejection"
+                );
+
+                engine.close_storage()?;
+                drop(engine);
+                let reopened = KvEngine::open_with_wal_io_mode(&database, options, mode)?;
+                assert_eq!(reopened.get(b"oversized")?, None);
+                assert_eq!(reopened.get(b"valid")?, Some(Bytes::from_static(b"value")));
+                reopened.close_storage()?;
+            }
+        }
+
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn v7_shared_resource_pressure_does_not_rotate_active_segment() -> anyhow::Result<()> {
+        let directory = tempdir()?;
+        let options = v7_recovery_test_database(directory.path())?;
+        let database = directory.path().join("db");
+        let engine =
+            KvEngine::open_with_wal_io_mode(&database, options, crate::wal::WalIoMode::Parallel)?;
+        suspend_pitr_maintenance_for_test(&engine);
+
+        let expected_memtable = engine.inner.state.load().memtable.clone();
+        let initial_segment_id = engine
+            .pitr_manifest_state
+            .lock()
+            .active_segment_id
+            .expect("v7 Active segment is installed");
+        let mut retries = 0;
+        let error = engine
+            .inner
+            .retry_after_capacity_error(
+                anyhow::Error::new(
+                    crate::wal::v7::admission::WalV7ReservationError::SourceSpoolLimit,
+                ),
+                &expected_memtable,
+                &mut retries,
+            )
+            .expect_err("shared source-spool pressure cannot be fixed by rotating the segment");
+
+        assert!(
+            error
+                .to_string()
+                .contains("shared resource capacity is exhausted"),
+            "unexpected capacity error: {error:#}"
+        );
+        assert_eq!(
+            retries, 0,
+            "shared pressure must not consume rotation retries"
+        );
+        assert_eq!(
+            engine.pitr_manifest_state.lock().active_segment_id,
+            Some(initial_segment_id),
+            "shared pressure must not install an empty successor"
+        );
+        let active_memtable = engine.inner.state.load().memtable.clone();
+        assert!(
+            Arc::ptr_eq(&active_memtable, &expected_memtable),
+            "shared pressure must keep the same Active memtable"
+        );
+
+        engine.close_storage()?;
         Ok(())
     }
 
