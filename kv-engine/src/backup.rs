@@ -4987,6 +4987,17 @@ fn sync_outcome(outcome: BackupOutcome) -> Result<CreateBackupOutcome> {
 }
 
 #[cfg(target_os = "linux")]
+fn ensure_backup_without_engine_owner_can_use_generic_path(
+    pitr_mode: crate::pitr::manifest::PitrMode,
+) -> Result<()> {
+    ensure!(
+        pitr_mode != crate::pitr::manifest::PitrMode::Enabled,
+        "enabled PITR backup boundary capture requires the retained KvEngine owner"
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
 impl crate::lsm_storage::KvEngine {
     #[allow(dead_code)]
     pub(crate) fn create_pitr_base_backup(
@@ -5016,6 +5027,9 @@ impl crate::lsm_storage::KvEngine {
 
     #[deprecated(note = "use create_backup")]
     pub fn create_backup_info(&self, options: BackupOptions) -> Result<BackupInfo> {
+        if let Some(info) = self.create_pitr_base_for_backup(&options)? {
+            return Ok(info);
+        }
         let _lifecycle_guard = self.inner.lifecycle.admit_write()?;
 
         self.inner.create_backup_inner(options)
@@ -5050,13 +5064,18 @@ impl crate::lsm_storage::KvEngine {
                 .blocking
                 .run_result_cancelable(&task_control.cancelled, move || {
                     let _guard = guard;
-                    if let Some(engine) = worker_inner
+                    let engine = worker_inner
                         .weak_engine
                         .get()
-                        .and_then(std::sync::Weak::upgrade)
-                        && let Some(info) = engine.create_pitr_base_for_backup(&options)?
-                    {
-                        return Ok(info);
+                        .and_then(std::sync::Weak::upgrade);
+                    if let Some(engine) = engine {
+                        if let Some(info) = engine.create_pitr_base_for_backup(&options)? {
+                            return Ok(info);
+                        }
+                    } else {
+                        ensure_backup_without_engine_owner_can_use_generic_path(
+                            worker_inner.pitr_state.lock().mode,
+                        )?;
                     }
                     worker_inner.create_backup_inner_with_cancellation(
                         options,
@@ -5131,6 +5150,16 @@ impl crate::lsm_storage::KvEngine {
             .blocking
             .run_result(move || {
                 let _lifecycle_guard = lifecycle_guard;
+                let engine = inner.weak_engine.get().and_then(std::sync::Weak::upgrade);
+                if let Some(engine) = engine {
+                    if let Some(info) = engine.create_pitr_base_for_backup(&options)? {
+                        return Ok(info);
+                    }
+                } else {
+                    ensure_backup_without_engine_owner_can_use_generic_path(
+                        inner.pitr_state.lock().mode,
+                    )?;
+                }
                 inner.create_backup_inner(options)
             })
             .await
@@ -5148,10 +5177,15 @@ impl crate::lsm_storage::KvEngine {
             .blocking
             .run_result(move || {
                 let _guard = guard;
-                if let Some(engine) = inner.weak_engine.get().and_then(std::sync::Weak::upgrade)
-                    && let Some(info) = engine.create_pitr_base_for_backup(&options)?
-                {
-                    return Ok(BackupOutcome::Committed(info));
+                let engine = inner.weak_engine.get().and_then(std::sync::Weak::upgrade);
+                if let Some(engine) = engine {
+                    if let Some(info) = engine.create_pitr_base_for_backup(&options)? {
+                        return Ok(BackupOutcome::Committed(info));
+                    }
+                } else {
+                    ensure_backup_without_engine_owner_can_use_generic_path(
+                        inner.pitr_state.lock().mode,
+                    )?;
                 }
                 match inner.create_backup_inner(options) {
                     Ok(info) => Ok(BackupOutcome::Committed(info)),
@@ -7219,6 +7253,28 @@ fn check_pitr_cancellation(cancellation: Option<&std::sync::atomic::AtomicBool>)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn backup_without_engine_owner_only_requires_boundary_for_enabled_pitr() {
+        for mode in [
+            crate::pitr::manifest::PitrMode::Disabled,
+            crate::pitr::manifest::PitrMode::Enabling,
+            crate::pitr::manifest::PitrMode::PublicationUncertain,
+            crate::pitr::manifest::PitrMode::ReconciliationRequired,
+        ] {
+            assert!(
+                ensure_backup_without_engine_owner_can_use_generic_path(mode).is_ok(),
+                "mode {mode:?} should retain the generic backup path"
+            );
+        }
+
+        let error = ensure_backup_without_engine_owner_can_use_generic_path(
+            crate::pitr::manifest::PitrMode::Enabled,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("retained KvEngine owner"));
+    }
 
     #[cfg(target_os = "linux")]
     #[test]

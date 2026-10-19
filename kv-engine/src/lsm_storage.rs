@@ -24401,6 +24401,163 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[tokio::test(flavor = "current_thread")]
+    #[allow(deprecated)]
+    async fn v7_pitr_backup_compatibility_apis_preserve_the_archived_chain() -> anyhow::Result<()> {
+        for mode in [
+            crate::wal::WalIoMode::Leader,
+            crate::wal::WalIoMode::Parallel,
+        ] {
+            let directory = tempdir()?;
+            let options = v7_recovery_test_database(directory.path())?;
+            let database = directory.path().join("db");
+            let repository_path = directory.path().join("repository");
+            let engine = KvEngine::open_with_wal_io_mode(&database, options, mode)?;
+
+            let sync_info = match engine.create_backup(crate::backup::BackupOptions {
+                repository: repository_path.clone(),
+                use_hard_links: false,
+            })? {
+                crate::backup::CreateBackupOutcome::Committed(info) => info,
+                outcome => anyhow::bail!("v7 PITR backup did not commit: {outcome:?}"),
+            };
+            assert_eq!(sync_info.backup_id, 2);
+
+            let sync_compat_info = engine.create_backup_info(crate::backup::BackupOptions {
+                repository: repository_path.clone(),
+                use_hard_links: false,
+            })?;
+            assert_eq!(sync_compat_info.backup_id, 3);
+
+            let async_outcome = engine
+                .create_backup_async_with_outcome(crate::backup::BackupOptions {
+                    repository: repository_path.clone(),
+                    use_hard_links: false,
+                })
+                .await?;
+            let async_info = match async_outcome {
+                crate::backup::BackupOutcome::Committed(info) => info,
+                outcome => anyhow::bail!("async v7 PITR backup did not commit: {outcome:?}"),
+            };
+            assert_eq!(async_info.backup_id, 4);
+
+            let async_info = engine
+                .create_backup_async_info(crate::backup::BackupOptions {
+                    repository: repository_path.clone(),
+                    use_hard_links: false,
+                })
+                .await?;
+            assert_eq!(async_info.backup_id, 5);
+
+            let repository = crate::backup::BackupRepository::open(&repository_path)?;
+            let page = repository.pitr_status_page(crate::pitr::api::PitrStatusOptions {
+                cursor: None,
+                page_size: crate::pitr::api::MAX_STATUS_PAGE_SIZE,
+            })?;
+            assert!(
+                !page.items.is_empty(),
+                "v7 backup capture must publish a PITR base bound to the archived source chain"
+            );
+            let verification = repository.verify_pitr(crate::pitr::api::VerifyPitrOptions {
+                depth: crate::pitr::api::VerifyPitrDepth::Deep {
+                    sampled_targets: NonZeroUsize::new(1).unwrap(),
+                },
+                selector: None,
+                cursor: None,
+                page_size: crate::pitr::api::MAX_STATUS_PAGE_SIZE,
+            })?;
+            assert!(verification.first_failure.is_none());
+            assert!(!verification.verified_intervals.is_empty());
+
+            drop(repository);
+            engine.close_storage()?;
+        }
+
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "current_thread")]
+    #[allow(deprecated)]
+    async fn v7_pitr_backup_apis_handle_engine_moved_out_of_arc() -> anyhow::Result<()> {
+        let directory = tempdir()?;
+        let options = v7_recovery_test_database(directory.path())?;
+        let database = directory.path().join("db");
+        let repository_path = directory.path().join("repository");
+        let engine =
+            KvEngine::open_with_wal_io_mode(&database, options, crate::wal::WalIoMode::Parallel)?;
+        let engine = std::sync::Arc::try_unwrap(engine)
+            .unwrap_or_else(|_| panic!("test must hold the only KvEngine Arc reference"));
+
+        assert!(
+            engine
+                .inner
+                .weak_engine
+                .get()
+                .and_then(std::sync::Weak::upgrade)
+                .is_none(),
+            "moving the engine out of its Arc must make the weak owner unavailable"
+        );
+
+        let sync_info = engine.create_backup_info(crate::backup::BackupOptions {
+            repository: repository_path.clone(),
+            use_hard_links: false,
+        })?;
+        assert_eq!(sync_info.backup_id, 2);
+
+        let async_info_error = engine
+            .create_backup_async_info(crate::backup::BackupOptions {
+                repository: repository_path.clone(),
+                use_hard_links: false,
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            async_info_error
+                .to_string()
+                .contains("retained KvEngine owner")
+        );
+
+        let async_outcome_error = engine
+            .create_backup_async_with_outcome(crate::backup::BackupOptions {
+                repository: repository_path.clone(),
+                use_hard_links: false,
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            async_outcome_error
+                .to_string()
+                .contains("retained KvEngine owner")
+        );
+
+        let task_error = engine
+            .create_backup_task(crate::backup::BackupOptions {
+                repository: repository_path.clone(),
+                use_hard_links: false,
+            })?
+            .await
+            .unwrap_err();
+        assert!(task_error.to_string().contains("retained KvEngine owner"));
+
+        let async_task_error = engine
+            .create_backup_async(crate::backup::BackupOptions {
+                repository: repository_path,
+                use_hard_links: false,
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            async_task_error
+                .to_string()
+                .contains("retained KvEngine owner")
+        );
+
+        engine.close_storage()?;
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "current_thread")]
     async fn v7_checkpoint_capture_seals_and_flushes_the_fixed_cutoff() -> anyhow::Result<()> {
         for mode in [
             crate::wal::WalIoMode::Leader,

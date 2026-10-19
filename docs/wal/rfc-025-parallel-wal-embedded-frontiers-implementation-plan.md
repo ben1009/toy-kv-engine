@@ -163,9 +163,18 @@ Standalone checkpoint capture now supports Active v7 WALs: it establishes a
 fixed cutoff, seals and rotates a nonempty source WAL, flushes the captured
 state, then pins the immutable file set before reopening admission. The
 checkpoint manifest is detached from the source PITR repository because the
-checkpoint omits that repository and source WAL. Incremental-backup capture,
-remaining public write shapes (including other OCC APIs), and broader lifecycle
-rotation remain. PITR manifest replay and
+checkpoint omits that repository and source WAL. PITR base-backup capture also
+supports Active v7: both the current and deprecated sync/async backup entrypoints
+use the sealed-and-archived base boundary before pinning the manifest snapshot.
+The deprecated synchronous entrypoint captures through its borrowed engine
+owner. Async entrypoints require a retained owner when PITR is enabled and needs
+boundary capture; other PITR modes retain the generic capture path, which still
+rejects Active v7 WALs.
+Deep verification coverage confirms that repeated captures retain a valid source
+chain in both WAL I/O modes. The generic low-level backup capture still rejects
+Active v7 so it cannot persist an Active source reference without its WAL and
+repository. Remaining public write shapes (including other OCC APIs) and broader
+lifecycle rotation remain. PITR manifest replay and
 snapshots now retain and validate a v7 format marker and the full immutable
 boundary in Sealing obligations;
 seal completion checks the WAL digest against that boundary. A v7 v2 seal
@@ -1032,8 +1041,15 @@ capture now uses the v7 sealing and successor-rotation path, flushes the fixed
 cutoff, and pins its immutable file set before reopening admission. Its
 manifest snapshot is detached from the source PITR repository because the
 checkpoint omits that repository and source WAL. Incremental-backup capture
-still rejects Active v7 WALs until it can preserve the sealed source chain.
-PITR base-backup capture follows a separate path and remains unqualified for v7.
+now routes Active v7 through PITR base capture, sealing and archiving the source
+chain before the backup snapshot is pinned. The deprecated synchronous and
+asynchronous backup APIs use the same path. The generic low-level capture helper
+continues to reject Active v7 because it cannot independently preserve the source
+chain. PITR base capture is qualified in both Leader and Parallel modes with
+repeated-backup and deep archive-verification coverage. The deprecated sync API
+uses its borrowed owner directly. Async entrypoints report an explicit error if
+the owner has been moved out of its `Arc` while enabled PITR requires boundary
+capture; other PITR modes retain generic capture, which rejects Active v7 WALs.
 If checkpoint capture fails, commit admission resumes only when the sequencer,
 manifest durability, active WAL, and PITR publication state remain healthy;
 uncertain state stays fail-closed for recovery.
