@@ -15,6 +15,7 @@ pub(crate) mod catalog;
 pub(crate) mod enable;
 pub(crate) mod limiter;
 pub(crate) mod manifest;
+pub(crate) mod migration;
 pub(crate) mod restore;
 pub(crate) mod seal;
 pub(crate) mod segment;

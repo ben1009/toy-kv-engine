@@ -1213,6 +1213,18 @@ stage 3's continuation cases through real sealing, archive, and restore here.
 
 ### 7. Capacity preflight, migration, and constructor coverage
 
+The first Stage 7 slice adds a checked capacity assessment for the v7 image,
+fresh-inode recovery workspace, maximum legacy and v7 seal sidecars, an empty
+v7 successor and its install staging image, and terminal manifest headroom
+bounded by the encoded handoff records. The legacy seal bound uses the recovered
+Active WAL image length, which may exceed the configured segment maximum;
+the future v7 image and recovery workspace use the configured v7 bound.
+It compares that transition requirement with caller-reconstructed retained
+source-spool charges and reports
+eligible or deferred outcomes. Enable, reopen, and rotation do not consume this
+assessment yet; those callers must next reconstruct all live charges and
+atomically reserve the transition before durable intent.
+
 - Add a shared migration/preflight decision used by enablement, reopen, and
   rotation. Calculate capacity for the largest configured v7 physical image
   plus fresh recovery workspace, current obligations/pins/orphans, and all
