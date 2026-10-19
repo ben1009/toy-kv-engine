@@ -453,6 +453,7 @@ impl Transaction {
         &self,
         preparation: Option<tokio::sync::OwnedSemaphorePermit>,
     ) -> Result<()> {
+        let allow_lifecycle_closing = self.lifecycle_guard.lock().is_some();
         {
             // A mutation that passed its committed check must finish both its
             // local write and OCC metadata before this owner can claim inputs.
@@ -560,11 +561,20 @@ impl Transaction {
                             drop(_commit_guard);
                             #[cfg(all(test, feature = "chaos-testing"))]
                             crate::chaos::failpoint::before_parallel_wal_transaction_rotation();
-                            if let Err(rotation_error) = self.inner.retry_after_capacity_error(
-                                error,
-                                &expected_memtable,
-                                &mut retries,
-                            ) {
+                            let rotation_result = if allow_lifecycle_closing {
+                                self.inner.retry_after_capacity_error_admitted(
+                                    error,
+                                    &expected_memtable,
+                                    &mut retries,
+                                )
+                            } else {
+                                self.inner.retry_after_capacity_error(
+                                    error,
+                                    &expected_memtable,
+                                    &mut retries,
+                                )
+                            };
+                            if let Err(rotation_error) = rotation_result {
                                 self.committed
                                     .store(false, std::sync::atomic::Ordering::SeqCst);
                                 return Err(rotation_error);
@@ -580,10 +590,11 @@ impl Transaction {
             .iter()
             .map(|(k, v, t)| (k.clone(), v.clone(), *t))
             .collect();
-        if let Err(e) = self
-            .inner
-            .mvcc_write_batch_with_native_preparation(&owned, preparation)
-        {
+        if let Err(e) = self.inner.mvcc_write_batch_with_native_preparation(
+            &owned,
+            preparation,
+            allow_lifecycle_closing,
+        ) {
             // Revert committed flag so caller can retry.
             self.committed
                 .store(false, std::sync::atomic::Ordering::SeqCst);
