@@ -168,6 +168,27 @@ impl V5Seal {
             .ok_or_else(|| anyhow::anyhow!("PITR seal size limit overflows"))
     }
 
+    /// Return the largest v5-family seal sidecar that can describe a WAL image
+    /// within `wal_image_bytes`.
+    ///
+    /// A v5-family batch occupies at least one alignment unit, so this bounds
+    /// the number of index entries without assuming anything about the batch
+    /// payload sizes. Migration preflight uses this before it creates the seal
+    /// that temporarily coexists with the legacy source WAL. A recovered legacy
+    /// image can exceed its configured segment limit.
+    pub(crate) fn max_encoded_len_for_segment(wal_image_bytes: u64) -> Result<u64> {
+        let max_entries = wal_image_bytes
+            .saturating_sub(WAL_V5_HEADER_LEN as u64)
+            .checked_div(WAL_V5_ALIGNMENT as u64)
+            .ok_or_else(|| anyhow::anyhow!("PITR seal alignment is zero"))?;
+        let index_bytes = max_entries
+            .checked_mul(ENTRY_BYTES as u64)
+            .ok_or_else(|| anyhow::anyhow!("PITR seal index size overflows"))?;
+        (HEADER_BYTES as u64)
+            .checked_add(index_bytes)
+            .ok_or_else(|| anyhow::anyhow!("PITR seal sidecar size overflows"))
+    }
+
     pub(crate) fn first_commit_ts(&self) -> Option<u64> {
         self.entries.first().map(|entry| entry.commit_ts)
     }
