@@ -81,8 +81,34 @@ regressions verify oversized batches fail before ticket assignment, do not rotat
 to empty successors, and leave the Active WAL usable. Serializable transactions
 rejected for shared capacity keep their snapshot and buffered writes for explicit
 retry; sync/async regressions verify successful retry and renewed OCC validation
-in both I/O modes. Waiting for global
-source-spool capacity to become available remains pending.
+in both I/O modes. Source-spool rejection assigns no ticket. Sync and async paths
+retry admission when shared-ledger capacity is released or in-flight source work
+finishes. Failed attempts release their
+memtable/commit guards before waiting.
+Native async point/range writers also drop their preparation permits. Async
+transactions await quota in an owned coordinator, retaining their transaction
+claim, snapshot, engine owner, and any preparation permit across retries so a
+subsequent rotation cannot race native preparation. Only a direct
+batch-reservation rejection produces a deferred quota wait.
+Rotation and seal failures return to the caller even when caused by spool
+pressure, allowing PITR resume and explicit transaction retry when commit
+admission has stopped. Under source-spool pressure,
+writers flush one immutable memtable below the normal count threshold and retry
+released quota before attempting another Active boundary. If only the populated
+Active WAL can release capacity, they archive and flush it. Independent scratch
+buffers do not block this reclamation, and batch completion wakes waiters even
+when its source bytes remain charged. Writers report a capacity error when no
+releaser exists or maintenance cannot make progress. PITR scheduling,
+reclamation, and flush use one reserved
+blocking-executor slot when the executor has more than one slot, so quota release
+can run when ordinary blocking work waits on that same quota or a live
+immutable-memtable pin. Point/range quota waiters exit when lifecycle close
+begins. Admitted transactions can flush and reconcile already-authorized PITR
+cleanup before retrying during close; they return a capacity error if that
+cleanup cannot release quota. Reconciliation preserves stopped commit admission
+after `close_pitr` publishes its final point. The bounded final close-time check
+runs with the blocking cleanup task, so caller runtimes without a time driver
+are supported.
 Public close drains and syncs
 the Active v7 WAL for recovery without emitting a final recovery point. It stops
 and drains MVCC commit admission, persists the latest synced logical boundary in
@@ -334,8 +360,8 @@ reservation errors. Point-write retry and rotation are now wired in Stage 6, wit
 public API coverage for physical segment rotation and shared Parallel seal-index
 pressure without rotation. Native async range retries are now wired through rotation
 and covered for queued-writer exclusion and reopen durability. Native transaction
-retries are also wired in Stage 6; waiting for shared-ledger capacity remains
-outstanding. Stage 5 has
+retries are also wired in Stage 6. Source-spool pressure waits for quota release;
+other shared-ledger categories still return without rotation. Stage 5 has
 started with recovered-runtime cursor bootstrap: an installed Active image
 supplies the v7 DATA start, append offset, and next ticket. The shared runtime
 seeds its admission, packer, and durability coordinates from that state. The seed now
@@ -825,11 +851,32 @@ transition remain.
   canonicalization scratch may be reserved first and is released on rejection.
   The engine retry/rotation handoff is now connected in Stage 6. Shared-ledger
   failures, including seal-index exhaustion, return capacity errors without
-  rotation; waiting for released capacity remains outstanding.
-- Document the lock/reservation order across the sequencer, memtable leases,
-  spool accounting, admission, and durability. Release admission/publication
-  locks before waiting for archive progress or new budget; inject full-spool
-  contention to check that maintenance can still make progress.
+  rotation. Source-spool exhaustion waits after active-memtable/commit guards
+  unwind, then retries without rotation. Native async point/range writers also
+  release their preparation permit before awaiting. Async transactions retain
+  their claim and any preparation permit while their owned coordinator awaits
+  quota, so a subsequent rotation cannot race native preparation. Explicit
+  attempt outcomes distinguish direct batch quota waits from rotation/seal
+  failures; the latter return to the caller with the snapshot and buffered
+  writes retained for PITR resume and transaction retry.
+- Source-spool wait ordering is implemented across reservation, memtable
+  admission, and durability: failed attempts release memtable/commit guards
+  before waiting, and native async point/range writers also release their
+  preparation permit. Ordinary async transaction quota waits release the blocking
+  worker and reject concurrent mutations while preserving their commit claim.
+  The bounded final check during close runs with cleanup and needs no Tokio time
+  driver. A cancellation regression verifies that a detached transaction keeps its engine
+  alive, finishes after quota release, and survives reopen. Full-spool
+  regressions verify the active-memtable exclusive gate is
+  available to maintenance while a writer waits for released quota. PITR
+  scheduling, reclamation, and flush use reserved executor capacity, covered by
+  an executor saturation regression. Sync and native async regressions verify
+  source-spool pressure flushes a Reclaimable immutable segment below the
+  configured memtable-count threshold and the waiting write completes without
+  a manual quota release. Sync and native async regressions also verify that a
+  blocked point/range source-spool writer exits when close begins. Admitted
+  transactions instead finish authorized source cleanup during close or return
+  a capacity error when cleanup cannot release quota.
 - Change the ordered packer to finalize the recorded-time clamp, canonical
   logical headers, and ticket-bound fragments in ticket order. Feed an
   incremental logical hash and tentative first-DATA-frame seal index. Retain
@@ -857,9 +904,9 @@ and marker-overhead cases in the serial Leader produce rotation-required before
 ticket assignment; a batch too large for a fresh segment and shared-ledger resource
 pressure remain distinct. Stage 6 now exercises physical segment rotation and
 shared Parallel seal-index reservation errors without rotation. Range and
-transaction retries and cancellation are also covered in Stage 6; waiting for
-shared-ledger capacity remains outstanding. Full lifecycle rotation/retry checks
-belong to Stage 6; they are not
+transaction retries and cancellation are also covered in Stage 6; source-spool
+release and retry is now covered, while logical, buffer, and seal-index caps
+remain non-rotating errors. Full lifecycle rotation/retry checks belong to Stage 6; they are not
 prerequisites for this stage.
 
 ### 5. Parallel runtime, one-sync coordinator, and API barriers
@@ -1068,8 +1115,13 @@ remain in later stage 5/6 work.
   capacity retries through close and recovery. V7 capacity failures distinguish
   segment-local rotation, shared resource pressure, and batches too large for a
   fresh segment. Oversized sync and async point writes are rejected before
-  ticket assignment without rotating; waiting for global source-spool capacity
-  to be reclaimed remains outstanding.
+  ticket assignment without rotating. Sync and native async writers now wait on
+  source-spool capacity and work-completion generations; tests verify no ticket
+  is assigned, the active-memtable gate stays available, and each write resumes on quota release
+  without rotating when released capacity suffices. Additional regressions
+  verify batch completion before waiter registration is observed, Active
+  reclamation proceeds while independent scratch stays owned, and a pressure
+  flush does not trigger an unnecessary Active rotation.
 - Extend `PitrManifestRecord::SealStarted`, its obligation state, replay, and
   snapshot validation with the versioned immutable boundary. Persist Active
   references using only logical anchors. Allocation-only timestamp watermarks

@@ -90,6 +90,26 @@ impl BlockingExecutor {
         .expect("blocking task panicked")
     }
 
+    /// Run lifecycle maintenance on the blocking pool. Ordinary work leaves
+    /// one slot available whenever the executor has more than one slot. A
+    /// maintenance operation may release resources awaited by ordinary work.
+    pub async fn run_result_with_reserved_capacity<F, T, E>(&self, f: F) -> Result<T, E>
+    where
+        F: FnOnce() -> Result<T, E> + Send + 'static,
+        T: Send + 'static,
+        E: Send + 'static,
+    {
+        self.acquire_slot_below(self.max_blocking).await;
+        let active = Arc::clone(&self.active);
+
+        tokio::task::spawn_blocking(move || {
+            let _guard = DecrementOnDrop(active);
+            f()
+        })
+        .await
+        .expect("blocking task panicked")
+    }
+
     pub async fn run_result_cancelable<F, T, E>(
         &self,
         cancelled: &AtomicBool,
@@ -120,9 +140,21 @@ impl BlockingExecutor {
 
     /// Wait until we are under the concurrency limit, then increment.
     async fn acquire_slot(&self) {
+        // Keep one slot available for lifecycle maintenance when possible.
+        // A source-spool waiter can occupy a blocking thread until that same
+        // maintenance reclaims its WAL and releases quota.
+        let limit = if self.max_blocking > 1 {
+            self.max_blocking - 1
+        } else {
+            self.max_blocking
+        };
+        self.acquire_slot_below(limit).await;
+    }
+
+    async fn acquire_slot_below(&self, limit: usize) {
         loop {
             let current = self.active.load(Ordering::Acquire);
-            if current < self.max_blocking
+            if current < limit
                 && self
                     .active
                     .compare_exchange(current, current + 1, Ordering::AcqRel, Ordering::Relaxed)
@@ -135,12 +167,17 @@ impl BlockingExecutor {
     }
 
     async fn acquire_slot_cancelable(&self, cancelled: &AtomicBool) -> bool {
+        let limit = if self.max_blocking > 1 {
+            self.max_blocking - 1
+        } else {
+            self.max_blocking
+        };
         loop {
             if cancelled.load(Ordering::Acquire) {
                 return false;
             }
             let current = self.active.load(Ordering::Acquire);
-            if current < self.max_blocking
+            if current < limit
                 && self
                     .active
                     .compare_exchange(current, current + 1, Ordering::AcqRel, Ordering::Relaxed)
@@ -180,5 +217,61 @@ pub(crate) struct HeldBlockingSlots {
 impl Drop for HeldBlockingSlots {
     fn drop(&mut self) {
         self.active.fetch_sub(self.slots, Ordering::Release);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::BlockingExecutor;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn reserved_capacity_runs_maintenance_when_regular_slots_are_full() {
+        let executor = BlockingExecutor::new(2);
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+
+        let regular_executor = executor.clone();
+        let regular = tokio::spawn(async move {
+            regular_executor
+                .run(move || {
+                    started_tx.send(()).unwrap();
+                    release_rx.blocking_recv().unwrap();
+                })
+                .await;
+        });
+        started_rx.await.unwrap();
+
+        let queued_executor = executor.clone();
+        let queued = tokio::spawn(async move { queued_executor.run(|| ()).await });
+        tokio::task::yield_now().await;
+        assert!(
+            !queued.is_finished(),
+            "ordinary work must leave maintenance capacity free"
+        );
+
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            executor.run_result_with_reserved_capacity(|| Ok::<_, anyhow::Error>(())),
+        )
+        .await
+        .expect("maintenance must acquire reserved capacity")
+        .unwrap();
+        assert!(
+            !queued.is_finished(),
+            "ordinary work must not consume the reserved slot"
+        );
+
+        release_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), regular)
+            .await
+            .expect("regular task must finish after release")
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), queued)
+            .await
+            .expect("queued regular task must acquire its slot after release")
+            .unwrap();
+        assert_eq!(executor.available_permits(), 2);
     }
 }

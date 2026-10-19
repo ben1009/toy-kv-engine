@@ -155,6 +155,74 @@ impl LsmStorageInner {
                 }
                 Err(error) => {
                     drop(lease);
+                    if let Some(generation) =
+                        crate::wal::Wal::v7_source_spool_wait_generation(&error)
+                    {
+                        drop(preparation);
+                        let owner = memtable
+                            .wal_v7_reservation_owner()
+                            .context("v7 source-spool rejection has no reservation owner")?;
+                        let work_generation = owner.source_spool_work_generation();
+                        let flush_inner = Arc::clone(self);
+                        let flush_admission = Arc::clone(&admission);
+                        self.blocking
+                            .run_result_with_reserved_capacity(move || {
+                                let _admission = flush_admission;
+                                flush_inner.flush_immutable_for_source_spool_pressure()
+                            })
+                            .await
+                            .context(
+                                "failed to dispatch immutable flush under v7 source-spool pressure",
+                            )?;
+                        if self.lifecycle.ensure_open().is_ok()
+                            && !owner.source_spool_generation_changed(generation)
+                        {
+                            let reclaim_inner = Arc::clone(self);
+                            let reclaim_owner = Arc::clone(&owner);
+                            let reclaim_result = self
+                                .blocking
+                                .run_result_with_reserved_capacity(move || {
+                                    reclaim_inner.reclaim_active_source_spool_for_pressure(
+                                        &reclaim_owner,
+                                        generation,
+                                    )
+                                })
+                                .await;
+                            let reclaimed = match reclaim_result {
+                                Ok(reclaimed) => reclaimed,
+                                Err(maintenance_error) => {
+                                    return Err(error.context(format!(
+                                        "PITR maintenance under v7 source-spool pressure failed: {maintenance_error:#}"
+                                    )));
+                                }
+                            };
+                            if reclaimed && !owner.source_spool_generation_changed(generation) {
+                                return Err(error.context(
+                                    "PITR maintenance completed without releasing v7 source-spool capacity",
+                                ));
+                            }
+                            if !owner.source_spool_generation_changed(generation)
+                                && !self.source_spool_wait_has_releaser(&owner)
+                            {
+                                return Err(error.context(
+                                    "v7 source-spool capacity is exhausted and no active WAL, immutable source, archive obligation, or in-flight preparation can release it",
+                                ));
+                            }
+                        }
+                        let closing = self.lifecycle.close_notify();
+                        if !owner
+                            .wait_for_source_spool_change_async_while(
+                                generation,
+                                work_generation,
+                                closing,
+                                || self.lifecycle.ensure_open().is_ok(),
+                            )
+                            .await
+                        {
+                            self.lifecycle.ensure_open()?;
+                        }
+                        continue;
+                    }
                     let v7_capacity = crate::wal::Wal::is_v7_capacity_retry_error(&error);
                     if !v7_capacity && !crate::wal::Wal::is_retryable_full_error(&error) {
                         drop(preparation);
@@ -329,6 +397,74 @@ impl LsmStorageInner {
                 }
                 Err(error) => {
                     drop(lease);
+                    if let Some(generation) =
+                        crate::wal::Wal::v7_source_spool_wait_generation(&error)
+                    {
+                        drop(preparation);
+                        let owner = memtable
+                            .wal_v7_reservation_owner()
+                            .context("v7 source-spool rejection has no reservation owner")?;
+                        let work_generation = owner.source_spool_work_generation();
+                        let flush_inner = Arc::clone(self);
+                        let flush_admission = Arc::clone(&admission);
+                        self.blocking
+                            .run_result_with_reserved_capacity(move || {
+                                let _admission = flush_admission;
+                                flush_inner.flush_immutable_for_source_spool_pressure()
+                            })
+                            .await
+                            .context(
+                                "failed to dispatch immutable flush under v7 source-spool pressure",
+                            )?;
+                        if self.lifecycle.ensure_open().is_ok()
+                            && !owner.source_spool_generation_changed(generation)
+                        {
+                            let reclaim_inner = Arc::clone(self);
+                            let reclaim_owner = Arc::clone(&owner);
+                            let reclaim_result = self
+                                .blocking
+                                .run_result_with_reserved_capacity(move || {
+                                    reclaim_inner.reclaim_active_source_spool_for_pressure(
+                                        &reclaim_owner,
+                                        generation,
+                                    )
+                                })
+                                .await;
+                            let reclaimed = match reclaim_result {
+                                Ok(reclaimed) => reclaimed,
+                                Err(maintenance_error) => {
+                                    return Err(error.context(format!(
+                                        "PITR maintenance under v7 source-spool pressure failed: {maintenance_error:#}"
+                                    )));
+                                }
+                            };
+                            if reclaimed && !owner.source_spool_generation_changed(generation) {
+                                return Err(error.context(
+                                    "PITR maintenance completed without releasing v7 source-spool capacity",
+                                ));
+                            }
+                            if !owner.source_spool_generation_changed(generation)
+                                && !self.source_spool_wait_has_releaser(&owner)
+                            {
+                                return Err(error.context(
+                                    "v7 source-spool capacity is exhausted and no active WAL, immutable source, archive obligation, or in-flight preparation can release it",
+                                ));
+                            }
+                        }
+                        let closing = self.lifecycle.close_notify();
+                        if !owner
+                            .wait_for_source_spool_change_async_while(
+                                generation,
+                                work_generation,
+                                closing,
+                                || self.lifecycle.ensure_open().is_ok(),
+                            )
+                            .await
+                        {
+                            self.lifecycle.ensure_open()?;
+                        }
+                        continue;
+                    }
                     let v7_capacity = crate::wal::Wal::is_v7_capacity_retry_error(&error);
                     if !v7_capacity && !crate::wal::Wal::is_retryable_full_error(&error) {
                         drop(preparation);
