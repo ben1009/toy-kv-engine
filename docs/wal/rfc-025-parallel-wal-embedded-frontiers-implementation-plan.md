@@ -1271,7 +1271,18 @@ that exact boundary. The source manifest advances to v10 so older engines reject
 compacted snapshots containing this intent. PITR v7/v8 envelopes and source
 manifests v3–v9 remain readable. Forced-gap reconciliation retains the
 intended successor identity until its abandoned obligation is cleaned up.
-Production migration does not yet emit this transition.
+PITR resume now completes a durable `MigrationStarted` transition whether
+the legacy seal sidecar was installed before the interruption or still needs to
+be created. It re-syncs and validates the legacy source, checks the intended
+successor header against the sealed predecessor, publishes the matching
+`SegmentSealed` record, and installs the v7 successor before reopening
+admission. Recovery counts the installed legacy seal and reconstructed
+seal/successor reservations once against the transition budget, and verifies
+and syncs an existing seal plus its parent directory on every retry before
+publishing `SegmentSealed`. Regression coverage includes exact-capacity reopen
+with and without the sidecar, source-tail truncation, a second reopen after v7
+writes, and repeated seal directory-sync failure. Production migration does not
+yet emit this transition.
 
 - Add a shared migration/preflight decision used by enablement, reopen, and
   rotation. Calculate capacity for the largest configured v7 physical image
