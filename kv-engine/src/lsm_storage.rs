@@ -3820,6 +3820,8 @@ impl KvEngine {
                 if let Some(message) = Self::deferred_v7_migration_resume_message(
                     &capacity,
                     active.wal_format_version(),
+                    &self.inner.path,
+                    state.active_segment_id,
                 ) {
                     report_sink(log::Level::Info, message);
                 }
@@ -3831,7 +3833,9 @@ impl KvEngine {
                 report_sink(
                     log::Level::Warn,
                     format!(
-                        "could not assess PITR v7 migration capacity on resume; keeping Active legacy WAL format {:?} on Leader I/O: {error:#}",
+                        "could not assess PITR v7 migration capacity on resume; database_path={}, active_segment_id={:?}; keeping Active legacy WAL format {:?} on Leader I/O: {error:#}",
+                        self.inner.path.display(),
+                        state.active_segment_id,
                         active.wal_format_version(),
                     ),
                 );
@@ -3843,6 +3847,8 @@ impl KvEngine {
     fn deferred_v7_migration_resume_message(
         capacity: &crate::pitr::api::PitrV7MigrationCapacityStatus,
         wal_format_version: Option<u16>,
+        database_path: &std::path::Path,
+        active_segment_id: Option<u64>,
     ) -> Option<String> {
         use crate::pitr::api::PitrV7MigrationCapacityDecision;
 
@@ -3850,7 +3856,8 @@ impl KvEngine {
             return None;
         };
         Some(format!(
-            "PITR v7 migration deferred on resume: reason={reason:?}, required_transition_bytes={}, required_total_bytes={}, available_capacity_bytes={}, source_spool_limit_bytes={}; keeping Active legacy WAL format {wal_format_version:?} on Leader I/O",
+            "PITR v7 migration deferred on resume: database_path={}, active_segment_id={active_segment_id:?}, reason={reason:?}, required_transition_bytes={}, required_total_bytes={}, available_capacity_bytes={}, source_spool_limit_bytes={}; keeping Active legacy WAL format {wal_format_version:?} on Leader I/O",
+            database_path.display(),
             capacity.required_transition_bytes,
             capacity.required_total_bytes,
             capacity.available_capacity_bytes,
@@ -18943,12 +18950,9 @@ mod tests {
         let active = engine.inner.state.load().memtable.clone();
         assert!(active.uses_wal_v5());
         let active_segment_id = state.active_segment_id.unwrap();
-        let retained_source_path = active
-            .wal_path()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .join(format!("pitr-{:020}.seal", active_segment_id + 100));
+        let database_path = active.wal_path().unwrap().parent().unwrap().to_path_buf();
+        let retained_source_path =
+            database_path.join(format!("pitr-{:020}.seal", active_segment_id + 100));
         write_random_file(&retained_source_path, 6 * 1024 * 1024, 10)?;
 
         let mut reports = Vec::new();
@@ -18985,6 +18989,8 @@ mod tests {
         assert_eq!(reports.len(), 1);
         let (level, message) = &reports[0];
         assert_eq!(*level, log::Level::Info);
+        assert!(message.contains(&format!("database_path={}", database_path.display())));
+        assert!(message.contains(&format!("active_segment_id=Some({active_segment_id})")));
         assert!(message.contains("reason=InsufficientSourceSpool"));
         assert!(message.contains(&format!(
             "required_transition_bytes={}",
@@ -19047,6 +19053,16 @@ mod tests {
         ));
         assert_eq!(reports.len(), 1);
         assert_eq!(reports[0].0, log::Level::Warn);
+        assert!(
+            reports[0]
+                .1
+                .contains(&format!("database_path={}", database_path.display()))
+        );
+        assert!(
+            reports[0]
+                .1
+                .contains(&format!("active_segment_id=Some({active_segment_id})"))
+        );
         assert!(
             reports[0]
                 .1
