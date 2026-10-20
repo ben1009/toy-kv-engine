@@ -1229,9 +1229,11 @@ It compares that transition requirement with caller-reconstructed retained
 source-spool charges and reports eligible or deferred outcomes. New PITR
 enablement now checks the requested configuration against this estimate before
 repository bootstrap or durable enable intent; disabled-state source files,
-staging files, and recovery temporaries are included. Existing legacy reopen and
-rotation do not consume the assessment yet. The migration module now exposes an
-owned reservation helper that atomically charges its source-spool and
+staging files, and recovery temporaries are included. Legacy reopen now performs
+the read-only assessment and logs deferred reason and capacity details while
+keeping a healthy v5/v6 Active WAL writable with Leader I/O; legacy rotation
+does not consume the assessment yet. The migration module now exposes an owned
+reservation helper that atomically charges its source-spool and
 recovery-workspace requirements on one live ledger. Active v7 recovery uses the
 same filesystem-rounded workspace charge for both its reservation and ledger
 limit. Callers must still reconstruct
