@@ -174,7 +174,9 @@ Deep verification coverage confirms that repeated captures retain a valid source
 chain in both WAL I/O modes. The generic low-level backup capture still rejects
 Active v7 so it cannot persist an Active source reference without its WAL and
 repository. Remaining public write shapes (including other OCC APIs) and broader
-lifecycle rotation remain. PITR manifest replay and
+lifecycle rotation remain. Manifest replay now accepts a legacy v5/v6 source seal
+that installs an empty v7 Active successor boundary; the capacity-gated
+installation path remains unwired. PITR manifest replay and
 snapshots now retain and validate a v7 format marker and the full immutable
 boundary in Sealing obligations;
 seal completion checks the WAL digest against that boundary. A v7 v2 seal
@@ -502,7 +504,7 @@ v6 to v7 transition remain unconnected. Active v7 reservation owners and their
 shared ledger are retained through durable source cleanup and then retired from
 segment bookkeeping.
 
-**Last updated:** 2026-10-19
+**Last updated:** 2026-10-20
 
 **Source baseline:** `30a64fa855126596316ab6b9237e6348b0e41fd2`, which merged RFC 025 in PR #379.
 
@@ -1234,6 +1236,13 @@ plus a v7 migration capacity estimate for Active v5/v6 WALs. The retained charge
 uses both filesystem allocations and the live segment manager's pinned-source
 accounting. The estimate is omitted across lifecycle transitions or source
 reclamation races; this advisory snapshot does not replace the atomic reservation.
+Manifest replay accepts the mixed-format handoff record from a sealed legacy
+source to an empty v7 Active successor, while retaining the source obligation's
+legacy format. Startup can recreate a missing empty successor after revalidating
+the legacy source WAL and seal against the manifest anchor. Validation reserves
+decoded/canonicalized batch and seal workspace before reading, and bounds the
+sidecar by the manifest's WAL image length. Production migration does not yet
+emit this transition.
 
 - Add a shared migration/preflight decision used by enablement, reopen, and
   rotation. Calculate capacity for the largest configured v7 physical image

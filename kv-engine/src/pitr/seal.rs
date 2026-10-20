@@ -189,6 +189,50 @@ impl V5Seal {
             .ok_or_else(|| anyhow::anyhow!("PITR seal sidecar size overflows"))
     }
 
+    /// Bound the peak memory used to validate a retained v5-family WAL against
+    /// its sidecar and rebuild the seal. The whole WAL remains resident while
+    /// decoding and canonicalizing one batch; small entries can need much more
+    /// memory than their encoded bytes. Sidecar reads must first be bounded by
+    /// `max_encoded_len_for_segment(wal_image_bytes)`.
+    pub(crate) fn validation_memory_bytes(wal_image_bytes: u64) -> Result<u64> {
+        ensure!(
+            wal_image_bytes >= WAL_V5_HEADER_LEN as u64
+                && wal_image_bytes <= crate::wal::MAX_WAL_FILE_SIZE
+                && wal_image_bytes.is_multiple_of(WAL_V5_ALIGNMENT as u64),
+            "legacy PITR validation image length is outside its bounds"
+        );
+        let payload_bytes = wal_image_bytes - WAL_V5_HEADER_LEN as u64;
+        let max_batch_data_bytes = payload_bytes
+            .saturating_sub(crate::pitr::WAL_V5_BATCH_HEADER_LEN as u64)
+            .min(u64::try_from(
+                crate::pitr::LIVE_WAL_V5_LIMITS.max_batch_data_bytes,
+            )?);
+        // Match the entry decoder's six-byte minimum before it inspects each
+        // operation's fields. The per-entry allowance covers decoded entries,
+        // canonicalized clones, the point-key map, and spare vector capacity.
+        let max_entry_count = (max_batch_data_bytes / 6).min(u64::try_from(
+            crate::pitr::LIVE_WAL_V5_LIMITS.max_entry_count,
+        )?);
+        let batch_workspace = max_batch_data_bytes
+            .checked_mul(3)
+            .and_then(|bytes| max_entry_count.checked_mul(256)?.checked_add(bytes))
+            .ok_or_else(|| anyhow::anyhow!("legacy PITR decode workspace overflows"))?;
+        // One batch occupies at least one alignment unit. This allowance
+        // covers the loaded and rebuilt indexes, rebuild spans, both encoded
+        // sidecars, and their vector capacity; fixed overhead has separate room.
+        let max_batch_count = payload_bytes / WAL_V5_ALIGNMENT as u64;
+        let seal_workspace = max_batch_count
+            .checked_mul(256)
+            .and_then(|bytes| bytes.checked_add(64 * 1024))
+            .ok_or_else(|| anyhow::anyhow!("legacy PITR seal workspace overflows"))?;
+        let total = wal_image_bytes
+            .checked_add(batch_workspace)
+            .and_then(|bytes| bytes.checked_add(seal_workspace))
+            .ok_or_else(|| anyhow::anyhow!("legacy PITR validation memory overflows"))?;
+
+        Ok(total)
+    }
+
     pub(crate) fn first_commit_ts(&self) -> Option<u64> {
         self.entries.first().map(|entry| entry.commit_ts)
     }

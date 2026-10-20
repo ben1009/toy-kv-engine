@@ -9089,6 +9089,114 @@ impl LsmStorageInner {
         Ok(seal)
     }
 
+    /// Validate a retained legacy source that authorizes a not-yet-installed
+    /// v7 successor. The source seal and WAL bytes must reproduce the logical
+    /// predecessor anchor persisted by `SegmentSealed` before that anchor is
+    /// used in the successor header.
+    #[cfg(target_os = "linux")]
+    fn load_legacy_sealed_recovery_anchor(
+        database_path: &Path,
+        state: &crate::pitr::manifest::PitrState,
+        segment_id: u64,
+        wal_path: &Path,
+    ) -> Result<crate::pitr::SegmentAnchor> {
+        use std::io::Read as _;
+
+        use crate::pitr::manifest::{ObligationState, PersistedChainAnchor, PitrWalFormat};
+
+        let obligation = state
+            .obligations
+            .get(&segment_id)
+            .ok_or_else(|| anyhow!("legacy PITR source has no manifest sealing obligation"))?;
+        ensure!(
+            obligation.state == ObligationState::Sealed
+                && obligation.wal_format == PitrWalFormat::LegacyV5V6
+                && obligation.immutable_boundary.is_none(),
+            "legacy PITR source is not covered by a legacy Sealed obligation"
+        );
+
+        let max_segment_bytes = state
+            .config
+            .as_ref()
+            .ok_or_else(|| anyhow!("PITR state is missing its persisted configuration"))?
+            .max_segment_bytes;
+        let seal_path = database_path.join(format!("pitr-{segment_id:020}.seal"));
+        let seal_file = File::open(&seal_path)
+            .with_context(|| format!("open sealed legacy PITR sidecar {}", seal_path.display()))?;
+        ensure!(
+            seal_file.metadata()?.len()
+                <= crate::pitr::seal::V5Seal::max_encoded_len_for_segment(
+                    obligation.logical_length
+                )?,
+            "legacy PITR source seal exceeds its manifest WAL image bound"
+        );
+        let (format, seal_bytes) =
+            crate::pitr::seal::read_seal_file(seal_file, Some(max_segment_bytes))?;
+        ensure!(
+            format == crate::pitr::seal::SealSidecarFormat::V5,
+            "legacy PITR source has a non-legacy seal sidecar"
+        );
+        let seal = crate::pitr::seal::V5Seal::decode(&seal_bytes)?;
+        ensure!(
+            seal.header.segment_id.0 == segment_id
+                && seal.logical_length == obligation.logical_length,
+            "legacy PITR source seal differs from its manifest obligation"
+        );
+        if let Some(timeline_id) = state.timeline_id {
+            ensure!(
+                seal.header.timeline_id.0 == timeline_id,
+                "legacy PITR source timeline differs from its manifest"
+            );
+        }
+        if let Some(archive_epoch_id) = state.archive_epoch_id {
+            ensure!(
+                seal.header.archive_epoch_id.0 == archive_epoch_id,
+                "legacy PITR source archive epoch differs from its manifest"
+            );
+        }
+
+        let wal_file = File::open(wal_path)
+            .with_context(|| format!("open sealed legacy PITR WAL {}", wal_path.display()))?;
+        let wal_len = wal_file.metadata()?.len();
+        ensure!(
+            wal_len <= crate::wal::MAX_WAL_FILE_SIZE && wal_len == seal.logical_length,
+            "sealed legacy PITR source length differs from its sealing obligation"
+        );
+        let mut wal_bytes = Vec::new();
+        wal_bytes
+            .try_reserve_exact(usize::try_from(wal_len)?)
+            .map_err(|error| anyhow!("reserve legacy PITR recovery source: {error}"))?;
+        wal_file
+            .take(crate::wal::MAX_WAL_FILE_SIZE.saturating_add(1))
+            .read_to_end(&mut wal_bytes)?;
+        ensure!(
+            u64::try_from(wal_bytes.len())? == wal_len,
+            "sealed legacy PITR source changed while reading"
+        );
+        let (verified_seal, verified_bytes) = crate::pitr::seal::build_v5_seal(&wal_bytes)?;
+        ensure!(
+            verified_seal == seal && verified_bytes == seal_bytes,
+            "sealed legacy PITR WAL does not match its sidecar"
+        );
+
+        let anchor = crate::pitr::SegmentAnchor {
+            segment_id: crate::pitr::SegmentId(segment_id),
+            wal_digest: seal.wal_digest,
+            seal_digest: sha2::Sha256::digest(&seal_bytes).into(),
+        };
+        ensure!(
+            state.predecessor_anchor
+                == Some(PersistedChainAnchor::Segment {
+                    segment_id,
+                    wal_digest: anchor.wal_digest,
+                    seal_digest: anchor.seal_digest,
+                }),
+            "legacy PITR source differs from the manifest predecessor anchor"
+        );
+
+        Ok(anchor)
+    }
+
     /// Recreate the empty Active v7 successor when SegmentSealed reached the
     /// manifest but the process stopped before installing the image. The
     /// sealed source and its sidecar prove the predecessor; the persisted
@@ -9116,7 +9224,10 @@ impl LsmStorageInner {
         );
         let mut sources = state.obligations.iter().filter(|(_, obligation)| {
             obligation.state == ObligationState::Sealed
-                && obligation.wal_format == PitrWalFormat::V7
+                && matches!(
+                    obligation.wal_format,
+                    PitrWalFormat::V7 | PitrWalFormat::LegacyV5V6
+                )
                 && obligation.successor_segment_id == boundary.segment_id
         });
         let (&source_segment_id, obligation) = sources
@@ -9126,28 +9237,59 @@ impl LsmStorageInner {
             sources.next().is_none(),
             "multiple sealed v7 obligations name the missing Active successor"
         );
+        let active_image_len = (WAL_V7_HEADER_LEN + WAL_V7_FRAME_LEN) as u64;
+        let legacy_source_buffer_bytes = if obligation.wal_format == PitrWalFormat::LegacyV5V6 {
+            crate::pitr::seal::V5Seal::validation_memory_bytes(obligation.logical_length)?
+        } else {
+            0
+        };
+        // Reconstruct the disk and temporary-memory budget before reading the
+        // legacy source into memory or rebuilding its seal index.
+        let (_, recovery_workspace, _) =
+            Self::reserve_v7_active_recovery_workspace_with_buffer_memory(
+                state,
+                database_path,
+                boundary.segment_id,
+                active_image_len,
+                0,
+                legacy_source_buffer_bytes,
+            )?;
         let source_path = database_path.join(format!("pitr-{source_segment_id:020}.wal"));
-        let mut source_file = File::open(&source_path)
-            .with_context(|| format!("open sealed v7 predecessor WAL {}", source_path.display()))?;
-        let mut source_header_bytes = [0; WAL_V7_HEADER_LEN];
-        std::io::Read::read_exact(&mut source_file, &mut source_header_bytes)?;
-        let source_header = WalV7Header::decode(&source_header_bytes)?;
-        let seal = Self::load_v7_sealed_recovery_source(
-            database_path,
-            state,
-            source_segment_id,
-            &source_path,
-            source_header,
-        )?;
-        ensure!(
-            obligation.immutable_boundary == Some(seal.boundary),
-            "sealed v7 predecessor differs from the obligation for the missing successor"
-        );
-        let seal_bytes = seal.encode()?;
-        let predecessor_anchor = crate::pitr::SegmentAnchor {
-            segment_id: crate::pitr::SegmentId(source_segment_id),
-            wal_digest: seal.boundary.wal_digest,
-            seal_digest: sha2::Sha256::digest(&seal_bytes).into(),
+        let predecessor_anchor = match obligation.wal_format {
+            PitrWalFormat::V7 => {
+                let mut source_file = File::open(&source_path).with_context(|| {
+                    format!("open sealed v7 predecessor WAL {}", source_path.display())
+                })?;
+                let mut source_header_bytes = [0; WAL_V7_HEADER_LEN];
+                std::io::Read::read_exact(&mut source_file, &mut source_header_bytes)?;
+                let source_header = WalV7Header::decode(&source_header_bytes)?;
+                let seal = Self::load_v7_sealed_recovery_source(
+                    database_path,
+                    state,
+                    source_segment_id,
+                    &source_path,
+                    source_header,
+                )?;
+                ensure!(
+                    obligation.immutable_boundary == Some(seal.boundary),
+                    "sealed v7 predecessor differs from the obligation for the missing successor"
+                );
+                let seal_bytes = seal.encode()?;
+                crate::pitr::SegmentAnchor {
+                    segment_id: crate::pitr::SegmentId(source_segment_id),
+                    wal_digest: seal.boundary.wal_digest,
+                    seal_digest: sha2::Sha256::digest(&seal_bytes).into(),
+                }
+            }
+            PitrWalFormat::LegacyV5V6 => Self::load_legacy_sealed_recovery_anchor(
+                database_path,
+                state,
+                source_segment_id,
+                &source_path,
+            )?,
+            PitrWalFormat::Unspecified => {
+                anyhow::bail!("missing v7 Active successor has an unspecified predecessor format")
+            }
         };
         ensure!(
             state.predecessor_anchor
@@ -9171,14 +9313,6 @@ impl LsmStorageInner {
         );
         Self::validate_v7_active_recovery_header(state, &header.encode()?)?;
 
-        let active_image_len = (WAL_V7_HEADER_LEN + WAL_V7_FRAME_LEN) as u64;
-        let (_, recovery_workspace, _) = Self::reserve_v7_active_recovery_workspace(
-            state,
-            database_path,
-            boundary.segment_id,
-            active_image_len,
-            0,
-        )?;
         crate::wal::v7::install::create_empty_active_image(&active_path, header)?;
         drop(recovery_workspace);
 
@@ -9194,6 +9328,28 @@ impl LsmStorageInner {
         active_segment_id: u64,
         source_file_len: u64,
         source_file_allocated_bytes: u64,
+    ) -> Result<(
+        Arc<crate::wal::v7::admission::WalV7RetainedResources>,
+        crate::wal::v7::admission::WalV7Reservation,
+        u64,
+    )> {
+        Self::reserve_v7_active_recovery_workspace_with_buffer_memory(
+            state,
+            database_path,
+            active_segment_id,
+            source_file_len,
+            source_file_allocated_bytes,
+            0,
+        )
+    }
+
+    fn reserve_v7_active_recovery_workspace_with_buffer_memory(
+        state: &crate::pitr::manifest::PitrState,
+        database_path: &Path,
+        active_segment_id: u64,
+        source_file_len: u64,
+        source_file_allocated_bytes: u64,
+        temporary_buffer_memory_bytes: u64,
     ) -> Result<(
         Arc<crate::wal::v7::admission::WalV7RetainedResources>,
         crate::wal::v7::admission::WalV7Reservation,
@@ -9256,8 +9412,14 @@ impl LsmStorageInner {
             .checked_mul(2)
             .ok_or_else(|| anyhow!("v7 buffer-memory limit overflows"))?
             .max(max_seal_preparation_memory_bytes);
+        // A retained legacy source may be larger than the current v7 segment
+        // limit. Its recovery-time validation is a maintenance operation, so
+        // protect enough extra headroom for its bounded source/seal buffers
+        // without increasing the ordinary write admission limit.
+        let maintenance_buffer_memory_reserve =
+            max_seal_preparation_memory_bytes.max(temporary_buffer_memory_bytes);
         let max_buffer_memory_bytes = ordinary_buffer_memory_bytes
-            .checked_add(max_seal_preparation_memory_bytes)
+            .checked_add(maintenance_buffer_memory_reserve)
             .ok_or_else(|| anyhow!("v7 maintenance buffer-memory limit overflows"))?;
         // A coalesced group can share one terminal FRONTIER across every
         // one-frame DATA batch. Reserve the index for that physical maximum:
@@ -9278,7 +9440,7 @@ impl LsmStorageInner {
                 max_buffer_memory_bytes,
                 max_seal_index_bytes,
             },
-            max_seal_preparation_memory_bytes,
+            maintenance_buffer_memory_reserve,
         )?;
         let retained = WalV7RetainedResources::new(ledger.clone());
 
@@ -9290,19 +9452,24 @@ impl LsmStorageInner {
                 obligation.state,
                 ObligationState::Sealing | ObligationState::Sealed
             ) {
-                let logical_wal_bytes = if obligation.wal_format
-                    == crate::pitr::manifest::PitrWalFormat::V7
-                {
-                    obligation
-                            .logical_length
-                            .checked_sub(active_fixed_bytes)
-                            .ok_or_else(|| {
-                                anyhow!(
-                                    "v7 PITR obligation {segment_id} is shorter than its header and generation-zero frontier"
-                                )
-                            })?
-                } else {
-                    obligation.logical_length
+                let logical_wal_bytes = match obligation.wal_format {
+                    crate::pitr::manifest::PitrWalFormat::V7 => obligation
+                        .logical_length
+                        .checked_sub(active_fixed_bytes)
+                        .ok_or_else(|| {
+                            anyhow!(
+                                "v7 PITR obligation {segment_id} is shorter than its header and generation-zero frontier"
+                            )
+                        })?,
+                    crate::pitr::manifest::PitrWalFormat::LegacyV5V6 => obligation
+                        .logical_length
+                        .checked_sub(crate::pitr::WAL_V5_HEADER_LEN as u64)
+                        .ok_or_else(|| {
+                            anyhow!(
+                                "legacy PITR obligation {segment_id} is shorter than its file header"
+                            )
+                        })?,
+                    crate::pitr::manifest::PitrWalFormat::Unspecified => obligation.logical_length,
                 };
                 retained.reserve_obligation_logical(segment_id, logical_wal_bytes)?;
             }
@@ -9347,7 +9514,7 @@ impl LsmStorageInner {
         )?;
 
         let retained_source_bytes = source_file_len.saturating_sub(active_fixed_bytes);
-        let workspace = ledger.reserve(WalV7ResourceCharge {
+        let workspace = ledger.reserve_maintenance(WalV7ResourceCharge {
             // A durable Sealing obligation already accounts these logical WAL
             // bytes. The workspace still reserves the physical source image and
             // replacement capacity while strict recovery runs.
@@ -9358,6 +9525,7 @@ impl LsmStorageInner {
             },
             source_spool_bytes: source_file_allocated_bytes.saturating_sub(active_fixed_bytes),
             recovery_workspace_bytes: max_recovery_workspace_bytes,
+            buffer_memory_bytes: temporary_buffer_memory_bytes,
             ..WalV7ResourceCharge::default()
         })?;
 
@@ -19546,6 +19714,331 @@ mod tests {
             crate::pitr::api::PitrResumeOutcome::Resumed
         ));
         assert_eq!(engine.get(b"v7-key")?, Some(Bytes::from_static(b"v")));
+        engine.close_storage()?;
+
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn v7_sealed_recovery_recreates_successor_from_legacy_source() -> anyhow::Result<()> {
+        use crate::{
+            manifest::{Manifest, ManifestRecord},
+            pitr::manifest::{
+                ActiveBoundary, PersistedChainAnchor, PersistedCommitAnchor, PersistedPitrConfig,
+                PersistedRecordedAt, PitrManifestRecord,
+            },
+            pitr::{
+                ArchiveEpochId, ChainAnchor, CommitTimeHighWater, LIVE_WAL_V5_LIMITS, RecordedAt,
+                SegmentAnchor, SegmentId, TimelineId, WAL_V5_HEADER_LEN, WalBatch, WalEntry,
+                WalV5Header, commit_time_entry_digest, encode_v5_batch, encode_v5_file_header,
+                seal::{V5Seal, build_v5_seal},
+            },
+            wal::v7::codec::{WAL_V7_HEADER_LEN, WalV7Header},
+        };
+        use sha2::Digest;
+
+        let directory = tempdir()?;
+        let database = directory.path().join("db");
+        std::fs::create_dir_all(&database)?;
+        let options = LsmStorageOptions {
+            enable_wal: true,
+            ..LsmStorageOptions::default_for_test()
+        };
+        let timeline_id = [2; 16];
+        let archive_epoch_id = [3; 16];
+        let first_source_segment_id = 1;
+        let source_segment_id = 2;
+        let successor_segment_id = 3;
+        let legacy_value = vec![b'x'; 60 * 1024];
+        let secondary_value = vec![b'y'; 60 * 1024];
+        let tertiary_value = vec![b'z'; 60 * 1024];
+        let inline_value = |value: &[u8]| {
+            let mut encoded = vec![crate::vlog::KvKind::Inline as u8];
+            encoded.extend_from_slice(value);
+            encoded
+        };
+        let source_recorded_at = RecordedAt {
+            secs: 1_700_000_000,
+            nanos: 123,
+        };
+        let first_source_header = WalV5Header {
+            wal_format_version: crate::pitr::WAL_V5_VERSION,
+            timeline_id: TimelineId(timeline_id),
+            archive_epoch_id: ArchiveEpochId(archive_epoch_id),
+            segment_id: SegmentId(first_source_segment_id),
+            predecessor: ChainAnchor::Genesis {
+                archive_epoch_id: ArchiveEpochId(archive_epoch_id),
+            },
+        };
+        let first_batch = WalBatch {
+            commit_ts: 7,
+            recorded_at: source_recorded_at,
+            entries: vec![WalEntry::Put {
+                key: b"first-legacy-key".to_vec(),
+                value: vec![crate::vlog::KvKind::Inline as u8, b'a'],
+            }],
+        };
+        let mut first_source_wal = encode_v5_file_header(first_source_header)?.to_vec();
+        first_source_wal.extend_from_slice(&encode_v5_batch(&first_batch, LIVE_WAL_V5_LIMITS)?);
+        let (first_source_seal, first_source_seal_bytes) = build_v5_seal(&first_source_wal)?;
+        let first_source_anchor = SegmentAnchor {
+            segment_id: SegmentId(first_source_segment_id),
+            wal_digest: first_source_seal.wal_digest,
+            seal_digest: sha2::Sha256::digest(&first_source_seal_bytes).into(),
+        };
+        let source_header = WalV5Header {
+            wal_format_version: crate::pitr::WAL_V5_VERSION,
+            timeline_id: TimelineId(timeline_id),
+            archive_epoch_id: ArchiveEpochId(archive_epoch_id),
+            segment_id: SegmentId(source_segment_id),
+            predecessor: ChainAnchor::Segment(first_source_anchor),
+        };
+        let batch = WalBatch {
+            commit_ts: 8,
+            recorded_at: source_recorded_at,
+            entries: vec![
+                WalEntry::Put {
+                    key: b"legacy-key".to_vec(),
+                    value: inline_value(&legacy_value),
+                },
+                WalEntry::Put {
+                    key: b"secondary-key".to_vec(),
+                    value: inline_value(&secondary_value),
+                },
+                WalEntry::Put {
+                    key: b"tertiary-key".to_vec(),
+                    value: inline_value(&tertiary_value),
+                },
+            ],
+        };
+        let mut source_wal = encode_v5_file_header(source_header)?.to_vec();
+        source_wal.extend_from_slice(&encode_v5_batch(&batch, LIVE_WAL_V5_LIMITS)?);
+        let small_entry_batch = WalBatch {
+            commit_ts: 9,
+            recorded_at: source_recorded_at,
+            entries: (0..16_384_u32)
+                .map(|index| WalEntry::PointDelete {
+                    key: index.to_be_bytes().to_vec(),
+                })
+                .collect(),
+        };
+        source_wal.extend_from_slice(&encode_v5_batch(&small_entry_batch, LIVE_WAL_V5_LIMITS)?);
+        assert_eq!(source_wal.len() as u64 % WAL_V5_HEADER_LEN as u64, 0);
+        assert!(source_wal.len() > 16 * 1024);
+        let (source_seal, source_seal_bytes) = build_v5_seal(&source_wal)?;
+        let max_segment_bytes = 16 * 1024_u64;
+        let ordinary_buffer_memory_bytes = max_segment_bytes
+            .checked_mul(2)
+            .ok_or_else(|| anyhow::anyhow!("test buffer limit overflow"))?
+            .max(crate::pitr::seal::V7Seal::max_preparation_memory_bytes(
+                max_segment_bytes,
+            )?);
+        // The decoded and canonicalized entry vectors coexist. Even their
+        // storage alone exceeds the previous twice-image-size reservation.
+        let entry_vectors_minimum_bytes =
+            u64::try_from(2 * small_entry_batch.entries.len() * std::mem::size_of::<WalEntry>())?;
+        assert!(entry_vectors_minimum_bytes > 2 * source_seal.logical_length);
+        let legacy_source_buffer_bytes =
+            V5Seal::validation_memory_bytes(source_seal.logical_length)?;
+        assert!(
+            legacy_source_buffer_bytes > source_seal.logical_length + entry_vectors_minimum_bytes
+        );
+        assert!(legacy_source_buffer_bytes > ordinary_buffer_memory_bytes);
+
+        let predecessor_anchor = SegmentAnchor {
+            segment_id: SegmentId(source_segment_id),
+            wal_digest: source_seal.wal_digest,
+            seal_digest: sha2::Sha256::digest(&source_seal_bytes).into(),
+        };
+        let successor_header = WalV7Header {
+            timeline_id: TimelineId(timeline_id),
+            archive_epoch_id: ArchiveEpochId(archive_epoch_id),
+            segment_id: SegmentId(successor_segment_id),
+            predecessor: ChainAnchor::Segment(predecessor_anchor),
+            incarnation: [8; 16],
+        };
+        let successor_boundary = ActiveBoundary {
+            timeline_id,
+            archive_epoch_id,
+            segment_id: successor_segment_id,
+            incarnation: successor_header.incarnation,
+            ticket_end: 0,
+            durable_end: WAL_V7_HEADER_LEN as u64,
+            last_commit_ts: 0,
+            prefix_digest: successor_header.digest()?,
+        };
+        let recorded_at = PersistedRecordedAt {
+            secs: source_recorded_at.secs,
+            nanos: source_recorded_at.nanos,
+        };
+        let max_unarchived_bytes = first_source_seal
+            .logical_length
+            .checked_sub(WAL_V5_HEADER_LEN as u64)
+            .and_then(|bytes| {
+                source_seal
+                    .logical_length
+                    .checked_sub(WAL_V5_HEADER_LEN as u64)
+                    .and_then(|source_bytes| bytes.checked_add(source_bytes))
+            })
+            .ok_or_else(|| anyhow::anyhow!("test legacy payload budget underflow"))?;
+        let full_legacy_images = first_source_seal
+            .logical_length
+            .checked_add(source_seal.logical_length)
+            .ok_or_else(|| anyhow::anyhow!("test legacy image length overflow"))?;
+        assert!(full_legacy_images > max_unarchived_bytes);
+        let manifest_records = [
+            ManifestRecord::FormatVersion(crate::manifest::MANIFEST_FORMAT_VERSION),
+            ManifestRecord::NewPitrMemtable {
+                id: 0,
+                segment_id: first_source_segment_id,
+            },
+            ManifestRecord::NewPitrMemtable {
+                id: 1,
+                segment_id: source_segment_id,
+            },
+            ManifestRecord::Pitr(PitrManifestRecord::EnableIntent {
+                repository_id: [1; 16],
+                timeline_id,
+                archive_epoch_id,
+                config: PersistedPitrConfig {
+                    archive_interval_ms: 1_000,
+                    max_segment_bytes,
+                    max_unarchived_bytes,
+                    max_source_spool_bytes: 1024 * 1024,
+                },
+            }),
+            ManifestRecord::Pitr(PitrManifestRecord::EnableComplete {
+                active_segment_id: first_source_segment_id,
+            }),
+            ManifestRecord::Pitr(PitrManifestRecord::SealStarted {
+                segment_id: first_source_segment_id,
+                successor_segment_id: source_segment_id,
+                logical_length: first_source_seal.logical_length,
+                immutable_boundary: None,
+            }),
+            ManifestRecord::Pitr(PitrManifestRecord::SegmentSealed {
+                segment_id: first_source_segment_id,
+                segment_anchor: PersistedChainAnchor::Segment {
+                    segment_id: first_source_segment_id,
+                    wal_digest: first_source_anchor.wal_digest,
+                    seal_digest: first_source_anchor.seal_digest,
+                },
+                last_recorded_at: Some(recorded_at),
+                last_commit_anchor: Some(PersistedCommitAnchor {
+                    segment_id: first_source_segment_id,
+                    commit_ts: first_batch.commit_ts,
+                    recorded_at,
+                    entry_digest: commit_time_entry_digest(CommitTimeHighWater {
+                        archive_epoch_id: ArchiveEpochId(archive_epoch_id),
+                        segment_id: SegmentId(first_source_segment_id),
+                        commit_ts: first_batch.commit_ts,
+                        recorded_at: source_recorded_at,
+                        entry_digest: [0; 32],
+                    }),
+                }),
+                successor_active_boundary: None,
+            }),
+            ManifestRecord::Pitr(PitrManifestRecord::SealStarted {
+                segment_id: source_segment_id,
+                successor_segment_id,
+                logical_length: source_seal.logical_length,
+                immutable_boundary: None,
+            }),
+            ManifestRecord::Pitr(PitrManifestRecord::SegmentSealed {
+                segment_id: source_segment_id,
+                segment_anchor: PersistedChainAnchor::Segment {
+                    segment_id: source_segment_id,
+                    wal_digest: predecessor_anchor.wal_digest,
+                    seal_digest: predecessor_anchor.seal_digest,
+                },
+                last_recorded_at: Some(recorded_at),
+                last_commit_anchor: Some(PersistedCommitAnchor {
+                    segment_id: source_segment_id,
+                    commit_ts: small_entry_batch.commit_ts,
+                    recorded_at,
+                    entry_digest: commit_time_entry_digest(CommitTimeHighWater {
+                        archive_epoch_id: ArchiveEpochId(archive_epoch_id),
+                        segment_id: SegmentId(source_segment_id),
+                        commit_ts: small_entry_batch.commit_ts,
+                        recorded_at: crate::pitr::RecordedAt {
+                            secs: recorded_at.secs,
+                            nanos: recorded_at.nanos,
+                        },
+                        entry_digest: [0; 32],
+                    }),
+                }),
+                successor_active_boundary: Some(successor_boundary),
+            }),
+        ];
+        let manifest = Manifest::create(database.join("MANIFEST"))?;
+        manifest.add_records_when_init(&manifest_records)?;
+        drop(manifest);
+
+        std::fs::write(
+            database.join(format!("pitr-{first_source_segment_id:020}.wal")),
+            first_source_wal,
+        )?;
+        std::fs::write(
+            database.join(format!("pitr-{first_source_segment_id:020}.seal")),
+            &first_source_seal_bytes,
+        )?;
+        std::fs::write(
+            database.join(format!("pitr-{source_segment_id:020}.wal")),
+            source_wal,
+        )?;
+        std::fs::write(
+            database.join(format!("pitr-{source_segment_id:020}.seal")),
+            &source_seal_bytes,
+        )?;
+        let successor_path = database.join(format!("pitr-{successor_segment_id:020}.wal"));
+        assert!(!successor_path.exists());
+
+        let source_seal_path = database.join(format!("pitr-{source_segment_id:020}.seal"));
+        let mut oversized_seal = source_seal_bytes.clone();
+        oversized_seal.resize(
+            usize::try_from(V5Seal::max_encoded_len_for_segment(
+                source_seal.logical_length,
+            )?)? + 1,
+            0,
+        );
+        std::fs::write(&source_seal_path, oversized_seal)?;
+        let manifest_before = std::fs::read(database.join("MANIFEST"))?;
+        let error = match KvEngine::open(&database, options.clone()) {
+            Ok(engine) => {
+                engine.close_storage()?;
+                anyhow::bail!("accepted an oversized legacy predecessor seal");
+            }
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("manifest WAL image bound"));
+        assert!(!successor_path.exists());
+        assert_eq!(std::fs::read(database.join("MANIFEST"))?, manifest_before);
+        std::fs::write(&source_seal_path, &source_seal_bytes)?;
+
+        let engine = KvEngine::open(&database, options)?;
+        assert!(successor_path.is_file());
+        let installed_header = WalV7Header::decode(&std::fs::read(&successor_path)?)?;
+        assert_eq!(installed_header, successor_header);
+        assert!(engine.inner.state.load().memtable.uses_v7_wal());
+        assert_eq!(
+            LsmStorageInner::pitr_segment_of(engine.inner.state.load().memtable.as_ref()),
+            Some(successor_segment_id)
+        );
+        assert_eq!(
+            engine.get(b"first-legacy-key")?,
+            Some(Bytes::from_static(b"a"))
+        );
+        assert_eq!(engine.get(b"legacy-key")?, Some(Bytes::from(legacy_value)));
+        assert_eq!(engine.get(&0_u32.to_be_bytes())?, None);
+        assert_eq!(
+            engine.inner.pitr_state.lock().obligations[&first_source_segment_id].wal_format,
+            crate::pitr::manifest::PitrWalFormat::LegacyV5V6
+        );
+        assert_eq!(
+            engine.inner.pitr_state.lock().obligations[&source_segment_id].wal_format,
+            crate::pitr::manifest::PitrWalFormat::LegacyV5V6
+        );
         engine.close_storage()?;
 
         Ok(())
