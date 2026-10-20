@@ -3959,7 +3959,198 @@ impl KvEngine {
             state = self.pitr_manifest_state.lock().clone();
         }
 
+        let active = self.inner.state.load().memtable.clone();
+        let active_memtable_segment = LsmStorageInner::pitr_segment_of(&active);
+        if let Some((&source_segment_id, _)) =
+            state.obligations.iter().find(|(source_id, obligation)| {
+                obligation.state == ObligationState::Sealed
+                    && obligation.wal_format == PitrWalFormat::LegacyV5V6
+                    && Some(obligation.successor_segment_id) == state.active_segment_id
+                    && active_memtable_segment == Some(**source_id)
+            })
+        {
+            let boundary = state
+                .active_boundary
+                .ok_or_else(|| anyhow!("sealed legacy migration has no v7 Active boundary"))?;
+            ensure!(
+                active.uses_wal_v5() && Some(boundary.segment_id) == state.active_segment_id,
+                "sealed legacy migration source is not paired with its v7 Active successor"
+            );
+            sequencer.stop_commit_admission_and_capture()?;
+            self.install_sealed_legacy_v7_successor(&state, source_segment_id)?;
+            state = self.pitr_manifest_state.lock().clone();
+        }
+
         Ok(state)
+    }
+
+    /// Install the manifest-authorized empty v7 successor for a sealed legacy
+    /// source that remains the current memtable after a failed handoff.
+    #[cfg(target_os = "linux")]
+    fn install_sealed_legacy_v7_successor(
+        &self,
+        state: &crate::pitr::manifest::PitrState,
+        source_segment_id: u64,
+    ) -> Result<()> {
+        use crate::pitr::manifest::{PersistedChainAnchor, PitrWalFormat};
+        use crate::wal::v7::{
+            admission::WalV7ReservationOwner,
+            codec::{WAL_V7_FRAME_LEN, WAL_V7_HEADER_LEN, WalV7Header},
+            install::recover_and_install_active_with_limits,
+            recovery::WalV7RecoveryAuthority,
+        };
+
+        let active = self.inner.state.load().memtable.clone();
+        let obligation = state
+            .obligations
+            .get(&source_segment_id)
+            .ok_or_else(|| anyhow!("sealed legacy migration source has no obligation"))?;
+        let boundary = state
+            .active_boundary
+            .ok_or_else(|| anyhow!("sealed legacy migration has no Active boundary"))?;
+        ensure!(
+            obligation.state == crate::pitr::manifest::ObligationState::Sealed
+                && obligation.wal_format == PitrWalFormat::LegacyV5V6
+                && obligation.successor_segment_id == boundary.segment_id
+                && state.active_segment_id == Some(boundary.segment_id)
+                && active.uses_wal_v5()
+                && LsmStorageInner::pitr_segment_of(&active) == Some(source_segment_id),
+            "legacy migration obligation does not authorize the current Active memtable"
+        );
+        ensure!(
+            boundary.ticket_end == 0
+                && boundary.durable_end == WAL_V7_HEADER_LEN as u64
+                && boundary.last_commit_ts == 0,
+            "legacy migration successor boundary is not empty"
+        );
+
+        let source_wal_path = self
+            .inner
+            .path
+            .join(format!("pitr-{source_segment_id:020}.wal"));
+        let successor_path = self
+            .inner
+            .path
+            .join(format!("pitr-{:020}.wal", boundary.segment_id));
+        if !successor_path.try_exists()? {
+            ensure!(
+                LsmStorageInner::recreate_missing_sealed_v7_successor(
+                    &self.inner.path,
+                    state,
+                    boundary,
+                )?,
+                "sealed legacy migration successor disappeared during recovery"
+            );
+        }
+        let source_metadata = fs::symlink_metadata(&successor_path)?;
+        ensure!(
+            source_metadata.file_type().is_file(),
+            "sealed legacy migration successor is not a regular file"
+        );
+        let source_len = source_metadata.len();
+        let source_allocated_bytes = LsmStorageInner::filesystem_allocated_bytes(&source_metadata)?;
+        let legacy_source_buffer_bytes =
+            crate::pitr::seal::V5Seal::validation_memory_bytes(obligation.logical_length)?;
+        let (retained_resources, recovery_workspace, max_seal_index_bytes) =
+            LsmStorageInner::reserve_v7_active_recovery_workspace_with_buffer_memory(
+                state,
+                &self.inner.path,
+                boundary.segment_id,
+                source_len,
+                source_allocated_bytes,
+                legacy_source_buffer_bytes,
+            )?;
+        let source_anchor = LsmStorageInner::load_legacy_sealed_recovery_anchor(
+            &self.inner.path,
+            state,
+            source_segment_id,
+            &source_wal_path,
+        )?;
+        ensure!(
+            state.predecessor_anchor
+                == Some(PersistedChainAnchor::Segment {
+                    segment_id: source_segment_id,
+                    wal_digest: source_anchor.wal_digest,
+                    seal_digest: source_anchor.seal_digest,
+                }),
+            "sealed legacy migration source differs from its Active successor anchor"
+        );
+        let predecessor = crate::pitr::ChainAnchor::Segment(source_anchor);
+        let header = WalV7Header {
+            timeline_id: crate::pitr::TimelineId(boundary.timeline_id),
+            archive_epoch_id: crate::pitr::ArchiveEpochId(boundary.archive_epoch_id),
+            segment_id: crate::pitr::SegmentId(boundary.segment_id),
+            predecessor,
+            incarnation: boundary.incarnation,
+        };
+        ensure!(
+            header.digest()? == boundary.prefix_digest,
+            "sealed legacy migration successor header differs from its Active boundary"
+        );
+
+        let max_segment_bytes = state
+            .config
+            .as_ref()
+            .ok_or_else(|| anyhow!("PITR state has no persisted configuration"))?
+            .max_segment_bytes;
+        let recovery = recover_and_install_active_with_limits(
+            &successor_path,
+            WalV7RecoveryAuthority::Active {
+                predecessor,
+                durable_anchors: vec![boundary],
+            },
+            max_segment_bytes,
+            max_seal_index_bytes,
+        )?;
+        ensure!(
+            recovery.selection.active_boundary.ticket_end == 0
+                && recovery.selection.active_boundary.durable_end == WAL_V7_HEADER_LEN as u64
+                && recovery.selection.active_boundary.last_commit_ts == 0
+                && recovery.installed.image_len == (WAL_V7_HEADER_LEN + WAL_V7_FRAME_LEN) as u64,
+            "sealed legacy migration successor is not the canonical empty v7 image"
+        );
+        let owner = Arc::new(WalV7ReservationOwner::new_with_retained_resources(
+            Arc::clone(&retained_resources),
+            &recovery.installed,
+        )?);
+        let (successor, recovered_commit_ts) = MemTable::recover_from_v7_active(
+            self.inner.next_sst_id(),
+            self.inner.vlog.is_some(),
+            &successor_path,
+            recovery.installed,
+            max_segment_bytes,
+            owner,
+            self.inner.wal_io_mode,
+        )?;
+        drop(recovery_workspace);
+        ensure!(
+            recovered_commit_ts == 0,
+            "sealed legacy migration successor unexpectedly contains committed batches"
+        );
+        successor.set_write_profile(self.inner.write_profile.clone());
+
+        // Lock order is segment manager, engine manifest, then Active memtable.
+        let mut segments = self.pitr_segments.lock();
+        let state_lock = self.inner.state_lock.lock();
+        let successor_owner = self.inner.install_pitr_v7_migration_successor(
+            source_segment_id,
+            boundary,
+            successor,
+            &state_lock,
+        )?;
+        segments
+            .as_mut()
+            .ok_or_else(|| anyhow!("PITR segment manager is not initialized"))?
+            .retain_v7_reservation_owner(boundary.segment_id, successor_owner)?;
+        self.inner.pitr_next_segment_id.store(
+            boundary
+                .segment_id
+                .checked_add(1)
+                .ok_or_else(|| anyhow!("PITR segment ID exhausted"))?,
+            Ordering::Release,
+        );
+
+        Ok(())
     }
 
     /// Advance the in-memory segment bookkeeping, so reported status tracks the
@@ -16556,6 +16747,101 @@ impl LsmStorageInner {
         Ok(owner)
     }
 
+    /// Finish an already sealed legacy-to-v7 handoff while commit admission is
+    /// stopped. The manifest's empty Active boundary and the sealed legacy
+    /// source together authorize replacing the source memtable with its v7
+    /// successor.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn install_pitr_v7_migration_successor(
+        &self,
+        source_segment_id: u64,
+        successor_boundary: crate::pitr::manifest::ActiveBoundary,
+        successor: mem_table::MemTable,
+        state_lock: &MutexGuard<'_, ()>,
+    ) -> Result<Arc<crate::wal::v7::admission::WalV7ReservationOwner>> {
+        use crate::pitr::manifest::{ObligationState, PitrWalFormat};
+
+        ensure!(self.options.enable_wal, "PITR successor requires WAL");
+        self.ensure_memtable_rotation_runtime_healthy()?;
+
+        let state = self.pitr_state.lock().clone();
+        ensure!(
+            state.mode == crate::pitr::manifest::PitrMode::Enabled
+                && state.active_segment_id == Some(successor_boundary.segment_id)
+                && state.active_boundary == Some(successor_boundary),
+            "v7 migration successor differs from the Active manifest boundary"
+        );
+        ensure!(
+            successor_boundary.ticket_end == 0
+                && successor_boundary.durable_end
+                    == crate::wal::v7::codec::WAL_V7_HEADER_LEN as u64
+                && successor_boundary.last_commit_ts == 0,
+            "v7 migration successor is not an empty Active image"
+        );
+        let obligation = state
+            .obligations
+            .get(&source_segment_id)
+            .ok_or_else(|| anyhow!("v7 migration source has no sealed obligation"))?;
+        ensure!(
+            obligation.state == ObligationState::Sealed
+                && obligation.wal_format == PitrWalFormat::LegacyV5V6
+                && obligation.successor_segment_id == successor_boundary.segment_id
+                && obligation.migration_successor_boundary.is_none(),
+            "v7 migration source is not durably sealed to this successor"
+        );
+        ensure!(
+            self.mvcc
+                .as_ref()
+                .is_some_and(|sequencer| !sequencer.commit_admission_is_open()),
+            "v7 migration successor requires stopped commit admission"
+        );
+        ensure!(
+            successor.uses_v7_wal()
+                && Self::pitr_segment_of(&successor) == Some(successor_boundary.segment_id),
+            "v7 migration successor WAL has a different segment identity"
+        );
+        let (empty_boundary, current_boundary) = successor.v7_active_boundaries()?;
+        ensure!(
+            empty_boundary == successor_boundary && current_boundary == successor_boundary,
+            "installed v7 migration successor differs from its persisted Active boundary"
+        );
+
+        let successor_owner = successor
+            .wal_v7_reservation_owner()
+            .ok_or_else(|| anyhow!("v7 migration successor has no reservation owner"))?;
+        let _active_guard = self.active_memtable_lock.write();
+        let current = self.state.load().memtable.clone();
+        ensure!(
+            current.uses_wal_v5() && Self::pitr_segment_of(&current) == Some(source_segment_id),
+            "v7 migration source is no longer the active legacy memtable"
+        );
+        self.manifest
+            .as_ref()
+            .ok_or_else(|| anyhow!("manifest is not initialized"))?
+            .ensure_durability_certain()?;
+        self.sync_dir()?;
+        self.manifest
+            .as_ref()
+            .ok_or_else(|| anyhow!("manifest is not initialized"))?
+            .add_record(
+                state_lock,
+                ManifestRecord::NewPitrMemtable {
+                    id: successor.id(),
+                    segment_id: successor_boundary.segment_id,
+                },
+            )?;
+        self.install_memtable_successor_locked(successor)?;
+        self.pitr_next_segment_id.fetch_max(
+            successor_boundary
+                .segment_id
+                .checked_add(1)
+                .ok_or_else(|| anyhow!("PITR segment ID exhausted"))?,
+            Ordering::AcqRel,
+        );
+
+        Ok(successor_owner)
+    }
+
     #[cfg(target_os = "linux")]
     fn install_post_pitr_wal(&self) -> Result<()> {
         ensure!(self.options.enable_wal, "PITR disable requires WAL");
@@ -20501,7 +20787,7 @@ mod tests {
         assert_eq!(std::fs::read(database.join("MANIFEST"))?, manifest_before);
         std::fs::write(&source_seal_path, &source_seal_bytes)?;
 
-        let engine = KvEngine::open(&database, options)?;
+        let engine = KvEngine::open(&database, options.clone())?;
         assert!(successor_path.is_file());
         let installed_header = WalV7Header::decode(&std::fs::read(&successor_path)?)?;
         assert_eq!(installed_header, successor_header);
@@ -20514,7 +20800,10 @@ mod tests {
             engine.get(b"first-legacy-key")?,
             Some(Bytes::from_static(b"a"))
         );
-        assert_eq!(engine.get(b"legacy-key")?, Some(Bytes::from(legacy_value)));
+        assert_eq!(
+            engine.get(b"legacy-key")?,
+            Some(Bytes::from(legacy_value.clone()))
+        );
         assert_eq!(engine.get(&0_u32.to_be_bytes())?, None);
         assert_eq!(
             engine.inner.pitr_state.lock().obligations[&first_source_segment_id].wal_format,
@@ -20524,7 +20813,61 @@ mod tests {
             engine.inner.pitr_state.lock().obligations[&source_segment_id].wal_format,
             crate::pitr::manifest::PitrWalFormat::LegacyV5V6
         );
+
+        // Recreate the in-process crash window after SegmentSealed: the
+        // manifest and empty v7 image are durable, but the legacy source is
+        // still the current memtable and has no registered v7 successor.
+        let mut storage_state = engine.inner.state.load().as_ref().clone();
+        let source_index = storage_state
+            .imm_memtables
+            .iter()
+            .position(|memtable| {
+                LsmStorageInner::pitr_segment_of(memtable.as_ref()) == Some(source_segment_id)
+            })
+            .ok_or_else(|| anyhow::anyhow!("sealed legacy source memtable is missing"))?;
+        let legacy_source = storage_state.imm_memtables.remove(source_index);
+        storage_state.memtable.close_parallel_wal()?;
+        storage_state.memtable.retire_wal_ring();
+        storage_state.memtable = legacy_source;
+        storage_state.imm_memtables.retain(|memtable| {
+            LsmStorageInner::pitr_segment_of(memtable.as_ref()) != Some(successor_segment_id)
+        });
+        engine.inner.state.store(Arc::new(storage_state));
+        // Startup recovery has already registered the empty v7 successor. Replace
+        // that registration with the coherent pre-handoff snapshot represented by
+        // the rewound runtime state before exercising the in-process recovery.
+        engine.inner.ensure_manifest_v7()?;
+
+        let migration_state = engine.pitr_manifest_state.lock().clone();
+        let config = migration_state.config.as_ref().unwrap();
+        *engine.pitr_segments.lock() = Some(
+            crate::pitr::segment::PitrSegmentManager::from_recovered_state(
+                successor_segment_id,
+                migration_state.next_segment_id,
+                u64::try_from(WAL_V7_HEADER_LEN + crate::wal::v7::codec::WAL_V7_FRAME_LEN)?,
+                config.max_source_spool_bytes,
+                &migration_state.obligations,
+            )?,
+        );
+        engine.resume_v7_successor_install(migration_state)?;
+        assert!(engine.inner.state.load().memtable.uses_v7_wal());
+        assert_eq!(
+            LsmStorageInner::pitr_segment_of(engine.inner.state.load().memtable.as_ref()),
+            Some(successor_segment_id)
+        );
+        assert_eq!(
+            engine.get(b"legacy-key")?,
+            Some(Bytes::from(legacy_value.clone()))
+        );
         engine.close_storage()?;
+        drop(engine);
+
+        let reopened = KvEngine::open(&database, options)?;
+        assert_eq!(
+            reopened.get(b"legacy-key")?,
+            Some(Bytes::from(legacy_value))
+        );
+        reopened.close_storage()?;
 
         Ok(())
     }
