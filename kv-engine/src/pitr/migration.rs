@@ -49,7 +49,8 @@ pub(crate) enum V7MigrationCapacityDecision {
 /// empty v7 successor image and its atomic-install staging extent, and terminal
 /// manifest headroom. File charges are rounded to the filesystem allocation
 /// unit. `available_capacity_bytes` is the configured source-spool limit after
-/// subtracting all currently retained source allocations supplied by the caller.
+/// subtracting all retained source allocations supplied by the caller, including
+/// any conservative future Active image charge required by its preflight.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct V7MigrationCapacity {
     pub(crate) decision: V7MigrationCapacityDecision,
@@ -67,6 +68,24 @@ pub(crate) struct V7MigrationCapacity {
     pub(crate) successor_image_bytes: u64,
     pub(crate) successor_staging_bytes: u64,
     pub(crate) terminal_manifest_headroom_bytes: u64,
+}
+
+impl V7MigrationCapacity {
+    /// Reject an enable or migration preflight whose estimated transition
+    /// cannot fit while retaining the persisted limits unchanged.
+    pub(crate) fn ensure_eligible(&self) -> Result<()> {
+        if let V7MigrationCapacityDecision::Deferred(reason) = self.decision {
+            anyhow::bail!(
+                "PITR v7 migration capacity is deferred ({reason:?}): transition requires {} bytes, but only {} bytes are available ({} bytes total required, {} byte source-spool limit)",
+                self.required_transition_bytes,
+                self.available_capacity_bytes,
+                self.required_total_bytes,
+                self.source_spool_limit_bytes,
+            );
+        }
+
+        Ok(())
+    }
 }
 
 /// Failure to acquire the whole migration charge from the live resource ledger.
@@ -166,17 +185,19 @@ pub(crate) fn reserve_v7_migration_transition(
 
 /// Decide whether a migration can reserve every source-spool resource it needs.
 ///
-/// The calculation deliberately retains the current files in the total: the
-/// old active WAL and its existing obligations remain live while the v7 image
-/// and recovery workspace are prepared. A later atomic ledger reservation must
+/// The calculation deliberately retains the source files in the total: the old
+/// active WAL and its existing obligations remain live while the v7 image and
+/// recovery workspace are prepared. A preflight before an Active WAL exists may
+/// include a conservative future-image charge. A later atomic ledger reservation must
 /// consume this exact transition charge through [`reserve_v7_migration_transition`]
 /// before a Sealing intent is durable.
 ///
 /// `legacy_active_image_bytes` is the recovered v5/v6 WAL's validated image
-/// length, independently of its filesystem allocation charge. Legacy admission
+/// length, independently of its filesystem allocation charge, or a conservative
+/// image bound when preflighting before an Active WAL exists. Legacy admission
 /// can exceed the configured segment limit after reopen, so that configuration
-/// cannot bound the predecessor's seal index. The caller must keep admission
-/// stopped while fixing this image length and acquiring the reservation.
+/// cannot bound a recovered predecessor's seal index. The caller must keep
+/// admission stopped while fixing this image length and acquiring the reservation.
 pub(crate) fn assess_v7_migration_capacity(
     config: &PersistedPitrConfig,
     legacy_active_image_bytes: u64,
