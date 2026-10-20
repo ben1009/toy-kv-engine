@@ -4438,7 +4438,22 @@ impl KvEngine {
                         ),
                     }
                 });
-                let (metadata, _, _) = self.load_pitr_source_segment(&state, segment_id)?;
+                let (metadata, _, seal_path) = self.load_pitr_source_segment(&state, segment_id)?;
+                let (_, seal_bytes) = crate::pitr::seal::read_seal_sidecar(
+                    &seal_path,
+                    state.config.as_ref().map(|config| config.max_segment_bytes),
+                )?;
+                let seal_digest: [u8; 32] = sha2::Sha256::digest(&seal_bytes).into();
+                ensure!(
+                    seal_digest == metadata.seal_digest,
+                    "PITR source seal changed during reconciliation"
+                );
+                // The source pair is validated above, but that does not prove
+                // the seal's directory entry survived a crash. Make the
+                // sidecar and its parent durable before publishing
+                // SegmentSealed, including callers that reconcile without
+                // first running `resume_v7_successor_install`.
+                crate::pitr::segment::install_pitr_file_no_replace(&seal_path, &seal_bytes)?;
                 if sealing_obligation.wal_format == crate::pitr::manifest::PitrWalFormat::V7
                     && let Some(boundary) = successor_active_boundary
                 {
@@ -21195,10 +21210,15 @@ mod tests {
             .path()
             .join("db")
             .join(format!("pitr-{source_segment_id:020}.seal"));
+        let source_wal_path = directory
+            .path()
+            .join("db")
+            .join(format!("pitr-{source_segment_id:020}.wal"));
+        let source_logical_length = state.obligations[&source_segment_id].logical_length;
         let manifest_path = directory.path().join("db").join("MANIFEST");
         let manifest_before = std::fs::read(&manifest_path)?;
         let scenario = fail::FailScenario::setup();
-        for _ in 0..2 {
+        for attempt in 0..2 {
             fail::cfg("pitr.install_before_directory_sync", "return").unwrap();
             let result = engine.resume_v7_successor_install(state.clone());
             fail::remove("pitr.install_before_directory_sync");
@@ -21208,6 +21228,28 @@ mod tests {
             assert_eq!(std::fs::read(&manifest_path)?, manifest_before);
             assert_eq!(*engine.pitr_manifest_state.lock(), state);
             assert!(engine.inner.state.load().memtable.uses_wal_v5());
+
+            if attempt == 0 {
+                // A recovery-point request can also reconcile Sealing. It
+                // must not publish SegmentSealed after a failed sidecar
+                // directory sync merely because the file is visible.
+                let source_wal = std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&source_wal_path)?;
+                source_wal.set_len(source_logical_length)?;
+                source_wal.sync_all()?;
+                fail::cfg("pitr.install_before_directory_sync", "return").unwrap();
+                let recovery_point = engine.create_recovery_point();
+                fail::remove("pitr.install_before_directory_sync");
+                let error = recovery_point.unwrap_err();
+                assert!(
+                    format!("{error:#}").contains("injected PITR install directory sync failure"),
+                    "unexpected recovery-point error: {error:#}"
+                );
+                assert_eq!(std::fs::read(&manifest_path)?, manifest_before);
+                assert_eq!(*engine.pitr_manifest_state.lock(), state);
+                assert!(engine.inner.state.load().memtable.uses_wal_v5());
+            }
         }
         let resumed = engine.resume_v7_successor_install(state)?;
         assert_eq!(resumed.active_boundary, Some(successor_boundary));
