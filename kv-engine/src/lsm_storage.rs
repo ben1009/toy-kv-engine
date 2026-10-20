@@ -3563,6 +3563,19 @@ impl KvEngine {
         &self,
         repository: impl AsRef<std::path::Path>,
     ) -> Result<crate::pitr::api::PitrResumeOutcome> {
+        self.resume_pitr_with_report_sink(repository, |level, message| match level {
+            log::Level::Info => log::info!("{message}"),
+            log::Level::Warn => log::warn!("{message}"),
+            level => unreachable!("unexpected PITR resume report level: {level}"),
+        })
+    }
+
+    #[cfg(target_os = "linux")]
+    fn resume_pitr_with_report_sink(
+        &self,
+        repository: impl AsRef<std::path::Path>,
+        mut report_sink: impl FnMut(log::Level, String),
+    ) -> Result<crate::pitr::api::PitrResumeOutcome> {
         let _operation_guard = self.pitr_operation_lock.lock();
         self.inner.lifecycle.ensure_open()?;
         let mut state = self.pitr_manifest_state.lock().clone();
@@ -3708,7 +3721,7 @@ impl KvEngine {
             // their spool/index quota before reporting a successful resume.
             state = self.reconcile_durable_archive_obligations(state)?;
         }
-        self.report_deferred_v7_migration_on_resume(&state);
+        self.report_deferred_v7_migration_on_resume(&state, &mut report_sink);
         drop(barrier);
         if state.mode == crate::pitr::manifest::PitrMode::PublicationUncertain {
             return Ok(crate::pitr::api::PitrResumeOutcome::ReconciliationRequired(
@@ -3792,7 +3805,11 @@ impl KvEngine {
     /// unavailable. Legacy v5/v6 recovery and its Leader writer remain valid
     /// even when the configured source-spool limit cannot fund a v7 transition.
     #[cfg(target_os = "linux")]
-    fn report_deferred_v7_migration_on_resume(&self, state: &crate::pitr::manifest::PitrState) {
+    fn report_deferred_v7_migration_on_resume(
+        &self,
+        state: &crate::pitr::manifest::PitrState,
+        report_sink: &mut impl FnMut(log::Level, String),
+    ) {
         let active = self.inner.state.load().memtable.clone();
         if !active.uses_wal_v5() || state.mode != crate::pitr::manifest::PitrMode::Enabled {
             return;
@@ -3804,16 +3821,19 @@ impl KvEngine {
                     &capacity,
                     active.wal_format_version(),
                 ) {
-                    log::info!("{message}");
+                    report_sink(log::Level::Info, message);
                 }
             }
             Ok(None) => {}
             Err(error) => {
                 // Capacity reporting is advisory; filesystem sampling errors
                 // must not turn a valid legacy reopen into a write outage.
-                log::warn!(
-                    "could not assess PITR v7 migration capacity on resume; keeping Active legacy WAL format {:?} on Leader I/O: {error:#}",
-                    active.wal_format_version(),
+                report_sink(
+                    log::Level::Warn,
+                    format!(
+                        "could not assess PITR v7 migration capacity on resume; keeping Active legacy WAL format {:?} on Leader I/O: {error:#}",
+                        active.wal_format_version(),
+                    ),
                 );
             }
         }
@@ -18931,8 +18951,14 @@ mod tests {
             .join(format!("pitr-{:020}.seal", active_segment_id + 100));
         write_random_file(&retained_source_path, 6 * 1024 * 1024, 10)?;
 
+        let mut reports = Vec::new();
         assert!(matches!(
-            engine.resume_pitr(dir.path().join("repository"))?,
+            engine.resume_pitr_with_report_sink(
+                dir.path().join("repository"),
+                |level, message| {
+                    reports.push((level, message));
+                }
+            )?,
             crate::pitr::api::PitrResumeOutcome::Resumed
         ));
 
@@ -18956,11 +18982,9 @@ mod tests {
             Some(crate::pitr::api::PitrWalIoMode::Leader)
         );
 
-        let message = KvEngine::deferred_v7_migration_resume_message(
-            &capacity,
-            status.active_wal_format_version,
-        )
-        .unwrap();
+        assert_eq!(reports.len(), 1);
+        let (level, message) = &reports[0];
+        assert_eq!(*level, log::Level::Info);
         assert!(message.contains("reason=InsufficientSourceSpool"));
         assert!(message.contains(&format!(
             "required_transition_bytes={}",
@@ -19011,10 +19035,23 @@ mod tests {
                 .is_err()
         );
 
+        let mut reports = Vec::new();
         assert!(matches!(
-            engine.resume_pitr(dir.path().join("repository"))?,
+            engine.resume_pitr_with_report_sink(
+                dir.path().join("repository"),
+                |level, message| {
+                    reports.push((level, message));
+                }
+            )?,
             crate::pitr::api::PitrResumeOutcome::Resumed
         ));
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].0, log::Level::Warn);
+        assert!(
+            reports[0]
+                .1
+                .contains("could not assess PITR v7 migration capacity on resume")
+        );
         engine.put(b"after-sampling-error", b"value")?;
 
         std::fs::remove_file(bad_source_path)?;
