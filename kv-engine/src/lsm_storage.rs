@@ -3195,7 +3195,15 @@ impl KvEngine {
                     crate::wal::WalIoMode::Parallel => crate::pitr::api::PitrWalIoMode::Parallel,
                 });
                 status.v7_migration_capacity =
-                    self.pitr_v7_migration_capacity_status(&state, &active)?;
+                    match self.pitr_v7_migration_capacity_status(&state, &active) {
+                        Ok(capacity) => capacity,
+                        Err(error) => {
+                            log::warn!(
+                                "omitting advisory PITR v7 migration capacity estimate: {error:#}"
+                            );
+                            None
+                        }
+                    };
                 status.active_wal_bytes = active.wal_logical_length().unwrap_or(0);
                 status.latest_durable_commit_ts = self
                     .inner
