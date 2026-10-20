@@ -9949,11 +9949,12 @@ impl LsmStorageInner {
             // Validate format version: the first record must be FormatVersion(v)
             // or a Snapshot with format_version == v. Pre-MVCC directories (no
             // format marker) are rejected to prevent silent data corruption.
-            // Accept v3–v9. Version 6 carries complete immutable-file identity
+            // Accept v3–v10. Version 6 carries complete immutable-file identity
             // metadata in snapshots and metadata-bearing manifest records.
             // Version 7 additionally requires PITR state in every snapshot.
             // Version 8 requires explicit PITR obligation WAL formats. Version
             // 9 requires durable successor Active boundaries for v7 handoffs.
+            // Version 10 preserves pending legacy-to-v7 migration intent.
             let detected_version = match ret.1.first() {
                 Some(ManifestRecord::FormatVersion(v)) => *v,
                 Some(ManifestRecord::Snapshot { format_version, .. }) => *format_version,
@@ -17814,6 +17815,7 @@ mod tests {
                 logical_length: 8192,
                 wal_format: crate::pitr::manifest::PitrWalFormat::LegacyV5V6,
                 immutable_boundary: None,
+                migration_successor_boundary: None,
             },
         );
         *engine.pitr_manifest_state.lock() = state.clone();
@@ -19902,8 +19904,14 @@ mod tests {
             drop(manifest);
             for record in &mut persisted_records {
                 match record {
-                    ManifestRecord::FormatVersion(version) if *version == 9 => *version = 8,
-                    ManifestRecord::Snapshot { format_version, .. } if *format_version == 9 => {
+                    ManifestRecord::FormatVersion(version)
+                        if *version == crate::manifest::MANIFEST_FORMAT_VERSION =>
+                    {
+                        *version = 8;
+                    }
+                    ManifestRecord::Snapshot { format_version, .. }
+                        if *format_version == crate::manifest::MANIFEST_FORMAT_VERSION =>
+                    {
                         *format_version = 8;
                     }
                     _ => {}

@@ -11,8 +11,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 const LEGACY_PITR_MANIFEST_FORMAT_VERSION: u32 = 7;
-// Version 8 makes the obligation WAL-format marker mandatory in persisted state.
-pub(crate) const PITR_MANIFEST_FORMAT_VERSION: u32 = 8;
+const PREVIOUS_PITR_MANIFEST_FORMAT_VERSION: u32 = 8;
+// Version 9 adds a durable intent that binds legacy migration to its v7 successor.
+pub(crate) const PITR_MANIFEST_FORMAT_VERSION: u32 = 9;
 pub(crate) const MAX_PITR_SNAPSHOT_BYTES: usize = 1 << 20;
 pub(crate) const MAX_PITR_RECORD_STREAM_BYTES: usize = 4 << 20;
 const PITR_SNAPSHOT_MAGIC: &[u8; 5] = b"PITR7";
@@ -221,6 +222,11 @@ pub(crate) struct PitrObligation {
     /// Legacy v5/v6 obligations do not have this boundary.
     #[serde(default)]
     pub(crate) immutable_boundary: Option<ImmutableBoundary>,
+    /// Empty v7 successor identity durably chosen before sealing a legacy
+    /// source for migration. Cleared when `SegmentSealed` publishes the handoff.
+    /// Retained for cleanup if a coverage gap abandons the pending migration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) migration_successor_boundary: Option<ActiveBoundary>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -589,6 +595,24 @@ impl PitrState {
                     == obligation.immutable_boundary.is_some(),
                 "PITR obligation format and immutable boundary disagree"
             );
+            if let Some(successor_boundary) = obligation.migration_successor_boundary {
+                successor_boundary.validate()?;
+                ensure!(
+                    obligation.wal_format == PitrWalFormat::LegacyV5V6
+                        && (obligation.state == ObligationState::Sealing
+                            || (self.mode == PitrMode::ReconciliationRequired
+                                && obligation.state == ObligationState::Abandoned))
+                        && self.active_segment_id == Some(segment)
+                        && self.active_boundary.is_none()
+                        && Some(successor_boundary.timeline_id) == self.timeline_id
+                        && Some(successor_boundary.archive_epoch_id) == self.archive_epoch_id
+                        && successor_boundary.segment_id == obligation.successor_segment_id
+                        && successor_boundary.ticket_end == 0
+                        && successor_boundary.durable_end == 4096
+                        && successor_boundary.last_commit_ts == 0,
+                    "migration successor boundary disagrees with its legacy obligation"
+                );
+            }
             if let Some(immutable) = obligation.immutable_boundary {
                 immutable.validate()?;
                 ensure!(
@@ -699,6 +723,15 @@ pub(crate) enum PitrManifestRecord {
         /// Present for v7 and absent for legacy v5/v6 seals.
         #[serde(default)]
         immutable_boundary: Option<ImmutableBoundary>,
+    },
+    /// Durably choose a v7 successor before sealing a legacy v5/v6 source.
+    /// Unlike an ordinary legacy `SealStarted`, this transition cannot be
+    /// recovered as a legacy rotation if the process stops before sealing.
+    MigrationStarted {
+        segment_id: u64,
+        successor_segment_id: u64,
+        logical_length: u64,
+        successor_active_boundary: ActiveBoundary,
     },
     SegmentSealed {
         segment_id: u64,
@@ -945,6 +978,63 @@ fn replay_pitr_records_inner(
                             PitrWalFormat::LegacyV5V6
                         },
                         immutable_boundary,
+                        migration_successor_boundary: None,
+                    },
+                );
+            }
+            PitrManifestRecord::MigrationStarted {
+                segment_id,
+                successor_segment_id,
+                logical_length,
+                successor_active_boundary,
+            } => {
+                ensure!(
+                    state.mode == PitrMode::Enabled,
+                    "v7 migration started while PITR is not enabled"
+                );
+                ensure!(
+                    state.active_segment_id == Some(segment_id),
+                    "v7 migration does not name the active legacy segment"
+                );
+                ensure!(
+                    state.active_boundary.is_none(),
+                    "v7 migration source already has an Active v7 boundary"
+                );
+                ensure!(
+                    successor_segment_id >= state.next_segment_id,
+                    "v7 migration successor ID is not monotonic"
+                );
+                ensure!(
+                    !state.obligations.contains_key(&segment_id),
+                    "duplicate v7 migration obligation"
+                );
+                ensure!(
+                    logical_length >= 4096 && logical_length.is_multiple_of(4096),
+                    "v7 migration source length is invalid"
+                );
+                successor_active_boundary.validate()?;
+                ensure!(
+                    Some(successor_active_boundary.timeline_id) == state.timeline_id
+                        && Some(successor_active_boundary.archive_epoch_id)
+                            == state.archive_epoch_id
+                        && successor_active_boundary.segment_id == successor_segment_id
+                        && successor_active_boundary.ticket_end == 0
+                        && successor_active_boundary.durable_end == 4096
+                        && successor_active_boundary.last_commit_ts == 0,
+                    "v7 migration successor boundary is not the empty Active prefix"
+                );
+                state.next_segment_id = successor_segment_id
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow::anyhow!("successor segment ID exhausted"))?;
+                state.obligations.insert(
+                    segment_id,
+                    PitrObligation {
+                        state: ObligationState::Sealing,
+                        successor_segment_id,
+                        logical_length,
+                        wal_format: PitrWalFormat::LegacyV5V6,
+                        immutable_boundary: None,
+                        migration_successor_boundary: Some(successor_active_boundary),
                     },
                 );
             }
@@ -966,6 +1056,12 @@ fn replay_pitr_records_inner(
                     .obligations
                     .get(&segment_id)
                     .ok_or_else(|| anyhow::anyhow!("sealed segment has no obligation"))?;
+                ensure!(
+                    obligation
+                        .migration_successor_boundary
+                        .is_none_or(|intended| { successor_active_boundary == Some(intended) }),
+                    "sealed v7 successor differs from its durable migration intent"
+                );
                 ensure!(
                     obligation.state == ObligationState::Sealing,
                     "segment sealed out of order"
@@ -1041,7 +1137,9 @@ fn replay_pitr_records_inner(
                 state.active_boundary = successor_active_boundary;
                 state.predecessor_anchor = Some(segment_anchor);
                 apply_high_water(&mut state, segment_id, last_recorded_at, last_commit_anchor)?;
-                state.obligations.get_mut(&segment_id).unwrap().state = ObligationState::Sealed;
+                let obligation = state.obligations.get_mut(&segment_id).unwrap();
+                obligation.state = ObligationState::Sealed;
+                obligation.migration_successor_boundary = None;
             }
             PitrManifestRecord::SegmentArchived { segment_id } => transition_obligation(
                 &mut state,
@@ -1245,7 +1343,9 @@ pub(crate) fn decode_pitr_snapshot(bytes: &[u8]) -> Result<PitrState> {
     ensure!(
         matches!(
             format_version,
-            LEGACY_PITR_MANIFEST_FORMAT_VERSION | PITR_MANIFEST_FORMAT_VERSION
+            LEGACY_PITR_MANIFEST_FORMAT_VERSION
+                | PREVIOUS_PITR_MANIFEST_FORMAT_VERSION
+                | PITR_MANIFEST_FORMAT_VERSION
         ),
         "unsupported PITR snapshot version"
     );
@@ -1307,7 +1407,9 @@ pub(crate) fn decode_pitr_record(bytes: &[u8]) -> Result<PitrManifestRecord> {
     ensure!(
         matches!(
             format_version,
-            LEGACY_PITR_MANIFEST_FORMAT_VERSION | PITR_MANIFEST_FORMAT_VERSION
+            LEGACY_PITR_MANIFEST_FORMAT_VERSION
+                | PREVIOUS_PITR_MANIFEST_FORMAT_VERSION
+                | PITR_MANIFEST_FORMAT_VERSION
         ),
         "unsupported PITR manifest record version"
     );
@@ -2253,6 +2355,195 @@ mod tests {
         }
     }
 
+    #[test]
+    fn migration_intent_durably_binds_empty_v7_successor_before_legacy_seal() {
+        let successor_boundary = empty_successor_active_boundary(2);
+        let mut records = enable();
+        records.push(PitrManifestRecord::MigrationStarted {
+            segment_id: 1,
+            successor_segment_id: 2,
+            logical_length: 4096,
+            successor_active_boundary: successor_boundary,
+        });
+
+        let migration_started = replay_pitr_records(records.clone()).unwrap();
+        assert_eq!(migration_started.active_segment_id, Some(1));
+        assert_eq!(migration_started.active_boundary, None);
+        assert_eq!(
+            migration_started.obligations[&1].state,
+            ObligationState::Sealing
+        );
+        assert_eq!(
+            migration_started.obligations[&1].migration_successor_boundary,
+            Some(successor_boundary)
+        );
+        assert_eq!(
+            decode_pitr_snapshot(&encode_pitr_snapshot(&migration_started).unwrap()).unwrap(),
+            migration_started
+        );
+        let encoded_started = encode_pitr_record_stream(&records).unwrap();
+        assert_eq!(
+            replay_pitr_record_stream(&encoded_started).unwrap(),
+            migration_started
+        );
+
+        records.push(PitrManifestRecord::SegmentSealed {
+            segment_id: 1,
+            segment_anchor: anchor(1),
+            last_recorded_at: None,
+            last_commit_anchor: None,
+            successor_active_boundary: Some(successor_boundary),
+        });
+        let migrated = replay_pitr_records(records.clone()).unwrap();
+        assert_eq!(migrated.active_segment_id, Some(2));
+        assert_eq!(migrated.active_boundary, Some(successor_boundary));
+        assert_eq!(migrated.predecessor_anchor, Some(anchor(1)));
+        assert_eq!(migrated.obligations[&1].state, ObligationState::Sealed);
+        assert_eq!(migrated.obligations[&1].migration_successor_boundary, None);
+        let encoded_migrated = encode_pitr_record_stream(&records).unwrap();
+        assert_eq!(
+            replay_pitr_record_stream(&encoded_migrated).unwrap(),
+            migrated
+        );
+
+        for invalid_boundary in [
+            ActiveBoundary {
+                segment_id: 3,
+                ..successor_boundary
+            },
+            ActiveBoundary {
+                ticket_end: 1,
+                durable_end: 3 * 4096,
+                last_commit_ts: 1,
+                ..successor_boundary
+            },
+            ActiveBoundary {
+                timeline_id: [9; 16],
+                ..successor_boundary
+            },
+        ] {
+            let mut invalid_records = enable();
+            invalid_records.push(PitrManifestRecord::MigrationStarted {
+                segment_id: 1,
+                successor_segment_id: 2,
+                logical_length: 4096,
+                successor_active_boundary: invalid_boundary,
+            });
+            assert!(replay_pitr_records(invalid_records).is_err());
+        }
+
+        for invalid_successor_boundary in [
+            None,
+            Some(empty_successor_active_boundary(3)),
+            Some(ActiveBoundary {
+                incarnation: [9; 16],
+                ..successor_boundary
+            }),
+            Some(ActiveBoundary {
+                prefix_digest: [9; 32],
+                ..successor_boundary
+            }),
+        ] {
+            let mut invalid_records = records.clone();
+            let Some(PitrManifestRecord::SegmentSealed {
+                successor_active_boundary,
+                ..
+            }) = invalid_records.last_mut()
+            else {
+                unreachable!();
+            };
+            *successor_active_boundary = invalid_successor_boundary;
+            assert!(replay_pitr_records(invalid_records).is_err());
+        }
+    }
+
+    #[test]
+    fn pending_migration_can_be_abandoned_and_reconciled_after_a_coverage_gap() {
+        let successor_boundary = empty_successor_active_boundary(2);
+        let mut records = enable();
+        records.push(PitrManifestRecord::MigrationStarted {
+            segment_id: 1,
+            successor_segment_id: 2,
+            logical_length: 4096,
+            successor_active_boundary: successor_boundary,
+        });
+        let pending = replay_pitr_records(records.clone()).unwrap();
+        let gap = PitrManifestRecord::CoverageGap(PersistedRecoveryGap {
+            repository_id: [1; 16],
+            timeline_id: [2; 16],
+            archive_epoch_id: [3; 16],
+            after: PersistedChainAnchor::Genesis {
+                archive_epoch_id: [3; 16],
+            },
+            last_archived_commit_ts: None,
+            first_uncovered_commit_ts: None,
+            reason: CoverageBreakReason::ForcedDisable,
+        });
+        records.push(gap.clone());
+
+        let abandoned = replay_pitr_records(records.clone()).unwrap();
+        assert_eq!(abandoned.mode, PitrMode::ReconciliationRequired);
+        assert_eq!(abandoned.obligations[&1].state, ObligationState::Abandoned);
+        assert_eq!(
+            abandoned.obligations[&1].migration_successor_boundary,
+            Some(successor_boundary)
+        );
+        assert_eq!(
+            replay_pitr_records([PitrManifestRecord::Snapshot(Box::new(pending)), gap]).unwrap(),
+            abandoned
+        );
+        assert_eq!(
+            decode_pitr_snapshot(&encode_pitr_snapshot(&abandoned).unwrap()).unwrap(),
+            abandoned
+        );
+
+        records.extend([
+            PitrManifestRecord::SegmentAbandoned { segment_id: 1 },
+            PitrManifestRecord::ReconciliationComplete,
+        ]);
+        let reconciled = replay_pitr_records(records.clone()).unwrap();
+        assert_eq!(reconciled.mode, PitrMode::Disabled);
+        assert!(reconciled.obligations.is_empty());
+        assert_eq!(reconciled.active_segment_id, None);
+        assert_eq!(reconciled.active_boundary, None);
+        assert_eq!(
+            replay_pitr_record_stream(&encode_pitr_record_stream(&records).unwrap()).unwrap(),
+            reconciled
+        );
+    }
+
+    #[test]
+    fn v8_manifest_envelopes_remain_readable_after_v9_upgrade() {
+        let mut records = enable();
+        let legacy_seal = PitrManifestRecord::SealStarted {
+            segment_id: 1,
+            successor_segment_id: 2,
+            logical_length: 4096,
+            immutable_boundary: None,
+        };
+        records.push(legacy_seal.clone());
+        let state = replay_pitr_records(records).unwrap();
+        let snapshot_payload = serde_json::to_vec(&state).unwrap();
+        assert_eq!(
+            decode_pitr_snapshot(&snapshot_fixture(
+                PREVIOUS_PITR_MANIFEST_FORMAT_VERSION,
+                &snapshot_payload,
+            ))
+            .unwrap(),
+            state
+        );
+
+        let record_payload = serde_json::to_vec(&legacy_seal).unwrap();
+        assert_eq!(
+            decode_pitr_record(&record_fixture(
+                PREVIOUS_PITR_MANIFEST_FORMAT_VERSION,
+                &record_payload,
+            ))
+            .unwrap(),
+            legacy_seal
+        );
+    }
+
     fn terminal_v7_immutable_states(nonempty: bool) -> Vec<PitrState> {
         let active = empty_active_boundary_for_enabled_segment();
         let durable = if nonempty {
@@ -3042,6 +3333,7 @@ mod tests {
                     logical_length: durable.durable_end + 4096,
                     wal_format: PitrWalFormat::LegacyV5V6,
                     immutable_boundary: None,
+                    migration_successor_boundary: None,
                 },
             );
             assert!(encode_pitr_snapshot(&invalid).is_err());
