@@ -3793,8 +3793,6 @@ impl KvEngine {
     /// even when the configured source-spool limit cannot fund a v7 transition.
     #[cfg(target_os = "linux")]
     fn report_deferred_v7_migration_on_resume(&self, state: &crate::pitr::manifest::PitrState) {
-        use crate::pitr::api::PitrV7MigrationCapacityDecision;
-
         let active = self.inner.state.load().memtable.clone();
         if !active.uses_wal_v5() || state.mode != crate::pitr::manifest::PitrMode::Enabled {
             return;
@@ -3802,17 +3800,12 @@ impl KvEngine {
 
         match self.pitr_v7_migration_capacity_status(state, &active) {
             Ok(Some(capacity)) => {
-                let PitrV7MigrationCapacityDecision::Deferred(reason) = capacity.decision else {
-                    return;
-                };
-                log::info!(
-                    "PITR v7 migration deferred on resume: reason={reason:?}, required_transition_bytes={}, required_total_bytes={}, available_capacity_bytes={}, source_spool_limit_bytes={}; keeping Active legacy WAL format {:?} on Leader I/O",
-                    capacity.required_transition_bytes,
-                    capacity.required_total_bytes,
-                    capacity.available_capacity_bytes,
-                    capacity.source_spool_limit_bytes,
+                if let Some(message) = Self::deferred_v7_migration_resume_message(
+                    &capacity,
                     active.wal_format_version(),
-                );
+                ) {
+                    log::info!("{message}");
+                }
             }
             Ok(None) => {}
             Err(error) => {
@@ -3824,6 +3817,25 @@ impl KvEngine {
                 );
             }
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn deferred_v7_migration_resume_message(
+        capacity: &crate::pitr::api::PitrV7MigrationCapacityStatus,
+        wal_format_version: Option<u16>,
+    ) -> Option<String> {
+        use crate::pitr::api::PitrV7MigrationCapacityDecision;
+
+        let PitrV7MigrationCapacityDecision::Deferred(reason) = capacity.decision else {
+            return None;
+        };
+        Some(format!(
+            "PITR v7 migration deferred on resume: reason={reason:?}, required_transition_bytes={}, required_total_bytes={}, available_capacity_bytes={}, source_spool_limit_bytes={}; keeping Active legacy WAL format {wal_format_version:?} on Leader I/O",
+            capacity.required_transition_bytes,
+            capacity.required_total_bytes,
+            capacity.available_capacity_bytes,
+            capacity.source_spool_limit_bytes,
+        ))
     }
 
     /// Finish v7 rotation transitions that stopped at either durable manifest
@@ -18897,6 +18909,117 @@ mod tests {
             capacity.retained_source_spool_bytes + capacity.required_transition_bytes
         );
         engine.close_storage().unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn resume_reports_deferred_v7_migration_capacity_for_legacy_wal() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let engine = pitr_flush_test_engine(dir.path());
+        suspend_pitr_maintenance_for_test(&engine);
+        engine.put(b"before-resume", b"value")?;
+
+        let state = engine.pitr_manifest_state.lock().clone();
+        let active = engine.inner.state.load().memtable.clone();
+        assert!(active.uses_wal_v5());
+        let active_segment_id = state.active_segment_id.unwrap();
+        let retained_source_path = active
+            .wal_path()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join(format!("pitr-{:020}.seal", active_segment_id + 100));
+        write_random_file(&retained_source_path, 6 * 1024 * 1024, 10)?;
+
+        assert!(matches!(
+            engine.resume_pitr(dir.path().join("repository"))?,
+            crate::pitr::api::PitrResumeOutcome::Resumed
+        ));
+
+        let status = engine.pitr_status(crate::pitr::api::PitrStatusOptions {
+            cursor: None,
+            page_size: crate::pitr::api::MAX_STATUS_PAGE_SIZE,
+        })?;
+        let capacity = status.v7_migration_capacity.unwrap();
+        assert_eq!(
+            capacity.decision,
+            crate::pitr::api::PitrV7MigrationCapacityDecision::Deferred(
+                crate::pitr::api::PitrV7MigrationDeferralReason::InsufficientSourceSpool
+            )
+        );
+        assert_eq!(
+            status.active_wal_format_version,
+            Some(crate::pitr::WAL_V5_VERSION)
+        );
+        assert_eq!(
+            status.active_wal_io_mode,
+            Some(crate::pitr::api::PitrWalIoMode::Leader)
+        );
+
+        let message = KvEngine::deferred_v7_migration_resume_message(
+            &capacity,
+            status.active_wal_format_version,
+        )
+        .unwrap();
+        assert!(message.contains("reason=InsufficientSourceSpool"));
+        assert!(message.contains(&format!(
+            "required_transition_bytes={}",
+            capacity.required_transition_bytes
+        )));
+        assert!(message.contains(&format!(
+            "required_total_bytes={}",
+            capacity.required_total_bytes
+        )));
+        assert!(message.contains(&format!(
+            "available_capacity_bytes={}",
+            capacity.available_capacity_bytes
+        )));
+        assert!(message.contains(&format!(
+            "source_spool_limit_bytes={}",
+            capacity.source_spool_limit_bytes
+        )));
+        assert!(message.contains(&format!(
+            "keeping Active legacy WAL format {:?} on Leader I/O",
+            status.active_wal_format_version
+        )));
+
+        engine.put(b"after-resume", b"value")?;
+        std::fs::remove_file(retained_source_path)?;
+        engine.close_storage()?;
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn resume_succeeds_when_v7_migration_capacity_sampling_fails() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let engine = pitr_flush_test_engine(dir.path());
+        suspend_pitr_maintenance_for_test(&engine);
+
+        let state = engine.pitr_manifest_state.lock().clone();
+        let active = engine.inner.state.load().memtable.clone();
+        assert!(active.uses_wal_v5());
+        let active_segment_id = state.active_segment_id.unwrap();
+        let database_path = active.wal_path().unwrap().parent().unwrap();
+        let bad_source_path =
+            database_path.join(format!("pitr-{:020}.seal", active_segment_id + 100));
+        let missing_target = database_path.join("missing-capacity-sampling-target");
+        std::os::unix::fs::symlink(&missing_target, &bad_source_path)?;
+        assert!(
+            engine
+                .pitr_v7_migration_capacity_status(&state, &active)
+                .is_err()
+        );
+
+        assert!(matches!(
+            engine.resume_pitr(dir.path().join("repository"))?,
+            crate::pitr::api::PitrResumeOutcome::Resumed
+        ));
+        engine.put(b"after-sampling-error", b"value")?;
+
+        std::fs::remove_file(bad_source_path)?;
+        engine.close_storage()?;
+        Ok(())
     }
 
     #[cfg(target_os = "linux")]
