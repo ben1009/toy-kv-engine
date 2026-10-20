@@ -314,18 +314,21 @@ impl LsmStorageInner {
         cleanup_checkpoint_tmps_for_target(&target_dir)?;
 
         let result = (|| {
-            let prepared = if self.state.load().memtable.uses_v7_wal() {
-                // Create the target staging directory before changing the
-                // active WAL boundary. The v7 capture helper stops admission,
-                // seals a nonempty active segment, and keeps admission stopped
-                // until the immutable checkpoint file set has been pinned.
+            let staging_prepared = if self.state.load().memtable.uses_v7_wal() {
                 self.prepare_checkpoint_staging(&target_dir, &tmp_dir)?;
-                self.capture_checkpoint_state_with_v7_boundary()?
+                true
             } else {
                 self.prepare_forced_memtable_freeze(None, false)?;
-                let _checkpoint_guard = self.checkpoint_lock.lock();
-                self.prepare_checkpoint(&target_dir, &tmp_dir)?
+                false
             };
+            // Legacy preparation can migrate the Active WAL to v7. Select
+            // the capture protocol under the PITR lifecycle locks afterward,
+            // and keep those locks until the immutable file set is pinned.
+            let prepared = self.capture_checkpoint_state_with_wal_boundary(
+                &target_dir,
+                &tmp_dir,
+                staging_prepared,
+            )?;
             self.publish_prepared_checkpoint(&target_dir, &tmp_dir, &options, prepared)
         })();
 
@@ -381,15 +384,6 @@ impl LsmStorageInner {
         Ok(())
     }
 
-    fn prepare_checkpoint<'a>(
-        &'a self,
-        target_dir: &Path,
-        tmp_dir: &Path,
-    ) -> Result<CheckpointCapture<'a>> {
-        self.prepare_checkpoint_staging(target_dir, tmp_dir)?;
-        self.capture_checkpoint_state_locked()
-    }
-
     fn prepare_checkpoint_staging(&self, target_dir: &Path, tmp_dir: &Path) -> Result<()> {
         let staging_tmp_dir = checkpoint_staging_tmp_dir(tmp_dir);
         fs::create_dir_all(&staging_tmp_dir).with_context(|| {
@@ -430,29 +424,55 @@ impl LsmStorageInner {
     }
 
     #[cfg(target_os = "linux")]
-    fn capture_checkpoint_state_with_v7_boundary(&self) -> Result<CheckpointCapture<'_>> {
-        let engine = self
-            .weak_engine
-            .get()
-            .and_then(std::sync::Weak::upgrade)
-            .ok_or_else(|| anyhow!("PITR engine owner is not installed"))?;
-        engine.with_v7_checkpoint_boundary(|| {
+    fn capture_checkpoint_state_with_wal_boundary(
+        &self,
+        target_dir: &Path,
+        tmp_dir: &Path,
+        staging_prepared: bool,
+    ) -> Result<CheckpointCapture<'_>> {
+        let capture = |is_v7| {
             let _checkpoint_guard = self.checkpoint_lock.lock();
+            if !staging_prepared {
+                self.prepare_checkpoint_staging(target_dir, tmp_dir)?;
+            }
             let mut capture = self.capture_checkpoint_state_locked()?;
-            // This checkpoint contains the complete committed state in its
-            // pinned immutable files. It does not copy the source PITR WAL or
-            // repository, so do not make the standalone checkpoint depend on
-            // the source's Active v7 boundary.
-            if let ManifestRecord::Snapshot { pitr_state, .. } = &mut capture.snapshot_record {
+            // A standalone v7 checkpoint contains its committed state in the
+            // pinned immutable files and does not copy the source Active WAL.
+            if is_v7
+                && let ManifestRecord::Snapshot { pitr_state, .. } = &mut capture.snapshot_record
+            {
                 *pitr_state = Some(crate::pitr::manifest::PitrState::default());
             }
             Ok(capture)
-        })
+        };
+        if let Some(engine) = self.weak_engine.get().and_then(std::sync::Weak::upgrade) {
+            return engine.with_checkpoint_wal_boundary(capture);
+        }
+        ensure!(
+            !self.state.load().memtable.uses_v7_wal(),
+            "PITR engine owner is not installed"
+        );
+
+        capture(false)
     }
 
     #[cfg(not(target_os = "linux"))]
-    fn capture_checkpoint_state_with_v7_boundary(&self) -> Result<CheckpointCapture<'_>> {
-        bail!("v7 PITR checkpoint capture requires Linux")
+    fn capture_checkpoint_state_with_wal_boundary(
+        &self,
+        target_dir: &Path,
+        tmp_dir: &Path,
+        staging_prepared: bool,
+    ) -> Result<CheckpointCapture<'_>> {
+        ensure!(
+            !self.state.load().memtable.uses_v7_wal(),
+            "v7 PITR checkpoint capture requires Linux"
+        );
+        let _checkpoint_guard = self.checkpoint_lock.lock();
+        if !staging_prepared {
+            self.prepare_checkpoint_staging(target_dir, tmp_dir)?;
+        }
+
+        self.capture_checkpoint_state_locked()
     }
 
     fn publish_prepared_checkpoint(
