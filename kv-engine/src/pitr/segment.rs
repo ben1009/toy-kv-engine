@@ -1229,6 +1229,7 @@ mod tests {
             logical_length: 4096,
             wal_format: PitrWalFormat::V7,
             immutable_boundary: None,
+            migration_successor_boundary: None,
         };
         let reclaimable = PitrObligation {
             state: ObligationState::Reclaimable,
@@ -1236,6 +1237,7 @@ mod tests {
             logical_length: 4096,
             wal_format: PitrWalFormat::V7,
             immutable_boundary: None,
+            migration_successor_boundary: None,
         };
         let previous = BTreeMap::from([(1, archived), (2, reclaimable)]);
         let current = BTreeMap::from([(1, archived)]);
@@ -1380,6 +1382,7 @@ mod tests {
                 logical_length: 8192,
                 wal_format: crate::pitr::manifest::PitrWalFormat::LegacyV5V6,
                 immutable_boundary: None,
+                migration_successor_boundary: None,
             },
         )]);
         let mut manager =
@@ -1412,6 +1415,7 @@ mod tests {
                 logical_length: 8192,
                 wal_format: crate::pitr::manifest::PitrWalFormat::LegacyV5V6,
                 immutable_boundary: None,
+                migration_successor_boundary: None,
             },
         )]);
         let mut manager =
@@ -1436,6 +1440,7 @@ mod tests {
                 logical_length: 8192,
                 wal_format: crate::pitr::manifest::PitrWalFormat::LegacyV5V6,
                 immutable_boundary: None,
+                migration_successor_boundary: None,
             },
         )]);
         let mut manager =
@@ -1461,6 +1466,7 @@ mod tests {
                 logical_length: 8192,
                 wal_format: crate::pitr::manifest::PitrWalFormat::LegacyV5V6,
                 immutable_boundary: None,
+                migration_successor_boundary: None,
             },
         )]);
         let mut manager =
@@ -1498,6 +1504,7 @@ mod tests {
                 logical_length: 8192,
                 wal_format: crate::pitr::manifest::PitrWalFormat::LegacyV5V6,
                 immutable_boundary: None,
+                migration_successor_boundary: None,
             },
         )]);
         let mut reconciled = obligations.clone();
@@ -1522,6 +1529,7 @@ mod tests {
                 logical_length: 8192,
                 wal_format: crate::pitr::manifest::PitrWalFormat::LegacyV5V6,
                 immutable_boundary: None,
+                migration_successor_boundary: None,
             },
         )]);
         let mut manager =
@@ -1552,6 +1560,7 @@ mod tests {
                 logical_length: 4096,
                 wal_format: crate::pitr::manifest::PitrWalFormat::LegacyV5V6,
                 immutable_boundary: None,
+                migration_successor_boundary: None,
             },
         )]);
         let mut manager =

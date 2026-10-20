@@ -124,6 +124,83 @@ fn pitr_snapshot_migration_uses_the_persisted_engine_version() {
 }
 
 #[test]
+fn source_manifest_snapshot_retains_pending_migration_under_version_10() {
+    use crate::pitr::manifest::ActiveBoundary;
+
+    let directory = tempdir().unwrap();
+    let manifest_path = directory.path().join("MANIFEST");
+    let manifest = Manifest::create(&manifest_path).unwrap();
+    manifest
+        .add_record_when_init(ManifestRecord::FormatVersion(MANIFEST_FORMAT_VERSION))
+        .unwrap();
+
+    let successor_boundary = ActiveBoundary {
+        timeline_id: [2; 16],
+        archive_epoch_id: [3; 16],
+        segment_id: 2,
+        incarnation: [4; 16],
+        ticket_end: 0,
+        durable_end: 4096,
+        last_commit_ts: 0,
+        prefix_digest: [5; 32],
+    };
+    let mut pending = legacy_pitr_sealing_state();
+    pending
+        .obligations
+        .get_mut(&1)
+        .unwrap()
+        .migration_successor_boundary = Some(successor_boundary);
+    pending.validate_for_status().unwrap();
+    let mut snapshot = empty_manifest_snapshot(1);
+    let ManifestRecord::Snapshot { pitr_state, .. } = &mut snapshot else {
+        unreachable!();
+    };
+    *pitr_state = Some(pending.clone());
+    manifest.snapshot(snapshot).unwrap();
+    drop(manifest);
+
+    let (_, recovered) = Manifest::recover(&manifest_path).unwrap();
+    let ManifestRecord::Snapshot {
+        format_version,
+        pitr_state: Some(recovered_state),
+        ..
+    } = &recovered[0]
+    else {
+        panic!("compacted manifest must retain the PITR state");
+    };
+    assert_eq!(
+        *format_version, 10,
+        "old v9 readers must reject a snapshot with pending migration intent"
+    );
+    assert_eq!(recovered_state, &pending);
+}
+
+#[test]
+fn source_manifest_v9_reopens_and_upgrades_with_pitr_state() {
+    for engine_snapshot in [false, true] {
+        let directory = tempdir().unwrap();
+        write_pitr_snapshot_fixture(
+            directory.path(),
+            9,
+            serde_json::to_value(crate::pitr::manifest::PitrState::default()).unwrap(),
+            engine_snapshot,
+        );
+        let storage =
+            LsmStorageInner::open(&directory, LsmStorageOptions::default_for_test()).unwrap();
+        drop(storage);
+
+        let (_, recovered) = Manifest::recover(directory.path().join("MANIFEST")).unwrap();
+        assert!(matches!(
+            &recovered[0],
+            ManifestRecord::Snapshot { format_version, pitr_state: Some(state), .. }
+                if *format_version == MANIFEST_FORMAT_VERSION
+                    && *format_version > 9
+                    && state.mode == crate::pitr::manifest::PitrMode::Disabled
+        ));
+    }
+}
+
+#[test]
 fn pitr_ambiguous_legacy_engine_snapshots_report_upgrade_guidance() {
     use crate::pitr::manifest::{PersistedChainAnchor, PitrManifestRecord, replay_pitr_records};
 

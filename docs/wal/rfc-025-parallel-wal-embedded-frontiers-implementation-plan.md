@@ -1264,8 +1264,14 @@ source to an empty v7 Active successor, while retaining the source obligation's
 legacy format. Startup can recreate a missing empty successor after revalidating
 the legacy source WAL and seal against the manifest anchor. Validation reserves
 decoded/canonicalized batch and seal workspace before reading, and bounds the
-sidecar by the manifest's WAL image length. Production migration does not yet
-emit this transition.
+sidecar by the manifest's WAL image length. The PITR envelope v9 adds a
+`MigrationStarted` record that durably fixes the empty v7 successor boundary
+before a legacy source is sealed, and replay requires `SegmentSealed` to publish
+that exact boundary. The source manifest advances to v10 so older engines reject
+compacted snapshots containing this intent. PITR v7/v8 envelopes and source
+manifests v3–v9 remain readable. Forced-gap reconciliation retains the
+intended successor identity until its abandoned obligation is cleaned up.
+Production migration does not yet emit this transition.
 
 - Add a shared migration/preflight decision used by enablement, reopen, and
   rotation. Calculate capacity for the largest configured v7 physical image

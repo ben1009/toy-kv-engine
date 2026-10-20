@@ -40,11 +40,12 @@ pub(crate) fn set_manifest_sync_failure(path: &Path) {
 /// carry PITR state, so manifest snapshot replacement cannot discard it.
 /// Version 8 requires explicit PITR obligation WAL-format markers and retains
 /// immutable v7 sealing boundaries. Version 9 requires a durable Active v7
-/// boundary for every sealed v7 successor. Earlier snapshots select legacy
-/// migration.
+/// boundary for every sealed v7 successor. Version 10 retains the intended empty
+/// v7 successor in pending legacy migration snapshots. Snapshots before version
+/// 9 select legacy Active-boundary recovery.
 /// Version 0 is reserved to mean "legacy/field-absent" and must never be
 /// assigned as a valid format version.
-pub const MANIFEST_FORMAT_VERSION: u32 = 9;
+pub const MANIFEST_FORMAT_VERSION: u32 = 10;
 
 /// The immutable file kinds that can be referenced by a physical backup.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -234,7 +235,8 @@ pub(crate) enum ManifestRecord {
     /// Written as the first record in a new database to identify the format
     /// version. Version 5 = MVCC + compaction filters + range tombstones + TTL,
     /// 6 = immutable-file identities, 7 = mandatory PITR state in snapshots,
-    /// 8 = explicit PITR obligation formats and immutable v7 boundaries.
+    /// 8 = explicit PITR obligation formats and immutable v7 boundaries,
+    /// 9 = durable Active v7 successor boundaries, 10 = pending migration intent.
     /// Absence of this record means pre-MVCC.
     FormatVersion(u32),
     /// Dormant PITR v7 transition record. Replayed only when PITR is enabled.
