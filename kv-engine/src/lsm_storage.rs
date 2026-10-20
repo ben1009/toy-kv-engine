@@ -18614,6 +18614,186 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn pitr_status_reports_v7_migration_capacity_details() {
+        let dir = tempdir().unwrap();
+        let engine = pitr_flush_test_engine(dir.path());
+        suspend_pitr_maintenance_for_test(&engine);
+        engine.put(b"capacity-status", b"value").unwrap();
+
+        let state = engine.pitr_manifest_state.lock().clone();
+        let active_segment_id = state.active_segment_id.unwrap();
+        let active = engine.inner.state.load().memtable.clone();
+        let active_wal_path = active.wal_path().unwrap().to_path_buf();
+        let database_path = active_wal_path.parent().unwrap();
+        let active_image_bytes = active.wal_logical_length().unwrap();
+        let active_allocated_bytes =
+            LsmStorageInner::filesystem_file_allocated_bytes(&active_wal_path).unwrap();
+
+        let retained_segment_id = active_segment_id.checked_add(100).unwrap();
+        let retained_segment_path =
+            database_path.join(format!("pitr-{retained_segment_id:020}.seal"));
+        std::fs::write(&retained_segment_path, [0x11; 4096]).unwrap();
+        let retained_segment_allocated_bytes =
+            LsmStorageInner::filesystem_file_allocated_bytes(&retained_segment_path).unwrap();
+
+        let staging_id = active_segment_id.checked_add(101).unwrap();
+        let staging_path = database_path.join(format!(
+            ".pitr-{staging_id:020}.wal.tmp-{}-1",
+            std::process::id()
+        ));
+        std::fs::write(&staging_path, [0x22; 8192]).unwrap();
+        let staging_allocated_bytes =
+            LsmStorageInner::filesystem_file_allocated_bytes(&staging_path).unwrap();
+
+        let recovery_prefix =
+            crate::wal::v7::install::recovery_temp_prefix(std::ffi::OsStr::new("untracked.wal"));
+        let unattributed_path =
+            database_path.join(format!("{recovery_prefix}{}-1", std::process::id()));
+        std::fs::write(&unattributed_path, [0x33; 12 * 1024]).unwrap();
+        let unattributed_allocated_bytes =
+            LsmStorageInner::filesystem_file_allocated_bytes(&unattributed_path).unwrap();
+
+        let mut segment_charges = engine
+            .pitr_segments
+            .lock()
+            .as_ref()
+            .unwrap()
+            .source_spool_charges_by_segment()
+            .unwrap();
+        for (segment_id, allocated_bytes) in [
+            (active_segment_id, active_allocated_bytes),
+            (retained_segment_id, retained_segment_allocated_bytes),
+        ] {
+            let charge = segment_charges.entry(segment_id).or_default();
+            *charge = (*charge).max(allocated_bytes);
+        }
+        let retained_segment_source_bytes = segment_charges.values().sum::<u64>();
+        let retained_source_spool_bytes =
+            retained_segment_source_bytes + staging_allocated_bytes + unattributed_allocated_bytes;
+        assert!(active_image_bytes > crate::pitr::WAL_V5_HEADER_LEN as u64);
+        assert!(active_allocated_bytes > 0);
+        assert!(retained_segment_allocated_bytes > 0);
+        assert!(staging_allocated_bytes > 0);
+        assert!(unattributed_allocated_bytes > 0);
+        assert_ne!(staging_allocated_bytes, unattributed_allocated_bytes);
+
+        let config = state.config.as_ref().unwrap();
+        let allocation_unit =
+            crate::pitr::segment::filesystem_allocation_reservation(database_path, 1).unwrap();
+        let expected = crate::pitr::migration::assess_v7_migration_capacity(
+            config,
+            active_image_bytes,
+            retained_source_spool_bytes,
+            allocation_unit,
+        )
+        .unwrap();
+        let status = engine
+            .pitr_status(crate::pitr::api::PitrStatusOptions {
+                cursor: None,
+                page_size: crate::pitr::api::MAX_STATUS_PAGE_SIZE,
+            })
+            .unwrap();
+        let capacity = status.v7_migration_capacity.unwrap();
+
+        let expected_decision = match expected.decision {
+            crate::pitr::migration::V7MigrationCapacityDecision::Eligible => {
+                crate::pitr::api::PitrV7MigrationCapacityDecision::Eligible
+            }
+            crate::pitr::migration::V7MigrationCapacityDecision::Deferred(reason) => {
+                let reason = match reason {
+                    crate::pitr::migration::V7MigrationDeferralReason::SegmentLimitTooSmall => {
+                        crate::pitr::api::PitrV7MigrationDeferralReason::SegmentLimitTooSmall
+                    }
+                    crate::pitr::migration::V7MigrationDeferralReason::SegmentLimitTooLarge => {
+                        crate::pitr::api::PitrV7MigrationDeferralReason::SegmentLimitTooLarge
+                    }
+                    crate::pitr::migration::V7MigrationDeferralReason::InsufficientSourceSpool => {
+                        crate::pitr::api::PitrV7MigrationDeferralReason::InsufficientSourceSpool
+                    }
+                };
+                crate::pitr::api::PitrV7MigrationCapacityDecision::Deferred(reason)
+            }
+        };
+
+        assert_eq!(capacity.decision, expected_decision);
+        assert_eq!(
+            capacity.required_transition_bytes,
+            expected.required_transition_bytes
+        );
+        assert_eq!(capacity.required_total_bytes, expected.required_total_bytes);
+        assert_eq!(
+            capacity.available_capacity_bytes,
+            expected.available_capacity_bytes
+        );
+        assert_eq!(
+            capacity.retained_source_spool_bytes,
+            retained_source_spool_bytes
+        );
+        assert_eq!(
+            capacity.source_spool_limit_bytes,
+            config.max_source_spool_bytes
+        );
+        assert_eq!(capacity.legacy_active_image_bytes, active_image_bytes);
+        assert_eq!(
+            capacity.legacy_active_allocated_bytes,
+            active_allocated_bytes
+        );
+        assert_eq!(
+            capacity.retained_segment_source_bytes,
+            retained_segment_source_bytes
+        );
+        assert_eq!(capacity.retained_staging_bytes, staging_allocated_bytes);
+        assert_eq!(
+            capacity.retained_unattributed_bytes,
+            unattributed_allocated_bytes
+        );
+        assert_eq!(
+            capacity.retained_segment_source_bytes
+                + capacity.retained_staging_bytes
+                + capacity.retained_unattributed_bytes,
+            capacity.retained_source_spool_bytes
+        );
+        assert_eq!(
+            capacity.configured_segment_limit_bytes,
+            config.max_segment_bytes
+        );
+        assert_eq!(
+            capacity.v7_active_image_bytes,
+            expected.v7_active_image_bytes
+        );
+        assert_eq!(
+            capacity.recovery_workspace_bytes,
+            expected.recovery_workspace_bytes
+        );
+        assert_eq!(
+            capacity.legacy_seal_sidecar_bytes,
+            expected.legacy_seal_sidecar_bytes
+        );
+        assert_eq!(
+            capacity.v7_seal_sidecar_bytes,
+            expected.v7_seal_sidecar_bytes
+        );
+        assert_eq!(
+            capacity.successor_image_bytes,
+            expected.successor_image_bytes
+        );
+        assert_eq!(
+            capacity.successor_staging_bytes,
+            expected.successor_staging_bytes
+        );
+        assert_eq!(
+            capacity.terminal_manifest_headroom_bytes,
+            expected.terminal_manifest_headroom_bytes
+        );
+        assert_eq!(
+            capacity.required_total_bytes,
+            capacity.retained_source_spool_bytes + capacity.required_transition_bytes
+        );
+        engine.close_storage().unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn pitr_status_skips_migration_capacity_during_lifecycle_transitions() {
         use crate::pitr::manifest::{PitrManifestRecord, replay_pitr_records};
 
