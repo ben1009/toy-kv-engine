@@ -19842,10 +19842,12 @@ mod tests {
         let dir = tempdir()?;
         let engine = pitr_flush_test_engine(dir.path());
         suspend_pitr_maintenance_for_test(&engine);
+        engine.put(b"before-sampling-error", b"value")?;
 
         let state = engine.pitr_manifest_state.lock().clone();
         let active = engine.inner.state.load().memtable.clone();
         assert!(active.uses_wal_v5());
+        assert!(!active.is_empty());
         let active_segment_id = state.active_segment_id.unwrap();
         let database_path = active.wal_path().unwrap().parent().unwrap();
         let bad_source_path =
