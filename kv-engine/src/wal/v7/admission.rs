@@ -804,7 +804,7 @@ impl WalV7ResourceLedger {
         self.reserve_with_priority(charge, false)
     }
 
-    fn reserve_maintenance(
+    pub(crate) fn reserve_maintenance(
         &self,
         charge: WalV7ResourceCharge,
     ) -> Result<WalV7Reservation, WalV7ReservationError> {

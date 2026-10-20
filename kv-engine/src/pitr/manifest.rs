@@ -1011,8 +1011,11 @@ fn replay_pitr_records_inner(
                     );
                 }
                 let successor = obligation.successor_segment_id;
+                // A legacy sealed source can hand off to a v7 Active successor
+                // during migration. The immutable boundary describes the new
+                // successor; it does not change the source obligation's format.
                 match (obligation.wal_format, successor_active_boundary) {
-                    (PitrWalFormat::V7, Some(boundary)) => {
+                    (PitrWalFormat::V7 | PitrWalFormat::LegacyV5V6, Some(boundary)) => {
                         boundary.validate()?;
                         ensure!(
                             Some(boundary.timeline_id) == state.timeline_id
@@ -1030,11 +1033,6 @@ fn replay_pitr_records_inner(
                             Some(PendingLegacyV7Boundary::SealedTransition);
                     }
                     (PitrWalFormat::LegacyV5V6, None) => {}
-                    (PitrWalFormat::LegacyV5V6, Some(_)) => {
-                        anyhow::bail!(
-                            "legacy sealed transition cannot carry a v7 successor boundary"
-                        )
-                    }
                     (PitrWalFormat::Unspecified, _) => {
                         anyhow::bail!("sealed obligation is missing its WAL format marker")
                     }
@@ -2183,6 +2181,76 @@ mod tests {
             ))])
             .is_err()
         );
+    }
+
+    #[test]
+    fn legacy_seal_can_install_an_empty_v7_successor_boundary() {
+        let records = [
+            enable()[0].clone(),
+            enable()[1].clone(),
+            PitrManifestRecord::SealStarted {
+                segment_id: 1,
+                successor_segment_id: 2,
+                logical_length: 4096,
+                immutable_boundary: None,
+            },
+            PitrManifestRecord::SegmentSealed {
+                segment_id: 1,
+                segment_anchor: anchor(1),
+                last_recorded_at: None,
+                last_commit_anchor: None,
+                successor_active_boundary: Some(empty_successor_active_boundary(2)),
+            },
+        ];
+
+        let migrated = replay_pitr_records(records.to_vec()).unwrap();
+        assert_eq!(migrated.active_segment_id, Some(2));
+        assert_eq!(
+            migrated.active_boundary,
+            Some(empty_successor_active_boundary(2))
+        );
+        assert_eq!(migrated.predecessor_anchor, Some(anchor(1)));
+        assert_eq!(
+            migrated.obligations[&1].wal_format,
+            PitrWalFormat::LegacyV5V6
+        );
+        assert_eq!(
+            decode_pitr_snapshot(&encode_pitr_snapshot(&migrated).unwrap()).unwrap(),
+            migrated
+        );
+        let encoded_records = encode_pitr_record_stream(&records).unwrap();
+        assert_eq!(
+            replay_pitr_record_stream(&encoded_records).unwrap(),
+            migrated
+        );
+
+        for invalid_boundary in [
+            ActiveBoundary {
+                segment_id: 3,
+                ..empty_successor_active_boundary(2)
+            },
+            ActiveBoundary {
+                ticket_end: 1,
+                durable_end: 3 * 4096,
+                last_commit_ts: 1,
+                ..empty_successor_active_boundary(2)
+            },
+            ActiveBoundary {
+                archive_epoch_id: [9; 16],
+                ..empty_successor_active_boundary(2)
+            },
+        ] {
+            let mut invalid_records = records.clone();
+            let Some(PitrManifestRecord::SegmentSealed {
+                successor_active_boundary,
+                ..
+            }) = invalid_records.last_mut()
+            else {
+                unreachable!();
+            };
+            *successor_active_boundary = Some(invalid_boundary);
+            assert!(replay_pitr_records(invalid_records).is_err());
+        }
     }
 
     fn terminal_v7_immutable_states(nonempty: bool) -> Vec<PitrState> {
