@@ -27964,6 +27964,138 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn enable_pitr_capacity_preflight_accounts_for_retained_source_files() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let database = dir.path().join("db");
+        let repository = dir.path().join("repository");
+        let engine = KvEngine::open(
+            &database,
+            LsmStorageOptions {
+                enable_wal: true,
+                ..LsmStorageOptions::default_for_test()
+            },
+        )?;
+
+        let retained_wal_path = database.join("pitr-00000000000000000001.wal");
+        let retained_seal_path = database.join("pitr-00000000000000000001.seal");
+        let staging_path = database.join(".pitr-00000000000000000002.wal.tmp-123-1");
+        let recovery_prefix = crate::wal::v7::install::recovery_temp_prefix(std::ffi::OsStr::new(
+            "pitr-00000000000000000003.wal",
+        ));
+        let recovery_temp_path = database.join(format!("{recovery_prefix}123-4"));
+        write_random_file(&retained_wal_path, 8192, 1)?;
+        write_random_file(&retained_seal_path, 4096, 2)?;
+        write_random_file(&staging_path, 4096, 3)?;
+        write_random_file(&recovery_temp_path, 4096, 4)?;
+
+        let retained_wal_bytes =
+            LsmStorageInner::filesystem_file_allocated_bytes(&retained_wal_path)?;
+        let retained_seal_bytes =
+            LsmStorageInner::filesystem_file_allocated_bytes(&retained_seal_path)?;
+        let staging_allocated_bytes =
+            LsmStorageInner::filesystem_file_allocated_bytes(&staging_path)?;
+        let recovery_temp_allocated_bytes =
+            LsmStorageInner::filesystem_file_allocated_bytes(&recovery_temp_path)?;
+        let (segment_allocations, staging_bytes, unattributed_bytes) =
+            LsmStorageInner::pitr_source_allocations(&database, None)?;
+        assert_eq!(
+            segment_allocations.get(&1),
+            Some(&(retained_wal_bytes + retained_seal_bytes)),
+            "retained WAL and seal allocations must be charged to their segment"
+        );
+        assert_eq!(
+            staging_bytes, staging_allocated_bytes,
+            "interrupted install files must be charged as staging"
+        );
+        assert_eq!(
+            unattributed_bytes, recovery_temp_allocated_bytes,
+            "recovery temporaries without a live segment must be charged"
+        );
+        let retained_source_bytes = segment_allocations
+            .values()
+            .try_fold(staging_bytes + unattributed_bytes, |total, bytes| {
+                total.checked_add(*bytes)
+            })
+            .ok_or_else(|| anyhow::anyhow!("retained source allocation overflows"))?;
+
+        let max_segment_bytes = 32 * 1024;
+        let legacy_active_image_bytes = max_segment_bytes + crate::pitr::WAL_V5_HEADER_LEN as u64;
+        let legacy_preallocated_bytes = legacy_active_image_bytes
+            .div_ceil(crate::wal::PREALLOC_BLOCK)
+            * crate::wal::PREALLOC_BLOCK;
+        let future_active_allocated_bytes =
+            crate::pitr::segment::filesystem_allocation_reservation(
+                &database,
+                legacy_preallocated_bytes,
+            )?;
+        let allocation_unit =
+            crate::pitr::segment::filesystem_allocation_reservation(&database, 1)?;
+        let mut options = crate::pitr::api::PitrOptions {
+            repository: repository.clone(),
+            config: crate::pitr::api::PersistedPitrConfig {
+                archive_interval: std::time::Duration::from_secs(60),
+                max_segment_bytes,
+                max_unarchived_bytes: max_segment_bytes,
+                max_source_spool_bytes: 1 << 30,
+            },
+            runtime: crate::pitr::api::PitrRuntimeOptions::default(),
+        };
+        let unconstrained_capacity = crate::pitr::migration::assess_v7_migration_capacity(
+            &options.persisted_config()?,
+            legacy_active_image_bytes,
+            future_active_allocated_bytes,
+            allocation_unit,
+        )?;
+        options.config.max_source_spool_bytes = unconstrained_capacity.required_total_bytes;
+
+        let capacity_without_retained_files = crate::pitr::migration::assess_v7_migration_capacity(
+            &options.persisted_config()?,
+            legacy_active_image_bytes,
+            future_active_allocated_bytes,
+            allocation_unit,
+        )?;
+        assert_eq!(
+            capacity_without_retained_files.decision,
+            crate::pitr::migration::V7MigrationCapacityDecision::Eligible
+        );
+        let capacity_with_retained_files = crate::pitr::migration::assess_v7_migration_capacity(
+            &options.persisted_config()?,
+            legacy_active_image_bytes,
+            future_active_allocated_bytes + retained_source_bytes,
+            allocation_unit,
+        )?;
+        assert_eq!(
+            capacity_with_retained_files.decision,
+            crate::pitr::migration::V7MigrationCapacityDecision::Deferred(
+                crate::pitr::migration::V7MigrationDeferralReason::InsufficientSourceSpool
+            )
+        );
+        assert_eq!(
+            capacity_with_retained_files.retained_source_spool_bytes,
+            future_active_allocated_bytes + retained_source_bytes
+        );
+
+        let error = engine.enable_pitr(options).unwrap_err();
+        assert!(
+            error.to_string().contains("InsufficientSourceSpool"),
+            "unexpected capacity error: {error:#}"
+        );
+        assert_eq!(
+            engine.pitr_manifest_state.lock().mode,
+            crate::pitr::manifest::PitrMode::Disabled,
+            "capacity rejection must happen before the durable enable intent"
+        );
+        assert!(
+            !repository.exists(),
+            "capacity rejection should happen before repository bootstrap"
+        );
+        engine.close()?;
+
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn enable_pitr_capacity_preflight_accounts_for_a_full_legacy_active_image() {
         let dir = tempdir().unwrap();
         let database = dir.path().join("db");
