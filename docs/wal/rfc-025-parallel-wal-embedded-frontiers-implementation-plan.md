@@ -1231,11 +1231,25 @@ charge for both its reservation and ledger limit. Callers must still reconstruct
 all live charges, retain this reservation through the transition, and rebuild
 in-flight migration charges from durable obligations after a crash.
 
-The read-only PITR status API now reports the Active WAL's format and scheduler,
-plus a v7 migration capacity estimate for Active v5/v6 WALs. The retained charge
-uses both filesystem allocations and the live segment manager's pinned-source
-accounting. The estimate is omitted across lifecycle transitions or source
-reclamation races; this advisory snapshot does not replace the atomic reservation.
+On Linux, the read-only PITR status API reports the Active WAL's format and
+scheduler, plus a v7 migration capacity estimate for Active v5/v6 WALs. The retained charge
+combines visible filesystem allocations with live segment-manager source-spool
+charges for tracked segments and any pending successor. It takes the greater of
+the visible allocation and manager charge per segment, then adds staging and
+unattributed allocations. The estimate is omitted on non-Linux builds, when
+the Active WAL is not a legacy format, the manifest has no Active segment or
+names a different segment, or capacity snapshot construction fails. A matching
+legacy WAL may still report an estimate during other lifecycle states. This
+advisory snapshot does not replace the atomic reservation. It exposes the Active legacy image's
+logical length and allocated bytes; retained segment, staging, and
+unattributed source usage; and the persisted configured segment limit. V7
+image and recovery-workspace estimates cap that limit at the maximum supported
+WAL size, while still reporting an oversized configured limit as deferred. It
+reports the estimated v7 image, recovery workspace, both seal sidecars,
+successor image and staging, and terminal manifest headroom as separate
+transition charges. File extents are rounded to the allocation unit where
+applicable. The status also reports the complete required total alongside
+available source-spool capacity.
 Manifest replay accepts the mixed-format handoff record from a sealed legacy
 source to an empty v7 Active successor, while retaining the source obligation's
 legacy format. Startup can recreate a missing empty successor after revalidating
