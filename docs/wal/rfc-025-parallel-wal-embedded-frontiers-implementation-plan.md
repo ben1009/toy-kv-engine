@@ -1281,8 +1281,25 @@ seal/successor reservations once against the transition budget, and verifies
 and syncs an existing seal plus its parent directory on every retry before
 publishing `SegmentSealed`. Regression coverage includes exact-capacity reopen
 with and without the sidecar, source-tail truncation, a second reopen after v7
-writes, and repeated seal directory-sync failure. Production migration does not
-yet emit this transition.
+writes, and repeated seal directory-sync failure. Production resume now starts
+the transition for an eligible, non-empty legacy Active WAL. An empty Active WAL
+stays on its current format to avoid creating an empty sealed source; it can
+migrate on a later resume after it has commits. The transition stops commit
+admission, reserves the assessed retained and transition charges, persists
+`MigrationStarted`, then uses the existing seal and successor-install recovery
+path. If capacity defers or reservation fails before intent, resume leaves the
+legacy WAL on Leader I/O and reopens admission. A replayed durable intent
+reacquires its transition reservation before sealing and retains it through
+successor installation and archive reconciliation. Intent publication replays the
+current manifest projection under the state lock, preserving concurrent flush
+reclamation. Successor installation also retires reconstructed charges for sources
+reclaimed before its resource ledger becomes visible, under the same lock used to
+publish that ledger. Sealed retries count the source seal and existing
+successor/recovery images once against their transition allowances. Regression
+coverage includes exact-capacity Sealed retries with and without retained successor
+images, plus flush reclamation before migration intent and after recovery
+reservation, checking source-spool charges and successful reopen. Constructor
+defaults and full crash qualification remain later Stage 7 work.
 
 - Add a shared migration/preflight decision used by enablement, reopen, and
   rotation. Calculate capacity for the largest configured v7 physical image
