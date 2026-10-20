@@ -3327,7 +3327,7 @@ impl KvEngine {
             .config
             .as_ref()
             .ok_or_else(|| anyhow!("Active legacy PITR WAL has no persisted configuration"))?;
-        match self.pitr_v7_migration_capacity_snapshot(config, active_segment_id, active) {
+        match self.pitr_v7_migration_capacity_snapshot(config, active_segment_id, active, None) {
             Ok(capacity) => Ok(Some(capacity)),
             // Reclamation can unlink a sampled source between read_dir and
             // metadata, or remove the captured Active WAL after rotation.
@@ -3349,6 +3349,7 @@ impl KvEngine {
         config: &crate::pitr::manifest::PersistedPitrConfig,
         active_segment_id: u64,
         active: &MemTable,
+        migration_successor_id: Option<u64>,
     ) -> Result<crate::pitr::api::PitrV7MigrationCapacityStatus> {
         let active_wal_path = active
             .wal_path()
@@ -3374,6 +3375,21 @@ impl KvEngine {
         let active_allocated_bytes = LsmStorageInner::filesystem_allocated_bytes(&active_metadata)?;
         let (mut segment_allocations, staging_bytes, unattributed_bytes) =
             LsmStorageInner::pitr_source_allocations(database_path, Some(active_segment_id))?;
+        let allocation_unit =
+            crate::pitr::segment::filesystem_allocation_reservation(database_path, 1)?;
+        if migration_successor_id.is_some()
+            && let Some(source_bytes) = segment_allocations.get_mut(&active_segment_id)
+        {
+            // The transition already budgets this sidecar. Count any installed
+            // allocation within that budget once, retaining oversized excess.
+            // The Active WAL was excluded from this per-segment scan, so only
+            // its seal contributes here.
+            let seal_reservation = crate::pitr::segment::filesystem_allocation_reservation(
+                database_path,
+                crate::pitr::seal::V5Seal::max_encoded_len_for_segment(active_image_bytes)?,
+            )?;
+            *source_bytes = source_bytes.saturating_sub(seal_reservation);
+        }
         let active_visible_bytes = segment_allocations.entry(active_segment_id).or_default();
         *active_visible_bytes = active_visible_bytes
             .checked_add(active_allocated_bytes)
@@ -3383,6 +3399,30 @@ impl KvEngine {
             // cannot hide the manager's charge for an unlinked, pinned inode in
             // another segment.
             let mut charges = segments.source_spool_charges_by_segment()?;
+            if let Some(successor_id) = migration_successor_id {
+                // Reopen reconstructs these transition reservations from the
+                // durable intent. The full transition assessment below already
+                // covers both; retain the source WAL's own charge and all
+                // visible files, pins, staging, and unrelated segment charges.
+                if let Some(source) = segments.segment(active_segment_id)
+                    && source.state == crate::pitr::segment::SegmentState::Sealing
+                    && source.successor_segment_id == Some(successor_id)
+                {
+                    charges.insert(active_segment_id, source.source_spool_bytes);
+                }
+                if segments.pending_successor_id().ok() == Some(successor_id)
+                    && let Some(successor_bytes) = charges.get_mut(&successor_id)
+                {
+                    let successor_reservation =
+                        crate::pitr::segment::filesystem_allocation_reservation(
+                            database_path,
+                            (crate::wal::v7::codec::WAL_V7_HEADER_LEN
+                                + crate::wal::v7::codec::WAL_V7_FRAME_LEN)
+                                as u64,
+                        )?;
+                    *successor_bytes = successor_bytes.saturating_sub(successor_reservation);
+                }
+            }
             for (segment_id, allocated_bytes) in segment_allocations {
                 let charge = charges.entry(segment_id).or_default();
                 *charge = (*charge).max(allocated_bytes);
@@ -3406,8 +3446,6 @@ impl KvEngine {
             .and_then(|bytes| bytes.checked_add(unattributed_bytes))
             .ok_or_else(|| anyhow!("PITR retained source allocation overflows"))?;
 
-        let allocation_unit =
-            crate::pitr::segment::filesystem_allocation_reservation(database_path, 1)?;
         let capacity = crate::pitr::migration::assess_v7_migration_capacity(
             config,
             active_image_bytes,
@@ -3865,10 +3903,10 @@ impl KvEngine {
         ))
     }
 
-    /// Finish v7 rotation transitions that stopped at either durable manifest
-    /// boundary. `Sealing` still has the source as Active and must be sealed;
-    /// `Sealed` with the source still installed only needs its already-authorized
-    /// empty successor image and memtable registration.
+    /// Finish v7 rotation or legacy-to-v7 migration transitions that stopped at
+    /// a durable manifest boundary. `Sealing` still has the source as Active and
+    /// must be sealed; `Sealed` with the source still installed only needs its
+    /// already-authorized empty successor image and memtable registration.
     #[cfg(target_os = "linux")]
     fn resume_v7_successor_install(
         &self,
@@ -3891,6 +3929,86 @@ impl KvEngine {
             let _prepared =
                 self.seal_rotate_v7_active_wal(source_segment_id, obligation.successor_segment_id)?;
             state = self.pitr_manifest_state.lock().clone();
+        }
+
+        if let Some((&source_segment_id, obligation)) =
+            state.obligations.iter().find(|(_, obligation)| {
+                obligation.state == ObligationState::Sealing
+                    && obligation.wal_format == PitrWalFormat::LegacyV5V6
+                    && obligation.migration_successor_boundary.is_some()
+            })
+        {
+            sequencer.stop_commit_admission_and_capture()?;
+            let active = self.inner.state.load().memtable.clone();
+            ensure!(
+                active.uses_wal_v5()
+                    && LsmStorageInner::pitr_segment_of(&active) == Some(source_segment_id),
+                "legacy migration intent does not name the installed Active WAL"
+            );
+            let capacity = self.pitr_v7_migration_capacity_snapshot(
+                state
+                    .config
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("legacy migration has no persisted configuration"))?,
+                source_segment_id,
+                &active,
+                Some(obligation.successor_segment_id),
+            )?;
+            ensure!(
+                matches!(
+                    capacity.decision,
+                    crate::pitr::api::PitrV7MigrationCapacityDecision::Eligible
+                ),
+                "durable legacy-to-v7 migration intent cannot be completed: capacity is deferred ({:?})",
+                capacity.decision
+            );
+            active.sync_wal()?;
+            let wal_path = active
+                .wal_path()
+                .ok_or_else(|| anyhow!("legacy migration source has no WAL path"))?;
+            let seal_path = wal_path.with_extension("seal");
+            let (seal, seal_bytes) = active.finalize_pitr_seal()?;
+            ensure!(
+                seal.logical_length == obligation.logical_length,
+                "recovered legacy migration seal differs from its durable intent"
+            );
+            // A visible seal may be left by a failed directory sync. Verify
+            // its complete identity and sync both the file and its parent on
+            // every retry before publishing SegmentSealed.
+            crate::pitr::segment::install_pitr_file_no_replace(&seal_path, &seal_bytes)?;
+            let wal_length = fs::metadata(wal_path)?.len();
+            ensure!(
+                wal_length >= seal.logical_length,
+                "legacy migration source WAL is shorter than its durable intent"
+            );
+            if wal_length != seal.logical_length {
+                let file = fs::OpenOptions::new().write(true).open(wal_path)?;
+                file.set_len(seal.logical_length)?;
+                file.sync_all()?;
+            }
+
+            // Bind the previously chosen successor boundary to the actual
+            // legacy seal before advancing the manifest from MigrationStarted
+            // to SegmentSealed. A forged or stale successor identity must not
+            // become the epoch's new Active anchor.
+            let (metadata, _, _) = self.load_pitr_source_segment(&state, source_segment_id)?;
+            let boundary = obligation
+                .migration_successor_boundary
+                .ok_or_else(|| anyhow!("legacy migration intent has no successor boundary"))?;
+            let header = crate::wal::v7::codec::WalV7Header {
+                timeline_id: crate::pitr::TimelineId(boundary.timeline_id),
+                archive_epoch_id: crate::pitr::ArchiveEpochId(boundary.archive_epoch_id),
+                segment_id: crate::pitr::SegmentId(boundary.segment_id),
+                predecessor: crate::pitr::ChainAnchor::Segment(metadata.anchor),
+                incarnation: boundary.incarnation,
+            };
+            ensure!(
+                header.digest()? == boundary.prefix_digest,
+                "legacy migration successor boundary differs from its sealed predecessor"
+            );
+
+            state = self.reconcile_durable_archive_obligations(state)?;
+            *self.inner.pitr_active_started_at.lock() = None;
         }
 
         let active = self.inner.state.load().memtable.clone();
@@ -4259,6 +4377,10 @@ impl KvEngine {
                         "v7 Sealing successor advanced before its boundary was published"
                     );
                     successor_active_boundary = Some(empty_boundary);
+                } else if sealing_obligation.wal_format
+                    == crate::pitr::manifest::PitrWalFormat::LegacyV5V6
+                {
+                    successor_active_boundary = sealing_obligation.migration_successor_boundary;
                 }
                 // A sealing batch torn at the record boundary leaves `SealStarted`
                 // durable without the `SegmentSealed` that finishes it, so the
@@ -4317,7 +4439,9 @@ impl KvEngine {
                     }
                 });
                 let (metadata, _, _) = self.load_pitr_source_segment(&state, segment_id)?;
-                if let Some(boundary) = successor_active_boundary {
+                if sealing_obligation.wal_format == crate::pitr::manifest::PitrWalFormat::V7
+                    && let Some(boundary) = successor_active_boundary
+                {
                     let active = self.inner.state.load().memtable.clone();
                     let successor_path = active
                         .wal_path()
@@ -4344,6 +4468,19 @@ impl KvEngine {
                                     seal_digest: metadata.seal_digest,
                                 },),
                         "v7 Sealing successor identity differs from its sealed predecessor"
+                    );
+                } else if let Some(boundary) = successor_active_boundary {
+                    let header = crate::wal::v7::codec::WalV7Header {
+                        timeline_id: crate::pitr::TimelineId(boundary.timeline_id),
+                        archive_epoch_id: crate::pitr::ArchiveEpochId(boundary.archive_epoch_id),
+                        segment_id: crate::pitr::SegmentId(boundary.segment_id),
+                        predecessor: crate::pitr::ChainAnchor::Segment(metadata.anchor),
+                        incarnation: boundary.incarnation,
+                    };
+                    ensure!(
+                        boundary.segment_id == sealing_obligation.successor_segment_id
+                            && header.digest()? == boundary.prefix_digest,
+                        "legacy migration successor boundary differs from its sealed predecessor"
                     );
                 }
                 let record = crate::pitr::manifest::PitrManifestRecord::SegmentSealed {
@@ -20868,6 +21005,215 @@ mod tests {
             Some(Bytes::from(legacy_value))
         );
         reopened.close_storage()?;
+
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn legacy_v7_migration_intent_test_engine(
+        directory: &std::path::Path,
+        persist_seal_before_resume: bool,
+    ) -> anyhow::Result<(Arc<KvEngine>, crate::pitr::manifest::ActiveBoundary)> {
+        use crate::pitr::manifest::{ActiveBoundary, PitrManifestRecord, replay_pitr_records};
+        use crate::pitr::{ArchiveEpochId, ChainAnchor, SegmentAnchor, SegmentId, TimelineId};
+        use crate::wal::v7::codec::{WAL_V7_HEADER_LEN, WalV7Header};
+        use sha2::Digest;
+        use std::io::Write as _;
+
+        let engine = pitr_flush_test_engine(directory);
+        suspend_pitr_maintenance_for_test(&engine);
+        engine.put(b"legacy-before-migration", b"value")?;
+        engine.put(b"second-legacy-key", b"second-value")?;
+
+        let mut state = engine.pitr_manifest_state.lock().clone();
+        let source_segment_id = state
+            .active_segment_id
+            .ok_or_else(|| anyhow::anyhow!("legacy PITR fixture has no Active segment"))?;
+        let successor_segment_id = state.next_segment_id;
+        let active = engine.inner.state.load().memtable.clone();
+        assert!(active.uses_wal_v5());
+        active.sync_wal()?;
+        let (seal, seal_bytes) = active.finalize_pitr_seal()?;
+        let predecessor = SegmentAnchor {
+            segment_id: SegmentId(source_segment_id),
+            wal_digest: seal.wal_digest,
+            seal_digest: sha2::Sha256::digest(&seal_bytes).into(),
+        };
+        let boundary_header = WalV7Header {
+            timeline_id: TimelineId(state.timeline_id.unwrap()),
+            archive_epoch_id: ArchiveEpochId(state.archive_epoch_id.unwrap()),
+            segment_id: SegmentId(successor_segment_id),
+            predecessor: ChainAnchor::Segment(predecessor),
+            incarnation: [0x5a; 16],
+        };
+        let successor_boundary = ActiveBoundary {
+            timeline_id: boundary_header.timeline_id.0,
+            archive_epoch_id: boundary_header.archive_epoch_id.0,
+            segment_id: successor_segment_id,
+            incarnation: boundary_header.incarnation,
+            ticket_end: 0,
+            durable_end: WAL_V7_HEADER_LEN as u64,
+            last_commit_ts: 0,
+            prefix_digest: boundary_header.digest()?,
+        };
+        engine
+            .inner
+            .mvcc
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("legacy PITR fixture has no MVCC"))?
+            .stop_commit_admission_and_capture()?;
+
+        // Keep the retained source close to its logical length so surplus
+        // preallocation cannot mask duplicate transition charges after reopen.
+        let source_wal_path = active.wal_path().unwrap();
+        let mut source_wal = std::fs::OpenOptions::new()
+            .append(true)
+            .open(source_wal_path)?;
+        source_wal.set_len(seal.logical_length)?;
+        source_wal.write_all(&[0xa5; 17])?;
+        source_wal.sync_all()?;
+        let capacity = engine
+            .pitr_v7_migration_capacity_status(&state, &active)?
+            .ok_or_else(|| anyhow::anyhow!("legacy PITR fixture has no migration assessment"))?;
+        // Persist a fixture whose limit is exactly the pre-intent budget.
+        state.config.as_mut().unwrap().max_source_spool_bytes = capacity.required_total_bytes;
+        *engine.inner.pitr_state.lock() = state.clone();
+        *engine.pitr_manifest_state.lock() = state.clone();
+        engine.inner.ensure_manifest_v7()?;
+        let snapshot = PitrManifestRecord::Snapshot(Box::new(state));
+        let migration_started = PitrManifestRecord::MigrationStarted {
+            segment_id: source_segment_id,
+            successor_segment_id,
+            logical_length: seal.logical_length,
+            successor_active_boundary: successor_boundary,
+        };
+        let sealing_state = replay_pitr_records([snapshot.clone(), migration_started.clone()])?;
+        engine.persist_pitr_lifecycle(&[migration_started], sealing_state)?;
+
+        if persist_seal_before_resume {
+            let (written, _, _) = engine.inner.write_pitr_seal_for_active_wal()?;
+            assert_eq!(written, seal);
+        }
+
+        Ok((engine, successor_boundary))
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn resume_completes_legacy_v7_migration_intent_with_or_without_seal_sidecar()
+    -> anyhow::Result<()> {
+        for (persist_seal_before_resume, reopen_before_resume) in
+            [(false, false), (true, false), (false, true), (true, true)]
+        {
+            let directory = tempdir()?;
+            let (engine, successor_boundary) = legacy_v7_migration_intent_test_engine(
+                directory.path(),
+                persist_seal_before_resume,
+            )?;
+            let options = engine.inner.options.as_ref().clone();
+            let sealing_state = engine.pitr_manifest_state.lock().clone();
+            let source_segment_id = sealing_state.active_segment_id.unwrap();
+            let source_wal_path = directory
+                .path()
+                .join("db")
+                .join(format!("pitr-{source_segment_id:020}.wal"));
+            let source_length = sealing_state.obligations[&source_segment_id].logical_length;
+            assert!(std::fs::metadata(&source_wal_path)?.len() > source_length);
+
+            let engine = if reopen_before_resume {
+                engine.close_storage()?;
+                drop(engine);
+                let reopened = KvEngine::open(directory.path().join("db"), options.clone())?;
+                suspend_pitr_maintenance_for_test(&reopened);
+                // Rebuild the actual Sealing source and pending-successor
+                // charges before exercising the authorized completion path.
+                reopened.resume_pitr_lifecycle(sealing_state.clone())?;
+                reopened
+            } else {
+                engine
+            };
+            let resumed = engine.resume_v7_successor_install(sealing_state)?;
+            let active = engine.inner.state.load().memtable.clone();
+            assert!(active.uses_v7_wal());
+            assert_eq!(
+                LsmStorageInner::pitr_segment_of(&active),
+                Some(successor_boundary.segment_id)
+            );
+            assert_eq!(resumed.active_boundary, Some(successor_boundary));
+            assert_eq!(
+                resumed.obligations[&source_segment_id].state,
+                crate::pitr::manifest::ObligationState::Sealed
+            );
+            assert_eq!(std::fs::metadata(&source_wal_path)?.len(), source_length);
+            assert!(source_wal_path.with_extension("seal").is_file());
+            assert_eq!(
+                std::fs::metadata(active.wal_path().unwrap())?.len(),
+                (crate::wal::v7::codec::WAL_V7_HEADER_LEN + crate::wal::v7::codec::WAL_V7_FRAME_LEN)
+                    as u64
+            );
+            assert_ne!(
+                source_length,
+                std::fs::metadata(active.wal_path().unwrap())?.len()
+            );
+            assert_eq!(
+                engine.get(b"legacy-before-migration")?,
+                Some(Bytes::from_static(b"value"))
+            );
+            assert!(matches!(
+                engine.resume_pitr(directory.path().join("repository"))?,
+                crate::pitr::api::PitrResumeOutcome::Resumed
+            ));
+            engine.put(b"after-migration", b"v7-value")?;
+            engine.close_storage()?;
+            drop(active);
+            drop(engine);
+
+            let reopened = KvEngine::open(directory.path().join("db"), options)?;
+            assert_eq!(
+                reopened.get(b"legacy-before-migration")?,
+                Some(Bytes::from_static(b"value"))
+            );
+            assert_eq!(
+                reopened.get(b"after-migration")?,
+                Some(Bytes::from_static(b"v7-value"))
+            );
+            reopened.close_storage()?;
+        }
+
+        Ok(())
+    }
+
+    #[cfg(all(target_os = "linux", feature = "chaos-testing"))]
+    #[test]
+    fn failpoint_resume_legacy_v7_migration_retries_seal_directory_sync() -> anyhow::Result<()> {
+        let directory = tempdir()?;
+        let (engine, successor_boundary) =
+            legacy_v7_migration_intent_test_engine(directory.path(), false)?;
+        let state = engine.pitr_manifest_state.lock().clone();
+        let source_segment_id = state.active_segment_id.unwrap();
+        let source_seal_path = directory
+            .path()
+            .join("db")
+            .join(format!("pitr-{source_segment_id:020}.seal"));
+        let manifest_path = directory.path().join("db").join("MANIFEST");
+        let manifest_before = std::fs::read(&manifest_path)?;
+        let scenario = fail::FailScenario::setup();
+        for _ in 0..2 {
+            fail::cfg("pitr.install_before_directory_sync", "return").unwrap();
+            let result = engine.resume_v7_successor_install(state.clone());
+            fail::remove("pitr.install_before_directory_sync");
+            let error = result.unwrap_err();
+            assert!(format!("{error:#}").contains("injected PITR install directory sync failure"));
+            assert!(source_seal_path.is_file());
+            assert_eq!(std::fs::read(&manifest_path)?, manifest_before);
+            assert_eq!(*engine.pitr_manifest_state.lock(), state);
+            assert!(engine.inner.state.load().memtable.uses_wal_v5());
+        }
+        let resumed = engine.resume_v7_successor_install(state)?;
+        assert_eq!(resumed.active_boundary, Some(successor_boundary));
+        assert!(engine.inner.state.load().memtable.uses_v7_wal());
+        engine.close_storage()?;
+        scenario.teardown();
 
         Ok(())
     }

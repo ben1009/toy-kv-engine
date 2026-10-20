@@ -1002,6 +1002,10 @@ pub(crate) fn install_pitr_file_no_replace(
             }
             return Err(error.into());
         }
+        #[cfg(feature = "chaos-testing")]
+        crate::chaos::failpoint::fail_point!("pitr.install_before_directory_sync", |_| Err(
+            anyhow::anyhow!("injected PITR install directory sync failure")
+        ));
         std::fs::File::open(parent)?.sync_all()?;
 
         Ok(())
@@ -1025,6 +1029,10 @@ fn verify_existing_pitr_file(
     existing_file.read_exact(&mut existing)?;
     ensure!(existing == bytes, "existing PITR file identity mismatch");
     existing_file.sync_all()?;
+    #[cfg(feature = "chaos-testing")]
+    crate::chaos::failpoint::fail_point!("pitr.install_before_directory_sync", |_| Err(
+        anyhow::anyhow!("injected PITR install directory sync failure")
+    ));
     parent_file.sync_all()?;
 
     Ok(())
