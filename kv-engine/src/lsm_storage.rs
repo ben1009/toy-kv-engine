@@ -3708,6 +3708,7 @@ impl KvEngine {
             // their spool/index quota before reporting a successful resume.
             state = self.reconcile_durable_archive_obligations(state)?;
         }
+        self.report_deferred_v7_migration_on_resume(&state);
         drop(barrier);
         if state.mode == crate::pitr::manifest::PitrMode::PublicationUncertain {
             return Ok(crate::pitr::api::PitrResumeOutcome::ReconciliationRequired(
@@ -3785,6 +3786,44 @@ impl KvEngine {
             ));
         }
         Ok(crate::pitr::api::PitrResumeOutcome::Resumed)
+    }
+
+    /// Report a capacity deferral without making a healthy legacy Active WAL
+    /// unavailable. Legacy v5/v6 recovery and its Leader writer remain valid
+    /// even when the configured source-spool limit cannot fund a v7 transition.
+    #[cfg(target_os = "linux")]
+    fn report_deferred_v7_migration_on_resume(&self, state: &crate::pitr::manifest::PitrState) {
+        use crate::pitr::api::PitrV7MigrationCapacityDecision;
+
+        let active = self.inner.state.load().memtable.clone();
+        if !active.uses_wal_v5() || state.mode != crate::pitr::manifest::PitrMode::Enabled {
+            return;
+        }
+
+        match self.pitr_v7_migration_capacity_status(state, &active) {
+            Ok(Some(capacity)) => {
+                let PitrV7MigrationCapacityDecision::Deferred(reason) = capacity.decision else {
+                    return;
+                };
+                log::info!(
+                    "PITR v7 migration deferred on resume: reason={reason:?}, required_transition_bytes={}, required_total_bytes={}, available_capacity_bytes={}, source_spool_limit_bytes={}; keeping Active legacy WAL format {:?} on Leader I/O",
+                    capacity.required_transition_bytes,
+                    capacity.required_total_bytes,
+                    capacity.available_capacity_bytes,
+                    capacity.source_spool_limit_bytes,
+                    active.wal_format_version(),
+                );
+            }
+            Ok(None) => {}
+            Err(error) => {
+                // Capacity reporting is advisory; filesystem sampling errors
+                // must not turn a valid legacy reopen into a write outage.
+                log::warn!(
+                    "could not assess PITR v7 migration capacity on resume; keeping Active legacy WAL format {:?} on Leader I/O: {error:#}",
+                    active.wal_format_version(),
+                );
+            }
+        }
     }
 
     /// Finish v7 rotation transitions that stopped at either durable manifest
