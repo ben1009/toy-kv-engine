@@ -466,8 +466,9 @@ Post-sync cursor tests also reject aligned cutoffs that omit covered fragments
 or include excluded DATA, preserving the prior frontier and poisoning admission.
 The serial persistence model covers repeated normalization, continued append,
 and crash/reopen for empty, nonempty, fallback, and trailing-control prefixes,
-including a selected marker behind speculative DATA. The production writer
-remains v6. Stage 5 now also has a low-level serial v7 Leader writer primitive:
+including a selected marker behind speculative DATA. At this point in the
+implementation sequence, the production writer remained v6. Stage 5 now also
+has a low-level serial v7 Leader writer primitive:
 it resumes from installed metadata, preflights DATA-plus-FRONTIER segment
 capacity, writes one ticket's DATA and linked FRONTIER frames, performs one
 WAL `fdatasync`, and advances hash/cursor state only after success. Any failure
@@ -499,12 +500,13 @@ retryable validation/capacity rejection, and returned errors or caught panics
 during v7 sync across all seven MVCC write paths. Uncertain append failures
 poison MVCC before returning or unwinding.
 Successful PITR resume now enables synchronous and asynchronous public point
-writes through the recovered v7 batch writer. Public Parallel barriers and the
-v6 to v7 transition remain unconnected. Active v7 reservation owners and their
-shared ledger are retained through durable source cleanup and then retired from
-segment bookkeeping.
+writes through the recovered v7 batch writer. Public Parallel barriers, the
+v6-to-v7 migration, recovery-point rotation, and checkpoint/backup boundaries
+now use the v7 lifecycle path. Active v7 reservation owners and their shared
+ledger are retained through durable source cleanup and then retired from segment
+bookkeeping. Constructor defaults and full crash/performance qualification remain.
 
-**Last updated:** 2026-10-20
+**Last updated:** 2026-10-21
 
 **Source baseline:** `30a64fa855126596316ab6b9237e6348b0e41fd2`, which merged RFC 025 in PR #379.
 
@@ -521,7 +523,9 @@ the final gate.
 The RFC is the protocol authority. This plan identifies code changes and
 acceptance criteria; it does not change the wire format or recovery contract.
 New types and module paths named below are proposed implementation boundaries.
-The current writer remains PITR v6 while these stages are incomplete.
+Fresh PITR segments still begin as v6. Capacity-eligible nonempty legacy Active
+segments migrate to v7 on resume or maintenance rotation; final default
+selection and qualification remain later work.
 
 The delivery includes synchronous and asynchronous engine entry points,
 explicit v7 Leader comparison mode using the same frontier protocol, and
@@ -572,10 +576,10 @@ durable anchors or the strict immutable-object rules.
 
 ## Stage dependencies
 
-Stage 2 codec and persistence-model implementation is complete. Stage 4 is in
-progress; production WAL-open and manifest integration, stages 5–8, and final
-qualification remain planned. Each stage adds its own regression coverage, and
-stage 8 assembles the complete qualification evidence.
+Stages 1–6 are implemented for the production v7 Active path. Stage 7 migration
+and constructor coverage remain in progress; Stage 8 completes crash/performance
+qualification and default adoption. Each stage adds its own regression coverage,
+and stage 8 assembles the complete qualification evidence.
 
 | Stage | Depends on | Reviewable result | Production writer |
 | --- | --- | --- | --- |
@@ -1232,7 +1236,9 @@ repository bootstrap or durable enable intent; disabled-state source files,
 staging files, and recovery temporaries are included. Legacy reopen now performs
 the read-only assessment and logs deferred reason and capacity details while
 keeping a healthy v5/v6 Active WAL writable with Leader I/O; legacy rotation
-does not consume the assessment yet. The migration module now exposes an owned
+now attempts the same capacity-gated migration before making another legacy
+successor. A deferred or unavailable assessment leaves the existing v5/v6
+Leader recovery-point rotation path in place. The migration module now exposes an owned
 reservation helper that atomically charges its source-spool and
 recovery-workspace requirements on one live ledger. Active v7 recovery uses the
 same filesystem-rounded workspace charge for both its reservation and ledger
@@ -1299,7 +1305,18 @@ successor/recovery images once against their transition allowances. Regression
 coverage includes exact-capacity Sealed retries with and without retained successor
 images, plus flush reclamation before migration intent and after recovery
 reservation, checking source-spool charges and successful reopen. Constructor
-defaults and full crash qualification remain later Stage 7 work.
+defaults and full crash qualification remain later Stage 7 work. Maintenance-driven
+legacy rotations use the same capacity assessment and reservation: eligible
+nonempty sources transition to v7, while deferred capacity retains the normal
+v5/v6 Leader rotation path. The transition keeps admission stopped through
+successor installation and archive reconciliation, then checks manifest,
+publication, archive-obligation completion, and Active-WAL health before
+reopening writes. A second reconciliation cleans up migrated legacy sources
+that already finished flushing; idle successors also schedule cleanup retries
+for legacy source obligations. Standalone checkpoints select their capture
+protocol under the PITR lifecycle locks after forced-boundary preparation, so
+a migration during preparation uses the v7 admission cutoff and produces a
+standalone snapshot without a source Active-WAL dependency.
 
 - Add a shared migration/preflight decision used by enablement, reopen, and
   rotation. Calculate capacity for the largest configured v7 physical image

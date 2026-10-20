@@ -3859,8 +3859,7 @@ impl KvEngine {
             self.resume_v7_successor_install_with_reservation(state, None)?;
         state = self.reconcile_durable_archive_obligations(state)?;
         if state.obligations.values().any(|obligation| {
-            obligation.wal_format == crate::pitr::manifest::PitrWalFormat::V7
-                && obligation.state == crate::pitr::manifest::ObligationState::Reclaimable
+            obligation.state == crate::pitr::manifest::ObligationState::Reclaimable
         }) {
             // The first pass makes newly archived sources durably Reclaimable.
             // Only then may cleanup unlink already-flushed sources and release
@@ -3877,8 +3876,7 @@ impl KvEngine {
             migration_reservation = reservation;
             state = self.reconcile_durable_archive_obligations(state)?;
             if state.obligations.values().any(|obligation| {
-                obligation.wal_format == crate::pitr::manifest::PitrWalFormat::V7
-                    && obligation.state == crate::pitr::manifest::ObligationState::Reclaimable
+                obligation.state == crate::pitr::manifest::ObligationState::Reclaimable
             }) {
                 state = self.reconcile_durable_archive_obligations(state)?;
             }
@@ -5354,22 +5352,31 @@ impl KvEngine {
         self.create_recovery_point_locked_cancellable(resume_admission_on_success, None, false)
     }
 
-    /// Capture a v7 checkpoint at a fixed MVCC cutoff while serializing PITR
-    /// lifecycle changes. Admission stays stopped through the source flush and
-    /// manifest snapshot; it resumes only after the pinned checkpoint view is
-    /// complete.
+    #[cfg(all(target_os = "linux", test))]
+    fn with_v7_checkpoint_boundary<T>(&self, capture: impl FnOnce() -> Result<T>) -> Result<T> {
+        self.with_checkpoint_wal_boundary(|is_v7| {
+            ensure!(
+                is_v7,
+                "v7 checkpoint boundary requires an Active v7 PITR WAL"
+            );
+            capture()
+        })
+    }
+
+    /// Choose the standalone checkpoint protocol while excluding PITR format
+    /// changes. For v7, admission stays stopped through the source flush and
+    /// manifest snapshot, then resumes after the checkpoint view is pinned.
     #[cfg(target_os = "linux")]
-    pub(crate) fn with_v7_checkpoint_boundary<T>(
+    pub(crate) fn with_checkpoint_wal_boundary<T>(
         &self,
-        capture: impl FnOnce() -> Result<T>,
+        capture: impl FnOnce(bool) -> Result<T>,
     ) -> Result<T> {
         let _operation_guard = self.pitr_operation_lock.lock();
         let _barrier = self.pitr_barrier_lock.lock();
         self.inner.lifecycle.ensure_open()?;
-        ensure!(
-            self.inner.state.load().memtable.uses_v7_wal(),
-            "v7 checkpoint boundary requires an Active v7 PITR WAL"
-        );
+        if !self.inner.state.load().memtable.uses_v7_wal() {
+            return capture(false);
+        }
         ensure!(
             !self.pitr_publication_unknown.load(Ordering::Acquire),
             "v7 checkpoint capture cannot proceed while a PITR manifest transition has an unknown outcome; reopen the database first"
@@ -5410,7 +5417,7 @@ impl KvEngine {
             }
         }
 
-        let captured = capture();
+        let captured = capture(true);
         if admission_was_open {
             let health = (|| -> Result<()> {
                 ensure!(
@@ -6334,8 +6341,7 @@ impl KvEngine {
         state = resumed_state;
         state = self.reconcile_durable_archive_obligations(state)?;
         if state.obligations.values().any(|obligation| {
-            obligation.wal_format == crate::pitr::manifest::PitrWalFormat::V7
-                && obligation.state == crate::pitr::manifest::ObligationState::Reclaimable
+            obligation.state == crate::pitr::manifest::ObligationState::Reclaimable
         }) {
             state = self.reconcile_durable_archive_obligations(state)?;
         }
@@ -6395,8 +6401,7 @@ impl KvEngine {
             state = resumed_state;
             state = self.reconcile_durable_archive_obligations(state)?;
             if state.obligations.values().any(|obligation| {
-                obligation.wal_format == crate::pitr::manifest::PitrWalFormat::V7
-                    && obligation.state == crate::pitr::manifest::ObligationState::Reclaimable
+                obligation.state == crate::pitr::manifest::ObligationState::Reclaimable
             }) {
                 // The first pass durably authorizes reclamation. A second
                 // pass can now remove sources that already finished flushing
@@ -6424,6 +6429,61 @@ impl KvEngine {
                 .resume_commit_admission();
         }
         if self.inner.state.load().memtable.is_empty() {
+            return Ok(());
+        }
+        let active_memtable = self.inner.state.load().memtable.clone();
+        if active_memtable.uses_wal_v5()
+            && let Some((migration_state, reservation)) =
+                self.start_eligible_legacy_v7_migration(&state)?
+        {
+            // Capacity-gated legacy migration is a rotation outcome: when the
+            // transition fits, archive this legacy source and install its v7
+            // successor instead of creating another v5/v6 successor. If the
+            // assessment or reservation defers, the normal legacy recovery
+            // point path below remains available.
+            let (migrated_state, reservation) = self
+                .resume_v7_successor_install_with_reservation(migration_state, Some(reservation))?;
+            let migration_reservation = reservation
+                .ok_or_else(|| anyhow!("legacy v7 migration lost its capacity reservation"))?;
+            state = self.reconcile_durable_archive_obligations(migrated_state)?;
+            if state.obligations.values().any(|obligation| {
+                obligation.state == crate::pitr::manifest::ObligationState::Reclaimable
+            }) {
+                state = self.reconcile_durable_archive_obligations(state)?;
+            }
+            ensure!(
+                state.obligations.values().all(|obligation| {
+                    obligation.state == crate::pitr::manifest::ObligationState::Reclaimable
+                }),
+                "legacy v7 migration archive obligations remain pending"
+            );
+
+            let active = self.inner.state.load().memtable.clone();
+            ensure!(
+                state.mode == crate::pitr::manifest::PitrMode::Enabled
+                    && state.active_segment_id == LsmStorageInner::pitr_segment_of(&active)
+                    && active.uses_v7_wal(),
+                "capacity-gated legacy migration did not install its v7 Active successor"
+            );
+            ensure!(
+                !self.pitr_publication_unknown.load(Ordering::Acquire),
+                "legacy v7 migration archive publication is unknown"
+            );
+            if let Some(manifest) = self.inner.manifest.as_ref() {
+                manifest.ensure_durability_certain()?;
+            }
+            let sequencer = self
+                .inner
+                .mvcc
+                .as_ref()
+                .ok_or_else(|| anyhow!("PITR maintenance requires MVCC"))?;
+            sequencer.ensure_publication_healthy()?;
+            ensure!(
+                !active.v7_wal_requires_recovery(),
+                "Active v7 WAL is poisoned after legacy migration"
+            );
+            sequencer.resume_commit_admission();
+            drop(migration_reservation);
             return Ok(());
         }
         if let (Some(started), Some(config)) = (
@@ -15905,7 +15965,7 @@ impl LsmStorageInner {
         &self,
         state: &crate::pitr::manifest::PitrState,
     ) -> bool {
-        use crate::pitr::manifest::{ObligationState, PitrMode, PitrWalFormat};
+        use crate::pitr::manifest::{ObligationState, PitrMode};
 
         if state.mode == PitrMode::PublicationUncertain {
             return true;
@@ -15918,10 +15978,9 @@ impl LsmStorageInner {
             // A flushed source may still need unlink/directory-sync retry even
             // when archival is durable and the successor has no writes. Live
             // memtables retain their sources until the flush path retires them.
-            obligation.wal_format == PitrWalFormat::V7
-                && !std::iter::once(storage_state.memtable.as_ref())
-                    .chain(storage_state.imm_memtables.iter().map(AsRef::as_ref))
-                    .any(|memtable| Self::pitr_segment_of(memtable) == Some(segment_id))
+            !std::iter::once(storage_state.memtable.as_ref())
+                .chain(storage_state.imm_memtables.iter().map(AsRef::as_ref))
+                .any(|memtable| Self::pitr_segment_of(memtable) == Some(segment_id))
         })
     }
 
@@ -27180,6 +27239,93 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[tokio::test(flavor = "current_thread")]
+    async fn legacy_checkpoint_migration_captures_standalone_state() -> anyhow::Result<()> {
+        for asynchronous in [false, true] {
+            let directory = tempdir()?;
+            let engine = pitr_flush_test_engine(directory.path());
+            suspend_pitr_maintenance_for_test(&engine);
+            engine.put(b"legacy-checkpoint-key", b"value")?;
+            assert!(engine.inner.state.load().memtable.uses_wal_v5());
+            let checkpoint_path = directory.path().join("checkpoint");
+            if asynchronous {
+                engine.create_checkpoint_async(&checkpoint_path).await?;
+            } else {
+                engine.create_checkpoint(&checkpoint_path)?;
+            }
+            assert!(engine.inner.state.load().memtable.uses_v7_wal());
+            let checkpoint =
+                KvEngine::open(&checkpoint_path, LsmStorageOptions::default_for_test())?;
+            assert_eq!(
+                checkpoint.get(b"legacy-checkpoint-key")?,
+                Some(Bytes::from_static(b"value"))
+            );
+            assert_eq!(
+                checkpoint.pitr_manifest_state.lock().mode,
+                crate::pitr::manifest::PitrMode::Disabled
+            );
+            engine.put(b"after-checkpoint", b"newer")?;
+            assert_eq!(checkpoint.get(b"after-checkpoint")?, None);
+            checkpoint.close()?;
+            engine.close_storage()?;
+        }
+
+        Ok(())
+    }
+
+    #[cfg(all(target_os = "linux", feature = "chaos-testing"))]
+    #[tokio::test(flavor = "current_thread")]
+    async fn failpoint_legacy_checkpoint_migration_captures_successor_writes() -> anyhow::Result<()>
+    {
+        let _scenario = crate::chaos::failpoint::FailScenario::setup();
+        for asynchronous in [false, true] {
+            let directory = tempdir()?;
+            let engine = pitr_flush_test_engine(directory.path());
+            suspend_pitr_maintenance_for_test(&engine);
+            engine.put(b"legacy-checkpoint-key", b"value")?;
+            let writer = Arc::clone(&engine);
+            fail::cfg_callback("pitr.after_forced_freeze_boundary", move || {
+                assert!(writer.inner.state.load().memtable.uses_v7_wal());
+                writer
+                    .put(b"successor-checkpoint-key", b"included")
+                    .unwrap();
+            })
+            .map_err(anyhow::Error::msg)?;
+
+            let checkpoint_path = directory.path().join("checkpoint");
+            let result = if asynchronous {
+                engine.create_checkpoint_async(&checkpoint_path).await
+            } else {
+                engine.create_checkpoint(&checkpoint_path)
+            };
+            fail::remove("pitr.after_forced_freeze_boundary");
+            result?;
+            let checkpoint =
+                KvEngine::open(&checkpoint_path, LsmStorageOptions::default_for_test())?;
+            assert_eq!(
+                checkpoint.get(b"legacy-checkpoint-key")?,
+                Some(Bytes::from_static(b"value"))
+            );
+            assert_eq!(
+                checkpoint.get(b"successor-checkpoint-key")?,
+                Some(Bytes::from_static(b"included"))
+            );
+            assert!(
+                engine
+                    .inner
+                    .mvcc
+                    .as_ref()
+                    .unwrap()
+                    .commit_admission_is_open()
+            );
+            checkpoint.close()?;
+            engine.close_storage()?;
+        }
+
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "current_thread")]
     async fn v7_checkpoint_capture_seals_and_flushes_the_fixed_cutoff() -> anyhow::Result<()> {
         for mode in [
             crate::wal::WalIoMode::Leader,
@@ -30194,9 +30340,11 @@ mod tests {
         use std::{sync::mpsc, time::Duration};
 
         let scenario = FailScenario::setup();
-        let dir = tempdir().unwrap();
-        let engine = pitr_flush_test_engine(dir.path());
         for checkpoint in [false, true] {
+            // Each operation must start on legacy PITR: its preparation can
+            // now migrate to v7, whose capture uses a separate boundary.
+            let dir = tempdir().unwrap();
+            let engine = pitr_flush_test_engine(dir.path());
             engine.put(b"before-capture", b"value").unwrap();
             let (entered_tx, entered_rx) = mpsc::channel();
             let (release_tx, release_rx) = mpsc::channel();
@@ -30231,8 +30379,8 @@ mod tests {
             release_tx.send(()).unwrap();
             worker.join().unwrap().unwrap();
             fail::remove("pitr.before_forced_freeze_boundary");
+            engine.close().unwrap();
         }
-        engine.close().unwrap();
         scenario.teardown();
     }
 
@@ -31675,6 +31823,104 @@ mod tests {
                 );
                 reopened.close_storage()?;
             }
+        }
+
+        Ok(())
+    }
+
+    #[cfg(all(target_os = "linux", feature = "chaos-testing"))]
+    #[test]
+    fn failpoint_legacy_migration_maintenance_reclaims_flushed_sources_after_failure()
+    -> anyhow::Result<()> {
+        use crate::pitr::manifest::ObligationState;
+
+        let _scenario = crate::chaos::failpoint::FailScenario::setup();
+        for failure in [
+            None,
+            Some("pitr.before_flushed_source_cleanup"),
+            Some("pitr.after_flushed_source_unlink"),
+        ] {
+            let directory = tempdir()?;
+            let engine = pitr_flush_test_engine(directory.path());
+            suspend_pitr_maintenance_for_test(&engine);
+            engine.put(b"legacy-before-cleanup", b"durable")?;
+            let source = engine.inner.state.load().memtable.clone();
+            let source_segment_id = LsmStorageInner::pitr_segment_of(&source).unwrap();
+            let source_wal = source.wal_path().unwrap().to_path_buf();
+            drop(source);
+
+            crate::pitr::archiver::set_catalog_publication_test_mode(
+                &directory.path().join("repository"),
+                1,
+            );
+            assert!(engine.run_pitr_maintenance(source_segment_id).is_err());
+            let state = engine.pitr_manifest_state.lock().clone();
+            assert_eq!(
+                state.obligations[&source_segment_id].state,
+                ObligationState::Sealed
+            );
+            assert!(
+                !engine
+                    .inner
+                    .mvcc
+                    .as_ref()
+                    .unwrap()
+                    .commit_admission_is_open()
+            );
+            let successor_segment_id = state.active_segment_id.unwrap();
+            let successor = engine.inner.state.load().memtable.clone();
+            assert!(successor.uses_v7_wal() && successor.is_empty());
+            let owner = successor.wal_v7_reservation_owner().unwrap();
+            let source_spool_before = owner.snapshot().source_spool_bytes;
+
+            // Flushing before archival becomes durable retains the source
+            // files. Reconciliation must later retire them even with an idle
+            // v7 successor and no new size or interval rotation trigger.
+            while !engine.inner.state.load().imm_memtables.is_empty() {
+                engine.inner.force_flush_next_imm_memtable()?;
+            }
+            assert!(source_wal.exists());
+            if let Some(failure) = failure {
+                fail::cfg(failure, "return").map_err(anyhow::Error::msg)?;
+            }
+            let retry = engine.run_pitr_maintenance(successor_segment_id);
+            if let Some(failure) = failure {
+                fail::remove(failure);
+                assert!(retry.is_err());
+                let state = engine.pitr_manifest_state.lock().clone();
+                assert_eq!(
+                    state.obligations[&source_segment_id].state,
+                    ObligationState::Reclaimable
+                );
+                assert!(engine.inner.pitr_maintenance_needs_reconciliation(&state));
+                assert!(
+                    !engine
+                        .inner
+                        .mvcc
+                        .as_ref()
+                        .unwrap()
+                        .commit_admission_is_open()
+                );
+            } else {
+                retry?;
+            }
+            engine
+                .inner
+                .pitr_maintenance_queued
+                .store(false, std::sync::atomic::Ordering::Release);
+            wait_for_v7_background_archive(&engine, source_segment_id)?;
+            assert!(
+                !engine
+                    .pitr_manifest_state
+                    .lock()
+                    .obligations
+                    .contains_key(&source_segment_id)
+            );
+            assert!(!source_wal.exists());
+            assert!(!source_wal.with_extension("seal").exists());
+            assert!(owner.snapshot().source_spool_bytes < source_spool_before);
+            engine.put(b"after-cleanup", b"writable")?;
+            engine.close_storage()?;
         }
 
         Ok(())
