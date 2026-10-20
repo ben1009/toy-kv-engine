@@ -89,8 +89,8 @@ const WAL_FD_INDEX: u32 = 0;
 const RING_SIZE: usize = 256;
 /// Maximum write SQEs per chunk (all slots for writes; fsync done via fdatasync).
 const MAX_WRITES_PER_CHUNK: usize = RING_SIZE;
-/// Preallocation block size (1 MiB).
-const PREALLOC_BLOCK: u64 = 1 << 20;
+/// Leader preallocation block size (1 MiB), also used by PITR capacity estimates.
+pub(crate) const PREALLOC_BLOCK: u64 = 1 << 20;
 /// Briefly spin before a solo leader drains the WAL queue so peer writers can
 /// join the same fdatasync.
 const GROUP_COMMIT_SOLO_SPINS: usize = 4;

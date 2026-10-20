@@ -3373,7 +3373,7 @@ impl KvEngine {
         );
         let active_allocated_bytes = LsmStorageInner::filesystem_allocated_bytes(&active_metadata)?;
         let (mut segment_allocations, staging_bytes, unattributed_bytes) =
-            LsmStorageInner::pitr_source_allocations(database_path, active_segment_id)?;
+            LsmStorageInner::pitr_source_allocations(database_path, Some(active_segment_id))?;
         let active_visible_bytes = segment_allocations.entry(active_segment_id).or_default();
         *active_visible_bytes = active_visible_bytes
             .checked_add(active_allocated_bytes)
@@ -3455,6 +3455,61 @@ impl KvEngine {
             successor_staging_bytes: capacity.successor_staging_bytes,
             terminal_manifest_headroom_bytes: capacity.terminal_manifest_headroom_bytes,
         })
+    }
+
+    /// Preflight a new PITR epoch against the complete v7 transition budget
+    /// before publishing its durable enable intent. A disabled database has no
+    /// live PITR segment manager, so account every visible PITR source, staging,
+    /// and recovery temporary file directly from the database directory. Also
+    /// budget for the new legacy Active WAL growing to its configured limit,
+    /// including Leader preallocation, before migration.
+    #[cfg(target_os = "linux")]
+    fn assess_new_pitr_v7_enable_capacity(
+        &self,
+        config: &crate::pitr::manifest::PersistedPitrConfig,
+    ) -> Result<crate::pitr::migration::V7MigrationCapacity> {
+        let (segment_allocations, staging_bytes, unattributed_bytes) =
+            LsmStorageInner::pitr_source_allocations(&self.inner.path, None)?;
+        let retained_source_spool_bytes = segment_allocations.values().try_fold(
+            staging_bytes
+                .checked_add(unattributed_bytes)
+                .ok_or_else(|| anyhow!("PITR retained source allocation overflows"))?,
+            |total, bytes| {
+                total
+                    .checked_add(*bytes)
+                    .ok_or_else(|| anyhow!("PITR retained source allocation overflows"))
+            },
+        )?;
+        let allocation_unit =
+            crate::pitr::segment::filesystem_allocation_reservation(&self.inner.path, 1)?;
+        let legacy_active_image_bytes = config
+            .max_segment_bytes
+            .saturating_add(crate::pitr::WAL_V5_HEADER_LEN as u64)
+            .clamp(
+                crate::pitr::WAL_V5_HEADER_LEN as u64,
+                crate::wal::MAX_WAL_FILE_SIZE,
+            );
+        // Seal sizing uses the logical image bound, but the Leader allocates
+        // whole preallocation blocks even when the segment limit is smaller.
+        let legacy_preallocated_bytes = legacy_active_image_bytes
+            .div_ceil(crate::wal::PREALLOC_BLOCK)
+            * crate::wal::PREALLOC_BLOCK;
+        let future_active_allocated_bytes =
+            crate::pitr::segment::filesystem_allocation_reservation(
+                &self.inner.path,
+                legacy_preallocated_bytes,
+            )?;
+        let retained_source_spool_bytes = retained_source_spool_bytes
+            .checked_add(future_active_allocated_bytes)
+            .ok_or_else(|| anyhow!("PITR retained source allocation overflows"))?;
+        let capacity = crate::pitr::migration::assess_v7_migration_capacity(
+            config,
+            legacy_active_image_bytes,
+            retained_source_spool_bytes,
+            allocation_unit,
+        )?;
+        capacity.ensure_eligible()?;
+        Ok(capacity)
     }
 
     #[cfg(target_os = "linux")]
@@ -6389,6 +6444,13 @@ impl KvEngine {
             self.pitr_manifest_state.lock().mode == crate::pitr::manifest::PitrMode::Disabled,
             "PITR is already enabled or requires reconciliation"
         );
+        ensure!(
+            self.inner.options.enable_wal,
+            "PITR requires WAL to be enabled"
+        );
+        options.validate()?;
+        let requested_config = options.persisted_config()?;
+        self.assess_new_pitr_v7_enable_capacity(&requested_config)?;
         let request = match self.prepare_pitr_enable_request(&options) {
             Ok(request) => request,
             Err(error) => {
@@ -9404,7 +9466,7 @@ impl LsmStorageInner {
         );
 
         let (source_allocations, staging_bytes, unattributed_bytes) =
-            Self::pitr_source_allocations(database_path, active_segment_id)?;
+            Self::pitr_source_allocations(database_path, Some(active_segment_id))?;
         let active_fixed_bytes = (WAL_V7_HEADER_LEN + WAL_V7_FRAME_LEN) as u64;
         let max_segment_bytes = config.max_segment_bytes;
         let max_recovery_workspace_bytes = {
@@ -9558,7 +9620,7 @@ impl LsmStorageInner {
         active_segment_id: u64,
     ) -> Result<u64> {
         let (segments, staging, unattributed) =
-            Self::pitr_source_allocations(database_path, active_segment_id)?;
+            Self::pitr_source_allocations(database_path, Some(active_segment_id))?;
         segments.values().try_fold(
             staging
                 .checked_add(unattributed)
@@ -9573,11 +9635,12 @@ impl LsmStorageInner {
 
     fn pitr_source_allocations(
         database_path: &Path,
-        active_segment_id: u64,
+        active_segment_id: Option<u64>,
     ) -> Result<(BTreeMap<u64, u64>, u64, u64)> {
-        let active_wal_name = format!("pitr-{active_segment_id:020}.wal");
-        let active_recovery_prefix =
-            crate::wal::v7::install::recovery_temp_prefix(std::ffi::OsStr::new(&active_wal_name));
+        let active_recovery_prefix = active_segment_id.map(|active_segment_id| {
+            let active_wal_name = format!("pitr-{active_segment_id:020}.wal");
+            crate::wal::v7::install::recovery_temp_prefix(std::ffi::OsStr::new(&active_wal_name))
+        });
         let mut by_segment = BTreeMap::new();
         let mut staging_bytes = 0_u64;
         let mut unattributed_bytes = 0_u64;
@@ -9595,9 +9658,10 @@ impl LsmStorageInner {
             if normal_source.is_none() && temporary_source.is_none() && !is_recovery_temp {
                 continue;
             }
-            if normal_source
-                .is_some_and(|(id, extension)| id == active_segment_id && extension == "wal")
-            {
+            if active_segment_id.is_some_and(|active_segment_id| {
+                normal_source
+                    .is_some_and(|(id, extension)| id == active_segment_id && extension == "wal")
+            }) {
                 continue;
             }
 
@@ -9612,7 +9676,11 @@ impl LsmStorageInner {
                 "PITR source path {} is not a regular file",
                 entry.path().display()
             );
-            if is_recovery_temp && name.starts_with(&active_recovery_prefix) {
+            if is_recovery_temp
+                && active_recovery_prefix
+                    .as_ref()
+                    .is_some_and(|prefix| name.starts_with(prefix))
+            {
                 continue;
             }
             let metadata = fs::symlink_metadata(entry.path())?;
@@ -18542,7 +18610,7 @@ mod tests {
                     archive_interval: std::time::Duration::from_secs(60),
                     max_segment_bytes: 64 * 1024,
                     max_unarchived_bytes: 64 * 1024,
-                    max_source_spool_bytes: 128 * 1024,
+                    max_source_spool_bytes: 2 * 1024 * 1024,
                 },
                 runtime: crate::pitr::api::PitrRuntimeOptions::default(),
             })
@@ -26996,7 +27064,7 @@ mod tests {
                     archive_interval: std::time::Duration::from_secs(3600),
                     max_segment_bytes: 1 << 20,
                     max_unarchived_bytes: 1 << 20,
-                    max_source_spool_bytes: 2 << 20,
+                    max_source_spool_bytes: 8 << 20,
                 },
                 runtime: crate::pitr::api::PitrRuntimeOptions::default(),
             })
@@ -27130,7 +27198,7 @@ mod tests {
                     archive_interval: std::time::Duration::from_secs(3600),
                     max_segment_bytes: 1 << 20,
                     max_unarchived_bytes: 1 << 20,
-                    max_source_spool_bytes: 2 << 20,
+                    max_source_spool_bytes: 8 << 20,
                 },
                 runtime: crate::pitr::api::PitrRuntimeOptions::default(),
             })
@@ -27725,7 +27793,7 @@ mod tests {
                     archive_interval: std::time::Duration::from_secs(3600),
                     max_segment_bytes: 1 << 20,
                     max_unarchived_bytes: 1 << 20,
-                    max_source_spool_bytes: 2 << 20,
+                    max_source_spool_bytes: 8 << 20,
                 },
                 runtime: crate::pitr::api::PitrRuntimeOptions::default(),
             })
@@ -27778,7 +27846,7 @@ mod tests {
                     archive_interval: std::time::Duration::from_secs(60),
                     max_segment_bytes: 1024 * 1024,
                     max_unarchived_bytes: 2 * 1024 * 1024,
-                    max_source_spool_bytes: 4 * 1024 * 1024,
+                    max_source_spool_bytes: 8 * 1024 * 1024,
                 },
                 runtime: crate::pitr::api::PitrRuntimeOptions::default(),
             })
@@ -27848,6 +27916,182 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn enable_pitr_rejects_insufficient_v7_capacity_before_intent_or_repository_creation() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("db");
+        let repository = dir.path().join("repository");
+        let engine = KvEngine::open(
+            &database,
+            LsmStorageOptions {
+                enable_wal: true,
+                ..LsmStorageOptions::default_for_test()
+            },
+        )
+        .unwrap();
+
+        let error = engine
+            .enable_pitr(crate::pitr::api::PitrOptions {
+                repository: repository.clone(),
+                config: crate::pitr::api::PersistedPitrConfig {
+                    archive_interval: std::time::Duration::from_secs(60),
+                    max_segment_bytes: 1 << 30,
+                    max_unarchived_bytes: 1 << 30,
+                    max_source_spool_bytes: 13 * (1 << 30) / 10,
+                },
+                runtime: crate::pitr::api::PitrRuntimeOptions::default(),
+            })
+            .unwrap_err();
+
+        assert!(
+            error.to_string().contains("InsufficientSourceSpool"),
+            "unexpected capacity error: {error:#}"
+        );
+        assert!(
+            error.to_string().contains("available"),
+            "capacity error should report the available headroom: {error:#}"
+        );
+        assert_eq!(
+            engine.pitr_manifest_state.lock().mode,
+            crate::pitr::manifest::PitrMode::Disabled,
+            "capacity rejection must happen before the durable enable intent"
+        );
+        assert!(
+            !repository.exists(),
+            "capacity rejection should happen before repository bootstrap"
+        );
+        engine.close().unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn enable_pitr_capacity_preflight_accounts_for_a_full_legacy_active_image() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("db");
+        let repository = dir.path().join("repository");
+        let engine = KvEngine::open(
+            &database,
+            LsmStorageOptions {
+                enable_wal: true,
+                ..LsmStorageOptions::default_for_test()
+            },
+        )
+        .unwrap();
+        let max_segment_bytes = 1 << 20;
+        let mut options = crate::pitr::api::PitrOptions {
+            repository: repository.clone(),
+            config: crate::pitr::api::PersistedPitrConfig {
+                archive_interval: std::time::Duration::from_secs(60),
+                max_segment_bytes,
+                max_unarchived_bytes: max_segment_bytes,
+                max_source_spool_bytes: 4 * max_segment_bytes,
+            },
+            runtime: crate::pitr::api::PitrRuntimeOptions::default(),
+        };
+        let allocation_unit =
+            crate::pitr::segment::filesystem_allocation_reservation(&database, 1).unwrap();
+        let empty_image_capacity = crate::pitr::migration::assess_v7_migration_capacity(
+            &options.persisted_config().unwrap(),
+            crate::pitr::WAL_V5_HEADER_LEN as u64,
+            0,
+            allocation_unit,
+        )
+        .unwrap();
+        assert_eq!(
+            empty_image_capacity.decision,
+            crate::pitr::migration::V7MigrationCapacityDecision::Eligible
+        );
+        options.config.max_source_spool_bytes = empty_image_capacity.required_transition_bytes;
+
+        let legacy_image_bound = max_segment_bytes + crate::pitr::WAL_V5_HEADER_LEN as u64;
+        let max_image_allocated_bytes =
+            crate::pitr::segment::filesystem_allocation_reservation(&database, legacy_image_bound)
+                .unwrap();
+        let full_image_capacity = crate::pitr::migration::assess_v7_migration_capacity(
+            &options.persisted_config().unwrap(),
+            legacy_image_bound,
+            max_image_allocated_bytes,
+            allocation_unit,
+        )
+        .unwrap();
+        assert_eq!(
+            full_image_capacity.decision,
+            crate::pitr::migration::V7MigrationCapacityDecision::Deferred(
+                crate::pitr::migration::V7MigrationDeferralReason::InsufficientSourceSpool
+            )
+        );
+
+        let error = engine.enable_pitr(options).unwrap_err();
+        assert!(
+            error.to_string().contains("InsufficientSourceSpool"),
+            "unexpected capacity error: {error:#}"
+        );
+        assert_eq!(
+            engine.pitr_manifest_state.lock().mode,
+            crate::pitr::manifest::PitrMode::Disabled
+        );
+        assert!(!repository.exists());
+        engine.close().unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn enable_pitr_capacity_preflight_accounts_for_leader_preallocation() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("db");
+        let repository = dir.path().join("repository");
+        let engine = KvEngine::open(
+            &database,
+            LsmStorageOptions {
+                enable_wal: true,
+                ..LsmStorageOptions::default_for_test()
+            },
+        )
+        .unwrap();
+        let mut options = crate::pitr::api::PitrOptions {
+            repository: repository.clone(),
+            config: crate::pitr::api::PersistedPitrConfig {
+                archive_interval: std::time::Duration::from_secs(3600),
+                max_segment_bytes: 16 * 1024,
+                max_unarchived_bytes: 16 * 1024,
+                max_source_spool_bytes: 128 * 1024,
+            },
+            runtime: crate::pitr::api::PitrRuntimeOptions::default(),
+        };
+        let error = engine.enable_pitr(options.clone()).unwrap_err();
+        assert!(
+            error.to_string().contains("InsufficientSourceSpool"),
+            "unexpected capacity error: {error:#}"
+        );
+        assert_eq!(
+            engine.pitr_manifest_state.lock().mode,
+            crate::pitr::manifest::PitrMode::Disabled
+        );
+        assert!(!repository.exists());
+
+        options.config.max_source_spool_bytes = 2 * 1024 * 1024;
+        let capacity = engine
+            .assess_new_pitr_v7_enable_capacity(&options.persisted_config().unwrap())
+            .unwrap();
+        assert_eq!(
+            capacity.legacy_active_image_bytes,
+            options.config.max_segment_bytes + crate::pitr::WAL_V5_HEADER_LEN as u64,
+            "seal sizing must keep the logical image bound"
+        );
+        engine.enable_pitr(options).unwrap();
+        engine.put(b"preallocation", b"value").unwrap();
+        let active = engine.inner.state.load().memtable.clone();
+        let metadata = std::fs::metadata(active.wal_path().unwrap()).unwrap();
+        assert_eq!(metadata.len(), crate::wal::PREALLOC_BLOCK);
+        assert!(
+            capacity.retained_source_spool_bytes
+                >= LsmStorageInner::filesystem_allocated_bytes(&metadata).unwrap(),
+            "preflight must cover the Leader's actual preallocation"
+        );
+        engine.close().unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn public_enable_pitr_installs_v5_successor_and_resumes_writes() {
         let dir = tempdir().unwrap();
         let parent = crate::backup::open_directory_no_follow(dir.path()).unwrap();
@@ -27867,7 +28111,7 @@ mod tests {
                     archive_interval: std::time::Duration::from_secs(60),
                     max_segment_bytes: 1024 * 1024,
                     max_unarchived_bytes: 2 * 1024 * 1024,
-                    max_source_spool_bytes: 4 * 1024 * 1024,
+                    max_source_spool_bytes: 8 * 1024 * 1024,
                 },
                 runtime: crate::pitr::api::PitrRuntimeOptions::default(),
             })
@@ -28072,7 +28316,7 @@ mod tests {
                     archive_interval,
                     max_segment_bytes,
                     max_unarchived_bytes: max_segment_bytes * 2,
-                    max_source_spool_bytes: max_segment_bytes * 4,
+                    max_source_spool_bytes: (max_segment_bytes * 8).max(2 * 1024 * 1024),
                 },
                 runtime: crate::pitr::api::PitrRuntimeOptions::default(),
             })
@@ -28424,9 +28668,9 @@ mod tests {
             repository: dir.path().join("repository"),
             config: crate::pitr::api::PersistedPitrConfig {
                 archive_interval: std::time::Duration::from_secs(1),
-                max_segment_bytes: 4096,
-                max_unarchived_bytes: 8192,
-                max_source_spool_bytes: 16384,
+                max_segment_bytes: 16 * 1024,
+                max_unarchived_bytes: 16 * 1024,
+                max_source_spool_bytes: 2 * 1024 * 1024,
             },
             runtime: crate::pitr::api::PitrRuntimeOptions::default(),
         };
@@ -28471,7 +28715,7 @@ mod tests {
                         archive_interval: std::time::Duration::from_secs(60),
                         max_segment_bytes: 1024 * 1024,
                         max_unarchived_bytes: 2 * 1024 * 1024,
-                        max_source_spool_bytes: 4 * 1024 * 1024,
+                        max_source_spool_bytes: 8 * 1024 * 1024,
                     },
                     runtime: crate::pitr::api::PitrRuntimeOptions::default(),
                 })
@@ -28545,7 +28789,7 @@ mod tests {
                     archive_interval: std::time::Duration::from_secs(60),
                     max_segment_bytes: 1024 * 1024,
                     max_unarchived_bytes: 2 * 1024 * 1024,
-                    max_source_spool_bytes: 4 * 1024 * 1024,
+                    max_source_spool_bytes: 8 * 1024 * 1024,
                 },
                 runtime: crate::pitr::api::PitrRuntimeOptions::default(),
             })
@@ -28631,9 +28875,9 @@ mod tests {
                 repository: dir.path().join("repository"),
                 config: crate::pitr::api::PersistedPitrConfig {
                     archive_interval: std::time::Duration::from_secs(1),
-                    max_segment_bytes: 8192,
-                    max_unarchived_bytes: 8192,
-                    max_source_spool_bytes: 16384,
+                    max_segment_bytes: 16 * 1024,
+                    max_unarchived_bytes: 16 * 1024,
+                    max_source_spool_bytes: 2 * 1024 * 1024,
                 },
                 runtime: crate::pitr::api::PitrRuntimeOptions::default(),
             })
@@ -28702,9 +28946,9 @@ mod tests {
                 repository: dir.path().join("repository"),
                 config: crate::pitr::api::PersistedPitrConfig {
                     archive_interval: std::time::Duration::from_secs(1),
-                    max_segment_bytes: 8192,
-                    max_unarchived_bytes: 8192,
-                    max_source_spool_bytes: 16384,
+                    max_segment_bytes: 16 * 1024,
+                    max_unarchived_bytes: 16 * 1024,
+                    max_source_spool_bytes: 2 * 1024 * 1024,
                 },
                 runtime: crate::pitr::api::PitrRuntimeOptions::default(),
             })
@@ -28757,9 +29001,9 @@ mod tests {
                 repository: dir.path().join("repository"),
                 config: crate::pitr::api::PersistedPitrConfig {
                     archive_interval: std::time::Duration::from_secs(1),
-                    max_segment_bytes: 8192,
-                    max_unarchived_bytes: 8192,
-                    max_source_spool_bytes: 16384,
+                    max_segment_bytes: 16 * 1024,
+                    max_unarchived_bytes: 16 * 1024,
+                    max_source_spool_bytes: 2 * 1024 * 1024,
                 },
                 runtime: crate::pitr::api::PitrRuntimeOptions::default(),
             })
@@ -28796,9 +29040,9 @@ mod tests {
                 config: crate::pitr::api::PersistedPitrConfig {
                     // Keep timer-driven rotation out of this explicit recovery-point test.
                     archive_interval: std::time::Duration::from_secs(3600),
-                    max_segment_bytes: 8192,
-                    max_unarchived_bytes: 8192,
-                    max_source_spool_bytes: 16384,
+                    max_segment_bytes: 16 * 1024,
+                    max_unarchived_bytes: 16 * 1024,
+                    max_source_spool_bytes: 2 * 1024 * 1024,
                 },
                 runtime: crate::pitr::api::PitrRuntimeOptions::default(),
             })
@@ -28933,9 +29177,9 @@ mod tests {
                 repository: dir.path().join("repository"),
                 config: crate::pitr::api::PersistedPitrConfig {
                     archive_interval: std::time::Duration::from_secs(1),
-                    max_segment_bytes: 4096,
-                    max_unarchived_bytes: 8192,
-                    max_source_spool_bytes: 16384,
+                    max_segment_bytes: 16 * 1024,
+                    max_unarchived_bytes: 16 * 1024,
+                    max_source_spool_bytes: 2 * 1024 * 1024,
                 },
                 runtime: crate::pitr::api::PitrRuntimeOptions::default(),
             })
@@ -28982,9 +29226,9 @@ mod tests {
                 repository: dir.path().join("repository"),
                 config: crate::pitr::api::PersistedPitrConfig {
                     archive_interval: std::time::Duration::from_secs(1),
-                    max_segment_bytes: 4096,
-                    max_unarchived_bytes: 8192,
-                    max_source_spool_bytes: 16384,
+                    max_segment_bytes: 16 * 1024,
+                    max_unarchived_bytes: 16 * 1024,
+                    max_source_spool_bytes: 2 * 1024 * 1024,
                 },
                 runtime: crate::pitr::api::PitrRuntimeOptions::default(),
             })
@@ -29033,9 +29277,9 @@ mod tests {
                 repository: dir.path().join("repository"),
                 config: crate::pitr::api::PersistedPitrConfig {
                     archive_interval: std::time::Duration::from_secs(1),
-                    max_segment_bytes: 4096,
-                    max_unarchived_bytes: 8192,
-                    max_source_spool_bytes: 16384,
+                    max_segment_bytes: 16 * 1024,
+                    max_unarchived_bytes: 16 * 1024,
+                    max_source_spool_bytes: 2 * 1024 * 1024,
                 },
                 runtime: crate::pitr::api::PitrRuntimeOptions::default(),
             })
@@ -29095,9 +29339,9 @@ mod tests {
                 repository: repository_path.clone(),
                 config: crate::pitr::api::PersistedPitrConfig {
                     archive_interval: std::time::Duration::from_secs(1),
-                    max_segment_bytes: 4096,
-                    max_unarchived_bytes: 8192,
-                    max_source_spool_bytes: 16384,
+                    max_segment_bytes: 16 * 1024,
+                    max_unarchived_bytes: 16 * 1024,
+                    max_source_spool_bytes: 2 * 1024 * 1024,
                 },
                 runtime: crate::pitr::api::PitrRuntimeOptions::default(),
             })
@@ -29167,7 +29411,7 @@ mod tests {
                     archive_interval: std::time::Duration::from_secs(3600),
                     max_segment_bytes: 1 << 20,
                     max_unarchived_bytes: 1 << 20,
-                    max_source_spool_bytes: 2 << 20,
+                    max_source_spool_bytes: 8 << 20,
                 },
                 runtime: crate::pitr::api::PitrRuntimeOptions::default(),
             })
@@ -29350,7 +29594,7 @@ mod tests {
                     archive_interval: std::time::Duration::from_secs(3600),
                     max_segment_bytes: 1 << 20,
                     max_unarchived_bytes: 1 << 20,
-                    max_source_spool_bytes: 2 << 20,
+                    max_source_spool_bytes: 8 << 20,
                 },
                 runtime: crate::pitr::api::PitrRuntimeOptions::default(),
             })
@@ -29469,9 +29713,9 @@ mod tests {
                 repository: dir.path().join("repository"),
                 config: crate::pitr::api::PersistedPitrConfig {
                     archive_interval: std::time::Duration::from_secs(1),
-                    max_segment_bytes: 8192,
-                    max_unarchived_bytes: 8192,
-                    max_source_spool_bytes: 16384,
+                    max_segment_bytes: 16 * 1024,
+                    max_unarchived_bytes: 16 * 1024,
+                    max_source_spool_bytes: 2 * 1024 * 1024,
                 },
                 runtime: crate::pitr::api::PitrRuntimeOptions::default(),
             })
@@ -29522,7 +29766,7 @@ mod tests {
     #[test]
     fn pitr_background_maintenance_archives_size_and_timer_boundaries() {
         for (archive_interval, max_segment_bytes) in [
-            (std::time::Duration::from_secs(60), 4096),
+            (std::time::Duration::from_secs(60), 16 * 1024),
             (std::time::Duration::from_millis(10), 1024 * 1024),
         ] {
             let dir = tempdir().unwrap();
@@ -29543,12 +29787,13 @@ mod tests {
                         archive_interval,
                         max_segment_bytes,
                         max_unarchived_bytes: 2 * 1024 * 1024,
-                        max_source_spool_bytes: 4 * 1024 * 1024,
+                        max_source_spool_bytes: 8 * 1024 * 1024,
                     },
                     runtime: crate::pitr::api::PitrRuntimeOptions::default(),
                 })
                 .unwrap();
-            engine.put(b"automatic", b"archive").unwrap();
+            let value = vec![b'a'; 8 * 1024];
+            engine.put(b"automatic", &value).unwrap();
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
             loop {
                 let status = engine
@@ -30035,7 +30280,7 @@ mod tests {
                     archive_interval: std::time::Duration::from_secs(60),
                     max_segment_bytes: 1024 * 1024,
                     max_unarchived_bytes: 2 * 1024 * 1024,
-                    max_source_spool_bytes: 4 * 1024 * 1024,
+                    max_source_spool_bytes: 8 * 1024 * 1024,
                 },
                 runtime: crate::pitr::api::PitrRuntimeOptions::default(),
             })
@@ -30101,7 +30346,7 @@ mod tests {
                     archive_interval: std::time::Duration::from_secs(60),
                     max_segment_bytes: 1024 * 1024,
                     max_unarchived_bytes: 2 * 1024 * 1024,
-                    max_source_spool_bytes: 4 * 1024 * 1024,
+                    max_source_spool_bytes: 8 * 1024 * 1024,
                 },
                 runtime: crate::pitr::api::PitrRuntimeOptions::default(),
             })
@@ -30166,7 +30411,7 @@ mod tests {
                     archive_interval: std::time::Duration::from_secs(60),
                     max_segment_bytes: 1024 * 1024,
                     max_unarchived_bytes: 2 * 1024 * 1024,
-                    max_source_spool_bytes: 4 * 1024 * 1024,
+                    max_source_spool_bytes: 8 * 1024 * 1024,
                 },
                 runtime: crate::pitr::api::PitrRuntimeOptions::default(),
             })
@@ -30251,7 +30496,7 @@ mod tests {
                     archive_interval: std::time::Duration::from_secs(60),
                     max_segment_bytes: 1024 * 1024,
                     max_unarchived_bytes: 2 * 1024 * 1024,
-                    max_source_spool_bytes: 4 * 1024 * 1024,
+                    max_source_spool_bytes: 8 * 1024 * 1024,
                 },
                 runtime: crate::pitr::api::PitrRuntimeOptions::default(),
             })
@@ -30299,9 +30544,9 @@ mod tests {
                 repository: dir.path().join("repository"),
                 config: crate::pitr::api::PersistedPitrConfig {
                     archive_interval: std::time::Duration::from_secs(1),
-                    max_segment_bytes: 8192,
-                    max_unarchived_bytes: 8192,
-                    max_source_spool_bytes: 16384,
+                    max_segment_bytes: 16 * 1024,
+                    max_unarchived_bytes: 16 * 1024,
+                    max_source_spool_bytes: 2 * 1024 * 1024,
                 },
                 runtime: crate::pitr::api::PitrRuntimeOptions::default(),
             })
@@ -30356,7 +30601,7 @@ mod tests {
                         archive_interval: std::time::Duration::from_secs(60),
                         max_segment_bytes: 1024 * 1024,
                         max_unarchived_bytes: 2 * 1024 * 1024,
-                        max_source_spool_bytes: 4 * 1024 * 1024,
+                        max_source_spool_bytes: 8 * 1024 * 1024,
                     },
                     runtime: crate::pitr::api::PitrRuntimeOptions::default(),
                 })

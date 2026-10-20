@@ -7748,9 +7748,9 @@ mod tests {
                 repository: repository.clone(),
                 config: crate::pitr::api::PersistedPitrConfig {
                     archive_interval: std::time::Duration::from_secs(1),
-                    max_segment_bytes: 4096,
-                    max_unarchived_bytes: 8192,
-                    max_source_spool_bytes: 16384,
+                    max_segment_bytes: 16 * 1024,
+                    max_unarchived_bytes: 16 * 1024,
+                    max_source_spool_bytes: 2 * 1024 * 1024,
                 },
                 runtime: crate::pitr::api::PitrRuntimeOptions::default(),
             })
@@ -7767,9 +7767,9 @@ mod tests {
                 archive_epoch_id: Some([3; 16]),
                 config: Some(crate::pitr::manifest::PersistedPitrConfig {
                     archive_interval_ms: 1000,
-                    max_segment_bytes: 4096,
-                    max_unarchived_bytes: 8192,
-                    max_source_spool_bytes: 16384,
+                    max_segment_bytes: 16 * 1024,
+                    max_unarchived_bytes: 16 * 1024,
+                    max_source_spool_bytes: 2 * 1024 * 1024,
                 }),
                 active_segment_id: Some(9),
                 next_segment_id: 10,
@@ -7906,7 +7906,7 @@ mod tests {
                     archive_interval: std::time::Duration::from_secs(3600),
                     max_segment_bytes: 1024 * 1024,
                     max_unarchived_bytes: 2 * 1024 * 1024,
-                    max_source_spool_bytes: 4 * 1024 * 1024,
+                    max_source_spool_bytes: 8 * 1024 * 1024,
                 },
                 runtime: crate::pitr::api::PitrRuntimeOptions::default(),
             })

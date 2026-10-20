@@ -1218,16 +1218,23 @@ stage 3's continuation cases through real sealing, archive, and restore here.
 The first Stage 7 slice adds a checked capacity assessment for the v7 image,
 fresh-inode recovery workspace, maximum legacy and v7 seal sidecars, an empty
 v7 successor and its install staging image, and terminal manifest headroom
-bounded by the encoded handoff records. The legacy seal bound uses the recovered
-Active WAL image length, which may exceed the configured segment maximum;
-the future v7 image and recovery workspace use the configured v7 bound.
+bounded by the encoded handoff records. Existing-source assessments size the
+legacy seal from the recovered Active WAL image, which may exceed the configured
+segment maximum. Before a new Active WAL exists, enablement uses the configured
+segment bound plus the header for the legacy logical image. It rounds that image
+up to Leader's 1 MiB preallocation blocks and then to the filesystem allocation
+unit for retained source-spool usage; seal sizing keeps the logical image bound.
+The future v7 image and recovery workspace use the configured v7 bound.
 It compares that transition requirement with caller-reconstructed retained
-source-spool charges and reports
-eligible or deferred outcomes. Enable, reopen, and rotation do not consume this
-assessment yet. The migration module now exposes an owned reservation helper
-that atomically charges its source-spool and recovery-workspace requirements on
-one live ledger. Active v7 recovery uses the same filesystem-rounded workspace
-charge for both its reservation and ledger limit. Callers must still reconstruct
+source-spool charges and reports eligible or deferred outcomes. New PITR
+enablement now checks the requested configuration against this estimate before
+repository bootstrap or durable enable intent; disabled-state source files,
+staging files, and recovery temporaries are included. Existing legacy reopen and
+rotation do not consume the assessment yet. The migration module now exposes an
+owned reservation helper that atomically charges its source-spool and
+recovery-workspace requirements on one live ledger. Active v7 recovery uses the
+same filesystem-rounded workspace charge for both its reservation and ledger
+limit. Callers must still reconstruct
 all live charges, retain this reservation through the transition, and rebuild
 in-flight migration charges from durable obligations after a crash.
 
