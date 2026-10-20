@@ -888,6 +888,35 @@ impl PitrSegmentManager {
         self.source_spool_reserved
     }
 
+    pub(crate) fn source_spool_charges_by_segment(&self) -> Result<BTreeMap<u64, u64>> {
+        let mut charges = self.segments.iter().try_fold(
+            BTreeMap::new(),
+            |mut charges, (&segment_id, segment)| {
+                let seal_reservation = if segment.state == SegmentState::Active {
+                    0
+                } else {
+                    4096
+                };
+                let charge = segment
+                    .source_spool_bytes
+                    .checked_add(seal_reservation)
+                    .ok_or_else(|| anyhow::anyhow!("source spool accounting overflow"))?;
+                charges.insert(segment_id, charge);
+                Ok::<_, anyhow::Error>(charges)
+            },
+        )?;
+        if let Some(successor) = self.pending_successor {
+            ensure!(
+                charges
+                    .insert(successor.segment_id, successor.source_spool_bytes)
+                    .is_none(),
+                "pending PITR successor duplicates a segment charge"
+            );
+        }
+
+        Ok(charges)
+    }
+
     pub(crate) fn sealed_unarchived_bytes(&self) -> u64 {
         self.segments
             .values()

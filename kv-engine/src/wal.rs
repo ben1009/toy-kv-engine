@@ -1380,7 +1380,6 @@ impl Wal {
         })
     }
 
-    #[cfg(test)]
     pub(crate) fn format_version(&self) -> u16 {
         self.format_version
     }
@@ -1466,7 +1465,6 @@ impl Wal {
             .is_some_and(parallel_runtime::ParallelWalRuntime::admission_is_open)
     }
 
-    #[cfg(test)]
     pub(crate) fn io_mode(&self) -> WalIoMode {
         self.io_mode
     }

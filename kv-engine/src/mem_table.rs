@@ -2058,6 +2058,14 @@ impl MemTable {
         self.wal.as_ref().is_some_and(|wal| wal.is_v5())
     }
 
+    pub(crate) fn wal_format_version(&self) -> Option<u16> {
+        self.wal.as_ref().map(Wal::format_version)
+    }
+
+    pub(crate) fn wal_io_mode(&self) -> Option<crate::wal::WalIoMode> {
+        self.wal.as_ref().map(Wal::io_mode)
+    }
+
     pub(crate) fn uses_pitr_batch_wal(&self) -> bool {
         self.wal_v7_source || self.wal.as_ref().is_some_and(Wal::is_pitr)
     }

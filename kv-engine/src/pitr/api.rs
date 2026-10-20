@@ -288,10 +288,52 @@ pub enum PitrArchiveState {
     ReconciliationRequired,
 }
 
+/// I/O scheduler used by the current Active PITR WAL.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PitrWalIoMode {
+    Leader,
+    Parallel,
+}
+
+/// Why an Active legacy PITR WAL cannot transition to v7 with its persisted limits.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PitrV7MigrationDeferralReason {
+    SegmentLimitTooSmall,
+    SegmentLimitTooLarge,
+    InsufficientSourceSpool,
+}
+
+/// Result of the read-only capacity estimate for a legacy Active WAL.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PitrV7MigrationCapacityDecision {
+    Eligible,
+    Deferred(PitrV7MigrationDeferralReason),
+}
+
+/// Advisory capacity details for transitioning a legacy Active WAL to v7.
+///
+/// This is a point-in-time report; callers must still reserve the full
+/// transition charge atomically before publishing migration intent.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PitrV7MigrationCapacityStatus {
+    pub decision: PitrV7MigrationCapacityDecision,
+    pub required_transition_bytes: u64,
+    pub available_capacity_bytes: u64,
+    pub retained_source_spool_bytes: u64,
+    pub source_spool_limit_bytes: u64,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PitrStatus {
     pub state: PitrArchiveState,
     pub archive_epoch_id: Option<[u8; 16]>,
+    /// On-disk format version of the current Active PITR WAL, if present.
+    pub active_wal_format_version: Option<u16>,
+    pub active_wal_io_mode: Option<PitrWalIoMode>,
+    /// Read-only v7 migration estimate for a v5/v6 Active WAL.
+    /// Omitted when the lifecycle and live WAL do not describe the same Active
+    /// segment, or a source disappears during sampling.
+    pub v7_migration_capacity: Option<PitrV7MigrationCapacityStatus>,
     pub latest_durable_commit_ts: Option<u64>,
     pub latest_archived_commit_ts: Option<u64>,
     pub recoverable_intervals: Vec<RecoveryInterval>,
@@ -833,6 +875,9 @@ impl PitrStatus {
         Self {
             state: archive_state,
             archive_epoch_id: state.archive_epoch_id,
+            active_wal_format_version: None,
+            active_wal_io_mode: None,
+            v7_migration_capacity: None,
             latest_durable_commit_ts: state.last_commit_anchor.map(|anchor| anchor.commit_ts),
             latest_archived_commit_ts,
             recoverable_intervals: Vec::new(),
