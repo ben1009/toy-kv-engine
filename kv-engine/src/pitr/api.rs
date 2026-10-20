@@ -314,13 +314,45 @@ pub enum PitrV7MigrationCapacityDecision {
 ///
 /// This is a point-in-time report; callers must still reserve the full
 /// transition charge atomically before publishing migration intent.
+/// Retained source fields report current filesystem allocations and live
+/// segment-manager charges. Transition estimates use the configured segment
+/// limit, and estimated file extents are rounded to the filesystem allocation
+/// unit where applicable.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PitrV7MigrationCapacityStatus {
     pub decision: PitrV7MigrationCapacityDecision,
     pub required_transition_bytes: u64,
+    /// Retained source-spool usage plus the complete estimated transition.
+    pub required_total_bytes: u64,
     pub available_capacity_bytes: u64,
     pub retained_source_spool_bytes: u64,
     pub source_spool_limit_bytes: u64,
+    /// Current Active v5/v6 WAL image length and allocated filesystem blocks.
+    /// The allocated byte count is already included in
+    /// `retained_segment_source_bytes`.
+    pub legacy_active_image_bytes: u64,
+    pub legacy_active_allocated_bytes: u64,
+    /// Current retained source usage, partitioned by accounting source. The
+    /// Active WAL allocation is a detail of the segment total, not an additional
+    /// category to add to it.
+    /// Segment bytes include the Active WAL allocation, other visible files,
+    /// and live manager charges for tracked source segments. Staging and
+    /// unattributed bytes come from filesystem inspection.
+    pub retained_segment_source_bytes: u64,
+    pub retained_staging_bytes: u64,
+    pub retained_unattributed_bytes: u64,
+    /// Persisted segment limit, reported as configured. The v7 image and
+    /// recovery-workspace estimates cap it at the maximum supported WAL size;
+    /// a larger configured limit still produces a deferred decision.
+    pub configured_segment_limit_bytes: u64,
+    /// Estimated transition reservation components.
+    pub v7_active_image_bytes: u64,
+    pub recovery_workspace_bytes: u64,
+    pub legacy_seal_sidecar_bytes: u64,
+    pub v7_seal_sidecar_bytes: u64,
+    pub successor_image_bytes: u64,
+    pub successor_staging_bytes: u64,
+    pub terminal_manifest_headroom_bytes: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -330,9 +362,9 @@ pub struct PitrStatus {
     /// On-disk format version of the current Active PITR WAL, if present.
     pub active_wal_format_version: Option<u16>,
     pub active_wal_io_mode: Option<PitrWalIoMode>,
-    /// Read-only v7 migration estimate for a v5/v6 Active WAL.
-    /// Omitted when the lifecycle and live WAL do not describe the same Active
-    /// segment, or a source disappears during sampling.
+    /// Read-only v7 migration estimate for a v5/v6 Active WAL on Linux.
+    /// Omitted when the Active WAL is not legacy, the manifest has no Active
+    /// segment or names a different segment, or snapshot construction fails.
     pub v7_migration_capacity: Option<PitrV7MigrationCapacityStatus>,
     pub latest_durable_commit_ts: Option<u64>,
     pub latest_archived_commit_ts: Option<u64>,

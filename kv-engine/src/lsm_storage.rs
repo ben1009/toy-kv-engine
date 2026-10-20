@@ -3437,9 +3437,23 @@ impl KvEngine {
         Ok(crate::pitr::api::PitrV7MigrationCapacityStatus {
             decision,
             required_transition_bytes: capacity.required_transition_bytes,
+            required_total_bytes: capacity.required_total_bytes,
             available_capacity_bytes: capacity.available_capacity_bytes,
             retained_source_spool_bytes: capacity.retained_source_spool_bytes,
             source_spool_limit_bytes: capacity.source_spool_limit_bytes,
+            legacy_active_image_bytes: capacity.legacy_active_image_bytes,
+            legacy_active_allocated_bytes: active_allocated_bytes,
+            retained_segment_source_bytes: live_segment_bytes,
+            retained_staging_bytes: staging_bytes,
+            retained_unattributed_bytes: unattributed_bytes,
+            configured_segment_limit_bytes: capacity.configured_segment_limit_bytes,
+            v7_active_image_bytes: capacity.v7_active_image_bytes,
+            recovery_workspace_bytes: capacity.recovery_workspace_bytes,
+            legacy_seal_sidecar_bytes: capacity.legacy_seal_sidecar_bytes,
+            v7_seal_sidecar_bytes: capacity.v7_seal_sidecar_bytes,
+            successor_image_bytes: capacity.successor_image_bytes,
+            successor_staging_bytes: capacity.successor_staging_bytes,
+            terminal_manifest_headroom_bytes: capacity.terminal_manifest_headroom_bytes,
         })
     }
 
