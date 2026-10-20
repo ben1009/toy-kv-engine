@@ -1229,6 +1229,12 @@ charge for both its reservation and ledger limit. Callers must still reconstruct
 all live charges, retain this reservation through the transition, and rebuild
 in-flight migration charges from durable obligations after a crash.
 
+The read-only PITR status API now reports the Active WAL's format and scheduler,
+plus a v7 migration capacity estimate for Active v5/v6 WALs. The retained charge
+uses both filesystem allocations and the live segment manager's pinned-source
+accounting. The estimate is omitted across lifecycle transitions or source
+reclamation races; this advisory snapshot does not replace the atomic reservation.
+
 - Add a shared migration/preflight decision used by enablement, reopen, and
   rotation. Calculate capacity for the largest configured v7 physical image
   plus fresh recovery workspace, current obligations/pins/orphans, and all

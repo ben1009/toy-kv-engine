@@ -3189,6 +3189,21 @@ impl KvEngine {
             }
             let active = self.inner.state.load().memtable.clone();
             if active.uses_pitr_batch_wal() {
+                status.active_wal_format_version = active.wal_format_version();
+                status.active_wal_io_mode = active.wal_io_mode().map(|mode| match mode {
+                    crate::wal::WalIoMode::Leader => crate::pitr::api::PitrWalIoMode::Leader,
+                    crate::wal::WalIoMode::Parallel => crate::pitr::api::PitrWalIoMode::Parallel,
+                });
+                status.v7_migration_capacity =
+                    match self.pitr_v7_migration_capacity_status(&state, &active) {
+                        Ok(capacity) => capacity,
+                        Err(error) => {
+                            log::warn!(
+                                "omitting advisory PITR v7 migration capacity estimate: {error:#}"
+                            );
+                            None
+                        }
+                    };
                 status.active_wal_bytes = active.wal_logical_length().unwrap_or(0);
                 status.latest_durable_commit_ts = self
                     .inner
@@ -3291,6 +3306,141 @@ impl KvEngine {
             }
         }
         Ok(status)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn pitr_v7_migration_capacity_status(
+        &self,
+        state: &crate::pitr::manifest::PitrState,
+        active: &MemTable,
+    ) -> Result<Option<crate::pitr::api::PitrV7MigrationCapacityStatus>> {
+        if !active.uses_wal_v5() {
+            return Ok(None);
+        }
+        let Some(active_segment_id) = state.active_segment_id else {
+            return Ok(None);
+        };
+        if LsmStorageInner::pitr_segment_of(active) != Some(active_segment_id) {
+            return Ok(None);
+        }
+        let config = state
+            .config
+            .as_ref()
+            .ok_or_else(|| anyhow!("Active legacy PITR WAL has no persisted configuration"))?;
+        match self.pitr_v7_migration_capacity_snapshot(config, active_segment_id, active) {
+            Ok(capacity) => Ok(Some(capacity)),
+            // Reclamation can unlink a sampled source between read_dir and
+            // metadata, or remove the captured Active WAL after rotation.
+            // Omit this advisory estimate without weakening startup scans.
+            Err(error)
+                if error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+            {
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn pitr_v7_migration_capacity_snapshot(
+        &self,
+        config: &crate::pitr::manifest::PersistedPitrConfig,
+        active_segment_id: u64,
+        active: &MemTable,
+    ) -> Result<crate::pitr::api::PitrV7MigrationCapacityStatus> {
+        let active_wal_path = active
+            .wal_path()
+            .ok_or_else(|| anyhow!("Active legacy PITR WAL has no source path"))?;
+        let database_path = active_wal_path
+            .parent()
+            .ok_or_else(|| anyhow!("Active legacy PITR WAL has no parent directory"))?;
+        let active_image_bytes = active
+            .wal_logical_length()
+            .ok_or_else(|| anyhow!("Active legacy PITR WAL has no logical length"))?;
+
+        let active_metadata = fs::symlink_metadata(active_wal_path).with_context(|| {
+            format!(
+                "inspect Active legacy PITR WAL {} for migration capacity",
+                active_wal_path.display()
+            )
+        })?;
+        ensure!(
+            active_metadata.file_type().is_file(),
+            "Active legacy PITR WAL {} is not a regular file",
+            active_wal_path.display()
+        );
+        let active_allocated_bytes = LsmStorageInner::filesystem_allocated_bytes(&active_metadata)?;
+        let (mut segment_allocations, staging_bytes, unattributed_bytes) =
+            LsmStorageInner::pitr_source_allocations(database_path, active_segment_id)?;
+        let active_visible_bytes = segment_allocations.entry(active_segment_id).or_default();
+        *active_visible_bytes = active_visible_bytes
+            .checked_add(active_allocated_bytes)
+            .ok_or_else(|| anyhow!("PITR retained source allocation overflows"))?;
+        let live_segment_bytes = if let Some(segments) = self.pitr_segments.lock().as_ref() {
+            // Compare per segment so a large visible allocation in one segment
+            // cannot hide the manager's charge for an unlinked, pinned inode in
+            // another segment.
+            let mut charges = segments.source_spool_charges_by_segment()?;
+            for (segment_id, allocated_bytes) in segment_allocations {
+                let charge = charges.entry(segment_id).or_default();
+                *charge = (*charge).max(allocated_bytes);
+            }
+            charges.values().try_fold(0_u64, |total, bytes| {
+                total
+                    .checked_add(*bytes)
+                    .ok_or_else(|| anyhow!("PITR retained source allocation overflows"))
+            })?
+        } else {
+            segment_allocations
+                .values()
+                .try_fold(0_u64, |total, bytes| {
+                    total
+                        .checked_add(*bytes)
+                        .ok_or_else(|| anyhow!("PITR retained source allocation overflows"))
+                })?
+        };
+        let retained_source_spool_bytes = live_segment_bytes
+            .checked_add(staging_bytes)
+            .and_then(|bytes| bytes.checked_add(unattributed_bytes))
+            .ok_or_else(|| anyhow!("PITR retained source allocation overflows"))?;
+
+        let allocation_unit =
+            crate::pitr::segment::filesystem_allocation_reservation(database_path, 1)?;
+        let capacity = crate::pitr::migration::assess_v7_migration_capacity(
+            config,
+            active_image_bytes,
+            retained_source_spool_bytes,
+            allocation_unit,
+        )?;
+        let decision = match capacity.decision {
+            crate::pitr::migration::V7MigrationCapacityDecision::Eligible => {
+                crate::pitr::api::PitrV7MigrationCapacityDecision::Eligible
+            }
+            crate::pitr::migration::V7MigrationCapacityDecision::Deferred(reason) => {
+                let reason = match reason {
+                    crate::pitr::migration::V7MigrationDeferralReason::SegmentLimitTooSmall => {
+                        crate::pitr::api::PitrV7MigrationDeferralReason::SegmentLimitTooSmall
+                    }
+                    crate::pitr::migration::V7MigrationDeferralReason::SegmentLimitTooLarge => {
+                        crate::pitr::api::PitrV7MigrationDeferralReason::SegmentLimitTooLarge
+                    }
+                    crate::pitr::migration::V7MigrationDeferralReason::InsufficientSourceSpool => {
+                        crate::pitr::api::PitrV7MigrationDeferralReason::InsufficientSourceSpool
+                    }
+                };
+                crate::pitr::api::PitrV7MigrationCapacityDecision::Deferred(reason)
+            }
+        };
+
+        Ok(crate::pitr::api::PitrV7MigrationCapacityStatus {
+            decision,
+            required_transition_bytes: capacity.required_transition_bytes,
+            available_capacity_bytes: capacity.available_capacity_bytes,
+            retained_source_spool_bytes: capacity.retained_source_spool_bytes,
+            source_spool_limit_bytes: capacity.source_spool_limit_bytes,
+        })
     }
 
     #[cfg(target_os = "linux")]
@@ -18278,6 +18428,86 @@ mod tests {
         assert_eq!(status.active_wal_bytes, retained_wal_length);
         assert!(status.source_spool_bytes >= retained_wal_length);
         reopened.close_storage().unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pitr_status_skips_migration_capacity_during_lifecycle_transitions() {
+        use crate::pitr::manifest::{PitrManifestRecord, replay_pitr_records};
+
+        let dir = tempdir().unwrap();
+        let engine = pitr_flush_test_engine(dir.path());
+        suspend_pitr_maintenance_for_test(&engine);
+        let enabled = engine.pitr_manifest_state.lock().clone();
+        let options = crate::pitr::api::PitrStatusOptions {
+            cursor: None,
+            page_size: crate::pitr::api::MAX_STATUS_PAGE_SIZE,
+        };
+        let status = engine.pitr_status(options).unwrap();
+        assert!(status.v7_migration_capacity.is_some());
+        let enabling = replay_pitr_records([PitrManifestRecord::EnableIntent {
+            repository_id: enabled.repository_id.unwrap(),
+            timeline_id: enabled.timeline_id.unwrap(),
+            archive_epoch_id: enabled.archive_epoch_id.unwrap(),
+            config: enabled.config.clone().unwrap(),
+        }])
+        .unwrap();
+        let disabled = replay_pitr_records([
+            PitrManifestRecord::Snapshot(Box::new(enabled.clone())),
+            PitrManifestRecord::DisableClean,
+        ])
+        .unwrap();
+
+        // Enable installs the legacy WAL before EnableComplete; disable
+        // persists its terminal record before replacing that WAL. Both
+        // windows legitimately have no manifest Active segment ID.
+        for (state, expected) in [
+            (enabling, crate::pitr::api::PitrArchiveState::Active),
+            (disabled, crate::pitr::api::PitrArchiveState::Disabled),
+        ] {
+            *engine.pitr_manifest_state.lock() = state;
+            let status = engine.pitr_status(options).unwrap();
+            assert_eq!(status.state, expected);
+            assert_eq!(
+                status.active_wal_format_version,
+                Some(crate::pitr::WAL_V5_VERSION)
+            );
+            assert_eq!(
+                status.active_wal_io_mode,
+                Some(crate::pitr::api::PitrWalIoMode::Leader)
+            );
+            assert!(status.v7_migration_capacity.is_none());
+        }
+        *engine.pitr_manifest_state.lock() = enabled;
+        engine.close_storage().unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pitr_status_skips_migration_capacity_after_source_reclamation() {
+        let dir = tempdir().unwrap();
+        let engine = pitr_flush_test_engine(dir.path());
+        suspend_pitr_maintenance_for_test(&engine);
+        engine.put(b"before-rotation", b"value").unwrap();
+        let captured_state = engine.pitr_manifest_state.lock().clone();
+        let captured_active = engine.inner.state.load().memtable.clone();
+        let old_path = captured_active.wal_path().unwrap().to_path_buf();
+
+        engine.force_flush().unwrap();
+        assert!(!old_path.exists());
+
+        // Status may have sampled either side of rotation, or have captured
+        // the old state and memtable before flush removed the source path.
+        let current_active = engine.inner.state.load().memtable.clone();
+        for active in [current_active, captured_active] {
+            assert!(
+                engine
+                    .pitr_v7_migration_capacity_status(&captured_state, &active)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        engine.close_storage().unwrap();
     }
 
     #[test]
