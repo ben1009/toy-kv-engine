@@ -15,8 +15,10 @@ use kv_engine::chaos::scenarios::ScenarioConfig;
 use kv_engine::lsm_storage::{KvEngine, LsmStorageOptions};
 use kv_engine::wal::WalIoMode;
 use kv_engine::{
-    BackupOptions, CreateBackupOutcome, EnablePitrOutcome, PersistedPitrConfig, PitrOptions,
-    PitrRuntimeOptions, PitrStatusOptions, PitrWalIoMode,
+    BackupOptions, BackupRepository, CreateBackupOutcome, EnablePitrOutcome,
+    ImplementationRegistry, PersistedPitrConfig, PitrCloseOutcome, PitrOptions, PitrRestoreOptions,
+    PitrRuntimeOptions, PitrStatusOptions, PitrWalIoMode, RecoverySelector, RecoveryTarget,
+    RestoreToOutcome,
 };
 use std::io::Read;
 use std::num::NonZeroUsize;
@@ -599,7 +601,7 @@ fn failpoint_v7_parallel_pitr_crash_recovery_install_rename_boundaries() {
 
     let continued_recovery_options = LsmStorageOptions {
         enable_wal: true,
-        pitr_repository: Some(repository),
+        pitr_repository: Some(repository.clone()),
         ..LsmStorageOptions::default_for_test()
     };
     let continued_recovery =
@@ -627,9 +629,88 @@ fn failpoint_v7_parallel_pitr_crash_recovery_install_rename_boundaries() {
             .as_deref(),
         Some(b"candidate".as_slice())
     );
-    continued_recovery
-        .close()
-        .expect("close database after continued recovery");
+
+    let continued_status = continued_recovery
+        .pitr_status(PitrStatusOptions {
+            cursor: None,
+            page_size: NonZeroUsize::new(64).expect("nonzero PITR status page size"),
+        })
+        .expect("read PITR status before sealing the recovered Active WAL");
+    let interval = continued_status
+        .recoverable_intervals
+        .first()
+        .expect("PITR setup must retain a recoverable base interval");
+    let selector = RecoverySelector {
+        timeline_id: interval.timeline_id,
+        archive_epoch_id: Some(interval.archive_epoch_id),
+        base_backup_id: None,
+    };
+    let final_point = match continued_recovery
+        .close_pitr()
+        .expect("seal and archive the recovered Active WAL")
+    {
+        PitrCloseOutcome::ClosedDurably {
+            final_point: Some(point),
+        } => point,
+        outcome => panic!("PITR close did not durably archive the recovered WAL: {outcome:?}"),
+    };
+    assert!(
+        final_point.commit_ts.is_some(),
+        "the continued write must be included in the final archived boundary"
+    );
+
+    let restored_path = dir.path().join("restored-after-recovery");
+    let backup_repository =
+        BackupRepository::open(&repository).expect("open repository after PITR close");
+    let restore_info = match backup_repository
+        .restore_to(
+            RecoveryTarget::Latest,
+            &restored_path,
+            PitrRestoreOptions {
+                selector,
+                implementations: ImplementationRegistry,
+                executor_threads: NonZeroUsize::new(1).expect("nonzero restore worker count"),
+                cache_capacity: 4096,
+                storage: LsmStorageOptions::default_for_test(),
+            },
+        )
+        .expect("restore the latest point after recovery continuation")
+    {
+        RestoreToOutcome::Restored(info) => info,
+        outcome => panic!("PITR restore did not produce a restored database: {outcome:?}"),
+    };
+    assert_eq!(restore_info.resolved_commit_ts, final_point.commit_ts);
+    assert!(
+        restore_info.replayed_segments > 0,
+        "latest restore must replay the archived WAL containing the continued write"
+    );
+
+    let restored = KvEngine::open(&restored_path, LsmStorageOptions::default_for_test())
+        .expect("open database restored from the continued v7 recovery chain");
+    for (key, expected) in [
+        (
+            b"acknowledged-before-crash".as_slice(),
+            b"stable".as_slice(),
+        ),
+        (
+            b"synced-before-publication".as_slice(),
+            b"candidate".as_slice(),
+        ),
+        (
+            b"post-recovery-synced-write".as_slice(),
+            b"durable".as_slice(),
+        ),
+    ] {
+        assert_eq!(
+            restored
+                .get(key)
+                .expect("read restored PITR value")
+                .as_deref(),
+            Some(expected),
+            "latest restore must retain {key:?}"
+        );
+    }
+    restored.close().expect("close restored database");
 }
 
 #[cfg(target_os = "linux")]
