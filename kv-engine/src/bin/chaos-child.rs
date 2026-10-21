@@ -5,7 +5,8 @@ mod wrapper;
 use wrapper::kv_engine_wrapper::chaos::control_log::ControlLogWriter;
 use wrapper::kv_engine_wrapper::chaos::scenarios::{self, ScenarioConfig};
 use wrapper::kv_engine_wrapper::chaos::stress::{self, StressScenario};
-use wrapper::kv_engine_wrapper::lsm_storage::KvEngine;
+use wrapper::kv_engine_wrapper::lsm_storage::{KvEngine, LsmStorageOptions};
+use wrapper::kv_engine_wrapper::pitr_api::{PitrStatusOptions, PitrWalIoMode};
 use wrapper::kv_engine_wrapper::wal::WalIoMode;
 
 fn main() {
@@ -129,9 +130,10 @@ fn child_main(args: &[String]) -> Result<(), String> {
     }
 
     // Look up scenario config
-    let config = match scenario.as_str() {
+    let mut config = match scenario.as_str() {
         "wal-only" => ScenarioConfig::wal_only(),
         "parallel-wal-crash" => ScenarioConfig::wal_only(),
+        "pitr-v7-parallel-crash" => ScenarioConfig::wal_only(),
         "flush-boundary" => ScenarioConfig::flush_boundary(),
         "manifest-snapshot" => ScenarioConfig::manifest_snapshot(),
         "range-tombstone" => ScenarioConfig::range_tombstone(),
@@ -140,6 +142,15 @@ fn child_main(args: &[String]) -> Result<(), String> {
         "tiered-compaction" => ScenarioConfig::tiered_compaction(),
         other => return Err(format!("unknown scenario: {other}")),
     };
+
+    if scenario == "pitr-v7-parallel-crash" {
+        let repository = get_arg(args, "--pitr-repository")
+            .ok_or("missing --pitr-repository for v7 PITR crash scenario")?;
+        config.storage_options = LsmStorageOptions {
+            pitr_repository: Some(repository.into()),
+            ..config.storage_options
+        };
+    }
 
     // Open the database
     let engine = KvEngine::open_with_wal_io_mode(
@@ -159,6 +170,11 @@ fn child_main(args: &[String]) -> Result<(), String> {
             run_parallel_wal_crash(&engine, args)?;
             return Err("configured parallel WAL crash boundary was not reached".to_string());
         }
+        #[cfg(target_os = "linux")]
+        "pitr-v7-parallel-crash" => {
+            run_v7_pitr_parallel_crash(&engine, args)?;
+            return Err("configured v7 PITR crash boundary was not reached".to_string());
+        }
         "wal-only" => scenarios::wal_only_restart(&engine, &mut log, &config, seed)?,
         "flush-boundary" => scenarios::flush_boundary(&engine, &mut log, &config, seed)?,
         "manifest-snapshot" => {
@@ -175,6 +191,53 @@ fn child_main(args: &[String]) -> Result<(), String> {
     loop {
         std::thread::park();
     }
+}
+
+#[cfg(target_os = "linux")]
+fn run_v7_pitr_parallel_crash(engine: &KvEngine, args: &[String]) -> Result<(), String> {
+    let repository = get_arg(args, "--pitr-repository")
+        .ok_or("missing --pitr-repository for v7 PITR crash scenario")?;
+    let mut resume_outcome = engine
+        .resume_pitr(&repository)
+        .map_err(|error| format!("resume PITR before crash write failed: {error:#}"))?;
+
+    let mut status = engine
+        .pitr_status(PitrStatusOptions {
+            cursor: None,
+            page_size: std::num::NonZeroUsize::new(1).expect("nonzero status page size"),
+        })
+        .map_err(|error| format!("read Active PITR status failed: {error:#}"))?;
+    if status.active_wal_format_version != Some(7) {
+        // A clean close can leave an empty legacy Active WAL, which has no
+        // source image to migrate. Add one acknowledged legacy batch, then
+        // resume once more so the migration path installs the v7 successor.
+        engine
+            .put(b"acknowledged-migration-trigger", b"legacy")
+            .map_err(|error| format!("write legacy migration trigger failed: {error:#}"))?;
+        resume_outcome = engine
+            .resume_pitr(&repository)
+            .map_err(|error| format!("resume PITR to migrate the legacy WAL failed: {error:#}"))?;
+        status = engine
+            .pitr_status(PitrStatusOptions {
+                cursor: None,
+                page_size: std::num::NonZeroUsize::new(1).expect("nonzero PITR status page size"),
+            })
+            .map_err(|error| format!("read migrated PITR status failed: {error:#}"))?;
+    }
+    if status.active_wal_format_version != Some(7)
+        || status.active_wal_io_mode != Some(PitrWalIoMode::Parallel)
+    {
+        return Err(format!(
+            "expected Active v7 Parallel WAL before crash write, got format {:?} and mode {:?}; resume outcome: {resume_outcome:?}; migration capacity: {:?}",
+            status.active_wal_format_version,
+            status.active_wal_io_mode,
+            status.v7_migration_capacity,
+        ));
+    }
+
+    engine
+        .put(b"synced-before-publication", b"candidate")
+        .map_err(|error| format!("post-sync candidate write failed: {error:#}"))
 }
 
 fn run_parallel_wal_crash(engine: &KvEngine, args: &[String]) -> Result<(), String> {

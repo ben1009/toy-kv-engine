@@ -12,9 +12,14 @@ use kv_engine::chaos::failpoint::{
 };
 use kv_engine::chaos::oracle::{self, BoundedKeyUniverse, ReferenceState};
 use kv_engine::chaos::scenarios::ScenarioConfig;
-use kv_engine::lsm_storage::KvEngine;
+use kv_engine::lsm_storage::{KvEngine, LsmStorageOptions};
 use kv_engine::wal::WalIoMode;
+use kv_engine::{
+    BackupOptions, CreateBackupOutcome, EnablePitrOutcome, PersistedPitrConfig, PitrOptions,
+    PitrRuntimeOptions, PitrStatusOptions, PitrWalIoMode,
+};
 use std::io::Read;
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -296,6 +301,169 @@ fn failpoint_parallel_wal_crash_boundaries() {
         &[(b"unacknowledged-before-crash", b"candidate")],
         CandidateRecovery::Present,
     );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn failpoint_v7_parallel_pitr_after_fdatasync_before_publication_replays_candidate() {
+    let probe_dir = tempfile::tempdir().expect("create v7 Parallel crash probe directory");
+    let probe_options = LsmStorageOptions {
+        enable_wal: true,
+        ..LsmStorageOptions::default_for_test()
+    };
+    match KvEngine::open_with_wal_io_mode(probe_dir.path(), probe_options, WalIoMode::Parallel) {
+        Ok(engine) => engine.close().expect("close v7 Parallel crash probe"),
+        Err(error) => panic!("v7 Parallel crash qualification requires io_uring: {error:#}"),
+    }
+
+    let dir = tempfile::tempdir().expect("create v7 Parallel crash directory");
+    let db_path = dir.path().join("db");
+    let repository = dir.path().join("repository");
+    let engine = KvEngine::open(
+        &db_path,
+        LsmStorageOptions {
+            enable_wal: true,
+            ..LsmStorageOptions::default_for_test()
+        },
+    )
+    .expect("open database for PITR setup");
+    assert!(matches!(
+        engine.create_backup(BackupOptions {
+            repository: repository.clone(),
+            use_hard_links: false,
+        }),
+        Ok(CreateBackupOutcome::Committed(_))
+    ));
+    assert!(matches!(
+        engine.enable_pitr(PitrOptions {
+            repository: repository.clone(),
+            config: PersistedPitrConfig {
+                archive_interval: Duration::from_secs(60),
+                max_segment_bytes: 1 << 20,
+                max_unarchived_bytes: 2 << 20,
+                max_source_spool_bytes: 8 << 20,
+            },
+            runtime: PitrRuntimeOptions::default(),
+        }),
+        Ok(EnablePitrOutcome::Enabled { .. })
+    ));
+    engine
+        .put(b"acknowledged-before-crash", b"stable")
+        .expect("persist acknowledged baseline");
+    engine.close().expect("close PITR setup engine");
+
+    let control_log_path = dir.path().join("chaos_control.log");
+    let marker_path = dir.path().join("crash.marker");
+    let crash_point = "parallel_wal.after_fdatasync";
+    let mut child = Command::new(chaos_child_path());
+    child
+        .arg("--child")
+        .arg("--scenario")
+        .arg("pitr-v7-parallel-crash")
+        .arg("--seed")
+        .arg("42")
+        .arg("--db-path")
+        .arg(&db_path)
+        .arg("--pitr-repository")
+        .arg(&repository)
+        .arg("--control-log-path")
+        .arg(&control_log_path)
+        .arg("--parallel-wal")
+        .arg("--crash-point")
+        .arg(crash_point)
+        .env(PARALLEL_WAL_CRASH_POINT_ENV, crash_point)
+        .env(PARALLEL_WAL_CRASH_OCCURRENCE_ENV, "1")
+        .env(PARALLEL_WAL_CRASH_MARKER_ENV, &marker_path)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = child
+        .spawn()
+        .expect("spawn v7 Parallel crash child process");
+
+    let mut child_stdout = child.stdout.take().expect("capture child stdout");
+    let mut child_stderr = child.stderr.take().expect("capture child stderr");
+    let stdout_handle = std::thread::spawn(move || {
+        let mut output = String::new();
+        let _ = child_stdout.read_to_string(&mut output);
+        output
+    });
+    let stderr_handle = std::thread::spawn(move || {
+        let mut output = String::new();
+        let _ = child_stderr.read_to_string(&mut output);
+        output
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut marker_detected = false;
+    let mut early_exit = None;
+    while Instant::now() < deadline {
+        if marker_path.is_file() {
+            marker_detected = true;
+            break;
+        }
+        if let Ok(Some(status)) = child.try_wait() {
+            early_exit = Some(status);
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    let _ = child.kill();
+    let _ = child.wait();
+    let child_stdout = stdout_handle.join().unwrap_or_default();
+    let child_stderr = stderr_handle.join().unwrap_or_default();
+    assert!(
+        marker_detected,
+        "v7 Parallel post-fdatasync boundary was not reached within 60s; early exit: {early_exit:?}\nchild_stdout:\n{child_stdout}\nchild_stderr:\n{child_stderr}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&marker_path)
+            .expect("read post-fdatasync crash marker")
+            .trim(),
+        crash_point
+    );
+
+    let recovery_options = LsmStorageOptions {
+        enable_wal: true,
+        pitr_repository: Some(repository),
+        ..LsmStorageOptions::default_for_test()
+    };
+    let recovered =
+        KvEngine::open_with_wal_io_mode(&db_path, recovery_options, WalIoMode::Parallel)
+            .expect("reopen PITR database after post-fdatasync process kill");
+    let status = recovered
+        .pitr_status(PitrStatusOptions {
+            cursor: None,
+            page_size: NonZeroUsize::new(1).expect("nonzero PITR status page size"),
+        })
+        .expect("read recovered PITR status");
+    assert_eq!(status.active_wal_format_version, Some(7));
+    assert_eq!(status.active_wal_io_mode, Some(PitrWalIoMode::Parallel));
+    assert_eq!(
+        recovered
+            .get(b"acknowledged-migration-trigger")
+            .expect("read acknowledged legacy migration trigger after recovery")
+            .as_deref(),
+        Some(b"legacy".as_slice())
+    );
+    assert_eq!(
+        recovered
+            .get(b"acknowledged-before-crash")
+            .expect("read acknowledged baseline after recovery")
+            .as_deref(),
+        Some(b"stable".as_slice())
+    );
+    assert_eq!(
+        recovered
+            .get(b"synced-before-publication")
+            .expect("read post-sync candidate after recovery")
+            .as_deref(),
+        Some(b"candidate".as_slice()),
+        "a successful v7 WAL sync must survive even when publication and ACK did not occur"
+    );
+    recovered
+        .close()
+        .expect("close recovered v7 Parallel PITR engine");
 }
 
 #[cfg(target_os = "linux")]
