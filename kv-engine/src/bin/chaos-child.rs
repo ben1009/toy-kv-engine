@@ -235,6 +235,21 @@ fn run_v7_pitr_parallel_crash(engine: &KvEngine, args: &[String]) -> Result<(), 
         ));
     }
 
+    let acknowledged_write_key = get_arg(args, "--acknowledged-write-key");
+    let acknowledged_write_value = get_arg(args, "--acknowledged-write-value");
+    match (acknowledged_write_key, acknowledged_write_value) {
+        (None, None) => {}
+        (Some(key), Some(value)) => engine
+            .put(key.as_bytes(), value.as_bytes())
+            .map_err(|error| format!("acknowledged v7 write before candidate failed: {error:#}"))?,
+        _ => {
+            return Err(
+                "--acknowledged-write-key and --acknowledged-write-value must be supplied together"
+                    .to_string(),
+            );
+        }
+    }
+
     let write_key = get_arg(args, "--write-key");
     let write_value = get_arg(args, "--write-value");
     let (write_key, write_value) = match (write_key, write_value) {

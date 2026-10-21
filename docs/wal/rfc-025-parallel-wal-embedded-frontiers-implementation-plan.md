@@ -1448,11 +1448,14 @@ trailing-control, and power-loss variants remain open; the twelfth slice below
 adds the fallback-to-archive-restore case.
 
 The twelfth Stage 8 slice adds a process-level Active fallback-to-restore case.
-After a successful WAL sync before publication, the test corrupts the speculative
-DATA above the manifest-authorized floor. Recovery must reject that candidate,
-normalize to the older anchored prefix, and retain only acknowledged values
-through sealing, archival, and Latest restore. This does not qualify empty
-images, trailing speculative control frames, or power-loss behavior.
+The child first acknowledges a write in the new v7 Active WAL, then crashes
+after syncing a speculative write before publication. The test corrupts the
+speculative DATA above the manifest-authorized floor. Recovery must reject that
+candidate, normalize to the preceding frontier, and retain the acknowledged v7
+write through sealing, archival, and Latest restore. Restore must include both
+the earlier legacy segment and the fallback v7 WAL segment. This does not
+qualify empty images, trailing speculative control frames, or power-loss
+behavior.
 
 - Complete the correctness matrix below using the persistence model, real
   runtime injection, and process-level integration. Regress ordinary v4,

@@ -444,6 +444,7 @@ fn failpoint_v7_parallel_pitr_crash_recovery_install_rename_boundaries() {
         &recovery_marker_path,
         recovery_crash_point,
         None,
+        None,
     );
     assert_eq!(
         std::fs::read(&active_wal_path).expect("read source WAL after recovery crash"),
@@ -493,6 +494,7 @@ fn failpoint_v7_parallel_pitr_crash_recovery_install_rename_boundaries() {
         &repeated_recovery_marker_path,
         recovery_crash_point,
         None,
+        None,
     );
     assert_eq!(
         std::fs::read(&normalized_wal_path)
@@ -517,6 +519,7 @@ fn failpoint_v7_parallel_pitr_crash_recovery_install_rename_boundaries() {
         &control_log_path,
         &rename_marker_path,
         rename_crash_point,
+        None,
         None,
     );
     let renamed_wal_inode = std::fs::metadata(&active_wal_path)
@@ -589,6 +592,7 @@ fn failpoint_v7_parallel_pitr_crash_recovery_install_rename_boundaries() {
         &control_log_path,
         &continued_write_marker_path,
         continued_write_crash_point,
+        None,
         Some(("post-recovery-synced-write", "durable")),
     );
     let continued_active_wal_path = find_v7_pitr_wal(&db_path);
@@ -772,7 +776,8 @@ fn failpoint_v7_parallel_pitr_fallback_archive_restore() {
         &control_log_path,
         &crash_marker_path,
         "parallel_wal.after_fdatasync",
-        None,
+        Some(("fallback-v7-acknowledged", "durable")),
+        Some(("synced-before-publication", "candidate")),
     );
 
     let active_wal_path = find_v7_pitr_wal(&db_path);
@@ -816,8 +821,8 @@ fn failpoint_v7_parallel_pitr_fallback_archive_restore() {
     );
 
     // Make the newest synced FRONTIER fail prefix verification while keeping
-    // the older manifest-authorized boundary intact. Active recovery is then
-    // required to choose and normalize the older boundary.
+    // the preceding acknowledged v7 frontier valid. Active recovery must reject
+    // the candidate and fall back to that frontier above the manifest floor.
     let mut wal = std::fs::OpenOptions::new()
         .write(true)
         .open(&active_wal_path)
@@ -855,6 +860,14 @@ fn failpoint_v7_parallel_pitr_fallback_archive_restore() {
             .expect("read acknowledged migration trigger after fallback")
             .as_deref(),
         Some(b"legacy".as_slice())
+    );
+    assert_eq!(
+        recovered
+            .get(b"fallback-v7-acknowledged")
+            .expect("read acknowledged v7 value after fallback")
+            .as_deref(),
+        Some(b"durable".as_slice()),
+        "fallback must retain the previous durable frontier in the same v7 WAL"
     );
     assert_eq!(
         recovered
@@ -929,14 +942,18 @@ fn failpoint_v7_parallel_pitr_fallback_archive_restore() {
     };
     assert_eq!(restore_info.resolved_commit_ts, final_point.commit_ts);
     assert!(
-        restore_info.replayed_segments > 0,
-        "latest restore must replay the archived fallback WAL"
+        restore_info.replayed_segments >= 2,
+        "latest restore must include both the prior legacy segment and fallback v7 WAL segment"
     );
 
     let restored = KvEngine::open(&restored_path, LsmStorageOptions::default_for_test())
         .expect("open database restored from the fallback WAL");
     for (key, expected) in [
         (b"fallback-acknowledged".as_slice(), b"stable".as_slice()),
+        (
+            b"fallback-v7-acknowledged".as_slice(),
+            b"durable".as_slice(),
+        ),
         (
             b"acknowledged-migration-trigger".as_slice(),
             b"legacy".as_slice(),
@@ -968,6 +985,7 @@ fn kill_pitr_child_at_crash_point(
     control_log_path: &std::path::Path,
     marker_path: &std::path::Path,
     crash_point: &str,
+    acknowledged_write: Option<(&str, &str)>,
     write: Option<(&str, &str)>,
 ) {
     let mut child = Command::new(chaos_child_path());
@@ -987,8 +1005,22 @@ fn kill_pitr_child_at_crash_point(
         .arg("--crash-point")
         .arg(crash_point)
         .env(PARALLEL_WAL_CRASH_POINT_ENV, crash_point)
-        .env(PARALLEL_WAL_CRASH_OCCURRENCE_ENV, "1")
+        .env(
+            PARALLEL_WAL_CRASH_OCCURRENCE_ENV,
+            if acknowledged_write.is_some() {
+                "2"
+            } else {
+                "1"
+            },
+        )
         .env(PARALLEL_WAL_CRASH_MARKER_ENV, marker_path);
+    if let Some((key, value)) = acknowledged_write {
+        child
+            .arg("--acknowledged-write-key")
+            .arg(key)
+            .arg("--acknowledged-write-value")
+            .arg(value);
+    }
     if let Some((key, value)) = write {
         child
             .arg("--write-key")
