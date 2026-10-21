@@ -1387,6 +1387,13 @@ is reused and the speculative value never reappears. This does not complete the
 process-crash recovery matrix. The remaining matrix and adoption gates are still
 open.
 
+The fourth Stage 8 slice crashes a child after the normalized Active recovery
+image has been synced but before it is renamed over the source. It verifies the
+source WAL remains byte-identical, then restarts and checks that stale temp
+cleanup and ordinary recovery preserve the synced candidate. This covers only
+the pre-rename installation cut; other copy, sync, rename, directory-sync, and
+repeated-normalization crash cases remain open.
+
 - Complete the correctness matrix below using the persistence model, real
   runtime injection, and process-level integration. Regress ordinary v4,
   strict v5/v6, TTL, recorded-time rollback/clamping, range deletion, OCC,

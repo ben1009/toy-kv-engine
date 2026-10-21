@@ -908,6 +908,8 @@ pub(crate) fn install_active_recovery(
         );
         temp.sync_all()
             .context("sync normalized Active v7 recovery image")?;
+        #[cfg(feature = "chaos-testing")]
+        crate::chaos::failpoint::wal_crash_point("wal_v7.recovery.after_temp_sync");
         drop(temp);
 
         fs::rename(&temp_path, &source_path)

@@ -1806,7 +1806,7 @@ fn take_admitted_group(
             .checked_add(1)
             .ok_or_else(|| anyhow!("parallel WAL ticket counter overflow"))?;
         #[cfg(feature = "chaos-testing")]
-        crate::chaos::failpoint::parallel_wal_crash_point("parallel_wal.offset_reserved");
+        crate::chaos::failpoint::wal_crash_point("parallel_wal.offset_reserved");
         writes.push(WriteBuffer::new(buffer, file_offset, aligned_len));
     }
 
@@ -2028,9 +2028,7 @@ fn process_group_result(inner: &RuntimeInner, result: GroupWriteResult) {
 
     #[cfg(feature = "chaos-testing")]
     if out_of_order_completion && later_group_remains_outside_prefix {
-        crate::chaos::failpoint::parallel_wal_crash_point(
-            "parallel_wal.later_group_completed_first",
-        );
+        crate::chaos::failpoint::wal_crash_point("parallel_wal.later_group_completed_first");
     }
 }
 
@@ -2333,7 +2331,7 @@ fn synchronize_written_prefix(sync_file: &File, inner: &RuntimeInner) -> Result<
     };
 
     #[cfg(feature = "chaos-testing")]
-    crate::chaos::failpoint::parallel_wal_crash_point("parallel_wal.before_fdatasync");
+    crate::chaos::failpoint::wal_crash_point("parallel_wal.before_fdatasync");
     #[cfg(all(test, feature = "chaos-testing"))]
     crate::chaos::failpoint::before_parallel_wal_fdatasync_call();
     let _sync_start = inner.sync_progress.begin_sync(target, durable);
@@ -2385,7 +2383,7 @@ fn synchronize_written_prefix(sync_file: &File, inner: &RuntimeInner) -> Result<
     }
     let Some(error) = sync_error else {
         #[cfg(feature = "chaos-testing")]
-        crate::chaos::failpoint::parallel_wal_crash_point("parallel_wal.after_fdatasync");
+        crate::chaos::failpoint::wal_crash_point("parallel_wal.after_fdatasync");
 
         if let Some(cycle) = frontier_cycle
             && let Err(error) = complete_v7_frontier_cycle(inner, cycle)

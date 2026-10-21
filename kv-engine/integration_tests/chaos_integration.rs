@@ -305,7 +305,7 @@ fn failpoint_parallel_wal_crash_boundaries() {
 
 #[cfg(target_os = "linux")]
 #[test]
-fn failpoint_v7_parallel_pitr_after_fdatasync_before_publication_replays_candidate() {
+fn failpoint_v7_parallel_pitr_crash_recovery_install_before_rename() {
     let probe_dir = tempfile::tempdir().expect("create v7 Parallel crash probe directory");
     let probe_options = LsmStorageOptions {
         enable_wal: true,
@@ -423,6 +423,90 @@ fn failpoint_v7_parallel_pitr_after_fdatasync_before_publication_replays_candida
         crash_point
     );
 
+    let active_wal_path = find_v7_pitr_wal(&db_path);
+    let source_wal_before_recovery_crash =
+        std::fs::read(&active_wal_path).expect("read source WAL before recovery crash");
+    let recovery_crash_point = "wal_v7.recovery.after_temp_sync";
+    let recovery_marker_path = dir.path().join("recovery-crash.marker");
+    let mut recovery_child = Command::new(chaos_child_path());
+    recovery_child
+        .arg("--child")
+        .arg("--scenario")
+        .arg("pitr-v7-parallel-crash")
+        .arg("--seed")
+        .arg("42")
+        .arg("--db-path")
+        .arg(&db_path)
+        .arg("--pitr-repository")
+        .arg(&repository)
+        .arg("--control-log-path")
+        .arg(&control_log_path)
+        .arg("--parallel-wal")
+        .arg("--crash-point")
+        .arg(recovery_crash_point)
+        .env(PARALLEL_WAL_CRASH_POINT_ENV, recovery_crash_point)
+        .env(PARALLEL_WAL_CRASH_OCCURRENCE_ENV, "1")
+        .env(PARALLEL_WAL_CRASH_MARKER_ENV, &recovery_marker_path)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut recovery_child = recovery_child
+        .spawn()
+        .expect("spawn v7 recovery-install crash child process");
+    let mut recovery_stdout = recovery_child
+        .stdout
+        .take()
+        .expect("capture recovery child stdout");
+    let mut recovery_stderr = recovery_child
+        .stderr
+        .take()
+        .expect("capture recovery child stderr");
+    let recovery_stdout_handle = std::thread::spawn(move || {
+        let mut output = String::new();
+        let _ = recovery_stdout.read_to_string(&mut output);
+        output
+    });
+    let recovery_stderr_handle = std::thread::spawn(move || {
+        let mut output = String::new();
+        let _ = recovery_stderr.read_to_string(&mut output);
+        output
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut recovery_marker_detected = false;
+    let mut recovery_early_exit = None;
+    while Instant::now() < deadline {
+        if recovery_marker_path.is_file() {
+            recovery_marker_detected = true;
+            break;
+        }
+        if let Ok(Some(status)) = recovery_child.try_wait() {
+            recovery_early_exit = Some(status);
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    let _ = recovery_child.kill();
+    let _ = recovery_child.wait();
+    let recovery_stdout = recovery_stdout_handle.join().unwrap_or_default();
+    let recovery_stderr = recovery_stderr_handle.join().unwrap_or_default();
+    assert!(
+        recovery_marker_detected,
+        "v7 recovery-install boundary was not reached within 60s; early exit: {recovery_early_exit:?}\nchild_stdout:\n{recovery_stdout}\nchild_stderr:\n{recovery_stderr}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&recovery_marker_path)
+            .expect("read recovery-install crash marker")
+            .trim(),
+        recovery_crash_point
+    );
+    assert_eq!(
+        std::fs::read(&active_wal_path).expect("read source WAL after recovery crash"),
+        source_wal_before_recovery_crash,
+        "crashing before rename must leave the source WAL unchanged"
+    );
+    assert_eq!(recovery_temp_images(&db_path).len(), 1);
+
     let recovery_options = LsmStorageOptions {
         enable_wal: true,
         pitr_repository: Some(repository),
@@ -430,7 +514,11 @@ fn failpoint_v7_parallel_pitr_after_fdatasync_before_publication_replays_candida
     };
     let recovered =
         KvEngine::open_with_wal_io_mode(&db_path, recovery_options, WalIoMode::Parallel)
-            .expect("reopen PITR database after post-fdatasync process kill");
+            .expect("reopen PITR database after recovery-install process kill");
+    assert!(
+        recovery_temp_images(&db_path).is_empty(),
+        "restart must durably remove the stale recovery image before serving"
+    );
     let status = recovered
         .pitr_status(PitrStatusOptions {
             cursor: None,
@@ -464,6 +552,41 @@ fn failpoint_v7_parallel_pitr_after_fdatasync_before_publication_replays_candida
     recovered
         .close()
         .expect("close recovered v7 Parallel PITR engine");
+}
+
+#[cfg(target_os = "linux")]
+fn find_v7_pitr_wal(db_path: &std::path::Path) -> PathBuf {
+    let mut paths = std::fs::read_dir(db_path)
+        .expect("list database files")
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("pitr-") && name.ends_with(".wal"))
+        })
+        .filter(|path| {
+            std::fs::read(path).ok().is_some_and(|bytes| {
+                bytes.len() >= 6 && u16::from_be_bytes([bytes[4], bytes[5]]) == 7
+            })
+        });
+    let path = paths.next().expect("find Active v7 PITR WAL");
+    assert!(paths.next().is_none(), "expected one Active v7 PITR WAL");
+    path
+}
+
+#[cfg(target_os = "linux")]
+fn recovery_temp_images(db_path: &std::path::Path) -> Vec<PathBuf> {
+    std::fs::read_dir(db_path)
+        .expect("list database files")
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with(".toy-kv-v7-recovery-"))
+        })
+        .collect()
 }
 
 #[cfg(target_os = "linux")]
