@@ -1221,21 +1221,25 @@ fn pitr_v7_empty_segment_archive_restore() {
     corrupted_empty_image[4096] ^= 0xff;
     std::fs::write(&empty_v7_path, corrupted_empty_image)
         .expect("corrupt the empty v7 archive proof WAL");
+    let corrupt_restore_path = dir.path().join("restored-with-corrupt-empty-proof");
+    let corrupt_restore_result = backup_repository.restore_to(
+        RecoveryTarget::Latest,
+        corrupt_restore_path.clone(),
+        PitrRestoreOptions {
+            selector,
+            implementations: ImplementationRegistry,
+            executor_threads: NonZeroUsize::new(1).expect("nonzero restore worker count"),
+            cache_capacity: 4096,
+            storage: LsmStorageOptions::default_for_test(),
+        },
+    );
     assert!(
-        backup_repository
-            .restore_to(
-                RecoveryTarget::Latest,
-                dir.path().join("restored-with-corrupt-empty-proof"),
-                PitrRestoreOptions {
-                    selector,
-                    implementations: ImplementationRegistry,
-                    executor_threads: NonZeroUsize::new(1).expect("nonzero restore worker count"),
-                    cache_capacity: 4096,
-                    storage: LsmStorageOptions::default_for_test(),
-                },
-            )
-            .is_err(),
+        corrupt_restore_result.is_err(),
         "Latest restore must verify the empty v7 proof segment before publishing the restored database"
+    );
+    assert!(
+        !corrupt_restore_path.exists(),
+        "a failed restore must not leave its destination published"
     );
 }
 
