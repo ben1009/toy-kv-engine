@@ -21581,7 +21581,7 @@ mod tests {
 
             let options = LsmStorageOptions {
                 enable_wal: true,
-                pitr_repository: Some(repository),
+                pitr_repository: Some(repository.clone()),
                 ..LsmStorageOptions::default_for_test()
             };
             let reopened = match startup_path {
@@ -21608,6 +21608,26 @@ mod tests {
             );
 
             reopened.put(b"after-startup-migration", b"v7-value")?;
+            assert_eq!(
+                reopened.get(b"after-startup-migration")?,
+                Some(Bytes::from_static(b"v7-value"))
+            );
+            reopened.close_storage()?;
+            drop(active);
+            drop(reopened);
+
+            let reopened = KvEngine::open(
+                &database,
+                LsmStorageOptions {
+                    enable_wal: true,
+                    pitr_repository: Some(repository),
+                    ..LsmStorageOptions::default_for_test()
+                },
+            )?;
+            assert_eq!(
+                reopened.get(b"before-startup-migration")?,
+                Some(Bytes::from_static(b"legacy-value"))
+            );
             assert_eq!(
                 reopened.get(b"after-startup-migration")?,
                 Some(Bytes::from_static(b"v7-value"))

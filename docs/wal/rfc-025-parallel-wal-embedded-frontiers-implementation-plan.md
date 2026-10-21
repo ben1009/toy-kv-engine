@@ -1317,7 +1317,8 @@ protocol under the PITR lifecycle locks after forced-boundary preparation, so
 a migration during preparation uses the v7 admission cutoff and produces a
 standalone snapshot without a source Active-WAL dependency. Linux regression
 coverage exercises automatic migration through synchronous, asynchronous, and
-repairing open, verifying the recovered data and subsequent write admission.
+repairing open, verifying the recovered data, subsequent write admission, and
+persistence of both legacy and v7 writes across a second reopen.
 Default activation and complete crash qualification remain Stage 8 work.
 
 - Add a shared migration/preflight decision used by enablement, reopen, and
