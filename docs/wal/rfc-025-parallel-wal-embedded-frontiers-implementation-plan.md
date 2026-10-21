@@ -1454,7 +1454,18 @@ speculative DATA above the manifest-authorized floor. Recovery must reject that
 candidate, normalize to the preceding frontier, and retain the acknowledged v7
 write through sealing, archival, and Latest restore. Restore must include both
 the earlier legacy segment and the fallback v7 WAL segment. This does not
-qualify empty images, trailing speculative control frames, or power-loss
+qualify empty-image archive/restore, trailing speculative control frames, or
+power-loss behavior. The thirteenth Stage 8 slice below adds the successful
+empty v7 archive/restore lifecycle.
+
+The thirteenth Stage 8 slice migrates an acknowledged nonempty legacy segment
+to an empty v7 Parallel successor and verifies that Active image is exactly its
+header and generation-zero FRONTIER. It then creates a recovery point to seal
+and archive that zero-batch v7 segment, writes a later v7 successor, and closes
+PITR. Latest restore must verify the empty segment as a proof before publishing
+the restored database, preserve values from both nonempty segments, and fail if
+the empty proof WAL is corrupted. This engine-level lifecycle test does not
+qualify empty-image crashes, trailing speculative control frames, or power-loss
 behavior.
 
 - Complete the correctness matrix below using the persistence model, real
