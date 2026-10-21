@@ -433,12 +433,13 @@ fn failpoint_v7_parallel_pitr_crash_recovery_install_rename_boundaries() {
         .ino();
     let recovery_crash_point = "wal_v7.recovery.after_temp_sync";
     let recovery_marker_path = dir.path().join("recovery-crash.marker");
-    kill_pitr_recovery_child_at_crash_point(
+    kill_pitr_child_at_crash_point(
         &db_path,
         &repository,
         &control_log_path,
         &recovery_marker_path,
         recovery_crash_point,
+        None,
     );
     assert_eq!(
         std::fs::read(&active_wal_path).expect("read source WAL after recovery crash"),
@@ -481,12 +482,13 @@ fn failpoint_v7_parallel_pitr_crash_recovery_install_rename_boundaries() {
     );
 
     let repeated_recovery_marker_path = dir.path().join("repeated-recovery-crash.marker");
-    kill_pitr_recovery_child_at_crash_point(
+    kill_pitr_child_at_crash_point(
         &db_path,
         &repository,
         &control_log_path,
         &repeated_recovery_marker_path,
         recovery_crash_point,
+        None,
     );
     assert_eq!(
         std::fs::read(&normalized_wal_path)
@@ -505,12 +507,13 @@ fn failpoint_v7_parallel_pitr_crash_recovery_install_rename_boundaries() {
 
     let rename_crash_point = "wal_v7.recovery.after_rename_before_directory_sync";
     let rename_marker_path = dir.path().join("recovery-rename-crash.marker");
-    kill_pitr_recovery_child_at_crash_point(
+    kill_pitr_child_at_crash_point(
         &db_path,
         &repository,
         &control_log_path,
         &rename_marker_path,
         rename_crash_point,
+        None,
     );
     let renamed_wal_inode = std::fs::metadata(&active_wal_path)
         .expect("stat normalized WAL after recovery rename")
@@ -526,7 +529,7 @@ fn failpoint_v7_parallel_pitr_crash_recovery_install_rename_boundaries() {
 
     let recovery_options = LsmStorageOptions {
         enable_wal: true,
-        pitr_repository: Some(repository),
+        pitr_repository: Some(repository.clone()),
         ..LsmStorageOptions::default_for_test()
     };
     let recovered =
@@ -569,15 +572,74 @@ fn failpoint_v7_parallel_pitr_crash_recovery_install_rename_boundaries() {
     recovered
         .close()
         .expect("close recovered v7 Parallel PITR engine");
+
+    let recovered_active_wal_path = find_v7_pitr_wal(&db_path);
+    let recovered_active_wal_len = std::fs::metadata(&recovered_active_wal_path)
+        .expect("stat recovered Active WAL before continued write")
+        .len();
+    let continued_write_crash_point = "parallel_wal.after_fdatasync";
+    let continued_write_marker_path = dir.path().join("continued-write-crash.marker");
+    kill_pitr_child_at_crash_point(
+        &db_path,
+        &repository,
+        &control_log_path,
+        &continued_write_marker_path,
+        continued_write_crash_point,
+        Some(("post-recovery-synced-write", "durable")),
+    );
+    let continued_active_wal_path = find_v7_pitr_wal(&db_path);
+    assert_eq!(continued_active_wal_path, recovered_active_wal_path);
+    assert!(
+        std::fs::metadata(&continued_active_wal_path)
+            .expect("stat Active WAL after continued-write sync crash")
+            .len()
+            > recovered_active_wal_len,
+        "the post-recovery sync must append to the installed Active WAL"
+    );
+
+    let continued_recovery_options = LsmStorageOptions {
+        enable_wal: true,
+        pitr_repository: Some(repository),
+        ..LsmStorageOptions::default_for_test()
+    };
+    let continued_recovery =
+        KvEngine::open_with_wal_io_mode(&db_path, continued_recovery_options, WalIoMode::Parallel)
+            .expect("recover a sync after continuing from the installed v7 recovery image");
+    assert_eq!(
+        continued_recovery
+            .get(b"post-recovery-synced-write")
+            .expect("read post-recovery synced write")
+            .as_deref(),
+        Some(b"durable".as_slice()),
+        "a new write synced after recovery must survive a process crash before publication"
+    );
+    assert_eq!(
+        continued_recovery
+            .get(b"acknowledged-before-crash")
+            .expect("read acknowledged baseline after continued recovery")
+            .as_deref(),
+        Some(b"stable".as_slice())
+    );
+    assert_eq!(
+        continued_recovery
+            .get(b"synced-before-publication")
+            .expect("read prior synced candidate after continued recovery")
+            .as_deref(),
+        Some(b"candidate".as_slice())
+    );
+    continued_recovery
+        .close()
+        .expect("close database after continued recovery");
 }
 
 #[cfg(target_os = "linux")]
-fn kill_pitr_recovery_child_at_crash_point(
+fn kill_pitr_child_at_crash_point(
     db_path: &std::path::Path,
     repository: &std::path::Path,
     control_log_path: &std::path::Path,
     marker_path: &std::path::Path,
     crash_point: &str,
+    write: Option<(&str, &str)>,
 ) {
     let mut child = Command::new(chaos_child_path());
     child
@@ -597,9 +659,15 @@ fn kill_pitr_recovery_child_at_crash_point(
         .arg(crash_point)
         .env(PARALLEL_WAL_CRASH_POINT_ENV, crash_point)
         .env(PARALLEL_WAL_CRASH_OCCURRENCE_ENV, "1")
-        .env(PARALLEL_WAL_CRASH_MARKER_ENV, marker_path)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .env(PARALLEL_WAL_CRASH_MARKER_ENV, marker_path);
+    if let Some((key, value)) = write {
+        child
+            .arg("--write-key")
+            .arg(key)
+            .arg("--write-value")
+            .arg(value);
+    }
+    child.stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = child
         .spawn()
         .expect("spawn v7 recovery-install crash child process");

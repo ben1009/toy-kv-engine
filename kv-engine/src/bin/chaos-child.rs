@@ -235,8 +235,19 @@ fn run_v7_pitr_parallel_crash(engine: &KvEngine, args: &[String]) -> Result<(), 
         ));
     }
 
+    let write_key = get_arg(args, "--write-key");
+    let write_value = get_arg(args, "--write-value");
+    let (write_key, write_value) = match (write_key, write_value) {
+        (None, None) => (
+            "synced-before-publication".to_string(),
+            "candidate".to_string(),
+        ),
+        (Some(key), Some(value)) => (key, value),
+        _ => return Err("--write-key and --write-value must be supplied together".to_string()),
+    };
+
     engine
-        .put(b"synced-before-publication", b"candidate")
+        .put(write_key.as_bytes(), write_value.as_bytes())
         .map_err(|error| format!("post-sync candidate write failed: {error:#}"))
 }
 
