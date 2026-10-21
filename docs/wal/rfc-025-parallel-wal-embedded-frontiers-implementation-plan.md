@@ -1370,6 +1370,15 @@ between preflight and intent cannot steal the transition's reserved space.
 
 ### 8. Complete qualification, defaults, and adoption record
 
+The first Stage 8 slice adds a process-level v7 Parallel crash case for a
+successful WAL sync before durable publication or client acknowledgement.
+The child resumes PITR, writes an acknowledged batch into the eligible legacy
+Active WAL if clean close left it empty, then resumes again to install the v7
+Parallel successor. It pauses at the post-`fdatasync` crash hook and is killed;
+recovery must retain the acknowledged values and the synced candidate. This
+qualifies that single boundary only; the remaining matrix and adoption gates
+are still open.
+
 - Complete the correctness matrix below using the persistence model, real
   runtime injection, and process-level integration. Regress ordinary v4,
   strict v5/v6, TTL, recorded-time rollback/clamping, range deletion, OCC,
