@@ -1376,8 +1376,11 @@ The child resumes PITR, writes an acknowledged batch into the eligible legacy
 Active WAL if clean close left it empty, then resumes again to install the v7
 Parallel successor. It pauses at the post-`fdatasync` crash hook and is killed;
 recovery must retain the acknowledged values and the synced candidate. This
-qualifies that single boundary only; the remaining matrix and adoption gates
-are still open.
+qualifies that single boundary only. The second Stage 8 slice adds an engine-open
+regression that corrupts DATA covered by the persisted Active manifest boundary.
+Recovery must reject fallback below that hard floor, preserve both WAL and
+manifest bytes on failure. The remaining matrix and adoption gates are still
+open.
 
 - Complete the correctness matrix below using the persistence model, real
   runtime injection, and process-level integration. Regress ordinary v4,
