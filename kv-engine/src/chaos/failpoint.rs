@@ -37,17 +37,17 @@ pub(crate) use fail::fail_point;
 /// Re-export failpoint configuration primitives for tests.
 pub use fail::{FailScenario, cfg};
 
-/// Environment variable selecting the parallel WAL crash boundary for a child process.
+/// Environment variable selecting a WAL crash boundary for a child process.
 #[doc(hidden)]
 pub const PARALLEL_WAL_CRASH_POINT_ENV: &str = "TOY_KV_PARALLEL_WAL_CRASH_POINT";
-/// Environment variable selecting which occurrence of a crash boundary to pause at.
+/// Environment variable selecting which occurrence of the WAL crash boundary to pause at.
 #[doc(hidden)]
 pub const PARALLEL_WAL_CRASH_OCCURRENCE_ENV: &str = "TOY_KV_PARALLEL_WAL_CRASH_OCCURRENCE";
 /// Environment variable containing the marker file path written before a child pauses.
 #[doc(hidden)]
 pub const PARALLEL_WAL_CRASH_MARKER_ENV: &str = "TOY_KV_PARALLEL_WAL_CRASH_MARKER";
 
-static PARALLEL_WAL_CRASH_POINT_HITS: AtomicUsize = AtomicUsize::new(0);
+static WAL_CRASH_POINT_HITS: AtomicUsize = AtomicUsize::new(0);
 static DEFER_LOWEST_PARALLEL_WAL_GROUP_COMPLETION: AtomicBool = AtomicBool::new(false);
 static PARALLEL_WAL_ADMISSIONS: AtomicUsize = AtomicUsize::new(0);
 #[cfg(all(test, feature = "chaos-testing"))]
@@ -77,8 +77,8 @@ static PARALLEL_WAL_RESULT_DRAIN_GATE: std::sync::OnceLock<ParallelWalTestGate> 
 static PARALLEL_WAL_TXN_ROTATION_GATE: std::sync::OnceLock<ParallelWalTestGate> =
     std::sync::OnceLock::new();
 
-/// Pause a child at a configured parallel WAL boundary until the parent kills it.
-pub(crate) fn parallel_wal_crash_point(point: &str) {
+/// Pause a child at a configured WAL boundary until the parent kills it.
+pub(crate) fn wal_crash_point(point: &str) {
     if !matches!(
         std::env::var(PARALLEL_WAL_CRASH_POINT_ENV),
         Ok(configured) if configured == point
@@ -90,7 +90,7 @@ pub(crate) fn parallel_wal_crash_point(point: &str) {
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(1);
-    let hit = PARALLEL_WAL_CRASH_POINT_HITS.fetch_add(1, Ordering::AcqRel) + 1;
+    let hit = WAL_CRASH_POINT_HITS.fetch_add(1, Ordering::AcqRel) + 1;
     if hit != occurrence {
         return;
     }
