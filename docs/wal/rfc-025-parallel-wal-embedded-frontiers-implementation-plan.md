@@ -1437,8 +1437,14 @@ The tenth Stage 8 slice continues from that recovered Active v7 WAL. A child
 appends a distinct write after recovery and is killed after WAL `fdatasync` but
 before publication; the next process must recover that write alongside the
 prior acknowledged values. This covers process-level continuation and replay
-after recovery, while sealing/archive/restore and power-loss variants remain
-open.
+after recovery.
+
+The eleventh Stage 8 slice closes that recovered engine through a durable PITR
+boundary, restores the latest archived point, and checks the acknowledged,
+pre-publication, and post-recovery writes in the restored database. This covers
+one nonempty continuation-to-seal/archive/restore path and dispatches v7 WAL
+digest verification to the frozen image's whole-object digest. Empty, fallback,
+trailing-control, and power-loss variants remain open.
 
 - Complete the correctness matrix below using the persistence model, real
   runtime injection, and process-level integration. Regress ordinary v4,

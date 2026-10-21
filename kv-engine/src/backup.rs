@@ -3429,9 +3429,11 @@ impl BackupRepository {
             let mut file = File::from(fd);
             let mut wal = Vec::new();
             file.read_to_end(&mut wal)?;
+            let digest_policy = crate::pitr::archive::SourceObjectDigest::for_wal_format(
+                metadata.wal_format_version,
+            )?;
             ensure!(
-                crate::pitr::seal::wal_digest(&wal, metadata.wal_digest_rule()?)?.as_slice()
-                    == metadata.wal_digest,
+                digest_policy.digest(&wal)?.as_slice() == metadata.wal_digest,
                 "PITR restore WAL digest mismatch"
             );
             let seal_name = crate::pitr::archive::archive_object_name(
