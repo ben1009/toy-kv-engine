@@ -1391,8 +1391,16 @@ The fourth Stage 8 slice crashes a child after the normalized Active recovery
 image has been synced but before it is renamed over the source. It verifies the
 source WAL remains byte-identical, then restarts and checks that stale temp
 cleanup and ordinary recovery preserve the synced candidate. This covers only
-the pre-rename installation cut; other copy, sync, rename, directory-sync, and
-repeated-normalization crash cases remain open.
+the pre-rename installation cut; other copy/write/sync cuts, rename failures,
+directory-sync failures, and repeated-normalization crash cases remain open.
+
+The fifth Stage 8 slice crashes a child after the normalized recovery image has
+been renamed over the Active WAL but before the parent directory sync. It checks
+that the source path exposes the normalized image, no staging image remains, and
+a later process restart recovers the acknowledged and synced values. This
+process-kill case does not simulate loss of the unsynced directory entry after a
+power failure; the remaining installation and repeated-normalization cuts stay
+open.
 
 - Complete the correctness matrix below using the persistence model, real
   runtime injection, and process-level integration. Regress ordinary v4,

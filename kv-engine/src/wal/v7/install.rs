@@ -914,6 +914,10 @@ pub(crate) fn install_active_recovery(
 
         fs::rename(&temp_path, &source_path)
             .context("atomically replace Active v7 WAL with normalized image")?;
+        #[cfg(feature = "chaos-testing")]
+        crate::chaos::failpoint::wal_crash_point(
+            "wal_v7.recovery.after_rename_before_directory_sync",
+        );
         parent_dir
             .sync_all()
             .context("sync Active v7 WAL directory after replacement")?;
