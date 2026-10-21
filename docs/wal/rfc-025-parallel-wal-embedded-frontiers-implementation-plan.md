@@ -1413,8 +1413,15 @@ The seventh Stage 8 slice injects a one-shot error at the normalized Active
 image's file sync before rename. It verifies the canonical source remains
 byte-identical, failed-attempt cleanup removes the staging image, and a retry
 revalidates and installs the same acknowledged prefix. The failure is injected
-before the OS sync call; other copy/write/sync cuts, rename failures, and
-repeated-normalization crash cases remain open.
+before the OS sync call.
+
+The eighth Stage 8 slice injects an error after writing the staging image's
+header and another after syncing the completed image but immediately before
+rename. Both cases verify the source remains byte-identical, failed-attempt
+cleanup removes the staging image, and a retry installs the same acknowledged
+prefix. These injected errors do not simulate process crashes during copying or
+the OS rename operation; repeated-normalization crash cases and the remaining
+process/power-loss matrix stay open.
 
 - Complete the correctness matrix below using the persistence model, real
   runtime injection, and process-level integration. Regress ordinary v4,

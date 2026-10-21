@@ -916,6 +916,10 @@ pub(crate) fn install_active_recovery(
         crate::chaos::failpoint::wal_crash_point("wal_v7.recovery.after_temp_sync");
         drop(temp);
 
+        #[cfg(feature = "chaos-testing")]
+        crate::chaos::failpoint::fail_point!("wal_v7.recovery.before_rename", |_| Err(
+            anyhow::anyhow!("injected Active v7 recovery rename failure")
+        ));
         fs::rename(&temp_path, &source_path)
             .context("atomically replace Active v7 WAL with normalized image")?;
         #[cfg(feature = "chaos-testing")]
@@ -1232,6 +1236,10 @@ fn copy_and_rebuild_prefix(
     destination
         .write_all(&header_bytes)
         .context("copy Active v7 immutable header")?;
+    #[cfg(feature = "chaos-testing")]
+    crate::chaos::failpoint::fail_point!("wal_v7.recovery.after_temp_header_write", |_| Err(
+        anyhow::anyhow!("injected Active v7 recovery temporary image write failure")
+    ));
     let mut physical_hasher = Sha256::new();
     physical_hasher.update(header_bytes);
     let mut logical_hasher = Sha256::new();
@@ -1806,6 +1814,67 @@ mod tests {
         ))
     }
 
+    #[cfg(feature = "chaos-testing")]
+    fn assert_active_recovery_failure_preserves_source_and_recovers_on_retry(
+        failpoint: &'static str,
+        expected_error: &'static str,
+    ) -> Result<()> {
+        let scenario = crate::chaos::failpoint::FailScenario::setup();
+        let directory = TestDirectory::new()?;
+        let path = directory.0.join("active.wal");
+        let (header, anchor) = create_nonempty_image(&path)?;
+        let original = fs::read(&path)?;
+        let selection = active_selection(&path, anchor)?;
+
+        crate::chaos::failpoint::cfg(failpoint, "return").map_err(anyhow::Error::msg)?;
+        let attempt = install_active_recovery(&path, &selection);
+        crate::chaos::failpoint::cfg(failpoint, "off").map_err(anyhow::Error::msg)?;
+        let error = attempt
+            .err()
+            .context("Active recovery succeeded despite an injected installation failure")?;
+        assert!(
+            error.to_string().contains(expected_error),
+            "unexpected recovery installation error: {error:#}"
+        );
+        assert_eq!(
+            fs::read(&path)?,
+            original,
+            "a pre-rename installation failure must preserve the source WAL"
+        );
+        let temp_prefix = recovery_temp_prefix(path.file_name().context("test WAL has no name")?);
+        assert!(
+            fs::read_dir(&directory.0)?.all(|entry| {
+                entry.is_ok_and(|entry| {
+                    !entry
+                        .file_name()
+                        .as_encoded_bytes()
+                        .starts_with(temp_prefix.as_bytes())
+                })
+            }),
+            "failed installation cleanup must not leave a recovery image"
+        );
+
+        let recovered = recover_and_install_active(
+            &path,
+            WalV7RecoveryAuthority::Active {
+                predecessor: header.predecessor,
+                durable_anchors: vec![anchor],
+            },
+        )?;
+        assert_eq!(recovered.installed.active_boundary, anchor);
+        assert_eq!(recovered.installed.batches.len(), 1);
+        assert_eq!(
+            recovered.installed.batches[0].entries,
+            [WalEntry::Put {
+                key: b"key".to_vec(),
+                value: b"value".to_vec(),
+            }]
+        );
+        scenario.teardown();
+
+        Ok(())
+    }
+
     #[test]
     fn active_normalization_relocates_marker_and_is_idempotent() -> Result<()> {
         // Arrange
@@ -1968,6 +2037,24 @@ mod tests {
         scenario.teardown();
 
         Ok(())
+    }
+
+    #[cfg(feature = "chaos-testing")]
+    #[test]
+    fn failpoint_active_recovery_partial_temp_image_failure_recovers_on_retry() -> Result<()> {
+        assert_active_recovery_failure_preserves_source_and_recovers_on_retry(
+            "wal_v7.recovery.after_temp_header_write",
+            "injected Active v7 recovery temporary image write failure",
+        )
+    }
+
+    #[cfg(feature = "chaos-testing")]
+    #[test]
+    fn failpoint_active_recovery_rename_failure_recovers_on_retry() -> Result<()> {
+        assert_active_recovery_failure_preserves_source_and_recovers_on_retry(
+            "wal_v7.recovery.before_rename",
+            "injected Active v7 recovery rename failure",
+        )
     }
 
     #[test]
