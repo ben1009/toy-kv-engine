@@ -447,6 +447,62 @@ fn failpoint_v7_parallel_pitr_crash_recovery_install_rename_boundaries() {
     );
     assert_eq!(recovery_temp_images(&db_path).len(), 1);
 
+    let first_recovery = KvEngine::open_with_wal_io_mode(
+        &db_path,
+        LsmStorageOptions {
+            enable_wal: true,
+            pitr_repository: Some(repository.clone()),
+            ..LsmStorageOptions::default_for_test()
+        },
+        WalIoMode::Parallel,
+    )
+    .expect("complete the first Active recovery normalization");
+    first_recovery
+        .close()
+        .expect("close after the first Active recovery normalization");
+    assert!(
+        recovery_temp_images(&db_path).is_empty(),
+        "successful recovery must clean the interrupted staging image"
+    );
+    let normalized_wal_path = find_v7_pitr_wal(&db_path);
+    assert_eq!(normalized_wal_path, active_wal_path);
+    let normalized_image = std::fs::read(&normalized_wal_path)
+        .expect("read the first installed normalized Active WAL");
+    let normalized_wal_inode = std::fs::metadata(&normalized_wal_path)
+        .expect("stat the first installed normalized Active WAL")
+        .ino();
+    assert_ne!(
+        normalized_wal_inode, source_wal_inode_before_recovery_crash,
+        "successful normalization must install a fresh inode"
+    );
+    assert!(
+        normalized_image.len() < source_wal_before_recovery_crash.len(),
+        "successful normalization must discard the speculative suffix"
+    );
+
+    let repeated_recovery_marker_path = dir.path().join("repeated-recovery-crash.marker");
+    kill_pitr_recovery_child_at_crash_point(
+        &db_path,
+        &repository,
+        &control_log_path,
+        &repeated_recovery_marker_path,
+        recovery_crash_point,
+    );
+    assert_eq!(
+        std::fs::read(&normalized_wal_path)
+            .expect("read the normalized source after repeated recovery crash"),
+        normalized_image,
+        "a second pre-rename crash must preserve the already-installed normalized WAL"
+    );
+    assert_eq!(
+        std::fs::metadata(&normalized_wal_path)
+            .expect("stat normalized source after repeated recovery crash")
+            .ino(),
+        normalized_wal_inode,
+        "a pre-rename crash during repeated normalization must keep the canonical inode"
+    );
+    assert_eq!(recovery_temp_images(&db_path).len(), 1);
+
     let rename_crash_point = "wal_v7.recovery.after_rename_before_directory_sync";
     let rename_marker_path = dir.path().join("recovery-rename-crash.marker");
     kill_pitr_recovery_child_at_crash_point(
@@ -460,8 +516,8 @@ fn failpoint_v7_parallel_pitr_crash_recovery_install_rename_boundaries() {
         .expect("stat normalized WAL after recovery rename")
         .ino();
     assert_ne!(
-        renamed_wal_inode, source_wal_inode_before_recovery_crash,
-        "the rename boundary must replace the source WAL with the fresh recovery inode"
+        renamed_wal_inode, normalized_wal_inode,
+        "the repeated rename boundary must replace the canonical WAL with a fresh recovery inode"
     );
     assert!(
         recovery_temp_images(&db_path).is_empty(),

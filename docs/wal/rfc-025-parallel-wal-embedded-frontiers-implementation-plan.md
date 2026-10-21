@@ -1420,8 +1420,18 @@ header and another after syncing the completed image but immediately before
 rename. Both cases verify the source remains byte-identical, failed-attempt
 cleanup removes the staging image, and a retry installs the same acknowledged
 prefix. These injected errors do not simulate process crashes during copying or
-the OS rename operation; repeated-normalization crash cases and the remaining
-process/power-loss matrix stay open.
+the OS rename operation. The ninth slice below covers repeated normalization at
+post-sync and post-rename crash boundaries; the remaining process/power-loss
+matrix stays open.
+
+The ninth Stage 8 slice extends the process-level installation scenario: after
+one normalization completes, a later reopen crashes after syncing a second
+temporary image but before rename. The test verifies the already-installed
+canonical image remains byte-identical and on the same inode, then retries
+normalization, crashes after replacement, and checks a final restart recovers
+the same acknowledged and synced values. This covers repeated normalization
+across process restarts, but does not simulate power loss or the remaining
+correctness matrix.
 
 - Complete the correctness matrix below using the persistence model, real
   runtime injection, and process-level integration. Regress ordinary v4,
