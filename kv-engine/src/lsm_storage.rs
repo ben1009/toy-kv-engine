@@ -21552,6 +21552,73 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn startup_paths_resume_eligible_legacy_pitr_as_v7() -> anyhow::Result<()> {
+        #[derive(Clone, Copy)]
+        enum StartupPath {
+            Sync,
+            Async,
+            Repairing,
+        }
+
+        for startup_path in [
+            StartupPath::Sync,
+            StartupPath::Async,
+            StartupPath::Repairing,
+        ] {
+            let directory = tempdir()?;
+            let database = directory.path().join("db");
+            let repository = directory.path().join("repository");
+            let engine = pitr_flush_test_engine(directory.path());
+            suspend_pitr_maintenance_for_test(&engine);
+            engine.put(b"before-startup-migration", b"legacy-value")?;
+            let legacy_active = engine.inner.state.load().memtable.clone();
+            assert!(legacy_active.uses_wal_v5());
+            assert!(!legacy_active.is_empty());
+            engine.close_storage()?;
+            drop(legacy_active);
+            drop(engine);
+
+            let options = LsmStorageOptions {
+                enable_wal: true,
+                pitr_repository: Some(repository),
+                ..LsmStorageOptions::default_for_test()
+            };
+            let reopened = match startup_path {
+                StartupPath::Sync => KvEngine::open(&database, options)?,
+                StartupPath::Async => KvEngine::open_async(&database, options).await?,
+                StartupPath::Repairing => {
+                    let (engine, repaired_memtable_ids) =
+                        KvEngine::open_repairing(&database, options)?;
+                    assert!(repaired_memtable_ids.is_empty());
+                    engine
+                }
+            };
+
+            let active = reopened.inner.state.load().memtable.clone();
+            assert!(active.uses_v7_wal(), "startup path did not migrate to v7");
+            let active_segment_id = LsmStorageInner::pitr_segment_of(&active);
+            let pitr_state = reopened.pitr_manifest_state.lock();
+            assert_eq!(pitr_state.mode, crate::pitr::manifest::PitrMode::Enabled);
+            assert_eq!(pitr_state.active_segment_id, active_segment_id);
+            drop(pitr_state);
+            assert_eq!(
+                reopened.get(b"before-startup-migration")?,
+                Some(Bytes::from_static(b"legacy-value"))
+            );
+
+            reopened.put(b"after-startup-migration", b"v7-value")?;
+            assert_eq!(
+                reopened.get(b"after-startup-migration")?,
+                Some(Bytes::from_static(b"v7-value"))
+            );
+            reopened.close_storage()?;
+        }
+
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
     #[test]
     fn resume_completes_legacy_v7_migration_intent_with_or_without_seal_sidecar()
     -> anyhow::Result<()> {

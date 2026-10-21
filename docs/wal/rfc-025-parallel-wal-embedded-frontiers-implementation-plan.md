@@ -1304,8 +1304,7 @@ publish that ledger. Sealed retries count the source seal and existing
 successor/recovery images once against their transition allowances. Regression
 coverage includes exact-capacity Sealed retries with and without retained successor
 images, plus flush reclamation before migration intent and after recovery
-reservation, checking source-spool charges and successful reopen. Constructor
-defaults and full crash qualification remain later Stage 7 work. Maintenance-driven
+reservation, checking source-spool charges and successful reopen. Maintenance-driven
 legacy rotations use the same capacity assessment and reservation: eligible
 nonempty sources transition to v7, while deferred capacity retains the normal
 v5/v6 Leader rotation path. The transition keeps admission stopped through
@@ -1316,7 +1315,10 @@ that already finished flushing; idle successors also schedule cleanup retries
 for legacy source obligations. Standalone checkpoints select their capture
 protocol under the PITR lifecycle locks after forced-boundary preparation, so
 a migration during preparation uses the v7 admission cutoff and produces a
-standalone snapshot without a source Active-WAL dependency.
+standalone snapshot without a source Active-WAL dependency. Linux regression
+coverage exercises automatic migration through synchronous, asynchronous, and
+repairing open, verifying the recovered data and subsequent write admission.
+Default activation and complete crash qualification remain Stage 8 work.
 
 - Add a shared migration/preflight decision used by enablement, reopen, and
   rotation. Calculate capacity for the largest configured v7 physical image
