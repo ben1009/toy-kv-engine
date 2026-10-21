@@ -17,8 +17,8 @@ use kv_engine::wal::WalIoMode;
 use kv_engine::{
     BackupOptions, BackupRepository, CreateBackupOutcome, EnablePitrOutcome,
     ImplementationRegistry, PersistedPitrConfig, PitrCloseOutcome, PitrOptions, PitrRestoreOptions,
-    PitrRuntimeOptions, PitrStatusOptions, PitrWalIoMode, RecoverySelector, RecoveryTarget,
-    RestoreToOutcome,
+    PitrRuntimeOptions, PitrStatusOptions, PitrWalIoMode, RecoveryPointOutcome, RecoverySelector,
+    RecoveryTarget, RestoreToOutcome, VerifyPitrDepth, VerifyPitrOptions,
 };
 use std::io::Read;
 #[cfg(target_os = "linux")]
@@ -976,6 +976,267 @@ fn failpoint_v7_parallel_pitr_fallback_archive_restore() {
         "latest restore must not replay the rejected speculative candidate"
     );
     restored.close().expect("close restored fallback database");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn pitr_v7_empty_segment_archive_restore() {
+    let probe_dir = tempfile::tempdir().expect("create v7 Parallel empty-segment probe directory");
+    let probe_options = LsmStorageOptions {
+        enable_wal: true,
+        ..LsmStorageOptions::default_for_test()
+    };
+    match KvEngine::open_with_wal_io_mode(probe_dir.path(), probe_options, WalIoMode::Parallel) {
+        Ok(engine) => engine
+            .close()
+            .expect("close v7 Parallel empty-segment probe"),
+        Err(error) => {
+            panic!("v7 Parallel empty-segment qualification requires io_uring: {error:#}")
+        }
+    }
+
+    let dir = tempfile::tempdir().expect("create v7 empty-segment archive-restore directory");
+    let db_path = dir.path().join("db");
+    let repository = dir.path().join("repository");
+    let engine = KvEngine::open(
+        &db_path,
+        LsmStorageOptions {
+            enable_wal: true,
+            ..LsmStorageOptions::default_for_test()
+        },
+    )
+    .expect("open database for empty-segment PITR setup");
+    assert!(matches!(
+        engine.create_backup(BackupOptions {
+            repository: repository.clone(),
+            use_hard_links: false,
+        }),
+        Ok(CreateBackupOutcome::Committed(_))
+    ));
+    assert!(matches!(
+        engine.enable_pitr(PitrOptions {
+            repository: repository.clone(),
+            config: PersistedPitrConfig {
+                archive_interval: Duration::from_secs(60),
+                max_segment_bytes: 1 << 20,
+                max_unarchived_bytes: 2 << 20,
+                max_source_spool_bytes: 8 << 20,
+            },
+            runtime: PitrRuntimeOptions::default(),
+        }),
+        Ok(EnablePitrOutcome::Enabled { .. })
+    ));
+    engine
+        .put(b"legacy-segment-value", b"restored")
+        .expect("persist value in the legacy PITR segment");
+    engine.close().expect("close PITR setup engine");
+
+    let engine = KvEngine::open_with_wal_io_mode(
+        &db_path,
+        LsmStorageOptions {
+            enable_wal: true,
+            pitr_repository: Some(repository.clone()),
+            ..LsmStorageOptions::default_for_test()
+        },
+        WalIoMode::Parallel,
+    )
+    .expect("reopen PITR database with the v7 Parallel writer");
+    engine
+        .resume_pitr(&repository)
+        .expect("resume PITR before checking the Active format");
+    let mut status = engine
+        .pitr_status(PitrStatusOptions {
+            cursor: None,
+            page_size: NonZeroUsize::new(64).expect("nonzero PITR status page size"),
+        })
+        .expect("read status after first legacy resume");
+    if status.active_wal_format_version != Some(7) {
+        engine
+            .put(b"legacy-migration-trigger", b"legacy")
+            .expect("persist a legacy batch before v7 migration");
+        engine
+            .resume_pitr(&repository)
+            .expect("resume PITR to install the v7 successor");
+        status = engine
+            .pitr_status(PitrStatusOptions {
+                cursor: None,
+                page_size: NonZeroUsize::new(64).expect("nonzero PITR status page size"),
+            })
+            .expect("read status after v7 migration");
+    }
+    assert_eq!(status.active_wal_format_version, Some(7));
+    assert_eq!(status.active_wal_io_mode, Some(PitrWalIoMode::Parallel));
+    let active_wal_path = find_v7_pitr_wal(&db_path);
+    let active_image = std::fs::read(&active_wal_path).expect("read empty v7 Active WAL");
+    assert_eq!(
+        active_image.len(),
+        2 * 4096,
+        "empty v7 image is header plus F0"
+    );
+    assert_eq!(&active_image[4096..4104], b"TKVW7FR1");
+    assert_eq!(
+        u16::from_be_bytes([active_image[4106], active_image[4107]]),
+        2,
+        "the empty Active v7 image must contain generation-zero FRONTIER"
+    );
+    assert_eq!(
+        status.active_wal_bytes,
+        u64::try_from(active_image.len()).expect("active image length fits u64")
+    );
+
+    let interval = status
+        .recoverable_intervals
+        .first()
+        .expect("PITR setup must retain a recoverable base interval");
+    let selector = RecoverySelector {
+        timeline_id: interval.timeline_id,
+        archive_epoch_id: Some(interval.archive_epoch_id),
+        base_backup_id: None,
+    };
+
+    assert!(matches!(
+        engine
+            .create_recovery_point()
+            .expect("archive the empty v7 segment before a later segment"),
+        RecoveryPointOutcome::Durable(_)
+    ));
+    engine
+        .put(b"after-empty-v7-segment", b"later")
+        .expect("persist a commit in the v7 segment after the empty one");
+    let final_point = match engine
+        .close_pitr()
+        .expect("seal and archive the later nonempty v7 segment")
+    {
+        PitrCloseOutcome::ClosedDurably {
+            final_point: Some(point),
+        } => point,
+        outcome => panic!("empty v7 PITR close did not finish durably: {outcome:?}"),
+    };
+    assert!(final_point.commit_ts.is_some());
+
+    let mut archived_v7_images = Vec::new();
+    for entry in std::fs::read_dir(repository.join("wal")).expect("list archived PITR WAL objects")
+    {
+        let path = entry
+            .expect("read archived PITR WAL directory entry")
+            .path();
+        if path.extension().and_then(|extension| extension.to_str()) != Some("wal") {
+            continue;
+        }
+        let image = std::fs::read(&path).expect("read archived PITR WAL object");
+        if image.len() >= 6 && u16::from_be_bytes([image[4], image[5]]) == 7 {
+            archived_v7_images.push((path, image));
+        }
+    }
+    assert_eq!(
+        archived_v7_images.len(),
+        2,
+        "archive must contain the empty v7 segment and its later successor"
+    );
+    let empty_v7_path = archived_v7_images
+        .iter()
+        .find(|(_, image)| image.len() == 2 * 4096)
+        .map(|(path, _)| path.clone())
+        .expect("find the archived empty v7 image");
+    let archived_v7_image = archived_v7_images
+        .iter()
+        .find(|(_, image)| image.len() == 2 * 4096)
+        .map(|(_, image)| image)
+        .expect("find the archived empty v7 image");
+    assert_eq!(&archived_v7_image[4096..4104], b"TKVW7FR1");
+    assert_eq!(
+        u16::from_be_bytes([archived_v7_image[4106], archived_v7_image[4107]]),
+        2,
+        "the empty archived v7 image must end at its generation-zero FRONTIER"
+    );
+    assert!(
+        archived_v7_images
+            .iter()
+            .any(|(_, image)| image.len() > 2 * 4096),
+        "archive must contain a later nonempty v7 segment"
+    );
+
+    let backup_repository =
+        BackupRepository::open(&repository).expect("open repository after empty v7 archive");
+    let verification = backup_repository
+        .verify_pitr(VerifyPitrOptions {
+            depth: VerifyPitrDepth::Deep {
+                sampled_targets: NonZeroUsize::new(1).expect("nonzero verification sample count"),
+            },
+            selector: Some(selector),
+            cursor: None,
+            page_size: NonZeroUsize::new(64).expect("nonzero PITR verification page size"),
+        })
+        .expect("deeply verify the archived empty v7 segment");
+    assert_eq!(
+        verification.first_failure, None,
+        "the empty v7 WAL and its seal must verify as immutable archive objects"
+    );
+
+    let restored_path = dir.path().join("restored-empty-v7-segment");
+    let restore_info = match backup_repository
+        .restore_to(
+            RecoveryTarget::Latest,
+            &restored_path,
+            PitrRestoreOptions {
+                selector,
+                implementations: ImplementationRegistry,
+                executor_threads: NonZeroUsize::new(1).expect("nonzero restore worker count"),
+                cache_capacity: 4096,
+                storage: LsmStorageOptions::default_for_test(),
+            },
+        )
+        .expect("restore Latest across the empty v7 segment")
+    {
+        RestoreToOutcome::Restored(info) => info,
+        outcome => panic!("empty v7 segment restore did not produce a database: {outcome:?}"),
+    };
+    assert_eq!(restore_info.resolved_commit_ts, final_point.commit_ts);
+    assert!(restore_info.replayed_segments >= 2);
+
+    let restored = KvEngine::open(&restored_path, LsmStorageOptions::default_for_test())
+        .expect("open database restored across the empty v7 segment");
+    assert_eq!(
+        restored
+            .get(b"legacy-segment-value")
+            .expect("read value restored from the legacy source segment")
+            .as_deref(),
+        Some(b"restored".as_slice())
+    );
+    assert_eq!(
+        restored
+            .get(b"after-empty-v7-segment")
+            .expect("read value restored from the later v7 segment")
+            .as_deref(),
+        Some(b"later".as_slice())
+    );
+    restored
+        .close()
+        .expect("close restored empty-segment database");
+
+    // The empty segment is included as a restore proof because the later v7
+    // segment is selected. Corrupting its archived WAL must therefore prevent a
+    // second Latest restore, even though there are no batches to replay from it.
+    let mut corrupted_empty_image = std::fs::read(&empty_v7_path).expect("read empty v7 archive");
+    corrupted_empty_image[4096] ^= 0xff;
+    std::fs::write(&empty_v7_path, corrupted_empty_image)
+        .expect("corrupt the empty v7 archive proof WAL");
+    assert!(
+        backup_repository
+            .restore_to(
+                RecoveryTarget::Latest,
+                dir.path().join("restored-with-corrupt-empty-proof"),
+                PitrRestoreOptions {
+                    selector,
+                    implementations: ImplementationRegistry,
+                    executor_threads: NonZeroUsize::new(1).expect("nonzero restore worker count"),
+                    cache_capacity: 4096,
+                    storage: LsmStorageOptions::default_for_test(),
+                },
+            )
+            .is_err(),
+        "Latest restore must verify the empty v7 proof segment before publishing the restored database"
+    );
 }
 
 #[cfg(target_os = "linux")]
