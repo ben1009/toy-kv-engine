@@ -906,6 +906,10 @@ pub(crate) fn install_active_recovery(
             source.metadata()?.len() == source_len,
             "Active v7 WAL changed during exclusive recovery"
         );
+        #[cfg(feature = "chaos-testing")]
+        crate::chaos::failpoint::fail_point!("wal_v7.recovery.before_temp_sync", |_| Err(
+            anyhow::anyhow!("injected Active v7 recovery image sync failure")
+        ));
         temp.sync_all()
             .context("sync normalized Active v7 recovery image")?;
         #[cfg(feature = "chaos-testing")]
@@ -1868,6 +1872,69 @@ mod tests {
         assert_ne!(
             replaced, original,
             "rename should have installed the normalized image"
+        );
+        let temp_prefix = recovery_temp_prefix(path.file_name().context("test WAL has no name")?);
+        assert!(
+            fs::read_dir(&directory.0)?.all(|entry| {
+                entry.is_ok_and(|entry| {
+                    !entry
+                        .file_name()
+                        .as_encoded_bytes()
+                        .starts_with(temp_prefix.as_bytes())
+                })
+            }),
+            "failed installation cleanup must not leave a recovery image"
+        );
+
+        let recovered = recover_and_install_active(
+            &path,
+            WalV7RecoveryAuthority::Active {
+                predecessor: header.predecessor,
+                durable_anchors: vec![anchor],
+            },
+        )?;
+        assert_eq!(recovered.installed.active_boundary, anchor);
+        assert_eq!(recovered.installed.batches.len(), 1);
+        assert_eq!(
+            recovered.installed.batches[0].entries,
+            [WalEntry::Put {
+                key: b"key".to_vec(),
+                value: b"value".to_vec(),
+            }]
+        );
+        scenario.teardown();
+
+        Ok(())
+    }
+
+    #[cfg(feature = "chaos-testing")]
+    #[test]
+    fn failpoint_active_recovery_temp_sync_failure_recovers_on_retry() -> Result<()> {
+        let scenario = crate::chaos::failpoint::FailScenario::setup();
+        let directory = TestDirectory::new()?;
+        let path = directory.0.join("active.wal");
+        let (header, anchor) = create_nonempty_image(&path)?;
+        let original = fs::read(&path)?;
+        let selection = active_selection(&path, anchor)?;
+
+        crate::chaos::failpoint::cfg("wal_v7.recovery.before_temp_sync", "return")
+            .map_err(anyhow::Error::msg)?;
+        let error = install_active_recovery(&path, &selection)
+            .err()
+            .context("Active recovery succeeded despite an injected image-sync failure")?;
+        crate::chaos::failpoint::cfg("wal_v7.recovery.before_temp_sync", "off")
+            .map_err(anyhow::Error::msg)?;
+
+        assert!(
+            error
+                .to_string()
+                .contains("injected Active v7 recovery image sync failure"),
+            "unexpected recovery installation error: {error:#}"
+        );
+        assert_eq!(
+            fs::read(&path)?,
+            original,
+            "failure before syncing the temporary image must preserve the source WAL"
         );
         let temp_prefix = recovery_temp_prefix(path.file_name().context("test WAL has no name")?);
         assert!(
