@@ -28246,6 +28246,53 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn v7_active_recovery_rejects_fallback_below_corrupt_manifest_boundary() -> anyhow::Result<()> {
+        use crate::wal::v7::codec::{WAL_V7_FRAME_HEADER_LEN, WAL_V7_FRAME_LEN};
+
+        let directory = tempdir()?;
+        let options = v7_recovery_test_database(directory.path())?;
+        let database = directory.path().join("db");
+        let wal_path = pitr_segment_wals(&database)
+            .pop()
+            .ok_or_else(|| anyhow::anyhow!("v7 recovery fixture has no Active WAL"))?
+            .1;
+        let manifest_path = database.join("MANIFEST");
+        let manifest_before = std::fs::read(&manifest_path)?;
+        let mut wal_image = std::fs::read(&wal_path)?;
+        let data_body_offset = 2 * WAL_V7_FRAME_LEN + WAL_V7_FRAME_HEADER_LEN;
+        anyhow::ensure!(
+            wal_image.len() > data_body_offset,
+            "v7 recovery fixture has no DATA frame body"
+        );
+
+        // The fixture's exact manifest ActiveBoundary includes this DATA
+        // frame. Corrupting it makes the newest frontier unverifiable, so
+        // falling back to generation zero would violate that durable floor.
+        wal_image[data_body_offset] ^= 1;
+        std::fs::write(&wal_path, &wal_image)?;
+
+        let error = match KvEngine::open(&database, options) {
+            Err(error) => error,
+            Ok(engine) => {
+                let _ = engine.close_storage();
+                anyhow::bail!(
+                    "recovery accepted Active v7 data corruption below the manifest boundary"
+                );
+            }
+        };
+        anyhow::ensure!(
+            format!("{error:#}")
+                .contains("Active v7 durable anchor extends beyond the verified physical prefix"),
+            "Active v7 corruption failed for an unexpected reason: {error:#}"
+        );
+        assert_eq!(std::fs::read(&wal_path)?, wal_image);
+        assert_eq!(std::fs::read(&manifest_path)?, manifest_before);
+
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn v7_recovery_uses_snapshot_authority_without_manifest() -> anyhow::Result<()> {
         for pending_snapshot in [false, true] {
             let directory = tempdir()?;
