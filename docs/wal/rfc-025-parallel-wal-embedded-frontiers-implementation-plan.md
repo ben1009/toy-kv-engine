@@ -1379,7 +1379,12 @@ recovery must retain the acknowledged values and the synced candidate. This
 qualifies that single boundary only. The second Stage 8 slice adds an engine-open
 regression that corrupts DATA covered by the persisted Active manifest boundary.
 Recovery must reject fallback below that hard floor, preserve both WAL and
-manifest bytes on failure. The remaining matrix and adoption gates are still
+manifest bytes on failure. The third Stage 8 slice adds an engine-level
+continuation regression: it damages a synced candidate above the manifest floor,
+checks fallback normalization, then appends and syncs new batches across repeated
+reopens in both Leader and Parallel modes. It verifies that the discarded ticket
+is reused and the speculative value never reappears. This does not complete the
+process-crash recovery matrix. The remaining matrix and adoption gates are still
 open.
 
 - Complete the correctness matrix below using the persistence model, real

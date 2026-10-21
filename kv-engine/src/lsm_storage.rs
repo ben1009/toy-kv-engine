@@ -28293,6 +28293,169 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn v7_active_fallback_normalizes_and_continues_writes_after_reopen() -> anyhow::Result<()> {
+        use crate::{
+            pitr::{LIVE_WAL_V5_LIMITS, RecordedAt, WalBatch, WalEntry},
+            wal::{WalIoMode, v7::codec::WAL_V7_FRAME_HEADER_LEN},
+        };
+
+        for mode in [WalIoMode::Leader, WalIoMode::Parallel] {
+            let directory = tempdir()?;
+            let options = v7_recovery_test_database(directory.path())?;
+            let database = directory.path().join("db");
+            let wal_path = pitr_segment_wals(&database)
+                .pop()
+                .ok_or_else(|| anyhow::anyhow!("v7 recovery fixture has no Active WAL"))?
+                .1;
+
+            let engine = KvEngine::open_with_wal_io_mode(&database, options.clone(), mode)?;
+            let state = engine.pitr_manifest_state.lock().clone();
+            engine.close_storage()?;
+            drop(engine);
+
+            // Append and sync a second ticket without publishing its logical
+            // boundary. A crash at this point leaves it above the manifest
+            // floor, where Active recovery is permitted to fall back.
+            let open_lock = super::WalV7OpenLock::acquire(&database)?;
+            let anchor = state
+                .active_boundary
+                .ok_or_else(|| anyhow::anyhow!("v7 recovery fixture has no Active boundary"))?;
+            let predecessor = super::pitr_chain_anchor_from_persisted(
+                state
+                    .predecessor_anchor
+                    .ok_or_else(|| anyhow::anyhow!("v7 recovery fixture has no predecessor"))?,
+            );
+            let installed = crate::wal::v7::install::recover_and_install_active(
+                &wal_path,
+                crate::wal::v7::recovery::WalV7RecoveryAuthority::Active {
+                    predecessor,
+                    durable_anchors: vec![anchor],
+                },
+            )?
+            .installed;
+            let ledger = crate::wal::v7::admission::WalV7ResourceLedger::new(
+                crate::wal::v7::admission::WalV7ResourceLimits {
+                    max_logical_wal_bytes: u64::MAX,
+                    max_source_spool_bytes: u64::MAX,
+                    max_recovery_workspace_bytes: u64::MAX,
+                    max_buffer_memory_bytes: u64::MAX,
+                    max_seal_index_bytes: u64::MAX,
+                },
+            )?;
+            let owner = Arc::new(crate::wal::v7::admission::WalV7ReservationOwner::new(
+                ledger, &installed,
+            )?);
+            let max_segment_bytes = state
+                .config
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("v7 recovery fixture has no persisted config"))?
+                .max_segment_bytes;
+            let mut writer = crate::wal::v7::leader::WalV7LeaderWriter::new(
+                std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(&wal_path)?,
+                std::fs::File::open(&wal_path)?,
+                installed.runtime_seed()?,
+                max_segment_bytes,
+                owner,
+            )?;
+            let speculative = writer.append_batch(
+                &WalBatch {
+                    commit_ts: anchor.last_commit_ts + 1,
+                    recorded_at: RecordedAt {
+                        secs: 4_000_000_001,
+                        nanos: 0,
+                    },
+                    entries: vec![WalEntry::Put {
+                        key: b"speculative-key".to_vec(),
+                        value: vec![crate::vlog::KvKind::Inline as u8, b'x'],
+                    }],
+                },
+                LIVE_WAL_V5_LIMITS,
+            )?;
+            drop(writer);
+            drop(open_lock);
+
+            let speculative_data_body =
+                usize::try_from(speculative.first_data_offset + WAL_V7_FRAME_HEADER_LEN as u64)?;
+            let mut damaged_image = std::fs::read(&wal_path)?;
+            anyhow::ensure!(
+                speculative_data_body < damaged_image.len(),
+                "speculative v7 batch has no DATA body"
+            );
+            damaged_image[speculative_data_body] ^= 1;
+            std::fs::write(&wal_path, damaged_image)?;
+
+            let engine = KvEngine::open_with_wal_io_mode(&database, options.clone(), mode)?;
+            suspend_pitr_maintenance_for_test(&engine);
+            assert!(engine.inner.state.load().memtable.uses_v7_wal());
+            assert_eq!(engine.get(b"v7-key")?, Some(Bytes::from_static(b"v")));
+            assert_eq!(engine.get(b"speculative-key")?, None);
+            assert_eq!(
+                std::fs::metadata(&wal_path)?.len(),
+                anchor.durable_end + crate::wal::v7::codec::WAL_V7_FRAME_LEN as u64,
+                "Active recovery must install only the anchored prefix and its replacement frontier"
+            );
+
+            // The discarded ticket is reusable. A write after normalization
+            // must extend that image and remain readable after another open.
+            engine.put(b"continued-after-fallback", b"first")?;
+            engine.sync()?;
+            assert_eq!(
+                engine
+                    .pitr_manifest_state
+                    .lock()
+                    .active_boundary
+                    .unwrap()
+                    .ticket_end,
+                anchor.ticket_end + 1
+            );
+            engine.close_storage()?;
+            drop(engine);
+
+            let reopened = KvEngine::open_with_wal_io_mode(&database, options.clone(), mode)?;
+            suspend_pitr_maintenance_for_test(&reopened);
+            assert_eq!(reopened.get(b"v7-key")?, Some(Bytes::from_static(b"v")));
+            assert_eq!(reopened.get(b"speculative-key")?, None);
+            assert_eq!(
+                reopened.get(b"continued-after-fallback")?,
+                Some(Bytes::from_static(b"first"))
+            );
+            reopened.put(b"continued-after-second-recovery", b"second")?;
+            reopened.sync()?;
+            assert_eq!(
+                reopened
+                    .pitr_manifest_state
+                    .lock()
+                    .active_boundary
+                    .unwrap()
+                    .ticket_end,
+                anchor.ticket_end + 2
+            );
+            reopened.close_storage()?;
+            drop(reopened);
+
+            let final_open = KvEngine::open_with_wal_io_mode(&database, options, mode)?;
+            suspend_pitr_maintenance_for_test(&final_open);
+            assert_eq!(final_open.get(b"v7-key")?, Some(Bytes::from_static(b"v")));
+            assert_eq!(final_open.get(b"speculative-key")?, None);
+            assert_eq!(
+                final_open.get(b"continued-after-fallback")?,
+                Some(Bytes::from_static(b"first"))
+            );
+            assert_eq!(
+                final_open.get(b"continued-after-second-recovery")?,
+                Some(Bytes::from_static(b"second"))
+            );
+            final_open.close_storage()?;
+        }
+
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn v7_recovery_uses_snapshot_authority_without_manifest() -> anyhow::Result<()> {
         for pending_snapshot in [false, true] {
             let directory = tempdir()?;
