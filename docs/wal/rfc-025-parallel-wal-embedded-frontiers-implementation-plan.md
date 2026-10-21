@@ -1433,6 +1433,13 @@ the same acknowledged and synced values. This covers repeated normalization
 across process restarts, but does not simulate power loss or the remaining
 correctness matrix.
 
+The tenth Stage 8 slice continues from that recovered Active v7 WAL. A child
+appends a distinct write after recovery and is killed after WAL `fdatasync` but
+before publication; the next process must recover that write alongside the
+prior acknowledged values. This covers process-level continuation and replay
+after recovery, while sealing/archive/restore and power-loss variants remain
+open.
+
 - Complete the correctness matrix below using the persistence model, real
   runtime injection, and process-level integration. Regress ordinary v4,
   strict v5/v6, TTL, recorded-time rollback/clamping, range deletion, OCC,
