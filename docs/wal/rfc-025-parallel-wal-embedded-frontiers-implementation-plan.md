@@ -1443,8 +1443,16 @@ The eleventh Stage 8 slice closes that recovered engine through a durable PITR
 boundary, restores the latest archived point, and checks the acknowledged,
 pre-publication, and post-recovery writes in the restored database. This covers
 one nonempty continuation-to-seal/archive/restore path and dispatches v7 WAL
-digest verification to the frozen image's whole-object digest. Empty, fallback,
-trailing-control, and power-loss variants remain open.
+digest verification to the frozen image's whole-object digest. Empty,
+trailing-control, and power-loss variants remain open; the twelfth slice below
+adds the fallback-to-archive-restore case.
+
+The twelfth Stage 8 slice adds a process-level Active fallback-to-restore case.
+After a successful WAL sync before publication, the test corrupts the speculative
+DATA above the manifest-authorized floor. Recovery must reject that candidate,
+normalize to the older anchored prefix, and retain only acknowledged values
+through sealing, archival, and Latest restore. This does not qualify empty
+images, trailing speculative control frames, or power-loss behavior.
 
 - Complete the correctness matrix below using the persistence model, real
   runtime injection, and process-level integration. Regress ordinary v4,

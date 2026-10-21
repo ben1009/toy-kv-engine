@@ -21,6 +21,8 @@ use kv_engine::{
     RestoreToOutcome,
 };
 use std::io::Read;
+#[cfg(target_os = "linux")]
+use std::io::{Seek, SeekFrom, Write};
 use std::num::NonZeroUsize;
 #[cfg(target_os = "linux")]
 use std::os::unix::fs::MetadataExt;
@@ -711,6 +713,252 @@ fn failpoint_v7_parallel_pitr_crash_recovery_install_rename_boundaries() {
         );
     }
     restored.close().expect("close restored database");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn failpoint_v7_parallel_pitr_fallback_archive_restore() {
+    let probe_dir = tempfile::tempdir().expect("create v7 Parallel fallback probe directory");
+    let probe_options = LsmStorageOptions {
+        enable_wal: true,
+        ..LsmStorageOptions::default_for_test()
+    };
+    match KvEngine::open_with_wal_io_mode(probe_dir.path(), probe_options, WalIoMode::Parallel) {
+        Ok(engine) => engine.close().expect("close v7 Parallel fallback probe"),
+        Err(error) => panic!("v7 Parallel fallback qualification requires io_uring: {error:#}"),
+    }
+
+    let dir = tempfile::tempdir().expect("create v7 fallback archive-restore directory");
+    let db_path = dir.path().join("db");
+    let repository = dir.path().join("repository");
+    let engine = KvEngine::open(
+        &db_path,
+        LsmStorageOptions {
+            enable_wal: true,
+            ..LsmStorageOptions::default_for_test()
+        },
+    )
+    .expect("open database for PITR fallback setup");
+    assert!(matches!(
+        engine.create_backup(BackupOptions {
+            repository: repository.clone(),
+            use_hard_links: false,
+        }),
+        Ok(CreateBackupOutcome::Committed(_))
+    ));
+    assert!(matches!(
+        engine.enable_pitr(PitrOptions {
+            repository: repository.clone(),
+            config: PersistedPitrConfig {
+                archive_interval: Duration::from_secs(60),
+                max_segment_bytes: 1 << 20,
+                max_unarchived_bytes: 2 << 20,
+                max_source_spool_bytes: 8 << 20,
+            },
+            runtime: PitrRuntimeOptions::default(),
+        }),
+        Ok(EnablePitrOutcome::Enabled { .. })
+    ));
+    engine
+        .put(b"fallback-acknowledged", b"stable")
+        .expect("persist acknowledged baseline");
+    engine.close().expect("close PITR fallback setup engine");
+
+    let control_log_path = dir.path().join("fallback-control.log");
+    let crash_marker_path = dir.path().join("fallback-crash.marker");
+    kill_pitr_child_at_crash_point(
+        &db_path,
+        &repository,
+        &control_log_path,
+        &crash_marker_path,
+        "parallel_wal.after_fdatasync",
+        None,
+    );
+
+    let active_wal_path = find_v7_pitr_wal(&db_path);
+    let speculative_wal = std::fs::read(&active_wal_path).expect("read synced candidate WAL");
+    let speculative_wal_inode = std::fs::metadata(&active_wal_path)
+        .expect("stat synced candidate WAL")
+        .ino();
+    let candidate_key = b"synced-before-publication";
+    let candidate_key_offset = speculative_wal
+        .windows(candidate_key.len())
+        .position(|window| window == candidate_key)
+        .expect("find the unacknowledged candidate in the v7 DATA frames");
+    assert!(
+        speculative_wal
+            .windows(candidate_key.len())
+            .filter(|window| *window == candidate_key)
+            .count()
+            == 1,
+        "candidate key must have one unambiguous on-disk occurrence"
+    );
+    let candidate_key_end = candidate_key_offset + candidate_key.len();
+    assert_eq!(
+        candidate_key_offset / 4096,
+        (candidate_key_end - 1) / 4096,
+        "candidate key must fit in one aligned DATA frame"
+    );
+    let candidate_frame_offset = candidate_key_offset / 4096 * 4096;
+    assert_eq!(
+        &speculative_wal[candidate_frame_offset..candidate_frame_offset + 8],
+        b"TKVW7FR1",
+        "candidate bytes must belong to a canonical v7 frame"
+    );
+    assert_eq!(
+        u16::from_be_bytes(
+            speculative_wal[candidate_frame_offset + 10..candidate_frame_offset + 12]
+                .try_into()
+                .expect("v7 frame kind has two bytes")
+        ),
+        1,
+        "candidate bytes must belong to a DATA frame"
+    );
+
+    // Make the newest synced FRONTIER fail prefix verification while keeping
+    // the older manifest-authorized boundary intact. Active recovery is then
+    // required to choose and normalize the older boundary.
+    let mut wal = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&active_wal_path)
+        .expect("open Active v7 WAL to damage speculative candidate");
+    wal.seek(SeekFrom::Start(
+        u64::try_from(candidate_key_offset).expect("candidate offset fits u64"),
+    ))
+    .expect("seek to speculative candidate bytes");
+    wal.write_all(&[speculative_wal[candidate_key_offset] ^ 1])
+        .expect("damage speculative candidate bytes");
+    wal.sync_all()
+        .expect("persist speculative candidate corruption");
+    drop(wal);
+
+    let recovered = KvEngine::open_with_wal_io_mode(
+        &db_path,
+        LsmStorageOptions {
+            enable_wal: true,
+            pitr_repository: Some(repository.clone()),
+            ..LsmStorageOptions::default_for_test()
+        },
+        WalIoMode::Parallel,
+    )
+    .expect("fall back to the manifest-authorized Active v7 boundary");
+    assert_eq!(
+        recovered
+            .get(b"fallback-acknowledged")
+            .expect("read acknowledged value after fallback")
+            .as_deref(),
+        Some(b"stable".as_slice())
+    );
+    assert_eq!(
+        recovered
+            .get(b"acknowledged-migration-trigger")
+            .expect("read acknowledged migration trigger after fallback")
+            .as_deref(),
+        Some(b"legacy".as_slice())
+    );
+    assert_eq!(
+        recovered
+            .get(candidate_key)
+            .expect("read rejected candidate after fallback"),
+        None,
+        "fallback must discard the corrupted, unacknowledged candidate"
+    );
+
+    let normalized_wal_path = find_v7_pitr_wal(&db_path);
+    assert_eq!(normalized_wal_path, active_wal_path);
+    let normalized_wal =
+        std::fs::read(&normalized_wal_path).expect("read normalized fallback WAL image");
+    assert_ne!(
+        std::fs::metadata(&normalized_wal_path)
+            .expect("stat normalized fallback WAL")
+            .ino(),
+        speculative_wal_inode,
+        "fallback recovery must install a fresh Active WAL inode"
+    );
+    assert!(
+        normalized_wal.len() < speculative_wal.len(),
+        "fallback normalization must discard the rejected speculative suffix"
+    );
+
+    let status = recovered
+        .pitr_status(PitrStatusOptions {
+            cursor: None,
+            page_size: NonZeroUsize::new(64).expect("nonzero PITR status page size"),
+        })
+        .expect("read PITR status before sealing the fallback WAL");
+    assert_eq!(status.active_wal_format_version, Some(7));
+    assert_eq!(status.active_wal_io_mode, Some(PitrWalIoMode::Parallel));
+    let interval = status
+        .recoverable_intervals
+        .first()
+        .expect("PITR setup must retain a recoverable base interval");
+    let selector = RecoverySelector {
+        timeline_id: interval.timeline_id,
+        archive_epoch_id: Some(interval.archive_epoch_id),
+        base_backup_id: None,
+    };
+    let final_point = match recovered
+        .close_pitr()
+        .expect("seal and archive the normalized fallback WAL")
+    {
+        PitrCloseOutcome::ClosedDurably {
+            final_point: Some(point),
+        } => point,
+        outcome => panic!("PITR close did not archive the fallback WAL: {outcome:?}"),
+    };
+
+    let restored_path = dir.path().join("restored-after-fallback");
+    let backup_repository =
+        BackupRepository::open(&repository).expect("open repository after fallback archive");
+    let restore_info = match backup_repository
+        .restore_to(
+            RecoveryTarget::Latest,
+            &restored_path,
+            PitrRestoreOptions {
+                selector,
+                implementations: ImplementationRegistry,
+                executor_threads: NonZeroUsize::new(1).expect("nonzero restore worker count"),
+                cache_capacity: 4096,
+                storage: LsmStorageOptions::default_for_test(),
+            },
+        )
+        .expect("restore the latest point after Active v7 fallback")
+    {
+        RestoreToOutcome::Restored(info) => info,
+        outcome => panic!("PITR fallback restore did not produce a database: {outcome:?}"),
+    };
+    assert_eq!(restore_info.resolved_commit_ts, final_point.commit_ts);
+    assert!(
+        restore_info.replayed_segments > 0,
+        "latest restore must replay the archived fallback WAL"
+    );
+
+    let restored = KvEngine::open(&restored_path, LsmStorageOptions::default_for_test())
+        .expect("open database restored from the fallback WAL");
+    for (key, expected) in [
+        (b"fallback-acknowledged".as_slice(), b"stable".as_slice()),
+        (
+            b"acknowledged-migration-trigger".as_slice(),
+            b"legacy".as_slice(),
+        ),
+    ] {
+        assert_eq!(
+            restored
+                .get(key)
+                .expect("read restored fallback value")
+                .as_deref(),
+            Some(expected),
+            "latest restore must retain {key:?}"
+        );
+    }
+    assert_eq!(
+        restored
+            .get(candidate_key)
+            .expect("read rejected candidate from restored database"),
+        None,
+        "latest restore must not replay the rejected speculative candidate"
+    );
+    restored.close().expect("close restored fallback database");
 }
 
 #[cfg(target_os = "linux")]
