@@ -1500,6 +1500,15 @@ the empty-successor variant of recovery followed by continued writes for this
 sync boundary. It does not cover power loss, other continuation variants, or
 the remaining correctness and adoption matrix.
 
+The seventeenth Stage 8 slice adds a process crash after an empty successor's
+staging WAL image is synced but before it is renamed to the canonical path.
+Reopen must remove the stranded install temp file, recreate the same
+manifest-authorized empty successor, and preserve its sealed predecessor. The
+existing post-rename crash case then proceeds to the following successor ID.
+This covers only the synced-temp-before-rename process-crash boundary; it does
+not simulate power loss or qualify partial image writes and manifest-sync
+interruptions.
+
 - Complete the correctness matrix below using the persistence model, real
   runtime injection, and process-level integration. Regress ordinary v4,
   strict v5/v6, TTL, recorded-time rollback/clamping, range deletion, OCC,

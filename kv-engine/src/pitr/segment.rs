@@ -946,15 +946,17 @@ pub(crate) fn install_pitr_file_no_replace(
     path: impl AsRef<std::path::Path>,
     bytes: &[u8],
 ) -> Result<()> {
-    install_pitr_file_no_replace_with_crash_point(path, bytes, None)
+    install_pitr_file_no_replace_with_crash_point(path, bytes, None, None)
 }
 
 #[cfg(target_os = "linux")]
 pub(crate) fn install_pitr_file_no_replace_with_crash_point(
     path: impl AsRef<std::path::Path>,
     bytes: &[u8],
+    crash_point_after_file_sync_before_rename: Option<&'static str>,
     crash_point_after_rename_before_directory_sync: Option<&'static str>,
 ) -> Result<()> {
+    let _ = crash_point_after_file_sync_before_rename;
     let _ = crash_point_after_rename_before_directory_sync;
     let path = path.as_ref();
     let file_name = path
@@ -991,6 +993,10 @@ pub(crate) fn install_pitr_file_no_replace_with_crash_point(
         file.write_all(bytes)?;
         file.sync_all()?;
         drop(file);
+        #[cfg(feature = "chaos-testing")]
+        if let Some(crash_point) = crash_point_after_file_sync_before_rename {
+            crate::chaos::failpoint::wal_crash_point(crash_point);
+        }
         let from = CString::new(temp_name.as_bytes())?;
         let to = CString::new(file_name.as_bytes())?;
         let rename = unsafe {
