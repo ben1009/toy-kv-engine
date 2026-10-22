@@ -1492,6 +1492,14 @@ recovery, a new write must succeed and survive another reopen. These
 process-only cases do not simulate power loss or qualify partial image writes
 and manifest-sync interruptions.
 
+The sixteenth Stage 8 slice extends the empty-successor installation case with
+a process crash after a post-recovery DATA write has synced but before it is
+published. Reopen must recover that write and preserve the sealed predecessor;
+the test then seals, archives, and restores the continued history. This covers
+the empty-successor variant of recovery followed by continued writes for this
+sync boundary. It does not cover power loss, other continuation variants, or
+the remaining correctness and adoption matrix.
+
 - Complete the correctness matrix below using the persistence model, real
   runtime injection, and process-level integration. Regress ordinary v4,
   strict v5/v6, TTL, recorded-time rollback/clamping, range deletion, OCC,

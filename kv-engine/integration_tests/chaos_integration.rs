@@ -1374,25 +1374,124 @@ fn failpoint_v7_empty_successor_install_crash_boundaries() {
         Some(b"restored".as_slice()),
         "reopening an installed empty successor must retain its sealed predecessor"
     );
-    recovered_after_rename_crash
-        .put(b"after-empty-successor-recovery", b"writable")
-        .expect("accept a v7 write after empty-successor recovery");
+    let empty_successor_len = std::fs::metadata(&active_wal_path)
+        .expect("stat empty successor before post-recovery write")
+        .len();
     recovered_after_rename_crash
         .close()
         .expect("close engine after post-rename recovery");
+
+    let continued_write_crash_point = "parallel_wal.after_fdatasync";
+    let continued_write_marker = dir.path().join("after-empty-successor-write-sync.marker");
+    kill_pitr_child_at_crash_point(
+        &db_path,
+        &repository,
+        &control_log_path,
+        &continued_write_marker,
+        continued_write_crash_point,
+        None,
+        Some(("after-empty-successor-recovery", "durable")),
+    );
+    assert_eq!(
+        std::fs::read_to_string(&continued_write_marker)
+            .expect("read post-recovery write crash marker")
+            .trim(),
+        continued_write_crash_point
+    );
+    assert!(
+        std::fs::metadata(&active_wal_path)
+            .expect("stat Active WAL after post-recovery write sync")
+            .len()
+            > empty_successor_len,
+        "the post-recovery write must extend the recovered empty Active WAL"
+    );
 
     let reopened = open_and_resume_parallel_pitr(&db_path, &repository);
     assert_eq!(
         reopened
             .get(b"after-empty-successor-recovery")
-            .expect("read post-recovery write after another reopen")
+            .expect("read post-recovery write after process crash")
             .as_deref(),
-        Some(b"writable".as_slice()),
-        "a write accepted after empty-successor recovery must survive reopen"
+        Some(b"durable".as_slice()),
+        "a synced write after empty-successor recovery must survive process crash before publication"
     );
-    reopened
-        .close()
-        .expect("close reopened post-recovery write engine");
+    assert_eq!(
+        reopened
+            .get(b"legacy-segment-value")
+            .expect("read sealed predecessor after post-recovery write crash")
+            .as_deref(),
+        Some(b"restored".as_slice())
+    );
+
+    let status = reopened
+        .pitr_status(PitrStatusOptions {
+            cursor: None,
+            page_size: NonZeroUsize::new(64).expect("nonzero PITR status page size"),
+        })
+        .expect("read PITR status before sealing post-recovery write");
+    let interval = status
+        .recoverable_intervals
+        .first()
+        .expect("PITR setup must retain a recoverable base interval");
+    let selector = RecoverySelector {
+        timeline_id: interval.timeline_id,
+        archive_epoch_id: Some(interval.archive_epoch_id),
+        base_backup_id: None,
+    };
+    let final_point = match reopened
+        .close_pitr()
+        .expect("seal and archive the post-recovery write")
+    {
+        PitrCloseOutcome::ClosedDurably {
+            final_point: Some(point),
+        } => point,
+        outcome => panic!("PITR close did not durably archive the recovered WAL: {outcome:?}"),
+    };
+    assert!(
+        final_point.commit_ts.is_some(),
+        "the post-recovery write must be included in the archived boundary"
+    );
+
+    let restored_path = dir.path().join("restored-after-empty-successor-recovery");
+    let backup_repository =
+        BackupRepository::open(&repository).expect("open repository after PITR close");
+    let restore_info = match backup_repository
+        .restore_to(
+            RecoveryTarget::Latest,
+            &restored_path,
+            PitrRestoreOptions {
+                selector,
+                implementations: ImplementationRegistry,
+                executor_threads: NonZeroUsize::new(1).expect("nonzero restore worker count"),
+                cache_capacity: 4096,
+                storage: LsmStorageOptions::default_for_test(),
+            },
+        )
+        .expect("restore latest after empty-successor recovery continuation")
+    {
+        RestoreToOutcome::Restored(info) => info,
+        outcome => panic!("PITR restore did not produce a restored database: {outcome:?}"),
+    };
+    assert_eq!(restore_info.resolved_commit_ts, final_point.commit_ts);
+    let restored = KvEngine::open(&restored_path, LsmStorageOptions::default_for_test())
+        .expect("open database restored after empty-successor recovery continuation");
+    for (key, expected) in [
+        (b"legacy-segment-value".as_slice(), b"restored".as_slice()),
+        (
+            b"after-empty-successor-recovery".as_slice(),
+            b"durable".as_slice(),
+        ),
+    ] {
+        assert_eq!(
+            restored
+                .get(key)
+                .expect("read restored PITR value")
+                .as_deref(),
+            Some(expected),
+            "Latest restore must retain {key:?}"
+        );
+    }
+    restored.close().expect("close restored database");
 }
 
 #[cfg(target_os = "linux")]
