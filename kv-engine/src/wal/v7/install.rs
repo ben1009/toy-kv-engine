@@ -298,11 +298,22 @@ pub(crate) fn create_empty_active_image(
     image[..WAL_V7_HEADER_LEN].copy_from_slice(&header_bytes);
     image[WAL_V7_HEADER_LEN..].copy_from_slice(&generation_zero);
 
-    crate::pitr::segment::install_pitr_file_no_replace_with_crash_point(
+    crate::pitr::segment::install_pitr_file_no_replace_with_faults(
         path,
         &image,
-        Some("wal_v7.active_image.after_temp_sync_before_rename"),
-        Some("wal_v7.active_image.after_rename_before_directory_sync"),
+        crate::pitr::segment::PitrFileInstallFaults {
+            after_header_write_before_remainder: Some(
+                "wal_v7.active_image.after_temp_header_write_before_frontier_write",
+            ),
+            after_file_write_before_sync: Some("wal_v7.active_image.after_temp_write_before_sync"),
+            after_file_sync_before_rename: Some(
+                "wal_v7.active_image.after_temp_sync_before_rename",
+            ),
+            after_rename_before_directory_sync: Some(
+                "wal_v7.active_image.after_rename_before_directory_sync",
+            ),
+            inject_empty_active_image_failures: true,
+        },
     )?;
 
     let mut file = File::open(path).context("open newly installed empty v7 Active WAL")?;

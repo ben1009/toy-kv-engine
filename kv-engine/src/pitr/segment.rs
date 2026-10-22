@@ -942,22 +942,37 @@ pub(crate) fn install_v5_wal_header(
 }
 
 #[cfg(target_os = "linux")]
+#[derive(Default)]
+pub(crate) struct PitrFileInstallFaults {
+    pub(crate) after_header_write_before_remainder: Option<&'static str>,
+    pub(crate) after_file_write_before_sync: Option<&'static str>,
+    pub(crate) after_file_sync_before_rename: Option<&'static str>,
+    pub(crate) after_rename_before_directory_sync: Option<&'static str>,
+    pub(crate) inject_empty_active_image_failures: bool,
+}
+
+#[cfg(target_os = "linux")]
 pub(crate) fn install_pitr_file_no_replace(
     path: impl AsRef<std::path::Path>,
     bytes: &[u8],
 ) -> Result<()> {
-    install_pitr_file_no_replace_with_crash_point(path, bytes, None, None)
+    install_pitr_file_no_replace_with_faults(path, bytes, PitrFileInstallFaults::default())
 }
 
 #[cfg(target_os = "linux")]
-pub(crate) fn install_pitr_file_no_replace_with_crash_point(
+pub(crate) fn install_pitr_file_no_replace_with_faults(
     path: impl AsRef<std::path::Path>,
     bytes: &[u8],
-    crash_point_after_file_sync_before_rename: Option<&'static str>,
-    crash_point_after_rename_before_directory_sync: Option<&'static str>,
+    faults: PitrFileInstallFaults,
 ) -> Result<()> {
-    let _ = crash_point_after_file_sync_before_rename;
-    let _ = crash_point_after_rename_before_directory_sync;
+    #[cfg(not(feature = "chaos-testing"))]
+    let _ = (
+        faults.after_header_write_before_remainder,
+        faults.after_file_write_before_sync,
+        faults.after_file_sync_before_rename,
+        faults.after_rename_before_directory_sync,
+        faults.inject_empty_active_image_failures,
+    );
     let path = path.as_ref();
     let file_name = path
         .file_name()
@@ -990,12 +1005,41 @@ pub(crate) fn install_pitr_file_no_replace_with_crash_point(
             .write(true)
             .create_new(true)
             .open(&temp_path)?;
+        #[cfg(feature = "chaos-testing")]
+        if let Some(crash_point) = faults.after_header_write_before_remainder {
+            ensure!(
+                bytes.len() > 4096,
+                "PITR image is too short for a header crash point"
+            );
+            file.write_all(&bytes[..4096])?;
+            crate::chaos::failpoint::wal_crash_point(crash_point);
+            file.write_all(&bytes[4096..])?;
+        } else {
+            file.write_all(bytes)?;
+        }
+        #[cfg(not(feature = "chaos-testing"))]
         file.write_all(bytes)?;
+        #[cfg(feature = "chaos-testing")]
+        if let Some(crash_point) = faults.after_file_write_before_sync {
+            crate::chaos::failpoint::wal_crash_point(crash_point);
+        }
+        #[cfg(feature = "chaos-testing")]
+        if faults.inject_empty_active_image_failures {
+            crate::chaos::failpoint::fail_point!("wal_v7.active_image.before_file_sync", |_| Err(
+                anyhow::anyhow!("injected empty Active v7 image file sync failure")
+            ));
+        }
         file.sync_all()?;
         drop(file);
         #[cfg(feature = "chaos-testing")]
-        if let Some(crash_point) = crash_point_after_file_sync_before_rename {
+        if let Some(crash_point) = faults.after_file_sync_before_rename {
             crate::chaos::failpoint::wal_crash_point(crash_point);
+        }
+        #[cfg(feature = "chaos-testing")]
+        if faults.inject_empty_active_image_failures {
+            crate::chaos::failpoint::fail_point!("wal_v7.active_image.before_rename", |_| Err(
+                anyhow::anyhow!("injected empty Active v7 image rename failure")
+            ));
         }
         let from = CString::new(temp_name.as_bytes())?;
         let to = CString::new(file_name.as_bytes())?;
@@ -1019,13 +1063,22 @@ pub(crate) fn install_pitr_file_no_replace_with_crash_point(
             return Err(error.into());
         }
         #[cfg(feature = "chaos-testing")]
-        if let Some(crash_point) = crash_point_after_rename_before_directory_sync {
+        if let Some(crash_point) = faults.after_rename_before_directory_sync {
             crate::chaos::failpoint::wal_crash_point(crash_point);
         }
         #[cfg(feature = "chaos-testing")]
         crate::chaos::failpoint::fail_point!("pitr.install_before_directory_sync", |_| Err(
             anyhow::anyhow!("injected PITR install directory sync failure")
         ));
+        #[cfg(feature = "chaos-testing")]
+        if faults.inject_empty_active_image_failures {
+            crate::chaos::failpoint::fail_point!(
+                "wal_v7.active_image.before_directory_sync",
+                |_| Err(anyhow::anyhow!(
+                    "injected empty Active v7 image directory sync failure"
+                ))
+            );
+        }
         std::fs::File::open(parent)?.sync_all()?;
 
         Ok(())

@@ -207,6 +207,399 @@ mod manifest_revalidation_tests {
         assert!(matches!(&parsed[0], ManifestRecord::Flush(1)));
         assert!(matches!(&parsed[1], ManifestRecord::Flush(8)));
     }
+
+    #[test]
+    fn recovery_discards_an_incomplete_segment_sealed_after_its_intent() {
+        use super::ManifestRecord;
+        use crate::pitr::manifest::{PersistedChainAnchor, PitrManifestRecord};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("MANIFEST");
+        let manifest = Manifest::create(&path).unwrap();
+        let state_lock = parking_lot::Mutex::new(());
+        let state_guard = state_lock.lock();
+        let seal_started = ManifestRecord::Pitr(PitrManifestRecord::SealStarted {
+            segment_id: 7,
+            successor_segment_id: 8,
+            logical_length: 4096,
+            immutable_boundary: None,
+        });
+        manifest.add_records(&state_guard, &[seal_started]).unwrap();
+        let valid_length = manifest.current_length().unwrap();
+
+        let mut encoded = Vec::new();
+        serde_json::to_writer(
+            &mut encoded,
+            &ManifestRecord::Pitr(PitrManifestRecord::SegmentSealed {
+                segment_id: 7,
+                segment_anchor: PersistedChainAnchor::Genesis {
+                    archive_epoch_id: [1; 16],
+                },
+                last_recorded_at: None,
+                last_commit_anchor: None,
+                successor_active_boundary: None,
+            }),
+        )
+        .unwrap();
+        let partial_len = encoded.len() / 2;
+        assert!(
+            encoded[..partial_len].starts_with(b"{\"Pitr\":{\"SegmentSealed\":{\"segment_id\":7,")
+        );
+        {
+            let mut file = manifest.file.lock();
+            file.write_all(&encoded[..partial_len]).unwrap();
+            file.sync_all().unwrap();
+        }
+        drop(state_guard);
+        drop(manifest);
+
+        let (recovered, records) = Manifest::recover(&path).unwrap();
+        assert_eq!(records.len(), 1);
+        assert!(matches!(
+            records.first(),
+            Some(ManifestRecord::Pitr(PitrManifestRecord::SealStarted {
+                segment_id: 7,
+                ..
+            }))
+        ));
+        assert_eq!(recovered.current_length().unwrap(), valid_length);
+
+        let recovered_bytes = std::fs::read(&path).unwrap();
+        let parsed = serde_json::Deserializer::from_slice(&recovered_bytes)
+            .into_iter::<ManifestRecord>()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(parsed.len(), 1);
+    }
+
+    #[test]
+    fn recovery_discards_an_incomplete_segment_sealed_after_migration_intent() {
+        use super::ManifestRecord;
+        use crate::pitr::manifest::{ActiveBoundary, PersistedChainAnchor, PitrManifestRecord};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("MANIFEST");
+        let manifest = Manifest::create(&path).unwrap();
+        let state_lock = parking_lot::Mutex::new(());
+        let state_guard = state_lock.lock();
+        manifest
+            .add_records(
+                &state_guard,
+                &[ManifestRecord::Pitr(PitrManifestRecord::MigrationStarted {
+                    segment_id: 7,
+                    successor_segment_id: 8,
+                    logical_length: 4096,
+                    successor_active_boundary: ActiveBoundary {
+                        timeline_id: [1; 16],
+                        archive_epoch_id: [2; 16],
+                        segment_id: 8,
+                        incarnation: [3; 16],
+                        ticket_end: 0,
+                        durable_end: 4096,
+                        last_commit_ts: 0,
+                        prefix_digest: [4; 32],
+                    },
+                })],
+            )
+            .unwrap();
+        let valid_length = manifest.current_length().unwrap();
+
+        let mut encoded = Vec::new();
+        serde_json::to_writer(
+            &mut encoded,
+            &ManifestRecord::Pitr(PitrManifestRecord::SegmentSealed {
+                segment_id: 7,
+                segment_anchor: PersistedChainAnchor::Genesis {
+                    archive_epoch_id: [2; 16],
+                },
+                last_recorded_at: None,
+                last_commit_anchor: None,
+                successor_active_boundary: None,
+            }),
+        )
+        .unwrap();
+        let partial_len = encoded.len() / 2;
+        assert!(
+            encoded[..partial_len].starts_with(b"{\"Pitr\":{\"SegmentSealed\":{\"segment_id\":7,")
+        );
+        {
+            let mut file = manifest.file.lock();
+            file.write_all(&encoded[..partial_len]).unwrap();
+            file.sync_all().unwrap();
+        }
+        drop(state_guard);
+        drop(manifest);
+
+        let (recovered, records) = Manifest::recover(&path).unwrap();
+        assert_eq!(records.len(), 1);
+        assert!(matches!(
+            records.first(),
+            Some(ManifestRecord::Pitr(PitrManifestRecord::MigrationStarted {
+                segment_id: 7,
+                successor_segment_id: 8,
+                ..
+            }))
+        ));
+        assert_eq!(recovered.current_length().unwrap(), valid_length);
+    }
+
+    #[test]
+    fn recovery_retains_sealing_intent_across_unrelated_progress() {
+        use crate::pitr::manifest::{PersistedRecordedAt, PitrManifestRecord};
+
+        for (progress, recoverable) in [
+            (PitrManifestRecord::SegmentReclaimed { segment_id: 6 }, true),
+            (
+                PitrManifestRecord::RecordedAtAdvanced {
+                    recorded_at: PersistedRecordedAt {
+                        secs: 10,
+                        nanos: 42,
+                    },
+                },
+                true,
+            ),
+            (
+                PitrManifestRecord::SegmentReclaimed { segment_id: 7 },
+                false,
+            ),
+            (
+                PitrManifestRecord::RecordedAtAdvanced {
+                    recorded_at: PersistedRecordedAt {
+                        secs: 10,
+                        nanos: 1_000_000_000,
+                    },
+                },
+                false,
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("MANIFEST");
+            let prefix = [
+                ManifestRecord::Pitr(PitrManifestRecord::SealStarted {
+                    segment_id: 7,
+                    successor_segment_id: 8,
+                    logical_length: 4096,
+                    immutable_boundary: None,
+                }),
+                ManifestRecord::Pitr(progress),
+            ];
+            let mut prefix_bytes = Vec::new();
+            for record in &prefix {
+                serde_json::to_writer(&mut prefix_bytes, record).unwrap();
+            }
+            let mut bytes = prefix_bytes.clone();
+            bytes.extend_from_slice(
+                b"{\"Pitr\":{\"SegmentSealed\":{\"segment_id\":7,\"segment_anchor\":",
+            );
+            std::fs::write(&path, &bytes).unwrap();
+
+            let recovered = Manifest::recover(&path);
+            if recoverable {
+                let (manifest, records) = recovered.unwrap();
+                assert_eq!(records.len(), prefix.len());
+                assert_eq!(
+                    manifest.current_length().unwrap(),
+                    prefix_bytes.len() as u64
+                );
+                assert_eq!(std::fs::read(&path).unwrap(), prefix_bytes);
+            } else {
+                assert!(
+                    recovered.is_err(),
+                    "invalid time or progress on the recovered segment must not authorize salvage"
+                );
+                assert_eq!(std::fs::read(&path).unwrap(), bytes);
+            }
+        }
+    }
+
+    #[cfg(feature = "chaos-testing")]
+    #[test]
+    fn failpoint_partial_segment_sealed_skipped_crash_hit_keeps_one_record() {
+        use crate::{
+            chaos::failpoint::{
+                PARALLEL_WAL_CRASH_MARKER_ENV, PARALLEL_WAL_CRASH_OCCURRENCE_ENV,
+                PARALLEL_WAL_CRASH_POINT_ENV,
+            },
+            pitr::manifest::{PersistedChainAnchor, PitrManifestRecord},
+        };
+
+        const CHILD_PATH_ENV: &str = "TOY_KV_MANIFEST_SKIPPED_CRASH_CHILD_PATH";
+        let sealed = ManifestRecord::Pitr(PitrManifestRecord::SegmentSealed {
+            segment_id: 7,
+            segment_anchor: PersistedChainAnchor::Genesis {
+                archive_epoch_id: [1; 16],
+            },
+            last_recorded_at: None,
+            last_commit_anchor: None,
+            successor_active_boundary: None,
+        });
+        if let Some(path) = std::env::var_os(CHILD_PATH_ENV) {
+            let manifest = Manifest::create(path).unwrap();
+            manifest.add_record_when_init(sealed).unwrap();
+            manifest
+                .add_record_when_init(ManifestRecord::Flush(8))
+                .unwrap();
+            return;
+        }
+
+        // A child isolates the process-global crash occurrence counter and
+        // selector from other library tests.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("MANIFEST");
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("manifest::manifest_revalidation_tests::failpoint_partial_segment_sealed_skipped_crash_hit_keeps_one_record")
+            .arg("--nocapture")
+            .env(CHILD_PATH_ENV, &path)
+            .env(
+                PARALLEL_WAL_CRASH_POINT_ENV,
+                "pitr.manifest.after_segment_sealed_partial_append",
+            )
+            .env(PARALLEL_WAL_CRASH_OCCURRENCE_ENV, "2")
+            .env(PARALLEL_WAL_CRASH_MARKER_ENV, dir.path().join("crash.marker"))
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "skipped crash child failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let mut expected = serde_json::to_vec(&sealed).unwrap();
+        serde_json::to_writer(&mut expected, &ManifestRecord::Flush(8)).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), expected);
+        let (_, records) = Manifest::recover(&path).unwrap();
+        assert_eq!(records.len(), 2);
+    }
+
+    #[test]
+    fn recovery_rejects_an_incomplete_flush_v3_even_with_a_valid_prefix() {
+        use super::ManifestRecord;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("MANIFEST");
+        let manifest = Manifest::create(&path).unwrap();
+        let state_lock = parking_lot::Mutex::new(());
+        let state_guard = state_lock.lock();
+        manifest
+            .add_records(
+                &state_guard,
+                &[ManifestRecord::FlushV3(1, Vec::new(), Vec::new())],
+            )
+            .unwrap();
+
+        let mut encoded = Vec::new();
+        serde_json::to_writer(
+            &mut encoded,
+            &ManifestRecord::FlushV3(2, Vec::new(), Vec::new()),
+        )
+        .unwrap();
+        {
+            let mut file = manifest.file.lock();
+            file.write_all(&encoded[..encoded.len() / 2]).unwrap();
+            file.sync_all().unwrap();
+        }
+        drop(state_guard);
+        drop(manifest);
+
+        assert!(
+            Manifest::recover(&path).is_err(),
+            "a torn FlushV3 may be acknowledged state and must remain corruption"
+        );
+    }
+
+    #[test]
+    fn recovery_rejects_a_non_eof_manifest_parse_error() {
+        use super::ManifestRecord;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("MANIFEST");
+        let manifest = Manifest::create(&path).unwrap();
+        let state_lock = parking_lot::Mutex::new(());
+        let state_guard = state_lock.lock();
+        manifest
+            .add_records(&state_guard, &[ManifestRecord::Flush(1)])
+            .unwrap();
+        {
+            let mut file = manifest.file.lock();
+            file.write_all(b"not-json").unwrap();
+            file.sync_all().unwrap();
+        }
+        drop(state_guard);
+        drop(manifest);
+
+        assert!(
+            Manifest::recover(&path).is_err(),
+            "recovery must not silently truncate a syntactically invalid suffix"
+        );
+    }
+
+    #[test]
+    fn recovery_rejects_an_incomplete_first_record_without_a_prefix() {
+        use super::ManifestRecord;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("MANIFEST");
+        let manifest = Manifest::create(&path).unwrap();
+        let mut encoded = Vec::new();
+        serde_json::to_writer(&mut encoded, &ManifestRecord::FormatVersion(10)).unwrap();
+        {
+            let mut file = manifest.file.lock();
+            file.write_all(&encoded[..encoded.len() / 2]).unwrap();
+            file.sync_all().unwrap();
+        }
+        drop(manifest);
+
+        assert!(
+            Manifest::recover(&path).is_err(),
+            "a torn initial record without a complete prefix must not open as a new database"
+        );
+    }
+
+    #[test]
+    fn recovery_rejects_an_incomplete_generic_tail_after_a_snapshot() {
+        use super::ManifestRecord;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("MANIFEST");
+        let manifest = Manifest::create(&path).unwrap();
+        manifest
+            .snapshot(ManifestRecord::Snapshot {
+                l0_sstables: Vec::new(),
+                levels: Vec::new(),
+                range_only_ssts: Vec::new(),
+                next_sst_id: 0,
+                vlog_references: Vec::new(),
+                imm_memtable_ids: Vec::new(),
+                pitr_memtable_segments: Vec::new(),
+                active_compaction_filters: Vec::new(),
+                next_compaction_filter_id: 0,
+                format_version: super::MANIFEST_FORMAT_VERSION,
+                immutable_file_metadata: Vec::new(),
+                pitr_state: Some(crate::pitr::manifest::PitrState::default()),
+            })
+            .unwrap();
+
+        let mut encoded = Vec::new();
+        serde_json::to_writer(&mut encoded, &ManifestRecord::FormatVersion(10)).unwrap();
+        {
+            let mut file = manifest.file.lock();
+            file.write_all(&encoded[..encoded.len() / 2]).unwrap();
+            file.sync_all().unwrap();
+        }
+        drop(manifest);
+
+        let original_manifest = std::fs::read(&path).unwrap();
+        assert!(
+            Manifest::recover(&path).is_err(),
+            "a snapshot does not authorize discarding an unrelated incomplete record"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), original_manifest);
+        assert!(
+            Manifest::snapshot_path(&path).exists(),
+            "failed recovery must preserve the validated snapshot"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -343,6 +736,9 @@ impl Manifest {
     /// to be post-snapshot records (written after the snapshot completed).
     /// If no snapshot exists, returns all records (backward compatible).
     /// If MANIFEST is missing but ENGINE_MANIFEST exists, creates a new empty MANIFEST.
+    /// An EOF-truncated final JSON value is discarded only when it identifies a
+    /// `SegmentSealed` transition authorized by a complete sealing intent;
+    /// generic incomplete records and other parse errors stay fatal.
     /// Accepted bytes are durably rewritten before replay is returned. Recovery
     /// requires exclusive database ownership with all old manifest handles closed.
     pub fn recover(path: impl AsRef<Path>) -> Result<(Self, Vec<ManifestRecord>)> {
@@ -620,14 +1016,139 @@ impl Manifest {
             return Ok(buf);
         }
 
-        let manifest_records =
+        let mut manifest_records =
             serde_json::Deserializer::from_slice(&buf).into_iter::<ManifestRecord>();
 
-        for record in manifest_records {
-            records.push(record?);
+        loop {
+            match manifest_records.next() {
+                Some(std::result::Result::Ok(record)) => records.push(record),
+                Some(Err(error)) if error.is_eof() => {
+                    let valid_len = manifest_records.byte_offset();
+                    ensure!(
+                        valid_len > 0 || !records.is_empty(),
+                        "manifest ends in an incomplete record without a complete recovery prefix"
+                    );
+                    ensure!(
+                        Self::is_recoverable_segment_sealed_tail(records, &buf[valid_len..]),
+                        "manifest ends in an incomplete record outside an authorized SegmentSealed transition"
+                    );
+                    // SegmentSealed is reconstructible from its preceding
+                    // durable sealing intent and the frozen source/seal files.
+                    // Other incomplete records may be acknowledged state, so
+                    // they remain corruption instead of being silently
+                    // discarded.
+                    buf.truncate(valid_len);
+                    break;
+                }
+                Some(Err(error)) => {
+                    return Err(error).context("failed to deserialize manifest record");
+                }
+                None => break,
+            }
         }
 
         Ok(buf)
+    }
+
+    fn is_recoverable_segment_sealed_tail(records: &[ManifestRecord], tail: &[u8]) -> bool {
+        const SEGMENT_SEALED_PREFIX: &[u8] = b"{\"Pitr\":{\"SegmentSealed\":{\"segment_id\":";
+
+        let Some(segment_id_bytes) = tail.strip_prefix(SEGMENT_SEALED_PREFIX) else {
+            return false;
+        };
+        let Some(separator) = segment_id_bytes.iter().position(|byte| *byte == b',') else {
+            return false;
+        };
+        let id_bytes = &segment_id_bytes[..separator];
+        if id_bytes.is_empty() || !id_bytes.iter().all(|byte| byte.is_ascii_digit()) {
+            return false;
+        }
+        let Some(segment_id_text) = std::str::from_utf8(id_bytes).ok() else {
+            return false;
+        };
+        let Some(segment_id) = segment_id_text.parse::<u64>().ok() else {
+            return false;
+        };
+
+        for record in records.iter().rev() {
+            match record {
+                // Older segments may make archive/reclamation progress while
+                // this Active segment still has an unfinished sealing intent.
+                // These transitions do not alter the intent for this segment.
+                ManifestRecord::Pitr(
+                    PitrManifestRecord::SegmentArchived {
+                        segment_id: other_segment_id,
+                    }
+                    | PitrManifestRecord::ArchivePublicationUnknown {
+                        segment_id: other_segment_id,
+                    }
+                    | PitrManifestRecord::ArchivePublicationResolved {
+                        segment_id: other_segment_id,
+                        ..
+                    }
+                    | PitrManifestRecord::SegmentReclaimable {
+                        segment_id: other_segment_id,
+                    }
+                    | PitrManifestRecord::SegmentReclaimed {
+                        segment_id: other_segment_id,
+                    }
+                    | PitrManifestRecord::SegmentAbandoned {
+                        segment_id: other_segment_id,
+                    },
+                ) if *other_segment_id != segment_id => {}
+                // Advancing the recorded-time watermark preserves every
+                // pending segment obligation. Invalid timestamps stay fatal.
+                ManifestRecord::Pitr(PitrManifestRecord::RecordedAtAdvanced { recorded_at })
+                    if recorded_at.nanos < 1_000_000_000 => {}
+                ManifestRecord::Pitr(PitrManifestRecord::SealStarted {
+                    segment_id: started_segment_id,
+                    ..
+                }) => return *started_segment_id == segment_id,
+                ManifestRecord::Pitr(PitrManifestRecord::MigrationStarted {
+                    segment_id: started_segment_id,
+                    successor_segment_id,
+                    logical_length,
+                    successor_active_boundary,
+                }) => {
+                    return *started_segment_id == segment_id
+                        && *logical_length >= 4096
+                        && (*logical_length).is_multiple_of(4096)
+                        && successor_active_boundary.validate().is_ok()
+                        && successor_active_boundary.segment_id == *successor_segment_id
+                        && successor_active_boundary.ticket_end == 0
+                        && successor_active_boundary.durable_end == 4096
+                        && successor_active_boundary.last_commit_ts == 0;
+                }
+                ManifestRecord::Pitr(PitrManifestRecord::Snapshot(state)) => {
+                    return state.active_segment_id == Some(segment_id)
+                        && state
+                            .obligations
+                            .get(&segment_id)
+                            .is_some_and(|obligation| {
+                                obligation.state == crate::pitr::manifest::ObligationState::Sealing
+                            });
+                }
+                ManifestRecord::Pitr(_) => return false,
+                ManifestRecord::Snapshot {
+                    pitr_state: Some(state),
+                    ..
+                } => {
+                    return state.active_segment_id == Some(segment_id)
+                        && state
+                            .obligations
+                            .get(&segment_id)
+                            .is_some_and(|obligation| {
+                                obligation.state == crate::pitr::manifest::ObligationState::Sealing
+                            });
+                }
+                ManifestRecord::Snapshot {
+                    pitr_state: None, ..
+                } => return false,
+                _ => {}
+            }
+        }
+
+        false
     }
 
     /// take a record of the changes in the LsmStorageState
@@ -672,7 +1193,75 @@ impl Manifest {
         }
         let mut file = self.file.lock();
         self.ensure_durability_certain()?;
-        file.write_all(&buf)?;
+        let append_bytes = buf.as_slice();
+
+        #[cfg(feature = "chaos-testing")]
+        let segment_sealed_batch = records.iter().any(|record| {
+            matches!(
+                record,
+                ManifestRecord::Pitr(
+                    crate::pitr::manifest::PitrManifestRecord::SegmentSealed { .. }
+                )
+            )
+        });
+
+        #[cfg(feature = "chaos-testing")]
+        let append_bytes = if segment_sealed_batch
+            && std::env::var(crate::chaos::failpoint::PARALLEL_WAL_CRASH_POINT_ENV).is_ok_and(
+                |configured| configured == "pitr.manifest.after_segment_sealed_partial_append",
+            ) {
+            // Leave a real torn JSON suffix for the process-level recovery test.
+            let partial_len = (append_bytes.len() / 2).max(1);
+            file.write_all(&append_bytes[..partial_len])?;
+            crate::chaos::failpoint::wal_crash_point(
+                "pitr.manifest.after_segment_sealed_partial_append",
+            );
+            // Earlier occurrences return normally. Complete their suffix
+            // without appending the already-written prefix a second time.
+            &append_bytes[partial_len..]
+        } else {
+            append_bytes
+        };
+
+        #[cfg(feature = "chaos-testing")]
+        crate::chaos::failpoint::fail_point!(
+            "pitr.manifest.segment_sealed_partial_append_failure",
+            segment_sealed_batch,
+            |_| {
+                // Model write_all returning after persisting a proper prefix.
+                // The lifecycle caller must revalidate and truncate this suffix
+                // before returning control or allowing a reopen to parse it.
+                let partial_len = (append_bytes.len() / 2).max(1);
+                file.write_all(&append_bytes[..partial_len])?;
+                Err(anyhow::anyhow!(
+                    "injected SegmentSealed manifest partial append failure"
+                ))
+            }
+        );
+
+        file.write_all(append_bytes)?;
+
+        #[cfg(feature = "chaos-testing")]
+        if segment_sealed_batch {
+            crate::chaos::failpoint::wal_crash_point(
+                "pitr.manifest.after_segment_sealed_append_before_sync",
+            );
+        }
+
+        #[cfg(feature = "chaos-testing")]
+        crate::chaos::failpoint::fail_point!(
+            "pitr.manifest.segment_sealed_sync_failure",
+            segment_sealed_batch,
+            |_| {
+                // Match the poisoned-handle state left by a failed sync. The
+                // complete append is still visible and must be reconciled on
+                // reopen rather than retried through this manifest handle.
+                self.mark_durability_uncertain();
+                Err(anyhow::anyhow!(
+                    "injected SegmentSealed manifest sync failure"
+                ))
+            }
+        );
 
         #[cfg(test)]
         if std::env::var_os("PITR_PROCESS_KILL_AFTER_MANIFEST_APPEND").is_some() {

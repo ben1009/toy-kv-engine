@@ -362,6 +362,9 @@ rotation/publication. Recovery covers crashes after `SealStarted` and after
 `SegmentSealed` but before successor installation. Logical quota release is
 coupled to durable archive publication; source-spool reservations remain until
 durable local cleanup.
+Stage 8 also injects a returned manifest sync failure specifically after the
+`SegmentSealed` append, verifies write admission stays closed and the successor
+is not installed, then reopens and reconciles the appended transition.
 Recovered and rotated Active v7 owners and their shared ledger are retained by
 PITR segment bookkeeping through durable WAL/seal cleanup; retirement fences new
 admission and retains charges for in-flight admission or preparation guards
@@ -1508,6 +1511,88 @@ existing post-rename crash case then proceeds to the following successor ID.
 This covers only the synced-temp-before-rename process-crash boundary; it does
 not simulate power loss or qualify partial image writes and manifest-sync
 interruptions.
+
+The eighteenth Stage 8 slice adds a process crash after all bytes of an empty
+successor staging image have been written but before the staging file is synced.
+The test verifies the complete image remains only at the temporary path, then
+reopen removes it, recreates the manifest-authorized successor, and preserves
+the sealed predecessor. This process-kill case does not simulate power loss or
+claim that the unsynced staging bytes survive a machine crash.
+
+The nineteenth Stage 8 slice adds a process crash after an empty successor's
+staging image header is written but before its generation-zero FRONTIER is
+written. It verifies the temp file contains only the exact canonical header,
+then checks reopen removes it, recreates the authorized empty successor, and
+preserves the sealed predecessor. This covers one partial-write process cut;
+it does not simulate power loss or qualify manifest-sync interruptions.
+
+The twentieth Stage 8 slice crashes after the `SegmentSealed` manifest record is
+appended and before its sync returns. It checks the empty successor is not
+installed by the child, then reopens and verifies manifest recovery durably
+accepts the complete record before recreating the successor and preserving its
+sealed predecessor. This process-kill case does not model power loss that drops
+the appended bytes.
+
+The twenty-first Stage 8 slice injects a returned manifest sync failure after
+the `SegmentSealed` append. It verifies the append is classified as published
+but not durable, write admission stays closed, no successor is installed, and
+reopen reconciles the transition. This injected failure does not simulate power
+loss that drops the appended bytes.
+
+The twenty-second Stage 8 slice injects a parent-directory sync failure after
+the empty successor image has been synced and renamed into place. It verifies
+the canonical image remains visible, then reopen verifies the existing image,
+syncs its directory entry, and preserves the sealed predecessor. This returned
+error case does not simulate power loss that removes the unsynced directory
+entry.
+
+The twenty-third Stage 8 slice corrupts the generation-zero FRONTIER of an
+installed, manifest-authorized empty Active v7 successor. Reopen must fail
+closed without replacing or normalizing the WAL, changing either manifest file,
+or leaving a staging image. This verifies the Active logical anchor remains a
+hard recovery floor even when no acknowledged DATA batches exist.
+
+The twenty-fourth Stage 8 slice injects a returned error immediately before
+the no-replace rename of a fully written and synced empty successor image. It
+verifies that the canonical successor remains absent, the staging image is
+cleaned up, writes stay blocked while the durable `SegmentSealed` transition
+awaits installation, and reopen installs the authorized successor while
+preserving the predecessor. This does not simulate process termination inside
+the rename syscall or power loss after a successful rename.
+
+The twenty-fifth Stage 8 slice injects a returned error after writing the full
+empty successor staging image but before its file sync. It verifies that the
+canonical path remains absent, the unsynced staging image is cleaned up, writes
+stay blocked while the durable `SegmentSealed` transition awaits installation,
+and reopen installs the successor while preserving the predecessor. This does
+not simulate an OS sync error or power loss.
+
+The twenty-sixth Stage 8 slice covers both a returned short write and a process
+crash after a proper prefix of the `SegmentSealed` manifest record reaches the
+file. Runtime append revalidation truncates and syncs the short suffix; reopen
+discards an EOF-truncated final JSON value only when its bytes identify a
+`SegmentSealed` for an already durable matching `SealStarted` or `MigrationStarted`
+intent (including a sealing obligation retained in a validated snapshot), then
+completes the transition from that intent. Generic incomplete records, including
+`FlushV3`, and other manifest parse errors remain fatal.
+Unrelated older-segment archive or reclamation records and valid recorded-time
+updates do not cancel that pending intent. A regression also checks that earlier
+hits skipped by the crash occurrence selector finish their append exactly once
+before the selected hit.
+
+The twenty-seventh Stage 8 slice injects a positive short `pwrite` result while
+writing a v7 Parallel FRONTIER. The fault hook writes one byte and returns that
+short count, so the test exercises an actual partial frame without relying on
+filesystem-specific partial-write behavior. It verifies the durability cycle
+fails, the runtime is poisoned, neither rejected writes nor close append another
+FRONTIER, and Active recovery falls back to the prior durable anchor while
+discarding the uncommitted DATA.
+
+The twenty-eighth Stage 8 slice exercises the v7 Leader FRONTIER `fdatasync`
+failure hook directly. It verifies DATA and FRONTIER were written before the
+injected error, the durable cursor does not advance, the writer is poisoned,
+and later appends leave the uncertain image unchanged. This complements the
+descriptor-based sync failure test with deterministic fault injection.
 
 - Complete the correctness matrix below using the persistence model, real
   runtime injection, and process-level integration. Regress ordinary v4,
