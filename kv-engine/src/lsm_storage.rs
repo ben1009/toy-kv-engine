@@ -5739,6 +5739,10 @@ impl KvEngine {
             .expect("PITR segment manager was checked above") = sealed_segments;
 
         #[cfg(feature = "chaos-testing")]
+        crate::chaos::failpoint::wal_crash_point(
+            "wal_v7.successor.after_segment_sealed_before_image_install",
+        );
+        #[cfg(feature = "chaos-testing")]
         crate::chaos::failpoint::fail_point!("pitr.v7_before_successor_install", |_| Err(anyhow!(
             "injected v7 failure before successor installation"
         )));

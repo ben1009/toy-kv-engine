@@ -17,8 +17,8 @@ use kv_engine::wal::WalIoMode;
 use kv_engine::{
     BackupOptions, BackupRepository, CreateBackupOutcome, EnablePitrOutcome,
     ImplementationRegistry, PersistedPitrConfig, PitrCloseOutcome, PitrOptions, PitrRestoreOptions,
-    PitrRuntimeOptions, PitrStatusOptions, PitrWalIoMode, RecoveryPointOutcome, RecoverySelector,
-    RecoveryTarget, RestoreToOutcome, VerifyPitrDepth, VerifyPitrOptions,
+    PitrResumeOutcome, PitrRuntimeOptions, PitrStatusOptions, PitrWalIoMode, RecoveryPointOutcome,
+    RecoverySelector, RecoveryTarget, RestoreToOutcome, VerifyPitrDepth, VerifyPitrOptions,
 };
 use std::io::Read;
 #[cfg(target_os = "linux")]
@@ -1101,74 +1101,13 @@ fn pitr_v7_empty_segment_archive_restore() {
     let dir = tempfile::tempdir().expect("create v7 empty-segment archive-restore directory");
     let db_path = dir.path().join("db");
     let repository = dir.path().join("repository");
-    let engine = KvEngine::open(
-        &db_path,
-        LsmStorageOptions {
-            enable_wal: true,
-            ..LsmStorageOptions::default_for_test()
-        },
-    )
-    .expect("open database for empty-segment PITR setup");
-    assert!(matches!(
-        engine.create_backup(BackupOptions {
-            repository: repository.clone(),
-            use_hard_links: false,
-        }),
-        Ok(CreateBackupOutcome::Committed(_))
-    ));
-    assert!(matches!(
-        engine.enable_pitr(PitrOptions {
-            repository: repository.clone(),
-            config: PersistedPitrConfig {
-                archive_interval: Duration::from_secs(60),
-                max_segment_bytes: 1 << 20,
-                max_unarchived_bytes: 2 << 20,
-                max_source_spool_bytes: 8 << 20,
-            },
-            runtime: PitrRuntimeOptions::default(),
-        }),
-        Ok(EnablePitrOutcome::Enabled { .. })
-    ));
-    engine
-        .put(b"legacy-segment-value", b"restored")
-        .expect("persist value in the legacy PITR segment");
-    engine.close().expect("close PITR setup engine");
-
-    let engine = KvEngine::open_with_wal_io_mode(
-        &db_path,
-        LsmStorageOptions {
-            enable_wal: true,
-            pitr_repository: Some(repository.clone()),
-            ..LsmStorageOptions::default_for_test()
-        },
-        WalIoMode::Parallel,
-    )
-    .expect("reopen PITR database with the v7 Parallel writer");
-    engine
-        .resume_pitr(&repository)
-        .expect("resume PITR before checking the Active format");
-    let mut status = engine
+    let engine = prepare_empty_v7_parallel_pitr(&db_path, &repository);
+    let status = engine
         .pitr_status(PitrStatusOptions {
             cursor: None,
             page_size: NonZeroUsize::new(64).expect("nonzero PITR status page size"),
         })
-        .expect("read status after first legacy resume");
-    if status.active_wal_format_version != Some(7) {
-        engine
-            .put(b"legacy-migration-trigger", b"legacy")
-            .expect("persist a legacy batch before v7 migration");
-        engine
-            .resume_pitr(&repository)
-            .expect("resume PITR to install the v7 successor");
-        status = engine
-            .pitr_status(PitrStatusOptions {
-                cursor: None,
-                page_size: NonZeroUsize::new(64).expect("nonzero PITR status page size"),
-            })
-            .expect("read status after v7 migration");
-    }
-    assert_eq!(status.active_wal_format_version, Some(7));
-    assert_eq!(status.active_wal_io_mode, Some(PitrWalIoMode::Parallel));
+        .expect("read status after v7 migration");
     let active_wal_path = find_v7_pitr_wal(&db_path);
     let active_image = std::fs::read(&active_wal_path).expect("read empty v7 Active WAL");
     assert_eq!(
@@ -1347,6 +1286,243 @@ fn pitr_v7_empty_segment_archive_restore() {
 }
 
 #[cfg(target_os = "linux")]
+#[test]
+fn failpoint_v7_empty_successor_install_crash_boundaries() {
+    let probe_dir = tempfile::tempdir().expect("create v7 empty-successor probe directory");
+    let probe_options = LsmStorageOptions {
+        enable_wal: true,
+        ..LsmStorageOptions::default_for_test()
+    };
+    match KvEngine::open_with_wal_io_mode(&probe_dir, probe_options, WalIoMode::Parallel) {
+        Ok(engine) => engine.close().expect("close v7 empty-successor probe"),
+        Err(error) => {
+            panic!("v7 Parallel empty-successor qualification requires io_uring: {error:#}")
+        }
+    }
+
+    let dir = tempfile::tempdir().expect("create v7 empty-successor crash directory");
+    let db_path = dir.path().join("db");
+    let repository = dir.path().join("repository");
+    let control_log_path = dir.path().join("chaos_control.log");
+    let engine = prepare_empty_v7_parallel_pitr(&db_path, &repository);
+    let initial_active_wal = find_v7_pitr_wal(&db_path);
+    let initial_active_segment_id = pitr_segment_id(&initial_active_wal);
+    engine.close().expect("close empty v7 Active setup engine");
+
+    let before_install_point = "wal_v7.successor.after_segment_sealed_before_image_install";
+    let before_install_marker = dir.path().join("before-empty-image-install.marker");
+    kill_pitr_child_at_empty_successor_crash_point(
+        &db_path,
+        &repository,
+        &control_log_path,
+        &before_install_marker,
+        before_install_point,
+    );
+    assert_eq!(
+        std::fs::read_to_string(&before_install_marker)
+            .expect("read pre-install crash marker")
+            .trim(),
+        before_install_point
+    );
+    let first_successor_path = pitr_wal_path(&db_path, initial_active_segment_id + 1);
+    assert!(
+        !first_successor_path.exists(),
+        "the manifest-authorized successor must be absent at the pre-install crash boundary"
+    );
+
+    let recovered_after_preinstall_crash = open_and_resume_parallel_pitr(&db_path, &repository);
+    assert_empty_v7_active_image(&first_successor_path);
+    assert_eq!(
+        recovered_after_preinstall_crash
+            .get(b"legacy-segment-value")
+            .expect("read predecessor value after pre-install recovery")
+            .as_deref(),
+        Some(b"restored".as_slice()),
+        "recreating the empty successor must preserve its sealed predecessor"
+    );
+    recovered_after_preinstall_crash
+        .close()
+        .expect("close engine after pre-install recovery");
+
+    let after_rename_point = "wal_v7.active_image.after_rename_before_directory_sync";
+    let after_rename_marker = dir.path().join("after-empty-image-rename.marker");
+    kill_pitr_child_at_empty_successor_crash_point(
+        &db_path,
+        &repository,
+        &control_log_path,
+        &after_rename_marker,
+        after_rename_point,
+    );
+    assert_eq!(
+        std::fs::read_to_string(&after_rename_marker)
+            .expect("read post-rename crash marker")
+            .trim(),
+        after_rename_point
+    );
+    let second_successor_path = pitr_wal_path(&db_path, initial_active_segment_id + 2);
+    assert_empty_v7_active_image(&second_successor_path);
+
+    let recovered_after_rename_crash = open_and_resume_parallel_pitr(&db_path, &repository);
+    let active_wal_path = find_v7_pitr_wal(&db_path);
+    assert_eq!(active_wal_path, second_successor_path);
+    assert_empty_v7_active_image(&active_wal_path);
+    assert_eq!(
+        recovered_after_rename_crash
+            .get(b"legacy-segment-value")
+            .expect("read predecessor value after post-rename recovery")
+            .as_deref(),
+        Some(b"restored".as_slice()),
+        "reopening an installed empty successor must retain its sealed predecessor"
+    );
+    recovered_after_rename_crash
+        .put(b"after-empty-successor-recovery", b"writable")
+        .expect("accept a v7 write after empty-successor recovery");
+    recovered_after_rename_crash
+        .close()
+        .expect("close engine after post-rename recovery");
+
+    let reopened = open_and_resume_parallel_pitr(&db_path, &repository);
+    assert_eq!(
+        reopened
+            .get(b"after-empty-successor-recovery")
+            .expect("read post-recovery write after another reopen")
+            .as_deref(),
+        Some(b"writable".as_slice()),
+        "a write accepted after empty-successor recovery must survive reopen"
+    );
+    reopened
+        .close()
+        .expect("close reopened post-recovery write engine");
+}
+
+#[cfg(target_os = "linux")]
+fn prepare_empty_v7_parallel_pitr(
+    db_path: &std::path::Path,
+    repository: &std::path::Path,
+) -> std::sync::Arc<KvEngine> {
+    let engine = KvEngine::open(
+        db_path,
+        LsmStorageOptions {
+            enable_wal: true,
+            ..LsmStorageOptions::default_for_test()
+        },
+    )
+    .expect("open database for empty-segment PITR setup");
+    assert!(matches!(
+        engine.create_backup(BackupOptions {
+            repository: repository.to_path_buf(),
+            use_hard_links: false,
+        }),
+        Ok(CreateBackupOutcome::Committed(_))
+    ));
+    assert!(matches!(
+        engine.enable_pitr(PitrOptions {
+            repository: repository.to_path_buf(),
+            config: PersistedPitrConfig {
+                archive_interval: Duration::from_secs(60),
+                max_segment_bytes: 1 << 20,
+                max_unarchived_bytes: 2 << 20,
+                max_source_spool_bytes: 8 << 20,
+            },
+            runtime: PitrRuntimeOptions::default(),
+        }),
+        Ok(EnablePitrOutcome::Enabled { .. })
+    ));
+    engine
+        .put(b"legacy-segment-value", b"restored")
+        .expect("persist value in the legacy PITR segment");
+    engine.close().expect("close PITR setup engine");
+
+    let engine = open_and_resume_parallel_pitr(db_path, repository);
+    let mut status = engine
+        .pitr_status(PitrStatusOptions {
+            cursor: None,
+            page_size: NonZeroUsize::new(64).expect("nonzero PITR status page size"),
+        })
+        .expect("read status after first legacy resume");
+    if status.active_wal_format_version != Some(7) {
+        engine
+            .put(b"legacy-migration-trigger", b"legacy")
+            .expect("persist a legacy batch before v7 migration");
+        engine
+            .resume_pitr(repository)
+            .expect("resume PITR to install the v7 successor");
+        status = engine
+            .pitr_status(PitrStatusOptions {
+                cursor: None,
+                page_size: NonZeroUsize::new(64).expect("nonzero PITR status page size"),
+            })
+            .expect("read status after v7 migration");
+    }
+    assert_eq!(status.active_wal_format_version, Some(7));
+    assert_eq!(status.active_wal_io_mode, Some(PitrWalIoMode::Parallel));
+    engine
+}
+
+#[cfg(target_os = "linux")]
+fn open_and_resume_parallel_pitr(
+    db_path: &std::path::Path,
+    repository: &std::path::Path,
+) -> std::sync::Arc<KvEngine> {
+    let engine = KvEngine::open_with_wal_io_mode(
+        db_path,
+        LsmStorageOptions {
+            enable_wal: true,
+            pitr_repository: Some(repository.to_path_buf()),
+            ..LsmStorageOptions::default_for_test()
+        },
+        WalIoMode::Parallel,
+    )
+    .expect("open PITR database with the v7 Parallel writer");
+    let outcome = engine
+        .resume_pitr(repository)
+        .expect("resume PITR with the v7 Parallel writer");
+    assert!(
+        matches!(outcome, PitrResumeOutcome::Resumed),
+        "PITR resume must complete reconciliation, got {outcome:?}"
+    );
+    engine
+}
+
+#[cfg(target_os = "linux")]
+fn pitr_wal_path(db_path: &std::path::Path, segment_id: u64) -> PathBuf {
+    db_path.join(format!("pitr-{segment_id:020}.wal"))
+}
+
+#[cfg(target_os = "linux")]
+fn pitr_segment_id(path: &std::path::Path) -> u64 {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.strip_prefix("pitr-"))
+        .and_then(|name| name.strip_suffix(".wal"))
+        .and_then(|segment_id| segment_id.parse().ok())
+        .expect("parse PITR WAL segment ID")
+}
+
+#[cfg(target_os = "linux")]
+fn assert_empty_v7_active_image(path: &std::path::Path) {
+    let image = std::fs::read(path).expect("read empty v7 Active WAL");
+    assert_eq!(image.len(), 2 * 4096, "empty v7 image is header plus F0");
+    assert_eq!(u16::from_be_bytes([image[4], image[5]]), 7);
+    assert_eq!(&image[4096..4104], b"TKVW7FR1");
+    assert_eq!(
+        u16::from_be_bytes([image[4106], image[4107]]),
+        2,
+        "empty Active v7 image must contain generation-zero FRONTIER"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy)]
+enum PitrChildCrashOperation<'a> {
+    CreateEmptySuccessor,
+    Write {
+        acknowledged_write: Option<(&'a str, &'a str)>,
+        write: Option<(&'a str, &'a str)>,
+    },
+}
+
+#[cfg(target_os = "linux")]
 fn kill_pitr_child_at_crash_point(
     db_path: &std::path::Path,
     repository: &std::path::Path,
@@ -1356,6 +1532,57 @@ fn kill_pitr_child_at_crash_point(
     acknowledged_write: Option<(&str, &str)>,
     write: Option<(&str, &str)>,
 ) {
+    kill_pitr_child_at_crash_point_with_operation(
+        db_path,
+        repository,
+        control_log_path,
+        marker_path,
+        crash_point,
+        PitrChildCrashOperation::Write {
+            acknowledged_write,
+            write,
+        },
+    );
+}
+
+#[cfg(target_os = "linux")]
+fn kill_pitr_child_at_empty_successor_crash_point(
+    db_path: &std::path::Path,
+    repository: &std::path::Path,
+    control_log_path: &std::path::Path,
+    marker_path: &std::path::Path,
+    crash_point: &str,
+) {
+    kill_pitr_child_at_crash_point_with_operation(
+        db_path,
+        repository,
+        control_log_path,
+        marker_path,
+        crash_point,
+        PitrChildCrashOperation::CreateEmptySuccessor,
+    );
+}
+
+#[cfg(target_os = "linux")]
+fn kill_pitr_child_at_crash_point_with_operation(
+    db_path: &std::path::Path,
+    repository: &std::path::Path,
+    control_log_path: &std::path::Path,
+    marker_path: &std::path::Path,
+    crash_point: &str,
+    operation: PitrChildCrashOperation<'_>,
+) {
+    let crash_occurrence = match operation {
+        PitrChildCrashOperation::Write {
+            acknowledged_write: Some(_),
+            ..
+        } => "2",
+        PitrChildCrashOperation::CreateEmptySuccessor
+        | PitrChildCrashOperation::Write {
+            acknowledged_write: None,
+            ..
+        } => "1",
+    };
     let mut child = Command::new(chaos_child_path());
     child
         .arg("--child")
@@ -1373,15 +1600,18 @@ fn kill_pitr_child_at_crash_point(
         .arg("--crash-point")
         .arg(crash_point)
         .env(PARALLEL_WAL_CRASH_POINT_ENV, crash_point)
-        .env(
-            PARALLEL_WAL_CRASH_OCCURRENCE_ENV,
-            if acknowledged_write.is_some() {
-                "2"
-            } else {
-                "1"
-            },
-        )
+        .env(PARALLEL_WAL_CRASH_OCCURRENCE_ENV, crash_occurrence)
         .env(PARALLEL_WAL_CRASH_MARKER_ENV, marker_path);
+    let (acknowledged_write, write) = match operation {
+        PitrChildCrashOperation::CreateEmptySuccessor => {
+            child.arg("--create-empty-successor");
+            (None, None)
+        }
+        PitrChildCrashOperation::Write {
+            acknowledged_write,
+            write,
+        } => (acknowledged_write, write),
+    };
     if let Some((key, value)) = acknowledged_write {
         child
             .arg("--acknowledged-write-key")

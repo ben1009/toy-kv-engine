@@ -298,7 +298,11 @@ pub(crate) fn create_empty_active_image(
     image[..WAL_V7_HEADER_LEN].copy_from_slice(&header_bytes);
     image[WAL_V7_HEADER_LEN..].copy_from_slice(&generation_zero);
 
-    crate::pitr::segment::install_pitr_file_no_replace(path, &image)?;
+    crate::pitr::segment::install_pitr_file_no_replace_with_crash_point(
+        path,
+        &image,
+        Some("wal_v7.active_image.after_rename_before_directory_sync"),
+    )?;
 
     let mut file = File::open(path).context("open newly installed empty v7 Active WAL")?;
     let metadata = file.metadata().context("inspect empty v7 Active WAL")?;
