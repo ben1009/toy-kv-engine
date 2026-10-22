@@ -1594,6 +1594,29 @@ injected error, the durable cursor does not advance, the writer is poisoned,
 and later appends leave the uncertain image unchanged. This complements the
 descriptor-based sync failure test with deterministic fault injection.
 
+The twenty-ninth Stage 8 slice kills a process after a successful v7 Leader
+WAL `fdatasync` but before in-memory frontier publication. Reopen must recover
+both the earlier acknowledged value and the candidate covered by the completed
+sync. This is a process-crash test; it does not model power loss or storage
+that violates successful-sync durability.
+
+The thirtieth Stage 8 slice injects a positive short positional write while
+writing a v7 Leader FRONTIER. It writes a real one-byte prefix through a
+buffered descriptor for the same inode, then verifies the durability cycle
+fails, the writer is poisoned, subsequent appends leave the uncertain image
+unchanged, and Active recovery falls back to the prior durable anchor. This
+complements the equivalent v7 Parallel short-FRONTIER-write coverage. The test
+checks the exact one-byte FRONTIER tail after a structurally valid DATA frame
+and verifies a previously committed batch and its logical frontier survive.
+
+The thirty-first Stage 8 slice injects a positive short positional write while
+writing v7 Leader DATA. It verifies the partial DATA image does not advance the
+durable frontier, the writer rejects later appends without changing the image,
+and Active recovery returns to the prior durable anchor. This complements the
+Leader FRONTIER short-write case and the existing post-DATA unwind coverage.
+The test checks the exact one-byte DATA tail and preservation of the previous
+committed batch, ticket boundary, and prefix digest after recovery.
+
 - Complete the correctness matrix below using the persistence model, real
   runtime injection, and process-level integration. Regress ordinary v4,
   strict v5/v6, TTL, recorded-time rollback/clamping, range deletion, OCC,
