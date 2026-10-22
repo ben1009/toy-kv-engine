@@ -21086,6 +21086,81 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn v7_sealed_recovery_keeps_frozen_sources_read_only_across_reopens() -> anyhow::Result<()> {
+        use crate::{
+            pitr::SegmentId,
+            wal::{WalIoMode, format::WAL_FORMAT_VERSION_V7, v7::codec::WalV7Header},
+        };
+
+        for mode in [WalIoMode::Leader, WalIoMode::Parallel] {
+            let directory = tempdir()?;
+            let (options, source_wal) = v7_sealed_recovery_test_database(directory.path())?;
+            let database = directory.path().join("db");
+            let source_before = std::fs::read(&source_wal)?;
+            let seal_path = source_wal.with_extension("seal");
+            let seal_before = std::fs::read(&seal_path)?;
+            let source_segment_id = WalV7Header::decode(&source_before)?.segment_id;
+
+            fn assert_read_only_source(
+                engine: &KvEngine,
+                segment_id: SegmentId,
+                wal_path: &std::path::Path,
+            ) -> anyhow::Result<()> {
+                let state = engine.inner.state.load();
+                let source = state
+                    .imm_memtables
+                    .iter()
+                    .find(|memtable| {
+                        LsmStorageInner::pitr_segment_of(memtable.as_ref()) == Some(segment_id.0)
+                    })
+                    .ok_or_else(|| anyhow::anyhow!("sealed v7 source memtable is missing"))?;
+                assert!(source.uses_v7_wal());
+                assert_eq!(source.wal_path(), Some(wal_path));
+                assert_eq!(source.wal_format_version(), None);
+                assert_eq!(source.wal_io_mode(), None);
+                assert!(!source.uses_parallel_wal());
+                assert_eq!(source.parallel_wal_is_closed(), None);
+                assert_eq!(source.has_ring(), None);
+                assert!(source.wal_v7_reservation_owner().is_none());
+                Ok(())
+            }
+
+            for _ in 0..2 {
+                let engine = KvEngine::open_with_wal_io_mode(&database, options.clone(), mode)?;
+                assert_read_only_source(&engine, source_segment_id, &source_wal)?;
+                assert_eq!(
+                    engine.inner.state.load().memtable.wal_format_version(),
+                    Some(WAL_FORMAT_VERSION_V7)
+                );
+                let active = engine.inner.state.load().memtable.clone();
+                let authoritative_active_segment = engine
+                    .pitr_manifest_state
+                    .lock()
+                    .active_segment_id
+                    .ok_or_else(|| anyhow::anyhow!("manifest has no Active v7 successor"))?;
+                assert_eq!(
+                    LsmStorageInner::pitr_segment_of(&active),
+                    Some(authoritative_active_segment),
+                    "the runtime must be attached to the manifest-authorized Active successor"
+                );
+                assert_eq!(active.wal_io_mode(), Some(mode));
+                assert_eq!(active.uses_parallel_wal(), mode == WalIoMode::Parallel);
+                assert_eq!(
+                    active.parallel_wal_is_closed(),
+                    (mode == WalIoMode::Parallel).then_some(false)
+                );
+                assert_eq!(engine.get(b"v7-key")?, Some(Bytes::from_static(b"v")));
+                engine.close_storage()?;
+                assert_eq!(std::fs::read(&source_wal)?, source_before);
+                assert_eq!(std::fs::read(&seal_path)?, seal_before);
+            }
+        }
+
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn v7_sealed_recovery_recreates_successor_from_legacy_source() -> anyhow::Result<()> {
         use crate::{
             manifest::{Manifest, ManifestRecord},
