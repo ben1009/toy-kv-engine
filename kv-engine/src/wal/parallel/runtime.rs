@@ -3548,6 +3548,55 @@ mod tests {
     }
 
     #[test]
+    fn v7_parallel_clamps_recorded_time_after_rollback_and_recovery() -> anyhow::Result<()> {
+        use crate::wal::v7::{
+            install::recover_and_install_active, recovery::WalV7RecoveryAuthority,
+        };
+
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("recorded-time-rollback.wal");
+        let V7RuntimeTestWal {
+            wal,
+            owner: _owner,
+            anchor,
+        } = live_v7_test_wal(&path, super::MAX_WAL_FILE_SIZE, v7_test_resource_limits())?
+            .ok_or_else(|| anyhow::anyhow!("v7 recorded-time qualification requires io_uring"))?;
+
+        let first = v7_test_batch(1, 10);
+        let mut second = v7_test_batch(2, 10);
+        second.recorded_at = RecordedAt { secs: 40, nanos: 0 };
+        let first_ticket = wal.put_v7_batch_with_index(&first, LIVE_WAL_V5_LIMITS)?.0;
+        let second_ticket = wal.put_v7_batch_with_index(&second, LIVE_WAL_V5_LIMITS)?.0;
+        assert_eq!((first_ticket, second_ticket), (0, 1));
+
+        wal.submit_and_commit(second_ticket)?;
+        wal.close()?;
+        drop(wal);
+
+        let recovered = recover_and_install_active(
+            &path,
+            WalV7RecoveryAuthority::Active {
+                predecessor: crate::pitr::ChainAnchor::Genesis {
+                    archive_epoch_id: crate::pitr::ArchiveEpochId(anchor.archive_epoch_id),
+                },
+                durable_anchors: vec![anchor],
+            },
+        )?;
+        assert_eq!(recovered.installed.next_ticket, 2);
+        assert_eq!(recovered.installed.batches.len(), 2);
+        assert_eq!(
+            recovered.installed.batches[0].recorded_at,
+            first.recorded_at
+        );
+        assert_eq!(
+            recovered.installed.batches[1].recorded_at, first.recorded_at,
+            "the regressing clock sample must be clamped to the preceding v7 batch"
+        );
+
+        Ok(())
+    }
+
+    #[test]
     fn v7_packer_preallocation_respects_small_segment_limits() -> anyhow::Result<()> {
         use crate::wal::v7::{
             codec::WAL_V7_FRAME_LEN, install::recover_and_install_active,
