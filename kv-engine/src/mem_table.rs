@@ -1034,6 +1034,10 @@ pub struct MemTable {
     /// True when this memtable's source image is an immutable or active v7
     /// PITR WAL. Sealed recovery retains the source without attaching a writer.
     wal_v7_source: bool,
+    /// Terminal cursor retained while a durable Sealing source is recovered
+    /// read-only. Explicit resume uses it to finish sealing without starting an
+    /// append runtime for the frozen source.
+    wal_v7_sealing_frontier: Option<crate::wal::v7::allocator::WalV7FrontierCursor>,
     wal_v7_reservation_owner: Option<Arc<WalV7ReservationOwner>>,
     wal_v7_seal_index: Option<Mutex<Vec<u64>>>,
     id: usize,
@@ -1078,6 +1082,7 @@ impl MemTable {
             wal: None,
             wal_path: None,
             wal_v7_source: false,
+            wal_v7_sealing_frontier: None,
             wal_v7_reservation_owner: None,
             wal_v7_seal_index: None,
             id,
@@ -1381,6 +1386,41 @@ impl MemTable {
         ret.wal_v7_seal_index = Some(Mutex::new(installed.seal_index));
         ret.last_ticket
             .store(next_ticket, std::sync::atomic::Ordering::Release);
+        ret.recovered_recorded_at = recovered_recorded_at;
+        ret.rebuild_bloom();
+
+        Ok((ret, max_commit_ts))
+    }
+
+    /// Recover an Active v7 image covered by a durable Sealing obligation as a
+    /// read-only source. The recovered cursor and resource owner are retained
+    /// so explicit PITR resume can build and install the seal without starting
+    /// a WAL writer for the frozen segment.
+    pub(crate) fn recover_from_v7_sealing_source(
+        id: usize,
+        vlog_enabled: bool,
+        path: impl AsRef<Path>,
+        installed: WalV7InstalledRecovery,
+        reservation_owner: Arc<WalV7ReservationOwner>,
+    ) -> Result<(Self, u64)> {
+        let path = path.as_ref().to_path_buf();
+        let seed = installed.runtime_seed()?;
+        reservation_owner.validate_image(seed.installed_dev, seed.installed_ino)?;
+        let max_commit_ts = installed.active_boundary.last_commit_ts;
+        let recovered_recorded_at = installed.last_recorded_at;
+
+        let mut ret = Self::create(id, vlog_enabled);
+        ret.wal_v7_source = true;
+        ret.wal_v7_sealing_frontier = Some(seed.frontier_cursor);
+        for batch in &installed.batches {
+            ret.apply_recovered_batch(batch)?;
+        }
+
+        ret.wal_path = Some(path);
+        ret.wal_v7_reservation_owner = Some(reservation_owner);
+        ret.wal_v7_seal_index = Some(Mutex::new(installed.seal_index));
+        ret.last_ticket
+            .store(installed.next_ticket, std::sync::atomic::Ordering::Release);
         ret.recovered_recorded_at = recovered_recorded_at;
         ret.rebuild_bloom();
 
@@ -2059,7 +2099,10 @@ impl MemTable {
     }
 
     pub(crate) fn wal_format_version(&self) -> Option<u16> {
-        self.wal.as_ref().map(Wal::format_version)
+        self.wal.as_ref().map(Wal::format_version).or_else(|| {
+            self.wal_v7_sealing_frontier
+                .map(|_| crate::wal::format::WAL_FORMAT_VERSION_V7)
+        })
     }
 
     pub(crate) fn wal_io_mode(&self) -> Option<crate::wal::WalIoMode> {
@@ -2083,11 +2126,7 @@ impl MemTable {
         crate::pitr::manifest::ActiveBoundary,
         crate::pitr::manifest::ActiveBoundary,
     )> {
-        let wal = self
-            .wal
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("memtable has no WAL"))?;
-        anyhow::ensure!(wal.is_v7(), "memtable WAL is not v7");
+        anyhow::ensure!(self.uses_v7_wal(), "memtable WAL is not v7");
         let path = self
             .wal_path
             .as_ref()
@@ -2132,7 +2171,7 @@ impl MemTable {
             }
         };
         let empty = active_boundary(genesis);
-        let cursor = wal.v7_frontier_cursor()?;
+        let cursor = self.v7_frontier_cursor()?;
         let mut terminal_frame = [0; crate::wal::v7::codec::WAL_V7_FRAME_LEN];
         file.seek(SeekFrom::Start(cursor.frame_offset))
             .context("seek Active v7 WAL to its terminal FRONTIER")?;
@@ -2172,8 +2211,10 @@ impl MemTable {
     ) -> Result<crate::wal::v7::allocator::WalV7FrontierCursor> {
         self.wal
             .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("memtable has no WAL"))?
-            .v7_frontier_cursor()
+            .map(Wal::v7_frontier_cursor)
+            .transpose()?
+            .or(self.wal_v7_sealing_frontier)
+            .ok_or_else(|| anyhow::anyhow!("memtable has no v7 frontier cursor"))
     }
 
     pub(crate) fn v7_wal_requires_recovery(&self) -> bool {
@@ -2227,12 +2268,21 @@ impl MemTable {
     }
 
     pub(crate) fn wal_logical_length(&self) -> Option<u64> {
-        self.wal.as_ref().map(Wal::logical_length)
+        self.wal.as_ref().map(Wal::logical_length).or_else(|| {
+            self.wal_v7_sealing_frontier.and_then(|cursor| {
+                cursor
+                    .frame_offset
+                    .checked_add(crate::wal::v7::codec::WAL_V7_FRAME_LEN as u64)
+            })
+        })
     }
 
     #[allow(dead_code)]
     pub(crate) fn wal_batch_count(&self) -> Option<u64> {
-        self.wal.as_ref().map(Wal::batch_count)
+        self.wal.as_ref().map(Wal::batch_count).or_else(|| {
+            self.wal_v7_sealing_frontier
+                .map(|cursor| cursor.frontier.ticket_end)
+        })
     }
 
     pub(crate) fn pitr_rotation_needed(&self) -> bool {

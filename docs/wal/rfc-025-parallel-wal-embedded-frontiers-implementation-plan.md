@@ -1645,9 +1645,37 @@ The thirty-fourth Stage 8 slice verifies that a recovered Sealed v7 source
 remains read-only and has no attached WAL writer, scheduler, ring, or reservation
 owner across open, close, and reopen in both Leader and Parallel selection
 modes. It also checks that the installed Active successor uses the requested
-mode and that the frozen source WAL and seal bytes remain unchanged. Sealing
-startup, process-crash qualification, and the remaining correctness matrix are
-still open.
+mode and that the frozen source WAL and seal bytes remain unchanged. The broader
+process-crash qualification and remaining correctness matrix are still open.
+
+The thirty-fifth Stage 8 slice kills a child after the `SealStarted` manifest
+record is durable but before the source seal sidecar is installed. Reopen with
+the repository configured must leave the source fenced and without a v7 writer
+until explicit resume completes the transition. The startup regression checks
+Leader and Parallel selection; the process-crash case verifies that the
+Parallel-selected successor becomes Active only after recovery. This qualifies
+one Sealing startup boundary, not the remaining process-crash or correctness
+matrix. Nonempty startup fixtures also verify that archive commit lag counts the
+retained source exactly once, both before and after its seal sidecar exists.
+
+The thirty-sixth Stage 8 slice drives a backward recorded-time sample through
+the v7 Parallel runtime, then recovers the synced batches and checks that the
+second batch retained the first batch's clamped time. Codec and Leader coverage
+already verify the wire encoding and serial path; this adds an end-to-end check
+of ordered Parallel admission and persisted replay. This qualification test
+requires io_uring and fails explicitly if the backend is unavailable.
+
+The thirty-seventh Stage 8 slice extends candidate-prefix recovery coverage to
+the out-of-order persistence shape where DATA A is durable, DATA B is torn, and
+later DATA C is structurally complete. An older FRONTIER physically after C
+certifies only A and remains recoverable; a newer candidate covering B and C
+must be rejected because the retained prefix crosses the torn B frame.
+
+The thirty-eighth Stage 8 slice forges a checksum-valid terminal FRONTIER that
+is a valid generation-one successor of the image's actual F0 while skipping F1
+inside its retained prefix. Standalone successor decoding accepts the marker;
+whole-prefix recovery keeps the retained F1 candidate and rejects the sibling,
+covering the immediate predecessor rule independently of local codec validation.
 
 - Complete the correctness matrix below using the persistence model, real
   runtime injection, and process-level integration. Regress ordinary v4,

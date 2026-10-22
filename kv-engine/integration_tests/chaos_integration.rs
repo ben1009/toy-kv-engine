@@ -1897,6 +1897,123 @@ fn v7_manifest_authorized_empty_successor_corruption_fails_open() {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn failpoint_v7_sealing_startup_stays_fenced_after_seal_started_crash() {
+    let probe_dir = tempfile::tempdir().expect("create v7 Parallel sealing probe directory");
+    let probe_options = LsmStorageOptions {
+        enable_wal: true,
+        ..LsmStorageOptions::default_for_test()
+    };
+    match KvEngine::open_with_wal_io_mode(probe_dir.path(), probe_options, WalIoMode::Parallel) {
+        Ok(engine) => engine.close().expect("close v7 Parallel sealing probe"),
+        Err(error) => {
+            panic!("v7 Parallel Sealing-startup qualification requires io_uring: {error:#}")
+        }
+    }
+
+    let dir = tempfile::tempdir().expect("create v7 Sealing-startup directory");
+    let db_path = dir.path().join("db");
+    let repository = dir.path().join("repository");
+    let control_log_path = dir.path().join("chaos_control.log");
+    let engine = prepare_empty_v7_parallel_pitr(&db_path, &repository);
+    let source_wal = find_v7_pitr_wal(&db_path);
+    let source_segment_id = pitr_segment_id(&source_wal);
+    engine.close().expect("close Sealing-startup setup engine");
+    let source_before = std::fs::read(&source_wal).expect("read Active v7 WAL before crash");
+
+    let crash_point = "pitr.v7.after_seal_started";
+    let marker_path = dir.path().join("seal-started-crash.marker");
+    kill_pitr_child_at_empty_successor_crash_point(
+        &db_path,
+        &repository,
+        &control_log_path,
+        &marker_path,
+        crash_point,
+    );
+    assert_eq!(
+        std::fs::read_to_string(&marker_path)
+            .expect("read durable SealStarted crash marker")
+            .trim(),
+        crash_point
+    );
+
+    let seal_path = source_wal.with_extension("seal");
+    let successor_path = pitr_wal_path(&db_path, source_segment_id + 1);
+    assert_eq!(
+        std::fs::read(&source_wal).expect("read Sealing source after crash"),
+        source_before,
+        "the source WAL must remain untouched until after durable SealStarted"
+    );
+    assert!(
+        !seal_path.exists(),
+        "seal install must not precede the crash point"
+    );
+    assert!(
+        !successor_path.exists(),
+        "successor install must follow source sealing"
+    );
+
+    let options = LsmStorageOptions {
+        enable_wal: true,
+        pitr_repository: Some(repository.clone()),
+        ..LsmStorageOptions::default_for_test()
+    };
+    let reopened = KvEngine::open_with_wal_io_mode(&db_path, options, WalIoMode::Parallel)
+        .expect("reopen Sealing v7 source without auto-resuming it");
+    let status = reopened
+        .pitr_status(PitrStatusOptions {
+            cursor: None,
+            page_size: NonZeroUsize::new(64).expect("nonzero status page size"),
+        })
+        .expect("read status while source remains Sealing");
+    assert_eq!(status.active_wal_format_version, Some(7));
+    assert_eq!(
+        status.active_wal_io_mode, None,
+        "the frozen Sealing source must not acquire the requested Parallel writer"
+    );
+    assert!(
+        reopened
+            .put(b"blocked-during-sealing-recovery", b"write")
+            .is_err(),
+        "reopen must keep commits fenced until explicit PITR resume completes Sealing"
+    );
+    assert_eq!(
+        std::fs::read(&source_wal).expect("read source WAL after fenced reopen"),
+        source_before
+    );
+    assert!(!seal_path.exists());
+    assert!(!successor_path.exists());
+
+    assert!(matches!(
+        reopened.resume_pitr(&repository),
+        Ok(PitrResumeOutcome::Resumed)
+    ));
+    let resumed_status = reopened
+        .pitr_status(PitrStatusOptions {
+            cursor: None,
+            page_size: NonZeroUsize::new(64).expect("nonzero status page size"),
+        })
+        .expect("read status after explicit resume");
+    assert_eq!(resumed_status.active_wal_format_version, Some(7));
+    assert_eq!(
+        resumed_status.active_wal_io_mode,
+        Some(PitrWalIoMode::Parallel)
+    );
+    assert!(seal_path.is_file());
+    assert!(successor_path.is_file());
+    assert_eq!(
+        reopened
+            .get(b"legacy-segment-value")
+            .expect("read predecessor value after Sealing recovery")
+            .as_deref(),
+        Some(b"restored".as_slice())
+    );
+    reopened
+        .close()
+        .expect("close engine after Sealing recovery");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn failpoint_v7_empty_successor_install_crash_boundaries() {
     let probe_dir = tempfile::tempdir().expect("create v7 empty-successor probe directory");
     let probe_options = LsmStorageOptions {

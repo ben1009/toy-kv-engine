@@ -2018,8 +2018,7 @@ mod tests {
     }
 
     #[test]
-    fn accepts_a_frontier_before_corrupt_speculative_data_and_rejects_newer_prefixes() -> Result<()>
-    {
+    fn accepts_a_frontier_before_a_torn_middle_batch_and_valid_later_data() -> Result<()> {
         let TestWalImage {
             mut image,
             header_digest,
@@ -2027,12 +2026,34 @@ mod tests {
             frontier_zero_digest: digest_zero,
         } = test_image()?;
         let header_bytes = image[..WAL_V7_HEADER_LEN].to_vec();
-        let (data_end, batch) =
+        let (first_data_end, first_batch) =
             append_data_batch(&mut image, 8192, header_digest, 0, 10, 100, b"durable")?;
-        // A broken DATA slot follows the acknowledged prefix. F1 is physically
-        // after it but names only D0, so the damaged speculative slot is excluded.
-        image.resize(12_288, 0);
-        let first_prefix_digest = logical_prefix_digest(&header_bytes, &[&batch]);
+        // Model parallel persistence where A and C are complete but B is torn.
+        // The older frontier is appended after C but certifies only A, so both
+        // speculative frames remain outside its durable physical prefix.
+        let (second_data_end, second_batch) = append_data_batch(
+            &mut image,
+            first_data_end,
+            header_digest,
+            1,
+            20,
+            101,
+            b"torn-middle",
+        )?;
+        let (third_data_end, third_batch) = append_data_batch(
+            &mut image,
+            second_data_end,
+            header_digest,
+            2,
+            30,
+            102,
+            b"valid-later",
+        )?;
+        image[usize::try_from(first_data_end)?] ^= 0x80;
+
+        let first_prefix_digest = logical_prefix_digest(&header_bytes, &[&first_batch]);
+        let all_batches_digest =
+            logical_prefix_digest(&header_bytes, &[&first_batch, &second_batch, &third_batch]);
         let (frontier_one, digest_one) = append_successor(
             &mut image,
             header_digest,
@@ -2040,9 +2061,9 @@ mod tests {
                 previous: frontier_zero,
                 previous_offset: HEADER_LEN_U64,
                 previous_digest: digest_zero,
-                frame_offset: 16_384,
+                frame_offset: third_data_end,
                 ticket_end: 1,
-                durable_end: data_end,
+                durable_end: first_data_end,
                 last_commit_ts: 10,
                 prefix_digest: first_prefix_digest,
             },
@@ -2052,19 +2073,34 @@ mod tests {
             header_digest,
             SuccessorSpec {
                 previous: frontier_one,
-                previous_offset: 16_384,
+                previous_offset: third_data_end,
                 previous_digest: digest_one,
-                frame_offset: 24_576,
-                ticket_end: 2,
-                durable_end: 20_480,
-                last_commit_ts: 20,
-                prefix_digest: [0x77; 32],
+                frame_offset: third_data_end + FRAME_LEN_U64,
+                ticket_end: 3,
+                durable_end: third_data_end + FRAME_LEN_U64,
+                last_commit_ts: 30,
+                prefix_digest: all_batches_digest,
             },
         )?;
 
+        let torn_middle_start = usize::try_from(first_data_end)?;
+        let torn_middle_frame: &[u8; WAL_V7_FRAME_LEN] =
+            image[torn_middle_start..torn_middle_start + WAL_V7_FRAME_LEN].try_into()?;
+        assert!(
+            decode_frame_structural(torn_middle_frame, first_data_end, &header_digest).is_err()
+        );
+
+        let later_data_offset = third_data_end - FRAME_LEN_U64;
+        let later_data_start = usize::try_from(later_data_offset)?;
+        let later_data_frame: &[u8; WAL_V7_FRAME_LEN] =
+            image[later_data_start..later_data_start + WAL_V7_FRAME_LEN].try_into()?;
+        assert!(
+            decode_frame_structural(later_data_frame, later_data_offset, &header_digest).is_ok()
+        );
+
         let verified = discover_and_verify(&image)?;
 
-        assert_eq!(verified.verified_prefix_end, data_end);
+        assert_eq!(verified.verified_prefix_end, first_data_end);
         assert!(verified.stopped_at.is_some());
         assert!(
             verified
@@ -2076,7 +2112,8 @@ mod tests {
             !verified
                 .verified_candidates
                 .iter()
-                .any(|candidate| candidate.frontier == frontier_two)
+                .any(|candidate| candidate.frontier == frontier_two),
+            "a newer frontier cannot skip the torn B frame even though later C is valid"
         );
         assert!(verified.rejected_candidate_count > 0);
         Ok(())
@@ -2228,6 +2265,77 @@ mod tests {
                 .any(|candidate| candidate.frontier == frontier_two)
         );
         assert!(verified.rejected_candidate_count > 0);
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_a_frontier_that_skips_the_immediately_preceding_frontier() -> Result<()> {
+        let (mut image, _, _) = two_batch_image()?;
+        let frontier_offset = u64::try_from(image.len())? - FRAME_LEN_U64;
+        let frontier_start = usize::try_from(frontier_offset)?;
+        let header_digest = test_header().digest()?;
+        let generation_zero_frame = &image[WAL_V7_HEADER_LEN..WAL_V7_HEADER_LEN + WAL_V7_FRAME_LEN];
+        let decoded_zero =
+            decode_frame_structural(generation_zero_frame, HEADER_LEN_U64, &header_digest)?;
+        let frontier_zero = WalV7Frontier::decode_body(&decoded_zero.body)?;
+        let generation_zero_digest = frame_record_digest(generation_zero_frame)?;
+        let decoded_terminal = decode_frame_structural(
+            &image[frontier_start..frontier_start + WAL_V7_FRAME_LEN],
+            frontier_offset,
+            &header_digest,
+        )?;
+
+        // Make the terminal marker a locally valid generation-one sibling of
+        // F1, referencing the real F0. Following only its named ancestors would
+        // accept it while overlooking the canonical F1 retained in its prefix.
+        let sibling = WalV7Frontier {
+            generation: frontier_zero.generation + 1,
+            previous_frontier_offset: HEADER_LEN_U64,
+            previous_frontier_digest: generation_zero_digest,
+            ..WalV7Frontier::decode_body(&decoded_terminal.body)?
+        };
+        let frontier_frame = encode_frontier_successor(
+            sibling,
+            frontier_zero,
+            HEADER_LEN_U64,
+            &generation_zero_digest,
+            frontier_offset,
+            header_digest,
+        )?;
+        let (decoded_sibling, _) = decode_frontier_successor(
+            &frontier_frame,
+            frontier_offset,
+            &header_digest,
+            frontier_zero,
+            HEADER_LEN_U64,
+            &generation_zero_digest,
+        )?;
+        assert_eq!(decoded_sibling, sibling);
+        install_frame(&mut image, frontier_offset, &frontier_frame)?;
+
+        let verified = discover_and_verify(&image)?;
+
+        assert!(
+            verified
+                .verified_candidates
+                .iter()
+                .any(|candidate| candidate.frontier.ticket_end == 1),
+            "the valid F1 predecessor remains independently recoverable"
+        );
+        assert!(
+            !verified
+                .verified_candidates
+                .iter()
+                .any(|candidate| candidate.frame_offset == frontier_offset),
+            "a candidate cannot skip F1 even with a valid CRC and matching F0 digest"
+        );
+        assert!(
+            verified
+                .rejected_candidates
+                .iter()
+                .any(|candidate| candidate.frame_offset == frontier_offset),
+            "whole-prefix verification must reject the locally valid sibling"
+        );
         Ok(())
     }
 

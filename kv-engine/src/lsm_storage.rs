@@ -3233,7 +3233,10 @@ impl KvEngine {
                 status.archive_lag_bytes = status
                     .active_wal_bytes
                     .saturating_add(status.sealed_unarchived_wal_bytes);
-                status.archive_lag_commits = active.wal_batch_count().unwrap_or(0);
+                let active_batch_count = active.wal_batch_count();
+                let counted_active_segment_id =
+                    active_batch_count.and_then(|_| LsmStorageInner::pitr_segment_of(&active));
+                status.archive_lag_commits = active_batch_count.unwrap_or(0);
                 let mut oldest_unarchived = active
                     .wal_path()
                     .and_then(|path| std::fs::read(path).ok())
@@ -3290,8 +3293,13 @@ impl KvEngine {
                     if segment_id != expected_segment_id {
                         continue;
                     }
-                    status.archive_lag_commits =
-                        status.archive_lag_commits.saturating_add(entry_count);
+                    // Until successor installation, a Sealing source can still
+                    // be the active memtable. Its saved frontier or live writer
+                    // already contributed this segment's batches above.
+                    if counted_active_segment_id != Some(segment_id) {
+                        status.archive_lag_commits =
+                            status.archive_lag_commits.saturating_add(entry_count);
+                    }
                     if let Some(recorded_at) =
                         first_recorded_at.and_then(|recorded_at| recorded_at.as_system_time().ok())
                     {
@@ -5627,6 +5635,8 @@ impl KvEngine {
         crate::chaos::failpoint::fail_point!("pitr.v7_after_seal_started", |_| Err(anyhow!(
             "injected v7 failure after SealStarted"
         )));
+        #[cfg(feature = "chaos-testing")]
+        crate::chaos::failpoint::wal_crash_point("pitr.v7.after_seal_started");
         if let Err(error) = self
             .inner
             .install_v7_pitr_seal_for_sealing_obligation(&mut prepared)
@@ -11615,19 +11625,25 @@ impl LsmStorageInner {
                             )?
                         });
                         let memtable_id = recovered_v7_active_memtable_id.unwrap_or(max_id);
-                        let (memtable, wal_max_ts) = MemTable::recover_from_v7_active(
-                            memtable_id,
-                            vlog_enabled,
-                            &wal_path,
-                            recovery.installed,
-                            pitr_state
-                                .config
-                                .as_ref()
-                                .ok_or_else(|| anyhow!("PITR state is missing configuration"))?
-                                .max_segment_bytes,
-                            owner,
-                            wal_io_mode,
-                        )?;
+                        let (memtable, wal_max_ts) = if sealing_boundary.is_some() {
+                            MemTable::recover_from_v7_sealing_source(
+                                memtable_id,
+                                vlog_enabled,
+                                &wal_path,
+                                recovery.installed,
+                                owner,
+                            )?
+                        } else {
+                            MemTable::recover_from_v7_active(
+                                memtable_id,
+                                vlog_enabled,
+                                &wal_path,
+                                recovery.installed,
+                                max_segment_bytes,
+                                owner,
+                                wal_io_mode,
+                            )?
+                        };
                         max_commit_ts = max_commit_ts.max(wal_max_ts);
                         if let Some(current) = memtable.recovered_recorded_at() {
                             max_recorded_at = Some(
@@ -21013,45 +21029,99 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn v7_sealing_recovery_resumes_after_seal_started() -> anyhow::Result<()> {
-        let directory = tempdir()?;
-        let (options, source_wal) = v7_recovery_point_transition_test_database(
-            directory.path(),
-            false,
-            false,
-            false,
-            false,
-        )?;
-        let database = directory.path().join("db");
-        assert!(!source_wal.with_extension("seal").exists());
-        assert!(
-            !database.join(format!("pitr-{:020}.wal", 1)).exists(),
-            "fixture unexpectedly installed the v7 successor"
-        );
+        use crate::wal::WalIoMode;
 
-        let engine = KvEngine::open(&database, options)?;
-        assert_eq!(
-            LsmStorageInner::pitr_segment_of(engine.inner.state.load().memtable.as_ref()),
-            Some(0)
-        );
-        assert!(matches!(
-            engine.resume_pitr(directory.path().join("repository"))?,
-            crate::pitr::api::PitrResumeOutcome::Resumed
-        ));
-        assert_eq!(
-            LsmStorageInner::pitr_segment_of(engine.inner.state.load().memtable.as_ref()),
-            Some(1)
-        );
-        let retained = engine
-            .inner
-            .state
-            .load()
-            .memtable
-            .wal_v7_reservation_owner()
-            .and_then(|owner| owner.retained_resources())
-            .ok_or_else(|| anyhow::anyhow!("successor has no retained v7 resource ledger"))?;
-        assert_eq!(retained.ledger().snapshot().logical_wal_bytes, 0);
-        assert_eq!(engine.get(b"v7-key")?, Some(Bytes::from_static(b"v")));
-        engine.close_storage()?;
+        for (mode, sidecar_installed) in [
+            (WalIoMode::Leader, false),
+            (WalIoMode::Leader, true),
+            (WalIoMode::Parallel, false),
+            (WalIoMode::Parallel, true),
+        ] {
+            let directory = tempdir()?;
+            let (mut options, source_wal) = v7_recovery_point_transition_test_database(
+                directory.path(),
+                false,
+                false,
+                false,
+                sidecar_installed,
+            )?;
+            let database = directory.path().join("db");
+            let repository = directory.path().join("repository");
+            options.pitr_repository = Some(repository.clone());
+            let source_before = std::fs::read(&source_wal)?;
+            let seal_path = source_wal.with_extension("seal");
+            let successor_path = database.join("pitr-00000000000000000001.wal");
+            let seal_before = sidecar_installed
+                .then(|| std::fs::read(&seal_path))
+                .transpose()?;
+            assert_eq!(seal_path.exists(), sidecar_installed);
+            assert!(!successor_path.exists());
+
+            let engine = KvEngine::open_with_wal_io_mode(&database, options, mode)?;
+            let active = engine.inner.state.load().memtable.clone();
+            assert_eq!(LsmStorageInner::pitr_segment_of(&active), Some(0));
+            assert!(active.uses_v7_wal());
+            assert_eq!(active.wal_path(), Some(source_wal.as_path()));
+            assert_eq!(
+                active.wal_format_version(),
+                Some(crate::wal::format::WAL_FORMAT_VERSION_V7)
+            );
+            assert_eq!(active.wal_io_mode(), None);
+            assert!(!active.uses_parallel_wal());
+            assert_eq!(active.parallel_wal_is_closed(), None);
+            assert_eq!(active.has_ring(), None);
+            assert!(
+                active.wal_v7_reservation_owner().is_some(),
+                "Sealing resume must retain its resource ledger without a WAL writer"
+            );
+            assert!(engine.pitr_runtime.lock().is_none());
+            assert!(engine.pitr_segments.lock().is_none());
+            let status = engine.pitr_status(crate::pitr::api::PitrStatusOptions {
+                cursor: None,
+                page_size: crate::pitr::api::MAX_STATUS_PAGE_SIZE,
+            })?;
+            assert_eq!(
+                status.archive_lag_commits, 1,
+                "the nonempty Sealing source must be counted exactly once, with or without its sidecar"
+            );
+            assert_eq!(active.wal_batch_count(), Some(1));
+            assert!(
+                engine
+                    .put(b"blocked-during-v7-sealing-recovery", b"write")
+                    .is_err(),
+                "recovered Sealing source must stay fenced until resume finishes"
+            );
+            assert_eq!(std::fs::read(&source_wal)?, source_before);
+            assert_eq!(seal_path.exists(), sidecar_installed);
+            if let Some(expected) = seal_before {
+                assert_eq!(std::fs::read(&seal_path)?, expected);
+            }
+            assert!(!successor_path.exists());
+
+            assert!(matches!(
+                engine.resume_pitr(&repository)?,
+                crate::pitr::api::PitrResumeOutcome::Resumed
+            ));
+            let successor = engine.inner.state.load().memtable.clone();
+            assert_eq!(LsmStorageInner::pitr_segment_of(&successor), Some(1));
+            assert_eq!(
+                successor.wal_format_version(),
+                Some(crate::wal::format::WAL_FORMAT_VERSION_V7)
+            );
+            assert_eq!(successor.wal_io_mode(), Some(mode));
+            assert_eq!(successor.uses_parallel_wal(), mode == WalIoMode::Parallel);
+            assert_eq!(
+                successor.parallel_wal_is_closed(),
+                (mode == WalIoMode::Parallel).then_some(false)
+            );
+            let retained = successor
+                .wal_v7_reservation_owner()
+                .and_then(|owner| owner.retained_resources())
+                .ok_or_else(|| anyhow::anyhow!("successor has no retained v7 resource ledger"))?;
+            assert_eq!(retained.ledger().snapshot().logical_wal_bytes, 0);
+            assert_eq!(engine.get(b"v7-key")?, Some(Bytes::from_static(b"v")));
+            engine.close_storage()?;
+        }
 
         Ok(())
     }
