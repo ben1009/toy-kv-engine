@@ -1929,6 +1929,81 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn active_recovery_round_trips_frontier_shaped_value_without_discovering_it() -> Result<()> {
+        let directory = TestDirectory::new()?;
+        let path = directory.0.join("frontier-shaped-value.wal");
+        let header = test_header();
+        let header_digest = header.digest()?;
+        let generation_zero = encode_generation_zero_frontier(header_digest)?;
+        let generation_zero_frame =
+            decode_frame_structural(&generation_zero, HEADER_LEN_U64, &header_digest)?;
+        let previous = WalV7Frontier::decode_body(&generation_zero_frame.body)?;
+        let previous_digest = frame_record_digest(&generation_zero)?;
+        let marker_shaped_value = encode_frontier_successor(
+            WalV7Frontier {
+                generation: 1,
+                ticket_end: 1,
+                durable_end: 3 * FRAME_LEN_U64,
+                last_commit_ts: 10,
+                prefix_digest: [0x77; 32],
+                previous_frontier_offset: HEADER_LEN_U64,
+                previous_frontier_digest: previous_digest,
+            },
+            previous,
+            HEADER_LEN_U64,
+            &previous_digest,
+            4 * FRAME_LEN_U64,
+            header_digest,
+        )?;
+        let batch = WalBatch {
+            commit_ts: 10,
+            recorded_at: RecordedAt {
+                secs: 100,
+                nanos: 5,
+            },
+            entries: vec![WalEntry::Put {
+                key: b"frontier-shaped-value".to_vec(),
+                value: marker_shaped_value.to_vec(),
+            }],
+        };
+        let (header, anchor) = create_nonempty_image_for_batch(&path, batch.clone())?;
+
+        let mut source = File::open(&path)?;
+        let file_len = source.metadata()?.len();
+        let discovery = discover_frontier_candidates(&mut source, file_len, &header.digest()?)?;
+
+        assert_eq!(discovery.candidates.len(), 2);
+        assert_eq!(discovery.rejected_frontier_count, 0);
+        assert_eq!(
+            discovery
+                .candidates
+                .iter()
+                .map(|candidate| candidate.frame_offset)
+                .collect::<Vec<_>>(),
+            [file_len - FRAME_LEN_U64, HEADER_LEN_U64],
+            "only the physical tail FRONTIER and codec-owned generation-zero frame are discovered"
+        );
+
+        let recovered = recover_and_install_active(
+            &path,
+            WalV7RecoveryAuthority::Active {
+                predecessor: header.predecessor,
+                durable_anchors: vec![anchor],
+            },
+        )?;
+
+        assert_eq!(recovered.installed.batches, [batch]);
+        assert_eq!(
+            recovered.installed.batches[0].entries,
+            [WalEntry::Put {
+                key: b"frontier-shaped-value".to_vec(),
+                value: marker_shaped_value.to_vec(),
+            }]
+        );
+        Ok(())
+    }
+
     #[cfg(feature = "chaos-testing")]
     #[test]
     fn failpoint_active_recovery_directory_sync_failure_recovers_on_retry() -> Result<()> {
