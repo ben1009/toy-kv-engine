@@ -1617,6 +1617,11 @@ Leader FRONTIER short-write case and the existing post-DATA unwind coverage.
 The test checks the exact one-byte DATA tail and preservation of the previous
 committed batch, ticket boundary, and prefix digest after recovery.
 
+The thirty-second Stage 8 slice embeds a complete structurally valid FRONTIER
+frame in a DATA value. Discovery must report only the actual aligned
+generation-zero and tail FRONTIER frames, and Active recovery must return the
+value byte-for-byte unchanged.
+
 - Complete the correctness matrix below using the persistence model, real
   runtime injection, and process-level integration. Regress ordinary v4,
   strict v5/v6, TTL, recorded-time rollback/clamping, range deletion, OCC,
