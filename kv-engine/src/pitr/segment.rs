@@ -946,6 +946,16 @@ pub(crate) fn install_pitr_file_no_replace(
     path: impl AsRef<std::path::Path>,
     bytes: &[u8],
 ) -> Result<()> {
+    install_pitr_file_no_replace_with_crash_point(path, bytes, None)
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn install_pitr_file_no_replace_with_crash_point(
+    path: impl AsRef<std::path::Path>,
+    bytes: &[u8],
+    crash_point_after_rename_before_directory_sync: Option<&'static str>,
+) -> Result<()> {
+    let _ = crash_point_after_rename_before_directory_sync;
     let path = path.as_ref();
     let file_name = path
         .file_name()
@@ -1001,6 +1011,10 @@ pub(crate) fn install_pitr_file_no_replace(
                 return verify_existing_pitr_file(existing_file, &parent_file, bytes);
             }
             return Err(error.into());
+        }
+        #[cfg(feature = "chaos-testing")]
+        if let Some(crash_point) = crash_point_after_rename_before_directory_sync {
+            crate::chaos::failpoint::wal_crash_point(crash_point);
         }
         #[cfg(feature = "chaos-testing")]
         crate::chaos::failpoint::fail_point!("pitr.install_before_directory_sync", |_| Err(

@@ -1480,6 +1480,18 @@ preserve that fallback through seal, archive, and Latest restore. This qualifies
 this one process-level trailing-control layout; empty-image crashes and
 power-loss behavior remain open.
 
+The fifteenth Stage 8 slice adds process-restart coverage for two empty v7
+successor installation boundaries. One child stops after `SegmentSealed` has
+durably authorized the empty successor but before its WAL image is installed;
+reopen must recreate the canonical header-plus-generation-zero-FRONTIER image
+and preserve the sealed predecessor. A second child stops after that image has
+been renamed into place but before its parent directory is synced; reopen must
+verify and sync the existing image before resuming, again retaining the
+predecessor. Both reopens must finish PITR reconciliation; after the second
+recovery, a new write must succeed and survive another reopen. These
+process-only cases do not simulate power loss or qualify partial image writes
+and manifest-sync interruptions.
+
 - Complete the correctness matrix below using the persistence model, real
   runtime injection, and process-level integration. Regress ordinary v4,
   strict v5/v6, TTL, recorded-time rollback/clamping, range deletion, OCC,

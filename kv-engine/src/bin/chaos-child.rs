@@ -6,7 +6,9 @@ use wrapper::kv_engine_wrapper::chaos::control_log::ControlLogWriter;
 use wrapper::kv_engine_wrapper::chaos::scenarios::{self, ScenarioConfig};
 use wrapper::kv_engine_wrapper::chaos::stress::{self, StressScenario};
 use wrapper::kv_engine_wrapper::lsm_storage::{KvEngine, LsmStorageOptions};
-use wrapper::kv_engine_wrapper::pitr_api::{PitrStatusOptions, PitrWalIoMode};
+use wrapper::kv_engine_wrapper::pitr_api::{
+    PitrStatusOptions, PitrWalIoMode, RecoveryPointOutcome,
+};
 use wrapper::kv_engine_wrapper::wal::WalIoMode;
 
 fn main() {
@@ -233,6 +235,20 @@ fn run_v7_pitr_parallel_crash(engine: &KvEngine, args: &[String]) -> Result<(), 
             status.active_wal_io_mode,
             status.v7_migration_capacity,
         ));
+    }
+
+    if args.iter().any(|arg| arg == "--create-empty-successor") {
+        match engine.create_recovery_point() {
+            Ok(RecoveryPointOutcome::Durable(_)) => return Ok(()),
+            Ok(outcome) => {
+                return Err(format!(
+                    "empty-successor recovery point was not durable: {outcome:?}"
+                ));
+            }
+            Err(error) => {
+                return Err(format!("empty-successor recovery point failed: {error:#}"));
+            }
+        }
     }
 
     let acknowledged_write_key = get_arg(args, "--acknowledged-write-key");
