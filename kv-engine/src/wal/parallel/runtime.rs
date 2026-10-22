@@ -2230,7 +2230,7 @@ fn append_v7_frontier(
 
 fn write_v7_frontier_once(file: &File, bytes: &[u8], offset: u64) -> io::Result<()> {
     loop {
-        match file.write_at(bytes, offset) {
+        match write_v7_frontier_at(file, bytes, offset) {
             Ok(written) if written == bytes.len() => return Ok(()),
             Ok(written) => {
                 return Err(io::Error::new(
@@ -2245,6 +2245,28 @@ fn write_v7_frontier_once(file: &File, bytes: &[u8], offset: u64) -> io::Result<
             Err(error) => return Err(error),
         }
     }
+}
+
+fn write_v7_frontier_at(file: &File, bytes: &[u8], offset: u64) -> io::Result<usize> {
+    #[cfg(feature = "chaos-testing")]
+    crate::chaos::failpoint::fail_point!("parallel_wal.v7_frontier_short_write", |_| {
+        // The runtime file is O_DIRECT, which can reject a byte-sized write
+        // before the short-write path runs. Reopen the same inode through procfs
+        // without O_DIRECT so the test leaves a real partial frame behind.
+        #[cfg(target_os = "linux")]
+        {
+            let buffered_path = format!("/proc/self/fd/{}", file.as_raw_fd());
+            let buffered_file = File::options().write(true).open(buffered_path)?;
+            buffered_file.write_at(&bytes[..1], offset)
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        {
+            Ok(1)
+        }
+    });
+
+    file.write_at(bytes, offset)
 }
 
 fn complete_v7_frontier_cycle(inner: &RuntimeInner, cycle: WalV7FrontierCycle) -> Result<()> {
@@ -2608,6 +2630,33 @@ mod tests {
         Ok(Some(V7RuntimeTestWal { wal, owner, anchor }))
     }
 
+    #[cfg(feature = "chaos-testing")]
+    fn count_valid_v7_frontiers(path: &Path) -> anyhow::Result<usize> {
+        use crate::wal::v7::codec::{
+            WAL_V7_FRAME_LEN, WAL_V7_HEADER_LEN, WalV7FrameKind, WalV7Header,
+            decode_frame_structural,
+        };
+
+        let image = std::fs::read(path)?;
+        let header = WalV7Header::decode(&image[..WAL_V7_HEADER_LEN])?;
+        let header_digest = header.digest()?;
+        let mut count = 0;
+        for (index, frame) in image[WAL_V7_HEADER_LEN..]
+            .as_chunks::<WAL_V7_FRAME_LEN>()
+            .0
+            .iter()
+            .enumerate()
+        {
+            let offset = WAL_V7_HEADER_LEN as u64 + (index * WAL_V7_FRAME_LEN) as u64;
+            if decode_frame_structural(frame, offset, &header_digest)
+                .is_ok_and(|decoded| decoded.kind == WalV7FrameKind::Frontier)
+            {
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
+
     fn v7_test_batch(commit_ts: u64, value_len: usize) -> WalBatch {
         WalBatch {
             commit_ts,
@@ -2874,6 +2923,134 @@ mod tests {
         );
         assert!(wal.close().is_err());
         assert_eq!(owner.snapshot(), after_close);
+
+        Ok(())
+    }
+
+    #[cfg(feature = "chaos-testing")]
+    #[test]
+    fn failpoint_v7_parallel_failed_frontier_cycle_never_appends_again() -> anyhow::Result<()> {
+        use crate::chaos::failpoint::{self, FailScenario};
+
+        let _scenario = FailScenario::setup();
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("failed-frontier-cycle.wal");
+        let Some(V7RuntimeTestWal { wal, .. }) =
+            live_v7_test_wal(&path, super::MAX_WAL_FILE_SIZE, v7_test_resource_limits())?
+        else {
+            return Ok(());
+        };
+
+        let (durable_ticket, _) =
+            wal.put_v7_batch_with_index(&v7_test_batch(1, 10), LIVE_WAL_V5_LIMITS)?;
+        wal.submit_and_commit(durable_ticket)?;
+        let before_failure = count_valid_v7_frontiers(&path)?;
+        assert_eq!(before_failure, 2, "genesis plus the first durable marker");
+
+        failpoint::cfg("parallel_wal.fdatasync_failure", "return")
+            .expect("inject FRONTIER sync failure");
+        let (failed_ticket, _) =
+            wal.put_v7_batch_with_index(&v7_test_batch(2, 10), LIVE_WAL_V5_LIMITS)?;
+        let failed = wal.submit_and_commit(failed_ticket);
+        failpoint::cfg("parallel_wal.fdatasync_failure", "off")
+            .expect("disable FRONTIER sync failure");
+        assert!(failed.is_err());
+
+        let after_failure = count_valid_v7_frontiers(&path)?;
+        assert_eq!(
+            after_failure,
+            before_failure + 1,
+            "the failed sync may leave its complete marker in the file"
+        );
+        assert!(
+            wal.put_v7_batch_with_index(&v7_test_batch(3, 10), LIVE_WAL_V5_LIMITS)
+                .is_err(),
+            "a poisoned frontier cycle must close admission"
+        );
+        assert_eq!(
+            count_valid_v7_frontiers(&path)?,
+            after_failure,
+            "rejected writes must not append another FRONTIER"
+        );
+
+        assert!(wal.submit_and_commit(durable_ticket).is_ok());
+        assert!(wal.close().is_err());
+        assert_eq!(
+            count_valid_v7_frontiers(&path)?,
+            after_failure,
+            "retry and close after an uncertain marker sync must not append another FRONTIER"
+        );
+
+        Ok(())
+    }
+
+    #[cfg(feature = "chaos-testing")]
+    #[test]
+    fn failpoint_v7_parallel_short_frontier_write_poisons_cycle() -> anyhow::Result<()> {
+        use crate::chaos::failpoint::{self, FailScenario};
+        use crate::{
+            pitr::{ArchiveEpochId, ChainAnchor},
+            wal::v7::{install::recover_and_install_active, recovery::WalV7RecoveryAuthority},
+        };
+
+        let _scenario = FailScenario::setup();
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("short-frontier-write.wal");
+        let Some(V7RuntimeTestWal { wal, anchor, .. }) =
+            live_v7_test_wal(&path, super::MAX_WAL_FILE_SIZE, v7_test_resource_limits())?
+        else {
+            return Ok(());
+        };
+
+        let before_failure = count_valid_v7_frontiers(&path)?;
+        assert_eq!(before_failure, 1, "genesis is the only initial marker");
+
+        failpoint::cfg("parallel_wal.v7_frontier_short_write", "return")
+            .expect("inject a positive short FRONTIER write");
+        let (ticket, _) = wal.put_v7_batch_with_index(&v7_test_batch(1, 10), LIVE_WAL_V5_LIMITS)?;
+        let failed = wal.submit_and_commit(ticket);
+        failpoint::cfg("parallel_wal.v7_frontier_short_write", "off")
+            .expect("disable short FRONTIER write");
+        let error = failed.expect_err("a short FRONTIER write must fail the durability cycle");
+        assert!(
+            format!("{error:#}").contains("short v7 FRONTIER write"),
+            "unexpected failure: {error:#}"
+        );
+
+        assert_eq!(
+            count_valid_v7_frontiers(&path)?,
+            before_failure,
+            "the injected short write does not leave a complete FRONTIER"
+        );
+        assert!(
+            wal.put_v7_batch_with_index(&v7_test_batch(2, 10), LIVE_WAL_V5_LIMITS)
+                .is_err(),
+            "a short FRONTIER write must poison further admission"
+        );
+        assert_eq!(count_valid_v7_frontiers(&path)?, before_failure);
+        assert!(wal.close().is_err());
+        assert_eq!(
+            count_valid_v7_frontiers(&path)?,
+            before_failure,
+            "close after a short write must not append another FRONTIER"
+        );
+        drop(wal);
+
+        let recovered = recover_and_install_active(
+            &path,
+            WalV7RecoveryAuthority::Active {
+                predecessor: ChainAnchor::Genesis {
+                    archive_epoch_id: ArchiveEpochId(anchor.archive_epoch_id),
+                },
+                durable_anchors: vec![anchor],
+            },
+        )?;
+        assert_eq!(recovered.installed.active_boundary, anchor);
+        assert_eq!(recovered.installed.next_ticket, 0);
+        assert!(
+            recovered.installed.batches.is_empty(),
+            "recovery must discard the DATA covered only by the partial FRONTIER"
+        );
 
         Ok(())
     }

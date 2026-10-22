@@ -8,7 +8,8 @@
 
 use kv_engine::chaos::control_log::{ControlLogReader, OperationKind};
 use kv_engine::chaos::failpoint::{
-    PARALLEL_WAL_CRASH_MARKER_ENV, PARALLEL_WAL_CRASH_OCCURRENCE_ENV, PARALLEL_WAL_CRASH_POINT_ENV,
+    FailScenario, PARALLEL_WAL_CRASH_MARKER_ENV, PARALLEL_WAL_CRASH_OCCURRENCE_ENV,
+    PARALLEL_WAL_CRASH_POINT_ENV,
 };
 use kv_engine::chaos::oracle::{self, BoundedKeyUniverse, ReferenceState};
 use kv_engine::chaos::scenarios::ScenarioConfig;
@@ -1287,6 +1288,522 @@ fn pitr_v7_empty_segment_archive_restore() {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn failpoint_v7_empty_successor_directory_sync_failure_reopens() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().expect("create v7 successor-directory-sync directory");
+    let db_path = dir.path().join("db");
+    let repository = dir.path().join("repository");
+    let engine = prepare_empty_v7_parallel_pitr(&db_path, &repository);
+    let active_wal_path = find_v7_pitr_wal(&db_path);
+    let active_segment_id = pitr_segment_id(&active_wal_path);
+    let successor_path = pitr_wal_path(&db_path, active_segment_id + 1);
+
+    let failpoint = "wal_v7.active_image.before_directory_sync";
+    fail::cfg(failpoint, "return").expect("inject empty Active image directory sync failure");
+    let publication = engine.create_recovery_point();
+    fail::remove(failpoint);
+    let error = publication.expect_err("successor directory sync failure must reach the caller");
+    let error_chain = format!("{error:#}");
+    assert!(
+        error_chain.contains("injected empty Active v7 image directory sync failure"),
+        "the targeted directory-sync failure must be reported, got: {error_chain}"
+    );
+    assert!(
+        successor_path.exists(),
+        "the canonical successor must remain after rename even though directory sync failed"
+    );
+    assert_empty_v7_active_image(&successor_path);
+    assert!(
+        engine
+            .put(
+                b"rejected-after-successor-directory-sync-failure",
+                b"must-not-write"
+            )
+            .is_err(),
+        "write admission must stay closed while the runtime still owns the sealed predecessor"
+    );
+    assert!(
+        pitr_wal_install_staging_files(&db_path).is_empty(),
+        "post-rename failure must not leave the temporary image behind"
+    );
+
+    drop(engine);
+    let recovered = open_and_resume_parallel_pitr(&db_path, &repository);
+    assert_empty_v7_active_image(&successor_path);
+    assert_eq!(
+        recovered
+            .get(b"legacy-segment-value")
+            .expect("read sealed predecessor after successor-directory-sync recovery")
+            .as_deref(),
+        Some(b"restored".as_slice()),
+        "reopen must retain the sealed predecessor while verifying the installed successor"
+    );
+    assert!(
+        pitr_wal_install_staging_files(&db_path).is_empty(),
+        "reopen must not leave a temporary successor image"
+    );
+    recovered
+        .close()
+        .expect("close engine after successor-directory-sync recovery");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn failpoint_v7_empty_successor_rename_failure_reopens() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().expect("create v7 successor-rename directory");
+    let db_path = dir.path().join("db");
+    let repository = dir.path().join("repository");
+    let engine = prepare_empty_v7_parallel_pitr(&db_path, &repository);
+    let active_wal_path = find_v7_pitr_wal(&db_path);
+    let active_segment_id = pitr_segment_id(&active_wal_path);
+    let successor_path = pitr_wal_path(&db_path, active_segment_id + 1);
+
+    let failpoint = "wal_v7.active_image.before_rename";
+    fail::cfg(failpoint, "return").expect("inject empty Active image rename failure");
+    let publication = engine.create_recovery_point();
+    fail::remove(failpoint);
+    let error = publication.expect_err("successor rename failure must reach the caller");
+    let error_chain = format!("{error:#}");
+    assert!(
+        error_chain.contains("injected empty Active v7 image rename failure"),
+        "the targeted rename failure must be reported, got: {error_chain}"
+    );
+    assert!(
+        !successor_path.exists(),
+        "a failed no-replace rename must not install the successor image"
+    );
+    assert!(
+        pitr_wal_install_staging_files(&db_path).is_empty(),
+        "a failed no-replace rename must clean up its synced staging image"
+    );
+    assert!(
+        engine
+            .put(
+                b"rejected-after-successor-rename-failure",
+                b"must-not-write"
+            )
+            .is_err(),
+        "write admission must stay closed until the authorized successor is installed"
+    );
+
+    drop(engine);
+    let recovered = open_and_resume_parallel_pitr(&db_path, &repository);
+    assert_empty_v7_active_image(&successor_path);
+    assert_eq!(
+        recovered
+            .get(b"legacy-segment-value")
+            .expect("read sealed predecessor after successor-rename recovery")
+            .as_deref(),
+        Some(b"restored".as_slice()),
+        "reopen must install the authorized empty successor and preserve its predecessor"
+    );
+    assert!(
+        pitr_wal_install_staging_files(&db_path).is_empty(),
+        "reopen must not leave a temporary successor image"
+    );
+    recovered
+        .close()
+        .expect("close engine after successor-rename recovery");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn failpoint_v7_empty_successor_file_sync_failure_reopens() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().expect("create v7 successor-file-sync directory");
+    let db_path = dir.path().join("db");
+    let repository = dir.path().join("repository");
+    let engine = prepare_empty_v7_parallel_pitr(&db_path, &repository);
+    let active_wal_path = find_v7_pitr_wal(&db_path);
+    let active_segment_id = pitr_segment_id(&active_wal_path);
+    let successor_path = pitr_wal_path(&db_path, active_segment_id + 1);
+
+    let failpoint = "wal_v7.active_image.before_file_sync";
+    fail::cfg(failpoint, "return").expect("inject empty Active image file sync failure");
+    let publication = engine.create_recovery_point();
+    fail::remove(failpoint);
+    let error = publication.expect_err("successor file sync failure must reach the caller");
+    let error_chain = format!("{error:#}");
+    assert!(
+        error_chain.contains("injected empty Active v7 image file sync failure"),
+        "the targeted file sync failure must be reported, got: {error_chain}"
+    );
+    assert!(
+        !successor_path.exists(),
+        "an unsynced staging image must not install as the canonical successor"
+    );
+    assert!(
+        pitr_wal_install_staging_files(&db_path).is_empty(),
+        "a failed file sync must clean up its staging image"
+    );
+    assert!(
+        engine
+            .put(
+                b"rejected-after-successor-file-sync-failure",
+                b"must-not-write"
+            )
+            .is_err(),
+        "write admission must stay closed until the authorized successor is installed"
+    );
+
+    drop(engine);
+    let recovered = open_and_resume_parallel_pitr(&db_path, &repository);
+    assert_empty_v7_active_image(&successor_path);
+    assert_eq!(
+        recovered
+            .get(b"legacy-segment-value")
+            .expect("read sealed predecessor after successor-file-sync recovery")
+            .as_deref(),
+        Some(b"restored".as_slice()),
+        "reopen must install the authorized empty successor and preserve its predecessor"
+    );
+    assert!(
+        pitr_wal_install_staging_files(&db_path).is_empty(),
+        "reopen must not leave a temporary successor image"
+    );
+    recovered
+        .close()
+        .expect("close engine after successor-file-sync recovery");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn failpoint_v7_empty_successor_segment_sealed_sync_failure_reopens() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().expect("create v7 manifest-sync-failure directory");
+    let db_path = dir.path().join("db");
+    let repository = dir.path().join("repository");
+    let engine = prepare_empty_v7_parallel_pitr(&db_path, &repository);
+    let active_wal_path = find_v7_pitr_wal(&db_path);
+    let active_segment_id = pitr_segment_id(&active_wal_path);
+    let successor_path = pitr_wal_path(&db_path, active_segment_id + 1);
+    assert!(
+        !successor_path.exists(),
+        "the successor must not exist before the recovery point"
+    );
+
+    let failpoint = "pitr.manifest.segment_sealed_sync_failure";
+    fail::cfg(failpoint, "return").expect("inject SegmentSealed manifest sync failure");
+    let publication = engine.create_recovery_point();
+    fail::remove(failpoint);
+    let error = publication.expect_err("SegmentSealed sync failure must reach the caller");
+    let error_chain = format!("{error:#}");
+    assert!(
+        error_chain.contains("PITR manifest published but not durable"),
+        "the append must be classified as published but uncertain, got: {error_chain}"
+    );
+    assert!(
+        error_chain.contains("injected SegmentSealed manifest sync failure"),
+        "the targeted manifest sync failure must be reported, got: {error:#}"
+    );
+    assert!(
+        !successor_path.exists(),
+        "the successor image must not install before SegmentSealed is synced"
+    );
+    assert!(
+        engine
+            .put(b"rejected-after-uncertain-seal", b"must-not-write")
+            .is_err(),
+        "write admission must stay closed after uncertain SegmentSealed publication"
+    );
+
+    drop(engine);
+    let recovered = open_and_resume_parallel_pitr(&db_path, &repository);
+    assert_empty_v7_active_image(&successor_path);
+    assert_eq!(
+        recovered
+            .get(b"legacy-segment-value")
+            .expect("read sealed predecessor after manifest-sync recovery")
+            .as_deref(),
+        Some(b"restored".as_slice()),
+        "reopen must reconcile the appended SegmentSealed transition"
+    );
+    assert!(
+        pitr_wal_install_staging_files(&db_path).is_empty(),
+        "manifest-sync recovery must not leave a partial successor staging image"
+    );
+    recovered
+        .close()
+        .expect("close engine after manifest-sync recovery");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn failpoint_v7_empty_successor_segment_sealed_partial_append_reopens() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().expect("create v7 partial-manifest-append directory");
+    let db_path = dir.path().join("db");
+    let repository = dir.path().join("repository");
+    let engine = prepare_empty_v7_parallel_pitr(&db_path, &repository);
+    let active_wal_path = find_v7_pitr_wal(&db_path);
+    let active_segment_id = pitr_segment_id(&active_wal_path);
+    let successor_path = pitr_wal_path(&db_path, active_segment_id + 1);
+
+    let failpoint = "pitr.manifest.segment_sealed_partial_append_failure";
+    fail::cfg(failpoint, "return").expect("inject a partial SegmentSealed manifest append");
+    let publication = engine.create_recovery_point();
+    fail::remove(failpoint);
+    let error = publication.expect_err("partial SegmentSealed append must reach the caller");
+    let error_chain = format!("{error:#}");
+    assert!(
+        error_chain.contains("injected SegmentSealed manifest partial append failure"),
+        "the targeted partial append failure must be reported, got: {error_chain}"
+    );
+    assert!(
+        !error_chain.contains("PITR manifest published but not durable"),
+        "revalidation must prove and remove the partial append, got: {error_chain}"
+    );
+    assert!(
+        !successor_path.exists(),
+        "the successor image must not install before SegmentSealed is complete"
+    );
+    assert!(
+        engine
+            .put(b"rejected-after-partial-seal", b"must-not-write")
+            .is_err(),
+        "write admission must stay closed while the sealing transition is incomplete"
+    );
+
+    let manifest_bytes = std::fs::read(db_path.join("MANIFEST"))
+        .expect("read manifest after partial append revalidation");
+    let manifest_records = serde_json::Deserializer::from_slice(&manifest_bytes)
+        .into_iter::<serde_json::Value>()
+        .collect::<Result<Vec<_>, _>>()
+        .expect("revalidation must leave a parseable manifest stream");
+    assert!(
+        !manifest_records.is_empty(),
+        "the repaired manifest must retain its prior lifecycle records"
+    );
+
+    drop(engine);
+    let recovered = open_and_resume_parallel_pitr(&db_path, &repository);
+    assert_empty_v7_active_image(&successor_path);
+    assert_eq!(
+        recovered
+            .get(b"legacy-segment-value")
+            .expect("read predecessor after partial-append recovery")
+            .as_deref(),
+        Some(b"restored".as_slice()),
+        "reopen must finish the sealing transition from its durable intent"
+    );
+    recovered
+        .close()
+        .expect("close engine after partial-manifest-append recovery");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn failpoint_v7_empty_successor_partial_manifest_append_crash_reopens() {
+    let probe_dir = tempfile::tempdir().expect("create v7 partial-append crash probe directory");
+    let probe_options = LsmStorageOptions {
+        enable_wal: true,
+        ..LsmStorageOptions::default_for_test()
+    };
+    match KvEngine::open_with_wal_io_mode(&probe_dir, probe_options, WalIoMode::Parallel) {
+        Ok(engine) => engine.close().expect("close v7 partial-append crash probe"),
+        Err(error) => {
+            panic!("v7 Parallel partial-append crash qualification requires io_uring: {error:#}")
+        }
+    }
+
+    let dir = tempfile::tempdir().expect("create v7 partial-manifest-append crash directory");
+    let db_path = dir.path().join("db");
+    let repository = dir.path().join("repository");
+    let control_log_path = dir.path().join("chaos_control.log");
+    let engine = prepare_empty_v7_parallel_pitr(&db_path, &repository);
+    let active_wal_path = find_v7_pitr_wal(&db_path);
+    let active_segment_id = pitr_segment_id(&active_wal_path);
+    engine
+        .close()
+        .expect("close empty v7 Active setup before partial-append crash");
+
+    let crash_point = "pitr.manifest.after_segment_sealed_partial_append";
+    let marker_path = dir.path().join("partial-segment-sealed-append.marker");
+    kill_pitr_child_at_empty_successor_crash_point(
+        &db_path,
+        &repository,
+        &control_log_path,
+        &marker_path,
+        crash_point,
+    );
+    assert_eq!(
+        std::fs::read_to_string(&marker_path)
+            .expect("read partial SegmentSealed append crash marker")
+            .trim(),
+        crash_point
+    );
+
+    let successor_path = pitr_wal_path(&db_path, active_segment_id + 1);
+    assert!(
+        !successor_path.exists(),
+        "the successor must not be installed before SegmentSealed is complete"
+    );
+    let recovered = open_and_resume_parallel_pitr(&db_path, &repository);
+    assert_empty_v7_active_image(&successor_path);
+    assert_eq!(
+        recovered
+            .get(b"legacy-segment-value")
+            .expect("read predecessor after partial-manifest crash recovery")
+            .as_deref(),
+        Some(b"restored".as_slice()),
+        "recovery must discard the torn tail and finish from the durable sealing intent"
+    );
+    recovered
+        .close()
+        .expect("close engine after partial-manifest crash recovery");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn failpoint_v7_empty_successor_manifest_append_crash() {
+    let probe_dir = tempfile::tempdir().expect("create v7 manifest-crash probe directory");
+    let probe_options = LsmStorageOptions {
+        enable_wal: true,
+        ..LsmStorageOptions::default_for_test()
+    };
+    match KvEngine::open_with_wal_io_mode(&probe_dir, probe_options, WalIoMode::Parallel) {
+        Ok(engine) => engine.close().expect("close v7 manifest-crash probe"),
+        Err(error) => {
+            panic!("v7 Parallel manifest-crash qualification requires io_uring: {error:#}")
+        }
+    }
+
+    let dir = tempfile::tempdir().expect("create v7 manifest-crash directory");
+    let db_path = dir.path().join("db");
+    let repository = dir.path().join("repository");
+    let control_log_path = dir.path().join("chaos_control.log");
+    let engine = prepare_empty_v7_parallel_pitr(&db_path, &repository);
+    let active_wal_path = find_v7_pitr_wal(&db_path);
+    let active_segment_id = pitr_segment_id(&active_wal_path);
+    engine.close().expect("close empty v7 Active setup engine");
+
+    let crash_point = "pitr.manifest.after_segment_sealed_append_before_sync";
+    let marker_path = dir
+        .path()
+        .join("after-segment-sealed-manifest-append.marker");
+    kill_pitr_child_at_empty_successor_crash_point(
+        &db_path,
+        &repository,
+        &control_log_path,
+        &marker_path,
+        crash_point,
+    );
+    assert_eq!(
+        std::fs::read_to_string(&marker_path)
+            .expect("read SegmentSealed manifest-append crash marker")
+            .trim(),
+        crash_point
+    );
+    let successor_path = pitr_wal_path(&db_path, active_segment_id + 1);
+    assert!(
+        !successor_path.exists(),
+        "the successor image must not be installed before SegmentSealed is synced"
+    );
+
+    let recovered = open_and_resume_parallel_pitr(&db_path, &repository);
+    assert_empty_v7_active_image(&successor_path);
+    assert_eq!(
+        recovered
+            .get(b"legacy-segment-value")
+            .expect("read sealed predecessor after manifest-append recovery")
+            .as_deref(),
+        Some(b"restored".as_slice()),
+        "replaying the appended SegmentSealed transition must preserve the predecessor"
+    );
+    assert!(
+        pitr_wal_install_staging_files(&db_path).is_empty(),
+        "manifest recovery must not leave a partial successor staging image"
+    );
+    recovered
+        .close()
+        .expect("close engine after manifest-append recovery");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn v7_manifest_authorized_empty_successor_corruption_fails_open() {
+    let dir = tempfile::tempdir().expect("create v7 corrupted-successor directory");
+    let db_path = dir.path().join("db");
+    let repository = dir.path().join("repository");
+    let engine = prepare_empty_v7_parallel_pitr(&db_path, &repository);
+    let predecessor_wal_path = find_v7_pitr_wal(&db_path);
+    let successor_path = pitr_wal_path(&db_path, pitr_segment_id(&predecessor_wal_path) + 1);
+
+    assert!(matches!(
+        engine.create_recovery_point(),
+        Ok(RecoveryPointOutcome::Durable(_))
+    ));
+    assert_empty_v7_active_image(&successor_path);
+    engine
+        .close()
+        .expect("close before corrupting Active image");
+
+    let mut corrupted_image =
+        std::fs::read(&successor_path).expect("read manifest-authorized Active image");
+    corrupted_image[4096] ^= 0xff;
+    std::fs::write(&successor_path, &corrupted_image).expect("corrupt generation-zero FRONTIER");
+
+    let manifest_names = ["MANIFEST", "ENGINE_MANIFEST"];
+    let manifest_images = manifest_names.map(|name| {
+        let path = db_path.join(name);
+        let image = path
+            .try_exists()
+            .expect("check manifest snapshot presence")
+            .then(|| std::fs::read(&path).expect("read manifest snapshot"));
+        (path, image)
+    });
+    assert!(
+        manifest_images[0].1.is_some(),
+        "MANIFEST must hold PITR authority"
+    );
+
+    let open_result = KvEngine::open_with_wal_io_mode(
+        &db_path,
+        LsmStorageOptions {
+            enable_wal: true,
+            pitr_repository: Some(repository),
+            ..LsmStorageOptions::default_for_test()
+        },
+        WalIoMode::Parallel,
+    );
+    let error = match open_result {
+        Err(error) => error,
+        Ok(engine) => {
+            drop(engine);
+            panic!("reopen accepted corruption in the manifest-authorized empty Active v7 image");
+        }
+    };
+    let error_chain = format!("{error:#}").to_lowercase();
+    assert!(
+        error_chain.contains("invalid v7 wal frame magic"),
+        "open must reject the damaged generation-zero FRONTIER, got: {error:#}"
+    );
+    assert_eq!(
+        std::fs::read(&successor_path).expect("reread damaged Active image"),
+        corrupted_image,
+        "failed recovery must not normalize, replace, or truncate the damaged authorized image"
+    );
+    for (path, expected_image) in manifest_images {
+        let actual_image = path
+            .try_exists()
+            .expect("check manifest snapshot after failed recovery")
+            .then(|| std::fs::read(&path).expect("reread manifest snapshot"));
+        assert_eq!(
+            actual_image,
+            expected_image,
+            "failed recovery must not change authoritative manifest file {}",
+            path.display()
+        );
+    }
+    assert!(
+        pitr_wal_install_staging_files(&db_path).is_empty(),
+        "failed recovery must not leave a replacement staging image"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn failpoint_v7_empty_successor_install_crash_boundaries() {
     let probe_dir = tempfile::tempdir().expect("create v7 empty-successor probe directory");
     let probe_options = LsmStorageOptions {
@@ -1344,6 +1861,117 @@ fn failpoint_v7_empty_successor_install_crash_boundaries() {
         .close()
         .expect("close engine after pre-install recovery");
 
+    let after_header_write_point =
+        "wal_v7.active_image.after_temp_header_write_before_frontier_write";
+    let after_header_write_marker = dir.path().join("after-empty-image-header-write.marker");
+    kill_pitr_child_at_empty_successor_crash_point(
+        &db_path,
+        &repository,
+        &control_log_path,
+        &after_header_write_marker,
+        after_header_write_point,
+    );
+    assert_eq!(
+        std::fs::read_to_string(&after_header_write_marker)
+            .expect("read staged-image header crash marker")
+            .trim(),
+        after_header_write_point
+    );
+    let second_successor_path = pitr_wal_path(&db_path, initial_active_segment_id + 2);
+    assert!(
+        !second_successor_path.exists(),
+        "a header-only staging image must not appear at the canonical path"
+    );
+    let staging_images = pitr_wal_install_staging_files(&db_path);
+    assert_eq!(
+        staging_images.len(),
+        1,
+        "the crash after staging-image header write must leave exactly one install temp file"
+    );
+    let header_only_image =
+        std::fs::read(&staging_images[0]).expect("read header-only staging image");
+    assert_eq!(
+        header_only_image.len(),
+        4096,
+        "the staging file must contain only the written header"
+    );
+    assert_eq!(&header_only_image[..4], b"WAL2");
+    assert_eq!(
+        u16::from_be_bytes([header_only_image[4], header_only_image[5]]),
+        7
+    );
+
+    let recovered_after_header_write_crash = open_and_resume_parallel_pitr(&db_path, &repository);
+    assert_empty_v7_active_image(&second_successor_path);
+    let recreated_image =
+        std::fs::read(&second_successor_path).expect("read recreated empty v7 successor");
+    assert_eq!(
+        header_only_image,
+        recreated_image[..4096],
+        "the partial staging image must contain the exact canonical WAL header"
+    );
+    assert!(
+        pitr_wal_install_staging_files(&db_path).is_empty(),
+        "startup must remove the header-only staging image before recreating the successor"
+    );
+    assert_eq!(
+        recovered_after_header_write_crash
+            .get(b"legacy-segment-value")
+            .expect("read predecessor value after header-only staging recovery")
+            .as_deref(),
+        Some(b"restored".as_slice()),
+        "recreating the successor after a partial-image crash must preserve its sealed predecessor"
+    );
+    recovered_after_header_write_crash
+        .close()
+        .expect("close engine after header-only staging recovery");
+
+    let after_temp_write_point = "wal_v7.active_image.after_temp_write_before_sync";
+    let after_temp_write_marker = dir.path().join("after-empty-image-temp-write.marker");
+    kill_pitr_child_at_empty_successor_crash_point(
+        &db_path,
+        &repository,
+        &control_log_path,
+        &after_temp_write_marker,
+        after_temp_write_point,
+    );
+    assert_eq!(
+        std::fs::read_to_string(&after_temp_write_marker)
+            .expect("read staged-image write crash marker")
+            .trim(),
+        after_temp_write_point
+    );
+    let third_successor_path = pitr_wal_path(&db_path, initial_active_segment_id + 3);
+    assert!(
+        !third_successor_path.exists(),
+        "a written staging image must not appear at the canonical path before rename"
+    );
+    let staging_images = pitr_wal_install_staging_files(&db_path);
+    assert_eq!(
+        staging_images.len(),
+        1,
+        "the crash after staging-image write must leave exactly one install temp file"
+    );
+    assert_empty_v7_active_image(&staging_images[0]);
+
+    let recovered_after_temp_write_crash = open_and_resume_parallel_pitr(&db_path, &repository);
+    assert_empty_v7_active_image(&third_successor_path);
+    assert!(
+        pitr_wal_install_staging_files(&db_path).is_empty(),
+        "startup must remove the stranded staging image before recreating the successor"
+    );
+    assert_eq!(
+        recovered_after_temp_write_crash
+            .get(b"legacy-segment-value")
+            .expect("read predecessor value after staged-image recovery")
+            .as_deref(),
+        Some(b"restored".as_slice()),
+        "recreating the successor after a staged-image crash must preserve its sealed predecessor"
+    );
+    recovered_after_temp_write_crash
+        .close()
+        .expect("close engine after staged-image recovery");
+
     let after_temp_sync_point = "wal_v7.active_image.after_temp_sync_before_rename";
     let after_temp_sync_marker = dir.path().join("after-empty-image-temp-sync.marker");
     kill_pitr_child_at_empty_successor_crash_point(
@@ -1359,9 +1987,9 @@ fn failpoint_v7_empty_successor_install_crash_boundaries() {
             .trim(),
         after_temp_sync_point
     );
-    let second_successor_path = pitr_wal_path(&db_path, initial_active_segment_id + 2);
+    let fourth_successor_path = pitr_wal_path(&db_path, initial_active_segment_id + 4);
     assert!(
-        !second_successor_path.exists(),
+        !fourth_successor_path.exists(),
         "a synced staging image must not appear at the canonical path before rename"
     );
     assert_eq!(
@@ -1371,7 +1999,7 @@ fn failpoint_v7_empty_successor_install_crash_boundaries() {
     );
 
     let recovered_after_temp_sync_crash = open_and_resume_parallel_pitr(&db_path, &repository);
-    assert_empty_v7_active_image(&second_successor_path);
+    assert_empty_v7_active_image(&fourth_successor_path);
     assert!(
         pitr_wal_install_staging_files(&db_path).is_empty(),
         "startup must remove the stranded staging image before recreating the successor"
@@ -1379,14 +2007,14 @@ fn failpoint_v7_empty_successor_install_crash_boundaries() {
     assert_eq!(
         recovered_after_temp_sync_crash
             .get(b"legacy-segment-value")
-            .expect("read predecessor value after staged-image recovery")
+            .expect("read predecessor value after staged-image sync recovery")
             .as_deref(),
         Some(b"restored".as_slice()),
-        "recreating the successor after a staged-image crash must preserve its sealed predecessor"
+        "recreating the successor after a synced-image crash must preserve its sealed predecessor"
     );
     recovered_after_temp_sync_crash
         .close()
-        .expect("close engine after staged-image recovery");
+        .expect("close engine after staged-image sync recovery");
 
     let after_rename_point = "wal_v7.active_image.after_rename_before_directory_sync";
     let after_rename_marker = dir.path().join("after-empty-image-rename.marker");
@@ -1403,12 +2031,12 @@ fn failpoint_v7_empty_successor_install_crash_boundaries() {
             .trim(),
         after_rename_point
     );
-    let third_successor_path = pitr_wal_path(&db_path, initial_active_segment_id + 3);
-    assert_empty_v7_active_image(&third_successor_path);
+    let fifth_successor_path = pitr_wal_path(&db_path, initial_active_segment_id + 5);
+    assert_empty_v7_active_image(&fifth_successor_path);
 
     let recovered_after_rename_crash = open_and_resume_parallel_pitr(&db_path, &repository);
     let active_wal_path = find_v7_pitr_wal(&db_path);
-    assert_eq!(active_wal_path, third_successor_path);
+    assert_eq!(active_wal_path, fifth_successor_path);
     assert_empty_v7_active_image(&active_wal_path);
     assert_eq!(
         recovered_after_rename_crash

@@ -1359,6 +1359,52 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "chaos-testing")]
+    #[test]
+    fn failpoint_leader_frontier_sync_failure_poison_prevents_further_writes() -> Result<()> {
+        use crate::chaos::failpoint::{self, FailScenario};
+
+        let scenario = FailScenario::setup();
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("active.wal");
+        let installed = install_empty(&path)?;
+        let mut writer = open_writer(&path, &installed, MAX_WAL_FILE_SIZE)?;
+        let previous = writer.allocator.last_frontier();
+
+        failpoint::cfg("wal.v7.leader.fdatasync", "return")
+            .expect("arm v7 Leader FRONTIER sync failure");
+        let error = writer
+            .append_batch(&batch(10, 100, 4), LIVE_WAL_V5_LIMITS)
+            .expect_err("injected fdatasync failure must reject the commit");
+        failpoint::cfg("wal.v7.leader.fdatasync", "off")
+            .expect("disable v7 Leader FRONTIER sync failure");
+        scenario.teardown();
+
+        assert!(format!("{error:#}").contains("injected v7 WAL sync failure"));
+        assert_eq!(writer.allocator.last_frontier(), previous);
+        assert!(
+            writer.runtime_seed().is_err(),
+            "uncertain writer is poisoned"
+        );
+        let uncertain_image = fs::read(&path)?;
+        assert!(
+            uncertain_image.len() > installed.image_len as usize,
+            "DATA and FRONTIER bytes precede the injected sync error"
+        );
+        assert!(
+            writer
+                .append_batch(&batch(20, 101, 4), LIVE_WAL_V5_LIMITS)
+                .is_err()
+        );
+        assert_eq!(
+            fs::read(&path)?,
+            uncertain_image,
+            "a poisoned writer must not append another FRONTIER"
+        );
+
+        Ok(())
+    }
+
     #[test]
     fn leader_rejects_seed_header_digest_mismatch_without_mutating_image() -> Result<()> {
         let directory = tempfile::tempdir()?;
