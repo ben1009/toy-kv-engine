@@ -1344,6 +1344,50 @@ fn failpoint_v7_empty_successor_install_crash_boundaries() {
         .close()
         .expect("close engine after pre-install recovery");
 
+    let after_temp_sync_point = "wal_v7.active_image.after_temp_sync_before_rename";
+    let after_temp_sync_marker = dir.path().join("after-empty-image-temp-sync.marker");
+    kill_pitr_child_at_empty_successor_crash_point(
+        &db_path,
+        &repository,
+        &control_log_path,
+        &after_temp_sync_marker,
+        after_temp_sync_point,
+    );
+    assert_eq!(
+        std::fs::read_to_string(&after_temp_sync_marker)
+            .expect("read staged-image sync crash marker")
+            .trim(),
+        after_temp_sync_point
+    );
+    let second_successor_path = pitr_wal_path(&db_path, initial_active_segment_id + 2);
+    assert!(
+        !second_successor_path.exists(),
+        "a synced staging image must not appear at the canonical path before rename"
+    );
+    assert_eq!(
+        pitr_wal_install_staging_files(&db_path).len(),
+        1,
+        "the crash after staging-image sync must leave exactly one install temp file"
+    );
+
+    let recovered_after_temp_sync_crash = open_and_resume_parallel_pitr(&db_path, &repository);
+    assert_empty_v7_active_image(&second_successor_path);
+    assert!(
+        pitr_wal_install_staging_files(&db_path).is_empty(),
+        "startup must remove the stranded staging image before recreating the successor"
+    );
+    assert_eq!(
+        recovered_after_temp_sync_crash
+            .get(b"legacy-segment-value")
+            .expect("read predecessor value after staged-image recovery")
+            .as_deref(),
+        Some(b"restored".as_slice()),
+        "recreating the successor after a staged-image crash must preserve its sealed predecessor"
+    );
+    recovered_after_temp_sync_crash
+        .close()
+        .expect("close engine after staged-image recovery");
+
     let after_rename_point = "wal_v7.active_image.after_rename_before_directory_sync";
     let after_rename_marker = dir.path().join("after-empty-image-rename.marker");
     kill_pitr_child_at_empty_successor_crash_point(
@@ -1359,12 +1403,12 @@ fn failpoint_v7_empty_successor_install_crash_boundaries() {
             .trim(),
         after_rename_point
     );
-    let second_successor_path = pitr_wal_path(&db_path, initial_active_segment_id + 2);
-    assert_empty_v7_active_image(&second_successor_path);
+    let third_successor_path = pitr_wal_path(&db_path, initial_active_segment_id + 3);
+    assert_empty_v7_active_image(&third_successor_path);
 
     let recovered_after_rename_crash = open_and_resume_parallel_pitr(&db_path, &repository);
     let active_wal_path = find_v7_pitr_wal(&db_path);
-    assert_eq!(active_wal_path, second_successor_path);
+    assert_eq!(active_wal_path, third_successor_path);
     assert_empty_v7_active_image(&active_wal_path);
     assert_eq!(
         recovered_after_rename_crash
@@ -1586,6 +1630,20 @@ fn open_and_resume_parallel_pitr(
 #[cfg(target_os = "linux")]
 fn pitr_wal_path(db_path: &std::path::Path, segment_id: u64) -> PathBuf {
     db_path.join(format!("pitr-{segment_id:020}.wal"))
+}
+
+#[cfg(target_os = "linux")]
+fn pitr_wal_install_staging_files(db_path: &std::path::Path) -> Vec<PathBuf> {
+    std::fs::read_dir(db_path)
+        .expect("list database files")
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with(".pitr-") && name.contains(".wal.tmp-"))
+        })
+        .collect()
 }
 
 #[cfg(target_os = "linux")]

@@ -301,6 +301,7 @@ pub(crate) fn create_empty_active_image(
     crate::pitr::segment::install_pitr_file_no_replace_with_crash_point(
         path,
         &image,
+        Some("wal_v7.active_image.after_temp_sync_before_rename"),
         Some("wal_v7.active_image.after_rename_before_directory_sync"),
     )?;
 
