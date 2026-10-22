@@ -722,6 +722,99 @@ fn failpoint_v7_parallel_pitr_crash_recovery_install_rename_boundaries() {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn failpoint_v7_leader_pitr_crash_after_sync_before_publish_recovers() {
+    let dir = tempfile::tempdir().expect("create v7 Leader crash directory");
+    let db_path = dir.path().join("db");
+    let repository = dir.path().join("repository");
+    let control_log_path = dir.path().join("chaos_control.log");
+
+    let engine = KvEngine::open_with_wal_io_mode(
+        &db_path,
+        LsmStorageOptions {
+            enable_wal: true,
+            ..LsmStorageOptions::default_for_test()
+        },
+        WalIoMode::Leader,
+    )
+    .expect("open Leader database for PITR setup");
+    assert!(matches!(
+        engine.create_backup(BackupOptions {
+            repository: repository.clone(),
+            use_hard_links: false,
+        }),
+        Ok(CreateBackupOutcome::Committed(_))
+    ));
+    assert!(matches!(
+        engine.enable_pitr(PitrOptions {
+            repository: repository.clone(),
+            config: PersistedPitrConfig {
+                archive_interval: Duration::from_secs(60),
+                max_segment_bytes: 1 << 20,
+                max_unarchived_bytes: 2 << 20,
+                max_source_spool_bytes: 8 << 20,
+            },
+            runtime: PitrRuntimeOptions::default(),
+        }),
+        Ok(EnablePitrOutcome::Enabled { .. })
+    ));
+    engine
+        .put(b"leader-acknowledged-before-crash", b"stable")
+        .expect("persist acknowledged Leader baseline");
+    engine.close().expect("close Leader PITR setup engine");
+
+    let crash_point = "wal_v7.leader.after_fdatasync_before_publish";
+    let marker_path = dir.path().join("leader-crash.marker");
+    kill_pitr_child_at_crash_point_with_mode(
+        &db_path,
+        &repository,
+        &control_log_path,
+        &marker_path,
+        crash_point,
+        WalIoMode::Leader,
+        PitrChildCrashOperation::Write {
+            acknowledged_write: None,
+            write: Some(("leader-synced-before-publish", "candidate")),
+        },
+    );
+
+    let recovered = KvEngine::open_with_wal_io_mode(
+        &db_path,
+        LsmStorageOptions {
+            enable_wal: true,
+            pitr_repository: Some(repository),
+            ..LsmStorageOptions::default_for_test()
+        },
+        WalIoMode::Leader,
+    )
+    .expect("reopen after successful Leader fdatasync before publication");
+    let status = recovered
+        .pitr_status(PitrStatusOptions {
+            cursor: None,
+            page_size: NonZeroUsize::new(1).expect("nonzero status page size"),
+        })
+        .expect("read Active Leader status after recovery");
+    assert_eq!(status.active_wal_format_version, Some(7));
+    assert_eq!(status.active_wal_io_mode, Some(PitrWalIoMode::Leader));
+    assert_eq!(
+        recovered
+            .get(b"leader-acknowledged-before-crash")
+            .expect("read acknowledged Leader baseline after recovery")
+            .as_deref(),
+        Some(b"stable".as_slice())
+    );
+    assert_eq!(
+        recovered
+            .get(b"leader-synced-before-publish")
+            .expect("read synced Leader candidate after recovery")
+            .as_deref(),
+        Some(b"candidate".as_slice()),
+        "a completed WAL fdatasync must survive a crash before publication"
+    );
+    recovered.close().expect("close recovered Leader engine");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn failpoint_v7_parallel_pitr_fallback_archive_restore() {
     let probe_dir = tempfile::tempdir().expect("create v7 Parallel fallback probe directory");
     let probe_options = LsmStorageOptions {
@@ -2357,6 +2450,27 @@ fn kill_pitr_child_at_crash_point_with_operation(
     crash_point: &str,
     operation: PitrChildCrashOperation<'_>,
 ) {
+    kill_pitr_child_at_crash_point_with_mode(
+        db_path,
+        repository,
+        control_log_path,
+        marker_path,
+        crash_point,
+        WalIoMode::Parallel,
+        operation,
+    );
+}
+
+#[cfg(target_os = "linux")]
+fn kill_pitr_child_at_crash_point_with_mode(
+    db_path: &std::path::Path,
+    repository: &std::path::Path,
+    control_log_path: &std::path::Path,
+    marker_path: &std::path::Path,
+    crash_point: &str,
+    wal_io_mode: WalIoMode,
+    operation: PitrChildCrashOperation<'_>,
+) {
     let crash_occurrence = match operation {
         PitrChildCrashOperation::Write {
             acknowledged_write: Some(_),
@@ -2368,11 +2482,15 @@ fn kill_pitr_child_at_crash_point_with_operation(
             ..
         } => "1",
     };
+    let scenario = match wal_io_mode {
+        WalIoMode::Leader => "pitr-v7-leader-crash",
+        WalIoMode::Parallel => "pitr-v7-parallel-crash",
+    };
     let mut child = Command::new(chaos_child_path());
     child
         .arg("--child")
         .arg("--scenario")
-        .arg("pitr-v7-parallel-crash")
+        .arg(scenario)
         .arg("--seed")
         .arg("42")
         .arg("--db-path")
@@ -2381,12 +2499,14 @@ fn kill_pitr_child_at_crash_point_with_operation(
         .arg(repository)
         .arg("--control-log-path")
         .arg(control_log_path)
-        .arg("--parallel-wal")
         .arg("--crash-point")
         .arg(crash_point)
         .env(PARALLEL_WAL_CRASH_POINT_ENV, crash_point)
         .env(PARALLEL_WAL_CRASH_OCCURRENCE_ENV, crash_occurrence)
         .env(PARALLEL_WAL_CRASH_MARKER_ENV, marker_path);
+    if wal_io_mode == WalIoMode::Parallel {
+        child.arg("--parallel-wal");
+    }
     let (acknowledged_write, write) = match operation {
         PitrChildCrashOperation::CreateEmptySuccessor => {
             child.arg("--create-empty-successor");

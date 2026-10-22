@@ -410,7 +410,7 @@ impl WalV7LeaderWriter {
                 "v7 Leader physical hash cursor does not match its DATA allocation"
             );
 
-            write_aligned_once(
+            write_data_once(
                 &self.write_file,
                 data_buffer.initialized_slice(0, encoded_len),
                 allocation.frame_range().start,
@@ -418,13 +418,17 @@ impl WalV7LeaderWriter {
             .context("write v7 Leader DATA frames")?;
             #[cfg(feature = "chaos-testing")]
             crate::chaos::failpoint::fail_point!("wal.v7.leader.after_data_write");
-            write_aligned_once(
+            write_frontier_once(
                 &self.write_file,
                 frontier_buffer.initialized_slice(0, WAL_V7_FRAME_LEN),
                 reservation.frame_offset(),
             )
             .context("write v7 Leader FRONTIER")?;
             fdatasync_once(&self.sync_file).context("fdatasync v7 Leader WAL")?;
+            #[cfg(feature = "chaos-testing")]
+            crate::chaos::failpoint::wal_crash_point(
+                "wal_v7.leader.after_fdatasync_before_publish",
+            );
 
             let frontier_cursor = WalV7FrontierCursor {
                 frontier,
@@ -485,7 +489,20 @@ fn validate_positional_write_handle(file: &File) -> io::Result<()> {
     Ok(())
 }
 
-fn write_aligned_once(file: &File, bytes: &[u8], offset: u64) -> io::Result<()> {
+fn write_data_once(file: &File, bytes: &[u8], offset: u64) -> io::Result<()> {
+    write_aligned_once_with(file, bytes, offset, write_data_at)
+}
+
+fn write_frontier_once(file: &File, bytes: &[u8], offset: u64) -> io::Result<()> {
+    write_aligned_once_with(file, bytes, offset, write_frontier_at)
+}
+
+fn write_aligned_once_with(
+    file: &File,
+    bytes: &[u8],
+    offset: u64,
+    mut write_at: impl FnMut(&File, &[u8], u64) -> io::Result<usize>,
+) -> io::Result<()> {
     if bytes.is_empty()
         || !bytes.len().is_multiple_of(WAL_V7_FRAME_LEN)
         || !offset.is_multiple_of(WAL_V7_FRAME_LEN as u64)
@@ -497,7 +514,7 @@ fn write_aligned_once(file: &File, bytes: &[u8], offset: u64) -> io::Result<()> 
     }
 
     loop {
-        match file.write_at(bytes, offset) {
+        match write_at(file, bytes, offset) {
             Ok(written) if written == bytes.len() => return Ok(()),
             Ok(written) => {
                 return Err(io::Error::new(
@@ -511,6 +528,43 @@ fn write_aligned_once(file: &File, bytes: &[u8], offset: u64) -> io::Result<()> 
             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
             Err(error) => return Err(error),
         }
+    }
+}
+
+fn write_data_at(file: &File, bytes: &[u8], offset: u64) -> io::Result<usize> {
+    #[cfg(feature = "chaos-testing")]
+    crate::chaos::failpoint::fail_point!("wal.v7.leader.data_short_write", |_| {
+        write_one_byte_prefix(file, bytes, offset)
+    });
+
+    file.write_at(bytes, offset)
+}
+
+fn write_frontier_at(file: &File, bytes: &[u8], offset: u64) -> io::Result<usize> {
+    #[cfg(feature = "chaos-testing")]
+    crate::chaos::failpoint::fail_point!("wal.v7.leader.frontier_short_write", |_| {
+        write_one_byte_prefix(file, bytes, offset)
+    });
+
+    file.write_at(bytes, offset)
+}
+
+#[cfg(feature = "chaos-testing")]
+fn write_one_byte_prefix(file: &File, bytes: &[u8], offset: u64) -> io::Result<usize> {
+    // The Leader write handle uses O_DIRECT, which may reject a one-byte write
+    // before exercising the short-write path. Reopen the same inode through
+    // procfs without O_DIRECT so the injected fault leaves a real partial frame.
+    #[cfg(target_os = "linux")]
+    {
+        let buffered_path = format!("/proc/self/fd/{}", file.as_raw_fd());
+        let buffered_file = File::options().write(true).open(buffered_path)?;
+        buffered_file.write_at(&bytes[..1], offset)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (file, bytes, offset);
+        Ok(1)
     }
 }
 
@@ -1402,6 +1456,165 @@ mod tests {
             "a poisoned writer must not append another FRONTIER"
         );
 
+        Ok(())
+    }
+
+    #[cfg(all(feature = "chaos-testing", target_os = "linux"))]
+    #[test]
+    fn failpoint_leader_short_frontier_write_poisons_and_recovers_prior_anchor() -> Result<()> {
+        use crate::chaos::failpoint::{self, FailScenario};
+
+        let _scenario = FailScenario::setup();
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("short-frontier-write.wal");
+        let installed = install_empty(&path)?;
+        let mut writer = open_writer(&path, &installed, MAX_WAL_FILE_SIZE)?;
+        let baseline = batch(10, 100, 4);
+        writer.append_batch(&baseline, LIVE_WAL_V5_LIMITS)?;
+        let previous = writer.allocator.last_frontier();
+        let before_failure = fs::read(&path)?;
+        let data_offset = before_failure.len();
+        let frontier_offset = data_offset + WAL_V7_FRAME_LEN;
+
+        failpoint::cfg("wal.v7.leader.frontier_short_write", "return")
+            .expect("inject a positive short FRONTIER write");
+        let result = writer.append_batch(&batch(20, 101, 4), LIVE_WAL_V5_LIMITS);
+        failpoint::cfg("wal.v7.leader.frontier_short_write", "off")
+            .expect("disable short FRONTIER write");
+        let error = result.expect_err("a short FRONTIER write must fail the durability cycle");
+
+        assert!(
+            format!("{error:#}").contains("short v7 positional write"),
+            "unexpected failure: {error:#}"
+        );
+        assert_eq!(writer.allocator.last_frontier(), previous);
+        assert!(
+            writer.runtime_seed().is_err(),
+            "uncertain writer is poisoned"
+        );
+        let uncertain_image = fs::read(&path)?;
+        assert_eq!(
+            uncertain_image.len(),
+            frontier_offset + 1,
+            "one complete DATA frame and exactly one FRONTIER byte were appended"
+        );
+        assert_eq!(&uncertain_image[..data_offset], before_failure.as_slice());
+        assert_eq!(
+            decode_frame_structural(
+                &uncertain_image[data_offset..frontier_offset],
+                u64::try_from(data_offset)?,
+                &writer.header_digest,
+            )?
+            .kind,
+            WalV7FrameKind::Data
+        );
+        assert_eq!(
+            &uncertain_image[frontier_offset..],
+            b"T",
+            "the partial FRONTIER contains the first byte of its frame magic"
+        );
+        assert!(
+            writer
+                .append_batch(&batch(30, 102, 4), LIVE_WAL_V5_LIMITS)
+                .is_err(),
+            "a poisoned writer must reject later appends"
+        );
+        assert_eq!(fs::read(&path)?, uncertain_image);
+        drop(writer);
+
+        let recovered = recover(&path, installed.active_boundary)?;
+        assert_eq!(recovered.next_ticket, previous.frontier.ticket_end);
+        assert_eq!(
+            recovered.active_boundary.ticket_end,
+            previous.frontier.ticket_end
+        );
+        assert_eq!(
+            recovered.active_boundary.durable_end,
+            previous.frontier.durable_end
+        );
+        assert_eq!(
+            recovered.active_boundary.last_commit_ts,
+            previous.frontier.last_commit_ts
+        );
+        assert_eq!(
+            recovered.active_boundary.prefix_digest,
+            previous.frontier.prefix_digest
+        );
+        assert_eq!(recovered.batches, [baseline]);
+        Ok(())
+    }
+
+    #[cfg(all(feature = "chaos-testing", target_os = "linux"))]
+    #[test]
+    fn failpoint_leader_short_data_write_poisons_and_recovers_prior_anchor() -> Result<()> {
+        use crate::chaos::failpoint::{self, FailScenario};
+
+        let _scenario = FailScenario::setup();
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("short-data-write.wal");
+        let installed = install_empty(&path)?;
+        let mut writer = open_writer(&path, &installed, MAX_WAL_FILE_SIZE)?;
+        let baseline = batch(10, 100, 4);
+        writer.append_batch(&baseline, LIVE_WAL_V5_LIMITS)?;
+        let previous = writer.allocator.last_frontier();
+        let before_failure = fs::read(&path)?;
+        let data_offset = before_failure.len();
+
+        failpoint::cfg("wal.v7.leader.data_short_write", "return")
+            .expect("inject a positive short DATA write");
+        let result = writer.append_batch(&batch(20, 101, 4), LIVE_WAL_V5_LIMITS);
+        failpoint::cfg("wal.v7.leader.data_short_write", "off").expect("disable short DATA write");
+        let error = result.expect_err("a short DATA write must fail the durability cycle");
+
+        assert!(
+            format!("{error:#}").contains("short v7 positional write"),
+            "unexpected failure: {error:#}"
+        );
+        assert_eq!(writer.allocator.last_frontier(), previous);
+        assert!(
+            writer.runtime_seed().is_err(),
+            "uncertain writer is poisoned"
+        );
+        let uncertain_image = fs::read(&path)?;
+        assert_eq!(
+            uncertain_image.len(),
+            data_offset + 1,
+            "exactly one DATA byte was appended without another FRONTIER"
+        );
+        assert_eq!(&uncertain_image[..data_offset], before_failure.as_slice());
+        assert_eq!(
+            &uncertain_image[data_offset..],
+            b"T",
+            "the partial DATA frame contains the first byte of its frame magic"
+        );
+        assert!(
+            writer
+                .append_batch(&batch(30, 102, 4), LIVE_WAL_V5_LIMITS)
+                .is_err(),
+            "a poisoned writer must reject later appends"
+        );
+        assert_eq!(fs::read(&path)?, uncertain_image);
+        drop(writer);
+
+        let recovered = recover(&path, installed.active_boundary)?;
+        assert_eq!(recovered.next_ticket, previous.frontier.ticket_end);
+        assert_eq!(
+            recovered.active_boundary.ticket_end,
+            previous.frontier.ticket_end
+        );
+        assert_eq!(
+            recovered.active_boundary.durable_end,
+            previous.frontier.durable_end
+        );
+        assert_eq!(
+            recovered.active_boundary.last_commit_ts,
+            previous.frontier.last_commit_ts
+        );
+        assert_eq!(
+            recovered.active_boundary.prefix_digest,
+            previous.frontier.prefix_digest
+        );
+        assert_eq!(recovered.batches, [baseline]);
         Ok(())
     }
 
