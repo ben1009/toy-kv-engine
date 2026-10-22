@@ -615,11 +615,45 @@ overhead and these timings are diagnostic only.
 
 ## PITR and pre-PITR controls
 
-The PITR-on leader control used 20,000 single puts, four writers, 1 KiB
+The PITR-on v6 Leader control used 20,000 single puts, four writers, 1 KiB
 values, a 1 GiB SST target, and latency sampling every 100 operations. It
 completed on both filesystems: tmpfs measured 164,470 ops/s with p50/p99
 `0.0194/0.2731 ms`; ext4 measured 3,450 ops/s with p50/p99
-`1.1292/2.6707 ms`. Candidate mode remains rejected with `--pitr`.
+`1.1292/2.6707 ms`. At the time of that run, candidate mode was rejected with
+`--pitr`; these results are a v6 historical control, not a v7 comparison.
+
+The current `write-perf` harness supports the v6/v7 comparison controls below.
+PITR defaults to v7 Parallel; v6 defaults to Leader and rejects Parallel. V7
+accepts either scheduler so the format and I/O mode can be compared
+independently. The harness records the Active WAL format version and I/O mode
+reported by PITR status in each comparison result. A run that requested v7 but
+could not migrate because of capacity fails instead of being labeled v7.
+The default PITR preset uses 20,000 entries. Segment sizing includes the file
+header, generation-zero marker, DATA fragmentation, and one FRONTIER for each
+planned commit without assuming coalescing. It accounts for the effective batch
+size and rejects runs that cannot fit within the 1 GiB WAL limit before creating
+the database or repository; reduce `--num` or `--value-size`, or use the batch
+workload when a larger run exceeds that bound.
+
+V7 runtime diagnostics are not instrumented yet. Those rows set
+`params.wal_runtime_counters_available` to `false`, omit `result.wal_pipeline`,
+and report the limitation when `--profile` is selected. The four legacy
+`counters.wal_commit_*` fields are placeholders in v7 rows and must not be used
+as measurements. V4/v6 retain their existing counters and optional pipeline
+diagnostics. V7 sync/coalescing instrumentation remains required for performance
+qualification.
+
+```text
+./target/release/write-perf --bench wal_concurrent --pitr --pitr-format v6 \
+  --wal-io-mode leader --num 20000 --threads 4 --value-size 1024 --output json
+./target/release/write-perf --bench wal_concurrent --pitr --pitr-format v7 \
+  --wal-io-mode parallel --num 20000 --threads 4 --value-size 1024 --output json
+```
+
+These controls make the runs reproducible; they do not qualify v7 performance.
+Qualification still requires the v6 Leader, v7 Leader, and v7 Parallel legs on
+tmpfs and a named physical device, with the required workload and coalescing
+controls recorded below.
 
 The pre-PITR `2f556ccb` reference used the exact 200k-put regression arguments
 on the same session and toolchain. It measured 177,605 ops/s on tmpfs and

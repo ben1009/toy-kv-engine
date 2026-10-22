@@ -15,8 +15,9 @@ use wrapper::kv_engine_wrapper;
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use clap::{Parser, ValueEnum};
 use kv_engine_wrapper::{
-    BackupOptions, CreateBackupOutcome, EnablePitrOutcome, PersistedPitrConfig, PitrOptions,
-    PitrRuntimeOptions, block_on,
+    BackupOptions, CreateBackupOutcome, EnablePitrOutcome, MAX_STATUS_PAGE_SIZE,
+    PersistedPitrConfig, PitrOptions, PitrResumeOutcome, PitrRuntimeOptions, PitrStatus,
+    PitrStatusOptions, PitrWalIoMode, block_on,
     checkpoint::CheckpointOptions,
     compact::{
         CompactionOptions, LeveledCompactionOptions, SimpleLeveledCompactionOptions,
@@ -120,6 +121,42 @@ impl WalIoModeArg {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum PitrFormatArg {
+    #[value(name = "v6")]
+    V6,
+    #[value(name = "v7")]
+    V7,
+}
+
+impl PitrFormatArg {
+    fn version(self) -> u16 {
+        match self {
+            Self::V6 => 6,
+            Self::V7 => 7,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct WalRunInfo {
+    format_version: u16,
+    io_mode: &'static str,
+}
+
+impl WalRunInfo {
+    fn v4(io_mode: WalIoModeArg) -> Self {
+        Self {
+            format_version: 4,
+            io_mode: io_mode.as_str(),
+        }
+    }
+
+    fn runtime_counters_available(self) -> bool {
+        matches!(self.format_version, 4..=6)
+    }
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "write-perf")]
 struct Args {
@@ -137,6 +174,7 @@ struct Args {
     no_cleanup: bool,
     #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
     output: OutputFormat,
+    /// Number of entries (the default PITR preset uses 20000).
     #[arg(long)]
     num: Option<usize>,
     #[arg(long)]
@@ -184,19 +222,22 @@ struct Args {
     wal: bool,
     #[arg(long, conflicts_with = "wal")]
     no_wal: bool,
-    /// Select the v4 WAL path for wal_concurrent comparisons.
-    #[arg(long, value_enum, default_value = "parallel")]
-    wal_io_mode: WalIoModeArg,
+    /// Select the WAL scheduler for WAL comparisons (parallel by default; v6 PITR uses Leader).
+    #[arg(long, value_enum)]
+    wal_io_mode: Option<WalIoModeArg>,
     #[arg(long)]
     vlog: bool,
     #[arg(long)]
     profile: bool,
-    /// Enable PITR on the workload's engine before it runs, bootstrapping a
+    /// Enable PITR for wal_concurrent or wal_batch_concurrent, bootstrapping a
     /// repository next to the database. Without this the harness opens with
     /// `pitr_repository: None`, so no PITR path - and no segment digest - is
     /// exercised at all, whatever the build contains.
     #[arg(long)]
     pitr: bool,
+    /// PITR format for WAL comparisons (v7 by default; v6 selects the isolated legacy control).
+    #[arg(long, value_enum, requires = "pitr")]
+    pitr_format: Option<PitrFormatArg>,
     #[arg(long)]
     clients: Option<usize>,
     #[arg(long)]
@@ -263,9 +304,11 @@ struct HarnessConfig {
     compaction: CompactionMode,
     wal_override: Option<bool>,
     wal_io_mode: WalIoModeArg,
+    wal_io_mode_explicit: bool,
     vlog_override: bool,
     profile: bool,
     pitr: bool,
+    pitr_format: Option<PitrFormatArg>,
     clients: usize,
     warmup_secs: u64,
     measurement_secs: u64,
@@ -305,7 +348,8 @@ impl HarnessConfig {
         ) = match (args.suite, preset) {
             (Suite::Legacy, Preset::Smoke) => ("smoke", 10_000, 10_000, 1, 10_000, 1024, 4, 0, 1),
             (Suite::Legacy, Preset::Default) => {
-                ("default", 200_000, 100_000, 5, 100_000, 1024, 4, 0, 5)
+                let num = if args.pitr { 20_000 } else { 200_000 };
+                ("default", num, 100_000, 5, 100_000, 1024, 4, 0, 5)
             }
             (Suite::Legacy, Preset::Large) => {
                 ("large", 2_000_000, 500_000, 10, 1_000_000, 1024, 4, 0, 10)
@@ -326,6 +370,14 @@ impl HarnessConfig {
             (false, true) => Some(false),
             _ => None,
         };
+        let wal_io_mode_explicit = args.wal_io_mode.is_some();
+        let wal_io_mode = args.wal_io_mode.unwrap_or_else(|| {
+            if args.pitr && args.pitr_format == Some(PitrFormatArg::V6) {
+                WalIoModeArg::Leader
+            } else {
+                WalIoModeArg::Parallel
+            }
+        });
 
         Self {
             suite: args.suite,
@@ -365,15 +417,12 @@ impl HarnessConfig {
                 .unwrap_or_else(|| "bypass".to_string()),
             compaction: args.compaction,
             wal_override,
-            // PITR v5/v6 uses the leader path regardless of the v4 default.
-            wal_io_mode: if args.pitr {
-                WalIoModeArg::Leader
-            } else {
-                args.wal_io_mode
-            },
+            wal_io_mode,
+            wal_io_mode_explicit,
             vlog_override: args.vlog,
             profile: args.profile,
             pitr: args.pitr,
+            pitr_format: args.pitr_format,
             clients: args.clients.unwrap_or(clients),
             warmup_secs: args.warmup_secs.unwrap_or(warmup_secs),
             measurement_secs: args.measurement_secs.unwrap_or(measurement_secs),
@@ -856,7 +905,11 @@ struct MeasurementParams {
     scan_limit: Option<usize>,
     latency_sample_every: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    wal_format_version: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     wal_io_mode: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    wal_runtime_counters_available: Option<bool>,
     settle_timeout_secs: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     transaction_hot_set: Option<usize>,
@@ -973,7 +1026,17 @@ impl From<kv_engine_wrapper::mem_table::WalSyncObservation> for WalSyncObservati
 }
 
 #[cfg(feature = "bench")]
-fn wal_pipeline_record(engine: &KvEngine, detailed: bool) -> Result<WalPipelineRecord> {
+fn wal_pipeline_record(
+    engine: &KvEngine,
+    detailed: bool,
+    wal_run_info: WalRunInfo,
+) -> Result<Option<WalPipelineRecord>> {
+    // V7 has no WriteProfile integration yet. Its zero-valued legacy counters
+    // must not be presented as measured pipeline activity.
+    if !wal_run_info.runtime_counters_available() {
+        return Ok(None);
+    }
+
     let profile = engine.write_profile();
     let (wal_file_length_bytes, wal_allocated_bytes) = engine.benchmark_wal_file_usage()?;
     let sync_observations = detailed.then(|| {
@@ -984,7 +1047,7 @@ fn wal_pipeline_record(engine: &KvEngine, detailed: bool) -> Result<WalPipelineR
             .collect()
     });
 
-    Ok(WalPipelineRecord {
+    Ok(Some(WalPipelineRecord {
         commit_groups: profile.wal_commit_groups,
         commit_solo_groups: profile.wal_commit_solo_groups,
         commit_buffers: profile.wal_commit_buffers,
@@ -1003,7 +1066,7 @@ fn wal_pipeline_record(engine: &KvEngine, detailed: bool) -> Result<WalPipelineR
         wal_file_length_bytes,
         wal_allocated_bytes,
         sync_observations,
-    })
+    }))
 }
 
 #[derive(Clone, Copy)]
@@ -1360,6 +1423,20 @@ fn select_workloads(
 }
 
 fn validate_selected_workloads(cfg: &HarnessConfig, workloads: &[&WorkloadSpec]) -> Result<()> {
+    if cfg.pitr {
+        anyhow::ensure!(
+            workloads.len() == 1
+                && matches!(workloads[0].name, "wal_concurrent" | "wal_batch_concurrent"),
+            "--pitr supports only one WAL comparison workload: wal_concurrent or wal_batch_concurrent"
+        );
+        let batch_size = if workloads[0].name == "wal_batch_concurrent" {
+            cfg.wal_batch_size
+        } else {
+            1
+        };
+        pitr_workload_limits(cfg, batch_size)?;
+    }
+
     if cfg.clone_golden {
         for workload in workloads {
             anyhow::ensure!(
@@ -3130,44 +3207,75 @@ fn run_wal_throughput(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
     Ok(results)
 }
 
-/// Bound the PITR bytes for concurrent puts or batches without relying on
-/// batching to reduce framing and alignment overhead.
-fn pitr_workload_limits(cfg: &HarnessConfig) -> Result<(u64, u64)> {
-    // Each value gets room for its key, value tag, entry framing, a batch
-    // header, and alignment even if it is committed in a batch of one. The
-    // harness's key indices fit in usize; 128 bytes covers their formatting
-    // and the current v5/v6 overhead. Batched writes need fewer padded bytes.
-    let per_value = u64::try_from(cfg.value_size)
+/// Bound the planned PITR commits without relying on FRONTIER coalescing.
+fn pitr_workload_limits(cfg: &HarnessConfig, batch_size: usize) -> Result<(u64, u64)> {
+    // V7 wire frames contain 4008 DATA payload bytes after their headers.
+    // Budget every commit's DATA frames and one uncoalesced FRONTIER, plus
+    // the file header/F0 and one spare DATA/FRONTIER pair. This also bounds v6.
+    const FRAME_BYTES: u64 = 4096;
+    const DATA_PAYLOAD_BYTES: u64 = 4008;
+    const MAX_SEGMENT_BYTES: u64 = 1 << 30; // Matches the engine's WAL file cap.
+    let batch_size = effective_wal_batch_size(cfg.num, cfg.threads, batch_size);
+    let batch_entries =
+        u64::try_from(batch_size).context("PITR workload batch entry count exceeds u64")?;
+    // A key, value tag, logical-entry framing, and a logical batch header fit
+    // within 128 bytes per entry, including the largest formatted usize key.
+    let logical_batch_bytes = u64::try_from(cfg.value_size)
         .context("PITR workload value size exceeds u64")?
         .checked_add(128)
-        .and_then(|bytes| bytes.checked_add(4095))
-        .context("PITR workload aligned value size overflow")?
-        / 4096
-        * 4096;
-    let written = u64::try_from(cfg.num)
-        .context("PITR workload value count exceeds u64")?
-        .checked_mul(per_value)
+        .and_then(|bytes| bytes.checked_mul(batch_entries))
+        .context("PITR workload logical batch size overflow")?;
+    let per_batch = logical_batch_bytes
+        .div_ceil(DATA_PAYLOAD_BYTES)
+        .checked_add(1)
+        .and_then(|frames| frames.checked_mul(FRAME_BYTES))
+        .context("PITR workload physical batch size overflow")?;
+    let written = effective_wal_batch_commit_count(cfg.num, cfg.threads, batch_size)
+        .checked_mul(per_batch)
         .context("PITR workload encoded size overflow")?;
-    // Preserve the existing minimum and headroom, which also cover the file
-    // header. Checked arithmetic rejects unrepresentable budgets.
     let segment = written
-        .checked_mul(2)
+        .checked_add(4 * FRAME_BYTES)
         .context("PITR workload segment size overflow")?
         .max(256 * 1024 * 1024);
+    ensure!(
+        segment <= MAX_SEGMENT_BYTES,
+        "PITR workload requires a {segment}-byte segment, exceeding the 1 GiB WAL limit; reduce --num or --value-size, or use wal_batch_concurrent with a larger --wal-batch-size"
+    );
+    // Four segments cover the legacy source, v7 image, recovery workspace,
+    // seals, successor, and transition metadata during setup migration.
     let budget = segment
-        .checked_mul(2)
+        .checked_mul(4)
         .context("PITR workload unarchived budget overflow")?;
 
     Ok((segment, budget))
 }
 
-/// Bootstrap a PITR repository next to the database and enable PITR on it.
-///
-/// Segment and unarchived limits cover the whole encoded workload, including
-/// larger values. The archive interval is parked far out of the way so the
-/// measurement is the write path and not a background archive.
-fn enable_pitr_for_workload(cfg: &HarnessConfig, engine: &KvEngine, path: &Path) -> Result<()> {
-    let (segment, budget) = pitr_workload_limits(cfg)?;
+fn pitr_wal_run_info(status: &PitrStatus) -> Result<WalRunInfo> {
+    let format_version = status
+        .active_wal_format_version
+        .context("PITR status did not report an Active WAL format")?;
+    let io_mode = status
+        .active_wal_io_mode
+        .context("PITR status did not report an Active WAL I/O mode")?;
+
+    Ok(WalRunInfo {
+        format_version,
+        io_mode: match io_mode {
+            PitrWalIoMode::Leader => "leader",
+            PitrWalIoMode::Parallel => "parallel",
+        },
+    })
+}
+
+/// Bootstrap PITR with capacity for the entire run and keep interval-driven
+/// archiving outside the measurement.
+fn enable_pitr_for_workload(
+    cfg: &HarnessConfig,
+    engine: &KvEngine,
+    path: &Path,
+    batch_size: usize,
+) -> Result<WalRunInfo> {
+    let (segment, budget) = pitr_workload_limits(cfg, batch_size)?;
     let repository = path.with_extension("pitr-repository");
     let _ = std::fs::remove_dir_all(&repository);
     ensure!(
@@ -3180,14 +3288,12 @@ fn enable_pitr_for_workload(cfg: &HarnessConfig, engine: &KvEngine, path: &Path)
         ),
         "repository bootstrap backup was not committed"
     );
-    // One segment for the whole run, so no boundary is taken while it is being
-    // measured: crossing `max_segment_bytes` stops commit admission, and a put
-    // during a barrier is a hard error rather than something a benchmark can wait
-    // out. The budget has to admit the segment, which the config enforces.
+    // Keep the entire measured workload in one segment so rotation and archive
+    // maintenance do not enter the timed write comparison.
     ensure!(
         matches!(
             engine.enable_pitr(PitrOptions {
-                repository,
+                repository: repository.clone(),
                 config: PersistedPitrConfig {
                     archive_interval: Duration::from_secs(3600),
                     max_segment_bytes: segment,
@@ -3201,21 +3307,61 @@ fn enable_pitr_for_workload(cfg: &HarnessConfig, engine: &KvEngine, path: &Path)
         "PITR enable did not complete"
     );
 
-    Ok(())
+    let requested_format = cfg.pitr_format.unwrap_or(PitrFormatArg::V7);
+    if requested_format == PitrFormatArg::V7 {
+        // A nonempty v6 source lets the regular, capacity-checked migration
+        // path install v7. Setup is outside the measured interval.
+        engine.put(b"write-perf-v7-migration-seed", b"setup")?;
+        match engine.resume_pitr(&repository)? {
+            PitrResumeOutcome::Resumed => {}
+            PitrResumeOutcome::ReconciliationRequired(error) => {
+                bail!("PITR benchmark setup requires reconciliation: {error:?}");
+            }
+        }
+    }
+
+    let status = engine.pitr_status(PitrStatusOptions {
+        cursor: None,
+        page_size: MAX_STATUS_PAGE_SIZE,
+    })?;
+    let actual = pitr_wal_run_info(&status)?;
+    let expected_version = requested_format.version();
+    ensure!(
+        actual.format_version == expected_version,
+        "requested PITR v{expected_version}, but Active WAL is v{} on {} (v7 migration capacity: {:?})",
+        actual.format_version,
+        actual.io_mode,
+        status
+            .v7_migration_capacity
+            .map(|capacity| capacity.decision)
+    );
+    ensure!(
+        actual.io_mode == cfg.wal_io_mode.as_str(),
+        "requested WAL I/O mode {}, but Active PITR WAL reports {}",
+        cfg.wal_io_mode.as_str(),
+        actual.io_mode
+    );
+
+    Ok(actual)
 }
 
 fn run_wal_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
     let workload = "wal_concurrent";
     let path = prepare_path(cfg, workload)?;
+    let cleanup = CleanupPathOnDrop::new(cfg, &path);
     let options = cfg.build_options(true, false);
     let engine = KvEngine::open_with_wal_io_mode(&path, options.clone(), cfg.wal_io_mode.into())?;
-    if cfg.pitr {
-        enable_pitr_for_workload(cfg, &engine, &path)?;
-    }
+    let wal_run_info = if cfg.pitr {
+        enable_pitr_for_workload(cfg, &engine, &path, 1)?
+    } else {
+        WalRunInfo::v4(cfg.wal_io_mode)
+    };
     #[cfg(feature = "bench")]
     {
         engine.reset_write_profile();
-        engine.set_wal_sync_diagnostics_enabled(cfg.profile)?;
+        engine.set_wal_sync_diagnostics_enabled(
+            cfg.profile && wal_run_info.runtime_counters_available(),
+        )?;
     }
     let value = vec![b'x'; cfg.value_size];
     let num_keys = cfg.num;
@@ -3267,11 +3413,15 @@ fn run_wal_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
     let (process_cpu_user_ms, process_cpu_system_ms) =
         process_cpu_delta(cpu_start, process_cpu_times());
     #[cfg(feature = "bench")]
-    let wal_pipeline = Some(wal_pipeline_record(&engine, cfg.profile)?);
+    let wal_pipeline = wal_pipeline_record(&engine, cfg.profile, wal_run_info)?;
     #[cfg(not(feature = "bench"))]
     let wal_pipeline = None;
     if cfg.profile {
-        print_write_profile(&engine, workload);
+        if wal_run_info.runtime_counters_available() {
+            print_write_profile(&engine, workload);
+        } else {
+            eprintln!("{workload}: v7 WAL runtime counters and sync observations are unavailable");
+        }
     }
     // With PITR enabled the drain is skipped: a forced freeze rotates the active
     // segment without advancing `active_segment_id`, so the close below refuses the
@@ -3283,7 +3433,7 @@ fn run_wal_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
     }
     let counters = collect_counter_delta(&baseline, &collect_counters(&engine)?);
     engine.close()?;
-    finalize_path(cfg, &path)?;
+    cleanup.finalize()?;
 
     let mut measurement = make_measurement(
         cfg,
@@ -3296,7 +3446,9 @@ fn run_wal_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
             threads: Some(writer_threads),
             seed: Some(cfg.seed),
             latency_sample_every: cfg.latency_sample_every,
-            wal_io_mode: Some(cfg.wal_io_mode.as_str()),
+            wal_format_version: Some(wal_run_info.format_version),
+            wal_io_mode: Some(wal_run_info.io_mode),
+            wal_runtime_counters_available: Some(wal_run_info.runtime_counters_available()),
             ..MeasurementParams::default()
         },
         MeasurementResult {
@@ -3320,15 +3472,20 @@ fn run_wal_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
 fn run_wal_batch_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
     let workload = "wal_batch_concurrent";
     let path = prepare_path(cfg, workload)?;
+    let cleanup = CleanupPathOnDrop::new(cfg, &path);
     let options = cfg.build_options(true, false);
     let engine = KvEngine::open_with_wal_io_mode(&path, options.clone(), cfg.wal_io_mode.into())?;
-    if cfg.pitr {
-        enable_pitr_for_workload(cfg, &engine, &path)?;
-    }
+    let wal_run_info = if cfg.pitr {
+        enable_pitr_for_workload(cfg, &engine, &path, cfg.wal_batch_size)?
+    } else {
+        WalRunInfo::v4(cfg.wal_io_mode)
+    };
     #[cfg(feature = "bench")]
     {
         engine.reset_write_profile();
-        engine.set_wal_sync_diagnostics_enabled(cfg.profile)?;
+        engine.set_wal_sync_diagnostics_enabled(
+            cfg.profile && wal_run_info.runtime_counters_available(),
+        )?;
     }
     let value = vec![b'x'; cfg.value_size];
     let num_keys = cfg.num;
@@ -3395,18 +3552,22 @@ fn run_wal_batch_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>
     let (process_cpu_user_ms, process_cpu_system_ms) =
         process_cpu_delta(cpu_start, process_cpu_times());
     #[cfg(feature = "bench")]
-    let wal_pipeline = Some(wal_pipeline_record(&engine, cfg.profile)?);
+    let wal_pipeline = wal_pipeline_record(&engine, cfg.profile, wal_run_info)?;
     #[cfg(not(feature = "bench"))]
     let wal_pipeline = None;
     if cfg.profile {
-        print_write_profile(&engine, workload);
+        if wal_run_info.runtime_counters_available() {
+            print_write_profile(&engine, workload);
+        } else {
+            eprintln!("{workload}: v7 WAL runtime counters and sync observations are unavailable");
+        }
     }
     if !cfg.pitr {
         engine.drain_flush()?;
     }
     let counters = collect_counter_delta(&baseline, &collect_counters(&engine)?);
     engine.close()?;
-    finalize_path(cfg, &path)?;
+    cleanup.finalize()?;
 
     let mut measurement = make_measurement(
         cfg,
@@ -3420,7 +3581,9 @@ fn run_wal_batch_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>
             threads: Some(writer_threads),
             seed: Some(cfg.seed),
             latency_sample_every: cfg.latency_sample_every,
-            wal_io_mode: Some(cfg.wal_io_mode.as_str()),
+            wal_format_version: Some(wal_run_info.format_version),
+            wal_io_mode: Some(wal_run_info.io_mode),
+            wal_runtime_counters_available: Some(wal_run_info.runtime_counters_available()),
             ..MeasurementParams::default()
         },
         MeasurementResult {
@@ -7516,6 +7679,15 @@ fn summary_for(record: &MeasurementRecord) -> String {
     if let Some(duration) = record.params.duration_secs {
         let _ = write!(summary, " duration={}s", duration);
     }
+    if let Some(version) = record.params.wal_format_version {
+        let _ = write!(summary, " wal_format=v{version}");
+    }
+    if let Some(mode) = record.params.wal_io_mode {
+        let _ = write!(summary, " wal_io={mode}");
+    }
+    if record.params.wal_runtime_counters_available == Some(false) {
+        let _ = write!(summary, " wal_runtime_counters=unavailable");
+    }
     if let Some(value_size) = record.params.value_size {
         let _ = write!(summary, " value={}B", value_size);
     }
@@ -7783,9 +7955,46 @@ fn finalize_path(cfg: &HarnessConfig, path: &Path) -> Result<()> {
     if cfg.cleanup {
         remove_path(path)?;
         remove_file_if_exists(&checkpoint_target_lock_path(path))?;
+        if cfg.pitr {
+            let repository = path.with_extension("pitr-repository");
+            remove_path(&repository)?;
+            remove_file_if_exists(&incremental_backup_init_lock_path(&repository))?;
+        }
     }
 
     Ok(())
+}
+
+struct CleanupPathOnDrop<'a> {
+    cfg: &'a HarnessConfig,
+    path: &'a Path,
+    armed: bool,
+}
+
+impl<'a> CleanupPathOnDrop<'a> {
+    fn new(cfg: &'a HarnessConfig, path: &'a Path) -> Self {
+        Self {
+            cfg,
+            path,
+            armed: true,
+        }
+    }
+
+    fn finalize(mut self) -> Result<()> {
+        let result = finalize_path(self.cfg, self.path);
+        self.armed = result.is_err();
+        result
+    }
+}
+
+impl Drop for CleanupPathOnDrop<'_> {
+    fn drop(&mut self) {
+        if self.armed
+            && let Err(error) = finalize_path(self.cfg, self.path)
+        {
+            eprintln!("write-perf cleanup failed: {error:#}");
+        }
+    }
 }
 
 fn remove_path(path: &Path) -> Result<()> {
@@ -7822,6 +8031,14 @@ fn checkpoint_target_lock_path(target_path: &Path) -> PathBuf {
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| "checkpoint".to_string());
     target_path.with_file_name(format!("{name}.checkpoint.lock"))
+}
+
+fn incremental_backup_init_lock_path(repository: &Path) -> PathBuf {
+    let name = repository
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "pitr-repository".to_string());
+    repository.with_file_name(format!(".{name}.incremental-backup.init.lock"))
 }
 
 fn ms(duration: Duration) -> f64 {
@@ -8008,6 +8225,19 @@ fn validate_config(cfg: &HarnessConfig) -> Result<()> {
     if let Some(settle_timeout_secs) = cfg.settle_timeout_secs {
         anyhow::ensure!(settle_timeout_secs > 0, "--settle-timeout-secs must be > 0");
     }
+    anyhow::ensure!(
+        !cfg.pitr || cfg.suite == Suite::Legacy,
+        "--pitr supports only legacy WAL comparison workloads"
+    );
+    if let Some(format) = cfg.pitr_format {
+        anyhow::ensure!(cfg.pitr, "--pitr-format requires --pitr");
+        if format == PitrFormatArg::V6 && cfg.wal_io_mode_explicit {
+            anyhow::ensure!(
+                cfg.wal_io_mode == WalIoModeArg::Leader,
+                "PITR v6 only supports --wal-io-mode leader"
+            );
+        }
+    }
     if cfg.prepare_golden || cfg.golden_path.is_some() || cfg.clone_golden {
         anyhow::ensure!(
             cfg.suite == Suite::SteadyState,
@@ -8073,24 +8303,58 @@ mod tests {
     #[test]
     fn pitr_workload_limits_cover_large_values_and_keep_small_value_budgets() {
         let mut cfg = legacy_cfg();
-        cfg.num = 200_000;
+        cfg.num = 20_000;
         cfg.value_size = 1024;
-        let (segment, budget) = pitr_workload_limits(&cfg).expect("size small-value workload");
-        assert_eq!(segment, 200_000 * 4096 * 2);
-        assert_eq!(budget, segment * 2);
+        let (segment, budget) = pitr_workload_limits(&cfg, 1).expect("size small-value workload");
+        assert!(segment > 8192 + 20_000 * 8192);
+        assert_eq!(budget, segment * 4);
 
         cfg.value_size = 16 * 1024;
-        let (segment, budget) = pitr_workload_limits(&cfg).expect("size large-value workload");
-        // A padded batch of one needs 20 KiB, including its key and framing.
-        assert!(segment >= 4096 + 200_000 * 20 * 1024);
+        let (segment, budget) = pitr_workload_limits(&cfg, 1).expect("size large-value workload");
+        // Each logical batch spans five DATA frames and needs its own FRONTIER.
+        assert!(segment > 8192 + 20_000 * 24 * 1024);
         assert!(budget >= segment);
 
         cfg.num = 1;
         cfg.value_size = 1024;
         assert_eq!(
-            pitr_workload_limits(&cfg).expect("keep minimum budget"),
-            (256 * 1024 * 1024, 512 * 1024 * 1024)
+            pitr_workload_limits(&cfg, 1).expect("keep minimum budget"),
+            (256 * 1024 * 1024, 1024 * 1024 * 1024)
         );
+    }
+
+    #[test]
+    fn pitr_workload_limits_include_fixed_frames_and_fragment_boundaries() {
+        let mut cfg = legacy_cfg();
+        cfg.num = 32_768;
+        cfg.threads = 1;
+        cfg.value_size = 1024;
+        let (segment, _) = pitr_workload_limits(&cfg, 1).expect("cover single-writer frame pairs");
+        // The old 256 MiB bound omitted the file header and generation-zero marker.
+        assert!(segment > 8192 + 32_768 * 8192);
+
+        cfg.value_size = 3950;
+        let (segment, _) = pitr_workload_limits(&cfg, 1).expect("cover DATA payload boundary");
+        // Logical framing pushes this value past the 4008-byte fragment capacity.
+        assert!(segment > 8192 + 32_768 * 12_288);
+    }
+
+    #[test]
+    fn pitr_workload_limits_reject_oversized_puts_but_admit_batched_runs() {
+        let mut cfg = legacy_cfg();
+        cfg.pitr = true;
+        cfg.num = 200_000;
+        let workloads =
+            select_workloads(Some("wal_concurrent"), &cfg).expect("select put comparison");
+        let error = validate_selected_workloads(&cfg, &workloads).expect_err("reject before setup");
+        assert!(error.to_string().contains("1 GiB WAL limit"));
+
+        let workloads =
+            select_workloads(Some("wal_batch_concurrent"), &cfg).expect("select batch comparison");
+        validate_selected_workloads(&cfg, &workloads).expect("batching fits the same entry count");
+        let (segment, _) =
+            pitr_workload_limits(&cfg, cfg.wal_batch_size).expect("size batched run");
+        assert!(segment <= 1 << 30);
     }
 
     #[test]
@@ -8098,13 +8362,69 @@ mod tests {
         let mut cfg = legacy_cfg();
         cfg.value_size = usize::MAX;
         cfg.num = usize::MAX;
-        assert!(pitr_workload_limits(&cfg).is_err());
+        assert!(pitr_workload_limits(&cfg, 1).is_err());
     }
 
     #[test]
-    fn default_wal_mode_and_pitr_control_are_reported_correctly() {
+    fn pitr_rejects_golden_preparation_before_setup() {
+        let cfg = HarnessConfig::from_args(
+            Args::try_parse_from([
+                "write-perf",
+                "--suite",
+                "steady-state",
+                "--prepare-golden",
+                "--golden-path",
+                "unused-golden",
+                "--pitr",
+                "--pitr-format",
+                "v7",
+            ])
+            .expect("parse conflicting PITR golden preparation"),
+        );
+        let error = validate_config(&cfg).expect_err("reject before golden preparation");
+        assert!(
+            error
+                .to_string()
+                .contains("--pitr supports only legacy WAL")
+        );
+    }
+
+    #[test]
+    fn pitr_cleanup_guard_removes_setup_artifacts_but_respects_no_cleanup() {
+        let tmp = tempfile::tempdir().expect("create temporary directory");
+        let path = tmp.path().join("wal_concurrent");
+        let repository = path.with_extension("pitr-repository");
+        let init_lock = incremental_backup_init_lock_path(&repository);
+        fs::create_dir(&path).expect("create benchmark database");
+        fs::create_dir(&repository).expect("create PITR repository");
+        fs::write(&init_lock, b"").expect("create repository init lock");
+
+        let mut cfg = legacy_cfg();
+        cfg.pitr = true;
+        {
+            let _cleanup = CleanupPathOnDrop::new(&cfg, &path);
+        }
+        assert!(!path.exists());
+        assert!(!repository.exists());
+        assert!(!init_lock.exists());
+
+        fs::create_dir(&path).expect("recreate benchmark database");
+        fs::create_dir(&repository).expect("recreate PITR repository");
+        fs::write(&init_lock, b"").expect("recreate repository init lock");
+        cfg.cleanup = false;
+        {
+            let _cleanup = CleanupPathOnDrop::new(&cfg, &path);
+        }
+        assert!(path.exists());
+        assert!(repository.exists());
+        assert!(init_lock.exists());
+    }
+
+    #[test]
+    fn pitr_format_controls_select_scheduler_without_relabeling_v7() {
         let cfg = legacy_cfg();
         assert_eq!(cfg.wal_io_mode, WalIoModeArg::Parallel);
+        assert_eq!(cfg.num, 200_000);
         validate_run_mode(&cfg, None).expect("default mode supports ordinary workloads");
 
         let args = Args::try_parse_from(["write-perf", "--wal-io-mode", "leader"])
@@ -8114,15 +8434,60 @@ mod tests {
             WalIoModeArg::Leader
         );
 
-        for args in [
-            vec!["write-perf", "--pitr"],
-            vec!["write-perf", "--pitr", "--wal-io-mode", "parallel"],
-        ] {
-            let args = Args::try_parse_from(args).expect("parse PITR workload");
-            let cfg = HarnessConfig::from_args(args);
-            assert_eq!(cfg.wal_io_mode, WalIoModeArg::Leader);
-            validate_run_mode(&cfg, Some("wal_concurrent")).expect("PITR keeps leader WAL");
-        }
+        let pitr_default = HarnessConfig::from_args(
+            Args::try_parse_from(["write-perf", "--pitr"]).expect("parse default PITR format"),
+        );
+        assert_eq!(pitr_default.wal_io_mode, WalIoModeArg::Parallel);
+        assert_eq!(pitr_default.num, 20_000);
+        assert_eq!(pitr_default.pitr_format, None);
+        validate_config(&pitr_default).expect("default PITR v7 uses parallel");
+        validate_run_mode(&pitr_default, Some("wal_concurrent"))
+            .expect("PITR comparison mode is valid");
+        let workloads = select_workloads(Some("wal_concurrent"), &pitr_default)
+            .expect("select default PITR comparison");
+        validate_selected_workloads(&pitr_default, &workloads).expect("default PITR workload fits");
+
+        let v6 = HarnessConfig::from_args(
+            Args::try_parse_from(["write-perf", "--pitr", "--pitr-format", "v6"])
+                .expect("parse explicit v6 control"),
+        );
+        assert_eq!(v6.wal_io_mode, WalIoModeArg::Leader);
+        assert_eq!(v6.pitr_format, Some(PitrFormatArg::V6));
+        validate_config(&v6).expect("v6 control defaults to its actual Leader mode");
+
+        let conflicting_v6 = HarnessConfig::from_args(
+            Args::try_parse_from([
+                "write-perf",
+                "--pitr",
+                "--pitr-format",
+                "v6",
+                "--wal-io-mode",
+                "parallel",
+            ])
+            .expect("parse conflicting v6 scheduler"),
+        );
+        assert!(
+            validate_config(&conflicting_v6)
+                .unwrap_err()
+                .to_string()
+                .contains("v6 only supports")
+        );
+
+        let v7_leader = HarnessConfig::from_args(
+            Args::try_parse_from([
+                "write-perf",
+                "--pitr",
+                "--pitr-format",
+                "v7",
+                "--wal-io-mode",
+                "leader",
+            ])
+            .expect("parse v7 Leader comparison"),
+        );
+        assert_eq!(v7_leader.wal_io_mode, WalIoModeArg::Leader);
+        validate_config(&v7_leader).expect("v7 supports the explicit Leader comparison");
+
+        assert!(Args::try_parse_from(["write-perf", "--pitr-format", "v6"]).is_err());
     }
 
     #[derive(Debug, Deserialize)]
@@ -9294,6 +9659,7 @@ mod tests {
             cleanup: true,
             output: OutputFormat::Json,
             pitr: false,
+            pitr_format: None,
             num: 1,
             reads: 1,
             duration_secs: 1,
@@ -9317,6 +9683,7 @@ mod tests {
             compaction: CompactionMode::None,
             wal_override: None,
             wal_io_mode: WalIoModeArg::Leader,
+            wal_io_mode_explicit: false,
             vlog_override: false,
             profile: true,
             clients: 1,
@@ -9340,10 +9707,15 @@ mod tests {
         let options = cfg.build_options(false, false);
         let measurement = make_measurement(
             &cfg,
-            "fillseq",
-            "write",
+            "wal_concurrent",
+            "concurrent",
             &options,
-            MeasurementParams::default(),
+            MeasurementParams {
+                wal_format_version: Some(7),
+                wal_io_mode: Some("parallel"),
+                wal_runtime_counters_available: Some(false),
+                ..MeasurementParams::default()
+            },
             MeasurementResult {
                 measure_elapsed_ms: 1.0,
                 ..MeasurementResult::default()
@@ -9351,8 +9723,22 @@ mod tests {
             MeasurementCounters::default(),
         );
         let json = serde_json::to_value(&measurement.record).expect("serialize record");
-        assert_eq!(json["measurement"], "write");
+        assert_eq!(json["measurement"], "concurrent");
         assert_eq!(json["schema"], JSON_SCHEMA_V1);
+        assert_eq!(json["params"]["wal_format_version"], 7);
+        assert_eq!(json["params"]["wal_io_mode"], "parallel");
+        assert_eq!(json["params"]["wal_runtime_counters_available"], false);
+        assert!(json["result"].get("wal_pipeline").is_none());
+        assert!(
+            measurement
+                .summary
+                .contains("wal_format=v7 wal_io=parallel")
+        );
+        assert!(
+            measurement
+                .summary
+                .contains("wal_runtime_counters=unavailable")
+        );
         assert!(json.get("phase").is_none());
         assert!(json.get("task").is_none());
         assert!(json.get("latency").is_none());
@@ -11700,6 +12086,7 @@ mod tests {
             cleanup: true,
             output: OutputFormat::Json,
             pitr: false,
+            pitr_format: None,
             num: 0,
             reads: 1,
             duration_secs: 1,
@@ -11723,6 +12110,7 @@ mod tests {
             compaction: CompactionMode::None,
             wal_override: None,
             wal_io_mode: WalIoModeArg::Leader,
+            wal_io_mode_explicit: false,
             vlog_override: false,
             profile: false,
             clients: 1,
