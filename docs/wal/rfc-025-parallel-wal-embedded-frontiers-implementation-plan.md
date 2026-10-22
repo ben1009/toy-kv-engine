@@ -1622,14 +1622,35 @@ frame in a DATA value. Discovery must report only the actual aligned
 generation-zero and tail FRONTIER frames, and Active recovery must return the
 value byte-for-byte unchanged.
 
+The thirty-third Stage 8 slice extends `write-perf` for the qualification
+matrix. With `--pitr`, the harness requests v7 by default, seeds the initial v6
+Active WAL outside the timer, and invokes the existing capacity-checked
+migration; `--pitr-format v6` keeps the isolated v6 Leader control unmigrated.
+PITR rows report the Active format version and I/O mode read from `pitr_status`,
+and fail if the requested format was deferred or the selected mode was not
+installed. Ordinary v4 comparison rows report the selected v4 format and mode.
+Format selection never edits an on-disk version field.
+The default PITR preset uses 20,000 entries. Workload sizing includes fixed v7
+frames, DATA fragmentation, and one FRONTIER per effective commit; oversized
+runs fail before creating artifacts instead of crossing the 1 GiB segment cap
+or including rotation in the measurement. The five comparison
+legs, tmpfs and named-device requirements, coalescing controls, and reopen
+metrics below remain qualification requirements; this harness change records
+controls and metadata, not performance results.
+V7 rows explicitly mark legacy WAL runtime counters unavailable and omit the
+unimplemented pipeline diagnostics; sync/coalescing instrumentation must be
+added before those rows can supply qualification evidence.
+
 - Complete the correctness matrix below using the persistence model, real
   runtime injection, and process-level integration. Regress ordinary v4,
   strict v5/v6, TTL, recorded-time rollback/clamping, range deletion, OCC,
   checkpoints, async cancellation, and close together.
-- Extend `write-perf` with actual format/mode output and an explicit isolated
-  v6 creation control. Remove its unconditional PITR-to-Leader comparison
-  assumption for v7; do not reinterpret on-disk version fields. Record the
-  required comparisons, devices, coalescing controls, and recovery metrics.
+- `write-perf` now reports actual format/mode for v4 and PITR comparison rows,
+  supports an explicit isolated v6 Leader control, and selects v7 Parallel or
+  Leader without an unconditional PITR-to-Leader rewrite. It verifies the
+  Active format/mode instead of reinterpreting on-disk version fields. Record
+  the required comparisons, devices, coalescing controls, and recovery metrics
+  listed below before treating any run as qualification evidence.
 - After correctness qualification, activate v7/Parallel in every eligible
   production creation and migration path. Retain documented legacy capacity
   deferral. A released v7 writer must already support Parallel; a development
