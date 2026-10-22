@@ -1641,6 +1641,14 @@ V7 rows explicitly mark legacy WAL runtime counters unavailable and omit the
 unimplemented pipeline diagnostics; sync/coalescing instrumentation must be
 added before those rows can supply qualification evidence.
 
+The thirty-fourth Stage 8 slice verifies that a recovered Sealed v7 source
+remains read-only and has no attached WAL writer, scheduler, ring, or reservation
+owner across open, close, and reopen in both Leader and Parallel selection
+modes. It also checks that the installed Active successor uses the requested
+mode and that the frozen source WAL and seal bytes remain unchanged. Sealing
+startup, process-crash qualification, and the remaining correctness matrix are
+still open.
+
 - Complete the correctness matrix below using the persistence model, real
   runtime injection, and process-level integration. Regress ordinary v4,
   strict v5/v6, TTL, recorded-time rollback/clamping, range deletion, OCC,
