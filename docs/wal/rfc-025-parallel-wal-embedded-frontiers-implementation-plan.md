@@ -506,7 +506,7 @@ now use the v7 lifecycle path. Active v7 reservation owners and their shared
 ledger are retained through durable source cleanup and then retired from segment
 bookkeeping. Constructor defaults and full crash/performance qualification remain.
 
-**Last updated:** 2026-10-21
+**Last updated:** 2026-10-22
 
 **Source baseline:** `30a64fa855126596316ab6b9237e6348b0e41fd2`, which merged RFC 025 in PR #379.
 
@@ -1465,8 +1465,20 @@ and archive that zero-batch v7 segment, writes a later v7 successor, and closes
 PITR. Latest restore must verify the empty segment as a proof before publishing
 the restored database, preserve values from both nonempty segments, and fail if
 the empty proof WAL is corrupted. This engine-level lifecycle test does not
-qualify empty-image crashes, trailing speculative control frames, or power-loss
-behavior.
+qualify empty-image crashes, other trailing speculative control layouts, or
+power-loss behavior. The fourteenth slice below adds one trailing-control case.
+
+The fourteenth Stage 8 slice extends the fallback-to-archive-restore case with a
+second complete, offset-bound, CRC-correct copy of the synced candidate
+FRONTIER in a zero-filled speculative tail, followed by another zero frame. A
+copied-database check first invalidates the original marker while leaving its
+covered DATA intact; recovery must scan through the zero tail, discover the
+trailing marker, and retain its candidate write. The main case then corrupts
+that DATA, so recovery must reject both candidate copies after prefix
+verification, normalize to the preceding manifest-authorized frontier, and
+preserve that fallback through seal, archive, and Latest restore. This qualifies
+this one process-level trailing-control layout; empty-image crashes and
+power-loss behavior remain open.
 
 - Complete the correctness matrix below using the persistence model, real
   runtime injection, and process-level integration. Regress ordinary v4,

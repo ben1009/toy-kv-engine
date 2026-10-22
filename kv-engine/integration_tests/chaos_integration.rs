@@ -820,9 +820,73 @@ fn failpoint_v7_parallel_pitr_fallback_archive_restore() {
         "candidate bytes must belong to a DATA frame"
     );
 
+    let (candidate_frontier_offset, trailing_frontier_offset, trailing_frontier) =
+        append_speculative_frontier_after_zero_tail(&active_wal_path, &speculative_wal, 1 << 20);
+    assert!(trailing_frontier_offset > candidate_frontier_offset);
+    assert!(
+        u64::from_be_bytes(
+            trailing_frontier[80..88]
+                .try_into()
+                .expect("v7 frontier durable end has eight bytes")
+        ) <= u64::try_from(trailing_frontier_offset).expect("frontier offset fits u64"),
+        "trailing frontier must certify a prefix ending before its own frame"
+    );
+
+    // Prove that recovery discovers the trailing marker, rather than passing
+    // the fallback case below by rejecting the original candidate marker.
+    // In this copy the DATA remains intact, but the marker at the original
+    // frontier offset is removed; only the trailing copy can retain the write.
+    let discovery_db_path = dir.path().join("trailing-frontier-discovery-db");
+    copy_dir_recursive(&db_path, &discovery_db_path)
+        .expect("copy database for trailing-frontier discovery check");
+    let discovery_repository = dir.path().join("trailing-frontier-discovery-repository");
+    copy_dir_recursive(&repository, &discovery_repository)
+        .expect("copy repository for trailing-frontier discovery check");
+    let discovery_wal_path = find_v7_pitr_wal(&discovery_db_path);
+    let mut discovery_wal = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&discovery_wal_path)
+        .expect("open copied WAL to remove original candidate FRONTIER");
+    discovery_wal
+        .seek(SeekFrom::Start(
+            u64::try_from(candidate_frontier_offset).expect("candidate frontier offset fits u64"),
+        ))
+        .expect("seek to original candidate FRONTIER");
+    discovery_wal
+        .write_all(&[0; 4096])
+        .expect("remove original candidate FRONTIER from copied WAL");
+    discovery_wal
+        .sync_all()
+        .expect("persist removal of original candidate FRONTIER");
+    drop(discovery_wal);
+
+    let discovered = KvEngine::open_with_wal_io_mode(
+        &discovery_db_path,
+        LsmStorageOptions {
+            enable_wal: true,
+            pitr_repository: Some(discovery_repository),
+            ..LsmStorageOptions::default_for_test()
+        },
+        WalIoMode::Parallel,
+    )
+    .expect("discover the valid trailing FRONTIER after the zero-filled gap");
+    assert_eq!(
+        discovered
+            .get(candidate_key)
+            .expect("read candidate authorized by trailing FRONTIER")
+            .as_deref(),
+        Some(b"candidate".as_slice()),
+        "recovery must discover the trailing FRONTIER to retain its covered candidate"
+    );
+    discovered
+        .close()
+        .expect("close trailing-frontier discovery copy");
+
     // Make the newest synced FRONTIER fail prefix verification while keeping
-    // the preceding acknowledged v7 frontier valid. Active recovery must reject
-    // the candidate and fall back to that frontier above the manifest floor.
+    // the preceding acknowledged v7 frontier valid. A second complete but
+    // speculative FRONTIER sits later in the zero-filled tail, so recovery must
+    // scan back through that tail, reject both candidates, and fall back above
+    // the manifest floor.
     let mut wal = std::fs::OpenOptions::new()
         .write(true)
         .open(&active_wal_path)
@@ -836,6 +900,41 @@ fn failpoint_v7_parallel_pitr_fallback_archive_restore() {
     wal.sync_all()
         .expect("persist speculative candidate corruption");
     drop(wal);
+    let tailed_wal =
+        std::fs::read(&active_wal_path).expect("read WAL with speculative tail marker");
+    assert_eq!(
+        &tailed_wal[trailing_frontier_offset..trailing_frontier_offset + 8],
+        b"TKVW7FR1",
+        "the speculative tail must contain a complete FRONTIER frame"
+    );
+    assert_eq!(
+        u64::from_be_bytes(
+            tailed_wal[trailing_frontier_offset + 48..trailing_frontier_offset + 56]
+                .try_into()
+                .expect("v7 frame offset has eight bytes")
+        ),
+        u64::try_from(trailing_frontier_offset).expect("frontier offset fits u64")
+    );
+    let mut trailing_frontier_crc = crc32fast::Hasher::new();
+    trailing_frontier_crc
+        .update(&tailed_wal[trailing_frontier_offset..trailing_frontier_offset + 60]);
+    trailing_frontier_crc
+        .update(&tailed_wal[trailing_frontier_offset + 64..trailing_frontier_offset + 4096]);
+    assert_eq!(
+        u32::from_be_bytes(
+            tailed_wal[trailing_frontier_offset + 60..trailing_frontier_offset + 64]
+                .try_into()
+                .expect("v7 frame CRC has four bytes")
+        ),
+        trailing_frontier_crc.finalize(),
+        "the speculative tail FRONTIER must have a valid frame CRC"
+    );
+    assert!(
+        tailed_wal[trailing_frontier_offset + 4096..trailing_frontier_offset + 8192]
+            .iter()
+            .all(|byte| *byte == 0),
+        "the complete speculative FRONTIER must be followed by a zero-filled frame"
+    );
 
     let recovered = KvEngine::open_with_wal_io_mode(
         &db_path,
@@ -889,8 +988,12 @@ fn failpoint_v7_parallel_pitr_fallback_archive_restore() {
         "fallback recovery must install a fresh Active WAL inode"
     );
     assert!(
-        normalized_wal.len() < speculative_wal.len(),
-        "fallback normalization must discard the rejected speculative suffix"
+        normalized_wal.len() < tailed_wal.len(),
+        "fallback normalization must discard the rejected DATA and trailing FRONTIER"
+    );
+    assert!(
+        normalized_wal.len() <= trailing_frontier_offset,
+        "fallback normalization must not retain the speculative tail FRONTIER"
     );
 
     let status = recovered
@@ -1360,6 +1463,121 @@ fn find_v7_pitr_wal(db_path: &std::path::Path) -> PathBuf {
     let path = paths.next().expect("find Active v7 PITR WAL");
     assert!(paths.next().is_none(), "expected one Active v7 PITR WAL");
     path
+}
+
+#[cfg(target_os = "linux")]
+fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dst)?;
+
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        let target = dst.join(entry.file_name());
+        if file_type.is_dir() {
+            copy_dir_recursive(&entry.path(), &target)?;
+        } else if file_type.is_file() {
+            std::fs::copy(entry.path(), target)?;
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn append_speculative_frontier_after_zero_tail(
+    wal_path: &std::path::Path,
+    image: &[u8],
+    max_segment_bytes: usize,
+) -> (usize, usize, Vec<u8>) {
+    const FRAME_LEN: usize = 4096;
+    const HEADER_LEN: usize = 4096;
+
+    assert!(image.len().is_multiple_of(FRAME_LEN));
+    assert!(image.len() <= max_segment_bytes);
+    let candidate_frontier_offset = image
+        .as_chunks::<FRAME_LEN>()
+        .0
+        .iter()
+        .enumerate()
+        .filter_map(|(frame_index, frame)| {
+            let frame_offset = frame_index * FRAME_LEN;
+            (frame_offset >= HEADER_LEN
+                && frame[..8] == *b"TKVW7FR1"
+                && u16::from_be_bytes([frame[10], frame[11]]) == 2)
+                .then_some(frame_offset)
+        })
+        .next_back()
+        .expect("synced candidate WAL must contain a FRONTIER frame");
+    assert!(candidate_frontier_offset > HEADER_LEN);
+    assert_eq!(
+        u64::from_be_bytes(
+            image[candidate_frontier_offset + 48..candidate_frontier_offset + 56]
+                .try_into()
+                .expect("candidate frame offset has eight bytes")
+        ),
+        u64::try_from(candidate_frontier_offset).expect("candidate offset fits u64")
+    );
+
+    let first_tail_slot = candidate_frontier_offset + FRAME_LEN;
+    let trailing_frontier_offset = (first_tail_slot..=image.len().saturating_sub(2 * FRAME_LEN))
+        .step_by(FRAME_LEN)
+        .find(|offset| {
+            image[*offset..*offset + FRAME_LEN]
+                .iter()
+                .all(|byte| *byte == 0)
+                && image[*offset + FRAME_LEN..*offset + 2 * FRAME_LEN]
+                    .iter()
+                    .all(|byte| *byte == 0)
+        })
+        .unwrap_or_else(|| {
+            let offset = image.len();
+            let new_len = offset
+                .checked_add(2 * FRAME_LEN)
+                .expect("speculative tail image length does not overflow");
+            assert!(
+                new_len <= max_segment_bytes,
+                "test WAL must have room for a speculative FRONTIER and zero tail"
+            );
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(wal_path)
+                .expect("open Active WAL to create a zero-filled speculative tail")
+                .set_len(u64::try_from(new_len).expect("test WAL length fits u64"))
+                .expect("extend Active WAL with a zero-filled speculative tail");
+            offset
+        });
+
+    let mut trailing_frontier =
+        image[candidate_frontier_offset..candidate_frontier_offset + FRAME_LEN].to_vec();
+    trailing_frontier[48..56].copy_from_slice(
+        &u64::try_from(trailing_frontier_offset)
+            .expect("trailing frontier offset fits u64")
+            .to_be_bytes(),
+    );
+    let mut crc = crc32fast::Hasher::new();
+    crc.update(&trailing_frontier[..60]);
+    crc.update(&trailing_frontier[64..]);
+    let frame_crc = crc.finalize();
+    trailing_frontier[60..64].copy_from_slice(&frame_crc.to_be_bytes());
+
+    let mut wal = std::fs::OpenOptions::new()
+        .write(true)
+        .open(wal_path)
+        .expect("open Active WAL to append a speculative FRONTIER");
+    wal.seek(SeekFrom::Start(
+        u64::try_from(trailing_frontier_offset).expect("trailing offset fits u64"),
+    ))
+    .expect("seek to the zero-filled speculative tail slot");
+    wal.write_all(&trailing_frontier)
+        .expect("write a complete speculative FRONTIER frame");
+    wal.sync_all()
+        .expect("persist the speculative FRONTIER and zero-filled tail");
+
+    (
+        candidate_frontier_offset,
+        trailing_frontier_offset,
+        trailing_frontier,
+    )
 }
 
 #[cfg(target_os = "linux")]
