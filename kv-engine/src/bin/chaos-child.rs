@@ -219,7 +219,7 @@ fn publish_v7_completion_marker(
 
 #[cfg(target_os = "linux")]
 fn run_v7_pitr_crash(
-    engine: &KvEngine,
+    engine: &std::sync::Arc<KvEngine>,
     args: &[String],
     wal_io_mode: WalIoMode,
 ) -> Result<(), String> {
@@ -277,6 +277,24 @@ fn run_v7_pitr_crash(
             }
             Err(error) => {
                 return Err(format!("empty-successor recovery point failed: {error:#}"));
+            }
+        }
+    }
+
+    if args.iter().any(|arg| arg == "--async-recovery-point") {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| format!("build async recovery-point crash runtime failed: {error}"))?;
+        match runtime.block_on(async { engine.create_recovery_point_async().await }) {
+            Ok(RecoveryPointOutcome::Durable(_)) => return Ok(()),
+            Ok(outcome) => {
+                return Err(format!(
+                    "async recovery point did not complete durably: {outcome:?}"
+                ));
+            }
+            Err(error) => {
+                return Err(format!("async recovery point failed: {error:#}"));
             }
         }
     }

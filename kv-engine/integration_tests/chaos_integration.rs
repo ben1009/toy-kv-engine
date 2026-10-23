@@ -4342,6 +4342,128 @@ fn failpoint_v7_parallel_async_ttl_crash_after_sync_before_ack_recovers_expirati
 }
 
 #[cfg(target_os = "linux")]
+#[test]
+fn failpoint_v7_recovery_point_archive_crash_after_source_seal_recovers_and_resumes() {
+    let probe_dir = tempfile::tempdir().expect("create v7 recovery-point crash probe directory");
+    let probe_options = LsmStorageOptions {
+        enable_wal: true,
+        ..LsmStorageOptions::default_for_test()
+    };
+    match KvEngine::open_with_wal_io_mode(probe_dir.path(), probe_options, WalIoMode::Parallel) {
+        Ok(engine) => engine
+            .close()
+            .expect("close v7 Parallel recovery-point crash probe"),
+        Err(error) => {
+            panic!("v7 recovery-point crash qualification requires io_uring: {error:#}")
+        }
+    }
+
+    let dir = tempfile::tempdir().expect("create v7 recovery-point crash directory");
+    let db_path = dir.path().join("db");
+    let repository = dir.path().join("repository");
+    let engine = prepare_empty_v7_parallel_pitr(&db_path, &repository);
+    engine
+        .put(b"recovery-point-crash-baseline", b"stable")
+        .expect("persist acknowledged recovery-point crash baseline");
+    engine
+        .close()
+        .expect("close recovery-point crash setup engine");
+
+    let control_log_path = dir.path().join("recovery-point-crash-control.log");
+    let marker_path = dir.path().join("recovery-point-crash.marker");
+    let crash_point = "pitr.before_recovery_point_archive";
+    kill_pitr_child_at_crash_point_with_operation(
+        &db_path,
+        &repository,
+        &control_log_path,
+        &marker_path,
+        crash_point,
+        PitrChildCrashOperation::AsyncRecoveryPoint,
+    );
+
+    let recovered = open_and_resume_parallel_pitr(&db_path, &repository);
+    assert_eq!(
+        recovered
+            .get(b"recovery-point-crash-baseline")
+            .expect("read acknowledged baseline after recovery-point crash")
+            .as_deref(),
+        Some(b"stable".as_slice())
+    );
+    recovered
+        .put(b"after-recovery-point-crash", b"resumed")
+        .expect("write after recovering the interrupted recovery point");
+    let point = match recovered
+        .create_recovery_point()
+        .expect("create recovery point after interrupted archive")
+    {
+        RecoveryPointOutcome::Durable(point) => point,
+        outcome => panic!("recovery-point retry was not durable: {outcome:?}"),
+    };
+    let point_commit_ts = point
+        .commit_ts
+        .expect("recovery-point retry has a committed timestamp");
+    let status = recovered
+        .pitr_status(PitrStatusOptions {
+            cursor: None,
+            page_size: NonZeroUsize::new(64).expect("nonzero PITR status page size"),
+        })
+        .expect("read recoverable intervals after recovery-point retry");
+    let interval = status
+        .recoverable_intervals
+        .first()
+        .expect("recovered repository contains a base interval");
+    let selector = RecoverySelector {
+        timeline_id: interval.timeline_id,
+        archive_epoch_id: Some(interval.archive_epoch_id),
+        base_backup_id: None,
+    };
+    recovered.close().expect("close recovered source engine");
+    drop(recovered);
+
+    let restored_path = dir.path().join("restored-after-recovery-point-crash");
+    let backup_repository =
+        BackupRepository::open(&repository).expect("open repository for crash recovery restore");
+    let restore_outcome = backup_repository
+        .restore_to(
+            RecoveryTarget::CommitTs(point_commit_ts),
+            &restored_path,
+            PitrRestoreOptions {
+                selector,
+                implementations: ImplementationRegistry,
+                executor_threads: NonZeroUsize::new(1).expect("one restore worker is nonzero"),
+                cache_capacity: 4096,
+                storage: LsmStorageOptions::default_for_test(),
+            },
+        )
+        .expect("restore point after recovery-point process crash");
+    assert!(matches!(
+        restore_outcome,
+        RestoreToOutcome::Restored(info) if info.resolved_commit_ts == Some(point_commit_ts)
+    ));
+    drop(backup_repository);
+
+    let restored = KvEngine::open(&restored_path, LsmStorageOptions::default_for_test())
+        .expect("open restored database after recovery-point process crash");
+    assert_eq!(
+        restored
+            .get(b"recovery-point-crash-baseline")
+            .expect("read baseline from restored database")
+            .as_deref(),
+        Some(b"stable".as_slice())
+    );
+    assert_eq!(
+        restored
+            .get(b"after-recovery-point-crash")
+            .expect("read post-recovery write from restored database")
+            .as_deref(),
+        Some(b"resumed".as_slice())
+    );
+    restored
+        .close()
+        .expect("close restored database after recovery-point process crash");
+}
+
+#[cfg(target_os = "linux")]
 fn prepare_empty_v7_parallel_pitr(
     db_path: &std::path::Path,
     repository: &std::path::Path,
@@ -4507,6 +4629,7 @@ fn assert_sealed_source_unchanged(
 #[derive(Clone, Copy)]
 enum PitrChildCrashOperation<'a> {
     CreateEmptySuccessor,
+    AsyncRecoveryPoint,
     Write {
         acknowledged_write: Option<(&'a str, &'a str)>,
         write: Option<(&'a str, &'a str)>,
@@ -4695,6 +4818,7 @@ fn kill_pitr_child_at_crash_point_with_mode(
         | PitrChildCrashOperation::CloseBoundary { .. }
         | PitrChildCrashOperation::AsyncClose { .. } => "1",
         PitrChildCrashOperation::CreateEmptySuccessor
+        | PitrChildCrashOperation::AsyncRecoveryPoint
         | PitrChildCrashOperation::Write {
             acknowledged_write: None,
             ..
@@ -4756,6 +4880,10 @@ fn kill_pitr_child_at_crash_point_with_mode(
     let (acknowledged_write, write) = match operation {
         PitrChildCrashOperation::CreateEmptySuccessor => {
             child.arg("--create-empty-successor");
+            (None, None)
+        }
+        PitrChildCrashOperation::AsyncRecoveryPoint => {
+            child.arg("--async-recovery-point");
             (None, None)
         }
         PitrChildCrashOperation::Write {

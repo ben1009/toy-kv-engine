@@ -2094,6 +2094,22 @@ passed 1/1 outside the sandbox on Linux with host io_uring access.
   writes across reopen. Focused evidence:
   `v7_forced_flush_drains_durable_unpublished_write_and_recovers` passed both
   sync and async cases outside the sandbox on Linux with host io_uring access.
+- The seventy-ninth Stage 8 slice cancels asynchronous recovery-point creation
+  after the source WAL is durably sealed and rotated but before archive
+  publication. It verifies the sealed source and stopped admission survive the
+  cancellation and close/reopen, automatic PITR resume reconciles pending work
+  and reopens admission, and a later recovery point advances the source
+  obligation to `Reclaimable` (retained until flush/reclamation). Restore and
+  source reopen both retain the data.
+  Focused evidence: `failpoint_v7_async_recovery_point_cancellation_reconciles_sealed_source`
+  passed outside the sandbox on Linux with host io_uring access.
+- The eightieth Stage 8 slice process-kills an async recovery-point operation
+  after its source WAL is durably sealed and rotated but before archive
+  publication. Reopen reconciles the pending source, keeps acknowledged data,
+  restores admission, accepts a successor write, and successfully archives and
+  restores a later recovery point.
+  Focused evidence: `failpoint_v7_recovery_point_archive_crash_after_source_seal_recovers_and_resumes`
+  passed outside the sandbox on Linux with host io_uring access.
 - Complete the correctness matrix below using the persistence model, real
   runtime injection, and process-level integration. Regress ordinary v4,
   strict v5/v6, TTL, recorded-time rollback/clamping, range deletion, OCC,
@@ -2147,6 +2163,7 @@ the captured prefix must survive even if no publication or ACK followed.
 | Chain invariants | Duplicate generation, sibling/orphan/skip-predecessor, wrong binding/digest, and physical containment fail even after fixture CRCs are recomputed. |
 | Fixed targets and stopped admission | Continuous work cannot change API cutoff `C` for sync/close/freeze/checkpoint/recovery points; predecessor containment may require marker `T > C`, fixed before construction. `D0 \| D1 \| F_A(D0)` drains; ineligible poisoned targets terminate. `v7_sync_write_durable_before_close_is_published_and_recovered` holds a synchronous point write between WAL durability and publication while close captures its cutoff. `v7_sync_batch_durable_before_close_is_published_and_recovered`, `v7_sync_transaction_durable_before_close_is_published_and_recovered`, `v7_sync_ttl_durable_before_close_is_published_and_recovered`, `v7_sync_delete_durable_before_close_is_published_and_recovered`, `v7_sync_range_batch_durable_before_close_is_published_and_recovered`, and `v7_sync_range_delete_durable_before_close_is_published_and_recovered` apply the same close-cutoff, post-publication, and recovery assertions to the remaining synchronous point, transaction, and range commit paths. `v7_sync_barrier_drains_durable_unpublished_write_and_recovers` and `v7_sync_async_barrier_drains_durable_unpublished_write_and_recovers` verify both public sync barriers drain a commit already past WAL durability. |
 | Recovery-point and forced-flush cutoffs | `v7_recovery_point_drains_durable_unpublished_write_and_restores_cutoff` verifies sync/async recovery-point capture waits for an admitted durable commit and restores exactly through its timestamp, excluding a successor. `v7_forced_flush_drains_durable_unpublished_write_and_recovers` verifies sync/async forced flush drains the admitted writer and immutable queue, rejects later admission at the cutoff, and recovers the cutoff and successor writes after reopen. |
+| Recovery-point cancellation | `failpoint_v7_async_recovery_point_cancellation_reconciles_sealed_source` cancels after the source is durably sealed but before archive publication; it verifies the source remains retained across close/reopen, automatic PITR resume reopens admission, and a later recovery point advances the source obligation to `Reclaimable` while restore and source reopen retain both baseline and post-cancellation writes. `failpoint_v7_recovery_point_archive_crash_after_source_seal_recovers_and_resumes` SIGKILLs a child at the same lifecycle boundary, then verifies reopen recovery, continued writes, a successful later recovery point, and restore of both baseline and successor. |
 | Real CQEs and ownership | Short/negative, reversed, stale, missing, and ambiguous completions cannot publish beyond a proven prefix or release kernel/hash-owned buffers. Worker-state tests exercise negative CQEs; `failpoint_v7_parallel_injected_negative_cqe_keeps_prior_frontier` and `failpoint_v7_parallel_injected_short_cqe_keeps_prior_frontier` inject negative and short results into the live completion path; `process_completions_rejects_stale_cqe_without_releasing_outstanding_buffer` exercises stale-ID rejection at the completion dispatcher; `missing_cqe_blocks_close_until_matching_completion_retires_buffer` verifies a missing completion keeps the buffer owned and prevents close; `failpoint_v7_parallel_later_group_cqe_does_not_advance_past_gap` verifies real out-of-order DATA completion cannot advance recovery across an earlier ticket gap; `failpoint_v7_parallel_post_io_group_completion_error_keeps_prior_frontier` verifies a post-I/O group-completion error preserves the prior durable boundary. |
 | Failed marker cycle | No further FRONTIER append in that runtime, including attempts that would not ACK; all waiters/leases reach terminal outcomes. |
 | Durable floors | Validate every exact logical anchor; never fall below it, reuse required timestamps, or reinterpret allocation watermarks as committed coordinates. |
