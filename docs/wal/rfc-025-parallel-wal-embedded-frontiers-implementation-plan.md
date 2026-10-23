@@ -1775,6 +1775,35 @@ retires the buffer and allows close to succeed. This complements the ambiguous
 submission case by covering a missing completion without changing the request
 to `Ambiguous`; the combined host run above passes 6/6.
 
+The forty-ninth Stage 8 slice strengthens the ordinary-v4 compatibility
+regression across default open, memtable rotation, async reopen, and repairing
+open. Each active WAL must still report format v4 and Parallel I/O, and its
+on-disk header must retain the v4 magic/version and zero padding. The test also
+checks that these v4 opens do not create Active-v7 recovery staging images.
+Strict legacy v5/v6 recovery remains covered by
+`test_v5_family_recovery_rejects_valid_batch_after_zero_hole`, which verifies
+both formats reject a valid later batch after a zero-filled hole. Local
+evidence: `cargo nextest run --package kv-engine --all-features --lib
+--filter-expr 'test(test_default_engine_open_rotation_async_and_repair_use_parallel_wal)
+| test(test_v5_family_recovery_rejects_valid_batch_after_zero_hole)'` passed
+2/2 on Linux with host io_uring access.
+
+The fiftieth Stage 8 slice strengthens the recovery-installation persistence
+model with distinct source and normalized images. The source has a torn tail;
+the replacement contains the normalized header and generation-zero frontier.
+After reopen, the source remains a recoverable input but is not service-ready
+until fresh-inode installation completes. The replacement inode must be
+created and synced in the current process; neither syncing an inherited rename
+nor renaming an inherited temporary inode satisfies the barrier. Power loss
+before parent-directory sync must restore the old source inode and its bytes.
+After directory sync, power loss must retain the new normalized inode and
+image. Any write after a successful sync invalidates that sync proof and a
+pending install candidate. Directory sync also rechecks the current-process
+create-and-sync proof. An interrupted sync that happens to persist every
+rewritten byte still cannot make the replacement service-ready. Local evidence:
+`cargo nextest run --package kv-engine --all-features --lib
+--filter-expr 'test(wal::v7::model::tests::)'` passed 22/22.
+
 - Complete the correctness matrix below using the persistence model, real
   runtime injection, and process-level integration. Regress ordinary v4,
   strict v5/v6, TTL, recorded-time rollback/clamping, range deletion, OCC,
@@ -1830,7 +1859,7 @@ the captured prefix must survive even if no publication or ACK followed.
 | Real CQEs and ownership | Short/negative, reversed, stale, missing, and ambiguous completions cannot publish beyond a proven prefix or release kernel/hash-owned buffers. Worker-state tests exercise negative CQEs; `failpoint_v7_parallel_injected_negative_cqe_keeps_prior_frontier` and `failpoint_v7_parallel_injected_short_cqe_keeps_prior_frontier` inject negative and short results into the live completion path; `process_completions_rejects_stale_cqe_without_releasing_outstanding_buffer` exercises stale-ID rejection at the completion dispatcher; `missing_cqe_blocks_close_until_matching_completion_retires_buffer` verifies a missing completion keeps the buffer owned and prevents close; `failpoint_v7_parallel_later_group_cqe_does_not_advance_past_gap` verifies real out-of-order DATA completion cannot advance recovery across an earlier ticket gap; `failpoint_v7_parallel_post_io_group_completion_error_keeps_prior_frontier` verifies a post-I/O group-completion error preserves the prior durable boundary. |
 | Failed marker cycle | No further FRONTIER append in that runtime, including attempts that would not ACK; all waiters/leases reach terminal outcomes. |
 | Durable floors | Validate every exact logical anchor; never fall below it, reuse required timestamps, or reinterpret allocation watermarks as committed coordinates. |
-| Recovery installation crashes | Copy/write/sync/replace/directory-sync failures, unchanged-length rewrite, restart without reboot, and crash during repeated normalization; canonical old/new image remains verifiable, with no early service. |
+| Recovery installation crashes | Copy/write/sync/replace/directory-sync failures, unchanged-length rewrite, restart without reboot, and crash during repeated normalization; `fresh_inode_replacement_is_not_durable_until_directory_sync` models power loss on both sides of directory sync using distinct source/normalized images and requires the canonical recoverable image before service. |
 | Recovery followed by continued writes | Normalize twice, append at restored ticket/offset extending the installed recovery marker, sync, crash/reopen, then seal/archive/restore. Empty/nonempty/fallback/trailing-control variants independently agree on digests, index, anchors, data, and accounting. |
 | Immutable and archive objects | Exact Sealing image, terminal marker, whole-image digest and seal index; no fallback/normalization; mixed legacy digest rules and empty v7 seals remain valid. |
 | Runtime startup after recovery | Frozen Sealing/Sealed files acquire no append pipeline or initializer and retain exact bytes/length; only installed authoritative Active state starts v7 runtime, with startup allocation reserved before mutation. |
@@ -1838,7 +1867,7 @@ the captured prefix must survive even if no publication or ACK followed.
 | Capacity and pins | Real engine admission/preallocation uses the shared ledger; full spool still permits terminal marker/recovery; workspace grows before allocation; old/temp/pinned files stay charged until durable cleanup. |
 | Segment exhaustion and shared pressure | Exact-boundary DATA-plus-marker exhaustion triggers rotation before ticket assignment for a batch that fits a fresh segment; retry preserves caps and ordering. Shared-ledger pressure, including aggregate spool and seal-index quota, does not trigger rotation, and oversized batches cannot loop through empty successors. |
 | Legacy upgrade | Insufficient maximum-image capacity defers with writable v6 rotations; transition reservations precede intent and survive concurrent capacity consumption/replay; eligible transition installs one v7 active; new enable fails before intent; installed v7 cannot downgrade. |
-| Compatibility and ordinary workloads | Legacy fixtures keep exact behavior; ordinary v4 read/write/mixed workloads retain semantics and no v7 frames or recovery-copy requirement. |
+| Compatibility and ordinary workloads | Legacy fixtures keep exact behavior; `test_v5_family_recovery_rejects_valid_batch_after_zero_hole` verifies strict v5/v6 prefix recovery; `test_default_engine_open_rotation_async_and_repair_use_parallel_wal` verifies ordinary v4 format/header persistence, Parallel selection, read/write across reopen, and no v7 recovery staging file. |
 
 Place pure v7 codec/recovery/model tests with proposed `wal/v7/` modules and
 golden files under `kv-engine/src/tests/fixtures/`. Extend live WAL tests in

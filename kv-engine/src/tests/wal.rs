@@ -36,6 +36,48 @@ fn set_parallel_wal_file_size_limit(engine: &KvEngine, limit: u64) -> usize {
     state.memtable.id()
 }
 
+fn assert_active_v4_parallel_wal(engine: &KvEngine) {
+    let active = engine.inner.state.load().memtable.clone();
+    assert_eq!(
+        active.wal_format_version(),
+        Some(crate::wal::format::WAL_FORMAT_VERSION_V4)
+    );
+    assert_eq!(active.wal_io_mode(), Some(WalIoMode::Parallel));
+
+    let wal_path = active
+        .wal_path()
+        .expect("active v4 memtable has a WAL path");
+    let bytes = std::fs::read(wal_path).expect("read active v4 WAL image");
+    assert!(bytes.len() >= 4096);
+    assert_eq!(
+        u32::from_be_bytes(bytes[..4].try_into().expect("v4 magic width")),
+        crate::wal::format::WAL_MVCC_MAGIC
+    );
+    assert_eq!(
+        u16::from_be_bytes(bytes[4..6].try_into().expect("v4 version width")),
+        crate::wal::format::WAL_FORMAT_VERSION_V4
+    );
+    assert!(
+        bytes[crate::wal::format::WAL_HEADER_SIZE..4096]
+            .iter()
+            .all(|byte| *byte == 0),
+        "ordinary v4 header padding remains unchanged"
+    );
+}
+
+fn assert_no_v7_recovery_staging_files(directory: &std::path::Path) {
+    for entry in std::fs::read_dir(directory).expect("read database directory") {
+        let entry = entry.expect("read database directory entry");
+        let file_name = entry.file_name();
+        assert!(
+            !file_name
+                .to_string_lossy()
+                .starts_with(".toy-kv-v7-recovery-"),
+            "ordinary v4 recovery must not create v7 staging images"
+        );
+    }
+}
+
 fn fill_parallel_wal_below_sst_limit(
     engine: &KvEngine,
     cap: u64,
@@ -171,6 +213,7 @@ async fn test_default_engine_open_rotation_async_and_repair_use_parallel_wal() {
         Err(error) => panic!("failed to open default WAL engine: {error:#}"),
     };
     assert!(engine.inner.selects_parallel_wal_io());
+    assert_active_v4_parallel_wal(&engine);
     assert_eq!(
         engine.inner.state.load().memtable.parallel_wal_is_closed(),
         Some(false)
@@ -185,13 +228,17 @@ async fn test_default_engine_open_rotation_async_and_repair_use_parallel_wal() {
         Some(false)
     );
     engine.put_async(b"after-rotation", b"value").await.unwrap();
+    assert_active_v4_parallel_wal(&engine);
     engine.close_async().await.unwrap();
     drop(engine);
+    assert_no_v7_recovery_staging_files(dir.path());
 
     let engine = KvEngine::open_async(dir.path(), options.clone())
         .await
         .unwrap();
     assert!(engine.inner.selects_parallel_wal_io());
+    assert_active_v4_parallel_wal(&engine);
+    assert_no_v7_recovery_staging_files(dir.path());
     assert_eq!(
         engine.inner.state.load().memtable.parallel_wal_is_closed(),
         Some(false)
@@ -205,12 +252,16 @@ async fn test_default_engine_open_rotation_async_and_repair_use_parallel_wal() {
         Some(b"value".as_slice())
     );
     engine.put_async(b"after-reopen", b"value").await.unwrap();
+    assert_active_v4_parallel_wal(&engine);
     engine.close_async().await.unwrap();
     drop(engine);
+    assert_no_v7_recovery_staging_files(dir.path());
 
     let (engine, repaired) = KvEngine::open_repairing(dir.path(), options).unwrap();
     assert!(repaired.is_empty());
     assert!(engine.inner.selects_parallel_wal_io());
+    assert_active_v4_parallel_wal(&engine);
+    assert_no_v7_recovery_staging_files(dir.path());
     assert_eq!(
         engine.inner.state.load().memtable.parallel_wal_is_closed(),
         Some(false)
