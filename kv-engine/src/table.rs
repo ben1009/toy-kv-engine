@@ -49,6 +49,14 @@ const SST_RANGE_TOMBSTONE_FOOTER_V8_LEN: u64 =
 const SST_RANGE_TOMBSTONE_FOOTER_V9_LEN: u64 =
     SST_RANGE_TOMBSTONE_FOOTER_V8_LEN + 2 * SIZE_OF_U64 as u64;
 
+const fn range_tombstone_footer_len(version: u8) -> u64 {
+    match version {
+        SST_FOOTER_VERSION_V8 => SST_RANGE_TOMBSTONE_FOOTER_V8_LEN,
+        SST_FOOTER_VERSION_V9 => SST_RANGE_TOMBSTONE_FOOTER_V9_LEN,
+        _ => SST_RANGE_TOMBSTONE_FOOTER_V4_V7_LEN,
+    }
+}
+
 /// A single prefix bloom filter for a specific prefix length.
 #[derive(Debug)]
 pub(crate) struct PrefixBloom {
@@ -436,18 +444,8 @@ impl SsTable {
                 let is_v8 = version == SST_FOOTER_VERSION_V8 || version == SST_FOOTER_VERSION_V9;
                 // v8: 42 bytes (3×u32 + 2×u64 + 1×u8 + max_ts:8 + magic:4 + version:1)
                 // v9: 58 bytes (v8 + 2×u64: ttl_entry_count + total_entry_count)
-                let tail_size = if is_v8 {
-                    let base =
-                        SIZE_OF_U32 + SIZE_OF_U32 + SIZE_OF_U32 + SIZE_OF_U64 + SIZE_OF_U64 + 1;
-                    // v9 adds 16 bytes: ttl_entry_count:8 + total_entry_count:8
-                    if version == SST_FOOTER_VERSION_V9 {
-                        base + SIZE_OF_U64 + SIZE_OF_U64 + MVCC_FOOTER_EXTRA as usize
-                    } else {
-                        base + MVCC_FOOTER_EXTRA as usize
-                    }
-                } else {
-                    SIZE_OF_U32 + SIZE_OF_U32 + SIZE_OF_U32 + MVCC_FOOTER_EXTRA as usize
-                };
+                let tail_size = usize::try_from(range_tombstone_footer_len(version))
+                    .expect("SST footer length fits usize");
                 let tail = file.read(
                     file.size().saturating_sub(tail_size as u64),
                     tail_size as u64,
@@ -637,20 +635,15 @@ impl SsTable {
             );
             BlockMeta::decode_block_meta(&file.read(meta_offset, meta_len)?)?
         };
-        // Decode range-tombstone block (v4 only).
+        // Decode range-tombstone blocks for v4, v7, v8, and v9 SST footers.
         let range_tombstones = if let Some(rt_off) = v4_rt_off {
             if rt_off > 0 {
                 // Range-tombstone blocks extend to the footer. Its length
                 // depends on the SST footer version, especially when TTL
                 // metadata is present.
-                let footer_len = match version {
-                    SST_FOOTER_VERSION_V8 => SST_RANGE_TOMBSTONE_FOOTER_V8_LEN,
-                    SST_FOOTER_VERSION_V9 => SST_RANGE_TOMBSTONE_FOOTER_V9_LEN,
-                    _ => SST_RANGE_TOMBSTONE_FOOTER_V4_V7_LEN,
-                };
                 let footer_start = file
                     .size()
-                    .checked_sub(footer_len)
+                    .checked_sub(range_tombstone_footer_len(version))
                     .ok_or_else(|| anyhow::anyhow!("SST is shorter than its v{version} footer"))?;
                 anyhow::ensure!(
                     rt_off <= footer_start,
