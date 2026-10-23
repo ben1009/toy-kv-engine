@@ -57,17 +57,19 @@ enum ImageView {
     Stable,
 }
 
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 struct ModelFile {
     cached: Vec<u8>,
     stable: Vec<u8>,
     sync_attempts: u64,
     successful_syncs: u64,
+    creation_generation: u64,
+    successful_sync_generation: Option<u64>,
 }
 
 /// A deterministic model of file data, directory entries, manifest state, and
 /// the independent client acknowledgement oracle.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 struct PersistenceModel {
     files: BTreeMap<u64, ModelFile>,
     cached_paths: BTreeMap<String, u64>,
@@ -75,6 +77,8 @@ struct PersistenceModel {
     next_inode: u64,
     cached_active_anchor: Option<ActiveAnchor>,
     stable_active_anchor: Option<ActiveAnchor>,
+    recovery_install_pending: bool,
+    recovery_install_candidate: Option<(u64, u64)>,
     directory_sync_attempts: u64,
     manifest_sync_attempts: u64,
     process_restarts: u64,
@@ -92,7 +96,13 @@ impl PersistenceModel {
             .next_inode
             .checked_add(1)
             .ok_or_else(|| anyhow::anyhow!("model inode counter overflows"))?;
-        self.files.insert(inode, ModelFile::default());
+        self.files.insert(
+            inode,
+            ModelFile {
+                creation_generation: self.process_generation,
+                ..ModelFile::default()
+            },
+        );
         self.cached_paths.insert(path.to_owned(), inode);
         Ok(inode)
     }
@@ -105,14 +115,22 @@ impl PersistenceModel {
             .files
             .get_mut(&inode)
             .ok_or_else(|| anyhow::anyhow!("model inode does not exist"))?;
+        file.successful_sync_generation = None;
         if file.cached.len() < end {
             file.cached.resize(end, 0);
         }
         file.cached[offset..end].copy_from_slice(bytes);
+        if self
+            .recovery_install_candidate
+            .is_some_and(|(_, candidate_inode)| candidate_inode == inode)
+        {
+            self.recovery_install_candidate = None;
+        }
         Ok(())
     }
 
     fn fdatasync_success(&mut self, inode: u64) -> Result<()> {
+        let process_generation = self.process_generation;
         let file = self
             .files
             .get_mut(&inode)
@@ -120,6 +138,7 @@ impl PersistenceModel {
         file.sync_attempts += 1;
         file.stable.clone_from(&file.cached);
         file.successful_syncs += 1;
+        file.successful_sync_generation = Some(process_generation);
         Ok(())
     }
 
@@ -152,7 +171,27 @@ impl PersistenceModel {
 
     fn sync_directory_success(&mut self) {
         self.directory_sync_attempts += 1;
+        let active_replaced =
+            self.cached_paths.get(ACTIVE_WAL_PATH) != self.stable_paths.get(ACTIVE_WAL_PATH);
+        let replacement_is_current =
+            self.recovery_install_candidate
+                .take()
+                .is_some_and(|(generation, inode)| {
+                    generation == self.process_generation
+                        && self.cached_paths.get(ACTIVE_WAL_PATH) == Some(&inode)
+                        && self.files.get(&inode).is_some_and(|file| {
+                            file.creation_generation == generation
+                                && file.successful_sync_generation == Some(generation)
+                        })
+                });
         self.stable_paths.clone_from(&self.cached_paths);
+        if active_replaced
+            && self.cached_paths.contains_key(ACTIVE_WAL_PATH)
+            && self.recovery_install_pending
+            && replacement_is_current
+        {
+            self.recovery_install_pending = false;
+        }
     }
 
     fn publish_active_anchor(&mut self, anchor: ActiveAnchor) {
@@ -168,11 +207,15 @@ impl PersistenceModel {
     fn restart_process_without_reboot(&mut self) {
         self.process_restarts += 1;
         self.process_generation += 1;
+        self.recovery_install_pending = true;
+        self.recovery_install_candidate = None;
     }
 
     /// A power loss discards every cached change that did not reach stable state.
     fn power_loss(&mut self) {
         self.process_generation += 1;
+        self.recovery_install_pending = true;
+        self.recovery_install_candidate = None;
         for file in self.files.values_mut() {
             file.cached.clone_from(&file.stable);
         }
@@ -185,7 +228,19 @@ impl PersistenceModel {
             .cached_paths
             .remove(source)
             .ok_or_else(|| anyhow::anyhow!("model rename source does not exist"))?;
-        Ok(self.cached_paths.insert(target.to_owned(), inode))
+        let replacement_is_fresh = self.files.get(&inode).is_some_and(|file| {
+            file.creation_generation == self.process_generation
+                && file.successful_sync_generation == Some(self.process_generation)
+        });
+        let replaced = self.cached_paths.insert(target.to_owned(), inode);
+        if target == ACTIVE_WAL_PATH
+            && replaced != Some(inode)
+            && self.recovery_install_pending
+            && replacement_is_fresh
+        {
+            self.recovery_install_candidate = Some((self.process_generation, inode));
+        }
+        Ok(replaced)
     }
 
     fn cleanup_unreferenced_inodes(&mut self) -> usize {
@@ -244,6 +299,11 @@ impl PersistenceModel {
     }
 
     fn service_ready_for(&self, path: &str, inode: u64) -> bool {
+        // Every reopened Active v7 image must pass the fresh-inode recovery
+        // installation barrier before the new process can serve requests.
+        if self.recovery_install_pending {
+            return false;
+        }
         if !self.canonical_inode_matches(path, inode) {
             return false;
         }
@@ -2769,56 +2829,97 @@ mod tests {
 
     #[test]
     fn fresh_inode_replacement_is_not_durable_until_directory_sync() -> Result<()> {
-        let mut harness = SerialHarness::create()?;
-        let old_inode = harness.writer.inode;
-        let image = harness
-            .disk
-            .path_bytes(ACTIVE_WAL_PATH, ImageView::Stable)
-            .expect("active WAL is installed")
-            .to_vec();
+        let (source_image, anchor) = empty_image_with_torn_tail()?;
+        let directory = TestDirectory::new()?;
+        let path = directory.0.join(ACTIVE_WAL_PATH);
+        fs::write(&path, &source_image)?;
+        let selection = active_selection(&path, anchor)?;
+        let installed = install_active_recovery(&path, &selection)?;
+        let normalized_image = fs::read(&path)?;
+        assert!(normalized_image.len() < source_image.len());
+        assert_eq!(recover_latest(&normalized_image)?.frontier.ticket_end, 0);
 
-        let first_temp = harness.disk.create_file(TEMP_WAL_PATH)?;
-        harness.disk.write_at(first_temp, 0, &image)?;
-        harness.disk.fdatasync_success(first_temp)?;
-        harness
-            .disk
-            .rename_replace(TEMP_WAL_PATH, ACTIVE_WAL_PATH)?;
+        let mut disk = PersistenceModel::default();
+        let old_inode = disk.create_file(ACTIVE_WAL_PATH)?;
+        disk.write_at(old_inode, 0, &source_image)?;
+        disk.fdatasync_success(old_inode)?;
+        disk.sync_directory_success();
+        disk.publish_active_anchor(model_anchor(anchor));
+        disk.sync_manifest_success();
+        assert_eq!(installed.active_boundary.ticket_end, 0);
+        assert!(disk.service_ready_for(ACTIVE_WAL_PATH, old_inode));
+        disk.restart_process_without_reboot();
+        assert!(!disk.service_ready_for(ACTIVE_WAL_PATH, old_inode));
+
+        let first_temp = disk.create_file(TEMP_WAL_PATH)?;
+        disk.write_at(first_temp, 0, &normalized_image)?;
+        disk.fdatasync_success(first_temp)?;
+        let mut rewritten_after_sync = disk.clone();
+        rewritten_after_sync.write_at(first_temp, 0, &normalized_image[..1])?;
+        let persisted_rewrite = 0..normalized_image.len();
+        rewritten_after_sync
+            .fdatasync_interrupted(first_temp, std::slice::from_ref(&persisted_rewrite))?;
         assert_eq!(
-            harness.disk.path_inode(ACTIVE_WAL_PATH, ImageView::Cached),
+            rewritten_after_sync.file(first_temp)?.cached,
+            rewritten_after_sync.file(first_temp)?.stable
+        );
+        rewritten_after_sync.rename_replace(TEMP_WAL_PATH, ACTIVE_WAL_PATH)?;
+        rewritten_after_sync.sync_directory_success();
+        assert!(!rewritten_after_sync.service_ready_for(ACTIVE_WAL_PATH, first_temp));
+
+        let mut stale_synced_temp = disk.clone();
+        stale_synced_temp.restart_process_without_reboot();
+        stale_synced_temp.rename_replace(TEMP_WAL_PATH, ACTIVE_WAL_PATH)?;
+        stale_synced_temp.sync_directory_success();
+        assert!(!stale_synced_temp.service_ready_for(ACTIVE_WAL_PATH, first_temp));
+        disk.rename_replace(TEMP_WAL_PATH, ACTIVE_WAL_PATH)?;
+        assert_eq!(
+            disk.path_inode(ACTIVE_WAL_PATH, ImageView::Cached),
             Some(first_temp)
         );
-        assert!(!harness.disk.service_ready_for(ACTIVE_WAL_PATH, first_temp));
-        assert!(!harness.disk.service_ready_for(ACTIVE_WAL_PATH, old_inode));
-        harness.disk.restart_process_without_reboot();
-        assert!(!harness.disk.service_ready_for(ACTIVE_WAL_PATH, first_temp));
-        assert!(!harness.disk.service_ready_for(ACTIVE_WAL_PATH, old_inode));
+        assert!(!disk.service_ready_for(ACTIVE_WAL_PATH, first_temp));
+        assert!(!disk.service_ready_for(ACTIVE_WAL_PATH, old_inode));
+        disk.restart_process_without_reboot();
+        assert!(!disk.service_ready_for(ACTIVE_WAL_PATH, first_temp));
+        assert!(!disk.service_ready_for(ACTIVE_WAL_PATH, old_inode));
+        let mut inherited_replacement = disk.clone();
+        inherited_replacement.sync_directory_success();
+        assert!(!inherited_replacement.service_ready_for(ACTIVE_WAL_PATH, first_temp));
 
-        harness.disk.power_loss();
+        disk.power_loss();
         assert_eq!(
-            harness.disk.path_inode(ACTIVE_WAL_PATH, ImageView::Cached),
+            disk.path_inode(ACTIVE_WAL_PATH, ImageView::Cached),
             Some(old_inode)
         );
-        assert!(harness.disk.service_ready_for(ACTIVE_WAL_PATH, old_inode));
-        assert_eq!(harness.disk.cleanup_unreferenced_inodes(), 1);
-
-        let second_temp = harness.disk.create_file(TEMP_WAL_PATH)?;
-        harness.disk.write_at(second_temp, 0, &image)?;
-        harness.disk.fdatasync_success(second_temp)?;
-        harness
-            .disk
-            .rename_replace(TEMP_WAL_PATH, ACTIVE_WAL_PATH)?;
-        assert!(!harness.disk.service_ready_for(ACTIVE_WAL_PATH, second_temp));
-        assert!(!harness.disk.service_ready_for(ACTIVE_WAL_PATH, old_inode));
-        harness.disk.sync_directory_success();
-        assert!(harness.disk.service_ready_for(ACTIVE_WAL_PATH, second_temp));
-        assert!(!harness.disk.service_ready_for(ACTIVE_WAL_PATH, old_inode));
-        assert_eq!(harness.disk.cleanup_unreferenced_inodes(), 1);
-        harness.disk.power_loss();
         assert_eq!(
-            harness.disk.path_inode(ACTIVE_WAL_PATH, ImageView::Stable),
+            disk.path_bytes(ACTIVE_WAL_PATH, ImageView::Stable),
+            Some(source_image.as_slice())
+        );
+        assert!(!disk.service_ready_for(ACTIVE_WAL_PATH, old_inode));
+        assert_eq!(recover_latest(&source_image)?.frontier.ticket_end, 0);
+        assert_eq!(disk.cleanup_unreferenced_inodes(), 1);
+
+        let second_temp = disk.create_file(TEMP_WAL_PATH)?;
+        disk.write_at(second_temp, 0, &normalized_image)?;
+        disk.fdatasync_success(second_temp)?;
+        disk.rename_replace(TEMP_WAL_PATH, ACTIVE_WAL_PATH)?;
+        assert!(!disk.service_ready_for(ACTIVE_WAL_PATH, second_temp));
+        assert!(!disk.service_ready_for(ACTIVE_WAL_PATH, old_inode));
+        disk.sync_directory_success();
+        assert!(disk.service_ready_for(ACTIVE_WAL_PATH, second_temp));
+        assert!(!disk.service_ready_for(ACTIVE_WAL_PATH, old_inode));
+        assert_eq!(disk.cleanup_unreferenced_inodes(), 1);
+        disk.power_loss();
+        assert_eq!(
+            disk.path_inode(ACTIVE_WAL_PATH, ImageView::Stable),
             Some(second_temp)
         );
-        assert!(harness.disk.service_ready_for(ACTIVE_WAL_PATH, second_temp));
+        assert_eq!(
+            disk.path_bytes(ACTIVE_WAL_PATH, ImageView::Stable),
+            Some(normalized_image.as_slice())
+        );
+        assert_eq!(recover_latest(&normalized_image)?.frontier.ticket_end, 0);
+        assert!(!disk.service_ready_for(ACTIVE_WAL_PATH, second_temp));
         Ok(())
     }
 }
