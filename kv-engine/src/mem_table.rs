@@ -3860,9 +3860,7 @@ mod tests {
         use crate::chaos::failpoint::{self, FailScenario};
 
         for action in ["return", "panic"] {
-            for operation in [
-                "put", "delete", "ttl", "range", "ranges", "batch", "deletes",
-            ] {
+            for operation in ["put", "delete", "ttl", "ranges", "batch", "deletes"] {
                 let scenario = FailScenario::setup();
                 let directory = tempfile::tempdir()?;
                 let path = directory.path().join("active.wal");
@@ -3881,9 +3879,6 @@ mod tests {
                             std::time::Duration::from_secs(60),
                             &memtable,
                         )
-                        .map(|_| ()),
-                    "range" => mvcc
-                        .write_range_tombstone(b"a", b"z", &memtable)
                         .map(|_| ()),
                     "ranges" => mvcc
                         .write_range_batch_wal_only(&[(b"a", b"z")], &memtable)

@@ -861,55 +861,6 @@ impl LsmMvccInner {
         Ok((commit_ts, encoded_key, prefixed, ticket))
     }
 
-    /// Write a range tombstone covering `[start, end)`.
-    /// Returns the commit timestamp used.
-    pub fn write_range_tombstone(
-        &self,
-        start: &[u8],
-        end: &[u8],
-        memtable: &MemTable,
-    ) -> Result<u64, anyhow::Error> {
-        let (commit_ts, ticket) = {
-            let _write_guard = self.write_lock.lock();
-            let commit_ts = self.reserve_commit_ts()?;
-            let _unwind_guard = self.guard_v7_commit_unwind(memtable, commit_ts);
-            let ticket = match if memtable.uses_pitr_batch_wal() {
-                let recorded_at = self.pitr_recorded_at_for_commit(commit_ts)?;
-                memtable.write_pitr_wal_batch_only(
-                    &crate::pitr::WalBatch {
-                        commit_ts,
-                        recorded_at,
-                        entries: vec![crate::pitr::WalEntry::RangeDelete {
-                            start: start.to_vec(),
-                            end: end.to_vec(),
-                        }],
-                    },
-                    crate::pitr::LIVE_WAL_V5_LIMITS,
-                )
-            } else {
-                memtable.put_range_tombstone_batch_wal_only(&[(start, end)], commit_ts, 0)
-            } {
-                Ok(ticket) => ticket,
-                Err(error) => {
-                    self.record_wal_append_failure(memtable, commit_ts);
-                    return Err(error);
-                }
-            };
-            (commit_ts, ticket)
-        };
-        if let Err(error) = memtable.commit_wal_ticket(ticket) {
-            self.poison_commit_ts(commit_ts);
-            return Err(error);
-        }
-        if let Err(error) = memtable.publish_range_tombstones(&[(start, end)], commit_ts, 0) {
-            self.poison_commit_ts(commit_ts);
-            return Err(error);
-        }
-        self.publish_commit_ts(commit_ts)?;
-
-        Ok(commit_ts)
-    }
-
     /// Write a batch of range tombstones to WAL buffer only (no skiplist
     /// insert, no sync). Returns `(commit_ts, wal_ticket)`.
     ///

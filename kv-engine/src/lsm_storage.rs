@@ -14272,6 +14272,8 @@ impl LsmStorageInner {
             };
             let memtable = state.memtable.clone();
             Self::commit_wal_ticket_or_poison(&memtable, ticket, self.mvcc.as_deref(), ts)?;
+            #[cfg(test)]
+            self.pause_native_write_blocking(native_write::NativeWriteStage::Durable, ts);
             if ts > 0
                 && let Some(ref mvcc) = self.mvcc
             {
@@ -15594,6 +15596,11 @@ impl LsmStorageInner {
                 self.mvcc.as_deref(),
                 mvcc_commit_ts,
             )?;
+            #[cfg(test)]
+            self.pause_native_write_blocking(
+                native_write::NativeWriteStage::Durable,
+                mvcc_commit_ts,
+            );
             // Publish to skiplist + bloom AFTER WAL sync succeeds.
             if !publish_data.is_empty() {
                 if let Some(ref mvcc) = self.mvcc {
@@ -16293,6 +16300,13 @@ impl LsmStorageInner {
                     .as_ref()
                     .map_or(0, |(commit_ts, _, _)| *commit_ts),
             )?;
+            #[cfg(test)]
+            if let Some((commit_ts, _, _)) = publish_data.as_ref() {
+                self.pause_native_write_blocking(
+                    native_write::NativeWriteStage::Durable,
+                    *commit_ts,
+                );
+            }
             if let Some((commit_ts, encoded_key, prefixed_val)) = publish_data {
                 if let Some(ref mvcc) = self.mvcc {
                     Self::publish_raw_batch_or_poison(
@@ -16400,6 +16414,13 @@ impl LsmStorageInner {
                     .as_ref()
                     .map_or(0, |(commit_ts, _, _)| *commit_ts),
             )?;
+            #[cfg(test)]
+            if let Some((commit_ts, _, _)) = publish_data.as_ref() {
+                self.pause_native_write_blocking(
+                    native_write::NativeWriteStage::Durable,
+                    *commit_ts,
+                );
+            }
             if let Some((commit_ts, encoded_key, tombstone_val)) = publish_data {
                 if let Some(ref mvcc) = self.mvcc {
                     Self::publish_raw_batch_or_poison(
@@ -16472,20 +16493,7 @@ impl LsmStorageInner {
     }
 
     fn delete_range_once(&self, start: &[u8], end: &[u8]) -> Result<()> {
-        {
-            let _guard = self.active_memtable_lock.read();
-            let state = self.state.load_full();
-            if let Some(ref mvcc) = self.mvcc {
-                mvcc.write_range_tombstone(start, end, &state.memtable)?;
-            } else {
-                // Non-MVCC path: use ts=0 as a sentinel.
-                state.memtable.put_range_tombstone(start, end, 0, 0)?;
-            }
-        }
-        // M5: The WAL file lifecycle is managed by flush, which only deletes
-        // the WAL file after the SST is durably written. Between releasing
-        // the lock above and the commit_wal inside the mvcc/memtable calls,
-        // the memtable may be frozen but the WAL file is still alive.
+        self.range_batch_write_attempt(&[(start, end)])?;
         self.try_freeze_memtable()
     }
 
@@ -23234,6 +23242,14 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    fn sync_async_for_test(engine: &KvEngine) -> anyhow::Result<()> {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(engine.sync_async())
+    }
+
+    #[cfg(target_os = "linux")]
     #[test]
     fn failpoint_v7_sync_keeps_admission_closed_after_prior_manifest_poison() -> anyhow::Result<()>
     {
@@ -23671,6 +23687,435 @@ mod tests {
         assert!(baseline_recovered, "reopen lost the acknowledged baseline");
 
         Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn v7_sync_publication_barrier_case(
+        scenario: &'static str,
+        barrier: fn(&KvEngine) -> anyhow::Result<()>,
+        admission_reopens_after_barrier: bool,
+        serializable: bool,
+        before_publication: &[(&[u8], Option<&[u8]>)],
+        after_publication: &[(&[u8], Option<&[u8]>)],
+        write: impl FnOnce(Arc<KvEngine>) -> anyhow::Result<()> + Send + 'static,
+    ) -> anyhow::Result<()> {
+        use std::time::{Duration, Instant};
+
+        use crate::manifest::ManifestRecord;
+
+        fn matches_expected(
+            engine: &KvEngine,
+            expected: &[(&[u8], Option<&[u8]>)],
+        ) -> anyhow::Result<bool> {
+            for &(key, value) in expected {
+                if engine.get(key)?.as_deref() != value {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
+
+        let directory = tempdir()?;
+        let mut options = v7_recovery_test_database(directory.path())?;
+        options.serializable = serializable;
+        // Inspect the complete MANIFEST stream before cleanup can publish a
+        // newer boundary; this fixture keeps its records out of snapshots.
+        options.manifest_snapshot_threshold_bytes = 0;
+        let database = directory.path().join("db");
+        let engine = KvEngine::open_with_wal_io_mode(
+            &database,
+            options.clone(),
+            crate::wal::WalIoMode::Parallel,
+        )?;
+        for (key, value) in [
+            (&b"sync-close-baseline"[..], &b"kept"[..]),
+            (&b"sync-close-delete-target"[..], &b"old"[..]),
+            (&b"sync-close-range-a"[..], &b"a"[..]),
+            (&b"sync-close-range-b"[..], &b"b"[..]),
+            (&b"sync-close-range-z"[..], &b"z"[..]),
+        ] {
+            engine.put(key, value)?;
+        }
+        let active = engine.inner.state.load().memtable.clone();
+        assert!(active.uses_v7_wal());
+        assert!(active.uses_parallel_wal());
+        let sequencer = engine.inner.mvcc.as_ref().unwrap();
+        let frontier_before = active.v7_frontier_cursor()?.frontier;
+        let boundary_before = engine
+            .pitr_manifest_state
+            .lock()
+            .active_boundary
+            .ok_or_else(|| anyhow::anyhow!("v7 barrier fixture has no Active boundary"))?;
+
+        let pause = crate::lsm_storage::native_write::NativeWritePause::new(
+            crate::lsm_storage::native_write::NativeWriteStage::Durable,
+        );
+        let _release_on_exit = NativeWritePauseReleaseGuard(Arc::clone(&pause));
+        *engine.inner.native_write_pause.lock() = Some(Arc::clone(&pause));
+        let writer_engine = Arc::clone(&engine);
+        let writer = std::thread::spawn(move || write(writer_engine));
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        let reached_durable_pause = runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), pause.reached.notified())
+                .await
+                .is_ok()
+        });
+        let hidden_before_publication =
+            reached_durable_pause && matches_expected(&engine, before_publication)?;
+        let frontier_after_sync = active.v7_frontier_cursor()?.frontier;
+        let durable_frontier_advanced = frontier_after_sync.ticket_end > frontier_before.ticket_end
+            && frontier_after_sync.durable_end > frontier_before.durable_end;
+        let paused_commit_ts = pause.timestamp.load(std::sync::atomic::Ordering::Acquire);
+        let expected_boundary = crate::pitr::manifest::ActiveBoundary {
+            ticket_end: frontier_after_sync.ticket_end,
+            durable_end: frontier_after_sync.durable_end,
+            last_commit_ts: frontier_after_sync.last_commit_ts,
+            prefix_digest: frontier_after_sync.prefix_digest,
+            ..boundary_before
+        };
+
+        let barrier_engine = Arc::clone(&engine);
+        let barrier_worker = std::thread::spawn(move || barrier(&barrier_engine));
+        let barrier_deadline = Instant::now() + Duration::from_secs(5);
+        while sequencer.commit_admission_is_open()
+            && !barrier_worker.is_finished()
+            && Instant::now() < barrier_deadline
+        {
+            std::thread::yield_now();
+        }
+        let barrier_stopped_admission = !sequencer.commit_admission_is_open();
+        let admission_rejected_new_commit = if barrier_stopped_admission {
+            match sequencer.reserve_commit_ts() {
+                Ok(commit_ts) => {
+                    sequencer.retire_commit_ts(commit_ts);
+                    false
+                }
+                Err(_) => true,
+            }
+        } else {
+            false
+        };
+        std::thread::sleep(Duration::from_millis(50));
+        let barrier_waited_for_publication = !barrier_worker.is_finished();
+        let wal_open_while_writer_paused = active.parallel_wal_is_closed() == Some(false);
+
+        // Release and join before assertions so a regression cannot strand the
+        // writer or barrier worker on a test failure.
+        pause.release_blocking();
+        let writer_result = writer.join().unwrap();
+        let barrier_result = barrier_worker.join().unwrap();
+        writer_result?;
+        barrier_result?;
+
+        let published_after_barrier = matches_expected(&engine, after_publication)?;
+        let admission_reopened = sequencer.commit_admission_is_open();
+        // A later close could repair a stale or missing boundary from sync.
+        // Capture and check the actual persisted record before cleanup starts.
+        let manifest_bytes = std::fs::read(database.join("MANIFEST"))?;
+        let manifest_records = serde_json::Deserializer::from_slice(&manifest_bytes)
+            .into_iter::<ManifestRecord>()
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let persisted_boundary =
+            manifest_records
+                .into_iter()
+                .rev()
+                .find_map(|record| match record {
+                    ManifestRecord::Pitr(
+                        crate::pitr::manifest::PitrManifestRecord::ActiveBoundaryAdvanced {
+                            boundary,
+                        },
+                    ) => Some(boundary),
+                    _ => None,
+                });
+        let projected_boundary = engine.pitr_manifest_state.lock().active_boundary;
+        if admission_reopens_after_barrier {
+            engine.close()?;
+        }
+        drop(active);
+        drop(engine);
+
+        let reopened =
+            KvEngine::open_with_wal_io_mode(&database, options, crate::wal::WalIoMode::Parallel)?;
+        let recovered_after_reopen = matches_expected(&reopened, after_publication)?;
+        reopened.close_storage()?;
+
+        assert!(
+            reached_durable_pause,
+            "{scenario}: write missed its durable pause"
+        );
+        assert!(
+            hidden_before_publication,
+            "{scenario}: durable commit became visible before publication"
+        );
+        assert!(
+            durable_frontier_advanced,
+            "{scenario}: WAL durability did not advance before pause"
+        );
+        assert!(
+            barrier_stopped_admission,
+            "{scenario}: barrier did not stop commit admission"
+        );
+        assert!(
+            admission_rejected_new_commit,
+            "{scenario}: barrier admitted a commit past its cutoff"
+        );
+        assert!(
+            barrier_waited_for_publication,
+            "{scenario}: barrier returned before the admitted commit published"
+        );
+        assert!(
+            wal_open_while_writer_paused,
+            "{scenario}: barrier closed the WAL before the admitted commit drained"
+        );
+        assert!(
+            published_after_barrier,
+            "{scenario}: barrier returned without publishing the admitted commit"
+        );
+        assert_eq!(
+            admission_reopened, admission_reopens_after_barrier,
+            "{scenario}: barrier left commit admission in the wrong state"
+        );
+        assert_eq!(
+            persisted_boundary,
+            Some(expected_boundary),
+            "{scenario}: barrier did not persist the exact durable cutoff"
+        );
+        assert_ne!(
+            expected_boundary, boundary_before,
+            "{scenario}: fixture did not advance beyond its persisted boundary"
+        );
+        assert_eq!(
+            expected_boundary.last_commit_ts, paused_commit_ts,
+            "{scenario}: captured frontier does not end at the paused commit"
+        );
+        assert_eq!(
+            projected_boundary,
+            Some(expected_boundary),
+            "{scenario}: barrier did not publish the exact durable cutoff"
+        );
+        assert!(
+            recovered_after_reopen,
+            "{scenario}: reopen lost the commit covered by the barrier"
+        );
+
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn v7_sync_batch_durable_before_close_is_published_and_recovered() -> anyhow::Result<()> {
+        let before_publication = [
+            (&b"sync-close-baseline"[..], Some(&b"kept"[..])),
+            (&b"sync-batch-a"[..], None),
+            (&b"sync-batch-b"[..], None),
+        ];
+        let after_publication = [
+            (&b"sync-close-baseline"[..], Some(&b"kept"[..])),
+            (&b"sync-batch-a"[..], Some(&b"batch-a"[..])),
+            (&b"sync-batch-b"[..], Some(&b"batch-b"[..])),
+        ];
+        v7_sync_publication_barrier_case(
+            "point batch",
+            KvEngine::close,
+            false,
+            false,
+            &before_publication,
+            &after_publication,
+            |engine| {
+                engine.write_batch(&[
+                    WriteBatchRecord::Put(&b"sync-batch-a"[..], &b"batch-a"[..]),
+                    WriteBatchRecord::Put(&b"sync-batch-b"[..], &b"batch-b"[..]),
+                ])
+            },
+        )
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn v7_sync_transaction_durable_before_close_is_published_and_recovered() -> anyhow::Result<()> {
+        let before_publication = [
+            (&b"sync-close-baseline"[..], Some(&b"kept"[..])),
+            (&b"sync-txn-a"[..], None),
+            (&b"sync-txn-b"[..], None),
+        ];
+        let after_publication = [
+            (&b"sync-close-baseline"[..], Some(&b"kept"[..])),
+            (&b"sync-txn-a"[..], Some(&b"txn-a"[..])),
+            (&b"sync-txn-b"[..], Some(&b"txn-b"[..])),
+        ];
+        v7_sync_publication_barrier_case(
+            "serializable transaction",
+            KvEngine::close,
+            false,
+            true,
+            &before_publication,
+            &after_publication,
+            |engine| {
+                let transaction = engine.new_txn()?;
+                anyhow::ensure!(
+                    transaction.get(b"sync-close-baseline")?.as_deref() == Some(b"kept"),
+                    "transaction did not read its baseline"
+                );
+                transaction.put(b"sync-txn-a", b"txn-a")?;
+                transaction.put(b"sync-txn-b", b"txn-b")?;
+                transaction.commit()
+            },
+        )
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn v7_sync_ttl_durable_before_close_is_published_and_recovered() -> anyhow::Result<()> {
+        let before_publication = [
+            (&b"sync-close-baseline"[..], Some(&b"kept"[..])),
+            (&b"sync-ttl"[..], None),
+        ];
+        let after_publication = [
+            (&b"sync-close-baseline"[..], Some(&b"kept"[..])),
+            (&b"sync-ttl"[..], Some(&b"ttl-value"[..])),
+        ];
+        v7_sync_publication_barrier_case(
+            "TTL put",
+            KvEngine::close,
+            false,
+            false,
+            &before_publication,
+            &after_publication,
+            |engine| {
+                engine.put_with_ttl(
+                    b"sync-ttl",
+                    b"ttl-value",
+                    std::time::Duration::from_secs(3_600),
+                )
+            },
+        )
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn v7_sync_delete_durable_before_close_is_published_and_recovered() -> anyhow::Result<()> {
+        let before_publication = [
+            (&b"sync-close-baseline"[..], Some(&b"kept"[..])),
+            (&b"sync-close-delete-target"[..], Some(&b"old"[..])),
+        ];
+        let after_publication = [
+            (&b"sync-close-baseline"[..], Some(&b"kept"[..])),
+            (&b"sync-close-delete-target"[..], None),
+        ];
+        v7_sync_publication_barrier_case(
+            "point delete",
+            KvEngine::close,
+            false,
+            false,
+            &before_publication,
+            &after_publication,
+            |engine| engine.delete(b"sync-close-delete-target"),
+        )
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn v7_sync_range_batch_durable_before_close_is_published_and_recovered() -> anyhow::Result<()> {
+        let before_publication = [
+            (&b"sync-close-baseline"[..], Some(&b"kept"[..])),
+            (&b"sync-close-range-a"[..], Some(&b"a"[..])),
+            (&b"sync-close-range-b"[..], Some(&b"b"[..])),
+            (&b"sync-close-range-z"[..], Some(&b"z"[..])),
+        ];
+        let after_publication = [
+            (&b"sync-close-baseline"[..], Some(&b"kept"[..])),
+            (&b"sync-close-range-a"[..], None),
+            (&b"sync-close-range-b"[..], None),
+            (&b"sync-close-range-z"[..], Some(&b"z"[..])),
+        ];
+        v7_sync_publication_barrier_case(
+            "range delete batch",
+            KvEngine::close,
+            false,
+            false,
+            &before_publication,
+            &after_publication,
+            |engine| {
+                engine.write_batch(&[WriteBatchRecord::DelRange(
+                    &b"sync-close-range-a"[..],
+                    &b"sync-close-range-z"[..],
+                )])
+            },
+        )
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn v7_sync_range_delete_durable_before_close_is_published_and_recovered() -> anyhow::Result<()>
+    {
+        let before_publication = [
+            (&b"sync-close-baseline"[..], Some(&b"kept"[..])),
+            (&b"sync-close-range-a"[..], Some(&b"a"[..])),
+            (&b"sync-close-range-b"[..], Some(&b"b"[..])),
+            (&b"sync-close-range-z"[..], Some(&b"z"[..])),
+        ];
+        let after_publication = [
+            (&b"sync-close-baseline"[..], Some(&b"kept"[..])),
+            (&b"sync-close-range-a"[..], None),
+            (&b"sync-close-range-b"[..], None),
+            (&b"sync-close-range-z"[..], Some(&b"z"[..])),
+        ];
+        v7_sync_publication_barrier_case(
+            "direct range delete",
+            KvEngine::close,
+            false,
+            false,
+            &before_publication,
+            &after_publication,
+            |engine| engine.delete_range(b"sync-close-range-a", b"sync-close-range-z"),
+        )
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn v7_sync_barrier_drains_durable_unpublished_write_and_recovers() -> anyhow::Result<()> {
+        let before_publication = [
+            (&b"sync-close-baseline"[..], Some(&b"kept"[..])),
+            (&b"sync-barrier-durable"[..], None),
+        ];
+        let after_publication = [
+            (&b"sync-close-baseline"[..], Some(&b"kept"[..])),
+            (&b"sync-barrier-durable"[..], Some(&b"published"[..])),
+        ];
+        v7_sync_publication_barrier_case(
+            "sync",
+            KvEngine::sync,
+            true,
+            false,
+            &before_publication,
+            &after_publication,
+            |engine| engine.put(b"sync-barrier-durable", b"published"),
+        )
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn v7_sync_async_barrier_drains_durable_unpublished_write_and_recovers() -> anyhow::Result<()> {
+        let before_publication = [
+            (&b"sync-close-baseline"[..], Some(&b"kept"[..])),
+            (&b"sync-async-barrier-durable"[..], None),
+        ];
+        let after_publication = [
+            (&b"sync-close-baseline"[..], Some(&b"kept"[..])),
+            (&b"sync-async-barrier-durable"[..], Some(&b"published"[..])),
+        ];
+        v7_sync_publication_barrier_case(
+            "async sync",
+            sync_async_for_test,
+            true,
+            false,
+            &before_publication,
+            &after_publication,
+            |engine| engine.put(b"sync-async-barrier-durable", b"published"),
+        )
     }
 
     #[cfg(target_os = "linux")]
@@ -27804,6 +28249,179 @@ mod tests {
                 engine.close_storage()?;
             }
         }
+
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn v7_checkpoint_drains_durable_unpublished_write_and_captures_it() -> anyhow::Result<()> {
+        for asynchronous in [false, true] {
+            v7_checkpoint_drains_durable_unpublished_write_and_captures_it_case(asynchronous)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn v7_checkpoint_drains_durable_unpublished_write_and_captures_it_case(
+        asynchronous: bool,
+    ) -> anyhow::Result<()> {
+        use std::time::{Duration, Instant};
+
+        let directory = tempdir()?;
+        let options = v7_recovery_test_database(directory.path())?;
+        let database = directory.path().join("db");
+        let checkpoint_path = directory.path().join("checkpoint");
+        let engine = KvEngine::open_with_wal_io_mode(
+            &database,
+            options.clone(),
+            crate::wal::WalIoMode::Parallel,
+        )?;
+        engine.put(b"checkpoint-close-baseline", b"kept")?;
+        let active = engine.inner.state.load().memtable.clone();
+        assert!(active.uses_v7_wal());
+        assert!(active.uses_parallel_wal());
+        let sequencer = engine.inner.mvcc.as_ref().unwrap();
+
+        let pause = crate::lsm_storage::native_write::NativeWritePause::new(
+            crate::lsm_storage::native_write::NativeWriteStage::Durable,
+        );
+        let _release_on_exit = NativeWritePauseReleaseGuard(Arc::clone(&pause));
+        *engine.inner.native_write_pause.lock() = Some(Arc::clone(&pause));
+        let writer_engine = Arc::clone(&engine);
+        let writer = std::thread::spawn(move || {
+            writer_engine.put(b"checkpoint-durable-unpublished", b"included")
+        });
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        let reached_durable_pause = runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), pause.reached.notified())
+                .await
+                .is_ok()
+        });
+        let hidden_before_publication =
+            reached_durable_pause && engine.get(b"checkpoint-durable-unpublished")?.is_none();
+        let checkpoint_engine = Arc::clone(&engine);
+        let worker_checkpoint_path = checkpoint_path.clone();
+        let checkpoint_worker = std::thread::spawn(move || {
+            if asynchronous {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()?
+                    .block_on(checkpoint_engine.create_checkpoint_async(&worker_checkpoint_path))
+            } else {
+                checkpoint_engine.create_checkpoint(&worker_checkpoint_path)
+            }
+        });
+        let cutoff_deadline = Instant::now() + Duration::from_secs(5);
+        while sequencer.commit_admission_is_open()
+            && !checkpoint_worker.is_finished()
+            && Instant::now() < cutoff_deadline
+        {
+            std::thread::yield_now();
+        }
+        let checkpoint_stopped_admission = !sequencer.commit_admission_is_open();
+        let checkpoint_rejected_new_commit = if checkpoint_stopped_admission {
+            engine.put(b"checkpoint-after-cutoff", b"rejected").is_err()
+        } else {
+            false
+        };
+        std::thread::sleep(Duration::from_millis(50));
+        let checkpoint_waited_for_publication = !checkpoint_worker.is_finished();
+        let wal_open_while_writer_paused = active.parallel_wal_is_closed() == Some(false);
+
+        // Always release and join both workers before assertions, so a failed
+        // barrier expectation cannot strand either thread during unwinding.
+        pause.release_blocking();
+        let writer_result = writer.join().unwrap();
+        let checkpoint_result = checkpoint_worker.join().unwrap();
+        writer_result?;
+        checkpoint_result?;
+
+        let source_published =
+            engine.get(b"checkpoint-durable-unpublished")? == Some(Bytes::from_static(b"included"));
+        let checkpoint = KvEngine::open(&checkpoint_path, LsmStorageOptions::default_for_test())?;
+        let checkpoint_includes_cutoff = checkpoint.get(b"checkpoint-durable-unpublished")?
+            == Some(Bytes::from_static(b"included"));
+        let checkpoint_keeps_baseline =
+            checkpoint.get(b"checkpoint-close-baseline")? == Some(Bytes::from_static(b"kept"));
+        let checkpoint_excludes_rejected_write =
+            checkpoint.get(b"checkpoint-after-cutoff")?.is_none();
+        engine.put(b"checkpoint-source-successor", b"newer")?;
+        let checkpoint_excludes_successor =
+            checkpoint.get(b"checkpoint-source-successor")?.is_none();
+        checkpoint.close()?;
+        engine.close()?;
+        drop(active);
+        drop(engine);
+
+        let reopened =
+            KvEngine::open_with_wal_io_mode(&database, options, crate::wal::WalIoMode::Parallel)?;
+        let source_recovers_cutoff = reopened.get(b"checkpoint-durable-unpublished")?
+            == Some(Bytes::from_static(b"included"));
+        let source_recovers_successor =
+            reopened.get(b"checkpoint-source-successor")? == Some(Bytes::from_static(b"newer"));
+        let source_excludes_rejected_write = reopened.get(b"checkpoint-after-cutoff")?.is_none();
+        reopened.close()?;
+
+        assert!(
+            reached_durable_pause,
+            "checkpoint writer missed its durable pause"
+        );
+        assert!(
+            hidden_before_publication,
+            "durable checkpoint write became visible before publication"
+        );
+        assert!(
+            checkpoint_stopped_admission,
+            "checkpoint did not stop commit admission"
+        );
+        assert!(
+            checkpoint_rejected_new_commit,
+            "checkpoint admitted a commit past its capture cutoff"
+        );
+        assert!(
+            checkpoint_waited_for_publication,
+            "checkpoint returned before its admitted commit published"
+        );
+        assert!(
+            wal_open_while_writer_paused,
+            "checkpoint closed the Active WAL before the admitted writer drained"
+        );
+        assert!(
+            source_published,
+            "checkpoint drain did not publish the source write"
+        );
+        assert!(
+            checkpoint_includes_cutoff,
+            "checkpoint omitted the durable commit admitted before its cutoff"
+        );
+        assert!(
+            checkpoint_keeps_baseline,
+            "checkpoint lost its acknowledged baseline"
+        );
+        assert!(
+            checkpoint_excludes_rejected_write,
+            "checkpoint included a write rejected past its cutoff"
+        );
+        assert!(
+            checkpoint_excludes_successor,
+            "checkpoint included a source write admitted after capture"
+        );
+        assert!(
+            source_recovers_cutoff,
+            "source reopen lost the durable cutoff write"
+        );
+        assert!(
+            source_recovers_successor,
+            "source reopen lost its post-checkpoint write"
+        );
+        assert!(
+            source_excludes_rejected_write,
+            "source reopen found a write rejected past the checkpoint cutoff"
+        );
 
         Ok(())
     }
