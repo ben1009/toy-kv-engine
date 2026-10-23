@@ -5879,10 +5879,16 @@ impl KvEngine {
             }
         }
 
+        #[cfg(feature = "chaos-testing")]
+        crate::chaos::failpoint::wal_crash_point(
+            "pitr.after_archive_commit_before_archived_manifest",
+        );
         let archived = crate::pitr::manifest::PitrManifestRecord::SegmentArchived {
             segment_id: active_segment_id,
         };
         self.persist_pitr_lifecycle_record_from_current_state(archived)?;
+        #[cfg(feature = "chaos-testing")]
+        crate::chaos::failpoint::wal_crash_point("pitr.after_archived_manifest_before_reclaimable");
         source_reservation_owner.release_logical_after_archive(active_segment_id)?;
         {
             // Keep manager advancement atomic with the durable Reclaimable
@@ -5917,6 +5923,10 @@ impl KvEngine {
             #[cfg(feature = "chaos-testing")]
             crate::chaos::failpoint::fail_point!(
                 "pitr.after_reclaimable_manifest_before_bookkeeping"
+            );
+            #[cfg(feature = "chaos-testing")]
+            crate::chaos::failpoint::wal_crash_point(
+                "pitr.after_reclaimable_manifest_before_bookkeeping",
             );
             *segments = reclaimable_segments;
         }

@@ -829,93 +829,21 @@ fn failpoint_v7_parallel_pitr_fallback_archive_restore() {
     let dir = tempfile::tempdir().expect("create v7 fallback archive-restore directory");
     let db_path = dir.path().join("db");
     let repository = dir.path().join("repository");
-    let engine = KvEngine::open(
-        &db_path,
-        LsmStorageOptions {
-            enable_wal: true,
-            ..LsmStorageOptions::default_for_test()
-        },
-    )
-    .expect("open database for PITR fallback setup");
-    assert!(matches!(
-        engine.create_backup(BackupOptions {
-            repository: repository.clone(),
-            use_hard_links: false,
-        }),
-        Ok(CreateBackupOutcome::Committed(_))
-    ));
-    assert!(matches!(
-        engine.enable_pitr(PitrOptions {
-            repository: repository.clone(),
-            config: PersistedPitrConfig {
-                archive_interval: Duration::from_secs(60),
-                max_segment_bytes: 1 << 20,
-                max_unarchived_bytes: 2 << 20,
-                max_source_spool_bytes: 8 << 20,
-            },
-            runtime: PitrRuntimeOptions::default(),
-        }),
-        Ok(EnablePitrOutcome::Enabled { .. })
-    ));
-    engine
-        .put(b"fallback-acknowledged", b"stable")
-        .expect("persist acknowledged baseline");
-    engine.close().expect("close PITR fallback setup engine");
-
+    prepare_legacy_v7_fallback_source(&db_path, &repository);
     let control_log_path = dir.path().join("fallback-control.log");
     let crash_marker_path = dir.path().join("fallback-crash.marker");
-    kill_pitr_child_at_crash_point(
-        &db_path,
-        &repository,
-        &control_log_path,
-        &crash_marker_path,
-        "parallel_wal.after_fdatasync",
-        Some(("fallback-v7-acknowledged", "durable")),
-        Some(("synced-before-publication", "candidate")),
-    );
-
-    let active_wal_path = find_v7_pitr_wal(&db_path);
-    let speculative_wal = std::fs::read(&active_wal_path).expect("read synced candidate WAL");
-    let speculative_wal_inode = std::fs::metadata(&active_wal_path)
-        .expect("stat synced candidate WAL")
-        .ino();
-    let candidate_key = b"synced-before-publication";
-    let candidate_key_offset = speculative_wal
-        .windows(candidate_key.len())
-        .position(|window| window == candidate_key)
-        .expect("find the unacknowledged candidate in the v7 DATA frames");
-    assert!(
-        speculative_wal
-            .windows(candidate_key.len())
-            .filter(|window| *window == candidate_key)
-            .count()
-            == 1,
-        "candidate key must have one unambiguous on-disk occurrence"
-    );
-    let candidate_key_end = candidate_key_offset + candidate_key.len();
-    assert_eq!(
-        candidate_key_offset / 4096,
-        (candidate_key_end - 1) / 4096,
-        "candidate key must fit in one aligned DATA frame"
-    );
-    let candidate_frame_offset = candidate_key_offset / 4096 * 4096;
-    assert_eq!(
-        &speculative_wal[candidate_frame_offset..candidate_frame_offset + 8],
-        b"TKVW7FR1",
-        "candidate bytes must belong to a canonical v7 frame"
-    );
-    assert_eq!(
-        u16::from_be_bytes(
-            speculative_wal[candidate_frame_offset + 10..candidate_frame_offset + 12]
-                .try_into()
-                .expect("v7 frame kind has two bytes")
-        ),
-        1,
-        "candidate bytes must belong to a DATA frame"
-    );
-
-    let (candidate_frontier_offset, trailing_frontier_offset, trailing_frontier) =
-        append_speculative_frontier_after_zero_tail(&active_wal_path, &speculative_wal, 1 << 20);
+    let fixture =
+        prepare_v7_fallback_candidate(&db_path, &repository, &control_log_path, &crash_marker_path);
+    let V7FallbackCandidateFixture {
+        active_wal_path,
+        speculative_wal,
+        speculative_wal_inode,
+        candidate_key_offset,
+        candidate_frontier_offset,
+        trailing_frontier_offset,
+        trailing_frontier,
+    } = fixture;
+    let candidate_key = V7_FALLBACK_CANDIDATE_KEY;
     assert!(trailing_frontier_offset > candidate_frontier_offset);
     assert!(
         u64::from_be_bytes(
@@ -981,21 +909,8 @@ fn failpoint_v7_parallel_pitr_fallback_archive_restore() {
     // speculative FRONTIER sits later in the zero-filled tail, so recovery must
     // scan back through that tail, reject both candidates, and fall back above
     // the manifest floor.
-    let mut wal = std::fs::OpenOptions::new()
-        .write(true)
-        .open(&active_wal_path)
-        .expect("open Active v7 WAL to damage speculative candidate");
-    wal.seek(SeekFrom::Start(
-        u64::try_from(candidate_key_offset).expect("candidate offset fits u64"),
-    ))
-    .expect("seek to speculative candidate bytes");
-    wal.write_all(&[speculative_wal[candidate_key_offset] ^ 1])
-        .expect("damage speculative candidate bytes");
-    wal.sync_all()
-        .expect("persist speculative candidate corruption");
-    drop(wal);
     let tailed_wal =
-        std::fs::read(&active_wal_path).expect("read WAL with speculative tail marker");
+        corrupt_v7_fallback_candidate(&active_wal_path, &speculative_wal, candidate_key_offset);
     assert_eq!(
         &tailed_wal[trailing_frontier_offset..trailing_frontier_offset + 8],
         b"TKVW7FR1",
@@ -1173,6 +1088,190 @@ fn failpoint_v7_parallel_pitr_fallback_archive_restore() {
         "latest restore must not replay the rejected speculative candidate"
     );
     restored.close().expect("close restored fallback database");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn failpoint_v7_parallel_pitr_fallback_normalization_write_crash_archives_and_restores() {
+    let probe_dir = tempfile::tempdir().expect("create v7 Parallel fallback-continuation probe");
+    let probe = KvEngine::open_with_wal_io_mode(
+        probe_dir.path(),
+        LsmStorageOptions {
+            enable_wal: true,
+            ..LsmStorageOptions::default_for_test()
+        },
+        WalIoMode::Parallel,
+    )
+    .unwrap_or_else(|error| {
+        panic!("v7 fallback-continuation crash qualification requires io_uring: {error:#}")
+    });
+    probe
+        .close()
+        .expect("close v7 Parallel fallback-continuation probe");
+
+    let dir = tempfile::tempdir().expect("create v7 fallback-continuation crash directory");
+    let db_path = dir.path().join("db");
+    let repository = dir.path().join("repository");
+    prepare_legacy_v7_fallback_source(&db_path, &repository);
+    let fixture = prepare_v7_fallback_candidate(
+        &db_path,
+        &repository,
+        &dir.path().join("fallback-continuation-control.log"),
+        &dir.path()
+            .join("fallback-continuation-initial-crash.marker"),
+    );
+    corrupt_v7_fallback_candidate(
+        &fixture.active_wal_path,
+        &fixture.speculative_wal,
+        fixture.candidate_key_offset,
+    );
+
+    const NORMALIZED_WRITE_KEY: &str = "after-fallback-normalization-synced-before-ack";
+    kill_pitr_child_at_crash_point_with_operation(
+        &db_path,
+        &repository,
+        &dir.path().join("fallback-continuation-second-control.log"),
+        &dir.path().join("fallback-continuation-second-crash.marker"),
+        "parallel_wal.after_fdatasync",
+        PitrChildCrashOperation::AsyncWrite {
+            acknowledged_write: None,
+            write: Some((NORMALIZED_WRITE_KEY, "normalized")),
+        },
+    );
+
+    assert_ne!(
+        std::fs::metadata(&fixture.active_wal_path)
+            .expect("stat Active WAL after child fallback and write")
+            .ino(),
+        fixture.speculative_wal_inode,
+        "the child must normalize the damaged Active WAL into a fresh inode before writing"
+    );
+
+    let recovered = open_and_resume_parallel_pitr(&db_path, &repository);
+    for (key, expected) in [
+        (b"fallback-acknowledged".as_slice(), b"stable".as_slice()),
+        (
+            b"acknowledged-migration-trigger".as_slice(),
+            b"legacy".as_slice(),
+        ),
+        (
+            b"fallback-v7-acknowledged".as_slice(),
+            b"durable".as_slice(),
+        ),
+        (NORMALIZED_WRITE_KEY.as_bytes(), b"normalized".as_slice()),
+    ] {
+        assert_eq!(
+            recovered
+                .get(key)
+                .expect("read value after fallback-normalization process crash")
+                .as_deref(),
+            Some(expected),
+            "the anchored prefix and the synced write after normalization must survive"
+        );
+    }
+    assert_eq!(
+        recovered
+            .get(V7_FALLBACK_CANDIDATE_KEY)
+            .expect("read rejected candidate after fallback-normalization process crash"),
+        None,
+        "fallback must continue to discard the damaged speculative candidate"
+    );
+
+    recovered
+        .put(b"after-fallback-crash-reopen", b"successor")
+        .expect("append a successor after reopening the normalized WAL");
+    recovered
+        .sync()
+        .expect("sync a successor after reopening the normalized WAL");
+    let point = match recovered
+        .create_recovery_point()
+        .expect("archive writes after Active fallback normalization and crash")
+    {
+        RecoveryPointOutcome::Durable(point) => point,
+        outcome => panic!("fallback-continuation recovery point was not durable: {outcome:?}"),
+    };
+    let point_commit_ts = point
+        .commit_ts
+        .expect("fallback-continuation recovery point has a commit timestamp");
+    let status = recovered
+        .pitr_status(PitrStatusOptions {
+            cursor: None,
+            page_size: NonZeroUsize::new(64).expect("nonzero PITR status page size"),
+        })
+        .expect("read recoverable intervals after fallback-continuation archive");
+    let interval = status
+        .recoverable_intervals
+        .first()
+        .expect("fallback-continuation repository has a recoverable interval");
+    let selector = RecoverySelector {
+        timeline_id: interval.timeline_id,
+        archive_epoch_id: Some(interval.archive_epoch_id),
+        base_backup_id: None,
+    };
+    recovered
+        .close()
+        .expect("close source after fallback-continuation archive");
+    drop(recovered);
+
+    let backup_repository =
+        BackupRepository::open(&repository).expect("open fallback-continuation repository");
+    let restored_path = dir.path().join("restored-after-fallback-continuation");
+    let restore_outcome = backup_repository
+        .restore_to(
+            RecoveryTarget::CommitTs(point_commit_ts),
+            &restored_path,
+            PitrRestoreOptions {
+                selector,
+                implementations: ImplementationRegistry,
+                executor_threads: NonZeroUsize::new(1).expect("one restore worker is nonzero"),
+                cache_capacity: 4096,
+                storage: LsmStorageOptions::default_for_test(),
+            },
+        )
+        .expect("restore fallback-continuation recovery point");
+    assert!(matches!(
+        restore_outcome,
+        RestoreToOutcome::Restored(info) if info.resolved_commit_ts == Some(point_commit_ts)
+    ));
+    drop(backup_repository);
+
+    let restored = KvEngine::open(&restored_path, LsmStorageOptions::default_for_test())
+        .expect("open restored fallback-continuation database");
+    for (key, expected) in [
+        (b"fallback-acknowledged".as_slice(), b"stable".as_slice()),
+        (
+            b"acknowledged-migration-trigger".as_slice(),
+            b"legacy".as_slice(),
+        ),
+        (
+            b"fallback-v7-acknowledged".as_slice(),
+            b"durable".as_slice(),
+        ),
+        (NORMALIZED_WRITE_KEY.as_bytes(), b"normalized".as_slice()),
+        (
+            b"after-fallback-crash-reopen".as_slice(),
+            b"successor".as_slice(),
+        ),
+    ] {
+        assert_eq!(
+            restored
+                .get(key)
+                .expect("read value from restored fallback-continuation database")
+                .as_deref(),
+            Some(expected),
+            "restore must preserve the anchored prefix and writes after fallback normalization"
+        );
+    }
+    assert_eq!(
+        restored
+            .get(V7_FALLBACK_CANDIDATE_KEY)
+            .expect("read rejected candidate from restored database"),
+        None,
+        "restore must not replay the damaged speculative candidate"
+    );
+    restored
+        .close()
+        .expect("close restored fallback-continuation database");
 }
 
 #[cfg(target_os = "linux")]
@@ -3064,6 +3163,132 @@ fn v7_parallel_pitr_sync_and_async_write_apis_survive_reopen() {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn v7_parallel_pitr_archive_restore_preserves_mixed_record_semantics() {
+    let dir = tempfile::tempdir().expect("create v7 archive-restore regression directory");
+    let db_path = dir.path().join("db");
+    let repository_path = dir.path().join("repository");
+    let engine = prepare_empty_v7_parallel_pitr(&db_path, &repository_path);
+
+    engine
+        .put_with_ttl(b"restore-live-ttl", b"alive", Duration::from_secs(3600))
+        .expect("write live TTL value to v7 WAL");
+    engine
+        .put_with_ttl(b"restore-expired-ttl", b"gone", Duration::ZERO)
+        .expect("write immediately expired TTL value to v7 WAL");
+    engine
+        .put(b"restore-point-delete", b"hidden")
+        .expect("seed point tombstone value");
+    engine
+        .delete(b"restore-point-delete")
+        .expect("write point tombstone to v7 WAL");
+    for (key, value) in [
+        (b"restore-range-a".as_slice(), b"start".as_slice()),
+        (b"restore-range-b".as_slice(), b"interior".as_slice()),
+        (b"restore-range-c".as_slice(), b"end".as_slice()),
+    ] {
+        engine.put(key, value).expect("seed range tombstone values");
+    }
+    engine
+        .delete_range(b"restore-range-a", b"restore-range-c")
+        .expect("write half-open range tombstone to v7 WAL");
+
+    let point = match engine
+        .create_recovery_point()
+        .expect("seal and archive mixed v7 WAL records")
+    {
+        RecoveryPointOutcome::Durable(point) => point,
+        outcome => panic!("mixed-record recovery point was not durable: {outcome:?}"),
+    };
+    let point_commit_ts = point
+        .commit_ts
+        .expect("mixed-record recovery point has a commit timestamp");
+    let status = engine
+        .pitr_status(PitrStatusOptions {
+            cursor: None,
+            page_size: NonZeroUsize::new(64).expect("nonzero PITR status page size"),
+        })
+        .expect("read status after mixed-record archive");
+    let interval = status
+        .recoverable_intervals
+        .first()
+        .expect("repository contains a recoverable base interval");
+    let selector = RecoverySelector {
+        timeline_id: interval.timeline_id,
+        archive_epoch_id: Some(interval.archive_epoch_id),
+        base_backup_id: None,
+    };
+    engine.close().expect("close source engine after archive");
+    drop(engine);
+
+    let backup_repository =
+        BackupRepository::open(&repository_path).expect("open repository for exact restore");
+    let restored_path = dir.path().join("restored");
+    let restore_outcome = backup_repository
+        .restore_to(
+            RecoveryTarget::CommitTs(point_commit_ts),
+            &restored_path,
+            PitrRestoreOptions {
+                selector,
+                implementations: ImplementationRegistry,
+                executor_threads: NonZeroUsize::new(1).expect("one restore worker is nonzero"),
+                cache_capacity: 4096,
+                storage: LsmStorageOptions::default_for_test(),
+            },
+        )
+        .expect("restore mixed v7 DATA records from the sealed archive");
+    assert!(matches!(
+        restore_outcome,
+        RestoreToOutcome::Restored(info) if info.resolved_commit_ts == Some(point_commit_ts)
+    ));
+    drop(backup_repository);
+
+    let restored = KvEngine::open(&restored_path, LsmStorageOptions::default_for_test())
+        .expect("open restored mixed-record database");
+    assert_eq!(
+        restored
+            .get(b"restore-live-ttl")
+            .expect("read restored live TTL value")
+            .as_deref(),
+        Some(b"alive".as_slice())
+    );
+    assert_eq!(
+        restored
+            .get(b"restore-expired-ttl")
+            .expect("read restored expired TTL value"),
+        None
+    );
+    assert_eq!(
+        restored
+            .get(b"restore-point-delete")
+            .expect("read restored point tombstone"),
+        None
+    );
+    assert_eq!(
+        restored
+            .get(b"restore-range-a")
+            .expect("read key at inclusive range start"),
+        None
+    );
+    assert_eq!(
+        restored
+            .get(b"restore-range-b")
+            .expect("read key inside half-open range"),
+        None
+    );
+    assert_eq!(
+        restored
+            .get(b"restore-range-c")
+            .expect("read key at exclusive range end")
+            .as_deref(),
+        Some(b"end".as_slice())
+    );
+    restored
+        .close()
+        .expect("close restored mixed-record database");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn failpoint_v7_parallel_pitr_checkpoint_captures_its_fixed_cutoff() {
     let _failpoint_guard = lock_v7_async_checkpoint_failpoint();
     let _scenario = FailScenario::setup();
@@ -4279,6 +4504,162 @@ fn failpoint_v7_parallel_async_range_delete_crash_after_sync_before_ack_recovers
 
 #[cfg(target_os = "linux")]
 #[test]
+fn failpoint_v7_parallel_async_range_batch_crash_after_sync_before_ack_recovers_all_tombstones() {
+    let probe_dir = tempfile::tempdir().expect("create v7 async range-batch probe directory");
+    let probe_options = LsmStorageOptions {
+        enable_wal: true,
+        ..LsmStorageOptions::default_for_test()
+    };
+    match KvEngine::open_with_wal_io_mode(probe_dir.path(), probe_options, WalIoMode::Parallel) {
+        Ok(engine) => engine
+            .close()
+            .expect("close v7 Parallel async range-batch crash probe"),
+        Err(error) => {
+            panic!("v7 Parallel async range-batch crash qualification requires io_uring: {error:#}")
+        }
+    }
+
+    let dir = tempfile::tempdir().expect("create v7 async range-batch crash directory");
+    let db_path = dir.path().join("db");
+    let repository_path = dir.path().join("repository");
+    let engine = prepare_empty_v7_parallel_pitr(&db_path, &repository_path);
+    for (key, value) in [
+        (
+            b"0-async-range-batch-baseline".as_slice(),
+            b"stable".as_slice(),
+        ),
+        (b"async-range-batch-a".as_slice(), b"first-start".as_slice()),
+        (
+            b"async-range-batch-b".as_slice(),
+            b"first-interior".as_slice(),
+        ),
+        (b"async-range-batch-c".as_slice(), b"first-end".as_slice()),
+        (
+            b"async-range-batch-e".as_slice(),
+            b"second-start".as_slice(),
+        ),
+        (
+            b"async-range-batch-f".as_slice(),
+            b"second-interior".as_slice(),
+        ),
+        (b"async-range-batch-g".as_slice(), b"second-end".as_slice()),
+    ] {
+        engine
+            .put(key, value)
+            .expect("seed async range-batch crash values");
+    }
+    engine
+        .close()
+        .expect("close v7 async range-batch crash setup engine");
+
+    kill_pitr_child_at_crash_point_with_operation(
+        &db_path,
+        &repository_path,
+        &dir.path().join("async-range-batch-crash-control.log"),
+        &dir.path().join("async-range-batch-crash.marker"),
+        "parallel_wal.after_fdatasync",
+        PitrChildCrashOperation::AsyncRangeBatch {
+            ranges: [
+                ("async-range-batch-a", "async-range-batch-c"),
+                ("async-range-batch-e", "async-range-batch-g"),
+            ],
+        },
+    );
+
+    let recovered = open_and_resume_parallel_pitr(&db_path, &repository_path);
+    let expected_values = [
+        ("0-async-range-batch-baseline", Some(b"stable".as_slice())),
+        ("async-range-batch-a", None),
+        ("async-range-batch-b", None),
+        ("async-range-batch-c", Some(b"first-end".as_slice())),
+        ("async-range-batch-e", None),
+        ("async-range-batch-f", None),
+        ("async-range-batch-g", Some(b"second-end".as_slice())),
+    ];
+    for (key, expected) in expected_values {
+        assert_eq!(
+            recovered
+                .get(key.as_bytes())
+                .unwrap_or_else(|error| panic!(
+                    "read {key} after async range-batch crash: {error:#}"
+                ))
+                .as_deref(),
+            expected,
+            "the synced async range batch must recover every tombstone and preserve each exclusive endpoint"
+        );
+    }
+
+    let point = match recovered
+        .create_recovery_point()
+        .expect("archive recovered async range-batch state")
+    {
+        RecoveryPointOutcome::Durable(point) => point,
+        outcome => panic!("recovered async range-batch point was not durable: {outcome:?}"),
+    };
+    let point_commit_ts = point
+        .commit_ts
+        .expect("recovered async range-batch point has a commit timestamp");
+    let status = recovered
+        .pitr_status(PitrStatusOptions {
+            cursor: None,
+            page_size: NonZeroUsize::new(64).expect("nonzero PITR status page size"),
+        })
+        .expect("read recoverable intervals after async range-batch archive");
+    let interval = status
+        .recoverable_intervals
+        .first()
+        .expect("repository contains a recoverable async range-batch interval");
+    let selector = RecoverySelector {
+        timeline_id: interval.timeline_id,
+        archive_epoch_id: Some(interval.archive_epoch_id),
+        base_backup_id: None,
+    };
+    recovered
+        .close()
+        .expect("close source after async range-batch recovery point");
+    drop(recovered);
+
+    let backup_repository = BackupRepository::open(&repository_path)
+        .expect("open repository to restore async range-batch point");
+    let restored_path = dir.path().join("restored-async-range-batch");
+    let restore_outcome = backup_repository
+        .restore_to(
+            RecoveryTarget::CommitTs(point_commit_ts),
+            &restored_path,
+            PitrRestoreOptions {
+                selector,
+                implementations: ImplementationRegistry,
+                executor_threads: NonZeroUsize::new(1).expect("one restore worker is nonzero"),
+                cache_capacity: 4096,
+                storage: LsmStorageOptions::default_for_test(),
+            },
+        )
+        .expect("restore recovered async range-batch point");
+    assert!(matches!(
+        restore_outcome,
+        RestoreToOutcome::Restored(info) if info.resolved_commit_ts == Some(point_commit_ts)
+    ));
+    drop(backup_repository);
+
+    let restored = KvEngine::open(&restored_path, LsmStorageOptions::default_for_test())
+        .expect("open restored async range-batch database");
+    for (key, expected) in expected_values {
+        assert_eq!(
+            restored
+                .get(key.as_bytes())
+                .unwrap_or_else(|error| panic!("read restored {key}: {error:#}"))
+                .as_deref(),
+            expected,
+            "the archived async range batch must preserve all tombstones and exclusive endpoints"
+        );
+    }
+    restored
+        .close()
+        .expect("close restored async range-batch database");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn failpoint_v7_parallel_async_ttl_crash_after_sync_before_ack_recovers_expiration() {
     let probe_dir = tempfile::tempdir().expect("create v7 async TTL probe directory");
     let probe_options = LsmStorageOptions {
@@ -4461,6 +4842,217 @@ fn failpoint_v7_recovery_point_archive_crash_after_source_seal_recovers_and_resu
     restored
         .close()
         .expect("close restored database after recovery-point process crash");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn failpoint_v7_recovery_point_archive_crash_after_reclaimable_manifest_recovers_and_reclaims() {
+    run_v7_recovery_point_archive_manifest_crash(
+        "pitr.after_reclaimable_manifest_before_bookkeeping",
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn failpoint_v7_recovery_point_archive_crash_after_archive_commit_recovers_and_reclaims() {
+    run_v7_recovery_point_archive_manifest_crash(
+        "pitr.after_archive_commit_before_archived_manifest",
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn failpoint_v7_recovery_point_archive_crash_after_archived_manifest_recovers_and_reclaims() {
+    run_v7_recovery_point_archive_manifest_crash("pitr.after_archived_manifest_before_reclaimable");
+}
+
+#[cfg(target_os = "linux")]
+fn run_v7_recovery_point_archive_manifest_crash(crash_point: &str) {
+    let probe_dir = tempfile::tempdir().expect("create v7 recovery-point reclaim probe directory");
+    let probe_options = LsmStorageOptions {
+        enable_wal: true,
+        ..LsmStorageOptions::default_for_test()
+    };
+    match KvEngine::open_with_wal_io_mode(probe_dir.path(), probe_options, WalIoMode::Parallel) {
+        Ok(engine) => engine
+            .close()
+            .expect("close v7 Parallel recovery-point reclaim probe"),
+        Err(error) => {
+            panic!("v7 recovery-point crash qualification requires io_uring: {error:#}")
+        }
+    }
+
+    let dir = tempfile::tempdir().expect("create v7 recovery-point reclaim crash directory");
+    let db_path = dir.path().join("db");
+    let repository = dir.path().join("repository");
+    let engine = prepare_empty_v7_parallel_pitr(&db_path, &repository);
+    engine
+        .put(b"recovery-point-reclaim-baseline", b"stable")
+        .expect("persist acknowledged recovery-point reclaim baseline");
+    engine
+        .close()
+        .expect("close recovery-point reclaim crash setup engine");
+
+    let control_log_path = dir.path().join("recovery-point-reclaim-control.log");
+    let marker_path = dir.path().join("recovery-point-reclaim.marker");
+    kill_pitr_child_at_crash_point_with_operation(
+        &db_path,
+        &repository,
+        &control_log_path,
+        &marker_path,
+        crash_point,
+        PitrChildCrashOperation::AsyncRecoveryPoint,
+    );
+
+    let recovered = open_and_resume_parallel_pitr(&db_path, &repository);
+    assert_eq!(
+        recovered
+            .get(b"recovery-point-reclaim-baseline")
+            .expect("read archived baseline after reclaimable-manifest crash")
+            .as_deref(),
+        Some(b"stable".as_slice())
+    );
+    let recovered_status = recovered
+        .pitr_status(PitrStatusOptions {
+            cursor: None,
+            page_size: NonZeroUsize::new(64).expect("nonzero PITR status page size"),
+        })
+        .expect("read status after reclaimable-manifest recovery");
+    let archived_baseline_commit_ts = recovered_status
+        .latest_archived_commit_ts
+        .expect("crashed recovery point remains durably archived");
+    assert_eq!(recovered_status.active_wal_format_version, Some(7));
+
+    recovered
+        .put(b"after-recovery-point-reclaim-crash", b"resumed")
+        .expect("write after recovering the reclaimable-manifest crash");
+    let point = match recovered
+        .create_recovery_point()
+        .expect("create recovery point after reclaimable-manifest crash")
+    {
+        RecoveryPointOutcome::Durable(point) => point,
+        outcome => panic!("recovery-point retry was not durable: {outcome:?}"),
+    };
+    let point_commit_ts = point
+        .commit_ts
+        .expect("recovery-point retry has a committed timestamp");
+    assert!(point_commit_ts > archived_baseline_commit_ts);
+
+    recovered
+        .drain_flush()
+        .expect("flush all recovered immutable sources and reclaim archived WALs");
+    let flushed_status = recovered
+        .pitr_status(PitrStatusOptions {
+            cursor: None,
+            page_size: NonZeroUsize::new(64).expect("nonzero PITR status page size"),
+        })
+        .expect("read status after flushing recovered sources");
+    assert_eq!(
+        flushed_status.source_spool_bytes, 4096,
+        "flushing the recovered sources should leave only the Active segment's fixed reservation"
+    );
+    let interval = flushed_status
+        .recoverable_intervals
+        .first()
+        .expect("recovered repository contains a base interval");
+    let selector = RecoverySelector {
+        timeline_id: interval.timeline_id,
+        archive_epoch_id: Some(interval.archive_epoch_id),
+        base_backup_id: None,
+    };
+    recovered
+        .close()
+        .expect("close source after recovery-point reclaim crash");
+    drop(recovered);
+
+    let backup_repository =
+        BackupRepository::open(&repository).expect("open repository for crash recovery restore");
+    let baseline_restore_path = dir.path().join("restored-crash-recovery-point");
+    let baseline_restore = backup_repository
+        .restore_to(
+            RecoveryTarget::CommitTs(archived_baseline_commit_ts),
+            &baseline_restore_path,
+            PitrRestoreOptions {
+                selector,
+                implementations: ImplementationRegistry,
+                executor_threads: NonZeroUsize::new(1).expect("one restore worker is nonzero"),
+                cache_capacity: 4096,
+                storage: LsmStorageOptions::default_for_test(),
+            },
+        )
+        .expect("restore recovery point committed before process crash");
+    assert!(matches!(
+        baseline_restore,
+        RestoreToOutcome::Restored(info)
+            if info.resolved_commit_ts == Some(archived_baseline_commit_ts)
+    ));
+    drop(backup_repository);
+
+    let backup_repository = BackupRepository::open(&repository)
+        .expect("reopen repository after the first restore mutation");
+    let later_restore_path = dir
+        .path()
+        .join("restored-after-recovery-point-reclaim-crash");
+    let later_restore = backup_repository
+        .restore_to(
+            RecoveryTarget::CommitTs(point_commit_ts),
+            &later_restore_path,
+            PitrRestoreOptions {
+                selector,
+                implementations: ImplementationRegistry,
+                executor_threads: NonZeroUsize::new(1).expect("one restore worker is nonzero"),
+                cache_capacity: 4096,
+                storage: LsmStorageOptions::default_for_test(),
+            },
+        )
+        .expect("restore later recovery point after local source reclamation");
+    assert!(matches!(
+        later_restore,
+        RestoreToOutcome::Restored(info) if info.resolved_commit_ts == Some(point_commit_ts)
+    ));
+    drop(backup_repository);
+
+    let baseline_restored = KvEngine::open(
+        &baseline_restore_path,
+        LsmStorageOptions::default_for_test(),
+    )
+    .expect("open recovery point archived before process crash");
+    assert_eq!(
+        baseline_restored
+            .get(b"recovery-point-reclaim-baseline")
+            .expect("read baseline from pre-crash recovery point")
+            .as_deref(),
+        Some(b"stable".as_slice())
+    );
+    assert_eq!(
+        baseline_restored
+            .get(b"after-recovery-point-reclaim-crash")
+            .expect("check successor is excluded from pre-crash recovery point"),
+        None
+    );
+    baseline_restored
+        .close()
+        .expect("close pre-crash recovery-point restore");
+
+    let later_restored = KvEngine::open(&later_restore_path, LsmStorageOptions::default_for_test())
+        .expect("open later recovery point after process crash");
+    assert_eq!(
+        later_restored
+            .get(b"recovery-point-reclaim-baseline")
+            .expect("read baseline from later recovery point")
+            .as_deref(),
+        Some(b"stable".as_slice())
+    );
+    assert_eq!(
+        later_restored
+            .get(b"after-recovery-point-reclaim-crash")
+            .expect("read post-crash write from later recovery point")
+            .as_deref(),
+        Some(b"resumed".as_slice())
+    );
+    later_restored
+        .close()
+        .expect("close later recovery-point restore");
 }
 
 #[cfg(target_os = "linux")]
@@ -4671,6 +5263,9 @@ enum PitrChildCrashOperation<'a> {
         acknowledged_write: Option<(&'a str, &'a str)>,
         range: (&'a str, &'a str),
     },
+    AsyncRangeBatch {
+        ranges: [(&'a str, &'a str); 2],
+    },
     AsyncTtlWrite {
         acknowledged_write: Option<(&'a str, &'a str)>,
         write: Option<(&'a str, &'a str)>,
@@ -4847,6 +5442,7 @@ fn kill_pitr_child_at_crash_point_with_mode(
             acknowledged_write: None,
             ..
         } => "1",
+        PitrChildCrashOperation::AsyncRangeBatch { .. } => "1",
         PitrChildCrashOperation::AsyncTtlWrite {
             acknowledged_write: None,
             ..
@@ -4963,6 +5559,17 @@ fn kill_pitr_child_at_crash_point_with_mode(
         } => {
             child.arg("--async-range-delete");
             (acknowledged_write, Some(range))
+        }
+        PitrChildCrashOperation::AsyncRangeBatch {
+            ranges: [first, second],
+        } => {
+            child
+                .arg("--async-range-batch")
+                .arg("--second-range-start")
+                .arg(second.0)
+                .arg("--second-range-end")
+                .arg(second.1);
+            (None, Some(first))
         }
         PitrChildCrashOperation::AsyncTtlWrite {
             acknowledged_write,
@@ -5134,6 +5741,157 @@ fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> std::io::
     }
 
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+const V7_FALLBACK_CANDIDATE_KEY: &[u8] = b"synced-before-publication";
+
+#[cfg(target_os = "linux")]
+struct V7FallbackCandidateFixture {
+    active_wal_path: PathBuf,
+    speculative_wal: Vec<u8>,
+    speculative_wal_inode: u64,
+    candidate_key_offset: usize,
+    candidate_frontier_offset: usize,
+    trailing_frontier_offset: usize,
+    trailing_frontier: Vec<u8>,
+}
+
+#[cfg(target_os = "linux")]
+fn prepare_legacy_v7_fallback_source(db_path: &std::path::Path, repository: &std::path::Path) {
+    let engine = KvEngine::open(
+        db_path,
+        LsmStorageOptions {
+            enable_wal: true,
+            ..LsmStorageOptions::default_for_test()
+        },
+    )
+    .expect("open database for PITR fallback setup");
+    assert!(matches!(
+        engine.create_backup(BackupOptions {
+            repository: repository.to_path_buf(),
+            use_hard_links: false,
+        }),
+        Ok(CreateBackupOutcome::Committed(_))
+    ));
+    assert!(matches!(
+        engine.enable_pitr(PitrOptions {
+            repository: repository.to_path_buf(),
+            config: PersistedPitrConfig {
+                archive_interval: Duration::from_secs(60),
+                max_segment_bytes: 1 << 20,
+                max_unarchived_bytes: 2 << 20,
+                max_source_spool_bytes: 8 << 20,
+            },
+            runtime: PitrRuntimeOptions::default(),
+        }),
+        Ok(EnablePitrOutcome::Enabled { .. })
+    ));
+    engine
+        .put(b"fallback-acknowledged", b"stable")
+        .expect("persist acknowledged fallback baseline");
+    engine.close().expect("close PITR fallback setup engine");
+}
+
+#[cfg(target_os = "linux")]
+fn prepare_v7_fallback_candidate(
+    db_path: &std::path::Path,
+    repository: &std::path::Path,
+    control_log_path: &std::path::Path,
+    crash_marker_path: &std::path::Path,
+) -> V7FallbackCandidateFixture {
+    kill_pitr_child_at_crash_point(
+        db_path,
+        repository,
+        control_log_path,
+        crash_marker_path,
+        "parallel_wal.after_fdatasync",
+        Some(("fallback-v7-acknowledged", "durable")),
+        Some(("synced-before-publication", "candidate")),
+    );
+
+    let active_wal_path = find_v7_pitr_wal(db_path);
+    let speculative_wal = std::fs::read(&active_wal_path).expect("read synced candidate WAL");
+    let speculative_wal_inode = std::fs::metadata(&active_wal_path)
+        .expect("stat synced candidate WAL")
+        .ino();
+    let candidate_key_offset = speculative_wal
+        .windows(V7_FALLBACK_CANDIDATE_KEY.len())
+        .position(|window| window == V7_FALLBACK_CANDIDATE_KEY)
+        .expect("find the unacknowledged candidate in the v7 DATA frames");
+    assert_eq!(
+        speculative_wal
+            .windows(V7_FALLBACK_CANDIDATE_KEY.len())
+            .filter(|window| *window == V7_FALLBACK_CANDIDATE_KEY)
+            .count(),
+        1,
+        "candidate key must have one unambiguous on-disk occurrence"
+    );
+    let candidate_key_end = candidate_key_offset + V7_FALLBACK_CANDIDATE_KEY.len();
+    assert_eq!(
+        candidate_key_offset / 4096,
+        (candidate_key_end - 1) / 4096,
+        "candidate key must fit in one aligned DATA frame"
+    );
+    let candidate_frame_offset = candidate_key_offset / 4096 * 4096;
+    assert_eq!(
+        &speculative_wal[candidate_frame_offset..candidate_frame_offset + 8],
+        b"TKVW7FR1",
+        "candidate bytes must belong to a canonical v7 frame"
+    );
+    assert_eq!(
+        u16::from_be_bytes(
+            speculative_wal[candidate_frame_offset + 10..candidate_frame_offset + 12]
+                .try_into()
+                .expect("v7 frame kind has two bytes")
+        ),
+        1,
+        "candidate bytes must belong to a DATA frame"
+    );
+
+    let (candidate_frontier_offset, trailing_frontier_offset, trailing_frontier) =
+        append_speculative_frontier_after_zero_tail(&active_wal_path, &speculative_wal, 1 << 20);
+    assert!(trailing_frontier_offset > candidate_frontier_offset);
+    assert!(
+        u64::from_be_bytes(
+            trailing_frontier[80..88]
+                .try_into()
+                .expect("v7 frontier durable end has eight bytes")
+        ) <= u64::try_from(trailing_frontier_offset).expect("frontier offset fits u64"),
+        "trailing frontier must certify a prefix ending before its own frame"
+    );
+
+    V7FallbackCandidateFixture {
+        active_wal_path,
+        speculative_wal,
+        speculative_wal_inode,
+        candidate_key_offset,
+        candidate_frontier_offset,
+        trailing_frontier_offset,
+        trailing_frontier,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn corrupt_v7_fallback_candidate(
+    active_wal_path: &std::path::Path,
+    speculative_wal: &[u8],
+    candidate_key_offset: usize,
+) -> Vec<u8> {
+    let mut wal = std::fs::OpenOptions::new()
+        .write(true)
+        .open(active_wal_path)
+        .expect("open Active v7 WAL to damage speculative candidate");
+    wal.seek(SeekFrom::Start(
+        u64::try_from(candidate_key_offset).expect("candidate offset fits u64"),
+    ))
+    .expect("seek to speculative candidate bytes");
+    wal.write_all(&[speculative_wal[candidate_key_offset] ^ 1])
+        .expect("damage speculative candidate bytes");
+    wal.sync_all()
+        .expect("persist speculative candidate corruption");
+    drop(wal);
+    std::fs::read(active_wal_path).expect("read WAL with speculative tail marker")
 }
 
 #[cfg(target_os = "linux")]

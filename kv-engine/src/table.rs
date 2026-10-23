@@ -43,6 +43,11 @@ const SST_FOOTER_VERSION_V8: u8 = 8;
 const SST_FOOTER_VERSION_V9: u8 = 9;
 /// Size of the MVCC footer extension: max_ts (8) + magic (4) + version (1) = 13 bytes.
 const MVCC_FOOTER_EXTRA: u64 = (SIZE_OF_U64 + SIZE_OF_U32 + 1) as u64;
+const SST_RANGE_TOMBSTONE_FOOTER_V4_V7_LEN: u64 = 3 * SIZE_OF_U32 as u64 + MVCC_FOOTER_EXTRA;
+const SST_RANGE_TOMBSTONE_FOOTER_V8_LEN: u64 =
+    3 * SIZE_OF_U32 as u64 + 2 * SIZE_OF_U64 as u64 + 1 + MVCC_FOOTER_EXTRA;
+const SST_RANGE_TOMBSTONE_FOOTER_V9_LEN: u64 =
+    SST_RANGE_TOMBSTONE_FOOTER_V8_LEN + 2 * SIZE_OF_U64 as u64;
 
 /// A single prefix bloom filter for a specific prefix length.
 #[derive(Debug)]
@@ -635,9 +640,18 @@ impl SsTable {
         // Decode range-tombstone block (v4 only).
         let range_tombstones = if let Some(rt_off) = v4_rt_off {
             if rt_off > 0 {
-                // Range-tombstone block extends from rt_off to the start of
-                // the 25-byte v4 footer.
-                let footer_start = file.size() - 25;
+                // Range-tombstone blocks extend to the footer. Its length
+                // depends on the SST footer version, especially when TTL
+                // metadata is present.
+                let footer_len = match version {
+                    SST_FOOTER_VERSION_V8 => SST_RANGE_TOMBSTONE_FOOTER_V8_LEN,
+                    SST_FOOTER_VERSION_V9 => SST_RANGE_TOMBSTONE_FOOTER_V9_LEN,
+                    _ => SST_RANGE_TOMBSTONE_FOOTER_V4_V7_LEN,
+                };
+                let footer_start = file
+                    .size()
+                    .checked_sub(footer_len)
+                    .ok_or_else(|| anyhow::anyhow!("SST is shorter than its v{version} footer"))?;
                 anyhow::ensure!(
                     rt_off <= footer_start,
                     "range tombstone offset ({rt_off}) exceeds footer start ({footer_start})"
