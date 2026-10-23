@@ -3558,6 +3558,302 @@ fn failpoint_v7_parallel_async_transaction_crash_after_sync_before_ack_recovers(
 
 #[cfg(target_os = "linux")]
 #[test]
+fn failpoint_v7_parallel_sync_serializable_transaction_crash_after_sync_before_ack_recovers() {
+    let probe_dir = tempfile::tempdir().expect("create v7 sync transaction probe directory");
+    let probe_options = LsmStorageOptions {
+        enable_wal: true,
+        serializable: true,
+        ..LsmStorageOptions::default_for_test()
+    };
+    match KvEngine::open_with_wal_io_mode(probe_dir.path(), probe_options, WalIoMode::Parallel) {
+        Ok(engine) => engine
+            .close()
+            .expect("close v7 Parallel sync transaction crash probe"),
+        Err(error) => {
+            panic!("v7 Parallel sync transaction crash qualification requires io_uring: {error:#}")
+        }
+    }
+
+    let dir = tempfile::tempdir().expect("create v7 sync transaction crash directory");
+    let db_path = dir.path().join("db");
+    let repository = dir.path().join("repository");
+    let engine = prepare_empty_v7_parallel_pitr(&db_path, &repository);
+    engine
+        .put(b"sync-transaction-crash-baseline", b"stable")
+        .expect("persist acknowledged sync-transaction baseline");
+    engine
+        .close()
+        .expect("close v7 sync transaction crash setup engine");
+
+    kill_pitr_child_at_crash_point_with_operation(
+        &db_path,
+        &repository,
+        &dir.path().join("sync-transaction-crash-control.log"),
+        &dir.path().join("sync-transaction-crash.marker"),
+        "parallel_wal.after_fdatasync",
+        PitrChildCrashOperation::SyncTransaction {
+            read_key: "sync-transaction-crash-baseline",
+            write: ("sync-transaction-synced-before-ack", "candidate"),
+        },
+    );
+
+    let recovered = open_and_resume_parallel_pitr(&db_path, &repository);
+    assert_eq!(
+        recovered
+            .get(b"sync-transaction-crash-baseline")
+            .expect("read acknowledged sync-transaction baseline after crash")
+            .as_deref(),
+        Some(b"stable".as_slice())
+    );
+    assert_eq!(
+        recovered
+            .get(b"sync-transaction-synced-before-ack")
+            .expect("read sync transaction value synced before caller acknowledgement")
+            .as_deref(),
+        Some(b"candidate".as_slice()),
+        "a successful serializable transaction WAL sync must survive a crash before MVCC publication or acknowledgement"
+    );
+    recovered
+        .close()
+        .expect("close recovered v7 sync transaction crash engine");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn failpoint_v7_parallel_sync_batch_crash_after_sync_before_ack_recovers_all_entries() {
+    let probe_dir = tempfile::tempdir().expect("create v7 sync batch probe directory");
+    let probe_options = LsmStorageOptions {
+        enable_wal: true,
+        ..LsmStorageOptions::default_for_test()
+    };
+    match KvEngine::open_with_wal_io_mode(probe_dir.path(), probe_options, WalIoMode::Parallel) {
+        Ok(engine) => engine
+            .close()
+            .expect("close v7 Parallel sync batch crash probe"),
+        Err(error) => {
+            panic!("v7 Parallel sync batch crash qualification requires io_uring: {error:#}")
+        }
+    }
+
+    let dir = tempfile::tempdir().expect("create v7 sync batch crash directory");
+    let db_path = dir.path().join("db");
+    let repository = dir.path().join("repository");
+    prepare_empty_v7_parallel_pitr(&db_path, &repository)
+        .close()
+        .expect("close v7 sync batch crash setup engine");
+
+    kill_pitr_child_at_crash_point_with_operation(
+        &db_path,
+        &repository,
+        &dir.path().join("sync-batch-crash-control.log"),
+        &dir.path().join("sync-batch-crash.marker"),
+        "parallel_wal.after_fdatasync",
+        PitrChildCrashOperation::SyncBatch {
+            writes: [
+                ("sync-batch-first-before-ack", "first"),
+                ("sync-batch-second-before-ack", "second"),
+            ],
+        },
+    );
+
+    let recovered = open_and_resume_parallel_pitr(&db_path, &repository);
+    for (key, expected) in [
+        (
+            b"sync-batch-first-before-ack".as_slice(),
+            b"first".as_slice(),
+        ),
+        (
+            b"sync-batch-second-before-ack".as_slice(),
+            b"second".as_slice(),
+        ),
+    ] {
+        assert_eq!(
+            recovered
+                .get(key)
+                .expect("read recovered sync batch entry")
+                .as_deref(),
+            Some(expected),
+            "the complete sync batch must survive a crash before caller acknowledgement"
+        );
+    }
+    recovered
+        .close()
+        .expect("close recovered v7 sync batch crash engine");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn failpoint_v7_parallel_sync_delete_crash_after_sync_before_ack_recovers_tombstone() {
+    let probe_dir = tempfile::tempdir().expect("create v7 sync delete probe directory");
+    let probe_options = LsmStorageOptions {
+        enable_wal: true,
+        ..LsmStorageOptions::default_for_test()
+    };
+    match KvEngine::open_with_wal_io_mode(probe_dir.path(), probe_options, WalIoMode::Parallel) {
+        Ok(engine) => engine
+            .close()
+            .expect("close v7 Parallel sync delete crash probe"),
+        Err(error) => {
+            panic!("v7 Parallel sync delete crash qualification requires io_uring: {error:#}")
+        }
+    }
+
+    let dir = tempfile::tempdir().expect("create v7 sync delete crash directory");
+    let db_path = dir.path().join("db");
+    let repository = dir.path().join("repository");
+    let engine = prepare_empty_v7_parallel_pitr(&db_path, &repository);
+    engine
+        .put(b"sync-delete-before-ack", b"prior")
+        .expect("persist value before sync delete crash");
+    engine
+        .close()
+        .expect("close v7 sync delete crash setup engine");
+
+    kill_pitr_child_at_crash_point_with_operation(
+        &db_path,
+        &repository,
+        &dir.path().join("sync-delete-crash-control.log"),
+        &dir.path().join("sync-delete-crash.marker"),
+        "parallel_wal.after_fdatasync",
+        PitrChildCrashOperation::SyncDelete {
+            key: "sync-delete-before-ack",
+        },
+    );
+
+    let recovered = open_and_resume_parallel_pitr(&db_path, &repository);
+    assert_eq!(
+        recovered
+            .get(b"sync-delete-before-ack")
+            .expect("read sync-deleted key after crash"),
+        None,
+        "the synced point tombstone must survive a crash before caller acknowledgement"
+    );
+    recovered
+        .close()
+        .expect("close recovered v7 sync delete crash engine");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn failpoint_v7_parallel_sync_range_delete_crash_after_sync_before_ack_recovers_tombstone() {
+    let probe_dir = tempfile::tempdir().expect("create v7 sync range-delete probe directory");
+    let probe_options = LsmStorageOptions {
+        enable_wal: true,
+        ..LsmStorageOptions::default_for_test()
+    };
+    match KvEngine::open_with_wal_io_mode(probe_dir.path(), probe_options, WalIoMode::Parallel) {
+        Ok(engine) => engine
+            .close()
+            .expect("close v7 Parallel sync range-delete crash probe"),
+        Err(error) => {
+            panic!("v7 Parallel sync range-delete crash qualification requires io_uring: {error:#}")
+        }
+    }
+
+    let dir = tempfile::tempdir().expect("create v7 sync range-delete crash directory");
+    let db_path = dir.path().join("db");
+    let repository = dir.path().join("repository");
+    let engine = prepare_empty_v7_parallel_pitr(&db_path, &repository);
+    for key in ["range-a", "range-b", "range-c", "range-d", "range-z"] {
+        engine
+            .put(key.as_bytes(), b"value")
+            .expect("persist range-delete crash fixture");
+    }
+    engine
+        .close()
+        .expect("close v7 sync range-delete crash setup engine");
+
+    kill_pitr_child_at_crash_point_with_operation(
+        &db_path,
+        &repository,
+        &dir.path().join("sync-range-delete-crash-control.log"),
+        &dir.path().join("sync-range-delete-crash.marker"),
+        "parallel_wal.after_fdatasync",
+        PitrChildCrashOperation::SyncRangeDelete {
+            range: ("range-b", "range-d"),
+        },
+    );
+
+    let recovered = open_and_resume_parallel_pitr(&db_path, &repository);
+    for key in ["range-a", "range-d", "range-z"] {
+        assert_eq!(
+            recovered
+                .get(key.as_bytes())
+                .expect("read key outside recovered sync range tombstone")
+                .as_deref(),
+            Some(b"value".as_slice()),
+            "range deletion must retain keys outside its half-open interval"
+        );
+    }
+    for key in ["range-b", "range-c"] {
+        assert_eq!(
+            recovered
+                .get(key.as_bytes())
+                .expect("read key covered by recovered sync range tombstone"),
+            None,
+            "the synced half-open range tombstone must survive before caller acknowledgement"
+        );
+    }
+    recovered
+        .close()
+        .expect("close recovered v7 sync range-delete crash engine");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn failpoint_v7_parallel_sync_ttl_crash_after_sync_before_ack_recovers_expiration() {
+    let probe_dir = tempfile::tempdir().expect("create v7 sync TTL probe directory");
+    let probe_options = LsmStorageOptions {
+        enable_wal: true,
+        ..LsmStorageOptions::default_for_test()
+    };
+    match KvEngine::open_with_wal_io_mode(probe_dir.path(), probe_options, WalIoMode::Parallel) {
+        Ok(engine) => engine
+            .close()
+            .expect("close v7 Parallel sync TTL crash probe"),
+        Err(error) => {
+            panic!("v7 Parallel sync TTL crash qualification requires io_uring: {error:#}")
+        }
+    }
+
+    let dir = tempfile::tempdir().expect("create v7 sync TTL crash directory");
+    let db_path = dir.path().join("db");
+    let repository = dir.path().join("repository");
+    let engine = prepare_empty_v7_parallel_pitr(&db_path, &repository);
+    engine
+        .put(b"sync-ttl-before-ack", b"prior")
+        .expect("persist value before sync TTL crash");
+    engine
+        .close()
+        .expect("close v7 sync TTL crash setup engine");
+
+    kill_pitr_child_at_crash_point_with_operation(
+        &db_path,
+        &repository,
+        &dir.path().join("sync-ttl-crash-control.log"),
+        &dir.path().join("sync-ttl-crash.marker"),
+        "parallel_wal.after_fdatasync",
+        PitrChildCrashOperation::SyncTtlWrite {
+            write: ("sync-ttl-before-ack", "candidate"),
+            ttl_secs: 0,
+        },
+    );
+
+    let recovered = open_and_resume_parallel_pitr(&db_path, &repository);
+    assert_eq!(
+        recovered
+            .get(b"sync-ttl-before-ack")
+            .expect("read sync TTL overwrite after crash"),
+        None,
+        "recovery must apply the synced zero-duration expiration rather than reveal the overwritten value"
+    );
+    recovered
+        .close()
+        .expect("close recovered v7 sync TTL crash engine");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn failpoint_v7_parallel_async_batch_crash_after_sync_before_ack_recovers_all_entries() {
     let probe_dir = tempfile::tempdir().expect("create v7 async batch probe directory");
     let probe_options = LsmStorageOptions {
@@ -4012,6 +4308,23 @@ enum PitrChildCrashOperation<'a> {
         acknowledged_write: Option<(&'a str, &'a str)>,
         write: Option<(&'a str, &'a str)>,
     },
+    SyncTransaction {
+        read_key: &'a str,
+        write: (&'a str, &'a str),
+    },
+    SyncBatch {
+        writes: [(&'a str, &'a str); 2],
+    },
+    SyncDelete {
+        key: &'a str,
+    },
+    SyncRangeDelete {
+        range: (&'a str, &'a str),
+    },
+    SyncTtlWrite {
+        write: (&'a str, &'a str),
+        ttl_secs: u64,
+    },
     AsyncBatch {
         acknowledged_write: Option<(&'a str, &'a str)>,
         writes: [(&'a str, &'a str); 2],
@@ -4140,6 +4453,7 @@ fn kill_pitr_child_at_crash_point_with_mode(
             acknowledged_write: Some(_),
             ..
         } => "2",
+        PitrChildCrashOperation::SyncTransaction { .. } => "1",
         PitrChildCrashOperation::AsyncBatch {
             acknowledged_write: Some(_),
             ..
@@ -4170,6 +4484,10 @@ fn kill_pitr_child_at_crash_point_with_mode(
             acknowledged_write: None,
             ..
         }
+        | PitrChildCrashOperation::SyncBatch { .. }
+        | PitrChildCrashOperation::SyncDelete { .. }
+        | PitrChildCrashOperation::SyncRangeDelete { .. }
+        | PitrChildCrashOperation::SyncTtlWrite { .. }
         | PitrChildCrashOperation::AsyncDelete {
             acknowledged_write: None,
             ..
@@ -4234,6 +4552,40 @@ fn kill_pitr_child_at_crash_point_with_mode(
         } => {
             child.arg("--async-transaction");
             (acknowledged_write, write)
+        }
+        PitrChildCrashOperation::SyncTransaction { read_key, write } => {
+            child
+                .arg("--sync-transaction")
+                .arg("--serializable")
+                .arg("--transaction-read-key")
+                .arg(read_key);
+            (None, Some(write))
+        }
+        PitrChildCrashOperation::SyncBatch {
+            writes: [first, second],
+        } => {
+            child
+                .arg("--sync-batch")
+                .arg("--second-write-key")
+                .arg(second.0)
+                .arg("--second-write-value")
+                .arg(second.1);
+            (None, Some(first))
+        }
+        PitrChildCrashOperation::SyncDelete { key } => {
+            child.arg("--sync-delete").arg("--delete-key").arg(key);
+            (None, None)
+        }
+        PitrChildCrashOperation::SyncRangeDelete { range } => {
+            child.arg("--sync-range-delete");
+            (None, Some(range))
+        }
+        PitrChildCrashOperation::SyncTtlWrite { write, ttl_secs } => {
+            child
+                .arg("--sync-ttl-write")
+                .arg("--ttl-secs")
+                .arg(ttl_secs.to_string());
+            (None, Some(write))
         }
         PitrChildCrashOperation::AsyncBatch {
             acknowledged_write,

@@ -157,6 +157,9 @@ fn child_main(args: &[String]) -> Result<(), String> {
             ..config.storage_options
         };
     }
+    if args.iter().any(|arg| arg == "--serializable") {
+        config.storage_options.serializable = true;
+    }
 
     // Open the database
     let engine = KvEngine::open_with_wal_io_mode(
@@ -359,6 +362,24 @@ fn run_v7_pitr_crash(
         runtime
             .block_on(engine.put_async(write_key.as_bytes(), write_value.as_bytes()))
             .map_err(|error| format!("post-sync async candidate write failed: {error:#}"))
+    } else if args.iter().any(|arg| arg == "--sync-transaction") {
+        let read_key = get_arg(args, "--transaction-read-key")
+            .ok_or("missing --transaction-read-key for sync transaction")?;
+        let transaction = engine
+            .new_txn()
+            .map_err(|error| format!("create sync crash transaction failed: {error:#}"))?;
+        let read_value = transaction
+            .get(read_key.as_bytes())
+            .map_err(|error| format!("read sync crash transaction key failed: {error:#}"))?;
+        if read_value.is_none() {
+            return Err("sync crash transaction read key must exist".to_string());
+        }
+        transaction
+            .put(write_key.as_bytes(), write_value.as_bytes())
+            .map_err(|error| format!("buffer sync crash transaction write failed: {error:#}"))?;
+        transaction
+            .commit()
+            .map_err(|error| format!("post-sync sync transaction commit failed: {error:#}"))
     } else if args.iter().any(|arg| arg == "--async-transaction") {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -373,6 +394,39 @@ fn run_v7_pitr_crash(
         runtime
             .block_on(transaction.commit_async())
             .map_err(|error| format!("post-sync async transaction commit failed: {error:#}"))
+    } else if args.iter().any(|arg| arg == "--sync-batch") {
+        let second_key = get_arg(args, "--second-write-key")
+            .ok_or("missing --second-write-key for sync batch")?;
+        let second_value = get_arg(args, "--second-write-value")
+            .ok_or("missing --second-write-value for sync batch")?;
+        let batch = [
+            WriteBatchRecord::Put(write_key, write_value),
+            WriteBatchRecord::Put(second_key, second_value),
+        ];
+        engine
+            .write_batch(&batch)
+            .map_err(|error| format!("post-sync sync batch write failed: {error:#}"))
+    } else if args.iter().any(|arg| arg == "--sync-delete") {
+        let key = get_arg(args, "--delete-key").ok_or("missing --delete-key for sync delete")?;
+        engine
+            .delete(key.as_bytes())
+            .map_err(|error| format!("post-sync sync delete failed: {error:#}"))
+    } else if args.iter().any(|arg| arg == "--sync-range-delete") {
+        engine
+            .delete_range(write_key.as_bytes(), write_value.as_bytes())
+            .map_err(|error| format!("post-sync sync range delete failed: {error:#}"))
+    } else if args.iter().any(|arg| arg == "--sync-ttl-write") {
+        let ttl_secs = get_arg(args, "--ttl-secs")
+            .ok_or("missing --ttl-secs for sync TTL write")?
+            .parse::<u64>()
+            .map_err(|_| "invalid --ttl-secs")?;
+        engine
+            .put_with_ttl(
+                write_key.as_bytes(),
+                write_value.as_bytes(),
+                std::time::Duration::from_secs(ttl_secs),
+            )
+            .map_err(|error| format!("post-sync sync TTL write failed: {error:#}"))
     } else if args.iter().any(|arg| arg == "--async-batch") {
         let second_key = get_arg(args, "--second-write-key")
             .ok_or("missing --second-write-key for async batch")?;

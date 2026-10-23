@@ -20648,6 +20648,53 @@ mod tests {
         })
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn v7_active_reopen_clamps_recorded_time_after_wall_clock_rollback() -> anyhow::Result<()> {
+        let directory = tempdir()?;
+        let options = v7_recovery_test_database(directory.path())?;
+        let database = directory.path().join("db");
+        let persisted_high_water = crate::pitr::RecordedAt {
+            secs: 4_000_000_000,
+            nanos: 0,
+        };
+        let rolled_back_clock = std::time::UNIX_EPOCH + std::time::Duration::from_secs(5);
+        let slightly_later_clock = std::time::UNIX_EPOCH
+            + std::time::Duration::from_secs(persisted_high_water.secs as u64)
+            + std::time::Duration::from_nanos(1);
+
+        for _ in 0..2 {
+            let engine = KvEngine::open_with_wal_io_mode(
+                &database,
+                options.clone(),
+                crate::wal::WalIoMode::Leader,
+            )?;
+            let mvcc = engine
+                .inner
+                .mvcc
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("v7 recovery fixture has no MVCC state"))?;
+
+            assert_eq!(
+                mvcc.next_pitr_recorded_at(rolled_back_clock)?,
+                persisted_high_water,
+                "Active v7 replay must seed the recorded-time high-water before writes resume"
+            );
+            assert_eq!(
+                mvcc.next_pitr_recorded_at(slightly_later_clock)?,
+                crate::pitr::RecordedAt {
+                    secs: persisted_high_water.secs,
+                    nanos: 1,
+                },
+                "a later sample must advance from the recovered high-water"
+            );
+
+            engine.close()?;
+        }
+
+        Ok(())
+    }
+
     /// Model a crash after SegmentSealed and the successor's empty boundary
     /// became durable, with the source memtable still awaiting its Flush record.
     #[cfg(target_os = "linux")]
