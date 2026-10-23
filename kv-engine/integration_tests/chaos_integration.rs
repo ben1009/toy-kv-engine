@@ -1177,6 +1177,113 @@ fn failpoint_v7_parallel_pitr_fallback_archive_restore() {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn failpoint_v7_parallel_later_group_cqe_does_not_advance_past_gap() {
+    let probe_dir = tempfile::tempdir().expect("create v7 Parallel CQE probe directory");
+    let probe = KvEngine::open_with_wal_io_mode(
+        probe_dir.path(),
+        LsmStorageOptions {
+            enable_wal: true,
+            ..LsmStorageOptions::default_for_test()
+        },
+        WalIoMode::Parallel,
+    )
+    .unwrap_or_else(|error| panic!("v7 Parallel CQE qualification requires io_uring: {error:#}"));
+    probe.close().expect("close v7 Parallel CQE probe");
+
+    let dir = tempfile::tempdir().expect("create v7 out-of-order crash directory");
+    let db_path = dir.path().join("db");
+    let repository = dir.path().join("repository");
+    let engine = prepare_empty_v7_parallel_pitr(&db_path, &repository);
+    engine
+        .put(b"v7-parallel-crash-baseline", b"stable")
+        .expect("write the earlier v7 durability baseline");
+    engine.sync().expect("sync the earlier v7 baseline");
+    engine.close().expect("close v7 out-of-order setup engine");
+
+    let control_log_path = dir.path().join("out-of-order-control.log");
+    let crash_marker_path = dir.path().join("out-of-order-crash.marker");
+    kill_pitr_child_at_crash_point_with_mode(
+        &db_path,
+        &repository,
+        &control_log_path,
+        &crash_marker_path,
+        "parallel_wal.later_group_completed_first",
+        WalIoMode::Parallel,
+        PitrChildCrashOperation::Write {
+            acknowledged_write: None,
+            write: None,
+        },
+    );
+
+    let active_wal_path = find_v7_pitr_wal(&db_path);
+    let speculative_image =
+        std::fs::read(&active_wal_path).expect("read v7 WAL after out-of-order CQE crash");
+    let speculative_inode = std::fs::metadata(&active_wal_path)
+        .expect("stat v7 WAL before recovery")
+        .ino();
+    for key in [
+        b"v7-parallel-crash-first".as_slice(),
+        b"v7-parallel-crash-second",
+    ] {
+        assert!(
+            speculative_image
+                .windows(key.len())
+                .any(|window| window == key),
+            "the later-group crash hook must run after real DATA I/O for {key:?}"
+        );
+    }
+
+    let recovered = KvEngine::open_with_wal_io_mode(
+        &db_path,
+        LsmStorageOptions {
+            enable_wal: true,
+            pitr_repository: Some(repository.clone()),
+            ..LsmStorageOptions::default_for_test()
+        },
+        WalIoMode::Parallel,
+    )
+    .expect("recover v7 after a later group completes before its predecessor");
+    for (key, expected) in [
+        (
+            b"legacy-segment-value".as_slice(),
+            Some(b"restored".as_slice()),
+        ),
+        (
+            b"v7-parallel-crash-baseline".as_slice(),
+            Some(b"stable".as_slice()),
+        ),
+        (b"v7-parallel-crash-first".as_slice(), None),
+        (b"v7-parallel-crash-second".as_slice(), None),
+    ] {
+        assert_eq!(
+            recovered
+                .get(key)
+                .unwrap_or_else(|error| panic!("read {key:?} after recovery: {error:#}"))
+                .as_deref(),
+            expected,
+            "recovery must retain only the previously durable contiguous prefix"
+        );
+    }
+    let status = recovered
+        .pitr_status(PitrStatusOptions {
+            cursor: None,
+            page_size: NonZeroUsize::new(64).expect("nonzero PITR status page size"),
+        })
+        .expect("read PITR status after out-of-order recovery");
+    assert_eq!(status.active_wal_format_version, Some(7));
+    assert_eq!(status.active_wal_io_mode, Some(PitrWalIoMode::Parallel));
+    assert_ne!(
+        std::fs::metadata(&active_wal_path)
+            .expect("stat normalized v7 WAL")
+            .ino(),
+        speculative_inode,
+        "recovery must install a normalized fresh inode"
+    );
+    recovered.close().expect("close recovered v7 engine");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn pitr_v7_empty_segment_archive_restore() {
     let probe_dir = tempfile::tempdir().expect("create v7 Parallel empty-segment probe directory");
     let probe_options = LsmStorageOptions {

@@ -2201,6 +2201,18 @@ fn process_completions<B: WorkerBuffer>(
 ) -> Result<()> {
     for (user_data, cqe_result) in completed {
         let request_id = RequestId(user_data);
+        #[cfg(all(test, feature = "chaos-testing"))]
+        let cqe_result = if cqe_result >= 0 {
+            core.request_ticket_start(request_id)
+                .and_then(|ticket_start| {
+                    crate::chaos::failpoint::parallel_wal_negative_cqe_result(ticket_start).or_else(
+                        || crate::chaos::failpoint::parallel_wal_short_cqe_result(ticket_start),
+                    )
+                })
+                .unwrap_or(cqe_result)
+        } else {
+            cqe_result
+        };
         let events = match core.complete_write(request_id, cqe_result) {
             Ok(events) => events,
             Err(error) => {
@@ -2298,8 +2310,8 @@ mod tests {
         DIRECT_IO_ALIGNMENT, DirectBuf, GroupId, GroupPermit, GroupSlots, GroupWriteResult,
         IoWorker, RequestId, SlotState, WalSyncProgress, WorkerCommand, WorkerCore, WorkerError,
         WorkerEvent, WorkerWake, WriteBuffer, WriteGroup, WriteGroupBuffers, close_group_admission,
-        enqueue_group_command, fail_shutdown_reply, flush_staged_writes, retry_interrupted,
-        wait_for_worker_progress,
+        enqueue_group_command, fail_shutdown_reply, flush_staged_writes, process_completions,
+        retry_interrupted, wait_for_worker_progress,
     };
     use crossbeam_queue::ArrayQueue;
     use parking_lot::{Condvar, Mutex};
@@ -3014,6 +3026,35 @@ mod tests {
     }
 
     #[test]
+    fn missing_cqe_blocks_close_until_matching_completion_retires_buffer() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut core = WorkerCore::new();
+        core.enqueue(make_group(0..1, 4096, 1, 4096, &drops))
+            .expect("enqueue group");
+        let requests = submitted_ids(&mut core, 1);
+
+        assert_eq!(core.outstanding_sqe_count(), 1);
+        assert!(matches!(
+            core.close(),
+            Err(WorkerError::RequestNotOutstanding)
+        ));
+        assert_eq!(drops.load(Ordering::Acquire), 0);
+
+        let events = core
+            .complete_write(requests[0], 4096)
+            .expect("matching CQE retires the outstanding request");
+        for event in events {
+            if let WorkerEvent::BufferRetired(buffer) = event {
+                drop(buffer);
+            }
+        }
+
+        assert!(core.is_idle());
+        assert_eq!(drops.load(Ordering::Acquire), 1);
+        assert!(core.close().is_ok());
+    }
+
+    #[test]
     fn partial_submission_keeps_unsubmitted_sqe_staged_without_resubmitting_it() {
         let drops = Arc::new(AtomicUsize::new(0));
         let mut core = WorkerCore::new();
@@ -3205,6 +3246,55 @@ mod tests {
             Err(WorkerError::UnknownRequest)
         ));
         assert_eq!(drops.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn process_completions_rejects_stale_cqe_without_releasing_outstanding_buffer() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut core = WorkerCore::new();
+        core.enqueue(make_group(0..1, 4096, 1, 4096, &drops))
+            .expect("enqueue group");
+        let requests = submitted_ids(&mut core, 1);
+        let buffer_pool = ArrayQueue::new(1);
+        let mut group_permits = std::collections::HashMap::new();
+        let (completion_tx, completion_rx) = crossbeam_channel::unbounded();
+        let slots = GroupSlots {
+            state: Mutex::new(SlotState {
+                active_groups: 0,
+                next_group_id: 0,
+                closed: false,
+            }),
+            available: Condvar::new(),
+        };
+        let sync_progress = WalSyncProgress::default();
+        let io_event = sync_progress.begin_io_event();
+
+        let error = process_completions(
+            vec![(requests[0].0 + 100, 4096)],
+            &mut core,
+            &buffer_pool,
+            &mut group_permits,
+            &completion_tx,
+            &slots,
+            &io_event,
+        )
+        .expect_err("unknown completion IDs must fail the live completion path");
+
+        assert!(format!("{error:#}").contains("invalid or stale WAL io_uring completion"));
+        assert_eq!(core.outstanding_sqe_count(), 1);
+        assert_eq!(drops.load(Ordering::Acquire), 0);
+        assert!(completion_rx.try_recv().is_err());
+
+        let events = core
+            .complete_write(requests[0], 4096)
+            .expect("the real request remains outstanding after stale completion");
+        for event in events {
+            if let super::WorkerEvent::BufferRetired(buffer) = event {
+                drop(buffer);
+            }
+        }
+        assert!(core.is_idle());
+        assert_eq!(drops.load(Ordering::Acquire), 1);
     }
 
     #[test]
