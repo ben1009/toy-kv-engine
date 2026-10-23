@@ -1677,6 +1677,36 @@ inside its retained prefix. Standalone successor decoding accepts the marker;
 whole-prefix recovery keeps the retained F1 candidate and rejects the sibling,
 covering the immediate predecessor rule independently of local codec validation.
 
+The thirty-ninth Stage 8 slice exercises process crashes at three successive
+sealing boundaries for a nonempty v7 source: after durable `SealStarted`,
+after the seal sidecar is durably installed but before `SegmentSealed`, and
+after `SegmentSealed` but before the successor image is installed. The source
+snapshot taken at `SealStarted` must remain byte-identical through the later
+crashes. Reopen must reconstruct the manifest-authorized successor with the
+requested Parallel mode while preserving the exact seal bytes and both legacy
+and v7 values. This extends process-crash evidence for these sealing
+boundaries. The after-`SealStarted` reopen check also verifies that synchronous
+and asynchronous point, TTL, delete, range-delete, batch, and transaction
+commits remain fenced; the remaining correctness matrix is still open.
+
+The fortieth Stage 8 slice extends the successor-image installation crash
+matrix to a nonempty v7 source. It writes and syncs a v7 value before sealing,
+then checks the value and byte-identical source WAL and seal after recovery
+from each staged-image and post-rename crash boundary and in the final Latest
+archive restore. This verifies that repairing the empty successor preserves
+sealed source data across repeated process crashes.
+
+The forty-first Stage 8 slice exercises read availability while a nonempty v7
+source remains Sealing after a process crash. Synchronous and asynchronous
+point reads must return the durable value while all write APIs stay fenced;
+explicit resume then installs the Parallel successor and keeps the same value
+readable.
+
+The forty-second Stage 8 slice verifies that explicit resume reopens both
+synchronous and asynchronous write admission. Those writes are synced, the
+engine is closed and reopened with Parallel selected, and the original sealed
+value plus both post-resume values must remain readable.
+
 - Complete the correctness matrix below using the persistence model, real
   runtime injection, and process-level integration. Regress ordinary v4,
   strict v5/v6, TTL, recorded-time rollback/clamping, range deletion, OCC,

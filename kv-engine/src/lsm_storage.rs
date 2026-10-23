@@ -5659,6 +5659,9 @@ impl KvEngine {
             return Err(error);
         }
 
+        #[cfg(feature = "chaos-testing")]
+        crate::chaos::failpoint::wal_crash_point("pitr.v7.after_seal_sidecar_install");
+
         let retained_resources = Arc::clone(&prepared.retained_resources);
         let (installed_seal, wal_path, seal_path, seal_reservation) = prepared.into_installed()?;
         ensure!(

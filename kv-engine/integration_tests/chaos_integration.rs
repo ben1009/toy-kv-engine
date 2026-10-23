@@ -13,7 +13,7 @@ use kv_engine::chaos::failpoint::{
 };
 use kv_engine::chaos::oracle::{self, BoundedKeyUniverse, ReferenceState};
 use kv_engine::chaos::scenarios::ScenarioConfig;
-use kv_engine::lsm_storage::{KvEngine, LsmStorageOptions};
+use kv_engine::lsm_storage::{KvEngine, LsmStorageOptions, WriteBatchRecord};
 use kv_engine::wal::WalIoMode;
 use kv_engine::{
     BackupOptions, BackupRepository, CreateBackupOutcome, EnablePitrOutcome,
@@ -1915,10 +1915,13 @@ fn failpoint_v7_sealing_startup_stays_fenced_after_seal_started_crash() {
     let repository = dir.path().join("repository");
     let control_log_path = dir.path().join("chaos_control.log");
     let engine = prepare_empty_v7_parallel_pitr(&db_path, &repository);
+    engine
+        .put(b"v7-sealed-source-value", b"durable")
+        .expect("write value to the Active v7 source");
+    engine.sync().expect("sync the Active v7 source");
     let source_wal = find_v7_pitr_wal(&db_path);
     let source_segment_id = pitr_segment_id(&source_wal);
     engine.close().expect("close Sealing-startup setup engine");
-    let source_before = std::fs::read(&source_wal).expect("read Active v7 WAL before crash");
 
     let crash_point = "pitr.v7.after_seal_started";
     let marker_path = dir.path().join("seal-started-crash.marker");
@@ -1935,14 +1938,13 @@ fn failpoint_v7_sealing_startup_stays_fenced_after_seal_started_crash() {
             .trim(),
         crash_point
     );
+    // Reopening an Active v7 WAL may normalize it before writing SealStarted,
+    // so take the frozen-image snapshot at the durable manifest boundary.
+    let source_at_seal_started =
+        std::fs::read(&source_wal).expect("read Sealing source after crash");
 
     let seal_path = source_wal.with_extension("seal");
     let successor_path = pitr_wal_path(&db_path, source_segment_id + 1);
-    assert_eq!(
-        std::fs::read(&source_wal).expect("read Sealing source after crash"),
-        source_before,
-        "the source WAL must remain untouched until after durable SealStarted"
-    );
     assert!(
         !seal_path.exists(),
         "seal install must not precede the crash point"
@@ -1957,7 +1959,7 @@ fn failpoint_v7_sealing_startup_stays_fenced_after_seal_started_crash() {
         pitr_repository: Some(repository.clone()),
         ..LsmStorageOptions::default_for_test()
     };
-    let reopened = KvEngine::open_with_wal_io_mode(&db_path, options, WalIoMode::Parallel)
+    let reopened = KvEngine::open_with_wal_io_mode(&db_path, options.clone(), WalIoMode::Parallel)
         .expect("reopen Sealing v7 source without auto-resuming it");
     let status = reopened
         .pitr_status(PitrStatusOptions {
@@ -1976,9 +1978,110 @@ fn failpoint_v7_sealing_startup_stays_fenced_after_seal_started_crash() {
             .is_err(),
         "reopen must keep commits fenced until explicit PITR resume completes Sealing"
     );
+    assert_v7_sealed_source_value(&reopened);
+    assert!(
+        reopened
+            .put_with_ttl(
+                b"ttl-blocked-during-sealing-recovery",
+                b"write",
+                Duration::from_secs(1),
+            )
+            .is_err(),
+        "TTL commits must remain fenced during Sealing recovery"
+    );
+    assert!(
+        reopened
+            .delete(b"delete-blocked-during-sealing-recovery")
+            .is_err(),
+        "deletes must remain fenced during Sealing recovery"
+    );
+    assert!(
+        reopened.delete_range(b"range-a", b"range-z").is_err(),
+        "range deletes must remain fenced during Sealing recovery"
+    );
+    assert!(
+        reopened
+            .write_batch(&[WriteBatchRecord::Put(&b"batch-key"[..], &b"write"[..],)])
+            .is_err(),
+        "write batches must remain fenced during Sealing recovery"
+    );
+    let transaction = reopened
+        .new_txn()
+        .expect("create snapshot transaction while checking synchronous Sealing write fences");
+    transaction
+        .put(b"transaction-blocked-during-sealing-recovery", b"write")
+        .expect("buffer transaction write before commit");
+    assert!(
+        transaction.commit().is_err(),
+        "synchronous transaction commits must remain fenced until explicit PITR resume completes Sealing"
+    );
+    drop(transaction);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("create runtime for async Sealing fence checks");
     assert_eq!(
-        std::fs::read(&source_wal).expect("read source WAL after fenced reopen"),
-        source_before
+        runtime
+            .block_on(reopened.get_async(b"v7-sealed-source-value"))
+            .expect("read sealed source asynchronously while commits are fenced")
+            .as_deref(),
+        Some(b"durable".as_slice()),
+        "async reads must remain available while Sealing recovery fences commits"
+    );
+    assert!(
+        runtime
+            .block_on(reopened.put_async(b"async-blocked-during-sealing-recovery", b"write"))
+            .is_err(),
+        "async commits must remain fenced until explicit PITR resume completes Sealing"
+    );
+    assert!(
+        runtime
+            .block_on(reopened.put_with_ttl_async(
+                b"async-ttl-blocked-during-sealing-recovery",
+                b"write",
+                Duration::from_secs(1),
+            ))
+            .is_err(),
+        "async TTL commits must remain fenced during Sealing recovery"
+    );
+    assert!(
+        runtime
+            .block_on(reopened.delete_async(b"async-delete-blocked-during-sealing-recovery"))
+            .is_err(),
+        "async deletes must remain fenced during Sealing recovery"
+    );
+    assert!(
+        runtime
+            .block_on(reopened.delete_range_async(b"async-range-a", b"async-range-z"))
+            .is_err(),
+        "async range deletes must remain fenced during Sealing recovery"
+    );
+    assert!(
+        runtime
+            .block_on(reopened.write_batch_async(&[WriteBatchRecord::Put(
+                &b"async-batch-key"[..],
+                &b"write"[..],
+            )]))
+            .is_err(),
+        "async write batches must remain fenced during Sealing recovery"
+    );
+    let transaction = reopened
+        .new_txn_async()
+        .expect("create snapshot transaction while checking Sealing write fences");
+    transaction
+        .put(
+            b"async-transaction-blocked-during-sealing-recovery",
+            b"write",
+        )
+        .expect("buffer transaction write before commit");
+    assert!(
+        runtime.block_on(transaction.commit_async()).is_err(),
+        "async transaction commits must remain fenced until explicit PITR resume completes Sealing"
+    );
+    drop(transaction);
+    assert!(
+        std::fs::read(&source_wal).expect("read source WAL after fenced reopen")
+            == source_at_seal_started,
+        "the source WAL must stay frozen while startup keeps Sealing writes fenced"
     );
     assert!(!seal_path.exists());
     assert!(!successor_path.exists());
@@ -2000,6 +2103,7 @@ fn failpoint_v7_sealing_startup_stays_fenced_after_seal_started_crash() {
     );
     assert!(seal_path.is_file());
     assert!(successor_path.is_file());
+    assert_v7_sealed_source_value(&reopened);
     assert_eq!(
         reopened
             .get(b"legacy-segment-value")
@@ -2008,13 +2112,226 @@ fn failpoint_v7_sealing_startup_stays_fenced_after_seal_started_crash() {
         Some(b"restored".as_slice())
     );
     reopened
+        .put(b"after-sealing-resume-sync", b"durable")
+        .expect("sync writes resume after explicit Sealing recovery");
+    runtime
+        .block_on(reopened.put_async(b"after-sealing-resume-async", b"durable"))
+        .expect("async writes resume after explicit Sealing recovery");
+    reopened.sync().expect("sync writes after Sealing recovery");
+    for key in [
+        b"after-sealing-resume-sync".as_slice(),
+        b"after-sealing-resume-async".as_slice(),
+    ] {
+        assert_eq!(
+            reopened
+                .get(key)
+                .expect("read post-resume write")
+                .as_deref(),
+            Some(b"durable".as_slice()),
+            "explicit resume must reopen write admission"
+        );
+    }
+    reopened
         .close()
         .expect("close engine after Sealing recovery");
+    drop(reopened);
+
+    let recovered = KvEngine::open_with_wal_io_mode(&db_path, options, WalIoMode::Parallel)
+        .expect("reopen after writes resume from Sealing");
+    assert_v7_sealed_source_value(&recovered);
+    for key in [
+        b"after-sealing-resume-sync".as_slice(),
+        b"after-sealing-resume-async".as_slice(),
+    ] {
+        assert_eq!(
+            recovered
+                .get(key)
+                .expect("read recovered post-resume write")
+                .as_deref(),
+            Some(b"durable".as_slice()),
+            "post-resume writes must survive reopen"
+        );
+    }
+    recovered
+        .close()
+        .expect("close engine after post-resume recovery");
 }
 
 #[cfg(target_os = "linux")]
 #[test]
-fn failpoint_v7_empty_successor_install_crash_boundaries() {
+fn failpoint_v7_sealing_crashes_after_durable_seal_install_with_nonempty_source() {
+    let probe_dir = tempfile::tempdir().expect("create v7 Parallel seal-install probe directory");
+    let probe_options = LsmStorageOptions {
+        enable_wal: true,
+        ..LsmStorageOptions::default_for_test()
+    };
+    match KvEngine::open_with_wal_io_mode(probe_dir.path(), probe_options, WalIoMode::Parallel) {
+        Ok(engine) => engine
+            .close()
+            .expect("close v7 Parallel seal-install probe"),
+        Err(error) => {
+            panic!("v7 Parallel seal-install qualification requires io_uring: {error:#}")
+        }
+    }
+
+    let dir = tempfile::tempdir().expect("create v7 seal-install crash directory");
+    let db_path = dir.path().join("db");
+    let repository = dir.path().join("repository");
+    let control_log_path = dir.path().join("chaos_control.log");
+    let engine = prepare_empty_v7_parallel_pitr(&db_path, &repository);
+    engine
+        .put(b"v7-sealing-source-value", b"durable")
+        .expect("write nonempty v7 sealing source");
+    engine.sync().expect("sync nonempty v7 sealing source");
+    assert_eq!(
+        engine
+            .get(b"v7-sealing-source-value")
+            .expect("read nonempty v7 sealing source before crash")
+            .as_deref(),
+        Some(b"durable".as_slice())
+    );
+    let source_wal = find_v7_pitr_wal(&db_path);
+    let source_segment_id = pitr_segment_id(&source_wal);
+    engine.close().expect("close v7 seal-install setup engine");
+
+    let seal_path = source_wal.with_extension("seal");
+    let successor_path = pitr_wal_path(&db_path, source_segment_id + 1);
+    let seal_started_point = "pitr.v7.after_seal_started";
+    let seal_started_marker = dir.path().join("after-seal-started.marker");
+    kill_pitr_child_at_empty_successor_crash_point(
+        &db_path,
+        &repository,
+        &control_log_path,
+        &seal_started_marker,
+        seal_started_point,
+    );
+    assert_eq!(
+        std::fs::read_to_string(&seal_started_marker)
+            .expect("read SealStarted crash marker")
+            .trim(),
+        seal_started_point
+    );
+    let source_after_seal_started =
+        std::fs::read(&source_wal).expect("read source at durable SealStarted boundary");
+    assert!(!seal_path.exists());
+    assert!(!successor_path.exists());
+
+    let seal_install_point = "pitr.v7.after_seal_sidecar_install";
+    let seal_install_marker = dir.path().join("after-seal-sidecar-install.marker");
+    kill_pitr_child_at_empty_successor_crash_point(
+        &db_path,
+        &repository,
+        &control_log_path,
+        &seal_install_marker,
+        seal_install_point,
+    );
+    assert_eq!(
+        std::fs::read_to_string(&seal_install_marker)
+            .expect("read post-install crash marker")
+            .trim(),
+        seal_install_point
+    );
+
+    let seal_after_install = std::fs::read(&seal_path).expect("read durably installed seal");
+    assert!(
+        !seal_after_install.is_empty(),
+        "the crash point must follow complete seal installation"
+    );
+    assert_eq!(
+        std::fs::read(&source_wal).expect("read source after seal install crash"),
+        source_after_seal_started,
+        "sealing must not rewrite the source WAL"
+    );
+    assert!(
+        !successor_path.exists(),
+        "the successor must not be installed before SegmentSealed is durable"
+    );
+
+    // Resume the installed seal and crash again after SegmentSealed becomes
+    // durable but before its authorized successor image is installed.
+    let segment_sealed_point = "wal_v7.successor.after_segment_sealed_before_image_install";
+    let segment_sealed_marker = dir.path().join("after-segment-sealed.marker");
+    kill_pitr_child_at_empty_successor_crash_point(
+        &db_path,
+        &repository,
+        &control_log_path,
+        &segment_sealed_marker,
+        segment_sealed_point,
+    );
+    assert_eq!(
+        std::fs::read_to_string(&segment_sealed_marker)
+            .expect("read post-SegmentSealed crash marker")
+            .trim(),
+        segment_sealed_point
+    );
+    assert_eq!(
+        std::fs::read(&source_wal).expect("read source after SegmentSealed crash"),
+        source_after_seal_started,
+        "the source WAL must remain byte-identical after sealing"
+    );
+    assert_eq!(
+        std::fs::read(&seal_path).expect("read seal after SegmentSealed crash"),
+        seal_after_install,
+        "recovery must retain the exact installed seal"
+    );
+    assert!(
+        !successor_path.exists(),
+        "the child must crash before installing the successor image"
+    );
+
+    let options = LsmStorageOptions {
+        enable_wal: true,
+        pitr_repository: Some(repository.clone()),
+        ..LsmStorageOptions::default_for_test()
+    };
+    let reopened = KvEngine::open_with_wal_io_mode(&db_path, options, WalIoMode::Parallel)
+        .expect("reopen Sealed v7 source and recreate its missing successor");
+    assert!(successor_path.is_file());
+    let status = reopened
+        .pitr_status(PitrStatusOptions {
+            cursor: None,
+            page_size: NonZeroUsize::new(64).expect("nonzero status page size"),
+        })
+        .expect("read status after sealed-successor recovery");
+    assert_eq!(status.active_wal_format_version, Some(7));
+    assert_eq!(
+        status.active_wal_io_mode,
+        Some(PitrWalIoMode::Parallel),
+        "the reconstructed Active successor must use the requested Parallel mode"
+    );
+    for (key, expected) in [
+        (b"legacy-segment-value".as_slice(), b"restored".as_slice()),
+        (b"v7-sealing-source-value".as_slice(), b"durable".as_slice()),
+    ] {
+        assert_eq!(
+            reopened
+                .get(key)
+                .expect("read value after seal recovery")
+                .as_deref(),
+            Some(expected),
+            "sealed-source recovery must preserve {key:?}"
+        );
+    }
+    assert!(matches!(
+        reopened.resume_pitr(&repository),
+        Ok(PitrResumeOutcome::Resumed)
+    ));
+    reopened
+        .close()
+        .expect("close engine after nonempty seal recovery");
+    assert_eq!(
+        std::fs::read(&source_wal).expect("read frozen source after close"),
+        source_after_seal_started
+    );
+    assert_eq!(
+        std::fs::read(&seal_path).expect("read frozen seal after close"),
+        seal_after_install
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn failpoint_v7_empty_successor_install_crash_boundaries_preserves_nonempty_source() {
     let probe_dir = tempfile::tempdir().expect("create v7 empty-successor probe directory");
     let probe_options = LsmStorageOptions {
         enable_wal: true,
@@ -2032,6 +2349,10 @@ fn failpoint_v7_empty_successor_install_crash_boundaries() {
     let repository = dir.path().join("repository");
     let control_log_path = dir.path().join("chaos_control.log");
     let engine = prepare_empty_v7_parallel_pitr(&db_path, &repository);
+    engine
+        .put(b"v7-sealed-source-value", b"durable")
+        .expect("write value to the nonempty v7 source");
+    engine.sync().expect("sync the nonempty v7 source");
     let initial_active_wal = find_v7_pitr_wal(&db_path);
     let initial_active_segment_id = pitr_segment_id(&initial_active_wal);
     engine.close().expect("close empty v7 Active setup engine");
@@ -2051,6 +2372,9 @@ fn failpoint_v7_empty_successor_install_crash_boundaries() {
             .trim(),
         before_install_point
     );
+    let source_seal_path = initial_active_wal.with_extension("seal");
+    let sealed_source_wal = std::fs::read(&initial_active_wal).expect("read sealed source WAL");
+    let sealed_source_seal = std::fs::read(&source_seal_path).expect("read installed source seal");
     let first_successor_path = pitr_wal_path(&db_path, initial_active_segment_id + 1);
     assert!(
         !first_successor_path.exists(),
@@ -2058,7 +2382,14 @@ fn failpoint_v7_empty_successor_install_crash_boundaries() {
     );
 
     let recovered_after_preinstall_crash = open_and_resume_parallel_pitr(&db_path, &repository);
+    assert_sealed_source_unchanged(
+        &initial_active_wal,
+        &source_seal_path,
+        &sealed_source_wal,
+        &sealed_source_seal,
+    );
     assert_empty_v7_active_image(&first_successor_path);
+    assert_v7_sealed_source_value(&recovered_after_preinstall_crash);
     assert_eq!(
         recovered_after_preinstall_crash
             .get(b"legacy-segment-value")
@@ -2087,6 +2418,12 @@ fn failpoint_v7_empty_successor_install_crash_boundaries() {
             .trim(),
         after_header_write_point
     );
+    assert_sealed_source_unchanged(
+        &initial_active_wal,
+        &source_seal_path,
+        &sealed_source_wal,
+        &sealed_source_seal,
+    );
     let second_successor_path = pitr_wal_path(&db_path, initial_active_segment_id + 2);
     assert!(
         !second_successor_path.exists(),
@@ -2112,7 +2449,14 @@ fn failpoint_v7_empty_successor_install_crash_boundaries() {
     );
 
     let recovered_after_header_write_crash = open_and_resume_parallel_pitr(&db_path, &repository);
+    assert_sealed_source_unchanged(
+        &initial_active_wal,
+        &source_seal_path,
+        &sealed_source_wal,
+        &sealed_source_seal,
+    );
     assert_empty_v7_active_image(&second_successor_path);
+    assert_v7_sealed_source_value(&recovered_after_header_write_crash);
     let recreated_image =
         std::fs::read(&second_successor_path).expect("read recreated empty v7 successor");
     assert_eq!(
@@ -2151,6 +2495,12 @@ fn failpoint_v7_empty_successor_install_crash_boundaries() {
             .trim(),
         after_temp_write_point
     );
+    assert_sealed_source_unchanged(
+        &initial_active_wal,
+        &source_seal_path,
+        &sealed_source_wal,
+        &sealed_source_seal,
+    );
     let third_successor_path = pitr_wal_path(&db_path, initial_active_segment_id + 3);
     assert!(
         !third_successor_path.exists(),
@@ -2165,7 +2515,14 @@ fn failpoint_v7_empty_successor_install_crash_boundaries() {
     assert_empty_v7_active_image(&staging_images[0]);
 
     let recovered_after_temp_write_crash = open_and_resume_parallel_pitr(&db_path, &repository);
+    assert_sealed_source_unchanged(
+        &initial_active_wal,
+        &source_seal_path,
+        &sealed_source_wal,
+        &sealed_source_seal,
+    );
     assert_empty_v7_active_image(&third_successor_path);
+    assert_v7_sealed_source_value(&recovered_after_temp_write_crash);
     assert!(
         pitr_wal_install_staging_files(&db_path).is_empty(),
         "startup must remove the stranded staging image before recreating the successor"
@@ -2197,6 +2554,12 @@ fn failpoint_v7_empty_successor_install_crash_boundaries() {
             .trim(),
         after_temp_sync_point
     );
+    assert_sealed_source_unchanged(
+        &initial_active_wal,
+        &source_seal_path,
+        &sealed_source_wal,
+        &sealed_source_seal,
+    );
     let fourth_successor_path = pitr_wal_path(&db_path, initial_active_segment_id + 4);
     assert!(
         !fourth_successor_path.exists(),
@@ -2209,7 +2572,14 @@ fn failpoint_v7_empty_successor_install_crash_boundaries() {
     );
 
     let recovered_after_temp_sync_crash = open_and_resume_parallel_pitr(&db_path, &repository);
+    assert_sealed_source_unchanged(
+        &initial_active_wal,
+        &source_seal_path,
+        &sealed_source_wal,
+        &sealed_source_seal,
+    );
     assert_empty_v7_active_image(&fourth_successor_path);
+    assert_v7_sealed_source_value(&recovered_after_temp_sync_crash);
     assert!(
         pitr_wal_install_staging_files(&db_path).is_empty(),
         "startup must remove the stranded staging image before recreating the successor"
@@ -2241,13 +2611,25 @@ fn failpoint_v7_empty_successor_install_crash_boundaries() {
             .trim(),
         after_rename_point
     );
+    assert_sealed_source_unchanged(
+        &initial_active_wal,
+        &source_seal_path,
+        &sealed_source_wal,
+        &sealed_source_seal,
+    );
     let fifth_successor_path = pitr_wal_path(&db_path, initial_active_segment_id + 5);
     assert_empty_v7_active_image(&fifth_successor_path);
 
     let recovered_after_rename_crash = open_and_resume_parallel_pitr(&db_path, &repository);
-    let active_wal_path = find_v7_pitr_wal(&db_path);
-    assert_eq!(active_wal_path, fifth_successor_path);
+    assert_sealed_source_unchanged(
+        &initial_active_wal,
+        &source_seal_path,
+        &sealed_source_wal,
+        &sealed_source_seal,
+    );
+    let active_wal_path = fifth_successor_path;
     assert_empty_v7_active_image(&active_wal_path);
+    assert_v7_sealed_source_value(&recovered_after_rename_crash);
     assert_eq!(
         recovered_after_rename_crash
             .get(b"legacy-segment-value")
@@ -2280,6 +2662,12 @@ fn failpoint_v7_empty_successor_install_crash_boundaries() {
             .trim(),
         continued_write_crash_point
     );
+    assert_sealed_source_unchanged(
+        &initial_active_wal,
+        &source_seal_path,
+        &sealed_source_wal,
+        &sealed_source_seal,
+    );
     assert!(
         std::fs::metadata(&active_wal_path)
             .expect("stat Active WAL after post-recovery write sync")
@@ -2289,6 +2677,12 @@ fn failpoint_v7_empty_successor_install_crash_boundaries() {
     );
 
     let reopened = open_and_resume_parallel_pitr(&db_path, &repository);
+    assert_sealed_source_unchanged(
+        &initial_active_wal,
+        &source_seal_path,
+        &sealed_source_wal,
+        &sealed_source_seal,
+    );
     assert_eq!(
         reopened
             .get(b"after-empty-successor-recovery")
@@ -2297,6 +2691,7 @@ fn failpoint_v7_empty_successor_install_crash_boundaries() {
         Some(b"durable".as_slice()),
         "a synced write after empty-successor recovery must survive process crash before publication"
     );
+    assert_v7_sealed_source_value(&reopened);
     assert_eq!(
         reopened
             .get(b"legacy-segment-value")
@@ -2359,6 +2754,7 @@ fn failpoint_v7_empty_successor_install_crash_boundaries() {
         .expect("open database restored after empty-successor recovery continuation");
     for (key, expected) in [
         (b"legacy-segment-value".as_slice(), b"restored".as_slice()),
+        (b"v7-sealed-source-value".as_slice(), b"durable".as_slice()),
         (
             b"after-empty-successor-recovery".as_slice(),
             b"durable".as_slice(),
@@ -2504,6 +2900,37 @@ fn assert_empty_v7_active_image(path: &std::path::Path) {
         u16::from_be_bytes([image[4106], image[4107]]),
         2,
         "empty Active v7 image must contain generation-zero FRONTIER"
+    );
+}
+
+#[cfg(target_os = "linux")]
+fn assert_v7_sealed_source_value(engine: &KvEngine) {
+    assert_eq!(
+        engine
+            .get(b"v7-sealed-source-value")
+            .expect("read sealed nonempty v7 source value")
+            .as_deref(),
+        Some(b"durable".as_slice()),
+        "successor installation must preserve the nonempty sealed v7 source"
+    );
+}
+
+#[cfg(target_os = "linux")]
+fn assert_sealed_source_unchanged(
+    wal_path: &std::path::Path,
+    seal_path: &std::path::Path,
+    expected_wal: &[u8],
+    expected_seal: &[u8],
+) {
+    assert_eq!(
+        std::fs::read(wal_path).expect("read immutable sealed source WAL"),
+        expected_wal,
+        "successor recovery must not rewrite the sealed source WAL"
+    );
+    assert_eq!(
+        std::fs::read(seal_path).expect("read immutable source seal"),
+        expected_seal,
+        "successor recovery must not rewrite the source seal"
     );
 }
 
