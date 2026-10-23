@@ -16457,11 +16457,6 @@ impl LsmStorageInner {
     }
 
     /// Internal range delete: hides all keys in `[start, end)` at a new commit timestamp.
-    ///
-    /// This is the Phase 1 test hook. It validates bounds, writes the range
-    /// tombstone into the active memtable, and publishes the commit timestamp.
-    /// The tombstone is also WAL-durable when WAL is enabled (via the
-    /// memtable's WAL integration — to be wired in Phase 2/3).
     pub fn delete_range_internal(&self, start: &[u8], end: &[u8]) -> Result<()> {
         anyhow::ensure!(
             !self.options.serializable,
@@ -16486,7 +16481,7 @@ impl LsmStorageInner {
             match self.delete_range_once(start, end) {
                 Ok(()) => return Ok(()),
                 Err(error) => {
-                    self.retry_after_wal_full(error, &expected_memtable, &mut retries)?;
+                    self.retry_after_capacity_error(error, &expected_memtable, &mut retries)?;
                 }
             }
         }
@@ -25938,7 +25933,7 @@ mod tests {
             crate::wal::WalIoMode::Leader,
             crate::wal::WalIoMode::Parallel,
         ] {
-            for operation in 0..3 {
+            for operation in 0..4 {
                 let directory = tempdir()?;
                 let options =
                     v7_recovery_test_database_with_segment_limit(directory.path(), 32 * 1024)?;
@@ -25970,6 +25965,7 @@ mod tests {
                         b"value".as_slice(),
                     )])?,
                     2 => engine.delete(b"v7-key")?,
+                    3 => engine.delete_range(b"fill-one", b"fill-two\xff")?,
                     _ => unreachable!(),
                 }
                 assert_eq!(
@@ -25981,14 +25977,16 @@ mod tests {
                 drop(engine);
 
                 let reopened = KvEngine::open_with_wal_io_mode(&database, options, mode)?;
-                assert_eq!(
-                    reopened.get(b"fill-one")?,
-                    Some(Bytes::from_static(b"value"))
-                );
-                assert_eq!(
-                    reopened.get(b"fill-two")?,
-                    Some(Bytes::from_static(b"value"))
-                );
+                if operation != 3 {
+                    assert_eq!(
+                        reopened.get(b"fill-one")?,
+                        Some(Bytes::from_static(b"value"))
+                    );
+                    assert_eq!(
+                        reopened.get(b"fill-two")?,
+                        Some(Bytes::from_static(b"value"))
+                    );
+                }
                 match operation {
                     0 => assert_eq!(
                         reopened.get(b"retry-put")?,
@@ -25999,6 +25997,10 @@ mod tests {
                         Some(Bytes::from_static(b"value"))
                     ),
                     2 => assert_eq!(reopened.get(b"v7-key")?, None),
+                    3 => {
+                        assert_eq!(reopened.get(b"fill-one")?, None);
+                        assert_eq!(reopened.get(b"fill-two")?, None);
+                    }
                     _ => unreachable!(),
                 }
                 reopened.close_storage()?;
