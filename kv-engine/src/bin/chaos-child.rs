@@ -203,6 +203,21 @@ fn child_main(args: &[String]) -> Result<(), String> {
 }
 
 #[cfg(target_os = "linux")]
+fn publish_v7_completion_marker(
+    marker_path: &str,
+    crash_point: &str,
+    operation: &str,
+) -> Result<(), String> {
+    let marker_path = std::path::Path::new(marker_path);
+    let temporary_marker_path = marker_path.with_extension("tmp");
+    std::fs::write(&temporary_marker_path, crash_point.as_bytes())
+        .map_err(|error| format!("write {operation} completion marker failed: {error}"))?;
+    std::fs::rename(&temporary_marker_path, marker_path)
+        .map_err(|error| format!("publish {operation} completion marker failed: {error}"))?;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
 fn run_v7_pitr_crash(
     engine: &KvEngine,
     args: &[String],
@@ -322,6 +337,30 @@ fn run_v7_pitr_crash(
         return Ok(());
     }
 
+    if args.iter().any(|arg| arg == "--sync-sync") {
+        engine
+            .sync()
+            .map_err(|error| format!("sync before process crash failed: {error:#}"))?;
+        let marker_path =
+            get_arg(args, "--sync-completion-marker").ok_or("missing --sync-completion-marker")?;
+        publish_v7_completion_marker(&marker_path, crash_point.as_str(), "sync")?;
+        loop {
+            std::thread::park();
+        }
+    }
+
+    if args.iter().any(|arg| arg == "--sync-close") {
+        engine
+            .close()
+            .map_err(|error| format!("close before process crash failed: {error:#}"))?;
+        let marker_path = get_arg(args, "--close-completion-marker")
+            .ok_or("missing --close-completion-marker")?;
+        publish_v7_completion_marker(&marker_path, crash_point.as_str(), "close")?;
+        loop {
+            std::thread::park();
+        }
+    }
+
     if args.iter().any(|arg| arg == "--async-sync") {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -332,12 +371,23 @@ fn run_v7_pitr_crash(
             .map_err(|error| format!("async sync before process crash failed: {error:#}"))?;
         let marker_path = get_arg(args, "--async-sync-completion-marker")
             .ok_or("missing --async-sync-completion-marker")?;
-        // The parent may kill this process as soon as the marker appears.
-        let temporary_marker_path = std::path::Path::new(&marker_path).with_extension("tmp");
-        std::fs::write(&temporary_marker_path, crash_point.as_bytes())
-            .map_err(|error| format!("write async sync completion marker failed: {error}"))?;
-        std::fs::rename(&temporary_marker_path, &marker_path)
-            .map_err(|error| format!("publish async sync completion marker failed: {error}"))?;
+        publish_v7_completion_marker(&marker_path, crash_point.as_str(), "async sync")?;
+        loop {
+            std::thread::park();
+        }
+    }
+
+    if args.iter().any(|arg| arg == "--async-close") {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| format!("build async close crash runtime failed: {error}"))?;
+        runtime
+            .block_on(engine.close_async())
+            .map_err(|error| format!("async close before process crash failed: {error:#}"))?;
+        let marker_path = get_arg(args, "--async-close-completion-marker")
+            .ok_or("missing --async-close-completion-marker")?;
+        publish_v7_completion_marker(&marker_path, crash_point.as_str(), "async close")?;
         loop {
             std::thread::park();
         }
