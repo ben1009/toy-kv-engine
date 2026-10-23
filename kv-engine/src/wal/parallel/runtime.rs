@@ -1709,6 +1709,9 @@ fn pack_admitted_groups(
                 return Err(error);
             }
         };
+        // Observe fixed membership before publication so an ACK cannot overtake this counter.
+        #[cfg(feature = "chaos-testing")]
+        crate::chaos::failpoint::note_parallel_wal_group_packed();
         if let Err(error) = inner.worker.submit_group(group) {
             report_packer_failure(inner, first_ticket, &error);
             return Err(error).context("failed to submit packed WAL group");
@@ -2925,6 +2928,156 @@ mod tests {
         assert_eq!(owner.snapshot(), after_close);
 
         Ok(())
+    }
+
+    #[cfg(feature = "chaos-testing")]
+    fn v7_parallel_injected_completion_failure_keeps_prior_frontier(
+        failpoint_name: &str,
+        wal_name: &str,
+        expected_error: Option<&str>,
+        injected_failure_count: fn() -> usize,
+    ) -> anyhow::Result<()> {
+        use crate::{
+            chaos::failpoint::{self, FailScenario},
+            pitr::{ArchiveEpochId, ChainAnchor},
+            wal::v7::{
+                codec::WAL_V7_FRAME_LEN, install::recover_and_install_active,
+                recovery::WalV7RecoveryAuthority,
+            },
+        };
+
+        let _scenario = FailScenario::setup();
+        failpoint::reset_parallel_wal_failure_test_counters();
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join(wal_name);
+        let Some(V7RuntimeTestWal { wal, owner, anchor }) =
+            live_v7_test_wal(&path, super::MAX_WAL_FILE_SIZE, v7_test_resource_limits())?
+        else {
+            anyhow::bail!("v7 Parallel completion qualification requires io_uring");
+        };
+
+        let (durable_ticket, _) =
+            wal.put_v7_batch_with_index(&v7_test_batch(1, 10), LIVE_WAL_V5_LIMITS)?;
+        wal.submit_and_commit(durable_ticket)?;
+        let prior_frontier = wal.v7_frontier_cursor()?;
+        let frontiers_before_failure = count_valid_v7_frontiers(&path)?;
+        assert_eq!(
+            frontiers_before_failure, 2,
+            "genesis plus the baseline marker"
+        );
+
+        failpoint::cfg(failpoint_name, "return").expect("enable the v7 worker completion fault");
+        let (failed_ticket, _) =
+            wal.put_v7_batch_with_index(&v7_test_batch(2, 10), LIVE_WAL_V5_LIMITS)?;
+        let failed = wal.submit_and_commit(failed_ticket);
+        failpoint::cfg(failpoint_name, "off").expect("disable the v7 worker completion fault");
+
+        let error =
+            failed.expect_err("the injected worker completion fault must poison its ticket");
+        if let Some(expected_error) = expected_error {
+            assert!(
+                format!("{error:#}").contains(expected_error),
+                "unexpected completion error: {error:#}"
+            );
+        }
+        assert!(wal.v7_requires_recovery());
+        let failed_frontier_offset = usize::try_from(
+            prior_frontier
+                .frame_offset
+                .checked_add(2 * WAL_V7_FRAME_LEN as u64)
+                .expect("next ticket's FRONTIER offset fits u64"),
+        )?;
+        let failed_image = std::fs::read(&path)?;
+        assert!(
+            failed_image[failed_frontier_offset..failed_frontier_offset + WAL_V7_FRAME_LEN]
+                .iter()
+                .all(|byte| *byte == 0),
+            "an injected worker completion fault must not append even a partial FRONTIER"
+        );
+        assert_eq!(
+            count_valid_v7_frontiers(&path)?,
+            frontiers_before_failure,
+            "an injected worker completion fault cannot append or publish a new FRONTIER"
+        );
+        assert!(
+            wal.put_v7_batch_with_index(&v7_test_batch(3, 10), LIVE_WAL_V5_LIMITS)
+                .is_err(),
+            "a v7 worker completion fault closes later admission"
+        );
+        assert!(wal.close().is_err(), "close reports the failed completion");
+        // The group-error hook counts after sending its result; close joins that worker.
+        assert_eq!(
+            injected_failure_count(),
+            1,
+            "the worker completion fault must be injected exactly once"
+        );
+        assert_eq!(owner.snapshot().buffer_memory_bytes, 0);
+        assert_eq!(count_valid_v7_frontiers(&path)?, frontiers_before_failure);
+        drop(wal);
+
+        let image = std::fs::read(&path)?;
+        assert!(
+            image
+                .windows(b"key-2".len())
+                .any(|window| window == b"key-2"),
+            "the injected worker completion fault follows a real DATA write"
+        );
+        let recovered = recover_and_install_active(
+            &path,
+            WalV7RecoveryAuthority::Active {
+                predecessor: ChainAnchor::Genesis {
+                    archive_epoch_id: ArchiveEpochId(anchor.archive_epoch_id),
+                },
+                durable_anchors: vec![anchor],
+            },
+        )?;
+        assert_eq!(recovered.installed.active_boundary.ticket_end, 1);
+        assert_eq!(recovered.installed.batches.len(), 1);
+        assert_eq!(recovered.installed.batches[0].commit_ts, 1);
+
+        owner.retire_after_durable_cleanup()?;
+        assert_eq!(owner.snapshot(), WalV7ResourceCharge::default());
+        Ok(())
+    }
+
+    #[cfg(feature = "chaos-testing")]
+    #[test]
+    fn failpoint_v7_parallel_post_io_group_completion_error_keeps_prior_frontier()
+    -> anyhow::Result<()> {
+        use crate::chaos::failpoint;
+
+        v7_parallel_injected_completion_failure_keeps_prior_frontier(
+            "parallel_wal.group_completion_failure",
+            "post-io-group-completion-error.wal",
+            Some("injected parallel WAL group write failure"),
+            failpoint::parallel_wal_injected_group_failure_count,
+        )
+    }
+
+    #[cfg(feature = "chaos-testing")]
+    #[test]
+    fn failpoint_v7_parallel_injected_negative_cqe_keeps_prior_frontier() -> anyhow::Result<()> {
+        use crate::chaos::failpoint;
+
+        v7_parallel_injected_completion_failure_keeps_prior_frontier(
+            "parallel_wal.negative_cqe",
+            "negative-cqe.wal",
+            Some("io_uring write failed with result -5"),
+            failpoint::parallel_wal_injected_negative_cqe_count,
+        )
+    }
+
+    #[cfg(feature = "chaos-testing")]
+    #[test]
+    fn failpoint_v7_parallel_injected_short_cqe_keeps_prior_frontier() -> anyhow::Result<()> {
+        use crate::chaos::failpoint;
+
+        v7_parallel_injected_completion_failure_keeps_prior_frontier(
+            "parallel_wal.short_cqe",
+            "short-cqe.wal",
+            Some("short io_uring write: expected 4096, got 0"),
+            failpoint::parallel_wal_injected_short_cqe_count,
+        )
     }
 
     #[cfg(feature = "chaos-testing")]

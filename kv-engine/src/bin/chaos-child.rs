@@ -278,6 +278,47 @@ fn run_v7_pitr_crash(
         }
     }
 
+    let crash_point = get_arg(args, "--crash-point").ok_or("missing --crash-point")?;
+    if wal_io_mode == WalIoMode::Parallel
+        && crash_point == "parallel_wal.later_group_completed_first"
+    {
+        use wrapper::kv_engine_wrapper::chaos::failpoint;
+
+        engine
+            .put(b"v7-parallel-crash-baseline", b"stable")
+            .map_err(|error| format!("acknowledged v7 baseline write failed: {error:#}"))?;
+        failpoint::enable_deferred_lowest_parallel_wal_group_completion();
+        failpoint::reset_parallel_wal_packed_group_count();
+
+        std::thread::scope(|scope| {
+            let first = scope.spawn(|| engine.put(b"v7-parallel-crash-first", b"first"));
+            let packing_deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            while failpoint::parallel_wal_packed_group_count() == 0 {
+                if first.is_finished() {
+                    return Err(
+                        "first v7 Parallel writer finished before group packing was observed"
+                            .to_string(),
+                    );
+                }
+                if std::time::Instant::now() >= packing_deadline {
+                    return Err("first v7 Parallel WAL group was not packed within 30s".to_string());
+                }
+                std::thread::yield_now();
+            }
+
+            let second = scope.spawn(|| engine.put(b"v7-parallel-crash-second", b"second"));
+            for (name, handle) in [("first", first), ("second", second)] {
+                handle
+                    .join()
+                    .map_err(|_| format!("{name} v7 Parallel writer panicked"))?
+                    .map_err(|error| format!("{name} v7 Parallel writer failed: {error:#}"))?;
+            }
+            Ok::<(), String>(())
+        })?;
+
+        return Ok(());
+    }
+
     let write_key = get_arg(args, "--write-key");
     let write_value = get_arg(args, "--write-value");
     let (write_key, write_value) = match (write_key, write_value) {

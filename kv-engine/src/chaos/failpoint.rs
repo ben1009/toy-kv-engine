@@ -50,8 +50,13 @@ pub const PARALLEL_WAL_CRASH_MARKER_ENV: &str = "TOY_KV_PARALLEL_WAL_CRASH_MARKE
 static WAL_CRASH_POINT_HITS: AtomicUsize = AtomicUsize::new(0);
 static DEFER_LOWEST_PARALLEL_WAL_GROUP_COMPLETION: AtomicBool = AtomicBool::new(false);
 static PARALLEL_WAL_ADMISSIONS: AtomicUsize = AtomicUsize::new(0);
+static PARALLEL_WAL_PACKED_GROUPS: AtomicUsize = AtomicUsize::new(0);
 #[cfg(all(test, feature = "chaos-testing"))]
 static PARALLEL_WAL_INJECTED_GROUP_FAILURES: AtomicUsize = AtomicUsize::new(0);
+#[cfg(all(test, feature = "chaos-testing"))]
+static PARALLEL_WAL_INJECTED_NEGATIVE_CQES: AtomicUsize = AtomicUsize::new(0);
+#[cfg(all(test, feature = "chaos-testing"))]
+static PARALLEL_WAL_INJECTED_SHORT_CQES: AtomicUsize = AtomicUsize::new(0);
 #[cfg(all(test, feature = "chaos-testing"))]
 static PARALLEL_WAL_SYNCS_WITH_POISON: AtomicUsize = AtomicUsize::new(0);
 #[cfg(all(test, feature = "chaos-testing"))]
@@ -136,15 +141,66 @@ pub(crate) fn note_parallel_wal_admission() {
     PARALLEL_WAL_ADMISSIONS.fetch_add(1, Ordering::AcqRel);
 }
 
+/// Reset the chaos-child counter used to wait until a WAL group's membership is fixed.
+#[doc(hidden)]
+pub fn reset_parallel_wal_packed_group_count() {
+    PARALLEL_WAL_PACKED_GROUPS.store(0, Ordering::Release);
+}
+
+/// Return how many WAL groups reached fixed membership before worker publication since the last
+/// reset.
+#[doc(hidden)]
+pub fn parallel_wal_packed_group_count() -> usize {
+    PARALLEL_WAL_PACKED_GROUPS.load(Ordering::Acquire)
+}
+
+pub(crate) fn note_parallel_wal_group_packed() {
+    PARALLEL_WAL_PACKED_GROUPS.fetch_add(1, Ordering::AcqRel);
+}
+
 #[cfg(all(test, feature = "chaos-testing"))]
 pub(crate) fn reset_parallel_wal_failure_test_counters() {
     PARALLEL_WAL_INJECTED_GROUP_FAILURES.store(0, Ordering::Release);
+    PARALLEL_WAL_INJECTED_NEGATIVE_CQES.store(0, Ordering::Release);
+    PARALLEL_WAL_INJECTED_SHORT_CQES.store(0, Ordering::Release);
     PARALLEL_WAL_SYNCS_WITH_POISON.store(0, Ordering::Release);
 }
 
 #[cfg(all(test, feature = "chaos-testing"))]
 pub(crate) fn parallel_wal_injected_group_failure_count() -> usize {
     PARALLEL_WAL_INJECTED_GROUP_FAILURES.load(Ordering::Acquire)
+}
+
+#[cfg(all(test, feature = "chaos-testing"))]
+pub(crate) fn parallel_wal_injected_negative_cqe_count() -> usize {
+    PARALLEL_WAL_INJECTED_NEGATIVE_CQES.load(Ordering::Acquire)
+}
+
+#[cfg(all(test, feature = "chaos-testing"))]
+pub(crate) fn parallel_wal_injected_short_cqe_count() -> usize {
+    PARALLEL_WAL_INJECTED_SHORT_CQES.load(Ordering::Acquire)
+}
+
+#[cfg(all(test, feature = "chaos-testing"))]
+pub(crate) fn parallel_wal_negative_cqe_result(ticket_start: u64) -> Option<i32> {
+    fail_point!("parallel_wal.negative_cqe", ticket_start > 0, |_| {
+        PARALLEL_WAL_INJECTED_NEGATIVE_CQES
+            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+            .then_some(-libc::EIO)
+    });
+    None
+}
+
+#[cfg(all(test, feature = "chaos-testing"))]
+pub(crate) fn parallel_wal_short_cqe_result(ticket_start: u64) -> Option<i32> {
+    fail_point!("parallel_wal.short_cqe", ticket_start > 0, |_| {
+        PARALLEL_WAL_INJECTED_SHORT_CQES
+            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+            .then_some(0)
+    });
+    None
 }
 
 #[cfg(all(test, feature = "chaos-testing"))]

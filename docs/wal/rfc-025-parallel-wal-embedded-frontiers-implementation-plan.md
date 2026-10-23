@@ -1707,6 +1707,74 @@ synchronous and asynchronous write admission. Those writes are synced, the
 engine is closed and reopened with Parallel selected, and the original sealed
 value plus both post-resume values must remain readable.
 
+The forty-third Stage 8 slice adds a process-level v7 Parallel crash at
+`parallel_wal.later_group_completed_first`. The child defers the lowest-ticket
+real CQE and waits until that ticket's group has fixed membership before
+admitting the next write, preventing the packer from coalescing both tickets.
+The packed-group counter advances before worker publication, so a baseline ACK
+cannot precede a delayed counter update that would release this wait early.
+A later group's real I/O completion then reaches the crash hook. The pre-crash
+image must contain both speculative DATA writes; after reopen, only
+the earlier durable v7 baseline and legacy source value may replay, and Active
+recovery must install a fresh normalized inode. The test probes io_uring
+strictly and requires the crash marker, so unavailable backends or an unreached
+hook fail qualification instead of being counted as a pass. Local evidence:
+`cargo nextest run --package kv-engine --features chaos-testing --test
+chaos_integration failpoint_v7_parallel_later_group_cqe_does_not_advance_past_gap`
+passed on Linux/io_uring; the observed fault point was
+`parallel_wal.later_group_completed_first` (crash occurrence 1).
+
+The forty-fourth Stage 8 slice injects a group-completion error after the actual
+v7 Parallel DATA CQEs have completed successfully. This qualifies post-I/O
+group-error handling, not a negative kernel CQE. The failed ticket must poison
+admission without advancing or appending a FRONTIER; close retires transient
+memory, and recovery replays only the previous durable ticket. Worker-state
+tests separately cover negative CQE handling. Local evidence:
+`cargo nextest run --package kv-engine --all-features --lib
+failpoint_v7_parallel_post_io_group_completion_error_keeps_prior_frontier`
+passed; the injected group-error hook was reached exactly once.
+
+The forty-fifth Stage 8 slice injects `-EIO` into a successful DATA CQE result
+immediately before `WorkerCore` consumes it. The underlying positional write
+has completed, so this exercises negative-result handling through the live
+worker completion path and its buffer ownership transitions; it does not claim
+that the kernel generated an error CQE. The test verifies that the injected
+negative result poisons the ticket, appends no FRONTIER, closes admission, and
+recovers only the prior durable ticket. Local evidence:
+`cargo nextest run --package kv-engine --features chaos-testing --lib
+failpoint_v7_parallel_injected_negative_cqe_keeps_prior_frontier` passed on
+Linux with host io_uring access; the negative result was injected once.
+
+The sandboxed unit attempt failed with `EPERM` while creating io_uring. The
+final combined host run of all six cases passed 6/6:
+
+```sh
+cargo nextest run --package kv-engine --features chaos-testing --filter-expr 'test(missing_cqe_blocks_close_until_matching_completion_retires_buffer) | test(process_completions_rejects_stale_cqe_without_releasing_outstanding_buffer) | test(failpoint_v7_parallel_later_group_cqe_does_not_advance_past_gap) | test(failpoint_v7_parallel_post_io_group_completion_error_keeps_prior_frontier) | test(failpoint_v7_parallel_injected_negative_cqe_keeps_prior_frontier) | test(failpoint_v7_parallel_injected_short_cqe_keeps_prior_frontier)'
+```
+
+The forty-sixth Stage 8 slice injects a zero-length completion result after a
+successful DATA `pwrite`, exercising the live worker's zero-length short-CQE path.
+It requires the short-write error to reach the caller, poisons the failed ticket,
+appends no FRONTIER, closes later admission, and recovers only the preceding
+durable ticket. This complements the negative-CQE test; it does not claim that
+the kernel returned a short CQE. The combined host run above passes 6/6 on Linux
+with io_uring access, and the short result was injected once.
+
+The forty-seventh Stage 8 slice passes an unknown `user_data` value to
+`process_completions` while a request is still submitted. The dispatcher must
+return its stale-completion error without finishing the group, emitting a
+completion result, or releasing the outstanding buffer; a later matching
+completion then retires that buffer. This exercises the live completion
+dispatcher with a synthetic stale ID and does not claim that the kernel emitted
+such a CQE. The combined host run above passes 6/6.
+
+The forty-eighth Stage 8 slice leaves a successfully submitted request without
+its CQE and verifies that `WorkerCore::close` returns
+`RequestNotOutstanding` while retaining the buffer. A matching completion then
+retires the buffer and allows close to succeed. This complements the ambiguous
+submission case by covering a missing completion without changing the request
+to `Ambiguous`; the combined host run above passes 6/6.
+
 - Complete the correctness matrix below using the persistence model, real
   runtime injection, and process-level integration. Regress ordinary v4,
   strict v5/v6, TTL, recorded-time rollback/clamping, range deletion, OCC,
@@ -1759,7 +1827,7 @@ the captured prefix must survive even if no publication or ACK followed.
 | Discovery damage and tail controls | Scan beyond broken DATA, zero/hole/preallocation and partial EOF; stray speculative control may be discarded, interior fork/orphan may not be skipped. |
 | Chain invariants | Duplicate generation, sibling/orphan/skip-predecessor, wrong binding/digest, and physical containment fail even after fixture CRCs are recomputed. |
 | Fixed targets and stopped admission | Continuous work cannot change API cutoff `C` for sync/close/freeze/checkpoint/recovery points; predecessor containment may require marker `T > C`, fixed before construction. `D0 \| D1 \| F_A(D0)` drains; ineligible poisoned targets terminate. |
-| Real CQEs and ownership | Short/negative, reversed, stale, missing, and ambiguous completions cannot publish beyond a proven prefix or release kernel/hash-owned buffers. |
+| Real CQEs and ownership | Short/negative, reversed, stale, missing, and ambiguous completions cannot publish beyond a proven prefix or release kernel/hash-owned buffers. Worker-state tests exercise negative CQEs; `failpoint_v7_parallel_injected_negative_cqe_keeps_prior_frontier` and `failpoint_v7_parallel_injected_short_cqe_keeps_prior_frontier` inject negative and short results into the live completion path; `process_completions_rejects_stale_cqe_without_releasing_outstanding_buffer` exercises stale-ID rejection at the completion dispatcher; `missing_cqe_blocks_close_until_matching_completion_retires_buffer` verifies a missing completion keeps the buffer owned and prevents close; `failpoint_v7_parallel_later_group_cqe_does_not_advance_past_gap` verifies real out-of-order DATA completion cannot advance recovery across an earlier ticket gap; `failpoint_v7_parallel_post_io_group_completion_error_keeps_prior_frontier` verifies a post-I/O group-completion error preserves the prior durable boundary. |
 | Failed marker cycle | No further FRONTIER append in that runtime, including attempts that would not ACK; all waiters/leases reach terminal outcomes. |
 | Durable floors | Validate every exact logical anchor; never fall below it, reuse required timestamps, or reinterpret allocation watermarks as committed coordinates. |
 | Recovery installation crashes | Copy/write/sync/replace/directory-sync failures, unchanged-length rewrite, restart without reboot, and crash during repeated normalization; canonical old/new image remains verifiable, with no early service. |
