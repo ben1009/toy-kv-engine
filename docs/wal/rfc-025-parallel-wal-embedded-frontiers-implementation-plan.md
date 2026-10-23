@@ -1804,6 +1804,26 @@ rewritten byte still cannot make the replacement service-ready. Local evidence:
 `cargo nextest run --package kv-engine --all-features --lib
 --filter-expr 'test(wal::v7::model::tests::)'` passed 22/22.
 
+The fifty-first Stage 8 slice exercises the public sync and async write APIs
+against an Active v7 Parallel PITR WAL, then closes and reopens the database.
+It covers point puts, live and zero-duration TTL puts through point and batch
+APIs, point deletes, half-open range deletes, and sync/async MVCC transaction
+commits. Reopen must retain live values, keep expired TTL values absent, preserve
+point and range deletions, and still select v7 Parallel. Local evidence:
+`cargo nextest run --package kv-engine --features chaos-testing --test
+chaos_integration v7_parallel_pitr_sync_and_async_write_apis_survive_reopen`
+passed 1/1 on Linux with host io_uring access.
+
+The fifty-second Stage 8 slice exercises standalone checkpoint capture from an
+Active v7 Parallel PITR engine. The checkpoint includes the legacy predecessor
+and the write committed before its fixed cutoff, excludes a later write, and
+reopens independently; the source retains both writes after a separate reopen.
+Local evidence:
+`cargo nextest run --package kv-engine --features chaos-testing --test
+chaos_integration --filter-expr 'test(v7_parallel_pitr_sync_and_async_write_apis_survive_reopen)
+| test(v7_parallel_pitr_checkpoint_captures_its_fixed_cutoff)'` passed 2/2 on
+Linux with host io_uring access.
+
 - Complete the correctness matrix below using the persistence model, real
   runtime injection, and process-level integration. Regress ordinary v4,
   strict v5/v6, TTL, recorded-time rollback/clamping, range deletion, OCC,
@@ -1863,7 +1883,7 @@ the captured prefix must survive even if no publication or ACK followed.
 | Recovery followed by continued writes | Normalize twice, append at restored ticket/offset extending the installed recovery marker, sync, crash/reopen, then seal/archive/restore. Empty/nonempty/fallback/trailing-control variants independently agree on digests, index, anchors, data, and accounting. |
 | Immutable and archive objects | Exact Sealing image, terminal marker, whole-image digest and seal index; no fallback/normalization; mixed legacy digest rules and empty v7 seals remain valid. |
 | Runtime startup after recovery | Frozen Sealing/Sealed files acquire no append pipeline or initializer and retain exact bytes/length; only installed authoritative Active state starts v7 runtime, with startup allocation reserved before mutation. |
-| Async, MVCC, and capture | Public point/TTL/delete/batch/range/OCC APIs use v7 encoding and ordered time clamping; rejected timestamp reservations retire. Cancellation and freeze/close/checkpoint/recovery-point races retain owners and the correct visible prefix. |
+| Async, MVCC, and capture | `v7_parallel_pitr_sync_and_async_write_apis_survive_reopen` exercises public point/TTL/delete/batch/range APIs and sync/async MVCC commits through Active v7 reopen; `v7_parallel_pitr_checkpoint_captures_its_fixed_cutoff` verifies checkpoint cutoff isolation and source continuation. Runtime tests separately cover OCC retry, recorded-time rollback clamping, cancellation, and checkpoint admission; remaining required crash/race cases must retain owners and the correct visible prefix. |
 | Capacity and pins | Real engine admission/preallocation uses the shared ledger; full spool still permits terminal marker/recovery; workspace grows before allocation; old/temp/pinned files stay charged until durable cleanup. |
 | Segment exhaustion and shared pressure | Exact-boundary DATA-plus-marker exhaustion triggers rotation before ticket assignment for a batch that fits a fresh segment; retry preserves caps and ordering. Shared-ledger pressure, including aggregate spool and seal-index quota, does not trigger rotation, and oversized batches cannot loop through empty successors. |
 | Legacy upgrade | Insufficient maximum-image capacity defers with writable v6 rotations; transition reservations precede intent and survive concurrent capacity consumption/replay; eligible transition installs one v7 active; new enable fails before intent; installed v7 cannot downgrade. |
