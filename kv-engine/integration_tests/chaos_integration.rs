@@ -3064,7 +3064,9 @@ fn v7_parallel_pitr_sync_and_async_write_apis_survive_reopen() {
 
 #[cfg(target_os = "linux")]
 #[test]
-fn v7_parallel_pitr_checkpoint_captures_its_fixed_cutoff() {
+fn failpoint_v7_parallel_pitr_checkpoint_captures_its_fixed_cutoff() {
+    let _failpoint_guard = lock_v7_async_checkpoint_failpoint();
+    let _scenario = FailScenario::setup();
     let dir = tempfile::tempdir().expect("create v7 checkpoint regression directory");
     let db_path = dir.path().join("db");
     let repository = dir.path().join("repository");
