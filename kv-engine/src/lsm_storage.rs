@@ -28429,6 +28429,324 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    #[derive(Clone, Copy)]
+    enum V7DurableLifecycleBoundary {
+        RecoveryPoint,
+        ForcedFlush,
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn v7_recovery_point_drains_durable_unpublished_write_and_restores_cutoff() -> anyhow::Result<()>
+    {
+        for asynchronous in [false, true] {
+            v7_durable_lifecycle_boundary_case(
+                V7DurableLifecycleBoundary::RecoveryPoint,
+                asynchronous,
+            )?;
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn v7_forced_flush_drains_durable_unpublished_write_and_recovers() -> anyhow::Result<()> {
+        for asynchronous in [false, true] {
+            v7_durable_lifecycle_boundary_case(
+                V7DurableLifecycleBoundary::ForcedFlush,
+                asynchronous,
+            )?;
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn v7_durable_lifecycle_boundary_case(
+        boundary: V7DurableLifecycleBoundary,
+        asynchronous: bool,
+    ) -> anyhow::Result<()> {
+        use std::time::{Duration, Instant};
+
+        let boundary_name = match boundary {
+            V7DurableLifecycleBoundary::RecoveryPoint => "recovery point",
+            V7DurableLifecycleBoundary::ForcedFlush => "forced flush",
+        };
+        let directory = tempdir()?;
+        let options = v7_recovery_test_database(directory.path())?;
+        let database = directory.path().join("db");
+        let repository_path = options
+            .pitr_repository
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("v7 fixture has no PITR repository"))?;
+        let engine = KvEngine::open_with_wal_io_mode(
+            &database,
+            options.clone(),
+            crate::wal::WalIoMode::Parallel,
+        )?;
+        suspend_pitr_maintenance_for_test(&engine);
+        engine.put(b"lifecycle-boundary-baseline", b"kept")?;
+        let initial_segment_id = engine
+            .pitr_manifest_state
+            .lock()
+            .active_segment_id
+            .ok_or_else(|| anyhow::anyhow!("v7 fixture has no Active segment"))?;
+        let active = engine.inner.state.load().memtable.clone();
+        assert!(active.uses_v7_wal());
+        assert!(active.uses_parallel_wal());
+        let sequencer = engine
+            .inner
+            .mvcc
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("v7 fixture has no MVCC sequencer"))?;
+
+        let pause = crate::lsm_storage::native_write::NativeWritePause::new(
+            crate::lsm_storage::native_write::NativeWriteStage::Durable,
+        );
+        let _release_on_exit = NativeWritePauseReleaseGuard(Arc::clone(&pause));
+        *engine.inner.native_write_pause.lock() = Some(Arc::clone(&pause));
+        let writer_engine = Arc::clone(&engine);
+        let writer = std::thread::spawn(move || {
+            writer_engine.put(b"lifecycle-boundary-durable", b"included")
+        });
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        let reached_durable_pause = runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), pause.reached.notified())
+                .await
+                .is_ok()
+        });
+        let hidden_before_publication =
+            reached_durable_pause && engine.get(b"lifecycle-boundary-durable")?.is_none();
+        let barrier_engine = Arc::clone(&engine);
+        let barrier_worker = std::thread::spawn(move || -> anyhow::Result<Option<u64>> {
+            match boundary {
+                V7DurableLifecycleBoundary::RecoveryPoint => {
+                    let outcome = if asynchronous {
+                        tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()?
+                            .block_on(async {
+                                barrier_engine.create_recovery_point_async().await
+                            })?
+                    } else {
+                        barrier_engine.create_recovery_point()?
+                    };
+                    match outcome {
+                        crate::pitr::api::RecoveryPointOutcome::Durable(point) => {
+                            Ok(point.commit_ts)
+                        }
+                        crate::pitr::api::RecoveryPointOutcome::CommitPublishedButNotDurable {
+                            error,
+                            ..
+                        } => Err(anyhow::anyhow!(
+                            "{boundary_name} published without durable archive: {error}"
+                        )),
+                        crate::pitr::api::RecoveryPointOutcome::PublicationUnknown { .. } => Err(
+                            anyhow::anyhow!("{boundary_name} archive publication is unknown"),
+                        ),
+                    }
+                }
+                V7DurableLifecycleBoundary::ForcedFlush => {
+                    if asynchronous {
+                        tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()?
+                            .block_on(barrier_engine.force_flush_async())?;
+                    } else {
+                        barrier_engine.force_flush()?;
+                    }
+                    Ok(None)
+                }
+            }
+        });
+
+        let cutoff_deadline = Instant::now() + Duration::from_secs(5);
+        while sequencer.commit_admission_is_open()
+            && !barrier_worker.is_finished()
+            && Instant::now() < cutoff_deadline
+        {
+            std::thread::yield_now();
+        }
+        let barrier_stopped_admission = !sequencer.commit_admission_is_open();
+        let barrier_rejected_new_commit = if barrier_stopped_admission {
+            engine
+                .put(b"lifecycle-boundary-after-cutoff", b"rejected")
+                .is_err()
+        } else {
+            false
+        };
+        std::thread::sleep(Duration::from_millis(50));
+        let barrier_waited_for_publication = !barrier_worker.is_finished();
+        let wal_open_while_writer_paused = active.parallel_wal_is_closed() == Some(false);
+
+        // Always release and join both workers before assertions, so failed
+        // barrier expectations cannot strand a writer during unwinding.
+        pause.release_blocking();
+        let writer_result = writer.join().map_err(|_| {
+            anyhow::anyhow!("{boundary_name} writer panicked while paused after WAL durability")
+        })?;
+        let barrier_result = barrier_worker
+            .join()
+            .map_err(|_| anyhow::anyhow!("{boundary_name} barrier worker panicked"))?;
+        writer_result?;
+        let point_commit_ts = barrier_result?;
+        let durable_write_ts = pause.timestamp.load(std::sync::atomic::Ordering::Acquire);
+        let recovery_point_matches_paused_write = match boundary {
+            V7DurableLifecycleBoundary::RecoveryPoint => point_commit_ts == Some(durable_write_ts),
+            V7DurableLifecycleBoundary::ForcedFlush => point_commit_ts.is_none(),
+        };
+        let segment_rotated_once =
+            engine.pitr_manifest_state.lock().active_segment_id == Some(initial_segment_id + 1);
+        let admission_resumed = sequencer.commit_admission_is_open();
+        let source_published =
+            engine.get(b"lifecycle-boundary-durable")? == Some(Bytes::from_static(b"included"));
+        let source_keeps_baseline =
+            engine.get(b"lifecycle-boundary-baseline")? == Some(Bytes::from_static(b"kept"));
+        let post_boundary_write_accepted = engine
+            .put(b"lifecycle-boundary-successor", b"later")
+            .is_ok();
+        let forced_flush_drained_immutables =
+            !matches!(boundary, V7DurableLifecycleBoundary::ForcedFlush)
+                || engine.inner.state.load().imm_memtables.is_empty();
+
+        let recovery_point_selector =
+            if matches!(boundary, V7DurableLifecycleBoundary::RecoveryPoint) {
+                let status = engine.pitr_status(crate::pitr::api::PitrStatusOptions {
+                    cursor: None,
+                    page_size: crate::pitr::api::MAX_STATUS_PAGE_SIZE,
+                })?;
+                let interval = status.recoverable_intervals.first().ok_or_else(|| {
+                    anyhow::anyhow!("recovery point produced no recoverable interval")
+                })?;
+                Some(crate::pitr::api::RecoverySelector {
+                    timeline_id: interval.timeline_id,
+                    archive_epoch_id: Some(interval.archive_epoch_id),
+                    base_backup_id: None,
+                })
+            } else {
+                None
+            };
+        let recovery_point_target = point_commit_ts;
+
+        engine.close_storage()?;
+        drop(active);
+        drop(engine);
+
+        if let (Some(selector), Some(target)) = (recovery_point_selector, recovery_point_target) {
+            let destination = directory.path().join("restored-recovery-point");
+            let repository = crate::backup::BackupRepository::open(&repository_path)?;
+            let outcome = repository.restore_to(
+                crate::pitr::api::RecoveryTarget::CommitTs(target),
+                &destination,
+                crate::pitr::api::PitrRestoreOptions {
+                    selector,
+                    implementations: crate::pitr::api::ImplementationRegistry,
+                    executor_threads: std::num::NonZeroUsize::new(1)
+                        .expect("one executor thread is nonzero"),
+                    cache_capacity: 4096,
+                    storage: LsmStorageOptions::default_for_test(),
+                },
+            )?;
+            assert!(matches!(
+                outcome,
+                crate::pitr::api::RestoreToOutcome::Restored(info)
+                    if info.resolved_commit_ts == Some(target)
+            ));
+            let restored = KvEngine::open(&destination, LsmStorageOptions::default_for_test())?;
+            assert_eq!(
+                restored.get(b"lifecycle-boundary-baseline")?,
+                Some(Bytes::from_static(b"kept"))
+            );
+            assert_eq!(
+                restored.get(b"lifecycle-boundary-durable")?,
+                Some(Bytes::from_static(b"included"))
+            );
+            assert_eq!(
+                restored.get(b"lifecycle-boundary-successor")?,
+                None,
+                "the recovery point included a commit admitted after its cutoff"
+            );
+            restored.close_storage()?;
+        }
+
+        let reopened =
+            KvEngine::open_with_wal_io_mode(&database, options, crate::wal::WalIoMode::Parallel)?;
+        let source_recovers_cutoff =
+            reopened.get(b"lifecycle-boundary-durable")? == Some(Bytes::from_static(b"included"));
+        let source_recovers_successor =
+            reopened.get(b"lifecycle-boundary-successor")? == Some(Bytes::from_static(b"later"));
+        let source_excludes_rejected_write =
+            reopened.get(b"lifecycle-boundary-after-cutoff")?.is_none();
+        reopened.close_storage()?;
+
+        assert!(reached_durable_pause, "writer missed its durable pause");
+        assert!(
+            hidden_before_publication,
+            "durable write became visible before MVCC publication"
+        );
+        assert!(
+            barrier_stopped_admission,
+            "{boundary_name} did not stop admission"
+        );
+        assert!(
+            barrier_rejected_new_commit,
+            "{boundary_name} admitted a commit past its fixed cutoff"
+        );
+        assert!(
+            barrier_waited_for_publication,
+            "{boundary_name} returned before the admitted commit published"
+        );
+        assert!(
+            wal_open_while_writer_paused,
+            "{boundary_name} closed the Active WAL before the admitted writer drained"
+        );
+        assert!(
+            recovery_point_matches_paused_write,
+            "{boundary_name} boundary did not match the paused commit timestamp"
+        );
+        assert!(
+            segment_rotated_once,
+            "{boundary_name} did not rotate one v7 segment"
+        );
+        assert!(
+            admission_resumed,
+            "{boundary_name} did not resume commit admission"
+        );
+        assert!(
+            source_published,
+            "{boundary_name} did not publish the admitted write"
+        );
+        assert!(
+            source_keeps_baseline,
+            "{boundary_name} lost its acknowledged baseline"
+        );
+        assert!(
+            post_boundary_write_accepted,
+            "source stopped accepting successor writes"
+        );
+        assert!(
+            forced_flush_drained_immutables,
+            "forced flush returned with immutable memtables still queued"
+        );
+        assert!(
+            source_recovers_cutoff,
+            "source reopen lost the admitted cutoff write"
+        );
+        assert!(
+            source_recovers_successor,
+            "source reopen lost its successor write"
+        );
+        assert!(
+            source_excludes_rejected_write,
+            "source reopen found a write rejected past the cutoff"
+        );
+
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
     #[test]
     fn v7_checkpoint_capture_error_reopens_healthy_admission() -> anyhow::Result<()> {
         for mode in [
