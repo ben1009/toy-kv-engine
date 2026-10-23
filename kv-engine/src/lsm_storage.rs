@@ -13993,6 +13993,8 @@ impl LsmStorageInner {
         // preparers proceed while the WAL's own worker handles durability.
         drop(preparation.take());
         Self::commit_wal_ticket_or_poison(&memtable, ticket, self.mvcc.as_deref(), commit_ts)?;
+        #[cfg(test)]
+        self.pause_native_write_blocking(native_write::NativeWriteStage::Durable, commit_ts);
         if !data.is_empty() {
             Self::publish_deferred_batch_or_poison(&memtable, data, mvcc, commit_ts)?;
         }
@@ -14567,6 +14569,8 @@ impl LsmStorageInner {
             )?;
             let memtable = guard.memtable.clone();
             Self::commit_wal_ticket_or_poison(&memtable, ticket, self.mvcc.as_deref(), commit_ts)?;
+            #[cfg(test)]
+            self.pause_native_write_blocking(native_write::NativeWriteStage::Durable, commit_ts);
             if !data.is_empty() {
                 Self::publish_deferred_batch_or_poison(&memtable, data, mvcc, commit_ts)?;
             }
@@ -20474,6 +20478,16 @@ mod tests {
     #[cfg(target_os = "linux")]
     fn v7_recovery_test_database(directory: &std::path::Path) -> anyhow::Result<LsmStorageOptions> {
         v7_recovery_test_database_with_segment_limit(directory, 1 << 20)
+    }
+
+    #[cfg(target_os = "linux")]
+    struct NativeWritePauseReleaseGuard(Arc<crate::lsm_storage::native_write::NativeWritePause>);
+
+    #[cfg(target_os = "linux")]
+    impl Drop for NativeWritePauseReleaseGuard {
+        fn drop(&mut self) {
+            self.0.release_blocking();
+        }
     }
 
     /// Keep periodic target rotation and reconciliation from consuming the
@@ -28126,6 +28140,713 @@ mod tests {
             Some(Bytes::from_static(b"durable"))
         );
         reopened.close_storage()?;
+
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn v7_native_async_cancellation_after_durability_keeps_commit_owned_and_close_drains_it()
+    -> anyhow::Result<()> {
+        let directory = tempdir()?;
+        let options = v7_recovery_test_database(directory.path())?;
+        let database = directory.path().join("db");
+        let engine = KvEngine::open_with_wal_io_mode(
+            &database,
+            options.clone(),
+            crate::wal::WalIoMode::Parallel,
+        )?;
+        let active = engine.inner.state.load().memtable.clone();
+        assert!(active.uses_v7_wal());
+        assert!(active.uses_parallel_wal());
+        let frontier_before_write = active.v7_frontier_cursor()?.frontier;
+
+        let pause = crate::lsm_storage::native_write::NativeWritePause::new(
+            crate::lsm_storage::native_write::NativeWriteStage::Durable,
+        );
+        *engine.inner.native_write_pause.lock() = Some(Arc::clone(&pause));
+        let writer_engine = Arc::clone(&engine);
+        let key = b"cancelled-after-v7-durability";
+        let writer = tokio::spawn(async move { writer_engine.put_async(key, b"durable").await });
+        tokio::time::timeout(std::time::Duration::from_secs(5), pause.reached.notified())
+            .await
+            .expect("v7 async writer must reach the post-durability pause");
+
+        let hidden_before_publication = engine.get(key)?.is_none();
+        let frontier_after_sync = active.v7_frontier_cursor()?.frontier;
+        let durable_frontier_advanced = frontier_after_sync.ticket_end
+            > frontier_before_write.ticket_end
+            && frontier_after_sync.durable_end > frontier_before_write.durable_end;
+        writer.abort();
+        let caller_cancelled = writer.await.unwrap_err().is_cancelled();
+
+        let close_engine = Arc::clone(&engine);
+        let close = tokio::spawn(async move { close_engine.close_async().await });
+        let close_entered_write_drain =
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while engine.inner.lifecycle.ensure_open().is_ok()
+                    || !engine
+                        .inner
+                        .lifecycle
+                        .0
+                        .wait_for_writes_started
+                        .load(std::sync::atomic::Ordering::Acquire)
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .is_ok();
+        let admission_stayed_open = engine
+            .inner
+            .mvcc
+            .as_ref()
+            .expect("v7 storage has MVCC")
+            .commit_admission_is_open();
+        let close_waited_for_owned_commit = !close.is_finished();
+        pause.release.notify_one();
+        close.await.unwrap()?;
+        assert_eq!(
+            engine.get(key)?,
+            Some(Bytes::from_static(b"durable")),
+            "close must finish publishing the cancelled write before recovery"
+        );
+        drop(engine);
+
+        assert!(
+            hidden_before_publication,
+            "a durable native async write must remain invisible until MVCC publication"
+        );
+        assert!(
+            durable_frontier_advanced,
+            "the post-durability pause must follow a persisted Active v7 frontier"
+        );
+        assert!(
+            caller_cancelled,
+            "native async write caller was not cancelled"
+        );
+        assert!(
+            close_entered_write_drain,
+            "close did not begin draining the accepted native async write"
+        );
+        assert!(
+            admission_stayed_open,
+            "close must preserve MVCC admission until the accepted v7 commit drains"
+        );
+        assert!(
+            close_waited_for_owned_commit,
+            "close must wait for the cancelled but durable v7 commit"
+        );
+
+        let reopened =
+            KvEngine::open_with_wal_io_mode(&database, options, crate::wal::WalIoMode::Parallel)?;
+        assert_eq!(
+            reopened.get(key)?,
+            Some(Bytes::from_static(b"durable")),
+            "the durable accepted write must publish and survive close/reopen after caller cancellation"
+        );
+        reopened.close_storage()?;
+
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn v7_native_async_batch_cancellation_after_durability_publishes_all_entries_and_close_drains_it()
+    -> anyhow::Result<()> {
+        let directory = tempdir()?;
+        let options = v7_recovery_test_database(directory.path())?;
+        let database = directory.path().join("db");
+        let engine = KvEngine::open_with_wal_io_mode(
+            &database,
+            options.clone(),
+            crate::wal::WalIoMode::Parallel,
+        )?;
+        let active = engine.inner.state.load().memtable.clone();
+        let frontier_before_batch = active.v7_frontier_cursor()?.frontier;
+
+        let pause = crate::lsm_storage::native_write::NativeWritePause::new(
+            crate::lsm_storage::native_write::NativeWriteStage::Durable,
+        );
+        *engine.inner.native_write_pause.lock() = Some(Arc::clone(&pause));
+        let batch_engine = Arc::clone(&engine);
+        let batch = vec![
+            WriteBatchRecord::Put(
+                Bytes::from_static(b"cancelled-batch-first"),
+                Bytes::from_static(b"first"),
+            ),
+            WriteBatchRecord::Put(
+                Bytes::from_static(b"cancelled-batch-second"),
+                Bytes::from_static(b"second"),
+            ),
+        ];
+        let writer = tokio::spawn(async move { batch_engine.write_batch_async(&batch).await });
+        tokio::time::timeout(std::time::Duration::from_secs(5), pause.reached.notified())
+            .await
+            .expect("v7 async batch writer must reach the post-durability pause");
+
+        let entries_hidden_before_publication = engine.get(b"cancelled-batch-first")?.is_none()
+            && engine.get(b"cancelled-batch-second")?.is_none();
+        let frontier_after_sync = active.v7_frontier_cursor()?.frontier;
+        let durable_frontier_advanced = frontier_after_sync.ticket_end
+            > frontier_before_batch.ticket_end
+            && frontier_after_sync.durable_end > frontier_before_batch.durable_end;
+        writer.abort();
+        let caller_cancelled = writer.await.unwrap_err().is_cancelled();
+
+        let close_engine = Arc::clone(&engine);
+        let close = tokio::spawn(async move { close_engine.close_async().await });
+        let close_entered_write_drain =
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while engine.inner.lifecycle.ensure_open().is_ok()
+                    || !engine
+                        .inner
+                        .lifecycle
+                        .0
+                        .wait_for_writes_started
+                        .load(std::sync::atomic::Ordering::Acquire)
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .is_ok();
+        let admission_stayed_open = engine
+            .inner
+            .mvcc
+            .as_ref()
+            .expect("v7 storage has MVCC")
+            .commit_admission_is_open();
+        let close_waited_for_owned_batch = !close.is_finished();
+        pause.release.notify_one();
+        close.await.unwrap()?;
+        assert_eq!(
+            engine.get(b"cancelled-batch-first")?,
+            Some(Bytes::from_static(b"first")),
+            "close must publish the first batch entry before recovery"
+        );
+        assert_eq!(
+            engine.get(b"cancelled-batch-second")?,
+            Some(Bytes::from_static(b"second")),
+            "close must publish the second batch entry before recovery"
+        );
+        drop(engine);
+
+        assert!(
+            entries_hidden_before_publication,
+            "durable async batch entries must remain invisible until batch publication"
+        );
+        assert!(
+            durable_frontier_advanced,
+            "the post-durability pause must follow a persisted Active v7 frontier"
+        );
+        assert!(
+            caller_cancelled,
+            "native async batch caller was not cancelled"
+        );
+        assert!(
+            close_entered_write_drain,
+            "close did not begin draining the accepted native async batch"
+        );
+        assert!(
+            admission_stayed_open,
+            "close must preserve MVCC admission until the accepted v7 batch drains"
+        );
+        assert!(
+            close_waited_for_owned_batch,
+            "close must wait for the cancelled but durable v7 batch"
+        );
+
+        let reopened =
+            KvEngine::open_with_wal_io_mode(&database, options, crate::wal::WalIoMode::Parallel)?;
+        assert_eq!(
+            reopened.get(b"cancelled-batch-first")?,
+            Some(Bytes::from_static(b"first")),
+            "the first entry must publish and survive close/reopen after caller cancellation"
+        );
+        assert_eq!(
+            reopened.get(b"cancelled-batch-second")?,
+            Some(Bytes::from_static(b"second")),
+            "the second entry must publish and survive close/reopen after caller cancellation"
+        );
+        reopened.close_storage()?;
+
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn v7_native_async_delete_cancellation_after_durability_keeps_tombstone_owned_and_close_drains_it()
+    -> anyhow::Result<()> {
+        let directory = tempdir()?;
+        let options = v7_recovery_test_database(directory.path())?;
+        let database = directory.path().join("db");
+        let engine = KvEngine::open_with_wal_io_mode(
+            &database,
+            options.clone(),
+            crate::wal::WalIoMode::Parallel,
+        )?;
+        let key = b"cancelled-delete-after-v7-durability";
+        engine.put(key, b"visible-before-delete")?;
+        let active = engine.inner.state.load().memtable.clone();
+        let frontier_before_delete = active.v7_frontier_cursor()?.frontier;
+
+        let pause = crate::lsm_storage::native_write::NativeWritePause::new(
+            crate::lsm_storage::native_write::NativeWriteStage::Durable,
+        );
+        *engine.inner.native_write_pause.lock() = Some(Arc::clone(&pause));
+        let delete_engine = Arc::clone(&engine);
+        let delete = tokio::spawn(async move { delete_engine.delete_async(key).await });
+        tokio::time::timeout(std::time::Duration::from_secs(5), pause.reached.notified())
+            .await
+            .expect("v7 async delete must reach the post-durability pause");
+
+        let old_value_visible_before_publication =
+            engine.get(key)?.as_deref() == Some(b"visible-before-delete".as_slice());
+        let frontier_after_sync = active.v7_frontier_cursor()?.frontier;
+        let durable_frontier_advanced = frontier_after_sync.ticket_end
+            > frontier_before_delete.ticket_end
+            && frontier_after_sync.durable_end > frontier_before_delete.durable_end;
+        delete.abort();
+        let caller_cancelled = delete.await.unwrap_err().is_cancelled();
+
+        let close_engine = Arc::clone(&engine);
+        let close = tokio::spawn(async move { close_engine.close_async().await });
+        let close_entered_write_drain =
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while engine.inner.lifecycle.ensure_open().is_ok()
+                    || !engine
+                        .inner
+                        .lifecycle
+                        .0
+                        .wait_for_writes_started
+                        .load(std::sync::atomic::Ordering::Acquire)
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .is_ok();
+        let admission_stayed_open = engine
+            .inner
+            .mvcc
+            .as_ref()
+            .expect("v7 storage has MVCC")
+            .commit_admission_is_open();
+        let close_waited_for_owned_delete = !close.is_finished();
+        pause.release.notify_one();
+        close.await.unwrap()?;
+        assert_eq!(
+            engine.get(key)?,
+            None,
+            "close must publish the cancelled point tombstone before recovery"
+        );
+        drop(engine);
+
+        assert!(
+            old_value_visible_before_publication,
+            "the durable async point tombstone must not become visible before MVCC publication"
+        );
+        assert!(
+            durable_frontier_advanced,
+            "the post-durability pause must follow a persisted Active v7 frontier"
+        );
+        assert!(
+            caller_cancelled,
+            "native async delete caller was not cancelled"
+        );
+        assert!(
+            close_entered_write_drain,
+            "close did not begin draining the accepted native async delete"
+        );
+        assert!(
+            admission_stayed_open,
+            "close must preserve MVCC admission until the accepted async delete drains"
+        );
+        assert!(
+            close_waited_for_owned_delete,
+            "close must wait for the cancelled but durable v7 delete"
+        );
+
+        let reopened =
+            KvEngine::open_with_wal_io_mode(&database, options, crate::wal::WalIoMode::Parallel)?;
+        assert_eq!(
+            reopened.get(key)?,
+            None,
+            "the durable point tombstone must publish and survive close/reopen after cancellation"
+        );
+        reopened.close_storage()?;
+
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn v7_async_transaction_cancellation_after_durability_keeps_commit_owned_and_close_drains_it()
+    -> anyhow::Result<()> {
+        for serializable in [false, true] {
+            let directory = tempdir()?;
+            let mut options = v7_recovery_test_database(directory.path())?;
+            options.serializable = serializable;
+            let database = directory.path().join("db");
+            let engine = KvEngine::open_with_wal_io_mode(
+                &database,
+                options.clone(),
+                crate::wal::WalIoMode::Parallel,
+            )?;
+            let active = engine.inner.state.load().memtable.clone();
+            let frontier_before_commit = active.v7_frontier_cursor()?.frontier;
+
+            let transaction = Arc::try_unwrap(engine.new_txn_async()?)
+                .unwrap_or_else(|_| panic!("transaction should have a unique owner"));
+            transaction.put(b"cancelled-transaction-after-v7-durability", b"durable")?;
+            let pause = crate::lsm_storage::native_write::NativeWritePause::new(
+                crate::lsm_storage::native_write::NativeWriteStage::Durable,
+            );
+            *engine.inner.native_write_pause.lock() = Some(Arc::clone(&pause));
+            let _release_on_test_exit = NativeWritePauseReleaseGuard(Arc::clone(&pause));
+            let writer = tokio::spawn(async move { transaction.commit_async().await });
+            tokio::time::timeout(std::time::Duration::from_secs(5), pause.reached.notified())
+                .await
+                .expect("v7 async transaction must reach the post-durability pause");
+
+            let value_hidden_before_publication = engine
+                .get(b"cancelled-transaction-after-v7-durability")?
+                .is_none();
+            let frontier_after_sync = active.v7_frontier_cursor()?.frontier;
+            let durable_frontier_advanced = frontier_after_sync.ticket_end
+                > frontier_before_commit.ticket_end
+                && frontier_after_sync.durable_end > frontier_before_commit.durable_end;
+            writer.abort();
+            let caller_cancelled = writer.await.unwrap_err().is_cancelled();
+
+            let close_engine = Arc::clone(&engine);
+            let close = tokio::spawn(async move { close_engine.close_async().await });
+            let close_entered_write_drain =
+                tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    while engine.inner.lifecycle.ensure_open().is_ok()
+                        || !engine
+                            .inner
+                            .lifecycle
+                            .0
+                            .wait_for_writes_started
+                            .load(std::sync::atomic::Ordering::Acquire)
+                    {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .is_ok();
+            let admission_stayed_open = engine
+                .inner
+                .mvcc
+                .as_ref()
+                .expect("v7 storage has MVCC")
+                .commit_admission_is_open();
+            let close_waited_for_owned_transaction = !close.is_finished();
+            pause.release_blocking();
+            close.await.unwrap()?;
+            assert_eq!(
+                engine.get(b"cancelled-transaction-after-v7-durability")?,
+                Some(Bytes::from_static(b"durable")),
+                "close must publish the cancelled transaction before recovery"
+            );
+            drop(engine);
+
+            assert!(
+                value_hidden_before_publication,
+                "a durable transaction must remain invisible until MVCC publication"
+            );
+            assert!(
+                durable_frontier_advanced,
+                "the transaction pause must follow a persisted Active v7 frontier"
+            );
+            assert!(
+                caller_cancelled,
+                "async transaction caller was not cancelled"
+            );
+            assert!(
+                close_entered_write_drain,
+                "close did not begin draining the accepted async transaction"
+            );
+            assert!(
+                admission_stayed_open,
+                "close must preserve MVCC admission until the accepted transaction drains"
+            );
+            assert!(
+                close_waited_for_owned_transaction,
+                "close must wait for the cancelled but durable transaction"
+            );
+
+            let reopened = KvEngine::open_with_wal_io_mode(
+                &database,
+                options,
+                crate::wal::WalIoMode::Parallel,
+            )?;
+            assert_eq!(
+                reopened.get(b"cancelled-transaction-after-v7-durability")?,
+                Some(Bytes::from_static(b"durable")),
+                "the accepted transaction must publish and survive close/reopen after cancellation"
+            );
+            reopened.close_storage()?;
+        }
+
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn v7_native_async_range_cancellation_after_durability_keeps_tombstone_owned_and_close_drains_it()
+    -> anyhow::Result<()> {
+        let directory = tempdir()?;
+        let options = v7_recovery_test_database(directory.path())?;
+        let database = directory.path().join("db");
+        let engine = KvEngine::open_with_wal_io_mode(
+            &database,
+            options.clone(),
+            crate::wal::WalIoMode::Parallel,
+        )?;
+        engine.put(b"range-middle", b"inside")?;
+        engine.put(b"range-z", b"outside")?;
+        let active = engine.inner.state.load().memtable.clone();
+        let frontier_before_delete = active.v7_frontier_cursor()?.frontier;
+
+        let pause = crate::lsm_storage::native_write::NativeWritePause::new(
+            crate::lsm_storage::native_write::NativeWriteStage::Durable,
+        );
+        *engine.inner.native_write_pause.lock() = Some(Arc::clone(&pause));
+        let range_engine = Arc::clone(&engine);
+        let range = tokio::spawn(async move {
+            range_engine
+                .delete_range_async(b"range-a", b"range-z")
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), pause.reached.notified())
+            .await
+            .expect("v7 async range writer must reach the post-durability pause");
+
+        let old_value_visible_before_publication =
+            engine.get(b"range-middle")?.as_deref() == Some(b"inside".as_slice());
+        let endpoint_value_visible =
+            engine.get(b"range-z")?.as_deref() == Some(b"outside".as_slice());
+        let frontier_after_sync = active.v7_frontier_cursor()?.frontier;
+        let durable_frontier_advanced = frontier_after_sync.ticket_end
+            > frontier_before_delete.ticket_end
+            && frontier_after_sync.durable_end > frontier_before_delete.durable_end;
+        range.abort();
+        let caller_cancelled = range.await.unwrap_err().is_cancelled();
+
+        let close_engine = Arc::clone(&engine);
+        let close = tokio::spawn(async move { close_engine.close_async().await });
+        let close_entered_write_drain =
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while engine.inner.lifecycle.ensure_open().is_ok()
+                    || !engine
+                        .inner
+                        .lifecycle
+                        .0
+                        .wait_for_writes_started
+                        .load(std::sync::atomic::Ordering::Acquire)
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .is_ok();
+        let admission_stayed_open = engine
+            .inner
+            .mvcc
+            .as_ref()
+            .expect("v7 storage has MVCC")
+            .commit_admission_is_open();
+        let close_waited_for_owned_range = !close.is_finished();
+        pause.release.notify_one();
+        close.await.unwrap()?;
+        assert_eq!(
+            engine.get(b"range-middle")?,
+            None,
+            "close must publish the cancelled range tombstone before recovery"
+        );
+        assert_eq!(
+            engine.get(b"range-z")?,
+            Some(Bytes::from_static(b"outside")),
+            "publication must preserve the exclusive range endpoint"
+        );
+        drop(engine);
+
+        assert!(
+            old_value_visible_before_publication,
+            "the durable range tombstone must not become visible before MVCC publication"
+        );
+        assert!(
+            endpoint_value_visible,
+            "the exclusive range endpoint must remain visible before and after publication"
+        );
+        assert!(
+            durable_frontier_advanced,
+            "the post-durability pause must follow a persisted Active v7 frontier"
+        );
+        assert!(
+            caller_cancelled,
+            "native async range caller was not cancelled"
+        );
+        assert!(
+            close_entered_write_drain,
+            "close did not begin draining the accepted native async range delete"
+        );
+        assert!(
+            admission_stayed_open,
+            "close must preserve MVCC admission until the accepted range delete drains"
+        );
+        assert!(
+            close_waited_for_owned_range,
+            "close must wait for the cancelled but durable v7 range delete"
+        );
+
+        let reopened =
+            KvEngine::open_with_wal_io_mode(&database, options, crate::wal::WalIoMode::Parallel)?;
+        assert_eq!(
+            reopened.get(b"range-middle")?,
+            None,
+            "the durable range tombstone must publish and survive close/reopen"
+        );
+        assert_eq!(
+            reopened.get(b"range-z")?,
+            Some(Bytes::from_static(b"outside")),
+            "range deletion must preserve the exclusive endpoint"
+        );
+        reopened.close_storage()?;
+
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn v7_native_async_ttl_cancellation_after_durability_keeps_expiration_owned_and_close_drains_it()
+    -> anyhow::Result<()> {
+        let directory = tempdir()?;
+        let options = v7_recovery_test_database(directory.path())?;
+        let database = directory.path().join("db");
+        let engine = KvEngine::open_with_wal_io_mode(
+            &database,
+            options.clone(),
+            crate::wal::WalIoMode::Parallel,
+        )?;
+        let key = b"cancelled-ttl-after-v7-durability";
+        engine.put(key, b"prior")?;
+        let active = engine.inner.state.load().memtable.clone();
+        let frontier_before_write = active.v7_frontier_cursor()?.frontier;
+
+        let pause = crate::lsm_storage::native_write::NativeWritePause::new(
+            crate::lsm_storage::native_write::NativeWriteStage::Durable,
+        );
+        *engine.inner.native_write_pause.lock() = Some(Arc::clone(&pause));
+        let ttl_engine = Arc::clone(&engine);
+        let writer = tokio::spawn(async move {
+            ttl_engine
+                .put_with_ttl_async(key, b"durable-ttl", std::time::Duration::from_secs(3_600))
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), pause.reached.notified())
+            .await
+            .expect("v7 async TTL writer must reach the post-durability pause");
+
+        let prior_value_visible_before_publication =
+            engine.get(key)?.as_deref() == Some(b"prior".as_slice());
+        let frontier_after_sync = active.v7_frontier_cursor()?.frontier;
+        let durable_frontier_advanced = frontier_after_sync.ticket_end
+            > frontier_before_write.ticket_end
+            && frontier_after_sync.durable_end > frontier_before_write.durable_end;
+        writer.abort();
+        let caller_cancelled = writer.await.unwrap_err().is_cancelled();
+
+        let close_engine = Arc::clone(&engine);
+        let close = tokio::spawn(async move { close_engine.close_async().await });
+        let close_entered_write_drain =
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while engine.inner.lifecycle.ensure_open().is_ok()
+                    || !engine
+                        .inner
+                        .lifecycle
+                        .0
+                        .wait_for_writes_started
+                        .load(std::sync::atomic::Ordering::Acquire)
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .is_ok();
+        let admission_stayed_open = engine
+            .inner
+            .mvcc
+            .as_ref()
+            .expect("v7 storage has MVCC")
+            .commit_admission_is_open();
+        let close_waited_for_owned_ttl_write = !close.is_finished();
+        pause.release.notify_one();
+        close.await.unwrap()?;
+        assert_eq!(
+            engine.get(key)?,
+            Some(Bytes::from_static(b"durable-ttl")),
+            "close must publish the cancelled TTL overwrite before recovery"
+        );
+        let (published_value, published_kind, published_expire_at) =
+            engine.inner.get_with_kind(key)?;
+        assert_eq!(published_value.as_deref(), Some(b"durable-ttl".as_slice()));
+        assert!(
+            matches!(published_kind, crate::vlog::KvKind::TtlInline),
+            "publication must preserve the TTL value kind"
+        );
+        assert!(
+            published_expire_at.is_some(),
+            "publication must preserve TTL expiration metadata"
+        );
+        drop(engine);
+
+        assert!(
+            prior_value_visible_before_publication,
+            "the durable native async TTL overwrite must not become visible before MVCC publication"
+        );
+        assert!(
+            durable_frontier_advanced,
+            "the post-durability pause must follow a persisted Active v7 frontier"
+        );
+        assert!(
+            caller_cancelled,
+            "native async TTL caller was not cancelled"
+        );
+        assert!(
+            close_entered_write_drain,
+            "close did not begin draining the accepted native async TTL write"
+        );
+        assert!(
+            admission_stayed_open,
+            "close must preserve MVCC admission until the accepted TTL write drains"
+        );
+        assert!(
+            close_waited_for_owned_ttl_write,
+            "close must wait for the cancelled but durable v7 TTL write"
+        );
+
+        let reopened =
+            KvEngine::open_with_wal_io_mode(&database, options, crate::wal::WalIoMode::Parallel)?;
+        assert_eq!(
+            reopened.get(key)?,
+            Some(Bytes::from_static(b"durable-ttl")),
+            "the accepted TTL value must publish and survive close/reopen after cancellation"
+        );
+        let (value, kind, expire_at) = reopened.inner.get_with_kind(key)?;
+        assert_eq!(value.as_deref(), Some(b"durable-ttl".as_slice()));
+        assert!(
+            matches!(kind, crate::vlog::KvKind::TtlInline),
+            "recovery must preserve the TTL value kind"
+        );
+        assert_eq!(
+            expire_at, published_expire_at,
+            "recovery must preserve the published TTL expiration timestamp"
+        );
+        reopened.close_async().await?;
 
         Ok(())
     }

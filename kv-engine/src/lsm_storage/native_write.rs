@@ -546,6 +546,7 @@ pub(crate) struct NativeWritePause {
     pub(crate) release: tokio::sync::Notify,
     pub(crate) timestamp: std::sync::atomic::AtomicU64,
     fired: std::sync::atomic::AtomicBool,
+    blocking_release: (std::sync::Mutex<bool>, std::sync::Condvar),
 }
 
 #[cfg(test)]
@@ -557,7 +558,22 @@ impl NativeWritePause {
             release: tokio::sync::Notify::new(),
             timestamp: std::sync::atomic::AtomicU64::new(0),
             fired: std::sync::atomic::AtomicBool::new(false),
+            blocking_release: (std::sync::Mutex::new(false), std::sync::Condvar::new()),
         })
+    }
+
+    pub(crate) fn release_blocking(&self) {
+        let (released, condition) = &self.blocking_release;
+        *released.lock().unwrap() = true;
+        condition.notify_one();
+    }
+
+    fn wait_for_blocking_release(&self) {
+        let (released, condition) = &self.blocking_release;
+        let mut released = released.lock().unwrap();
+        while !*released {
+            released = condition.wait(released).unwrap();
+        }
     }
 }
 
@@ -574,6 +590,20 @@ impl LsmStorageInner {
                 .store(timestamp, std::sync::atomic::Ordering::Release);
             pause.reached.notify_one();
             pause.release.notified().await;
+        }
+    }
+
+    pub(crate) fn pause_native_write_blocking(&self, stage: NativeWriteStage, timestamp: u64) {
+        let pause = self.native_write_pause.lock().clone();
+        if let Some(pause) = pause
+            && pause.stage == stage
+            && !pause.fired.swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            pause
+                .timestamp
+                .store(timestamp, std::sync::atomic::Ordering::Release);
+            pause.reached.notify_one();
+            pause.wait_for_blocking_release();
         }
     }
 }

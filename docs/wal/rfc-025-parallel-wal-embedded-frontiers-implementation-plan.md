@@ -509,7 +509,7 @@ now use the v7 lifecycle path. Active v7 reservation owners and their shared
 ledger are retained through durable source cleanup and then retired from segment
 bookkeeping. Constructor defaults and full crash/performance qualification remain.
 
-**Last updated:** 2026-10-22
+**Last updated:** 2026-10-23
 
 **Source baseline:** `30a64fa855126596316ab6b9237e6348b0e41fd2`, which merged RFC 025 in PR #379.
 
@@ -1824,6 +1824,170 @@ chaos_integration --filter-expr 'test(v7_parallel_pitr_sync_and_async_write_apis
 | test(v7_parallel_pitr_checkpoint_captures_its_fixed_cutoff)'` passed 2/2 on
 Linux with host io_uring access.
 
+The fifty-third Stage 8 slice extends public Active v7 Parallel lifecycle
+qualification to the asynchronous barriers. The public write API regression
+now exercises both `sync()` and `sync_async()` before close and reopen. A paired
+async checkpoint regression verifies the fixed cutoff, independent checkpoint
+reopen, and continued source writes after the capture. Focused evidence:
+`cargo nextest run --package kv-engine --features chaos-testing --test
+chaos_integration --filter-expr 'test(v7_parallel_pitr_sync_and_async_write_apis_survive_reopen)
+| test(v7_parallel_pitr_checkpoint_captures_its_fixed_cutoff)
+| test(v7_parallel_pitr_async_checkpoint_captures_its_fixed_cutoff)'` passed
+3/3 on Linux with host io_uring access.
+
+The fifty-fourth Stage 8 slice exercises the real v7 Parallel async point-write
+path at the successful-WAL-sync-before-publication crash boundary. The child
+uses `put_async()`, reaches the post-`fdatasync` hook, and is terminated before
+the async call returns; reopen must recover the synced candidate and the
+acknowledged baseline. Local evidence:
+`cargo nextest run --package kv-engine --features chaos-testing --test
+chaos_integration
+failpoint_v7_parallel_async_pitr_crash_after_sync_before_ack_recovers` passed
+1/1 on Linux with host io_uring access.
+
+The fifty-fifth Stage 8 slice closes two async-capture qualification gaps found
+in review. A child process now completes `sync_async()`, signals that the call
+returned, and is killed without closing the engine; reopen verifies the
+boundary's write survived, while a direct manifest read confirms that
+`ticket_end`, `durable_end`, and `last_commit_ts` advanced before the crash.
+The async checkpoint test pauses after pinning its fixed cutoff but before
+file copy, commits a later async write during that pause, and verifies the
+checkpoint excludes it while the source retains it.
+Focused evidence: `cargo fmt --all --check`, `git diff --check`, and
+`cargo nextest run --package kv-engine --features chaos-testing --test
+chaos_integration --filter-expr 'test(v7_parallel_pitr_sync_and_async_write_apis_survive_reopen)
+| test(v7_parallel_pitr_checkpoint_captures_its_fixed_cutoff)
+| test(failpoint_v7_parallel_pitr_async_checkpoint_captures_its_fixed_cutoff)
+| test(failpoint_v7_parallel_pitr_async_sync_survives_crash_after_return)
+| test(failpoint_v7_parallel_async_pitr_crash_after_sync_before_ack_recovers)'`
+passed 5/5; the integration tests ran outside the sandbox on Linux with host io_uring access.
+
+The fifty-sixth Stage 8 slice qualifies cancellation and shutdown while an
+asynchronous checkpoint is copying a fixed Active v7 cutoff. The test cancels
+the async caller after capture, writes a later source value, and confirms
+`close_async()` remains pending until the detached checkpoint worker finishes.
+The completed checkpoint contains only the captured prefix, while reopening
+the source retains the later write. Focused evidence: the cancellation test
+passed 1/1, and the six-test async write, sync, checkpoint, cancellation, and
+crash qualification filter passed 6/6 outside the sandbox on Linux with host
+io_uring access. The two tests sharing the process-global checkpoint failpoint
+also passed concurrently in one process with
+`cargo test --package kv-engine --features chaos-testing --test chaos_integration
+async_checkpoint -- --test-threads=2` (2/2).
+
+The fifty-seventh Stage 8 slice covers native async point-write cancellation
+after an Active v7 Parallel ticket becomes durable but before MVCC publication.
+The test verifies that the durable frontier advanced while the value remains
+invisible, then cancels the caller and confirms close keeps admission and waits
+for the owned commit. Releasing the writer publishes the value, which survives
+close and reopen. Focused evidence: `cargo nextest run --package kv-engine
+--features chaos-testing --lib --filter-expr
+'test(v7_native_async_cancelled_caller_keeps_commit_owned_and_close_drains_it)
+| test(v7_native_async_cancellation_after_durability_keeps_commit_owned_and_close_drains_it)'`
+passed 2/2 outside the sandbox on Linux with host io_uring access.
+
+The fifty-eighth Stage 8 slice applies the post-durability cancellation check
+to the separate native async range-delete publisher. It confirms the frontier
+is durable while the old value remains visible, the exclusive range endpoint
+is preserved, and caller cancellation cannot release the accepted tombstone
+while close drains. Reopen observes the deleted interior key and preserved
+endpoint. Focused evidence: `cargo nextest run --package kv-engine --features
+chaos-testing --lib --filter-expr
+'test(v7_native_async_range_cancellation_after_durability_keeps_tombstone_owned_and_close_drains_it)'`
+passed 1/1 outside the sandbox on Linux with host io_uring access.
+
+The fifty-ninth Stage 8 slice checks cancellation after durability for a
+multi-entry native async point batch. Both entries stay invisible before
+publication; after caller cancellation, close waits for the owned batch, and
+both entries survive close/reopen. Focused evidence: `cargo nextest run
+--package kv-engine --features chaos-testing --lib --filter-expr
+'test(v7_native_async_batch_cancellation_after_durability_publishes_all_entries_and_close_drains_it)'`
+passed 1/1 outside the sandbox on Linux with host io_uring access.
+
+The sixtieth Stage 8 slice pauses async MVCC transaction commits after the v7
+WAL ticket is durable and before publication. It covers both serializable and
+nonserializable transactions, proving cancellation retains the commit owner,
+close waits with admission open, and the transaction survives reopen. Focused
+evidence: `cargo nextest run --package kv-engine --features chaos-testing --lib
+--filter-expr
+'test(v7_async_transaction_cancellation_after_durability_keeps_commit_owned_and_close_drains_it)'`
+passed 1/1 outside the sandbox on Linux with host io_uring access.
+
+The sixty-first Stage 8 slice exercises a process crash after async MVCC
+transaction WAL sync but before ticket publication, transaction publication,
+or caller acknowledgment. The child is killed at
+`parallel_wal.after_fdatasync`; recovery must retain both the acknowledged
+baseline and the transaction's synced value. Focused evidence:
+`cargo nextest run --package kv-engine --features chaos-testing --test
+chaos_integration --filter-expr
+'test(failpoint_v7_parallel_async_transaction_crash_after_sync_before_ack_recovers)'`
+passed 1/1 outside the sandbox on Linux with host io_uring access.
+
+The sixty-second Stage 8 slice applies the same post-durability cancellation
+check to async point deletion. The old value remains visible while the durable
+tombstone is unpublished; after cancelling the caller, close waits for the
+owned publisher, and reopen confirms the deletion. Focused evidence:
+`cargo nextest run --package kv-engine --features chaos-testing --lib
+--filter-expr
+'test(v7_native_async_delete_cancellation_after_durability_keeps_tombstone_owned_and_close_drains_it)'`
+passed 1/1 outside the sandbox on Linux with host io_uring access.
+
+The sixty-third Stage 8 slice extends the successful-sync-before-ack crash
+case to a two-entry async batch. The child is killed at
+`parallel_wal.after_fdatasync`, before batch publication or acknowledgment;
+recovery must preserve the acknowledged baseline and both entries from the
+synced batch. Focused evidence: `cargo nextest run --package kv-engine
+--features chaos-testing --test chaos_integration --filter-expr
+'test(failpoint_v7_parallel_async_batch_crash_after_sync_before_ack_recovers_all_entries)'`
+passed 1/1 outside the sandbox on Linux with host io_uring access.
+
+The sixty-fourth Stage 8 slice extends the successful-sync-before-ack crash
+case to async range deletion. The child is killed after the tombstone's WAL
+sync but before publication or acknowledgment; recovery must remove a key in
+the half-open interval while preserving the exclusive endpoint and the prior
+acknowledged baseline. Focused evidence: `cargo nextest run --package kv-engine
+--features chaos-testing --test chaos_integration --filter-expr
+'test(failpoint_v7_parallel_async_range_delete_crash_after_sync_before_ack_recovers_tombstone)'`
+passed 1/1 outside the sandbox on Linux with host io_uring access.
+
+- The sixty-fifth Stage 8 slice extends the successful-sync-before-ack crash
+  case to async TTL writes. The child is killed after a zero-duration TTL
+  overwrite and its expiration metadata are synced but before publication or
+  acknowledgment. Recovery must retain the acknowledged baseline and apply
+  the expiration, rather than expose either a permanent candidate or the
+  overwritten prior value. Focused evidence: `cargo nextest run --package
+  kv-engine --features chaos-testing --test chaos_integration --filter-expr
+  'test(failpoint_v7_parallel_async_ttl_crash_after_sync_before_ack_recovers_expiration)'`
+  passed 1/1 outside the sandbox on Linux with host io_uring access.
+- The sixty-sixth Stage 8 slice applies post-durability cancellation and close
+  draining to a native async TTL overwrite. It verifies the prior value stays
+  visible until publication, close waits for the owned commit, and recovery
+  retains both the TTL kind and expiration metadata. Focused evidence: `cargo
+  nextest run --package kv-engine --features chaos-testing --lib --filter-expr
+  'test(v7_native_async_ttl_cancellation_after_durability_keeps_expiration_owned_and_close_drains_it)'`
+  passed 1/1 outside the sandbox on Linux with host io_uring access.
+- The sixty-seventh Stage 8 slice extends the successful-sync-before-ack crash
+  case to async point deletion. The child is killed after the point tombstone
+  sync but before publication or acknowledgment; recovery must preserve the
+  earlier acknowledged value and apply the deletion. Focused evidence: `cargo
+  nextest run --package kv-engine --features chaos-testing --test
+  chaos_integration --filter-expr
+  'test(failpoint_v7_parallel_async_delete_crash_after_sync_before_ack_recovers_tombstone)'`
+  passed 1/1 outside the sandbox on Linux with host io_uring access.
+- The sixty-eighth Stage 8 slice runs the completed async write/capture matrix
+  together: six post-sync-before-ack process crashes, six post-durability
+  cancellation/close-drain tests, Active reopen through the public sync/async
+  APIs, and async checkpoint cutoff/cancellation cases. The combined focused
+  qualification passed 15/15 outside the sandbox on Linux with host io_uring
+  access.
+  Review hardening publishes the returned-`sync_async()` completion marker
+  through a temporary file and rename, so the parent cannot kill the child
+  between marker creation and completion of its contents.
+  The six post-durability cancellation tests also verify the original engine
+  after close and before reopening, so WAL replay cannot mask missing
+  publication; the TTL case compares the published and recovered expiration.
+  These six tests and the async-sync process crash test passed 7/7 after the
+  review fixes, outside the sandbox with host io_uring access.
 - Complete the correctness matrix below using the persistence model, real
   runtime injection, and process-level integration. Regress ordinary v4,
   strict v5/v6, TTL, recorded-time rollback/clamping, range deletion, OCC,
@@ -1872,7 +2036,7 @@ the captured prefix must survive even if no publication or ACK followed.
 | Creation crashes | Header/F0/file-sync/rename/directory-sync/manifest cuts; installed damage is fatal, uninstalled incomplete creation is an accounted orphan. |
 | Reordered DATA persistence | A and C complete with B torn; only a validated, anchored-eligible prefix replays and every acknowledged batch survives the stated sync guarantees. |
 | FRONTIER interrupted sync | Complete marker with missing DATA falls back for Active above floors; cached complete bytes still require fresh writes before service. |
-| Successful sync before publication/ACK | Crash after WAL sync but before durable-ticket, memtable/MVCC publication, or ACK; recovery must include the captured prefix and choose the newest fully verified candidate. |
+| Successful sync before publication/ACK | Crash after WAL sync but before durable-ticket, memtable/MVCC publication, or ACK; recovery must include the captured prefix and choose the newest fully verified candidate. `failpoint_v7_parallel_async_pitr_crash_after_sync_before_ack_recovers` covers an async point write; `failpoint_v7_parallel_async_transaction_crash_after_sync_before_ack_recovers` verifies MVCC publication is recovered even though the caller never received an acknowledgment; `failpoint_v7_parallel_async_batch_crash_after_sync_before_ack_recovers_all_entries` verifies a two-entry async batch is replayed in full; `failpoint_v7_parallel_async_delete_crash_after_sync_before_ack_recovers_tombstone` verifies point deletion; `failpoint_v7_parallel_async_range_delete_crash_after_sync_before_ack_recovers_tombstone` verifies the half-open range tombstone; and `failpoint_v7_parallel_async_ttl_crash_after_sync_before_ack_recovers_expiration` verifies a zero-duration TTL overwrite and its expiration metadata. Each child is killed after WAL sync but before publication/ACK, and recovery checks the operation-specific result plus acknowledged baseline. |
 | Discovery damage and tail controls | Scan beyond broken DATA, zero/hole/preallocation and partial EOF; stray speculative control may be discarded, interior fork/orphan may not be skipped. |
 | Chain invariants | Duplicate generation, sibling/orphan/skip-predecessor, wrong binding/digest, and physical containment fail even after fixture CRCs are recomputed. |
 | Fixed targets and stopped admission | Continuous work cannot change API cutoff `C` for sync/close/freeze/checkpoint/recovery points; predecessor containment may require marker `T > C`, fixed before construction. `D0 \| D1 \| F_A(D0)` drains; ineligible poisoned targets terminate. |
@@ -1883,7 +2047,7 @@ the captured prefix must survive even if no publication or ACK followed.
 | Recovery followed by continued writes | Normalize twice, append at restored ticket/offset extending the installed recovery marker, sync, crash/reopen, then seal/archive/restore. Empty/nonempty/fallback/trailing-control variants independently agree on digests, index, anchors, data, and accounting. |
 | Immutable and archive objects | Exact Sealing image, terminal marker, whole-image digest and seal index; no fallback/normalization; mixed legacy digest rules and empty v7 seals remain valid. |
 | Runtime startup after recovery | Frozen Sealing/Sealed files acquire no append pipeline or initializer and retain exact bytes/length; only installed authoritative Active state starts v7 runtime, with startup allocation reserved before mutation. |
-| Async, MVCC, and capture | `v7_parallel_pitr_sync_and_async_write_apis_survive_reopen` exercises public point/TTL/delete/batch/range APIs and sync/async MVCC commits through Active v7 reopen; `v7_parallel_pitr_checkpoint_captures_its_fixed_cutoff` verifies checkpoint cutoff isolation and source continuation. Runtime tests separately cover OCC retry, recorded-time rollback clamping, cancellation, and checkpoint admission; remaining required crash/race cases must retain owners and the correct visible prefix. |
+| Async, MVCC, and capture | `v7_parallel_pitr_sync_and_async_write_apis_survive_reopen` exercises public point/TTL/delete/batch/range APIs and sync/async MVCC commits through Active v7 reopen; sync and async checkpoint tests verify cutoff isolation and source continuation; `failpoint_v7_parallel_async_checkpoint_cancellation_keeps_cutoff_and_close_waiting` verifies cancellation keeps the detached capture alive, close waits for it, and the checkpoint retains the pinned prefix; `v7_native_async_cancellation_after_durability_keeps_commit_owned_and_close_drains_it` verifies a durable but unpublished native async v7 commit survives caller cancellation and close; `v7_native_async_batch_cancellation_after_durability_publishes_all_entries_and_close_drains_it` verifies every entry in a durable multi-entry batch remains unpublished until its owned publisher drains; `v7_async_transaction_cancellation_after_durability_keeps_commit_owned_and_close_drains_it` verifies both serializable and nonserializable async MVCC transaction owners survive cancellation after the ticket is durable; `v7_native_async_delete_cancellation_after_durability_keeps_tombstone_owned_and_close_drains_it` verifies a durable point tombstone remains visible only after its owned publisher drains; `v7_native_async_range_cancellation_after_durability_keeps_tombstone_owned_and_close_drains_it` verifies the separate range tombstone publisher has the same durable ownership guarantee and preserves its exclusive endpoint; `v7_native_async_ttl_cancellation_after_durability_keeps_expiration_owned_and_close_drains_it` verifies cancellation retains TTL kind and expiration metadata. The successful-sync-before-ACK process crashes are listed in the preceding matrix row. Runtime tests separately cover OCC retry, recorded-time rollback clamping, cancellation, and checkpoint admission; remaining required crash/race cases must retain owners and the correct visible prefix. |
 | Capacity and pins | Real engine admission/preallocation uses the shared ledger; full spool still permits terminal marker/recovery; workspace grows before allocation; old/temp/pinned files stay charged until durable cleanup. |
 | Segment exhaustion and shared pressure | Exact-boundary DATA-plus-marker exhaustion triggers rotation before ticket assignment for a batch that fits a fresh segment; retry preserves caps and ordering. Shared-ledger pressure, including aggregate spool and seal-index quota, does not trigger rotation, and oversized batches cannot loop through empty successors. |
 | Legacy upgrade | Insufficient maximum-image capacity defers with writable v6 rotations; transition reservations precede intent and survive concurrent capacity consumption/replay; eligible transition installs one v7 active; new enable fails before intent; installed v7 cannot downgrade. |

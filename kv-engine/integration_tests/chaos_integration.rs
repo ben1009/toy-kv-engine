@@ -2926,6 +2926,7 @@ fn v7_parallel_pitr_sync_and_async_write_apis_survive_reopen() {
         .expect("buffer sync transaction write");
     transaction.commit().expect("commit sync transaction");
     drop(transaction);
+    engine.sync().expect("sync the fixed synchronous v7 prefix");
 
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -2987,7 +2988,9 @@ fn v7_parallel_pitr_sync_and_async_write_apis_survive_reopen() {
             "zero-duration TTL must be expired before reopen: {key:?}"
         );
     }
-    engine.sync().expect("sync the fixed v7 commit prefix");
+    runtime
+        .block_on(engine.sync_async())
+        .expect("async sync the fixed v7 commit prefix");
     engine.close().expect("close v7 API regression engine");
 
     let reopened = open_and_resume_parallel_pitr(&db_path, &repository);
@@ -3126,6 +3129,707 @@ fn v7_parallel_pitr_checkpoint_captures_its_fixed_cutoff() {
     reopened
         .close()
         .expect("close reopened v7 checkpoint source");
+}
+
+#[cfg(target_os = "linux")]
+fn lock_v7_async_checkpoint_failpoint() -> parking_lot::MutexGuard<'static, ()> {
+    static LOCK: std::sync::OnceLock<parking_lot::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| parking_lot::Mutex::new(())).lock()
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn failpoint_v7_parallel_pitr_async_checkpoint_captures_its_fixed_cutoff() {
+    let _failpoint_guard = lock_v7_async_checkpoint_failpoint();
+    let scenario = FailScenario::setup();
+    let (capture_entered_tx, capture_entered_rx) = std::sync::mpsc::channel();
+    let (release_capture_tx, release_capture_rx) = std::sync::mpsc::channel();
+    let release_capture_rx = std::sync::Mutex::new(release_capture_rx);
+    fail::cfg_callback("checkpoint.after_capture_boundary_before_copy", move || {
+        capture_entered_tx
+            .send(())
+            .expect("signal that async checkpoint pinned its cutoff");
+        release_capture_rx
+            .lock()
+            .expect("lock checkpoint capture release channel")
+            .recv_timeout(Duration::from_secs(30))
+            .expect("release paused async checkpoint capture");
+    })
+    .expect("pause async checkpoint after its fixed cutoff");
+
+    let dir = tempfile::tempdir().expect("create v7 async checkpoint regression directory");
+    let db_path = dir.path().join("db");
+    let repository = dir.path().join("repository");
+    let checkpoint_path = dir.path().join("checkpoint");
+    let engine = prepare_empty_v7_parallel_pitr(&db_path, &repository);
+
+    engine
+        .put(b"before-async-checkpoint-cutoff", b"captured")
+        .expect("write before async checkpoint cutoff");
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("create async checkpoint runtime");
+    let checkpoint_engine = engine.clone();
+    let checkpoint_path_for_task = checkpoint_path.clone();
+    let checkpoint_task = runtime.spawn(async move {
+        checkpoint_engine
+            .create_checkpoint_async(&checkpoint_path_for_task)
+            .await
+    });
+    let capture_paused = capture_entered_rx
+        .recv_timeout(Duration::from_secs(10))
+        .is_ok();
+    let post_cutoff_write = if capture_paused {
+        runtime.block_on(engine.put_async(b"after-async-checkpoint-cutoff", b"later"))
+    } else {
+        Err(anyhow::anyhow!(
+            "async checkpoint did not pause after pinning its cutoff"
+        ))
+    };
+    let _ = release_capture_tx.send(());
+    let checkpoint_result = runtime
+        .block_on(checkpoint_task)
+        .expect("join async checkpoint capture");
+    fail::remove("checkpoint.after_capture_boundary_before_copy");
+    scenario.teardown();
+    assert!(
+        capture_paused,
+        "async checkpoint did not reach its post-cutoff pause"
+    );
+    post_cutoff_write.expect("write after the checkpoint cutoff while file copy is paused");
+    checkpoint_result.expect("capture async checkpoint at v7 commit cutoff");
+
+    let checkpoint = KvEngine::open(&checkpoint_path, LsmStorageOptions::default_for_test())
+        .expect("open standalone async checkpoint");
+    for (key, expected) in [
+        (b"legacy-segment-value".as_slice(), b"restored".as_slice()),
+        (
+            b"before-async-checkpoint-cutoff".as_slice(),
+            b"captured".as_slice(),
+        ),
+    ] {
+        assert_eq!(
+            checkpoint
+                .get(key)
+                .expect("read async checkpoint value")
+                .as_deref(),
+            Some(expected),
+            "async checkpoint must retain {key:?}"
+        );
+    }
+    assert_eq!(
+        checkpoint
+            .get(b"after-async-checkpoint-cutoff")
+            .expect("read key written after async checkpoint cutoff"),
+        None,
+        "async checkpoint must exclude writes admitted after its cutoff"
+    );
+    checkpoint
+        .close()
+        .expect("close standalone async checkpoint");
+    engine.close().expect("close v7 async checkpoint source");
+
+    let reopened = open_and_resume_parallel_pitr(&db_path, &repository);
+    for (key, expected) in [
+        (
+            b"before-async-checkpoint-cutoff".as_slice(),
+            b"captured".as_slice(),
+        ),
+        (
+            b"after-async-checkpoint-cutoff".as_slice(),
+            b"later".as_slice(),
+        ),
+    ] {
+        assert_eq!(
+            reopened
+                .get(key)
+                .expect("read source value after async checkpoint and reopen")
+                .as_deref(),
+            Some(expected),
+            "source reopen must retain {key:?}"
+        );
+    }
+    reopened
+        .close()
+        .expect("close reopened v7 async checkpoint source");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn failpoint_v7_parallel_async_checkpoint_cancellation_keeps_cutoff_and_close_waiting() {
+    let _failpoint_guard = lock_v7_async_checkpoint_failpoint();
+    let scenario = FailScenario::setup();
+    let (capture_entered_tx, capture_entered_rx) = std::sync::mpsc::channel();
+    let (release_capture_tx, release_capture_rx) = std::sync::mpsc::channel();
+    let release_capture_rx = std::sync::Mutex::new(release_capture_rx);
+    fail::cfg_callback("checkpoint.after_capture_boundary_before_copy", move || {
+        capture_entered_tx
+            .send(())
+            .expect("signal that async checkpoint pinned its cutoff");
+        release_capture_rx
+            .lock()
+            .expect("lock checkpoint capture release channel")
+            .recv_timeout(Duration::from_secs(30))
+            .expect("release paused async checkpoint capture");
+    })
+    .expect("pause async checkpoint after its fixed cutoff");
+
+    let dir = tempfile::tempdir().expect("create v7 async checkpoint cancellation directory");
+    let db_path = dir.path().join("db");
+    let repository = dir.path().join("repository");
+    let checkpoint_path = dir.path().join("checkpoint");
+    let engine = prepare_empty_v7_parallel_pitr(&db_path, &repository);
+    engine
+        .put(b"before-cancelled-async-checkpoint", b"captured")
+        .expect("write before async checkpoint cutoff");
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("create async checkpoint cancellation runtime");
+    let checkpoint_engine = engine.clone();
+    let checkpoint_path_for_task = checkpoint_path.clone();
+    let checkpoint_task = runtime.spawn(async move {
+        checkpoint_engine
+            .create_checkpoint_async(&checkpoint_path_for_task)
+            .await
+    });
+    let capture_paused = capture_entered_rx
+        .recv_timeout(Duration::from_secs(10))
+        .is_ok();
+    checkpoint_task.abort();
+    let checkpoint_cancelled = runtime
+        .block_on(checkpoint_task)
+        .is_err_and(|error| error.is_cancelled());
+    let post_cutoff_write = if capture_paused {
+        runtime.block_on(engine.put_async(b"after-cancelled-checkpoint-cutoff", b"later"))
+    } else {
+        Err(anyhow::anyhow!(
+            "async checkpoint did not pause after pinning its cutoff"
+        ))
+    };
+
+    let close_engine = engine.clone();
+    let mut close_task = runtime.spawn(async move { close_engine.close_async().await });
+    let close_waited_for_checkpoint = runtime.block_on(async {
+        tokio::time::timeout(Duration::from_millis(100), &mut close_task)
+            .await
+            .is_err()
+    });
+    let _ = release_capture_tx.send(());
+    let close_result = runtime
+        .block_on(close_task)
+        .expect("join async close after checkpoint cancellation");
+    fail::remove("checkpoint.after_capture_boundary_before_copy");
+    scenario.teardown();
+
+    assert!(
+        capture_paused,
+        "async checkpoint did not reach its post-cutoff pause"
+    );
+    assert!(checkpoint_cancelled, "checkpoint caller was not cancelled");
+    assert!(
+        close_waited_for_checkpoint,
+        "close_async must wait for the detached v7 checkpoint worker"
+    );
+    post_cutoff_write.expect("write after checkpoint cutoff while copied files remain pinned");
+    close_result.expect("close v7 source after detached checkpoint completes");
+
+    let checkpoint = KvEngine::open(&checkpoint_path, LsmStorageOptions::default_for_test())
+        .expect("open checkpoint completed after caller cancellation");
+    assert_eq!(
+        checkpoint
+            .get(b"before-cancelled-async-checkpoint")
+            .expect("read value captured before async checkpoint cutoff")
+            .as_deref(),
+        Some(b"captured".as_slice())
+    );
+    assert_eq!(
+        checkpoint
+            .get(b"after-cancelled-checkpoint-cutoff")
+            .expect("read value written after async checkpoint cutoff"),
+        None,
+        "cancelled checkpoint must preserve its already-pinned cutoff"
+    );
+    checkpoint
+        .close()
+        .expect("close checkpoint completed after caller cancellation");
+
+    let reopened = open_and_resume_parallel_pitr(&db_path, &repository);
+    assert_eq!(
+        reopened
+            .get(b"after-cancelled-checkpoint-cutoff")
+            .expect("read source write after cancelled checkpoint and close")
+            .as_deref(),
+        Some(b"later".as_slice())
+    );
+    reopened
+        .close()
+        .expect("close reopened v7 source after checkpoint cancellation");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn failpoint_v7_parallel_pitr_async_sync_survives_crash_after_return() {
+    let probe_dir = tempfile::tempdir().expect("create v7 async sync crash probe directory");
+    let probe_options = LsmStorageOptions {
+        enable_wal: true,
+        ..LsmStorageOptions::default_for_test()
+    };
+    match KvEngine::open_with_wal_io_mode(&probe_dir, probe_options, WalIoMode::Parallel) {
+        Ok(engine) => engine.close().expect("close v7 async sync crash probe"),
+        Err(error) => panic!("v7 Parallel async sync qualification requires io_uring: {error:#}"),
+    }
+
+    let dir = tempfile::tempdir().expect("create v7 async sync crash directory");
+    let db_path = dir.path().join("db");
+    let repository = dir.path().join("repository");
+    let engine = prepare_empty_v7_parallel_pitr(&db_path, &repository);
+    engine
+        .put(b"async-sync-crash-baseline", b"stable")
+        .expect("persist acknowledged async sync baseline");
+    engine
+        .close()
+        .expect("close v7 async sync crash setup engine");
+    let boundary_before_async_sync = latest_persisted_active_boundary(&db_path);
+
+    kill_pitr_child_at_crash_point_with_operation(
+        &db_path,
+        &repository,
+        &dir.path().join("async-sync-control.log"),
+        &dir.path().join("async-sync-returned.marker"),
+        "async_sync.returned",
+        PitrChildCrashOperation::AsyncSync {
+            acknowledged_write: Some(("async-sync-boundary-value", "durable")),
+        },
+    );
+    let boundary_after_async_sync = latest_persisted_active_boundary(&db_path);
+    assert!(
+        boundary_after_async_sync.0 > boundary_before_async_sync.0,
+        "returned sync_async must advance the persisted ticket boundary: before={boundary_before_async_sync:?}, after={boundary_after_async_sync:?}"
+    );
+    assert!(
+        boundary_after_async_sync.1 > boundary_before_async_sync.1,
+        "returned sync_async must advance the persisted physical boundary: before={boundary_before_async_sync:?}, after={boundary_after_async_sync:?}"
+    );
+    assert!(
+        boundary_after_async_sync.2 > boundary_before_async_sync.2,
+        "returned sync_async must advance the persisted commit timestamp: before={boundary_before_async_sync:?}, after={boundary_after_async_sync:?}"
+    );
+
+    let recovered = open_and_resume_parallel_pitr(&db_path, &repository);
+    assert_eq!(
+        recovered
+            .get(b"async-sync-crash-baseline")
+            .expect("read acknowledged async sync baseline after crash")
+            .as_deref(),
+        Some(b"stable".as_slice())
+    );
+    assert_eq!(
+        recovered
+            .get(b"async-sync-boundary-value")
+            .expect("read write covered by returned async sync after crash")
+            .as_deref(),
+        Some(b"durable".as_slice()),
+        "sync_async must persist its Active boundary before returning"
+    );
+    recovered
+        .close()
+        .expect("close recovered v7 async sync engine");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn failpoint_v7_parallel_async_pitr_crash_after_sync_before_ack_recovers() {
+    let probe_dir = tempfile::tempdir().expect("create v7 async crash probe directory");
+    let probe_options = LsmStorageOptions {
+        enable_wal: true,
+        ..LsmStorageOptions::default_for_test()
+    };
+    match KvEngine::open_with_wal_io_mode(probe_dir.path(), probe_options, WalIoMode::Parallel) {
+        Ok(engine) => engine.close().expect("close v7 Parallel async crash probe"),
+        Err(error) => panic!("v7 Parallel async crash qualification requires io_uring: {error:#}"),
+    }
+
+    let dir = tempfile::tempdir().expect("create v7 async crash directory");
+    let db_path = dir.path().join("db");
+    let repository = dir.path().join("repository");
+    let engine = prepare_empty_v7_parallel_pitr(&db_path, &repository);
+    engine
+        .put(b"async-crash-baseline", b"stable")
+        .expect("persist acknowledged async-crash baseline");
+    engine.close().expect("close v7 async crash setup engine");
+
+    let control_log_path = dir.path().join("async-crash-control.log");
+    let marker_path = dir.path().join("async-crash.marker");
+    kill_v7_async_pitr_child_at_crash_point(
+        &db_path,
+        &repository,
+        &control_log_path,
+        &marker_path,
+        "parallel_wal.after_fdatasync",
+        Some(("async-synced-before-ack", "candidate")),
+    );
+
+    let recovered = open_and_resume_parallel_pitr(&db_path, &repository);
+    assert_eq!(
+        recovered
+            .get(b"async-crash-baseline")
+            .expect("read acknowledged baseline after async crash")
+            .as_deref(),
+        Some(b"stable".as_slice())
+    );
+    assert_eq!(
+        recovered
+            .get(b"async-synced-before-ack")
+            .expect("read async value synced before caller acknowledgement")
+            .as_deref(),
+        Some(b"candidate".as_slice()),
+        "a successful v7 WAL sync must survive a process crash before async publication or return"
+    );
+    recovered
+        .close()
+        .expect("close recovered v7 async crash engine");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn failpoint_v7_parallel_async_transaction_crash_after_sync_before_ack_recovers() {
+    let probe_dir = tempfile::tempdir().expect("create v7 async transaction probe directory");
+    let probe_options = LsmStorageOptions {
+        enable_wal: true,
+        ..LsmStorageOptions::default_for_test()
+    };
+    match KvEngine::open_with_wal_io_mode(probe_dir.path(), probe_options, WalIoMode::Parallel) {
+        Ok(engine) => engine
+            .close()
+            .expect("close v7 Parallel async transaction crash probe"),
+        Err(error) => {
+            panic!("v7 Parallel async transaction crash qualification requires io_uring: {error:#}")
+        }
+    }
+
+    let dir = tempfile::tempdir().expect("create v7 async transaction crash directory");
+    let db_path = dir.path().join("db");
+    let repository = dir.path().join("repository");
+    let engine = prepare_empty_v7_parallel_pitr(&db_path, &repository);
+    engine
+        .put(b"async-transaction-crash-baseline", b"stable")
+        .expect("persist acknowledged async-transaction crash baseline");
+    engine
+        .close()
+        .expect("close v7 async transaction crash setup engine");
+
+    kill_pitr_child_at_crash_point_with_operation(
+        &db_path,
+        &repository,
+        &dir.path().join("async-transaction-crash-control.log"),
+        &dir.path().join("async-transaction-crash.marker"),
+        "parallel_wal.after_fdatasync",
+        PitrChildCrashOperation::AsyncTransaction {
+            acknowledged_write: None,
+            write: Some(("async-transaction-synced-before-ack", "candidate")),
+        },
+    );
+
+    let recovered = open_and_resume_parallel_pitr(&db_path, &repository);
+    assert_eq!(
+        recovered
+            .get(b"async-transaction-crash-baseline")
+            .expect("read acknowledged async-transaction baseline after crash")
+            .as_deref(),
+        Some(b"stable".as_slice())
+    );
+    assert_eq!(
+        recovered
+            .get(b"async-transaction-synced-before-ack")
+            .expect("read transaction value synced before caller acknowledgement")
+            .as_deref(),
+        Some(b"candidate".as_slice()),
+        "a successful transaction WAL sync must survive a crash before MVCC publication or acknowledgement"
+    );
+    recovered
+        .close()
+        .expect("close recovered v7 async transaction crash engine");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn failpoint_v7_parallel_async_batch_crash_after_sync_before_ack_recovers_all_entries() {
+    let probe_dir = tempfile::tempdir().expect("create v7 async batch probe directory");
+    let probe_options = LsmStorageOptions {
+        enable_wal: true,
+        ..LsmStorageOptions::default_for_test()
+    };
+    match KvEngine::open_with_wal_io_mode(probe_dir.path(), probe_options, WalIoMode::Parallel) {
+        Ok(engine) => engine
+            .close()
+            .expect("close v7 Parallel async batch crash probe"),
+        Err(error) => {
+            panic!("v7 Parallel async batch crash qualification requires io_uring: {error:#}")
+        }
+    }
+
+    let dir = tempfile::tempdir().expect("create v7 async batch crash directory");
+    let db_path = dir.path().join("db");
+    let repository = dir.path().join("repository");
+    let engine = prepare_empty_v7_parallel_pitr(&db_path, &repository);
+    engine
+        .put(b"async-batch-crash-baseline", b"stable")
+        .expect("persist acknowledged async-batch crash baseline");
+    engine
+        .close()
+        .expect("close v7 async batch crash setup engine");
+
+    kill_pitr_child_at_crash_point_with_operation(
+        &db_path,
+        &repository,
+        &dir.path().join("async-batch-crash-control.log"),
+        &dir.path().join("async-batch-crash.marker"),
+        "parallel_wal.after_fdatasync",
+        PitrChildCrashOperation::AsyncBatch {
+            acknowledged_write: None,
+            writes: [
+                ("async-batch-first-synced-before-ack", "first"),
+                ("async-batch-second-synced-before-ack", "second"),
+            ],
+        },
+    );
+
+    let recovered = open_and_resume_parallel_pitr(&db_path, &repository);
+    assert_eq!(
+        recovered
+            .get(b"async-batch-crash-baseline")
+            .expect("read acknowledged async-batch baseline after crash")
+            .as_deref(),
+        Some(b"stable".as_slice())
+    );
+    for (key, expected) in [
+        (
+            b"async-batch-first-synced-before-ack".as_slice(),
+            b"first".as_slice(),
+        ),
+        (
+            b"async-batch-second-synced-before-ack".as_slice(),
+            b"second".as_slice(),
+        ),
+    ] {
+        assert_eq!(
+            recovered
+                .get(key)
+                .expect("read async batch entry synced before caller acknowledgment")
+                .as_deref(),
+            Some(expected),
+            "all entries in a successfully synced async batch must recover after a pre-ack crash"
+        );
+    }
+    recovered
+        .close()
+        .expect("close recovered v7 async batch crash engine");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn failpoint_v7_parallel_async_delete_crash_after_sync_before_ack_recovers_tombstone() {
+    let probe_dir = tempfile::tempdir().expect("create v7 async delete probe directory");
+    let probe_options = LsmStorageOptions {
+        enable_wal: true,
+        ..LsmStorageOptions::default_for_test()
+    };
+    match KvEngine::open_with_wal_io_mode(probe_dir.path(), probe_options, WalIoMode::Parallel) {
+        Ok(engine) => engine
+            .close()
+            .expect("close v7 Parallel async delete crash probe"),
+        Err(error) => {
+            panic!("v7 Parallel async delete crash qualification requires io_uring: {error:#}")
+        }
+    }
+
+    let dir = tempfile::tempdir().expect("create v7 async delete crash directory");
+    let db_path = dir.path().join("db");
+    let repository = dir.path().join("repository");
+    let engine = prepare_empty_v7_parallel_pitr(&db_path, &repository);
+    engine
+        .put(b"async-delete-crash-baseline", b"stable")
+        .expect("persist acknowledged async delete baseline");
+    engine
+        .put(b"async-delete-crash-target", b"prior")
+        .expect("persist async delete target before crash");
+    engine
+        .close()
+        .expect("close v7 async delete crash setup engine");
+
+    kill_pitr_child_at_crash_point_with_operation(
+        &db_path,
+        &repository,
+        &dir.path().join("async-delete-crash-control.log"),
+        &dir.path().join("async-delete-crash.marker"),
+        "parallel_wal.after_fdatasync",
+        PitrChildCrashOperation::AsyncDelete {
+            acknowledged_write: None,
+            key: "async-delete-crash-target",
+        },
+    );
+
+    let recovered = open_and_resume_parallel_pitr(&db_path, &repository);
+    assert_eq!(
+        recovered
+            .get(b"async-delete-crash-baseline")
+            .expect("read acknowledged async delete baseline after crash")
+            .as_deref(),
+        Some(b"stable".as_slice())
+    );
+    assert_eq!(
+        recovered
+            .get(b"async-delete-crash-target")
+            .expect("read async delete target after crash"),
+        None,
+        "a synced async point tombstone must replay before caller acknowledgment"
+    );
+    recovered
+        .close()
+        .expect("close recovered v7 async delete crash engine");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn failpoint_v7_parallel_async_range_delete_crash_after_sync_before_ack_recovers_tombstone() {
+    let probe_dir = tempfile::tempdir().expect("create v7 async range-delete probe directory");
+    let probe_options = LsmStorageOptions {
+        enable_wal: true,
+        ..LsmStorageOptions::default_for_test()
+    };
+    match KvEngine::open_with_wal_io_mode(probe_dir.path(), probe_options, WalIoMode::Parallel) {
+        Ok(engine) => engine
+            .close()
+            .expect("close v7 Parallel async range-delete crash probe"),
+        Err(error) => {
+            panic!(
+                "v7 Parallel async range-delete crash qualification requires io_uring: {error:#}"
+            )
+        }
+    }
+
+    let dir = tempfile::tempdir().expect("create v7 async range-delete crash directory");
+    let db_path = dir.path().join("db");
+    let repository = dir.path().join("repository");
+    let engine = prepare_empty_v7_parallel_pitr(&db_path, &repository);
+    engine
+        .put(b"0-async-range-crash-baseline", b"stable")
+        .expect("persist acknowledged async range-delete baseline");
+    engine
+        .put(b"async-range-crash-middle", b"inside")
+        .expect("persist async range-delete interior value");
+    engine
+        .put(b"async-range-crash-z", b"endpoint")
+        .expect("persist async range-delete exclusive endpoint");
+    engine
+        .close()
+        .expect("close v7 async range-delete crash setup engine");
+
+    kill_pitr_child_at_crash_point_with_operation(
+        &db_path,
+        &repository,
+        &dir.path().join("async-range-crash-control.log"),
+        &dir.path().join("async-range-crash.marker"),
+        "parallel_wal.after_fdatasync",
+        PitrChildCrashOperation::AsyncRangeDelete {
+            acknowledged_write: None,
+            range: ("async-range-crash-a", "async-range-crash-z"),
+        },
+    );
+
+    let recovered = open_and_resume_parallel_pitr(&db_path, &repository);
+    assert_eq!(
+        recovered
+            .get(b"0-async-range-crash-baseline")
+            .expect("read acknowledged async range-delete baseline after crash")
+            .as_deref(),
+        Some(b"stable".as_slice())
+    );
+    assert_eq!(
+        recovered
+            .get(b"async-range-crash-middle")
+            .expect("read async range-delete interior key after crash"),
+        None,
+        "a synced async range tombstone must replay before caller acknowledgment"
+    );
+    assert_eq!(
+        recovered
+            .get(b"async-range-crash-z")
+            .expect("read async range-delete exclusive endpoint after crash")
+            .as_deref(),
+        Some(b"endpoint".as_slice()),
+        "replaying the half-open range tombstone must preserve its exclusive endpoint"
+    );
+    recovered
+        .close()
+        .expect("close recovered v7 async range-delete crash engine");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn failpoint_v7_parallel_async_ttl_crash_after_sync_before_ack_recovers_expiration() {
+    let probe_dir = tempfile::tempdir().expect("create v7 async TTL probe directory");
+    let probe_options = LsmStorageOptions {
+        enable_wal: true,
+        ..LsmStorageOptions::default_for_test()
+    };
+    match KvEngine::open_with_wal_io_mode(probe_dir.path(), probe_options, WalIoMode::Parallel) {
+        Ok(engine) => engine
+            .close()
+            .expect("close v7 Parallel async TTL crash probe"),
+        Err(error) => {
+            panic!("v7 Parallel async TTL crash qualification requires io_uring: {error:#}")
+        }
+    }
+
+    let dir = tempfile::tempdir().expect("create v7 async TTL crash directory");
+    let db_path = dir.path().join("db");
+    let repository = dir.path().join("repository");
+    let engine = prepare_empty_v7_parallel_pitr(&db_path, &repository);
+    engine
+        .put(b"async-ttl-crash-baseline", b"stable")
+        .expect("persist acknowledged async TTL baseline");
+    engine
+        .put(b"async-ttl-synced-before-ack", b"prior")
+        .expect("persist prior value before async TTL overwrite");
+    engine
+        .close()
+        .expect("close v7 async TTL crash setup engine");
+
+    kill_pitr_child_at_crash_point_with_operation(
+        &db_path,
+        &repository,
+        &dir.path().join("async-ttl-crash-control.log"),
+        &dir.path().join("async-ttl-crash.marker"),
+        "parallel_wal.after_fdatasync",
+        PitrChildCrashOperation::AsyncTtlWrite {
+            acknowledged_write: None,
+            write: Some(("async-ttl-synced-before-ack", "candidate")),
+            ttl_secs: 0,
+        },
+    );
+
+    let recovered = open_and_resume_parallel_pitr(&db_path, &repository);
+    assert_eq!(
+        recovered
+            .get(b"async-ttl-crash-baseline")
+            .expect("read acknowledged async TTL baseline after crash")
+            .as_deref(),
+        Some(b"stable".as_slice())
+    );
+    assert_eq!(
+        recovered
+            .get(b"async-ttl-synced-before-ack")
+            .expect("read async TTL overwrite synced before caller acknowledgment"),
+        None,
+        "recovery must apply the synced zero-duration expiration rather than restore a permanent value or reveal the overwritten value"
+    );
+    recovered
+        .close()
+        .expect("close recovered v7 async TTL crash engine");
 }
 
 #[cfg(target_os = "linux")]
@@ -3298,6 +4002,34 @@ enum PitrChildCrashOperation<'a> {
         acknowledged_write: Option<(&'a str, &'a str)>,
         write: Option<(&'a str, &'a str)>,
     },
+    AsyncWrite {
+        acknowledged_write: Option<(&'a str, &'a str)>,
+        write: Option<(&'a str, &'a str)>,
+    },
+    AsyncTransaction {
+        acknowledged_write: Option<(&'a str, &'a str)>,
+        write: Option<(&'a str, &'a str)>,
+    },
+    AsyncBatch {
+        acknowledged_write: Option<(&'a str, &'a str)>,
+        writes: [(&'a str, &'a str); 2],
+    },
+    AsyncDelete {
+        acknowledged_write: Option<(&'a str, &'a str)>,
+        key: &'a str,
+    },
+    AsyncRangeDelete {
+        acknowledged_write: Option<(&'a str, &'a str)>,
+        range: (&'a str, &'a str),
+    },
+    AsyncTtlWrite {
+        acknowledged_write: Option<(&'a str, &'a str)>,
+        write: Option<(&'a str, &'a str)>,
+        ttl_secs: u64,
+    },
+    AsyncSync {
+        acknowledged_write: Option<(&'a str, &'a str)>,
+    },
 }
 
 #[cfg(target_os = "linux")]
@@ -3318,6 +4050,28 @@ fn kill_pitr_child_at_crash_point(
         crash_point,
         PitrChildCrashOperation::Write {
             acknowledged_write,
+            write,
+        },
+    );
+}
+
+#[cfg(target_os = "linux")]
+fn kill_v7_async_pitr_child_at_crash_point(
+    db_path: &std::path::Path,
+    repository: &std::path::Path,
+    control_log_path: &std::path::Path,
+    marker_path: &std::path::Path,
+    crash_point: &str,
+    write: Option<(&str, &str)>,
+) {
+    kill_pitr_child_at_crash_point_with_operation(
+        db_path,
+        repository,
+        control_log_path,
+        marker_path,
+        crash_point,
+        PitrChildCrashOperation::AsyncWrite {
+            acknowledged_write: None,
             write,
         },
     );
@@ -3376,8 +4130,57 @@ fn kill_pitr_child_at_crash_point_with_mode(
             acknowledged_write: Some(_),
             ..
         } => "2",
+        PitrChildCrashOperation::AsyncWrite {
+            acknowledged_write: Some(_),
+            ..
+        } => "2",
+        PitrChildCrashOperation::AsyncTransaction {
+            acknowledged_write: Some(_),
+            ..
+        } => "2",
+        PitrChildCrashOperation::AsyncBatch {
+            acknowledged_write: Some(_),
+            ..
+        } => "2",
+        PitrChildCrashOperation::AsyncDelete {
+            acknowledged_write: Some(_),
+            ..
+        } => "2",
+        PitrChildCrashOperation::AsyncRangeDelete {
+            acknowledged_write: Some(_),
+            ..
+        } => "2",
+        PitrChildCrashOperation::AsyncTtlWrite {
+            acknowledged_write: Some(_),
+            ..
+        } => "2",
+        PitrChildCrashOperation::AsyncSync { .. } => "1",
         PitrChildCrashOperation::CreateEmptySuccessor
         | PitrChildCrashOperation::Write {
+            acknowledged_write: None,
+            ..
+        }
+        | PitrChildCrashOperation::AsyncWrite {
+            acknowledged_write: None,
+            ..
+        }
+        | PitrChildCrashOperation::AsyncTransaction {
+            acknowledged_write: None,
+            ..
+        }
+        | PitrChildCrashOperation::AsyncDelete {
+            acknowledged_write: None,
+            ..
+        } => "1",
+        PitrChildCrashOperation::AsyncBatch {
+            acknowledged_write: None,
+            ..
+        } => "1",
+        PitrChildCrashOperation::AsyncRangeDelete {
+            acknowledged_write: None,
+            ..
+        } => "1",
+        PitrChildCrashOperation::AsyncTtlWrite {
             acknowledged_write: None,
             ..
         } => "1",
@@ -3416,6 +4219,64 @@ fn kill_pitr_child_at_crash_point_with_mode(
             acknowledged_write,
             write,
         } => (acknowledged_write, write),
+        PitrChildCrashOperation::AsyncWrite {
+            acknowledged_write,
+            write,
+        } => {
+            child.arg("--async-write");
+            (acknowledged_write, write)
+        }
+        PitrChildCrashOperation::AsyncTransaction {
+            acknowledged_write,
+            write,
+        } => {
+            child.arg("--async-transaction");
+            (acknowledged_write, write)
+        }
+        PitrChildCrashOperation::AsyncBatch {
+            acknowledged_write,
+            writes: [first, second],
+        } => {
+            child
+                .arg("--async-batch")
+                .arg("--second-write-key")
+                .arg(second.0)
+                .arg("--second-write-value")
+                .arg(second.1);
+            (acknowledged_write, Some(first))
+        }
+        PitrChildCrashOperation::AsyncDelete {
+            acknowledged_write,
+            key,
+        } => {
+            child.arg("--async-delete").arg("--delete-key").arg(key);
+            (acknowledged_write, None)
+        }
+        PitrChildCrashOperation::AsyncRangeDelete {
+            acknowledged_write,
+            range,
+        } => {
+            child.arg("--async-range-delete");
+            (acknowledged_write, Some(range))
+        }
+        PitrChildCrashOperation::AsyncTtlWrite {
+            acknowledged_write,
+            write,
+            ttl_secs,
+        } => {
+            child
+                .arg("--async-ttl-write")
+                .arg("--ttl-secs")
+                .arg(ttl_secs.to_string());
+            (acknowledged_write, write)
+        }
+        PitrChildCrashOperation::AsyncSync { acknowledged_write } => {
+            child
+                .arg("--async-sync")
+                .arg("--async-sync-completion-marker")
+                .arg(marker_path);
+            (acknowledged_write, None)
+        }
     };
     if let Some((key, value)) = acknowledged_write {
         child
@@ -3498,6 +4359,37 @@ fn find_v7_pitr_wal(db_path: &std::path::Path) -> PathBuf {
     let path = paths.next().expect("find Active v7 PITR WAL");
     assert!(paths.next().is_none(), "expected one Active v7 PITR WAL");
     path
+}
+
+#[cfg(target_os = "linux")]
+fn latest_persisted_active_boundary(manifest_path: &std::path::Path) -> (u64, u64, u64) {
+    let manifest_bytes = std::fs::read(manifest_path.join("MANIFEST"))
+        .expect("read manifest for persisted Active boundary assertion");
+    let records = serde_json::Deserializer::from_slice(&manifest_bytes)
+        .into_iter::<serde_json::Value>()
+        .collect::<Result<Vec<_>, _>>()
+        .expect("decode manifest record stream for Active boundary assertion");
+    let boundary = records
+        .iter()
+        .filter_map(|record| {
+            record
+                .get("Pitr")?
+                .get("ActiveBoundaryAdvanced")?
+                .get("boundary")
+        })
+        .next_back()
+        .expect("find persisted ActiveBoundaryAdvanced record");
+    (
+        boundary["ticket_end"]
+            .as_u64()
+            .expect("read persisted Active ticket boundary"),
+        boundary["durable_end"]
+            .as_u64()
+            .expect("read persisted Active physical boundary"),
+        boundary["last_commit_ts"]
+            .as_u64()
+            .expect("read persisted Active commit timestamp"),
+    )
 }
 
 #[cfg(target_os = "linux")]

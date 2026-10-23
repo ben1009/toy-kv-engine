@@ -5,7 +5,7 @@ mod wrapper;
 use wrapper::kv_engine_wrapper::chaos::control_log::ControlLogWriter;
 use wrapper::kv_engine_wrapper::chaos::scenarios::{self, ScenarioConfig};
 use wrapper::kv_engine_wrapper::chaos::stress::{self, StressScenario};
-use wrapper::kv_engine_wrapper::lsm_storage::{KvEngine, LsmStorageOptions};
+use wrapper::kv_engine_wrapper::lsm_storage::{KvEngine, LsmStorageOptions, WriteBatchRecord};
 use wrapper::kv_engine_wrapper::pitr_api::{
     PitrStatusOptions, PitrWalIoMode, RecoveryPointOutcome,
 };
@@ -319,6 +319,27 @@ fn run_v7_pitr_crash(
         return Ok(());
     }
 
+    if args.iter().any(|arg| arg == "--async-sync") {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| format!("build async sync crash runtime failed: {error}"))?;
+        runtime
+            .block_on(engine.sync_async())
+            .map_err(|error| format!("async sync before process crash failed: {error:#}"))?;
+        let marker_path = get_arg(args, "--async-sync-completion-marker")
+            .ok_or("missing --async-sync-completion-marker")?;
+        // The parent may kill this process as soon as the marker appears.
+        let temporary_marker_path = std::path::Path::new(&marker_path).with_extension("tmp");
+        std::fs::write(&temporary_marker_path, crash_point.as_bytes())
+            .map_err(|error| format!("write async sync completion marker failed: {error}"))?;
+        std::fs::rename(&temporary_marker_path, &marker_path)
+            .map_err(|error| format!("publish async sync completion marker failed: {error}"))?;
+        loop {
+            std::thread::park();
+        }
+    }
+
     let write_key = get_arg(args, "--write-key");
     let write_value = get_arg(args, "--write-value");
     let (write_key, write_value) = match (write_key, write_value) {
@@ -330,9 +351,82 @@ fn run_v7_pitr_crash(
         _ => return Err("--write-key and --write-value must be supplied together".to_string()),
     };
 
-    engine
-        .put(write_key.as_bytes(), write_value.as_bytes())
-        .map_err(|error| format!("post-sync candidate write failed: {error:#}"))
+    if args.iter().any(|arg| arg == "--async-write") {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| format!("build async crash runtime failed: {error}"))?;
+        runtime
+            .block_on(engine.put_async(write_key.as_bytes(), write_value.as_bytes()))
+            .map_err(|error| format!("post-sync async candidate write failed: {error:#}"))
+    } else if args.iter().any(|arg| arg == "--async-transaction") {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| format!("build async transaction crash runtime failed: {error}"))?;
+        let transaction = engine
+            .new_txn_async()
+            .map_err(|error| format!("create async crash transaction failed: {error:#}"))?;
+        transaction
+            .put(write_key.as_bytes(), write_value.as_bytes())
+            .map_err(|error| format!("buffer async crash transaction write failed: {error:#}"))?;
+        runtime
+            .block_on(transaction.commit_async())
+            .map_err(|error| format!("post-sync async transaction commit failed: {error:#}"))
+    } else if args.iter().any(|arg| arg == "--async-batch") {
+        let second_key = get_arg(args, "--second-write-key")
+            .ok_or("missing --second-write-key for async batch")?;
+        let second_value = get_arg(args, "--second-write-value")
+            .ok_or("missing --second-write-value for async batch")?;
+        let batch = [
+            WriteBatchRecord::Put(write_key, write_value),
+            WriteBatchRecord::Put(second_key, second_value),
+        ];
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| format!("build async batch crash runtime failed: {error}"))?;
+        runtime
+            .block_on(engine.write_batch_async(&batch))
+            .map_err(|error| format!("post-sync async batch write failed: {error:#}"))
+    } else if args.iter().any(|arg| arg == "--async-delete") {
+        let key = get_arg(args, "--delete-key").ok_or("missing --delete-key for async delete")?;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| format!("build async delete crash runtime failed: {error}"))?;
+        runtime
+            .block_on(engine.delete_async(key.as_bytes()))
+            .map_err(|error| format!("post-sync async delete failed: {error:#}"))
+    } else if args.iter().any(|arg| arg == "--async-range-delete") {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| format!("build async range-delete crash runtime failed: {error}"))?;
+        runtime
+            .block_on(engine.delete_range_async(write_key.as_bytes(), write_value.as_bytes()))
+            .map_err(|error| format!("post-sync async range delete failed: {error:#}"))
+    } else if args.iter().any(|arg| arg == "--async-ttl-write") {
+        let ttl_secs = get_arg(args, "--ttl-secs")
+            .ok_or("missing --ttl-secs for async TTL write")?
+            .parse::<u64>()
+            .map_err(|_| "invalid --ttl-secs")?;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| format!("build async TTL crash runtime failed: {error}"))?;
+        runtime
+            .block_on(engine.put_with_ttl_async(
+                write_key.as_bytes(),
+                write_value.as_bytes(),
+                std::time::Duration::from_secs(ttl_secs),
+            ))
+            .map_err(|error| format!("post-sync async TTL write failed: {error:#}"))
+    } else {
+        engine
+            .put(write_key.as_bytes(), write_value.as_bytes())
+            .map_err(|error| format!("post-sync candidate write failed: {error:#}"))
+    }
 }
 
 fn run_parallel_wal_crash(engine: &KvEngine, args: &[String]) -> Result<(), String> {
