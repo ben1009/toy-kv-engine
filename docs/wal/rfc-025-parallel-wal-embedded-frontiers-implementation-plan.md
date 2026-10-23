@@ -1379,8 +1379,10 @@ successful WAL sync before durable publication or client acknowledgement.
 The child resumes PITR, writes an acknowledged batch into the eligible legacy
 Active WAL if clean close left it empty, then resumes again to install the v7
 Parallel successor. It pauses at the post-`fdatasync` crash hook and is killed;
-recovery must retain the acknowledged values and the synced candidate. This
-qualifies that single boundary only. The second Stage 8 slice adds an engine-open
+recovery must retain the acknowledged values and the synced candidate. In
+`failpoint_v7_parallel_pitr_crash_recovery_install_rename_boundaries`, the
+crash-triggering candidate uses the child’s default synchronous point-`put`
+path. This qualifies that single boundary only. The second Stage 8 slice adds an engine-open
 regression that corrupts DATA covered by the persisted Active manifest boundary.
 Recovery must reject fallback below that hard floor, preserve both WAL and
 manifest bytes on failure. The third Stage 8 slice adds an engine-level
@@ -2023,6 +2025,14 @@ passed 1/1 outside the sandbox on Linux with host io_uring access.
   test(failpoint_v7_parallel_pitr_close_survives_crash_after_return) |
   test(failpoint_v7_parallel_pitr_async_close_survives_crash_after_return)'`
   passed 4/4 outside the sandbox on Linux with host io_uring access.
+- The seventy-second Stage 8 slice pauses a synchronous v7 Parallel point write
+  after WAL `fdatasync` and before MVCC publication, then starts `close()`. The
+  test verifies close stops commit admission, rejects a later write, waits for
+  the admitted commit to publish before closing the WAL, and preserves both
+  the baseline and admitted value through reopen. Focused evidence:
+  `cargo nextest run --package kv-engine --all-features --lib --filter-expr
+  'test(v7_sync_write_durable_before_close_is_published_and_recovered)'`
+  passed 1/1 outside the sandbox on Linux with host io_uring access.
 - Complete the correctness matrix below using the persistence model, real
   runtime injection, and process-level integration. Regress ordinary v4,
   strict v5/v6, TTL, recorded-time rollback/clamping, range deletion, OCC,
@@ -2074,7 +2084,7 @@ the captured prefix must survive even if no publication or ACK followed.
 | Successful sync before publication/ACK | Crash after WAL sync but before durable-ticket, memtable/MVCC publication, or ACK; recovery must include the captured prefix and choose the newest fully verified candidate. `failpoint_v7_parallel_async_pitr_crash_after_sync_before_ack_recovers` covers an async point write; `failpoint_v7_parallel_async_transaction_crash_after_sync_before_ack_recovers` verifies async MVCC publication is recovered even though the caller never received an acknowledgment; `failpoint_v7_parallel_async_batch_crash_after_sync_before_ack_recovers_all_entries` verifies a two-entry async batch is replayed in full; `failpoint_v7_parallel_async_delete_crash_after_sync_before_ack_recovers_tombstone` verifies async point deletion; `failpoint_v7_parallel_async_range_delete_crash_after_sync_before_ack_recovers_tombstone` verifies the async half-open range tombstone; and `failpoint_v7_parallel_async_ttl_crash_after_sync_before_ack_recovers_expiration` verifies an async zero-duration TTL overwrite and its expiration metadata. The synchronous cases `failpoint_v7_parallel_sync_serializable_transaction_crash_after_sync_before_ack_recovers`, `failpoint_v7_parallel_sync_batch_crash_after_sync_before_ack_recovers_all_entries`, `failpoint_v7_parallel_sync_delete_crash_after_sync_before_ack_recovers_tombstone`, `failpoint_v7_parallel_sync_range_delete_crash_after_sync_before_ack_recovers_tombstone`, and `failpoint_v7_parallel_sync_ttl_crash_after_sync_before_ack_recovers_expiration` cover the same point with a serializable transaction that reads an acknowledged baseline, a complete two-entry batch, point deletion, half-open range deletion, and zero-duration TTL overwrite. Every child is stopped by the live post-sync hook before the operation returns, and recovery checks the operation-specific result and the acknowledged baseline. |
 | Discovery damage and tail controls | Scan beyond broken DATA, zero/hole/preallocation and partial EOF; stray speculative control may be discarded, interior fork/orphan may not be skipped. |
 | Chain invariants | Duplicate generation, sibling/orphan/skip-predecessor, wrong binding/digest, and physical containment fail even after fixture CRCs are recomputed. |
-| Fixed targets and stopped admission | Continuous work cannot change API cutoff `C` for sync/close/freeze/checkpoint/recovery points; predecessor containment may require marker `T > C`, fixed before construction. `D0 \| D1 \| F_A(D0)` drains; ineligible poisoned targets terminate. |
+| Fixed targets and stopped admission | Continuous work cannot change API cutoff `C` for sync/close/freeze/checkpoint/recovery points; predecessor containment may require marker `T > C`, fixed before construction. `D0 \| D1 \| F_A(D0)` drains; ineligible poisoned targets terminate. `v7_sync_write_durable_before_close_is_published_and_recovered` holds a synchronous commit between WAL durability and publication while close captures its cutoff, then checks that close blocks until publication and rejects post-cutoff admission. |
 | Real CQEs and ownership | Short/negative, reversed, stale, missing, and ambiguous completions cannot publish beyond a proven prefix or release kernel/hash-owned buffers. Worker-state tests exercise negative CQEs; `failpoint_v7_parallel_injected_negative_cqe_keeps_prior_frontier` and `failpoint_v7_parallel_injected_short_cqe_keeps_prior_frontier` inject negative and short results into the live completion path; `process_completions_rejects_stale_cqe_without_releasing_outstanding_buffer` exercises stale-ID rejection at the completion dispatcher; `missing_cqe_blocks_close_until_matching_completion_retires_buffer` verifies a missing completion keeps the buffer owned and prevents close; `failpoint_v7_parallel_later_group_cqe_does_not_advance_past_gap` verifies real out-of-order DATA completion cannot advance recovery across an earlier ticket gap; `failpoint_v7_parallel_post_io_group_completion_error_keeps_prior_frontier` verifies a post-I/O group-completion error preserves the prior durable boundary. |
 | Failed marker cycle | No further FRONTIER append in that runtime, including attempts that would not ACK; all waiters/leases reach terminal outcomes. |
 | Durable floors | Validate every exact logical anchor; never fall below it, reuse required timestamps, or reinterpret allocation watermarks as committed coordinates. |

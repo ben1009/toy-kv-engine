@@ -16164,6 +16164,13 @@ impl LsmStorageInner {
                     .as_ref()
                     .map_or(0, |(commit_ts, _, _)| *commit_ts),
             )?;
+            #[cfg(test)]
+            if let Some((commit_ts, _, _)) = publish_data.as_ref() {
+                self.pause_native_write_blocking(
+                    native_write::NativeWriteStage::Durable,
+                    *commit_ts,
+                );
+            }
             // Publish to skiplist + bloom AFTER WAL sync succeeds.
             if let Some((commit_ts, encoded_key, prefixed_val)) = publish_data {
                 if let Some(ref mvcc) = self.mvcc {
@@ -23541,6 +23548,127 @@ mod tests {
         assert!(!admission_reopened, "sync reopened admission during close");
         sync_result?;
         close_result?;
+
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn v7_sync_write_durable_before_close_is_published_and_recovered() -> anyhow::Result<()> {
+        use std::time::{Duration, Instant};
+
+        let directory = tempdir()?;
+        let options = v7_recovery_test_database(directory.path())?;
+        let database = directory.path().join("db");
+        let engine = KvEngine::open_with_wal_io_mode(
+            &database,
+            options.clone(),
+            crate::wal::WalIoMode::Parallel,
+        )?;
+        engine.put(b"sync-close-baseline", b"kept")?;
+        let active = engine.inner.state.load().memtable.clone();
+        assert!(active.uses_v7_wal());
+        assert!(active.uses_parallel_wal());
+        let sequencer = engine.inner.mvcc.as_ref().unwrap();
+        assert!(sequencer.commit_admission_is_open());
+        let frontier_before = active.v7_frontier_cursor()?.frontier;
+
+        let pause = crate::lsm_storage::native_write::NativeWritePause::new(
+            crate::lsm_storage::native_write::NativeWriteStage::Durable,
+        );
+        let _release_on_exit = NativeWritePauseReleaseGuard(Arc::clone(&pause));
+        *engine.inner.native_write_pause.lock() = Some(Arc::clone(&pause));
+        let writer_engine = Arc::clone(&engine);
+        let writer =
+            std::thread::spawn(move || writer_engine.put(b"sync-close-durable", b"published"));
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        let reached_durable_pause = runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), pause.reached.notified())
+                .await
+                .is_ok()
+        });
+        let hidden_before_publication =
+            reached_durable_pause && engine.get(b"sync-close-durable")?.is_none();
+        let frontier_after_sync = active.v7_frontier_cursor()?.frontier;
+        let durable_frontier_advanced = frontier_after_sync.ticket_end > frontier_before.ticket_end
+            && frontier_after_sync.durable_end > frontier_before.durable_end;
+
+        let close_engine = Arc::clone(&engine);
+        let closer = std::thread::spawn(move || close_engine.close());
+        let close_deadline = Instant::now() + Duration::from_secs(5);
+        while sequencer.commit_admission_is_open()
+            && !closer.is_finished()
+            && Instant::now() < close_deadline
+        {
+            std::thread::yield_now();
+        }
+        let close_stopped_admission = !sequencer.commit_admission_is_open();
+        let admission_rejected_new_write =
+            close_stopped_admission && engine.put(b"after-close-cutoff", b"rejected").is_err();
+        std::thread::sleep(Duration::from_millis(50));
+        let close_waited_for_publication = !closer.is_finished();
+        let wal_open_while_writer_paused = active.parallel_wal_is_closed() == Some(false);
+
+        // Release and join before asserting so a regression cannot strand either
+        // the writer or close worker on a failure path.
+        pause.release_blocking();
+        let writer_result = writer.join().unwrap();
+        let close_result = closer.join().unwrap();
+        writer_result?;
+        close_result?;
+
+        let visible_after_close =
+            engine.get(b"sync-close-durable")? == Some(Bytes::from_static(b"published"));
+        drop(active);
+        drop(engine);
+
+        let reopened =
+            KvEngine::open_with_wal_io_mode(&database, options, crate::wal::WalIoMode::Parallel)?;
+        let recovered =
+            reopened.get(b"sync-close-durable")? == Some(Bytes::from_static(b"published"));
+        let rejected_write_absent = reopened.get(b"after-close-cutoff")?.is_none();
+        let baseline_recovered =
+            reopened.get(b"sync-close-baseline")? == Some(Bytes::from_static(b"kept"));
+        reopened.close_storage()?;
+
+        assert!(reached_durable_pause, "sync write missed its durable pause");
+        assert!(
+            hidden_before_publication,
+            "durable write became visible before publication"
+        );
+        assert!(
+            durable_frontier_advanced,
+            "WAL durability did not advance before pause"
+        );
+        assert!(
+            close_stopped_admission,
+            "close did not stop commit admission"
+        );
+        assert!(
+            admission_rejected_new_write,
+            "close admitted a write past its cutoff"
+        );
+        assert!(
+            close_waited_for_publication,
+            "close returned before the admitted write published"
+        );
+        assert!(
+            wal_open_while_writer_paused,
+            "close closed the WAL before the admitted write drained"
+        );
+        assert!(
+            visible_after_close,
+            "close returned without publishing its admitted write"
+        );
+        assert!(recovered, "reopen lost the durable write covered by close");
+        assert!(
+            rejected_write_absent,
+            "reopen found a write rejected past the close cutoff"
+        );
+        assert!(baseline_recovered, "reopen lost the acknowledged baseline");
 
         Ok(())
     }
