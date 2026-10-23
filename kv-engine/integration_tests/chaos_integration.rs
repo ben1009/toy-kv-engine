@@ -2880,6 +2880,255 @@ fn failpoint_v7_empty_successor_install_crash_boundaries_preserves_nonempty_sour
 }
 
 #[cfg(target_os = "linux")]
+#[test]
+fn v7_parallel_pitr_sync_and_async_write_apis_survive_reopen() {
+    let dir = tempfile::tempdir().expect("create v7 public API regression directory");
+    let db_path = dir.path().join("db");
+    let repository = dir.path().join("repository");
+    let engine = prepare_empty_v7_parallel_pitr(&db_path, &repository);
+
+    engine.put(b"sync-put", b"value").expect("sync put");
+    engine
+        .put_with_ttl(b"sync-ttl", b"value", Duration::from_secs(3600))
+        .expect("sync TTL put");
+    engine
+        .put_with_ttl(b"sync-expired-ttl", b"gone", Duration::ZERO)
+        .expect("sync expired TTL put");
+    engine
+        .put(b"sync-delete", b"old")
+        .expect("seed sync delete");
+    engine.delete(b"sync-delete").expect("sync delete");
+    for (key, value) in [
+        (b"range-a".as_slice(), b"a".as_slice()),
+        (b"range-b".as_slice(), b"b".as_slice()),
+        (b"range-c".as_slice(), b"c".as_slice()),
+        (b"range-d".as_slice(), b"d".as_slice()),
+    ] {
+        engine.put(key, value).expect("seed sync range delete");
+    }
+    engine
+        .delete_range(b"range-b", b"range-d")
+        .expect("sync range delete");
+    engine
+        .put(b"batch-delete", b"old")
+        .expect("seed sync batch delete");
+    engine
+        .write_batch(&[
+            WriteBatchRecord::Put(&b"batch-put"[..], &b"value"[..]),
+            WriteBatchRecord::PutWithTtl(&b"batch-ttl"[..], &b"value"[..], 3600),
+            WriteBatchRecord::PutWithTtl(&b"batch-expired-ttl"[..], &b"gone"[..], 0),
+            WriteBatchRecord::Del(&b"batch-delete"[..]),
+        ])
+        .expect("sync write batch");
+    let transaction = engine.new_txn().expect("create sync transaction");
+    transaction
+        .put(b"sync-transaction", b"value")
+        .expect("buffer sync transaction write");
+    transaction.commit().expect("commit sync transaction");
+    drop(transaction);
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("create async API runtime");
+    runtime
+        .block_on(engine.put_async(b"async-put", b"value"))
+        .expect("async put");
+    runtime
+        .block_on(engine.put_with_ttl_async(b"async-ttl", b"value", Duration::from_secs(3600)))
+        .expect("async TTL put");
+    runtime
+        .block_on(engine.put_with_ttl_async(b"async-expired-ttl", b"gone", Duration::ZERO))
+        .expect("async expired TTL put");
+    runtime
+        .block_on(engine.put_async(b"async-delete", b"old"))
+        .expect("seed async delete");
+    runtime
+        .block_on(engine.delete_async(b"async-delete"))
+        .expect("async delete");
+    runtime
+        .block_on(engine.put_async(b"async-range-a", b"a"))
+        .expect("seed async range start");
+    runtime
+        .block_on(engine.put_async(b"async-range-b", b"b"))
+        .expect("seed async range middle");
+    runtime
+        .block_on(engine.put_async(b"async-range-c", b"c"))
+        .expect("seed async range end");
+    runtime
+        .block_on(engine.delete_range_async(b"async-range-b", b"async-range-c"))
+        .expect("async range delete");
+    runtime
+        .block_on(engine.write_batch_async(&[
+            WriteBatchRecord::Put(&b"async-batch-put"[..], &b"value"[..]),
+            WriteBatchRecord::PutWithTtl(&b"async-batch-ttl"[..], &b"value"[..], 3600),
+            WriteBatchRecord::PutWithTtl(&b"async-batch-expired-ttl"[..], &b"gone"[..], 0),
+        ]))
+        .expect("async write batch");
+    let transaction = engine.new_txn_async().expect("create async transaction");
+    transaction
+        .put(b"async-transaction", b"value")
+        .expect("buffer async transaction write");
+    runtime
+        .block_on(transaction.commit_async())
+        .expect("commit async transaction");
+    drop(transaction);
+    for key in [
+        b"sync-expired-ttl".as_slice(),
+        b"batch-expired-ttl".as_slice(),
+        b"async-expired-ttl".as_slice(),
+        b"async-batch-expired-ttl".as_slice(),
+    ] {
+        assert_eq!(
+            engine
+                .get(key)
+                .expect("read expired v7 TTL value before reopen"),
+            None,
+            "zero-duration TTL must be expired before reopen: {key:?}"
+        );
+    }
+    engine.sync().expect("sync the fixed v7 commit prefix");
+    engine.close().expect("close v7 API regression engine");
+
+    let reopened = open_and_resume_parallel_pitr(&db_path, &repository);
+    let status = reopened
+        .pitr_status(PitrStatusOptions {
+            cursor: None,
+            page_size: NonZeroUsize::new(64).expect("nonzero PITR status page size"),
+        })
+        .expect("read PITR status after reopen");
+    assert_eq!(status.active_wal_format_version, Some(7));
+    assert_eq!(status.active_wal_io_mode, Some(PitrWalIoMode::Parallel));
+
+    for (key, expected) in [
+        (b"legacy-segment-value".as_slice(), b"restored".as_slice()),
+        (b"sync-put".as_slice(), b"value".as_slice()),
+        (b"sync-ttl".as_slice(), b"value".as_slice()),
+        (b"range-a".as_slice(), b"a".as_slice()),
+        (b"range-d".as_slice(), b"d".as_slice()),
+        (b"batch-put".as_slice(), b"value".as_slice()),
+        (b"batch-ttl".as_slice(), b"value".as_slice()),
+        (b"sync-transaction".as_slice(), b"value".as_slice()),
+        (b"async-put".as_slice(), b"value".as_slice()),
+        (b"async-ttl".as_slice(), b"value".as_slice()),
+        (b"async-range-a".as_slice(), b"a".as_slice()),
+        (b"async-range-c".as_slice(), b"c".as_slice()),
+        (b"async-batch-put".as_slice(), b"value".as_slice()),
+        (b"async-batch-ttl".as_slice(), b"value".as_slice()),
+        (b"async-transaction".as_slice(), b"value".as_slice()),
+    ] {
+        assert_eq!(
+            reopened
+                .get(key)
+                .expect("read recovered v7 API value")
+                .as_deref(),
+            Some(expected),
+            "reopened v7 database must retain {key:?}"
+        );
+    }
+    for key in [
+        b"sync-expired-ttl".as_slice(),
+        b"batch-expired-ttl".as_slice(),
+        b"async-expired-ttl".as_slice(),
+        b"async-batch-expired-ttl".as_slice(),
+    ] {
+        assert_eq!(
+            reopened
+                .get(key)
+                .expect("read expired TTL value after reopen"),
+            None,
+            "reopen must preserve expiration for {key:?}"
+        );
+    }
+    for key in [
+        b"sync-delete".as_slice(),
+        b"range-b".as_slice(),
+        b"range-c".as_slice(),
+        b"batch-delete".as_slice(),
+        b"async-delete".as_slice(),
+        b"async-range-b".as_slice(),
+    ] {
+        assert_eq!(
+            reopened.get(key).expect("read deleted v7 API value"),
+            None,
+            "reopened v7 database must keep {key:?} deleted"
+        );
+    }
+    reopened
+        .close()
+        .expect("close reopened v7 API regression engine");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn v7_parallel_pitr_checkpoint_captures_its_fixed_cutoff() {
+    let dir = tempfile::tempdir().expect("create v7 checkpoint regression directory");
+    let db_path = dir.path().join("db");
+    let repository = dir.path().join("repository");
+    let checkpoint_path = dir.path().join("checkpoint");
+    let engine = prepare_empty_v7_parallel_pitr(&db_path, &repository);
+
+    engine
+        .put(b"before-checkpoint-cutoff", b"captured")
+        .expect("write before checkpoint cutoff");
+    engine
+        .create_checkpoint(&checkpoint_path)
+        .expect("capture checkpoint at v7 commit cutoff");
+    engine
+        .put(b"after-checkpoint-cutoff", b"later")
+        .expect("write after checkpoint cutoff");
+
+    let checkpoint = KvEngine::open(&checkpoint_path, LsmStorageOptions::default_for_test())
+        .expect("open standalone checkpoint");
+    for (key, expected) in [
+        (b"legacy-segment-value".as_slice(), b"restored".as_slice()),
+        (
+            b"before-checkpoint-cutoff".as_slice(),
+            b"captured".as_slice(),
+        ),
+    ] {
+        assert_eq!(
+            checkpoint
+                .get(key)
+                .expect("read checkpoint value")
+                .as_deref(),
+            Some(expected),
+            "checkpoint must retain {key:?}"
+        );
+    }
+    assert_eq!(
+        checkpoint
+            .get(b"after-checkpoint-cutoff")
+            .expect("read key written after checkpoint cutoff"),
+        None,
+        "checkpoint must not include writes admitted after its cutoff"
+    );
+    checkpoint.close().expect("close standalone checkpoint");
+    engine.close().expect("close v7 checkpoint source");
+
+    let reopened = open_and_resume_parallel_pitr(&db_path, &repository);
+    for (key, expected) in [
+        (
+            b"before-checkpoint-cutoff".as_slice(),
+            b"captured".as_slice(),
+        ),
+        (b"after-checkpoint-cutoff".as_slice(), b"later".as_slice()),
+    ] {
+        assert_eq!(
+            reopened
+                .get(key)
+                .expect("read source value after checkpoint and reopen")
+                .as_deref(),
+            Some(expected),
+            "source reopen must retain {key:?}"
+        );
+    }
+    reopened
+        .close()
+        .expect("close reopened v7 checkpoint source");
+}
+
+#[cfg(target_os = "linux")]
 fn prepare_empty_v7_parallel_pitr(
     db_path: &std::path::Path,
     repository: &std::path::Path,
