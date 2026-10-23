@@ -329,6 +329,12 @@ impl LsmStorageInner {
                 &tmp_dir,
                 staging_prepared,
             )?;
+            #[cfg(feature = "chaos-testing")]
+            {
+                crate::chaos::failpoint::fail_point!(
+                    "checkpoint.after_capture_boundary_before_copy"
+                );
+            }
             self.publish_prepared_checkpoint(&target_dir, &tmp_dir, &options, prepared)
         })();
 
