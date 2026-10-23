@@ -3443,6 +3443,217 @@ fn failpoint_v7_parallel_pitr_async_sync_survives_crash_after_return() {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn failpoint_v7_parallel_pitr_sync_survives_crash_after_return() {
+    let probe_dir = tempfile::tempdir().expect("create v7 sync crash probe directory");
+    let probe_options = LsmStorageOptions {
+        enable_wal: true,
+        ..LsmStorageOptions::default_for_test()
+    };
+    match KvEngine::open_with_wal_io_mode(&probe_dir, probe_options, WalIoMode::Parallel) {
+        Ok(engine) => engine.close().expect("close v7 Parallel sync crash probe"),
+        Err(error) => panic!("v7 Parallel sync qualification requires io_uring: {error:#}"),
+    }
+
+    let dir = tempfile::tempdir().expect("create v7 sync crash directory");
+    let db_path = dir.path().join("db");
+    let repository = dir.path().join("repository");
+    let engine = prepare_empty_v7_parallel_pitr(&db_path, &repository);
+    engine
+        .put(b"sync-crash-baseline", b"stable")
+        .expect("persist sync crash baseline");
+    engine.close().expect("close v7 sync crash setup engine");
+    let boundary_before_sync = latest_persisted_active_boundary(&db_path);
+
+    kill_pitr_child_at_crash_point_with_operation(
+        &db_path,
+        &repository,
+        &dir.path().join("sync-crash-control.log"),
+        &dir.path().join("sync-returned.marker"),
+        "sync.returned",
+        PitrChildCrashOperation::SyncBarrier {
+            acknowledged_write: Some(("sync-boundary-value", "durable")),
+        },
+    );
+
+    let boundary_after_sync = latest_persisted_active_boundary(&db_path);
+    assert!(
+        boundary_after_sync.0 > boundary_before_sync.0,
+        "returned sync must advance the persisted ticket boundary: before={boundary_before_sync:?}, after={boundary_after_sync:?}"
+    );
+    assert!(
+        boundary_after_sync.1 > boundary_before_sync.1,
+        "returned sync must advance the persisted physical boundary: before={boundary_before_sync:?}, after={boundary_after_sync:?}"
+    );
+    assert!(
+        boundary_after_sync.2 > boundary_before_sync.2,
+        "returned sync must advance the persisted commit timestamp: before={boundary_before_sync:?}, after={boundary_after_sync:?}"
+    );
+
+    let recovered = open_and_resume_parallel_pitr(&db_path, &repository);
+    assert_eq!(
+        recovered
+            .get(b"sync-crash-baseline")
+            .expect("read acknowledged sync baseline after crash")
+            .as_deref(),
+        Some(b"stable".as_slice())
+    );
+    assert_eq!(
+        recovered
+            .get(b"sync-boundary-value")
+            .expect("read write covered by returned sync after crash")
+            .as_deref(),
+        Some(b"durable".as_slice()),
+        "sync must persist its Active boundary before returning"
+    );
+    recovered
+        .close()
+        .expect("close recovered v7 sync crash engine");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn failpoint_v7_parallel_pitr_close_survives_crash_after_return() {
+    let probe_dir = tempfile::tempdir().expect("create v7 close crash probe directory");
+    let probe_options = LsmStorageOptions {
+        enable_wal: true,
+        ..LsmStorageOptions::default_for_test()
+    };
+    match KvEngine::open_with_wal_io_mode(&probe_dir, probe_options, WalIoMode::Parallel) {
+        Ok(engine) => engine.close().expect("close v7 Parallel close crash probe"),
+        Err(error) => panic!("v7 Parallel close qualification requires io_uring: {error:#}"),
+    }
+
+    let dir = tempfile::tempdir().expect("create v7 close crash directory");
+    let db_path = dir.path().join("db");
+    let repository = dir.path().join("repository");
+    let engine = prepare_empty_v7_parallel_pitr(&db_path, &repository);
+    engine
+        .put(b"close-crash-baseline", b"stable")
+        .expect("persist close crash baseline");
+    engine.close().expect("close v7 close crash setup engine");
+    let boundary_before_close = latest_persisted_active_boundary(&db_path);
+
+    kill_pitr_child_at_crash_point_with_operation(
+        &db_path,
+        &repository,
+        &dir.path().join("close-crash-control.log"),
+        &dir.path().join("close-returned.marker"),
+        "close.returned",
+        PitrChildCrashOperation::CloseBoundary {
+            acknowledged_write: Some(("close-boundary-value", "durable")),
+        },
+    );
+
+    let boundary_after_close = latest_persisted_active_boundary(&db_path);
+    assert!(
+        boundary_after_close.0 > boundary_before_close.0,
+        "returned close must advance the persisted ticket boundary: before={boundary_before_close:?}, after={boundary_after_close:?}"
+    );
+    assert!(
+        boundary_after_close.1 > boundary_before_close.1,
+        "returned close must advance the persisted physical boundary: before={boundary_before_close:?}, after={boundary_after_close:?}"
+    );
+    assert!(
+        boundary_after_close.2 > boundary_before_close.2,
+        "returned close must advance the persisted commit timestamp: before={boundary_before_close:?}, after={boundary_after_close:?}"
+    );
+
+    let recovered = open_and_resume_parallel_pitr(&db_path, &repository);
+    assert_eq!(
+        recovered
+            .get(b"close-crash-baseline")
+            .expect("read acknowledged close baseline after crash")
+            .as_deref(),
+        Some(b"stable".as_slice())
+    );
+    assert_eq!(
+        recovered
+            .get(b"close-boundary-value")
+            .expect("read write covered by returned close after crash")
+            .as_deref(),
+        Some(b"durable".as_slice()),
+        "close must persist its Active boundary before returning"
+    );
+    recovered
+        .close()
+        .expect("close recovered v7 close crash engine");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn failpoint_v7_parallel_pitr_async_close_survives_crash_after_return() {
+    let probe_dir = tempfile::tempdir().expect("create v7 async close crash probe directory");
+    let probe_options = LsmStorageOptions {
+        enable_wal: true,
+        ..LsmStorageOptions::default_for_test()
+    };
+    match KvEngine::open_with_wal_io_mode(&probe_dir, probe_options, WalIoMode::Parallel) {
+        Ok(engine) => engine
+            .close()
+            .expect("close v7 Parallel async close crash probe"),
+        Err(error) => panic!("v7 Parallel async close qualification requires io_uring: {error:#}"),
+    }
+
+    let dir = tempfile::tempdir().expect("create v7 async close crash directory");
+    let db_path = dir.path().join("db");
+    let repository = dir.path().join("repository");
+    let engine = prepare_empty_v7_parallel_pitr(&db_path, &repository);
+    engine
+        .put(b"async-close-crash-baseline", b"stable")
+        .expect("persist async close crash baseline");
+    engine
+        .close()
+        .expect("close v7 async close crash setup engine");
+    let boundary_before_close = latest_persisted_active_boundary(&db_path);
+
+    kill_pitr_child_at_crash_point_with_operation(
+        &db_path,
+        &repository,
+        &dir.path().join("async-close-crash-control.log"),
+        &dir.path().join("async-close-returned.marker"),
+        "async_close.returned",
+        PitrChildCrashOperation::AsyncClose {
+            acknowledged_write: Some(("async-close-boundary-value", "durable")),
+        },
+    );
+
+    let boundary_after_close = latest_persisted_active_boundary(&db_path);
+    assert!(
+        boundary_after_close.0 > boundary_before_close.0,
+        "returned close_async must advance the persisted ticket boundary: before={boundary_before_close:?}, after={boundary_after_close:?}"
+    );
+    assert!(
+        boundary_after_close.1 > boundary_before_close.1,
+        "returned close_async must advance the persisted physical boundary: before={boundary_before_close:?}, after={boundary_after_close:?}"
+    );
+    assert!(
+        boundary_after_close.2 > boundary_before_close.2,
+        "returned close_async must advance the persisted commit timestamp: before={boundary_before_close:?}, after={boundary_after_close:?}"
+    );
+
+    let recovered = open_and_resume_parallel_pitr(&db_path, &repository);
+    assert_eq!(
+        recovered
+            .get(b"async-close-crash-baseline")
+            .expect("read acknowledged async close baseline after crash")
+            .as_deref(),
+        Some(b"stable".as_slice())
+    );
+    assert_eq!(
+        recovered
+            .get(b"async-close-boundary-value")
+            .expect("read write covered by returned close_async after crash")
+            .as_deref(),
+        Some(b"durable".as_slice()),
+        "close_async must persist its Active boundary before returning"
+    );
+    recovered
+        .close()
+        .expect("close recovered v7 async close crash engine");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn failpoint_v7_parallel_async_pitr_crash_after_sync_before_ack_recovers() {
     let probe_dir = tempfile::tempdir().expect("create v7 async crash probe directory");
     let probe_options = LsmStorageOptions {
@@ -4345,6 +4556,15 @@ enum PitrChildCrashOperation<'a> {
     AsyncSync {
         acknowledged_write: Option<(&'a str, &'a str)>,
     },
+    SyncBarrier {
+        acknowledged_write: Option<(&'a str, &'a str)>,
+    },
+    CloseBoundary {
+        acknowledged_write: Option<(&'a str, &'a str)>,
+    },
+    AsyncClose {
+        acknowledged_write: Option<(&'a str, &'a str)>,
+    },
 }
 
 #[cfg(target_os = "linux")]
@@ -4470,7 +4690,10 @@ fn kill_pitr_child_at_crash_point_with_mode(
             acknowledged_write: Some(_),
             ..
         } => "2",
-        PitrChildCrashOperation::AsyncSync { .. } => "1",
+        PitrChildCrashOperation::AsyncSync { .. }
+        | PitrChildCrashOperation::SyncBarrier { .. }
+        | PitrChildCrashOperation::CloseBoundary { .. }
+        | PitrChildCrashOperation::AsyncClose { .. } => "1",
         PitrChildCrashOperation::CreateEmptySuccessor
         | PitrChildCrashOperation::Write {
             acknowledged_write: None,
@@ -4628,6 +4851,27 @@ fn kill_pitr_child_at_crash_point_with_mode(
             child
                 .arg("--async-sync")
                 .arg("--async-sync-completion-marker")
+                .arg(marker_path);
+            (acknowledged_write, None)
+        }
+        PitrChildCrashOperation::SyncBarrier { acknowledged_write } => {
+            child
+                .arg("--sync-sync")
+                .arg("--sync-completion-marker")
+                .arg(marker_path);
+            (acknowledged_write, None)
+        }
+        PitrChildCrashOperation::CloseBoundary { acknowledged_write } => {
+            child
+                .arg("--sync-close")
+                .arg("--close-completion-marker")
+                .arg(marker_path);
+            (acknowledged_write, None)
+        }
+        PitrChildCrashOperation::AsyncClose { acknowledged_write } => {
+            child
+                .arg("--async-close")
+                .arg("--async-close-completion-marker")
                 .arg(marker_path);
             (acknowledged_write, None)
         }
