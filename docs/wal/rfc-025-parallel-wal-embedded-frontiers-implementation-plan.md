@@ -2077,6 +2077,23 @@ passed 1/1 outside the sandbox on Linux with host io_uring access.
   range-path poison regression passed 11/11 together. All-targets
   `cargo clippy --workspace --all-features --all-targets -- -D warnings` also
   passed.
+- The seventy-seventh Stage 8 slice pauses a v7 write after WAL durability and
+  before MVCC publication while synchronous and asynchronous recovery-point
+  creation fix their cutoff. Both APIs must wait for publication, reject later
+  admission, archive exactly through the paused commit, and leave the source
+  writable and recoverable. The test restores the recovery point at the paused
+  commit timestamp and verifies the admitted write is included while a
+  successor is excluded. Focused evidence:
+  `v7_recovery_point_drains_durable_unpublished_write_and_restores_cutoff`
+  passed both sync and async cases outside the sandbox on Linux with host
+  io_uring access.
+- The seventy-eighth Stage 8 slice applies the same durable-before-publication
+  race to synchronous and asynchronous forced flush. Both APIs must drain the
+  admitted writer before rotating, reject a post-cutoff commit, finish draining
+  immutable memtables, resume admission, and preserve the cutoff and successor
+  writes across reopen. Focused evidence:
+  `v7_forced_flush_drains_durable_unpublished_write_and_recovers` passed both
+  sync and async cases outside the sandbox on Linux with host io_uring access.
 - Complete the correctness matrix below using the persistence model, real
   runtime injection, and process-level integration. Regress ordinary v4,
   strict v5/v6, TTL, recorded-time rollback/clamping, range deletion, OCC,
@@ -2129,6 +2146,7 @@ the captured prefix must survive even if no publication or ACK followed.
 | Discovery damage and tail controls | Scan beyond broken DATA, zero/hole/preallocation and partial EOF; stray speculative control may be discarded, interior fork/orphan may not be skipped. |
 | Chain invariants | Duplicate generation, sibling/orphan/skip-predecessor, wrong binding/digest, and physical containment fail even after fixture CRCs are recomputed. |
 | Fixed targets and stopped admission | Continuous work cannot change API cutoff `C` for sync/close/freeze/checkpoint/recovery points; predecessor containment may require marker `T > C`, fixed before construction. `D0 \| D1 \| F_A(D0)` drains; ineligible poisoned targets terminate. `v7_sync_write_durable_before_close_is_published_and_recovered` holds a synchronous point write between WAL durability and publication while close captures its cutoff. `v7_sync_batch_durable_before_close_is_published_and_recovered`, `v7_sync_transaction_durable_before_close_is_published_and_recovered`, `v7_sync_ttl_durable_before_close_is_published_and_recovered`, `v7_sync_delete_durable_before_close_is_published_and_recovered`, `v7_sync_range_batch_durable_before_close_is_published_and_recovered`, and `v7_sync_range_delete_durable_before_close_is_published_and_recovered` apply the same close-cutoff, post-publication, and recovery assertions to the remaining synchronous point, transaction, and range commit paths. `v7_sync_barrier_drains_durable_unpublished_write_and_recovers` and `v7_sync_async_barrier_drains_durable_unpublished_write_and_recovers` verify both public sync barriers drain a commit already past WAL durability. |
+| Recovery-point and forced-flush cutoffs | `v7_recovery_point_drains_durable_unpublished_write_and_restores_cutoff` verifies sync/async recovery-point capture waits for an admitted durable commit and restores exactly through its timestamp, excluding a successor. `v7_forced_flush_drains_durable_unpublished_write_and_recovers` verifies sync/async forced flush drains the admitted writer and immutable queue, rejects later admission at the cutoff, and recovers the cutoff and successor writes after reopen. |
 | Real CQEs and ownership | Short/negative, reversed, stale, missing, and ambiguous completions cannot publish beyond a proven prefix or release kernel/hash-owned buffers. Worker-state tests exercise negative CQEs; `failpoint_v7_parallel_injected_negative_cqe_keeps_prior_frontier` and `failpoint_v7_parallel_injected_short_cqe_keeps_prior_frontier` inject negative and short results into the live completion path; `process_completions_rejects_stale_cqe_without_releasing_outstanding_buffer` exercises stale-ID rejection at the completion dispatcher; `missing_cqe_blocks_close_until_matching_completion_retires_buffer` verifies a missing completion keeps the buffer owned and prevents close; `failpoint_v7_parallel_later_group_cqe_does_not_advance_past_gap` verifies real out-of-order DATA completion cannot advance recovery across an earlier ticket gap; `failpoint_v7_parallel_post_io_group_completion_error_keeps_prior_frontier` verifies a post-I/O group-completion error preserves the prior durable boundary. |
 | Failed marker cycle | No further FRONTIER append in that runtime, including attempts that would not ACK; all waiters/leases reach terminal outcomes. |
 | Durable floors | Validate every exact logical anchor; never fall below it, reuse required timestamps, or reinterpret allocation watermarks as committed coordinates. |
