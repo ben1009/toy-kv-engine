@@ -2867,6 +2867,18 @@ mod tests {
         rewritten_after_sync.sync_directory_success();
         assert!(!rewritten_after_sync.service_ready_for(ACTIVE_WAL_PATH, first_temp));
 
+        let mut renamed_then_rewritten = disk.clone();
+        renamed_then_rewritten.rename_replace(TEMP_WAL_PATH, ACTIVE_WAL_PATH)?;
+        assert_eq!(
+            renamed_then_rewritten.recovery_install_candidate,
+            Some((renamed_then_rewritten.process_generation, first_temp))
+        );
+        renamed_then_rewritten.write_at(first_temp, 0, &normalized_image[..1])?;
+        assert_eq!(renamed_then_rewritten.recovery_install_candidate, None);
+        renamed_then_rewritten.fdatasync_success(first_temp)?;
+        renamed_then_rewritten.sync_directory_success();
+        assert!(!renamed_then_rewritten.service_ready_for(ACTIVE_WAL_PATH, first_temp));
+
         let mut stale_synced_temp = disk.clone();
         stale_synced_temp.restart_process_without_reboot();
         stale_synced_temp.rename_replace(TEMP_WAL_PATH, ACTIVE_WAL_PATH)?;
