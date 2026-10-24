@@ -636,12 +636,13 @@ the database or repository; reduce `--num` or `--value-size`, or use the batch
 workload when a larger run exceeds that bound.
 
 V7 rows now report runtime commit-group, DATA-byte, embedded FRONTIER write,
-sync-count/latency, per-sync frontier coverage, and bounded coalescing receive-
-wait counters in `result.wal_pipeline` when built with benchmark profiling. The
-legacy `counters.wal_commit_*` fields are populated for v7 too. These diagnostics
-make runs inspectable; they do not qualify v7 performance. The five comparison
-legs, required devices/workloads, archive controls, and recovery measurements
-below remain open.
+sync-count/latency, and bounded coalescing receive-wait counters in
+`result.wal_pipeline` when built with the `bench` feature. Detailed sync-group
+totals and per-sync frontier coverage observations require the run to also use
+`--profile`. The legacy `counters.wal_commit_*` fields are populated for v7 too.
+These diagnostics make runs inspectable; they do not qualify v7 performance. The
+five comparison legs, required devices/workloads, archive controls, and recovery
+measurements below remain open.
 
 ```text
 ./target/release/write-perf --bench wal_concurrent --pitr --pitr-format v6 \
