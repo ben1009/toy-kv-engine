@@ -164,6 +164,16 @@ pub struct WriteProfile {
     pub wal_commit_max_buffers: AtomicU64,
     /// Maximum aligned bytes submitted by one WAL commit group.
     pub wal_commit_max_bytes: AtomicU64,
+    /// Number of successfully written embedded v7 FRONTIER frames.
+    pub wal_frontier_writes: AtomicU64,
+    /// Aligned bytes written for embedded v7 FRONTIER frames.
+    pub wal_frontier_bytes: AtomicU64,
+    /// Time writing embedded v7 FRONTIER frames.
+    pub wal_frontier_write_ns: AtomicU64,
+    /// Number of bounded completion-receive calls made while coalescing WAL syncs.
+    pub wal_sync_coalesce_wait_calls: AtomicU64,
+    /// Time blocked waiting for additional admitted groups before a sync.
+    pub wal_sync_coalesce_wait_ns: AtomicU64,
     /// Number of write operations profiled.
     pub op_count: AtomicU64,
     /// Per-fdatasync detail for paired WAL pipeline benchmarks.
@@ -245,6 +255,11 @@ impl WriteProfile {
         self.wal_commit_bytes.store(0, o);
         self.wal_commit_max_buffers.store(0, o);
         self.wal_commit_max_bytes.store(0, o);
+        self.wal_frontier_writes.store(0, o);
+        self.wal_frontier_bytes.store(0, o);
+        self.wal_frontier_write_ns.store(0, o);
+        self.wal_sync_coalesce_wait_calls.store(0, o);
+        self.wal_sync_coalesce_wait_ns.store(0, o);
         self.op_count.store(0, o);
     }
 
@@ -299,6 +314,11 @@ impl WriteProfile {
             wal_commit_bytes: self.wal_commit_bytes.load(o),
             wal_commit_max_buffers: self.wal_commit_max_buffers.load(o),
             wal_commit_max_bytes: self.wal_commit_max_bytes.load(o),
+            wal_frontier_writes: self.wal_frontier_writes.load(o),
+            wal_frontier_bytes: self.wal_frontier_bytes.load(o),
+            wal_frontier_write_ns: self.wal_frontier_write_ns.load(o),
+            wal_sync_coalesce_wait_calls: self.wal_sync_coalesce_wait_calls.load(o),
+            wal_sync_coalesce_wait_ns: self.wal_sync_coalesce_wait_ns.load(o),
             op_count: self.op_count.load(o),
         }
     }
@@ -313,6 +333,21 @@ impl WriteProfile {
         self.wal_commit_bytes.fetch_add(bytes, o);
         self.wal_commit_max_buffers.fetch_max(buffers, o);
         self.wal_commit_max_bytes.fetch_max(bytes, o);
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn record_wal_frontier_write(&self, bytes: u64, nanos: u64) {
+        let o = std::sync::atomic::Ordering::Relaxed;
+        self.wal_frontier_writes.fetch_add(1, o);
+        self.wal_frontier_bytes.fetch_add(bytes, o);
+        self.wal_frontier_write_ns.fetch_add(nanos, o);
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn record_wal_sync_coalesce_wait(&self, nanos: u64) {
+        let o = std::sync::atomic::Ordering::Relaxed;
+        self.wal_sync_coalesce_wait_calls.fetch_add(1, o);
+        self.wal_sync_coalesce_wait_ns.fetch_add(nanos, o);
     }
 
     #[cfg(feature = "bench")]
@@ -583,6 +618,11 @@ pub struct WriteProfileSnapshot {
     pub wal_commit_bytes: u64,
     pub wal_commit_max_buffers: u64,
     pub wal_commit_max_bytes: u64,
+    pub wal_frontier_writes: u64,
+    pub wal_frontier_bytes: u64,
+    pub wal_frontier_write_ns: u64,
+    pub wal_sync_coalesce_wait_calls: u64,
+    pub wal_sync_coalesce_wait_ns: u64,
     pub op_count: u64,
 }
 
@@ -696,6 +736,21 @@ impl WriteProfileSnapshot {
                 .saturating_sub(before.wal_commit_bytes),
             wal_commit_max_buffers: self.wal_commit_max_buffers,
             wal_commit_max_bytes: self.wal_commit_max_bytes,
+            wal_frontier_writes: self
+                .wal_frontier_writes
+                .saturating_sub(before.wal_frontier_writes),
+            wal_frontier_bytes: self
+                .wal_frontier_bytes
+                .saturating_sub(before.wal_frontier_bytes),
+            wal_frontier_write_ns: self
+                .wal_frontier_write_ns
+                .saturating_sub(before.wal_frontier_write_ns),
+            wal_sync_coalesce_wait_calls: self
+                .wal_sync_coalesce_wait_calls
+                .saturating_sub(before.wal_sync_coalesce_wait_calls),
+            wal_sync_coalesce_wait_ns: self
+                .wal_sync_coalesce_wait_ns
+                .saturating_sub(before.wal_sync_coalesce_wait_ns),
             op_count: self.op_count.saturating_sub(before.op_count),
         }
     }

@@ -1639,10 +1639,8 @@ runs fail before creating artifacts instead of crossing the 1 GiB segment cap
 or including rotation in the measurement. The five comparison
 legs, tmpfs and named-device requirements, coalescing controls, and reopen
 metrics below remain qualification requirements; this harness change records
-controls and metadata, not performance results.
-V7 rows explicitly mark legacy WAL runtime counters unavailable and omit the
-unimplemented pipeline diagnostics; sync/coalescing instrumentation must be
-added before those rows can supply qualification evidence.
+controls and metadata, not performance results. V7 pipeline diagnostics were
+added by the eighty-seventh Stage 8 slice below.
 
 The thirty-fourth Stage 8 slice verifies that a recovered Sealed v7 source
 remains read-only and has no attached WAL writer, scheduler, ring, or reservation
@@ -2166,6 +2164,16 @@ passed 1/1 outside the sandbox on Linux with host io_uring access.
   and `failpoint_v7_parallel_pitr_fallback_archive_restore` passed outside the
   sandbox on Linux with host io_uring access; `./dev check` passed all 1,945
   tests.
+- The eighty-seventh Stage 8 slice instruments v7 Leader and Parallel writes
+  for benchmark qualification. The `write-perf` pipeline now exposes commit
+  groups and DATA bytes, embedded FRONTIER count/bytes/write time, sync count
+  and latency, per-sync frontier coverage, and bounded coalescing receive-wait
+  count/time. V7 Leader attaches the shared write profile and records the same
+  single-group/one-frontier sync data as the Parallel runtime. V7 rows mark
+  runtime counters available when built with the `bench` feature. Detailed
+  sync-group totals and per-sync frontier coverage observations require running
+  with `--profile`. This enables measurement collection; it does not provide the
+  five required performance comparisons or adoption evidence.
 - Complete the correctness matrix below using the persistence model, real
   runtime injection, and process-level integration. Regress ordinary v4,
   strict v5/v6, TTL, recorded-time rollback/clamping, range deletion, OCC,

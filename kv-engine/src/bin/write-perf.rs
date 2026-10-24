@@ -153,7 +153,7 @@ impl WalRunInfo {
     }
 
     fn runtime_counters_available(self) -> bool {
-        matches!(self.format_version, 4..=6)
+        cfg!(feature = "bench") && matches!(self.format_version, 4..=7)
     }
 }
 
@@ -1000,6 +1000,11 @@ struct WalPipelineRecord {
     preallocation_ns: u64,
     fdatasync_ns: u64,
     wal_sync_wait_ns: u64,
+    frontier_writes: u64,
+    frontier_bytes: u64,
+    frontier_write_ns: u64,
+    sync_coalesce_wait_calls: u64,
+    sync_coalesce_wait_ns: u64,
     memtable_insert_ns: u64,
     wal_file_length_bytes: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1031,8 +1036,6 @@ fn wal_pipeline_record(
     detailed: bool,
     wal_run_info: WalRunInfo,
 ) -> Result<Option<WalPipelineRecord>> {
-    // V7 has no WriteProfile integration yet. Its zero-valued legacy counters
-    // must not be presented as measured pipeline activity.
     if !wal_run_info.runtime_counters_available() {
         return Ok(None);
     }
@@ -1062,6 +1065,11 @@ fn wal_pipeline_record(
         preallocation_ns: profile.wal_preallocation_ns,
         fdatasync_ns: profile.wal_fdatasync_ns,
         wal_sync_wait_ns: profile.wal_sync_ns,
+        frontier_writes: profile.wal_frontier_writes,
+        frontier_bytes: profile.wal_frontier_bytes,
+        frontier_write_ns: profile.wal_frontier_write_ns,
+        sync_coalesce_wait_calls: profile.wal_sync_coalesce_wait_calls,
+        sync_coalesce_wait_ns: profile.wal_sync_coalesce_wait_ns,
         memtable_insert_ns: profile.memtable_insert_ns,
         wal_file_length_bytes,
         wal_allocated_bytes,
@@ -3420,7 +3428,7 @@ fn run_wal_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
         if wal_run_info.runtime_counters_available() {
             print_write_profile(&engine, workload);
         } else {
-            eprintln!("{workload}: v7 WAL runtime counters and sync observations are unavailable");
+            eprintln!("{workload}: WAL runtime counters and sync observations are unavailable");
         }
     }
     // With PITR enabled the drain is skipped: a forced freeze rotates the active
@@ -3559,7 +3567,7 @@ fn run_wal_batch_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>
         if wal_run_info.runtime_counters_available() {
             print_write_profile(&engine, workload);
         } else {
-            eprintln!("{workload}: v7 WAL runtime counters and sync observations are unavailable");
+            eprintln!("{workload}: WAL runtime counters and sync observations are unavailable");
         }
     }
     if !cfg.pitr {
@@ -7685,8 +7693,16 @@ fn summary_for(record: &MeasurementRecord) -> String {
     if let Some(mode) = record.params.wal_io_mode {
         let _ = write!(summary, " wal_io={mode}");
     }
-    if record.params.wal_runtime_counters_available == Some(false) {
-        let _ = write!(summary, " wal_runtime_counters=unavailable");
+    if let Some(available) = record.params.wal_runtime_counters_available {
+        let _ = write!(
+            summary,
+            " wal_runtime_counters={}",
+            if available {
+                "available"
+            } else {
+                "unavailable"
+            }
+        );
     }
     if let Some(value_size) = record.params.value_size {
         let _ = write!(summary, " value={}B", value_size);
@@ -9713,11 +9729,19 @@ mod tests {
             MeasurementParams {
                 wal_format_version: Some(7),
                 wal_io_mode: Some("parallel"),
-                wal_runtime_counters_available: Some(false),
+                wal_runtime_counters_available: Some(cfg!(feature = "bench")),
                 ..MeasurementParams::default()
             },
             MeasurementResult {
                 measure_elapsed_ms: 1.0,
+                wal_pipeline: cfg!(feature = "bench").then(|| WalPipelineRecord {
+                    frontier_writes: 2,
+                    frontier_bytes: 8192,
+                    frontier_write_ns: 4500,
+                    sync_coalesce_wait_calls: 3,
+                    sync_coalesce_wait_ns: 9000,
+                    ..WalPipelineRecord::default()
+                }),
                 ..MeasurementResult::default()
             },
             MeasurementCounters::default(),
@@ -9727,18 +9751,35 @@ mod tests {
         assert_eq!(json["schema"], JSON_SCHEMA_V1);
         assert_eq!(json["params"]["wal_format_version"], 7);
         assert_eq!(json["params"]["wal_io_mode"], "parallel");
-        assert_eq!(json["params"]["wal_runtime_counters_available"], false);
-        assert!(json["result"].get("wal_pipeline").is_none());
+        assert_eq!(
+            json["params"]["wal_runtime_counters_available"],
+            cfg!(feature = "bench")
+        );
+        if cfg!(feature = "bench") {
+            assert_eq!(json["result"]["wal_pipeline"]["frontier_writes"], 2);
+            assert_eq!(json["result"]["wal_pipeline"]["frontier_bytes"], 8192);
+            assert_eq!(json["result"]["wal_pipeline"]["frontier_write_ns"], 4500);
+            assert_eq!(
+                json["result"]["wal_pipeline"]["sync_coalesce_wait_calls"],
+                3
+            );
+            assert_eq!(
+                json["result"]["wal_pipeline"]["sync_coalesce_wait_ns"],
+                9000
+            );
+        } else {
+            assert!(json["result"].get("wal_pipeline").is_none());
+        }
         assert!(
             measurement
                 .summary
                 .contains("wal_format=v7 wal_io=parallel")
         );
-        assert!(
-            measurement
-                .summary
-                .contains("wal_runtime_counters=unavailable")
-        );
+        assert!(measurement.summary.contains(if cfg!(feature = "bench") {
+            "wal_runtime_counters=available"
+        } else {
+            "wal_runtime_counters=unavailable"
+        }));
         assert!(json.get("phase").is_none());
         assert!(json.get("task").is_none());
         assert!(json.get("latency").is_none());

@@ -1946,7 +1946,18 @@ fn coalesce_admitted_prefix(inner: &RuntimeInner, completions: &Receiver<GroupWr
         let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
             return;
         };
-        match completions.recv_timeout(remaining) {
+        #[cfg(feature = "bench")]
+        let profile = inner.sync_progress.profile();
+        #[cfg(feature = "bench")]
+        let wait_started = profile.as_ref().map(|_| Instant::now());
+        let result = completions.recv_timeout(remaining);
+        #[cfg(feature = "bench")]
+        if let (Some(profile), Some(started)) = (profile, wait_started) {
+            profile.record_wal_sync_coalesce_wait(
+                started.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+            );
+        }
+        match result {
             Ok(result) => process_group_result(inner, result),
             Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => return,
         }
@@ -2204,8 +2215,19 @@ fn append_v7_frontier(
 
         preallocate_runtime(inner, preallocation_end)
             .context("preallocate v7 Parallel FRONTIER frame")?;
+        #[cfg(feature = "bench")]
+        let profile = inner.sync_progress.profile();
+        #[cfg(feature = "bench")]
+        let frontier_write_started = profile.as_ref().map(|_| Instant::now());
         write_v7_frontier_once(sync_file, frontier_bytes, reservation.frame_offset())
             .context("write v7 Parallel FRONTIER")?;
+        #[cfg(feature = "bench")]
+        if let (Some(profile), Some(started)) = (profile, frontier_write_started) {
+            profile.record_wal_frontier_write(
+                WAL_V7_FRAME_LEN as u64,
+                started.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+            );
+        }
 
         Ok(Some(WalV7FrontierCycle {
             reservation,
@@ -2631,6 +2653,41 @@ mod tests {
         };
 
         Ok(Some(V7RuntimeTestWal { wal, owner, anchor }))
+    }
+
+    #[cfg(feature = "bench")]
+    #[test]
+    fn v7_parallel_profile_records_frontier_and_sync() -> anyhow::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("profiled-v7-parallel.wal");
+        let Some(V7RuntimeTestWal { wal, .. }) =
+            live_v7_test_wal(&path, super::MAX_WAL_FILE_SIZE, v7_test_resource_limits())?
+        else {
+            return Ok(());
+        };
+        let profile = Arc::new(crate::mem_table::WriteProfile::default());
+        profile.set_wal_sync_diagnostics_enabled(true);
+        wal.set_write_profile(Arc::clone(&profile));
+
+        let (ticket, _) = wal.put_v7_batch_with_index(&v7_test_batch(1, 16), LIVE_WAL_V5_LIMITS)?;
+        wal.submit_and_commit(ticket)?;
+
+        let snapshot = profile.snapshot();
+        assert_eq!(snapshot.wal_commit_groups, 1);
+        assert_eq!(snapshot.wal_commit_buffers, 1);
+        assert!(snapshot.wal_commit_bytes >= super::WAL_V7_FRAME_LEN as u64);
+        assert_eq!(snapshot.wal_frontier_writes, 1);
+        assert_eq!(snapshot.wal_frontier_bytes, super::WAL_V7_FRAME_LEN as u64);
+        assert_eq!(snapshot.wal_sync_count, 1);
+        assert_eq!(snapshot.wal_sync_groups_total, 1);
+        let observations = profile.wal_sync_observations();
+        assert_eq!(observations.len(), 1);
+        assert_eq!(observations[0].captured_target, 1);
+        assert_eq!(observations[0].groups_covered, 1);
+        assert!(observations[0].succeeded);
+
+        wal.close()?;
+        Ok(())
     }
 
     #[cfg(feature = "chaos-testing")]
