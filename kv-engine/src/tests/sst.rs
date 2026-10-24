@@ -7,7 +7,9 @@ use crate::{
     cache::CacheAdmission,
     iterators::StorageIterator,
     key::{KeySlice, KeyVec},
-    table::{SsTable, SsTableBuilder, SsTableIterator, SsTableTtlMetadata},
+    range_tombstone::RangeTombstoneFragment,
+    table::{FileObject, SsTable, SsTableBuilder, SsTableIterator, SsTableTtlMetadata},
+    vlog::{KvKind, encode_ttl_value},
 };
 
 #[test]
@@ -38,6 +40,51 @@ fn test_sst_has_ttl_entries_detects_v8_metadata() {
     });
 
     assert!(sst.has_ttl_entries());
+}
+
+#[test]
+fn test_sst_v8_footer_decodes_range_tombstones_with_ttl_metadata() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("v8-range-ttl.sst");
+    let mut builder = SsTableBuilder::new(128);
+    builder
+        .add_with_ttl(
+            KeySlice::for_testing_from_slice_no_ts(b"ttl-key"),
+            &encode_ttl_value(KvKind::TtlInline, 3600, b"value"),
+        )
+        .unwrap();
+    builder.add_range_tombstones(vec![RangeTombstoneFragment {
+        start: Bytes::from_static(b"range-a"),
+        end: Bytes::from_static(b"range-z"),
+        covering_ts: vec![7],
+    }]);
+    let sst = builder.build_for_test(&path).unwrap();
+    drop(sst);
+
+    // The current builder emits v9. Remove the v9-only entry counters to
+    // recreate the v8 footer layout emitted by earlier releases.
+    let mut image = std::fs::read(&path).unwrap();
+    const V8_FOOTER_LEN: usize = 42;
+    const V9_FOOTER_LEN: usize = 58;
+    let v9_footer_start = image.len() - V9_FOOTER_LEN;
+    assert_eq!(image.last(), Some(&9));
+    let v9_footer = image[v9_footer_start..].to_vec();
+    let mut v8_footer = Vec::with_capacity(V8_FOOTER_LEN);
+    v8_footer.extend_from_slice(&v9_footer[..29]);
+    v8_footer.extend_from_slice(&v9_footer[45..]);
+    assert_eq!(v8_footer.len(), V8_FOOTER_LEN);
+    *v8_footer.last_mut().unwrap() = 8;
+    image.truncate(v9_footer_start);
+    image.extend_from_slice(&v8_footer);
+    std::fs::write(&path, image).unwrap();
+
+    let decoded = SsTable::open(0, None, FileObject::open(&path).unwrap()).unwrap();
+    assert!(decoded.has_ttl_entries());
+    let fragments = decoded.range_tombstone_fragments().unwrap();
+    assert_eq!(fragments.len(), 1);
+    assert_eq!(fragments[0].start, Bytes::from_static(b"range-a"));
+    assert_eq!(fragments[0].end, Bytes::from_static(b"range-z"));
+    assert_eq!(fragments[0].covering_ts, vec![7]);
 }
 
 #[test]

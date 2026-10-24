@@ -5829,6 +5829,8 @@ impl KvEngine {
 
         #[cfg(feature = "chaos-testing")]
         crate::chaos::failpoint::fail_point!("pitr.before_recovery_point_archive");
+        #[cfg(feature = "chaos-testing")]
+        crate::chaos::failpoint::wal_crash_point("pitr.before_recovery_point_archive");
         check_pitr_cancellation(cancellation)?;
         let archive = self.archive_pitr_segment_from_paths_cancellable(
             metadata,
@@ -5877,10 +5879,16 @@ impl KvEngine {
             }
         }
 
+        #[cfg(feature = "chaos-testing")]
+        crate::chaos::failpoint::wal_crash_point(
+            "pitr.after_archive_commit_before_archived_manifest",
+        );
         let archived = crate::pitr::manifest::PitrManifestRecord::SegmentArchived {
             segment_id: active_segment_id,
         };
         self.persist_pitr_lifecycle_record_from_current_state(archived)?;
+        #[cfg(feature = "chaos-testing")]
+        crate::chaos::failpoint::wal_crash_point("pitr.after_archived_manifest_before_reclaimable");
         source_reservation_owner.release_logical_after_archive(active_segment_id)?;
         {
             // Keep manager advancement atomic with the durable Reclaimable
@@ -5915,6 +5923,10 @@ impl KvEngine {
             #[cfg(feature = "chaos-testing")]
             crate::chaos::failpoint::fail_point!(
                 "pitr.after_reclaimable_manifest_before_bookkeeping"
+            );
+            #[cfg(feature = "chaos-testing")]
+            crate::chaos::failpoint::wal_crash_point(
+                "pitr.after_reclaimable_manifest_before_bookkeeping",
             );
             *segments = reclaimable_segments;
         }
@@ -28742,6 +28754,197 @@ mod tests {
             source_excludes_rejected_write,
             "source reopen found a write rejected past the cutoff"
         );
+
+        Ok(())
+    }
+
+    #[cfg(all(target_os = "linux", feature = "chaos-testing"))]
+    #[tokio::test(flavor = "current_thread")]
+    async fn failpoint_v7_async_recovery_point_cancellation_reconciles_sealed_source()
+    -> anyhow::Result<()> {
+        use std::{sync::mpsc, time::Duration};
+
+        let _scenario = crate::chaos::failpoint::FailScenario::setup();
+        let directory = tempdir()?;
+        let options = v7_recovery_test_database(directory.path())?;
+        let database = directory.path().join("db");
+        let repository_path = options
+            .pitr_repository
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("v7 fixture has no PITR repository"))?;
+        let engine = KvEngine::open_with_wal_io_mode(
+            &database,
+            options.clone(),
+            crate::wal::WalIoMode::Parallel,
+        )?;
+        suspend_pitr_maintenance_for_test(&engine);
+        engine.put(b"cancelled-point-baseline", b"kept")?;
+
+        let source = engine.inner.state.load().memtable.clone();
+        assert!(source.uses_v7_wal());
+        assert!(source.uses_parallel_wal());
+        let source_segment_id = LsmStorageInner::pitr_segment_of(&source)
+            .ok_or_else(|| anyhow::anyhow!("Active v7 fixture has no segment identity"))?;
+        let source_wal = source
+            .wal_path()
+            .ok_or_else(|| anyhow::anyhow!("Active v7 fixture has no WAL path"))?
+            .to_path_buf();
+        drop(source);
+
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let release_rx = parking_lot::Mutex::new(release_rx);
+        fail::cfg_callback("pitr.before_recovery_point_archive", move || {
+            entered_tx
+                .send(())
+                .expect("notify after the recovery-point source is sealed");
+            release_rx
+                .lock()
+                .recv_timeout(Duration::from_secs(5))
+                .expect("wait for recovery-point cancellation");
+        })
+        .map_err(anyhow::Error::msg)?;
+
+        let task = engine.create_recovery_point_async();
+        let cancellation = task.cancellation_handle();
+        tokio::task::spawn_blocking(move || entered_rx.recv_timeout(Duration::from_secs(5)))
+            .await??;
+        let sealed_state = engine.pitr_manifest_state.lock().clone();
+        assert_eq!(
+            sealed_state.obligations[&source_segment_id].state,
+            crate::pitr::manifest::ObligationState::Sealed
+        );
+        assert_eq!(sealed_state.active_segment_id, Some(source_segment_id + 1));
+        assert!(source_wal.is_file());
+        assert!(source_wal.with_extension("seal").is_file());
+        assert!(
+            engine
+                .inner
+                .mvcc
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("v7 fixture has no MVCC sequencer"))?
+                .commit_admission_is_open(),
+            "recovery-point admission should remain open while the sealed source is archived"
+        );
+
+        cancellation.cancel();
+        release_tx.send(())?;
+        let cancellation_error = task.await.expect_err("cancelled recovery point must fail");
+        fail::remove("pitr.before_recovery_point_archive");
+        assert!(
+            cancellation_error.to_string().contains("cancelled"),
+            "unexpected recovery-point cancellation result: {cancellation_error:#}"
+        );
+        let sequencer = engine
+            .inner
+            .mvcc
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("v7 fixture has no MVCC sequencer"))?;
+        assert!(
+            !sequencer.commit_admission_is_open(),
+            "cancellation with a sealed, unarchived source must keep admission stopped"
+        );
+        let cancelled_state = engine.pitr_manifest_state.lock().clone();
+        assert_eq!(
+            cancelled_state.obligations[&source_segment_id].state,
+            crate::pitr::manifest::ObligationState::Sealed
+        );
+        assert!(source_wal.is_file());
+        assert!(source_wal.with_extension("seal").is_file());
+
+        engine.close()?;
+        drop(engine);
+        let engine = KvEngine::open_with_wal_io_mode(
+            &database,
+            options.clone(),
+            crate::wal::WalIoMode::Parallel,
+        )?;
+        suspend_pitr_maintenance_for_test(&engine);
+        assert!(
+            engine
+                .inner
+                .mvcc
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("reopened v7 fixture has no MVCC sequencer"))?
+                .commit_admission_is_open()
+        );
+        engine.put(b"after-cancelled-point", b"resumed")?;
+        let point = match engine.create_recovery_point()? {
+            crate::pitr::api::RecoveryPointOutcome::Durable(point) => point,
+            crate::pitr::api::RecoveryPointOutcome::CommitPublishedButNotDurable {
+                error, ..
+            } => return Err(anyhow::Error::new(error)),
+            crate::pitr::api::RecoveryPointOutcome::PublicationUnknown { .. } => {
+                anyhow::bail!("recovery-point retry had an unknown publication outcome")
+            }
+        };
+        let point_commit_ts = point
+            .commit_ts
+            .ok_or_else(|| anyhow::anyhow!("recovery-point retry has no committed timestamp"))?;
+        assert_eq!(
+            engine.pitr_manifest_state.lock().obligations[&source_segment_id].state,
+            crate::pitr::manifest::ObligationState::Reclaimable,
+            "the retry did not archive the cancelled recovery-point source"
+        );
+        let status = engine.pitr_status(crate::pitr::api::PitrStatusOptions {
+            cursor: None,
+            page_size: crate::pitr::api::MAX_STATUS_PAGE_SIZE,
+        })?;
+        let interval = status
+            .recoverable_intervals
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("recovery-point retry produced no interval"))?;
+        let selector = crate::pitr::api::RecoverySelector {
+            timeline_id: interval.timeline_id,
+            archive_epoch_id: Some(interval.archive_epoch_id),
+            base_backup_id: None,
+        };
+
+        engine.close()?;
+        drop(engine);
+
+        let destination = directory.path().join("restored-after-cancel");
+        let repository = crate::backup::BackupRepository::open(&repository_path)?;
+        let restored_outcome = repository.restore_to(
+            crate::pitr::api::RecoveryTarget::CommitTs(point_commit_ts),
+            &destination,
+            crate::pitr::api::PitrRestoreOptions {
+                selector,
+                implementations: crate::pitr::api::ImplementationRegistry,
+                executor_threads: std::num::NonZeroUsize::new(1)
+                    .expect("one executor thread is nonzero"),
+                cache_capacity: 4096,
+                storage: LsmStorageOptions::default_for_test(),
+            },
+        )?;
+        drop(repository);
+        assert!(matches!(
+            restored_outcome,
+            crate::pitr::api::RestoreToOutcome::Restored(info)
+                if info.resolved_commit_ts == Some(point_commit_ts)
+        ));
+        let restored = KvEngine::open(&destination, LsmStorageOptions::default_for_test())?;
+        assert_eq!(
+            restored.get(b"cancelled-point-baseline")?,
+            Some(Bytes::from_static(b"kept"))
+        );
+        assert_eq!(
+            restored.get(b"after-cancelled-point")?,
+            Some(Bytes::from_static(b"resumed"))
+        );
+        restored.close_storage()?;
+
+        let reopened =
+            KvEngine::open_with_wal_io_mode(&database, options, crate::wal::WalIoMode::Parallel)?;
+        assert_eq!(
+            reopened.get(b"cancelled-point-baseline")?,
+            Some(Bytes::from_static(b"kept"))
+        );
+        assert_eq!(
+            reopened.get(b"after-cancelled-point")?,
+            Some(Bytes::from_static(b"resumed"))
+        );
+        reopened.close()?;
 
         Ok(())
     }

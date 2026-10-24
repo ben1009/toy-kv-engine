@@ -219,7 +219,7 @@ fn publish_v7_completion_marker(
 
 #[cfg(target_os = "linux")]
 fn run_v7_pitr_crash(
-    engine: &KvEngine,
+    engine: &std::sync::Arc<KvEngine>,
     args: &[String],
     wal_io_mode: WalIoMode,
 ) -> Result<(), String> {
@@ -277,6 +277,24 @@ fn run_v7_pitr_crash(
             }
             Err(error) => {
                 return Err(format!("empty-successor recovery point failed: {error:#}"));
+            }
+        }
+    }
+
+    if args.iter().any(|arg| arg == "--async-recovery-point") {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| format!("build async recovery-point crash runtime failed: {error}"))?;
+        match runtime.block_on(async { engine.create_recovery_point_async().await }) {
+            Ok(RecoveryPointOutcome::Durable(_)) => return Ok(()),
+            Ok(outcome) => {
+                return Err(format!(
+                    "async recovery point did not complete durably: {outcome:?}"
+                ));
+            }
+            Err(error) => {
+                return Err(format!("async recovery point failed: {error:#}"));
             }
         }
     }
@@ -502,6 +520,22 @@ fn run_v7_pitr_crash(
         runtime
             .block_on(engine.delete_async(key.as_bytes()))
             .map_err(|error| format!("post-sync async delete failed: {error:#}"))
+    } else if args.iter().any(|arg| arg == "--async-range-batch") {
+        let second_range_start = get_arg(args, "--second-range-start")
+            .ok_or("missing --second-range-start for async range batch")?;
+        let second_range_end = get_arg(args, "--second-range-end")
+            .ok_or("missing --second-range-end for async range batch")?;
+        let batch = [
+            WriteBatchRecord::DelRange(write_key, write_value),
+            WriteBatchRecord::DelRange(second_range_start, second_range_end),
+        ];
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| format!("build async range-batch crash runtime failed: {error}"))?;
+        runtime
+            .block_on(engine.write_batch_async(&batch))
+            .map_err(|error| format!("post-sync async range batch write failed: {error:#}"))
     } else if args.iter().any(|arg| arg == "--async-range-delete") {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
