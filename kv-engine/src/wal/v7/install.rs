@@ -1930,6 +1930,50 @@ mod tests {
     }
 
     #[test]
+    fn active_recovery_limit_preflight_preserves_the_source_inode() -> Result<()> {
+        let directory = TestDirectory::new()?;
+        let path = directory.0.join("active.wal");
+        let (header, anchor) = create_nonempty_image(&path)?;
+        let original = fs::read(&path)?;
+        let original_inode = fs::metadata(&path)?.ino();
+        let normalized_image_len = anchor.durable_end + FRAME_LEN_U64;
+
+        for (max_image_len, max_seal_index_bytes, expected_error) in [
+            (
+                normalized_image_len - 1,
+                u64::MAX,
+                "normalized Active v7 WAL exceeds the configured segment limit",
+            ),
+            (
+                MAX_WAL_FILE_SIZE,
+                0,
+                "normalized Active v7 seal index exceeds its configured limit",
+            ),
+        ] {
+            let error = recover_and_install_active_with_limits(
+                &path,
+                WalV7RecoveryAuthority::Active {
+                    predecessor: header.predecessor,
+                    durable_anchors: vec![anchor],
+                },
+                max_image_len,
+                max_seal_index_bytes,
+            )
+            .err()
+            .context("recovery must reject limits before replacing the Active WAL")?;
+
+            assert!(
+                error.to_string().contains(expected_error),
+                "recovery failed for an unexpected reason: {error:#}"
+            );
+            assert_eq!(fs::read(&path)?, original);
+            assert_eq!(fs::metadata(&path)?.ino(), original_inode);
+            assert_eq!(fs::read_dir(&directory.0)?.count(), 1);
+        }
+        Ok(())
+    }
+
+    #[test]
     fn active_recovery_round_trips_frontier_shaped_value_without_discovering_it() -> Result<()> {
         let directory = TestDirectory::new()?;
         let path = directory.0.join("frontier-shaped-value.wal");
@@ -2421,9 +2465,11 @@ mod tests {
     fn sealing_recovery_rejects_corruption_without_mutating_the_source() -> Result<()> {
         let directory = TestDirectory::new()?;
         let path = directory.0.join("active.wal");
-        let (header, boundary) = create_sealing_image(&path)?;
+        let (header, mut boundary) = create_sealing_image(&path)?;
         let mut corrupted = fs::read(&path)?;
         corrupted[2 * WAL_V7_FRAME_LEN + 64] ^= 1;
+        boundary.wal_digest = Sha256::digest(&corrupted).into();
+        let original_inode = fs::metadata(&path)?.ino();
         fs::write(&path, &corrupted)?;
 
         assert!(
@@ -2437,6 +2483,8 @@ mod tests {
             .is_err()
         );
         assert_eq!(fs::read(&path)?, corrupted);
+        assert_eq!(fs::metadata(&path)?.ino(), original_inode);
+        assert_eq!(fs::read_dir(&directory.0)?.count(), 1);
         Ok(())
     }
 

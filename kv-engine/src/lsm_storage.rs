@@ -19871,23 +19871,42 @@ mod tests {
         suspend_pitr_maintenance_for_test(&engine);
         engine.put(b"before-resume", b"value")?;
 
-        let state = engine.pitr_manifest_state.lock().clone();
-        let active = engine.inner.state.load().memtable.clone();
-        assert!(active.uses_wal_v5());
-        let active_segment_id = state.active_segment_id.unwrap();
-        let database_path = active.wal_path().unwrap().parent().unwrap().to_path_buf();
+        let original_active = engine.inner.state.load().memtable.clone();
+        assert!(original_active.uses_wal_v5());
+        let active_segment_id = engine.pitr_manifest_state.lock().active_segment_id.unwrap();
+        let database_path = original_active
+            .wal_path()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_path_buf();
         let retained_source_path =
             database_path.join(format!("pitr-{:020}.seal", active_segment_id + 100));
         write_random_file(&retained_source_path, 6 * 1024 * 1024, 10)?;
+        drop(original_active);
+        engine.close_storage()?;
+        drop(engine);
+
+        let repository_path = dir.path().join("repository");
+        let engine = KvEngine::open(
+            &database_path,
+            LsmStorageOptions {
+                enable_wal: true,
+                pitr_repository: Some(repository_path.clone()),
+                ..LsmStorageOptions::default_for_test()
+            },
+        )?;
+        suspend_pitr_maintenance_for_test(&engine);
+        let state = engine.pitr_manifest_state.lock().clone();
+        let active = engine.inner.state.load().memtable.clone();
+        assert!(active.uses_wal_v5());
+        assert_eq!(state.active_segment_id, Some(active_segment_id));
 
         let mut reports = Vec::new();
         assert!(matches!(
-            engine.resume_pitr_with_report_sink(
-                dir.path().join("repository"),
-                |level, message| {
-                    reports.push((level, message));
-                }
-            )?,
+            engine.resume_pitr_with_report_sink(repository_path.clone(), |level, message| {
+                reports.push((level, message));
+            })?,
             crate::pitr::api::PitrResumeOutcome::Resumed
         ));
 
@@ -19938,8 +19957,47 @@ mod tests {
             status.active_wal_format_version
         )));
 
+        assert!(matches!(
+            engine.create_recovery_point()?,
+            crate::pitr::api::RecoveryPointOutcome::Durable(_)
+        ));
+        let rotated_status = engine.pitr_status(crate::pitr::api::PitrStatusOptions {
+            cursor: None,
+            page_size: crate::pitr::api::MAX_STATUS_PAGE_SIZE,
+        })?;
+        assert_eq!(
+            engine.pitr_manifest_state.lock().active_segment_id,
+            Some(active_segment_id + 1)
+        );
+        assert_eq!(
+            rotated_status.active_wal_format_version,
+            Some(crate::pitr::WAL_V5_VERSION),
+            "capacity deferral must retain ordinary legacy successor rotation"
+        );
+        assert_eq!(
+            rotated_status.active_wal_io_mode,
+            Some(crate::pitr::api::PitrWalIoMode::Leader)
+        );
+
         engine.put(b"after-resume", b"value")?;
+        assert!(engine.inner.state.load().memtable.uses_wal_v5());
         std::fs::remove_file(retained_source_path)?;
+
+        assert!(matches!(
+            engine.resume_pitr(&repository_path)?,
+            crate::pitr::api::PitrResumeOutcome::Resumed
+        ));
+        let migrated_status = engine.pitr_status(crate::pitr::api::PitrStatusOptions {
+            cursor: None,
+            page_size: crate::pitr::api::MAX_STATUS_PAGE_SIZE,
+        })?;
+        assert!(engine.inner.state.load().memtable.uses_v7_wal());
+        assert_eq!(migrated_status.active_wal_format_version, Some(7));
+        assert_eq!(
+            migrated_status.active_wal_io_mode,
+            Some(crate::pitr::api::PitrWalIoMode::Parallel)
+        );
+        engine.put(b"after-capacity-returns", b"value")?;
         engine.close_storage()?;
         Ok(())
     }
