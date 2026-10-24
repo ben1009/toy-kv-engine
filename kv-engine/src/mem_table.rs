@@ -3477,7 +3477,8 @@ mod tests {
         mvcc::{BatchEntryKind, LsmMvccInner},
         pitr::{
             ArchiveEpochId, ChainAnchor, LIVE_WAL_V5_LIMITS, RecordedAt, SegmentId, TimelineId,
-            WalBatch, WalEntry, manifest::ActiveBoundary,
+            WalBatch, WalEntry,
+            manifest::{ActiveBoundary, ImmutableBoundary},
         },
         wal::WalIoMode,
         wal::v7::{
@@ -3485,7 +3486,10 @@ mod tests {
             codec::{
                 WAL_V7_FRAME_LEN, WAL_V7_HEADER_LEN, WalV7Header, encode_generation_zero_frontier,
             },
-            install::{WalV7InstalledRecovery, recover_and_install_active},
+            install::{
+                WalV7InstalledRecovery, recover_and_install_active,
+                recover_sealing_active_with_limits,
+            },
             recovery::WalV7RecoveryAuthority,
         },
     };
@@ -3596,6 +3600,63 @@ mod tests {
         wal.close()?;
         assert_eq!(fs::metadata(&path)?.len(), 2 * WAL_V7_FRAME_LEN as u64);
         assert_eq!(fs::read(&path)?, original_image);
+
+        Ok(())
+    }
+
+    #[test]
+    fn v7_sealing_source_keeps_the_frozen_image_without_starting_a_wal_runtime() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("sealing-source.wal");
+        let active = install_empty_v7(&path)?;
+        let predecessor = ChainAnchor::Genesis {
+            archive_epoch_id: ArchiveEpochId(active.active_boundary.archive_epoch_id),
+        };
+        let immutable_boundary = ImmutableBoundary {
+            active: active.active_boundary,
+            sealed_end: active.image_len,
+            terminal_frontier_digest: active.frontier_digest,
+            wal_digest: active.image_digest(),
+        };
+        let expected_image = fs::read(&path)?;
+
+        let sealing = recover_sealing_active_with_limits(
+            &path,
+            predecessor,
+            immutable_boundary,
+            TEST_V7_MAX_FILE_SIZE,
+            u64::MAX,
+        )?;
+        assert_eq!(sealing.installed.image_len, immutable_boundary.sealed_end);
+        assert_eq!(fs::read(&path)?, expected_image);
+
+        let ledger = WalV7ResourceLedger::new(WalV7ResourceLimits {
+            max_logical_wal_bytes: u64::MAX,
+            max_source_spool_bytes: u64::MAX,
+            max_recovery_workspace_bytes: u64::MAX,
+            max_buffer_memory_bytes: u64::MAX,
+            max_seal_index_bytes: u64::MAX,
+        })?;
+        let owner = Arc::new(WalV7ReservationOwner::new(ledger, &sealing.installed)?);
+        let (memtable, _) = MemTable::recover_from_v7_sealing_source(
+            7,
+            false,
+            &path,
+            sealing.installed,
+            Arc::clone(&owner),
+        )?;
+
+        assert!(
+            memtable.wal.is_none(),
+            "a frozen Sealing source has no WAL runtime"
+        );
+        let retained_owner = memtable
+            .wal_v7_reservation_owner()
+            .expect("the frozen Sealing source retains its resource owner");
+        assert!(Arc::ptr_eq(&retained_owner, &owner));
+        assert_eq!(memtable.wal_path.as_deref(), Some(path.as_path()));
+        assert_eq!(fs::metadata(&path)?.len(), immutable_boundary.sealed_end);
+        assert_eq!(fs::read(&path)?, expected_image);
 
         Ok(())
     }
