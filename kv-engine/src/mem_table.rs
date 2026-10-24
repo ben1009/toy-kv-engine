@@ -3486,13 +3486,13 @@ mod tests {
             codec::{
                 WAL_V7_FRAME_LEN, WAL_V7_HEADER_LEN, WalV7Header, encode_generation_zero_frontier,
             },
-            install::{
-                WalV7InstalledRecovery, recover_and_install_active,
-                recover_sealing_active_with_limits,
-            },
+            install::{WalV7InstalledRecovery, recover_and_install_active},
             recovery::WalV7RecoveryAuthority,
         },
     };
+
+    #[cfg(target_os = "linux")]
+    use crate::wal::v7::install::recover_sealing_active_with_limits;
 
     #[cfg(target_os = "linux")]
     use crate::wal::v7::admission::{WalV7ResourceCharge, WalV7RetainedResources};
@@ -3604,6 +3604,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn v7_sealing_source_keeps_the_frozen_image_without_starting_a_wal_runtime() -> Result<()> {
         let directory = tempfile::tempdir()?;
