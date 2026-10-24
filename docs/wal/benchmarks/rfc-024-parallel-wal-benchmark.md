@@ -635,13 +635,13 @@ size and rejects runs that cannot fit within the 1 GiB WAL limit before creating
 the database or repository; reduce `--num` or `--value-size`, or use the batch
 workload when a larger run exceeds that bound.
 
-V7 runtime diagnostics are not instrumented yet. Those rows set
-`params.wal_runtime_counters_available` to `false`, omit `result.wal_pipeline`,
-and report the limitation when `--profile` is selected. The four legacy
-`counters.wal_commit_*` fields are placeholders in v7 rows and must not be used
-as measurements. V4/v6 retain their existing counters and optional pipeline
-diagnostics. V7 sync/coalescing instrumentation remains required for performance
-qualification.
+V7 rows now report runtime commit-group, DATA-byte, embedded FRONTIER write,
+sync-count/latency, per-sync frontier coverage, and bounded coalescing receive-
+wait counters in `result.wal_pipeline` when built with benchmark profiling. The
+legacy `counters.wal_commit_*` fields are populated for v7 too. These diagnostics
+make runs inspectable; they do not qualify v7 performance. The five comparison
+legs, required devices/workloads, archive controls, and recovery measurements
+below remain open.
 
 ```text
 ./target/release/write-perf --bench wal_concurrent --pitr --pitr-format v6 \

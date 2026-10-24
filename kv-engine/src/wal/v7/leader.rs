@@ -18,6 +18,9 @@ use std::{
     sync::Arc,
 };
 
+#[cfg(feature = "bench")]
+use std::time::Instant;
+
 use anyhow::{Context, Result, ensure};
 use sha2::{Digest, Sha256};
 
@@ -83,6 +86,8 @@ pub(crate) struct WalV7LeaderWriter {
     allocator: WalV7PhysicalAllocator,
     metadata: WalV7RuntimeMetadata,
     reservation_owner: Arc<WalV7ReservationOwner>,
+    #[cfg(feature = "bench")]
+    profile: Option<Arc<crate::mem_table::WriteProfile>>,
     poisoned: bool,
 }
 
@@ -168,8 +173,15 @@ impl WalV7LeaderWriter {
             allocator,
             metadata: seed.metadata,
             reservation_owner,
+            #[cfg(feature = "bench")]
+            profile: None,
             poisoned: false,
         })
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn set_write_profile(&mut self, profile: Arc<crate::mem_table::WriteProfile>) {
+        self.profile = Some(profile);
     }
 
     /// Write and durably publish one ticketed batch using one WAL sync.
@@ -418,13 +430,44 @@ impl WalV7LeaderWriter {
             .context("write v7 Leader DATA frames")?;
             #[cfg(feature = "chaos-testing")]
             crate::chaos::failpoint::fail_point!("wal.v7.leader.after_data_write");
+            #[cfg(feature = "bench")]
+            let frontier_write_started = self.profile.as_ref().map(|_| Instant::now());
             write_frontier_once(
                 &self.write_file,
                 frontier_buffer.initialized_slice(0, WAL_V7_FRAME_LEN),
                 reservation.frame_offset(),
             )
             .context("write v7 Leader FRONTIER")?;
-            fdatasync_once(&self.sync_file).context("fdatasync v7 Leader WAL")?;
+            #[cfg(feature = "bench")]
+            if let (Some(profile), Some(started)) = (&self.profile, frontier_write_started) {
+                profile.record_wal_commit_group(1, encoded_len as u64);
+                profile.record_wal_inflight_groups(1);
+                profile.record_wal_frontier_write(
+                    WAL_V7_FRAME_LEN as u64,
+                    started.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+                );
+            }
+            #[cfg(feature = "bench")]
+            let sync_started = self.profile.as_ref().map(|_| Instant::now());
+            let sync_result = fdatasync_once(&self.sync_file);
+            #[cfg(feature = "bench")]
+            if let (Some(profile), Some(started)) = (&self.profile, sync_started) {
+                let duration_ns = started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+                profile.record_wal_sync(1);
+                profile.record_wal_fdatasync_ns(duration_ns);
+                if profile.wal_sync_diagnostics_enabled() {
+                    profile.record_wal_sync_observation(crate::mem_table::WalSyncObservation {
+                        captured_target: ticket_end,
+                        written_frontier_start: previous_cursor.frontier.ticket_end,
+                        written_frontier_end: ticket_end,
+                        groups_covered: 1,
+                        duration_ns,
+                        succeeded: sync_result.is_ok(),
+                        ..crate::mem_table::WalSyncObservation::default()
+                    });
+                }
+            }
+            sync_result.context("fdatasync v7 Leader WAL")?;
             #[cfg(feature = "chaos-testing")]
             crate::chaos::failpoint::wal_crash_point(
                 "wal_v7.leader.after_fdatasync_before_publish",
@@ -1046,6 +1089,43 @@ mod tests {
         assert_eq!(recovered.next_ticket, 3);
         assert_eq!(recovered.batches.last(), Some(&third));
 
+        Ok(())
+    }
+
+    #[cfg(feature = "bench")]
+    #[test]
+    fn wal_adapter_profiles_v7_leader_frontier_and_sync() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("active.wal");
+        let installed = install_empty(&path)?;
+        let writer = open_writer(&path, &installed, MAX_WAL_FILE_SIZE)?;
+        let wal = Wal::from_v7_leader(writer)?;
+        let profile = Arc::new(crate::mem_table::WriteProfile::default());
+        profile.set_wal_sync_diagnostics_enabled(true);
+        wal.set_write_profile(Arc::clone(&profile));
+
+        let first = batch(10, 100, 4);
+        assert_eq!(wal.put_v5_batch(&first, LIVE_WAL_V5_LIMITS, None)?, 0);
+        wal.submit_and_commit(0)?;
+
+        let snapshot = profile.snapshot();
+        assert_eq!(snapshot.wal_commit_groups, 1);
+        assert_eq!(snapshot.wal_commit_solo_groups, 1);
+        assert_eq!(snapshot.wal_commit_buffers, 1);
+        assert_eq!(snapshot.wal_commit_bytes, WAL_V7_FRAME_LEN as u64);
+        assert_eq!(snapshot.wal_frontier_writes, 1);
+        assert_eq!(snapshot.wal_frontier_bytes, WAL_V7_FRAME_LEN as u64);
+        assert_eq!(snapshot.wal_sync_count, 1);
+        assert_eq!(snapshot.wal_sync_groups_total, 1);
+        let observations = profile.wal_sync_observations();
+        assert_eq!(observations.len(), 1);
+        assert_eq!(observations[0].captured_target, 1);
+        assert_eq!(observations[0].written_frontier_start, 0);
+        assert_eq!(observations[0].written_frontier_end, 1);
+        assert_eq!(observations[0].groups_covered, 1);
+        assert!(observations[0].succeeded);
+
+        wal.close()?;
         Ok(())
     }
 

@@ -1598,7 +1598,11 @@ impl Wal {
 
     pub(crate) fn set_write_profile(&self, profile: Arc<crate::mem_table::WriteProfile>) {
         if let Some(runtime) = &self.parallel_runtime {
-            runtime.set_write_profile(profile);
+            runtime.set_write_profile(Arc::clone(&profile));
+        }
+        #[cfg(feature = "bench")]
+        if let Some(writer) = &self.v7_leader {
+            writer.lock().set_write_profile(profile);
         }
     }
 
