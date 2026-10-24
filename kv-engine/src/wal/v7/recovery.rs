@@ -1273,7 +1273,7 @@ fn frontier_candidate(
 
 #[cfg(test)]
 mod tests {
-    use std::io::{self, Cursor, Read, Seek, SeekFrom};
+    use std::io::{self, Cursor, Read, Seek, SeekFrom, Write};
 
     use anyhow::Result;
     use sha2::{Digest, Sha256};
@@ -1915,6 +1915,153 @@ mod tests {
     }
 
     #[test]
+    fn immutable_recovery_rejects_covered_data_corruption_without_fallback() -> Result<()> {
+        let (mut image, _, active) = two_batch_image()?;
+        let terminal_offset = u64::try_from(image.len())? - FRAME_LEN_U64;
+        let terminal = discover_image(&image)?
+            .candidates
+            .into_iter()
+            .find(|candidate| candidate.frame_offset == terminal_offset)
+            .context("test image has no terminal candidate")?;
+        let second_data_offset = terminal_offset - FRAME_LEN_U64;
+
+        // Leave both the terminal FRONTIER and the immutable whole-image digest
+        // structurally valid. Only the DATA it certifies is corrupt, so the
+        // earlier frontier remains a tempting but unauthorized fallback.
+        image[usize::try_from(second_data_offset)? + 64] ^= 0x01;
+        let boundary = ImmutableBoundary {
+            active,
+            sealed_end: u64::try_from(image.len())?,
+            terminal_frontier_digest: terminal.frame_digest,
+            wal_digest: Sha256::digest(&image).into(),
+        };
+        let discovery = discover_image(&image)?;
+        assert!(
+            discovery
+                .candidates
+                .iter()
+                .any(|candidate| candidate.frame_offset == terminal_offset),
+            "the terminal marker remains structurally valid"
+        );
+
+        let mut verification_reader = Cursor::new(image.as_slice());
+        let verification = verify_frontier_candidate_prefixes(
+            &mut verification_reader,
+            u64::try_from(image.len())?,
+            &discovery.candidates,
+        )?;
+        assert!(
+            verification
+                .verified_candidates
+                .iter()
+                .any(|candidate| candidate.frontier.ticket_end == 1),
+            "the older immutable prefix remains independently valid"
+        );
+        assert!(
+            !verification
+                .verified_candidates
+                .iter()
+                .any(|candidate| candidate.frame_offset == terminal_offset),
+            "corrupt covered DATA invalidates the terminal candidate"
+        );
+
+        for authority in [
+            WalV7RecoveryAuthority::Sealing {
+                predecessor: test_header().predecessor,
+                boundary,
+            },
+            WalV7RecoveryAuthority::Sealed {
+                predecessor: test_header().predecessor,
+                boundary,
+            },
+        ] {
+            let mut reader = Cursor::new(image.as_slice());
+            let error = select_recovery_candidate(
+                &mut reader,
+                u64::try_from(image.len())?,
+                &discovery,
+                authority,
+            )
+            .expect_err(
+                "immutable recovery must reject corrupt covered DATA instead of falling back",
+            );
+            assert!(
+                error.to_string().contains("verified physical prefix"),
+                "immutable recovery failed for an unexpected reason: {error:#}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn immutable_recovery_rejects_uncovered_tail_inside_sealed_boundary() -> Result<()> {
+        let (mut image, _, active) = two_batch_image()?;
+        let header_digest = test_header().digest()?;
+        let old_terminal_offset = u64::try_from(image.len())? - FRAME_LEN_U64;
+        let old_terminal = discover_image(&image)?
+            .candidates
+            .into_iter()
+            .find(|candidate| candidate.frame_offset == old_terminal_offset)
+            .context("test image has no terminal candidate")?;
+
+        let trailing_data_offset = u64::try_from(image.len())?;
+        append_data_batch(
+            &mut image,
+            trailing_data_offset,
+            header_digest,
+            2,
+            30,
+            102,
+            b"uncovered-tail",
+        )?;
+        let boundary = ImmutableBoundary {
+            active,
+            sealed_end: u64::try_from(image.len())?,
+            terminal_frontier_digest: old_terminal.frame_digest,
+            wal_digest: Sha256::digest(&image).into(),
+        };
+        let discovery = discover_image(&image)?;
+        let mut verification_reader = Cursor::new(image.as_slice());
+        let verification = verify_frontier_candidate_prefixes(
+            &mut verification_reader,
+            u64::try_from(image.len())?,
+            &discovery.candidates,
+        )?;
+        assert!(
+            verification
+                .verified_candidates
+                .iter()
+                .any(|candidate| candidate.frame_offset == old_terminal_offset),
+            "the earlier frontier remains valid for Active recovery"
+        );
+
+        for authority in [
+            WalV7RecoveryAuthority::Sealing {
+                predecessor: test_header().predecessor,
+                boundary,
+            },
+            WalV7RecoveryAuthority::Sealed {
+                predecessor: test_header().predecessor,
+                boundary,
+            },
+        ] {
+            let mut reader = Cursor::new(image.as_slice());
+            let error = select_recovery_candidate(
+                &mut reader,
+                u64::try_from(image.len())?,
+                &discovery,
+                authority,
+            )
+            .expect_err("immutable recovery must reject uncovered DATA inside its fixed image");
+            assert!(
+                error.to_string().contains("terminal FRONTIER"),
+                "immutable recovery failed for an unexpected reason: {error:#}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn immutable_recovery_accepts_the_generation_zero_empty_image() -> Result<()> {
         let TestWalImage {
             image,
@@ -2393,6 +2540,53 @@ mod tests {
         assert_eq!(discovery.scanned_frame_count, 7);
         assert_eq!(discovery.incomplete_tail_bytes, 5);
 
+        Ok(())
+    }
+
+    #[test]
+    fn discovery_finds_frontier_after_a_sparse_hole() -> Result<()> {
+        let TestWalImage {
+            mut image,
+            header_digest,
+            frontier_zero,
+            frontier_zero_digest,
+        } = test_image()?;
+        let frontier_offset = 256 * FRAME_LEN_U64;
+        append_successor(
+            &mut image,
+            header_digest,
+            SuccessorSpec {
+                previous: frontier_zero,
+                previous_offset: HEADER_LEN_U64,
+                previous_digest: frontier_zero_digest,
+                frame_offset: frontier_offset,
+                ticket_end: 1,
+                durable_end: HEADER_LEN_U64 + FRAME_LEN_U64,
+                last_commit_ts: 1,
+                prefix_digest: [1; 32],
+            },
+        )?;
+        let mut file = tempfile::tempfile()?;
+        file.set_len(frontier_offset + FRAME_LEN_U64)?;
+        file.seek(SeekFrom::Start(0))?;
+        file.write_all(&image[..usize::try_from(HEADER_LEN_U64 + FRAME_LEN_U64)?])?;
+        file.seek(SeekFrom::Start(frontier_offset))?;
+        let frontier_start = usize::try_from(frontier_offset)?;
+        let frontier_end = frontier_start + WAL_V7_FRAME_LEN;
+        file.write_all(&image[frontier_start..frontier_end])?;
+        let file_len = file.metadata()?.len();
+
+        let discovery = discover_frontier_candidates(&mut file, file_len, &header_digest)?;
+
+        assert_eq!(
+            discovery
+                .candidates
+                .iter()
+                .map(|candidate| candidate.frame_offset)
+                .collect::<Vec<_>>(),
+            [frontier_offset, HEADER_LEN_U64]
+        );
+        assert_eq!(discovery.scanned_frame_count, 256);
         Ok(())
     }
 
