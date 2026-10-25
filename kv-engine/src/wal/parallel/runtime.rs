@@ -54,9 +54,11 @@ const EXTENT_INITIALIZATION_CHUNK: usize = 128 * 1024;
 const ALLOCATION_ONLY_MIN_BATCH_BYTES: usize = 64 * 1024;
 // Coalesce already-admitted tickets with one fixed deadline. Refresh the
 // batching cutoff only when the written prefix catches it; a refresh cannot
-// extend the deadline. Skip the wait when the prior sync was cheap.
+// extend the deadline. V4 skips waiting after cheap syncs; v7 uses a shorter
+// wait because each durability advance also writes a FRONTIER frame.
 const SYNC_COALESCE_WAIT: Duration = Duration::from_micros(400);
 const SYNC_COALESCE_MIN_SYNC: Duration = Duration::from_micros(100);
+const V7_FAST_SYNC_COALESCE_WAIT: Duration = Duration::from_micros(100);
 
 #[derive(Debug)]
 pub(crate) struct WalFull;
@@ -1926,14 +1928,20 @@ fn run_sync_coordinator(
     inner: Arc<RuntimeInner>,
 ) -> Result<()> {
     let mut last_sync_latency = None;
+    let v7_layout = inner.admission.lock().v7_allocator.is_some();
 
     while let Ok(result) = completions.recv() {
         process_group_result(&inner, result);
         #[cfg(all(test, feature = "chaos-testing"))]
         crate::chaos::failpoint::before_parallel_wal_result_drain();
         drain_ready_results(&inner, &completions);
-        if last_sync_latency.is_some_and(|latency| latency >= SYNC_COALESCE_MIN_SYNC) {
-            coalesce_admitted_prefix(&inner, &completions);
+        let coalesce_wait = match last_sync_latency {
+            Some(latency) if latency >= SYNC_COALESCE_MIN_SYNC => Some(SYNC_COALESCE_WAIT),
+            Some(_) if v7_layout => Some(V7_FAST_SYNC_COALESCE_WAIT),
+            _ => None,
+        };
+        if let Some(wait) = coalesce_wait {
+            coalesce_admitted_prefix(&inner, &completions, wait);
             // Coalescing may return at its captured admission cutoff while
             // later groups have already completed. Include the results that
             // are queued now before capturing the next durability target.
@@ -1954,7 +1962,11 @@ fn run_sync_coordinator(
     Ok(())
 }
 
-fn coalesce_admitted_prefix(inner: &RuntimeInner, completions: &Receiver<GroupWriteResult>) {
+fn coalesce_admitted_prefix(
+    inner: &RuntimeInner,
+    completions: &Receiver<GroupWriteResult>,
+    wait: Duration,
+) {
     {
         let state = inner.durability.state.lock();
         if state.poison_ticket.is_some() || state.written_frontier <= state.durable_frontier {
@@ -1962,7 +1974,7 @@ fn coalesce_admitted_prefix(inner: &RuntimeInner, completions: &Receiver<GroupWr
         }
     }
 
-    let deadline = Instant::now() + SYNC_COALESCE_WAIT;
+    let deadline = Instant::now() + wait;
     let mut cutoff = inner.admission.lock().next_ticket;
     loop {
         let state = inner.durability.state.lock();
