@@ -6,4 +6,7 @@
 "FPR"="FPR"
 "RTO"="RTO"
 
+[default.extend-identifiers]
+"FiFoQueues"="FiFoQueues" # Preserve TinyUFO's type name in CPU profiles.
+
 [files]

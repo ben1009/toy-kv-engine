@@ -2504,6 +2504,16 @@ references and below the earlier retained v7 highs. All 120 scored records,
 24 warmups, three unscored profiles, source patch, and hashes remain available.
 V4 parity and the Stage 8 gate remain unmet.
 
+The [maintenance-state clone experiment](benchmarks/rfc-025-v7-maintenance-snapshot-20261025.md)
+is rejected and reverted. Borrowing scheduling coordinates and checking pending
+obligations in place improves ext4 point throughput 1.2% raw and 1.0% normalized
+across ten pairs, with 3.2% less CPU. However, ten ext4 batch64 pairs lose 5.8%
+raw throughput and 3.8% normalized, with 3.6% more CPU. The batch guard prevents
+retention; no claim of uniform improvement follows from the point result.
+The eleven earlier optimizations remain. All 140 scored records, 28 warmups,
+three unscored profiles, rejected source patch, and hashes are preserved.
+V4 parity and the Stage 8 gate remain unmet.
+
 ## Delivery checklist
 
 - [ ] Stages 1–3: legacy compatibility, byte-exact codec, independent validation,

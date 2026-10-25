@@ -1,0 +1,43 @@
+diff --git a/kv-engine/src/lsm_storage.rs b/kv-engine/src/lsm_storage.rs
+--- a/kv-engine/src/lsm_storage.rs
++++ b/kv-engine/src/lsm_storage.rs
+@@ -16013,0 +16014,7 @@
++        Self::pitr_state_needs_reconciliation(state, &self.state.load())
++    }
++
++    fn pitr_state_needs_reconciliation(
++        state: &crate::pitr::manifest::PitrState,
++        storage_state: &LsmStorageState,
++    ) -> bool {
+@@ -16019 +16025,0 @@
+-        let storage_state = self.state.load();
+@@ -16034 +16040 @@
+-        let state = self.pitr_state.lock().clone();
++        let state = self.pitr_state.lock();
+@@ -16046 +16052,10 @@
+-        let memtable = self.state.load().memtable.clone();
++        let archive_interval_ms = config.archive_interval_ms;
++        let max_segment_bytes = config.max_segment_bytes;
++        let active_segment_id = state.active_segment_id;
++        // Inspect obligations in place instead of cloning the persisted state
++        // on every commit. Keep the storage snapshot alive after releasing
++        // the PITR mutex, before querying the WAL, timer, or background runtime.
++        let storage_state = self.state.load();
++        let has_pending_obligation = Self::pitr_state_needs_reconciliation(&state, &storage_state);
++        drop(state);
++        let memtable = &storage_state.memtable;
+@@ -16050 +16064,0 @@
+-        let has_pending_obligation = self.pitr_maintenance_needs_reconciliation(&state);
+@@ -16059,2 +16073 @@
+-            now.saturating_duration_since(started)
+-                >= Duration::from_millis(config.archive_interval_ms)
++            now.saturating_duration_since(started) >= Duration::from_millis(archive_interval_ms)
+@@ -16062,2 +16075,2 @@
+-        let size_due = check_size
+-            && (logical_length >= config.max_segment_bytes || memtable.pitr_rotation_needed());
++        let size_due =
++            check_size && (logical_length >= max_segment_bytes || memtable.pitr_rotation_needed());
+@@ -16086,2 +16099 @@
+-                        state
+-                            .active_segment_id
++                        active_segment_id

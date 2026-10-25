@@ -1,0 +1,301 @@
+# To display the perf.data header info, please use --header/--header-only options.
+#
+#
+# Total Lost Samples: 0
+#
+# Samples: 1K of event 'cpu-clock:u'
+# Event count (approx.): 1996990919
+#
+# Children      Self  Command          Shared Object                          Symbol
+# ........  ........  ...............  .....................................  ...........................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................
+#
+    10.30%     9.94%  wal-sync-coordi  write-perf-v7-validated-logical-batch  [.] <crossbeam_channel::flavors::list::Channel<kv_engine::wal::parallel_worker::GroupWriteResult>>::recv
+            |
+             --7.89%--<crossbeam_channel::flavors::list::Channel<kv_engine::wal::parallel_worker::GroupWriteResult>>::recv
+
+     9.79%     9.64%  wal-ordered-pac  write-perf-v7-validated-logical-batch  [.] <crossbeam_channel::flavors::array::Channel<bool>>::recv
+     5.17%     5.17%  write-perf-v7-v  write-perf-v7-validated-logical-batch  [.] <kv_engine::mvcc::LsmMvccInner>::publish_commit_ts
+            |
+             --5.12%--0x30d3
+                       <kv_engine::mvcc::LsmMvccInner>::publish_commit_ts
+
+     5.12%     0.20%  wal-io-worker    write-perf-v7-validated-logical-batch  [.] kv_engine::wal::parallel_worker::process_worker_events::<kv_engine::wal::parallel_runtime::ParallelBuffer>
+            |
+             --4.97%--kv_engine::wal::parallel_worker::process_worker_events::<kv_engine::wal::parallel_runtime::ParallelBuffer>
+                       |
+                        --4.32%--<crossbeam_channel::flavors::list::Channel<kv_engine::wal::parallel_worker::WorkerCommand<kv_engine::wal::parallel_runtime::ParallelBuffer>>>::recv
+
+     5.12%     0.00%  write-perf-v7-v  [unknown]                              [.] 0x00000000000030d3
+            |
+            ---0x30d3
+               <kv_engine::mvcc::LsmMvccInner>::publish_commit_ts
+
+     4.67%     1.96%  write-perf-v7-v  write-perf-v7-validated-logical-batch  [.] <std::thread::local::LocalKey<core::cell::RefCell<alloc::vec::Vec<u8>>>>::with::<<kv_engine::mem_table::MemTable>::publish_raw_batch::{closure#0}, ()>
+            |
+            ---<std::thread::local::LocalKey<core::cell::RefCell<alloc::vec::Vec<u8>>>>::with::<<kv_engine::mem_table::MemTable>::publish_raw_batch::{closure#0}, ()>
+               |
+               |--1.05%--<std::time::Instant>::elapsed
+               |          |
+               |           --0.90%--<std::sys::pal::unix::time::Timespec>::now
+               |                     |
+               |                      --0.85%--clock_gettime
+               |
+                --0.85%--<std::sys::pal::unix::time::Timespec>::now
+                          clock_gettime
+                          __vdso_clock_gettime
+
+     4.52%     3.72%  write-perf-v7-v  write-perf-v7-validated-logical-batch  [.] <parking_lot::raw_mutex::RawMutex>::lock_slow
+            |
+             --4.02%--<parking_lot::raw_mutex::RawMutex>::lock_slow
+
+     4.52%     0.25%  write-perf-v7-v  write-perf-v7-validated-logical-batch  [.] <std::sys::pal::unix::time::Timespec>::now
+            |
+             --4.37%--<std::sys::pal::unix::time::Timespec>::now
+                       |
+                       |--2.91%--clock_gettime
+                       |          |
+                       |           --2.61%--__vdso_clock_gettime
+                       |
+                        --1.31%--kv_engine::key::decode_user_key_into
+
+     4.32%     4.12%  wal-io-worker    write-perf-v7-validated-logical-batch  [.] <crossbeam_channel::flavors::list::Channel<kv_engine::wal::parallel_worker::WorkerCommand<kv_engine::wal::parallel_runtime::ParallelBuffer>>>::recv
+            |
+             --4.12%--kv_engine::wal::parallel_worker::process_worker_events::<kv_engine::wal::parallel_runtime::ParallelBuffer>
+                       <crossbeam_channel::flavors::list::Channel<kv_engine::wal::parallel_worker::WorkerCommand<kv_engine::wal::parallel_runtime::ParallelBuffer>>>::recv
+
+     4.27%     0.30%  write-perf-v7-v  libc.so.6                              [.] clock_gettime
+            |
+             --3.97%--clock_gettime
+                       |
+                       |--2.61%--__vdso_clock_gettime
+                       |
+                        --1.31%--<std::sys::pal::unix::time::Timespec>::now
+                                  kv_engine::key::decode_user_key_into
+
+     4.22%     0.00%  wal-ordered-pac  [unknown]                              [.] 0x0000000000000fff
+            |
+            ---0xfff
+               |
+                --3.42%--sha2::sha256::x86::digest_blocks
+
+     3.42%     3.42%  wal-ordered-pac  write-perf-v7-validated-logical-batch  [.] sha2::sha256::x86::digest_blocks
+            |
+            ---0xfff
+               sha2::sha256::x86::digest_blocks
+
+     2.81%     1.41%  wal-io-worker    write-perf-v7-validated-logical-batch  [.] kv_engine::wal::parallel_worker::run_worker::<kv_engine::wal::parallel_runtime::ParallelBuffer>
+            |
+             --2.06%--kv_engine::wal::parallel_worker::run_worker::<kv_engine::wal::parallel_runtime::ParallelBuffer>
+
+     2.61%     2.61%  write-perf-v7-v  [vdso]                                 [.] __vdso_clock_gettime
+            |
+             --1.61%--<std::thread::local::LocalKey<core::cell::RefCell<alloc::vec::Vec<u8>>>>::with::<<kv_engine::mem_table::MemTable>::publish_raw_batch::{closure#0}, ()>
+                       |
+                        --0.85%--<std::sys::pal::unix::time::Timespec>::now
+                                  clock_gettime
+                                  __vdso_clock_gettime
+
+     2.51%     1.81%  write-perf-v7-v  write-perf-v7-validated-logical-batch  [.] <kv_engine::lsm_storage::LsmStorageInner>::maybe_queue_pitr_maintenance
+            |
+            ---<kv_engine::lsm_storage::LsmStorageInner>::maybe_queue_pitr_maintenance
+
+     2.41%     1.31%  write-perf-v7-v  write-perf-v7-validated-logical-batch  [.] <crossbeam_skiplist::base::SkipList<bytes::bytes::Bytes, bytes::bytes::Bytes>>::search_position::<bytes::bytes::Bytes>
+            |
+            ---<crossbeam_skiplist::base::SkipList<bytes::bytes::Bytes, bytes::bytes::Bytes>>::search_position::<bytes::bytes::Bytes>
+
+     2.01%     1.10%  write-perf-v7-v  write-perf-v7-validated-logical-batch  [.] <kv_engine::mvcc::LsmMvccInner>::write_wal_only
+            |
+             --1.81%--<kv_engine::mvcc::LsmMvccInner>::write_wal_only
+
+     1.76%     1.31%  wal-ordered-pac  write-perf-v7-validated-logical-batch  [.] kv_engine::wal::parallel_runtime::pack_admitted_groups
+            |
+             --0.80%--std::sys::backtrace::__rust_begin_short_backtrace::<<kv_engine::wal::parallel_runtime::ParallelWalRuntime>::spawn::{closure#4}, core::result::Result<(), anyhow::Error>>
+                       kv_engine::wal::parallel_runtime::pack_admitted_groups
+
+     1.71%     0.70%  write-perf-v7-v  write-perf-v7-validated-logical-batch  [.] <kv_engine::mem_table::MemTable>::commit_wal_ticket
+            |
+            ---<kv_engine::mem_table::MemTable>::commit_wal_ticket
+
+     1.66%     0.00%  write-perf-v7-v  libc.so.6                              [.] 0x000078c94a623fec
+            |
+            ---0x78c94a623fec
+               |
+                --0.80%--0x78c94a623d07
+
+     1.66%     0.75%  write-perf-v7-v  write-perf-v7-validated-logical-batch  [.] <kv_engine::lsm_storage::LsmStorageInner>::put_with_lifecycle_admission
+            |
+             --0.95%--<kv_engine::lsm_storage::LsmStorageInner>::put_with_lifecycle_admission
+
+     1.66%     0.35%  write-perf-v7-v  write-perf-v7-validated-logical-batch  [.] <std::time::Instant>::elapsed
+            |
+             --1.56%--<std::time::Instant>::elapsed
+                       |
+                        --1.16%--<std::sys::pal::unix::time::Timespec>::now
+                                  |
+                                   --1.10%--clock_gettime
+                                             |
+                                              --0.95%--__vdso_clock_gettime
+
+     1.61%     1.61%  wal-sync-coordi  write-perf-v7-validated-logical-batch  [.] sha2::sha256::x86::digest_blocks
+     1.61%     0.00%  wal-io-worker    write-perf-v7-validated-logical-batch  [.] std::sys::backtrace::__rust_begin_short_backtrace::<<kv_engine::wal::parallel_worker::IoWorker<kv_engine::wal::parallel_runtime::ParallelBuffer>>::spawn::{closure#0}, core::result::Result<(), anyhow::Error>>
+            |
+            ---std::sys::backtrace::__rust_begin_short_backtrace::<<kv_engine::wal::parallel_worker::IoWorker<kv_engine::wal::parallel_runtime::ParallelBuffer>>::spawn::{closure#0}, core::result::Result<(), anyhow::Error>>
+               std::sys::backtrace::__rust_begin_short_backtrace::<<kv_engine::wal::parallel_worker::IoWorker<kv_engine::wal::parallel_runtime::ParallelBuffer>>::spawn::{closure#0}, core::result::Result<(), anyhow::Error>>
+               kv_engine::wal::parallel_worker::run_worker::<kv_engine::wal::parallel_runtime::ParallelBuffer>
+
+     1.56%     1.05%  write-perf-v7-v  write-perf-v7-validated-logical-batch  [.] <parking_lot::raw_mutex::RawMutex>::unlock_slow
+            |
+             --0.95%--<parking_lot::raw_mutex::RawMutex>::unlock_slow
+
+     1.46%     1.36%  write-perf-v7-v  write-perf-v7-validated-logical-batch  [.] kv_engine::key::decode_user_key_into
+            |
+             --1.21%--clock_gettime
+                       <std::sys::pal::unix::time::Timespec>::now
+                       kv_engine::key::decode_user_key_into
+
+     1.41%     1.41%  write-perf-v7-v  write-perf-v7-validated-logical-batch  [.] crc32fast::baseline::update_fast_16
+     1.41%     0.00%  write-perf-v7-v  [unknown]                              [.] 0x000000006ade1495
+            |
+            ---0x6ade1495
+               |
+                --0.95%--<kv_engine::wal::parallel_runtime::ParallelWalRuntime>::put_v7_prepared_batch
+
+     1.36%     0.85%  write-perf-v7-v  write-perf-v7-validated-logical-batch  [.] <kv_engine::wal::parallel_runtime::ParallelWalRuntime>::wait_durable
+            |
+            ---<kv_engine::wal::parallel_runtime::ParallelWalRuntime>::wait_durable
+
+     1.31%     0.00%  write-perf-v7-v  [unknown]                              [.] 0x01007ffcacd7193f
+            |
+            ---0x1007ffcacd7193f
+               <kv_engine::lsm_storage::LsmStorageInner>::put_with_lifecycle_admission
+
+     1.26%     1.26%  write-perf-v7-v  libc.so.6                              [.] syscall
+     1.16%     0.05%  write-perf-v7-v  write-perf-v7-validated-logical-batch  [.] <alloc::collections::btree::map::BTreeMap<_, _, _> as core::clone::Clone>::clone::clone_subtree::<u64, kv_engine::pitr::manifest::PitrObligation, alloc::alloc::Global>
+            |
+            ---<alloc::collections::btree::map::BTreeMap<_, _, _> as core::clone::Clone>::clone::clone_subtree::<u64, kv_engine::pitr::manifest::PitrObligation, alloc::alloc::Global>
+               |
+                --0.85%--0x78c94a623fec
+                          |
+                           --0.80%--0x78c94a623d07
+
+     1.10%     1.10%  wal-sync-coordi  write-perf-v7-validated-logical-batch  [.] <kv_engine::wal::v7::admission::WalV7OwnedBatchReservation>::release_unused_frontier_credit
+            |
+            ---<kv_engine::wal::v7::admission::WalV7OwnedBatchReservation>::release_unused_frontier_credit
+
+     1.05%     0.50%  write-perf-v7-v  write-perf-v7-validated-logical-batch  [.] <parking_lot::condvar::Condvar>::wait_until_internal
+            |
+            ---<parking_lot::condvar::Condvar>::wait_until_internal
+
+     1.05%     0.00%  write-perf-v7-v  [unknown]                              [.] 0x0000000000001fff
+            |
+            ---0x1fff
+
+     1.00%     1.00%  write-perf-v7-v  write-perf-v7-validated-logical-batch  [.] <kv_engine::wal::parallel_runtime::ParallelWalRuntime>::prepare_v7_batch
+     1.00%     0.55%  write-perf-v7-v  write-perf-v7-validated-logical-batch  [.] <kv_engine::wal::parallel_runtime::ParallelWalRuntime>::put_v7_prepared_batch
+     0.90%     0.05%  wal-ordered-pac  write-perf-v7-validated-logical-batch  [.] std::sys::backtrace::__rust_begin_short_backtrace::<<kv_engine::wal::parallel_runtime::ParallelWalRuntime>::spawn::{closure#4}, core::result::Result<(), anyhow::Error>>
+            |
+            ---std::sys::backtrace::__rust_begin_short_backtrace::<<kv_engine::wal::parallel_runtime::ParallelWalRuntime>::spawn::{closure#4}, core::result::Result<(), anyhow::Error>>
+               |
+                --0.85%--kv_engine::wal::parallel_runtime::pack_admitted_groups
+
+     0.85%     0.85%  wal-io-worker    write-perf-v7-validated-logical-batch  [.] <std::hash::random::RandomState as core::hash::BuildHasher>::hash_one::<&kv_engine::wal::parallel_worker::RequestId>
+     0.85%     0.85%  wal-ordered-pac  write-perf-v7-validated-logical-batch  [.] crc32fast::specialized::pclmulqdq::calculate
+     0.85%     0.35%  wal-sync-coordi  write-perf-v7-validated-logical-batch  [.] kv_engine::wal::parallel_runtime::run_sync_coordinator
+            |
+            ---kv_engine::wal::parallel_runtime::run_sync_coordinator
+
+     0.85%     0.00%  write-perf-v7-v  write-perf-v7-validated-logical-batch  [.] std::sys::backtrace::__rust_begin_short_backtrace::<write_perf::run_wal_concurrent::{closure#0}, core::result::Result<alloc::vec::Vec<u64>, anyhow::Error>>
+            |
+            ---std::sys::backtrace::__rust_begin_short_backtrace::<write_perf::run_wal_concurrent::{closure#0}, core::result::Result<alloc::vec::Vec<u64>, anyhow::Error>>
+
+     0.80%     0.45%  write-perf-v7-v  write-perf-v7-validated-logical-batch  [.] <std::path::Path>::file_name
+            |
+            ---<std::path::Path>::file_name
+
+     0.80%     0.20%  write-perf-v7-v  write-perf-v7-validated-logical-batch  [.] core::fmt::write
+     0.80%     0.15%  wal-ordered-pac  write-perf-v7-validated-logical-batch  [.] kv_engine::wal::v7::codec::encode_data_frame_sequence
+            |
+            ---kv_engine::wal::v7::codec::encode_data_frame_sequence
+
+     0.80%     0.00%  write-perf-v7-v  libc.so.6                              [.] 0x000078c94a623d07
+            |
+            ---0x78c94a623d07
+
+     0.75%     0.65%  write-perf-v7-v  write-perf-v7-validated-logical-batch  [.] <kv_engine::wal::v7::admission::WalV7ReservationOwner>::reserve_batch
+     0.75%     0.25%  write-perf-v7-v  write-perf-v7-validated-logical-batch  [.] <crossbeam_skiplist::base::SkipList<bytes::bytes::Bytes, bytes::bytes::Bytes>>::insert_internal::<<crossbeam_skiplist::base::SkipList<bytes::bytes::Bytes, bytes::bytes::Bytes>>::insert::{closure#0}, <crossbeam_skiplist::base::SkipList<bytes::bytes::Bytes, bytes::bytes::Bytes>>::insert::{closure#1}>
+     0.75%     0.25%  write-perf-v7-v  write-perf-v7-validated-logical-batch  [.] <kv_engine::lsm_storage::LsmStorageInner>::pitr_segment_of
+     0.75%     0.10%  write-perf-v7-v  write-perf-v7-validated-logical-batch  [.] <bytes::bytes::Bytes as core::convert::From<alloc::vec::Vec<u8>>>::from
+     0.75%     0.00%  write-perf-v7-v  [unknown]                              [.] 0x000000000000fffe
+     0.75%     0.05%  write-perf-v7-v  write-perf-v7-validated-logical-batch  [.] <kv_engine::wal::v7::codec::PreparedWalV7LogicalBatch>::encode_entry_stream
+     0.75%     0.05%  write-perf-v7-v  write-perf-v7-validated-logical-batch  [.] alloc::fmt::format::format_inner
+     0.70%     0.70%  wal-io-worker    write-perf-v7-validated-logical-batch  [.] <crossbeam_channel::flavors::list::Channel<kv_engine::wal::parallel_worker::WorkerCommand<kv_engine::wal::parallel_runtime::ParallelBuffer>>>::start_recv
+     0.70%     0.55%  write-perf-v7-v  write-perf-v7-validated-logical-batch  [.] <kv_engine::mem_table::MemTable>::write_prepared_v7_pitr_wal_batch_only
+     0.70%     0.45%  wal-io-worker    write-perf-v7-validated-logical-batch  [.] kv_engine::wal::parallel_worker::enqueue_group_command::<kv_engine::wal::parallel_runtime::ParallelBuffer>
+     0.70%     0.15%  wal-sync-coordi  write-perf-v7-validated-logical-batch  [.] <kv_engine::wal::v7::admission::WalV7OwnedBatchReservation>::finish_after_io
+     0.65%     0.65%  write-perf-v7-v  libc.so.6                              [.] __sched_yield
+     0.65%     0.65%  write-perf-v7-v  libc.so.6                              [.] 0x00000000000a5ffc
+     0.65%     0.45%  wal-io-worker    write-perf-v7-validated-logical-batch  [.] <kv_engine::wal::parallel_worker::WorkerCore<kv_engine::wal::parallel_runtime::ParallelBuffer>>::assert_invariants
+     0.65%     0.40%  write-perf-v7-v  write-perf-v7-validated-logical-batch  [.] <kv_engine::wal::v7::admission::WalV7ResourceLedger>::reserve_with_priority
+     0.65%     0.05%  write-perf-v7-v  write-perf-v7-validated-logical-batch  [.] bytes::bytes::shared_drop
+     0.65%     0.00%  write-perf-v7-v  libc.so.6                              [.] 0x000078c94a623ffc
+     0.60%     0.05%  write-perf-v7-v  write-perf-v7-validated-logical-batch  [.] <kv_engine::pitr::CanonicalWalEntryStream>::encode_into
+     0.60%     0.00%  write-perf-v7-v  [unknown]                              [.] 0x0000000000000449
+     0.55%     0.55%  write-perf-v7-v  write-perf-v7-validated-logical-batch  [.] <arc_swap::strategy::hybrid::HybridStrategy<arc_swap::strategy::hybrid::DefaultConfig> as arc_swap::strategy::sealed::InnerStrategy<alloc::sync::Arc<kv_engine::lsm_storage::LsmStorageState>>>::load::{closure#0}
+     0.55%     0.05%  wal-io-worker    write-perf-v7-validated-logical-batch  [.] <alloc::vec::Vec<kv_engine::wal::parallel_worker::GroupId> as alloc::vec::spec_from_iter::SpecFromIter<kv_engine::wal::parallel_worker::GroupId, core::iter::adapters::filter::Filter<core::iter::adapters::copied::Copied<alloc::collections::vec_deque::iter::Iter<kv_engine::wal::parallel_worker::GroupId>>, <kv_engine::wal::parallel_worker::WorkerCore<kv_engine::wal::parallel_runtime::ParallelBuffer>>::finish_completed_groups::{closure#0}>>>::from_iter
+     0.50%     0.40%  wal-io-worker    write-perf-v7-validated-logical-batch  [.] <core::iter::adapters::copied::Copied<alloc::collections::vec_deque::iter::Iter<kv_engine::wal::parallel_worker::GroupId>> as core::iter::traits::iterator::Iterator>::try_fold::<(), core::iter::traits::iterator::Iterator::find::check<kv_engine::wal::parallel_worker::GroupId, &mut <kv_engine::wal::parallel_worker::WorkerCore<kv_engine::wal::parallel_runtime::ParallelBuffer>>::finish_completed_groups::{closure#0}>::{closure#0}, core::ops::control_flow::ControlFlow<kv_engine::wal::parallel_worker::GroupId>>
+     0.50%     0.50%  wal-io-worker    libc.so.6                              [.] syscall
+     0.50%     0.00%  wal-io-worker    [unknown]                              [.] 0x0000000000000fff
+     0.50%     0.50%  wal-io-worker    write-perf-v7-validated-logical-batch  [.] <core::hash::sip::Hasher<core::hash::sip::Sip13Rounds> as core::hash::Hasher>::write
+     0.50%     0.50%  write-perf-v7-v  libc.so.6                              [.] 0x00000000000a481c
+     0.50%     0.35%  write-perf-v7-v  write-perf-v7-validated-logical-batch  [.] <std::path::Components as core::iter::traits::double_ended::DoubleEndedIterator>::next_back
+     0.50%     0.50%  write-perf-v7-v  libc.so.6                              [.] 0x00000000000a5fdc
+     0.50%     0.25%  wal-io-worker    write-perf-v7-validated-logical-batch  [.] <kv_engine::wal::parallel_worker::WorkerCore<kv_engine::wal::parallel_runtime::ParallelBuffer>>::finish_completed_groups
+     0.50%     0.25%  write-perf-v7-v  write-perf-v7-validated-logical-batch  [.] <kv_engine::mem_table::MemTable>::publish_raw_batch
+     0.50%     0.10%  write-perf-v7-v  write-perf-v7-validated-logical-batch  [.] <usize as core::fmt::Display>::fmt
+     0.50%     0.00%  write-perf-v7-v  libc.so.6                              [.] 0x000078c94a622813
+     0.50%     0.00%  write-perf-v7-v  libc.so.6                              [.] 0x000078c94a62281c
+     0.50%     0.00%  write-perf-v7-v  libc.so.6                              [.] 0x000078c94a623fdc
+     0.45%     0.45%  wal-ordered-pac  write-perf-v7-validated-logical-batch  [.] <parking_lot::raw_mutex::RawMutex>::lock_slow
+     0.45%     0.45%  write-perf-v7-v  libc.so.6                              [.] 0x000000000016c11d
+     0.45%     0.45%  write-perf-v7-v  write-perf-v7-validated-logical-batch  [.] <crossbeam_channel::flavors::array::Channel<bool>>::start_send
+     0.45%     0.45%  write-perf-v7-v  write-perf-v7-validated-logical-batch  [.] <kv_engine::wal::Wal>::put_v7_prepared_batch_with_index
+     0.45%     0.45%  write-perf-v7-v  write-perf-v7-validated-logical-batch  [.] <kv_engine::wal::parallel_runtime::BufferBudget>::reserve
+     0.45%     0.20%  write-perf-v7-v  write-perf-v7-validated-logical-batch  [.] <kv_engine::mvcc::LsmMvccInner>::advance_ready_publications
+     0.45%     0.10%  wal-io-worker    write-perf-v7-validated-logical-batch  [.] <kv_engine::wal::parallel_runtime::ParallelBuffer as kv_engine::wal::parallel_worker::WorkerBuffer>::retire
+     0.45%     0.00%  wal-io-worker    libc.so.6                              [.] 0x000078c94a6113e3
+     0.45%     0.05%  wal-io-worker    write-perf-v7-validated-logical-batch  [.] <io_uring::submit::Submitter>::submit_and_wait
+     0.45%     0.00%  write-perf-v7-v  libc.so.6                              [.] 0x000078c94a6ea11d
+     0.40%     0.40%  wal-io-worker    libc.so.6                              [.] 0x000000000009ef32
+     0.40%     0.00%  wal-io-worker    libc.so.6                              [.] 0x000078c94a61139b
+     0.40%     0.40%  wal-io-worker    write-perf-v7-validated-logical-batch  [.] <kv_engine::wal::parallel_worker::WalSyncProgress>::begin_io_event
+     0.40%     0.40%  write-perf-v7-v  libc.so.6                              [.] __mprotect
+     0.40%     0.40%  write-perf-v7-v  write-perf-v7-validated-logical-batch  [.] <tokio::sync::notify::Notify>::notify_waiters
+     0.40%     0.35%  wal-ordered-pac  write-perf-v7-validated-logical-batch  [.] <crossbeam_channel::flavors::list::Channel<kv_engine::wal::parallel_worker::WorkerCommand<kv_engine::wal::parallel_runtime::ParallelBuffer>>>::send
+     0.40%     0.20%  wal-sync-coordi  write-perf-v7-validated-logical-batch  [.] kv_engine::wal::parallel_runtime::synchronize_written_prefix
+     0.40%     0.35%  wal-sync-coordi  write-perf-v7-validated-logical-batch  [.] <parking_lot::condvar::Condvar>::notify_all_slow
+     0.40%     0.25%  wal-sync-coordi  write-perf-v7-validated-logical-batch  [.] <kv_engine::wal::v7::admission::WalV7ReservationOwner>::finish_batch_operation
+     0.40%     0.20%  write-perf-v7-v  write-perf-v7-validated-logical-batch  [.] <core::fmt::Formatter>::pad_integral
+     0.40%     0.05%  write-perf-v7-v  write-perf-v7-validated-logical-batch  [.] <alloc::collections::btree::map::IntoIter<u64, kv_engine::pitr::manifest::PitrObligation>>::dying_next
+     0.40%     0.00%  wal-io-worker    libc.so.6                              [.] 0x000078c94a61cf32
+     0.40%     0.00%  write-perf-v7-v  libc.so.6                              [.] 0x000078c94a622cce
+     0.35%     0.35%  write-perf-v7-v  libc.so.6                              [.] 0x00000000000a49e1
+     0.35%     0.35%  write-perf-v7-v  libc.so.6                              [.] malloc
+     0.35%     0.35%  write-perf-v7-v  write-perf-v7-validated-logical-batch  [.] <crossbeam_queue::array_queue::ArrayQueue<kv_engine::wal::DirectBuf>>::pop
+     0.35%     0.35%  write-perf-v7-v  write-perf-v7-validated-logical-batch  [.] <kv_engine::lsm_storage::LsmStorageInner>::try_freeze_memtable
+     0.35%     0.00%  wal-io-worker    libc.so.6                              [.] __poll
+     0.35%     0.15%  wal-io-worker    write-perf-v7-validated-logical-batch  [.] <crossbeam_channel::flavors::list::Channel<kv_engine::wal::parallel_worker::WorkerCommand<kv_engine::wal::parallel_runtime::ParallelBuffer>>>::read
+     0.35%     0.00%  wal-io-worker    write-perf-v7-validated-logical-batch  [.] <crossbeam_channel::channel::Receiver<kv_engine::wal::parallel_worker::WorkerCommand<kv_engine::wal::parallel_runtime::ParallelBuffer>>>::try_recv
+     0.35%     0.00%  write-perf-v7-v  libc.so.6                              [.] 0x000078c94a6229e1
+     0.35%     0.00%  write-perf-v7-v  [unknown]                              [.] 0x0000000000000019
+     0.30%     0.30%  wal-ordered-pac  write-perf-v7-validated-logical-batch  [.] crc32fast::baseline::update_fast_16
+     0.30%     0.30%  write-perf-v7-v  write-perf-v7-validated-logical-batch  [.] <std::sys::pal::unix::time::Timespec>::sub_timespec
+     0.30%     0.30%  write-perf-v7-v  write-perf-v7-validated-logical-batch  [.] <alloc::collections::btree::map::BTreeMap<u64, kv_engine::wal::v7::admission::WalV7OwnedBatchReservation>>::get::<u64>
+     0.30%     0.25%  write-perf-v7-v  write-perf-v7-validated-logical-batch  [.] <hashbrown::map::HashMap<u64, kv_engine::wal::v7::admission::WalV7ResourceCharge, ahash::random_state::RandomState>>::insert
+     0.30%     0.20%  write-perf-v7-v  write-perf-v7-validated-logical-batch  [.] <kv_engine::wal::v7::admission::WalV7Reservation as core::ops::drop::Drop>::drop
+     0.30%     0.15%  wal-sync-coordi  write-perf-v7-validated-logical-batch  [.] kv_engine::wal::parallel_runtime::process_group_result
+     0.30%     0.00%  write-perf-v7-v  libc.so.6                              [.] 0x000078c94a61467f
+
+
+#
+# (Tip: Treat branches as callchains: perf record -b ... ; perf report --branch-history)
+#
