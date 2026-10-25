@@ -49,6 +49,12 @@ const MAX_BUFFER_CAPACITY: u64 = 240 * 1024 * 1024;
 const WAL_HEADER_END: u64 = 4096;
 const PACKER_GROUP_MAX_TICKETS: usize = 8;
 const EXTENT_INITIALIZATION_CHUNK: usize = 128 * 1024;
+#[repr(align(4096))]
+struct ExtentZeros([u8; EXTENT_INITIALIZATION_CHUNK]);
+
+// A single immutable aligned source avoids allocating a zero buffer per v7
+// runtime or per range. Its lifetime also covers all synchronous direct I/O.
+static EXTENT_ZEROS: ExtentZeros = ExtentZeros([0; EXTENT_INITIALIZATION_CHUNK]);
 // Large writes amortize extent conversion themselves. Zero-filling their
 // allocated space adds a second write of the same bytes on ext4.
 const ALLOCATION_ONLY_MIN_BATCH_BYTES: usize = 64 * 1024;
@@ -656,7 +662,9 @@ struct RuntimeInner {
     worker: IoWorkerClient<ParallelBuffer>,
     sync_progress: Arc<WalSyncProgress>,
     preallocator: Arc<File>,
-    preallocation_lock: Mutex<()>,
+    // Some(end) tracks the extent prefix prepared for active v7 writers.
+    // DATA and FRONTIER share it; large DATA groups skip zero filling.
+    preallocation_lock: Mutex<Option<u64>>,
     max_file_size: u64,
     durability: Arc<DurabilityShared>,
 }
@@ -841,6 +849,10 @@ impl ParallelWalRuntime {
             .v7_allocator
             .as_ref()
             .map(|allocator| allocator.last_frontier().frontier.last_commit_ts);
+        let prepared_v7_extent_end = (start.v7_allocator.is_some()
+            && start.admission_open
+            && is_ext_filesystem(&preallocator))
+        .then_some(initial_file_end);
 
         ensure!(
             (start.min_append_offset..=start.max_file_size).contains(&initial_file_end),
@@ -922,7 +934,7 @@ impl ParallelWalRuntime {
             worker: worker_client,
             sync_progress,
             preallocator,
-            preallocation_lock: Mutex::new(()),
+            preallocation_lock: Mutex::new(prepared_v7_extent_end),
             max_file_size: start.max_file_size,
             durability: Arc::clone(&durability),
         });
@@ -1752,7 +1764,9 @@ fn pack_admitted_groups(
                 Some(initializer) => {
                     initializer.prepare(target_preallocated_end, packed.initialize_extents)
                 }
-                None => preallocate_runtime(inner, target_preallocated_end),
+                None => {
+                    preallocate_runtime(inner, target_preallocated_end, packed.initialize_extents)
+                }
             };
             if let Err(error) = allocation {
                 report_packer_failure(inner, first_ticket, &error);
@@ -2335,7 +2349,7 @@ fn append_v7_frontier(
         // append after it. Any failure in the I/O below poisons this runtime.
         drop(admission);
 
-        preallocate_runtime(inner, preallocation_end)
+        preallocate_runtime(inner, preallocation_end, true)
             .context("preallocate v7 Parallel FRONTIER frame")?;
         #[cfg(feature = "bench")]
         let profile = inner.sync_progress.profile();
@@ -2639,9 +2653,41 @@ fn wal_sync_timestamp() -> Option<std::time::Instant> {
 /// already-sized range and avoid extending the WAL themselves.
 /// Only allocate the new suffix; revisiting the existing extents adds work
 /// as the WAL grows without reserving any additional space.
-fn preallocate_runtime(inner: &RuntimeInner, end: u64) -> Result<()> {
-    let _guard = inner.preallocation_lock.lock();
-    preallocate(&inner.preallocator, end)
+/// Active v7 writers also initialize that range before small DATA or FRONTIER
+/// I/O. Large DATA groups initialize their own extents. Their shared cursor
+/// prevents later preparation from overwriting either kind of write.
+fn preallocate_runtime(inner: &RuntimeInner, end: u64, initialize_extents: bool) -> Result<()> {
+    ensure!(
+        end <= inner.max_file_size,
+        "WAL preallocation exceeds the configured file cap"
+    );
+    let mut prepared_end = inner.preallocation_lock.lock();
+    preallocate(&inner.preallocator, end)?;
+    if let Some(prepared_end) = prepared_end.as_mut() {
+        // The configured cap may end in a partial frame. Preserve that EOF
+        // while initializing only complete aligned ranges for direct writes.
+        let aligned_end = end - end % WAL_V7_FRAME_LEN as u64;
+        if !initialize_extents {
+            // Large DATA writes initialize their own extents. Mark their
+            // allocation usable so later FRONTIER preparation cannot zero it.
+            *prepared_end = (*prepared_end).max(aligned_end);
+        }
+        while *prepared_end < aligned_end {
+            #[cfg(feature = "chaos-testing")]
+            crate::chaos::failpoint::fail_point!("parallel_wal.v7_extent_init_failure", |_| {
+                Err(anyhow!("injected v7 extent initialization failure"))
+            });
+            let len =
+                (aligned_end - *prepared_end).min(EXTENT_INITIALIZATION_CHUNK as u64) as usize;
+            inner
+                .preallocator
+                .write_all_at(&EXTENT_ZEROS.0[..len], *prepared_end)
+                .context("failed to initialize v7 WAL extent")?;
+            *prepared_end += len as u64;
+        }
+    }
+
+    Ok(())
 }
 
 fn preallocate(file: &File, end: u64) -> Result<()> {
@@ -2851,6 +2897,148 @@ mod tests {
         }
     }
 
+    fn v7_large_extent_test_batch(commit_ts: u64) -> WalBatch {
+        let mut batch = v7_test_batch(commit_ts, 0);
+        batch.entries = (0..40)
+            .map(|index| WalEntry::Put {
+                key: format!("large-{index:02}").into_bytes(),
+                value: vec![index as u8; 32 * 1024],
+            })
+            .collect();
+
+        batch
+    }
+
+    #[test]
+    fn v7_extent_initialization_preserves_data_and_frontiers_across_growth() -> anyhow::Result<()> {
+        use crate::wal::v7::{
+            install::recover_and_install_active, recovery::WalV7RecoveryAuthority,
+        };
+
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("initialized-v7-extents.wal");
+        let cap = 3 * super::PREALLOC_BLOCK + 1;
+        let Some(V7RuntimeTestWal { wal, owner, anchor }) =
+            live_v7_test_wal(&path, cap, v7_test_resource_limits())?
+        else {
+            return Ok(());
+        };
+        let runtime = wal.parallel_runtime.as_ref().unwrap();
+        let start = runtime.logical_length();
+        // Exercise initialization on any test filesystem, including tmpfs.
+        *runtime.inner.preallocation_lock.lock() = Some(start);
+        runtime.inner.preallocator.set_len(super::PREALLOC_BLOCK)?;
+        let mut garbage = super::DirectBuf::new(super::WAL_V7_FRAME_LEN);
+        garbage.as_mut_slice().fill(0xA5);
+        runtime
+            .inner
+            .preallocator
+            .write_all_at(garbage.as_mut_slice(), start)?;
+        super::preallocate_runtime(&runtime.inner, super::PREALLOC_BLOCK, true)?;
+        let initialized = std::fs::read(&path)?;
+        assert!(
+            initialized[start as usize..start as usize + super::WAL_V7_FRAME_LEN]
+                .iter()
+                .all(|byte| *byte == 0),
+            "a preallocated physical tail must still be initialized"
+        );
+
+        let first = v7_test_batch(1, 10);
+        let first_ticket = wal.put_v7_batch_with_index(&first, LIVE_WAL_V5_LIMITS)?.0;
+        wal.submit_and_commit(first_ticket)?;
+        let prefix_end = runtime.logical_length() as usize;
+        let prefix = std::fs::read(&path)?[..prefix_end].to_vec();
+        let large = v7_large_extent_test_batch(2);
+        let large_ticket = wal.put_v7_batch_with_index(&large, LIVE_WAL_V5_LIMITS)?.0;
+        wal.submit_and_commit(large_ticket)?;
+        assert!(runtime.logical_length() > super::PREALLOC_BLOCK);
+        assert_eq!(&std::fs::read(&path)?[..prefix_end], prefix.as_slice());
+        let image_after_large_data = std::fs::read(&path)?;
+        let prepared_end = runtime.inner.packer_state.lock().preallocated_end;
+        super::preallocate_runtime(&runtime.inner, prepared_end, true)?;
+        assert_eq!(std::fs::read(&path)?, image_after_large_data);
+        assert!(std::fs::metadata(&path)?.len() <= cap);
+        wal.close()?;
+        assert_eq!(owner.snapshot().buffer_memory_bytes, 0);
+        drop(wal);
+
+        let recovered = recover_and_install_active(
+            &path,
+            WalV7RecoveryAuthority::Active {
+                predecessor: crate::pitr::ChainAnchor::Genesis {
+                    archive_epoch_id: crate::pitr::ArchiveEpochId(anchor.archive_epoch_id),
+                },
+                durable_anchors: vec![anchor],
+            },
+        )?;
+        assert_eq!(recovered.installed.batches, vec![first, large]);
+
+        Ok(())
+    }
+
+    #[cfg(feature = "chaos-testing")]
+    #[test]
+    fn failpoint_v7_extent_initialization_failure_preserves_durable_prefix() -> anyhow::Result<()> {
+        use crate::{
+            chaos::failpoint::{self, FailScenario},
+            wal::v7::{install::recover_and_install_active, recovery::WalV7RecoveryAuthority},
+        };
+
+        let _scenario = FailScenario::setup();
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("failed-v7-extent-init.wal");
+        let Some(V7RuntimeTestWal { wal, owner, anchor }) =
+            live_v7_test_wal(&path, super::MAX_WAL_FILE_SIZE, v7_test_resource_limits())?
+        else {
+            return Ok(());
+        };
+        let runtime = wal.parallel_runtime.as_ref().unwrap();
+        *runtime.inner.preallocation_lock.lock() = Some(runtime.logical_length());
+        let first = v7_test_batch(1, 10);
+        let first_ticket = wal.put_v7_batch_with_index(&first, LIVE_WAL_V5_LIMITS)?.0;
+        wal.submit_and_commit(first_ticket)?;
+
+        let mut acknowledged = vec![first];
+        while runtime.logical_length() + 10 * super::WAL_V7_FRAME_LEN as u64
+            <= super::PREALLOC_BLOCK
+        {
+            let batch = v7_test_batch(acknowledged.len() as u64 + 1, 32 * 1024);
+            let ticket = wal.put_v7_batch_with_index(&batch, LIVE_WAL_V5_LIMITS)?.0;
+            wal.submit_and_commit(ticket)?;
+            acknowledged.push(batch);
+        }
+        failpoint::cfg("parallel_wal.v7_extent_init_failure", "return")
+            .expect("inject v7 extent initialization failure");
+        let batch = v7_test_batch(acknowledged.len() as u64 + 1, 32 * 1024);
+        let failed_ticket = wal.put_v7_batch_with_index(&batch, LIVE_WAL_V5_LIMITS)?.0;
+        let failed = wal.submit_and_commit(failed_ticket);
+        failpoint::cfg("parallel_wal.v7_extent_init_failure", "off")
+            .expect("disable v7 extent initialization failure");
+        let error = failed.expect_err("an initialization failure must poison the DATA ticket");
+        assert!(format!("{error:#}").contains("injected v7 extent initialization failure"));
+        runtime.wait_durable(first_ticket)?;
+        assert!(
+            wal.put_v7_batch_with_index(&v7_test_batch(3, 10), LIVE_WAL_V5_LIMITS)
+                .is_err()
+        );
+        assert!(wal.close().is_err());
+        assert_eq!(owner.snapshot().buffer_memory_bytes, 0);
+        drop(wal);
+
+        let recovered = recover_and_install_active(
+            &path,
+            WalV7RecoveryAuthority::Active {
+                predecessor: crate::pitr::ChainAnchor::Genesis {
+                    archive_epoch_id: crate::pitr::ArchiveEpochId(anchor.archive_epoch_id),
+                },
+                durable_anchors: vec![anchor],
+            },
+        )?;
+        assert_eq!(recovered.installed.batches, acknowledged);
+
+        Ok(())
+    }
+
     #[test]
     fn v7_prepared_batches_own_bytes_and_release_cancelled_resources() -> anyhow::Result<()> {
         use crate::wal::v7::{
@@ -2995,6 +3183,7 @@ mod tests {
                 .is_none()
         );
         if error.is_none() {
+            super::preallocate_runtime(inner, file_offset + aligned_len as u64, true)?;
             inner.preallocator.write_all_at(
                 buffer
                     .buffer
@@ -3547,7 +3736,7 @@ mod tests {
             ..
         } = runtime.inner.admission.lock().queue.pop_front().unwrap();
         let data_end = file_offset + aligned_len as u64;
-        super::preallocate_runtime(&runtime.inner, data_end)?;
+        super::preallocate_runtime(&runtime.inner, data_end, true)?;
         // Retain the allocation just as WorkerCore::drop does for an ambiguous
         // submission. No SQE is actually submitted here, allowing the test to
         // release it safely after checking accounting across close/retirement.
@@ -4098,6 +4287,7 @@ mod tests {
             };
             let runtime = wal.parallel_runtime.as_ref().expect("v7 Parallel runtime");
             assert_eq!(runtime.inner.max_file_size, configured_limit);
+            *runtime.inner.preallocation_lock.lock() = Some(runtime.logical_length());
             let batch = v7_test_batch(1, 10);
             let (ticket, first_data_offset) =
                 wal.put_v7_batch_with_index(&batch, LIVE_WAL_V5_LIMITS)?;
