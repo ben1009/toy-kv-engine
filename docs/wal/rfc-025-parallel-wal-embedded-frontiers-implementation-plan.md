@@ -2449,6 +2449,17 @@ All mixed controls, sparse batch latency samples, temperatures, and stalled
 runs remain recorded. A packer-wakeup replacement is rejected and reverted
 after a 22.4% tmpfs throughput loss. V4 parity and the Stage 8 gate remain unmet.
 
+The eight retained optimizations are split into independent commits. The next
+[ticket-boundary cache experiments](benchmarks/rfc-025-v7-ticket-boundary-experiments-20261025.md)
+are rejected: an initial normalized CPU-side gain does not replicate in the
+final implementation with authoritative rejection checks. The final SSD
+batch64 repeat loses raw throughput in all five pairs (6.1% median) and uses
+13.5% more CPU. Both variants pass their correctness checks, but neither
+implementation remains in production. The committed extent-cache source and
+executable are restored, with retained highest scores unchanged at 15,759 /
+391,992 puts/s against v4's 20,420 / 482,410. All initial and final measurements,
+source patches, hashes, and the unrelated compaction-test retry are recorded.
+
 ## Delivery checklist
 
 - [ ] Stages 1–3: legacy compatibility, byte-exact codec, independent validation,

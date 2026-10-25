@@ -8,7 +8,13 @@ steady-state v7/PITR cost against ordinary v4 writes, not just the format
 change. Each cell has three paired repeats and no same-binary null controls or
 confidence intervals.
 
-The latest [extent readiness cache follow-up](rfc-025-v7-extent-readiness-cache-20261025.md)
+The subsequent [ticket-boundary experiments](rfc-025-v7-ticket-boundary-experiments-20261025.md)
+are rejected. Their initial relative CPU gain does not replicate in the final
+build, and the final ext4 batch64 repeat loses 6.1% raw throughput while using
+13.5% more CPU. The eight accepted optimizations are committed separately;
+their source is restored after these trials.
+
+The latest retained [extent readiness cache follow-up](rfc-025-v7-extent-readiness-cache-20261025.md)
 avoids preparation locks and inode queries inside an already prepared range.
 Its highest ext4 scores are 15,759 puts/s for single puts and 391,992 for
 batch64, still 22.8% and 18.7% below the highest comparable v4 scores. Both

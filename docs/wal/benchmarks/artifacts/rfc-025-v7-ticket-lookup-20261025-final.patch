@@ -1,0 +1,84 @@
+--- a/kv-engine/src/wal/parallel/runtime.rs
++++ b/kv-engine/src/wal/parallel/runtime.rs
+@@ -665,0 +666,4 @@
++    // Publish accepted coordinates before releasing admission. Ticket waits
++    // covered by this lower bound need not lock the mutable admission queue.
++    // A cache miss rechecks admission before rejecting an unassigned ticket.
++    admitted_ticket_end: AtomicU64,
+@@ -942,0 +947 @@
++            admitted_ticket_end: AtomicU64::new(start.next_ticket),
+@@ -1303,0 +1309,3 @@
++            self.inner
++                .admitted_ticket_end
++                .store(next_ticket, Ordering::Release);
+@@ -1417,0 +1426,3 @@
++        self.inner
++            .admitted_ticket_end
++            .store(next_ticket, Ordering::Release);
+@@ -1460 +1471 @@
+-        self.inner.admission.lock().next_ticket
++        self.inner.admitted_ticket_end.load(Ordering::Acquire)
+@@ -1502 +1513,6 @@
+-        let assigned = self.inner.admission.lock().next_ticket;
++        let assigned = self.inner.admitted_ticket_end.load(Ordering::Acquire);
++        let assigned = if ticket >= assigned {
++            self.inner.admission.lock().next_ticket
++        } else {
++            assigned
++        };
+@@ -1530 +1546,6 @@
+-        let assigned = self.inner.admission.lock().next_ticket;
++        let assigned = self.inner.admitted_ticket_end.load(Ordering::Acquire);
++        let assigned = if ticket >= assigned {
++            self.inner.admission.lock().next_ticket
++        } else {
++            assigned
++        };
+@@ -3356,0 +3378,8 @@
++        assert!(
++            wal.parallel_runtime
++                .as_ref()
++                .unwrap()
++                .wait_durable(ticket + 1)
++                .is_err(),
++            "a rejected prepared batch must not publish another assigned ticket"
++        );
+@@ -3368,0 +3398,33 @@
++
++        Ok(())
++    }
++
++    #[tokio::test(flavor = "current_thread")]
++    async fn v7_ticket_wait_rechecks_a_stale_admission_snapshot() -> anyhow::Result<()> {
++        let directory = tempfile::tempdir()?;
++        let path = directory.path().join("ticket-snapshot.wal");
++        let Some(V7RuntimeTestWal { wal, .. }) =
++            live_v7_test_wal(&path, super::MAX_WAL_FILE_SIZE, v7_test_resource_limits())?
++        else {
++            return Ok(());
++        };
++        let ticket = wal
++            .put_v7_batch_with_index(&v7_test_batch(1, 10), LIVE_WAL_V5_LIMITS)?
++            .0;
++        wal.submit_and_commit(ticket)?;
++        let runtime = wal.parallel_runtime.as_ref().unwrap();
++        // Model an older published lower bound. It cannot reject a ticket
++        // whose coordinates authoritative admission has already assigned.
++        runtime
++            .inner
++            .admitted_ticket_end
++            .store(0, super::Ordering::Release);
++        runtime.wait_durable(ticket)?;
++        runtime.wait_durable_async(ticket).await?;
++        assert!(runtime.wait_durable(ticket + 1).is_err());
++        assert!(runtime.wait_durable_async(ticket + 1).await.is_err());
++        runtime
++            .inner
++            .admitted_ticket_end
++            .store(ticket + 1, super::Ordering::Release);
++        wal.close()?;
+@@ -5316,0 +5379,4 @@
++        runtime
++            .inner
++            .admitted_ticket_end
++            .store(2, Ordering::Release);
