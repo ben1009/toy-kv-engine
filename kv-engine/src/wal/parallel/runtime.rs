@@ -2125,10 +2125,15 @@ fn coalesce_admitted_prefix(
             return;
         }
         let written = state.written_frontier;
+        let durable = state.durable_frontier;
         drop(state);
         if written >= cutoff {
-            cutoff = inner.admission.lock().next_ticket;
-            if written >= cutoff {
+            let pending_preparation = {
+                let admission = inner.admission.lock();
+                cutoff = admission.next_ticket;
+                has_pending_v7_preparations(&admission, durable)
+            };
+            if written >= cutoff && !pending_preparation {
                 return;
             }
         }
@@ -2151,6 +2156,19 @@ fn coalesce_admitted_prefix(
             Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => return,
         }
     }
+}
+
+fn has_pending_v7_preparations(admission: &AdmissionState, durable: u64) -> bool {
+    // Already-reserved preparation can be part of the same producer wave.
+    // This hint only consumes the existing fixed coalescing deadline: capture
+    // and ACK still use the written prefix, and closing admission skips it.
+    admission.open
+        && admission
+            .v7_reservation_owner
+            .as_ref()
+            .is_some_and(|owner| {
+                owner.has_batch_operations_beyond(admission.next_ticket.saturating_sub(durable))
+            })
 }
 
 fn drain_results_at_capture(inner: &RuntimeInner, completions: &Receiver<GroupWriteResult>) {
@@ -3437,6 +3455,68 @@ mod tests {
                 error,
             },
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn v7_coalescing_preparation_hint_never_advances_durability_or_blocks_close()
+    -> anyhow::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("preparation-coalesce.wal");
+        let Some(V7RuntimeTestWal { wal, owner, .. }) =
+            live_v7_test_wal(&path, super::MAX_WAL_FILE_SIZE, v7_test_resource_limits())?
+        else {
+            return Ok(());
+        };
+        let runtime = wal.parallel_runtime.as_ref().unwrap();
+        let mut packer = runtime.inner.packer_state.lock();
+        let first = v7_test_batch(1, 10);
+        let ticket = wal.put_v7_batch_with_index(&first, LIVE_WAL_V5_LIMITS)?.0;
+        let batch = runtime.inner.admission.lock().queue.pop_front().unwrap();
+        let data_end = batch.file_offset + batch.aligned_len as u64;
+        let batch = prepare_test_v7_data(&runtime.inner, &mut packer, batch)?;
+        complete_test_v7_data(&runtime.inner, batch, None)?;
+        packer.next_ticket = ticket + 1;
+        packer.reserved_end = data_end;
+
+        assert!(!super::has_pending_v7_preparations(
+            &runtime.inner.admission.lock(),
+            0
+        ));
+        let pending = runtime.prepare_v7_batch(&v7_test_batch(2, 10), LIVE_WAL_V5_LIMITS)?;
+        assert!(super::has_pending_v7_preparations(
+            &runtime.inner.admission.lock(),
+            0
+        ));
+        let (_sender, completions) = crossbeam_channel::bounded(1);
+        super::coalesce_admitted_prefix(
+            &runtime.inner,
+            &completions,
+            std::time::Duration::from_millis(1),
+        );
+        {
+            let state = runtime.inner.durability.state.lock();
+            assert_eq!(state.written_frontier, 1);
+            assert_eq!(state.durable_frontier, 0);
+        }
+        runtime.inner.admission.lock().open = false;
+        assert!(!super::has_pending_v7_preparations(
+            &runtime.inner.admission.lock(),
+            0
+        ));
+        // This fixture injects CQEs directly instead of waking the automatic
+        // coordinator, so perform its matching sync step before shutdown.
+        assert!(
+            super::synchronize_written_prefix(&runtime.inner.preallocator, &runtime.inner)?
+                .is_some()
+        );
+        drop(packer);
+        wal.close()?;
+        assert_eq!(runtime.inner.durability.state.lock().durable_frontier, 1);
+        assert!(runtime.wait_durable(1).is_err());
+        drop(pending);
+        assert_eq!(owner.snapshot().buffer_memory_bytes, 0);
 
         Ok(())
     }

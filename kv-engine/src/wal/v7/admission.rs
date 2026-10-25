@@ -399,6 +399,12 @@ impl WalV7ReservationOwner {
         state.active_source_spool_preparations != 0 || state.active_batch_operations != 0
     }
 
+    /// A conservative hint for bounded coalescing, never a durability bound.
+    /// Excess operations may be preparing batches or lingering DATA pins.
+    pub(crate) fn has_batch_operations_beyond(&self, admitted_in_flight: u64) -> bool {
+        self.state.lock().active_batch_operations > admitted_in_flight
+    }
+
     pub(crate) fn source_spool_generation_changed(&self, generation: u64) -> bool {
         self.ledger.source_spool_generation() != generation
     }
@@ -1642,6 +1648,33 @@ mod tests {
             .await
             .expect("batch completion before registration was lost")
         );
+    }
+
+    #[test]
+    fn batch_operation_hint_includes_preparation_and_lingering_pins() {
+        let ledger = WalV7ResourceLedger::new(batch_limits()).unwrap();
+        let owner = Arc::new(WalV7ReservationOwner {
+            ledger,
+            retained_resources: None,
+            installed_dev: 0,
+            installed_ino: 0,
+            state: Mutex::new(WalV7ReservationOwnerState {
+                retired: false,
+                active_batch_operations: 0,
+                active_source_spool_preparations: 0,
+                reservations: AHashMap::new(),
+            }),
+        });
+        assert!(!owner.has_batch_operations_beyond(0));
+        let mut batch = owner.reserve_batch(128).unwrap();
+        assert!(owner.has_batch_operations_beyond(0));
+        batch.mark_admitted();
+        assert!(!owner.has_batch_operations_beyond(1));
+        let pin = batch.pin_buffer();
+        batch.finish_after_io().unwrap();
+        assert!(owner.has_batch_operations_beyond(0));
+        drop(pin);
+        assert!(!owner.has_batch_operations_beyond(0));
     }
 
     fn charge(
