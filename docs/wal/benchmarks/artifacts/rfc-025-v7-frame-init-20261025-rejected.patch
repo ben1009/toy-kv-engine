@@ -1,0 +1,11 @@
+diff --git a/kv-engine/src/wal/v7/codec.rs b/kv-engine/src/wal/v7/codec.rs
+index ea795fd8..c330123e 100644
+--- a/kv-engine/src/wal/v7/codec.rs
++++ b/kv-engine/src/wal/v7/codec.rs
+@@ -637 +637,5 @@ fn initialize_frame(
+-    output.fill(0);
++    // Both encoders overwrite the complete body before computing its CRC.
++    // Initialize reserved header bytes and padding without clearing payload
++    // bytes that will immediately be replaced, including in recycled buffers.
++    output[..WAL_V7_FRAME_HEADER_LEN].fill(0);
++    output[WAL_V7_FRAME_HEADER_LEN + body_len..].fill(0);

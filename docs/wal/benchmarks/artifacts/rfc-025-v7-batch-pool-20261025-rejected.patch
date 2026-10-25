@@ -1,0 +1,169 @@
+diff --git a/kv-engine/src/wal/parallel/runtime.rs b/kv-engine/src/wal/parallel/runtime.rs
+index 0792af13..89b07ab5 100644
+--- a/kv-engine/src/wal/parallel/runtime.rs
++++ b/kv-engine/src/wal/parallel/runtime.rs
+@@ -51,0 +52,3 @@ const MAX_BUFFER_CAPACITY: u64 = 240 * 1024 * 1024;
++// Idle multi-frame buffers retain at most 8 * 256 KiB. Each activation still
++// charges the exact allocation to both the direct-buffer and v7 budgets.
++const V7_BATCH_BUFFER_POOL_CAPACITY: usize = 8;
+@@ -447 +450 @@ pub(crate) struct ParallelBuffer {
+-    v7_frame_buffer_pool: Option<Arc<ArrayQueue<DirectBuf>>>,
++    v7_buffer_pool: Option<Arc<ArrayQueue<DirectBuf>>>,
+@@ -458 +461 @@ impl ParallelBuffer {
+-            v7_frame_buffer_pool: None,
++            v7_buffer_pool: None,
+@@ -469 +472 @@ impl ParallelBuffer {
+-            v7_frame_buffer_pool: None,
++            v7_buffer_pool: None,
+@@ -478 +481 @@ impl ParallelBuffer {
+-        v7_frame_buffer_pool: Option<Arc<ArrayQueue<DirectBuf>>>,
++        v7_buffer_pool: Option<Arc<ArrayQueue<DirectBuf>>>,
+@@ -486 +489 @@ impl ParallelBuffer {
+-            v7_frame_buffer_pool,
++            v7_buffer_pool,
+@@ -529,3 +532 @@ impl WorkerBuffer for ParallelBuffer {
+-        } else if self.cap() == WAL_V7_FRAME_LEN
+-            && let Some(v7_frame_buffer_pool) = self.v7_frame_buffer_pool.take()
+-        {
++        } else if let Some(v7_buffer_pool) = self.v7_buffer_pool.take() {
+@@ -539 +540 @@ impl WorkerBuffer for ParallelBuffer {
+-            let _ = v7_frame_buffer_pool.push(buffer);
++            let _ = v7_buffer_pool.push(buffer);
+@@ -673,0 +675 @@ struct RuntimeInner {
++    v7_batch_buffer_pool: Arc<ArrayQueue<DirectBuf>>,
+@@ -888,0 +891 @@ impl ParallelWalRuntime {
++        let v7_batch_buffer_pool = Arc::new(ArrayQueue::new(V7_BATCH_BUFFER_POOL_CAPACITY));
+@@ -956,0 +960 @@ impl ParallelWalRuntime {
++            v7_batch_buffer_pool,
+@@ -1085,5 +1089,4 @@ impl ParallelWalRuntime {
+-        let mut direct_buffer = if capacity == WAL_V7_FRAME_LEN {
+-            self.inner
+-                .v7_frame_buffer_pool
+-                .pop()
+-                .unwrap_or_else(|| DirectBuf::new(capacity))
++        let pool = if capacity == WAL_V7_FRAME_LEN {
++            Some(&self.inner.v7_frame_buffer_pool)
++        } else if capacity <= BUFFER_POOL_BUF_SIZE {
++            Some(&self.inner.v7_batch_buffer_pool)
+@@ -1091 +1094 @@ impl ParallelWalRuntime {
+-            DirectBuf::new(capacity)
++            None
+@@ -1092,0 +1096,6 @@ impl ParallelWalRuntime {
++        // Capacity remains exact: a differently sized idle buffer is freed
++        // rather than exposing an oversized allocation under a smaller charge.
++        let mut direct_buffer = pool
++            .and_then(|pool| pool.pop())
++            .filter(|buffer| buffer.cap() == capacity)
++            .unwrap_or_else(|| DirectBuf::new(capacity));
+@@ -1094,2 +1102,0 @@ impl ParallelWalRuntime {
+-        let v7_frame_buffer_pool =
+-            (capacity == WAL_V7_FRAME_LEN).then(|| Arc::clone(&self.inner.v7_frame_buffer_pool));
+@@ -1102 +1109 @@ impl ParallelWalRuntime {
+-            v7_frame_buffer_pool,
++            pool.map(Arc::clone),
+@@ -4019 +4026 @@ mod tests {
+-    fn v7_admission_recycles_single_frame_buffers_in_its_separate_pool() -> anyhow::Result<()> {
++    fn v7_admission_recycles_exact_frame_buffers_in_separate_pools() -> anyhow::Result<()> {
+@@ -4024,3 +4031,6 @@ mod tests {
+-        for (value_len, expected_capacity) in
+-            [(10, 4096), (large_value_len, super::BUFFER_POOL_BUF_SIZE)]
+-        {
++        for (value_len, expected_capacity) in [
++            (10, 4096),
++            (64 * 1024, 17 * super::WAL_V7_FRAME_LEN),
++            (large_value_len, super::BUFFER_POOL_BUF_SIZE),
++            (large_value_len * 2, super::BUFFER_POOL_BUF_SIZE * 2),
++        ] {
+@@ -4030 +4040,2 @@ mod tests {
+-                batch.entries = (0..4)
++                let entry_count = value_len.div_ceil(LIVE_WAL_V5_LIMITS.max_value_bytes);
++                batch.entries = (0..entry_count)
+@@ -4033 +4044,5 @@ mod tests {
+-                        value: vec![0x5A; value_len / 4],
++                        value: vec![
++                            0x5A;
++                            (value_len - index * LIVE_WAL_V5_LIMITS.max_value_bytes)
++                                .min(LIVE_WAL_V5_LIMITS.max_value_bytes)
++                        ],
+@@ -4056,0 +4072 @@ mod tests {
++            let first_pointer = super::WorkerBuffer::as_ptr(&queued.buffer);
+@@ -4080,2 +4096,16 @@ mod tests {
+-            if expected_capacity == super::WAL_V7_FRAME_LEN {
+-                let next_batch = v7_test_batch(2, 10);
++            let batch_pool_eligible = expected_capacity > super::WAL_V7_FRAME_LEN
++                && expected_capacity <= super::BUFFER_POOL_BUF_SIZE;
++            assert_eq!(
++                runtime.inner.v7_batch_buffer_pool.len(),
++                usize::from(batch_pool_eligible)
++            );
++            assert_eq!(owner.snapshot().buffer_memory_bytes, 0);
++            if expected_capacity <= super::BUFFER_POOL_BUF_SIZE {
++                let pool = if batch_pool_eligible {
++                    &runtime.inner.v7_batch_buffer_pool
++                } else {
++                    &runtime.inner.v7_frame_buffer_pool
++                };
++                let packer = runtime.inner.packer_state.lock();
++                let mut next_batch = batch.clone();
++                next_batch.commit_ts = 2;
+@@ -4084 +4114,11 @@ mod tests {
+-                assert!(runtime.inner.v7_frame_buffer_pool.is_empty());
++                let admission = runtime.inner.admission.lock();
++                let next_buffer = &admission.queue.front().unwrap().buffer;
++                assert_eq!(super::WorkerBuffer::as_ptr(next_buffer), first_pointer);
++                assert_eq!(super::WorkerBuffer::cap(next_buffer), expected_capacity);
++                assert_eq!(
++                    owner.snapshot().buffer_memory_bytes,
++                    charge.buffer_memory_bytes
++                );
++                assert!(pool.is_empty());
++                drop(admission);
++                drop(packer);
+@@ -4086 +4126 @@ mod tests {
+-                assert_eq!(runtime.inner.v7_frame_buffer_pool.len(), 1);
++                assert_eq!(pool.len(), 1);
+@@ -4096,0 +4137,44 @@ mod tests {
++    fn v7_batch_pool_rejects_mismatched_capacities_without_changing_charges() -> anyhow::Result<()>
++    {
++        let directory = tempfile::tempdir()?;
++        let path = directory.path().join("buffer-capacity.wal");
++        let Some(V7RuntimeTestWal { wal, owner, .. }) =
++            live_v7_test_wal(&path, super::MAX_WAL_FILE_SIZE, v7_test_resource_limits())?
++        else {
++            return Ok(());
++        };
++        let runtime = wal.parallel_runtime.as_ref().unwrap();
++        let before = owner.snapshot();
++        let batch = v7_test_batch(1, 5000);
++        let encoded_len = super::prepare_logical_batch(&batch, LIVE_WAL_V5_LIMITS)?.encoded_len();
++        let charge = WalV7ResourceCharge::for_batch(encoded_len as u64)?;
++        for cached_capacity in [super::WAL_V7_FRAME_LEN, 3 * super::WAL_V7_FRAME_LEN] {
++            assert!(
++                runtime
++                    .inner
++                    .v7_batch_buffer_pool
++                    .push(super::DirectBuf::new(cached_capacity))
++                    .is_ok()
++            );
++            let prepared = runtime.prepare_v7_batch(&batch, LIVE_WAL_V5_LIMITS)?;
++            assert_eq!(
++                super::WorkerBuffer::cap(&prepared.buffer),
++                2 * super::WAL_V7_FRAME_LEN
++            );
++            assert_eq!(
++                owner.snapshot().buffer_memory_bytes,
++                before.buffer_memory_bytes + charge.buffer_memory_bytes
++            );
++            assert_eq!(runtime.inner.buffer_budget.state.lock().active_bytes, 8192);
++            assert!(runtime.inner.v7_batch_buffer_pool.is_empty());
++            drop(prepared);
++            assert_eq!(owner.snapshot(), before);
++            assert_eq!(runtime.inner.buffer_budget.state.lock().active_bytes, 0);
++            assert!(runtime.inner.v7_batch_buffer_pool.is_empty());
++        }
++        wal.close()?;
++
++        Ok(())
++    }
++
++    #[test]

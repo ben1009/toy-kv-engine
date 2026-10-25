@@ -2475,6 +2475,19 @@ of 15,759 / 391,992 and 22.9% / 23.2% below the highest v4 references. Every
 stall, sparse batch latency result, and unfavorable control remains recorded.
 V4 parity and the Stage 8 gate remain unmet.
 
+The [preparation and batching follow-up](benchmarks/rfc-025-v7-preparation-and-batching-20261025.md)
+retains a conservative reservation-owner hint within the existing 100/400 µs
+coalescing deadline. It never supplies a durability bound, and closed admission
+ignores it. Across ten ext4 batch64 pairs, raw throughput improves 6.8%, the
+v4-normalized ratio improves 10.7%, and CPU falls 2.8%. Ext4 point throughput
+rises 1.1% raw but falls 2.0% normalized; solo tmpfs throughput falls 1.4% raw.
+All 1,961 tests pass, with an unrelated compaction timeout/retry recorded.
+Canonical-index skipping, partial frame initialization, and a bounded batch
+buffer pool are rejected and reverted. Candidate ext4 peaks remain 15,664 /
+390,163 puts/s, 23.3% / 19.1% below the strongest v4 references and below the
+prior retained v7 highs. All 300 scored records, 60 warmups, patches, and hashes
+remain available. V4 parity and the Stage 8 gate remain unmet.
+
 ## Delivery checklist
 
 - [ ] Stages 1–3: legacy compatibility, byte-exact codec, independent validation,
