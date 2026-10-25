@@ -36,6 +36,8 @@ the retained and rejected experiments.
 
 ## Benchmarks and qualification
 
+- [RFC 025 user-requested ext4 batch64 rerun, 2026-10-26](benchmarks/rfc-025-v7-maintenance-batch-rerun-20261026.md)
+
 - [RFC 025 v7 maintenance-state clone experiment (rejected), 2026-10-25–26](benchmarks/rfc-025-v7-maintenance-snapshot-20261025.md)
 
 - [RFC 025 immutable v7 logical batches and repeated comparisons, 2026-10-25](benchmarks/rfc-025-v7-validated-logical-batch-20261025.md)

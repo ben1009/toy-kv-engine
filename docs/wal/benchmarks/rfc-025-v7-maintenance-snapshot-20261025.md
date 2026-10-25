@@ -154,6 +154,15 @@ paired comparisons retain the contemporaneous v4 controls. Earlier v7
 highs are preserved as separate references, rather than replaced by this
 pass's slower controls. V4 parity remains unproven.
 
+## Subsequent user-requested rerun
+
+After this rejection, the user requested another fixed batch comparison. The
+[separate rerun report](rfc-025-v7-maintenance-batch-rerun-20261026.md) preserves
+all new records: five pairs change raw throughput +0.8% and the v4-normalized
+ratio -4.4%. Across all fifteen batch pairs, the medians are -3.8% raw and
+-4.4% normalized. The original captures and summary above remain unchanged;
+the prototype remains reverted.
+
 ## Reproduction artifacts
 
 The [analyzer](artifacts/rfc-025-v7-maintenance-snapshot-20261025-analyze.py)
