@@ -430,6 +430,7 @@ pub(crate) struct ParallelBuffer {
     poolable: bool,
     // Field order frees the DATA allocation before retiring its ledger pin.
     _v7_reservation_pin: Option<WalV7BatchBufferPin>,
+    v7_frame_buffer_pool: Option<Arc<ArrayQueue<DirectBuf>>>,
 }
 
 impl ParallelBuffer {
@@ -440,6 +441,7 @@ impl ParallelBuffer {
             active_bytes: None,
             poolable: true,
             _v7_reservation_pin: None,
+            v7_frame_buffer_pool: None,
         }
     }
 
@@ -450,6 +452,7 @@ impl ParallelBuffer {
             active_bytes: Some(active_bytes),
             poolable: true,
             _v7_reservation_pin: None,
+            v7_frame_buffer_pool: None,
         }
     }
 
@@ -458,6 +461,7 @@ impl ParallelBuffer {
         budget: Arc<BufferBudget>,
         active_bytes: u64,
         reservation_pin: WalV7BatchBufferPin,
+        v7_frame_buffer_pool: Option<Arc<ArrayQueue<DirectBuf>>>,
     ) -> Self {
         Self {
             buffer: Some(buffer),
@@ -465,6 +469,7 @@ impl ParallelBuffer {
             active_bytes: Some(active_bytes),
             poolable: false,
             _v7_reservation_pin: Some(reservation_pin),
+            v7_frame_buffer_pool,
         }
     }
 
@@ -507,6 +512,17 @@ impl WorkerBuffer for ParallelBuffer {
         self.release_budget();
         if self.poolable && self.cap() == BUFFER_POOL_BUF_SIZE {
             let _ = pool.push(self);
+        } else if self.cap() == WAL_V7_FRAME_LEN
+            && let Some(v7_frame_buffer_pool) = self.v7_frame_buffer_pool.take()
+        {
+            let buffer = self
+                .buffer
+                .take()
+                .expect("completed v7 buffer owns its DirectBuf");
+            // The worker has reaped this write's CQE, so the reservation pin
+            // can retire while the aligned allocation is reused independently.
+            drop(self);
+            let _ = v7_frame_buffer_pool.push(buffer);
         }
     }
 }
@@ -595,6 +611,7 @@ struct RuntimeInner {
     file_size_limit: std::sync::atomic::AtomicU64,
     buffer_budget: Arc<BufferBudget>,
     buffer_pool: Arc<ArrayQueue<ParallelBuffer>>,
+    v7_frame_buffer_pool: Arc<ArrayQueue<DirectBuf>>,
     worker: IoWorkerClient<ParallelBuffer>,
     sync_progress: Arc<WalSyncProgress>,
     preallocator: Arc<File>,
@@ -787,6 +804,9 @@ impl ParallelWalRuntime {
 
         let buffer_budget = Arc::new(BufferBudget::new());
         let buffer_pool = Arc::new(ArrayQueue::new(BUFFER_POOL_CAPACITY));
+        // v7's common one-frame writes use exact 4 KiB buffers. Keep these in
+        // their own bounded pool rather than retaining them in the 256 KiB v4 pool.
+        let v7_frame_buffer_pool = Arc::new(ArrayQueue::new(BUFFER_POOL_CAPACITY));
         if start.prewarm_buffers {
             for _ in 0..BUFFER_POOL_CAPACITY {
                 let _ = buffer_pool.push(ParallelBuffer::pooled(
@@ -849,6 +869,7 @@ impl ParallelWalRuntime {
             file_size_limit: std::sync::atomic::AtomicU64::new(MAX_WAL_FILE_SIZE),
             buffer_budget,
             buffer_pool,
+            v7_frame_buffer_pool,
             worker: worker_client,
             sync_progress,
             preallocator,
@@ -971,11 +992,24 @@ impl ParallelWalRuntime {
             u64::try_from(capacity).context("v7 DATA buffer capacity exceeds u64")?;
         self.inner.buffer_budget.reserve(capacity_u64)?;
 
+        let mut direct_buffer = if capacity == WAL_V7_FRAME_LEN {
+            self.inner
+                .v7_frame_buffer_pool
+                .pop()
+                .unwrap_or_else(|| DirectBuf::new(capacity))
+        } else {
+            DirectBuf::new(capacity)
+        };
+        direct_buffer.clear();
+        let v7_frame_buffer_pool =
+            (capacity == WAL_V7_FRAME_LEN).then(|| Arc::clone(&self.inner.v7_frame_buffer_pool));
+
         Ok(ParallelBuffer::activate_unpooled(
-            DirectBuf::new(capacity),
+            direct_buffer,
             Arc::clone(&self.inner.buffer_budget),
             capacity_u64,
             reservation.pin_buffer(),
+            v7_frame_buffer_pool,
         ))
     }
 
@@ -3335,8 +3369,7 @@ mod tests {
     }
 
     #[test]
-    fn v7_admission_uses_exact_buffers_and_never_retires_them_into_the_v4_pool()
-    -> anyhow::Result<()> {
+    fn v7_admission_recycles_single_frame_buffers_in_its_separate_pool() -> anyhow::Result<()> {
         use crate::wal::v7::codec::WAL_V7_DATA_FRAGMENT_PAYLOAD_CAPACITY;
 
         let directory = tempfile::tempdir()?;
@@ -3387,6 +3420,24 @@ mod tests {
             drop(admission);
             drop(packer);
             wal.submit_and_commit(ticket)?;
+            assert!(runtime.inner.buffer_pool.is_empty());
+            let expected_v7_pool_len = if expected_capacity == super::WAL_V7_FRAME_LEN {
+                1
+            } else {
+                0
+            };
+            assert_eq!(
+                runtime.inner.v7_frame_buffer_pool.len(),
+                expected_v7_pool_len
+            );
+            if expected_capacity == super::WAL_V7_FRAME_LEN {
+                let next_batch = v7_test_batch(2, 10);
+                let (next_ticket, _) =
+                    wal.put_v7_batch_with_index(&next_batch, LIVE_WAL_V5_LIMITS)?;
+                assert!(runtime.inner.v7_frame_buffer_pool.is_empty());
+                wal.submit_and_commit(next_ticket)?;
+                assert_eq!(runtime.inner.v7_frame_buffer_pool.len(), 1);
+            }
             wal.close()?;
             assert!(runtime.inner.buffer_pool.is_empty());
             assert_eq!(owner.snapshot().buffer_memory_bytes, 0);
