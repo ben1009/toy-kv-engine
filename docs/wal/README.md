@@ -36,6 +36,7 @@ the retained and rejected experiments.
 
 ## Benchmarks and qualification
 
+- [RFC 025 v7 FRONTIER encoding outside admission, 2026-10-25](benchmarks/rfc-025-v7-frontier-lock-scope-20261025.md)
 - [RFC 025 v7 ticket-boundary experiments (rejected), 2026-10-25](benchmarks/rfc-025-v7-ticket-boundary-experiments-20261025.md)
 - [RFC 025 v7 cached extent readiness and cooled ext4 comparisons, 2026-10-25](benchmarks/rfc-025-v7-extent-readiness-cache-20261025.md)
 - [RFC 025 v7 ordered encoding outside admission, 2026-10-25](benchmarks/rfc-025-v7-packer-encoding-20261025.md)

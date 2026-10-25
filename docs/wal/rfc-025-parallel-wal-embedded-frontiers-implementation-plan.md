@@ -2460,6 +2460,21 @@ executable are restored, with retained highest scores unchanged at 15,759 /
 391,992 puts/s against v4's 20,420 / 482,410. All initial and final measurements,
 source patches, hashes, and the unrelated compaction-test retry are recorded.
 
+The [FRONTIER lock-scope follow-up](benchmarks/rfc-025-v7-frontier-lock-scope-20261025.md)
+retains moving frame allocation, encoding, and hashing outside admission after
+reserving the marker and publishing its physical range. Captured predecessor
+and prefix ownership remain with the single sync coordinator; wire bytes,
+sync ordering, poisoning, and recovery rules remain the same. All 1,958 tests
+pass. Ext4 point throughput improves 3.7% in five paired comparisons, and tmpfs
+batch64 throughput improves 9.8% with 8.3% less CPU. Across ten SSD batch64
+pairs, raw throughput improves 3.1%, the v4-normalized ratio improves 1.0%,
+and CPU rises 0.8%; the screen's SSD CPU decrease does not replicate. Solo
+tmpfs raw throughput rises 2.1%, but its normalized ratio falls 3.9%. Candidate
+ext4 peaks are 15,750 / 370,652 puts/s, below the stronger historical v7 highs
+of 15,759 / 391,992 and 22.9% / 23.2% below the highest v4 references. Every
+stall, sparse batch latency result, and unfavorable control remains recorded.
+V4 parity and the Stage 8 gate remain unmet.
+
 ## Delivery checklist
 
 - [ ] Stages 1–3: legacy compatibility, byte-exact codec, independent validation,

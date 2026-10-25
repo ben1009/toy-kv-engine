@@ -1,0 +1,39 @@
+# To display the perf.data header info, please use --header/--header-only options.
+#
+#
+# Total Lost Samples: 0
+#
+# Samples: 2K of event 'cpu-clock:u'
+# Event count (approx.): 2023069153
+#
+# Overhead  Command          Shared Object                 Symbol
+# ........  ...............  ............................  ...........................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................
+#
+    10.31%  wal-sync-coordi  write-perf-v7-cached-extents  [.] <crossbeam_channel::flavors::list::Channel<kv_engine::wal::parallel_worker::GroupWriteResult>>::recv
+     8.43%  wal-ordered-pac  write-perf-v7-cached-extents  [.] <crossbeam_channel::flavors::array::Channel<bool>>::recv
+     4.46%  write-perf-v7-c  write-perf-v7-cached-extents  [.] <parking_lot::raw_mutex::RawMutex>::lock_slow
+     4.36%  write-perf-v7-c  write-perf-v7-cached-extents  [.] <kv_engine::mvcc::LsmMvccInner>::publish_commit_ts
+     3.92%  wal-io-worker    write-perf-v7-cached-extents  [.] <crossbeam_channel::flavors::list::Channel<kv_engine::wal::parallel_worker::WorkerCommand<kv_engine::wal::parallel_runtime::ParallelBuffer>>>::recv
+     2.93%  write-perf-v7-c  [vdso]                        [.] __vdso_clock_gettime
+     2.68%  wal-ordered-pac  write-perf-v7-cached-extents  [.] sha2::sha256::x86::digest_blocks
+     2.23%  wal-ordered-pac  write-perf-v7-cached-extents  [.] crc32fast::specialized::pclmulqdq::calculate
+     1.88%  wal-sync-coordi  write-perf-v7-cached-extents  [.] sha2::sha256::x86::digest_blocks
+     1.54%  wal-io-worker    write-perf-v7-cached-extents  [.] kv_engine::wal::parallel_worker::run_worker::<kv_engine::wal::parallel_runtime::ParallelBuffer>
+     1.54%  wal-ordered-pac  write-perf-v7-cached-extents  [.] kv_engine::wal::parallel_runtime::pack_admitted_groups
+     1.54%  write-perf-v7-c  write-perf-v7-cached-extents  [.] <crossbeam_skiplist::base::SkipList<bytes::bytes::Bytes, bytes::bytes::Bytes>>::search_position::<bytes::bytes::Bytes>
+     1.49%  wal-io-worker    write-perf-v7-cached-extents  [.] <std::hash::random::RandomState as core::hash::BuildHasher>::hash_one::<&kv_engine::wal::parallel_worker::RequestId>
+     1.44%  write-perf-v7-c  write-perf-v7-cached-extents  [.] <kv_engine::lsm_storage::LsmStorageInner>::maybe_queue_pitr_maintenance
+     1.39%  write-perf-v7-c  write-perf-v7-cached-extents  [.] <std::thread::local::LocalKey<core::cell::RefCell<alloc::vec::Vec<u8>>>>::with::<<kv_engine::mem_table::MemTable>::publish_raw_batch::{closure#0}, ()>
+     1.24%  write-perf-v7-c  libc.so.6                     [.] 0x00000000000a5fdc
+     1.19%  wal-ordered-pac  write-perf-v7-cached-extents  [.] crc32fast::baseline::update_fast_16
+     1.04%  write-perf-v7-c  libc.so.6                     [.] syscall
+     0.99%  write-perf-v7-c  write-perf-v7-cached-extents  [.] <parking_lot::condvar::Condvar>::wait_until_internal
+     0.94%  write-perf-v7-c  write-perf-v7-cached-extents  [.] <kv_engine::lsm_storage::LsmStorageInner>::put_with_lifecycle_admission
+     0.94%  write-perf-v7-c  write-perf-v7-cached-extents  [.] <kv_engine::mem_table::MemTable>::write_prepared_v7_pitr_wal_batch_only
+     0.89%  wal-ordered-pac  write-perf-v7-cached-extents  [.] <parking_lot::raw_mutex::RawMutex>::lock_slow
+     0.84%  write-perf-v7-c  write-perf-v7-cached-extents  [.] <kv_engine::wal::parallel_runtime::ParallelWalRuntime>::prepare_v7_batch
+
+
+#
+# (Tip: To add Node.js USDT(User-Level Statically Defined Tracing): perf buildid-cache --add `which node`)
+#
