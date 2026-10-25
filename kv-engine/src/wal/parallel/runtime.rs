@@ -22,9 +22,9 @@ use crate::{
             WalV7FrontierReservation, WalV7PhysicalAllocator,
         },
         codec::{
-            PreparedWalV7LogicalBatch, WAL_V7_FRAME_LEN, WAL_V7_HEADER_LEN, WalV7Frontier,
-            WalV7Header, data_fragment_count, encode_data_frames_into,
-            encode_frontier_successor_into, frame_record_digest, prepare_logical_batch,
+            EncodedWalV7Entries, WAL_V7_FRAME_LEN, WAL_V7_HEADER_LEN, WalV7Frontier, WalV7Header,
+            data_fragment_count, encode_data_frames_into, encode_frontier_successor_into,
+            frame_record_digest, prepare_logical_batch,
         },
         install::{WalV7RuntimeMetadata, WalV7RuntimeSeed},
         leader::WalV7LeaderCapacityError,
@@ -71,12 +71,15 @@ impl std::fmt::Display for WalFull {
 
 impl std::error::Error for WalFull {}
 
-/// A v7 batch whose canonical entry stream and scratch reservation were
-/// prepared before the caller enters the MVCC write sequencer.
-pub(crate) struct WalV7PreparedBatch<'a> {
-    prepared: PreparedWalV7LogicalBatch<'a>,
-    owner: Arc<WalV7ReservationOwner>,
-    preparation: Option<crate::wal::v7::admission::WalV7OwnedPreparationReservation>,
+/// Owned v7 entry bytes and charged DATA buffers prepared before the caller
+/// enters the MVCC sequencer. Admission assigns their ordered coordinates.
+pub(crate) struct WalV7PreparedBatch {
+    // Drop owned bytes and the frame buffer before their reservation charge.
+    encoded_entries: EncodedWalV7Entries,
+    buffer: ParallelBuffer,
+    reservation: WalV7OwnedBatchReservation,
+    fragment_count: u32,
+    frame_bytes: usize,
     limits: WalV5Limits,
 }
 
@@ -1059,13 +1062,13 @@ impl ParallelWalRuntime {
         ))
     }
 
-    /// Validate a v7 batch and hold its temporary preparation charge. Callers
-    /// may retain this value while assigning ordered MVCC metadata.
-    pub(crate) fn prepare_v7_batch<'a>(
+    /// Validate and encode a v7 entry stream with its charged frame buffer.
+    /// Callers may retain this owned value while assigning MVCC metadata.
+    pub(crate) fn prepare_v7_batch(
         &self,
-        batch: &'a WalBatch,
+        batch: &WalBatch,
         limits: WalV5Limits,
-    ) -> Result<WalV7PreparedBatch<'a>> {
+    ) -> Result<WalV7PreparedBatch> {
         ensure!(!batch.entries.is_empty(), "v7 WAL batch is empty");
         let limits = WalV5Limits {
             max_input_entry_count: limits
@@ -1099,37 +1102,6 @@ impl ParallelWalRuntime {
         let preparation = owner.reserve_preparation_buffer(preparation_bytes)?;
         let prepared = prepare_logical_batch(batch, limits)?;
 
-        Ok(WalV7PreparedBatch {
-            prepared,
-            owner,
-            preparation,
-            limits,
-        })
-    }
-
-    /// Prepare and admit one v7 ticket into the ordered parallel DATA packer.
-    /// The caller publishes the returned ticket only after `wait_durable`.
-    pub(crate) fn put_v7_batch(&self, batch: &WalBatch, limits: WalV5Limits) -> Result<(u64, u64)> {
-        let commit_ts = batch.commit_ts;
-        let recorded_at = batch.recorded_at;
-        let prepared = self.prepare_v7_batch(batch, limits)?;
-        self.put_v7_prepared_batch(prepared, commit_ts, recorded_at)
-    }
-
-    /// Admit a previously prepared batch with ordered MVCC metadata.
-    pub(crate) fn put_v7_prepared_batch(
-        &self,
-        prepared_batch: WalV7PreparedBatch<'_>,
-        commit_ts: u64,
-        sampled_recorded_at: crate::pitr::RecordedAt,
-    ) -> Result<(u64, u64)> {
-        let WalV7PreparedBatch {
-            prepared,
-            owner,
-            preparation,
-            limits,
-        } = prepared_batch;
-
         let encoded_batch_bytes =
             u64::try_from(prepared.encoded_len()).context("v7 logical batch length exceeds u64")?;
         let fragment_count = data_fragment_count(encoded_batch_bytes)
@@ -1148,7 +1120,7 @@ impl ParallelWalRuntime {
 
         // Charge persistent frames, marker headroom, seal index, and all batch
         // buffers before allocating a direct buffer or assigning coordinates.
-        let mut reservation = match owner.reserve_batch(encoded_batch_bytes) {
+        let reservation = match owner.reserve_batch(encoded_batch_bytes) {
             Ok(reservation) => reservation,
             Err(resource_error) => {
                 // Concurrent producers can consume the remaining segment space
@@ -1162,7 +1134,45 @@ impl ParallelWalRuntime {
         };
         let encoded_entries = prepared.encode_entry_stream()?;
         drop(preparation);
-        let mut buffer = self.allocate_v7_buffer(frame_bytes, &reservation)?;
+        let buffer = self.allocate_v7_buffer(frame_bytes, &reservation)?;
+
+        Ok(WalV7PreparedBatch {
+            encoded_entries,
+            buffer,
+            reservation,
+            fragment_count,
+            frame_bytes,
+            limits,
+        })
+    }
+
+    /// Prepare and admit one v7 ticket into the ordered parallel DATA packer.
+    /// The caller publishes the returned ticket only after `wait_durable`.
+    pub(crate) fn put_v7_batch(&self, batch: &WalBatch, limits: WalV5Limits) -> Result<(u64, u64)> {
+        let commit_ts = batch.commit_ts;
+        let recorded_at = batch.recorded_at;
+        let prepared = self.prepare_v7_batch(batch, limits)?;
+        self.put_v7_prepared_batch(prepared, commit_ts, recorded_at)
+    }
+
+    /// Admit a previously prepared batch with ordered MVCC metadata.
+    pub(crate) fn put_v7_prepared_batch(
+        &self,
+        prepared_batch: WalV7PreparedBatch,
+        commit_ts: u64,
+        sampled_recorded_at: crate::pitr::RecordedAt,
+    ) -> Result<(u64, u64)> {
+        // Locals drop in reverse binding order on early rejection: buffers
+        // and encoded bytes must release before their reservation charge.
+        let WalV7PreparedBatch {
+            mut reservation,
+            encoded_entries,
+            mut buffer,
+            fragment_count,
+            frame_bytes,
+            limits,
+        } = prepared_batch;
+
         let mut post_admission_failure = None;
         let (ticket, first_data_offset, logical_batch) = {
             let mut admission = self.inner.admission.lock();
@@ -2841,6 +2851,123 @@ mod tests {
         }
     }
 
+    #[test]
+    fn v7_prepared_batches_own_bytes_and_release_cancelled_resources() -> anyhow::Result<()> {
+        use crate::wal::v7::{
+            install::recover_and_install_active, recovery::WalV7RecoveryAuthority,
+        };
+
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("owned-preparation.wal");
+        let Some(V7RuntimeTestWal { wal, owner, anchor }) =
+            live_v7_test_wal(&path, super::MAX_WAL_FILE_SIZE, v7_test_resource_limits())?
+        else {
+            return Ok(());
+        };
+        let baseline = owner.snapshot();
+        let cancelled = wal.prepare_v7_parallel_batch(&v7_test_batch(1, 10), LIVE_WAL_V5_LIMITS)?;
+        assert!(owner.snapshot().buffer_memory_bytes > baseline.buffer_memory_bytes);
+        assert!(owner.has_in_flight_source_spool_work());
+        assert_eq!(
+            wal.next_ticket.load(std::sync::atomic::Ordering::Acquire),
+            0
+        );
+        drop(cancelled);
+        assert_eq!(owner.snapshot(), baseline);
+        assert!(!owner.has_in_flight_source_spool_work());
+        let runtime = wal.parallel_runtime.as_ref().unwrap();
+        assert_eq!(runtime.inner.buffer_budget.state.lock().active_bytes, 0);
+
+        let first = v7_test_batch(1, 10);
+        let second = v7_test_batch(2, 20);
+        let first_entries = first.entries.clone();
+        let second_entries = second.entries.clone();
+        let first_prepared = wal.prepare_v7_parallel_batch(&first, LIVE_WAL_V5_LIMITS)?;
+        let second_prepared = wal.prepare_v7_parallel_batch(&second, LIVE_WAL_V5_LIMITS)?;
+        drop((first, second));
+        // Preparation order does not assign tickets, timestamps, or recorded
+        // time. Consume in reverse order with metadata chosen by the sequencer.
+        let recorded_at = RecordedAt { secs: 60, nanos: 5 };
+        let first_ticket = wal
+            .put_v7_prepared_batch_with_index(second_prepared, 7, recorded_at)?
+            .0;
+        let second_ticket = wal
+            .put_v7_prepared_batch_with_index(first_prepared, 9, RecordedAt { secs: 40, nanos: 0 })?
+            .0;
+        assert_eq!((first_ticket, second_ticket), (0, 1));
+        wal.submit_and_commit(second_ticket)?;
+        wal.close()?;
+        assert_eq!(owner.snapshot().buffer_memory_bytes, 0);
+        drop(wal);
+
+        let recovered = recover_and_install_active(
+            &path,
+            WalV7RecoveryAuthority::Active {
+                predecessor: crate::pitr::ChainAnchor::Genesis {
+                    archive_epoch_id: crate::pitr::ArchiveEpochId(anchor.archive_epoch_id),
+                },
+                durable_anchors: vec![anchor],
+            },
+        )?;
+        let batches = &recovered.installed.batches;
+        assert_eq!(batches.len(), 2);
+        assert_eq!((batches[0].commit_ts, batches[1].commit_ts), (7, 9));
+        assert_eq!(batches[0].entries, second_entries);
+        assert_eq!(batches[1].entries, first_entries);
+        assert_eq!(batches[0].recorded_at, recorded_at);
+        assert_eq!(batches[1].recorded_at, recorded_at);
+
+        Ok(())
+    }
+
+    #[test]
+    fn v7_prepared_batch_rechecks_capacity_and_retires_rejected_buffers() -> anyhow::Result<()> {
+        use crate::wal::v7::leader::WalV7LeaderCapacityError;
+
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("prepared-capacity-race.wal");
+        let limit = 4 * super::WAL_V7_FRAME_LEN as u64;
+        let Some(V7RuntimeTestWal { wal, owner, .. }) =
+            live_v7_test_wal(&path, limit, v7_test_resource_limits())?
+        else {
+            return Ok(());
+        };
+        let baseline = owner.snapshot();
+        let batch = v7_test_batch(1, 10);
+        let first = wal.prepare_v7_parallel_batch(&batch, LIVE_WAL_V5_LIMITS)?;
+        let second = wal.prepare_v7_parallel_batch(&batch, LIVE_WAL_V5_LIMITS)?;
+        let ticket = wal
+            .put_v7_prepared_batch_with_index(first, 1, batch.recorded_at)?
+            .0;
+        wal.submit_and_commit(ticket)?;
+        let error = wal
+            .put_v7_prepared_batch_with_index(second, 2, batch.recorded_at)
+            .expect_err("the first prepared batch has filled the segment");
+        assert_eq!(
+            error.downcast_ref::<WalV7LeaderCapacityError>(),
+            Some(&WalV7LeaderCapacityError::RotationRequired)
+        );
+        assert_eq!(
+            wal.next_ticket.load(std::sync::atomic::Ordering::Acquire),
+            1
+        );
+        assert!(!wal.parallel_runtime.as_ref().unwrap().is_poisoned());
+        wal.close()?;
+        let retained = owner.snapshot();
+        assert_eq!(retained.buffer_memory_bytes, 0);
+        assert_eq!(
+            retained.logical_wal_bytes - baseline.logical_wal_bytes,
+            8192
+        );
+        assert_eq!(
+            retained.source_spool_bytes - baseline.source_spool_bytes,
+            8192
+        );
+        assert_eq!(retained.seal_index_bytes - baseline.seal_index_bytes, 8);
+
+        Ok(())
+    }
+
     fn complete_test_v7_data(
         inner: &super::RuntimeInner,
         batch: AdmittedBatch,
@@ -2850,9 +2977,23 @@ mod tests {
             ticket,
             file_offset,
             aligned_len,
+            v7_prefix,
             buffer,
             ..
         } = batch;
+        // These tests bypass the packer and complete one batch per group;
+        // publish the same endpoint snapshot that take_admitted_group records.
+        assert!(
+            inner
+                .admission
+                .lock()
+                .v7_prefixes
+                .insert(
+                    ticket + 1,
+                    v7_prefix.expect("test DATA batch has a prefix snapshot"),
+                )
+                .is_none()
+        );
         if error.is_none() {
             inner.preallocator.write_all_at(
                 buffer

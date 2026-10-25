@@ -454,6 +454,37 @@ pub(crate) struct PreparedWalV7LogicalBatch<'a> {
     limits: WalV5Limits,
 }
 
+/// Canonically encoded entry bytes whose ticket and commit metadata have not
+/// yet been assigned by ordered WAL admission.
+pub(crate) struct EncodedWalV7Entries {
+    output: Vec<u8>,
+    entry_stream_crc: u32,
+    entry_count: u32,
+    limits: WalV5Limits,
+}
+
+impl EncodedWalV7Entries {
+    /// Fill the reserved logical header after admission assigns ordered metadata.
+    pub(crate) fn encode_with_metadata(
+        mut self,
+        segment_ticket: u64,
+        commit_ts: u64,
+        recorded_at: RecordedAt,
+    ) -> Result<Vec<u8>> {
+        let data_len = self.output.len() - WAL_V7_LOGICAL_BATCH_HEADER_LEN;
+        let header = WalV7LogicalBatchHeader {
+            segment_ticket,
+            commit_ts,
+            recorded_at_secs: recorded_at.secs,
+            recorded_at_nanos: recorded_at.nanos,
+            entry_count: self.entry_count,
+        }
+        .encode_with_data_crc(data_len, self.entry_stream_crc, self.limits)?;
+        self.output[..WAL_V7_LOGICAL_BATCH_HEADER_LEN].copy_from_slice(&header);
+        Ok(self.output)
+    }
+}
+
 impl PreparedWalV7LogicalBatch<'_> {
     pub(crate) fn encoded_len(&self) -> usize {
         self.logical_len
@@ -476,6 +507,13 @@ impl PreparedWalV7LogicalBatch<'_> {
         commit_ts: u64,
         recorded_at: RecordedAt,
     ) -> Result<Vec<u8>> {
+        self.encode_entry_stream()?
+            .encode_with_metadata(segment_ticket, commit_ts, recorded_at)
+    }
+
+    /// Encode the canonical entries before ordered admission takes its mutex.
+    /// The logical header is reserved and filled once the ticket is assigned.
+    pub(crate) fn encode_entry_stream(self) -> Result<EncodedWalV7Entries> {
         let Self {
             batch: _,
             canonical,
@@ -495,17 +533,12 @@ impl PreparedWalV7LogicalBatch<'_> {
             written == entry_stream_len,
             "v7 logical batch entry stream length changed while encoding"
         );
-        let header = WalV7LogicalBatchHeader {
-            segment_ticket,
-            commit_ts,
-            recorded_at_secs: recorded_at.secs,
-            recorded_at_nanos: recorded_at.nanos,
+        Ok(EncodedWalV7Entries {
+            output,
+            entry_stream_crc,
             entry_count: canonical.entry_count(),
-        }
-        .encode_with_data_crc(entry_stream.len(), entry_stream_crc, limits)?;
-        output[..WAL_V7_LOGICAL_BATCH_HEADER_LEN].copy_from_slice(&header);
-
-        Ok(output)
+            limits,
+        })
     }
 }
 
@@ -657,7 +690,6 @@ pub(crate) fn encode_data_frames_into(
         output.len() >= output_len,
         "v7 DATA frame output buffer is too small"
     );
-
     ensure!(
         first_frame_offset >= (WAL_V7_HEADER_LEN + WAL_V7_FRAME_LEN) as u64,
         "v7 DATA frame sequence overlaps the generation-zero FRONTIER"

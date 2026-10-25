@@ -729,6 +729,9 @@ impl LsmMvccInner {
             !(value.len() == 1 && value[0] == crate::vlog::KvKind::Tombstone as u8),
             "value must not be the tombstone marker byte (0x02)"
         );
+        if memtable.uses_v7_wal() && memtable.uses_parallel_wal() {
+            return self.write_v7_parallel_wal_only(user_key, value, memtable);
+        }
         let _write_guard = self.write_lock.lock();
         let commit_ts = self.reserve_commit_ts()?;
         let _unwind_guard = self.guard_v7_commit_unwind(memtable, commit_ts);
@@ -764,6 +767,49 @@ impl LsmMvccInner {
         // Do NOT advance current_ts here — readers would see the timestamp
         // before the data is published to the skiplist. The caller must
         // advance current_ts after commit_wal_ticket + publish_raw_batch succeed.
+
+        Ok((commit_ts, encoded_key, prefixed, ticket))
+    }
+
+    /// Prepare owned v7 bytes and buffer reservations before taking the MVCC
+    /// sequencer. Ticket assignment and admission remain timestamp ordered.
+    fn write_v7_parallel_wal_only(
+        &self,
+        user_key: &[u8],
+        value: &[u8],
+        memtable: &MemTable,
+    ) -> Result<WalPublish, anyhow::Error> {
+        let recorded_at = self.next_pitr_recorded_at(std::time::SystemTime::now())?;
+        let mut prefixed = Vec::with_capacity(1 + value.len());
+        prefixed.push(crate::vlog::KvKind::Inline as u8);
+        prefixed.extend_from_slice(value);
+        let batch = crate::pitr::WalBatch {
+            commit_ts: 1,
+            recorded_at,
+            entries: vec![crate::pitr::WalEntry::Put {
+                key: user_key.to_vec(),
+                value: prefixed.clone(),
+            }],
+        };
+        let prepared =
+            memtable.prepare_v7_pitr_wal_batch(&batch, crate::pitr::LIVE_WAL_V5_LIMITS)?;
+        drop(batch);
+
+        let _write_guard = self.write_lock.lock();
+        let commit_ts = self.reserve_commit_ts()?;
+        let _unwind_guard = self.guard_v7_commit_unwind(memtable, commit_ts);
+        let encoded_key = encode_internal_key(user_key, commit_ts);
+        let ticket = match memtable.write_prepared_v7_pitr_wal_batch_only(
+            prepared,
+            commit_ts,
+            recorded_at,
+        ) {
+            Ok(ticket) => ticket,
+            Err(error) => {
+                self.record_wal_append_failure(memtable, commit_ts);
+                return Err(error);
+            }
+        };
 
         Ok((commit_ts, encoded_key, prefixed, ticket))
     }

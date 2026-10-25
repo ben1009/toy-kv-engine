@@ -1791,13 +1791,13 @@ impl Wal {
         Ok(ticket)
     }
 
-    /// Append a v7 PITR batch and return the first DATA frame offset for its
-    /// seal index. Callers must serialize this with their seal-index update.
-    pub(crate) fn prepare_v7_parallel_batch<'a>(
+    /// Prepare owned v7 PITR entry bytes and charged buffers before entering
+    /// the caller's timestamp sequencer and seal-index critical section.
+    pub(crate) fn prepare_v7_parallel_batch(
         &self,
-        batch: &'a crate::pitr::WalBatch,
+        batch: &crate::pitr::WalBatch,
         limits: crate::pitr::WalV5Limits,
-    ) -> Result<WalV7PreparedBatch<'a>> {
+    ) -> Result<WalV7PreparedBatch> {
         anyhow::ensure!(
             self.format_version == WAL_FORMAT_VERSION_V7,
             "v7 WAL preparation selected for format {}",
@@ -1821,7 +1821,7 @@ impl Wal {
     /// for the seal index. Callers serialize this with their seal-index update.
     pub(crate) fn put_v7_prepared_batch_with_index(
         &self,
-        prepared: WalV7PreparedBatch<'_>,
+        prepared: WalV7PreparedBatch,
         commit_ts: u64,
         recorded_at: crate::pitr::RecordedAt,
     ) -> Result<(u64, u64)> {

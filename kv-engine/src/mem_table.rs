@@ -1990,11 +1990,11 @@ impl MemTable {
     }
 
     /// Prepare a v7 Parallel point batch before entering the MVCC sequencer.
-    pub(crate) fn prepare_v7_pitr_wal_batch<'a>(
+    pub(crate) fn prepare_v7_pitr_wal_batch(
         &self,
-        batch: &'a crate::pitr::WalBatch,
+        batch: &crate::pitr::WalBatch,
         limits: crate::pitr::WalV5Limits,
-    ) -> Result<crate::wal::WalV7PreparedBatch<'a>> {
+    ) -> Result<crate::wal::WalV7PreparedBatch> {
         let wal = self
             .wal
             .as_ref()
@@ -2026,7 +2026,7 @@ impl MemTable {
     /// in the seal index only after WAL admission succeeds.
     pub(crate) fn write_prepared_v7_pitr_wal_batch_only(
         &self,
-        prepared: crate::wal::WalV7PreparedBatch<'_>,
+        prepared: crate::wal::WalV7PreparedBatch,
         commit_ts: u64,
         recorded_at: crate::pitr::RecordedAt,
     ) -> Result<Option<u64>> {
