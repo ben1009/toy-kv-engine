@@ -14,7 +14,7 @@ use std::{
 };
 
 use crate::{
-    pitr::{CanonicalWalEntryStream, LIVE_WAL_V5_LIMITS, WalBatch, WalV5Limits},
+    pitr::{CanonicalWalEntryStream, LIVE_WAL_V5_LIMITS, RecordedAt, WalBatch, WalV5Limits},
     wal::v7::{
         admission::{WalV7BatchBufferPin, WalV7OwnedBatchReservation, WalV7ReservationOwner},
         allocator::{
@@ -540,6 +540,7 @@ struct AdmittedBatch {
     file_offset: u64,
     aligned_len: usize,
     v7_allocation: Option<WalV7DataAllocation>,
+    v7_prefix: Option<WalV7PrefixMetadata>,
     buffer: ParallelBuffer,
 }
 
@@ -565,16 +566,51 @@ struct AdmissionState {
     v7_allocator: Option<WalV7PhysicalAllocator>,
     v7_header_digest: Option<[u8; 32]>,
     v7_reservation_owner: Option<Arc<WalV7ReservationOwner>>,
-    v7_metadata: Option<WalV7RuntimeMetadata>,
+    v7_metadata: Option<ParallelWalV7Metadata>,
     v7_prefixes: BTreeMap<u64, WalV7PrefixMetadata>,
     v7_reservations: BTreeMap<u64, WalV7OwnedBatchReservation>,
     queue: VecDeque<AdmittedBatch>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct WalV7PrefixMetadata {
     last_commit_ts: u64,
-    prefix_digest: [u8; 32],
+    logical_hasher: Sha256,
+}
+
+struct ParallelWalV7Metadata {
+    logical_hasher: Sha256,
+    last_commit_ts: u64,
+    physical_end: u64,
+    last_recorded_at: Option<RecordedAt>,
+}
+
+impl ParallelWalV7Metadata {
+    fn from_runtime(metadata: WalV7RuntimeMetadata, last_commit_ts: u64) -> Self {
+        Self {
+            logical_hasher: metadata.logical_hasher,
+            last_commit_ts,
+            physical_end: metadata.physical_hashed_end,
+            last_recorded_at: metadata.last_recorded_at,
+        }
+    }
+
+    fn validate_frontier(&self, frontier: WalV7Frontier, append_offset: u64) -> Result<()> {
+        let logical_digest: [u8; 32] = self.logical_hasher.clone().finalize().into();
+        ensure!(
+            logical_digest == frontier.prefix_digest,
+            "v7 runtime logical hash does not match its recovered FRONTIER"
+        );
+        ensure!(
+            self.physical_end == append_offset,
+            "v7 runtime physical cursor does not reach the installed image end"
+        );
+        ensure!(
+            self.last_recorded_at.is_some() == (frontier.ticket_end > 0),
+            "v7 runtime recorded-time cursor disagrees with its recovered ticket frontier"
+        );
+        Ok(())
+    }
 }
 
 struct WalV7FrontierCycle {
@@ -798,6 +834,10 @@ impl ParallelWalRuntime {
         start.validate()?;
         start.validate_v7_file_handles(&worker_file, &sync_file, &preallocator)?;
         let initial_file_end = start.append_offset;
+        let initial_v7_commit_ts = start
+            .v7_allocator
+            .as_ref()
+            .map(|allocator| allocator.last_frontier().frontier.last_commit_ts);
 
         ensure!(
             (start.min_append_offset..=start.max_file_size).contains(&initial_file_end),
@@ -854,7 +894,11 @@ impl ParallelWalRuntime {
                 v7_allocator: start.v7_allocator,
                 v7_header_digest: start.v7_header_digest,
                 v7_reservation_owner: start.v7_reservation_owner,
-                v7_metadata: start.v7_metadata,
+                v7_metadata: start.v7_metadata.zip(initial_v7_commit_ts).map(
+                    |(metadata, last_commit_ts)| {
+                        ParallelWalV7Metadata::from_runtime(metadata, last_commit_ts)
+                    },
+                ),
                 v7_prefixes: BTreeMap::new(),
                 v7_reservations: BTreeMap::new(),
                 queue: VecDeque::new(),
@@ -1116,9 +1160,11 @@ impl ParallelWalRuntime {
                 return Err(resource_error).context("reserve v7 Parallel batch resources");
             }
         };
+        let encoded_entries = prepared.encode_entry_stream()?;
+        drop(preparation);
         let mut buffer = self.allocate_v7_buffer(frame_bytes, &reservation)?;
         let mut post_admission_failure = None;
-        let (ticket, first_data_offset) = {
+        let (ticket, first_data_offset, logical_batch) = {
             let mut admission = self.inner.admission.lock();
             ensure!(admission.open, "v7 Parallel WAL admission is closed");
             validate_v7_data_capacity(&admission, fragment_count)?;
@@ -1132,23 +1178,21 @@ impl ParallelWalRuntime {
                 ticket == admission.next_ticket,
                 "v7 Parallel admission ticket cursor disagrees with its allocator"
             );
-            let previous = allocator.last_frontier();
             let allocation_tail = allocator.allocation_tail();
-            let physical_hashed_end = admission
+            let physical_end = admission
                 .v7_metadata
                 .as_ref()
-                .map(|metadata| metadata.physical_hashed_end)
-                .context("v7 Parallel runtime has no hash metadata")?;
+                .map(|metadata| metadata.physical_end)
+                .context("v7 Parallel runtime has no metadata")?;
             ensure!(
-                physical_hashed_end == allocation_tail,
-                "v7 Parallel physical hash cursor disagrees with DATA allocator"
+                physical_end == allocation_tail,
+                "v7 Parallel physical cursor disagrees with DATA allocator"
             );
             let last_commit_ts = admission
-                .v7_prefixes
-                .last_key_value()
-                .map_or(previous.frontier.last_commit_ts, |(_, metadata)| {
-                    metadata.last_commit_ts
-                });
+                .v7_metadata
+                .as_ref()
+                .map(|metadata| metadata.last_commit_ts)
+                .context("v7 Parallel runtime has no commit timestamp metadata")?;
             ensure!(
                 commit_ts > last_commit_ts,
                 "v7 Parallel batch commit timestamp does not advance"
@@ -1160,8 +1204,8 @@ impl ParallelWalRuntime {
                 .map_or(sampled_recorded_at, |previous| {
                     previous.max(sampled_recorded_at)
                 });
-            let logical_batch = prepared.encode_with_metadata(ticket, commit_ts, recorded_at)?;
-            drop(preparation);
+            let logical_batch =
+                encoded_entries.encode_with_metadata(ticket, commit_ts, recorded_at)?;
             let next_ticket = ticket
                 .checked_add(1)
                 .context("v7 Parallel ticket counter overflows")?;
@@ -1183,8 +1227,7 @@ impl ParallelWalRuntime {
             let first_data_offset = allocation.frame_range().start;
             let data_end = allocation.frame_range().end;
             reservation.mark_admitted();
-            let previous_reservation = admission.v7_reservations.insert(ticket, reservation);
-            debug_assert!(previous_reservation.is_none());
+            admission.v7_reservations.insert(ticket, reservation);
             admission.next_ticket = next_ticket;
             admission.admitted_end = data_end;
 
@@ -1204,24 +1247,19 @@ impl ParallelWalRuntime {
                         .as_mut()
                         .expect("v7 runtime metadata is present for a v7 allocator");
                     metadata.logical_hasher.update(&logical_batch);
-                    let prefix_digest: [u8; 32] = metadata.logical_hasher.clone().finalize().into();
-                    metadata
-                        .physical_hasher
-                        .update(buffer.direct_mut().initialized_slice(0, encoded_len));
-                    metadata.physical_hashed_end = data_end;
+                    metadata.last_commit_ts = commit_ts;
+                    metadata.physical_end = data_end;
                     metadata.last_recorded_at = Some(recorded_at);
-                    admission.v7_prefixes.insert(
-                        next_ticket,
-                        WalV7PrefixMetadata {
-                            last_commit_ts: commit_ts,
-                            prefix_digest,
-                        },
-                    );
+                    let v7_prefix = Some(WalV7PrefixMetadata {
+                        last_commit_ts: commit_ts,
+                        logical_hasher: metadata.logical_hasher.clone(),
+                    });
                     admission.queue.push_back(AdmittedBatch {
                         ticket,
                         file_offset: first_data_offset,
                         aligned_len: encoded_len,
                         v7_allocation: Some(allocation),
+                        v7_prefix,
                         buffer,
                     });
                     #[cfg(feature = "chaos-testing")]
@@ -1245,8 +1283,12 @@ impl ParallelWalRuntime {
                     admission.poison = Some((*failed_ticket, format!("{error:#}")));
                 }
             }
-            (ticket, first_data_offset)
+            (ticket, first_data_offset, logical_batch)
         };
+
+        // The byte stream has already been hashed in order; free its temporary
+        // allocation after releasing the shared admission mutex.
+        drop(logical_batch);
 
         if let Some((ticket, error)) = post_admission_failure {
             report_packer_failure(&self.inner, ticket, &error);
@@ -1359,6 +1401,7 @@ impl ParallelWalRuntime {
             file_offset,
             aligned_len,
             v7_allocation: None,
+            v7_prefix: None,
             buffer,
         });
         #[cfg(feature = "chaos-testing")]
@@ -1781,6 +1824,7 @@ fn take_admitted_group(
     let mut writes = WriteGroupBuffers::with_capacity(group_capacity);
     let mut data_allocations = v7_layout.then(|| Vec::with_capacity(group_capacity));
     let mut initialize_extents = false;
+    let mut v7_prefix = None;
     let mut expected_ticket = next_ticket;
     let mut packed_end = reserved_end;
     while writes.len() < max_tickets {
@@ -1804,6 +1848,7 @@ fn take_admitted_group(
             file_offset,
             aligned_len,
             v7_allocation,
+            v7_prefix: batch_v7_prefix,
             buffer,
         } = batch;
         // Keep zero-fill for groups containing small writes. Only extent
@@ -1841,6 +1886,16 @@ fn take_admitted_group(
             (true, None) => bail!("v7 WAL admission batch has no physical allocation"),
             (false, Some(_)) => bail!("legacy WAL admission batch has a v7 physical allocation"),
         }
+        if v7_layout {
+            v7_prefix = Some(
+                batch_v7_prefix.context("v7 WAL admission batch has no logical prefix state")?,
+            );
+        } else {
+            ensure!(
+                batch_v7_prefix.is_none(),
+                "legacy WAL admission batch has v7 logical prefix state"
+            );
+        }
         expected_ticket = expected_ticket
             .checked_add(1)
             .ok_or_else(|| anyhow!("parallel WAL ticket counter overflow"))?;
@@ -1864,6 +1919,18 @@ fn take_admitted_group(
     } else {
         Vec::new()
     };
+    if v7_layout {
+        ensure!(
+            admission
+                .v7_prefixes
+                .insert(
+                    expected_ticket,
+                    v7_prefix.context("v7 WAL group has no endpoint logical prefix state")?,
+                )
+                .is_none(),
+            "v7 WAL group endpoint already has logical prefix state"
+        );
+    }
 
     Ok(Some(PackedGroup {
         first_ticket,
@@ -2182,19 +2249,19 @@ fn append_v7_frontier(
             .frame_offset
             .checked_add(WAL_V7_FRAME_LEN as u64)
             .context("previous v7 FRONTIER end overflows")?;
-        let physical_hashed_end = admission
+        let physical_end = admission
             .v7_metadata
             .as_ref()
-            .map(|metadata| metadata.physical_hashed_end)
-            .context("v7 Parallel runtime has no hash metadata")?;
+            .map(|metadata| metadata.physical_end)
+            .context("v7 Parallel runtime has no metadata")?;
         ensure!(
-            physical_hashed_end == allocation_tail,
-            "v7 Parallel physical hash cursor disagrees with FRONTIER allocation tail"
+            physical_end == allocation_tail,
+            "v7 Parallel physical cursor disagrees with FRONTIER allocation tail"
         );
         let prefix = admission
             .v7_prefixes
             .get(&target)
-            .copied()
+            .cloned()
             .context("v7 Parallel runtime has no digest snapshot for FRONTIER target")?;
         let header_digest = admission
             .v7_header_digest
@@ -2215,7 +2282,7 @@ fn append_v7_frontier(
             ticket_end: target,
             durable_end: reservation.durable_end(),
             last_commit_ts: prefix.last_commit_ts,
-            prefix_digest: prefix.prefix_digest,
+            prefix_digest: prefix.logical_hasher.finalize().into(),
             previous_frontier_offset: previous.frame_offset,
             previous_frontier_digest: previous.frame_digest,
         };
@@ -2251,9 +2318,8 @@ fn append_v7_frontier(
         let metadata = admission
             .v7_metadata
             .as_mut()
-            .context("v7 Parallel runtime lost its hash metadata")?;
-        metadata.physical_hasher.update(frontier_bytes);
-        metadata.physical_hashed_end = frame_end;
+            .context("v7 Parallel runtime lost its metadata")?;
+        metadata.physical_end = frame_end;
         admission.admitted_end = frame_end;
         // Record the marker in the shared hash cursor before producers can
         // append after it. Any failure in the I/O below poisons this runtime.
@@ -2621,6 +2687,7 @@ mod tests {
             WalV7ReservationOwner, WalV7ResourceCharge, WalV7ResourceLedger, WalV7ResourceLimits,
         },
     };
+    use sha2::Digest;
 
     struct V7RuntimeTestWal {
         wal: Wal,
@@ -3489,7 +3556,6 @@ mod tests {
         let prefix_digest = logical_hasher.clone().finalize().into();
         let mut physical_hasher = Sha256::new();
         physical_hasher.update(b"normalized physical image");
-        let physical_digest: [u8; 32] = physical_hasher.clone().finalize().into();
         let last_recorded_at = Some(RecordedAt { secs: 60, nanos: 0 });
         let frontier_cursor = WalV7FrontierCursor {
             frontier: WalV7Frontier {
@@ -3793,11 +3859,8 @@ mod tests {
                 .as_ref()
                 .expect("runtime retains v7 metadata");
             let logical_digest: [u8; 32] = metadata.logical_hasher.clone().finalize().into();
-            let retained_physical_digest: [u8; 32] =
-                metadata.physical_hasher.clone().finalize().into();
             assert_eq!(logical_digest, prefix_digest);
-            assert_eq!(retained_physical_digest, physical_digest);
-            assert_eq!(metadata.physical_hashed_end, APPEND_OFFSET);
+            assert_eq!(metadata.physical_end, APPEND_OFFSET);
             assert_eq!(metadata.last_recorded_at, last_recorded_at);
         }
         assert!(runtime.inner.buffer_pool.is_empty());
@@ -4263,6 +4326,7 @@ mod tests {
             file_offset,
             aligned_len,
             v7_allocation: None,
+            v7_prefix: None,
             buffer: ParallelBuffer::activate(
                 direct,
                 std::sync::Arc::clone(budget),
@@ -4289,6 +4353,10 @@ mod tests {
             file_offset: range.start,
             aligned_len,
             v7_allocation: Some(allocation),
+            v7_prefix: Some(super::WalV7PrefixMetadata {
+                last_commit_ts: ticket + 1,
+                logical_hasher: super::Sha256::new(),
+            }),
             buffer: ParallelBuffer::activate(
                 direct,
                 std::sync::Arc::clone(budget),
