@@ -1,0 +1,78 @@
+# To display the perf.data header info, please use --header/--header-only options.
+#
+#
+# Total Lost Samples: 0
+#
+# Samples: 1K of event 'cpu-clock:u'
+# Event count (approx.): 1959879586
+#
+# Overhead  Command          Shared Object                  Symbol                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         
+# ........  ...............  .............................  ...........................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................
+#
+    10.29%  wal-sync-coordi  write-perf-v7-packer-encoding  [.] <crossbeam_channel::flavors::list::Channel<kv_engine::wal::parallel_worker::GroupWriteResult>>::recv
+     8.75%  wal-ordered-pac  write-perf-v7-packer-encoding  [.] <crossbeam_channel::flavors::array::Channel<bool>>::recv
+     4.45%  write-perf-v7-p  write-perf-v7-packer-encoding  [.] <parking_lot::raw_mutex::RawMutex>::lock_slow
+     4.35%  wal-io-worker    write-perf-v7-packer-encoding  [.] <crossbeam_channel::flavors::list::Channel<kv_engine::wal::parallel_worker::WorkerCommand<kv_engine::wal::parallel_runtime::ParallelBuffer>>>::recv
+     3.94%  write-perf-v7-p  write-perf-v7-packer-encoding  [.] <kv_engine::mvcc::LsmMvccInner>::publish_commit_ts
+     2.81%  write-perf-v7-p  [vdso]                         [.] __vdso_clock_gettime
+     2.76%  wal-ordered-pac  write-perf-v7-packer-encoding  [.] sha2::sha256::x86::digest_blocks
+     1.89%  wal-ordered-pac  write-perf-v7-packer-encoding  [.] crc32fast::specialized::pclmulqdq::calculate
+     1.89%  wal-sync-coordi  write-perf-v7-packer-encoding  [.] sha2::sha256::x86::digest_blocks
+     1.84%  wal-io-worker    write-perf-v7-packer-encoding  [.] kv_engine::wal::parallel_worker::run_worker::<kv_engine::wal::parallel_runtime::ParallelBuffer>
+     1.74%  write-perf-v7-p  write-perf-v7-packer-encoding  [.] <std::thread::local::LocalKey<core::cell::RefCell<alloc::vec::Vec<u8>>>>::with::<<kv_engine::mem_table::MemTable>::publish_raw_batch::{closure#0}, ()>
+     1.69%  write-perf-v7-p  write-perf-v7-packer-encoding  [.] <kv_engine::lsm_storage::LsmStorageInner>::maybe_queue_pitr_maintenance
+     1.43%  wal-ordered-pac  write-perf-v7-packer-encoding  [.] kv_engine::wal::parallel_runtime::pack_admitted_groups
+     1.33%  write-perf-v7-p  libc.so.6                      [.] 0x00000000000a5fdc
+     1.18%  wal-ordered-pac  write-perf-v7-packer-encoding  [.] crc32fast::baseline::update_fast_16
+     1.18%  write-perf-v7-p  write-perf-v7-packer-encoding  [.] <crossbeam_skiplist::base::SkipList<bytes::bytes::Bytes, bytes::bytes::Bytes>>::search_position::<bytes::bytes::Bytes>
+     1.07%  write-perf-v7-p  write-perf-v7-packer-encoding  [.] <kv_engine::wal::parallel_runtime::ParallelWalRuntime>::prepare_v7_batch
+     1.02%  write-perf-v7-p  write-perf-v7-packer-encoding  [.] <kv_engine::mvcc::LsmMvccInner>::write_wal_only
+     0.97%  write-perf-v7-p  write-perf-v7-packer-encoding  [.] <parking_lot::raw_mutex::RawMutex>::unlock_slow
+     0.92%  write-perf-v7-p  write-perf-v7-packer-encoding  [.] <kv_engine::lsm_storage::LsmStorageInner>::put_with_lifecycle_admission
+     0.92%  write-perf-v7-p  write-perf-v7-packer-encoding  [.] <kv_engine::mem_table::MemTable>::commit_wal_ticket
+     0.87%  wal-io-worker    write-perf-v7-packer-encoding  [.] <std::hash::random::RandomState as core::hash::BuildHasher>::hash_one::<&kv_engine::wal::parallel_worker::RequestId>
+     0.87%  write-perf-v7-p  write-perf-v7-packer-encoding  [.] <kv_engine::mem_table::MemTable>::write_prepared_v7_pitr_wal_batch_only
+     0.82%  write-perf-v7-p  libc.so.6                      [.] __sched_yield
+     0.82%  write-perf-v7-p  write-perf-v7-packer-encoding  [.] <kv_engine::wal::parallel_runtime::ParallelWalRuntime>::wait_durable
+     0.77%  wal-io-worker    write-perf-v7-packer-encoding  [.] <kv_engine::wal::parallel_worker::WalSyncProgress>::begin_io_event
+     0.77%  wal-sync-coordi  write-perf-v7-packer-encoding  [.] <kv_engine::wal::v7::admission::WalV7OwnedBatchReservation>::release_unused_frontier_credit
+     0.77%  write-perf-v7-p  write-perf-v7-packer-encoding  [.] kv_engine::key::decode_user_key_into
+     0.72%  write-perf-v7-p  libc.so.6                      [.] 0x00000000000a5ffc
+     0.67%  write-perf-v7-p  write-perf-v7-packer-encoding  [.] <kv_engine::wal::parallel_runtime::ParallelWalRuntime>::put_v7_prepared_batch
+     0.67%  write-perf-v7-p  write-perf-v7-packer-encoding  [.] crc32fast::baseline::update_fast_16
+     0.61%  wal-ordered-pac  write-perf-v7-packer-encoding  [.] <crossbeam_channel::flavors::list::Channel<kv_engine::wal::parallel_worker::WorkerCommand<kv_engine::wal::parallel_runtime::ParallelBuffer>>>::send
+     0.61%  write-perf-v7-p  libc.so.6                      [.] syscall
+     0.56%  write-perf-v7-p  libc.so.6                      [.] malloc
+     0.56%  write-perf-v7-p  write-perf-v7-packer-encoding  [.] <kv_engine::wal::v7::admission::WalV7ResourceLedger>::reserve_with_priority
+     0.51%  wal-io-worker    write-perf-v7-packer-encoding  [.] <crossbeam_channel::flavors::list::Channel<kv_engine::wal::parallel_worker::WorkerCommand<kv_engine::wal::parallel_runtime::ParallelBuffer>>>::start_recv
+     0.51%  write-perf-v7-p  write-perf-v7-packer-encoding  [.] <parking_lot::condvar::Condvar>::wait_until_internal
+     0.46%  wal-sync-coordi  write-perf-v7-packer-encoding  [.] kv_engine::wal::parallel_runtime::run_sync_coordinator
+     0.46%  write-perf-v7-p  write-perf-v7-packer-encoding  [.] <std::path::Components as core::iter::traits::double_ended::DoubleEndedIterator>::next_back
+     0.41%  wal-io-worker    write-perf-v7-packer-encoding  [.] <kv_engine::wal::parallel_worker::WorkerCore<kv_engine::wal::parallel_runtime::ParallelBuffer>>::assert_invariants
+     0.41%  wal-io-worker    write-perf-v7-packer-encoding  [.] kv_engine::wal::parallel_worker::process_worker_events::<kv_engine::wal::parallel_runtime::ParallelBuffer>
+     0.41%  wal-ordered-pac  write-perf-v7-packer-encoding  [.] <kv_engine::wal::parallel_worker::IoWorkerClient<kv_engine::wal::parallel_runtime::ParallelBuffer>>::submit_group
+     0.41%  wal-ordered-pac  write-perf-v7-packer-encoding  [.] <parking_lot::raw_mutex::RawMutex>::lock_slow
+     0.41%  wal-sync-coordi  [vdso]                         [.] __vdso_clock_gettime
+     0.41%  wal-sync-coordi  write-perf-v7-packer-encoding  [.] <crossbeam_channel::flavors::list::Channel<kv_engine::wal::parallel_worker::WorkerCommand<kv_engine::wal::parallel_runtime::ParallelBuffer>>>::start_recv
+     0.41%  write-perf-v7-p  libc.so.6                      [.] 0x000000000016c669
+     0.41%  write-perf-v7-p  write-perf-v7-packer-encoding  [.] <kv_engine::wal::v7::admission::WalV7ReservationOwner>::reserve_batch
+     0.41%  write-perf-v7-p  write-perf-v7-packer-encoding  [.] crc32fast::specialized::pclmulqdq::calculate
+     0.36%  wal-sync-coordi  libc.so.6                      [.] __sched_yield
+     0.36%  write-perf-v7-p  write-perf-v7-packer-encoding  [.] <arc_swap::strategy::hybrid::HybridStrategy<arc_swap::strategy::hybrid::DefaultConfig> as arc_swap::strategy::sealed::InnerStrategy<alloc::sync::Arc<kv_engine::lsm_storage::LsmStorageState>>>::load::{closure#0}
+     0.36%  write-perf-v7-p  write-perf-v7-packer-encoding  [.] <kv_engine::lsm_storage::LsmStorageInner>::try_freeze_memtable
+     0.36%  write-perf-v7-p  write-perf-v7-packer-encoding  [.] <kv_engine::mvcc::LsmMvccInner>::advance_ready_publications
+     0.36%  write-perf-v7-p  write-perf-v7-packer-encoding  [.] <std::path::Path>::file_name
+     0.36%  write-perf-v7-p  write-perf-v7-packer-encoding  [.] <tokio::sync::notify::NotifyGuard>::notify_waiters
+     0.31%  wal-io-worker    write-perf-v7-packer-encoding  [.] <core::hash::sip::Hasher<core::hash::sip::Sip13Rounds> as core::hash::Hasher>::write
+     0.31%  wal-io-worker    write-perf-v7-packer-encoding  [.] <crossbeam_channel::flavors::list::Channel<kv_engine::wal::parallel_worker::GroupWriteResult>>::send
+     0.31%  wal-sync-coordi  write-perf-v7-packer-encoding  [.] <hashbrown::map::HashMap<u64, kv_engine::wal::v7::admission::WalV7ResourceCharge, ahash::random_state::RandomState>>::insert
+     0.31%  write-perf-v7-p  libc.so.6                      [.] 0x00000000000a4809
+     0.31%  write-perf-v7-p  write-perf-v7-packer-encoding  [.] <alloc::collections::btree::map::BTreeMap<u64, kv_engine::wal::v7::admission::WalV7OwnedBatchReservation>>::insert
+     0.31%  write-perf-v7-p  write-perf-v7-packer-encoding  [.] <crossbeam_skiplist::base::SkipList<bytes::bytes::Bytes, bytes::bytes::Bytes>>::insert_internal::<<crossbeam_skiplist::base::SkipList<bytes::bytes::Bytes, bytes::bytes::Bytes>>::insert::{closure#0}, <crossbeam_skiplist::base::SkipList<bytes::bytes::Bytes, bytes::bytes::Bytes>>::insert::{closure#1}>
+     0.31%  write-perf-v7-p  write-perf-v7-packer-encoding  [.] <kv_engine::mem_table::MemTable>::publish_raw_batch
+     0.31%  write-perf-v7-p  write-perf-v7-packer-encoding  [.] <tokio::sync::notify::Notify>::notify_waiters
+
+
+#
+# (Tip: To trace calls using Processor Trace use perf record -e intel_pt// ... ; perf script --call-trace. Then use perf script --time A-B --insn-trace to look at region of interest.)
+#

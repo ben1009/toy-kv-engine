@@ -36,6 +36,18 @@ the retained and rejected experiments.
 
 ## Benchmarks and qualification
 
+- [RFC 025 v7 cached extent readiness and cooled ext4 comparisons, 2026-10-25](benchmarks/rfc-025-v7-extent-readiness-cache-20261025.md)
+- [RFC 025 v7 ordered encoding outside admission, 2026-10-25](benchmarks/rfc-025-v7-packer-encoding-20261025.md)
+- [RFC 025 v7 resource-retirement experiments (rejected), 2026-10-25](benchmarks/rfc-025-v7-resource-retirement-20261025.md)
+- [RFC 025 v7 shared extent initialization and highest ext4 scores, 2026-10-25](benchmarks/rfc-025-v7-parallel-vs-v4-parallel-writer-sweep-20261025.md#shared-v7-extent-initialization-on-ext4)
+- [RFC 025 v7 preparation before the MVCC sequencer, 2026-10-25](benchmarks/rfc-025-v7-parallel-vs-v4-parallel-writer-sweep-20261025.md#mvcc-preparation-before-the-sequencer)
+- [RFC 025 v7 physical digest hot-path optimization, 2026-10-25](benchmarks/rfc-025-v7-parallel-vs-v4-parallel-writer-sweep-20261025.md#physical-digest-and-prefix-finalization-follow-up)
+- [RFC 025 v7 Parallel versus v4 Parallel writer sweep, 2026-10-25](benchmarks/rfc-025-v7-parallel-vs-v4-parallel-writer-sweep-20261025.md)
+- [RFC 025 v7 Parallel versus baseline v6 Leader exploratory screen, 2026-10-25](benchmarks/rfc-025-v7-parallel-vs-baseline-v6-20261025.md)
+- [RFC 025 v7 Leader versus v6 Leader exploratory screen, 2026-10-25](benchmarks/rfc-025-v7-leader-vs-v6-leader-20261025.md)
+- [RFC 025 v7 Parallel versus v7 Leader exploratory screen, 2026-10-25](benchmarks/rfc-025-v7-parallel-vs-leader-20261025.md)
+- [RFC 025 v7 Parallel versus v4 Parallel exploratory screen, 2026-10-24](benchmarks/rfc-025-v7-parallel-vs-v4-20261024.md)
+- [RFC 025 v4 Parallel first-leg exploratory screen, 2026-10-24](benchmarks/rfc-025-v4-parallel-first-leg-20261024.md)
 - [Parallel WAL benchmark outcomes](benchmarks/rfc-024-parallel-wal-benchmark.md)
 - [Batch64 parallel WAL versus Leader rerun, 2026-10-06](benchmarks/rfc-024-native-batch64-leader-rerun-20261006.md)
 - [Native async parallel WAL versus leader, 2026-10-05](benchmarks/rfc-024-native-async-vs-leader-20261005.md)

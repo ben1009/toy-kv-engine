@@ -2342,6 +2342,113 @@ One sync per advance does not promise v4/v6 latency parity. Material regressions
 need a recorded maintainer adoption decision; performance does not silently
 create a permanent v7 Leader default or a new format exception.
 
+The first exploratory baseline-v4 Parallel versus current-v4 Parallel screen is
+recorded in the [2026-10-24 report](benchmarks/rfc-025-v4-parallel-first-leg-20261024.md).
+It covers three paired repeats of single-writer and four-writer WAL puts plus a
+mixed WAL workload on tmpfs and ext4. The ext4 results are unstable, and this
+partial screen has no same-binary controls; it does not satisfy or pass the
+Stage 8 performance gate.
+
+The next exploratory comparison, current v7 Parallel with PITR versus current
+v4 Parallel without PITR, is recorded in the
+[2026-10-24 report](benchmarks/rfc-025-v7-parallel-vs-v4-20261024.md). It uses
+the same single-writer and four-writer put workloads on both filesystems. The
+four-writer throughput loss is consistent in these three pairs, while device
+single-writer results remain variable. This comparison also does not pass the
+Stage 8 performance gate.
+
+The follow-up v7 Parallel versus v4 Parallel writer sweep is recorded in the
+[2026-10-25 report](benchmarks/rfc-025-v7-parallel-vs-v4-parallel-writer-sweep-20261025.md).
+It combines the original 1/4-writer pairs with new 8/16-writer pairs. V7 has
+lower median throughput in all eight filesystem/writer cells; the larger
+tmpfs losses are consistent across pairs. The result remains exploratory and
+does not pass the Stage 8 performance gate.
+
+The v7 Parallel versus v7 Leader scheduler comparison is recorded in the
+[2026-10-25 report](benchmarks/rfc-025-v7-parallel-vs-leader-20261025.md).
+It uses the same single-writer and four-writer PITR workloads. Parallel loses
+single-writer throughput on both filesystems and tmpfs four-writer throughput,
+while its four-writer ext4 throughput is about 3.56 times Leader across the
+first two stable pairs. The small sample has no null controls and does not pass
+the Stage 8 performance gate.
+
+The v7 Leader versus v6 Leader format comparison is recorded in the
+[2026-10-25 report](benchmarks/rfc-025-v7-leader-vs-v6-leader-20261025.md).
+It holds Leader scheduling and PITR constant. V7 is near parity for single
+writer ext4 but has lower throughput in all four-writer pairs, with median
+paired throughput ratios of 0.451 on tmpfs and 0.475 on ext4. Four-writer v7
+runs issue 50,000 syncs/frontiers versus roughly 25,000 v6 syncs on tmpfs and
+24,000 on ext4, and use nearly twice the WAL bytes. This small screen lacks
+same-binary controls and does not pass the Stage 8 performance gate.
+
+The end-to-end candidate v7 Parallel versus baseline v6 Leader comparison is
+recorded in the [2026-10-25 report](benchmarks/rfc-025-v7-parallel-vs-baseline-v6-20261025.md).
+It uses the pinned pre-v7 v6 source and single-put PITR workloads at 1, 4, 8,
+and 16 writers. V7 Parallel loses throughput at every count on tmpfs and at one
+writer on ext4; ext4 favors v7 at 4, 8, and 16 writers. The result is
+exploratory, has no same-binary controls, and does not pass the Stage 8
+performance gate.
+
+The synchronous v7 Parallel point path now prepares owned encoded entries and
+charged DATA buffers before taking the MVCC sequencer. Five paired 8-writer
+runs show a 5.2% median improvement in the v7:v4 ratio on tmpfs. Ext4 shows no
+confirmed gain: the median normalized change is -1.8% initially and -1.1% in
+a separate complete rerun (-1.4% across all ten pairs). Slowdowns occur in both
+v7 builds. The [writer-sweep report](benchmarks/rfc-025-v7-parallel-vs-v4-parallel-writer-sweep-20261025.md#mvcc-preparation-before-the-sequencer)
+records the comparisons and ownership/capacity checks. This does not meet the
+Stage 8 performance gate or establish parity with v4.
+
+
+Active v7 Parallel now shares extent preparation between DATA and FRONTIER
+writers on ext-family filesystems, with allocation alone for large-only DATA
+groups. The final five-pair, 8-writer ext4 point-write comparison improves the
+median v4-normalized v7 throughput by 15.7%. Its highest score is 15,256 puts/s,
+versus the previous retained v7 high of 12,596 and a new v4 control high of
+20,420 under matching settings. The highest-score gap to v4 is still 25.3%.
+All stalled runs remain in the [extent-initialization follow-up](benchmarks/rfc-025-v7-parallel-vs-v4-parallel-writer-sweep-20261025.md#shared-v7-extent-initialization-on-ext4).
+The batch64 repeat has a 3.4% lower v7 peak and a 1.0% lower median paired raw
+throughput; variable controls prevent a no-regression claim. Sixty focused
+correctness tests pass. This remains exploratory and does not pass the Stage 8
+gate.
+
+
+The next [resource-retirement experiments](benchmarks/rfc-025-v7-resource-retirement-20261025.md)
+are rejected. Combining per-ticket buffer and marker-credit retirement improves
+the median v7:v4 throughput ratio on tmpfs by 5.8% across ten pairs, but lowers
+the pooled batch64 ratio by 4.0%. A whole-group variant adds complexity without
+a useful measured gain. Both source changes are reverted; the highest retained
+ext4 point-write score remains 15,256 puts/s versus v4's 20,420. The performance
+gate remains unmet.
+
+The [ordered packer encoding follow-up](benchmarks/rfc-025-v7-packer-encoding-20261025.md)
+is retained. Admission still assigns tickets, timestamps, and physical ranges;
+the ordered packer now frames DATA and hashes logical batches outside the MVCC
+sequencer/admission locks, publishing each group endpoint's digest before I/O.
+Existing buffer charges cover queued inputs. Deterministic deferred-framing
+and failure tests pass, as do all 1,958 tests in `cargo make check`. Five paired
+8-writer batch64 comparisons improve raw throughput by 1.90x on ext4 and
+3.52x on tmpfs. The highest ext4 batch64 score is 341,049 puts/s versus the
+previous retained v7 high of 194,069 and v4's 482,410; the remaining gap is
+29.3%. Single puts peak at 15,278 versus v4's 20,420, a 25.2% gap. Ten
+single-writer tmpfs pairs have 1.6% lower raw throughput, 0.7% higher normalized
+throughput, and 1.5% higher sampled p99. All stalls and unfavorable comparisons
+remain recorded. This does not establish parity or pass the Stage 8 gate.
+
+The [extent readiness cache follow-up](benchmarks/rfc-025-v7-extent-readiness-cache-20261025.md)
+retains a small shared atomic cursor for successful allocation/preparation.
+DATA and FRONTIER requests inside that prefix avoid the preparation mutex
+and inode query; growth and failed initialization preserve the existing rules.
+The cursor never represents DATA completion or durability. All 1,958 tests
+pass. Five cooled ext4 pairs improve median raw v7 throughput 1.5% for
+single puts and 8.0% for batch64. Highest scores are 15,759 and 391,992 puts/s,
+22.8% and 18.7% below the historical v4 highs. The same cooled baseline reaches
+373,687 batch64 puts/s, so the candidate peak improves 4.9% against that
+stronger control. Single-writer tmpfs throughput falls 1.8%, and tmpfs batch64's
+normalized throughput falls 2.8% despite higher raw throughput and lower CPU.
+All mixed controls, sparse batch latency samples, temperatures, and stalled
+runs remain recorded. A packer-wakeup replacement is rejected and reverted
+after a 22.4% tmpfs throughput loss. V4 parity and the Stage 8 gate remain unmet.
+
 ## Delivery checklist
 
 - [ ] Stages 1–3: legacy compatibility, byte-exact codec, independent validation,
