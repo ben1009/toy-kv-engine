@@ -2318,7 +2318,6 @@ fn append_v7_frontier(
             }
             return Ok(None);
         }
-        let mut frame = DirectBuf::new(WAL_V7_FRAME_LEN);
         let previous = allocator.last_frontier();
         let allocation_tail = allocator.allocation_tail();
         let previous_frontier_end = previous
@@ -2349,6 +2348,35 @@ fn append_v7_frontier(
             .reserve_frontier(target)?;
         frontier_reservation = Some(reservation.clone());
 
+        ensure!(
+            previous_frontier_end <= reservation.durable_end()
+                && reservation.durable_end() <= reservation.frame_offset(),
+            "v7 Parallel FRONTIER has invalid physical prefix bounds"
+        );
+        let frame_end = reservation
+            .frame_offset()
+            .checked_add(WAL_V7_FRAME_LEN as u64)
+            .context("v7 Parallel FRONTIER end overflows")?;
+        let preallocation_end = round_up(frame_end, PREALLOC_BLOCK)
+            .context("v7 Parallel FRONTIER preallocation end overflows")?
+            .min(inner.max_file_size);
+        ensure!(
+            preallocation_end >= frame_end,
+            "v7 Parallel FRONTIER exceeds the configured segment cap"
+        );
+        let metadata = admission
+            .v7_metadata
+            .as_mut()
+            .context("v7 Parallel runtime lost its metadata")?;
+        metadata.physical_end = frame_end;
+        admission.admitted_end = frame_end;
+        // Publish the reserved marker's physical end before producers append
+        // after it. The single sync coordinator owns this cycle and its
+        // captured predecessor/prefix while encoding without admission held.
+        // Encoding or I/O failure below still poisons this reserved cycle.
+        drop(admission);
+
+        let mut frame = DirectBuf::new(WAL_V7_FRAME_LEN);
         let frontier = WalV7Frontier {
             generation: previous
                 .frontier
@@ -2375,31 +2403,6 @@ fn append_v7_frontier(
         frame.set_len(WAL_V7_FRAME_LEN);
         let frontier_bytes = frame.initialized_slice(0, WAL_V7_FRAME_LEN);
         let frontier_digest = frame_record_digest(frontier_bytes)?;
-        ensure!(
-            previous_frontier_end <= reservation.durable_end()
-                && reservation.durable_end() <= reservation.frame_offset(),
-            "v7 Parallel FRONTIER has invalid physical prefix bounds"
-        );
-        let frame_end = reservation
-            .frame_offset()
-            .checked_add(WAL_V7_FRAME_LEN as u64)
-            .context("v7 Parallel FRONTIER end overflows")?;
-        let preallocation_end = round_up(frame_end, PREALLOC_BLOCK)
-            .context("v7 Parallel FRONTIER preallocation end overflows")?
-            .min(inner.max_file_size);
-        ensure!(
-            preallocation_end >= frame_end,
-            "v7 Parallel FRONTIER exceeds the configured segment cap"
-        );
-        let metadata = admission
-            .v7_metadata
-            .as_mut()
-            .context("v7 Parallel runtime lost its metadata")?;
-        metadata.physical_end = frame_end;
-        admission.admitted_end = frame_end;
-        // Record the marker in the shared hash cursor before producers can
-        // append after it. Any failure in the I/O below poisons this runtime.
-        drop(admission);
 
         preallocate_runtime(inner, preallocation_end, true)
             .context("preallocate v7 Parallel FRONTIER frame")?;
