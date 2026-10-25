@@ -25,8 +25,8 @@ use crate::{
             WalV7FrontierReservation, WalV7PhysicalAllocator,
         },
         codec::{
-            EncodedWalV7Entries, WAL_V7_FRAME_LEN, WAL_V7_HEADER_LEN, WalV7Frontier, WalV7Header,
-            data_fragment_count, encode_data_frames_into, encode_frontier_successor_into,
+            EncodedWalV7Entries, EncodedWalV7LogicalBatch, WAL_V7_FRAME_LEN, WAL_V7_HEADER_LEN,
+            WalV7Frontier, WalV7Header, data_fragment_count, encode_frontier_successor_into,
             frame_record_digest, prepare_logical_batch,
         },
         install::{WalV7RuntimeMetadata, WalV7RuntimeSeed},
@@ -89,7 +89,6 @@ pub(crate) struct WalV7PreparedBatch {
     reservation: WalV7OwnedBatchReservation,
     fragment_count: u32,
     frame_bytes: usize,
-    limits: WalV5Limits,
 }
 
 /// Coordinates and resource owner from which a parallel runtime begins admission.
@@ -559,10 +558,9 @@ struct AdmittedBatch {
 /// Coordinates are assigned, but DATA framing and logical hashing belong to
 /// the ordered packer. The batch reservation already charges both allocations.
 struct WalV7AdmittedInput {
-    logical_batch: Vec<u8>,
+    logical_batch: EncodedWalV7LogicalBatch,
     header_digest: [u8; 32],
     commit_ts: u64,
-    limits: WalV5Limits,
 }
 
 struct PackedGroup {
@@ -1183,7 +1181,6 @@ impl ParallelWalRuntime {
             reservation,
             fragment_count,
             frame_bytes,
-            limits,
         })
     }
 
@@ -1211,7 +1208,6 @@ impl ParallelWalRuntime {
             buffer,
             fragment_count,
             frame_bytes,
-            limits,
         } = prepared_batch;
 
         let (ticket, first_data_offset) = {
@@ -1255,7 +1251,7 @@ impl ParallelWalRuntime {
                     previous.max(sampled_recorded_at)
                 });
             let logical_batch =
-                encoded_entries.encode_with_metadata(ticket, commit_ts, recorded_at)?;
+                encoded_entries.into_logical_batch(ticket, commit_ts, recorded_at)?;
             let next_ticket = ticket
                 .checked_add(1)
                 .context("v7 Parallel ticket counter overflows")?;
@@ -1297,7 +1293,6 @@ impl ParallelWalRuntime {
                     logical_batch,
                     header_digest,
                     commit_ts,
-                    limits,
                 }),
                 buffer,
             });
@@ -1986,12 +1981,10 @@ fn materialize_v7_batch(batch: &mut AdmittedBatch, prefix: &mut WalV7PrefixMetad
         input.commit_ts > prefix.last_commit_ts,
         "v7 packer commit timestamp does not advance"
     );
-    let encoded_len = encode_data_frames_into(
+    let encoded_len = input.logical_batch.encode_data_frames_into(
         input.header_digest,
         batch.file_offset,
         batch.ticket,
-        &input.logical_batch,
-        input.limits,
         batch.buffer.direct_mut().as_mut_slice(),
     )?;
     ensure!(
@@ -1999,7 +1992,7 @@ fn materialize_v7_batch(batch: &mut AdmittedBatch, prefix: &mut WalV7PrefixMetad
         "v7 DATA materializer returned an unexpected frame length"
     );
     batch.buffer.direct_mut().set_len(encoded_len);
-    prefix.logical_hasher.update(&input.logical_batch);
+    prefix.logical_hasher.update(input.logical_batch.as_bytes());
     prefix.last_commit_ts = input.commit_ts;
     Ok(())
 }
@@ -3022,7 +3015,7 @@ mod tests {
                     0,
                     "admission must not encode DATA frames"
                 );
-                expected_hash.update(&batch.v7_input.as_ref().unwrap().logical_batch);
+                expected_hash.update(batch.v7_input.as_ref().unwrap().logical_batch.as_bytes());
             }
         }
         assert!(owner.snapshot().buffer_memory_bytes > 0);
@@ -3082,13 +3075,18 @@ mod tests {
                 .v7_input
                 .as_mut()
                 .unwrap();
-            *input.logical_batch.last_mut().unwrap() ^= 1;
+            // Owned logical bytes have no mutable access. Inject a mismatched
+            // ticket instead to exercise the post-admission framing failure.
+            input.logical_batch =
+                super::prepare_logical_batch(&v7_test_batch(3, 5000), LIVE_WAL_V5_LIMITS)?
+                    .encode_entry_stream()?
+                    .into_logical_batch(later + 1, 3, RecordedAt { secs: 50, nanos: 0 })?;
         }
         drop(packer);
         let error = wal
             .submit_and_commit(later)
-            .expect_err("corrupt input must poison its group");
-        assert!(format!("{error:#}").to_ascii_lowercase().contains("crc"));
+            .expect_err("mismatched input must poison its group");
+        assert!(format!("{error:#}").to_ascii_lowercase().contains("ticket"));
         assert!(runtime.wait_durable(earlier).is_err());
         wal.submit_and_commit(acknowledged)?;
         assert!(
@@ -5013,11 +5011,12 @@ mod tests {
                     LIVE_WAL_V5_LIMITS,
                 )
                 .unwrap()
-                .encode_with_recorded_at(ticket, RecordedAt { secs: 50, nanos: 0 })
+                .encode_entry_stream()
+                .unwrap()
+                .into_logical_batch(ticket, ticket + 1, RecordedAt { secs: 50, nanos: 0 })
                 .unwrap(),
                 header_digest: [0x11; 32],
                 commit_ts: ticket + 1,
-                limits: LIVE_WAL_V5_LIMITS,
             }),
             buffer: ParallelBuffer::activate(
                 direct,
