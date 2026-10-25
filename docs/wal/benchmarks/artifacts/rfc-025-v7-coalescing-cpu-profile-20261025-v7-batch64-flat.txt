@@ -1,0 +1,52 @@
+# To display the perf.data header info, please use --header/--header-only options.
+#
+#
+# Total Lost Samples: 0
+#
+# Samples: 730  of event 'cpu-clock:u'
+# Event count (approx.): 732196570
+#
+# Overhead  Command          Shared Object                       Symbol
+# ........  ...............  ..................................  .......................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................
+#
+    17.12%  wal-ordered-pac  write-perf-v7-preparation-coalesce  [.] sha2::sha256::x86::digest_blocks
+     6.03%  write-perf-v7-p  libc.so.6                           [.] 0x00000000000a5fdc
+     5.48%  write-perf-v7-p  [vdso]                              [.] __vdso_clock_gettime
+     4.93%  write-perf-v7-p  write-perf-v7-preparation-coalesce  [.] <crossbeam_skiplist::base::SkipList<bytes::bytes::Bytes, bytes::bytes::Bytes>>::insert_internal::<<crossbeam_skiplist::base::SkipList<bytes::bytes::Bytes, bytes::bytes::Bytes>>::insert::{closure#0}, <crossbeam_skiplist::base::SkipList<bytes::bytes::Bytes, bytes::bytes::Bytes>>::insert::{closure#1}>
+     4.52%  write-perf-v7-p  write-perf-v7-preparation-coalesce  [.] <std::thread::local::LocalKey<core::cell::RefCell<alloc::vec::Vec<u8>>>>::with::<<kv_engine::mem_table::MemTable>::publish_raw_batch::{closure#0}, ()>
+     4.25%  write-perf-v7-p  write-perf-v7-preparation-coalesce  [.] <crossbeam_skiplist::base::SkipList<bytes::bytes::Bytes, bytes::bytes::Bytes>>::search_position::<bytes::bytes::Bytes>
+     3.42%  write-perf-v7-p  libc.so.6                           [.] 0x00000000000a5ffc
+     2.47%  wal-ordered-pac  write-perf-v7-preparation-coalesce  [.] crc32fast::specialized::pclmulqdq::calculate
+     2.33%  wal-ordered-pac  libc.so.6                           [.] 0x000000000016d053
+     2.33%  wal-sync-coordi  write-perf-v7-preparation-coalesce  [.] <crossbeam_channel::flavors::list::Channel<kv_engine::wal::parallel_worker::GroupWriteResult>>::recv
+     2.33%  write-perf-v7-p  write-perf-v7-preparation-coalesce  [.] <kv_engine::mvcc::LsmMvccInner>::publish_commit_ts
+     2.19%  write-perf-v7-p  write-perf-v7-preparation-coalesce  [.] crc32fast::baseline::update_fast_16
+     1.51%  wal-io-worker    write-perf-v7-preparation-coalesce  [.] <crossbeam_channel::flavors::list::Channel<kv_engine::wal::parallel_worker::WorkerCommand<kv_engine::wal::parallel_runtime::ParallelBuffer>>>::recv
+     1.51%  write-perf-v7-p  libc.so.6                           [.] 0x00000000000a4809
+     1.37%  write-perf-v7-p  write-perf-v7-preparation-coalesce  [.] bytes::bytes::shared_drop
+     1.37%  write-perf-v7-p  write-perf-v7-preparation-coalesce  [.] crc32fast::specialized::pclmulqdq::calculate
+     1.23%  write-perf-v7-p  libc.so.6                           [.] 0x000000000016bf08
+     1.23%  write-perf-v7-p  libc.so.6                           [.] 0x000000000016d053
+     1.23%  write-perf-v7-p  write-perf-v7-preparation-coalesce  [.] <core::slice::iter::Iter<kv_engine::pitr::WalEntry> as core::iter::traits::iterator::Iterator>::try_fold::<(), <core::iter::adapters::enumerate::Enumerate<_> as core::iter::traits::iterator::Iterator>::try_fold::enumerate<&kv_engine::pitr::WalEntry, (), core::ops::control_flow::ControlFlow<&kv_engine::pitr::WalEntry>, core::iter::traits::iterator::Iterator::find_map::check<(usize, &kv_engine::pitr::WalEntry), &kv_engine::pitr::WalEntry, &mut <kv_engine::pitr::CanonicalWalEntryStream>::entries::{closure#0}>::{closure#0}>::{closure#0}, core::ops::control_flow::ControlFlow<&kv_engine::pitr::WalEntry>>
+     1.10%  wal-ordered-pac  write-perf-v7-preparation-coalesce  [.] crc32fast::baseline::update_fast_16
+     0.96%  write-perf-v7-p  libc.so.6                           [.] cfree
+     0.96%  write-perf-v7-p  libc.so.6                           [.] 0x00000000000a481c
+     0.82%  write-perf-v7-p  libc.so.6                           [.] malloc
+     0.68%  write-perf-v7-p  libc.so.6                           [.] 0x000000000016be20
+     0.68%  write-perf-v7-p  libc.so.6                           [.] 0x000000000016c123
+     0.55%  write-perf-v7-p  libc.so.6                           [.] 0x00000000000a347e
+     0.41%  wal-ordered-pac  libc.so.6                           [.] 0x000000000016c887
+     0.41%  write-perf-v7-p  libc.so.6                           [.] clock_gettime
+     0.41%  write-perf-v7-p  libc.so.6                           [.] 0x000000000016bf0c
+     0.41%  write-perf-v7-p  libc.so.6                           [.] 0x000000000016c119
+     0.41%  write-perf-v7-p  libc.so.6                           [.] 0x000000000016c11d
+     0.41%  write-perf-v7-p  libc.so.6                           [.] 0x000000000016c121
+     0.41%  write-perf-v7-p  write-perf-v7-preparation-coalesce  [.] <bytes::bytes::Bytes as core::convert::From<alloc::vec::Vec<u8>>>::from
+     0.41%  write-perf-v7-p  write-perf-v7-preparation-coalesce  [.] <kv_engine::lsm_storage::LsmStorageInner>::push_point_batch_entry::<&[u8]>
+     0.41%  write-perf-v7-p  write-perf-v7-preparation-coalesce  [.] <std::time::Instant>::elapsed
+     0.41%  write-perf-v7-p  write-perf-v7-preparation-coalesce  [.] crossbeam_epoch::default::with_handle::<crossbeam_epoch::default::pin::{closure#0}, crossbeam_epoch::guard::Guard>
+
+
+#
+# (Tip: To analyze particular parallelism levels, try: perf report --latency --parallelism=32-64)
+#

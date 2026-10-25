@@ -2488,6 +2488,22 @@ buffer pool are rejected and reverted. Candidate ext4 peaks remain 15,664 /
 prior retained v7 highs. All 300 scored records, 60 warmups, patches, and hashes
 remain available. V4 parity and the Stage 8 gate remain unmet.
 
+The [immutable logical-batch follow-up](benchmarks/rfc-025-v7-validated-logical-batch-20261025.md)
+retains an encoder-owned type whose bytes remain immutable from admission
+through framing and logical hashing. It avoids rereading the producer-computed
+entry CRC in the ordered packer; raw input and recovery retain full CRC checks,
+and physical bounds and ticket assignments remain checked. Persisted bytes and
+durability ordering are unchanged. All 1,963 tests pass with zero skips/retries
+and one unrelated slow compaction test. Across ten cooled ext4 batch64 pairs,
+raw throughput improves 10.1%, the v4-normalized ratio improves 5.6%, and CPU
+falls 8.0%. Ext4 point throughput rises 1.1% raw and is nearly flat normalized.
+Tmpfs batch64 rises 17.7% raw, but tmpfs point8 falls 5.1% raw with 3.0% more
+CPU; its normalized ratio rises 4.2%. Solo tmpfs rises 4.5% raw. Candidate ext4
+peaks remain 15,541 / 381,813 puts/s, 23.9% / 20.9% below the strongest v4
+references and below the earlier retained v7 highs. All 120 scored records,
+24 warmups, three unscored profiles, source patch, and hashes remain available.
+V4 parity and the Stage 8 gate remain unmet.
+
 ## Delivery checklist
 
 - [ ] Stages 1–3: legacy compatibility, byte-exact codec, independent validation,
