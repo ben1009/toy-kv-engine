@@ -8,7 +8,10 @@ use std::{
         fd::AsRawFd,
         unix::fs::{FileExt, MetadataExt},
     },
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
@@ -674,6 +677,9 @@ struct RuntimeInner {
     // Some(end) tracks the extent prefix prepared for active v7 writers.
     // DATA and FRONTIER share it; large DATA groups skip zero filling.
     preallocation_lock: Mutex<Option<u64>>,
+    // Publish only a successfully allocated/prepared prefix. DATA and
+    // FRONTIER can reuse it without an inode query or the preparation lock.
+    prepared_file_end: AtomicU64,
     max_file_size: u64,
     durability: Arc<DurabilityShared>,
 }
@@ -952,6 +958,7 @@ impl ParallelWalRuntime {
             sync_progress,
             preallocator,
             preallocation_lock: Mutex::new(prepared_v7_extent_end),
+            prepared_file_end: AtomicU64::new(initial_file_end),
             max_file_size: start.max_file_size,
             durability: Arc::clone(&durability),
         });
@@ -2706,7 +2713,13 @@ fn preallocate_runtime(inner: &RuntimeInner, end: u64, initialize_extents: bool)
         end <= inner.max_file_size,
         "WAL preallocation exceeds the configured file cap"
     );
+    if end <= inner.prepared_file_end.load(Ordering::Acquire) {
+        return Ok(());
+    }
     let mut prepared_end = inner.preallocation_lock.lock();
+    if end <= inner.prepared_file_end.load(Ordering::Acquire) {
+        return Ok(());
+    }
     preallocate(&inner.preallocator, end)?;
     if let Some(prepared_end) = prepared_end.as_mut() {
         // The configured cap may end in a partial frame. Preserve that EOF
@@ -2731,6 +2744,9 @@ fn preallocate_runtime(inner: &RuntimeInner, end: u64, initialize_extents: bool)
             *prepared_end += len as u64;
         }
     }
+    // Preparation can fail after allocating the inode or writing only part
+    // of its zero-filled suffix. Neither makes that entire suffix ready.
+    inner.prepared_file_end.store(end, Ordering::Release);
 
     Ok(())
 }
@@ -3114,6 +3130,13 @@ mod tests {
             .preallocator
             .write_all_at(garbage.as_mut_slice(), start)?;
         super::preallocate_runtime(&runtime.inner, super::PREALLOC_BLOCK, true)?;
+        assert_eq!(
+            runtime
+                .inner
+                .prepared_file_end
+                .load(super::Ordering::Acquire),
+            super::PREALLOC_BLOCK
+        );
         let initialized = std::fs::read(&path)?;
         assert!(
             initialized[start as usize..start as usize + super::WAL_V7_FRAME_LEN]
@@ -3186,6 +3209,10 @@ mod tests {
             wal.submit_and_commit(ticket)?;
             acknowledged.push(batch);
         }
+        let prepared_before_failure = runtime
+            .inner
+            .prepared_file_end
+            .load(super::Ordering::Acquire);
         failpoint::cfg("parallel_wal.v7_extent_init_failure", "return")
             .expect("inject v7 extent initialization failure");
         let batch = v7_test_batch(acknowledged.len() as u64 + 1, 32 * 1024);
@@ -3195,6 +3222,14 @@ mod tests {
             .expect("disable v7 extent initialization failure");
         let error = failed.expect_err("an initialization failure must poison the DATA ticket");
         assert!(format!("{error:#}").contains("injected v7 extent initialization failure"));
+        assert_eq!(
+            runtime
+                .inner
+                .prepared_file_end
+                .load(super::Ordering::Acquire),
+            prepared_before_failure,
+            "a partially initialized suffix must never become a cached ready prefix"
+        );
         runtime.wait_durable(first_ticket)?;
         assert!(
             wal.put_v7_batch_with_index(&v7_test_batch(3, 10), LIVE_WAL_V5_LIMITS)
