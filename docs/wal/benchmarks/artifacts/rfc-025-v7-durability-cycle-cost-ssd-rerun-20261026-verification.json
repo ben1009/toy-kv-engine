@@ -1,0 +1,15 @@
+{
+  "source_and_canonical_unchanged": true,
+  "saved_binary_sha256": {
+    "retained": "614f0cb1adde43cabe900eb032c6f884783d658c597471d9d9ddc8faff314aa9",
+    "candidate": "698d294f9704b0a42210265f852025d49b27f640c70fcf6888857fca71670e32",
+    "canonical": "614f0cb1adde43cabe900eb032c6f884783d658c597471d9d9ddc8faff314aa9"
+  },
+  "new_scored_runs": 40,
+  "new_warmup_runs": 8,
+  "pooled_scored_runs": 80,
+  "pooled_warmup_runs": 16,
+  "unique_combined_run_ids": 96,
+  "all_new_scratch_removed": true,
+  "candidate_reinstalled": false
+}

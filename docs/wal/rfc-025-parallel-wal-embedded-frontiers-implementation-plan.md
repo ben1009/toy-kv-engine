@@ -2561,6 +2561,15 @@ The eleven earlier optimizations remain; a fresh full check passes 1,963
 restored-source tests, with one slow compaction integration test and no skips.
 V4 parity and the full Stage 8 gate remain unmet.
 
+The [requested SSD timing-policy rerun](benchmarks/rfc-025-v7-durability-cycle-cost-ssd-rerun-20261026.md)
+uses the unchanged candidate binary for 40 new scored records and eight warmups.
+Pooling ten pairs per SSD workload gives -0.4% raw batch throughput and +1.0%
+raw point throughput, with unstable moving v4 controls. All 150,272 original
+and rerun candidate cycles report zero changed batching classifications.
+The stronger retained v7 batch peak of 480,373 puts/s remains recorded; the
+timing candidate peaks at 441,889 batch / 16,612 point puts/s. The retained
+source and canonical binary are unchanged. V4 parity and Stage 8 remain unmet.
+
 ## Delivery checklist
 
 - [ ] Stages 1–3: legacy compatibility, byte-exact codec, independent validation,

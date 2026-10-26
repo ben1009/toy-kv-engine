@@ -2,6 +2,10 @@
 
 **Result: rejected and reverted. The broader timer produces no SSD batching-policy changes and fails the fixed SSD improvement gate.**
 
+The subsequent [requested SSD rerun](rfc-025-v7-durability-cycle-cost-ssd-rerun-20261026.md)
+uses the exact same enabled candidate binary. Its separate and pooled results
+preserve this original failure, every stall, and stronger historical peaks.
+
 The previous [hash-stage and group-hint investigation](rfc-025-v7-large-group-hint-cache-20261026.md) left a measurement question: coalescing classifies only `fdatasync` latency, even though v7 must prepare and write an embedded FRONTIER before that call. This experiment measures that missing work and uses the broader duration as the next cycle's batching signal. It does not retain any of the previous rejected hash/offload or group-size policies.
 
 ## Candidate and timing scope
