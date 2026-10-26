@@ -17815,6 +17815,18 @@ impl LsmStorageInner {
             .ok_or_else(|| anyhow!("manifest is not initialized"))?
             .ensure_durability_certain()?;
 
+        // SealStarted is durable and admission is stopped. Join unused extent
+        // writes before truncating, so they cannot re-extend the frozen inode.
+        let source_memtable = self.state.load().memtable.clone();
+        ensure!(
+            source_memtable
+                .wal_path()
+                .is_some_and(|path| path == prepared.wal_path.as_path()),
+            "v7 seal preparation no longer names the current source WAL"
+        );
+        source_memtable
+            .stop_v7_extent_initialization()
+            .context("stop v7 extent initialization before sealing truncation")?;
         let sealed_end = prepared.seal.boundary.sealed_end;
         let wal = std::fs::OpenOptions::new()
             .write(true)

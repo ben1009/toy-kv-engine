@@ -1411,6 +1411,17 @@ impl Wal {
         anyhow::bail!("v7 WAL has no writer runtime")
     }
 
+    /// Stop preparation outside the acknowledged prefix before sealing can
+    /// truncate that tail. This does not close the writer's DATA runtime.
+    /// The caller owns the stopped-admission sealing barrier.
+    pub(crate) fn stop_v7_extent_initialization(&self) -> Result<()> {
+        ensure!(self.is_v7(), "WAL is not v7");
+        if let Some(runtime) = &self.parallel_runtime {
+            runtime.stop_v7_extent_initialization()?;
+        }
+        Ok(())
+    }
+
     /// Whether a failed v7 append can contain recoverable data. Inspect both
     /// flags because cursor-publication errors poison the adapter, while an
     /// unwind can leave only the serial writer poisoned.

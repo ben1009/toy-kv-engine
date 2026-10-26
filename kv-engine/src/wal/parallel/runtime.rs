@@ -10,7 +10,7 @@ use std::{
     },
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
@@ -678,6 +678,7 @@ struct RuntimeInner {
     // Publish only a successfully allocated/prepared prefix. DATA and
     // FRONTIER can reuse it without an inode query or the preparation lock.
     prepared_file_end: AtomicU64,
+    async_v7_extents: Option<Arc<AsyncV7ExtentControl>>,
     max_file_size: u64,
     durability: Arc<DurabilityShared>,
 }
@@ -686,6 +687,7 @@ struct RuntimeThreads {
     packer: Option<JoinHandle<Result<()>>>,
     worker: Option<IoWorker<ParallelBuffer>>,
     coordinator: Option<JoinHandle<Result<()>>>,
+    v7_initializer: Option<AsyncV7ExtentInitializer>,
     closed: bool,
     close_error: Option<String>,
 }
@@ -842,6 +844,145 @@ impl Drop for ExtentInitializer {
     }
 }
 
+/// A coalesced target inside an extent already allocated by demand preparation.
+/// The worker never grows the file or prepares beyond that charged target.
+struct AsyncV7ExtentControl {
+    target: AtomicU64,
+    requests: Mutex<Option<Sender<()>>>,
+    failure: Mutex<Option<String>>,
+    stopping: AtomicBool,
+    #[cfg(test)]
+    before_chunk: Mutex<Option<(Sender<()>, Receiver<()>)>>,
+    #[cfg(test)]
+    completed_requests: AtomicU64,
+}
+
+impl AsyncV7ExtentControl {
+    fn new(start: u64) -> Self {
+        Self {
+            target: AtomicU64::new(start),
+            requests: Mutex::new(None),
+            failure: Mutex::new(None),
+            stopping: AtomicBool::new(false),
+            #[cfg(test)]
+            before_chunk: Mutex::new(None),
+            #[cfg(test)]
+            completed_requests: AtomicU64::new(0),
+        }
+    }
+
+    fn request(&self, end: u64) {
+        self.target.fetch_max(end, Ordering::AcqRel);
+        if let Some(requests) = self.requests.lock().as_ref() {
+            // A full wake channel already guarantees another target check.
+            let _ = requests.try_send(());
+        }
+    }
+
+    fn fail(&self, error: String) {
+        self.failure.lock().get_or_insert(error);
+    }
+
+    #[cfg(test)]
+    fn pause_before_chunk(&self) {
+        let hook = self.before_chunk.lock().take();
+        if let Some((entered, resume)) = hook {
+            let _ = entered.send(());
+            while !self.stopping.load(Ordering::Acquire) {
+                match resume.recv_timeout(Duration::from_millis(1)) {
+                    Ok(()) | Err(RecvTimeoutError::Disconnected) => break,
+                    Err(RecvTimeoutError::Timeout) => {}
+                }
+            }
+        }
+    }
+}
+
+struct AsyncV7ExtentInitializer {
+    control: Arc<AsyncV7ExtentControl>,
+    join: Option<JoinHandle<Result<()>>>,
+}
+
+impl AsyncV7ExtentInitializer {
+    fn spawn(inner: &Arc<RuntimeInner>) -> Result<Self> {
+        let control = Arc::clone(
+            inner
+                .async_v7_extents
+                .as_ref()
+                .context("missing v7 extent control")?,
+        );
+        let (requests, incoming) = crossbeam_channel::bounded(1);
+        *control.requests.lock() = Some(requests);
+        // A sleeping initializer must not keep its runtime and sender alive.
+        let runtime = Arc::downgrade(inner);
+        let worker_control = Arc::clone(&control);
+        let join = thread::Builder::new()
+            .name("wal-v7-extent-initializer".to_owned())
+            .spawn(move || {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    while incoming.recv().is_ok() {
+                        loop {
+                            if worker_control.stopping.load(Ordering::Acquire) {
+                                return;
+                            }
+                            let Some(inner) = runtime.upgrade() else {
+                                return;
+                            };
+                            let target = worker_control.target.load(Ordering::Acquire);
+                            if inner.prepared_file_end.load(Ordering::Acquire) >= target {
+                                #[cfg(test)]
+                                worker_control
+                                    .completed_requests
+                                    .fetch_add(1, Ordering::AcqRel);
+                                break;
+                            }
+                            #[cfg(test)]
+                            worker_control.pause_before_chunk();
+                            if worker_control.stopping.load(Ordering::Acquire) {
+                                return;
+                            }
+                            if let Err(error) = prepare_v7_background_chunk(&inner, target) {
+                                // An unused suffix may fail without invalidating
+                                // the ready prefix. Demand crossing it consumes
+                                // this sticky error and poisons its DATA/marker.
+                                worker_control.fail(format!("{error:#}"));
+                                return;
+                            }
+                        }
+                    }
+                }));
+                if result.is_err() {
+                    worker_control.fail("v7 extent initializer panicked".to_owned());
+                    bail!("v7 extent initializer panicked");
+                }
+                Ok(())
+            })
+            .context("failed to spawn v7 extent initializer")?;
+        Ok(Self {
+            control,
+            join: Some(join),
+        })
+    }
+
+    fn close(&mut self) -> Result<()> {
+        self.control.stopping.store(true, Ordering::Release);
+        self.control.requests.lock().take();
+        if let Some(join) = self.join.take() {
+            join.join()
+                .map_err(|_| anyhow!("v7 extent initializer panicked"))??;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for AsyncV7ExtentInitializer {
+    fn drop(&mut self) {
+        if let Err(error) = self.close() {
+            log::error!("failed to stop v7 extent initializer: {error:#}");
+        }
+    }
+}
+
 /// Parallel WAL runtime with admission-driven packing, an I/O worker, a
 /// single-owner durability coordinator, and ext-family extent lookahead.
 pub(crate) struct ParallelWalRuntime {
@@ -957,9 +1098,17 @@ impl ParallelWalRuntime {
             preallocator,
             preallocation_lock: Mutex::new(prepared_v7_extent_end),
             prepared_file_end: AtomicU64::new(initial_file_end),
+            async_v7_extents: prepared_v7_extent_end
+                .map(|start| Arc::new(AsyncV7ExtentControl::new(start))),
             max_file_size: start.max_file_size,
             durability: Arc::clone(&durability),
         });
+
+        let v7_initializer = if inner.async_v7_extents.is_some() {
+            Some(AsyncV7ExtentInitializer::spawn(&inner)?)
+        } else {
+            None
+        };
 
         let coordinator_inner = Arc::clone(&inner);
         let coordinator = match thread::Builder::new()
@@ -1023,6 +1172,7 @@ impl ParallelWalRuntime {
                 packer: Some(packer),
                 worker: Some(worker),
                 coordinator: Some(coordinator),
+                v7_initializer,
                 closed: false,
                 close_error: None,
             }),
@@ -1568,7 +1718,7 @@ impl ParallelWalRuntime {
         }
         self.inner.buffer_budget.close();
 
-        let mut close_error = None;
+        let mut close_error = threads.close_error.clone();
         let _ = self.inner.packer_wake.send(false);
         if let Some(packer) = threads.packer.take() {
             match packer.join() {
@@ -1593,6 +1743,11 @@ impl ParallelWalRuntime {
             && let Err(error) = initializer.close()
         {
             close_error.get_or_insert_with(|| format!("extent initializer failed: {error:#}"));
+        }
+        if let Some(mut initializer) = threads.v7_initializer.take()
+            && let Err(error) = initializer.close()
+        {
+            close_error.get_or_insert_with(|| format!("v7 extent initializer failed: {error:#}"));
         }
 
         if let Some(worker) = threads.worker.take()
@@ -1648,6 +1803,20 @@ impl ParallelWalRuntime {
             Some(error) => Err(anyhow!(error)),
             None => Ok(()),
         }
+    }
+
+    /// Join unused v7 preparation before an external sealing operation can
+    /// truncate the allocated tail. Admission and the DATA runtime stay intact.
+    pub(crate) fn stop_v7_extent_initialization(&self) -> Result<()> {
+        let mut threads = self.threads.lock();
+        if let Some(mut initializer) = threads.v7_initializer.take()
+            && let Err(error) = initializer.close()
+        {
+            let message = format!("v7 extent initializer failed: {error:#}");
+            threads.close_error.get_or_insert_with(|| message.clone());
+            bail!(message);
+        }
+        Ok(())
     }
 
     #[cfg(feature = "chaos-testing")]
@@ -1773,16 +1942,21 @@ fn pack_admitted_groups(
             report_packer_failure(inner, first_ticket, &error);
             return Err(error);
         }
-        if target_preallocated_end > packer.preallocated_end {
+        if target_preallocated_end > packer.preallocated_end
+            || (v7_layout && packer.reserved_end > inner.prepared_file_end.load(Ordering::Acquire))
+        {
             #[cfg(feature = "bench")]
             let preallocation_start = Instant::now();
             let allocation = match packer.initializer.as_mut() {
                 Some(initializer) => {
                     initializer.prepare(target_preallocated_end, packed.initialize_extents)
                 }
-                None => {
-                    preallocate_runtime(inner, target_preallocated_end, packed.initialize_extents)
-                }
+                None => preallocate_runtime_for_write(
+                    inner,
+                    target_preallocated_end,
+                    packer.reserved_end,
+                    packed.initialize_extents,
+                ),
             };
             if let Err(error) = allocation {
                 report_packer_failure(inner, first_ticket, &error);
@@ -2415,7 +2589,7 @@ fn append_v7_frontier(
         let frontier_bytes = frame.initialized_slice(0, WAL_V7_FRAME_LEN);
         let frontier_digest = frame_record_digest(frontier_bytes)?;
 
-        preallocate_runtime(inner, preallocation_end, true)
+        preallocate_runtime_for_write(inner, preallocation_end, frame_end, true)
             .context("preallocate v7 Parallel FRONTIER frame")?;
         #[cfg(feature = "bench")]
         let profile = inner.sync_progress.profile();
@@ -2734,7 +2908,38 @@ fn preallocate_runtime(inner: &RuntimeInner, end: u64, initialize_extents: bool)
     if end <= inner.prepared_file_end.load(Ordering::Acquire) {
         return Ok(());
     }
+    check_v7_preparation_failure(inner)?;
     preallocate(&inner.preallocator, end)?;
+    let initialized =
+        initialize_v7_extent_prefix(inner, &mut prepared_end, end, initialize_extents);
+    if let Err(error) = &initialized
+        && let Some(control) = &inner.async_v7_extents
+    {
+        control.fail(format!("{error:#}"));
+    }
+    initialized?;
+    // Preparation can fail after allocating the inode or writing only part
+    // of its zero-filled suffix. Neither makes that entire suffix ready.
+    inner.prepared_file_end.store(end, Ordering::Release);
+
+    Ok(())
+}
+
+fn check_v7_preparation_failure(inner: &RuntimeInner) -> Result<()> {
+    if let Some(control) = &inner.async_v7_extents
+        && let Some(error) = control.failure.lock().as_ref()
+    {
+        bail!("v7 extent preparation previously failed: {error}");
+    }
+    Ok(())
+}
+
+fn initialize_v7_extent_prefix(
+    inner: &RuntimeInner,
+    prepared_end: &mut Option<u64>,
+    end: u64,
+    initialize_extents: bool,
+) -> Result<()> {
     if let Some(prepared_end) = prepared_end.as_mut() {
         // The configured cap may end in a partial frame. Preserve that EOF
         // while initializing only complete aligned ranges for direct writes.
@@ -2758,10 +2963,87 @@ fn preallocate_runtime(inner: &RuntimeInner, end: u64, initialize_extents: bool)
             *prepared_end += len as u64;
         }
     }
-    // Preparation can fail after allocating the inode or writing only part
-    // of its zero-filled suffix. Neither makes that entire suffix ready.
-    inner.prepared_file_end.store(end, Ordering::Release);
+    Ok(())
+}
 
+/// Allocate the same bounded extent as before, but require only the prefix
+/// used by this write to be ready. Demand can initialize that prefix itself;
+/// progress never depends on the background thread being scheduled.
+fn preallocate_runtime_for_write(
+    inner: &RuntimeInner,
+    end: u64,
+    required_end: u64,
+    initialize_extents: bool,
+) -> Result<()> {
+    ensure!(
+        required_end <= end && end <= inner.max_file_size,
+        "invalid WAL preparation bounds"
+    );
+    if required_end <= inner.prepared_file_end.load(Ordering::Acquire) {
+        return Ok(());
+    }
+    let Some(control) = inner
+        .async_v7_extents
+        .as_ref()
+        .filter(|control| initialize_extents && !control.stopping.load(Ordering::Acquire))
+    else {
+        return preallocate_runtime(inner, end, initialize_extents);
+    };
+    let mut prepared_end = inner.preallocation_lock.lock();
+    if required_end <= inner.prepared_file_end.load(Ordering::Acquire) {
+        return Ok(());
+    }
+    check_v7_preparation_failure(inner)?;
+    preallocate(&inner.preallocator, end)?;
+    let aligned_end = end - end % WAL_V7_FRAME_LEN as u64;
+    let needed = round_up(required_end, EXTENT_INITIALIZATION_CHUNK as u64)
+        .context("v7 required preparation prefix overflows")?
+        .min(aligned_end);
+    if let Err(error) = initialize_v7_extent_prefix(inner, &mut prepared_end, needed, true) {
+        control.fail(format!("{error:#}"));
+        return Err(error);
+    }
+    let ready = if needed == aligned_end { end } else { needed };
+    ensure!(
+        ready >= required_end,
+        "v7 write exceeds its aligned prepared prefix"
+    );
+    inner.prepared_file_end.store(ready, Ordering::Release);
+    drop(prepared_end);
+    control.request(end);
+    Ok(())
+}
+
+/// Initialize one bounded chunk of an already allocated suffix. The same
+/// cursor protects DATA, FRONTIER, demand initialization and large-write skips.
+fn prepare_v7_background_chunk(inner: &RuntimeInner, target: u64) -> Result<()> {
+    ensure!(
+        target <= inner.max_file_size,
+        "v7 background preparation exceeds file cap"
+    );
+    let mut prepared_end = inner.preallocation_lock.lock();
+    if inner.prepared_file_end.load(Ordering::Acquire) >= target {
+        return Ok(());
+    }
+    check_v7_preparation_failure(inner)?;
+    let cursor = prepared_end
+        .as_ref()
+        .copied()
+        .context("v7 background preparation has no cursor")?;
+    let aligned_target = target - target % WAL_V7_FRAME_LEN as u64;
+    let next = cursor
+        .saturating_add(EXTENT_INITIALIZATION_CHUNK as u64)
+        .min(aligned_target);
+    if let Err(error) = initialize_v7_extent_prefix(inner, &mut prepared_end, next, true) {
+        // Publish the sticky failure before releasing the shared cursor lock;
+        // a demand caller must not retry this suffix in the intervening gap.
+        if let Some(control) = &inner.async_v7_extents {
+            control.fail(format!("{error:#}"));
+        }
+        return Err(error);
+    }
+    let ready = if next == aligned_target { target } else { next };
+    inner.prepared_file_end.store(ready, Ordering::Release);
     Ok(())
 }
 
@@ -2931,6 +3213,355 @@ mod tests {
         assert!(observations[0].succeeded);
 
         wal.close()?;
+        Ok(())
+    }
+
+    fn async_extent_test_directory() -> anyhow::Result<tempfile::TempDir> {
+        let base =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/wal-opt/async-extent-tests");
+        std::fs::create_dir_all(&base)?;
+        Ok(tempfile::tempdir_in(base)?)
+    }
+
+    fn pause_async_extent(
+        runtime: &super::ParallelWalRuntime,
+    ) -> Option<(
+        crossbeam_channel::Receiver<()>,
+        crossbeam_channel::Sender<()>,
+    )> {
+        let control = runtime.inner.async_v7_extents.as_ref()?;
+        let (entered, waiting) = crossbeam_channel::bounded(1);
+        let (resume, released) = crossbeam_channel::bounded(1);
+        *control.before_chunk.lock() = Some((entered, released));
+        Some((waiting, resume))
+    }
+
+    fn wait_for_extent_state(mut ready: impl FnMut() -> bool) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !ready() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "extent worker made no progress"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
+    fn async_extent_large_batch(commit_ts: u64) -> WalBatch {
+        let mut batch = v7_test_batch(commit_ts, 32 * 1024);
+        for index in 1..4 {
+            batch.entries.push(WalEntry::Put {
+                key: format!("large-{commit_ts}-{index}").into_bytes(),
+                value: vec![0x6b; 32 * 1024],
+            });
+        }
+        batch
+    }
+
+    #[test]
+    fn async_v7_extent_preparation_allows_ready_prefix_acks() -> anyhow::Result<()> {
+        use crate::wal::v7::{
+            install::recover_and_install_active, recovery::WalV7RecoveryAuthority,
+        };
+        let directory = async_extent_test_directory()?;
+        let path = directory.path().join("background-ready.wal");
+        let Some(V7RuntimeTestWal { wal, owner, anchor }) =
+            live_v7_test_wal(&path, super::MAX_WAL_FILE_SIZE, v7_test_resource_limits())?
+        else {
+            return Ok(());
+        };
+        let runtime = wal.parallel_runtime.as_ref().unwrap();
+        let Some((entered, resume)) = pause_async_extent(runtime) else {
+            eprintln!("skipping async extent test (ext filesystem unavailable)");
+            return Ok(());
+        };
+        let control = Arc::clone(runtime.inner.async_v7_extents.as_ref().unwrap());
+        let mut batches = Vec::new();
+        for ts in 1..=8 {
+            let batch = v7_test_batch(ts, 16);
+            let ticket = wal.put_v7_batch_with_index(&batch, LIVE_WAL_V5_LIMITS)?.0;
+            wal.submit_and_commit(ticket)?;
+            if ts == 1 {
+                entered.recv_timeout(std::time::Duration::from_secs(5))?;
+            }
+            batches.push(batch);
+        }
+        assert_eq!(
+            runtime
+                .inner
+                .prepared_file_end
+                .load(super::Ordering::Acquire),
+            128 * 1024
+        );
+        assert_eq!(std::fs::metadata(&path)?.len(), super::PREALLOC_BLOCK);
+        let accepted_end = runtime.logical_length() as usize;
+        let before = std::fs::read(&path)?[..accepted_end].to_vec();
+        resume.send(())?;
+        wait_for_extent_state(|| control.completed_requests.load(super::Ordering::Acquire) > 0);
+        assert_eq!(
+            runtime
+                .inner
+                .prepared_file_end
+                .load(super::Ordering::Acquire),
+            super::PREALLOC_BLOCK
+        );
+        assert_eq!(&std::fs::read(&path)?[..accepted_end], before);
+        wal.close()?;
+        assert_eq!(owner.snapshot().buffer_memory_bytes, 0);
+        drop(wal);
+        let recovered = recover_and_install_active(
+            &path,
+            WalV7RecoveryAuthority::Active {
+                predecessor: crate::pitr::ChainAnchor::Genesis {
+                    archive_epoch_id: crate::pitr::ArchiveEpochId(anchor.archive_epoch_id),
+                },
+                durable_anchors: vec![anchor],
+            },
+        )?;
+        assert_eq!(recovered.installed.batches, batches);
+        Ok(())
+    }
+
+    #[test]
+    fn async_v7_extent_demand_and_close_progress_while_background_is_paused() -> anyhow::Result<()>
+    {
+        use crate::wal::v7::{
+            install::recover_and_install_active, recovery::WalV7RecoveryAuthority,
+        };
+        let directory = async_extent_test_directory()?;
+        let path = directory.path().join("foreground-progress.wal");
+        let Some(V7RuntimeTestWal { wal, owner, anchor }) =
+            live_v7_test_wal(&path, super::MAX_WAL_FILE_SIZE, v7_test_resource_limits())?
+        else {
+            return Ok(());
+        };
+        let runtime = wal.parallel_runtime.as_ref().unwrap();
+        let Some((entered, resume)) = pause_async_extent(runtime) else {
+            eprintln!("skipping async extent test (ext filesystem unavailable)");
+            return Ok(());
+        };
+        let control = Arc::clone(runtime.inner.async_v7_extents.as_ref().unwrap());
+        let mut batches = Vec::new();
+        for ts in 1..=10 {
+            let batch = v7_test_batch(ts, if ts == 1 { 16 } else { 32 * 1024 });
+            let ticket = wal.put_v7_batch_with_index(&batch, LIVE_WAL_V5_LIMITS)?.0;
+            wal.submit_and_commit(ticket)?;
+            if ts == 1 {
+                entered.recv_timeout(std::time::Duration::from_secs(5))?;
+            }
+            batches.push(batch);
+        }
+        let ready = runtime
+            .inner
+            .prepared_file_end
+            .load(super::Ordering::Acquire);
+        assert!(ready > 128 * 1024 && ready < super::PREALLOC_BLOCK);
+        assert!(runtime.logical_length() <= ready);
+        assert_eq!(std::fs::metadata(&path)?.len(), super::PREALLOC_BLOCK);
+        // Close must stop/join the paused worker without another DATA write,
+        // a new wake, or a release from this test's resume sender.
+        wal.close()?;
+        assert!(control.stopping.load(super::Ordering::Acquire));
+        assert!(control.requests.lock().is_none());
+        assert_eq!(owner.snapshot().buffer_memory_bytes, 0);
+        drop(resume);
+        drop(wal);
+        let recovered = recover_and_install_active(
+            &path,
+            WalV7RecoveryAuthority::Active {
+                predecessor: crate::pitr::ChainAnchor::Genesis {
+                    archive_epoch_id: crate::pitr::ArchiveEpochId(anchor.archive_epoch_id),
+                },
+                durable_anchors: vec![anchor],
+            },
+        )?;
+        assert_eq!(recovered.installed.batches, batches);
+        Ok(())
+    }
+
+    #[test]
+    fn async_v7_extent_large_data_skip_cancels_queued_zeroing() -> anyhow::Result<()> {
+        use crate::wal::v7::{
+            install::recover_and_install_active, recovery::WalV7RecoveryAuthority,
+        };
+        let directory = async_extent_test_directory()?;
+        let path = directory.path().join("background-large-skip.wal");
+        let Some(V7RuntimeTestWal { wal, owner, anchor }) =
+            live_v7_test_wal(&path, super::MAX_WAL_FILE_SIZE, v7_test_resource_limits())?
+        else {
+            return Ok(());
+        };
+        let runtime = wal.parallel_runtime.as_ref().unwrap();
+        let Some((entered, resume)) = pause_async_extent(runtime) else {
+            eprintln!("skipping async extent test (ext filesystem unavailable)");
+            return Ok(());
+        };
+        let control = Arc::clone(runtime.inner.async_v7_extents.as_ref().unwrap());
+        let first = v7_test_batch(1, 16);
+        let ticket = wal.put_v7_batch_with_index(&first, LIVE_WAL_V5_LIMITS)?.0;
+        wal.submit_and_commit(ticket)?;
+        entered.recv_timeout(std::time::Duration::from_secs(5))?;
+        assert_eq!(
+            runtime
+                .inner
+                .prepared_file_end
+                .load(super::Ordering::Acquire),
+            128 * 1024
+        );
+        let large = async_extent_large_batch(2);
+        let ticket = wal.put_v7_batch_with_index(&large, LIVE_WAL_V5_LIMITS)?.0;
+        wal.submit_and_commit(ticket)?;
+        assert_eq!(
+            runtime
+                .inner
+                .prepared_file_end
+                .load(super::Ordering::Acquire),
+            super::PREALLOC_BLOCK
+        );
+        let before = std::fs::read(&path)?;
+        resume.send(())?;
+        wait_for_extent_state(|| control.completed_requests.load(super::Ordering::Acquire) > 0);
+        assert_eq!(std::fs::read(&path)?, before);
+        wal.close()?;
+        assert_eq!(owner.snapshot().buffer_memory_bytes, 0);
+        drop(wal);
+        let recovered = recover_and_install_active(
+            &path,
+            WalV7RecoveryAuthority::Active {
+                predecessor: crate::pitr::ChainAnchor::Genesis {
+                    archive_epoch_id: crate::pitr::ArchiveEpochId(anchor.archive_epoch_id),
+                },
+                durable_anchors: vec![anchor],
+            },
+        )?;
+        assert_eq!(recovered.installed.batches, vec![first, large]);
+        Ok(())
+    }
+
+    #[test]
+    fn async_v7_extent_quiesce_can_freeze_or_continue_writing() -> anyhow::Result<()> {
+        use crate::wal::v7::{
+            install::recover_and_install_active, recovery::WalV7RecoveryAuthority,
+        };
+        for freeze in [true, false] {
+            let directory = async_extent_test_directory()?;
+            let path = directory.path().join("quiesced-background.wal");
+            let Some(V7RuntimeTestWal { wal, owner, anchor }) =
+                live_v7_test_wal(&path, super::MAX_WAL_FILE_SIZE, v7_test_resource_limits())?
+            else {
+                return Ok(());
+            };
+            let runtime = wal.parallel_runtime.as_ref().unwrap();
+            let Some((entered, resume)) = pause_async_extent(runtime) else {
+                eprintln!("skipping async extent test (ext filesystem unavailable)");
+                return Ok(());
+            };
+            let mut batches = vec![v7_test_batch(1, 16)];
+            let ticket = wal
+                .put_v7_batch_with_index(&batches[0], LIVE_WAL_V5_LIMITS)?
+                .0;
+            wal.submit_and_commit(ticket)?;
+            entered.recv_timeout(std::time::Duration::from_secs(5))?;
+            wal.stop_v7_extent_initialization()?;
+            assert!(!runtime.is_closed());
+            assert!(runtime.admission_is_open());
+            if freeze {
+                let sealed_end = runtime.logical_length();
+                runtime.inner.preallocator.set_len(sealed_end)?;
+                runtime.inner.preallocator.sync_all()?;
+                wal.close()?;
+                assert_eq!(std::fs::metadata(&path)?.len(), sealed_end);
+            } else {
+                // Stopping only preparation must not close the old writer
+                // before a fallible lifecycle transition has committed.
+                batches.push(async_extent_large_batch(2));
+                let ticket = wal
+                    .put_v7_batch_with_index(&batches[1], LIVE_WAL_V5_LIMITS)?
+                    .0;
+                wal.submit_and_commit(ticket)?;
+                wal.close()?;
+            }
+            assert_eq!(owner.snapshot().buffer_memory_bytes, 0);
+            drop(resume);
+            drop(wal);
+            let recovered = recover_and_install_active(
+                &path,
+                WalV7RecoveryAuthority::Active {
+                    predecessor: crate::pitr::ChainAnchor::Genesis {
+                        archive_epoch_id: crate::pitr::ArchiveEpochId(anchor.archive_epoch_id),
+                    },
+                    durable_anchors: vec![anchor],
+                },
+            )?;
+            assert_eq!(recovered.installed.batches, batches);
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "chaos-testing")]
+    #[test]
+    fn failpoint_async_v7_extent_failure_is_sticky_on_later_demand() -> anyhow::Result<()> {
+        use crate::{
+            chaos::failpoint::{self, FailScenario},
+            wal::v7::{install::recover_and_install_active, recovery::WalV7RecoveryAuthority},
+        };
+        let _scenario = FailScenario::setup();
+        let directory = async_extent_test_directory()?;
+        let path = directory.path().join("failed-background.wal");
+        let Some(V7RuntimeTestWal { wal, owner, anchor }) =
+            live_v7_test_wal(&path, super::MAX_WAL_FILE_SIZE, v7_test_resource_limits())?
+        else {
+            return Ok(());
+        };
+        let runtime = wal.parallel_runtime.as_ref().unwrap();
+        let Some((entered, resume)) = pause_async_extent(runtime) else {
+            eprintln!("skipping async extent test (ext filesystem unavailable)");
+            return Ok(());
+        };
+        let control = Arc::clone(runtime.inner.async_v7_extents.as_ref().unwrap());
+        let first = v7_test_batch(1, 16);
+        let first_ticket = wal.put_v7_batch_with_index(&first, LIVE_WAL_V5_LIMITS)?.0;
+        wal.submit_and_commit(first_ticket)?;
+        entered.recv_timeout(std::time::Duration::from_secs(5))?;
+        let ready = runtime
+            .inner
+            .prepared_file_end
+            .load(super::Ordering::Acquire);
+        failpoint::cfg("parallel_wal.v7_extent_init_failure", "return")
+            .expect("inject background initialization failure");
+        resume.send(())?;
+        wait_for_extent_state(|| control.failure.lock().is_some());
+        failpoint::cfg("parallel_wal.v7_extent_init_failure", "off")
+            .expect("disable background initialization failure");
+        assert_eq!(
+            runtime
+                .inner
+                .prepared_file_end
+                .load(super::Ordering::Acquire),
+            ready
+        );
+        runtime.wait_durable(first_ticket)?;
+        // Allocation-only large DATA must consume the cached failure too,
+        // rather than silently promoting the failed suffix to a ready range.
+        let later = async_extent_large_batch(2);
+        let failed_ticket = wal.put_v7_batch_with_index(&later, LIVE_WAL_V5_LIMITS)?.0;
+        let error = wal
+            .submit_and_commit(failed_ticket)
+            .expect_err("failed suffix poisons later demand");
+        assert!(format!("{error:#}").contains("injected v7 extent initialization failure"));
+        assert!(wal.close().is_err());
+        assert_eq!(owner.snapshot().buffer_memory_bytes, 0);
+        drop(wal);
+        let recovered = recover_and_install_active(
+            &path,
+            WalV7RecoveryAuthority::Active {
+                predecessor: crate::pitr::ChainAnchor::Genesis {
+                    archive_epoch_id: crate::pitr::ArchiveEpochId(anchor.archive_epoch_id),
+                },
+                durable_anchors: vec![anchor],
+            },
+        )?;
+        assert_eq!(recovered.installed.batches, vec![first]);
         Ok(())
     }
 
@@ -3228,6 +3859,9 @@ mod tests {
             wal.submit_and_commit(ticket)?;
             acknowledged.push(batch);
         }
+        // Establish the complete current extent before injecting the next
+        // demanded-range failure; unused background work is tested separately.
+        super::preallocate_runtime(&runtime.inner, std::fs::metadata(&path)?.len(), true)?;
         let prepared_before_failure = runtime
             .inner
             .prepared_file_end

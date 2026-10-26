@@ -2276,6 +2276,13 @@ impl MemTable {
         self.wal.as_ref().is_some_and(Wal::v7_requires_recovery)
     }
 
+    pub(crate) fn stop_v7_extent_initialization(&self) -> Result<()> {
+        if let Some(wal) = &self.wal {
+            wal.stop_v7_extent_initialization()?;
+        }
+        Ok(())
+    }
+
     /// Release the io_uring ring of a drained, immutable leader WAL.
     ///
     /// Call after writers have finished, when freezing the memtable or after
