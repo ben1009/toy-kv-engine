@@ -1,0 +1,121 @@
+diff --git a/kv-engine/src/wal.rs b/kv-engine/src/wal.rs
+index 707e3f66..1c50f825 100644
+--- a/kv-engine/src/wal.rs
++++ b/kv-engine/src/wal.rs
+@@ -484 +484,2 @@ pub struct Wal {
+-    /// O_DIRECT file handle for io_uring writes (None for legacy buffered WALs).
++    /// File handle for io_uring writes (None for legacy buffered WALs).
++    /// Earlier formats use O_DIRECT; v7 buffers DATA and FRONTIER together.
+@@ -1320 +1321,11 @@ impl Wal {
+-        let (direct_file, alloc_offset) = Self::open_direct_file(path)?;
++        // Keep v7 DATA and FRONTIER in one buffered I/O domain so writeback
++        // can combine adjacent frames before the single durability sync. The
++        // ticket pipeline still owns offsets and waits for every DATA CQE
++        // before writing a marker; fdatasync covers both kinds of frame.
++        // O_APPEND would bypass those offsets and must remain disabled.
++        let io_file = File::options()
++            .read(true)
++            .write(true)
++            .open(path)
++            .context("open installed v7 Parallel WAL I/O file")?;
++        let alloc_offset = io_file.metadata()?.len();
+@@ -1327 +1338 @@ impl Wal {
+-            direct_file
++            io_file
+@@ -1332 +1343 @@ impl Wal {
+-            direct_file
++            io_file
+@@ -1337 +1348 @@ impl Wal {
+-            direct_file
++            io_file
+@@ -1361 +1372 @@ impl Wal {
+-            direct_file: Some(direct_file),
++            direct_file: Some(io_file),
+diff --git a/kv-engine/src/wal/parallel/runtime.rs b/kv-engine/src/wal/parallel/runtime.rs
+index a709ed68..a69bb1f9 100644
+--- a/kv-engine/src/wal/parallel/runtime.rs
++++ b/kv-engine/src/wal/parallel/runtime.rs
+@@ -2480,2 +2480,2 @@ fn write_v7_frontier_at(file: &File, bytes: &[u8], offset: u64) -> io::Result<us
+-        // The runtime file is O_DIRECT, which can reject a byte-sized write
+-        // before the short-write path runs. Reopen the same inode through procfs
++        // Direct test handles can reject a byte-sized write before the
++        // short-write path runs. Reopen the same inode through procfs
+@@ -2963,0 +2964,78 @@ mod tests {
++    #[cfg(all(feature = "bench", feature = "chaos-testing"))]
++    #[test]
++    fn failpoint_v7_frontier_survives_later_data_before_sync() -> anyhow::Result<()> {
++        use crate::{
++            chaos::failpoint::{self, FailScenario},
++            wal::v7::{install::recover_and_install_active, recovery::WalV7RecoveryAuthority},
++        };
++
++        let _scenario = FailScenario::setup();
++        let directory = tempfile::tempdir()?;
++        let path = directory.path().join("buffered-v7-data-frontier.wal");
++        let Some(V7RuntimeTestWal { wal, owner, anchor }) =
++            live_v7_test_wal(&path, super::MAX_WAL_FILE_SIZE, v7_test_resource_limits())?
++        else {
++            return Ok(());
++        };
++        let profile = Arc::new(crate::mem_table::WriteProfile::default());
++        wal.set_write_profile(Arc::clone(&profile));
++        let runtime = wal.parallel_runtime.as_ref().unwrap();
++        let mut large = v7_test_batch(3, 35000);
++        large.entries.push(WalEntry::Put {
++            key: b"second-large-value".to_vec(),
++            value: vec![0x6B; 35000],
++        });
++        let batches = vec![v7_test_batch(1, 16), v7_test_batch(2, 8192), large];
++        let gate = failpoint::arm_parallel_wal_sync_gate();
++        let first_ticket = wal
++            .put_v7_batch_with_index(&batches[0], LIVE_WAL_V5_LIMITS)?
++            .0;
++        assert!(gate.wait_until_entered(std::time::Duration::from_secs(10)));
++        let frontier_offset = runtime.logical_length() - super::WAL_V7_FRAME_LEN as u64;
++        let reader = std::fs::File::open(&path)?;
++        let mut frontier_before = vec![0; super::WAL_V7_FRAME_LEN];
++        reader.read_exact_at(&mut frontier_before, frontier_offset)?;
++        assert_eq!(count_valid_v7_frontiers(&path)?, 2);
++
++        let mut last_ticket = first_ticket;
++        for batch in &batches[1..] {
++            let (ticket, offset) = wal.put_v7_batch_with_index(batch, LIVE_WAL_V5_LIMITS)?;
++            assert!(offset >= frontier_offset + super::WAL_V7_FRAME_LEN as u64);
++            last_ticket = ticket;
++        }
++        // The coordinator is paused after its buffered marker write. The I/O
++        // worker can still finish disjoint DATA writes in the same
++        // preallocated range without publishing any of those tickets.
++        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
++        while profile.snapshot().wal_cqe_count < batches.len() as u64 {
++            assert!(
++                std::time::Instant::now() < deadline,
++                "later DATA writes must complete"
++            );
++            std::thread::sleep(std::time::Duration::from_millis(1));
++        }
++        let mut frontier_after = vec![0; super::WAL_V7_FRAME_LEN];
++        reader.read_exact_at(&mut frontier_after, frontier_offset)?;
++        assert_eq!(frontier_after, frontier_before);
++        assert_eq!(runtime.inner.durability.state.lock().durable_frontier, 0);
++
++        gate.release();
++        wal.submit_and_commit(first_ticket)?;
++        wal.submit_and_commit(last_ticket)?;
++        wal.close()?;
++        assert_eq!(owner.snapshot().buffer_memory_bytes, 0);
++        drop(wal);
++        let recovered = recover_and_install_active(
++            &path,
++            WalV7RecoveryAuthority::Active {
++                predecessor: crate::pitr::ChainAnchor::Genesis {
++                    archive_epoch_id: crate::pitr::ArchiveEpochId(anchor.archive_epoch_id),
++                },
++                durable_anchors: vec![anchor],
++            },
++        )?;
++        assert_eq!(recovered.installed.batches, batches);
++
++        Ok(())
++    }
++

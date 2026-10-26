@@ -1,0 +1,94 @@
+{
+  "ext4-point8": {
+    "v4_control": {
+      "puts_per_sec": 18300.21412553502,
+      "run_id": "1793002695493",
+      "arm": "old_v4",
+      "variant_matrix": "buffered-parallel",
+      "binary_sha256": "614f0cb1adde43cabe900eb032c6f884783d658c597471d9d9ddc8faff314aa9",
+      "raw_record_sha256": "8cebe044ceed5b825ea26dcc0399a6b74bc99547311a407e04fcbec66ac5460b",
+      "raw": "rfc-025-v7-buffered-parallel-isolated-ext4-point8-20261026.jsonl",
+      "manifest": "rfc-025-v7-buffered-parallel-isolated-ext4-point8-20261026-runs.tsv",
+      "host_audit": "rfc-025-v7-buffered-parallel-isolated-ext4-point8-20261026-host.jsonl"
+    },
+    "retained_v7": {
+      "puts_per_sec": 16450.05929902571,
+      "run_id": "1793002571117",
+      "arm": "old_v7",
+      "variant_matrix": "buffered-parallel",
+      "binary_sha256": "614f0cb1adde43cabe900eb032c6f884783d658c597471d9d9ddc8faff314aa9",
+      "raw_record_sha256": "b0820b4b8ac8389bd5813018b13258c339e7e7edca94cd8be4de1a0a2b7dc971",
+      "raw": "rfc-025-v7-buffered-parallel-isolated-ext4-point8-20261026.jsonl",
+      "manifest": "rfc-025-v7-buffered-parallel-isolated-ext4-point8-20261026-runs.tsv",
+      "host_audit": "rfc-025-v7-buffered-parallel-isolated-ext4-point8-20261026-host.jsonl"
+    },
+    "buffered-frontier": {
+      "puts_per_sec": 16096.906275798945,
+      "run_id": "1793001860589",
+      "arm": "new_v7",
+      "variant_matrix": "buffered-frontier",
+      "binary_sha256": "25660d36f5d1f1332693af104ee5ef390e3c383cdbf256a967d29d0e7943f7d7",
+      "raw_record_sha256": "5605812fc4937d993f89431e45e22e6b412d546805dde1b131773f42de3f8cd8",
+      "raw": "rfc-025-v7-buffered-frontier-isolated-ext4-point8-20261026.jsonl",
+      "manifest": "rfc-025-v7-buffered-frontier-isolated-ext4-point8-20261026-runs.tsv",
+      "host_audit": "rfc-025-v7-buffered-frontier-isolated-ext4-point8-20261026-host.jsonl"
+    },
+    "buffered-parallel": {
+      "puts_per_sec": 13968.65148751717,
+      "run_id": "1793002456318",
+      "arm": "new_v7",
+      "variant_matrix": "buffered-parallel",
+      "binary_sha256": "e06550ac79c26d0f1c758c1ea07aad71e3296964a32d39a2f4b0c19edabcf5cb",
+      "raw_record_sha256": "000228e4b035062756c4718c1d5e2c838e7bffa6513d9e44bf4036419e9accbe",
+      "raw": "rfc-025-v7-buffered-parallel-isolated-ext4-point8-20261026.jsonl",
+      "manifest": "rfc-025-v7-buffered-parallel-isolated-ext4-point8-20261026-runs.tsv",
+      "host_audit": "rfc-025-v7-buffered-parallel-isolated-ext4-point8-20261026-host.jsonl"
+    }
+  },
+  "ext4-batch64": {
+    "v4_control": {
+      "puts_per_sec": 406529.46839508985,
+      "run_id": "1793002236764",
+      "arm": "new_v4",
+      "variant_matrix": "buffered-frontier",
+      "binary_sha256": "25660d36f5d1f1332693af104ee5ef390e3c383cdbf256a967d29d0e7943f7d7",
+      "raw_record_sha256": "05eff20e4b5ca59d44a6dbf933971219046d2bcbc34f803eb694256bc51c13b8",
+      "raw": "rfc-025-v7-buffered-frontier-isolated-ext4-batch64-20261026.jsonl",
+      "manifest": "rfc-025-v7-buffered-frontier-isolated-ext4-batch64-20261026-runs.tsv",
+      "host_audit": "rfc-025-v7-buffered-frontier-isolated-ext4-batch64-20261026-host.jsonl"
+    },
+    "retained_v7": {
+      "puts_per_sec": 432642.8302422385,
+      "run_id": "1793002120339",
+      "arm": "old_v7",
+      "variant_matrix": "buffered-frontier",
+      "binary_sha256": "614f0cb1adde43cabe900eb032c6f884783d658c597471d9d9ddc8faff314aa9",
+      "raw_record_sha256": "e723d3412a52fcfef8c6719157cea9e1adae698082584560044735626071ac26",
+      "raw": "rfc-025-v7-buffered-frontier-isolated-ext4-batch64-20261026.jsonl",
+      "manifest": "rfc-025-v7-buffered-frontier-isolated-ext4-batch64-20261026-runs.tsv",
+      "host_audit": "rfc-025-v7-buffered-frontier-isolated-ext4-batch64-20261026-host.jsonl"
+    },
+    "buffered-frontier": {
+      "puts_per_sec": 406355.29759533703,
+      "run_id": "1793002132258",
+      "arm": "new_v7",
+      "variant_matrix": "buffered-frontier",
+      "binary_sha256": "25660d36f5d1f1332693af104ee5ef390e3c383cdbf256a967d29d0e7943f7d7",
+      "raw_record_sha256": "9997f1a500b4583b5de32cb575b8d820f762b61a6fbfc00d4a9c0163d3c1b91e",
+      "raw": "rfc-025-v7-buffered-frontier-isolated-ext4-batch64-20261026.jsonl",
+      "manifest": "rfc-025-v7-buffered-frontier-isolated-ext4-batch64-20261026-runs.tsv",
+      "host_audit": "rfc-025-v7-buffered-frontier-isolated-ext4-batch64-20261026-host.jsonl"
+    },
+    "buffered-parallel": {
+      "puts_per_sec": 352580.2176196371,
+      "run_id": "1793003046508",
+      "arm": "new_v7",
+      "variant_matrix": "buffered-parallel",
+      "binary_sha256": "e06550ac79c26d0f1c758c1ea07aad71e3296964a32d39a2f4b0c19edabcf5cb",
+      "raw_record_sha256": "9ae62c20105bee88dde763d750cfdf6711570554099e361cf2ebbb2504dc3192",
+      "raw": "rfc-025-v7-buffered-parallel-isolated-ext4-batch64-20261026.jsonl",
+      "manifest": "rfc-025-v7-buffered-parallel-isolated-ext4-batch64-20261026-runs.tsv",
+      "host_audit": "rfc-025-v7-buffered-parallel-isolated-ext4-batch64-20261026-host.jsonl"
+    }
+  }
+}

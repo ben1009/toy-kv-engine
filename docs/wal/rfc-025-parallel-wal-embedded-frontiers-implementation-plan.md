@@ -2570,6 +2570,20 @@ The stronger retained v7 batch peak of 480,373 puts/s remains recorded; the
 timing candidate peaks at 441,889 batch / 16,612 point puts/s. The retained
 source and canonical binary are unchanged. V4 parity and Stage 8 remain unmet.
 
+The [buffered-I/O experiments and audited SSD rerun](benchmarks/rfc-025-v7-buffered-io-ssd-20261026.md)
+reject both buffered FRONTIER-only and fully buffered Parallel handles. After
+the maintainer reported a competing Rust project, the original 80 scored
+records and 16 warmups were excluded from qualification. The exact saved
+executables were rerun after that project finished: 80 new scored records,
+16 warmups, and 967 clear host-process samples. FRONTIER-only throughput loses
+2.2% point / 2.8% batch raw; fully buffered throughput loses 12.4% / 13.6%.
+Neither passes the fixed SSD guards, so dependent RAM and confirmation cells
+are cancelled. Both source changes are reverted; a fresh full check passes
+1,963 restored-source tests, with one slow compaction integration test and no
+skips or retries. All captures, source patches, identities, and audit records
+remain. The eleven earlier optimizations remain; v4 parity and Stage 8 remain
+unmet.
+
 ## Delivery checklist
 
 - [ ] Stages 1–3: legacy compatibility, byte-exact codec, independent validation,
