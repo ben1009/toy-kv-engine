@@ -36,6 +36,7 @@ the retained and rejected experiments.
 
 ## Benchmarks and qualification
 
+- [RFC 025 full v7 durability-cycle feedback (rejected), 2026-10-26](benchmarks/rfc-025-v7-durability-cycle-cost-20261026.md)
 - [RFC 025 precomputed v7 group hints and pooled SSD confirmation (rejected), 2026-10-26](benchmarks/rfc-025-v7-large-group-hint-cache-20261026.md)
 - [RFC 025 fixed v7 hash-stage experiments (rejected), 2026-10-26](benchmarks/rfc-025-v7-prefix-hash-overlap-20261026.md)
 

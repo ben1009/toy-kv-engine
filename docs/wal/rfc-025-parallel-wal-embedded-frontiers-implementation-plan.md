@@ -2549,6 +2549,18 @@ and saved binary identities remain available. The retained executable reaches
 480,373 puts/s in the longer SSD batch cell; historical short-cell references
 remain separate. V4 parity and the full Stage 8 gate remain unmet.
 
+The [full durability-cycle feedback experiment](benchmarks/rfc-025-v7-durability-cycle-cost-20261026.md)
+is rejected and reverted. It measures FRONTIER preparation/write, WAL sync,
+and marker publication/credit cleanup, then uses that cost for the existing
+100/400-microsecond coalescing choice. Across 74,894 scored SSD cycles, the
+broader duration changes zero classifications relative to fdatasync alone;
+the missing timing scope does not explain the SSD gap through this threshold.
+SSD batch throughput loses 2.4% raw and point gains only 0.9%, failing the
+predeclared material-gain guard. All 76 scored records and 20 warmups remain.
+The eleven earlier optimizations remain; a fresh full check passes 1,963
+restored-source tests, with one slow compaction integration test and no skips.
+V4 parity and the full Stage 8 gate remain unmet.
+
 ## Delivery checklist
 
 - [ ] Stages 1–3: legacy compatibility, byte-exact codec, independent validation,
