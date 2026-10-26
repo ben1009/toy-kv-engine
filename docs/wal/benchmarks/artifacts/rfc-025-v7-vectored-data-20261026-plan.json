@@ -1,0 +1,20 @@
+{
+  "created_at_utc": "2026-10-26T14:19:55.352713+00:00",
+  "source_base": "e2989d6d13b2d4b02d00212788e3988443206d75",
+  "hypothesis": "Retained v7 SSD point8 submits ~100000 DATA requests plus ~12800 FRONTIER writes; ~74000 existing DATA groups show adjacent buffers can share one vectored io_uring WRITEV request. Batch64 has ~11720 DATA buffers in ~8000 groups. Gather adjacent buffers without copying or changing group membership to reduce SSD submission/completion and small-I/O overhead.",
+  "source_evidence": [
+    "docs/wal/benchmarks/artifacts/rfc-025-v7-extent-io-20261026-summary.json",
+    "docs/wal/benchmarks/artifacts/rfc-025-v7-extent-io-20261026-profiles.jsonl"
+  ],
+  "candidate": "Only active v7 ext-family runtimes request vector aggregation. Inside each already-validated group, merge up to8 physically adjacent DATA buffers per WRITEV, stopping at every FRONTIER gap and never crossing groups. Singletons retain WRITE. Own every original buffer/pin and the stable iovec array until a terminal CQE; ambiguous submit keeps the whole bundle alive. Full combined CQE length required. Preserve bytes,offsets,tickets,resources,parallel scheduling,coalescing,FRONTIER write,whole-file fdatasync and publish ordering. No payload copies,preallocation changes,allocator changes,OS settings or RAM-path selector changes.",
+  "baseline": {
+    "path": "target/release/write-perf-v7-validated-logical-batch",
+    "sha256": "614f0cb1adde43cabe900eb032c6f884783d658c597471d9d9ddc8faff314aa9"
+  },
+  "initial_ssd": "Five four-arm rounds each ext4-point8 100000 puts and ext4-batch64 750000 puts. Eight writers,1KiB values,2GiB SST,sampling every100 point operations or10 batches. Four warmups;odd old_v4,new_v4,old_v7,new_v7;even reverse.30sec initialcooldown,10sec betweenruns.1Hz recognized competing-process audits. Preserve all stalls;no builds,tests,profiles during scoring.",
+  "initial_guards": "Both workloads paired raw,v4-normalized and per-arm-median throughput ratios>=0.95;p99<=1.10. At leastone raw gain>=2% with normalized>=1.00. DATA byte counters equal baseline and total retired worker write requests decrease>=5% in at leastone workload. Median paired sync-count ratio<=1.05 in both. These are exploratory acceptance guards,not complete RFC qualification.",
+  "conditional_low_concurrency": "Only if initialSSD passes: exactly three four-arm rounds each ext4-point1 20000 puts,ext4-point2 20000 puts,ext4-point4 50000 puts;same payload,SST,cooldowns,samplingevery100 operations. Four warmups. Each requires paired raw,normalized and arm-median throughput>=0.95,p99<=1.10. These smaller-count guard cells are not pooled with eight-writer cells or historical peaks.",
+  "conditional_confirmation": "Only if initial and low-concurrency guards pass: exactly five further four-arm SSD rounds each initialcell using identical source/binary. Pool only this candidate across both fixed phases,reevaluate initialguards. No extra attempts chosen by score.",
+  "correctness": "Run full cargo make check outside sandbox and direct typos. Add tests for physical gaps/vector limits,actual direct WRITEV byte preservation,short CQE and ambiguous ownership,poisoned later completions,and deterministic v7 recovery/resource retirement after a merged DATA group. No performance claim from tests or tmpfs.",
+  "decision": "Keep and commit source separately from evidence only if all fixed SSD phases pass;otherwise restore both modified source files and canonical baseline executable,preserve allsource/captures and run restored checks. No PR/push."
+}

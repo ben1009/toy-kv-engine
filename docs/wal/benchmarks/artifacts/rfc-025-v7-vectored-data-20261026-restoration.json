@@ -1,0 +1,17 @@
+{
+  "restored_at_utc": "2026-10-26T15:01:28.397165+00:00",
+  "before_next_candidate": true,
+  "source_base": "e2989d6d13b2d4b02d00212788e3988443206d75",
+  "source_sha256": {
+    "runtime.rs": "bc4573288884886fd4edc96e821d3a500f09a844e4f64d4ca0009346b8f3e619",
+    "worker.rs": "b26fedc3a3966a47d5ee05f9fa07241730f60b7ff00b51b454235c13b1cf2970"
+  },
+  "canonical_sha256": "614f0cb1adde43cabe900eb032c6f884783d658c597471d9d9ddc8faff314aa9",
+  "conditional_captures_cancelled": [
+    "ext4-point1",
+    "ext4-point2",
+    "ext4-point4",
+    "confirmation"
+  ],
+  "reason": "Initial SSD phase failed point p99 and material-throughput-gain guards."
+}

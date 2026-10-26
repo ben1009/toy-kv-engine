@@ -2635,6 +2635,31 @@ The restored engine passes all 1,963 tests with zero skips/retries, and the elev
 retained optimizations remain. Point parity and the complete Stage 8 gate remain
 unmet.
 
+The [vectored v7 DATA experiment](benchmarks/rfc-025-v7-vectored-data-20261026.md)
+gathers at most eight contiguous original buffers per submission while stopping
+at FRONTIER gaps. DATA submissions fall 27.0% for point writes and 30.2% for
+batch64, but paired raw throughput gains only 0.8% / 0.7%, and point p99 rises
+31.5%. Neither workload meets the fixed material-gain requirement. The prototype
+is rejected and restored before the next candidate. All 40 scored records,
+eight warmups, 485 clear host samples, exact source reconstruction and binary
+identities remain. Full prototype checks pass 1,969 tests, including six focused
+ownership, completion, direct-I/O and recovery tests. The eleven retained
+optimizations remain; point parity and the complete Stage 8 gate remain unmet.
+
+The [asynchronous v7 extent experiment](benchmarks/rfc-025-v7-async-extent-20261026.md)
+prepares required bytes synchronously and initializes the unused part of the same
+allocated extent in a bounded worker. Eight-writer batch64 gains 6.0% raw / 4.9%
+normalized throughput with 9.2% lower p99; point throughput gains 0.7%, preparation
+wait falls 73.7%, and p99 falls 36.7%. The low-concurrency phase fails only the
+one-writer p99 guard: 0.759 to 0.934 ms, +23.1% paired. Confirmation is cancelled.
+The maintainer explicitly directs keeping the optimization and fixing one-writer
+latency, so source commit `0ffebd51` retains it despite the failed original guard.
+All 76 scored records, 20 warmups, 1,006 clear samples, exact patches and binary
+identities remain. The prototype passes 1,968 tests; a temporary restoration before
+the retention instruction also passes all 1,963 original tests. A separate serial
+scheduling follow-up includes the subsequently requested 16-writer coverage.
+This retention does not establish point parity or the complete Stage 8 gate.
+
 ## Delivery checklist
 
 - [ ] Stages 1–3: legacy compatibility, byte-exact codec, independent validation,

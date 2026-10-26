@@ -1,0 +1,16 @@
+{
+  "source_base": "e2989d6d13b2d4b02d00212788e3988443206d75",
+  "rustc": "rustc 1.100.0-nightly (6bb1652a0 2026-09-22)\nbinary: rustc\ncommit-hash: 6bb1652a020e80cef79332741d89e996d71933c9\ncommit-date: 2026-09-22\nhost: x86_64-unknown-linux-gnu\nrelease: 1.100.0-nightly\nLLVM version: 23.1.1\n",
+  "kernel": "Linux 6.12.71-1-lts #1 SMP PREEMPT_DYNAMIC Fri, 13 Feb 2026 19:12:56 +0000 x86_64 GNU/Linux",
+  "mount": "ext4 /dev/nvme0n1p3[/liu/proj/toy-kv-engine] rw,nosuid,nodev,relatime",
+  "queue": {
+    "max_hw_sectors_kb": "512",
+    "max_sectors_kb": "512",
+    "physical_block_size": "512",
+    "max_segments": "128",
+    "nr_requests": "255"
+  },
+  "source_manifest_sha256": "eb8fed7a7cf5ca96084d78a513c7106a0891d06572846b08d42b34b7ba73b94c",
+  "build_command": "cargo build --release --package kv-engine --bin write-perf --features bench",
+  "candidate_build_log_sha256": "1611f789ea236194e75354261dbc0a774ecac11efbcf0b95cf42ae6c32e40b65"
+}

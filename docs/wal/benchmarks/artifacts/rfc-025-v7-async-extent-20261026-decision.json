@@ -1,0 +1,13 @@
+{
+  "decision_at_utc": "2026-10-26T17:06:07.289065+00:00",
+  "retained": false,
+  "initial_ssd_passed": true,
+  "low_concurrency_passed": false,
+  "failed_guards": [
+    "ext4-point1_p99_ceiling"
+  ],
+  "confirmation_cancelled": true,
+  "reason": "Single-writer median paired p99 ratio 1.230837943487134 exceeds frozen 1.10 limit. All scheduled low-concurrency captures completed. Do not retain the source based only on the initial eight-writer batch gain.",
+  "initial_summary_sha256": "ae9f37d1ac943a2c5c9d7150c8bbc8887c1633e2da83443463f3fc81aee85f8b",
+  "low_summary_sha256": "0467ceb53738f0a4464f4195ab39811c2245e10ddecd35cccaa2bd59af91675d"
+}

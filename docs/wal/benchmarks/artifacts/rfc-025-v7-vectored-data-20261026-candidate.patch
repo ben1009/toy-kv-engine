@@ -1,0 +1,497 @@
+diff --git a/kv-engine/src/wal/parallel/runtime.rs b/kv-engine/src/wal/parallel/runtime.rs
+index a709ed68..8a3853bf 100644
+--- a/kv-engine/src/wal/parallel/runtime.rs
++++ b/kv-engine/src/wal/parallel/runtime.rs
+@@ -698,0 +699,2 @@ struct PackerState {
++    // Gather adjacent DATA only for the active v7 ext-family path.
++    vectored_v7_data: bool,
+@@ -946,0 +949 @@ impl ParallelWalRuntime {
++                vectored_v7_data: prepared_v7_extent_end.is_some(),
+@@ -1830,0 +1834,5 @@ fn pack_admitted_groups(
++        let group = if v7_layout && packer.vectored_v7_data {
++            group.with_vectored_writes()
++        } else {
++            group
++        };
+@@ -2936,0 +2945,66 @@ mod tests {
++    #[cfg(feature = "bench")]
++    #[test]
++    fn v7_vectored_data_group_retires_all_credits_and_recovers_exact_batches() -> anyhow::Result<()>
++    {
++        use crate::wal::v7::{
++            install::recover_and_install_active, recovery::WalV7RecoveryAuthority,
++        };
++
++        for gathered in [false, true] {
++            let directory = tempfile::tempdir()?;
++            let path = directory.path().join("gathered-v7.wal");
++            let Some(V7RuntimeTestWal { wal, owner, anchor }) =
++                live_v7_test_wal(&path, super::MAX_WAL_FILE_SIZE, v7_test_resource_limits())?
++            else {
++                return Ok(());
++            };
++            let profile = Arc::new(crate::mem_table::WriteProfile::default());
++            wal.set_write_profile(Arc::clone(&profile));
++            let runtime = wal.parallel_runtime.as_ref().unwrap();
++            let mut packer = runtime.inner.packer_state.lock();
++            assert_eq!(
++                packer.vectored_v7_data,
++                super::is_ext_filesystem(&runtime.inner.preallocator)
++            );
++            // Force both paths on every test filesystem, and hold the packer
++            // until all eight admissions form one deterministic DATA group.
++            packer.vectored_v7_data = gathered;
++            let batches = (1..=8).map(|ts| v7_test_batch(ts, 16)).collect::<Vec<_>>();
++            for (ticket, batch) in batches.iter().enumerate() {
++                assert_eq!(
++                    wal.put_v7_batch_with_index(batch, LIVE_WAL_V5_LIMITS)?.0,
++                    ticket as u64
++                );
++            }
++            assert!(owner.snapshot().buffer_memory_bytes > 0);
++            assert_eq!(
++                runtime.inner.buffer_budget.state.lock().active_bytes,
++                8 * 4096
++            );
++            drop(packer);
++            wal.submit_and_commit(7)?;
++            wal.close()?;
++            let snapshot = profile.snapshot();
++            assert_eq!(snapshot.wal_commit_groups, 1);
++            assert_eq!(snapshot.wal_commit_buffers, if gathered { 1 } else { 8 });
++            assert_eq!(snapshot.wal_commit_bytes, 8 * 4096);
++            assert_eq!(snapshot.wal_frontier_writes, 1);
++            assert_eq!(snapshot.wal_sync_count, 1);
++            assert_eq!(owner.snapshot().buffer_memory_bytes, 0);
++            assert_eq!(runtime.inner.buffer_budget.state.lock().active_bytes, 0);
++            assert_eq!(runtime.inner.v7_frame_buffer_pool.len(), 8);
++            drop(wal);
++            let recovered = recover_and_install_active(
++                &path,
++                WalV7RecoveryAuthority::Active {
++                    predecessor: crate::pitr::ChainAnchor::Genesis {
++                        archive_epoch_id: crate::pitr::ArchiveEpochId(anchor.archive_epoch_id),
++                    },
++                    durable_anchors: vec![anchor],
++                },
++            )?;
++            assert_eq!(recovered.installed.batches, batches);
++        }
++        Ok(())
++    }
++
+diff --git a/kv-engine/src/wal/parallel/worker.rs b/kv-engine/src/wal/parallel/worker.rs
+index 11c6962a..15198c46 100644
+--- a/kv-engine/src/wal/parallel/worker.rs
++++ b/kv-engine/src/wal/parallel/worker.rs
+@@ -624,0 +625 @@ pub(crate) struct WriteGroup<B = DirectBuf> {
++    vectored_writes: bool,
+@@ -627,0 +629,7 @@ impl<B> WriteGroup<B> {
++    /// Gather only adjacent DATA buffers within this already validated group.
++    /// Reserved FRONTIER gaps always start a separate I/O request.
++    pub(crate) fn with_vectored_writes(mut self) -> Self {
++        self.vectored_writes = true;
++        self
++    }
++
+@@ -735,0 +744 @@ impl<B> WriteGroup<B> {
++            vectored_writes: false,
+@@ -740,0 +750 @@ pub(crate) trait WorkerBuffer: Send + 'static + Sized {
++    /// The backing allocation must stay at the same address when its owner moves.
+@@ -787,0 +798,79 @@ impl WriteState {
++const MAX_VECTORED_WRITE_BUFFERS: usize = 8;
++
++/// The box pins both the iovec array and its original buffer owners. Neither
++/// payload bytes nor their reservation pins are copied or released by gathering.
++struct VectoredWriteBuffers<B> {
++    buffers: [Option<B>; MAX_VECTORED_WRITE_BUFFERS],
++    vectors: [libc::iovec; MAX_VECTORED_WRITE_BUFFERS],
++    count: usize,
++}
++
++impl<B: WorkerBuffer> VectoredWriteBuffers<B> {
++    fn push(&mut self, buffer: B, write_len: usize) {
++        assert!(self.count < MAX_VECTORED_WRITE_BUFFERS);
++        self.vectors[self.count] = libc::iovec {
++            iov_base: buffer.as_ptr().cast_mut().cast(),
++            iov_len: write_len,
++        };
++        self.buffers[self.count] = Some(buffer);
++        self.count += 1;
++    }
++}
++
++enum OwnedWriteBuffer<B> {
++    Single(B),
++    Vectored(Box<VectoredWriteBuffers<B>>),
++}
++
++impl<B: WorkerBuffer> OwnedWriteBuffer<B> {
++    fn append(self, previous_len: usize, buffer: B, write_len: usize) -> Self {
++        let mut gathered = match self {
++            Self::Single(first) => {
++                let mut gathered = Box::new(VectoredWriteBuffers {
++                    buffers: std::array::from_fn(|_| None),
++                    vectors: [libc::iovec {
++                        iov_base: std::ptr::null_mut(),
++                        iov_len: 0,
++                    }; MAX_VECTORED_WRITE_BUFFERS],
++                    count: 0,
++                });
++                gathered.push(first, previous_len);
++                gathered
++            }
++            Self::Vectored(gathered) => gathered,
++        };
++        gathered.push(buffer, write_len);
++        Self::Vectored(gathered)
++    }
++
++    fn as_ptr(&self) -> *const u8 {
++        match self {
++            Self::Single(buffer) => buffer.as_ptr(),
++            Self::Vectored(gathered) => gathered.buffers[0]
++                .as_ref()
++                .expect("vectored write owns its first buffer")
++                .as_ptr(),
++        }
++    }
++
++    fn vectors(&self) -> Option<(*const libc::iovec, u32)> {
++        match self {
++            Self::Single(_) => None,
++            Self::Vectored(gathered) => Some((gathered.vectors.as_ptr(), gathered.count as u32)),
++        }
++    }
++
++    fn retire_into(self, events: &mut Vec<WorkerEvent<B>>) {
++        match self {
++            Self::Single(buffer) => events.push(WorkerEvent::BufferRetired(buffer)),
++            Self::Vectored(mut gathered) => {
++                for buffer in &mut gathered.buffers[..gathered.count] {
++                    events.push(WorkerEvent::BufferRetired(
++                        buffer.take().expect("vectored write owns every segment"),
++                    ));
++                }
++            }
++        }
++    }
++}
++
+@@ -791 +880 @@ struct OwnedWrite<B> {
+-    buffer: Option<B>,
++    buffer: Option<OwnedWriteBuffer<B>>,
+@@ -828,0 +918 @@ struct WriteSubmission {
++    vectors: Option<(*const libc::iovec, u32)>,
+@@ -852,2 +942,2 @@ pub(crate) struct GroupWriteResult {
+-/// one SQE identity to one owned buffer, so a buffer cannot leave the worker
+-/// before its terminal CQE.
++/// one SQE identity to one owned buffer or stable vector of original buffers.
++/// No buffer or iovec storage can leave the worker before its terminal CQE.
+@@ -918 +1008 @@ impl<B: WorkerBuffer> WorkerCore<B> {
+-        let request_count =
++        let buffer_count =
+@@ -920,3 +1010,4 @@ impl<B: WorkerBuffer> WorkerCore<B> {
+-        let next_request_id = self
+-            .next_request_id
+-            .checked_add(request_count)
++        // Check the unmerged upper bound before mutating worker state. Gathering
++        // can only reduce these counts, and failure must leave enqueue atomic.
++        self.next_request_id
++            .checked_add(buffer_count)
+@@ -924,3 +1015,2 @@ impl<B: WorkerBuffer> WorkerCore<B> {
+-        let next_buffer_id = self
+-            .next_buffer_id
+-            .checked_add(request_count)
++        self.next_buffer_id
++            .checked_add(buffer_count)
+@@ -929 +1019,20 @@ impl<B: WorkerBuffer> WorkerCore<B> {
+-        for write in group.writes.into_iter() {
++        let mut writes = group.writes.into_iter().peekable();
++        while let Some(write) = writes.next() {
++            let file_offset = write.file_offset;
++            let mut write_len = write.write_len;
++            let mut buffer = OwnedWriteBuffer::Single(write.buffer);
++            let mut segments = 1;
++            while group.vectored_writes
++                && segments < MAX_VECTORED_WRITE_BUFFERS
++                && writes.peek().is_some_and(|next| {
++                    next.file_offset == file_offset + write_len as u64
++                        && write_len
++                            .checked_add(next.write_len)
++                            .is_some_and(|len| len <= i32::MAX as usize)
++                })
++            {
++                let next = writes.next().expect("adjacent DATA buffer exists");
++                buffer = buffer.append(write_len, next.buffer, next.write_len);
++                write_len += next.write_len;
++                segments += 1;
++            }
+@@ -939,3 +1048,3 @@ impl<B: WorkerBuffer> WorkerCore<B> {
+-                    buffer: Some(write.buffer),
+-                    file_offset: write.file_offset,
+-                    write_len: write.write_len,
++                    buffer: Some(buffer),
++                    file_offset,
++                    write_len,
+@@ -948,2 +1056,0 @@ impl<B: WorkerBuffer> WorkerCore<B> {
+-        self.next_request_id = next_request_id;
+-        self.next_buffer_id = next_buffer_id;
+@@ -953 +1060,2 @@ impl<B: WorkerBuffer> WorkerCore<B> {
+-        let request_ids = request_ids_start..next_request_id;
++        let request_ids = request_ids_start..self.next_request_id;
++        let request_count = self.next_request_id - request_ids_start;
+@@ -1029,0 +1138 @@ impl<B: WorkerBuffer> WorkerCore<B> {
++                vectors: buffer.vectors(),
+@@ -1144 +1253,6 @@ impl<B: WorkerBuffer> WorkerCore<B> {
+-        let mut events = vec![WorkerEvent::BufferRetired(retired_buffer)];
++        let retirement_count = match &retired_buffer {
++            OwnedWriteBuffer::Single(_) => 1,
++            OwnedWriteBuffer::Vectored(gathered) => gathered.count,
++        };
++        let mut events = Vec::with_capacity(retirement_count);
++        retired_buffer.retire_into(&mut events);
+@@ -1198,3 +1312,5 @@ impl<B: WorkerBuffer> WorkerCore<B> {
+-                    events.push(WorkerEvent::BufferRetired(
+-                        write.buffer.take().expect("ready write owns buffer"),
+-                    ));
++                    write
++                        .buffer
++                        .take()
++                        .expect("ready write owns buffer")
++                        .retire_into(&mut events);
+@@ -1931,7 +2047,16 @@ fn run_worker_loop<B: WorkerBuffer>(
+-                let sqe = io_uring::opcode::Write::new(
+-                    io_uring::types::Fixed(WAL_FD_INDEX),
+-                    submission.buffer_ptr,
+-                    submission.write_len as u32,
+-                )
+-                .offset(submission.file_offset)
+-                .build()
++                let sqe = match submission.vectors {
++                    Some((vectors, count)) => io_uring::opcode::Writev::new(
++                        io_uring::types::Fixed(WAL_FD_INDEX),
++                        vectors,
++                        count,
++                    )
++                    .offset(submission.file_offset)
++                    .build(),
++                    None => io_uring::opcode::Write::new(
++                        io_uring::types::Fixed(WAL_FD_INDEX),
++                        submission.buffer_ptr,
++                        submission.write_len as u32,
++                    )
++                    .offset(submission.file_offset)
++                    .build(),
++                }
+@@ -1939,3 +2064,4 @@ fn run_worker_loop<B: WorkerBuffer>(
+-                // SAFETY: `core` owns the DirectBuf and retains it until its CQE is
+-                // consumed. The ring is private to this worker thread and has no
+-                // SQPOLL mode, so a pushed SQE cannot outlive this ownership path.
++                // SAFETY: `core` owns every DirectBuf and the boxed iovec array
++                // through the terminal CQE. Ambiguous submissions retain the
++                // entire owner, including vector metadata. The ring is private
++                // to this thread and does not use SQPOLL.
+@@ -2448,0 +2575,202 @@ mod tests {
++    #[test]
++    fn vectored_data_requests_stop_at_frontier_gaps() {
++        let drops = Arc::new(AtomicUsize::new(0));
++        let writes = [4096, 8192, 16_384, 20_480]
++            .map(|offset| WriteBuffer::new(DropProbe::new(4096, Arc::clone(&drops)), offset, 4096));
++        let group =
++            WriteGroup::new_with_frontiers(0..4, Vec::from(writes), 4096..24_576, &[12_288])
++                .expect("valid DATA spans around a reserved FRONTIER")
++                .with_vectored_writes();
++        let mut core = WorkerCore::new();
++        core.enqueue(group).expect("enqueue gathered group");
++        let submissions = core.stage_writes(8).expect("stage two DATA spans");
++        assert_eq!(submissions.len(), 2);
++        assert_eq!(submissions[0].file_offset, 4096);
++        assert_eq!(submissions[1].file_offset, 16_384);
++        for submission in &submissions {
++            assert_eq!(submission.write_len, 8192);
++            assert_eq!(submission.vectors.map(|(_, count)| count), Some(2));
++            core.mark_submitted(submission.request_id).unwrap();
++        }
++        let first = core
++            .complete_write(submissions[0].request_id, 8192)
++            .unwrap();
++        assert!(
++            first
++                .iter()
++                .all(|event| matches!(event, WorkerEvent::BufferRetired(_)))
++        );
++        drop(first);
++        assert_eq!(drops.load(Ordering::Acquire), 2);
++        let result = take_group_result(
++            core.complete_write(submissions[1].request_id, 8192)
++                .unwrap(),
++        );
++        assert_eq!(result.error, None);
++        assert_eq!(result.tickets, 0..4);
++        assert_eq!(result.write_count, 2);
++        assert_eq!(result.write_bytes, 4 * 4096);
++        assert_eq!(drops.load(Ordering::Acquire), 4);
++        assert!(core.is_idle());
++    }
++
++    #[test]
++    fn vectored_data_requests_keep_the_fixed_segment_limit() {
++        let drops = Arc::new(AtomicUsize::new(0));
++        let mut core = WorkerCore::new();
++        core.enqueue(make_group(0..9, 4096, 9, 4096, &drops).with_vectored_writes())
++            .unwrap();
++        let submissions = core.stage_writes(8).unwrap();
++        assert_eq!(submissions.len(), 2);
++        assert_eq!(submissions[0].vectors.map(|(_, count)| count), Some(8));
++        assert_eq!(submissions[0].write_len, 8 * 4096);
++        assert!(submissions[1].vectors.is_none());
++        assert_eq!(submissions[1].file_offset, 9 * 4096);
++        assert_eq!(submissions[1].write_len, 4096);
++        for submission in &submissions {
++            core.mark_submitted(submission.request_id).unwrap();
++        }
++        drop(
++            core.complete_write(submissions[0].request_id, 8 * 4096)
++                .unwrap(),
++        );
++        assert_eq!(drops.load(Ordering::Acquire), 8);
++        let result = take_group_result(
++            core.complete_write(submissions[1].request_id, 4096)
++                .unwrap(),
++        );
++        assert_eq!(result.write_count, 2);
++        assert_eq!(result.write_bytes, 9 * 4096);
++        assert_eq!(result.error, None);
++        assert_eq!(drops.load(Ordering::Acquire), 9);
++    }
++
++    #[test]
++    fn vectored_short_cqe_poisons_without_retiring_later_inflight_segments() {
++        let drops = Arc::new(AtomicUsize::new(0));
++        let mut core = WorkerCore::new();
++        core.enqueue(make_group(0..8, 4096, 8, 4096, &drops).with_vectored_writes())
++            .unwrap();
++        core.enqueue(make_group(8..10, 9 * 4096, 2, 4096, &drops).with_vectored_writes())
++            .unwrap();
++        let requests = submitted_ids(&mut core, 8);
++        assert_eq!(requests.len(), 2);
++        let first = take_group_result(core.complete_write(requests[0], 4096).unwrap());
++        assert!(first.error.unwrap().contains("short io_uring write"));
++        assert_eq!(core.poison_ticket, Some(0));
++        assert_eq!(drops.load(Ordering::Acquire), 8);
++        assert_eq!(core.outstanding_sqe_count(), 1);
++        let later = take_group_result(core.complete_write(requests[1], 8192).unwrap());
++        assert!(later.error.is_some());
++        assert_eq!(drops.load(Ordering::Acquire), 10);
++        assert!(core.is_idle());
++    }
++
++    #[test]
++    fn vectored_ambiguous_submit_keeps_metadata_and_all_segments_until_cqe() {
++        let drops = Arc::new(AtomicUsize::new(0));
++        let mut core = WorkerCore::new();
++        core.enqueue(make_group(0..3, 4096, 3, 4096, &drops).with_vectored_writes())
++            .unwrap();
++        let submissions = core.stage_writes(1).unwrap();
++        let first = submissions[0];
++        let (vectors, count) = first.vectors.expect("gathered DATA vector");
++        // Resize the request map while this vector is staged. Its metadata
++        // belongs to the boxed request, independently of map/owner addresses.
++        for ticket in 3..23 {
++            core.enqueue(make_group(
++                ticket..ticket + 1,
++                (ticket + 1) * 4096,
++                1,
++                4096,
++                &drops,
++            ))
++            .unwrap();
++        }
++        assert_eq!(
++            core.writes[&first.request_id]
++                .buffer
++                .as_ref()
++                .unwrap()
++                .vectors(),
++            Some((vectors, count))
++        );
++        let mut relocated = Box::new(core);
++        drop(relocated.mark_ambiguous(&[first.request_id]).unwrap());
++        assert_eq!(drops.load(Ordering::Acquire), 20);
++        // SAFETY: the staged/ambiguous request still owns this boxed array;
++        // neither its terminal CQE nor its retirement has occurred.
++        let retained = unsafe { std::slice::from_raw_parts(vectors, count as usize) };
++        assert_eq!(retained.len(), 3);
++        assert!(
++            retained
++                .iter()
++                .all(|vector| !vector.iov_base.is_null() && vector.iov_len == 4096)
++        );
++        let result = take_group_result(
++            relocated
++                .complete_write(first.request_id, 3 * 4096)
++                .unwrap(),
++        );
++        assert!(
++            result.error.is_some(),
++            "ambiguous submission cannot acknowledge its group"
++        );
++        assert_eq!(drops.load(Ordering::Acquire), 23);
++        assert!(relocated.is_idle());
++    }
++
++    #[test]
++    fn io_worker_vectored_data_preserves_real_frontier_gaps() {
++        let directory = tempfile::tempdir().unwrap();
++        let path = directory.path().join("vectored-wal");
++        std::fs::write(&path, vec![0xcc; 7 * 4096]).unwrap();
++        let file = Arc::new(
++            File::options()
++                .read(true)
++                .write(true)
++                .custom_flags(libc::O_DIRECT)
++                .open(&path)
++                .unwrap(),
++        );
++        file.sync_all().unwrap();
++        let worker = match IoWorker::spawn(Arc::clone(&file), Arc::new(ArrayQueue::new(8))) {
++            Ok(worker) => worker,
++            Err(error) if io_uring_unavailable(&error) => {
++                eprintln!("skipping test (io_uring unavailable): {error:#}");
++                return;
++            }
++            Err(error) => panic!("failed to start WAL I/O worker: {error:#}"),
++        };
++        let offsets = [4096, 8192, 16_384, 20_480];
++        let mut writes = Vec::new();
++        for (index, offset) in offsets.iter().enumerate() {
++            let mut buffer = DirectBuf::new(4096);
++            buffer.as_mut_slice().fill(index as u8 + 1);
++            buffer.set_len(4096);
++            writes.push(WriteBuffer::new(buffer, *offset, 4096));
++        }
++        worker
++            .submit_group(
++                WriteGroup::new_with_frontiers(0..4, writes, 4096..24_576, &[12_288])
++                    .unwrap()
++                    .with_vectored_writes(),
++            )
++            .unwrap();
++        let result = worker
++            .completions()
++            .recv_timeout(Duration::from_secs(5))
++            .unwrap();
++        assert_eq!(result.error, None);
++        assert_eq!(result.write_count, 2);
++        assert_eq!(result.write_bytes, 4 * 4096);
++        worker.close().unwrap();
++        file.sync_data().unwrap();
++        let image = std::fs::read(path).unwrap();
++        let mut expected = vec![0xcc; 7 * 4096];
++        for (index, offset) in offsets.into_iter().enumerate() {
++            expected[offset as usize..offset as usize + 4096].fill(index as u8 + 1);
++        }
++        assert_eq!(image, expected);
++    }
++

@@ -1,0 +1,12 @@
+{
+  "retained_at_utc": "2026-10-26T17:13:06.551820+00:00",
+  "user_instruction": "Keep and Optimize for 1 writer",
+  "source_commit": "0ffebd516b865b01371ed65014ac0347ae2fb420",
+  "retained": true,
+  "original_performance_guards_passed": false,
+  "failed_guard": "ext4-point1_p99_ceiling",
+  "single_writer_fix_pending": true,
+  "source_manifest_sha256": "caa9b179bcbcd829ff628a3b9779d0d476390ae080f6f12e1d70e8d6a16520dc",
+  "candidate_sha256": "ef112fd0dea7f292a0be9ab47eae6276242dd6b290efccdf4335f03e41b17d0a",
+  "note": "Explicit maintainer retention supersedes automatic rejection. Preserve all original failed guards and measurements; optimize single-writer behavior separately."
+}

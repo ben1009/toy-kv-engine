@@ -1,0 +1,15 @@
+{
+  "source_base": "e2989d6d13b2d4b02d00212788e3988443206d75",
+  "reconstructed_inputs": 128,
+  "verified_binaries": 2,
+  "engine_records": 48,
+  "scored_records": 40,
+  "warmups": 8,
+  "host_samples": 485,
+  "restoration_record_verified": true,
+  "summary_regenerates": true,
+  "peaks_verified": true,
+  "scratch_removed": true,
+  "checks_record_sha256": "33b6993fde2eb6c47defce7240dc7d58c80d1d67c24bda823b357cbf5773a025",
+  "verification_script_sha256": "789c69d0d72f9678d076f3312f37fc67172730baacabb195a43e8100e0eacb83"
+}

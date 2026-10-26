@@ -1,0 +1,12 @@
+{
+  "restored_at_utc": "2026-10-26T17:06:07.307517+00:00",
+  "source_base": "e2989d6d13b2d4b02d00212788e3988443206d75",
+  "source_sha256": {
+    "kv-engine/src/lsm_storage.rs": "33197c568a48bc83d4ea731d9c3e120e8c50853b94da4e68562f1416670a1d97",
+    "kv-engine/src/mem_table.rs": "51c9ecb0c450607e22c2030117af505b7c9352ceb2a312a3b62124c4c469f7aa",
+    "kv-engine/src/wal.rs": "3c3874d2d19dd2fe36ad4c383f69c73de47eda43a6dd199a5ec7dfa254d8a821",
+    "kv-engine/src/wal/parallel/runtime.rs": "bc4573288884886fd4edc96e821d3a500f09a844e4f64d4ca0009346b8f3e619"
+  },
+  "canonical_sha256": "614f0cb1adde43cabe900eb032c6f884783d658c597471d9d9ddc8faff314aa9",
+  "confirmation_cancelled": true
+}

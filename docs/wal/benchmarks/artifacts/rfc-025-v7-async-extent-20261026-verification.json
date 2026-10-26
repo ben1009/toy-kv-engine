@@ -1,0 +1,23 @@
+{
+  "source_base": "e2989d6d13b2d4b02d00212788e3988443206d75",
+  "reconstructed_inputs": 128,
+  "verified_binaries": 2,
+  "engine_records": 96,
+  "scored_records": 76,
+  "warmups": 20,
+  "host_samples": 1006,
+  "initial_phase_passed": true,
+  "low_concurrency_phase_passed": false,
+  "confirmation_cancelled": true,
+  "failed_guards": [
+    "ext4-point1_p99_ceiling"
+  ],
+  "historical_restoration_verified": true,
+  "retained_by_maintainer": true,
+  "retained_source_commit": "0ffebd516b865b01371ed65014ac0347ae2fb420",
+  "summaries_regenerate": true,
+  "peaks_verified": true,
+  "scratch_removed": true,
+  "checks_record_sha256": "e649c749d19642af56c32aefc2221c689df245bb18ca9dae01690f1b2c7a5a2d",
+  "verification_script_sha256": "719624ac1f54411c070f9ff812a2bfa5146ef97356c9875947473fc8327d124b"
+}
