@@ -1,0 +1,202 @@
+diff --git a/kv-engine/src/wal/parallel/runtime.rs b/kv-engine/src/wal/parallel/runtime.rs
+index a709ed68..7daeeec5 100644
+--- a/kv-engine/src/wal/parallel/runtime.rs
++++ b/kv-engine/src/wal/parallel/runtime.rs
+@@ -1728 +1727,0 @@ fn pack_admitted_groups(
+-        let expected_ticket = packed.next_ticket;
+@@ -1735,0 +1735,12 @@ fn pack_admitted_groups(
++                // Framing can overlap new admissions. Capture those already
++                // queued once, without waiting or exceeding the group bound.
++                // Keep both framing passes outside the admission lock.
++                let mut admission = inner.admission.lock();
++                if packed.initialize_extents && packed.writes.len() < PACKER_GROUP_MAX_TICKETS {
++                    take_v7_group_refill(&mut admission, &mut packed, v7_batches)?;
++                    if !v7_batches.is_empty() {
++                        drop(admission);
++                        materialize_v7_batches(v7_batches, prefix, &mut packed.writes)?;
++                        admission = inner.admission.lock();
++                    }
++                }
+@@ -1739 +1749,0 @@ fn pack_admitted_groups(
+-                let mut admission = inner.admission.lock();
+@@ -1748 +1758 @@ fn pack_admitted_groups(
+-                        .insert(expected_ticket, prefix.clone())
++                        .insert(packed.next_ticket, prefix.clone())
+@@ -1758,0 +1769 @@ fn pack_admitted_groups(
++        let expected_ticket = packed.next_ticket;
+@@ -1841,0 +1853,34 @@ fn pack_admitted_groups(
++/// Extend a v7 DATA group with one snapshot of admissions that arrived during
++/// its first materialization pass. Membership stays bounded and ordered;
++/// callers frame the returned scratch batches after releasing admission.
++fn take_v7_group_refill(
++    admission: &mut AdmissionState,
++    packed: &mut PackedGroup,
++    v7_batches: &mut Vec<AdmittedBatch>,
++) -> Result<()> {
++    ensure!(packed.v7_layout, "only v7 groups support packer refill");
++    let remaining = PACKER_GROUP_MAX_TICKETS.saturating_sub(packed.writes.len());
++    if !packed.initialize_extents || remaining == 0 {
++        return Ok(());
++    }
++    let Some(refill) = take_admitted_group(
++        admission,
++        packed.next_ticket,
++        packed.reserved_end,
++        remaining,
++        v7_batches,
++    )?
++    else {
++        return Ok(());
++    };
++    ensure!(
++        refill.v7_layout,
++        "v7 packer refill has an incompatible layout"
++    );
++    packed.next_ticket = refill.next_ticket;
++    packed.reserved_end = refill.reserved_end;
++    packed.frontier_offsets.extend(refill.frontier_offsets);
++    packed.initialize_extents |= refill.initialize_extents;
++    Ok(())
++}
++
+@@ -5216,0 +5262,140 @@ mod tests {
++    fn v7_refill_admission(
++        count: u64,
++        poison: Option<u64>,
++        first_fragments: u32,
++    ) -> (AdmissionState, std::sync::Arc<BufferBudget>) {
++        use crate::wal::v7::{
++            allocator::{WalV7FrontierCursor, WalV7PhysicalAllocator},
++            codec::WalV7Frontier,
++        };
++
++        let genesis = WalV7FrontierCursor {
++            frontier: WalV7Frontier {
++                generation: 0,
++                ticket_end: 0,
++                durable_end: 4096,
++                last_commit_ts: 0,
++                prefix_digest: [0x11; 32],
++                previous_frontier_offset: 0,
++                previous_frontier_digest: [0; 32],
++            },
++            frame_offset: 4096,
++            frame_digest: [0x22; 32],
++        };
++        let mut allocator =
++            WalV7PhysicalAllocator::new(0, 8192, MAX_WAL_FILE_SIZE, genesis).unwrap();
++        let budget = std::sync::Arc::new(BufferBudget::new());
++        let mut queue = std::collections::VecDeque::new();
++        for ticket in 0..count {
++            let allocation = allocator
++                .reserve_data(if ticket == 0 { first_fragments } else { 1 })
++                .unwrap();
++            queue.push_back(admitted_v7_batch(&budget, allocation));
++            if ticket == 0 {
++                let _marker = allocator.reserve_frontier(1).unwrap();
++            }
++        }
++        let admission = AdmissionState {
++            open: false,
++            close_cutoff: Some(count),
++            poison: poison.map(|ticket| (ticket, "test poison".to_owned())),
++            #[cfg(feature = "bench")]
++            initial_ticket: 0,
++            next_ticket: count,
++            admitted_end: allocator.allocation_tail(),
++            v7_allocator: Some(allocator),
++            v7_header_digest: None,
++            v7_reservation_owner: None,
++            v7_metadata: None,
++            v7_prefixes: BTreeMap::new(),
++            v7_reservations: BTreeMap::new(),
++            queue,
++        };
++        (admission, budget)
++    }
++
++    #[test]
++    fn v7_packer_refill_preserves_frontier_gaps_and_eight_ticket_limit() {
++        let (mut admission, budget) = v7_refill_admission(10, None, 1);
++        let mut pending = Vec::new();
++        let mut prefix = super::WalV7PrefixMetadata {
++            last_commit_ts: 0,
++            logical_hasher: super::Sha256::new(),
++        };
++        let mut group = take_admitted_group(&mut admission, 0, 8192, 1, &mut pending)
++            .unwrap()
++            .unwrap();
++        super::materialize_v7_batches(&mut pending, &mut prefix, &mut group.writes).unwrap();
++        super::take_v7_group_refill(&mut admission, &mut group, &mut pending).unwrap();
++        assert_eq!(pending.len(), 7);
++        super::materialize_v7_batches(&mut pending, &mut prefix, &mut group.writes).unwrap();
++        assert_eq!(group.first_ticket, 0);
++        assert_eq!(group.next_ticket, 8);
++        assert_eq!(prefix.last_commit_ts, 8);
++        assert_eq!(group.frontier_offsets, [12288]);
++        assert_eq!(group.reserved_end, 8192 + 9 * 4096);
++        assert_eq!(group.writes.len(), 8);
++        assert!(group.initialize_extents);
++        assert_eq!(admission.queue.len(), 2);
++        // A full group cannot consume the two still-admitted tickets.
++        super::take_v7_group_refill(&mut admission, &mut group, &mut pending).unwrap();
++        assert!(pending.is_empty());
++        assert_eq!(admission.queue.front().unwrap().ticket, 8);
++        let group = super::WriteGroup::new_with_frontiers(
++            group.first_ticket..group.next_ticket,
++            group.writes,
++            group.allocation_start..group.reserved_end,
++            &group.frontier_offsets,
++        )
++        .unwrap();
++        drop((group, admission));
++        assert_eq!(budget.state.lock().active_bytes, 0);
++    }
++
++    #[test]
++    fn v7_packer_refill_drains_closed_admission_below_poison_without_waiting() {
++        for (count, poison, expected) in [(4, Some(2), 2), (1, None, 1)] {
++            let (mut admission, budget) = v7_refill_admission(count, poison, 1);
++            let mut pending = Vec::new();
++            let mut prefix = super::WalV7PrefixMetadata {
++                last_commit_ts: 0,
++                logical_hasher: super::Sha256::new(),
++            };
++            let mut group = take_admitted_group(&mut admission, 0, 8192, 1, &mut pending)
++                .unwrap()
++                .unwrap();
++            super::materialize_v7_batches(&mut pending, &mut prefix, &mut group.writes).unwrap();
++            super::take_v7_group_refill(&mut admission, &mut group, &mut pending).unwrap();
++            super::materialize_v7_batches(&mut pending, &mut prefix, &mut group.writes).unwrap();
++            assert_eq!(group.next_ticket, expected);
++            assert_eq!(group.writes.len() as u64, expected);
++            assert_eq!(prefix.last_commit_ts, expected);
++            assert!(admission.queue.is_empty());
++            drop((group, admission));
++            assert_eq!(budget.state.lock().active_bytes, 0);
++        }
++    }
++
++    #[test]
++    fn v7_packer_refill_submits_large_only_groups_without_collecting_later_tickets() {
++        let (mut admission, budget) = v7_refill_admission(3, None, 16);
++        let mut pending = Vec::new();
++        let mut prefix = super::WalV7PrefixMetadata {
++            last_commit_ts: 0,
++            logical_hasher: super::Sha256::new(),
++        };
++        let mut group = take_admitted_group(&mut admission, 0, 8192, 1, &mut pending)
++            .unwrap()
++            .unwrap();
++        super::materialize_v7_batches(&mut pending, &mut prefix, &mut group.writes).unwrap();
++        assert!(!group.initialize_extents);
++        super::take_v7_group_refill(&mut admission, &mut group, &mut pending).unwrap();
++        assert!(pending.is_empty());
++        assert_eq!(group.next_ticket, 1);
++        assert_eq!(group.writes.len(), 1);
++        assert_eq!(admission.queue.len(), 2);
++        assert_eq!(admission.queue.front().unwrap().ticket, 1);
++        drop((group, admission));
++        assert_eq!(budget.state.lock().active_bytes, 0);
++    }
++

@@ -1,0 +1,6 @@
+{
+  "adopted": false,
+  "reason": "Initial SSD phase failed: batch64 loses 7.6% raw and 6.1% v4-normalized throughput; cancel RAM and confirmation. Reject broad refill policy.",
+  "next_experiment": "Separate small-write-only refill policy with a shared endpoint/admission lock; not a repeat or pooling of this rejected candidate.",
+  "summary_sha256": "5ada4db3ee2c24c542e8c50cced7322b749a3f9fe56089871eed86469f4a11a9"
+}

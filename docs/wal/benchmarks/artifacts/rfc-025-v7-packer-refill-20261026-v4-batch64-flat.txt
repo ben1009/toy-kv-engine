@@ -1,0 +1,40 @@
+# To display the perf.data header info, please use --header/--header-only options.
+#
+#
+# Total Lost Samples: 0
+#
+# Samples: 2K of event 'cpu-clock:u'
+# Event count (approx.): 2514543563
+#
+# Overhead  Command          Shared Object                          Symbol
+# ........  ...............  .....................................  .......................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................
+#
+    18.83%  write-perf-v7-v  write-perf-v7-validated-logical-batch  [.] <kv_engine::table::builder::SsTableBuilder>::add_inner
+    12.52%  write-perf-v7-v  write-perf-v7-validated-logical-batch  [.] sha2::sha256::x86::digest_blocks
+     5.23%  write-perf-v7-v  [vdso]                                 [.] __vdso_clock_gettime
+     5.03%  write-perf-v7-v  write-perf-v7-validated-logical-batch  [.] <crossbeam_skiplist::base::SkipList<bytes::bytes::Bytes, bytes::bytes::Bytes>>::search_position::<bytes::bytes::Bytes>
+     4.31%  write-perf-v7-v  write-perf-v7-validated-logical-batch  [.] <kv_engine::mvcc::LsmMvccInner>::publish_commit_ts
+     4.15%  write-perf-v7-v  write-perf-v7-validated-logical-batch  [.] <std::thread::local::LocalKey<core::cell::RefCell<alloc::vec::Vec<u8>>>>::with::<<kv_engine::mem_table::MemTable>::publish_raw_batch::{closure#0}, ()>
+     2.19%  write-perf-v7-v  libc.so.6                              [.] 0x00000000000a5fdc
+     1.79%  wal-ordered-pac  write-perf-v7-validated-logical-batch  [.] <crossbeam_channel::flavors::array::Channel<bool>>::recv
+     1.79%  write-perf-v7-v  libc.so.6                              [.] 0x00000000000a481c
+     1.56%  write-perf-v7-v  libc.so.6                              [.] 0x00000000000a347e
+     1.56%  write-perf-v7-v  libc.so.6                              [.] 0x00000000000a4809
+     1.56%  write-perf-v7-v  write-perf-v7-validated-logical-batch  [.] <crossbeam_skiplist::base::SkipList<bytes::bytes::Bytes, bytes::bytes::Bytes>>::insert_internal::<<crossbeam_skiplist::base::SkipList<bytes::bytes::Bytes, bytes::bytes::Bytes>>::insert::{closure#0}, <crossbeam_skiplist::base::SkipList<bytes::bytes::Bytes, bytes::bytes::Bytes>>::insert::{closure#1}>
+     1.48%  write-perf-v7-v  write-perf-v7-validated-logical-batch  [.] crc32fast::specialized::pclmulqdq::calculate
+     1.36%  write-perf-v7-v  libc.so.6                              [.] 0x00000000000a5ffc
+     1.16%  write-perf-v7-v  libc.so.6                              [.] 0x00000000000a49e1
+     1.04%  write-perf-v7-v  write-perf-v7-validated-logical-batch  [.] bytes::bytes::shared_drop
+     1.00%  write-perf-v7-v  write-perf-v7-validated-logical-batch  [.] crc32fast::baseline::update_fast_16
+     0.88%  wal-sync-coordi  write-perf-v7-validated-logical-batch  [.] <crossbeam_channel::flavors::list::Channel<kv_engine::wal::parallel_worker::GroupWriteResult>>::recv
+     0.84%  write-perf-v7-v  libc.so.6                              [.] 0x00000000000a5cd2
+     0.68%  write-perf-v7-v  write-perf-v7-validated-logical-batch  [.] <tinyufo::buckets::Buckets<alloc::sync::Arc<kv_engine::block::Block>>>::get_map::<core::option::Option<tinyufo::KV<alloc::sync::Arc<kv_engine::block::Block>>>, <tinyufo::FiFoQueues<alloc::sync::Arc<kv_engine::block::Block>>>::evict_one_from_small::{closure#0}>
+     0.56%  write-perf-v7-v  libc.so.6                              [.] cfree
+     0.56%  write-perf-v7-v  write-perf-v7-validated-logical-batch  [.] tinyufo::estimation::incr_no_overflow
+     0.52%  write-perf-v7-v  libc.so.6                              [.] 0x000000000016c119
+     0.52%  write-perf-v7-v  write-perf-v7-validated-logical-batch  [.] <kv_engine::lsm_storage::LsmStorageInner>::push_point_batch_entry::<&[u8]>
+
+
+#
+# (Tip: Use --symfs <dir> if your symbol files are in non-standard locations)
+#

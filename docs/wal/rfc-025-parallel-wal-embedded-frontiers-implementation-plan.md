@@ -2584,6 +2584,18 @@ skips or retries. All captures, source patches, identities, and audit records
 remain. The eleven earlier optimizations remain; v4 parity and Stage 8 remain
 unmet.
 
+The [DATA packer refill experiments](benchmarks/rfc-025-v7-packer-refill-20261026.md)
+reject both bounded refill policies. Broad refill reduces point / batch DATA
+groups by about 30% / 43%, but batch throughput loses 7.6% raw. Small-write-only
+refill reuses the endpoint admission guard and keeps large-only groups on the
+original path; point throughput is flat with 2.6% less CPU, while batch loses
+1.5% raw and 7.2% normalized. Neither meets the fixed SSD acceptance criteria,
+so dependent RAM and confirmation cells are cancelled. Both source changes
+are reverted. The two prototypes pass 1,965 / 1,966 full-check tests. All 80
+scored records, 16 warmups, 921 clear host samples, three unscored profiles,
+source reconstructions and saved executable identities remain available.
+The eleven retained optimizations remain; v4 parity and Stage 8 remain unmet.
+
 ## Delivery checklist
 
 - [ ] Stages 1–3: legacy compatibility, byte-exact codec, independent validation,
