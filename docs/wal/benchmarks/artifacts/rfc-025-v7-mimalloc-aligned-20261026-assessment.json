@@ -1,0 +1,11 @@
+{
+  "adopted": false,
+  "reason": "Full allocator fails fixed v7 SSD batch CPU and v4 tail criteria; point peak RSS also rises substantially. Keep System and revert prototype.",
+  "failed_guards": [
+    "ext4-batch64_v7_cpu_ceiling",
+    "tmpfs-point1_v4_p99_ceiling",
+    "ext4-point8_v4_p99_ceiling"
+  ],
+  "confirmation_cancelled": true,
+  "summary_sha256": "26fa17b3e34cb27d804b3723d8052f713798e7ed38953e4da0789a0a8bfd5829"
+}

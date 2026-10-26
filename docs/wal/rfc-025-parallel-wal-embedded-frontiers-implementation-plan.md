@@ -2596,6 +2596,19 @@ scored records, 16 warmups, 921 clear host samples, three unscored profiles,
 source reconstructions and saved executable identities remain available.
 The eleven retained optimizations remain; v4 parity and Stage 8 remain unmet.
 
+The [System/mimalloc trials](benchmarks/rfc-025-v7-mimalloc-20261026.md), suggested
+by the DataFusion point-query allocator study, test Rust-only mimalloc and a
+separate policy covering aligned WAL buffers too. The full policy improves
+RAM v7 point8 / batch64 throughput 11.7% / 18.9%, with 11.7% less / nearly flat
+CPU, but raises peak RSS 49.6% / 22.4%. SSD point throughput is nearly flat;
+SSD batch gains 1.2% with 11.6% more CPU. V4 solo and SSD point p99 also fail
+the fixed limits. Neither policy is adopted; both are reverted and System
+remains selected. All 152 scored records, 40 warmups, 1,398 clear host samples,
+12 excluded diagnostics, source patches and native memory evidence remain.
+The prototypes pass 1,963 / 1,964 full-check tests, and a fresh restored-source
+check passes 1,963 with zero skips/retries. The eleven retained optimizations
+remain; point parity and the complete Stage 8 gate remain unmet.
+
 ## Delivery checklist
 
 - [ ] Stages 1–3: legacy compatibility, byte-exact codec, independent validation,

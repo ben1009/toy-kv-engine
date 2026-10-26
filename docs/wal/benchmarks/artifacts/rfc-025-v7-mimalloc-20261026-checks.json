@@ -1,0 +1,26 @@
+{
+  "rust-only": {
+    "command": "cargo make check",
+    "log": "target/wal-opt/20261026-v7-mimalloc/check.log",
+    "sha256": "7a53d21656266b01cfd3c1f6d8092dc29ea42c8696897c45c6ed173b45d443cd",
+    "nextest_run_id": "582ba3f8-ae30-4da7-bc70-99e8dd8a34e4",
+    "summary": "1963 tests run: 1963 passed, 0 skipped",
+    "retries": 0
+  },
+  "aligned": {
+    "command": "cargo make check",
+    "log": "target/wal-opt/20261026-v7-mimalloc-aligned/check.log",
+    "sha256": "f05f86f09ba2f975e159390ce39d931182bc40d780dfb5c8af61ebd490c4661a",
+    "nextest_run_id": "b5c65d53-0740-49f1-bdbe-ef8bb4c52358",
+    "summary": "1964 tests run: 1964 passed (1 slow), 0 skipped",
+    "retries": 0
+  },
+  "restored": {
+    "command": "cargo make check",
+    "log": "target/wal-opt/20261026-v7-mimalloc-aligned/restored-check.log",
+    "sha256": "e1c43643d07ab3ac586f33fdce6c15b299b3f44603f584504b39c64af6cbb1ed",
+    "nextest_run_id": "5f78fc7a-c5b8-497e-999b-b9e4ffe1869b",
+    "summary": "1963 tests run: 1963 passed, 0 skipped",
+    "retries": 0
+  }
+}

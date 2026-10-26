@@ -1,0 +1,12 @@
+{
+  "scored_records": 152,
+  "warmups": 40,
+  "main_records": 192,
+  "excluded_mixed_stat_diagnostics": 6,
+  "excluded_engine_only_diagnostics": 6,
+  "expected_all_unique_ids": 204,
+  "policies_adopted": [],
+  "peak_rss_scope": "wait4 engine child lifetime, including setup/close, in KiB on Linux",
+  "memory_stats_scope": "engine-only rerun; first six native-stat files include launcher output and are excluded from memory interpretation",
+  "main_matrix_host_samples": 1398
+}

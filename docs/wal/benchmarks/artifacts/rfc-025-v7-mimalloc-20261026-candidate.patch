@@ -1,0 +1,69 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index 1c6b3393..fd5a966b 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -168,0 +169,10 @@ checksum = "37b2a672a2cb129a2e41c10b1224bb368f9f37a2b16b612598138befd7b37eb5"
++[[package]]
++name = "cc"
++version = "1.10.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "86e055fa6e3e40ad6187ba25b6855eeb635d5271f8e0f0e1e9a5826b8d75bea0"
++dependencies = [
++ "find-msvc-tools",
++ "shlex",
++]
++
+@@ -514,0 +525,6 @@ checksum = "658bd65b1cf4c852a3cc96f18a8ce7b5640f6b703f905c7d74532294c2a63984"
++[[package]]
++name = "find-msvc-tools"
++version = "0.1.15"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "1c66915cc5391097de7a2b0b972e8505aa33c0df401fd3a6811dbdb32881ba48"
++
+@@ -828,0 +845 @@ dependencies = [
++ "mimalloc",
+@@ -856,0 +874,9 @@ checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
++[[package]]
++name = "libmimalloc-sys"
++version = "0.1.49"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "6a45a52f43e1c16f667ccfe4dd8c85b7f7c204fd5e3bf46c5b0db9a5c3c0b8e9"
++dependencies = [
++ "cc",
++]
++
+@@ -980,0 +1007,9 @@ checksum = "6b947ae49db0d222b1dbc6b113ce7248a3fc3a6ca21b696717bfc000ba4484d8"
++[[package]]
++name = "mimalloc"
++version = "0.1.52"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "2d4139bb28d14ad1facf21d5eb8825051b326e172d216b39f6d31df53cc97862"
++dependencies = [
++ "libmimalloc-sys",
++]
++
+@@ -1502,0 +1538,6 @@ dependencies = [
++[[package]]
++name = "shlex"
++version = "2.0.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
++
+diff --git a/kv-engine/Cargo.toml b/kv-engine/Cargo.toml
+index 35877b5b..162cf650 100644
+--- a/kv-engine/Cargo.toml
++++ b/kv-engine/Cargo.toml
+@@ -27,0 +28 @@ hotpath-profile = ["dep:hotpath", "hotpath/hotpath", "hotpath/threads"]
++mimalloc-allocator = ["dep:mimalloc"]
+@@ -48,0 +50 @@ logforth = { version = "0.30", features = ["starter-log", "layout-json", "append
++mimalloc = { version = "0.1.52", optional = true }
+diff --git a/kv-engine/src/lib.rs b/kv-engine/src/lib.rs
+index 119a6683..55c990f8 100644
+--- a/kv-engine/src/lib.rs
++++ b/kv-engine/src/lib.rs
+@@ -0,0 +1,5 @@
++/// Optional process-wide Rust allocator for controlled allocator comparisons.
++#[cfg(feature = "mimalloc-allocator")]
++#[global_allocator]
++static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
++

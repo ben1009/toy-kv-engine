@@ -1,0 +1,49 @@
+{
+  "created_at_utc": "2026-10-26T11:44:12.098212+00:00",
+  "source_base": "85556ad2e3c57dcd910bfd61253d0c6b1142e1b3",
+  "reference": "https://datafusion.apache.org/blog/2026/10/24/point-queries/#memory-allocator",
+  "hypothesis": "The DataFusion point-query study favors mimalloc; the retained WAL profiles contain malloc/free and cross-thread ownership work. Test a process-wide Rust allocator change without changing WAL framing, hashes, I/O or fixed durability cutoffs.",
+  "change": "Optional mimalloc-allocator Cargo feature installs mimalloc::MiMalloc as Rust global allocator. Baseline builds identical source with the feature disabled. Explicit libc posix_memalign/free WAL buffers remain a separately controlled factor. No libc override feature, allocator tuning or OS tuning.",
+  "build": "cargo build --release --package kv-engine --features bench[,mimalloc-allocator] --bin write-perf; freeze both binaries; preserve existing retained SHA 614f0cb1 separately.",
+  "protocol": "Audited four-arm paired comparison: System v4,mimalloc v4,System v7,mimalloc v7 on odd rounds;reverse on even. Four unscored warmups. 1KiB values,2GiB SST target;100K point operations or750K batch64;latency every100 point or10 batches. Include all stalled runs;no builds/tests/profiles during scoring. One-second host-process and child RSS samples;RSS covers the complete child lifetime and is not measured-interval-only. Keep raw and normalized ratios; allocator benefits to v4 count as benefits, not a regression in the v7-specific ratio.",
+  "cells": {
+    "tmpfs-point8": {
+      "writers": 8,
+      "operations": 100000,
+      "pairs": 3
+    },
+    "tmpfs-point1": {
+      "writers": 1,
+      "operations": 100000,
+      "pairs": 3
+    },
+    "tmpfs-batch64": {
+      "writers": 8,
+      "operations": 750000,
+      "batch_size": 64,
+      "pairs": 3
+    },
+    "ext4-point8": {
+      "writers": 8,
+      "operations": 100000,
+      "pairs": 5
+    },
+    "ext4-batch64": {
+      "writers": 8,
+      "operations": 750000,
+      "batch_size": 64,
+      "pairs": 5
+    }
+  },
+  "order": [
+    "tmpfs-point8",
+    "tmpfs-batch64",
+    "tmpfs-point1",
+    "ext4-point8",
+    "ext4-batch64"
+  ],
+  "cooldown": "tmpfs3s between runs;SSD30s before eachcell and10s between runs.",
+  "gates": "For each format and each cell: median paired raw and ratio of arm medians >=0.95,CPU ratio <=1.05; p99 ratio <=1.10 for SSD and solo. At least one cell/format gains >=2% raw with CPU ratio<=1.0. RSS is reported; investigate lifetime peak RSS >1.20x before retention. Normalized v7/v4 is diagnostic since both formats change allocator.",
+  "confirmation": "If initial complete matrix passes, exactly five additional SSD pairs each workload and three further RAM pairs each cell, same settings. Pool only this allocator source/policy and reevaluate gates; no further attempts chosen by score.",
+  "decision": "If guards fail, do not adopt allocator as default; retain evidence and either revert the prototype or keep an explicitly documented opt-in only if useful without claiming qualified improvement. Any second aligned-WAL-buffer experiment needs a separate patch, plan and controls."
+}
