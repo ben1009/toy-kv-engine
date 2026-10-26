@@ -36,6 +36,7 @@ the retained and rejected experiments.
 
 ## Benchmarks and qualification
 
+- [RFC 025 linked FRONTIER write/sync and task-work diagnostic (rejected), 2026-10-26](benchmarks/rfc-025-v7-frontier-link-20261026.md)
 - [RFC 025 larger v7 extent-initialization writes (rejected), 2026-10-26](benchmarks/rfc-025-v7-extent-io-20261026.md)
 - [RFC 025 System versus mimalloc allocator trials (rejected), 2026-10-26](benchmarks/rfc-025-v7-mimalloc-20261026.md)
 - [RFC 025 v7 DATA packer refill policies (rejected), 2026-10-26](benchmarks/rfc-025-v7-packer-refill-20261026.md)

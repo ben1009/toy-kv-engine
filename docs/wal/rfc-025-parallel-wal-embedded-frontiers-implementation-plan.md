@@ -2621,6 +2621,20 @@ exact source patch and binary identities remain. The prototype passes 1,963
 full-check tests with zero skips/retries. The eleven retained optimizations
 remain; point parity and the complete Stage 8 gate remain unmet.
 
+The separate [native linked-commit diagnostic](benchmarks/rfc-025-v7-frontier-link-20261026.md)
+tests an opaque 4-KiB marker write linked to whole-file DATASYNC, comparing default,
+cooperative/single-issuer and deferred/single-issuer rings with correct GETEVENTS
+waits. The current DATA worker already uses cooperative/single-issuer flags;
+deferred task work would require replacing its external-poll completion wait.
+Across five native rounds, linked marker-plus-sync latency is 11–14% higher for
+point-sized groups and 2–3% higher for batch-sized groups than direct syscalls.
+All 40 scored native records, eight warmups, 151 clear samples and both excluded
+setup preflights remain. This is a single-thread mechanism diagnostic, not engine
+throughput or crash qualification. No linked backend advances to implementation.
+The restored engine passes all 1,963 tests with zero skips/retries, and the eleven
+retained optimizations remain. Point parity and the complete Stage 8 gate remain
+unmet.
+
 ## Delivery checklist
 
 - [ ] Stages 1–3: legacy compatibility, byte-exact codec, independent validation,

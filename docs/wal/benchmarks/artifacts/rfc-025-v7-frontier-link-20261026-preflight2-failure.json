@@ -1,0 +1,9 @@
+{
+  "phase": "warmup; no scored observations",
+  "cause": "Installed liburing2.14 queue_mmap initializes mapped ring pointers but leaves ring_fd,enter_ring_fd,flags and features to its caller. The probe omitted those assignments. A direct registration syscall succeeds, and the library registration helper uses the uninitialized zero descriptor.",
+  "observed_registration": "setup fd=4 mapped=0 ringfd=0 enterfd=0 flags=0 features=0 internal=0 sqentries=8 array=0x772f7c269140\nlibrary register=-95 errno=0\nraw register=0 errno=0\n",
+  "failed_stderr": "register file: Operation not supported\n",
+  "correction": "Explicitly initialize the four ring identity fields after mapping, before registration or submission. Retain all failed preflight evidence separately.",
+  "initial_source_sha256": "5d9f1eb5e0c286b1e09ed7a094290bc72e8febc0e0a69d5a1090ed292daa8dd3",
+  "initial_binary_sha256": "fffeb058e03146e34f5913a663d5c032ad2c1bcd7c990c49660b212a0dbd6fc6"
+}

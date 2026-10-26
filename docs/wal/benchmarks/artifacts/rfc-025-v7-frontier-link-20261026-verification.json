@@ -1,0 +1,14 @@
+{
+  "native_records": 48,
+  "scored_native_records": 40,
+  "native_warmups": 8,
+  "excluded_setup_preflights": 2,
+  "host_samples": 151,
+  "verified_native_binaries": 3,
+  "total_distinct_records_across_experiments": 101,
+  "summary_regenerates": true,
+  "scratch_removed": true,
+  "engine_source_unchanged": true,
+  "summary_sha256": "ee1f6328549391a35308b432172bd26c1e4074b7053dbc0302a5f52fec0c7530",
+  "verification_script_sha256": "950bed477b89eeb8b7482d3922c1a41466dcd7d4f47bd80b11588ea978e24969"
+}
