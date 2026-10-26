@@ -2609,6 +2609,18 @@ The prototypes pass 1,963 / 1,964 full-check tests, and a fresh restored-source
 check passes 1,963 with zero skips/retries. The eleven retained optimizations
 remain; point parity and the complete Stage 8 gate remain unmet.
 
+The [larger v7 extent-write experiment](benchmarks/rfc-025-v7-extent-io-20261026.md)
+changes synchronous initialization chunks from 128 to 512 KiB while preserving
+v4 and the shared v7 preparation guard. The fastest point pair reduces measured
+readiness time from 227 to 145 ms and gains 3.2% throughput. All five pairs,
+including moving SSD stalls, instead give -31.3% raw / -32.3% normalized point
+throughput and +24.1% p99. Batch64 is flat raw. The fixed SSD gates fail, so RAM
+and confirmation phases are cancelled and the candidate is reverted. All 40
+scored records, eight warmups, 471 clear host samples, three excluded profiles,
+exact source patch and binary identities remain. The prototype passes 1,963
+full-check tests with zero skips/retries. The eleven retained optimizations
+remain; point parity and the complete Stage 8 gate remain unmet.
+
 ## Delivery checklist
 
 - [ ] Stages 1–3: legacy compatibility, byte-exact codec, independent validation,
