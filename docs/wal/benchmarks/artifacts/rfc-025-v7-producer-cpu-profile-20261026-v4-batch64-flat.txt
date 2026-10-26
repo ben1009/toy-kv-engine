@@ -1,0 +1,62 @@
+# To display the perf.data header info, please use --header/--header-only options.
+#
+#
+# Total Lost Samples: 0
+#
+# Samples: 1K of event 'cpu-clock:u'
+# Event count (approx.): 1785356020
+#
+# Overhead  Command          Shared Object                          Symbol
+# ........  ...............  .....................................  .......................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................
+#
+    11.01%  write-perf-v7-v  write-perf-v7-validated-logical-batch  [.] <kv_engine::table::builder::SsTableBuilder>::add_inner
+     8.09%  write-perf-v7-v  [vdso]                                 [.] __vdso_clock_gettime
+     7.30%  write-perf-v7-v  write-perf-v7-validated-logical-batch  [.] <crossbeam_skiplist::base::SkipList<bytes::bytes::Bytes, bytes::bytes::Bytes>>::search_position::<bytes::bytes::Bytes>
+     6.12%  write-perf-v7-v  write-perf-v7-validated-logical-batch  [.] sha2::sha256::x86::digest_blocks
+     4.44%  write-perf-v7-v  write-perf-v7-validated-logical-batch  [.] <std::thread::local::LocalKey<core::cell::RefCell<alloc::vec::Vec<u8>>>>::with::<<kv_engine::mem_table::MemTable>::publish_raw_batch::{closure#0}, ()>
+     3.48%  write-perf-v7-v  write-perf-v7-validated-logical-batch  [.] <crossbeam_skiplist::base::SkipList<bytes::bytes::Bytes, bytes::bytes::Bytes>>::insert_internal::<<crossbeam_skiplist::base::SkipList<bytes::bytes::Bytes, bytes::bytes::Bytes>>::insert::{closure#0}, <crossbeam_skiplist::base::SkipList<bytes::bytes::Bytes, bytes::bytes::Bytes>>::insert::{closure#1}>
+     3.43%  write-perf-v7-v  write-perf-v7-validated-logical-batch  [.] <kv_engine::mvcc::LsmMvccInner>::publish_commit_ts
+     3.03%  wal-ordered-pac  write-perf-v7-validated-logical-batch  [.] <crossbeam_channel::flavors::array::Channel<bool>>::recv
+     2.70%  write-perf-v7-v  libc.so.6                              [.] 0x00000000000a5fdc
+     2.70%  write-perf-v7-v  libc.so.6                              [.] 0x00000000000a5ffc
+     1.85%  write-perf-v7-v  libc.so.6                              [.] 0x00000000000a481c
+     1.29%  write-perf-v7-v  libc.so.6                              [.] 0x00000000000a49e1
+     1.29%  write-perf-v7-v  write-perf-v7-validated-logical-batch  [.] crc32fast::specialized::pclmulqdq::calculate
+     1.24%  wal-sync-coordi  write-perf-v7-validated-logical-batch  [.] <crossbeam_channel::flavors::list::Channel<kv_engine::wal::parallel_worker::GroupWriteResult>>::recv
+     1.12%  write-perf-v7-v  libc.so.6                              [.] 0x00000000000a4809
+     1.07%  write-perf-v7-v  write-perf-v7-validated-logical-batch  [.] crc32fast::baseline::update_fast_16
+     0.79%  write-perf-v7-v  write-perf-v7-validated-logical-batch  [.] <std::sys::pal::unix::time::Timespec>::sub_timespec
+     0.79%  write-perf-v7-v  write-perf-v7-validated-logical-batch  [.] bytes::bytes::shared_drop
+     0.73%  write-perf-v7-v  libc.so.6                              [.] cfree
+     0.67%  write-perf-v7-v  libc.so.6                              [.] 0x000000000016c6f1
+     0.62%  wal-io-worker    write-perf-v7-validated-logical-batch  [.] <crossbeam_channel::flavors::list::Channel<kv_engine::wal::parallel_worker::WorkerCommand<kv_engine::wal::parallel_runtime::ParallelBuffer>>>::recv
+     0.62%  write-perf-v7-v  libc.so.6                              [.] malloc
+     0.62%  write-perf-v7-v  libc.so.6                              [.] 0x00000000000a5cd2
+     0.62%  write-perf-v7-v  libc.so.6                              [.] 0x000000000016be20
+     0.62%  write-perf-v7-v  libc.so.6                              [.] 0x000000000016c119
+     0.62%  write-perf-v7-v  libc.so.6                              [.] 0x000000000016c6ab
+     0.62%  write-perf-v7-v  libc.so.6                              [.] 0x000000000016c729
+     0.56%  write-perf-v7-v  libc.so.6                              [.] __mprotect
+     0.56%  write-perf-v7-v  libc.so.6                              [.] 0x000000000016c11d
+     0.56%  write-perf-v7-v  write-perf-v7-validated-logical-batch  [.] crossbeam_epoch::default::with_handle::<crossbeam_epoch::default::pin::{closure#0}, crossbeam_epoch::guard::Guard>
+     0.56%  write-perf-v7-v  write-perf-v7-validated-logical-batch  [.] kv_engine::key::decode_user_key_into
+     0.51%  write-perf-v7-v  libc.so.6                              [.] 0x00000000000a347e
+     0.51%  write-perf-v7-v  libc.so.6                              [.] 0x000000000016c591
+     0.51%  write-perf-v7-v  write-perf-v7-validated-logical-batch  [.] <kv_engine::lsm_storage::LsmStorageInner>::push_point_batch_entry::<&[u8]>
+     0.51%  write-perf-v7-v  write-perf-v7-validated-logical-batch  [.] <kv_engine::lsm_storage::LsmStorageInner>::write_batch_with_lifecycle_admission::<&[u8]>
+     0.45%  write-perf-v7-v  libc.so.6                              [.] 0x000000000016bf08
+     0.45%  write-perf-v7-v  libc.so.6                              [.] 0x000000000016c724
+     0.45%  write-perf-v7-v  write-perf-v7-validated-logical-batch  [.] <crossbeam_skiplist::base::RefEntry<bytes::bytes::Bytes, bytes::bytes::Bytes>>::next
+     0.45%  write-perf-v7-v  write-perf-v7-validated-logical-batch  [.] <std::sys::pal::unix::time::Timespec>::now
+     0.39%  write-perf-v7-v  libc.so.6                              [.] clock_gettime
+     0.39%  write-perf-v7-v  write-perf-v7-validated-logical-batch  [.] <crossbeam_skiplist::base::RefIter<bytes::bytes::Bytes, bytes::bytes::Bytes>>::next
+     0.39%  write-perf-v7-v  write-perf-v7-validated-logical-batch  [.] <usize as core::fmt::Display>::fmt
+     0.34%  wal-ordered-pac  libc.so.6                              [.] syscall
+     0.34%  write-perf-v7-v  write-perf-v7-validated-logical-batch  [.] <bytes::bytes::Bytes as core::convert::From<alloc::vec::Vec<u8>>>::from
+     0.34%  write-perf-v7-v  write-perf-v7-validated-logical-batch  [.] <parking_lot::condvar::Condvar>::wait_until_internal
+     0.34%  write-perf-v7-v  write-perf-v7-validated-logical-batch  [.] <parking_lot::raw_mutex::RawMutex>::unlock_slow
+
+
+#
+# (Tip: Order by the overhead of source file name and line number: perf report -s srcline)
+#

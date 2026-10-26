@@ -1,0 +1,713 @@
+diff --git a/kv-engine/src/mem_table.rs b/kv-engine/src/mem_table.rs
+index 94d878b9..c2ce671c 100644
+--- a/kv-engine/src/mem_table.rs
++++ b/kv-engine/src/mem_table.rs
+@@ -1997,0 +1998,18 @@ impl MemTable {
++        self.prepare_v7_pitr_wal_entries(
++            crate::pitr::wal_entry_refs(&batch.entries),
++            batch.commit_ts,
++            batch.recorded_at,
++            limits,
++        )
++    }
++
++    pub(crate) fn prepare_v7_pitr_wal_entries<'a, I>(
++        &self,
++        entries: I,
++        commit_ts: u64,
++        recorded_at: crate::pitr::RecordedAt,
++        limits: crate::pitr::WalV5Limits,
++    ) -> Result<crate::wal::WalV7PreparedBatch>
++    where
++        I: Iterator<Item = crate::pitr::WalEntryRef<'a>> + Clone + ExactSizeIterator,
++    {
+@@ -2006 +2024 @@ impl MemTable {
+-        wal.prepare_v7_parallel_batch(batch, limits)
++        wal.prepare_v7_parallel_entries(entries, commit_ts, recorded_at, limits)
+diff --git a/kv-engine/src/mvcc.rs b/kv-engine/src/mvcc.rs
+index 86a412da..93683d7c 100644
+--- a/kv-engine/src/mvcc.rs
++++ b/kv-engine/src/mvcc.rs
+@@ -786,2 +786,6 @@ impl LsmMvccInner {
+-        let batch = crate::pitr::WalBatch {
+-            commit_ts: 1,
++        let prepared = memtable.prepare_v7_pitr_wal_entries(
++            std::iter::once(crate::pitr::WalEntryRef::Put {
++                key: user_key,
++                value: &prefixed,
++            }),
++            1,
+@@ -789,8 +793,2 @@ impl LsmMvccInner {
+-            entries: vec![crate::pitr::WalEntry::Put {
+-                key: user_key.to_vec(),
+-                value: prefixed.clone(),
+-            }],
+-        };
+-        let prepared =
+-            memtable.prepare_v7_pitr_wal_batch(&batch, crate::pitr::LIVE_WAL_V5_LIMITS)?;
+-        drop(batch);
++            crate::pitr::LIVE_WAL_V5_LIMITS,
++        )?;
+@@ -1146,31 +1144,13 @@ impl LsmMvccInner {
+-        let v7_wal_batch = v7_sampled_recorded_at.map(|recorded_at| crate::pitr::WalBatch {
+-            // Canonical entry preparation does not depend on the commit
+-            // timestamp. The actual timestamp is substituted at admission.
+-            commit_ts: 1,
+-            recorded_at,
+-            entries: entries
+-                .iter()
+-                .map(|(key, value, kind)| match kind {
+-                    BatchEntryKind::Delete => {
+-                        crate::pitr::WalEntry::PointDelete { key: key.to_vec() }
+-                    }
+-                    BatchEntryKind::PutPrefixed => crate::pitr::WalEntry::Put {
+-                        key: key.to_vec(),
+-                        value: value.to_vec(),
+-                    },
+-                    BatchEntryKind::PutRaw => {
+-                        let mut prefixed = Vec::with_capacity(1 + value.len());
+-                        prefixed.push(crate::vlog::KvKind::Inline as u8);
+-                        prefixed.extend_from_slice(value);
+-                        crate::pitr::WalEntry::Put {
+-                            key: key.to_vec(),
+-                            value: prefixed,
+-                        }
+-                    }
+-                })
+-                .collect(),
+-        });
+-        let prepared_v7 = match v7_wal_batch.as_ref() {
+-            Some(batch) => {
+-                Some(memtable.prepare_v7_pitr_wal_batch(batch, crate::pitr::LIVE_WAL_V5_LIMITS)?)
+-            }
++        let prepared_v7 = match v7_sampled_recorded_at {
++            Some(recorded_at) => Some(memtable.prepare_v7_pitr_wal_entries(
++                entries.iter().map(|(key, value, kind)| match kind {
++                    BatchEntryKind::Delete => crate::pitr::WalEntryRef::PointDelete { key },
++                    BatchEntryKind::PutPrefixed => crate::pitr::WalEntryRef::Put { key, value },
++                    BatchEntryKind::PutRaw => crate::pitr::WalEntryRef::PutRaw { key, value },
++                }),
++                // Assign the real timestamp only after preparation acquires
++                // all resources and the MVCC sequencer is held.
++                1,
++                recorded_at,
++                crate::pitr::LIVE_WAL_V5_LIMITS,
++            )?),
+diff --git a/kv-engine/src/pitr/mod.rs b/kv-engine/src/pitr/mod.rs
+index 1c4faf2c..5e9ef8ba 100644
+--- a/kv-engine/src/pitr/mod.rs
++++ b/kv-engine/src/pitr/mod.rs
+@@ -249,0 +250,36 @@ pub(crate) enum WalEntry {
++/// Borrowed encoder input. Raw PUT values gain the inline tag while encoding,
++/// without allocating a temporary prefixed value or cloning caller-owned bytes.
++#[derive(Clone, Copy)]
++pub(crate) enum WalEntryRef<'a> {
++    Put { key: &'a [u8], value: &'a [u8] },
++    PutRaw { key: &'a [u8], value: &'a [u8] },
++    PointDelete { key: &'a [u8] },
++    RangeDelete { start: &'a [u8], end: &'a [u8] },
++}
++
++impl<'a> WalEntryRef<'a> {
++    pub(crate) fn from_entry(entry: &'a WalEntry) -> Self {
++        match entry {
++            WalEntry::Put { key, value } => Self::Put { key, value },
++            WalEntry::PointDelete { key } => Self::PointDelete { key },
++            WalEntry::RangeDelete { start, end } => Self::RangeDelete { start, end },
++        }
++    }
++
++    fn point_key(self) -> Option<&'a [u8]> {
++        match self {
++            Self::Put { key, .. } | Self::PutRaw { key, .. } | Self::PointDelete { key } => {
++                Some(key)
++            }
++            Self::RangeDelete { .. } => None,
++        }
++    }
++}
++
++pub(crate) type WalEntryRefs<'a> =
++    std::iter::Map<std::slice::Iter<'a, WalEntry>, fn(&'a WalEntry) -> WalEntryRef<'a>>;
++
++pub(crate) fn wal_entry_refs(entries: &[WalEntry]) -> WalEntryRefs<'_> {
++    entries.iter().map(WalEntryRef::from_entry)
++}
++
+@@ -496,2 +532,5 @@ pub(crate) fn encode_v5_batch_into(
+-pub(crate) struct CanonicalWalEntryStream<'a> {
+-    batch: &'a WalBatch,
++pub(crate) struct CanonicalWalEntryStream<'a, I = WalEntryRefs<'a>>
++where
++    I: Iterator<Item = WalEntryRef<'a>> + Clone + ExactSizeIterator,
++{
++    source: I,
+@@ -504,4 +543,34 @@ impl<'a> CanonicalWalEntryStream<'a> {
+-    /// Calculate the temporary point-operation index memory without allocating
+-    /// it. The v7 Leader charges this amount before constructing the stream.
+-    pub(crate) fn preparation_buffer_bytes(batch: &WalBatch, limits: WalV5Limits) -> Result<u64> {
+-        let point_count = Self::point_index_capacity(batch, limits)?;
++    pub(crate) fn preparation_buffer_bytes(
++        batch: &'a WalBatch,
++        limits: WalV5Limits,
++    ) -> Result<u64> {
++        Self::entry_preparation_buffer_bytes(
++            wal_entry_refs(&batch.entries),
++            batch.commit_ts,
++            batch.recorded_at,
++            limits,
++        )
++    }
++
++    pub(crate) fn new(batch: &'a WalBatch, limits: WalV5Limits) -> Result<Self> {
++        Self::from_entries(
++            wal_entry_refs(&batch.entries),
++            batch.commit_ts,
++            batch.recorded_at,
++            limits,
++        )
++    }
++}
++
++impl<'a, I> CanonicalWalEntryStream<'a, I>
++where
++    I: Iterator<Item = WalEntryRef<'a>> + Clone + ExactSizeIterator,
++{
++    /// Charge the same bounded point index before constructing either source.
++    pub(crate) fn entry_preparation_buffer_bytes(
++        entries: I,
++        commit_ts: u64,
++        recorded_at: RecordedAt,
++        limits: WalV5Limits,
++    ) -> Result<u64> {
++        let point_count = Self::point_index_capacity(entries, commit_ts, recorded_at, limits)?;
+@@ -517 +586,6 @@ impl<'a> CanonicalWalEntryStream<'a> {
+-    fn point_index_capacity(batch: &WalBatch, limits: WalV5Limits) -> Result<usize> {
++    fn point_index_capacity(
++        entries: I,
++        commit_ts: u64,
++        recorded_at: RecordedAt,
++        limits: WalV5Limits,
++    ) -> Result<usize> {
+@@ -520 +594 @@ impl<'a> CanonicalWalEntryStream<'a> {
+-            batch.entries.len() <= limits.max_input_entry_count,
++            entries.len() <= limits.max_input_entry_count,
+@@ -524 +598 @@ impl<'a> CanonicalWalEntryStream<'a> {
+-            batch.entries.len() <= u32::MAX as usize,
++            entries.len() <= u32::MAX as usize,
+@@ -527,2 +601,2 @@ impl<'a> CanonicalWalEntryStream<'a> {
+-        ensure!(batch.commit_ts != 0, "v5 commit timestamp must be nonzero");
+-        ensure!(!batch.entries.is_empty(), "v5 batch must contain an entry");
++        ensure!(commit_ts != 0, "v5 commit timestamp must be nonzero");
++        ensure!(entries.len() != 0, "v5 batch must contain an entry");
+@@ -530 +604 @@ impl<'a> CanonicalWalEntryStream<'a> {
+-            batch.recorded_at.nanos < 1_000_000_000,
++            recorded_at.nanos < 1_000_000_000,
+@@ -534 +608 @@ impl<'a> CanonicalWalEntryStream<'a> {
+-        if batch.entries.len() <= 1 {
++        if entries.len() <= 1 {
+@@ -537,5 +611 @@ impl<'a> CanonicalWalEntryStream<'a> {
+-        Ok(batch
+-            .entries
+-            .iter()
+-            .filter(|entry| matches!(entry, WalEntry::Put { .. } | WalEntry::PointDelete { .. }))
+-            .count())
++        Ok(entries.filter(|entry| entry.point_key().is_some()).count())
+@@ -544 +614,6 @@ impl<'a> CanonicalWalEntryStream<'a> {
+-    pub(crate) fn new(batch: &'a WalBatch, limits: WalV5Limits) -> Result<Self> {
++    pub(crate) fn from_entries(
++        entries: I,
++        commit_ts: u64,
++        recorded_at: RecordedAt,
++        limits: WalV5Limits,
++    ) -> Result<Self> {
+@@ -546 +621,2 @@ impl<'a> CanonicalWalEntryStream<'a> {
+-        let point_index_capacity = Self::point_index_capacity(batch, limits)?;
++        let point_index_capacity =
++            Self::point_index_capacity(entries.clone(), commit_ts, recorded_at, limits)?;
+@@ -552,3 +628,3 @@ impl<'a> CanonicalWalEntryStream<'a> {
+-            for (index, entry) in batch.entries.iter().enumerate() {
+-                if let WalEntry::Put { key, .. } | WalEntry::PointDelete { key } = entry {
+-                    last_point.push((key.as_slice(), index));
++            for (index, entry) in entries.clone().enumerate() {
++                if let Some(key) = entry.point_key() {
++                    last_point.push((key, index));
+@@ -582 +658 @@ impl<'a> CanonicalWalEntryStream<'a> {
+-            batch,
++            source: entries,
+@@ -596 +672 @@ impl<'a> CanonicalWalEntryStream<'a> {
+-                .checked_add(encoded_entry_len(entry, limits)?)
++                .checked_add(encoded_entry_ref_len(entry, limits)?)
+@@ -617,4 +693,3 @@ impl<'a> CanonicalWalEntryStream<'a> {
+-    fn entries(&self) -> impl Iterator<Item = &WalEntry> {
+-        self.batch
+-            .entries
+-            .iter()
++    fn entries(&self) -> impl Iterator<Item = WalEntryRef<'a>> + '_ {
++        self.source
++            .clone()
+@@ -622,7 +697,7 @@ impl<'a> CanonicalWalEntryStream<'a> {
+-            .filter_map(|(index, entry)| match entry {
+-                WalEntry::Put { key, .. } | WalEntry::PointDelete { key }
+-                    if !self.last_point.is_empty()
+-                        && self
+-                            .last_point
+-                            .binary_search_by(|(indexed_key, _)| (*indexed_key).cmp(key.as_slice()))
+-                            .map_or(true, |position| self.last_point[position].1 != index) =>
++            .filter_map(|(index, entry)| {
++                if let Some(key) = entry.point_key()
++                    && !self.last_point.is_empty()
++                    && self
++                        .last_point
++                        .binary_search_by(|(indexed_key, _)| indexed_key.cmp(&key))
++                        .map_or(true, |position| self.last_point[position].1 != index)
+@@ -630 +705 @@ impl<'a> CanonicalWalEntryStream<'a> {
+-                    None
++                    return None;
+@@ -632 +707 @@ impl<'a> CanonicalWalEntryStream<'a> {
+-                _ => Some(entry),
++                Some(entry)
+@@ -647 +722 @@ impl<'a> CanonicalWalEntryStream<'a> {
+-            pos = write_entry_into(dst, pos, entry, &mut hasher)?;
++            pos = write_entry_ref_into(dst, pos, entry, &mut hasher)?;
+@@ -681,4 +756,14 @@ fn write_entry_into(
+-    let (kind, fields): (u8, &[&[u8]]) = match entry {
+-        WalEntry::Put { key, value } => (1, &[key.as_slice(), value.as_slice()]),
+-        WalEntry::PointDelete { key } => (2, &[key.as_slice()]),
+-        WalEntry::RangeDelete { start, end } => (3, &[start.as_slice(), end.as_slice()]),
++    write_entry_ref_into(dst, pos, WalEntryRef::from_entry(entry), hasher)
++}
++
++fn write_entry_ref_into(
++    dst: &mut [u8],
++    pos: usize,
++    entry: WalEntryRef<'_>,
++    hasher: &mut crc32fast::Hasher,
++) -> Result<usize> {
++    let (kind, fields, inline): (u8, &[&[u8]], bool) = match entry {
++        WalEntryRef::Put { key, value } => (1, &[key, value], false),
++        WalEntryRef::PutRaw { key, value } => (1, &[key, value], true),
++        WalEntryRef::PointDelete { key } => (2, &[key], false),
++        WalEntryRef::RangeDelete { start, end } => (3, &[start, end], false),
+@@ -686 +771,2 @@ fn write_entry_into(
+-    let payload_len: usize = fields.iter().map(|field| 4 + field.len()).sum();
++    let payload_len: usize =
++        fields.iter().map(|field| 4 + field.len()).sum::<usize>() + usize::from(inline);
+@@ -699,2 +785,7 @@ fn write_entry_into(
+-    for field in fields {
+-        let prefix = u32::try_from(field.len())
++    for (index, field) in fields.iter().enumerate() {
++        let add_inline = inline && index == 1;
++        let field_len = field
++            .len()
++            .checked_add(usize::from(add_inline))
++            .context("v5 field size overflow")?;
++        let prefix = u32::try_from(field_len)
+@@ -705,0 +797,5 @@ fn write_entry_into(
++        if add_inline {
++            dst[at] = crate::vlog::KvKind::Inline as u8;
++            hasher.update(&dst[at..at + 1]);
++            at += 1;
++        }
+@@ -1112,0 +1209,4 @@ fn encoded_entry_len(entry: &WalEntry, limits: WalV5Limits) -> Result<usize> {
++    encoded_entry_ref_len(WalEntryRef::from_entry(entry), limits)
++}
++
++fn encoded_entry_ref_len(entry: WalEntryRef<'_>, limits: WalV5Limits) -> Result<usize> {
+@@ -1114 +1214 @@ fn encoded_entry_len(entry: &WalEntry, limits: WalV5Limits) -> Result<usize> {
+-        WalEntry::Put { key, value } => {
++        WalEntryRef::Put { key, value } => {
+@@ -1121 +1221,15 @@ fn encoded_entry_len(entry: &WalEntry, limits: WalV5Limits) -> Result<usize> {
+-        WalEntry::PointDelete { key } => {
++        WalEntryRef::PutRaw { key, value } => {
++            validate_field_len(key, limits.max_key_bytes, "key")?;
++            let value_len = value
++                .len()
++                .checked_add(1)
++                .context("v5 value size overflow")?;
++            ensure!(
++                value_len <= limits.max_value_bytes,
++                "v5 value exceeds configured limit"
++            );
++            8_usize
++                .checked_add(key.len())
++                .and_then(|length| length.checked_add(value_len))
++        }
++        WalEntryRef::PointDelete { key } => {
+@@ -1125 +1239 @@ fn encoded_entry_len(entry: &WalEntry, limits: WalV5Limits) -> Result<usize> {
+-        WalEntry::RangeDelete { start, end } => {
++        WalEntryRef::RangeDelete { start, end } => {
+@@ -1216 +1330,27 @@ mod tests {
+-            assert!(std::ptr::eq(*retained, original));
++            match (*retained, WalEntryRef::from_entry(original)) {
++                (
++                    WalEntryRef::Put { key, value },
++                    WalEntryRef::Put {
++                        key: original_key,
++                        value: original_value,
++                    },
++                ) => {
++                    assert!(std::ptr::eq(key, original_key));
++                    assert!(std::ptr::eq(value, original_value));
++                }
++                (
++                    WalEntryRef::PointDelete { key },
++                    WalEntryRef::PointDelete { key: original_key },
++                ) => assert!(std::ptr::eq(key, original_key)),
++                (
++                    WalEntryRef::RangeDelete { start, end },
++                    WalEntryRef::RangeDelete {
++                        start: original_start,
++                        end: original_end,
++                    },
++                ) => {
++                    assert!(std::ptr::eq(start, original_start));
++                    assert!(std::ptr::eq(end, original_end));
++                }
++                _ => panic!("canonical entry changed kind"),
++            }
+@@ -1295,0 +1436,163 @@ mod tests {
++    #[test]
++    fn borrowed_entry_stream_matches_independent_owned_fixture() -> Result<()> {
++        let pool = [
++            WalEntryRef::PutRaw {
++                key: b"b",
++                value: b"raw",
++            },
++            WalEntryRef::Put {
++                key: b"a",
++                value: b"prefixed",
++            },
++            WalEntryRef::PointDelete { key: b"b" },
++            WalEntryRef::RangeDelete {
++                start: b"a",
++                end: b"z",
++            },
++            WalEntryRef::PutRaw {
++                key: b"a",
++                value: b"",
++            },
++            WalEntryRef::PointDelete { key: b"a" },
++        ];
++        for len in 1..=4 {
++            for mut pattern in 0..pool.len().pow(len) {
++                let entries: Vec<_> = (0..len)
++                    .map(|_| {
++                        let entry = pool[pattern % pool.len()];
++                        pattern /= pool.len();
++                        entry
++                    })
++                    .collect();
++                let batch = WalBatch {
++                    commit_ts: 11,
++                    recorded_at: RecordedAt {
++                        secs: -2,
++                        nanos: 500_000_000,
++                    },
++                    entries: entries
++                        .iter()
++                        .map(|entry| match *entry {
++                            WalEntryRef::Put { key, value } => WalEntry::Put {
++                                key: key.to_vec(),
++                                value: value.to_vec(),
++                            },
++                            WalEntryRef::PutRaw { key, value } => {
++                                let mut prefixed = vec![crate::vlog::KvKind::Inline as u8];
++                                prefixed.extend_from_slice(value);
++                                WalEntry::Put {
++                                    key: key.to_vec(),
++                                    value: prefixed,
++                                }
++                            }
++                            WalEntryRef::PointDelete { key } => {
++                                WalEntry::PointDelete { key: key.to_vec() }
++                            }
++                            WalEntryRef::RangeDelete { start, end } => WalEntry::RangeDelete {
++                                start: start.to_vec(),
++                                end: end.to_vec(),
++                            },
++                        })
++                        .collect(),
++                }
++                .canonicalized()?;
++                let expected = encode_v5_batch_inner(&batch, limits())?;
++                let source = entries.iter().copied();
++                let charge = CanonicalWalEntryStream::entry_preparation_buffer_bytes(
++                    source.clone(),
++                    batch.commit_ts,
++                    batch.recorded_at,
++                    limits(),
++                )?;
++                let stream = CanonicalWalEntryStream::from_entries(
++                    source,
++                    batch.commit_ts,
++                    batch.recorded_at,
++                    limits(),
++                )?;
++                assert!(
++                    (stream.last_point.capacity() * std::mem::size_of::<(&[u8], usize)>()) as u64
++                        <= charge
++                );
++                let mut output = vec![0xa5; stream.data_len() + 17];
++                let (written, crc) = stream.encode_into(&mut output)?;
++                assert_eq!(stream.entry_count() as usize, batch.entries.len());
++                assert_eq!(
++                    &output[..written],
++                    &expected[WAL_V5_BATCH_HEADER_LEN..WAL_V5_BATCH_HEADER_LEN + written]
++                );
++                assert_eq!(crc, crc32fast::hash(&output[..written]));
++                assert!(output[written..].iter().all(|byte| *byte == 0xa5));
++            }
++        }
++        Ok(())
++    }
++
++    #[test]
++    fn borrowed_raw_value_limits_include_the_inline_tag_after_canonicalization() -> Result<()> {
++        let time = RecordedAt { secs: -2, nanos: 0 };
++        let value = vec![0x5a; limits().max_value_bytes];
++        assert!(
++            CanonicalWalEntryStream::from_entries(
++                std::iter::once(WalEntryRef::PutRaw {
++                    key: b"k",
++                    value: &value
++                }),
++                1,
++                time,
++                limits(),
++            )
++            .is_err()
++        );
++        let good = WalEntryRef::PutRaw {
++            key: b"k",
++            value: &value[..value.len() - 1],
++        };
++        assert!(
++            CanonicalWalEntryStream::from_entries(std::iter::once(good), 1, time, limits()).is_ok()
++        );
++        let overwritten = [
++            WalEntryRef::PutRaw {
++                key: b"k",
++                value: &value,
++            },
++            good,
++        ];
++        assert!(
++            CanonicalWalEntryStream::from_entries(overwritten.into_iter(), 1, time, limits())
++                .is_ok()
++        );
++        let mut count_limited = limits();
++        count_limited.max_input_entry_count = 1;
++        assert!(
++            CanonicalWalEntryStream::from_entries(overwritten.into_iter(), 1, time, count_limited)
++                .is_err()
++        );
++        let mut byte_limited = limits();
++        byte_limited.max_batch_data_bytes = 14 + 1 + value.len() - 1;
++        assert!(
++            CanonicalWalEntryStream::from_entries(std::iter::once(good), 1, time, byte_limited)
++                .is_err()
++        );
++        assert!(
++            CanonicalWalEntryStream::from_entries(std::iter::once(good), 0, time, limits())
++                .is_err()
++        );
++        assert!(
++            CanonicalWalEntryStream::from_entries(
++                std::iter::once(good),
++                1,
++                RecordedAt {
++                    secs: 0,
++                    nanos: 1_000_000_000
++                },
++                limits()
++            )
++            .is_err()
++        );
++        assert!(
++            CanonicalWalEntryStream::from_entries(std::iter::empty(), 1, time, limits()).is_err()
++        );
++        Ok(())
++    }
++
+diff --git a/kv-engine/src/wal.rs b/kv-engine/src/wal.rs
+index 707e3f66..0b077138 100644
+--- a/kv-engine/src/wal.rs
++++ b/kv-engine/src/wal.rs
+@@ -1795,0 +1796 @@ impl Wal {
++    #[cfg(test)]
+@@ -1800,0 +1802,18 @@ impl Wal {
++        self.prepare_v7_parallel_entries(
++            crate::pitr::wal_entry_refs(&batch.entries),
++            batch.commit_ts,
++            batch.recorded_at,
++            limits,
++        )
++    }
++
++    pub(crate) fn prepare_v7_parallel_entries<'a, I>(
++        &self,
++        entries: I,
++        commit_ts: u64,
++        recorded_at: crate::pitr::RecordedAt,
++        limits: crate::pitr::WalV5Limits,
++    ) -> Result<WalV7PreparedBatch>
++    where
++        I: Iterator<Item = crate::pitr::WalEntryRef<'a>> + Clone + ExactSizeIterator,
++    {
+@@ -1817 +1836 @@ impl Wal {
+-            .prepare_v7_batch(batch, limits)
++            .prepare_v7_entries(entries, commit_ts, recorded_at, limits)
+diff --git a/kv-engine/src/wal/parallel/runtime.rs b/kv-engine/src/wal/parallel/runtime.rs
+index a709ed68..567844d3 100644
+--- a/kv-engine/src/wal/parallel/runtime.rs
++++ b/kv-engine/src/wal/parallel/runtime.rs
+@@ -18,0 +19,2 @@ use std::{
++#[cfg(test)]
++use crate::wal::v7::codec::prepare_logical_batch;
+@@ -20 +22,4 @@ use crate::{
+-    pitr::{CanonicalWalEntryStream, LIVE_WAL_V5_LIMITS, RecordedAt, WalBatch, WalV5Limits},
++    pitr::{
++        CanonicalWalEntryStream, LIVE_WAL_V5_LIMITS, RecordedAt, WalBatch, WalEntryRef,
++        WalV5Limits, wal_entry_refs,
++    },
+@@ -30 +35 @@ use crate::{
+-            frame_record_digest, prepare_logical_batch,
++            frame_record_digest, prepare_logical_entries,
+@@ -1111 +1116,19 @@ impl ParallelWalRuntime {
+-        ensure!(!batch.entries.is_empty(), "v7 WAL batch is empty");
++        self.prepare_v7_entries(
++            wal_entry_refs(&batch.entries),
++            batch.commit_ts,
++            batch.recorded_at,
++            limits,
++        )
++    }
++
++    pub(crate) fn prepare_v7_entries<'a, I>(
++        &self,
++        entries: I,
++        commit_ts: u64,
++        recorded_at: RecordedAt,
++        limits: WalV5Limits,
++    ) -> Result<WalV7PreparedBatch>
++    where
++        I: Iterator<Item = WalEntryRef<'a>> + Clone + ExactSizeIterator,
++    {
++        ensure!(entries.len() != 0, "v7 WAL batch is empty");
+@@ -1140 +1163,6 @@ impl ParallelWalRuntime {
+-        let preparation_bytes = CanonicalWalEntryStream::preparation_buffer_bytes(batch, limits)?;
++        let preparation_bytes = CanonicalWalEntryStream::entry_preparation_buffer_bytes(
++            entries.clone(),
++            commit_ts,
++            recorded_at,
++            limits,
++        )?;
+@@ -1142 +1170 @@ impl ParallelWalRuntime {
+-        let prepared = prepare_logical_batch(batch, limits)?;
++        let prepared = prepare_logical_entries(entries, commit_ts, recorded_at, limits)?;
+diff --git a/kv-engine/src/wal/v7/codec.rs b/kv-engine/src/wal/v7/codec.rs
+index 9a472c75..841fad99 100644
+--- a/kv-engine/src/wal/v7/codec.rs
++++ b/kv-engine/src/wal/v7/codec.rs
+@@ -7,2 +7,2 @@ use crate::{
+-        WAL_V5_HEADER_LEN, WAL_V5_MAGIC, WAL_V5_VERSION, WalBatch, WalV5Header, WalV5Limits,
+-        decode_v5_file_header, encode_v5_file_header,
++        WAL_V5_HEADER_LEN, WAL_V5_MAGIC, WAL_V5_VERSION, WalBatch, WalEntryRef, WalEntryRefs,
++        WalV5Header, WalV5Limits, decode_v5_file_header, encode_v5_file_header, wal_entry_refs,
+@@ -450,3 +450,6 @@ pub(crate) fn encode_logical_batch_with_recorded_at(
+-pub(crate) struct PreparedWalV7LogicalBatch<'a> {
+-    batch: &'a WalBatch,
+-    canonical: CanonicalWalEntryStream<'a>,
++pub(crate) struct PreparedWalV7LogicalBatch<'a, I = WalEntryRefs<'a>>
++where
++    I: Iterator<Item = WalEntryRef<'a>> + Clone + ExactSizeIterator,
++{
++    commit_ts: u64,
++    canonical: CanonicalWalEntryStream<'a, I>,
+@@ -543 +546,4 @@ impl EncodedWalV7Entries {
+-impl PreparedWalV7LogicalBatch<'_> {
++impl<'a, I> PreparedWalV7LogicalBatch<'a, I>
++where
++    I: Iterator<Item = WalEntryRef<'a>> + Clone + ExactSizeIterator,
++{
+@@ -553 +559 @@ impl PreparedWalV7LogicalBatch<'_> {
+-        let commit_ts = self.batch.commit_ts;
++        let commit_ts = self.commit_ts;
+@@ -573 +579 @@ impl PreparedWalV7LogicalBatch<'_> {
+-            batch: _,
++            commit_ts: _,
+@@ -604 +610,18 @@ pub(crate) fn prepare_logical_batch(
+-    let canonical = CanonicalWalEntryStream::new(batch, limits)?;
++    prepare_logical_entries(
++        wal_entry_refs(&batch.entries),
++        batch.commit_ts,
++        batch.recorded_at,
++        limits,
++    )
++}
++
++pub(crate) fn prepare_logical_entries<'a, I>(
++    entries: I,
++    commit_ts: u64,
++    recorded_at: RecordedAt,
++    limits: WalV5Limits,
++) -> Result<PreparedWalV7LogicalBatch<'a, I>>
++where
++    I: Iterator<Item = WalEntryRef<'a>> + Clone + ExactSizeIterator,
++{
++    let canonical = CanonicalWalEntryStream::from_entries(entries, commit_ts, recorded_at, limits)?;
+@@ -616 +639 @@ pub(crate) fn prepare_logical_batch(
+-        batch,
++        commit_ts,
+@@ -1886,0 +1910,50 @@ mod tests {
++    #[test]
++    fn borrowed_raw_entries_preserve_fragment_bytes_and_digests() -> Result<()> {
++        let limits = crate::pitr::LIVE_WAL_V5_LIMITS;
++        let time = RecordedAt {
++            secs: -2,
++            nanos: 500_000_000,
++        };
++        for len in [0, 1, 3943, 3944, 3945, 7951, 7952, 7953, 65534] {
++            let value = vec![0x5a; len];
++            let mut prefixed = vec![crate::vlog::KvKind::Inline as u8];
++            prefixed.extend_from_slice(&value);
++            let batch = WalBatch {
++                commit_ts: 23,
++                recorded_at: time,
++                entries: vec![WalEntry::Put {
++                    key: b"k".to_vec(),
++                    value: prefixed,
++                }],
++            };
++            let prepared = prepare_logical_entries(
++                std::iter::once(WalEntryRef::PutRaw {
++                    key: b"k",
++                    value: &value,
++                }),
++                1,
++                time,
++                limits,
++            )?
++            .encode_entry_stream()?;
++            drop(value);
++            let owned = prepared.into_logical_batch(41, 23, time)?;
++            let expected = encode_logical_batch(41, &batch, limits)?;
++            assert_eq!(owned.as_bytes(), expected);
++            assert_eq!(Sha256::digest(owned.as_bytes()), Sha256::digest(&expected));
++            let size = usize::try_from(data_fragment_count(expected.len() as u64).unwrap())?
++                * WAL_V7_FRAME_LEN;
++            let mut expected_frames = vec![0xa5; size + 17];
++            let mut frames = expected_frames.clone();
++            let digest = golden_header().digest()?;
++            let expected_len =
++                encode_data_frames_into(digest, 8192, 41, &expected, limits, &mut expected_frames)?;
++            assert_eq!(
++                owned.encode_data_frames_into(digest, 8192, 41, &mut frames)?,
++                expected_len
++            );
++            assert_eq!(frames, expected_frames);
++        }
++        Ok(())
++    }
++

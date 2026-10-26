@@ -2514,6 +2514,17 @@ The eleven earlier optimizations remain. All 140 scored records, 28 warmups,
 three unscored profiles, rejected source patch, and hashes are preserved.
 V4 parity and the Stage 8 gate remain unmet.
 
+The [borrowed producer preparation experiment](benchmarks/rfc-025-v7-borrowed-preparation-20261026.md)
+is rejected and reverted. It removes temporary owned key/value copies while
+preserving exact canonical bytes, limits, charges, and admission ordering.
+All 1,966 prototype tests pass. Tmpfs batch64 throughput improves 4.6% raw and
+3.4% normalized with 2.5% less CPU; ext4 point throughput rises 2.5% raw and
+4.1% normalized. However, ten ext4 batch64 pairs lose 3.1% raw throughput and
+10.0% normalized, with 2.9% more CPU, so the fixed guard prevents retention.
+All 120 scored records, 24 warmups, three unscored profiles, rejected source
+patch, and hashes remain available. The eleven earlier optimizations remain;
+v4 parity and the Stage 8 gate remain unmet.
+
 ## Delivery checklist
 
 - [ ] Stages 1–3: legacy compatibility, byte-exact codec, independent validation,
