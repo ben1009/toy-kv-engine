@@ -1,0 +1,10 @@
+{
+  "retained": {
+    "path": "target/release/write-perf-v7-validated-logical-batch",
+    "sha256": "614f0cb1adde43cabe900eb032c6f884783d658c597471d9d9ddc8faff314aa9"
+  },
+  "candidate": {
+    "path": "target/release/write-perf-v7-hash-pipeline",
+    "sha256": "644ca097378dd11f5409e99475d7747aaed2b7c05dba01cc5cb838ef6edda739"
+  }
+}

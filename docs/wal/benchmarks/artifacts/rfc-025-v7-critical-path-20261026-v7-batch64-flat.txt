@@ -1,0 +1,44 @@
+# To display the perf.data header info, please use --header/--header-only options.
+#
+#
+# Total Lost Samples: 0
+#
+# Samples: 1K of event 'cpu-clock:u'
+# Event count (approx.): 1954864541
+#
+# Overhead  Command          Shared Object                 Symbol
+# ........  ...............  ............................  .......................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................
+#
+    19.60%  wal-ordered-pac  write-perf-v7-fast-sync-wait  [.] sha2::sha256::x86::digest_blocks
+     6.05%  write-perf-v7-f  write-perf-v7-fast-sync-wait  [.] <crossbeam_skiplist::base::SkipList<bytes::bytes::Bytes, bytes::bytes::Bytes>>::search_position::<bytes::bytes::Bytes>
+     4.98%  write-perf-v7-f  [vdso]                        [.] __vdso_clock_gettime
+     4.16%  write-perf-v7-f  write-perf-v7-fast-sync-wait  [.] <std::thread::local::LocalKey<core::cell::RefCell<alloc::vec::Vec<u8>>>>::with::<<kv_engine::mem_table::MemTable>::publish_raw_batch::{closure#0}, ()>
+     3.69%  write-perf-v7-f  libc.so.6                     [.] 0x00000000000a5fdc
+     3.54%  write-perf-v7-f  libc.so.6                     [.] 0x00000000000a5ffc
+     3.13%  write-perf-v7-f  write-perf-v7-fast-sync-wait  [.] <crossbeam_skiplist::base::SkipList<bytes::bytes::Bytes, bytes::bytes::Bytes>>::insert_internal::<<crossbeam_skiplist::base::SkipList<bytes::bytes::Bytes, bytes::bytes::Bytes>>::insert::{closure#0}, <crossbeam_skiplist::base::SkipList<bytes::bytes::Bytes, bytes::bytes::Bytes>>::insert::{closure#1}>
+     2.82%  write-perf-v7-f  write-perf-v7-fast-sync-wait  [.] <kv_engine::mvcc::LsmMvccInner>::publish_commit_ts
+     2.41%  write-perf-v7-f  libc.so.6                     [.] 0x00000000000a481c
+     2.10%  write-perf-v7-f  libc.so.6                     [.] 0x00000000000a4809
+     1.80%  write-perf-v7-f  write-perf-v7-fast-sync-wait  [.] crc32fast::baseline::update_fast_16
+     1.74%  wal-sync-coordi  write-perf-v7-fast-sync-wait  [.] <crossbeam_channel::flavors::list::Channel<kv_engine::wal::parallel_worker::GroupWriteResult>>::recv
+     1.59%  wal-ordered-pac  libc.so.6                     [.] 0x000000000016c887
+     1.49%  write-perf-v7-f  write-perf-v7-fast-sync-wait  [.] <core::slice::iter::Iter<kv_engine::pitr::WalEntry> as core::iter::traits::iterator::Iterator>::try_fold::<(), <core::iter::adapters::enumerate::Enumerate<_> as core::iter::traits::iterator::Iterator>::try_fold::enumerate<&kv_engine::pitr::WalEntry, (), core::ops::control_flow::ControlFlow<&kv_engine::pitr::WalEntry>, core::iter::traits::iterator::Iterator::find_map::check<(usize, &kv_engine::pitr::WalEntry), &kv_engine::pitr::WalEntry, &mut <kv_engine::pitr::CanonicalWalEntryStream>::entries::{closure#0}>::{closure#0}>::{closure#0}, core::ops::control_flow::ControlFlow<&kv_engine::pitr::WalEntry>>
+     1.49%  write-perf-v7-f  write-perf-v7-fast-sync-wait  [.] bytes::bytes::shared_drop
+     1.39%  write-perf-v7-f  write-perf-v7-fast-sync-wait  [.] crc32fast::specialized::pclmulqdq::calculate
+     1.33%  wal-ordered-pac  libc.so.6                     [.] 0x000000000016d053
+     1.18%  wal-ordered-pac  write-perf-v7-fast-sync-wait  [.] crc32fast::specialized::pclmulqdq::calculate
+     1.08%  write-perf-v7-f  libc.so.6                     [.] 0x000000000016c11d
+     1.08%  write-perf-v7-f  libc.so.6                     [.] 0x000000000016d053
+     0.87%  wal-io-worker    write-perf-v7-fast-sync-wait  [.] <crossbeam_channel::flavors::list::Channel<kv_engine::wal::parallel_worker::WorkerCommand<kv_engine::wal::parallel_runtime::ParallelBuffer>>>::recv
+     0.82%  write-perf-v7-f  libc.so.6                     [.] 0x000000000016bf08
+     0.77%  write-perf-v7-f  libc.so.6                     [.] 0x000000000016c119
+     0.72%  write-perf-v7-f  libc.so.6                     [.] malloc
+     0.62%  wal-ordered-pac  write-perf-v7-fast-sync-wait  [.] crc32fast::baseline::update_fast_16
+     0.62%  write-perf-v7-f  write-perf-v7-fast-sync-wait  [.] <kv_engine::lsm_storage::LsmStorageInner>::push_point_batch_entry::<&[u8]>
+     0.56%  write-perf-v7-f  libc.so.6                     [.] 0x000000000016be20
+     0.51%  write-perf-v7-f  libc.so.6                     [.] 0x000000000016bf0c
+
+
+#
+# (Tip: To not record events from perf itself add --exclude-perf)
+#

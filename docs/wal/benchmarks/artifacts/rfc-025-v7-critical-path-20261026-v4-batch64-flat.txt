@@ -1,0 +1,44 @@
+# To display the perf.data header info, please use --header/--header-only options.
+#
+#
+# Total Lost Samples: 0
+#
+# Samples: 2K of event 'cpu-clock:u'
+# Event count (approx.): 2555666932
+#
+# Overhead  Command          Shared Object                 Symbol
+# ........  ...............  ............................  .......................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................
+#
+    17.39%  write-perf-v7-f  write-perf-v7-fast-sync-wait  [.] <kv_engine::table::builder::SsTableBuilder>::add_inner
+    12.52%  write-perf-v7-f  write-perf-v7-fast-sync-wait  [.] sha2::sha256::x86::digest_blocks
+     5.42%  write-perf-v7-f  [vdso]                        [.] __vdso_clock_gettime
+     5.34%  write-perf-v7-f  write-perf-v7-fast-sync-wait  [.] <crossbeam_skiplist::base::SkipList<bytes::bytes::Bytes, bytes::bytes::Bytes>>::search_position::<bytes::bytes::Bytes>
+     3.77%  write-perf-v7-f  write-perf-v7-fast-sync-wait  [.] <kv_engine::mvcc::LsmMvccInner>::publish_commit_ts
+     3.45%  write-perf-v7-f  write-perf-v7-fast-sync-wait  [.] <std::thread::local::LocalKey<core::cell::RefCell<alloc::vec::Vec<u8>>>>::with::<<kv_engine::mem_table::MemTable>::publish_raw_batch::{closure#0}, ()>
+     2.04%  write-perf-v7-f  libc.so.6                     [.] 0x00000000000a4809
+     1.92%  write-perf-v7-f  libc.so.6                     [.] 0x00000000000a5fdc
+     1.88%  write-perf-v7-f  libc.so.6                     [.] 0x00000000000a347e
+     1.73%  write-perf-v7-f  libc.so.6                     [.] 0x00000000000a481c
+     1.73%  write-perf-v7-f  write-perf-v7-fast-sync-wait  [.] bytes::bytes::shared_drop
+     1.69%  write-perf-v7-f  write-perf-v7-fast-sync-wait  [.] <crossbeam_skiplist::base::SkipList<bytes::bytes::Bytes, bytes::bytes::Bytes>>::insert_internal::<<crossbeam_skiplist::base::SkipList<bytes::bytes::Bytes, bytes::bytes::Bytes>>::insert::{closure#0}, <crossbeam_skiplist::base::SkipList<bytes::bytes::Bytes, bytes::bytes::Bytes>>::insert::{closure#1}>
+     1.53%  write-perf-v7-f  libc.so.6                     [.] 0x00000000000a5ffc
+     1.30%  wal-ordered-pac  write-perf-v7-fast-sync-wait  [.] <crossbeam_channel::flavors::array::Channel<bool>>::recv
+     1.26%  write-perf-v7-f  write-perf-v7-fast-sync-wait  [.] crc32fast::baseline::update_fast_16
+     1.14%  write-perf-v7-f  libc.so.6                     [.] 0x00000000000a49e1
+     1.14%  write-perf-v7-f  write-perf-v7-fast-sync-wait  [.] crc32fast::specialized::pclmulqdq::calculate
+     1.10%  write-perf-v7-f  libc.so.6                     [.] 0x00000000000a5cd2
+     0.98%  wal-sync-coordi  write-perf-v7-fast-sync-wait  [.] <crossbeam_channel::flavors::list::Channel<kv_engine::wal::parallel_worker::GroupWriteResult>>::recv
+     0.94%  write-perf-v7-f  libc.so.6                     [.] 0x000000000016c6f1
+     0.75%  write-perf-v7-f  libc.so.6                     [.] 0x000000000016c119
+     0.67%  write-perf-v7-f  libc.so.6                     [.] malloc
+     0.63%  write-perf-v7-f  libc.so.6                     [.] 0x000000000016c11d
+     0.63%  write-perf-v7-f  write-perf-v7-fast-sync-wait  [.] <bytes::bytes::Bytes as core::convert::From<alloc::vec::Vec<u8>>>::from
+     0.59%  write-perf-v7-f  write-perf-v7-fast-sync-wait  [.] <tinyufo::buckets::Buckets<alloc::sync::Arc<kv_engine::block::Block>>>::get_map::<core::option::Option<tinyufo::KV<alloc::sync::Arc<kv_engine::block::Block>>>, <tinyufo::FiFoQueues<alloc::sync::Arc<kv_engine::block::Block>>>::evict_one_from_small::{closure#0}>
+     0.55%  write-perf-v7-f  libc.so.6                     [.] cfree
+     0.51%  write-perf-v7-f  libc.so.6                     [.] clock_gettime
+     0.51%  write-perf-v7-f  libc.so.6                     [.] 0x000000000016c72e
+
+
+#
+# (Tip: To only collect call graph on one event use perf record -e cpu/cpu-cycles,callgraph=1/,branches ; perf report --show-ref-call-graph)
+#

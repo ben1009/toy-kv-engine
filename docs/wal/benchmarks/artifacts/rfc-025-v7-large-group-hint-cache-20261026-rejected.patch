@@ -1,0 +1,171 @@
+--- a/kv-engine/src/wal/parallel/runtime.rs
++++ b/kv-engine/src/wal/parallel/runtime.rs
+@@ -13 +13 @@
+-        atomic::{AtomicU64, Ordering},
++        atomic::{AtomicBool, AtomicU64, Ordering},
+@@ -70,0 +71,3 @@
++// Large DATA batches amortize the embedded FRONTIER; after a cheap sync,
++// waiting for another producer wave adds latency without a measured CPU gain.
++const V7_LARGE_LOGICAL_BATCH_BYTES: usize = 64 * 1024;
+@@ -597,0 +601,3 @@
++    // A scheduling hint for this packed group's membership; never persisted
++    // or used to validate a logical or physical durability boundary.
++    large_group: bool,
+@@ -664,0 +671,3 @@
++    // A false hint avoids admission/durability lookups for point-only waves.
++    // A true hint still requires checking every written group's snapshot.
++    v7_last_group_large: AtomicBool,
+@@ -869,0 +879 @@
++                large_group: false,
+@@ -947,0 +958 @@
++            v7_last_group_large: AtomicBool::new(false),
+@@ -1734,0 +1746 @@
++                let previous_large_group = prefix.large_group;
+@@ -1751,0 +1764,5 @@
++                if prefix.large_group != previous_large_group {
++                    inner
++                        .v7_last_group_large
++                        .store(prefix.large_group, Ordering::Relaxed);
++                }
+@@ -2004,0 +2022 @@
++    prefix.large_group = !batches.is_empty();
+@@ -2005,0 +2024,3 @@
++        prefix.large_group &= batch.v7_input.as_ref().is_some_and(|input| {
++            input.logical_batch.as_bytes().len() >= V7_LARGE_LOGICAL_BATCH_BYTES
++        });
+@@ -2075,0 +2097,3 @@
++            Some(_) if v7_layout && has_only_large_v7_written_groups(&inner) => {
++                Some(Duration::ZERO)
++            }
+@@ -2100,0 +2125,35 @@
++fn has_only_large_v7_written_groups(inner: &RuntimeInner) -> bool {
++    if !inner.v7_last_group_large.load(Ordering::Relaxed) {
++        return false;
++    }
++    let (durable, written) = {
++        let state = inner.durability.state.lock();
++        (state.durable_frontier, state.written_frontier)
++    };
++    let admission = inner.admission.lock();
++    v7_prefix_is_large(&admission.v7_prefixes, durable, written)
++}
++
++fn v7_prefix_is_large(
++    prefixes: &BTreeMap<u64, WalV7PrefixMetadata>,
++    durable: u64,
++    written: u64,
++) -> bool {
++    if written <= durable {
++        return false;
++    }
++    let mut last_endpoint = None;
++    for (endpoint, prefix) in prefixes.range((
++        std::ops::Bound::Excluded(durable),
++        std::ops::Bound::Included(written),
++    )) {
++        if !prefix.large_group {
++            return false;
++        }
++        last_endpoint = Some(*endpoint);
++    }
++    // A missing snapshot is conservative: do not skip waiting unless the
++    // whole written wave has known group membership, including its endpoint.
++    last_endpoint == Some(written)
++}
++
+@@ -5029,0 +5089,93 @@
++    fn v7_large_prefix_hint_requires_the_entire_unsynced_written_wave() {
++        let mut prefixes = BTreeMap::new();
++        for (endpoint, large_group) in [(1, true), (3, false), (4, true)] {
++            prefixes.insert(
++                endpoint,
++                super::WalV7PrefixMetadata {
++                    last_commit_ts: endpoint,
++                    logical_hasher: super::Sha256::new(),
++                    large_group,
++                },
++            );
++        }
++        assert!(super::v7_prefix_is_large(&prefixes, 0, 1));
++        assert!(!super::v7_prefix_is_large(&prefixes, 0, 3));
++        assert!(
++            !super::v7_prefix_is_large(&prefixes, 1, 4),
++            "an earlier small group in the unsynced wave must retain waiting"
++        );
++        assert!(
++            super::v7_prefix_is_large(&prefixes, 3, 4),
++            "a previously durable small group does not affect the next wave"
++        );
++        for (durable, written) in [(0, 0), (1, 1), (4, 3), (0, 2), (4, 5)] {
++            assert!(!super::v7_prefix_is_large(&prefixes, durable, written));
++        }
++        prefixes.remove(&1);
++        assert!(
++            !super::v7_prefix_is_large(&prefixes, 0, 1),
++            "unknown membership is conservative"
++        );
++        assert!(super::v7_prefix_is_large(&prefixes, 3, 4));
++    }
++
++    #[test]
++    fn v7_materializer_recomputes_large_group_hint_from_all_logical_batches() -> anyhow::Result<()>
++    {
++        let budget = Arc::new(BufferBudget::new());
++        let mut prefix = super::WalV7PrefixMetadata {
++            last_commit_ts: 0,
++            logical_hasher: super::Sha256::new(),
++            large_group: false,
++        };
++        let mut ticket = 0u64;
++        let mut offset = 8192u64;
++        for (members, expected_large) in [
++            (&[true][..], true),
++            (&[true, false][..], false),
++            (&[true][..], true),
++        ] {
++            let mut batches = Vec::new();
++            for large in members {
++                let mut batch = v7_test_batch(ticket + 1, 1024);
++                if *large {
++                    batch.entries = (0..64)
++                        .map(|index| WalEntry::Put {
++                            key: format!("bulk-{index:02}").into_bytes(),
++                            value: vec![0x5A; 1024],
++                        })
++                        .collect();
++                }
++                let logical_batch = super::prepare_logical_batch(&batch, LIVE_WAL_V5_LIMITS)?
++                    .encode_entry_stream()?
++                    .into_logical_batch(ticket, batch.commit_ts, batch.recorded_at)?;
++                assert_eq!(
++                    logical_batch.as_bytes().len() >= super::V7_LARGE_LOGICAL_BATCH_BYTES,
++                    *large
++                );
++                let frame_len = super::data_fragment_count(logical_batch.as_bytes().len() as u64)
++                    .expect("test logical batch has a valid frame count")
++                    as usize
++                    * super::WAL_V7_FRAME_LEN;
++                let mut admitted = admitted_batch_of_size(&budget, ticket, offset, frame_len);
++                admitted.v7_input = Some(super::WalV7AdmittedInput {
++                    logical_batch,
++                    header_digest: [0x11; 32],
++                    commit_ts: batch.commit_ts,
++                });
++                batches.push(admitted);
++                offset += frame_len as u64;
++                ticket += 1;
++            }
++            let mut writes = super::WriteGroupBuffers::with_capacity(batches.len());
++            super::materialize_v7_batches(&mut batches, &mut prefix, &mut writes)?;
++            assert!(batches.is_empty());
++            assert_eq!(prefix.large_group, expected_large);
++            assert_eq!(prefix.last_commit_ts, ticket);
++            drop(writes);
++            assert_eq!(budget.state.lock().active_bytes, 0);
++        }
++        Ok(())
++    }
++
++    #[test]
+@@ -5175,0 +5328 @@
++            large_group: false,

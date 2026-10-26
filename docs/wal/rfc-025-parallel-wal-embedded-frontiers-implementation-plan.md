@@ -2525,6 +2525,30 @@ All 120 scored records, 24 warmups, three unscored profiles, rejected source
 patch, and hashes remain available. The eleven earlier optimizations remain;
 v4 parity and the Stage 8 gate remain unmet.
 
+The [critical-path diagnosis](benchmarks/rfc-025-v7-critical-path-20261026.md)
+identifies ordered prefix SHA-256 before DATA submission as the largest sampled
+batch packer CPU cost. Removing v7's fast-sync wait improves tmpfs batch
+throughput 8.3% raw and 6.7% normalized, but raises point CPU 17.6% and sampled
+p99 86.1%; that policy is rejected and its planned SSD qualification is cancelled.
+All 24 scored records, eight warmups, three unscored profiles, sample records,
+and source identities are preserved. The retained coalescing policy remains.
+V4 parity and the Stage 8 gate remain unmet.
+
+The [hash-stage and group-hint investigation](benchmarks/rfc-025-v7-large-group-hint-cache-20261026.md)
+rejects coordinator hash offload and selective fast-sync coalescing experiments.
+Offload improves CPU batch throughput but can serialize required hashing with
+SSD sync work; a fixed policy loses 31.5% SSD batch throughput. Precomputed
+group-size hints with a negative cache improve tmpfs batch throughput 10.1%
+raw and 12.2% normalized, with nearly flat CPU, but the fixed ten-pair SSD
+confirmation has a per-arm median-rate ratio of 0.94584, below its 0.95 floor.
+The paired SSD throughput is nearly flat, so the evidence does not justify a
+reliable SSD gain. All changes are reverted; the eleven earlier optimizations
+remain and a fresh full check passes 1,963 restored-source tests. All 408 scored
+records, 112 warmups, three unscored profiles, seven source patches/manifests,
+and saved binary identities remain available. The retained executable reaches
+480,373 puts/s in the longer SSD batch cell; historical short-cell references
+remain separate. V4 parity and the full Stage 8 gate remain unmet.
+
 ## Delivery checklist
 
 - [ ] Stages 1–3: legacy compatibility, byte-exact codec, independent validation,

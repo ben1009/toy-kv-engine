@@ -36,6 +36,11 @@ the retained and rejected experiments.
 
 ## Benchmarks and qualification
 
+- [RFC 025 precomputed v7 group hints and pooled SSD confirmation (rejected), 2026-10-26](benchmarks/rfc-025-v7-large-group-hint-cache-20261026.md)
+- [RFC 025 fixed v7 hash-stage experiments (rejected), 2026-10-26](benchmarks/rfc-025-v7-prefix-hash-overlap-20261026.md)
+
+- [RFC 025 v7 critical-path diagnosis and rejected waiting policy, 2026-10-26](benchmarks/rfc-025-v7-critical-path-20261026.md)
+
 - [RFC 025 borrowed v7 producer preparation (rejected), 2026-10-26](benchmarks/rfc-025-v7-borrowed-preparation-20261026.md)
 
 - [RFC 025 user-requested ext4 batch64 rerun, 2026-10-26](benchmarks/rfc-025-v7-maintenance-batch-rerun-20261026.md)

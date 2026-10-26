@@ -1,0 +1,10 @@
+--- a/kv-engine/src/wal/parallel/runtime.rs
++++ b/kv-engine/src/wal/parallel/runtime.rs
+@@ -66,2 +66,2 @@
+-// extend the deadline. V4 skips waiting after cheap syncs; v7 uses a shorter
+-// wait because each durability advance also writes a FRONTIER frame.
++// extend the deadline. Cheap v4 syncs skip coalescing. Cheap v7 syncs retain
++// the bounded capture drain without waiting for another producer wave.
+@@ -70 +70 @@
+-const V7_FAST_SYNC_COALESCE_WAIT: Duration = Duration::from_micros(100);
++const V7_FAST_SYNC_COALESCE_WAIT: Duration = Duration::ZERO;

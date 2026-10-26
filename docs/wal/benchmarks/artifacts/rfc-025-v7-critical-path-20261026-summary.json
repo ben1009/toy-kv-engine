@@ -1,0 +1,59 @@
+{
+  "v4-batch64": {
+    "run_id": "1792980143151",
+    "measure_elapsed_ms": 466.923089,
+    "puts_per_sec": 1606260.2549945863,
+    "timed_process_cpu_ms": 2656.433,
+    "samples": 2548,
+    "sampled_user_cpu_ms_by_comm": {
+      "kv-background-r": 1.003009,
+      "wal-io-worker": 50.15045,
+      "wal-ordered-pac": 43.129387,
+      "wal-sync-coordi": 43.129387,
+      "write-perf-v7-f": 2418.254699
+    },
+    "sampled_packer_sha_self_ms": 0.0,
+    "packer_sha_fraction_of_sampled_packer_user_cpu": 0.0,
+    "samples_sha256": "8125d2d15137167d62870ee648e84152ab9cad20260d22706e59383c091066c4"
+  },
+  "v7-batch64": {
+    "run_id": "1792980145957",
+    "measure_elapsed_ms": 815.3188660000001,
+    "puts_per_sec": 919885.4966763397,
+    "timed_process_cpu_ms": 2567.772,
+    "samples": 1949,
+    "sampled_user_cpu_ms_by_comm": {
+      "wal-io-worker": 53.159477,
+      "wal-ordered-pac": 492.477419,
+      "wal-sync-coordi": 56.168504,
+      "write-perf-v7-f": 1353.059141
+    },
+    "sampled_packer_sha_self_ms": 383.149438,
+    "packer_sha_fraction_of_sampled_packer_user_cpu": 0.7780040733197556,
+    "samples_sha256": "d45996b272e30ad684b92f87ac1db1b279c596436066853156eb7376ea19a627"
+  },
+  "v7-point8": {
+    "run_id": "1792980147190",
+    "measure_elapsed_ms": 676.5839129999999,
+    "puts_per_sec": 147801.3267513205,
+    "timed_process_cpu_ms": 3212.0519999999997,
+    "samples": 2025,
+    "sampled_user_cpu_ms_by_comm": {
+      "wal-io-worker": 245.737205,
+      "wal-ordered-pac": 364.092267,
+      "wal-sync-coordi": 316.950844,
+      "write-perf-v7-f": 1104.312909
+    },
+    "sampled_packer_sha_self_ms": 73.219657,
+    "packer_sha_fraction_of_sampled_packer_user_cpu": 0.20110192837465565,
+    "samples_sha256": "277b6e251e8f3408b5744cf6c523d8d6f283b9ef808b7850a32c51e1a5c47452"
+  },
+  "sampling_limits": "Unscored whole-process cpu-clock:u samples; user CPU period estimates include setup/close. Packer SHA is identified by thread and leaf symbol; it is not total process CPU or a percentage of end-to-end wall time.",
+  "artifacts_sha256": {
+    ".jsonl": "071f4f24c6340490775fdf6811cd19d764f9fcbcae7d714283b5b5e8939a43d1",
+    "-runs.tsv": "a8960c4f4b32d78c279ac45bc47e1272f2b9f307ee8c864faa423562d0d22493",
+    "-profile.py": "529d99bcd2e06d1207164b80d152f77a60010b34e3836bc74d2434b161fa8bcf",
+    "-capture.json": "db55463ef5538cf2391d6fef37cef16858a4084341ece2a34275b1c434e338b7"
+  },
+  "analysis_sha256": "fcf039d728f8caeb6a9e7d6a75d35a8a0b905c63ff1d8ffe0907ca7b6da11fe6"
+}

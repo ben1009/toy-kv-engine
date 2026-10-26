@@ -119,9 +119,11 @@ the full RFC Stage 8 workload or operational gate.
 
 The captured median group count falls from 1,252 to 1,192.5 and sync count from
 361 to 357.5. The corresponding FRONTIER count also falls from 361 to 357.5.
-These diagnostics do not show extra syncs explaining the loss. They include
-setup/close activity and do not isolate its cause; the raw counter records and
-their reproducible medians remain in the summary.
+These diagnostics do not show extra syncs explaining the loss. The harness
+resets them after setup and captures them before drain/close. Counter intervals
+overlap and do not isolate causality; the raw records and their reproducible
+medians remain in the summary. Whole-process perf samples, discussed above,
+include setup/close.
 
 ## Highest comparable scored ext4 results
 
