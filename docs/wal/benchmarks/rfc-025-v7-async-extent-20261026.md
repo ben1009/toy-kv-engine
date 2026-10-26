@@ -1,6 +1,6 @@
 # RFC 025: asynchronous v7 extent initialization, 2026-10-26–27
 
-**Result: retained at the maintainer's explicit request, despite the failed single-writer p99 guard. A separate follow-up addresses serial preparation. The original failed measurements remain unchanged.**
+**Result: retained at the maintainer's explicit request, despite the failed single-writer p99 guard. The [serial follow-up](rfc-025-v7-serial-preparation-20261027.md) addresses serial preparation and includes 16-writer measurements. The original failed measurements remain unchanged.**
 
 ## Measured results and retention decision
 

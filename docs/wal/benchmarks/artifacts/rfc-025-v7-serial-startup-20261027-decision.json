@@ -1,0 +1,20 @@
+{
+  "decided_at_utc": "2026-10-26T18:35:15.981637+00:00",
+  "retained": true,
+  "review_only": true,
+  "source_commit": "71bd7c23ba240de2fffac33110c4d92c3691c881",
+  "guards_passed": false,
+  "single_writer_objective_passed": true,
+  "original_async_retained": true,
+  "failed_guards": {
+    "ext4-point8": [
+      "paired_normalized_floor"
+    ],
+    "ext4-batch16": [
+      "paired_normalized_floor"
+    ]
+  },
+  "summary_sha256": "6dde8a2b9d8579098391d267b82ea56b94643f8ffbf7cd6fc2dfdb48b66347e2",
+  "policy_deviation": "The user requested keeping asynchronous extent work and optimizing one writer. The agent preserves the tested single-writer fix in a local review commit despite the trial automatic-retention rule failing two normalized guards. This is agent judgment within the authorized optimization work, not explicit user approval of those failed limits and not a passing qualification claim.",
+  "reason": "Serial p99 returns to the pre-async reference; all direct throughput/p99/data/sync-count guards pass. Sixteen-writer raw throughput is about 3% lower. Preserve every moving v4 control and failed normalized guard for review; no PR, push or default activation."
+}

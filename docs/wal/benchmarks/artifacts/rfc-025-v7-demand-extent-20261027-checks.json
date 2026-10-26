@@ -1,0 +1,76 @@
+{
+  "source_base": "0ffebd516b865b01371ed65014ac0347ae2fb420",
+  "outside_sandbox": true,
+  "checks": [
+    {
+      "command": [
+        "cargo",
+        "nextest",
+        "run",
+        "--workspace",
+        "--all-features",
+        "--lib",
+        "--test-threads",
+        "1",
+        "--retries",
+        "0",
+        "--success-output",
+        "immediate",
+        "-E",
+        "test(async_v7_extent) | test(v7_extent_initialization) | test(v7_packer_preallocation)"
+      ],
+      "phase": "demand-prefix serial scheduling candidate",
+      "exit_code": 0,
+      "log": "target/wal-opt/20261027-v7-demand-extent/focused.log",
+      "log_sha256": "1fcdb7077fd0dc3723b7dc7ecde8edd323247cf03ce458f1ed629f92a714aa1b"
+    },
+    {
+      "command": [
+        "cargo",
+        "make",
+        "check"
+      ],
+      "phase": "demand-prefix serial scheduling candidate",
+      "exit_code": 0,
+      "log": "target/wal-opt/20261027-v7-demand-extent/check.log",
+      "log_sha256": "8e0104808f031635c385c1c32f5661cb0d06d86011af1261044d075f5574f9f0"
+    },
+    {
+      "command": [
+        "typos"
+      ],
+      "phase": "demand-prefix serial scheduling candidate",
+      "exit_code": 0,
+      "log": "target/wal-opt/20261027-v7-demand-extent/typos.log",
+      "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "command": [
+        "cargo",
+        "build",
+        "--release",
+        "--package",
+        "kv-engine",
+        "--bin",
+        "write-perf",
+        "--features",
+        "bench"
+      ],
+      "phase": "demand-prefix serial scheduling candidate",
+      "exit_code": 0,
+      "log": "target/wal-opt/20261027-v7-demand-extent/build.log",
+      "log_sha256": "9cbe535adc554f98672c8ae58cebb6de7e3fc946a52fde8cf78484c17505cb9e"
+    }
+  ],
+  "test_count": 1969,
+  "focused_test_count": 9,
+  "skips": 0,
+  "retries": 0,
+  "earlier_validation_corrections": [
+    {
+      "log": "target/wal-opt/20261027-v7-demand-extent/focused-previous-full-extent-expectation.log",
+      "sha256": "ecc23cd3ddd66a77f84a82d0df2835c6374678d41b8d09642d63af1d811f1dfe",
+      "reason": "The serial test retained a whole-extent readiness expectation from the rejected prototype; corrected to the revised 128KiB demand prefix."
+    }
+  ]
+}

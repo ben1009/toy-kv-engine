@@ -1,0 +1,69 @@
+{
+  "source_base": "0ffebd516b865b01371ed65014ac0347ae2fb420",
+  "outside_sandbox": true,
+  "checks": [
+    {
+      "command": [
+        "cargo",
+        "nextest",
+        "run",
+        "--workspace",
+        "--all-features",
+        "--lib",
+        "--test-threads",
+        "1",
+        "--retries",
+        "0",
+        "--success-output",
+        "immediate",
+        "-E",
+        "test(async_v7_extent) | test(v7_extent_initialization) | test(v7_packer_preallocation)"
+      ],
+      "phase": "serial scheduling candidate",
+      "exit_code": 0,
+      "log": "target/wal-opt/20261027-v7-serial-extent/focused.log",
+      "log_sha256": "5a78d2a0a302dc25d39158ea9f4185721aaead520b72bb96ead5bb957575cfe1"
+    },
+    {
+      "command": [
+        "cargo",
+        "make",
+        "check"
+      ],
+      "phase": "serial scheduling candidate",
+      "exit_code": 0,
+      "log": "target/wal-opt/20261027-v7-serial-extent/check.log",
+      "log_sha256": "0bee5fe10261018772ccedc4de7faf384d4e52793d2e9c91700872acf3cf1a6c"
+    },
+    {
+      "command": [
+        "typos"
+      ],
+      "phase": "serial scheduling candidate",
+      "exit_code": 0,
+      "log": "target/wal-opt/20261027-v7-serial-extent/typos.log",
+      "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "command": [
+        "cargo",
+        "build",
+        "--release",
+        "--package",
+        "kv-engine",
+        "--bin",
+        "write-perf",
+        "--features",
+        "bench"
+      ],
+      "phase": "serial scheduling candidate",
+      "exit_code": 0,
+      "log": "target/wal-opt/20261027-v7-serial-extent/build.log",
+      "log_sha256": "187438a0faa7419e90def626f299ae3a7afbb498bb70db0da6c83abff5656fc7"
+    }
+  ],
+  "test_count": 1969,
+  "focused_test_count": 9,
+  "skips": 0,
+  "retries": 0
+}

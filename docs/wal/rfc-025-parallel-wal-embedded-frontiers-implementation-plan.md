@@ -2660,6 +2660,21 @@ the retention instruction also passes all 1,963 original tests. A separate seria
 scheduling follow-up includes the subsequently requested 16-writer coverage.
 This retention does not establish point parity or the complete Stage 8 gate.
 
+The [serial extent follow-up](benchmarks/rfc-025-v7-serial-preparation-20261027.md)
+rejects full serial preparation at startup (16-writer p99 +32.9%) and repeated
+128-KiB serial prefixes (one-writer p99 +19.1% against pre-async). The final hybrid
+keeps a small startup prefix, then prepares whole extents for serial demand while
+concurrent operations retain background work. Five serial rounds restore p99 to
+the pre-async reference, improve p99 9.2% and throughput 2.6% against kept async,
+and reduce CPU 6.3%. All direct guards pass in the full 1/8/16-writer matrix, but
+point8 and batch16 v4-normalized guards fail; 16-writer raw throughput is about 3%
+lower and CPU about 7% higher. Source `71bd7c23` is preserved for local review under
+the requested single-writer work, with the automatic-rule deviation explicit and
+qualification still failed. All three prototypes pass 1,969 tests and nine focused
+checks. All 146 scored records, 42 warmups, exact source and executable identities,
+failed controls and cancellation records remain. Point parity and Stage 8 remain
+unmet; no default activation or publication occurs.
+
 ## Delivery checklist
 
 - [ ] Stages 1–3: legacy compatibility, byte-exact codec, independent validation,

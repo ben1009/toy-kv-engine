@@ -36,6 +36,7 @@ the retained and rejected experiments.
 
 ## Benchmarks and qualification
 
+- [RFC 025 serial extent scheduling fix and 16-writer SSD results (local review; full gate failed), 2026-10-27](benchmarks/rfc-025-v7-serial-preparation-20261027.md)
 - [RFC 025 asynchronous v7 extent preparation (maintainer-retained; serial p99 follow-up), 2026-10-26–27](benchmarks/rfc-025-v7-async-extent-20261026.md)
 - [RFC 025 vectored v7 DATA submissions (rejected), 2026-10-26](benchmarks/rfc-025-v7-vectored-data-20261026.md)
 - [RFC 025 linked FRONTIER write/sync and task-work diagnostic (rejected), 2026-10-26](benchmarks/rfc-025-v7-frontier-link-20261026.md)

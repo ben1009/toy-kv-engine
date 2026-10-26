@@ -1,0 +1,90 @@
+{
+  "created_at_utc": "2026-10-26T17:57:10.967059+00:00",
+  "source_base": "0ffebd516b865b01371ed65014ac0347ae2fb420",
+  "authorization": "Maintainer: Keep and Optimize for 1 writer; additionally requested 16-writer coverage.",
+  "hypothesis": "Combine a small initial prefix (preserves16writer startup) with complete synchronous extent preparation on subsequent serial demand (matches pre-async preparation frequency). The repeated128KiB serial prototype fails its pre-async latency/throughput guards. Keep async suffix work only with concurrent reservations.",
+  "candidate": "Add immutable initial_end to the async control. At a readiness miss with zero/one batch operation, use complete existing extent preparation once any prefix beyond initial_end was prepared. For first preparation retain required128KiB prefix, with no background request unless concurrent. Multiple operations retain original asynchronous prefix/suffix work. All preparation shares existing cursor/error state and bounds; no durability/codec/resource changes.",
+  "baselines": {
+    "async": "ef112fd0dea7f292a0be9ab47eae6276242dd6b290efccdf4335f03e41b17d0a",
+    "pre_async": "614f0cb1adde43cabe900eb032c6f884783d658c597471d9d9ddc8faff314aa9",
+    "failed_serial": "c51dbed65ed734aee51380b64c3d67ac05efdb7ba31cab547d0e0446b7a09caa",
+    "failed_demand": "b1f2940d1f709ffbddbe8665796c69140d138a4cfd776b54d4aebf4642561ae3"
+  },
+  "matrix": {
+    "ext4-point1": {
+      "operations": 20000,
+      "writers": 1,
+      "batch": null,
+      "sample_every": 10,
+      "samples": 2000,
+      "pairs": 5,
+      "arms": [
+        "base_v7",
+        "old_v4",
+        "new_v4",
+        "old_v7",
+        "new_v7"
+      ]
+    },
+    "ext4-point8": {
+      "operations": 100000,
+      "writers": 8,
+      "batch": null,
+      "sample_every": 100,
+      "samples": 1000,
+      "pairs": 3,
+      "arms": [
+        "old_v4",
+        "new_v4",
+        "old_v7",
+        "new_v7"
+      ]
+    },
+    "ext4-batch8": {
+      "operations": 750000,
+      "writers": 8,
+      "batch": 64,
+      "sample_every": 10,
+      "samples": 1176,
+      "pairs": 3,
+      "arms": [
+        "old_v4",
+        "new_v4",
+        "old_v7",
+        "new_v7"
+      ]
+    },
+    "ext4-point16": {
+      "operations": 100000,
+      "writers": 16,
+      "batch": null,
+      "sample_every": 100,
+      "samples": 1008,
+      "pairs": 3,
+      "arms": [
+        "old_v4",
+        "new_v4",
+        "old_v7",
+        "new_v7"
+      ]
+    },
+    "ext4-batch16": {
+      "operations": 750000,
+      "writers": 16,
+      "batch": 64,
+      "sample_every": 10,
+      "samples": 1184,
+      "pairs": 3,
+      "arms": [
+        "old_v4",
+        "new_v4",
+        "old_v7",
+        "new_v7"
+      ]
+    }
+  },
+  "protocol": "SSD only, same payload/options/cooldowns/audits and arms. Run one-writer5pairs first. If its required guards fail, stop before unrun high cells and preserve all serial captures. If it passes, run16point,16batch,8point,8batch3pairs each, unchanged source/binary. No score-selected retries or pooling different candidates.",
+  "guards": "Each cell candidate/async paired raw, v4-normalized and arm-median throughput >=0.95, paired p99<=1.10, identical DATA bytes and paired sync count<=1.05. Serial additionally requires p99 versus async<=0.95 and versus pre-async<=1.10; paired raw versus pre-async>=0.95. CPU reported. These are exploratory fix guards, not complete RFC qualification. Report exact failed guards without overriding the maintainer retention of the original async optimization.",
+  "correctness": "Full cargo make check,9 focused tests,direct typos and release build outside sandbox. Serial rollover test checks first128KiB readiness with no wake, whole allocated readiness after later serial rollovers, concurrent-to-serial transition with paused old background work, preserved bytes and65exact recovered ACKs. Preserve all failure/cap/sealing tests.",
+  "decision": "Original async0ff remains kept by maintainer instruction. Commit this separate hybrid scheduling fix only if all fixed five-cell guards pass. If not, keep core and continue from measured failure without deleting captures. No PR/push."
+}

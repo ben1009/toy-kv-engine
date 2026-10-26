@@ -1,0 +1,22 @@
+{
+  "stopped_at_utc": "2026-10-26T17:56:12.608425+00:00",
+  "reason": "The required five-pair serial phase fails a necessary guard. Preserve both complete 16-writer cells and the complete serial cell, then cancel unrun eight-writer cells before refining preparation granularity.",
+  "failed_serial_guards": [
+    "pre_async_p99_ceiling",
+    "pre_async_raw_floor",
+    "serial_p99_improves"
+  ],
+  "completed_cells": [
+    "ext4-point16",
+    "ext4-batch16",
+    "ext4-point1"
+  ],
+  "cancelled_cells": [
+    "ext4-point8",
+    "ext4-batch8"
+  ],
+  "scored_records": 49,
+  "warmups": 13,
+  "prototype_qualified": false,
+  "stopped_driver": "python3 docs/wal/benchmarks/artifacts/rfc-025-v7-demand-extent-20261027-run.py ext4-point1"
+}

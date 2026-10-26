@@ -1,0 +1,157 @@
+diff --git a/kv-engine/src/wal/parallel/runtime.rs b/kv-engine/src/wal/parallel/runtime.rs
+index 4c526f1a..0c9ccac6 100644
+--- a/kv-engine/src/wal/parallel/runtime.rs
++++ b/kv-engine/src/wal/parallel/runtime.rs
+@@ -849,0 +850 @@ struct AsyncV7ExtentControl {
++    initial_end: u64,
+@@ -862,0 +864 @@ impl AsyncV7ExtentControl {
++            initial_end: start,
+@@ -2991,0 +2994,18 @@ fn preallocate_runtime_for_write(
++    // A single commit cannot hide suffix I/O behind another producer. Keep
++    // its preparation before DATA/FRONTIER I/O so background zero writes do
++    // not compete with its sync. This count is only a scheduling hint: the
++    // shared cursor and readiness checks remain the correctness boundary.
++    let concurrent_preparation = inner
++        .admission
++        .lock()
++        .v7_reservation_owner
++        .as_ref()
++        .is_some_and(|owner| owner.has_batch_operations_beyond(1));
++    // Keep the first preparation small while producers are arriving. Later
++    // serial demand prepares the complete extent before its syncs, avoiding
++    // repeated small conversions and background I/O in a single-writer stream.
++    if !concurrent_preparation
++        && inner.prepared_file_end.load(Ordering::Acquire) > control.initial_end
++    {
++        return preallocate_runtime(inner, end, initialize_extents);
++    }
+@@ -3013 +3033,3 @@ fn preallocate_runtime_for_write(
+-    control.request(end);
++    if concurrent_preparation {
++        control.request(end);
++    }
+@@ -3260,0 +3283,99 @@ mod tests {
++    #[test]
++    fn async_v7_extent_serial_rollover_does_not_schedule_background_work() -> anyhow::Result<()> {
++        use crate::wal::v7::{
++            install::recover_and_install_active, recovery::WalV7RecoveryAuthority,
++        };
++        for start_concurrent in [false, true] {
++            let directory = async_extent_test_directory()?;
++            let path = directory.path().join("serial-preparation.wal");
++            let Some(V7RuntimeTestWal { wal, owner, anchor }) =
++                live_v7_test_wal(&path, super::MAX_WAL_FILE_SIZE, v7_test_resource_limits())?
++            else {
++                return Ok(());
++            };
++            let runtime = wal.parallel_runtime.as_ref().unwrap();
++            let Some((entered, resume)) = pause_async_extent(runtime) else {
++                eprintln!("skipping async extent test (ext filesystem unavailable)");
++                return Ok(());
++            };
++            let control = Arc::clone(runtime.inner.async_v7_extents.as_ref().unwrap());
++            let initial_target = control.target.load(super::Ordering::Acquire);
++            let concurrent = start_concurrent
++                .then(|| owner.reserve_batch(256))
++                .transpose()?;
++            let mut batches = vec![v7_test_batch(1, 16)];
++            let ticket = wal
++                .put_v7_batch_with_index(&batches[0], LIVE_WAL_V5_LIMITS)?
++                .0;
++            wal.submit_and_commit(ticket)?;
++            if start_concurrent {
++                entered.recv_timeout(std::time::Duration::from_secs(5))?;
++                assert_eq!(
++                    runtime
++                        .inner
++                        .prepared_file_end
++                        .load(super::Ordering::Acquire),
++                    128 * 1024
++                );
++            } else {
++                assert_eq!(
++                    runtime
++                        .inner
++                        .prepared_file_end
++                        .load(super::Ordering::Acquire),
++                    super::EXTENT_INITIALIZATION_CHUNK as u64
++                );
++                assert_eq!(
++                    control.target.load(super::Ordering::Acquire),
++                    initial_target
++                );
++                assert!(matches!(
++                    entered.try_recv(),
++                    Err(crossbeam_channel::TryRecvError::Empty)
++                ));
++            }
++            let requested_target = control.target.load(super::Ordering::Acquire);
++            let first_end = runtime.logical_length() as usize;
++            let first_bytes = std::fs::read(&path)?[..first_end].to_vec();
++            drop(concurrent);
++            // Roll through multiple extents with only one real batch operation
++            // at a time, including a transition from a paused concurrent wave.
++            for ts in 2..=65 {
++                let batch = v7_test_batch(ts, 32 * 1024);
++                let ticket = wal.put_v7_batch_with_index(&batch, LIVE_WAL_V5_LIMITS)?.0;
++                wal.submit_and_commit(ticket)?;
++                batches.push(batch);
++            }
++            let physical_end = std::fs::metadata(&path)?.len();
++            assert!(physical_end >= 2 * super::PREALLOC_BLOCK);
++            assert_eq!(
++                runtime
++                    .inner
++                    .prepared_file_end
++                    .load(super::Ordering::Acquire),
++                physical_end
++            );
++            assert_eq!(
++                control.target.load(super::Ordering::Acquire),
++                requested_target
++            );
++            assert_eq!(control.completed_requests.load(super::Ordering::Acquire), 0);
++            assert_eq!(&std::fs::read(&path)?[..first_end], first_bytes);
++            wal.close()?;
++            assert_eq!(owner.snapshot().buffer_memory_bytes, 0);
++            drop(resume);
++            drop(wal);
++            let recovered = recover_and_install_active(
++                &path,
++                WalV7RecoveryAuthority::Active {
++                    predecessor: crate::pitr::ChainAnchor::Genesis {
++                        archive_epoch_id: crate::pitr::ArchiveEpochId(anchor.archive_epoch_id),
++                    },
++                    durable_anchors: vec![anchor],
++                },
++            )?;
++            assert_eq!(recovered.installed.batches, batches);
++        }
++        Ok(())
++    }
++
+@@ -3272,0 +3394,2 @@ mod tests {
++        // Hold another producer in preparation while exercising background work.
++        let concurrent_preparation = owner.reserve_batch(256)?;
+@@ -3308,0 +3432 @@ mod tests {
++        drop(concurrent_preparation);
+@@ -3337,0 +3462,2 @@ mod tests {
++        // Hold another producer in preparation while exercising background work.
++        let concurrent_preparation = owner.reserve_batch(256)?;
+@@ -3362,0 +3489 @@ mod tests {
++        drop(concurrent_preparation);
+@@ -3393,0 +3521,2 @@ mod tests {
++        // Hold another producer in preparation while exercising background work.
++        let concurrent_preparation = owner.reserve_batch(256)?;
+@@ -3424,0 +3554 @@ mod tests {
++        drop(concurrent_preparation);
+@@ -3453,0 +3584,2 @@ mod tests {
++            // Hold another producer in preparation while exercising background work.
++            let concurrent_preparation = owner.reserve_batch(256)?;
+@@ -3467,0 +3600 @@ mod tests {
++            drop(concurrent_preparation);
+@@ -3515,0 +3649,2 @@ mod tests {
++        // Hold another producer in preparation while exercising background work.
++        let concurrent_preparation = owner.reserve_batch(256)?;
+@@ -3551,0 +3687 @@ mod tests {
++        drop(concurrent_preparation);
