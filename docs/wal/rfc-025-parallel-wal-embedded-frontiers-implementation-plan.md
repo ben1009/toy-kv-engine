@@ -2750,6 +2750,16 @@ qualification or proof of a fixed sixteen-writer regression. Retained f7 source
 and executable are restored; global invocation accounting reaches 433 without
 double-counting reused profiles. This slice adds evidence only.
 
+The [shared coalescing deadline candidate](benchmarks/rfc-025-v7-coalescing-deadline-20261027.md)
+tests that mechanism independently against retained f7. The predeclared
+aggregate-stall view passes batch16 on three matched pairs (+0.8% throughput,
+-14.3% p99), but all three unflagged batch8 pairs lose throughput (paired
+-11.8%, p99 +1.3%, syncs +11.1%). It is not retained; point8 and batch1 are
+cancelled. All twenty new invocations and exact candidate inputs remain.
+Candidate/restored checks pass 1,972/1,971 tests. The retained source and f7
+executable are restored, with no parity or adoption claim; this measurement
+lineage now contains 453 unique invocations.
+
 ## Delivery checklist
 
 - [ ] Stages 1–3: legacy compatibility, byte-exact codec, independent validation,

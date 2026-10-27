@@ -1,0 +1,106 @@
+{
+  "outside_sandbox": true,
+  "checks": [
+    {
+      "phase": "focused",
+      "command": [
+        "cargo",
+        "nextest",
+        "run",
+        "--offline",
+        "--locked",
+        "--workspace",
+        "--all-features",
+        "--lib",
+        "--retries",
+        "0",
+        "--success-output",
+        "immediate",
+        "-E",
+        "test(v7_coalescing) or test(v7_frontier_) or test(large_batch_coalescing) or test(failpoint_parallel_wal_v7)"
+      ],
+      "exit_code": 0,
+      "log": "target/wal-opt/20261027-v7-coalescing-deadline/focused.log",
+      "log_sha256": "ce2021bac91eed0c6da10c22fe8a92dbe1d805a1eb52e5234417fd4ea34a3e51"
+    },
+    {
+      "phase": "format",
+      "command": [
+        "cargo",
+        "fmt",
+        "--all",
+        "--check"
+      ],
+      "exit_code": 0,
+      "log": "target/wal-opt/20261027-v7-coalescing-deadline/format.log",
+      "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "phase": "check",
+      "command": [
+        "cargo",
+        "make",
+        "check"
+      ],
+      "exit_code": 0,
+      "log": "target/wal-opt/20261027-v7-coalescing-deadline/check.log",
+      "log_sha256": "9426716c7af260068098f788dc19593aaca1adaf1ae423ce11430d71ff8924ad"
+    },
+    {
+      "phase": "release",
+      "command": [
+        "cargo",
+        "build",
+        "--offline",
+        "--locked",
+        "--release",
+        "--package",
+        "kv-engine",
+        "--bin",
+        "write-perf",
+        "--features",
+        "bench"
+      ],
+      "exit_code": 0,
+      "log": "target/wal-opt/20261027-v7-coalescing-deadline/release.log",
+      "log_sha256": "abe0dad2db27b5e2c15dc305ba1453b81b54cb66de88cb7472d8ba6baabac523"
+    },
+    {
+      "phase": "direct spelling",
+      "command": [
+        "typos",
+        "--format",
+        "brief"
+      ],
+      "exit_code": 0,
+      "log": "target/wal-opt/20261027-v7-coalescing-deadline/direct-spelling.log",
+      "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "phase": "restored check",
+      "command": [
+        "cargo",
+        "make",
+        "check"
+      ],
+      "exit_code": 0,
+      "log": "target/wal-opt/20261027-v7-coalescing-deadline/restored-check.log",
+      "log_sha256": "4de899768d110a7eeda8aa1466d176a245de74d15cacbd40fb81397cf47c1ab8"
+    },
+    {
+      "phase": "final spelling",
+      "command": [
+        "typos",
+        "--format",
+        "brief"
+      ],
+      "exit_code": 0,
+      "log": "target/wal-opt/20261027-v7-coalescing-deadline/final-spelling.log",
+      "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    }
+  ],
+  "tests": 1972,
+  "focused_tests": 6,
+  "restored_tests": 1971,
+  "restored_flaky_tests": 1
+}

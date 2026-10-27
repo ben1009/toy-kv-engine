@@ -1,0 +1,11 @@
+{
+  "source_base": "cda2ce872f6a520743c02ba5e20b1accf3fa21a5",
+  "restored_at_utc": "2026-10-27T14:02:22.334208+00:00",
+  "source_hashes": {
+    "kv-engine/src/wal/parallel/runtime.rs": "81986cd243505af166add3a9acc4bd1a003e41aec6edcb77da5bdffc0dc2e647"
+  },
+  "source_mtimes_refreshed": true,
+  "canonical_sha256": "f7fd96e5ca0ecaaaa23f59f135e7ce9430521f986834e5c95f2d32070e378d54",
+  "tests": 1971,
+  "check_exit_code": 0
+}

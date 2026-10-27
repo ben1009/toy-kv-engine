@@ -36,6 +36,7 @@ the retained and rejected experiments.
 
 ## Benchmarks and qualification
 
+- [RFC 025 one coalescing deadline across retries (not retained; eight-writer throughput loss), 2026-10-27](benchmarks/rfc-025-v7-coalescing-deadline-20261027.md)
 - [RFC 025 sixteen-writer tail: separated stalls and repeated coalescing, 2026-10-27](benchmarks/rfc-025-v7-16-writer-tail-diagnosis-20261027.md)
 - [RFC 025 coordinator FRONTIER-buffer reuse (not retained; storage variation), 2026-10-27](benchmarks/rfc-025-v7-frontier-buffer-reuse-20261027.md)
 - [RFC 025 batch geometry at worker retirement (rejected; existing optimization kept), 2026-10-27](benchmarks/rfc-025-v7-batch-retirement-hint-20261027.md)

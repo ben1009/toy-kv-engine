@@ -1,0 +1,19 @@
+{
+  "created_at_utc": "2026-10-27T13:49:19.901345+00:00",
+  "source_base": "cda2ce872f6a520743c02ba5e20b1accf3fa21a5",
+  "baseline": {
+    "path": "target/release/write-perf-v7-batch-window",
+    "sha256": "f7fd96e5ca0ecaaaa23f59f135e7ce9430521f986834e5c95f2d32070e378d54"
+  },
+  "candidate": "Retain one v7 coalescing deadline per durable ticket frontier, starting only when a healthy contiguous written prefix can advance. Physical ineligibility retains the original deadline; durable progress starts a new window. V4 uses a fresh deadline, existing 100/400/800us budget selection stays unchanged. No retirement-hint or scratch-buffer prototype included.",
+  "motivation": "Prior coordinator traces identify repeated optional coalescing after a prefix is physically ineligible. A filtered prototype sample spends937us across two400us windows. Test this single mechanism against retained f7.",
+  "scope": "One source candidate; local repo only. Validate and run a bounded SSD screen, dependent guards only after screen benefit. Preserve prior evidence; stop for review, no push/PR.",
+  "validation": "One deterministic real DATA/FRONTIER fixture for idle start, repeated ineligible prefix, expired-window queued result, durable-progress reset, close and exact recovery; existing recapture/poison/short marker/sync failure tests; full cargo make check and release build outside sandbox before captures.",
+  "configuration": "Fresh local ext4 databases, 1KiB values, 2GiB SST, explicit v7 Parallel/no compaction. 750000 batch64 puts/sample10 at16,8,1writers;100000 point puts/sample100 at8writers. Host audit before/1Hz/after,30s initial cooldown,10s gaps, no concurrent build/test/source edit/profile.",
+  "schedule": "Two-arm warmups then5 alternating pairs for batch16 screen. If it improves both throughput and p99 on at least3 non-stall matched pairs, run batch8,point8,batch1 with2 warmups and3 alternating pairs each. No replacements or score-selected retries. Raw guard failure alone does not exclude or veto a source based on obvious storage stalls.",
+  "stall_policy": "Preserve every raw invocation. Predeclare an obvious-stall flag when mean FRONTIER-write >=1ms or mean fdatasync >=1.5ms, relative to observed quiet markers~20-150us and syncs~350us. Exclude a pair from the filtered comparison if either invocation is flagged. This conservative aggregate mask misses short outliers and cannot prove retained samples stall-free or distinguish source-induced I/O changes from environment. Report exclusions by arm and all raw ratios.",
+  "assessment": "Screen:>=3 filtered pairs, median paired throughput>1 and p99<1. Followups:>=2 filtered pairs, paired and arm-median throughput>=0.95 and paired p99<=1.10. Equal DATA bytes in all pairs. CPU/RSS diagnostic only. No extra test cases after a screen miss; restore baseline if insufficient evidence or failed guards. Any retention must state masked observations and source/environment ambiguity; no RFC adoption or v4 parity claim.",
+  "publication": "Keep accepted source in its own local commit, with evidence separate. For a failed or inconclusive candidate, evidence-only commit plus exact restoration.",
+  "prior_verification": "rfc-025-v7-16-writer-tail-20261027-verification.json",
+  "prior_global_invocations": 433
+}
