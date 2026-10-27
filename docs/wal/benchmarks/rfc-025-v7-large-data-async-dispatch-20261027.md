@@ -1,6 +1,6 @@
 # RFC 025: async dispatch for large v7 DATA, 2026-10-27 UTC
 
-This candidate is **not retained: the SSD screen is inconclusive**. Only two matched pairs survive the predeclared stall mask, below the required three. Those two observe **+13.2% throughput / -61.4% p99**, but baseline p99 remains 16–18 ms despite mean I/O calls staying below the aggregate thresholds. The gain is not isolated from storage variation. Dependent guards are cancelled; the accepted source and executable are restored.
+This candidate is **retained provisionally** after maintainer review on 2026-10-28, source commit `f7f39b1b`. The original SSD screen remains **inconclusive**: only two matched pairs survive the predeclared stall mask, below the required three. Those two observe **+13.2% throughput / -61.4% p99**, but baseline p99 remains 16–18 ms despite mean I/O calls staying below the aggregate thresholds. The gain is not isolated from storage variation. The cancelled follow-up guards remain pending confirmation; provisional retention does not turn the original assessment into a pass.
 
 ## Candidate and validation
 
@@ -36,12 +36,16 @@ All five raw scored pairs have median throughput **1.7757x** and p99 **0.5137x**
 
 Twelve new invocations remain: ten scored and two warmups. Added to the preceding verified 537, this lineage contains **549 unique invocations**. This screen contains no new v4-parity comparison. The candidate binary and exact patch remain available for a separately planned confirmation.
 
-Both Rust files are restored byte for byte with refreshed modification times before the restored full check. The canonical executable is atomically replaced with the retained baseline, preserving hardlinked artifacts. This slice records evidence only and stops for review.
+At the original screen boundary, both Rust files were restored byte for byte with refreshed modification times before the restored full check; the canonical executable was atomically replaced with the prior retained baseline. Evidence commit `6d904618` preserves that initial outcome. The original decision, verifier and receipt describe that historical restored state.
+
+Following maintainer review on 2026-10-28, the exact candidate is reapplied and committed separately as `f7f39b1b`. All 128 inputs match the tested candidate manifest, so the existing 1,973 full-check and 47 focused-test results are reused. Formatting is checked again. Canonical `target/release/write-perf` is atomically replaced with candidate `f353022d…`; no new benchmark invocations are added. The retention supplement verifies the current retained source, executable and source commit while keeping the original frozen assessment and raw evidence intact. This remains provisional pending confirmation and the cancelled workload guards.
 
 - [Plan](artifacts/rfc-025-v7-large-data-async-dispatch-20261027-plan.json), [matrix](artifacts/rfc-025-v7-large-data-async-dispatch-20261027-matrix.json), [environment](artifacts/rfc-025-v7-large-data-async-dispatch-20261027-environment.json)
 - [Patch](artifacts/rfc-025-v7-large-data-async-dispatch-20261027-candidate.patch), [source manifest](artifacts/rfc-025-v7-large-data-async-dispatch-20261027-source-sha256.tsv), [binaries](artifacts/rfc-025-v7-large-data-async-dispatch-20261027-binaries.json)
 - [Raw runs](artifacts/rfc-025-v7-large-data-async-dispatch-20261027-ext4-batch16.jsonl), [commands and hashes](artifacts/rfc-025-v7-large-data-async-dispatch-20261027-ext4-batch16-runs.tsv), [host audits](artifacts/rfc-025-v7-large-data-async-dispatch-20261027-ext4-batch16-host.jsonl)
 - [Driver](artifacts/rfc-025-v7-large-data-async-dispatch-20261027-run.py), [stage controller](artifacts/rfc-025-v7-large-data-async-dispatch-20261027-run-all.py), [analyzer](artifacts/rfc-025-v7-large-data-async-dispatch-20261027-analyze.py), [summary](artifacts/rfc-025-v7-large-data-async-dispatch-20261027-summary.json), [scored peaks](artifacts/rfc-025-v7-large-data-async-dispatch-20261027-peaks.json)
 - [Checks](artifacts/rfc-025-v7-large-data-async-dispatch-20261027-checks.json), [initial compile](artifacts/rfc-025-v7-large-data-async-dispatch-20261027-attempts.json), [decision](artifacts/rfc-025-v7-large-data-async-dispatch-20261027-decision.json), [verifier](artifacts/rfc-025-v7-large-data-async-dispatch-20261027-verify.py), [verification](artifacts/rfc-025-v7-large-data-async-dispatch-20261027-verification.json)
+
+- [Provisional retention decision](artifacts/rfc-025-v7-large-data-async-retention-20261028.json), [retention checks](artifacts/rfc-025-v7-large-data-async-retention-20261028-checks.json), [current-state verifier](artifacts/rfc-025-v7-large-data-async-retention-20261028-verify.py), [current verification](artifacts/rfc-025-v7-large-data-async-retention-20261028-verification.json)
 
 [WAL documentation](../README.md).

@@ -2791,13 +2791,15 @@ eligible-prefix source and executable are restored. Candidate checks pass
 537 unique invocations, with parity and adoption still unqualified.
 
 The [large-DATA async dispatch screen](benchmarks/rfc-025-v7-large-data-async-dispatch-20261027.md)
-is inconclusive and not retained. It adds `IOSQE_ASYNC` only to large v7 DATA
-on ext filesystems. Two matched sixteen-writer pairs observe +13.2% throughput
-and -61.4% p99, but three other pairs are excluded for aggregate stalls and
-baseline tails remain long below the mask. The required third matched pair
-is unavailable, so dependent guards are cancelled. Candidate/restored checks
-pass 1,973/1,972 tests. Both source files and the retained executable are
-restored; all twelve new invocations remain, bringing this lineage to 549.
+remains inconclusive; maintainer review on 2026-10-28 retains the exact
+candidate provisionally as `f7f39b1b`. It adds `IOSQE_ASYNC` only to large v7
+DATA on ext filesystems. Two matched sixteen-writer pairs observe +13.2%
+throughput and -61.4% p99, but three other pairs are excluded for aggregate
+stalls and baseline tails remain long below the mask. The required third
+matched pair is unavailable; cancelled guards remain pending confirmation.
+Candidate/restored checks pass 1,973/1,972 tests. Reapplying the exact 128-input
+candidate reuses its 1,973 full and 47 focused tests and adds no benchmark
+invocations. This lineage remains at 549; the frozen assessment stays inconclusive.
 
 ## Delivery checklist
 

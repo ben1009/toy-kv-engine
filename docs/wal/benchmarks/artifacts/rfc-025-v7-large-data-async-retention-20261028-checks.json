@@ -1,0 +1,20 @@
+{
+  "outside_sandbox": true,
+  "reused_original_checks_sha256": "c77b079cc6a00e2f9ae971cbb314d7a76495c898672fe494a2524153647a2c69",
+  "checks": [
+    {
+      "phase": "retention spelling",
+      "command": [
+        "typos",
+        "docs/wal/README.md",
+        "docs/wal/rfc-025-parallel-wal-embedded-frontiers-implementation-plan.md",
+        "docs/wal/benchmarks/rfc-025-v7-large-data-async-dispatch-20261027.md",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-large-data-async-retention-20261028-verify.py",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-large-data-async-retention-20261028.json"
+      ],
+      "exit_code": 0,
+      "log": "target/wal-opt/20261028-v7-large-data-async-retention/spelling.log",
+      "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    }
+  ]
+}

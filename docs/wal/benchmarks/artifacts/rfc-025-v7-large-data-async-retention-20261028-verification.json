@@ -1,0 +1,18 @@
+{
+  "source_commit": "f7f39b1b5be96986839b39d7dbfdcf0048074fd0",
+  "verified_candidate_inputs": 128,
+  "source_retained": true,
+  "retention_provisional": true,
+  "assessment_passed": false,
+  "canonical_sha256": "f353022d846530a6754330aaea11f295319ea8f4de20afa09b6d2a3b57b021d8",
+  "reused_tests": 1973,
+  "reused_focused_tests": 47,
+  "new_benchmarks": 0,
+  "global_unique_invocations": 549,
+  "original_summary_regenerates": true,
+  "original_assessment_preserved": true,
+  "prior_verification_sha256": "1e631ae4ead0945eb3b438756f3ecdeac5357a6a2a062c6be1ce5c05ce995552",
+  "retention_sha256": "339bac6ff4992a886687cdf17678d517c98f5ce31407fabe1e772d6b87c29cd0",
+  "checks_sha256": "cacd414fe886728a67481ddfeac6d55131595de2e5da96833cfe77ce588a46cf",
+  "verifier_sha256": "f9ebb2a2f0522acd66a4f5d3a048497cba4d05a5e4b13dc5e6962fd4bbf17614"
+}

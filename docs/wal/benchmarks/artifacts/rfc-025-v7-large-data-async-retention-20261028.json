@@ -1,0 +1,28 @@
+{
+  "user_message": "Keep?",
+  "decision": "Retain the exact tested candidate provisionally after maintainer review, following the throughput/p99 preference. The original fixed assessment remains inconclusive.",
+  "source_commit": "f7f39b1b5be96986839b39d7dbfdcf0048074fd0",
+  "source_parent": "6d9046185d0846dcea3739a9287024ed0e0f72ec",
+  "source_retained": true,
+  "retention_provisional": true,
+  "assessment_passed": false,
+  "performance_confirmed": false,
+  "confirmation_required": true,
+  "pending_guards": [
+    "ext4-batch8",
+    "ext4-point8",
+    "ext4-batch1"
+  ],
+  "original_stem": "rfc-025-v7-large-data-async-dispatch-20261027",
+  "prior_verification_sha256": "1e631ae4ead0945eb3b438756f3ecdeac5357a6a2a062c6be1ce5c05ce995552",
+  "source_manifest_sha256": "8681fa873cfbfe2811218eb411b3da50fd88b90fc3be9309a85fc52d012c23e3",
+  "original_checks_sha256": "c77b079cc6a00e2f9ae971cbb314d7a76495c898672fe494a2524153647a2c69",
+  "original_decision_sha256": "31b6cc4bbce0d74aed3e83592987c4acfa22ce32b173dcecaa97de3b02cef6dd",
+  "canonical_sha256": "f353022d846530a6754330aaea11f295319ea8f4de20afa09b6d2a3b57b021d8",
+  "verified_candidate_inputs": 128,
+  "reused_full_tests": 1973,
+  "reused_focused_tests": 47,
+  "new_benchmarks": 0,
+  "global_unique_invocations": 549,
+  "fresh_format_check_passed": true
+}
