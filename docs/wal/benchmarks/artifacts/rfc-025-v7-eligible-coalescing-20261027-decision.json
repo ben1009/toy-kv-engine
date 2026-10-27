@@ -1,0 +1,15 @@
+{
+  "source_base": "d7f5aa8aee266b9b428a0d25601d626e6951a233",
+  "source_commit": "d5d23e95553e95cd06f637c48d98ada75c10d56f",
+  "assessment_passed": true,
+  "source_retained": true,
+  "cpu_is_diagnostic": true,
+  "captured_cells": [
+    "ext4-batch16",
+    "ext4-batch8",
+    "ext4-point8",
+    "ext4-batch1"
+  ],
+  "cancelled_cells": [],
+  "reason": "All four fixed cells pass their predeclared aggregate-stall matched-pair guards. Batch8 has+9.9% throughput/-7.0% p99 with no pairs flagged and7.2% fewer syncs. Batch16 has+0.3%/-16.0% after2 flagged pairs; point8 p99 is+2.8%, within its guard. Point/solo raw throughput gains remain storage-confounded; do not claim uniform gains or RFC/v4 parity. Keep this isolated eligibility policy; CPU is diagnostic only."
+}

@@ -2760,6 +2760,17 @@ Candidate/restored checks pass 1,972/1,971 tests. The retained source and f7
 executable are restored, with no parity or adoption claim; this measurement
 lineage now contains 453 unique invocations.
 
+The [eligible-prefix coalescing candidate](benchmarks/rfc-025-v7-eligible-coalescing-20261027.md)
+is retained for review as `d5d23e95`. It skips optional coalescing and capture
+drain only for a known physically ineligible healthy v7 prefix, then preserves
+the existing fresh window once eligible. All four fixed guards pass: batch8
+observes throughput +9.9%, p99 -7.0%, syncs -7.2%; batch16's predeclared
+aggregate-stall view observes +0.3%/-16.0% over three matched pairs. Point8 p99
+is +2.8%, within its guard; point and solo throughput ratios remain
+storage-confounded. All 36 invocations and exact inputs remain, candidate
+checks pass 1,972 tests, and no RFC adoption or v4 parity is qualified. This
+measurement lineage now contains 489 unique invocations.
+
 ## Delivery checklist
 
 - [ ] Stages 1–3: legacy compatibility, byte-exact codec, independent validation,

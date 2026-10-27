@@ -1,0 +1,28 @@
+{
+  "source_base": "d7f5aa8aee266b9b428a0d25601d626e6951a233",
+  "source_commit": "d5d23e95553e95cd06f637c48d98ada75c10d56f",
+  "reconstructed_inputs": 128,
+  "changed_input": "kv-engine/src/wal/parallel/runtime.rs",
+  "verified_binaries": 2,
+  "summary_regenerates": true,
+  "records": 36,
+  "scored_records": 28,
+  "warmup_records": 8,
+  "excluded_diagnostic_invocations": 0,
+  "global_unique_invocations": 489,
+  "all_four_stages_pass": true,
+  "filtered_pairs": {
+    "ext4-batch16": 3,
+    "ext4-batch8": 3,
+    "ext4-point8": 3,
+    "ext4-batch1": 3
+  },
+  "tests": 1972,
+  "focused_tests": 6,
+  "source_retained": true,
+  "cpu_is_diagnostic": true,
+  "canonical_sha256": "e9abcc91b499c3cecd0acc137a0c9b8f65228b76ac3cb31ba3894bf9a0d06d40",
+  "checks_sha256": "e4d94967c898c924944c2762b0900e73c2c9dd060114d0f95b4d53e78b6038b0",
+  "decision_sha256": "bfc0b731397439dbe4798fb84daf98095d5d534df50d859a9d91c5d1be9f5516",
+  "verifier_sha256": "0e9ae17a1199f6957288ff5c3318b2ddba1e8ca08e67e3fb1b72161c697949e4"
+}
