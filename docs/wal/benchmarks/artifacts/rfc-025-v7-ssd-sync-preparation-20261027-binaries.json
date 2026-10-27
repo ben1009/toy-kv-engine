@@ -1,0 +1,12 @@
+{
+  "baseline": {
+    "path": "target/release/write-perf-v7-serial-startup",
+    "sha256": "e7f7712825d2166c14b5b67601388a8e29697f8fc034832e457061cf6e30ae19",
+    "features": "bench"
+  },
+  "candidate": {
+    "path": "target/release/write-perf-v7-bounded-lookahead",
+    "sha256": "800bdc851fc2a4767a4cb56fbe81eb5d06dc3544c0784eb0da8d6b782be7f81d",
+    "features": "bench"
+  }
+}

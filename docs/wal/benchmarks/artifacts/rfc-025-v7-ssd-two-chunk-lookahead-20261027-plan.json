@@ -1,0 +1,15 @@
+{
+  "created_at_utc": "2026-10-27T02:32:27.650227+00:00",
+  "source_base": "53f48459b15ae96d50df39ab0f5e7586579206fc",
+  "candidate": "Two128KiB chunks of concurrent v7 lookahead: min(allocated_end, required_initialized_prefix+256KiB). Allocation, serial fallback, large-DATA skip, byte format and sync ordering unchanged.",
+  "hypothesis": "One-chunk trial increased preparation from58ms to176ms in a fast matched point pair and had a lower highest score. Two chunks should reduce forced foreground preparations while still limiting a seven-chunk unused suffix burst. This is a distinct source prototype, not a retry of the failed 128KiB policy.",
+  "baseline": "target/release/write-perf-v7-serial-startup",
+  "baseline_sha256": "e7f7712825d2166c14b5b67601388a8e29697f8fc034832e457061cf6e30ae19",
+  "stages": "SSD screen point8,batch8, each one warmup/arm+5alternating four-arm pairs(oldv4,newv4,oldv7,newv7). If screen passes, low concurrency point1/batch1 and point16/batch16 each3pairs, then fixed point8/batch8 confirmation3pairs. No RAM gate; user explicitly requests SSD work.",
+  "configuration": "Ext4 SSD,1KiB values,2GiB SST,explicit v4/v7Parallel. point8/16=100k puts/sample100;point1=20k/sample10;batch=750k/batch64/sample10.30s initialcooldown,10s interrun. Recognized process audits before/during1Hz/after. No build/test/profile overlap; all completed records/stalls retained.",
+  "guards": "Each workload: paired raw and separate-arm median throughput>=.95; paired p99<=1.10,CPU<=1.05,DATAbytesidentical,synccount<=1.05. V4 same-executable controls recorded and compared; normalizedv7/v4 ratio diagnostic. Atleastone SSD cell raw>=1.02 withCPU<=1.00. Highest scores and IDs are descriptive. If screen fails cancel unrun downstream stages and restore; no score-selected retries.",
+  "validation": "Full cargo make check outside sandbox; focused actual ext4 worker-ready-prefix ACK, bounded lookahead/no overwrite, caps, paused worker close/demand, large write skips, failure poison and exact crash recovery. Source/binary snapshots before scoring.",
+  "decision": "Use the same fixed SSD screen/followup/confirmation and guards. Keep all completed observations. Retain source only on complete passing qualification with materialV7gain; otherwise restore original e7 code/binary. Preserve kept async/serial changes; no PR/push/default adoption. Stop after this second prototype for review.",
+  "prior_experiment": "rfc-025-v7-ssd-sync-preparation-20261027",
+  "baseline_profile_reuse": "rfc-025-v7-ssd-sync-preparation-20261027-profiles.json"
+}

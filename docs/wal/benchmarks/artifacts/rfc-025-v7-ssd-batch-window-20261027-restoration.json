@@ -1,0 +1,7 @@
+{
+  "source_base": "53f48459b15ae96d50df39ab0f5e7586579206fc",
+  "runtime_sha256": "a73c272d82f49b6eb3f369d517e297e99164779dcf7e24996d149acd28986bb7",
+  "canonical_sha256": "e7f7712825d2166c14b5b67601388a8e29697f8fc034832e457061cf6e30ae19",
+  "scope": "Final restoration: both kept SSD source policies and System/SkipMap retained; failed candidates preserved separately.",
+  "restored_at_utc": "2026-10-27T03:10:24.809563+00:00"
+}

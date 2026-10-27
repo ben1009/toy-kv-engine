@@ -1,0 +1,13 @@
+{
+  "created_at_utc": "2026-10-27T02:06:08.023841+00:00",
+  "source_base": "53f48459b15ae96d50df39ab0f5e7586579206fc",
+  "candidate": "Bound v7 concurrent background zero-fill target to min(allocated_end, required_initialized_prefix+128KiB). The 1MiB allocation target, serial full-extent fallback after startup, DATA/FRONTIER bytes and one-sync durability stay unchanged. Demand always prepares its own required bytes; background progress never gates ACK/close.",
+  "hypothesis": "A full allocated suffix can issue up to seven unused128KiB zero writes after a small required prefix. Shorter lookahead may reduce SSD write interference and unused tail IO. Profiles show preparation/marker/sync cost but do not independently prove that interference is the cause.",
+  "baseline": "target/release/write-perf-v7-serial-startup",
+  "baseline_sha256": "e7f7712825d2166c14b5b67601388a8e29697f8fc034832e457061cf6e30ae19",
+  "stages": "SSD screen point8,batch8, each one warmup/arm+5alternating four-arm pairs(oldv4,newv4,oldv7,newv7). If screen passes, low concurrency point1/batch1 and point16/batch16 each3pairs, then fixed point8/batch8 confirmation3pairs. No RAM gate; user explicitly requests SSD work.",
+  "configuration": "Ext4 SSD,1KiB values,2GiB SST,explicit v4/v7Parallel. point8/16=100k puts/sample100;point1=20k/sample10;batch=750k/batch64/sample10.30s initialcooldown,10s interrun. Recognized process audits before/during1Hz/after. No build/test/profile overlap; all completed records/stalls retained.",
+  "guards": "Each workload: paired raw and separate-arm median throughput>=.95; paired p99<=1.10,CPU<=1.05,DATAbytesidentical,synccount<=1.05. V4 same-executable controls recorded and compared; normalizedv7/v4 ratio diagnostic. Atleastone SSD cell raw>=1.02 withCPU<=1.00. Highest scores and IDs are descriptive. If screen fails cancel unrun downstream stages and restore; no score-selected retries.",
+  "validation": "Full cargo make check outside sandbox; focused actual ext4 worker-ready-prefix ACK, bounded lookahead/no overwrite, caps, paused worker close/demand, large write skips, failure poison and exact crash recovery. Source/binary snapshots before scoring.",
+  "decision": "Retain only measured, checked improvement; separate source/evidence commits. If guards fail restore changed source and canonicale7. Preserve kept async/serial fixes, System allocator and SkipMap. No PR/push/default adoption. Stop for review after bounded experiment."
+}

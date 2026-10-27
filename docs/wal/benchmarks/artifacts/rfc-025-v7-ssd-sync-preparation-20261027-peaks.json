@@ -1,0 +1,198 @@
+{
+  "source_base": "53f48459b15ae96d50df39ab0f5e7586579206fc",
+  "scope": "Highest scored observation per cell/format/arm; descriptive only, never substitutes for fixed paired or arm-median guards. No pooling across prototypes.",
+  "cells": {
+    "ext4-point8/concurrent/v4": {
+      "old_v4": {
+        "median_rate": 5269.633719047218,
+        "median_cpu_ms": 7036.292,
+        "median_peak_rss_kib": 388312,
+        "peak_rate": 18075.38652655085,
+        "peak_run_id": "1793067567345",
+        "peak_raw_sha256": "0dd04f1faa637727b00cdae0702a66ca0cdd6b14f444433812e38cc0bdbf5943",
+        "binary_sha256": "e7f7712825d2166c14b5b67601388a8e29697f8fc034832e457061cf6e30ae19",
+        "median_p99_ms": 9.969082,
+        "pipeline_medians": {
+          "commit_groups": 88716,
+          "commit_buffers": 100000,
+          "commit_bytes": 409600000,
+          "sync_count": 12737,
+          "fdatasync_ns": 6431203209,
+          "frontier_writes": 0,
+          "frontier_bytes": 0,
+          "frontier_write_ns": 0,
+          "preallocation_ns": 1291118,
+          "wal_sync_wait_ns": 148652016694,
+          "memtable_insert_ns": 787119017
+        }
+      },
+      "new_v4": {
+        "median_rate": 5071.30232405225,
+        "median_cpu_ms": 7249.195,
+        "median_peak_rss_kib": 387860,
+        "peak_rate": 18341.337311050946,
+        "peak_run_id": "1793067583279",
+        "peak_raw_sha256": "9e497e846867159dbd2d23a18d0573db8b55e10979df3bb21f88d79628649a02",
+        "binary_sha256": "800bdc851fc2a4767a4cb56fbe81eb5d06dc3544c0784eb0da8d6b782be7f81d",
+        "median_p99_ms": 10.413452,
+        "pipeline_medians": {
+          "commit_groups": 89032,
+          "commit_buffers": 100000,
+          "commit_bytes": 409600000,
+          "sync_count": 12727,
+          "fdatasync_ns": 6679061414,
+          "frontier_writes": 0,
+          "frontier_bytes": 0,
+          "frontier_write_ns": 0,
+          "preallocation_ns": 1371248,
+          "wal_sync_wait_ns": 154179563920,
+          "memtable_insert_ns": 823375448
+        }
+      }
+    },
+    "ext4-point8/concurrent/v7": {
+      "old_v7": {
+        "median_rate": 10972.86973364266,
+        "median_cpu_ms": 6784.112,
+        "median_peak_rss_kib": 144772,
+        "peak_rate": 16728.866219547257,
+        "peak_run_id": "1793067599123",
+        "peak_raw_sha256": "6a840d2be1fab40f3da873bf19dd909a6e6c5ed805ae5b0d57cb4fc447f0b513",
+        "binary_sha256": "e7f7712825d2166c14b5b67601388a8e29697f8fc034832e457061cf6e30ae19",
+        "median_p99_ms": 9.077921,
+        "pipeline_medians": {
+          "commit_groups": 74861,
+          "commit_buffers": 100000,
+          "commit_bytes": 409600000,
+          "sync_count": 12693,
+          "fdatasync_ns": 3492745857,
+          "frontier_writes": 12693,
+          "frontier_bytes": 51990528,
+          "frontier_write_ns": 568369626,
+          "preallocation_ns": 332493575,
+          "wal_sync_wait_ns": 69830884688,
+          "memtable_insert_ns": 502835811
+        }
+      },
+      "new_v7": {
+        "median_rate": 16176.928286349428,
+        "median_cpu_ms": 6533.312000000001,
+        "median_peak_rss_kib": 144524,
+        "peak_rate": 16296.613751676434,
+        "peak_run_id": "1793067448370",
+        "peak_raw_sha256": "2aac172d942c832b566d318cdac9dbf0851b2f71973fcc5f42a55c775f4cc8d7",
+        "binary_sha256": "800bdc851fc2a4767a4cb56fbe81eb5d06dc3544c0784eb0da8d6b782be7f81d",
+        "median_p99_ms": 1.193246,
+        "pipeline_medians": {
+          "commit_groups": 72484,
+          "commit_buffers": 100000,
+          "commit_bytes": 409600000,
+          "sync_count": 12609,
+          "fdatasync_ns": 3181800116,
+          "frontier_writes": 12609,
+          "frontier_bytes": 51646464,
+          "frontier_write_ns": 209814612,
+          "preallocation_ns": 175753087,
+          "wal_sync_wait_ns": 46858190835,
+          "memtable_insert_ns": 470515006
+        }
+      }
+    },
+    "ext4-batch8/concurrent_batch_64/v4": {
+      "old_v4": {
+        "median_rate": 377636.98506461736,
+        "median_cpu_ms": 5922.914,
+        "median_peak_rss_kib": 2869268,
+        "peak_rate": 392731.4328356571,
+        "peak_run_id": "1793067873991",
+        "peak_raw_sha256": "5690bae37e14c406c24bca0bb39e9a19a45c28dc79232011039fd5c0a97c5de2",
+        "binary_sha256": "e7f7712825d2166c14b5b67601388a8e29697f8fc034832e457061cf6e30ae19",
+        "median_p99_ms": 2.577646,
+        "pipeline_medians": {
+          "commit_groups": 11669,
+          "commit_buffers": 11720,
+          "commit_bytes": 815988736,
+          "sync_count": 2427,
+          "fdatasync_ns": 1128459287,
+          "frontier_writes": 0,
+          "frontier_bytes": 0,
+          "frontier_write_ns": 0,
+          "preallocation_ns": 2328545,
+          "wal_sync_wait_ns": 9979414770,
+          "memtable_insert_ns": 3522090721
+        }
+      },
+      "new_v4": {
+        "median_rate": 381110.07912486524,
+        "median_cpu_ms": 6019.611000000001,
+        "median_peak_rss_kib": 2869436,
+        "peak_rate": 386285.6502891452,
+        "peak_run_id": "1793068045637",
+        "peak_raw_sha256": "b9036581cc1271a2180fc719b513b3ff3807cc8f314879e6d650b1435199ef48",
+        "binary_sha256": "800bdc851fc2a4767a4cb56fbe81eb5d06dc3544c0784eb0da8d6b782be7f81d",
+        "median_p99_ms": 2.382777,
+        "pipeline_medians": {
+          "commit_groups": 11689,
+          "commit_buffers": 11720,
+          "commit_bytes": 815988736,
+          "sync_count": 2531,
+          "fdatasync_ns": 1099797028,
+          "frontier_writes": 0,
+          "frontier_bytes": 0,
+          "frontier_write_ns": 0,
+          "preallocation_ns": 2388745,
+          "wal_sync_wait_ns": 9749416521,
+          "memtable_insert_ns": 3515981688
+        }
+      }
+    },
+    "ext4-batch8/concurrent_batch_64/v7": {
+      "old_v7": {
+        "median_rate": 382006.06768251077,
+        "median_cpu_ms": 3860.648,
+        "median_peak_rss_kib": 927284,
+        "peak_rate": 435334.45101177675,
+        "peak_run_id": "1793067966421",
+        "peak_raw_sha256": "ac5c596f7aedfe96ef94a47057b08820f61ecd294fc3d94613135961eb21afe5",
+        "binary_sha256": "e7f7712825d2166c14b5b67601388a8e29697f8fc034832e457061cf6e30ae19",
+        "median_p99_ms": 2.995649,
+        "pipeline_medians": {
+          "commit_groups": 8346,
+          "commit_buffers": 11720,
+          "commit_bytes": 816021504,
+          "sync_count": 2282,
+          "fdatasync_ns": 752774406,
+          "frontier_writes": 2282,
+          "frontier_bytes": 9347072,
+          "frontier_write_ns": 266088356,
+          "preallocation_ns": 34264029,
+          "wal_sync_wait_ns": 12064787711,
+          "memtable_insert_ns": 1152565830
+        }
+      },
+      "new_v7": {
+        "median_rate": 95859.10574036934,
+        "median_cpu_ms": 6506.304,
+        "median_peak_rss_kib": 927312,
+        "peak_rate": 389906.96216306806,
+        "peak_run_id": "1793067781081",
+        "peak_raw_sha256": "f1029c57109dee5a47694bb6436544d5fffdf92de9136c15e6d3e89b1493902f",
+        "binary_sha256": "800bdc851fc2a4767a4cb56fbe81eb5d06dc3544c0784eb0da8d6b782be7f81d",
+        "median_p99_ms": 18.5506,
+        "pipeline_medians": {
+          "commit_groups": 9486,
+          "commit_buffers": 11720,
+          "commit_bytes": 816021504,
+          "sync_count": 2582,
+          "fdatasync_ns": 2904141429,
+          "frontier_writes": 2582,
+          "frontier_bytes": 10575872,
+          "frontier_write_ns": 2330145713,
+          "preallocation_ns": 969075791,
+          "wal_sync_wait_ns": 56911395018,
+          "memtable_insert_ns": 1620683381
+        }
+      }
+    }
+  }
+}

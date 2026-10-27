@@ -1,0 +1,22 @@
+{
+  "assessment_passed": false,
+  "source_retained": false,
+  "allocator_unchanged": true,
+  "memtable_unchanged": true,
+  "captured_cells": [
+    "ext4-point8",
+    "ext4-batch8"
+  ],
+  "cancelled_cells": [
+    "ext4-point1",
+    "ext4-batch1",
+    "ext4-point16",
+    "ext4-batch16",
+    "confirmation-point8",
+    "confirmation-batch8"
+  ],
+  "reason": "Batch8 fails the predeclared separate-arm median-throughput floor; paired raw+1.1%,CPU+1.4%,p99+8.7%,highest-10.4%. Point8 passes with lower variability but highest-2.6%. No failed guard is waived.",
+  "superseded_by": "rfc-025-v7-ssd-two-chunk-lookahead-20261027",
+  "restoration_scope": "Historical: exact baseline source and e7 executable restored before trying a different source policy.",
+  "publication": "No source commit, PR or push."
+}

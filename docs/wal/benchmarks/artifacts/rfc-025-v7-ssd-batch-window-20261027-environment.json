@@ -1,0 +1,23 @@
+{
+  "source_base": "53f48459b15ae96d50df39ab0f5e7586579206fc",
+  "rustc": "rustc 1.100.0-nightly (6bb1652a0 2026-09-22)\nbinary: rustc\ncommit-hash: 6bb1652a020e80cef79332741d89e996d71933c9\ncommit-date: 2026-09-22\nhost: x86_64-unknown-linux-gnu\nrelease: 1.100.0-nightly\nLLVM version: 23.1.1\n",
+  "kernel": "Linux 6.12.71-1-lts #1 SMP PREEMPT_DYNAMIC Fri, 13 Feb 2026 19:12:56 +0000 x86_64",
+  "mount": "ext4 /dev/nvme0n1p3 rw,relatime",
+  "queue": {
+    "max_hw_sectors_kb": "512",
+    "max_sectors_kb": "512",
+    "physical_block_size": "512",
+    "max_segments": "128",
+    "nr_requests": "255"
+  },
+  "source_manifest_sha256": "aa82fc48bbe344da5434fb5a21a32c882848a23bd1db593cc93acacd7732ca30",
+  "patch_sha256": "088b35cf32bcd6bcbe981fd62c2fe157e4f5247d017683d39bccb9d7cc1aa4d0",
+  "plan_sha256": "e2d0b15c7da9cb7077b5661c8696b14b6283890aedefd432a42eed307f7c8c20",
+  "allocator_environment_overrides": [],
+  "created_at_utc": "2026-10-27T03:01:04.395221+00:00",
+  "candidate": "Batch-specific v7 800us slow-sync coalescing",
+  "hardware_metadata_origin": "Same host/mount/kernel as preceding trials; no device settings changed.",
+  "matrix_sha256": "1661fe89bdf7404069cd8dbbdb17c4e6237012908ee6551c78e156eaff9dd62f",
+  "driver_sha256": "68439ae9b55be95f847871ce0164db8702675ccbdd5460655e4eb67d378e1a73",
+  "baseline_profile_reuse": "rfc-025-v7-ssd-sync-preparation-20261027-profiles.json"
+}

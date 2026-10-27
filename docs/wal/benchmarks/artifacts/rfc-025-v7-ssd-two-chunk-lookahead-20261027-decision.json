@@ -1,0 +1,23 @@
+{
+  "source_base": "53f48459b15ae96d50df39ab0f5e7586579206fc",
+  "assessment_passed": false,
+  "source_retained": false,
+  "allocator_unchanged": true,
+  "memtable_unchanged": true,
+  "captured_cells": [
+    "ext4-point8",
+    "ext4-batch8"
+  ],
+  "cancelled_cells": [
+    "ext4-point1",
+    "ext4-batch1",
+    "ext4-point16",
+    "ext4-batch16",
+    "confirmation-point8",
+    "confirmation-batch8"
+  ],
+  "reason": "Point8 fails separate-arm throughput and paired p99 guards. Batch8 paired throughput -1.35%, CPU -0.78%, p99 -4.56% passes regression guards but shows no material gain. The fixed screen fails; all downstream stages are cancelled.",
+  "superseded_by": "rfc-025-v7-ssd-batch-window-20261027",
+  "restoration_scope": "Historical: exact baseline restored before separate batch-window experiment.",
+  "publication": "No source commit, PR or push."
+}

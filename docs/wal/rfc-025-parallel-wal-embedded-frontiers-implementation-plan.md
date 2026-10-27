@@ -2699,6 +2699,18 @@ and executable identities remain. SkipMap and System stay selected, and the
 kept SSD runtime remains byte-identical. No SSD benefit or Stage 8 qualification
 is inferred from these CPU measurements.
 
+The [SSD extent and batch follow-up](benchmarks/rfc-025-v7-ssd-batch-and-extent-20261027.md)
+rejects 128/256-KiB background lookahead at the fixed point/batch screens. A separate
+large-batch v7 policy extends only slow-sync coalescing to 800 microseconds: paired
+batch8 throughput rises 3.3%, p99 falls 23.5%, and sync count falls 17.1%, but CPU
+rises 0.5%, missing the frozen no-CPU-increase material-gain rule. The v4 control
+also fails. Dependent cells are cancelled, the original SSD runtime is restored,
+and no source policy is adopted. All 100 scored records, 20 warmups, three excluded
+profiles, exact source/binary identities and failed controls remain. Extent
+prototypes pass 1,970 tests; the batch prototype passes 1,971 and restored source
+passes 1,969. This separates batch investigation from point tuning without
+qualifying v4 parity or Stage 8.
+
 ## Delivery checklist
 
 - [ ] Stages 1–3: legacy compatibility, byte-exact codec, independent validation,
