@@ -1,0 +1,53 @@
+{
+  "note": "Raw scored peaks are descriptive, not retention evidence.",
+  "cells": {
+    "ext4-batch16/concurrent_batch_64/v7": {
+      "old_v7": {
+        "median_rate": 97647.68756925444,
+        "median_cpu_ms": 7176.785,
+        "median_peak_rss_kib": 928944,
+        "peak_rate": 437384.82298073097,
+        "peak_run_id": "1793117176207",
+        "peak_raw_sha256": "f6ed6c6186bcb4c3b972fe3d306d137ce630e3a3e9dcbacfa14e0d10af02b700",
+        "binary_sha256": "e9abcc91b499c3cecd0acc137a0c9b8f65228b76ac3cb31ba3894bf9a0d06d40",
+        "median_p99_ms": 31.966727,
+        "pipeline_medians": {
+          "commit_groups": 7790,
+          "commit_buffers": 11728,
+          "commit_bytes": 816054272,
+          "sync_count": 1287,
+          "fdatasync_ns": 2046861181,
+          "frontier_writes": 1287,
+          "frontier_bytes": 5271552,
+          "frontier_write_ns": 2044331410,
+          "preallocation_ns": 2840368711,
+          "wal_sync_wait_ns": 106537225391,
+          "memtable_insert_ns": 1768392408
+        }
+      },
+      "new_v7": {
+        "median_rate": 456638.1991837706,
+        "median_cpu_ms": 4362.38,
+        "median_peak_rss_kib": 929368,
+        "peak_rate": 508635.0697741723,
+        "peak_run_id": "1793117164498",
+        "peak_raw_sha256": "b43b71fcd500d1f6be21b1ba7a86802598b31ed0a47a65ad24304e6cf5528d41",
+        "binary_sha256": "f353022d846530a6754330aaea11f295319ea8f4de20afa09b6d2a3b57b021d8",
+        "median_p99_ms": 8.322368,
+        "pipeline_medians": {
+          "commit_groups": 5570,
+          "commit_buffers": 11728,
+          "commit_bytes": 816054272,
+          "sync_count": 1312,
+          "fdatasync_ns": 528664739,
+          "frontier_writes": 1312,
+          "frontier_bytes": 5373952,
+          "frontier_write_ns": 110784935,
+          "preallocation_ns": 116148935,
+          "wal_sync_wait_ns": 19827639341,
+          "memtable_insert_ns": 1414000030
+        }
+      }
+    }
+  }
+}

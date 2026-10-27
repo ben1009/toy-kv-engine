@@ -36,6 +36,7 @@ the retained and rejected experiments.
 
 ## Benchmarks and qualification
 
+- [RFC 025 async dispatch for large v7 DATA (not retained; too few matched SSD pairs), 2026-10-27 UTC](benchmarks/rfc-025-v7-large-data-async-dispatch-20261027.md)
 - [RFC 025 large-wave FRONTIER allocation (not retained; filtered screen misses throughput/p99), 2026-10-27](benchmarks/rfc-025-v7-large-frontier-allocation-20261027.md)
 - [Current v4/v7 Parallel SSD comparison (stall-limited pairs and same-executable peaks), 2026-10-27](benchmarks/rfc-025-v7-current-v4-parallel-20261027.md)
 - [RFC 025 coalesce eligible v7 prefixes (retained for review; all four guards pass), 2026-10-27](benchmarks/rfc-025-v7-eligible-coalescing-20261027.md)

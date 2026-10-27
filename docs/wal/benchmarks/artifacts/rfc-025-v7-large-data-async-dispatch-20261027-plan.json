@@ -1,0 +1,19 @@
+{
+  "created_at_utc": "2026-10-27T16:00:04.259725+00:00",
+  "source_base": "48ae7a7ca3d2351045409a5fab49c93fe3eede0a",
+  "baseline": {
+    "path": "target/release/write-perf-v7-eligible-coalescing",
+    "sha256": "e9abcc91b499c3cecd0acc137a0c9b8f65228b76ac3cb31ba3894bf9a0d06d40"
+  },
+  "candidate": "On ext filesystems only, force v7 DATA writes of at least 64 KiB to use IOSQE_ASYNC. Pass a private optional size threshold to the dedicated I/O worker. V4, tmpfs, small DATA, FRONTIER writes, coalescing, and sync/ACK ordering retain their policies.",
+  "motivation": "Saved v7 timing locates substantial delay before DATA staging and kernel I/O delay. Earlier v4 native traces show forcing async shortens submission syscall time but can add helper handoff cost and was not retained. V7 has a separate FRONTIER coordinator and more framing work, so this is a new bounded v7/large/ext-only experiment, not a claimed general improvement.",
+  "scope": "One source candidate; local repo only. Validate and run a bounded SSD screen, dependent guards only after screen benefit. Preserve prior evidence; stop for review, no push/PR.",
+  "validation": "Extend the real O_DIRECT owned-ring test to exercise a large forced-async DATA write beside a small ordinary write, validate full completions and file bytes, and close the worker. Existing v7 large-batch, extent-growth, short-write, ambiguous-submission, ownership, poison and recovery coverage plus full checks outside the sandbox.",
+  "configuration": "Fresh local ext4 databases, 1KiB values, 2GiB SST, explicit v7 Parallel/no compaction. 750000 batch64 puts/sample10 at16,8,1writers;100000 point puts/sample100 at8writers. Host audit before/1Hz/after,30s initial cooldown,10s gaps, no concurrent build/test/source edit/profile.",
+  "schedule": "Two-arm warmups then5 alternating pairs for batch16 screen. If it improves both throughput and p99 on at least3 non-stall matched pairs, run batch8,point8,batch1 with2 warmups and3 alternating pairs each. No replacements or score-selected retries. Raw guard failure alone does not exclude or veto a source based on obvious storage stalls.",
+  "stall_policy": "Preserve every raw invocation. Predeclare an obvious-stall flag when mean FRONTIER-write >=1ms or mean fdatasync >=1.5ms, relative to observed quiet markers~20-150us and syncs~350us. Exclude a pair from the filtered comparison if either invocation is flagged. This conservative aggregate mask misses short outliers and cannot prove retained samples stall-free or distinguish source-induced I/O changes from environment. Report exclusions by arm and all raw ratios.",
+  "assessment": "Screen:>=3 filtered pairs, median paired throughput>1 and p99<1. Followups:>=2 filtered pairs, paired and arm-median throughput>=0.95 and paired p99<=1.10. Equal DATA bytes in all pairs. CPU/RSS diagnostic only. No extra test cases after a screen miss; restore baseline if insufficient evidence or failed guards. Any retention must state masked observations and source/environment ambiguity; no RFC adoption or v4 parity claim.",
+  "publication": "Keep accepted source in its own local commit, with evidence separate. For a failed or inconclusive candidate, evidence-only commit plus exact restoration.",
+  "prior_verification": "rfc-025-v7-large-frontier-allocation-20261027-verification.json",
+  "prior_global_invocations": 537
+}
