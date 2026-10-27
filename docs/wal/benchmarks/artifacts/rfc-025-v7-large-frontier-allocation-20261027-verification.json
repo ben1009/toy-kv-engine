@@ -1,0 +1,28 @@
+{
+  "source_base": "95eed41c17d5342a82b65239eebec1128d96bc31",
+  "reconstructed_candidate_inputs": 128,
+  "verified_restored_inputs": 128,
+  "retained_source_restored": true,
+  "verified_binaries": 2,
+  "summary_regenerates": true,
+  "records": 12,
+  "scored_records": 10,
+  "warmup_records": 2,
+  "global_unique_invocations": 537,
+  "full_archive_unique_invocations": 4633,
+  "filtered_pairs": 3,
+  "excluded_scored_pairs": 2,
+  "source_retained": false,
+  "candidate_tests": 1974,
+  "focused_tests": 20,
+  "restored_tests": 1972,
+  "restored_flaky_tests": [
+    "tests::simple_leveled_compaction::test_integration"
+  ],
+  "cpu_is_diagnostic": true,
+  "canonical_sha256": "e9abcc91b499c3cecd0acc137a0c9b8f65228b76ac3cb31ba3894bf9a0d06d40",
+  "prior_verification_sha256": "3a22ea5b28e4f66f8093cb336c2c8f2caaa8bcb5bc61e78371d3753195b26eb6",
+  "checks_sha256": "066588f6acd9fa6ba92500ae1de336f93bb3bd9665093562f2da21814885a5fd",
+  "decision_sha256": "1c1a9c78b371499e159c61f6c8819c0f933f1a9e87116354aacd253e72d56c95",
+  "verifier_sha256": "8a73b7fef985b04773e6fec16e9556b8b1df77449f0b0aec5447aa673b06b180"
+}

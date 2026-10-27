@@ -2781,6 +2781,15 @@ observes v7 throughput about 7–20% below v4 with unequal sample counts. No
 source or retained executable changes; all raw data remain and this lineage
 reaches 525 unique invocations.
 
+The [large-wave FRONTIER allocation screen](benchmarks/rfc-025-v7-large-frontier-allocation-20261027.md)
+tries skipping duplicate extent zeroing only after a known large-DATA wave.
+It is not retained: three matched sixteen-writer pairs after excluding two
+baseline stalls observe throughput -2.5%, p99 +10.3% and syncs +4.0%.
+Dependent cells are cancelled, all twelve invocations remain, and the accepted
+eligible-prefix source and executable are restored. Candidate checks pass
+1,974 tests; the restored source receives a full check. This lineage reaches
+537 unique invocations, with parity and adoption still unqualified.
+
 ## Delivery checklist
 
 - [ ] Stages 1–3: legacy compatibility, byte-exact codec, independent validation,

@@ -1,0 +1,139 @@
+--- a/kv-engine/src/wal/parallel/runtime.rs
++++ b/kv-engine/src/wal/parallel/runtime.rs
+@@ -2542,0 +2543 @@
++    initialize_extents: bool,
+@@ -2646 +2647 @@
+-        preallocate_runtime_for_write(inner, preallocation_end, frame_end, true)
++        preallocate_runtime_for_write(inner, preallocation_end, frame_end, initialize_extents)
+@@ -2780 +2781 @@
+-    let (target, durable, poison_ticket) = {
++    let (target, durable, poison_ticket, initialize_frontier_extents) = {
+@@ -2791 +2792,6 @@
+-        (target, state.durable_frontier, state.poison_ticket)
++        (
++            target,
++            state.durable_frontier,
++            state.poison_ticket,
++            !state.large_batch_wave,
++        )
+@@ -2798 +2804,11 @@
+-        let cycle = append_v7_frontier(sync_file, inner, target, durable, poison_ticket)?;
++        // Known large DATA waves initialize their own extents. Their marker
++        // can do the same instead of zeroing speculative DATA at the tail.
++        // Small or mixed waves retain the existing preparation policy.
++        let cycle = append_v7_frontier(
++            sync_file,
++            inner,
++            target,
++            durable,
++            poison_ticket,
++            initialize_frontier_extents,
++        )?;
+@@ -2950,2 +2966,2 @@
+-/// Active v7 writers also initialize that range before small DATA or FRONTIER
+-/// I/O. Large DATA groups initialize their own extents. Their shared cursor
++/// Active v7 writers also initialize that range before small DATA or their FRONTIER
++/// I/O. Large DATA groups and their FRONTIER initialize their own extents. Their shared cursor
+@@ -4603,0 +4620,102 @@
++    fn check_v7_frontier_initialization_policy(large_wave: bool) -> anyhow::Result<()> {
++        use crate::wal::v7::{
++            install::recover_and_install_active, recovery::WalV7RecoveryAuthority,
++        };
++
++        let directory = async_extent_test_directory()?;
++        let path = directory.path().join("frontier-preparation.wal");
++        let Some(V7RuntimeTestWal { wal, owner, anchor }) =
++            live_v7_test_wal(&path, super::MAX_WAL_FILE_SIZE, v7_test_resource_limits())?
++        else {
++            return Ok(());
++        };
++        let runtime = wal.parallel_runtime.as_ref().unwrap();
++        if runtime.inner.async_v7_extents.is_none() {
++            eprintln!("skipping FRONTIER extent test (ext filesystem unavailable)");
++            return Ok(());
++        }
++        // Control the real DATA completions while one speculative batch sits
++        // between the written prefix and its marker's allocation offset.
++        let mut packer = runtime.inner.packer_state.lock();
++        let value_len = if large_wave {
++            super::ALLOCATION_ONLY_MIN_BATCH_BYTES - 1
++        } else {
++            10
++        };
++        let batches = [v7_test_batch(1, value_len), v7_test_batch(2, value_len)];
++        for batch in &batches {
++            wal.put_v7_batch_with_index(batch, LIVE_WAL_V5_LIMITS)?;
++        }
++        let pending = std::mem::take(&mut runtime.inner.admission.lock().queue);
++        let mut pending = pending
++            .into_iter()
++            .map(|batch| prepare_test_v7_data(&runtime.inner, &mut packer, batch))
++            .collect::<anyhow::Result<std::collections::VecDeque<_>>>()?;
++        complete_test_v7_data(&runtime.inner, pending.pop_front().unwrap(), None)?;
++        assert_eq!(
++            runtime.inner.durability.state.lock().large_batch_wave,
++            large_wave
++        );
++
++        // Allocate without advancing the preparation cursor. A small-wave
++        // FRONTIER must still initialize this range; a large wave can skip
++        // zero I/O, letting the eventual full DATA/FRONTIER writes convert it.
++        super::preallocate(&runtime.inner.preallocator, super::PREALLOC_BLOCK)?;
++        let speculative_offset = pending.front().unwrap().0.file_offset;
++        let mut canary = super::DirectBuf::new(super::WAL_V7_FRAME_LEN);
++        canary.as_mut_slice().fill(0x5A);
++        canary.set_len(super::WAL_V7_FRAME_LEN);
++        runtime.inner.preallocator.write_all_at(
++            canary.initialized_slice(0, super::WAL_V7_FRAME_LEN),
++            speculative_offset,
++        )?;
++        assert!(
++            super::synchronize_written_prefix(&runtime.inner.preallocator, &runtime.inner)?
++                .is_some()
++        );
++        runtime.wait_durable(0)?;
++        assert_eq!(runtime.inner.durability.state.lock().durable_frontier, 1);
++        let mut observed = vec![0; super::WAL_V7_FRAME_LEN];
++        std::fs::File::open(&path)?.read_exact_at(&mut observed, speculative_offset)?;
++        assert_eq!(
++            observed,
++            vec![if large_wave { 0x5A } else { 0 }; observed.len()]
++        );
++
++        complete_test_v7_data(&runtime.inner, pending.pop_front().unwrap(), None)?;
++        assert!(
++            super::synchronize_written_prefix(&runtime.inner.preallocator, &runtime.inner)?
++                .is_some()
++        );
++        runtime.wait_durable(1)?;
++        packer.next_ticket = wal.next_ticket();
++        packer.reserved_end = runtime.logical_length();
++        packer.preallocated_end = std::fs::metadata(&path)?.len();
++        drop(packer);
++        wal.close()?;
++        assert_eq!(owner.snapshot().buffer_memory_bytes, 0);
++        drop(wal);
++        let recovered = recover_and_install_active(
++            &path,
++            WalV7RecoveryAuthority::Active {
++                predecessor: crate::pitr::ChainAnchor::Genesis {
++                    archive_epoch_id: crate::pitr::ArchiveEpochId(anchor.archive_epoch_id),
++                },
++                durable_anchors: vec![anchor],
++            },
++        )?;
++        assert_eq!(recovered.installed.batches, batches);
++
++        Ok(())
++    }
++
++    #[test]
++    fn v7_frontier_large_wave_preparation_skips_speculative_zeroing() -> anyhow::Result<()> {
++        check_v7_frontier_initialization_policy(true)
++    }
++
++    #[test]
++    fn v7_frontier_small_wave_keeps_extent_initialization() -> anyhow::Result<()> {
++        check_v7_frontier_initialization_policy(false)
++    }
++
