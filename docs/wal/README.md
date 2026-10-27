@@ -36,6 +36,7 @@ the retained and rejected experiments.
 
 ## Benchmarks and qualification
 
+- [RFC 025 BBTree memtable trial (CPU screen failed; SSD tests cancelled), 2026-10-27](benchmarks/rfc-025-bbtree-memtable-20261027.md)
 - [RFC 025 allocator retry after SSD improvements (not adopted), 2026-10-27](benchmarks/rfc-025-v7-mimalloc-ssd-followup-20261027.md)
 - [RFC 025 serial extent scheduling fix and 16-writer SSD results (local review; full gate failed), 2026-10-27](benchmarks/rfc-025-v7-serial-preparation-20261027.md)
 - [RFC 025 asynchronous v7 extent preparation (maintainer-retained; serial p99 follow-up), 2026-10-26–27](benchmarks/rfc-025-v7-async-extent-20261026.md)

@@ -2688,6 +2688,17 @@ System passes 1,969. All 90 scored records, 30 warmups, one excluded profile,
 1,453 clear audit samples, exact patch and saved identities remain. The retry
 does not qualify v4 parity or Stage 8.
 
+The [BBTree point-memtable trial](benchmarks/rfc-025-bbtree-memtable-20261027.md)
+improves point-read throughput 10.8% and one-writer publication 8.3%, but
+sixteen-writer publication loses 25.5% with 31.2% more whole-child CPU. Its
+excluded user-CPU profile places 37.0% of BBTree samples in contended node-version
+reads. The fixed CPU screen fails, so all six SSD cells are cancelled before
+execution. The prototype passes 1,973 tests; restored SkipMap passes 1,969.
+All 36 scored records, 12 warmup records, two excluded profiles, exact source
+and executable identities remain. SkipMap and System stay selected, and the
+kept SSD runtime remains byte-identical. No SSD benefit or Stage 8 qualification
+is inferred from these CPU measurements.
+
 ## Delivery checklist
 
 - [ ] Stages 1–3: legacy compatibility, byte-exact codec, independent validation,

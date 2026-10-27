@@ -1,0 +1,6 @@
+{
+  "reason": "The repository external diff renderer produced a human-readable side-by-side report instead of an applicable patch. Regenerated a zero-context unified patch from the exact frozen baseline/candidate snapshots; no Rust, binary, source manifest or measurements changed.",
+  "original_rendered_diff": "target/wal-opt/20261027-bbtree-investigation/initial-rendered-diff.txt",
+  "original_sha256": "ac57c44fc0a748bc21405df5aea6c72991aa13da179af2e487534627afee0d55",
+  "corrected_patch_sha256": "ecddf8b992aaf7bc68162a606f185253f6e8ae7362bf1c591daaea7074edf228"
+}

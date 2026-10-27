@@ -1,0 +1,125 @@
+{
+  "scope": "Highest scored throughput within each CPU cell and measurement, excluding warmups/profiles/history.",
+  "cells": {
+    "cpu-publish1/concurrent_batch_64/cpu": {
+      "old": {
+        "median_rate": 936434.5598740714,
+        "median_cpu_ms": 130.745,
+        "median_peak_rss_kib": 127220,
+        "peak_rate": 1046417.3469207835,
+        "peak_run_id": "1793065243894",
+        "peak_raw_sha256": "7f8106db589d36352bf5fba21c7439f4656934d3eadc172759eaac47993901d9",
+        "binary_sha256": "052f42f5bbea9b1e60982608163d87ed580155e74d537d30d50ea52469776fd9"
+      },
+      "new": {
+        "median_rate": 1010522.7144992608,
+        "median_cpu_ms": 122.03500000000001,
+        "median_peak_rss_kib": 133800,
+        "peak_rate": 1032453.0769176922,
+        "peak_run_id": "1793065250253",
+        "peak_raw_sha256": "9bcc600620c571c5812a153e4aaeb05ca65aeab45377e1e0440a19f74590998e",
+        "binary_sha256": "41eb17d001a5702be859636c6d1a56c2afb04de05edfd41726f6c586f22896e4"
+      }
+    },
+    "cpu-publish8/concurrent_batch_64/cpu": {
+      "old": {
+        "median_rate": 2917834.9069751925,
+        "median_cpu_ms": 279.693,
+        "median_peak_rss_kib": 125956,
+        "peak_rate": 3165579.8650633595,
+        "peak_run_id": "1793065272084",
+        "peak_raw_sha256": "f7b27f3d57bf9c2720c6c285e678568c3b56a711268a238a4d663f8a6c5422dc",
+        "binary_sha256": "052f42f5bbea9b1e60982608163d87ed580155e74d537d30d50ea52469776fd9"
+      },
+      "new": {
+        "median_rate": 3258757.536121209,
+        "median_cpu_ms": 248.661,
+        "median_peak_rss_kib": 133392,
+        "peak_rate": 3268483.141425435,
+        "peak_run_id": "1793065278313",
+        "peak_raw_sha256": "4c76142c36d63bd00fe947eef984b2dbb74656169f6028900867cf5fd76a431a",
+        "binary_sha256": "41eb17d001a5702be859636c6d1a56c2afb04de05edfd41726f6c586f22896e4"
+      }
+    },
+    "cpu-publish16/concurrent_batch_64/cpu": {
+      "old": {
+        "median_rate": 3414018.307400052,
+        "median_cpu_ms": 433.42099999999994,
+        "median_peak_rss_kib": 124968,
+        "peak_rate": 3551044.0566672767,
+        "peak_run_id": "1793065300102",
+        "peak_raw_sha256": "026de93c85ab41bb9e8c286e3833ce3e66d29a611fb379209e02f134da8239c1",
+        "binary_sha256": "052f42f5bbea9b1e60982608163d87ed580155e74d537d30d50ea52469776fd9"
+      },
+      "new": {
+        "median_rate": 2541751.0570380124,
+        "median_cpu_ms": 568.802,
+        "median_peak_rss_kib": 131856,
+        "peak_rate": 2949751.1368709602,
+        "peak_run_id": "1793065306322",
+        "peak_raw_sha256": "8641294ac994fd03225c6d511cfa13adde237f4b9e47c96bdd1e5c363ac37d62",
+        "binary_sha256": "41eb17d001a5702be859636c6d1a56c2afb04de05edfd41726f6c586f22896e4"
+      }
+    },
+    "cpu-read/point_get/cpu": {
+      "old": {
+        "median_rate": 441739.57915615186,
+        "median_cpu_ms": 1573.0240000000001,
+        "median_peak_rss_kib": 389380,
+        "peak_rate": 443414.0404737747,
+        "peak_run_id": "1793065322702",
+        "peak_raw_sha256": "3357b706406313d9b4b6b56fb46b0b601e4348737aa82f02a4a8ded7ff07a8d6",
+        "binary_sha256": "052f42f5bbea9b1e60982608163d87ed580155e74d537d30d50ea52469776fd9"
+      },
+      "new": {
+        "median_rate": 489456.863247442,
+        "median_cpu_ms": 1405.204,
+        "median_peak_rss_kib": 394360,
+        "peak_rate": 494154.24570355396,
+        "peak_run_id": "1793065345878",
+        "peak_raw_sha256": "fae67eb05d90f82962d44da7cf007544b90303a489ecf3672410c2167dcf9a96",
+        "binary_sha256": "41eb17d001a5702be859636c6d1a56c2afb04de05edfd41726f6c586f22896e4"
+      }
+    },
+    "cpu-scan/full_scan/cpu": {
+      "old": {
+        "median_rate": 1303288.0432484148,
+        "median_cpu_ms": 529.471,
+        "median_peak_rss_kib": 389036,
+        "peak_rate": 1336518.8636740202,
+        "peak_run_id": "1793065376301",
+        "peak_raw_sha256": "f5c7c8c0adc519e32192ca0b6300a3e161437016f99dc73e31628ec9ecffddcc",
+        "binary_sha256": "052f42f5bbea9b1e60982608163d87ed580155e74d537d30d50ea52469776fd9"
+      },
+      "new": {
+        "median_rate": 1315529.2412287812,
+        "median_cpu_ms": 533.297,
+        "median_peak_rss_kib": 394072,
+        "peak_rate": 1322138.4870785158,
+        "peak_run_id": "1793065380539",
+        "peak_raw_sha256": "f4b09ee98cbfaf72a3ccb8675cd41ea242966488a5a602cd1a7eb79aa4f8c863",
+        "binary_sha256": "41eb17d001a5702be859636c6d1a56c2afb04de05edfd41726f6c586f22896e4"
+      }
+    },
+    "cpu-scan/scan_10pct/cpu": {
+      "old": {
+        "median_rate": 1420287.2985553264,
+        "median_cpu_ms": 529.471,
+        "median_peak_rss_kib": 389036,
+        "peak_rate": 1459388.5016239346,
+        "peak_run_id": "1793065376301",
+        "peak_raw_sha256": "6a3a5951882ce2577ba1fb9ecba26228ae22bc1ae31d703a59e1b0e86ab2bfd8",
+        "binary_sha256": "052f42f5bbea9b1e60982608163d87ed580155e74d537d30d50ea52469776fd9"
+      },
+      "new": {
+        "median_rate": 1396012.4300946775,
+        "median_cpu_ms": 533.297,
+        "median_peak_rss_kib": 394072,
+        "peak_rate": 1436349.8787433433,
+        "peak_run_id": "1793065380539",
+        "peak_raw_sha256": "7b995bdb4332776238bf216cb00b27cdb0499dce05e3c6f0467f7891b3b54a7b",
+        "binary_sha256": "41eb17d001a5702be859636c6d1a56c2afb04de05edfd41726f6c586f22896e4"
+      }
+    }
+  }
+}

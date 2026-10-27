@@ -1,0 +1,30 @@
+{
+  "assessment_passed": false,
+  "source_retained": false,
+  "source_default_changed": false,
+  "allocator_unchanged": true,
+  "ssd_optimizations_preserved": true,
+  "reason": "CPU screen fails at16writers: paired publication throughput0.7445x and whole-processCPU1.3124x. Pointread+10.8%, other CPU phases pass. Per frozen staged plan, cancel all SSD cells before any SSD capture. Revert the optional prototype; no general conclusion about BBTree or native batch APIs.",
+  "cancelled_cells": [
+    "ext4-point8",
+    "ext4-batch8",
+    "ext4-point1",
+    "ext4-batch1",
+    "ext4-point16",
+    "ext4-batch16"
+  ],
+  "captured_cells": [
+    "cpu-publish1",
+    "cpu-publish8",
+    "cpu-publish16",
+    "cpu-read",
+    "cpu-scan"
+  ],
+  "records": 48,
+  "scored_records": 36,
+  "warmup_records": 12,
+  "invocations": 40,
+  "excluded_new_profiles": 2,
+  "incomplete_unscored_warmup_attempts": 1,
+  "publication": "Local evidence only, no PR/push/default adoption."
+}

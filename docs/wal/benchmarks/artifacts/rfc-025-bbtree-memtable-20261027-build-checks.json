@@ -1,0 +1,102 @@
+{
+  "outside_sandbox": true,
+  "checks": [
+    {
+      "phase": "selected full check",
+      "command": [
+        "cargo",
+        "make",
+        "check"
+      ],
+      "exit_code": 0,
+      "log": "target/wal-opt/20261027-bbtree-investigation/selected-check-final.log",
+      "log_sha256": "54f95be6ba06b1355d6a9d6965fab357cc65e8e75a733a3e3d06185a54188eb7"
+    },
+    {
+      "phase": "default-tests",
+      "command": [
+        "cargo",
+        "nextest",
+        "run",
+        "--offline",
+        "--locked",
+        "--workspace",
+        "--lib",
+        "--bins",
+        "--tests",
+        "--features",
+        "bench,chaos-testing,compaction-setsum,hotpath-profile",
+        "--retries",
+        "0"
+      ],
+      "exit_code": 0,
+      "log": "target/wal-opt/20261027-bbtree-investigation/default-tests.log",
+      "log_sha256": "93feac5a2d3ae4bfe1e58eb813db0c51ee529d160a9a7a6a1000c85036705924"
+    },
+    {
+      "phase": "skipmap-release",
+      "command": [
+        "cargo",
+        "build",
+        "--offline",
+        "--locked",
+        "--release",
+        "--package",
+        "kv-engine",
+        "--bin",
+        "write-perf",
+        "--features",
+        "bench"
+      ],
+      "exit_code": 0,
+      "log": "target/wal-opt/20261027-bbtree-investigation/skipmap-release.log",
+      "log_sha256": "e4344e1238de2aa5f98c3c1fdbc617c6342676b35a22afe6b6fb5fcda5143018"
+    },
+    {
+      "phase": "bbtree-release",
+      "command": [
+        "cargo",
+        "build",
+        "--offline",
+        "--locked",
+        "--release",
+        "--package",
+        "kv-engine",
+        "--bin",
+        "write-perf",
+        "--features",
+        "bench,bbtree-memtable"
+      ],
+      "exit_code": 0,
+      "log": "target/wal-opt/20261027-bbtree-investigation/bbtree-release.log",
+      "log_sha256": "92dbd8c2845edf665ab2a3cd23ea8ca60c7cfb63e6a063b5b3ee8f0d5dd73c84"
+    },
+    {
+      "command": [
+        "cargo",
+        "make",
+        "check"
+      ],
+      "phase": "restored full Rust check; spelling output required patch-format correction",
+      "exit_code": 0,
+      "log": "target/wal-opt/20261027-bbtree-investigation/restored-check.log",
+      "log_sha256": "848bba18ec35a45d1e8e4da4127e86f415875a752728cbdf9e1ebf79daa20678"
+    },
+    {
+      "phase": "final direct spelling",
+      "command": [
+        "typos"
+      ],
+      "exit_code": 0,
+      "log": "target/wal-opt/20261027-bbtree-investigation/final-typos.log",
+      "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    }
+  ],
+  "selected_tests": 1973,
+  "default_tests": 1969,
+  "skips": 0,
+  "retries": 0,
+  "slow_tests": 1,
+  "restored_tests": 1969,
+  "spelling_correction": "Rendered patch caused spelling errors despite the cargo-make task returning success; final direct typos check is required after patch correction."
+}

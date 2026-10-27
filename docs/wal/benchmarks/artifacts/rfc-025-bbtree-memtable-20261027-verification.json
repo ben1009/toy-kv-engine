@@ -1,0 +1,23 @@
+{
+  "source_base": "c6d4c3526fa234ac308c6509fdf36cbede20cd1e",
+  "reconstructed_inputs": 129,
+  "verified_binaries": 2,
+  "invocations": 40,
+  "records": 48,
+  "scored_records": 36,
+  "warmup_records": 12,
+  "excluded_profiles": 2,
+  "incomplete_unscored_warmup_attempts": 1,
+  "retained_unique_invocation_ids": 42,
+  "cancelled_ssd_cells": 6,
+  "recognized_process_samples": 133,
+  "source_reconstructs": true,
+  "summary_regenerates": true,
+  "default_restored": true,
+  "allocator_unchanged": true,
+  "ssd_optimizations_preserved": true,
+  "scratch_removed": true,
+  "checks_sha256": "d9e5fa47286cbb61b2d47661e6bb674e96368f02d92f46f5066135365b1eee78",
+  "decision_sha256": "ee9b103f4cce01b859cd319e777c38f4dc8f439b31bde2ff083f3e7ddf187e36",
+  "verifier_sha256": "da9fe64a5ee772b570ff990dcc851c695db54e84a1250d2e9a2238bb2701d40d"
+}

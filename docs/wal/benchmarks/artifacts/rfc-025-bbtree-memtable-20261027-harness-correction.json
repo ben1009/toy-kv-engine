@@ -1,0 +1,14 @@
+{
+  "reason": "First unscored CPU warmup completed, but the new harness incorrectly addressed engine phase instead of measurement. Assertion failed before raw/audit records were saved. No scored run occurred. Fixed schema handling and preserve stdout before parsing on every invocation.",
+  "raw_warmup_stdout_retained": false,
+  "completed_scored_runs_before_correction": 0,
+  "original_driver_sha256": "d2aebb7819f656553b2d21b8adaf95feb4f8d41e2e8a2c9e4c08baba464312ae",
+  "corrected_driver_sha256": "8fe37cea6d65b0666800666c5ddb3458357936b36c29c8363ca45b60d180a0fe",
+  "retained_files": {
+    "target/wal-opt/20261027-bbtree-investigation/excluded-initial-warmup/rfc-025-bbtree-memtable-20261027-cpu-publish1-runs.tsv": "f4aa829ca3a9d2d78a48aee6bcb7255af11a67ebef95c94e7daa26e34a0a0db8",
+    "target/wal-opt/20261027-bbtree-investigation/excluded-initial-warmup/rfc-025-bbtree-memtable-20261027-cpu-publish1.jsonl": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "target/wal-opt/20261027-bbtree-investigation/excluded-initial-warmup/cpu-publish1-warmup-0-old-rusage.json": "fa65edfddf9f89365673db242cf62e898f39d34a9aa017d105d588a4377e8182",
+    "target/wal-opt/20261027-bbtree-investigation/excluded-initial-warmup/cpu-publish1-warmup-0-old.stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "target/wal-opt/20261027-bbtree-investigation/excluded-initial-warmup/rfc-025-bbtree-memtable-20261027-cpu-publish1-host.jsonl": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  }
+}
