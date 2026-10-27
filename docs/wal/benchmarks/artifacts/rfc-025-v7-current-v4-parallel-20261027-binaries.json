@@ -1,0 +1,10 @@
+{
+  "v4": {
+    "path": "target/release/write-perf-v7-eligible-coalescing",
+    "sha256": "e9abcc91b499c3cecd0acc137a0c9b8f65228b76ac3cb31ba3894bf9a0d06d40"
+  },
+  "v7": {
+    "path": "target/release/write-perf-v7-eligible-coalescing",
+    "sha256": "e9abcc91b499c3cecd0acc137a0c9b8f65228b76ac3cb31ba3894bf9a0d06d40"
+  }
+}

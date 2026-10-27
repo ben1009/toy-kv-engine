@@ -1,0 +1,19 @@
+{
+  "outside_sandbox": true,
+  "reused_tests": 1972,
+  "reused_focused_tests": 6,
+  "reused_evidence": "rfc-025-v7-eligible-coalescing-20261027-verification.json",
+  "checks": [
+    {
+      "phase": "final spelling",
+      "command": [
+        "typos",
+        "--format",
+        "brief"
+      ],
+      "exit_code": 0,
+      "log": "target/wal-opt/20261027-v7-current-v4-parallel/final-spelling.log",
+      "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    }
+  ]
+}

@@ -2771,6 +2771,16 @@ storage-confounded. All 36 invocations and exact inputs remain, candidate
 checks pass 1,972 tests, and no RFC adoption or v4 parity is qualified. This
 measurement lineage now contains 489 unique invocations.
 
+The [fresh current-v4/v7 comparison](benchmarks/rfc-025-v7-current-v4-parallel-20261027.md)
+adds 36 fixed invocations from the same retained executable. The maintainer
+asks to ignore obvious stalls; combined-mask matched-pair counts are only
+0/2/1 for batch8/batch16/batch1, while point8 still has unresolved long tails
+below the mean-call thresholds. Stable parity remains unqualified. A labelled
+post-capture descriptive peak view, reusing matching earlier current-v7 runs,
+observes v7 throughput about 7–20% below v4 with unequal sample counts. No
+source or retained executable changes; all raw data remain and this lineage
+reaches 525 unique invocations.
+
 ## Delivery checklist
 
 - [ ] Stages 1–3: legacy compatibility, byte-exact codec, independent validation,

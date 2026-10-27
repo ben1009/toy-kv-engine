@@ -1,0 +1,13 @@
+{
+  "source_base": "89648122b82f5e5f9e8992ab74864e00de235f30",
+  "source_commit": "d5d23e95553e95cd06f637c48d98ada75c10d56f",
+  "kernel": "6.12.71-1-lts",
+  "filesystem": "/dev/nvme0n1p3[/liu/proj/toy-kv-engine] ext4 rw,nosuid,nodev,relatime",
+  "allocator_environment_overrides": {},
+  "source_manifest_sha256": "d75f83a903f43816fd72afe7b7b8e7bb058ab0d9863195b3e449ef99e4301396",
+  "binaries_sha256": "eee3d5a9731017b3cd7578729834a334660b39d4ac72ab6b2e8fbadd69aba30f",
+  "plan_sha256": "8e2cf906fea150eee09279bd4f906a51637ebd444d41e8cf786042d6ce11b689",
+  "matrix_sha256": "a18f8efb63904bf3d25f1fbde5fcaeae7daac057e00551fb432d3dc51bc98daf",
+  "driver_sha256": "5c5f4f102be0c68aac2b921a499c1fc1bc52241f9de2579483272ecd7be5cc53",
+  "prior_verification_sha256": "1196b42fe011d4c587f8020993e02f4267a4df6dee4524381c78bdc17efc44aa"
+}

@@ -36,6 +36,7 @@ the retained and rejected experiments.
 
 ## Benchmarks and qualification
 
+- [Current v4/v7 Parallel SSD comparison (stall-limited pairs and same-executable peaks), 2026-10-27](benchmarks/rfc-025-v7-current-v4-parallel-20261027.md)
 - [RFC 025 coalesce eligible v7 prefixes (retained for review; all four guards pass), 2026-10-27](benchmarks/rfc-025-v7-eligible-coalescing-20261027.md)
 - [RFC 025 one coalescing deadline across retries (not retained; eight-writer throughput loss), 2026-10-27](benchmarks/rfc-025-v7-coalescing-deadline-20261027.md)
 - [RFC 025 sixteen-writer tail: separated stalls and repeated coalescing, 2026-10-27](benchmarks/rfc-025-v7-16-writer-tail-diagnosis-20261027.md)
