@@ -68,6 +68,7 @@ const ALLOCATION_ONLY_MIN_BATCH_BYTES: usize = 64 * 1024;
 const SYNC_COALESCE_WAIT: Duration = Duration::from_micros(400);
 const SYNC_COALESCE_MIN_SYNC: Duration = Duration::from_micros(100);
 const V7_FAST_SYNC_COALESCE_WAIT: Duration = Duration::from_micros(100);
+const V7_LARGE_BATCH_COALESCE_WAIT: Duration = Duration::from_micros(800);
 
 #[derive(Debug)]
 pub(crate) struct WalFull;
@@ -641,6 +642,10 @@ struct WalV7FrontierCycle {
 struct DurabilityState {
     written_frontier: u64,
     durable_frontier: u64,
+    // A conservative batching hint for the contiguous, unsynced wave. Only
+    // single-ticket completions prove the size of every logical batch;
+    // multi-ticket groups and small batches disable the longer wait.
+    large_batch_wave: bool,
     poison_ticket: Option<u64>,
     poison_error: Option<String>,
     completed: BTreeMap<u64, GroupWriteResult>,
@@ -2247,11 +2252,10 @@ fn run_sync_coordinator(
         #[cfg(all(test, feature = "chaos-testing"))]
         crate::chaos::failpoint::before_parallel_wal_result_drain();
         drain_ready_results(&inner, &completions);
-        let coalesce_wait = match last_sync_latency {
-            Some(latency) if latency >= SYNC_COALESCE_MIN_SYNC => Some(SYNC_COALESCE_WAIT),
-            Some(_) if v7_layout => Some(V7_FAST_SYNC_COALESCE_WAIT),
-            _ => None,
-        };
+        let large_batch_wave = v7_layout
+            && last_sync_latency.is_some_and(|latency| latency >= SYNC_COALESCE_MIN_SYNC)
+            && inner.durability.state.lock().large_batch_wave;
+        let coalesce_wait = sync_coalesce_wait(last_sync_latency, v7_layout, large_batch_wave);
         if let Some(wait) = coalesce_wait {
             coalesce_admitted_prefix(&inner, &completions, wait);
             // Coalescing may return at its captured admission cutoff while
@@ -2272,6 +2276,24 @@ fn run_sync_coordinator(
     synchronize_written_prefix(&sync_file, &inner)?;
 
     Ok(())
+}
+
+fn sync_coalesce_wait(
+    last_sync_latency: Option<Duration>,
+    v7_layout: bool,
+    large_batch_wave: bool,
+) -> Option<Duration> {
+    match last_sync_latency {
+        Some(latency) if latency >= SYNC_COALESCE_MIN_SYNC => {
+            Some(if v7_layout && large_batch_wave {
+                V7_LARGE_BATCH_COALESCE_WAIT
+            } else {
+                SYNC_COALESCE_WAIT
+            })
+        }
+        Some(_) if v7_layout => Some(V7_FAST_SYNC_COALESCE_WAIT),
+        _ => None,
+    }
 }
 
 fn coalesce_admitted_prefix(
@@ -2399,6 +2421,10 @@ fn process_group_result(inner: &RuntimeInner, result: GroupWriteResult) {
         {
             break;
         }
+        let single_large_batch = completed.tickets.end == completed.tickets.start.saturating_add(1)
+            && completed.write_bytes >= ALLOCATION_ONLY_MIN_BATCH_BYTES as u64;
+        state.large_batch_wave = single_large_batch
+            && (state.written_frontier == state.durable_frontier || state.large_batch_wave);
         state.written_frontier = completed.tickets.end;
     }
     debug_assert!(state.durable_frontier <= state.written_frontier);
@@ -4223,6 +4249,165 @@ mod tests {
                 error,
             },
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn large_batch_coalescing_preserves_point_v4_and_fast_sync_policy() {
+        use std::time::Duration;
+
+        for v7 in [false, true] {
+            for large in [false, true] {
+                assert_eq!(super::sync_coalesce_wait(None, v7, large), None);
+                assert_eq!(
+                    super::sync_coalesce_wait(Some(Duration::from_micros(99)), v7, large),
+                    v7.then_some(super::V7_FAST_SYNC_COALESCE_WAIT)
+                );
+                let expected = if v7 && large {
+                    super::V7_LARGE_BATCH_COALESCE_WAIT
+                } else {
+                    super::SYNC_COALESCE_WAIT
+                };
+                assert_eq!(
+                    super::sync_coalesce_wait(Some(Duration::from_micros(100)), v7, large),
+                    Some(expected)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn v7_large_batch_wave_follows_contiguous_completion_and_durable_cutoffs() -> anyhow::Result<()>
+    {
+        use crate::wal::v7::{
+            install::recover_and_install_active, recovery::WalV7RecoveryAuthority,
+        };
+
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("large-batch-wave.wal");
+        let Some(V7RuntimeTestWal { wal, owner, anchor }) =
+            live_v7_test_wal(&path, super::MAX_WAL_FILE_SIZE, v7_test_resource_limits())?
+        else {
+            return Ok(());
+        };
+        let runtime = wal.parallel_runtime.as_ref().unwrap();
+        // Own the packer while injecting real encoded DATA completions. The
+        // coordinator remains idle because no I/O groups are submitted to it.
+        let mut packer = runtime.inner.packer_state.lock();
+        let batches: Vec<_> = (0..7)
+            .map(|ticket| v7_test_batch(ticket + 1, if ticket == 2 { 10 } else { 64 * 1024 - 1 }))
+            .collect();
+        let mut pending = std::collections::VecDeque::new();
+        for batch in &batches[..2] {
+            wal.put_v7_batch_with_index(batch, LIVE_WAL_V5_LIMITS)?;
+            let admitted = runtime.inner.admission.lock().queue.pop_front().unwrap();
+            pending.push_back(prepare_test_v7_data(&runtime.inner, &mut packer, admitted)?);
+        }
+        let first = pending.pop_front().unwrap();
+        complete_test_v7_data(&runtime.inner, pending.pop_front().unwrap(), None)?;
+        {
+            let state = runtime.inner.durability.state.lock();
+            assert_eq!((state.written_frontier, state.durable_frontier), (0, 0));
+            assert!(
+                !state.large_batch_wave,
+                "out-of-order DATA cannot classify a prefix"
+            );
+        }
+        complete_test_v7_data(&runtime.inner, first, None)?;
+        {
+            let state = runtime.inner.durability.state.lock();
+            assert_eq!((state.written_frontier, state.durable_frontier), (2, 0));
+            assert!(state.large_batch_wave);
+        }
+        super::synchronize_written_prefix(&runtime.inner.preallocator, &runtime.inner)?;
+
+        for batch in &batches[2..4] {
+            wal.put_v7_batch_with_index(batch, LIVE_WAL_V5_LIMITS)?;
+            let admitted = runtime.inner.admission.lock().queue.pop_front().unwrap();
+            pending.push_back(prepare_test_v7_data(&runtime.inner, &mut packer, admitted)?);
+        }
+        complete_test_v7_data(&runtime.inner, pending.pop_front().unwrap(), None)?;
+        complete_test_v7_data(&runtime.inner, pending.pop_front().unwrap(), None)?;
+        {
+            let state = runtime.inner.durability.state.lock();
+            assert_eq!((state.written_frontier, state.durable_frontier), (4, 2));
+            assert!(
+                !state.large_batch_wave,
+                "a later large batch cannot hide a small one"
+            );
+        }
+        super::synchronize_written_prefix(&runtime.inner.preallocator, &runtime.inner)?;
+        for batch in &batches[4..] {
+            wal.put_v7_batch_with_index(batch, LIVE_WAL_V5_LIMITS)?;
+            let admitted = runtime.inner.admission.lock().queue.pop_front().unwrap();
+            pending.push_back(prepare_test_v7_data(&runtime.inner, &mut packer, admitted)?);
+        }
+        complete_test_v7_data(&runtime.inner, pending.pop_front().unwrap(), None)?;
+        assert!(runtime.inner.durability.state.lock().large_batch_wave);
+
+        // A multi-ticket CQE does not expose individual logical batch sizes.
+        // Even when these particular test batches are large, classify the
+        // group conservatively instead of using its average byte count.
+        let mut group_bytes = 0;
+        for (batch, prefix) in pending {
+            runtime
+                .inner
+                .admission
+                .lock()
+                .v7_prefixes
+                .insert(batch.ticket + 1, prefix);
+            super::preallocate_runtime(
+                &runtime.inner,
+                batch.file_offset + batch.aligned_len as u64,
+                false,
+            )?;
+            runtime.inner.preallocator.write_all_at(
+                batch
+                    .buffer
+                    .buffer
+                    .as_ref()
+                    .unwrap()
+                    .initialized_slice(0, batch.aligned_len),
+                batch.file_offset,
+            )?;
+            group_bytes += batch.aligned_len as u64;
+            super::WorkerBuffer::retire(batch.buffer, &runtime.inner.buffer_pool);
+        }
+        super::process_group_result(
+            &runtime.inner,
+            super::GroupWriteResult {
+                group_id: 5,
+                tickets: 5..7,
+                write_count: 2,
+                write_bytes: group_bytes,
+                error: None,
+            },
+        );
+        {
+            let state = runtime.inner.durability.state.lock();
+            assert_eq!((state.written_frontier, state.durable_frontier), (7, 4));
+            assert!(!state.large_batch_wave);
+        }
+        super::synchronize_written_prefix(&runtime.inner.preallocator, &runtime.inner)?;
+        packer.next_ticket = wal.next_ticket();
+        packer.reserved_end = runtime.logical_length();
+        packer.preallocated_end = std::fs::metadata(&path)?.len();
+        drop(packer);
+        wal.close()?;
+        assert_eq!(owner.snapshot().buffer_memory_bytes, 0);
+        drop(wal);
+
+        let recovered = recover_and_install_active(
+            &path,
+            WalV7RecoveryAuthority::Active {
+                predecessor: crate::pitr::ChainAnchor::Genesis {
+                    archive_epoch_id: crate::pitr::ArchiveEpochId(anchor.archive_epoch_id),
+                },
+                durable_anchors: vec![anchor],
+            },
+        )?;
+        assert_eq!(recovered.installed.batches, batches);
 
         Ok(())
     }
