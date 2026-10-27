@@ -1,0 +1,76 @@
+{
+  "created_at_utc": "2026-10-27T07:30:25.416163+00:00",
+  "purpose": "User-requested causal investigation of apparent8-writer gains and16-writer losses. Preserve the original buffer-reuse qualification failure; these instrumented diagnostics are excluded and cannot replace it. No additional engine optimization or adoption.",
+  "source_base": "3aca2bdb9b574e7d1c106aad12731db0c384191f",
+  "binary_identities": {
+    "baseline": {
+      "path": "target/release/write-perf-v7-batch-window",
+      "sha256": "f7fd96e5ca0ecaaaa23f59f135e7ce9430521f986834e5c95f2d32070e378d54"
+    },
+    "candidate": {
+      "path": "target/release/write-perf-v7-frontier-buffer-reuse",
+      "sha256": "02f733af9e7a7a26ac7905d309c117e976e39405eb7473d6c3845bc3dc069103"
+    }
+  },
+  "source_snapshot": "rfc-025-v7-frontier-buffer-reuse-20261027-source-sha256.tsv",
+  "evidence_trigger": "Third16-writer pair reaches577743/576255 puts/s with4.392/4.337ms p99, while another pair has only1.3% more syncs but57.5x marker latency.8-writer ratios reverse across rounds. Historical16 results also include wins.",
+  "schedule": [
+    {
+      "round": 1,
+      "arm": "baseline",
+      "writers": 8
+    },
+    {
+      "round": 1,
+      "arm": "baseline",
+      "writers": 16
+    },
+    {
+      "round": 1,
+      "arm": "candidate",
+      "writers": 16
+    },
+    {
+      "round": 1,
+      "arm": "candidate",
+      "writers": 8
+    },
+    {
+      "round": 2,
+      "arm": "candidate",
+      "writers": 8
+    },
+    {
+      "round": 2,
+      "arm": "candidate",
+      "writers": 16
+    },
+    {
+      "round": 2,
+      "arm": "baseline",
+      "writers": 16
+    },
+    {
+      "round": 2,
+      "arm": "baseline",
+      "writers": 8
+    }
+  ],
+  "configuration": {
+    "operations": 750000,
+    "batch": 64,
+    "value_bytes": 1024,
+    "sst_bytes": 2147483648,
+    "sample_every": 10,
+    "compaction": "none",
+    "wal_format": 7,
+    "wal_io": "parallel",
+    "initial_cooldown_seconds": 30,
+    "between_seconds": 15,
+    "sampler_period_seconds": 0.1
+  },
+  "instrumentation": "LD_PRELOAD diagnostic shim forwards synchronous WAL pwrite64/fdatasync/fallocate calls directly to their Linux syscalls, timestamps calls and records marker coordinates. One bounded pre-touched in-memory event array is flushed only at process exit; no trace-file I/O during measured writes. Parent samples block counters, I/O pressure, child worker wait channels/syscalls and task CPU ticks at100ms, retaining samples in memory until child exits. No kernel settings, firmware, allocator or global tracing settings change.",
+  "observer_limits": "Kernel syscall tracepoint access fails under current account. Sched_schedstats is0, so zero run-delay counters cannot establish absence of scheduling delays. No active NVMe hwmon/SMART polling during runs, because prior repo experiments identify polling as an interference source. Sampler/interposer perturbation makes all8 runs diagnostic only. I/O shim does not capture asynchronous DATA requests or all file metadata syscalls; block counters are whole-device and100ms sampling can miss short waits.",
+  "assessment": "Report all8 fixed diagnostics, including slow calls, per-round/per-binary8vs16 effects, marker/sync counts and latency distributions, extent write/lock overlap, device busy time, task states and CPU placement. Do not filter stall states, retry scores, infer SSD firmware cause from host timing, or claim a fast-pair comparison proves uniform nonregression. Stop after this bounded diagnostic for review.",
+  "outside_sandbox": true
+}

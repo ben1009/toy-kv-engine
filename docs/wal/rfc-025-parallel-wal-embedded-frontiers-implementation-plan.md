@@ -2735,6 +2735,21 @@ profiles remain. Each candidate passes 1,973 tests; restored kept source passes
 1,971. Existing `d7fbe1c9` / f7 batch behavior remains provisionally retained;
 this investigation adds no source change, parity or Stage 8 qualification.
 
+The [FRONTIER-buffer reuse experiment](benchmarks/rfc-025-v7-frontier-buffer-reuse-20261027.md)
+adds 32 invocations and passes 1,971 tests but is not retained: the raw batch16
+guards fail amid large unchanged-v4 variation, while its fastest matching pair
+is effectively tied. The maintainer asks to separate obvious stalls. The
+[sixteen-writer investigation](benchmarks/rfc-025-v7-16-writer-tail-diagnosis-20261027.md)
+therefore preserves all scores and adds 17 excluded captures, using the exact
+earlier retirement-hint source for the tail analysis. The final short-I/O
+diagnostic has p99 4.574 versus 4.605 ms; the previous +23.1% p99 does not
+reproduce. It finds 51 versus 20 physical-prefix eligibility retries and repeated
+coalescing windows after ineligible attempts, with 17.4% more successful syncs
+in the prototype. These are targets for a future bounded optimization, not
+qualification or proof of a fixed sixteen-writer regression. Retained f7 source
+and executable are restored; global invocation accounting reaches 433 without
+double-counting reused profiles. This slice adds evidence only.
+
 ## Delivery checklist
 
 - [ ] Stages 1–3: legacy compatibility, byte-exact codec, independent validation,

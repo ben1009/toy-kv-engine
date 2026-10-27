@@ -1,0 +1,40 @@
+[
+  {
+    "arm": "baseline",
+    "command": [
+      "cargo",
+      "build",
+      "--offline",
+      "--locked",
+      "--release",
+      "--package",
+      "kv-engine",
+      "--bin",
+      "write-perf",
+      "--features",
+      "bench"
+    ],
+    "exit_code": 0,
+    "log": "target/wal-opt/20261027-v7-ready-tail/baseline-release.log",
+    "log_sha256": "1b76da76a33786daa76cbedcb62799ef0399bda727d99418a73afdee80225d3d"
+  },
+  {
+    "arm": "retirement_hint",
+    "command": [
+      "cargo",
+      "build",
+      "--offline",
+      "--locked",
+      "--release",
+      "--package",
+      "kv-engine",
+      "--bin",
+      "write-perf",
+      "--features",
+      "bench"
+    ],
+    "exit_code": 0,
+    "log": "target/wal-opt/20261027-v7-ready-tail/retirement_hint-release.log",
+    "log_sha256": "bc65270b75a03ea6a8cddbf447dd9aae720ad46ad99b2b78c73069b1e0cca8f2"
+  }
+]

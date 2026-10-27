@@ -1,0 +1,17 @@
+{
+  "created_at_utc": "2026-10-27T07:03:06.780850+00:00",
+  "source_base": "3aca2bdb9b574e7d1c106aad12731db0c384191f",
+  "baseline": {
+    "path": "target/release/write-perf-v7-batch-window",
+    "sha256": "f7fd96e5ca0ecaaaa23f59f135e7ce9430521f986834e5c95f2d32070e378d54"
+  },
+  "candidate": "Lazily allocate one coordinator-owned aligned FRONTIER scratch buffer and reuse it only after each synchronous write/sync cycle completes. Re-encode the complete frame on every reuse. No per-group fields, deadline change, allocator switch, byte/hash/ACK or recovery change.",
+  "motivation": "Retained source allocates/frees a 4096-byte posix_memalign buffer for every FRONTIER on the sync path. Existing excluded f7 profiles record11719 markers at1writer,1662 at8,1315 at16. Packer SHA dominates CPU, but moving it or coalescing membership previously failed; this isolates an avoidable allocation on the commit path without claiming it dominates SSD time.",
+  "diagnostic_profile_reuse": "rfc-025-v7-batch-membership-20261027-profiles.json",
+  "scope": "One source candidate only; stop after its bounded comparison for review. Source base retains all earlier accepted optimizations. No push/PR.",
+  "validation": "Full outside-sandbox check, focused v7 wave/recapture/poison/short-marker/sync-failure tests. Extend real-cycle wave/recovery test to prove lazy allocation, stable pointer across cycles, dirty-buffer re-encoding, no-op reuse and exact recovery.",
+  "stages": "Batch8 screen first, then batch16, batch1, point8, independent batch8 confirmation. Four warmups plus3 alternating four-arm rounds per cell. Cancel dependent cells after a v7 throughput/p99/DATA failure; no retries or replacement slow runs.",
+  "assessment": "Every v7 stage requires paired and separate-arm median throughput>=0.95x, paired p99<=1.10x and equal DATA byte counts. Independent batch8 confirmation must improve throughput>1.00x and p99<1.00x. CPU/RSS/syncs/v4 controls diagnostic only; no CPU veto. Retain only if all stages complete and pass; else restore f7 source/executable and rebuild restored tests.",
+  "configuration": "Fresh local ext4 SSD databases;1KiB values,2GiB SST,explicitParallel,no compaction. Batch64=750000 puts/sample10;point8=100000 puts/sample100.30s initial cooldown,10s gaps. Host audits before/during1Hz/after. No build/test/profile/source edits during scores.",
+  "publication": "Retained source and evidence in separate local commits. If rejected, evidence-only commit. Preserve all raw observations, exact patch/build inputs/saved binary and restoration. Preserve prior evidence unchanged."
+}

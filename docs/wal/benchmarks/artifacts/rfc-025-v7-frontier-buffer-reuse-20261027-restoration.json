@@ -1,0 +1,15 @@
+{
+  "source_base": "3aca2bdb9b574e7d1c106aad12731db0c384191f",
+  "scope": "Final retained-source restoration after all excluded diagnostic builds",
+  "restored_at_utc": "2026-10-27T10:36:18.361422+00:00",
+  "source_hashes": {
+    "kv-engine/src/wal/parallel/runtime.rs": "81986cd243505af166add3a9acc4bd1a003e41aec6edcb77da5bdffc0dc2e647",
+    "kv-engine/src/wal/parallel/worker.rs": "b26fedc3a3966a47d5ee05f9fa07241730f60b7ff00b51b454235c13b1cf2970",
+    "kv-engine/src/bin/write-perf.rs": "1ab98aec3185b751207fd3ad8f29bea60078642db66b8c1eec1fac6edf9d7015"
+  },
+  "canonical_sha256": "f7fd96e5ca0ecaaaa23f59f135e7ce9430521f986834e5c95f2d32070e378d54",
+  "source_mtimes_refreshed": true,
+  "tests": 1971,
+  "restored_check": "target/wal-opt/20261027-v7-frontier-buffer-reuse/restored-check.log",
+  "limits": "The full restored check ran after restoring the identical retained bytes. Later diagnostic build finally blocks restored these same bytes and refreshed source mtimes. One unrelated compaction test needed a retry in that restored check. No diagnostic source is retained."
+}

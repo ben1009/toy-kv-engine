@@ -1,0 +1,274 @@
+--- a/kv-engine/src/wal/parallel/runtime.rs
++++ b/kv-engine/src/wal/parallel/runtime.rs
+@@ -2246,0 +2247 @@
++    let mut stage_trace = super::parallel_worker::WalStageTrace::new("frontier");
+@@ -2250,0 +2252,10 @@
++        if let Some(trace) = stage_trace.as_mut() {
++            trace.push([
++                4,
++                result.group_id,
++                result.tickets.end,
++                0,
++                0,
++                result.write_count as u64,
++            ]);
++        }
+@@ -2254,0 +2266,4 @@
++        if let Some(trace) = stage_trace.as_mut() {
++            let state = inner.durability.state.lock();
++            trace.push([5, 0, state.written_frontier, state.durable_frontier, 0, 0]);
++        }
+@@ -2260 +2275,23 @@
+-            coalesce_admitted_prefix(&inner, &completions, wait);
++            if let Some(trace) = stage_trace.as_mut() {
++                let state = inner.durability.state.lock();
++                trace.push([
++                    6,
++                    wait.as_nanos() as u64,
++                    state.written_frontier,
++                    state.durable_frontier,
++                    large_batch_wave as u64,
++                    last_sync_latency.map_or(0, |d: Duration| d.as_nanos() as u64),
++                ]);
++            }
++            coalesce_admitted_prefix(&inner, &completions, wait, &mut stage_trace);
++            if let Some(trace) = stage_trace.as_mut() {
++                let state = inner.durability.state.lock();
++                trace.push([
++                    7,
++                    wait.as_nanos() as u64,
++                    state.written_frontier,
++                    state.durable_frontier,
++                    0,
++                    0,
++                ]);
++            }
+@@ -2267,2 +2304,18 @@
+-        }
+-        if let Some(latency) = synchronize_written_prefix(&sync_file, &inner)? {
++            if let Some(trace) = stage_trace.as_mut() {
++                let state = inner.durability.state.lock();
++                trace.push([8, 0, state.written_frontier, state.durable_frontier, 0, 0]);
++            }
++        }
++        let sync_result = synchronize_written_prefix(&sync_file, &inner, &mut stage_trace)?;
++        if let Some(trace) = stage_trace.as_mut() {
++            let state = inner.durability.state.lock();
++            trace.push([
++                9,
++                sync_result.is_some() as u64,
++                state.durable_frontier,
++                0,
++                0,
++                0,
++            ]);
++        }
++        if let Some(latency) = sync_result {
+@@ -2276 +2329 @@
+-    synchronize_written_prefix(&sync_file, &inner)?;
++    synchronize_written_prefix(&sync_file, &inner, &mut stage_trace)?;
+@@ -2302,0 +2356 @@
++    stage_trace: &mut Option<super::parallel_worker::WalStageTrace>,
+@@ -2346 +2400,17 @@
+-            Ok(result) => process_group_result(inner, result),
++            Ok(result) => {
++                if let Some(trace) = stage_trace.as_mut() {
++                    trace.push([
++                        10,
++                        result.group_id,
++                        result.tickets.end,
++                        0,
++                        0,
++                        result.write_count as u64,
++                    ]);
++                }
++                process_group_result(inner, result);
++                if let Some(trace) = stage_trace.as_mut() {
++                    let state = inner.durability.state.lock();
++                    trace.push([11, 0, state.written_frontier, state.durable_frontier, 0, 0]);
++                }
++            }
+@@ -2516,0 +2587 @@
++    stage_trace: &mut Option<super::parallel_worker::WalStageTrace>,
+@@ -2591,0 +2663,10 @@
++        if let Some(trace) = stage_trace.as_mut() {
++            trace.push([
++                3,
++                previous.frontier.generation.saturating_add(1),
++                target,
++                0,
++                reservation.frame_offset(),
++                0,
++            ]);
++        }
+@@ -2753 +2834,5 @@
+-fn synchronize_written_prefix(sync_file: &File, inner: &RuntimeInner) -> Result<Option<Duration>> {
++fn synchronize_written_prefix(
++    sync_file: &File,
++    inner: &RuntimeInner,
++    stage_trace: &mut Option<super::parallel_worker::WalStageTrace>,
++) -> Result<Option<Duration>> {
+@@ -2772 +2857,8 @@
+-        let cycle = append_v7_frontier(sync_file, inner, target, durable, poison_ticket)?;
++        let cycle = append_v7_frontier(
++            sync_file,
++            inner,
++            target,
++            durable,
++            poison_ticket,
++            stage_trace,
++        )?;
+@@ -4323 +4415 @@
+-        super::synchronize_written_prefix(&runtime.inner.preallocator, &runtime.inner)?;
++        super::synchronize_written_prefix(&runtime.inner.preallocator, &runtime.inner, &mut None)?;
+@@ -4340 +4432 @@
+-        super::synchronize_written_prefix(&runtime.inner.preallocator, &runtime.inner)?;
++        super::synchronize_written_prefix(&runtime.inner.preallocator, &runtime.inner, &mut None)?;
+@@ -4392 +4484 @@
+-        super::synchronize_written_prefix(&runtime.inner.preallocator, &runtime.inner)?;
++        super::synchronize_written_prefix(&runtime.inner.preallocator, &runtime.inner, &mut None)?;
+@@ -4464,2 +4556,6 @@
+-            super::synchronize_written_prefix(&runtime.inner.preallocator, &runtime.inner)?
+-                .is_some()
++            super::synchronize_written_prefix(
++                &runtime.inner.preallocator,
++                &runtime.inner,
++                &mut None
++            )?
++            .is_some()
+@@ -4511,2 +4607,6 @@
+-            super::synchronize_written_prefix(&runtime.inner.preallocator, &runtime.inner)?
+-                .is_some()
++            super::synchronize_written_prefix(
++                &runtime.inner.preallocator,
++                &runtime.inner,
++                &mut None
++            )?
++            .is_some()
+@@ -4547,2 +4647,6 @@
+-            super::synchronize_written_prefix(&runtime.inner.preallocator, &runtime.inner)?
+-                .is_none()
++            super::synchronize_written_prefix(
++                &runtime.inner.preallocator,
++                &runtime.inner,
++                &mut None
++            )?
++            .is_none()
+@@ -4563 +4667,5 @@
+-        let sync = super::synchronize_written_prefix(&runtime.inner.preallocator, &runtime.inner);
++        let sync = super::synchronize_written_prefix(
++            &runtime.inner.preallocator,
++            &runtime.inner,
++            &mut None,
++        );
+--- a/kv-engine/src/wal/parallel/worker.rs
++++ b/kv-engine/src/wal/parallel/worker.rs
+@@ -1819,0 +1820 @@
++    let mut stage_trace = WalStageTrace::new("data");
+@@ -1838,0 +1840 @@
++        &mut stage_trace,
+@@ -1897,0 +1900 @@
++    stage_trace: &mut Option<WalStageTrace>,
+@@ -1946,0 +1950,20 @@
++                if let Some(trace) = stage_trace.as_mut() {
++                    let group = core
++                        .groups
++                        .get(&submission.group_id)
++                        .expect("trace group exists");
++                    assert_eq!(
++                        group.tickets.end - group.tickets.start,
++                        group.request_ids.end - group.request_ids.start
++                    );
++                    let ticket =
++                        group.tickets.start + submission.request_id.0 - group.request_ids.start;
++                    trace.push([
++                        1,
++                        submission.request_id.0,
++                        ticket,
++                        group.tickets.end,
++                        submission.file_offset,
++                        submission.write_len as u64,
++                    ]);
++                }
+@@ -1963,0 +1987,5 @@
++            if let Some(trace) = stage_trace.as_mut() {
++                for (request, result) in &completed {
++                    trace.push([2, *request, 0, 0, 0, *result as i64 as u64]);
++                }
++            }
+@@ -3527,0 +3556,75 @@
++
++// Temporary diagnostic only. Buffers are local to one worker/coordinator and
++// are emitted at thread shutdown, outside the measured write interval.
++pub(crate) struct WalStageTrace {
++    path: std::path::PathBuf,
++    events: Vec<[u64; 7]>,
++}
++
++impl WalStageTrace {
++    pub(crate) fn new(role: &str) -> Option<Self> {
++        let path = std::env::var_os("KV_WAL_STAGE_TRACE")?;
++        // SAFETY: gettid has no arguments and returns this live thread's ID.
++        let tid = unsafe { libc::syscall(libc::SYS_gettid) };
++        Some(Self {
++            path: std::path::PathBuf::from(format!(
++                "{}.{}.{}.csv",
++                std::path::Path::new(&path).display(),
++                role,
++                tid
++            )),
++            events: Vec::with_capacity(32768),
++        })
++    }
++
++    pub(crate) fn push(&mut self, fields: [u64; 6]) {
++        let mut time = std::mem::MaybeUninit::<libc::timespec>::uninit();
++        // SAFETY: CLOCK_MONOTONIC initializes the writable timespec on success.
++        assert_eq!(
++            unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, time.as_mut_ptr()) },
++            0
++        );
++        // SAFETY: the call above succeeded.
++        let time = unsafe { time.assume_init() };
++        self.events.push([
++            fields[0],
++            fields[1],
++            fields[2],
++            fields[3],
++            fields[4],
++            fields[5],
++            time.tv_sec as u64 * 1_000_000_000 + time.tv_nsec as u64,
++        ]);
++    }
++}
++
++impl Drop for WalStageTrace {
++    fn drop(&mut self) {
++        use std::io::Write;
++        if self.events.is_empty() {
++            return;
++        }
++        let result = (|| -> std::io::Result<()> {
++            let file = std::fs::OpenOptions::new()
++                .write(true)
++                .create_new(true)
++                .open(&self.path)?;
++            let mut output = std::io::BufWriter::new(file);
++            writeln!(
++                output,
++                "event,request,ticket,group_end,offset,length,time_ns"
++            )?;
++            for r in &self.events {
++                writeln!(
++                    output,
++                    "{},{},{},{},{},{},{}",
++                    r[0], r[1], r[2], r[3], r[4], r[5], r[6]
++                )?;
++            }
++            output.flush()
++        })();
++        if let Err(error) = result {
++            eprintln!("stage trace emission failed: {error}");
++        }
++    }
++}

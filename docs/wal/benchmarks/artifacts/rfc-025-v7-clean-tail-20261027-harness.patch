@@ -1,0 +1,119 @@
+--- a/kv-engine/src/bin/write-perf.rs
++++ b/kv-engine/src/bin/write-perf.rs
+@@ -3479,0 +3480,21 @@
++#[derive(Serialize)]
++struct WalBatchTraceSample {
++    client: usize,
++    first_key: usize,
++    batch_index: usize,
++    start_ns: u64,
++    end_ns: u64,
++}
++
++fn monotonic_trace_ns() -> u64 {
++    let mut time = std::mem::MaybeUninit::<libc::timespec>::uninit();
++    // SAFETY: CLOCK_MONOTONIC initializes the supplied timespec on success.
++    assert_eq!(
++        unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, time.as_mut_ptr()) },
++        0
++    );
++    // SAFETY: the call above succeeded.
++    let time = unsafe { time.assume_init() };
++    time.tv_sec as u64 * 1_000_000_000 + time.tv_nsec as u64
++}
++
+@@ -3501,0 +3523,2 @@
++    let batch_trace_path = std::env::var_os("KV_WAL_BATCH_TRACE").map(PathBuf::from);
++    let trace_enabled = batch_trace_path.is_some();
+@@ -3512,11 +3535,39 @@
+-        handles.push(std::thread::spawn(move || -> Result<Vec<u64>> {
+-            let thread_ops = per_thread + usize::from(t < remainder);
+-            let start_idx = t * per_thread + remainder.min(t);
+-            let mut next = 0usize;
+-            let mut batch_index = 0usize;
+-            let mut latency_samples = Vec::new();
+-            while next < thread_ops {
+-                let current_batch = (thread_ops - next).min(batch_size);
+-                let mut keys = Vec::with_capacity(current_batch);
+-                for i in 0..current_batch {
+-                    keys.push(format!("key{:08}", start_idx + next + i).into_bytes());
++        handles.push(std::thread::spawn(
++            move || -> Result<(Vec<u64>, Vec<WalBatchTraceSample>)> {
++                let thread_ops = per_thread + usize::from(t < remainder);
++                let start_idx = t * per_thread + remainder.min(t);
++                let mut next = 0usize;
++                let mut batch_index = 0usize;
++                let mut latency_samples = Vec::new();
++                let mut trace_samples = Vec::new();
++                while next < thread_ops {
++                    let current_batch = (thread_ops - next).min(batch_size);
++                    let mut keys = Vec::with_capacity(current_batch);
++                    for i in 0..current_batch {
++                        keys.push(format!("key{:08}", start_idx + next + i).into_bytes());
++                    }
++                    let batch: Vec<_> = keys
++                        .iter()
++                        .map(|key| WriteBatchRecord::Put(key.as_slice(), val.as_slice()))
++                        .collect();
++                    let sample_start = sample_every
++                        .filter(|every| batch_index.is_multiple_of(*every))
++                        .map(|_| Instant::now());
++                    let trace_start =
++                        (trace_enabled && sample_start.is_some()).then(monotonic_trace_ns);
++                    eng.write_batch(&batch)?;
++                    let trace_end = trace_start.map(|_| monotonic_trace_ns());
++                    if let (Some(start_ns), Some(end_ns)) = (trace_start, trace_end) {
++                        trace_samples.push(WalBatchTraceSample {
++                            client: t,
++                            first_key: start_idx + next,
++                            batch_index,
++                            start_ns,
++                            end_ns,
++                        });
++                    }
++                    if let Some(sample_start) = sample_start {
++                        latency_samples.push(sample_start.elapsed().as_nanos() as u64);
++                    }
++                    next += current_batch;
++                    batch_index += 1;
+@@ -3524,16 +3575,3 @@
+-                let batch: Vec<_> = keys
+-                    .iter()
+-                    .map(|key| WriteBatchRecord::Put(key.as_slice(), val.as_slice()))
+-                    .collect();
+-                let sample_start = sample_every
+-                    .filter(|every| batch_index.is_multiple_of(*every))
+-                    .map(|_| Instant::now());
+-                eng.write_batch(&batch)?;
+-                if let Some(sample_start) = sample_start {
+-                    latency_samples.push(sample_start.elapsed().as_nanos() as u64);
+-                }
+-                next += current_batch;
+-                batch_index += 1;
+-            }
+-            Ok(latency_samples)
+-        }));
++                Ok((latency_samples, trace_samples))
++            },
++        ));
+@@ -3541,0 +3580 @@
++    let mut batch_trace_samples = Vec::new();
+@@ -3549 +3588,4 @@
+-            Ok(samples) => latency_samples.extend(samples),
++            Ok((samples, traces)) => {
++                latency_samples.extend(samples);
++                batch_trace_samples.extend(traces);
++            }
+@@ -3561,0 +3604,12 @@
++    if let Some(path) = batch_trace_path {
++        let file = fs::OpenOptions::new()
++            .write(true)
++            .create_new(true)
++            .open(path)?;
++        let mut output = std::io::BufWriter::new(file);
++        for sample in &batch_trace_samples {
++            serde_json::to_writer(&mut output, sample)?;
++            output.write_all(b"\n")?;
++        }
++        output.flush()?;
++    }

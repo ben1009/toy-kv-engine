@@ -1,0 +1,121 @@
+--- a/kv-engine/src/wal/parallel/runtime.rs
++++ b/kv-engine/src/wal/parallel/runtime.rs
+@@ -2248,0 +2249,3 @@
++    // One synchronous FRONTIER cycle owns this scratch at a time. Allocate
++    // lazily so idle and v4 coordinators retain no aligned frame allocation.
++    let mut frontier_frame = None;
+@@ -2268 +2271,2 @@
+-        if let Some(latency) = synchronize_written_prefix(&sync_file, &inner)? {
++        if let Some(latency) = synchronize_written_prefix(&sync_file, &inner, &mut frontier_frame)?
++        {
+@@ -2276 +2280 @@
+-    synchronize_written_prefix(&sync_file, &inner)?;
++    synchronize_written_prefix(&sync_file, &inner, &mut frontier_frame)?;
+@@ -2516,0 +2521 @@
++    frame: &mut Option<DirectBuf>,
+@@ -2592 +2597 @@
+-        let mut frame = DirectBuf::new(WAL_V7_FRAME_LEN);
++        let frame = frame.get_or_insert_with(|| DirectBuf::new(WAL_V7_FRAME_LEN));
+@@ -2753 +2758,5 @@
+-fn synchronize_written_prefix(sync_file: &File, inner: &RuntimeInner) -> Result<Option<Duration>> {
++fn synchronize_written_prefix(
++    sync_file: &File,
++    inner: &RuntimeInner,
++    frontier_frame: &mut Option<DirectBuf>,
++) -> Result<Option<Duration>> {
+@@ -2772 +2781,8 @@
+-        let cycle = append_v7_frontier(sync_file, inner, target, durable, poison_ticket)?;
++        let cycle = append_v7_frontier(
++            sync_file,
++            inner,
++            target,
++            durable,
++            poison_ticket,
++            frontier_frame,
++        )?;
+@@ -4301,0 +4318,13 @@
++        let mut frontier_frame = None;
++        assert!(
++            super::synchronize_written_prefix(
++                &runtime.inner.preallocator,
++                &runtime.inner,
++                &mut frontier_frame
++            )?
++            .is_none()
++        );
++        assert!(
++            frontier_frame.is_none(),
++            "no frame is allocated without a written prefix"
++        );
+@@ -4323 +4352,10 @@
+-        super::synchronize_written_prefix(&runtime.inner.preallocator, &runtime.inner)?;
++        super::synchronize_written_prefix(
++            &runtime.inner.preallocator,
++            &runtime.inner,
++            &mut frontier_frame,
++        )?;
++        let scratch_ptr = frontier_frame.as_ref().unwrap().as_ptr();
++        assert_eq!(scratch_ptr as usize % super::WAL_V7_FRAME_LEN, 0);
++        // Previous frame bytes are not an initialization guarantee: every
++        // reused frame must replace the full header/body/padding and CRC.
++        frontier_frame.as_mut().unwrap().as_mut_slice().fill(0xa5);
+@@ -4340 +4378,6 @@
+-        super::synchronize_written_prefix(&runtime.inner.preallocator, &runtime.inner)?;
++        super::synchronize_written_prefix(
++            &runtime.inner.preallocator,
++            &runtime.inner,
++            &mut frontier_frame,
++        )?;
++        assert_eq!(frontier_frame.as_ref().unwrap().as_ptr(), scratch_ptr);
+@@ -4392 +4435,6 @@
+-        super::synchronize_written_prefix(&runtime.inner.preallocator, &runtime.inner)?;
++        super::synchronize_written_prefix(
++            &runtime.inner.preallocator,
++            &runtime.inner,
++            &mut frontier_frame,
++        )?;
++        assert_eq!(frontier_frame.as_ref().unwrap().as_ptr(), scratch_ptr);
+@@ -4395,0 +4444,9 @@
++        assert!(
++            super::synchronize_written_prefix(
++                &runtime.inner.preallocator,
++                &runtime.inner,
++                &mut frontier_frame
++            )?
++            .is_none()
++        );
++        assert_eq!(frontier_frame.as_ref().unwrap().as_ptr(), scratch_ptr);
+@@ -4464,2 +4521,6 @@
+-            super::synchronize_written_prefix(&runtime.inner.preallocator, &runtime.inner)?
+-                .is_some()
++            super::synchronize_written_prefix(
++                &runtime.inner.preallocator,
++                &runtime.inner,
++                &mut None
++            )?
++            .is_some()
+@@ -4511,2 +4572,6 @@
+-            super::synchronize_written_prefix(&runtime.inner.preallocator, &runtime.inner)?
+-                .is_some()
++            super::synchronize_written_prefix(
++                &runtime.inner.preallocator,
++                &runtime.inner,
++                &mut None
++            )?
++            .is_some()
+@@ -4547,2 +4612,6 @@
+-            super::synchronize_written_prefix(&runtime.inner.preallocator, &runtime.inner)?
+-                .is_none()
++            super::synchronize_written_prefix(
++                &runtime.inner.preallocator,
++                &runtime.inner,
++                &mut None
++            )?
++            .is_none()
+@@ -4563 +4632,5 @@
+-        let sync = super::synchronize_written_prefix(&runtime.inner.preallocator, &runtime.inner);
++        let sync = super::synchronize_written_prefix(
++            &runtime.inner.preallocator,
++            &runtime.inner,
++            &mut None,
++        );

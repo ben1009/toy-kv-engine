@@ -1,0 +1,9 @@
+[
+  {
+    "phase": "format",
+    "exit_code": 1,
+    "reason": "Temporary helper inserted before module inner documentation; moved after existing items. No diagnostic uses this version.",
+    "log": "target/wal-opt/20261027-v7-ready-tail/baseline-format-attempt1.log",
+    "log_sha256": "681ff12f40c2636b3d7824520c87d66f6ea8b4aa132106e5ec1dc34b3425673a"
+  }
+]

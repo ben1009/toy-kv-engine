@@ -1,0 +1,10 @@
+{
+  "baseline": {
+    "path": "target/release/write-perf-v7-batch-window",
+    "sha256": "f7fd96e5ca0ecaaaa23f59f135e7ce9430521f986834e5c95f2d32070e378d54"
+  },
+  "candidate": {
+    "path": "target/release/write-perf-v7-frontier-buffer-reuse",
+    "sha256": "02f733af9e7a7a26ac7905d309c117e976e39405eb7473d6c3845bc3dc069103"
+  }
+}

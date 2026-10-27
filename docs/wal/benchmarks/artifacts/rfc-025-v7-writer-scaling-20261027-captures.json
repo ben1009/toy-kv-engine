@@ -1,0 +1,810 @@
+[
+  {
+    "round": 1,
+    "arm": "baseline",
+    "writers": 8,
+    "name": "round1-baseline-8writers",
+    "excluded_from_scoring": true,
+    "run_id": "1793086373334",
+    "command": [
+      "/home/liu/proj/toy-kv-engine/target/release/write-perf-v7-batch-window",
+      "--suite",
+      "legacy",
+      "--preset",
+      "smoke",
+      "--bench",
+      "wal_batch_concurrent",
+      "--wal",
+      "--wal-io-mode",
+      "parallel",
+      "--pitr",
+      "--pitr-format",
+      "v7",
+      "--num",
+      "750000",
+      "--threads",
+      "8",
+      "--wal-batch-size",
+      "64",
+      "--value-size",
+      "1024",
+      "--target-sst-size",
+      "2147483648",
+      "--compaction",
+      "none",
+      "--latency-sample-every",
+      "10",
+      "--output",
+      "json",
+      "--path",
+      "/home/liu/proj/toy-kv-engine/target/wal-opt/20261027-v7-writer-scaling/round1-baseline-8writers-db"
+    ],
+    "binary": {
+      "path": "target/release/write-perf-v7-batch-window",
+      "sha256": "f7fd96e5ca0ecaaaa23f59f135e7ce9430521f986834e5c95f2d32070e378d54"
+    },
+    "preload_library_sha256": "7bef6a9cfadc9c803f955fb96e86bd65f5bdebd07aab39184d283832bfe3e46b",
+    "io_trace_environment_key": "KV_WAL_IO_TRACE",
+    "raw_sha256": "b16b9619a7de6c68c6046fc94be9bbcbe990d657b34216003efc9cd39a0e7aae",
+    "samples": 229,
+    "audit_samples": 25,
+    "clean_sampled": true,
+    "sampling_errors": [],
+    "before": {
+      "time_utc": "2026-10-27T07:32:53.331126+00:00",
+      "competing": [],
+      "load_average": [
+        0.18505859375,
+        0.24951171875,
+        0.53466796875
+      ],
+      "cpu_jiffies": [
+        17901297,
+        4950,
+        8042922,
+        6379409115,
+        3356245,
+        1155238,
+        1421909,
+        0,
+        0,
+        0
+      ]
+    },
+    "after": {
+      "time_utc": "2026-10-27T07:33:17.309976+00:00",
+      "competing": [],
+      "load_average": [
+        0.64453125,
+        0.3486328125,
+        0.56201171875
+      ],
+      "cpu_jiffies": [
+        17902403,
+        4950,
+        8043343,
+        6379481945,
+        3358347,
+        1155299,
+        1421957,
+        0,
+        0,
+        0
+      ]
+    },
+    "returncode": 0,
+    "files": {
+      "target/wal-opt/20261027-v7-writer-scaling/round1-baseline-8writers-io.csv": "a7be809e4b8fa5b147f0889483701a5a50cb06dd559e5fc66cab9b602b0eb432",
+      "target/wal-opt/20261027-v7-writer-scaling/round1-baseline-8writers.stdout": "0725aa1e7205840f6f2a1fd2cde94ce94e4200ef62e08cb236041912a1373bdb",
+      "target/wal-opt/20261027-v7-writer-scaling/round1-baseline-8writers.stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "target/wal-opt/20261027-v7-writer-scaling/round1-baseline-8writers-samples.jsonl": "97de3d5d0c1a1b29454eca6a30cc2e0bfe0ebcf42da5bfc5e8ec3fe1cbea2771"
+    }
+  },
+  {
+    "round": 1,
+    "arm": "baseline",
+    "writers": 16,
+    "name": "round1-baseline-16writers",
+    "excluded_from_scoring": true,
+    "run_id": "1793086412345",
+    "command": [
+      "/home/liu/proj/toy-kv-engine/target/release/write-perf-v7-batch-window",
+      "--suite",
+      "legacy",
+      "--preset",
+      "smoke",
+      "--bench",
+      "wal_batch_concurrent",
+      "--wal",
+      "--wal-io-mode",
+      "parallel",
+      "--pitr",
+      "--pitr-format",
+      "v7",
+      "--num",
+      "750000",
+      "--threads",
+      "16",
+      "--wal-batch-size",
+      "64",
+      "--value-size",
+      "1024",
+      "--target-sst-size",
+      "2147483648",
+      "--compaction",
+      "none",
+      "--latency-sample-every",
+      "10",
+      "--output",
+      "json",
+      "--path",
+      "/home/liu/proj/toy-kv-engine/target/wal-opt/20261027-v7-writer-scaling/round1-baseline-16writers-db"
+    ],
+    "binary": {
+      "path": "target/release/write-perf-v7-batch-window",
+      "sha256": "f7fd96e5ca0ecaaaa23f59f135e7ce9430521f986834e5c95f2d32070e378d54"
+    },
+    "preload_library_sha256": "7bef6a9cfadc9c803f955fb96e86bd65f5bdebd07aab39184d283832bfe3e46b",
+    "io_trace_environment_key": "KV_WAL_IO_TRACE",
+    "raw_sha256": "32266ea413eb56da2eb7974abc28d36ec7e949be35cef4882fa6577e367829fa",
+    "samples": 268,
+    "audit_samples": 29,
+    "clean_sampled": true,
+    "sampling_errors": [],
+    "before": {
+      "time_utc": "2026-10-27T07:33:32.338247+00:00",
+      "competing": [],
+      "load_average": [
+        0.72265625,
+        0.38037109375,
+        0.568359375
+      ],
+      "cpu_jiffies": [
+        17902664,
+        4950,
+        8043456,
+        6379529602,
+        3358352,
+        1155319,
+        1421983,
+        0,
+        0,
+        0
+      ]
+    },
+    "after": {
+      "time_utc": "2026-10-27T07:34:00.710940+00:00",
+      "competing": [],
+      "load_average": [
+        1.12646484375,
+        0.5185546875,
+        0.609375
+      ],
+      "cpu_jiffies": [
+        17903982,
+        4950,
+        8043899,
+        6379616025,
+        3360662,
+        1155392,
+        1422043,
+        0,
+        0,
+        0
+      ]
+    },
+    "returncode": 0,
+    "files": {
+      "target/wal-opt/20261027-v7-writer-scaling/round1-baseline-16writers-io.csv": "1f1f24bfe1eb6746418527f544d32534b5c06a3ed66306039ffe9aa9cb86b4d7",
+      "target/wal-opt/20261027-v7-writer-scaling/round1-baseline-16writers.stdout": "ac6228da05702a2f44e2ecae8b4aa525591ce253c7a643658569a0bc1b78ff10",
+      "target/wal-opt/20261027-v7-writer-scaling/round1-baseline-16writers.stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "target/wal-opt/20261027-v7-writer-scaling/round1-baseline-16writers-samples.jsonl": "8e9aa768d6cf86fed7f8438bef44a00f37a0b33e9d72f7777a54851aa42ce94d"
+    }
+  },
+  {
+    "round": 1,
+    "arm": "candidate",
+    "writers": 16,
+    "name": "round1-candidate-16writers",
+    "excluded_from_scoring": true,
+    "run_id": "1793086455741",
+    "command": [
+      "/home/liu/proj/toy-kv-engine/target/release/write-perf-v7-frontier-buffer-reuse",
+      "--suite",
+      "legacy",
+      "--preset",
+      "smoke",
+      "--bench",
+      "wal_batch_concurrent",
+      "--wal",
+      "--wal-io-mode",
+      "parallel",
+      "--pitr",
+      "--pitr-format",
+      "v7",
+      "--num",
+      "750000",
+      "--threads",
+      "16",
+      "--wal-batch-size",
+      "64",
+      "--value-size",
+      "1024",
+      "--target-sst-size",
+      "2147483648",
+      "--compaction",
+      "none",
+      "--latency-sample-every",
+      "10",
+      "--output",
+      "json",
+      "--path",
+      "/home/liu/proj/toy-kv-engine/target/wal-opt/20261027-v7-writer-scaling/round1-candidate-16writers-db"
+    ],
+    "binary": {
+      "path": "target/release/write-perf-v7-frontier-buffer-reuse",
+      "sha256": "02f733af9e7a7a26ac7905d309c117e976e39405eb7473d6c3845bc3dc069103"
+    },
+    "preload_library_sha256": "7bef6a9cfadc9c803f955fb96e86bd65f5bdebd07aab39184d283832bfe3e46b",
+    "io_trace_environment_key": "KV_WAL_IO_TRACE",
+    "raw_sha256": "7a67fd3aaa25d03357ee35e70ddf3b9ae36f92fee20fa9efb56b529862399d9c",
+    "samples": 15,
+    "audit_samples": 4,
+    "clean_sampled": true,
+    "sampling_errors": [],
+    "before": {
+      "time_utc": "2026-10-27T07:34:15.736700+00:00",
+      "competing": [],
+      "load_average": [
+        0.87646484375,
+        0.4921875,
+        0.59912109375
+      ],
+      "cpu_jiffies": [
+        17904249,
+        4950,
+        8044020,
+        6379663640,
+        3360663,
+        1155414,
+        1422073,
+        0,
+        0,
+        0
+      ]
+    },
+    "after": {
+      "time_utc": "2026-10-27T07:34:17.245958+00:00",
+      "competing": [],
+      "load_average": [
+        0.87646484375,
+        0.4921875,
+        0.59912109375
+      ],
+      "cpu_jiffies": [
+        17904555,
+        4950,
+        8044099,
+        6379667978,
+        3360718,
+        1155420,
+        1422076,
+        0,
+        0,
+        0
+      ]
+    },
+    "returncode": 0,
+    "files": {
+      "target/wal-opt/20261027-v7-writer-scaling/round1-candidate-16writers-io.csv": "26739641657968aa89bed8748d643a9160d09ee0e4c53202b61783ba2b30fb06",
+      "target/wal-opt/20261027-v7-writer-scaling/round1-candidate-16writers.stdout": "1f0279884dbb8fda6dbd4f08842b02401f3f98e8d24ecba631a0af2f3a66a68b",
+      "target/wal-opt/20261027-v7-writer-scaling/round1-candidate-16writers.stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "target/wal-opt/20261027-v7-writer-scaling/round1-candidate-16writers-samples.jsonl": "4a4e3a4416338e635fddd9ef2386f686c640a4b6bfb0f60c83ecbbcfecd5ca0a"
+    }
+  },
+  {
+    "round": 1,
+    "arm": "candidate",
+    "writers": 8,
+    "name": "round1-candidate-8writers",
+    "excluded_from_scoring": true,
+    "run_id": "1793086472266",
+    "command": [
+      "/home/liu/proj/toy-kv-engine/target/release/write-perf-v7-frontier-buffer-reuse",
+      "--suite",
+      "legacy",
+      "--preset",
+      "smoke",
+      "--bench",
+      "wal_batch_concurrent",
+      "--wal",
+      "--wal-io-mode",
+      "parallel",
+      "--pitr",
+      "--pitr-format",
+      "v7",
+      "--num",
+      "750000",
+      "--threads",
+      "8",
+      "--wal-batch-size",
+      "64",
+      "--value-size",
+      "1024",
+      "--target-sst-size",
+      "2147483648",
+      "--compaction",
+      "none",
+      "--latency-sample-every",
+      "10",
+      "--output",
+      "json",
+      "--path",
+      "/home/liu/proj/toy-kv-engine/target/wal-opt/20261027-v7-writer-scaling/round1-candidate-8writers-db"
+    ],
+    "binary": {
+      "path": "target/release/write-perf-v7-frontier-buffer-reuse",
+      "sha256": "02f733af9e7a7a26ac7905d309c117e976e39405eb7473d6c3845bc3dc069103"
+    },
+    "preload_library_sha256": "7bef6a9cfadc9c803f955fb96e86bd65f5bdebd07aab39184d283832bfe3e46b",
+    "io_trace_environment_key": "KV_WAL_IO_TRACE",
+    "raw_sha256": "edf909f322bfcfcd701972aa72c0f77547e4a506d76893ba2d8f5bb82adcf98c",
+    "samples": 22,
+    "audit_samples": 5,
+    "clean_sampled": true,
+    "sampling_errors": [],
+    "before": {
+      "time_utc": "2026-10-27T07:34:32.260930+00:00",
+      "competing": [],
+      "load_average": [
+        0.681640625,
+        0.46728515625,
+        0.5888671875
+      ],
+      "cpu_jiffies": [
+        17904811,
+        4950,
+        8044195,
+        6379715604,
+        3360719,
+        1155438,
+        1422101,
+        0,
+        0,
+        0
+      ]
+    },
+    "after": {
+      "time_utc": "2026-10-27T07:34:34.485571+00:00",
+      "competing": [],
+      "load_average": [
+        0.78759765625,
+        0.4931640625,
+        0.5966796875
+      ],
+      "cpu_jiffies": [
+        17905185,
+        4950,
+        8044283,
+        6379722162,
+        3360777,
+        1155447,
+        1422105,
+        0,
+        0,
+        0
+      ]
+    },
+    "returncode": 0,
+    "files": {
+      "target/wal-opt/20261027-v7-writer-scaling/round1-candidate-8writers-io.csv": "929eab9b92b6621865e5693f30af70a730e3efa696aa00e68edd709098dff9fe",
+      "target/wal-opt/20261027-v7-writer-scaling/round1-candidate-8writers.stdout": "d77ff3912b09122fb71e0db6102a3e664ac69f7afb33d79e28f50979c5456887",
+      "target/wal-opt/20261027-v7-writer-scaling/round1-candidate-8writers.stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "target/wal-opt/20261027-v7-writer-scaling/round1-candidate-8writers-samples.jsonl": "d72e10da3cf8c009cd3bbe34e95620e0cd5ac50df57d243be05426d26b0de7da"
+    }
+  },
+  {
+    "round": 2,
+    "arm": "candidate",
+    "writers": 8,
+    "name": "round2-candidate-8writers",
+    "excluded_from_scoring": true,
+    "run_id": "1793086489516",
+    "command": [
+      "/home/liu/proj/toy-kv-engine/target/release/write-perf-v7-frontier-buffer-reuse",
+      "--suite",
+      "legacy",
+      "--preset",
+      "smoke",
+      "--bench",
+      "wal_batch_concurrent",
+      "--wal",
+      "--wal-io-mode",
+      "parallel",
+      "--pitr",
+      "--pitr-format",
+      "v7",
+      "--num",
+      "750000",
+      "--threads",
+      "8",
+      "--wal-batch-size",
+      "64",
+      "--value-size",
+      "1024",
+      "--target-sst-size",
+      "2147483648",
+      "--compaction",
+      "none",
+      "--latency-sample-every",
+      "10",
+      "--output",
+      "json",
+      "--path",
+      "/home/liu/proj/toy-kv-engine/target/wal-opt/20261027-v7-writer-scaling/round2-candidate-8writers-db"
+    ],
+    "binary": {
+      "path": "target/release/write-perf-v7-frontier-buffer-reuse",
+      "sha256": "02f733af9e7a7a26ac7905d309c117e976e39405eb7473d6c3845bc3dc069103"
+    },
+    "preload_library_sha256": "7bef6a9cfadc9c803f955fb96e86bd65f5bdebd07aab39184d283832bfe3e46b",
+    "io_trace_environment_key": "KV_WAL_IO_TRACE",
+    "raw_sha256": "3d41580e7c42060ddac2024827c4f05960831e88a549245ea6cc64d8f452821c",
+    "samples": 18,
+    "audit_samples": 4,
+    "clean_sampled": true,
+    "sampling_errors": [],
+    "before": {
+      "time_utc": "2026-10-27T07:34:49.509453+00:00",
+      "competing": [],
+      "load_average": [
+        0.6123046875,
+        0.46826171875,
+        0.58642578125
+      ],
+      "cpu_jiffies": [
+        17905429,
+        4950,
+        8044402,
+        6379769797,
+        3360779,
+        1155467,
+        1422133,
+        0,
+        0,
+        0
+      ]
+    },
+    "after": {
+      "time_utc": "2026-10-27T07:34:51.322972+00:00",
+      "competing": [],
+      "load_average": [
+        0.6123046875,
+        0.46826171875,
+        0.58642578125
+      ],
+      "cpu_jiffies": [
+        17905716,
+        4950,
+        8044479,
+        6379775155,
+        3360834,
+        1155472,
+        1422136,
+        0,
+        0,
+        0
+      ]
+    },
+    "returncode": 0,
+    "files": {
+      "target/wal-opt/20261027-v7-writer-scaling/round2-candidate-8writers-io.csv": "8cec548819a7b43c69410152b6efe2087e17697b87a7e2a7b01acb2df3c7023f",
+      "target/wal-opt/20261027-v7-writer-scaling/round2-candidate-8writers.stdout": "b20e21ba64061297622015cb3c8ff45166acfe48561e07cbf28724ee07a8c458",
+      "target/wal-opt/20261027-v7-writer-scaling/round2-candidate-8writers.stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "target/wal-opt/20261027-v7-writer-scaling/round2-candidate-8writers-samples.jsonl": "d6464ecb6b0fbe4d9c901de70d98690d2180364b1df4680194ed9cbf9f68b415"
+    }
+  },
+  {
+    "round": 2,
+    "arm": "candidate",
+    "writers": 16,
+    "name": "round2-candidate-16writers",
+    "excluded_from_scoring": true,
+    "run_id": "1793086506343",
+    "command": [
+      "/home/liu/proj/toy-kv-engine/target/release/write-perf-v7-frontier-buffer-reuse",
+      "--suite",
+      "legacy",
+      "--preset",
+      "smoke",
+      "--bench",
+      "wal_batch_concurrent",
+      "--wal",
+      "--wal-io-mode",
+      "parallel",
+      "--pitr",
+      "--pitr-format",
+      "v7",
+      "--num",
+      "750000",
+      "--threads",
+      "16",
+      "--wal-batch-size",
+      "64",
+      "--value-size",
+      "1024",
+      "--target-sst-size",
+      "2147483648",
+      "--compaction",
+      "none",
+      "--latency-sample-every",
+      "10",
+      "--output",
+      "json",
+      "--path",
+      "/home/liu/proj/toy-kv-engine/target/wal-opt/20261027-v7-writer-scaling/round2-candidate-16writers-db"
+    ],
+    "binary": {
+      "path": "target/release/write-perf-v7-frontier-buffer-reuse",
+      "sha256": "02f733af9e7a7a26ac7905d309c117e976e39405eb7473d6c3845bc3dc069103"
+    },
+    "preload_library_sha256": "7bef6a9cfadc9c803f955fb96e86bd65f5bdebd07aab39184d283832bfe3e46b",
+    "io_trace_environment_key": "KV_WAL_IO_TRACE",
+    "raw_sha256": "66aeed916f9926b2f1c0f0f68c6d91b21283108e2b948b5a7f6332b0df37f087",
+    "samples": 19,
+    "audit_samples": 4,
+    "clean_sampled": true,
+    "sampling_errors": [],
+    "before": {
+      "time_utc": "2026-10-27T07:35:06.338764+00:00",
+      "competing": [],
+      "load_average": [
+        0.5498046875,
+        0.4619140625,
+        0.58203125
+      ],
+      "cpu_jiffies": [
+        17905989,
+        4950,
+        8044605,
+        6379822741,
+        3360835,
+        1155494,
+        1422164,
+        0,
+        0,
+        0
+      ]
+    },
+    "after": {
+      "time_utc": "2026-10-27T07:35:08.316311+00:00",
+      "competing": [],
+      "load_average": [
+        0.666015625,
+        0.48779296875,
+        0.58984375
+      ],
+      "cpu_jiffies": [
+        17906397,
+        4950,
+        8044698,
+        6379828451,
+        3360930,
+        1155502,
+        1422168,
+        0,
+        0,
+        0
+      ]
+    },
+    "returncode": 0,
+    "files": {
+      "target/wal-opt/20261027-v7-writer-scaling/round2-candidate-16writers-io.csv": "a628b267ec2f29be94874af8eedaf981fecf57d3b9a8bc0b2a4dbd6b246e0098",
+      "target/wal-opt/20261027-v7-writer-scaling/round2-candidate-16writers.stdout": "305626b0b903541ee49259081e67c02414f88702f16faf4a51a0fc2025330d5b",
+      "target/wal-opt/20261027-v7-writer-scaling/round2-candidate-16writers.stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "target/wal-opt/20261027-v7-writer-scaling/round2-candidate-16writers-samples.jsonl": "671b94b6c5788b4d45a2461acc7db3cc766cc0b63651f01997af65bf8d9071ec"
+    }
+  },
+  {
+    "round": 2,
+    "arm": "baseline",
+    "writers": 16,
+    "name": "round2-baseline-16writers",
+    "excluded_from_scoring": true,
+    "run_id": "1793086523349",
+    "command": [
+      "/home/liu/proj/toy-kv-engine/target/release/write-perf-v7-batch-window",
+      "--suite",
+      "legacy",
+      "--preset",
+      "smoke",
+      "--bench",
+      "wal_batch_concurrent",
+      "--wal",
+      "--wal-io-mode",
+      "parallel",
+      "--pitr",
+      "--pitr-format",
+      "v7",
+      "--num",
+      "750000",
+      "--threads",
+      "16",
+      "--wal-batch-size",
+      "64",
+      "--value-size",
+      "1024",
+      "--target-sst-size",
+      "2147483648",
+      "--compaction",
+      "none",
+      "--latency-sample-every",
+      "10",
+      "--output",
+      "json",
+      "--path",
+      "/home/liu/proj/toy-kv-engine/target/wal-opt/20261027-v7-writer-scaling/round2-baseline-16writers-db"
+    ],
+    "binary": {
+      "path": "target/release/write-perf-v7-batch-window",
+      "sha256": "f7fd96e5ca0ecaaaa23f59f135e7ce9430521f986834e5c95f2d32070e378d54"
+    },
+    "preload_library_sha256": "7bef6a9cfadc9c803f955fb96e86bd65f5bdebd07aab39184d283832bfe3e46b",
+    "io_trace_environment_key": "KV_WAL_IO_TRACE",
+    "raw_sha256": "dd33020f8cc5059c195f86b571dc6ab78f7d9319e35ed41ab6c720b1bdb68dfd",
+    "samples": 42,
+    "audit_samples": 7,
+    "clean_sampled": true,
+    "sampling_errors": [],
+    "before": {
+      "time_utc": "2026-10-27T07:35:23.342020+00:00",
+      "competing": [],
+      "load_average": [
+        0.5859375,
+        0.47998046875,
+        0.58544921875
+      ],
+      "cpu_jiffies": [
+        17906648,
+        4950,
+        8044804,
+        6379876112,
+        3360930,
+        1155521,
+        1422195,
+        0,
+        0,
+        0
+      ]
+    },
+    "after": {
+      "time_utc": "2026-10-27T07:35:27.813713+00:00",
+      "competing": [],
+      "load_average": [
+        0.53857421875,
+        0.4716796875,
+        0.58203125
+      ],
+      "cpu_jiffies": [
+        17907069,
+        4950,
+        8044914,
+        6379889529,
+        3361236,
+        1155533,
+        1422203,
+        0,
+        0,
+        0
+      ]
+    },
+    "returncode": 0,
+    "files": {
+      "target/wal-opt/20261027-v7-writer-scaling/round2-baseline-16writers-io.csv": "9b10294ff60176d4be2217307db3a0e647b134a721cc820e14cd4092a23f16c0",
+      "target/wal-opt/20261027-v7-writer-scaling/round2-baseline-16writers.stdout": "bb70964790c1b598ffe9e5aad97f87ff0cee0b176850f99a7aedcf765cba0940",
+      "target/wal-opt/20261027-v7-writer-scaling/round2-baseline-16writers.stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "target/wal-opt/20261027-v7-writer-scaling/round2-baseline-16writers-samples.jsonl": "1cdea5dcaf195581965ffaabe05b361fa73afa6af801bd3ab09e173a1c8f7000"
+    }
+  },
+  {
+    "round": 2,
+    "arm": "baseline",
+    "writers": 8,
+    "name": "round2-baseline-8writers",
+    "excluded_from_scoring": true,
+    "run_id": "1793086542836",
+    "command": [
+      "/home/liu/proj/toy-kv-engine/target/release/write-perf-v7-batch-window",
+      "--suite",
+      "legacy",
+      "--preset",
+      "smoke",
+      "--bench",
+      "wal_batch_concurrent",
+      "--wal",
+      "--wal-io-mode",
+      "parallel",
+      "--pitr",
+      "--pitr-format",
+      "v7",
+      "--num",
+      "750000",
+      "--threads",
+      "8",
+      "--wal-batch-size",
+      "64",
+      "--value-size",
+      "1024",
+      "--target-sst-size",
+      "2147483648",
+      "--compaction",
+      "none",
+      "--latency-sample-every",
+      "10",
+      "--output",
+      "json",
+      "--path",
+      "/home/liu/proj/toy-kv-engine/target/wal-opt/20261027-v7-writer-scaling/round2-baseline-8writers-db"
+    ],
+    "binary": {
+      "path": "target/release/write-perf-v7-batch-window",
+      "sha256": "f7fd96e5ca0ecaaaa23f59f135e7ce9430521f986834e5c95f2d32070e378d54"
+    },
+    "preload_library_sha256": "7bef6a9cfadc9c803f955fb96e86bd65f5bdebd07aab39184d283832bfe3e46b",
+    "io_trace_environment_key": "KV_WAL_IO_TRACE",
+    "raw_sha256": "c8a6a0e5c392fa0eb1cb3cf868292e128df9ba2a182f470adf9231ac31a689d0",
+    "samples": 25,
+    "audit_samples": 5,
+    "clean_sampled": true,
+    "sampling_errors": [],
+    "before": {
+      "time_utc": "2026-10-27T07:35:42.831977+00:00",
+      "competing": [],
+      "load_average": [
+        0.5732421875,
+        0.4814453125,
+        0.58349609375
+      ],
+      "cpu_jiffies": [
+        17907317,
+        4950,
+        8045018,
+        6379937151,
+        3361237,
+        1155553,
+        1422231,
+        0,
+        0,
+        0
+      ]
+    },
+    "after": {
+      "time_utc": "2026-10-27T07:35:45.349993+00:00",
+      "competing": [],
+      "load_average": [
+        0.5732421875,
+        0.4814453125,
+        0.58349609375
+      ],
+      "cpu_jiffies": [
+        17907690,
+        4950,
+        8045117,
+        6379944619,
+        3361337,
+        1155563,
+        1422235,
+        0,
+        0,
+        0
+      ]
+    },
+    "returncode": 0,
+    "files": {
+      "target/wal-opt/20261027-v7-writer-scaling/round2-baseline-8writers-io.csv": "7d4e6c8d612bae414605e958a3725c6f4816c1f0494fae8e6c9e7d9df446ee6f",
+      "target/wal-opt/20261027-v7-writer-scaling/round2-baseline-8writers.stdout": "ad9296656868432c7711a2fb52140d8b25d9017861fa412f2fa29eb1fc67f71c",
+      "target/wal-opt/20261027-v7-writer-scaling/round2-baseline-8writers.stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "target/wal-opt/20261027-v7-writer-scaling/round2-baseline-8writers-samples.jsonl": "cee54b26f194f5e04ed215d2694c2ff445ae5352578e627f0eebdd3ca4ff9e9d"
+    }
+  }
+]
