@@ -2675,6 +2675,19 @@ checks. All 146 scored records, 42 warmups, exact source and executable identiti
 failed controls and cancellation records remain. Point parity and Stage 8 remain
 unmet; no default activation or publication occurs.
 
+The [allocator retry after the SSD changes](benchmarks/rfc-025-v7-mimalloc-ssd-followup-20261027.md)
+repeats the full mimalloc policy, including aligned WAL buffers, at 1/8/16 writers
+on ext4. Single-writer v7 batch throughput gains 10.3% with 15.2% less CPU, but
+eight-writer batch throughput falls 15.5% with 56.8% more CPU and 11.9% more syncs.
+Sixteen-writer batch CPU rises 27.3%. Point results include large moving stalls
+and failed independent controls; their highest scores and paired observations
+are both preserved. V7 peak RSS rises in every cell. The allocator source is
+restored and System remains selected, while the async and serial SSD changes
+stay byte-identical. Both allocator configurations pass 1,970 tests; restored
+System passes 1,969. All 90 scored records, 30 warmups, one excluded profile,
+1,453 clear audit samples, exact patch and saved identities remain. The retry
+does not qualify v4 parity or Stage 8.
+
 ## Delivery checklist
 
 - [ ] Stages 1–3: legacy compatibility, byte-exact codec, independent validation,

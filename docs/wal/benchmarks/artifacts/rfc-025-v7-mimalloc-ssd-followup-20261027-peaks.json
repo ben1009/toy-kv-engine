@@ -1,0 +1,288 @@
+{
+  "source_base": "e16e433a90a826d4f51fd8e29e5ec14f8f1ae0fc",
+  "scope": "Highest scored runs within each cell/arm of this fixed cohort; warmups and historical records excluded.",
+  "cells": {
+    "ext4-point1": {
+      "base_v7": {
+        "run_id": "1793059052508",
+        "raw_sha256": "0781e63c2c74fb98a81d1bc52f6e418edb6f5c7c7ee5a253cd6e58f77b1793b2",
+        "puts_per_sec": 2262.919069944376,
+        "binary": {
+          "path": "target/release/write-perf-v7-serial-startup",
+          "sha256": "e7f7712825d2166c14b5b67601388a8e29697f8fc034832e457061cf6e30ae19"
+        }
+      },
+      "old_v4": {
+        "run_id": "1793059071472",
+        "raw_sha256": "efdc2380ea6029c67119df2dfa42e12e24b6cf4cc172e33fcf535b56f31a7fae",
+        "puts_per_sec": 2522.9781684248014,
+        "binary": {
+          "path": "target/release/write-perf-ssd-allocator-system",
+          "sha256": "37a824c5f64874f3633fa0efca25c1c260dd73f837dc4ab18e56f767040fb8cc"
+        }
+      },
+      "new_v4": {
+        "run_id": "1793059089553",
+        "raw_sha256": "22290f41cdee37ae57d2156c2f52545b8e799acaa5d4be6e1ae8cc12c40368ef",
+        "puts_per_sec": 2538.669924694101,
+        "binary": {
+          "path": "target/release/write-perf-ssd-allocator-mimalloc",
+          "sha256": "1affcad90fd93ed9007d92d779706c48b89bcd36e000b33051c8a66e06983c01"
+        }
+      },
+      "old_v7": {
+        "run_id": "1793059107582",
+        "raw_sha256": "8960c831b4d73597abfddf7882a38d261fa443f33eb43b9d8eda76cf1df9eb90",
+        "puts_per_sec": 2249.9306967347065,
+        "binary": {
+          "path": "target/release/write-perf-ssd-allocator-system",
+          "sha256": "37a824c5f64874f3633fa0efca25c1c260dd73f837dc4ab18e56f767040fb8cc"
+        }
+      },
+      "new_v7": {
+        "run_id": "1793059126609",
+        "raw_sha256": "0b99f2cc674311f852923f96815850224926cea5d716ae46341bb4096378b787",
+        "puts_per_sec": 2259.707390828918,
+        "binary": {
+          "path": "target/release/write-perf-ssd-allocator-mimalloc",
+          "sha256": "1affcad90fd93ed9007d92d779706c48b89bcd36e000b33051c8a66e06983c01"
+        }
+      }
+    },
+    "ext4-batch1": {
+      "base_v7": {
+        "run_id": "1793059320713",
+        "raw_sha256": "7c4e7353226a4efc6414118d9f7cbde8deccb2bfbf2eea79fad22277fe4e3ded",
+        "puts_per_sec": 64624.47024163761,
+        "binary": {
+          "path": "target/release/write-perf-v7-serial-startup",
+          "sha256": "e7f7712825d2166c14b5b67601388a8e29697f8fc034832e457061cf6e30ae19"
+        }
+      },
+      "old_v4": {
+        "run_id": "1793059342548",
+        "raw_sha256": "295f3058445416159be94008750a61d0ff09ceaaeff56fdf88cdf56f55bb25c6",
+        "puts_per_sec": 83122.08774617082,
+        "binary": {
+          "path": "target/release/write-perf-ssd-allocator-system",
+          "sha256": "37a824c5f64874f3633fa0efca25c1c260dd73f837dc4ab18e56f767040fb8cc"
+        }
+      },
+      "new_v4": {
+        "run_id": "1793059645776",
+        "raw_sha256": "54f5f3ebfd91d8f6efc216439117d5c597e502c1ec65dbd8dbc61b761327422d",
+        "puts_per_sec": 101676.74814919838,
+        "binary": {
+          "path": "target/release/write-perf-ssd-allocator-mimalloc",
+          "sha256": "1affcad90fd93ed9007d92d779706c48b89bcd36e000b33051c8a66e06983c01"
+        }
+      },
+      "old_v7": {
+        "run_id": "1793059665223",
+        "raw_sha256": "059f2799d379e1ca3a844464b4b24424313aae0cfa97a50924d5b6232c5758cb",
+        "puts_per_sec": 67508.60417210229,
+        "binary": {
+          "path": "target/release/write-perf-ssd-allocator-system",
+          "sha256": "37a824c5f64874f3633fa0efca25c1c260dd73f837dc4ab18e56f767040fb8cc"
+        }
+      },
+      "new_v7": {
+        "run_id": "1793059459992",
+        "raw_sha256": "f9aff654fc2162b2e33330768421aaf1558e0a68c1c9cb41ce48e84e2c74f4f7",
+        "puts_per_sec": 72899.67722274068,
+        "binary": {
+          "path": "target/release/write-perf-ssd-allocator-mimalloc",
+          "sha256": "1affcad90fd93ed9007d92d779706c48b89bcd36e000b33051c8a66e06983c01"
+        }
+      }
+    },
+    "ext4-point8": {
+      "base_v7": {
+        "run_id": "1793060059230",
+        "raw_sha256": "343e9a05fdb5821faefd22cccd65752a625eb318a0085b51dcebff7bfbcc9d1a",
+        "puts_per_sec": 16215.42600519962,
+        "binary": {
+          "path": "target/release/write-perf-v7-serial-startup",
+          "sha256": "e7f7712825d2166c14b5b67601388a8e29697f8fc034832e457061cf6e30ae19"
+        }
+      },
+      "old_v4": {
+        "run_id": "1793060026533",
+        "raw_sha256": "88b3ecd8b56c4475080ac7c612ec5b9b7fb4d95120479f652be2c98c33bbf1e5",
+        "puts_per_sec": 16972.32972571303,
+        "binary": {
+          "path": "target/release/write-perf-ssd-allocator-system",
+          "sha256": "37a824c5f64874f3633fa0efca25c1c260dd73f837dc4ab18e56f767040fb8cc"
+        }
+      },
+      "new_v4": {
+        "run_id": "1793059889958",
+        "raw_sha256": "0296a3558842da3a02c44d719090a16635ef6e9f62edd1a42e79138a7a5bde98",
+        "puts_per_sec": 17121.11652896003,
+        "binary": {
+          "path": "target/release/write-perf-ssd-allocator-mimalloc",
+          "sha256": "1affcad90fd93ed9007d92d779706c48b89bcd36e000b33051c8a66e06983c01"
+        }
+      },
+      "old_v7": {
+        "run_id": "1793060108147",
+        "raw_sha256": "33ca68a72fee85d79b69edf2c9922273e083c06d6f1b5e7e1efa134013c93b64",
+        "puts_per_sec": 16282.462270332566,
+        "binary": {
+          "path": "target/release/write-perf-ssd-allocator-system",
+          "sha256": "37a824c5f64874f3633fa0efca25c1c260dd73f837dc4ab18e56f767040fb8cc"
+        }
+      },
+      "new_v7": {
+        "run_id": "1793060124426",
+        "raw_sha256": "d201f02085ae4c1618d31938f145af4a190832a03e9c53f5acba3459bb99c867",
+        "puts_per_sec": 16118.355742591715,
+        "binary": {
+          "path": "target/release/write-perf-ssd-allocator-mimalloc",
+          "sha256": "1affcad90fd93ed9007d92d779706c48b89bcd36e000b33051c8a66e06983c01"
+        }
+      }
+    },
+    "ext4-batch8": {
+      "base_v7": {
+        "run_id": "1793060264527",
+        "raw_sha256": "58b7e33865bed89114484a98052e2b6d64b2ed7e06da5d2bf5b163975a52b8a1",
+        "puts_per_sec": 418674.2880303057,
+        "binary": {
+          "path": "target/release/write-perf-v7-serial-startup",
+          "sha256": "e7f7712825d2166c14b5b67601388a8e29697f8fc034832e457061cf6e30ae19"
+        }
+      },
+      "old_v4": {
+        "run_id": "1793060367462",
+        "raw_sha256": "8678bc623720b653bc9971492d0d78a55e56ac2b35c4293d373e1d5d6d6bdf90",
+        "puts_per_sec": 388832.811651212,
+        "binary": {
+          "path": "target/release/write-perf-ssd-allocator-system",
+          "sha256": "37a824c5f64874f3633fa0efca25c1c260dd73f837dc4ab18e56f767040fb8cc"
+        }
+      },
+      "new_v4": {
+        "run_id": "1793060290712",
+        "raw_sha256": "35122a7d35ac62014fd32599da42e55e727c8ee78a7e95a3a98d186189dd50e7",
+        "puts_per_sec": 454896.04982341785,
+        "binary": {
+          "path": "target/release/write-perf-ssd-allocator-mimalloc",
+          "sha256": "1affcad90fd93ed9007d92d779706c48b89bcd36e000b33051c8a66e06983c01"
+        }
+      },
+      "old_v7": {
+        "run_id": "1793060304546",
+        "raw_sha256": "57e19fbd7580da118e90492e9e7099fa8f1ecea67934b09cd6f7b15727128b16",
+        "puts_per_sec": 416437.83893261466,
+        "binary": {
+          "path": "target/release/write-perf-ssd-allocator-system",
+          "sha256": "37a824c5f64874f3633fa0efca25c1c260dd73f837dc4ab18e56f767040fb8cc"
+        }
+      },
+      "new_v7": {
+        "run_id": "1793060472838",
+        "raw_sha256": "d48f15670806cc4c4d62d810cefaf27261b29b64ac00337bc3391a80d95caed5",
+        "puts_per_sec": 353801.32025897,
+        "binary": {
+          "path": "target/release/write-perf-ssd-allocator-mimalloc",
+          "sha256": "1affcad90fd93ed9007d92d779706c48b89bcd36e000b33051c8a66e06983c01"
+        }
+      }
+    },
+    "ext4-point16": {
+      "base_v7": {
+        "run_id": "1793060744597",
+        "raw_sha256": "276b323393a21602b866fd633df8913ead5240ca2ca595b35bd31d4a1df654cb",
+        "puts_per_sec": 24694.54040706491,
+        "binary": {
+          "path": "target/release/write-perf-v7-serial-startup",
+          "sha256": "e7f7712825d2166c14b5b67601388a8e29697f8fc034832e457061cf6e30ae19"
+        }
+      },
+      "old_v4": {
+        "run_id": "1793060730629",
+        "raw_sha256": "fb6ecaf759018f7c60794ae933dabd35eb36a670e3b2ae05f2883007cbe510a2",
+        "puts_per_sec": 27854.707039214798,
+        "binary": {
+          "path": "target/release/write-perf-ssd-allocator-system",
+          "sha256": "37a824c5f64874f3633fa0efca25c1c260dd73f837dc4ab18e56f767040fb8cc"
+        }
+      },
+      "new_v4": {
+        "run_id": "1793060716891",
+        "raw_sha256": "f2410509a6657a76059659f4b1bd16c6921ccd6b695b64abe6d10aeb69039803",
+        "puts_per_sec": 30013.128321581233,
+        "binary": {
+          "path": "target/release/write-perf-ssd-allocator-mimalloc",
+          "sha256": "1affcad90fd93ed9007d92d779706c48b89bcd36e000b33051c8a66e06983c01"
+        }
+      },
+      "old_v7": {
+        "run_id": "1793060801242",
+        "raw_sha256": "1dc6eb1815023d641cf6e01755accb5db0f6b5d189a91619a22f1546e294567c",
+        "puts_per_sec": 23888.96756083316,
+        "binary": {
+          "path": "target/release/write-perf-ssd-allocator-system",
+          "sha256": "37a824c5f64874f3633fa0efca25c1c260dd73f837dc4ab18e56f767040fb8cc"
+        }
+      },
+      "new_v7": {
+        "run_id": "1793060815566",
+        "raw_sha256": "7ead3c04dc63df7db38cf17e89822292ab2e84d4cdb2889127f0758715af55bb",
+        "puts_per_sec": 25099.924367652897,
+        "binary": {
+          "path": "target/release/write-perf-ssd-allocator-mimalloc",
+          "sha256": "1affcad90fd93ed9007d92d779706c48b89bcd36e000b33051c8a66e06983c01"
+        }
+      }
+    },
+    "ext4-batch16": {
+      "base_v7": {
+        "run_id": "1793061065234",
+        "raw_sha256": "d3aecb84c9f5646c7cb04f1f76917b4155577997464567439a78f96b9e3f7bbb",
+        "puts_per_sec": 176130.59427326254,
+        "binary": {
+          "path": "target/release/write-perf-v7-serial-startup",
+          "sha256": "e7f7712825d2166c14b5b67601388a8e29697f8fc034832e457061cf6e30ae19"
+        }
+      },
+      "old_v4": {
+        "run_id": "1793061051344",
+        "raw_sha256": "3eded5683a499ce0ecb8c145790a55705f55cf65c9ee6b6a9a0133f47698bc34",
+        "puts_per_sec": 569897.7435898064,
+        "binary": {
+          "path": "target/release/write-perf-ssd-allocator-system",
+          "sha256": "37a824c5f64874f3633fa0efca25c1c260dd73f837dc4ab18e56f767040fb8cc"
+        }
+      },
+      "new_v4": {
+        "run_id": "1793060977490",
+        "raw_sha256": "f7a3e297e3429c9b5b27b3615fc946579f266af8afab4afc8331a3604b3eba70",
+        "puts_per_sec": 560944.6140363255,
+        "binary": {
+          "path": "target/release/write-perf-ssd-allocator-mimalloc",
+          "sha256": "1affcad90fd93ed9007d92d779706c48b89bcd36e000b33051c8a66e06983c01"
+        }
+      },
+      "old_v7": {
+        "run_id": "1793061026058",
+        "raw_sha256": "3dcebc163c6f3b9994fd9de87177927313ce1c1e959f298f82082afcb04fb537",
+        "puts_per_sec": 550131.0313092993,
+        "binary": {
+          "path": "target/release/write-perf-ssd-allocator-system",
+          "sha256": "37a824c5f64874f3633fa0efca25c1c260dd73f837dc4ab18e56f767040fb8cc"
+        }
+      },
+      "new_v7": {
+        "run_id": "1793061014503",
+        "raw_sha256": "01ec9c6ee370876bcdc3690370db810424c99eecc496218bba30076be65d44ae",
+        "puts_per_sec": 555158.7687792752,
+        "binary": {
+          "path": "target/release/write-perf-ssd-allocator-mimalloc",
+          "sha256": "1affcad90fd93ed9007d92d779706c48b89bcd36e000b33051c8a66e06983c01"
+        }
+      }
+    }
+  }
+}

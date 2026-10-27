@@ -1,0 +1,116 @@
+{
+  "created_at_utc": "2026-10-26T23:37:35.678021+00:00",
+  "source_base": "e16e433a90a826d4f51fd8e29e5ec14f8f1ae0fc",
+  "user_request": "Switch allocator to test after SSD improvement.",
+  "baseline": {
+    "path": "target/release/write-perf-v7-serial-startup",
+    "sha256": "e7f7712825d2166c14b5b67601388a8e29697f8fc034832e457061cf6e30ae19"
+  },
+  "candidate": "Repeat published mimalloc0.1.52/libmimalloc-sys0.1.49/native3.3.2, matching the earlier experiment. Opt-in feature changes Rust global allocator and routes aligned WAL allocations through matching std::alloc Layout(capacity,4096). Default remains System/libc; no C malloc override or allocator tuning. Address/Leak sanitizer builds use System. Retained async and hybrid SSD fixes remain byte-identical.",
+  "version_scope": "This is a controlled repeat of the prior published Rust-wrapper/native combination, not a test of newer upstream mimalloc3.6.0. Exact locked/cached sources will be recorded.",
+  "matrix": {
+    "ext4-point1": {
+      "operations": 20000,
+      "writers": 1,
+      "batch": null,
+      "sample_every": 10,
+      "samples": 2000,
+      "pairs": 3,
+      "arms": [
+        "base_v7",
+        "old_v4",
+        "new_v4",
+        "old_v7",
+        "new_v7"
+      ]
+    },
+    "ext4-batch1": {
+      "operations": 750000,
+      "writers": 1,
+      "batch": 64,
+      "sample_every": 10,
+      "samples": 1172,
+      "pairs": 3,
+      "arms": [
+        "base_v7",
+        "old_v4",
+        "new_v4",
+        "old_v7",
+        "new_v7"
+      ]
+    },
+    "ext4-point8": {
+      "operations": 100000,
+      "writers": 8,
+      "batch": null,
+      "sample_every": 100,
+      "samples": 1000,
+      "pairs": 3,
+      "arms": [
+        "base_v7",
+        "old_v4",
+        "new_v4",
+        "old_v7",
+        "new_v7"
+      ]
+    },
+    "ext4-batch8": {
+      "operations": 750000,
+      "writers": 8,
+      "batch": 64,
+      "sample_every": 10,
+      "samples": 1176,
+      "pairs": 3,
+      "arms": [
+        "base_v7",
+        "old_v4",
+        "new_v4",
+        "old_v7",
+        "new_v7"
+      ]
+    },
+    "ext4-point16": {
+      "operations": 100000,
+      "writers": 16,
+      "batch": null,
+      "sample_every": 100,
+      "samples": 1008,
+      "pairs": 3,
+      "arms": [
+        "base_v7",
+        "old_v4",
+        "new_v4",
+        "old_v7",
+        "new_v7"
+      ]
+    },
+    "ext4-batch16": {
+      "operations": 750000,
+      "writers": 16,
+      "batch": 64,
+      "sample_every": 10,
+      "samples": 1184,
+      "pairs": 3,
+      "arms": [
+        "base_v7",
+        "old_v4",
+        "new_v4",
+        "old_v7",
+        "new_v7"
+      ]
+    }
+  },
+  "protocol": "SSD ext4 only. Per cell5warmups(oneperarm),3 alternating five-arm rounds. odd base_v7,old_v4,new_v4,old_v7,new_v7; evenreverse; warmupbase,oldv4,oldv7,newv4,newv7. base_v7=unchanged retained e7;old=paired new-source System, new=selected mimalloc. 1KiB values,2GiB SST, explicit v4/v7Parallel.30s initial cooldown,10s between runs,1Hzrecognized host-process audits. No build/test/profile overlap. All completed observations and stalls retained. No score-selected retries.",
+  "order": [
+    "ext4-point1",
+    "ext4-batch1",
+    "ext4-point8",
+    "ext4-batch8",
+    "ext4-point16",
+    "ext4-batch16"
+  ],
+  "measurement": "Timed throughput/p50/p99 and measured processCPU fromengineJSON. Child-lifetime Linux wait4peakRSS, faults and switches for exact engine PID, excluding launcher. Compare both formats independently because both allocators change; v7/v4 normalization diagnostic only. Record matched peaks with hashes, not a replacement for the paired results.",
+  "assessment": "For each format/cell paired raw and arm-median throughput>=0.95,CPU<=1.05,p99<=1.10,DATAbytes equal andsync-count ratio<=1.05. Atleastone cell/format>=2%raw gain withCPU<=1.00. Compare paired Systemv7 against unchanged e7 as an independent control. RSSratio>1.20 is a review flag; prior memory investigation already establishes the tradeoff and this test records current RSS. These assessment rules do not activate a default allocator.",
+  "correctness": "Outside-sandbox cargo make check with allfeatures(mimalloc), and full Systemnextest(all existing features except allocator) with zero retries. Alignment/content/cross-thread free regression test, plus existing WALownership/recovery/failpoints. Build and hash System and selected-allocator releasebinaries; activationproof separate from scoring. One excluded current-baseline SSDCPU profile before source edits.",
+  "decision": "The request is an allocator test, not unconditional default adoption. Keep allocator source only if assessment passes and memory cost is acceptable under the measured tradeoff; otherwise restore the four modified manifests/sourcefiles and canonicale7 binary while preserving evidence. Never revert kept async/hybrid IO commits. NoPR/push; separate any retained source from evidence."
+}

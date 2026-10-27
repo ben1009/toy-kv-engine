@@ -1,0 +1,23 @@
+{
+  "source_base": "e16e433a90a826d4f51fd8e29e5ec14f8f1ae0fc",
+  "rustc": "rustc 1.100.0-nightly (6bb1652a0 2026-09-22)\nbinary: rustc\ncommit-hash: 6bb1652a020e80cef79332741d89e996d71933c9\ncommit-date: 2026-09-22\nhost: x86_64-unknown-linux-gnu\nrelease: 1.100.0-nightly\nLLVM version: 23.1.1\n",
+  "kernel": "Linux 6.12.71-1-lts #1 SMP PREEMPT_DYNAMIC Fri, 13 Feb 2026 19:12:56 +0000 x86_64",
+  "mount": "ext4 /dev/nvme0n1p3 rw,relatime",
+  "queue": {
+    "max_hw_sectors_kb": "512",
+    "max_sectors_kb": "512",
+    "physical_block_size": "512",
+    "max_segments": "128",
+    "nr_requests": "255"
+  },
+  "source_manifest_sha256": "e99a6f6fe0444887cd5d80a3aa90286a7b193678694ce580f212428c8e03cdcb",
+  "candidate_build_log_sha256": "26b12aac5324043a54e5734ea82339de1f0234fd4097a42e5fbdddf365786ff0",
+  "created_at_utc": "2026-10-26T23:48:18.560940+00:00",
+  "patch_sha256": "30896dd83e2ac6a2c027b834f7dad76709701364372ab2ea9e8d7bb401bf2e5c",
+  "plan_sha256": "64fa1607d8dae60fb14d24ab5a2d8b5691bdb85edfd2039df54c812d6fcf037c",
+  "system_build_command": "cargo build --offline --locked --release --package kv-engine --bin write-perf --features bench",
+  "candidate_build_command": "cargo build --offline --locked --release --package kv-engine --bin write-perf --features bench,mimalloc-allocator",
+  "system_build_log_sha256": "b1b76bab65ee97b3c485fe106cd8c2f60c75922379474dfb2f8b6f4136f6dcea",
+  "system_binary_equals_unchanged_retained": false,
+  "allocator_environment_overrides": []
+}

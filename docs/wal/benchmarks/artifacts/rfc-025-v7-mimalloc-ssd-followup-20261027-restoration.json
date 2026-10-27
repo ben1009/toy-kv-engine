@@ -1,0 +1,13 @@
+{
+  "source_base": "e16e433a90a826d4f51fd8e29e5ec14f8f1ae0fc",
+  "source_sha256": {
+    "Cargo.lock": "dceb60bb09ffbbfb09bcef9df4f2bb9237555188a220a3e14e7770aad3e6dcc3",
+    "kv-engine/Cargo.toml": "b58cd47497f1231c3bfa649fb7a42275ac5a986f1e8b8c44ed6bd7d9eabcce30",
+    "kv-engine/src/lib.rs": "70e91f75ba2a3e0a06f628cce15a4b628c027ad1e2dac499e297c6aea35ed59a",
+    "kv-engine/src/wal.rs": "cd39631f446ae864f94778920d1a0fbea70376941de9a1350c6da177697aced8"
+  },
+  "canonical_sha256": "e7f7712825d2166c14b5b67601388a8e29697f8fc034832e457061cf6e30ae19",
+  "ssd_runtime_unchanged": true,
+  "canonical_replaced_atomically": true,
+  "saved_trial_binaries_preserved": true
+}
