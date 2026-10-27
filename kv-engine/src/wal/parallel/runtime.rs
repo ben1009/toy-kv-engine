@@ -2257,13 +2257,7 @@ fn run_sync_coordinator(
             && inner.durability.state.lock().large_batch_wave;
         let coalesce_wait = sync_coalesce_wait(last_sync_latency, v7_layout, large_batch_wave);
         if let Some(wait) = coalesce_wait {
-            coalesce_admitted_prefix(&inner, &completions, wait);
-            // Coalescing may return at its captured admission cutoff while
-            // later groups have already completed. Include the results that
-            // are queued now before capturing the next durability target.
-            // Bound this drain to its initial queue length so new completions
-            // cannot extend the coalescing window indefinitely.
-            drain_results_at_capture(&inner, &completions);
+            coalesce_before_capture(&inner, &completions, wait, v7_layout);
         }
         if let Some(latency) = synchronize_written_prefix(&sync_file, &inner)? {
             last_sync_latency = Some(latency);
@@ -2276,6 +2270,38 @@ fn run_sync_coordinator(
     synchronize_written_prefix(&sync_file, &inner)?;
 
     Ok(())
+}
+
+fn coalesce_before_capture(
+    inner: &RuntimeInner,
+    completions: &Receiver<GroupWriteResult>,
+    wait: Duration,
+    v7_layout: bool,
+) {
+    if v7_layout {
+        let target = {
+            let state = inner.durability.state.lock();
+            (state.poison_ticket.is_none() && state.written_frontier > state.durable_frontier)
+                .then_some(state.written_frontier)
+        };
+        if let Some(target) = target {
+            let admission = inner.admission.lock();
+            if admission.v7_allocator.as_ref().is_some_and(|allocator| {
+                matches!(allocator.eligible_durable_end_for(target), Ok(None))
+            }) {
+                // Do not spend an optional batching window on a prefix that
+                // cannot retain its predecessor yet. Leave later results for
+                // the next iteration, which can start a normal window once
+                // eligible. The authoritative sync path still handles errors.
+                return;
+            }
+        }
+    }
+    coalesce_admitted_prefix(inner, completions, wait);
+    // Coalescing may return at its captured admission cutoff while later
+    // results are queued. Bound this drain to its initial length so new
+    // completions cannot extend the optional window indefinitely.
+    drain_results_at_capture(inner, completions);
 }
 
 fn sync_coalesce_wait(
@@ -4207,9 +4233,20 @@ mod tests {
 
     fn complete_test_v7_data(
         inner: &super::RuntimeInner,
-        (batch, prefix): (AdmittedBatch, super::WalV7PrefixMetadata),
+        batch: (AdmittedBatch, super::WalV7PrefixMetadata),
         error: Option<String>,
     ) -> anyhow::Result<()> {
+        let result = finish_test_v7_data(inner, batch, error)?;
+        super::process_group_result(inner, result);
+
+        Ok(())
+    }
+
+    fn finish_test_v7_data(
+        inner: &super::RuntimeInner,
+        (batch, prefix): (AdmittedBatch, super::WalV7PrefixMetadata),
+        error: Option<String>,
+    ) -> anyhow::Result<super::GroupWriteResult> {
         let AdmittedBatch {
             ticket,
             file_offset,
@@ -4239,18 +4276,13 @@ mod tests {
             )?;
         }
         super::WorkerBuffer::retire(buffer, &inner.buffer_pool);
-        super::process_group_result(
-            inner,
-            super::GroupWriteResult {
-                group_id: ticket,
-                tickets: ticket..ticket + 1,
-                write_count: 1,
-                write_bytes: aligned_len as u64,
-                error,
-            },
-        );
-
-        Ok(())
+        Ok(super::GroupWriteResult {
+            group_id: ticket,
+            tickets: ticket..ticket + 1,
+            write_count: 1,
+            write_bytes: aligned_len as u64,
+            error,
+        })
     }
 
     #[test]
@@ -4470,6 +4502,101 @@ mod tests {
         assert!(runtime.wait_durable(1).is_err());
         drop(pending);
         assert_eq!(owner.snapshot().buffer_memory_bytes, 0);
+
+        Ok(())
+    }
+
+    #[test]
+    fn v7_coalescing_waits_only_after_a_written_prefix_becomes_eligible() -> anyhow::Result<()> {
+        use std::time::Duration;
+
+        use crate::wal::v7::{
+            install::recover_and_install_active, recovery::WalV7RecoveryAuthority,
+        };
+
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("eligible-coalescing.wal");
+        let Some(V7RuntimeTestWal { wal, owner, anchor }) =
+            live_v7_test_wal(&path, super::MAX_WAL_FILE_SIZE, v7_test_resource_limits())?
+        else {
+            return Ok(());
+        };
+        let runtime = wal.parallel_runtime.as_ref().unwrap();
+        let mut packer = runtime.inner.packer_state.lock();
+        let batches = (1..=4).map(|ts| v7_test_batch(ts, 10)).collect::<Vec<_>>();
+        let mut pending = std::collections::VecDeque::new();
+        for batch in &batches[..3] {
+            wal.put_v7_batch_with_index(batch, LIVE_WAL_V5_LIMITS)?;
+            let admitted = runtime.inner.admission.lock().queue.pop_front().unwrap();
+            pending.push_back(prepare_test_v7_data(&runtime.inner, &mut packer, admitted)?);
+        }
+        complete_test_v7_data(&runtime.inner, pending.pop_front().unwrap(), None)?;
+        assert!(
+            super::synchronize_written_prefix(&runtime.inner.preallocator, &runtime.inner)?
+                .is_some()
+        );
+        complete_test_v7_data(&runtime.inner, pending.pop_front().unwrap(), None)?;
+        let (sender, completions) = crossbeam_channel::bounded(1);
+        sender.send(finish_test_v7_data(
+            &runtime.inner,
+            pending.pop_front().unwrap(),
+            None,
+        )?)?;
+
+        // F(T=1) follows D0,D1,D2. T=2 cannot retain that marker without
+        // retaining excluded D2. Even with its CQE queued, skip this optional
+        // window and leave the result for the next coordinator iteration.
+        super::coalesce_before_capture(&runtime.inner, &completions, Duration::from_secs(1), true);
+        assert_eq!(completions.len(), 1);
+        assert!(!runtime.is_poisoned());
+        let tail = runtime.logical_length();
+        assert!(
+            super::synchronize_written_prefix(&runtime.inner.preallocator, &runtime.inner)?
+                .is_none()
+        );
+        assert_eq!(runtime.logical_length(), tail);
+        {
+            let state = runtime.inner.durability.state.lock();
+            assert_eq!((state.written_frontier, state.durable_frontier), (2, 1));
+        }
+        runtime.wait_durable(0)?;
+
+        // The next received result makes T=3 eligible. Preserve a normal
+        // batching window: a later queued DATA result can join its capture.
+        super::process_group_result(&runtime.inner, completions.recv()?);
+        wal.put_v7_batch_with_index(&batches[3], LIVE_WAL_V5_LIMITS)?;
+        let admitted = runtime.inner.admission.lock().queue.pop_front().unwrap();
+        let last = prepare_test_v7_data(&runtime.inner, &mut packer, admitted)?;
+        sender.send(finish_test_v7_data(&runtime.inner, last, None)?)?;
+        super::coalesce_before_capture(&runtime.inner, &completions, Duration::from_secs(1), true);
+        assert!(completions.is_empty());
+        {
+            let state = runtime.inner.durability.state.lock();
+            assert_eq!((state.written_frontier, state.durable_frontier), (4, 1));
+        }
+        assert!(
+            super::synchronize_written_prefix(&runtime.inner.preallocator, &runtime.inner)?
+                .is_some()
+        );
+        runtime.wait_durable(3)?;
+        packer.next_ticket = wal.next_ticket();
+        packer.reserved_end = runtime.logical_length();
+        packer.preallocated_end = std::fs::metadata(&path)?.len();
+        drop(packer);
+        wal.close()?;
+        assert_eq!(owner.snapshot().buffer_memory_bytes, 0);
+        drop(wal);
+
+        let recovered = recover_and_install_active(
+            &path,
+            WalV7RecoveryAuthority::Active {
+                predecessor: crate::pitr::ChainAnchor::Genesis {
+                    archive_epoch_id: crate::pitr::ArchiveEpochId(anchor.archive_epoch_id),
+                },
+                durable_anchors: vec![anchor],
+            },
+        )?;
+        assert_eq!(recovered.installed.batches, batches);
 
         Ok(())
     }
