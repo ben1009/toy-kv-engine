@@ -1,0 +1,24 @@
+{
+  "assessment_passed": false,
+  "source_retained": false,
+  "source_restored": true,
+  "cpu_is_diagnostic": true,
+  "source_candidates_in_corrected_matrix": 1,
+  "captured_cells": [
+    "ext4-batch16",
+    "ext4-batch8",
+    "ext4-point8",
+    "ext4-batch1"
+  ],
+  "cancelled_cells": [],
+  "reason": "Reject the four-per-class cap: point8 paired throughput -54.7% and p99 7.99x across three unflagged pairs; batch16 lacks enough matched pairs and has no filtered throughput/p99 gain. All four planned cells completed. Keep the previously retained large-DATA async dispatch source.",
+  "canonical_sha256": "f353022d846530a6754330aaea11f295319ea8f4de20afa09b6d2a3b57b021d8",
+  "restored_source_sha256": "1d351aadce5cf93d97b381a3eee7b13fa6bc0d0d704eba1854ad3ef2b120e0d9",
+  "candidate_tests": 1974,
+  "candidate_focused_tests": 48,
+  "preceding_completed_invocations": 5,
+  "preceding_interrupted_without_json": 1,
+  "corrected_probe_invocations": 1,
+  "corrected_matrix_invocations": 36,
+  "global_completed_unique_invocations": 591
+}

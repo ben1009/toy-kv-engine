@@ -2801,6 +2801,16 @@ Candidate/restored checks pass 1,973/1,972 tests. Reapplying the exact 128-input
 candidate reuses its 1,973 full and 47 focused tests and adds no benchmark
 invocations. This lineage remains at 549; the frozen assessment stays inconclusive.
 
+The [kernel worker pool limit experiment](benchmarks/rfc-025-v7-async-pool-limits-20261028.md)
+is rejected. A bounded-only cap does not constrain the forced-async path;
+limiting both classes works, with four helpers observed, but the full fixed
+matrix has no qualifying benefit. Point8 observes -54.7% throughput / 7.99x
+p99 across three pairs below aggregate stall thresholds. Batch8 observes
+-4.4%/+3.9%; batch16 has only two matched pairs and no gain. Candidate/restored
+checks pass 1,974/1,973 tests. The accepted async-dispatch source and executable
+are restored. Both variants preserve 42 new completed run IDs, bringing this
+lineage to 591, plus one explicitly recorded interrupted run without JSON.
+
 ## Delivery checklist
 
 - [ ] Stages 1–3: legacy compatibility, byte-exact codec, independent validation,

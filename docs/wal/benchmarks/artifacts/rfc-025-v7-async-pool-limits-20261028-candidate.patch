@@ -1,0 +1,64 @@
+--- a/kv-engine/src/wal/parallel/worker.rs
++++ b/kv-engine/src/wal/parallel/worker.rs
+@@ -531,0 +532 @@
++const V7_ASYNC_WORKER_LIMIT: u32 = 4;
+@@ -1627,0 +1629,5 @@
++                if let Err(error) = configure_async_worker_limit(&ring, async_write_min_bytes) {
++                    // This is a performance hint. Kernels or policies that
++                    // reject it can keep their existing worker limits.
++                    log::debug!("WAL async worker limit unavailable: {error}");
++                }
+@@ -1813,0 +1820,14 @@
++}
++
++fn configure_async_worker_limit(
++    ring: &io_uring::IoUring,
++    async_write_min_bytes: Option<usize>,
++) -> io::Result<()> {
++    if async_write_min_bytes.is_none() {
++        return Ok(());
++    }
++    // The runtime enables large async writes only for active v7 WALs on ext
++    // filesystems. Forced-async requests can be classified before their file
++    // is assigned, so constrain both worker classes for this DATA-only ring.
++    let mut limits = [V7_ASYNC_WORKER_LIMIT; 2];
++    ring.submitter().register_iowq_max_workers(&mut limits)
+@@ -2468,0 +2489,38 @@
++    #[test]
++    fn v7_async_worker_limit_is_applied_to_real_ring() {
++        let ring = match io_uring::IoUring::new(8).map_err(anyhow::Error::from) {
++            Ok(ring) => ring,
++            Err(error) if io_uring_unavailable(&error) => {
++                eprintln!("skipping test (io_uring unavailable): {error:#}");
++                return;
++            }
++            Err(error) => panic!("failed to create test ring: {error:#}"),
++        };
++        let mut original = [0; 2];
++        if let Err(error) = ring.submitter().register_iowq_max_workers(&mut original) {
++            if matches!(
++                error.raw_os_error(),
++                Some(libc::EINVAL | libc::ENOSYS | libc::EOPNOTSUPP | libc::EPERM)
++            ) {
++                eprintln!("skipping test (io-wq limits unavailable): {error}");
++                return;
++            }
++            panic!("failed to query initial io-wq limits: {error}");
++        }
++        super::configure_async_worker_limit(&ring, None).expect("retain ordinary worker limits");
++        let mut unchanged = [0; 2];
++        ring.submitter()
++            .register_iowq_max_workers(&mut unchanged)
++            .expect("query ordinary limits");
++        assert_eq!(unchanged, original);
++
++        super::configure_async_worker_limit(&ring, Some(64 * 1024))
++            .expect("set v7 bounded worker limit");
++        let mut limited = [0; 2];
++        ring.submitter()
++            .register_iowq_max_workers(&mut limited)
++            .expect("query configured worker limits");
++        assert_eq!(limited[0], super::V7_ASYNC_WORKER_LIMIT);
++        assert_eq!(limited[1], super::V7_ASYNC_WORKER_LIMIT);
++    }
++

@@ -1,0 +1,127 @@
+[
+  {
+    "writers": 16,
+    "run_id": "1793118536883",
+    "excluded_from_scoring": true,
+    "command": [
+      "/home/liu/proj/toy-kv-engine/target/release/write-perf-v7-async-worker-limit",
+      "--suite",
+      "legacy",
+      "--preset",
+      "smoke",
+      "--bench",
+      "wal_batch_concurrent",
+      "--wal",
+      "--wal-io-mode",
+      "parallel",
+      "--pitr",
+      "--pitr-format",
+      "v7",
+      "--num",
+      "750000",
+      "--threads",
+      "16",
+      "--wal-batch-size",
+      "64",
+      "--value-size",
+      "1024",
+      "--target-sst-size",
+      "2147483648",
+      "--compaction",
+      "none",
+      "--latency-sample-every",
+      "10",
+      "--output",
+      "json",
+      "--path",
+      "/home/liu/proj/toy-kv-engine/target/wal-opt/20261028-v7-async-worker-limit/candidate-probe/16writers-db"
+    ],
+    "binary": {
+      "path": "target/release/write-perf-v7-async-worker-limit",
+      "sha256": "568b4d41efed45ed06c83af198448e826a020ca0214a0649d2492ed749583255"
+    },
+    "returncode": 0,
+    "clean_sampled": true,
+    "sampling_errors": [],
+    "before": {
+      "time_utc": "2026-10-27T16:28:56.879681+00:00",
+      "competing": [],
+      "load_average": [
+        0.255859375,
+        0.6650390625,
+        0.55810546875
+      ],
+      "cpu_jiffies": [
+        18285686,
+        4955,
+        8185919,
+        6481620972,
+        3467250,
+        1174045,
+        1446634,
+        0,
+        0,
+        0
+      ]
+    },
+    "after": {
+      "time_utc": "2026-10-27T16:28:58.479696+00:00",
+      "competing": [],
+      "load_average": [
+        0.255859375,
+        0.6650390625,
+        0.55810546875
+      ],
+      "cpu_jiffies": [
+        18286043,
+        4955,
+        8186003,
+        6481625562,
+        3467306,
+        1174052,
+        1446637,
+        0,
+        0,
+        0
+      ]
+    },
+    "samples": 15,
+    "active_window_samples": 12,
+    "helper_counts": [
+      14,
+      34,
+      52,
+      74,
+      88,
+      125,
+      153,
+      165,
+      179,
+      194,
+      207,
+      231
+    ],
+    "active_helper_counts": [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "max_helpers": 231,
+    "max_active_helpers": 0,
+    "files": {
+      "target/wal-opt/20261028-v7-async-worker-limit/candidate-probe/16writers-io.csv": "937b83dad2911a075ac2069ec2c55701c2c4add693ae2a999e571257ba0e73cb",
+      "target/wal-opt/20261028-v7-async-worker-limit/candidate-probe/16writers-samples.jsonl": "183dda74772e2c503f3242e33133e34d3d24c7ea987ac27e89d30f01974c1f14",
+      "target/wal-opt/20261028-v7-async-worker-limit/candidate-probe/16writers.stdout": "73f07e0622c81b1075f30846346ee1809cdd8b99bab3113c32ee23d67d5251c8",
+      "target/wal-opt/20261028-v7-async-worker-limit/candidate-probe/16writers.stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    }
+  }
+]

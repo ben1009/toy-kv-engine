@@ -1,0 +1,30 @@
+{
+  "source_base": "976a1e35d1cbf35707f59a50cd4ad674f713e15a",
+  "reconstructed_variants": 2,
+  "reconstructed_inputs_per_variant": 128,
+  "restored_inputs": 128,
+  "summary_regenerates": true,
+  "all_four_cells_complete": true,
+  "new_completed_invocations": 42,
+  "interrupted_without_json": 1,
+  "corrected_matrix_records": 36,
+  "corrected_scored_records": 28,
+  "global_unique_invocations": 591,
+  "full_archive_unique_invocations": 4687,
+  "source_retained": false,
+  "retained_source_restored": true,
+  "canonical_sha256": "f353022d846530a6754330aaea11f295319ea8f4de20afa09b6d2a3b57b021d8",
+  "candidate_tests": 1974,
+  "focused_tests": 48,
+  "restored_tests": 1973,
+  "helpers_before": [
+    70,
+    69
+  ],
+  "initial_probe_helpers": 231,
+  "corrected_probe_helpers": 4,
+  "decision_sha256": "b0781d70ce9f9f817e9cd23c39787cc2fe1d9cc772edb3436c84f6d2ce97f03b",
+  "checks_sha256": "e60d7e49e421f18375c4d5d3fc0703ce6601c79834b8921cf2fdafcc6ce6ba4d",
+  "interrupted_sha256": "9f9ea6abea248fed9488587d198795cd2c84ce5b3930773d61c01f0a29c1c3d2",
+  "verifier_sha256": "61953fc23d50ccbeaa625d1ebbdbe340f34f57fc90557e52fbd65765c9a9cfcd"
+}

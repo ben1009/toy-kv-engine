@@ -1,0 +1,24 @@
+{
+  "created_at_utc": "2026-10-27T16:24:28.134332+00:00",
+  "source_base": "976a1e35d1cbf35707f59a50cd4ad674f713e15a",
+  "baseline": {
+    "path": "target/release/write-perf-v7-large-data-async-dispatch",
+    "sha256": "f353022d846530a6754330aaea11f295319ea8f4de20afa09b6d2a3b57b021d8"
+  },
+  "candidate": "On the ext-filesystem v7 runtime already enabling large-DATA async dispatch, request a four-thread limit for bounded io-wq workers per NUMA node. Leave unbounded workers unchanged; unsupported or denied tuning falls back to kernel defaults. Other runtimes retain their setup.",
+  "motivation": "Two fixed retained diagnostics observe up to70/69 kernel helpers at8/16 writers, all associated with the WAL issuer. Most are sleeping when sampled. Test limiting proliferation; this does not prove worker count causes storage stalls or that four helpers preserve throughput.",
+  "scope": "One source candidate; local repo only. Validate and run a bounded SSD screen, dependent guards only after screen benefit. Preserve prior evidence; stop for review, no push/PR.",
+  "validation": "A real ring test queries bounded/unbounded worker limits, applies the candidate setup, verifies the bounded limit is four and the unbounded limit is unchanged, then verifies ordinary setup does not alter it. Existing real large/small O_DIRECT worker writes, v7 recovery, extent and failure/ownership tests plus full checks outside sandbox.",
+  "configuration": "Fresh local ext4 databases, 1KiB values, 2GiB SST, explicit v7 Parallel/no compaction. 750000 batch64 puts/sample10 at16,8,1writers;100000 point puts/sample100 at8writers. Host audit before/1Hz/after,30s initial cooldown,10s gaps, no concurrent build/test/source edit/profile.",
+  "schedule": "Two warmups and five alternating pairs at batch16, followed by two warmups and three alternating pairs each at batch8,point8,batch1. Run all four fixed cells regardless of interim performance to preserve smaller-workload evidence under moving stalls. No replacement or score-selected retries; stop on capture correctness or sampled host-audit errors.",
+  "stall_policy": "Preserve every raw invocation. Predeclare an obvious-stall flag when mean FRONTIER-write >=1ms or mean fdatasync >=1.5ms, relative to observed quiet markers~20-150us and syncs~350us. Exclude a pair from the filtered comparison if either invocation is flagged. This conservative aggregate mask misses short outliers and cannot prove retained samples stall-free or distinguish source-induced I/O changes from environment. Report exclusions by arm and all raw ratios.",
+  "assessment": "Screen: at least3 filtered matched pairs with median paired and arm-median throughput>1 and paired p99<1. Other cells: at least2 filtered pairs with paired and arm-median throughput>=0.95 and paired p99<=1.10. Identical DATA bytes throughout. CPU/RSS diagnostic only. All four cells are captured even if a guard fails; aggregate threshold limitations remain explicit. Retention requires the complete assessment or a clearly labelled maintainer-directed provisional decision.",
+  "publication": "Keep accepted source in its own local commit, with evidence separate. For a failed or inconclusive candidate, evidence-only commit plus exact restoration.",
+  "prior_verification": "rfc-025-v7-large-data-async-retention-20261028-verification.json",
+  "prior_global_invocations": 549,
+  "diagnostic_invocations": 3,
+  "diagnostic_plan_sha256": "c28b4a358f96b364ebfa1bf0626dd58c38262c6e12ec7ead88b1078d54d14095",
+  "diagnostic_captures_sha256": "a98ba923ddab69c054efe7e8cc1e89f315c627622cef0a261b18f82d5d571526",
+  "retained_diagnostics": 2,
+  "candidate_probe": "One additional fixed unscored16-writer run after the release build and before scoring verifies that sampled helper count remains at most four. Same100ms task sampler and native WAL call interposer; no performance selection. Then the scored matrix begins after its own30s cooldown."
+}

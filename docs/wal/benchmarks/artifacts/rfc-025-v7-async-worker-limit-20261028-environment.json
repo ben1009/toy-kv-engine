@@ -1,0 +1,13 @@
+{
+  "source_base": "976a1e35d1cbf35707f59a50cd4ad674f713e15a",
+  "kernel": "6.12.71-1-lts",
+  "filesystem": "/dev/nvme0n1p3 ext4 rw,relatime",
+  "toolchain": "rustc 1.100.0-nightly (6bb1652a0 2026-09-22)\nbinary: rustc\ncommit-hash: 6bb1652a020e80cef79332741d89e996d71933c9\ncommit-date: 2026-09-22\nhost: x86_64-unknown-linux-gnu\nrelease: 1.100.0-nightly\nLLVM version: 23.1.1\n",
+  "allocator_environment_overrides": {},
+  "source_manifest_sha256": "1a9a956aa4813608d20c1d736d0fadd9fc1c4c82612b2740776c8125d81ad874",
+  "patch_sha256": "82a4188c5d7862f5506d1f39f12e5a3bcd75ee4a61fd41b2e5df7e9ad4fb1812",
+  "plan_sha256": "7515856f76093cf49eae43c8ad3dec56c0c384d6e4f95304e29077ff9c2d7a14",
+  "matrix_sha256": "20d413bd354527fce6d62a4303480a0304dcdf7466a5155828cc33f66961005a",
+  "driver_sha256": "59e1f9381f72a1e4d6fa84457c940e644e60a48c29018420edd93ee61a7104d2",
+  "prior_verification_sha256": "c691aa2fffd5a4fbc8a4cbb6b1efc552323db081b4b20286525c8e67f928103e"
+}
