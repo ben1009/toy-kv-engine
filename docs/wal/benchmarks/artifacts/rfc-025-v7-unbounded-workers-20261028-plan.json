@@ -1,0 +1,21 @@
+{
+  "created_at_utc": "2026-10-27T23:37:27.247317+00:00",
+  "source_base": "073deec2c27b8376106deda1ee12d417a0ca18cb",
+  "baseline": {
+    "path": "target/release/write-perf-v7-large-data-async-dispatch",
+    "sha256": "f353022d846530a6754330aaea11f295319ea8f4de20afa09b6d2a3b57b021d8"
+  },
+  "candidate": "Only for ext-filesystem v7 rings enabling large-DATA forced async, set unbounded kernel helpers to16 per NUMA node; retain the existing bounded limit. Unsupported/denied tuning keeps defaults.",
+  "motivation": "Previous diagnostic observed70/69 mostly sleeping helpers at8/16writers. Limiting both pools to4 harmed point writes and did not improve batch16. This separate candidate limits only the pool reached by forced async, with room for16 concurrent writers. Counts motivate a hypothesis, not proof that helpers cause stalls.",
+  "scope": "One source candidate, four fixed SSD cells; local repository only. Stop for review, no push or PR.",
+  "validation": "Real-ring test starts with distinct bounded/unbounded limits, verifies None changes neither and Some changes only unbounded to16. Mixed large/small O_DIRECT write test plus full existing correctness coverage. One excluded16-writer engine probe must observe at most32 total helpers on this one-NUMA-node host before scoring. This is a mechanism sanity bound; ordinary bounded fallback remains permitted.",
+  "configuration": "Fresh local ext4 databases, 1KiB values, 2GiB SST, explicit v7 Parallel/no compaction. 750000 batch64 puts/sample10 at16,8,1writers;100000 point puts/sample100 at8writers. Host audit before/1Hz/after,30s initial cooldown,10s gaps, no concurrent build/test/source edit/profile. No SSD health or temperature polling.",
+  "schedule": "Two warmups and five alternating pairs at batch16, followed by two warmups and three alternating pairs each at batch8,point8,batch1. Run all four fixed cells regardless of interim performance. No replacements or score-selected retries; stop on capture correctness or host-audit errors.",
+  "stall_policy": "Preserve every raw invocation. Predeclare an obvious-stall flag when mean FRONTIER-write >=1ms or mean fdatasync >=1.5ms, relative to observed quiet markers~20-150us and syncs~350us. Exclude a pair from the filtered comparison if either invocation is flagged. This conservative aggregate mask misses short outliers and cannot prove retained samples stall-free or distinguish source-induced I/O changes from environment. Report exclusions by arm and all raw ratios.",
+  "assessment": "Screen: at least3 filtered matched pairs, both median paired and arm-median throughput>1, paired p99<1. Other cells: at least2 filtered matched pairs, both throughput ratios>=0.95 and paired p99<=1.10. Identical DATA bytes. CPU/RSS diagnostic. Retention requires all four guards; failed or inconclusive candidate is restored exactly.",
+  "publication": "Keep accepted source in its own local commit, with evidence separate. For a failed or inconclusive candidate, evidence-only commit plus exact restoration.",
+  "prior_verification": "rfc-025-v7-async-pool-limits-20261028-verification.json",
+  "prior_global_invocations": 591,
+  "diagnostic_invocations": 1,
+  "candidate_probe": "One excluded16-writer helper probe, at most32 sampled total helpers, before the fixed matrix. Probe and matrix launched sequentially with checked exit codes."
+}

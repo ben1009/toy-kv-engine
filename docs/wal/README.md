@@ -36,6 +36,7 @@ the retained and rejected experiments.
 
 ## Benchmarks and qualification
 
+- [RFC 025 unbounded kernel worker limit (not retained; eight-writer and solo guards fail), 2026-10-28](benchmarks/rfc-025-v7-unbounded-workers-20261028.md)
 - [RFC 025 kernel worker pool limits (rejected; all four SSD workloads measured), 2026-10-28](benchmarks/rfc-025-v7-async-pool-limits-20261028.md)
 - [RFC 025 async dispatch for large v7 DATA (retained provisionally; confirmation pending), 2026-10-27 UTC](benchmarks/rfc-025-v7-large-data-async-dispatch-20261027.md)
 - [RFC 025 large-wave FRONTIER allocation (not retained; filtered screen misses throughput/p99), 2026-10-27](benchmarks/rfc-025-v7-large-frontier-allocation-20261027.md)

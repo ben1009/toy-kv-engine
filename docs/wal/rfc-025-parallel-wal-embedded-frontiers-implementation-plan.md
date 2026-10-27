@@ -2811,6 +2811,18 @@ checks pass 1,974/1,973 tests. The accepted async-dispatch source and executable
 are restored. Both variants preserve 42 new completed run IDs, bringing this
 lineage to 591, plus one explicitly recorded interrupted run without JSON.
 
+The [unbounded-only worker limit](benchmarks/rfc-025-v7-unbounded-workers-20261028.md)
+also remains unretained. It preserves the bounded class and limits the
+forced-async class to sixteen; an excluded engine probe observes sixteen
+helpers. Batch16 passes its screen at +1.2% throughput/-6.3% p99 across four
+matched pairs, but batch8 fails at -10.1% throughput despite -9.3% p99 across
+three pairs. Solo batches fail too; point and solo I/O timing varies widely
+below the aggregate stall cutoffs. All four fixed cells finish without
+replacement runs. Candidate/restored checks pass 1,974/1,973 tests. The retained
+async-dispatch source and executable are restored exactly. Thirty-seven new
+completed run IDs advance this lineage to 628, with the prior interrupted
+invocation still counted separately. This result does not qualify v4 parity.
+
 ## Delivery checklist
 
 - [ ] Stages 1–3: legacy compatibility, byte-exact codec, independent validation,
