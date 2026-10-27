@@ -1049,7 +1049,11 @@ impl ParallelWalRuntime {
         } else {
             None
         };
-        let mut worker = IoWorker::spawn(worker_file, Arc::clone(&buffer_pool))?;
+        let mut worker = IoWorker::spawn(
+            worker_file,
+            Arc::clone(&buffer_pool),
+            prepared_v7_extent_end.map(|_| ALLOCATION_ONLY_MIN_BATCH_BYTES),
+        )?;
         let worker_client = worker.client();
         let sync_progress = worker.sync_progress();
         sync_progress.initialize_frontiers(start.next_ticket);
