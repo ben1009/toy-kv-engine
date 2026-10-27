@@ -1,0 +1,26 @@
+{
+  "source_base": "7aefc27a227a5e500ef4ac497ad40b7e59182efb",
+  "source_commit": "d7fbe1c9f085b159c9e082a070f9437a42839314",
+  "assessment_passed": false,
+  "source_retained": true,
+  "provisional_retention": true,
+  "cpu_is_diagnostic": true,
+  "all_requested_cells_run": true,
+  "captured_cells": [
+    "ext4-point8",
+    "ext4-batch1",
+    "ext4-batch16",
+    "ext4-point1",
+    "ext4-point16",
+    "confirmation-batch8"
+  ],
+  "cancelled_cells": [],
+  "failed_v7_cells": [
+    "ext4-batch1"
+  ],
+  "retention_exception": "Retain provisionally for local review under the maintainer throughput/p99 preference: independent batch8 confirmation and batch16 show both benefits, while other point cells pass regression guards. The original batch1 failure remains. Supplemental identical-baseline arms differ2.79x and yield opposite candidate conclusions, leaving solo source causality unresolved. This is a reasoned provisional-retention exception to the predeclared automatic all-cell gate, not an overall pass or an explicit maintainer waiver of the newly observed solo failure.",
+  "performance_limits": "Single-writer batch qualification remains unresolved; moving SSD and V4 controls prevent a precise causal speedup claim. No V4 parity or fullRFC qualification.",
+  "supplemental_solo_cohort": "rfc-025-v7-ssd-batch-solo-control-20261027",
+  "source_policy_unchanged_since_initial_trial": true,
+  "publication": "Local source/evidence commits only; no default activation, PR or push."
+}

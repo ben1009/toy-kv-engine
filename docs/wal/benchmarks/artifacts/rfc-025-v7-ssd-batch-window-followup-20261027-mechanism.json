@@ -1,0 +1,446 @@
+{
+  "ext4-point8": {
+    "old_v4": {
+      "run_ids": [
+        "1793071317420",
+        "1793071489291",
+        "1793071509317"
+      ],
+      "pipeline_medians": {
+        "commit_buffers": 100000,
+        "sync_count": 12687,
+        "sync_coalesce_wait_calls": 36333,
+        "sync_coalesce_wait_ns": 161681439,
+        "fdatasync_ns": 4071800602,
+        "frontier_write_ns": 0,
+        "preallocation_ns": 1324752
+      },
+      "all_coalescing_waits_zero": false,
+      "batches_per_sync_median": 7.882084023015685
+    },
+    "new_v4": {
+      "run_ids": [
+        "1793071346081",
+        "1793071460058",
+        "1793071525165"
+      ],
+      "pipeline_medians": {
+        "commit_buffers": 100000,
+        "sync_count": 12695,
+        "sync_coalesce_wait_calls": 27862,
+        "sync_coalesce_wait_ns": 178121762,
+        "fdatasync_ns": 5681441780,
+        "frontier_write_ns": 0,
+        "preallocation_ns": 1339323
+      },
+      "all_coalescing_waits_zero": false,
+      "batches_per_sync_median": 7.877116975187081
+    },
+    "old_v7": {
+      "run_ids": [
+        "1793071368234",
+        "1793071430554",
+        "1793071553154"
+      ],
+      "pipeline_medians": {
+        "commit_buffers": 100000,
+        "sync_count": 12955,
+        "sync_coalesce_wait_calls": 25231,
+        "sync_coalesce_wait_ns": 393913955,
+        "fdatasync_ns": 5336825363,
+        "frontier_write_ns": 1471632947,
+        "preallocation_ns": 488695842
+      },
+      "all_coalescing_waits_zero": false,
+      "batches_per_sync_median": 7.719027402547279
+    },
+    "new_v7": {
+      "run_ids": [
+        "1793071384409",
+        "1793071401716",
+        "1793071582451"
+      ],
+      "pipeline_medians": {
+        "commit_buffers": 100000,
+        "sync_count": 13097,
+        "sync_coalesce_wait_calls": 25541,
+        "sync_coalesce_wait_ns": 537818721,
+        "fdatasync_ns": 5012564354,
+        "frontier_write_ns": 1439489616,
+        "preallocation_ns": 560326125
+      },
+      "all_coalescing_waits_zero": false,
+      "batches_per_sync_median": 7.635336336565626
+    }
+  },
+  "ext4-batch1": {
+    "old_v4": {
+      "run_ids": [
+        "1793071778671",
+        "1793072028714",
+        "1793072073090"
+      ],
+      "pipeline_medians": {
+        "commit_buffers": 11719,
+        "sync_count": 11719,
+        "sync_coalesce_wait_calls": 0,
+        "sync_coalesce_wait_ns": 0,
+        "fdatasync_ns": 17762788022,
+        "frontier_write_ns": 0,
+        "preallocation_ns": 3913900
+      },
+      "all_coalescing_waits_zero": true,
+      "batches_per_sync_median": 1.0
+    },
+    "new_v4": {
+      "run_ids": [
+        "1793071827735",
+        "1793071987764",
+        "1793072095215"
+      ],
+      "pipeline_medians": {
+        "commit_buffers": 11719,
+        "sync_count": 11719,
+        "sync_coalesce_wait_calls": 0,
+        "sync_coalesce_wait_ns": 0,
+        "fdatasync_ns": 13765420437,
+        "frontier_write_ns": 0,
+        "preallocation_ns": 3888101
+      },
+      "all_coalescing_waits_zero": true,
+      "batches_per_sync_median": 1.0
+    },
+    "old_v7": {
+      "run_ids": [
+        "1793071860005",
+        "1793071966907",
+        "1793072143266"
+      ],
+      "pipeline_medians": {
+        "commit_buffers": 11719,
+        "sync_count": 11719,
+        "sync_coalesce_wait_calls": 0,
+        "sync_coalesce_wait_ns": 0,
+        "fdatasync_ns": 8295837616,
+        "frontier_write_ns": 566872786,
+        "preallocation_ns": 16481045
+      },
+      "all_coalescing_waits_zero": true,
+      "batches_per_sync_median": 1.0
+    },
+    "new_v7": {
+      "run_ids": [
+        "1793071888235",
+        "1793071930592",
+        "1793072176724"
+      ],
+      "pipeline_medians": {
+        "commit_buffers": 11719,
+        "sync_count": 11719,
+        "sync_coalesce_wait_calls": 0,
+        "sync_coalesce_wait_ns": 0,
+        "fdatasync_ns": 12864869973,
+        "frontier_write_ns": 1094130199,
+        "preallocation_ns": 21594010
+      },
+      "all_coalescing_waits_zero": true,
+      "batches_per_sync_median": 1.0
+    }
+  },
+  "ext4-batch16": {
+    "old_v4": {
+      "run_ids": [
+        "1793072306313",
+        "1793072422636",
+        "1793072437142"
+      ],
+      "pipeline_medians": {
+        "commit_buffers": 11728,
+        "sync_count": 1571,
+        "sync_coalesce_wait_calls": 5691,
+        "sync_coalesce_wait_ns": 398023507,
+        "fdatasync_ns": 1120529975,
+        "frontier_write_ns": 0,
+        "preallocation_ns": 2501050
+      },
+      "all_coalescing_waits_zero": false,
+      "batches_per_sync_median": 7.465308720560153
+    },
+    "new_v4": {
+      "run_ids": [
+        "1793072319855",
+        "1793072409012",
+        "1793072459792"
+      ],
+      "pipeline_medians": {
+        "commit_buffers": 11728,
+        "sync_count": 1595,
+        "sync_coalesce_wait_calls": 5901,
+        "sync_coalesce_wait_ns": 383415620,
+        "fdatasync_ns": 845522710,
+        "frontier_write_ns": 0,
+        "preallocation_ns": 2564370
+      },
+      "all_coalescing_waits_zero": false,
+      "batches_per_sync_median": 7.352978056426332
+    },
+    "old_v7": {
+      "run_ids": [
+        "1793072336608",
+        "1793072390950",
+        "1793072483154"
+      ],
+      "pipeline_medians": {
+        "commit_buffers": 11728,
+        "sync_count": 1505,
+        "sync_coalesce_wait_calls": 3836,
+        "sync_coalesce_wait_ns": 659561178,
+        "fdatasync_ns": 2245788717,
+        "frontier_write_ns": 2640138971,
+        "preallocation_ns": 3143761768
+      },
+      "all_coalescing_waits_zero": false,
+      "batches_per_sync_median": 7.7926910299003325
+    },
+    "new_v7": {
+      "run_ids": [
+        "1793072354504",
+        "1793072372249",
+        "1793072501194"
+      ],
+      "pipeline_medians": {
+        "commit_buffers": 11728,
+        "sync_count": 1404,
+        "sync_coalesce_wait_calls": 4362,
+        "sync_coalesce_wait_ns": 957706416,
+        "fdatasync_ns": 1666264242,
+        "frontier_write_ns": 2319662267,
+        "preallocation_ns": 2762032321
+      },
+      "all_coalescing_waits_zero": false,
+      "batches_per_sync_median": 8.353276353276353
+    }
+  },
+  "ext4-point1": {
+    "old_v4": {
+      "run_ids": [
+        "1793072667002",
+        "1793072804383",
+        "1793072823689"
+      ],
+      "pipeline_medians": {
+        "commit_buffers": 20000,
+        "sync_count": 20000,
+        "sync_coalesce_wait_calls": 0,
+        "sync_coalesce_wait_ns": 0,
+        "fdatasync_ns": 5144739014,
+        "frontier_write_ns": 0,
+        "preallocation_ns": 475166
+      },
+      "all_coalescing_waits_zero": true,
+      "batches_per_sync_median": 1.0
+    },
+    "new_v4": {
+      "run_ids": [
+        "1793072688631",
+        "1793072784921",
+        "1793072857847"
+      ],
+      "pipeline_medians": {
+        "commit_buffers": 20000,
+        "sync_count": 20000,
+        "sync_coalesce_wait_calls": 0,
+        "sync_coalesce_wait_ns": 0,
+        "fdatasync_ns": 5053355212,
+        "frontier_write_ns": 0,
+        "preallocation_ns": 284992
+      },
+      "all_coalescing_waits_zero": true,
+      "batches_per_sync_median": 1.0
+    },
+    "old_v7": {
+      "run_ids": [
+        "1793072706356",
+        "1793072763767",
+        "1793072892876"
+      ],
+      "pipeline_medians": {
+        "commit_buffers": 20000,
+        "sync_count": 20000,
+        "sync_coalesce_wait_calls": 0,
+        "sync_coalesce_wait_ns": 0,
+        "fdatasync_ns": 4966475852,
+        "frontier_write_ns": 336908818,
+        "preallocation_ns": 223212682
+      },
+      "all_coalescing_waits_zero": true,
+      "batches_per_sync_median": 1.0
+    },
+    "new_v7": {
+      "run_ids": [
+        "1793072724930",
+        "1793072744250",
+        "1793072928772"
+      ],
+      "pipeline_medians": {
+        "commit_buffers": 20000,
+        "sync_count": 20000,
+        "sync_coalesce_wait_calls": 0,
+        "sync_coalesce_wait_ns": 0,
+        "fdatasync_ns": 4877581503,
+        "frontier_write_ns": 350840158,
+        "preallocation_ns": 137181159
+      },
+      "all_coalescing_waits_zero": true,
+      "batches_per_sync_median": 1.0
+    }
+  },
+  "ext4-point16": {
+    "old_v4": {
+      "run_ids": [
+        "1793073041247",
+        "1793073182844",
+        "1793073204559"
+      ],
+      "pipeline_medians": {
+        "commit_buffers": 100000,
+        "sync_count": 6719,
+        "sync_coalesce_wait_calls": 61804,
+        "sync_coalesce_wait_ns": 389684271,
+        "fdatasync_ns": 5950303256,
+        "frontier_write_ns": 0,
+        "preallocation_ns": 1389340
+      },
+      "all_coalescing_waits_zero": false,
+      "batches_per_sync_median": 14.883167137966959
+    },
+    "new_v4": {
+      "run_ids": [
+        "1793073063002",
+        "1793073160883",
+        "1793073226781"
+      ],
+      "pipeline_medians": {
+        "commit_buffers": 100000,
+        "sync_count": 6800,
+        "sync_coalesce_wait_calls": 62496,
+        "sync_coalesce_wait_ns": 422877817,
+        "fdatasync_ns": 6058242305,
+        "frontier_write_ns": 0,
+        "preallocation_ns": 1382631
+      },
+      "all_coalescing_waits_zero": false,
+      "batches_per_sync_median": 14.705882352941176
+    },
+    "old_v7": {
+      "run_ids": [
+        "1793073085086",
+        "1793073143080",
+        "1793073246155"
+      ],
+      "pipeline_medians": {
+        "commit_buffers": 100000,
+        "sync_count": 6577,
+        "sync_coalesce_wait_calls": 52888,
+        "sync_coalesce_wait_ns": 437142563,
+        "fdatasync_ns": 2847436650,
+        "frontier_write_ns": 943178336,
+        "preallocation_ns": 155365638
+      },
+      "all_coalescing_waits_zero": false,
+      "batches_per_sync_median": 15.20450053215752
+    },
+    "new_v7": {
+      "run_ids": [
+        "1793073108331",
+        "1793073129004",
+        "1793073260373"
+      ],
+      "pipeline_medians": {
+        "commit_buffers": 100000,
+        "sync_count": 6600,
+        "sync_coalesce_wait_calls": 54090,
+        "sync_coalesce_wait_ns": 405438473,
+        "fdatasync_ns": 2905080943,
+        "frontier_write_ns": 998671172,
+        "preallocation_ns": 217804366
+      },
+      "all_coalescing_waits_zero": false,
+      "batches_per_sync_median": 15.151515151515152
+    }
+  },
+  "confirmation-batch8": {
+    "old_v4": {
+      "run_ids": [
+        "1793073385134",
+        "1793073517310",
+        "1793073542698"
+      ],
+      "pipeline_medians": {
+        "commit_buffers": 11720,
+        "sync_count": 2408,
+        "sync_coalesce_wait_calls": 5406,
+        "sync_coalesce_wait_ns": 531602005,
+        "fdatasync_ns": 4011684051,
+        "frontier_write_ns": 0,
+        "preallocation_ns": 2562510
+      },
+      "all_coalescing_waits_zero": false,
+      "batches_per_sync_median": 4.867109634551495
+    },
+    "new_v4": {
+      "run_ids": [
+        "1793073408085",
+        "1793073489867",
+        "1793073556906"
+      ],
+      "pipeline_medians": {
+        "commit_buffers": 11720,
+        "sync_count": 2467,
+        "sync_coalesce_wait_calls": 3986,
+        "sync_coalesce_wait_ns": 613601591,
+        "fdatasync_ns": 7917065899,
+        "frontier_write_ns": 0,
+        "preallocation_ns": 2703647
+      },
+      "all_coalescing_waits_zero": false,
+      "batches_per_sync_median": 4.750709363599514
+    },
+    "old_v7": {
+      "run_ids": [
+        "1793073435917",
+        "1793073475476",
+        "1793073575227"
+      ],
+      "pipeline_medians": {
+        "commit_buffers": 11720,
+        "sync_count": 2351,
+        "sync_coalesce_wait_calls": 4661,
+        "sync_coalesce_wait_ns": 704400637,
+        "fdatasync_ns": 1815209485,
+        "frontier_write_ns": 1388799301,
+        "preallocation_ns": 502472699
+      },
+      "all_coalescing_waits_zero": false,
+      "batches_per_sync_median": 4.985112717992344
+    },
+    "new_v7": {
+      "run_ids": [
+        "1793073451188",
+        "1793073463358",
+        "1793073597019"
+      ],
+      "pipeline_medians": {
+        "commit_buffers": 11720,
+        "sync_count": 1704,
+        "sync_coalesce_wait_calls": 5559,
+        "sync_coalesce_wait_ns": 782468390,
+        "fdatasync_ns": 526390510,
+        "frontier_write_ns": 120416137,
+        "preallocation_ns": 12739071
+      },
+      "all_coalescing_waits_zero": false,
+      "batches_per_sync_median": 6.877934272300469
+    }
+  }
+}

@@ -1,5 +1,7 @@
 # RFC 025: SSD extent lookahead and separate batch coalescing, 2026-10-27
 
+**Follow-up:** the maintainer requested the remaining tests and chose throughput/p99-led retention. The [remaining qualification](rfc-025-v7-ssd-batch-window-followup-20261027.md) keeps the batch candidate provisionally, with single-writer uncertainty and failed automatic qualification explicit. The initial result below remains historical.
+
 **Result: neither bounded extent policy nor the batch-only coalescing policy is adopted. The original retained SSD runtime and executable are restored. Batch coalescing reduces sync count, but misses the frozen material-gain requirement; the kept async and serial improvements remain.**
 
 This investigation returns to SSD writes after the allocator and BBTree trials. Its source base is `53f48459b15ae96d50df39ab0f5e7586579206fc`. System and SkipMap remain selected. Every candidate starts from the retained asynchronous v7 extent preparation (`0ffebd51`) and serial startup/hybrid policy (`71bd7c23`); candidates are not stacked on a failed predecessor.

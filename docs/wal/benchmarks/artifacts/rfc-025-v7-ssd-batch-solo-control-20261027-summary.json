@@ -1,0 +1,378 @@
+{
+  "cell": {
+    "invocations": 18,
+    "records": 18,
+    "warmup_records": 3,
+    "host_samples": 465,
+    "run_ids": [
+      "1793075737363",
+      "1793075762662",
+      "1793075791032",
+      "1793075837535",
+      "1793075865885",
+      "1793075890874",
+      "1793075934188",
+      "1793075975274",
+      "1793075998007",
+      "1793076044262",
+      "1793076078964",
+      "1793076103673",
+      "1793076147636",
+      "1793076185064",
+      "1793076206240",
+      "1793076247052",
+      "1793076287788",
+      "1793076308779"
+    ],
+    "comparisons": {
+      "concurrent_batch_64/repeat_reference": {
+        "pairs": [
+          {
+            "pair": 1,
+            "throughput": 1.2235290022768133,
+            "cpu": 0.9588159161180689,
+            "rss": 0.9998361595805685,
+            "p99": 0.8994351835194536,
+            "sync_count": 1.0,
+            "data_bytes": 1.0
+          },
+          {
+            "pair": 2,
+            "throughput": 2.878047256873505,
+            "cpu": 0.8712939397543478,
+            "rss": 1.0004485620136985,
+            "p99": 0.18106080838489727,
+            "sync_count": 1.0,
+            "data_bytes": 1.0
+          },
+          {
+            "pair": 3,
+            "throughput": 1.6853923171174332,
+            "cpu": 0.9147798185338214,
+            "rss": 1.0007294890555058,
+            "p99": 0.14582140240940528,
+            "sync_count": 1.0,
+            "data_bytes": 1.0
+          },
+          {
+            "pair": 4,
+            "throughput": 2.7939071242490674,
+            "cpu": 0.8833010126958911,
+            "rss": 1.0003623422840504,
+            "p99": 0.12339671472700599,
+            "sync_count": 1.0,
+            "data_bytes": 1.0
+          },
+          {
+            "pair": 5,
+            "throughput": 2.823832036898107,
+            "cpu": 0.8493331469291717,
+            "rss": 1.0001293003129068,
+            "p99": 0.08528665196405325,
+            "sync_count": 1.0,
+            "data_bytes": 1.0
+          }
+        ],
+        "median": {
+          "throughput": 2.7939071242490674,
+          "cpu": 0.8833010126958911,
+          "rss": 1.0003623422840504,
+          "p99": 0.14582140240940528,
+          "sync_count": 1.0,
+          "data_bytes": 1.0
+        },
+        "per_arm": {
+          "old_ref_v7": {
+            "median_rate": 24672.672312167735,
+            "median_cpu_ms": 7776.6449999999995,
+            "median_peak_rss_kib": 927408,
+            "peak_rate": 41662.83496351029,
+            "peak_run_id": "1793075837535",
+            "peak_raw_sha256": "bac084d6bfc837d869a86ea026ed8596fe48bbcbbc731be25f2be36b2f4426ba",
+            "binary_sha256": "e7f7712825d2166c14b5b67601388a8e29697f8fc034832e457061cf6e30ae19",
+            "median_p99_ms": 11.141966,
+            "pipeline_medians": {
+              "commit_groups": 11719,
+              "commit_buffers": 11719,
+              "commit_bytes": 816001024,
+              "sync_count": 11719,
+              "fdatasync_ns": 15115751293,
+              "frontier_writes": 11719,
+              "frontier_bytes": 48001024,
+              "frontier_write_ns": 1500318758,
+              "preallocation_ns": 21029210,
+              "wal_sync_wait_ns": 27253252175,
+              "memtable_insert_ns": 1356352949
+            }
+          },
+          "old_repeat_v7": {
+            "median_rate": 60057.864007891236,
+            "median_cpu_ms": 7212.329,
+            "median_peak_rss_kib": 927636,
+            "peak_rate": 69671.48251098815,
+            "peak_run_id": "1793076287788",
+            "peak_raw_sha256": "972ccd9d8e4de04f86f8808b53ddbfc4366b14236383f61a52f3027498bf3408",
+            "binary_sha256": "e7f7712825d2166c14b5b67601388a8e29697f8fc034832e457061cf6e30ae19",
+            "median_p99_ms": 1.623762,
+            "pipeline_medians": {
+              "commit_groups": 11719,
+              "commit_buffers": 11719,
+              "commit_bytes": 816001024,
+              "sync_count": 11719,
+              "fdatasync_ns": 4180888058,
+              "frontier_writes": 11719,
+              "frontier_bytes": 48001024,
+              "frontier_write_ns": 483389864,
+              "preallocation_ns": 17736227,
+              "wal_sync_wait_ns": 9392093480,
+              "memtable_insert_ns": 1235001665
+            }
+          }
+        },
+        "guards": {
+          "paired_floor": true,
+          "arm_median_floor": true,
+          "p99_ceiling": true,
+          "identical_data_bytes": true
+        },
+        "passed": true,
+        "memory_review": false
+      },
+      "concurrent_batch_64/candidate_reference": {
+        "pairs": [
+          {
+            "pair": 1,
+            "throughput": 0.5458441461592313,
+            "cpu": 1.0852776486518287,
+            "rss": 1.0003751083286985,
+            "p99": 1.6247144518285728,
+            "sync_count": 1.0,
+            "data_bytes": 1.0
+          },
+          {
+            "pair": 2,
+            "throughput": 1.1688987910646658,
+            "cpu": 0.9424610157171821,
+            "rss": 1.000914376412539,
+            "p99": 0.7436367728981108,
+            "sync_count": 1.0,
+            "data_bytes": 1.0
+          },
+          {
+            "pair": 3,
+            "throughput": 0.7227677381420546,
+            "cpu": 1.0004219819223805,
+            "rss": 1.0018345138969824,
+            "p99": 1.2555995229216976,
+            "sync_count": 1.0,
+            "data_bytes": 1.0
+          },
+          {
+            "pair": 4,
+            "throughput": 1.1287262097195339,
+            "cpu": 0.9277487138032045,
+            "rss": 0.9999784320069017,
+            "p99": 1.0222025448650625,
+            "sync_count": 1.0,
+            "data_bytes": 1.0
+          },
+          {
+            "pair": 5,
+            "throughput": 1.0862907931064787,
+            "cpu": 1.0696084040307599,
+            "rss": 0.9993922885293383,
+            "p99": 0.7433991357763975,
+            "sync_count": 1.0,
+            "data_bytes": 1.0
+          }
+        ],
+        "median": {
+          "throughput": 1.0862907931064787,
+          "cpu": 1.0004219819223805,
+          "rss": 1.0003751083286985,
+          "p99": 1.0222025448650625,
+          "sync_count": 1.0,
+          "data_bytes": 1.0
+        },
+        "per_arm": {
+          "old_ref_v7": {
+            "median_rate": 24672.672312167735,
+            "median_cpu_ms": 7776.6449999999995,
+            "median_peak_rss_kib": 927408,
+            "peak_rate": 41662.83496351029,
+            "peak_run_id": "1793075837535",
+            "peak_raw_sha256": "bac084d6bfc837d869a86ea026ed8596fe48bbcbbc731be25f2be36b2f4426ba",
+            "binary_sha256": "e7f7712825d2166c14b5b67601388a8e29697f8fc034832e457061cf6e30ae19",
+            "median_p99_ms": 11.141966,
+            "pipeline_medians": {
+              "commit_groups": 11719,
+              "commit_buffers": 11719,
+              "commit_bytes": 816001024,
+              "sync_count": 11719,
+              "fdatasync_ns": 15115751293,
+              "frontier_writes": 11719,
+              "frontier_bytes": 48001024,
+              "frontier_write_ns": 1500318758,
+              "preallocation_ns": 21029210,
+              "wal_sync_wait_ns": 27253252175,
+              "memtable_insert_ns": 1356352949
+            }
+          },
+          "new_v7": {
+            "median_rate": 24392.08198027015,
+            "median_cpu_ms": 8106.438,
+            "median_peak_rss_kib": 928080,
+            "peak_rate": 27708.835486804503,
+            "peak_run_id": "1793076147636",
+            "peak_raw_sha256": "c2612e0993f7e3dde509549670b5e8ab3544253a82e84a0857272c8a55eb66a0",
+            "binary_sha256": "f7fd96e5ca0ecaaaa23f59f135e7ce9430521f986834e5c95f2d32070e378d54",
+            "median_p99_ms": 12.137668,
+            "pipeline_medians": {
+              "commit_groups": 11719,
+              "commit_buffers": 11719,
+              "commit_bytes": 816001024,
+              "sync_count": 11719,
+              "fdatasync_ns": 15685783752,
+              "frontier_writes": 11719,
+              "frontier_bytes": 48001024,
+              "frontier_write_ns": 1277218349,
+              "preallocation_ns": 24701037,
+              "wal_sync_wait_ns": 27701750805,
+              "memtable_insert_ns": 1326702467
+            }
+          }
+        },
+        "guards": {
+          "paired_floor": true,
+          "arm_median_floor": true,
+          "p99_ceiling": true,
+          "identical_data_bytes": true
+        },
+        "passed": true,
+        "memory_review": false
+      },
+      "concurrent_batch_64/candidate_repeat": {
+        "pairs": [
+          {
+            "pair": 1,
+            "throughput": 0.4461227687643636,
+            "cpu": 1.1318936517509657,
+            "rss": 1.0005390370641885,
+            "p99": 1.8063719116158328,
+            "sync_count": 1.0,
+            "data_bytes": 1.0
+          },
+          {
+            "pair": 2,
+            "throughput": 0.4061430152938037,
+            "cpu": 1.0816797554943387,
+            "rss": 1.0004656055458794,
+            "p99": 4.1071106416209915,
+            "sync_count": 1.0,
+            "data_bytes": 1.0
+          },
+          {
+            "pair": 3,
+            "throughput": 0.42884243081054363,
+            "cpu": 1.0936205211936394,
+            "rss": 1.0011042193255635,
+            "p99": 8.610529745122745,
+            "sync_count": 1.0,
+            "data_bytes": 1.0
+          },
+          {
+            "pair": 4,
+            "throughput": 0.40399560884576907,
+            "cpu": 1.0503199933753682,
+            "rss": 0.9996162287793919,
+            "p99": 8.28387163407478,
+            "sync_count": 1.0,
+            "data_bytes": 1.0
+          },
+          {
+            "pair": 5,
+            "throughput": 0.384686758600464,
+            "cpu": 1.2593508305875143,
+            "rss": 0.9992630834999655,
+            "p99": 8.716476947526637,
+            "sync_count": 1.0,
+            "data_bytes": 1.0
+          }
+        ],
+        "median": {
+          "throughput": 0.4061430152938037,
+          "cpu": 1.0936205211936394,
+          "rss": 1.0004656055458794,
+          "p99": 8.28387163407478,
+          "sync_count": 1.0,
+          "data_bytes": 1.0
+        },
+        "per_arm": {
+          "old_repeat_v7": {
+            "median_rate": 60057.864007891236,
+            "median_cpu_ms": 7212.329,
+            "median_peak_rss_kib": 927636,
+            "peak_rate": 69671.48251098815,
+            "peak_run_id": "1793076287788",
+            "peak_raw_sha256": "972ccd9d8e4de04f86f8808b53ddbfc4366b14236383f61a52f3027498bf3408",
+            "binary_sha256": "e7f7712825d2166c14b5b67601388a8e29697f8fc034832e457061cf6e30ae19",
+            "median_p99_ms": 1.623762,
+            "pipeline_medians": {
+              "commit_groups": 11719,
+              "commit_buffers": 11719,
+              "commit_bytes": 816001024,
+              "sync_count": 11719,
+              "fdatasync_ns": 4180888058,
+              "frontier_writes": 11719,
+              "frontier_bytes": 48001024,
+              "frontier_write_ns": 483389864,
+              "preallocation_ns": 17736227,
+              "wal_sync_wait_ns": 9392093480,
+              "memtable_insert_ns": 1235001665
+            }
+          },
+          "new_v7": {
+            "median_rate": 24392.08198027015,
+            "median_cpu_ms": 8106.438,
+            "median_peak_rss_kib": 928080,
+            "peak_rate": 27708.835486804503,
+            "peak_run_id": "1793076147636",
+            "peak_raw_sha256": "c2612e0993f7e3dde509549670b5e8ab3544253a82e84a0857272c8a55eb66a0",
+            "binary_sha256": "f7fd96e5ca0ecaaaa23f59f135e7ce9430521f986834e5c95f2d32070e378d54",
+            "median_p99_ms": 12.137668,
+            "pipeline_medians": {
+              "commit_groups": 11719,
+              "commit_buffers": 11719,
+              "commit_bytes": 816001024,
+              "sync_count": 11719,
+              "fdatasync_ns": 15685783752,
+              "frontier_writes": 11719,
+              "frontier_bytes": 48001024,
+              "frontier_write_ns": 1277218349,
+              "preallocation_ns": 24701037,
+              "wal_sync_wait_ns": 27701750805,
+              "memtable_insert_ns": 1326702467
+            }
+          }
+        },
+        "guards": {
+          "paired_floor": false,
+          "arm_median_floor": false,
+          "p99_ceiling": false,
+          "identical_data_bytes": true
+        },
+        "passed": false,
+        "memory_review": false
+      }
+    },
+    "passed": false,
+    "artifact_sha256": {
+      ".jsonl": "b21903ba6824d753a1af71e9052c662ef3c3300acb7f01c606471c7164fc0e30",
+      "-runs.tsv": "44e3129c824793166141916c26aae8d64f70939a9303e10d3f0584cd12b832a3",
+      "-host.jsonl": "a654cbb9c18506c1cd3bf2159e18ebe2496c20f46fdf38a62a1b8e32b78bfaa2"
+    }
+  },
+  "analysis_sha256": "baab4dc8a0b7855dd1194b27a8c4a353eb855feea6bae5dd9aea718eaedc7776",
+  "driver_sha256": "d1db0f15cf59d98cec941b03875ad13cf9ed58d311941a07f3c5be156f1d2c75",
+  "matrix_sha256": "b88deaba5d3645cba7b1b471977857c70f6d32de7e37f70c1740c11185d24c6c"
+}

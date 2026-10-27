@@ -36,7 +36,8 @@ the retained and rejected experiments.
 
 ## Benchmarks and qualification
 
-- [RFC 025 SSD extent lookahead and separate batch coalescing (not adopted), 2026-10-27](benchmarks/rfc-025-v7-ssd-batch-and-extent-20261027.md)
+- [RFC 025 batch-window remaining SSD tests (provisionally retained; solo unresolved), 2026-10-27](benchmarks/rfc-025-v7-ssd-batch-window-followup-20261027.md)
+- [RFC 025 SSD extent lookahead and initial batch-coalescing screen, 2026-10-27](benchmarks/rfc-025-v7-ssd-batch-and-extent-20261027.md)
 - [RFC 025 BBTree memtable trial (CPU screen failed; SSD tests cancelled), 2026-10-27](benchmarks/rfc-025-bbtree-memtable-20261027.md)
 - [RFC 025 allocator retry after SSD improvements (not adopted), 2026-10-27](benchmarks/rfc-025-v7-mimalloc-ssd-followup-20261027.md)
 - [RFC 025 serial extent scheduling fix and 16-writer SSD results (local review; full gate failed), 2026-10-27](benchmarks/rfc-025-v7-serial-preparation-20261027.md)

@@ -1,0 +1,9 @@
+{
+  "recorded_at_utc": "2026-10-27T04:50:20.478142+00:00",
+  "changed_field": "user_direction[1]",
+  "scope": "Post-timing spelling correction in the quoted user preference only; no criteria, workload, schedule, source or executable changes.",
+  "original_plan_sha256": "5dcf01f8d885068557dea19d7253cce675a452385ba908d075ca22362183e75f",
+  "corrected_plan_sha256": "955ccc480db3f43fc3a2570e50187c563c84c799a5111feca9f618d6324e9f24",
+  "original_gzip_path": "docs/wal/benchmarks/artifacts/rfc-025-v7-ssd-batch-window-followup-20261027-plan-original.json.gz",
+  "original_gzip_sha256": "b510558757e33c080325c0d66023b29da37476dd157c155d4d4299ca2bc88202"
+}

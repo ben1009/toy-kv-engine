@@ -1,0 +1,8 @@
+{
+  "source_commit": "d7fbe1c9f085b159c9e082a070f9437a42839314",
+  "source_retained": true,
+  "provisional": true,
+  "runtime_sha256": "81986cd243505af166add3a9acc4bd1a003e41aec6edcb77da5bdffc0dc2e647",
+  "canonical_sha256": "f7fd96e5ca0ecaaaa23f59f135e7ce9430521f986834e5c95f2d32070e378d54",
+  "saved_candidate": "target/release/write-perf-v7-batch-window"
+}

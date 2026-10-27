@@ -1,0 +1,26 @@
+{
+  "same_binary_control_stable": false,
+  "repeat_reference_paired_throughput": 2.7939071242490674,
+  "repeat_reference_paired_p99": 0.14582140240940528,
+  "candidate_reference_passed": true,
+  "candidate_repeat_passed": false,
+  "all_scored_coalescing_waits_zero": true,
+  "scored_run_ids": [
+    "1793075837535",
+    "1793075865885",
+    "1793075890874",
+    "1793075934188",
+    "1793075975274",
+    "1793075998007",
+    "1793076044262",
+    "1793076078964",
+    "1793076103673",
+    "1793076147636",
+    "1793076185064",
+    "1793076206240",
+    "1793076247052",
+    "1793076287788",
+    "1793076308779"
+  ],
+  "interpretation": "Identical-baseline arm ordering produces2.79x paired throughput. Candidate/reference passes and candidate/repeat fails. Neither the apparent solo loss nor its absence is isolated as a source-level effect. Original six-cell failure remains; CPU is diagnostic."
+}

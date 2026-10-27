@@ -1,0 +1,20 @@
+{
+  "created_at_utc": "2026-10-27T04:35:03.381744+00:00",
+  "source_base": "7aefc27a227a5e500ef4ac497ad40b7e59182efb",
+  "purpose": "Investigate the newly observed single-writer batch failure with an independent fixed same-binary control. No source retuning and no replacement of any prior failed result.",
+  "trigger": "All six requested cases completed. Batch1 paired throughput0.562x and p991.103x failed; both versions had11719syncs, zero coalescing waits, and large fdatasync timer differences.",
+  "prior_summary_sha256": "3386961941f21094c1434763cc394ab864ce9e2b959aecb6e20dc40dfbd5e37e",
+  "protocol": "One warmup/arm then five alternating three-arm rounds: reference e7 v7, repeat e7 v7, candidate f7 v7; reverse even rounds. Same750k puts/batch64/onewriter/1KiB/2GiB/ext4/Parallel;sampleevery10.30s initial and10s between commands. All18invocations retained; no score-selected retries.",
+  "assessment": "Report candidate/reference and candidate/repeat throughput,p99,CPU,DATA and sync counts, plus repeat/reference null control. Throughput/p99 regression guards remain0.95/1.10. CPU diagnostic only. This does not erase or reclassify the original six-cell assessment. If null controls vary substantially, source-level causality remains inconclusive. Stop after this one cohort for review.",
+  "binary_identities": {
+    "baseline": {
+      "path": "target/release/write-perf-v7-serial-startup",
+      "sha256": "e7f7712825d2166c14b5b67601388a8e29697f8fc034832e457061cf6e30ae19",
+      "features": "bench"
+    },
+    "candidate": {
+      "path": "target/release/write-perf-v7-batch-window",
+      "sha256": "f7fd96e5ca0ecaaaa23f59f135e7ce9430521f986834e5c95f2d32070e378d54"
+    }
+  }
+}

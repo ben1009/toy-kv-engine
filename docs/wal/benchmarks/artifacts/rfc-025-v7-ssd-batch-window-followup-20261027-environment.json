@@ -1,0 +1,25 @@
+{
+  "source_base": "7aefc27a227a5e500ef4ac497ad40b7e59182efb",
+  "rustc": "rustc 1.100.0-nightly (6bb1652a0 2026-09-22)\nbinary: rustc\ncommit-hash: 6bb1652a020e80cef79332741d89e996d71933c9\ncommit-date: 2026-09-22\nhost: x86_64-unknown-linux-gnu\nrelease: 1.100.0-nightly\nLLVM version: 23.1.1\n",
+  "kernel": "Linux 6.12.71-1-lts #1 SMP PREEMPT_DYNAMIC Fri, 13 Feb 2026 19:12:56 +0000 GNU/Linux",
+  "mount": "ext4 /dev/nvme0n1p3[/liu/proj/toy-kv-engine] rw,nosuid,nodev,relatime",
+  "queue": {
+    "max_hw_sectors_kb": "512",
+    "max_sectors_kb": "512",
+    "physical_block_size": "512",
+    "max_segments": "128",
+    "nr_requests": "255"
+  },
+  "source_manifest_sha256": "aa82fc48bbe344da5434fb5a21a32c882848a23bd1db593cc93acacd7732ca30",
+  "patch_sha256": "088b35cf32bcd6bcbe981fd62c2fe157e4f5247d017683d39bccb9d7cc1aa4d0",
+  "plan_sha256": "955ccc480db3f43fc3a2570e50187c563c84c799a5111feca9f618d6324e9f24",
+  "allocator_environment_overrides": [],
+  "created_at_utc": "2026-10-27T03:19:12.577004+00:00",
+  "candidate": "Exact batch-window candidate restored for user-authorized remaining qualification",
+  "hardware_metadata_origin": "Same host/mount/kernel as preceding trials; no device settings changed.",
+  "matrix_sha256": "634a0f35850a30db4ec9e53006f6be5778574e0c4305f049f56b74c2799fabb9",
+  "driver_sha256": "62bf84bd1a14df4b63b942d9eb7cf6d5aaf39f830e257fb9659eeff61c177721",
+  "baseline_profile_reuse": "rfc-025-v7-ssd-sync-preparation-20261027-profiles.json",
+  "prior_environment_sha256": "6b2b4cb69e34b9bc735acc6e1b04b625cdc3b0015e7df55589229233cf73df8c",
+  "original_plan_sha256": "5dcf01f8d885068557dea19d7253cce675a452385ba908d075ca22362183e75f"
+}

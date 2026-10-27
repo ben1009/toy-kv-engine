@@ -2711,6 +2711,18 @@ prototypes pass 1,970 tests; the batch prototype passes 1,971 and restored sourc
 passes 1,969. This separates batch investigation from point tuning without
 qualifying v4 parity or Stage 8.
 
+The [remaining batch-window tests](benchmarks/rfc-025-v7-ssd-batch-window-followup-20261027.md)
+run all six previously cancelled cells under the maintainer's throughput/p99
+preference, with CPU diagnostic only. Batch16 observes throughput +2.2% and p99
+-24.9%; independent batch8 confirmation also improves, with large storage
+variation. The original batch1 case fails throughput/p99 guards. An additional
+fixed same-binary control produces 2.79x baseline-to-baseline throughput,
+leaving solo causality unresolved. The six-cell assessment stays failed, while
+the batch source is kept provisionally for local review as a documented retention
+exception. All 72 scored follow-up records, 24 warmups, 15 scored solo-control
+records and three warmups remain. Correctness reuses exact matching 1,971-test
+and 12-focused-test evidence. No RFC adoption or v4 parity is qualified.
+
 ## Delivery checklist
 
 - [ ] Stages 1–3: legacy compatibility, byte-exact codec, independent validation,

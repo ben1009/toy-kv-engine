@@ -1,0 +1,28 @@
+{
+  "created_at_utc": "2026-10-27T03:19:12.522526+00:00",
+  "source_base": "7aefc27a227a5e500ef4ac497ad40b7e59182efb",
+  "prior_experiment": "rfc-025-v7-ssd-batch-window-20261027",
+  "prior_evidence_commit": "7aefc27a227a5e500ef4ac497ad40b7e59182efb",
+  "candidate": "Exact prior batch-specific800us v7 coalescing candidate, no source edits or policy retuning.",
+  "source_identity": "Reuse the same128-input candidate manifest and saved executable as the initial batch screen. Both source hashes and saved binary hashes are checked before scoring.",
+  "baseline": {
+    "path": "target/release/write-perf-v7-serial-startup",
+    "sha256": "e7f7712825d2166c14b5b67601388a8e29697f8fc034832e457061cf6e30ae19",
+    "features": "bench"
+  },
+  "candidate_binary": {
+    "path": "target/release/write-perf-v7-batch-window",
+    "sha256": "f7fd96e5ca0ecaaaa23f59f135e7ce9430521f986834e5c95f2d32070e378d54"
+  },
+  "user_direction": [
+    "ok, test the rest",
+    "if throughput, p99 better then worth keep"
+  ],
+  "assessment": "Throughput and p99 determine benefit. CPU, RSS, sync count and V4 controls remain reported diagnostics; a small CPU increase is not an automatic veto. Preserve the earlier zero-CPU gate/result as historical, rather than retroactively rewriting it.",
+  "retention": "Provisional retention requires all six cells complete with identical DATA byte counts, each V7 cell paired and separate-arm median throughput>=0.95 and paired p99<=1.10, and independent batch8 confirmation paired throughput>1.00 plus p99<1.00. The original screen is separate corroborating evidence. CPU is not a retention gate. Failed/noisy V4 controls limit causal interpretation and do not qualify RFC default adoption.",
+  "configuration": "Same ext4 SSD,1KiB values,2GiB SST,explicit v4/v7Parallel, fresh databases. Point1=20k/sample10,point8/16=100k/sample100;batch64=750k/sample10. One warmup per arm and3 alternating four-arm rounds per cell.30s initialcooldown,10s intercommand.",
+  "execution": "Run all six remaining cells even if a performance guard fails. Stop only for benchmark/correctness errors or detected competing work. Preserve every completed record and failed controls. No score-selected reruns; no new candidate or profiles. No build/test/profile during scoring.",
+  "validation": "Exact source/binary restored from prior candidate. Reuse byte-identical full1971-test and12-focused-test logs; no code changes require a rebuild. Final spelling, source reconstruction, raw/command/audit validation, summary regeneration and live source/executable checks before local commits. Keep source/evidence commits separate; no push or PR.",
+  "prior_screen_summary_sha256": "7cf62abbd3646a76f345c930a8d2cb40061115770eb823388a63aebeb427044f",
+  "prior_verification_sha256": "fa9b3f535face612429cd04364be09a8cd679fdc0d2c42ed8628a41eb5c7b0ed"
+}
