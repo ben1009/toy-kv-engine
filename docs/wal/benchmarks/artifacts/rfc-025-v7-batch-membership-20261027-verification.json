@@ -1,0 +1,22 @@
+{
+  "source_base": "dc3e3c1a8fce0f15700ff7c5d2ef2cb1c2875d4d",
+  "reconstructed_inputs": 128,
+  "verified_binaries": 2,
+  "source_reconstructs": true,
+  "summary_regenerates": true,
+  "records": 80,
+  "scored_records": 60,
+  "warmup_records": 20,
+  "excluded_profiles": 3,
+  "unique_invocations": 83,
+  "global_unique_invocations": 320,
+  "recognized_process_samples": 1235,
+  "source_retained": false,
+  "assessment_passed": false,
+  "cpu_is_diagnostic": true,
+  "tests": 1973,
+  "focused_tests": 8,
+  "checks_sha256": "276552d2c852807c2a7e76644cd641b3ed59e39e28dc5135de05639a36f0a9f6",
+  "decision_sha256": "3713ddc235fe0150aa75a23ac782d1040c813e363c1cb4e9b12d2443bf7ff128",
+  "verifier_sha256": "448f8817cfcf242e6ef3c891c7bcf7b58f3326abcb521833a563c3d5371caaa5"
+}

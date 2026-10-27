@@ -1,0 +1,258 @@
+--- a/kv-engine/src/wal/parallel/runtime.rs
++++ b/kv-engine/src/wal/parallel/runtime.rs
+@@ -645,3 +645,3 @@
+-    // A conservative batching hint for the contiguous, unsynced wave. Only
+-    // single-ticket completions prove the size of every logical batch;
+-    // multi-ticket groups and small batches disable the longer wait.
++    // A conservative batching hint for the contiguous, unsynced wave. V7
++    // submits one DATA write per logical batch, so the group's minimum write
++    // length proves that every batch is large without an admission lookup.
+@@ -2222,0 +2223 @@
++            min_write_bytes: 0,
+@@ -2288 +2289,6 @@
+-            Some(if v7_layout && large_batch_wave {
++            // The longer cap adds only the difference over the ordinary
++            // wait. Require the previous sync to cover that extra cost;
++            // accurate multi-ticket membership must not over-coalesce
++            // modest-latency SSD cycles.
++            let extra_wait = V7_LARGE_BATCH_COALESCE_WAIT.saturating_sub(SYNC_COALESCE_WAIT);
++            Some(if v7_layout && large_batch_wave && latency >= extra_wait {
+@@ -2424,3 +2430,8 @@
+-        let single_large_batch = completed.tickets.end == completed.tickets.start.saturating_add(1)
+-            && completed.write_bytes >= ALLOCATION_ONLY_MIN_BATCH_BYTES as u64;
+-        state.large_batch_wave = single_large_batch
++        let large_batch_group = completed.write_count > 0
++            && u64::from(completed.write_count)
++                == completed
++                    .tickets
++                    .end
++                    .saturating_sub(completed.tickets.start)
++            && completed.min_write_bytes >= ALLOCATION_ONLY_MIN_BATCH_BYTES as u32;
++        state.large_batch_wave = large_batch_group
+@@ -4248,0 +4260 @@
++                min_write_bytes: aligned_len as u32,
+@@ -4267,9 +4279,11 @@
+-                let expected = if v7 && large {
+-                    super::V7_LARGE_BATCH_COALESCE_WAIT
+-                } else {
+-                    super::SYNC_COALESCE_WAIT
+-                };
+-                assert_eq!(
+-                    super::sync_coalesce_wait(Some(Duration::from_micros(100)), v7, large),
+-                    Some(expected)
+-                );
++                for micros in [100, 399, 400, 800] {
++                    let expected = if v7 && large && micros >= 400 {
++                        super::V7_LARGE_BATCH_COALESCE_WAIT
++                    } else {
++                        super::SYNC_COALESCE_WAIT
++                    };
++                    assert_eq!(
++                        super::sync_coalesce_wait(Some(Duration::from_micros(micros)), v7, large),
++                        Some(expected)
++                    );
++                }
+@@ -4277,0 +4292,67 @@
++    }
++
++    #[test]
++    fn v7_worker_group_geometry_distinguishes_large_and_mixed_logical_batches() -> anyhow::Result<()>
++    {
++        use crate::wal::v7::{
++            install::recover_and_install_active, recovery::WalV7RecoveryAuthority,
++        };
++
++        for mixed in [false, true] {
++            let directory = tempfile::tempdir()?;
++            let path = directory.path().join("group-membership.wal");
++            let Some(V7RuntimeTestWal { wal, owner, anchor }) =
++                live_v7_test_wal(&path, super::MAX_WAL_FILE_SIZE, v7_test_resource_limits())?
++            else {
++                return Ok(());
++            };
++            #[cfg(feature = "bench")]
++            let profile = {
++                let profile = Arc::new(crate::mem_table::WriteProfile::default());
++                wal.set_write_profile(Arc::clone(&profile));
++                profile
++            };
++            let mut first = v7_test_batch(1, 65_535);
++            if mixed {
++                // The large batch plus the tiny one still average above
++                // 64 KiB. Only the minimum proves this is a mixed group.
++                first.entries.push(WalEntry::Put {
++                    key: b"second-large-value".to_vec(),
++                    value: vec![0x5A; 65_535],
++                });
++            }
++            let batches = [first, v7_test_batch(2, if mixed { 10 } else { 65_535 })];
++            let runtime = wal.parallel_runtime.as_ref().unwrap();
++            let packer = runtime.inner.packer_state.lock();
++            for batch in &batches {
++                wal.put_v7_batch_with_index(batch, LIVE_WAL_V5_LIMITS)?;
++            }
++            assert_eq!(runtime.inner.admission.lock().queue.len(), 2);
++            drop(packer);
++            wal.submit_and_commit(1)?;
++            {
++                let state = runtime.inner.durability.state.lock();
++                assert_eq!((state.written_frontier, state.durable_frontier), (2, 2));
++                assert_eq!(state.large_batch_wave, !mixed);
++            }
++            #[cfg(feature = "bench")]
++            {
++                assert_eq!(profile.wal_commit_groups.load(super::Ordering::Acquire), 1);
++                assert_eq!(profile.wal_commit_buffers.load(super::Ordering::Acquire), 2);
++            }
++            wal.close()?;
++            assert_eq!(owner.snapshot().buffer_memory_bytes, 0);
++            drop(wal);
++            let recovered = recover_and_install_active(
++                &path,
++                WalV7RecoveryAuthority::Active {
++                    predecessor: crate::pitr::ChainAnchor::Genesis {
++                        archive_epoch_id: crate::pitr::ArchiveEpochId(anchor.archive_epoch_id),
++                    },
++                    durable_anchors: vec![anchor],
++                },
++            )?;
++            assert_eq!(recovered.installed.batches, batches);
++        }
++
++        Ok(())
+@@ -4349,3 +4430,3 @@
+-        // A multi-ticket CQE does not expose individual logical batch sizes.
+-        // Even when these particular test batches are large, classify the
+-        // group conservatively instead of using its average byte count.
++        // A completion without minimum-size metadata cannot prove individual
++        // logical batch sizes. Even when these test batches are large, keep
++        // unknown geometry conservative instead of using average bytes.
+@@ -4383,0 +4465 @@
++                min_write_bytes: 0,
+@@ -5020,0 +5103 @@
++                min_write_bytes: aligned_len as u32,
+--- a/kv-engine/src/wal/parallel/worker.rs
++++ b/kv-engine/src/wal/parallel/worker.rs
+@@ -324 +324 @@
+-            profile.record_wal_commit_group(result.write_count, result.write_bytes);
++            profile.record_wal_commit_group(u64::from(result.write_count), result.write_bytes);
+@@ -331 +331 @@
+-                        result.write_count,
++                        u64::from(result.write_count),
+@@ -844 +844 @@
+-    pub(crate) write_count: u64,
++    pub(crate) write_count: u32,
+@@ -845,0 +846,4 @@
++    // Minimum DATA-write length, excluding reserved FRONTIER gaps. Zero means
++    // the geometry is unavailable, as with a rejected/unsubmitted group.
++    // This is a batching hint, never evidence of write completion or durability.
++    pub(crate) min_write_bytes: u32,
+@@ -919 +923 @@
+-            u64::try_from(group.writes.len()).map_err(|_| WorkerError::CounterOverflow)?;
++            u64::from(u32::try_from(group.writes.len()).map_err(|_| WorkerError::CounterOverflow)?);
+@@ -1235 +1239,2 @@
+-            let write_count = group.request_ids.end - group.request_ids.start;
++            let write_count = u32::try_from(group.request_ids.end - group.request_ids.start)
++                .expect("admitted group count fits u32");
+@@ -1237,0 +1243 @@
++            let mut min_write_bytes = u32::MAX;
+@@ -1239,0 +1246,5 @@
++                // Lengths were validated at admission and survive buffer
++                // retirement. Reuse this existing metadata removal instead
++                // of growing commands or per-group worker state.
++                min_write_bytes =
++                    min_write_bytes.min(write.as_ref().map_or(0, |write| write.write_len as u32));
+@@ -1257,0 +1269 @@
++                min_write_bytes,
+@@ -1358 +1370,2 @@
+-                    write_count: group.request_ids.end - group.request_ids.start,
++                    write_count: u32::try_from(group.request_ids.end - group.request_ids.start)
++                        .expect("admitted group count fits u32"),
+@@ -1359,0 +1373 @@
++                    min_write_bytes: 0,
+@@ -1870,0 +1885 @@
++                        min_write_bytes: 0,
+@@ -2045,0 +2061 @@
++                min_write_bytes: 0,
+@@ -2055,0 +2072 @@
++                min_write_bytes: 0,
+@@ -2439,0 +2457,63 @@
++    #[test]
++    fn group_minimum_write_size_survives_frontier_gaps_and_out_of_order_cqes() {
++        #[cfg(target_pointer_width = "64")]
++        {
++            assert_eq!(std::mem::size_of::<GroupWriteResult>(), 64);
++            assert_eq!(std::mem::size_of::<super::GroupState>(), 96);
++        }
++        for (first_len, second_len, short_first) in [
++            (64 * 1024, 128 * 1024, false),
++            (128 * 1024, 4096, false),
++            (64 * 1024, 128 * 1024, true),
++        ] {
++            let drops = Arc::new(AtomicUsize::new(0));
++            let gap = first_len as u64;
++            let second_offset = gap + DIRECT_IO_ALIGNMENT as u64;
++            let group = WriteGroup::new_with_frontiers(
++                0..2,
++                vec![
++                    WriteBuffer::new(
++                        DropProbe::new(first_len + 4096, Arc::clone(&drops)),
++                        0,
++                        first_len,
++                    ),
++                    WriteBuffer::new(
++                        DropProbe::new(second_len, Arc::clone(&drops)),
++                        second_offset,
++                        second_len,
++                    ),
++                ],
++                0..second_offset + second_len as u64,
++                &[gap],
++            )
++            .expect("DATA writes span one separately owned FRONTIER frame");
++            let mut core = WorkerCore::new();
++            core.enqueue(group).expect("enqueue DATA group");
++            let failure_snapshot = core.failed_group_results("snapshot before terminal CQEs");
++            assert_eq!(
++                failure_snapshot[0].min_write_bytes, 0,
++                "nonterminal failure snapshots keep geometry unknown"
++            );
++
++            let requests = submitted_ids(&mut core, 256);
++            assert_eq!(requests.len(), 2);
++            for event in core.complete_write(requests[1], second_len as i32).unwrap() {
++                match event {
++                    WorkerEvent::BufferRetired(buffer) => drop(buffer),
++                    WorkerEvent::GroupFinished(_) => panic!("the first DATA write is incomplete"),
++                }
++            }
++            let first_result = first_len - if short_first { 4096 } else { 0 };
++            let result = take_group_result(
++                core.complete_write(requests[0], first_result as i32)
++                    .unwrap(),
++            );
++            assert_eq!(result.min_write_bytes, first_len.min(second_len) as u32);
++            assert_eq!(result.write_bytes, (first_len + second_len) as u64);
++            assert_eq!(result.write_count, 2);
++            assert_eq!(result.error.is_some(), short_first);
++            assert!(core.is_idle());
++            assert_eq!(drops.load(Ordering::Acquire), 2);
++        }
++    }
++
+@@ -2618,0 +2699 @@
++                min_write_bytes: 4096,
+@@ -2629,0 +2711 @@
++                min_write_bytes: 4096,
+@@ -2650,0 +2733 @@
++                min_write_bytes: 4096,
+@@ -2676,0 +2760 @@
++                min_write_bytes: 4096,
+@@ -2710,0 +2795 @@
++                min_write_bytes: 4096,
+@@ -2773,0 +2859 @@
++                min_write_bytes: 4096,
+@@ -2826,0 +2913 @@
++                min_write_bytes: 4096,
+@@ -2861,0 +2949 @@
++                min_write_bytes: 4096,

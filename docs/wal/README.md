@@ -36,6 +36,9 @@ the retained and rejected experiments.
 
 ## Benchmarks and qualification
 
+- [RFC 025 batch geometry at worker retirement (rejected; existing optimization kept), 2026-10-27](benchmarks/rfc-025-v7-batch-retirement-hint-20261027.md)
+- [RFC 025 compact batch geometry and wait-cost budget (rejected), 2026-10-27](benchmarks/rfc-025-v7-batch-wait-budget-20261027.md)
+- [RFC 025 packed-batch membership diagnosis and initial prototype (rejected), 2026-10-27](benchmarks/rfc-025-v7-batch-membership-20261027.md)
 - [RFC 025 batch-window remaining SSD tests (provisionally retained; solo unresolved), 2026-10-27](benchmarks/rfc-025-v7-ssd-batch-window-followup-20261027.md)
 - [RFC 025 SSD extent lookahead and initial batch-coalescing screen, 2026-10-27](benchmarks/rfc-025-v7-ssd-batch-and-extent-20261027.md)
 - [RFC 025 BBTree memtable trial (CPU screen failed; SSD tests cancelled), 2026-10-27](benchmarks/rfc-025-bbtree-memtable-20261027.md)

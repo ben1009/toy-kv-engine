@@ -2723,6 +2723,18 @@ exception. All 72 scored follow-up records, 24 warmups, 15 scored solo-control
 records and three warmups remain. Correctness reuses exact matching 1,971-test
 and 12-focused-test evidence. No RFC adoption or v4 parity is qualified.
 
+The [packed-batch investigation](benchmarks/rfc-025-v7-batch-membership-20261027.md)
+finds that 63.3% / 73.6% of logical batches occupy multi-ticket groups at eight /
+sixteen writers. Three bounded prototypes extend the existing large-wave hint:
+minimum group geometry, compact completion metadata with an added-wait cost
+limit, and [retirement-derived geometry without extra group state](benchmarks/rfc-025-v7-batch-retirement-hint-20261027.md).
+All are rejected by throughput/p99 checks. The final variant passes point8 but
+batch16 observes throughput -1.0%, p99 +23.1%, with CPU diagnostic only; dependent
+stages are cancelled. All 108 scored records, 36 warmups and three fresh excluded
+profiles remain. Each candidate passes 1,973 tests; restored kept source passes
+1,971. Existing `d7fbe1c9` / f7 batch behavior remains provisionally retained;
+this investigation adds no source change, parity or Stage 8 qualification.
+
 ## Delivery checklist
 
 - [ ] Stages 1–3: legacy compatibility, byte-exact codec, independent validation,

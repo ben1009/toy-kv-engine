@@ -1,0 +1,18 @@
+{
+  "created_at_utc": "2026-10-27T06:21:01.947168+00:00",
+  "source_base": "dc3e3c1a8fce0f15700ff7c5d2ef2cb1c2875d4d",
+  "baseline": {
+    "path": "target/release/write-perf-v7-batch-window",
+    "sha256": "f7fd96e5ca0ecaaaa23f59f135e7ce9430521f986834e5c95f2d32070e378d54"
+  },
+  "prior_experiment": "rfc-025-v7-batch-wait-budget-20261027",
+  "candidate": "Derive the minimum DATA size while removing already-owned write metadata at group retirement. Keep WriteGroup and GroupState layouts identical to retained f7. Pack the per-completion u32 count/minimum within the original64-byte result, retaining the extra-wait cost budget.",
+  "hypothesis": "The second prototype preserves the64-byte completion and recovers16-writer fast throughput but still adds8bytes to group command/state and fails point8. Existing OwnedWrite.write_len remains available until retirement; compute its minimum in the existing removal loop to avoid all extra command/state metadata. This removes an avoidable cost without claiming it explains every failed storage result.",
+  "scope": "Final correction within the requested batch optimization. Earlier two prototypes remain rejected, with original records and real baseline restorations. No third score-selected retry: this is a distinct source layout/ownership implementation. No persisted format/hash/ACK, allocator, memtable, extent or runtime changes.",
+  "stages": "Point8 screen first,3alternating four-arm rounds plus warmups. If its V7 throughput/p99/DATA guard passes, run batch16,batch1,batch8 and independent batch8 confirmation, each3rounds/fourarms/warmups. Assess each completed stage; cancel dependents after failure. Stop after this final correction for review.",
+  "assessment": "V7 paired and arm-median throughput>=0.95,p99<=1.10,identical DATA byte counts in each completed cell. Independent batch8 confirmation must improve both throughput>1.00 and p99<1.00. CPU/RSS/sync counts/V4 controls diagnostic, with no CPU veto. Retain only after all planned cells complete and pass; otherwise restore f7 and its1971-test source. No silent guard overrides.",
+  "configuration": "Ext4 SSD,1KiB values,2GiB SST,explicitParallel. Batch64=750k/sample10,point8=100k/sample100.30s initialcooldown,10s intercommand. Recognized-process audits before/during1Hz/after; no build/test/profile during scoring.",
+  "validation": "Full outside-sandbox check and8focused tests. Assert GroupWriteResult64bytes and GroupState96bytes on64-bit targets; test retirement minimum with out-of-order/short CQEs and FRONTIER gaps, unknown failure snapshots, actual large/mixed v7 groups, publication and exact recovery. No source changes during scoring.",
+  "baseline_profile_reuse": "rfc-025-v7-batch-membership-20261027-profiles.json",
+  "publication": "Separate final retained source/evidence commits if qualified. Otherwise restore original kept f7 and1971-test source. No push/PR/default adoption."
+}

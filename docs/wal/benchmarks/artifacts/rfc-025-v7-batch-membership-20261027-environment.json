@@ -1,0 +1,25 @@
+{
+  "source_base": "dc3e3c1a8fce0f15700ff7c5d2ef2cb1c2875d4d",
+  "rustc": "rustc 1.100.0-nightly (6bb1652a0 2026-09-22)\nbinary: rustc\ncommit-hash: 6bb1652a020e80cef79332741d89e996d71933c9\ncommit-date: 2026-09-22\nhost: x86_64-unknown-linux-gnu\nrelease: 1.100.0-nightly\nLLVM version: 23.1.1\n",
+  "kernel": "Linux 6.12.71-1-lts #1 SMP PREEMPT_DYNAMIC Fri, 13 Feb 2026 19:12:56 +0000 GNU/Linux",
+  "mount": "ext4 /dev/nvme0n1p3[/liu/proj/toy-kv-engine] rw,nosuid,nodev,relatime",
+  "queue": {
+    "max_hw_sectors_kb": "512",
+    "max_sectors_kb": "512",
+    "physical_block_size": "512",
+    "max_segments": "128",
+    "nr_requests": "255"
+  },
+  "source_manifest_sha256": "2b589e65904a30eb22950235dcf9080d5295e51fbc604fde2dd15ff7c899b849",
+  "patch_sha256": "6bbccb98ca76c7330e94cef35109068570de1fa3ea15fee2a65f448356d4990c",
+  "plan_sha256": "f61e2ebf8ee5dd8d65c7853bb7abd9110200b5a5c4b7adf0bfebd91e6b9a9cbe",
+  "allocator_environment_overrides": [],
+  "created_at_utc": "2026-10-27T05:17:58.307539+00:00",
+  "candidate": "Minimum DATA-write geometry for large multi-ticket v7 group coalescing",
+  "hardware_metadata_origin": "Same host/mount/kernel as preceding trials; no device settings changed.",
+  "matrix_sha256": "65b614cddd995fccad828bfb2c1a8b38dc5b1db15cad3db70ea77585001a6ce7",
+  "driver_sha256": "043e3536d64c53f10fb6d19c0edda1e5c36e041a1f3f978f2c674a5c7f1e64c5",
+  "baseline_profile_reuse": null,
+  "prior_environment_sha256": "6b2b4cb69e34b9bc735acc6e1b04b625cdc3b0015e7df55589229233cf73df8c",
+  "diagnostic_profiles": "rfc-025-v7-batch-membership-20261027-profiles.json"
+}

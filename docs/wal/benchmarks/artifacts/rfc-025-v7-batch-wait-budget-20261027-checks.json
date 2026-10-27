@@ -1,0 +1,127 @@
+{
+  "outside_sandbox": true,
+  "prior_attempts": [
+    {
+      "phase": "format",
+      "command": [
+        "cargo",
+        "fmt",
+        "--all"
+      ],
+      "exit_code": 0,
+      "log": "target/wal-opt/20261027-v7-batch-wait-budget/format.log",
+      "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "phase": "focused",
+      "command": [
+        "cargo",
+        "nextest",
+        "run",
+        "--offline",
+        "--locked",
+        "--workspace",
+        "--all-features",
+        "--lib",
+        "--retries",
+        "0",
+        "--success-output",
+        "immediate",
+        "-E",
+        "test(group_minimum_write_size) or test(v7_worker_group_geometry) or test(v7_large_batch_wave) or test(large_batch_coalescing) or test(worker_accepts_data_groups) or test(v7_frontier_recaptures) or test(v7_frontier_poison)"
+      ],
+      "exit_code": 101,
+      "log": "target/wal-opt/20261027-v7-batch-wait-budget/focused-compile-attempt1.log",
+      "log_sha256": "dc2b3dd10825dd12eeef0797cfab1f35268890b5c4de7365d95f0e68c21a26e4"
+    }
+  ],
+  "checks": [
+    {
+      "phase": "format",
+      "command": [
+        "cargo",
+        "fmt",
+        "--all"
+      ],
+      "exit_code": 0,
+      "log": "target/wal-opt/20261027-v7-batch-wait-budget/format.log",
+      "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "phase": "focused",
+      "command": [
+        "cargo",
+        "nextest",
+        "run",
+        "--offline",
+        "--locked",
+        "--workspace",
+        "--all-features",
+        "--lib",
+        "--retries",
+        "0",
+        "--success-output",
+        "immediate",
+        "-E",
+        "test(group_minimum_write_size) or test(v7_worker_group_geometry) or test(v7_large_batch_wave) or test(large_batch_coalescing) or test(worker_accepts_data_groups) or test(v7_frontier_recaptures) or test(v7_frontier_poison)"
+      ],
+      "exit_code": 0,
+      "log": "target/wal-opt/20261027-v7-batch-wait-budget/focused.log",
+      "log_sha256": "003b405c0e6182d406cd1fd913fd7ba7371965d96a886c1a68a4202beede4219"
+    },
+    {
+      "phase": "check",
+      "command": [
+        "cargo",
+        "make",
+        "check"
+      ],
+      "exit_code": 0,
+      "log": "target/wal-opt/20261027-v7-batch-wait-budget/check.log",
+      "log_sha256": "02f30d0b1ccad52bbcecc0830021161b7178b3041e9e9deaca7050c983646303"
+    },
+    {
+      "phase": "release",
+      "command": [
+        "cargo",
+        "build",
+        "--offline",
+        "--locked",
+        "--release",
+        "--package",
+        "kv-engine",
+        "--bin",
+        "write-perf",
+        "--features",
+        "bench"
+      ],
+      "exit_code": 0,
+      "log": "target/wal-opt/20261027-v7-batch-wait-budget/release.log",
+      "log_sha256": "cba190ab5dc84b28dd6aeb8e6923bea2ec557dd6add7181cf5b89a87f0928f4c"
+    },
+    {
+      "phase": "direct spelling",
+      "command": [
+        "typos",
+        "--format",
+        "brief"
+      ],
+      "exit_code": 0,
+      "log": "target/wal-opt/20261027-v7-batch-wait-budget/direct-spelling.log",
+      "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "phase": "final spelling",
+      "command": [
+        "typos",
+        "--format",
+        "brief"
+      ],
+      "exit_code": 0,
+      "log": "target/wal-opt/20261027-v7-batch-retirement-hint/final-spelling.log",
+      "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    }
+  ],
+  "tests": 1973,
+  "focused_tests": 8
+}

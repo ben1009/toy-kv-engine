@@ -1,0 +1,25 @@
+{
+  "source_base": "dc3e3c1a8fce0f15700ff7c5d2ef2cb1c2875d4d",
+  "rustc": "rustc 1.100.0-nightly (6bb1652a0 2026-09-22)\nbinary: rustc\ncommit-hash: 6bb1652a020e80cef79332741d89e996d71933c9\ncommit-date: 2026-09-22\nhost: x86_64-unknown-linux-gnu\nrelease: 1.100.0-nightly\nLLVM version: 23.1.1\n",
+  "kernel": "Linux 6.12.71-1-lts #1 SMP PREEMPT_DYNAMIC Fri, 13 Feb 2026 19:12:56 +0000 GNU/Linux",
+  "mount": "ext4 /dev/nvme0n1p3 rw,relatime",
+  "queue": {
+    "max_hw_sectors_kb": "512",
+    "max_sectors_kb": "512",
+    "physical_block_size": "512",
+    "max_segments": "128",
+    "nr_requests": "255"
+  },
+  "source_manifest_sha256": "269a8a83eccbb0866f32eb82dfd9230c18c8cf8347d6e37bb2e4b4958deca58c",
+  "patch_sha256": "6bb2c8b896745af800111a0f2856ea48cf4d4ab8095b30ee84d2c2b072090fe3",
+  "plan_sha256": "cafb986dde68c663947fba47b174d63030dead176b3d7c20fe27b042feb6a97c",
+  "allocator_environment_overrides": [],
+  "created_at_utc": "2026-10-27T06:27:02.150497+00:00",
+  "candidate": "Retirement-derived DATA minimum; original command and group-state layouts; compact completion and added-wait cost limit",
+  "hardware_metadata_origin": "Same host/mount/kernel as preceding trials; no device settings changed.",
+  "matrix_sha256": "c7747bbf34275288cfaa054ad6b22cca2d0dfd11e4130f239c3bca4f8d0c2f50",
+  "driver_sha256": "afbf10816c1d73f5308628594e0c2bb9e332af67c43827250bab133e60573939",
+  "baseline_profile_reuse": null,
+  "prior_environment_sha256": "79e97a40788afbf47bcf43acabd3261d43723ef92119038f6678231d4a0df245",
+  "diagnostic_profiles": "rfc-025-v7-batch-membership-20261027-profiles.json"
+}

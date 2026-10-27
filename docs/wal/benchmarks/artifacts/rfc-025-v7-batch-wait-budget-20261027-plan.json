@@ -1,0 +1,19 @@
+{
+  "created_at_utc": "2026-10-27T05:53:21.007820+00:00",
+  "source_base": "dc3e3c1a8fce0f15700ff7c5d2ef2cb1c2875d4d",
+  "baseline": {
+    "path": "target/release/write-perf-v7-batch-window",
+    "sha256": "f7fd96e5ca0ecaaaa23f59f135e7ce9430521f986834e5c95f2d32070e378d54"
+  },
+  "prior_experiment": "rfc-025-v7-batch-membership-20261027",
+  "candidate": "Retain accurate minimum-DATA geometry, compact completion write count/minimum to u32 within the original64-byte result, and grant800us only when the previous sync covers the additional400us waiting budget. Ordinary400us/fast100us remain.",
+  "hypothesis": "Source1reveals two avoidable costs: GroupWriteResult grows64to72bytes; a fast16-writer pair spends168ms more coalescing and loses16%throughput despite fewer syncs. Validated u32 count/minimum restore the64-byte completion, and requiring last_sync>=800us-400us prevents the extra400us wait after modest-cost syncs. These mechanisms need fresh matched validation, not causal claims from failed V4 controls.",
+  "scope": "Corrective second source prototype within the batch optimization. Original source1failing cohort remains rejected. No source1score is replaced or pooled into acceptance. Existing kept f7 coalescing remains the comparison and fallback. No allocator, memtable, wire format, recovery or ACK changes.",
+  "extension": "Extend the originally bounded one-candidate investigation to fix the two costs exposed by validation; stop after this corrective prototype for review. Preserve the first failure and actual baseline restoration.",
+  "configuration": "Ext4 SSD,1KiB values,2GiB SST,explicitParallel. Batch64=750k/sample10,point8=100k/sample100.30s initialcooldown,10s intercommand. Recognized-process audits before/during1Hz/after; no build/test/profile during scoring.",
+  "stages": "Start with batch16,3alternating four-arm rounds after one warmup/arm. If its V7 throughput/p99/DATA guards pass, run point8,batch1,batch8 and independent batch8 confirmation, each3rounds/fourarms/warmups. Check each completed stage before advancing; cancel unrun dependent stages after a failed V7 performance stage. No score-selected reruns.",
+  "assessment": "V7 paired and arm-median throughput>=0.95,p99<=1.10,identical DATA byte counts in each completed cell. Independent batch8 confirmation must improve both throughput>1.00 and p99<1.00. CPU/RSS/sync counts/V4 controls diagnostic, with no CPU veto. Retain only after all planned cells complete and pass; otherwise restore f7 and its1971-test source. No silent guard overrides.",
+  "validation": "Full outside-sandbox cargo make check; focused worker/runtime tests and64-byte completion assertion; validate400us extra-budget boundary; retain tests of mixed/unknown geometry, failures, gaps, out-of-order completions and exact recovery. Snapshot128inputs, exact patch and saved binaries before scoring.",
+  "baseline_profile_reuse": "rfc-025-v7-batch-membership-20261027-profiles.json",
+  "publication": "Separate final retained source and evidence commits; no push/PR/default adoption."
+}

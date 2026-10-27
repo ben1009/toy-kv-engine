@@ -1,0 +1,44 @@
+[
+  {
+    "cell": "v7-batch1",
+    "run_id": "1793077729926",
+    "excluded_diagnostic": true,
+    "groups": 11719,
+    "solo_groups": 11719,
+    "logical_batches": 11719,
+    "multi_ticket_groups": 0,
+    "fraction_batches_in_multi_ticket_groups": 0.0,
+    "batches_per_sync": 1.0,
+    "frontier_write_ns": 1529362597,
+    "fdatasync_ns": 16248482304,
+    "preallocation_ns": 23242501
+  },
+  {
+    "cell": "v7-batch8",
+    "run_id": "1793077772562",
+    "excluded_diagnostic": true,
+    "groups": 7617,
+    "solo_groups": 4299,
+    "logical_batches": 11720,
+    "multi_ticket_groups": 3318,
+    "fraction_batches_in_multi_ticket_groups": 0.6331911262798635,
+    "batches_per_sync": 7.051744885679904,
+    "frontier_write_ns": 94226522,
+    "fdatasync_ns": 524230757,
+    "preallocation_ns": 15179797
+  },
+  {
+    "cell": "v7-batch16",
+    "run_id": "1793077784780",
+    "excluded_diagnostic": true,
+    "groups": 6212,
+    "solo_groups": 3102,
+    "logical_batches": 11728,
+    "multi_ticket_groups": 3110,
+    "fraction_batches_in_multi_ticket_groups": 0.7355047748976807,
+    "batches_per_sync": 8.918631178707225,
+    "frontier_write_ns": 76940287,
+    "fdatasync_ns": 514580048,
+    "preallocation_ns": 37266868
+  }
+]

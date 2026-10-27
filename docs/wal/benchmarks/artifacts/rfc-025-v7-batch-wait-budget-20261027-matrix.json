@@ -1,0 +1,104 @@
+{
+  "created_at_utc": "2026-10-27T05:53:21.007864+00:00",
+  "ssd_initial_cooldown_seconds": 30,
+  "ssd_between_seconds": 10,
+  "cells": {
+    "ext4-batch16": {
+      "kind": "ssd",
+      "bench": "wal_batch_concurrent",
+      "writers": 16,
+      "operations": 750000,
+      "reads": 500000,
+      "scan_num": 100000,
+      "batch": 64,
+      "sample_every": 10,
+      "arms": [
+        "old_v4",
+        "new_v4",
+        "old_v7",
+        "new_v7"
+      ],
+      "pairs": 3
+    },
+    "ext4-point8": {
+      "kind": "ssd",
+      "bench": "wal_concurrent",
+      "writers": 8,
+      "operations": 100000,
+      "reads": 500000,
+      "scan_num": 100000,
+      "batch": null,
+      "sample_every": 100,
+      "arms": [
+        "old_v4",
+        "new_v4",
+        "old_v7",
+        "new_v7"
+      ],
+      "pairs": 3
+    },
+    "ext4-batch1": {
+      "kind": "ssd",
+      "bench": "wal_batch_concurrent",
+      "writers": 1,
+      "operations": 750000,
+      "reads": 500000,
+      "scan_num": 100000,
+      "batch": 64,
+      "sample_every": 10,
+      "arms": [
+        "old_v4",
+        "new_v4",
+        "old_v7",
+        "new_v7"
+      ],
+      "pairs": 3
+    },
+    "ext4-batch8": {
+      "kind": "ssd",
+      "bench": "wal_batch_concurrent",
+      "writers": 8,
+      "operations": 750000,
+      "reads": 500000,
+      "scan_num": 100000,
+      "batch": 64,
+      "sample_every": 10,
+      "arms": [
+        "old_v4",
+        "new_v4",
+        "old_v7",
+        "new_v7"
+      ],
+      "pairs": 3
+    },
+    "confirmation-batch8": {
+      "kind": "ssd",
+      "bench": "wal_batch_concurrent",
+      "writers": 8,
+      "operations": 750000,
+      "reads": 500000,
+      "scan_num": 100000,
+      "batch": 64,
+      "sample_every": 10,
+      "arms": [
+        "old_v4",
+        "new_v4",
+        "old_v7",
+        "new_v7"
+      ],
+      "pairs": 3
+    }
+  },
+  "screen": [
+    "ext4-batch16"
+  ],
+  "followup": [
+    "ext4-point8",
+    "ext4-batch1",
+    "ext4-batch8"
+  ],
+  "confirmation": [
+    "confirmation-batch8"
+  ],
+  "guard_scope": "V7 performance stage gates; CPU diagnostics only. Preserve all captures and explicitly cancel unrun stages; no selected retries."
+}

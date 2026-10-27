@@ -1,0 +1,20 @@
+{
+  "source_base": "dc3e3c1a8fce0f15700ff7c5d2ef2cb1c2875d4d",
+  "assessment_passed": false,
+  "source_retained": false,
+  "cpu_is_diagnostic": true,
+  "captured_cells": [
+    "ext4-batch16",
+    "ext4-point8"
+  ],
+  "cancelled_cells": [
+    "ext4-batch1",
+    "ext4-batch8",
+    "confirmation-batch8"
+  ],
+  "failed_v7_cells": [
+    "ext4-point8"
+  ],
+  "reason": "The cost budget restores fast16-writer scores and passes that guard, but point8 paired throughput0.861x and p991.174x fail. All three dependent stages are cancelled. Preserve all32records and reject this exact source.",
+  "superseded_by": "rfc-025-v7-batch-retirement-hint-20261027"
+}
