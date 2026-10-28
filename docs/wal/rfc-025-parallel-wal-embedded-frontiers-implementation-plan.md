@@ -2823,6 +2823,18 @@ async-dispatch source and executable are restored exactly. Thirty-seven new
 completed run IDs advance this lineage to 628, with the prior interrupted
 invocation still counted separately. This result does not qualify v4 parity.
 
+The [sync-priority extent experiment](benchmarks/rfc-025-v7-sync-priority-extents-20261028.md)
+defers new optional background chunks during the FRONTIER/sync cycle. Its
+excluded eight-writer trace records no background starts during sync, versus
+137 in the earlier retained trace, while already selected I/O may finish.
+The fixed matrix rejects the policy: batch8 is -1.4% throughput/+4.6% p99
+across four matched pairs, and batch16, point8 and solo guards also fail.
+Point/solo delays vary widely below the aggregate filter; the ratios do not
+isolate source-only regressions. Candidate/restored checks pass 1,975/1,973
+tests, with 49 focused candidate tests. The exact retained source and executable
+are restored. Thirty-seven new completed IDs bring this lineage to 665;
+the two reused diagnostics and prior interrupted run are not double-counted.
+
 ## Delivery checklist
 
 - [ ] Stages 1–3: legacy compatibility, byte-exact codec, independent validation,

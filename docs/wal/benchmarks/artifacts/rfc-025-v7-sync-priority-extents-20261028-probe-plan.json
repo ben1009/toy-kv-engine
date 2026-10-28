@@ -1,0 +1,32 @@
+{
+  "created_at_utc": "2026-10-28T01:59:43.134164+00:00",
+  "source_base": "6cb51d522559585428c56d0f9e674e68320d3dd2",
+  "binary": {
+    "path": "target/release/write-perf-v7-sync-priority-extents",
+    "sha256": "6bf28f838a0d97b3f6ee9c4c7439418c2381e995252d4feb67c3647dab1611ea"
+  },
+  "schedule": [
+    8
+  ],
+  "operations": 750000,
+  "batch": 64,
+  "value_size": 1024,
+  "sst_size": 2147483648,
+  "initial_seconds": 30,
+  "between_seconds": 15,
+  "sampler_seconds": 0.1,
+  "excluded_from_scoring": true,
+  "source_changed": true,
+  "purpose": "Measure background zeroing overlap with fdatasync in one excluded8-writer batch64 diagnostic. Already selected chunks may finish during priority.",
+  "scope": "One excluded mechanism probe only; no source/build/test/profile overlap or SSD health polling.",
+  "prior_verification": "rfc-025-v7-unbounded-workers-20261028-verification.json",
+  "prior_verification_sha256": "31689a6e4181de4caaa84d31030182890a0ec8168d797fb28d04b6ea99361bf5",
+  "prior_global_invocations": 628,
+  "trace_library": {
+    "path": "target/wal-opt/20261027-v7-writer-scaling/io-trace.so",
+    "sha256": "7bef6a9cfadc9c803f955fb96e86bd65f5bdebd07aab39184d283832bfe3e46b"
+  },
+  "trace_source_sha256": "628b683e22047bc9cdfbe80f142cf686795f8a9eef2eb0593208832fecd09308",
+  "candidate_source_manifest_sha256": "d9f8ea65db9bfc159cbc8ec7a3d3252bc670873d2ae026a935703dcfe7e6e841",
+  "candidate_probe": true
+}

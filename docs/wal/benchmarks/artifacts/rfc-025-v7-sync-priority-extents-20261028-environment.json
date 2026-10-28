@@ -1,0 +1,21 @@
+{
+  "source_base": "6cb51d522559585428c56d0f9e674e68320d3dd2",
+  "kernel": "6.12.71-1-lts",
+  "filesystem": "/dev/nvme0n1p3[/liu/proj/toy-kv-engine] ext4 rw,nosuid,nodev,relatime",
+  "toolchain": "rustc 1.100.0-nightly (6bb1652a0 2026-09-22)\nbinary: rustc\ncommit-hash: 6bb1652a020e80cef79332741d89e996d71933c9\ncommit-date: 2026-09-22\nhost: x86_64-unknown-linux-gnu\nrelease: 1.100.0-nightly\nLLVM version: 23.1.1\n",
+  "numa_nodes": [
+    "node0"
+  ],
+  "max_processes": [
+    255469,
+    255469
+  ],
+  "allocator_environment_overrides": {},
+  "source_manifest_sha256": "d9f8ea65db9bfc159cbc8ec7a3d3252bc670873d2ae026a935703dcfe7e6e841",
+  "patch_sha256": "884284f393060ba093f37ce85a11e78bd382b014da5d9385e3b6a87dd6791e32",
+  "plan_sha256": "8ff84c54be7a1e70142334b4b19122381ed2a1c442f0b11cbb200bc4bba9a974",
+  "matrix_sha256": "6bf1544b932ba94e2b83448a9f9643573ae8cab85368d90abf1d65b54f36e703",
+  "driver_sha256": "04a264ce0553bae3abe53a2be5c61aa2daaa571be8f114b5e330b350edd613b0",
+  "prior_verification_sha256": "31689a6e4181de4caaa84d31030182890a0ec8168d797fb28d04b6ea99361bf5",
+  "kernel_source_provenance": "rfc-025-v7-async-worker-limit-20261028-interrupted.json"
+}

@@ -1,0 +1,58 @@
+{
+  "baseline": [
+    {
+      "run_id": "1793118123171",
+      "writers": 8,
+      "source": "excluded native diagnostic",
+      "trace_path": "target/wal-opt/20261028-v7-async-worker-limit/8writers-io.csv",
+      "trace_sha256": "fde05c554b97ffef9da701d46e4eed5335a978e3fd509af26571787f1d474246",
+      "frontiers": 2288,
+      "syncs": 2288,
+      "background_writes": 398,
+      "background_bytes": 52166656,
+      "background_starts_during_sync": 137,
+      "background_overlaps_sync": 196,
+      "background_starts_during_marker_and_sync": 187,
+      "background_overlaps_marker_and_sync": 210,
+      "already_counted_in_lineage": true
+    },
+    {
+      "run_id": "1793118148120",
+      "writers": 16,
+      "source": "excluded native diagnostic",
+      "trace_path": "target/wal-opt/20261028-v7-async-worker-limit/16writers-io.csv",
+      "trace_sha256": "13a7d2673c273d0bbf77dcefaaec702ea04a404486ed5d18122c2b7814105f50",
+      "frontiers": 1403,
+      "syncs": 1403,
+      "background_writes": 224,
+      "background_bytes": 29360128,
+      "background_starts_during_sync": 89,
+      "background_overlaps_sync": 121,
+      "background_starts_during_marker_and_sync": 112,
+      "background_overlaps_marker_and_sync": 125,
+      "already_counted_in_lineage": true
+    }
+  ],
+  "candidate": {
+    "run_id": "1793152840259",
+    "writers": 8,
+    "source": "excluded native diagnostic",
+    "trace_path": "target/wal-opt/20261028-v7-sync-priority-extents/candidate-probe/8writers-io.csv",
+    "trace_sha256": "787a3150bb4d9b1edc2d7cb0fbac08e314969827017b2e116b7bd1a77ee510b7",
+    "frontiers": 1878,
+    "syncs": 1878,
+    "background_writes": 151,
+    "background_bytes": 19791872,
+    "background_starts_during_sync": 0,
+    "background_overlaps_sync": 18,
+    "background_starts_during_marker_and_sync": 0,
+    "background_overlaps_marker_and_sync": 18,
+    "already_counted_in_lineage": false
+  },
+  "baseline_metadata_sha256": "a98ba923ddab69c054efe7e8cc1e89f315c627622cef0a261b18f82d5d571526",
+  "candidate_metadata_sha256": "c6ac871cc13815e6571c3a58e15fa8d73bb17c45008ca1535a3ba162a5247841",
+  "added_invocations": 1,
+  "reused_invocations": 2,
+  "limits": "Different excluded traces establish overlap observations, not paired performance or proof that overlap causes every tail. An already selected chunk may start I/O after priority begins.",
+  "analyzer_sha256": "a0f7eac9c5cd2d6e2e79b9c976273b07cd109bae8fa8de11142238e8d89d062b"
+}
