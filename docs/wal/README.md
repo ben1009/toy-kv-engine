@@ -36,6 +36,7 @@ the retained and rejected experiments.
 
 ## Benchmarks and qualification
 
+- [RFC 025 completion priority for small writes (not retained; independent p99 benefit fails to repeat), 2026-10-28](benchmarks/rfc-025-v7-small-completion-priority-20261028.md)
 - [RFC 025 ready-completion-first scheduling (not retained; batch p99 checks fail), 2026-10-28](benchmarks/rfc-025-v7-ready-completion-first-20261028.md)
 - [RFC 025 unused-suffix preparation after large DATA (not retained; extra writes fail SSD batch checks), 2026-10-28](benchmarks/rfc-025-v7-large-data-lookahead-20261028.md)
 - [RFC 025 sync priority over optional extent initialization (not retained; fixed SSD checks fail), 2026-10-28](benchmarks/rfc-025-v7-sync-priority-extents-20261028.md)

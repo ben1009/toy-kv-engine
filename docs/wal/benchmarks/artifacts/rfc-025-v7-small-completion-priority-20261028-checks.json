@@ -1,0 +1,162 @@
+{
+  "outside_sandbox": true,
+  "checks": [
+    {
+      "phase": "format",
+      "command": [
+        "cargo",
+        "fmt",
+        "--all"
+      ],
+      "started_at_utc": "2026-10-28T14:05:09.337583+00:00",
+      "exit_code": 0,
+      "log": "target/wal-opt/20261028-v7-small-completion-priority/format.log",
+      "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "phase": "direct spelling",
+      "command": [
+        "typos",
+        "kv-engine/src/wal/parallel/worker.rs",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-small-completion-priority-20261028-analyze.py",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-small-completion-priority-20261028-baseline-sha256.tsv",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-small-completion-priority-20261028-candidate.patch",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-small-completion-priority-20261028-checks.json",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-small-completion-priority-20261028-child.py",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-small-completion-priority-20261028-matrix.json",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-small-completion-priority-20261028-plan.json",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-small-completion-priority-20261028-run-all.py",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-small-completion-priority-20261028-run.py",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-small-completion-priority-20261028-source-sha256.tsv"
+      ],
+      "started_at_utc": "2026-10-28T14:05:10.371598+00:00",
+      "exit_code": 0,
+      "log": "target/wal-opt/20261028-v7-small-completion-priority/direct-spelling.log",
+      "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "phase": "focused",
+      "command": [
+        "cargo",
+        "nextest",
+        "run",
+        "--offline",
+        "--locked",
+        "--workspace",
+        "--all-features",
+        "--lib",
+        "--retries",
+        "0",
+        "--success-output",
+        "immediate",
+        "-E",
+        "test(wal::parallel_worker::tests::) or (test(wal::parallel_runtime::tests::) and (test(v7_frontier) or test(v7_extent) or test(async_v7_extent) or test(failpoint_v7) or test(v7_large_batch_wave)))"
+      ],
+      "started_at_utc": "2026-10-28T14:05:10.402738+00:00",
+      "exit_code": 0,
+      "log": "target/wal-opt/20261028-v7-small-completion-priority/focused.log",
+      "log_sha256": "1e041df71ca594ea73568dcf1594a282dd1e3c1a899ffa8521cd0e5af79a98ad"
+    },
+    {
+      "phase": "check",
+      "command": [
+        "cargo",
+        "make",
+        "check"
+      ],
+      "started_at_utc": "2026-10-28T14:05:20.814607+00:00",
+      "exit_code": 0,
+      "log": "target/wal-opt/20261028-v7-small-completion-priority/check.log",
+      "log_sha256": "63f727c36ad701d903a6fbb39a497dad6645022dcd43fb5d76f5224c3531b9c5"
+    },
+    {
+      "phase": "release",
+      "command": [
+        "cargo",
+        "build",
+        "--offline",
+        "--locked",
+        "--release",
+        "--package",
+        "kv-engine",
+        "--bin",
+        "write-perf",
+        "--features",
+        "bench"
+      ],
+      "started_at_utc": "2026-10-28T14:06:12.738077+00:00",
+      "exit_code": 0,
+      "log": "target/wal-opt/20261028-v7-small-completion-priority/release.log",
+      "log_sha256": "4a3e9e2e2a4e9bd86861e4dae67d746d4e5737f1669c1f6b86e9f254a4fcb1e1"
+    },
+    {
+      "phase": "restored check",
+      "command": [
+        "cargo",
+        "make",
+        "check"
+      ],
+      "started_at_utc": "2026-10-28T23:34:26.126132+00:00",
+      "exit_code": 0,
+      "log": "target/wal-opt/20261028-v7-small-completion-priority/restored-check.log",
+      "log_sha256": "7411b95885df779c1294b458b26d87b5355861ad00817e4eea6411779d6a29ff"
+    },
+    {
+      "phase": "final spelling",
+      "command": [
+        "typos",
+        "docs/wal/README.md",
+        "docs/wal/rfc-025-parallel-wal-embedded-frontiers-implementation-plan.md",
+        "docs/wal/benchmarks/rfc-025-v7-small-completion-priority-20261028.md",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-small-completion-priority-20261028-analyze.py",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-small-completion-priority-20261028-baseline-sha256.tsv",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-small-completion-priority-20261028-binaries.json",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-small-completion-priority-20261028-candidate.patch",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-small-completion-priority-20261028-checks.json",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-small-completion-priority-20261028-child.py",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-small-completion-priority-20261028-decision.json",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-small-completion-priority-20261028-environment.json",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-small-completion-priority-20261028-ext4-batch1-host.jsonl",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-small-completion-priority-20261028-ext4-batch1-runs.tsv",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-small-completion-priority-20261028-ext4-batch1.jsonl",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-small-completion-priority-20261028-ext4-batch16-host.jsonl",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-small-completion-priority-20261028-ext4-batch16-runs.tsv",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-small-completion-priority-20261028-ext4-batch16.jsonl",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-small-completion-priority-20261028-ext4-batch8-host.jsonl",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-small-completion-priority-20261028-ext4-batch8-runs.tsv",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-small-completion-priority-20261028-ext4-batch8.jsonl",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-small-completion-priority-20261028-ext4-point1-host.jsonl",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-small-completion-priority-20261028-ext4-point1-runs.tsv",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-small-completion-priority-20261028-ext4-point1.jsonl",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-small-completion-priority-20261028-ext4-point16-host.jsonl",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-small-completion-priority-20261028-ext4-point16-runs.tsv",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-small-completion-priority-20261028-ext4-point16.jsonl",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-small-completion-priority-20261028-ext4-point8-confirm-host.jsonl",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-small-completion-priority-20261028-ext4-point8-confirm-runs.tsv",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-small-completion-priority-20261028-ext4-point8-confirm.jsonl",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-small-completion-priority-20261028-ext4-point8-host.jsonl",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-small-completion-priority-20261028-ext4-point8-runs.tsv",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-small-completion-priority-20261028-ext4-point8.jsonl",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-small-completion-priority-20261028-matrix.json",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-small-completion-priority-20261028-peaks.json",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-small-completion-priority-20261028-plan.json",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-small-completion-priority-20261028-run-all.py",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-small-completion-priority-20261028-run.py",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-small-completion-priority-20261028-source-sha256.tsv",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-small-completion-priority-20261028-summary.json",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-small-completion-priority-20261028-verify.py"
+      ],
+      "started_at_utc": "2026-10-28T23:36:30.164945+00:00",
+      "exit_code": 0,
+      "log": "target/wal-opt/20261028-v7-small-completion-priority/final-spelling.log",
+      "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    }
+  ],
+  "tests": 1976,
+  "focused_tests": 50,
+  "restored_tests": 1973,
+  "validation_driver": {
+    "path": "target/wal-opt/20261028-v7-small-completion-priority/validate.py",
+    "sha256": "d37721a1c42eb11bd932fa3169297580738eedf1e88b19206d5b98a651976c81"
+  }
+}

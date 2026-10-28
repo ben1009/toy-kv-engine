@@ -2871,3 +2871,13 @@ point gains coincide with delayed baselines; the lower-latency pair gains only
 restored source passes 1,973 with no retries/skips. The lineage reaches 739
 completed invocations, plus the earlier interrupted invocation without JSON.
 V4 parity remains open.
+
+The [small-write completion-priority experiment](benchmarks/rfc-025-v7-small-completion-priority-20261028.md)
+restricts early CQE retirement to workers owning only writes below 64 KiB. It passes
+its point8 screen and five regression guards, but independent point8 confirmation
+misses the required p99 benefit (+1.65%). Large apparent throughput gains coincide
+with delayed baselines; the confirmation pair with low mean I/O times gains 1.9%
+throughput with 2.2% higher p99. The candidate is not retained. All 64 invocations
+finish; candidate checks pass 1,976 tests and restored source passes 1,973 without
+retries/skips. The lineage reaches 803 completed invocations, plus the earlier
+interrupted invocation without JSON. V4 parity remains open.

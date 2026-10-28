@@ -1,0 +1,21 @@
+{
+  "created_at_utc": "2026-10-28T14:03:30.612655+00:00",
+  "source_base": "b24cd80c114041566bc2c1f8075f76ce9e4b45c3",
+  "baseline": {
+    "path": "target/release/write-perf-v7-large-data-async-dispatch",
+    "sha256": "f353022d846530a6754330aaea11f295319ea8f4de20afa09b6d2a3b57b021d8"
+  },
+  "candidate": "For active ext-filesystem v7 workers, retire already-ready CQEs before later commands only when every write currently owned by the worker is smaller than its64KiB async threshold. Keep post-submit retirement. Empty, mixed/large and other-format workers use the retained ordering. Conservatively include completed writes of unfinished mixed groups in the size check.",
+  "motivation": "The preceding ungated candidate failed batch p99 but its lowest-I/O-latency point pair improved1.1% throughput/7.5% p99. Narrow the routing policy to small owned writes and test it independently; prior large point gains were baseline-delay-confounded and are not evidence of a repeatable gain.",
+  "scope": "One source candidate, staged SSD qualification. Local repository only; stop for review, no push or PR.",
+  "validation": "Real O_DIRECT coverage closes with96 mixed groups and96 small-only groups, crossing32-group admission; verify all completion tickets/lengths and bytes. Deterministic core fixture checks size boundary, per-write versus aggregate group size, mixed partial/out-of-order retirement, empty and other-format selection. Existing failure, poison, recovery and lifecycle tests plus full checks.",
+  "configuration": "Fresh local ext4,1KiB values,2GiB SST,explicit v7 Parallel/no compaction. Screen/confirmation point8 and guard point16 use100000 puts/sample100;point1 uses20000/sample10. Batch64 guards at1/8/16writers use750000 puts/sample10. Host audit before/1Hz/after;30s initial cooldown and10s gaps, no overlapping builds/tests/profiles/edits or SSD health polling.",
+  "schedule": "Screen: two warmups plus five alternating point8 pairs. If screen passes, run all five guards with two warmups plus three pairs each regardless of interim guard performance. If all guards pass, independent point8 confirmation has two warmups plus five pairs. Otherwise cancel dependent stages. No replacements or score-selected retries; stop on capture/audit errors.",
+  "stall_policy": "Preserve every raw invocation. Predeclare an obvious-stall flag when mean FRONTIER-write >=1ms or mean fdatasync >=1.5ms, relative to observed quiet markers~20-150us and syncs~350us. Exclude a pair from the filtered comparison if either invocation is flagged. This conservative aggregate mask misses short outliers and cannot prove retained samples stall-free or distinguish source-induced I/O changes from environment. Report exclusions by arm and all raw ratios.",
+  "assessment": "Point8 screen and independent confirmation each need at least3 filtered matched pairs, paired and arm-median throughput>1 and paired p99<1. Each guard needs at least2 filtered pairs, paired and arm-median throughput>=0.95 and paired p99<=1.10. Identical DATA bytes. CPU/RSS diagnostic. Retain only if all seven cells pass; otherwise restore exact retained source/executable.",
+  "publication": "Keep accepted source in its own local commit, with evidence separate. For a failed or inconclusive candidate, evidence-only commit plus exact restoration.",
+  "prior_verification": "rfc-025-v7-ready-completion-first-20261028-verification.json",
+  "prior_global_invocations": 739,
+  "diagnostic_invocations": 0,
+  "candidate_probe": "No new excluded diagnostic; one independent narrower source policy, without pooling prior measurements."
+}

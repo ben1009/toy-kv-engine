@@ -1,0 +1,327 @@
+diff --git a/kv-engine/src/wal/parallel/worker.rs b/kv-engine/src/wal/parallel/worker.rs
+index c0569297..0add1f79 100644
+--- a/kv-engine/src/wal/parallel/worker.rs
++++ b/kv-engine/src/wal/parallel/worker.rs
+@@ -1302,0 +1303,9 @@ impl<B: WorkerBuffer> WorkerCore<B> {
++    /// A scheduling hint for small v7 writes, separate from completion safety.
++    /// Keep mixed groups on the ordinary path until the whole group retires,
++    /// including any terminal large request still represented in that group.
++    fn should_prioritize_small_completions(&self, large_write_min_bytes: Option<usize>) -> bool {
++        large_write_min_bytes.is_some_and(|minimum| {
++            !self.writes.is_empty() && self.writes.values().all(|write| write.write_len < minimum)
++        })
++    }
++
+@@ -1911,0 +1921,21 @@ fn run_worker_loop<B: WorkerBuffer>(
++        // Give small v7 completions an earlier handoff without interrupting
++        // large/mixed submission waves. Do not wait for new CQEs here; the
++        // ordinary post-submit drain handles every other case.
++        if async_write_min_bytes.is_some()
++            && ring_staged.is_empty()
++            && !ring.completion().is_empty()
++            && core.should_prioritize_small_completions(async_write_min_bytes)
++        {
++            retire_ready_completions(
++                ring,
++                core,
++                buffer_pool,
++                group_permits,
++                completions,
++                slots,
++                sync_progress,
++                #[cfg(feature = "chaos-testing")]
++                &mut deferred_lowest_group_completions,
++            )?;
++        }
++
+@@ -1974,9 +2004,8 @@ fn run_worker_loop<B: WorkerBuffer>(
+-        let completion_count = {
+-            let mut completion_event = sync_progress.begin_io_event();
+-            #[cfg(feature = "chaos-testing")]
+-            let mut completed = drain_completions(ring);
+-            #[cfg(not(feature = "chaos-testing"))]
+-            let completed = drain_completions(ring);
+-            let completion_at = completion_event.event_timestamp();
+-            completion_event.set_event_at(completion_at);
+-            completion_event.record_write_completions(completed.len() as u64);
++        let completion_count = retire_ready_completions(
++            ring,
++            core,
++            buffer_pool,
++            group_permits,
++            completions,
++            slots,
++            sync_progress,
+@@ -1984,26 +2013,2 @@ fn run_worker_loop<B: WorkerBuffer>(
+-            if crate::chaos::failpoint::defer_lowest_parallel_wal_group_completion()
+-                && let Some(lowest_ticket) = core.lowest_group_ticket()
+-            {
+-                let mut ready = Vec::with_capacity(completed.len());
+-                for completion in completed.drain(..) {
+-                    let request_id = RequestId(completion.0);
+-                    if core.request_ticket_start(request_id) == Some(lowest_ticket) {
+-                        deferred_lowest_group_completions.push(completion);
+-                    } else {
+-                        ready.push(completion);
+-                    }
+-                }
+-                completed = ready;
+-            }
+-            let completion_count = completed.len();
+-            process_completions(
+-                completed,
+-                core,
+-                buffer_pool,
+-                group_permits,
+-                completions,
+-                slots,
+-                &completion_event,
+-            )?;
+-            completion_count
+-        };
++            &mut deferred_lowest_group_completions,
++        )?;
+@@ -2042,0 +2048,47 @@ fn run_worker_loop<B: WorkerBuffer>(
++#[allow(clippy::too_many_arguments)]
++fn retire_ready_completions<B: WorkerBuffer>(
++    ring: &mut io_uring::IoUring,
++    core: &mut WorkerCore<B>,
++    buffer_pool: &ArrayQueue<B>,
++    group_permits: &mut HashMap<GroupId, GroupPermit>,
++    completions: &Sender<GroupWriteResult>,
++    slots: &GroupSlots,
++    sync_progress: &WalSyncProgress,
++    #[cfg(feature = "chaos-testing")] deferred_lowest_group_completions: &mut Vec<(u64, i32)>,
++) -> Result<usize> {
++    let mut completion_event = sync_progress.begin_io_event();
++    #[cfg(feature = "chaos-testing")]
++    let mut completed = drain_completions(ring);
++    #[cfg(not(feature = "chaos-testing"))]
++    let completed = drain_completions(ring);
++    let completion_at = completion_event.event_timestamp();
++    completion_event.set_event_at(completion_at);
++    completion_event.record_write_completions(completed.len() as u64);
++    #[cfg(feature = "chaos-testing")]
++    if crate::chaos::failpoint::defer_lowest_parallel_wal_group_completion()
++        && let Some(lowest_ticket) = core.lowest_group_ticket()
++    {
++        let mut ready = Vec::with_capacity(completed.len());
++        for completion in completed.drain(..) {
++            let request_id = RequestId(completion.0);
++            if core.request_ticket_start(request_id) == Some(lowest_ticket) {
++                deferred_lowest_group_completions.push(completion);
++            } else {
++                ready.push(completion);
++            }
++        }
++        completed = ready;
++    }
++    let completion_count = completed.len();
++    process_completions(
++        completed,
++        core,
++        buffer_pool,
++        group_permits,
++        completions,
++        slots,
++        &completion_event,
++    )?;
++    Ok(completion_count)
++}
++
+@@ -2469 +2521,5 @@ mod tests {
+-    fn check_io_worker_writes_groups(async_write_min_bytes: Option<usize>) {
++    fn check_io_worker_writes_groups(
++        async_write_min_bytes: Option<usize>,
++        groups: usize,
++        include_large: bool,
++    ) {
+@@ -2475 +2531,8 @@ mod tests {
+-        let first_len = async_write_min_bytes.map_or(4096, |minimum| minimum + 4096);
++        let large_len = if include_large {
++            async_write_min_bytes.map_or(4096, |minimum| minimum + 4096)
++        } else {
++            4096
++        };
++        let lengths = (0..groups)
++            .map(|index| if index % 2 == 0 { large_len } else { 4096 })
++            .collect::<Vec<_>>();
+@@ -2478 +2541 @@ mod tests {
+-            .set_len(first_len as u64 + 4096)
++            .set_len(lengths.iter().sum::<usize>() as u64)
+@@ -2495,18 +2558,14 @@ mod tests {
+-
+-        let mut first_buffer = DirectBuf::new(first_len);
+-        first_buffer.as_mut_slice().fill(0xa1);
+-        first_buffer.set_len(first_len);
+-        let mut second_buffer = DirectBuf::new(4096);
+-        second_buffer.as_mut_slice().fill(0xb2);
+-        second_buffer.set_len(4096);
+-        worker
+-            .submit_group(
+-                WriteGroup::new(0..1, vec![WriteBuffer::new(first_buffer, 0, first_len)])
+-                    .expect("build first group"),
+-            )
+-            .expect("submit first group");
+-        worker
+-            .submit_group(
+-                WriteGroup::new(
+-                    1..2,
+-                    vec![WriteBuffer::new(second_buffer, first_len as u64, 4096)],
++        let results = worker.completions().clone();
++        let mut offset = 0;
++        for (index, len) in lengths.iter().copied().enumerate() {
++            let mut buffer = DirectBuf::new(len);
++            buffer.as_mut_slice().fill(index as u8);
++            buffer.set_len(len);
++            let ticket = index as u64;
++            worker
++                .submit_group(
++                    WriteGroup::new(
++                        ticket..ticket + 1,
++                        vec![WriteBuffer::new(buffer, offset, len)],
++                    )
++                    .expect("build group"),
+@@ -2514,20 +2573,5 @@ mod tests {
+-                .expect("build second group"),
+-            )
+-            .expect("submit second group");
+-
+-        let first_result = worker
+-            .completions()
+-            .recv_timeout(Duration::from_secs(5))
+-            .expect("first group completion");
+-        let second_result = worker
+-            .completions()
+-            .recv_timeout(Duration::from_secs(5))
+-            .expect("second group completion");
+-        assert_eq!(first_result.error, None);
+-        assert_eq!(second_result.error, None);
+-        let mut completed = [
+-            (first_result.tickets.start, first_result.write_bytes),
+-            (second_result.tickets.start, second_result.write_bytes),
+-        ];
+-        completed.sort_unstable();
+-        assert_eq!(completed, [(0, first_len as u64), (1, 4096)]);
++                .expect("submit group");
++            offset += len as u64;
++        }
++        // Close with work queued and more groups than the in-flight limit.
++        // Completion delivery and owned-buffer retirement must keep progressing.
+@@ -2535 +2579,19 @@ mod tests {
+-
++        let mut completed = Vec::new();
++        for _ in 0..groups {
++            let result = results
++                .recv_timeout(Duration::from_secs(5))
++                .expect("group completion");
++            assert_eq!(result.error, None);
++            assert_eq!(result.tickets.end, result.tickets.start + 1);
++            completed.push((result.tickets.start, result.write_bytes));
++        }
++        completed.sort_unstable();
++        assert_eq!(
++            completed,
++            lengths
++                .iter()
++                .enumerate()
++                .map(|(i, n)| (i as u64, *n as u64))
++                .collect::<Vec<_>>()
++        );
++        assert!(results.try_recv().is_err());
+@@ -2537,2 +2599,10 @@ mod tests {
+-        assert!(bytes[..first_len].iter().all(|byte| *byte == 0xa1));
+-        assert!(bytes[first_len..].iter().all(|byte| *byte == 0xb2));
++        assert_eq!(bytes.len(), offset as usize);
++        let mut start = 0;
++        for (index, len) in lengths.into_iter().enumerate() {
++            assert!(
++                bytes[start..start + len]
++                    .iter()
++                    .all(|byte| *byte == index as u8)
++            );
++            start += len;
++        }
+@@ -2543 +2613 @@ mod tests {
+-        check_io_worker_writes_groups(None);
++        check_io_worker_writes_groups(None, 2, true);
+@@ -2548 +2618,78 @@ mod tests {
+-        check_io_worker_writes_groups(Some(64 * 1024));
++        check_io_worker_writes_groups(Some(64 * 1024), 2, true);
++    }
++
++    #[test]
++    fn io_worker_retires_mixed_async_waves_and_drains_close() {
++        check_io_worker_writes_groups(Some(64 * 1024), 3 * super::MAX_INFLIGHT_GROUPS, true);
++    }
++
++    #[test]
++    fn io_worker_retires_small_only_waves_and_drains_close() {
++        check_io_worker_writes_groups(Some(64 * 1024), 3 * super::MAX_INFLIGHT_GROUPS, false);
++    }
++
++    #[test]
++    fn small_completion_priority_tracks_mixed_group_retirement() {
++        let drops = Arc::new(AtomicUsize::new(0));
++        let mut core = WorkerCore::new();
++        let threshold = Some(64 * 1024);
++        assert!(!core.should_prioritize_small_completions(threshold));
++        // Aggregate group bytes reach the threshold, but each write is small.
++        core.enqueue(make_group(0..1, 4096, 2, 32 * 1024, &drops))
++            .expect("small group");
++        assert!(core.should_prioritize_small_completions(threshold));
++        assert!(!core.should_prioritize_small_completions(None));
++        let mixed_start = 4096 + 64 * 1024;
++        let mixed = vec![
++            WriteBuffer::new(
++                DropProbe::new(64 * 1024, Arc::clone(&drops)),
++                mixed_start,
++                64 * 1024,
++            ),
++            WriteBuffer::new(
++                DropProbe::new(4096, Arc::clone(&drops)),
++                mixed_start + 64 * 1024,
++                4096,
++            ),
++        ];
++        core.enqueue(WriteGroup::new(1..2, mixed).expect("mixed group"))
++            .expect("enqueue mixed group");
++        // Ready, staged and submitted large writes all disable early retirement.
++        assert!(!core.should_prioritize_small_completions(threshold));
++        let staged = core.stage_writes(4).expect("stage mixed writes");
++        assert!(!core.should_prioritize_small_completions(threshold));
++        for write in &staged {
++            core.mark_submitted(write.request_id)
++                .expect("submit mixed write");
++        }
++        let large = staged
++            .iter()
++            .find(|write| write.write_len == 64 * 1024)
++            .unwrap();
++        let tail = staged
++            .iter()
++            .find(|write| write.file_offset == mixed_start + 64 * 1024)
++            .unwrap();
++        drop(
++            core.complete_write(large.request_id, large.write_len as i32)
++                .expect("complete later large write first"),
++        );
++        // Its terminal metadata remains until the unfinished mixed group retires.
++        assert!(!core.should_prioritize_small_completions(threshold));
++        drop(
++            core.complete_write(tail.request_id, tail.write_len as i32)
++                .expect("complete mixed group"),
++        );
++        assert!(core.should_prioritize_small_completions(threshold));
++        for write in staged
++            .iter()
++            .filter(|write| write.file_offset < mixed_start)
++        {
++            drop(
++                core.complete_write(write.request_id, write.write_len as i32)
++                    .expect("complete earlier small group"),
++            );
++        }
++        assert!(core.is_idle());
++        assert!(!core.should_prioritize_small_completions(threshold));
++        assert_eq!(drops.load(Ordering::Acquire), 4);
