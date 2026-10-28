@@ -36,6 +36,7 @@ the retained and rejected experiments.
 
 ## Benchmarks and qualification
 
+- [RFC 025 unused-suffix preparation after large DATA (not retained; extra writes fail SSD batch checks), 2026-10-28](benchmarks/rfc-025-v7-large-data-lookahead-20261028.md)
 - [RFC 025 sync priority over optional extent initialization (not retained; fixed SSD checks fail), 2026-10-28](benchmarks/rfc-025-v7-sync-priority-extents-20261028.md)
 - [RFC 025 unbounded kernel worker limit (not retained; eight-writer and solo guards fail), 2026-10-28](benchmarks/rfc-025-v7-unbounded-workers-20261028.md)
 - [RFC 025 kernel worker pool limits (rejected; all four SSD workloads measured), 2026-10-28](benchmarks/rfc-025-v7-async-pool-limits-20261028.md)

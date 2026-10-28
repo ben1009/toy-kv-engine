@@ -1,0 +1,122 @@
+diff --git a/kv-engine/src/wal/parallel/runtime.rs b/kv-engine/src/wal/parallel/runtime.rs
+index cbcb7b51..a536f152 100644
+--- a/kv-engine/src/wal/parallel/runtime.rs
++++ b/kv-engine/src/wal/parallel/runtime.rs
+@@ -3046 +3046 @@ fn preallocate_runtime_for_write(
+-        .filter(|control| initialize_extents && !control.stopping.load(Ordering::Acquire))
++        .filter(|control| !control.stopping.load(Ordering::Acquire))
+@@ -3064 +3064,2 @@ fn preallocate_runtime_for_write(
+-        && inner.prepared_file_end.load(Ordering::Acquire) > control.initial_end
++        && (!initialize_extents
++            || inner.prepared_file_end.load(Ordering::Acquire) > control.initial_end)
+@@ -3075,4 +3076,13 @@ fn preallocate_runtime_for_write(
+-    let needed = round_up(required_end, EXTENT_INITIALIZATION_CHUNK as u64)
+-        .context("v7 required preparation prefix overflows")?
+-        .min(aligned_end);
+-    if let Err(error) = initialize_v7_extent_prefix(inner, &mut prepared_end, needed, true) {
++    let needed = if initialize_extents {
++        round_up(required_end, EXTENT_INITIALIZATION_CHUNK as u64)
++            .context("v7 required preparation prefix overflows")?
++            .min(aligned_end)
++    } else {
++        // Large DATA initializes its own reserved range. Protect exactly that
++        // prefix from zeroing, leaving the unused allocated suffix available
++        // for background preparation before later DATA or FRONTIER writes.
++        required_end
++    };
++    if let Err(error) =
++        initialize_v7_extent_prefix(inner, &mut prepared_end, needed, initialize_extents)
++    {
+@@ -3566 +3576 @@ mod tests {
+-    fn async_v7_extent_large_data_skip_cancels_queued_zeroing() -> anyhow::Result<()> {
++    fn async_v7_extent_large_data_skip_preserves_unused_suffix_preparation() -> anyhow::Result<()> {
+@@ -3604 +3614 @@ mod tests {
+-            super::PREALLOC_BLOCK
++            256 * 1024
+@@ -3606 +3616,8 @@ mod tests {
+-        let before = std::fs::read(&path)?;
++        let accepted_end = runtime.logical_length() as usize;
++        let before = std::fs::read(&path)?[..accepted_end].to_vec();
++        let canary_offset = 384 * 1024;
++        let buffered = std::fs::OpenOptions::new()
++            .read(true)
++            .write(true)
++            .open(&path)?;
++        buffered.write_all_at(b"canary", canary_offset)?;
+@@ -3609 +3626,11 @@ mod tests {
+-        assert_eq!(std::fs::read(&path)?, before);
++        assert_eq!(
++            runtime
++                .inner
++                .prepared_file_end
++                .load(super::Ordering::Acquire),
++            super::PREALLOC_BLOCK
++        );
++        assert_eq!(&std::fs::read(&path)?[..accepted_end], before);
++        let mut canary = [0; 6];
++        buffered.read_exact_at(&mut canary, canary_offset)?;
++        assert_eq!(canary, [0; 6]);
+@@ -3626,0 +3654,63 @@ mod tests {
++    #[test]
++    fn async_v7_extent_first_large_batch_and_close_progress_with_paused_suffix()
++    -> anyhow::Result<()> {
++        use crate::wal::v7::{
++            install::recover_and_install_active, recovery::WalV7RecoveryAuthority,
++        };
++        for cap in [super::PREALLOC_BLOCK, 192 * 1024 + 123] {
++            let directory = async_extent_test_directory()?;
++            let path = directory.path().join("first-large-paused.wal");
++            let Some(V7RuntimeTestWal { wal, owner, anchor }) =
++                live_v7_test_wal(&path, cap, v7_test_resource_limits())?
++            else {
++                return Ok(());
++            };
++            let concurrent_preparation = owner.reserve_batch(256)?;
++            let runtime = wal.parallel_runtime.as_ref().unwrap();
++            let Some((entered, resume)) = pause_async_extent(runtime) else {
++                eprintln!("skipping async extent test (ext filesystem unavailable)");
++                return Ok(());
++            };
++            let control = Arc::clone(runtime.inner.async_v7_extents.as_ref().unwrap());
++            let batches = vec![async_extent_large_batch(1), v7_test_batch(2, 16)];
++            for (index, batch) in batches.iter().enumerate() {
++                let ticket = wal.put_v7_batch_with_index(batch, LIVE_WAL_V5_LIMITS)?.0;
++                wal.submit_and_commit(ticket)?;
++                if index == 0 {
++                    entered.recv_timeout(std::time::Duration::from_secs(5))?;
++                }
++            }
++            assert_eq!(std::fs::metadata(&path)?.len(), cap);
++            assert_eq!(control.target.load(super::Ordering::Acquire), cap);
++            assert_eq!(
++                runtime
++                    .inner
++                    .prepared_file_end
++                    .load(super::Ordering::Acquire),
++                cap.min(256 * 1024)
++            );
++            assert!(runtime.logical_length() <= cap);
++            assert_eq!(control.completed_requests.load(super::Ordering::Acquire), 0);
++            // Large DATA, its FRONTIER and later small DATA must all progress
++            // without the optional suffix worker. Close must join that paused
++            // worker without requiring this test to release its pause.
++            drop(concurrent_preparation);
++            wal.close()?;
++            assert!(control.stopping.load(super::Ordering::Acquire));
++            assert_eq!(owner.snapshot().buffer_memory_bytes, 0);
++            drop(resume);
++            drop(wal);
++            let recovered = recover_and_install_active(
++                &path,
++                WalV7RecoveryAuthority::Active {
++                    predecessor: crate::pitr::ChainAnchor::Genesis {
++                        archive_epoch_id: crate::pitr::ArchiveEpochId(anchor.archive_epoch_id),
++                    },
++                    durable_anchors: vec![anchor],
++                },
++            )?;
++            assert_eq!(recovered.installed.batches, batches);
++        }
++        Ok(())
++    }
++

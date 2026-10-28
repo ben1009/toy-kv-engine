@@ -1,0 +1,51 @@
+{
+  "captures": [
+    {
+      "arm": "baseline",
+      "run_id": "1793172018011",
+      "writers": 8,
+      "source": "excluded native diagnostic",
+      "trace_path": "target/wal-opt/20261028-v7-large-data-lookahead/probe/baseline-8writers-io.csv",
+      "trace_sha256": "e500d75f6b71efebf5c7ff68c7b1310080e8084af042e9db7e749fdeb8043399",
+      "frontiers": 1953,
+      "syncs": 1953,
+      "background_writes": 76,
+      "background_bytes": 9961472,
+      "background_starts_during_sync": 30,
+      "background_overlaps_sync": 41,
+      "background_starts_during_marker_and_sync": 40,
+      "background_overlaps_marker_and_sync": 42,
+      "already_counted_in_lineage": false,
+      "foreground_zero_bytes": 6684672,
+      "total_zero_bytes": 16646144,
+      "frontier_mean_us": 3150.3024014336916,
+      "sync_mean_us": 3925.847420378904
+    },
+    {
+      "arm": "candidate",
+      "run_id": "1793172050888",
+      "writers": 8,
+      "source": "excluded native diagnostic",
+      "trace_path": "target/wal-opt/20261028-v7-large-data-lookahead/probe/candidate-8writers-io.csv",
+      "trace_sha256": "7bd2aa75c3e75ee9afd386c67921ad3501ce3ebee10a2d5d1408e35adc8ade4c",
+      "frontiers": 1767,
+      "syncs": 1767,
+      "background_writes": 6116,
+      "background_bytes": 763236352,
+      "background_starts_during_sync": 299,
+      "background_overlaps_sync": 456,
+      "background_starts_during_marker_and_sync": 629,
+      "background_overlaps_marker_and_sync": 830,
+      "already_counted_in_lineage": false,
+      "foreground_zero_bytes": 5595136,
+      "total_zero_bytes": 768831488,
+      "frontier_mean_us": 73.85102093944539,
+      "sync_mean_us": 320.23528239954726
+    }
+  ],
+  "metadata_sha256": "9cdb4250b5452e2f43fa3e1e2f4f1fd51923b3dda3fe80807594e48eb4df2672",
+  "added_invocations": 2,
+  "reused_invocations": 0,
+  "limits": "Two excluded native traces are mechanism diagnostics, not scored throughput evidence or proof that conversion costs explain every tail.",
+  "analyzer_sha256": "881a15dc5f4385f111b39a2f7c9344bbf3acd18f57c808c35c655cc668756a61"
+}

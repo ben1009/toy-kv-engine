@@ -1,0 +1,21 @@
+{
+  "created_at_utc": "2026-10-28T07:16:16.556770+00:00",
+  "source_base": "8ca9a3d60f43804d4bd69535e32de85916514c78",
+  "baseline": {
+    "path": "target/release/write-perf-v7-large-data-async-dispatch",
+    "sha256": "f353022d846530a6754330aaea11f295319ea8f4de20afa09b6d2a3b57b021d8"
+  },
+  "candidate": "For concurrent active ext-filesystem v7 large-DATA demand, allocate the existing bounded extent but skip initialization only through required_end; request existing background initialization for the unused suffix. Large DATA remains self-initializing. Solo, small-write, stopping and non-ext paths retain their policies.",
+  "motivation": "Current large DATA marks the entire allocated 1MiB usable after skipping zero fill, including unused space that future small FRONTIER writes must convert from unwritten extents. Keep the exact reserved prefix protected but prepare unused suffix asynchronously. Existing native traces establish background preparation and FRONTIER I/O costs, not a source attribution or guaranteed gain.",
+  "scope": "One source candidate, four fixed SSD cells; local repository only. Stop for review, no push or PR.",
+  "validation": "Real ext4 tests verify queued preparation skips acknowledged large DATA, initializes a sentinel in the unused suffix, preserves bytes and exact recovery; test first-large-demand startup and close while background work is paused, including a partial physical cap. Existing serial, sticky failure, poison and sealing tests plus full checks.",
+  "configuration": "Fresh local ext4 databases, 1KiB values, 2GiB SST, explicit v7 Parallel/no compaction. 750000 batch64 puts/sample10 at16,8,1writers;100000 point puts/sample100 at8writers. Host audit before/1Hz/after,30s initial cooldown,10s gaps, no concurrent build/test/source edit/profile. No SSD health or temperature polling.",
+  "schedule": "Two warmups and five alternating pairs at batch8, followed by two warmups and three alternating pairs each at batch16,point8,batch1. Run all four fixed cells regardless of interim performance. No replacements or score-selected retries; stop on capture correctness or host-audit errors.",
+  "stall_policy": "Preserve every raw invocation. Predeclare an obvious-stall flag when mean FRONTIER-write >=1ms or mean fdatasync >=1.5ms, relative to observed quiet markers~20-150us and syncs~350us. Exclude a pair from the filtered comparison if either invocation is flagged. This conservative aggregate mask misses short outliers and cannot prove retained samples stall-free or distinguish source-induced I/O changes from environment. Report exclusions by arm and all raw ratios.",
+  "assessment": "Screen batch8: at least3 filtered matched pairs, both median paired and arm-median throughput>1, paired p99<1. Other cells: at least2 filtered pairs, both throughput ratios>=0.95 and paired p99<=1.10. Identical DATA bytes. CPU/RSS diagnostic. Retention requires all four guards; failed or inconclusive candidate is restored exactly.",
+  "publication": "Keep accepted source in its own local commit, with evidence separate. For a failed or inconclusive candidate, evidence-only commit plus exact restoration.",
+  "prior_verification": "rfc-025-v7-sync-priority-extents-20261028-verification.json",
+  "prior_global_invocations": 665,
+  "diagnostic_invocations": 2,
+  "candidate_probe": "Two fixed excluded8-writer batch64 native captures, baseline then candidate, after validation. Compare zero-fill bytes, counts and native FRONTIER/sync intervals; no score-based changes or replacements."
+}

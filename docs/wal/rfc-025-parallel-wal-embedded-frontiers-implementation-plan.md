@@ -2849,3 +2849,15 @@ the two reused diagnostics and prior interrupted run are not double-counted.
   current-behavior documentation together.
 
 [WAL documentation](README.md) · [All documentation](../README.md).
+
+The [large-DATA suffix experiment](benchmarks/rfc-025-v7-large-data-lookahead-20261028.md)
+leaves only the reserved large-DATA prefix protected and initializes the unused
+allocated suffix in the background. It is not retained: the excluded native
+candidate writes about 733 MiB of zeros, versus 16 MiB in the stalled baseline
+trace, and the filtered batch8 screen loses 7.7% throughput with 32.9% higher p99.
+Batch16 has only one matched pair, also worse. Point and solo timing varies below
+the aggregate stall mask; no isolated large source effect is claimed. All four
+fixed cells finish, and retained source/executable are restored. Candidate checks
+pass 1,974 tests; restored checks pass 1,973 with one compaction timeout/retry,
+followed by an isolated no-retry pass. The lineage is 703 completed invocations,
+plus the earlier interrupted invocation without JSON. V4 parity remains open.

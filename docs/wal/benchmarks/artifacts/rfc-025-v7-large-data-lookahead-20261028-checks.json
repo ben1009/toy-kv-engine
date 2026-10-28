@@ -1,0 +1,187 @@
+{
+  "outside_sandbox": true,
+  "checks": [
+    {
+      "phase": "format",
+      "command": [
+        "cargo",
+        "fmt",
+        "--all"
+      ],
+      "started_at_utc": "2026-10-28T07:17:38.447349+00:00",
+      "exit_code": 0,
+      "log": "target/wal-opt/20261028-v7-large-data-lookahead/format.log",
+      "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "phase": "direct spelling",
+      "command": [
+        "typos",
+        "kv-engine/src/wal/parallel/runtime.rs",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-large-data-lookahead-20261028-analyze.py",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-large-data-lookahead-20261028-baseline-sha256.tsv",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-large-data-lookahead-20261028-candidate.patch",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-large-data-lookahead-20261028-checks.json",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-large-data-lookahead-20261028-child.py",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-large-data-lookahead-20261028-matrix.json",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-large-data-lookahead-20261028-plan.json",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-large-data-lookahead-20261028-run-all.py",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-large-data-lookahead-20261028-run.py",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-large-data-lookahead-20261028-source-sha256.tsv"
+      ],
+      "started_at_utc": "2026-10-28T07:17:39.455016+00:00",
+      "exit_code": 0,
+      "log": "target/wal-opt/20261028-v7-large-data-lookahead/direct-spelling.log",
+      "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "phase": "focused",
+      "command": [
+        "cargo",
+        "nextest",
+        "run",
+        "--offline",
+        "--locked",
+        "--workspace",
+        "--all-features",
+        "--lib",
+        "--retries",
+        "0",
+        "--success-output",
+        "immediate",
+        "-E",
+        "test(wal::parallel_worker::tests::) or (test(wal::parallel_runtime::tests::) and (test(v7_frontier) or test(v7_extent) or test(async_v7_extent) or test(failpoint_v7) or test(v7_large_batch_wave)))"
+      ],
+      "started_at_utc": "2026-10-28T07:17:39.487034+00:00",
+      "exit_code": 0,
+      "log": "target/wal-opt/20261028-v7-large-data-lookahead/focused.log",
+      "log_sha256": "d60b2e843965354cd9b5829a03969b573cf97635f343757c50717fd5029068ab"
+    },
+    {
+      "phase": "check",
+      "command": [
+        "cargo",
+        "make",
+        "check"
+      ],
+      "started_at_utc": "2026-10-28T07:17:46.381191+00:00",
+      "exit_code": 0,
+      "log": "target/wal-opt/20261028-v7-large-data-lookahead/check.log",
+      "log_sha256": "8503b5f15685936d8a4892927c522827decbf7dad023b7b4aedc92ea701f6956"
+    },
+    {
+      "phase": "release",
+      "command": [
+        "cargo",
+        "build",
+        "--offline",
+        "--locked",
+        "--release",
+        "--package",
+        "kv-engine",
+        "--bin",
+        "write-perf",
+        "--features",
+        "bench"
+      ],
+      "started_at_utc": "2026-10-28T07:18:37.846226+00:00",
+      "exit_code": 0,
+      "log": "target/wal-opt/20261028-v7-large-data-lookahead/release.log",
+      "log_sha256": "bb199406a25ae9bde1d8c7cde3f349c6a9370dfbebefa81741d8e0991a9a1ccf"
+    },
+    {
+      "phase": "restored check",
+      "command": [
+        "cargo",
+        "make",
+        "check"
+      ],
+      "started_at_utc": "2026-10-28T07:36:42.297760+00:00",
+      "exit_code": 0,
+      "log": "target/wal-opt/20261028-v7-large-data-lookahead/restored-check.log",
+      "log_sha256": "f57bc629c3856e3099f54e0e5b492bd141707a61ad33477663999ed80fadfe3b"
+    },
+    {
+      "phase": "restored compaction no retry",
+      "command": [
+        "cargo",
+        "nextest",
+        "run",
+        "--offline",
+        "--locked",
+        "--workspace",
+        "--all-features",
+        "--lib",
+        "--retries",
+        "0",
+        "--success-output",
+        "immediate",
+        "-E",
+        "test(=tests::simple_leveled_compaction::test_integration)"
+      ],
+      "started_at_utc": "2026-10-28T07:39:01.374901+00:00",
+      "exit_code": 0,
+      "log": "target/wal-opt/20261028-v7-large-data-lookahead/restored-compaction.log",
+      "log_sha256": "fae31f194d78c649b2fdbaa605da29e1f4192274aeed20336110a5b931510f94"
+    },
+    {
+      "phase": "final spelling",
+      "command": [
+        "typos",
+        "docs/wal/README.md",
+        "docs/wal/rfc-025-parallel-wal-embedded-frontiers-implementation-plan.md",
+        "docs/wal/benchmarks/rfc-025-v7-large-data-lookahead-20261028.md",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-large-data-lookahead-20261028-analyze.py",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-large-data-lookahead-20261028-baseline-sha256.tsv",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-large-data-lookahead-20261028-binaries.json",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-large-data-lookahead-20261028-candidate.patch",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-large-data-lookahead-20261028-capture-all.py",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-large-data-lookahead-20261028-checks.json",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-large-data-lookahead-20261028-child.py",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-large-data-lookahead-20261028-decision.json",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-large-data-lookahead-20261028-diagnose.py",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-large-data-lookahead-20261028-diagnosis.json",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-large-data-lookahead-20261028-environment.json",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-large-data-lookahead-20261028-ext4-batch1-host.jsonl",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-large-data-lookahead-20261028-ext4-batch1-runs.tsv",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-large-data-lookahead-20261028-ext4-batch1.jsonl",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-large-data-lookahead-20261028-ext4-batch16-host.jsonl",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-large-data-lookahead-20261028-ext4-batch16-runs.tsv",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-large-data-lookahead-20261028-ext4-batch16.jsonl",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-large-data-lookahead-20261028-ext4-batch8-host.jsonl",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-large-data-lookahead-20261028-ext4-batch8-runs.tsv",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-large-data-lookahead-20261028-ext4-batch8.jsonl",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-large-data-lookahead-20261028-ext4-point8-host.jsonl",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-large-data-lookahead-20261028-ext4-point8-runs.tsv",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-large-data-lookahead-20261028-ext4-point8.jsonl",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-large-data-lookahead-20261028-matrix.json",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-large-data-lookahead-20261028-peaks.json",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-large-data-lookahead-20261028-plan.json",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-large-data-lookahead-20261028-probe-captures.json",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-large-data-lookahead-20261028-probe-plan.json",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-large-data-lookahead-20261028-probe-run.py",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-large-data-lookahead-20261028-probe-runs.jsonl",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-large-data-lookahead-20261028-run-all.py",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-large-data-lookahead-20261028-run.py",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-large-data-lookahead-20261028-source-sha256.tsv",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-large-data-lookahead-20261028-summary.json",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-large-data-lookahead-20261028-verify.py"
+      ],
+      "started_at_utc": "2026-10-28T07:42:27.472945+00:00",
+      "exit_code": 0,
+      "log": "target/wal-opt/20261028-v7-large-data-lookahead/final-spelling.log",
+      "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    }
+  ],
+  "tests": 1974,
+  "focused_tests": 48,
+  "restored_tests": 1973,
+  "restored_flaky_tests": [
+    "tests::simple_leveled_compaction::test_integration"
+  ],
+  "restored_check_note": "Full check exit0, one30-second simple-leveled-compaction timeout passed automatic retry. Post-check no-flaky assertion stopped. Preserve original log; isolate the test once with retries0. No engine change for this timeout.",
+  "validation_driver": {
+    "path": "target/wal-opt/20261028-v7-large-data-lookahead/candidate-validation.py",
+    "sha256": "eadeb02a4fe795564d20973e3fc3703b3c5f3f04d595a85b05e3d4b8d86c0902"
+  }
+}
