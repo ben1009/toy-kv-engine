@@ -1,0 +1,932 @@
+{
+  "ext4-batch8": {
+    "invocations": 12,
+    "records": 12,
+    "warmup_records": 2,
+    "host_samples": 107,
+    "run_ids": [
+      "1793194844679",
+      "1793194857194",
+      "1793194880806",
+      "1793194920310",
+      "1793194945124",
+      "1793194957023",
+      "1793194968872",
+      "1793194981424",
+      "1793194994393",
+      "1793195007052",
+      "1793195019914",
+      "1793195032690"
+    ],
+    "comparisons": {
+      "concurrent_batch_64/v7": {
+        "pairs": [
+          {
+            "pair": 1,
+            "throughput": 2.0376391915633927,
+            "cpu": 0.693166572899987,
+            "rss": 1.0004660596383723,
+            "p99": 0.7178000498480995,
+            "sync_count": 0.8838297872340426,
+            "data_bytes": 1.0
+          },
+          {
+            "pair": 2,
+            "throughput": 0.9665978661576641,
+            "cpu": 0.9823720352637051,
+            "rss": 1.001419688358987,
+            "p99": 1.0600098395644824,
+            "sync_count": 0.9798488664987406,
+            "data_bytes": 1.0
+          },
+          {
+            "pair": 3,
+            "throughput": 0.8509511304179468,
+            "cpu": 1.0894628276639888,
+            "rss": 1.000004310474885,
+            "p99": 2.449914295138959,
+            "sync_count": 1.0306391970417328,
+            "data_bytes": 1.0
+          },
+          {
+            "pair": 4,
+            "throughput": 1.0747110708447254,
+            "cpu": 0.8693937090249246,
+            "rss": 0.9996420824762718,
+            "p99": 1.075787325947362,
+            "sync_count": 0.985854189336235,
+            "data_bytes": 1.0
+          },
+          {
+            "pair": 5,
+            "throughput": 1.1896314830376014,
+            "cpu": 0.7725630153715195,
+            "rss": 1.0008804792569446,
+            "p99": 1.6149718038002518,
+            "sync_count": 0.9032620922384702,
+            "data_bytes": 1.0
+          }
+        ],
+        "median": {
+          "throughput": 1.0747110708447254,
+          "cpu": 0.8693937090249246,
+          "rss": 1.0004660596383723,
+          "p99": 1.075787325947362,
+          "sync_count": 0.9798488664987406,
+          "data_bytes": 1.0
+        },
+        "per_arm": {
+          "old_v7": {
+            "median_rate": 293983.100447323,
+            "median_cpu_ms": 4633.634,
+            "median_peak_rss_kib": 926964,
+            "peak_rate": 463804.97885702644,
+            "peak_run_id": "1793194957023",
+            "peak_raw_sha256": "f4a41fde0784ba02dc0199535bfc2d9765bb12d0701328536bbf1e453a32783d",
+            "binary_sha256": "f353022d846530a6754330aaea11f295319ea8f4de20afa09b6d2a3b57b021d8",
+            "median_p99_ms": 7.938834,
+            "pipeline_medians": {
+              "commit_groups": 7549,
+              "commit_buffers": 11720,
+              "commit_bytes": 816021504,
+              "sync_count": 1838,
+              "fdatasync_ns": 752249507,
+              "frontier_writes": 1838,
+              "frontier_bytes": 7528448,
+              "frontier_write_ns": 215865080,
+              "preallocation_ns": 55342294,
+              "wal_sync_wait_ns": 15976075243,
+              "memtable_insert_ns": 1381251226
+            }
+          },
+          "new_v7": {
+            "median_rate": 308117.2384646261,
+            "median_cpu_ms": 4141.017,
+            "median_peak_rss_kib": 927584,
+            "peak_rate": 448312.90287650225,
+            "peak_run_id": "1793194945124",
+            "peak_raw_sha256": "6b3da750925776318551870f5557ea20b9fc841612eab9c5aa8b016d6d53a3c1",
+            "binary_sha256": "1f5cc447edbd82e57951013ea2c481b40982316e91e13467c5e8cd9c6de009f4",
+            "median_p99_ms": 8.622809,
+            "pipeline_medians": {
+              "commit_groups": 7566,
+              "commit_buffers": 11720,
+              "commit_bytes": 816021504,
+              "sync_count": 1812,
+              "fdatasync_ns": 785824509,
+              "frontier_writes": 1812,
+              "frontier_bytes": 7421952,
+              "frontier_write_ns": 219669164,
+              "preallocation_ns": 82168816,
+              "wal_sync_wait_ns": 15345024123,
+              "memtable_insert_ns": 1193213621
+            }
+          }
+        },
+        "guards": {
+          "paired_floor": true,
+          "arm_median_floor": true,
+          "p99_ceiling": true,
+          "identical_data_bytes": true
+        },
+        "passed": true,
+        "memory_review": false
+      }
+    },
+    "passed": true,
+    "artifact_sha256": {
+      ".jsonl": "25619005f28f746d2c9ef07162e2dbcebb2119ec6d8c47dfa53f83a134078aed",
+      "-runs.tsv": "cbb7392e4f7ad7f8d006594c8003e5dd0c78ca9590af3ad4a9c50cde50fe52e7",
+      "-host.jsonl": "a544a05d1fb31f110be355fba256181a5b20ea0cec5cefdd8ca0843e56004c26"
+    },
+    "raw_v7_passed": true,
+    "v7_passed": false,
+    "stall_filter": {
+      "rule": "Either arm mean FRONTIER write>=1ms or mean fdatasync>=1.5ms",
+      "pair_masks": [
+        {
+          "pair": 1,
+          "old_v7": {
+            "run_id": "1793194880806",
+            "frontier_mean_ms": 4.290058025957446,
+            "fdatasync_mean_ms": 5.403571007659574,
+            "obvious_stall": true,
+            "puts_s": 25780.234103450413,
+            "p99_ms": 62.221028
+          },
+          "new_v7": {
+            "run_id": "1793194920310",
+            "frontier_mean_ms": 2.2610583413577277,
+            "fdatasync_mean_ms": 3.0388599913336543,
+            "obvious_stall": true,
+            "puts_s": 52530.8153768697,
+            "p99_ms": 44.662257
+          },
+          "excluded": true
+        },
+        {
+          "pair": 2,
+          "old_v7": {
+            "run_id": "1793194957023",
+            "frontier_mean_ms": 0.024734748740554157,
+            "fdatasync_mean_ms": 0.31286431108312346,
+            "obvious_stall": false,
+            "puts_s": 463804.97885702644,
+            "p99_ms": 2.607839
+          },
+          "new_v7": {
+            "run_id": "1793194945124",
+            "frontier_mean_ms": 0.059348987146529565,
+            "fdatasync_mean_ms": 0.3107865411311054,
+            "obvious_stall": false,
+            "puts_s": 448312.90287650225,
+            "p99_ms": 2.764335
+          },
+          "excluded": false
+        },
+        {
+          "pair": 3,
+          "old_v7": {
+            "run_id": "1793194968872",
+            "frontier_mean_ms": 0.05520983042789224,
+            "fdatasync_mean_ms": 0.31466747966191233,
+            "obvious_stall": false,
+            "puts_s": 322686.69236070785,
+            "p99_ms": 3.519637
+          },
+          "new_v7": {
+            "run_id": "1793194981424",
+            "frontier_mean_ms": 0.1278061845207586,
+            "fdatasync_mean_ms": 0.4027803736545362,
+            "obvious_stall": false,
+            "puts_s": 274590.6056351726,
+            "p99_ms": 8.622809
+          },
+          "excluded": false
+        },
+        {
+          "pair": 4,
+          "old_v7": {
+            "run_id": "1793195007052",
+            "frontier_mean_ms": 0.11744563656147987,
+            "fdatasync_mean_ms": 0.4367772464635473,
+            "obvious_stall": false,
+            "puts_s": 286697.74307102396,
+            "p99_ms": 7.938834
+          },
+          "new_v7": {
+            "run_id": "1793194994393",
+            "frontier_mean_ms": 0.1212302229580574,
+            "fdatasync_mean_ms": 0.44663131125827815,
+            "obvious_stall": false,
+            "puts_s": 308117.2384646261,
+            "p99_ms": 8.540497
+          },
+          "excluded": false
+        },
+        {
+          "pair": 5,
+          "old_v7": {
+            "run_id": "1793195019914",
+            "frontier_mean_ms": 0.12421361361079865,
+            "fdatasync_mean_ms": 0.4230874617547807,
+            "obvious_stall": false,
+            "puts_s": 293983.100447323,
+            "p99_ms": 8.287819
+          },
+          "new_v7": {
+            "run_id": "1793195032690",
+            "frontier_mean_ms": 0.1252255292652553,
+            "fdatasync_mean_ms": 0.4323540323785803,
+            "obvious_stall": false,
+            "puts_s": 349731.55177314096,
+            "p99_ms": 13.384594
+          },
+          "excluded": false
+        }
+      ],
+      "matched_pairs": [
+        2,
+        3,
+        4,
+        5
+      ],
+      "excluded_by_arm": {
+        "old_v7": 1,
+        "new_v7": 1
+      },
+      "median": {
+        "throughput": 1.0206544685011947,
+        "cpu": 0.9258828721443149,
+        "rss": 1.0004423948659147,
+        "p99": 1.345379564873807,
+        "sync_count": 0.9828515279174879,
+        "data_bytes": 1.0
+      },
+      "arm_median_rate_ratio": 1.0667764140711773,
+      "guards": {
+        "enough_matched_pairs": true,
+        "paired_throughput": true,
+        "arm_median_throughput": true,
+        "paired_p99": false,
+        "identical_data_bytes": true
+      },
+      "limits": "Aggregate mask excludes obvious long-I/O runs but misses short outliers and does not establish stall-free conditions or prove source/environment attribution. Every raw record is preserved."
+    }
+  },
+  "ext4-batch16": {
+    "invocations": 8,
+    "records": 8,
+    "warmup_records": 2,
+    "host_samples": 42,
+    "run_ids": [
+      "1793195075146",
+      "1793195087316",
+      "1793195099719",
+      "1793195112131",
+      "1793195124619",
+      "1793195137066",
+      "1793195149506",
+      "1793195162020"
+    ],
+    "comparisons": {
+      "concurrent_batch_64/v7": {
+        "pairs": [
+          {
+            "pair": 1,
+            "throughput": 0.9567006707600404,
+            "cpu": 1.073179527452781,
+            "rss": 1.0014686058580577,
+            "p99": 1.2102145053319282,
+            "sync_count": 1.048202614379085,
+            "data_bytes": 1.0
+          },
+          {
+            "pair": 2,
+            "throughput": 0.9967774369094226,
+            "cpu": 1.0384665654460057,
+            "rss": 0.9988511929092356,
+            "p99": 0.7260264510123815,
+            "sync_count": 0.9946236559139785,
+            "data_bytes": 1.0
+          },
+          {
+            "pair": 3,
+            "throughput": 0.5096554623990103,
+            "cpu": 1.3668047677787096,
+            "rss": 1.0002667917432257,
+            "p99": 2.1110287703396007,
+            "sync_count": 1.0642857142857143,
+            "data_bytes": 1.0
+          }
+        ],
+        "median": {
+          "throughput": 0.9567006707600404,
+          "cpu": 1.073179527452781,
+          "rss": 1.0002667917432257,
+          "p99": 1.2102145053319282,
+          "sync_count": 1.048202614379085,
+          "data_bytes": 1.0
+        },
+        "per_arm": {
+          "old_v7": {
+            "median_rate": 339859.32123362523,
+            "median_cpu_ms": 4789.536,
+            "median_peak_rss_kib": 929564,
+            "peak_rate": 346877.9208335007,
+            "peak_run_id": "1793195099719",
+            "peak_raw_sha256": "bef8bdcfe3725b139df384df6db25e66a73ec24b59ea3910315e5174244828cc",
+            "binary_sha256": "f353022d846530a6754330aaea11f295319ea8f4de20afa09b6d2a3b57b021d8",
+            "median_p99_ms": 16.389849,
+            "pipeline_medians": {
+              "commit_groups": 6450,
+              "commit_buffers": 11728,
+              "commit_bytes": 816054272,
+              "sync_count": 1260,
+              "fdatasync_ns": 717941135,
+              "frontier_writes": 1260,
+              "frontier_bytes": 5160960,
+              "frontier_write_ns": 320259895,
+              "preallocation_ns": 209099566,
+              "wal_sync_wait_ns": 28635250366,
+              "memtable_insert_ns": 1447052586
+            }
+          },
+          "new_v7": {
+            "median_rate": 331858.3395332583,
+            "median_cpu_ms": 5041.146000000001,
+            "median_peak_rss_kib": 929812,
+            "peak_rate": 338764.10312902904,
+            "peak_run_id": "1793195124619",
+            "peak_raw_sha256": "1a722ac6ff0186f0ed7f0c742d6c76152b76d4af48147f4d07c850fbbd01e555",
+            "binary_sha256": "1f5cc447edbd82e57951013ea2c481b40982316e91e13467c5e8cd9c6de009f4",
+            "median_p99_ms": 19.835233,
+            "pipeline_medians": {
+              "commit_groups": 6329,
+              "commit_buffers": 11728,
+              "commit_bytes": 816054272,
+              "sync_count": 1295,
+              "fdatasync_ns": 762817438,
+              "frontier_writes": 1295,
+              "frontier_bytes": 5304320,
+              "frontier_write_ns": 319676661,
+              "preallocation_ns": 257347999,
+              "wal_sync_wait_ns": 29028275354,
+              "memtable_insert_ns": 1485554147
+            }
+          }
+        },
+        "guards": {
+          "paired_floor": true,
+          "arm_median_floor": true,
+          "p99_ceiling": false,
+          "identical_data_bytes": true
+        },
+        "passed": false,
+        "memory_review": false
+      }
+    },
+    "passed": false,
+    "artifact_sha256": {
+      ".jsonl": "7b06c33d0a26445050834ad2e774a7755fcb8329d65efca6308b721c9c5b05cd",
+      "-runs.tsv": "d9c2a27bc1396a77aa4b26ed11de1f9fcb636dc3d09a112dd34145acd58074c4",
+      "-host.jsonl": "5030f6337c5e03551213c3d69aa8cf4d1080b36e6b4d93804f38c0abe0178dc5"
+    },
+    "raw_v7_passed": false,
+    "v7_passed": false,
+    "stall_filter": {
+      "rule": "Either arm mean FRONTIER write>=1ms or mean fdatasync>=1.5ms",
+      "pair_masks": [
+        {
+          "pair": 1,
+          "old_v7": {
+            "run_id": "1793195099719",
+            "frontier_mean_ms": 0.2616502410130719,
+            "fdatasync_mean_ms": 0.5823383276143791,
+            "obvious_stall": false,
+            "puts_s": 346877.9208335007,
+            "p99_ms": 16.389849
+          },
+          "new_v7": {
+            "run_id": "1793195112131",
+            "frontier_mean_ms": 0.24916341465315664,
+            "fdatasync_mean_ms": 0.5828848620420889,
+            "obvious_stall": false,
+            "puts_s": 331858.3395332583,
+            "p99_ms": 19.835233
+          },
+          "excluded": false
+        },
+        {
+          "pair": 2,
+          "old_v7": {
+            "run_id": "1793195137066",
+            "frontier_mean_ms": 0.2330698901689708,
+            "fdatasync_mean_ms": 0.5514140821812596,
+            "obvious_stall": false,
+            "puts_s": 339859.32123362523,
+            "p99_ms": 21.237448
+          },
+          "new_v7": {
+            "run_id": "1793195124619",
+            "frontier_mean_ms": 0.18383239768339768,
+            "fdatasync_mean_ms": 0.5890482146718147,
+            "obvious_stall": false,
+            "puts_s": 338764.10312902904,
+            "p99_ms": 15.418949
+          },
+          "excluded": false
+        },
+        {
+          "pair": 3,
+          "old_v7": {
+            "run_id": "1793195149506",
+            "frontier_mean_ms": 0.27455173730158733,
+            "fdatasync_mean_ms": 0.58777425,
+            "obvious_stall": false,
+            "puts_s": 328180.29433887627,
+            "p99_ms": 14.626209
+          },
+          "new_v7": {
+            "run_id": "1793195162020",
+            "frontier_mean_ms": 0.9761963430275914,
+            "fdatasync_mean_ms": 0.777427283370619,
+            "obvious_stall": false,
+            "puts_s": 167258.87966152327,
+            "p99_ms": 30.876348
+          },
+          "excluded": false
+        }
+      ],
+      "matched_pairs": [
+        1,
+        2,
+        3
+      ],
+      "excluded_by_arm": {
+        "old_v7": 0,
+        "new_v7": 0
+      },
+      "median": {
+        "throughput": 0.9567006707600404,
+        "cpu": 1.073179527452781,
+        "rss": 1.0002667917432257,
+        "p99": 1.2102145053319282,
+        "sync_count": 1.048202614379085,
+        "data_bytes": 1.0
+      },
+      "arm_median_rate_ratio": 0.976457960101477,
+      "guards": {
+        "enough_matched_pairs": true,
+        "paired_throughput": true,
+        "arm_median_throughput": true,
+        "paired_p99": false,
+        "identical_data_bytes": true
+      },
+      "limits": "Aggregate mask excludes obvious long-I/O runs but misses short outliers and does not establish stall-free conditions or prove source/environment attribution. Every raw record is preserved."
+    }
+  },
+  "ext4-point8": {
+    "invocations": 8,
+    "records": 8,
+    "warmup_records": 2,
+    "host_samples": 135,
+    "run_ids": [
+      "1793195206864",
+      "1793195236269",
+      "1793195265723",
+      "1793195294130",
+      "1793195310473",
+      "1793195335627",
+      "1793195371319",
+      "1793195387744"
+    ],
+    "comparisons": {
+      "concurrent/v7": {
+        "pairs": [
+          {
+            "pair": 1,
+            "throughput": 2.9287806098158953,
+            "cpu": 0.8166856485006995,
+            "rss": 0.98871189233727,
+            "p99": 0.12793498764545952,
+            "sync_count": 0.9604103343465046,
+            "data_bytes": 1.0
+          },
+          {
+            "pair": 2,
+            "throughput": 1.6834435600164497,
+            "cpu": 0.8100605514316108,
+            "rss": 1.0067274546869787,
+            "p99": 0.5520665803922998,
+            "sync_count": 0.9768799272286234,
+            "data_bytes": 1.0
+          },
+          {
+            "pair": 3,
+            "throughput": 1.0105055216195482,
+            "cpu": 0.9747944900085791,
+            "rss": 0.9916689655172414,
+            "p99": 0.9256319386390915,
+            "sync_count": 0.999842594050055,
+            "data_bytes": 1.0
+          }
+        ],
+        "median": {
+          "throughput": 1.6834435600164497,
+          "cpu": 0.8166856485006995,
+          "rss": 0.9916689655172414,
+          "p99": 0.5520665803922998,
+          "sync_count": 0.9768799272286234,
+          "data_bytes": 1.0
+        },
+        "per_arm": {
+          "old_v7": {
+            "median_rate": 5496.327825853843,
+            "median_cpu_ms": 8192.921,
+            "median_peak_rss_kib": 145000,
+            "peak_rate": 15892.89563522333,
+            "peak_run_id": "1793195371319",
+            "peak_raw_sha256": "9c2b4cfe3954bf4286e71a8c6d10f967c0689479222ff5ec0b136166524fc710",
+            "binary_sha256": "f353022d846530a6754330aaea11f295319ea8f4de20afa09b6d2a3b57b021d8",
+            "median_p99_ms": 10.359754,
+            "pipeline_medians": {
+              "commit_groups": 77238,
+              "commit_buffers": 100000,
+              "commit_bytes": 409600000,
+              "sync_count": 13160,
+              "fdatasync_ns": 4992462053,
+              "frontier_writes": 13160,
+              "frontier_bytes": 53903360,
+              "frontier_write_ns": 1425987361,
+              "preallocation_ns": 523016349,
+              "wal_sync_wait_ns": 141884529304,
+              "memtable_insert_ns": 616354977
+            }
+          },
+          "new_v7": {
+            "median_rate": 16059.858793916392,
+            "median_cpu_ms": 7030.986,
+            "median_peak_rss_kib": 143996,
+            "peak_rate": 16097.538361552291,
+            "peak_run_id": "1793195294130",
+            "peak_raw_sha256": "a4c8ef14e7d800c2791102c0d1d94d38ed6619bd2005c1562bec4b1c3f7e7ec4",
+            "binary_sha256": "1f5cc447edbd82e57951013ea2c481b40982316e91e13467c5e8cd9c6de009f4",
+            "median_p99_ms": 1.325375,
+            "pipeline_medians": {
+              "commit_groups": 75835,
+              "commit_buffers": 100000,
+              "commit_bytes": 409600000,
+              "sync_count": 12704,
+              "fdatasync_ns": 3181665254,
+              "frontier_writes": 12704,
+              "frontier_bytes": 52035584,
+              "frontier_write_ns": 242290415,
+              "preallocation_ns": 62517091,
+              "wal_sync_wait_ns": 46967778932,
+              "memtable_insert_ns": 489942937
+            }
+          }
+        },
+        "guards": {
+          "paired_floor": true,
+          "arm_median_floor": true,
+          "p99_ceiling": true,
+          "identical_data_bytes": true
+        },
+        "passed": true,
+        "memory_review": false
+      }
+    },
+    "passed": true,
+    "artifact_sha256": {
+      ".jsonl": "2cd408a8e4a08c692ce1e9c51cf77f6be5b00e7ed93a2b3ee89999b8f0b68cd9",
+      "-runs.tsv": "4d9a544169cc8aa0396783fa840cc7c7b1599dd205738430869d81ecc26483a5",
+      "-host.jsonl": "c810184ac63efd6014305502afb7562de48f7aad02a3a9e14670ae03226ad807"
+    },
+    "raw_v7_passed": true,
+    "v7_passed": true,
+    "stall_filter": {
+      "rule": "Either arm mean FRONTIER write>=1ms or mean fdatasync>=1.5ms",
+      "pair_masks": [
+        {
+          "pair": 1,
+          "old_v7": {
+            "run_id": "1793195265723",
+            "frontier_mean_ms": 0.10835770220364742,
+            "fdatasync_mean_ms": 0.3793664174012158,
+            "obvious_stall": false,
+            "puts_s": 5496.327825853843,
+            "p99_ms": 10.359754
+          },
+          "new_v7": {
+            "run_id": "1793195294130",
+            "frontier_mean_ms": 0.019170062109344094,
+            "fdatasync_mean_ms": 0.2517339389192183,
+            "obvious_stall": false,
+            "puts_s": 16097.538361552291,
+            "p99_ms": 1.325375
+          },
+          "excluded": false
+        },
+        {
+          "pair": 2,
+          "old_v7": {
+            "run_id": "1793195335627",
+            "frontier_mean_ms": 0.2547657005003032,
+            "fdatasync_mean_ms": 0.5253859177531838,
+            "obvious_stall": false,
+            "puts_s": 3958.150859337982,
+            "p99_ms": 18.10503
+          },
+          "new_v7": {
+            "run_id": "1793195310473",
+            "frontier_mean_ms": 0.12891773096919376,
+            "fdatasync_mean_ms": 0.3906191125940871,
+            "obvious_stall": false,
+            "puts_s": 6663.323573726102,
+            "p99_ms": 9.995182
+          },
+          "excluded": false
+        },
+        {
+          "pair": 3,
+          "old_v7": {
+            "run_id": "1793195371319",
+            "frontier_mean_ms": 0.023207757358728157,
+            "fdatasync_mean_ms": 0.25136753974500237,
+            "obvious_stall": false,
+            "puts_s": 15892.89563522333,
+            "p99_ms": 1.229708
+          },
+          "new_v7": {
+            "run_id": "1793195387744",
+            "frontier_mean_ms": 0.01870557871536524,
+            "fdatasync_mean_ms": 0.25041084178211587,
+            "obvious_stall": false,
+            "puts_s": 16059.858793916392,
+            "p99_ms": 1.138257
+          },
+          "excluded": false
+        }
+      ],
+      "matched_pairs": [
+        1,
+        2,
+        3
+      ],
+      "excluded_by_arm": {
+        "old_v7": 0,
+        "new_v7": 0
+      },
+      "median": {
+        "throughput": 1.6834435600164497,
+        "cpu": 0.8166856485006995,
+        "rss": 0.9916689655172414,
+        "p99": 0.5520665803922998,
+        "sync_count": 0.9768799272286234,
+        "data_bytes": 1.0
+      },
+      "arm_median_rate_ratio": 2.9219252022001663,
+      "guards": {
+        "enough_matched_pairs": true,
+        "paired_throughput": true,
+        "arm_median_throughput": true,
+        "paired_p99": true,
+        "identical_data_bytes": true
+      },
+      "limits": "Aggregate mask excludes obvious long-I/O runs but misses short outliers and does not establish stall-free conditions or prove source/environment attribution. Every raw record is preserved."
+    }
+  },
+  "ext4-batch1": {
+    "invocations": 8,
+    "records": 8,
+    "warmup_records": 2,
+    "host_samples": 216,
+    "run_ids": [
+      "1793195434201",
+      "1793195463599",
+      "1793195506773",
+      "1793195541786",
+      "1793195568926",
+      "1793195611484",
+      "1793195649614",
+      "1793195673851"
+    ],
+    "comparisons": {
+      "concurrent_batch_64/v7": {
+        "pairs": [
+          {
+            "pair": 1,
+            "throughput": 1.4632410463668266,
+            "cpu": 0.9547831510586026,
+            "rss": 0.9991299104066161,
+            "p99": 0.9238666241086176,
+            "sync_count": 1.0,
+            "data_bytes": 1.0
+          },
+          {
+            "pair": 2,
+            "throughput": 0.8620479625179288,
+            "cpu": 0.9955062593039066,
+            "rss": 0.9999698217326637,
+            "p99": 0.9315072074540549,
+            "sync_count": 1.0,
+            "data_bytes": 1.0
+          },
+          {
+            "pair": 3,
+            "throughput": 0.4333614300503572,
+            "cpu": 1.189510579879307,
+            "rss": 0.9993620717152081,
+            "p99": 1.1598446375190654,
+            "sync_count": 1.0,
+            "data_bytes": 1.0
+          }
+        ],
+        "median": {
+          "throughput": 0.8620479625179288,
+          "cpu": 0.9955062593039066,
+          "rss": 0.9993620717152081,
+          "p99": 0.9315072074540549,
+          "sync_count": 1.0,
+          "data_bytes": 1.0
+        },
+        "per_arm": {
+          "old_v7": {
+            "median_rate": 30365.6095239982,
+            "median_cpu_ms": 7513.018,
+            "median_peak_rss_kib": 928004,
+            "peak_rate": 53559.30872727263,
+            "peak_run_id": "1793195649614",
+            "peak_raw_sha256": "342496218f5c18f445f35394c9720383a3a0a00b8e84c9d763f871ce03d13b23",
+            "binary_sha256": "f353022d846530a6754330aaea11f295319ea8f4de20afa09b6d2a3b57b021d8",
+            "median_p99_ms": 10.827564,
+            "pipeline_medians": {
+              "commit_groups": 11719,
+              "commit_buffers": 11719,
+              "commit_bytes": 816001024,
+              "sync_count": 11719,
+              "fdatasync_ns": 12117592965,
+              "frontier_writes": 11719,
+              "frontier_bytes": 48001024,
+              "frontier_write_ns": 936826052,
+              "preallocation_ns": 19523919,
+              "wal_sync_wait_ns": 21686694861,
+              "memtable_insert_ns": 1265873742
+            }
+          },
+          "new_v7": {
+            "median_rate": 23258.326630926822,
+            "median_cpu_ms": 7538.061,
+            "median_peak_rss_kib": 927792,
+            "peak_rate": 44432.2062534616,
+            "peak_run_id": "1793195541786",
+            "peak_raw_sha256": "e1a6711498a19ddc9b8a1e95af0f467e8cafad46764a169ed197549108c70d26",
+            "binary_sha256": "1f5cc447edbd82e57951013ea2c481b40982316e91e13467c5e8cd9c6de009f4",
+            "median_p99_ms": 10.902678,
+            "pipeline_medians": {
+              "commit_groups": 11719,
+              "commit_buffers": 11719,
+              "commit_bytes": 816001024,
+              "sync_count": 11719,
+              "fdatasync_ns": 16882503983,
+              "frontier_writes": 11719,
+              "frontier_bytes": 48001024,
+              "frontier_write_ns": 1169125710,
+              "preallocation_ns": 26978111,
+              "wal_sync_wait_ns": 29028939125,
+              "memtable_insert_ns": 1247833270
+            }
+          }
+        },
+        "guards": {
+          "paired_floor": false,
+          "arm_median_floor": false,
+          "p99_ceiling": true,
+          "identical_data_bytes": true
+        },
+        "passed": false,
+        "memory_review": false
+      }
+    },
+    "passed": false,
+    "artifact_sha256": {
+      ".jsonl": "51abed18e87a090e5e78fe950ad7800d37a00447ec8d4269a1442577ea461fd7",
+      "-runs.tsv": "8c81000aea7820ee0c85e8a2b4fb399e029371d5d74c90f34afaca9f81e87b07",
+      "-host.jsonl": "9455b9ba34f77a838003dd0903d25c11b9426652f43eb2f8e3a37c4f1b304823"
+    },
+    "raw_v7_passed": false,
+    "v7_passed": false,
+    "stall_filter": {
+      "rule": "Either arm mean FRONTIER write>=1ms or mean fdatasync>=1.5ms",
+      "pair_masks": [
+        {
+          "pair": 1,
+          "old_v7": {
+            "run_id": "1793195506773",
+            "frontier_mean_ms": 0.07994078436726684,
+            "fdatasync_mean_ms": 1.0340125407457974,
+            "obvious_stall": false,
+            "puts_s": 30365.6095239982,
+            "p99_ms": 10.827564
+          },
+          "new_v7": {
+            "run_id": "1793195541786",
+            "frontier_mean_ms": 0.04365077301817561,
+            "fdatasync_mean_ms": 0.6253673545524363,
+            "obvious_stall": false,
+            "puts_s": 44432.2062534616,
+            "p99_ms": 10.003225
+          },
+          "excluded": false
+        },
+        {
+          "pair": 2,
+          "old_v7": {
+            "run_id": "1793195611484",
+            "frontier_mean_ms": 0.10169521392610291,
+            "fdatasync_mean_ms": 1.2100006906732657,
+            "obvious_stall": false,
+            "puts_s": 26980.31622624837,
+            "p99_ms": 11.704341
+          },
+          "new_v7": {
+            "run_id": "1793195568926",
+            "frontier_mean_ms": 0.09976326563699975,
+            "fdatasync_mean_ms": 1.4568264235856303,
+            "obvious_stall": false,
+            "puts_s": 23258.326630926822,
+            "p99_ms": 10.902678
+          },
+          "excluded": false
+        },
+        {
+          "pair": 3,
+          "old_v7": {
+            "run_id": "1793195649614",
+            "frontier_mean_ms": 0.03434330642546292,
+            "fdatasync_mean_ms": 0.48787101015445,
+            "obvious_stall": false,
+            "puts_s": 53559.30872727263,
+            "p99_ms": 9.570393
+          },
+          "new_v7": {
+            "run_id": "1793195673851",
+            "frontier_mean_ms": 0.10287771345677958,
+            "fdatasync_mean_ms": 1.4406096068777199,
+            "obvious_stall": false,
+            "puts_s": 23210.538622559445,
+            "p99_ms": 11.100169
+          },
+          "excluded": false
+        }
+      ],
+      "matched_pairs": [
+        1,
+        2,
+        3
+      ],
+      "excluded_by_arm": {
+        "old_v7": 0,
+        "new_v7": 0
+      },
+      "median": {
+        "throughput": 0.8620479625179288,
+        "cpu": 0.9955062593039066,
+        "rss": 0.9993620717152081,
+        "p99": 0.9315072074540549,
+        "sync_count": 1.0,
+        "data_bytes": 1.0
+      },
+      "arm_median_rate_ratio": 0.765943018945349,
+      "guards": {
+        "enough_matched_pairs": true,
+        "paired_throughput": false,
+        "arm_median_throughput": false,
+        "paired_p99": true,
+        "identical_data_bytes": true
+      },
+      "limits": "Aggregate mask excludes obvious long-I/O runs but misses short outliers and does not establish stall-free conditions or prove source/environment attribution. Every raw record is preserved."
+    }
+  },
+  "status": {
+    "all_planned_cells_complete": true,
+    "captured_cells": [
+      "ext4-batch8",
+      "ext4-batch16",
+      "ext4-point8",
+      "ext4-batch1"
+    ],
+    "cancelled_cells": [],
+    "captured_cells_pass": false,
+    "records": 36,
+    "scored_records": 28,
+    "warmup_records": 8,
+    "cpu_is_diagnostic": true,
+    "source_candidates": 1
+  },
+  "analysis_sha256": "0cdd3b5641a415272ff802260249912ae9aecc739866812bf7cf879609aa310e",
+  "driver_sha256": "f018b5d57418e3c5a6cff5ddf41c857c44a09335eb92cab2a6c3fcce61f93ec8",
+  "matrix_sha256": "7936f14244c67a6907dfb037c67269e8773dd8cf573726e909909ebdb1058726"
+}

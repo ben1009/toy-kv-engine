@@ -2861,3 +2861,13 @@ fixed cells finish, and retained source/executable are restored. Candidate check
 pass 1,974 tests; restored checks pass 1,973 with one compaction timeout/retry,
 followed by an isolated no-retry pass. The lineage is 703 completed invocations,
 plus the earlier interrupted invocation without JSON. V4 parity remains open.
+
+The [ready-completion-first experiment](benchmarks/rfc-025-v7-ready-completion-first-20261028.md)
+reports already-ready v7 CQEs before later submissions while retaining the normal
+post-submit drain. It adds no writes but is not retained: filtered batch8 gains
+2.1% throughput with 34.5% higher p99, and batch16 p99 rises 21.0%. Apparent large
+point gains coincide with delayed baselines; the lower-latency pair gains only
+1.1% throughput. All four fixed cells complete. Candidate checks pass 1,974 tests;
+restored source passes 1,973 with no retries/skips. The lineage reaches 739
+completed invocations, plus the earlier interrupted invocation without JSON.
+V4 parity remains open.
