@@ -1,0 +1,26 @@
+{
+  "created_at_utc": "2026-10-29T01:16:11.478476+00:00",
+  "source_base": "b4001ad267b28baa9c57c83dcfa71164c2fc7039",
+  "baseline": {
+    "path": "target/release/write-perf-v7-large-data-async-dispatch",
+    "sha256": "f353022d846530a6754330aaea11f295319ea8f4de20afa09b6d2a3b57b021d8"
+  },
+  "candidate": {
+    "path": "target/release/write-perf-v7-signal-taskwork",
+    "sha256": "79592a3cbf0c4f9e5411690cd5e369e62b9abdc6991f88b03b0b0d9b42071889"
+  },
+  "scope": "Maintainer-requested fresh qualification retry of the exact previously inconclusive ordinary completion-notification candidate. No new Rust policy, no diagnostic captures, no pooling with the earlier cohort.",
+  "prior_verification": "rfc-025-v7-signal-taskwork-20261029-verification.json",
+  "prior_verification_sha256": "d1bfac8639c22b2849cc9f8ae23d3fa26e6e2b4a7bd0d4ca40419d18b13a3d84",
+  "prior_global_invocations": 857,
+  "prior_full_archive_invocations": 4953,
+  "source_origin": "rfc-025-v7-signal-taskwork-20261029",
+  "candidate_patch_sha256": "e339370429eddb1f84793589b44814ca3162e91e2a2603dabe80a6981eafba97",
+  "configuration": "Fresh local ext4 databases; v7 Parallel,1KiB values,2GiB SST,no compaction. Batch64 uses750000 puts/sample10;point8/16 use100000/sample100;point1 uses20000/sample10. Exact saved baseline/candidate binaries, no new release build.",
+  "schedule": "First batch16 guard:2 warmups+5 alternating pairs, minimum3 matched. If it passes, run point8 independent confirmation:2 warmups+5 pairs and four guards point1,point16,batch8,batch1:2 warmups+3 pairs each. Finish every enabled followup regardless of interim results. Maximum56 invocations, no replacement pairs, no pooling or subsequent score-selected retries. Stop on capture or audit errors.",
+  "cooldown": "60s before each cell and15s between invocations; no overlapping builds/tests/profiles/source edits or SSD health polling.",
+  "stall_policy": "Unchanged: flag mean FRONTIER write>=1ms OR mean fdatasync>=1.5ms; exclude whole pair if either arm is flagged. Preserve all raw records. This aggregate mask misses short outliers and cannot isolate source effects from storage variation.",
+  "assessment": "Batch16 needs>=3 matched pairs; other guards>=2. Guard paired and arm-median throughput>=0.95 and paired p99<=1.10. Point8 independent confirmation needs>=3 pairs, paired and arm-median throughput>1 and paired p99<1. Identical DATA bytes throughout. CPU/RSS diagnostic. Retain only if all six cells complete and pass; otherwise restore baseline source/canonical executable.",
+  "validation": "Reapply byte-identical saved patch to the128-input baseline, fresh focused tests without retries and full cargo make check outside sandbox. Reuse existing candidate binary only after verifying original build/check provenance and128-input candidate hash identity.",
+  "publication": "Accepted Rust change gets its own local commit; evidence separate. Failed/inconclusive retry gets evidence-only commit. No push/PR; stop for review."
+}

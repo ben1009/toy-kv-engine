@@ -2894,3 +2894,14 @@ Qualification is inconclusive, confirmation is cancelled and retained source is
 restored. Candidate checks pass 1,975 tests; restored checks pass 1,973. The lineage
 reaches 857 completed invocations, plus the earlier interrupted invocation without
 JSON. No new runtime optimization or v4-parity qualification is retained.
+
+The maintainer-requested [ordinary-notification retry](benchmarks/rfc-025-v7-signal-taskwork-retry-20261029.md)
+reuses the exact candidate and starts with five fresh batch16 pairs. Only two
+pairs survive the unchanged aggregate stall cutoff; their paired median
+throughput falls 6.7% and p99 falls 2.3%. The minimum three pairs and throughput
+guard are not met, so qualification remains inconclusive and the five dependent
+cells are cancelled. All 12 enabled invocations finish without replacements or
+pooling with earlier cohorts. Fresh candidate checks pass 1,975 tests; exact
+restoration passes 1,973 without retries or skips. The lineage reaches 869
+completed invocations, plus the inherited interrupted invocation without JSON.
+The notification change is not retained; v4 parity remains open.
