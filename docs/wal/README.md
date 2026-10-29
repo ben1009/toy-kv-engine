@@ -44,6 +44,7 @@ the retained and rejected experiments.
 - [RFC 025 contiguous entry CRC (not retained; batch8 throughput falls), 2026-10-29](benchmarks/rfc-025-v7-entry-crc-20261029.md)
 - [RFC 025 post-submit SHA overlap (not retained alone; concurrent batch checks fail), 2026-10-29](benchmarks/rfc-025-v7-post-submit-hash-20261029.md)
 - [RFC 025 producer framing plus SHA overlap (not retained; point guards fail), 2026-10-29](benchmarks/rfc-025-v7-producer-framing-20261029.md)
+- [RFC 025 physical DATA CRC from source components (not retained; SSD qualification incomplete), 2026-10-29](benchmarks/rfc-025-v7-frame-source-crc-20261029.md)
 - [RFC 025 completion priority for small writes (not retained; independent p99 benefit fails to repeat), 2026-10-28](benchmarks/rfc-025-v7-small-completion-priority-20261028.md)
 - [RFC 025 ready-completion-first scheduling (not retained; batch p99 checks fail), 2026-10-28](benchmarks/rfc-025-v7-ready-completion-first-20261028.md)
 - [RFC 025 unused-suffix preparation after large DATA (not retained; extra writes fail SSD batch checks), 2026-10-28](benchmarks/rfc-025-v7-large-data-lookahead-20261028.md)

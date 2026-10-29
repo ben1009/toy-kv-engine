@@ -1,0 +1,26 @@
+diff --git a/kv-engine/src/wal/v7/codec.rs b/kv-engine/src/wal/v7/codec.rs
+index 9a472c75..15aa1c6a 100644
+--- a/kv-engine/src/wal/v7/codec.rs
++++ b/kv-engine/src/wal/v7/codec.rs
+@@ -799,0 +800,2 @@
++    static ZERO_PADDING: [u8; WAL_V7_FRAME_LEN] = [0; WAL_V7_FRAME_LEN];
++
+@@ -837,0 +840,4 @@
++        // Checksum each constructed component. Payload is read from the
++        // logical input rather than rereading the completed output frame.
++        let mut crc = crc32fast::Hasher::new();
++        crc.update(&frame[..60]);
+@@ -843,3 +849,10 @@
+-        frame[body_start + WAL_V7_DATA_FRAGMENT_HEADER_LEN..body_start + body_len]
+-            .copy_from_slice(payload);
+-        finish_frame(frame);
++        let payload_start = body_start + WAL_V7_DATA_FRAGMENT_HEADER_LEN;
++        let payload_end = body_start + body_len;
++        crc.update(&frame[body_start..payload_start]);
++        frame[payload_start..payload_end].copy_from_slice(payload);
++        crc.update(payload);
++        let padding_len = WAL_V7_FRAME_LEN - payload_end;
++        if padding_len != 0 {
++            crc.update(&ZERO_PADDING[..padding_len]);
++        }
++        frame[60..64].copy_from_slice(&crc.finalize().to_be_bytes());

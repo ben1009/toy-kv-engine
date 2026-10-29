@@ -2882,6 +2882,8 @@ finish; candidate checks pass 1,976 tests and restored source passes 1,973 witho
 retries/skips. The lineage reaches 803 completed invocations, plus the earlier
 interrupted invocation without JSON. V4 parity remains open.
 
+
+
 The [point-handoff diagnosis](benchmarks/rfc-025-v7-point-handoff-20261029.md)
 maps every API call in two excluded current-policy captures. DATA submission
 return to CQE reap averages 843/768 us at one/eight writers, about 67%/50% of
@@ -2949,3 +2951,15 @@ files and the canonical executable are restored; candidate checks pass 1,979
 tests and fresh restored checks pass 1,973. The lineage reaches 1,103 completed
 invocations, or 5,199 across the full indexed archive, plus the inherited
 interrupted invocation without JSON. V4 parity remains open.
+
+The independent [physical DATA source-CRC screen](benchmarks/rfc-025-v7-frame-source-crc-20261029.md)
+adds 24 invocations. Copy and CRC remain separate operations; wire bytes and
+whole-frame initialization are preserved. Solo/eight-writer checks fail amid
+different storage latency, and sixteen writers have only one eligible score per
+build. This does not isolate a CRC CPU regression or establish a qualified gain.
+The candidate passes 1,973 full tests and 69 focused codec/runtime tests. The
+codec and retained executable are restored. The first restored check retries a
+compaction timeout; the isolated test and a fresh 1,973-test suite pass with
+retries disabled. The lineage reaches 1,127 completed invocations, or 5,223 in the full indexed archive,
+plus the inherited interrupted invocation without JSON. No new runtime
+optimization or digest-format change is retained.

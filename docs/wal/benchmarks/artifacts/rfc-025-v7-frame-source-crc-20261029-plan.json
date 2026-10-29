@@ -1,0 +1,43 @@
+{
+  "source_base": "474ce01e33ae18ff6a4429809f6fdf25fe15b60f",
+  "change": "Checksum physical DATA headers, fragments, logical payload and zero padding during construction. Payload is read from the logical input instead of rereading the completed DATA output. This uses separate copy and CRC operations, not a fused single-load API. Frame initialization, wire bytes, logical SHA, scheduling, workers and sync protocol stay unchanged.",
+  "baseline": {
+    "path": "target/release/write-perf-v7-large-data-async-dispatch",
+    "sha256": "f353022d846530a6754330aaea11f295319ea8f4de20afa09b6d2a3b57b021d8"
+  },
+  "screen_cells": [
+    "ext4-batch1",
+    "ext4-batch8",
+    "ext4-batch16"
+  ],
+  "guard_cells": [
+    "ext4-point1",
+    "ext4-point8",
+    "ext4-point16"
+  ],
+  "schedule": "One warmup per arm, then three alternating retained/candidate pairs per cell. All three batch screens complete regardless of performance; point guards run only if all screens pass. No replacement runs.",
+  "ranking": "Highest-throughput eligible scored invocation per exact binary and workload; p99 is from that same invocation. Preserve raw maxima, all stalls, and separate historical matching-binary bests.",
+  "stall_filter": {
+    "frontier_mean_ms_at_least": 1,
+    "fdatasync_mean_ms_at_least": 1.5,
+    "selection": "Independently flag runs per arm; aggregate means do not establish absence of stalls."
+  },
+  "screen_gate": {
+    "minimum_throughput_ratio": 1.0,
+    "maximum_p99_ratio": 1.0,
+    "minimum_eligible_runs_per_arm": 2
+  },
+  "guard_gate": {
+    "minimum_throughput_ratio": 0.98,
+    "maximum_p99_ratio": 1.05,
+    "minimum_eligible_runs_per_arm": 2
+  },
+  "cpu_policy": "Diagnostic only, not a retention veto.",
+  "constraints": [
+    "Production source, builds, tests, profiles and other benchmarks stay frozen during capture.",
+    "Scratch databases stay in the local repo and are removed.",
+    "A rejected candidate keeps its exact binary, source patch and raw captures. Restore the one changed codec file with a fresh mtime and replace the retained canonical binary through a fresh inode, then run fresh full checks.",
+    "Keep accepted source and evidence in separate commits."
+  ],
+  "historical_context": "Retained exact-binary historical highs include the completed P1 cohort. V4 references come from the separately indexed retained executable; this comparison runs only retained and candidate v7."
+}

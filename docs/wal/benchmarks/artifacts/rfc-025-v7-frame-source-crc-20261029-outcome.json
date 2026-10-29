@@ -1,0 +1,94 @@
+{
+  "source_retained": false,
+  "reason": "The physical DATA source-CRC candidate does not qualify all frozen throughput and p99 checks. Preserve its exact executable, patch and raw captures; restore the codec and retained canonical binary.",
+  "rust_mtimes_refreshed": true,
+  "atomic_binary_replacement": true,
+  "restored_files": [
+    "kv-engine/src/wal/v7/codec.rs"
+  ],
+  "canonical_sha256": "f353022d846530a6754330aaea11f295319ea8f4de20afa09b6d2a3b57b021d8",
+  "restored_checks": [
+    {
+      "step": "restored-check",
+      "command": [
+        "cargo",
+        "make",
+        "check"
+      ],
+      "returncode": 0,
+      "elapsed_seconds": 47.802043437957764,
+      "log_path": "target/wal-opt/20261029-v7-frame-source-crc/restored-check.log",
+      "log_sha256": "2aaebec940e8a9d6f3ecaef5c2e125c56ca6022209a97a15dac475db25f63782"
+    },
+    {
+      "step": "restored-typos",
+      "command": [
+        "typos"
+      ],
+      "returncode": 0,
+      "elapsed_seconds": 0.2731621265411377,
+      "log_path": "target/wal-opt/20261029-v7-frame-source-crc/restored-typos.log",
+      "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "step": "restored-isolated",
+      "command": [
+        "cargo",
+        "nextest",
+        "run",
+        "--workspace",
+        "--all-features",
+        "--lib",
+        "--retries",
+        "0",
+        "-E",
+        "test(=tests::simple_leveled_compaction::test_integration)"
+      ],
+      "returncode": 0,
+      "elapsed_seconds": 3.555610179901123,
+      "log_path": "target/wal-opt/20261029-v7-frame-source-crc/restored-isolated.log",
+      "log_sha256": "de0a706f84839becff44f9f5a4a11657185fc1c4e4590cc4f6948331fbae631a"
+    },
+    {
+      "step": "restored-no-retry",
+      "command": [
+        "cargo",
+        "nextest",
+        "run",
+        "--workspace",
+        "--all-features",
+        "--lib",
+        "--tests",
+        "--retries",
+        "0"
+      ],
+      "returncode": 0,
+      "elapsed_seconds": 5.302194833755493,
+      "log_path": "target/wal-opt/20261029-v7-frame-source-crc/restored-no-retry.log",
+      "log_sha256": "451b14c60e7639cef87c8782793041fb773363b3bed0fba28c4b521627a1c1a3"
+    }
+  ],
+  "preliminary_restored_checks": [
+    {
+      "step": "restored-all-targets",
+      "command": [
+        "cargo",
+        "nextest",
+        "run",
+        "--workspace",
+        "--all-features",
+        "--all-targets",
+        "--retries",
+        "0"
+      ],
+      "returncode": 100,
+      "elapsed_seconds": 86.00944399833679,
+      "log_path": "target/wal-opt/20261029-v7-frame-source-crc/restored-all-targets.log",
+      "log_sha256": "cc1f2dc80cace759f39236b757c4ffef81a703b80ab6ae5a955e63c6f93a3798",
+      "scope_error": "The all-targets command also launched Criterion benchmarks; preserve this failed verification attempt and use the project lib/tests target selection."
+    }
+  ],
+  "candidate_tests": 1973,
+  "restored_tests": 1973,
+  "restored_flake": "The original full check retries tests::simple_leveled_compaction::test_integration once. Preserve the original check and validate an isolated pass and a complete zero-retry run."
+}
