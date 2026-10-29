@@ -1,0 +1,13 @@
+{
+  "logical_cpu_flag_records": 32,
+  "features_present_on_all_cpus": {
+    "sha_ni": true,
+    "sse4_1": true,
+    "ssse3": true,
+    "sse2": true,
+    "pclmulqdq": true
+  },
+  "sha2_dependency": "0.10.9",
+  "sha2_release_fingerprints": [],
+  "interpretation": "All32 logical CPUs advertise features required by the cached sha2 x86 SHA-NI dispatch implementation. Release fingerprint JSONs were not present at the default target path, so compiled feature/backend selection is not asserted. The runtime branch and CPU frequency during traces were not measured."
+}

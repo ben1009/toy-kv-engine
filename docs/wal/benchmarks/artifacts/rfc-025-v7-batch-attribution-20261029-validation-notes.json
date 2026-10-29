@@ -1,0 +1,20 @@
+{
+  "recorded_at_utc": "2026-10-29T02:56:11.753045+00:00",
+  "initial_validation_driver": {
+    "path": "target/wal-opt/20261029-v7-batch-attribution/validate.py",
+    "sha256": "8ac4f4396f302329ec467c86c8a14cb95cc77bee7718b6c2e05b6ad3ceebeda3"
+  },
+  "full_check_exit_code": 0,
+  "full_check_tests": 1973,
+  "full_check_flaky_tests": [
+    "tests::simple_leveled_compaction::test_integration"
+  ],
+  "initial_gate": "Stopped before release build because the full nextest log contains one automatic retry; original log and driver preserved.",
+  "resolution": "Run that test alone with retries0, then resume release build without overwriting or rerunning the original full check.",
+  "diagnostic_driver_generation": "An else15 syntax typo was caught by compile() before writing or running the diagnostic capture driver; corrected to else 15. No diagnostic invocation started.",
+  "isolated_gate_parser": "The isolated test passed exit0 without retries. The gate expected plural tests run, while nextest uses singular test run. Resume the build using tests? without rerunning or overwriting the passing isolated check.",
+  "first_resume_driver": {
+    "path": "target/wal-opt/20261029-v7-batch-attribution/resume-validation.py",
+    "sha256": "2e7bfe195d913ef9251ca5102bc93f662f2d9b2bb953e942ed17f9b69372f606"
+  }
+}

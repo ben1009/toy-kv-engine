@@ -1,0 +1,255 @@
+diff --git a/kv-engine/src/bin/write-perf.rs b/kv-engine/src/bin/write-perf.rs
+index 907f2f9e..3d84f5aa 100644
+--- a/kv-engine/src/bin/write-perf.rs
++++ b/kv-engine/src/bin/write-perf.rs
+@@ -3394,0 +3395,6 @@ fn run_wal_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
++                kv_engine_wrapper::wal::trace_point_event(
++                    1,
++                    (start_idx + i) as u64,
++                    t as u64,
++                    i as u64,
++                );
+@@ -3395,0 +3402,6 @@ fn run_wal_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
++                kv_engine_wrapper::wal::trace_point_event(
++                    2,
++                    (start_idx + i) as u64,
++                    t as u64,
++                    i as u64,
++                );
+@@ -3443,0 +3456 @@ fn run_wal_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
++    kv_engine_wrapper::wal::flush_point_trace()?;
+@@ -3530,0 +3544,6 @@ fn run_wal_batch_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>
++                kv_engine_wrapper::wal::trace_point_event(
++                    1,
++                    (start_idx + next) as u64,
++                    t as u64,
++                    batch_index as u64,
++                );
+@@ -3531,0 +3551,6 @@ fn run_wal_batch_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>
++                kv_engine_wrapper::wal::trace_point_event(
++                    2,
++                    (start_idx + next) as u64,
++                    t as u64,
++                    batch_index as u64,
++                );
+@@ -3577,0 +3603 @@ fn run_wal_batch_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>
++    kv_engine_wrapper::wal::flush_point_trace()?;
+diff --git a/kv-engine/src/mvcc.rs b/kv-engine/src/mvcc.rs
+index 86a412da..50107883 100644
+--- a/kv-engine/src/mvcc.rs
++++ b/kv-engine/src/mvcc.rs
+@@ -1182,0 +1183 @@ impl LsmMvccInner {
++        crate::wal::trace_point_event(41, commit_ts, entries.len() as u64, 0);
+@@ -1205,0 +1207 @@ impl LsmMvccInner {
++        crate::wal::trace_point_event(42, commit_ts, entries.len() as u64, 0);
+@@ -1212,0 +1215 @@ impl LsmMvccInner {
++                crate::wal::trace_point_event(35, commit_ts, entries.len() as u64, 0);
+@@ -1236,0 +1240 @@ impl LsmMvccInner {
++                crate::wal::trace_point_event(36, commit_ts, entries.len() as u64, 0);
+diff --git a/kv-engine/src/wal.rs b/kv-engine/src/wal.rs
+index 71b32c84..f0e4d610 100644
+--- a/kv-engine/src/wal.rs
++++ b/kv-engine/src/wal.rs
+@@ -43,0 +44,93 @@ pub(crate) use parallel_runtime::WalV7PreparedBatch;
++// Temporary bounded diagnostic, removed before any scored comparison.
++struct PointTrace {
++    path: std::path::PathBuf,
++    state: Mutex<(Vec<[u64; 7]>, u64)>,
++}
++static POINT_TRACE: std::sync::OnceLock<Option<PointTrace>> = std::sync::OnceLock::new();
++
++fn point_trace() -> Option<&'static PointTrace> {
++    POINT_TRACE
++        .get_or_init(|| {
++            std::env::var_os("KV_WAL_POINT_TRACE").map(|path| PointTrace {
++                path: path.into(),
++                state: Mutex::new((Vec::with_capacity(1_000_000), 0)),
++            })
++        })
++        .as_ref()
++}
++
++#[doc(hidden)]
++pub fn point_trace_enabled() -> bool {
++    point_trace().is_some()
++}
++
++#[doc(hidden)]
++pub fn trace_initialize_large() -> bool {
++    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    point_trace_enabled()
++        && *ENABLED
++            .get_or_init(|| std::env::var("KV_WAL_TRACE_INITIALIZE_LARGE").as_deref() == Ok("1"))
++}
++
++#[doc(hidden)]
++pub fn trace_point_event(event: u64, subject: u64, arg1: u64, arg2: u64) {
++    let trace = point_trace();
++    let Some(trace) = trace else {
++        return;
++    };
++    thread_local! {
++        static TRACE_TID: u64 = unsafe { libc::syscall(libc::SYS_gettid) } as u64;
++    }
++    let tid = TRACE_TID.with(|tid| *tid);
++    let mut clock = std::mem::MaybeUninit::<libc::timespec>::uninit();
++    assert_eq!(
++        unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, clock.as_mut_ptr()) },
++        0
++    );
++    let clock = unsafe { clock.assume_init() };
++    let time = clock.tv_sec as u64 * 1_000_000_000 + clock.tv_nsec as u64;
++    let mut cpu_clock = std::mem::MaybeUninit::<libc::timespec>::uninit();
++    assert_eq!(
++        unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, cpu_clock.as_mut_ptr()) },
++        0
++    );
++    let cpu_clock = unsafe { cpu_clock.assume_init() };
++    let cpu_time = cpu_clock.tv_sec as u64 * 1_000_000_000 + cpu_clock.tv_nsec as u64;
++    let mut state = trace.state.lock();
++    if state.0.len() < 1_000_000 {
++        state
++            .0
++            .push([event, subject, arg1, arg2, tid, time, cpu_time]);
++    } else {
++        state.1 += 1;
++    }
++}
++
++#[doc(hidden)]
++pub fn flush_point_trace() -> std::io::Result<()> {
++    let Some(Some(trace)) = POINT_TRACE.get() else {
++        return Ok(());
++    };
++    let state = trace.state.lock();
++    let mut output = BufWriter::new(
++        File::options()
++            .write(true)
++            .create_new(true)
++            .open(&trace.path)?,
++    );
++    writeln!(output, "event,subject,arg1,arg2,tid,time_ns,cpu_ns")?;
++    for row in &state.0 {
++        writeln!(
++            output,
++            "{},{},{},{},{},{},{}",
++            row[0], row[1], row[2], row[3], row[4], row[5], row[6]
++        )?;
++    }
++    output.flush()?;
++    std::fs::write(
++        trace.path.with_extension("meta.json"),
++        format!("{{\"events\":{},\"dropped\":{}}}\n", state.0.len(), state.1),
++    )?;
++    Ok(())
++}
++
+diff --git a/kv-engine/src/wal/parallel/runtime.rs b/kv-engine/src/wal/parallel/runtime.rs
+index cbcb7b51..7be18d64 100644
+--- a/kv-engine/src/wal/parallel/runtime.rs
++++ b/kv-engine/src/wal/parallel/runtime.rs
+@@ -1300,0 +1301 @@ impl ParallelWalRuntime {
++        crate::wal::trace_point_event(27, 0, batch.entries.len() as u64, 0);
+@@ -1338,0 +1340 @@ impl ParallelWalRuntime {
++        crate::wal::trace_point_event(28, 0, encoded_batch_bytes, fragment_count as u64);
+@@ -1684,0 +1687 @@ impl ParallelWalRuntime {
++        crate::wal::trace_point_event(3, ticket, 0, 0);
+@@ -1692,0 +1696 @@ impl ParallelWalRuntime {
++                crate::wal::trace_point_event(4, ticket, state.durable_frontier, 0);
+@@ -1908,0 +1913 @@ fn pack_admitted_groups(
++        crate::wal::trace_point_event(13, first_ticket, expected_ticket, 0);
+@@ -1960,0 +1966,6 @@ fn pack_admitted_groups(
++            crate::wal::trace_point_event(
++                15,
++                first_ticket,
++                packer.reserved_end,
++                target_preallocated_end,
++            );
+@@ -1982,0 +1994,6 @@ fn pack_admitted_groups(
++            crate::wal::trace_point_event(
++                16,
++                first_ticket,
++                packer.reserved_end,
++                target_preallocated_end,
++            );
+@@ -2018,0 +2036 @@ fn pack_admitted_groups(
++        crate::wal::trace_point_event(14, first_ticket, expected_ticket, 0);
+@@ -2077 +2095,2 @@ fn take_admitted_group(
+-        initialize_extents |= batch.aligned_len < ALLOCATION_ONLY_MIN_BATCH_BYTES;
++        initialize_extents |= batch.aligned_len < ALLOCATION_ONLY_MIN_BATCH_BYTES
++            || crate::wal::trace_initialize_large();
+@@ -2168,0 +2188 @@ fn materialize_v7_batch(batch: &mut AdmittedBatch, prefix: &mut WalV7PrefixMetad
++    crate::wal::trace_point_event(23, batch.ticket, 0, 0);
+@@ -2179,0 +2200,2 @@ fn materialize_v7_batch(batch: &mut AdmittedBatch, prefix: &mut WalV7PrefixMetad
++    crate::wal::trace_point_event(24, batch.ticket, encoded_len as u64, 0);
++    crate::wal::trace_point_event(25, batch.ticket, 0, 0);
+@@ -2180,0 +2203,6 @@ fn materialize_v7_batch(batch: &mut AdmittedBatch, prefix: &mut WalV7PrefixMetad
++    crate::wal::trace_point_event(
++        26,
++        batch.ticket,
++        input.logical_batch.as_bytes().len() as u64,
++        0,
++    );
+@@ -2254,0 +2283 @@ fn run_sync_coordinator(
++        crate::wal::trace_point_event(8, result.tickets.start, result.tickets.end, result.group_id);
+@@ -2263,0 +2293,6 @@ fn run_sync_coordinator(
++            crate::wal::trace_point_event(
++                11,
++                inner.durability.state.lock().written_frontier,
++                wait.as_nanos() as u64,
++                0,
++            );
+@@ -2264,0 +2300 @@ fn run_sync_coordinator(
++            crate::wal::trace_point_event(12, inner.durability.state.lock().written_frontier, 0, 0);
+@@ -2649,0 +2686 @@ fn append_v7_frontier(
++        crate::wal::trace_point_event(43, target, frame_end, preallocation_end);
+@@ -2651,0 +2689 @@ fn append_v7_frontier(
++        crate::wal::trace_point_event(44, target, frame_end, preallocation_end);
+@@ -2655,0 +2694 @@ fn append_v7_frontier(
++        crate::wal::trace_point_event(33, target, reservation.frame_offset(), 0);
+@@ -2657,0 +2697 @@ fn append_v7_frontier(
++        crate::wal::trace_point_event(34, target, reservation.frame_offset(), 0);
+@@ -2800,0 +2841 @@ fn synchronize_written_prefix(sync_file: &File, inner: &RuntimeInner) -> Result<
++    crate::wal::trace_point_event(9, target, durable, 0);
+@@ -2819,0 +2861 @@ fn synchronize_written_prefix(sync_file: &File, inner: &RuntimeInner) -> Result<
++    crate::wal::trace_point_event(31, target, durable, 0);
+@@ -2835,0 +2878 @@ fn synchronize_written_prefix(sync_file: &File, inner: &RuntimeInner) -> Result<
++    crate::wal::trace_point_event(32, target, durable, 0);
+@@ -2890,0 +2934 @@ fn synchronize_written_prefix(sync_file: &File, inner: &RuntimeInner) -> Result<
++        crate::wal::trace_point_event(10, acknowledged, durable, 0);
+diff --git a/kv-engine/src/wal/parallel/worker.rs b/kv-engine/src/wal/parallel/worker.rs
+index c0569297..ca4dc934 100644
+--- a/kv-engine/src/wal/parallel/worker.rs
++++ b/kv-engine/src/wal/parallel/worker.rs
+@@ -1939,0 +1940,15 @@ fn run_worker_loop<B: WorkerBuffer>(
++                if crate::wal::point_trace_enabled() {
++                    let group = &core.groups[&submission.group_id];
++                    assert_eq!(
++                        group.tickets.end - group.tickets.start,
++                        group.request_ids.end - group.request_ids.start
++                    );
++                    let ticket =
++                        group.tickets.start + submission.request_id.0 - group.request_ids.start;
++                    crate::wal::trace_point_event(
++                        5,
++                        ticket,
++                        submission.request_id.0,
++                        submission.write_len as u64,
++                    );
++                }
+@@ -1979,0 +1995,8 @@ fn run_worker_loop<B: WorkerBuffer>(
++            if crate::wal::point_trace_enabled() {
++                for (request, result) in &completed {
++                    let write = &core.writes[&RequestId(*request)];
++                    let group = &core.groups[&write.group_id];
++                    let ticket = group.tickets.start + request - group.request_ids.start;
++                    crate::wal::trace_point_event(7, ticket, *request, *result as i64 as u64);
++                }
++            }
+@@ -2198,0 +2222,6 @@ fn mark_submitted_prefix<B: WorkerBuffer>(
++        if crate::wal::point_trace_enabled() {
++            let write = &core.writes[&request_id];
++            let group = &core.groups[&write.group_id];
++            let ticket = group.tickets.start + request_id.0 - group.request_ids.start;
++            crate::wal::trace_point_event(6, ticket, request_id.0, 0);
++        }

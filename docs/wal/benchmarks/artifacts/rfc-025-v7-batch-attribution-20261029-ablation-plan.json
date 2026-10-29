@@ -1,0 +1,7 @@
+{
+  "created_at_utc": "2026-10-29T02:50:07.232432+00:00",
+  "source_finding": "V4 start.initialize_extents is true. V7 take_admitted_group normally requests initialization only below64KiB. Same bytes and sync count can therefore take different ext4 extent paths.",
+  "schedule": "After the four standard diagnostic captures, run v7 with explicit large-DATA extent initialization at1writer then8writers. Two fixed additional excluded captures; same instrumented binary and workload, no replacements.60s cooldown before the additional stage,15s gaps.",
+  "mechanism": "KV_WAL_TRACE_INITIALIZE_LARGE=1 is honored only with diagnostic tracing enabled and routes large batches through the existing initialize_extents path. It changes no framing, ACK, sync count or durability semantics. The flag and all instrumentation are removed after diagnostics.",
+  "analysis": "Compare per-call wall/thread-CPU paths, native zero-write bytes and DATA service intervals. All six traces are excluded from performance scores and cannot qualify a retained optimization."
+}

@@ -1,0 +1,220 @@
+{
+  "outside_sandbox": true,
+  "checks": [
+    {
+      "phase": "format",
+      "command": [
+        "cargo",
+        "fmt",
+        "--all"
+      ],
+      "started_at_utc": "2026-10-29T02:51:21.399801+00:00",
+      "exit_code": 0,
+      "log": "target/wal-opt/20261029-v7-batch-attribution/format.log",
+      "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "phase": "spelling",
+      "command": [
+        "typos",
+        "kv-engine/src/wal.rs",
+        "kv-engine/src/wal/parallel/runtime.rs",
+        "kv-engine/src/wal/parallel/worker.rs",
+        "kv-engine/src/bin/write-perf.rs",
+        "kv-engine/src/mvcc.rs",
+        "/home/liu/proj/toy-kv-engine/docs/wal/benchmarks/artifacts/rfc-025-v7-batch-attribution-20261029-checks.json",
+        "/home/liu/proj/toy-kv-engine/docs/wal/benchmarks/artifacts/rfc-025-v7-batch-attribution-20261029-ext4-batch1-runs.tsv",
+        "/home/liu/proj/toy-kv-engine/docs/wal/benchmarks/artifacts/rfc-025-v7-batch-attribution-20261029-ext4-batch8.jsonl",
+        "/home/liu/proj/toy-kv-engine/docs/wal/benchmarks/artifacts/rfc-025-v7-batch-attribution-20261029-instrumentation.patch",
+        "/home/liu/proj/toy-kv-engine/docs/wal/benchmarks/artifacts/rfc-025-v7-batch-attribution-20261029-source-sha256.tsv",
+        "/home/liu/proj/toy-kv-engine/docs/wal/benchmarks/artifacts/rfc-025-v7-batch-attribution-20261029-run.py",
+        "/home/liu/proj/toy-kv-engine/docs/wal/benchmarks/artifacts/rfc-025-v7-batch-attribution-20261029-ablation-plan.json",
+        "/home/liu/proj/toy-kv-engine/docs/wal/benchmarks/artifacts/rfc-025-v7-batch-attribution-20261029-matrix.json",
+        "/home/liu/proj/toy-kv-engine/docs/wal/benchmarks/artifacts/rfc-025-v7-batch-attribution-20261029-environment.json",
+        "/home/liu/proj/toy-kv-engine/docs/wal/benchmarks/artifacts/rfc-025-v7-batch-attribution-20261029-baseline-sha256.tsv",
+        "/home/liu/proj/toy-kv-engine/docs/wal/benchmarks/artifacts/rfc-025-v7-batch-attribution-20261029-ext4-batch8-runs.tsv",
+        "/home/liu/proj/toy-kv-engine/docs/wal/benchmarks/artifacts/rfc-025-v7-batch-attribution-20261029-run-all.py",
+        "/home/liu/proj/toy-kv-engine/docs/wal/benchmarks/artifacts/rfc-025-v7-batch-attribution-20261029-plan.json",
+        "/home/liu/proj/toy-kv-engine/docs/wal/benchmarks/artifacts/rfc-025-v7-batch-attribution-20261029-ext4-batch1.jsonl",
+        "/home/liu/proj/toy-kv-engine/docs/wal/benchmarks/artifacts/rfc-025-v7-batch-attribution-20261029-child.py",
+        "/home/liu/proj/toy-kv-engine/docs/wal/benchmarks/artifacts/rfc-025-v7-batch-attribution-20261029-ext4-batch8-host.jsonl",
+        "/home/liu/proj/toy-kv-engine/docs/wal/benchmarks/artifacts/rfc-025-v7-batch-attribution-20261029-ext4-batch1-host.jsonl",
+        "/home/liu/proj/toy-kv-engine/docs/wal/benchmarks/artifacts/rfc-025-v7-batch-attribution-20261029-binaries.json"
+      ],
+      "started_at_utc": "2026-10-29T02:51:22.411727+00:00",
+      "exit_code": 0,
+      "log": "target/wal-opt/20261029-v7-batch-attribution/spelling.log",
+      "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "phase": "focused",
+      "command": [
+        "cargo",
+        "nextest",
+        "run",
+        "--offline",
+        "--locked",
+        "--workspace",
+        "--all-features",
+        "--lib",
+        "--retries",
+        "0",
+        "--success-output",
+        "immediate",
+        "-E",
+        "test(wal::parallel_worker::tests::) or test(wal::parallel_runtime::tests::)"
+      ],
+      "started_at_utc": "2026-10-29T02:51:22.476087+00:00",
+      "exit_code": 0,
+      "log": "target/wal-opt/20261029-v7-batch-attribution/focused.log",
+      "log_sha256": "c8043615fc3d5dd3f46c67aaac9089cf5681b33e3a58373f8dfea4505cf88773"
+    },
+    {
+      "phase": "check",
+      "command": [
+        "cargo",
+        "make",
+        "check"
+      ],
+      "started_at_utc": "2026-10-29T02:51:35.815803+00:00",
+      "exit_code": 0,
+      "log": "target/wal-opt/20261029-v7-batch-attribution/check.log",
+      "log_sha256": "a4782935a3af74af42477a9976c3d7027f9dda7c5d5761741f77b788a55bd485"
+    },
+    {
+      "phase": "isolated-compaction",
+      "command": [
+        "cargo",
+        "nextest",
+        "run",
+        "--offline",
+        "--locked",
+        "--workspace",
+        "--all-features",
+        "--lib",
+        "--retries",
+        "0",
+        "-E",
+        "test(/^tests::simple_leveled_compaction::test_integration$/)"
+      ],
+      "started_at_utc": "2026-10-29T02:56:14.740478+00:00",
+      "exit_code": 0,
+      "log": "target/wal-opt/20261029-v7-batch-attribution/isolated-compaction.log",
+      "log_sha256": "452b6f93573d729b5c0110740d363e2b89800662f99968ae082af2b05362a06e"
+    },
+    {
+      "phase": "diagnostic-spelling",
+      "command": [
+        "typos",
+        "/home/liu/proj/toy-kv-engine/docs/wal/benchmarks/artifacts/rfc-025-v7-batch-attribution-20261029-diagnostic-run.py",
+        "/home/liu/proj/toy-kv-engine/docs/wal/benchmarks/artifacts/rfc-025-v7-batch-attribution-20261029-validation-notes.json"
+      ],
+      "started_at_utc": "2026-10-29T02:57:23.857510+00:00",
+      "exit_code": 0,
+      "log": "target/wal-opt/20261029-v7-batch-attribution/diagnostic-spelling.log",
+      "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "phase": "release",
+      "command": [
+        "cargo",
+        "build",
+        "--offline",
+        "--locked",
+        "--release",
+        "--package",
+        "kv-engine",
+        "--bin",
+        "write-perf",
+        "--features",
+        "bench"
+      ],
+      "started_at_utc": "2026-10-29T02:57:23.875634+00:00",
+      "exit_code": 0,
+      "log": "target/wal-opt/20261029-v7-batch-attribution/release.log",
+      "log_sha256": "41cc727f1e6a5b6652632e5739dc96306eaff0f8b769d5241f2828829a24c17d"
+    },
+    {
+      "phase": "restored check",
+      "command": [
+        "cargo",
+        "make",
+        "check"
+      ],
+      "started_at_utc": "2026-10-29T03:17:53.612940+00:00",
+      "exit_code": 0,
+      "log": "target/wal-opt/20261029-v7-batch-attribution/restored-check.log",
+      "log_sha256": "0194341df12661285f4b3921dedd81d2241a70d0e6906b371327c90564e4f7e1"
+    },
+    {
+      "phase": "final spelling",
+      "command": [
+        "typos",
+        "docs/wal/README.md",
+        "docs/wal/rfc-025-parallel-wal-embedded-frontiers-implementation-plan.md",
+        "docs/wal/benchmarks/rfc-025-v7-batch-attribution-20261029.md",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-batch-attribution-20261029-ablation-plan.json",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-batch-attribution-20261029-analyze.py",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-batch-attribution-20261029-baseline-sha256.tsv",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-batch-attribution-20261029-best-inputs.json",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-batch-attribution-20261029-best.json",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-batch-attribution-20261029-best.py",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-batch-attribution-20261029-binaries.json",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-batch-attribution-20261029-captures.json",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-batch-attribution-20261029-checks.json",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-batch-attribution-20261029-child.py",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-batch-attribution-20261029-cpu-context.json",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-batch-attribution-20261029-diagnostic-binaries.json",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-batch-attribution-20261029-diagnostic-environment.json",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-batch-attribution-20261029-diagnostic-run.py",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-batch-attribution-20261029-environment.json",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-batch-attribution-20261029-ext4-batch1-host.jsonl",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-batch-attribution-20261029-ext4-batch1-runs.tsv",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-batch-attribution-20261029-ext4-batch1.jsonl",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-batch-attribution-20261029-ext4-batch8-host.jsonl",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-batch-attribution-20261029-ext4-batch8-runs.tsv",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-batch-attribution-20261029-ext4-batch8.jsonl",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-batch-attribution-20261029-extent-hypothesis-correction.json",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-batch-attribution-20261029-findings.json",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-batch-attribution-20261029-instrumentation.patch",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-batch-attribution-20261029-matrix.json",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-batch-attribution-20261029-plan.json",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-batch-attribution-20261029-restoration.json",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-batch-attribution-20261029-run-all.py",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-batch-attribution-20261029-run.py",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-batch-attribution-20261029-runs.jsonl",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-batch-attribution-20261029-score-peaks.json",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-batch-attribution-20261029-score-summary.json",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-batch-attribution-20261029-source-sha256.tsv",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-batch-attribution-20261029-trace-analyze.py",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-batch-attribution-20261029-trace-summary.json",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-batch-attribution-20261029-validation-notes.json",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-batch-attribution-20261029-verify.py"
+      ],
+      "started_at_utc": "2026-10-29T04:40:48.960243+00:00",
+      "exit_code": 0,
+      "log": "target/wal-opt/20261029-v7-batch-attribution/final-spelling.log",
+      "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    }
+  ],
+  "tests": 1973,
+  "focused_tests": 79,
+  "full_check_flaky_test": "tests::simple_leveled_compaction::test_integration",
+  "full_check_automatic_retries": 1,
+  "isolated_compaction_retries": 0,
+  "validation_drivers": [
+    {
+      "path": "target/wal-opt/20261029-v7-batch-attribution/validate.py",
+      "sha256": "8ac4f4396f302329ec467c86c8a14cb95cc77bee7718b6c2e05b6ad3ceebeda3"
+    },
+    {
+      "path": "target/wal-opt/20261029-v7-batch-attribution/resume-validation.py",
+      "sha256": "2e7bfe195d913ef9251ca5102bc93f662f2d9b2bb953e942ed17f9b69372f606"
+    },
+    {
+      "path": "target/wal-opt/20261029-v7-batch-attribution/resume-release.py",
+      "sha256": "8e68b9519eef788b7ad3254270cf75ec771e24bc596eb64fc4c88e437582257e"
+    }
+  ],
+  "restored_tests": 1973
+}

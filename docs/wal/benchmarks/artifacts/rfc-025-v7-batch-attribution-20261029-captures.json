@@ -1,0 +1,608 @@
+[
+  {
+    "name": "v4-w1",
+    "writers": 1,
+    "format": 4,
+    "initialize_large": false,
+    "operations": 750000,
+    "sample_every": 10,
+    "run_id": "1793243069846",
+    "command": [
+      "/home/liu/proj/toy-kv-engine/target/release/write-perf-v4-v7-batch-attribution",
+      "--suite",
+      "legacy",
+      "--preset",
+      "smoke",
+      "--bench",
+      "wal_batch_concurrent",
+      "--wal",
+      "--wal-io-mode",
+      "parallel",
+      "--wal-batch-size",
+      "64",
+      "--num",
+      "750000",
+      "--threads",
+      "1",
+      "--value-size",
+      "1024",
+      "--target-sst-size",
+      "2147483648",
+      "--compaction",
+      "none",
+      "--latency-sample-every",
+      "10",
+      "--output",
+      "json",
+      "--path",
+      "/home/liu/proj/toy-kv-engine/target/wal-opt/20261029-v7-batch-attribution/v4-w1-db"
+    ],
+    "binary": {
+      "path": "target/release/write-perf-v4-v7-batch-attribution",
+      "sha256": "8515271997838ec7f83caf376409a16373f3b59ae204911ee56cc8149378ba46"
+    },
+    "trace_library_sha256": "7bef6a9cfadc9c803f955fb96e86bd65f5bdebd07aab39184d283832bfe3e46b",
+    "returncode": 0,
+    "excluded_from_scoring": true,
+    "clean_sampled": true,
+    "sampling_errors": [],
+    "before": {
+      "time_utc": "2026-10-29T03:04:29.838694+00:00",
+      "competing": [],
+      "load_average": [
+        0.11279296875,
+        0.43359375,
+        0.587890625
+      ],
+      "cpu_jiffies": [
+        19026123,
+        5277,
+        8601260,
+        6878375787,
+        3807093,
+        1242556,
+        1523206,
+        0,
+        0,
+        0
+      ]
+    },
+    "after": {
+      "time_utc": "2026-10-29T03:05:25.109944+00:00",
+      "competing": [],
+      "load_average": [
+        0.9130859375,
+        0.60693359375,
+        0.64013671875
+      ],
+      "cpu_jiffies": [
+        19027507,
+        5277,
+        8601955,
+        6878543388,
+        3813933,
+        1242657,
+        1523309,
+        0,
+        0,
+        0
+      ]
+    },
+    "events": 212498,
+    "files": {
+      "target/wal-opt/20261029-v7-batch-attribution/v4-w1-events.csv": "8ea7b067bc737abaaaba32c4272f3f44aa6bac06ede48245038e23a8e6d1dfa3",
+      "target/wal-opt/20261029-v7-batch-attribution/v4-w1-events.meta.json": "21966bf1bd225b782002d83bff10c981e2454587a26ff642efde55046fc6dfbc",
+      "target/wal-opt/20261029-v7-batch-attribution/v4-w1-io.csv": "876a55cc514b0f73c0774965134729b013285b7047069042090071b531f4c5cb",
+      "target/wal-opt/20261029-v7-batch-attribution/v4-w1-samples.jsonl": "5d2f9dbc9d560bc7a73a0eca782bc2eeec51388a03cebbe61a3fcfbd423ec66f",
+      "target/wal-opt/20261029-v7-batch-attribution/v4-w1.stdout": "c92a648a88ce1dd160081485fa2f020d3c9a723287f457c17967a3ffdd3dbf06",
+      "target/wal-opt/20261029-v7-batch-attribution/v4-w1.stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    }
+  },
+  {
+    "name": "v7-w1",
+    "writers": 1,
+    "format": 7,
+    "initialize_large": false,
+    "operations": 750000,
+    "sample_every": 10,
+    "run_id": "1793243140143",
+    "command": [
+      "/home/liu/proj/toy-kv-engine/target/release/write-perf-v4-v7-batch-attribution",
+      "--suite",
+      "legacy",
+      "--preset",
+      "smoke",
+      "--bench",
+      "wal_batch_concurrent",
+      "--wal",
+      "--wal-io-mode",
+      "parallel",
+      "--wal-batch-size",
+      "64",
+      "--num",
+      "750000",
+      "--threads",
+      "1",
+      "--value-size",
+      "1024",
+      "--target-sst-size",
+      "2147483648",
+      "--compaction",
+      "none",
+      "--latency-sample-every",
+      "10",
+      "--output",
+      "json",
+      "--path",
+      "/home/liu/proj/toy-kv-engine/target/wal-opt/20261029-v7-batch-attribution/v7-w1-db",
+      "--pitr",
+      "--pitr-format",
+      "v7"
+    ],
+    "binary": {
+      "path": "target/release/write-perf-v4-v7-batch-attribution",
+      "sha256": "8515271997838ec7f83caf376409a16373f3b59ae204911ee56cc8149378ba46"
+    },
+    "trace_library_sha256": "7bef6a9cfadc9c803f955fb96e86bd65f5bdebd07aab39184d283832bfe3e46b",
+    "returncode": 0,
+    "excluded_from_scoring": true,
+    "clean_sampled": true,
+    "sampling_errors": [],
+    "before": {
+      "time_utc": "2026-10-29T03:05:40.138395+00:00",
+      "competing": [],
+      "load_average": [
+        0.791015625,
+        0.59375,
+        0.63525390625
+      ],
+      "cpu_jiffies": [
+        19027767,
+        5277,
+        8602053,
+        6878591023,
+        3813935,
+        1242676,
+        1523337,
+        0,
+        0,
+        0
+      ]
+    },
+    "after": {
+      "time_utc": "2026-10-29T03:05:58.985791+00:00",
+      "competing": [],
+      "load_average": [
+        1.166015625,
+        0.68701171875,
+        0.66455078125
+      ],
+      "cpu_jiffies": [
+        19028634,
+        5277,
+        8602415,
+        6878649108,
+        3814735,
+        1242732,
+        1523379,
+        0,
+        0,
+        0
+      ]
+    },
+    "events": 353218,
+    "files": {
+      "target/wal-opt/20261029-v7-batch-attribution/v7-w1-events.csv": "9037e77baf42a2d0bf8fe2daf61e2fa7a84cc21e3c181922b2253e3067d98f16",
+      "target/wal-opt/20261029-v7-batch-attribution/v7-w1-events.meta.json": "56a09cca77431ff1bc42b54722a9c108049547ac0ce82b027b7774abe42fdb38",
+      "target/wal-opt/20261029-v7-batch-attribution/v7-w1-io.csv": "0a81518f11993821f01b6fae0f3e290ad17459d3dddc634bf164c60971740181",
+      "target/wal-opt/20261029-v7-batch-attribution/v7-w1-samples.jsonl": "cb93b90d5394c5c2b86f3d30059e437245988d324fa064ff4583ee9446fbd519",
+      "target/wal-opt/20261029-v7-batch-attribution/v7-w1.stdout": "0bbc96ce762217eda103aab70debd80cea3f12e27f8b7409d4c9ece2e4a1ae1b",
+      "target/wal-opt/20261029-v7-batch-attribution/v7-w1.stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    }
+  },
+  {
+    "name": "v7-w8",
+    "writers": 8,
+    "format": 7,
+    "initialize_large": false,
+    "operations": 750000,
+    "sample_every": 10,
+    "run_id": "1793243174020",
+    "command": [
+      "/home/liu/proj/toy-kv-engine/target/release/write-perf-v4-v7-batch-attribution",
+      "--suite",
+      "legacy",
+      "--preset",
+      "smoke",
+      "--bench",
+      "wal_batch_concurrent",
+      "--wal",
+      "--wal-io-mode",
+      "parallel",
+      "--wal-batch-size",
+      "64",
+      "--num",
+      "750000",
+      "--threads",
+      "8",
+      "--value-size",
+      "1024",
+      "--target-sst-size",
+      "2147483648",
+      "--compaction",
+      "none",
+      "--latency-sample-every",
+      "10",
+      "--output",
+      "json",
+      "--path",
+      "/home/liu/proj/toy-kv-engine/target/wal-opt/20261029-v7-batch-attribution/v7-w8-db",
+      "--pitr",
+      "--pitr-format",
+      "v7"
+    ],
+    "binary": {
+      "path": "target/release/write-perf-v4-v7-batch-attribution",
+      "sha256": "8515271997838ec7f83caf376409a16373f3b59ae204911ee56cc8149378ba46"
+    },
+    "trace_library_sha256": "7bef6a9cfadc9c803f955fb96e86bd65f5bdebd07aab39184d283832bfe3e46b",
+    "returncode": 0,
+    "excluded_from_scoring": true,
+    "clean_sampled": true,
+    "sampling_errors": [],
+    "before": {
+      "time_utc": "2026-10-29T03:06:14.015557+00:00",
+      "competing": [],
+      "load_average": [
+        0.9072265625,
+        0.65283203125,
+        0.65283203125
+      ],
+      "cpu_jiffies": [
+        19028902,
+        5277,
+        8602543,
+        6878696755,
+        3814736,
+        1242751,
+        1523406,
+        0,
+        0,
+        0
+      ]
+    },
+    "after": {
+      "time_utc": "2026-10-29T03:06:19.042660+00:00",
+      "competing": [],
+      "load_average": [
+        1.1552734375,
+        0.70849609375,
+        0.6708984375
+      ],
+      "cpu_jiffies": [
+        19029392,
+        5277,
+        8602704,
+        6878711801,
+        3815020,
+        1242769,
+        1523418,
+        0,
+        0,
+        0
+      ]
+    },
+    "events": 239452,
+    "files": {
+      "target/wal-opt/20261029-v7-batch-attribution/v7-w8-events.csv": "2901c747dfdce16fcc1ffc6b10e7c5ed6f9e25e93e1af36d7d4fbca921f626d9",
+      "target/wal-opt/20261029-v7-batch-attribution/v7-w8-events.meta.json": "7aff1a7cab97e86ea3d5637467a2f02282f6b3826e40de2bf66494085e0e3034",
+      "target/wal-opt/20261029-v7-batch-attribution/v7-w8-io.csv": "1323c3e10a4d5cbd758c04a1ad29e49074f6150f9fa6fdce4767acb1abd8c554",
+      "target/wal-opt/20261029-v7-batch-attribution/v7-w8-samples.jsonl": "0eaa3e7dd13f71fc2a7d0798b8f464b65e1aa4957c552028c1a7ca3e58ed23d7",
+      "target/wal-opt/20261029-v7-batch-attribution/v7-w8.stdout": "0d42145ac0d32fc6b7e6be57eb949e5bfa1ffbf37eb14a73e85239c7da97e490",
+      "target/wal-opt/20261029-v7-batch-attribution/v7-w8.stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    }
+  },
+  {
+    "name": "v4-w8",
+    "writers": 8,
+    "format": 4,
+    "initialize_large": false,
+    "operations": 750000,
+    "sample_every": 10,
+    "run_id": "1793243194077",
+    "command": [
+      "/home/liu/proj/toy-kv-engine/target/release/write-perf-v4-v7-batch-attribution",
+      "--suite",
+      "legacy",
+      "--preset",
+      "smoke",
+      "--bench",
+      "wal_batch_concurrent",
+      "--wal",
+      "--wal-io-mode",
+      "parallel",
+      "--wal-batch-size",
+      "64",
+      "--num",
+      "750000",
+      "--threads",
+      "8",
+      "--value-size",
+      "1024",
+      "--target-sst-size",
+      "2147483648",
+      "--compaction",
+      "none",
+      "--latency-sample-every",
+      "10",
+      "--output",
+      "json",
+      "--path",
+      "/home/liu/proj/toy-kv-engine/target/wal-opt/20261029-v7-batch-attribution/v4-w8-db"
+    ],
+    "binary": {
+      "path": "target/release/write-perf-v4-v7-batch-attribution",
+      "sha256": "8515271997838ec7f83caf376409a16373f3b59ae204911ee56cc8149378ba46"
+    },
+    "trace_library_sha256": "7bef6a9cfadc9c803f955fb96e86bd65f5bdebd07aab39184d283832bfe3e46b",
+    "returncode": 0,
+    "excluded_from_scoring": true,
+    "clean_sampled": true,
+    "sampling_errors": [],
+    "before": {
+      "time_utc": "2026-10-29T03:06:34.071510+00:00",
+      "competing": [],
+      "load_average": [
+        1.11474609375,
+        0.72265625,
+        0.67626953125
+      ],
+      "cpu_jiffies": [
+        19029687,
+        5277,
+        8602826,
+        6878759412,
+        3815026,
+        1242788,
+        1523446,
+        0,
+        0,
+        0
+      ]
+    },
+    "after": {
+      "time_utc": "2026-10-29T03:06:48.419299+00:00",
+      "competing": [],
+      "load_average": [
+        1.3046875,
+        0.78564453125,
+        0.6982421875
+      ],
+      "cpu_jiffies": [
+        19030514,
+        5277,
+        8603255,
+        6878802678,
+        3816235,
+        1242827,
+        1523477,
+        0,
+        0,
+        0
+      ]
+    },
+    "events": 148388,
+    "files": {
+      "target/wal-opt/20261029-v7-batch-attribution/v4-w8-events.csv": "550c45c1508624992d580e270815256f1380e8a3523c14a4d9e7f56af63ce5f4",
+      "target/wal-opt/20261029-v7-batch-attribution/v4-w8-events.meta.json": "c2b5a97ef75f29d2b6d034e2a9caff44a4e1881f3ba002fdaef9b6e878ef2bfe",
+      "target/wal-opt/20261029-v7-batch-attribution/v4-w8-io.csv": "35a7c5d68772056e9066e837cb2b998bb29202ef42dfac625ad7b20ba50b3f3d",
+      "target/wal-opt/20261029-v7-batch-attribution/v4-w8-samples.jsonl": "741c20fe543baf8848c9348cdfb2d6c57540a516b984ee246a5068b33b2f8d25",
+      "target/wal-opt/20261029-v7-batch-attribution/v4-w8.stdout": "06eef0926e0c461b0ee65a2eedb4dee9f0bc9db0d82e4485c26d8f921c606452",
+      "target/wal-opt/20261029-v7-batch-attribution/v4-w8.stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    }
+  },
+  {
+    "name": "v7-init-w1",
+    "writers": 1,
+    "format": 7,
+    "initialize_large": true,
+    "operations": 750000,
+    "sample_every": 10,
+    "run_id": "1793243268454",
+    "command": [
+      "/home/liu/proj/toy-kv-engine/target/release/write-perf-v4-v7-batch-attribution",
+      "--suite",
+      "legacy",
+      "--preset",
+      "smoke",
+      "--bench",
+      "wal_batch_concurrent",
+      "--wal",
+      "--wal-io-mode",
+      "parallel",
+      "--wal-batch-size",
+      "64",
+      "--num",
+      "750000",
+      "--threads",
+      "1",
+      "--value-size",
+      "1024",
+      "--target-sst-size",
+      "2147483648",
+      "--compaction",
+      "none",
+      "--latency-sample-every",
+      "10",
+      "--output",
+      "json",
+      "--path",
+      "/home/liu/proj/toy-kv-engine/target/wal-opt/20261029-v7-batch-attribution/v7-init-w1-db",
+      "--pitr",
+      "--pitr-format",
+      "v7"
+    ],
+    "binary": {
+      "path": "target/release/write-perf-v4-v7-batch-attribution",
+      "sha256": "8515271997838ec7f83caf376409a16373f3b59ae204911ee56cc8149378ba46"
+    },
+    "trace_library_sha256": "7bef6a9cfadc9c803f955fb96e86bd65f5bdebd07aab39184d283832bfe3e46b",
+    "returncode": 0,
+    "excluded_from_scoring": true,
+    "clean_sampled": true,
+    "sampling_errors": [],
+    "before": {
+      "time_utc": "2026-10-29T03:07:48.450872+00:00",
+      "competing": [],
+      "load_average": [
+        0.5263671875,
+        0.65576171875,
+        0.6572265625
+      ],
+      "cpu_jiffies": [
+        19031441,
+        5277,
+        8603594,
+        6878993266,
+        3816245,
+        1242893,
+        1523575,
+        0,
+        0,
+        0
+      ]
+    },
+    "after": {
+      "time_utc": "2026-10-29T03:08:11.630700+00:00",
+      "competing": [],
+      "load_average": [
+        0.72412109375,
+        0.6943359375,
+        0.67041015625
+      ],
+      "cpu_jiffies": [
+        19032391,
+        5277,
+        8603921,
+        6879064840,
+        3817356,
+        1242946,
+        1523623,
+        0,
+        0,
+        0
+      ]
+    },
+    "events": 353220,
+    "files": {
+      "target/wal-opt/20261029-v7-batch-attribution/v7-init-w1-events.csv": "668feaedc94caaf17fe3e63e8fb55880e059952afbde271e331e340fc24e8019",
+      "target/wal-opt/20261029-v7-batch-attribution/v7-init-w1-events.meta.json": "06d275e4d6201c6037d005b5c1fa22345c489709830993969bf5d5819803f489",
+      "target/wal-opt/20261029-v7-batch-attribution/v7-init-w1-io.csv": "6a6fa938a2fecdfaf6b8f0576f22b9bbd40fe425dfef25493c5b185157ebb302",
+      "target/wal-opt/20261029-v7-batch-attribution/v7-init-w1-samples.jsonl": "15ede5d245a05a7bb4748e9944d1d1db6c0133a9c49aedada31063bf027f1c59",
+      "target/wal-opt/20261029-v7-batch-attribution/v7-init-w1.stdout": "2b701029aeaed7bf41a5d9ca8b63e7b2dc67d26d6d179c035c1756a2c620ff7a",
+      "target/wal-opt/20261029-v7-batch-attribution/v7-init-w1.stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    }
+  },
+  {
+    "name": "v7-init-w8",
+    "writers": 8,
+    "format": 7,
+    "initialize_large": true,
+    "operations": 750000,
+    "sample_every": 10,
+    "run_id": "1793243306665",
+    "command": [
+      "/home/liu/proj/toy-kv-engine/target/release/write-perf-v4-v7-batch-attribution",
+      "--suite",
+      "legacy",
+      "--preset",
+      "smoke",
+      "--bench",
+      "wal_batch_concurrent",
+      "--wal",
+      "--wal-io-mode",
+      "parallel",
+      "--wal-batch-size",
+      "64",
+      "--num",
+      "750000",
+      "--threads",
+      "8",
+      "--value-size",
+      "1024",
+      "--target-sst-size",
+      "2147483648",
+      "--compaction",
+      "none",
+      "--latency-sample-every",
+      "10",
+      "--output",
+      "json",
+      "--path",
+      "/home/liu/proj/toy-kv-engine/target/wal-opt/20261029-v7-batch-attribution/v7-init-w8-db",
+      "--pitr",
+      "--pitr-format",
+      "v7"
+    ],
+    "binary": {
+      "path": "target/release/write-perf-v4-v7-batch-attribution",
+      "sha256": "8515271997838ec7f83caf376409a16373f3b59ae204911ee56cc8149378ba46"
+    },
+    "trace_library_sha256": "7bef6a9cfadc9c803f955fb96e86bd65f5bdebd07aab39184d283832bfe3e46b",
+    "returncode": 0,
+    "excluded_from_scoring": true,
+    "clean_sampled": true,
+    "sampling_errors": [],
+    "before": {
+      "time_utc": "2026-10-29T03:08:26.662025+00:00",
+      "competing": [],
+      "load_average": [
+        0.7177734375,
+        0.693359375,
+        0.67041015625
+      ],
+      "cpu_jiffies": [
+        19032661,
+        5277,
+        8604022,
+        6879112506,
+        3817357,
+        1242965,
+        1523650,
+        0,
+        0,
+        0
+      ]
+    },
+    "after": {
+      "time_utc": "2026-10-29T03:08:29.004509+00:00",
+      "competing": [],
+      "load_average": [
+        0.82080078125,
+        0.71533203125,
+        0.677734375
+      ],
+      "cpu_jiffies": [
+        19033037,
+        5277,
+        8604142,
+        6879119386,
+        3817445,
+        1242976,
+        1523655,
+        0,
+        0,
+        0
+      ]
+    },
+    "events": 234856,
+    "files": {
+      "target/wal-opt/20261029-v7-batch-attribution/v7-init-w8-events.csv": "482e95b01ec2147ccf0180894d27eedea0af6be82cb3e385d5bb8a45e5113852",
+      "target/wal-opt/20261029-v7-batch-attribution/v7-init-w8-events.meta.json": "8b735814fdd827e066e3247dc94e6be7385e910dbea319bb15d3eccef9822820",
+      "target/wal-opt/20261029-v7-batch-attribution/v7-init-w8-io.csv": "5a22eec98d49e68ca0a42a8b20c847f7afd335a0a48efb1a9c112010ebc43b5f",
+      "target/wal-opt/20261029-v7-batch-attribution/v7-init-w8-samples.jsonl": "b820d831ddd68a13599b66d6341c1d056cab9abdb211e40d89b6bcaa25002571",
+      "target/wal-opt/20261029-v7-batch-attribution/v7-init-w8.stdout": "f0366c87ea600b9c4d5edc123674a141e26a441bea3289fa9dafa05c4a793c15",
+      "target/wal-opt/20261029-v7-batch-attribution/v7-init-w8.stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    }
+  }
+]

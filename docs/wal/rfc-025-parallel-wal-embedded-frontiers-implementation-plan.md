@@ -2904,6 +2904,7 @@ cells are cancelled. All 12 enabled invocations finish without replacements or
 pooling with earlier cohorts. Fresh candidate checks pass 1,975 tests; exact
 restoration passes 1,973 without retries or skips. The lineage reaches 869
 completed invocations, plus the inherited interrupted invocation without JSON.
+
 The notification change is not retained; v4 parity remains open.
 
 The [full ordinary-notification rerun](benchmarks/rfc-025-v7-signal-taskwork-rerun-20261029.md)
@@ -2916,3 +2917,17 @@ the unfiltered raw maximum. The notification candidate is not retained. No Rust
 source or executable changes; existing 1,975 candidate/1,973 retained correctness
 checks and all 128 baseline inputs are reverified. The lineage reaches 925
 completed invocations, plus the inherited interrupted invocation without JSON.
+
+The [v4/v7 batch attribution](benchmarks/rfc-025-v7-batch-attribution-20261029.md)
+adds 16 same-build scored-stage invocations and six excluded wall/thread-CPU
+traces. Fresh solo best scores retain a 16.9% gap, or 15.2% when matching-binary
+historical v7 peaks are included. In the solo diagnostic, DATA framing/CRC and
+logical-prefix SHA-256 consume 0.85/1.14 seconds of CPU before DATA submission;
+the v7 packer uses 2.05 seconds versus 0.024 for v4. WAL durability wait includes
+this CPU work. Both large-batch paths mostly skip zero filling, correcting the
+initial extent hypothesis; forcing initialization adds substantial I/O and is
+not retained. All 70,317 traced calls map to exact API partitions. Instrumented
+checks pass 1,973 tests with one recorded compaction retry and an isolated pass;
+fresh restored checks pass 1,973 without retries or skips. Source/executable are
+restored; no runtime optimization is retained. The lineage reaches 947 completed
+invocations, plus the inherited interrupted invocation without JSON.

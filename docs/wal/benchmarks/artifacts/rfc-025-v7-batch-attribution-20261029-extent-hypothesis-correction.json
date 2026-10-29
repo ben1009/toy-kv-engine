@@ -1,0 +1,19 @@
+{
+  "recorded_at_utc": "2026-10-29T03:26:15.110350+00:00",
+  "initial_hypothesis": "V4 initialization enabled at startup was initially interpreted as all large DATA extents being zero-filled, unlike v7.",
+  "correction": "take_admitted_group computes initialize_extents from batch size for both formats. V4 ExtentInitializer::prepare receives that zero_fill boolean. Thus both large-batch paths largely use allocation without zero filling; v4 startup initialization is separate.",
+  "evidence": {
+    "v4-w1_preparation_bytes": 126976,
+    "v7-w1_preparation_bytes": 0,
+    "v4-w8_preparation_bytes": 0,
+    "v7-w8_preparation_bytes": 39583744,
+    "v7-init-w1_preparation_bytes": 864018432,
+    "v7-init-w8_preparation_bytes": 824172544
+  },
+  "conclusion": "The initial generalization is rejected. Forced large-write initialization is a diagnostic intervention, not a reproduction of the ordinary v4 large-batch path or a retained optimization. Its throughput differences are confounded by different storage/sync latencies.",
+  "source_references": [
+    "kv-engine/src/wal/parallel/runtime.rs:2094",
+    "kv-engine/src/wal/parallel/runtime.rs:751",
+    "kv-engine/src/wal/parallel/runtime.rs:804"
+  ]
+}
