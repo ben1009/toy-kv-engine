@@ -1,0 +1,52 @@
+{
+  "source_retained": false,
+  "reason": "The candidate did not qualify all frozen throughput and p99 checks; its exact executable, patch, and raw captures are retained.",
+  "rust_mtimes_refreshed": true,
+  "atomic_binary_replacement": true,
+  "restored_files": [
+    "kv-engine/src/chaos/failpoint.rs",
+    "kv-engine/src/mem_table.rs",
+    "kv-engine/src/mvcc.rs",
+    "kv-engine/src/wal/parallel/runtime.rs",
+    "kv-engine/src/wal.rs"
+  ],
+  "canonical_sha256": "f353022d846530a6754330aaea11f295319ea8f4de20afa09b6d2a3b57b021d8",
+  "restored_checks": [
+    {
+      "step": "restored-check",
+      "command": [
+        "cargo",
+        "make",
+        "check"
+      ],
+      "returncode": 0,
+      "elapsed_seconds": 96.40068745613098,
+      "log_path": "target/wal-opt/20261029-v7-admission-grouping/restored-check.log",
+      "log_sha256": "2732d86793e0429fed5a4402e7c152e7dac1a7feec0204121594adb44e528331"
+    },
+    {
+      "step": "restored-typos",
+      "command": [
+        "typos"
+      ],
+      "returncode": 0,
+      "elapsed_seconds": 0.263141393661499,
+      "log_path": "target/wal-opt/20261029-v7-admission-grouping/restored-typos.log",
+      "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    }
+  ],
+  "prior_restored_attempts": [
+    {
+      "path": "target/wal-opt/20261029-v7-admission-grouping/restored-check-first-timeout.log",
+      "sha256": "258479aab8f71df8b19f4dd072fd435762287df29d37168ffa0de438da2d253b"
+    },
+    {
+      "path": "target/wal-opt/20261029-v7-admission-grouping/restored-simple-leveled-isolated.log",
+      "sha256": "5ba3f83332bb4bccf1e4e83b31b2a5006b8f4b97c20f415cadfc52b6c32a1544"
+    }
+  ],
+  "candidate_tests": 1985,
+  "restored_tests": 1973,
+  "test_threads": 2,
+  "retries": 0
+}
