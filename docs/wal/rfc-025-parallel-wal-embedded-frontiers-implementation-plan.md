@@ -2881,3 +2881,16 @@ throughput with 2.2% higher p99. The candidate is not retained. All 64 invocatio
 finish; candidate checks pass 1,976 tests and restored source passes 1,973 without
 retries/skips. The lineage reaches 803 completed invocations, plus the earlier
 interrupted invocation without JSON. V4 parity remains open.
+
+The [point-handoff diagnosis](benchmarks/rfc-025-v7-point-handoff-20261029.md)
+maps every API call in two excluded current-policy captures. DATA submission
+return to CQE reap averages 843/768 us at one/eight writers, about 67%/50% of
+mean API time; publication/wakeup is much smaller. This interval includes
+kernel/device completion and reaping/scheduling delay, so it is not a hardware-only
+attribution. The [ordinary-notification trial](benchmarks/rfc-025-v7-signal-taskwork-20261029.md)
+removes cooperative task work only for active ext-filesystem v7. Its screen and
+four guards pass, but every batch16 pair is excluded by the fixed I/O-stall mask.
+Qualification is inconclusive, confirmation is cancelled and retained source is
+restored. Candidate checks pass 1,975 tests; restored checks pass 1,973. The lineage
+reaches 857 completed invocations, plus the earlier interrupted invocation without
+JSON. No new runtime optimization or v4-parity qualification is retained.

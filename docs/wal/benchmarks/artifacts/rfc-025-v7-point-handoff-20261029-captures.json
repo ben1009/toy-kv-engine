@@ -1,0 +1,196 @@
+[
+  {
+    "writers": 1,
+    "operations": 20000,
+    "sample_every": 10,
+    "run_id": "1793231423197",
+    "command": [
+      "/home/liu/proj/toy-kv-engine/target/release/write-perf-v7-point-handoff",
+      "--suite",
+      "legacy",
+      "--preset",
+      "smoke",
+      "--bench",
+      "wal_concurrent",
+      "--wal",
+      "--wal-io-mode",
+      "parallel",
+      "--pitr",
+      "--pitr-format",
+      "v7",
+      "--num",
+      "20000",
+      "--threads",
+      "1",
+      "--value-size",
+      "1024",
+      "--target-sst-size",
+      "2147483648",
+      "--compaction",
+      "none",
+      "--latency-sample-every",
+      "10",
+      "--output",
+      "json",
+      "--path",
+      "/home/liu/proj/toy-kv-engine/target/wal-opt/20261029-v7-point-handoff/1writers-db"
+    ],
+    "binary": {
+      "path": "target/release/write-perf-v7-point-handoff",
+      "sha256": "dbc0577ddf71b618f67ee2621af3ffceae7d445159a6bc6962c406e50fa73cb6"
+    },
+    "trace_library_sha256": "7bef6a9cfadc9c803f955fb96e86bd65f5bdebd07aab39184d283832bfe3e46b",
+    "returncode": 0,
+    "excluded_from_scoring": true,
+    "clean_sampled": true,
+    "sampling_errors": [],
+    "before": {
+      "time_utc": "2026-10-28T23:50:23.193716+00:00",
+      "competing": [],
+      "load_average": [
+        1.1904296875,
+        0.673828125,
+        0.396484375
+      ],
+      "cpu_jiffies": [
+        18789401,
+        5275,
+        8510192,
+        6841592150,
+        3700461,
+        1229523,
+        1509446,
+        0,
+        0,
+        0
+      ]
+    },
+    "after": {
+      "time_utc": "2026-10-28T23:50:48.615839+00:00",
+      "competing": [],
+      "load_average": [
+        0.9130859375,
+        0.65185546875,
+        0.39599609375
+      ],
+      "cpu_jiffies": [
+        18790088,
+        5275,
+        8510502,
+        6841671710,
+        3701056,
+        1229573,
+        1509475,
+        0,
+        0,
+        0
+      ]
+    },
+    "events": 280000,
+    "files": {
+      "target/wal-opt/20261029-v7-point-handoff/1writers-events.csv": "abd663eefe177539fc96429ad73a987122c2393d8e74e33a0bdbe1910cc22864",
+      "target/wal-opt/20261029-v7-point-handoff/1writers-events.meta.json": "e4cc49d98251928577d31c44f22e7ac4bdd646f33330b62076d8ef8d644a7647",
+      "target/wal-opt/20261029-v7-point-handoff/1writers-io.csv": "751e995b39b9769dc5dbbb5dd37ebbf08c96234ca9dcd708a3965a08d16821d5",
+      "target/wal-opt/20261029-v7-point-handoff/1writers-samples.jsonl": "ec4578d95685c3f7e18ea1bcd9022ff862c9e74515d5a4495676d4c6579dba38",
+      "target/wal-opt/20261029-v7-point-handoff/1writers.stdout": "caa296011f4b654e919c396598e9ed9c672aebfb88c0fb384ea32a71ba65ad98",
+      "target/wal-opt/20261029-v7-point-handoff/1writers.stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    }
+  },
+  {
+    "writers": 8,
+    "operations": 100000,
+    "sample_every": 100,
+    "run_id": "1793231463679",
+    "command": [
+      "/home/liu/proj/toy-kv-engine/target/release/write-perf-v7-point-handoff",
+      "--suite",
+      "legacy",
+      "--preset",
+      "smoke",
+      "--bench",
+      "wal_concurrent",
+      "--wal",
+      "--wal-io-mode",
+      "parallel",
+      "--pitr",
+      "--pitr-format",
+      "v7",
+      "--num",
+      "100000",
+      "--threads",
+      "8",
+      "--value-size",
+      "1024",
+      "--target-sst-size",
+      "2147483648",
+      "--compaction",
+      "none",
+      "--latency-sample-every",
+      "100",
+      "--output",
+      "json",
+      "--path",
+      "/home/liu/proj/toy-kv-engine/target/wal-opt/20261029-v7-point-handoff/8writers-db"
+    ],
+    "binary": {
+      "path": "target/release/write-perf-v7-point-handoff",
+      "sha256": "dbc0577ddf71b618f67ee2621af3ffceae7d445159a6bc6962c406e50fa73cb6"
+    },
+    "trace_library_sha256": "7bef6a9cfadc9c803f955fb96e86bd65f5bdebd07aab39184d283832bfe3e46b",
+    "returncode": 0,
+    "excluded_from_scoring": true,
+    "clean_sampled": true,
+    "sampling_errors": [],
+    "before": {
+      "time_utc": "2026-10-28T23:51:03.673940+00:00",
+      "competing": [],
+      "load_average": [
+        0.791015625,
+        0.63623046875,
+        0.39453125
+      ],
+      "cpu_jiffies": [
+        18790227,
+        5275,
+        8510561,
+        6841719661,
+        3701056,
+        1229582,
+        1509492,
+        0,
+        0,
+        0
+      ]
+    },
+    "after": {
+      "time_utc": "2026-10-28T23:51:23.119827+00:00",
+      "competing": [],
+      "load_average": [
+        0.7587890625,
+        0.642578125,
+        0.40185546875
+      ],
+      "cpu_jiffies": [
+        18791467,
+        5275,
+        8511034,
+        6841778984,
+        3701985,
+        1229639,
+        1509520,
+        0,
+        0,
+        0
+      ]
+    },
+    "events": 924453,
+    "files": {
+      "target/wal-opt/20261029-v7-point-handoff/8writers-events.csv": "20ce1ecb96b1217711567bee280e2f6c7420acc3cb0cfa46e4fb9a24c94fe399",
+      "target/wal-opt/20261029-v7-point-handoff/8writers-events.meta.json": "738b6bb7d3deacca0216318d1680000c95f049cbe58156e725ada60e2ff59794",
+      "target/wal-opt/20261029-v7-point-handoff/8writers-io.csv": "1486fe72dc7051124d1d2deb809291889628f72d03359d71a3b9b7749ed38c63",
+      "target/wal-opt/20261029-v7-point-handoff/8writers-samples.jsonl": "6258932d63a741c5ff1b9b8b0aedcdb824459082881c3ca811bbf0c1a69973aa",
+      "target/wal-opt/20261029-v7-point-handoff/8writers.stdout": "6740c96425526f81d00c032eff855171ba21eb27db7e6fa2b422a978f98eb1af",
+      "target/wal-opt/20261029-v7-point-handoff/8writers.stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    }
+  }
+]

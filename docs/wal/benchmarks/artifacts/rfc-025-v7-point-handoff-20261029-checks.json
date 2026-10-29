@@ -1,0 +1,91 @@
+{
+  "outside_sandbox": true,
+  "checks": [
+    {
+      "phase": "format",
+      "command": [
+        "cargo",
+        "fmt",
+        "--all"
+      ],
+      "started_at_utc": "2026-10-28T23:48:11.788712+00:00",
+      "exit_code": 0,
+      "log": "target/wal-opt/20261029-v7-point-handoff/format.log",
+      "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "phase": "spelling",
+      "command": [
+        "typos",
+        "kv-engine/src/wal.rs",
+        "kv-engine/src/wal/parallel/runtime.rs",
+        "kv-engine/src/wal/parallel/worker.rs",
+        "kv-engine/src/bin/write-perf.rs",
+        "/home/liu/proj/toy-kv-engine/docs/wal/benchmarks/artifacts/rfc-025-v7-point-handoff-20261029-instrumentation.patch",
+        "/home/liu/proj/toy-kv-engine/docs/wal/benchmarks/artifacts/rfc-025-v7-point-handoff-20261029-source-sha256.tsv",
+        "/home/liu/proj/toy-kv-engine/docs/wal/benchmarks/artifacts/rfc-025-v7-point-handoff-20261029-baseline-sha256.tsv",
+        "/home/liu/proj/toy-kv-engine/docs/wal/benchmarks/artifacts/rfc-025-v7-point-handoff-20261029-plan.json",
+        "/home/liu/proj/toy-kv-engine/docs/wal/benchmarks/artifacts/rfc-025-v7-point-handoff-20261029-checks.json"
+      ],
+      "started_at_utc": "2026-10-28T23:48:12.979292+00:00",
+      "exit_code": 0,
+      "log": "target/wal-opt/20261029-v7-point-handoff/spelling.log",
+      "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "phase": "focused",
+      "command": [
+        "cargo",
+        "nextest",
+        "run",
+        "--offline",
+        "--locked",
+        "--workspace",
+        "--all-features",
+        "--lib",
+        "--retries",
+        "0",
+        "--success-output",
+        "immediate",
+        "-E",
+        "test(wal::parallel_worker::tests::) or test(wal::parallel_runtime::tests::)"
+      ],
+      "started_at_utc": "2026-10-28T23:48:13.044305+00:00",
+      "exit_code": 0,
+      "log": "target/wal-opt/20261029-v7-point-handoff/focused.log",
+      "log_sha256": "ece449b351c002a66ef0a2a8ad880f4f7d272a67f8ef1abb013a976e1074f9ba"
+    },
+    {
+      "phase": "check",
+      "command": [
+        "cargo",
+        "make",
+        "check"
+      ],
+      "started_at_utc": "2026-10-28T23:48:25.382531+00:00",
+      "exit_code": 0,
+      "log": "target/wal-opt/20261029-v7-point-handoff/check.log",
+      "log_sha256": "9440d3677f1b12a72c2adf9321378a16f62a1819d1a719a2685e9446e54fcdc8"
+    },
+    {
+      "phase": "release",
+      "command": [
+        "cargo",
+        "build",
+        "--offline",
+        "--locked",
+        "--release",
+        "--package",
+        "kv-engine",
+        "--bin",
+        "write-perf",
+        "--features",
+        "bench"
+      ],
+      "started_at_utc": "2026-10-28T23:49:15.082820+00:00",
+      "exit_code": 0,
+      "log": "target/wal-opt/20261029-v7-point-handoff/release.log",
+      "log_sha256": "848ca4559c8d13d4e0efd38495fd28267044bf3c5170a87d188d942a1f1e77f7"
+    }
+  ]
+}

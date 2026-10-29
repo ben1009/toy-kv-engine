@@ -1,0 +1,16 @@
+{
+  "source_base": "05dd9c2c74901741d635a8b9559638a88594f143",
+  "reconstructed_inputs": 128,
+  "summary_regenerates": true,
+  "new_completed_invocations": 2,
+  "global_unique_invocations": 805,
+  "full_archive_unique_invocations": 4901,
+  "inherited_interrupted_without_json": 1,
+  "retained_source_restored": true,
+  "restoration_scope": "Historical diagnostic-end restoration; the successor optimization verifier owns final live-state checks.",
+  "canonical_sha256": "f353022d846530a6754330aaea11f295319ea8f4de20afa09b6d2a3b57b021d8",
+  "checks_sha256": "c0ba59f252c9e1d87fa4ca4d232f5538efe1ad9b9703fbfdd1ff3fdb862599e2",
+  "restoration_sha256": "8225ab28a736876705898c58fd112751c9bfc0ea9204881859d41025c6069494",
+  "summary_sha256": "076618f57ce6ba452edaed3b3bde69aa220dc3de02192354c4f6beddd15671cc",
+  "verifier_sha256": "dbd351db4e3664579954b79a9a1ece8499706c5edce38ff9e90ffb1cd2b17d81"
+}
