@@ -2931,3 +2931,21 @@ checks pass 1,973 tests with one recorded compaction retry and an isolated pass;
 fresh restored checks pass 1,973 without retries or skips. Source/executable are
 restored; no runtime optimization is retained. The lineage reaches 947 completed
 invocations, plus the inherited interrupted invocation without JSON.
+
+The [contiguous entry CRC screen](benchmarks/rfc-025-v7-entry-crc-20261029.md)
+adds 24 invocations and is rejected after batch8 throughput falls 10.1%. The
+[post-submit SHA overlap screen](benchmarks/rfc-025-v7-post-submit-hash-20261029.md)
+adds 36: solo throughput improves, but concurrent batch checks fail. Both
+experiments restore retained source and executable; the lineage reaches 1,007
+completed invocations.
+
+The [producer-framing composition](benchmarks/rfc-025-v7-producer-framing-20261029.md)
+adds 96 invocations, including the exact P0 binary as a separate control. Its
+fresh batch checks pass, and the solo high reaches 80,853 puts/s with 1.250 ms
+p99. Point throughput and p99 guards reject the composition. The eight-writer
+winner also submits substantially more solo groups than retained v7, identifying
+a coordination cost to measure in future pipeline work. All five changed Rust
+files and the canonical executable are restored; candidate checks pass 1,979
+tests and fresh restored checks pass 1,973. The lineage reaches 1,103 completed
+invocations, or 5,199 across the full indexed archive, plus the inherited
+interrupted invocation without JSON. V4 parity remains open.

@@ -1,0 +1,225 @@
+{
+  "outside_sandbox": true,
+  "candidate_tests": 1979,
+  "focused_tests": 59,
+  "checks": [
+    {
+      "step": "fmt",
+      "command": [
+        "cargo",
+        "fmt",
+        "--all"
+      ],
+      "returncode": 0,
+      "elapsed_seconds": 1.149665355682373,
+      "log_path": "target/wal-opt/20261029-v7-producer-framing/v4-fmt.log",
+      "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "step": "focused",
+      "command": [
+        "cargo",
+        "nextest",
+        "run",
+        "--workspace",
+        "--all-features",
+        "--lib",
+        "--retries",
+        "0",
+        "-E",
+        "test(wal::parallel_runtime) | test(mem_table::tests::failpoint_v7_producer)"
+      ],
+      "returncode": 0,
+      "elapsed_seconds": 11.554173231124878,
+      "log_path": "target/wal-opt/20261029-v7-producer-framing/v4-focused.log",
+      "log_sha256": "4e08e60769085c0c8a8511aaad78dfce9d982c4d4d5fc80c97a5961d4ae53917"
+    },
+    {
+      "step": "check",
+      "command": [
+        "cargo",
+        "make",
+        "check"
+      ],
+      "returncode": 0,
+      "elapsed_seconds": 34.64070200920105,
+      "log_path": "target/wal-opt/20261029-v7-producer-framing/v4-check.log",
+      "log_sha256": "535d1f2e6f6e81ffc2e12ee0f3c3a1855a24cb0c773d1f8b7bc7d903189ba27b"
+    },
+    {
+      "step": "typos",
+      "command": [
+        "typos"
+      ],
+      "returncode": 0,
+      "elapsed_seconds": 0.35614728927612305,
+      "log_path": "target/wal-opt/20261029-v7-producer-framing/v4-typos.log",
+      "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "step": "release",
+      "command": [
+        "cargo",
+        "build",
+        "--release",
+        "--package",
+        "kv-engine",
+        "--bin",
+        "write-perf",
+        "--features",
+        "bench"
+      ],
+      "returncode": 0,
+      "elapsed_seconds": 19.64686155319214,
+      "log_path": "target/wal-opt/20261029-v7-producer-framing/v4-release.log",
+      "log_sha256": "7b93181de907aefd7b421d180bd11e879b7dde6893f81dfd7411553ea728140c"
+    }
+  ],
+  "prior_attempts": {
+    "initial-compile.json": [
+      {
+        "step": "fmt",
+        "command": [
+          "cargo",
+          "fmt",
+          "--all"
+        ],
+        "returncode": 0,
+        "elapsed_seconds": 0.9948732852935791,
+        "log_path": "target/wal-opt/20261029-v7-producer-framing/fmt.log",
+        "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      {
+        "step": "compile",
+        "command": [
+          "cargo",
+          "check",
+          "--workspace",
+          "--all-features",
+          "--tests"
+        ],
+        "returncode": 0,
+        "elapsed_seconds": 7.313822984695435,
+        "log_path": "target/wal-opt/20261029-v7-producer-framing/compile.log",
+        "log_sha256": "9057a7b68b7667aa794101ad341eca42a352e95ac8f91c7969d618d54b4c9c61"
+      }
+    ],
+    "validation-v1.json": [
+      {
+        "step": "fmt",
+        "command": [
+          "cargo",
+          "fmt",
+          "--all"
+        ],
+        "returncode": 0,
+        "elapsed_seconds": 1.0422394275665283,
+        "log_path": "target/wal-opt/20261029-v7-producer-framing/v1-fmt.log",
+        "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      {
+        "step": "focused",
+        "command": [
+          "cargo",
+          "nextest",
+          "run",
+          "--workspace",
+          "--all-features",
+          "--lib",
+          "--retries",
+          "0",
+          "-E",
+          "test(wal::parallel_runtime) | test(mem_table::tests::failpoint_v7_producer)"
+        ],
+        "returncode": 101,
+        "elapsed_seconds": 6.51037073135376,
+        "log_path": "target/wal-opt/20261029-v7-producer-framing/v1-focused.log",
+        "log_sha256": "4a81cb81f839585477aebe50080d2857b546df0d5a563aebec5a9eb22e797739"
+      }
+    ],
+    "validation-v2.json": [
+      {
+        "step": "fmt",
+        "command": [
+          "cargo",
+          "fmt",
+          "--all"
+        ],
+        "returncode": 0,
+        "elapsed_seconds": 1.0059564113616943,
+        "log_path": "target/wal-opt/20261029-v7-producer-framing/v2-fmt.log",
+        "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      {
+        "step": "focused",
+        "command": [
+          "cargo",
+          "nextest",
+          "run",
+          "--workspace",
+          "--all-features",
+          "--lib",
+          "--retries",
+          "0",
+          "-E",
+          "test(wal::parallel_runtime) | test(mem_table::tests::failpoint_v7_producer)"
+        ],
+        "returncode": 100,
+        "elapsed_seconds": 16.65502905845642,
+        "log_path": "target/wal-opt/20261029-v7-producer-framing/v2-focused.log",
+        "log_sha256": "0cda4eff13fe663a3b3d19f05feb2fb45ab4e9f4788c81c8c7f1edeeb1f20458"
+      }
+    ],
+    "validation-v3.json": [
+      {
+        "step": "fmt",
+        "command": [
+          "cargo",
+          "fmt",
+          "--all"
+        ],
+        "returncode": 0,
+        "elapsed_seconds": 1.208594799041748,
+        "log_path": "target/wal-opt/20261029-v7-producer-framing/v3-fmt.log",
+        "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      {
+        "step": "focused",
+        "command": [
+          "cargo",
+          "nextest",
+          "run",
+          "--workspace",
+          "--all-features",
+          "--lib",
+          "--retries",
+          "0",
+          "-E",
+          "test(wal::parallel_runtime) | test(mem_table::tests::failpoint_v7_producer)"
+        ],
+        "returncode": 0,
+        "elapsed_seconds": 8.289843320846558,
+        "log_path": "target/wal-opt/20261029-v7-producer-framing/v3-focused.log",
+        "log_sha256": "19b1638947fda4e942c1bcd46475311d8d27fabe520057be44a79592b19a78ee"
+      },
+      {
+        "step": "check",
+        "command": [
+          "cargo",
+          "make",
+          "check"
+        ],
+        "returncode": 1,
+        "elapsed_seconds": 8.554019689559937,
+        "log_path": "target/wal-opt/20261029-v7-producer-framing/v3-check.log",
+        "log_sha256": "0d9ca180a8c61703f2da2c6a9e37c9f93acff3255b9928733c4d8e5e2375c7bf"
+      }
+    ]
+  },
+  "corrections": [
+    "Use the current owner durable-cleanup API in the lifetime test.",
+    "A recovery cursor requires a drained pipeline; correct the concurrent-framing fixture expectation.",
+    "Remove an obsolete private append wrapper caught by strict Clippy."
+  ],
+  "all_captures_follow_final_checks": true
+}
