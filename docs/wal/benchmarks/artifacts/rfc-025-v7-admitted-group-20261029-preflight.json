@@ -1,0 +1,12 @@
+{
+  "head": "59becf2791cfcefb91dee80f20af6157215c392c",
+  "source_hashes": {
+    "kv-engine/src/chaos/failpoint.rs": "9dd0b8a02e25635c736671d6f8e1bf22d7ee507f300bb29f178780c48a8ff3ac",
+    "kv-engine/src/mem_table.rs": "a3d0b6d2761db13055ce68f20a4e3f684eb3f5f06bf75c1c58fb65de0d4014e3",
+    "kv-engine/src/mvcc.rs": "c366aa61baf4ebf5ca4fc7fe94aca90b11fea19b5720fb90d50ff4abbad22dae",
+    "kv-engine/src/wal.rs": "cd39631f446ae864f94778920d1a0fbea70376941de9a1350c6da177697aced8",
+    "kv-engine/src/wal/parallel/runtime.rs": "31a3a050633dfd7900fc2288ce9eba104972d402e4d51b284ef547d889d5902a"
+  },
+  "canonical_sha256": "f353022d846530a6754330aaea11f295319ea8f4de20afa09b6d2a3b57b021d8",
+  "parent_verified": true
+}

@@ -1,0 +1,21 @@
+{
+  "kernel": "6.12.71-1-lts",
+  "logical_cpus": 32,
+  "filesystem": "/dev/nvme0n1p3 ext4 rw,relatime",
+  "environment": {
+    "RUSTFLAGS": null,
+    "CARGO_ENCODED_RUSTFLAGS": null,
+    "CARGO_TARGET_DIR": null,
+    "LD_PRELOAD": null,
+    "TMPDIR": "/home/liu/proj/toy-kv-engine/target/tmp/wal-grouping"
+  },
+  "plan_sha256": "6a832730b1901104d23cb3478b41d165d4af4521b748c01e27acc629b4827214",
+  "matrix_sha256": "cf2917bd2114363f8bf4ec4780c5fa43751fedf8a19d43192ee236d33d114bcf",
+  "driver_sha256": "327ad5ddb9d40fbc32229fba68439a04e95af897e0274e181a43d919f7d5db30",
+  "child_sha256": "538c6a74a405dd67eba4d7bb7295fd24965c69a0fa3dde06bed30ed1985650ab",
+  "analyzer_sha256": "f120098a9c7eeecf6e5838dc82cccaf7cdf9d9a73aaf6adfa156d2b95355a467",
+  "orchestrator_sha256": "c6b269b8fd5e2c2a4c6a49819643852ed3684730cde3939d6f648945ffb6d938",
+  "source_manifest_sha256": "08ce03c7fc99143314a9166943c9a0440741823d4af37025bfb5549456f7a89f",
+  "patch_sha256": "bc87f44bbaaf5654f652929841ee1dc7d0c3cde791acad12bde788d0fc8e37fe",
+  "checks_sha256": "dbc595fbda92c908f6c2f7549d55b6b0896ca2bb6974716c11e169081d978218"
+}
