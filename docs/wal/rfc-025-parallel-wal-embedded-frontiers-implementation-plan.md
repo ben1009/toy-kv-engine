@@ -2905,3 +2905,14 @@ pooling with earlier cohorts. Fresh candidate checks pass 1,975 tests; exact
 restoration passes 1,973 without retries or skips. The lineage reaches 869
 completed invocations, plus the inherited interrupted invocation without JSON.
 The notification change is not retained; v4 parity remains open.
+
+The [full ordinary-notification rerun](benchmarks/rfc-025-v7-signal-taskwork-rerun-20261029.md)
+finishes all six cells: 56 invocations, including 44 scored runs. Following the
+maintainer's reminder, assessment uses the highest-throughput scored invocation
+for each exact binary/workload and p99 from that same invocation. The historical
+best-score view improves point1/16, but point8 throughput is 1.4% lower and
+batch1/8/16 throughput is 7.5%/13.8%/10.9% lower. Every selected winner is also
+the unfiltered raw maximum. The notification candidate is not retained. No Rust
+source or executable changes; existing 1,975 candidate/1,973 retained correctness
+checks and all 128 baseline inputs are reverified. The lineage reaches 925
+completed invocations, plus the inherited interrupted invocation without JSON.

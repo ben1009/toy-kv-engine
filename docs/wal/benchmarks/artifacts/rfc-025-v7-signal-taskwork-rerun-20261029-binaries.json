@@ -1,0 +1,10 @@
+{
+  "baseline": {
+    "path": "target/release/write-perf-v7-large-data-async-dispatch",
+    "sha256": "f353022d846530a6754330aaea11f295319ea8f4de20afa09b6d2a3b57b021d8"
+  },
+  "candidate": {
+    "path": "target/release/write-perf-v7-signal-taskwork",
+    "sha256": "79592a3cbf0c4f9e5411690cd5e369e62b9abdc6991f88b03b0b0d9b42071889"
+  }
+}

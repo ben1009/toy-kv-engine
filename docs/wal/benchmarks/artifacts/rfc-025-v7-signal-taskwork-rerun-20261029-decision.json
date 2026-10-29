@@ -1,0 +1,20 @@
+{
+  "assessment": "not_retained",
+  "assessment_basis": "Maintainer-directed highest-throughput scored run per exact binary/workload, with p99 from the same invocation. Historical best scores determine the assessment; current-cohort best scores are also reported.",
+  "assessment_passed": false,
+  "source_retained": false,
+  "source_changed": false,
+  "baseline_unchanged": true,
+  "canonical_sha256": "f353022d846530a6754330aaea11f295319ea8f4de20afa09b6d2a3b57b021d8",
+  "new_completed_invocations": 56,
+  "source_candidates": 1,
+  "paired_analysis_diagnostic_only": true,
+  "failed_best_score_cells": [
+    "batch16",
+    "point8",
+    "batch8",
+    "batch1"
+  ],
+  "best_summary_sha256": "cd02936c6e3ba5e1bde1b15b693a0a6ca3a4f555f29271d507f8ad8fa2ebd02d",
+  "maintainer_assessment_sha256": "53a961cfd8aa46a26d5ebd9549784f5f39cb2c743c1bf7004f4f8825e3ab61dc"
+}

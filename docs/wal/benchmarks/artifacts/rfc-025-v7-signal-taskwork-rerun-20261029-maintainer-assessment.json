@@ -1,0 +1,9 @@
+{
+  "recorded_at_utc": "2026-10-29T01:47:43.169333+00:00",
+  "instruction": "i told you to use best score",
+  "change": "Use the highest-throughput scored run for each exact binary and workload, with p99 from that same invocation. Show the current rerun and the historical best across saved scored runs of those binaries. Paired medians remain diagnostic; they are not the requested ranking.",
+  "selection": "Exclude warmups, diagnostic captures and runs crossing the unchanged obvious-stall cutoff. Select each arm independently; matching pair eligibility is not required for the best-score view. Never combine throughput from one invocation with p99 from another.",
+  "schedule": "Keep all56 fixed invocations and all raw evidence. No replacements or additional score-selected runs.",
+  "retention": "Use historical best scored results for the exact binaries: point8 target must improve throughput and its associated p99; every other workload keeps the original throughput>=0.95 and p99<=1.10 guard. Require an eligible scored run in each arm/workload. Source may be retained only after correctness validation.",
+  "source_during_capture": "Retained source and canonical executable remain unchanged."
+}

@@ -1,0 +1,1133 @@
+{
+  "selection": "Highest throughput eligible scored run per exact binary/workload; p99 is from that same invocation. Individual stall exclusions; no pair matching or median ranking. Equal scores break by run ID.",
+  "current": {
+    "cells": {
+      "batch16": {
+        "arms": {
+          "baseline": {
+            "scored_runs": 5,
+            "eligible_runs": 5,
+            "excluded_runs": 0,
+            "best": {
+              "run_id": "1793237788185",
+              "binary_sha256": "f353022d846530a6754330aaea11f295319ea8f4de20afa09b6d2a3b57b021d8",
+              "arm": "baseline",
+              "workload": "batch16",
+              "puts_s": 588223.2071687807,
+              "p99_ms": 4.194785,
+              "frontier_mean_ms": 0.05409016783831283,
+              "fdatasync_mean_ms": 0.34375243848857645,
+              "obvious_stall": false,
+              "data_bytes": 816054272,
+              "raw": "rfc-025-v7-signal-taskwork-rerun-20261029-ext4-batch16.jsonl",
+              "raw_sha256": "ecad8b5e86c70661eebd0bdfba67c63481c6c4b89bec5538f31a4b0985f3f046",
+              "manifest": "rfc-025-v7-signal-taskwork-rerun-20261029-ext4-batch16-runs.tsv",
+              "pair": 2,
+              "current_cohort": true
+            },
+            "raw_best": {
+              "run_id": "1793237788185",
+              "binary_sha256": "f353022d846530a6754330aaea11f295319ea8f4de20afa09b6d2a3b57b021d8",
+              "arm": "baseline",
+              "workload": "batch16",
+              "puts_s": 588223.2071687807,
+              "p99_ms": 4.194785,
+              "frontier_mean_ms": 0.05409016783831283,
+              "fdatasync_mean_ms": 0.34375243848857645,
+              "obvious_stall": false,
+              "data_bytes": 816054272,
+              "raw": "rfc-025-v7-signal-taskwork-rerun-20261029-ext4-batch16.jsonl",
+              "raw_sha256": "ecad8b5e86c70661eebd0bdfba67c63481c6c4b89bec5538f31a4b0985f3f046",
+              "manifest": "rfc-025-v7-signal-taskwork-rerun-20261029-ext4-batch16-runs.tsv",
+              "pair": 2,
+              "current_cohort": true
+            }
+          },
+          "candidate": {
+            "scored_runs": 5,
+            "eligible_runs": 3,
+            "excluded_runs": 2,
+            "best": {
+              "run_id": "1793237837969",
+              "binary_sha256": "79592a3cbf0c4f9e5411690cd5e369e62b9abdc6991f88b03b0b0d9b42071889",
+              "arm": "candidate",
+              "workload": "batch16",
+              "puts_s": 540919.8674687473,
+              "p99_ms": 4.420096,
+              "frontier_mean_ms": 0.05762352561983471,
+              "fdatasync_mean_ms": 0.3889372438016529,
+              "obvious_stall": false,
+              "data_bytes": 816054272,
+              "raw": "rfc-025-v7-signal-taskwork-rerun-20261029-ext4-batch16.jsonl",
+              "raw_sha256": "14aaec07d6886f775842b56452edcadf03a409541b70d939b379fd80baad3446",
+              "manifest": "rfc-025-v7-signal-taskwork-rerun-20261029-ext4-batch16-runs.tsv",
+              "pair": 4,
+              "current_cohort": true
+            },
+            "raw_best": {
+              "run_id": "1793237837969",
+              "binary_sha256": "79592a3cbf0c4f9e5411690cd5e369e62b9abdc6991f88b03b0b0d9b42071889",
+              "arm": "candidate",
+              "workload": "batch16",
+              "puts_s": 540919.8674687473,
+              "p99_ms": 4.420096,
+              "frontier_mean_ms": 0.05762352561983471,
+              "fdatasync_mean_ms": 0.3889372438016529,
+              "obvious_stall": false,
+              "data_bytes": 816054272,
+              "raw": "rfc-025-v7-signal-taskwork-rerun-20261029-ext4-batch16.jsonl",
+              "raw_sha256": "14aaec07d6886f775842b56452edcadf03a409541b70d939b379fd80baad3446",
+              "manifest": "rfc-025-v7-signal-taskwork-rerun-20261029-ext4-batch16-runs.tsv",
+              "pair": 4,
+              "current_cohort": true
+            }
+          }
+        },
+        "ratios": {
+          "throughput": 0.9195826701096808,
+          "p99": 1.0537121688000695
+        },
+        "guards": {
+          "available": true,
+          "throughput": false,
+          "p99": true,
+          "identical_data_bytes": true
+        },
+        "passed": false
+      },
+      "point8": {
+        "arms": {
+          "baseline": {
+            "scored_runs": 5,
+            "eligible_runs": 5,
+            "excluded_runs": 0,
+            "best": {
+              "run_id": "1793238101658",
+              "binary_sha256": "f353022d846530a6754330aaea11f295319ea8f4de20afa09b6d2a3b57b021d8",
+              "arm": "baseline",
+              "workload": "point8",
+              "puts_s": 16749.488832776868,
+              "p99_ms": 1.155587,
+              "frontier_mean_ms": 0.01628885579047018,
+              "fdatasync_mean_ms": 0.2480724091984853,
+              "obvious_stall": false,
+              "data_bytes": 409600000,
+              "raw": "rfc-025-v7-signal-taskwork-rerun-20261029-ext4-point8-confirm.jsonl",
+              "raw_sha256": "4dc3164f73aeefead1efe45f1244b87db38cf6278f4f3701426d3d4dc09c793a",
+              "manifest": "rfc-025-v7-signal-taskwork-rerun-20261029-ext4-point8-confirm-runs.tsv",
+              "pair": 2,
+              "current_cohort": true
+            },
+            "raw_best": {
+              "run_id": "1793238101658",
+              "binary_sha256": "f353022d846530a6754330aaea11f295319ea8f4de20afa09b6d2a3b57b021d8",
+              "arm": "baseline",
+              "workload": "point8",
+              "puts_s": 16749.488832776868,
+              "p99_ms": 1.155587,
+              "frontier_mean_ms": 0.01628885579047018,
+              "fdatasync_mean_ms": 0.2480724091984853,
+              "obvious_stall": false,
+              "data_bytes": 409600000,
+              "raw": "rfc-025-v7-signal-taskwork-rerun-20261029-ext4-point8-confirm.jsonl",
+              "raw_sha256": "4dc3164f73aeefead1efe45f1244b87db38cf6278f4f3701426d3d4dc09c793a",
+              "manifest": "rfc-025-v7-signal-taskwork-rerun-20261029-ext4-point8-confirm-runs.tsv",
+              "pair": 2,
+              "current_cohort": true
+            }
+          },
+          "candidate": {
+            "scored_runs": 5,
+            "eligible_runs": 5,
+            "excluded_runs": 0,
+            "best": {
+              "run_id": "1793238080478",
+              "binary_sha256": "79592a3cbf0c4f9e5411690cd5e369e62b9abdc6991f88b03b0b0d9b42071889",
+              "arm": "candidate",
+              "workload": "point8",
+              "puts_s": 16515.438675840087,
+              "p99_ms": 1.119237,
+              "frontier_mean_ms": 0.016261324846287246,
+              "fdatasync_mean_ms": 0.2483005039413527,
+              "obvious_stall": false,
+              "data_bytes": 409600000,
+              "raw": "rfc-025-v7-signal-taskwork-rerun-20261029-ext4-point8-confirm.jsonl",
+              "raw_sha256": "fd1c359acda2a1f2c16ad426c627d1006d3b43381c05894b5ade5b9c240eb539",
+              "manifest": "rfc-025-v7-signal-taskwork-rerun-20261029-ext4-point8-confirm-runs.tsv",
+              "pair": 2,
+              "current_cohort": true
+            },
+            "raw_best": {
+              "run_id": "1793238080478",
+              "binary_sha256": "79592a3cbf0c4f9e5411690cd5e369e62b9abdc6991f88b03b0b0d9b42071889",
+              "arm": "candidate",
+              "workload": "point8",
+              "puts_s": 16515.438675840087,
+              "p99_ms": 1.119237,
+              "frontier_mean_ms": 0.016261324846287246,
+              "fdatasync_mean_ms": 0.2483005039413527,
+              "obvious_stall": false,
+              "data_bytes": 409600000,
+              "raw": "rfc-025-v7-signal-taskwork-rerun-20261029-ext4-point8-confirm.jsonl",
+              "raw_sha256": "fd1c359acda2a1f2c16ad426c627d1006d3b43381c05894b5ade5b9c240eb539",
+              "manifest": "rfc-025-v7-signal-taskwork-rerun-20261029-ext4-point8-confirm-runs.tsv",
+              "pair": 2,
+              "current_cohort": true
+            }
+          }
+        },
+        "ratios": {
+          "throughput": 0.9860264298646075,
+          "p99": 0.9685441251935165
+        },
+        "guards": {
+          "available": true,
+          "throughput": false,
+          "p99": true,
+          "identical_data_bytes": true
+        },
+        "passed": false
+      },
+      "point1": {
+        "arms": {
+          "baseline": {
+            "scored_runs": 3,
+            "eligible_runs": 3,
+            "excluded_runs": 0,
+            "best": {
+              "run_id": "1793238590487",
+              "binary_sha256": "f353022d846530a6754330aaea11f295319ea8f4de20afa09b6d2a3b57b021d8",
+              "arm": "baseline",
+              "workload": "point1",
+              "puts_s": 2011.9733337883076,
+              "p99_ms": 2.42169,
+              "frontier_mean_ms": 0.017580677500000003,
+              "fdatasync_mean_ms": 0.244650469,
+              "obvious_stall": false,
+              "data_bytes": 81920000,
+              "raw": "rfc-025-v7-signal-taskwork-rerun-20261029-ext4-point1.jsonl",
+              "raw_sha256": "219aa6f0f9e11ee831a5ea8b309209e9d550c02230516e107bbeb7817b791683",
+              "manifest": "rfc-025-v7-signal-taskwork-rerun-20261029-ext4-point1-runs.tsv",
+              "pair": 3,
+              "current_cohort": true
+            },
+            "raw_best": {
+              "run_id": "1793238590487",
+              "binary_sha256": "f353022d846530a6754330aaea11f295319ea8f4de20afa09b6d2a3b57b021d8",
+              "arm": "baseline",
+              "workload": "point1",
+              "puts_s": 2011.9733337883076,
+              "p99_ms": 2.42169,
+              "frontier_mean_ms": 0.017580677500000003,
+              "fdatasync_mean_ms": 0.244650469,
+              "obvious_stall": false,
+              "data_bytes": 81920000,
+              "raw": "rfc-025-v7-signal-taskwork-rerun-20261029-ext4-point1.jsonl",
+              "raw_sha256": "219aa6f0f9e11ee831a5ea8b309209e9d550c02230516e107bbeb7817b791683",
+              "manifest": "rfc-025-v7-signal-taskwork-rerun-20261029-ext4-point1-runs.tsv",
+              "pair": 3,
+              "current_cohort": true
+            }
+          },
+          "candidate": {
+            "scored_runs": 3,
+            "eligible_runs": 3,
+            "excluded_runs": 0,
+            "best": {
+              "run_id": "1793238515407",
+              "binary_sha256": "79592a3cbf0c4f9e5411690cd5e369e62b9abdc6991f88b03b0b0d9b42071889",
+              "arm": "candidate",
+              "workload": "point1",
+              "puts_s": 2343.4198604746935,
+              "p99_ms": 0.735291,
+              "frontier_mean_ms": 0.017597649,
+              "fdatasync_mean_ms": 0.24304406795,
+              "obvious_stall": false,
+              "data_bytes": 81920000,
+              "raw": "rfc-025-v7-signal-taskwork-rerun-20261029-ext4-point1.jsonl",
+              "raw_sha256": "f80686eab5f94553ef47b61d790ea20c4d8506f6bcf3bbb2f6127d30b1e9efa1",
+              "manifest": "rfc-025-v7-signal-taskwork-rerun-20261029-ext4-point1-runs.tsv",
+              "pair": 1,
+              "current_cohort": true
+            },
+            "raw_best": {
+              "run_id": "1793238515407",
+              "binary_sha256": "79592a3cbf0c4f9e5411690cd5e369e62b9abdc6991f88b03b0b0d9b42071889",
+              "arm": "candidate",
+              "workload": "point1",
+              "puts_s": 2343.4198604746935,
+              "p99_ms": 0.735291,
+              "frontier_mean_ms": 0.017597649,
+              "fdatasync_mean_ms": 0.24304406795,
+              "obvious_stall": false,
+              "data_bytes": 81920000,
+              "raw": "rfc-025-v7-signal-taskwork-rerun-20261029-ext4-point1.jsonl",
+              "raw_sha256": "f80686eab5f94553ef47b61d790ea20c4d8506f6bcf3bbb2f6127d30b1e9efa1",
+              "manifest": "rfc-025-v7-signal-taskwork-rerun-20261029-ext4-point1-runs.tsv",
+              "pair": 1,
+              "current_cohort": true
+            }
+          }
+        },
+        "ratios": {
+          "throughput": 1.164737037574107,
+          "p99": 0.3036272190082133
+        },
+        "guards": {
+          "available": true,
+          "throughput": true,
+          "p99": true,
+          "identical_data_bytes": true
+        },
+        "passed": true
+      },
+      "point16": {
+        "arms": {
+          "baseline": {
+            "scored_runs": 3,
+            "eligible_runs": 3,
+            "excluded_runs": 0,
+            "best": {
+              "run_id": "1793238829282",
+              "binary_sha256": "f353022d846530a6754330aaea11f295319ea8f4de20afa09b6d2a3b57b021d8",
+              "arm": "baseline",
+              "workload": "point16",
+              "puts_s": 9791.226662505382,
+              "p99_ms": 10.86105,
+              "frontier_mean_ms": 0.21310668705740546,
+              "fdatasync_mean_ms": 0.5281077013711014,
+              "obvious_stall": false,
+              "data_bytes": 409600000,
+              "raw": "rfc-025-v7-signal-taskwork-rerun-20261029-ext4-point16.jsonl",
+              "raw_sha256": "02654bb9322456b403c23824a5c058c7bdfd729ea2315704adff259abd3c67b1",
+              "manifest": "rfc-025-v7-signal-taskwork-rerun-20261029-ext4-point16-runs.tsv",
+              "pair": 2,
+              "current_cohort": true
+            },
+            "raw_best": {
+              "run_id": "1793238829282",
+              "binary_sha256": "f353022d846530a6754330aaea11f295319ea8f4de20afa09b6d2a3b57b021d8",
+              "arm": "baseline",
+              "workload": "point16",
+              "puts_s": 9791.226662505382,
+              "p99_ms": 10.86105,
+              "frontier_mean_ms": 0.21310668705740546,
+              "fdatasync_mean_ms": 0.5281077013711014,
+              "obvious_stall": false,
+              "data_bytes": 409600000,
+              "raw": "rfc-025-v7-signal-taskwork-rerun-20261029-ext4-point16.jsonl",
+              "raw_sha256": "02654bb9322456b403c23824a5c058c7bdfd729ea2315704adff259abd3c67b1",
+              "manifest": "rfc-025-v7-signal-taskwork-rerun-20261029-ext4-point16-runs.tsv",
+              "pair": 2,
+              "current_cohort": true
+            }
+          },
+          "candidate": {
+            "scored_runs": 3,
+            "eligible_runs": 3,
+            "excluded_runs": 0,
+            "best": {
+              "run_id": "1793238810184",
+              "binary_sha256": "79592a3cbf0c4f9e5411690cd5e369e62b9abdc6991f88b03b0b0d9b42071889",
+              "arm": "candidate",
+              "workload": "point16",
+              "puts_s": 25210.569663333896,
+              "p99_ms": 1.769994,
+              "frontier_mean_ms": 0.02496896130315081,
+              "fdatasync_mean_ms": 0.2778693871214439,
+              "obvious_stall": false,
+              "data_bytes": 409600000,
+              "raw": "rfc-025-v7-signal-taskwork-rerun-20261029-ext4-point16.jsonl",
+              "raw_sha256": "fe461e5c710f2441b9a6fc87fbb9492c83120b063467e20486bc5e63629a6f5f",
+              "manifest": "rfc-025-v7-signal-taskwork-rerun-20261029-ext4-point16-runs.tsv",
+              "pair": 2,
+              "current_cohort": true
+            },
+            "raw_best": {
+              "run_id": "1793238810184",
+              "binary_sha256": "79592a3cbf0c4f9e5411690cd5e369e62b9abdc6991f88b03b0b0d9b42071889",
+              "arm": "candidate",
+              "workload": "point16",
+              "puts_s": 25210.569663333896,
+              "p99_ms": 1.769994,
+              "frontier_mean_ms": 0.02496896130315081,
+              "fdatasync_mean_ms": 0.2778693871214439,
+              "obvious_stall": false,
+              "data_bytes": 409600000,
+              "raw": "rfc-025-v7-signal-taskwork-rerun-20261029-ext4-point16.jsonl",
+              "raw_sha256": "fe461e5c710f2441b9a6fc87fbb9492c83120b063467e20486bc5e63629a6f5f",
+              "manifest": "rfc-025-v7-signal-taskwork-rerun-20261029-ext4-point16-runs.tsv",
+              "pair": 2,
+              "current_cohort": true
+            }
+          }
+        },
+        "ratios": {
+          "throughput": 2.574812179547992,
+          "p99": 0.16296711643901832
+        },
+        "guards": {
+          "available": true,
+          "throughput": true,
+          "p99": true,
+          "identical_data_bytes": true
+        },
+        "passed": true
+      },
+      "batch8": {
+        "arms": {
+          "baseline": {
+            "scored_runs": 3,
+            "eligible_runs": 3,
+            "excluded_runs": 0,
+            "best": {
+              "run_id": "1793239013119",
+              "binary_sha256": "f353022d846530a6754330aaea11f295319ea8f4de20afa09b6d2a3b57b021d8",
+              "arm": "baseline",
+              "workload": "batch8",
+              "puts_s": 394090.55910051666,
+              "p99_ms": 2.940045,
+              "frontier_mean_ms": 0.03361310435301133,
+              "fdatasync_mean_ms": 0.32020110435301136,
+              "obvious_stall": false,
+              "data_bytes": 816021504,
+              "raw": "rfc-025-v7-signal-taskwork-rerun-20261029-ext4-batch8.jsonl",
+              "raw_sha256": "ad036b46e42265b8ee92dff5989d5b28de01ee3ceacec974ee7a8ba2c9bf92e7",
+              "manifest": "rfc-025-v7-signal-taskwork-rerun-20261029-ext4-batch8-runs.tsv",
+              "pair": 1,
+              "current_cohort": true
+            },
+            "raw_best": {
+              "run_id": "1793239013119",
+              "binary_sha256": "f353022d846530a6754330aaea11f295319ea8f4de20afa09b6d2a3b57b021d8",
+              "arm": "baseline",
+              "workload": "batch8",
+              "puts_s": 394090.55910051666,
+              "p99_ms": 2.940045,
+              "frontier_mean_ms": 0.03361310435301133,
+              "fdatasync_mean_ms": 0.32020110435301136,
+              "obvious_stall": false,
+              "data_bytes": 816021504,
+              "raw": "rfc-025-v7-signal-taskwork-rerun-20261029-ext4-batch8.jsonl",
+              "raw_sha256": "ad036b46e42265b8ee92dff5989d5b28de01ee3ceacec974ee7a8ba2c9bf92e7",
+              "manifest": "rfc-025-v7-signal-taskwork-rerun-20261029-ext4-batch8-runs.tsv",
+              "pair": 1,
+              "current_cohort": true
+            }
+          },
+          "candidate": {
+            "scored_runs": 3,
+            "eligible_runs": 3,
+            "excluded_runs": 0,
+            "best": {
+              "run_id": "1793239099760",
+              "binary_sha256": "79592a3cbf0c4f9e5411690cd5e369e62b9abdc6991f88b03b0b0d9b42071889",
+              "arm": "candidate",
+              "workload": "batch8",
+              "puts_s": 412847.2966001031,
+              "p99_ms": 2.611874,
+              "frontier_mean_ms": 0.03660037635054022,
+              "fdatasync_mean_ms": 0.31153657563025206,
+              "obvious_stall": false,
+              "data_bytes": 816021504,
+              "raw": "rfc-025-v7-signal-taskwork-rerun-20261029-ext4-batch8.jsonl",
+              "raw_sha256": "8f81c37fd02e22a7835c3dc5528c53d8427bd542414b0facc62638f8d72e5a0e",
+              "manifest": "rfc-025-v7-signal-taskwork-rerun-20261029-ext4-batch8-runs.tsv",
+              "pair": 3,
+              "current_cohort": true
+            },
+            "raw_best": {
+              "run_id": "1793239099760",
+              "binary_sha256": "79592a3cbf0c4f9e5411690cd5e369e62b9abdc6991f88b03b0b0d9b42071889",
+              "arm": "candidate",
+              "workload": "batch8",
+              "puts_s": 412847.2966001031,
+              "p99_ms": 2.611874,
+              "frontier_mean_ms": 0.03660037635054022,
+              "fdatasync_mean_ms": 0.31153657563025206,
+              "obvious_stall": false,
+              "data_bytes": 816021504,
+              "raw": "rfc-025-v7-signal-taskwork-rerun-20261029-ext4-batch8.jsonl",
+              "raw_sha256": "8f81c37fd02e22a7835c3dc5528c53d8427bd542414b0facc62638f8d72e5a0e",
+              "manifest": "rfc-025-v7-signal-taskwork-rerun-20261029-ext4-batch8-runs.tsv",
+              "pair": 3,
+              "current_cohort": true
+            }
+          }
+        },
+        "ratios": {
+          "throughput": 1.0475949932482456,
+          "p99": 0.8883789193702817
+        },
+        "guards": {
+          "available": true,
+          "throughput": true,
+          "p99": true,
+          "identical_data_bytes": true
+        },
+        "passed": true
+      },
+      "batch1": {
+        "arms": {
+          "baseline": {
+            "scored_runs": 3,
+            "eligible_runs": 3,
+            "excluded_runs": 0,
+            "best": {
+              "run_id": "1793239353211",
+              "binary_sha256": "f353022d846530a6754330aaea11f295319ea8f4de20afa09b6d2a3b57b021d8",
+              "arm": "baseline",
+              "workload": "batch1",
+              "puts_s": 69533.06632689635,
+              "p99_ms": 1.366788,
+              "frontier_mean_ms": 0.026447920641692976,
+              "fdatasync_mean_ms": 0.3134777971669938,
+              "obvious_stall": false,
+              "data_bytes": 816001024,
+              "raw": "rfc-025-v7-signal-taskwork-rerun-20261029-ext4-batch1.jsonl",
+              "raw_sha256": "684ef26f8726cb9ef00ff757c3377221848ff683eea6bc927e787dc0a1a7e6ff",
+              "manifest": "rfc-025-v7-signal-taskwork-rerun-20261029-ext4-batch1-runs.tsv",
+              "pair": 2,
+              "current_cohort": true
+            },
+            "raw_best": {
+              "run_id": "1793239353211",
+              "binary_sha256": "f353022d846530a6754330aaea11f295319ea8f4de20afa09b6d2a3b57b021d8",
+              "arm": "baseline",
+              "workload": "batch1",
+              "puts_s": 69533.06632689635,
+              "p99_ms": 1.366788,
+              "frontier_mean_ms": 0.026447920641692976,
+              "fdatasync_mean_ms": 0.3134777971669938,
+              "obvious_stall": false,
+              "data_bytes": 816001024,
+              "raw": "rfc-025-v7-signal-taskwork-rerun-20261029-ext4-batch1.jsonl",
+              "raw_sha256": "684ef26f8726cb9ef00ff757c3377221848ff683eea6bc927e787dc0a1a7e6ff",
+              "manifest": "rfc-025-v7-signal-taskwork-rerun-20261029-ext4-batch1-runs.tsv",
+              "pair": 2,
+              "current_cohort": true
+            }
+          },
+          "candidate": {
+            "scored_runs": 3,
+            "eligible_runs": 3,
+            "excluded_runs": 0,
+            "best": {
+              "run_id": "1793239316130",
+              "binary_sha256": "79592a3cbf0c4f9e5411690cd5e369e62b9abdc6991f88b03b0b0d9b42071889",
+              "arm": "candidate",
+              "workload": "batch1",
+              "puts_s": 34439.32462643419,
+              "p99_ms": 10.818438,
+              "frontier_mean_ms": 0.05349689000767984,
+              "fdatasync_mean_ms": 0.9220489633074495,
+              "obvious_stall": false,
+              "data_bytes": 816001024,
+              "raw": "rfc-025-v7-signal-taskwork-rerun-20261029-ext4-batch1.jsonl",
+              "raw_sha256": "ed539889b0c13dfe23c9f5828e31131f6be8738fb1bbc38b3de06b1c2324623e",
+              "manifest": "rfc-025-v7-signal-taskwork-rerun-20261029-ext4-batch1-runs.tsv",
+              "pair": 2,
+              "current_cohort": true
+            },
+            "raw_best": {
+              "run_id": "1793239316130",
+              "binary_sha256": "79592a3cbf0c4f9e5411690cd5e369e62b9abdc6991f88b03b0b0d9b42071889",
+              "arm": "candidate",
+              "workload": "batch1",
+              "puts_s": 34439.32462643419,
+              "p99_ms": 10.818438,
+              "frontier_mean_ms": 0.05349689000767984,
+              "fdatasync_mean_ms": 0.9220489633074495,
+              "obvious_stall": false,
+              "data_bytes": 816001024,
+              "raw": "rfc-025-v7-signal-taskwork-rerun-20261029-ext4-batch1.jsonl",
+              "raw_sha256": "ed539889b0c13dfe23c9f5828e31131f6be8738fb1bbc38b3de06b1c2324623e",
+              "manifest": "rfc-025-v7-signal-taskwork-rerun-20261029-ext4-batch1-runs.tsv",
+              "pair": 2,
+              "current_cohort": true
+            }
+          }
+        },
+        "ratios": {
+          "throughput": 0.49529420239464655,
+          "p99": 7.9152275261415825
+        },
+        "guards": {
+          "available": true,
+          "throughput": false,
+          "p99": false,
+          "identical_data_bytes": true
+        },
+        "passed": false
+      }
+    },
+    "passed": false
+  },
+  "historical": {
+    "cells": {
+      "batch16": {
+        "arms": {
+          "baseline": {
+            "scored_runs": 40,
+            "eligible_runs": 29,
+            "excluded_runs": 11,
+            "best": {
+              "run_id": "1793172417140",
+              "binary_sha256": "f353022d846530a6754330aaea11f295319ea8f4de20afa09b6d2a3b57b021d8",
+              "arm": "baseline",
+              "workload": "batch16",
+              "puts_s": 606947.5808629282,
+              "p99_ms": 4.065151,
+              "frontier_mean_ms": 0.0992594793621013,
+              "fdatasync_mean_ms": 0.34712752345215764,
+              "obvious_stall": false,
+              "data_bytes": 816054272,
+              "raw": "rfc-025-v7-large-data-lookahead-20261028-ext4-batch16.jsonl",
+              "raw_sha256": "dcf1d592d0671b64a504ff207e4a0090859c3fbc14e4e93f83b92965967b2372",
+              "manifest": "rfc-025-v7-large-data-lookahead-20261028-ext4-batch16-runs.tsv",
+              "pair": 2,
+              "current_cohort": false
+            },
+            "raw_best": {
+              "run_id": "1793172417140",
+              "binary_sha256": "f353022d846530a6754330aaea11f295319ea8f4de20afa09b6d2a3b57b021d8",
+              "arm": "baseline",
+              "workload": "batch16",
+              "puts_s": 606947.5808629282,
+              "p99_ms": 4.065151,
+              "frontier_mean_ms": 0.0992594793621013,
+              "fdatasync_mean_ms": 0.34712752345215764,
+              "obvious_stall": false,
+              "data_bytes": 816054272,
+              "raw": "rfc-025-v7-large-data-lookahead-20261028-ext4-batch16.jsonl",
+              "raw_sha256": "dcf1d592d0671b64a504ff207e4a0090859c3fbc14e4e93f83b92965967b2372",
+              "manifest": "rfc-025-v7-large-data-lookahead-20261028-ext4-batch16-runs.tsv",
+              "pair": 2,
+              "current_cohort": false
+            }
+          },
+          "candidate": {
+            "scored_runs": 13,
+            "eligible_runs": 5,
+            "excluded_runs": 8,
+            "best": {
+              "run_id": "1793236790597",
+              "binary_sha256": "79592a3cbf0c4f9e5411690cd5e369e62b9abdc6991f88b03b0b0d9b42071889",
+              "arm": "candidate",
+              "workload": "batch16",
+              "puts_s": 540955.8074592007,
+              "p99_ms": 4.260025,
+              "frontier_mean_ms": 0.06345949838709677,
+              "fdatasync_mean_ms": 0.3566099991935484,
+              "obvious_stall": false,
+              "data_bytes": 816054272,
+              "raw": "rfc-025-v7-signal-taskwork-retry-20261029-ext4-batch16.jsonl",
+              "raw_sha256": "0cbcd2188a3e7d17526da3ddc66fc90c32d29b7a55987a7990521550c1f21c4f",
+              "manifest": "rfc-025-v7-signal-taskwork-retry-20261029-ext4-batch16-runs.tsv",
+              "pair": 1,
+              "current_cohort": false
+            },
+            "raw_best": {
+              "run_id": "1793236790597",
+              "binary_sha256": "79592a3cbf0c4f9e5411690cd5e369e62b9abdc6991f88b03b0b0d9b42071889",
+              "arm": "candidate",
+              "workload": "batch16",
+              "puts_s": 540955.8074592007,
+              "p99_ms": 4.260025,
+              "frontier_mean_ms": 0.06345949838709677,
+              "fdatasync_mean_ms": 0.3566099991935484,
+              "obvious_stall": false,
+              "data_bytes": 816054272,
+              "raw": "rfc-025-v7-signal-taskwork-retry-20261029-ext4-batch16.jsonl",
+              "raw_sha256": "0cbcd2188a3e7d17526da3ddc66fc90c32d29b7a55987a7990521550c1f21c4f",
+              "manifest": "rfc-025-v7-signal-taskwork-retry-20261029-ext4-batch16-runs.tsv",
+              "pair": 1,
+              "current_cohort": false
+            }
+          }
+        },
+        "ratios": {
+          "throughput": 0.8912726972073872,
+          "p99": 1.047937702683123
+        },
+        "guards": {
+          "available": true,
+          "throughput": false,
+          "p99": true,
+          "identical_data_bytes": true
+        },
+        "passed": false
+      },
+      "point8": {
+        "arms": {
+          "baseline": {
+            "scored_runs": 35,
+            "eligible_runs": 35,
+            "excluded_runs": 0,
+            "best": {
+              "run_id": "1793238101658",
+              "binary_sha256": "f353022d846530a6754330aaea11f295319ea8f4de20afa09b6d2a3b57b021d8",
+              "arm": "baseline",
+              "workload": "point8",
+              "puts_s": 16749.488832776868,
+              "p99_ms": 1.155587,
+              "frontier_mean_ms": 0.01628885579047018,
+              "fdatasync_mean_ms": 0.2480724091984853,
+              "obvious_stall": false,
+              "data_bytes": 409600000,
+              "raw": "rfc-025-v7-signal-taskwork-rerun-20261029-ext4-point8-confirm.jsonl",
+              "raw_sha256": "4dc3164f73aeefead1efe45f1244b87db38cf6278f4f3701426d3d4dc09c793a",
+              "manifest": "rfc-025-v7-signal-taskwork-rerun-20261029-ext4-point8-confirm-runs.tsv",
+              "pair": 2,
+              "current_cohort": true
+            },
+            "raw_best": {
+              "run_id": "1793238101658",
+              "binary_sha256": "f353022d846530a6754330aaea11f295319ea8f4de20afa09b6d2a3b57b021d8",
+              "arm": "baseline",
+              "workload": "point8",
+              "puts_s": 16749.488832776868,
+              "p99_ms": 1.155587,
+              "frontier_mean_ms": 0.01628885579047018,
+              "fdatasync_mean_ms": 0.2480724091984853,
+              "obvious_stall": false,
+              "data_bytes": 409600000,
+              "raw": "rfc-025-v7-signal-taskwork-rerun-20261029-ext4-point8-confirm.jsonl",
+              "raw_sha256": "4dc3164f73aeefead1efe45f1244b87db38cf6278f4f3701426d3d4dc09c793a",
+              "manifest": "rfc-025-v7-signal-taskwork-rerun-20261029-ext4-point8-confirm-runs.tsv",
+              "pair": 2,
+              "current_cohort": true
+            }
+          },
+          "candidate": {
+            "scored_runs": 10,
+            "eligible_runs": 10,
+            "excluded_runs": 0,
+            "best": {
+              "run_id": "1793238080478",
+              "binary_sha256": "79592a3cbf0c4f9e5411690cd5e369e62b9abdc6991f88b03b0b0d9b42071889",
+              "arm": "candidate",
+              "workload": "point8",
+              "puts_s": 16515.438675840087,
+              "p99_ms": 1.119237,
+              "frontier_mean_ms": 0.016261324846287246,
+              "fdatasync_mean_ms": 0.2483005039413527,
+              "obvious_stall": false,
+              "data_bytes": 409600000,
+              "raw": "rfc-025-v7-signal-taskwork-rerun-20261029-ext4-point8-confirm.jsonl",
+              "raw_sha256": "fd1c359acda2a1f2c16ad426c627d1006d3b43381c05894b5ade5b9c240eb539",
+              "manifest": "rfc-025-v7-signal-taskwork-rerun-20261029-ext4-point8-confirm-runs.tsv",
+              "pair": 2,
+              "current_cohort": true
+            },
+            "raw_best": {
+              "run_id": "1793238080478",
+              "binary_sha256": "79592a3cbf0c4f9e5411690cd5e369e62b9abdc6991f88b03b0b0d9b42071889",
+              "arm": "candidate",
+              "workload": "point8",
+              "puts_s": 16515.438675840087,
+              "p99_ms": 1.119237,
+              "frontier_mean_ms": 0.016261324846287246,
+              "fdatasync_mean_ms": 0.2483005039413527,
+              "obvious_stall": false,
+              "data_bytes": 409600000,
+              "raw": "rfc-025-v7-signal-taskwork-rerun-20261029-ext4-point8-confirm.jsonl",
+              "raw_sha256": "fd1c359acda2a1f2c16ad426c627d1006d3b43381c05894b5ade5b9c240eb539",
+              "manifest": "rfc-025-v7-signal-taskwork-rerun-20261029-ext4-point8-confirm-runs.tsv",
+              "pair": 2,
+              "current_cohort": true
+            }
+          }
+        },
+        "ratios": {
+          "throughput": 0.9860264298646075,
+          "p99": 0.9685441251935165
+        },
+        "guards": {
+          "available": true,
+          "throughput": false,
+          "p99": true,
+          "identical_data_bytes": true
+        },
+        "passed": false
+      },
+      "point1": {
+        "arms": {
+          "baseline": {
+            "scored_runs": 9,
+            "eligible_runs": 9,
+            "excluded_runs": 0,
+            "best": {
+              "run_id": "1793238590487",
+              "binary_sha256": "f353022d846530a6754330aaea11f295319ea8f4de20afa09b6d2a3b57b021d8",
+              "arm": "baseline",
+              "workload": "point1",
+              "puts_s": 2011.9733337883076,
+              "p99_ms": 2.42169,
+              "frontier_mean_ms": 0.017580677500000003,
+              "fdatasync_mean_ms": 0.244650469,
+              "obvious_stall": false,
+              "data_bytes": 81920000,
+              "raw": "rfc-025-v7-signal-taskwork-rerun-20261029-ext4-point1.jsonl",
+              "raw_sha256": "219aa6f0f9e11ee831a5ea8b309209e9d550c02230516e107bbeb7817b791683",
+              "manifest": "rfc-025-v7-signal-taskwork-rerun-20261029-ext4-point1-runs.tsv",
+              "pair": 3,
+              "current_cohort": true
+            },
+            "raw_best": {
+              "run_id": "1793238590487",
+              "binary_sha256": "f353022d846530a6754330aaea11f295319ea8f4de20afa09b6d2a3b57b021d8",
+              "arm": "baseline",
+              "workload": "point1",
+              "puts_s": 2011.9733337883076,
+              "p99_ms": 2.42169,
+              "frontier_mean_ms": 0.017580677500000003,
+              "fdatasync_mean_ms": 0.244650469,
+              "obvious_stall": false,
+              "data_bytes": 81920000,
+              "raw": "rfc-025-v7-signal-taskwork-rerun-20261029-ext4-point1.jsonl",
+              "raw_sha256": "219aa6f0f9e11ee831a5ea8b309209e9d550c02230516e107bbeb7817b791683",
+              "manifest": "rfc-025-v7-signal-taskwork-rerun-20261029-ext4-point1-runs.tsv",
+              "pair": 3,
+              "current_cohort": true
+            }
+          },
+          "candidate": {
+            "scored_runs": 6,
+            "eligible_runs": 6,
+            "excluded_runs": 0,
+            "best": {
+              "run_id": "1793238515407",
+              "binary_sha256": "79592a3cbf0c4f9e5411690cd5e369e62b9abdc6991f88b03b0b0d9b42071889",
+              "arm": "candidate",
+              "workload": "point1",
+              "puts_s": 2343.4198604746935,
+              "p99_ms": 0.735291,
+              "frontier_mean_ms": 0.017597649,
+              "fdatasync_mean_ms": 0.24304406795,
+              "obvious_stall": false,
+              "data_bytes": 81920000,
+              "raw": "rfc-025-v7-signal-taskwork-rerun-20261029-ext4-point1.jsonl",
+              "raw_sha256": "f80686eab5f94553ef47b61d790ea20c4d8506f6bcf3bbb2f6127d30b1e9efa1",
+              "manifest": "rfc-025-v7-signal-taskwork-rerun-20261029-ext4-point1-runs.tsv",
+              "pair": 1,
+              "current_cohort": true
+            },
+            "raw_best": {
+              "run_id": "1793238515407",
+              "binary_sha256": "79592a3cbf0c4f9e5411690cd5e369e62b9abdc6991f88b03b0b0d9b42071889",
+              "arm": "candidate",
+              "workload": "point1",
+              "puts_s": 2343.4198604746935,
+              "p99_ms": 0.735291,
+              "frontier_mean_ms": 0.017597649,
+              "fdatasync_mean_ms": 0.24304406795,
+              "obvious_stall": false,
+              "data_bytes": 81920000,
+              "raw": "rfc-025-v7-signal-taskwork-rerun-20261029-ext4-point1.jsonl",
+              "raw_sha256": "f80686eab5f94553ef47b61d790ea20c4d8506f6bcf3bbb2f6127d30b1e9efa1",
+              "manifest": "rfc-025-v7-signal-taskwork-rerun-20261029-ext4-point1-runs.tsv",
+              "pair": 1,
+              "current_cohort": true
+            }
+          }
+        },
+        "ratios": {
+          "throughput": 1.164737037574107,
+          "p99": 0.3036272190082133
+        },
+        "guards": {
+          "available": true,
+          "throughput": true,
+          "p99": true,
+          "identical_data_bytes": true
+        },
+        "passed": true
+      },
+      "point16": {
+        "arms": {
+          "baseline": {
+            "scored_runs": 9,
+            "eligible_runs": 9,
+            "excluded_runs": 0,
+            "best": {
+              "run_id": "1793197101391",
+              "binary_sha256": "f353022d846530a6754330aaea11f295319ea8f4de20afa09b6d2a3b57b021d8",
+              "arm": "baseline",
+              "workload": "point16",
+              "puts_s": 20478.85137038852,
+              "p99_ms": 3.520863,
+              "frontier_mean_ms": 0.05766254628086653,
+              "fdatasync_mean_ms": 0.30719109225874863,
+              "obvious_stall": false,
+              "data_bytes": 409600000,
+              "raw": "rfc-025-v7-small-completion-priority-20261028-ext4-point16.jsonl",
+              "raw_sha256": "6e5bf8352a32e394daff055f298dcb86efbaa5dbeb8c82dc29cd0435b0126f62",
+              "manifest": "rfc-025-v7-small-completion-priority-20261028-ext4-point16-runs.tsv",
+              "pair": 1,
+              "current_cohort": false
+            },
+            "raw_best": {
+              "run_id": "1793197101391",
+              "binary_sha256": "f353022d846530a6754330aaea11f295319ea8f4de20afa09b6d2a3b57b021d8",
+              "arm": "baseline",
+              "workload": "point16",
+              "puts_s": 20478.85137038852,
+              "p99_ms": 3.520863,
+              "frontier_mean_ms": 0.05766254628086653,
+              "fdatasync_mean_ms": 0.30719109225874863,
+              "obvious_stall": false,
+              "data_bytes": 409600000,
+              "raw": "rfc-025-v7-small-completion-priority-20261028-ext4-point16.jsonl",
+              "raw_sha256": "6e5bf8352a32e394daff055f298dcb86efbaa5dbeb8c82dc29cd0435b0126f62",
+              "manifest": "rfc-025-v7-small-completion-priority-20261028-ext4-point16-runs.tsv",
+              "pair": 1,
+              "current_cohort": false
+            }
+          },
+          "candidate": {
+            "scored_runs": 6,
+            "eligible_runs": 6,
+            "excluded_runs": 0,
+            "best": {
+              "run_id": "1793238810184",
+              "binary_sha256": "79592a3cbf0c4f9e5411690cd5e369e62b9abdc6991f88b03b0b0d9b42071889",
+              "arm": "candidate",
+              "workload": "point16",
+              "puts_s": 25210.569663333896,
+              "p99_ms": 1.769994,
+              "frontier_mean_ms": 0.02496896130315081,
+              "fdatasync_mean_ms": 0.2778693871214439,
+              "obvious_stall": false,
+              "data_bytes": 409600000,
+              "raw": "rfc-025-v7-signal-taskwork-rerun-20261029-ext4-point16.jsonl",
+              "raw_sha256": "fe461e5c710f2441b9a6fc87fbb9492c83120b063467e20486bc5e63629a6f5f",
+              "manifest": "rfc-025-v7-signal-taskwork-rerun-20261029-ext4-point16-runs.tsv",
+              "pair": 2,
+              "current_cohort": true
+            },
+            "raw_best": {
+              "run_id": "1793238810184",
+              "binary_sha256": "79592a3cbf0c4f9e5411690cd5e369e62b9abdc6991f88b03b0b0d9b42071889",
+              "arm": "candidate",
+              "workload": "point16",
+              "puts_s": 25210.569663333896,
+              "p99_ms": 1.769994,
+              "frontier_mean_ms": 0.02496896130315081,
+              "fdatasync_mean_ms": 0.2778693871214439,
+              "obvious_stall": false,
+              "data_bytes": 409600000,
+              "raw": "rfc-025-v7-signal-taskwork-rerun-20261029-ext4-point16.jsonl",
+              "raw_sha256": "fe461e5c710f2441b9a6fc87fbb9492c83120b063467e20486bc5e63629a6f5f",
+              "manifest": "rfc-025-v7-signal-taskwork-rerun-20261029-ext4-point16-runs.tsv",
+              "pair": 2,
+              "current_cohort": true
+            }
+          }
+        },
+        "ratios": {
+          "throughput": 1.2310538910296125,
+          "p99": 0.5027159534466408
+        },
+        "guards": {
+          "available": true,
+          "throughput": true,
+          "p99": true,
+          "identical_data_bytes": true
+        },
+        "passed": true
+      },
+      "batch8": {
+        "arms": {
+          "baseline": {
+            "scored_runs": 30,
+            "eligible_runs": 27,
+            "excluded_runs": 3,
+            "best": {
+              "run_id": "1793233037541",
+              "binary_sha256": "f353022d846530a6754330aaea11f295319ea8f4de20afa09b6d2a3b57b021d8",
+              "arm": "baseline",
+              "workload": "batch8",
+              "puts_s": 478797.76042692293,
+              "p99_ms": 2.653265,
+              "frontier_mean_ms": 0.02211912395632627,
+              "fdatasync_mean_ms": 0.31482543481053304,
+              "obvious_stall": false,
+              "data_bytes": 816021504,
+              "raw": "rfc-025-v7-signal-taskwork-20261029-ext4-batch8.jsonl",
+              "raw_sha256": "53c4af185fcf1d14ab016540fabe14b7b4c6a094a19e212bf916ab5c1662f6b7",
+              "manifest": "rfc-025-v7-signal-taskwork-20261029-ext4-batch8-runs.tsv",
+              "pair": 3,
+              "current_cohort": false
+            },
+            "raw_best": {
+              "run_id": "1793233037541",
+              "binary_sha256": "f353022d846530a6754330aaea11f295319ea8f4de20afa09b6d2a3b57b021d8",
+              "arm": "baseline",
+              "workload": "batch8",
+              "puts_s": 478797.76042692293,
+              "p99_ms": 2.653265,
+              "frontier_mean_ms": 0.02211912395632627,
+              "fdatasync_mean_ms": 0.31482543481053304,
+              "obvious_stall": false,
+              "data_bytes": 816021504,
+              "raw": "rfc-025-v7-signal-taskwork-20261029-ext4-batch8.jsonl",
+              "raw_sha256": "53c4af185fcf1d14ab016540fabe14b7b4c6a094a19e212bf916ab5c1662f6b7",
+              "manifest": "rfc-025-v7-signal-taskwork-20261029-ext4-batch8-runs.tsv",
+              "pair": 3,
+              "current_cohort": false
+            }
+          },
+          "candidate": {
+            "scored_runs": 6,
+            "eligible_runs": 6,
+            "excluded_runs": 0,
+            "best": {
+              "run_id": "1793239099760",
+              "binary_sha256": "79592a3cbf0c4f9e5411690cd5e369e62b9abdc6991f88b03b0b0d9b42071889",
+              "arm": "candidate",
+              "workload": "batch8",
+              "puts_s": 412847.2966001031,
+              "p99_ms": 2.611874,
+              "frontier_mean_ms": 0.03660037635054022,
+              "fdatasync_mean_ms": 0.31153657563025206,
+              "obvious_stall": false,
+              "data_bytes": 816021504,
+              "raw": "rfc-025-v7-signal-taskwork-rerun-20261029-ext4-batch8.jsonl",
+              "raw_sha256": "8f81c37fd02e22a7835c3dc5528c53d8427bd542414b0facc62638f8d72e5a0e",
+              "manifest": "rfc-025-v7-signal-taskwork-rerun-20261029-ext4-batch8-runs.tsv",
+              "pair": 3,
+              "current_cohort": true
+            },
+            "raw_best": {
+              "run_id": "1793239099760",
+              "binary_sha256": "79592a3cbf0c4f9e5411690cd5e369e62b9abdc6991f88b03b0b0d9b42071889",
+              "arm": "candidate",
+              "workload": "batch8",
+              "puts_s": 412847.2966001031,
+              "p99_ms": 2.611874,
+              "frontier_mean_ms": 0.03660037635054022,
+              "fdatasync_mean_ms": 0.31153657563025206,
+              "obvious_stall": false,
+              "data_bytes": 816021504,
+              "raw": "rfc-025-v7-signal-taskwork-rerun-20261029-ext4-batch8.jsonl",
+              "raw_sha256": "8f81c37fd02e22a7835c3dc5528c53d8427bd542414b0facc62638f8d72e5a0e",
+              "manifest": "rfc-025-v7-signal-taskwork-rerun-20261029-ext4-batch8-runs.tsv",
+              "pair": 3,
+              "current_cohort": true
+            }
+          }
+        },
+        "ratios": {
+          "throughput": 0.8622582031962416,
+          "p99": 0.9843999751249873
+        },
+        "guards": {
+          "available": true,
+          "throughput": false,
+          "p99": true,
+          "identical_data_bytes": true
+        },
+        "passed": false
+      },
+      "batch1": {
+        "arms": {
+          "baseline": {
+            "scored_runs": 24,
+            "eligible_runs": 24,
+            "excluded_runs": 0,
+            "best": {
+              "run_id": "1793153668825",
+              "binary_sha256": "f353022d846530a6754330aaea11f295319ea8f4de20afa09b6d2a3b57b021d8",
+              "arm": "baseline",
+              "workload": "batch1",
+              "puts_s": 72647.1800513317,
+              "p99_ms": 1.372848,
+              "frontier_mean_ms": 0.02308695545695025,
+              "fdatasync_mean_ms": 0.3151055142076969,
+              "obvious_stall": false,
+              "data_bytes": 816001024,
+              "raw": "rfc-025-v7-sync-priority-extents-20261028-ext4-batch1.jsonl",
+              "raw_sha256": "975c7e6c267ad3960eec7932abbf85d11f040a1191577fdb938c24ba6808cd0d",
+              "manifest": "rfc-025-v7-sync-priority-extents-20261028-ext4-batch1-runs.tsv",
+              "pair": 3,
+              "current_cohort": false
+            },
+            "raw_best": {
+              "run_id": "1793153668825",
+              "binary_sha256": "f353022d846530a6754330aaea11f295319ea8f4de20afa09b6d2a3b57b021d8",
+              "arm": "baseline",
+              "workload": "batch1",
+              "puts_s": 72647.1800513317,
+              "p99_ms": 1.372848,
+              "frontier_mean_ms": 0.02308695545695025,
+              "fdatasync_mean_ms": 0.3151055142076969,
+              "obvious_stall": false,
+              "data_bytes": 816001024,
+              "raw": "rfc-025-v7-sync-priority-extents-20261028-ext4-batch1.jsonl",
+              "raw_sha256": "975c7e6c267ad3960eec7932abbf85d11f040a1191577fdb938c24ba6808cd0d",
+              "manifest": "rfc-025-v7-sync-priority-extents-20261028-ext4-batch1-runs.tsv",
+              "pair": 3,
+              "current_cohort": false
+            }
+          },
+          "candidate": {
+            "scored_runs": 6,
+            "eligible_runs": 6,
+            "excluded_runs": 0,
+            "best": {
+              "run_id": "1793233377903",
+              "binary_sha256": "79592a3cbf0c4f9e5411690cd5e369e62b9abdc6991f88b03b0b0d9b42071889",
+              "arm": "candidate",
+              "workload": "batch1",
+              "puts_s": 67175.59324239552,
+              "p99_ms": 1.331348,
+              "frontier_mean_ms": 0.027703960150183463,
+              "fdatasync_mean_ms": 0.3107153402167421,
+              "obvious_stall": false,
+              "data_bytes": 816001024,
+              "raw": "rfc-025-v7-signal-taskwork-20261029-ext4-batch1.jsonl",
+              "raw_sha256": "e698e86c744b33327c2dc4982c058ae8c544c8a66d436a94ca389835f79f7dcd",
+              "manifest": "rfc-025-v7-signal-taskwork-20261029-ext4-batch1-runs.tsv",
+              "pair": 2,
+              "current_cohort": false
+            },
+            "raw_best": {
+              "run_id": "1793233377903",
+              "binary_sha256": "79592a3cbf0c4f9e5411690cd5e369e62b9abdc6991f88b03b0b0d9b42071889",
+              "arm": "candidate",
+              "workload": "batch1",
+              "puts_s": 67175.59324239552,
+              "p99_ms": 1.331348,
+              "frontier_mean_ms": 0.027703960150183463,
+              "fdatasync_mean_ms": 0.3107153402167421,
+              "obvious_stall": false,
+              "data_bytes": 816001024,
+              "raw": "rfc-025-v7-signal-taskwork-20261029-ext4-batch1.jsonl",
+              "raw_sha256": "e698e86c744b33327c2dc4982c058ae8c544c8a66d436a94ca389835f79f7dcd",
+              "manifest": "rfc-025-v7-signal-taskwork-20261029-ext4-batch1-runs.tsv",
+              "pair": 2,
+              "current_cohort": false
+            }
+          }
+        },
+        "ratios": {
+          "throughput": 0.9246827364108282,
+          "p99": 0.969770870482384
+        },
+        "guards": {
+          "available": true,
+          "throughput": false,
+          "p99": true,
+          "identical_data_bytes": true
+        },
+        "passed": false
+      }
+    },
+    "passed": false
+  },
+  "unique_scored_records": 194,
+  "input_index_sha256": "b5b3dd2f0d957d3633bf867501ca7e858a7d961e96d6e027c1e31b4f3a8258ee",
+  "maintainer_assessment_sha256": "53a961cfd8aa46a26d5ebd9549784f5f39cb2c743c1bf7004f4f8825e3ab61dc",
+  "analyzer_sha256": "58ab357804eaec66794d867da49130469d5b1184d20d433e0537ac5ea825fab3"
+}

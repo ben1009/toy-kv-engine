@@ -1,0 +1,151 @@
+diff --git a/kv-engine/src/wal/parallel/worker.rs b/kv-engine/src/wal/parallel/worker.rs
+index c0569297..2fb93be9 100644
+--- a/kv-engine/src/wal/parallel/worker.rs
++++ b/kv-engine/src/wal/parallel/worker.rs
+@@ -1600,8 +1600,9 @@ impl<B: WorkerBuffer> IoWorker<B> {
+-                // This thread creates, submits to, and reaps the ring. Let
+-                // completion task work run at kernel transitions instead of
+-                // interrupting userspace, and advertise the single issuer.
+-                // Keep the existing setup on kernels without these flags.
+-                let configured_ring = io_uring::IoUring::builder()
+-                    .setup_coop_taskrun()
+-                    .setup_single_issuer()
+-                    .build(RING_SIZE as u32);
++                // This worker is the sole ring issuer. V7 extent runtimes
++                // use ordinary completion notification; other runtimes keep
++                // cooperative task work. Preserve the older-kernel fallback.
++                let mut builder = io_uring::IoUring::builder();
++                builder.setup_single_issuer();
++                if async_write_min_bytes.is_none() {
++                    builder.setup_coop_taskrun();
++                }
++                let configured_ring = builder.build(RING_SIZE as u32);
+@@ -2469 +2470,5 @@ mod tests {
+-    fn check_io_worker_writes_groups(async_write_min_bytes: Option<usize>) {
++    fn check_io_worker_writes_groups(
++        async_write_min_bytes: Option<usize>,
++        groups: usize,
++        include_large: bool,
++    ) {
+@@ -2475 +2480,8 @@ mod tests {
+-        let first_len = async_write_min_bytes.map_or(4096, |minimum| minimum + 4096);
++        let large_len = if include_large {
++            async_write_min_bytes.map_or(4096, |minimum| minimum + 4096)
++        } else {
++            4096
++        };
++        let lengths = (0..groups)
++            .map(|index| if index % 2 == 0 { large_len } else { 4096 })
++            .collect::<Vec<_>>();
+@@ -2478 +2490 @@ mod tests {
+-            .set_len(first_len as u64 + 4096)
++            .set_len(lengths.iter().sum::<usize>() as u64)
+@@ -2495,18 +2507,14 @@ mod tests {
+-
+-        let mut first_buffer = DirectBuf::new(first_len);
+-        first_buffer.as_mut_slice().fill(0xa1);
+-        first_buffer.set_len(first_len);
+-        let mut second_buffer = DirectBuf::new(4096);
+-        second_buffer.as_mut_slice().fill(0xb2);
+-        second_buffer.set_len(4096);
+-        worker
+-            .submit_group(
+-                WriteGroup::new(0..1, vec![WriteBuffer::new(first_buffer, 0, first_len)])
+-                    .expect("build first group"),
+-            )
+-            .expect("submit first group");
+-        worker
+-            .submit_group(
+-                WriteGroup::new(
+-                    1..2,
+-                    vec![WriteBuffer::new(second_buffer, first_len as u64, 4096)],
++        let results = worker.completions().clone();
++        let mut offset = 0;
++        for (index, len) in lengths.iter().copied().enumerate() {
++            let mut buffer = DirectBuf::new(len);
++            buffer.as_mut_slice().fill(index as u8);
++            buffer.set_len(len);
++            let ticket = index as u64;
++            worker
++                .submit_group(
++                    WriteGroup::new(
++                        ticket..ticket + 1,
++                        vec![WriteBuffer::new(buffer, offset, len)],
++                    )
++                    .expect("build group"),
+@@ -2514,20 +2522,5 @@ mod tests {
+-                .expect("build second group"),
+-            )
+-            .expect("submit second group");
+-
+-        let first_result = worker
+-            .completions()
+-            .recv_timeout(Duration::from_secs(5))
+-            .expect("first group completion");
+-        let second_result = worker
+-            .completions()
+-            .recv_timeout(Duration::from_secs(5))
+-            .expect("second group completion");
+-        assert_eq!(first_result.error, None);
+-        assert_eq!(second_result.error, None);
+-        let mut completed = [
+-            (first_result.tickets.start, first_result.write_bytes),
+-            (second_result.tickets.start, second_result.write_bytes),
+-        ];
+-        completed.sort_unstable();
+-        assert_eq!(completed, [(0, first_len as u64), (1, 4096)]);
++                .expect("submit group");
++            offset += len as u64;
++        }
++        // Close with work queued and more groups than the in-flight limit.
++        // Completion delivery and owned-buffer retirement must keep progressing.
+@@ -2535 +2528,19 @@ mod tests {
+-
++        let mut completed = Vec::new();
++        for _ in 0..groups {
++            let result = results
++                .recv_timeout(Duration::from_secs(5))
++                .expect("group completion");
++            assert_eq!(result.error, None);
++            assert_eq!(result.tickets.end, result.tickets.start + 1);
++            completed.push((result.tickets.start, result.write_bytes));
++        }
++        completed.sort_unstable();
++        assert_eq!(
++            completed,
++            lengths
++                .iter()
++                .enumerate()
++                .map(|(i, n)| (i as u64, *n as u64))
++                .collect::<Vec<_>>()
++        );
++        assert!(results.try_recv().is_err());
+@@ -2537,2 +2548,10 @@ mod tests {
+-        assert!(bytes[..first_len].iter().all(|byte| *byte == 0xa1));
+-        assert!(bytes[first_len..].iter().all(|byte| *byte == 0xb2));
++        assert_eq!(bytes.len(), offset as usize);
++        let mut start = 0;
++        for (index, len) in lengths.into_iter().enumerate() {
++            assert!(
++                bytes[start..start + len]
++                    .iter()
++                    .all(|byte| *byte == index as u8)
++            );
++            start += len;
++        }
+@@ -2543 +2562 @@ mod tests {
+-        check_io_worker_writes_groups(None);
++        check_io_worker_writes_groups(None, 2, true);
+@@ -2548 +2567,11 @@ mod tests {
+-        check_io_worker_writes_groups(Some(64 * 1024));
++        check_io_worker_writes_groups(Some(64 * 1024), 2, true);
++    }
++
++    #[test]
++    fn io_worker_retires_mixed_async_waves_and_drains_close() {
++        check_io_worker_writes_groups(Some(64 * 1024), 3 * super::MAX_INFLIGHT_GROUPS, true);
++    }
++
++    #[test]
++    fn io_worker_retires_small_only_waves_and_drains_close() {
++        check_io_worker_writes_groups(Some(64 * 1024), 3 * super::MAX_INFLIGHT_GROUPS, false);

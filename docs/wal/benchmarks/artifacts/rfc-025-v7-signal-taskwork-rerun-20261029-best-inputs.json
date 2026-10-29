@@ -1,0 +1,374 @@
+{
+  "selection": "Frozen source list of saved matrix captures containing scored runs of the exact two binaries. The analyzer further requires the same workload configuration.",
+  "sources": [
+    {
+      "matrix": "rfc-025-v7-async-pool-limits-20261028-matrix.json",
+      "matrix_sha256": "f895590b1b77c161179695a502f680567c959f7c942b71d6a1215fc063c12d10",
+      "cell": "ext4-batch16",
+      "manifest": "rfc-025-v7-async-pool-limits-20261028-ext4-batch16-runs.tsv",
+      "manifest_sha256": "70837169953d837e58a176faf1a579daefe8252bebe036586361befc5c6a35f9",
+      "raw": "rfc-025-v7-async-pool-limits-20261028-ext4-batch16.jsonl",
+      "raw_sha256": "ad7cb3c883e8175796ce646cd4a126b6a2c969b247a1bdd0b990d48837efb9b2"
+    },
+    {
+      "matrix": "rfc-025-v7-async-pool-limits-20261028-matrix.json",
+      "matrix_sha256": "f895590b1b77c161179695a502f680567c959f7c942b71d6a1215fc063c12d10",
+      "cell": "ext4-batch8",
+      "manifest": "rfc-025-v7-async-pool-limits-20261028-ext4-batch8-runs.tsv",
+      "manifest_sha256": "55542c10865956ad690702da14b5353c5025c62212e55c78f21a65a2be1b4b9c",
+      "raw": "rfc-025-v7-async-pool-limits-20261028-ext4-batch8.jsonl",
+      "raw_sha256": "bf3839665624cc4f3da237b135e49a468c35fca681105f5497518071fac5527a"
+    },
+    {
+      "matrix": "rfc-025-v7-async-pool-limits-20261028-matrix.json",
+      "matrix_sha256": "f895590b1b77c161179695a502f680567c959f7c942b71d6a1215fc063c12d10",
+      "cell": "ext4-point8",
+      "manifest": "rfc-025-v7-async-pool-limits-20261028-ext4-point8-runs.tsv",
+      "manifest_sha256": "03414b7f76a7736227ebf86e3a2ea9b97b832c6eca83019a302cf1e4c00b71aa",
+      "raw": "rfc-025-v7-async-pool-limits-20261028-ext4-point8.jsonl",
+      "raw_sha256": "5721147ef3ab77ca6395906e1011eed35bfc0e3151eea102d235990e84e3950e"
+    },
+    {
+      "matrix": "rfc-025-v7-async-pool-limits-20261028-matrix.json",
+      "matrix_sha256": "f895590b1b77c161179695a502f680567c959f7c942b71d6a1215fc063c12d10",
+      "cell": "ext4-batch1",
+      "manifest": "rfc-025-v7-async-pool-limits-20261028-ext4-batch1-runs.tsv",
+      "manifest_sha256": "5c4a8496949c2917b538ff344089f7098b99fa2b7be2e304b6fc3f82fc17994b",
+      "raw": "rfc-025-v7-async-pool-limits-20261028-ext4-batch1.jsonl",
+      "raw_sha256": "77b9291296ace31f5a5d9e539427028fa05b915043f3ea59dbb4d8b3e029df26"
+    },
+    {
+      "matrix": "rfc-025-v7-large-data-async-dispatch-20261027-matrix.json",
+      "matrix_sha256": "56884b9d04f843ea839bf4e4207b9f42494c30444869be53a3a493ac0c24f807",
+      "cell": "ext4-batch16",
+      "manifest": "rfc-025-v7-large-data-async-dispatch-20261027-ext4-batch16-runs.tsv",
+      "manifest_sha256": "d98adf800b9e69509485ceea50290bcbea6d88498ff4d89c5ba46590b6c5cf9d",
+      "raw": "rfc-025-v7-large-data-async-dispatch-20261027-ext4-batch16.jsonl",
+      "raw_sha256": "45fc3ec30e6ed82866064e16c6ee09fa89f3f519d0c5460b525782ab774021c1"
+    },
+    {
+      "matrix": "rfc-025-v7-large-data-lookahead-20261028-matrix.json",
+      "matrix_sha256": "bb8fb2644bcced9f08718377f42f66a22341b51c7d97134c5a53729440c43df7",
+      "cell": "ext4-batch8",
+      "manifest": "rfc-025-v7-large-data-lookahead-20261028-ext4-batch8-runs.tsv",
+      "manifest_sha256": "6b059d3bfc5035affe02d99836bd4104dc49060ce78bb211014944929d1271a3",
+      "raw": "rfc-025-v7-large-data-lookahead-20261028-ext4-batch8.jsonl",
+      "raw_sha256": "34ae3461eff8f15dc2864d41cde6cba1fafaf40890ede710a1605d17e6acadc5"
+    },
+    {
+      "matrix": "rfc-025-v7-large-data-lookahead-20261028-matrix.json",
+      "matrix_sha256": "bb8fb2644bcced9f08718377f42f66a22341b51c7d97134c5a53729440c43df7",
+      "cell": "ext4-batch16",
+      "manifest": "rfc-025-v7-large-data-lookahead-20261028-ext4-batch16-runs.tsv",
+      "manifest_sha256": "ec3ba84a2ebe95a8bd8e3e9fef56000844c100f9b4ad6afc9d136ecd11534ac6",
+      "raw": "rfc-025-v7-large-data-lookahead-20261028-ext4-batch16.jsonl",
+      "raw_sha256": "b8ab2b5770290bbf3b4ee45baf516346bef63a5569f603ab574b0c5c28036d6f"
+    },
+    {
+      "matrix": "rfc-025-v7-large-data-lookahead-20261028-matrix.json",
+      "matrix_sha256": "bb8fb2644bcced9f08718377f42f66a22341b51c7d97134c5a53729440c43df7",
+      "cell": "ext4-point8",
+      "manifest": "rfc-025-v7-large-data-lookahead-20261028-ext4-point8-runs.tsv",
+      "manifest_sha256": "ff9ba6c9a38bb3d2ca90d31192d9e2168ea5df3463311ce1a767742592c15243",
+      "raw": "rfc-025-v7-large-data-lookahead-20261028-ext4-point8.jsonl",
+      "raw_sha256": "13163951cf3394e532ef798ed29735c8d7dd83cb8cca4122574dfa2b4120f03f"
+    },
+    {
+      "matrix": "rfc-025-v7-large-data-lookahead-20261028-matrix.json",
+      "matrix_sha256": "bb8fb2644bcced9f08718377f42f66a22341b51c7d97134c5a53729440c43df7",
+      "cell": "ext4-batch1",
+      "manifest": "rfc-025-v7-large-data-lookahead-20261028-ext4-batch1-runs.tsv",
+      "manifest_sha256": "fd8fb7ca52bd825ecc68edaef7b3f460029924b8dd05fb688329b62c3734f2f0",
+      "raw": "rfc-025-v7-large-data-lookahead-20261028-ext4-batch1.jsonl",
+      "raw_sha256": "af6270a9bc7ff44c43035e3a773b5e2ef90cb0eef415ff9dfd2ffabe7f89a1e2"
+    },
+    {
+      "matrix": "rfc-025-v7-ready-completion-first-20261028-matrix.json",
+      "matrix_sha256": "7936f14244c67a6907dfb037c67269e8773dd8cf573726e909909ebdb1058726",
+      "cell": "ext4-batch8",
+      "manifest": "rfc-025-v7-ready-completion-first-20261028-ext4-batch8-runs.tsv",
+      "manifest_sha256": "cbb7392e4f7ad7f8d006594c8003e5dd0c78ca9590af3ad4a9c50cde50fe52e7",
+      "raw": "rfc-025-v7-ready-completion-first-20261028-ext4-batch8.jsonl",
+      "raw_sha256": "25619005f28f746d2c9ef07162e2dbcebb2119ec6d8c47dfa53f83a134078aed"
+    },
+    {
+      "matrix": "rfc-025-v7-ready-completion-first-20261028-matrix.json",
+      "matrix_sha256": "7936f14244c67a6907dfb037c67269e8773dd8cf573726e909909ebdb1058726",
+      "cell": "ext4-batch16",
+      "manifest": "rfc-025-v7-ready-completion-first-20261028-ext4-batch16-runs.tsv",
+      "manifest_sha256": "d9c2a27bc1396a77aa4b26ed11de1f9fcb636dc3d09a112dd34145acd58074c4",
+      "raw": "rfc-025-v7-ready-completion-first-20261028-ext4-batch16.jsonl",
+      "raw_sha256": "7b06c33d0a26445050834ad2e774a7755fcb8329d65efca6308b721c9c5b05cd"
+    },
+    {
+      "matrix": "rfc-025-v7-ready-completion-first-20261028-matrix.json",
+      "matrix_sha256": "7936f14244c67a6907dfb037c67269e8773dd8cf573726e909909ebdb1058726",
+      "cell": "ext4-point8",
+      "manifest": "rfc-025-v7-ready-completion-first-20261028-ext4-point8-runs.tsv",
+      "manifest_sha256": "4d9a544169cc8aa0396783fa840cc7c7b1599dd205738430869d81ecc26483a5",
+      "raw": "rfc-025-v7-ready-completion-first-20261028-ext4-point8.jsonl",
+      "raw_sha256": "2cd408a8e4a08c692ce1e9c51cf77f6be5b00e7ed93a2b3ee89999b8f0b68cd9"
+    },
+    {
+      "matrix": "rfc-025-v7-ready-completion-first-20261028-matrix.json",
+      "matrix_sha256": "7936f14244c67a6907dfb037c67269e8773dd8cf573726e909909ebdb1058726",
+      "cell": "ext4-batch1",
+      "manifest": "rfc-025-v7-ready-completion-first-20261028-ext4-batch1-runs.tsv",
+      "manifest_sha256": "8c81000aea7820ee0c85e8a2b4fb399e029371d5d74c90f34afaca9f81e87b07",
+      "raw": "rfc-025-v7-ready-completion-first-20261028-ext4-batch1.jsonl",
+      "raw_sha256": "51abed18e87a090e5e78fe950ad7800d37a00447ec8d4269a1442577ea461fd7"
+    },
+    {
+      "matrix": "rfc-025-v7-signal-taskwork-20261029-matrix.json",
+      "matrix_sha256": "27260e0aca8f9170039a1cfed1e7084109560d36dcc3bd798532608290d009b5",
+      "cell": "ext4-point8",
+      "manifest": "rfc-025-v7-signal-taskwork-20261029-ext4-point8-runs.tsv",
+      "manifest_sha256": "e7585ad861677e943e6a46c299eb97f18fe78a178e7fecaaa11b2b7d3938892e",
+      "raw": "rfc-025-v7-signal-taskwork-20261029-ext4-point8.jsonl",
+      "raw_sha256": "95aa96ce8fd49d37e538b8817fc3cd4998d92c9d0d459f03eec93267a24cfee5"
+    },
+    {
+      "matrix": "rfc-025-v7-signal-taskwork-20261029-matrix.json",
+      "matrix_sha256": "27260e0aca8f9170039a1cfed1e7084109560d36dcc3bd798532608290d009b5",
+      "cell": "ext4-point1",
+      "manifest": "rfc-025-v7-signal-taskwork-20261029-ext4-point1-runs.tsv",
+      "manifest_sha256": "bbe94a44b41dd4ac9ceacdb62fd2d195a1bbe8d86acd8d3b8d7d2aa67bacdf51",
+      "raw": "rfc-025-v7-signal-taskwork-20261029-ext4-point1.jsonl",
+      "raw_sha256": "e0450134cfd8520390a6a6134b8ff77ea5349aef1a7603fa7c101e75000d01e7"
+    },
+    {
+      "matrix": "rfc-025-v7-signal-taskwork-20261029-matrix.json",
+      "matrix_sha256": "27260e0aca8f9170039a1cfed1e7084109560d36dcc3bd798532608290d009b5",
+      "cell": "ext4-point16",
+      "manifest": "rfc-025-v7-signal-taskwork-20261029-ext4-point16-runs.tsv",
+      "manifest_sha256": "75316df0e86b2caf8c5c0dc759aeb0e64843ac30e7323ed21f96a396f331d19f",
+      "raw": "rfc-025-v7-signal-taskwork-20261029-ext4-point16.jsonl",
+      "raw_sha256": "86bf523c585fd9c6ecee205d168f8cc9f028266c90b929f7e08832c8b1540459"
+    },
+    {
+      "matrix": "rfc-025-v7-signal-taskwork-20261029-matrix.json",
+      "matrix_sha256": "27260e0aca8f9170039a1cfed1e7084109560d36dcc3bd798532608290d009b5",
+      "cell": "ext4-batch8",
+      "manifest": "rfc-025-v7-signal-taskwork-20261029-ext4-batch8-runs.tsv",
+      "manifest_sha256": "dbb46497450abaef0505bac2c4990cde93189569af0f6000b83bffabf9f01e49",
+      "raw": "rfc-025-v7-signal-taskwork-20261029-ext4-batch8.jsonl",
+      "raw_sha256": "0b01a7f7b36481b9332ad3dc53513be4c8c08477b032535cfc9bcfde549fce53"
+    },
+    {
+      "matrix": "rfc-025-v7-signal-taskwork-20261029-matrix.json",
+      "matrix_sha256": "27260e0aca8f9170039a1cfed1e7084109560d36dcc3bd798532608290d009b5",
+      "cell": "ext4-batch16",
+      "manifest": "rfc-025-v7-signal-taskwork-20261029-ext4-batch16-runs.tsv",
+      "manifest_sha256": "4a760da4228b2a9b6c70e1a372f21ba973b550376004f781d1fa4e380e2f8b6f",
+      "raw": "rfc-025-v7-signal-taskwork-20261029-ext4-batch16.jsonl",
+      "raw_sha256": "cec602bfdc2579767ea56212b730717f442ec561bb19bb6b2e2fdff6e5a03b7f"
+    },
+    {
+      "matrix": "rfc-025-v7-signal-taskwork-20261029-matrix.json",
+      "matrix_sha256": "27260e0aca8f9170039a1cfed1e7084109560d36dcc3bd798532608290d009b5",
+      "cell": "ext4-batch1",
+      "manifest": "rfc-025-v7-signal-taskwork-20261029-ext4-batch1-runs.tsv",
+      "manifest_sha256": "84c86f50a202d97477ede19b2a27707224b5c4582ab41e96dfbf336dc8548d3c",
+      "raw": "rfc-025-v7-signal-taskwork-20261029-ext4-batch1.jsonl",
+      "raw_sha256": "8b08ba5b4922edfe081f05c27ccb4a715d82cfffc29c6c0cd15d8f2058b3f860"
+    },
+    {
+      "matrix": "rfc-025-v7-signal-taskwork-rerun-20261029-matrix.json",
+      "matrix_sha256": "22803a75bf92960bde9b84e37aecca0b28c89ea4ebd647c4b6012d6c6114474d",
+      "cell": "ext4-batch16",
+      "manifest": "rfc-025-v7-signal-taskwork-rerun-20261029-ext4-batch16-runs.tsv",
+      "manifest_sha256": "e5f61cd57fa8925080bd016b4be844104f23412f0659a0acd72ad29d74581f12",
+      "raw": "rfc-025-v7-signal-taskwork-rerun-20261029-ext4-batch16.jsonl",
+      "raw_sha256": "49cdbd76289151556a8c0f3ff9707f6c7c2ea31368f4617126c6f937099d57bf"
+    },
+    {
+      "matrix": "rfc-025-v7-signal-taskwork-rerun-20261029-matrix.json",
+      "matrix_sha256": "22803a75bf92960bde9b84e37aecca0b28c89ea4ebd647c4b6012d6c6114474d",
+      "cell": "ext4-point8-confirm",
+      "manifest": "rfc-025-v7-signal-taskwork-rerun-20261029-ext4-point8-confirm-runs.tsv",
+      "manifest_sha256": "820cd4a0777c6b20c5207655ed2c113d3b1ccf58d8f2362d881aba058768d51f",
+      "raw": "rfc-025-v7-signal-taskwork-rerun-20261029-ext4-point8-confirm.jsonl",
+      "raw_sha256": "13e53599e5a4b2741ae15d4774d2a50b9a8645ec4c8fab1ee9167d4e6d8ceba8"
+    },
+    {
+      "matrix": "rfc-025-v7-signal-taskwork-rerun-20261029-matrix.json",
+      "matrix_sha256": "22803a75bf92960bde9b84e37aecca0b28c89ea4ebd647c4b6012d6c6114474d",
+      "cell": "ext4-point1",
+      "manifest": "rfc-025-v7-signal-taskwork-rerun-20261029-ext4-point1-runs.tsv",
+      "manifest_sha256": "5d365a49dccf295a4a434b26960db6890c21ffdde5de439ec0d4d7327f8afbf1",
+      "raw": "rfc-025-v7-signal-taskwork-rerun-20261029-ext4-point1.jsonl",
+      "raw_sha256": "8e352e1119bbb6c5ee61ae38baa4542e740f25dfd4df5849a42527565a5b990a"
+    },
+    {
+      "matrix": "rfc-025-v7-signal-taskwork-rerun-20261029-matrix.json",
+      "matrix_sha256": "22803a75bf92960bde9b84e37aecca0b28c89ea4ebd647c4b6012d6c6114474d",
+      "cell": "ext4-point16",
+      "manifest": "rfc-025-v7-signal-taskwork-rerun-20261029-ext4-point16-runs.tsv",
+      "manifest_sha256": "a8546ebb61d7a7fb817a9c1aa73815382cf6a7e8196e4b61da35a27057c72d1a",
+      "raw": "rfc-025-v7-signal-taskwork-rerun-20261029-ext4-point16.jsonl",
+      "raw_sha256": "ca40dd12dafe99f69d1e104d9878a5846db7b877feef8090c4dcf3be01713c32"
+    },
+    {
+      "matrix": "rfc-025-v7-signal-taskwork-rerun-20261029-matrix.json",
+      "matrix_sha256": "22803a75bf92960bde9b84e37aecca0b28c89ea4ebd647c4b6012d6c6114474d",
+      "cell": "ext4-batch8",
+      "manifest": "rfc-025-v7-signal-taskwork-rerun-20261029-ext4-batch8-runs.tsv",
+      "manifest_sha256": "2b59cc79918e5c0495ca11653b5f2032ac2c9fab59edbfc115c5e3ecc9e22d78",
+      "raw": "rfc-025-v7-signal-taskwork-rerun-20261029-ext4-batch8.jsonl",
+      "raw_sha256": "5272ff5665d5f9f472877439b5253a0a1c60e8bfddcf5784a853c6877319a680"
+    },
+    {
+      "matrix": "rfc-025-v7-signal-taskwork-rerun-20261029-matrix.json",
+      "matrix_sha256": "22803a75bf92960bde9b84e37aecca0b28c89ea4ebd647c4b6012d6c6114474d",
+      "cell": "ext4-batch1",
+      "manifest": "rfc-025-v7-signal-taskwork-rerun-20261029-ext4-batch1-runs.tsv",
+      "manifest_sha256": "b0a46621b2cbb6fb20220b699a57e03295a86690acaf72f2cba2443167aa7978",
+      "raw": "rfc-025-v7-signal-taskwork-rerun-20261029-ext4-batch1.jsonl",
+      "raw_sha256": "e5eadef7e4baf43f60f1593aae0a50cfbb01415b76b87349f3d8409bca13400f"
+    },
+    {
+      "matrix": "rfc-025-v7-signal-taskwork-retry-20261029-matrix.json",
+      "matrix_sha256": "b90e03e966e130309faba47e35cf433f618fe0fdf2d4580b294c84f5560761a0",
+      "cell": "ext4-batch16",
+      "manifest": "rfc-025-v7-signal-taskwork-retry-20261029-ext4-batch16-runs.tsv",
+      "manifest_sha256": "8c3ee38fcedfa1029099664054c2c177297789788aed28dde521d82cb0ffead8",
+      "raw": "rfc-025-v7-signal-taskwork-retry-20261029-ext4-batch16.jsonl",
+      "raw_sha256": "9ea32ee2dfb5c50387fcc02cb54d1381afcfc05a5d25a050e44e5b1c211f15c9"
+    },
+    {
+      "matrix": "rfc-025-v7-small-completion-priority-20261028-matrix.json",
+      "matrix_sha256": "29b0b5e8a14f779e0e32d81ccb5ce935bbe03ba9313fe518c7a8c06fd2dd2483",
+      "cell": "ext4-point8",
+      "manifest": "rfc-025-v7-small-completion-priority-20261028-ext4-point8-runs.tsv",
+      "manifest_sha256": "76fb26017362ee009026786838637edb2c0c4b234c4c550e973eb728dc091cb5",
+      "raw": "rfc-025-v7-small-completion-priority-20261028-ext4-point8.jsonl",
+      "raw_sha256": "55da7e685cb0ad00f4ce805a1b7bb0ab6ca3fe9854a9f2a7611cd9aefa670565"
+    },
+    {
+      "matrix": "rfc-025-v7-small-completion-priority-20261028-matrix.json",
+      "matrix_sha256": "29b0b5e8a14f779e0e32d81ccb5ce935bbe03ba9313fe518c7a8c06fd2dd2483",
+      "cell": "ext4-point1",
+      "manifest": "rfc-025-v7-small-completion-priority-20261028-ext4-point1-runs.tsv",
+      "manifest_sha256": "16c9e2262d6a6b2dee1c7eab629ba34a3c05bc896f916af2c0dd1022821073ea",
+      "raw": "rfc-025-v7-small-completion-priority-20261028-ext4-point1.jsonl",
+      "raw_sha256": "53b00503b918f3e36825cd3edfa5e1e2dd19cd77d2b139fbde944c29d84188a9"
+    },
+    {
+      "matrix": "rfc-025-v7-small-completion-priority-20261028-matrix.json",
+      "matrix_sha256": "29b0b5e8a14f779e0e32d81ccb5ce935bbe03ba9313fe518c7a8c06fd2dd2483",
+      "cell": "ext4-point16",
+      "manifest": "rfc-025-v7-small-completion-priority-20261028-ext4-point16-runs.tsv",
+      "manifest_sha256": "98685d4e3aa4ed865cb22b01aebef1d3ea34c368181d2205cd11d88d66c24df0",
+      "raw": "rfc-025-v7-small-completion-priority-20261028-ext4-point16.jsonl",
+      "raw_sha256": "bf3dee01c7e85747bce9cfb848e4490c264984a1b2448f47e57f012033084f8b"
+    },
+    {
+      "matrix": "rfc-025-v7-small-completion-priority-20261028-matrix.json",
+      "matrix_sha256": "29b0b5e8a14f779e0e32d81ccb5ce935bbe03ba9313fe518c7a8c06fd2dd2483",
+      "cell": "ext4-batch8",
+      "manifest": "rfc-025-v7-small-completion-priority-20261028-ext4-batch8-runs.tsv",
+      "manifest_sha256": "871168458d9bfd7153d06e3f5141701e4de4faaa67d984e04fc76fa14af85774",
+      "raw": "rfc-025-v7-small-completion-priority-20261028-ext4-batch8.jsonl",
+      "raw_sha256": "7c47688699ff4e54ed50a6645ec17b66860e78e8a2d953c0d91f410c3fd1a1f2"
+    },
+    {
+      "matrix": "rfc-025-v7-small-completion-priority-20261028-matrix.json",
+      "matrix_sha256": "29b0b5e8a14f779e0e32d81ccb5ce935bbe03ba9313fe518c7a8c06fd2dd2483",
+      "cell": "ext4-batch16",
+      "manifest": "rfc-025-v7-small-completion-priority-20261028-ext4-batch16-runs.tsv",
+      "manifest_sha256": "15b74417824762b57a6902606a28bb44d32bdbf26afb44b29ba7e6dfc974ca52",
+      "raw": "rfc-025-v7-small-completion-priority-20261028-ext4-batch16.jsonl",
+      "raw_sha256": "b0ad59996ea0da402c7b5790fcac38cc4c0427e8ce54257de61eb22e9ea556b3"
+    },
+    {
+      "matrix": "rfc-025-v7-small-completion-priority-20261028-matrix.json",
+      "matrix_sha256": "29b0b5e8a14f779e0e32d81ccb5ce935bbe03ba9313fe518c7a8c06fd2dd2483",
+      "cell": "ext4-batch1",
+      "manifest": "rfc-025-v7-small-completion-priority-20261028-ext4-batch1-runs.tsv",
+      "manifest_sha256": "4b9b90204548aa599b48c19beba9e7f15a617a277d957d2f31c982624dd6404e",
+      "raw": "rfc-025-v7-small-completion-priority-20261028-ext4-batch1.jsonl",
+      "raw_sha256": "47dcb0f39390d00a977fa340ede038d5be579071c65d2adf2604cb494bd054e3"
+    },
+    {
+      "matrix": "rfc-025-v7-small-completion-priority-20261028-matrix.json",
+      "matrix_sha256": "29b0b5e8a14f779e0e32d81ccb5ce935bbe03ba9313fe518c7a8c06fd2dd2483",
+      "cell": "ext4-point8-confirm",
+      "manifest": "rfc-025-v7-small-completion-priority-20261028-ext4-point8-confirm-runs.tsv",
+      "manifest_sha256": "9872e725c493949f26cd149877207f51316485e9ce50f74e174e914860dce45f",
+      "raw": "rfc-025-v7-small-completion-priority-20261028-ext4-point8-confirm.jsonl",
+      "raw_sha256": "6f2dc64da987a041ffd0fc7a40bd6f4655e14d93dcdfea3df56ab6ebc9abf829"
+    },
+    {
+      "matrix": "rfc-025-v7-sync-priority-extents-20261028-matrix.json",
+      "matrix_sha256": "6bf1544b932ba94e2b83448a9f9643573ae8cab85368d90abf1d65b54f36e703",
+      "cell": "ext4-batch8",
+      "manifest": "rfc-025-v7-sync-priority-extents-20261028-ext4-batch8-runs.tsv",
+      "manifest_sha256": "f7747704436b017c91bafc0a928e0190a7cea580e58728a77608bb8d7c28829a",
+      "raw": "rfc-025-v7-sync-priority-extents-20261028-ext4-batch8.jsonl",
+      "raw_sha256": "4731b867af0792d7159576c074b986431745f30ae86962807be4e886f4c60d49"
+    },
+    {
+      "matrix": "rfc-025-v7-sync-priority-extents-20261028-matrix.json",
+      "matrix_sha256": "6bf1544b932ba94e2b83448a9f9643573ae8cab85368d90abf1d65b54f36e703",
+      "cell": "ext4-batch16",
+      "manifest": "rfc-025-v7-sync-priority-extents-20261028-ext4-batch16-runs.tsv",
+      "manifest_sha256": "da29f211b47351a2fec93bafdec8a18feb3d226b4a2a47afe1c1b6041ebabf27",
+      "raw": "rfc-025-v7-sync-priority-extents-20261028-ext4-batch16.jsonl",
+      "raw_sha256": "970e3633b8d4240720f339defd7fc1533cc534470363020a4364d6949ed83bf6"
+    },
+    {
+      "matrix": "rfc-025-v7-sync-priority-extents-20261028-matrix.json",
+      "matrix_sha256": "6bf1544b932ba94e2b83448a9f9643573ae8cab85368d90abf1d65b54f36e703",
+      "cell": "ext4-point8",
+      "manifest": "rfc-025-v7-sync-priority-extents-20261028-ext4-point8-runs.tsv",
+      "manifest_sha256": "749358d8e95f7a9cf182c3703e4896ce4fefefe3d5604edbc8773486a4ca87d9",
+      "raw": "rfc-025-v7-sync-priority-extents-20261028-ext4-point8.jsonl",
+      "raw_sha256": "1db3e3eb625d4a64a0bdd21c01e477032ea6fc9f6ea2862ae2763550686d8c42"
+    },
+    {
+      "matrix": "rfc-025-v7-sync-priority-extents-20261028-matrix.json",
+      "matrix_sha256": "6bf1544b932ba94e2b83448a9f9643573ae8cab85368d90abf1d65b54f36e703",
+      "cell": "ext4-batch1",
+      "manifest": "rfc-025-v7-sync-priority-extents-20261028-ext4-batch1-runs.tsv",
+      "manifest_sha256": "438b985398136d70909a0f99eb656fc9b7480f7ac41efb45537bf22328fcb40b",
+      "raw": "rfc-025-v7-sync-priority-extents-20261028-ext4-batch1.jsonl",
+      "raw_sha256": "46fa37832a65436418400ff3b8c55c3eee2fd2b5cc4a588490914803556dba15"
+    },
+    {
+      "matrix": "rfc-025-v7-unbounded-workers-20261028-matrix.json",
+      "matrix_sha256": "a3f1b803aa5b4b6bd58f4cfc92c7f2ba6c9ccbfc3dd27beb614c78d15dfc6a99",
+      "cell": "ext4-batch16",
+      "manifest": "rfc-025-v7-unbounded-workers-20261028-ext4-batch16-runs.tsv",
+      "manifest_sha256": "4949f6cfaf4fa8cf078d3587b787b0002c23446fa7c9810754a2ca8f11edad4a",
+      "raw": "rfc-025-v7-unbounded-workers-20261028-ext4-batch16.jsonl",
+      "raw_sha256": "e22c113a42ccf6f4b9281aa5de887674df0a8f6a0291c162e90cf05f1f5ec6e8"
+    },
+    {
+      "matrix": "rfc-025-v7-unbounded-workers-20261028-matrix.json",
+      "matrix_sha256": "a3f1b803aa5b4b6bd58f4cfc92c7f2ba6c9ccbfc3dd27beb614c78d15dfc6a99",
+      "cell": "ext4-batch8",
+      "manifest": "rfc-025-v7-unbounded-workers-20261028-ext4-batch8-runs.tsv",
+      "manifest_sha256": "91886193b9cf85e2004320108d5f692dea5be1d3c5f1cd8b93bdae394721678b",
+      "raw": "rfc-025-v7-unbounded-workers-20261028-ext4-batch8.jsonl",
+      "raw_sha256": "9742b9fa17195eb367287c304188554435737d65f4731caca4187e5ed062dd1f"
+    },
+    {
+      "matrix": "rfc-025-v7-unbounded-workers-20261028-matrix.json",
+      "matrix_sha256": "a3f1b803aa5b4b6bd58f4cfc92c7f2ba6c9ccbfc3dd27beb614c78d15dfc6a99",
+      "cell": "ext4-point8",
+      "manifest": "rfc-025-v7-unbounded-workers-20261028-ext4-point8-runs.tsv",
+      "manifest_sha256": "31f45101ad7396bc24bc20af9288c28cb0cb4cdec02f14d4c4cff67085212238",
+      "raw": "rfc-025-v7-unbounded-workers-20261028-ext4-point8.jsonl",
+      "raw_sha256": "8c2e817a2e8b76ebb667d1705f0eb78004a6e653d1d72efb43e00b2ef85978f0"
+    },
+    {
+      "matrix": "rfc-025-v7-unbounded-workers-20261028-matrix.json",
+      "matrix_sha256": "a3f1b803aa5b4b6bd58f4cfc92c7f2ba6c9ccbfc3dd27beb614c78d15dfc6a99",
+      "cell": "ext4-batch1",
+      "manifest": "rfc-025-v7-unbounded-workers-20261028-ext4-batch1-runs.tsv",
+      "manifest_sha256": "b0c715a2b75cab2548c7d8521c07c6751ccb6fa71ad5d0df07ce6fa592963648",
+      "raw": "rfc-025-v7-unbounded-workers-20261028-ext4-batch1.jsonl",
+      "raw_sha256": "b362cd997286de21a1e4da5e02bd124e70498f038e6789090be9922ad469ede6"
+    }
+  ]
+}
