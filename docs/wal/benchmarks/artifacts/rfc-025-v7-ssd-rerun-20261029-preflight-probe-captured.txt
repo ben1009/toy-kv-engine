@@ -1,0 +1,85 @@
+#!/usr/bin/env python3
+import gzip
+import hashlib
+import json
+import math
+import mmap
+import os
+import subprocess
+import threading
+import time
+from array import array
+from pathlib import Path
+
+root = Path('/home/liu/proj/toy-kv-engine')
+work = root / 'target/wal-opt/20261029-v7-stable-ssd-recheck'
+path = work / 'probe-data.bin'
+plan_path = work / 'probe-plan.json'
+result_path = work / 'probe-result.json'
+raw_path = work / 'probe-latencies.json.gz'
+assert not path.exists() and not plan_path.exists() and not result_path.exists() and not raw_path.exists()
+plan = dict(file_bytes=128*1024*1024, block_bytes=4096, blocks_per_sync=4, passes=4,
+            initialization='Direct-write the full preallocated file, then fdatasync; overwrite the same initialized file in every pass.',
+            eligibility=dict(write_p99_ms_max=0.2, write_at_least_1ms_fraction_max=0.005, sync_p99_ms_max=1.5),
+            host_check='Recognized build, benchmark, test and profiler processes sampled once per second. No NVMe administrative queries during capture.',
+            interpretation='All passes must meet thresholds before considering the device suitable for the next fixed benchmark. A pass is not proof that later benchmark runs will be stall-free.')
+plan_path.write_text(json.dumps(plan,indent=2)+'\n')
+blocked = {'cargo','cargo-make','cargo-nextest','nextest','rustc','rustdoc','rustfmt','clippy-driver','sccache','cc','gcc','g++','cc1','cc1plus','clang','clang++','ld','ld.lld','lld','collect2','cmake','ninja','make','perf','fio','stress-ng'}
+def host_sample():
+ out=subprocess.check_output(['ps','-eo','pid=,ppid=,comm=,stat=,pcpu='],text=True)
+ competing=[]
+ for line in out.splitlines():
+  fields=line.split();pid,ppid=fields[:2];state,cpu=fields[-2:];name=' '.join(fields[2:-2])
+  if 'Z' in state or int(pid)==os.getpid():continue
+  if name in blocked or name.startswith(('write-perf','kv_engine-')):
+   competing.append(dict(pid=int(pid),ppid=int(ppid),command=name,state=state,cpu_percent=float(cpu)))
+ return dict(monotonic_ns=time.monotonic_ns(),competing=competing,load=list(os.getloadavg()))
+def percentile(values, p):
+ return sorted(values)[max(0,math.ceil(len(values)*p)-1)] / 1e6
+stop=threading.Event();samples=[];sample_errors=[]
+def observe():
+ while not stop.is_set():
+  try:samples.append(host_sample())
+  except Exception as error:sample_errors.append(str(error))
+  stop.wait(1)
+fd=None; buf=None; view=None;all_passes=[];summaries=[]; start=time.time()
+try:
+ before=host_sample()
+ if before['competing']:raise RuntimeError('Competing processes before probe: '+json.dumps(before['competing']))
+ fd=os.open(path,os.O_CREAT|os.O_EXCL|os.O_RDWR|os.O_DIRECT,0o600)
+ os.posix_fallocate(fd,0,plan['file_bytes'])
+ buf=mmap.mmap(-1,1024*1024);buf[:]=b'\x5a'*(1024*1024);view=memoryview(buf)
+ for offset in range(0,plan['file_bytes'],len(view)):
+  assert os.pwrite(fd,view,offset)==len(view)
+ os.fdatasync(fd)
+ observer=threading.Thread(target=observe,daemon=True);observer.start()
+ try:
+  for index in range(plan['passes']):
+   writes=array('Q');syncs=array('Q');started=time.monotonic_ns()
+   for offset in range(0,plan['file_bytes'],plan['block_bytes']):
+    t=time.monotonic_ns();n=os.pwrite(fd,view[:plan['block_bytes']],offset);writes.append(time.monotonic_ns()-t)
+    assert n==plan['block_bytes']
+    if (offset//plan['block_bytes']+1)%plan['blocks_per_sync']==0:
+     t=time.monotonic_ns();os.fdatasync(fd);syncs.append(time.monotonic_ns()-t)
+   duration=(time.monotonic_ns()-started)/1e9
+   item=dict(pass_number=index+1,writes=len(writes),syncs=len(syncs),elapsed_s=duration,
+             write_p50_ms=percentile(writes,.50),write_p99_ms=percentile(writes,.99),
+             write_max_ms=max(writes)/1e6,write_at_least_1ms=sum(x>=1_000_000 for x in writes),
+             write_at_least_5ms=sum(x>=5_000_000 for x in writes),
+             sync_p50_ms=percentile(syncs,.50),sync_p99_ms=percentile(syncs,.99),sync_max_ms=max(syncs)/1e6)
+   item['eligible']=(item['write_p99_ms']<=plan['eligibility']['write_p99_ms_max'] and item['write_at_least_1ms']/item['writes']<=plan['eligibility']['write_at_least_1ms_fraction_max'] and item['sync_p99_ms']<=plan['eligibility']['sync_p99_ms_max'])
+   summaries.append(item);all_passes.append(dict(write_ns=list(writes),sync_ns=list(syncs)))
+   print(json.dumps(item),flush=True)
+ finally:
+  stop.set();observer.join()
+ after=host_sample()
+ clean=not sample_errors and not any(s['competing'] for s in [before,*samples,after])
+ with gzip.open(raw_path,'wt') as f:json.dump(all_passes,f,separators=(',',':'))
+ result=dict(plan_sha256=hashlib.sha256(plan_path.read_bytes()).hexdigest(),raw_sha256=hashlib.sha256(raw_path.read_bytes()).hexdigest(),before=before,after=after,host_samples=samples,sample_errors=sample_errors,clean=clean,passes=summaries,stable=clean and all(x['eligible'] for x in summaries),elapsed_s=time.time()-start)
+ result_path.write_text(json.dumps(result,indent=2)+'\n')
+ print('STABLE',result['stable'],'HOST_CLEAN',clean,flush=True)
+finally:
+ if view is not None:view.release()
+ if buf is not None:buf.close()
+ if fd is not None:os.close(fd)
+ if path.exists():path.unlink()

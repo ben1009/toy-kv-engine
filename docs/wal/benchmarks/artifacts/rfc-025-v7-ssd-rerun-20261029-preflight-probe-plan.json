@@ -1,0 +1,14 @@
+{
+  "file_bytes": 134217728,
+  "block_bytes": 4096,
+  "blocks_per_sync": 4,
+  "passes": 4,
+  "initialization": "Direct-write the full preallocated file, then fdatasync; overwrite the same initialized file in every pass.",
+  "eligibility": {
+    "write_p99_ms_max": 0.2,
+    "write_at_least_1ms_fraction_max": 0.005,
+    "sync_p99_ms_max": 1.5
+  },
+  "host_check": "Recognized build, benchmark, test and profiler processes sampled once per second. No NVMe administrative queries during capture.",
+  "interpretation": "All passes must meet thresholds before considering the device suitable for the next fixed benchmark. A pass is not proof that later benchmark runs will be stall-free."
+}

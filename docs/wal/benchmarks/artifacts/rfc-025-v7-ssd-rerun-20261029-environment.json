@@ -1,0 +1,29 @@
+{
+  "created_at_utc": "2026-10-29T15:53:48.198620+00:00",
+  "filesystem": "/dev/nvme0n1p3[/liu/proj/toy-kv-engine] ext4 rw,nosuid,nodev,relatime",
+  "kernel": "6.12.71-1-lts",
+  "cpu_count": 32,
+  "variables": {
+    "RUSTFLAGS": null,
+    "CARGO_ENCODED_RUSTFLAGS": null,
+    "CARGO_TARGET_DIR": null,
+    "LD_PRELOAD": null,
+    "TMPDIR": "/home/liu/proj/toy-kv-engine/target/tmp/wal-grouping"
+  },
+  "preflight_probe_result_sha256": "8272792362591ea6f47cf091967b884187ea7bc1abc70e5557e2b568b21c05d9",
+  "preflight_probe_raw_sha256": "efedd623dca003ab0ddc940b70a6046103528d3182438ad579663b2882cee27a",
+  "parent_receipt_sha256": "814a0f261c289b0dc48ef00bc8671c1958cbb2da93d6292a152bbc36c3da25d5",
+  "plan_sha256": "0d4049b627fc216fde6237bb3741494daa77d8a44377d155b5de448c0e3b3cc2",
+  "matrix_sha256": "7f3621f47da2941dab634049ad8262997dbdf353108797c4555349a71d195b86",
+  "driver_sha256": "7fbfac04fcf726c8d4af1abd382d41e0b36e7b0e7fca882dbee1e55cde14d763",
+  "child_sha256": "538c6a74a405dd67eba4d7bb7295fd24965c69a0fa3dde06bed30ed1985650ab",
+  "analyzer_sha256": "1a19962115525ebbcafd627d8a0da902ba0d36f83c51854e6b864986ffc0a457",
+  "orchestrator_sha256": "cd56bd4cae8acea83a530608fd64aac3d2c9e60a989bb049a5cff08beddc44df",
+  "identity_sha256": "5023c120b80acbb5a11ba270131ceedefb3c8c73bde3f136f892e46753e9d2e2",
+  "historical_sha256": "224bdf10114d279886cb4d26fd61789436ba334a2998d1c9fb1b526bd7223e56",
+  "historical_analyzer_sha256": "42aa1777ba8917c40089a17538c3daaa44fa3f5bd5586142dea3c5cda5276186",
+  "preflight_probe_plan_sha256": "8eec58823692765842d0e9f7cca0cfad0eaf21bb262a1b1a3d2c325077d90a0b",
+  "candidate_patch_sha256": "bc87f44bbaaf5654f652929841ee1dc7d0c3cde791acad12bde788d0fc8e37fe",
+  "captured_probe_script_sha256": "008f8dfadef6c20d5a04af22d35c104291122d63d0ba311f8c0602fbd0020d5d",
+  "reproducer_probe_script_sha256": "a2d7f66a33868270037c710026ddd1c4487d64a41c09a204ac9ec045c0c5ed1b"
+}

@@ -1,0 +1,49 @@
+{
+  "source_base": "859b66b0",
+  "baseline": {
+    "path": "target/release/write-perf-v7-large-data-async-dispatch",
+    "sha256": "f353022d846530a6754330aaea11f295319ea8f4de20afa09b6d2a3b57b021d8"
+  },
+  "candidate": {
+    "path": "target/release/write-perf-v7-admitted-group",
+    "sha256": "bb8b4c54c81a18c74f8d635d53ef6072f635b3e5bcff0ff7e4e2e184760d98fa"
+  },
+  "screen_cells": [
+    "ext4-batch8",
+    "ext4-batch1",
+    "ext4-batch16"
+  ],
+  "guard_cells": [
+    "ext4-point1",
+    "ext4-point8",
+    "ext4-point16"
+  ],
+  "schedule": "Run all three batch screens, each with three arms, one warmup per arm and three scored rounds in rotated order. Run point guards only if every batch screen qualifies. Use 120-second initial cooldown per cell and 15-second gaps; no score-selected replacement runs.",
+  "ranking": "Highest eligible throughput per exact binary and workload; p99, CPU, and grouping counters come from that same invocation. Historical highs remain separately identified.",
+  "stall_filter": {
+    "frontier_mean_ms_at_least": 0.12,
+    "fdatasync_mean_ms_at_least": 0.6,
+    "selection": "Independently flag each run using available mean timings. v4 has no FRONTIER metric, and means can miss intermittent DATA stalls; report all values and do not interpret a suspected stall as a source regression."
+  },
+  "screen_gate": {
+    "minimum_throughput_ratio": 1.0,
+    "maximum_p99_ratio": 1.0,
+    "minimum_eligible_runs_per_arm": 2
+  },
+  "guard_gate": {
+    "minimum_throughput_ratio": 0.98,
+    "maximum_p99_ratio": 1.05,
+    "minimum_eligible_runs_per_arm": 2
+  },
+  "ssd_preflight": "The same Solidigm SSD failed four direct-I/O stability passes. The user explicitly directed this rerun on that drive with stalls flagged; do not describe the drive as stable.",
+  "constraints": [
+    "Source and executables stay frozen; all scratch databases are under the local repository.",
+    "Discard only the disposable directories created for this run.",
+    "Do not retain the candidate without successful batch and point guards.",
+    "Preserve all invocations and note that aggregate stall flags can miss short storage stalls."
+  ],
+  "candidate_patch": "docs/wal/benchmarks/artifacts/rfc-025-v7-admitted-group-20261029-candidate.patch",
+  "candidate_patch_sha256": "bc87f44bbaaf5654f652929841ee1dc7d0c3cde791acad12bde788d0fc8e37fe",
+  "candidate_source_base": "59becf2791cfcefb91dee80f20af6157215c392c",
+  "preflight_override": "The earlier probe plan required a stable drive; the user subsequently instructed running on the same drive despite the failed preflight. This comparison is therefore exploratory, with per-run flags and caveats."
+}
