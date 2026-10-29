@@ -1830,52 +1830,100 @@ fn failpoint_v7_empty_successor_segment_sealed_sync_failure_reopens() {
 #[cfg(target_os = "linux")]
 #[test]
 fn failpoint_v7_empty_successor_segment_sealed_partial_append_reopens() {
-    let _scenario = FailScenario::setup();
+    const CHILD_DIR: &str = "TOY_KV_PARTIAL_SEAL_TEST_CHILD_DIR";
+    if let Some(root) = std::env::var_os(CHILD_DIR) {
+        let _scenario = FailScenario::setup();
+        let root = PathBuf::from(root);
+        let db_path = root.join("db");
+        let repository = root.join("repository");
+        let engine = prepare_empty_v7_parallel_pitr(&db_path, &repository);
+        let active_wal_path = find_v7_pitr_wal(&db_path);
+        let active_segment_id = pitr_segment_id(&active_wal_path);
+        let successor_path = pitr_wal_path(&db_path, active_segment_id + 1);
+        std::fs::write(
+            root.join("expected-successor-id"),
+            (active_segment_id + 1).to_string(),
+        )
+        .expect("record the expected successor segment");
+
+        let failpoint = "pitr.manifest.segment_sealed_partial_append_failure";
+        fail::cfg(failpoint, "return").expect("inject a partial SegmentSealed manifest append");
+        let publication = engine.create_recovery_point();
+        let error = publication.expect_err("partial SegmentSealed append must reach the caller");
+        let error_chain = format!("{error:#}");
+        assert!(
+            error_chain.contains("injected SegmentSealed manifest partial append failure"),
+            "the targeted partial append failure must be reported, got: {error_chain}"
+        );
+        assert!(
+            !error_chain.contains("PITR manifest published but not durable"),
+            "revalidation must prove and remove the partial append, got: {error_chain}"
+        );
+        assert!(
+            !successor_path.exists(),
+            "the successor image must not install before SegmentSealed is complete"
+        );
+        assert!(
+            engine
+                .put(b"rejected-after-partial-seal", b"must-not-write")
+                .is_err(),
+            "write admission must stay closed while the sealing transition is incomplete"
+        );
+
+        let manifest_bytes = std::fs::read(db_path.join("MANIFEST"))
+            .expect("read manifest after partial append revalidation");
+        let manifest_records = serde_json::Deserializer::from_slice(&manifest_bytes)
+            .into_iter::<serde_json::Value>()
+            .collect::<Result<Vec<_>, _>>()
+            .expect("revalidation must leave a parseable manifest stream");
+        assert!(
+            !manifest_records.is_empty(),
+            "the repaired manifest must retain its prior lifecycle records"
+        );
+
+        assert!(
+            !manifest_records.iter().any(|record| {
+                record
+                    .get("Pitr")
+                    .and_then(|pitr| pitr.get("SegmentSealed"))
+                    .and_then(|sealed| sealed.get("segment_id"))
+                    .and_then(serde_json::Value::as_u64)
+                    == Some(active_segment_id)
+            }),
+            "the target SegmentSealed record must remain absent before the crash"
+        );
+        // End the entire process without dropping the engine. Otherwise a
+        // background task can retain it and race the parent's recovery.
+        std::process::exit(0);
+    }
+
     let dir = tempfile::tempdir().expect("create v7 partial-manifest-append directory");
     let db_path = dir.path().join("db");
     let repository = dir.path().join("repository");
-    let engine = prepare_empty_v7_parallel_pitr(&db_path, &repository);
-    let active_wal_path = find_v7_pitr_wal(&db_path);
-    let active_segment_id = pitr_segment_id(&active_wal_path);
-    let successor_path = pitr_wal_path(&db_path, active_segment_id + 1);
-
-    let failpoint = "pitr.manifest.segment_sealed_partial_append_failure";
-    fail::cfg(failpoint, "return").expect("inject a partial SegmentSealed manifest append");
-    let publication = engine.create_recovery_point();
-    fail::remove(failpoint);
-    let error = publication.expect_err("partial SegmentSealed append must reach the caller");
-    let error_chain = format!("{error:#}");
+    let output = Command::new(std::env::current_exe().expect("locate this test executable"))
+        .arg("--exact")
+        .arg("failpoint_v7_empty_successor_segment_sealed_partial_append_reopens")
+        .arg("--nocapture")
+        .env(CHILD_DIR, dir.path())
+        .output()
+        .expect("run the partial-seal crash child");
     assert!(
-        error_chain.contains("injected SegmentSealed manifest partial append failure"),
-        "the targeted partial append failure must be reported, got: {error_chain}"
+        output.status.success(),
+        "partial-seal child failed: {}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
     );
-    assert!(
-        !error_chain.contains("PITR manifest published but not durable"),
-        "revalidation must prove and remove the partial append, got: {error_chain}"
-    );
+    let successor_segment_id: u64 =
+        std::fs::read_to_string(dir.path().join("expected-successor-id"))
+            .expect("read expected successor segment")
+            .parse()
+            .expect("decode expected successor segment");
+    let successor_path = pitr_wal_path(&db_path, successor_segment_id);
     assert!(
         !successor_path.exists(),
-        "the successor image must not install before SegmentSealed is complete"
+        "the child must exit before successor installation"
     );
-    assert!(
-        engine
-            .put(b"rejected-after-partial-seal", b"must-not-write")
-            .is_err(),
-        "write admission must stay closed while the sealing transition is incomplete"
-    );
-
-    let manifest_bytes = std::fs::read(db_path.join("MANIFEST"))
-        .expect("read manifest after partial append revalidation");
-    let manifest_records = serde_json::Deserializer::from_slice(&manifest_bytes)
-        .into_iter::<serde_json::Value>()
-        .collect::<Result<Vec<_>, _>>()
-        .expect("revalidation must leave a parseable manifest stream");
-    assert!(
-        !manifest_records.is_empty(),
-        "the repaired manifest must retain its prior lifecycle records"
-    );
-
-    drop(engine);
     let recovered = open_and_resume_parallel_pitr(&db_path, &repository);
     assert_empty_v7_active_image(&successor_path);
     assert_eq!(
