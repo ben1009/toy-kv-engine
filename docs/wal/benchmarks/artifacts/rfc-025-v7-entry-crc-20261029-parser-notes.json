@@ -1,0 +1,6 @@
+{
+  "reason": "The frozen matrix uses batch=0 for point workloads; write-perf serializes their batch_size as null. Normalize that metadata assertion before any conditional point guard runs. No command, scoring rule, source, or schedule changed.",
+  "initial_analyzer_sha256": "71848385af0cbc45721d18ecb8e0003afc292a75c69aff2c250db04901766902",
+  "corrected_analyzer_sha256": "c1663e73a2f4cf1f1d5624e1b2e3987e36b8f5da47d71215be5f14e9c0e0ca86",
+  "initial_analyzer": "rfc-025-v7-entry-crc-20261029-analyze-initial.py"
+}

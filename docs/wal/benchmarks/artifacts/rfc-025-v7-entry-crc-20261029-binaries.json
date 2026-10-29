@@ -1,0 +1,14 @@
+{
+  "v4": {
+    "path": "target/release/write-perf-v7-large-data-async-dispatch",
+    "sha256": "f353022d846530a6754330aaea11f295319ea8f4de20afa09b6d2a3b57b021d8"
+  },
+  "retained-v7": {
+    "path": "target/release/write-perf-v7-large-data-async-dispatch",
+    "sha256": "f353022d846530a6754330aaea11f295319ea8f4de20afa09b6d2a3b57b021d8"
+  },
+  "candidate-v7": {
+    "path": "target/release/write-perf-v7-entry-crc",
+    "sha256": "64f5e56c2312bd17bd82335ae055db60fd1aeb2303a4b6d0fcd3af49ca269cef"
+  }
+}

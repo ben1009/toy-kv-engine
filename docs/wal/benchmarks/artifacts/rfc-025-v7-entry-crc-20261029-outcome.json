@@ -1,0 +1,57 @@
+{
+  "source_retained": false,
+  "reason": "Eight-writer best eligible throughput fell 10.1%; p99 improved only 0.2%. The fixed screen fails, so conditional guards are not run.",
+  "canonical_sha256": "f353022d846530a6754330aaea11f295319ea8f4de20afa09b6d2a3b57b021d8",
+  "rust_mtimes_refreshed": true,
+  "atomic_binary_replacement": true,
+  "restored_inputs": 128,
+  "preliminary_restored_checks": [
+    {
+      "step": "restored-check",
+      "command": [
+        "cargo",
+        "make",
+        "check"
+      ],
+      "returncode": 0,
+      "elapsed_seconds": 21.624475717544556,
+      "log_path": "target/wal-opt/20261029-v7-entry-crc/restored-check.log",
+      "log_sha256": "3862508eb59c09109291f75ca87b9285c086b83ef51b1e0213d7ef15cfd73afd"
+    },
+    {
+      "step": "restored-typos",
+      "command": [
+        "typos"
+      ],
+      "returncode": 2,
+      "elapsed_seconds": 0.29007792472839355,
+      "log_path": "target/wal-opt/20261029-v7-entry-crc/restored-typos.log",
+      "log_sha256": "9dea48d8555130fbcc82d843cfb841f6583194ff7715d3e59bb3d7db8db2d731"
+    }
+  ],
+  "restored_checks": [
+    {
+      "step": "restored-check",
+      "command": [
+        "cargo",
+        "make",
+        "check"
+      ],
+      "returncode": 0,
+      "elapsed_seconds": 35.29296922683716,
+      "log_path": "target/wal-opt/20261029-v7-entry-crc/restored-check-final.log",
+      "log_sha256": "ff845a71c42c212ed3c14d8460b1413ffe5db591d91e193451659cf98c5511ca"
+    },
+    {
+      "step": "restored-typos",
+      "command": [
+        "typos"
+      ],
+      "returncode": 0,
+      "elapsed_seconds": 0.2798349857330322,
+      "log_path": "target/wal-opt/20261029-v7-entry-crc/restored-typos-final.log",
+      "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    }
+  ],
+  "spelling_failure_note": "The initial restored full check passed 1973 tests but its typos wrapper printed visual-diff truncation errors and returned zero. Direct typos returned 2 and caught it. Preserve those logs, compress the original visual bytes, and run final checks again."
+}

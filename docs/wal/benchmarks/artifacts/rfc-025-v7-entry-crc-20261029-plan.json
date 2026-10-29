@@ -1,0 +1,42 @@
+{
+  "source_base": "00d65d82573e760a8e211abab713a3e57f943c54",
+  "change": "Encode canonical v7 entries without per-field CRC updates; CRC the complete contiguous encoded stream once. Keep v5/v6 streaming CRCs, v4, digest format, and scheduling behavior.",
+  "baseline": {
+    "path": "target/release/write-perf-v7-large-data-async-dispatch",
+    "sha256": "f353022d846530a6754330aaea11f295319ea8f4de20afa09b6d2a3b57b021d8"
+  },
+  "screen_cells": [
+    "ext4-batch1",
+    "ext4-batch8"
+  ],
+  "guard_cells": [
+    "ext4-point1",
+    "ext4-point8",
+    "ext4-point16",
+    "ext4-batch16"
+  ],
+  "schedule": "One unscored warmup per arm, then three alternating triplets per cell. Both screen cells complete regardless of performance. Run all four guards only if both screens pass. No score-selected replacements or additional retries.",
+  "ranking": "Highest-throughput eligible scored invocation per exact binary and workload; p99 is from that same invocation. Report unfiltered maxima and every raw invocation too. Historical matching-binary best scores remain separate.",
+  "stall_filter": {
+    "frontier_mean_ms_at_least": 1,
+    "fdatasync_mean_ms_at_least": 1.5,
+    "selection": "Independently exclude obvious stalls per arm; no requirement that its same-round control qualifies. Aggregate means can miss stalls."
+  },
+  "screen_gate": {
+    "minimum_throughput_ratio": 1.0,
+    "maximum_p99_ratio": 1.0,
+    "minimum_eligible_runs_per_arm": 2
+  },
+  "guard_gate": {
+    "minimum_throughput_ratio": 0.98,
+    "maximum_p99_ratio": 1.05,
+    "minimum_eligible_runs_per_arm": 2
+  },
+  "cpu_policy": "Diagnostic only, never a retention veto.",
+  "constraints": [
+    "No benchmarks overlap builds, tests, profiles, source edits, or other benchmarks.",
+    "All scratch databases under the local repo and removed after capture.",
+    "On failure or inconclusive outcome save full patch and exact binary, restore retained Rust with fresh mtimes and canonical binary atomically, then run a fresh full check.",
+    "Retained source optimization and evidence use separate commits."
+  ]
+}
