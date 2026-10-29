@@ -2,9 +2,11 @@
   "original_visual_diff": "rfc-025-v7-entry-crc-20261029-candidate.patch.gz",
   "reason": "Git external diff produced a human-readable rendering. The frozen source manifest is unchanged; add an applicable unified patch without changing production source or capture schedules.",
   "applicable_patch": "rfc-025-v7-entry-crc-20261029-source.patch",
-  "applicable_patch_sha256": "391dae152b4ca89c2814755283a99b2f287bb18b572eaebd2188b5c54e2c72c3",
+  "applicable_patch_sha256": "070d018872c1f35cacf13ccf7331a45eaa29e67df770798c6740b2569a21f6f9",
   "original_visual_diff_sha256": "04e805df6bb137db2c6f4ecc3df0cd5d16d80f139f82bb5bfe021cda78737b6f",
   "original_visual_diff_encoding": "gzip",
   "compressed_sha256": "cd08b0ccb153507306bcdf5463a6bbb6ab114e2efc15147bd81758f74e74d6b4",
-  "compression_reason": "Keep the exact visual rendering without treating truncated display words as source spelling. The applicable unified patch stays plain text."
+  "compression_reason": "Keep the exact visual rendering without treating truncated display words as source spelling. The applicable unified patch stays plain text.",
+  "previous_applicable_patch_sha256": "391dae152b4ca89c2814755283a99b2f287bb18b572eaebd2188b5c54e2c72c3",
+  "context_note": "Use zero-context unified diff so blank context lines do not trip git diff --check when the patch itself is added. Reconstructed candidate bytes are unchanged."
 }
