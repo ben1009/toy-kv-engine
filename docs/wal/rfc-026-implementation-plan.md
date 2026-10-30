@@ -78,11 +78,12 @@ TOY_KV_PRE_V8_CLI=/path/to/kv-engine-cli cargo test --package kv-engine --lib \
   v8_compatibility_guard_rejects_pre_v8_cli -- --ignored
 ```
 
-The filter runs four process cases: the guarded database with its normal
-`MANIFEST`, after the guard append but before the new wrapper is installed,
-with `MANIFEST` removed and the installed `ENGINE_MANIFEST`, and with
-`MANIFEST` missing while the guarded snapshot remains pending as
-`ENGINE_MANIFEST.tmp`.
+The filter runs six process cases: the guarded database with its normal
+`MANIFEST`; after the guard append but before snapshot installation; after the
+new wrapper is synced as `ENGINE_MANIFEST.tmp`; after the wrapper is renamed to
+`ENGINE_MANIFEST` but before `MANIFEST` compaction; with `MANIFEST` removed and
+the installed `ENGINE_MANIFEST`; and with `MANIFEST` missing while the guarded
+snapshot remains pending as `ENGINE_MANIFEST.tmp`.
 
 The publisher requires a token holding both PITR lifecycle barriers;
 the migration caller must retain it through the v7-to-v8 transition so a
