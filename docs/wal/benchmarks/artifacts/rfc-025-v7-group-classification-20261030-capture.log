@@ -1,0 +1,32 @@
+START ext4-batch8
+ext4-batch8 warmup 0 retained-v7 clean_sampled
+ext4-batch8 warmup 0 candidate-v7 clean_sampled
+ext4-batch8 scored 1 retained-v7 clean_sampled
+ext4-batch8 scored 1 candidate-v7 clean_sampled
+ext4-batch8 scored 2 candidate-v7 clean_sampled
+ext4-batch8 scored 2 retained-v7 clean_sampled
+ext4-batch8 scored 3 retained-v7 clean_sampled
+ext4-batch8 scored 3 candidate-v7 clean_sampled
+DONE ext4-batch8
+START ext4-batch16
+ext4-batch16 warmup 0 retained-v7 clean_sampled
+ext4-batch16 warmup 0 candidate-v7 clean_sampled
+ext4-batch16 scored 1 candidate-v7 clean_sampled
+ext4-batch16 scored 1 retained-v7 clean_sampled
+ext4-batch16 scored 2 retained-v7 clean_sampled
+ext4-batch16 scored 2 candidate-v7 clean_sampled
+ext4-batch16 scored 3 candidate-v7 clean_sampled
+ext4-batch16 scored 3 retained-v7 clean_sampled
+DONE ext4-batch16
+START ext4-batch1
+ext4-batch1 warmup 0 retained-v7 clean_sampled
+ext4-batch1 warmup 0 candidate-v7 clean_sampled
+ext4-batch1 scored 1 retained-v7 clean_sampled
+ext4-batch1 scored 1 candidate-v7 clean_sampled
+ext4-batch1 scored 2 candidate-v7 clean_sampled
+ext4-batch1 scored 2 retained-v7 clean_sampled
+ext4-batch1 scored 3 retained-v7 clean_sampled
+ext4-batch1 scored 3 candidate-v7 clean_sampled
+DONE ext4-batch1
+SKIP point guards: batch screen did not qualify
+SUMMARY captured
