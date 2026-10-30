@@ -4756,10 +4756,7 @@ impl KvEngine {
                 // refused while it is outstanding - including the one `close`
                 // runs. That is terminal in both directions: nothing completes the
                 // record, and nothing may proceed until something does.
-                let seal = self.load_pitr_source_seal(
-                    segment_id,
-                    state.config.as_ref().map(|config| config.max_segment_bytes),
-                )?;
+                let seal = self.load_pitr_source_seal(&state, segment_id)?;
                 let sealing = state
                     .obligations
                     .get(&segment_id)
@@ -4807,9 +4804,39 @@ impl KvEngine {
                     }
                 });
                 let (metadata, _, seal_path) = self.load_pitr_source_segment(&state, segment_id)?;
-                let (_, seal_bytes) = crate::pitr::seal::read_seal_sidecar(
+                let (expected_seal_format, seal_image_limit) = match sealing_obligation.wal_format {
+                    crate::pitr::manifest::PitrWalFormat::V7
+                    | crate::pitr::manifest::PitrWalFormat::V8 => {
+                        let boundary = sealing_obligation.immutable_boundary.ok_or_else(|| {
+                            anyhow!("versioned PITR source has no immutable boundary")
+                        })?;
+                        ensure!(
+                            sealing_obligation.logical_length == boundary.sealed_end
+                                && boundary.active.segment_id == segment_id
+                                && boundary.active.wal_format == sealing_obligation.wal_format,
+                            "versioned PITR source boundary differs from its manifest obligation"
+                        );
+                        let expected_format = match sealing_obligation.wal_format {
+                            crate::pitr::manifest::PitrWalFormat::V7 => {
+                                crate::pitr::seal::SealSidecarFormat::V7
+                            }
+                            crate::pitr::manifest::PitrWalFormat::V8 => {
+                                crate::pitr::seal::SealSidecarFormat::V8
+                            }
+                            _ => unreachable!("guarded to versioned PITR formats"),
+                        };
+                        (expected_format, Some(boundary.sealed_end))
+                    }
+                    crate::pitr::manifest::PitrWalFormat::LegacyV5V6
+                    | crate::pitr::manifest::PitrWalFormat::Unspecified => (
+                        crate::pitr::seal::SealSidecarFormat::V5,
+                        state.config.as_ref().map(|config| config.max_segment_bytes),
+                    ),
+                };
+                let (_, seal_bytes) = crate::pitr::seal::read_seal_sidecar_for_format(
                     &seal_path,
-                    state.config.as_ref().map(|config| config.max_segment_bytes),
+                    seal_image_limit,
+                    expected_seal_format,
                 )?;
                 let seal_digest: [u8; 32] = sha2::Sha256::digest(&seal_bytes).into();
                 ensure!(
@@ -5386,9 +5413,42 @@ impl KvEngine {
     #[cfg(target_os = "linux")]
     fn load_pitr_source_seal(
         &self,
+        state: &crate::pitr::manifest::PitrState,
         segment_id: u64,
-        max_segment_bytes: Option<u64>,
     ) -> Result<PitrSourceSealSummary> {
+        let obligation = state
+            .obligations
+            .get(&segment_id)
+            .ok_or_else(|| anyhow!("sealed PITR source has no manifest obligation"))?;
+        let configured_segment_limit = state.config.as_ref().map(|config| config.max_segment_bytes);
+        let (expected_format, sidecar_image_limit) = match obligation.wal_format {
+            crate::pitr::manifest::PitrWalFormat::V7 | crate::pitr::manifest::PitrWalFormat::V8 => {
+                let boundary = obligation
+                    .immutable_boundary
+                    .ok_or_else(|| anyhow!("versioned PITR source has no immutable boundary"))?;
+                ensure!(
+                    obligation.logical_length == boundary.sealed_end
+                        && boundary.active.segment_id == segment_id
+                        && boundary.active.wal_format == obligation.wal_format,
+                    "versioned PITR source boundary differs from its manifest obligation"
+                );
+                let expected_format = match obligation.wal_format {
+                    crate::pitr::manifest::PitrWalFormat::V7 => {
+                        crate::pitr::seal::SealSidecarFormat::V7
+                    }
+                    crate::pitr::manifest::PitrWalFormat::V8 => {
+                        crate::pitr::seal::SealSidecarFormat::V8
+                    }
+                    _ => unreachable!("guarded to versioned PITR formats"),
+                };
+                (expected_format, Some(boundary.sealed_end))
+            }
+            crate::pitr::manifest::PitrWalFormat::LegacyV5V6
+            | crate::pitr::manifest::PitrWalFormat::Unspecified => (
+                crate::pitr::seal::SealSidecarFormat::V5,
+                configured_segment_limit,
+            ),
+        };
         let expected_seal_name = format!("pitr-{segment_id:020}.seal");
         for entry in std::fs::read_dir(&self.inner.path)? {
             let path = entry?.path();
@@ -5396,7 +5456,11 @@ impl KvEngine {
             {
                 continue;
             }
-            let (format, bytes) = crate::pitr::seal::read_seal_sidecar(&path, max_segment_bytes)?;
+            let (format, bytes) = crate::pitr::seal::read_seal_sidecar_for_format(
+                &path,
+                sidecar_image_limit,
+                expected_format,
+            )?;
             match format {
                 crate::pitr::seal::SealSidecarFormat::V5 => {
                     let seal = crate::pitr::seal::V5Seal::decode(&bytes)?;
@@ -5411,9 +5475,12 @@ impl KvEngine {
                     }
                 }
                 crate::pitr::seal::SealSidecarFormat::V7 => {
-                    let max_segment_bytes = max_segment_bytes
-                        .ok_or_else(|| anyhow!("PITR v7 source has no persisted segment limit"))?;
-                    let seal = crate::pitr::seal::V7Seal::decode(&bytes, max_segment_bytes)?;
+                    let seal = crate::pitr::seal::V7Seal::decode(
+                        &bytes,
+                        sidecar_image_limit.ok_or_else(|| {
+                            anyhow!("PITR v7 source has no immutable image limit")
+                        })?,
+                    )?;
                     if seal.header.segment_id.0 == segment_id {
                         return Ok(PitrSourceSealSummary {
                             logical_length: seal.boundary.sealed_end,
@@ -5425,9 +5492,12 @@ impl KvEngine {
                     }
                 }
                 crate::pitr::seal::SealSidecarFormat::V8 => {
-                    let max_segment_bytes = max_segment_bytes
-                        .ok_or_else(|| anyhow!("PITR v8 source has no persisted segment limit"))?;
-                    let seal = crate::pitr::seal::V8Seal::decode(&bytes, max_segment_bytes)?;
+                    let seal = crate::pitr::seal::V8Seal::decode(
+                        &bytes,
+                        sidecar_image_limit.ok_or_else(|| {
+                            anyhow!("PITR v8 source has no immutable image limit")
+                        })?,
+                    )?;
                     if seal.header.segment_id.0 == segment_id {
                         return Ok(PitrSourceSealSummary {
                             logical_length: seal.boundary.sealed_end,
@@ -23060,10 +23130,7 @@ mod tests {
             metadata.wal_format_version == crate::wal::format::WAL_FORMAT_VERSION_V7,
             "an unrelated malformed sidecar must not shadow the canonical source"
         );
-        let seal_summary = engine.load_pitr_source_seal(
-            segment_id,
-            state.config.as_ref().map(|config| config.max_segment_bytes),
-        )?;
+        let seal_summary = engine.load_pitr_source_seal(&sealing_state, segment_id)?;
         assert_eq!(seal_summary.logical_length, sealed_end);
         assert_eq!(
             seal_summary.last_commit.map(|(commit_ts, _)| commit_ts),
@@ -23374,6 +23441,17 @@ mod tests {
             .expect_err("a v8 obligation must reject a legacy seal before reading its body");
         assert!(
             wrong_format_error
+                .to_string()
+                .contains("format differs from its manifest obligation")
+        );
+        let wrong_format_summary_error = engine
+            .load_pitr_source_seal(&state, segment_id)
+            .err()
+            .ok_or_else(|| {
+                anyhow::anyhow!("sealing recovery accepted a legacy seal under a v8 obligation")
+            })?;
+        assert!(
+            wrong_format_summary_error
                 .to_string()
                 .contains("format differs from its manifest obligation")
         );
