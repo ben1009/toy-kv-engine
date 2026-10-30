@@ -1,0 +1,29 @@
+START ext4-batch8
+ext4-batch8 warmup 0 retained-v7 clean_sampled
+ext4-batch8 warmup 0 candidate-v7 clean_sampled
+ext4-batch8 scored 1 retained-v7 clean_sampled
+ext4-batch8 scored 1 candidate-v7 clean_sampled
+ext4-batch8 scored 2 candidate-v7 clean_sampled
+ext4-batch8 scored 2 retained-v7 clean_sampled
+ext4-batch8 scored 3 retained-v7 clean_sampled
+ext4-batch8 scored 3 candidate-v7 clean_sampled
+DONE ext4-batch8
+START ext4-batch16
+Traceback (most recent call last):
+  File "/home/liu/proj/toy-kv-engine/docs/wal/benchmarks/artifacts/rfc-025-v7-progress-sync-20261030-run.py", line 167, in <module>
+    main()
+    ~~~~^^
+  File "/home/liu/proj/toy-kv-engine/docs/wal/benchmarks/artifacts/rfc-025-v7-progress-sync-20261030-run.py", line 122, in main
+    stdout, stderr, audit, clean = run_audited(wrapped)
+                                   ~~~~~~~~~~~^^^^^^^^^
+  File "/home/liu/proj/toy-kv-engine/docs/wal/benchmarks/artifacts/rfc-025-v7-progress-sync-20261030-run.py", line 52, in run_audited
+    raise RuntimeError('Competing processes before launch: ' + json.dumps(before))
+RuntimeError: Competing processes before launch: {"time_utc": "2026-10-30T02:44:53.821704+00:00", "competing": [{"pid": 1208243, "ppid": 1059978, "command": "cargo-make", "state": "Ss", "cpu_percent": 3.4}, {"pid": 1208649, "ppid": 1208243, "command": "cargo-nextest", "state": "S", "cpu_percent": 3.7}, {"pid": 1208696, "ppid": 1208649, "command": "cargo", "state": "Sl", "cpu_percent": 13.7}, {"pid": 1208701, "ppid": 1208696, "command": "rustc", "state": "Sl", "cpu_percent": 176.0}, {"pid": 1208875, "ppid": 1208696, "command": "rustc", "state": "Sl", "cpu_percent": 168.0}, {"pid": 1208876, "ppid": 1208696, "command": "rustc", "state": "Sl", "cpu_percent": 37.5}, {"pid": 1208877, "ppid": 1208696, "command": "rustc", "state": "Sl", "cpu_percent": 56.2}, {"pid": 1208878, "ppid": 1208696, "command": "rustc", "state": "Sl", "cpu_percent": 43.7}, {"pid": 1208879, "ppid": 1208696, "command": "rustc", "state": "Sl", "cpu_percent": 135.0}, {"pid": 1208984, "ppid": 1208876, "command": "cc", "state": "S", "cpu_percent": 0.0}, {"pid": 1209034, "ppid": 1208984, "command": "collect2", "state": "S", "cpu_percent": 0.0}, {"pid": 1209250, "ppid": 1208878, "command": "cc", "state": "S", "cpu_percent": 0.0}, {"pid": 1209253, "ppid": 1209250, "command": "collect2", "state": "S", "cpu_percent": 0.0}, {"pid": 1209273, "ppid": 1208877, "command": "cc", "state": "S", "cpu_percent": 0.0}, {"pid": 1209276, "ppid": 1209273, "command": "collect2", "state": "S", "cpu_percent": 0.0}], "load_average": [2.12353515625, 1.62841796875, 1.11865234375], "cpu_jiffies": [20221348, 5322, 9044341, 7148650126, 4382552, 1304645, 1592196, 0, 0, 0], "device_diskstats": " 259       0 nvme0n1 1164183 171231 116897804 640883 301555588 114486192 15841754810 477908882 0 45718454 493213363 255713 0 2484154120 921501 52540153 13742096", "io_pressure": "some avg10=1.04 avg60=10.43 avg300=8.02 total=10463500634\nfull avg10=1.03 avg60=10.33 avg300=7.83 total=10347507571"}
+Traceback (most recent call last):
+  File "/home/liu/proj/toy-kv-engine/docs/wal/benchmarks/artifacts/rfc-025-v7-progress-sync-20261030-run-all.py", line 8, in <module>
+    print('START',cell,flush=True); subprocess.run([sys.executable,str(art/(stem+'-run.py')),cell],check=True);print('DONE',cell,flush=True)
+                                    ~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.14/subprocess.py", line 577, in run
+    raise CalledProcessError(retcode, process.args,
+                             output=stdout, stderr=stderr)
+subprocess.CalledProcessError: Command '['/usr/bin/python3', '/home/liu/proj/toy-kv-engine/docs/wal/benchmarks/artifacts/rfc-025-v7-progress-sync-20261030-run.py', 'ext4-batch16']' returned non-zero exit status 1.

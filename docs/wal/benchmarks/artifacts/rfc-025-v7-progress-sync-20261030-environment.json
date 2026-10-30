@@ -1,0 +1,21 @@
+{
+  "captured_at_utc": "2026-10-30T07:27:49.861781+00:00",
+  "repository": "/home/liu/proj/toy-kv-engine",
+  "filesystem": "/dev/nvme0n1p3[/liu/proj/toy-kv-engine] ext4 /home/liu/proj/toy-kv-engine",
+  "base_commit": "7c55d461",
+  "candidate_patch_raw_sha256": "f91c7c557189bf9432e69ab8368d33d3e89d60d5774723f2927db91b9ca54c69",
+  "candidate_patch_gzip_sha256": "b68016288c635c3e21645a400222a78555d5d1a4a6fd43761d55bb6562060999",
+  "binaries_rechecked_after_capture": {
+    "retained-v7": {
+      "path": "target/wal-opt/20261030-v7-dynamic-group/write-perf-v7-dynamic-window",
+      "sha256": "53d9ddddf0490142bbc5449ebf47b20af363e06c04259f4e74367cc3e7614907"
+    },
+    "candidate-v7": {
+      "path": "target/wal-opt/20261030-v7-progress-sync/write-perf-v7-progress-sync",
+      "sha256": "093312e765a114634604103d47e75d7c45a3096b4c7fa12704e5ec66fdcbd20d"
+    }
+  },
+  "candidate_correctness": "96 WAL runtime and worker nextest tests passed outside the sandbox without retries.",
+  "interruption": "The initial screen stopped before the first 16-writer warmup because an unrelated Rust build was detected. Its completed 8-writer cell, empty 16-writer output, and failure log are preserved.",
+  "disposition": "Experimental progress policy restored to base after the performance screen lacked sufficient eligible samples; patch and raw captures preserved."
+}
