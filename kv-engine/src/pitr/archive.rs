@@ -916,66 +916,13 @@ pub(crate) fn decode_v8_archive_batches(
     seal_bytes: &[u8],
     limits: crate::pitr::WalV5Limits,
 ) -> anyhow::Result<Vec<crate::pitr::WalBatch>> {
-    use std::io::Cursor;
-
-    use crate::wal::v8::{
-        codec::WAL_V8_FRAME_LEN,
-        recovery::{discover_frontier_candidates, select_sealed_candidate_for_replay},
-    };
-
     let seal = decode_v8_archive_seal(metadata, seal_bytes)?;
     let wal_len = u64::try_from(wal.len())?;
     anyhow::ensure!(
         wal_len == seal.boundary.sealed_end,
         "v8 archive WAL length differs from its immutable seal"
     );
-    anyhow::ensure!(
-        Sha256::digest(wal).as_slice() == seal.boundary.wal_digest,
-        "v8 archive WAL digest mismatch"
-    );
-
-    let physical_header_digest = seal.header.physical_digest()?;
-    let initial_prefix_digest = seal.header.initial_prefix_digest()?;
-    let mut reader = Cursor::new(wal);
-    let discovery = discover_frontier_candidates(
-        &mut reader,
-        wal_len,
-        &physical_header_digest,
-        &initial_prefix_digest,
-    )?;
-    let (selection, tickets) = select_sealed_candidate_for_replay(
-        &mut reader,
-        wal_len,
-        &discovery,
-        &[seal.boundary.active],
-        seal.header.predecessor,
-        limits,
-    )?;
-    let terminal_offset = seal
-        .boundary
-        .sealed_end
-        .checked_sub(u64::try_from(WAL_V8_FRAME_LEN)?)
-        .ok_or_else(|| anyhow::anyhow!("v8 archive terminal frontier offset underflows"))?;
-    anyhow::ensure!(
-        selection.header == seal.header
-            && selection.active_boundary == seal.boundary.active
-            && selection.candidate.frame_offset == terminal_offset
-            && selection.candidate.frame_digest == seal.boundary.terminal_frontier_digest
-            && u64::try_from(tickets.len())? == seal.boundary.active.ticket_end
-            && tickets.len() == seal.entries.len(),
-        "v8 archive WAL does not match its immutable terminal boundary"
-    );
-    for (index, (ticket, entry)) in tickets.iter().zip(&seal.entries).enumerate() {
-        anyhow::ensure!(
-            entry.ticket == u64::try_from(index)?
-                && entry.first_data_offset == ticket.first_data_offset
-                && entry.commit_ts == ticket.commit_ts
-                && entry.recorded_at == ticket.recorded_at,
-            "v8 archive seal index differs from its WAL"
-        );
-    }
-
-    Ok(selection.batches)
+    seal.decode_wal_batches(wal, limits)
 }
 
 /// Validate a frozen v7 archive pair and decode its ticket-ordered batches.

@@ -1559,6 +1559,117 @@ impl V8Seal {
 
         Ok(())
     }
+
+    /// Decode and visit ticket-ordered replay batches from a strictly verified
+    /// frozen v8 WAL image. The seal index and terminal frontier are checked
+    /// against the same recovery selection that supplies the batches.
+    pub(crate) fn visit_wal_batches_from_reader<R: Read + Seek>(
+        &self,
+        reader: &mut R,
+        wal_len: u64,
+        limits: WalV5Limits,
+        mut visit_batch: impl FnMut(WalBatch) -> Result<()>,
+    ) -> Result<()> {
+        use crate::wal::v8::{
+            codec::WAL_V8_FRAME_LEN,
+            recovery::{discover_frontier_candidates, select_sealed_candidate_for_replay},
+        };
+
+        self.validate()?;
+        ensure!(
+            wal_len == self.boundary.sealed_end,
+            "v8 PITR WAL length differs from its immutable seal"
+        );
+
+        let mut header_bytes = [0; crate::wal::v8::WAL_V8_HEADER_LEN];
+        reader
+            .seek(SeekFrom::Start(0))
+            .context("seek v8 PITR WAL to its immutable header")?;
+        reader
+            .read_exact(&mut header_bytes)
+            .context("read v8 PITR WAL immutable header")?;
+        let header = WalV8Header::decode(&header_bytes)?;
+        ensure!(
+            header.encode()?.as_slice() == header_bytes && header == self.header,
+            "v8 PITR seal identity differs from the WAL header"
+        );
+
+        let physical_header_digest = header.physical_digest()?;
+        let initial_prefix_digest = header.initial_prefix_digest()?;
+        let discovery = discover_frontier_candidates(
+            reader,
+            wal_len,
+            &physical_header_digest,
+            &initial_prefix_digest,
+        )?;
+        let (selection, tickets) = select_sealed_candidate_for_replay(
+            reader,
+            wal_len,
+            &discovery,
+            &[self.boundary.active],
+            header.predecessor,
+            limits,
+        )?;
+        let terminal_offset = self
+            .boundary
+            .sealed_end
+            .checked_sub(u64::try_from(WAL_V8_FRAME_LEN)?)
+            .context("v8 terminal FRONTIER offset underflows")?;
+        ensure!(
+            selection.header == self.header
+                && selection.active_boundary == self.boundary.active
+                && selection.candidate.frame_offset == terminal_offset
+                && selection.candidate.frame_digest == self.boundary.terminal_frontier_digest
+                && u64::try_from(tickets.len())? == self.boundary.active.ticket_end
+                && tickets.len() == self.entries.len()
+                && selection.batches.len() == tickets.len(),
+            "v8 PITR terminal FRONTIER differs from its immutable seal"
+        );
+
+        for (index, (ticket, entry)) in tickets.iter().zip(&self.entries).enumerate() {
+            let expected_ticket = u64::try_from(index)?;
+            ensure!(
+                entry.ticket == expected_ticket
+                    && ticket.first_data_offset == entry.first_data_offset
+                    && ticket.commit_ts == entry.commit_ts
+                    && ticket.recorded_at == entry.recorded_at,
+                "v8 PITR WAL batches or seal index differ from the sidecar"
+            );
+        }
+        ensure!(
+            digest_v8_prefix(reader, wal_len)? == self.boundary.wal_digest,
+            "v8 PITR WAL digest differs from its immutable seal"
+        );
+
+        for batch in selection.batches {
+            visit_batch(batch)?;
+        }
+        Ok(())
+    }
+
+    /// Decode ticket-ordered replay batches from a strictly verified frozen
+    /// v8 WAL image.
+    pub(crate) fn decode_wal_batches(
+        &self,
+        wal: &[u8],
+        limits: WalV5Limits,
+    ) -> Result<Vec<WalBatch>> {
+        let mut reader = std::io::Cursor::new(wal);
+        let mut batches = Vec::new();
+        self.visit_wal_batches_from_reader(
+            &mut reader,
+            u64::try_from(wal.len())?,
+            limits,
+            |batch| {
+                batches
+                    .try_reserve(1)
+                    .map_err(|error| anyhow::anyhow!("reserve v8 PITR restore batches: {error}"))?;
+                batches.push(batch);
+                Ok(())
+            },
+        )?;
+        Ok(batches)
+    }
 }
 
 /// Build a strict v8 seal from the exact frozen image prefix. Unlike Active
@@ -3327,6 +3438,34 @@ mod tests {
     fn v8_frozen_wal_rebuilds_and_strictly_verifies_its_seal() -> Result<()> {
         let (wal, seal) = v8_one_batch_fixture()?;
         seal.verify_wal(&wal)?;
+
+        let expected_batch = WalBatch {
+            commit_ts: 1,
+            recorded_at: RecordedAt {
+                secs: -2,
+                nanos: 500_000_000,
+            },
+            entries: vec![crate::pitr::WalEntry::Put {
+                key: b"k".to_vec(),
+                value: b"v".to_vec(),
+            }],
+        };
+        let mut replayed = Vec::new();
+        let mut reader = Cursor::new(wal.as_slice());
+        seal.visit_wal_batches_from_reader(
+            &mut reader,
+            u64::try_from(wal.len())?,
+            crate::pitr::LIVE_WAL_V5_LIMITS,
+            |batch| {
+                replayed.push(batch);
+                Ok(())
+            },
+        )?;
+        assert_eq!(replayed, vec![expected_batch.clone()]);
+        assert_eq!(
+            seal.decode_wal_batches(&wal, crate::pitr::LIVE_WAL_V5_LIMITS)?,
+            replayed
+        );
 
         let mut reader = Cursor::new(wal.as_slice());
         let (rebuilt, rebuilt_bytes) = build_v8_seal_from_reader(
