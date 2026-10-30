@@ -34447,9 +34447,17 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    #[derive(Clone, Copy)]
+    enum PreV8ReaderGuardState {
+        Published,
+        MissingManifest,
+        MissingManifestPendingSnapshot,
+        AfterGuardAppend,
+    }
+
+    #[cfg(target_os = "linux")]
     fn assert_pre_v8_cli_rejects_guarded_active_v7_without_mutation(
-        remove_manifest: bool,
-        pending_snapshot: bool,
+        state: PreV8ReaderGuardState,
     ) -> anyhow::Result<()> {
         use std::{
             collections::BTreeMap,
@@ -34540,6 +34548,24 @@ mod tests {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("v7 compatibility test database has no MVCC"))?
             .stop_commit_admission_and_capture()?;
+        let database_path = dir.path().join("db");
+        let manifest_path = database_path.join("MANIFEST");
+        let manifest_before_guard = std::fs::read(&manifest_path)?;
+        let prior_snapshot_files = [
+            "ENGINE_MANIFEST",
+            "ENGINE_MANIFEST.tmp",
+            "MANIFEST.v8-guard.tmp",
+        ]
+        .map(|name| {
+            let path = database_path.join(name);
+            if path.try_exists()? {
+                Ok(Some(std::fs::read(path)?))
+            } else {
+                Ok(None)
+            }
+        })
+        .into_iter()
+        .collect::<anyhow::Result<Vec<_>>>()?;
         let publication_guards = engine.lock_v8_compatibility_publication();
         engine
             .inner
@@ -34548,21 +34574,62 @@ mod tests {
         engine.close_storage()?;
         drop(engine);
 
-        let database_path = dir.path().join("db");
-        if pending_snapshot {
-            anyhow::ensure!(
-                remove_manifest,
-                "pending snapshot compatibility case requires a missing MANIFEST"
-            );
-            std::fs::rename(
-                database_path.join("ENGINE_MANIFEST"),
-                database_path.join("ENGINE_MANIFEST.tmp"),
-            )?;
+        let manifest_snapshot = std::fs::read(database_path.join("ENGINE_MANIFEST"))?;
+        let v8_snapshot: crate::manifest::ManifestRecord =
+            serde_json::from_slice(&manifest_snapshot)?;
+        let snapshot_id = match v8_snapshot {
+            crate::manifest::ManifestRecord::V8Snapshot { snapshot_id, .. } => snapshot_id,
+            _ => anyhow::bail!("published compatibility snapshot is not v8-wrapped"),
+        };
+        match state {
+            PreV8ReaderGuardState::Published => {}
+            PreV8ReaderGuardState::MissingManifest => {
+                std::fs::remove_file(database_path.join("MANIFEST"))?;
+            }
+            PreV8ReaderGuardState::MissingManifestPendingSnapshot => {
+                std::fs::rename(
+                    database_path.join("ENGINE_MANIFEST"),
+                    database_path.join("ENGINE_MANIFEST.tmp"),
+                )?;
+                std::fs::remove_file(database_path.join("MANIFEST"))?;
+            }
+            PreV8ReaderGuardState::AfterGuardAppend => {
+                let mut marker_only_manifest = manifest_before_guard;
+                marker_only_manifest.extend_from_slice(&serde_json::to_vec(
+                    &crate::manifest::ManifestRecord::V8CompatibilityGuard {
+                        format_version: crate::wal::format::WAL_FORMAT_VERSION_V8,
+                        snapshot_id,
+                    },
+                )?);
+                let mut manifest_file = std::fs::File::create(database_path.join("MANIFEST"))?;
+                use std::io::Write;
+                manifest_file.write_all(&marker_only_manifest)?;
+                manifest_file.sync_all()?;
+                for (name, prior_contents) in [
+                    "ENGINE_MANIFEST",
+                    "ENGINE_MANIFEST.tmp",
+                    "MANIFEST.v8-guard.tmp",
+                ]
+                .into_iter()
+                .zip(prior_snapshot_files)
+                {
+                    let path = database_path.join(name);
+                    match prior_contents {
+                        Some(contents) => {
+                            let mut file = std::fs::File::create(path)?;
+                            use std::io::Write;
+                            file.write_all(&contents)?;
+                            file.sync_all()?;
+                        }
+                        None if path.try_exists()? => {
+                            std::fs::remove_file(path)?;
+                        }
+                        None => {}
+                    }
+                }
+            }
         }
-        if remove_manifest {
-            std::fs::remove_file(database_path.join("MANIFEST"))?;
-            std::fs::File::open(&database_path)?.sync_all()?;
-        }
+        std::fs::File::open(&database_path)?.sync_all()?;
         let before = snapshot_database(&database_path)?;
         let output = Command::new(old_cli)
             .arg("--path")
@@ -34581,10 +34648,15 @@ mod tests {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
-        let identifies_expected_v8_record = if remove_manifest {
-            diagnostic.contains("V8Snapshot")
-        } else {
-            diagnostic.contains("V8CompatibilityGuard") || diagnostic.contains("V8Snapshot")
+        let identifies_expected_v8_record = match state {
+            PreV8ReaderGuardState::Published => {
+                diagnostic.contains("V8CompatibilityGuard") || diagnostic.contains("V8Snapshot")
+            }
+            PreV8ReaderGuardState::MissingManifest
+            | PreV8ReaderGuardState::MissingManifestPendingSnapshot => {
+                diagnostic.contains("V8Snapshot")
+            }
+            PreV8ReaderGuardState::AfterGuardAppend => diagnostic.contains("V8CompatibilityGuard"),
         };
         anyhow::ensure!(
             diagnostic.contains("unknown variant") && identifies_expected_v8_record,
@@ -34602,7 +34674,9 @@ mod tests {
     #[test]
     #[ignore = "requires the pre-v8 CLI path in TOY_KV_PRE_V8_CLI"]
     fn v8_compatibility_guard_rejects_pre_v8_cli_without_database_mutation() -> anyhow::Result<()> {
-        assert_pre_v8_cli_rejects_guarded_active_v7_without_mutation(false, false)
+        assert_pre_v8_cli_rejects_guarded_active_v7_without_mutation(
+            PreV8ReaderGuardState::Published,
+        )
     }
 
     #[cfg(target_os = "linux")]
@@ -34610,7 +34684,9 @@ mod tests {
     #[ignore = "requires the pre-v8 CLI path in TOY_KV_PRE_V8_CLI"]
     fn v8_compatibility_guard_rejects_pre_v8_cli_with_missing_manifest_without_mutation()
     -> anyhow::Result<()> {
-        assert_pre_v8_cli_rejects_guarded_active_v7_without_mutation(true, false)
+        assert_pre_v8_cli_rejects_guarded_active_v7_without_mutation(
+            PreV8ReaderGuardState::MissingManifest,
+        )
     }
 
     #[cfg(target_os = "linux")]
@@ -34618,7 +34694,19 @@ mod tests {
     #[ignore = "requires the pre-v8 CLI path in TOY_KV_PRE_V8_CLI"]
     fn v8_compatibility_guard_rejects_pre_v8_cli_with_missing_manifest_and_pending_snapshot_without_mutation()
     -> anyhow::Result<()> {
-        assert_pre_v8_cli_rejects_guarded_active_v7_without_mutation(true, true)
+        assert_pre_v8_cli_rejects_guarded_active_v7_without_mutation(
+            PreV8ReaderGuardState::MissingManifestPendingSnapshot,
+        )
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires the pre-v8 CLI path in TOY_KV_PRE_V8_CLI"]
+    fn v8_compatibility_guard_rejects_pre_v8_cli_after_guard_append_before_snapshot_mutation()
+    -> anyhow::Result<()> {
+        assert_pre_v8_cli_rejects_guarded_active_v7_without_mutation(
+            PreV8ReaderGuardState::AfterGuardAppend,
+        )
     }
 
     #[cfg(target_os = "linux")]
