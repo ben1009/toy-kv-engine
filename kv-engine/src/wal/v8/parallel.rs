@@ -72,6 +72,7 @@ struct CoordinatorState {
     last_commit_ts: u64,
     last_recorded_at: Option<RecordedAt>,
     reserved_bytes: u64,
+    reserved_preparation_bytes: u64,
     tickets: VecDeque<TicketState>,
     pending_frontier: Option<WalV8FrontierReservation>,
     last_frontier_end: u64,
@@ -123,8 +124,8 @@ pub(crate) struct WalV8CoordinatorWake {
 
 impl WalV8ParallelCoordinator {
     /// Create a bounded ticket coordinator positioned at a recovered Active
-    /// image. The caller remains responsible for reserving source-spool and
-    /// preparation-index capacity before calling [`PreparedWalV8Batch::admit`].
+    /// image. Source-spool capacity is managed by the caller; preparation
+    /// indexes are charged against this coordinator's shared byte window.
     pub(crate) fn new(header: WalV8Header, config: WalV8ParallelConfig) -> Result<Self> {
         ensure!(
             config.max_inflight_tickets > 0,
@@ -187,6 +188,7 @@ impl WalV8ParallelCoordinator {
                     last_commit_ts: config.last_commit_ts,
                     last_recorded_at: config.last_recorded_at,
                     reserved_bytes: 0,
+                    reserved_preparation_bytes: 0,
                     tickets,
                     pending_frontier: None,
                     last_frontier_end: config.next_data_offset,
@@ -538,6 +540,36 @@ impl WalV8ParallelCoordinator {
             poisoned: state.poisoned,
         }
     }
+
+    /// Charge preparation-index memory before canonicalization allocates it.
+    /// The charge shares the admission byte window so concurrent producers
+    /// cannot each allocate an unbounded pre-admission index.
+    pub(crate) fn reserve_preparation(&self, bytes: u64) -> Result<WalV8PreparationReservation> {
+        ensure!(
+            bytes <= self.inner.max_inflight_bytes,
+            "v8 preparation index exceeds the configured byte window"
+        );
+        let mut state = self.inner.state.lock();
+        ensure!(!state.poisoned, "v8 Parallel coordinator is poisoned");
+        ensure!(!state.closed, "v8 Parallel coordinator is closed");
+        let new_preparation_bytes = state
+            .reserved_preparation_bytes
+            .checked_add(bytes)
+            .context("v8 preparation reservation accounting overflows")?;
+        let total_reserved_bytes = state
+            .reserved_bytes
+            .checked_add(new_preparation_bytes)
+            .context("v8 combined admission reservation accounting overflows")?;
+        ensure!(
+            total_reserved_bytes <= self.inner.max_inflight_bytes,
+            "v8 preparation reservation window is full"
+        );
+        state.reserved_preparation_bytes = new_preparation_bytes;
+        Ok(WalV8PreparationReservation {
+            coordinator: self.clone(),
+            bytes,
+        })
+    }
 }
 
 impl WalV8AdmissionPublisher for WalV8ParallelCoordinator {
@@ -568,8 +600,11 @@ impl WalV8AdmissionPublisher for WalV8ParallelCoordinator {
             .reserved_bytes
             .checked_add(reserved_bytes)
             .context("v8 Parallel reservation accounting overflows")?;
+        let total_reserved_bytes = new_reserved_bytes
+            .checked_add(state.reserved_preparation_bytes)
+            .context("v8 combined admission reservation accounting overflows")?;
         ensure!(
-            new_reserved_bytes <= self.inner.max_inflight_bytes,
+            total_reserved_bytes <= self.inner.max_inflight_bytes,
             "v8 Parallel buffer reservation is full"
         );
         ensure!(
@@ -636,6 +671,28 @@ pub(crate) struct WalV8ParallelAdmissionGuard {
     coordinator: WalV8ParallelCoordinator,
     ticket: u64,
     armed: bool,
+}
+
+/// RAII charge for canonicalization indexes allocated before ticket admission.
+/// It releases shared-window capacity when preparation encoding consumes the
+/// canonical stream or when preflight fails.
+pub(crate) struct WalV8PreparationReservation {
+    coordinator: WalV8ParallelCoordinator,
+    bytes: u64,
+}
+
+impl Drop for WalV8PreparationReservation {
+    fn drop(&mut self) {
+        if self.bytes == 0 {
+            return;
+        }
+        let mut state = self.coordinator.inner.state.lock();
+        let Some(remaining) = state.reserved_preparation_bytes.checked_sub(self.bytes) else {
+            poison_locked(&self.coordinator.inner, &mut state);
+            return;
+        };
+        state.reserved_preparation_bytes = remaining;
+    }
 }
 
 impl WalV8AdmissionGuard for WalV8ParallelAdmissionGuard {
@@ -1154,6 +1211,47 @@ mod tests {
         assert!(admit(&second, &coordinator).is_err());
         assert_eq!(coordinator.next_ticket(), 1);
         assert_eq!(coordinator.admitted_window().len(), 1);
+        drop(admitted);
+        assert!(coordinator.is_poisoned());
+        Ok(())
+    }
+
+    #[test]
+    fn preparation_reservation_counts_against_admission_window() -> Result<()> {
+        let mut batch = batch(10);
+        batch.entries.push(WalEntry::Put {
+            key: b"other".to_vec(),
+            value: vec![0x3c; 24],
+        });
+        let preparation_bytes = PreparedWalV8Batch::<()>::preparation_buffer_bytes(
+            &batch,
+            crate::pitr::LIVE_WAL_V5_LIMITS,
+        )?;
+        assert!(preparation_bytes > 0);
+        let prepared =
+            PreparedWalV8Batch::<()>::preflight(&batch, crate::pitr::LIVE_WAL_V5_LIMITS, |_| {
+                Ok(())
+            })?;
+        let ticket_bytes = u64::try_from(prepared.logical_batch_bytes())?
+            .checked_add(u64::try_from(prepared.frame_buffer_bytes())?)
+            .context("test ticket reservation overflows")?;
+        drop(prepared);
+
+        let byte_limit = ticket_bytes
+            .checked_add(preparation_bytes)
+            .and_then(|total| total.checked_sub(1))
+            .context("test byte limit underflows")?;
+        let coordinator = coordinator_with_byte_limit(8, byte_limit)?;
+        let preparation = coordinator.reserve_preparation(preparation_bytes)?;
+
+        assert!(admit(&batch, &coordinator).is_err());
+        assert_eq!(coordinator.next_ticket(), 0);
+        assert!(coordinator.admitted_window().is_empty());
+        assert!(!coordinator.is_poisoned());
+
+        drop(preparation);
+        let admitted = admit(&batch, &coordinator)?;
+        assert_eq!(coordinator.next_ticket(), 1);
         drop(admitted);
         assert!(coordinator.is_poisoned());
         Ok(())

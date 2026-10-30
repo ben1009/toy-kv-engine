@@ -210,6 +210,7 @@ impl<G: WalV8AdmissionGuard, R> AdmittedWalV8Batch<'_, G, R> {
     /// emitted slices, then finalize the assigned logical header and batch hash.
     pub(crate) fn encode(self) -> Result<EncodedWalV8Batch<G>> {
         let Self {
+            preparation_reservation,
             canonical,
             limits,
             logical_batch_bytes,
@@ -217,9 +218,9 @@ impl<G: WalV8AdmissionGuard, R> AdmittedWalV8Batch<'_, G, R> {
             fragment_count,
             frame_buffer_bytes,
             admission_guard,
-            preparation_reservation: _preparation_reservation,
         } = self;
         let entry_stream_len = canonical.data_len();
+        let entry_count = canonical.entry_count();
         let mut logical_batch = Vec::new();
         logical_batch
             .try_reserve_exact(logical_batch_bytes)
@@ -242,11 +243,16 @@ impl<G: WalV8AdmissionGuard, R> AdmittedWalV8Batch<'_, G, R> {
             commit_ts: assignment.commit_ts,
             recorded_at_secs: assignment.recorded_at.secs,
             recorded_at_nanos: assignment.recorded_at.nanos,
-            entry_count: canonical.entry_count(),
+            entry_count,
         }
         .encode_with_data_crc(written, entry_stream_crc, limits)?;
         logical_batch[..codec::WAL_V8_LOGICAL_BATCH_HEADER_LEN].copy_from_slice(&header);
         let batch_digest = digest::batch_digest(&header, &entry_digest);
+
+        // Release the shared preparation charge only after its index storage
+        // has actually been dropped, on both success and error paths.
+        drop(canonical);
+        drop(preparation_reservation);
 
         Ok(EncodedWalV8Batch {
             logical_batch,

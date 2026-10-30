@@ -34,7 +34,10 @@ use super::{
     },
     digest,
     install::WalV8InstalledRecovery,
-    parallel::{WalV8ParallelAdmissionGuard, WalV8ParallelConfig, WalV8ParallelCoordinator},
+    parallel::{
+        WalV8ParallelAdmissionGuard, WalV8ParallelConfig, WalV8ParallelCoordinator,
+        WalV8PreparationReservation,
+    },
     prepare::{EncodedWalV8Batch, PreparedWalV8Batch, WalV8BatchAssignment, WalV8DigestReady},
 };
 
@@ -268,16 +271,20 @@ impl WalV8LeaderWriter {
 
         let mut preparation_index_bytes = 0_u64;
         for batch in batches {
-            let prepared = PreparedWalV8Batch::<()>::preflight(batch, limits, |bytes| {
-                preparation_index_bytes = preparation_index_bytes
-                    .checked_add(bytes)
-                    .context("v8 group preparation index reservation overflows")?;
-                ensure!(
-                    preparation_index_bytes <= self.max_file_size,
-                    WalV8LeaderCapacityError::GroupExceedsAdmissionWindow
-                );
-                Ok(())
-            })?;
+            let prepared = PreparedWalV8Batch::<WalV8PreparationReservation>::preflight(
+                batch,
+                limits,
+                |bytes| {
+                    preparation_index_bytes = preparation_index_bytes
+                        .checked_add(bytes)
+                        .context("v8 group preparation index reservation overflows")?;
+                    ensure!(
+                        preparation_index_bytes <= self.max_file_size,
+                        WalV8LeaderCapacityError::GroupExceedsAdmissionWindow
+                    );
+                    self.coordinator.reserve_preparation(bytes)
+                },
+            )?;
             prepared_batches.push(prepared);
         }
         let mut previous_commit_ts = self.frontier.last_commit_ts;
@@ -944,6 +951,10 @@ mod tests {
         assert_eq!(writer.coordinator.next_ticket(), 0);
         assert!(!writer.is_poisoned());
         assert_eq!(std::fs::metadata(&path)?.len(), installed.image_len);
+        let retried = writer.append_group(&[batch(10)], LIVE_WAL_V5_LIMITS)?;
+        assert_eq!(retried.commits.len(), 1);
+        assert_eq!(retried.commits[0].ticket, 0);
+        assert!(!writer.is_poisoned());
         Ok(())
     }
 
