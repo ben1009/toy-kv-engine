@@ -1,0 +1,7 @@
+[package]
+name = "v7-fused-crc-screen"
+version = "0.1.0"
+edition = "2024"
+[workspace]
+[dependencies]
+crc32fast = "=1.5.0"
