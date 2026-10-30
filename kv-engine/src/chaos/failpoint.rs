@@ -82,6 +82,10 @@ static PARALLEL_WAL_RESULT_DRAIN_GATE: std::sync::OnceLock<ParallelWalTestGate> 
 static PARALLEL_WAL_TXN_ROTATION_GATE: std::sync::OnceLock<ParallelWalTestGate> =
     std::sync::OnceLock::new();
 
+#[cfg(all(test, feature = "chaos-testing"))]
+static PARALLEL_WAL_POST_SUBMIT_HASH_GATE: std::sync::OnceLock<ParallelWalTestGate> =
+    std::sync::OnceLock::new();
+
 /// Pause a child at a configured WAL boundary until the parent kills it.
 pub(crate) fn wal_crash_point(point: &str) {
     if !matches!(
@@ -296,6 +300,20 @@ impl ParallelWalTestGate {
         }
         state.armed = false;
     }
+}
+
+#[cfg(all(test, feature = "chaos-testing"))]
+pub(crate) fn arm_parallel_wal_post_submit_hash_gate() -> ParallelWalTestGateGuard {
+    PARALLEL_WAL_POST_SUBMIT_HASH_GATE
+        .get_or_init(ParallelWalTestGate::default)
+        .arm()
+}
+
+#[cfg(all(test, feature = "chaos-testing"))]
+pub(crate) fn before_parallel_wal_post_submit_hash() {
+    PARALLEL_WAL_POST_SUBMIT_HASH_GATE
+        .get_or_init(ParallelWalTestGate::default)
+        .enter();
 }
 
 #[cfg(all(test, feature = "chaos-testing"))]
