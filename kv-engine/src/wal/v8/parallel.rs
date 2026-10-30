@@ -24,7 +24,6 @@ use super::{
 
 const DATA_START: u64 = (WAL_V8_HEADER_LEN + WAL_V8_FRAME_LEN) as u64;
 const FRAME_LEN_U64: u64 = WAL_V8_FRAME_LEN as u64;
-const MINIMUM_NONEMPTY_IMAGE_LEN: u64 = (WAL_V8_HEADER_LEN + 3 * WAL_V8_FRAME_LEN) as u64;
 
 /// Configuration for a v8 Parallel admission window resumed from recovery.
 #[derive(Clone, Copy, Debug)]
@@ -136,17 +135,14 @@ impl WalV8ParallelCoordinator {
             "v8 Parallel byte window must be nonempty"
         );
         ensure!(
-            (MINIMUM_NONEMPTY_IMAGE_LEN..=MAX_WAL_FILE_SIZE).contains(&config.max_file_size),
+            (DATA_START..=MAX_WAL_FILE_SIZE).contains(&config.max_file_size)
+                && config.max_file_size.is_multiple_of(FRAME_LEN_U64),
             "invalid v8 Parallel segment size"
         );
-        let next_frontier_end = config
-            .next_data_offset
-            .checked_add(FRAME_LEN_U64)
-            .context("v8 Parallel initial FRONTIER end overflows")?;
         ensure!(
             config.next_data_offset >= DATA_START
                 && config.next_data_offset.is_multiple_of(FRAME_LEN_U64)
-                && next_frontier_end <= config.max_file_size,
+                && config.next_data_offset <= config.max_file_size,
             "invalid v8 Parallel next DATA offset"
         );
         if config.next_ticket == 0 {

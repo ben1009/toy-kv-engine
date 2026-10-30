@@ -15,10 +15,6 @@ use std::{
         fs::{FileExt, MetadataExt},
         io::AsRawFd,
     },
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
     thread,
 };
 
@@ -26,7 +22,7 @@ use anyhow::{Context, Result, ensure};
 use sha2::{Digest, Sha256};
 
 use crate::{
-    pitr::{LIVE_WAL_V5_LIMITS, RecordedAt, WalBatch, WalV5Limits},
+    pitr::{LIVE_WAL_V5_LIMITS, WalBatch, WalV5Limits},
     wal::{DirectBuf, MAX_WAL_FILE_SIZE},
 };
 
@@ -38,10 +34,8 @@ use super::{
     },
     digest,
     install::WalV8InstalledRecovery,
-    prepare::{
-        EncodedWalV8Batch, PreparedWalV8Batch, WalV8AdmissionGuard, WalV8AdmissionPlan,
-        WalV8AdmissionPublisher, WalV8BatchAssignment, WalV8DigestReady,
-    },
+    parallel::{WalV8ParallelAdmissionGuard, WalV8ParallelConfig, WalV8ParallelCoordinator},
+    prepare::{EncodedWalV8Batch, PreparedWalV8Batch, WalV8BatchAssignment, WalV8DigestReady},
 };
 
 const FRAME_LEN_U64: u64 = WAL_V8_FRAME_LEN as u64;
@@ -52,6 +46,7 @@ const MAX_GROUP_TICKETS: usize = 8;
 pub(crate) enum WalV8LeaderCapacityError {
     RotationRequired,
     BatchTooLarge,
+    GroupExceedsAdmissionWindow,
 }
 
 impl fmt::Display for WalV8LeaderCapacityError {
@@ -59,6 +54,9 @@ impl fmt::Display for WalV8LeaderCapacityError {
         formatter.write_str(match self {
             Self::RotationRequired => "v8 WAL segment rotation required before retrying batch",
             Self::BatchTooLarge => "v8 WAL batch cannot fit a fresh segment",
+            Self::GroupExceedsAdmissionWindow => {
+                "v8 WAL group exceeds the bounded admission memory window"
+            }
         })
     }
 }
@@ -93,80 +91,19 @@ pub(crate) struct WalV8LeaderWriter {
     header: WalV8Header,
     physical_header_digest: [u8; 32],
     initial_prefix_digest: digest::WalV8Digest,
-    prefix_digest: digest::WalV8Digest,
+    coordinator: WalV8ParallelCoordinator,
     frontier: WalV8Frontier,
     frontier_offset: u64,
     frontier_digest: [u8; 32],
-    append_offset: u64,
-    next_ticket: u64,
-    last_recorded_at: Option<RecordedAt>,
     max_file_size: u64,
     installed_dev: u64,
     installed_ino: u64,
-    poisoned: Arc<AtomicBool>,
-}
-
-struct LeaderAdmissionGuard {
-    ticket: u64,
-    poisoned: Arc<AtomicBool>,
-    armed: bool,
-}
-
-impl WalV8AdmissionGuard for LeaderAdmissionGuard {
-    fn segment_ticket(&self) -> u64 {
-        self.ticket
-    }
-
-    fn poison(&mut self) {
-        if self.armed {
-            self.poisoned.store(true, Ordering::Release);
-            self.armed = false;
-        }
-    }
-
-    fn disarm_after_durable(&mut self) {
-        self.armed = false;
-    }
-}
-
-impl Drop for LeaderAdmissionGuard {
-    fn drop(&mut self) {
-        if self.armed {
-            self.poisoned.store(true, Ordering::Release);
-        }
-    }
-}
-
-struct FixedAdmissionPublisher {
-    assignment: WalV8BatchAssignment,
-    expected_plan: WalV8AdmissionPlan,
-    poisoned: Arc<AtomicBool>,
 }
 
 struct ProducerCompletion {
     assignment: WalV8BatchAssignment,
     digest_ready: WalV8DigestReady,
-    encoded: EncodedWalV8Batch<LeaderAdmissionGuard>,
-}
-
-impl WalV8AdmissionPublisher for FixedAdmissionPublisher {
-    type Guard = LeaderAdmissionGuard;
-
-    fn admit_and_publish(
-        &self,
-        plan: WalV8AdmissionPlan,
-    ) -> Result<(WalV8BatchAssignment, Self::Guard)> {
-        ensure!(
-            plan == self.expected_plan,
-            "v8 admission plan differs from its preflighted reservation"
-        );
-        let guard = LeaderAdmissionGuard {
-            ticket: self.assignment.segment_ticket,
-            poisoned: Arc::clone(&self.poisoned),
-            armed: true,
-        };
-        Ok((self.assignment, guard))
-    }
+    encoded: EncodedWalV8Batch<WalV8ParallelAdmissionGuard>,
 }
 
 impl WalV8LeaderWriter {
@@ -242,6 +179,25 @@ impl WalV8LeaderWriter {
                 && installed.next_ticket == installed.active_boundary.ticket_end,
             "installed v8 FRONTIER does not match its logical recovery boundary"
         );
+        let coordinator = WalV8ParallelCoordinator::new(
+            header,
+            WalV8ParallelConfig {
+                next_ticket: installed.next_ticket,
+                next_data_offset: installed.image_len,
+                last_commit_ts: installed.active_boundary.last_commit_ts,
+                last_recorded_at: installed.last_recorded_at,
+                durable_prefix_digest: installed.active_boundary.prefix_digest,
+                max_inflight_tickets: MAX_GROUP_TICKETS,
+                max_inflight_bytes: max_file_size,
+                max_file_size,
+            },
+        )?;
+        ensure!(
+            coordinator.durable_ticket_end() == installed.active_boundary.ticket_end
+                && coordinator.last_frontier_end() == installed.image_len
+                && coordinator.durable_prefix_digest() == installed.active_boundary.prefix_digest,
+            "v8 admission coordinator differs from the installed recovery boundary"
+        );
 
         Ok(Self {
             write_file,
@@ -249,17 +205,13 @@ impl WalV8LeaderWriter {
             header,
             physical_header_digest,
             initial_prefix_digest,
-            prefix_digest: installed.active_boundary.prefix_digest,
+            coordinator,
             frontier: installed.frontier,
             frontier_offset: installed.frontier_offset,
             frontier_digest: installed.frontier_digest,
-            append_offset: installed.image_len,
-            next_ticket: installed.next_ticket,
-            last_recorded_at: installed.last_recorded_at,
             max_file_size,
             installed_dev: installed.installed_dev,
             installed_ino: installed.installed_ino,
-            poisoned: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -301,10 +253,6 @@ impl WalV8LeaderWriter {
         write_handles
             .try_reserve_exact(batches.len())
             .context("reserve v8 producer write handles")?;
-        let mut assignments = Vec::new();
-        assignments
-            .try_reserve_exact(batches.len())
-            .context("reserve v8 group assignments")?;
         let mut admitted_batches = Vec::new();
         admitted_batches
             .try_reserve_exact(batches.len())
@@ -320,56 +268,20 @@ impl WalV8LeaderWriter {
 
         for batch in batches {
             let prepared = PreparedWalV8Batch::<()>::preflight(batch, limits, |_| Ok(()))?;
-            data_buffers.push(DirectBuf::new(prepared.frame_buffer_bytes()));
-            write_handles.push(
-                self.write_file
-                    .try_clone()
-                    .context("clone v8 WAL data-write handle before admission")?,
-            );
             prepared_batches.push(prepared);
         }
-        let mut frontier_buffer = DirectBuf::new(WAL_V8_FRAME_LEN);
-        let ticket_start = self.next_ticket;
-        let mut ticket = ticket_start;
-        let mut data_offset = self.append_offset;
         let mut previous_commit_ts = self.frontier.last_commit_ts;
-        let mut previous_recorded_at = self.last_recorded_at;
+        let mut frontier_offset = self.coordinator.last_frontier_end();
         for (batch, prepared) in batches.iter().zip(&prepared_batches) {
             ensure!(
                 batch.commit_ts > previous_commit_ts,
                 "v8 Leader group commit timestamps do not advance"
             );
-            let recorded_at = previous_recorded_at.map_or(batch.recorded_at, |previous| {
-                previous.max(batch.recorded_at)
-            });
-            let assignment = WalV8BatchAssignment {
-                segment_ticket: ticket,
-                commit_ts: batch.commit_ts,
-                recorded_at,
-                first_data_offset: data_offset,
-                segment_incarnation: self.header.incarnation,
-                physical_header_digest: self.physical_header_digest,
-                initial_prefix_digest: self.initial_prefix_digest,
-            };
-            let plan = WalV8AdmissionPlan {
-                commit_ts: batch.commit_ts,
-                recorded_at: batch.recorded_at,
-                logical_batch_bytes: prepared.logical_batch_bytes(),
-                fragment_count: prepared.fragment_count(),
-                frame_buffer_bytes: prepared.frame_buffer_bytes(),
-            };
-            assignments.push((assignment, plan));
-            ticket = ticket
-                .checked_add(1)
-                .context("v8 ticket cursor overflows")?;
-            data_offset = data_offset
+            frontier_offset = frontier_offset
                 .checked_add(u64::try_from(prepared.frame_buffer_bytes())?)
                 .context("v8 group DATA allocation end overflows")?;
             previous_commit_ts = batch.commit_ts;
-            previous_recorded_at = Some(recorded_at);
         }
-        let ticket_end = ticket;
-        let frontier_offset = data_offset;
         let frontier_end = frontier_offset
             .checked_add(FRAME_LEN_U64)
             .context("v8 group FRONTIER allocation end overflows")?;
@@ -377,8 +289,8 @@ impl WalV8LeaderWriter {
             let fresh_end = HEADER_LEN_U64
                 .checked_add(FRAME_LEN_U64)
                 .and_then(|start| {
-                    assignments.iter().try_fold(start, |offset, (_, plan)| {
-                        offset.checked_add(u64::try_from(plan.frame_buffer_bytes).ok()?)
+                    prepared_batches.iter().try_fold(start, |offset, prepared| {
+                        offset.checked_add(u64::try_from(prepared.frame_buffer_bytes()).ok()?)
                     })
                 })
                 .and_then(|end| end.checked_add(FRAME_LEN_U64))
@@ -404,22 +316,43 @@ impl WalV8LeaderWriter {
             "v8 DATA group overlaps its previous FRONTIER"
         );
 
-        // All reservations and output buffers exist before coordinates are
-        // consumed. Publishing the full group here lets every admitted ticket
-        // become visible before any producer encodes payload bytes.
-        self.next_ticket = ticket_end;
-        self.append_offset = frontier_end;
-        self.poisoned.store(true, Ordering::Release);
-        for (prepared, (assignment, plan)) in prepared_batches
-            .into_iter()
-            .zip(assignments.iter().copied())
-        {
-            let publisher = FixedAdmissionPublisher {
-                assignment,
-                expected_plan: plan,
-                poisoned: Arc::clone(&self.poisoned),
-            };
-            admitted_batches.push(prepared.admit(&publisher)?);
+        let group_buffer_bytes = prepared_batches.iter().try_fold(0_u64, |total, prepared| {
+            let logical_bytes = u64::try_from(prepared.logical_batch_bytes())
+                .context("v8 logical batch reservation exceeds u64")?;
+            let frame_bytes = u64::try_from(prepared.frame_buffer_bytes())
+                .context("v8 frame buffer reservation exceeds u64")?;
+            total
+                .checked_add(logical_bytes)
+                .and_then(|total| total.checked_add(frame_bytes))
+                .context("v8 group buffer reservation overflows")
+        })?;
+        ensure!(
+            group_buffer_bytes <= self.max_file_size,
+            WalV8LeaderCapacityError::GroupExceedsAdmissionWindow
+        );
+
+        // Delay large aligned allocations and handle clones until metadata,
+        // timestamp, physical-capacity, and aggregate-memory preflight pass.
+        for prepared in &prepared_batches {
+            data_buffers.push(DirectBuf::new(prepared.frame_buffer_bytes()));
+            write_handles.push(
+                self.write_file
+                    .try_clone()
+                    .context("clone v8 WAL data-write handle before admission")?,
+            );
+        }
+        let mut frontier_buffer = DirectBuf::new(WAL_V8_FRAME_LEN);
+
+        // Resource buffers and write handles exist before admission. Publish
+        // every ticket through the actual coordinator before a producer can
+        // encode or hash payload bytes.
+        let ticket_start = self.coordinator.next_ticket();
+        ensure!(
+            self.coordinator.admitted_window().is_empty(),
+            "serial v8 protocol writer has unresolved tickets"
+        );
+        for prepared in prepared_batches {
+            admitted_batches.push(prepared.admit(&self.coordinator)?);
         }
 
         let producer_result = thread::scope(|scope| -> Result<()> {
@@ -427,26 +360,30 @@ impl WalV8LeaderWriter {
             handles
                 .try_reserve_exact(admitted_batches.len())
                 .context("reserve scoped v8 producer handles")?;
-            for ((admitted, (assignment, _)), (mut data_buffer, write_file)) in admitted_batches
+            for (admitted, (mut data_buffer, write_file)) in admitted_batches
                 .into_iter()
-                .zip(assignments.iter().copied())
                 .zip(data_buffers.into_iter().zip(write_handles))
             {
+                let coordinator = self.coordinator.clone();
                 handles.push(scope.spawn(move || -> Result<ProducerCompletion> {
                     let mut encoded = admitted.encode()?;
+                    let assignment = encoded.assignment();
                     let digest_ready = encoded.digest_ready()?;
+                    coordinator.mark_digest_ready(digest_ready)?;
                     let data_len = encoded.encode_data_frames_into(data_buffer.as_mut_slice())?;
                     ensure!(
                         data_len == data_buffer.cap(),
                         "v8 DATA materializer returned an unexpected frame length"
                     );
                     data_buffer.set_len(data_len);
+                    coordinator.mark_frames_ready(assignment.segment_ticket)?;
                     write_aligned_once(
                         &write_file,
                         data_buffer.initialized_slice(0, data_len),
                         assignment.first_data_offset,
                     )
                     .context("write v8 Parallel DATA frames")?;
+                    coordinator.mark_data_complete(assignment.segment_ticket)?;
                     Ok(ProducerCompletion {
                         assignment,
                         digest_ready,
@@ -479,32 +416,46 @@ impl WalV8LeaderWriter {
         });
         producer_result?;
 
-        let mut next_prefix = self.prefix_digest;
-        for ((completion, (expected_assignment, _)), expected_ticket) in producer_completions
+        let ticket_end = ticket_start
+            .checked_add(u64::try_from(producer_completions.len())?)
+            .context("v8 group ticket end overflows")?;
+        let ready_prefix = self.coordinator.frontier_ready_prefix();
+        ensure!(
+            ready_prefix.len() >= producer_completions.len(),
+            "v8 coordinator did not observe the complete DATA/digest-ready group"
+        );
+        for (progress, expected_ticket) in ready_prefix
             .iter()
-            .zip(assignments.iter())
+            .take(producer_completions.len())
             .zip(ticket_start..ticket_end)
         {
             ensure!(
-                completion.assignment == *expected_assignment
+                progress.assignment.segment_ticket == expected_ticket,
+                "v8 coordinator frontier prefix is not ticket-contiguous"
+            );
+        }
+        for (completion, expected_ticket) in
+            producer_completions.iter().zip(ticket_start..ticket_end)
+        {
+            ensure!(
+                completion.assignment.segment_ticket == expected_ticket
                     && completion.digest_ready.segment_ticket == expected_ticket
                     && completion.digest_ready.segment_incarnation == self.header.incarnation,
                 "v8 producer completion does not match its admitted ticket"
             );
-            next_prefix = digest::advance_prefix(
-                &next_prefix,
-                expected_ticket,
-                completion.digest_ready.logical_batch_bytes,
-                &completion.digest_ready.batch_digest,
-            );
         }
+        let reservation = self.coordinator.reserve_frontier(ticket_end)?;
+        ensure!(
+            reservation.frame_offset == frontier_offset,
+            "v8 coordinator FRONTIER offset differs from preflight reservation"
+        );
 
         let frontier = WalV8Frontier {
             generation: next_generation,
             ticket_end,
             durable_end: frontier_offset.max(previous_frontier_end),
             last_commit_ts: previous_commit_ts,
-            prefix_digest: next_prefix,
+            prefix_digest: reservation.prefix_digest,
             previous_frontier_offset: self.frontier_offset,
             previous_frontier_digest: self.frontier_digest,
         };
@@ -528,23 +479,22 @@ impl WalV8LeaderWriter {
         )
         .context("write v8 Leader FRONTIER")?;
         fdatasync_once(&self.sync_file).context("fdatasync v8 Leader WAL")?;
+        self.coordinator.publish_durable_frontier(reservation)?;
 
         // Everything below is infallible publication after the successful
-        // sync. Every ticket guard remains armed until this boundary.
+        // sync and coordinator publication. Every ticket guard remains armed
+        // until this boundary.
         self.frontier = frontier;
         self.frontier_offset = frontier_offset;
         self.frontier_digest = frontier_digest;
-        self.prefix_digest = next_prefix;
-        self.last_recorded_at = previous_recorded_at;
         for completion in &mut producer_completions {
             completion.encoded.disarm_after_durable();
         }
-        self.poisoned.store(false, Ordering::Release);
 
-        for (assignment, _) in assignments {
+        for completion in producer_completions {
             commits.push(WalV8LeaderCommit {
-                ticket: assignment.segment_ticket,
-                first_data_offset: assignment.first_data_offset,
+                ticket: completion.assignment.segment_ticket,
+                first_data_offset: completion.assignment.first_data_offset,
                 frontier,
                 frontier_offset,
                 frontier_digest,
@@ -554,7 +504,7 @@ impl WalV8LeaderWriter {
     }
 
     pub(crate) fn is_poisoned(&self) -> bool {
-        self.poisoned.load(Ordering::Acquire)
+        self.coordinator.is_poisoned()
     }
 }
 
@@ -666,7 +616,8 @@ mod tests {
 
     use super::*;
     use crate::pitr::{
-        ArchiveEpochId, ChainAnchor, SegmentId, TimelineId, WalEntry, manifest::ActiveBoundary,
+        ArchiveEpochId, ChainAnchor, RecordedAt, SegmentId, TimelineId, WalEntry,
+        manifest::ActiveBoundary,
     };
 
     fn header() -> WalV8Header {
@@ -866,6 +817,48 @@ mod tests {
             .append_batch(&batch(10), LIVE_WAL_V5_LIMITS)
             .expect_err("fresh segment cannot fit DATA and its FRONTIER");
         assert!(error.downcast_ref::<WalV8LeaderCapacityError>().is_some());
+        assert!(!writer.is_poisoned());
+        assert_eq!(std::fs::metadata(&path)?.len(), installed.image_len);
+        Ok(())
+    }
+
+    #[test]
+    fn aggregate_admission_window_failure_does_not_consume_tickets() -> Result<()> {
+        const SEGMENT_LIMIT: u64 = 32 * 1024;
+
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("active-v8.wal");
+        let header = header();
+        let installed = install_empty(&path, header)?;
+        let mut writer = WalV8LeaderWriter::new(
+            OpenOptions::new().read(true).write(true).open(&path)?,
+            OpenOptions::new().read(true).write(true).open(&path)?,
+            &installed,
+            SEGMENT_LIMIT,
+        )?;
+        let batches = (1..=5)
+            .map(|ticket| WalBatch {
+                commit_ts: ticket * 10,
+                recorded_at: RecordedAt {
+                    secs: i64::try_from(ticket).unwrap_or(i64::MAX),
+                    nanos: 17,
+                },
+                entries: vec![WalEntry::Put {
+                    key: vec![u8::try_from(ticket).unwrap_or(u8::MAX)],
+                    value: vec![0x5a; 3800],
+                }],
+            })
+            .collect::<Vec<_>>();
+
+        let error = writer
+            .append_group(&batches, LIVE_WAL_V5_LIMITS)
+            .err()
+            .context("aggregate memory reservation exceeds the admission window")?;
+        assert!(matches!(
+            error.downcast_ref::<WalV8LeaderCapacityError>(),
+            Some(WalV8LeaderCapacityError::GroupExceedsAdmissionWindow)
+        ));
+        assert_eq!(writer.coordinator.next_ticket(), 0);
         assert!(!writer.is_poisoned());
         assert_eq!(std::fs::metadata(&path)?.len(), installed.image_len);
         Ok(())
