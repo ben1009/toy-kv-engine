@@ -1,0 +1,6 @@
+{
+  "uncompressed_patch_sha256": "65df6b598759fb05b0821d16c6d064b91b78da358e7a5644a2f595fb153277f7",
+  "gzip_sha256": "4842a68109528cae9d9c26cb1121246f29dc93e671b01952451533151d444093",
+  "archive": "rfc-025-v7-submitted-sync-join-20261030-candidate.patch.gz",
+  "apply": "Decompress the gzip bytes, then apply the resulting patch against the recorded base commit."
+}
