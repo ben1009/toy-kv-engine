@@ -39,7 +39,7 @@ mod parallel_worker;
 #[path = "wal/parallel/runtime.rs"]
 mod parallel_runtime;
 
-pub(crate) use parallel_runtime::WalV7PreparedBatch;
+pub(crate) use parallel_runtime::{WalV7FrameJob, WalV7PreparedBatch};
 
 /// Result of recovering a WAL file, containing both point entries and range tombstones.
 pub struct RecoveredWalBatch {
@@ -1830,12 +1830,31 @@ impl Wal {
 
     /// Admit a prepared v7 PITR batch and return its first DATA frame offset
     /// for the seal index. Callers serialize this with their seal-index update.
+    #[cfg(test)]
     pub(crate) fn put_v7_prepared_batch_with_index(
         &self,
         prepared: WalV7PreparedBatch,
         commit_ts: u64,
         recorded_at: crate::pitr::RecordedAt,
     ) -> Result<(u64, u64)> {
+        let (ticket, offset, frame_job) =
+            self.admit_v7_prepared_batch_with_index(prepared, commit_ts, recorded_at)?;
+        if let Some(job) = frame_job
+            && let Err(error) = job.finish()
+        {
+            self.poisoned.store(true, Ordering::Release);
+            return Err(error);
+        }
+
+        Ok((ticket, offset))
+    }
+
+    pub(crate) fn admit_v7_prepared_batch_with_index(
+        &self,
+        prepared: WalV7PreparedBatch,
+        commit_ts: u64,
+        recorded_at: crate::pitr::RecordedAt,
+    ) -> Result<(u64, u64, Option<WalV7FrameJob>)> {
         anyhow::ensure!(
             self.format_version == WAL_FORMAT_VERSION_V7,
             "v7 WAL append selected for format {}",
@@ -1855,7 +1874,7 @@ impl Wal {
             .context("v7 WAL has no Parallel runtime")?;
         let previous_ticket = self.next_ticket.load(Ordering::Acquire);
         match runtime.put_v7_prepared_batch(prepared, commit_ts, recorded_at) {
-            Ok((ticket, first_data_offset)) => {
+            Ok((ticket, first_data_offset, frame_job)) => {
                 if ticket != previous_ticket {
                     self.poisoned.store(true, Ordering::Release);
                     anyhow::bail!("v7 Parallel ticket disagrees with the WAL admission cursor");
@@ -1869,7 +1888,7 @@ impl Wal {
                     .fetch_max(append_offset, Ordering::Release);
                 self.preallocated_size
                     .fetch_max(append_offset, Ordering::Release);
-                Ok((ticket, first_data_offset))
+                Ok((ticket, first_data_offset, frame_job))
             }
             Err(error) => {
                 if runtime.is_poisoned() {
@@ -1880,18 +1899,37 @@ impl Wal {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn put_v7_batch_with_index(
         &self,
         batch: &crate::pitr::WalBatch,
         limits: crate::pitr::WalV5Limits,
     ) -> Result<(u64, u64)> {
+        let (ticket, offset, frame_job) = self.admit_v7_batch_with_index(batch, limits)?;
+        if let Some(job) = frame_job
+            && let Err(error) = job.finish()
+        {
+            self.poisoned.store(true, Ordering::Release);
+            return Err(error);
+        }
+
+        Ok((ticket, offset))
+    }
+
+    pub(crate) fn admit_v7_batch_with_index(
+        &self,
+        batch: &crate::pitr::WalBatch,
+        limits: crate::pitr::WalV5Limits,
+    ) -> Result<(u64, u64, Option<WalV7FrameJob>)> {
         anyhow::ensure!(
             self.format_version == WAL_FORMAT_VERSION_V7,
             "v7 WAL append selected for format {}",
             self.format_version
         );
         if self.v7_leader.is_some() {
-            return self.put_v7_leader_batch(batch, limits);
+            return self
+                .put_v7_leader_batch(batch, limits)
+                .map(|(ticket, offset)| (ticket, offset, None));
         }
 
         let runtime = self
@@ -1904,7 +1942,7 @@ impl Wal {
         );
         let previous_ticket = self.next_ticket.load(Ordering::Acquire);
         match runtime.put_v7_batch(batch, limits) {
-            Ok((ticket, first_data_offset)) => {
+            Ok((ticket, first_data_offset, frame_job)) => {
                 if ticket != previous_ticket {
                     self.poisoned.store(true, Ordering::Release);
                     anyhow::bail!("v7 Parallel ticket disagrees with the WAL admission cursor");
@@ -1918,7 +1956,7 @@ impl Wal {
                     .fetch_max(append_offset, Ordering::Release);
                 self.preallocated_size
                     .fetch_max(append_offset, Ordering::Release);
-                Ok((ticket, first_data_offset))
+                Ok((ticket, first_data_offset, frame_job))
             }
             Err(error) => {
                 if runtime.is_poisoned() {

@@ -86,6 +86,14 @@ static PARALLEL_WAL_TXN_ROTATION_GATE: std::sync::OnceLock<ParallelWalTestGate> 
 static PARALLEL_WAL_POST_SUBMIT_HASH_GATE: std::sync::OnceLock<ParallelWalTestGate> =
     std::sync::OnceLock::new();
 
+#[cfg(all(test, feature = "chaos-testing"))]
+static PARALLEL_WAL_PRODUCER_FRAME_GATE: std::sync::OnceLock<ParallelWalTestGate> =
+    std::sync::OnceLock::new();
+
+#[cfg(all(test, feature = "chaos-testing"))]
+static PARALLEL_WAL_SMALL_ADMISSION_GATE: std::sync::OnceLock<ParallelWalTestGate> =
+    std::sync::OnceLock::new();
+
 /// Pause a child at a configured WAL boundary until the parent kills it.
 pub(crate) fn wal_crash_point(point: &str) {
     if !matches!(
@@ -299,6 +307,38 @@ impl ParallelWalTestGate {
                 .expect("parallel WAL test gate mutex poisoned");
         }
         state.armed = false;
+    }
+}
+
+#[cfg(all(test, feature = "chaos-testing"))]
+pub(crate) fn arm_parallel_wal_producer_frame_gate() -> ParallelWalTestGateGuard {
+    PARALLEL_WAL_PRODUCER_FRAME_GATE
+        .get_or_init(ParallelWalTestGate::default)
+        .arm()
+}
+
+#[cfg(all(test, feature = "chaos-testing"))]
+pub(crate) fn before_parallel_wal_producer_frame(ticket: u64) {
+    if ticket == 0 {
+        PARALLEL_WAL_PRODUCER_FRAME_GATE
+            .get_or_init(ParallelWalTestGate::default)
+            .enter();
+    }
+}
+
+#[cfg(all(test, feature = "chaos-testing"))]
+pub(crate) fn arm_parallel_wal_small_admission_gate() -> ParallelWalTestGateGuard {
+    PARALLEL_WAL_SMALL_ADMISSION_GATE
+        .get_or_init(ParallelWalTestGate::default)
+        .arm()
+}
+
+#[cfg(all(test, feature = "chaos-testing"))]
+pub(crate) fn after_parallel_wal_small_admission(ticket: u64) {
+    if ticket == 0 {
+        PARALLEL_WAL_SMALL_ADMISSION_GATE
+            .get_or_init(ParallelWalTestGate::default)
+            .enter();
     }
 }
 

@@ -551,17 +551,106 @@ struct AdmittedBatch {
     ticket: u64,
     file_offset: u64,
     aligned_len: usize,
+    v7_framed: bool,
     v7_allocation: Option<WalV7DataAllocation>,
     v7_input: Option<WalV7AdmittedInput>,
     buffer: ParallelBuffer,
 }
 
-/// Coordinates are assigned, but DATA framing and logical hashing belong to
-/// the ordered packer. The batch reservation already charges both allocations.
+/// Coordinates are assigned. Large DATA buffers are framed by producers;
+/// the ordered packer hashes logical inputs and submits ready DATA. The batch
+/// reservation charges both allocations throughout either placement.
 struct WalV7AdmittedInput {
     logical_batch: EncodedWalV7LogicalBatch,
     header_digest: [u8; 32],
     commit_ts: u64,
+}
+
+/// Assigned DATA work owned by the producer after both sequencers are released.
+/// Dropping an unfinished job poisons its ticket; it cannot leave a live hole.
+#[must_use = "complete producer framing or drop the job to poison its admitted ticket"]
+pub(crate) struct WalV7FrameJob {
+    // AdmittedBatch drops logical bytes before its pinned aligned buffer.
+    batch: Option<AdmittedBatch>,
+    inner: Arc<RuntimeInner>,
+    ticket: u64,
+    completed: bool,
+}
+
+impl WalV7FrameJob {
+    pub(crate) fn finish(mut self) -> Result<()> {
+        let result = (|| -> Result<()> {
+            let mut batch = self.batch.take().context("v7 producer job lost its DATA")?;
+            #[cfg(all(test, feature = "chaos-testing"))]
+            crate::chaos::failpoint::before_parallel_wal_producer_frame(batch.ticket);
+            #[cfg(feature = "chaos-testing")]
+            crate::chaos::failpoint::fail_point!("parallel_wal.v7_producer_frame_failure", |_| {
+                Err(anyhow!("injected v7 producer framing failure"))
+            });
+            let input = batch
+                .v7_input
+                .take()
+                .context("v7 producer job lost its logical input")?;
+            frame_v7_batch(&mut batch, &input)?;
+            batch.v7_input = Some(input);
+            batch.v7_framed = true;
+            let mut admission = self.inner.admission.lock();
+            ensure!(
+                admission
+                    .poison
+                    .as_ref()
+                    .is_none_or(|(poison, _)| batch.ticket < *poison),
+                "v7 producer framing completed after its ticket was poisoned"
+            );
+            publish_v7_ready_batch(&mut admission, batch);
+            drop(admission);
+            self.inner.v7_frames_ready.notify_all();
+            let _ = self.inner.packer_wake.try_send(true);
+            Ok(())
+        })();
+        if let Err(error) = &result {
+            report_packer_failure(&self.inner, self.ticket, error);
+        }
+        self.completed = true;
+
+        result
+    }
+}
+
+impl Drop for WalV7FrameJob {
+    fn drop(&mut self) {
+        if !self.completed {
+            report_packer_failure(
+                &self.inner,
+                self.ticket,
+                &anyhow!("v7 producer framing did not complete"),
+            );
+        }
+    }
+}
+
+fn publish_v7_ready_batch(admission: &mut AdmissionState, batch: AdmittedBatch) {
+    let ticket = batch.ticket;
+    assert!(
+        ticket >= admission.v7_ready_ticket && ticket < admission.next_ticket,
+        "v7 producer completion is outside assigned tickets"
+    );
+    if ticket == admission.v7_ready_ticket {
+        admission.queue.push_back(batch);
+        admission.v7_ready_ticket += 1;
+        while let Some(next) = admission
+            .v7_ready_batches
+            .remove(&admission.v7_ready_ticket)
+        {
+            admission.queue.push_back(next);
+            admission.v7_ready_ticket += 1;
+        }
+    } else {
+        assert!(
+            admission.v7_ready_batches.insert(ticket, batch).is_none(),
+            "v7 producer completed a ticket twice"
+        );
+    }
 }
 
 struct PackedGroup {
@@ -590,6 +679,8 @@ struct AdmissionState {
     v7_prefixes: BTreeMap<u64, WalV7PrefixMetadata>,
     // One ordered packer can hash a submitted group while its DATA is in flight.
     v7_hash_pending: Option<u64>,
+    v7_ready_ticket: u64,
+    v7_ready_batches: BTreeMap<u64, AdmittedBatch>,
     v7_reservations: BTreeMap<u64, WalV7OwnedBatchReservation>,
     queue: VecDeque<AdmittedBatch>,
 }
@@ -669,6 +760,7 @@ impl DurabilityShared {
 struct RuntimeInner {
     admission: Mutex<AdmissionState>,
     v7_prefix_ready: Condvar,
+    v7_frames_ready: Condvar,
     packer_state: Mutex<PackerState>,
     packer_failures: Mutex<Option<Sender<GroupWriteResult>>>,
     packer_wake: Sender<bool>,
@@ -1091,10 +1183,13 @@ impl ParallelWalRuntime {
                 ),
                 v7_prefixes: BTreeMap::new(),
                 v7_hash_pending: None,
+                v7_ready_ticket: start.next_ticket,
+                v7_ready_batches: BTreeMap::new(),
                 v7_reservations: BTreeMap::new(),
                 queue: VecDeque::new(),
             }),
             v7_prefix_ready: Condvar::new(),
+            v7_frames_ready: Condvar::new(),
             packer_state: Mutex::new(PackerState {
                 next_ticket: start.next_ticket,
                 reserved_end: initial_file_end,
@@ -1354,7 +1449,11 @@ impl ParallelWalRuntime {
 
     /// Prepare and admit one v7 ticket into the ordered parallel DATA packer.
     /// The caller publishes the returned ticket only after `wait_durable`.
-    pub(crate) fn put_v7_batch(&self, batch: &WalBatch, limits: WalV5Limits) -> Result<(u64, u64)> {
+    pub(crate) fn put_v7_batch(
+        &self,
+        batch: &WalBatch,
+        limits: WalV5Limits,
+    ) -> Result<(u64, u64, Option<WalV7FrameJob>)> {
         let commit_ts = batch.commit_ts;
         let recorded_at = batch.recorded_at;
         let prepared = self.prepare_v7_batch(batch, limits)?;
@@ -1367,7 +1466,7 @@ impl ParallelWalRuntime {
         prepared_batch: WalV7PreparedBatch,
         commit_ts: u64,
         sampled_recorded_at: crate::pitr::RecordedAt,
-    ) -> Result<(u64, u64)> {
+    ) -> Result<(u64, u64, Option<WalV7FrameJob>)> {
         // Locals drop in reverse binding order on early rejection: buffers
         // and encoded bytes must release before their reservation charge.
         let WalV7PreparedBatch {
@@ -1378,7 +1477,7 @@ impl ParallelWalRuntime {
             frame_bytes,
         } = prepared_batch;
 
-        let (ticket, first_data_offset) = {
+        let (ticket, first_data_offset, frame_job) = {
             let mut admission = self.inner.admission.lock();
             ensure!(admission.open, "v7 Parallel WAL admission is closed");
             validate_v7_data_capacity(&admission, fragment_count)?;
@@ -1431,8 +1530,8 @@ impl ParallelWalRuntime {
                 "v7 Parallel admission reused a reservation ticket"
             );
             // Expected rejection is complete before assigning coordinates.
-            // Framing happens in the ordered packer; a later failure poisons
-            // the admitted range and retains persistent image charges.
+            // Large framing jobs leave admission owned by their producer.
+            // Later failure poisons the assigned range and retains image charges.
             let allocation = admission
                 .v7_allocator
                 .as_mut()
@@ -1452,10 +1551,11 @@ impl ParallelWalRuntime {
             metadata.last_commit_ts = commit_ts;
             metadata.physical_end = data_end;
             metadata.last_recorded_at = Some(recorded_at);
-            admission.queue.push_back(AdmittedBatch {
+            let batch = AdmittedBatch {
                 ticket,
                 file_offset: first_data_offset,
                 aligned_len: frame_bytes,
+                v7_framed: false,
                 v7_allocation: Some(allocation),
                 v7_input: Some(WalV7AdmittedInput {
                     logical_batch,
@@ -1463,14 +1563,27 @@ impl ParallelWalRuntime {
                     commit_ts,
                 }),
                 buffer,
-            });
+            };
+            let frame_job = if frame_bytes >= ALLOCATION_ONLY_MIN_BATCH_BYTES {
+                Some(WalV7FrameJob {
+                    batch: Some(batch),
+                    inner: Arc::clone(&self.inner),
+                    ticket,
+                    completed: false,
+                })
+            } else {
+                publish_v7_ready_batch(&mut admission, batch);
+                None
+            };
             #[cfg(feature = "chaos-testing")]
             crate::chaos::failpoint::note_parallel_wal_admission();
-            (ticket, first_data_offset)
+            (ticket, first_data_offset, frame_job)
         };
 
-        let _ = self.inner.packer_wake.try_send(true);
-        Ok((ticket, first_data_offset))
+        if frame_job.is_none() {
+            let _ = self.inner.packer_wake.try_send(true);
+        }
+        Ok((ticket, first_data_offset, frame_job))
     }
 
     fn activate_buffer(&self, capacity: usize, capacity_u64: u64) -> ParallelBuffer {
@@ -1574,6 +1687,7 @@ impl ParallelWalRuntime {
             ticket,
             file_offset,
             aligned_len,
+            v7_framed: false,
             v7_allocation: None,
             v7_input: None,
             buffer,
@@ -1729,12 +1843,22 @@ impl ParallelWalRuntime {
             };
         }
 
-        {
+        let cutoff = {
             let mut admission = self.inner.admission.lock();
             admission.open = false;
-            admission.close_cutoff = Some(admission.next_ticket);
-        }
+            admission.next_ticket
+        };
         self.inner.buffer_budget.close();
+        {
+            let mut admission = self.inner.admission.lock();
+            while admission.v7_allocator.is_some()
+                && admission.v7_ready_ticket < cutoff
+                && admission.poison.is_none()
+            {
+                self.inner.v7_frames_ready.wait(&mut admission);
+            }
+            admission.close_cutoff = Some(cutoff);
+        }
 
         let mut close_error = threads.close_error.clone();
         let _ = self.inner.packer_wake.send(false);
@@ -1796,6 +1920,7 @@ impl ParallelWalRuntime {
         let remaining_reservations = {
             let mut admission = self.inner.admission.lock();
             admission.queue.clear();
+            admission.v7_ready_batches.clear();
             std::mem::take(&mut admission.v7_reservations)
         };
         for reservation in remaining_reservations.into_values() {
@@ -2202,6 +2327,13 @@ fn take_admitted_group(
 }
 
 fn frame_v7_batch(batch: &mut AdmittedBatch, input: &WalV7AdmittedInput) -> Result<()> {
+    if batch.v7_framed {
+        ensure!(
+            batch.buffer.len() == batch.aligned_len,
+            "ready v7 frame buffer has the wrong length"
+        );
+        return Ok(());
+    }
     let encoded_len = input.logical_batch.encode_data_frames_into(
         input.header_digest,
         batch.file_offset,
@@ -2331,8 +2463,12 @@ fn report_packer_failure(inner: &RuntimeInner, ticket: u64, error: &anyhow::Erro
             .as_ref()
             .map_or(ticket, |(poison_ticket, _)| *poison_ticket);
         admission.queue.retain(|batch| batch.ticket < poison_ticket);
+        admission
+            .v7_ready_batches
+            .retain(|ticket, _| *ticket < poison_ticket);
     }
     inner.v7_prefix_ready.notify_all();
+    inner.v7_frames_ready.notify_all();
     let _ = inner.packer_wake.try_send(true);
     inner.buffer_budget.close();
     if let Some(failures) = inner.packer_failures.lock().as_ref() {
@@ -2357,9 +2493,11 @@ fn poison_unacknowledged(inner: &RuntimeInner, message: &str) {
     admission.v7_hash_pending = None;
     admission.poison = Some((boundary, message.to_owned()));
     admission.queue.clear();
+    admission.v7_ready_batches.clear();
     inner.buffer_budget.close();
     inner.durability.notify_change();
     inner.v7_prefix_ready.notify_all();
+    inner.v7_frames_ready.notify_all();
 }
 
 fn run_sync_coordinator(
@@ -2553,6 +2691,9 @@ fn process_group_result(inner: &RuntimeInner, result: GroupWriteResult) {
                 durability_poison_ticket.min(*poison_ticket)
             });
         admission.queue.retain(|batch| batch.ticket < poison_ticket);
+        admission
+            .v7_ready_batches
+            .retain(|ticket, _| *ticket < poison_ticket);
         inner.buffer_budget.close();
     } else {
         let previous = state.completed.insert(result.tickets.start, result);
@@ -2588,6 +2729,7 @@ fn process_group_result(inner: &RuntimeInner, result: GroupWriteResult) {
     // waiters can finish after fdatasync; poison must wake them immediately.
     if failed {
         inner.durability.notify_change();
+        inner.v7_frames_ready.notify_all();
     }
     drop(state);
 
@@ -2607,6 +2749,7 @@ fn terminalize_unresolved_prefix(inner: &RuntimeInner) {
         let mut admission = inner.admission.lock();
         admission.open = false;
         admission.queue.clear();
+        admission.v7_ready_batches.clear();
         if admission
             .poison
             .as_ref()
@@ -2617,6 +2760,7 @@ fn terminalize_unresolved_prefix(inner: &RuntimeInner) {
         inner.buffer_budget.close();
     }
     inner.durability.notify_change();
+    inner.v7_frames_ready.notify_all();
 }
 
 fn set_poison(state: &mut DurabilityState, ticket: u64, error: String) {
@@ -2646,6 +2790,7 @@ fn poison_v7_runtime(
     }
     admission.open = false;
     admission.queue.clear();
+    admission.v7_ready_batches.clear();
     if admission
         .poison
         .as_ref()
@@ -2655,6 +2800,7 @@ fn poison_v7_runtime(
     }
     inner.buffer_budget.close();
     inner.durability.notify_change();
+    inner.v7_frames_ready.notify_all();
 }
 
 fn append_v7_frontier(
@@ -3925,6 +4071,151 @@ mod tests {
                 value: vec![0x5A; value_len],
             }],
         }
+    }
+
+    #[test]
+    fn v7_producer_framing_publishes_only_a_contiguous_ready_prefix() -> anyhow::Result<()> {
+        use crate::wal::v7::{
+            install::recover_and_install_active, recovery::WalV7RecoveryAuthority,
+        };
+
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("producer-ready-order.wal");
+        let Some(V7RuntimeTestWal { wal, owner, anchor }) =
+            live_v7_test_wal(&path, super::MAX_WAL_FILE_SIZE, v7_test_resource_limits())?
+        else {
+            return Ok(());
+        };
+        let runtime = wal.parallel_runtime.as_ref().unwrap();
+        let packer = runtime.inner.packer_state.lock();
+        let batches = [v7_test_batch(1, 60 * 1024), v7_test_batch(2, 60 * 1024)];
+        let (first, _, first_job) =
+            wal.admit_v7_batch_with_index(&batches[0], LIVE_WAL_V5_LIMITS)?;
+        let (second, _, second_job) =
+            wal.admit_v7_batch_with_index(&batches[1], LIVE_WAL_V5_LIMITS)?;
+        second_job
+            .expect("large successor has producer work")
+            .finish()?;
+        {
+            let admission = runtime.inner.admission.lock();
+            assert!(admission.queue.is_empty());
+            assert_eq!(admission.v7_ready_ticket, first);
+            assert!(admission.v7_ready_batches.contains_key(&second));
+            assert!(admission.v7_prefixes.is_empty());
+        }
+        first_job
+            .expect("large predecessor has producer work")
+            .finish()?;
+        {
+            let admission = runtime.inner.admission.lock();
+            assert_eq!(admission.v7_ready_ticket, second + 1);
+            assert!(admission.v7_ready_batches.is_empty());
+            assert_eq!(admission.queue.len(), 2);
+            for batch in &admission.queue {
+                assert!(batch.v7_framed);
+                assert_eq!(super::WorkerBuffer::len(&batch.buffer), batch.aligned_len);
+            }
+            assert!(
+                admission.v7_prefixes.is_empty(),
+                "producer framing cannot publish the digest"
+            );
+        }
+        drop(packer);
+        wal.submit_and_commit(second)?;
+        wal.close()?;
+        assert_eq!(owner.snapshot().buffer_memory_bytes, 0);
+        drop(wal);
+        let recovered = recover_and_install_active(
+            &path,
+            WalV7RecoveryAuthority::Active {
+                predecessor: crate::pitr::ChainAnchor::Genesis {
+                    archive_epoch_id: crate::pitr::ArchiveEpochId(anchor.archive_epoch_id),
+                },
+                durable_anchors: vec![anchor],
+            },
+        )?;
+        assert_eq!(recovered.installed.batches, batches);
+
+        Ok(())
+    }
+
+    #[test]
+    fn v7_dropped_producer_job_poison_keeps_surviving_input_charged_after_close()
+    -> anyhow::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("dropped-producer.wal");
+        let Some(V7RuntimeTestWal { wal, owner, .. }) =
+            live_v7_test_wal(&path, super::MAX_WAL_FILE_SIZE, v7_test_resource_limits())?
+        else {
+            return Ok(());
+        };
+        let (_, _, first) =
+            wal.admit_v7_batch_with_index(&v7_test_batch(1, 60 * 1024), LIVE_WAL_V5_LIMITS)?;
+        let (later, _, survivor) =
+            wal.admit_v7_batch_with_index(&v7_test_batch(2, 60 * 1024), LIVE_WAL_V5_LIMITS)?;
+        drop(first);
+        assert!(wal.submit_and_commit(later).is_err());
+        assert!(wal.close().is_err());
+        assert!(owner.snapshot().buffer_memory_bytes > 0);
+        drop(wal);
+        owner.retire_after_durable_cleanup()?;
+        assert!(
+            owner.snapshot().buffer_memory_bytes > 0,
+            "surviving job pins logical bytes and DATA allocation"
+        );
+        drop(survivor);
+        assert_eq!(owner.snapshot().buffer_memory_bytes, 0);
+
+        Ok(())
+    }
+
+    #[cfg(feature = "chaos-testing")]
+    #[test]
+    fn failpoint_v7_producer_frame_error_and_panic_preserve_the_acknowledged_prefix()
+    -> anyhow::Result<()> {
+        use crate::wal::v7::{
+            install::recover_and_install_active, recovery::WalV7RecoveryAuthority,
+        };
+
+        for action in ["return", "panic"] {
+            let scenario = crate::chaos::failpoint::FailScenario::setup();
+            let directory = tempfile::tempdir()?;
+            let path = directory.path().join("producer-failure.wal");
+            let Some(V7RuntimeTestWal { wal, owner, anchor }) =
+                live_v7_test_wal(&path, super::MAX_WAL_FILE_SIZE, v7_test_resource_limits())?
+            else {
+                return Ok(());
+            };
+            let first = v7_test_batch(1, 8);
+            let acknowledged = wal.put_v7_batch_with_index(&first, LIVE_WAL_V5_LIMITS)?.0;
+            wal.submit_and_commit(acknowledged)?;
+            let (ticket, _, job) =
+                wal.admit_v7_batch_with_index(&v7_test_batch(2, 60 * 1024), LIVE_WAL_V5_LIMITS)?;
+            crate::chaos::failpoint::cfg("parallel_wal.v7_producer_frame_failure", action)
+                .map_err(anyhow::Error::msg)?;
+            let result =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| job.unwrap().finish()));
+            assert!(result.is_err() || result.unwrap().is_err());
+            assert!(wal.v7_requires_recovery());
+            assert!(wal.submit_and_commit(ticket).is_err());
+            wal.submit_and_commit(acknowledged)?;
+            assert!(wal.close().is_err());
+            assert_eq!(owner.snapshot().buffer_memory_bytes, 0);
+            drop(wal);
+            scenario.teardown();
+            let recovered = recover_and_install_active(
+                &path,
+                WalV7RecoveryAuthority::Active {
+                    predecessor: crate::pitr::ChainAnchor::Genesis {
+                        archive_epoch_id: crate::pitr::ArchiveEpochId(anchor.archive_epoch_id),
+                    },
+                    durable_anchors: vec![anchor],
+                },
+            )?;
+            assert_eq!(recovered.installed.batches, vec![first]);
+        }
+
+        Ok(())
     }
 
     #[cfg(feature = "chaos-testing")]
@@ -6351,6 +6642,7 @@ mod tests {
             ticket,
             file_offset,
             aligned_len,
+            v7_framed: false,
             v7_allocation: None,
             v7_input: None,
             buffer: ParallelBuffer::activate(
@@ -6378,6 +6670,7 @@ mod tests {
             ticket,
             file_offset: range.start,
             aligned_len,
+            v7_framed: false,
             v7_allocation: Some(allocation),
             v7_input: Some(super::WalV7AdmittedInput {
                 logical_batch: super::prepare_logical_batch(
@@ -6423,6 +6716,8 @@ mod tests {
             v7_metadata: None,
             v7_prefixes: BTreeMap::new(),
             v7_hash_pending: None,
+            v7_ready_ticket: 0,
+            v7_ready_batches: BTreeMap::new(),
             v7_reservations: BTreeMap::new(),
             queue: std::collections::VecDeque::from([
                 admitted_batch_of_size(&budget, 0, WAL_HEADER_END, large),
@@ -6470,6 +6765,8 @@ mod tests {
             v7_metadata: None,
             v7_prefixes: BTreeMap::new(),
             v7_hash_pending: None,
+            v7_ready_ticket: 0,
+            v7_ready_batches: BTreeMap::new(),
             v7_reservations: BTreeMap::new(),
             queue: std::collections::VecDeque::from([
                 admitted_batch(&budget, 0, WAL_HEADER_END),
@@ -6544,6 +6841,8 @@ mod tests {
             v7_metadata: None,
             v7_prefixes: BTreeMap::new(),
             v7_hash_pending: None,
+            v7_ready_ticket: 0,
+            v7_ready_batches: BTreeMap::new(),
             v7_reservations: BTreeMap::new(),
             queue: std::collections::VecDeque::from([
                 admitted_v7_batch(&budget, first),

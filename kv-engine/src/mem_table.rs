@@ -1942,6 +1942,19 @@ impl MemTable {
         batch: &crate::pitr::WalBatch,
         limits: crate::pitr::WalV5Limits,
     ) -> Result<Option<u64>> {
+        let (ticket, frame_job) = self.admit_pitr_wal_batch_only(batch, limits)?;
+        if let Some(job) = frame_job {
+            job.finish()?;
+        }
+
+        Ok(ticket)
+    }
+
+    pub(crate) fn admit_pitr_wal_batch_only(
+        &self,
+        batch: &crate::pitr::WalBatch,
+        limits: crate::pitr::WalV5Limits,
+    ) -> Result<(Option<u64>, Option<crate::wal::WalV7FrameJob>)> {
         anyhow::ensure!(!batch.entries.is_empty(), "PITR WAL batch is empty");
         let wal = self
             .wal
@@ -1967,18 +1980,19 @@ impl MemTable {
         let started = Instant::now();
         #[cfg(feature = "bench")]
         let profile = self.write_profile.load();
-        let ticket = if let Some(seal_index) = &mut v7_seal_index {
-            let (ticket, first_data_offset) = wal.put_v7_batch_with_index(batch, limits)?;
+        let (ticket, frame_job) = if let Some(seal_index) = &mut v7_seal_index {
+            let (ticket, first_data_offset, frame_job) =
+                wal.admit_v7_batch_with_index(batch, limits)?;
             seal_index.push(first_data_offset);
             self.last_ticket
                 .fetch_max(ticket + 1, std::sync::atomic::Ordering::Release);
-            ticket
+            (ticket, frame_job)
         } else {
             #[cfg(feature = "bench")]
             let ticket = wal.put_v5_batch(batch, limits, Some(&profile))?;
             #[cfg(not(feature = "bench"))]
             let ticket = wal.put_v5_batch(batch, limits, None)?;
-            ticket
+            (ticket, None)
         };
         #[cfg(feature = "bench")]
         self.write_profile.load().wal_write_ns.fetch_add(
@@ -1986,7 +2000,7 @@ impl MemTable {
             std::sync::atomic::Ordering::Relaxed,
         );
 
-        Ok(Some(ticket))
+        Ok((Some(ticket), frame_job))
     }
 
     /// Prepare a v7 Parallel point batch before entering the MVCC sequencer.
@@ -2024,12 +2038,12 @@ impl MemTable {
 
     /// Admit a prevalidated v7 Parallel batch and retain its first DATA offset
     /// in the seal index only after WAL admission succeeds.
-    pub(crate) fn write_prepared_v7_pitr_wal_batch_only(
+    pub(crate) fn admit_prepared_v7_pitr_wal_batch_only(
         &self,
         prepared: crate::wal::WalV7PreparedBatch,
         commit_ts: u64,
         recorded_at: crate::pitr::RecordedAt,
-    ) -> Result<Option<u64>> {
+    ) -> Result<(Option<u64>, Option<crate::wal::WalV7FrameJob>)> {
         let wal = self
             .wal
             .as_ref()
@@ -2055,8 +2069,8 @@ impl MemTable {
 
         #[cfg(feature = "bench")]
         let started = Instant::now();
-        let (ticket, first_data_offset) =
-            wal.put_v7_prepared_batch_with_index(prepared, commit_ts, recorded_at)?;
+        let (ticket, first_data_offset, frame_job) =
+            wal.admit_v7_prepared_batch_with_index(prepared, commit_ts, recorded_at)?;
         seal_index.push(first_data_offset);
         self.last_ticket
             .fetch_max(ticket + 1, std::sync::atomic::Ordering::Release);
@@ -2066,7 +2080,7 @@ impl MemTable {
             std::sync::atomic::Ordering::Relaxed,
         );
 
-        Ok(Some(ticket))
+        Ok((Some(ticket), frame_job))
     }
 
     pub(crate) fn uses_parallel_wal(&self) -> bool {
@@ -3585,6 +3599,129 @@ mod tests {
         })?;
         let owner = Arc::new(WalV7ReservationOwner::new(ledger, &installed)?);
         MemTable::recover_from_v7_active(7, false, path, installed, max_file_size, owner, io_mode)
+    }
+
+    #[cfg(all(target_os = "linux", feature = "chaos-testing"))]
+    #[test]
+    fn failpoint_v7_producer_framing_releases_mvcc_and_seal_index_for_other_writers() -> Result<()>
+    {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("parallel-producer-frames.wal");
+        let installed = install_empty_v7(&path)?;
+        let anchor = installed.active_boundary;
+        let (memtable, max_ts) =
+            attach_v7_with_mode(&path, installed, TEST_V7_MAX_FILE_SIZE, WalIoMode::Parallel)?;
+        let mvcc = LsmMvccInner::new(max_ts);
+        let first_entries = [(
+            Bytes::from_static(b"first"),
+            Bytes::from(vec![0x41; 60 * 1024]),
+            BatchEntryKind::PutRaw,
+        )];
+        let second_entries = [(
+            Bytes::from_static(b"second"),
+            Bytes::from(vec![0x42; 60 * 1024]),
+            BatchEntryKind::PutRaw,
+        )];
+        let gate = crate::chaos::failpoint::arm_parallel_wal_producer_frame_gate();
+        std::thread::scope(|scope| -> Result<()> {
+            // The scope owns the release guard so failed assertions cannot
+            // join a writer while leaving its framing gate armed.
+            let gate = gate;
+            let first = scope.spawn(|| {
+                mvcc.write_batch_wal_only(&first_entries, &memtable, false)
+                    .map(|(ts, _, ticket)| (ts, ticket))
+            });
+            assert!(gate.wait_until_entered(std::time::Duration::from_secs(5)));
+            let second = scope.spawn(|| {
+                mvcc.write_batch_wal_only(&second_entries, &memtable, false)
+                    .map(|(ts, _, ticket)| (ts, ticket))
+            });
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while !second.is_finished() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "another producer is blocked by the first framer"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            let second = second.join().expect("second producer panicked")?;
+            assert_eq!(second, (2, Some(1)));
+            assert!(!first.is_finished());
+            assert_eq!(memtable.wal_v7_seal_index().unwrap().len(), 2);
+            assert!(
+                memtable.v7_frontier_cursor().is_err(),
+                "a fully reconciled cursor is unavailable while a producer is pending"
+            );
+            assert_eq!(mvcc.latest_commit_ts(), 0);
+            gate.release();
+            let first = first.join().expect("first producer panicked")?;
+            assert_eq!(first, (1, Some(0)));
+            memtable.commit_wal_ticket(second.1)?;
+            Ok(())
+        })?;
+        memtable.wal.as_ref().unwrap().close()?;
+        drop(memtable);
+        let recovered = recover_v7(&path, anchor)?;
+        assert_eq!(recovered.batches.len(), 2);
+        assert_eq!(recovered.batches[0].commit_ts, 1);
+        assert_eq!(recovered.batches[1].commit_ts, 2);
+
+        Ok(())
+    }
+
+    #[cfg(all(target_os = "linux", feature = "chaos-testing"))]
+    #[test]
+    fn failpoint_v7_small_admission_keeps_the_mvcc_guard_until_return() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("small-admission-guard.wal");
+        let installed = install_empty_v7(&path)?;
+        let anchor = installed.active_boundary;
+        let (memtable, max_ts) =
+            attach_v7_with_mode(&path, installed, TEST_V7_MAX_FILE_SIZE, WalIoMode::Parallel)?;
+        let mvcc = LsmMvccInner::new(max_ts);
+        let first_entries = [(
+            Bytes::from_static(b"first"),
+            Bytes::from_static(b"small"),
+            BatchEntryKind::PutRaw,
+        )];
+        let second_entries = [(
+            Bytes::from_static(b"second"),
+            Bytes::from_static(b"small"),
+            BatchEntryKind::PutRaw,
+        )];
+        let gate = crate::chaos::failpoint::arm_parallel_wal_small_admission_gate();
+        std::thread::scope(|scope| -> Result<()> {
+            let gate = gate;
+            let first = scope.spawn(|| {
+                mvcc.write_batch_wal_only(&first_entries, &memtable, false)
+                    .map(|(ts, _, ticket)| (ts, ticket))
+            });
+            assert!(gate.wait_until_entered(std::time::Duration::from_secs(5)));
+            assert!(
+                mvcc.write_lock.try_lock().is_none(),
+                "a small v7 write must retain the sequencer after admission"
+            );
+            let second = scope.spawn(|| {
+                mvcc.write_batch_wal_only(&second_entries, &memtable, false)
+                    .map(|(ts, _, ticket)| (ts, ticket))
+            });
+            assert_eq!(memtable.wal_v7_seal_index().unwrap().len(), 1);
+            gate.release();
+            let first = first.join().expect("first producer panicked")?;
+            let second = second.join().expect("second producer panicked")?;
+            assert_eq!(first, (1, Some(0)));
+            assert_eq!(second, (2, Some(1)));
+            memtable.commit_wal_ticket(second.1)?;
+            Ok(())
+        })?;
+        memtable.wal.as_ref().unwrap().close()?;
+        drop(memtable);
+        let recovered = recover_v7(&path, anchor)?;
+        assert_eq!(recovered.batches.len(), 2);
+        assert_eq!(recovered.batches[0].commit_ts, 1);
+        assert_eq!(recovered.batches[1].commit_ts, 2);
+
+        Ok(())
     }
 
     #[test]
