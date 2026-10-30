@@ -57,6 +57,18 @@ pub(crate) struct WalV8InstalledRecovery {
     pub(crate) last_recorded_at: Option<RecordedAt>,
 }
 
+/// Strictly verified v8 Sealing authority rebuilt from the immutable WAL
+/// prefix. The caller may install the returned sidecar only after the durable
+/// Sealing obligation is present in the manifest.
+#[allow(dead_code)] // Consumed by the Active v8 sealing lifecycle integration slice.
+pub(crate) struct WalV8SealingRecovery {
+    pub(crate) seal: crate::pitr::seal::V8Seal,
+    pub(crate) seal_bytes: Vec<u8>,
+    pub(crate) image_len: u64,
+    pub(crate) installed_dev: u64,
+    pub(crate) installed_ino: u64,
+}
+
 /// Durably create the canonical empty Active image for a new v8 segment.
 ///
 /// This is a creation path, not recovery. The caller must have a durable
@@ -220,6 +232,264 @@ pub(crate) fn recover_and_install_active(
         normalized_len,
     })?;
     Ok(installed)
+}
+
+/// Recover an Active v8 image named by a durable Sealing obligation.
+///
+/// Unlike Active recovery this path never falls back or rewrites accepted
+/// bytes: it verifies the exact immutable boundary, checks any existing seal
+/// sidecar against that image, and installs an exact fresh-inode copy. Bytes
+/// after `boundary.sealed_end` are discarded only after the complete immutable
+/// prefix has passed strict validation.
+#[cfg(target_os = "linux")]
+#[allow(dead_code)] // Consumed by the Active v8 sealing lifecycle integration slice.
+pub(crate) fn recover_sealing_active(
+    path: impl AsRef<Path>,
+    boundary: crate::pitr::manifest::ImmutableBoundary,
+    expected_predecessor: crate::pitr::ChainAnchor,
+    max_image_len: u64,
+) -> Result<WalV8SealingRecovery> {
+    use crate::pitr::seal::build_v8_seal_from_reader;
+
+    boundary.validate()?;
+    ensure!(
+        boundary.active.wal_format == crate::pitr::manifest::PitrWalFormat::V8,
+        "v8 Sealing recovery received a non-v8 immutable boundary"
+    );
+    ensure!(
+        boundary.sealed_end <= max_image_len && max_image_len <= MAX_WAL_FILE_SIZE,
+        "immutable v8 WAL exceeds its configured segment limit"
+    );
+
+    let path = path.as_ref();
+    let path_metadata = fs::symlink_metadata(path).context("inspect Sealing v8 WAL path")?;
+    ensure!(
+        path_metadata.file_type().is_file(),
+        "Sealing v8 WAL path is not a regular file"
+    );
+    let mut source = File::open(path).context("open Sealing v8 WAL for strict recovery")?;
+    let source_metadata = source.metadata().context("inspect opened Sealing v8 WAL")?;
+    let source_len = source_metadata.len();
+    ensure!(
+        source_metadata.is_file()
+            && source_metadata.dev() == path_metadata.dev()
+            && source_metadata.ino() == path_metadata.ino()
+            && source_len >= boundary.sealed_end
+            && source_len <= max_image_len,
+        "Sealing v8 WAL length or inode is outside its durable boundary and configured limit"
+    );
+
+    let (seal, seal_bytes) = build_v8_seal_from_reader(
+        &mut source,
+        boundary.sealed_end,
+        boundary.active,
+        expected_predecessor,
+    )?;
+    ensure!(
+        seal.boundary == boundary
+            && seal.header.segment_id.0 == boundary.active.segment_id
+            && seal.header.timeline_id.0 == boundary.active.timeline_id
+            && seal.header.archive_epoch_id.0 == boundary.active.archive_epoch_id
+            && seal.header.incarnation == boundary.active.incarnation,
+        "strict v8 Sealing recovery differs from its immutable manifest boundary"
+    );
+    validate_existing_v8_sealing_sidecar(path, boundary, max_image_len, &seal, &seal_bytes)?;
+
+    let installed_metadata = install_exact_v8_recovery_image(
+        path,
+        &mut source,
+        source_len,
+        boundary.sealed_end,
+        boundary.wal_digest,
+    )?;
+    Ok(WalV8SealingRecovery {
+        seal,
+        seal_bytes,
+        image_len: boundary.sealed_end,
+        installed_dev: installed_metadata.dev(),
+        installed_ino: installed_metadata.ino(),
+    })
+}
+
+fn validate_existing_v8_sealing_sidecar(
+    wal_path: &Path,
+    boundary: crate::pitr::manifest::ImmutableBoundary,
+    max_image_len: u64,
+    expected_seal: &crate::pitr::seal::V8Seal,
+    expected_bytes: &[u8],
+) -> Result<()> {
+    let seal_path = wal_path.with_extension("seal");
+    match fs::symlink_metadata(&seal_path) {
+        Ok(metadata) => ensure!(
+            metadata.file_type().is_file(),
+            "Sealing v8 seal sidecar is not a regular file"
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error).context("inspect Sealing v8 seal sidecar"),
+    }
+    let (format, bytes) = crate::pitr::seal::read_seal_sidecar_for_format(
+        &seal_path,
+        Some(max_image_len),
+        crate::pitr::seal::SealSidecarFormat::V8,
+    )?;
+    ensure!(
+        format == crate::pitr::seal::SealSidecarFormat::V8,
+        "Sealing v8 sidecar has the wrong seal format"
+    );
+    let seal = crate::pitr::seal::V8Seal::decode(&bytes, boundary.sealed_end)?;
+    ensure!(
+        seal == *expected_seal && bytes == expected_bytes,
+        "Sealing v8 sidecar differs from its immutable WAL authority"
+    );
+    Ok(())
+}
+
+/// Copy an already validated immutable v8 image to a fresh inode and durably
+/// replace its canonical pathname without changing any image bytes.
+fn install_exact_v8_recovery_image(
+    source_path: &Path,
+    source: &mut File,
+    source_len: u64,
+    image_len: u64,
+    expected_digest: [u8; 32],
+) -> Result<fs::Metadata> {
+    ensure!(
+        image_len <= source_len,
+        "immutable v8 image exceeds its source length"
+    );
+    let file_name = source_path
+        .file_name()
+        .filter(|name| !name.is_empty())
+        .context("immutable v8 WAL path has no file name")?;
+    let parent = source_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let source_metadata = source
+        .metadata()
+        .context("read immutable v8 WAL metadata")?;
+    ensure!(
+        source_metadata.is_file(),
+        "immutable v8 WAL is not a regular file"
+    );
+
+    let parent_dir = File::open(parent).context("open immutable v8 WAL directory")?;
+    let temp_prefix = recovery_temp_prefix(file_name);
+    cleanup_stale_recovery_images(parent, &parent_dir, &temp_prefix)?;
+    let temp_path = parent.join(format!(
+        "{temp_prefix}{}-{}",
+        std::process::id(),
+        TEMP_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    ));
+    let mut temp_created = false;
+    let result = (|| -> Result<fs::Metadata> {
+        let mut temp = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)
+            .context("create immutable v8 recovery image")?;
+        temp_created = true;
+        fs::set_permissions(&temp_path, source_metadata.permissions())
+            .context("preserve immutable v8 WAL permissions")?;
+
+        source
+            .seek(SeekFrom::Start(0))
+            .context("seek immutable v8 WAL for copy")?;
+        let mut copied_hasher = Sha256::new();
+        let mut remaining = image_len;
+        let mut buffer = [0_u8; COPY_BUFFER_LEN];
+        while remaining > 0 {
+            let chunk_len = usize::try_from(remaining.min(COPY_BUFFER_LEN as u64))?;
+            source
+                .read_exact(&mut buffer[..chunk_len])
+                .context("read immutable v8 WAL for copy")?;
+            temp.write_all(&buffer[..chunk_len])
+                .context("write immutable v8 recovery image")?;
+            copied_hasher.update(&buffer[..chunk_len]);
+            remaining -= u64::try_from(chunk_len)?;
+        }
+        let copied_digest: [u8; 32] = copied_hasher.finalize().into();
+        ensure!(
+            copied_digest == expected_digest,
+            "copied immutable v8 image differs from its Sealing digest"
+        );
+        ensure!(
+            source.metadata()?.len() == source_len,
+            "immutable v8 WAL changed during exclusive recovery"
+        );
+        let current_path_metadata = fs::symlink_metadata(source_path)
+            .context("reinspect immutable v8 WAL path before replacement")?;
+        ensure!(
+            current_path_metadata.file_type().is_file()
+                && current_path_metadata.dev() == source_metadata.dev()
+                && current_path_metadata.ino() == source_metadata.ino(),
+            "immutable v8 WAL path changed during exclusive recovery"
+        );
+        let temp_metadata = temp.metadata()?;
+        ensure!(
+            temp_metadata.len() == image_len && temp_metadata.dev() == source_metadata.dev(),
+            "immutable v8 recovery image has an unexpected size or device"
+        );
+        #[cfg(feature = "chaos-testing")]
+        crate::chaos::failpoint::wal_crash_point(
+            "wal_v8.sealing_recovery.after_temp_write_before_sync",
+        );
+        #[cfg(feature = "chaos-testing")]
+        crate::chaos::failpoint::fail_point!("wal_v8.sealing_recovery.before_temp_sync", |_| Err(
+            anyhow::anyhow!("injected immutable v8 recovery image sync failure")
+        ));
+        temp.sync_all()
+            .context("sync exact immutable v8 recovery image")?;
+        #[cfg(feature = "chaos-testing")]
+        crate::chaos::failpoint::wal_crash_point(
+            "wal_v8.sealing_recovery.after_temp_sync_before_rename",
+        );
+        drop(temp);
+
+        #[cfg(feature = "chaos-testing")]
+        crate::chaos::failpoint::fail_point!("wal_v8.sealing_recovery.before_rename", |_| Err(
+            anyhow::anyhow!("injected immutable v8 recovery rename failure")
+        ));
+        fs::rename(&temp_path, source_path)
+            .context("atomically replace immutable v8 WAL with recovery image")?;
+        #[cfg(feature = "chaos-testing")]
+        crate::chaos::failpoint::wal_crash_point(
+            "wal_v8.sealing_recovery.after_rename_before_directory_sync",
+        );
+        #[cfg(feature = "chaos-testing")]
+        crate::chaos::failpoint::fail_point!(
+            "wal_v8.sealing_recovery.before_directory_sync",
+            |_| Err(anyhow::anyhow!(
+                "injected immutable v8 recovery directory sync failure"
+            ))
+        );
+        parent_dir
+            .sync_all()
+            .context("sync immutable v8 WAL directory after replacement")?;
+        #[cfg(feature = "chaos-testing")]
+        crate::chaos::failpoint::wal_crash_point("wal_v8.sealing_recovery.after_directory_sync");
+        let installed_metadata = fs::symlink_metadata(source_path)
+            .context("inspect installed immutable v8 WAL inode")?;
+        ensure!(
+            installed_metadata.file_type().is_file()
+                && installed_metadata.len() == image_len
+                && installed_metadata.dev() == source_metadata.dev(),
+            "installed immutable v8 WAL has an unexpected file type, size, or device"
+        );
+        Ok(installed_metadata)
+    })();
+
+    match result {
+        Err(operation_error) if temp_created => {
+            match cleanup_failed_recovery_image(&temp_path, &parent_dir) {
+                Ok(()) => Err(operation_error),
+                Err(cleanup_error) => Err(anyhow::anyhow!(
+                    "{operation_error:#}; additionally, failed to durably clean the temporary immutable v8 recovery image: {cleanup_error:#}"
+                )),
+            }
+        }
+        other => other,
+    }
 }
 
 fn normalized_image_len(selection: &WalV8RecoverySelection) -> Result<u64> {

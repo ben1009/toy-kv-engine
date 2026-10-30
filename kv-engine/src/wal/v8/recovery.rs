@@ -1684,6 +1684,320 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn sealing_recovery_is_strict_and_installs_the_exact_immutable_image() -> Result<()> {
+        let fixture = two_batch_image()?;
+        let active = active_boundary(fixture.last_frontier);
+        let sealed_end = u64::try_from(fixture.bytes.len())?;
+        let mut image = Cursor::new(fixture.bytes.clone());
+        let (seal, seal_bytes) = crate::pitr::seal::build_v8_seal_from_reader(
+            &mut image,
+            sealed_end,
+            active,
+            test_header().predecessor,
+        )?;
+        let boundary = seal.boundary;
+
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("active-v8.wal");
+        let mut source_with_tail = fixture.bytes.clone();
+        source_with_tail.extend_from_slice(&[0xa5; FRAME_LEN]);
+        std::fs::write(&path, source_with_tail)?;
+        let seal_path = path.with_extension("seal");
+        std::fs::write(&seal_path, &seal_bytes)?;
+        let original_metadata = std::fs::metadata(&path)?;
+
+        let recovered = crate::wal::v8::install::recover_sealing_active(
+            &path,
+            boundary,
+            test_header().predecessor,
+            crate::wal::MAX_WAL_FILE_SIZE,
+        )?;
+
+        assert_eq!(recovered.seal, seal);
+        assert_eq!(recovered.seal_bytes, seal_bytes);
+        assert_eq!(recovered.image_len, sealed_end);
+        assert_eq!(recovered.installed_dev, std::fs::metadata(&path)?.dev());
+        assert_eq!(recovered.installed_ino, std::fs::metadata(&path)?.ino());
+        assert_ne!(original_metadata.ino(), recovered.installed_ino);
+        assert_eq!(std::fs::read(&path)?, fixture.bytes);
+        assert_eq!(std::fs::read(&seal_path)?, seal_bytes);
+
+        let corrupt_sidecar_path = directory.path().join("bad-sidecar.wal");
+        std::fs::write(&corrupt_sidecar_path, &fixture.bytes)?;
+        let mut corrupt_sidecar = seal_bytes.clone();
+        let last = corrupt_sidecar.len() - 1;
+        corrupt_sidecar[last] ^= 1;
+        std::fs::write(corrupt_sidecar_path.with_extension("seal"), corrupt_sidecar)?;
+        assert!(
+            crate::wal::v8::install::recover_sealing_active(
+                &corrupt_sidecar_path,
+                boundary,
+                test_header().predecessor,
+                crate::wal::MAX_WAL_FILE_SIZE,
+            )
+            .is_err()
+        );
+        assert_eq!(std::fs::read(&corrupt_sidecar_path)?, fixture.bytes);
+
+        let mismatched_sidecar_path = directory.path().join("mismatched-sidecar.wal");
+        std::fs::write(&mismatched_sidecar_path, &fixture.bytes)?;
+        let mismatched_seal_path = mismatched_sidecar_path.with_extension("seal");
+        let original_mismatched_inode = std::fs::metadata(&mismatched_sidecar_path)?.ino();
+        let mut mismatched_seal = seal.clone();
+        mismatched_seal.entries[0].commit_ts += 1;
+        let mismatched_seal_bytes = mismatched_seal.encode()?;
+        crate::pitr::seal::V8Seal::decode(&mismatched_seal_bytes, boundary.sealed_end)?;
+        std::fs::write(&mismatched_seal_path, mismatched_seal_bytes)?;
+        assert!(
+            crate::wal::v8::install::recover_sealing_active(
+                &mismatched_sidecar_path,
+                boundary,
+                test_header().predecessor,
+                crate::wal::MAX_WAL_FILE_SIZE,
+            )
+            .is_err()
+        );
+        assert_eq!(std::fs::read(&mismatched_sidecar_path)?, fixture.bytes);
+        assert_eq!(
+            std::fs::metadata(&mismatched_sidecar_path)?.ino(),
+            original_mismatched_inode,
+            "a valid but mismatched seal sidecar must be rejected before WAL replacement"
+        );
+
+        let corrupt_wal_path = directory.path().join("bad-wal.wal");
+        let mut corrupt_wal = fixture.bytes.clone();
+        corrupt_wal[8192 + 64 + 10] ^= 1;
+        std::fs::write(&corrupt_wal_path, &corrupt_wal)?;
+        assert!(
+            crate::wal::v8::install::recover_sealing_active(
+                &corrupt_wal_path,
+                boundary,
+                test_header().predecessor,
+                crate::wal::MAX_WAL_FILE_SIZE,
+            )
+            .is_err()
+        );
+        assert_eq!(std::fs::read(&corrupt_wal_path)?, corrupt_wal);
+
+        Ok(())
+    }
+
+    #[cfg(feature = "chaos-testing")]
+    #[test]
+    fn failpoint_sealing_recovery_crashes_at_install_boundaries_and_retries() -> Result<()> {
+        const CHILD_WAL_ENV: &str = "TOY_KV_V8_SEALING_RECOVERY_CHILD_WAL";
+        const CRASH_POINTS: [&str; 4] = [
+            "wal_v8.sealing_recovery.after_temp_write_before_sync",
+            "wal_v8.sealing_recovery.after_temp_sync_before_rename",
+            "wal_v8.sealing_recovery.after_rename_before_directory_sync",
+            "wal_v8.sealing_recovery.after_directory_sync",
+        ];
+        const TEST_NAME: &str = "wal::v8::recovery::tests::failpoint_sealing_recovery_crashes_at_install_boundaries_and_retries";
+
+        if let Some(wal_path) = std::env::var_os(CHILD_WAL_ENV) {
+            let fixture = two_batch_image()?;
+            let active = active_boundary(fixture.last_frontier);
+            let mut image = Cursor::new(fixture.bytes.clone());
+            let (seal, _) = crate::pitr::seal::build_v8_seal_from_reader(
+                &mut image,
+                u64::try_from(fixture.bytes.len())?,
+                active,
+                test_header().predecessor,
+            )?;
+            crate::wal::v8::install::recover_sealing_active(
+                wal_path,
+                seal.boundary,
+                test_header().predecessor,
+                crate::wal::MAX_WAL_FILE_SIZE,
+            )?;
+            anyhow::bail!("configured Sealing v8 recovery crash point did not stop the child")
+        }
+
+        let fixture = two_batch_image()?;
+        let active = active_boundary(fixture.last_frontier);
+        let mut image = Cursor::new(fixture.bytes.clone());
+        let (seal, seal_bytes) = crate::pitr::seal::build_v8_seal_from_reader(
+            &mut image,
+            u64::try_from(fixture.bytes.len())?,
+            active,
+            test_header().predecessor,
+        )?;
+        let boundary = seal.boundary;
+
+        for crash_point in CRASH_POINTS {
+            let directory = tempfile::tempdir()?;
+            let wal_path = directory.path().join("active-v8.wal");
+            let marker_path = directory.path().join("crash.marker");
+            let mut source_with_tail = fixture.bytes.clone();
+            source_with_tail.extend_from_slice(&[0xa5; FRAME_LEN]);
+            std::fs::write(&wal_path, source_with_tail)?;
+            std::fs::write(wal_path.with_extension("seal"), &seal_bytes)?;
+
+            // Repeat interruption at each boundary to verify retry cleanup of
+            // both pre-rename temporary images and post-rename directory state.
+            for _ in 0..2 {
+                let _ = std::fs::remove_file(&marker_path);
+                let mut child = Command::new(std::env::current_exe()?);
+                child
+                    .arg("--exact")
+                    .arg(TEST_NAME)
+                    .arg("--nocapture")
+                    .env(CHILD_WAL_ENV, &wal_path)
+                    .env(
+                        crate::chaos::failpoint::PARALLEL_WAL_CRASH_POINT_ENV,
+                        crash_point,
+                    )
+                    .env(
+                        crate::chaos::failpoint::PARALLEL_WAL_CRASH_OCCURRENCE_ENV,
+                        "1",
+                    )
+                    .env(
+                        crate::chaos::failpoint::PARALLEL_WAL_CRASH_MARKER_ENV,
+                        &marker_path,
+                    )
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null());
+                let mut child = child.spawn()?;
+                let deadline = Instant::now() + Duration::from_secs(30);
+                loop {
+                    if marker_path.is_file() {
+                        break;
+                    }
+                    if let Some(status) = child.try_wait()? {
+                        anyhow::bail!(
+                            "Sealing v8 recovery child exited before reaching {crash_point}: {status}"
+                        );
+                    }
+                    if Instant::now() >= deadline {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        anyhow::bail!("Sealing v8 recovery child did not reach {crash_point}");
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+
+                child.kill()?;
+                let status = child.wait()?;
+                ensure!(
+                    status.signal() == Some(libc::SIGKILL),
+                    "Sealing v8 recovery child was not killed at {crash_point}: {status}"
+                );
+                ensure!(
+                    std::fs::read_to_string(&marker_path)?.trim() == crash_point,
+                    "Sealing v8 recovery child reached an unexpected crash point"
+                );
+            }
+
+            let recovered = crate::wal::v8::install::recover_sealing_active(
+                &wal_path,
+                boundary,
+                test_header().predecessor,
+                crate::wal::MAX_WAL_FILE_SIZE,
+            )?;
+            assert_eq!(recovered.seal, seal);
+            assert_eq!(recovered.seal_bytes, seal_bytes);
+            assert_eq!(std::fs::read(&wal_path)?, fixture.bytes);
+            assert_eq!(std::fs::read(wal_path.with_extension("seal"))?, seal_bytes);
+            for entry in std::fs::read_dir(directory.path())? {
+                let entry = entry?;
+                ensure!(
+                    !entry
+                        .file_name()
+                        .as_encoded_bytes()
+                        .starts_with(b".toy-kv-v8-recovery-"),
+                    "successful Sealing recovery retry left a stale v8 recovery image"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "chaos-testing")]
+    #[test]
+    fn failpoint_sealing_recovery_install_errors_preserve_or_install_the_immutable_image()
+    -> Result<()> {
+        const FAILURES: [(&str, &str, bool); 3] = [
+            (
+                "wal_v8.sealing_recovery.before_temp_sync",
+                "injected immutable v8 recovery image sync failure",
+                false,
+            ),
+            (
+                "wal_v8.sealing_recovery.before_rename",
+                "injected immutable v8 recovery rename failure",
+                false,
+            ),
+            (
+                "wal_v8.sealing_recovery.before_directory_sync",
+                "injected immutable v8 recovery directory sync failure",
+                true,
+            ),
+        ];
+
+        let fixture = two_batch_image()?;
+        let active = active_boundary(fixture.last_frontier);
+        let mut image = Cursor::new(fixture.bytes.clone());
+        let (seal, seal_bytes) = crate::pitr::seal::build_v8_seal_from_reader(
+            &mut image,
+            u64::try_from(fixture.bytes.len())?,
+            active,
+            test_header().predecessor,
+        )?;
+        let boundary = seal.boundary;
+        let mut source_with_tail = fixture.bytes.clone();
+        source_with_tail.extend_from_slice(&[0xa5; FRAME_LEN]);
+
+        for (failpoint, expected_error, rename_completed) in FAILURES {
+            let directory = tempfile::tempdir()?;
+            let wal_path = directory.path().join("active-v8.wal");
+            std::fs::write(&wal_path, &source_with_tail)?;
+            std::fs::write(wal_path.with_extension("seal"), &seal_bytes)?;
+            let original = std::fs::read(&wal_path)?;
+            let scenario = crate::chaos::failpoint::FailScenario::setup();
+            crate::chaos::failpoint::cfg(failpoint, "return").map_err(anyhow::Error::msg)?;
+            let operation = crate::wal::v8::install::recover_sealing_active(
+                &wal_path,
+                boundary,
+                test_header().predecessor,
+                crate::wal::MAX_WAL_FILE_SIZE,
+            );
+            crate::chaos::failpoint::cfg(failpoint, "off").map_err(anyhow::Error::msg)?;
+            scenario.teardown();
+
+            let error = operation
+                .err()
+                .context("Sealing v8 recovery succeeded despite an injected install failure")?;
+            ensure!(
+                format!("{error:#}").contains(expected_error),
+                "unexpected Sealing v8 recovery error: {error:#}"
+            );
+            let image_after_failure = std::fs::read(&wal_path)?;
+            if rename_completed {
+                ensure!(
+                    image_after_failure == fixture.bytes,
+                    "directory-sync failure must leave the exact immutable WAL installed"
+                );
+            } else {
+                ensure!(
+                    image_after_failure == original,
+                    "pre-rename failure must preserve the source WAL"
+                );
+            }
+
+            let recovered = crate::wal::v8::install::recover_sealing_active(
+                &wal_path,
+                boundary,
+                test_header().predecessor,
+                crate::wal::MAX_WAL_FILE_SIZE,
+            )?;
+            assert_eq!(recovered.seal, seal);
+            assert_eq!(recovered.seal_bytes, seal_bytes);
+            assert_eq!(std::fs::read(&wal_path)?, fixture.bytes);
+        }
+        Ok(())
+    }
+
     #[cfg(feature = "chaos-testing")]
     #[test]
     fn failpoint_active_recovery_crashes_at_install_boundaries_and_retries() -> Result<()> {

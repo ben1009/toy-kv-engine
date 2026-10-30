@@ -132,8 +132,11 @@ remain unqualified, so v8 creation stays disabled.
    publication. Recovery keeps a compact per-ticket replay index and decodes
    one batch at a time into the memtable under the reserved workspace, rather
    than retaining a second WAL-sized collection of decoded entries. Active v8
-   Sealing recovery and rotation/successor installation still fail closed; v8
-   creation and general format-registry selection remain disabled.
+   strict Sealing recovery now verifies the immutable logical boundary, checks
+   any existing v8 sidecar, and installs an exact fresh-inode copy of the
+   accepted physical image. High-level Active v8 Sealing recovery and
+   rotation/successor installation still fail closed; v8 creation and general
+   format-registry selection remain disabled.
 5. **Persistence and transitions:** version persisted seal/manifest/backup
    digest references, validate v8 archive objects, support v5/v6/v7/v8 chain
    transitions and the old-reader compatibility gate above. Add capacity and
