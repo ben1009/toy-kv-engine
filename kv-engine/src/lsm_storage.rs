@@ -3289,6 +3289,23 @@ impl KvEngine {
                                 seal.entries.first().map(|entry| entry.recorded_at),
                             )
                         }
+                        crate::pitr::seal::SealSidecarFormat::V8 => {
+                            let Some(max_segment_bytes) =
+                                state.config.as_ref().map(|config| config.max_segment_bytes)
+                            else {
+                                continue;
+                            };
+                            let Ok(seal) =
+                                crate::pitr::seal::V8Seal::decode(&bytes, max_segment_bytes)
+                            else {
+                                continue;
+                            };
+                            (
+                                seal.header.segment_id.0,
+                                seal.entries.len() as u64,
+                                seal.entries.first().map(|entry| entry.recorded_at),
+                            )
+                        }
                     };
                     if segment_id != expected_segment_id {
                         continue;
@@ -5162,6 +5179,20 @@ impl KvEngine {
                 continue;
             }
 
+            if format == crate::pitr::seal::SealSidecarFormat::V8 {
+                let max_segment_bytes = state
+                    .config
+                    .as_ref()
+                    .map(|config| config.max_segment_bytes)
+                    .ok_or_else(|| anyhow!("PITR v8 source has no persisted segment limit"))?;
+                let seal = crate::pitr::seal::V8Seal::decode(&bytes, max_segment_bytes)?;
+                ensure!(
+                    seal.header.segment_id.0 == segment_id,
+                    "sealed v8 PITR source filename does not match its segment ID"
+                );
+                anyhow::bail!("v8 PITR source WAL verification is not implemented")
+            }
+
             let seal = crate::pitr::seal::V5Seal::decode(&bytes)?;
             if seal.header.segment_id.0 == segment_id {
                 ensure!(selected.is_none(), "duplicate PITR source seal for segment");
@@ -5240,7 +5271,7 @@ impl KvEngine {
     fn load_pitr_source_seal(
         &self,
         segment_id: u64,
-        max_v7_segment_bytes: Option<u64>,
+        max_segment_bytes: Option<u64>,
     ) -> Result<PitrSourceSealSummary> {
         let expected_seal_name = format!("pitr-{segment_id:020}.seal");
         for entry in std::fs::read_dir(&self.inner.path)? {
@@ -5249,8 +5280,7 @@ impl KvEngine {
             {
                 continue;
             }
-            let (format, bytes) =
-                crate::pitr::seal::read_seal_sidecar(&path, max_v7_segment_bytes)?;
+            let (format, bytes) = crate::pitr::seal::read_seal_sidecar(&path, max_segment_bytes)?;
             match format {
                 crate::pitr::seal::SealSidecarFormat::V5 => {
                     let seal = crate::pitr::seal::V5Seal::decode(&bytes)?;
@@ -5265,9 +5295,23 @@ impl KvEngine {
                     }
                 }
                 crate::pitr::seal::SealSidecarFormat::V7 => {
-                    let max_segment_bytes = max_v7_segment_bytes
+                    let max_segment_bytes = max_segment_bytes
                         .ok_or_else(|| anyhow!("PITR v7 source has no persisted segment limit"))?;
                     let seal = crate::pitr::seal::V7Seal::decode(&bytes, max_segment_bytes)?;
+                    if seal.header.segment_id.0 == segment_id {
+                        return Ok(PitrSourceSealSummary {
+                            logical_length: seal.boundary.sealed_end,
+                            last_commit: seal
+                                .entries
+                                .last()
+                                .map(|entry| (entry.commit_ts, entry.recorded_at)),
+                        });
+                    }
+                }
+                crate::pitr::seal::SealSidecarFormat::V8 => {
+                    let max_segment_bytes = max_segment_bytes
+                        .ok_or_else(|| anyhow!("PITR v8 source has no persisted segment limit"))?;
+                    let seal = crate::pitr::seal::V8Seal::decode(&bytes, max_segment_bytes)?;
                     if seal.header.segment_id.0 == segment_id {
                         return Ok(PitrSourceSealSummary {
                             logical_length: seal.boundary.sealed_end,
@@ -6860,6 +6904,19 @@ impl KvEngine {
                                 anyhow!("PITR v7 source has no persisted segment limit")
                             })?;
                         crate::pitr::seal::V7Seal::decode(&bytes, max_segment_bytes)?
+                            .header
+                            .segment_id
+                            .0
+                    }
+                    crate::pitr::seal::SealSidecarFormat::V8 => {
+                        let max_segment_bytes = state
+                            .config
+                            .as_ref()
+                            .map(|config| config.max_segment_bytes)
+                            .ok_or_else(|| {
+                                anyhow!("PITR v8 source has no persisted segment limit")
+                            })?;
+                        crate::pitr::seal::V8Seal::decode(&bytes, max_segment_bytes)?
                             .header
                             .segment_id
                             .0
