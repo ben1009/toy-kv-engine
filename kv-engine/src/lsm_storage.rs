@@ -10118,7 +10118,7 @@ impl LsmStorageInner {
 
         let seal_path = database_path.join(format!("pitr-{segment_id:020}.seal"));
         let (format, bytes) =
-            crate::pitr::seal::read_seal_sidecar(&seal_path, Some(max_segment_bytes))?;
+            crate::pitr::seal::read_seal_sidecar(&seal_path, Some(boundary.sealed_end))?;
         ensure!(
             format == crate::pitr::seal::SealSidecarFormat::V7,
             "v7 PITR source has a non-v7 seal sidecar"
@@ -10146,6 +10146,98 @@ impl LsmStorageInner {
             verified_seal == seal && verified_bytes == bytes,
             "sealed v7 PITR WAL does not match its immutable sidecar"
         );
+
+        Ok(seal)
+    }
+
+    /// Validate a retained v8 source before using its format-independent
+    /// sealed-image digests as the predecessor anchor of a missing successor.
+    #[cfg(target_os = "linux")]
+    fn load_v8_sealed_recovery_source(
+        database_path: &Path,
+        state: &crate::pitr::manifest::PitrState,
+        segment_id: u64,
+        wal_path: &Path,
+    ) -> Result<crate::pitr::seal::V8Seal> {
+        use crate::pitr::manifest::{ObligationState, PitrWalFormat};
+
+        let obligation = state
+            .obligations
+            .get(&segment_id)
+            .ok_or_else(|| anyhow!("v8 PITR source has no manifest sealing obligation"))?;
+        ensure!(
+            obligation.state == ObligationState::Sealed
+                && obligation.wal_format == PitrWalFormat::V8,
+            "v8 PITR predecessor is not covered by a durable Sealed obligation"
+        );
+        let boundary = obligation
+            .immutable_boundary
+            .ok_or_else(|| anyhow!("v8 PITR Sealed obligation has no immutable boundary"))?;
+        ensure!(
+            obligation.logical_length == boundary.sealed_end
+                && boundary.active.segment_id == segment_id
+                && boundary.active.wal_format == PitrWalFormat::V8,
+            "v8 PITR predecessor boundary differs from its Sealed obligation"
+        );
+        if let Some(timeline_id) = state.timeline_id {
+            ensure!(
+                boundary.active.timeline_id == timeline_id,
+                "sealed v8 PITR predecessor timeline differs from its manifest"
+            );
+        }
+        if let Some(archive_epoch_id) = state.archive_epoch_id {
+            ensure!(
+                boundary.active.archive_epoch_id == archive_epoch_id,
+                "sealed v8 PITR predecessor archive epoch differs from its manifest"
+            );
+        }
+        let max_segment_bytes = state
+            .config
+            .as_ref()
+            .ok_or_else(|| anyhow!("PITR state is missing its persisted configuration"))?
+            .max_segment_bytes;
+        ensure!(
+            boundary.sealed_end <= max_segment_bytes,
+            "sealed v8 PITR predecessor exceeds the persisted segment limit"
+        );
+
+        let seal_path = database_path.join(format!("pitr-{segment_id:020}.seal"));
+        let (format, bytes) =
+            crate::pitr::seal::read_seal_sidecar(&seal_path, Some(boundary.sealed_end))?;
+        ensure!(
+            format == crate::pitr::seal::SealSidecarFormat::V8,
+            "v8 PITR predecessor has a non-v8 seal sidecar"
+        );
+        let seal = crate::pitr::seal::V8Seal::decode(&bytes, boundary.sealed_end)?;
+        ensure!(
+            seal.boundary == boundary && seal.header.segment_id.0 == segment_id,
+            "v8 PITR seal differs from its manifest obligation"
+        );
+        ensure!(
+            state
+                .timeline_id
+                .is_none_or(|timeline_id| seal.header.timeline_id.0 == timeline_id)
+                && state.archive_epoch_id.is_none_or(|archive_epoch_id| seal
+                    .header
+                    .archive_epoch_id
+                    .0
+                    == archive_epoch_id),
+            "v8 PITR seal identity differs from its manifest"
+        );
+        ensure!(
+            seal.encode()? == bytes,
+            "v8 PITR predecessor seal is not canonically encoded"
+        );
+
+        let mut wal = File::open(wal_path).with_context(|| {
+            format!("open sealed v8 PITR predecessor WAL {}", wal_path.display())
+        })?;
+        let wal_len = wal.metadata()?.len();
+        ensure!(
+            wal_len == boundary.sealed_end,
+            "sealed v8 PITR predecessor length differs from its immutable boundary"
+        );
+        seal.verify_wal_from_reader(&mut wal, wal_len)?;
 
         Ok(seal)
     }
@@ -10287,7 +10379,7 @@ impl LsmStorageInner {
             obligation.state == ObligationState::Sealed
                 && matches!(
                     obligation.wal_format,
-                    PitrWalFormat::V7 | PitrWalFormat::LegacyV5V6
+                    PitrWalFormat::V7 | PitrWalFormat::V8 | PitrWalFormat::LegacyV5V6
                 )
                 && obligation.successor_segment_id == boundary.segment_id
         });
@@ -10299,13 +10391,23 @@ impl LsmStorageInner {
             "multiple sealed v7 obligations name the missing Active successor"
         );
         let active_image_len = (WAL_V7_HEADER_LEN + WAL_V7_FRAME_LEN) as u64;
-        let legacy_source_buffer_bytes = if obligation.wal_format == PitrWalFormat::LegacyV5V6 {
-            crate::pitr::seal::V5Seal::validation_memory_bytes(obligation.logical_length)?
-        } else {
-            0
+        let source_validation_buffer_bytes = match obligation.wal_format {
+            PitrWalFormat::LegacyV5V6 => {
+                crate::pitr::seal::V5Seal::validation_memory_bytes(obligation.logical_length)?
+            }
+            PitrWalFormat::V8 => {
+                let immutable_boundary = obligation
+                    .immutable_boundary
+                    .ok_or_else(|| anyhow!("sealed v8 predecessor has no immutable boundary"))?;
+                crate::pitr::seal::V8Seal::validation_memory_bytes(
+                    immutable_boundary.sealed_end,
+                    immutable_boundary.active.ticket_end,
+                )?
+            }
+            PitrWalFormat::Unspecified | PitrWalFormat::V7 => 0,
         };
         // Reconstruct the disk and temporary-memory budget before reading the
-        // legacy source into memory or rebuilding its seal index.
+        // legacy source into memory or rebuilding a versioned seal index.
         let (_, recovery_workspace, _) =
             Self::reserve_v7_active_recovery_workspace_with_buffer_memory(
                 state,
@@ -10313,7 +10415,7 @@ impl LsmStorageInner {
                 boundary.segment_id,
                 active_image_len,
                 0,
-                legacy_source_buffer_bytes,
+                source_validation_buffer_bytes,
             )?;
         let source_path = database_path.join(format!("pitr-{source_segment_id:020}.wal"));
         let predecessor_anchor = match obligation.wal_format {
@@ -10349,7 +10451,18 @@ impl LsmStorageInner {
                 &source_path,
             )?,
             PitrWalFormat::V8 => {
-                anyhow::bail!("cannot synthesize a missing successor from a v8 predecessor yet")
+                let seal = Self::load_v8_sealed_recovery_source(
+                    database_path,
+                    state,
+                    source_segment_id,
+                    &source_path,
+                )?;
+                let seal_bytes = seal.encode()?;
+                crate::pitr::SegmentAnchor {
+                    segment_id: crate::pitr::SegmentId(source_segment_id),
+                    wal_digest: seal.boundary.wal_digest,
+                    seal_digest: sha2::Sha256::digest(&seal_bytes).into(),
+                }
             }
             PitrWalFormat::Unspecified => {
                 anyhow::bail!("missing v7 Active successor has an unspecified predecessor format")
@@ -22970,18 +23083,21 @@ mod tests {
     -> anyhow::Result<()> {
         use crate::{
             pitr::{
-                ArchiveEpochId, ChainAnchor, SegmentId, TimelineId,
+                ArchiveEpochId, ChainAnchor, SegmentAnchor, SegmentId, TimelineId,
                 manifest::{
                     ActiveBoundary, ImmutableBoundary, ObligationState, PersistedChainAnchor,
                     PersistedPitrConfig, PitrMode, PitrObligation, PitrState, PitrWalFormat,
                 },
                 seal::V8Seal,
             },
-            wal::v8::{
-                WAL_V8_HEADER_LEN,
-                codec::{
-                    WAL_V8_FRAME_LEN, WalV8Header, encode_generation_zero_frontier,
-                    frame_record_digest,
+            wal::{
+                v7::codec::{WAL_V7_FRAME_LEN, WAL_V7_HEADER_LEN, WalV7Header},
+                v8::{
+                    WAL_V8_HEADER_LEN,
+                    codec::{
+                        WAL_V8_FRAME_LEN, WalV8Header, encode_generation_zero_frontier,
+                        frame_record_digest,
+                    },
                 },
             },
         };
@@ -23082,6 +23198,78 @@ mod tests {
         assert_eq!(metadata.immutable_boundary.as_deref(), Some(&boundary));
         assert_eq!(metadata.batch_count, 0);
 
+        let successor_id = segment_id + 1;
+        let predecessor_anchor = SegmentAnchor {
+            segment_id: SegmentId(segment_id),
+            wal_digest: boundary.wal_digest,
+            seal_digest: Sha256::digest(&seal_bytes).into(),
+        };
+        let successor_header = WalV7Header {
+            timeline_id: TimelineId(timeline_id),
+            archive_epoch_id: ArchiveEpochId(archive_epoch_id),
+            segment_id: SegmentId(successor_id),
+            predecessor: ChainAnchor::Segment(predecessor_anchor),
+            incarnation: [7; 16],
+        };
+        let successor_boundary = ActiveBoundary {
+            timeline_id,
+            archive_epoch_id,
+            segment_id: successor_id,
+            incarnation: successor_header.incarnation,
+            wal_format: PitrWalFormat::V7,
+            ticket_end: 0,
+            durable_end: WAL_V7_HEADER_LEN as u64,
+            last_commit_ts: 0,
+            prefix_digest: successor_header.digest()?,
+        };
+        let successor_path = database.join(format!("pitr-{successor_id:020}.wal"));
+        let mut successor_state = state.clone();
+        successor_state.active_segment_id = Some(successor_id);
+        successor_state.active_boundary = Some(successor_boundary);
+        successor_state.next_segment_id = successor_id + 1;
+        successor_state.predecessor_anchor = Some(PersistedChainAnchor::Segment {
+            segment_id,
+            wal_digest: predecessor_anchor.wal_digest,
+            seal_digest: predecessor_anchor.seal_digest,
+        });
+        let source_obligation = successor_state.obligations.get_mut(&segment_id).unwrap();
+        source_obligation.state = ObligationState::Sealed;
+        source_obligation.successor_segment_id = successor_id;
+        let v8_validation_buffer_bytes =
+            V8Seal::validation_memory_bytes(sealed_end, active.ticket_end)?;
+        let (retained, validation_workspace, _) =
+            LsmStorageInner::reserve_v7_active_recovery_workspace_with_buffer_memory(
+                &successor_state,
+                &database,
+                successor_id,
+                u64::try_from(WAL_V7_HEADER_LEN + WAL_V7_FRAME_LEN)?,
+                0,
+                v8_validation_buffer_bytes,
+            )?;
+        assert_eq!(
+            retained.ledger().snapshot().buffer_memory_bytes,
+            v8_validation_buffer_bytes,
+            "v8 seal validation memory must be charged to the maintenance workspace"
+        );
+        drop(validation_workspace);
+        drop(retained);
+        assert!(LsmStorageInner::recreate_missing_sealed_v7_successor(
+            &database,
+            &successor_state,
+            successor_boundary,
+        )?);
+        let successor_file = std::fs::File::open(&successor_path)?;
+        let mut successor_header_bytes = [0; WAL_V7_HEADER_LEN];
+        std::io::Read::read_exact(&mut &successor_file, &mut successor_header_bytes)?;
+        assert_eq!(
+            WalV7Header::decode(&successor_header_bytes)?,
+            successor_header
+        );
+        assert_eq!(
+            std::fs::metadata(&successor_path)?.len(),
+            u64::try_from(WAL_V7_HEADER_LEN + WAL_V7_FRAME_LEN)?
+        );
+
         let mut wrong_authority = state.clone();
         wrong_authority
             .obligations
@@ -23097,8 +23285,51 @@ mod tests {
                 .is_err()
         );
 
+        std::fs::remove_file(&successor_path)?;
+        let mut wrong_successor_authority = successor_state.clone();
+        wrong_successor_authority
+            .obligations
+            .get_mut(&segment_id)
+            .unwrap()
+            .immutable_boundary
+            .as_mut()
+            .unwrap()
+            .wal_digest[0] ^= 1;
+        assert!(
+            LsmStorageInner::recreate_missing_sealed_v7_successor(
+                &database,
+                &wrong_successor_authority,
+                successor_boundary,
+            )
+            .is_err()
+        );
+        assert!(!successor_path.exists());
+
+        let mut oversized_sidecar = seal_bytes.clone();
+        oversized_sidecar.extend_from_slice(&[0; 40]);
+        std::fs::write(&seal_path, &oversized_sidecar)?;
+        assert!(
+            LsmStorageInner::recreate_missing_sealed_v7_successor(
+                &database,
+                &successor_state,
+                successor_boundary,
+            )
+            .is_err()
+        );
+        assert!(!successor_path.exists());
+        std::fs::write(&seal_path, &seal_bytes)?;
+
         wal_bytes[WAL_V8_HEADER_LEN + 80] ^= 1;
         std::fs::write(&wal_path, &wal_bytes)?;
+        assert!(
+            LsmStorageInner::recreate_missing_sealed_v7_successor(
+                &database,
+                &successor_state,
+                successor_boundary,
+            )
+            .is_err()
+        );
+        assert!(!successor_path.exists());
         assert!(engine.load_pitr_source_segment(&state, segment_id).is_err());
         engine.close_storage()?;
         Ok(())

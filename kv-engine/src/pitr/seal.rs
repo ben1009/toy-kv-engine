@@ -1116,6 +1116,39 @@ impl V8Seal {
         v8_max_seal_bytes(v8_max_entry_count(max_segment_bytes)?)
     }
 
+    /// Conservatively estimate the peak memory for strict validation of a
+    /// frozen v8 image. V7's estimate covers the shared frame scan and logical
+    /// batch decoding work; v8 adds its compact ticket index and keeps the
+    /// original sidecar plus two encoded sidecars during strict comparison.
+    pub(crate) fn validation_memory_bytes(sealed_end: u64, ticket_end: u64) -> Result<u64> {
+        ensure!(
+            crate::wal::v8::WAL_V8_HEADER_LEN == WAL_V7_HEADER_LEN
+                && WAL_V8_FRAME_LEN == WAL_V7_FRAME_LEN
+                && crate::wal::v8::codec::WAL_V8_DATA_FRAGMENT_PAYLOAD_CAPACITY
+                    == WAL_V7_DATA_FRAGMENT_PAYLOAD_CAPACITY
+                && crate::wal::v8::codec::WAL_V8_LOGICAL_BATCH_HEADER_LEN
+                    == WAL_V7_LOGICAL_BATCH_HEADER_LEN
+                && V8_ENTRY_BYTES == V7_ENTRY_BYTES
+                && std::mem::size_of::<V8SealEntry>() == std::mem::size_of::<V7SealEntry>(),
+            "v8 seal validation estimate requires v7-compatible frame geometry"
+        );
+        let shared_scan_and_decode = V7Seal::preparation_memory_bytes(sealed_end, ticket_end)?;
+        let ticket_index_bytes = ticket_end
+            .checked_mul(u64::try_from(std::mem::size_of::<
+                crate::wal::v8::recovery::WalV8SealTicket,
+            >())?)
+            .ok_or_else(|| anyhow::anyhow!("v8 seal ticket-index workspace overflows"))?;
+        // The shared estimate includes one encoded sidecar. Strict v8
+        // verification can retain the input sidecar, rebuilt sidecar, and a
+        // canonical re-encoding at once, so reserve the two additional fixed
+        // headers as well as the separately accounted ticket index above.
+        let additional_sidecar_headers = u64::try_from(2 * V8_HEADER_BYTES)?;
+        shared_scan_and_decode
+            .checked_add(ticket_index_bytes)
+            .and_then(|bytes| bytes.checked_add(additional_sidecar_headers))
+            .ok_or_else(|| anyhow::anyhow!("v8 seal validation workspace overflows"))
+    }
+
     pub(crate) fn encode(&self) -> Result<Vec<u8>> {
         self.validate()?;
         let body_len = self
