@@ -1083,7 +1083,12 @@ mod tests {
     use std::{
         fs::File,
         io::{self, Cursor, Read, Seek, SeekFrom},
-        os::unix::{fs::MetadataExt, process::ExitStatusExt},
+        os::unix::fs::MetadataExt,
+    };
+
+    #[cfg(feature = "chaos-testing")]
+    use std::{
+        os::unix::process::ExitStatusExt,
         process::{Command, Stdio},
         time::{Duration, Instant},
     };
