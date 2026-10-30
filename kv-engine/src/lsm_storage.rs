@@ -5078,17 +5078,62 @@ impl KvEngine {
             {
                 continue;
             }
-            let (format, bytes) = crate::pitr::seal::read_seal_sidecar(
-                &path,
-                state.config.as_ref().map(|config| config.max_segment_bytes),
-            )?;
+            // A versioned obligation's immutable image boundary is the tighter
+            // sidecar allocation bound. Do not allocate against the configured
+            // segment maximum when the manifest already fixes this source's
+            // smaller physical image.
+            let (expected_seal_format, sidecar_image_limit) =
+                match state.obligations.get(&segment_id) {
+                    Some(obligation)
+                        if matches!(
+                            obligation.wal_format,
+                            crate::pitr::manifest::PitrWalFormat::V7
+                                | crate::pitr::manifest::PitrWalFormat::V8
+                        ) =>
+                    {
+                        let boundary = obligation.immutable_boundary.ok_or_else(|| {
+                            anyhow!("versioned PITR source has no immutable boundary")
+                        })?;
+                        ensure!(
+                            obligation.logical_length == boundary.sealed_end
+                                && boundary.active.segment_id == segment_id
+                                && boundary.active.wal_format == obligation.wal_format,
+                            "versioned PITR source boundary differs from its manifest obligation"
+                        );
+                        let expected_format = match obligation.wal_format {
+                            crate::pitr::manifest::PitrWalFormat::V7 => {
+                                crate::pitr::seal::SealSidecarFormat::V7
+                            }
+                            crate::pitr::manifest::PitrWalFormat::V8 => {
+                                crate::pitr::seal::SealSidecarFormat::V8
+                            }
+                            _ => unreachable!("guarded to versioned PITR formats"),
+                        };
+                        (Some(expected_format), Some(boundary.sealed_end))
+                    }
+                    _ => (
+                        None,
+                        state.config.as_ref().map(|config| config.max_segment_bytes),
+                    ),
+                };
+            let (format, bytes) = match expected_seal_format {
+                Some(expected_format) => crate::pitr::seal::read_seal_sidecar_for_format(
+                    &path,
+                    sidecar_image_limit,
+                    expected_format,
+                )?,
+                None => crate::pitr::seal::read_seal_sidecar(&path, sidecar_image_limit)?,
+            };
             if format == crate::pitr::seal::SealSidecarFormat::V7 {
                 let max_segment_bytes = state
                     .config
                     .as_ref()
                     .map(|config| config.max_segment_bytes)
                     .ok_or_else(|| anyhow!("PITR v7 source has no persisted segment limit"))?;
-                let seal = crate::pitr::seal::V7Seal::decode(&bytes, max_segment_bytes)?;
+                let seal = crate::pitr::seal::V7Seal::decode(
+                    &bytes,
+                    sidecar_image_limit.unwrap_or(max_segment_bytes),
+                )?;
                 if seal.header.segment_id.0 != segment_id {
                     continue;
                 }
@@ -5186,7 +5231,10 @@ impl KvEngine {
                     .as_ref()
                     .map(|config| config.max_segment_bytes)
                     .ok_or_else(|| anyhow!("PITR v8 source has no persisted segment limit"))?;
-                let seal = crate::pitr::seal::V8Seal::decode(&bytes, max_segment_bytes)?;
+                let seal = crate::pitr::seal::V8Seal::decode(
+                    &bytes,
+                    sidecar_image_limit.unwrap_or(max_segment_bytes),
+                )?;
                 if seal.header.segment_id.0 != segment_id {
                     continue;
                 }
@@ -23308,6 +23356,27 @@ mod tests {
         let mut oversized_sidecar = seal_bytes.clone();
         oversized_sidecar.extend_from_slice(&[0; 40]);
         std::fs::write(&seal_path, &oversized_sidecar)?;
+        let source_error = engine
+            .load_pitr_source_segment(&state, segment_id)
+            .expect_err("source discovery must apply the immutable image sidecar bound");
+        assert!(
+            source_error
+                .to_string()
+                .contains("exceeds its format size limit")
+        );
+        std::fs::write(&seal_path, b"TKVSEAL1")?;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&seal_path)?
+            .set_len(sealed_end + 1)?;
+        let wrong_format_error = engine
+            .load_pitr_source_segment(&state, segment_id)
+            .expect_err("a v8 obligation must reject a legacy seal before reading its body");
+        assert!(
+            wrong_format_error
+                .to_string()
+                .contains("format differs from its manifest obligation")
+        );
         assert!(
             LsmStorageInner::recreate_missing_sealed_v7_successor(
                 &database,

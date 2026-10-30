@@ -83,7 +83,19 @@ pub(crate) fn read_seal_sidecar(
 ) -> Result<(SealSidecarFormat, Vec<u8>)> {
     let file =
         File::open(path).with_context(|| format!("open PITR seal sidecar {}", path.display()))?;
-    read_seal_file(file, max_segment_bytes)
+    read_seal_file_inner(file, max_segment_bytes, None)
+}
+
+/// Read a local seal sidecar only when it uses the format authorized by its
+/// manifest obligation. The magic is checked before the body is allocated.
+pub(crate) fn read_seal_sidecar_for_format(
+    path: &Path,
+    max_segment_bytes: Option<u64>,
+    expected_format: SealSidecarFormat,
+) -> Result<(SealSidecarFormat, Vec<u8>)> {
+    let file =
+        File::open(path).with_context(|| format!("open PITR seal sidecar {}", path.display()))?;
+    read_seal_file_inner(file, max_segment_bytes, Some(expected_format))
 }
 
 /// Read a seal object only after checking its format-specific size cap.
@@ -91,8 +103,16 @@ pub(crate) fn read_seal_sidecar(
 /// This is also used for repository files opened relative to a trusted
 /// directory descriptor, where reopening by path would weaken path validation.
 pub(crate) fn read_seal_file(
+    file: File,
+    max_segment_bytes: Option<u64>,
+) -> Result<(SealSidecarFormat, Vec<u8>)> {
+    read_seal_file_inner(file, max_segment_bytes, None)
+}
+
+fn read_seal_file_inner(
     mut file: File,
     max_segment_bytes: Option<u64>,
+    expected_format: Option<SealSidecarFormat>,
 ) -> Result<(SealSidecarFormat, Vec<u8>)> {
     let sidecar_len = file.metadata()?.len();
     let mut magic = [0; 8];
@@ -121,6 +141,10 @@ pub(crate) fn read_seal_file(
         }
         _ => anyhow::bail!("unknown PITR source seal magic"),
     };
+    ensure!(
+        expected_format.is_none_or(|expected| expected == format),
+        "PITR source seal format differs from its manifest obligation"
+    );
     ensure!(
         sidecar_len <= u64::try_from(max_sidecar_bytes)?,
         "PITR source seal exceeds its format size limit"
