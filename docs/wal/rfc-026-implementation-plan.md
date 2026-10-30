@@ -94,8 +94,9 @@ explicit compatibility decision and any necessary RFC amendment.
    and binds an empty v8 prefix to its header. Archive publication now verifies
    the frozen v8 WAL and sidecar, and shallow/deep repository verification and
    ticket-ordered restore dispatch by format. Tests cover source-path archival,
-   catalog reopen, sealed-source startup recovery, and exact restore across a
-   v7-to-v8 chain. Active recovery normalization is tested with repeated process
+   catalog reopen, sealed-source startup recovery, and exact restore from
+   persisted archive objects across a v7-to-v8 chain. Active recovery
+   normalization is tested with repeated process
    interruption after temp-image write, temp sync, rename, and directory sync;
    retries preserve the hard anchor. Returned errors before sync, rename, and
    directory sync are also covered. V8 creation remains disabled pending the

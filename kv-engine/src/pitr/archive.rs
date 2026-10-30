@@ -1697,6 +1697,138 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn exact_restore_replays_persisted_v7_to_v8_archive_chain() {
+        use crate::pitr::{
+            base::{PITR_BASE_WAL_REPLAY_VERSION, PitrBaseMetadata, PitrBaseTimeAnchor},
+            catalog::PitrCatalogRecord,
+            manifest::{PersistedChainAnchor, PersistedRecordedAt},
+            restore::{
+                ExactRestoreExecutor, PitrRestoreTarget, plan_exact_restore,
+                required_source_objects,
+            },
+        };
+
+        let root = tempfile::tempdir().unwrap();
+        let archive_epoch_id = ArchiveEpochId([3; 16]);
+        let first_batch = crate::pitr::WalBatch {
+            commit_ts: 10,
+            recorded_at: crate::pitr::RecordedAt { secs: 10, nanos: 0 },
+            entries: vec![crate::pitr::WalEntry::Put {
+                key: b"persisted-v7-key".to_vec(),
+                value: b"from-persisted-v7".to_vec(),
+            }],
+        };
+        let (first, first_wal, first_seal) = v7_archive_objects_with_batches(
+            SegmentId(8),
+            ChainAnchor::Genesis { archive_epoch_id },
+            &[first_batch],
+        );
+        let (second, second_wal, second_seal, second_batch) =
+            v8_archive_objects_with_one_batch_after(ChainAnchor::Segment(first.anchor));
+
+        let limiter_options = crate::pitr::limiter::ArchiveLimiterOptions {
+            bytes_per_second: None,
+            burst_bytes: std::num::NonZeroU64::new(1024 * 1024).unwrap(),
+        };
+        let now = std::time::Instant::now();
+        let mut archiver =
+            crate::pitr::archiver::PitrArchiver::new(root.path(), limiter_options, now).unwrap();
+        for (sequence, (metadata, wal, seal)) in [
+            (&first, &first_wal, &first_seal),
+            (&second, &second_wal, &second_seal),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert!(matches!(
+                archiver
+                    .archive_segment(
+                        metadata.clone(),
+                        wal,
+                        seal,
+                        std::time::Instant::now(),
+                    )
+                    .unwrap(),
+                crate::pitr::archiver::ArchiveTransactionOutcome::Committed {
+                    sequence: committed
+                } if committed == sequence as u64 + 1
+            ));
+        }
+        drop(archiver);
+
+        // Reopen from the persisted catalog, then plan from its committed metadata.
+        let reopened =
+            crate::pitr::archiver::PitrArchiver::new(root.path(), limiter_options, now).unwrap();
+        let persisted_catalog = std::fs::read(root.path().join("PITR_CATALOG_LOG")).unwrap();
+        assert_eq!(reopened.catalog_bytes(), persisted_catalog);
+        assert_eq!(reopened.committed_segment_ids().unwrap(), [8, 9].into());
+        let catalog = crate::pitr::catalog::replay_catalog(&persisted_catalog).unwrap();
+        let mut segments = catalog
+            .records
+            .into_iter()
+            .filter_map(|record| match record {
+                PitrCatalogRecord::CommitSegment { metadata } => Some(metadata),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        segments.sort_by_key(|metadata| metadata.key.segment_id);
+        assert_eq!(segments, vec![first.clone(), second.clone()]);
+        drop(reopened);
+
+        let first_metadata = &segments[0];
+        let base_time = PersistedRecordedAt { secs: 1, nanos: 0 };
+        let base = PitrBaseMetadata {
+            repository_id: first_metadata.key.repository_id,
+            timeline_id: first_metadata.key.timeline_id.0,
+            archive_epoch_id: first_metadata.key.archive_epoch_id.0,
+            included_commit_ts: Some(7),
+            boundary_segment_id: first_metadata.key.segment_id.0,
+            boundary_anchor: PersistedChainAnchor::Genesis {
+                archive_epoch_id: archive_epoch_id.0,
+            },
+            base_recorded_at: base_time,
+            time_anchor: PitrBaseTimeAnchor::Observed {
+                commit_ts: Some(7),
+                observed_at: base_time,
+            },
+            wal_replay_version: PITR_BASE_WAL_REPLAY_VERSION,
+            compatibility_digest: [7; 32],
+        };
+        let plan = plan_exact_restore(
+            &base,
+            segments.clone(),
+            PitrRestoreTarget::CommitTs(second_batch.commit_ts),
+        )
+        .unwrap();
+        assert_eq!(
+            plan.segments,
+            vec![first_metadata.key.segment_id, segments[1].key.segment_id]
+        );
+
+        let expected = required_source_objects(&base, &segments, &plan).unwrap();
+        let stager = ArchiveObjectStager::new(root.path()).unwrap();
+        let loaded =
+            crate::pitr::restore::load_verified_archive_objects(&stager, &expected).unwrap();
+        assert_eq!(loaded.len(), 4);
+
+        let mut executor = ExactRestoreExecutor::new_with_sources(plan, Some(expected));
+        let info = executor
+            .run_exact_restore_with_segments(|| Ok(()), &loaded, crate::pitr::LIVE_WAL_V5_LIMITS)
+            .unwrap();
+        assert_eq!(info.last_commit_ts, Some(second_batch.commit_ts));
+        assert_eq!(info.applied_batches, 2);
+        assert_eq!(
+            executor.get(b"persisted-v7-key"),
+            Some(b"from-persisted-v7".as_slice())
+        );
+        assert_eq!(
+            executor.get(b"archive-key"),
+            Some(b"archive-value".as_slice())
+        );
+    }
+
     #[test]
     fn rejects_a_v7_seal_that_disagrees_with_the_catalog_boundary() {
         let (mut metadata, wal, seal_bytes) = v7_archive_objects();
