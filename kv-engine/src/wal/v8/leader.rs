@@ -538,6 +538,12 @@ fn validate_positional_write_handle(file: &File) -> io::Result<()> {
             return Err(error);
         }
     };
+    if flags & libc::O_ACCMODE == libc::O_RDONLY {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "v8 WAL positional write handle is not writable",
+        ));
+    }
     if flags & libc::O_APPEND != 0 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -819,6 +825,30 @@ mod tests {
         assert!(error.downcast_ref::<WalV8LeaderCapacityError>().is_some());
         assert!(!writer.is_poisoned());
         assert_eq!(std::fs::metadata(&path)?.len(), installed.image_len);
+        Ok(())
+    }
+
+    #[test]
+    fn read_only_write_handle_is_rejected_before_mutation() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("active-v8.wal");
+        let header = header();
+        let installed = install_empty(&path, header)?;
+        let before = std::fs::read(&path)?;
+        let read_only_file = OpenOptions::new().read(true).open(&path)?;
+        let sync_file = OpenOptions::new().read(true).write(true).open(&path)?;
+
+        let error = WalV8LeaderWriter::new(
+            read_only_file,
+            sync_file,
+            &installed,
+            MAX_WAL_FILE_SIZE,
+        )
+        .err()
+        .context("read-only positional write handle should be rejected")?;
+        assert!(format!("{error:#}").contains("not writable"));
+        assert_eq!(std::fs::read(&path)?, before);
+
         Ok(())
     }
 
