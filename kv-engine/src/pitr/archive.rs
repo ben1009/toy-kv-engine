@@ -61,8 +61,8 @@ pub(crate) struct PreparedArchiveObjects {
 }
 
 /// How a source object's bytes are digested. v5/v6 WALs use their recorded
-/// coverage rule, v7 WALs use the frozen image's whole-object digest, and seal
-/// sidecars are always hashed whole.
+/// coverage rule, embedded-frontier WALs use the frozen image's whole-object
+/// digest, and seal sidecars are always hashed whole.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SourceObjectDigest {
     WholeObject,
@@ -72,7 +72,10 @@ pub(crate) enum SourceObjectDigest {
 impl SourceObjectDigest {
     /// Select the digest policy recorded by a segment's WAL format.
     pub(crate) fn for_wal_format(version: u16) -> anyhow::Result<Self> {
-        if version == crate::wal::format::WAL_FORMAT_VERSION_V7 {
+        if matches!(
+            version,
+            crate::wal::format::WAL_FORMAT_VERSION_V7 | crate::wal::format::WAL_FORMAT_VERSION_V8
+        ) {
             Ok(Self::WholeObject)
         } else {
             Ok(Self::Wal(crate::pitr::wal_digest_rule(version)?))
@@ -733,8 +736,14 @@ impl PitrArchiveCatalog {
             Sha256::digest(seal).as_slice() == metadata.seal_digest,
             "archived seal digest mismatch"
         );
-        if metadata.wal_format_version == crate::wal::format::WAL_FORMAT_VERSION_V7 {
-            verify_v7_archive_objects(metadata, wal, seal)?;
+        match metadata.wal_format_version {
+            crate::wal::format::WAL_FORMAT_VERSION_V7 => {
+                verify_v7_archive_objects(metadata, wal, seal)?;
+            }
+            crate::wal::format::WAL_FORMAT_VERSION_V8 => {
+                anyhow::bail!("v8 archive seal verification is not implemented");
+            }
+            _ => {}
         }
 
         Ok(PreparedArchiveObjects {
@@ -971,6 +980,55 @@ mod tests {
         }
     }
 
+    fn unverified_v8_metadata(wal: &[u8], seal: &[u8]) -> SegmentMetadata {
+        let key = crate::pitr::catalog::SegmentKey {
+            repository_id: [1; 16],
+            timeline_id: TimelineId([2; 16]),
+            archive_epoch_id: ArchiveEpochId([3; 16]),
+            segment_id: SegmentId(8),
+        };
+        let wal_digest: [u8; 32] = Sha256::digest(wal).into();
+        let seal_digest: [u8; 32] = Sha256::digest(seal).into();
+        let boundary = crate::pitr::manifest::ImmutableBoundary {
+            active: crate::pitr::manifest::ActiveBoundary {
+                timeline_id: key.timeline_id.0,
+                archive_epoch_id: key.archive_epoch_id.0,
+                segment_id: key.segment_id.0,
+                incarnation: [5; 16],
+                ticket_end: 1,
+                durable_end: 3 * 4096,
+                last_commit_ts: 1,
+                prefix_digest: [6; 32],
+            },
+            sealed_end: wal.len() as u64,
+            terminal_frontier_digest: [7; 32],
+            wal_digest,
+        };
+
+        SegmentMetadata {
+            key,
+            wal_format_version: crate::wal::format::WAL_FORMAT_VERSION_V8,
+            seal_format_version: 3,
+            immutable_boundary: Some(Box::new(boundary)),
+            anchor: SegmentAnchor {
+                segment_id: key.segment_id,
+                wal_digest,
+                seal_digest,
+            },
+            predecessor: ChainAnchor::Genesis {
+                archive_epoch_id: key.archive_epoch_id,
+            },
+            first_commit_ts: Some(1),
+            last_commit_ts: Some(1),
+            batch_count: 1,
+            logical_bytes: 64,
+            wal_bytes: wal.len() as u64,
+            wal_digest,
+            seal_digest,
+            source_identity: [8; 32],
+        }
+    }
+
     fn v7_archive_objects() -> (SegmentMetadata, Vec<u8>, Vec<u8>) {
         v7_archive_objects_with_batches(
             SegmentId(4),
@@ -1201,6 +1259,25 @@ mod tests {
                 .digest(&wal)
                 .unwrap(),
             metadata.wal_digest
+        );
+    }
+
+    #[test]
+    fn v8_uses_whole_image_digest_but_archive_publication_stays_fail_closed() {
+        let wal = vec![0; 4 * 4096];
+        let seal = b"unverified v8 seal";
+        let metadata = unverified_v8_metadata(&wal, seal);
+
+        let digest_policy =
+            SourceObjectDigest::for_wal_format(crate::wal::format::WAL_FORMAT_VERSION_V8).unwrap();
+        assert_eq!(digest_policy, SourceObjectDigest::WholeObject);
+        assert_eq!(digest_policy.digest(&wal).unwrap(), metadata.wal_digest);
+        assert!(
+            PitrArchiveCatalog::default()
+                .prepare_objects(&metadata, &wal, seal)
+                .is_err_and(|error| error
+                    .to_string()
+                    .contains("v8 archive seal verification is not implemented"))
         );
     }
 
