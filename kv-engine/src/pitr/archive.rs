@@ -1973,6 +1973,62 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn archiver_publishes_and_reopens_a_strictly_verified_v8_source() {
+        let root = tempfile::tempdir().unwrap();
+        let (metadata, wal, seal, _) = v8_archive_objects_with_one_batch();
+        let wal_path = root.path().join("source.wal");
+        let seal_path = root.path().join("source.seal");
+        std::fs::write(&wal_path, &wal).unwrap();
+        std::fs::write(&seal_path, &seal).unwrap();
+
+        let now = std::time::Instant::now();
+        let mut archiver = crate::pitr::archiver::PitrArchiver::new(
+            root.path(),
+            crate::pitr::limiter::ArchiveLimiterOptions {
+                bytes_per_second: None,
+                burst_bytes: std::num::NonZeroU64::new(1024 * 1024).unwrap(),
+            },
+            now,
+        )
+        .unwrap();
+        assert!(matches!(
+            archiver
+                .archive_segment_from_paths(
+                    metadata.clone(),
+                    &wal_path,
+                    &seal_path,
+                    std::time::Instant::now(),
+                )
+                .unwrap(),
+            crate::pitr::archiver::ArchiveTransactionOutcome::Committed { sequence: 1 }
+        ));
+        assert!(
+            archiver
+                .committed_segment_ids()
+                .unwrap()
+                .contains(&metadata.key.segment_id.0)
+        );
+        drop(archiver);
+
+        let reopened = crate::pitr::archiver::PitrArchiver::new(
+            root.path(),
+            crate::pitr::limiter::ArchiveLimiterOptions {
+                bytes_per_second: None,
+                burst_bytes: std::num::NonZeroU64::new(1024 * 1024).unwrap(),
+            },
+            std::time::Instant::now(),
+        )
+        .unwrap();
+        assert!(
+            reopened
+                .committed_segment_ids()
+                .unwrap()
+                .contains(&metadata.key.segment_id.0)
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn deep_repository_verification_reports_rehashed_v7_structural_corruption() {
         assert_deep_v7_corruption_reports(false);
     }
