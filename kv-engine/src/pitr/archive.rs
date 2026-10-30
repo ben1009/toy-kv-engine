@@ -907,6 +907,77 @@ pub(crate) fn decode_v8_archive_seal(
     Ok(seal)
 }
 
+/// Validate a frozen v8 archive pair and decode its ticket-ordered replay
+/// batches. The terminal FRONTIER and every batch are checked in the same
+/// recovery pass that rebuilds the seal index.
+pub(crate) fn decode_v8_archive_batches(
+    metadata: &SegmentMetadata,
+    wal: &[u8],
+    seal_bytes: &[u8],
+    limits: crate::pitr::WalV5Limits,
+) -> anyhow::Result<Vec<crate::pitr::WalBatch>> {
+    use std::io::Cursor;
+
+    use crate::wal::v8::{
+        codec::WAL_V8_FRAME_LEN,
+        recovery::{discover_frontier_candidates, select_sealed_candidate_for_replay},
+    };
+
+    let seal = decode_v8_archive_seal(metadata, seal_bytes)?;
+    let wal_len = u64::try_from(wal.len())?;
+    anyhow::ensure!(
+        wal_len == seal.boundary.sealed_end,
+        "v8 archive WAL length differs from its immutable seal"
+    );
+    anyhow::ensure!(
+        Sha256::digest(wal).as_slice() == seal.boundary.wal_digest,
+        "v8 archive WAL digest mismatch"
+    );
+
+    let physical_header_digest = seal.header.physical_digest()?;
+    let initial_prefix_digest = seal.header.initial_prefix_digest()?;
+    let mut reader = Cursor::new(wal);
+    let discovery = discover_frontier_candidates(
+        &mut reader,
+        wal_len,
+        &physical_header_digest,
+        &initial_prefix_digest,
+    )?;
+    let (selection, tickets) = select_sealed_candidate_for_replay(
+        &mut reader,
+        wal_len,
+        &discovery,
+        &[seal.boundary.active],
+        seal.header.predecessor,
+        limits,
+    )?;
+    let terminal_offset = seal
+        .boundary
+        .sealed_end
+        .checked_sub(u64::try_from(WAL_V8_FRAME_LEN)?)
+        .ok_or_else(|| anyhow::anyhow!("v8 archive terminal frontier offset underflows"))?;
+    anyhow::ensure!(
+        selection.header == seal.header
+            && selection.active_boundary == seal.boundary.active
+            && selection.candidate.frame_offset == terminal_offset
+            && selection.candidate.frame_digest == seal.boundary.terminal_frontier_digest
+            && u64::try_from(tickets.len())? == seal.boundary.active.ticket_end
+            && tickets.len() == seal.entries.len(),
+        "v8 archive WAL does not match its immutable terminal boundary"
+    );
+    for (index, (ticket, entry)) in tickets.iter().zip(&seal.entries).enumerate() {
+        anyhow::ensure!(
+            entry.ticket == u64::try_from(index)?
+                && entry.first_data_offset == ticket.first_data_offset
+                && entry.commit_ts == ticket.commit_ts
+                && entry.recorded_at == ticket.recorded_at,
+            "v8 archive seal index differs from its WAL"
+        );
+    }
+
+    Ok(selection.batches)
+}
+
 /// Validate a frozen v7 archive pair and decode its ticket-ordered batches.
 pub(crate) fn decode_v7_archive_batches(
     metadata: &SegmentMetadata,
@@ -979,7 +1050,10 @@ fn hex<const N: usize>(bytes: [u8; N]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pitr::{ArchiveEpochId, ChainAnchor, SegmentAnchor, SegmentId, TimelineId};
+    use crate::pitr::{
+        ArchiveEpochId, ChainAnchor, RecordedAt, SegmentAnchor, SegmentId, TimelineId, WalBatch,
+        WalEntry,
+    };
 
     /// The segment's identity, shared by its WAL header and its metadata.
     fn header() -> crate::pitr::WalV5Header {
@@ -1110,6 +1184,187 @@ mod tests {
             source_identity: source_identity.finalize().into(),
         };
         (metadata, wal, seal_bytes)
+    }
+
+    fn v8_archive_objects_with_one_batch() -> (SegmentMetadata, Vec<u8>, Vec<u8>, WalBatch) {
+        use crate::wal::v8::{
+            codec::{
+                WAL_V8_DATA_FRAGMENT_PAYLOAD_CAPACITY, WAL_V8_FRAME_LEN, WalV8DataFragmentHeader,
+                WalV8Frontier, WalV8Header, data_fragment_count, encode_frontier_successor,
+                encode_generation_zero_frontier, frame_record_digest,
+            },
+            digest::{self, WalV8EntryHasher},
+        };
+
+        let key = crate::pitr::catalog::SegmentKey {
+            repository_id: [1; 16],
+            timeline_id: TimelineId([2; 16]),
+            archive_epoch_id: ArchiveEpochId([3; 16]),
+            segment_id: SegmentId(9),
+        };
+        let predecessor = ChainAnchor::Genesis {
+            archive_epoch_id: key.archive_epoch_id,
+        };
+        let header = WalV8Header {
+            timeline_id: key.timeline_id,
+            archive_epoch_id: key.archive_epoch_id,
+            segment_id: key.segment_id,
+            predecessor,
+            incarnation: [6; 16],
+        };
+        let header_bytes = header.encode().unwrap();
+        let physical_header_digest = header.physical_digest().unwrap();
+        let initial_prefix_digest = header.initial_prefix_digest().unwrap();
+        let generation_zero =
+            encode_generation_zero_frontier(physical_header_digest, initial_prefix_digest).unwrap();
+        let generation_zero_digest = frame_record_digest(&generation_zero).unwrap();
+        let mut wal = header_bytes.to_vec();
+        wal.extend_from_slice(&generation_zero);
+
+        let batch = WalBatch {
+            commit_ts: 17,
+            recorded_at: RecordedAt { secs: 42, nanos: 7 },
+            entries: vec![WalEntry::Put {
+                key: b"archive-key".to_vec(),
+                value: b"archive-value".to_vec(),
+            }],
+        };
+        let legacy_batch =
+            crate::pitr::encode_v5_batch(&batch, crate::pitr::LIVE_WAL_V5_LIMITS).unwrap();
+        let entry_len =
+            usize::try_from(u32::from_be_bytes(legacy_batch[24..28].try_into().unwrap())).unwrap();
+        let entry_start = crate::pitr::WAL_V5_BATCH_HEADER_LEN;
+        let entries = &legacy_batch[entry_start..entry_start + entry_len];
+        let logical_header = crate::wal::v8::codec::WalV8LogicalBatchHeader {
+            segment_ticket: 0,
+            commit_ts: batch.commit_ts,
+            recorded_at_secs: batch.recorded_at.secs,
+            recorded_at_nanos: batch.recorded_at.nanos,
+            entry_count: u32::try_from(batch.entries.len()).unwrap(),
+        }
+        .encode(entries, crate::pitr::LIVE_WAL_V5_LIMITS)
+        .unwrap();
+        let mut logical_batch = logical_header.to_vec();
+        logical_batch.extend_from_slice(entries);
+        let mut entry_hasher = WalV8EntryHasher::new(u64::try_from(entries.len()).unwrap());
+        entry_hasher.update(entries).unwrap();
+        let entry_digest = entry_hasher.finish().unwrap();
+        let batch_digest = digest::batch_digest(&logical_header, &entry_digest);
+        let prefix_digest = digest::advance_prefix(
+            &initial_prefix_digest,
+            0,
+            u64::try_from(logical_batch.len()).unwrap(),
+            &batch_digest,
+        );
+
+        let data_offset = u64::try_from(wal.len()).unwrap();
+        let fragment_count = data_fragment_count(u64::try_from(logical_batch.len()).unwrap())
+            .expect("test batch has a valid fragment count");
+        for (fragment_index, payload) in logical_batch
+            .chunks(WAL_V8_DATA_FRAGMENT_PAYLOAD_CAPACITY)
+            .enumerate()
+        {
+            let frame_offset =
+                data_offset + u64::try_from(fragment_index).unwrap() * WAL_V8_FRAME_LEN as u64;
+            let fragment = WalV8DataFragmentHeader {
+                segment_ticket: 0,
+                fragment_index: u32::try_from(fragment_index).unwrap(),
+                fragment_count,
+                batch_bytes: u64::try_from(logical_batch.len()).unwrap(),
+            };
+            let body = fragment.encode_body(payload).unwrap();
+            let frame = crate::wal::v8::codec::encode_data_frame(
+                physical_header_digest,
+                initial_prefix_digest,
+                frame_offset,
+                &body,
+            )
+            .unwrap();
+            wal.extend_from_slice(&frame);
+        }
+        let frontier_offset = u64::try_from(wal.len()).unwrap();
+        let frontier = WalV8Frontier {
+            generation: 1,
+            ticket_end: 1,
+            durable_end: frontier_offset,
+            last_commit_ts: batch.commit_ts,
+            prefix_digest,
+            previous_frontier_offset: crate::wal::v8::WAL_V8_HEADER_LEN as u64,
+            previous_frontier_digest: generation_zero_digest,
+        };
+        let generation_zero_frontier = WalV8Frontier {
+            generation: 0,
+            ticket_end: 0,
+            durable_end: crate::wal::v8::WAL_V8_HEADER_LEN as u64,
+            last_commit_ts: 0,
+            prefix_digest: initial_prefix_digest,
+            previous_frontier_offset: 0,
+            previous_frontier_digest: [0; 32],
+        };
+        let terminal_frontier = encode_frontier_successor(
+            frontier,
+            generation_zero_frontier,
+            crate::wal::v8::WAL_V8_HEADER_LEN as u64,
+            &generation_zero_digest,
+            frontier_offset,
+            physical_header_digest,
+            initial_prefix_digest,
+        )
+        .unwrap();
+        let terminal_frontier_digest = frame_record_digest(&terminal_frontier).unwrap();
+        wal.extend_from_slice(&terminal_frontier);
+        let wal_digest: [u8; 32] = Sha256::digest(&wal).into();
+        let boundary = crate::pitr::manifest::ImmutableBoundary {
+            active: crate::pitr::manifest::ActiveBoundary {
+                timeline_id: key.timeline_id.0,
+                archive_epoch_id: key.archive_epoch_id.0,
+                segment_id: key.segment_id.0,
+                incarnation: header.incarnation,
+                ticket_end: 1,
+                durable_end: frontier_offset,
+                last_commit_ts: batch.commit_ts,
+                prefix_digest,
+            },
+            sealed_end: u64::try_from(wal.len()).unwrap(),
+            terminal_frontier_digest,
+            wal_digest,
+        };
+        let seal = crate::pitr::seal::V8Seal {
+            header,
+            boundary,
+            entries: vec![crate::pitr::seal::V8SealEntry {
+                ticket: 0,
+                first_data_offset: data_offset,
+                commit_ts: batch.commit_ts,
+                recorded_at: batch.recorded_at,
+            }],
+        };
+        let seal_bytes = seal.encode().unwrap();
+        let seal_digest = Sha256::digest(&seal_bytes).into();
+        let mut source_identity = Sha256::new();
+        source_identity.update(wal_digest);
+        source_identity.update(seal_digest);
+        let metadata = SegmentMetadata {
+            key,
+            wal_format_version: crate::wal::format::WAL_FORMAT_VERSION_V8,
+            seal_format_version: 3,
+            immutable_boundary: Some(Box::new(boundary)),
+            anchor: SegmentAnchor {
+                segment_id: key.segment_id,
+                wal_digest,
+                seal_digest,
+            },
+            predecessor,
+            first_commit_ts: Some(batch.commit_ts),
+            last_commit_ts: Some(batch.commit_ts),
+            batch_count: 1,
+            logical_bytes: u64::try_from(logical_batch.len()).unwrap(),
+            wal_bytes: u64::try_from(wal.len()).unwrap(),
+            wal_digest,
+            seal_digest,
+            source_identity: source_identity.finalize().into(),
+        };
+        (metadata, wal, seal_bytes, batch)
     }
 
     fn v7_archive_objects() -> (SegmentMetadata, Vec<u8>, Vec<u8>) {
@@ -1384,6 +1639,21 @@ mod tests {
                 .prepare_objects(&corrupt_metadata, &corrupt_wal, &corrupt_seal)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn restores_ticket_ordered_batches_from_a_strictly_verified_v8_archive() {
+        let (metadata, wal, seal, expected_batch) = v8_archive_objects_with_one_batch();
+
+        let batches = crate::pitr::restore::decode_restore_segment_batches(
+            &wal,
+            &seal,
+            &metadata,
+            crate::pitr::LIVE_WAL_V5_LIMITS,
+        )
+        .unwrap();
+
+        assert_eq!(batches, vec![expected_batch]);
     }
 
     #[test]

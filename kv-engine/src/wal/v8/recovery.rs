@@ -95,6 +95,13 @@ pub(crate) struct WalV8SealSelection {
     pub(crate) tickets: Vec<WalV8SealTicket>,
 }
 
+#[derive(Clone, Copy)]
+enum SelectionPayload {
+    RecoveryBatches,
+    SealIndex,
+    SealedReplay,
+}
+
 /// Find structurally valid FRONTIER frames by scanning every aligned slot from
 /// the physical tail. Corrupt DATA, holes, and zero-filled frames do not stop
 /// discovery because FRONTIER candidates are independent recovery certificates.
@@ -215,7 +222,7 @@ pub(crate) fn select_active_candidate<R: Read + Seek>(
         anchors,
         expected_predecessor,
         limits,
-        false,
+        SelectionPayload::RecoveryBatches,
     )?;
     Ok(selection)
 }
@@ -236,7 +243,7 @@ pub(crate) fn select_active_candidate_for_seal<R: Read + Seek>(
         anchors,
         expected_predecessor,
         limits,
-        true,
+        SelectionPayload::SealIndex,
     )?;
     Ok(WalV8SealSelection {
         header: selection.header,
@@ -246,6 +253,27 @@ pub(crate) fn select_active_candidate_for_seal<R: Read + Seek>(
     })
 }
 
+/// Strictly select a frozen v8 boundary and return replay batches plus the
+/// compact seal index from the same validation pass.
+pub(crate) fn select_sealed_candidate_for_replay<R: Read + Seek>(
+    reader: &mut R,
+    file_len: u64,
+    discovery: &WalV8FrontierDiscovery,
+    anchors: &[ActiveBoundary],
+    expected_predecessor: crate::pitr::ChainAnchor,
+    limits: WalV5Limits,
+) -> Result<(WalV8RecoverySelection, Vec<WalV8SealTicket>)> {
+    select_active_candidate_inner(
+        reader,
+        file_len,
+        discovery,
+        anchors,
+        expected_predecessor,
+        limits,
+        SelectionPayload::SealedReplay,
+    )
+}
+
 fn select_active_candidate_inner<R: Read + Seek>(
     reader: &mut R,
     file_len: u64,
@@ -253,7 +281,7 @@ fn select_active_candidate_inner<R: Read + Seek>(
     anchors: &[ActiveBoundary],
     expected_predecessor: crate::pitr::ChainAnchor,
     limits: WalV5Limits,
-    collect_seal_index: bool,
+    payload: SelectionPayload,
 ) -> Result<(WalV8RecoverySelection, Vec<WalV8SealTicket>)> {
     ensure!(
         !anchors.is_empty(),
@@ -652,7 +680,10 @@ fn select_active_candidate_inner<R: Read + Seek>(
         "v8 candidate ticket end exceeds verified DATA"
     );
     let mut seal_tickets = Vec::new();
-    if collect_seal_index {
+    if matches!(
+        payload,
+        SelectionPayload::SealIndex | SelectionPayload::SealedReplay
+    ) {
         seal_tickets
             .try_reserve_exact(ticket_end)
             .context("reserve v8 seal ticket index")?;
@@ -666,9 +697,10 @@ fn select_active_candidate_inner<R: Read + Seek>(
             });
         }
     }
-    let batches = if collect_seal_index {
-        Vec::new()
-    } else {
+    let batches = if matches!(
+        payload,
+        SelectionPayload::RecoveryBatches | SelectionPayload::SealedReplay
+    ) {
         decode_selected_batches(
             reader,
             &checkpoints,
@@ -678,6 +710,8 @@ fn select_active_candidate_inner<R: Read + Seek>(
             &initial_prefix_digest,
             limits,
         )?
+    } else {
+        Vec::new()
     };
     let active_boundary = ActiveBoundary {
         timeline_id: header.timeline_id.0,

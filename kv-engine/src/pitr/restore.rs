@@ -344,8 +344,9 @@ pub(crate) fn decode_restore_wal_batches_for_segment(
     limits: crate::pitr::WalV5Limits,
 ) -> Result<Vec<WalBatch>> {
     ensure!(
-        expected.wal_format_version != crate::wal::format::WAL_FORMAT_VERSION_V7,
-        "v7 PITR restore requires the segment seal object"
+        expected.wal_format_version != crate::wal::format::WAL_FORMAT_VERSION_V7
+            && expected.wal_format_version != crate::wal::format::WAL_FORMAT_VERSION_V8,
+        "embedded-frontier PITR restore requires the segment seal object"
     );
     let header = crate::pitr::decode_v5_file_header(wal)?;
     ensure!(
@@ -369,10 +370,14 @@ pub(crate) fn decode_restore_segment_batches(
     limits: crate::pitr::WalV5Limits,
 ) -> Result<Vec<WalBatch>> {
     expected.validate()?;
-    let batches = if expected.wal_format_version == crate::wal::format::WAL_FORMAT_VERSION_V7 {
-        crate::pitr::archive::decode_v7_archive_batches(expected, wal, seal_bytes, limits)?
-    } else {
-        decode_restore_wal_batches_for_segment(wal, expected, limits)?
+    let batches = match expected.wal_format_version {
+        crate::wal::format::WAL_FORMAT_VERSION_V7 => {
+            crate::pitr::archive::decode_v7_archive_batches(expected, wal, seal_bytes, limits)?
+        }
+        crate::wal::format::WAL_FORMAT_VERSION_V8 => {
+            crate::pitr::archive::decode_v8_archive_batches(expected, wal, seal_bytes, limits)?
+        }
+        _ => decode_restore_wal_batches_for_segment(wal, expected, limits)?,
     };
     validate_segment_batch_range(expected, &batches)?;
     Ok(batches)
