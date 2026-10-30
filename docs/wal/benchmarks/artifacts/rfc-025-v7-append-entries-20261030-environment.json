@@ -1,0 +1,22 @@
+{
+  "captured_at_utc": "2026-10-30T08:39:11.269704+00:00",
+  "repository": "/home/liu/proj/toy-kv-engine",
+  "filesystem": "/dev/nvme0n1p3[/liu/proj/toy-kv-engine] ext4 /home/liu/proj/toy-kv-engine",
+  "base_commit": "9d0ef1a9fc1a5b74b8a7eef05c257ed05b3afb4f",
+  "candidate_patch_raw_sha256": "dba5aac197b376beba278a991fd544fe2feccabce30c9477cbd9eabffb818d65",
+  "binaries_rechecked_after_capture": {
+    "retained-v7": {
+      "path": "target/wal-opt/20261030-v7-dynamic-group/write-perf-v7-dynamic-window",
+      "sha256": "53d9ddddf0490142bbc5449ebf47b20af363e06c04259f4e74367cc3e7614907"
+    },
+    "candidate-v7": {
+      "path": "target/wal-opt/20261030-v7-append-entries/write-perf-v7-append-entries",
+      "sha256": "199fd640f00a31b5a4d6afd5320270dc74eb02307c813ae63a604e33e67a9aa9"
+    }
+  },
+  "restored_default_release_binary_sha256": "53d9ddddf0490142bbc5449ebf47b20af363e06c04259f4e74367cc3e7614907",
+  "candidate_correctness": "49 canonical encoding, v7 codec and v7 runtime tests passed outside the sandbox without retries; release build passed.",
+  "cpu_screen": "Seven alternating rounds per 2/8/64-entry size in one release test binary; canonical index creation, SHA, DATA framing and I/O excluded.",
+  "validated_unique_invocations": 42,
+  "disposition": "Experimental source restored after the SSD screen did not pass; candidate patch and all captures preserved."
+}
