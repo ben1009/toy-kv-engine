@@ -136,9 +136,12 @@ remain unqualified, so v8 creation stays disabled.
    any existing v8 sidecar, and installs an exact fresh-inode copy of the
    accepted physical image. High-level startup can attach that recovered
    image as a read-only memtable, keep commit admission fenced, and close
-   without advancing the immutable boundary. PITR resume and
-   rotation/successor installation still fail closed for Active v8 Sealing;
-   v8 creation and general format-registry selection remain disabled.
+   without advancing the immutable boundary. Startup can also recreate an
+   empty v8 successor when a durable `SegmentSealed` record names its exact
+   Active boundary but the process stopped before installing its image; the
+   sealed predecessor and sidecar are strictly revalidated first. Resuming an
+   Active v8 Sealing source and initiating v8 rotation still fail closed; v8
+   creation and general format-registry selection remain disabled.
 5. **Persistence and transitions:** version persisted seal/manifest/backup
    digest references, validate v8 archive objects, support v5/v6/v7/v8 chain
    transitions and the old-reader compatibility gate above. Add capacity and

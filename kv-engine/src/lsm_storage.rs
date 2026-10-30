@@ -4736,7 +4736,7 @@ impl KvEngine {
             .join(format!("pitr-{:020}.wal", boundary.segment_id));
         if !successor_path.try_exists()? {
             ensure!(
-                LsmStorageInner::recreate_missing_sealed_v7_successor(
+                LsmStorageInner::recreate_missing_sealed_versioned_successor(
                     &self.inner.path,
                     state,
                     boundary,
@@ -10859,34 +10859,43 @@ impl LsmStorageInner {
         Ok(anchor)
     }
 
-    /// Recreate the empty Active v7 successor when SegmentSealed reached the
-    /// manifest but the process stopped before installing the image. The
+    /// Recreate an empty Active v7 or v8 successor when SegmentSealed reached
+    /// the manifest but the process stopped before installing the image. The
     /// sealed source and its sidecar prove the predecessor; the persisted
     /// Active boundary fixes the successor's complete header identity.
     #[cfg(target_os = "linux")]
-    fn recreate_missing_sealed_v7_successor(
+    fn recreate_missing_sealed_versioned_successor(
         database_path: &Path,
         state: &crate::pitr::manifest::PitrState,
         boundary: crate::pitr::manifest::ActiveBoundary,
     ) -> Result<bool> {
         use crate::pitr::manifest::{ObligationState, PersistedChainAnchor, PitrWalFormat};
-        use crate::wal::v7::codec::{WAL_V7_FRAME_LEN, WAL_V7_HEADER_LEN, WalV7Header};
+        use crate::wal::v7::codec::{WAL_V7_HEADER_LEN, WalV7Header};
 
         ensure!(
-            boundary.wal_format == PitrWalFormat::V7,
-            "Active v8 PITR WAL recovery is not enabled"
+            matches!(boundary.wal_format, PitrWalFormat::V7 | PitrWalFormat::V8),
+            "missing successor requires a versioned v7 or v8 Active boundary"
         );
         let active_path = database_path.join(format!("pitr-{:020}.wal", boundary.segment_id));
         if active_path.try_exists()? {
             return Ok(false);
         }
+        let active_image_len = match boundary.wal_format {
+            PitrWalFormat::V7 => {
+                crate::wal::v7::codec::WAL_V7_HEADER_LEN + crate::wal::v7::codec::WAL_V7_FRAME_LEN
+            }
+            PitrWalFormat::V8 => {
+                crate::wal::v8::WAL_V8_HEADER_LEN + crate::wal::v8::codec::WAL_V8_FRAME_LEN
+            }
+            PitrWalFormat::Unspecified | PitrWalFormat::LegacyV5V6 => unreachable!(),
+        };
         ensure!(
             state.active_segment_id == Some(boundary.segment_id)
                 && state.active_boundary == Some(boundary)
                 && boundary.ticket_end == 0
-                && boundary.durable_end == WAL_V7_HEADER_LEN as u64
+                && boundary.durable_end == crate::wal::v7::codec::WAL_V7_HEADER_LEN as u64
                 && boundary.last_commit_ts == 0,
-            "missing v7 successor is not the manifest's canonical empty Active boundary"
+            "missing versioned successor is not the manifest's canonical empty Active boundary"
         );
         let mut sources = state.obligations.iter().filter(|(_, obligation)| {
             obligation.state == ObligationState::Sealed
@@ -10898,12 +10907,12 @@ impl LsmStorageInner {
         });
         let (&source_segment_id, obligation) = sources
             .next()
-            .ok_or_else(|| anyhow!("missing v7 Active successor has no sealed predecessor"))?;
+            .ok_or_else(|| anyhow!("missing Active successor has no sealed predecessor"))?;
         ensure!(
             sources.next().is_none(),
-            "multiple sealed v7 obligations name the missing Active successor"
+            "multiple sealed obligations name the missing Active successor"
         );
-        let active_image_len = (WAL_V7_HEADER_LEN + WAL_V7_FRAME_LEN) as u64;
+        let active_image_len = u64::try_from(active_image_len)?;
         let source_validation_buffer_bytes = match obligation.wal_format {
             PitrWalFormat::LegacyV5V6 => {
                 crate::pitr::seal::V5Seal::validation_memory_bytes(obligation.logical_length)?
@@ -10978,7 +10987,7 @@ impl LsmStorageInner {
                 }
             }
             PitrWalFormat::Unspecified => {
-                anyhow::bail!("missing v7 Active successor has an unspecified predecessor format")
+                anyhow::bail!("missing Active successor has an unspecified predecessor format")
             }
         };
         ensure!(
@@ -10988,22 +10997,51 @@ impl LsmStorageInner {
                     wal_digest: predecessor_anchor.wal_digest,
                     seal_digest: predecessor_anchor.seal_digest,
                 }),
-            "missing v7 successor predecessor differs from its sealed manifest anchor"
+            "missing successor predecessor differs from its sealed manifest anchor"
         );
-        let header = WalV7Header {
-            timeline_id: crate::pitr::TimelineId(boundary.timeline_id),
-            archive_epoch_id: crate::pitr::ArchiveEpochId(boundary.archive_epoch_id),
-            segment_id: crate::pitr::SegmentId(boundary.segment_id),
-            predecessor: crate::pitr::ChainAnchor::Segment(predecessor_anchor),
-            incarnation: boundary.incarnation,
-        };
-        ensure!(
-            header.digest()? == boundary.prefix_digest,
-            "missing v7 successor header does not match its Active boundary"
-        );
-        Self::validate_v7_active_recovery_header(state, &header.encode()?)?;
-
-        crate::wal::v7::install::create_empty_active_image(&active_path, header)?;
+        let predecessor = crate::pitr::ChainAnchor::Segment(predecessor_anchor);
+        match boundary.wal_format {
+            PitrWalFormat::V7 => {
+                let header = crate::wal::v7::codec::WalV7Header {
+                    timeline_id: crate::pitr::TimelineId(boundary.timeline_id),
+                    archive_epoch_id: crate::pitr::ArchiveEpochId(boundary.archive_epoch_id),
+                    segment_id: crate::pitr::SegmentId(boundary.segment_id),
+                    predecessor,
+                    incarnation: boundary.incarnation,
+                };
+                ensure!(
+                    header.digest()? == boundary.prefix_digest,
+                    "missing v7 successor header does not match its Active boundary"
+                );
+                Self::validate_v7_active_recovery_header(state, &header.encode()?)?;
+                ensure!(
+                    crate::wal::v7::install::create_empty_active_image(&active_path, header)?
+                        .active_boundary
+                        == boundary,
+                    "created v7 successor differs from its Active boundary"
+                );
+            }
+            PitrWalFormat::V8 => {
+                let header = crate::wal::v8::codec::WalV8Header {
+                    timeline_id: crate::pitr::TimelineId(boundary.timeline_id),
+                    archive_epoch_id: crate::pitr::ArchiveEpochId(boundary.archive_epoch_id),
+                    segment_id: crate::pitr::SegmentId(boundary.segment_id),
+                    predecessor,
+                    incarnation: boundary.incarnation,
+                };
+                ensure!(
+                    header.initial_prefix_digest()? == boundary.prefix_digest,
+                    "missing v8 successor header does not match its Active boundary"
+                );
+                Self::validate_v8_active_recovery_header(state, &header.encode()?)?;
+                ensure!(
+                    crate::wal::v8::install::create_empty_active_image(&active_path, header)?
+                        == boundary,
+                    "created v8 successor differs from its Active boundary"
+                );
+            }
+            PitrWalFormat::Unspecified | PitrWalFormat::LegacyV5V6 => unreachable!(),
+        }
         drop(recovery_workspace);
 
         Ok(true)
@@ -11666,7 +11704,7 @@ impl LsmStorageInner {
                                 "manifest-registered Active v7 WAL {} is missing",
                                 boundary.segment_id
                             );
-                            Self::recreate_missing_sealed_v7_successor(
+                            Self::recreate_missing_sealed_versioned_successor(
                                 path,
                                 &pitr_state,
                                 boundary,
@@ -11692,11 +11730,23 @@ impl LsmStorageInner {
                             options.enable_wal,
                             "opening a v8 Active PITR WAL requires enable_wal"
                         );
-                        ensure!(
-                            wal_path.try_exists()?,
-                            "manifest-bound Active v8 WAL {} is missing",
-                            boundary.segment_id
-                        );
+                        if !wal_path.try_exists()? {
+                            ensure!(
+                                !pitr_memtable_segments
+                                    .values()
+                                    .any(|segment_id| *segment_id == boundary.segment_id),
+                                "manifest-registered Active v8 WAL {} is missing",
+                                boundary.segment_id
+                            );
+                            ensure!(
+                                Self::recreate_missing_sealed_versioned_successor(
+                                    path,
+                                    &pitr_state,
+                                    boundary,
+                                )?,
+                                "sealed v8 successor disappeared during recovery"
+                            );
+                        }
                         let mut file = File::open(&wal_path).with_context(|| {
                             format!(
                                 "failed to open manifest-bound Active v8 WAL {}",
@@ -23703,11 +23753,13 @@ mod tests {
 
             if retain_successor_image {
                 let database = directory.path().join("db");
-                assert!(LsmStorageInner::recreate_missing_sealed_v7_successor(
-                    &database,
-                    &sealed_state,
-                    successor_boundary,
-                )?);
+                assert!(
+                    LsmStorageInner::recreate_missing_sealed_versioned_successor(
+                        &database,
+                        &sealed_state,
+                        successor_boundary,
+                    )?
+                );
                 let successor_path =
                     database.join(format!("pitr-{:020}.wal", successor_boundary.segment_id));
                 let temp_prefix = crate::wal::v7::install::recovery_temp_prefix(
@@ -24632,26 +24684,6 @@ mod tests {
         source_obligation.state = ObligationState::Sealed;
         source_obligation.successor_segment_id = successor_id;
 
-        let mut unsupported_v8_boundary = successor_boundary;
-        unsupported_v8_boundary.wal_format = PitrWalFormat::V8;
-        let mut unsupported_v8_state = successor_state.clone();
-        unsupported_v8_state.active_boundary = Some(unsupported_v8_boundary);
-        let unsupported_v8_error = LsmStorageInner::recreate_missing_sealed_v7_successor(
-            &database,
-            &unsupported_v8_state,
-            unsupported_v8_boundary,
-        )
-        .expect_err("v8 Active boundaries must not enter the v7 successor installer");
-        assert!(
-            unsupported_v8_error
-                .to_string()
-                .contains("Active v8 PITR WAL recovery is not enabled")
-        );
-        assert!(
-            !successor_path.exists(),
-            "rejecting an unsupported Active v8 boundary must not create a v7 image"
-        );
-
         let v8_validation_buffer_bytes =
             V8Seal::validation_memory_bytes(sealed_end, active.ticket_end)?;
         let (retained, validation_workspace, _) =
@@ -24670,11 +24702,13 @@ mod tests {
         );
         drop(validation_workspace);
         drop(retained);
-        assert!(LsmStorageInner::recreate_missing_sealed_v7_successor(
-            &database,
-            &successor_state,
-            successor_boundary,
-        )?);
+        assert!(
+            LsmStorageInner::recreate_missing_sealed_versioned_successor(
+                &database,
+                &successor_state,
+                successor_boundary,
+            )?
+        );
         let successor_file = std::fs::File::open(&successor_path)?;
         let mut successor_header_bytes = [0; WAL_V7_HEADER_LEN];
         std::io::Read::read_exact(&mut &successor_file, &mut successor_header_bytes)?;
@@ -24685,6 +24719,46 @@ mod tests {
         assert_eq!(
             std::fs::metadata(&successor_path)?.len(),
             u64::try_from(WAL_V7_HEADER_LEN + WAL_V7_FRAME_LEN)?
+        );
+
+        std::fs::remove_file(&successor_path)?;
+        let v8_successor_header = WalV8Header {
+            timeline_id: TimelineId(timeline_id),
+            archive_epoch_id: ArchiveEpochId(archive_epoch_id),
+            segment_id: SegmentId(successor_id),
+            predecessor: ChainAnchor::Segment(predecessor_anchor),
+            incarnation: [8; 16],
+        };
+        let v8_successor_boundary = ActiveBoundary {
+            timeline_id,
+            archive_epoch_id,
+            segment_id: successor_id,
+            incarnation: v8_successor_header.incarnation,
+            wal_format: PitrWalFormat::V8,
+            ticket_end: 0,
+            durable_end: WAL_V8_HEADER_LEN as u64,
+            last_commit_ts: 0,
+            prefix_digest: v8_successor_header.initial_prefix_digest()?,
+        };
+        let mut v8_successor_state = successor_state.clone();
+        v8_successor_state.active_boundary = Some(v8_successor_boundary);
+        assert!(
+            LsmStorageInner::recreate_missing_sealed_versioned_successor(
+                &database,
+                &v8_successor_state,
+                v8_successor_boundary,
+            )?
+        );
+        let successor_file = std::fs::File::open(&successor_path)?;
+        let mut successor_header_bytes = [0; WAL_V8_HEADER_LEN];
+        std::io::Read::read_exact(&mut &successor_file, &mut successor_header_bytes)?;
+        assert_eq!(
+            WalV8Header::decode(&successor_header_bytes)?,
+            v8_successor_header
+        );
+        assert_eq!(
+            std::fs::metadata(&successor_path)?.len(),
+            u64::try_from(WAL_V8_HEADER_LEN + WAL_V8_FRAME_LEN)?
         );
 
         let mut wrong_authority = state.clone();
@@ -24713,7 +24787,7 @@ mod tests {
             .unwrap()
             .wal_digest[0] ^= 1;
         assert!(
-            LsmStorageInner::recreate_missing_sealed_v7_successor(
+            LsmStorageInner::recreate_missing_sealed_versioned_successor(
                 &database,
                 &wrong_successor_authority,
                 successor_boundary,
@@ -24793,7 +24867,7 @@ mod tests {
                 .contains("format differs from its manifest obligation")
         );
         assert!(
-            LsmStorageInner::recreate_missing_sealed_v7_successor(
+            LsmStorageInner::recreate_missing_sealed_versioned_successor(
                 &database,
                 &successor_state,
                 successor_boundary,
@@ -24811,7 +24885,7 @@ mod tests {
         wal_bytes[WAL_V8_HEADER_LEN + 80] ^= 1;
         std::fs::write(&wal_path, &wal_bytes)?;
         assert!(
-            LsmStorageInner::recreate_missing_sealed_v7_successor(
+            LsmStorageInner::recreate_missing_sealed_versioned_successor(
                 &database,
                 &successor_state,
                 successor_boundary,
@@ -24841,10 +24915,6 @@ mod tests {
             },
             wal::{
                 WalIoMode,
-                v7::{
-                    codec::{WAL_V7_HEADER_LEN, WalV7Header},
-                    install::create_empty_active_image,
-                },
                 v8::{
                     WAL_V8_HEADER_LEN,
                     codec::{
@@ -25007,7 +25077,7 @@ mod tests {
             wal_digest: source_boundary.wal_digest,
             seal_digest: Sha256::digest(&source_seal_bytes).into(),
         };
-        let successor_header = WalV7Header {
+        let successor_header = WalV8Header {
             timeline_id: TimelineId(timeline_id),
             archive_epoch_id: ArchiveEpochId(archive_epoch_id),
             segment_id: SegmentId(successor_segment_id),
@@ -25019,14 +25089,12 @@ mod tests {
             archive_epoch_id,
             segment_id: successor_segment_id,
             incarnation: successor_header.incarnation,
-            wal_format: PitrWalFormat::V7,
+            wal_format: PitrWalFormat::V8,
             ticket_end: 0,
-            durable_end: WAL_V7_HEADER_LEN as u64,
+            durable_end: WAL_V8_HEADER_LEN as u64,
             last_commit_ts: 0,
-            prefix_digest: successor_header.digest()?,
+            prefix_digest: successor_header.initial_prefix_digest()?,
         };
-        let successor_wal_path = database.join(format!("pitr-{successor_segment_id:020}.wal"));
-        create_empty_active_image(&successor_wal_path, successor_header)?;
 
         let last_recorded_at = PersistedRecordedAt {
             secs: recorded_at.secs,
@@ -25096,10 +25164,6 @@ mod tests {
                 last_commit_anchor: Some(last_commit_anchor),
                 successor_active_boundary: Some(successor_active_boundary),
             }),
-            ManifestRecord::NewPitrMemtable {
-                id: 51,
-                segment_id: successor_segment_id,
-            },
         ];
         Manifest::recover(database.join("MANIFEST"))?
             .0
@@ -25127,9 +25191,27 @@ mod tests {
         );
         assert_eq!(
             engine.inner.state.load().memtable.wal_format_version(),
-            Some(crate::wal::format::WAL_FORMAT_VERSION_V7)
+            Some(crate::wal::format::WAL_FORMAT_VERSION_V8)
         );
+        assert!(engine.inner.state.load().memtable.uses_v8_wal());
         engine.close_storage()?;
+
+        let reopened = KvEngine::open_with_wal_io_mode(
+            &database,
+            {
+                let mut options = LsmStorageOptions::default_for_test();
+                options.enable_wal = true;
+                options.pitr_repository = None;
+                options
+            },
+            WalIoMode::Leader,
+        )?;
+        assert!(reopened.inner.state.load().memtable.uses_v8_wal());
+        assert_eq!(
+            reopened.get(b"v8-key")?,
+            Some(bytes::Bytes::from_static(b"v"))
+        );
+        reopened.close_storage()?;
 
         Ok(())
     }
