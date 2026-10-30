@@ -1,0 +1,10 @@
+{
+  "retained-v7": {
+    "path": "target/release/write-perf-v7-large-data-async-dispatch",
+    "sha256": "f353022d846530a6754330aaea11f295319ea8f4de20afa09b6d2a3b57b021d8"
+  },
+  "candidate-v7": {
+    "path": "target/wal-opt/20261030-v7-dynamic-group/write-perf-v7-dynamic-window",
+    "sha256": "53d9ddddf0490142bbc5449ebf47b20af363e06c04259f4e74367cc3e7614907"
+  }
+}

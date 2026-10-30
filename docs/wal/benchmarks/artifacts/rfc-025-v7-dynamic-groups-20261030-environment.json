@@ -1,0 +1,22 @@
+{
+  "captured_at_utc": "2026-10-30T01:43:51.560365+00:00",
+  "repository": "/home/liu/proj/toy-kv-engine",
+  "filesystem": "/dev/nvme0n1p3[/liu/proj/toy-kv-engine] ext4 /home/liu/proj/toy-kv-engine",
+  "head_during_measurements": "0aac3ce8d119107c08b2bdc55d13d66c973ffbc5",
+  "candidate_source_patch_sha256": "0f2a42e82c117792af06746b646bbc4b2c6752514abc13f4e16f33bbb75e4af2",
+  "binaries_rechecked_after_capture": {
+    "retained-v7": {
+      "path": "target/release/write-perf-v7-large-data-async-dispatch",
+      "sha256": "f353022d846530a6754330aaea11f295319ea8f4de20afa09b6d2a3b57b021d8"
+    },
+    "fixed-v7": {
+      "path": "target/release/write-perf-v7-admitted-group",
+      "sha256": "bb8b4c54c81a18c74f8d635d53ef6072f635b3e5bcff0ff7e4e2e184760d98fa"
+    },
+    "candidate-v7": {
+      "path": "target/wal-opt/20261030-v7-dynamic-group/write-perf-v7-dynamic-window",
+      "sha256": "53d9ddddf0490142bbc5449ebf47b20af363e06c04259f4e74367cc3e7614907"
+    }
+  },
+  "previous_probe_note": "This SSD previously failed stability preflight; samples are individually flagged using the plan thresholds."
+}
