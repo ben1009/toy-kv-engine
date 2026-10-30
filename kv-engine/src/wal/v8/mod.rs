@@ -9,6 +9,7 @@ pub(crate) mod codec;
 pub(crate) mod digest;
 pub(crate) mod install;
 pub(crate) mod leader;
+pub(crate) mod parallel;
 pub(crate) mod prepare;
 pub(crate) mod recovery;
 

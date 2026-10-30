@@ -28,6 +28,8 @@ pub(crate) struct WalV8BatchAssignment {
 /// Checked sizes that the runtime must reserve before assigning a ticket.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct WalV8AdmissionPlan {
+    pub(crate) commit_ts: u64,
+    pub(crate) recorded_at: RecordedAt,
     pub(crate) logical_batch_bytes: usize,
     pub(crate) fragment_count: u32,
     pub(crate) frame_buffer_bytes: usize,
@@ -64,8 +66,9 @@ pub(crate) trait WalV8AdmissionPublisher {
 pub(crate) struct PreparedWalV8Batch<'a, R> {
     canonical: CanonicalWalEntryStream<'a>,
     limits: WalV5Limits,
+    commit_ts: u64,
+    recorded_at: RecordedAt,
     logical_batch_bytes: usize,
-    logical_batch: Vec<u8>,
     fragment_count: u32,
     frame_buffer_bytes: usize,
     preparation_reservation: R,
@@ -102,16 +105,12 @@ impl<'a, R> PreparedWalV8Batch<'a, R> {
         let frame_buffer_bytes = usize::try_from(fragment_count)?
             .checked_mul(codec::WAL_V8_FRAME_LEN)
             .context("v8 DATA frame buffer length overflows")?;
-        let mut logical_batch = Vec::new();
-        logical_batch
-            .try_reserve_exact(logical_batch_bytes)
-            .context("reserve v8 logical batch bytes")?;
-
         Ok(PreparedWalV8Batch {
             canonical,
             limits,
+            commit_ts: batch.commit_ts,
+            recorded_at: batch.recorded_at,
             logical_batch_bytes,
-            logical_batch,
             fragment_count,
             frame_buffer_bytes,
             preparation_reservation,
@@ -137,12 +136,14 @@ impl<'a, R> PreparedWalV8Batch<'a, R> {
         P: WalV8AdmissionPublisher,
     {
         let plan = WalV8AdmissionPlan {
+            commit_ts: self.commit_ts,
+            recorded_at: self.recorded_at,
             logical_batch_bytes: self.logical_batch_bytes,
             fragment_count: self.fragment_count,
             frame_buffer_bytes: self.frame_buffer_bytes,
         };
         let (assignment, admission_guard) = publisher.admit_and_publish(plan)?;
-        validate_assignment(assignment, self.frame_buffer_bytes)?;
+        validate_assignment(assignment, plan)?;
         ensure!(
             admission_guard.segment_ticket() == assignment.segment_ticket,
             "v8 admission guard ticket does not match its published assignment"
@@ -152,7 +153,6 @@ impl<'a, R> PreparedWalV8Batch<'a, R> {
             canonical: self.canonical,
             limits: self.limits,
             logical_batch_bytes: self.logical_batch_bytes,
-            logical_batch: self.logical_batch,
             assignment,
             fragment_count: self.fragment_count,
             frame_buffer_bytes: self.frame_buffer_bytes,
@@ -162,7 +162,15 @@ impl<'a, R> PreparedWalV8Batch<'a, R> {
     }
 }
 
-fn validate_assignment(assignment: WalV8BatchAssignment, frame_buffer_bytes: usize) -> Result<()> {
+fn validate_assignment(assignment: WalV8BatchAssignment, plan: WalV8AdmissionPlan) -> Result<()> {
+    ensure!(
+        assignment.commit_ts == plan.commit_ts,
+        "v8 admission changed the batch commit timestamp"
+    );
+    ensure!(
+        assignment.recorded_at >= plan.recorded_at,
+        "v8 admission moved the recorded-at timestamp backwards"
+    );
     ensure!(
         assignment.commit_ts > 0,
         "v8 batch commit timestamp is zero"
@@ -180,7 +188,7 @@ fn validate_assignment(assignment: WalV8BatchAssignment, frame_buffer_bytes: usi
     );
     assignment
         .first_data_offset
-        .checked_add(u64::try_from(frame_buffer_bytes)?)
+        .checked_add(u64::try_from(plan.frame_buffer_bytes)?)
         .context("v8 DATA allocation end overflows")?;
     Ok(())
 }
@@ -190,7 +198,6 @@ pub(crate) struct AdmittedWalV8Batch<'a, G, R> {
     canonical: CanonicalWalEntryStream<'a>,
     limits: WalV5Limits,
     logical_batch_bytes: usize,
-    logical_batch: Vec<u8>,
     assignment: WalV8BatchAssignment,
     fragment_count: u32,
     frame_buffer_bytes: usize,
@@ -206,7 +213,6 @@ impl<G: WalV8AdmissionGuard, R> AdmittedWalV8Batch<'_, G, R> {
             canonical,
             limits,
             logical_batch_bytes,
-            mut logical_batch,
             assignment,
             fragment_count,
             frame_buffer_bytes,
@@ -214,6 +220,10 @@ impl<G: WalV8AdmissionGuard, R> AdmittedWalV8Batch<'_, G, R> {
             preparation_reservation: _preparation_reservation,
         } = self;
         let entry_stream_len = canonical.data_len();
+        let mut logical_batch = Vec::new();
+        logical_batch
+            .try_reserve_exact(logical_batch_bytes)
+            .context("reserve admitted v8 logical batch bytes")?;
         logical_batch.resize(logical_batch_bytes, 0);
 
         let expected_entry_len = u64::try_from(entry_stream_len)?;
@@ -545,6 +555,8 @@ mod tests {
         assert_eq!(reserved_bytes, Some(preparation_bytes));
         let publisher = TestPublisher::new(WAL_V8_DATA_START);
         let plan_expected = WalV8AdmissionPlan {
+            commit_ts: batch.commit_ts,
+            recorded_at: batch.recorded_at,
             logical_batch_bytes: prepared.logical_batch_bytes(),
             fragment_count: prepared.fragment_count(),
             frame_buffer_bytes: prepared.frame_buffer_bytes(),

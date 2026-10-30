@@ -352,6 +352,8 @@ impl WalV8LeaderWriter {
                 initial_prefix_digest: self.initial_prefix_digest,
             };
             let plan = WalV8AdmissionPlan {
+                commit_ts: batch.commit_ts,
+                recorded_at: batch.recorded_at,
                 logical_batch_bytes: prepared.logical_batch_bytes(),
                 fragment_count: prepared.fragment_count(),
                 frame_buffer_bytes: prepared.frame_buffer_bytes(),
