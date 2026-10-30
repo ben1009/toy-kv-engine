@@ -458,6 +458,7 @@ requires both p95 and p99 to pass, and allows at most 5% regression per metric.
 - [023: Point-in-Time Recovery](rfcs/023-point-in-time-recovery.md)
 - [024: Dedicated WAL I/O Pipeline](rfcs/024-dedicated-wal-pipeline.md)
 - [025: Parallel WAL with Embedded Frontiers and One Sync (proposed)](rfcs/025-parallel-wal-embedded-frontiers.md)
+- [026: Composable WAL Prefix Digests (proposed)](rfcs/026-composable-wal-prefix-digest.md)
 
 ## License
 
