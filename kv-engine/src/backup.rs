@@ -7477,6 +7477,7 @@ mod tests {
                 archive_epoch_id: archive_epoch_id.0,
                 segment_id: segment_id.0,
                 incarnation: header.incarnation,
+                wal_format: crate::pitr::manifest::PitrWalFormat::V7,
                 ticket_end: 1,
                 durable_end: 3 * 4096,
                 last_commit_ts: 20,

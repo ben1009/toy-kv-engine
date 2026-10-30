@@ -689,6 +689,7 @@ mod tests {
             archive_epoch_id: [u8::MAX; 16],
             segment_id: u64::MAX,
             incarnation: [u8::MAX; 16],
+            wal_format: crate::pitr::manifest::PitrWalFormat::V7,
             ticket_end: u64::MAX,
             durable_end: u64::MAX,
             last_commit_ts: u64::MAX,

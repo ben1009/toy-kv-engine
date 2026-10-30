@@ -139,6 +139,7 @@ fn source_manifest_snapshot_retains_pending_migration_under_version_10() {
         archive_epoch_id: [3; 16],
         segment_id: 2,
         incarnation: [4; 16],
+        wal_format: crate::pitr::manifest::PitrWalFormat::V7,
         ticket_end: 0,
         durable_end: 4096,
         last_commit_ts: 0,

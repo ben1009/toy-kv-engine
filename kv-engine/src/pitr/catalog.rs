@@ -185,7 +185,8 @@ impl SegmentMetadata {
         boundary.validate()?;
         let active = boundary.active;
         ensure!(
-            active.timeline_id == self.key.timeline_id.0
+            active.wal_format == crate::pitr::manifest::PitrWalFormat::V7
+                && active.timeline_id == self.key.timeline_id.0
                 && active.archive_epoch_id == self.key.archive_epoch_id.0
                 && active.segment_id == self.key.segment_id.0,
             "v7 catalog boundary identity mismatch"
@@ -283,7 +284,8 @@ impl SegmentMetadata {
         boundary.validate()?;
         let active = boundary.active;
         ensure!(
-            active.timeline_id == self.key.timeline_id.0
+            active.wal_format == crate::pitr::manifest::PitrWalFormat::V8
+                && active.timeline_id == self.key.timeline_id.0
                 && active.archive_epoch_id == self.key.archive_epoch_id.0
                 && active.segment_id == self.key.segment_id.0,
             "v8 catalog boundary identity mismatch"
@@ -1266,14 +1268,20 @@ fn decode_metadata_prefix(
                 std::mem::size_of::<ImmutableBoundary>() <= max_owned_bytes,
                 "catalog metadata allocation exceeds decoded-state limit"
             );
-            Some(Box::new(decode_immutable_boundary(&mut cursor)?))
+            Some(Box::new(decode_immutable_boundary(
+                &mut cursor,
+                crate::pitr::manifest::PitrWalFormat::V7,
+            )?))
         }
         3 if wal_format_version == crate::wal::format::WAL_FORMAT_VERSION_V8 => {
             ensure!(
                 std::mem::size_of::<ImmutableBoundary>() <= max_owned_bytes,
                 "catalog metadata allocation exceeds decoded-state limit"
             );
-            Some(Box::new(decode_immutable_boundary(&mut cursor)?))
+            Some(Box::new(decode_immutable_boundary(
+                &mut cursor,
+                crate::pitr::manifest::PitrWalFormat::V8,
+            )?))
         }
         _ => bail!("unsupported PITR WAL/seal descriptor"),
     };
@@ -1313,12 +1321,16 @@ fn encode_immutable_boundary(out: &mut Vec<u8>, boundary: ImmutableBoundary) {
     put_bytes(out, &boundary.wal_digest);
 }
 
-fn decode_immutable_boundary(cursor: &mut Cursor<'_>) -> Result<ImmutableBoundary> {
+fn decode_immutable_boundary(
+    cursor: &mut Cursor<'_>,
+    wal_format: crate::pitr::manifest::PitrWalFormat,
+) -> Result<ImmutableBoundary> {
     let active = crate::pitr::manifest::ActiveBoundary {
         timeline_id: cursor.fixed()?,
         archive_epoch_id: cursor.fixed()?,
         segment_id: cursor.u64()?,
         incarnation: cursor.fixed()?,
+        wal_format,
         ticket_end: cursor.u64()?,
         durable_end: cursor.u64()?,
         last_commit_ts: cursor.u64()?,
@@ -1577,6 +1589,7 @@ mod tests {
                 archive_epoch_id: key.archive_epoch_id.0,
                 segment_id,
                 incarnation: [11; 16],
+                wal_format: crate::pitr::manifest::PitrWalFormat::V7,
                 ticket_end: 1,
                 durable_end: 3 * 4096,
                 last_commit_ts: segment_id * 10,
@@ -1624,6 +1637,7 @@ mod tests {
                 archive_epoch_id: key.archive_epoch_id.0,
                 segment_id,
                 incarnation: [15; 16],
+                wal_format: crate::pitr::manifest::PitrWalFormat::V8,
                 ticket_end: 1,
                 durable_end: 3 * 4096,
                 last_commit_ts: segment_id * 10,
@@ -1682,6 +1696,7 @@ mod tests {
             archive_epoch_id: header.archive_epoch_id.0,
             segment_id,
             incarnation: header.incarnation,
+            wal_format: crate::pitr::manifest::PitrWalFormat::V7,
             ticket_end: 0,
             durable_end: WAL_V7_HEADER_LEN as u64,
             last_commit_ts: 0,

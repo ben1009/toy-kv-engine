@@ -294,6 +294,7 @@ mod manifest_revalidation_tests {
                         archive_epoch_id: [2; 16],
                         segment_id: 8,
                         incarnation: [3; 16],
+                        wal_format: crate::pitr::manifest::PitrWalFormat::V7,
                         ticket_end: 0,
                         durable_end: 4096,
                         last_commit_ts: 0,

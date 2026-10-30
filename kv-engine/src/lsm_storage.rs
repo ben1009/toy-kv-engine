@@ -4181,6 +4181,7 @@ impl KvEngine {
             archive_epoch_id: archive_epoch_id.0,
             segment_id: successor_segment_id,
             incarnation,
+            wal_format: crate::pitr::manifest::PitrWalFormat::V7,
             ticket_end: 0,
             durable_end: WAL_V7_HEADER_LEN as u64,
             last_commit_ts: 0,
@@ -5725,6 +5726,7 @@ impl KvEngine {
             archive_epoch_id: successor_header.archive_epoch_id.0,
             segment_id: successor_header.segment_id.0,
             incarnation: successor_header.incarnation,
+            wal_format: crate::pitr::manifest::PitrWalFormat::V7,
             ticket_end: 0,
             durable_end: crate::wal::v7::codec::WAL_V7_HEADER_LEN as u64,
             last_commit_ts: 0,
@@ -9980,6 +9982,7 @@ impl LsmStorageInner {
             archive_epoch_id: header.archive_epoch_id.0,
             segment_id: header.segment_id.0,
             incarnation: header.incarnation,
+            wal_format: crate::pitr::manifest::PitrWalFormat::V7,
             ticket_end: 0,
             durable_end: crate::wal::v7::codec::WAL_V7_HEADER_LEN as u64,
             last_commit_ts: 0,
@@ -10278,6 +10281,9 @@ impl LsmStorageInner {
                 source_segment_id,
                 &source_path,
             )?,
+            PitrWalFormat::V8 => {
+                anyhow::bail!("cannot synthesize a missing successor from a v8 predecessor yet")
+            }
             PitrWalFormat::Unspecified => {
                 anyhow::bail!("missing v7 Active successor has an unspecified predecessor format")
             }
@@ -10444,7 +10450,8 @@ impl LsmStorageInner {
                 ObligationState::Sealing | ObligationState::Sealed
             ) {
                 let logical_wal_bytes = match obligation.wal_format {
-                    crate::pitr::manifest::PitrWalFormat::V7 => obligation
+                    crate::pitr::manifest::PitrWalFormat::V7
+                    | crate::pitr::manifest::PitrWalFormat::V8 => obligation
                         .logical_length
                         .checked_sub(active_fixed_bytes)
                         .ok_or_else(|| {
@@ -17212,6 +17219,7 @@ impl LsmStorageInner {
             archive_epoch_id: header.archive_epoch_id.0,
             segment_id: header.segment_id.0,
             incarnation: header.incarnation,
+            wal_format: crate::pitr::manifest::PitrWalFormat::V7,
             ticket_end: 0,
             durable_end: crate::wal::v7::codec::WAL_V7_HEADER_LEN as u64,
             last_commit_ts: 0,
@@ -20725,6 +20733,7 @@ mod tests {
             archive_epoch_id: header.archive_epoch_id.0,
             segment_id: header.segment_id.0,
             incarnation: header.incarnation,
+            wal_format: crate::pitr::manifest::PitrWalFormat::V7,
             ticket_end: 0,
             durable_end: WAL_V7_HEADER_LEN as u64,
             last_commit_ts: 0,
@@ -20937,6 +20946,7 @@ mod tests {
             archive_epoch_id: successor_header.archive_epoch_id.0,
             segment_id: successor_header.segment_id.0,
             incarnation: successor_header.incarnation,
+            wal_format: crate::pitr::manifest::PitrWalFormat::V7,
             ticket_end: 0,
             durable_end: WAL_V7_HEADER_LEN as u64,
             last_commit_ts: 0,
@@ -21586,6 +21596,7 @@ mod tests {
             archive_epoch_id,
             segment_id: successor_segment_id,
             incarnation: successor_header.incarnation,
+            wal_format: crate::pitr::manifest::PitrWalFormat::V7,
             ticket_end: 0,
             durable_end: WAL_V7_HEADER_LEN as u64,
             last_commit_ts: 0,
@@ -21866,6 +21877,7 @@ mod tests {
             archive_epoch_id: boundary_header.archive_epoch_id.0,
             segment_id: successor_segment_id,
             incarnation: boundary_header.incarnation,
+            wal_format: crate::pitr::manifest::PitrWalFormat::V7,
             ticket_end: 0,
             durable_end: WAL_V7_HEADER_LEN as u64,
             last_commit_ts: 0,
@@ -23123,6 +23135,7 @@ mod tests {
                 archive_epoch_id: header.archive_epoch_id.0,
                 segment_id: header.segment_id.0,
                 incarnation: header.incarnation,
+                wal_format: crate::pitr::manifest::PitrWalFormat::V7,
                 ticket_end: 0,
                 durable_end: WAL_V7_HEADER_LEN as u64,
                 last_commit_ts: 0,
