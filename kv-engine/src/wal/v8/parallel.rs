@@ -37,6 +37,8 @@ pub(crate) struct WalV8ParallelConfig {
     pub(crate) last_commit_ts: u64,
     /// Recorded-at value of the last recovered ticket, if one exists.
     pub(crate) last_recorded_at: Option<RecordedAt>,
+    /// Verified logical prefix digest at `next_ticket` from recovery.
+    pub(crate) durable_prefix_digest: WalV8Digest,
     /// Maximum number of admitted tickets whose durability is unresolved.
     pub(crate) max_inflight_tickets: usize,
     /// Maximum logical and frame buffer bytes reserved by unresolved tickets.
@@ -63,6 +65,9 @@ struct CoordinatorInner {
 
 struct CoordinatorState {
     durable_ticket_end: u64,
+    durable_prefix_digest: WalV8Digest,
+    folded_ticket_end: u64,
+    folded_prefix_digest: WalV8Digest,
     next_ticket: u64,
     next_data_offset: u64,
     last_commit_ts: u64,
@@ -82,6 +87,7 @@ struct TicketState {
     reserved_bytes: u64,
     frames_ready: bool,
     digest_ready: Option<WalV8DigestReady>,
+    prefix_digest_after: Option<WalV8Digest>,
     data_complete: bool,
 }
 
@@ -93,6 +99,9 @@ pub(crate) struct WalV8TicketProgress {
     pub(crate) frame_buffer_bytes: usize,
     pub(crate) frames_ready: bool,
     pub(crate) digest_ready: Option<WalV8DigestReady>,
+    /// Ordered prefix digest after this ticket, once all preceding tickets
+    /// have published their producer digests.
+    pub(crate) prefix_digest_after: Option<WalV8Digest>,
     pub(crate) data_complete: bool,
 }
 
@@ -101,6 +110,8 @@ pub(crate) struct WalV8TicketProgress {
 pub(crate) struct WalV8FrontierReservation {
     pub(crate) ticket_end: u64,
     pub(crate) frame_offset: u64,
+    /// RFC 026 logical prefix digest for exactly `ticket_end`.
+    pub(crate) prefix_digest: WalV8Digest,
 }
 
 /// Wake result returned by a bounded admission/readiness wait.
@@ -158,6 +169,12 @@ impl WalV8ParallelCoordinator {
 
         let physical_header_digest = header.physical_digest()?;
         let initial_prefix_digest = header.initial_prefix_digest()?;
+        if config.next_ticket == 0 {
+            ensure!(
+                config.durable_prefix_digest == initial_prefix_digest,
+                "v8 empty recovery prefix digest differs from P_0"
+            );
+        }
         let mut tickets = VecDeque::new();
         tickets
             .try_reserve_exact(config.max_inflight_tickets)
@@ -166,6 +183,9 @@ impl WalV8ParallelCoordinator {
             inner: Arc::new(CoordinatorInner {
                 state: Mutex::new(CoordinatorState {
                     durable_ticket_end: config.next_ticket,
+                    durable_prefix_digest: config.durable_prefix_digest,
+                    folded_ticket_end: config.next_ticket,
+                    folded_prefix_digest: config.durable_prefix_digest,
                     next_ticket: config.next_ticket,
                     next_data_offset: config.next_data_offset,
                     last_commit_ts: config.last_commit_ts,
@@ -215,8 +235,8 @@ impl WalV8ParallelCoordinator {
             .collect()
     }
 
-    /// Return the contiguous head prefix whose digest and DATA completion are
-    /// both ready for an embedded FRONTIER.
+    /// Return the contiguous head prefix whose frames, ordered digest fold,
+    /// and DATA completion are ready for an embedded FRONTIER.
     pub(crate) fn frontier_ready_prefix(&self) -> Vec<WalV8TicketProgress> {
         let state = self.inner.state.lock();
         if state.poisoned {
@@ -285,6 +305,10 @@ impl WalV8ParallelCoordinator {
             }
             None => state.tickets[index].digest_ready = Some(digest),
         }
+        if let Err(error) = fold_ready_digests(&mut state) {
+            poison_locked(&self.inner, &mut state);
+            return Err(error);
+        }
         signal_change(&self.inner, &mut state);
         Ok(())
     }
@@ -339,6 +363,14 @@ impl WalV8ParallelCoordinator {
             ticket_count <= ready,
             "v8 FRONTIER extends past the contiguous completed ticket prefix"
         );
+        let Some(prefix_digest) = state
+            .tickets
+            .get(ticket_count - 1)
+            .and_then(|ticket| ticket.prefix_digest_after)
+        else {
+            poison_locked(&self.inner, &mut state);
+            anyhow::bail!("v8 FRONTIER prefix digest was not folded in ticket order");
+        };
         let frame_offset = state.next_data_offset;
         let frontier_end = frame_offset
             .checked_add(FRAME_LEN_U64)
@@ -350,6 +382,7 @@ impl WalV8ParallelCoordinator {
         let reservation = WalV8FrontierReservation {
             ticket_end,
             frame_offset,
+            prefix_digest,
         };
         state.next_data_offset = frontier_end;
         state.pending_frontier = Some(reservation);
@@ -411,6 +444,8 @@ impl WalV8ParallelCoordinator {
             anyhow::bail!("v8 durable ticket reservation sum overflows");
         };
         if !valid_ticket_prefix
+            || state.tickets[ticket_count - 1].prefix_digest_after
+                != Some(reservation.prefix_digest)
             || frontier_end < state.last_frontier_end
             || frontier_end > state.next_data_offset
             || frontier_end > self.inner.max_file_size
@@ -424,6 +459,7 @@ impl WalV8ParallelCoordinator {
         }
         state.reserved_bytes -= prefix_reserved_bytes;
         state.durable_ticket_end = reservation.ticket_end;
+        state.durable_prefix_digest = reservation.prefix_digest;
         state.last_frontier_end = frontier_end;
         state.pending_frontier = None;
         signal_change(&self.inner, &mut state);
@@ -451,6 +487,30 @@ impl WalV8ParallelCoordinator {
 
     pub(crate) fn durable_ticket_end(&self) -> u64 {
         self.inner.state.lock().durable_ticket_end
+    }
+
+    /// Return the verified digest at the current durable ticket boundary.
+    pub(crate) fn durable_prefix_digest(&self) -> WalV8Digest {
+        self.inner.state.lock().durable_prefix_digest
+    }
+
+    /// Return the folded digest at a ticket end still represented in the live
+    /// admission window, or the current durable digest. Older durable prefixes
+    /// are intentionally not retained here.
+    pub(crate) fn prefix_digest_at(&self, ticket_end: u64) -> Option<WalV8Digest> {
+        let state = self.inner.state.lock();
+        if state.poisoned || ticket_end < state.durable_ticket_end {
+            return None;
+        }
+        if ticket_end == state.durable_ticket_end {
+            return Some(state.durable_prefix_digest);
+        }
+        if ticket_end > state.folded_ticket_end {
+            return None;
+        }
+        let previous_ticket = ticket_end.checked_sub(1)?;
+        let index = usize::try_from(previous_ticket.checked_sub(state.durable_ticket_end)?).ok()?;
+        state.tickets.get(index)?.prefix_digest_after
     }
 
     pub(crate) fn next_ticket(&self) -> u64 {
@@ -553,6 +613,7 @@ impl WalV8AdmissionPublisher for WalV8ParallelCoordinator {
             reserved_bytes,
             frames_ready: false,
             digest_ready: None,
+            prefix_digest_after: None,
             data_complete: false,
         });
         state.next_ticket = next_ticket;
@@ -624,13 +685,57 @@ impl TicketState {
             frame_buffer_bytes: self.plan.frame_buffer_bytes,
             frames_ready: self.frames_ready,
             digest_ready: self.digest_ready,
+            prefix_digest_after: self.prefix_digest_after,
             data_complete: self.data_complete,
         }
     }
 
     fn is_frontier_ready(&self) -> bool {
-        self.frames_ready && self.digest_ready.is_some() && self.data_complete
+        self.frames_ready
+            && self.digest_ready.is_some()
+            && self.prefix_digest_after.is_some()
+            && self.data_complete
     }
+}
+
+/// Fold producer digests in strict ticket order, even when later producers
+/// finish hashing first. The fold is bounded by the admitted ticket window.
+fn fold_ready_digests(state: &mut CoordinatorState) -> Result<()> {
+    loop {
+        let index = usize::try_from(
+            state
+                .folded_ticket_end
+                .checked_sub(state.durable_ticket_end)
+                .context("v8 folded ticket end precedes the durable boundary")?,
+        )
+        .context("v8 folded ticket index exceeds usize")?;
+        let Some(ticket) = state.tickets.get(index) else {
+            break;
+        };
+        let Some(batch_digest) = ticket.digest_ready else {
+            break;
+        };
+        ensure!(
+            ticket.assignment.segment_ticket == state.folded_ticket_end,
+            "v8 ordered digest fold encountered a noncontiguous ticket"
+        );
+        let logical_batch_bytes = u64::try_from(ticket.plan.logical_batch_bytes)
+            .context("v8 folded logical batch length exceeds u64")?;
+        let prefix_digest = super::digest::advance_prefix(
+            &state.folded_prefix_digest,
+            state.folded_ticket_end,
+            logical_batch_bytes,
+            &batch_digest.batch_digest,
+        );
+        let next_ticket = state
+            .folded_ticket_end
+            .checked_add(1)
+            .context("v8 folded ticket cursor overflows")?;
+        state.tickets[index].prefix_digest_after = Some(prefix_digest);
+        state.folded_ticket_end = next_ticket;
+        state.folded_prefix_digest = prefix_digest;
+    }
+    Ok(())
 }
 
 fn validate_plan(plan: WalV8AdmissionPlan) -> Result<()> {
@@ -691,13 +796,15 @@ mod tests {
         max_inflight_tickets: usize,
         max_inflight_bytes: u64,
     ) -> Result<WalV8ParallelCoordinator> {
+        let wal_header = header();
         WalV8ParallelCoordinator::new(
-            header(),
+            wal_header,
             WalV8ParallelConfig {
                 next_ticket: 0,
                 next_data_offset: DATA_START,
                 last_commit_ts: 0,
                 last_recorded_at: None,
+                durable_prefix_digest: wal_header.initial_prefix_digest()?,
                 max_inflight_tickets,
                 max_inflight_bytes,
                 max_file_size: MAX_WAL_FILE_SIZE,
@@ -785,13 +892,33 @@ mod tests {
         let second = batch(20);
         let first_admitted = admit(&first, &coordinator)?;
         let second_admitted = admit(&second, &coordinator)?;
+        let mut first_encoded = first_admitted.encode()?;
         let mut second_encoded = second_admitted.encode()?;
-        mark_producer_ready(&mut second_encoded, &coordinator, true)?;
+        let first_digest = first_encoded.digest_ready()?;
+        let second_digest = second_encoded.digest_ready()?;
+        coordinator.mark_digest_ready(second_digest)?;
 
         assert!(coordinator.frame_ready_prefix().is_empty());
         assert!(coordinator.frontier_ready_prefix().is_empty());
+        assert_eq!(coordinator.prefix_digest_at(2), None);
 
-        let mut first_encoded = first_admitted.encode()?;
+        coordinator.mark_digest_ready(first_digest)?;
+        let prefix_one = super::super::digest::advance_prefix(
+            &header().initial_prefix_digest()?,
+            0,
+            first_digest.logical_batch_bytes,
+            &first_digest.batch_digest,
+        );
+        let prefix_two = super::super::digest::advance_prefix(
+            &prefix_one,
+            1,
+            second_digest.logical_batch_bytes,
+            &second_digest.batch_digest,
+        );
+        assert_eq!(coordinator.prefix_digest_at(1), Some(prefix_one));
+        assert_eq!(coordinator.prefix_digest_at(2), Some(prefix_two));
+
+        mark_producer_ready(&mut second_encoded, &coordinator, true)?;
         mark_producer_ready(&mut first_encoded, &coordinator, true)?;
         assert_eq!(
             coordinator
@@ -803,10 +930,14 @@ mod tests {
         );
         let reservation = coordinator.reserve_frontier(2)?;
         assert_eq!(reservation.frame_offset, DATA_START + 2 * FRAME_LEN_U64);
+        assert_eq!(reservation.prefix_digest, prefix_two);
         coordinator.publish_durable_frontier(reservation)?;
         first_encoded.disarm_after_durable();
         second_encoded.disarm_after_durable();
         assert_eq!(coordinator.durable_ticket_end(), 2);
+        assert_eq!(coordinator.durable_prefix_digest(), prefix_two);
+        assert_eq!(coordinator.prefix_digest_at(2), Some(prefix_two));
+        assert_eq!(coordinator.prefix_digest_at(1), None);
         assert_eq!(
             coordinator.last_frontier_end(),
             reservation.frame_offset + FRAME_LEN_U64
@@ -837,6 +968,48 @@ mod tests {
         let reservation = coordinator.reserve_frontier(1)?;
         coordinator.publish_durable_frontier(reservation)?;
         encoded.disarm_after_durable();
+        Ok(())
+    }
+
+    #[test]
+    fn ordered_fold_resumes_from_recovered_durable_prefix() -> Result<()> {
+        let wal_header = header();
+        let recovered_prefix = [0xa7; 32];
+        let coordinator = WalV8ParallelCoordinator::new(
+            wal_header,
+            WalV8ParallelConfig {
+                next_ticket: 5,
+                next_data_offset: DATA_START + 4 * FRAME_LEN_U64,
+                last_commit_ts: 50,
+                last_recorded_at: Some(RecordedAt { secs: 50, nanos: 9 }),
+                durable_prefix_digest: recovered_prefix,
+                max_inflight_tickets: 8,
+                max_inflight_bytes: 64 * 1024 * 1024,
+                max_file_size: MAX_WAL_FILE_SIZE,
+            },
+        )?;
+        let batch = batch(60);
+        let mut encoded = admit(&batch, &coordinator)?.encode()?;
+        let digest_ready = encoded.digest_ready()?;
+        assert_eq!(digest_ready.segment_ticket, 5);
+
+        coordinator.mark_digest_ready(digest_ready)?;
+        let expected_prefix = super::super::digest::advance_prefix(
+            &recovered_prefix,
+            5,
+            digest_ready.logical_batch_bytes,
+            &digest_ready.batch_digest,
+        );
+        assert_eq!(coordinator.durable_prefix_digest(), recovered_prefix);
+        assert_eq!(coordinator.prefix_digest_at(5), Some(recovered_prefix));
+        assert_eq!(coordinator.prefix_digest_at(6), Some(expected_prefix));
+
+        mark_producer_ready(&mut encoded, &coordinator, true)?;
+        let reservation = coordinator.reserve_frontier(6)?;
+        assert_eq!(reservation.prefix_digest, expected_prefix);
+        coordinator.publish_durable_frontier(reservation)?;
+        encoded.disarm_after_durable();
+        assert_eq!(coordinator.durable_prefix_digest(), expected_prefix);
         Ok(())
     }
 
@@ -888,36 +1061,91 @@ mod tests {
         let first_batch = batch(10);
         let second_batch = batch(20);
         let third_batch = batch(30);
+        let fourth_batch = batch(40);
         let first_admitted = admit(&first_batch, &coordinator)?;
         let second_admitted = admit(&second_batch, &coordinator)?;
+        let third_admitted = admit(&third_batch, &coordinator)?;
         let mut first_encoded = first_admitted.encode()?;
-        mark_producer_ready(&mut first_encoded, &coordinator, true)?;
+        let mut second_encoded = second_admitted.encode()?;
+        let mut third_encoded = third_admitted.encode()?;
+        let first_digest = first_encoded.digest_ready()?;
+        let second_digest = second_encoded.digest_ready()?;
+        let third_digest = third_encoded.digest_ready()?;
+        coordinator.mark_digest_ready(third_digest)?;
+        coordinator.mark_digest_ready(second_digest)?;
+        assert_eq!(coordinator.prefix_digest_at(3), None);
+        coordinator.mark_digest_ready(first_digest)?;
+        let prefix_one = super::super::digest::advance_prefix(
+            &header().initial_prefix_digest()?,
+            0,
+            first_digest.logical_batch_bytes,
+            &first_digest.batch_digest,
+        );
+        let prefix_two = super::super::digest::advance_prefix(
+            &prefix_one,
+            1,
+            second_digest.logical_batch_bytes,
+            &second_digest.batch_digest,
+        );
+        let prefix_three = super::super::digest::advance_prefix(
+            &prefix_two,
+            2,
+            third_digest.logical_batch_bytes,
+            &third_digest.batch_digest,
+        );
+        assert_eq!(coordinator.prefix_digest_at(1), Some(prefix_one));
+        assert_eq!(coordinator.prefix_digest_at(2), Some(prefix_two));
+        assert_eq!(coordinator.prefix_digest_at(3), Some(prefix_three));
+
+        let mut first_frames = vec![0; first_encoded.frame_buffer_bytes()];
+        first_encoded.encode_data_frames_into(&mut first_frames)?;
+        coordinator.mark_frames_ready(0)?;
+        coordinator.mark_data_complete(0)?;
 
         let first_frontier = coordinator.reserve_frontier(1)?;
-        assert_eq!(first_frontier.frame_offset, DATA_START + 2 * FRAME_LEN_U64);
-        let third_admitted = admit(&third_batch, &coordinator)?;
-        let mut third_encoded = third_admitted.encode()?;
+        assert_eq!(first_frontier.frame_offset, DATA_START + 3 * FRAME_LEN_U64);
+        assert_eq!(first_frontier.prefix_digest, prefix_one);
+        let fourth_admitted = admit(&fourth_batch, &coordinator)?;
+        let mut fourth_encoded = fourth_admitted.encode()?;
         assert_eq!(
-            third_encoded.assignment().first_data_offset,
+            fourth_encoded.assignment().first_data_offset,
             first_frontier.frame_offset + FRAME_LEN_U64
         );
 
         coordinator.publish_durable_frontier(first_frontier)?;
         first_encoded.disarm_after_durable();
+        assert_eq!(coordinator.durable_prefix_digest(), prefix_one);
+        assert_eq!(coordinator.prefix_digest_at(1), Some(prefix_one));
+        assert_eq!(coordinator.prefix_digest_at(2), Some(prefix_two));
+        assert_eq!(coordinator.prefix_digest_at(3), Some(prefix_three));
 
-        let mut second_encoded = second_admitted.encode()?;
+        let fourth_digest = fourth_encoded.digest_ready()?;
+        coordinator.mark_digest_ready(fourth_digest)?;
+        let prefix_four = super::super::digest::advance_prefix(
+            &prefix_three,
+            3,
+            fourth_digest.logical_batch_bytes,
+            &fourth_digest.batch_digest,
+        );
+        assert_eq!(coordinator.prefix_digest_at(4), Some(prefix_four));
+
         mark_producer_ready(&mut second_encoded, &coordinator, true)?;
         mark_producer_ready(&mut third_encoded, &coordinator, true)?;
-        assert_eq!(coordinator.frontier_ready_prefix().len(), 2);
-        let second_frontier = coordinator.reserve_frontier(3)?;
+        mark_producer_ready(&mut fourth_encoded, &coordinator, true)?;
+        assert_eq!(coordinator.frontier_ready_prefix().len(), 3);
+        let second_frontier = coordinator.reserve_frontier(4)?;
+        assert_eq!(second_frontier.prefix_digest, prefix_four);
         assert_eq!(
             second_frontier.frame_offset,
-            third_encoded.assignment().first_data_offset + FRAME_LEN_U64
+            fourth_encoded.assignment().first_data_offset + FRAME_LEN_U64
         );
         coordinator.publish_durable_frontier(second_frontier)?;
         second_encoded.disarm_after_durable();
         third_encoded.disarm_after_durable();
+        fourth_encoded.disarm_after_durable();
         assert!(!coordinator.is_poisoned());
+        assert_eq!(coordinator.durable_ticket_end(), 4);
+        assert_eq!(coordinator.durable_prefix_digest(), prefix_four);
         Ok(())
     }
 
