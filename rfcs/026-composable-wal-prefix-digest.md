@@ -10,11 +10,12 @@
 ## 1. Summary
 
 This RFC proposes a new PITR WAL format, provisionally **v8**, whose logical
-prefix digest is a chain of independently computed batch digests. A producer
-can hash a complete logical batch after its ordered metadata is fixed; the
-ordered coordinator then hashes a fixed-size link for each ticket. The
-physical DATA/FRONTIER layout and single-sync durability protocol follow RFC
-025, with format-specific validation and a new digest definition.
+prefix uses **BLAKE3-256 entry-stream digests, batch digests, and an ordered
+chain**. Producers hash canonical entry bytes during encoding, then bind the
+completed logical header to that entry digest. The ordered coordinator hashes
+only a fixed-size link for each ticket. The physical DATA/FRONTIER layout and
+single-sync durability protocol follow RFC 025, with format-specific validation
+and a new logical digest definition.
 
 This is a proposal, not an implemented format, adoption decision, or claim of
 v4/v7 performance parity. In particular, it does not alter the digest of any
@@ -34,11 +35,28 @@ measured substantial SHA work before later pipeline changes; its timings are
 not measurements of the current pipeline. The [direct-frame CPU screen](../docs/wal/benchmarks/rfc-025-v7-direct-frame-cpu-20261030.md)
 found only a small isolated gain from removing a logical-to-frame copy.
 
-V8 moves the payload-sized SHA operation to independent per-batch work. The
-ordered chain still performs one SHA-256 per batch; total payload bytes still
-need hashing and total CPU can increase. Producer contention, cache behavior,
-grouping and sync timing can erase any latency or throughput gain. This design
-requires end-to-end qualification rather than assuming parallel work is free.
+Performance is the primary goal. V8 MUST remove payload-sized cryptographic
+work from the ordered coordinator and SHOULD avoid a second full-buffer
+cryptographic scan after canonical entry encoding. The entry-stream digest
+allows this without waiting for the logical header's entry-stream CRC to be
+known: encode and hash entries first, then hash the completed header and the
+32-byte entry digest. There is no need for a payload CRC prepass solely to
+start the cryptographic hash in header-first order.
+
+[BLAKE3](https://c2sp.org/BLAKE3@v1.0.0) provides incremental hashing, a 32-byte
+output and a tree structure suitable for SIMD implementations. Independent
+producer jobs provide concurrency across batches; this RFC does not require
+an additional thread pool inside each hash. BLAKE3's
+[Rust API](https://docs.rs/blake3/latest/blake3/struct.Hasher.html#method.update)
+notes that update size limits SIMD parallelism. Replacing one bulk update with
+many tiny field updates may lose that benefit and MUST be measured.
+
+Every canonical entry byte still enters a cryptographic hash once. Encoding
+with incremental updates avoids revisiting the entire completed logical
+buffer; it does not eliminate payload hashing, CRC work or every memory read.
+The fixed-size hashes add work, and total CPU can still increase. Producer
+contention, update granularity, cache behavior, grouping and sync timing can
+erase any gain. End-to-end qualification is required.
 
 Goals are deterministic independent verification, a fixed-size ordered step,
 and unambiguous backward compatibility. This RFC does not change frame CRCs,
@@ -56,66 +74,103 @@ exact numeric version assignment, magic, flags and registry entries MUST be
 specified in the implementation plan before any v8 files are written; `v8`
 below is the proposed format identity, not permission to reuse the v7 format
 version identifier.
-A reader that does not support v8 MUST reject it before changing any files or
-persistent metadata. Unknown versions and unsupported digest schemes MUST NOT
-be guessed from digest length or treated as v7.
 
-Let `H = SHA256(header)` over the complete immutable 4096-byte v8 WAL header,
-including the v8 identity. Let `L_i` be the complete canonical logical batch
-header and entry stream for segment-local ticket `i`, including its logical
-header, entry CRC and header CRC. Exclude physical fragment headers, frame
-headers, FRONTIER frames and padding, exactly as for v7's logical input. Let
-`len_i` be `len(L_i)` in bytes, encoded as an unsigned 64-bit big-endian
-integer. A batch MUST be valid under the v8 logical codec and have ticket `i`
-before it contributes to the chain.
+A registered v8 identity selects exactly the BLAKE3-256 entry-chain scheme
+defined here. Changing the primitive, hash mode, tags or preimages requires a
+distinct registered format or scheme identity. A reader that does not support
+v8 MUST reject it before changing any files or persistent metadata. Unknown
+versions and unsupported digest schemes MUST NOT be guessed from digest length
+or treated as v7.
 
-`SHA256` returns exactly 32 raw bytes. The following tags are exact ASCII bytes,
-including one final NUL byte; `||` denotes byte concatenation:
+Let `W` be the complete immutable 4096-byte v8 WAL header, including its format
+identity, header checksum and reserved bytes. For segment-local ticket `i`:
+
+- `Q_i` is the exact 48-byte canonical logical batch header from RFC 025,
+  including ticket, commit timestamp, recorded time, entry count, `data_len`,
+  `data_crc32`, `header_crc32` and the zero reserved field.
+- `S_i` is the exact canonical entry stream following that header. It includes
+  all operation tags, lengths, keys and values in canonical mixed-operation
+  order. Hashing source records before canonicalization is insufficient.
+- `n_i = len(S_i)` MUST equal the header's `data_len`, and `len_i = 48 + n_i`
+  MUST equal the logical batch length repeated in every DATA fragment header.
+  Thus `L_i = Q_i || S_i` remains the complete logical batch on disk, but the
+  digest computation does not require a contiguous `L_i` allocation.
+
+Exclude physical fragment headers, frame headers, FRONTIER frames and padding
+from these logical inputs. Validate their canonical encoding separately.
+A batch MUST be valid under the v8 logical codec before contributing to a
+verified prefix.
+
+`BLAKE3` below means the regular **unkeyed hash mode with exactly 32 output
+bytes**. Use neither keyed mode nor `derive_key` mode. Inputs are byte strings;
+`u64be` encodes an unsigned 64-bit big-endian integer, all digest outputs remain
+raw bytes, and BLAKE3's internal word order does not change the WAL byte order.
+The following tags are exact ASCII bytes, including one final NUL byte;
+`||` denotes byte concatenation:
 
 ```text
-INIT  = "toy-kv-engine/wal-prefix/v8/init\0"
-BATCH = "toy-kv-engine/wal-prefix/v8/batch\0"
-LINK  = "toy-kv-engine/wal-prefix/v8/link\0"
+HEADER  = "toy-kv-engine/wal-prefix/v8/header\0"
+ENTRIES = "toy-kv-engine/wal-prefix/v8/entries\0"
+BATCH   = "toy-kv-engine/wal-prefix/v8/batch\0"
+INIT    = "toy-kv-engine/wal-prefix/v8/init\0"
+LINK    = "toy-kv-engine/wal-prefix/v8/link\0"
 
-P_0     = SHA256(INIT || H)
-B_i     = SHA256(BATCH || u64be(len_i) || L_i)
-P_(i+1) = SHA256(LINK || P_i || u64be(i) || u64be(len_i) || B_i)
+H       = BLAKE3(HEADER || W)
+E_i     = BLAKE3(ENTRIES || u64be(n_i) || S_i)
+B_i     = BLAKE3(BATCH || Q_i || E_i)
+P_0     = BLAKE3(INIT || H)
+P_(i+1) = BLAKE3(LINK || P_i || u64be(i) || u64be(len_i) || B_i)
 ```
 
 Ticket `i` starts at zero for each segment. `P_T` is the digest after exactly
 `T` contiguous batches and is the v8 FRONTIER `prefix_digest` for exclusive
-`ticket_end = T`. The generation-zero FRONTIER carries `P_0`, **not** `H` as
-in v7. The ticket is also present in `L_i`; both copies MUST agree. The length
-and fixed-width fields make the input unambiguous. All arithmetic and ticket
-increment operations MUST be checked; overflow or a ticket discontinuity is
-an error. There is no cross-segment hash-state continuation: each segment starts
-from its own header, whose predecessor identity and archive chain continue to
-be validated by the existing PITR rules.
+`ticket_end = T`. The generation-zero FRONTIER carries `P_0`. This differs from
+v7's generation-zero value, `SHA256(W)`. The link's ticket MUST match `Q_i` and
+every fragment header. The length and fixed-width fields make the input
+unambiguous. All arithmetic, length conversions and ticket increments MUST be
+checked against the existing wire and configured limits; overflow or a ticket
+discontinuity is an error. Each link hashes exactly 113 bytes regardless of
+payload size. There is no cross-segment hash-state continuation: each segment
+starts from its own header, whose predecessor identity and archive chain
+continue to be validated by the existing PITR rules.
 
-`B_i` is an ephemeral computation result, not a new on-disk record or a trusted
-recovery shortcut. A correct implementation may cache it in memory while the
-batch is owned, but MUST NOT accept a persisted or supplied `B_i` as proof of
-the payload. A v8 batch digest or chain value MUST NOT be substituted for a v7
-rolling SHA state, a frame-record digest, a sealed-image digest, or an archive
-object digest.
+`H` is solely the logical chain's header binding. The common frame header's
+`wal_header_digest` remains `SHA256(W)`; FRONTIER record digests, sealed-image
+digests and archive-object digests retain their existing SHA-256 definitions.
+Their purpose and input bytes differ from `H`, `E_i`, `B_i` and `P_T`. A v8
+logical digest MUST NOT be substituted into one of those physical fields or
+into a v7 rolling SHA state.
+
+`E_i` and `B_i` are ephemeral computation results, not new on-disk records or
+trusted recovery shortcuts. A correct encoder may cache them with its owned
+bytes, but recovery MUST recompute them from actual validated content. Neither
+a persisted or externally supplied digest nor entry CRCs alone prove the
+payload. `E_i` MUST cover every canonical entry byte directly.
 
 ### 3.1 Digest conformance vector
 
-This vector exercises the byte-level formula only. `H` is a synthetic 32-byte
-input, not the digest of a valid WAL header. `L_0` encodes ticket 0, commit
-timestamp 1, recorded seconds 1, nanos 0, and one PUT of key `k` and value
-`v`. Its two logical-header CRCs are included.
+This vector exercises every hash preimage. Its synthetic header is
+`W[j] = j mod 256` for `0 <= j < 4096`; it is not a valid WAL header. `Q_0 || S_0`
+encodes ticket 0, commit timestamp 1, recorded seconds 1, nanos 0, and one PUT
+of key `k` and value `v`. Both logical-header CRCs are included.
 
 ```text
-H   = 000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f
-L_0 = 0000000000000000000000000000000100000000000000010000000000000001
-      00000010c4459325224cded90000000001000000000a000000016b0000000176
+H   = 53edd07fe6e3d0dda540770b400ece2538228897a535415cf8958be5a1bb922f
+Q_0 = 0000000000000000000000000000000100000000000000010000000000000001
+      00000010c4459325224cded900000000
+S_0 = 01000000000a000000016b0000000176
+n_0 = 16
 len_0 = 64
-P_0 = 4d03b59ab6e18fe4a553a1113df059d15c538b2cfa30c8010fd3b8135d76b603
-B_0 = 58ca4d4b04c6dddb4e13ec78bada4b29608cfb798fd36809d0a5dffa1e8c853d
-P_1 = c944f20de0cdd94b5633c396a0107d48e90e3f4b9ec2ce1e535ae4da212465a0
+E_0 = 15c56b2a4fef9ab6690b5f8c68e10b8750ad63a677951adcc5a3aeefa3f45fb4
+B_0 = 0bdffcb250aaf751128e25262a7942f608fa99d7857eb43c54c5abf922532c48
+P_0 = 308b9c35ac3fa99809a80e99ad7dde4de8d653dd782ee9adc0dd390ed9bb87e3
+P_1 = b0d28130323ebce6e10591137ab6623bdb6533e9863b39ef56e9b0d6f59f2d53
 ```
 
+The values agree between the official BLAKE3 C implementation and Rust
+reference implementation at
+[revision 93a431c](https://github.com/BLAKE3-team/BLAKE3/tree/93a431c78a52d7ccf0f366f106467f5070e6075e),
+including incremental update sizes of 1, 7, 64, 4008 and 65536 bytes.
 Implementations MUST add independently generated byte-exact golden vectors for
 valid v8 headers, multiple batches, frames, FRONTIERs and persisted anchors,
 including negative timestamps and fragment boundaries. A round trip using the
@@ -124,15 +179,42 @@ same encoder and decoder is not sufficient.
 ## 4. Parallel writer and durability
 
 Admission retains RFC 025's segment-local ticket, physical offset, resource
-reservation, timestamp and recorded-time rules. A batch digest MUST be
-computed from the immutable final `L_i`, after admission has chosen the ticket
-and ordered metadata and the canonical logical header and CRCs are complete.
-Pre-hashing entries alone cannot replace `B_i`. Producer hashing may run
-alongside framing or I/O, but a caller MUST NOT mutate, release or reuse bytes
-while any hash or write can still read them. V8 MUST charge and bound digest
-jobs, logical buffers, frame buffers and completed out-of-order results using
-the existing admission/backpressure model; shutdown and cancellation MUST
-retire their ownership only after all consumers finish.
+reservation, timestamp and recorded-time rules. The intended preparation path
+is:
+
+1. Canonicalize the operations and obtain the checked encoded entry length
+   `n_i` from their sizes. A size calculation need not serialize or hash the
+   payload. Reserve preparation resources before encoding.
+2. Initialize an entry hasher with `ENTRIES || u64be(n_i)`. As canonical byte
+   ranges are encoded, feed those same bytes in order to `E_i` and the existing
+   entry-stream CRC computation. Hash each range exactly once; no skipped,
+   repeated or pre-canonical bytes are permitted. Use bounded contiguous
+   ranges to preserve efficient hash updates. Check the emitted byte count
+   against `n_i`, then finalize `E_i`.
+3. After admission assigns the final ticket and ordered timestamp metadata,
+   complete `Q_i`, including `data_crc32` and `header_crc32`. Compute
+   `B_i = BLAKE3(BATCH || Q_i || E_i)` without rereading `S_i`.
+4. Prepare DATA frames on producers and publish frame-ready and digest-ready
+   results independently from worker DATA-completion events. The ordered
+   coordinator folds `B_i` using the 113-byte link input and performs no payload
+   hashing.
+
+Entry encoding and `E_i` may finish before ticket assignment because `S_i`
+does not depend on ordered metadata. `B_i` MUST wait for the final `Q_i`.
+Changing any encoded entry invalidates the cached `E_i` and `B_i`; changing
+the logical header invalidates `B_i`. The digest and the DATA bytes MUST come
+from the same owned immutable encoding. Admission determines group visibility;
+digest or frame readiness only gates submission or durability eligibility and
+MUST NOT hide admitted tickets from group formation.
+
+Digest work may overlap framing or I/O, but a caller MUST NOT mutate, release
+or reuse bytes while any encoder, hash or write can still read them. V8 MUST
+charge and bound digest jobs, incremental hash state, logical buffers, frame
+buffers and completed out-of-order results using the existing
+admission/backpressure model. Shutdown and cancellation MUST retire ownership
+only after all consumers finish. This RFC allows existing intermediate buffers;
+direct-to-frame encoding is not required to obtain the digest's streaming
+benefit.
 
 Digest completion and DATA completion are independent events. They may arrive
 out of order. The ordered coordinator MUST fold only the contiguous digest-ready
@@ -169,13 +251,26 @@ Active recovery independently discovers aligned FRONTIER candidates as in RFC
 025. For each candidate, it MUST validate the entire covered physical prefix,
 all retained control frames and their unique linear chain, canonical fragments,
 logical batch CRCs, contiguous tickets, commit timestamps and recorded times.
-It MUST recompute each `B_i` from the validated complete `L_i`, fold the chain
-from `P_0`, and compare `P_T` with the candidate and every applicable hard
-anchor. Reassembly or streaming validation MUST produce the identical ordered
-logical bytes, regardless of fragmentation or buffer size. An invalid or
-missing batch, wrong digest, reordered/duplicated/skipped ticket, or conflicting
-anchor rejects that candidate. Recovery MUST NOT trust a marker merely because
-its own CRC or predecessor chain is valid.
+It MUST recompute each `E_i` from the actual canonical `S_i`, compute `B_i`
+using the complete validated `Q_i`, fold the chain from `P_0`, and compare `P_T`
+with the candidate and every applicable hard anchor. Reassembly or streaming
+validation MUST produce identical results regardless of fragmentation or
+buffer size. An invalid or missing batch, wrong digest,
+reordered/duplicated/skipped ticket, or conflicting anchor rejects that
+candidate. Recovery MUST NOT trust a marker merely because its own CRC or
+predecessor chain is valid.
+
+Recovery SHOULD validate the digest without allocating a complete `L_i`:
+validate each physical frame CRC, collect the fixed 48-byte `Q_i`, check its
+header CRC and limits, then stream the canonical entry bytes through the
+entry-stream CRC, entry parser and `E_i` hasher. Count exactly `n_i` bytes,
+validate entry count, ordering and all logical constraints, compare
+`data_crc32`, then compute `B_i` and the link. Fields and entries may cross
+fragment or input-buffer boundaries. Bounded parser buffering and any owned
+records needed for replay remain permitted; parsing streamed bytes MUST NOT
+publish them before the applicable batch and candidate validation succeeds.
+Neither stored intermediate digests nor CRC values may replace hashing the
+actual entry bytes.
 
 V8 inherits RFC 025's explicit Active fault model: an interrupted single sync
 can leave a complete marker but missing DATA, indistinguishable from some
@@ -238,16 +333,18 @@ downgrade is proposed.
 ## 7. Integrity and security
 
 The chain commits to segment header identity, batch boundaries, order, ticket,
-length, metadata and all canonical logical bytes, subject to SHA-256's
-collision resistance. Separate tags prevent confusing a batch digest with an
-initial or link digest. Reordering, truncation, duplication, substitution,
-cross-segment replay, header or length tampering MUST be rejected against a
-trusted frontier or hard anchor. A complete, self-consistent malicious rewrite
-of the WAL and all anchors is outside this unkeyed hash's protection: SHA-256
-and CRCs are not MACs, signatures, encryption, or independent protection
-against an attacker who can rewrite every trusted record. The RFC 025
-single-sync Active fallback ambiguity remains; a chain digest cannot prove that
-a particular sync succeeded.
+length, metadata and all canonical logical bytes, subject to BLAKE3-256's
+collision resistance. Separate tags distinguish header, entry-stream, batch,
+initial and link digests. `E_i` directly binds the payload; retaining CRCs alone
+would not provide that cryptographic binding. Reordering, truncation,
+duplication, substitution, cross-segment replay, header or length tampering
+MUST be rejected against a trusted frontier or hard anchor. A complete,
+self-consistent malicious rewrite of the WAL and all anchors is outside this
+unkeyed hash's protection. Using regular unkeyed BLAKE3 does not add a MAC,
+signature or encryption. The physical
+SHA-256 digests and CRCs also do not protect against an attacker who can rewrite
+every trusted record. The RFC 025 single-sync Active fallback ambiguity remains;
+a chain digest cannot prove that a particular sync succeeded.
 
 ## 8. Implementation and validation gates
 
@@ -257,9 +354,13 @@ the implementation plan MUST cover at least:
 - Exact v8 wire identifiers, every format-dispatch and persisted descriptor
   change, checked size limits, cross-version chains, and old-reader rejection.
 - Independent digest vectors, a reference implementation, multi-ticket
-  prefix checks, duplicate/reordered/omitted batches, fragment and CRC
-  corruption, header/identity binding and overflow. Exercise both empty and
-  nonempty segments and both Leader and Parallel writers.
+  prefix checks, exact tags and unkeyed 32-byte output, duplicate, reordered or
+  omitted batches, fragment and CRC corruption, header/identity binding and
+  overflow. Compare one-shot and encode-time entry hashing with streaming
+  recovery at field, entry, BLAKE3 chunk and DATA fragment boundaries. Mutate
+  payload bytes while recomputing CRCs to ensure the cryptographic digest still
+  rejects. Exercise empty and nonempty segments, canonical mixed operations,
+  and both Leader and Parallel writers.
 - Deterministic out-of-order digest/DATA completion, failure and panic,
   cancellation, backpressure, lost-wakeup, close and resource-retirement tests.
   No acknowledged ticket may precede its data, digest, marker and successful
@@ -278,9 +379,24 @@ the implementation plan MUST cover at least:
   stalls and memory/backpressure. Compare matching workloads and report both
   best eligible and the sample distribution; a best score is not a substitute
   for repeated evidence. Check normal read/write and replay workloads too.
+- CPU attribution that distinguishes changing the hash primitive from moving
+  work: report `payload_hash_bytes`, `payload_hash_cpu_ns`,
+  `ordered_link_hash_cpu_ns`, and `post_encode_hash_reread_bytes`. Count all
+  canonical entry bytes fed to cryptographic hashes and sum hashing CPU across
+  producers; report retries or discarded preparations separately. The reread
+  metric counts entry bytes consumed by a separate post-encoding hash pass,
+  excluding immediate encode-time range updates, CRC and framing reads. Also
+  report update sizes/counts, header/batch hash CPU, peak hash/buffer memory
+  and any thread-pool overhead. The ordered coordinator MUST hash zero payload
+  bytes. A streaming encode path should have zero post-encode full-stream hash
+  rereads; incremental updates still read their byte ranges and do not imply
+  zero memory traffic. Isolate bulk versus encode-time hashing, SHA-256 versus
+  BLAKE3, and the final pipeline before attributing a gain to one change.
+  Document and measure any path that retains a separate full-stream hash scan.
 - An explicit adoption decision based on correctness, performance and resource
-  evidence. A producer hash chain increases work and coordination; if the
-  throughput or tail-latency tradeoff is not favorable, keep v7 as the default.
+  evidence. A fixed-size ordered step and avoiding full-buffer rereads do not
+  prove an end-to-end gain. If throughput or tail latency is not favorable,
+  keep v7 as the default.
 
 ## 9. Alternatives
 
@@ -290,5 +406,13 @@ reconstruct `SHA256(header || L_0 || ... || L_i)` and therefore cannot replace
 the v7 state. Merkle trees enable other proofs and parallel tree construction
 but add tree shape, storage and recovery complexity beyond this ordered-prefix
 need. A weaker or non-cryptographic hash reduces CPU but changes integrity
-properties and is not proposed. Buffered scatter/gather and direct-to-frame
-encoding address different costs and do not remove the ordered SHA dependency.
+properties and is not proposed.
+
+An independent `SHA256(BATCH || len_i || L_i)` plus a small ordered chain removes
+the serial payload dependency, but naturally requires a full logical-buffer
+scan after the CRC-dependent header is complete. The entry-stream/header split
+permits encode-time hashing without that dependency. Using SHA-256 with the
+same split is a useful benchmark control; BLAKE3 is the proposed primitive,
+with any speedup subject to measured update granularity and CPU features.
+Buffered scatter/gather and direct-to-frame encoding address different costs
+and do not remove the ordered hash dependency by themselves.
