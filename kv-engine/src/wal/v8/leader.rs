@@ -266,8 +266,18 @@ impl WalV8LeaderWriter {
             .try_reserve_exact(batches.len())
             .context("reserve v8 durable commit results")?;
 
+        let mut preparation_index_bytes = 0_u64;
         for batch in batches {
-            let prepared = PreparedWalV8Batch::<()>::preflight(batch, limits, |_| Ok(()))?;
+            let prepared = PreparedWalV8Batch::<()>::preflight(batch, limits, |bytes| {
+                preparation_index_bytes = preparation_index_bytes
+                    .checked_add(bytes)
+                    .context("v8 group preparation index reservation overflows")?;
+                ensure!(
+                    preparation_index_bytes <= self.max_file_size,
+                    WalV8LeaderCapacityError::GroupExceedsAdmissionWindow
+                );
+                Ok(())
+            })?;
             prepared_batches.push(prepared);
         }
         let mut previous_commit_ts = self.frontier.last_commit_ts;
@@ -316,16 +326,19 @@ impl WalV8LeaderWriter {
             "v8 DATA group overlaps its previous FRONTIER"
         );
 
-        let group_buffer_bytes = prepared_batches.iter().try_fold(0_u64, |total, prepared| {
-            let logical_bytes = u64::try_from(prepared.logical_batch_bytes())
-                .context("v8 logical batch reservation exceeds u64")?;
-            let frame_bytes = u64::try_from(prepared.frame_buffer_bytes())
-                .context("v8 frame buffer reservation exceeds u64")?;
-            total
-                .checked_add(logical_bytes)
-                .and_then(|total| total.checked_add(frame_bytes))
-                .context("v8 group buffer reservation overflows")
-        })?;
+        let group_buffer_bytes =
+            prepared_batches
+                .iter()
+                .try_fold(preparation_index_bytes, |total, prepared| {
+                    let logical_bytes = u64::try_from(prepared.logical_batch_bytes())
+                        .context("v8 logical batch reservation exceeds u64")?;
+                    let frame_bytes = u64::try_from(prepared.frame_buffer_bytes())
+                        .context("v8 frame buffer reservation exceeds u64")?;
+                    total
+                        .checked_add(logical_bytes)
+                        .and_then(|total| total.checked_add(frame_bytes))
+                        .context("v8 group buffer reservation overflows")
+                })?;
         ensure!(
             group_buffer_bytes <= self.max_file_size,
             WalV8LeaderCapacityError::GroupExceedsAdmissionWindow
@@ -880,6 +893,50 @@ mod tests {
             .append_group(&batches, LIVE_WAL_V5_LIMITS)
             .err()
             .context("aggregate memory reservation exceeds the admission window")?;
+        assert!(matches!(
+            error.downcast_ref::<WalV8LeaderCapacityError>(),
+            Some(WalV8LeaderCapacityError::GroupExceedsAdmissionWindow)
+        ));
+        assert_eq!(writer.coordinator.next_ticket(), 0);
+        assert!(!writer.is_poisoned());
+        assert_eq!(std::fs::metadata(&path)?.len(), installed.image_len);
+        Ok(())
+    }
+
+    #[test]
+    fn preparation_indexes_count_toward_the_admission_window() -> Result<()> {
+        const SEGMENT_LIMIT: u64 = 32 * 1024;
+
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("active-v8.wal");
+        let header = header();
+        let installed = install_empty(&path, header)?;
+        let mut writer = WalV8LeaderWriter::new(
+            OpenOptions::new().read(true).write(true).open(&path)?,
+            OpenOptions::new().read(true).write(true).open(&path)?,
+            &installed,
+            SEGMENT_LIMIT,
+        )?;
+        let batches = (1..=5)
+            .map(|ticket| WalBatch {
+                commit_ts: ticket * 10,
+                recorded_at: RecordedAt {
+                    secs: i64::try_from(ticket).unwrap_or(i64::MAX),
+                    nanos: 17,
+                },
+                entries: (0..100)
+                    .map(|key| WalEntry::Put {
+                        key: vec![u8::try_from(key).unwrap_or(u8::MAX)],
+                        value: vec![0x5a],
+                    })
+                    .collect(),
+            })
+            .collect::<Vec<_>>();
+
+        let error = writer
+            .append_group(&batches, LIVE_WAL_V5_LIMITS)
+            .err()
+            .context("preparation indexes plus output buffers exceed the admission window")?;
         assert!(matches!(
             error.downcast_ref::<WalV8LeaderCapacityError>(),
             Some(WalV8LeaderCapacityError::GroupExceedsAdmissionWindow)
