@@ -12,10 +12,11 @@
 This RFC proposes a new PITR WAL format, provisionally **v8**, whose logical
 prefix uses **BLAKE3-256 entry-stream digests, batch digests, and an ordered
 chain**. Producers hash canonical entry bytes during encoding, then bind the
-completed logical header to that entry digest. The ordered coordinator hashes
-only a fixed-size link for each ticket. The physical DATA/FRONTIER layout and
-single-sync durability protocol follow RFC 025, with format-specific validation
-and a new logical digest definition.
+completed logical header to that entry digest. Parallel publishes each admitted
+ticket to group formation before payload encoding or hashing begins. The
+ordered coordinator hashes only a fixed-size link for each ticket. The physical
+DATA/FRONTIER layout and single-sync durability protocol follow RFC 025, with
+format-specific validation and a new logical digest definition.
 
 This is a proposal, not an implemented format, adoption decision, or claim of
 v4/v7 performance parity. In particular, it does not alter the digest of any
@@ -60,7 +61,7 @@ erase any gain. End-to-end qualification is required.
 
 Goals are deterministic independent verification, a fixed-size ordered step,
 and unambiguous backward compatibility. This RFC does not change frame CRCs,
-canonical batch encoding, timestamp or ticket assignment, active fallback,
+canonical batch encoding, timestamp or ticket ordering rules, active fallback,
 sealed-object strictness, or introduce a cryptographic authenticity guarantee.
 
 ## 3. Wire identity and digest definition
@@ -179,28 +180,46 @@ same encoder and decoder is not sufficient.
 ## 4. Parallel writer and durability
 
 Admission retains RFC 025's segment-local ticket, physical offset, resource
-reservation, timestamp and recorded-time rules. The intended preparation path
-is:
+reservation, timestamp and recorded-time rules. For the Parallel writer,
+admission and group visibility MUST precede payload-sized entry encoding or
+cryptographic hashing. Digest and frame readiness gate submission and
+durability only; they MUST NOT delay admission visibility. The Parallel
+preparation path is:
 
-1. Canonicalize the operations and obtain the checked encoded entry length
-   `n_i` from their sizes. A size calculation need not serialize or hash the
-   payload. Reserve preparation resources before encoding.
-2. Initialize an entry hasher with `ENTRIES || u64be(n_i)`. As canonical byte
-   ranges are encoded, feed those same bytes in order to `E_i` and the existing
+1. Validate caller input, canonicalize the operations, obtain the checked
+   encoded entry length `n_i` from their sizes, and preflight resources. This
+   step MUST NOT serialize the entry payload or compute its cryptographic
+   digest. Charge canonicalization and preparation storage under the existing
+   resource model.
+2. Secure the memory and spool reservations needed to complete the batch,
+   then admit it: assign the ticket, ordered timestamp metadata and physical
+   DATA offsets, bind the reservations, and immediately publish an admitted
+   entry in `Preparing` state to group formation. Publication MUST complete
+   before the producer begins payload encoding or hashing. Capacity rejection
+   before admission assigns no ticket; an admitted producer MUST NOT depend
+   on a later unreserved capacity grant to finish preparation.
+3. Outside admission and ordered-metadata serialization locks, initialize an
+   entry hasher with `ENTRIES || u64be(n_i)`. As canonical byte ranges are
+   encoded, feed those same bytes in order to `E_i` and the existing
    entry-stream CRC computation. Hash each range exactly once; no skipped,
-   repeated or pre-canonical bytes are permitted. Use bounded contiguous
-   ranges to preserve efficient hash updates. Check the emitted byte count
-   against `n_i`, then finalize `E_i`.
-3. After admission assigns the final ticket and ordered timestamp metadata,
-   complete `Q_i`, including `data_crc32` and `header_crc32`. Compute
+   repeated or pre-canonical bytes are permitted. Use bounded contiguous ranges
+   to preserve efficient hash updates. Check the emitted byte count against
+   `n_i`, then finalize `E_i`.
+4. Complete `Q_i` using the assigned ticket and ordered timestamp metadata,
+   including `data_crc32` and `header_crc32`. Compute
    `B_i = BLAKE3(BATCH || Q_i || E_i)` without rereading `S_i`.
-4. Prepare DATA frames on producers and publish frame-ready and digest-ready
+5. Prepare DATA frames on producers and publish frame-ready and digest-ready
    results independently from worker DATA-completion events. The ordered
    coordinator folds `B_i` using the 113-byte link input and performs no payload
    hashing.
 
-Entry encoding and `E_i` may finish before ticket assignment because `S_i`
-does not depend on ordered metadata. `B_i` MUST wait for the final `Q_i`.
+`E_i` is independent of ordered metadata, but Parallel MUST follow the
+admission-before-preparation order above. A packer MUST be able to observe
+admitted membership while its producer is still encoding; publishing only a
+wakeup before encoding and withholding the admitted entry until readiness
+does not satisfy the rule. Leader may schedule preparation differently while
+preserving the same digest, ownership and durability requirements.
+`B_i` MUST wait for the final `Q_i`.
 Changing any encoded entry invalidates the cached `E_i` and `B_i`; changing
 the logical header invalidates `B_i`. The digest and the DATA bytes MUST come
 from the same owned immutable encoding. Admission determines group visibility;
@@ -236,10 +255,12 @@ or a submitted sync MUST NOT publish durability. V8 does not add a second
 steady-state sync. RFC 025's failed marker/sync poisoning and prohibition on
 further FRONTIER appends in that runtime remain mandatory.
 
-A post-admission hash or frame failure, panic, dropped job, invalid completion,
-or write failure MUST follow the existing ordered poison rules, wake waiters,
-and prevent acknowledgement at or beyond the failed ticket. A later ready
-batch cannot skip an unfinished earlier one. An implementation MUST document
+A post-admission encoding failure, size mismatch, hash or frame failure, panic,
+dropped job, invalid completion or write failure MUST follow the existing
+ordered poison rules, wake waiters, and prevent acknowledgement at or beyond
+the failed ticket. An admitted `Preparing` entry cannot be silently removed
+or its ticket skipped after preparation fails. A later ready batch cannot skip
+an unfinished earlier one. An implementation MUST document
 its fail-stop assumption for a producer that neither completes nor fails and
 MUST ensure close, cancellation, and poisoning do not create an unbounded
 resource leak or admit an incorrectly durable prefix. This RFC does not require
@@ -363,6 +384,14 @@ the implementation plan MUST cover at least:
   and both Leader and Parallel writers.
 - Deterministic out-of-order digest/DATA completion, failure and panic,
   cancellation, backpressure, lost-wakeup, close and resource-retirement tests.
+  Pause a Parallel producer at the start of payload encoding and verify that
+  group formation can already see its admitted `Preparing` entry and any
+  admitted successors. Readiness must gate submission without hiding group
+  membership, and successors must not bypass an unfinished head. Exercise
+  capacity rejection before ticket assignment and encoding failure, size
+  mismatch, cancellation and dropped preparation after admission, including
+  close and poison waking group waiters. Verify preparation can finish within
+  its secured reservations.
   No acknowledged ticket may precede its data, digest, marker and successful
   sync. Test recovery of every acknowledged prefix after injected crashes at
   each boundary, including a complete marker with incomplete DATA.
@@ -374,9 +403,10 @@ the implementation plan MUST cover at least:
 - Predeclared, reproducible v7 Parallel versus v8 Parallel comparisons, with
   v8 Leader as a control and v4 Parallel as context. Cover point writes and
   batch sizes including 64, with 1, 2, 4, 8 and 16 writers on ext4 SSD; report
-  throughput, p50/p99, process CPU, hash/framing time, sync and group counts,
-  and recovery time. Record exact binaries, configuration, samples, storage
-  stalls and memory/backpressure. Compare matching workloads and report both
+  throughput, p50/p99, process CPU, hash/framing time, sync and group/solo
+  counts, buffers per group, and recovery time. Record exact binaries,
+  configuration, samples, storage stalls and memory/backpressure. Compare
+  matching workloads and report both
   best eligible and the sample distribution; a best score is not a substitute
   for repeated evidence. Check normal read/write and replay workloads too.
 - CPU attribution that distinguishes changing the hash primitive from moving
