@@ -5190,7 +5190,7 @@ impl KvEngine {
                     seal.header.segment_id.0 == segment_id,
                     "sealed v8 PITR source filename does not match its segment ID"
                 );
-                anyhow::bail!("v8 PITR source WAL verification is not implemented")
+                anyhow::bail!("v8 PITR source manifest verification is not implemented")
             }
 
             let seal = crate::pitr::seal::V5Seal::decode(&bytes)?;

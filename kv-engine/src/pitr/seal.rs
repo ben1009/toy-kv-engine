@@ -32,6 +32,13 @@ use crate::{
             select_recovery_candidate_with_limits,
         },
     },
+    wal::v8::{
+        codec::{WAL_V8_FRAME_LEN, WalV8Header},
+        recovery::{
+            discover_frontier_candidates as discover_v8_frontier_candidates,
+            select_active_candidate_for_seal,
+        },
+    },
 };
 
 #[cfg(test)]
@@ -1439,6 +1446,170 @@ impl V8Seal {
 
         Ok(())
     }
+
+    /// Verify the complete frozen WAL image against this sidecar.
+    pub(crate) fn verify_wal(&self, wal: &[u8]) -> Result<()> {
+        let mut reader = std::io::Cursor::new(wal);
+        self.verify_wal_from_reader(&mut reader, u64::try_from(wal.len())?)
+    }
+
+    /// Verify a frozen WAL image without allocating a second copy of it.
+    pub(crate) fn verify_wal_from_reader<R: Read + Seek>(
+        &self,
+        reader: &mut R,
+        wal_len: u64,
+    ) -> Result<()> {
+        self.validate()?;
+        ensure!(
+            wal_len == self.boundary.sealed_end,
+            "v8 PITR WAL length differs from its immutable seal"
+        );
+        let (verified, encoded) = build_v8_seal_from_reader(
+            reader,
+            wal_len,
+            self.boundary.active,
+            self.header.predecessor,
+        )?;
+        ensure!(
+            verified == *self && encoded == self.encode()?,
+            "v8 PITR WAL does not match its immutable seal"
+        );
+
+        Ok(())
+    }
+}
+
+/// Build a strict v8 seal from the exact frozen image prefix. Unlike Active
+/// recovery, sealed verification requires the terminal candidate itself to
+/// pass and to match the immutable logical boundary; it never falls back.
+pub(crate) fn build_v8_seal_from_reader<R: Read + Seek>(
+    reader: &mut R,
+    sealed_end: u64,
+    active: ActiveBoundary,
+    predecessor: ChainAnchor,
+) -> Result<(V8Seal, Vec<u8>)> {
+    active.validate()?;
+    let header_len = crate::wal::v8::WAL_V8_HEADER_LEN as u64;
+    let frame_len = WAL_V8_FRAME_LEN as u64;
+    ensure!(
+        sealed_end
+            == active
+                .durable_end
+                .checked_add(frame_len)
+                .context("v8 sealed end overflows")?,
+        "v8 PITR image does not end immediately after its terminal FRONTIER"
+    );
+    ensure!(
+        sealed_end <= crate::wal::MAX_WAL_FILE_SIZE,
+        "v8 PITR sealed image exceeds the WAL format limit"
+    );
+
+    let mut header_bytes = [0; crate::wal::v8::WAL_V8_HEADER_LEN];
+    reader
+        .seek(SeekFrom::Start(0))
+        .context("seek v8 PITR WAL to its immutable header")?;
+    reader
+        .read_exact(&mut header_bytes)
+        .context("read v8 PITR WAL immutable header")?;
+    let header = WalV8Header::decode(&header_bytes)?;
+    ensure!(
+        header.encode()?.as_slice() == header_bytes,
+        "v8 PITR WAL header is not canonical"
+    );
+    ensure!(
+        header.predecessor == predecessor,
+        "v8 PITR WAL predecessor differs from the manifest"
+    );
+    let physical_header_digest = header.physical_digest()?;
+    let initial_prefix_digest = header.initial_prefix_digest()?;
+    let terminal_offset = sealed_end
+        .checked_sub(frame_len)
+        .context("v8 terminal frontier offset underflows")?;
+    ensure!(
+        terminal_offset == active.durable_end && terminal_offset >= header_len,
+        "v8 terminal FRONTIER offset differs from its immutable boundary"
+    );
+
+    let discovery = discover_v8_frontier_candidates(
+        reader,
+        sealed_end,
+        &physical_header_digest,
+        &initial_prefix_digest,
+    )?;
+    let terminal = discovery
+        .candidates
+        .iter()
+        .find(|candidate| candidate.frame_offset == terminal_offset)
+        .context("v8 PITR WAL has no canonical terminal FRONTIER")?;
+    let selection = select_active_candidate_for_seal(
+        reader,
+        sealed_end,
+        &discovery,
+        &[active],
+        predecessor,
+        crate::pitr::LIVE_WAL_V5_LIMITS,
+    )?;
+    ensure!(
+        selection.header == header
+            && selection.candidate.frame_offset == terminal_offset
+            && selection.candidate.frame_digest == terminal.frame_digest
+            && selection.active_boundary == active
+            && u64::try_from(selection.tickets.len())? == active.ticket_end,
+        "v8 PITR terminal FRONTIER differs from its immutable boundary"
+    );
+
+    let mut entries = Vec::new();
+    entries
+        .try_reserve_exact(selection.tickets.len())
+        .context("reserve v8 PITR seal index")?;
+    for (ticket, metadata) in selection.tickets.iter().enumerate() {
+        entries.push(V8SealEntry {
+            ticket: u64::try_from(ticket)?,
+            first_data_offset: metadata.first_data_offset,
+            commit_ts: metadata.commit_ts,
+            recorded_at: metadata.recorded_at,
+        });
+    }
+
+    let seal = V8Seal {
+        header,
+        boundary: ImmutableBoundary {
+            active,
+            sealed_end,
+            terminal_frontier_digest: terminal.frame_digest,
+            wal_digest: digest_v8_prefix(reader, sealed_end)?,
+        },
+        entries,
+    };
+    seal.validate()?;
+    let bytes = seal.encode()?;
+    ensure!(
+        V8Seal::decode(&bytes, sealed_end)? == seal,
+        "v8 PITR seal codec round-trip mismatch"
+    );
+
+    Ok((seal, bytes))
+}
+
+fn digest_v8_prefix<R: Read + Seek>(reader: &mut R, sealed_end: u64) -> Result<[u8; 32]> {
+    const HASH_BUFFER_BYTES: usize = 64 * 1024;
+
+    reader
+        .seek(SeekFrom::Start(0))
+        .context("seek v8 PITR WAL to hash its sealed prefix")?;
+    let mut remaining = sealed_end;
+    let mut buffer = [0_u8; HASH_BUFFER_BYTES];
+    let mut hasher = Sha256::new();
+    while remaining > 0 {
+        let read_len = usize::try_from(remaining.min(HASH_BUFFER_BYTES as u64))?;
+        reader
+            .read_exact(&mut buffer[..read_len])
+            .context("read v8 PITR WAL while hashing its sealed prefix")?;
+        hasher.update(&buffer[..read_len]);
+        remaining -= u64::try_from(read_len)?;
+    }
+
+    Ok(hasher.finalize().into())
 }
 
 /// Build the v7 seal only from a complete image whose final frame is the
@@ -2024,6 +2195,149 @@ mod tests {
             boundary,
             entries: Vec::new(),
         })
+    }
+
+    fn v8_one_batch_fixture() -> Result<(Vec<u8>, V8Seal)> {
+        use crate::wal::v8::{
+            codec::{
+                WAL_V8_FRAME_LEN, WalV8DataFragmentHeader, WalV8Frontier, WalV8LogicalBatchHeader,
+                decode_frame_structural, encode_data_frame, encode_frontier_successor,
+                encode_generation_zero_frontier, frame_record_digest,
+            },
+            digest::{WalV8EntryHasher, advance_prefix, batch_digest},
+        };
+
+        let archive_epoch_id = crate::pitr::ArchiveEpochId([2; 16]);
+        let header = crate::wal::v8::codec::WalV8Header {
+            timeline_id: crate::pitr::TimelineId([1; 16]),
+            archive_epoch_id,
+            segment_id: crate::pitr::SegmentId(3),
+            predecessor: ChainAnchor::Genesis { archive_epoch_id },
+            incarnation: [4; 16],
+        };
+        let header_bytes = header.encode()?;
+        let physical_header_digest = header.physical_digest()?;
+        let initial_prefix_digest = header.initial_prefix_digest()?;
+        let generation_zero =
+            encode_generation_zero_frontier(physical_header_digest, initial_prefix_digest)?;
+        let generation_zero_frame = decode_frame_structural(
+            &generation_zero,
+            crate::wal::v8::WAL_V8_HEADER_LEN as u64,
+            &physical_header_digest,
+            &initial_prefix_digest,
+        )?;
+        let generation_zero_frontier = WalV8Frontier::decode_body(&generation_zero_frame.body)?;
+        let generation_zero_digest = frame_record_digest(&generation_zero)?;
+
+        let batch = WalBatch {
+            commit_ts: 1,
+            recorded_at: RecordedAt {
+                secs: -2,
+                nanos: 500_000_000,
+            },
+            entries: vec![crate::pitr::WalEntry::Put {
+                key: b"k".to_vec(),
+                value: b"v".to_vec(),
+            }],
+        };
+        let limits = crate::pitr::LIVE_WAL_V5_LIMITS;
+        let stream = crate::pitr::CanonicalWalEntryStream::new(&batch, limits)?;
+        let mut entry_stream = vec![0; stream.data_len()];
+        let (entry_len, entry_crc) = stream.encode_into(&mut entry_stream)?;
+        ensure!(
+            entry_len == entry_stream.len(),
+            "v8 fixture entry length mismatch"
+        );
+        let logical_header = WalV8LogicalBatchHeader {
+            segment_ticket: 0,
+            commit_ts: batch.commit_ts,
+            recorded_at_secs: batch.recorded_at.secs,
+            recorded_at_nanos: batch.recorded_at.nanos,
+            entry_count: stream.entry_count(),
+        }
+        .encode_with_data_crc(entry_len, entry_crc, limits)?;
+        let mut logical_batch = Vec::with_capacity(logical_header.len() + entry_stream.len());
+        logical_batch.extend_from_slice(&logical_header);
+        logical_batch.extend_from_slice(&entry_stream);
+
+        let mut entry_hasher = WalV8EntryHasher::new(u64::try_from(entry_stream.len())?);
+        entry_hasher.update(&entry_stream)?;
+        let entry_digest = entry_hasher.finish()?;
+        let batch_digest = batch_digest(&logical_header, &entry_digest);
+        let prefix_digest = advance_prefix(
+            &initial_prefix_digest,
+            0,
+            u64::try_from(logical_batch.len())?,
+            &batch_digest,
+        );
+
+        let first_data_offset = (crate::wal::v8::WAL_V8_HEADER_LEN + WAL_V8_FRAME_LEN) as u64;
+        let fragment = WalV8DataFragmentHeader {
+            segment_ticket: 0,
+            fragment_index: 0,
+            fragment_count: 1,
+            batch_bytes: u64::try_from(logical_batch.len())?,
+        };
+        let data_body = fragment.encode_body(&logical_batch)?;
+        let data_frame = encode_data_frame(
+            physical_header_digest,
+            initial_prefix_digest,
+            first_data_offset,
+            &data_body,
+        )?;
+        let terminal_offset = first_data_offset + WAL_V8_FRAME_LEN as u64;
+        let terminal_frontier = WalV8Frontier {
+            generation: 1,
+            ticket_end: 1,
+            durable_end: terminal_offset,
+            last_commit_ts: batch.commit_ts,
+            prefix_digest,
+            previous_frontier_offset: crate::wal::v8::WAL_V8_HEADER_LEN as u64,
+            previous_frontier_digest: generation_zero_digest,
+        };
+        let terminal_frame = encode_frontier_successor(
+            terminal_frontier,
+            generation_zero_frontier,
+            crate::wal::v8::WAL_V8_HEADER_LEN as u64,
+            &generation_zero_digest,
+            terminal_offset,
+            physical_header_digest,
+            initial_prefix_digest,
+        )?;
+
+        let mut wal = Vec::new();
+        wal.extend_from_slice(&header_bytes);
+        wal.extend_from_slice(&generation_zero);
+        wal.extend_from_slice(&data_frame);
+        wal.extend_from_slice(&terminal_frame);
+        let sealed_end = u64::try_from(wal.len())?;
+        let seal = V8Seal {
+            header,
+            boundary: ImmutableBoundary {
+                active: ActiveBoundary {
+                    timeline_id: header.timeline_id.0,
+                    archive_epoch_id: header.archive_epoch_id.0,
+                    segment_id: header.segment_id.0,
+                    incarnation: header.incarnation,
+                    ticket_end: 1,
+                    durable_end: terminal_offset,
+                    last_commit_ts: batch.commit_ts,
+                    prefix_digest,
+                },
+                sealed_end,
+                terminal_frontier_digest: frame_record_digest(&terminal_frame)?,
+                wal_digest: Sha256::digest(&wal).into(),
+            },
+            entries: vec![V8SealEntry {
+                ticket: 0,
+                first_data_offset,
+                commit_ts: batch.commit_ts,
+                recorded_at: batch.recorded_at,
+            }],
+        };
+        seal.validate()?;
+
+        Ok((wal, seal))
     }
 
     #[cfg(target_os = "linux")]
@@ -2921,6 +3235,36 @@ mod tests {
             .to_string()
             .contains("exceeds its format size limit")
         );
+        Ok(())
+    }
+
+    #[test]
+    fn v8_frozen_wal_rebuilds_and_strictly_verifies_its_seal() -> Result<()> {
+        let (wal, seal) = v8_one_batch_fixture()?;
+        seal.verify_wal(&wal)?;
+
+        let mut reader = Cursor::new(wal.as_slice());
+        let (rebuilt, rebuilt_bytes) = build_v8_seal_from_reader(
+            &mut reader,
+            seal.boundary.sealed_end,
+            seal.boundary.active,
+            seal.header.predecessor,
+        )?;
+        assert_eq!(rebuilt, seal);
+        assert_eq!(rebuilt_bytes, seal.encode()?);
+
+        let mut corrupt_data = wal.clone();
+        let data_payload_offset = crate::wal::v8::WAL_V8_HEADER_LEN
+            + crate::wal::v8::codec::WAL_V8_FRAME_LEN
+            + crate::wal::v8::codec::WAL_V8_FRAME_HEADER_LEN
+            + crate::wal::v8::codec::WAL_V8_DATA_FRAGMENT_HEADER_LEN;
+        corrupt_data[data_payload_offset] ^= 1;
+        assert!(seal.verify_wal(&corrupt_data).is_err());
+
+        let mut corrupt_terminal = wal;
+        let terminal_offset = usize::try_from(seal.boundary.active.durable_end)?;
+        corrupt_terminal[terminal_offset + 80] ^= 1;
+        assert!(seal.verify_wal(&corrupt_terminal).is_err());
         Ok(())
     }
 }

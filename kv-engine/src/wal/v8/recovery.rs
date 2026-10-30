@@ -52,6 +52,7 @@ struct PrefixCheckpoint {
     data_start: u64,
     data_end: u64,
     last_commit_ts: u64,
+    recorded_at: Option<RecordedAt>,
     prefix_digest: WalV8Digest,
 }
 
@@ -76,6 +77,22 @@ pub(crate) struct WalV8RecoverySelection {
     pub(crate) last_frontier: WalV8Frontier,
     pub(crate) last_frontier_offset: u64,
     pub(crate) last_frontier_digest: [u8; 32],
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct WalV8SealTicket {
+    pub(crate) first_data_offset: u64,
+    pub(crate) commit_ts: u64,
+    pub(crate) recorded_at: RecordedAt,
+}
+
+/// Strictly verified terminal boundary plus compact metadata for seal indexing.
+/// It intentionally does not retain decoded key/value batches.
+pub(crate) struct WalV8SealSelection {
+    pub(crate) header: WalV8Header,
+    pub(crate) candidate: WalV8FrontierCandidate,
+    pub(crate) active_boundary: ActiveBoundary,
+    pub(crate) tickets: Vec<WalV8SealTicket>,
 }
 
 /// Find structurally valid FRONTIER frames by scanning every aligned slot from
@@ -191,6 +208,53 @@ pub(crate) fn select_active_candidate<R: Read + Seek>(
     expected_predecessor: crate::pitr::ChainAnchor,
     limits: WalV5Limits,
 ) -> Result<WalV8RecoverySelection> {
+    let (selection, _) = select_active_candidate_inner(
+        reader,
+        file_len,
+        discovery,
+        anchors,
+        expected_predecessor,
+        limits,
+        false,
+    )?;
+    Ok(selection)
+}
+
+/// Verify a frozen v8 boundary and return only its compact ticket index.
+pub(crate) fn select_active_candidate_for_seal<R: Read + Seek>(
+    reader: &mut R,
+    file_len: u64,
+    discovery: &WalV8FrontierDiscovery,
+    anchors: &[ActiveBoundary],
+    expected_predecessor: crate::pitr::ChainAnchor,
+    limits: WalV5Limits,
+) -> Result<WalV8SealSelection> {
+    let (selection, tickets) = select_active_candidate_inner(
+        reader,
+        file_len,
+        discovery,
+        anchors,
+        expected_predecessor,
+        limits,
+        true,
+    )?;
+    Ok(WalV8SealSelection {
+        header: selection.header,
+        candidate: selection.candidate,
+        active_boundary: selection.active_boundary,
+        tickets,
+    })
+}
+
+fn select_active_candidate_inner<R: Read + Seek>(
+    reader: &mut R,
+    file_len: u64,
+    discovery: &WalV8FrontierDiscovery,
+    anchors: &[ActiveBoundary],
+    expected_predecessor: crate::pitr::ChainAnchor,
+    limits: WalV5Limits,
+    collect_seal_index: bool,
+) -> Result<(WalV8RecoverySelection, Vec<WalV8SealTicket>)> {
     ensure!(
         !anchors.is_empty(),
         "v8 Active recovery requires a durable anchor"
@@ -275,6 +339,7 @@ pub(crate) fn select_active_candidate<R: Read + Seek>(
         data_start: HEADER_LEN_U64,
         data_end: HEADER_LEN_U64,
         last_commit_ts: 0,
+        recorded_at: None,
         prefix_digest: initial_prefix_digest,
     });
     let mut frontiers = Vec::new();
@@ -485,6 +550,7 @@ pub(crate) fn select_active_candidate<R: Read + Seek>(
                     data_start: frame_offset,
                     data_end: batch_end,
                     last_commit_ts: batch.commit_ts,
+                    recorded_at: Some(batch.recorded_at),
                     prefix_digest,
                 });
                 last_recorded_at = Some(batch.recorded_at);
@@ -585,15 +651,34 @@ pub(crate) fn select_active_candidate<R: Read + Seek>(
         ticket_end < checkpoints.len(),
         "v8 candidate ticket end exceeds verified DATA"
     );
-    let batches = decode_selected_batches(
-        reader,
-        &checkpoints,
-        ticket_end,
-        candidate.frontier,
-        &physical_header_digest,
-        &initial_prefix_digest,
-        limits,
-    )?;
+    let mut seal_tickets = Vec::new();
+    if collect_seal_index {
+        seal_tickets
+            .try_reserve_exact(ticket_end)
+            .context("reserve v8 seal ticket index")?;
+        for checkpoint in checkpoints.iter().skip(1).take(ticket_end) {
+            seal_tickets.push(WalV8SealTicket {
+                first_data_offset: checkpoint.data_start,
+                commit_ts: checkpoint.last_commit_ts,
+                recorded_at: checkpoint
+                    .recorded_at
+                    .context("selected v8 batch has no recorded time")?,
+            });
+        }
+    }
+    let batches = if collect_seal_index {
+        Vec::new()
+    } else {
+        decode_selected_batches(
+            reader,
+            &checkpoints,
+            ticket_end,
+            candidate.frontier,
+            &physical_header_digest,
+            &initial_prefix_digest,
+            limits,
+        )?
+    };
     let active_boundary = ActiveBoundary {
         timeline_id: header.timeline_id.0,
         archive_epoch_id: header.archive_epoch_id.0,
@@ -611,19 +696,22 @@ pub(crate) fn select_active_candidate<R: Read + Seek>(
     } else {
         retained_frontier(&frontiers, candidate.frontier.durable_end)?
     };
-    Ok(WalV8RecoverySelection {
-        header,
-        header_bytes,
-        physical_header_digest,
-        initial_prefix_digest,
-        candidate,
-        active_boundary,
-        hard_anchors,
-        batches,
-        last_frontier: predecessor.frontier,
-        last_frontier_offset: predecessor.frame_offset,
-        last_frontier_digest: predecessor.frame_digest,
-    })
+    Ok((
+        WalV8RecoverySelection {
+            header,
+            header_bytes,
+            physical_header_digest,
+            initial_prefix_digest,
+            candidate,
+            active_boundary,
+            hard_anchors,
+            batches,
+            last_frontier: predecessor.frontier,
+            last_frontier_offset: predecessor.frame_offset,
+            last_frontier_digest: predecessor.frame_digest,
+        },
+        seal_tickets,
+    ))
 }
 
 /// Decode only batches covered by the selected frontier. The verification scan

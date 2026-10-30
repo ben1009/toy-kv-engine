@@ -741,7 +741,7 @@ impl PitrArchiveCatalog {
                 verify_v7_archive_objects(metadata, wal, seal)?;
             }
             crate::wal::format::WAL_FORMAT_VERSION_V8 => {
-                anyhow::bail!("v8 archive seal verification is not implemented");
+                verify_v8_archive_objects(metadata, wal, seal)?;
             }
             _ => {}
         }
@@ -851,6 +851,60 @@ pub(crate) fn verify_v7_archive_objects(
     seal.verify_wal(wal)?;
 
     Ok(())
+}
+
+pub(crate) fn verify_v8_archive_objects(
+    metadata: &SegmentMetadata,
+    wal: &[u8],
+    seal_bytes: &[u8],
+) -> anyhow::Result<()> {
+    let seal = decode_v8_archive_seal(metadata, seal_bytes)?;
+    seal.verify_wal(wal)?;
+
+    Ok(())
+}
+
+/// Decode and bind a v8 seal sidecar to its catalog descriptor.
+///
+/// Archive preparation additionally verifies the exact frozen WAL image before
+/// publishing or accepting the object pair.
+pub(crate) fn decode_v8_archive_seal(
+    metadata: &SegmentMetadata,
+    seal_bytes: &[u8],
+) -> anyhow::Result<crate::pitr::seal::V8Seal> {
+    metadata.validate()?;
+    anyhow::ensure!(
+        metadata.wal_format_version == crate::wal::format::WAL_FORMAT_VERSION_V8,
+        "segment is not a v8 WAL"
+    );
+    anyhow::ensure!(
+        Sha256::digest(seal_bytes).as_slice() == metadata.seal_digest,
+        "v8 archive seal digest mismatch"
+    );
+    let boundary = metadata
+        .immutable_boundary
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("v8 archive descriptor has no immutable boundary"))?;
+    let seal = crate::pitr::seal::V8Seal::decode(seal_bytes, metadata.wal_bytes)?;
+    anyhow::ensure!(
+        seal.boundary == *boundary,
+        "v8 archive seal boundary mismatch"
+    );
+    anyhow::ensure!(
+        seal.header.timeline_id == metadata.key.timeline_id
+            && seal.header.archive_epoch_id == metadata.key.archive_epoch_id
+            && seal.header.segment_id == metadata.key.segment_id
+            && seal.header.predecessor == metadata.predecessor,
+        "v8 archive seal identity mismatch"
+    );
+    anyhow::ensure!(
+        seal.entries.len() as u64 == metadata.batch_count
+            && seal.entries.first().map(|entry| entry.commit_ts) == metadata.first_commit_ts
+            && seal.entries.last().map(|entry| entry.commit_ts) == metadata.last_commit_ts,
+        "v8 archive seal commit range mismatch"
+    );
+
+    Ok(seal)
 }
 
 /// Validate a frozen v7 archive pair and decode its ticket-ordered batches.
@@ -980,32 +1034,62 @@ mod tests {
         }
     }
 
-    fn unverified_v8_metadata(wal: &[u8], seal: &[u8]) -> SegmentMetadata {
+    fn v8_archive_objects() -> (SegmentMetadata, Vec<u8>, Vec<u8>) {
+        use crate::wal::v8::codec::{
+            WalV8Header, encode_generation_zero_frontier, frame_record_digest,
+        };
+
         let key = crate::pitr::catalog::SegmentKey {
             repository_id: [1; 16],
             timeline_id: TimelineId([2; 16]),
             archive_epoch_id: ArchiveEpochId([3; 16]),
             segment_id: SegmentId(8),
         };
-        let wal_digest: [u8; 32] = Sha256::digest(wal).into();
-        let seal_digest: [u8; 32] = Sha256::digest(seal).into();
-        let boundary = crate::pitr::manifest::ImmutableBoundary {
-            active: crate::pitr::manifest::ActiveBoundary {
-                timeline_id: key.timeline_id.0,
-                archive_epoch_id: key.archive_epoch_id.0,
-                segment_id: key.segment_id.0,
-                incarnation: [5; 16],
-                ticket_end: 1,
-                durable_end: 3 * 4096,
-                last_commit_ts: 1,
-                prefix_digest: [6; 32],
-            },
-            sealed_end: wal.len() as u64,
-            terminal_frontier_digest: [7; 32],
-            wal_digest,
+        let predecessor = ChainAnchor::Genesis {
+            archive_epoch_id: key.archive_epoch_id,
         };
+        let header = WalV8Header {
+            timeline_id: key.timeline_id,
+            archive_epoch_id: key.archive_epoch_id,
+            segment_id: key.segment_id,
+            predecessor,
+            incarnation: [5; 16],
+        };
+        let header_bytes = header.encode().unwrap();
+        let physical_header_digest = header.physical_digest().unwrap();
+        let prefix_digest = header.initial_prefix_digest().unwrap();
+        let generation_zero =
+            encode_generation_zero_frontier(physical_header_digest, prefix_digest).unwrap();
+        let mut wal = header_bytes.to_vec();
+        wal.extend_from_slice(&generation_zero);
+        let wal_digest = Sha256::digest(&wal).into();
+        let seal = crate::pitr::seal::V8Seal {
+            header,
+            boundary: crate::pitr::manifest::ImmutableBoundary {
+                active: crate::pitr::manifest::ActiveBoundary {
+                    timeline_id: key.timeline_id.0,
+                    archive_epoch_id: key.archive_epoch_id.0,
+                    segment_id: key.segment_id.0,
+                    incarnation: header.incarnation,
+                    ticket_end: 0,
+                    durable_end: crate::wal::v8::WAL_V8_HEADER_LEN as u64,
+                    last_commit_ts: 0,
+                    prefix_digest,
+                },
+                sealed_end: wal.len() as u64,
+                terminal_frontier_digest: frame_record_digest(&generation_zero).unwrap(),
+                wal_digest,
+            },
+            entries: Vec::new(),
+        };
+        let seal_bytes = seal.encode().unwrap();
+        let seal_digest = Sha256::digest(&seal_bytes).into();
+        let mut source_identity = Sha256::new();
+        source_identity.update(wal_digest);
+        source_identity.update(seal_digest);
+        let boundary = crate::pitr::manifest::ImmutableBoundary { ..seal.boundary };
 
-        SegmentMetadata {
+        let metadata = SegmentMetadata {
             key,
             wal_format_version: crate::wal::format::WAL_FORMAT_VERSION_V8,
             seal_format_version: 3,
@@ -1015,18 +1099,17 @@ mod tests {
                 wal_digest,
                 seal_digest,
             },
-            predecessor: ChainAnchor::Genesis {
-                archive_epoch_id: key.archive_epoch_id,
-            },
-            first_commit_ts: Some(1),
-            last_commit_ts: Some(1),
-            batch_count: 1,
-            logical_bytes: 64,
+            predecessor,
+            first_commit_ts: None,
+            last_commit_ts: None,
+            batch_count: 0,
+            logical_bytes: wal.len() as u64,
             wal_bytes: wal.len() as u64,
             wal_digest,
             seal_digest,
-            source_identity: [8; 32],
-        }
+            source_identity: source_identity.finalize().into(),
+        };
+        (metadata, wal, seal_bytes)
     }
 
     fn v7_archive_objects() -> (SegmentMetadata, Vec<u8>, Vec<u8>) {
@@ -1263,21 +1346,43 @@ mod tests {
     }
 
     #[test]
-    fn v8_uses_whole_image_digest_but_archive_publication_stays_fail_closed() {
-        let wal = vec![0; 4 * 4096];
-        let seal = b"unverified v8 seal";
-        let metadata = unverified_v8_metadata(&wal, seal);
+    fn prepares_v8_objects_after_verifying_the_seal_against_the_frozen_image() {
+        let (metadata, wal, seal) = v8_archive_objects();
 
         let digest_policy =
             SourceObjectDigest::for_wal_format(crate::wal::format::WAL_FORMAT_VERSION_V8).unwrap();
         assert_eq!(digest_policy, SourceObjectDigest::WholeObject);
         assert_eq!(digest_policy.digest(&wal).unwrap(), metadata.wal_digest);
+        let prepared = PitrArchiveCatalog::default()
+            .prepare_objects(&metadata, &wal, &seal)
+            .unwrap();
+        assert_eq!(prepared.wal_digest_policy, SourceObjectDigest::WholeObject);
+
+        let mut corrupt_wal = wal.clone();
+        corrupt_wal[crate::wal::v8::WAL_V8_HEADER_LEN + 80] ^= 1;
+        let mut corrupt_seal =
+            crate::pitr::seal::V8Seal::decode(&seal, metadata.wal_bytes).unwrap();
+        corrupt_seal.boundary.terminal_frontier_digest =
+            Sha256::digest(&corrupt_wal[crate::wal::v8::WAL_V8_HEADER_LEN..]).into();
+        corrupt_seal.boundary.wal_digest = Sha256::digest(&corrupt_wal).into();
+        let corrupt_boundary = corrupt_seal.boundary;
+        let corrupt_seal = corrupt_seal.encode().unwrap();
+        let mut corrupt_metadata = metadata;
+        let wal_digest: [u8; 32] = Sha256::digest(&corrupt_wal).into();
+        let seal_digest: [u8; 32] = Sha256::digest(&corrupt_seal).into();
+        let mut source_identity = Sha256::new();
+        source_identity.update(wal_digest);
+        source_identity.update(seal_digest);
+        corrupt_metadata.wal_digest = wal_digest;
+        corrupt_metadata.anchor.wal_digest = wal_digest;
+        corrupt_metadata.seal_digest = seal_digest;
+        corrupt_metadata.anchor.seal_digest = seal_digest;
+        corrupt_metadata.immutable_boundary = Some(Box::new(corrupt_boundary));
+        corrupt_metadata.source_identity = source_identity.finalize().into();
         assert!(
             PitrArchiveCatalog::default()
-                .prepare_objects(&metadata, &wal, seal)
-                .is_err_and(|error| error
-                    .to_string()
-                    .contains("v8 archive seal verification is not implemented"))
+                .prepare_objects(&corrupt_metadata, &corrupt_wal, &corrupt_seal)
+                .is_err()
         );
     }
 
