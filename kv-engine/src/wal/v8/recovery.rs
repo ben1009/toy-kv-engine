@@ -105,7 +105,6 @@ enum SelectionPayload {
     RecoveryIndex,
     ValidationOnly,
     SealIndex,
-    SealedReplay,
 }
 
 /// Find structurally valid FRONTIER frames by scanning every aligned slot from
@@ -303,9 +302,9 @@ pub(crate) fn select_active_candidate_for_seal<R: Read + Seek>(
     })
 }
 
-/// Strictly select a frozen v8 boundary and return replay batches plus the
-/// compact seal index from the same validation pass.
-pub(crate) fn select_sealed_candidate_for_replay<R: Read + Seek>(
+/// Strictly select a frozen v8 boundary and return only its compact replay
+/// index. Batch decoding happens later, one ticket at a time.
+pub(crate) fn select_sealed_candidate_for_index<R: Read + Seek>(
     reader: &mut R,
     file_len: u64,
     discovery: &WalV8FrontierDiscovery,
@@ -320,7 +319,7 @@ pub(crate) fn select_sealed_candidate_for_replay<R: Read + Seek>(
         anchors,
         expected_predecessor,
         limits,
-        SelectionPayload::SealedReplay,
+        SelectionPayload::SealIndex,
     )
 }
 
@@ -732,9 +731,7 @@ fn select_active_candidate_inner<R: Read + Seek>(
     let mut seal_tickets = Vec::new();
     if matches!(
         payload,
-        SelectionPayload::RecoveryIndex
-            | SelectionPayload::SealIndex
-            | SelectionPayload::SealedReplay
+        SelectionPayload::RecoveryIndex | SelectionPayload::SealIndex
     ) {
         seal_tickets
             .try_reserve_exact(ticket_end)
@@ -750,10 +747,7 @@ fn select_active_candidate_inner<R: Read + Seek>(
             });
         }
     }
-    let batches = if matches!(
-        payload,
-        SelectionPayload::RecoveryBatches | SelectionPayload::SealedReplay
-    ) {
+    let batches = if matches!(payload, SelectionPayload::RecoveryBatches) {
         decode_selected_batches(
             reader,
             &checkpoints,
@@ -878,7 +872,7 @@ pub(crate) fn replay_selected_batches<R: Read + Seek>(
     selection: &WalV8RecoverySelection,
     tickets: &[WalV8SealTicket],
     limits: WalV5Limits,
-    mut apply: impl FnMut(&WalBatch) -> Result<()>,
+    mut apply: impl FnMut(WalBatch) -> Result<()>,
 ) -> Result<()> {
     ensure!(
         u64::try_from(tickets.len())? == selection.active_boundary.ticket_end,
@@ -918,7 +912,7 @@ pub(crate) fn replay_selected_batches<R: Read + Seek>(
             u64::try_from(logical_bytes.len())?,
             &batch_digest,
         );
-        apply(&batch)?;
+        apply(batch)?;
     }
     ensure!(
         prefix_digest == selection.active_boundary.prefix_digest,
@@ -1574,6 +1568,44 @@ mod tests {
         let mut bad_anchor = anchor;
         bad_anchor.prefix_digest[0] ^= 1;
         assert!(select(&image.bytes, &image.physical_header_digest, &[bad_anchor],).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn sealed_candidate_keeps_compact_index_and_streams_batches() -> Result<()> {
+        let image = two_batch_image()?;
+        let boundary = active_boundary(image.last_frontier);
+        let discovered = discovery(&image.bytes, &image.physical_header_digest)?;
+        let mut reader = Cursor::new(image.bytes.clone());
+        let (selection, tickets) = select_sealed_candidate_for_index(
+            &mut reader,
+            u64::try_from(image.bytes.len())?,
+            &discovered,
+            &[boundary],
+            test_header().predecessor,
+            LIVE_WAL_V5_LIMITS,
+        )?;
+
+        assert!(selection.batches.is_empty());
+        assert_eq!(tickets.len(), 2);
+        let mut replayed = Vec::new();
+        replay_selected_batches(
+            &mut reader,
+            &selection,
+            &tickets,
+            LIVE_WAL_V5_LIMITS,
+            |batch| {
+                replayed.push(batch);
+                Ok(())
+            },
+        )?;
+        assert_eq!(
+            replayed
+                .iter()
+                .map(|batch| batch.commit_ts)
+                .collect::<Vec<_>>(),
+            [10, 20]
+        );
         Ok(())
     }
 

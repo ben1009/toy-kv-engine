@@ -134,9 +134,11 @@ remain unqualified, so v8 creation stays disabled.
    than retaining a second WAL-sized collection of decoded entries. Active v8
    strict Sealing recovery now verifies the immutable logical boundary, checks
    any existing v8 sidecar, and installs an exact fresh-inode copy of the
-   accepted physical image. High-level Active v8 Sealing recovery and
-   rotation/successor installation still fail closed; v8 creation and general
-   format-registry selection remain disabled.
+   accepted physical image. High-level startup can attach that recovered
+   image as a read-only memtable, keep commit admission fenced, and close
+   without advancing the immutable boundary. PITR resume and
+   rotation/successor installation still fail closed for Active v8 Sealing;
+   v8 creation and general format-registry selection remain disabled.
 5. **Persistence and transitions:** version persisted seal/manifest/backup
    digest references, validate v8 archive objects, support v5/v6/v7/v8 chain
    transitions and the old-reader compatibility gate above. Add capacity and

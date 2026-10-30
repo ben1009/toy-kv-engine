@@ -1594,11 +1594,14 @@ impl V8Seal {
         reader: &mut R,
         wal_len: u64,
         limits: WalV5Limits,
-        mut visit_batch: impl FnMut(WalBatch) -> Result<()>,
+        visit_batch: impl FnMut(WalBatch) -> Result<()>,
     ) -> Result<()> {
         use crate::wal::v8::{
             codec::WAL_V8_FRAME_LEN,
-            recovery::{discover_frontier_candidates, select_sealed_candidate_for_replay},
+            recovery::{
+                discover_frontier_candidates, replay_selected_batches,
+                select_sealed_candidate_for_index,
+            },
         };
 
         self.validate()?;
@@ -1628,7 +1631,7 @@ impl V8Seal {
             &physical_header_digest,
             &initial_prefix_digest,
         )?;
-        let (selection, tickets) = select_sealed_candidate_for_replay(
+        let (selection, tickets) = select_sealed_candidate_for_index(
             reader,
             wal_len,
             &discovery,
@@ -1647,8 +1650,7 @@ impl V8Seal {
                 && selection.candidate.frame_offset == terminal_offset
                 && selection.candidate.frame_digest == self.boundary.terminal_frontier_digest
                 && u64::try_from(tickets.len())? == self.boundary.active.ticket_end
-                && tickets.len() == self.entries.len()
-                && selection.batches.len() == tickets.len(),
+                && tickets.len() == self.entries.len(),
             "v8 PITR terminal FRONTIER differs from its immutable seal"
         );
 
@@ -1667,10 +1669,7 @@ impl V8Seal {
             "v8 PITR WAL digest differs from its immutable seal"
         );
 
-        for batch in selection.batches {
-            visit_batch(batch)?;
-        }
-        Ok(())
+        replay_selected_batches(reader, &selection, &tickets, limits, visit_batch)
     }
 
     /// Decode ticket-ordered replay batches from a strictly verified frozen

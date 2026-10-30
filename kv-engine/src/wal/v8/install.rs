@@ -737,7 +737,7 @@ pub(crate) fn replay_installed_active_batches(
     path: impl AsRef<Path>,
     installed: &WalV8InstalledRecovery,
     limits: WalV5Limits,
-    apply: impl FnMut(&crate::pitr::WalBatch) -> Result<()>,
+    mut apply: impl FnMut(&crate::pitr::WalBatch) -> Result<()>,
 ) -> Result<()> {
     let path = path.as_ref();
     let path_metadata = fs::symlink_metadata(path).context("inspect installed Active v8 WAL")?;
@@ -783,7 +783,7 @@ pub(crate) fn replay_installed_active_batches(
         &installed.selection,
         &installed.replay_tickets,
         limits,
-        apply,
+        |batch| apply(&batch),
     )
 }
 
