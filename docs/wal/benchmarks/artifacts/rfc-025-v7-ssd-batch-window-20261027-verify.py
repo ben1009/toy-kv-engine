@@ -1,0 +1,138 @@
+#!/usr/bin/env python3
+"""Reconstruct the batch-window trial and verify SSD records and decision."""
+import csv
+import hashlib
+import json
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[4]
+ART = Path(__file__).resolve().parent
+STEM = 'rfc-025-v7-ssd-batch-window-20261027'
+PROFILE_STEM = 'rfc-025-v7-ssd-sync-preparation-20261027'
+WORK = ROOT / 'target/wal-opt/20261027-v7-ssd-batch-window'
+RUNTIME = 'kv-engine/src/wal/parallel/runtime.rs'
+
+
+def sha(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def main():
+    plan = json.loads((ART / (STEM + '-plan.json')).read_text())
+    matrix = json.loads((ART / (STEM + '-matrix.json')).read_text())
+    manifest = list(csv.DictReader((ART / (STEM + '-source-sha256.tsv')).open(), delimiter='\t'))
+    assert len(manifest) == len({r['path'] for r in manifest}) == 128
+    scratch = WORK / 'verification-source'
+    assert not scratch.exists()
+    scratch.mkdir()
+    try:
+        for row in manifest:
+            path = scratch / row['path']
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(subprocess.check_output(['git', 'show', plan['source_base'] + ':' + row['path']], cwd=ROOT))
+        subprocess.run(['patch', '-p1', '-i', str(ART / (STEM + '-candidate.patch'))],
+                       cwd=scratch, check=True, capture_output=True)
+        for row in manifest:
+            assert sha(scratch / row['path']) == row['sha256'], row['path']
+    finally:
+        shutil.rmtree(scratch)
+    identity = json.loads((ART / (STEM + '-binaries.json')).read_text())
+    assert set(identity) == {'baseline', 'candidate'}
+    assert identity['baseline']['sha256'] == plan['baseline_sha256']
+    for item in identity.values():
+        assert sha(ROOT / item['path']) == item['sha256']
+    regenerated = subprocess.check_output([sys.executable, str(ART / (STEM + '-analyze.py'))])
+    assert regenerated == (ART / (STEM + '-summary.json')).read_bytes()
+    summary = json.loads(regenerated)
+    cells = [cell for cell in matrix['cells'] if cell in summary]
+    decision = json.loads((ART / (STEM + '-decision.json')).read_text())
+    assert set(decision['captured_cells']) == set(cells)
+    assert set(decision['cancelled_cells']) == set(matrix['cells']) - set(cells)
+    for cell in decision['cancelled_cells']:
+        assert not (ART / (STEM + '-' + cell + '.jsonl')).exists()
+    ids = {run for cell in cells for run in summary[cell]['run_ids']}
+    assert len(ids) == summary['status']['invocations']
+    peaks = json.loads((ART / (STEM + '-peaks.json')).read_text())
+    expected_peaks = {cell + '/' + part: value['per_arm'] for cell in cells for part, value in summary[cell]['comparisons'].items()}
+    assert peaks['cells'] == expected_peaks
+    profiles = json.loads((ART / (PROFILE_STEM + '-profiles.json')).read_text())
+    raw_profiles = [json.loads(line) for line in (ART / (PROFILE_STEM + '-profiles.jsonl')).read_bytes().splitlines()]
+    diagnostic_plan = json.loads((ART / (PROFILE_STEM + '-diagnostic-plan.json')).read_text())
+    assert len(profiles) == len(raw_profiles) == len(diagnostic_plan['captures']) == 3
+    for profile, record, cfg in zip(profiles, raw_profiles, diagnostic_plan['captures']):
+        assert profile['run_id'] == record['run_id'] and profile['run_id'] not in ids
+        ids.add(profile['run_id'])
+        assert profile['excluded_from_scoring'] and profile['binary']['sha256'] == plan['baseline_sha256']
+        assert profile['samples'] > 0 and profile['lost_samples'] == 0
+        assert record['params']['wal_format_version'] == cfg['format'] and record['result']['ops'] == cfg['num']
+        assert profile['audit']['returncode'] == 0 and not profile['audit']['sampling_errors']
+        assert not any(s['competing'] for s in [profile['audit']['before'], *profile['audit']['during'], profile['audit']['after']])
+        for name, digest in profile['files'].items():
+            assert sha(ROOT / name) == digest
+    env = json.loads((ART / (STEM + '-environment.json')).read_text())
+    for key, suffix in [('source_manifest_sha256', '-source-sha256.tsv'), ('patch_sha256', '-candidate.patch'),
+                        ('plan_sha256', '-plan.json'), ('matrix_sha256', '-matrix.json'), ('driver_sha256', '-run.py')]:
+        assert env[key] == sha(ART / (STEM + suffix))
+    checks = json.loads((ART / (STEM + '-checks.json')).read_text())
+    assert checks['outside_sandbox'] and checks['tests'] == 1971 and checks['focused_tests'] == 12
+    assert any(c['phase'] == 'final spelling' for c in checks['checks'])
+    for check in checks['checks']:
+        assert check['exit_code'] == 0 and sha(ROOT / check['log']) == check['log_sha256']
+    assert len(checks['prior_attempts']) == 2 and checks['prior_attempts'][1]['exit_code'] != 0
+    failure = checks['prior_attempts'][1]
+    assert sha(ROOT / failure['log']) == failure['log_sha256']
+    assert 'v5 value exceeds configured limit' in (ROOT / failure['log']).read_text()
+    assert decision['allocator_unchanged'] and decision['memtable_unchanged']
+    batch_gains = [c['median']['throughput'] >= 1.02 and c['median']['cpu'] <= 1 for name in ['ext4-batch8', 'confirmation-batch8'] for part, c in summary.get(name, {}).get('comparisons', {}).items() if part.endswith('/v7')]
+    all_pass = summary['status']['all_planned_cells_complete'] and summary['status']['captured_v7_cells_pass'] and len(batch_gains) == 2 and all(batch_gains)
+    assert decision['assessment_passed'] == all_pass
+    if decision['source_retained']:
+        assert all_pass
+        runtime_hash = next(row['sha256'] for row in manifest if row['path'] == RUNTIME)
+        assert sha(ROOT / RUNTIME) == runtime_hash
+        assert sha(ROOT / 'target/release/write-perf') == identity['candidate']['sha256']
+        source = subprocess.check_output(['git', 'show', decision['source_commit'] + ':' + RUNTIME], cwd=ROOT)
+        assert hashlib.sha256(source).hexdigest() == runtime_hash
+    else:
+        restoration = json.loads((ART / (STEM + '-restoration.json')).read_text())
+        original = subprocess.check_output(['git', 'show', plan['source_base'] + ':' + RUNTIME], cwd=ROOT)
+        assert hashlib.sha256(original).hexdigest() == restoration['runtime_sha256'] == sha(ROOT / RUNTIME)
+        assert restoration['canonical_sha256'] == plan['baseline_sha256'] == sha(ROOT / 'target/release/write-perf')
+        assert checks['restored_tests'] == 1969
+    for name in ['kv-engine/Cargo.toml', 'Cargo.lock', 'kv-engine/src/mem_table.rs', 'kv-engine/src/wal.rs']:
+        assert (ROOT / name).read_bytes() == subprocess.check_output(['git', 'show', plan['source_base'] + ':' + name], cwd=ROOT)
+    for cell in matrix['cells']:
+        assert not (WORK / (cell + '-scratch')).exists()
+    prior_stem = 'rfc-025-v7-ssd-two-chunk-lookahead-20261027'
+    prior = subprocess.check_output([sys.executable, str(ART / (prior_stem + '-verify.py'))])
+    assert prior == (ART / (prior_stem + '-verification.json')).read_bytes()
+    global_ids = set(ids)
+    global_records = summary['status']['records']
+    global_scored = summary['status']['scored_records']
+    for earlier_stem in [PROFILE_STEM, prior_stem]:
+        earlier = json.loads((ART / (earlier_stem + '-summary.json')).read_text())
+        earlier_ids = {run for value in earlier.values() if isinstance(value, dict) and 'run_ids' in value for run in value['run_ids']}
+        assert global_ids.isdisjoint(earlier_ids)
+        global_ids.update(earlier_ids)
+        global_records += earlier['status']['records']
+        global_scored += earlier['status']['scored_records']
+    assert len(global_ids) == global_records + 3
+    print(json.dumps(dict(source_base=plan['source_base'],reconstructed_inputs=128,verified_binaries=2,
+                          captured_cells=cells,cancelled_cells=decision['cancelled_cells'],
+                          records=summary['status']['records'],scored_records=summary['status']['scored_records'],
+                          warmup_records=summary['status']['records']-summary['status']['scored_records'],
+                          excluded_profiles=3,retained_unique_invocation_ids=len(ids),
+                          global_unique_invocations=len(global_ids),global_records=global_records,global_scored_records=global_scored,
+                          recognized_process_samples=sum(summary[c]['host_samples'] for c in cells),
+                          source_reconstructs=True,summary_regenerates=True,source_retained=decision['source_retained'],
+                          assessment_passed=all_pass,allocator_unchanged=True,memtable_unchanged=True,
+                          scratch_removed=True,checks_sha256=sha(ART/(STEM+'-checks.json')),
+                          decision_sha256=sha(ART/(STEM+'-decision.json')),
+                          prior_verification_sha256=sha(ART/(prior_stem+'-verification.json')),verifier_sha256=sha(Path(__file__))),indent=2))
+
+
+if __name__ == '__main__':
+    main()

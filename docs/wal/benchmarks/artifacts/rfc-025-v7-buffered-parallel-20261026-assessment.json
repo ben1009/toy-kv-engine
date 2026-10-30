@@ -1,0 +1,10 @@
+{
+  "adopted": false,
+  "ssd_gate_passed": false,
+  "ram_cancelled": true,
+  "confirmation_cancelled": true,
+  "candidate_source_inputs_verified": 128,
+  "reason": "Both SSD workloads fail throughput and p99 guards. Restore the retained direct-I/O source and executable.",
+  "qualification_status": "Potentially contaminated: user subsequently reported a concurrent Rust project. Do not use this matrix for retention decisions or pool it into the isolated rerun.",
+  "isolated_rerun_plan": "rfc-025-v7-buffered-isolated-20261026-plan.json"
+}

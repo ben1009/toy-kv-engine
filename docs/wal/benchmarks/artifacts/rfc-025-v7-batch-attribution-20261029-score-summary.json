@@ -1,0 +1,505 @@
+{
+  "ext4-batch1": {
+    "invocations": 8,
+    "records": 8,
+    "warmup_records": 2,
+    "host_samples": 219,
+    "run_ids": [
+      "1793241479071",
+      "1793241508774",
+      "1793241556089",
+      "1793241601646",
+      "1793241627417",
+      "1793241672863",
+      "1793241723422",
+      "1793241749422"
+    ],
+    "comparisons": {
+      "concurrent_batch_64/v7_vs_v4": {
+        "pairs": [
+          {
+            "pair": 1,
+            "throughput": 2.690198312588415,
+            "cpu": 1.205331358922067,
+            "rss": 0.3231679626446309,
+            "p99": 0.11046502993415622,
+            "sync_count": 1.0,
+            "data_bytes": 1.0
+          },
+          {
+            "pair": 2,
+            "throughput": 1.0463005849662241,
+            "cpu": 1.3333062101374882,
+            "rss": 0.32318212666688034,
+            "p99": 1.0202951691558964,
+            "sync_count": 1.0,
+            "data_bytes": 1.0
+          },
+          {
+            "pair": 3,
+            "throughput": 0.2217931508753659,
+            "cpu": 1.8289242796257408,
+            "rss": 0.3231992796700532,
+            "p99": 13.739417218077634,
+            "sync_count": 1.0,
+            "data_bytes": 1.0
+          }
+        ],
+        "median": {
+          "throughput": 1.0463005849662241,
+          "cpu": 1.3333062101374882,
+          "rss": 0.32318212666688034,
+          "p99": 1.0202951691558964,
+          "sync_count": 1.0,
+          "data_bytes": 1.0
+        },
+        "per_arm": {
+          "v4": {
+            "median_rate": 26453.78665235912,
+            "median_cpu_ms": 5351.131,
+            "median_peak_rss_kib": 2870332,
+            "peak_rate": 85618.27291336328,
+            "peak_run_id": "1793241723422",
+            "peak_raw_sha256": "f724962b453fa00fbc5bf24a301288dac5321f57bf18e161f94a43802cee5f94",
+            "binary_sha256": "f353022d846530a6754330aaea11f295319ea8f4de20afa09b6d2a3b57b021d8",
+            "median_p99_ms": 11.191481,
+            "peak_p99_ms": 1.195267,
+            "pipeline_medians": {
+              "commit_groups": 11719,
+              "commit_buffers": 11719,
+              "commit_bytes": 816001024,
+              "sync_count": 11719,
+              "fdatasync_ns": 15821148433,
+              "frontier_writes": 0,
+              "frontier_bytes": 0,
+              "frontier_write_ns": 0,
+              "preallocation_ns": 4143800,
+              "wal_sync_wait_ns": 25016107815,
+              "memtable_insert_ns": 2250477246
+            }
+          },
+          "v7": {
+            "median_rate": 24817.555163606154,
+            "median_cpu_ms": 7570.242,
+            "median_peak_rss_kib": 927640,
+            "peak_rate": 71165.93221375044,
+            "peak_run_id": "1793241601646",
+            "peak_raw_sha256": "bd3fdb6a4e28318e242756dc0cd65af1b3e87b7828d763955cb5ebd52d3c04ba",
+            "binary_sha256": "f353022d846530a6754330aaea11f295319ea8f4de20afa09b6d2a3b57b021d8",
+            "median_p99_ms": 11.418614,
+            "peak_p99_ms": 1.26447,
+            "pipeline_medians": {
+              "commit_groups": 11719,
+              "commit_buffers": 11719,
+              "commit_bytes": 816001024,
+              "sync_count": 11719,
+              "fdatasync_ns": 15458342220,
+              "frontier_writes": 11719,
+              "frontier_bytes": 48001024,
+              "frontier_write_ns": 949010746,
+              "preallocation_ns": 22381086,
+              "wal_sync_wait_ns": 27081859620,
+              "memtable_insert_ns": 1287059870
+            }
+          }
+        },
+        "guards": {
+          "paired_floor": true,
+          "arm_median_floor": false,
+          "p99_ceiling": true
+        },
+        "passed": false,
+        "memory_review": false
+      }
+    },
+    "passed": false,
+    "artifact_sha256": {
+      ".jsonl": "35ca314780b1eeb4e2f98309d8ed5b107239d2e5ad91472b566ad82323f0cbeb",
+      "-runs.tsv": "d6380c379a867a2a1fbc57391b946f26f8a5a74b6afa7fd167cc140eb1cf2982",
+      "-host.jsonl": "1d4415f246447dfe9dcdc9746609d5f80d441de40d69a84638a643ae56da61a2"
+    },
+    "stall_views": {
+      "pair_masks": [
+        {
+          "pair": 1,
+          "v4": {
+            "run_id": "1793241556089",
+            "frontier_mean_ms": 0.0,
+            "fdatasync_mean_ms": 1.3500425320419833,
+            "sync_stall": false,
+            "combined_stall": false,
+            "rate": 26453.78665235912,
+            "p99_ms": 11.44679
+          },
+          "v7": {
+            "run_id": "1793241601646",
+            "frontier_mean_ms": 0.02604717023636829,
+            "fdatasync_mean_ms": 0.3066413344995307,
+            "sync_stall": false,
+            "combined_stall": false,
+            "rate": 71165.93221375044,
+            "p99_ms": 1.26447
+          }
+        },
+        {
+          "pair": 2,
+          "v4": {
+            "run_id": "1793241672863",
+            "frontier_mean_ms": 0.0,
+            "fdatasync_mean_ms": 1.5246940767983617,
+            "sync_stall": true,
+            "combined_stall": true,
+            "rate": 23719.33603038872,
+            "p99_ms": 11.191481
+          },
+          "v7": {
+            "run_id": "1793241627417",
+            "frontier_mean_ms": 0.0809805227408482,
+            "fdatasync_mean_ms": 1.35682630062292,
+            "sync_stall": false,
+            "combined_stall": false,
+            "rate": 24817.555163606154,
+            "p99_ms": 11.418614
+          }
+        },
+        {
+          "pair": 3,
+          "v4": {
+            "run_id": "1793241723422",
+            "frontier_mean_ms": 0.0,
+            "fdatasync_mean_ms": 0.31952170953153,
+            "sync_stall": false,
+            "combined_stall": false,
+            "rate": 85618.27291336328,
+            "p99_ms": 1.195267
+          },
+          "v7": {
+            "run_id": "1793241749422",
+            "frontier_mean_ms": 0.6392017052649543,
+            "fdatasync_mean_ms": 1.319083728987115,
+            "sync_stall": false,
+            "combined_stall": false,
+            "rate": 18989.546521961838,
+            "p99_ms": 16.422272
+          }
+        }
+      ],
+      "combined": {
+        "matched_pairs": [
+          1,
+          3
+        ],
+        "median": {
+          "throughput": 1.4559957317318903,
+          "cpu": 1.517127819273904,
+          "rss": 0.323183621157342,
+          "p99": 6.924941124005895,
+          "sync_count": 1.0,
+          "data_bytes": 1.0
+        },
+        "per_arm": {
+          "v4": {
+            "median_rate": 56036.0297828612,
+            "median_p99_ms": 6.3210285
+          },
+          "v7": {
+            "median_rate": 45077.739367856135,
+            "median_p99_ms": 8.843371
+          }
+        },
+        "excluded_by_arm": {
+          "v4": 1,
+          "v7": 0
+        }
+      },
+      "sync_only": {
+        "matched_pairs": [
+          1,
+          3
+        ],
+        "median": {
+          "throughput": 1.4559957317318903,
+          "cpu": 1.517127819273904,
+          "rss": 0.323183621157342,
+          "p99": 6.924941124005895,
+          "sync_count": 1.0,
+          "data_bytes": 1.0
+        },
+        "per_arm": {
+          "v4": {
+            "median_rate": 56036.0297828612,
+            "median_p99_ms": 6.3210285
+          },
+          "v7": {
+            "median_rate": 45077.739367856135,
+            "median_p99_ms": 8.843371
+          }
+        },
+        "excluded_by_arm": {
+          "v4": 1,
+          "v7": 0
+        }
+      },
+      "limits": "Combined mask uses a v7-only FRONTIER criterion. Sync-only is symmetric. Both aggregate masks miss outliers and DATA/preparation delays; filtered ratios cannot establish format parity or source attribution by themselves. All raw runs remain."
+    }
+  },
+  "ext4-batch8": {
+    "invocations": 8,
+    "records": 8,
+    "warmup_records": 2,
+    "host_samples": 73,
+    "run_ids": [
+      "1793241864207",
+      "1793241883227",
+      "1793241900525",
+      "1793241924580",
+      "1793241949317",
+      "1793241973926",
+      "1793242001213",
+      "1793242020343"
+    ],
+    "comparisons": {
+      "concurrent_batch_64/v7_vs_v4": {
+        "pairs": [
+          {
+            "pair": 1,
+            "throughput": 0.35411028072898026,
+            "cpu": 1.3925440786267627,
+            "rss": 0.32294946909723526,
+            "p99": 1.6395719393097123,
+            "sync_count": 0.9256232120964446,
+            "data_bytes": 1.000040157417075
+          },
+          {
+            "pair": 2,
+            "throughput": 0.9052877530910659,
+            "cpu": 1.208343209153776,
+            "rss": 0.3232579960209853,
+            "p99": 1.133462650191969,
+            "sync_count": 0.8762317698068585,
+            "data_bytes": 1.000040157417075
+          },
+          {
+            "pair": 3,
+            "throughput": 1.043333892798078,
+            "cpu": 0.5099400628115196,
+            "rss": 0.32351120776179326,
+            "p99": 3.1213645697032706,
+            "sync_count": 0.6247011952191235,
+            "data_bytes": 1.000040157417075
+          }
+        ],
+        "median": {
+          "throughput": 0.9052877530910659,
+          "cpu": 1.208343209153776,
+          "rss": 0.3232579960209853,
+          "p99": 1.6395719393097123,
+          "sync_count": 0.8762317698068585,
+          "data_bytes": 1.000040157417075
+        },
+        "per_arm": {
+          "v4": {
+            "median_rate": 224432.59178821024,
+            "median_cpu_ms": 5858.5650000000005,
+            "median_peak_rss_kib": 2869440,
+            "peak_rate": 388372.0671907931,
+            "peak_run_id": "1793242001213",
+            "peak_raw_sha256": "ac443fa5d197f0308e7fbcf450e9c377352716138aa46806ca9b113b295d087d",
+            "binary_sha256": "f353022d846530a6754330aaea11f295319ea8f4de20afa09b6d2a3b57b021d8",
+            "median_p99_ms": 12.173414,
+            "peak_p99_ms": 2.510535,
+            "pipeline_medians": {
+              "commit_groups": 11645,
+              "commit_buffers": 11720,
+              "commit_bytes": 815988736,
+              "sync_count": 2510,
+              "fdatasync_ns": 2212609966,
+              "frontier_writes": 0,
+              "frontier_bytes": 0,
+              "frontier_write_ns": 0,
+              "preallocation_ns": 2539459,
+              "wal_sync_wait_ns": 20580721688,
+              "memtable_insert_ns": 3384252929
+            }
+          },
+          "v7": {
+            "median_rate": 80801.16828500161,
+            "median_cpu_ms": 8158.31,
+            "median_peak_rss_kib": 927444,
+            "peak_rate": 405201.7407162069,
+            "peak_run_id": "1793242020343",
+            "peak_raw_sha256": "513c22dbeba8e55b0e8f02efc4e538dc24fd813e6b733c095fb6d8e5ef0e7ccc",
+            "binary_sha256": "f353022d846530a6754330aaea11f295319ea8f4de20afa09b6d2a3b57b021d8",
+            "median_p99_ms": 19.959188,
+            "peak_p99_ms": 7.836295,
+            "pipeline_medians": {
+              "commit_groups": 10170,
+              "commit_buffers": 11720,
+              "commit_bytes": 816021504,
+              "sync_count": 2223,
+              "fdatasync_ns": 2934686258,
+              "frontier_writes": 2223,
+              "frontier_bytes": 9105408,
+              "frontier_write_ns": 2606416264,
+              "preallocation_ns": 958097756,
+              "wal_sync_wait_ns": 66044768845,
+              "memtable_insert_ns": 1978238445
+            }
+          }
+        },
+        "guards": {
+          "paired_floor": false,
+          "arm_median_floor": false,
+          "p99_ceiling": false
+        },
+        "passed": false,
+        "memory_review": false
+      }
+    },
+    "passed": false,
+    "artifact_sha256": {
+      ".jsonl": "ab1da291cc98000f05a57032958c1601ee8c5e62a1fb2e199c94e995215efef4",
+      "-runs.tsv": "ddf012408277b92447d68c5f9fc70f2a6f77e5b0c26bcbc59ed57ec944aacf06",
+      "-host.jsonl": "48771909d829be3fcc478381a372ed1e0baeaf285b4ef5309860047e96f7a1f6"
+    },
+    "stall_views": {
+      "pair_masks": [
+        {
+          "pair": 1,
+          "v4": {
+            "run_id": "1793241900525",
+            "frontier_mean_ms": 0.0,
+            "fdatasync_mean_ms": 0.9042133085410706,
+            "sync_stall": false,
+            "combined_stall": false,
+            "rate": 224432.59178821024,
+            "p99_ms": 12.173414
+          },
+          "v7": {
+            "run_id": "1793241924580",
+            "frontier_mean_ms": 1.1663699673289183,
+            "fdatasync_mean_ms": 1.3578503222958056,
+            "sync_stall": false,
+            "combined_stall": true,
+            "rate": 79473.88808285576,
+            "p99_ms": 19.959188
+          }
+        },
+        {
+          "pair": 2,
+          "v4": {
+            "run_id": "1793241973926",
+            "frontier_mean_ms": 0.0,
+            "fdatasync_mean_ms": 2.550064679148601,
+            "sync_stall": true,
+            "combined_stall": true,
+            "rate": 89254.67953046919,
+            "p99_ms": 18.217269
+          },
+          "v7": {
+            "run_id": "1793241949317",
+            "frontier_mean_ms": 1.1724769518668465,
+            "fdatasync_mean_ms": 1.3201467647323437,
+            "sync_stall": false,
+            "combined_stall": true,
+            "rate": 80801.16828500161,
+            "p99_ms": 20.648594
+          }
+        },
+        {
+          "pair": 3,
+          "v4": {
+            "run_id": "1793242001213",
+            "frontier_mean_ms": 0.0,
+            "fdatasync_mean_ms": 0.42264575179282865,
+            "sync_stall": false,
+            "combined_stall": false,
+            "rate": 388372.0671907931,
+            "p99_ms": 2.510535
+          },
+          "v7": {
+            "run_id": "1793242020343",
+            "frontier_mean_ms": 0.13377951977040817,
+            "fdatasync_mean_ms": 0.3616768730867347,
+            "sync_stall": false,
+            "combined_stall": false,
+            "rate": 405201.7407162069,
+            "p99_ms": 7.836295
+          }
+        }
+      ],
+      "combined": {
+        "matched_pairs": [
+          3
+        ],
+        "median": {
+          "throughput": 1.043333892798078,
+          "cpu": 0.5099400628115196,
+          "rss": 0.32351120776179326,
+          "p99": 3.1213645697032706,
+          "sync_count": 0.6247011952191235,
+          "data_bytes": 1.000040157417075
+        },
+        "per_arm": {
+          "v4": {
+            "median_rate": 388372.0671907931,
+            "median_p99_ms": 2.510535
+          },
+          "v7": {
+            "median_rate": 405201.7407162069,
+            "median_p99_ms": 7.836295
+          }
+        },
+        "excluded_by_arm": {
+          "v4": 1,
+          "v7": 2
+        }
+      },
+      "sync_only": {
+        "matched_pairs": [
+          1,
+          3
+        ],
+        "median": {
+          "throughput": 0.6987220867635291,
+          "cpu": 0.9512420707191411,
+          "rss": 0.32323033842951426,
+          "p99": 2.3804682545064915,
+          "sync_count": 0.7751622036577841,
+          "data_bytes": 1.000040157417075
+        },
+        "per_arm": {
+          "v4": {
+            "median_rate": 306402.32948950166,
+            "median_p99_ms": 7.341974499999999
+          },
+          "v7": {
+            "median_rate": 242337.81439953134,
+            "median_p99_ms": 13.8977415
+          }
+        },
+        "excluded_by_arm": {
+          "v4": 1,
+          "v7": 0
+        }
+      },
+      "limits": "Combined mask uses a v7-only FRONTIER criterion. Sync-only is symmetric. Both aggregate masks miss outliers and DATA/preparation delays; filtered ratios cannot establish format parity or source attribution by themselves. All raw runs remain."
+    }
+  },
+  "status": {
+    "all_planned_cells_complete": true,
+    "captured_cells": [
+      "ext4-batch1",
+      "ext4-batch8"
+    ],
+    "missing_cells": [],
+    "records": 16,
+    "scored_records": 12,
+    "warmup_records": 4,
+    "source_changed": false,
+    "comparison_only": true
+  },
+  "analysis_sha256": "64e0f5453893e8d7e4a0b010049ca3b84c1b7ab9d6a7e465620b874056777bce",
+  "driver_sha256": "c51ec8018165852042836d2aac7897bb15f0e34500512af40f43b967e3f8504b",
+  "matrix_sha256": "95b5a613e83f2c3b481a56598529d3770aef11d60304ca89dff08b9db36d66ce"
+}

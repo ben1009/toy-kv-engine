@@ -1,0 +1,368 @@
+{
+  "host_samples": 151,
+  "scored_records": 40,
+  "warmups": 8,
+  "cells": {
+    "point8": {
+      "paired_medians": {
+        "uring_default": {
+          "frontier_sync_change": 1.1379005099155013,
+          "throughput_change": 0.9721646774485625,
+          "cpu_change": 1.8007739938080496,
+          "p99_change": 1.0003550849180753
+        },
+        "uring_coop_single": {
+          "frontier_sync_change": 1.1110026584754489,
+          "throughput_change": 0.933037499971488,
+          "cpu_change": 1.6598427648478244,
+          "p99_change": 0.9823760387923869
+        },
+        "uring_defer_single": {
+          "frontier_sync_change": 1.1151303263496335,
+          "throughput_change": 0.9573750644826342,
+          "cpu_change": 1.430995018176922,
+          "p99_change": 1.0113162129332895
+        }
+      },
+      "pairs": [
+        {
+          "round": 1,
+          "policies": {
+            "uring_default": {
+              "frontier_sync_change": 1.1441423148926229,
+              "throughput_change": 0.9721646774485625,
+              "cpu_change": 2.0542488960980445,
+              "p99_change": 0.9850460177753528
+            },
+            "uring_coop_single": {
+              "frontier_sync_change": 1.163518846093775,
+              "throughput_change": 0.9743901854398508,
+              "cpu_change": 2.0941695953861403,
+              "p99_change": 0.975445993320232
+            },
+            "uring_defer_single": {
+              "frontier_sync_change": 1.095765283304278,
+              "throughput_change": 0.9985692356961091,
+              "cpu_change": 1.8506803640623593,
+              "p99_change": 0.9686148860358944
+            }
+          }
+        },
+        {
+          "round": 2,
+          "policies": {
+            "uring_default": {
+              "frontier_sync_change": 1.2358079676980689,
+              "throughput_change": 0.9111194926104762,
+              "cpu_change": 1.9220051373861602,
+              "p99_change": 1.076879119756
+            },
+            "uring_coop_single": {
+              "frontier_sync_change": 1.147016701905994,
+              "throughput_change": 0.933037499971488,
+              "cpu_change": 1.6598427648478244,
+              "p99_change": 1.0395418716732296
+            },
+            "uring_defer_single": {
+              "frontier_sync_change": 1.165258682801818,
+              "throughput_change": 0.9573750644826342,
+              "cpu_change": 1.60870242079863,
+              "p99_change": 1.0567065507170346
+            }
+          }
+        },
+        {
+          "round": 3,
+          "policies": {
+            "uring_default": {
+              "frontier_sync_change": 1.058397478401062,
+              "throughput_change": 1.0032166669211402,
+              "cpu_change": 1.0576948969974418,
+              "p99_change": 0.918767712002019
+            },
+            "uring_coop_single": {
+              "frontier_sync_change": 1.0990531139084287,
+              "throughput_change": 0.9070973652652966,
+              "cpu_change": 1.3883129123468425,
+              "p99_change": 0.9823760387923869
+            },
+            "uring_defer_single": {
+              "frontier_sync_change": 1.1151303263496335,
+              "throughput_change": 0.943601467917242,
+              "cpu_change": 1.430995018176922,
+              "p99_change": 1.0113162129332895
+            }
+          }
+        },
+        {
+          "round": 4,
+          "policies": {
+            "uring_default": {
+              "frontier_sync_change": 1.1379005099155013,
+              "throughput_change": 0.7498061971322041,
+              "cpu_change": 1.8007739938080496,
+              "p99_change": 1.8185120775671462
+            },
+            "uring_coop_single": {
+              "frontier_sync_change": 1.1110026584754489,
+              "throughput_change": 0.9004478230689255,
+              "cpu_change": 1.7195046439628483,
+              "p99_change": 1.0800260105743835
+            },
+            "uring_defer_single": {
+              "frontier_sync_change": 1.047379656568985,
+              "throughput_change": 0.8854318495435521,
+              "cpu_change": 1.2656346749226006,
+              "p99_change": 1.1252584567823936
+            }
+          }
+        },
+        {
+          "round": 5,
+          "policies": {
+            "uring_default": {
+              "frontier_sync_change": 1.1286136677461234,
+              "throughput_change": 0.9844754161896073,
+              "cpu_change": 1.5732501542469322,
+              "p99_change": 1.0003550849180753
+            },
+            "uring_coop_single": {
+              "frontier_sync_change": 1.0861814078166017,
+              "throughput_change": 0.9901751483961633,
+              "cpu_change": 1.4573250154246933,
+              "p99_change": 0.9717258696151444
+            },
+            "uring_defer_single": {
+              "frontier_sync_change": 1.1201931783480603,
+              "throughput_change": 0.9815174199780542,
+              "cpu_change": 1.3516144512236923,
+              "p99_change": 1.0012342383060913
+            }
+          }
+        }
+      ],
+      "per_policy": {
+        "syscalls": {
+          "median_frontier_sync_us": 283.873216,
+          "median_cycles_per_sec": 777.3985356495168,
+          "median_p99_us": 9113.313
+        },
+        "uring_default": {
+          "median_frontier_sync_us": 322.76126400000004,
+          "median_cycles_per_sec": 765.3297469287493,
+          "median_p99_us": 9116.549
+        },
+        "uring_coop_single": {
+          "median_frontier_sync_us": 316.29996600000004,
+          "median_cycles_per_sec": 764.9644986707855,
+          "median_p99_us": 9038.634
+        },
+        "uring_defer_single": {
+          "median_frontier_sync_us": 316.555632,
+          "median_cycles_per_sec": 752.2078609560739,
+          "median_p99_us": 9417.18
+        }
+      }
+    },
+    "batch64x8": {
+      "paired_medians": {
+        "uring_default": {
+          "frontier_sync_change": 1.019384784686655,
+          "throughput_change": 1.0019025500592447,
+          "cpu_change": 1.0940527056076006,
+          "p99_change": 1.0033917129845622
+        },
+        "uring_coop_single": {
+          "frontier_sync_change": 1.028674371311475,
+          "throughput_change": 0.9972352056804311,
+          "cpu_change": 1.1248374512353707,
+          "p99_change": 1.0009702139475116
+        },
+        "uring_defer_single": {
+          "frontier_sync_change": 1.026148593260548,
+          "throughput_change": 0.9927851336897553,
+          "cpu_change": 0.9926520546566345,
+          "p99_change": 1.000036854603781
+        }
+      },
+      "pairs": [
+        {
+          "round": 1,
+          "policies": {
+            "uring_default": {
+              "frontier_sync_change": 1.019384784686655,
+              "throughput_change": 1.0035825866139756,
+              "cpu_change": 1.024862226024812,
+              "p99_change": 1.0005229680845091
+            },
+            "uring_coop_single": {
+              "frontier_sync_change": 1.1655892930998164,
+              "throughput_change": 0.9304815763433852,
+              "cpu_change": 1.042351342509877,
+              "p99_change": 1.0489279956365853
+            },
+            "uring_defer_single": {
+              "frontier_sync_change": 1.0186437888269664,
+              "throughput_change": 1.0006878509450747,
+              "cpu_change": 0.9926520546566345,
+              "p99_change": 0.9931645183800824
+            }
+          }
+        },
+        {
+          "round": 2,
+          "policies": {
+            "uring_default": {
+              "frontier_sync_change": 1.0127378262730706,
+              "throughput_change": 1.0019025500592447,
+              "cpu_change": 1.0940527056076006,
+              "p99_change": 1.0185474799462884
+            },
+            "uring_coop_single": {
+              "frontier_sync_change": 1.0361033430802238,
+              "throughput_change": 0.9163988530775756,
+              "cpu_change": 1.1248374512353707,
+              "p99_change": 1.0995731275457719
+            },
+            "uring_defer_single": {
+              "frontier_sync_change": 1.026148593260548,
+              "throughput_change": 0.9887483338505556,
+              "cpu_change": 0.8866006740797749,
+              "p99_change": 1.000036854603781
+            }
+          }
+        },
+        {
+          "round": 3,
+          "policies": {
+            "uring_default": {
+              "frontier_sync_change": 1.013719499601315,
+              "throughput_change": 1.004960903915844,
+              "cpu_change": 1.0411880078453348,
+              "p99_change": 1.0033917129845622
+            },
+            "uring_coop_single": {
+              "frontier_sync_change": 1.0053747939956716,
+              "throughput_change": 1.0100421137520414,
+              "cpu_change": 0.8444687842278203,
+              "p99_change": 1.0009702139475116
+            },
+            "uring_defer_single": {
+              "frontier_sync_change": 1.043774528312069,
+              "throughput_change": 0.9110550267593324,
+              "cpu_change": 0.9886904913523014,
+              "p99_change": 1.1318982453817978
+            }
+          }
+        },
+        {
+          "round": 4,
+          "policies": {
+            "uring_default": {
+              "frontier_sync_change": 1.0199077864392874,
+              "throughput_change": 0.9237758405812712,
+              "cpu_change": 1.3318917502129612,
+              "p99_change": 1.0451123700951113
+            },
+            "uring_coop_single": {
+              "frontier_sync_change": 1.0094576945881464,
+              "throughput_change": 1.000035195601892,
+              "cpu_change": 1.2092916584758535,
+              "p99_change": 0.9986490938779061
+            },
+            "uring_defer_single": {
+              "frontier_sync_change": 1.0080983459159312,
+              "throughput_change": 1.0008215423449323,
+              "cpu_change": 1.3199003997116834,
+              "p99_change": 1.0015071826800463
+            }
+          }
+        },
+        {
+          "round": 5,
+          "policies": {
+            "uring_default": {
+              "frontier_sync_change": 1.0450529892128417,
+              "throughput_change": 0.9056602180638531,
+              "cpu_change": 1.26835484938762,
+              "p99_change": 0.9999395250389598
+            },
+            "uring_coop_single": {
+              "frontier_sync_change": 1.028674371311475,
+              "throughput_change": 0.9972352056804311,
+              "cpu_change": 1.2459781529294935,
+              "p99_change": 0.9629776940432163
+            },
+            "uring_defer_single": {
+              "frontier_sync_change": 1.0342399619433942,
+              "throughput_change": 0.9927851336897553,
+              "cpu_change": 1.1737173121482953,
+              "p99_change": 0.9652679893626094
+            }
+          }
+        }
+      ],
+      "per_policy": {
+        "syscalls": {
+          "median_frontier_sync_us": 387.095022,
+          "median_cycles_per_sec": 1406.570163500616,
+          "median_p99_us": 1246.73
+        },
+        "uring_default": {
+          "median_frontier_sync_us": 394.320212,
+          "median_cycles_per_sec": 1405.4518105373154,
+          "median_p99_us": 1271.298
+        },
+        "uring_coop_single": {
+          "median_frontier_sync_us": 390.279962,
+          "median_cycles_per_sec": 1410.6453664181809,
+          "median_p99_us": 1242.039
+        },
+        "uring_defer_single": {
+          "median_frontier_sync_us": 396.44847999999996,
+          "median_cycles_per_sec": 1401.3979224556078,
+          "median_p99_us": 1244.993
+        }
+      }
+    }
+  },
+  "guards": {
+    "uring_default": false,
+    "uring_coop_single": false,
+    "uring_defer_single": false
+  },
+  "flag_transitions": {
+    "point8": {
+      "uring_default_to_uring_coop_single": {
+        "paired_frontier_sync_change": 0.9763618601049314,
+        "paired_throughput_change": 1.0057896135473008
+      },
+      "uring_coop_single_to_uring_defer_single": {
+        "paired_frontier_sync_change": 1.014628239743602,
+        "paired_throughput_change": 1.0248145461823834
+      }
+    },
+    "batch64x8": {
+      "uring_default_to_uring_coop_single": {
+        "paired_frontier_sync_change": 0.99176823015743,
+        "paired_throughput_change": 1.0050561268765765
+      },
+      "uring_coop_single_to_uring_defer_single": {
+        "paired_frontier_sync_change": 0.9986533871805594,
+        "paired_throughput_change": 1.0007863190680673
+      }
+    }
+  },
+  "advance_to_engine_candidate": false,
+  "scope": "Native diagnostic with opaque bytes; not engine throughput or crash qualification.",
+  "artifacts_sha256": {
+    ".jsonl": "7383bd537b349d36ad341b0f3ab39551bc07e4663815a42fec20e808dd5fa994",
+    "-host.jsonl": "e124c3e0177410f822767455c43ad3c6908d31d0ec3dbda015f9abfafa9a7dc9",
+    "-runs.tsv": "225ff1b74f5b7bf184c6a4ae822171afac6264f262d960b49e96ee5b9a8b6e89",
+    "-probe.c": "d1299d4e07616d1db67f1f012f48b435ee4b7b221d027a297767580fdbbc3146",
+    "-run.py": "c46bc8629dccbb76e5e6e6d818a6002a2c30494f6ba1e1143dbcc7d7159e5579",
+    "-analyze.py": "432b33bbe9925e27205dd786b8c8c902ef710605a2c201b8545956962f55f0ba",
+    "-plan.json": "c3892be6af28386551544c89bb414e7de773c73bd194a6911b522c7ead287a09",
+    "-build.json": "54f9b21ab68f5d333887604b4dc0690c7bd99950a8f1beea736ac254a7b6eff2"
+  }
+}

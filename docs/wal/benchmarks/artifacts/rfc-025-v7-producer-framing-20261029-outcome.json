@@ -1,0 +1,41 @@
+{
+  "source_retained": false,
+  "reason": "The combined candidate passes the fresh batch screens but fails the one-writer point throughput and p99 guard. Keep its patch and exact executable, restore the five changed Rust files and retained canonical binary.",
+  "rust_mtimes_refreshed": true,
+  "atomic_binary_replacement": true,
+  "restored_files": [
+    "kv-engine/src/chaos/failpoint.rs",
+    "kv-engine/src/mem_table.rs",
+    "kv-engine/src/mvcc.rs",
+    "kv-engine/src/wal/parallel/runtime.rs",
+    "kv-engine/src/wal.rs"
+  ],
+  "canonical_sha256": "f353022d846530a6754330aaea11f295319ea8f4de20afa09b6d2a3b57b021d8",
+  "restored_checks": [
+    {
+      "step": "restored-check",
+      "command": [
+        "cargo",
+        "make",
+        "check"
+      ],
+      "returncode": 0,
+      "elapsed_seconds": 46.09973335266113,
+      "log_path": "target/wal-opt/20261029-v7-producer-framing/restored-check.log",
+      "log_sha256": "b7903e4bc7eb870e741d762755bb452789fb8c8a25ab4400c3f847caa5e8098f"
+    },
+    {
+      "step": "restored-typos",
+      "command": [
+        "typos"
+      ],
+      "returncode": 0,
+      "elapsed_seconds": 0.362837553024292,
+      "log_path": "target/wal-opt/20261029-v7-producer-framing/restored-typos.log",
+      "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    }
+  ],
+  "preliminary_restored_checks": [],
+  "candidate_tests": 1979,
+  "restored_tests": 1973
+}

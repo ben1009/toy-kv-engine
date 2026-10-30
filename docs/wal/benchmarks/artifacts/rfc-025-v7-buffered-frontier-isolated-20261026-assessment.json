@@ -1,0 +1,15 @@
+{
+  "adopted": false,
+  "qualification_source": "Fresh isolated matrix; earlier concurrent-project captures excluded.",
+  "failed_guards": [
+    "ext4-point8_arm_median_floor",
+    "ssd_material_gain"
+  ],
+  "ram_cancelled": true,
+  "confirmation_cancelled": true,
+  "raw_records": 48,
+  "scored_records": 40,
+  "warmups": 8,
+  "host_samples": 492,
+  "detected_competing_build_or_test_processes": 0
+}

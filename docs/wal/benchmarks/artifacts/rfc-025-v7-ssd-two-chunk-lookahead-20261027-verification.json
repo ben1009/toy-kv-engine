@@ -1,0 +1,35 @@
+{
+  "source_base": "53f48459b15ae96d50df39ab0f5e7586579206fc",
+  "reconstructed_inputs": 128,
+  "verified_binaries": 2,
+  "captured_cells": [
+    "ext4-point8",
+    "ext4-batch8"
+  ],
+  "cancelled_cells": [
+    "ext4-point1",
+    "ext4-batch1",
+    "ext4-point16",
+    "ext4-batch16",
+    "confirmation-point8",
+    "confirmation-batch8"
+  ],
+  "records": 48,
+  "scored_records": 40,
+  "warmup_records": 8,
+  "excluded_profiles": 3,
+  "retained_unique_invocation_ids": 51,
+  "recognized_process_samples": 623,
+  "source_reconstructs": true,
+  "summary_regenerates": true,
+  "source_retained": false,
+  "assessment_passed": false,
+  "allocator_unchanged": true,
+  "memtable_unchanged": true,
+  "live_state_owned_by": "rfc-025-v7-ssd-batch-window-20261027",
+  "scratch_removed": true,
+  "checks_sha256": "5e8366a0a606e493ef3855155616f66b28ceba9ae29edd9c1ba99c4e6040d84b",
+  "decision_sha256": "6a63f98103908a71eecd9827be0483c73acfe921eaf11c50559311beca39acc9",
+  "prior_verification_sha256": "976e924a2d44a44ff8b13ae55a585fd493b804c044a6ce92d47a79ff23d7ae72",
+  "verifier_sha256": "d40521365d279c1a7db8f131b347a0b33620946eae957f1146ea75c491099e51"
+}

@@ -1,0 +1,81 @@
+{
+  "outside_sandbox": true,
+  "candidate_tests": 1973,
+  "focused_tests": 69,
+  "checks": [
+    {
+      "step": "fmt",
+      "command": [
+        "cargo",
+        "fmt",
+        "--all"
+      ],
+      "returncode": 0,
+      "elapsed_seconds": 1.1133918762207031,
+      "log_path": "target/wal-opt/20261029-v7-frame-source-crc/fmt.log",
+      "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "step": "focused",
+      "command": [
+        "cargo",
+        "nextest",
+        "run",
+        "--workspace",
+        "--all-features",
+        "--lib",
+        "--retries",
+        "0",
+        "-E",
+        "test(wal::v7::codec::tests) | test(wal::parallel_runtime)"
+      ],
+      "returncode": 0,
+      "elapsed_seconds": 4.7249603271484375,
+      "log_path": "target/wal-opt/20261029-v7-frame-source-crc/focused.log",
+      "log_sha256": "c16db18c88abd34434495937bed796db282d0982c7f2c1849caf4066fdc8843e"
+    },
+    {
+      "step": "check",
+      "command": [
+        "cargo",
+        "make",
+        "check"
+      ],
+      "returncode": 0,
+      "elapsed_seconds": 17.578487396240234,
+      "log_path": "target/wal-opt/20261029-v7-frame-source-crc/check.log",
+      "log_sha256": "35149d0efaea1d1c13ac7bbf4c5bb7d86bad5c7f017da4872cfb80706dd093f5"
+    },
+    {
+      "step": "typos",
+      "command": [
+        "typos"
+      ],
+      "returncode": 0,
+      "elapsed_seconds": 0.2565031051635742,
+      "log_path": "target/wal-opt/20261029-v7-frame-source-crc/typos.log",
+      "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "step": "release",
+      "command": [
+        "cargo",
+        "build",
+        "--release",
+        "--package",
+        "kv-engine",
+        "--bin",
+        "write-perf",
+        "--features",
+        "bench"
+      ],
+      "returncode": 0,
+      "elapsed_seconds": 16.658491373062134,
+      "log_path": "target/wal-opt/20261029-v7-frame-source-crc/release.log",
+      "log_sha256": "57d5836ad29aeae6d3a75e49bfb6531e2efd5c9519d0085f70e253ea2d0c1e11"
+    }
+  ],
+  "prior_attempts": {},
+  "coverage": "Existing byte-exact DATA golden vectors, independent readback CRC decoder, fragment boundary and dirty-buffer tests, plus the WAL runtime tests.",
+  "all_captures_follow_final_checks": true
+}

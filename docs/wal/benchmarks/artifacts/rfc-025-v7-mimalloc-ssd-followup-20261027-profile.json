@@ -1,0 +1,15 @@
+{
+  "excluded_from_scoring": true,
+  "run_id": "1793057859463",
+  "binary_sha256": "e7f7712825d2166c14b5b67601388a8e29697f8fc034832e457061cf6e30ae19",
+  "event": "cpu-clock:u",
+  "samples": 596,
+  "lost_samples": 0,
+  "files": {
+    "target/wal-opt/20261027-v7-mimalloc-ssd-followup/baseline.perf.data": "acdf5c31bfad404b23976a3ea7dc3ca381d68df50fbc1912a4c016bacf1635e7",
+    "target/wal-opt/20261027-v7-mimalloc-ssd-followup/baseline-profile.txt": "dc456831ecee5b01c17d5b1c327aaf05452203a638e42eb67c11382ebe478f2f",
+    "target/wal-opt/20261027-v7-mimalloc-ssd-followup/profile.stdout": "294e9fe38d737eaf6df8e314beea789c3ee6e6bb27a4b8b99cc0d327e2225c09",
+    "target/wal-opt/20261027-v7-mimalloc-ssd-followup/profile.stderr": "f962fe6422adbc22fedc6a2f919c23e6b91ab80e054a6c8e4b4611ad15dd70f0"
+  },
+  "scope": "User CPU only; no kernel/off-CPU attribution. Separate before source changes."
+}

@@ -1,0 +1,1213 @@
+{
+  "cells": {
+    "ext4-batch64": {
+      "original": {
+        "pair_count": 5,
+        "pairs": [
+          {
+            "dataset": "original",
+            "pair": 1,
+            "v7_throughput_change": 3.3294715426103845,
+            "v4_throughput_change": 0.17733726824565685,
+            "normalized_v7_v4_change": 18.77479886516706,
+            "v7_cpu_change": 0.5029697371449049,
+            "v7_p50_change": 0.12029896863454191,
+            "v7_p99_change": 0.6670166511673871
+          },
+          {
+            "dataset": "original",
+            "pair": 2,
+            "v7_throughput_change": 0.8994014709883169,
+            "v4_throughput_change": 1.0257103124532427,
+            "normalized_v7_v4_change": 0.8768571984395608,
+            "v7_cpu_change": 1.2810005650218899,
+            "v7_p50_change": 1.0762563010389739,
+            "v7_p99_change": 1.047147510496552
+          },
+          {
+            "dataset": "original",
+            "pair": 3,
+            "v7_throughput_change": 0.9558465102306998,
+            "v4_throughput_change": 0.8553603119182518,
+            "normalized_v7_v4_change": 1.1174782099570357,
+            "v7_cpu_change": 1.097179863121097,
+            "v7_p50_change": 1.0110373849726728,
+            "v7_p99_change": 0.9697876599898587
+          },
+          {
+            "dataset": "original",
+            "pair": 4,
+            "v7_throughput_change": 1.0447381711250823,
+            "v4_throughput_change": 1.2810651609552228,
+            "normalized_v7_v4_change": 0.8155230529773178,
+            "v7_cpu_change": 0.8935839581173294,
+            "v7_p50_change": 0.902550476601658,
+            "v7_p99_change": 0.946301476338233
+          },
+          {
+            "dataset": "original",
+            "pair": 5,
+            "v7_throughput_change": 0.9759796370806654,
+            "v4_throughput_change": 0.9532166564961603,
+            "normalized_v7_v4_change": 1.0238801750151716,
+            "v7_cpu_change": 1.0455660969405811,
+            "v7_p50_change": 1.028821616950238,
+            "v7_p99_change": 1.006879220167241
+          }
+        ],
+        "median_changes": {
+          "v7_throughput_change": 0.9759796370806654,
+          "v4_throughput_change": 0.9532166564961603,
+          "normalized_v7_v4_change": 1.0238801750151716,
+          "v7_cpu_change": 1.0455660969405811,
+          "v7_p50_change": 1.0110373849726728,
+          "v7_p99_change": 0.9697876599898587
+        },
+        "per_arm": {
+          "old_v4": {
+            "median_puts_per_sec": 379863.9989638526,
+            "minimum_puts_per_sec": 67503.28455456886,
+            "peak_puts_per_sec": 409202.4372895928,
+            "peak_run_id": "1792992950944",
+            "median_cpu_ms": 6091.472,
+            "median_p50_ms": 1.226949,
+            "median_p99_ms": 2.656477,
+            "pipeline_medians": {
+              "sync_count": 2403,
+              "fdatasync_ns": 999321936,
+              "frontier_writes": 0,
+              "frontier_write_ns": 0,
+              "sync_coalesce_wait_ns": 430348973,
+              "preallocation_ns": 2325514,
+              "commit_groups": 11671,
+              "commit_bytes": 815988736
+            }
+          },
+          "new_v4": {
+            "median_puts_per_sec": 86476.10609290497,
+            "minimum_puts_per_sec": 72566.8423884011,
+            "peak_puts_per_sec": 389630.42106695153,
+            "peak_run_id": "1792993053460",
+            "median_cpu_ms": 6949.937,
+            "median_p50_ms": 2.509289,
+            "median_p99_ms": 18.209197,
+            "pipeline_medians": {
+              "sync_count": 2440,
+              "fdatasync_ns": 6449790742,
+              "frontier_writes": 0,
+              "frontier_write_ns": 0,
+              "sync_coalesce_wait_ns": 592205786,
+              "preallocation_ns": 2622639,
+              "commit_groups": 11429,
+              "commit_bytes": 815988736
+            }
+          },
+          "old_v7": {
+            "median_puts_per_sec": 401606.11065437633,
+            "minimum_puts_per_sec": 61850.66777921647,
+            "peak_puts_per_sec": 428580.9952339525,
+            "peak_run_id": "1792993041519",
+            "median_cpu_ms": 3419.5379999999996,
+            "median_p50_ms": 1.152503,
+            "median_p99_ms": 2.748083,
+            "pipeline_medians": {
+              "sync_count": 2193,
+              "fdatasync_ns": 734198728,
+              "frontier_writes": 2193,
+              "frontier_write_ns": 240486371,
+              "sync_coalesce_wait_ns": 541498192,
+              "preallocation_ns": 50595080,
+              "commit_groups": 8094,
+              "commit_bytes": 816021504
+            }
+          },
+          "new_v7": {
+            "median_puts_per_sec": 391959.38612583576,
+            "minimum_puts_per_sec": 205930.03826235025,
+            "peak_puts_per_sec": 418048.84577248787,
+            "peak_run_id": "1792993158961",
+            "median_cpu_ms": 3641.3709999999996,
+            "median_p50_ms": 1.18572,
+            "median_p99_ms": 2.752107,
+            "pipeline_medians": {
+              "sync_count": 2262,
+              "fdatasync_ns": 741433220,
+              "frontier_writes": 2262,
+              "frontier_write_ns": 252999412,
+              "sync_coalesce_wait_ns": 558498443,
+              "preallocation_ns": 53790270,
+              "commit_groups": 8285,
+              "commit_bytes": 816021504
+            }
+          }
+        },
+        "paired_v7_v4": {
+          "retained": 1.1282485215839992,
+          "candidate": 2.837797973351884
+        },
+        "candidate_cycle_diagnostics": {
+          "sync_cycles": 11200,
+          "changed_classifications": 0,
+          "changed_fraction": 0.0,
+          "mean_cycle_us": 572.0871272321428,
+          "mean_fdatasync_us": 374.54807785714286,
+          "mean_frontier_write_us": 149.35548553571428
+        }
+      },
+      "rerun": {
+        "pair_count": 5,
+        "pairs": [
+          {
+            "dataset": "requested-rerun",
+            "pair": 1,
+            "v7_throughput_change": 1.0887417246909803,
+            "v4_throughput_change": 0.9769687478686899,
+            "normalized_v7_v4_change": 1.1144079348148332,
+            "v7_cpu_change": 0.8501800666193129,
+            "v7_p50_change": 0.861976804249556,
+            "v7_p99_change": 0.9539763900574528
+          },
+          {
+            "dataset": "requested-rerun",
+            "pair": 2,
+            "v7_throughput_change": 1.016491105023511,
+            "v4_throughput_change": 4.673768069927031,
+            "normalized_v7_v4_change": 0.21748856379160914,
+            "v7_cpu_change": 0.9891145901045266,
+            "v7_p50_change": 1.0014432089153416,
+            "v7_p99_change": 1.114033928318346
+          },
+          {
+            "dataset": "requested-rerun",
+            "pair": 3,
+            "v7_throughput_change": 0.25933753132821125,
+            "v4_throughput_change": 5.718936866680537,
+            "normalized_v7_v4_change": 0.04534715758782969,
+            "v7_cpu_change": 1.6224964257060301,
+            "v7_p50_change": 1.6833720216698556,
+            "v7_p99_change": 7.016019635181327
+          },
+          {
+            "dataset": "requested-rerun",
+            "pair": 4,
+            "v7_throughput_change": 1.1622926062727998,
+            "v4_throughput_change": 1.0066525809911377,
+            "normalized_v7_v4_change": 1.1546114600217097,
+            "v7_cpu_change": 1.2221609782065832,
+            "v7_p50_change": 0.7722189818809971,
+            "v7_p99_change": 0.8282444512068621
+          },
+          {
+            "dataset": "requested-rerun",
+            "pair": 5,
+            "v7_throughput_change": 0.933416723927583,
+            "v4_throughput_change": 0.9972602096755552,
+            "normalized_v7_v4_change": 0.935981115932879,
+            "v7_cpu_change": 1.1266456535233909,
+            "v7_p50_change": 1.0515272878911612,
+            "v7_p99_change": 0.9779371169854161
+          }
+        ],
+        "median_changes": {
+          "v7_throughput_change": 1.016491105023511,
+          "v4_throughput_change": 1.0066525809911377,
+          "normalized_v7_v4_change": 0.935981115932879,
+          "v7_cpu_change": 1.1266456535233909,
+          "v7_p50_change": 1.0014432089153416,
+          "v7_p99_change": 0.9779371169854161
+        },
+        "per_arm": {
+          "old_v4": {
+            "median_puts_per_sec": 375521.50079020363,
+            "minimum_puts_per_sec": 73345.48234944136,
+            "peak_puts_per_sec": 393589.90434464376,
+            "peak_run_id": "1792995358022",
+            "median_cpu_ms": 6049.852000000001,
+            "median_p50_ms": 1.26564,
+            "median_p99_ms": 2.622182,
+            "pipeline_medians": {
+              "sync_count": 2467,
+              "fdatasync_ns": 1094889695,
+              "frontier_writes": 0,
+              "frontier_write_ns": 0,
+              "sync_coalesce_wait_ns": 445313578,
+              "preallocation_ns": 2372753,
+              "commit_groups": 11631,
+              "commit_bytes": 815988736
+            }
+          },
+          "new_v4": {
+            "median_puts_per_sec": 384525.0360213441,
+            "minimum_puts_per_sec": 377200.71116194926,
+            "peak_puts_per_sec": 419458.18301268684,
+            "peak_run_id": "1792995501403",
+            "median_cpu_ms": 5838.9220000000005,
+            "median_p50_ms": 1.206129,
+            "median_p99_ms": 2.46468,
+            "pipeline_medians": {
+              "sync_count": 2529,
+              "fdatasync_ns": 1100483321,
+              "frontier_writes": 0,
+              "frontier_write_ns": 0,
+              "sync_coalesce_wait_ns": 426917781,
+              "preallocation_ns": 2272344,
+              "commit_groups": 11684,
+              "commit_bytes": 815988736
+            }
+          },
+          "old_v7": {
+            "median_puts_per_sec": 405871.56908638455,
+            "minimum_puts_per_sec": 28599.928707630675,
+            "peak_puts_per_sec": 416400.862959142,
+            "peak_run_id": "1792995422228",
+            "median_cpu_ms": 3373.1960000000004,
+            "median_p50_ms": 1.167369,
+            "median_p99_ms": 2.896267,
+            "pipeline_medians": {
+              "sync_count": 2232,
+              "fdatasync_ns": 753669221,
+              "frontier_writes": 2232,
+              "frontier_write_ns": 210426712,
+              "sync_coalesce_wait_ns": 524281697,
+              "preallocation_ns": 51489863,
+              "commit_groups": 8325,
+              "commit_bytes": 816021504
+            }
+          },
+          "new_v7": {
+            "median_puts_per_sec": 379832.68282200507,
+            "minimum_puts_per_sec": 33241.48567680833,
+            "peak_puts_per_sec": 441889.3121301447,
+            "peak_run_id": "1792995398409",
+            "median_cpu_ms": 3695.231,
+            "median_p50_ms": 1.210371,
+            "median_p99_ms": 2.832367,
+            "pipeline_medians": {
+              "sync_count": 2411,
+              "fdatasync_ns": 824385449,
+              "frontier_writes": 2411,
+              "frontier_write_ns": 236487027,
+              "sync_coalesce_wait_ns": 554515027,
+              "preallocation_ns": 57042941,
+              "commit_groups": 8129,
+              "commit_bytes": 816021504
+            }
+          }
+        },
+        "paired_v7_v4": {
+          "retained": 1.075852520117758,
+          "candidate": 1.0069776423590193
+        },
+        "candidate_cycle_diagnostics": {
+          "sync_cycles": 11652,
+          "changed_classifications": 0,
+          "changed_fraction": 0.0,
+          "mean_cycle_us": 2353.7488585650535,
+          "mean_fdatasync_us": 1132.3974780295227,
+          "mean_frontier_write_us": 778.2864028492962
+        }
+      },
+      "pooled": {
+        "pair_count": 10,
+        "pairs": [
+          {
+            "dataset": "original",
+            "pair": 1,
+            "v7_throughput_change": 3.3294715426103845,
+            "v4_throughput_change": 0.17733726824565685,
+            "normalized_v7_v4_change": 18.77479886516706,
+            "v7_cpu_change": 0.5029697371449049,
+            "v7_p50_change": 0.12029896863454191,
+            "v7_p99_change": 0.6670166511673871
+          },
+          {
+            "dataset": "original",
+            "pair": 2,
+            "v7_throughput_change": 0.8994014709883169,
+            "v4_throughput_change": 1.0257103124532427,
+            "normalized_v7_v4_change": 0.8768571984395608,
+            "v7_cpu_change": 1.2810005650218899,
+            "v7_p50_change": 1.0762563010389739,
+            "v7_p99_change": 1.047147510496552
+          },
+          {
+            "dataset": "original",
+            "pair": 3,
+            "v7_throughput_change": 0.9558465102306998,
+            "v4_throughput_change": 0.8553603119182518,
+            "normalized_v7_v4_change": 1.1174782099570357,
+            "v7_cpu_change": 1.097179863121097,
+            "v7_p50_change": 1.0110373849726728,
+            "v7_p99_change": 0.9697876599898587
+          },
+          {
+            "dataset": "original",
+            "pair": 4,
+            "v7_throughput_change": 1.0447381711250823,
+            "v4_throughput_change": 1.2810651609552228,
+            "normalized_v7_v4_change": 0.8155230529773178,
+            "v7_cpu_change": 0.8935839581173294,
+            "v7_p50_change": 0.902550476601658,
+            "v7_p99_change": 0.946301476338233
+          },
+          {
+            "dataset": "original",
+            "pair": 5,
+            "v7_throughput_change": 0.9759796370806654,
+            "v4_throughput_change": 0.9532166564961603,
+            "normalized_v7_v4_change": 1.0238801750151716,
+            "v7_cpu_change": 1.0455660969405811,
+            "v7_p50_change": 1.028821616950238,
+            "v7_p99_change": 1.006879220167241
+          },
+          {
+            "dataset": "requested-rerun",
+            "pair": 1,
+            "v7_throughput_change": 1.0887417246909803,
+            "v4_throughput_change": 0.9769687478686899,
+            "normalized_v7_v4_change": 1.1144079348148332,
+            "v7_cpu_change": 0.8501800666193129,
+            "v7_p50_change": 0.861976804249556,
+            "v7_p99_change": 0.9539763900574528
+          },
+          {
+            "dataset": "requested-rerun",
+            "pair": 2,
+            "v7_throughput_change": 1.016491105023511,
+            "v4_throughput_change": 4.673768069927031,
+            "normalized_v7_v4_change": 0.21748856379160914,
+            "v7_cpu_change": 0.9891145901045266,
+            "v7_p50_change": 1.0014432089153416,
+            "v7_p99_change": 1.114033928318346
+          },
+          {
+            "dataset": "requested-rerun",
+            "pair": 3,
+            "v7_throughput_change": 0.25933753132821125,
+            "v4_throughput_change": 5.718936866680537,
+            "normalized_v7_v4_change": 0.04534715758782969,
+            "v7_cpu_change": 1.6224964257060301,
+            "v7_p50_change": 1.6833720216698556,
+            "v7_p99_change": 7.016019635181327
+          },
+          {
+            "dataset": "requested-rerun",
+            "pair": 4,
+            "v7_throughput_change": 1.1622926062727998,
+            "v4_throughput_change": 1.0066525809911377,
+            "normalized_v7_v4_change": 1.1546114600217097,
+            "v7_cpu_change": 1.2221609782065832,
+            "v7_p50_change": 0.7722189818809971,
+            "v7_p99_change": 0.8282444512068621
+          },
+          {
+            "dataset": "requested-rerun",
+            "pair": 5,
+            "v7_throughput_change": 0.933416723927583,
+            "v4_throughput_change": 0.9972602096755552,
+            "normalized_v7_v4_change": 0.935981115932879,
+            "v7_cpu_change": 1.1266456535233909,
+            "v7_p50_change": 1.0515272878911612,
+            "v7_p99_change": 0.9779371169854161
+          }
+        ],
+        "median_changes": {
+          "v7_throughput_change": 0.9962353710520881,
+          "v4_throughput_change": 1.0019563953333464,
+          "normalized_v7_v4_change": 0.9799306454740253,
+          "v7_cpu_change": 1.071372980030839,
+          "v7_p50_change": 1.0062402969440072,
+          "v7_p99_change": 0.9738623884876374
+        },
+        "per_arm": {
+          "old_v4": {
+            "median_puts_per_sec": 376879.25101424626,
+            "minimum_puts_per_sec": 67503.28455456886,
+            "peak_puts_per_sec": 409202.4372895928,
+            "peak_run_id": "1792992950944",
+            "median_cpu_ms": 6070.662,
+            "median_p50_ms": 1.2462945,
+            "median_p99_ms": 2.6393295,
+            "pipeline_medians": {
+              "sync_count": 2440.0,
+              "fdatasync_ns": 1080135819.5,
+              "frontier_writes": 0.0,
+              "frontier_write_ns": 0.0,
+              "sync_coalesce_wait_ns": 437831275.5,
+              "preallocation_ns": 2349133.5,
+              "commit_groups": 11651.0,
+              "commit_bytes": 815988736.0
+            }
+          },
+          "new_v4": {
+            "median_puts_per_sec": 381272.3620047341,
+            "minimum_puts_per_sec": 72566.8423884011,
+            "peak_puts_per_sec": 419458.18301268684,
+            "peak_run_id": "1792995501403",
+            "median_cpu_ms": 5937.412,
+            "median_p50_ms": 1.2132275,
+            "median_p99_ms": 2.5128589999999997,
+            "pipeline_medians": {
+              "sync_count": 2446.5,
+              "fdatasync_ns": 1100630324.0,
+              "frontier_writes": 0.0,
+              "frontier_write_ns": 0.0,
+              "sync_coalesce_wait_ns": 429564396.5,
+              "preallocation_ns": 2356972.5,
+              "commit_groups": 11680.5,
+              "commit_bytes": 815988736.0
+            }
+          },
+          "old_v7": {
+            "median_puts_per_sec": 403738.83987038047,
+            "minimum_puts_per_sec": 28599.928707630675,
+            "peak_puts_per_sec": 428580.9952339525,
+            "peak_run_id": "1792993041519",
+            "median_cpu_ms": 3396.367,
+            "median_p50_ms": 1.159936,
+            "median_p99_ms": 2.775335,
+            "pipeline_medians": {
+              "sync_count": 2212.5,
+              "fdatasync_ns": 743933974.5,
+              "frontier_writes": 2212.5,
+              "frontier_write_ns": 225456541.5,
+              "sync_coalesce_wait_ns": 538754099.5,
+              "preallocation_ns": 51042471.5,
+              "commit_groups": 8296.5,
+              "commit_bytes": 816021504.0
+            }
+          },
+          "new_v7": {
+            "median_puts_per_sec": 388712.88183844474,
+            "minimum_puts_per_sec": 33241.48567680833,
+            "peak_puts_per_sec": 441889.3121301447,
+            "peak_run_id": "1792995398409",
+            "median_cpu_ms": 3668.301,
+            "median_p50_ms": 1.1954855000000002,
+            "median_p99_ms": 2.8153455000000003,
+            "pipeline_medians": {
+              "sync_count": 2282.5,
+              "fdatasync_ns": 742439255.0,
+              "frontier_writes": 2282.5,
+              "frontier_write_ns": 244743219.5,
+              "sync_coalesce_wait_ns": 556812947.0,
+              "preallocation_ns": 55416605.5,
+              "commit_groups": 8207.0,
+              "commit_bytes": 816021504.0
+            }
+          }
+        },
+        "paired_v7_v4": {
+          "retained": 1.1020505208508786,
+          "candidate": 1.0416868341809926
+        },
+        "candidate_cycle_diagnostics": {
+          "sync_cycles": 22852,
+          "changed_classifications": 0,
+          "changed_fraction": 0.0,
+          "mean_cycle_us": 1480.538137799755,
+          "mean_fdatasync_us": 760.9677002450551,
+          "mean_frontier_write_us": 470.0408981270786
+        }
+      },
+      "strongest_matching_scored_references": {
+        "v4_control": {
+          "puts_per_sec": 419458.18301268684,
+          "run_id": "1792995501403",
+          "arm": "new_v4",
+          "binary_sha256": "698d294f9704b0a42210265f852025d49b27f640c70fcf6888857fca71670e32",
+          "raw_record_sha256": "4caa3f9cc98704cd63b03bfa517c70349c13286480fdaa1cbd6a8b04eec6d0be",
+          "raw": "rfc-025-v7-durability-cycle-cost-ssd-rerun-ext4-batch64-20261026.jsonl",
+          "manifest": "rfc-025-v7-durability-cycle-cost-ssd-rerun-ext4-batch64-20261026-runs.tsv",
+          "dataset": "requested-rerun"
+        },
+        "retained_v7": {
+          "puts_per_sec": 480373.0901766222,
+          "run_id": "1792989818168",
+          "arm": "old_v7",
+          "binary_sha256": "614f0cb1adde43cabe900eb032c6f884783d658c597471d9d9ddc8faff314aa9",
+          "manifest": "rfc-025-v7-large-group-hint-cache-confirmation-ext4-batch64-20261026-runs.tsv",
+          "raw": "rfc-025-v7-large-group-hint-cache-confirmation-ext4-batch64-20261026.jsonl",
+          "raw_record_sha256": "bd7cf83c7984967fc2e4ef7083dee0a01d59f03a1234d9416ff977ab8dcb6227"
+        },
+        "candidate_v7": {
+          "puts_per_sec": 441889.3121301447,
+          "run_id": "1792995398409",
+          "arm": "new_v7",
+          "binary_sha256": "698d294f9704b0a42210265f852025d49b27f640c70fcf6888857fca71670e32",
+          "raw_record_sha256": "2bc8ad259634c833eb16ea038595e1c2b3120cdc4ea27550563de62979173ab0",
+          "raw": "rfc-025-v7-durability-cycle-cost-ssd-rerun-ext4-batch64-20261026.jsonl",
+          "manifest": "rfc-025-v7-durability-cycle-cost-ssd-rerun-ext4-batch64-20261026-runs.tsv",
+          "dataset": "requested-rerun"
+        }
+      }
+    },
+    "ext4-point8": {
+      "original": {
+        "pair_count": 5,
+        "pairs": [
+          {
+            "dataset": "original",
+            "pair": 1,
+            "v7_throughput_change": 1.0112623346322513,
+            "v4_throughput_change": 0.9936675510085973,
+            "normalized_v7_v4_change": 1.0177069117390367,
+            "v7_cpu_change": 0.9581911036065961,
+            "v7_p50_change": 0.986711170223801,
+            "v7_p99_change": 0.9205331954693794
+          },
+          {
+            "dataset": "original",
+            "pair": 2,
+            "v7_throughput_change": 1.0041987416382152,
+            "v4_throughput_change": 1.005353802234634,
+            "normalized_v7_v4_change": 0.9988510904381608,
+            "v7_cpu_change": 0.9712360836309543,
+            "v7_p50_change": 1.0063073220492493,
+            "v7_p99_change": 1.0363368163427926
+          },
+          {
+            "dataset": "original",
+            "pair": 3,
+            "v7_throughput_change": 1.0112470284544626,
+            "v4_throughput_change": 0.9924410492453618,
+            "normalized_v7_v4_change": 1.0189492153951114,
+            "v7_cpu_change": 0.9966743471872537,
+            "v7_p50_change": 0.9893004786137669,
+            "v7_p99_change": 1.2147853832956532
+          },
+          {
+            "dataset": "original",
+            "pair": 4,
+            "v7_throughput_change": 1.008698874231534,
+            "v4_throughput_change": 1.039102968625875,
+            "normalized_v7_v4_change": 0.9707400562674285,
+            "v7_cpu_change": 0.9772526887214318,
+            "v7_p50_change": 1.0038473329604571,
+            "v7_p99_change": 0.968305618651695
+          },
+          {
+            "dataset": "original",
+            "pair": 5,
+            "v7_throughput_change": 0.9873735164933799,
+            "v4_throughput_change": 2.3977141015059305,
+            "normalized_v7_v4_change": 0.4117978519095504,
+            "v7_cpu_change": 1.004526342478309,
+            "v7_p50_change": 1.0090727635637815,
+            "v7_p99_change": 1.109452783886286
+          }
+        ],
+        "median_changes": {
+          "v7_throughput_change": 1.008698874231534,
+          "v4_throughput_change": 1.005353802234634,
+          "normalized_v7_v4_change": 0.9988510904381608,
+          "v7_cpu_change": 0.9772526887214318,
+          "v7_p50_change": 1.0038473329604571,
+          "v7_p99_change": 1.0363368163427926
+        },
+        "per_arm": {
+          "old_v4": {
+            "median_puts_per_sec": 18037.4050434565,
+            "minimum_puts_per_sec": 4914.640721678842,
+            "peak_puts_per_sec": 18278.49878502307,
+            "peak_run_id": "1792993385248",
+            "median_cpu_ms": 6146.972,
+            "median_p50_ms": 0.385105,
+            "median_p99_ms": 1.207408,
+            "pipeline_medians": {
+              "sync_count": 12672,
+              "fdatasync_ns": 3218836865,
+              "frontier_writes": 0,
+              "frontier_write_ns": 0,
+              "sync_coalesce_wait_ns": 134144082,
+              "preallocation_ns": 1191309,
+              "commit_groups": 88428,
+              "commit_bytes": 409600000
+            }
+          },
+          "new_v4": {
+            "median_puts_per_sec": 18001.56157750182,
+            "minimum_puts_per_sec": 5106.817763626098,
+            "peak_puts_per_sec": 18162.751123827493,
+            "peak_run_id": "1792993401070",
+            "median_cpu_ms": 5884.383,
+            "median_p50_ms": 0.384228,
+            "median_p99_ms": 1.219649,
+            "pipeline_medians": {
+              "sync_count": 12666,
+              "fdatasync_ns": 3251493904,
+              "frontier_writes": 0,
+              "frontier_write_ns": 0,
+              "sync_coalesce_wait_ns": 119035081,
+              "preallocation_ns": 1231779,
+              "commit_groups": 88538,
+              "commit_bytes": 409600000
+            }
+          },
+          "old_v7": {
+            "median_puts_per_sec": 16293.445344300491,
+            "minimum_puts_per_sec": 16098.028107639695,
+            "peak_puts_per_sec": 16519.07350787335,
+            "peak_run_id": "1792993711839",
+            "median_cpu_ms": 6515.636,
+            "median_p50_ms": 0.428391,
+            "median_p99_ms": 1.86664,
+            "pipeline_medians": {
+              "sync_count": 12763,
+              "fdatasync_ns": 3148881956,
+              "frontier_writes": 12763,
+              "frontier_write_ns": 206766719,
+              "sync_coalesce_wait_ns": 259822136,
+              "preallocation_ns": 214362306,
+              "commit_groups": 74171,
+              "commit_bytes": 409600000
+            }
+          },
+          "new_v7": {
+            "median_puts_per_sec": 16396.661475756922,
+            "minimum_puts_per_sec": 16279.32948710732,
+            "peak_puts_per_sec": 16476.69818770907,
+            "peak_run_id": "1792993561630",
+            "median_cpu_ms": 6382.395,
+            "median_p50_ms": 0.428197,
+            "median_p99_ms": 1.851786,
+            "pipeline_medians": {
+              "sync_count": 12728,
+              "fdatasync_ns": 3140318484,
+              "frontier_writes": 12728,
+              "frontier_write_ns": 210570806,
+              "sync_coalesce_wait_ns": 255148152,
+              "preallocation_ns": 205764508,
+              "commit_groups": 73760,
+              "commit_bytes": 409600000
+            }
+          }
+        },
+        "paired_v7_v4": {
+          "retained": 0.9052357557165661,
+          "candidate": 0.9113680100556789
+        },
+        "candidate_cycle_diagnostics": {
+          "sync_cycles": 63694,
+          "changed_classifications": 0,
+          "changed_fraction": 0.0,
+          "mean_cycle_us": 285.67603694225517,
+          "mean_fdatasync_us": 246.16992774829654,
+          "mean_frontier_write_us": 16.459940559550347
+        }
+      },
+      "rerun": {
+        "pair_count": 5,
+        "pairs": [
+          {
+            "dataset": "requested-rerun",
+            "pair": 1,
+            "v7_throughput_change": 1.025643049206862,
+            "v4_throughput_change": 1.386549189861642,
+            "normalized_v7_v4_change": 0.7397090970203565,
+            "v7_cpu_change": 0.9580401406084611,
+            "v7_p50_change": 0.9692886785651568,
+            "v7_p99_change": 1.1653861090830007
+          },
+          {
+            "dataset": "requested-rerun",
+            "pair": 2,
+            "v7_throughput_change": 1.003269999309718,
+            "v4_throughput_change": 3.257623272117174,
+            "normalized_v7_v4_change": 0.30797606583209336,
+            "v7_cpu_change": 1.0115334161553229,
+            "v7_p50_change": 1.00251757474418,
+            "v7_p99_change": 1.025114593164987
+          },
+          {
+            "dataset": "requested-rerun",
+            "pair": 3,
+            "v7_throughput_change": 1.010566761051008,
+            "v4_throughput_change": 1.3934059754865984,
+            "normalized_v7_v4_change": 0.7252493378307086,
+            "v7_cpu_change": 0.9570188474382948,
+            "v7_p50_change": 0.9804357213500675,
+            "v7_p99_change": 0.9293643506516299
+          },
+          {
+            "dataset": "requested-rerun",
+            "pair": 4,
+            "v7_throughput_change": 1.013018531522699,
+            "v4_throughput_change": 0.9976617759789367,
+            "normalized_v7_v4_change": 1.0153927472350974,
+            "v7_cpu_change": 0.9881591290087295,
+            "v7_p50_change": 0.9853368891532006,
+            "v7_p99_change": 1.1415319018788888
+          },
+          {
+            "dataset": "requested-rerun",
+            "pair": 5,
+            "v7_throughput_change": 0.8180573827449544,
+            "v4_throughput_change": 0.9972077273363121,
+            "normalized_v7_v4_change": 0.8203480180905792,
+            "v7_cpu_change": 1.0754573873532365,
+            "v7_p50_change": 1.0087452641592514,
+            "v7_p99_change": 1.3092064778954327
+          }
+        ],
+        "median_changes": {
+          "v7_throughput_change": 1.010566761051008,
+          "v4_throughput_change": 1.386549189861642,
+          "normalized_v7_v4_change": 0.7397090970203565,
+          "v7_cpu_change": 0.9881591290087295,
+          "v7_p50_change": 0.9853368891532006,
+          "v7_p99_change": 1.1415319018788888
+        },
+        "per_arm": {
+          "old_v4": {
+            "median_puts_per_sec": 12654.07127560962,
+            "minimum_puts_per_sec": 5048.140034122723,
+            "peak_puts_per_sec": 17815.92869346001,
+            "peak_run_id": "1792996107449",
+            "median_cpu_ms": 6339.878999999999,
+            "median_p50_ms": 0.400723,
+            "median_p99_ms": 8.994947,
+            "pipeline_medians": {
+              "sync_count": 12668,
+              "fdatasync_ns": 3807835799,
+              "frontier_writes": 0,
+              "frontier_write_ns": 0,
+              "sync_coalesce_wait_ns": 128489098,
+              "preallocation_ns": 1255533,
+              "commit_groups": 88142,
+              "commit_bytes": 409600000
+            }
+          },
+          "new_v4": {
+            "median_puts_per_sec": 17545.492275647994,
+            "minimum_puts_per_sec": 7034.108488639723,
+            "peak_puts_per_sec": 17774.27106103141,
+            "peak_run_id": "1792996091468",
+            "median_cpu_ms": 6410.932,
+            "median_p50_ms": 0.394871,
+            "median_p99_ms": 1.270397,
+            "pipeline_medians": {
+              "sync_count": 12685,
+              "fdatasync_ns": 3248074501,
+              "frontier_writes": 0,
+              "frontier_write_ns": 0,
+              "sync_coalesce_wait_ns": 143405146,
+              "preallocation_ns": 1163853,
+              "commit_groups": 88682,
+              "commit_bytes": 409600000
+            }
+          },
+          "old_v7": {
+            "median_puts_per_sec": 16357.175541607045,
+            "minimum_puts_per_sec": 16196.724091757274,
+            "peak_puts_per_sec": 16473.322965050218,
+            "peak_run_id": "1792996155456",
+            "median_cpu_ms": 6479.4220000000005,
+            "median_p50_ms": 0.430468,
+            "median_p99_ms": 1.609325,
+            "pipeline_medians": {
+              "sync_count": 12732,
+              "fdatasync_ns": 3132406903,
+              "frontier_writes": 12732,
+              "frontier_write_ns": 207855310,
+              "sync_coalesce_wait_ns": 254281063,
+              "preallocation_ns": 217468564,
+              "commit_groups": 73190,
+              "commit_bytes": 409600000
+            }
+          },
+          "new_v7": {
+            "median_puts_per_sec": 16504.56343562139,
+            "minimum_puts_per_sec": 13476.123469901333,
+            "peak_puts_per_sec": 16612.057484632172,
+            "peak_run_id": "1792995877091",
+            "median_cpu_ms": 6348.496,
+            "median_p50_ms": 0.424156,
+            "median_p99_ms": 1.875485,
+            "pipeline_medians": {
+              "sync_count": 12720,
+              "fdatasync_ns": 3136264521,
+              "frontier_writes": 12720,
+              "frontier_write_ns": 203105208,
+              "sync_coalesce_wait_ns": 236351190,
+              "preallocation_ns": 239143449,
+              "commit_groups": 73633,
+              "commit_bytes": 409600000
+            }
+          }
+        },
+        "paired_v7_v4": {
+          "retained": 1.2799615032180214,
+          "candidate": 0.9419708442262329
+        },
+        "candidate_cycle_diagnostics": {
+          "sync_cycles": 63726,
+          "changed_classifications": 0,
+          "changed_fraction": 0.0,
+          "mean_cycle_us": 290.4208428584879,
+          "mean_fdatasync_us": 248.02391984433353,
+          "mean_frontier_write_us": 17.760599017669396
+        }
+      },
+      "pooled": {
+        "pair_count": 10,
+        "pairs": [
+          {
+            "dataset": "original",
+            "pair": 1,
+            "v7_throughput_change": 1.0112623346322513,
+            "v4_throughput_change": 0.9936675510085973,
+            "normalized_v7_v4_change": 1.0177069117390367,
+            "v7_cpu_change": 0.9581911036065961,
+            "v7_p50_change": 0.986711170223801,
+            "v7_p99_change": 0.9205331954693794
+          },
+          {
+            "dataset": "original",
+            "pair": 2,
+            "v7_throughput_change": 1.0041987416382152,
+            "v4_throughput_change": 1.005353802234634,
+            "normalized_v7_v4_change": 0.9988510904381608,
+            "v7_cpu_change": 0.9712360836309543,
+            "v7_p50_change": 1.0063073220492493,
+            "v7_p99_change": 1.0363368163427926
+          },
+          {
+            "dataset": "original",
+            "pair": 3,
+            "v7_throughput_change": 1.0112470284544626,
+            "v4_throughput_change": 0.9924410492453618,
+            "normalized_v7_v4_change": 1.0189492153951114,
+            "v7_cpu_change": 0.9966743471872537,
+            "v7_p50_change": 0.9893004786137669,
+            "v7_p99_change": 1.2147853832956532
+          },
+          {
+            "dataset": "original",
+            "pair": 4,
+            "v7_throughput_change": 1.008698874231534,
+            "v4_throughput_change": 1.039102968625875,
+            "normalized_v7_v4_change": 0.9707400562674285,
+            "v7_cpu_change": 0.9772526887214318,
+            "v7_p50_change": 1.0038473329604571,
+            "v7_p99_change": 0.968305618651695
+          },
+          {
+            "dataset": "original",
+            "pair": 5,
+            "v7_throughput_change": 0.9873735164933799,
+            "v4_throughput_change": 2.3977141015059305,
+            "normalized_v7_v4_change": 0.4117978519095504,
+            "v7_cpu_change": 1.004526342478309,
+            "v7_p50_change": 1.0090727635637815,
+            "v7_p99_change": 1.109452783886286
+          },
+          {
+            "dataset": "requested-rerun",
+            "pair": 1,
+            "v7_throughput_change": 1.025643049206862,
+            "v4_throughput_change": 1.386549189861642,
+            "normalized_v7_v4_change": 0.7397090970203565,
+            "v7_cpu_change": 0.9580401406084611,
+            "v7_p50_change": 0.9692886785651568,
+            "v7_p99_change": 1.1653861090830007
+          },
+          {
+            "dataset": "requested-rerun",
+            "pair": 2,
+            "v7_throughput_change": 1.003269999309718,
+            "v4_throughput_change": 3.257623272117174,
+            "normalized_v7_v4_change": 0.30797606583209336,
+            "v7_cpu_change": 1.0115334161553229,
+            "v7_p50_change": 1.00251757474418,
+            "v7_p99_change": 1.025114593164987
+          },
+          {
+            "dataset": "requested-rerun",
+            "pair": 3,
+            "v7_throughput_change": 1.010566761051008,
+            "v4_throughput_change": 1.3934059754865984,
+            "normalized_v7_v4_change": 0.7252493378307086,
+            "v7_cpu_change": 0.9570188474382948,
+            "v7_p50_change": 0.9804357213500675,
+            "v7_p99_change": 0.9293643506516299
+          },
+          {
+            "dataset": "requested-rerun",
+            "pair": 4,
+            "v7_throughput_change": 1.013018531522699,
+            "v4_throughput_change": 0.9976617759789367,
+            "normalized_v7_v4_change": 1.0153927472350974,
+            "v7_cpu_change": 0.9881591290087295,
+            "v7_p50_change": 0.9853368891532006,
+            "v7_p99_change": 1.1415319018788888
+          },
+          {
+            "dataset": "requested-rerun",
+            "pair": 5,
+            "v7_throughput_change": 0.8180573827449544,
+            "v4_throughput_change": 0.9972077273363121,
+            "normalized_v7_v4_change": 0.8203480180905792,
+            "v7_cpu_change": 1.0754573873532365,
+            "v7_p50_change": 1.0087452641592514,
+            "v7_p99_change": 1.3092064778954327
+          }
+        ],
+        "median_changes": {
+          "v7_throughput_change": 1.009632817641271,
+          "v4_throughput_change": 1.0222283854302545,
+          "normalized_v7_v4_change": 0.8955440371790039,
+          "v7_cpu_change": 0.9827059088650807,
+          "v7_p50_change": 0.9959090266789734,
+          "v7_p99_change": 1.0728948001145393
+        },
+        "per_arm": {
+          "old_v4": {
+            "median_puts_per_sec": 15179.81113598798,
+            "minimum_puts_per_sec": 4914.640721678842,
+            "peak_puts_per_sec": 18278.49878502307,
+            "peak_run_id": "1792993385248",
+            "median_cpu_ms": 6332.077499999999,
+            "median_p50_ms": 0.3973235,
+            "median_p99_ms": 5.1011775,
+            "pipeline_medians": {
+              "sync_count": 12670.0,
+              "fdatasync_ns": 3547353924.5,
+              "frontier_writes": 0.0,
+              "frontier_write_ns": 0.0,
+              "sync_coalesce_wait_ns": 131316590.0,
+              "preallocation_ns": 1193903.5,
+              "commit_groups": 88293.0,
+              "commit_bytes": 409600000.0
+            }
+          },
+          "new_v4": {
+            "median_puts_per_sec": 17715.191665677532,
+            "minimum_puts_per_sec": 5106.817763626098,
+            "peak_puts_per_sec": 18162.751123827493,
+            "peak_run_id": "1792993401070",
+            "median_cpu_ms": 6386.056500000001,
+            "median_p50_ms": 0.394142,
+            "median_p99_ms": 1.245023,
+            "pipeline_medians": {
+              "sync_count": 12667.5,
+              "fdatasync_ns": 3249784202.5,
+              "frontier_writes": 0.0,
+              "frontier_write_ns": 0.0,
+              "sync_coalesce_wait_ns": 136943791.5,
+              "preallocation_ns": 1197747.0,
+              "commit_groups": 88653.5,
+              "commit_bytes": 409600000.0
+            }
+          },
+          "old_v7": {
+            "median_puts_per_sec": 16310.774664989818,
+            "minimum_puts_per_sec": 16098.028107639695,
+            "peak_puts_per_sec": 16519.07350787335,
+            "peak_run_id": "1792993711839",
+            "median_cpu_ms": 6510.4175,
+            "median_p50_ms": 0.428878,
+            "median_p99_ms": 1.7379825,
+            "pipeline_medians": {
+              "sync_count": 12743.0,
+              "fdatasync_ns": 3138593683.5,
+              "frontier_writes": 12743.0,
+              "frontier_write_ns": 207311014.5,
+              "sync_coalesce_wait_ns": 257145637.5,
+              "preallocation_ns": 216312167.0,
+              "commit_groups": 73611.5,
+              "commit_bytes": 409600000.0
+            }
+          },
+          "new_v7": {
+            "median_puts_per_sec": 16434.603216843803,
+            "minimum_puts_per_sec": 13476.123469901333,
+            "peak_puts_per_sec": 16612.057484632172,
+            "peak_run_id": "1792995877091",
+            "median_cpu_ms": 6365.4455,
+            "median_p50_ms": 0.426871,
+            "median_p99_ms": 1.8636355,
+            "pipeline_medians": {
+              "sync_count": 12727.5,
+              "fdatasync_ns": 3138291502.5,
+              "frontier_writes": 12727.5,
+              "frontier_write_ns": 208923267.5,
+              "sync_coalesce_wait_ns": 244387484.5,
+              "preallocation_ns": 222453978.5,
+              "commit_groups": 73696.5,
+              "commit_bytes": 409600000.0
+            }
+          }
+        },
+        "paired_v7_v4": {
+          "retained": 1.1051829632891497,
+          "candidate": 0.9210140649952502
+        },
+        "candidate_cycle_diagnostics": {
+          "sync_cycles": 127420,
+          "changed_classifications": 0,
+          "changed_fraction": 0.0,
+          "mean_cycle_us": 288.0490357008319,
+          "mean_fdatasync_us": 247.09715660021976,
+          "mean_frontier_write_us": 17.110433110971588
+        }
+      },
+      "strongest_matching_scored_references": {
+        "v4_control": {
+          "puts_per_sec": 18379.334030826732,
+          "run_id": "1792983845990",
+          "arm": "old_v4",
+          "binary_sha256": "614f0cb1adde43cabe900eb032c6f884783d658c597471d9d9ddc8faff314aa9",
+          "manifest": "rfc-025-v7-prefix-hash-overlap-ext4-point8-20261026-runs.tsv",
+          "raw": "rfc-025-v7-prefix-hash-overlap-ext4-point8-20261026.jsonl",
+          "raw_record_sha256": "c3906aebb705499af9665eed1e1a1f13a028e6593ea4a1066f7c6847e00f15fb"
+        },
+        "retained_v7": {
+          "puts_per_sec": 16574.02886702917,
+          "run_id": "1792989161230",
+          "arm": "old_v7",
+          "binary_sha256": "614f0cb1adde43cabe900eb032c6f884783d658c597471d9d9ddc8faff314aa9",
+          "manifest": "rfc-025-v7-large-group-hint-cache-ext4-point8-20261026-runs.tsv",
+          "raw": "rfc-025-v7-large-group-hint-cache-ext4-point8-20261026.jsonl",
+          "raw_record_sha256": "1f0d17f32b859ef4405ba4f9bb535754f6f3a2f02e55494f91f06877c597fe37"
+        },
+        "candidate_v7": {
+          "puts_per_sec": 16612.057484632172,
+          "run_id": "1792995877091",
+          "arm": "new_v7",
+          "binary_sha256": "698d294f9704b0a42210265f852025d49b27f640c70fcf6888857fca71670e32",
+          "raw_record_sha256": "41ac57ee97fc6350b878238604a95b30faded85062914d58eeb68369d1bfaa9a",
+          "raw": "rfc-025-v7-durability-cycle-cost-ssd-rerun-ext4-point8-20261026.jsonl",
+          "manifest": "rfc-025-v7-durability-cycle-cost-ssd-rerun-ext4-point8-20261026-runs.tsv",
+          "dataset": "requested-rerun"
+        }
+      }
+    }
+  },
+  "input_sha256": {
+    "rfc-025-v7-large-group-hint-cache-20261026-peaks.json": "d11577aadcf09edf35640e4ae0b55e0a57710d161c28f2486e4769b2bca13650",
+    "rfc-025-v7-durability-cycle-cost-ext4-batch64-20261026.jsonl": "5f3bad1204f7581746897d3086dc6a13c67197dacd52df784298274fb7fd463c",
+    "rfc-025-v7-durability-cycle-cost-ext4-batch64-20261026-runs.tsv": "50313e6179017cc7d6035a935c820b36a1f3a4d6a0e486ecdcd8763047713265",
+    "rfc-025-v7-durability-cycle-cost-ext4-batch64-20261026-run.sh": "26fb56d0872c89df752cd9d493ebb22fc306b7c6ad8aed1991264e8f8ed21d36",
+    "rfc-025-v7-durability-cycle-cost-ssd-rerun-ext4-batch64-20261026.jsonl": "5fff9d07523451efc7265cc5f5be758a7e3f13550129434d88b31be05ee7304a",
+    "rfc-025-v7-durability-cycle-cost-ssd-rerun-ext4-batch64-20261026-runs.tsv": "8a5a9e6f64b72ef49d53f747b82fae34e432128464cf410917ee207a58672966",
+    "rfc-025-v7-durability-cycle-cost-ssd-rerun-ext4-batch64-20261026-run.sh": "5b00a5d1d3d2376832da9001afe2e24e11890402505bf31d9da496ec8a1eb95e",
+    "rfc-025-v7-durability-cycle-cost-ext4-point8-20261026.jsonl": "defc526e405261421af5d6be9319325f139703573786c90a52a502aef0055f0a",
+    "rfc-025-v7-durability-cycle-cost-ext4-point8-20261026-runs.tsv": "e5c921aa3fa97a9b976d150e4c6ae487488b21c063a6d9513abcd56d0be14fad",
+    "rfc-025-v7-durability-cycle-cost-ext4-point8-20261026-run.sh": "cc0305482ec7271a3e59a018191c4cecb241e2f1724360b1867a3e9a59133be9",
+    "rfc-025-v7-durability-cycle-cost-ssd-rerun-ext4-point8-20261026.jsonl": "918b62e9bafb7c413a4e0bf790cec13de574e91c0ed42fcb32375bcfd0a17d2a",
+    "rfc-025-v7-durability-cycle-cost-ssd-rerun-ext4-point8-20261026-runs.tsv": "950617345b710a5ce1c95c45337591530b5ace91d3cb6269f0e1c985b35fb72b",
+    "rfc-025-v7-durability-cycle-cost-ssd-rerun-ext4-point8-20261026-run.sh": "d49914bc17e7e444f64dc8ea9345d7be7063ba4b45f8d8acc9866dfd01c71b9b",
+    "rfc-025-v7-durability-cycle-cost-ssd-rerun-20261026-binaries.json": "ffdc8f33be6b5210bcb3371acf4953f148f90f53d245520c08ff582c450187e4",
+    "rfc-025-v7-durability-cycle-cost-ssd-rerun-20261026-plan.json": "87c8cae4d80e76970b576e69a9e443ddb4a6da1b45fd64b6f5604aeac692d89f",
+    "rfc-025-v7-durability-cycle-cost-ssd-rerun-20261026-environment.json": "cb2603ccc8c7d13ac9652ec7b9dc771d5f4da2b0fd08cc424d5d6c253b93a963",
+    "rfc-025-v7-durability-cycle-cost-ssd-rerun-20261026-run.py": "11dadd458bff35583d515891a66c58193f82b4e94197ff5676fd05ce2d5c5f77"
+  },
+  "run_ids": [
+    "1792992898573",
+    "1792992912778",
+    "1792992924733",
+    "1792992938842",
+    "1792992950944",
+    "1792992965671",
+    "1792992993027",
+    "1792993015447",
+    "1792993029385",
+    "1792993041519",
+    "1792993053460",
+    "1792993067624",
+    "1792993081755",
+    "1792993107582",
+    "1792993134960",
+    "1792993146916",
+    "1792993158961",
+    "1792993170932",
+    "1792993182979",
+    "1792993209184",
+    "1792993238547",
+    "1792993252666",
+    "1792993266859",
+    "1792993278917",
+    "1792995305749",
+    "1792995319895",
+    "1792995331939",
+    "1792995346145",
+    "1792995358022",
+    "1792995372156",
+    "1792995386380",
+    "1792995398409",
+    "1792995410287",
+    "1792995422228",
+    "1792995434196",
+    "1792995448289",
+    "1792995474330",
+    "1792995501403",
+    "1792995515474",
+    "1792995527611",
+    "1792995545359",
+    "1792995578204",
+    "1792995614836",
+    "1792995629114",
+    "1792995643352",
+    "1792995657593",
+    "1792995672008",
+    "1792995684026",
+    "1792993321070",
+    "1792993336899",
+    "1792993353060",
+    "1792993368935",
+    "1792993385248",
+    "1792993401070",
+    "1792993416921",
+    "1792993433213",
+    "1792993449444",
+    "1792993465635",
+    "1792993481843",
+    "1792993497708",
+    "1792993513645",
+    "1792993529518",
+    "1792993545414",
+    "1792993561630",
+    "1792993577791",
+    "1792993593976",
+    "1792993610209",
+    "1792993640760",
+    "1792993672154",
+    "1792993695902",
+    "1792993711839",
+    "1792993727975",
+    "1792995726239",
+    "1792995742164",
+    "1792995763830",
+    "1792995794541",
+    "1792995826509",
+    "1792995844762",
+    "1792995860821",
+    "1792995877091",
+    "1792995893203",
+    "1792995909361",
+    "1792995925537",
+    "1792995941603",
+    "1792995971254",
+    "1792996002152",
+    "1792996026739",
+    "1792996042933",
+    "1792996059072",
+    "1792996075227",
+    "1792996091468",
+    "1792996107449",
+    "1792996123421",
+    "1792996139421",
+    "1792996155456",
+    "1792996171609"
+  ],
+  "scope": "Requested independent rerun; preserve original, rerun, and pooled SSD results. No source reinstallation.",
+  "counts": {
+    "original_scored": 40,
+    "original_warmup": 8,
+    "rerun_scored": 40,
+    "rerun_warmup": 8
+  },
+  "candidate_reinstalled": false,
+  "analysis_sha256": "f243206a103ea03bd4798e351ec72826b9b56b918a4c7323ff58912e8a79e8e7"
+}

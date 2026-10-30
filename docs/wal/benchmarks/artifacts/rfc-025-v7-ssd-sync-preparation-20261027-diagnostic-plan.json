@@ -1,0 +1,37 @@
+{
+  "created_at_utc": "2026-10-27T02:02:22.761726+00:00",
+  "source_base": "53f48459b15ae96d50df39ab0f5e7586579206fc",
+  "baseline": {
+    "path": "target/release/write-perf-v7-serial-startup",
+    "sha256": "e7f7712825d2166c14b5b67601388a8e29697f8fc034832e457061cf6e30ae19"
+  },
+  "purpose": "Fresh retained SSD point8/batch8 and v4 point8 profiles before selecting one IO optimization; no source changes or scored captures yet.",
+  "captures": [
+    {
+      "cell": "v4-point8",
+      "format": 4,
+      "batch": null,
+      "num": 100000
+    },
+    {
+      "cell": "v7-point8",
+      "format": 7,
+      "batch": null,
+      "num": 100000
+    },
+    {
+      "cell": "v7-batch8",
+      "format": 7,
+      "batch": 64,
+      "num": 750000
+    }
+  ],
+  "event": "cpu-clock:u",
+  "frequency": 99,
+  "stack": "dwarf,16384",
+  "writers": 8,
+  "value_size": 1024,
+  "target_sst_size": 2147483648,
+  "scope": "All captures excluded from scoring. User CPU samples plus existing engine stage timers; no claim to measure kernel/off-CPU time.",
+  "outside_sandbox": true
+}

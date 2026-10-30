@@ -1,0 +1,23 @@
+{
+  "assessment_passed": false,
+  "source_retained": false,
+  "source_restored": true,
+  "cpu_is_diagnostic": true,
+  "source_candidates": 1,
+  "captured_cells": [
+    "ext4-batch16",
+    "ext4-batch8",
+    "ext4-point8",
+    "ext4-batch1"
+  ],
+  "cancelled_cells": [],
+  "reason": "Reject unbounded-only16 cap: batch16 has +1.2% throughput/-6.3% p99 over4 matched pairs, but batch8 has -10.1% throughput despite -9.3% p99 over3 pairs. Batch1 also fails guards. Point/solo results vary substantially below aggregate stall thresholds and do not isolate source effects. Restore retained large-DATA async dispatch.",
+  "canonical_sha256": "f353022d846530a6754330aaea11f295319ea8f4de20afa09b6d2a3b57b021d8",
+  "restored_source_sha256": "1d351aadce5cf93d97b381a3eee7b13fa6bc0d0d704eba1854ad3ef2b120e0d9",
+  "candidate_tests": 1974,
+  "candidate_focused_tests": 48,
+  "probe_invocations": 1,
+  "matrix_invocations": 36,
+  "global_completed_unique_invocations": 628,
+  "inherited_interrupted_without_json": 1
+}

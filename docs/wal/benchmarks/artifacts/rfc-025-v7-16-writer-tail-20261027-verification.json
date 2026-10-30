@@ -1,0 +1,28 @@
+{
+  "source_base": "3aca2bdb9b574e7d1c106aad12731db0c384191f",
+  "reconstructed_builds": [
+    "rfc-025-v7-clean-tail-20261027/baseline",
+    "rfc-025-v7-clean-tail-20261027/retirement_hint",
+    "rfc-025-v7-ready-tail-20261027/baseline",
+    "rfc-025-v7-ready-tail-20261027/retirement_hint",
+    "rfc-025-v7-coordinator-tail-20261027/baseline",
+    "rfc-025-v7-coordinator-tail-20261027/retirement_hint"
+  ],
+  "inputs_per_build": 128,
+  "verified_diagnostic_binaries": 6,
+  "trace_library_sha256": "7bef6a9cfadc9c803f955fb96e86bd65f5bdebd07aab39184d283832bfe3e46b",
+  "all_summaries_regenerate": true,
+  "all_capture_hashes_match": true,
+  "excluded_diagnostic_invocations": 17,
+  "mapped_api_samples": 9488,
+  "candidate_comparison_invocations": 32,
+  "unique_new_invocations": 49,
+  "global_unique_invocations": 433,
+  "retained_source_restored": true,
+  "canonical_sha256": "f7fd96e5ca0ecaaaa23f59f135e7ce9430521f986834e5c95f2d32070e378d54",
+  "source_retained": false,
+  "tests": 1971,
+  "cpu_is_diagnostic": true,
+  "buffer_verification_sha256": "820640eb6925c52cb8eae1d427ee7c0a8bba02b8f6d900d4e593bf67c2f96f51",
+  "verifier_sha256": "3be36517286297402652361fe0ae18d16a5412520b49136097ec47f7388ee8e5"
+}

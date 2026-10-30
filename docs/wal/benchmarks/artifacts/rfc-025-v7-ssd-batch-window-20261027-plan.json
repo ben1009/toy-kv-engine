@@ -1,0 +1,20 @@
+{
+  "created_at_utc": "2026-10-27T02:56:10.481274+00:00",
+  "source_base": "53f48459b15ae96d50df39ab0f5e7586579206fc",
+  "baseline": "target/release/write-perf-v7-serial-startup",
+  "baseline_sha256": "e7f7712825d2166c14b5b67601388a8e29697f8fc034832e457061cf6e30ae19",
+  "candidate": "Batch-specific v7 coalescing: after a sync >=100us, allow up to800us only when the entire unsynced contiguous written wave consists of one-ticket groups of >=64KiB. Other paths retain400us/100us/no wait. Return immediately when the captured admission prefix is complete; no mandatory grace.",
+  "hypothesis": "Excluded baseline batch trace covers4.57 logical batches/sync at8writers;67.25%of syncs see later DATA completion outside the captured certificate. A bounded longer wait may gather these before writing the next FRONTIER, reducing certificate/sync count. Single-ticket classification is conservative; multi-ticket/mixed groups disable the extension.",
+  "prior_evidence": [
+    "rfc-025-v7-ssd-sync-preparation-20261027-batch-diagnosis.json",
+    "rfc-024-native-sync-batching-20261006.md",
+    "rfc-025-v7-large-group-coalescing-20261026.md"
+  ],
+  "scope": "A distinct batch-only policy after both bounded extent policies failed. Original kept asynchronous extent preparation and serial startup restored. No protocol/ACK/codec/allocation/memtable/allocator changes.",
+  "configuration": "Ext4 SSD,1KiB values,2GiB SST,explicit v4/v7Parallel. point8/16=100k puts/sample100;point1=20k/sample10;batch=750k/batch64/sample10.30s initialcooldown,10s interrun. Recognized process audits before/during1Hz/after. No build/test/profile overlap; all completed records/stalls retained.",
+  "stages": "Batch8 screen: one warmup/arm plus5alternating four-arm rounds. If it passes V7 guards with >=2%paired throughput gain and CPU<=unchanged, run point8 and batch1/batch16 with3rounds each, then batch8 confirmation3rounds. Point1/point16 each3rounds also required before retention. No score-selected reruns; failures cancel remaining stages.",
+  "guards": "Each workload: paired raw and separate-arm median throughput>=.95; paired p99<=1.10,CPU<=1.05,DATAbytesidentical,synccount<=1.05. V4 same-executable controls recorded and compared; normalizedv7/v4 ratio diagnostic. Atleastone SSD cell raw>=1.02 withCPU<=1.00. Highest scores and IDs are descriptive. If screen fails cancel unrun downstream stages and restore; no score-selected retries.",
+  "validation": "Full cargo make check and targeted real-v7-runtime tests outside sandbox before scoring. Test out-of-order CQEs, mixed/small/unknown waves, reset at the durable boundary, no early ACK, and close/poison behavior. Snapshot sources and binaries. No build/test/profile during scored commands.",
+  "decision": "Retain only if all planned cells pass V7 guards and screen plus confirmation each show >=2% paired batch8 throughput with CPU<=unchanged. V4 controls diagnostic; no parity claim from a failed control. Otherwise restore original baseline source/executable and run full checks. Stop this bounded investigation for review. No PR/push.",
+  "baseline_profile_reuse": "rfc-025-v7-ssd-sync-preparation-20261027-profiles.json"
+}

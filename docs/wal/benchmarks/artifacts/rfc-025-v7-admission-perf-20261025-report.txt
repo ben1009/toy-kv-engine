@@ -1,0 +1,171 @@
+# To display the perf.data header info, please use --header/--header-only options.
+#
+#
+# Total Lost Samples: 0
+#
+# Samples: 4K of event 'cpu_atom/cycles/Pu'
+# Event count (approx.): 2339961435
+#
+# Overhead  Command          Shared Object                 Symbol                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         
+# ........  ...............  ............................  ...........................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................
+#
+     5.49%  write-perf-ahas  write-perf-ahash-reservation  [.] <kv_engine::mvcc::LsmMvccInner>::publish_commit_ts
+            |
+            ---<kv_engine::mvcc::LsmMvccInner>::publish_commit_ts
+               |          
+                --3.82%--0xb
+
+     4.86%  write-perf-ahas  write-perf-ahash-reservation  [.] <parking_lot::raw_mutex::RawMutex>::lock_slow
+            |
+            ---<parking_lot::raw_mutex::RawMutex>::lock_slow
+
+     4.37%  write-perf-ahas  write-perf-ahash-reservation  [.] sha2::sha256::x86::digest_blocks
+            |
+            ---sha2::sha256::x86::digest_blocks
+
+     4.05%  write-perf-ahas  [vdso]                        [.] __vdso_clock_gettime
+            |
+            ---__vdso_clock_gettime
+               |          
+                --3.98%--clock_gettime
+                          <std::sys::pal::unix::time::Timespec>::now
+                          |          
+                          |--1.81%--<std::time::Instant>::elapsed
+                          |          |          
+                          |           --1.19%--<std::thread::local::LocalKey<core::cell::RefCell<alloc::vec::Vec<u8>>>>::with::<<kv_engine::mem_table::MemTable>::publish_raw_batch::{closure#0}, ()>
+                          |          
+                           --1.03%--<std::thread::local::LocalKey<core::cell::RefCell<alloc::vec::Vec<u8>>>>::with::<<kv_engine::mem_table::MemTable>::publish_raw_batch::{closure#0}, ()>
+
+     3.32%  write-perf-ahas  write-perf-ahash-reservation  [.] crc32fast::baseline::update_fast_16
+            |
+            ---crc32fast::baseline::update_fast_16
+
+     3.25%  wal-sync-coordi  write-perf-ahash-reservation  [.] <crossbeam_channel::flavors::list::Channel<kv_engine::wal::parallel_worker::GroupWriteResult>>::recv
+            |
+            ---<crossbeam_channel::flavors::list::Channel<kv_engine::wal::parallel_worker::GroupWriteResult>>::recv
+
+     2.58%  write-perf-ahas  write-perf-ahash-reservation  [.] <std::thread::local::LocalKey<core::cell::RefCell<alloc::vec::Vec<u8>>>>::with::<<kv_engine::mem_table::MemTable>::publish_raw_batch::{closure#0}, ()>
+            |
+            ---<std::thread::local::LocalKey<core::cell::RefCell<alloc::vec::Vec<u8>>>>::with::<<kv_engine::mem_table::MemTable>::publish_raw_batch::{closure#0}, ()>
+
+     2.04%  write-perf-ahas  write-perf-ahash-reservation  [.] crc32fast::specialized::pclmulqdq::calculate
+            |
+            ---crc32fast::specialized::pclmulqdq::calculate
+               |          
+                --1.16%--0x449
+
+     2.04%  write-perf-ahas  write-perf-ahash-reservation  [.] <kv_engine::lsm_storage::LsmStorageInner>::put_with_lifecycle_admission
+            |
+            ---<kv_engine::lsm_storage::LsmStorageInner>::put_with_lifecycle_admission
+               |          
+                --1.04%--0x75ac1edd667f
+
+     1.96%  write-perf-ahas  write-perf-ahash-reservation  [.] <parking_lot::condvar::Condvar>::wait_until_internal
+            |
+            ---<parking_lot::condvar::Condvar>::wait_until_internal
+
+     1.93%  write-perf-ahas  write-perf-ahash-reservation  [.] <crossbeam_skiplist::base::SkipList<bytes::bytes::Bytes, bytes::bytes::Bytes>>::search_position::<bytes::bytes::Bytes>
+            |
+            ---<crossbeam_skiplist::base::SkipList<bytes::bytes::Bytes, bytes::bytes::Bytes>>::search_position::<bytes::bytes::Bytes>
+
+     1.92%  write-perf-ahas  libc.so.6                     [.] 0x000000000016d053
+            |
+            ---0x75ac1eead053
+               kv_engine::wal::v7::codec::encode_data_frames_into
+
+     1.86%  write-perf-ahas  write-perf-ahash-reservation  [.] <parking_lot::raw_mutex::RawMutex>::unlock_slow
+            |
+            ---<parking_lot::raw_mutex::RawMutex>::unlock_slow
+
+     1.85%  write-perf-ahas  write-perf-ahash-reservation  [.] <kv_engine::lsm_storage::LsmStorageInner>::maybe_queue_pitr_maintenance
+            |
+            ---<kv_engine::lsm_storage::LsmStorageInner>::maybe_queue_pitr_maintenance
+
+     1.81%  write-perf-ahas  write-perf-ahash-reservation  [.] <kv_engine::wal::parallel_runtime::ParallelWalRuntime>::put_v7_prepared_batch
+            |
+            ---<kv_engine::wal::parallel_runtime::ParallelWalRuntime>::put_v7_prepared_batch
+
+     1.46%  write-perf-ahas  write-perf-ahash-reservation  [.] <kv_engine::mvcc::LsmMvccInner>::write_wal_only
+            |
+            ---<kv_engine::mvcc::LsmMvccInner>::write_wal_only
+
+     1.46%  write-perf-ahas  libc.so.6                     [.] malloc
+            |
+            ---malloc
+
+     1.21%  wal-io-worker    write-perf-ahash-reservation  [.] <crossbeam_channel::flavors::list::Channel<kv_engine::wal::parallel_worker::WorkerCommand<kv_engine::wal::parallel_runtime::ParallelBuffer>>>::recv
+            |
+            ---<crossbeam_channel::flavors::list::Channel<kv_engine::wal::parallel_worker::WorkerCommand<kv_engine::wal::parallel_runtime::ParallelBuffer>>>::recv
+               0x75ac1ede4788
+
+     1.12%  wal-io-worker    write-perf-ahash-reservation  [.] kv_engine::wal::parallel_worker::run_worker::<kv_engine::wal::parallel_runtime::ParallelBuffer>
+            |
+            ---kv_engine::wal::parallel_worker::run_worker::<kv_engine::wal::parallel_runtime::ParallelBuffer>
+
+     1.02%  write-perf-ahas  write-perf-ahash-reservation  [.] <crossbeam_channel::flavors::array::Channel<bool>>::start_send
+            |
+            ---<crossbeam_channel::flavors::array::Channel<bool>>::start_send
+
+     1.00%  write-perf-ahas  libc.so.6                     [.] 0x00000000000a5fd6
+            |
+            ---0x75ac1ede5fd6
+
+
+
+# Samples: 5K of event 'cpu_core/cycles/Pu'
+# Event count (approx.): 5358542766
+#
+# Overhead  Command          Shared Object                 Symbol                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         
+# ........  ...............  ............................  ...........................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................
+#
+    27.51%  wal-ordered-pac  write-perf-ahash-reservation  [.] <crossbeam_channel::flavors::array::Channel<bool>>::recv
+            |
+            ---<crossbeam_channel::flavors::array::Channel<bool>>::recv
+
+    18.65%  wal-sync-coordi  write-perf-ahash-reservation  [.] <crossbeam_channel::flavors::list::Channel<kv_engine::wal::parallel_worker::GroupWriteResult>>::recv
+            |
+            ---<crossbeam_channel::flavors::list::Channel<kv_engine::wal::parallel_worker::GroupWriteResult>>::recv
+               |          
+                --3.02%--0xfff
+
+     5.76%  wal-io-worker    write-perf-ahash-reservation  [.] <crossbeam_channel::flavors::list::Channel<kv_engine::wal::parallel_worker::WorkerCommand<kv_engine::wal::parallel_runtime::ParallelBuffer>>>::recv
+            |
+            ---<crossbeam_channel::flavors::list::Channel<kv_engine::wal::parallel_worker::WorkerCommand<kv_engine::wal::parallel_runtime::ParallelBuffer>>>::recv
+               |          
+                --5.64%--0x75ac1ede4788
+
+     3.99%  write-perf-ahas  write-perf-ahash-reservation  [.] <parking_lot::raw_mutex::RawMutex>::lock_slow
+            |
+            ---<parking_lot::raw_mutex::RawMutex>::lock_slow
+
+     3.15%  write-perf-ahas  write-perf-ahash-reservation  [.] <kv_engine::mvcc::LsmMvccInner>::publish_commit_ts
+            |
+            ---<kv_engine::mvcc::LsmMvccInner>::publish_commit_ts
+               |          
+                --2.21%--0xb
+
+     1.90%  wal-ordered-pac  write-perf-ahash-reservation  [.] kv_engine::wal::parallel_runtime::pack_admitted_groups
+            |
+            ---kv_engine::wal::parallel_runtime::pack_admitted_groups
+
+     1.82%  wal-sync-coordi  write-perf-ahash-reservation  [.] sha2::sha256::x86::digest_blocks
+            |
+            ---sha2::sha256::x86::digest_blocks
+
+     1.81%  write-perf-ahas  write-perf-ahash-reservation  [.] sha2::sha256::x86::digest_blocks
+            |
+            ---sha2::sha256::x86::digest_blocks
+
+     1.05%  wal-io-worker    write-perf-ahash-reservation  [.] kv_engine::wal::parallel_worker::run_worker::<kv_engine::wal::parallel_runtime::ParallelBuffer>
+            |
+            ---kv_engine::wal::parallel_worker::run_worker::<kv_engine::wal::parallel_runtime::ParallelBuffer>
+
+     1.03%  wal-ordered-pac  write-perf-ahash-reservation  [.] <parking_lot::raw_mutex::RawMutex>::lock_slow
+            |
+            ---<parking_lot::raw_mutex::RawMutex>::lock_slow
+
+
+
+#
+# (Tip: Customize output of perf script with: perf script -F event,ip,sym)
+#

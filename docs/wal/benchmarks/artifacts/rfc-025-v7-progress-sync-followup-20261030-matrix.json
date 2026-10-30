@@ -1,0 +1,39 @@
+{
+  "created_at_utc": "2026-10-30T07:23:26.725405+00:00",
+  "ssd_initial_cooldown_seconds": 30,
+  "ssd_between_seconds": 5,
+  "cells": {
+    "ext4-batch8": {
+      "kind": "ssd",
+      "bench": "wal_batch_concurrent",
+      "writers": 8,
+      "operations": 750000,
+      "reads": 500000,
+      "scan_num": 100000,
+      "batch": 64,
+      "sample_every": 10,
+      "arms": [
+        "retained-v7",
+        "candidate-v7"
+      ],
+      "pairs": 2,
+      "schedule_offset": 0
+    },
+    "ext4-batch16": {
+      "kind": "ssd",
+      "bench": "wal_batch_concurrent",
+      "writers": 16,
+      "operations": 750000,
+      "reads": 500000,
+      "scan_num": 100000,
+      "batch": 64,
+      "sample_every": 10,
+      "arms": [
+        "retained-v7",
+        "candidate-v7"
+      ],
+      "pairs": 2,
+      "schedule_offset": 1
+    }
+  }
+}

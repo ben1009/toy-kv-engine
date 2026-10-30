@@ -1,0 +1,62 @@
+{
+  "source_base": "7a415451",
+  "change": "Use v7 FRONTIER preparation/write, fdatasync, and post-sync frontier publication/credit cleanup duration as coalescing feedback. Keep v4 fdatasync-only feedback; unchanged 100/400 us waits and 100 us classifier threshold.",
+  "counter_scope": "Successful v7 Parallel cycles; excludes DATA work, coalescing waits, and waiter notification. New additive counters total cycle nanoseconds and cycles promoted from short to long wait because full cycle >=100 us but fdatasync <100 us.",
+  "baseline_sha256": "614f0cb1adde43cabe900eb032c6f884783d658c597471d9d9ddc8faff314aa9",
+  "build_command": [
+    "cargo",
+    "build",
+    "--release",
+    "--package",
+    "kv-engine",
+    "--bin",
+    "write-perf",
+    "--features",
+    "bench"
+  ],
+  "cells": {
+    "tmpfs-batch64": {
+      "operations": 750000,
+      "batch": 64,
+      "writers": 8,
+      "pairs": 3
+    },
+    "tmpfs-point8": {
+      "operations": 100000,
+      "batch": null,
+      "writers": 8,
+      "pairs": 3
+    },
+    "tmpfs-point1": {
+      "operations": 100000,
+      "batch": null,
+      "writers": 1,
+      "pairs": 3
+    },
+    "ext4-batch64": {
+      "operations": 750000,
+      "batch": 64,
+      "writers": 8,
+      "pairs": 5
+    },
+    "ext4-point8": {
+      "operations": 100000,
+      "batch": null,
+      "writers": 8,
+      "pairs": 5
+    }
+  },
+  "schedule": "Four warmups per cell; odd scored pairs old_v4,new_v4,old_v7,new_v7; even pairs reverse. Same 1 KiB values, 2 GiB target SST, fresh databases, pinned binary SHA. No concurrent build/test/profile/scored work.",
+  "cooldown": "tmpfs: 3 seconds after each run; ext4: 30 seconds before first run and 10 seconds after every run.",
+  "initial_guards": {
+    "paired_raw_throughput_all": ">=0.95",
+    "paired_v4_normalized_throughput_all": ">=0.95",
+    "ratio_of_per_arm_median_v7_rates_all": ">=0.95",
+    "tmpfs_paired_cpu_all": "<=1.05",
+    "paired_p99_ssd_and_solo": "<=1.10",
+    "ssd_material_gain": "At least one SSD cell has median paired raw v7 throughput >=1.02 and v4-normalized >=1.00."
+  },
+  "confirmation": "Only if all initial guards pass: exactly five additional pairs for each SSD cell, same protocol/arms, plus four warmups per cell. Pool all ten pairs. All SSD guard floors/ceilings and material gain must still pass. Do not cherry-pick runs or continue rerunning to pass.",
+  "peaks": "Report strongest scored throughput from every arm; compare only matching operation counts, SST size, sample cadence and writer count. Peaks are supplementary, not the retention gate.",
+  "on_rejection": "Restore retained source and canonical baseline binary, run fresh required checks, preserve all failed captures and exact rejected patch/source manifests."
+}

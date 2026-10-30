@@ -1,0 +1,9 @@
+{
+  "completed_at_utc": "2026-10-29T01:23:30.195712+00:00",
+  "candidate_worker_sha256": "30ffd57fb7aff803737cd75c9338878b35fa92c2b53216f95e3b94cfd1c01cd5",
+  "restored_inputs": 128,
+  "baseline_manifest_sha256": "9a33cb488d2b99f3e374e9949e9a0fb1ff3988c7bc6f23b2adf98f05aa4715de",
+  "canonical_sha256": "f353022d846530a6754330aaea11f295319ea8f4de20afa09b6d2a3b57b021d8",
+  "atomic_binary_replacement": true,
+  "rust_mtime_refreshed": true
+}

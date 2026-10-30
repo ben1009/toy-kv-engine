@@ -1,0 +1,14 @@
+{
+  "retained": {
+    "path": "target/release/write-perf-v7-async-extent",
+    "sha256": "ef112fd0dea7f292a0be9ab47eae6276242dd6b290efccdf4335f03e41b17d0a"
+  },
+  "candidate": {
+    "path": "target/release/write-perf-v7-serial-startup",
+    "sha256": "e7f7712825d2166c14b5b67601388a8e29697f8fc034832e457061cf6e30ae19"
+  },
+  "pre_async": {
+    "path": "target/release/write-perf-v7-validated-logical-batch",
+    "sha256": "614f0cb1adde43cabe900eb032c6f884783d658c597471d9d9ddc8faff314aa9"
+  }
+}

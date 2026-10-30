@@ -1,0 +1,67 @@
+{
+  "created_at_utc": "2026-10-26T07:53:17.064395+00:00",
+  "reason": "User reported another Rust project was running during the previous two matrices and has now finished. Treat both previous matrices as potentially contaminated; retain raw data but exclude them from new qualification and pooling.",
+  "source_head": "b9684dc5101d058b4f737def66bec9f169eeb739",
+  "source_changes": false,
+  "binaries": {
+    "buffered-frontier": {
+      "retained": {
+        "path": "target/release/write-perf-v7-validated-logical-batch",
+        "sha256": "614f0cb1adde43cabe900eb032c6f884783d658c597471d9d9ddc8faff314aa9"
+      },
+      "candidate": {
+        "path": "target/release/write-perf-v7-buffered-frontier",
+        "sha256": "25660d36f5d1f1332693af104ee5ef390e3c383cdbf256a967d29d0e7943f7d7"
+      }
+    },
+    "buffered-parallel": {
+      "retained": {
+        "path": "target/release/write-perf-v7-validated-logical-batch",
+        "sha256": "614f0cb1adde43cabe900eb032c6f884783d658c597471d9d9ddc8faff314aa9"
+      },
+      "candidate": {
+        "path": "target/release/write-perf-v7-buffered-parallel",
+        "sha256": "e06550ac79c26d0f1c758c1ea07aad71e3296964a32d39a2f4b0c19edabcf5cb"
+      }
+    }
+  },
+  "cells": {
+    "ext4-point8": {
+      "operations": 100000,
+      "writers": 8,
+      "batch_size": null,
+      "pairs": 5
+    },
+    "ext4-batch64": {
+      "operations": 750000,
+      "writers": 8,
+      "batch_size": 64,
+      "pairs": 5
+    }
+  },
+  "initial_order": [
+    [
+      "buffered-frontier",
+      "ext4-point8"
+    ],
+    [
+      "buffered-frontier",
+      "ext4-batch64"
+    ],
+    [
+      "buffered-parallel",
+      "ext4-point8"
+    ],
+    [
+      "buffered-parallel",
+      "ext4-batch64"
+    ]
+  ],
+  "common": "Same four-arm protocol and parameters as original: 1 KiB values, 2 GiB SST target, latency sampled every 10 batches or 100 point operations. Four unscored warmups, then five paired rounds per cell. Odd old_v4,new_v4,old_v7,new_v7; even reverse. Separate fresh captures, no source rebuilds or tests during scoring.",
+  "cooldowns": "30 seconds before each SSD cell and 10 seconds after every run; three seconds between conditional tmpfs runs.",
+  "isolation": "Read-only host process preflight and per-run before/during/after samples (one-second period). Record PID, command name, state and CPU for recognized build/test/linker processes; no command arguments. Exclude only the current expected benchmark PID. If competing activity is detected, preserve the run and audit and stop that matrix; never silently count the run as clean or kill another project.",
+  "ssd_guards": "Same numerical rules as previous plans: both workloads paired raw, paired v4-normalized, and ratio of per-arm median v7 rates >=0.95, paired p99 <=1.10. At least one workload paired raw >=1.02 and normalized >=1.00.",
+  "conditional_ram": "For each candidate passing isolated SSD guards, run three pairs for tmpfs batch64 (750000 ops, eight writers), point8 (100000), and point1 (100000). Same options. Require raw/normalized/arm-median floors >=0.95, CPU <=1.05, solo p99 <=1.10.",
+  "conditional_confirmation": "For each candidate passing both phases, exactly five further SSD pairs per workload, same protocol plus four warmups. Pool only isolated initial and confirmation data. Require SSD rules still pass; no further attempts selected by score.",
+  "interpretation": "Earlier potentially contaminated data remain labelled separately. Do not use the previous rejection or extreme control peaks to decide the new result. Preserve all newly observed stalls. Host sampling detects sustained competing tasks but does not prove absence of every short task or storage stall."
+}

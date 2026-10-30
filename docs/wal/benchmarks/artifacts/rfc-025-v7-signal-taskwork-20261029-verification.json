@@ -1,0 +1,23 @@
+{
+  "source_base": "05dd9c2c74901741d635a8b9559638a88594f143",
+  "reconstructed_inputs": 128,
+  "final_inputs_verified": 128,
+  "summary_regenerates": true,
+  "all_enabled_stages_complete": true,
+  "confirmation_cancelled": true,
+  "new_completed_invocations": 52,
+  "matrix_records": 52,
+  "scored_records": 40,
+  "global_unique_invocations": 857,
+  "full_archive_unique_invocations": 4953,
+  "inherited_interrupted_without_json": 1,
+  "source_retained": false,
+  "retained_source_restored": true,
+  "canonical_sha256": "f353022d846530a6754330aaea11f295319ea8f4de20afa09b6d2a3b57b021d8",
+  "candidate_tests": 1975,
+  "focused_tests": 49,
+  "restored_tests": 1973,
+  "decision_sha256": "2c193f6e52af0d07cb9e1f5e9b628e8d06a77f7c041c313715f7509ab72a04ca",
+  "checks_sha256": "627e55fb0954b7c527764a1d3e1685579c3cc95d90c8625993f3de9ac1d7278d",
+  "verifier_sha256": "454ac31e5052ad6d011cf85aee1bc7fcad77ccb6d3707faafcd504c3cf87e923"
+}

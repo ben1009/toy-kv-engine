@@ -1,0 +1,37 @@
+{
+  "base_commit": "5b0ce817460b3c5b1daeb27879a8eb4a3fd0f884",
+  "candidate_patch_raw_sha256": "61bd391f1959e0e34b1657c4e452d321620ccfdb01f143e07641e1d72dd6ed36",
+  "candidate_patch_gzip_sha256": "2c3e576dbbf0b4f39351599bbd407a0c587849e223fd5b8a90f5f5d3adf45674",
+  "build": "cargo build --offline --locked --release --package kv-engine --bin write-perf --features bench",
+  "screen_cells": [
+    "ext4-batch8",
+    "ext4-batch16"
+  ],
+  "guard_cells": [],
+  "schedule": "Separate follow-up for high-concurrency cells with insufficient eligible candidates in the initial screen. One warmup and two scored runs per arm, alternating order, 30 seconds initial cooldown and five seconds between invocations. No score-selected replacement runs.",
+  "ranking": "Highest eligible throughput per exact binary and workload; p99, syncs, frontiers, coalesce waits and grouping counts come from that same invocation. Report unfiltered samples too.",
+  "stall_filter": {
+    "frontier_mean_ms_at_least": 0.12,
+    "fdatasync_mean_ms_at_least": 0.6,
+    "selection": "Flag each run using mean times; passing means can still hide brief SSD stalls."
+  },
+  "screen_gate": {
+    "minimum_throughput_ratio": 1.0,
+    "maximum_p99_ratio": 1.0,
+    "minimum_eligible_runs_per_arm": 2
+  },
+  "guard_gate": {
+    "minimum_throughput_ratio": 0.98,
+    "maximum_p99_ratio": 1.05,
+    "minimum_eligible_runs_per_arm": 2
+  },
+  "constraints": [
+    "Baseline is the exact previously measured dynamic grouping binary.",
+    "Candidate replaces only v7 durability coalescing with a submitted-successor gate and worker-observed completion cadence, capped at 50us, leaving v4 policy, DATA grouping and wire format unchanged.",
+    "All scratch databases remain inside the local repository.",
+    "Do not qualify a performance win from stalled or insufficient samples.",
+    "Completion observations are sampled at CQE-drain time; groups completed in a single drain share one timestamp."
+  ],
+  "candidate_patch_correction": "After capture, the unchanged source was re-exported using git diff --no-ext-diff because the initial snapshot used the configured human-readable external diff. Both snapshots are retained.",
+  "candidate_initial_rendered_diff_sha256": "55428a3c8b5622c53feaf7450efe7cec3f4b65ec7409650a5c3b82ebb83077bf"
+}

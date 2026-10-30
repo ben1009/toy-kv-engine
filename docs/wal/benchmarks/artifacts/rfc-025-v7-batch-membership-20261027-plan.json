@@ -1,0 +1,17 @@
+{
+  "created_at_utc": "2026-10-27T05:10:59.323529+00:00",
+  "source_base": "dc3e3c1a8fce0f15700ff7c5d2ef2cb1c2875d4d",
+  "baseline": {
+    "path": "target/release/write-perf-v7-batch-window",
+    "sha256": "f7fd96e5ca0ecaaaa23f59f135e7ce9430521f986834e5c95f2d32070e378d54"
+  },
+  "candidate": "Carry minimum DATA write size through WriteGroup/worker completion. Classify a contiguous unsynced group as all-large only when its write count equals its logical ticket count and minimum write size>=64KiB. Missing/zero geometry and mixed writes remain conservative. Keep800us slow-large/400us ordinary/100us fast policy unchanged.",
+  "hypothesis": "Fresh batch8/16 captures place63.3%/73.6% of logical batches in multi-ticket groups. Retained classification excludes every such group. Reusing geometry from the existing worker validation loop removes that avoidable blind spot without an admission-map lookup, new locks, codec work or mandatory solo wait. Single-ticket behavior remains equivalent.",
+  "scope": "One generic min-write metadata field propagated through worker ownership/results plus runtime classification. No new I/O policy, format/hash/ACK changes, allocation policy, runtime switch, allocator or memtable changes.",
+  "diagnostic_scope": "Three newly captured retained SSD user-CPU profiles and existing engine timers are excluded from scoring. SHA remains roughly20-23% of user samples; this candidate targets sharing FRONTIER/sync costs, not removal of required hashing.",
+  "stages": "Run batch1/8/16 and point8, all four cells regardless of performance outcomes: one warmup/arm+3alternating four-arm rounds each. Then independent batch8 confirmation with3rounds. Native v4 controls and retained f7-v7 compare with the candidate; no RAM gate or score-selected reruns.",
+  "configuration": "Ext4 SSD,1KiB values,2GiB SST,explicitParallel. Batch64=750k/sample10,point8=100k/sample100.30s initialcooldown,10s intercommand. Recognized-process audits before/during1Hz/after; no build/test/profile during scoring.",
+  "assessment": "Throughput and p99 are primary, CPU/RSS/sync counts and V4 controls diagnostic. Provisional retention if every V7 cell has paired/arm-median throughput>=0.95,p99<=1.10,identical DATA byte counts, and independent batch8 confirmation throughput>1,p99<1. Preserve all failures. A small CPU increase does not veto a throughput/p99 gain. Otherwise restore retained f7 source/executable; do not silently waive failed guards. Stop after this bounded candidate for review.",
+  "validation": "Outside-sandbox full cargo make check plus meaningful tests for worker minimum-size propagation under out-of-order CQEs and failures, unknown/mismatched counts, mixed huge/small batches, retained-frontier gaps, no early ACK and exact v7 close/recovery. Snapshot all128inputs and saved executables before scoring.",
+  "publication": "Keep retained provisional coalescing commit. Separate new retained source and evidence commits. No push, PR or default adoption."
+}

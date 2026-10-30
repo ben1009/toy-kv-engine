@@ -1,0 +1,66 @@
+diff --git a/kv-engine/src/wal/parallel/worker.rs b/kv-engine/src/wal/parallel/worker.rs
+index c0569297..cb732a68 100644
+--- a/kv-engine/src/wal/parallel/worker.rs
++++ b/kv-engine/src/wal/parallel/worker.rs
+@@ -532,0 +533 @@ const DIRECT_IO_ALIGNMENT: usize = 4096;
++const V7_ASYNC_UNBOUNDED_WORKER_LIMIT: u32 = 16;
+@@ -1627,0 +1629,5 @@ impl<B: WorkerBuffer> IoWorker<B> {
++                if let Err(error) = configure_unbounded_worker_limit(&ring, async_write_min_bytes) {
++                    // This is a performance hint; keep kernel defaults when
++                    // the registration is unsupported or denied.
++                    log::debug!("WAL async worker limit unavailable: {error}");
++                }
+@@ -1815,0 +1822,14 @@ impl<B: WorkerBuffer> Drop for IoWorker<B> {
++fn configure_unbounded_worker_limit(
++    ring: &io_uring::IoUring,
++    async_write_min_bytes: Option<usize>,
++) -> io::Result<()> {
++    if async_write_min_bytes.is_none() {
++        return Ok(());
++    }
++    // Large v7 writes forced async can enter io-wq before file assignment,
++    // reaching its unbounded class. Preserve the bounded class used by
++    // ordinary regular-file writes; zero leaves that limit unchanged.
++    let mut limits = [0, V7_ASYNC_UNBOUNDED_WORKER_LIMIT];
++    ring.submitter().register_iowq_max_workers(&mut limits)
++}
++
+@@ -2468,0 +2489,38 @@ mod tests {
++    #[test]
++    fn v7_async_worker_limit_preserves_the_bounded_pool() {
++        let ring = match io_uring::IoUring::new(8).map_err(anyhow::Error::from) {
++            Ok(ring) => ring,
++            Err(error) if io_uring_unavailable(&error) => {
++                eprintln!("skipping test (io_uring unavailable): {error:#}");
++                return;
++            }
++            Err(error) => panic!("failed to create test ring: {error:#}"),
++        };
++        let mut initial = [3, 11];
++        if let Err(error) = ring.submitter().register_iowq_max_workers(&mut initial) {
++            if matches!(
++                error.raw_os_error(),
++                Some(libc::EINVAL | libc::ENOSYS | libc::EOPNOTSUPP | libc::EPERM)
++            ) {
++                eprintln!("skipping test (io-wq limits unavailable): {error}");
++                return;
++            }
++            panic!("failed to set initial io-wq limits: {error}");
++        }
++        super::configure_unbounded_worker_limit(&ring, None)
++            .expect("retain ordinary worker limits");
++        let mut unchanged = [0; 2];
++        ring.submitter()
++            .register_iowq_max_workers(&mut unchanged)
++            .expect("query ordinary limits");
++        assert_eq!(unchanged, [3, 11]);
++
++        super::configure_unbounded_worker_limit(&ring, Some(64 * 1024))
++            .expect("set v7 unbounded worker limit");
++        let mut limited = [0; 2];
++        ring.submitter()
++            .register_iowq_max_workers(&mut limited)
++            .expect("query configured worker limits");
++        assert_eq!(limited, [3, super::V7_ASYNC_UNBOUNDED_WORKER_LIMIT]);
++    }
++

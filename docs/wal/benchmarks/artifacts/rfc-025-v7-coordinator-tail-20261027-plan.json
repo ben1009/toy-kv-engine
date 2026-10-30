@@ -1,0 +1,14 @@
+{
+  "created_at_utc": "2026-10-27T10:30:10.726763+00:00",
+  "parent": "rfc-025-v7-ready-tail-20261027",
+  "purpose": "Final bounded diagnostic: distinguish result handoff, coalescing elapsed/deadline, repeated no-progress attempts and post-sync bookkeeping in the exact retirement-hint prototype.",
+  "schedule": [
+    "baseline",
+    "retirement_hint"
+  ],
+  "configuration": "Two fixed excluded 16-writer, 750000-put, batch64, 1KiB-value, 2GiB-SST, v7 Parallel, no-compaction captures; 30-second initial and 15-second gaps.",
+  "instrumentation": "Same sampled-batch harness, syscall shim, 100ms observer and DATA staging/reap timestamps as readiness diagnostics. Add local coordinator checkpoints around result processing, drains, coalescing and sync return. Preallocated vectors emit at shutdown. No tracing to disk during timed writes.",
+  "analysis": "Preserve raw runs and 1/2/5ms synchronous-I/O plus DATA-queue sensitivity masks. Check coalescing elapsed against requested deadline, result-processing time, and previous fdatasync return to sync-function return. Staging/reap and deadline overrun can include scheduling; they do not isolate hardware latency.",
+  "outside_sandbox": true,
+  "stop_after": "These two captures complete this diagnostic slice. Do not add further instrumentation or optimization prototypes; restore retained source and executable and report for review."
+}

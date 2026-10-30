@@ -1,0 +1,10 @@
+{
+  "user_steering": "ignore the obvious stall result",
+  "scope": "Interpretation added after the request during capture; the frozen schedule, raw records and original paired filters are unchanged.",
+  "main_view": "Do not use flagged runs as representative performance. Show counts for the predeclared combined paired view. It leaves0 batch8,2 batch16,1 batch1 and3 point8 pairs; none proves stall-free steady-state source behavior. Mean-call masks miss remaining tails.",
+  "best_view": "User has previously requested highest scores to reduce SSD-stall distortion. Separately show individually unflagged scored maxima from this fresh cohort and the earlier matching eligibility cohort, using only the same current executable SHA and settings. Explicitly label this post-capture cross-cohort descriptive view, unequal sample counts and peak-run p99. Never call it a fresh paired estimate or use it to qualify adoption.",
+  "source_changed": false,
+  "retained_source_commit": "d5d23e95553e95cd06f637c48d98ada75c10d56f",
+  "parity_qualified": false,
+  "all_raw_runs_preserved": true
+}

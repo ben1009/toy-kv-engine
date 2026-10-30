@@ -1,0 +1,209 @@
+{
+  "created_at_utc": "2026-10-27T01:36:26.003009+00:00",
+  "cpu_initial_cooldown_seconds": 3,
+  "cpu_between_seconds": 3,
+  "ssd_initial_cooldown_seconds": 30,
+  "ssd_between_seconds": 10,
+  "pairs": 3,
+  "warmups_per_arm": 1,
+  "value_size": 1024,
+  "target_sst_size": 2147483648,
+  "cells": {
+    "cpu-publish1": {
+      "kind": "cpu",
+      "bench": "memtable_publish_concurrent",
+      "writers": 1,
+      "operations": 100000,
+      "reads": 500000,
+      "scan_num": 100000,
+      "batch": 64,
+      "arms": [
+        "old",
+        "new"
+      ],
+      "parts": {
+        "concurrent_batch_64": 100000
+      }
+    },
+    "cpu-publish8": {
+      "kind": "cpu",
+      "bench": "memtable_publish_concurrent",
+      "writers": 8,
+      "operations": 100000,
+      "reads": 500000,
+      "scan_num": 100000,
+      "batch": 64,
+      "arms": [
+        "old",
+        "new"
+      ],
+      "parts": {
+        "concurrent_batch_64": 100000
+      }
+    },
+    "cpu-publish16": {
+      "kind": "cpu",
+      "bench": "memtable_publish_concurrent",
+      "writers": 16,
+      "operations": 100000,
+      "reads": 500000,
+      "scan_num": 100000,
+      "batch": 64,
+      "arms": [
+        "old",
+        "new"
+      ],
+      "parts": {
+        "concurrent_batch_64": 100000
+      }
+    },
+    "cpu-read": {
+      "kind": "cpu",
+      "bench": "readrandom",
+      "writers": 1,
+      "operations": 100000,
+      "reads": 500000,
+      "scan_num": 100000,
+      "batch": null,
+      "arms": [
+        "old",
+        "new"
+      ],
+      "parts": {
+        "point_get": 500000
+      }
+    },
+    "cpu-scan": {
+      "kind": "cpu",
+      "bench": "scan",
+      "writers": 1,
+      "operations": 100000,
+      "reads": 500000,
+      "scan_num": 100000,
+      "batch": null,
+      "arms": [
+        "old",
+        "new"
+      ],
+      "parts": {
+        "full_scan": 100000,
+        "scan_10pct": 10000
+      }
+    },
+    "ext4-point8": {
+      "kind": "ssd",
+      "bench": "wal_concurrent",
+      "writers": 8,
+      "operations": 100000,
+      "reads": 500000,
+      "scan_num": 100000,
+      "batch": null,
+      "sample_every": 100,
+      "arms": [
+        "old_v4",
+        "new_v4",
+        "old_v7",
+        "new_v7"
+      ]
+    },
+    "ext4-batch8": {
+      "kind": "ssd",
+      "bench": "wal_batch_concurrent",
+      "writers": 8,
+      "operations": 750000,
+      "reads": 500000,
+      "scan_num": 100000,
+      "batch": 64,
+      "sample_every": 10,
+      "arms": [
+        "old_v4",
+        "new_v4",
+        "old_v7",
+        "new_v7"
+      ]
+    },
+    "ext4-point1": {
+      "kind": "ssd",
+      "bench": "wal_concurrent",
+      "writers": 1,
+      "operations": 20000,
+      "reads": 500000,
+      "scan_num": 100000,
+      "batch": null,
+      "sample_every": 10,
+      "arms": [
+        "old_v4",
+        "new_v4",
+        "old_v7",
+        "new_v7"
+      ]
+    },
+    "ext4-batch1": {
+      "kind": "ssd",
+      "bench": "wal_batch_concurrent",
+      "writers": 1,
+      "operations": 750000,
+      "reads": 500000,
+      "scan_num": 100000,
+      "batch": 64,
+      "sample_every": 10,
+      "arms": [
+        "old_v4",
+        "new_v4",
+        "old_v7",
+        "new_v7"
+      ]
+    },
+    "ext4-point16": {
+      "kind": "ssd",
+      "bench": "wal_concurrent",
+      "writers": 16,
+      "operations": 100000,
+      "reads": 500000,
+      "scan_num": 100000,
+      "batch": null,
+      "sample_every": 100,
+      "arms": [
+        "old_v4",
+        "new_v4",
+        "old_v7",
+        "new_v7"
+      ]
+    },
+    "ext4-batch16": {
+      "kind": "ssd",
+      "bench": "wal_batch_concurrent",
+      "writers": 16,
+      "operations": 750000,
+      "reads": 500000,
+      "scan_num": 100000,
+      "batch": 64,
+      "sample_every": 10,
+      "arms": [
+        "old_v4",
+        "new_v4",
+        "old_v7",
+        "new_v7"
+      ]
+    }
+  },
+  "cpu_order": [
+    "cpu-publish1",
+    "cpu-publish8",
+    "cpu-publish16",
+    "cpu-read",
+    "cpu-scan"
+  ],
+  "ssd_screen": [
+    "ext4-point8",
+    "ext4-batch8"
+  ],
+  "ssd_followup": [
+    "ext4-point1",
+    "ext4-batch1",
+    "ext4-point16",
+    "ext4-batch16"
+  ],
+  "cpu_scope": "Existing engine benchmarks; no WAL and data below freeze threshold. Child wait4 CPU/RSS include setup/close, unlike phase throughput. Scans report two phases sharing one invocation ID and child usage. Engine read/scan throughput, rather than raw map microbenchmarks.",
+  "screen": "CPU throughput floor0.90 each phase; SSD guards as in original plan. Stop after complete SSD screen cells if either fails, cancel unrun followup cells."
+}

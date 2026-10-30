@@ -1,0 +1,9 @@
+{
+  "phase": "warmup; no scored observations",
+  "cause": "liburing2.14 implicitly adds IORING_SETUP_NO_SQARRAY to all queue_init_params modes; the diagnostic strict flag check correctly rejected the result before measuring the linked mode.",
+  "observed_flags": "requested=0 actual=65536 result=0\nrequested=4352 actual=69888 result=0\nrequested=12288 actual=77824 result=0\n",
+  "failed_stderr": "setup flags: Input/output error\n",
+  "correction": "Use io_uring_setup plus queue_mmap and initialize the SQ index array explicitly; keep the original requested flags unchanged. All original warmup and failure evidence is retained separately.",
+  "initial_source_sha256": "3aa1a2241748fa91eea5008ef33bbf3bb85ba571acd2b24c7efef7366a4567ee",
+  "initial_binary_sha256": "df7b4737af73b8209c3c58c15aabf594945556dafca920d825dd273d3323ccfb"
+}

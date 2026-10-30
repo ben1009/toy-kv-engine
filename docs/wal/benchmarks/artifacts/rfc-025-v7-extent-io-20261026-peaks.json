@@ -1,0 +1,48 @@
+{
+  "ext4-point8": {
+    "v4_control": {
+      "arm": "old_v4",
+      "run_id": "1793021016264",
+      "binary_sha256": "614f0cb1adde43cabe900eb032c6f884783d658c597471d9d9ddc8faff314aa9",
+      "raw_sha256": "1250dd94e42a145181c4e7886db05601bf7b6d09ebd9053ae0c7f767af0983ba",
+      "puts_per_sec": 17252.90611375282
+    },
+    "retained_v7": {
+      "arm": "old_v7",
+      "run_id": "1793021065285",
+      "binary_sha256": "614f0cb1adde43cabe900eb032c6f884783d658c597471d9d9ddc8faff314aa9",
+      "raw_sha256": "5fe8c40dbe53dc598d0ebe828b8559b12a2c944a66cf5456e1b2f069ac06b1f7",
+      "puts_per_sec": 15552.312126045774
+    },
+    "candidate_v7": {
+      "arm": "new_v7",
+      "run_id": "1793021081826",
+      "binary_sha256": "3bf906ff74bba673c33ece1332c234717365e62350c433228c817bddda258cd2",
+      "raw_sha256": "686af96271e73b02bd2d3c6f554070c979bbc60bd0beafea6da306fc983b692d",
+      "puts_per_sec": 16051.931962800623
+    }
+  },
+  "ext4-batch64": {
+    "v4_control": {
+      "arm": "new_v4",
+      "run_id": "1793021286042",
+      "binary_sha256": "3bf906ff74bba673c33ece1332c234717365e62350c433228c817bddda258cd2",
+      "raw_sha256": "1d96bfdc63151a6a139f399c2fe45a0d513ca8976c3d026d9e6aada0b049486c",
+      "puts_per_sec": 390705.18979829864
+    },
+    "retained_v7": {
+      "arm": "old_v7",
+      "run_id": "1793021273874",
+      "binary_sha256": "614f0cb1adde43cabe900eb032c6f884783d658c597471d9d9ddc8faff314aa9",
+      "raw_sha256": "486193db11bfddeae52bec1d8c78fe761fea7186612b034a905a4880d29e331e",
+      "puts_per_sec": 383348.2442936901
+    },
+    "candidate_v7": {
+      "arm": "new_v7",
+      "run_id": "1793021249580",
+      "binary_sha256": "3bf906ff74bba673c33ece1332c234717365e62350c433228c817bddda258cd2",
+      "raw_sha256": "eaee7fc978640d7d35bb5b4fede71e53471ab1c1ca6fd90a85018ad5485f4fe0",
+      "puts_per_sec": 392085.07089230575
+    }
+  }
+}

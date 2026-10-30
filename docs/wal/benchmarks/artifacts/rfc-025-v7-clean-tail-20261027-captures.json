@@ -1,0 +1,414 @@
+[
+  {
+    "arm": "baseline",
+    "name": "case1-baseline",
+    "operations": 750000,
+    "run_id": "1793087876281",
+    "command": [
+      "/home/liu/proj/toy-kv-engine/target/release/write-perf-v7-clean-tail-baseline",
+      "--suite",
+      "legacy",
+      "--preset",
+      "smoke",
+      "--bench",
+      "wal_batch_concurrent",
+      "--wal",
+      "--wal-io-mode",
+      "parallel",
+      "--pitr",
+      "--pitr-format",
+      "v7",
+      "--num",
+      "750000",
+      "--threads",
+      "16",
+      "--wal-batch-size",
+      "64",
+      "--value-size",
+      "1024",
+      "--target-sst-size",
+      "2147483648",
+      "--compaction",
+      "none",
+      "--latency-sample-every",
+      "10",
+      "--output",
+      "json",
+      "--no-cleanup",
+      "--path",
+      "/home/liu/proj/toy-kv-engine/target/wal-opt/20261027-v7-clean-tail/case1-baseline-db"
+    ],
+    "excluded_from_scoring": true,
+    "binary": {
+      "path": "target/release/write-perf-v7-clean-tail-baseline",
+      "sha256": "1136ad34d9c9d5db9109a24069282ad1cd322db94224581ae722fb924054398f"
+    },
+    "preload_sha256": "7bef6a9cfadc9c803f955fb96e86bd65f5bdebd07aab39184d283832bfe3e46b",
+    "trace_samples": 1184,
+    "mapped_tickets": 11728,
+    "host_samples": 10,
+    "clean_sampled": true,
+    "sampling_errors": [],
+    "before": {
+      "time_utc": "2026-10-27T07:57:56.277768+00:00",
+      "competing": [],
+      "load_average": [
+        0.76953125,
+        0.49560546875,
+        0.4169921875
+      ],
+      "cpu_jiffies": [
+        17948971,
+        4950,
+        8056509,
+        6384143991,
+        3362593,
+        1157341,
+        1424574,
+        0,
+        0,
+        0
+      ]
+    },
+    "after": {
+      "time_utc": "2026-10-27T07:58:04.074269+00:00",
+      "competing": [],
+      "load_average": [
+        0.958984375,
+        0.5458984375,
+        0.4345703125
+      ],
+      "cpu_jiffies": [
+        17949872,
+        4950,
+        8056783,
+        6384167159,
+        3363041,
+        1157371,
+        1424595,
+        0,
+        0,
+        0
+      ]
+    },
+    "returncode": 0,
+    "raw_sha256": "c55921d4331b2ca22b61dd869be6c545cda86c8cb3bcc2649416bea1de0f25ff",
+    "files": {
+      "target/wal-opt/20261027-v7-clean-tail/case1-baseline-io.csv": "c54c6195bc3c37bb27df9114b1dd23b6776b6ad82bb2f3c25bfaa228ea262268",
+      "target/wal-opt/20261027-v7-clean-tail/case1-baseline-batch.jsonl": "757f77bba2248710d822f94c154d85fbb3f830846ac7b0c3c4769b017c890652",
+      "target/wal-opt/20261027-v7-clean-tail/case1-baseline-samples.jsonl": "00df335f86014a50ae1f3fdb59ab782725a423ba0876e9660fb281a9fbd26e8d",
+      "target/wal-opt/20261027-v7-clean-tail/case1-baseline-tickets.json": "f4158aa196c370e5bde051870acc103f5e1bce9562dbc601e414729abce07f0f",
+      "target/wal-opt/20261027-v7-clean-tail/case1-baseline.stdout": "e9e5fcf69f8249ff68e91eba878d39793278b9a7f1aac0cd1377798674390582",
+      "target/wal-opt/20261027-v7-clean-tail/case1-baseline.stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    }
+  },
+  {
+    "arm": "retirement_hint",
+    "name": "case2-retirement_hint",
+    "operations": 750000,
+    "run_id": "1793087899878",
+    "command": [
+      "/home/liu/proj/toy-kv-engine/target/release/write-perf-v7-clean-tail-retirement_hint",
+      "--suite",
+      "legacy",
+      "--preset",
+      "smoke",
+      "--bench",
+      "wal_batch_concurrent",
+      "--wal",
+      "--wal-io-mode",
+      "parallel",
+      "--pitr",
+      "--pitr-format",
+      "v7",
+      "--num",
+      "750000",
+      "--threads",
+      "16",
+      "--wal-batch-size",
+      "64",
+      "--value-size",
+      "1024",
+      "--target-sst-size",
+      "2147483648",
+      "--compaction",
+      "none",
+      "--latency-sample-every",
+      "10",
+      "--output",
+      "json",
+      "--no-cleanup",
+      "--path",
+      "/home/liu/proj/toy-kv-engine/target/wal-opt/20261027-v7-clean-tail/case2-retirement_hint-db"
+    ],
+    "excluded_from_scoring": true,
+    "binary": {
+      "path": "target/release/write-perf-v7-clean-tail-retirement_hint",
+      "sha256": "930cee423345951e970821cccbdf9503be089e62b55f2deb6f85688f633aec61"
+    },
+    "preload_sha256": "7bef6a9cfadc9c803f955fb96e86bd65f5bdebd07aab39184d283832bfe3e46b",
+    "trace_samples": 1184,
+    "mapped_tickets": 11728,
+    "host_samples": 10,
+    "clean_sampled": true,
+    "sampling_errors": [],
+    "before": {
+      "time_utc": "2026-10-27T07:58:19.872009+00:00",
+      "competing": [],
+      "load_average": [
+        0.81396484375,
+        0.53515625,
+        0.43310546875
+      ],
+      "cpu_jiffies": [
+        17950133,
+        4950,
+        8056899,
+        6384217191,
+        3363099,
+        1157396,
+        1424624,
+        0,
+        0,
+        0
+      ]
+    },
+    "after": {
+      "time_utc": "2026-10-27T07:58:27.644046+00:00",
+      "competing": [],
+      "load_average": [
+        0.9892578125,
+        0.576171875,
+        0.447265625
+      ],
+      "cpu_jiffies": [
+        17951030,
+        4950,
+        8057169,
+        6384240329,
+        3363541,
+        1157426,
+        1424644,
+        0,
+        0,
+        0
+      ]
+    },
+    "returncode": 0,
+    "raw_sha256": "361a6e4fbea8ccbeb5793c66bdf99512ab7583af66b259cf1d28bd1601812db4",
+    "files": {
+      "target/wal-opt/20261027-v7-clean-tail/case2-retirement_hint-io.csv": "0619d2ea31420ff06fcee9273cdd06ac76e69dc6e74e762e86a9062c8a0b18b8",
+      "target/wal-opt/20261027-v7-clean-tail/case2-retirement_hint-batch.jsonl": "1b8f1411df735d77e3f08b6cf1e1eeeea7d27367020fd1202535506ab89d99c9",
+      "target/wal-opt/20261027-v7-clean-tail/case2-retirement_hint-samples.jsonl": "3827fefbffebac35a482c9548a25d7d2b7642140fd454f973c902c5b83a0f45a",
+      "target/wal-opt/20261027-v7-clean-tail/case2-retirement_hint-tickets.json": "6edd37d8b8325f40dcf01c569c53d092e8048075db41728ff8ccfe6817fc7082",
+      "target/wal-opt/20261027-v7-clean-tail/case2-retirement_hint.stdout": "7c606834def0d1703d7c5a50f9111d8601f4c87cb42a6ea766b27ffac1221988",
+      "target/wal-opt/20261027-v7-clean-tail/case2-retirement_hint.stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    }
+  },
+  {
+    "arm": "retirement_hint",
+    "name": "case3-retirement_hint",
+    "operations": 750000,
+    "run_id": "1793087923454",
+    "command": [
+      "/home/liu/proj/toy-kv-engine/target/release/write-perf-v7-clean-tail-retirement_hint",
+      "--suite",
+      "legacy",
+      "--preset",
+      "smoke",
+      "--bench",
+      "wal_batch_concurrent",
+      "--wal",
+      "--wal-io-mode",
+      "parallel",
+      "--pitr",
+      "--pitr-format",
+      "v7",
+      "--num",
+      "750000",
+      "--threads",
+      "16",
+      "--wal-batch-size",
+      "64",
+      "--value-size",
+      "1024",
+      "--target-sst-size",
+      "2147483648",
+      "--compaction",
+      "none",
+      "--latency-sample-every",
+      "10",
+      "--output",
+      "json",
+      "--no-cleanup",
+      "--path",
+      "/home/liu/proj/toy-kv-engine/target/wal-opt/20261027-v7-clean-tail/case3-retirement_hint-db"
+    ],
+    "excluded_from_scoring": true,
+    "binary": {
+      "path": "target/release/write-perf-v7-clean-tail-retirement_hint",
+      "sha256": "930cee423345951e970821cccbdf9503be089e62b55f2deb6f85688f633aec61"
+    },
+    "preload_sha256": "7bef6a9cfadc9c803f955fb96e86bd65f5bdebd07aab39184d283832bfe3e46b",
+    "trace_samples": 1184,
+    "mapped_tickets": 11728,
+    "host_samples": 6,
+    "clean_sampled": true,
+    "sampling_errors": [],
+    "before": {
+      "time_utc": "2026-10-27T07:58:43.449799+00:00",
+      "competing": [],
+      "load_average": [
+        0.98095703125,
+        0.603515625,
+        0.458984375
+      ],
+      "cpu_jiffies": [
+        17951291,
+        4950,
+        8057275,
+        6384290387,
+        3363596,
+        1157451,
+        1424673,
+        0,
+        0,
+        0
+      ]
+    },
+    "after": {
+      "time_utc": "2026-10-27T07:58:47.176706+00:00",
+      "competing": [],
+      "load_average": [
+        0.98095703125,
+        0.603515625,
+        0.458984375
+      ],
+      "cpu_jiffies": [
+        17951762,
+        4950,
+        8057419,
+        6384301423,
+        3363805,
+        1157465,
+        1424682,
+        0,
+        0,
+        0
+      ]
+    },
+    "returncode": 0,
+    "raw_sha256": "f207f1ad20403e05c3d04066426776c10f26f94b748d5b152616af166b18e3c2",
+    "files": {
+      "target/wal-opt/20261027-v7-clean-tail/case3-retirement_hint-io.csv": "113a636cbb1a76ffd06e1a028909bae84ce1f6aac8f366e89a211c2de5602124",
+      "target/wal-opt/20261027-v7-clean-tail/case3-retirement_hint-batch.jsonl": "f5e79518b496972aeb8fd0ea8648f8a844453646f760771556dab4a4149d8bb4",
+      "target/wal-opt/20261027-v7-clean-tail/case3-retirement_hint-samples.jsonl": "7f8dc628fec65fcd145c0f0c002da7871d0d02cf8677951dc57c91e433e85408",
+      "target/wal-opt/20261027-v7-clean-tail/case3-retirement_hint-tickets.json": "97c7740c3637552a9cd2ebf893542a4648985f3829211f15562a369db9644532",
+      "target/wal-opt/20261027-v7-clean-tail/case3-retirement_hint.stdout": "c2079cacd07d72d89cea6d325e59c6d5998e2942306885c5a70070fa056d93fe",
+      "target/wal-opt/20261027-v7-clean-tail/case3-retirement_hint.stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    }
+  },
+  {
+    "arm": "baseline",
+    "name": "case4-baseline",
+    "operations": 750000,
+    "run_id": "1793087942964",
+    "command": [
+      "/home/liu/proj/toy-kv-engine/target/release/write-perf-v7-clean-tail-baseline",
+      "--suite",
+      "legacy",
+      "--preset",
+      "smoke",
+      "--bench",
+      "wal_batch_concurrent",
+      "--wal",
+      "--wal-io-mode",
+      "parallel",
+      "--pitr",
+      "--pitr-format",
+      "v7",
+      "--num",
+      "750000",
+      "--threads",
+      "16",
+      "--wal-batch-size",
+      "64",
+      "--value-size",
+      "1024",
+      "--target-sst-size",
+      "2147483648",
+      "--compaction",
+      "none",
+      "--latency-sample-every",
+      "10",
+      "--output",
+      "json",
+      "--no-cleanup",
+      "--path",
+      "/home/liu/proj/toy-kv-engine/target/wal-opt/20261027-v7-clean-tail/case4-baseline-db"
+    ],
+    "excluded_from_scoring": true,
+    "binary": {
+      "path": "target/release/write-perf-v7-clean-tail-baseline",
+      "sha256": "1136ad34d9c9d5db9109a24069282ad1cd322db94224581ae722fb924054398f"
+    },
+    "preload_sha256": "7bef6a9cfadc9c803f955fb96e86bd65f5bdebd07aab39184d283832bfe3e46b",
+    "trace_samples": 1184,
+    "mapped_tickets": 11728,
+    "host_samples": 12,
+    "clean_sampled": true,
+    "sampling_errors": [],
+    "before": {
+      "time_utc": "2026-10-27T07:59:02.959136+00:00",
+      "competing": [],
+      "load_average": [
+        0.84375,
+        0.59033203125,
+        0.45654296875
+      ],
+      "cpu_jiffies": [
+        17952048,
+        4950,
+        8057546,
+        6384351362,
+        3363859,
+        1157491,
+        1424714,
+        0,
+        0,
+        0
+      ]
+    },
+    "after": {
+      "time_utc": "2026-10-27T07:59:12.988009+00:00",
+      "competing": [],
+      "load_average": [
+        1.9794921875,
+        0.84912109375,
+        0.54296875
+      ],
+      "cpu_jiffies": [
+        17952794,
+        4950,
+        8057766,
+        6384381596,
+        3364596,
+        1157521,
+        1424737,
+        0,
+        0,
+        0
+      ]
+    },
+    "returncode": 0,
+    "raw_sha256": "e423fa97c3355d107e7d93b35022ba71f15dcc2468fa055496c16c977ba6628f",
+    "files": {
+      "target/wal-opt/20261027-v7-clean-tail/case4-baseline-io.csv": "940e0542697b59fabc8e03f1c5c64e8b44d3b0a6e35d5862b952c2475b474bf7",
+      "target/wal-opt/20261027-v7-clean-tail/case4-baseline-batch.jsonl": "fbfb0af463b0509db3f080cda425fcbee998e81c1c0590abdd918fe8edac325d",
+      "target/wal-opt/20261027-v7-clean-tail/case4-baseline-samples.jsonl": "3c2dd7a77e20ca6e03b6fc723cca4cec4bc1ce2a92fe03e7b97b02b722940dd5",
+      "target/wal-opt/20261027-v7-clean-tail/case4-baseline-tickets.json": "5193b019818f8b8b131b8ae0ec4d58ced7cae5f6ea5b47911452a7e69574b5f2",
+      "target/wal-opt/20261027-v7-clean-tail/case4-baseline.stdout": "920eadd5e74f57e0297bab143a53e16b8f20a1693c6b7bc6db303828741e89a8",
+      "target/wal-opt/20261027-v7-clean-tail/case4-baseline.stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    }
+  }
+]

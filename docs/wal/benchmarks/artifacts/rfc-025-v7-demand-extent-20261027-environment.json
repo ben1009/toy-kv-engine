@@ -1,0 +1,19 @@
+{
+  "source_base": "0ffebd516b865b01371ed65014ac0347ae2fb420",
+  "rustc": "rustc 1.100.0-nightly (6bb1652a0 2026-09-22)\nbinary: rustc\ncommit-hash: 6bb1652a020e80cef79332741d89e996d71933c9\ncommit-date: 2026-09-22\nhost: x86_64-unknown-linux-gnu\nrelease: 1.100.0-nightly\nLLVM version: 23.1.1\n",
+  "kernel": "Linux 6.12.71-1-lts #1 SMP PREEMPT_DYNAMIC Fri, 13 Feb 2026 19:12:56 +0000 x86_64",
+  "mount": "ext4 /dev/nvme0n1p3 rw,relatime",
+  "queue": {
+    "max_hw_sectors_kb": "512",
+    "max_sectors_kb": "512",
+    "physical_block_size": "512",
+    "max_segments": "128",
+    "nr_requests": "255"
+  },
+  "source_manifest_sha256": "749914e9c18747253156a7178025a4a682a9c65e96672f6fb4836df3f32b03e7",
+  "build_command": "cargo build --release --package kv-engine --bin write-perf --features bench",
+  "candidate_build_log_sha256": "9cbe535adc554f98672c8ae58cebb6de7e3fc946a52fde8cf78484c17505cb9e",
+  "created_at_utc": "2026-10-26T17:34:24.074824+00:00",
+  "patch_sha256": "3c9d47fb56aaaca5487352edbe88374960a6acceabbd55d2454d37cd3384d088",
+  "plan_sha256": "591549bcb26ee5f3d1b8f7a4bc82f6502c35a9202ef44c1d4ff1abe898ffa855"
+}

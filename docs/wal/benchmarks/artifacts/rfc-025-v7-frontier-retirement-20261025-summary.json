@@ -1,0 +1,71 @@
+{
+  "binary_sha256": [
+    "06efc8d7dc473ddfd770832c9075c6cfffdc9ab05df13460481d4f2302f2625b",
+    "0eb717d809a8baef5397398b086d5f5243c83b1167f3261378682d9d750005f9"
+  ],
+  "artifact_sha256": {
+    "-run.sh": "383363d52f18b9cabab95b14a30337808cb9772e3c444a85514fecc35b4e504f",
+    "-runs.tsv": "e60d72f9e838980c396c295ab9117517a44baf11b7e499e8fe37f5687041716c",
+    ".jsonl": "21ccd5eb6f256d4badea6b6d51eba89cb2858b6c9fec4481a70d582787ae5a36"
+  },
+  "pairs": [
+    {
+      "writers": 8,
+      "pair": 1,
+      "v7_throughput_change": 1.0243727576539492,
+      "normalized_v7_v4_change": 1.0075952886767818,
+      "v7_p50_change": 0.9439073236421394,
+      "v7_p99_change": 0.6678524070651021,
+      "v7_cpu_change": 1.0184349730752524
+    },
+    {
+      "writers": 8,
+      "pair": 2,
+      "v7_throughput_change": 1.068336602695415,
+      "normalized_v7_v4_change": 1.077387977862992,
+      "v7_p50_change": 0.9532566525952385,
+      "v7_p99_change": 0.969861107457344,
+      "v7_cpu_change": 0.9566433381050846
+    },
+    {
+      "writers": 8,
+      "pair": 3,
+      "v7_throughput_change": 1.1423891379639235,
+      "normalized_v7_v4_change": 1.0932662038648489,
+      "v7_p50_change": 0.8930038323394457,
+      "v7_p99_change": 0.7738398724059244,
+      "v7_cpu_change": 0.9047078981324942
+    },
+    {
+      "writers": 8,
+      "pair": 4,
+      "v7_throughput_change": 1.0436999089061596,
+      "normalized_v7_v4_change": 0.9866829312174816,
+      "v7_p50_change": 0.9528534704370181,
+      "v7_p99_change": 0.6141480354019125,
+      "v7_cpu_change": 0.995884930239909
+    },
+    {
+      "writers": 8,
+      "pair": 5,
+      "v7_throughput_change": 1.0483740785277622,
+      "normalized_v7_v4_change": 1.0121404639388856,
+      "v7_p50_change": 0.9488762402627551,
+      "v7_p99_change": 1.5724557442170422,
+      "v7_cpu_change": 0.9850528428883509
+    }
+  ],
+  "median_puts_per_sec": {
+    "new_v4": 205831.53930906724,
+    "new_v7": 112472.22270704,
+    "old_v4": 200761.31098260335,
+    "old_v7": 107012.11638909162
+  },
+  "median_changes": {
+    "v7_throughput_change": 1.0483740785277622,
+    "normalized_v7_v4_change": 1.0121404639388856,
+    "v7_p50_change": 0.9488762402627551,
+    "v7_p99_change": 0.7738398724059244,
+    "v7_cpu_change": 0.9850528428883509
+  }
+}

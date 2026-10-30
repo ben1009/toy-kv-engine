@@ -1,0 +1,15 @@
+{
+  "source_base": "cda2ce872f6a520743c02ba5e20b1accf3fa21a5",
+  "assessment_passed": false,
+  "source_retained": false,
+  "cpu_is_diagnostic": true,
+  "captured_cells": [
+    "ext4-batch16",
+    "ext4-batch8"
+  ],
+  "cancelled_cells": [
+    "ext4-point8",
+    "ext4-batch1"
+  ],
+  "reason": "The predeclared aggregate-stall view passes the16-writer screen on3 matched pairs (+0.8% throughput,-14.3% p99). All3 batch8 pairs remain after filtering and lose11.8% paired throughput with1.3% higher p99 and11.1% more syncs. Cancel point8/batch1 and restore f7. The16-writer fastest matched pair also favors baseline; do not claim a uniform16-writer benefit or use raw stalls as the rejection reason. CPU is diagnostic only."
+}

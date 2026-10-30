@@ -1,0 +1,71 @@
+{
+  "created_at_utc": "2026-10-27T14:42:01.340607+00:00",
+  "ssd_initial_cooldown_seconds": 30,
+  "ssd_between_seconds": 10,
+  "cells": {
+    "ext4-batch16": {
+      "kind": "ssd",
+      "bench": "wal_batch_concurrent",
+      "writers": 16,
+      "operations": 750000,
+      "reads": 500000,
+      "scan_num": 100000,
+      "batch": 64,
+      "sample_every": 10,
+      "arms": [
+        "v4",
+        "v7"
+      ],
+      "pairs": 5
+    },
+    "ext4-batch8": {
+      "kind": "ssd",
+      "bench": "wal_batch_concurrent",
+      "writers": 8,
+      "operations": 750000,
+      "reads": 500000,
+      "scan_num": 100000,
+      "batch": 64,
+      "sample_every": 10,
+      "arms": [
+        "v4",
+        "v7"
+      ],
+      "pairs": 3
+    },
+    "ext4-point8": {
+      "kind": "ssd",
+      "bench": "wal_concurrent",
+      "writers": 8,
+      "operations": 100000,
+      "reads": 500000,
+      "scan_num": 100000,
+      "batch": null,
+      "sample_every": 100,
+      "arms": [
+        "v4",
+        "v7"
+      ],
+      "pairs": 3
+    },
+    "ext4-batch1": {
+      "kind": "ssd",
+      "bench": "wal_batch_concurrent",
+      "writers": 1,
+      "operations": 750000,
+      "reads": 500000,
+      "scan_num": 100000,
+      "batch": 64,
+      "sample_every": 10,
+      "arms": [
+        "v4",
+        "v7"
+      ],
+      "pairs": 3
+    }
+  },
+  "screen": [],
+  "followup": [],
+  "confirmation": [],
+  "guard_scope": "Descriptive format comparison only; run all four fixed cells despite any throughput/p99 difference. No new source or adoption decision."
+}

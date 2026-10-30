@@ -1,0 +1,17 @@
+{
+  "screens": {
+    "rfc-025-v7-dynamic-window-20261030": {
+      "invocations": 36,
+      "scored": 27,
+      "summary_sha256": "4121a46a659d98034d128e34dbee865895c21d015076469db06c44e042778ba8"
+    },
+    "rfc-025-v7-dynamic-point-20261030": {
+      "invocations": 24,
+      "scored": 18,
+      "summary_sha256": "20229d62bcc779920ba63560d7c0817515e9b87283ea3204cfa65b7506acdab5"
+    }
+  },
+  "unique_invocations": 60,
+  "source_matches_benchmark": true,
+  "candidate_sha256": "53d9ddddf0490142bbc5449ebf47b20af363e06c04259f4e74367cc3e7614907"
+}

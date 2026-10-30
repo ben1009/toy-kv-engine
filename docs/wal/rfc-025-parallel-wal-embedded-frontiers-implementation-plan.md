@@ -2342,6 +2342,499 @@ One sync per advance does not promise v4/v6 latency parity. Material regressions
 need a recorded maintainer adoption decision; performance does not silently
 create a permanent v7 Leader default or a new format exception.
 
+The first exploratory baseline-v4 Parallel versus current-v4 Parallel screen is
+recorded in the [2026-10-24 report](benchmarks/rfc-025-v4-parallel-first-leg-20261024.md).
+It covers three paired repeats of single-writer and four-writer WAL puts plus a
+mixed WAL workload on tmpfs and ext4. The ext4 results are unstable, and this
+partial screen has no same-binary controls; it does not satisfy or pass the
+Stage 8 performance gate.
+
+The next exploratory comparison, current v7 Parallel with PITR versus current
+v4 Parallel without PITR, is recorded in the
+[2026-10-24 report](benchmarks/rfc-025-v7-parallel-vs-v4-20261024.md). It uses
+the same single-writer and four-writer put workloads on both filesystems. The
+four-writer throughput loss is consistent in these three pairs, while device
+single-writer results remain variable. This comparison also does not pass the
+Stage 8 performance gate.
+
+The follow-up v7 Parallel versus v4 Parallel writer sweep is recorded in the
+[2026-10-25 report](benchmarks/rfc-025-v7-parallel-vs-v4-parallel-writer-sweep-20261025.md).
+It combines the original 1/4-writer pairs with new 8/16-writer pairs. V7 has
+lower median throughput in all eight filesystem/writer cells; the larger
+tmpfs losses are consistent across pairs. The result remains exploratory and
+does not pass the Stage 8 performance gate.
+
+The v7 Parallel versus v7 Leader scheduler comparison is recorded in the
+[2026-10-25 report](benchmarks/rfc-025-v7-parallel-vs-leader-20261025.md).
+It uses the same single-writer and four-writer PITR workloads. Parallel loses
+single-writer throughput on both filesystems and tmpfs four-writer throughput,
+while its four-writer ext4 throughput is about 3.56 times Leader across the
+first two stable pairs. The small sample has no null controls and does not pass
+the Stage 8 performance gate.
+
+The v7 Leader versus v6 Leader format comparison is recorded in the
+[2026-10-25 report](benchmarks/rfc-025-v7-leader-vs-v6-leader-20261025.md).
+It holds Leader scheduling and PITR constant. V7 is near parity for single
+writer ext4 but has lower throughput in all four-writer pairs, with median
+paired throughput ratios of 0.451 on tmpfs and 0.475 on ext4. Four-writer v7
+runs issue 50,000 syncs/frontiers versus roughly 25,000 v6 syncs on tmpfs and
+24,000 on ext4, and use nearly twice the WAL bytes. This small screen lacks
+same-binary controls and does not pass the Stage 8 performance gate.
+
+The end-to-end candidate v7 Parallel versus baseline v6 Leader comparison is
+recorded in the [2026-10-25 report](benchmarks/rfc-025-v7-parallel-vs-baseline-v6-20261025.md).
+It uses the pinned pre-v7 v6 source and single-put PITR workloads at 1, 4, 8,
+and 16 writers. V7 Parallel loses throughput at every count on tmpfs and at one
+writer on ext4; ext4 favors v7 at 4, 8, and 16 writers. The result is
+exploratory, has no same-binary controls, and does not pass the Stage 8
+performance gate.
+
+The synchronous v7 Parallel point path now prepares owned encoded entries and
+charged DATA buffers before taking the MVCC sequencer. Five paired 8-writer
+runs show a 5.2% median improvement in the v7:v4 ratio on tmpfs. Ext4 shows no
+confirmed gain: the median normalized change is -1.8% initially and -1.1% in
+a separate complete rerun (-1.4% across all ten pairs). Slowdowns occur in both
+v7 builds. The [writer-sweep report](benchmarks/rfc-025-v7-parallel-vs-v4-parallel-writer-sweep-20261025.md#mvcc-preparation-before-the-sequencer)
+records the comparisons and ownership/capacity checks. This does not meet the
+Stage 8 performance gate or establish parity with v4.
+
+
+Active v7 Parallel now shares extent preparation between DATA and FRONTIER
+writers on ext-family filesystems, with allocation alone for large-only DATA
+groups. The final five-pair, 8-writer ext4 point-write comparison improves the
+median v4-normalized v7 throughput by 15.7%. Its highest score is 15,256 puts/s,
+versus the previous retained v7 high of 12,596 and a new v4 control high of
+20,420 under matching settings. The highest-score gap to v4 is still 25.3%.
+All stalled runs remain in the [extent-initialization follow-up](benchmarks/rfc-025-v7-parallel-vs-v4-parallel-writer-sweep-20261025.md#shared-v7-extent-initialization-on-ext4).
+The batch64 repeat has a 3.4% lower v7 peak and a 1.0% lower median paired raw
+throughput; variable controls prevent a no-regression claim. Sixty focused
+correctness tests pass. This remains exploratory and does not pass the Stage 8
+gate.
+
+
+The next [resource-retirement experiments](benchmarks/rfc-025-v7-resource-retirement-20261025.md)
+are rejected. Combining per-ticket buffer and marker-credit retirement improves
+the median v7:v4 throughput ratio on tmpfs by 5.8% across ten pairs, but lowers
+the pooled batch64 ratio by 4.0%. A whole-group variant adds complexity without
+a useful measured gain. Both source changes are reverted; the highest retained
+ext4 point-write score remains 15,256 puts/s versus v4's 20,420. The performance
+gate remains unmet.
+
+The [ordered packer encoding follow-up](benchmarks/rfc-025-v7-packer-encoding-20261025.md)
+is retained. Admission still assigns tickets, timestamps, and physical ranges;
+the ordered packer now frames DATA and hashes logical batches outside the MVCC
+sequencer/admission locks, publishing each group endpoint's digest before I/O.
+Existing buffer charges cover queued inputs. Deterministic deferred-framing
+and failure tests pass, as do all 1,958 tests in `cargo make check`. Five paired
+8-writer batch64 comparisons improve raw throughput by 1.90x on ext4 and
+3.52x on tmpfs. The highest ext4 batch64 score is 341,049 puts/s versus the
+previous retained v7 high of 194,069 and v4's 482,410; the remaining gap is
+29.3%. Single puts peak at 15,278 versus v4's 20,420, a 25.2% gap. Ten
+single-writer tmpfs pairs have 1.6% lower raw throughput, 0.7% higher normalized
+throughput, and 1.5% higher sampled p99. All stalls and unfavorable comparisons
+remain recorded. This does not establish parity or pass the Stage 8 gate.
+
+The [extent readiness cache follow-up](benchmarks/rfc-025-v7-extent-readiness-cache-20261025.md)
+retains a small shared atomic cursor for successful allocation/preparation.
+DATA and FRONTIER requests inside that prefix avoid the preparation mutex
+and inode query; growth and failed initialization preserve the existing rules.
+The cursor never represents DATA completion or durability. All 1,958 tests
+pass. Five cooled ext4 pairs improve median raw v7 throughput 1.5% for
+single puts and 8.0% for batch64. Highest scores are 15,759 and 391,992 puts/s,
+22.8% and 18.7% below the historical v4 highs. The same cooled baseline reaches
+373,687 batch64 puts/s, so the candidate peak improves 4.9% against that
+stronger control. Single-writer tmpfs throughput falls 1.8%, and tmpfs batch64's
+normalized throughput falls 2.8% despite higher raw throughput and lower CPU.
+All mixed controls, sparse batch latency samples, temperatures, and stalled
+runs remain recorded. A packer-wakeup replacement is rejected and reverted
+after a 22.4% tmpfs throughput loss. V4 parity and the Stage 8 gate remain unmet.
+
+The eight retained optimizations are split into independent commits. The next
+[ticket-boundary cache experiments](benchmarks/rfc-025-v7-ticket-boundary-experiments-20261025.md)
+are rejected: an initial normalized CPU-side gain does not replicate in the
+final implementation with authoritative rejection checks. The final SSD
+batch64 repeat loses raw throughput in all five pairs (6.1% median) and uses
+13.5% more CPU. Both variants pass their correctness checks, but neither
+implementation remains in production. The committed extent-cache source and
+executable are restored, with retained highest scores unchanged at 15,759 /
+391,992 puts/s against v4's 20,420 / 482,410. All initial and final measurements,
+source patches, hashes, and the unrelated compaction-test retry are recorded.
+
+The [FRONTIER lock-scope follow-up](benchmarks/rfc-025-v7-frontier-lock-scope-20261025.md)
+retains moving frame allocation, encoding, and hashing outside admission after
+reserving the marker and publishing its physical range. Captured predecessor
+and prefix ownership remain with the single sync coordinator; wire bytes,
+sync ordering, poisoning, and recovery rules remain the same. All 1,958 tests
+pass. Ext4 point throughput improves 3.7% in five paired comparisons, and tmpfs
+batch64 throughput improves 9.8% with 8.3% less CPU. Across ten SSD batch64
+pairs, raw throughput improves 3.1%, the v4-normalized ratio improves 1.0%,
+and CPU rises 0.8%; the screen's SSD CPU decrease does not replicate. Solo
+tmpfs raw throughput rises 2.1%, but its normalized ratio falls 3.9%. Candidate
+ext4 peaks are 15,750 / 370,652 puts/s, below the stronger historical v7 highs
+of 15,759 / 391,992 and 22.9% / 23.2% below the highest v4 references. Every
+stall, sparse batch latency result, and unfavorable control remains recorded.
+V4 parity and the Stage 8 gate remain unmet.
+
+The [preparation and batching follow-up](benchmarks/rfc-025-v7-preparation-and-batching-20261025.md)
+retains a conservative reservation-owner hint within the existing 100/400 µs
+coalescing deadline. It never supplies a durability bound, and closed admission
+ignores it. Across ten ext4 batch64 pairs, raw throughput improves 6.8%, the
+v4-normalized ratio improves 10.7%, and CPU falls 2.8%. Ext4 point throughput
+rises 1.1% raw but falls 2.0% normalized; solo tmpfs throughput falls 1.4% raw.
+All 1,961 tests pass, with an unrelated compaction timeout/retry recorded.
+Canonical-index skipping, partial frame initialization, and a bounded batch
+buffer pool are rejected and reverted. Candidate ext4 peaks remain 15,664 /
+390,163 puts/s, 23.3% / 19.1% below the strongest v4 references and below the
+prior retained v7 highs. All 300 scored records, 60 warmups, patches, and hashes
+remain available. V4 parity and the Stage 8 gate remain unmet.
+
+The [immutable logical-batch follow-up](benchmarks/rfc-025-v7-validated-logical-batch-20261025.md)
+retains an encoder-owned type whose bytes remain immutable from admission
+through framing and logical hashing. It avoids rereading the producer-computed
+entry CRC in the ordered packer; raw input and recovery retain full CRC checks,
+and physical bounds and ticket assignments remain checked. Persisted bytes and
+durability ordering are unchanged. All 1,963 tests pass with zero skips/retries
+and one unrelated slow compaction test. Across ten cooled ext4 batch64 pairs,
+raw throughput improves 10.1%, the v4-normalized ratio improves 5.6%, and CPU
+falls 8.0%. Ext4 point throughput rises 1.1% raw and is nearly flat normalized.
+Tmpfs batch64 rises 17.7% raw, but tmpfs point8 falls 5.1% raw with 3.0% more
+CPU; its normalized ratio rises 4.2%. Solo tmpfs rises 4.5% raw. Candidate ext4
+peaks remain 15,541 / 381,813 puts/s, 23.9% / 20.9% below the strongest v4
+references and below the earlier retained v7 highs. All 120 scored records,
+24 warmups, three unscored profiles, source patch, and hashes remain available.
+V4 parity and the Stage 8 gate remain unmet.
+
+The [maintenance-state clone experiment](benchmarks/rfc-025-v7-maintenance-snapshot-20261025.md)
+is rejected and reverted. Borrowing scheduling coordinates and checking pending
+obligations in place improves ext4 point throughput 1.2% raw and 1.0% normalized
+across ten pairs, with 3.2% less CPU. However, ten ext4 batch64 pairs lose 5.8%
+raw throughput and 3.8% normalized, with 3.6% more CPU. The batch guard prevents
+retention; no claim of uniform improvement follows from the point result.
+The eleven earlier optimizations remain. All 140 scored records, 28 warmups,
+three unscored profiles, rejected source patch, and hashes are preserved.
+V4 parity and the Stage 8 gate remain unmet.
+
+The [borrowed producer preparation experiment](benchmarks/rfc-025-v7-borrowed-preparation-20261026.md)
+is rejected and reverted. It removes temporary owned key/value copies while
+preserving exact canonical bytes, limits, charges, and admission ordering.
+All 1,966 prototype tests pass. Tmpfs batch64 throughput improves 4.6% raw and
+3.4% normalized with 2.5% less CPU; ext4 point throughput rises 2.5% raw and
+4.1% normalized. However, ten ext4 batch64 pairs lose 3.1% raw throughput and
+10.0% normalized, with 2.9% more CPU, so the fixed guard prevents retention.
+All 120 scored records, 24 warmups, three unscored profiles, rejected source
+patch, and hashes remain available. The eleven earlier optimizations remain;
+v4 parity and the Stage 8 gate remain unmet.
+
+The [critical-path diagnosis](benchmarks/rfc-025-v7-critical-path-20261026.md)
+identifies ordered prefix SHA-256 before DATA submission as the largest sampled
+batch packer CPU cost. Removing v7's fast-sync wait improves tmpfs batch
+throughput 8.3% raw and 6.7% normalized, but raises point CPU 17.6% and sampled
+p99 86.1%; that policy is rejected and its planned SSD qualification is cancelled.
+All 24 scored records, eight warmups, three unscored profiles, sample records,
+and source identities are preserved. The retained coalescing policy remains.
+V4 parity and the Stage 8 gate remain unmet.
+
+The [hash-stage and group-hint investigation](benchmarks/rfc-025-v7-large-group-hint-cache-20261026.md)
+rejects coordinator hash offload and selective fast-sync coalescing experiments.
+Offload improves CPU batch throughput but can serialize required hashing with
+SSD sync work; a fixed policy loses 31.5% SSD batch throughput. Precomputed
+group-size hints with a negative cache improve tmpfs batch throughput 10.1%
+raw and 12.2% normalized, with nearly flat CPU, but the fixed ten-pair SSD
+confirmation has a per-arm median-rate ratio of 0.94584, below its 0.95 floor.
+The paired SSD throughput is nearly flat, so the evidence does not justify a
+reliable SSD gain. All changes are reverted; the eleven earlier optimizations
+remain and a fresh full check passes 1,963 restored-source tests. All 408 scored
+records, 112 warmups, three unscored profiles, seven source patches/manifests,
+and saved binary identities remain available. The retained executable reaches
+480,373 puts/s in the longer SSD batch cell; historical short-cell references
+remain separate. V4 parity and the full Stage 8 gate remain unmet.
+
+The [full durability-cycle feedback experiment](benchmarks/rfc-025-v7-durability-cycle-cost-20261026.md)
+is rejected and reverted. It measures FRONTIER preparation/write, WAL sync,
+and marker publication/credit cleanup, then uses that cost for the existing
+100/400-microsecond coalescing choice. Across 74,894 scored SSD cycles, the
+broader duration changes zero classifications relative to fdatasync alone;
+the missing timing scope does not explain the SSD gap through this threshold.
+SSD batch throughput loses 2.4% raw and point gains only 0.9%, failing the
+predeclared material-gain guard. All 76 scored records and 20 warmups remain.
+The eleven earlier optimizations remain; a fresh full check passes 1,963
+restored-source tests, with one slow compaction integration test and no skips.
+V4 parity and the full Stage 8 gate remain unmet.
+
+The [requested SSD timing-policy rerun](benchmarks/rfc-025-v7-durability-cycle-cost-ssd-rerun-20261026.md)
+uses the unchanged candidate binary for 40 new scored records and eight warmups.
+Pooling ten pairs per SSD workload gives -0.4% raw batch throughput and +1.0%
+raw point throughput, with unstable moving v4 controls. All 150,272 original
+and rerun candidate cycles report zero changed batching classifications.
+The stronger retained v7 batch peak of 480,373 puts/s remains recorded; the
+timing candidate peaks at 441,889 batch / 16,612 point puts/s. The retained
+source and canonical binary are unchanged. V4 parity and Stage 8 remain unmet.
+
+The [buffered-I/O experiments and audited SSD rerun](benchmarks/rfc-025-v7-buffered-io-ssd-20261026.md)
+reject both buffered FRONTIER-only and fully buffered Parallel handles. After
+the maintainer reported a competing Rust project, the original 80 scored
+records and 16 warmups were excluded from qualification. The exact saved
+executables were rerun after that project finished: 80 new scored records,
+16 warmups, and 967 clear host-process samples. FRONTIER-only throughput loses
+2.2% point / 2.8% batch raw; fully buffered throughput loses 12.4% / 13.6%.
+Neither passes the fixed SSD guards, so dependent RAM and confirmation cells
+are cancelled. Both source changes are reverted; a fresh full check passes
+1,963 restored-source tests, with one slow compaction integration test and no
+skips or retries. All captures, source patches, identities, and audit records
+remain. The eleven earlier optimizations remain; v4 parity and Stage 8 remain
+unmet.
+
+The [DATA packer refill experiments](benchmarks/rfc-025-v7-packer-refill-20261026.md)
+reject both bounded refill policies. Broad refill reduces point / batch DATA
+groups by about 30% / 43%, but batch throughput loses 7.6% raw. Small-write-only
+refill reuses the endpoint admission guard and keeps large-only groups on the
+original path; point throughput is flat with 2.6% less CPU, while batch loses
+1.5% raw and 7.2% normalized. Neither meets the fixed SSD acceptance criteria,
+so dependent RAM and confirmation cells are cancelled. Both source changes
+are reverted. The two prototypes pass 1,965 / 1,966 full-check tests. All 80
+scored records, 16 warmups, 921 clear host samples, three unscored profiles,
+source reconstructions and saved executable identities remain available.
+The eleven retained optimizations remain; v4 parity and Stage 8 remain unmet.
+
+The [System/mimalloc trials](benchmarks/rfc-025-v7-mimalloc-20261026.md), suggested
+by the DataFusion point-query allocator study, test Rust-only mimalloc and a
+separate policy covering aligned WAL buffers too. The full policy improves
+RAM v7 point8 / batch64 throughput 11.7% / 18.9%, with 11.7% less / nearly flat
+CPU, but raises peak RSS 49.6% / 22.4%. SSD point throughput is nearly flat;
+SSD batch gains 1.2% with 11.6% more CPU. V4 solo and SSD point p99 also fail
+the fixed limits. Neither policy is adopted; both are reverted and System
+remains selected. All 152 scored records, 40 warmups, 1,398 clear host samples,
+12 excluded diagnostics, source patches and native memory evidence remain.
+The prototypes pass 1,963 / 1,964 full-check tests, and a fresh restored-source
+check passes 1,963 with zero skips/retries. The eleven retained optimizations
+remain; point parity and the complete Stage 8 gate remain unmet.
+
+The [larger v7 extent-write experiment](benchmarks/rfc-025-v7-extent-io-20261026.md)
+changes synchronous initialization chunks from 128 to 512 KiB while preserving
+v4 and the shared v7 preparation guard. The fastest point pair reduces measured
+readiness time from 227 to 145 ms and gains 3.2% throughput. All five pairs,
+including moving SSD stalls, instead give -31.3% raw / -32.3% normalized point
+throughput and +24.1% p99. Batch64 is flat raw. The fixed SSD gates fail, so RAM
+and confirmation phases are cancelled and the candidate is reverted. All 40
+scored records, eight warmups, 471 clear host samples, three excluded profiles,
+exact source patch and binary identities remain. The prototype passes 1,963
+full-check tests with zero skips/retries. The eleven retained optimizations
+remain; point parity and the complete Stage 8 gate remain unmet.
+
+The separate [native linked-commit diagnostic](benchmarks/rfc-025-v7-frontier-link-20261026.md)
+tests an opaque 4-KiB marker write linked to whole-file DATASYNC, comparing default,
+cooperative/single-issuer and deferred/single-issuer rings with correct GETEVENTS
+waits. The current DATA worker already uses cooperative/single-issuer flags;
+deferred task work would require replacing its external-poll completion wait.
+Across five native rounds, linked marker-plus-sync latency is 11–14% higher for
+point-sized groups and 2–3% higher for batch-sized groups than direct syscalls.
+All 40 scored native records, eight warmups, 151 clear samples and both excluded
+setup preflights remain. This is a single-thread mechanism diagnostic, not engine
+throughput or crash qualification. No linked backend advances to implementation.
+The restored engine passes all 1,963 tests with zero skips/retries, and the eleven
+retained optimizations remain. Point parity and the complete Stage 8 gate remain
+unmet.
+
+The [vectored v7 DATA experiment](benchmarks/rfc-025-v7-vectored-data-20261026.md)
+gathers at most eight contiguous original buffers per submission while stopping
+at FRONTIER gaps. DATA submissions fall 27.0% for point writes and 30.2% for
+batch64, but paired raw throughput gains only 0.8% / 0.7%, and point p99 rises
+31.5%. Neither workload meets the fixed material-gain requirement. The prototype
+is rejected and restored before the next candidate. All 40 scored records,
+eight warmups, 485 clear host samples, exact source reconstruction and binary
+identities remain. Full prototype checks pass 1,969 tests, including six focused
+ownership, completion, direct-I/O and recovery tests. The eleven retained
+optimizations remain; point parity and the complete Stage 8 gate remain unmet.
+
+The [asynchronous v7 extent experiment](benchmarks/rfc-025-v7-async-extent-20261026.md)
+prepares required bytes synchronously and initializes the unused part of the same
+allocated extent in a bounded worker. Eight-writer batch64 gains 6.0% raw / 4.9%
+normalized throughput with 9.2% lower p99; point throughput gains 0.7%, preparation
+wait falls 73.7%, and p99 falls 36.7%. The low-concurrency phase fails only the
+one-writer p99 guard: 0.759 to 0.934 ms, +23.1% paired. Confirmation is cancelled.
+The maintainer explicitly directs keeping the optimization and fixing one-writer
+latency, so source commit `0ffebd51` retains it despite the failed original guard.
+All 76 scored records, 20 warmups, 1,006 clear samples, exact patches and binary
+identities remain. The prototype passes 1,968 tests; a temporary restoration before
+the retention instruction also passes all 1,963 original tests. A separate serial
+scheduling follow-up includes the subsequently requested 16-writer coverage.
+This retention does not establish point parity or the complete Stage 8 gate.
+
+The [serial extent follow-up](benchmarks/rfc-025-v7-serial-preparation-20261027.md)
+rejects full serial preparation at startup (16-writer p99 +32.9%) and repeated
+128-KiB serial prefixes (one-writer p99 +19.1% against pre-async). The final hybrid
+keeps a small startup prefix, then prepares whole extents for serial demand while
+concurrent operations retain background work. Five serial rounds restore p99 to
+the pre-async reference, improve p99 9.2% and throughput 2.6% against kept async,
+and reduce CPU 6.3%. All direct guards pass in the full 1/8/16-writer matrix, but
+point8 and batch16 v4-normalized guards fail; 16-writer raw throughput is about 3%
+lower and CPU about 7% higher. Source `71bd7c23` is preserved for local review under
+the requested single-writer work, with the automatic-rule deviation explicit and
+qualification still failed. All three prototypes pass 1,969 tests and nine focused
+checks. All 146 scored records, 42 warmups, exact source and executable identities,
+failed controls and cancellation records remain. Point parity and Stage 8 remain
+unmet; no default activation or publication occurs.
+
+The [allocator retry after the SSD changes](benchmarks/rfc-025-v7-mimalloc-ssd-followup-20261027.md)
+repeats the full mimalloc policy, including aligned WAL buffers, at 1/8/16 writers
+on ext4. Single-writer v7 batch throughput gains 10.3% with 15.2% less CPU, but
+eight-writer batch throughput falls 15.5% with 56.8% more CPU and 11.9% more syncs.
+Sixteen-writer batch CPU rises 27.3%. Point results include large moving stalls
+and failed independent controls; their highest scores and paired observations
+are both preserved. V7 peak RSS rises in every cell. The allocator source is
+restored and System remains selected, while the async and serial SSD changes
+stay byte-identical. Both allocator configurations pass 1,970 tests; restored
+System passes 1,969. All 90 scored records, 30 warmups, one excluded profile,
+1,453 clear audit samples, exact patch and saved identities remain. The retry
+does not qualify v4 parity or Stage 8.
+
+The [BBTree point-memtable trial](benchmarks/rfc-025-bbtree-memtable-20261027.md)
+improves point-read throughput 10.8% and one-writer publication 8.3%, but
+sixteen-writer publication loses 25.5% with 31.2% more whole-child CPU. Its
+excluded user-CPU profile places 37.0% of BBTree samples in contended node-version
+reads. The fixed CPU screen fails, so all six SSD cells are cancelled before
+execution. The prototype passes 1,973 tests; restored SkipMap passes 1,969.
+All 36 scored records, 12 warmup records, two excluded profiles, exact source
+and executable identities remain. SkipMap and System stay selected, and the
+kept SSD runtime remains byte-identical. No SSD benefit or Stage 8 qualification
+is inferred from these CPU measurements.
+
+The [SSD extent and batch follow-up](benchmarks/rfc-025-v7-ssd-batch-and-extent-20261027.md)
+rejects 128/256-KiB background lookahead at the fixed point/batch screens. A separate
+large-batch v7 policy extends only slow-sync coalescing to 800 microseconds: paired
+batch8 throughput rises 3.3%, p99 falls 23.5%, and sync count falls 17.1%, but CPU
+rises 0.5%, missing the frozen no-CPU-increase material-gain rule. The v4 control
+also fails. Dependent cells are cancelled, the original SSD runtime is restored,
+and no source policy is adopted. All 100 scored records, 20 warmups, three excluded
+profiles, exact source/binary identities and failed controls remain. Extent
+prototypes pass 1,970 tests; the batch prototype passes 1,971 and restored source
+passes 1,969. This separates batch investigation from point tuning without
+qualifying v4 parity or Stage 8.
+
+The [remaining batch-window tests](benchmarks/rfc-025-v7-ssd-batch-window-followup-20261027.md)
+run all six previously cancelled cells under the maintainer's throughput/p99
+preference, with CPU diagnostic only. Batch16 observes throughput +2.2% and p99
+-24.9%; independent batch8 confirmation also improves, with large storage
+variation. The original batch1 case fails throughput/p99 guards. An additional
+fixed same-binary control produces 2.79x baseline-to-baseline throughput,
+leaving solo causality unresolved. The six-cell assessment stays failed, while
+the batch source is kept provisionally for local review as a documented retention
+exception. All 72 scored follow-up records, 24 warmups, 15 scored solo-control
+records and three warmups remain. Correctness reuses exact matching 1,971-test
+and 12-focused-test evidence. No RFC adoption or v4 parity is qualified.
+
+The [packed-batch investigation](benchmarks/rfc-025-v7-batch-membership-20261027.md)
+finds that 63.3% / 73.6% of logical batches occupy multi-ticket groups at eight /
+sixteen writers. Three bounded prototypes extend the existing large-wave hint:
+minimum group geometry, compact completion metadata with an added-wait cost
+limit, and [retirement-derived geometry without extra group state](benchmarks/rfc-025-v7-batch-retirement-hint-20261027.md).
+All are rejected by throughput/p99 checks. The final variant passes point8 but
+batch16 observes throughput -1.0%, p99 +23.1%, with CPU diagnostic only; dependent
+stages are cancelled. All 108 scored records, 36 warmups and three fresh excluded
+profiles remain. Each candidate passes 1,973 tests; restored kept source passes
+1,971. Existing `d7fbe1c9` / f7 batch behavior remains provisionally retained;
+this investigation adds no source change, parity or Stage 8 qualification.
+
+The [FRONTIER-buffer reuse experiment](benchmarks/rfc-025-v7-frontier-buffer-reuse-20261027.md)
+adds 32 invocations and passes 1,971 tests but is not retained: the raw batch16
+guards fail amid large unchanged-v4 variation, while its fastest matching pair
+is effectively tied. The maintainer asks to separate obvious stalls. The
+[sixteen-writer investigation](benchmarks/rfc-025-v7-16-writer-tail-diagnosis-20261027.md)
+therefore preserves all scores and adds 17 excluded captures, using the exact
+earlier retirement-hint source for the tail analysis. The final short-I/O
+diagnostic has p99 4.574 versus 4.605 ms; the previous +23.1% p99 does not
+reproduce. It finds 51 versus 20 physical-prefix eligibility retries and repeated
+coalescing windows after ineligible attempts, with 17.4% more successful syncs
+in the prototype. These are targets for a future bounded optimization, not
+qualification or proof of a fixed sixteen-writer regression. Retained f7 source
+and executable are restored; global invocation accounting reaches 433 without
+double-counting reused profiles. This slice adds evidence only.
+
+The [shared coalescing deadline candidate](benchmarks/rfc-025-v7-coalescing-deadline-20261027.md)
+tests that mechanism independently against retained f7. The predeclared
+aggregate-stall view passes batch16 on three matched pairs (+0.8% throughput,
+-14.3% p99), but all three unflagged batch8 pairs lose throughput (paired
+-11.8%, p99 +1.3%, syncs +11.1%). It is not retained; point8 and batch1 are
+cancelled. All twenty new invocations and exact candidate inputs remain.
+Candidate/restored checks pass 1,972/1,971 tests. The retained source and f7
+executable are restored, with no parity or adoption claim; this measurement
+lineage now contains 453 unique invocations.
+
+The [eligible-prefix coalescing candidate](benchmarks/rfc-025-v7-eligible-coalescing-20261027.md)
+is retained for review as `d5d23e95`. It skips optional coalescing and capture
+drain only for a known physically ineligible healthy v7 prefix, then preserves
+the existing fresh window once eligible. All four fixed guards pass: batch8
+observes throughput +9.9%, p99 -7.0%, syncs -7.2%; batch16's predeclared
+aggregate-stall view observes +0.3%/-16.0% over three matched pairs. Point8 p99
+is +2.8%, within its guard; point and solo throughput ratios remain
+storage-confounded. All 36 invocations and exact inputs remain, candidate
+checks pass 1,972 tests, and no RFC adoption or v4 parity is qualified. This
+measurement lineage now contains 489 unique invocations.
+
+The [fresh current-v4/v7 comparison](benchmarks/rfc-025-v7-current-v4-parallel-20261027.md)
+adds 36 fixed invocations from the same retained executable. The maintainer
+asks to ignore obvious stalls; combined-mask matched-pair counts are only
+0/2/1 for batch8/batch16/batch1, while point8 still has unresolved long tails
+below the mean-call thresholds. Stable parity remains unqualified. A labelled
+post-capture descriptive peak view, reusing matching earlier current-v7 runs,
+observes v7 throughput about 7–20% below v4 with unequal sample counts. No
+source or retained executable changes; all raw data remain and this lineage
+reaches 525 unique invocations.
+
+The [large-wave FRONTIER allocation screen](benchmarks/rfc-025-v7-large-frontier-allocation-20261027.md)
+tries skipping duplicate extent zeroing only after a known large-DATA wave.
+It is not retained: three matched sixteen-writer pairs after excluding two
+baseline stalls observe throughput -2.5%, p99 +10.3% and syncs +4.0%.
+Dependent cells are cancelled, all twelve invocations remain, and the accepted
+eligible-prefix source and executable are restored. Candidate checks pass
+1,974 tests; the restored source receives a full check. This lineage reaches
+537 unique invocations, with parity and adoption still unqualified.
+
+The [large-DATA async dispatch screen](benchmarks/rfc-025-v7-large-data-async-dispatch-20261027.md)
+remains inconclusive; maintainer review on 2026-10-28 retains the exact
+candidate provisionally as `f7f39b1b`. It adds `IOSQE_ASYNC` only to large v7
+DATA on ext filesystems. Two matched sixteen-writer pairs observe +13.2%
+throughput and -61.4% p99, but three other pairs are excluded for aggregate
+stalls and baseline tails remain long below the mask. The required third
+matched pair is unavailable; cancelled guards remain pending confirmation.
+Candidate/restored checks pass 1,973/1,972 tests. Reapplying the exact 128-input
+candidate reuses its 1,973 full and 47 focused tests and adds no benchmark
+invocations. This lineage remains at 549; the frozen assessment stays inconclusive.
+
+The [kernel worker pool limit experiment](benchmarks/rfc-025-v7-async-pool-limits-20261028.md)
+is rejected. A bounded-only cap does not constrain the forced-async path;
+limiting both classes works, with four helpers observed, but the full fixed
+matrix has no qualifying benefit. Point8 observes -54.7% throughput / 7.99x
+p99 across three pairs below aggregate stall thresholds. Batch8 observes
+-4.4%/+3.9%; batch16 has only two matched pairs and no gain. Candidate/restored
+checks pass 1,974/1,973 tests. The accepted async-dispatch source and executable
+are restored. Both variants preserve 42 new completed run IDs, bringing this
+lineage to 591, plus one explicitly recorded interrupted run without JSON.
+
+The [unbounded-only worker limit](benchmarks/rfc-025-v7-unbounded-workers-20261028.md)
+also remains unretained. It preserves the bounded class and limits the
+forced-async class to sixteen; an excluded engine probe observes sixteen
+helpers. Batch16 passes its screen at +1.2% throughput/-6.3% p99 across four
+matched pairs, but batch8 fails at -10.1% throughput despite -9.3% p99 across
+three pairs. Solo batches fail too; point and solo I/O timing varies widely
+below the aggregate stall cutoffs. All four fixed cells finish without
+replacement runs. Candidate/restored checks pass 1,974/1,973 tests. The retained
+async-dispatch source and executable are restored exactly. Thirty-seven new
+completed run IDs advance this lineage to 628, with the prior interrupted
+invocation still counted separately. This result does not qualify v4 parity.
+
+The [sync-priority extent experiment](benchmarks/rfc-025-v7-sync-priority-extents-20261028.md)
+defers new optional background chunks during the FRONTIER/sync cycle. Its
+excluded eight-writer trace records no background starts during sync, versus
+137 in the earlier retained trace, while already selected I/O may finish.
+The fixed matrix rejects the policy: batch8 is -1.4% throughput/+4.6% p99
+across four matched pairs, and batch16, point8 and solo guards also fail.
+Point/solo delays vary widely below the aggregate filter; the ratios do not
+isolate source-only regressions. Candidate/restored checks pass 1,975/1,973
+tests, with 49 focused candidate tests. The exact retained source and executable
+are restored. Thirty-seven new completed IDs bring this lineage to 665;
+the two reused diagnostics and prior interrupted run are not double-counted.
+
 ## Delivery checklist
 
 - [ ] Stages 1–3: legacy compatibility, byte-exact codec, independent validation,
@@ -2356,3 +2849,117 @@ create a permanent v7 Leader default or a new format exception.
   current-behavior documentation together.
 
 [WAL documentation](README.md) · [All documentation](../README.md).
+
+The [large-DATA suffix experiment](benchmarks/rfc-025-v7-large-data-lookahead-20261028.md)
+leaves only the reserved large-DATA prefix protected and initializes the unused
+allocated suffix in the background. It is not retained: the excluded native
+candidate writes about 733 MiB of zeros, versus 16 MiB in the stalled baseline
+trace, and the filtered batch8 screen loses 7.7% throughput with 32.9% higher p99.
+Batch16 has only one matched pair, also worse. Point and solo timing varies below
+the aggregate stall mask; no isolated large source effect is claimed. All four
+fixed cells finish, and retained source/executable are restored. Candidate checks
+pass 1,974 tests; restored checks pass 1,973 with one compaction timeout/retry,
+followed by an isolated no-retry pass. The lineage is 703 completed invocations,
+plus the earlier interrupted invocation without JSON. V4 parity remains open.
+
+The [ready-completion-first experiment](benchmarks/rfc-025-v7-ready-completion-first-20261028.md)
+reports already-ready v7 CQEs before later submissions while retaining the normal
+post-submit drain. It adds no writes but is not retained: filtered batch8 gains
+2.1% throughput with 34.5% higher p99, and batch16 p99 rises 21.0%. Apparent large
+point gains coincide with delayed baselines; the lower-latency pair gains only
+1.1% throughput. All four fixed cells complete. Candidate checks pass 1,974 tests;
+restored source passes 1,973 with no retries/skips. The lineage reaches 739
+completed invocations, plus the earlier interrupted invocation without JSON.
+V4 parity remains open.
+
+The [small-write completion-priority experiment](benchmarks/rfc-025-v7-small-completion-priority-20261028.md)
+restricts early CQE retirement to workers owning only writes below 64 KiB. It passes
+its point8 screen and five regression guards, but independent point8 confirmation
+misses the required p99 benefit (+1.65%). Large apparent throughput gains coincide
+with delayed baselines; the confirmation pair with low mean I/O times gains 1.9%
+throughput with 2.2% higher p99. The candidate is not retained. All 64 invocations
+finish; candidate checks pass 1,976 tests and restored source passes 1,973 without
+retries/skips. The lineage reaches 803 completed invocations, plus the earlier
+interrupted invocation without JSON. V4 parity remains open.
+
+
+
+The [point-handoff diagnosis](benchmarks/rfc-025-v7-point-handoff-20261029.md)
+maps every API call in two excluded current-policy captures. DATA submission
+return to CQE reap averages 843/768 us at one/eight writers, about 67%/50% of
+mean API time; publication/wakeup is much smaller. This interval includes
+kernel/device completion and reaping/scheduling delay, so it is not a hardware-only
+attribution. The [ordinary-notification trial](benchmarks/rfc-025-v7-signal-taskwork-20261029.md)
+removes cooperative task work only for active ext-filesystem v7. Its screen and
+four guards pass, but every batch16 pair is excluded by the fixed I/O-stall mask.
+Qualification is inconclusive, confirmation is cancelled and retained source is
+restored. Candidate checks pass 1,975 tests; restored checks pass 1,973. The lineage
+reaches 857 completed invocations, plus the earlier interrupted invocation without
+JSON. No new runtime optimization or v4-parity qualification is retained.
+
+The maintainer-requested [ordinary-notification retry](benchmarks/rfc-025-v7-signal-taskwork-retry-20261029.md)
+reuses the exact candidate and starts with five fresh batch16 pairs. Only two
+pairs survive the unchanged aggregate stall cutoff; their paired median
+throughput falls 6.7% and p99 falls 2.3%. The minimum three pairs and throughput
+guard are not met, so qualification remains inconclusive and the five dependent
+cells are cancelled. All 12 enabled invocations finish without replacements or
+pooling with earlier cohorts. Fresh candidate checks pass 1,975 tests; exact
+restoration passes 1,973 without retries or skips. The lineage reaches 869
+completed invocations, plus the inherited interrupted invocation without JSON.
+
+The notification change is not retained; v4 parity remains open.
+
+The [full ordinary-notification rerun](benchmarks/rfc-025-v7-signal-taskwork-rerun-20261029.md)
+finishes all six cells: 56 invocations, including 44 scored runs. Following the
+maintainer's reminder, assessment uses the highest-throughput scored invocation
+for each exact binary/workload and p99 from that same invocation. The historical
+best-score view improves point1/16, but point8 throughput is 1.4% lower and
+batch1/8/16 throughput is 7.5%/13.8%/10.9% lower. Every selected winner is also
+the unfiltered raw maximum. The notification candidate is not retained. No Rust
+source or executable changes; existing 1,975 candidate/1,973 retained correctness
+checks and all 128 baseline inputs are reverified. The lineage reaches 925
+completed invocations, plus the inherited interrupted invocation without JSON.
+
+The [v4/v7 batch attribution](benchmarks/rfc-025-v7-batch-attribution-20261029.md)
+adds 16 same-build scored-stage invocations and six excluded wall/thread-CPU
+traces. Fresh solo best scores retain a 16.9% gap, or 15.2% when matching-binary
+historical v7 peaks are included. In the solo diagnostic, DATA framing/CRC and
+logical-prefix SHA-256 consume 0.85/1.14 seconds of CPU before DATA submission;
+the v7 packer uses 2.05 seconds versus 0.024 for v4. WAL durability wait includes
+this CPU work. Both large-batch paths mostly skip zero filling, correcting the
+initial extent hypothesis; forcing initialization adds substantial I/O and is
+not retained. All 70,317 traced calls map to exact API partitions. Instrumented
+checks pass 1,973 tests with one recorded compaction retry and an isolated pass;
+fresh restored checks pass 1,973 without retries or skips. Source/executable are
+restored; no runtime optimization is retained. The lineage reaches 947 completed
+invocations, plus the inherited interrupted invocation without JSON.
+
+The [contiguous entry CRC screen](benchmarks/rfc-025-v7-entry-crc-20261029.md)
+adds 24 invocations and is rejected after batch8 throughput falls 10.1%. The
+[post-submit SHA overlap screen](benchmarks/rfc-025-v7-post-submit-hash-20261029.md)
+adds 36: solo throughput improves, but concurrent batch checks fail. Both
+experiments restore retained source and executable; the lineage reaches 1,007
+completed invocations.
+
+The [producer-framing composition](benchmarks/rfc-025-v7-producer-framing-20261029.md)
+adds 96 invocations, including the exact P0 binary as a separate control. Its
+fresh batch checks pass, and the solo high reaches 80,853 puts/s with 1.250 ms
+p99. Point throughput and p99 guards reject the composition. The eight-writer
+winner also submits substantially more solo groups than retained v7, identifying
+a coordination cost to measure in future pipeline work. All five changed Rust
+files and the canonical executable are restored; candidate checks pass 1,979
+tests and fresh restored checks pass 1,973. The lineage reaches 1,103 completed
+invocations, or 5,199 across the full indexed archive, plus the inherited
+interrupted invocation without JSON. V4 parity remains open.
+
+The independent [physical DATA source-CRC screen](benchmarks/rfc-025-v7-frame-source-crc-20261029.md)
+adds 24 invocations. Copy and CRC remain separate operations; wire bytes and
+whole-frame initialization are preserved. Solo/eight-writer checks fail amid
+different storage latency, and sixteen writers have only one eligible score per
+build. This does not isolate a CRC CPU regression or establish a qualified gain.
+The candidate passes 1,973 full tests and 69 focused codec/runtime tests. The
+codec and retained executable are restored. The first restored check retries a
+compaction timeout; the isolated test and a fresh 1,973-test suite pass with
+retries disabled. The lineage reaches 1,127 completed invocations, or 5,223 in the full indexed archive,
+plus the inherited interrupted invocation without JSON. No new runtime
+optimization or digest-format change is retained.

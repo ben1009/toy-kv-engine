@@ -1,0 +1,64 @@
+diff --git a/kv-engine/src/pitr/mod.rs b/kv-engine/src/pitr/mod.rs
+index c67dcf4b..1c4faf2c 100644
+--- a/kv-engine/src/pitr/mod.rs
++++ b/kv-engine/src/pitr/mod.rs
+@@ -1236,0 +1237,59 @@ mod tests {
++    #[test]
++    fn canonical_entry_stream_matches_v5_for_mixed_point_and_range_sequences() -> Result<()> {
++        let pool = [
++            WalEntry::Put {
++                key: b"b".to_vec(),
++                value: b"two".to_vec(),
++            },
++            WalEntry::Put {
++                key: b"c".to_vec(),
++                value: b"three".to_vec(),
++            },
++            WalEntry::PointDelete { key: b"a".to_vec() },
++            WalEntry::RangeDelete {
++                start: b"a".to_vec(),
++                end: b"d".to_vec(),
++            },
++            WalEntry::PointDelete { key: b"c".to_vec() },
++            WalEntry::Put {
++                key: b"a".to_vec(),
++                value: b"latest".to_vec(),
++            },
++        ];
++        let mut batch = batch();
++        for len in 1..=5 {
++            for mut pattern in 0..pool.len().pow(len) {
++                batch.entries.clear();
++                for _ in 0..len {
++                    batch.entries.push(pool[pattern % pool.len()].clone());
++                    pattern /= pool.len();
++                }
++                let preparation_bytes =
++                    CanonicalWalEntryStream::preparation_buffer_bytes(&batch, limits())?;
++                let stream = CanonicalWalEntryStream::new(&batch, limits())?;
++                assert!(
++                    (stream.last_point.capacity() * std::mem::size_of::<(&[u8], usize)>()) as u64
++                        <= preparation_bytes,
++                    "canonical index allocation exceeds its preflight charge"
++                );
++
++                // The existing v5 canonicalizer uses an independent hash-map
++                // implementation. Compare exact retained order and entry bytes
++                // for sorted/unsorted keys, duplicates, and interleaved ranges.
++                let canonical = canonical_batch(&batch, limits())?;
++                let v5 = encode_v5_batch(&canonical, limits())?;
++                let mut encoded = vec![0; stream.data_len()];
++                let (written, crc) = stream.encode_into(&mut encoded)?;
++                assert_eq!(written, encoded.len());
++                assert_eq!(stream.entry_count() as usize, canonical.entries.len());
++                assert_eq!(
++                    encoded,
++                    v5[WAL_V5_BATCH_HEADER_LEN..WAL_V5_BATCH_HEADER_LEN + written]
++                );
++                assert_eq!(crc, crc32fast::hash(&encoded));
++            }
++        }
++
++        Ok(())
++    }
++

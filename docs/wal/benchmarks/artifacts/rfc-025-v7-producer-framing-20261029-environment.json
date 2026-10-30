@@ -1,0 +1,20 @@
+{
+  "kernel": "6.12.71-1-lts",
+  "logical_cpus": 32,
+  "filesystem": "/dev/nvme0n1p3[/liu/proj/toy-kv-engine] ext4 rw,nosuid,nodev,relatime",
+  "environment": {
+    "RUSTFLAGS": null,
+    "CARGO_ENCODED_RUSTFLAGS": null,
+    "CARGO_TARGET_DIR": null,
+    "LD_PRELOAD": null
+  },
+  "plan_sha256": "1b7cd21d5942c23b6b1867cb83404c971c8819793249be21c377d0600046c2d3",
+  "matrix_sha256": "75137fd9ce90ddce17f2c1f890b1377231ef01ae71121e9cc41cc3c62ddd4d4e",
+  "driver_sha256": "51121e2f27c0aa108612ac78f4d11175f5a75c45d4c59dcf96c3de4259593456",
+  "child_sha256": "538c6a74a405dd67eba4d7bb7295fd24965c69a0fa3dde06bed30ed1985650ab",
+  "analyzer_sha256": "5d69b2686b8491c7232cca60c27d842a1278caf716774dccbe17443b9f5b6868",
+  "orchestrator_sha256": "053b4a5fa0a3202110f9b9d30f030b3d9dbe181083459fd7e8e9acc9e13c61cd",
+  "source_manifest_sha256": "45932c3c46147c918458c0f44d2a11555b081713953adeecc840c12a9d741030",
+  "patch_sha256": "b58effa5d8f525184fd6517267ed97f58095ae370e6539f6f1b99bc83874c2df",
+  "checks_sha256": "bbac847ceb7eb632581ac9949748dfec85a76acd5dc4ca0f20078de7781f949d"
+}

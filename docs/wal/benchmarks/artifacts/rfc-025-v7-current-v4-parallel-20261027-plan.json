@@ -1,0 +1,19 @@
+{
+  "created_at_utc": "2026-10-27T14:42:01.340607+00:00",
+  "source_base": "89648122b82f5e5f9e8992ab74864e00de235f30",
+  "source_commit": "d5d23e95553e95cd06f637c48d98ada75c10d56f",
+  "purpose": "User-approved fresh alternating current v7 versus v4 Parallel comparison after historical peak comparison. Compare formats in the same retained executable rather than different software cohorts.",
+  "scope": "Measurement only; no source edits, builds, optimization, push, PR or adoption. Keep current retained implementation and stop for review after all four cells.",
+  "binary": {
+    "path": "target/release/write-perf-v7-eligible-coalescing",
+    "sha256": "e9abcc91b499c3cecd0acc137a0c9b8f65228b76ac3cb31ba3894bf9a0d06d40"
+  },
+  "configuration": "Fresh local ext4;1KiB values,2GiB targetSST,no compaction,explicit Parallel. V4 ordinary WAL without PITR;v7 with PITR enabled to select v7. This compares supported configurations, not wire framing alone. Batch64:750000 puts/sample10 at16,8,1writers. Point8:100000 puts/sample100.",
+  "schedule": "Batch16 two warmups+5 alternating v4/v7 pairs;batch8,point8,batch1 each two warmups+3 alternating pairs. Odd pairs v4 then v7;even reverse. All36 invocations run regardless of ratios;no retries/replacements/peak-selected repeats.30s initial cooldown per cell,10s gaps. Host audit before/during1Hz/after. No concurrent source edit/build/test/profile or active SMART polling.",
+  "stall_policy": "Preserve every raw record. Reuse combined mask:mean fdatasync>=1.5ms in either format OR mean v7 FRONTIER write>=1ms. Exclude a matched pair if either invocation is flagged. Also report a symmetric sync-only mask and raw comparisons. V4 has no FRONTIER write, so combined mask is asymmetric and could hide a real v7-specific cost; it is descriptive, not qualification. Both aggregate masks miss short outliers and DATA/preparation delays. Report counts/arm-specific flags; do not label remaining runs stall-free.",
+  "analysis": "Report all raw and combined/sync-only paired throughput,p99,CPU,RSS,sync count and DATA-byte ratios. Formats have different padding/frame sizes, so DATA equality is diagnostic rather than a guard. Include separate-arm medians and per-format scored peaks with p99 from each peak run. No assertion of parity unless evidence supports it;no new retention decision.",
+  "correctness": "Reuse exact matching1972-test/6-focused-test/full-check/release evidence from retained eligibility candidate. Verify all128 input hashes,source commit and executable SHA before capture. No rebuild or correctness rerun for unchanged source.",
+  "prior_verification": "rfc-025-v7-eligible-coalescing-20261027-verification.json",
+  "prior_global_invocations": 489,
+  "outside_sandbox": true
+}

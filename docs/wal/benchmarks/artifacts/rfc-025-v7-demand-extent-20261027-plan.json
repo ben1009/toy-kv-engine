@@ -1,0 +1,89 @@
+{
+  "created_at_utc": "2026-10-26T17:28:12.887912+00:00",
+  "source_base": "0ffebd516b865b01371ed65014ac0347ae2fb420",
+  "authorization": "Maintainer: Keep and Optimize for 1 writer; additionally requested 16-writer coverage.",
+  "hypothesis": "The whole-extent serial fallback avoids background work but adds a full 1MiB first-allocation stall to a concurrent wave. Retain the original bounded 128KiB demand prefix for every write; only request asynchronous suffix work when multiple batch operations are outstanding.",
+  "candidate": "Remove the whole-extent early return from the failed serial prototype. Compute the current 128KiB-aligned required prefix through the original shared cursor, and send a background target only if the reservation owner reports more than one outstanding operation. A stale concurrency observation affects scheduling only. Do not change DATA/FRONTIER ordering, allocated targets, sync protocol, hashes or resource charges.",
+  "baselines": {
+    "async": "ef112fd0dea7f292a0be9ab47eae6276242dd6b290efccdf4335f03e41b17d0a",
+    "pre_async": "614f0cb1adde43cabe900eb032c6f884783d658c597471d9d9ddc8faff314aa9",
+    "failed_serial": "c51dbed65ed734aee51380b64c3d67ac05efdb7ba31cab547d0e0446b7a09caa"
+  },
+  "matrix": {
+    "ext4-point1": {
+      "operations": 20000,
+      "writers": 1,
+      "batch": null,
+      "sample_every": 10,
+      "samples": 2000,
+      "pairs": 5,
+      "arms": [
+        "base_v7",
+        "old_v4",
+        "new_v4",
+        "old_v7",
+        "new_v7"
+      ]
+    },
+    "ext4-point8": {
+      "operations": 100000,
+      "writers": 8,
+      "batch": null,
+      "sample_every": 100,
+      "samples": 1000,
+      "pairs": 3,
+      "arms": [
+        "old_v4",
+        "new_v4",
+        "old_v7",
+        "new_v7"
+      ]
+    },
+    "ext4-batch8": {
+      "operations": 750000,
+      "writers": 8,
+      "batch": 64,
+      "sample_every": 10,
+      "samples": 1176,
+      "pairs": 3,
+      "arms": [
+        "old_v4",
+        "new_v4",
+        "old_v7",
+        "new_v7"
+      ]
+    },
+    "ext4-point16": {
+      "operations": 100000,
+      "writers": 16,
+      "batch": null,
+      "sample_every": 100,
+      "samples": 1008,
+      "pairs": 3,
+      "arms": [
+        "old_v4",
+        "new_v4",
+        "old_v7",
+        "new_v7"
+      ]
+    },
+    "ext4-batch16": {
+      "operations": 750000,
+      "writers": 16,
+      "batch": 64,
+      "sample_every": 10,
+      "samples": 1184,
+      "pairs": 3,
+      "arms": [
+        "old_v4",
+        "new_v4",
+        "old_v7",
+        "new_v7"
+      ]
+    }
+  },
+  "protocol": "SSD only; same 1KiB values,2GiB SST,parallel mode and explicit formats. One warmup per arm. Alternate arm order between pairs. 30s initial cooldown and 10s between runs. Host auditing before/during(1Hz)/after, no build/test/profile overlap, all stalls retained. Run 16-writer cells first, then serial and eight-writer cells. No retries chosen by score.",
+  "guards": "Each cell candidate/async paired raw, v4-normalized and arm-median throughput >=0.95, paired p99<=1.10, identical DATA bytes and paired sync count<=1.05. Serial additionally requires p99 versus async<=0.95 and versus pre-async<=1.10; paired raw versus pre-async>=0.95. CPU reported. These are exploratory fix guards, not complete RFC qualification. Report exact failed guards without overriding the maintainer retention of the original async optimization.",
+  "correctness": "Full cargo make check and direct typos outside sandbox. Keep concurrent-producer reservation fixtures. Serial and concurrent-to-serial rollover test must recover every ACK while showing no new background target, no suffix overwrite and demand readiness rounded to 128KiB rather than the complete allocated extent.",
+  "decision": "Keep the maintainer-retained async core. Keep this revised scheduling fix only if the fixed five-cell SSD matrix passes. Preserve the first serial prototype, its failed 16-writer p99 guard and all completed captures; cancel its unrun cells after completing requested 16-writer coverage. Do not pool different candidate binaries or select runs by score. No PR or push."
+}

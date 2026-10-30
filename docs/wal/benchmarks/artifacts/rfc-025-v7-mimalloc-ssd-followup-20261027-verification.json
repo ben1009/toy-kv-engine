@@ -1,0 +1,20 @@
+{
+  "source_base": "e16e433a90a826d4f51fd8e29e5ec14f8f1ae0fc",
+  "reconstructed_inputs": 128,
+  "verified_binaries": 3,
+  "records": 120,
+  "scored_records": 90,
+  "warmups": 30,
+  "excluded_profiles": 1,
+  "unique_engine_ids_including_profile": 121,
+  "host_samples": 1453,
+  "source_reconstructs": true,
+  "summary_regenerates": true,
+  "scratch_removed": true,
+  "allocator_source_retained": false,
+  "default_allocator_changed": false,
+  "ssd_optimizations_preserved": true,
+  "checks_record_sha256": "e73850b6d161bb400573b4f2630e1eeaf85ab6fa74d8efe72c3f365a9e352643",
+  "decision_sha256": "96886d80b4afa1fcd93732e2762766ae9c9f3f7df90438fb46bbeb22202b4b02",
+  "verification_script_sha256": "6fcbca5bddd10b37126d6fce1c3efb8f519432277e6e2254d61a746601d64db0"
+}

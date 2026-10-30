@@ -1,0 +1,18 @@
+{
+  "retained-v7": {
+    "path": "target/release/write-perf-v7-large-data-async-dispatch",
+    "sha256": "f353022d846530a6754330aaea11f295319ea8f4de20afa09b6d2a3b57b021d8"
+  },
+  "prior-v7": {
+    "path": "target/release/write-perf-v7-producer-framing",
+    "sha256": "8bcc3df029c84a57991b6eba54b209d7121246b97fe4732df5e2da123059ea8f"
+  },
+  "guard-v7": {
+    "path": "target/release/write-perf-v7-small-guard-control",
+    "sha256": "c5f394f0ec7d269a04f20dcd1b4df9f490966dd9cc92c46628f3ea134b75bcf4"
+  },
+  "candidate-v7": {
+    "path": "target/release/write-perf-v7-admission-grouping",
+    "sha256": "7ed3991ea9364e0932694eb4c1856bc779ee93e72d0324ce185f49d60988f4b2"
+  }
+}

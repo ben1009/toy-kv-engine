@@ -1,0 +1,172 @@
+{
+  "kernel": "Linux 6.12.71-1-lts #1 SMP PREEMPT_DYNAMIC Fri, 13 Feb 2026 19:12:56 +0000 GNU/Linux",
+  "sched_schedstats": "0",
+  "tracepoint_probe": "perf stat -e syscalls:sys_enter_fdatasync -- true: exit129, no permission to read trace event",
+  "topology": {
+    "cpu21": {
+      "topology/core_id": "37",
+      "topology/thread_siblings_list": "21",
+      "cpufreq/cpuinfo_max_freq": "3900000"
+    },
+    "cpu11": {
+      "topology/core_id": "20",
+      "topology/thread_siblings_list": "10-11",
+      "cpufreq/cpuinfo_max_freq": "5300000"
+    },
+    "cpu9": {
+      "topology/core_id": "16",
+      "topology/thread_siblings_list": "8-9",
+      "cpufreq/cpuinfo_max_freq": "5300000"
+    },
+    "cpu7": {
+      "topology/core_id": "12",
+      "topology/thread_siblings_list": "6-7",
+      "cpufreq/cpuinfo_max_freq": "5100000"
+    },
+    "cpu28": {
+      "topology/core_id": "44",
+      "topology/thread_siblings_list": "28",
+      "cpufreq/cpuinfo_max_freq": "3900000"
+    },
+    "cpu18": {
+      "topology/core_id": "34",
+      "topology/thread_siblings_list": "18",
+      "cpufreq/cpuinfo_max_freq": "3900000"
+    },
+    "cpu5": {
+      "topology/core_id": "8",
+      "topology/thread_siblings_list": "4-5",
+      "cpufreq/cpuinfo_max_freq": "5100000"
+    },
+    "cpu26": {
+      "topology/core_id": "42",
+      "topology/thread_siblings_list": "26",
+      "cpufreq/cpuinfo_max_freq": "3900000"
+    },
+    "cpu16": {
+      "topology/core_id": "32",
+      "topology/thread_siblings_list": "16",
+      "cpufreq/cpuinfo_max_freq": "3900000"
+    },
+    "cpu3": {
+      "topology/core_id": "4",
+      "topology/thread_siblings_list": "2-3",
+      "cpufreq/cpuinfo_max_freq": "5100000"
+    },
+    "cpu24": {
+      "topology/core_id": "40",
+      "topology/thread_siblings_list": "24",
+      "cpufreq/cpuinfo_max_freq": "3900000"
+    },
+    "cpu14": {
+      "topology/core_id": "28",
+      "topology/thread_siblings_list": "14-15",
+      "cpufreq/cpuinfo_max_freq": "5100000"
+    },
+    "cpu1": {
+      "topology/core_id": "0",
+      "topology/thread_siblings_list": "0-1",
+      "cpufreq/cpuinfo_max_freq": "5100000"
+    },
+    "cpu22": {
+      "topology/core_id": "38",
+      "topology/thread_siblings_list": "22",
+      "cpufreq/cpuinfo_max_freq": "3900000"
+    },
+    "cpu12": {
+      "topology/core_id": "24",
+      "topology/thread_siblings_list": "12-13",
+      "cpufreq/cpuinfo_max_freq": "5100000"
+    },
+    "cpu30": {
+      "topology/core_id": "46",
+      "topology/thread_siblings_list": "30",
+      "cpufreq/cpuinfo_max_freq": "3900000"
+    },
+    "cpu20": {
+      "topology/core_id": "36",
+      "topology/thread_siblings_list": "20",
+      "cpufreq/cpuinfo_max_freq": "3900000"
+    },
+    "cpu10": {
+      "topology/core_id": "20",
+      "topology/thread_siblings_list": "10-11",
+      "cpufreq/cpuinfo_max_freq": "5300000"
+    },
+    "cpu8": {
+      "topology/core_id": "16",
+      "topology/thread_siblings_list": "8-9",
+      "cpufreq/cpuinfo_max_freq": "5300000"
+    },
+    "cpu29": {
+      "topology/core_id": "45",
+      "topology/thread_siblings_list": "29",
+      "cpufreq/cpuinfo_max_freq": "3900000"
+    },
+    "cpu19": {
+      "topology/core_id": "35",
+      "topology/thread_siblings_list": "19",
+      "cpufreq/cpuinfo_max_freq": "3900000"
+    },
+    "cpu6": {
+      "topology/core_id": "12",
+      "topology/thread_siblings_list": "6-7",
+      "cpufreq/cpuinfo_max_freq": "5100000"
+    },
+    "cpu27": {
+      "topology/core_id": "43",
+      "topology/thread_siblings_list": "27",
+      "cpufreq/cpuinfo_max_freq": "3900000"
+    },
+    "cpu17": {
+      "topology/core_id": "33",
+      "topology/thread_siblings_list": "17",
+      "cpufreq/cpuinfo_max_freq": "3900000"
+    },
+    "cpu4": {
+      "topology/core_id": "8",
+      "topology/thread_siblings_list": "4-5",
+      "cpufreq/cpuinfo_max_freq": "5100000"
+    },
+    "cpu25": {
+      "topology/core_id": "41",
+      "topology/thread_siblings_list": "25",
+      "cpufreq/cpuinfo_max_freq": "3900000"
+    },
+    "cpu15": {
+      "topology/core_id": "28",
+      "topology/thread_siblings_list": "14-15",
+      "cpufreq/cpuinfo_max_freq": "5100000"
+    },
+    "cpu2": {
+      "topology/core_id": "4",
+      "topology/thread_siblings_list": "2-3",
+      "cpufreq/cpuinfo_max_freq": "5100000"
+    },
+    "cpu23": {
+      "topology/core_id": "39",
+      "topology/thread_siblings_list": "23",
+      "cpufreq/cpuinfo_max_freq": "3900000"
+    },
+    "cpu13": {
+      "topology/core_id": "24",
+      "topology/thread_siblings_list": "12-13",
+      "cpufreq/cpuinfo_max_freq": "5100000"
+    },
+    "cpu0": {
+      "topology/core_id": "0",
+      "topology/thread_siblings_list": "0-1",
+      "cpufreq/cpuinfo_max_freq": "5100000"
+    },
+    "cpu31": {
+      "topology/core_id": "47",
+      "topology/thread_siblings_list": "31",
+      "cpufreq/cpuinfo_max_freq": "3900000"
+    }
+  },
+  "trace_library_sha256": "7bef6a9cfadc9c803f955fb96e86bd65f5bdebd07aab39184d283832bfe3e46b",
+  "trace_source_sha256": "628b683e22047bc9cdfbe80f142cf686795f8a9eef2eb0593208832fecd09308",
+  "driver_sha256": "f48ab5caccc0270265179d06342997f212aae4d95b627fc55b3ebb85cc16cd43",
+  "plan_sha256": "79026af68552971b461fd64ad6a580f01003bd5772194707d38f453d24a5af18",
+  "monitor": "100ms proc/sysfs sampling; no NVMe SMART or temperature polling"
+}

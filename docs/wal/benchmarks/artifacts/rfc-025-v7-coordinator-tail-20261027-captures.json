@@ -1,0 +1,226 @@
+[
+  {
+    "arm": "baseline",
+    "name": "case1-baseline",
+    "operations": 750000,
+    "run_id": "1793097160086",
+    "command": [
+      "/home/liu/proj/toy-kv-engine/target/release/write-perf-v7-coordinator-tail-baseline",
+      "--suite",
+      "legacy",
+      "--preset",
+      "smoke",
+      "--bench",
+      "wal_batch_concurrent",
+      "--wal",
+      "--wal-io-mode",
+      "parallel",
+      "--pitr",
+      "--pitr-format",
+      "v7",
+      "--num",
+      "750000",
+      "--threads",
+      "16",
+      "--wal-batch-size",
+      "64",
+      "--value-size",
+      "1024",
+      "--target-sst-size",
+      "2147483648",
+      "--compaction",
+      "none",
+      "--latency-sample-every",
+      "10",
+      "--output",
+      "json",
+      "--no-cleanup",
+      "--path",
+      "/home/liu/proj/toy-kv-engine/target/wal-opt/20261027-v7-coordinator-tail/case1-baseline-db"
+    ],
+    "excluded_from_scoring": true,
+    "binary": {
+      "path": "target/release/write-perf-v7-coordinator-tail-baseline",
+      "sha256": "8eb99c95af197bb1417b91ab90c3e80b951c0b964ab8fbbfe7002cdbea93b002"
+    },
+    "preload_sha256": "7bef6a9cfadc9c803f955fb96e86bd65f5bdebd07aab39184d283832bfe3e46b",
+    "trace_samples": 1184,
+    "mapped_tickets": 11728,
+    "host_samples": 4,
+    "clean_sampled": true,
+    "sampling_errors": [],
+    "before": {
+      "time_utc": "2026-10-27T10:32:40.080630+00:00",
+      "competing": [],
+      "load_average": [
+        0.64306640625,
+        0.537109375,
+        0.21142578125
+      ],
+      "cpu_jiffies": [
+        18006668,
+        4951,
+        8078516,
+        6413750866,
+        3368504,
+        1161583,
+        1429721,
+        0,
+        0,
+        0
+      ]
+    },
+    "after": {
+      "time_utc": "2026-10-27T10:32:41.607469+00:00",
+      "competing": [],
+      "load_average": [
+        0.64306640625,
+        0.537109375,
+        0.21142578125
+      ],
+      "cpu_jiffies": [
+        18006944,
+        4951,
+        8078589,
+        6413755257,
+        3368562,
+        1161589,
+        1429723,
+        0,
+        0,
+        0
+      ]
+    },
+    "returncode": 0,
+    "raw_sha256": "ba0abc06c47ef6711a409336dd7fa5968805f19cfa7767090578a5d116f462ff",
+    "files": {
+      "target/wal-opt/20261027-v7-coordinator-tail/case1-baseline-io.csv": "50621117c0079cd91f2cef21ef1c4d0a0aba1f1837a808d48e3cca1018d23a7a",
+      "target/wal-opt/20261027-v7-coordinator-tail/case1-baseline-batch.jsonl": "2ff33559d56d2b413548d00ed7d4b6b2af93ac054dfaea709d9fdd084876d57f",
+      "target/wal-opt/20261027-v7-coordinator-tail/case1-baseline-samples.jsonl": "d89c778e81eda2ea535a9a13a8951407c7a456af229b2eeb151b93a53d4d990d",
+      "target/wal-opt/20261027-v7-coordinator-tail/case1-baseline-tickets.json": "504d292e753b5e803ae9a368769bd9480785033a98ca325c8468757cbfaaa151",
+      "target/wal-opt/20261027-v7-coordinator-tail/case1-baseline.stdout": "1f9dfec3ec32528f0898b6aac31e0210efd3a68b2f36eb59f7c3f82253c3957c",
+      "target/wal-opt/20261027-v7-coordinator-tail/case1-baseline.stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "stage_files": {
+      "target/wal-opt/20261027-v7-coordinator-tail/case1-baseline-stage.data.4105546.csv": "ffc99b1527649de25e9798451de6a144b6e5c144ff0ba7c32788a51f310bee07",
+      "target/wal-opt/20261027-v7-coordinator-tail/case1-baseline-stage.frontier.4105548.csv": "f01651c0d4dce1e35ac7b60853593abb7eb3beda3976c3ac07ae0e4ff58cd391"
+    },
+    "stage_event_counts": {
+      "data_staging": 11728,
+      "data_reap": 11728,
+      "frontier_capture": 1175
+    }
+  },
+  {
+    "arm": "retirement_hint",
+    "name": "case2-retirement_hint",
+    "operations": 750000,
+    "run_id": "1793097177506",
+    "command": [
+      "/home/liu/proj/toy-kv-engine/target/release/write-perf-v7-coordinator-tail-retirement_hint",
+      "--suite",
+      "legacy",
+      "--preset",
+      "smoke",
+      "--bench",
+      "wal_batch_concurrent",
+      "--wal",
+      "--wal-io-mode",
+      "parallel",
+      "--pitr",
+      "--pitr-format",
+      "v7",
+      "--num",
+      "750000",
+      "--threads",
+      "16",
+      "--wal-batch-size",
+      "64",
+      "--value-size",
+      "1024",
+      "--target-sst-size",
+      "2147483648",
+      "--compaction",
+      "none",
+      "--latency-sample-every",
+      "10",
+      "--output",
+      "json",
+      "--no-cleanup",
+      "--path",
+      "/home/liu/proj/toy-kv-engine/target/wal-opt/20261027-v7-coordinator-tail/case2-retirement_hint-db"
+    ],
+    "excluded_from_scoring": true,
+    "binary": {
+      "path": "target/release/write-perf-v7-coordinator-tail-retirement_hint",
+      "sha256": "0fb36403acaf4c96f7ad4c3e0f1dd3e990bec183687d63c7e7a6871973e4e35c"
+    },
+    "preload_sha256": "7bef6a9cfadc9c803f955fb96e86bd65f5bdebd07aab39184d283832bfe3e46b",
+    "trace_samples": 1184,
+    "mapped_tickets": 11728,
+    "host_samples": 4,
+    "clean_sampled": true,
+    "sampling_errors": [],
+    "before": {
+      "time_utc": "2026-10-27T10:32:57.503407+00:00",
+      "competing": [],
+      "load_average": [
+        0.5,
+        0.51025390625,
+        0.20703125
+      ],
+      "cpu_jiffies": [
+        18007114,
+        4951,
+        8078666,
+        6413805770,
+        3368616,
+        1161603,
+        1429743,
+        0,
+        0,
+        0
+      ]
+    },
+    "after": {
+      "time_utc": "2026-10-27T10:32:59.157263+00:00",
+      "competing": [],
+      "load_average": [
+        0.5,
+        0.51025390625,
+        0.20703125
+      ],
+      "cpu_jiffies": [
+        18007496,
+        4951,
+        8078770,
+        6413810504,
+        3368680,
+        1161611,
+        1429746,
+        0,
+        0,
+        0
+      ]
+    },
+    "returncode": 0,
+    "raw_sha256": "8aea45d716b44c3501bd4b88ba01ed719a68888a3b7e84c75af945cba6232b41",
+    "files": {
+      "target/wal-opt/20261027-v7-coordinator-tail/case2-retirement_hint-io.csv": "580975c92625f218e38dc629309abdd889affca3a1acdbf7f3ad3c2b31f1c644",
+      "target/wal-opt/20261027-v7-coordinator-tail/case2-retirement_hint-batch.jsonl": "07c31abecabab996032bfdeb9d58f992aeebc1fc734e1bb145329a9732139d68",
+      "target/wal-opt/20261027-v7-coordinator-tail/case2-retirement_hint-samples.jsonl": "7ff364187e5e58f9706b2512b45c2f95e6d80fbac9dcc6ce1a73f205613e3f43",
+      "target/wal-opt/20261027-v7-coordinator-tail/case2-retirement_hint-tickets.json": "ca31588d2a2589b5e505164ddcb07197ca3628bedc9db1b592ef151fd66fb035",
+      "target/wal-opt/20261027-v7-coordinator-tail/case2-retirement_hint.stdout": "c8822eef817009cc75b57cf251a7b181111156542f86b5249a93960020470dad",
+      "target/wal-opt/20261027-v7-coordinator-tail/case2-retirement_hint.stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "stage_files": {
+      "target/wal-opt/20261027-v7-coordinator-tail/case2-retirement_hint-stage.data.4105673.csv": "ad1105a005f0d7aa5dab98ca6608b7dd56f9f60efa929e20b2e0124d20930b9f",
+      "target/wal-opt/20261027-v7-coordinator-tail/case2-retirement_hint-stage.frontier.4105675.csv": "080b4af1e6a9db1ed592f169b3c27ae1765b28009c6bfeec1926ea271f4128a6"
+    },
+    "stage_event_counts": {
+      "data_staging": 11728,
+      "data_reap": 11728,
+      "frontier_capture": 1380
+    }
+  }
+]

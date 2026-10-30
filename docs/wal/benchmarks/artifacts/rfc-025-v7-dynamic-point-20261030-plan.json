@@ -1,0 +1,21 @@
+{
+  "screen_cells": [
+    "ext4-point1",
+    "ext4-point8",
+    "ext4-point16"
+  ],
+  "guard_cells": [],
+  "purpose": "Exploratory point-write guard on known-unstable SSD; not a performance qualification.",
+  "baseline": "retained-v7 names the fixed admitted-window candidate.",
+  "schedule": "One warmup and three scored runs per arm, rotated order, 5 seconds initial gap, 2 seconds between runs; no replacement runs.",
+  "ranking": "Highest eligible throughput; p99 comes from that same run.",
+  "stall_filter": {
+    "frontier_mean_ms_at_least": 0.12,
+    "fdatasync_mean_ms_at_least": 0.6
+  },
+  "screen_gate": {
+    "minimum_throughput_ratio": 0.98,
+    "maximum_p99_ratio": 1.05,
+    "minimum_eligible_runs_per_arm": 2
+  }
+}

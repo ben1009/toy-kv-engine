@@ -1,0 +1,13 @@
+{
+  "adopted": false,
+  "reason": "Initial complete allocator matrix fails fixed CPU/tail/throughput criteria; significant peak-RSS increase also needs investigation.",
+  "failed_guards": [
+    "tmpfs-batch64_v7_cpu_ceiling",
+    "ext4-batch64_v7_cpu_ceiling",
+    "tmpfs-point1_v7_p99_ceiling",
+    "ext4-point8_v4_p99_ceiling"
+  ],
+  "confirmation_cancelled": true,
+  "source_policy": "Rust global mimalloc; aligned WAL buffers remain on libc",
+  "summary_sha256": "87631aa2eb0efc0e54c7fedc2d539dc87e093cdb4e422ac5bb127fa863dfd9ab"
+}

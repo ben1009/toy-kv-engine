@@ -1,0 +1,25 @@
+{
+  "assessment_passed": false,
+  "source_retained": false,
+  "source_restored": true,
+  "cpu_is_diagnostic": true,
+  "source_candidates_in_scored_matrix": 1,
+  "pre_score_validation_corrections": true,
+  "captured_cells": [
+    "ext4-batch8",
+    "ext4-batch16",
+    "ext4-point8",
+    "ext4-batch1"
+  ],
+  "cancelled_cells": [],
+  "reason": "Reject sync-priority deferral of optional extent initialization. Excluded diagnostic observes zero background starts during sync versus137 in prior retained trace, but batch8 screen is -1.4% throughput/+4.6% p99 across4 matched pairs. All followup cells also fail their guards. Point/solo timing varies sharply below aggregate thresholds; no isolated source effect is claimed. Restore retained large-DATA async-dispatch implementation.",
+  "canonical_sha256": "f353022d846530a6754330aaea11f295319ea8f4de20afa09b6d2a3b57b021d8",
+  "restored_source_sha256": "31a3a050633dfd7900fc2288ce9eba104972d402e4d51b284ef547d889d5902a",
+  "candidate_tests": 1975,
+  "candidate_focused_tests": 49,
+  "probe_invocations": 1,
+  "reused_diagnostic_invocations": 2,
+  "matrix_invocations": 36,
+  "global_completed_unique_invocations": 665,
+  "inherited_interrupted_without_json": 1
+}

@@ -1,0 +1,10 @@
+{
+  "baseline": {
+    "path": "target/release/write-perf-v7-ready-tail-baseline",
+    "sha256": "765f00dd278e7edfacab27b177d1af8b395231e93dd6f0e0c58ce5cfd5bcc102"
+  },
+  "retirement_hint": {
+    "path": "target/release/write-perf-v7-ready-tail-retirement_hint",
+    "sha256": "60191d977bbfd3c3708e02bbb2741723129436e22aab3c57839d5c75eee23717"
+  }
+}

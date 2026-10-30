@@ -1,0 +1,35 @@
+{
+  "system": {
+    "command": [
+      "target/release/write-perf-ssd-allocator-system",
+      "--help"
+    ],
+    "environment": {
+      "MIMALLOC_VERBOSE": "1"
+    },
+    "exit_code": 0,
+    "stderr": "target/wal-opt/20261027-v7-mimalloc-ssd-followup/system-allocator-proof.stderr",
+    "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "native_version_lines": []
+  },
+  "mimalloc": {
+    "command": [
+      "target/release/write-perf-ssd-allocator-mimalloc",
+      "--help"
+    ],
+    "environment": {
+      "MIMALLOC_VERBOSE": "1"
+    },
+    "exit_code": 0,
+    "stderr": "target/wal-opt/20261027-v7-mimalloc-ssd-followup/mimalloc-allocator-proof.stderr",
+    "stderr_sha256": "e05169738d4588d6a3382eb88c69d440123cfbfc2c4ef8fe28dae1a29186839f",
+    "native_version_lines": [
+      "v3.3.2 (built on Oct 26 2026, 19:45:27)"
+    ]
+  },
+  "selected_symbols": [
+    "00000000005823d0 T mi_free",
+    "00000000005844b0 T mi_malloc_aligned"
+  ],
+  "c_malloc_overrides": []
+}

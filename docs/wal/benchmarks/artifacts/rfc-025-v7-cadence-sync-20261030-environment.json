@@ -1,0 +1,22 @@
+{
+  "captured_at_utc": "2026-10-30T08:12:10.944174+00:00",
+  "repository": "/home/liu/proj/toy-kv-engine",
+  "filesystem": "/dev/nvme0n1p3[/liu/proj/toy-kv-engine] ext4 /home/liu/proj/toy-kv-engine",
+  "base_commit": "5b0ce817460b3c5b1daeb27879a8eb4a3fd0f884",
+  "candidate_patch_raw_sha256": "61bd391f1959e0e34b1657c4e452d321620ccfdb01f143e07641e1d72dd6ed36",
+  "initial_rendered_diff_raw_sha256": "55428a3c8b5622c53feaf7450efe7cec3f4b65ec7409650a5c3b82ebb83077bf",
+  "candidate_patch_note": "The initial source snapshot was a configured external rendered diff. The unchanged source was re-exported after the measurements as an applicable patch, checked before rollback; both snapshots are preserved.",
+  "binaries_rechecked_after_capture": {
+    "retained-v7": {
+      "path": "target/wal-opt/20261030-v7-dynamic-group/write-perf-v7-dynamic-window",
+      "sha256": "53d9ddddf0490142bbc5449ebf47b20af363e06c04259f4e74367cc3e7614907"
+    },
+    "candidate-v7": {
+      "path": "target/wal-opt/20261030-v7-cadence-sync/write-perf-v7-cadence-sync",
+      "sha256": "368e3fc3a38ed74debd4b69c68ee9755e3745a3a4e7ae924a70de42205c6ddce"
+    }
+  },
+  "candidate_correctness": "99 WAL runtime and worker nextest tests passed outside the sandbox without retries; non-benchmark cargo check passed.",
+  "disposition": "Candidate source restored after failing the performance gate; patch and all captures preserved.",
+  "validated_unique_invocations": 36
+}

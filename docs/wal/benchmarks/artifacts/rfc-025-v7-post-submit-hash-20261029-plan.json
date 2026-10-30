@@ -1,0 +1,42 @@
+{
+  "source_base": "1dce85d892a2054455843bb29b7f80bc741204a9",
+  "change": "Large-only v7 groups frame DATA, submit it, hash on the same ordered packer, publish the exact endpoint, then allow FRONTIER plus one fdatasync. Small and mixed groups keep inline hashing. No new hash worker or coordinator hash stage.",
+  "baseline": {
+    "path": "target/release/write-perf-v7-large-data-async-dispatch",
+    "sha256": "f353022d846530a6754330aaea11f295319ea8f4de20afa09b6d2a3b57b021d8"
+  },
+  "screen_cells": [
+    "ext4-batch1",
+    "ext4-batch8",
+    "ext4-batch16"
+  ],
+  "guard_cells": [
+    "ext4-point1",
+    "ext4-point8",
+    "ext4-point16"
+  ],
+  "schedule": "One unscored warmup per arm, then three alternating triplets per cell. All three batch screens complete regardless of performance; run all point guards only if all screens pass. No score-selected replacements or extra repeats.",
+  "ranking": "Highest-throughput eligible scored invocation per exact binary and workload; p99 is from that same invocation. Preserve raw maxima, all stalls, and separate historical matching-binary bests.",
+  "stall_filter": {
+    "frontier_mean_ms_at_least": 1,
+    "fdatasync_mean_ms_at_least": 1.5,
+    "selection": "Independently flag runs per arm; aggregate means do not establish absence of stalls."
+  },
+  "screen_gate": {
+    "minimum_throughput_ratio": 1.0,
+    "maximum_p99_ratio": 1.0,
+    "minimum_eligible_runs_per_arm": 2
+  },
+  "guard_gate": {
+    "minimum_throughput_ratio": 0.98,
+    "maximum_p99_ratio": 1.05,
+    "minimum_eligible_runs_per_arm": 2
+  },
+  "cpu_policy": "Diagnostic only, not a retention veto.",
+  "constraints": [
+    "No scored captures overlap builds, tests, profiles, production source edits, or other benchmarks.",
+    "All benchmark scratch databases stay in the local repo and are removed.",
+    "A rejected or inconclusive candidate keeps its patch, exact executable, raw captures, and receipts; restore both Rust files with fresh mtimes and the retained canonical binary by atomic replacement, then run a fresh full check.",
+    "Keep accepted source changes and evidence in separate commits."
+  ]
+}

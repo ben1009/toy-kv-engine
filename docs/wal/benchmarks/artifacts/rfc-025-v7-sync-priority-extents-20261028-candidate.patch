@@ -1,0 +1,203 @@
+diff --git a/kv-engine/src/wal/parallel/runtime.rs b/kv-engine/src/wal/parallel/runtime.rs
+index cbcb7b51..3db590e7 100644
+--- a/kv-engine/src/wal/parallel/runtime.rs
++++ b/kv-engine/src/wal/parallel/runtime.rs
+@@ -859,0 +860 @@ struct AsyncV7ExtentControl {
++    sync_priority: Mutex<usize>,
+@@ -863,0 +865,2 @@ struct AsyncV7ExtentControl {
++    #[cfg(test)]
++    deferred_requests: AtomicU64,
+@@ -873,0 +877 @@ impl AsyncV7ExtentControl {
++            sync_priority: Mutex::new(0),
+@@ -877,0 +882,2 @@ impl AsyncV7ExtentControl {
++            #[cfg(test)]
++            deferred_requests: AtomicU64::new(0),
+@@ -892,0 +899,8 @@ impl AsyncV7ExtentControl {
++    fn prioritize_sync<'a>(&'a self, prepared_end: &'a AtomicU64) -> V7SyncExtentPriority<'a> {
++        *self.sync_priority.lock() += 1;
++        V7SyncExtentPriority {
++            control: self,
++            prepared_end,
++        }
++    }
++
+@@ -907,0 +922,22 @@ impl AsyncV7ExtentControl {
++/// Defer new optional chunks while the coordinator writes and syncs its
++/// certificate. Already selected I/O may finish; demand never waits on this
++/// hint. Resume a pending target on every exit, including error or unwind.
++struct V7SyncExtentPriority<'a> {
++    control: &'a AsyncV7ExtentControl,
++    prepared_end: &'a AtomicU64,
++}
++
++impl Drop for V7SyncExtentPriority<'_> {
++    fn drop(&mut self) {
++        let resume = {
++            let mut active = self.control.sync_priority.lock();
++            *active -= 1;
++            *active == 0
++        };
++        let target = self.control.target.load(Ordering::Acquire);
++        if resume && target > self.prepared_end.load(Ordering::Acquire) {
++            self.control.request(target);
++        }
++    }
++}
++
+@@ -950,0 +987,7 @@ impl AsyncV7ExtentInitializer {
++                            if *worker_control.sync_priority.lock() > 0 {
++                                #[cfg(test)]
++                                worker_control
++                                    .deferred_requests
++                                    .fetch_add(1, Ordering::AcqRel);
++                                break;
++                            }
+@@ -2800,0 +2844,4 @@ fn synchronize_written_prefix(sync_file: &File, inner: &RuntimeInner) -> Result<
++    let _extent_priority = inner
++        .async_v7_extents
++        .as_ref()
++        .map(|control| control.prioritize_sync(&inner.prepared_file_end));
+@@ -3338,0 +3386,143 @@ mod tests {
++    #[test]
++    fn async_v7_extent_sync_priority_defers_chunks_but_allows_demand_and_recovery()
++    -> anyhow::Result<()> {
++        use std::os::unix::fs::FileExt;
++
++        use crate::wal::v7::{
++            install::recover_and_install_active, recovery::WalV7RecoveryAuthority,
++        };
++
++        let directory = async_extent_test_directory()?;
++        let path = directory.path().join("sync-priority.wal");
++        let Some(V7RuntimeTestWal { wal, owner, anchor }) =
++            live_v7_test_wal(&path, super::MAX_WAL_FILE_SIZE, v7_test_resource_limits())?
++        else {
++            return Ok(());
++        };
++        let concurrent = owner.reserve_batch(256)?;
++        let runtime = wal.parallel_runtime.as_ref().unwrap();
++        let Some((entered, resume)) = pause_async_extent(runtime) else {
++            eprintln!("skipping async extent test (ext filesystem unavailable)");
++            return Ok(());
++        };
++        let control = Arc::clone(runtime.inner.async_v7_extents.as_ref().unwrap());
++        let mut batches = vec![v7_test_batch(1, 16)];
++        let ticket = wal
++            .put_v7_batch_with_index(&batches[0], LIVE_WAL_V5_LIMITS)?
++            .0;
++        wal.submit_and_commit(ticket)?;
++        entered.recv_timeout(std::time::Duration::from_secs(5))?;
++        let first_priority = control.prioritize_sync(&runtime.inner.prepared_file_end);
++        let second_priority = control.prioritize_sync(&runtime.inner.prepared_file_end);
++        let sentinel = 3 * super::EXTENT_INITIALIZATION_CHUNK as u64;
++        let canary = std::fs::OpenOptions::new()
++            .read(true)
++            .write(true)
++            .open(&path)?;
++        canary.write_all_at(b"unused", sentinel)?;
++        resume.send(())?;
++        wait_for_extent_state(|| control.deferred_requests.load(super::Ordering::Acquire) > 0);
++        assert_eq!(
++            runtime
++                .inner
++                .prepared_file_end
++                .load(super::Ordering::Acquire),
++            super::EXTENT_INITIALIZATION_CHUNK as u64
++        );
++
++        // Real acknowledged writes cross the ready prefix while optional
++        // preparation is deferred. Demand must never wait for this hint.
++        for ts in 2..=5 {
++            let batch = v7_test_batch(ts, 32 * 1024);
++            let ticket = wal.put_v7_batch_with_index(&batch, LIVE_WAL_V5_LIMITS)?.0;
++            wal.submit_and_commit(ticket)?;
++            batches.push(batch);
++        }
++        let ready = runtime
++            .inner
++            .prepared_file_end
++            .load(super::Ordering::Acquire);
++        assert!(ready > super::EXTENT_INITIALIZATION_CHUNK as u64);
++        assert!(ready <= sentinel);
++        let mut unused = [0; 6];
++        canary.read_exact_at(&mut unused, sentinel)?;
++        assert_eq!(&unused, b"unused");
++        let accepted_end = runtime.logical_length() as usize;
++        let accepted = std::fs::read(&path)?[..accepted_end].to_vec();
++        drop(first_priority);
++        assert_eq!(*control.sync_priority.lock(), 1);
++        drop(second_priority);
++        // No new producer is needed to resume the pending allocated suffix.
++        wait_for_extent_state(|| {
++            runtime
++                .inner
++                .prepared_file_end
++                .load(super::Ordering::Acquire)
++                == super::PREALLOC_BLOCK
++        });
++        canary.read_exact_at(&mut unused, sentinel)?;
++        assert_eq!(unused, [0; 6]);
++        assert_eq!(&std::fs::read(&path)?[..accepted_end], accepted);
++        drop(concurrent);
++        wal.close()?;
++        assert_eq!(owner.snapshot().buffer_memory_bytes, 0);
++        drop(wal);
++        let recovered = recover_and_install_active(
++            &path,
++            WalV7RecoveryAuthority::Active {
++                predecessor: crate::pitr::ChainAnchor::Genesis {
++                    archive_epoch_id: crate::pitr::ArchiveEpochId(anchor.archive_epoch_id),
++                },
++                durable_anchors: vec![anchor],
++            },
++        )?;
++        assert_eq!(recovered.installed.batches, batches);
++        Ok(())
++    }
++
++    #[test]
++    fn async_v7_extent_close_does_not_wait_for_sync_priority() -> anyhow::Result<()> {
++        use crate::wal::v7::{
++            install::recover_and_install_active, recovery::WalV7RecoveryAuthority,
++        };
++
++        let directory = async_extent_test_directory()?;
++        let path = directory.path().join("priority-close.wal");
++        let Some(V7RuntimeTestWal { wal, owner, anchor }) =
++            live_v7_test_wal(&path, super::MAX_WAL_FILE_SIZE, v7_test_resource_limits())?
++        else {
++            return Ok(());
++        };
++        let concurrent = owner.reserve_batch(256)?;
++        let runtime = wal.parallel_runtime.as_ref().unwrap();
++        let Some((entered, resume)) = pause_async_extent(runtime) else {
++            eprintln!("skipping async extent test (ext filesystem unavailable)");
++            return Ok(());
++        };
++        let control = Arc::clone(runtime.inner.async_v7_extents.as_ref().unwrap());
++        let batch = v7_test_batch(1, 16);
++        let ticket = wal.put_v7_batch_with_index(&batch, LIVE_WAL_V5_LIMITS)?.0;
++        wal.submit_and_commit(ticket)?;
++        entered.recv_timeout(std::time::Duration::from_secs(5))?;
++        let priority = control.prioritize_sync(&runtime.inner.prepared_file_end);
++        resume.send(())?;
++        wait_for_extent_state(|| control.deferred_requests.load(super::Ordering::Acquire) > 0);
++        drop(concurrent);
++        wal.close()?;
++        assert_eq!(owner.snapshot().buffer_memory_bytes, 0);
++        assert_eq!(*control.sync_priority.lock(), 1);
++        drop(priority);
++        drop(wal);
++        let recovered = recover_and_install_active(
++            &path,
++            WalV7RecoveryAuthority::Active {
++                predecessor: crate::pitr::ChainAnchor::Genesis {
++                    archive_epoch_id: crate::pitr::ArchiveEpochId(anchor.archive_epoch_id),
++                },
++                durable_anchors: vec![anchor],
++            },
++        )?;
++        assert_eq!(recovered.installed.batches, vec![batch]);
++        Ok(())
++    }
++

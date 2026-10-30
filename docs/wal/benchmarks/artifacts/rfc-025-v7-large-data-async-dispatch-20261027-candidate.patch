@@ -1,0 +1,97 @@
+--- a/kv-engine/src/wal/parallel/runtime.rs
++++ b/kv-engine/src/wal/parallel/runtime.rs
+@@ -1052 +1052,5 @@
+-        let mut worker = IoWorker::spawn(worker_file, Arc::clone(&buffer_pool))?;
++        let mut worker = IoWorker::spawn(
++            worker_file,
++            Arc::clone(&buffer_pool),
++            prepared_v7_extent_end.map(|_| ALLOCATION_ONLY_MIN_BATCH_BYTES),
++        )?;
+--- a/kv-engine/src/wal/parallel/worker.rs
++++ b/kv-engine/src/wal/parallel/worker.rs
+@@ -1574 +1574,5 @@
+-    pub(crate) fn spawn(wal_file: Arc<File>, buffer_pool: Arc<ArrayQueue<B>>) -> Result<Self> {
++    pub(crate) fn spawn(
++        wal_file: Arc<File>,
++        buffer_pool: Arc<ArrayQueue<B>>,
++        async_write_min_bytes: Option<usize>,
++    ) -> Result<Self> {
+@@ -1635,0 +1640 @@
++                    async_write_min_bytes,
+@@ -1810,0 +1816 @@
++#[allow(clippy::too_many_arguments)]
+@@ -1818,0 +1825 @@
++    async_write_min_bytes: Option<usize>,
+@@ -1833,0 +1841 @@
++        async_write_min_bytes,
+@@ -1892,0 +1901 @@
++    async_write_min_bytes: Option<usize>,
+@@ -1937,0 +1947,10 @@
++                // Keep large v7 extent conversion off this issuing thread.
++                // Small writes and other runtimes retain ordinary dispatch.
++                .flags(
++                    if async_write_min_bytes.is_some_and(|minimum| submission.write_len >= minimum)
++                    {
++                        io_uring::squeue::Flags::ASYNC
++                    } else {
++                        io_uring::squeue::Flags::empty()
++                    },
++                )
+@@ -2302,0 +2322 @@
++        path::Path,
+@@ -2449,3 +2469,5 @@
+-    #[test]
+-    fn io_worker_writes_groups_through_its_owned_ring() {
+-        let directory = tempfile::tempdir().expect("create temporary directory");
++    fn check_io_worker_writes_groups(async_write_min_bytes: Option<usize>) {
++        let base =
++            Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/wal-opt/async-dispatch-tests");
++        std::fs::create_dir_all(&base).expect("create local test directory");
++        let directory = tempfile::tempdir_in(base).expect("create temporary directory");
+@@ -2452,0 +2475 @@
++        let first_len = async_write_min_bytes.map_or(4096, |minimum| minimum + 4096);
+@@ -2455 +2478 @@
+-            .set_len(8192)
++            .set_len(first_len as u64 + 4096)
+@@ -2464 +2487 @@
+-        let worker = match IoWorker::spawn(Arc::new(file), buffer_pool) {
++        let worker = match IoWorker::spawn(Arc::new(file), buffer_pool, async_write_min_bytes) {
+@@ -2473 +2496 @@
+-        let mut first_buffer = DirectBuf::new(4096);
++        let mut first_buffer = DirectBuf::new(first_len);
+@@ -2475 +2498 @@
+-        first_buffer.set_len(4096);
++        first_buffer.set_len(first_len);
+@@ -2481 +2504 @@
+-                WriteGroup::new(0..1, vec![WriteBuffer::new(first_buffer, 0, 4096)])
++                WriteGroup::new(0..1, vec![WriteBuffer::new(first_buffer, 0, first_len)])
+@@ -2487,2 +2510,5 @@
+-                WriteGroup::new(1..2, vec![WriteBuffer::new(second_buffer, 4096, 4096)])
+-                    .expect("build second group"),
++                WriteGroup::new(
++                    1..2,
++                    vec![WriteBuffer::new(second_buffer, first_len as u64, 4096)],
++                )
++                .expect("build second group"),
+@@ -2501,0 +2528,6 @@
++        let mut completed = [
++            (first_result.tickets.start, first_result.write_bytes),
++            (second_result.tickets.start, second_result.write_bytes),
++        ];
++        completed.sort_unstable();
++        assert_eq!(completed, [(0, first_len as u64), (1, 4096)]);
+@@ -2505,2 +2537,12 @@
+-        assert!(bytes[..4096].iter().all(|byte| *byte == 0xa1));
+-        assert!(bytes[4096..].iter().all(|byte| *byte == 0xb2));
++        assert!(bytes[..first_len].iter().all(|byte| *byte == 0xa1));
++        assert!(bytes[first_len..].iter().all(|byte| *byte == 0xb2));
++    }
++
++    #[test]
++    fn io_worker_writes_groups_through_its_owned_ring() {
++        check_io_worker_writes_groups(None);
++    }
++
++    #[test]
++    fn io_worker_forces_large_writes_async_beside_ordinary_small_writes() {
++        check_io_worker_writes_groups(Some(64 * 1024));

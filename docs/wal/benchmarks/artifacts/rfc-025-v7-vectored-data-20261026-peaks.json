@@ -1,0 +1,62 @@
+{
+  "ext4-point8": {
+    "old_v4": {
+      "puts_per_sec": 17392.73010402087,
+      "run_id": "1793025528030",
+      "pair": 5,
+      "raw_sha256": "cb9882b1425e4ba108713b3563b58bd1f41beb872a7ee987b59e76edf271b06f",
+      "binary_sha256": "614f0cb1adde43cabe900eb032c6f884783d658c597471d9d9ddc8faff314aa9"
+    },
+    "new_v4": {
+      "puts_per_sec": 17221.56261857832,
+      "run_id": "1793025243750",
+      "pair": 1,
+      "raw_sha256": "5161603b787ea899db2520af6d2bdcc1e49728380b53bad290a9a4c746b3611b",
+      "binary_sha256": "dc0e2b3977e23fb6c6f9b23d0d70ced4728a06daa207ed6c0ca563c77a9ab2cf"
+    },
+    "old_v7": {
+      "puts_per_sec": 15863.322901787218,
+      "run_id": "1793025390695",
+      "pair": 3,
+      "raw_sha256": "84182907f8213533d4679a17ebd5cbfa579b89c82401bbd42130e0bc91497f8a",
+      "binary_sha256": "614f0cb1adde43cabe900eb032c6f884783d658c597471d9d9ddc8faff314aa9"
+    },
+    "new_v7": {
+      "puts_per_sec": 15859.243320962898,
+      "run_id": "1793025276386",
+      "pair": 1,
+      "raw_sha256": "04b8221159b4ba4e246f84ef687d3f7cc0f02d557cb606097e3c3dae2439d714",
+      "binary_sha256": "dc0e2b3977e23fb6c6f9b23d0d70ced4728a06daa207ed6c0ca563c77a9ab2cf"
+    }
+  },
+  "ext4-batch64": {
+    "old_v4": {
+      "puts_per_sec": 401119.2223217751,
+      "run_id": "1793025795698",
+      "pair": 2,
+      "raw_sha256": "d880d7028a7737525dc937b9b5bda60e495ef179dcce25d6bd285a8798ade02f",
+      "binary_sha256": "614f0cb1adde43cabe900eb032c6f884783d658c597471d9d9ddc8faff314aa9"
+    },
+    "new_v4": {
+      "puts_per_sec": 373209.88070651196,
+      "run_id": "1793025887750",
+      "pair": 4,
+      "raw_sha256": "929d026877b90e96ad41d9a11637c3ec83d491f4b15102c9c78261e792ecbe6e",
+      "binary_sha256": "dc0e2b3977e23fb6c6f9b23d0d70ced4728a06daa207ed6c0ca563c77a9ab2cf"
+    },
+    "old_v7": {
+      "puts_per_sec": 378964.8002274323,
+      "run_id": "1793025769270",
+      "pair": 2,
+      "raw_sha256": "84bed18fcc37d84309e74627dd512039f9e1389fb2871726c8bb3b961782defe",
+      "binary_sha256": "614f0cb1adde43cabe900eb032c6f884783d658c597471d9d9ddc8faff314aa9"
+    },
+    "new_v7": {
+      "puts_per_sec": 386514.584680269,
+      "run_id": "1793025744949",
+      "pair": 1,
+      "raw_sha256": "094f76b20ca188ccb5b137cbda025048fac3f3dce57343d9a69df89d35fed302",
+      "binary_sha256": "dc0e2b3977e23fb6c6f9b23d0d70ced4728a06daa207ed6c0ca563c77a9ab2cf"
+    }
+  }
+}

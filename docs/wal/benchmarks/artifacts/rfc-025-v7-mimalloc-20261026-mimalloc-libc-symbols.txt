@@ -1,0 +1,3 @@
+                 U free@GLIBC_2.2.5
+                 U malloc@GLIBC_2.2.5
+                 U posix_memalign@GLIBC_2.2.5

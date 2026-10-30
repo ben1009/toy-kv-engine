@@ -1,0 +1,192 @@
+diff --git a/kv-engine/src/pitr/mod.rs b/kv-engine/src/pitr/mod.rs
+--- a/kv-engine/src/pitr/mod.rs
++++ b/kv-engine/src/pitr/mod.rs
+@@ -1232,0 +1233,59 @@
++
++        Ok(())
++    }
++
++    #[test]
++    fn canonical_entry_stream_matches_v5_for_mixed_point_and_range_sequences() -> Result<()> {
++        let pool = [
++            WalEntry::Put {
++                key: b"b".to_vec(),
++                value: b"two".to_vec(),
++            },
++            WalEntry::Put {
++                key: b"c".to_vec(),
++                value: b"three".to_vec(),
++            },
++            WalEntry::PointDelete { key: b"a".to_vec() },
++            WalEntry::RangeDelete {
++                start: b"a".to_vec(),
++                end: b"d".to_vec(),
++            },
++            WalEntry::PointDelete { key: b"c".to_vec() },
++            WalEntry::Put {
++                key: b"a".to_vec(),
++                value: b"latest".to_vec(),
++            },
++        ];
++        let mut batch = batch();
++        for len in 1..=5 {
++            for mut pattern in 0..pool.len().pow(len) {
++                batch.entries.clear();
++                for _ in 0..len {
++                    batch.entries.push(pool[pattern % pool.len()].clone());
++                    pattern /= pool.len();
++                }
++                let preparation_bytes =
++                    CanonicalWalEntryStream::preparation_buffer_bytes(&batch, limits())?;
++                let stream = CanonicalWalEntryStream::new(&batch, limits())?;
++                assert!(
++                    (stream.last_point.capacity() * std::mem::size_of::<(&[u8], usize)>()) as u64
++                        <= preparation_bytes,
++                    "canonical index allocation exceeds its preflight charge"
++                );
++
++                // The existing v5 canonicalizer uses an independent hash-map
++                // implementation. Compare exact retained order and entry bytes
++                // for sorted/unsorted keys, duplicates, and interleaved ranges.
++                let canonical = canonical_batch(&batch, limits())?;
++                let v5 = encode_v5_batch(&canonical, limits())?;
++                let mut encoded = vec![0; stream.data_len()];
++                let (written, crc) = stream.encode_into(&mut encoded)?;
++                assert_eq!(written, encoded.len());
++                assert_eq!(stream.entry_count() as usize, canonical.entries.len());
++                assert_eq!(
++                    encoded,
++                    v5[WAL_V5_BATCH_HEADER_LEN..WAL_V5_BATCH_HEADER_LEN + written]
++                );
++                assert_eq!(crc, crc32fast::hash(&encoded));
++            }
++        }
+diff --git a/kv-engine/src/wal/parallel/runtime.rs b/kv-engine/src/wal/parallel/runtime.rs
+--- a/kv-engine/src/wal/parallel/runtime.rs
++++ b/kv-engine/src/wal/parallel/runtime.rs
+@@ -2127,0 +2128 @@
++        let durable = state.durable_frontier;
+@@ -2130,2 +2131,6 @@
+-            cutoff = inner.admission.lock().next_ticket;
+-            if written >= cutoff {
++            let pending_preparation = {
++                let admission = inner.admission.lock();
++                cutoff = admission.next_ticket;
++                has_pending_v7_preparations(&admission, durable)
++            };
++            if written >= cutoff && !pending_preparation {
+@@ -2153,0 +2159,13 @@
++}
++
++fn has_pending_v7_preparations(admission: &AdmissionState, durable: u64) -> bool {
++    // Already-reserved preparation can be part of the same producer wave.
++    // This hint only consumes the existing fixed coalescing deadline: capture
++    // and ACK still use the written prefix, and closing admission skips it.
++    admission.open
++        && admission
++            .v7_reservation_owner
++            .as_ref()
++            .is_some_and(|owner| {
++                owner.has_batch_operations_beyond(admission.next_ticket.saturating_sub(durable))
++            })
+@@ -3439,0 +3458,62 @@
++
++        Ok(())
++    }
++
++    #[test]
++    fn v7_coalescing_preparation_hint_never_advances_durability_or_blocks_close()
++    -> anyhow::Result<()> {
++        let directory = tempfile::tempdir()?;
++        let path = directory.path().join("preparation-coalesce.wal");
++        let Some(V7RuntimeTestWal { wal, owner, .. }) =
++            live_v7_test_wal(&path, super::MAX_WAL_FILE_SIZE, v7_test_resource_limits())?
++        else {
++            return Ok(());
++        };
++        let runtime = wal.parallel_runtime.as_ref().unwrap();
++        let mut packer = runtime.inner.packer_state.lock();
++        let first = v7_test_batch(1, 10);
++        let ticket = wal.put_v7_batch_with_index(&first, LIVE_WAL_V5_LIMITS)?.0;
++        let batch = runtime.inner.admission.lock().queue.pop_front().unwrap();
++        let data_end = batch.file_offset + batch.aligned_len as u64;
++        let batch = prepare_test_v7_data(&runtime.inner, &mut packer, batch)?;
++        complete_test_v7_data(&runtime.inner, batch, None)?;
++        packer.next_ticket = ticket + 1;
++        packer.reserved_end = data_end;
++
++        assert!(!super::has_pending_v7_preparations(
++            &runtime.inner.admission.lock(),
++            0
++        ));
++        let pending = runtime.prepare_v7_batch(&v7_test_batch(2, 10), LIVE_WAL_V5_LIMITS)?;
++        assert!(super::has_pending_v7_preparations(
++            &runtime.inner.admission.lock(),
++            0
++        ));
++        let (_sender, completions) = crossbeam_channel::bounded(1);
++        super::coalesce_admitted_prefix(
++            &runtime.inner,
++            &completions,
++            std::time::Duration::from_millis(1),
++        );
++        {
++            let state = runtime.inner.durability.state.lock();
++            assert_eq!(state.written_frontier, 1);
++            assert_eq!(state.durable_frontier, 0);
++        }
++        runtime.inner.admission.lock().open = false;
++        assert!(!super::has_pending_v7_preparations(
++            &runtime.inner.admission.lock(),
++            0
++        ));
++        // This fixture injects CQEs directly instead of waking the automatic
++        // coordinator, so perform its matching sync step before shutdown.
++        assert!(
++            super::synchronize_written_prefix(&runtime.inner.preallocator, &runtime.inner)?
++                .is_some()
++        );
++        drop(packer);
++        wal.close()?;
++        assert_eq!(runtime.inner.durability.state.lock().durable_frontier, 1);
++        assert!(runtime.wait_durable(1).is_err());
++        drop(pending);
++        assert_eq!(owner.snapshot().buffer_memory_bytes, 0);
+diff --git a/kv-engine/src/wal/v7/admission.rs b/kv-engine/src/wal/v7/admission.rs
+--- a/kv-engine/src/wal/v7/admission.rs
++++ b/kv-engine/src/wal/v7/admission.rs
+@@ -399,0 +400,6 @@
++    }
++
++    /// A conservative hint for bounded coalescing, never a durability bound.
++    /// Excess operations may be preparing batches or lingering DATA pins.
++    pub(crate) fn has_batch_operations_beyond(&self, admitted_in_flight: u64) -> bool {
++        self.state.lock().active_batch_operations > admitted_in_flight
+@@ -1644,0 +1651,27 @@
++    }
++
++    #[test]
++    fn batch_operation_hint_includes_preparation_and_lingering_pins() {
++        let ledger = WalV7ResourceLedger::new(batch_limits()).unwrap();
++        let owner = Arc::new(WalV7ReservationOwner {
++            ledger,
++            retained_resources: None,
++            installed_dev: 0,
++            installed_ino: 0,
++            state: Mutex::new(WalV7ReservationOwnerState {
++                retired: false,
++                active_batch_operations: 0,
++                active_source_spool_preparations: 0,
++                reservations: AHashMap::new(),
++            }),
++        });
++        assert!(!owner.has_batch_operations_beyond(0));
++        let mut batch = owner.reserve_batch(128).unwrap();
++        assert!(owner.has_batch_operations_beyond(0));
++        batch.mark_admitted();
++        assert!(!owner.has_batch_operations_beyond(1));
++        let pin = batch.pin_buffer();
++        batch.finish_after_io().unwrap();
++        assert!(owner.has_batch_operations_beyond(0));
++        drop(pin);
++        assert!(!owner.has_batch_operations_beyond(0));

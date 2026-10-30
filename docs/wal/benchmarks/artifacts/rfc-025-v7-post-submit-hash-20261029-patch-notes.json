@@ -1,0 +1,7 @@
+{
+  "reason": "Git truncates function names in hunk labels, producing incomplete words. Strip only the optional labels; all source hunks and reconstructed bytes stay identical. Keep the frozen original compressed.",
+  "original": "rfc-025-v7-post-submit-hash-20261029-candidate-original.patch.gz",
+  "original_sha256": "e2b8c5e1824c6047ce09d08e588e5d3df9994cfa0ba497d480b1380811d2e503",
+  "compressed_sha256": "f1fa3bf531c69f1f270fbe8023571218f6077f25892ade0080fe395447e20ae2",
+  "applicable_patch_sha256": "40b2ba710b6ce5df9d87ef208cf9a36b7e69d8af4ddd4203161bd652c579e45e"
+}

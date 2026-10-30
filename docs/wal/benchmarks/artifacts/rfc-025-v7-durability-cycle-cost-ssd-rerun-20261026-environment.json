@@ -1,0 +1,16 @@
+{
+  "kernel": "Linux 6.12.71-1-lts x86_64 GNU/Linux",
+  "ext4": "ext4 /dev/nvme0n1p3[/liu/proj/toy-kv-engine] rw,nosuid,nodev,relatime",
+  "block_devices": "NAME    MODEL                    SIZE ROTA\nzram0                           31.2G    0\nnvme0n1 SOLIDIGM SSDPFKNU010TZ 953.9G    0",
+  "binary_identity": {
+    "retained": {
+      "path": "target/release/write-perf-v7-validated-logical-batch",
+      "sha256": "614f0cb1adde43cabe900eb032c6f884783d658c597471d9d9ddc8faff314aa9"
+    },
+    "candidate": {
+      "path": "target/release/write-perf-v7-durability-cycle-cost",
+      "sha256": "698d294f9704b0a42210265f852025d49b27f640c70fcf6888857fca71670e32"
+    }
+  },
+  "canonical_sha256": "614f0cb1adde43cabe900eb032c6f884783d658c597471d9d9ddc8faff314aa9"
+}

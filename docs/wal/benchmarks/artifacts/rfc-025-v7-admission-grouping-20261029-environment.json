@@ -1,0 +1,25 @@
+{
+  "kernel": "6.12.71-1-lts",
+  "logical_cpus": 32,
+  "filesystem": "/dev/nvme0n1p3 ext4 rw,relatime",
+  "environment": {
+    "RUSTFLAGS": null,
+    "CARGO_ENCODED_RUSTFLAGS": null,
+    "CARGO_TARGET_DIR": null,
+    "LD_PRELOAD": null,
+    "TMPDIR": "/home/liu/proj/toy-kv-engine/target/tmp/wal-grouping"
+  },
+  "plan_sha256": "e8f0a8ece4afa62323eca81e3864e91d35bb87651fa257703339c7c4a7777365",
+  "matrix_sha256": "e8dc3e5865b2f59293d9eb675ce70b93f6b26d34639e5caa961bf017349ad4c5",
+  "driver_sha256": "6004083d01559d0d684df911414b766417f4a09ca4bc659f146d160d5d85d3f1",
+  "child_sha256": "538c6a74a405dd67eba4d7bb7295fd24965c69a0fa3dde06bed30ed1985650ab",
+  "analyzer_sha256": "6814fc95c366f87a242cb2aa248b0825c0ae2a572a86ef766942fb576e50a860",
+  "orchestrator_sha256": "bcfb2d2e1976e8a92b9c497dcfe2901767e0a13b4f2006f44a81373f17e6eb99",
+  "source_manifest_sha256": "9f9cb17fdbeeb2d00d54d92c7cdba840a451dd40cd428f30530087530755299d",
+  "patch_sha256": "9518cdd7c39c65830b2da8eb9b5bb032527d76a0c770d55730c4ff07b306b2fd",
+  "checks_sha256": "caa0511ac229139173f0670283e0282c2e77c1dae8547e005b67ae3ffcb8efd1",
+  "guard_source_manifest_sha256": "1abbf6e9e9792d53336c957da83ce76d6771f1e9ba1358a6a9ac89365f09f744",
+  "guard_patch_sha256": "77d9cf7e17fa1df82982ac87a0c9a5324bb86a792f66264c67dc72e6f8105041",
+  "guard_checks_sha256": "3c9d7c13e9b29ea093654f705898ec8c9e13dabb0ab97cfc4f00c3c356709d4b",
+  "recovery_diagnosis_sha256": "136debe109ffcf4223b7f8e3dcee6564c103439c3b921ffb6b6a8970ad94ac23"
+}

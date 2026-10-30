@@ -21,6 +21,8 @@ use std::{
     time::Duration,
 };
 
+use ahash::AHashMap;
+
 #[cfg(test)]
 use std::sync::atomic::AtomicU64;
 
@@ -196,7 +198,7 @@ impl Eq for WalV7Reservation {}
 struct LedgerState {
     next_id: u64,
     charged: WalV7ResourceCharge,
-    reservations: BTreeMap<u64, WalV7ResourceCharge>,
+    reservations: AHashMap<u64, WalV7ResourceCharge>,
     source_spool_generation: u64,
     source_spool_work_generation: u64,
 }
@@ -272,7 +274,7 @@ struct WalV7ReservationOwnerState {
     retired: bool,
     active_batch_operations: u64,
     active_source_spool_preparations: u64,
-    reservations: BTreeMap<u64, WalV7Reservation>,
+    reservations: AHashMap<u64, WalV7Reservation>,
 }
 
 /// A batch reservation already held by its image owner. Declare this guard
@@ -362,7 +364,7 @@ impl WalV7ReservationOwner {
         sealing: bool,
     ) -> anyhow::Result<Self> {
         let seed = installed.runtime_seed()?;
-        let mut reservations = BTreeMap::new();
+        let mut reservations = AHashMap::new();
         let mut recovered_charge = installed.recovered_resource_charge()?;
         if sealing {
             recovered_charge.logical_wal_bytes = 0;
@@ -395,6 +397,12 @@ impl WalV7ReservationOwner {
     pub(crate) fn has_in_flight_source_spool_work(&self) -> bool {
         let state = self.state.lock();
         state.active_source_spool_preparations != 0 || state.active_batch_operations != 0
+    }
+
+    /// A conservative hint for bounded coalescing, never a durability bound.
+    /// Excess operations may be preparing batches or lingering DATA pins.
+    pub(crate) fn has_batch_operations_beyond(&self, admitted_in_flight: u64) -> bool {
+        self.state.lock().active_batch_operations > admitted_in_flight
     }
 
     pub(crate) fn source_spool_generation_changed(&self, generation: u64) -> bool {
@@ -784,7 +792,7 @@ impl WalV7ResourceLedger {
                 state: Mutex::new(LedgerState {
                     next_id: 1,
                     charged: WalV7ResourceCharge::default(),
-                    reservations: BTreeMap::new(),
+                    reservations: AHashMap::new(),
                     source_spool_generation: 0,
                     source_spool_work_generation: 0,
                 }),
@@ -1606,7 +1614,7 @@ mod tests {
                 retired: false,
                 active_batch_operations: 0,
                 active_source_spool_preparations: 0,
-                reservations: BTreeMap::new(),
+                reservations: AHashMap::new(),
             }),
         });
         let mut batch = owner.reserve_batch(128).unwrap();
@@ -1640,6 +1648,33 @@ mod tests {
             .await
             .expect("batch completion before registration was lost")
         );
+    }
+
+    #[test]
+    fn batch_operation_hint_includes_preparation_and_lingering_pins() {
+        let ledger = WalV7ResourceLedger::new(batch_limits()).unwrap();
+        let owner = Arc::new(WalV7ReservationOwner {
+            ledger,
+            retained_resources: None,
+            installed_dev: 0,
+            installed_ino: 0,
+            state: Mutex::new(WalV7ReservationOwnerState {
+                retired: false,
+                active_batch_operations: 0,
+                active_source_spool_preparations: 0,
+                reservations: AHashMap::new(),
+            }),
+        });
+        assert!(!owner.has_batch_operations_beyond(0));
+        let mut batch = owner.reserve_batch(128).unwrap();
+        assert!(owner.has_batch_operations_beyond(0));
+        batch.mark_admitted();
+        assert!(!owner.has_batch_operations_beyond(1));
+        let pin = batch.pin_buffer();
+        batch.finish_after_io().unwrap();
+        assert!(owner.has_batch_operations_beyond(0));
+        drop(pin);
+        assert!(!owner.has_batch_operations_beyond(0));
     }
 
     fn charge(
@@ -1745,7 +1780,7 @@ mod tests {
                 retired: false,
                 active_batch_operations: 0,
                 active_source_spool_preparations: 0,
-                reservations: BTreeMap::from([(reservation.id, reservation)]),
+                reservations: AHashMap::from([(reservation.id, reservation)]),
             }),
         });
 

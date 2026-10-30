@@ -1,0 +1,162 @@
+{
+  "memory-probe": [
+    {
+      "cell": "point8",
+      "policy": "system",
+      "peak_rss_mib": 141.62890625,
+      "run_id": "1793017833504",
+      "stats": "rfc-025-v7-mimalloc-20261026-memory-probe-point8-system-stats.txt",
+      "stats_sha256": "d6f9600ea13071289e69ec359f3f3472371bb622e570763cc235e95fe36a44c8",
+      "native_lines": []
+    },
+    {
+      "cell": "point8",
+      "policy": "rust-only",
+      "peak_rss_mib": 198.3125,
+      "run_id": "1793017834378",
+      "stats": "rfc-025-v7-mimalloc-20261026-memory-probe-point8-rust-only-stats.txt",
+      "stats_sha256": "e2833169bc8ff3028bb527e279def4e360f013278bc7cd3a229050d82be3c4f9",
+      "native_lines": [
+        "pages     :     2.3 K       2.6 K      32",
+        "reserved  :     1.0 GiB     1.0 GiB     1.0 GiB",
+        "committed :   197.5 MiB   197.5 MiB   197.5 MiB",
+        "purged    :   192.8 MiB",
+        "process   : user: 1.566 s, system: 0.854 s, faults: 0, peak rss: 198.3 MiB, peak commit: 197.5 MiB"
+      ]
+    },
+    {
+      "cell": "point8",
+      "policy": "aligned",
+      "peak_rss_mib": 211.61328125,
+      "run_id": "1793017835165",
+      "stats": "rfc-025-v7-mimalloc-20261026-memory-probe-point8-aligned-stats.txt",
+      "stats_sha256": "f24a92ef3bf4840db5f4e69cbf25f91ba49a9be723ecb8210362da3b75970847",
+      "native_lines": [
+        "pages     :     2.3 K       2.6 K      34",
+        "reserved  :     1.0 GiB     1.0 GiB     1.0 GiB",
+        "committed :   215.1 MiB   215.1 MiB   215.1 MiB",
+        "purged    :   210.5 MiB",
+        "process   : user: 1.581 s, system: 0.691 s, faults: 0, peak rss: 211.6 MiB, peak commit: 215.1 MiB"
+      ]
+    },
+    {
+      "cell": "batch64",
+      "policy": "system",
+      "peak_rss_mib": 906.06640625,
+      "run_id": "1793017835932",
+      "stats": "rfc-025-v7-mimalloc-20261026-memory-probe-batch64-system-stats.txt",
+      "stats_sha256": "487d0a952c04a1a8db2f198f728df01f031338711c06469fe70528e8ff19f44d",
+      "native_lines": []
+    },
+    {
+      "cell": "batch64",
+      "policy": "rust-only",
+      "peak_rss_mib": 1096.796875,
+      "run_id": "1793017837029",
+      "stats": "rfc-025-v7-mimalloc-20261026-memory-probe-batch64-rust-only-stats.txt",
+      "stats_sha256": "f644ef41d9494d0670dc4662b01de6f5aaa868ee5e5b9dde1183cead87dab1fa",
+      "native_lines": [
+        "pages     :    17.0 K      34.4 K      30",
+        "reserved  :     2.0 GiB     2.0 GiB     2.0 GiB",
+        "committed :     1.0 GiB     1.0 GiB     1.0 GiB",
+        "purged    :     1.0 GiB",
+        "process   : user: 1.817 s, system: 0.966 s, faults: 0, peak rss: 1.0 GiB, peak commit: 1.0 GiB"
+      ]
+    },
+    {
+      "cell": "batch64",
+      "policy": "aligned",
+      "peak_rss_mib": 1107.734375,
+      "run_id": "1793017837981",
+      "stats": "rfc-025-v7-mimalloc-20261026-memory-probe-batch64-aligned-stats.txt",
+      "stats_sha256": "555f35197e6a9c5d299db630b2066254ad4c400cb8c34b1f209e4061cd66871d",
+      "native_lines": [
+        "pages     :    17.0 K      34.4 K      31",
+        "reserved  :     2.0 GiB     2.0 GiB     2.0 GiB",
+        "committed :     1.0 GiB     1.0 GiB     1.0 GiB",
+        "purged    :     1.0 GiB",
+        "process   : user: 2.000 s, system: 0.890 s, faults: 0, peak rss: 1.0 GiB, peak commit: 1.0 GiB"
+      ]
+    }
+  ],
+  "memory-probe-engine": [
+    {
+      "cell": "point8",
+      "policy": "system",
+      "peak_rss_mib": 141.34375,
+      "run_id": "1793018035470",
+      "stats": "rfc-025-v7-mimalloc-20261026-memory-probe-engine-point8-system-stats.txt",
+      "stats_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "native_lines": []
+    },
+    {
+      "cell": "point8",
+      "policy": "rust-only",
+      "peak_rss_mib": 192.05078125,
+      "run_id": "1793018036332",
+      "stats": "rfc-025-v7-mimalloc-20261026-memory-probe-engine-point8-rust-only-stats.txt",
+      "stats_sha256": "e2d534b40bd55581d75a4e1b88d1eae19497b5845895c7d926e43c51f2da6c8e",
+      "native_lines": [
+        "pages     :     2.3 K       2.6 K      32",
+        "reserved  :     1.0 GiB     1.0 GiB     1.0 GiB",
+        "committed :   184.8 MiB   184.8 MiB   184.8 MiB",
+        "purged    :   180.2 MiB",
+        "process   : user: 1.550 s, system: 0.752 s, faults: 0, peak rss: 192.0 MiB, peak commit: 184.8 MiB"
+      ]
+    },
+    {
+      "cell": "point8",
+      "policy": "aligned",
+      "peak_rss_mib": 213.81640625,
+      "run_id": "1793018037095",
+      "stats": "rfc-025-v7-mimalloc-20261026-memory-probe-engine-point8-aligned-stats.txt",
+      "stats_sha256": "71c8e591f0140e97601d847e5534fc5e0e5ce270449d3bb2910dd442b2e67052",
+      "native_lines": [
+        "pages     :     2.3 K       2.6 K      34",
+        "reserved  :     1.0 GiB     1.0 GiB     1.0 GiB",
+        "committed :   214.9 MiB   214.9 MiB   214.9 MiB",
+        "purged    :   210.2 MiB",
+        "process   : user: 1.621 s, system: 0.714 s, faults: 0, peak rss: 213.8 MiB, peak commit: 214.9 MiB"
+      ]
+    },
+    {
+      "cell": "batch64",
+      "policy": "system",
+      "peak_rss_mib": 905.515625,
+      "run_id": "1793018037874",
+      "stats": "rfc-025-v7-mimalloc-20261026-memory-probe-engine-batch64-system-stats.txt",
+      "stats_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "native_lines": []
+    },
+    {
+      "cell": "batch64",
+      "policy": "rust-only",
+      "peak_rss_mib": 1092.6875,
+      "run_id": "1793018039069",
+      "stats": "rfc-025-v7-mimalloc-20261026-memory-probe-engine-batch64-rust-only-stats.txt",
+      "stats_sha256": "07f0467a3df44ab1ef7db25ff3176e6e49dbd3d72814caf9b9808f3c79438eab",
+      "native_lines": [
+        "pages     :    17.0 K      34.4 K      28",
+        "reserved  :     2.0 GiB     2.0 GiB     2.0 GiB",
+        "committed :     1.0 GiB     1.0 GiB     1.0 GiB",
+        "purged    :     1.0 GiB",
+        "process   : user: 2.121 s, system: 0.864 s, faults: 0, peak rss: 1.0 GiB, peak commit: 1.0 GiB"
+      ]
+    },
+    {
+      "cell": "batch64",
+      "policy": "aligned",
+      "peak_rss_mib": 1111.9296875,
+      "run_id": "1793018040061",
+      "stats": "rfc-025-v7-mimalloc-20261026-memory-probe-engine-batch64-aligned-stats.txt",
+      "stats_sha256": "e10c788a3cd07e12a500831a27658f110b281e5fd30cfb56c01704cade75124b",
+      "native_lines": [
+        "pages     :    17.0 K      34.4 K      29",
+        "reserved  :     2.0 GiB     2.0 GiB     2.0 GiB",
+        "committed :     1.0 GiB     1.0 GiB     1.0 GiB",
+        "purged    :     1.0 GiB",
+        "process   : user: 2.022 s, system: 0.871 s, faults: 0, peak rss: 1.0 GiB, peak commit: 1.0 GiB"
+      ]
+    }
+  ]
+}

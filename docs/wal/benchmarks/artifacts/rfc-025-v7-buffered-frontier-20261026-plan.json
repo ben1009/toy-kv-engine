@@ -1,0 +1,71 @@
+{
+  "created_at_utc": "2026-10-26T06:53:51.658108+00:00",
+  "source_base": "b9684dc5101d058b4f737def66bec9f169eeb739",
+  "change": "Only the v7 Parallel FRONTIER/sync handle becomes a separately opened non-append buffered descriptor. DATA and extent initialization remain direct. The existing three-handle installed-inode validation and one-fdatasync publication sequence remain.",
+  "correctness": "Require concurrent direct-DATA/unsynced-FRONTIER preservation/recovery test, existing short-marker and failed-sync poisoning tests, and full cargo make check before benchmark. Do not weaken cutoffs, allocation, digest, or recovery rules.",
+  "baseline_sha256": "614f0cb1adde43cabe900eb032c6f884783d658c597471d9d9ddc8faff314aa9",
+  "build": [
+    "cargo",
+    "build",
+    "--release",
+    "--package",
+    "kv-engine",
+    "--bin",
+    "write-perf",
+    "--features",
+    "bench"
+  ],
+  "phase_one": [
+    "ext4-point8",
+    "ext4-batch64"
+  ],
+  "cells": {
+    "ext4-point8": {
+      "operations": 100000,
+      "writers": 8,
+      "batch_size": null,
+      "pairs": 5
+    },
+    "ext4-batch64": {
+      "operations": 750000,
+      "writers": 8,
+      "batch_size": 64,
+      "pairs": 5
+    },
+    "tmpfs-batch64": {
+      "operations": 750000,
+      "writers": 8,
+      "batch_size": 64,
+      "pairs": 3
+    },
+    "tmpfs-point8": {
+      "operations": 100000,
+      "writers": 8,
+      "batch_size": null,
+      "pairs": 3
+    },
+    "tmpfs-point1": {
+      "operations": 100000,
+      "writers": 1,
+      "batch_size": null,
+      "pairs": 3
+    }
+  },
+  "common": "1 KiB values; 2 GiB SST target; sample every 10 batches or 100 point operations. Four unscored warmups per cell. Four-arm pairs old_v4,new_v4,old_v7,new_v7 when odd; reverse when even. No tests/builds/profiles overlap scored runs.",
+  "cooldown": "SSD: initial 30 seconds, 10 seconds between every run. Tmpfs: three seconds between runs.",
+  "ssd_gate": {
+    "paired_raw_throughput_both": ">=0.95",
+    "paired_v4_normalized_throughput_both": ">=0.95",
+    "ratio_of_per_arm_median_v7_rates_both": ">=0.95",
+    "paired_p99_both": "<=1.10",
+    "material_gain": "At least one SSD cell must achieve >=1.02 paired raw throughput and >=1.00 v4-normalized throughput."
+  },
+  "conditional_ram": "Only if the SSD gate passes: all three RAM cells. Require paired raw and normalized throughput plus ratio of per-arm median rates >=0.95; CPU <=1.05; solo p99 <=1.10.",
+  "conditional_confirmation": "Only if SSD and RAM gates pass: exactly five additional pairs per SSD cell, same protocol plus four warmups each. Pool ten pairs per SSD cell; SSD gates must still pass. No further attempts selected by results.",
+  "on_failure": "Cancel dependent phases; preserve every failed capture and exact candidate patch/source manifest. Restore retained source and canonical executable, refresh source mtimes, and run fresh required checks.",
+  "interpretation": "Buffered FRONTIER pwrite timing may shrink while fdatasync absorbs the physical write. Judge total throughput/latency and counters, not marker timing alone. Linux documents possible coherency and performance costs from mixed buffered/direct I/O; every physical frame range remains allocator-owned and disjoint.",
+  "primary_references": [
+    "https://man7.org/linux/man-pages/man2/open.2.html",
+    "https://man7.org/linux/man-pages/man2/fsync.2.html"
+  ]
+}

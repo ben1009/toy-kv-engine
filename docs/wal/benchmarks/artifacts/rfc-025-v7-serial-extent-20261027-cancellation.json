@@ -1,0 +1,17 @@
+{
+  "stopped_at_utc": "2026-10-26T17:28:34.411008+00:00",
+  "reason": "The first serial fallback fails the necessary point16 p99 guard. Finish both requested 16-writer cells, then stop this rejected prototype before unrun single/eight-writer cells. A separately frozen demand-prefix candidate addresses the first-allocation stall.",
+  "completed_cells": [
+    "ext4-point16",
+    "ext4-batch16"
+  ],
+  "cancelled_cells": [
+    "ext4-point1",
+    "ext4-point8",
+    "ext4-batch8"
+  ],
+  "scored_records": 24,
+  "warmups": 8,
+  "prototype_qualified": false,
+  "stopped_driver": "python3 docs/wal/benchmarks/artifacts/rfc-025-v7-serial-extent-20261027-run.py ext4-batch16"
+}

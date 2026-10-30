@@ -1,0 +1,88 @@
+{
+  "created_at_utc": "2026-10-26T17:13:42.365114+00:00",
+  "source_base": "0ffebd516b865b01371ed65014ac0347ae2fb420",
+  "authorization": "Maintainer: Keep and Optimize for 1 writer; additionally requested 16-writer coverage.",
+  "hypothesis": "Serial commits should not enqueue background zero writes that can compete with their WAL sync. Keep the asynchronous extent optimization for concurrent producer reservations; prepare the complete already allocated extent synchronously when zero or one batch operation is outstanding.",
+  "candidate": "Use the existing reservation owner count as a scheduling hint before requesting background extent preparation. Query before taking the preparation mutex. Ready-prefix fast paths stay unchanged. Existing background requests remain bounded by their allocated target; no new target is scheduled by serial demand. No changes to codec, ticket, hashes, allocation bounds, DATA/FRONTIER ordering, fdatasync or spool charges.",
+  "baselines": {
+    "async": "ef112fd0dea7f292a0be9ab47eae6276242dd6b290efccdf4335f03e41b17d0a",
+    "pre_async": "614f0cb1adde43cabe900eb032c6f884783d658c597471d9d9ddc8faff314aa9"
+  },
+  "matrix": {
+    "ext4-point1": {
+      "operations": 20000,
+      "writers": 1,
+      "batch": null,
+      "sample_every": 10,
+      "samples": 2000,
+      "pairs": 5,
+      "arms": [
+        "base_v7",
+        "old_v4",
+        "new_v4",
+        "old_v7",
+        "new_v7"
+      ]
+    },
+    "ext4-point8": {
+      "operations": 100000,
+      "writers": 8,
+      "batch": null,
+      "sample_every": 100,
+      "samples": 1000,
+      "pairs": 3,
+      "arms": [
+        "old_v4",
+        "new_v4",
+        "old_v7",
+        "new_v7"
+      ]
+    },
+    "ext4-batch8": {
+      "operations": 750000,
+      "writers": 8,
+      "batch": 64,
+      "sample_every": 10,
+      "samples": 1176,
+      "pairs": 3,
+      "arms": [
+        "old_v4",
+        "new_v4",
+        "old_v7",
+        "new_v7"
+      ]
+    },
+    "ext4-point16": {
+      "operations": 100000,
+      "writers": 16,
+      "batch": null,
+      "sample_every": 100,
+      "samples": 1008,
+      "pairs": 3,
+      "arms": [
+        "old_v4",
+        "new_v4",
+        "old_v7",
+        "new_v7"
+      ]
+    },
+    "ext4-batch16": {
+      "operations": 750000,
+      "writers": 16,
+      "batch": 64,
+      "sample_every": 10,
+      "samples": 1184,
+      "pairs": 3,
+      "arms": [
+        "old_v4",
+        "new_v4",
+        "old_v7",
+        "new_v7"
+      ]
+    }
+  },
+  "protocol": "SSD only; same 1KiB values,2GiB SST,parallel mode and explicit formats. One warmup per arm. Alternate arm order between pairs. 30s initial cooldown and 10s between runs. Host auditing before/during(1Hz)/after, no build/test/profile overlap, all stalls retained. Run 16-writer cells first, then serial and eight-writer cells. No retries chosen by score.",
+  "guards": "Each cell candidate/async paired raw, v4-normalized and arm-median throughput >=0.95, paired p99<=1.10, identical DATA bytes and paired sync count<=1.05. Serial additionally requires p99 versus async<=0.95 and versus pre-async<=1.10; paired raw versus pre-async>=0.95. CPU reported. These are exploratory fix guards, not complete RFC qualification. Report exact failed guards without overriding the maintainer retention of the original async optimization.",
+  "correctness": "Full cargo make check and direct typos outside sandbox. Preserve all async lifecycle/failure tests using actual concurrent producer reservations. Add serial extent rollover and exact recovery test proving no background target or wake is scheduled with one batch operation. Preserve caps, shared cursor safety and sealing join.",
+  "decision": "Keep original async commit at maintainer request. Commit serial scheduling fix separately if fixed guards pass; otherwise revert only the follow-up and report unresolved single-writer latency. Preserve all code, hashes, captures, controls and failed guards. No PR or push."
+}

@@ -1,0 +1,31 @@
+{
+  "attempt": "Initial fixture compile",
+  "reason": "Missing std::path::Path import in the new repository-backed test fixture; corrected before successful checks and any capture.",
+  "checks": {
+    "outside_sandbox": true,
+    "checks": [
+      {
+        "phase": "focused",
+        "command": [
+          "cargo",
+          "nextest",
+          "run",
+          "--offline",
+          "--locked",
+          "--workspace",
+          "--all-features",
+          "--lib",
+          "--retries",
+          "0",
+          "--success-output",
+          "immediate",
+          "-E",
+          "test(wal::parallel_worker::tests::) or (test(wal::parallel_runtime::tests::) and (test(v7_frontier) or test(v7_extent) or test(async_v7_extent) or test(failpoint_v7) or test(v7_large_batch_wave)))"
+        ],
+        "exit_code": 101,
+        "log": "target/wal-opt/20261027-v7-large-data-async-dispatch/initial-focused.log",
+        "log_sha256": "a71a2d2b43756ff3d1e08c7a38c9026bb0a8db2901b5fa19a4cf7318464405eb"
+      }
+    ]
+  }
+}

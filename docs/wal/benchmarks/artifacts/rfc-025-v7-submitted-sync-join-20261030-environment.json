@@ -1,0 +1,20 @@
+{
+  "captured_at_utc": "2026-10-30T02:09:22.997918+00:00",
+  "repository": "/home/liu/proj/toy-kv-engine",
+  "filesystem": "/dev/nvme0n1p3[/liu/proj/toy-kv-engine] ext4 /home/liu/proj/toy-kv-engine",
+  "base_commit": "0b87e88a",
+  "candidate_patch_sha256": "65df6b598759fb05b0821d16c6d064b91b78da358e7a5644a2f595fb153277f7",
+  "binaries_rechecked_after_capture": {
+    "retained-v7": {
+      "path": "target/wal-opt/20261030-v7-dynamic-group/write-perf-v7-dynamic-window",
+      "sha256": "53d9ddddf0490142bbc5449ebf47b20af363e06c04259f4e74367cc3e7614907"
+    },
+    "candidate-v7": {
+      "path": "target/wal-opt/20261030-v7-submitted-sync-join/write-perf-v7-submitted-sync-join",
+      "sha256": "63b3660ed22bbf0b589ca6bbdee1fed6d87731b2ad6fe9f74f244e93a9e0afec"
+    }
+  },
+  "candidate_correctness": "97 WAL runtime and worker nextest tests passed outside the sandbox, including ineligible frontier and new submitted-follower recovery test; no retries.",
+  "disposition": "Experimental source restored to base after the performance screen did not qualify; patch and raw captures preserved.",
+  "candidate_patch_archive_sha256": "4842a68109528cae9d9c26cb1121246f29dc93e671b01952451533151d444093"
+}

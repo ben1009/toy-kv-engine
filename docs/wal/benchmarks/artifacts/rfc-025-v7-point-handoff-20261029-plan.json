@@ -1,0 +1,27 @@
+{
+  "created_at_utc": "2026-10-28T23:46:53.686548+00:00",
+  "source_base": "05dd9c2c74901741d635a8b9559638a88594f143",
+  "purpose": "Locate small-write delays between API entry, DATA staging/submission/reap, coordinator receive/capture, FRONTIER/sync, durable publication and waiting caller return. Two excluded retained-policy captures only; no performance qualification or new source policy before diagnosis.",
+  "prior_verification": "rfc-025-v7-small-completion-priority-20261028-verification.json",
+  "prior_global_invocations": 803,
+  "baseline": {
+    "path": "target/release/write-perf-v7-large-data-async-dispatch",
+    "sha256": "f353022d846530a6754330aaea11f295319ea8f4de20afa09b6d2a3b57b021d8"
+  },
+  "schedule": [
+    {
+      "writers": 1,
+      "operations": 20000,
+      "sample_every": 10
+    },
+    {
+      "writers": 8,
+      "operations": 100000,
+      "sample_every": 100
+    }
+  ],
+  "configuration": "v7 Parallel,ext4,1KiB values,2GiB SST,no compaction,fresh repository-local databases.30s initial cooldown and15s gaps. RAM-buffered event tracing emitted after engine close; native synchronous-I/O interposer.10ms scheduler observer plus1Hz host audit. No overlapping builds/tests/edits/profiles or SSD health polling.",
+  "instrumentation": "Temporary global bounded1million-event buffer records CLOCK_MONOTONIC,thread IDs and ticket/key coordinates. A mutex serializes trace insertion; timestamps are taken before its lock. All trace overhead, including synchronization and page faults, may change scheduling/grouping. Events are diagnostic only. Trace drop count must be0.",
+  "analysis": "Map API calls to the one wait_durable ticket inside their thread interval, then to request staging/reap, coordinator and covering FRONTIER/sync. Report distributions and sampled runnable-delay counters. Do not sum overlapping stages or classify all unexplained delay as SSD stalls.",
+  "next_step": "Restore exact retained source/executable after the two captures. Choose a separately frozen bounded optimization only if the diagnosis identifies a concrete source mechanism; otherwise report diagnosis for review."
+}

@@ -1571,7 +1571,11 @@ impl<B: WorkerBuffer> Clone for IoWorkerClient<B> {
 }
 
 impl<B: WorkerBuffer> IoWorker<B> {
-    pub(crate) fn spawn(wal_file: Arc<File>, buffer_pool: Arc<ArrayQueue<B>>) -> Result<Self> {
+    pub(crate) fn spawn(
+        wal_file: Arc<File>,
+        buffer_pool: Arc<ArrayQueue<B>>,
+        async_write_min_bytes: Option<usize>,
+    ) -> Result<Self> {
         let (command_tx, command_rx) = unbounded();
         let (completion_tx, completion_rx) = unbounded::<GroupWriteResult>();
         let failure_events = completion_tx.clone();
@@ -1633,6 +1637,7 @@ impl<B: WorkerBuffer> IoWorker<B> {
                     worker_slots,
                     &worker_wake,
                     worker_sync_progress,
+                    async_write_min_bytes,
                 )
             })
             .context("failed to spawn WAL I/O worker")?;
@@ -1808,6 +1813,7 @@ impl<B: WorkerBuffer> Drop for IoWorker<B> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_worker<B: WorkerBuffer>(
     ring: &mut io_uring::IoUring,
     buffer_pool: Arc<ArrayQueue<B>>,
@@ -1816,6 +1822,7 @@ fn run_worker<B: WorkerBuffer>(
     slots: Arc<GroupSlots>,
     wake: &WorkerWake,
     sync_progress: Arc<WalSyncProgress>,
+    async_write_min_bytes: Option<usize>,
 ) -> Result<()> {
     let mut core = WorkerCore::<B>::new();
     let mut group_permits = HashMap::<GroupId, GroupPermit>::new();
@@ -1831,6 +1838,7 @@ fn run_worker<B: WorkerBuffer>(
         &slots,
         wake,
         &sync_progress,
+        async_write_min_bytes,
         &mut core,
         &mut group_permits,
         &mut ring_staged,
@@ -1890,6 +1898,7 @@ fn run_worker_loop<B: WorkerBuffer>(
     slots: &GroupSlots,
     wake: &WorkerWake,
     sync_progress: &WalSyncProgress,
+    async_write_min_bytes: Option<usize>,
     core: &mut WorkerCore<B>,
     group_permits: &mut HashMap<GroupId, GroupPermit>,
     ring_staged: &mut VecDeque<RequestId>,
@@ -1935,6 +1944,16 @@ fn run_worker_loop<B: WorkerBuffer>(
                 )
                 .offset(submission.file_offset)
                 .build()
+                // Keep large v7 extent conversion off this issuing thread.
+                // Small writes and other runtimes retain ordinary dispatch.
+                .flags(
+                    if async_write_min_bytes.is_some_and(|minimum| submission.write_len >= minimum)
+                    {
+                        io_uring::squeue::Flags::ASYNC
+                    } else {
+                        io_uring::squeue::Flags::empty()
+                    },
+                )
                 .user_data(submission.request_id.0);
                 // SAFETY: `core` owns the DirectBuf and retains it until its CQE is
                 // consumed. The ring is private to this worker thread and has no
@@ -2300,6 +2319,7 @@ mod tests {
             fd::AsRawFd,
             unix::{fs::OpenOptionsExt, net::UnixStream},
         },
+        path::Path,
         thread,
         time::Duration,
     };
@@ -2446,13 +2466,16 @@ mod tests {
         })
     }
 
-    #[test]
-    fn io_worker_writes_groups_through_its_owned_ring() {
-        let directory = tempfile::tempdir().expect("create temporary directory");
+    fn check_io_worker_writes_groups(async_write_min_bytes: Option<usize>) {
+        let base =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/wal-opt/async-dispatch-tests");
+        std::fs::create_dir_all(&base).expect("create local test directory");
+        let directory = tempfile::tempdir_in(base).expect("create temporary directory");
         let path = directory.path().join("wal");
+        let first_len = async_write_min_bytes.map_or(4096, |minimum| minimum + 4096);
         File::create(&path)
             .expect("create buffered WAL file")
-            .set_len(8192)
+            .set_len(first_len as u64 + 4096)
             .expect("size WAL file");
         let file = File::options()
             .read(true)
@@ -2461,7 +2484,7 @@ mod tests {
             .open(&path)
             .expect("open direct WAL handle");
         let buffer_pool = Arc::new(super::ArrayQueue::new(4));
-        let worker = match IoWorker::spawn(Arc::new(file), buffer_pool) {
+        let worker = match IoWorker::spawn(Arc::new(file), buffer_pool, async_write_min_bytes) {
             Ok(worker) => worker,
             Err(error) if io_uring_unavailable(&error) => {
                 eprintln!("skipping test (io_uring unavailable): {error:#}");
@@ -2470,22 +2493,25 @@ mod tests {
             Err(error) => panic!("failed to start WAL I/O worker: {error:#}"),
         };
 
-        let mut first_buffer = DirectBuf::new(4096);
+        let mut first_buffer = DirectBuf::new(first_len);
         first_buffer.as_mut_slice().fill(0xa1);
-        first_buffer.set_len(4096);
+        first_buffer.set_len(first_len);
         let mut second_buffer = DirectBuf::new(4096);
         second_buffer.as_mut_slice().fill(0xb2);
         second_buffer.set_len(4096);
         worker
             .submit_group(
-                WriteGroup::new(0..1, vec![WriteBuffer::new(first_buffer, 0, 4096)])
+                WriteGroup::new(0..1, vec![WriteBuffer::new(first_buffer, 0, first_len)])
                     .expect("build first group"),
             )
             .expect("submit first group");
         worker
             .submit_group(
-                WriteGroup::new(1..2, vec![WriteBuffer::new(second_buffer, 4096, 4096)])
-                    .expect("build second group"),
+                WriteGroup::new(
+                    1..2,
+                    vec![WriteBuffer::new(second_buffer, first_len as u64, 4096)],
+                )
+                .expect("build second group"),
             )
             .expect("submit second group");
 
@@ -2499,11 +2525,27 @@ mod tests {
             .expect("second group completion");
         assert_eq!(first_result.error, None);
         assert_eq!(second_result.error, None);
+        let mut completed = [
+            (first_result.tickets.start, first_result.write_bytes),
+            (second_result.tickets.start, second_result.write_bytes),
+        ];
+        completed.sort_unstable();
+        assert_eq!(completed, [(0, first_len as u64), (1, 4096)]);
         worker.close().expect("close worker");
 
         let bytes = std::fs::read(path).expect("read WAL contents");
-        assert!(bytes[..4096].iter().all(|byte| *byte == 0xa1));
-        assert!(bytes[4096..].iter().all(|byte| *byte == 0xb2));
+        assert!(bytes[..first_len].iter().all(|byte| *byte == 0xa1));
+        assert!(bytes[first_len..].iter().all(|byte| *byte == 0xb2));
+    }
+
+    #[test]
+    fn io_worker_writes_groups_through_its_owned_ring() {
+        check_io_worker_writes_groups(None);
+    }
+
+    #[test]
+    fn io_worker_forces_large_writes_async_beside_ordinary_small_writes() {
+        check_io_worker_writes_groups(Some(64 * 1024));
     }
 
     #[test]

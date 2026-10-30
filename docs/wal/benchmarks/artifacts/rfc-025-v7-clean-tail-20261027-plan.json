@@ -1,0 +1,13 @@
+{
+  "created_at_utc": "2026-10-27T07:52:16.469511+00:00",
+  "purpose": "Trace the exact retirement-hint prototype that reported16-writer throughput-1.0%/p99+23.1%, after the user asked to ignore obvious stall results and investigate the remaining tail. Earlier buffer-reuse diagnostics are a different source and cannot establish this prototypes causal tail.",
+  "source_base": "3aca2bdb9b574e7d1c106aad12731db0c384191f",
+  "prototype_snapshot": "target/wal-opt/20261027-v7-batch-retirement-hint/candidate-source",
+  "protocol": "Four excluded diagnostics, all16writers: baseline, retirement_hint, retirement_hint, baseline. Same750000 puts/batch64/1KiB/2GiB/no compaction/explicitv7Parallel/sample10.30s initial cooldown,15s gaps. Both saved executables contain the identical benchmark-only latency trace patch. No new engine optimization, source retuning or score replacement.",
+  "trace": "Collect sampled batch start/end monotonic timestamps and first-key ordinal in per-writer memory; emit only after measured writes finish. Retain databases until parent reads first-fragment ticket/key coordinates and then delete them. Reuse in-memory syscall shim and100ms observer. Pair each sample with first successful FRONTIER covering its ticket and matching fdatasync; decompose before FRONTIER, FRONTIER write, sync gap, fdatasync, and after durability.",
+  "stall_filter": "Preserve every record. In the requested filtered view, flag a sampled operation as obvious I/O-stall-overlapping if any traced WAL pwrite64/fdatasync/fallocate lasting>=1ms overlaps its interval. Also report sensitivity at2ms and5ms. Keep entire-run raw summaries, clean-sample counts and tails visible. The shim does not capture asynchronous DATA CQE latency, so unflagged is not proof of stall-free storage; no hardware cause is inferred.",
+  "comparison_limits": "All runs diagnostic because sampling/interposition/timestamps perturb the workload. Bounded4-run schedule has no peak-selected retries. Whole-run noisy ratios do not establish a16-writer regression or erase the original qualification failure. No source optimization is promoted from these traces.",
+  "publication": "Restore live runtime/worker/harness and canonical executable to retained f7 after building named diagnostic binaries; force source mtimes for the restored validation. Keep only documentation/evidence locally. No push or PR.",
+  "outside_sandbox": true,
+  "bootstrap_probe": "One5000-put baseline16-writer trace verifies the timestamp/key/ticket mapping before the four fixed diagnostics. Excluded, no qualification or threshold selection; probe artifacts preserved."
+}

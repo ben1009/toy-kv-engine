@@ -1,0 +1,183 @@
+--- a/kv-engine/src/wal/parallel/runtime.rs
++++ b/kv-engine/src/wal/parallel/runtime.rs
+@@ -2247,0 +2248 @@
++    let mut v7_coalesce_window = V7CoalesceWindow::default();
+@@ -2260 +2261,6 @@
+-            coalesce_admitted_prefix(&inner, &completions, wait);
++            coalesce_admitted_prefix(
++                &inner,
++                &completions,
++                wait,
++                v7_layout.then_some(&mut v7_coalesce_window),
++            );
+@@ -2278,0 +2285,19 @@
++}
++
++#[derive(Default)]
++struct V7CoalesceWindow {
++    durable_frontier: u64,
++    deadline: Option<Instant>,
++}
++
++impl V7CoalesceWindow {
++    fn deadline(&mut self, durable_frontier: u64, wait: Duration) -> Instant {
++        if self.durable_frontier != durable_frontier {
++            self.durable_frontier = durable_frontier;
++            self.deadline = None;
++        }
++        // Retaining a preceding FRONTIER can make the next written target
++        // physically ineligible. A retry spends only the original window's
++        // remaining budget, even if more DATA has completed in the meantime.
++        *self.deadline.get_or_insert_with(|| Instant::now() + wait)
++    }
+@@ -2302,0 +2328 @@
++    retry_window: Option<&mut V7CoalesceWindow>,
+@@ -2304 +2330 @@
+-    {
++    let durable = {
+@@ -2309,3 +2335,7 @@
+-    }
+-
+-    let deadline = Instant::now() + wait;
++        state.durable_frontier
++    };
++
++    let deadline = match retry_window {
++        Some(window) => window.deadline(durable, wait),
++        None => Instant::now() + wait,
++    };
+@@ -4449,0 +4480 @@
++            None,
+@@ -4472,0 +4504,132 @@
++
++        Ok(())
++    }
++
++    #[test]
++    fn v7_coalescing_retries_share_one_deadline_until_durable_progress() -> anyhow::Result<()> {
++        use std::time::{Duration, Instant};
++
++        use crate::wal::v7::{
++            install::recover_and_install_active, recovery::WalV7RecoveryAuthority,
++        };
++
++        let directory = tempfile::tempdir()?;
++        let path = directory.path().join("coalescing-retry.wal");
++        let Some(V7RuntimeTestWal { wal, owner, anchor }) =
++            live_v7_test_wal(&path, super::MAX_WAL_FILE_SIZE, v7_test_resource_limits())?
++        else {
++            return Ok(());
++        };
++        let runtime = wal.parallel_runtime.as_ref().unwrap();
++        let mut packer = runtime.inner.packer_state.lock();
++        let (sender, completions) = crossbeam_channel::bounded(1);
++        let mut window = super::V7CoalesceWindow::default();
++        super::coalesce_admitted_prefix(
++            &runtime.inner,
++            &completions,
++            Duration::ZERO,
++            Some(&mut window),
++        );
++        assert!(
++            window.deadline.is_none(),
++            "idle DATA does not start a window"
++        );
++
++        let batches = (1..=5).map(|ts| v7_test_batch(ts, 10)).collect::<Vec<_>>();
++        let mut pending = std::collections::VecDeque::new();
++        for batch in &batches[..3] {
++            wal.put_v7_batch_with_index(batch, LIVE_WAL_V5_LIMITS)?;
++            let batch = runtime.inner.admission.lock().queue.pop_front().unwrap();
++            pending.push_back(prepare_test_v7_data(&runtime.inner, &mut packer, batch)?);
++        }
++        // F(T=1) follows D0,D1,D2. A successor at T=2 would retain D2 even
++        // though that ticket has not completed, so only T=3 is eligible.
++        complete_test_v7_data(&runtime.inner, pending.pop_front().unwrap(), None)?;
++        assert!(
++            super::synchronize_written_prefix(&runtime.inner.preallocator, &runtime.inner)?
++                .is_some()
++        );
++        complete_test_v7_data(&runtime.inner, pending.pop_front().unwrap(), None)?;
++        super::coalesce_admitted_prefix(
++            &runtime.inner,
++            &completions,
++            Duration::ZERO,
++            Some(&mut window),
++        );
++        assert_eq!(window.durable_frontier, 1);
++        assert!(window.deadline.is_some());
++        let tail = runtime.logical_length();
++        assert!(
++            super::synchronize_written_prefix(&runtime.inner.preallocator, &runtime.inner)?
++                .is_none()
++        );
++        assert_eq!(runtime.logical_length(), tail);
++        runtime.wait_durable(0)?;
++
++        // Simulate an elapsed original deadline without a timing-sensitive
++        // sleep. A queued error makes an accidental fresh wait observable:
++        // coalescing must leave it for the coordinator's normal capture drain.
++        let expired = Instant::now() - Duration::from_secs(1);
++        window.deadline = Some(expired);
++        sender.send(super::GroupWriteResult {
++            group_id: 2,
++            tickets: 2..3,
++            write_count: 1,
++            write_bytes: 4096,
++            error: Some("queued result must remain outside expired coalescing".to_owned()),
++        })?;
++        super::coalesce_admitted_prefix(
++            &runtime.inner,
++            &completions,
++            Duration::from_secs(1),
++            Some(&mut window),
++        );
++        assert_eq!(window.deadline, Some(expired));
++        assert_eq!(completions.try_recv()?.tickets, 2..3);
++        assert!(!runtime.is_poisoned());
++        {
++            let state = runtime.inner.durability.state.lock();
++            assert_eq!((state.written_frontier, state.durable_frontier), (2, 1));
++        }
++        complete_test_v7_data(&runtime.inner, pending.pop_front().unwrap(), None)?;
++        assert!(
++            super::synchronize_written_prefix(&runtime.inner.preallocator, &runtime.inner)?
++                .is_some()
++        );
++        runtime.wait_durable(2)?;
++
++        for batch in &batches[3..] {
++            wal.put_v7_batch_with_index(batch, LIVE_WAL_V5_LIMITS)?;
++            let batch = runtime.inner.admission.lock().queue.pop_front().unwrap();
++            pending.push_back(prepare_test_v7_data(&runtime.inner, &mut packer, batch)?);
++        }
++        complete_test_v7_data(&runtime.inner, pending.pop_front().unwrap(), None)?;
++        super::coalesce_admitted_prefix(
++            &runtime.inner,
++            &completions,
++            Duration::ZERO,
++            Some(&mut window),
++        );
++        assert_eq!(window.durable_frontier, 3);
++        assert!(window.deadline.unwrap() > expired);
++        assert_eq!(runtime.inner.durability.state.lock().durable_frontier, 3);
++        complete_test_v7_data(&runtime.inner, pending.pop_front().unwrap(), None)?;
++        super::synchronize_written_prefix(&runtime.inner.preallocator, &runtime.inner)?;
++        packer.next_ticket = wal.next_ticket();
++        packer.reserved_end = runtime.logical_length();
++        packer.preallocated_end = std::fs::metadata(&path)?.len();
++        drop(packer);
++        wal.close()?;
++        assert_eq!(owner.snapshot().buffer_memory_bytes, 0);
++        drop(wal);
++
++        let recovered = recover_and_install_active(
++            &path,
++            WalV7RecoveryAuthority::Active {
++                predecessor: crate::pitr::ChainAnchor::Genesis {
++                    archive_epoch_id: crate::pitr::ArchiveEpochId(anchor.archive_epoch_id),
++                },
++                durable_anchors: vec![anchor],
++            },
++        )?;
++        assert_eq!(recovered.installed.batches, batches);

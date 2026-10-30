@@ -1,0 +1,260 @@
+{
+  "ext4-point1": {
+    "options": {
+      "operations": 20000,
+      "writers": 1,
+      "batch": null,
+      "sample_every": 10,
+      "samples": 2000,
+      "pairs": 5,
+      "arms": [
+        "base_v7",
+        "old_v4",
+        "new_v4",
+        "old_v7",
+        "new_v7"
+      ]
+    },
+    "peaks": {
+      "v4_control": {
+        "puts_per_sec": 2560.705222315354,
+        "run_id": "1793036859200",
+        "raw_sha256": "b278a037187bc66d90204e4fb28dd705652e0675e146d41336fce23693d34c34",
+        "binary_sha256": "b1f2940d1f709ffbddbe8665796c69140d138a4cfd776b54d4aebf4642561ae3",
+        "cohort": "demand-extent",
+        "arm": "new_v4",
+        "pair": 1,
+        "manifest": "rfc-025-v7-demand-extent-initial-ext4-point1-20261027-runs.tsv",
+        "raw": "rfc-025-v7-demand-extent-initial-ext4-point1-20261027.jsonl"
+      },
+      "kept_async_v7": {
+        "puts_per_sec": 2290.6115855350363,
+        "run_id": "1793037166474",
+        "raw_sha256": "d58c95b794f2f4ae4935e54005be42698930eb5264c51b05966bf0150fd8c025",
+        "binary_sha256": "ef112fd0dea7f292a0be9ab47eae6276242dd6b290efccdf4335f03e41b17d0a",
+        "cohort": "demand-extent",
+        "arm": "old_v7",
+        "pair": 4,
+        "manifest": "rfc-025-v7-demand-extent-initial-ext4-point1-20261027-runs.tsv",
+        "raw": "rfc-025-v7-demand-extent-initial-ext4-point1-20261027.jsonl"
+      },
+      "hybrid_v7": {
+        "puts_per_sec": 2318.7649116228104,
+        "run_id": "1793038149018",
+        "raw_sha256": "9248912ad1b2ceb9312f378faf854574240671a2a8d5d7f72dc9159f44433397",
+        "binary_sha256": "e7f7712825d2166c14b5b67601388a8e29697f8fc034832e457061cf6e30ae19",
+        "cohort": "serial-startup",
+        "arm": "new_v7",
+        "pair": 3,
+        "manifest": "rfc-025-v7-serial-startup-initial-ext4-point1-20261027-runs.tsv",
+        "raw": "rfc-025-v7-serial-startup-initial-ext4-point1-20261027.jsonl"
+      }
+    }
+  },
+  "ext4-point8": {
+    "options": {
+      "operations": 100000,
+      "writers": 8,
+      "batch": null,
+      "sample_every": 100,
+      "samples": 1000,
+      "pairs": 3,
+      "arms": [
+        "old_v4",
+        "new_v4",
+        "old_v7",
+        "new_v7"
+      ]
+    },
+    "peaks": {
+      "v4_control": {
+        "puts_per_sec": 17184.80611086811,
+        "run_id": "1793032649943",
+        "raw_sha256": "d54033144e3212f0dcb60a151660cced9e55e884b574d42cdaf7c1fb4014989d",
+        "binary_sha256": "ef112fd0dea7f292a0be9ab47eae6276242dd6b290efccdf4335f03e41b17d0a",
+        "cohort": "async-extent",
+        "arm": "new_v4",
+        "pair": 3,
+        "manifest": "rfc-025-v7-async-extent-initial-ext4-point8-20261026-runs.tsv",
+        "raw": "rfc-025-v7-async-extent-initial-ext4-point8-20261026.jsonl"
+      },
+      "kept_async_v7": {
+        "puts_per_sec": 16068.684741931844,
+        "run_id": "1793039082068",
+        "raw_sha256": "b26d1434181419bfe3855e4018827fe65494c11f5d0164b1a9733f332287c70e",
+        "binary_sha256": "ef112fd0dea7f292a0be9ab47eae6276242dd6b290efccdf4335f03e41b17d0a",
+        "cohort": "serial-startup",
+        "arm": "old_v7",
+        "pair": 1,
+        "manifest": "rfc-025-v7-serial-startup-initial-ext4-point8-20261027-runs.tsv",
+        "raw": "rfc-025-v7-serial-startup-initial-ext4-point8-20261027.jsonl"
+      },
+      "hybrid_v7": {
+        "puts_per_sec": 16005.222076303964,
+        "run_id": "1793039265204",
+        "raw_sha256": "b281e4e31865b55174d9eb1b2d3f5995f46e9ef87ce2f23433a2ac49a1f167c8",
+        "binary_sha256": "e7f7712825d2166c14b5b67601388a8e29697f8fc034832e457061cf6e30ae19",
+        "cohort": "serial-startup",
+        "arm": "new_v7",
+        "pair": 3,
+        "manifest": "rfc-025-v7-serial-startup-initial-ext4-point8-20261027-runs.tsv",
+        "raw": "rfc-025-v7-serial-startup-initial-ext4-point8-20261027.jsonl"
+      }
+    }
+  },
+  "ext4-batch8": {
+    "options": {
+      "operations": 750000,
+      "writers": 8,
+      "batch": 64,
+      "sample_every": 10,
+      "samples": 1176,
+      "pairs": 3,
+      "arms": [
+        "old_v4",
+        "new_v4",
+        "old_v7",
+        "new_v7"
+      ]
+    },
+    "peaks": {
+      "v4_control": {
+        "puts_per_sec": 395269.298559456,
+        "run_id": "1793039472711",
+        "raw_sha256": "9a2ae79cc43f0fce9700b4dc8be582084a919a186a40f425e1057fe405645b9f",
+        "binary_sha256": "e7f7712825d2166c14b5b67601388a8e29697f8fc034832e457061cf6e30ae19",
+        "cohort": "serial-startup",
+        "arm": "new_v4",
+        "pair": 2,
+        "manifest": "rfc-025-v7-serial-startup-initial-ext4-batch8-20261027-runs.tsv",
+        "raw": "rfc-025-v7-serial-startup-initial-ext4-batch8-20261027.jsonl"
+      },
+      "kept_async_v7": {
+        "puts_per_sec": 418117.06202562625,
+        "run_id": "1793033125013",
+        "raw_sha256": "cf8fd76ff9fda9d6c2f2c893f3d07079a9f7500b06c144bc5b0b908df13ad570",
+        "binary_sha256": "ef112fd0dea7f292a0be9ab47eae6276242dd6b290efccdf4335f03e41b17d0a",
+        "cohort": "async-extent",
+        "arm": "new_v7",
+        "pair": 3,
+        "manifest": "rfc-025-v7-async-extent-initial-ext4-batch64-20261026-runs.tsv",
+        "raw": "rfc-025-v7-async-extent-initial-ext4-batch64-20261026.jsonl"
+      },
+      "hybrid_v7": {
+        "puts_per_sec": 381379.93192538054,
+        "run_id": "1793039448286",
+        "raw_sha256": "66f1015c1d9011c855f42a33fc56c5f1d7cf4300204443c8562d442320c94db4",
+        "binary_sha256": "e7f7712825d2166c14b5b67601388a8e29697f8fc034832e457061cf6e30ae19",
+        "cohort": "serial-startup",
+        "arm": "new_v7",
+        "pair": 2,
+        "manifest": "rfc-025-v7-serial-startup-initial-ext4-batch8-20261027-runs.tsv",
+        "raw": "rfc-025-v7-serial-startup-initial-ext4-batch8-20261027.jsonl"
+      }
+    }
+  },
+  "ext4-point16": {
+    "options": {
+      "operations": 100000,
+      "writers": 16,
+      "batch": null,
+      "sample_every": 100,
+      "samples": 1008,
+      "pairs": 3,
+      "arms": [
+        "old_v4",
+        "new_v4",
+        "old_v7",
+        "new_v7"
+      ]
+    },
+    "peaks": {
+      "v4_control": {
+        "puts_per_sec": 28430.24799697083,
+        "run_id": "1793036241496",
+        "raw_sha256": "b7e0ad037bef7af33f6b557485a5a0e4144ed270d7e1a487cc2e6535970bcccd",
+        "binary_sha256": "ef112fd0dea7f292a0be9ab47eae6276242dd6b290efccdf4335f03e41b17d0a",
+        "cohort": "demand-extent",
+        "arm": "old_v4",
+        "pair": 1,
+        "manifest": "rfc-025-v7-demand-extent-initial-ext4-point16-20261027-runs.tsv",
+        "raw": "rfc-025-v7-demand-extent-initial-ext4-point16-20261027.jsonl"
+      },
+      "kept_async_v7": {
+        "puts_per_sec": 24689.5299326448,
+        "run_id": "1793038516099",
+        "raw_sha256": "e624b2458fb61f494928bc0273b97ee93bd961e8aa1706dfe432b5b429fd3957",
+        "binary_sha256": "ef112fd0dea7f292a0be9ab47eae6276242dd6b290efccdf4335f03e41b17d0a",
+        "cohort": "serial-startup",
+        "arm": "old_v7",
+        "pair": 1,
+        "manifest": "rfc-025-v7-serial-startup-initial-ext4-point16-20261027-runs.tsv",
+        "raw": "rfc-025-v7-serial-startup-initial-ext4-point16-20261027.jsonl"
+      },
+      "hybrid_v7": {
+        "puts_per_sec": 23779.143134642334,
+        "run_id": "1793038530254",
+        "raw_sha256": "652ccaf0f64a21a29e20ed39adb65349832efd02947a82853c913e1cc0664794",
+        "binary_sha256": "e7f7712825d2166c14b5b67601388a8e29697f8fc034832e457061cf6e30ae19",
+        "cohort": "serial-startup",
+        "arm": "new_v7",
+        "pair": 1,
+        "manifest": "rfc-025-v7-serial-startup-initial-ext4-point16-20261027-runs.tsv",
+        "raw": "rfc-025-v7-serial-startup-initial-ext4-point16-20261027.jsonl"
+      }
+    }
+  },
+  "ext4-batch16": {
+    "options": {
+      "operations": 750000,
+      "writers": 16,
+      "batch": 64,
+      "sample_every": 10,
+      "samples": 1184,
+      "pairs": 3,
+      "arms": [
+        "old_v4",
+        "new_v4",
+        "old_v7",
+        "new_v7"
+      ]
+    },
+    "peaks": {
+      "v4_control": {
+        "puts_per_sec": 610718.3254938652,
+        "run_id": "1793036648511",
+        "raw_sha256": "31a425762ba9b5e35320c4db29583f2c2552e752bb726836b35e7a0b3ea12938",
+        "binary_sha256": "ef112fd0dea7f292a0be9ab47eae6276242dd6b290efccdf4335f03e41b17d0a",
+        "cohort": "demand-extent",
+        "arm": "old_v4",
+        "pair": 3,
+        "manifest": "rfc-025-v7-demand-extent-initial-ext4-batch16-20261027-runs.tsv",
+        "raw": "rfc-025-v7-demand-extent-initial-ext4-batch16-20261027.jsonl"
+      },
+      "kept_async_v7": {
+        "puts_per_sec": 570779.4419080719,
+        "run_id": "1793038827640",
+        "raw_sha256": "76c654dc66229aafd90d4c5c6ea0df8f5d9468dc1e1ff76a9b69353c4485455f",
+        "binary_sha256": "ef112fd0dea7f292a0be9ab47eae6276242dd6b290efccdf4335f03e41b17d0a",
+        "cohort": "serial-startup",
+        "arm": "old_v7",
+        "pair": 2,
+        "manifest": "rfc-025-v7-serial-startup-initial-ext4-batch16-20261027-runs.tsv",
+        "raw": "rfc-025-v7-serial-startup-initial-ext4-batch16-20261027.jsonl"
+      },
+      "hybrid_v7": {
+        "puts_per_sec": 538834.1032268043,
+        "run_id": "1793038905362",
+        "raw_sha256": "007bb652624125fc7e460d17780bc3f0486fab3962c54b178c8605d3ad06be93",
+        "binary_sha256": "e7f7712825d2166c14b5b67601388a8e29697f8fc034832e457061cf6e30ae19",
+        "cohort": "serial-startup",
+        "arm": "new_v7",
+        "pair": 3,
+        "manifest": "rfc-025-v7-serial-startup-initial-ext4-batch16-20261027-runs.tsv",
+        "raw": "rfc-025-v7-serial-startup-initial-ext4-batch16-20261027.jsonl"
+      }
+    }
+  },
+  "scope": "Highest scored records across the four named System/native-I/O extent cohorts with exactly matching workload options; warmups excluded. Descriptive peaks only; no pooling of candidate binaries or override of fixed paired guards.",
+  "script_sha256": "73966a429553cd74a132db88a5eba10223104d7fa6f90a0d3929dd28d4e5b77e"
+}

@@ -1,0 +1,175 @@
+{
+  "outside_sandbox": true,
+  "checks": [
+    {
+      "phase": "format",
+      "command": [
+        "cargo",
+        "fmt",
+        "--all"
+      ],
+      "started_at_utc": "2026-10-29T00:00:29.457076+00:00",
+      "exit_code": 0,
+      "log": "target/wal-opt/20261029-v7-signal-taskwork/format.log",
+      "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "phase": "direct spelling",
+      "command": [
+        "typos",
+        "kv-engine/src/wal/parallel/worker.rs",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-signal-taskwork-20261029-analyze.py",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-signal-taskwork-20261029-baseline-sha256.tsv",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-signal-taskwork-20261029-candidate.patch",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-signal-taskwork-20261029-checks.json",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-signal-taskwork-20261029-child.py",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-signal-taskwork-20261029-matrix.json",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-signal-taskwork-20261029-plan.json",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-signal-taskwork-20261029-run-all.py",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-signal-taskwork-20261029-run.py",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-signal-taskwork-20261029-source-sha256.tsv"
+      ],
+      "started_at_utc": "2026-10-29T00:00:30.580734+00:00",
+      "exit_code": 0,
+      "log": "target/wal-opt/20261029-v7-signal-taskwork/direct-spelling.log",
+      "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "phase": "focused",
+      "command": [
+        "cargo",
+        "nextest",
+        "run",
+        "--offline",
+        "--locked",
+        "--workspace",
+        "--all-features",
+        "--lib",
+        "--retries",
+        "0",
+        "--success-output",
+        "immediate",
+        "-E",
+        "test(wal::parallel_worker::tests::) or (test(wal::parallel_runtime::tests::) and (test(v7_frontier) or test(v7_extent) or test(async_v7_extent) or test(failpoint_v7) or test(v7_large_batch_wave)))"
+      ],
+      "started_at_utc": "2026-10-29T00:00:30.609295+00:00",
+      "exit_code": 0,
+      "log": "target/wal-opt/20261029-v7-signal-taskwork/focused.log",
+      "log_sha256": "a78f207b998b193e79622b82e73b7a8275976065c989b615173c0754d40086e9"
+    },
+    {
+      "phase": "check",
+      "command": [
+        "cargo",
+        "make",
+        "check"
+      ],
+      "started_at_utc": "2026-10-29T00:00:44.320022+00:00",
+      "exit_code": 0,
+      "log": "target/wal-opt/20261029-v7-signal-taskwork/check.log",
+      "log_sha256": "1db08e4c018066f60e1bbe816ecf490b6c5f5d674cf921ed12555ef5624e805e"
+    },
+    {
+      "phase": "release",
+      "command": [
+        "cargo",
+        "build",
+        "--offline",
+        "--locked",
+        "--release",
+        "--package",
+        "kv-engine",
+        "--bin",
+        "write-perf",
+        "--features",
+        "bench"
+      ],
+      "started_at_utc": "2026-10-29T00:01:36.886118+00:00",
+      "exit_code": 0,
+      "log": "target/wal-opt/20261029-v7-signal-taskwork/release.log",
+      "log_sha256": "99efa098a1b31f45e375fc0e300a5f193d7382f6a2aff2fb316617286d215778"
+    },
+    {
+      "phase": "restored check",
+      "command": [
+        "cargo",
+        "make",
+        "check"
+      ],
+      "started_at_utc": "2026-10-29T00:25:48.378355+00:00",
+      "exit_code": 0,
+      "log": "target/wal-opt/20261029-v7-signal-taskwork/restored-check.log",
+      "log_sha256": "b77917fb96b392d328e20d8c51dbe1cd38523ad092dc0d283e9431ad4ea7b33a"
+    },
+    {
+      "phase": "final spelling",
+      "command": [
+        "typos",
+        "docs/wal/README.md",
+        "docs/wal/rfc-025-parallel-wal-embedded-frontiers-implementation-plan.md",
+        "docs/wal/benchmarks/rfc-025-v7-point-handoff-20261029.md",
+        "docs/wal/benchmarks/rfc-025-v7-signal-taskwork-20261029.md",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-point-handoff-20261029-analyze.py",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-point-handoff-20261029-baseline-sha256.tsv",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-point-handoff-20261029-binaries.json",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-point-handoff-20261029-captures.json",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-point-handoff-20261029-checks.json",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-point-handoff-20261029-environment.json",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-point-handoff-20261029-instrumentation.patch",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-point-handoff-20261029-plan.json",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-point-handoff-20261029-restoration.json",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-point-handoff-20261029-run.py",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-point-handoff-20261029-runs.jsonl",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-point-handoff-20261029-source-sha256.tsv",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-point-handoff-20261029-summary.json",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-point-handoff-20261029-verification.json",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-point-handoff-20261029-verify.py",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-signal-taskwork-20261029-analyze.py",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-signal-taskwork-20261029-baseline-sha256.tsv",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-signal-taskwork-20261029-binaries.json",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-signal-taskwork-20261029-candidate.patch",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-signal-taskwork-20261029-checks.json",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-signal-taskwork-20261029-child.py",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-signal-taskwork-20261029-decision.json",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-signal-taskwork-20261029-environment.json",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-signal-taskwork-20261029-ext4-batch1-host.jsonl",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-signal-taskwork-20261029-ext4-batch1-runs.tsv",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-signal-taskwork-20261029-ext4-batch1.jsonl",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-signal-taskwork-20261029-ext4-batch16-host.jsonl",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-signal-taskwork-20261029-ext4-batch16-runs.tsv",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-signal-taskwork-20261029-ext4-batch16.jsonl",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-signal-taskwork-20261029-ext4-batch8-host.jsonl",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-signal-taskwork-20261029-ext4-batch8-runs.tsv",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-signal-taskwork-20261029-ext4-batch8.jsonl",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-signal-taskwork-20261029-ext4-point1-host.jsonl",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-signal-taskwork-20261029-ext4-point1-runs.tsv",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-signal-taskwork-20261029-ext4-point1.jsonl",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-signal-taskwork-20261029-ext4-point16-host.jsonl",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-signal-taskwork-20261029-ext4-point16-runs.tsv",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-signal-taskwork-20261029-ext4-point16.jsonl",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-signal-taskwork-20261029-ext4-point8-host.jsonl",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-signal-taskwork-20261029-ext4-point8-runs.tsv",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-signal-taskwork-20261029-ext4-point8.jsonl",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-signal-taskwork-20261029-matrix.json",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-signal-taskwork-20261029-peaks.json",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-signal-taskwork-20261029-plan.json",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-signal-taskwork-20261029-run-all.py",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-signal-taskwork-20261029-run.py",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-signal-taskwork-20261029-source-sha256.tsv",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-signal-taskwork-20261029-summary.json",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-signal-taskwork-20261029-verify.py"
+      ],
+      "started_at_utc": "2026-10-29T00:28:46.875662+00:00",
+      "exit_code": 0,
+      "log": "target/wal-opt/20261029-v7-signal-taskwork/final-spelling.log",
+      "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    }
+  ],
+  "tests": 1975,
+  "focused_tests": 49,
+  "restored_tests": 1973,
+  "validation_driver": {
+    "path": "target/wal-opt/20261029-v7-signal-taskwork/validate.py",
+    "sha256": "f9b9df64c93efe2273b7a73f40221e51f829e5ab8396cdfbce6a94c25ed006f9"
+  }
+}

@@ -1,0 +1,104 @@
+{
+  "outside_sandbox": true,
+  "checks": [
+    {
+      "phase": "format",
+      "command": [
+        "cargo",
+        "fmt",
+        "--all"
+      ],
+      "exit_code": 0,
+      "log": "target/wal-opt/20261027-v7-frontier-buffer-reuse/format.log",
+      "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "phase": "focused",
+      "command": [
+        "cargo",
+        "nextest",
+        "run",
+        "--offline",
+        "--locked",
+        "--workspace",
+        "--all-features",
+        "--lib",
+        "--retries",
+        "0",
+        "--success-output",
+        "immediate",
+        "-E",
+        "test(v7_large_batch_wave) or test(v7_frontier_) or test(v7_close) or test(failpoint_parallel_wal_v7)"
+      ],
+      "exit_code": 0,
+      "log": "target/wal-opt/20261027-v7-frontier-buffer-reuse/focused.log",
+      "log_sha256": "2762498b3c7a1226acb1e82a20c87b07324d2b15235414d63be4e3f08fd12959"
+    },
+    {
+      "phase": "check",
+      "command": [
+        "cargo",
+        "make",
+        "check"
+      ],
+      "exit_code": 0,
+      "log": "target/wal-opt/20261027-v7-frontier-buffer-reuse/check.log",
+      "log_sha256": "2e1c6880659b27c37a0bf566d81560e869a07b1487df02e59aec51bcd35fd45f"
+    },
+    {
+      "phase": "release",
+      "command": [
+        "cargo",
+        "build",
+        "--offline",
+        "--locked",
+        "--release",
+        "--package",
+        "kv-engine",
+        "--bin",
+        "write-perf",
+        "--features",
+        "bench"
+      ],
+      "exit_code": 0,
+      "log": "target/wal-opt/20261027-v7-frontier-buffer-reuse/release.log",
+      "log_sha256": "87f16b2eb23c61dc0ec2d9847c491f6b0960572bbd2cd24577b1d283baaba589"
+    },
+    {
+      "phase": "direct spelling",
+      "command": [
+        "typos",
+        "--format",
+        "brief"
+      ],
+      "exit_code": 0,
+      "log": "target/wal-opt/20261027-v7-frontier-buffer-reuse/direct-spelling.log",
+      "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "phase": "restored check",
+      "command": [
+        "cargo",
+        "make",
+        "check"
+      ],
+      "exit_code": 0,
+      "log": "target/wal-opt/20261027-v7-frontier-buffer-reuse/restored-check.log",
+      "log_sha256": "c3e4a9fcb706467d7f2d6b04950a9c236ea8529261bcb9c811aa2953dd4eaa6b"
+    },
+    {
+      "phase": "final spelling",
+      "command": [
+        "typos",
+        "--format",
+        "brief"
+      ],
+      "exit_code": 0,
+      "log": "target/wal-opt/20261027-v7-frontier-buffer-reuse/final-spelling.log",
+      "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    }
+  ],
+  "tests": 1971,
+  "focused_filter": "test(v7_large_batch_wave) or test(v7_frontier_) or test(v7_close) or test(failpoint_parallel_wal_v7)",
+  "focused_tests": 5
+}

@@ -1,0 +1,37 @@
+{
+  "created_at_utc": "2026-10-29T02:36:55.015087+00:00",
+  "source_base": "cf655cdd16c53c1f1bf7c9741149c48f01bec620",
+  "purpose": "Attribute the v4/v7 Parallel batch gap beyond the FRONTIER syscall. Start with fresh same-build best scores, then excluded wall/thread-CPU traces for one/eight writers. No optimization or changed durability semantics in this slice.",
+  "baseline": {
+    "path": "target/release/write-perf-v7-large-data-async-dispatch",
+    "sha256": "f353022d846530a6754330aaea11f295319ea8f4de20afa09b6d2a3b57b021d8"
+  },
+  "prior_verification": "rfc-025-v7-signal-taskwork-rerun-20261029-verification.json",
+  "prior_verification_sha256": "3071252ddf8db88a752c0db266e2195e229c140d0671583cd423c41820264fe1",
+  "prior_global_invocations": 925,
+  "prior_full_archive_invocations": 5021,
+  "scored_schedule": "Batch64 at1writer then8writers, each2 warmups+3 alternating v4/v7 pairs.16 invocations,12 scored. Run both cells regardless of results, no replacements.1KiB values,750000 puts,sample10,2GiB SST,no compaction,fresh local ext4.60s initial cooldown per cell,15s gaps.",
+  "diagnostic_schedule": [
+    {
+      "writers": 1,
+      "format": 4
+    },
+    {
+      "writers": 1,
+      "format": 7
+    },
+    {
+      "writers": 8,
+      "format": 7
+    },
+    {
+      "writers": 8,
+      "format": 4
+    }
+  ],
+  "diagnostic_configuration": "Four fixed excluded captures with the same batch64 configuration. One instrumented binary for both formats; RAM-buffered monotonic/thread-CPU events and the existing synchronous-I/O interposer.60s initial cooldown,15s gaps. No scored use of traces, no overlap with builds/tests/edits/profiles/SSD health queries.",
+  "instrumentation": "Temporary event tracing covers API, canonical preparation, ordered framing/prefix hashing, extent preparation, worker staging/submission/CQE, coordinator capture, FRONTIER, sync and publication/wakeup. Trace timestamp/locking/clock overhead may perturb grouping. CPU deltas are thread CPU, not device latency. Per-group CPU is counted once; concurrent per-call intervals overlap.",
+  "analysis": "Use highest-throughput scored invocation per format/workload and its associated p99. Preserve all raw runs. Exclude individual scores with mean FRONTIER write>=1ms or mean fdatasync>=1.5ms; show raw maxima too. Fresh and matching-binary historical best views remain separate. Diagnostics partition every API call; compare stage CPU/wall and groups rather than subtracting overlapping multiwriter counters.",
+  "validation": "Verify128 baseline inputs and both format arms use the exact saved binary. After instrumentation, run focused tests without retries, full cargo make check and release build outside sandbox. After four traces, restore all128 inputs and canonical retained binary atomically, refresh Rust mtimes, and run a fresh restored full check.",
+  "publication": "Evidence-only local commit after diagnosis; no new runtime policy, push or PR. Stop for review."
+}

@@ -1,0 +1,210 @@
+{
+  "cells": {
+    "ext4-batch16": {
+      "v4": {
+        "scored": 5,
+        "unflagged": 3,
+        "flagged_run_ids": [
+          "1793112319022",
+          "1793112394062"
+        ],
+        "peak": {
+          "cohort": "rfc-025-v7-current-v4-parallel-20261027",
+          "run_id": "1793112377624",
+          "raw_sha256": "5278a3668d6b16c3196b9f4a87067f788c1f8d5e48a892cb5a2e498fb02ccb40",
+          "binary_sha256": "e9abcc91b499c3cecd0acc137a0c9b8f65228b76ac3cb31ba3894bf9a0d06d40",
+          "rate": 584857.586510947,
+          "p99_ms": 3.129744,
+          "frontier_mean_ms": 0.0,
+          "fdatasync_mean_ms": 0.41008297141041933,
+          "flagged": false
+        }
+      },
+      "v7": {
+        "scored": 10,
+        "unflagged": 7,
+        "flagged_run_ids": [
+          "1793112341960",
+          "1793112360099",
+          "1793112429349"
+        ],
+        "peak": {
+          "cohort": "rfc-025-v7-eligible-coalescing-20261027",
+          "run_id": "1793110565204",
+          "raw_sha256": "e8e802bd1d3636bec7ee9cf65bce864d0c374893cdf233d343b617465007a165",
+          "binary_sha256": "e9abcc91b499c3cecd0acc137a0c9b8f65228b76ac3cb31ba3894bf9a0d06d40",
+          "rate": 544147.1873158856,
+          "p99_ms": 4.729597,
+          "frontier_mean_ms": 0.060355599999999995,
+          "fdatasync_mean_ms": 0.35932033714285716,
+          "flagged": false
+        }
+      },
+      "throughput_ratio": 0.9303926286774782,
+      "peak_run_p99_ratio": 1.511176952491961,
+      "sources": {
+        "rfc-025-v7-current-v4-parallel-20261027": {
+          "docs/wal/benchmarks/artifacts/rfc-025-v7-current-v4-parallel-20261027-ext4-batch16.jsonl": "ea33345564b4b8e5fc1aff2072f2a7f82adf8c4869b9050c45ce7fa9cd2bc224",
+          "docs/wal/benchmarks/artifacts/rfc-025-v7-current-v4-parallel-20261027-ext4-batch16-runs.tsv": "5365e7d26cb618873e95ef568976ee8c6b7a4cdaa79487bc8904db3b1cc24e54"
+        },
+        "rfc-025-v7-eligible-coalescing-20261027": {
+          "docs/wal/benchmarks/artifacts/rfc-025-v7-eligible-coalescing-20261027-ext4-batch16.jsonl": "ceac72330e0b116baacbad2005242b11624057272199c8cd0c260843cfe2e78b",
+          "docs/wal/benchmarks/artifacts/rfc-025-v7-eligible-coalescing-20261027-ext4-batch16-runs.tsv": "45577b6ba87185b9fac63fdc0dbe095f2652ec57b257150a36cd03a07660b164"
+        }
+      }
+    },
+    "ext4-batch8": {
+      "v4": {
+        "scored": 3,
+        "unflagged": 2,
+        "flagged_run_ids": [
+          "1793112583922"
+        ],
+        "peak": {
+          "cohort": "rfc-025-v7-current-v4-parallel-20261027",
+          "run_id": "1793112606005",
+          "raw_sha256": "d2c8d166d33730477b2ec4ba21713a0444bd3b6205113fa4241242847a0557fa",
+          "binary_sha256": "e9abcc91b499c3cecd0acc137a0c9b8f65228b76ac3cb31ba3894bf9a0d06d40",
+          "rate": 384552.1113970064,
+          "p99_ms": 2.357839,
+          "frontier_mean_ms": 0.0,
+          "fdatasync_mean_ms": 0.4168198365960847,
+          "flagged": false
+        }
+      },
+      "v7": {
+        "scored": 6,
+        "unflagged": 3,
+        "flagged_run_ids": [
+          "1793112544344",
+          "1793112564149",
+          "1793112620627"
+        ],
+        "peak": {
+          "cohort": "rfc-025-v7-eligible-coalescing-20261027",
+          "run_id": "1793110704221",
+          "raw_sha256": "fdeb06bf1945abc9bc9196df421c7a17da3fc938eb0374c55d36462e10a40439",
+          "binary_sha256": "e9abcc91b499c3cecd0acc137a0c9b8f65228b76ac3cb31ba3894bf9a0d06d40",
+          "rate": 306533.24218484276,
+          "p99_ms": 8.348837,
+          "frontier_mean_ms": 0.11065046483704974,
+          "fdatasync_mean_ms": 0.4270798021726701,
+          "flagged": false
+        }
+      },
+      "throughput_ratio": 0.797117563784176,
+      "peak_run_p99_ratio": 3.5408851070832235,
+      "sources": {
+        "rfc-025-v7-current-v4-parallel-20261027": {
+          "docs/wal/benchmarks/artifacts/rfc-025-v7-current-v4-parallel-20261027-ext4-batch8.jsonl": "c6f5bfea57e2476a9a003d1e5496f8f978362af6fe59096b68e6c64112b48523",
+          "docs/wal/benchmarks/artifacts/rfc-025-v7-current-v4-parallel-20261027-ext4-batch8-runs.tsv": "e45663ddc4442d3f62250620597b2a683cdc0d0e20410ed418c6b9f20a14b90f"
+        },
+        "rfc-025-v7-eligible-coalescing-20261027": {
+          "docs/wal/benchmarks/artifacts/rfc-025-v7-eligible-coalescing-20261027-ext4-batch8.jsonl": "7a51f9aaed34f5116c11741783c0856b80f4459275ca3fecfcaf1da475e3b09e",
+          "docs/wal/benchmarks/artifacts/rfc-025-v7-eligible-coalescing-20261027-ext4-batch8-runs.tsv": "b2ca671a455178b41806a50d6897b5c3e24e2fe752e56c562f5d94f2ae3f55ae"
+        }
+      }
+    },
+    "ext4-point8": {
+      "v4": {
+        "scored": 3,
+        "unflagged": 3,
+        "flagged_run_ids": [],
+        "peak": {
+          "cohort": "rfc-025-v7-current-v4-parallel-20261027",
+          "run_id": "1793112824099",
+          "raw_sha256": "d377e07ebedcf8fbf36463177d774fe23dc7c95966b8dffe3cfd1dd568f9bbee",
+          "binary_sha256": "e9abcc91b499c3cecd0acc137a0c9b8f65228b76ac3cb31ba3894bf9a0d06d40",
+          "rate": 17469.69768083013,
+          "p99_ms": 1.310198,
+          "frontier_mean_ms": 0.0,
+          "fdatasync_mean_ms": 0.2526879991331074,
+          "flagged": false
+        }
+      },
+      "v7": {
+        "scored": 6,
+        "unflagged": 6,
+        "flagged_run_ids": [],
+        "peak": {
+          "cohort": "rfc-025-v7-eligible-coalescing-20261027",
+          "run_id": "1793110881246",
+          "raw_sha256": "1e2eb32e86fbc2b23c6bed4f83a5c36db0cf672af069cfdb276221190d65be1c",
+          "binary_sha256": "e9abcc91b499c3cecd0acc137a0c9b8f65228b76ac3cb31ba3894bf9a0d06d40",
+          "rate": 16000.86046227222,
+          "p99_ms": 1.349562,
+          "frontier_mean_ms": 0.018381540661938537,
+          "fdatasync_mean_ms": 0.24943620575256106,
+          "flagged": false
+        }
+      },
+      "throughput_ratio": 0.9159208564799781,
+      "peak_run_p99_ratio": 1.030044313912859,
+      "sources": {
+        "rfc-025-v7-current-v4-parallel-20261027": {
+          "docs/wal/benchmarks/artifacts/rfc-025-v7-current-v4-parallel-20261027-ext4-point8.jsonl": "84e5496acf353c82d94af03091dd774ec0f80b8c8eb64777c06d8f962116b09d",
+          "docs/wal/benchmarks/artifacts/rfc-025-v7-current-v4-parallel-20261027-ext4-point8-runs.tsv": "d5c19738c41a1c442458338cd708cd89031012fd0d399a00f485e8e9bdc77d96"
+        },
+        "rfc-025-v7-eligible-coalescing-20261027": {
+          "docs/wal/benchmarks/artifacts/rfc-025-v7-eligible-coalescing-20261027-ext4-point8.jsonl": "8045dccf5fe499c5d99e8146d99ae711627b513cfb92093da22751e5985aa3c4",
+          "docs/wal/benchmarks/artifacts/rfc-025-v7-eligible-coalescing-20261027-ext4-point8-runs.tsv": "d7c1140de2135f5c4db6852575410f10a52b703d4c23e95e0918210a06fb191c"
+        }
+      }
+    },
+    "ext4-batch1": {
+      "v4": {
+        "scored": 3,
+        "unflagged": 1,
+        "flagged_run_ids": [
+          "1793112974099",
+          "1793113079323"
+        ],
+        "peak": {
+          "cohort": "rfc-025-v7-current-v4-parallel-20261027",
+          "run_id": "1793113129831",
+          "raw_sha256": "081886a43e31cf9d76ecc77264a9160db600d38d43676c85f6e2fd1f10420471",
+          "binary_sha256": "e9abcc91b499c3cecd0acc137a0c9b8f65228b76ac3cb31ba3894bf9a0d06d40",
+          "rate": 85857.47570176743,
+          "p99_ms": 1.175959,
+          "frontier_mean_ms": 0.0,
+          "fdatasync_mean_ms": 0.3180113920983019,
+          "flagged": false
+        }
+      },
+      "v7": {
+        "scored": 6,
+        "unflagged": 6,
+        "flagged_run_ids": [],
+        "peak": {
+          "cohort": "rfc-025-v7-current-v4-parallel-20261027",
+          "run_id": "1793113058118",
+          "raw_sha256": "4d95f7e9e83a920280bd43a18f34cfdf48fa7981be688120266056dc62c04665",
+          "binary_sha256": "e9abcc91b499c3cecd0acc137a0c9b8f65228b76ac3cb31ba3894bf9a0d06d40",
+          "rate": 68426.02368088084,
+          "p99_ms": 1.349326,
+          "frontier_mean_ms": 0.033858794095059305,
+          "fdatasync_mean_ms": 0.30809726188241315,
+          "flagged": false
+        }
+      },
+      "throughput_ratio": 0.7969722277715678,
+      "peak_run_p99_ratio": 1.1474260582214175,
+      "sources": {
+        "rfc-025-v7-current-v4-parallel-20261027": {
+          "docs/wal/benchmarks/artifacts/rfc-025-v7-current-v4-parallel-20261027-ext4-batch1.jsonl": "0fcdc95ebe56a1701b0c14f1c4ec9a549a8cd9434282c99781f3824c5257006a",
+          "docs/wal/benchmarks/artifacts/rfc-025-v7-current-v4-parallel-20261027-ext4-batch1-runs.tsv": "8d2f955484bfaa5ded01f545b330121b68bee27d073a8589d2cbc13dc911d114"
+        },
+        "rfc-025-v7-eligible-coalescing-20261027": {
+          "docs/wal/benchmarks/artifacts/rfc-025-v7-eligible-coalescing-20261027-ext4-batch1.jsonl": "2b4338e37864ada5f8160c951a1547c6bb2aa84cb9e3a285b99ee6fe0eb648a2",
+          "docs/wal/benchmarks/artifacts/rfc-025-v7-eligible-coalescing-20261027-ext4-batch1-runs.tsv": "b714218ac26475e6d6b4c130c312c43e94540e6b17f1ab0e0e15b553aa0fe83b"
+        }
+      }
+    }
+  },
+  "binary": {
+    "path": "target/release/write-perf-v7-eligible-coalescing",
+    "sha256": "e9abcc91b499c3cecd0acc137a0c9b8f65228b76ac3cb31ba3894bf9a0d06d40"
+  },
+  "method": "Post-capture descriptive view requested after the maintainer reiterated ignoring obvious stalls. Exclude individually flagged scored observations using the original combined mean-I/O mask, then select each format maximum over these two matching cohorts. Warmups excluded; p99 belongs to each peak-throughput run. Same exact executable and workload settings; unequal sample counts and separate cohorts mean this is not a paired or sustained-performance estimate. Unflagged does not mean stall-free. No raw or predeclared paired analysis is changed.",
+  "analyzer_sha256": "0323b9b2e13a840cd0d901def16de8a2d2cfe699e2969b98b48f284b4d8c3d31"
+}

@@ -1,0 +1,16 @@
+{
+  "created_at_utc": "2026-10-26T13:08:16.845948+00:00",
+  "source_base": "911ab1170027bc4c7faab84376a059417bb3e475",
+  "hypothesis": "v7 initializes new 1MiB extents synchronously in up to eight 128KiB direct writes. Increasing only the v7 initialization chunk to512KiB can reduce serial syscalls/waits and ext4 conversion work. Host max_hw_sectors_kb and max_sectors_kb are512. No OS tuning.",
+  "change": "Retain v4 initializer128KiB. Give v7 a single immutable,4096-aligned512KiB zero source and use up to512KiB per write_all_at while holding the existing shared preparation lock. Publish the same prepared frontier only after the complete requested range succeeds. Preserve caps,large-DATA allocation-only behavior,CRC/hash/wire bytes and one fdatasync protocol.",
+  "baseline": {
+    "path": "target/release/write-perf-v7-validated-logical-batch",
+    "sha256": "614f0cb1adde43cabe900eb032c6f884783d658c597471d9d9ddc8faff314aa9"
+  },
+  "primary": "SSD first: five four-arm pairs each of ext4-point8 (100000 puts) and ext4-batch64 (750000 puts,batch64). Four warmups; odd retainedv4,candidatev4,retainedv7,candidatev7;even reverse.1KiB values,2GiB SST,sample every100point or10batches.30s initialcooldown,10s betweenruns.Host-process audit before/during/after each command;preserve stalls. No builds/tests/profiles during scoring.",
+  "ssd_guards": "Both SSD workloads paired raw,paired v4-normalized and ratio of per-arm medians >=0.95;paired p99 <=1.10. At least one gains >=2% raw with normalized ratio >=1.00.",
+  "conditional_ram": "If SSD passes: three four-arm pairs each RAMpoint8 100000,RAMbatch64 750000,RAMpoint1 100000. Same payload,SST,cadence. Raw/normalized/arm-median throughput>=0.95;CPU<=1.05;solo p99<=1.10.",
+  "confirmation": "If both phases pass: exactly five further SSD pairs eachcell,four warmups. Pool only this identical candidate source/binary;require SSD guards stillpass,no extra attempts chosen byscore.",
+  "diagnostics": "Before source changes, unscored retained v4/v7 SSD profiles with cpu-clock kernel+user if permitted,else user-only. Preserve failed profiling metadata and exclude diagnostics from qualification.",
+  "decision": "Keep only if full fixed qualification passes;otherwise restore source and canonical retained binary while preserving patch,identities and allcaptures."
+}

@@ -1,0 +1,21 @@
+[
+  {
+    "arm": "baseline",
+    "command": [
+      "cargo",
+      "build",
+      "--offline",
+      "--locked",
+      "--release",
+      "--package",
+      "kv-engine",
+      "--bin",
+      "write-perf",
+      "--features",
+      "bench"
+    ],
+    "exit_code": 101,
+    "log": "target/wal-opt/20261027-v7-coordinator-tail/baseline-release.log",
+    "log_sha256": "5aa4acf28db3d6cd47878e9d91e5c36faffca258cd6bb16ae998136054b4e5c5"
+  }
+]

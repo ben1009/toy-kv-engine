@@ -1,0 +1,19 @@
+{
+  "created_at_utc": "2026-10-27T15:27:10.050290+00:00",
+  "source_base": "95eed41c17d5342a82b65239eebec1128d96bc31",
+  "baseline": {
+    "path": "target/release/write-perf-v7-eligible-coalescing",
+    "sha256": "e9abcc91b499c3cecd0acc137a0c9b8f65228b76ac3cb31ba3894bf9a0d06d40"
+  },
+  "candidate": "Use allocation-only FRONTIER extent preparation only when the captured unsynced prefix is already classified as a known large-DATA wave. Small, mixed and unknown waves keep extent initialization. Reuse the existing shared preparation cursor and failure checks; do not change coalescing or batch classification.",
+  "motivation": "Prior allocation traces show synchronous zero initialization can follow speculative DATA ranges before the marker. Large DATA already initializes its own extents; avoid duplicate zero I/O for the FRONTIER of a known large wave. Older traces motivate a candidate rather than establish its effect in the current binary.",
+  "scope": "One source candidate; local repo only. Validate and run a bounded SSD screen, dependent guards only after screen benefit. Preserve prior evidence; stop for review, no push/PR.",
+  "validation": "Two deterministic real DATA/FRONTIER fixtures with a canary inside pending DATA: a known large wave must preserve the canary during FRONTIER preparation; small writes must retain zero initialization. Complete pending DATA, sync, close and recover exact batches. Existing async cursor, sticky-error, extent-growth and failed-FRONTIER tests plus full checks outside sandbox.",
+  "configuration": "Fresh local ext4 databases, 1KiB values, 2GiB SST, explicit v7 Parallel/no compaction. 750000 batch64 puts/sample10 at16,8,1writers;100000 point puts/sample100 at8writers. Host audit before/1Hz/after,30s initial cooldown,10s gaps, no concurrent build/test/source edit/profile.",
+  "schedule": "Two-arm warmups then5 alternating pairs for batch16 screen. If it improves both throughput and p99 on at least3 non-stall matched pairs, run batch8,point8,batch1 with2 warmups and3 alternating pairs each. No replacements or score-selected retries. Raw guard failure alone does not exclude or veto a source based on obvious storage stalls.",
+  "stall_policy": "Preserve every raw invocation. Predeclare an obvious-stall flag when mean FRONTIER-write >=1ms or mean fdatasync >=1.5ms, relative to observed quiet markers~20-150us and syncs~350us. Exclude a pair from the filtered comparison if either invocation is flagged. This conservative aggregate mask misses short outliers and cannot prove retained samples stall-free or distinguish source-induced I/O changes from environment. Report exclusions by arm and all raw ratios.",
+  "assessment": "Screen:>=3 filtered pairs, median paired throughput>1 and p99<1. Followups:>=2 filtered pairs, paired and arm-median throughput>=0.95 and paired p99<=1.10. Equal DATA bytes in all pairs. CPU/RSS diagnostic only. No extra test cases after a screen miss; restore baseline if insufficient evidence or failed guards. Any retention must state masked observations and source/environment ambiguity; no RFC adoption or v4 parity claim.",
+  "publication": "Keep accepted source in its own local commit, with evidence separate. For a failed or inconclusive candidate, evidence-only commit plus exact restoration.",
+  "prior_verification": "rfc-025-v7-current-v4-parallel-20261027-verification.json",
+  "prior_global_invocations": 525
+}

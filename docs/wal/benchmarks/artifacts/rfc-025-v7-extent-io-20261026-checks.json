@@ -1,0 +1,43 @@
+{
+  "source_base": "911ab1170027bc4c7faab84376a059417bb3e475",
+  "outside_sandbox": true,
+  "checks": [
+    {
+      "command": [
+        "cargo",
+        "make",
+        "check"
+      ],
+      "phase": "512KiB prototype",
+      "exit_code": 0,
+      "log": "target/wal-opt/20261026-v7-extent-io/check.log",
+      "log_sha256": "7abb2d49f2fd3e232dc63b29a66166931e5aef3ad6aa1f531a921eb3b01eafc8"
+    },
+    {
+      "command": [
+        "cargo",
+        "make",
+        "check"
+      ],
+      "phase": "restored engine",
+      "exit_code": 0,
+      "log": "target/wal-opt/20261026-v7-extent-io/restored-check.log",
+      "log_sha256": "58f1e98eeb5f22de36e8680f3bac9319edb7f2681b9745d20c39253f5f5618cd"
+    },
+    {
+      "command": [
+        "typos"
+      ],
+      "phase": "final documentation and artifacts",
+      "exit_code": 0,
+      "log": "target/wal-opt/20261026-v7-extent-io/final-typos.log",
+      "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    }
+  ],
+  "prototype_test_count": 1963,
+  "restored_test_count": 1963,
+  "prototype_slow_tests": 1,
+  "restored_slow_tests": 0,
+  "skips": 0,
+  "retries": 0
+}

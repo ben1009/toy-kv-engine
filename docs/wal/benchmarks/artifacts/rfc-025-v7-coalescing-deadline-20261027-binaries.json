@@ -1,0 +1,10 @@
+{
+  "baseline": {
+    "path": "target/release/write-perf-v7-batch-window",
+    "sha256": "f7fd96e5ca0ecaaaa23f59f135e7ce9430521f986834e5c95f2d32070e378d54"
+  },
+  "candidate": {
+    "path": "target/release/write-perf-v7-coalescing-deadline",
+    "sha256": "cc9f37e90c9b6b750873333f4811b7eea65c84b7766efdeb3b80648973b632d2"
+  }
+}

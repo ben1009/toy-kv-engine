@@ -1,0 +1,118 @@
+{
+  "outside_sandbox": true,
+  "checks": [
+    {
+      "phase": "format",
+      "command": [
+        "cargo",
+        "fmt",
+        "--all"
+      ],
+      "exit_code": 0,
+      "log": "target/wal-opt/20261027-v7-batch-retirement-hint/format.log",
+      "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "phase": "focused",
+      "command": [
+        "cargo",
+        "nextest",
+        "run",
+        "--offline",
+        "--locked",
+        "--workspace",
+        "--all-features",
+        "--lib",
+        "--retries",
+        "0",
+        "--success-output",
+        "immediate",
+        "-E",
+        "test(group_minimum_write_size) or test(v7_worker_group_geometry) or test(v7_large_batch_wave) or test(large_batch_coalescing) or test(worker_accepts_data_groups) or test(v7_frontier_recaptures) or test(v7_frontier_poison)"
+      ],
+      "exit_code": 0,
+      "log": "target/wal-opt/20261027-v7-batch-retirement-hint/focused.log",
+      "log_sha256": "682029d2ffbc329113c528e8c81414c8dc29e97f61f95e1d69c479aae1db615a"
+    },
+    {
+      "phase": "check",
+      "command": [
+        "cargo",
+        "make",
+        "check"
+      ],
+      "exit_code": 0,
+      "log": "target/wal-opt/20261027-v7-batch-retirement-hint/check.log",
+      "log_sha256": "200716df707001ce6ca04091d5e77dbe87a7b9cb4260921934201d40705283cc"
+    },
+    {
+      "phase": "release",
+      "command": [
+        "cargo",
+        "build",
+        "--offline",
+        "--locked",
+        "--release",
+        "--package",
+        "kv-engine",
+        "--bin",
+        "write-perf",
+        "--features",
+        "bench"
+      ],
+      "exit_code": 0,
+      "log": "target/wal-opt/20261027-v7-batch-retirement-hint/release.log",
+      "log_sha256": "055976ef2af1bc265316d3932245b7ece2642d400e9ed8046ab9cfab9e84f526"
+    },
+    {
+      "phase": "direct spelling",
+      "command": [
+        "typos",
+        "--format",
+        "brief"
+      ],
+      "exit_code": 0,
+      "log": "target/wal-opt/20261027-v7-batch-retirement-hint/direct-spelling.log",
+      "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "phase": "restored check",
+      "command": [
+        "cargo",
+        "make",
+        "check"
+      ],
+      "exit_code": 0,
+      "log": "target/wal-opt/20261027-v7-batch-retirement-hint/restored-check.log",
+      "log_sha256": "680bdb8ecf7942b588d776d6750e0407e1c9b807620a541090fecc5737bd1892"
+    },
+    {
+      "phase": "final spelling",
+      "command": [
+        "typos",
+        "--format",
+        "brief"
+      ],
+      "exit_code": 0,
+      "log": "target/wal-opt/20261027-v7-batch-retirement-hint/final-spelling.log",
+      "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    }
+  ],
+  "tests": 1973,
+  "focused_tests": 8,
+  "prior_attempts": [
+    {
+      "phase": "restored check reused candidate cache",
+      "command": [
+        "cargo",
+        "make",
+        "check"
+      ],
+      "exit_code": 0,
+      "log": "target/wal-opt/20261027-v7-batch-retirement-hint/restored-check-cache-attempt1.log",
+      "log_sha256": "7b1ad395149b26a5064c07a2dac82f269cba875eecb9551dbafdbc5a9e67220f",
+      "accepted_as_restored_validation": false,
+      "reason": "Restoration preserved source mtimes, so Cargo reused1973-test candidate binary despite exact f7 source hashes. Touch source mtimes and rebuild. Includes one unrelated compaction retry."
+    }
+  ]
+}

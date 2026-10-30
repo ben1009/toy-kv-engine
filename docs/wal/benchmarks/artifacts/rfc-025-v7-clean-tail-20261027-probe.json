@@ -1,0 +1,103 @@
+{
+  "arm": "baseline",
+  "name": "bootstrap-probe",
+  "operations": 5000,
+  "run_id": "1793087745444",
+  "command": [
+    "/home/liu/proj/toy-kv-engine/target/release/write-perf-v7-clean-tail-baseline",
+    "--suite",
+    "legacy",
+    "--preset",
+    "smoke",
+    "--bench",
+    "wal_batch_concurrent",
+    "--wal",
+    "--wal-io-mode",
+    "parallel",
+    "--pitr",
+    "--pitr-format",
+    "v7",
+    "--num",
+    "5000",
+    "--threads",
+    "16",
+    "--wal-batch-size",
+    "64",
+    "--value-size",
+    "1024",
+    "--target-sst-size",
+    "2147483648",
+    "--compaction",
+    "none",
+    "--latency-sample-every",
+    "10",
+    "--output",
+    "json",
+    "--no-cleanup",
+    "--path",
+    "/home/liu/proj/toy-kv-engine/target/wal-opt/20261027-v7-clean-tail/bootstrap-probe-db"
+  ],
+  "excluded_from_scoring": true,
+  "binary": {
+    "path": "target/release/write-perf-v7-clean-tail-baseline",
+    "sha256": "1136ad34d9c9d5db9109a24069282ad1cd322db94224581ae722fb924054398f"
+  },
+  "preload_sha256": "7bef6a9cfadc9c803f955fb96e86bd65f5bdebd07aab39184d283832bfe3e46b",
+  "trace_samples": 16,
+  "mapped_tickets": 80,
+  "host_samples": 3,
+  "clean_sampled": true,
+  "sampling_errors": [],
+  "before": {
+    "time_utc": "2026-10-27T07:55:45.441448+00:00",
+    "competing": [],
+    "load_average": [
+      0.33642578125,
+      0.31591796875,
+      0.3564453125
+    ],
+    "cpu_jiffies": [
+      17938255,
+      4950,
+      8053117,
+      6383741317,
+      3361392,
+      1157126,
+      1424324,
+      0,
+      0,
+      0
+    ]
+  },
+  "after": {
+    "time_utc": "2026-10-27T07:55:45.529160+00:00",
+    "competing": [],
+    "load_average": [
+      0.33642578125,
+      0.31591796875,
+      0.3564453125
+    ],
+    "cpu_jiffies": [
+      17938267,
+      4950,
+      8053124,
+      6383741579,
+      3361395,
+      1157126,
+      1424324,
+      0,
+      0,
+      0
+    ]
+  },
+  "returncode": 0,
+  "raw_sha256": "6fdaebc2c6b02c748c382daba8b44dbe7ba6a4be58b9c0952994ad0f5c34670b",
+  "files": {
+    "target/wal-opt/20261027-v7-clean-tail/bootstrap-probe-io.csv": "d02dab42cfbdca4060e4abab2ab91f57b4ef93de277eaae592e68c8f0446626d",
+    "target/wal-opt/20261027-v7-clean-tail/bootstrap-probe-batch.jsonl": "63453b5e3ffb05bd642c1eba5bb691f6d2f2c03236fdc923b41998a34cd53476",
+    "target/wal-opt/20261027-v7-clean-tail/bootstrap-probe-samples.jsonl": "23d6321e028e79b992264b0bdc24e8f35fbf341df88944781c30557f93753f89",
+    "target/wal-opt/20261027-v7-clean-tail/bootstrap-probe-tickets.json": "02cb58aaedc289a6d9e4e0c69f97c226b36e325d7c49f7b8abddcc01ad23e9fb",
+    "target/wal-opt/20261027-v7-clean-tail/bootstrap-probe.stdout": "fec9ad5dfa5d0b0847cc08ff28fd94e3edb7cef817b8e74fffd24a42e30538fe",
+    "target/wal-opt/20261027-v7-clean-tail/bootstrap-probe.stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  }
+}

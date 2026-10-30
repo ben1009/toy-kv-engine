@@ -1,0 +1,34 @@
+{
+  "base_commit": "0b87e88adf3780d07a4fd2801b81b171a7b4bcb2",
+  "candidate_patch_sha256": "65df6b598759fb05b0821d16c6d064b91b78da358e7a5644a2f595fb153277f7",
+  "build": "cargo build --offline --locked --release --package kv-engine --bin write-perf --features bench",
+  "screen_cells": [
+    "ext4-batch8",
+    "ext4-batch16"
+  ],
+  "guard_cells": [],
+  "schedule": "Separately planned follow-up after the initial screen had insufficient eligible high-concurrency samples. Two batch64 screens, one warmup and two scored runs per arm with balanced alternating order, 30 seconds initial cooldown and five seconds between invocations. No score-selected replacement runs.",
+  "ranking": "Highest eligible throughput per exact binary and workload within the follow-up; p99 and counts come from the same invocation. Keep the initial cohort separately.",
+  "stall_filter": {
+    "frontier_mean_ms_at_least": 0.12,
+    "fdatasync_mean_ms_at_least": 0.6,
+    "selection": "Flag each run using mean times; passing means can still hide brief SSD stalls."
+  },
+  "screen_gate": {
+    "minimum_throughput_ratio": 1.0,
+    "maximum_p99_ratio": 1.0,
+    "minimum_eligible_runs_per_arm": 2
+  },
+  "guard_gate": {
+    "minimum_throughput_ratio": 0.98,
+    "maximum_p99_ratio": 1.05,
+    "minimum_eligible_runs_per_arm": 2
+  },
+  "constraints": [
+    "Baseline is the exact previously measured dynamic grouping binary.",
+    "Candidate changes only v7 durability joining and its submitted-ticket hint.",
+    "No change to grouping, wire format, or fsync behavior.",
+    "All scratch databases remain inside the local repository.",
+    "Do not qualify a performance win from stalled or insufficient samples."
+  ]
+}

@@ -1,0 +1,27 @@
+{
+  "outside_sandbox": true,
+  "full_tests": 1986,
+  "focused_tests": 66,
+  "race_iterations": 10,
+  "race_tests_each": 6,
+  "test_threads": 2,
+  "retries": 0,
+  "logs": {
+    "full-check.log": {
+      "path": "target/wal-opt/20261029-v7-admitted-group/full-check.log",
+      "sha256": "508f9cacdac6643b13c8dae3260937c43fe33361dedf6b3489879e2daf0625ce"
+    },
+    "focused-final.log": {
+      "path": "target/wal-opt/20261029-v7-admitted-group/focused-final.log",
+      "sha256": "a3f13f8dc8ba801657d7df2cee751751aa7e16aa04d942ab8b055d88be567592"
+    },
+    "race-stress.log": {
+      "path": "target/wal-opt/20261029-v7-admitted-group/race-stress.log",
+      "sha256": "961695489263e8ee69b62fe49bd54653b0103fec2941cd0a080085728b0fca53"
+    },
+    "release.log": {
+      "path": "target/wal-opt/20261029-v7-admitted-group/release.log",
+      "sha256": "41d5a75d211fcb6ed49dd9354f1aa319a009c198343af12694f290909a065ac7"
+    }
+  }
+}

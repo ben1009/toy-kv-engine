@@ -1,0 +1,24 @@
+[
+  {
+    "attempt": 1,
+    "reason": "Diagnostic-only build used group_id.0, but GroupWriteResult stores u64. No executable or benchmark used this version. Build finally restored retained source/executable; correct the trace field to group_id and preserve failed logs.",
+    "files": [
+      {
+        "path": "target/wal-opt/20261027-v7-coordinator-tail/baseline-format-attempt1.log",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      {
+        "path": "target/wal-opt/20261027-v7-coordinator-tail/baseline-release-attempt1.log",
+        "sha256": "5aa4acf28db3d6cd47878e9d91e5c36faffca258cd6bb16ae998136054b4e5c5"
+      },
+      {
+        "path": "docs/wal/benchmarks/artifacts/rfc-025-v7-coordinator-tail-20261027-baseline-stage-attempt1.patch",
+        "sha256": "d394e28ec9267cd9a31b6e1d3410bf21f16ee9d1b37b32df88eaaf81a2c5f2c0"
+      },
+      {
+        "path": "docs/wal/benchmarks/artifacts/rfc-025-v7-coordinator-tail-20261027-builds-attempt1.json",
+        "sha256": "9646c5d8fa737a80a015f9aa6ac1291a11db5c19d94dbbfe0f1c6aa151e04634"
+      }
+    ]
+  }
+]

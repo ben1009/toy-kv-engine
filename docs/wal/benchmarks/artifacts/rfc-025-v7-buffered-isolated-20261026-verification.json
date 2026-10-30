@@ -1,0 +1,33 @@
+{
+  "fresh_scored_records": 80,
+  "fresh_warmups": 16,
+  "potentially_contaminated_scored_records": 80,
+  "potentially_contaminated_warmups": 16,
+  "all_unique_run_ids": 192,
+  "fresh_host_samples": 967,
+  "competing_build_or_test_processes_observed": 0,
+  "sample_period_seconds": 1,
+  "validation": {
+    "buffered-frontier": {
+      "command": "cargo make check",
+      "log": "target/wal-opt/20261026-v7-buffered-frontier/candidate-check.log",
+      "nextest_run_id": "5e5b1868-15b6-4fcc-83fc-8ba40a1e36d4",
+      "summary": "1964 tests run: 1964 passed (1 slow), 0 skipped"
+    },
+    "buffered-parallel": {
+      "command": "cargo make check",
+      "log": "target/wal-opt/20261026-v7-buffered-parallel/check.log",
+      "nextest_run_id": "032a8505-ebb4-4c2e-807f-bdcb4022b9b5",
+      "summary": "1964 tests run: 1964 passed, 0 skipped"
+    },
+    "restored": {
+      "command": "cargo make check",
+      "log": "target/wal-opt/20261026-v7-buffered-parallel/restored-check.log",
+      "nextest_run_id": "5babb16f-fe65-4eb2-bcdd-11ebfb4cb952",
+      "summary": "1963 tests run: 1963 passed (1 slow), 0 skipped"
+    }
+  },
+  "source_base": "b9684dc5",
+  "candidate_adopted": false,
+  "conditional_ram_and_confirmation_cancelled": true
+}

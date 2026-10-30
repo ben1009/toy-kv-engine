@@ -1,0 +1,93 @@
+{
+  "outside_sandbox": true,
+  "checks": [
+    {
+      "phase": "format",
+      "command": [
+        "cargo",
+        "fmt",
+        "--all"
+      ],
+      "exit_code": 0,
+      "log": "target/wal-opt/20261027-v7-batch-membership/format.log",
+      "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "phase": "focused",
+      "command": [
+        "cargo",
+        "nextest",
+        "run",
+        "--offline",
+        "--locked",
+        "--workspace",
+        "--all-features",
+        "--lib",
+        "--retries",
+        "0",
+        "--success-output",
+        "immediate",
+        "-E",
+        "test(group_minimum_write_size) or test(v7_worker_group_geometry) or test(v7_large_batch_wave) or test(large_batch_coalescing) or test(worker_accepts_data_groups) or test(v7_frontier_recaptures) or test(v7_frontier_poison)"
+      ],
+      "exit_code": 0,
+      "log": "target/wal-opt/20261027-v7-batch-membership/focused.log",
+      "log_sha256": "fddedb32a8384666f1ddef3a3db6811acb681dacf62919b519f098679fc5d6b2"
+    },
+    {
+      "phase": "check",
+      "command": [
+        "cargo",
+        "make",
+        "check"
+      ],
+      "exit_code": 0,
+      "log": "target/wal-opt/20261027-v7-batch-membership/check.log",
+      "log_sha256": "45ca7d64d5b502c6f4fd25d45e5ad25f3fa74ca44e88bfa3ef2a2ccfcf7da753"
+    },
+    {
+      "phase": "release",
+      "command": [
+        "cargo",
+        "build",
+        "--offline",
+        "--locked",
+        "--release",
+        "--package",
+        "kv-engine",
+        "--bin",
+        "write-perf",
+        "--features",
+        "bench"
+      ],
+      "exit_code": 0,
+      "log": "target/wal-opt/20261027-v7-batch-membership/release.log",
+      "log_sha256": "caf23fa4daca9d52b01402e25e21e633c8971a2fef40476a4ae050d1c2cb4501"
+    },
+    {
+      "phase": "direct spelling",
+      "command": [
+        "typos",
+        "--format",
+        "brief"
+      ],
+      "exit_code": 0,
+      "log": "target/wal-opt/20261027-v7-batch-membership/direct-spelling.log",
+      "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "phase": "final spelling",
+      "command": [
+        "typos",
+        "--format",
+        "brief"
+      ],
+      "exit_code": 0,
+      "log": "target/wal-opt/20261027-v7-batch-retirement-hint/final-spelling.log",
+      "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    }
+  ],
+  "tests": 1973,
+  "focused_tests": 8,
+  "embedded_spelling_issue": "The make task returned0 after reporting joined words in the unscored plan. Corrected metadata before scoring; direct spelling is checked separately."
+}

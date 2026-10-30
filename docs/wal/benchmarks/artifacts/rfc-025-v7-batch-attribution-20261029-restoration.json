@@ -1,0 +1,15 @@
+{
+  "completed_at_utc": "2026-10-29T03:17:49.270875+00:00",
+  "restored_inputs": 128,
+  "restored_rust_files": [
+    "kv-engine/src/wal.rs",
+    "kv-engine/src/wal/parallel/runtime.rs",
+    "kv-engine/src/wal/parallel/worker.rs",
+    "kv-engine/src/bin/write-perf.rs",
+    "kv-engine/src/mvcc.rs"
+  ],
+  "rust_mtimes_refreshed": true,
+  "atomic_binary_replacement": true,
+  "canonical_sha256": "f353022d846530a6754330aaea11f295319ea8f4de20afa09b6d2a3b57b021d8",
+  "baseline_manifest_sha256": "9a33cb488d2b99f3e374e9949e9a0fb1ff3988c7bc6f23b2adf98f05aa4715de"
+}

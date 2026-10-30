@@ -1,0 +1,251 @@
+{
+  "pairs": [
+    {
+      "cohort": "initial",
+      "pair": 1,
+      "v7_throughput_change": 0.8670203595560125,
+      "normalized_v7_v4_change": 0.8761577403849075,
+      "v7_cpu_change": 1.231772347220727,
+      "v7_p50_change": 1.152586216325593,
+      "v7_p99_change": 1.1784659451781352
+    },
+    {
+      "cohort": "initial",
+      "pair": 2,
+      "v7_throughput_change": 1.094597816782477,
+      "normalized_v7_v4_change": 1.0316944314235732,
+      "v7_cpu_change": 0.8154681392763654,
+      "v7_p50_change": 0.8198996827959785,
+      "v7_p99_change": 1.0030730938520191
+    },
+    {
+      "cohort": "initial",
+      "pair": 3,
+      "v7_throughput_change": 0.9680506756722895,
+      "normalized_v7_v4_change": 0.9216504745005614,
+      "v7_cpu_change": 1.0287323987017878,
+      "v7_p50_change": 0.9944549444992766,
+      "v7_p99_change": 0.9456824971987501
+    },
+    {
+      "cohort": "initial",
+      "pair": 4,
+      "v7_throughput_change": 0.2702176930406534,
+      "normalized_v7_v4_change": 0.28645540988325574,
+      "v7_cpu_change": 1.7693180798792183,
+      "v7_p50_change": 1.2809257149477666,
+      "v7_p99_change": 7.4849417237055915
+    },
+    {
+      "cohort": "initial",
+      "pair": 5,
+      "v7_throughput_change": 4.318504292199491,
+      "normalized_v7_v4_change": 22.72467286549523,
+      "v7_cpu_change": 0.4508512168156387,
+      "v7_p50_change": 0.11728282873211131,
+      "v7_p99_change": 0.6185696067925037
+    },
+    {
+      "cohort": "confirmation",
+      "pair": 1,
+      "v7_throughput_change": 1.0563915263727823,
+      "normalized_v7_v4_change": 1.099546183409658,
+      "v7_cpu_change": 0.9051491954125611,
+      "v7_p50_change": 0.9708922007942669,
+      "v7_p99_change": 0.864307128821118
+    },
+    {
+      "cohort": "confirmation",
+      "pair": 2,
+      "v7_throughput_change": 0.8339891595265263,
+      "normalized_v7_v4_change": 0.8288979073903976,
+      "v7_cpu_change": 1.3806364047073132,
+      "v7_p50_change": 1.2870917189683255,
+      "v7_p99_change": 1.1891572896073714
+    },
+    {
+      "cohort": "confirmation",
+      "pair": 3,
+      "v7_throughput_change": 1.6108699032501839,
+      "normalized_v7_v4_change": 6.515302557287902,
+      "v7_cpu_change": 0.736920926961649,
+      "v7_p50_change": 0.17821835578789563,
+      "v7_p99_change": 0.9480065274807202
+    },
+    {
+      "cohort": "confirmation",
+      "pair": 4,
+      "v7_throughput_change": 1.0347951279243846,
+      "normalized_v7_v4_change": 1.0543623180078754,
+      "v7_cpu_change": 0.9603933619764041,
+      "v7_p50_change": 0.9711101740143444,
+      "v7_p99_change": 0.897930541268203
+    },
+    {
+      "cohort": "confirmation",
+      "pair": 5,
+      "v7_throughput_change": 0.9521755161741632,
+      "normalized_v7_v4_change": 0.9485130302188595,
+      "v7_cpu_change": 1.1516539687023497,
+      "v7_p50_change": 1.0407477441734339,
+      "v7_p99_change": 0.9926154354217535
+    }
+  ],
+  "median_changes": {
+    "v7_throughput_change": 1.0014229017983372,
+    "normalized_v7_v4_change": 0.9901037308212164,
+    "v7_cpu_change": 0.994562880339096,
+    "v7_p50_change": 0.9827825592568105,
+    "v7_p99_change": 0.9703109814512368
+  },
+  "per_arm": {
+    "old_v4": {
+      "median_puts_per_sec": 387310.16105536325,
+      "peak_puts_per_sec": 399484.80585827015,
+      "median_cpu_ms": 5900.5585,
+      "median_p50_ms": 1.2008885,
+      "median_p99_ms": 2.4031965,
+      "pipeline_medians": {
+        "commit_groups": 11689.5,
+        "commit_buffers": 11720.0,
+        "commit_bytes": 815988736.0,
+        "sync_count": 2458.5,
+        "fdatasync_ns": 1034353143.0,
+        "frontier_writes": 0.0,
+        "frontier_bytes": 0.0,
+        "frontier_write_ns": 0.0,
+        "sync_coalesce_wait_calls": 5844.5,
+        "sync_coalesce_wait_ns": 423683238.0,
+        "preallocation_ns": 2263238.0
+      }
+    },
+    "new_v4": {
+      "median_puts_per_sec": 383166.001305328,
+      "peak_puts_per_sec": 398605.6866620031,
+      "median_cpu_ms": 5966.3855,
+      "median_p50_ms": 1.209667,
+      "median_p99_ms": 2.522863,
+      "pipeline_medians": {
+        "commit_groups": 11671.5,
+        "commit_buffers": 11720.0,
+        "commit_bytes": 815988736.0,
+        "sync_count": 2429.5,
+        "fdatasync_ns": 1067571880.5,
+        "frontier_writes": 0.0,
+        "frontier_bytes": 0.0,
+        "frontier_write_ns": 0.0,
+        "sync_coalesce_wait_calls": 5800.5,
+        "sync_coalesce_wait_ns": 418261393.5,
+        "preallocation_ns": 2380835.5
+      }
+    },
+    "old_v7": {
+      "median_puts_per_sec": 402882.0158713949,
+      "peak_puts_per_sec": 480373.0901766222,
+      "median_cpu_ms": 3606.5645,
+      "median_p50_ms": 1.1565910000000001,
+      "median_p99_ms": 2.7728245,
+      "pipeline_medians": {
+        "commit_groups": 8217.5,
+        "commit_buffers": 11720.0,
+        "commit_bytes": 816021504.0,
+        "sync_count": 2185.5,
+        "fdatasync_ns": 716239195.0,
+        "frontier_writes": 2185.5,
+        "frontier_bytes": 8951808.0,
+        "frontier_write_ns": 215755035.0,
+        "sync_coalesce_wait_calls": 4683.5,
+        "sync_coalesce_wait_ns": 566076946.5,
+        "preallocation_ns": 49714598.5
+      }
+    },
+    "new_v7": {
+      "median_puts_per_sec": 381063.4716859273,
+      "peak_puts_per_sec": 453655.438388702,
+      "median_cpu_ms": 3728.2595,
+      "median_p50_ms": 1.180779,
+      "median_p99_ms": 2.9045615,
+      "pipeline_medians": {
+        "commit_groups": 8213.5,
+        "commit_buffers": 11720.0,
+        "commit_bytes": 816021504.0,
+        "sync_count": 2235.0,
+        "fdatasync_ns": 759222041.0,
+        "frontier_writes": 2235.0,
+        "frontier_bytes": 9154560.0,
+        "frontier_write_ns": 229706214.5,
+        "sync_coalesce_wait_calls": 4702.0,
+        "sync_coalesce_wait_ns": 575151416.0,
+        "preallocation_ns": 99263133.5
+      }
+    }
+  },
+  "per_arm_median_rate_ratio": 0.9458438368407283,
+  "retention_extension": {
+    "original_guards": true,
+    "pooled_raw_loss_at_most_five_percent": true,
+    "pooled_normalized_loss_at_most_five_percent": true,
+    "per_arm_median_loss_at_most_five_percent": false,
+    "keep": false
+  },
+  "run_ids": [
+    "1792988305370",
+    "1792988319460",
+    "1792988331272",
+    "1792988345458",
+    "1792988357661",
+    "1792988371848",
+    "1792988386103",
+    "1792988398073",
+    "1792988410321",
+    "1792988422148",
+    "1792988434145",
+    "1792988461114",
+    "1792988487629",
+    "1792988501828",
+    "1792988518188",
+    "1792988540307",
+    "1792988562832",
+    "1792988579450",
+    "1792988591348",
+    "1792988605588",
+    "1792988619718",
+    "1792988635282",
+    "1792988662539",
+    "1792988685286",
+    "1792989700924",
+    "1792989715143",
+    "1792989727089",
+    "1792989741251",
+    "1792989753408",
+    "1792989767660",
+    "1792989781891",
+    "1792989794059",
+    "1792989806121",
+    "1792989818168",
+    "1792989829910",
+    "1792989847024",
+    "1792989861214",
+    "1792989875517",
+    "1792989900841",
+    "1792989923123",
+    "1792989940856",
+    "1792989952888",
+    "1792989964983",
+    "1792989979169",
+    "1792989993380",
+    "1792990007607",
+    "1792990021771",
+    "1792990033719"
+  ],
+  "input_sha256": {
+    "rfc-025-v7-large-group-hint-cache-ext4-batch64-20261026.jsonl": "33b3cb9447f727ac4850807f647197227080062c4d8d8c2eb6767c94ff04afd8",
+    "rfc-025-v7-large-group-hint-cache-ext4-batch64-20261026-runs.tsv": "f6e895a80e580b40f204fa88017d62010304a7bd64805c71f48f770740611f76",
+    "rfc-025-v7-large-group-hint-cache-confirmation-ext4-batch64-20261026.jsonl": "c374ea66dac29483206aed0ad238aa1fc360e409d719f9584f0c1b843678d584",
+    "rfc-025-v7-large-group-hint-cache-confirmation-ext4-batch64-20261026-runs.tsv": "eeb4ae1b3c938e6ecf10fab2a65e1c85485c5b199edd967732dc1c65dc580339"
+  },
+  "original_summary_sha256": "7ff244dda1dad894c3b411734375e1f7f7185cff00bee651c17e3285077b1056",
+  "confirmation_driver_sha256": "cc5fd17fdde220f7d4153ce31193c38f67139ac644c349df564b6b665acaa333",
+  "analysis_sha256": "82a373370ecf08b855618c9be25e202fca2be21d4bf77b237a03f7f514648ea1",
+  "limits": "Exactly one fixed confirmation, pooled with all original pairs and stalls. Paired medians and per-arm medians are separate statistics. This does not qualify the complete RFC gate."
+}

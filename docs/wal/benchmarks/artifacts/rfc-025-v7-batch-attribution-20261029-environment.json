@@ -1,0 +1,21 @@
+{
+  "source_base": "cf655cdd16c53c1f1bf7c9741149c48f01bec620",
+  "kernel": "6.12.71-1-lts",
+  "filesystem": "/dev/nvme0n1p3[/liu/proj/toy-kv-engine] ext4 rw,nosuid,nodev,relatime",
+  "toolchain": "rustc 1.100.0-nightly (6bb1652a0 2026-09-22)\nbinary: rustc\ncommit-hash: 6bb1652a020e80cef79332741d89e996d71933c9\ncommit-date: 2026-09-22\nhost: x86_64-unknown-linux-gnu\nrelease: 1.100.0-nightly\nLLVM version: 23.1.1\n",
+  "numa_nodes": [
+    "node0"
+  ],
+  "max_processes": [
+    255469,
+    255469
+  ],
+  "allocator_environment_overrides": {},
+  "prior_verification_sha256": "3071252ddf8db88a752c0db266e2195e229c140d0671583cd423c41820264fe1",
+  "plan_sha256": "69490b481bf988adc17a48531caa87df20d0d0b7664fe389352ddff64150ba40",
+  "matrix_sha256": "95b5a613e83f2c3b481a56598529d3770aef11d60304ca89dff08b9db36d66ce",
+  "driver_sha256": "c51ec8018165852042836d2aac7897bb15f0e34500512af40f43b967e3f8504b",
+  "orchestrator_sha256": "49eb81b29704d9cd46973f30a23c174aeb47442bd52e40932a4b963ac41f2ca6",
+  "child_sha256": "538c6a74a405dd67eba4d7bb7295fd24965c69a0fa3dde06bed30ed1985650ab",
+  "baseline_manifest_sha256": "9a33cb488d2b99f3e374e9949e9a0fb1ff3988c7bc6f23b2adf98f05aa4715de"
+}

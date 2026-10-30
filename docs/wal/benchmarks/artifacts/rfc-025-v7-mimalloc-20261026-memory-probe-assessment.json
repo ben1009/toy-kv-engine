@@ -1,0 +1,5 @@
+{
+  "qualified_native_stats": false,
+  "excluded_from_scoring": true,
+  "reason": "MIMALLOC_SHOW_STATS was inherited by the Python launcher, whose own allocator emitted additional native statistics. Preserve all first diagnostic records; use the separate engine-only rerun for memory interpretation. Main scored matrices used no stats flags and already record exact wait4 engine-child RSS."
+}

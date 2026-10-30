@@ -1,0 +1,10 @@
+{
+  "retained": {
+    "path": "target/release/write-perf-allocator-system",
+    "sha256": "614f0cb1adde43cabe900eb032c6f884783d658c597471d9d9ddc8faff314aa9"
+  },
+  "candidate": {
+    "path": "target/release/write-perf-allocator-mimalloc",
+    "sha256": "9b0417a150a3cd5caf99b6ca83572f5bd0a7fa363b44b855872ca16e340c5350"
+  }
+}

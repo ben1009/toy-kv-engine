@@ -1,0 +1,23 @@
+{
+  "source_base": "dc3e3c1a8fce0f15700ff7c5d2ef2cb1c2875d4d",
+  "assessment_passed": false,
+  "source_retained": false,
+  "cpu_is_diagnostic": true,
+  "all_requested_cells_run": true,
+  "captured_cells": [
+    "ext4-batch1",
+    "ext4-batch8",
+    "ext4-batch16",
+    "ext4-point8",
+    "confirmation-batch8"
+  ],
+  "cancelled_cells": [],
+  "failed_v7_cells": [
+    "ext4-batch16",
+    "ext4-point8",
+    "confirmation-batch8"
+  ],
+  "reason": "Minimum geometry recognizes packed groups but source1fails16-writer throughput/p99,point8 throughput,and independent batch8 confirmation. CPU is not a gate. Preserve all80records; reject this source without overriding failures.",
+  "superseded_by": "rfc-025-v7-batch-wait-budget-20261027",
+  "scope": "Historical rejected prototype before corrective compact metadata and wait-cost budget."
+}

@@ -1,0 +1,376 @@
+[
+  {
+    "backend": "skipmap",
+    "samples": 117,
+    "lost_samples": 0,
+    "event": "cpu-clock:u",
+    "scope": "Excluded diagnostic; flat user-CPU sample share, not elapsed or kernel time",
+    "symbols": [
+      {
+        "percent": 14.53,
+        "symbol": "<crossbeam_skiplist::base::SkipList<bytes::bytes::Bytes, bytes::bytes::Bytes>>::search_position::<bytes::bytes::Bytes>"
+      },
+      {
+        "percent": 12.82,
+        "symbol": "__vdso_clock_gettime"
+      },
+      {
+        "percent": 7.69,
+        "symbol": "<kv_engine::mem_table::MemTable>::publish_raw_batch"
+      },
+      {
+        "percent": 5.98,
+        "symbol": "0x00000000000a5ffc"
+      },
+      {
+        "percent": 5.13,
+        "symbol": "<crossbeam_skiplist::base::SkipList<bytes::bytes::Bytes, bytes::bytes::Bytes>>::insert_internal::<<crossbeam_skiplist::base::SkipList<bytes::bytes::Bytes, bytes::bytes::Bytes>>::insert::{closure#0}, <crossbeam_skiplist::base::SkipList<bytes::bytes::Bytes, bytes::bytes::Bytes>>::insert::{closure#1}>"
+      },
+      {
+        "percent": 4.27,
+        "symbol": "0x00000000000a4809"
+      },
+      {
+        "percent": 3.42,
+        "symbol": "__mprotect"
+      },
+      {
+        "percent": 3.42,
+        "symbol": "0x00000000000a5fdc"
+      },
+      {
+        "percent": 3.42,
+        "symbol": "0x000000000016c11d"
+      },
+      {
+        "percent": 2.56,
+        "symbol": "crossbeam_epoch::default::with_handle::<crossbeam_epoch::default::pin::{closure#0}, crossbeam_epoch::guard::Guard>"
+      },
+      {
+        "percent": 2.56,
+        "symbol": "0x00000000000a481c"
+      },
+      {
+        "percent": 2.56,
+        "symbol": "0x000000000016be20"
+      },
+      {
+        "percent": 1.71,
+        "symbol": "<alloc::string::String as core::fmt::Write>::write_char"
+      },
+      {
+        "percent": 1.71,
+        "symbol": "<alloc::sync::Arc<crossbeam_skiplist::map::SkipMap<bytes::bytes::Bytes, bytes::bytes::Bytes>>>::drop_slow"
+      },
+      {
+        "percent": 1.71,
+        "symbol": "<std::time::Instant>::elapsed"
+      },
+      {
+        "percent": 1.71,
+        "symbol": "crc32fast::baseline::update_fast_16"
+      },
+      {
+        "percent": 1.71,
+        "symbol": "kv_engine::key::decode_user_key_into"
+      },
+      {
+        "percent": 1.71,
+        "symbol": "std::sys::backtrace::__rust_begin_short_backtrace::<write_perf::run_memtable_publish_workload::{closure#0}, core::result::Result<(), anyhow::Error>>"
+      },
+      {
+        "percent": 1.71,
+        "symbol": "0x000000000016bf08"
+      },
+      {
+        "percent": 0.85,
+        "symbol": "<bytes::bytes::Bytes as core::convert::From<alloc::vec::Vec<u8>>>::from"
+      },
+      {
+        "percent": 0.85,
+        "symbol": "<core::fmt::Formatter>::pad_integral"
+      },
+      {
+        "percent": 0.85,
+        "symbol": "<crossbeam_skiplist::base::Node<bytes::bytes::Bytes, bytes::bytes::Bytes>>::finalize"
+      },
+      {
+        "percent": 0.85,
+        "symbol": "<crossbeam_skiplist::map::Entry<bytes::bytes::Bytes, bytes::bytes::Bytes> as core::ops::drop::Drop>::drop"
+      },
+      {
+        "percent": 0.85,
+        "symbol": "<std::sys::pal::unix::time::Timespec>::sub_timespec"
+      },
+      {
+        "percent": 0.85,
+        "symbol": "__rustc::__rust_alloc"
+      },
+      {
+        "percent": 0.85,
+        "symbol": "__rustc::__rust_no_alloc_shim_is_unstable_v2"
+      },
+      {
+        "percent": 0.85,
+        "symbol": "cfree"
+      },
+      {
+        "percent": 0.85,
+        "symbol": "clock_gettime"
+      },
+      {
+        "percent": 0.85,
+        "symbol": "kv_engine::key::encode_memcomparable_user_key_to"
+      },
+      {
+        "percent": 0.85,
+        "symbol": "malloc"
+      },
+      {
+        "percent": 0.85,
+        "symbol": "0x00000000000a347e"
+      },
+      {
+        "percent": 0.85,
+        "symbol": "0x00000000000a3538"
+      },
+      {
+        "percent": 0.85,
+        "symbol": "0x00000000000a47b2"
+      },
+      {
+        "percent": 0.85,
+        "symbol": "0x00000000000a49e1"
+      },
+      {
+        "percent": 0.85,
+        "symbol": "0x00000000000a49e5"
+      },
+      {
+        "percent": 0.85,
+        "symbol": "0x00000000000a5fbb"
+      },
+      {
+        "percent": 0.85,
+        "symbol": "0x000000000016bf00"
+      },
+      {
+        "percent": 0.85,
+        "symbol": "0x000000000016c103"
+      },
+      {
+        "percent": 0.85,
+        "symbol": "0x000000000016c119"
+      },
+      {
+        "percent": 0.85,
+        "symbol": "0x000000000016c121"
+      },
+      {
+        "percent": 0.85,
+        "symbol": "0x000000000016c128"
+      },
+      {
+        "percent": 0.85,
+        "symbol": "0x000000000016c6f1"
+      }
+    ]
+  },
+  {
+    "backend": "bbtree",
+    "samples": 189,
+    "lost_samples": 0,
+    "event": "cpu-clock:u",
+    "scope": "Excluded diagnostic; flat user-CPU sample share, not elapsed or kernel time",
+    "symbols": [
+      {
+        "percent": 37.04,
+        "symbol": "<bbtree::tree::node::latch::NodeLatch>::read_version_contended"
+      },
+      {
+        "percent": 9.52,
+        "symbol": "<kv_engine::mem_table::bbtree_backend::Map>::insert"
+      },
+      {
+        "percent": 7.41,
+        "symbol": "__vdso_clock_gettime"
+      },
+      {
+        "percent": 5.29,
+        "symbol": "<std::thread::local::LocalKey<core::cell::RefCell<alloc::vec::Vec<u8>>>>::with::<<kv_engine::mem_table::MemTable>::publish_raw_batch::{closure#0}, ()>"
+      },
+      {
+        "percent": 3.17,
+        "symbol": "0x00000000000a49e1"
+      },
+      {
+        "percent": 2.65,
+        "symbol": "crc32fast::baseline::update_fast_16"
+      },
+      {
+        "percent": 2.65,
+        "symbol": "0x00000000000a5fdc"
+      },
+      {
+        "percent": 2.12,
+        "symbol": "0x00000000000a347e"
+      },
+      {
+        "percent": 1.59,
+        "symbol": "<bbtree::tree::walk::DyingWalk<kv_engine::mem_table::bbtree_backend::Key, bytes::bytes::Bytes, bbtree::tree::node::latch::Latched<bbtree::inline_key::WithInlineKey>, &bbtree::allocator::Global>>::drop_rest"
+      },
+      {
+        "percent": 1.59,
+        "symbol": "<std::sys::pal::unix::time::Timespec>::now"
+      },
+      {
+        "percent": 1.59,
+        "symbol": "<std::time::Instant>::elapsed"
+      },
+      {
+        "percent": 1.59,
+        "symbol": "__mprotect"
+      },
+      {
+        "percent": 1.59,
+        "symbol": "cfree"
+      },
+      {
+        "percent": 1.06,
+        "symbol": "<bbtree::tree::latched::LatchedTree<kv_engine::mem_table::bbtree_backend::Key, bytes::bytes::Bytes, bbtree::inline_key::WithInlineKey>>::insert_splitting::<bbtree::tree::latched::insert::UpdateOrInsert<<bbtree::map::BBTreeMap<kv_engine::mem_table::bbtree_backend::Key, bytes::bytes::Bytes, bbtree::inline_key::WithInlineKey>>::insert::{closure#0}>, bbtree::allocator::Global>"
+      },
+      {
+        "percent": 1.06,
+        "symbol": "<bbtree::tree::node::optimistic::SharedLatch>::lock"
+      },
+      {
+        "percent": 1.06,
+        "symbol": "<bbtree::tree::node_stack::NodeStackMut<kv_engine::mem_table::bbtree_backend::Key, bytes::bytes::Bytes, bbtree::tree::node::latch::Latched<bbtree::inline_key::WithInlineKey>>>::insert_splitting::<bbtree::tree::latched::pages::NodePages<bbtree::allocator::Global>>"
+      },
+      {
+        "percent": 1.06,
+        "symbol": "posix_memalign"
+      },
+      {
+        "percent": 1.06,
+        "symbol": "realloc"
+      },
+      {
+        "percent": 1.06,
+        "symbol": "0x00000000000a5ffc"
+      },
+      {
+        "percent": 1.06,
+        "symbol": "0x000000000016c580"
+      },
+      {
+        "percent": 1.06,
+        "symbol": "0x000000000016c591"
+      },
+      {
+        "percent": 0.53,
+        "symbol": "<alloc::string::String as core::fmt::Write>::write_char"
+      },
+      {
+        "percent": 0.53,
+        "symbol": "<bytes::bytes::Bytes as core::convert::From<alloc::vec::Vec<u8>>>::from"
+      },
+      {
+        "percent": 0.53,
+        "symbol": "<kv_engine::mem_table::bbtree_backend::Key as bbtree::inline_key::InlineKey>::cmp_prefix"
+      },
+      {
+        "percent": 0.53,
+        "symbol": "<std::time::Instant>::now"
+      },
+      {
+        "percent": 0.53,
+        "symbol": "__rustc::__rust_realloc"
+      },
+      {
+        "percent": 0.53,
+        "symbol": "bytes::bytes::shared_drop"
+      },
+      {
+        "percent": 0.53,
+        "symbol": "core::fmt::write"
+      },
+      {
+        "percent": 0.53,
+        "symbol": "malloc"
+      },
+      {
+        "percent": 0.53,
+        "symbol": "std::sys::backtrace::__rust_begin_short_backtrace::<write_perf::run_memtable_publish_workload::{closure#0}, core::result::Result<(), anyhow::Error>>"
+      },
+      {
+        "percent": 0.53,
+        "symbol": "0x00000000000a33a3"
+      },
+      {
+        "percent": 0.53,
+        "symbol": "0x00000000000a33a9"
+      },
+      {
+        "percent": 0.53,
+        "symbol": "0x00000000000a33ad"
+      },
+      {
+        "percent": 0.53,
+        "symbol": "0x00000000000a33b3"
+      },
+      {
+        "percent": 0.53,
+        "symbol": "0x00000000000a34c2"
+      },
+      {
+        "percent": 0.53,
+        "symbol": "0x00000000000a351b"
+      },
+      {
+        "percent": 0.53,
+        "symbol": "0x00000000000a354f"
+      },
+      {
+        "percent": 0.53,
+        "symbol": "0x00000000000a432a"
+      },
+      {
+        "percent": 0.53,
+        "symbol": "0x00000000000a4809"
+      },
+      {
+        "percent": 0.53,
+        "symbol": "0x00000000000a4ce3"
+      },
+      {
+        "percent": 0.53,
+        "symbol": "0x00000000000a537a"
+      },
+      {
+        "percent": 0.53,
+        "symbol": "0x00000000000a5c21"
+      },
+      {
+        "percent": 0.53,
+        "symbol": "0x00000000000a5d32"
+      },
+      {
+        "percent": 0.53,
+        "symbol": "0x00000000000a5dcf"
+      },
+      {
+        "percent": 0.53,
+        "symbol": "0x00000000000a7222"
+      },
+      {
+        "percent": 0.53,
+        "symbol": "0x000000000016c5db"
+      },
+      {
+        "percent": 0.53,
+        "symbol": "0x000000000016c75d"
+      }
+    ]
+  }
+]

@@ -1,0 +1,30 @@
+{
+  "requested": "Rerun ssd with the Optimize",
+  "created_at_utc": "2026-10-26 06:13:17 UTC",
+  "source_head": "f4b64963bac2ea4802ad50d7912ae914e9d10734",
+  "candidate": "Saved full FRONTIER + sync timing optimization, unchanged SHA-256 698d294f9704b0a42210265f852025d49b27f640c70fcf6888857fca71670e32.",
+  "control": "Retained build with the eleven earlier kept optimizations, unchanged SHA-256 614f0cb1adde43cabe900eb032c6f884783d658c597471d9d9ddc8faff314aa9.",
+  "source_changes": false,
+  "cells": {
+    "ext4-batch64": {
+      "operations": 750000,
+      "writers": 8,
+      "batch_size": 64,
+      "pairs": 5
+    },
+    "ext4-point8": {
+      "operations": 100000,
+      "writers": 8,
+      "batch_size": null,
+      "pairs": 5
+    }
+  },
+  "format": "1 KiB values; target SST 2 GiB; sample every 10 batches or 100 point operations. Same options as the previous SSD matrix. Fresh disposable databases under the local repository target directory.",
+  "schedule": "Exactly four unscored warmups per cell (old_v4,old_v7,new_v4,new_v7), then five four-arm pairs. Odd pairs old_v4,new_v4,old_v7,new_v7; even pairs reverse. No additional attempts selected by results.",
+  "cooldowns": "30 seconds before the first run of each SSD cell; 10 seconds after every run. Same as original.",
+  "isolation": "No concurrent build, tests, profiles, or other benchmarks; verify pinned binaries before and after runs; cleanup every database and its PITR repository.",
+  "analysis": "Preserve all 40 scored runs plus eight warmups separately. Report medians of paired v7 throughput/CPU/p50/p99 ratios, v4-normalized ratios, per-arm median rates, and scored peaks. Also pool all original five and requested five SSD pairs per workload (ten each); retain stalls and historical stronger matching peaks.",
+  "interpretation": "This is a user-requested independent rerun after the original gate failed, not the original conditional confirmation. Do not relabel the initial failure or reinstall the candidate based on one rerun. Report whether the full-cycle policy changes any SSD classifications.",
+  "original_identity_sha256": "ffdc8f33be6b5210bcb3371acf4953f148f90f53d245520c08ff582c450187e4",
+  "candidate_source_manifest_sha256": "27d09334e1b36a723f4838f26db32f0628ce6b360b086e516e566675eb358144"
+}

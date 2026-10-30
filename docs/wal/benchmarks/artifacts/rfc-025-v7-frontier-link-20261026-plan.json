@@ -1,0 +1,26 @@
+{
+  "created_at_utc": "2026-10-26T13:38:19.306096+00:00",
+  "kind": "Native mechanism diagnostic; not an engine throughput qualification",
+  "hypothesis": "Linking a 4KiB FRONTIER write to a whole-file DATASYNC request may avoid a userspace handoff. Compare default,COOP_TASKRUN+SINGLE_ISSUER,and SINGLE_ISSUER+DEFER_TASKRUN rings using proper GETEVENTS waits. Current engine already uses COOP+SINGLE for DATA, and synchronous pwrite+fdatasync for FRONTIER.",
+  "policies": [
+    "syscalls",
+    "uring_default",
+    "uring_coop_single",
+    "uring_defer_single"
+  ],
+  "workloads": {
+    "point8": {
+      "data_bytes": 32768,
+      "prezero": true
+    },
+    "batch64x8": {
+      "data_bytes": 557056,
+      "prezero": false
+    }
+  },
+  "cycles": 500,
+  "protocol": "Every cycle completes a synchronous O_DIRECT DATA pwrite, then times either synchronous O_DIRECT FRONTIER pwrite+fdatasync, or linked WRITE+FSYNC(DATASYNC) and GETEVENTS waits. Each mode uses identical initialized buffers and file-size allocation. Point prezeros the allocated image before timing; batch keeps unwritten extents. Setup,initialization,readback verification and unlink excluded from cycle timing and included in process audit.",
+  "schedule": "One warmup per policy/workload, then exactly five rounds with policy order rotated by round and reversed on alternate rounds.30s initial cooldown,10s between commands,no build/profile/test during timing,1Hz competing-process audit. Preserve every observation and stall.",
+  "metrics": "All-run medians,paired per-round syscall-relative FRONTIER+sync latency,cycle throughput,CPU,p50,p99. Read back every DATA and FRONTIER to verify bytes. Keep kernel setup flags and errors.",
+  "decision": "Advance linked backend to a Rust engine candidate only if at least one ring mode improves paired median FRONTIER+sync latency by >=3% in both workloads,cycle throughput never loses >5%,and p99 never grows >10%. Failure means no runtime change; native probe cannot qualify an engine change even if successful."
+}

@@ -1,0 +1,14 @@
+{
+  "source_retained": false,
+  "live_source_files_verified": 128,
+  "new_invocations": 36,
+  "scored_records": 27,
+  "full_archive_unique_invocations": 5391,
+  "failed_preflight_passes": 4,
+  "summaries_regenerate": true,
+  "screens_passed": false,
+  "guards_complete": false,
+  "summary_sha256": "cc6c3e890fffaf66b77aa5845ab481c5a920b44bb6b36935a87c99c16dbca5c4",
+  "historical_scores_sha256": "000d78f545ceb04e21070a8fd1a79be5932307e7ea631bb15f2072248d77a36f",
+  "verifier_sha256": "0bac1ae68b12241eba1dc1b6ec1e831bc2b1c487a418882c8396beaa4e63ff65"
+}

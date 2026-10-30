@@ -1,0 +1,44 @@
+{
+  "source_base": "16a9314e95f55e664a39550b53f0c3d19fffa73e",
+  "change": "Keep large DATA framing on producers and hash after submission. Schedule the packer on admission; if the head frame is not ready it waits for that frame, then immediately drains the contiguous ready prefix using the existing group limit. Producer completion signals readiness but does not schedule the packer. Small writes retain their original MVCC guard lifetime. No new batching wait, fsync/coalescing setting, or wire-format change is introduced.",
+  "baseline": {
+    "path": "target/release/write-perf-v7-large-data-async-dispatch",
+    "sha256": "f353022d846530a6754330aaea11f295319ea8f4de20afa09b6d2a3b57b021d8"
+  },
+  "screen_cells": [
+    "ext4-batch1",
+    "ext4-batch8",
+    "ext4-batch16"
+  ],
+  "guard_cells": [
+    "ext4-point1",
+    "ext4-point8",
+    "ext4-point16"
+  ],
+  "schedule": "All three batch and all three point cells run, regardless of earlier scores. After 120 seconds of SSD cooldown per cell, one warmup per arm and three alternating rounds run: batch compares retained, prior producer-framing and candidate; point adds an independently built small-guard-only control. No replacement runs.",
+  "ranking": "Highest-throughput eligible scored invocation per exact binary and workload; p99 is from that same invocation. Preserve raw maxima, all stalls, and separate historical matching-binary bests.",
+  "stall_filter": {
+    "frontier_mean_ms_at_least": 1,
+    "fdatasync_mean_ms_at_least": 1.5,
+    "selection": "Independently flag runs per arm; aggregate means do not establish absence of stalls."
+  },
+  "screen_gate": {
+    "minimum_throughput_ratio": 1.0,
+    "maximum_p99_ratio": 1.0,
+    "minimum_eligible_runs_per_arm": 2
+  },
+  "guard_gate": {
+    "minimum_throughput_ratio": 0.98,
+    "maximum_p99_ratio": 1.05,
+    "minimum_eligible_runs_per_arm": 2
+  },
+  "cpu_policy": "Diagnostic only, not a retention veto.",
+  "constraints": [
+    "Production source, builds, tests, profiles and other benchmarks remain frozen during capture.",
+    "Benchmark and temporary databases stay in the local repository.",
+    "A failed or inconclusive candidate preserves its exact executable, patch and raw captures; restore the five Rust files with fresh mtimes and atomically replace the canonical binary, followed by fresh checks.",
+    "Commit accepted source changes separately from evidence."
+  ],
+  "control_policy": "The original P1 executable isolates the combined change; the guard-only control differs from P1 in MVCC guard handling and its tests, while the final candidate differs in the ordered WAL runtime and in a separately committed crash-test fixture that is not linked into the benchmark binary. Guard/P1 sample counts must be reported; fewer than two eligible runs limits isolation.",
+  "historical_context": "Rank matching-binary retained v4/v7 historical highs separately; current fresh cells compare only v7 builds."
+}

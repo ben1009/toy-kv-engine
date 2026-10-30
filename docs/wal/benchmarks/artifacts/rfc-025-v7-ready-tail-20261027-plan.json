@@ -1,0 +1,14 @@
+{
+  "created_at_utc": "2026-10-27T08:11:03.692936+00:00",
+  "purpose": "Resolve the remaining10ms pre-FRONTIER gaps in the exact retirement-hint tail investigation. The first4 batch-timestamp diagnostics could not see asynchronous DATA completion; preserve them and add two excluded stage captures rather than mislabel their unflagged samples stall-free.",
+  "parent": "rfc-025-v7-clean-tail-20261027",
+  "schedule": [
+    "baseline",
+    "retirement_hint"
+  ],
+  "configuration": "Two16-writer750000-put/batch64/1KiB/2GiB/v7Parallel/no-compaction/sample10 diagnostics, baseline then retirement_hint, with30s initial/15s gap. No retry or performance qualification.",
+  "common_instrumentation": "Identical batch timestamp harness, syscall shim,100ms observer. Add an identical local worker trace for each DATA SQE staging/reap and group membership, plus FRONTIER target-capture time. Bounded preallocated vectors flush at worker/coordinator shutdown after timed writes. Staging-to-reap is not hardware latency; it includes submission and reaping delay. Restore live retained source/executable after saving the two builds.",
+  "analysis": "Separate admission/preparation-to-DATA, DATA staging-to-reap, group/contiguous-prefix readiness, readiness-to-capture, capture-to-write, marker/sync, and return after sync. Keep raw and previously defined1/2/5ms synchronous-I/O masks. Add explicit sensitivity excluding long DATA queue/reap intervals without asserting those are all hardware stalls. Determine whether ready prefixes miss FRONTIER capture or are waiting on earlier DATA/group completion.",
+  "outside_sandbox": true,
+  "publication": "Diagnostic evidence only; no retained engine change or adoption. This extension is justified by an identified measurement gap, not a score-selected retry."
+}

@@ -1,0 +1,21 @@
+{
+  "source_raw_sha256": "0f157f718a9652766863e2328e20d82e057fb4ecdb35dec9ef4e1ece08e055bb",
+  "run_id": "1793066618016",
+  "excluded_diagnostic": true,
+  "writers": 8,
+  "logical_batches": 11720,
+  "sync_count": 2565,
+  "logical_batches_per_sync": 4.569200779727096,
+  "median_captured_ticket_delta": 4,
+  "largest_captured_ticket_delta": 8,
+  "syncs_with_later_written_prefix": 1725,
+  "fraction_with_later_written_prefix": 0.672514619883041,
+  "median_extra_written_tickets": 1,
+  "coalesce_wait_calls": 4793,
+  "coalesce_wait_ns": 977627935,
+  "frontier_write_ns": 2391400739,
+  "fdatasync_ns": 2969701922,
+  "interpretation": "Eight-writer batch waves cover fewer than eight logical batches per sync; later DATA sometimes completes during fdatasync but is outside the already-written certificate. This motivates separate batch coalescing investigation, not treating uncovered tickets as durable or changing the ACK contract.",
+  "median_extra_written_tickets_scope": "All syncs, including syncs with zero extra completed tickets.",
+  "median_extra_when_later_prefix_exists": 2
+}

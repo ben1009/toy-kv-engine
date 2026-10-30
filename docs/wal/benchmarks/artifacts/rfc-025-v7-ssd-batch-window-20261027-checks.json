@@ -1,0 +1,196 @@
+{
+  "source_base": "53f48459b15ae96d50df39ab0f5e7586579206fc",
+  "outside_sandbox": true,
+  "prior_attempts": [
+    {
+      "phase": "format",
+      "command": [
+        "cargo",
+        "fmt",
+        "--all"
+      ],
+      "exit_code": 0,
+      "log": "target/wal-opt/20261027-v7-ssd-batch-window/format.log",
+      "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "phase": "focused",
+      "command": [
+        "cargo",
+        "nextest",
+        "run",
+        "--offline",
+        "--locked",
+        "--workspace",
+        "--all-features",
+        "--lib",
+        "--retries",
+        "0",
+        "--success-output",
+        "immediate",
+        "-E",
+        "test(large_batch_coalescing) or test(v7_large_batch_wave) or test(v7_coalescing_preparation_hint) or test(v7_frontier_recaptures) or test(v7_frontier_poison) or test(async_v7_extent)"
+      ],
+      "exit_code": 100,
+      "log": "target/wal-opt/20261027-v7-ssd-batch-window/focused-fixture-failure.log",
+      "log_sha256": "e88df3e9712c6ebc12079319b610412cd4e51d23083f6492a1d5c87c73bc6e7c"
+    }
+  ],
+  "checks": [
+    {
+      "phase": "format",
+      "command": [
+        "cargo",
+        "fmt",
+        "--all"
+      ],
+      "exit_code": 0,
+      "log": "target/wal-opt/20261027-v7-ssd-batch-window/format.log",
+      "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "phase": "focused",
+      "command": [
+        "cargo",
+        "nextest",
+        "run",
+        "--offline",
+        "--locked",
+        "--workspace",
+        "--all-features",
+        "--lib",
+        "--retries",
+        "0",
+        "--success-output",
+        "immediate",
+        "-E",
+        "test(large_batch_coalescing) or test(v7_large_batch_wave) or test(v7_coalescing_preparation_hint) or test(v7_frontier_recaptures) or test(v7_frontier_poison) or test(async_v7_extent)"
+      ],
+      "exit_code": 0,
+      "log": "target/wal-opt/20261027-v7-ssd-batch-window/focused.log",
+      "log_sha256": "a3fdf0a0550b558201112df17a54ddc46d3fe1c42d2306af8562022224cb2907"
+    },
+    {
+      "phase": "check",
+      "command": [
+        "cargo",
+        "make",
+        "check"
+      ],
+      "exit_code": 0,
+      "log": "target/wal-opt/20261027-v7-ssd-batch-window/check.log",
+      "log_sha256": "255d620a1c89ab69cfb000abe9e4c67c5ed532727f8ad16b2b24b0dac505b99a"
+    },
+    {
+      "phase": "release",
+      "command": [
+        "cargo",
+        "build",
+        "--offline",
+        "--locked",
+        "--release",
+        "--package",
+        "kv-engine",
+        "--bin",
+        "write-perf",
+        "--features",
+        "bench"
+      ],
+      "exit_code": 0,
+      "log": "target/wal-opt/20261027-v7-ssd-batch-window/release.log",
+      "log_sha256": "d6bde7e93abb47b5463b63cc68edfe24c27881fcc2a946bd1a0e5357664a2204"
+    },
+    {
+      "phase": "restored check",
+      "command": [
+        "cargo",
+        "make",
+        "check"
+      ],
+      "exit_code": 0,
+      "log": "target/wal-opt/20261027-v7-ssd-batch-window/restored-check.log",
+      "log_sha256": "b44ca02669ebb821773f22760c86abbf2f78eed28d8e756bb11fa2c7086b3afc"
+    },
+    {
+      "phase": "final spelling",
+      "command": [
+        "typos",
+        "--format",
+        "brief",
+        "docs/wal/README.md",
+        "docs/wal/rfc-025-parallel-wal-embedded-frontiers-implementation-plan.md",
+        "docs/wal/benchmarks/rfc-025-v7-ssd-batch-and-extent-20261027.md",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-ssd-sync-preparation-20261027-analyze.py",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-ssd-sync-preparation-20261027-batch-diagnosis.json",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-ssd-sync-preparation-20261027-binaries.json",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-ssd-sync-preparation-20261027-candidate.patch",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-ssd-sync-preparation-20261027-checks.json",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-ssd-sync-preparation-20261027-child.py",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-ssd-sync-preparation-20261027-decision.json",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-ssd-sync-preparation-20261027-diagnostic-plan.json",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-ssd-sync-preparation-20261027-environment.json",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-ssd-sync-preparation-20261027-ext4-batch8-host.jsonl",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-ssd-sync-preparation-20261027-ext4-batch8-runs.tsv",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-ssd-sync-preparation-20261027-ext4-batch8.jsonl",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-ssd-sync-preparation-20261027-ext4-point8-host.jsonl",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-ssd-sync-preparation-20261027-ext4-point8-runs.tsv",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-ssd-sync-preparation-20261027-ext4-point8.jsonl",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-ssd-sync-preparation-20261027-matrix.json",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-ssd-sync-preparation-20261027-peaks.json",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-ssd-sync-preparation-20261027-plan.json",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-ssd-sync-preparation-20261027-profiles.json",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-ssd-sync-preparation-20261027-profiles.jsonl",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-ssd-sync-preparation-20261027-restoration.json",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-ssd-sync-preparation-20261027-run.py",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-ssd-sync-preparation-20261027-source-sha256.tsv",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-ssd-sync-preparation-20261027-summary.json",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-ssd-sync-preparation-20261027-verify.py",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-ssd-two-chunk-lookahead-20261027-analyze.py",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-ssd-two-chunk-lookahead-20261027-binaries.json",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-ssd-two-chunk-lookahead-20261027-candidate.patch",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-ssd-two-chunk-lookahead-20261027-checks.json",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-ssd-two-chunk-lookahead-20261027-child.py",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-ssd-two-chunk-lookahead-20261027-decision.json",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-ssd-two-chunk-lookahead-20261027-environment.json",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-ssd-two-chunk-lookahead-20261027-ext4-batch8-host.jsonl",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-ssd-two-chunk-lookahead-20261027-ext4-batch8-runs.tsv",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-ssd-two-chunk-lookahead-20261027-ext4-batch8.jsonl",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-ssd-two-chunk-lookahead-20261027-ext4-point8-host.jsonl",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-ssd-two-chunk-lookahead-20261027-ext4-point8-runs.tsv",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-ssd-two-chunk-lookahead-20261027-ext4-point8.jsonl",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-ssd-two-chunk-lookahead-20261027-matrix.json",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-ssd-two-chunk-lookahead-20261027-peaks.json",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-ssd-two-chunk-lookahead-20261027-plan.json",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-ssd-two-chunk-lookahead-20261027-restoration.json",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-ssd-two-chunk-lookahead-20261027-run.py",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-ssd-two-chunk-lookahead-20261027-source-sha256.tsv",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-ssd-two-chunk-lookahead-20261027-summary.json",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-ssd-two-chunk-lookahead-20261027-verify.py",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-ssd-batch-window-20261027-analyze.py",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-ssd-batch-window-20261027-binaries.json",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-ssd-batch-window-20261027-candidate.patch",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-ssd-batch-window-20261027-checks.json",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-ssd-batch-window-20261027-child.py",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-ssd-batch-window-20261027-decision.json",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-ssd-batch-window-20261027-environment.json",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-ssd-batch-window-20261027-ext4-batch8-host.jsonl",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-ssd-batch-window-20261027-ext4-batch8-runs.tsv",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-ssd-batch-window-20261027-ext4-batch8.jsonl",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-ssd-batch-window-20261027-matrix.json",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-ssd-batch-window-20261027-peaks.json",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-ssd-batch-window-20261027-plan.json",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-ssd-batch-window-20261027-restoration.json",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-ssd-batch-window-20261027-run.py",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-ssd-batch-window-20261027-source-sha256.tsv",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-ssd-batch-window-20261027-summary.json",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-ssd-batch-window-20261027-verify.py"
+      ],
+      "exit_code": 0,
+      "log": "target/wal-opt/20261027-v7-ssd-batch-window/final-spelling.log",
+      "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    }
+  ],
+  "tests": 1971,
+  "focused_tests": 12,
+  "restored_tests": 1969
+}

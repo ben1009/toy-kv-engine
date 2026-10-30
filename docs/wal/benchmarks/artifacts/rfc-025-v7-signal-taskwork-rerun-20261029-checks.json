@@ -1,0 +1,89 @@
+{
+  "outside_sandbox": true,
+  "checks": [
+    {
+      "phase": "preflight spelling",
+      "command": [
+        "typos",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-signal-taskwork-rerun-20261029-analyze.py",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-signal-taskwork-rerun-20261029-baseline-sha256.tsv",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-signal-taskwork-rerun-20261029-binaries.json",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-signal-taskwork-rerun-20261029-candidate.patch",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-signal-taskwork-rerun-20261029-checks.json",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-signal-taskwork-rerun-20261029-child.py",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-signal-taskwork-rerun-20261029-matrix.json",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-signal-taskwork-rerun-20261029-plan.json",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-signal-taskwork-rerun-20261029-run-all.py",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-signal-taskwork-rerun-20261029-run.py",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-signal-taskwork-rerun-20261029-source-sha256.tsv"
+      ],
+      "exit_code": 0,
+      "log": "target/wal-opt/20261029-v7-signal-taskwork-rerun/preflight-spelling.log",
+      "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "phase": "final spelling",
+      "command": [
+        "typos",
+        "docs/wal/README.md",
+        "docs/wal/rfc-025-parallel-wal-embedded-frontiers-implementation-plan.md",
+        "docs/wal/benchmarks/rfc-025-v7-signal-taskwork-rerun-20261029.md",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-signal-taskwork-rerun-20261029-analyze.py",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-signal-taskwork-rerun-20261029-baseline-sha256.tsv",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-signal-taskwork-rerun-20261029-best-analyze.py",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-signal-taskwork-rerun-20261029-best-inputs.json",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-signal-taskwork-rerun-20261029-best-summary.json",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-signal-taskwork-rerun-20261029-binaries.json",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-signal-taskwork-rerun-20261029-candidate.patch",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-signal-taskwork-rerun-20261029-checks.json",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-signal-taskwork-rerun-20261029-child.py",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-signal-taskwork-rerun-20261029-decision.json",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-signal-taskwork-rerun-20261029-environment.json",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-signal-taskwork-rerun-20261029-ext4-batch1-host.jsonl",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-signal-taskwork-rerun-20261029-ext4-batch1-runs.tsv",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-signal-taskwork-rerun-20261029-ext4-batch1.jsonl",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-signal-taskwork-rerun-20261029-ext4-batch16-host.jsonl",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-signal-taskwork-rerun-20261029-ext4-batch16-runs.tsv",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-signal-taskwork-rerun-20261029-ext4-batch16.jsonl",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-signal-taskwork-rerun-20261029-ext4-batch8-host.jsonl",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-signal-taskwork-rerun-20261029-ext4-batch8-runs.tsv",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-signal-taskwork-rerun-20261029-ext4-batch8.jsonl",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-signal-taskwork-rerun-20261029-ext4-point1-host.jsonl",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-signal-taskwork-rerun-20261029-ext4-point1-runs.tsv",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-signal-taskwork-rerun-20261029-ext4-point1.jsonl",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-signal-taskwork-rerun-20261029-ext4-point16-host.jsonl",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-signal-taskwork-rerun-20261029-ext4-point16-runs.tsv",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-signal-taskwork-rerun-20261029-ext4-point16.jsonl",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-signal-taskwork-rerun-20261029-ext4-point8-confirm-host.jsonl",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-signal-taskwork-rerun-20261029-ext4-point8-confirm-runs.tsv",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-signal-taskwork-rerun-20261029-ext4-point8-confirm.jsonl",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-signal-taskwork-rerun-20261029-maintainer-assessment.json",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-signal-taskwork-rerun-20261029-matrix.json",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-signal-taskwork-rerun-20261029-plan.json",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-signal-taskwork-rerun-20261029-run-all.py",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-signal-taskwork-rerun-20261029-run.py",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-signal-taskwork-rerun-20261029-source-sha256.tsv",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-signal-taskwork-rerun-20261029-summary.json",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-signal-taskwork-rerun-20261029-unchanged.json",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-signal-taskwork-rerun-20261029-verify.py"
+      ],
+      "started_at_utc": "2026-10-29T02:11:25.118202+00:00",
+      "exit_code": 0,
+      "log": "target/wal-opt/20261029-v7-signal-taskwork-rerun/final-spelling.log",
+      "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    }
+  ],
+  "candidate_tests": 1975,
+  "focused_tests": 49,
+  "baseline_tests": 1973,
+  "correctness_reused": true,
+  "reused_validation": {
+    "path": "rfc-025-v7-signal-taskwork-retry-20261029-checks.json",
+    "sha256": "50636f95b291e10d19784834b3e18d0fb7d452483662e6bcd08745306c15c6b8"
+  },
+  "reused_release_build": {
+    "path": "rfc-025-v7-signal-taskwork-20261029-checks.json",
+    "sha256": "627e55fb0954b7c527764a1d3e1685579c3cc95d90c8625993f3de9ac1d7278d"
+  },
+  "source_changed": false
+}

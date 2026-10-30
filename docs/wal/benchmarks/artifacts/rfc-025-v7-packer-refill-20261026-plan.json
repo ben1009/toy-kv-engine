@@ -1,0 +1,28 @@
+{
+  "created_at_utc": "2026-10-26T09:05:20.855124+00:00",
+  "source_base": "225f671a04fafef49d2590358db6634f508d56bd",
+  "hypothesis": "Framing/hash time permits more admissions to arrive. One opportunistic post-materialization refill can amortize DATA worker submission, result and endpoint snapshot overhead without a timer, new wait, or larger eight-ticket group.",
+  "change": "v7 only: after framing initial ordered admissions, take one snapshot of already-queued admissions up to the remaining eight-ticket capacity, materialize outside admission, publish only the combined endpoint then submit. Preserve poison, close, FRONTIER gap and resource bounds. No repeated refill, sleep, or codec/durability change.",
+  "baseline": {
+    "path": "target/release/write-perf-v7-validated-logical-batch",
+    "sha256": "614f0cb1adde43cabe900eb032c6f884783d658c597471d9d9ddc8faff314aa9"
+  },
+  "cells": {
+    "ext4-point8": {
+      "operations": 100000,
+      "writers": 8,
+      "pairs": 5
+    },
+    "ext4-batch64": {
+      "operations": 750000,
+      "writers": 8,
+      "batch_size": 64,
+      "pairs": 5
+    }
+  },
+  "protocol": "Same audited four-arm protocol as buffered-isolated plan: four warmups; odd retained v4/candidate v4/retained v7/candidate v7, even reverse; 1KiB values;2GiB SST; sample every100 point or10 batch;30sec initial SSD cooldown,10sec between runs. Preserve all scores and stalled runs. No builds/tests/profiles during scoring; one-second host audit.",
+  "ssd_guards": "Both workloads raw/normalized/arm-median throughput >=0.95 and paired p99 <=1.10; at least one raw >=1.02 and normalized >=1.00.",
+  "conditional_ram": "If initial SSD guards pass: three four-arm pairs each of tmpfs batch64 750000puts/8writers,point8 100000,point1 100000. Raw/normalized/arm-median throughput >=0.95,CPU <=1.05,and solo p99 <=1.10.",
+  "confirmation": "If both phases pass: exactly five further SSD pairs per workload;pool only this candidate initial+confirmation,require SSD rules still pass. No extra attempts selected by score.",
+  "rejection": "Revert if fixed guards fail;retain exact patch,source manifest,binary identity,and all captures. Never pool buffering experiments or historical different-length cells."
+}

@@ -1,0 +1,9 @@
+{
+  "source_base": "dc3e3c1a8fce0f15700ff7c5d2ef2cb1c2875d4d",
+  "source_hashes": {
+    "kv-engine/src/wal/parallel/runtime.rs": "81986cd243505af166add3a9acc4bd1a003e41aec6edcb77da5bdffc0dc2e647",
+    "kv-engine/src/wal/parallel/worker.rs": "b26fedc3a3966a47d5ee05f9fa07241730f60b7ff00b51b454235c13b1cf2970"
+  },
+  "canonical_sha256": "f7fd96e5ca0ecaaaa23f59f135e7ce9430521f986834e5c95f2d32070e378d54",
+  "scope": "Historical restoration before the separately frozen compact-metadata/wait-budget prototype."
+}

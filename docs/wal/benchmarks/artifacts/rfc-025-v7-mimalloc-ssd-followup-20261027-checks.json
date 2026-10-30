@@ -1,0 +1,139 @@
+{
+  "source_base": "e16e433a90a826d4f51fd8e29e5ec14f8f1ae0fc",
+  "outside_sandbox": true,
+  "checks": [
+    {
+      "command": [
+        "cargo",
+        "make",
+        "check"
+      ],
+      "phase": "mimalloc all-features full check",
+      "exit_code": 0,
+      "log": "target/wal-opt/20261027-v7-mimalloc-ssd-followup/mi-check.log",
+      "log_sha256": "215cf06b1758316fceb693e883eb47d3c83de9554a9928a257c15e3cf6d33882"
+    },
+    {
+      "command": [
+        "cargo",
+        "nextest",
+        "run",
+        "--offline",
+        "--locked",
+        "--workspace",
+        "--lib",
+        "--bins",
+        "--tests",
+        "--features",
+        "bench,chaos-testing,compaction-setsum,hotpath-profile",
+        "--retries",
+        "0"
+      ],
+      "phase": "System normal test targets",
+      "exit_code": 0,
+      "log": "target/wal-opt/20261027-v7-mimalloc-ssd-followup/system-tests.log",
+      "log_sha256": "2a33e30e59e2f84855c9f71824f70929bc759ec56053108928398544658e2f43"
+    },
+    {
+      "command": [
+        "cargo",
+        "nextest",
+        "run",
+        "--offline",
+        "--locked",
+        "--workspace",
+        "--lib",
+        "--features",
+        "mimalloc-allocator",
+        "--retries",
+        "0",
+        "--success-output",
+        "immediate",
+        "-E",
+        "test(aligned_buffers_preserve_contents_and_cross_thread_ownership)"
+      ],
+      "phase": "mimalloc actual aligned ownership test",
+      "exit_code": 0,
+      "log": "target/wal-opt/20261027-v7-mimalloc-ssd-followup/mi-alignment-test.log",
+      "log_sha256": "a8317441dcb31de573df9e6eddbe74490a401d42003aae5b42a522dca4e2ec6b"
+    },
+    {
+      "command": [
+        "typos"
+      ],
+      "phase": "pre-score spelling",
+      "exit_code": 0,
+      "log": "target/wal-opt/20261027-v7-mimalloc-ssd-followup/typos.log",
+      "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "command": [
+        "cargo",
+        "build",
+        "--offline",
+        "--locked",
+        "--release",
+        "--package",
+        "kv-engine",
+        "--bin",
+        "write-perf",
+        "--features",
+        "bench"
+      ],
+      "phase": "System release",
+      "exit_code": 0,
+      "log": "target/wal-opt/20261027-v7-mimalloc-ssd-followup/system-build.log",
+      "log_sha256": "b1b76bab65ee97b3c485fe106cd8c2f60c75922379474dfb2f8b6f4136f6dcea"
+    },
+    {
+      "command": [
+        "cargo",
+        "build",
+        "--offline",
+        "--locked",
+        "--release",
+        "--package",
+        "kv-engine",
+        "--bin",
+        "write-perf",
+        "--features",
+        "bench,mimalloc-allocator"
+      ],
+      "phase": "mimalloc release",
+      "exit_code": 0,
+      "log": "target/wal-opt/20261027-v7-mimalloc-ssd-followup/mi-build.log",
+      "log_sha256": "26b12aac5324043a54e5734ea82339de1f0234fd4097a42e5fbdddf365786ff0"
+    },
+    {
+      "command": [
+        "cargo",
+        "make",
+        "check"
+      ],
+      "phase": "restored System full check",
+      "exit_code": 0,
+      "log": "target/wal-opt/20261027-v7-mimalloc-ssd-followup/restored-check.log",
+      "log_sha256": "1257de4d7b58bda2ae1667336b5c863c44da504653c6305d4953801eb7e7c2f9"
+    },
+    {
+      "command": [
+        "typos"
+      ],
+      "phase": "final documentation and evidence spelling",
+      "exit_code": 0,
+      "log": "target/wal-opt/20261027-v7-mimalloc-ssd-followup/final-typos.log",
+      "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    }
+  ],
+  "mimalloc_test_count": 1970,
+  "system_test_count": 1970,
+  "focused_test_count": 1,
+  "skips": 0,
+  "retries": 0,
+  "validation_correction": {
+    "log": "target/wal-opt/20261027-v7-mimalloc-ssd-followup/system-all-targets-timeouts.log",
+    "log_sha256": "a3f4057df52d59eeab0e352f8ef16b5c850e592730a30ff66e4c4ec5e0426cee",
+    "reason": "Initial System command included Criterion benchmarks under all-targets;27 benchmark targets timed out. Corrected to project normal lib/bins/tests targets. No source change required; full System test target run passes."
+  },
+  "restored_test_count": 1969
+}

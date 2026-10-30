@@ -1,0 +1,10 @@
+{
+  "retained-v7": {
+    "path": "target/release/write-perf-v7-large-data-async-dispatch",
+    "sha256": "f353022d846530a6754330aaea11f295319ea8f4de20afa09b6d2a3b57b021d8"
+  },
+  "candidate-v7": {
+    "path": "target/release/write-perf-v7-frame-source-crc",
+    "sha256": "ea86ec239062a7c17bec6c262dd1ff4b0628d01cdef4965eaa7a5a20d4ef297d"
+  }
+}

@@ -1,0 +1,103 @@
+{
+  "created_at_utc": "2026-10-29T06:27:47.666271+00:00",
+  "ssd_initial_cooldown_seconds": 60,
+  "ssd_between_seconds": 15,
+  "cells": {
+    "ext4-batch1": {
+      "kind": "ssd",
+      "bench": "wal_batch_concurrent",
+      "writers": 1,
+      "operations": 750000,
+      "reads": 500000,
+      "scan_num": 100000,
+      "batch": 64,
+      "sample_every": 10,
+      "arms": [
+        "v4",
+        "retained-v7",
+        "candidate-v7"
+      ],
+      "pairs": 3
+    },
+    "ext4-batch8": {
+      "kind": "ssd",
+      "bench": "wal_batch_concurrent",
+      "writers": 8,
+      "operations": 750000,
+      "reads": 500000,
+      "scan_num": 100000,
+      "batch": 64,
+      "sample_every": 10,
+      "arms": [
+        "v4",
+        "retained-v7",
+        "candidate-v7"
+      ],
+      "pairs": 3
+    },
+    "ext4-batch16": {
+      "kind": "ssd",
+      "bench": "wal_batch_concurrent",
+      "writers": 16,
+      "operations": 750000,
+      "reads": 500000,
+      "scan_num": 100000,
+      "batch": 64,
+      "sample_every": 10,
+      "arms": [
+        "v4",
+        "retained-v7",
+        "candidate-v7"
+      ],
+      "pairs": 3
+    },
+    "ext4-point1": {
+      "kind": "ssd",
+      "bench": "wal_concurrent",
+      "writers": 1,
+      "operations": 20000,
+      "reads": 500000,
+      "scan_num": 100000,
+      "batch": null,
+      "sample_every": 10,
+      "arms": [
+        "v4",
+        "retained-v7",
+        "candidate-v7"
+      ],
+      "pairs": 3
+    },
+    "ext4-point8": {
+      "kind": "ssd",
+      "bench": "wal_concurrent",
+      "writers": 8,
+      "operations": 20000,
+      "reads": 500000,
+      "scan_num": 100000,
+      "batch": null,
+      "sample_every": 10,
+      "arms": [
+        "v4",
+        "retained-v7",
+        "candidate-v7"
+      ],
+      "pairs": 3
+    },
+    "ext4-point16": {
+      "kind": "ssd",
+      "bench": "wal_concurrent",
+      "writers": 16,
+      "operations": 20000,
+      "reads": 500000,
+      "scan_num": 100000,
+      "batch": null,
+      "sample_every": 10,
+      "arms": [
+        "v4",
+        "retained-v7",
+        "candidate-v7"
+      ],
+      "pairs": 3
+    }
+  }
+}

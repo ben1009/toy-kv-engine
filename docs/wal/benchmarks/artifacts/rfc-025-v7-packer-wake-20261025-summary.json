@@ -1,0 +1,255 @@
+{
+  "tmpfs": {
+    "binary_sha256": [
+      "160fd69137403428444c55f260a370ea95380f9fb0187002e6812d14e7fb9509",
+      "9a9a108ae23a3928ad88e42664ecc79c85a8e2d3f8ed5f81ef6aeb3b034e469e"
+    ],
+    "artifact_sha256": {
+      "-run.sh": "abce31d804ae5f98af5ae114aaccc7078abb923ed6e2ada76ee000fc35b29b16",
+      "-runs.tsv": "6051229a8b2de8372838d2b06f646a79f271ca4d040e42868a1087aad6e3f402",
+      ".jsonl": "341199008eb43aab0516b432bfa6f41c2c8928ab4401b2d85d66cc42326c64b6"
+    },
+    "pairs": [
+      {
+        "writers": 8,
+        "pair": 1,
+        "v7_throughput_change": 0.9618330497663226,
+        "normalized_v7_v4_change": 0.9403433051506105,
+        "v7_p50_change": 1.0414594400118515,
+        "v7_p99_change": 0.9081571080263174,
+        "v7_cpu_change": 0.9551679373830897
+      },
+      {
+        "writers": 8,
+        "pair": 2,
+        "v7_throughput_change": 0.5584906064455321,
+        "normalized_v7_v4_change": 0.6086618218679655,
+        "v7_p50_change": 2.258914289185413,
+        "v7_p99_change": 1.3603786864338463,
+        "v7_cpu_change": 1.677607152998391
+      },
+      {
+        "writers": 8,
+        "pair": 3,
+        "v7_throughput_change": 0.8070087461710546,
+        "normalized_v7_v4_change": 0.7692396439382058,
+        "v7_p50_change": 1.0520681080465444,
+        "v7_p99_change": 1.1670586198795703,
+        "v7_cpu_change": 1.1553123947238852
+      },
+      {
+        "writers": 8,
+        "pair": 4,
+        "v7_throughput_change": 0.7423579511383303,
+        "normalized_v7_v4_change": 0.7987194742320861,
+        "v7_p50_change": 1.5716700201207243,
+        "v7_p99_change": 0.9054642178467031,
+        "v7_cpu_change": 1.3121791673744987
+      },
+      {
+        "writers": 8,
+        "pair": 5,
+        "v7_throughput_change": 0.776028649894947,
+        "normalized_v7_v4_change": 0.8116859243715759,
+        "v7_p50_change": 1.3629187287823632,
+        "v7_p99_change": 0.7112205744713379,
+        "v7_cpu_change": 1.2133694714022194
+      }
+    ],
+    "median_puts_per_sec": {
+      "new_v4": 195694.34936362682,
+      "new_v7": 90065.23370838359,
+      "old_v4": 207011.79247644125,
+      "old_v7": 116059.1606000319
+    },
+    "median_changes": {
+      "v7_throughput_change": 0.776028649894947,
+      "normalized_v7_v4_change": 0.7987194742320861,
+      "v7_p50_change": 1.3629187287823632,
+      "v7_p99_change": 0.9081571080263174,
+      "v7_cpu_change": 1.2133694714022194
+    },
+    "best_runs": {
+      "old_v4": {
+        "puts_per_sec": 210551.9144696013,
+        "run_id": "1792914393253",
+        "p50_ms": 0.026454,
+        "p99_ms": 0.868125,
+        "cpu_ms": 1314.445,
+        "pipeline": {
+          "commit_groups": 44657,
+          "commit_solo_groups": 40329,
+          "commit_buffers": 50000,
+          "commit_bytes": 204800000,
+          "cqe_count": 50000,
+          "inflight_groups_max": 8,
+          "outstanding_write_sqes_max": 8,
+          "sync_count": 23516,
+          "worker_eventfd_notifications": 44657,
+          "worker_eventfd_writes": 7249,
+          "preallocation_ns": 34967791,
+          "fdatasync_ns": 5828242,
+          "wal_sync_wait_ns": 1262030025,
+          "frontier_writes": 0,
+          "frontier_bytes": 0,
+          "frontier_write_ns": 0,
+          "sync_coalesce_wait_calls": 0,
+          "sync_coalesce_wait_ns": 0,
+          "memtable_insert_ns": 118772469,
+          "wal_file_length_bytes": 205520896,
+          "wal_allocated_bytes": 205520896
+        }
+      },
+      "new_v4": {
+        "puts_per_sec": 203772.62934275082,
+        "run_id": "1792914343580",
+        "p50_ms": 0.028353,
+        "p99_ms": 0.711151,
+        "cpu_ms": 1297.3609999999999,
+        "pipeline": {
+          "commit_groups": 46303,
+          "commit_solo_groups": 43444,
+          "commit_buffers": 50000,
+          "commit_bytes": 204800000,
+          "cqe_count": 50000,
+          "inflight_groups_max": 8,
+          "outstanding_write_sqes_max": 8,
+          "sync_count": 30546,
+          "worker_eventfd_notifications": 46303,
+          "worker_eventfd_writes": 16250,
+          "preallocation_ns": 34452846,
+          "fdatasync_ns": 6307920,
+          "wal_sync_wait_ns": 1137471836,
+          "frontier_writes": 0,
+          "frontier_bytes": 0,
+          "frontier_write_ns": 0,
+          "sync_coalesce_wait_calls": 0,
+          "sync_coalesce_wait_ns": 0,
+          "memtable_insert_ns": 121999343,
+          "wal_file_length_bytes": 205520896,
+          "wal_allocated_bytes": 205520896
+        }
+      },
+      "old_v7": {
+        "puts_per_sec": 122942.4889076922,
+        "run_id": "1792914347050",
+        "p50_ms": 0.047251,
+        "p99_ms": 1.305904,
+        "cpu_ms": 1415.081,
+        "pipeline": {
+          "commit_groups": 35058,
+          "commit_solo_groups": 22864,
+          "commit_buffers": 50000,
+          "commit_bytes": 204800000,
+          "cqe_count": 50000,
+          "inflight_groups_max": 8,
+          "outstanding_write_sqes_max": 8,
+          "sync_count": 6459,
+          "worker_eventfd_notifications": 35058,
+          "worker_eventfd_writes": 7017,
+          "preallocation_ns": 39555514,
+          "fdatasync_ns": 1070494,
+          "wal_sync_wait_ns": 2689301981,
+          "frontier_writes": 6459,
+          "frontier_bytes": 26456064,
+          "frontier_write_ns": 4918842,
+          "sync_coalesce_wait_calls": 24736,
+          "sync_coalesce_wait_ns": 103522906,
+          "memtable_insert_ns": 89585030,
+          "wal_file_length_bytes": 231747584,
+          "wal_allocated_bytes": 231747584
+        }
+      },
+      "new_v7": {
+        "puts_per_sec": 118250.14905194787,
+        "run_id": "1792914350549",
+        "p50_ms": 0.04921,
+        "p99_ms": 1.185966,
+        "cpu_ms": 1351.6399999999999,
+        "pipeline": {
+          "commit_groups": 31555,
+          "commit_solo_groups": 16848,
+          "commit_buffers": 50000,
+          "commit_bytes": 204800000,
+          "cqe_count": 50000,
+          "inflight_groups_max": 8,
+          "outstanding_write_sqes_max": 8,
+          "sync_count": 6472,
+          "worker_eventfd_notifications": 31555,
+          "worker_eventfd_writes": 6751,
+          "preallocation_ns": 45501741,
+          "fdatasync_ns": 1018721,
+          "wal_sync_wait_ns": 2835580794,
+          "frontier_writes": 6472,
+          "frontier_bytes": 26509312,
+          "frontier_write_ns": 4761588,
+          "sync_coalesce_wait_calls": 21579,
+          "sync_coalesce_wait_ns": 107897608,
+          "memtable_insert_ns": 85402363,
+          "wal_file_length_bytes": 231747584,
+          "wal_allocated_bytes": 231747584
+        }
+      }
+    },
+    "candidate_paired_v7_v4_ratio": 0.45506386822937545
+  },
+  "reference_peaks": {
+    "v7_ext4_point": [
+      15277.788191287964,
+      {
+        "binary_sha256": [
+          "06efc8d7dc473ddfd770832c9075c6cfffdc9ab05df13460481d4f2302f2625b",
+          "9a9a108ae23a3928ad88e42664ecc79c85a8e2d3f8ed5f81ef6aeb3b034e469e"
+        ],
+        "artifact_sha256": {
+          "-run.sh": "9aa3bbf5d8b840d431b01dbe4e358ac8ca617f06ad909e81fad0a199bef38584",
+          "-runs.tsv": "1960e0875e3a61780cc911ed2f43c36ea37f1595b59dc73c5eaae3227a373336",
+          ".jsonl": "35bcfd2ec3c07a25a7a6335bce056423bf1f5e75714d975bdf2ea408653bd28b"
+        }
+      }
+    ],
+    "v4_ext4_point": [
+      20420.174086648054,
+      {
+        "binary_sha256": [
+          "06efc8d7dc473ddfd770832c9075c6cfffdc9ab05df13460481d4f2302f2625b",
+          "b5078356212a72389b2920cd55f9dbfcbc6f69c52b10e2b09cd0db857ec1ef0b"
+        ],
+        "artifact_sha256": {
+          "-run.sh": "9276fc6407b0d6c14a766e03f92d22fb484fac43706f4e44d7d9221bc52735b5",
+          "-runs.tsv": "a954166987bfec6a1f96ea21b0bfae628d7ddb3ff80dc375ff7940cfab970c12",
+          ".jsonl": "b3d138df5f3bfba32a452a9561656b89774e5e24643c7eb2cf599e8863222727"
+        }
+      }
+    ],
+    "v7_ext4_batch64": [
+      341049.12296609004,
+      {
+        "binary_sha256": [
+          "06efc8d7dc473ddfd770832c9075c6cfffdc9ab05df13460481d4f2302f2625b",
+          "9a9a108ae23a3928ad88e42664ecc79c85a8e2d3f8ed5f81ef6aeb3b034e469e"
+        ],
+        "artifact_sha256": {
+          "-run.sh": "26138dff9dd5e84be6e60cfa6dff808eb3e5e4abe409b7ded0b6efe8ff3ca219",
+          "-runs.tsv": "b8ae64f8e84d2f6d85bdc0646b5ff3c11af3e5700e70e71719b0c3ace98cfd3f",
+          ".jsonl": "2ab9b55354bcdd0a213166978115bb3df1bdfdb1c5547583011d9e3ccab61cfb"
+        }
+      }
+    ],
+    "v4_ext4_batch64": [
+      482410.28852245386,
+      {
+        "binary_sha256": [
+          "06efc8d7dc473ddfd770832c9075c6cfffdc9ab05df13460481d4f2302f2625b",
+          "b5078356212a72389b2920cd55f9dbfcbc6f69c52b10e2b09cd0db857ec1ef0b"
+        ],
+        "artifact_sha256": {
+          "-run.sh": "8993aa67ad0c3afde34cfdf64b9991b8cd1f516d1be059bc3be0ed34fd192512",
+          "-runs.tsv": "8fb4c35d81a46b53e26ac0ecb2113ae4b3155e4503501349a8bb28f6288e2269",
+          ".jsonl": "99ad16f9dcd698f80481220e2d4dec85480a866fa1963304ab11076d1d223b35"
+        }
+      }
+    ]
+  },
+  "analysis_sha256": "be730f43471285eb29031a1fdcba331d9dee46574098a486e5875b9d5125fc2c"
+}

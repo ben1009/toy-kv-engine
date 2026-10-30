@@ -1,0 +1,386 @@
+{
+  "mimalloc": {
+    "tmpfs-point8": {
+      "old_v4": {
+        "puts_per_sec": 252388.7159660221,
+        "run_id": "1793015338727",
+        "binary_sha256": "614f0cb1adde43cabe900eb032c6f884783d658c597471d9d9ddc8faff314aa9",
+        "raw_record_sha256": "83f35fc75bd3e0ffc12806b5b7b840550d6def8dd44206e81b726ab5354d0316",
+        "raw": "rfc-025-v7-mimalloc-initial-tmpfs-point8-20261026.jsonl",
+        "manifest": "rfc-025-v7-mimalloc-initial-tmpfs-point8-20261026-runs.tsv",
+        "host_audit": "rfc-025-v7-mimalloc-initial-tmpfs-point8-20261026-host.jsonl"
+      },
+      "new_v4": {
+        "puts_per_sec": 236137.4366636595,
+        "run_id": "1793015334984",
+        "binary_sha256": "9b0417a150a3cd5caf99b6ca83572f5bd0a7fa363b44b855872ca16e340c5350",
+        "raw_record_sha256": "c7b19017025c4686f54e70187e6298a7d7d233cbd2e6e6a501b8e554d402ed95",
+        "raw": "rfc-025-v7-mimalloc-initial-tmpfs-point8-20261026.jsonl",
+        "manifest": "rfc-025-v7-mimalloc-initial-tmpfs-point8-20261026-runs.tsv",
+        "host_audit": "rfc-025-v7-mimalloc-initial-tmpfs-point8-20261026-host.jsonl"
+      },
+      "old_v7": {
+        "puts_per_sec": 143330.14215460568,
+        "run_id": "1793015331170",
+        "binary_sha256": "614f0cb1adde43cabe900eb032c6f884783d658c597471d9d9ddc8faff314aa9",
+        "raw_record_sha256": "2b2968dd467cf0f5c1117db212491645970ca6a88fbab7b230d318e752b48d55",
+        "raw": "rfc-025-v7-mimalloc-initial-tmpfs-point8-20261026.jsonl",
+        "manifest": "rfc-025-v7-mimalloc-initial-tmpfs-point8-20261026-runs.tsv",
+        "host_audit": "rfc-025-v7-mimalloc-initial-tmpfs-point8-20261026-host.jsonl"
+      },
+      "new_v7": {
+        "puts_per_sec": 151750.4256049343,
+        "run_id": "1793015323602",
+        "binary_sha256": "9b0417a150a3cd5caf99b6ca83572f5bd0a7fa363b44b855872ca16e340c5350",
+        "raw_record_sha256": "77a7b36a16f6b8698abf2c6792b1d7a0b1e3c77d2b06855211112bf0e3177022",
+        "raw": "rfc-025-v7-mimalloc-initial-tmpfs-point8-20261026.jsonl",
+        "manifest": "rfc-025-v7-mimalloc-initial-tmpfs-point8-20261026-runs.tsv",
+        "host_audit": "rfc-025-v7-mimalloc-initial-tmpfs-point8-20261026-host.jsonl"
+      }
+    },
+    "tmpfs-batch64": {
+      "old_v4": {
+        "puts_per_sec": 1749685.83399362,
+        "run_id": "1793015409365",
+        "binary_sha256": "614f0cb1adde43cabe900eb032c6f884783d658c597471d9d9ddc8faff314aa9",
+        "raw_record_sha256": "a79372675b3896437911643540af228ce5fd0a447eba8e5a829de592fd6262da",
+        "raw": "rfc-025-v7-mimalloc-initial-tmpfs-batch64-20261026.jsonl",
+        "manifest": "rfc-025-v7-mimalloc-initial-tmpfs-batch64-20261026-runs.tsv",
+        "host_audit": "rfc-025-v7-mimalloc-initial-tmpfs-batch64-20261026-host.jsonl"
+      },
+      "new_v4": {
+        "puts_per_sec": 1769455.6091457338,
+        "run_id": "1793015382340",
+        "binary_sha256": "9b0417a150a3cd5caf99b6ca83572f5bd0a7fa363b44b855872ca16e340c5350",
+        "raw_record_sha256": "655114e0ea7553fc8437d713564bd3b56c4edbc6520f59cd11ee809576a406f1",
+        "raw": "rfc-025-v7-mimalloc-initial-tmpfs-batch64-20261026.jsonl",
+        "manifest": "rfc-025-v7-mimalloc-initial-tmpfs-batch64-20261026-runs.tsv",
+        "host_audit": "rfc-025-v7-mimalloc-initial-tmpfs-batch64-20261026-host.jsonl"
+      },
+      "old_v7": {
+        "puts_per_sec": 812163.7263163312,
+        "run_id": "1793015399835",
+        "binary_sha256": "614f0cb1adde43cabe900eb032c6f884783d658c597471d9d9ddc8faff314aa9",
+        "raw_record_sha256": "2b096c53719e552fe6592f2da7cdf7be56e5d6db2cdaa63d32f5b6745bc6de66",
+        "raw": "rfc-025-v7-mimalloc-initial-tmpfs-batch64-20261026.jsonl",
+        "manifest": "rfc-025-v7-mimalloc-initial-tmpfs-batch64-20261026-runs.tsv",
+        "host_audit": "rfc-025-v7-mimalloc-initial-tmpfs-batch64-20261026-host.jsonl"
+      },
+      "new_v7": {
+        "puts_per_sec": 955953.0789422803,
+        "run_id": "1793015429809",
+        "binary_sha256": "9b0417a150a3cd5caf99b6ca83572f5bd0a7fa363b44b855872ca16e340c5350",
+        "raw_record_sha256": "d3228736baaaa9fe283a6608b0a15643792d59b6ee166516ebb33ecdb1811815",
+        "raw": "rfc-025-v7-mimalloc-initial-tmpfs-batch64-20261026.jsonl",
+        "manifest": "rfc-025-v7-mimalloc-initial-tmpfs-batch64-20261026-runs.tsv",
+        "host_audit": "rfc-025-v7-mimalloc-initial-tmpfs-batch64-20261026-host.jsonl"
+      }
+    },
+    "tmpfs-point1": {
+      "old_v4": {
+        "puts_per_sec": 71218.97540832423,
+        "run_id": "1793015489798",
+        "binary_sha256": "614f0cb1adde43cabe900eb032c6f884783d658c597471d9d9ddc8faff314aa9",
+        "raw_record_sha256": "47f3aa80ba01de461309003c4202b76a6615c5d47ff623348f322d6246931c8a",
+        "raw": "rfc-025-v7-mimalloc-initial-tmpfs-point1-20261026.jsonl",
+        "manifest": "rfc-025-v7-mimalloc-initial-tmpfs-point1-20261026-runs.tsv",
+        "host_audit": "rfc-025-v7-mimalloc-initial-tmpfs-point1-20261026-host.jsonl"
+      },
+      "new_v4": {
+        "puts_per_sec": 74515.22562600786,
+        "run_id": "1793015459025",
+        "binary_sha256": "9b0417a150a3cd5caf99b6ca83572f5bd0a7fa363b44b855872ca16e340c5350",
+        "raw_record_sha256": "0b70dc3d9bf3dfedf442717b3e4676969849327eefcd017d1465712ade679725",
+        "raw": "rfc-025-v7-mimalloc-initial-tmpfs-point1-20261026.jsonl",
+        "manifest": "rfc-025-v7-mimalloc-initial-tmpfs-point1-20261026-runs.tsv",
+        "host_audit": "rfc-025-v7-mimalloc-initial-tmpfs-point1-20261026-host.jsonl"
+      },
+      "old_v7": {
+        "puts_per_sec": 48411.94272801529,
+        "run_id": "1793015504217",
+        "binary_sha256": "614f0cb1adde43cabe900eb032c6f884783d658c597471d9d9ddc8faff314aa9",
+        "raw_record_sha256": "690fd929285a15aa8fda19d8837d7b0ebf61a5b92a31d46a6309fc39d546b3b1",
+        "raw": "rfc-025-v7-mimalloc-initial-tmpfs-point1-20261026.jsonl",
+        "manifest": "rfc-025-v7-mimalloc-initial-tmpfs-point1-20261026-runs.tsv",
+        "host_audit": "rfc-025-v7-mimalloc-initial-tmpfs-point1-20261026-host.jsonl"
+      },
+      "new_v7": {
+        "puts_per_sec": 48617.24284269774,
+        "run_id": "1793015509418",
+        "binary_sha256": "9b0417a150a3cd5caf99b6ca83572f5bd0a7fa363b44b855872ca16e340c5350",
+        "raw_record_sha256": "fdb6b57ad233db33290d55fb9d66147453d9b1be7a2281df6c1ac71a8bcae909",
+        "raw": "rfc-025-v7-mimalloc-initial-tmpfs-point1-20261026.jsonl",
+        "manifest": "rfc-025-v7-mimalloc-initial-tmpfs-point1-20261026-runs.tsv",
+        "host_audit": "rfc-025-v7-mimalloc-initial-tmpfs-point1-20261026-host.jsonl"
+      }
+    },
+    "ext4-point8": {
+      "old_v4": {
+        "puts_per_sec": 8991.404251792537,
+        "run_id": "1793015609820",
+        "binary_sha256": "614f0cb1adde43cabe900eb032c6f884783d658c597471d9d9ddc8faff314aa9",
+        "raw_record_sha256": "050597e92b8bf2b3a88a03bb06a665ea803417f4306f8bdc1994ab987cdc2c0e",
+        "raw": "rfc-025-v7-mimalloc-initial-ext4-point8-20261026.jsonl",
+        "manifest": "rfc-025-v7-mimalloc-initial-ext4-point8-20261026-runs.tsv",
+        "host_audit": "rfc-025-v7-mimalloc-initial-ext4-point8-20261026-host.jsonl"
+      },
+      "new_v4": {
+        "puts_per_sec": 17883.82949073385,
+        "run_id": "1793015949243",
+        "binary_sha256": "9b0417a150a3cd5caf99b6ca83572f5bd0a7fa363b44b855872ca16e340c5350",
+        "raw_record_sha256": "1cf1e98264a97dea5ea6db34dacce3e789b6243951130d1704d71174cbce958c",
+        "raw": "rfc-025-v7-mimalloc-initial-ext4-point8-20261026.jsonl",
+        "manifest": "rfc-025-v7-mimalloc-initial-ext4-point8-20261026-runs.tsv",
+        "host_audit": "rfc-025-v7-mimalloc-initial-ext4-point8-20261026-host.jsonl"
+      },
+      "old_v7": {
+        "puts_per_sec": 15940.361024016927,
+        "run_id": "1793015932838",
+        "binary_sha256": "614f0cb1adde43cabe900eb032c6f884783d658c597471d9d9ddc8faff314aa9",
+        "raw_record_sha256": "1ca0f3ebc9b5c318d3e59a6ed3cbd41e20c7cbc8c16bc273fe96ea15f425e59b",
+        "raw": "rfc-025-v7-mimalloc-initial-ext4-point8-20261026.jsonl",
+        "manifest": "rfc-025-v7-mimalloc-initial-ext4-point8-20261026-runs.tsv",
+        "host_audit": "rfc-025-v7-mimalloc-initial-ext4-point8-20261026-host.jsonl"
+      },
+      "new_v7": {
+        "puts_per_sec": 16199.571476137651,
+        "run_id": "1793016067498",
+        "binary_sha256": "9b0417a150a3cd5caf99b6ca83572f5bd0a7fa363b44b855872ca16e340c5350",
+        "raw_record_sha256": "ecc151937a704dac9025db8c90023a2928cc53d79ebcf116960c4ec63a4ea7c3",
+        "raw": "rfc-025-v7-mimalloc-initial-ext4-point8-20261026.jsonl",
+        "manifest": "rfc-025-v7-mimalloc-initial-ext4-point8-20261026-runs.tsv",
+        "host_audit": "rfc-025-v7-mimalloc-initial-ext4-point8-20261026-host.jsonl"
+      }
+    },
+    "ext4-batch64": {
+      "old_v4": {
+        "puts_per_sec": 387379.7015321421,
+        "run_id": "1793016167030",
+        "binary_sha256": "614f0cb1adde43cabe900eb032c6f884783d658c597471d9d9ddc8faff314aa9",
+        "raw_record_sha256": "2978e3bd014c60ad57fb4bbe77903ea9e83ab2f60bdcc230e72883fb95ebc168",
+        "raw": "rfc-025-v7-mimalloc-initial-ext4-batch64-20261026.jsonl",
+        "manifest": "rfc-025-v7-mimalloc-initial-ext4-batch64-20261026-runs.tsv",
+        "host_audit": "rfc-025-v7-mimalloc-initial-ext4-batch64-20261026-host.jsonl"
+      },
+      "new_v4": {
+        "puts_per_sec": 413154.8477067933,
+        "run_id": "1793016181450",
+        "binary_sha256": "9b0417a150a3cd5caf99b6ca83572f5bd0a7fa363b44b855872ca16e340c5350",
+        "raw_record_sha256": "3c7da0fd41434b03874214c2d5a3e75018ef3945a24179edacd2c9f35f1265bc",
+        "raw": "rfc-025-v7-mimalloc-initial-ext4-batch64-20261026.jsonl",
+        "manifest": "rfc-025-v7-mimalloc-initial-ext4-batch64-20261026-runs.tsv",
+        "host_audit": "rfc-025-v7-mimalloc-initial-ext4-batch64-20261026-host.jsonl"
+      },
+      "old_v7": {
+        "puts_per_sec": 378176.48296884354,
+        "run_id": "1793016433826",
+        "binary_sha256": "614f0cb1adde43cabe900eb032c6f884783d658c597471d9d9ddc8faff314aa9",
+        "raw_record_sha256": "5cab6d1a7b1f1289decff4b3276f1ebd5eff77a095b00e40fbbd0b8f9179e6f8",
+        "raw": "rfc-025-v7-mimalloc-initial-ext4-batch64-20261026.jsonl",
+        "manifest": "rfc-025-v7-mimalloc-initial-ext4-batch64-20261026-runs.tsv",
+        "host_audit": "rfc-025-v7-mimalloc-initial-ext4-batch64-20261026-host.jsonl"
+      },
+      "new_v7": {
+        "puts_per_sec": 376099.17975271214,
+        "run_id": "1793016207765",
+        "binary_sha256": "9b0417a150a3cd5caf99b6ca83572f5bd0a7fa363b44b855872ca16e340c5350",
+        "raw_record_sha256": "64a4d02fe3400ea6b0f52b2184d3e3b5dda42bda01568135bd0e6f1975bdd7d6",
+        "raw": "rfc-025-v7-mimalloc-initial-ext4-batch64-20261026.jsonl",
+        "manifest": "rfc-025-v7-mimalloc-initial-ext4-batch64-20261026-runs.tsv",
+        "host_audit": "rfc-025-v7-mimalloc-initial-ext4-batch64-20261026-host.jsonl"
+      }
+    }
+  },
+  "mimalloc-aligned": {
+    "tmpfs-point8": {
+      "old_v4": {
+        "puts_per_sec": 231581.96983002897,
+        "run_id": "1793016720318",
+        "binary_sha256": "4ad32b442d83e24b6fe7ea3bb2e986f03597fe7fcc4f9353cbaeb8ee561d9b52",
+        "raw_record_sha256": "0adb6b611494286fc02ce7935c5b66e00d43ccde6ec8f94069a158d3992a9e21",
+        "raw": "rfc-025-v7-mimalloc-aligned-initial-tmpfs-point8-20261026.jsonl",
+        "manifest": "rfc-025-v7-mimalloc-aligned-initial-tmpfs-point8-20261026-runs.tsv",
+        "host_audit": "rfc-025-v7-mimalloc-aligned-initial-tmpfs-point8-20261026-host.jsonl"
+      },
+      "new_v4": {
+        "puts_per_sec": 237286.65782017712,
+        "run_id": "1793016693575",
+        "binary_sha256": "ad9ae949fc93b56abd5024715e0505d66be4c81c986fba7a1dbaee36705b2c51",
+        "raw_record_sha256": "614554918de82ff3fa9bcad97ebc46ad348468a2da96313f0b437d49bd37280f",
+        "raw": "rfc-025-v7-mimalloc-aligned-initial-tmpfs-point8-20261026.jsonl",
+        "manifest": "rfc-025-v7-mimalloc-aligned-initial-tmpfs-point8-20261026-runs.tsv",
+        "host_audit": "rfc-025-v7-mimalloc-aligned-initial-tmpfs-point8-20261026-host.jsonl"
+      },
+      "old_v7": {
+        "puts_per_sec": 127546.01536586386,
+        "run_id": "1793016708839",
+        "binary_sha256": "4ad32b442d83e24b6fe7ea3bb2e986f03597fe7fcc4f9353cbaeb8ee561d9b52",
+        "raw_record_sha256": "2612ac66ea11fa32ff2f80cc601f8ef5ed4a9e6d0164cbcaca273b1593ca9da4",
+        "raw": "rfc-025-v7-mimalloc-aligned-initial-tmpfs-point8-20261026.jsonl",
+        "manifest": "rfc-025-v7-mimalloc-aligned-initial-tmpfs-point8-20261026-runs.tsv",
+        "host_audit": "rfc-025-v7-mimalloc-aligned-initial-tmpfs-point8-20261026-host.jsonl"
+      },
+      "new_v7": {
+        "puts_per_sec": 146740.91903910963,
+        "run_id": "1793016705066",
+        "binary_sha256": "ad9ae949fc93b56abd5024715e0505d66be4c81c986fba7a1dbaee36705b2c51",
+        "raw_record_sha256": "d67f94bdea6b119ee1e4a4654c431550ff906247dc8d2dede1de62c34ee18461",
+        "raw": "rfc-025-v7-mimalloc-aligned-initial-tmpfs-point8-20261026.jsonl",
+        "manifest": "rfc-025-v7-mimalloc-aligned-initial-tmpfs-point8-20261026-runs.tsv",
+        "host_audit": "rfc-025-v7-mimalloc-aligned-initial-tmpfs-point8-20261026-host.jsonl"
+      }
+    },
+    "tmpfs-batch64": {
+      "old_v4": {
+        "puts_per_sec": 1749990.3085536712,
+        "run_id": "1793016755063",
+        "binary_sha256": "4ad32b442d83e24b6fe7ea3bb2e986f03597fe7fcc4f9353cbaeb8ee561d9b52",
+        "raw_record_sha256": "3a93498067a0bb6aa4075b89b6530be86384bde7c54e4377ee9d182645e0e5b2",
+        "raw": "rfc-025-v7-mimalloc-aligned-initial-tmpfs-batch64-20261026.jsonl",
+        "manifest": "rfc-025-v7-mimalloc-aligned-initial-tmpfs-batch64-20261026-runs.tsv",
+        "host_audit": "rfc-025-v7-mimalloc-aligned-initial-tmpfs-batch64-20261026-host.jsonl"
+      },
+      "new_v4": {
+        "puts_per_sec": 1704587.7128244806,
+        "run_id": "1793016799396",
+        "binary_sha256": "ad9ae949fc93b56abd5024715e0505d66be4c81c986fba7a1dbaee36705b2c51",
+        "raw_record_sha256": "5b2f324fd400bfdb74a500d19feab405d0e79cb295cda43dc05c1fe7e438f321",
+        "raw": "rfc-025-v7-mimalloc-aligned-initial-tmpfs-batch64-20261026.jsonl",
+        "manifest": "rfc-025-v7-mimalloc-aligned-initial-tmpfs-batch64-20261026-runs.tsv",
+        "host_audit": "rfc-025-v7-mimalloc-aligned-initial-tmpfs-batch64-20261026-host.jsonl"
+      },
+      "old_v7": {
+        "puts_per_sec": 763292.870520139,
+        "run_id": "1793016804632",
+        "binary_sha256": "4ad32b442d83e24b6fe7ea3bb2e986f03597fe7fcc4f9353cbaeb8ee561d9b52",
+        "raw_record_sha256": "8dc9ac3d0b83faad85257b653afe36362776f013c3e7ec3c4b2176fd2aed1a69",
+        "raw": "rfc-025-v7-mimalloc-aligned-initial-tmpfs-batch64-20261026.jsonl",
+        "manifest": "rfc-025-v7-mimalloc-aligned-initial-tmpfs-batch64-20261026-runs.tsv",
+        "host_audit": "rfc-025-v7-mimalloc-aligned-initial-tmpfs-batch64-20261026-host.jsonl"
+      },
+      "new_v7": {
+        "puts_per_sec": 928558.5200161857,
+        "run_id": "1793016770547",
+        "binary_sha256": "ad9ae949fc93b56abd5024715e0505d66be4c81c986fba7a1dbaee36705b2c51",
+        "raw_record_sha256": "fb3377429216d06facda9c3bad6264777a03680688578bfaa841df6441079a32",
+        "raw": "rfc-025-v7-mimalloc-aligned-initial-tmpfs-batch64-20261026.jsonl",
+        "manifest": "rfc-025-v7-mimalloc-aligned-initial-tmpfs-batch64-20261026-runs.tsv",
+        "host_audit": "rfc-025-v7-mimalloc-aligned-initial-tmpfs-batch64-20261026-host.jsonl"
+      }
+    },
+    "tmpfs-point1": {
+      "old_v4": {
+        "puts_per_sec": 70481.5743501966,
+        "run_id": "1793016874053",
+        "binary_sha256": "4ad32b442d83e24b6fe7ea3bb2e986f03597fe7fcc4f9353cbaeb8ee561d9b52",
+        "raw_record_sha256": "0b9e3e90e4d6aada15e79508e8d5bf389b83e53c718d6be6d454ad79d4c39cc9",
+        "raw": "rfc-025-v7-mimalloc-aligned-initial-tmpfs-point1-20261026.jsonl",
+        "manifest": "rfc-025-v7-mimalloc-aligned-initial-tmpfs-point1-20261026-runs.tsv",
+        "host_audit": "rfc-025-v7-mimalloc-aligned-initial-tmpfs-point1-20261026-host.jsonl"
+      },
+      "new_v4": {
+        "puts_per_sec": 73156.61747620584,
+        "run_id": "1793016878848",
+        "binary_sha256": "ad9ae949fc93b56abd5024715e0505d66be4c81c986fba7a1dbaee36705b2c51",
+        "raw_record_sha256": "9d942343fc484a7ecff99d6a7b02fe9d15a59ea15fa310222c46db3a420053a9",
+        "raw": "rfc-025-v7-mimalloc-aligned-initial-tmpfs-point1-20261026.jsonl",
+        "manifest": "rfc-025-v7-mimalloc-aligned-initial-tmpfs-point1-20261026-runs.tsv",
+        "host_audit": "rfc-025-v7-mimalloc-aligned-initial-tmpfs-point1-20261026-host.jsonl"
+      },
+      "old_v7": {
+        "puts_per_sec": 44951.345403185216,
+        "run_id": "1793016858996",
+        "binary_sha256": "4ad32b442d83e24b6fe7ea3bb2e986f03597fe7fcc4f9353cbaeb8ee561d9b52",
+        "raw_record_sha256": "19f744ae995b9b4feb04d6ab653622048d88fbc540ebf629cddb74e186c105b7",
+        "raw": "rfc-025-v7-mimalloc-aligned-initial-tmpfs-point1-20261026.jsonl",
+        "manifest": "rfc-025-v7-mimalloc-aligned-initial-tmpfs-point1-20261026-runs.tsv",
+        "host_audit": "rfc-025-v7-mimalloc-aligned-initial-tmpfs-point1-20261026-host.jsonl"
+      },
+      "new_v7": {
+        "puts_per_sec": 48356.125580486754,
+        "run_id": "1793016889181",
+        "binary_sha256": "ad9ae949fc93b56abd5024715e0505d66be4c81c986fba7a1dbaee36705b2c51",
+        "raw_record_sha256": "1670336be69558baff9ed562060055f5894f6033e46729e847bf5d3bf27e56ac",
+        "raw": "rfc-025-v7-mimalloc-aligned-initial-tmpfs-point1-20261026.jsonl",
+        "manifest": "rfc-025-v7-mimalloc-aligned-initial-tmpfs-point1-20261026-runs.tsv",
+        "host_audit": "rfc-025-v7-mimalloc-aligned-initial-tmpfs-point1-20261026-host.jsonl"
+      }
+    },
+    "ext4-point8": {
+      "old_v4": {
+        "puts_per_sec": 17672.018656897224,
+        "run_id": "1793017158865",
+        "binary_sha256": "4ad32b442d83e24b6fe7ea3bb2e986f03597fe7fcc4f9353cbaeb8ee561d9b52",
+        "raw_record_sha256": "0fe605ee952666cf1b2b83e9d5cf1332fb5a699d56be672727ad6dca09d59f6d",
+        "raw": "rfc-025-v7-mimalloc-aligned-initial-ext4-point8-20261026.jsonl",
+        "manifest": "rfc-025-v7-mimalloc-aligned-initial-ext4-point8-20261026-runs.tsv",
+        "host_audit": "rfc-025-v7-mimalloc-aligned-initial-ext4-point8-20261026-host.jsonl"
+      },
+      "new_v4": {
+        "puts_per_sec": 17654.013707384092,
+        "run_id": "1793017174915",
+        "binary_sha256": "ad9ae949fc93b56abd5024715e0505d66be4c81c986fba7a1dbaee36705b2c51",
+        "raw_record_sha256": "e7a22874eae13b5c954dbd4f70558492222f9c69c8aff6b600b6854568c19f1a",
+        "raw": "rfc-025-v7-mimalloc-aligned-initial-ext4-point8-20261026.jsonl",
+        "manifest": "rfc-025-v7-mimalloc-aligned-initial-ext4-point8-20261026-runs.tsv",
+        "host_audit": "rfc-025-v7-mimalloc-aligned-initial-ext4-point8-20261026-host.jsonl"
+      },
+      "old_v7": {
+        "puts_per_sec": 15896.431576622277,
+        "run_id": "1793017359036",
+        "binary_sha256": "4ad32b442d83e24b6fe7ea3bb2e986f03597fe7fcc4f9353cbaeb8ee561d9b52",
+        "raw_record_sha256": "e844b2d5cf14a6e5dd0fb0fa250c88645d88660cbe68e47de4b183e8cfaa89a2",
+        "raw": "rfc-025-v7-mimalloc-aligned-initial-ext4-point8-20261026.jsonl",
+        "manifest": "rfc-025-v7-mimalloc-aligned-initial-ext4-point8-20261026-runs.tsv",
+        "host_audit": "rfc-025-v7-mimalloc-aligned-initial-ext4-point8-20261026-host.jsonl"
+      },
+      "new_v7": {
+        "puts_per_sec": 16128.976202067872,
+        "run_id": "1793017224026",
+        "binary_sha256": "ad9ae949fc93b56abd5024715e0505d66be4c81c986fba7a1dbaee36705b2c51",
+        "raw_record_sha256": "4e4e99136187f9fef573208602f713f4061b9f934f648d328adff6eb88772e3a",
+        "raw": "rfc-025-v7-mimalloc-aligned-initial-ext4-point8-20261026.jsonl",
+        "manifest": "rfc-025-v7-mimalloc-aligned-initial-ext4-point8-20261026-runs.tsv",
+        "host_audit": "rfc-025-v7-mimalloc-aligned-initial-ext4-point8-20261026-host.jsonl"
+      }
+    },
+    "ext4-batch64": {
+      "old_v4": {
+        "puts_per_sec": 372786.98176961805,
+        "run_id": "1793017596073",
+        "binary_sha256": "4ad32b442d83e24b6fe7ea3bb2e986f03597fe7fcc4f9353cbaeb8ee561d9b52",
+        "raw_record_sha256": "c3ccff7a58cabb68f026060cd4a619e1098ae70b7d035071e635c41bc9608dfd",
+        "raw": "rfc-025-v7-mimalloc-aligned-initial-ext4-batch64-20261026.jsonl",
+        "manifest": "rfc-025-v7-mimalloc-aligned-initial-ext4-batch64-20261026-runs.tsv",
+        "host_audit": "rfc-025-v7-mimalloc-aligned-initial-ext4-batch64-20261026-host.jsonl"
+      },
+      "new_v4": {
+        "puts_per_sec": 421018.3450267343,
+        "run_id": "1793017581944",
+        "binary_sha256": "ad9ae949fc93b56abd5024715e0505d66be4c81c986fba7a1dbaee36705b2c51",
+        "raw_record_sha256": "5829b84af5f9985e6b1a1ac68143a4e979b67793a1072be4f34aa312fdacf9b7",
+        "raw": "rfc-025-v7-mimalloc-aligned-initial-ext4-batch64-20261026.jsonl",
+        "manifest": "rfc-025-v7-mimalloc-aligned-initial-ext4-batch64-20261026-runs.tsv",
+        "host_audit": "rfc-025-v7-mimalloc-aligned-initial-ext4-batch64-20261026-host.jsonl"
+      },
+      "old_v7": {
+        "puts_per_sec": 406224.79881211766,
+        "run_id": "1793017675682",
+        "binary_sha256": "4ad32b442d83e24b6fe7ea3bb2e986f03597fe7fcc4f9353cbaeb8ee561d9b52",
+        "raw_record_sha256": "b51e7c0194f6c541353d93548c1db3522de8c2df1749f13cbb5c65a4304fc53c",
+        "raw": "rfc-025-v7-mimalloc-aligned-initial-ext4-batch64-20261026.jsonl",
+        "manifest": "rfc-025-v7-mimalloc-aligned-initial-ext4-batch64-20261026-runs.tsv",
+        "host_audit": "rfc-025-v7-mimalloc-aligned-initial-ext4-batch64-20261026-host.jsonl"
+      },
+      "new_v7": {
+        "puts_per_sec": 417474.4795526708,
+        "run_id": "1793017651325",
+        "binary_sha256": "ad9ae949fc93b56abd5024715e0505d66be4c81c986fba7a1dbaee36705b2c51",
+        "raw_record_sha256": "9e02102f123021aa75df735bb1bc18d2de20194843a13c459f02f5cef4fd80d9",
+        "raw": "rfc-025-v7-mimalloc-aligned-initial-ext4-batch64-20261026.jsonl",
+        "manifest": "rfc-025-v7-mimalloc-aligned-initial-ext4-batch64-20261026-runs.tsv",
+        "host_audit": "rfc-025-v7-mimalloc-aligned-initial-ext4-batch64-20261026-host.jsonl"
+      }
+    }
+  }
+}

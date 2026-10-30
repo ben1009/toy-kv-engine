@@ -1,0 +1,14 @@
+{
+  "baseline": {
+    "path": "target/release/write-perf-v7-serial-startup",
+    "sha256": "e7f7712825d2166c14b5b67601388a8e29697f8fc034832e457061cf6e30ae19"
+  },
+  "retained": {
+    "path": "target/release/write-perf-ssd-allocator-system",
+    "sha256": "37a824c5f64874f3633fa0efca25c1c260dd73f837dc4ab18e56f767040fb8cc"
+  },
+  "candidate": {
+    "path": "target/release/write-perf-ssd-allocator-mimalloc",
+    "sha256": "1affcad90fd93ed9007d92d779706c48b89bcd36e000b33051c8a66e06983c01"
+  }
+}

@@ -1,0 +1,22 @@
+{
+  "source_base": "37bc99d388da6157962901e1c7f59589a236223c",
+  "reconstructed_inputs": 128,
+  "final_inputs_verified": 128,
+  "summary_regenerates": true,
+  "all_four_cells_complete": true,
+  "new_completed_invocations": 36,
+  "matrix_records": 36,
+  "scored_records": 28,
+  "global_unique_invocations": 739,
+  "full_archive_unique_invocations": 4835,
+  "inherited_interrupted_without_json": 1,
+  "source_retained": false,
+  "retained_source_restored": true,
+  "canonical_sha256": "f353022d846530a6754330aaea11f295319ea8f4de20afa09b6d2a3b57b021d8",
+  "candidate_tests": 1974,
+  "focused_tests": 48,
+  "restored_tests": 1973,
+  "decision_sha256": "e465107b078326ed5cc905674c48a90d2d3b9a5d304fee6a27eb54d17954f353",
+  "checks_sha256": "c3557133c843ef5236fbb27b8c17473685af09e7a3a874f3b43f134f71d84e44",
+  "verifier_sha256": "e4745b11d1e84db62a19961f4e1e070a4eb4700666e4e1492a85a78e6038db12"
+}

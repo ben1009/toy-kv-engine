@@ -1,0 +1,48 @@
+{
+  "phase": "Pre-score validation correction",
+  "benchmark_invocations": 0,
+  "initial_focused_tests": 49,
+  "initial_passed": 47,
+  "initial_failed": 2,
+  "failures": [
+    "Guard drop woke background work on every sync, violating existing serial scheduling coverage. Resume only when a target is still unprepared.",
+    "New canary fixture used a6-byte buffer with an O_DIRECT descriptor. Use a separate buffered handle for the unused-tail sentinel."
+  ],
+  "files": {
+    "target/wal-opt/20261028-v7-sync-priority-extents/initial-direct-spelling.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "target/wal-opt/20261028-v7-sync-priority-extents/initial-candidate.patch": "c90d59c5ef166e1ac5106ff6699547f38c96e068a165b07fec2c7edcc849d86e",
+    "target/wal-opt/20261028-v7-sync-priority-extents/initial-checks.json": "89a6abeb142cf20abff79a635d0472dd8c4d967fa0313bb4669bab0935a7ceb8",
+    "target/wal-opt/20261028-v7-sync-priority-extents/initial-validate.py": "f5bd0aafaad929b2263e8e881dbe7cc091dcd457e97dcc5d97abdc548b69dd74",
+    "target/wal-opt/20261028-v7-sync-priority-extents/initial-format.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "target/wal-opt/20261028-v7-sync-priority-extents/initial-focused.log": "bbc0d54959efa3cb3d07f83ab41aadce1676f787841e16b59969c5a311019216",
+    "target/wal-opt/20261028-v7-sync-priority-extents/initial-runtime.rs": "4e2b6bb7db63a7c8ed455a51b95c688a665ad25ab30a9e0eedfaec473294508c",
+    "target/wal-opt/20261028-v7-sync-priority-extents/initial-source-sha256.tsv": "dfa959a3ee95838c27b958a378717a35e66e8f7d9ed8b40959ffc276d5673637"
+  },
+  "second_attempt": {
+    "focused_tests": 49,
+    "passed": 48,
+    "failed": 1,
+    "benchmark_invocations": 0,
+    "reason": "Scheduling fix passes the serial test. Text substitution missed the rustfmt-wrapped canary calls, leaving the fixture alignment error. Apply the buffered-handle correction explicitly.",
+    "files": {
+      "target/wal-opt/20261028-v7-sync-priority-extents/second-checks.json": "17631241c0b4538788375f25443e20a9572b5bfe8c3f20639312356acdd36f03",
+      "target/wal-opt/20261028-v7-sync-priority-extents/second-runtime.rs": "b9a9a6cca208cc83afb41f61cd45362c7094eb847064f195b2d1906ad4cc190b",
+      "target/wal-opt/20261028-v7-sync-priority-extents/second-candidate.patch": "8e81996c802cdfbaf9bba9c8399a34e551888e848140c34968c37070bb1078a0",
+      "target/wal-opt/20261028-v7-sync-priority-extents/second-validate.py": "f5bd0aafaad929b2263e8e881dbe7cc091dcd457e97dcc5d97abdc548b69dd74",
+      "target/wal-opt/20261028-v7-sync-priority-extents/second-source-sha256.tsv": "5766d379c47a98d8731103c3ea75de956995146d42bebc3e07313695fe0b8c1f",
+      "target/wal-opt/20261028-v7-sync-priority-extents/second-direct-spelling.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "target/wal-opt/20261028-v7-sync-priority-extents/second-focused.log": "cab62c57a2732965b49a5a4accdaffd417b1e8abc5da8da8835a3bf69154b585",
+      "target/wal-opt/20261028-v7-sync-priority-extents/second-format.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    }
+  },
+  "post_validation_identity_correction": {
+    "benchmark_invocations": 0,
+    "tests": 1975,
+    "focused_tests": 49,
+    "release_build_passed": true,
+    "reason": "Copied validation driver retained the previous candidate executable name. Existence assertion stops before overwriting it. Correct only the destination name and finish identity/environment metadata without rerunning successful checks.",
+    "driver_path": "target/wal-opt/20261028-v7-sync-priority-extents/validated-driver-before-identity-fix.py",
+    "driver_sha256": "f5bd0aafaad929b2263e8e881dbe7cc091dcd457e97dcc5d97abdc548b69dd74"
+  },
+  "restored_check_summary_note": "Full restored check returns0 and1973 tests pass, with one slow test. A strict post-check substring omits the runner optional(1 slow) label and raises after success. Verifier now accepts this label without rerunning tests."
+}

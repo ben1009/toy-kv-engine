@@ -1,0 +1,12 @@
+{
+  "skipmap": {
+    "path": "target/release/write-perf-bbtree-skipmap",
+    "sha256": "052f42f5bbea9b1e60982608163d87ed580155e74d537d30d50ea52469776fd9",
+    "features": "bench"
+  },
+  "bbtree": {
+    "path": "target/release/write-perf-bbtree-bbtree",
+    "sha256": "41eb17d001a5702be859636c6d1a56c2afb04de05edfd41726f6c586f22896e4",
+    "features": "bench,bbtree-memtable"
+  }
+}

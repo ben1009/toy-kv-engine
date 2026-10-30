@@ -1,0 +1,34 @@
+{
+  "source_base": "53f48459b15ae96d50df39ab0f5e7586579206fc",
+  "reconstructed_inputs": 128,
+  "verified_binaries": 2,
+  "captured_cells": [
+    "ext4-point8",
+    "ext4-batch8"
+  ],
+  "cancelled_cells": [
+    "ext4-point1",
+    "ext4-batch1",
+    "ext4-point16",
+    "ext4-batch16",
+    "confirmation-point8",
+    "confirmation-batch8"
+  ],
+  "records": 48,
+  "scored_records": 40,
+  "warmup_records": 8,
+  "excluded_profiles": 3,
+  "retained_unique_invocation_ids": 51,
+  "recognized_process_samples": 581,
+  "source_reconstructs": true,
+  "summary_regenerates": true,
+  "source_retained": false,
+  "assessment_passed": false,
+  "allocator_unchanged": true,
+  "memtable_unchanged": true,
+  "live_state_owned_by": "rfc-025-v7-ssd-two-chunk-lookahead-20261027",
+  "scratch_removed": true,
+  "checks_sha256": "be0863403ec5e8e698cbfa8dce9cb66ccc1cf9ef3d3cfcecadfe9835e0b8e91f",
+  "decision_sha256": "239eccad6b5931df4449a21bd454e429d3408f1a8c468bdd1449bfd3ce5d4f0b",
+  "verifier_sha256": "07b4f58d2c65842c74a7fe03acdd023122c86bc28a1ed1dcb20e244d2d8141f8"
+}

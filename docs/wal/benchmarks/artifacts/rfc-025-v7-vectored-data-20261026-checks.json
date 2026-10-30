@@ -1,0 +1,71 @@
+{
+  "source_base": "e2989d6d13b2d4b02d00212788e3988443206d75",
+  "outside_sandbox": true,
+  "checks": [
+    {
+      "command": [
+        "cargo",
+        "nextest",
+        "run",
+        "--workspace",
+        "--all-features",
+        "--lib",
+        "--test-threads",
+        "1",
+        "--retries",
+        "0",
+        "--success-output",
+        "immediate",
+        "-E",
+        "test(vectored)"
+      ],
+      "phase": "prototype focused six tests",
+      "exit_code": 0,
+      "log": "target/wal-opt/20261026-v7-vectored-data/live-vectored-tests.log",
+      "log_sha256": "69ab77b5a05a70ecf9514197b334febe71070f165d389c7577e86ff112edece0"
+    },
+    {
+      "command": [
+        "cargo",
+        "make",
+        "check"
+      ],
+      "phase": "prototype full checks",
+      "exit_code": 0,
+      "log": "target/wal-opt/20261026-v7-vectored-data/check.log",
+      "log_sha256": "44921375a8b5fe434e4b660249726e2083a40af62a792bc6aac244e717642c07"
+    },
+    {
+      "command": [
+        "cargo",
+        "build",
+        "--release",
+        "--package",
+        "kv-engine",
+        "--bin",
+        "write-perf",
+        "--features",
+        "bench"
+      ],
+      "phase": "prototype release build",
+      "exit_code": 0,
+      "log": "target/wal-opt/20261026-v7-vectored-data/build.log",
+      "log_sha256": "1611f789ea236194e75354261dbc0a774ecac11efbcf0b95cf42ae6c32e40b65"
+    },
+    {
+      "command": [
+        "typos"
+      ],
+      "phase": "prototype direct spelling check",
+      "exit_code": 0,
+      "log": "target/wal-opt/20261026-v7-vectored-data/typos.log",
+      "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    }
+  ],
+  "prototype_test_count": 1969,
+  "focused_test_count": 6,
+  "skips": 0,
+  "retries": 0,
+  "restoration_record": "rfc-025-v7-vectored-data-20261026-restoration.json",
+  "restoration_note": "Runtime and worker source were restored and canonical executable verified before the separately qualified asynchronous-extent candidate. Final restored-source checks are recorded with that experiment."
+}

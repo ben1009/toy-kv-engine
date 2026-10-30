@@ -1,0 +1,19 @@
+{
+  "completed_at_utc": "2026-10-29T01:25:45.231793+00:00",
+  "assessment": "inconclusive",
+  "assessment_passed": false,
+  "reason": "Only two of five batch16 pairs survive the fixed stall cutoff versus minimum three; matched paired and arm-median throughput ratios also fall below0.95. No repeatable gain or general source-caused regression is established.",
+  "source_retained": false,
+  "source_restored": true,
+  "canonical_sha256": "f353022d846530a6754330aaea11f295319ea8f4de20afa09b6d2a3b57b021d8",
+  "new_completed_invocations": 12,
+  "cancelled_cells": [
+    "ext4-point8-confirm",
+    "ext4-point1",
+    "ext4-point16",
+    "ext4-batch8",
+    "ext4-batch1"
+  ],
+  "no_pooling_with_prior_cohorts": true,
+  "no_replacement_runs": true
+}

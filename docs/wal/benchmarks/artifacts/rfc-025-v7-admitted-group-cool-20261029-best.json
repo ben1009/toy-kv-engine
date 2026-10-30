@@ -1,0 +1,44 @@
+{
+  "cells": {
+    "ext4-batch8": {
+      "retained_historical_plus_fresh": {
+        "v4": {
+          "scored": 13,
+          "eligible": 5,
+          "best": {
+            "run_id": "1793242001213",
+            "format": 4,
+            "puts_s": 388372.0671907931,
+            "p99_ms": 2.510535,
+            "flagged": false,
+            "frontier_mean_ms": 0.0,
+            "fdatasync_mean_ms": 0.42264575179282865,
+            "raw": "rfc-025-v7-batch-attribution-20261029-ext4-batch8.jsonl",
+            "raw_sha256": "ac443fa5d197f0308e7fbcf450e9c377352716138aa46806ca9b113b295d087d"
+          }
+        },
+        "v7": {
+          "scored": 55,
+          "eligible": 23,
+          "best": {
+            "run_id": "1793233037541",
+            "format": 7,
+            "puts_s": 478797.76042692293,
+            "p99_ms": 2.653265,
+            "flagged": false,
+            "frontier_mean_ms": 0.02211912395632627,
+            "fdatasync_mean_ms": 0.31482543481053304,
+            "raw": "rfc-025-v7-signal-taskwork-20261029-ext4-batch8.jsonl",
+            "raw_sha256": "53c4af185fcf1d14ab016540fabe14b7b4c6a094a19e212bf916ab5c1662f6b7"
+          }
+        }
+      },
+      "candidate_fresh_best": null,
+      "candidate_vs_retained": null,
+      "candidate_vs_v4": null
+    }
+  },
+  "method": "Highest eligible throughput; p99 from that same invocation. Historical cohorts are unequal and provide context, not causal qualification.",
+  "historical_index_sha256": "c9364f9e8f98e3b37a93deb44dd2cc9e59c7ced3c5a6d9488c90b3bfa526b4fb",
+  "analyzer_sha256": "a1e9c8754a39ba6d29d01e848fe8057c97b5e004f8cac259a873d4ac14ef6fb4"
+}

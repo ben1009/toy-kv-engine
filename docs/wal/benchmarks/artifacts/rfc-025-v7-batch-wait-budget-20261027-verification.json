@@ -1,0 +1,32 @@
+{
+  "source_base": "dc3e3c1a8fce0f15700ff7c5d2ef2cb1c2875d4d",
+  "reconstructed_inputs": 128,
+  "verified_binaries": 2,
+  "source_reconstructs": true,
+  "summary_regenerates": true,
+  "records": 32,
+  "scored_records": 24,
+  "warmup_records": 8,
+  "captured_cells": [
+    "ext4-batch16",
+    "ext4-point8"
+  ],
+  "cancelled_cells": [
+    "ext4-batch1",
+    "ext4-batch8",
+    "confirmation-batch8"
+  ],
+  "reused_excluded_profiles": 3,
+  "unique_invocations": 35,
+  "global_unique_invocations": 352,
+  "recognized_process_samples": 461,
+  "source_retained": false,
+  "assessment_passed": false,
+  "cpu_is_diagnostic": true,
+  "tests": 1973,
+  "focused_tests": 8,
+  "checks_sha256": "82d22cd2e278f204b36cec11301d2bf8b92023d9dd61de9198d21449d1b767ca",
+  "decision_sha256": "009974a0a099220a0c44f27fe5a0cbe407018cc03439149e5749ff66534942d1",
+  "prior_verification_sha256": "43fd78b50b32785badcd9c4c51fe04d854a6f1541b10d3d135ea99f20d2d040d",
+  "verifier_sha256": "9a2873d46969191b7c8729bd099d5b4922ea1c6a8d33731408c215447b0ec691"
+}

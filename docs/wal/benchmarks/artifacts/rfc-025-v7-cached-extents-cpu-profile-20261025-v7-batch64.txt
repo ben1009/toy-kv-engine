@@ -1,0 +1,33 @@
+# To display the perf.data header info, please use --header/--header-only options.
+#
+#
+# Total Lost Samples: 0
+#
+# Samples: 323  of event 'cpu-clock:u'
+# Event count (approx.): 323971907
+#
+# Overhead  Command          Shared Object                 Symbol
+# ........  ...............  ............................  .......................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................
+#
+    18.27%  wal-ordered-pac  write-perf-v7-cached-extents  [.] sha2::sha256::x86::digest_blocks
+     6.19%  write-perf-v7-c  [vdso]                        [.] __vdso_clock_gettime
+     5.88%  wal-ordered-pac  write-perf-v7-cached-extents  [.] crc32fast::specialized::pclmulqdq::calculate
+     5.57%  write-perf-v7-c  write-perf-v7-cached-extents  [.] <std::thread::local::LocalKey<core::cell::RefCell<alloc::vec::Vec<u8>>>>::with::<<kv_engine::mem_table::MemTable>::publish_raw_batch::{closure#0}, ()>
+     5.26%  write-perf-v7-c  write-perf-v7-cached-extents  [.] <crossbeam_skiplist::base::SkipList<bytes::bytes::Bytes, bytes::bytes::Bytes>>::search_position::<bytes::bytes::Bytes>
+     4.02%  write-perf-v7-c  libc.so.6                     [.] 0x00000000000a5fdc
+     3.10%  write-perf-v7-c  libc.so.6                     [.] 0x00000000000a4809
+     3.10%  write-perf-v7-c  write-perf-v7-cached-extents  [.] <core::slice::iter::Iter<kv_engine::pitr::WalEntry> as core::iter::traits::iterator::Iterator>::try_fold::<(), <core::iter::adapters::enumerate::Enumerate<_> as core::iter::traits::iterator::Iterator>::try_fold::enumerate<&kv_engine::pitr::WalEntry, (), core::ops::control_flow::ControlFlow<&kv_engine::pitr::WalEntry>, core::iter::traits::iterator::Iterator::find_map::check<(usize, &kv_engine::pitr::WalEntry), &kv_engine::pitr::WalEntry, &mut <kv_engine::pitr::CanonicalWalEntryStream>::entries::{closure#0}>::{closure#0}>::{closure#0}, core::ops::control_flow::ControlFlow<&kv_engine::pitr::WalEntry>>
+     3.10%  write-perf-v7-c  write-perf-v7-cached-extents  [.] <crossbeam_skiplist::base::SkipList<bytes::bytes::Bytes, bytes::bytes::Bytes>>::insert_internal::<<crossbeam_skiplist::base::SkipList<bytes::bytes::Bytes, bytes::bytes::Bytes>>::insert::{closure#0}, <crossbeam_skiplist::base::SkipList<bytes::bytes::Bytes, bytes::bytes::Bytes>>::insert::{closure#1}>
+     3.10%  write-perf-v7-c  write-perf-v7-cached-extents  [.] crc32fast::specialized::pclmulqdq::calculate
+     2.79%  wal-sync-coordi  write-perf-v7-cached-extents  [.] <crossbeam_channel::flavors::list::Channel<kv_engine::wal::parallel_worker::GroupWriteResult>>::recv
+     2.79%  write-perf-v7-c  libc.so.6                     [.] 0x00000000000a5ffc
+     2.79%  write-perf-v7-c  write-perf-v7-cached-extents  [.] <kv_engine::mvcc::LsmMvccInner>::publish_commit_ts
+     2.17%  write-perf-v7-c  libc.so.6                     [.] 0x00000000000a481c
+     2.17%  write-perf-v7-c  write-perf-v7-cached-extents  [.] bytes::bytes::shared_drop
+     0.93%  wal-ordered-pac  write-perf-v7-cached-extents  [.] crc32fast::baseline::update_fast_16
+     0.93%  write-perf-v7-c  libc.so.6                     [.] 0x000000000016c105
+
+
+#
+# (Tip: Limit to show entries above 5% only: perf report --percent-limit 5)
+#

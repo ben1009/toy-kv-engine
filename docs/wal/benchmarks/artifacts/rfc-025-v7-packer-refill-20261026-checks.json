@@ -1,0 +1,26 @@
+{
+  "packer-refill": {
+    "command": "cargo make check",
+    "log": "target/wal-opt/20261026-v7-packer-refill/check.log",
+    "sha256": "eb7696484cfd68a01174e0b2d914dd3617fdff8d33d37f89071e99542bd57835",
+    "nextest_run_id": "d81eea7f-fd25-4312-9ceb-e2af9a83ad47",
+    "summary": "1965 tests run: 1965 passed (1 slow), 0 skipped",
+    "retry_lines": 0
+  },
+  "small-packer-refill": {
+    "command": "cargo make check",
+    "log": "target/wal-opt/20261026-v7-small-packer-refill/check.log",
+    "sha256": "0035754674139771b9cae1c5c9107bdd4558429c17f592a926abf6adfb0398d4",
+    "nextest_run_id": "ea9a2c79-2855-4d89-82a3-550fff78debf",
+    "summary": "1966 tests run: 1966 passed (1 slow), 0 skipped",
+    "retry_lines": 0
+  },
+  "restored": {
+    "command": "cargo make check",
+    "log": "target/wal-opt/20261026-v7-small-packer-refill/restored-check.log",
+    "sha256": "10e6650257f739132205c14e6472412a7c9e566ed510ade4924ec0a0e444e084",
+    "nextest_run_id": "c0a37e09-0ea3-4d46-b5f8-32dbe0c8f274",
+    "summary": "1963 tests run: 1963 passed (1 slow), 0 skipped",
+    "retry_lines": 0
+  }
+}

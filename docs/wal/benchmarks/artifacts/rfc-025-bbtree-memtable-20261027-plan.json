@@ -1,0 +1,20 @@
+{
+  "created_at_utc": "2026-10-27T01:27:03.380638+00:00",
+  "source_base": "c6d4c3526fa234ac308c6509fdf36cbede20cd1e",
+  "user_request": "Try BBTree from https://bbtree.xiangpeng.systems/post/",
+  "upstream": {
+    "crate": "bbtree",
+    "version": "0.1.5",
+    "crate_source_commit": "ff4f37ca199220452d65005742596635ee8fb621"
+  },
+  "candidate": "Optional bbtree-memtable backend for point entries only; System allocator; Bytes key newtype delegates InlineKey to [u8]. Range tombstones and transaction-local indexes stay on SkipMap. WAL bytes/runtime/sync unchanged. Legacy WAL replay can use a transient compatibility SkipMap before importing entries.",
+  "profile": {
+    "reuse": "docs/wal/benchmarks/artifacts/rfc-025-v7-mimalloc-ssd-followup-20261027-profile.json",
+    "reason": "Current retained Rust source and exact e7 baseline executable are unchanged since this immediately preceding excluded 596-sample user-CPU capture. SkipMap search is visible; no kernel/off-CPU claim.",
+    "baseline_sha256": "e7f7712825d2166c14b5b67601388a8e29697f8fc034832e457061cf6e30ae19"
+  },
+  "correctness": "Full outside-sandbox cargo make check selected backend; full normal nextest targets default backend; focused binary/prefix key order, mixed bounds, held-iterator concurrent publication, MVCC version visibility and legacy/v7 reopen tests. No benchmark target timeouts treated as correctness failures.",
+  "measurement": "Freeze/hash default and selected feature release executables. Existing engine JSON throughput/CPU/latency and exact-child wait4 RSS. Versioned point reads and scans stay in memory; CPU work uses existing benchmark workloads. SSD ext4 v4/v7 Parallel point/batch64;1KiB values,2GiB SST,point1=20k/sample10,point8/16=100k/sample100,batch=750k/sample10batch. 1/8/16 writers. Each cell1warmup/arm+3alternating scored rounds,30s initial/10s interrun cooldown; recognized process audit1Hz; keep all completed observations.",
+  "assessment": "Within-format paired raw and arm-median throughput>=0.95,CPU<=1.05,p99<=1.10,DATA bytes equal,sync count<=1.05. Atleastone meaningful CPU/read/scan or SSD gain>=2% with CPU<=1.0. RSS>1.20 requires review. Peak scores diagnostic, no filtering or score-selected retries. Screening: CPU/read/scan must pass correctness and not show >10% throughput regressions; then SSD point8 and batch8. If fixed SSD guards fail, cancel remaining SSD1/16 cells and retain evidence; do not run unneeded downstream qualification.",
+  "decision": "Experimental feature default off only if correctness and assessment justify it. Otherwise restore exact modified source and canonical e7 executable. Preserve async/serial SSD commits. Store trial patch/evidence in separate local docs commit; no PR/push/default adoption. Stop for review after the trial."
+}

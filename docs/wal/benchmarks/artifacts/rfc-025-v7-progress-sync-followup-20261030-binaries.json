@@ -1,0 +1,10 @@
+{
+  "retained-v7": {
+    "path": "target/wal-opt/20261030-v7-dynamic-group/write-perf-v7-dynamic-window",
+    "sha256": "53d9ddddf0490142bbc5449ebf47b20af363e06c04259f4e74367cc3e7614907"
+  },
+  "candidate-v7": {
+    "path": "target/wal-opt/20261030-v7-progress-sync/write-perf-v7-progress-sync",
+    "sha256": "093312e765a114634604103d47e75d7c45a3096b4c7fa12704e5ec66fdcbd20d"
+  }
+}

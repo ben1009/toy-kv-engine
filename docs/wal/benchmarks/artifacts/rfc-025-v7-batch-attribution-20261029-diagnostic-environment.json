@@ -1,0 +1,21 @@
+{
+  "driver_sha256": "1a4fc1660c049b95d4d850e4da0977da2658651c1d23f3ab020b9afc573dacae",
+  "analyzer_sha256": "09bf2e30f13d0a3014ed32f12a4766392bdbe06224685a5ddd0727e2ca72a815",
+  "source_manifest_sha256": "332a5edd848282783ef8a2af503494a8a9d5ab3e9895a0975985ef0a0a9eb6e1",
+  "instrumentation_sha256": "37bb642bdb9e4440b9276eaa2f65c51f4503ac7e49808c50b3ca6995ac5cb12c",
+  "ablation_plan_sha256": "1eeac7faffc4ddba63b70a442a59db6ed19e282a2d802a6b5530b37e30a83337",
+  "trace_library": {
+    "path": "target/wal-opt/20261027-v7-writer-scaling/io-trace.so",
+    "sha256": "7bef6a9cfadc9c803f955fb96e86bd65f5bdebd07aab39184d283832bfe3e46b"
+  },
+  "native_source": {
+    "path": "docs/wal/benchmarks/artifacts/rfc-025-v7-writer-scaling-20261027-io-trace.c",
+    "sha256": "628b683e22047bc9cdfbe80f142cf686795f8a9eef2eb0593208832fecd09308"
+  },
+  "task_sampling_period_seconds": 0.1,
+  "host_sampling_period_seconds": 1,
+  "thread_cpu_clock": "CLOCK_THREAD_CPUTIME_ID",
+  "wall_clock": "CLOCK_MONOTONIC",
+  "thread_clock_resolution_seconds": 1e-09,
+  "scheduler_statistics_enabled": "0"
+}

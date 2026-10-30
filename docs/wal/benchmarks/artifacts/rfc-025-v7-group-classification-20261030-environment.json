@@ -1,0 +1,20 @@
+{
+  "captured_at_utc": "2026-10-30T02:32:37.441977+00:00",
+  "repository": "/home/liu/proj/toy-kv-engine",
+  "filesystem": "/dev/nvme0n1p3[/liu/proj/toy-kv-engine] ext4 /home/liu/proj/toy-kv-engine",
+  "base_commit": "1b8cbde3",
+  "candidate_patch_raw_sha256": "ef843103cd502d289ac64c94396123d937512230db57c46ed0c3af6775b9eb1b",
+  "candidate_patch_gzip_sha256": "9d603efe856e20c4fb0c2f364cf2dda36ae1d051f549a25b62c3cca459e61f4b",
+  "binaries_rechecked_after_capture": {
+    "retained-v7": {
+      "path": "target/wal-opt/20261030-v7-dynamic-group/write-perf-v7-dynamic-window",
+      "sha256": "53d9ddddf0490142bbc5449ebf47b20af363e06c04259f4e74367cc3e7614907"
+    },
+    "candidate-v7": {
+      "path": "target/wal-opt/20261030-v7-group-classification/write-perf-v7-group-classification",
+      "sha256": "088d83def46fb1431e2c1cafcfb4d4584d242e8af57a5d9ee8c909d27ea48ce1"
+    }
+  },
+  "candidate_correctness": "97 WAL runtime and worker nextest tests passed outside the sandbox without retries after fixing an invalid-value fixture. The original fixture timed out after exceeding the per-value WAL limit.",
+  "disposition": "Experimental classification restored to base after the performance screen did not qualify; patch and raw captures preserved."
+}

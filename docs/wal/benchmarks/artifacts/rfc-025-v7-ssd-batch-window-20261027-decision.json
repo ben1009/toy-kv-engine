@@ -1,0 +1,20 @@
+{
+  "source_base": "53f48459b15ae96d50df39ab0f5e7586579206fc",
+  "assessment_passed": false,
+  "source_retained": false,
+  "allocator_unchanged": true,
+  "memtable_unchanged": true,
+  "captured_cells": [
+    "ext4-batch8"
+  ],
+  "cancelled_cells": [
+    "ext4-point8",
+    "ext4-batch1",
+    "ext4-batch16",
+    "ext4-point1",
+    "ext4-point16",
+    "confirmation-batch8"
+  ],
+  "reason": "Batch8 passes V7 regression guards: paired throughput +3.323%, CPU +0.500%, p99 -23.469%, sync count -17.077%. It misses the predeclared material-gain criterion requiring throughput >=1.02 with CPU<=1.00; no gate is waived. V4 control throughput -13.34%/CPU+5.66% fails and further limits attribution. All six dependent cells cancelled.",
+  "publication": "No source commit, PR or push; preserve exact patch and candidate executable."
+}

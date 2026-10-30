@@ -1,0 +1,53 @@
+{
+  "note": "Descriptive raw scored peaks within this stage; paired filtered comparison determines retention.",
+  "cells": {
+    "ext4-batch16/concurrent_batch_64/v7": {
+      "old_v7": {
+        "median_rate": 388848.3903866373,
+        "median_cpu_ms": 4397.437,
+        "median_peak_rss_kib": 928952,
+        "peak_rate": 547657.7122883071,
+        "peak_run_id": "1793115161693",
+        "peak_raw_sha256": "2bd6074b66b430588d233a57726efd39f69b956abaa249472b341dc19013764a",
+        "binary_sha256": "e9abcc91b499c3cecd0acc137a0c9b8f65228b76ac3cb31ba3894bf9a0d06d40",
+        "median_p99_ms": 14.798268,
+        "pipeline_medians": {
+          "commit_groups": 6234,
+          "commit_buffers": 11728,
+          "commit_bytes": 816054272,
+          "sync_count": 1262,
+          "fdatasync_ns": 742159289,
+          "frontier_writes": 1262,
+          "frontier_bytes": 5169152,
+          "frontier_write_ns": 189353515,
+          "preallocation_ns": 184505606,
+          "wal_sync_wait_ns": 24639319843,
+          "memtable_insert_ns": 1432479394
+        }
+      },
+      "new_v7": {
+        "median_rate": 482764.616071285,
+        "median_cpu_ms": 4382.924,
+        "median_peak_rss_kib": 929056,
+        "peak_rate": 523353.2556356345,
+        "peak_run_id": "1793115078136",
+        "peak_raw_sha256": "1f9fe8fa513c849027bf5b04c54e5ac56909e4394f506cb0f2504cb8ac3f5e08",
+        "binary_sha256": "7ad88dac2dba0a39b1538b0698afb0d8e3f41deda3f6a0491533a44c1c5d0b3b",
+        "median_p99_ms": 5.091453,
+        "pipeline_medians": {
+          "commit_groups": 5765,
+          "commit_buffers": 11728,
+          "commit_bytes": 816054272,
+          "sync_count": 1311,
+          "fdatasync_ns": 483499409,
+          "frontier_writes": 1311,
+          "frontier_bytes": 5369856,
+          "frontier_write_ns": 79486277,
+          "preallocation_ns": 37526723,
+          "wal_sync_wait_ns": 18378534655,
+          "memtable_insert_ns": 1420693023
+        }
+      }
+    }
+  }
+}

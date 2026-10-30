@@ -1,0 +1,106 @@
+{
+  "outside_sandbox": true,
+  "checks": [
+    {
+      "phase": "focused",
+      "command": [
+        "cargo",
+        "nextest",
+        "run",
+        "--offline",
+        "--locked",
+        "--workspace",
+        "--all-features",
+        "--lib",
+        "--retries",
+        "0",
+        "--success-output",
+        "immediate",
+        "-E",
+        "test(wal::parallel_worker::tests::) or (test(wal::parallel_runtime::tests::) and (test(v7_frontier) or test(v7_extent) or test(async_v7_extent) or test(failpoint_v7) or test(v7_large_batch_wave)))"
+      ],
+      "exit_code": 0,
+      "log": "target/wal-opt/20261028-v7-async-worker-limit/focused.log",
+      "log_sha256": "0f31174ad7c44164395ba56adb9c9594f40cf48a0abf5624a871733bb4612532"
+    },
+    {
+      "phase": "format",
+      "command": [
+        "cargo",
+        "fmt",
+        "--all",
+        "--check"
+      ],
+      "exit_code": 0,
+      "log": "target/wal-opt/20261028-v7-async-worker-limit/format.log",
+      "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "phase": "check",
+      "command": [
+        "cargo",
+        "make",
+        "check"
+      ],
+      "exit_code": 0,
+      "log": "target/wal-opt/20261028-v7-async-worker-limit/check.log",
+      "log_sha256": "fec4f7939aa0f8c157259b8d8c6f60b2419258cfccc7689d94349891e9793022"
+    },
+    {
+      "phase": "release",
+      "command": [
+        "cargo",
+        "build",
+        "--offline",
+        "--locked",
+        "--release",
+        "--package",
+        "kv-engine",
+        "--bin",
+        "write-perf",
+        "--features",
+        "bench"
+      ],
+      "exit_code": 0,
+      "log": "target/wal-opt/20261028-v7-async-worker-limit/release.log",
+      "log_sha256": "a91aa0e50e6190dda414c74972902543f533f11de3e2ad8e784ab6a1b0191a0d"
+    },
+    {
+      "phase": "direct spelling",
+      "command": [
+        "typos",
+        "kv-engine/src/wal/parallel/runtime.rs",
+        "kv-engine/src/wal/parallel/worker.rs"
+      ],
+      "exit_code": 0,
+      "log": "target/wal-opt/20261028-v7-async-worker-limit/direct-spelling.log",
+      "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "phase": "artifact spelling",
+      "command": [
+        "typos",
+        "kv-engine/src/wal/parallel/worker.rs",
+        "/home/liu/proj/toy-kv-engine/docs/wal/benchmarks/artifacts/rfc-025-v7-async-worker-limit-20261028-analyze.py",
+        "/home/liu/proj/toy-kv-engine/docs/wal/benchmarks/artifacts/rfc-025-v7-async-worker-limit-20261028-attempts.json",
+        "/home/liu/proj/toy-kv-engine/docs/wal/benchmarks/artifacts/rfc-025-v7-async-worker-limit-20261028-baseline-sha256.tsv",
+        "/home/liu/proj/toy-kv-engine/docs/wal/benchmarks/artifacts/rfc-025-v7-async-worker-limit-20261028-checks.json",
+        "/home/liu/proj/toy-kv-engine/docs/wal/benchmarks/artifacts/rfc-025-v7-async-worker-limit-20261028-child.py",
+        "/home/liu/proj/toy-kv-engine/docs/wal/benchmarks/artifacts/rfc-025-v7-async-worker-limit-20261028-diagnostic-captures.json",
+        "/home/liu/proj/toy-kv-engine/docs/wal/benchmarks/artifacts/rfc-025-v7-async-worker-limit-20261028-diagnostic-plan.json",
+        "/home/liu/proj/toy-kv-engine/docs/wal/benchmarks/artifacts/rfc-025-v7-async-worker-limit-20261028-diagnostic-run.py",
+        "/home/liu/proj/toy-kv-engine/docs/wal/benchmarks/artifacts/rfc-025-v7-async-worker-limit-20261028-diagnostic-runs.jsonl",
+        "/home/liu/proj/toy-kv-engine/docs/wal/benchmarks/artifacts/rfc-025-v7-async-worker-limit-20261028-matrix.json",
+        "/home/liu/proj/toy-kv-engine/docs/wal/benchmarks/artifacts/rfc-025-v7-async-worker-limit-20261028-plan.json",
+        "/home/liu/proj/toy-kv-engine/docs/wal/benchmarks/artifacts/rfc-025-v7-async-worker-limit-20261028-probe-run.py",
+        "/home/liu/proj/toy-kv-engine/docs/wal/benchmarks/artifacts/rfc-025-v7-async-worker-limit-20261028-run-all.py",
+        "/home/liu/proj/toy-kv-engine/docs/wal/benchmarks/artifacts/rfc-025-v7-async-worker-limit-20261028-run.py"
+      ],
+      "exit_code": 0,
+      "log": "/home/liu/proj/toy-kv-engine/target/wal-opt/20261028-v7-async-worker-limit/artifact-spelling.log",
+      "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    }
+  ],
+  "tests": 1974,
+  "focused_tests": 48
+}

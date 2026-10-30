@@ -1,0 +1,9 @@
+{
+  "issue": "The full check returns zero but its spelling step flags the literal kernel helper name in the diagnostic classifier. No Rust or measurement failure occurred.",
+  "original_driver_path": "target/wal-opt/20261028-v7-async-worker-limit/diagnostic-run-original.py",
+  "original_driver_sha256": "5b9690b89733907439ff059fed792d31249eb01e83dbd86a5dd7d3c90a105c01",
+  "corrected_driver_sha256": "c3c06560b020fc7539de31323c39b7f46b7c7a026258cfa25a3b47a298a87c44",
+  "correction": "Match the io_uring task prefix; this ring has no SQPOLL thread. Recomputed counts must exactly match the captured helper lists.",
+  "check_log": "target/wal-opt/20261028-v7-async-worker-limit/check.log",
+  "check_log_sha256": "fec4f7939aa0f8c157259b8d8c6f60b2419258cfccc7689d94349891e9793022"
+}

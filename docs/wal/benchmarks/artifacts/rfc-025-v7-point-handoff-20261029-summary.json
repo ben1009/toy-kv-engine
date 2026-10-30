@@ -1,0 +1,645 @@
+{
+  "captures": [
+    {
+      "run_id": "1793231423197",
+      "writers": 1,
+      "operations": 20000,
+      "mapped_calls": 20000,
+      "latency": {
+        "count": 20000,
+        "mean_us": 1258.29528355,
+        "p50_us": 924.346,
+        "p95_us": 1296.711,
+        "p99_us": 8924.898,
+        "max_us": 35816.011
+      },
+      "stages": {
+        "api_to_packer": {
+          "count": 20000,
+          "mean_us": 19.016017650000002,
+          "p50_us": 15.106,
+          "p95_us": 35.64,
+          "p99_us": 105.894,
+          "max_us": 1168.059
+        },
+        "packer_materialize_prepare": {
+          "count": 20000,
+          "mean_us": 46.54888425,
+          "p50_us": 5.988,
+          "p95_us": 8.32,
+          "p99_us": 24.785,
+          "max_us": 23248.513
+        },
+        "packer_to_worker": {
+          "count": 20000,
+          "mean_us": 12.26273255,
+          "p50_us": 10.136,
+          "p95_us": 16.532,
+          "p99_us": 87.379,
+          "max_us": 497.446
+        },
+        "stage_to_submit_return": {
+          "count": 20000,
+          "mean_us": 5.67834205,
+          "p50_us": 4.206,
+          "p95_us": 10.838,
+          "p99_us": 29.337,
+          "max_us": 134.914
+        },
+        "submit_return_to_reap": {
+          "count": 20000,
+          "mean_us": 842.9801204,
+          "p50_us": 593.936,
+          "p95_us": 643.332,
+          "p99_us": 8053.949,
+          "max_us": 34831.079
+        },
+        "reap_to_frontier": {
+          "count": 20000,
+          "mean_us": 24.086062849999998,
+          "p50_us": 22.753,
+          "p95_us": 31.521,
+          "p99_us": 89.703,
+          "max_us": 483.57
+        },
+        "frontier_write": {
+          "count": 20000,
+          "mean_us": 20.8793857,
+          "p50_us": 18.661,
+          "p95_us": 29.682,
+          "p99_us": 59.879,
+          "max_us": 8337.644
+        },
+        "frontier_to_sync": {
+          "count": 20000,
+          "mean_us": 0.95712155,
+          "p50_us": 0.873,
+          "p95_us": 1.459,
+          "p99_us": 3.515,
+          "max_us": 17.113
+        },
+        "fdatasync": {
+          "count": 20000,
+          "mean_us": 263.84958715,
+          "p50_us": 225.136,
+          "p95_us": 538.177,
+          "p99_us": 614.492,
+          "max_us": 8802.159
+        },
+        "sync_to_publish": {
+          "count": 20000,
+          "mean_us": 2.87618495,
+          "p50_us": 2.445,
+          "p95_us": 3.938,
+          "p99_us": 10.274,
+          "max_us": 1655.16
+        },
+        "publish_to_wait_return": {
+          "count": 20000,
+          "mean_us": 10.2284418,
+          "p50_us": 8.85,
+          "p95_us": 12.054,
+          "p99_us": 71.901,
+          "max_us": 131.96
+        },
+        "wait_return_to_api_return": {
+          "count": 20000,
+          "mean_us": 8.93240265,
+          "p50_us": 7.639,
+          "p95_us": 15.898,
+          "p99_us": 26.887,
+          "max_us": 177.66
+        }
+      },
+      "top_1pct": {
+        "calls": 200,
+        "stages": {
+          "api_to_packer": {
+            "count": 200,
+            "mean_us": 25.624365,
+            "p50_us": 15.217,
+            "p95_us": 79.141,
+            "p99_us": 131.897,
+            "max_us": 1070.785
+          },
+          "packer_materialize_prepare": {
+            "count": 200,
+            "mean_us": 3527.46664,
+            "p50_us": 6.846,
+            "p95_us": 9881.637,
+            "p99_us": 10929.344,
+            "max_us": 23248.513
+          },
+          "packer_to_worker": {
+            "count": 200,
+            "mean_us": 17.610654999999998,
+            "p50_us": 13.463,
+            "p95_us": 23.288,
+            "p99_us": 104.619,
+            "max_us": 407.746
+          },
+          "stage_to_submit_return": {
+            "count": 200,
+            "mean_us": 7.43862,
+            "p50_us": 6.174,
+            "p95_us": 16.213,
+            "p99_us": 25.938,
+            "max_us": 40.215
+          },
+          "submit_return_to_reap": {
+            "count": 200,
+            "mean_us": 6687.68537,
+            "p50_us": 8530.806,
+            "p95_us": 14585.993,
+            "p99_us": 24465.004,
+            "max_us": 34831.079
+          },
+          "reap_to_frontier": {
+            "count": 200,
+            "mean_us": 35.87869,
+            "p50_us": 31.44,
+            "p95_us": 55.741,
+            "p99_us": 128.983,
+            "max_us": 168.18
+          },
+          "frontier_write": {
+            "count": 200,
+            "mean_us": 75.462165,
+            "p50_us": 26.978,
+            "p95_us": 56.324,
+            "p99_us": 248.648,
+            "max_us": 8337.644
+          },
+          "frontier_to_sync": {
+            "count": 200,
+            "mean_us": 1.2913599999999998,
+            "p50_us": 1.136,
+            "p95_us": 2.828,
+            "p99_us": 3.974,
+            "max_us": 4.097
+          },
+          "fdatasync": {
+            "count": 200,
+            "mean_us": 864.7643499999999,
+            "p50_us": 542.879,
+            "p95_us": 1462.557,
+            "p99_us": 8497.191,
+            "max_us": 8802.159
+          },
+          "sync_to_publish": {
+            "count": 200,
+            "mean_us": 4.41616,
+            "p50_us": 3.203,
+            "p95_us": 12.425,
+            "p99_us": 13.778,
+            "max_us": 14.667
+          },
+          "publish_to_wait_return": {
+            "count": 200,
+            "mean_us": 15.82125,
+            "p50_us": 11.783,
+            "p95_us": 63.248,
+            "p99_us": 87.857,
+            "max_us": 101.662
+          },
+          "wait_return_to_api_return": {
+            "count": 200,
+            "mean_us": 11.80493,
+            "p50_us": 8.859,
+            "p95_us": 27.585,
+            "p99_us": 41.106,
+            "max_us": 46.954
+          }
+        },
+        "dominant_stage": {
+          "submit_return_to_reap": 122,
+          "fdatasync": 4,
+          "frontier_write": 1,
+          "packer_materialize_prepare": 73
+        }
+      },
+      "calls_ge_2ms": {
+        "calls": 886,
+        "dominant_stage": {
+          "fdatasync": 61,
+          "submit_return_to_reap": 731,
+          "packer_materialize_prepare": 92,
+          "sync_to_publish": 1,
+          "frontier_write": 1
+        }
+      },
+      "thread_states": {
+        "worker": {
+          "S:do_sys_poll": 1372,
+          "S:futex_wait_queue": 582,
+          "R:futex_wait_queue": 52,
+          "R:do_sys_poll": 27,
+          "S:0": 93
+        },
+        "packer": {
+          "S:futex_wait_queue": 1905,
+          "S:0": 65,
+          "R:futex_wait_queue": 77,
+          "D:__iomap_dio_rw": 67,
+          "D:0": 3,
+          "S:__iomap_dio_rw": 3,
+          "R:__iomap_dio_rw": 2,
+          "R:0": 3,
+          "D:futex_wait_queue": 1
+        },
+        "coordinator": {
+          "S:futex_wait_queue": 1406,
+          "D:submit_bio_wait": 251,
+          "D:0": 59,
+          "S:0": 76,
+          "R:futex_wait_queue": 52,
+          "D:futex_wait_queue": 129,
+          "R:submit_bio_wait": 45,
+          "D:jbd2_log_wait_commit": 16,
+          "S:submit_bio_wait": 78,
+          "S:__iomap_dio_rw": 9,
+          "R:0": 4,
+          "D:__iomap_dio_rw": 1
+        }
+      },
+      "pipeline": {
+        "commit_groups": 20000,
+        "commit_solo_groups": 20000,
+        "commit_buffers": 20000,
+        "commit_bytes": 81920000,
+        "cqe_count": 20000,
+        "inflight_groups_max": 1,
+        "outstanding_write_sqes_max": 1,
+        "sync_count": 20000,
+        "worker_eventfd_notifications": 20000,
+        "worker_eventfd_writes": 11,
+        "preallocation_ns": 813585943,
+        "fdatasync_ns": 5281558154,
+        "wal_sync_wait_ns": 24832989914,
+        "frontier_writes": 20000,
+        "frontier_bytes": 81920000,
+        "frontier_write_ns": 425646947,
+        "sync_coalesce_wait_calls": 0,
+        "sync_coalesce_wait_ns": 0,
+        "memtable_insert_ns": 82391145,
+        "wal_file_length_bytes": 165683200,
+        "wal_allocated_bytes": 165687296
+      },
+      "raw_puts_s": 794.5962252080577,
+      "raw_p99_ms": 8.523704,
+      "trace_counts": {
+        "1": 20000,
+        "3": 20001,
+        "13": 20000,
+        "14": 20000,
+        "5": 20000,
+        "6": 20000,
+        "7": 20000,
+        "8": 20000,
+        "9": 20000,
+        "10": 20000,
+        "4": 20001,
+        "2": 20000,
+        "11": 19999,
+        "12": 19999
+      },
+      "files_sha256": {
+        "target/wal-opt/20261029-v7-point-handoff/1writers-events.csv": "abd663eefe177539fc96429ad73a987122c2393d8e74e33a0bdbe1910cc22864",
+        "target/wal-opt/20261029-v7-point-handoff/1writers-events.meta.json": "e4cc49d98251928577d31c44f22e7ac4bdd646f33330b62076d8ef8d644a7647",
+        "target/wal-opt/20261029-v7-point-handoff/1writers-io.csv": "751e995b39b9769dc5dbbb5dd37ebbf08c96234ca9dcd708a3965a08d16821d5",
+        "target/wal-opt/20261029-v7-point-handoff/1writers-samples.jsonl": "ec4578d95685c3f7e18ea1bcd9022ff862c9e74515d5a4495676d4c6579dba38",
+        "target/wal-opt/20261029-v7-point-handoff/1writers.stdout": "caa296011f4b654e919c396598e9ed9c672aebfb88c0fb384ea32a71ba65ad98",
+        "target/wal-opt/20261029-v7-point-handoff/1writers.stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "paths_file": "target/wal-opt/20261029-v7-point-handoff/1writers-paths.jsonl",
+      "paths_sha256": "dad0e5b2bd6b223c88236d3258f27e1ac1ae34e1c22c35e033101b8e3686582f"
+    },
+    {
+      "run_id": "1793231463679",
+      "writers": 8,
+      "operations": 100000,
+      "mapped_calls": 100000,
+      "latency": {
+        "count": 100000,
+        "mean_us": 1531.96969383,
+        "p50_us": 952.319,
+        "p95_us": 8431.078,
+        "p99_us": 10248.98,
+        "max_us": 62179.482
+      },
+      "stages": {
+        "api_to_packer": {
+          "count": 100000,
+          "mean_us": 42.68819269,
+          "p50_us": 15.324,
+          "p95_us": 61.898,
+          "p99_us": 558.137,
+          "max_us": 30616.813
+        },
+        "packer_materialize_prepare": {
+          "count": 100000,
+          "mean_us": 19.8226021,
+          "p50_us": 6.224,
+          "p95_us": 25.33,
+          "p99_us": 39.866,
+          "max_us": 51060.977
+        },
+        "packer_to_worker": {
+          "count": 100000,
+          "mean_us": 14.169664059999999,
+          "p50_us": 10.823,
+          "p95_us": 29.241,
+          "p99_us": 101.062,
+          "max_us": 1380.004
+        },
+        "stage_to_submit_return": {
+          "count": 100000,
+          "mean_us": 9.880594940000002,
+          "p50_us": 6.564,
+          "p95_us": 30.428,
+          "p99_us": 51.652,
+          "max_us": 667.293
+        },
+        "submit_return_to_reap": {
+          "count": 100000,
+          "mean_us": 768.19086112,
+          "p50_us": 528.881,
+          "p95_us": 620.286,
+          "p99_us": 8523.46,
+          "max_us": 50928.637
+        },
+        "reap_to_frontier": {
+          "count": 100000,
+          "mean_us": 90.60084175,
+          "p50_us": 28.486,
+          "p95_us": 658.391,
+          "p99_us": 916.832,
+          "max_us": 15350.478
+        },
+        "frontier_write": {
+          "count": 100000,
+          "mean_us": 93.00063816000001,
+          "p50_us": 18.583,
+          "p95_us": 70.657,
+          "p99_us": 592.172,
+          "max_us": 18740.038
+        },
+        "frontier_to_sync": {
+          "count": 100000,
+          "mean_us": 0.98777562,
+          "p50_us": 0.799,
+          "p95_us": 1.697,
+          "p99_us": 3.735,
+          "max_us": 16.666
+        },
+        "fdatasync": {
+          "count": 100000,
+          "mean_us": 395.298478,
+          "p50_us": 227.826,
+          "p95_us": 892.481,
+          "p99_us": 8457.65,
+          "max_us": 28270.99
+        },
+        "sync_to_publish": {
+          "count": 100000,
+          "mean_us": 13.37945996,
+          "p50_us": 12.777,
+          "p95_us": 18.836,
+          "p99_us": 25.1,
+          "max_us": 2068.243
+        },
+        "publish_to_wait_return": {
+          "count": 100000,
+          "mean_us": 53.73436220000001,
+          "p50_us": 42.526,
+          "p95_us": 145.883,
+          "p99_us": 233.631,
+          "max_us": 3342.357
+        },
+        "wait_return_to_api_return": {
+          "count": 100000,
+          "mean_us": 30.21622323,
+          "p50_us": 18.182,
+          "p95_us": 85.738,
+          "p99_us": 187.575,
+          "max_us": 3336.371
+        }
+      },
+      "top_1pct": {
+        "calls": 1000,
+        "stages": {
+          "api_to_packer": {
+            "count": 1000,
+            "mean_us": 1075.121247,
+            "p50_us": 16.841,
+            "p95_us": 9203.061,
+            "p99_us": 15354.93,
+            "max_us": 30616.813
+          },
+          "packer_materialize_prepare": {
+            "count": 1000,
+            "mean_us": 479.518914,
+            "p50_us": 7.264,
+            "p95_us": 631.916,
+            "p99_us": 10020.893,
+            "max_us": 51060.977
+          },
+          "packer_to_worker": {
+            "count": 1000,
+            "mean_us": 16.545383,
+            "p50_us": 11.878,
+            "p95_us": 58.992,
+            "p99_us": 99.603,
+            "max_us": 141.508
+          },
+          "stage_to_submit_return": {
+            "count": 1000,
+            "mean_us": 12.585011,
+            "p50_us": 8.608,
+            "p95_us": 40.634,
+            "p99_us": 57.118,
+            "max_us": 60.797
+          },
+          "submit_return_to_reap": {
+            "count": 1000,
+            "mean_us": 6816.877196,
+            "p50_us": 612.572,
+            "p95_us": 18872.196,
+            "p99_us": 29071.155,
+            "max_us": 50928.637
+          },
+          "reap_to_frontier": {
+            "count": 1000,
+            "mean_us": 810.7745600000001,
+            "p50_us": 46.178,
+            "p95_us": 8953.884,
+            "p99_us": 10295.844,
+            "max_us": 15350.478
+          },
+          "frontier_write": {
+            "count": 1000,
+            "mean_us": 1916.670671,
+            "p50_us": 31.278,
+            "p95_us": 13937.889,
+            "p99_us": 15693.646,
+            "max_us": 18740.038
+          },
+          "frontier_to_sync": {
+            "count": 1000,
+            "mean_us": 1.5665719999999999,
+            "p50_us": 1.205,
+            "p95_us": 3.53,
+            "p99_us": 6.04,
+            "max_us": 7.065
+          },
+          "fdatasync": {
+            "count": 1000,
+            "mean_us": 3314.3982119999996,
+            "p50_us": 641.289,
+            "p95_us": 15034.093,
+            "p99_us": 20005.578,
+            "max_us": 28270.99
+          },
+          "sync_to_publish": {
+            "count": 1000,
+            "mean_us": 17.132322,
+            "p50_us": 15.637,
+            "p95_us": 25.72,
+            "p99_us": 31.747,
+            "max_us": 43.198
+          },
+          "publish_to_wait_return": {
+            "count": 1000,
+            "mean_us": 110.126137,
+            "p50_us": 66.908,
+            "p95_us": 360.329,
+            "p99_us": 560.786,
+            "max_us": 860.392
+          },
+          "wait_return_to_api_return": {
+            "count": 1000,
+            "mean_us": 55.320603999999996,
+            "p50_us": 27.528,
+            "p95_us": 207.243,
+            "p99_us": 381.49,
+            "max_us": 572.027
+          }
+        },
+        "dominant_stage": {
+          "api_to_packer": 87,
+          "reap_to_frontier": 59,
+          "fdatasync": 188,
+          "submit_return_to_reap": 482,
+          "frontier_write": 160,
+          "packer_materialize_prepare": 24
+        }
+      },
+      "calls_ge_2ms": {
+        "calls": 6666,
+        "dominant_stage": {
+          "reap_to_frontier": 712,
+          "fdatasync": 1326,
+          "submit_return_to_reap": 3586,
+          "wait_return_to_api_return": 12,
+          "api_to_packer": 186,
+          "frontier_write": 776,
+          "publish_to_wait_return": 2,
+          "packer_materialize_prepare": 66
+        }
+      },
+      "thread_states": {
+        "worker": {
+          "S:do_sys_poll": 667,
+          "S:0": 117,
+          "S:futex_wait_queue": 455,
+          "R:0": 14,
+          "R:do_sys_poll": 59,
+          "R:futex_wait_queue": 42
+        },
+        "packer": {
+          "S:futex_wait_queue": 1083,
+          "S:0": 93,
+          "D:inode_dio_wait": 21,
+          "R:futex_wait_queue": 79,
+          "R:0": 42,
+          "D:__iomap_dio_rw": 28,
+          "R:__iomap_dio_rw": 2,
+          "D:0": 2,
+          "S:inode_dio_wait": 2,
+          "R:inode_dio_wait": 1,
+          "D:ext4_fallocate": 1
+        },
+        "coordinator": {
+          "S:futex_wait_queue": 719,
+          "S:0": 51,
+          "D:jbd2_log_wait_commit": 150,
+          "D:submit_bio_wait": 133,
+          "D:__iomap_dio_rw": 82,
+          "R:submit_bio_wait": 32,
+          "R:futex_wait_queue": 31,
+          "D:futex_wait_queue": 53,
+          "D:0": 57,
+          "S:__iomap_dio_rw": 9,
+          "S:submit_bio_wait": 31,
+          "R:jbd2_log_wait_commit": 1,
+          "R:0": 3,
+          "R:__iomap_dio_rw": 1,
+          "S:jbd2_log_wait_commit": 1
+        }
+      },
+      "pipeline": {
+        "commit_groups": 75488,
+        "commit_solo_groups": 57325,
+        "commit_buffers": 100000,
+        "commit_bytes": 409600000,
+        "cqe_count": 100000,
+        "inflight_groups_max": 8,
+        "outstanding_write_sqes_max": 8,
+        "sync_count": 13246,
+        "worker_eventfd_notifications": 75488,
+        "worker_eventfd_writes": 25307,
+        "preallocation_ns": 677864893,
+        "fdatasync_ns": 5200796140,
+        "wal_sync_wait_ns": 149074189062,
+        "frontier_writes": 13246,
+        "frontier_bytes": 54255616,
+        "frontier_write_ns": 1489575690,
+        "sync_coalesce_wait_calls": 19063,
+        "sync_coalesce_wait_ns": 657030792,
+        "memtable_insert_ns": 641907052,
+        "wal_file_length_bytes": 465575936,
+        "wal_allocated_bytes": 465584128
+      },
+      "raw_puts_s": 5216.149636031796,
+      "raw_p99_ms": 10.535611,
+      "trace_counts": {
+        "1": 100000,
+        "3": 100001,
+        "13": 75488,
+        "14": 75488,
+        "5": 100000,
+        "6": 100000,
+        "7": 100000,
+        "8": 15661,
+        "9": 13248,
+        "10": 13246,
+        "4": 100001,
+        "2": 100000,
+        "11": 15660,
+        "12": 15660
+      },
+      "files_sha256": {
+        "target/wal-opt/20261029-v7-point-handoff/8writers-events.csv": "20ce1ecb96b1217711567bee280e2f6c7420acc3cb0cfa46e4fb9a24c94fe399",
+        "target/wal-opt/20261029-v7-point-handoff/8writers-events.meta.json": "738b6bb7d3deacca0216318d1680000c95f049cbe58156e725ada60e2ff59794",
+        "target/wal-opt/20261029-v7-point-handoff/8writers-io.csv": "1486fe72dc7051124d1d2deb809291889628f72d03359d71a3b9b7749ed38c63",
+        "target/wal-opt/20261029-v7-point-handoff/8writers-samples.jsonl": "6258932d63a741c5ff1b9b8b0aedcdb824459082881c3ca811bbf0c1a69973aa",
+        "target/wal-opt/20261029-v7-point-handoff/8writers.stdout": "6740c96425526f81d00c032eff855171ba21eb27db7e6fa2b422a978f98eb1af",
+        "target/wal-opt/20261029-v7-point-handoff/8writers.stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "paths_file": "target/wal-opt/20261029-v7-point-handoff/8writers-paths.jsonl",
+      "paths_sha256": "509519defc9031ad72b2dd2349d6c5cb0ab01b3fb8776c52e9f5573b5ab5837d"
+    }
+  ],
+  "analyzer_sha256": "3d781a9304d456f0e90110b15b8e267534e179f5e30873d5a624b70b0b6e9cc5",
+  "limits": "Excluded instrumented observations. Stage intervals partition each call; stage percentiles do not sum to an API percentile. DATA submission/reap includes kernel work and scheduling; native synchronous calls identify syscall elapsed time, not hardware-only service. Trace locking and observer overhead can change scheduling. Scheduler statistics were disabled, so runqueue counters cannot establish runnable-delay attribution."
+}

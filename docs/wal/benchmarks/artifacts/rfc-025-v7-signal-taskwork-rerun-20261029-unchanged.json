@@ -1,0 +1,8 @@
+{
+  "verified_at_utc": "2026-10-29T02:07:41.127287+00:00",
+  "source_changed": false,
+  "baseline_inputs_verified": 128,
+  "baseline_manifest_sha256": "9a33cb488d2b99f3e374e9949e9a0fb1ff3988c7bc6f23b2adf98f05aa4715de",
+  "canonical_changed": false,
+  "canonical_sha256": "f353022d846530a6754330aaea11f295319ea8f4de20afa09b6d2a3b57b021d8"
+}

@@ -1,0 +1,130 @@
+{
+  "outside_sandbox": true,
+  "checks": [
+    {
+      "phase": "focused",
+      "command": [
+        "cargo",
+        "nextest",
+        "run",
+        "--offline",
+        "--locked",
+        "--workspace",
+        "--all-features",
+        "--lib",
+        "--retries",
+        "0",
+        "--success-output",
+        "immediate",
+        "-E",
+        "test(wal::parallel_worker::tests::) or (test(wal::parallel_runtime::tests::) and (test(v7_frontier) or test(v7_extent) or test(async_v7_extent) or test(failpoint_v7) or test(v7_large_batch_wave)))"
+      ],
+      "exit_code": 0,
+      "log": "target/wal-opt/20261027-v7-large-data-async-dispatch/focused.log",
+      "log_sha256": "63e87791fc696d3fe8c0d08a65b35a947da88ade28c181a2ecad4a266c92e38e"
+    },
+    {
+      "phase": "format",
+      "command": [
+        "cargo",
+        "fmt",
+        "--all",
+        "--check"
+      ],
+      "exit_code": 0,
+      "log": "target/wal-opt/20261027-v7-large-data-async-dispatch/format.log",
+      "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "phase": "check",
+      "command": [
+        "cargo",
+        "make",
+        "check"
+      ],
+      "exit_code": 0,
+      "log": "target/wal-opt/20261027-v7-large-data-async-dispatch/check.log",
+      "log_sha256": "484cd61c2d88bc1121ec8b40afe8991153961da475bf45ab6da303ec0702cd64"
+    },
+    {
+      "phase": "release",
+      "command": [
+        "cargo",
+        "build",
+        "--offline",
+        "--locked",
+        "--release",
+        "--package",
+        "kv-engine",
+        "--bin",
+        "write-perf",
+        "--features",
+        "bench"
+      ],
+      "exit_code": 0,
+      "log": "target/wal-opt/20261027-v7-large-data-async-dispatch/release.log",
+      "log_sha256": "07aa859d0ba03e7f6fe0663f585ccbeab763064d5f1e4d5e5be0df01052c52f2"
+    },
+    {
+      "phase": "direct spelling",
+      "command": [
+        "typos",
+        "kv-engine/src/wal/parallel/runtime.rs",
+        "kv-engine/src/wal/parallel/worker.rs"
+      ],
+      "exit_code": 0,
+      "log": "target/wal-opt/20261027-v7-large-data-async-dispatch/direct-spelling.log",
+      "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "phase": "restored check",
+      "command": [
+        "cargo",
+        "make",
+        "check"
+      ],
+      "exit_code": 0,
+      "log": "target/wal-opt/20261027-v7-large-data-async-dispatch/restored-check.log",
+      "log_sha256": "96b7f373171581259709a175f14ea7aefae9f2d32369fad043591fb4874d0fd8"
+    },
+    {
+      "phase": "final spelling",
+      "command": [
+        "typos",
+        "docs/wal/README.md",
+        "docs/wal/rfc-025-parallel-wal-embedded-frontiers-implementation-plan.md",
+        "docs/wal/benchmarks/rfc-025-v7-large-data-async-dispatch-20261027.md",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-large-data-async-dispatch-20261027-analyze.py",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-large-data-async-dispatch-20261027-attempts.json",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-large-data-async-dispatch-20261027-binaries.json",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-large-data-async-dispatch-20261027-candidate.patch",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-large-data-async-dispatch-20261027-checks.json",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-large-data-async-dispatch-20261027-child.py",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-large-data-async-dispatch-20261027-decision.json",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-large-data-async-dispatch-20261027-environment.json",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-large-data-async-dispatch-20261027-ext4-batch16-host.jsonl",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-large-data-async-dispatch-20261027-ext4-batch16-runs.tsv",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-large-data-async-dispatch-20261027-ext4-batch16.jsonl",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-large-data-async-dispatch-20261027-matrix.json",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-large-data-async-dispatch-20261027-peaks.json",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-large-data-async-dispatch-20261027-plan.json",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-large-data-async-dispatch-20261027-run-all.py",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-large-data-async-dispatch-20261027-run.py",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-large-data-async-dispatch-20261027-source-sha256.tsv",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-large-data-async-dispatch-20261027-summary.json",
+        "docs/wal/benchmarks/artifacts/rfc-025-v7-large-data-async-dispatch-20261027-verify.py"
+      ],
+      "exit_code": 0,
+      "log": "target/wal-opt/20261027-v7-large-data-async-dispatch/final-spelling.log",
+      "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    }
+  ],
+  "tests": 1973,
+  "focused_tests": 47,
+  "restored_tests": 1972,
+  "candidate_retries": 0,
+  "candidate_slow_tests": [
+    "tests::leveled_compaction::test_integration"
+  ],
+  "restored_flaky_tests": []
+}

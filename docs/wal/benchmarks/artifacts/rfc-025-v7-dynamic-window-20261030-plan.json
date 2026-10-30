@@ -1,0 +1,21 @@
+{
+  "screen_cells": [
+    "ext4-batch8",
+    "ext4-batch1",
+    "ext4-batch16"
+  ],
+  "guard_cells": [],
+  "purpose": "Exploratory grouping screen on the known-unstable SSD; not a performance or retention qualification.",
+  "baseline": "retained-v7 is the fixed admitted-window candidate, not the main-branch v7 baseline.",
+  "schedule": "One warmup and three scored runs per arm, rotated order, 5 seconds initial gap, 2 seconds between runs; no replacement runs.",
+  "ranking": "Highest eligible throughput; p99 and grouping counters come from that same run.",
+  "stall_filter": {
+    "frontier_mean_ms_at_least": 0.12,
+    "fdatasync_mean_ms_at_least": 0.6
+  },
+  "screen_gate": {
+    "minimum_throughput_ratio": 1,
+    "maximum_p99_ratio": 1,
+    "minimum_eligible_runs_per_arm": 2
+  }
+}

@@ -1,0 +1,457 @@
+{
+  "cpu-publish1": {
+    "invocations": 8,
+    "records": 8,
+    "warmup_records": 2,
+    "host_samples": 24,
+    "run_ids": [
+      "1793065227953",
+      "1793065231143",
+      "1793065234332",
+      "1793065237526",
+      "1793065240710",
+      "1793065243894",
+      "1793065247064",
+      "1793065250253"
+    ],
+    "comparisons": {
+      "concurrent_batch_64/cpu": {
+        "pairs": [
+          {
+            "pair": 1,
+            "throughput": 1.0826103733834944,
+            "cpu": 0.933381773681594,
+            "rss": 1.0558378839051799
+          },
+          {
+            "pair": 2,
+            "throughput": 0.8816483918035589,
+            "cpu": 1.132759106601846,
+            "rss": 1.0485485642554526
+          },
+          {
+            "pair": 3,
+            "throughput": 1.1025362808657266,
+            "cpu": 0.8836057604666706,
+            "rss": 1.0524760257821097
+          }
+        ],
+        "median": {
+          "throughput": 1.0826103733834944,
+          "cpu": 0.933381773681594,
+          "rss": 1.0524760257821097
+        },
+        "per_arm": {
+          "old": {
+            "median_rate": 936434.5598740714,
+            "median_cpu_ms": 130.745,
+            "median_peak_rss_kib": 127220,
+            "peak_rate": 1046417.3469207835,
+            "peak_run_id": "1793065243894",
+            "peak_raw_sha256": "7f8106db589d36352bf5fba21c7439f4656934d3eadc172759eaac47993901d9",
+            "binary_sha256": "052f42f5bbea9b1e60982608163d87ed580155e74d537d30d50ea52469776fd9"
+          },
+          "new": {
+            "median_rate": 1010522.7144992608,
+            "median_cpu_ms": 122.03500000000001,
+            "median_peak_rss_kib": 133800,
+            "peak_rate": 1032453.0769176922,
+            "peak_run_id": "1793065250253",
+            "peak_raw_sha256": "9bcc600620c571c5812a153e4aaeb05ca65aeab45377e1e0440a19f74590998e",
+            "binary_sha256": "41eb17d001a5702be859636c6d1a56c2afb04de05edfd41726f6c586f22896e4"
+          }
+        },
+        "guards": {
+          "paired_floor": true,
+          "arm_median_floor": true
+        },
+        "passed": true,
+        "memory_review": false
+      }
+    },
+    "passed": true,
+    "artifact_sha256": {
+      ".jsonl": "37a5f99343585a79e15e83c976480bca64616a96d243b229a7102134e8bbd049",
+      "-runs.tsv": "2854f7f77ef83bb1cdcc39608943674ed06ebb50fdab9dc38cd78da3bfc0b42c",
+      "-host.jsonl": "a8fa495b178737eedb4633a698a07687fecc58d6a216ce973b07bf62ad7f7190"
+    }
+  },
+  "cpu-publish8": {
+    "invocations": 8,
+    "records": 8,
+    "warmup_records": 2,
+    "host_samples": 24,
+    "run_ids": [
+      "1793065256491",
+      "1793065259598",
+      "1793065262715",
+      "1793065265846",
+      "1793065268972",
+      "1793065272084",
+      "1793065275198",
+      "1793065278313"
+    ],
+    "comparisons": {
+      "concurrent_batch_64/cpu": {
+        "pairs": [
+          {
+            "pair": 1,
+            "throughput": 0.9145435772866045,
+            "cpu": 1.0370646447339131,
+            "rss": 1.0583060751373496
+          },
+          {
+            "pair": 2,
+            "throughput": 1.0294346296822887,
+            "cpu": 1.0710080910065352,
+            "rss": 1.0590364889326431
+          },
+          {
+            "pair": 3,
+            "throughput": 1.1201741173265167,
+            "cpu": 0.8890497795797536,
+            "rss": 1.0615448161916563
+          }
+        ],
+        "median": {
+          "throughput": 1.0294346296822887,
+          "cpu": 1.0370646447339131,
+          "rss": 1.0590364889326431
+        },
+        "per_arm": {
+          "old": {
+            "median_rate": 2917834.9069751925,
+            "median_cpu_ms": 279.693,
+            "median_peak_rss_kib": 125956,
+            "peak_rate": 3165579.8650633595,
+            "peak_run_id": "1793065272084",
+            "peak_raw_sha256": "f7b27f3d57bf9c2720c6c285e678568c3b56a711268a238a4d663f8a6c5422dc",
+            "binary_sha256": "052f42f5bbea9b1e60982608163d87ed580155e74d537d30d50ea52469776fd9"
+          },
+          "new": {
+            "median_rate": 3258757.536121209,
+            "median_cpu_ms": 248.661,
+            "median_peak_rss_kib": 133392,
+            "peak_rate": 3268483.141425435,
+            "peak_run_id": "1793065278313",
+            "peak_raw_sha256": "4c76142c36d63bd00fe947eef984b2dbb74656169f6028900867cf5fd76a431a",
+            "binary_sha256": "41eb17d001a5702be859636c6d1a56c2afb04de05edfd41726f6c586f22896e4"
+          }
+        },
+        "guards": {
+          "paired_floor": true,
+          "arm_median_floor": true
+        },
+        "passed": true,
+        "memory_review": false
+      }
+    },
+    "passed": true,
+    "artifact_sha256": {
+      ".jsonl": "12d2a09a6420a7470daeab9a4f1e1735d7a392ae1f0306eea4b1ea1443dbe28a",
+      "-runs.tsv": "1e909be8b33e9b2bb0c55021c3495028beb713324421c2910b87fc4feb5a2c37",
+      "-host.jsonl": "445b2492c6c9d2532a24c57991a382a96a815d01db3852b177f982164cdb2e45"
+    }
+  },
+  "cpu-publish16": {
+    "invocations": 8,
+    "records": 8,
+    "warmup_records": 2,
+    "host_samples": 24,
+    "run_ids": [
+      "1793065284479",
+      "1793065287591",
+      "1793065290720",
+      "1793065293826",
+      "1793065296956",
+      "1793065300102",
+      "1793065303214",
+      "1793065306322"
+    ],
+    "comparisons": {
+      "concurrent_batch_64/cpu": {
+        "pairs": [
+          {
+            "pair": 1,
+            "throughput": 0.7445042258644725,
+            "cpu": 1.3123545005894963,
+            "rss": 1.0573967724341493
+          },
+          {
+            "pair": 2,
+            "throughput": 0.5838709672068771,
+            "cpu": 1.7372160074379592,
+            "rss": 1.0571666346584725
+          },
+          {
+            "pair": 3,
+            "throughput": 1.081053320733963,
+            "cpu": 0.9704104900943945,
+            "rss": 1.051349110161383
+          }
+        ],
+        "median": {
+          "throughput": 0.7445042258644725,
+          "cpu": 1.3123545005894963,
+          "rss": 1.0571666346584725
+        },
+        "per_arm": {
+          "old": {
+            "median_rate": 3414018.307400052,
+            "median_cpu_ms": 433.42099999999994,
+            "median_peak_rss_kib": 124968,
+            "peak_rate": 3551044.0566672767,
+            "peak_run_id": "1793065300102",
+            "peak_raw_sha256": "026de93c85ab41bb9e8c286e3833ce3e66d29a611fb379209e02f134da8239c1",
+            "binary_sha256": "052f42f5bbea9b1e60982608163d87ed580155e74d537d30d50ea52469776fd9"
+          },
+          "new": {
+            "median_rate": 2541751.0570380124,
+            "median_cpu_ms": 568.802,
+            "median_peak_rss_kib": 131856,
+            "peak_rate": 2949751.1368709602,
+            "peak_run_id": "1793065306322",
+            "peak_raw_sha256": "8641294ac994fd03225c6d511cfa13adde237f4b9e47c96bdd1e5c363ac37d62",
+            "binary_sha256": "41eb17d001a5702be859636c6d1a56c2afb04de05edfd41726f6c586f22896e4"
+          }
+        },
+        "guards": {
+          "paired_floor": false,
+          "arm_median_floor": false
+        },
+        "passed": false,
+        "memory_review": false
+      }
+    },
+    "passed": false,
+    "artifact_sha256": {
+      ".jsonl": "50591bf8bb106989c49883aaf406776cf3e0cc5af32e32b597286b067a03e753",
+      "-runs.tsv": "6a802c60dbeb17bd0cf93a6c54605af436aaf7ff62cba4c92ebbd7370d16cfd7",
+      "-host.jsonl": "eeb2925bb85190c32b1ab427b798d55d19b024e63b33cf1ce1a88f550e1b705c"
+    }
+  },
+  "cpu-read": {
+    "invocations": 8,
+    "records": 8,
+    "warmup_records": 2,
+    "host_samples": 33,
+    "run_ids": [
+      "1793065312508",
+      "1793065317995",
+      "1793065322702",
+      "1793065327357",
+      "1793065332034",
+      "1793065336531",
+      "1793065341198",
+      "1793065345878"
+    ],
+    "comparisons": {
+      "point_get/cpu": {
+        "pairs": [
+          {
+            "pair": 1,
+            "throughput": 0.9793113116143912,
+            "cpu": 1.0136110901773046,
+            "rss": 1.0145727919700522
+          },
+          {
+            "pair": 2,
+            "throughput": 1.1080213011078692,
+            "cpu": 0.8933137701649815,
+            "rss": 1.0127895628948584
+          },
+          {
+            "pair": 3,
+            "throughput": 1.1400115638221007,
+            "cpu": 0.8778210601803086,
+            "rss": 1.011216335586187
+          }
+        ],
+        "median": {
+          "throughput": 1.1080213011078692,
+          "cpu": 0.8933137701649815,
+          "rss": 1.0127895628948584
+        },
+        "per_arm": {
+          "old": {
+            "median_rate": 441739.57915615186,
+            "median_cpu_ms": 1573.0240000000001,
+            "median_peak_rss_kib": 389380,
+            "peak_rate": 443414.0404737747,
+            "peak_run_id": "1793065322702",
+            "peak_raw_sha256": "3357b706406313d9b4b6b56fb46b0b601e4348737aa82f02a4a8ded7ff07a8d6",
+            "binary_sha256": "052f42f5bbea9b1e60982608163d87ed580155e74d537d30d50ea52469776fd9"
+          },
+          "new": {
+            "median_rate": 489456.863247442,
+            "median_cpu_ms": 1405.204,
+            "median_peak_rss_kib": 394360,
+            "peak_rate": 494154.24570355396,
+            "peak_run_id": "1793065345878",
+            "peak_raw_sha256": "fae67eb05d90f82962d44da7cf007544b90303a489ecf3672410c2167dcf9a96",
+            "binary_sha256": "41eb17d001a5702be859636c6d1a56c2afb04de05edfd41726f6c586f22896e4"
+          }
+        },
+        "guards": {
+          "paired_floor": true,
+          "arm_median_floor": true
+        },
+        "passed": true,
+        "memory_review": false
+      }
+    },
+    "passed": true,
+    "artifact_sha256": {
+      ".jsonl": "2d2cc58c33bfdfe6402df733c7bd4855efd1e03024f4f94a857a9bd54d4436ed",
+      "-runs.tsv": "cf571dfd7efd337f52f4472bce2033e250a0ded6b072f818198f0a6f615d6393",
+      "-host.jsonl": "7478304c504595b59afe1fe88a96bb44a099a03e2e079abcd0da53035b665be6"
+    }
+  },
+  "cpu-scan": {
+    "invocations": 8,
+    "records": 16,
+    "warmup_records": 4,
+    "host_samples": 28,
+    "run_ids": [
+      "1793065353428",
+      "1793065357038",
+      "1793065360655",
+      "1793065364306",
+      "1793065367924",
+      "1793065372044",
+      "1793065376301",
+      "1793065380539"
+    ],
+    "comparisons": {
+      "full_scan/cpu": {
+        "pairs": [
+          {
+            "pair": 1,
+            "throughput": 1.6550215906433068,
+            "cpu": 0.9419356334797233,
+            "rss": 1.013314963139658
+          },
+          {
+            "pair": 2,
+            "throughput": 1.009392549900063,
+            "cpu": 1.0107805715516052,
+            "rss": 1.0104562152400107
+          },
+          {
+            "pair": 3,
+            "throughput": 0.9892404237707701,
+            "cpu": 1.019694185626304,
+            "rss": 1.0136535275900032
+          }
+        ],
+        "median": {
+          "throughput": 1.009392549900063,
+          "cpu": 1.0107805715516052,
+          "rss": 1.013314963139658
+        },
+        "per_arm": {
+          "old": {
+            "median_rate": 1303288.0432484148,
+            "median_cpu_ms": 529.471,
+            "median_peak_rss_kib": 389036,
+            "peak_rate": 1336518.8636740202,
+            "peak_run_id": "1793065376301",
+            "peak_raw_sha256": "f5c7c8c0adc519e32192ca0b6300a3e161437016f99dc73e31628ec9ecffddcc",
+            "binary_sha256": "052f42f5bbea9b1e60982608163d87ed580155e74d537d30d50ea52469776fd9"
+          },
+          "new": {
+            "median_rate": 1315529.2412287812,
+            "median_cpu_ms": 533.297,
+            "median_peak_rss_kib": 394072,
+            "peak_rate": 1322138.4870785158,
+            "peak_run_id": "1793065380539",
+            "peak_raw_sha256": "f4b09ee98cbfaf72a3ccb8675cd41ea242966488a5a602cd1a7eb79aa4f8c863",
+            "binary_sha256": "41eb17d001a5702be859636c6d1a56c2afb04de05edfd41726f6c586f22896e4"
+          }
+        },
+        "guards": {
+          "paired_floor": true,
+          "arm_median_floor": true
+        },
+        "passed": true,
+        "memory_review": false
+      },
+      "scan_10pct/cpu": {
+        "pairs": [
+          {
+            "pair": 1,
+            "throughput": 1.2951231701767072,
+            "cpu": 0.9419356334797233,
+            "rss": 1.013314963139658
+          },
+          {
+            "pair": 2,
+            "throughput": 0.9501775570194603,
+            "cpu": 1.0107805715516052,
+            "rss": 1.0104562152400107
+          },
+          {
+            "pair": 3,
+            "throughput": 0.9842135093876956,
+            "cpu": 1.019694185626304,
+            "rss": 1.0136535275900032
+          }
+        ],
+        "median": {
+          "throughput": 0.9842135093876956,
+          "cpu": 1.0107805715516052,
+          "rss": 1.013314963139658
+        },
+        "per_arm": {
+          "old": {
+            "median_rate": 1420287.2985553264,
+            "median_cpu_ms": 529.471,
+            "median_peak_rss_kib": 389036,
+            "peak_rate": 1459388.5016239346,
+            "peak_run_id": "1793065376301",
+            "peak_raw_sha256": "6a3a5951882ce2577ba1fb9ecba26228ae22bc1ae31d703a59e1b0e86ab2bfd8",
+            "binary_sha256": "052f42f5bbea9b1e60982608163d87ed580155e74d537d30d50ea52469776fd9"
+          },
+          "new": {
+            "median_rate": 1396012.4300946775,
+            "median_cpu_ms": 533.297,
+            "median_peak_rss_kib": 394072,
+            "peak_rate": 1436349.8787433433,
+            "peak_run_id": "1793065380539",
+            "peak_raw_sha256": "7b995bdb4332776238bf216cb00b27cdb0499dce05e3c6f0467f7891b3b54a7b",
+            "binary_sha256": "41eb17d001a5702be859636c6d1a56c2afb04de05edfd41726f6c586f22896e4"
+          }
+        },
+        "guards": {
+          "paired_floor": true,
+          "arm_median_floor": true
+        },
+        "passed": true,
+        "memory_review": false
+      }
+    },
+    "passed": true,
+    "artifact_sha256": {
+      ".jsonl": "6a19b982e5a75703a3d1b773e54ea17131ef65b336feab0530f3460034d4f13c",
+      "-runs.tsv": "5bb1f31018bf5e9d5279336d967fd8e5ef4baf684d15f170587fde9f5315b2dc",
+      "-host.jsonl": "0e235781d3fc5090543dd2304bce98ba445ccbf49fbb5a5c0fa52f49cd677f36"
+    }
+  },
+  "status": {
+    "cpu_complete": true,
+    "cpu_passed": false,
+    "ssd_screen_complete": false,
+    "ssd_screen_passed": false,
+    "all_planned_cells_complete": false,
+    "captured_cells_pass": false,
+    "invocations": 40,
+    "records": 48,
+    "scored_records": 36,
+    "material_gain": true,
+    "source_default_changed": false,
+    "allocator_unchanged": true
+  },
+  "analysis_sha256": "bb340eace92eb8b79d3c96b4fd1e8f0d0a4e1476c152dc8ba89c2578eb98ad6d",
+  "driver_sha256": "8fe37cea6d65b0666800666c5ddb3458357936b36c29c8363ca45b60d180a0fe",
+  "matrix_sha256": "546b7f98741156943d7047f951b02434315f065cdfaaea5889fafad392507f26"
+}

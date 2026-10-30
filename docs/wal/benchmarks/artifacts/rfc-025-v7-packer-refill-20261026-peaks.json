@@ -1,0 +1,158 @@
+{
+  "packer-refill": {
+    "ext4-point8": {
+      "old_v4": {
+        "puts_per_sec": 18073.07392542475,
+        "run_id": "1793006222970",
+        "binary_sha256": "614f0cb1adde43cabe900eb032c6f884783d658c597471d9d9ddc8faff314aa9",
+        "raw_record_sha256": "709aa73adb1173a0bc62a4d04a61a0808f40d72d12c5627d5aa905d70e3e2f1d",
+        "raw": "rfc-025-v7-packer-refill-initial-ext4-point8-20261026.jsonl",
+        "manifest": "rfc-025-v7-packer-refill-initial-ext4-point8-20261026-runs.tsv",
+        "host_audit": "rfc-025-v7-packer-refill-initial-ext4-point8-20261026-host.jsonl"
+      },
+      "new_v4": {
+        "puts_per_sec": 18188.775090655858,
+        "run_id": "1793006041420",
+        "binary_sha256": "b28a87cc259b16f183896ac21fcdffaeebd30cbaf4f63c6f0a11e0dd7cc738e3",
+        "raw_record_sha256": "d0694da422e31bfb46c35482bf5511cde7d97d1fe3ab55ca1cabebf16f3840c1",
+        "raw": "rfc-025-v7-packer-refill-initial-ext4-point8-20261026.jsonl",
+        "manifest": "rfc-025-v7-packer-refill-initial-ext4-point8-20261026-runs.tsv",
+        "host_audit": "rfc-025-v7-packer-refill-initial-ext4-point8-20261026-host.jsonl"
+      },
+      "old_v7": {
+        "puts_per_sec": 16628.21136990059,
+        "run_id": "1793006190861",
+        "binary_sha256": "614f0cb1adde43cabe900eb032c6f884783d658c597471d9d9ddc8faff314aa9",
+        "raw_record_sha256": "6c26a186eef114b0af8a38dd7e36ec7859cc3999dd10eb65da710e87d046ec0f",
+        "raw": "rfc-025-v7-packer-refill-initial-ext4-point8-20261026.jsonl",
+        "manifest": "rfc-025-v7-packer-refill-initial-ext4-point8-20261026-runs.tsv",
+        "host_audit": "rfc-025-v7-packer-refill-initial-ext4-point8-20261026-host.jsonl"
+      },
+      "new_v7": {
+        "puts_per_sec": 16831.319880941875,
+        "run_id": "1793006158483",
+        "binary_sha256": "b28a87cc259b16f183896ac21fcdffaeebd30cbaf4f63c6f0a11e0dd7cc738e3",
+        "raw_record_sha256": "ee3e01e9e28e07815e1143b5f4c9de18de1deb8dab88561904abf517790228f5",
+        "raw": "rfc-025-v7-packer-refill-initial-ext4-point8-20261026.jsonl",
+        "manifest": "rfc-025-v7-packer-refill-initial-ext4-point8-20261026-runs.tsv",
+        "host_audit": "rfc-025-v7-packer-refill-initial-ext4-point8-20261026-host.jsonl"
+      }
+    },
+    "ext4-batch64": {
+      "old_v4": {
+        "puts_per_sec": 392016.09094545,
+        "run_id": "1793006622475",
+        "binary_sha256": "614f0cb1adde43cabe900eb032c6f884783d658c597471d9d9ddc8faff314aa9",
+        "raw_record_sha256": "028ff6105a4534564cc833c9332fd5c10b433a08f0d9a58f2429806db38e1480",
+        "raw": "rfc-025-v7-packer-refill-initial-ext4-batch64-20261026.jsonl",
+        "manifest": "rfc-025-v7-packer-refill-initial-ext4-batch64-20261026-runs.tsv",
+        "host_audit": "rfc-025-v7-packer-refill-initial-ext4-batch64-20261026-host.jsonl"
+      },
+      "new_v4": {
+        "puts_per_sec": 398240.4361213213,
+        "run_id": "1793006440017",
+        "binary_sha256": "b28a87cc259b16f183896ac21fcdffaeebd30cbaf4f63c6f0a11e0dd7cc738e3",
+        "raw_record_sha256": "70d6ea421e5c416cb3f6863e95482511d7e891bcc3330957167fba71b37e7b85",
+        "raw": "rfc-025-v7-packer-refill-initial-ext4-batch64-20261026.jsonl",
+        "manifest": "rfc-025-v7-packer-refill-initial-ext4-batch64-20261026-runs.tsv",
+        "host_audit": "rfc-025-v7-packer-refill-initial-ext4-batch64-20261026-host.jsonl"
+      },
+      "old_v7": {
+        "puts_per_sec": 415055.63031288533,
+        "run_id": "1793006596297",
+        "binary_sha256": "614f0cb1adde43cabe900eb032c6f884783d658c597471d9d9ddc8faff314aa9",
+        "raw_record_sha256": "4f47e3cdb234a48a2e4d00957fb8d865b85236f72c73305778e3b0ca7c944bb0",
+        "raw": "rfc-025-v7-packer-refill-initial-ext4-batch64-20261026.jsonl",
+        "manifest": "rfc-025-v7-packer-refill-initial-ext4-batch64-20261026-runs.tsv",
+        "host_audit": "rfc-025-v7-packer-refill-initial-ext4-batch64-20261026-host.jsonl"
+      },
+      "new_v7": {
+        "puts_per_sec": 433171.2262984198,
+        "run_id": "1793006478748",
+        "binary_sha256": "b28a87cc259b16f183896ac21fcdffaeebd30cbaf4f63c6f0a11e0dd7cc738e3",
+        "raw_record_sha256": "f62d9af0020aeafe674e343cf3260d4b3c4a3a7393b6318ceae9ef4a0981d572",
+        "raw": "rfc-025-v7-packer-refill-initial-ext4-batch64-20261026.jsonl",
+        "manifest": "rfc-025-v7-packer-refill-initial-ext4-batch64-20261026-runs.tsv",
+        "host_audit": "rfc-025-v7-packer-refill-initial-ext4-batch64-20261026-host.jsonl"
+      }
+    }
+  },
+  "small-packer-refill": {
+    "ext4-point8": {
+      "old_v4": {
+        "puts_per_sec": 17131.74176043162,
+        "run_id": "1793013736928",
+        "binary_sha256": "614f0cb1adde43cabe900eb032c6f884783d658c597471d9d9ddc8faff314aa9",
+        "raw_record_sha256": "ea591a98a4922c0c9a7c1d376195eda1fd580e3295642679c76c1e9590400f96",
+        "raw": "rfc-025-v7-small-packer-refill-initial-ext4-point8-20261026.jsonl",
+        "manifest": "rfc-025-v7-small-packer-refill-initial-ext4-point8-20261026-runs.tsv",
+        "host_audit": "rfc-025-v7-small-packer-refill-initial-ext4-point8-20261026-host.jsonl"
+      },
+      "new_v4": {
+        "puts_per_sec": 17180.099241138763,
+        "run_id": "1793013921399",
+        "binary_sha256": "30075729dbff118738d3514457cd40057d306b9b85377f50069921bcb09eb51c",
+        "raw_record_sha256": "eb297932188c62ea3171653914a7704a89ce16bfdb1aca062c30aca4cd18bf23",
+        "raw": "rfc-025-v7-small-packer-refill-initial-ext4-point8-20261026.jsonl",
+        "manifest": "rfc-025-v7-small-packer-refill-initial-ext4-point8-20261026-runs.tsv",
+        "host_audit": "rfc-025-v7-small-packer-refill-initial-ext4-point8-20261026-host.jsonl"
+      },
+      "old_v7": {
+        "puts_per_sec": 15725.666181206963,
+        "run_id": "1793013818883",
+        "binary_sha256": "614f0cb1adde43cabe900eb032c6f884783d658c597471d9d9ddc8faff314aa9",
+        "raw_record_sha256": "c8ccb32a3efa8dc7d3491ae96f2b076464acb0842bab651c3cfa033693e3c214",
+        "raw": "rfc-025-v7-small-packer-refill-initial-ext4-point8-20261026.jsonl",
+        "manifest": "rfc-025-v7-small-packer-refill-initial-ext4-point8-20261026-runs.tsv",
+        "host_audit": "rfc-025-v7-small-packer-refill-initial-ext4-point8-20261026-host.jsonl"
+      },
+      "new_v7": {
+        "puts_per_sec": 16040.98472881491,
+        "run_id": "1793013786092",
+        "binary_sha256": "30075729dbff118738d3514457cd40057d306b9b85377f50069921bcb09eb51c",
+        "raw_record_sha256": "657aa7877086cad6b7c7ac931184ddbc231a60888b209d77e567422ff90c0686",
+        "raw": "rfc-025-v7-small-packer-refill-initial-ext4-point8-20261026.jsonl",
+        "manifest": "rfc-025-v7-small-packer-refill-initial-ext4-point8-20261026-runs.tsv",
+        "host_audit": "rfc-025-v7-small-packer-refill-initial-ext4-point8-20261026-host.jsonl"
+      }
+    },
+    "ext4-batch64": {
+      "old_v4": {
+        "puts_per_sec": 386335.48352330236,
+        "run_id": "1793014300899",
+        "binary_sha256": "614f0cb1adde43cabe900eb032c6f884783d658c597471d9d9ddc8faff314aa9",
+        "raw_record_sha256": "71fa2bae442d6fb50e7145789391a12c7ccb0c7f2cf99ae157541c7272120392",
+        "raw": "rfc-025-v7-small-packer-refill-initial-ext4-batch64-20261026.jsonl",
+        "manifest": "rfc-025-v7-small-packer-refill-initial-ext4-batch64-20261026-runs.tsv",
+        "host_audit": "rfc-025-v7-small-packer-refill-initial-ext4-batch64-20261026-host.jsonl"
+      },
+      "new_v4": {
+        "puts_per_sec": 384591.31393256393,
+        "run_id": "1793014132334",
+        "binary_sha256": "30075729dbff118738d3514457cd40057d306b9b85377f50069921bcb09eb51c",
+        "raw_record_sha256": "853e3b004601b0c463b138c26973340400e9390bc8f5e71ec4f3c32dbc5eb117",
+        "raw": "rfc-025-v7-small-packer-refill-initial-ext4-batch64-20261026.jsonl",
+        "manifest": "rfc-025-v7-small-packer-refill-initial-ext4-batch64-20261026-runs.tsv",
+        "host_audit": "rfc-025-v7-small-packer-refill-initial-ext4-batch64-20261026-host.jsonl"
+      },
+      "old_v7": {
+        "puts_per_sec": 428555.5521799981,
+        "run_id": "1793014274459",
+        "binary_sha256": "614f0cb1adde43cabe900eb032c6f884783d658c597471d9d9ddc8faff314aa9",
+        "raw_record_sha256": "32da651ed425c13f6517427c8dd2b9422e69d3e95ff460d95ca9aa43342cf58a",
+        "raw": "rfc-025-v7-small-packer-refill-initial-ext4-batch64-20261026.jsonl",
+        "manifest": "rfc-025-v7-small-packer-refill-initial-ext4-batch64-20261026-runs.tsv",
+        "host_audit": "rfc-025-v7-small-packer-refill-initial-ext4-batch64-20261026-host.jsonl"
+      },
+      "new_v7": {
+        "puts_per_sec": 385893.7075890081,
+        "run_id": "1793014250080",
+        "binary_sha256": "30075729dbff118738d3514457cd40057d306b9b85377f50069921bcb09eb51c",
+        "raw_record_sha256": "75ce7f89324ff20b9a3e34d62a37041bce24855fe39b4014f41cd4c856405a28",
+        "raw": "rfc-025-v7-small-packer-refill-initial-ext4-batch64-20261026.jsonl",
+        "manifest": "rfc-025-v7-small-packer-refill-initial-ext4-batch64-20261026-runs.tsv",
+        "host_audit": "rfc-025-v7-small-packer-refill-initial-ext4-batch64-20261026-host.jsonl"
+      }
+    }
+  }
+}

@@ -1,0 +1,17 @@
+diff --git a/kv-engine/src/wal/parallel/runtime.rs b/kv-engine/src/wal/parallel/runtime.rs
+index a709ed68..0fb7dfae 100644
+--- a/kv-engine/src/wal/parallel/runtime.rs
++++ b/kv-engine/src/wal/parallel/runtime.rs
+@@ -54,0 +55,3 @@ const EXTENT_INITIALIZATION_CHUNK: usize = 128 * 1024;
++// Prepare v7's synchronous suffix in larger contiguous writes, reducing
++// serial direct-I/O waits while retaining the same ready-prefix guard.
++const V7_EXTENT_INITIALIZATION_CHUNK: usize = 512 * 1024;
+@@ -56 +59 @@ const EXTENT_INITIALIZATION_CHUNK: usize = 128 * 1024;
+-struct ExtentZeros([u8; EXTENT_INITIALIZATION_CHUNK]);
++struct ExtentZeros([u8; V7_EXTENT_INITIALIZATION_CHUNK]);
+@@ -60 +63 @@ struct ExtentZeros([u8; EXTENT_INITIALIZATION_CHUNK]);
+-static EXTENT_ZEROS: ExtentZeros = ExtentZeros([0; EXTENT_INITIALIZATION_CHUNK]);
++static EXTENT_ZEROS: ExtentZeros = ExtentZeros([0; V7_EXTENT_INITIALIZATION_CHUNK]);
+@@ -2753 +2756 @@ fn preallocate_runtime(inner: &RuntimeInner, end: u64, initialize_extents: bool)
+-                (aligned_end - *prepared_end).min(EXTENT_INITIALIZATION_CHUNK as u64) as usize;
++                (aligned_end - *prepared_end).min(V7_EXTENT_INITIALIZATION_CHUNK as u64) as usize;

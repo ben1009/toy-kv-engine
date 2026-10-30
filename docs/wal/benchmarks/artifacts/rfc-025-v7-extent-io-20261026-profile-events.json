@@ -1,0 +1,17 @@
+{
+  "v4-point8": {
+    "requested": "cpu-clock",
+    "recorded": "cpu-clock:u",
+    "perf_stderr": "[ perf record: Woken up 172 times to write data ]\n[ perf record: Captured and wrote 47.535 MB /home/liu/proj/toy-kv-engine/target/wal-opt/20261026-v7-extent-io/v4-point8.data (5506 samples) ]\n"
+  },
+  "v7-point8": {
+    "requested": "cpu-clock",
+    "recorded": "cpu-clock:u",
+    "perf_stderr": "[ perf record: Woken up 182 times to write data ]\n[ perf record: Captured and wrote 48.820 MB /home/liu/proj/toy-kv-engine/target/wal-opt/20261026-v7-extent-io/v7-point8.data (5682 samples) ]\n"
+  },
+  "v7-batch64": {
+    "requested": "cpu-clock",
+    "recorded": "cpu-clock:u",
+    "perf_stderr": "[ perf record: Woken up 100 times to write data ]\n[ perf record: Captured and wrote 27.593 MB /home/liu/proj/toy-kv-engine/target/wal-opt/20261026-v7-extent-io/v7-batch64.data (3131 samples) ]\n"
+  }
+}

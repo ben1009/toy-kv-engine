@@ -1,0 +1,93 @@
+{
+  "source_base": "e2989d6d13b2d4b02d00212788e3988443206d75",
+  "outside_sandbox": true,
+  "checks": [
+    {
+      "command": [
+        "cargo",
+        "nextest",
+        "run",
+        "--workspace",
+        "--all-features",
+        "--lib",
+        "--test-threads",
+        "1",
+        "--retries",
+        "0",
+        "--success-output",
+        "immediate",
+        "-E",
+        "test(async_v7_extent) | test(v7_extent_initialization) | test(v7_packer_preallocation)"
+      ],
+      "phase": "prototype focused eight tests",
+      "exit_code": 0,
+      "log": "target/wal-opt/20261026-v7-async-extent/focused-final.log",
+      "log_sha256": "1ae4652c4013ecdbcfa6627cad5da9e650f57357baa7c84c5434029ddc4159bc"
+    },
+    {
+      "command": [
+        "cargo",
+        "make",
+        "check"
+      ],
+      "phase": "prototype full checks",
+      "exit_code": 0,
+      "log": "target/wal-opt/20261026-v7-async-extent/check.log",
+      "log_sha256": "a6c466cd5de578048e4277ce48a149a5ae6dece9d1fb25c673c40da5db3d4d89"
+    },
+    {
+      "command": [
+        "typos"
+      ],
+      "phase": "prototype direct spelling check",
+      "exit_code": 0,
+      "log": "target/wal-opt/20261026-v7-async-extent/typos.log",
+      "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "command": [
+        "cargo",
+        "build",
+        "--release",
+        "--package",
+        "kv-engine",
+        "--bin",
+        "write-perf",
+        "--features",
+        "bench"
+      ],
+      "phase": "prototype release build",
+      "exit_code": 0,
+      "log": "target/wal-opt/20261026-v7-async-extent/build.log",
+      "log_sha256": "04a5f9edc5079a5dc795dbfb6f9a9c73375a5e6724920fa8ffb46c0519113834"
+    },
+    {
+      "command": [
+        "cargo",
+        "make",
+        "check"
+      ],
+      "phase": "restored engine before explicit maintainer retention",
+      "exit_code": 0,
+      "log": "target/wal-opt/20261026-v7-async-extent/restored-check.log",
+      "log_sha256": "ae28e101dc56883dd6b36bf3a500c28aee2327a464fedfe7aa7c6b7305d6058c"
+    }
+  ],
+  "prototype_test_count": 1968,
+  "focused_test_count": 8,
+  "skips": 0,
+  "retries": 0,
+  "earlier_validation_corrections": [
+    {
+      "log": "target/wal-opt/20261026-v7-async-extent/focused-tests-compile-error.log",
+      "sha256": "76dc49277d69fc0b492ce5e39224b1850c7cb571d2ac0789cb74d43ae2e8ec55",
+      "reason": "Test failpoint configuration returns String, requiring expect rather than anyhow question-mark conversion."
+    },
+    {
+      "log": "target/wal-opt/20261026-v7-async-extent/focused-tests-invalid-fixture.log",
+      "sha256": "18c34aa23435f14dd0441e4c8f3223429aa4a191379bb35530f3be71d818a1ed",
+      "reason": "The initial large-DATA test exceeded the existing u16 per-value limit. Corrected to four 32KiB values; production limits stay unchanged."
+    }
+  ],
+  "restored_test_count": 1963
+}

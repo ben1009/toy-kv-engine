@@ -1,0 +1,18 @@
+{
+  "v4": {
+    "path": "target/release/write-perf-v7-large-data-async-dispatch",
+    "sha256": "f353022d846530a6754330aaea11f295319ea8f4de20afa09b6d2a3b57b021d8"
+  },
+  "retained-v7": {
+    "path": "target/release/write-perf-v7-large-data-async-dispatch",
+    "sha256": "f353022d846530a6754330aaea11f295319ea8f4de20afa09b6d2a3b57b021d8"
+  },
+  "overlap-v7": {
+    "path": "target/release/write-perf-v7-post-submit-hash",
+    "sha256": "27079b2afcd608d455a9bb91ccdad04f1567337b54896f4a486f0c51ccdd54e0"
+  },
+  "candidate-v7": {
+    "path": "target/release/write-perf-v7-producer-framing",
+    "sha256": "8bcc3df029c84a57991b6eba54b209d7121246b97fe4732df5e2da123059ea8f"
+  }
+}

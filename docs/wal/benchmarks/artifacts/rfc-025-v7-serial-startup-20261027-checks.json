@@ -1,0 +1,78 @@
+{
+  "source_base": "0ffebd516b865b01371ed65014ac0347ae2fb420",
+  "outside_sandbox": true,
+  "checks": [
+    {
+      "command": [
+        "cargo",
+        "nextest",
+        "run",
+        "--workspace",
+        "--all-features",
+        "--lib",
+        "--test-threads",
+        "1",
+        "--retries",
+        "0",
+        "--success-output",
+        "immediate",
+        "-E",
+        "test(async_v7_extent) | test(v7_extent_initialization) | test(v7_packer_preallocation)"
+      ],
+      "phase": "hybrid serial startup candidate",
+      "exit_code": 0,
+      "log": "target/wal-opt/20261027-v7-serial-startup/focused.log",
+      "log_sha256": "6b5541e0131f4ec2dcfe0b126c641ae552e4a6c7ba7d84e0ed6d0f7bd8273080"
+    },
+    {
+      "command": [
+        "cargo",
+        "make",
+        "check"
+      ],
+      "phase": "hybrid serial startup candidate",
+      "exit_code": 0,
+      "log": "target/wal-opt/20261027-v7-serial-startup/check.log",
+      "log_sha256": "2e503b1c74d931b7b578dc2631703f35cce06cb697d67e5df2fbe3632e142625"
+    },
+    {
+      "command": [
+        "typos"
+      ],
+      "phase": "hybrid serial startup candidate",
+      "exit_code": 0,
+      "log": "target/wal-opt/20261027-v7-serial-startup/typos.log",
+      "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "command": [
+        "cargo",
+        "build",
+        "--release",
+        "--package",
+        "kv-engine",
+        "--bin",
+        "write-perf",
+        "--features",
+        "bench"
+      ],
+      "phase": "hybrid serial startup candidate",
+      "exit_code": 0,
+      "log": "target/wal-opt/20261027-v7-serial-startup/build.log",
+      "log_sha256": "6050351f232ce1d3a56347ff123ad3b4d3da7062894e4bc795b6409da03f7c80"
+    },
+    {
+      "command": [
+        "typos"
+      ],
+      "phase": "final reports and artifacts",
+      "exit_code": 0,
+      "log": "target/wal-opt/20261027-v7-serial-startup/final-typos.log",
+      "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    }
+  ],
+  "test_count": 1969,
+  "focused_test_count": 9,
+  "skips": 0,
+  "retries": 0
+}

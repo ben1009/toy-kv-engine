@@ -1,0 +1,61 @@
+{
+  "source_base": "59becf2791cfcefb91dee80f20af6157215c392c",
+  "change": "Producer framing and post-submit hashing retain the last candidate semantics. Separate v7 admission entries expose ticket, offset, frame length and commit timestamp to group selection before readiness. Once the head is ready, snapshot up to eight admitted entries; if selected successors are not ready, wait on their condition for at most 100 microseconds, then submit the contiguous ready prefix. Failure removes poisoned entries. Small requests keep their original MVCC guard lifetime. No wire, digest, frontier or fsync changes.",
+  "baseline": {
+    "path": "target/release/write-perf-v7-large-data-async-dispatch",
+    "sha256": "f353022d846530a6754330aaea11f295319ea8f4de20afa09b6d2a3b57b021d8"
+  },
+  "screen_cells": [
+    "ext4-batch8"
+  ],
+  "guard_cells": [
+    "ext4-point1",
+    "ext4-point8",
+    "ext4-point16"
+  ],
+  "schedule": "Independent follow-up triggered because every candidate batch8 sample had both elevated p99 and FRONTIER write latency. Every arm gets one warmup and three alternating scored runs, with 120 seconds initial cooldown per cell and 60 seconds between every invocation. Batch8 compares all three binaries. If it passes, run all three point guards with the same longer cooldown. The original captures remain unchanged; no replacement or score-selected runs.",
+  "ranking": "Highest-throughput eligible scored invocation per exact binary and workload; p99 is from that same invocation. Preserve raw maxima, all stalls, and separate historical matching-binary bests.",
+  "stall_filter": {
+    "frontier_mean_ms_at_least": 0.12,
+    "fdatasync_mean_ms_at_least": 0.6,
+    "selection": "Applied independently to every scored arm. Conservative thresholds are fixed before this cohort; aggregate means can still miss stalls."
+  },
+  "screen_gate": {
+    "minimum_throughput_ratio": 1.0,
+    "maximum_p99_ratio": 1.0,
+    "minimum_eligible_runs_per_arm": 2
+  },
+  "guard_gate": {
+    "minimum_throughput_ratio": 0.98,
+    "maximum_p99_ratio": 1.05,
+    "minimum_eligible_runs_per_arm": 2
+  },
+  "cpu_policy": "Diagnostic only, not a retention veto.",
+  "constraints": [
+    "Production source, builds, tests, profiles and other benchmarks remain frozen during capture.",
+    "Benchmark and temporary databases stay in the local repository.",
+    "A failed or inconclusive candidate preserves its exact executable, patch and raw captures; restore the five Rust files with fresh mtimes and atomically replace the canonical binary, followed by fresh checks.",
+    "Commit accepted source changes separately from evidence."
+  ],
+  "historical_context": "Rank matching-binary retained v4/v7 historical highs separately; current fresh cells compare only v7 builds.",
+  "slow_head": "A ready prefix is not held beyond the join deadline by a later producer. If the head is not ready, no later ticket can be acknowledged; dropped or failed producer jobs poison their tickets. This experiment does not impose a timeout that poisons a merely slow head.",
+  "trigger": {
+    "primary_summary": "rfc-025-v7-admitted-group-20261029-summary.json",
+    "primary_summary_sha256": "aa082c246a23a9aa4ee4931dced3586eb0630e3d3d5138ebfe2fcdfd146517c7",
+    "candidate_batch8_samples": [
+      {
+        "p99_ms": 9.028298,
+        "frontier_mean_ms": 0.27133172429906544
+      },
+      {
+        "p99_ms": 8.701965,
+        "frontier_mean_ms": 0.18271562155688623
+      },
+      {
+        "p99_ms": 8.70743,
+        "frontier_mean_ms": 0.21870331275720165
+      }
+    ],
+    "reason": "All three candidate samples show high FRONTIER-write time and high p99."
+  }
+}

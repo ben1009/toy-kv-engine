@@ -1,0 +1,195 @@
+diff --git a/kv-engine/src/bin/write-perf.rs b/kv-engine/src/bin/write-perf.rs
+index 907f2f9e..167398c3 100644
+--- a/kv-engine/src/bin/write-perf.rs
++++ b/kv-engine/src/bin/write-perf.rs
+@@ -1005,0 +1006,4 @@ struct WalPipelineRecord {
++    #[serde(skip_serializing_if = "Option::is_none")]
++    v7_durability_cycle_ns: Option<u64>,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    v7_durability_cycle_promotions: Option<u64>,
+@@ -1070,0 +1075,6 @@ fn wal_pipeline_record(
++        v7_durability_cycle_ns: (wal_run_info.format_version == 7
++            && wal_run_info.io_mode == "parallel")
++            .then_some(profile.wal_v7_durability_cycle_ns),
++        v7_durability_cycle_promotions: (wal_run_info.format_version == 7
++            && wal_run_info.io_mode == "parallel")
++            .then_some(profile.wal_v7_durability_cycle_promotions),
+@@ -9740,0 +9751,2 @@ mod tests {
++                    v7_durability_cycle_ns: Some(15000),
++                    v7_durability_cycle_promotions: Some(1),
+@@ -9761,0 +9774,8 @@ mod tests {
++            assert_eq!(
++                json["result"]["wal_pipeline"]["v7_durability_cycle_ns"],
++                15000
++            );
++            assert_eq!(
++                json["result"]["wal_pipeline"]["v7_durability_cycle_promotions"],
++                1
++            );
+diff --git a/kv-engine/src/mem_table.rs b/kv-engine/src/mem_table.rs
+index 94d878b9..0b2c6bac 100644
+--- a/kv-engine/src/mem_table.rs
++++ b/kv-engine/src/mem_table.rs
+@@ -172,0 +173,7 @@ pub struct WriteProfile {
++    /// Time in successful v7 Parallel durability cycles, from FRONTIER
++    /// preparation through sync and marker publication/credit cleanup.
++    /// Excludes DATA writes, coalescing waits, and waiter notification.
++    pub wal_v7_durability_cycle_ns: AtomicU64,
++    /// Cycles whose full cost selects the longer coalescing wait even though
++    /// their fdatasync latency alone would select the shorter wait.
++    pub wal_v7_durability_cycle_promotions: AtomicU64,
+@@ -260,0 +268,2 @@ impl WriteProfile {
++        self.wal_v7_durability_cycle_ns.store(0, o);
++        self.wal_v7_durability_cycle_promotions.store(0, o);
+@@ -319,0 +329,2 @@ impl WriteProfile {
++            wal_v7_durability_cycle_ns: self.wal_v7_durability_cycle_ns.load(o),
++            wal_v7_durability_cycle_promotions: self.wal_v7_durability_cycle_promotions.load(o),
+@@ -345,0 +357,9 @@ impl WriteProfile {
++    #[cfg(feature = "bench")]
++    pub(crate) fn record_wal_v7_durability_cycle(&self, nanos: u64, promoted: bool) {
++        let o = std::sync::atomic::Ordering::Relaxed;
++        self.wal_v7_durability_cycle_ns.fetch_add(nanos, o);
++        if promoted {
++            self.wal_v7_durability_cycle_promotions.fetch_add(1, o);
++        }
++    }
++
+@@ -623,0 +644,2 @@ pub struct WriteProfileSnapshot {
++    pub wal_v7_durability_cycle_ns: u64,
++    pub wal_v7_durability_cycle_promotions: u64,
+@@ -747,0 +770,6 @@ impl WriteProfileSnapshot {
++            wal_v7_durability_cycle_ns: self
++                .wal_v7_durability_cycle_ns
++                .saturating_sub(before.wal_v7_durability_cycle_ns),
++            wal_v7_durability_cycle_promotions: self
++                .wal_v7_durability_cycle_promotions
++                .saturating_sub(before.wal_v7_durability_cycle_promotions),
+diff --git a/kv-engine/src/wal/parallel/runtime.rs b/kv-engine/src/wal/parallel/runtime.rs
+index a709ed68..db37e47e 100644
+--- a/kv-engine/src/wal/parallel/runtime.rs
++++ b/kv-engine/src/wal/parallel/runtime.rs
+@@ -2066 +2066 @@ fn run_sync_coordinator(
+-    let mut last_sync_latency = None;
++    let mut last_durability_latency = None;
+@@ -2074 +2074 @@ fn run_sync_coordinator(
+-        let coalesce_wait = match last_sync_latency {
++        let coalesce_wait = match last_durability_latency {
+@@ -2089 +2089 @@ fn run_sync_coordinator(
+-            last_sync_latency = Some(latency);
++            last_durability_latency = Some(latency);
+@@ -2458,0 +2459,3 @@ fn write_v7_frontier_once(file: &File, bytes: &[u8], offset: u64) -> io::Result<
++    #[cfg(all(test, feature = "chaos-testing"))]
++    crate::chaos::failpoint::fail_point!("parallel_wal.v7_frontier_write_delay");
++
+@@ -2550,0 +2554,3 @@ fn validate_sync_diagnostics_transition(
++/// Returns the next coalescing signal: successful v7 cycles include FRONTIER
++/// preparation/write and post-sync cleanup; v4 retains fdatasync latency.
++/// Failed syncs poison the runtime, so their duration cannot start a new cycle.
+@@ -2569 +2575,11 @@ fn synchronize_written_prefix(sync_file: &File, inner: &RuntimeInner) -> Result<
+-    let frontier_cycle = if inner.admission.lock().v7_allocator.is_some() {
++    // FRONTIER preparation, extent readiness, and its write are serialized
++    // with the sync. Include them in v7's batching feedback: a fast fdatasync
++    // alone does not imply a cheap durability advance on direct-I/O storage.
++    // v4 retains its fdatasync-only signal.
++    let v7_cycle_started_at = inner
++        .admission
++        .lock()
++        .v7_allocator
++        .as_ref()
++        .map(|_| Instant::now());
++    let frontier_cycle = if v7_cycle_started_at.is_some() {
+@@ -2648,0 +2665,15 @@ fn synchronize_written_prefix(sync_file: &File, inner: &RuntimeInner) -> Result<
++        // Stop after FRONTIER publication/credit cleanup, before notifying
++        // waiters. Neither DATA writes nor the coalescing wait is included.
++        let durability_latency =
++            v7_cycle_started_at.map_or(sync_latency, |started| started.elapsed());
++        #[cfg(feature = "bench")]
++        if v7_cycle_started_at.is_some()
++            && let Some(profile) = inner.sync_progress.profile()
++        {
++            profile.record_wal_v7_durability_cycle(
++                durability_latency.as_nanos().min(u64::MAX as u128) as u64,
++                sync_latency < SYNC_COALESCE_MIN_SYNC
++                    && durability_latency >= SYNC_COALESCE_MIN_SYNC,
++            );
++        }
++
+@@ -2663 +2694 @@ fn synchronize_written_prefix(sync_file: &File, inner: &RuntimeInner) -> Result<
+-        return Ok(Some(sync_latency));
++        return Ok(Some(durability_latency));
+@@ -2926,0 +2958,4 @@ mod tests {
++        assert!(
++            snapshot.wal_v7_durability_cycle_ns
++                >= snapshot.wal_frontier_write_ns + snapshot.wal_fdatasync_ns
++        );
+@@ -2936,0 +2972,70 @@ mod tests {
++    #[cfg(all(feature = "bench", feature = "chaos-testing"))]
++    #[test]
++    fn failpoint_v7_durability_feedback_includes_frontier_write() -> anyhow::Result<()> {
++        use crate::chaos::failpoint::{self, FailScenario};
++
++        let _scenario = FailScenario::setup();
++        let directory = tempfile::tempdir()?;
++        let path = directory.path().join("v7-cycle-feedback.wal");
++        let Some(V7RuntimeTestWal { wal, owner, .. }) =
++            live_v7_test_wal(&path, super::MAX_WAL_FILE_SIZE, v7_test_resource_limits())?
++        else {
++            return Ok(());
++        };
++        let profile = Arc::new(crate::mem_table::WriteProfile::default());
++        wal.set_write_profile(Arc::clone(&profile));
++        let before = profile.snapshot();
++        let runtime = wal.parallel_runtime.as_ref().unwrap();
++        // Bypass the automatic packer/coordinator so this call's returned
++        // batching signal can be compared with the actual nested I/O timers.
++        let mut packer = runtime.inner.packer_state.lock();
++        wal.put_v7_batch_with_index(&v7_test_batch(1, 16), LIVE_WAL_V5_LIMITS)?;
++        let batch = runtime.inner.admission.lock().queue.pop_front().unwrap();
++        let batch = prepare_test_v7_data(&runtime.inner, &mut packer, batch)?;
++        complete_test_v7_data(&runtime.inner, batch, None)?;
++        failpoint::cfg("parallel_wal.v7_frontier_write_delay", "1*sleep(20)")
++            .expect("valid FRONTIER write delay");
++        let latency =
++            super::synchronize_written_prefix(&runtime.inner.preallocator, &runtime.inner)?
++                .expect("the completed DATA prefix needs a FRONTIER and sync");
++        failpoint::cfg("parallel_wal.v7_frontier_write_delay", "off")
++            .expect("disable FRONTIER write delay");
++
++        let snapshot = profile.snapshot().saturating_sub(before);
++        assert_eq!(snapshot.wal_sync_count, 1);
++        assert_eq!(snapshot.wal_frontier_writes, 1);
++        assert!(snapshot.wal_frontier_write_ns >= 20_000_000);
++        assert_eq!(
++            snapshot.wal_v7_durability_cycle_ns,
++            latency.as_nanos() as u64
++        );
++        assert!(
++            snapshot.wal_v7_durability_cycle_ns
++                >= snapshot.wal_frontier_write_ns + snapshot.wal_fdatasync_ns
++        );
++        assert!(
++            super::synchronize_written_prefix(&runtime.inner.preallocator, &runtime.inner)?
++                .is_none()
++        );
++        let unchanged = profile.snapshot().saturating_sub(before);
++        assert_eq!(
++            unchanged.wal_v7_durability_cycle_ns,
++            snapshot.wal_v7_durability_cycle_ns
++        );
++        assert_eq!(unchanged.wal_sync_count, snapshot.wal_sync_count);
++        runtime.wait_durable(0)?;
++        packer.next_ticket = wal.next_ticket();
++        packer.reserved_end = runtime.logical_length();
++        packer.preallocated_end = std::fs::metadata(&path)?.len();
++        drop(packer);
++        wal.close()?;
++        assert_eq!(owner.snapshot().buffer_memory_bytes, 0);
++
++        profile.reset();
++        let reset = profile.snapshot();
++        assert_eq!(reset.wal_v7_durability_cycle_ns, 0);
++        assert_eq!(reset.wal_v7_durability_cycle_promotions, 0);
++
++        Ok(())
++    }
++

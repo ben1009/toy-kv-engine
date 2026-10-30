@@ -1,0 +1,39 @@
+--- a/kv-engine/src/wal/parallel/runtime.rs
++++ b/kv-engine/src/wal/parallel/runtime.rs
+@@ -665,0 +666,3 @@
++    // Publish accepted coordinates before releasing admission. Readers that
++    // only validate a ticket need not contend on the mutable admission queue.
++    admitted_ticket_end: AtomicU64,
+@@ -942,0 +946 @@
++            admitted_ticket_end: AtomicU64::new(start.next_ticket),
+@@ -1303,0 +1308,3 @@
++            self.inner
++                .admitted_ticket_end
++                .store(next_ticket, Ordering::Release);
+@@ -1417,0 +1425,3 @@
++        self.inner
++            .admitted_ticket_end
++            .store(next_ticket, Ordering::Release);
+@@ -1460 +1470 @@
+-        self.inner.admission.lock().next_ticket
++        self.inner.admitted_ticket_end.load(Ordering::Acquire)
+@@ -1502 +1512 @@
+-        let assigned = self.inner.admission.lock().next_ticket;
++        let assigned = self.inner.admitted_ticket_end.load(Ordering::Acquire);
+@@ -1530 +1540 @@
+-        let assigned = self.inner.admission.lock().next_ticket;
++        let assigned = self.inner.admitted_ticket_end.load(Ordering::Acquire);
+@@ -3356,0 +3367,8 @@
++        assert!(
++            wal.parallel_runtime
++                .as_ref()
++                .unwrap()
++                .wait_durable(ticket + 1)
++                .is_err(),
++            "a rejected prepared batch must not publish another assigned ticket"
++        );
+@@ -5316,0 +5335,4 @@
++        runtime
++            .inner
++            .admitted_ticket_end
++            .store(2, Ordering::Release);

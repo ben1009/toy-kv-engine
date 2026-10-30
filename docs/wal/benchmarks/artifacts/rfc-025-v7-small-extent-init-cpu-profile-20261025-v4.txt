@@ -1,0 +1,45 @@
+# To display the perf.data header info, please use --header/--header-only options.
+#
+#
+# Total Lost Samples: 0
+#
+# Samples: 2K of event 'cpu-clock:u'
+# Event count (approx.): 2636910661
+#
+# Overhead Command Symbol IPC [IPC Coverage]
+# ........ ............... ........................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................... ....................
+#
+ 19.59% wal-ordered-pac [.] <crossbeam_channel::flavors::array::Channel<bool>>::recv - -
+ 11.11% write-perf-v7-s [.] <kv_engine::mvcc::LsmMvccInner>::publish_commit_ts - -
+ 7.04% wal-sync-coordi [.] <crossbeam_channel::flavors::list::Channel<kv_engine::wal::parallel_worker::GroupWriteResult>>::recv - -
+ 3.46% wal-io-worker [.] <crossbeam_channel::flavors::list::Channel<kv_engine::wal::parallel_worker::WorkerCommand<kv_engine::wal::parallel_runtime::ParallelBuffer>>>::recv - -
+ 3.42% write-perf-v7-s [.] __vdso_clock_gettime - -
+ 3.08% write-perf-v7-s [.] <parking_lot::raw_mutex::RawMutex>::lock_slow - -
+ 2.17% write-perf-v7-s [.] <kv_engine::lsm_storage::LsmStorageInner>::put_with_lifecycle_admission - -
+ 2.05% write-perf-v7-s [.] <crossbeam_skiplist::base::SkipList<bytes::bytes::Bytes, bytes::bytes::Bytes>>::search_position::<bytes::bytes::Bytes> - -
+ 2.05% write-perf-v7-s [.] <std::thread::local::LocalKey<core::cell::RefCell<alloc::vec::Vec<u8>>>>::with::<<kv_engine::mem_table::MemTable>::publish_raw_batch::{closure#0}, ()> - -
+ 1.56% write-perf-v7-s [.] <kv_engine::table::builder::SsTableBuilder>::add_inner - -
+ 1.52% write-perf-v7-s [.] <parking_lot::condvar::Condvar>::wait_until_internal - -
+ 1.52% write-perf-v7-s [.] syscall - -
+ 1.45% wal-io-worker [.] kv_engine::wal::parallel_worker::run_worker::<kv_engine::wal::parallel_runtime::ParallelBuffer> - -
+ 1.29% write-perf-v7-s [.] <kv_engine::wal::Wal>::put_key_batch_profiled - -
+ 1.26% wal-io-worker [.] <std::hash::random::RandomState as core::hash::BuildHasher>::hash_one::<&kv_engine::wal::parallel_worker::RequestId> - -
+ 0.95% write-perf-v7-s [.] __sched_yield - -
+ 0.91% write-perf-v7-s [.] <parking_lot::raw_mutex::RawMutex>::unlock_slow - -
+ 0.87% wal-io-worker [.] <core::hash::sip::Hasher<core::hash::sip::Sip13Rounds> as core::hash::Hasher>::write - -
+ 0.87% wal-io-worker [.] <kv_engine::wal::parallel_worker::WorkerCore<kv_engine::wal::parallel_runtime::ParallelBuffer>>::assert_invariants - -
+ 0.80% write-perf-v7-s [.] <kv_engine::mvcc::LsmMvccInner>::write_wal_only - -
+ 0.76% write-perf-v7-s [.] sha2::sha256::x86::digest_blocks - -
+ 0.68% wal-ordered-pac [.] kv_engine::wal::parallel_runtime::pack_admitted_groups - -
+ 0.68% write-perf-v7-s [.] <kv_engine::wal::Wal>::enqueue_encoded_buffer - -
+ 0.65% write-perf-v7-s [.] 0x000000000016d053 - -
+ 0.61% wal-io-worker [.] <crossbeam_channel::flavors::list::Channel<kv_engine::wal::parallel_worker::WorkerCommand<kv_engine::wal::parallel_runtime::ParallelBuffer>>>::start_recv - -
+ 0.61% wal-ordered-pac [.] <crossbeam_channel::flavors::list::Channel<kv_engine::wal::parallel_worker::WorkerCommand<kv_engine::wal::parallel_runtime::ParallelBuffer>>>::send - -
+ 0.61% write-perf-v7-s [.] <kv_engine::wal::parallel_runtime::ParallelWalRuntime>::wait_durable - -
+ 0.57% write-perf-v7-s [.] crc32fast::specialized::pclmulqdq::calculate - -
+ 0.57% write-perf-v7-s [.] crossbeam_epoch::default::with_handle::<crossbeam_epoch::default::pin::{closure#0}, crossbeam_epoch::guard::Guard> - -
+ 0.53% wal-io-worker [.] kv_engine::wal::parallel_worker::process_worker_events::<kv_engine::wal::parallel_runtime::ParallelBuffer> - -
+ 0.53% write-perf-v7-s [.] <kv_engine::mem_table::MemTable>::commit_wal_ticket - -
+#
+# (Tip: If you prefer Intel style assembly, try: perf annotate -M intel)
+#

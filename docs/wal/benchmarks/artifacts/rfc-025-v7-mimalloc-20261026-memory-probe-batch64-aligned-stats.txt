@@ -1,0 +1,57 @@
+subproc 0
+ pages           peak       total     current       block      total#   
+  touched   :     0           0           0                                ok
+  pages     :    17.0 K      34.4 K      31      
+  abandoned :    16.9 K      51.1 K      24      
+  reclaima  :    55      
+  reclaimf  :    34.0 K  
+  reabandon :    16.9 K  
+  waits     :     0      
+  extended  :     0      
+  retire    :     0      
+  searches  :     2.8 avg
+
+ arenas          peak       total     current       block      total#   
+  reserved  :     2.0 GiB     2.0 GiB     2.0 GiB                          
+  committed :     1.0 GiB     1.0 GiB     1.0 GiB                          
+  reset     :     0      
+  purged    :     1.0 GiB
+  arenas    :     2      
+  rollback  :     0      
+  mmaps     :     6      
+  commits   :     0      
+  resets    :     0      
+  purges    :   530      
+  guarded   :     0      
+  theaps    :    15          18           0      
+  heaps     :     1           1           1      
+  heap waits:     0      
+
+ process         peak       total     current       block      total#   
+  threads   :    16          19           1      
+  numa nodes:     1
+  elapsed   :     0.938 s
+  process   : user: 2.000 s, system: 0.890 s, faults: 0, peak rss: 1.0 GiB, peak commit: 1.0 GiB
+
+heap stats:     peak       total       freed     current        unit       count   
+  reserved:     0           0           0           0                                ok
+ committed:     0           0           0           0                                ok
+     reset:     0      
+    purged:     0      
+   touched:     0           0           0           0                                ok
+  segments:     0           0           0           0                                ok
+-abandoned:     0           0           0           0                                ok
+   -cached:     0           0           0           0                                ok
+     pages:     0           0           0           0                                ok
+-abandoned:     0           0           0           0                                ok
+ -extended:     0      
+ -noretire:     0      
+     mmaps:     0      
+   commits:     0      
+    resets:     0      
+    purges:     0      
+   threads:     0           0           0           0                                ok
+  searches:     0.0 avg
+numa nodes:     1
+   elapsed:     0.962 s
+   process: user: 0.016 s, system: 0.006 s, faults: 0, rss: 27.8 MiB

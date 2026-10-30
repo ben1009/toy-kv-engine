@@ -1,0 +1,13 @@
+{
+  "created_at_utc": "2026-10-30T00:19:01.617097+00:00",
+  "filesystem": "/dev/nvme0n1p3[/liu/proj/toy-kv-engine] ext4 rw,nosuid,nodev,relatime",
+  "capture_inputs_sha256": {
+    "rfc-025-v7-dynamic-point-20261030-analyze.py": "f467c6aa9be078a956463156ec6a28c614afe4e15f064dd1dab8a6b032aa2854",
+    "rfc-025-v7-dynamic-point-20261030-binaries.json": "672586249167514e0caec94e1d7ab3d31f8b57a612373656b94b4b7a6743a6d4",
+    "rfc-025-v7-dynamic-point-20261030-child.py": "538c6a74a405dd67eba4d7bb7295fd24965c69a0fa3dde06bed30ed1985650ab",
+    "rfc-025-v7-dynamic-point-20261030-matrix.json": "65cb0d73894ec51a36077a0db030b49dbe6492fb582eab2210e17f1f44b182c2",
+    "rfc-025-v7-dynamic-point-20261030-plan.json": "7066c8647b70d6d8da4cd0e3848bbf1e231934daa247cb43f6906b8c6c818cb5",
+    "rfc-025-v7-dynamic-point-20261030-run-all.py": "96d7d90e1562df65898594e9181b707ce4efdd576a55b602c4589e14f733a47a",
+    "rfc-025-v7-dynamic-point-20261030-run.py": "601f8d628af3f91f3bae73e59252e77b2d7a0d7dab683ea3c7b0b8c3ff5b5be3"
+  }
+}

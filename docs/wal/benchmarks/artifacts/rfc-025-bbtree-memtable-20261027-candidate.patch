@@ -1,0 +1,601 @@
+diff --git a/Cargo.lock b/Cargo.lock
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -124,0 +125,9 @@
++name = "bbtree"
++version = "0.1.5"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "5fcbde4ae7859bc7cbeabf81fd0fb834fd135a6167e90828341724e9884f2f25"
++dependencies = [
++ "vstd",
++]
++
++[[package]]
+@@ -294,0 +304,6 @@
++
++[[package]]
++name = "convert_case"
++version = "0.4.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "6245d59a3e82a7fc217c5828a6692dbc6dfb63a0c8c90495621f7b9d79704a0e"
+@@ -427 +442 @@
+- "hashbrown",
++ "hashbrown 0.14.5",
+@@ -480,0 +496,6 @@
++
++[[package]]
++name = "equivalent"
++version = "1.0.3"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "00d174d5400e5e8fd687ad1049e2f578285fa914201b1af7e8b112a4546bd826"
+@@ -618,0 +640,6 @@
++
++[[package]]
++name = "hashbrown"
++version = "0.17.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
+@@ -702,0 +730,10 @@
++name = "indexmap"
++version = "2.14.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "cc4e190f5d26ca7051642629da2c52fc03bde85a03197c99408dcd291734c855"
++dependencies = [
++ "equivalent",
++ "hashbrown 0.17.1",
++]
++
++[[package]]
+@@ -813,0 +851 @@
++ "bbtree",
+@@ -1538,0 +1577,11 @@
++name = "synstructure"
++version = "0.13.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "728a70f3dbaf5bab7f0c4b1ac8d7ae5ea60a4b5549c8a5914361c99147a709d2"
++dependencies = [
++ "proc-macro2",
++ "quote",
++ "syn",
++]
++
++[[package]]
+@@ -1673,0 +1723,65 @@
++
++[[package]]
++name = "verus_builtin"
++version = "0.0.0-2026-08-30-0159"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "300d269a2e06dbe54cb53084464065912ad7accbb52ae8d6c8aa7a6c521974c5"
++
++[[package]]
++name = "verus_builtin_macros"
++version = "0.0.0-2026-08-30-0159"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "cc040bfded82e79a708c1819c52b386ee23c0c823239334f39ced152bbdf3624"
++dependencies = [
++ "convert_case",
++ "proc-macro2",
++ "quote",
++ "syn",
++ "synstructure",
++ "verus_prettyplease",
++ "verus_syn",
++]
++
++[[package]]
++name = "verus_prettyplease"
++version = "0.0.0-2026-08-09-0044"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "51fc115de5fb3806bc362060bb683024660ed2bc13c1183d1f01d464e4537139"
++dependencies = [
++ "proc-macro2",
++ "verus_syn",
++]
++
++[[package]]
++name = "verus_state_machines_macros"
++version = "0.0.0-2026-08-02-0125"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "93f77ff8d121edb1bf2651335769a80a2f611da8573c3b498434a66b3162805f"
++dependencies = [
++ "indexmap",
++ "proc-macro2",
++ "quote",
++ "verus_syn",
++]
++
++[[package]]
++name = "verus_syn"
++version = "0.0.0-2026-08-02-0125"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "f17237ea6d267e457d53ce36f55b315fc9edd26eb88c765dd95e035c0b415869"
++dependencies = [
++ "proc-macro2",
++ "quote",
++ "unicode-ident",
++]
++
++[[package]]
++name = "vstd"
++version = "0.0.0-2026-08-30-0159"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "7169790c92857fa9441c8ba7e0c469f4fc62104caf1dfc632c318577a1a08d7a"
++dependencies = [
++ "verus_builtin",
++ "verus_builtin_macros",
++ "verus_state_machines_macros",
++]
+diff --git a/kv-engine/Cargo.toml b/kv-engine/Cargo.toml
+--- a/kv-engine/Cargo.toml
++++ b/kv-engine/Cargo.toml
+@@ -23,0 +24 @@
++bbtree-memtable = ["dep:bbtree"]
+@@ -33,0 +35 @@
++bbtree = { version = "=0.1.5", optional = true }
+diff --git a/kv-engine/src/mem_table.rs b/kv-engine/src/mem_table.rs
+--- a/kv-engine/src/mem_table.rs
++++ b/kv-engine/src/mem_table.rs
+@@ -16,0 +17,8 @@
++
++#[cfg(feature = "bbtree-memtable")]
++#[path = "mem_table_bbtree.rs"]
++mod bbtree_backend;
++#[cfg(feature = "bbtree-memtable")]
++use bbtree_backend::Map as PointMap;
++#[cfg(not(feature = "bbtree-memtable"))]
++type PointMap = SkipMap<Bytes, Bytes>;
+@@ -1086 +1094 @@
+-    map: Arc<SkipMap<Bytes, Bytes>>,
++    map: Arc<PointMap>,
+@@ -1136 +1144 @@
+-            map: Arc::new(SkipMap::new()),
++            map: Arc::new(PointMap::new()),
+@@ -1287 +1295,9 @@
+-        let (wal, max_ts) = Wal::recover(&path, &ret.map)?;
++        #[cfg(feature = "bbtree-memtable")]
++        let recovery_storage = SkipMap::new();
++        #[cfg(feature = "bbtree-memtable")]
++        let recovery_map = &recovery_storage;
++        #[cfg(not(feature = "bbtree-memtable"))]
++        let recovery_map = ret.map.as_ref();
++        let (wal, max_ts) = Wal::recover(&path, recovery_map)?;
++        #[cfg(feature = "bbtree-memtable")]
++        ret.import_recovered_points(recovery_map);
+@@ -1326,0 +1343,6 @@
++        #[cfg(feature = "bbtree-memtable")]
++        let recovery_storage = SkipMap::new();
++        #[cfg(feature = "bbtree-memtable")]
++        let recovery_map = &recovery_storage;
++        #[cfg(not(feature = "bbtree-memtable"))]
++        let recovery_map = ret.map.as_ref();
+@@ -1329 +1351 @@
+-            &ret.map,
++            recovery_map,
+@@ -1332,0 +1355,2 @@
++        #[cfg(feature = "bbtree-memtable")]
++        ret.import_recovered_points(recovery_map);
+@@ -1338,0 +1363,8 @@
++    }
++
++    /// Compatibility bridge for legacy WAL replay. V7 replays directly below.
++    #[cfg(feature = "bbtree-memtable")]
++    fn import_recovered_points(&self, recovered: &SkipMap<Bytes, Bytes>) {
++        for entry in recovered {
++            self.map.insert(entry.key().clone(), entry.value().clone());
++        }
+@@ -1688,0 +1721,3 @@
++        #[cfg(feature = "bbtree-memtable")]
++        let mut range = std::iter::once(self.map.visible_version(&seek_key, read_ts)).flatten();
++        #[cfg(not(feature = "bbtree-memtable"))]
+@@ -1775,0 +1811,3 @@
++        #[cfg(feature = "bbtree-memtable")]
++        let mut range = std::iter::once(self.map.visible_version(seek_buf, read_ts)).flatten();
++        #[cfg(not(feature = "bbtree-memtable"))]
+@@ -3023 +3061 @@
+-    /// Access the underlying skiplist map. Intended for tests and benchmarks only.
++    /// Access the selected point-entry map. Intended for tests and benchmarks only.
+@@ -3026 +3064 @@
+-    pub fn raw_map(&self) -> &Arc<SkipMap<Bytes, Bytes>> {
++    pub fn raw_map(&self) -> &Arc<PointMap> {
+@@ -3342,0 +3381 @@
++#[cfg(not(feature = "bbtree-memtable"))]
+@@ -3344,0 +3384 @@
++#[cfg(not(feature = "bbtree-memtable"))]
+@@ -3345,0 +3386,4 @@
++#[cfg(feature = "bbtree-memtable")]
++type SkipMapRangeIter<'a> = bbtree_backend::Range<'a, Bytes, (Bound<Bytes>, Bound<Bytes>)>;
++#[cfg(feature = "bbtree-memtable")]
++type SkipMapEntry<'a> = bbtree_backend::Entry<'a>;
+@@ -3354 +3398 @@
+-    map: Arc<SkipMap<Bytes, Bytes>>,
++    map: Arc<PointMap>,
+diff --git a/kv-engine/src/mem_table_bbtree.rs b/kv-engine/src/mem_table_bbtree.rs
+--- /dev/null
++++ b/kv-engine/src/mem_table_bbtree.rs
+@@ -0,0 +1,385 @@
++//! Experimental BBTree point-entry backend. No leaf latch escapes a method.
++
++use std::{
++    borrow::Borrow,
++    cmp::Ordering,
++    collections::VecDeque,
++    marker::PhantomData,
++    ops::{Bound, ControlFlow, RangeBounds, RangeFull},
++};
++
++use bbtree::{BBTreeMap, InlineKey, InlineWord, WithInlineKey};
++use bytes::Bytes;
++
++/// Preserve the engine's shared key bytes and use BBTree's byte-string strategy.
++#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
++pub struct Key(Bytes);
++
++impl Borrow<[u8]> for Key {
++    fn borrow(&self) -> &[u8] {
++        &self.0
++    }
++}
++
++impl Borrow<Bytes> for Key {
++    fn borrow(&self) -> &Bytes {
++        &self.0
++    }
++}
++
++impl InlineKey for Key {
++    const HAS_CMP_FROM: bool = <[u8] as InlineKey>::HAS_CMP_FROM;
++    const HAS_HASH_TAG: bool = <[u8] as InlineKey>::HAS_HASH_TAG;
++
++    fn inline_key_at(&self, offset: usize) -> InlineWord {
++        self.0.as_ref().inline_key_at(offset)
++    }
++
++    fn hash_tag(&self) -> u8 {
++        self.0.as_ref().hash_tag()
++    }
++
++    fn cmp_from(&self, other: &Self, equal_len: usize) -> Ordering {
++        self.0.as_ref().cmp_from(other.0.as_ref(), equal_len)
++    }
++
++    fn cmp_prefix(&self, prefix: &[u8]) -> Ordering {
++        self.0.as_ref().cmp_prefix(prefix)
++    }
++}
++
++/// Owned byte references remain valid after the tree releases its leaf latch.
++pub struct Entry<'a> {
++    key: Bytes,
++    value: Bytes,
++    owner: PhantomData<&'a Map>,
++}
++
++impl Entry<'_> {
++    fn copy(key: &Key, value: &Bytes) -> Self {
++        Self {
++            key: key.0.clone(),
++            value: value.clone(),
++            owner: PhantomData,
++        }
++    }
++
++    pub fn key(&self) -> &Bytes {
++        &self.key
++    }
++
++    pub fn value(&self) -> &Bytes {
++        &self.value
++    }
++}
++
++/// Feature-selected point map; range tombstones use their original skiplist.
++pub struct Map {
++    inner: BBTreeMap<Key, Bytes, WithInlineKey>,
++}
++
++impl Map {
++    pub fn new() -> Self {
++        Self {
++            inner: BBTreeMap::with_strategy(WithInlineKey),
++        }
++    }
++
++    pub fn insert(&self, key: Bytes, value: Bytes) {
++        if self.inner.insert(Key(key), value).is_err() {
++            // Publication may follow successful WAL durability. As with the
++            // existing infallible skiplist allocation, OOM must fail-stop;
++            // returning an error could expose a partially published batch.
++            std::process::abort();
++        }
++    }
++
++    pub fn get<Q: Ord + ?Sized>(&self, key: &Q) -> Option<Entry<'_>>
++    where
++        Key: Borrow<Q>,
++    {
++        self.inner.read(key, Entry::copy)
++    }
++
++    pub fn is_empty(&self) -> bool {
++        self.inner.is_empty()
++    }
++
++    pub fn front(&self) -> Option<Entry<'_>> {
++        self.inner
++            .scan::<[u8], _>(.., |key, value| ControlFlow::Break(Entry::copy(key, value)))
++    }
++
++    pub fn back(&self) -> Option<Entry<'_>> {
++        self.inner
++            .scan_rev::<[u8], _>(.., |key, value| ControlFlow::Break(Entry::copy(key, value)))
++    }
++
++    /// Locate one MVCC version without allocating a range cursor or its buffer.
++    pub fn visible_version(&self, seek: &[u8], read_ts: u64) -> Option<Entry<'_>> {
++        let prefix = crate::key::encoded_user_key_prefix(seek)
++            .expect("seek is an engine-encoded internal key");
++        self.inner
++            .scan::<[u8], _>((Bound::Included(seek), Bound::Unbounded), |key, value| {
++                if crate::key::encoded_user_key_prefix(&key.0) != Some(prefix) {
++                    return ControlFlow::Break(None);
++                }
++                let ts = crate::key::extract_ts(&key.0);
++                debug_assert!(!crate::key::TS_ENABLED || ts.is_some(), "corrupt MVCC key");
++                if ts.unwrap_or(0) > read_ts {
++                    return ControlFlow::Continue(());
++                }
++                ControlFlow::Break(Some(Entry::copy(key, value)))
++            })
++            .flatten()
++    }
++
++    pub fn range<Q, R>(&self, bounds: R) -> Range<'_, Q, R>
++    where
++        Q: Ord + ?Sized,
++        R: RangeBounds<Q>,
++        Key: Borrow<Q>,
++        Bytes: Borrow<Q>,
++    {
++        Range {
++            map: self,
++            bounds,
++            pending: VecDeque::new(),
++            last: None,
++            exhausted: false,
++            query: PhantomData,
++        }
++    }
++
++    pub fn iter(&self) -> Range<'_, [u8], RangeFull> {
++        self.range(..)
++    }
++}
++
++impl Default for Map {
++    fn default() -> Self {
++        Self::new()
++    }
++}
++
++/// Bounded owned read-ahead, with no raw node cursor or lock between calls.
++///
++/// MVCC scans fix their read timestamp before traversing this cursor. Later
++/// publications have newer timestamps; callers filter them as on the skiplist.
++/// Refill resumes strictly after the last delivered full internal key.
++pub struct Range<'a, Q: ?Sized, R> {
++    map: &'a Map,
++    bounds: R,
++    pending: VecDeque<Entry<'a>>,
++    last: Option<Bytes>,
++    exhausted: bool,
++    query: PhantomData<fn(&Q)>,
++}
++
++impl<'a, Q, R> Iterator for Range<'a, Q, R>
++where
++    Q: Ord + ?Sized,
++    R: RangeBounds<Q>,
++    Key: Borrow<Q>,
++    Bytes: Borrow<Q>,
++{
++    type Item = Entry<'a>;
++
++    fn next(&mut self) -> Option<Self::Item> {
++        if self.pending.is_empty() && !self.exhausted {
++            let lower = self.last.as_ref().map_or_else(
++                || self.bounds.start_bound(),
++                |last| Bound::Excluded(last.borrow()),
++            );
++            let upper = self.bounds.end_bound();
++            let empty = match (lower, upper) {
++                (Bound::Unbounded, _) | (_, Bound::Unbounded) => false,
++                (Bound::Included(a), Bound::Included(b)) => a > b,
++                (
++                    Bound::Included(a) | Bound::Excluded(a),
++                    Bound::Included(b) | Bound::Excluded(b),
++                ) => a >= b,
++            };
++            if empty {
++                self.exhausted = true;
++                return None;
++            }
++            let pending = &mut self.pending;
++            let full = self.map.inner.scan((lower, upper), |key, value| {
++                pending.push_back(Entry::copy(key, value));
++                if pending.len() == 64 {
++                    ControlFlow::Break(())
++                } else {
++                    ControlFlow::Continue(())
++                }
++            });
++            self.exhausted = full.is_none();
++        }
++        let item = self.pending.pop_front()?;
++        self.last = Some(item.key.clone());
++
++        Some(item)
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use std::{collections::BTreeMap, ops::Bound, sync::Arc};
++
++    use bytes::Bytes;
++
++    use super::{InlineKey, Key, Map};
++
++    #[test]
++    fn byte_keys_match_ordered_model_with_zeros_and_shared_prefixes() {
++        let map = Map::new();
++        let mut model = BTreeMap::new();
++        let mut seed = 42_u64;
++        for index in 0..4096 {
++            seed ^= seed << 13;
++            seed ^= seed >> 7;
++            seed ^= seed << 17;
++            let mut key = vec![0, 0xff, 0, b'a'];
++            key.extend_from_slice(&seed.to_be_bytes());
++            key.truncate(4 + index % 9);
++            let key = Bytes::from(key);
++            let value = Bytes::from(index.to_string());
++            map.insert(key.clone(), value.clone());
++            model.insert(key, value);
++        }
++        for raw in [b"".as_slice(), b"\0", b"\0\0", b"a", b"a\0", b"\xff"] {
++            map.insert(Bytes::copy_from_slice(raw), Bytes::from_static(b"edge"));
++            model.insert(Bytes::copy_from_slice(raw), Bytes::from_static(b"edge"));
++        }
++        let actual: Vec<_> = map.iter().map(|entry| (entry.key, entry.value)).collect();
++        let expected: Vec<_> = model.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
++        assert_eq!(actual, expected);
++        for (key, value) in &model {
++            assert_eq!(map.get(key.as_ref()).unwrap().value(), value);
++        }
++        assert_eq!(
++            map.front().unwrap().key(),
++            model.first_key_value().unwrap().0
++        );
++        assert_eq!(map.back().unwrap().key(), model.last_key_value().unwrap().0);
++        for raw in model.keys() {
++            let key = Key(raw.clone());
++            for offset in [0, 1, 7, 8, 16, 63, 64] {
++                let mut expected = [0; 8];
++                if let Some(tail) = raw.get(offset..) {
++                    let len = tail.len().min(8);
++                    expected[..len].copy_from_slice(&tail[..len]);
++                }
++                assert_eq!(key.inline_key_at(offset), u64::from_be_bytes(expected));
++            }
++        }
++    }
++
++    #[test]
++    fn range_bounds_are_exact_across_refills_and_empty_ranges() {
++        let map = Map::new();
++        for key in 0_u32..1024 {
++            map.insert(Bytes::copy_from_slice(&key.to_be_bytes()), Bytes::new());
++        }
++        let lower = 127_u32.to_be_bytes();
++        let upper = 769_u32.to_be_bytes();
++        for start in [
++            Bound::Included(lower.as_slice()),
++            Bound::Excluded(lower.as_slice()),
++        ] {
++            for end in [
++                Bound::Included(upper.as_slice()),
++                Bound::Excluded(upper.as_slice()),
++            ] {
++                let actual: Vec<_> = map.range::<[u8], _>((start, end)).map(|e| e.key).collect();
++                let first = 127 + u32::from(matches!(start, Bound::Excluded(_)));
++                let last = 769 - u32::from(matches!(end, Bound::Excluded(_)));
++                let expected: Vec<_> = (first..=last)
++                    .map(|x| Bytes::copy_from_slice(&x.to_be_bytes()))
++                    .collect();
++                assert_eq!(actual, expected);
++            }
++        }
++        assert!(
++            map.range::<[u8], _>((
++                Bound::Excluded(lower.as_slice()),
++                Bound::Excluded(lower.as_slice())
++            ))
++            .next()
++            .is_none()
++        );
++        assert!(
++            map.range::<[u8], _>((
++                Bound::Included(upper.as_slice()),
++                Bound::Included(lower.as_slice())
++            ))
++            .next()
++            .is_none()
++        );
++    }
++
++    #[test]
++    fn owned_cursor_and_entry_do_not_block_concurrent_publication() {
++        static_assertions::assert_impl_all!(crate::mem_table::MemTableIterator: Send);
++        let map = Arc::new(Map::new());
++        for key in 0_u32..512 {
++            map.insert(
++                Bytes::copy_from_slice(&key.to_be_bytes()),
++                Bytes::from_static(b"old"),
++            );
++        }
++        let mut cursor = map.iter();
++        let held = cursor.next().unwrap();
++        let writer_map = Arc::clone(&map);
++        std::thread::spawn(move || {
++            for key in 0_u32..1024 {
++                writer_map.insert(
++                    Bytes::copy_from_slice(&key.to_be_bytes()),
++                    Bytes::from_static(b"new"),
++                );
++            }
++        })
++        .join()
++        .unwrap();
++        assert_eq!(held.value(), b"old".as_slice());
++        let mut previous = held.key().clone();
++        for entry in cursor {
++            assert!(entry.key() > &previous);
++            previous = entry.key;
++        }
++        assert_eq!(previous, Bytes::copy_from_slice(&1023_u32.to_be_bytes()));
++        assert_eq!(
++            map.get(&0_u32.to_be_bytes()[..]).unwrap().value(),
++            b"new".as_slice()
++        );
++    }
++
++    #[test]
++    fn mvcc_lookup_skips_new_versions_across_leaf_splits() {
++        let map = Map::new();
++        let user = b"shared\0binary\xffprefix";
++        for ts in 1..=512 {
++            map.insert(
++                Bytes::from(crate::key::encode_internal_key(user, ts)),
++                Bytes::from(ts.to_string()),
++            );
++        }
++        map.insert(
++            Bytes::from(crate::key::encode_internal_key(
++                b"shared\0binary\xffprefix\0",
++                1,
++            )),
++            Bytes::from_static(b"adjacent"),
++        );
++        let seek = crate::key::encode_internal_key(user, u64::MAX);
++        assert!(map.visible_version(&seek, 0).is_none());
++        for ts in [1, 127, 128, 255, 511, 512, 999] {
++            assert_eq!(
++                map.visible_version(&seek, ts).unwrap().value().as_ref(),
++                ts.min(512).to_string().as_bytes()
++            );
++        }
++        let missing = crate::key::encode_internal_key(b"shared\0binary\xffprefiw", u64::MAX);
++        assert!(map.visible_version(&missing, u64::MAX).is_none());
++    }
++}

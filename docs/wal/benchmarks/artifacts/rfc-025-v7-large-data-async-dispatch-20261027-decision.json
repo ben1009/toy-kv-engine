@@ -1,0 +1,23 @@
+{
+  "assessment_passed": false,
+  "source_retained": false,
+  "source_restored": true,
+  "cpu_is_diagnostic": true,
+  "captured_cells": [
+    "ext4-batch16"
+  ],
+  "cancelled_cells": [
+    "ext4-batch8",
+    "ext4-point8",
+    "ext4-batch1"
+  ],
+  "reason": "Inconclusive: only two of five pairs survive the predeclared stall mask; minimum is three. Their positive throughput/p99 ratios do not qualify retention and remain storage-confounded by long baseline tails below the aggregate threshold. Dependent stages cancelled without replacements.",
+  "candidate_tests": 1973,
+  "candidate_focused_tests": 47,
+  "source_candidates": 1,
+  "canonical_sha256": "e9abcc91b499c3cecd0acc137a0c9b8f65228b76ac3cb31ba3894bf9a0d06d40",
+  "restored_source_sha256": {
+    "runtime": "8979edacc62576db9ff01fcb0944a6410dbb9039632f1c64471481d11d7425f0",
+    "worker": "b26fedc3a3966a47d5ee05f9fa07241730f60b7ff00b51b454235c13b1cf2970"
+  }
+}

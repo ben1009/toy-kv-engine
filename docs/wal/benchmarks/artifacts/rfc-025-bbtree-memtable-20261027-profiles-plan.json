@@ -1,0 +1,19 @@
+{
+  "created_at_utc": "2026-10-27T01:45:16.003288+00:00",
+  "excluded_from_scoring": true,
+  "reason": "Investigate the completed CPU-screen 16-writer publication regression; no additional qualifying captures or retries.",
+  "backends": [
+    "skipmap",
+    "bbtree"
+  ],
+  "workload": "memtable_publish_concurrent",
+  "operations": 1000000,
+  "writers": 16,
+  "batch": 64,
+  "value_size": 1024,
+  "event": "cpu-clock:u",
+  "frequency": 99,
+  "call_graph": "dwarf,16384",
+  "profile_count": 2,
+  "scope": "User CPU samples only; kernel and off-CPU waits are not measured. Larger diagnostic dataset is not pooled with the fixed screen."
+}

@@ -1,0 +1,47 @@
+{
+  "source_retained": false,
+  "reason": "Solo throughput and p99 improve, but the eight-writer best throughput falls 11.7%; sixteen writers have only one eligible candidate run and it also trails the retained build.",
+  "canonical_sha256": "f353022d846530a6754330aaea11f295319ea8f4de20afa09b6d2a3b57b021d8",
+  "rust_mtimes_refreshed": true,
+  "atomic_binary_replacement": true,
+  "restored_inputs": 128,
+  "preliminary_restored_checks": [
+    {
+      "step": "restored-check",
+      "command": [
+        "cargo",
+        "make",
+        "check"
+      ],
+      "returncode": 0,
+      "elapsed_seconds": 59.30101418495178,
+      "log_path": "target/wal-opt/20261029-v7-post-submit-hash/restored-check.log",
+      "log_sha256": "cf2028ed2fb5a25d5dddd23aa7128ced83920699c34f65bbbbf513c13de679f9"
+    }
+  ],
+  "restored_checks": [
+    {
+      "step": "restored-check",
+      "command": [
+        "cargo",
+        "make",
+        "check"
+      ],
+      "returncode": 0,
+      "elapsed_seconds": 35.21472716331482,
+      "log_path": "target/wal-opt/20261029-v7-post-submit-hash/restored-check-final.log",
+      "log_sha256": "81e55729c13dc7f36ec2975ec841b9d122a1e3762c3180ba937c2fec9b4f3f81"
+    },
+    {
+      "step": "restored-typos",
+      "command": [
+        "typos"
+      ],
+      "returncode": 0,
+      "elapsed_seconds": 0.26233601570129395,
+      "log_path": "target/wal-opt/20261029-v7-post-submit-hash/restored-typos-final.log",
+      "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    }
+  ],
+  "initial_spelling_issue": "The restored full check passed 1973 tests but printed spelling errors from truncated patch hunk labels. The labels are stripped without changing source bytes, with the frozen original preserved compressed; final checks follow."
+}

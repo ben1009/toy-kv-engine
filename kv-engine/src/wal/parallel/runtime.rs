@@ -8,13 +8,16 @@ use std::{
         fd::AsRawFd,
         unix::fs::{FileExt, MetadataExt},
     },
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
 
 use crate::{
-    pitr::{CanonicalWalEntryStream, LIVE_WAL_V5_LIMITS, WalBatch, WalV5Limits},
+    pitr::{CanonicalWalEntryStream, LIVE_WAL_V5_LIMITS, RecordedAt, WalBatch, WalV5Limits},
     wal::v7::{
         admission::{WalV7BatchBufferPin, WalV7OwnedBatchReservation, WalV7ReservationOwner},
         allocator::{
@@ -22,9 +25,9 @@ use crate::{
             WalV7FrontierReservation, WalV7PhysicalAllocator,
         },
         codec::{
-            PreparedWalV7LogicalBatch, WAL_V7_FRAME_LEN, WAL_V7_HEADER_LEN, WalV7Frontier,
-            WalV7Header, data_fragment_count, encode_data_frames_into,
-            encode_frontier_successor_into, frame_record_digest, prepare_logical_batch,
+            EncodedWalV7Entries, EncodedWalV7LogicalBatch, WAL_V7_FRAME_LEN, WAL_V7_HEADER_LEN,
+            WalV7Frontier, WalV7Header, data_fragment_count, encode_frontier_successor_into,
+            frame_record_digest, prepare_logical_batch,
         },
         install::{WalV7RuntimeMetadata, WalV7RuntimeSeed},
         leader::WalV7LeaderCapacityError,
@@ -48,15 +51,28 @@ const NORMAL_ACTIVE_BUFFER_BUDGET: u64 = 64 * 1024 * 1024;
 const MAX_BUFFER_CAPACITY: u64 = 240 * 1024 * 1024;
 const WAL_HEADER_END: u64 = 4096;
 const PACKER_GROUP_MAX_TICKETS: usize = 8;
+// Keep one fixed deadline while joining admitted producers. A shorter
+// opportunity applies when only one ready batch has a concurrent preparer.
+const V7_FRAME_JOIN_LIMIT: Duration = Duration::from_micros(100);
+const V7_SOLO_JOIN_LIMIT: Duration = Duration::from_micros(10);
 const EXTENT_INITIALIZATION_CHUNK: usize = 128 * 1024;
+#[repr(align(4096))]
+struct ExtentZeros([u8; EXTENT_INITIALIZATION_CHUNK]);
+
+// A single immutable aligned source avoids allocating a zero buffer per v7
+// runtime or per range. Its lifetime also covers all synchronous direct I/O.
+static EXTENT_ZEROS: ExtentZeros = ExtentZeros([0; EXTENT_INITIALIZATION_CHUNK]);
 // Large writes amortize extent conversion themselves. Zero-filling their
 // allocated space adds a second write of the same bytes on ext4.
 const ALLOCATION_ONLY_MIN_BATCH_BYTES: usize = 64 * 1024;
 // Coalesce already-admitted tickets with one fixed deadline. Refresh the
 // batching cutoff only when the written prefix catches it; a refresh cannot
-// extend the deadline. Skip the wait when the prior sync was cheap.
+// extend the deadline. V4 skips waiting after cheap syncs; v7 uses a shorter
+// wait because each durability advance also writes a FRONTIER frame.
 const SYNC_COALESCE_WAIT: Duration = Duration::from_micros(400);
 const SYNC_COALESCE_MIN_SYNC: Duration = Duration::from_micros(100);
+const V7_FAST_SYNC_COALESCE_WAIT: Duration = Duration::from_micros(100);
+const V7_LARGE_BATCH_COALESCE_WAIT: Duration = Duration::from_micros(800);
 
 #[derive(Debug)]
 pub(crate) struct WalFull;
@@ -69,13 +85,42 @@ impl std::fmt::Display for WalFull {
 
 impl std::error::Error for WalFull {}
 
-/// A v7 batch whose canonical entry stream and scratch reservation were
-/// prepared before the caller enters the MVCC write sequencer.
-pub(crate) struct WalV7PreparedBatch<'a> {
-    prepared: PreparedWalV7LogicalBatch<'a>,
-    owner: Arc<WalV7ReservationOwner>,
-    preparation: Option<crate::wal::v7::admission::WalV7OwnedPreparationReservation>,
-    limits: WalV5Limits,
+/// Owned v7 entry bytes and charged DATA buffers prepared before the caller
+/// enters the MVCC sequencer. Admission assigns their ordered coordinates.
+pub(crate) struct WalV7PreparedBatch {
+    // Drop owned bytes and the frame buffer before their reservation charge.
+    encoded_entries: EncodedWalV7Entries,
+    buffer: ParallelBuffer,
+    reservation: WalV7OwnedBatchReservation,
+    fragment_count: u32,
+    frame_bytes: usize,
+    preparation: WalV7PreparingBatch,
+}
+
+/// A hint that another producer may yet join an open group. This does not
+/// assign a ticket or participate in the WAL's ordering or durability rules.
+struct WalV7PreparingBatch {
+    count: Arc<AtomicU64>,
+}
+
+impl WalV7PreparingBatch {
+    fn new(count: &Arc<AtomicU64>) -> Result<Self> {
+        count
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+                value.checked_add(1)
+            })
+            .map_err(|_| anyhow!("v7 producer preparation count overflow"))?;
+        Ok(Self {
+            count: Arc::clone(count),
+        })
+    }
+}
+
+impl Drop for WalV7PreparingBatch {
+    fn drop(&mut self) {
+        let previous = self.count.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(previous > 0, "v7 producer preparation count underflow");
+    }
 }
 
 /// Coordinates and resource owner from which a parallel runtime begins admission.
@@ -430,6 +475,7 @@ pub(crate) struct ParallelBuffer {
     poolable: bool,
     // Field order frees the DATA allocation before retiring its ledger pin.
     _v7_reservation_pin: Option<WalV7BatchBufferPin>,
+    v7_frame_buffer_pool: Option<Arc<ArrayQueue<DirectBuf>>>,
 }
 
 impl ParallelBuffer {
@@ -440,6 +486,7 @@ impl ParallelBuffer {
             active_bytes: None,
             poolable: true,
             _v7_reservation_pin: None,
+            v7_frame_buffer_pool: None,
         }
     }
 
@@ -450,6 +497,7 @@ impl ParallelBuffer {
             active_bytes: Some(active_bytes),
             poolable: true,
             _v7_reservation_pin: None,
+            v7_frame_buffer_pool: None,
         }
     }
 
@@ -458,6 +506,7 @@ impl ParallelBuffer {
         budget: Arc<BufferBudget>,
         active_bytes: u64,
         reservation_pin: WalV7BatchBufferPin,
+        v7_frame_buffer_pool: Option<Arc<ArrayQueue<DirectBuf>>>,
     ) -> Self {
         Self {
             buffer: Some(buffer),
@@ -465,6 +514,7 @@ impl ParallelBuffer {
             active_bytes: Some(active_bytes),
             poolable: false,
             _v7_reservation_pin: Some(reservation_pin),
+            v7_frame_buffer_pool,
         }
     }
 
@@ -507,6 +557,17 @@ impl WorkerBuffer for ParallelBuffer {
         self.release_budget();
         if self.poolable && self.cap() == BUFFER_POOL_BUF_SIZE {
             let _ = pool.push(self);
+        } else if self.cap() == WAL_V7_FRAME_LEN
+            && let Some(v7_frame_buffer_pool) = self.v7_frame_buffer_pool.take()
+        {
+            let buffer = self
+                .buffer
+                .take()
+                .expect("completed v7 buffer owns its DirectBuf");
+            // The worker has reaped this write's CQE, so the reservation pin
+            // can retire while the aligned allocation is reused independently.
+            drop(self);
+            let _ = v7_frame_buffer_pool.push(buffer);
         }
     }
 }
@@ -521,8 +582,113 @@ struct AdmittedBatch {
     ticket: u64,
     file_offset: u64,
     aligned_len: usize,
+    v7_framed: bool,
     v7_allocation: Option<WalV7DataAllocation>,
+    v7_input: Option<WalV7AdmittedInput>,
     buffer: ParallelBuffer,
+}
+
+/// Coordinates are assigned. Large DATA buffers are framed by producers;
+/// the ordered packer hashes logical inputs and submits ready DATA. The batch
+/// reservation charges both allocations throughout either placement.
+struct WalV7AdmittedInput {
+    logical_batch: EncodedWalV7LogicalBatch,
+    header_digest: [u8; 32],
+    commit_ts: u64,
+}
+
+/// Group membership is recorded at admission, independently of frame readiness.
+struct WalV7Admission {
+    ticket: u64,
+    file_offset: u64,
+    aligned_len: usize,
+    commit_ts: u64,
+}
+
+/// Assigned DATA work owned by the producer after both sequencers are released.
+/// Dropping an unfinished job poisons its ticket; it cannot leave a live hole.
+#[must_use = "complete producer framing or drop the job to poison its admitted ticket"]
+pub(crate) struct WalV7FrameJob {
+    // AdmittedBatch drops logical bytes before its pinned aligned buffer.
+    batch: Option<AdmittedBatch>,
+    inner: Arc<RuntimeInner>,
+    ticket: u64,
+    completed: bool,
+}
+
+impl WalV7FrameJob {
+    pub(crate) fn finish(mut self) -> Result<()> {
+        let result = (|| -> Result<()> {
+            let mut batch = self.batch.take().context("v7 producer job lost its DATA")?;
+            #[cfg(all(test, feature = "chaos-testing"))]
+            crate::chaos::failpoint::before_parallel_wal_producer_frame(batch.ticket);
+            #[cfg(feature = "chaos-testing")]
+            crate::chaos::failpoint::fail_point!("parallel_wal.v7_producer_frame_failure", |_| {
+                Err(anyhow!("injected v7 producer framing failure"))
+            });
+            let input = batch
+                .v7_input
+                .take()
+                .context("v7 producer job lost its logical input")?;
+            frame_v7_batch(&mut batch, &input)?;
+            batch.v7_input = Some(input);
+            batch.v7_framed = true;
+            let mut admission = self.inner.admission.lock();
+            ensure!(
+                admission
+                    .poison
+                    .as_ref()
+                    .is_none_or(|(poison, _)| batch.ticket < *poison),
+                "v7 producer framing completed after its ticket was poisoned"
+            );
+            publish_v7_ready_batch(&mut admission, batch);
+            drop(admission);
+            self.inner.v7_frames_ready.notify_all();
+            Ok(())
+        })();
+        if let Err(error) = &result {
+            report_packer_failure(&self.inner, self.ticket, error);
+        }
+        self.completed = true;
+
+        result
+    }
+}
+
+impl Drop for WalV7FrameJob {
+    fn drop(&mut self) {
+        if !self.completed {
+            report_packer_failure(
+                &self.inner,
+                self.ticket,
+                &anyhow!("v7 producer framing did not complete"),
+            );
+        }
+    }
+}
+
+fn publish_v7_ready_batch(admission: &mut AdmissionState, batch: AdmittedBatch) {
+    let ticket = batch.ticket;
+    assert!(
+        ticket >= admission.v7_ready_ticket && ticket < admission.next_ticket,
+        "v7 producer completion is outside assigned tickets"
+    );
+    if ticket == admission.v7_ready_ticket {
+        admission.queue.push_back(batch);
+        admission.v7_ready_ticket += 1;
+        while let Some(next) = admission
+            .v7_ready_batches
+            .remove(&admission.v7_ready_ticket)
+        {
+            admission.queue.push_back(next);
+            admission.v7_ready_ticket += 1;
+        }
+    } else {
+        assert!(
+            admission.v7_ready_batches.insert(ticket, batch).is_none(),
+            "v7 producer completed a ticket twice"
+        );
+    }
 }
 
 struct PackedGroup {
@@ -547,16 +713,56 @@ struct AdmissionState {
     v7_allocator: Option<WalV7PhysicalAllocator>,
     v7_header_digest: Option<[u8; 32]>,
     v7_reservation_owner: Option<Arc<WalV7ReservationOwner>>,
-    v7_metadata: Option<WalV7RuntimeMetadata>,
+    v7_metadata: Option<ParallelWalV7Metadata>,
     v7_prefixes: BTreeMap<u64, WalV7PrefixMetadata>,
+    // One ordered packer can hash a submitted group while its DATA is in flight.
+    v7_hash_pending: Option<u64>,
+    v7_admitted: VecDeque<WalV7Admission>,
+    v7_ready_ticket: u64,
+    v7_ready_batches: BTreeMap<u64, AdmittedBatch>,
     v7_reservations: BTreeMap<u64, WalV7OwnedBatchReservation>,
     queue: VecDeque<AdmittedBatch>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct WalV7PrefixMetadata {
     last_commit_ts: u64,
-    prefix_digest: [u8; 32],
+    logical_hasher: Sha256,
+}
+
+struct ParallelWalV7Metadata {
+    logical_hasher: Sha256,
+    last_commit_ts: u64,
+    physical_end: u64,
+    last_recorded_at: Option<RecordedAt>,
+}
+
+impl ParallelWalV7Metadata {
+    fn from_runtime(metadata: WalV7RuntimeMetadata, last_commit_ts: u64) -> Self {
+        Self {
+            logical_hasher: metadata.logical_hasher,
+            last_commit_ts,
+            physical_end: metadata.physical_hashed_end,
+            last_recorded_at: metadata.last_recorded_at,
+        }
+    }
+
+    fn validate_frontier(&self, frontier: WalV7Frontier, append_offset: u64) -> Result<()> {
+        let logical_digest: [u8; 32] = self.logical_hasher.clone().finalize().into();
+        ensure!(
+            logical_digest == frontier.prefix_digest,
+            "v7 runtime logical hash does not match its recovered FRONTIER"
+        );
+        ensure!(
+            self.physical_end == append_offset,
+            "v7 runtime physical cursor does not reach the installed image end"
+        );
+        ensure!(
+            self.last_recorded_at.is_some() == (frontier.ticket_end > 0),
+            "v7 runtime recorded-time cursor disagrees with its recovered ticket frontier"
+        );
+        Ok(())
+    }
 }
 
 struct WalV7FrontierCycle {
@@ -568,6 +774,10 @@ struct WalV7FrontierCycle {
 struct DurabilityState {
     written_frontier: u64,
     durable_frontier: u64,
+    // A conservative batching hint for the contiguous, unsynced wave. Only
+    // single-ticket completions prove the size of every logical batch;
+    // multi-ticket groups and small batches disable the longer wait.
+    large_batch_wave: bool,
     poison_ticket: Option<u64>,
     poison_error: Option<String>,
     completed: BTreeMap<u64, GroupWriteResult>,
@@ -588,17 +798,33 @@ impl DurabilityShared {
 
 struct RuntimeInner {
     admission: Mutex<AdmissionState>,
+    v7_prefix_ready: Condvar,
+    v7_frames_ready: Condvar,
+    v7_preparing_batches: Arc<AtomicU64>,
     packer_state: Mutex<PackerState>,
     packer_failures: Mutex<Option<Sender<GroupWriteResult>>>,
     packer_wake: Sender<bool>,
     #[cfg(test)]
     file_size_limit: std::sync::atomic::AtomicU64,
+    #[cfg(test)]
+    v7_frame_join_micros: AtomicU64,
+    #[cfg(test)]
+    v7_solo_join_micros: AtomicU64,
+    #[cfg(test)]
+    v7_group_wait_cutoff: AtomicU64,
     buffer_budget: Arc<BufferBudget>,
     buffer_pool: Arc<ArrayQueue<ParallelBuffer>>,
+    v7_frame_buffer_pool: Arc<ArrayQueue<DirectBuf>>,
     worker: IoWorkerClient<ParallelBuffer>,
     sync_progress: Arc<WalSyncProgress>,
     preallocator: Arc<File>,
-    preallocation_lock: Mutex<()>,
+    // Some(end) tracks the extent prefix prepared for active v7 writers.
+    // DATA and FRONTIER share it; large DATA groups skip zero filling.
+    preallocation_lock: Mutex<Option<u64>>,
+    // Publish only a successfully allocated/prepared prefix. DATA and
+    // FRONTIER can reuse it without an inode query or the preparation lock.
+    prepared_file_end: AtomicU64,
+    async_v7_extents: Option<Arc<AsyncV7ExtentControl>>,
     max_file_size: u64,
     durability: Arc<DurabilityShared>,
 }
@@ -607,6 +833,7 @@ struct RuntimeThreads {
     packer: Option<JoinHandle<Result<()>>>,
     worker: Option<IoWorker<ParallelBuffer>>,
     coordinator: Option<JoinHandle<Result<()>>>,
+    v7_initializer: Option<AsyncV7ExtentInitializer>,
     closed: bool,
     close_error: Option<String>,
 }
@@ -616,6 +843,7 @@ struct PackerState {
     reserved_end: u64,
     preallocated_end: u64,
     initializer: Option<ExtentInitializer>,
+    v7_prefix: Option<WalV7PrefixMetadata>,
 }
 
 fn is_ext_filesystem(file: &File) -> bool {
@@ -762,6 +990,147 @@ impl Drop for ExtentInitializer {
     }
 }
 
+/// A coalesced target inside an extent already allocated by demand preparation.
+/// The worker never grows the file or prepares beyond that charged target.
+struct AsyncV7ExtentControl {
+    initial_end: u64,
+    target: AtomicU64,
+    requests: Mutex<Option<Sender<()>>>,
+    failure: Mutex<Option<String>>,
+    stopping: AtomicBool,
+    #[cfg(test)]
+    before_chunk: Mutex<Option<(Sender<()>, Receiver<()>)>>,
+    #[cfg(test)]
+    completed_requests: AtomicU64,
+}
+
+impl AsyncV7ExtentControl {
+    fn new(start: u64) -> Self {
+        Self {
+            initial_end: start,
+            target: AtomicU64::new(start),
+            requests: Mutex::new(None),
+            failure: Mutex::new(None),
+            stopping: AtomicBool::new(false),
+            #[cfg(test)]
+            before_chunk: Mutex::new(None),
+            #[cfg(test)]
+            completed_requests: AtomicU64::new(0),
+        }
+    }
+
+    fn request(&self, end: u64) {
+        self.target.fetch_max(end, Ordering::AcqRel);
+        if let Some(requests) = self.requests.lock().as_ref() {
+            // A full wake channel already guarantees another target check.
+            let _ = requests.try_send(());
+        }
+    }
+
+    fn fail(&self, error: String) {
+        self.failure.lock().get_or_insert(error);
+    }
+
+    #[cfg(test)]
+    fn pause_before_chunk(&self) {
+        let hook = self.before_chunk.lock().take();
+        if let Some((entered, resume)) = hook {
+            let _ = entered.send(());
+            while !self.stopping.load(Ordering::Acquire) {
+                match resume.recv_timeout(Duration::from_millis(1)) {
+                    Ok(()) | Err(RecvTimeoutError::Disconnected) => break,
+                    Err(RecvTimeoutError::Timeout) => {}
+                }
+            }
+        }
+    }
+}
+
+struct AsyncV7ExtentInitializer {
+    control: Arc<AsyncV7ExtentControl>,
+    join: Option<JoinHandle<Result<()>>>,
+}
+
+impl AsyncV7ExtentInitializer {
+    fn spawn(inner: &Arc<RuntimeInner>) -> Result<Self> {
+        let control = Arc::clone(
+            inner
+                .async_v7_extents
+                .as_ref()
+                .context("missing v7 extent control")?,
+        );
+        let (requests, incoming) = crossbeam_channel::bounded(1);
+        *control.requests.lock() = Some(requests);
+        // A sleeping initializer must not keep its runtime and sender alive.
+        let runtime = Arc::downgrade(inner);
+        let worker_control = Arc::clone(&control);
+        let join = thread::Builder::new()
+            .name("wal-v7-extent-initializer".to_owned())
+            .spawn(move || {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    while incoming.recv().is_ok() {
+                        loop {
+                            if worker_control.stopping.load(Ordering::Acquire) {
+                                return;
+                            }
+                            let Some(inner) = runtime.upgrade() else {
+                                return;
+                            };
+                            let target = worker_control.target.load(Ordering::Acquire);
+                            if inner.prepared_file_end.load(Ordering::Acquire) >= target {
+                                #[cfg(test)]
+                                worker_control
+                                    .completed_requests
+                                    .fetch_add(1, Ordering::AcqRel);
+                                break;
+                            }
+                            #[cfg(test)]
+                            worker_control.pause_before_chunk();
+                            if worker_control.stopping.load(Ordering::Acquire) {
+                                return;
+                            }
+                            if let Err(error) = prepare_v7_background_chunk(&inner, target) {
+                                // An unused suffix may fail without invalidating
+                                // the ready prefix. Demand crossing it consumes
+                                // this sticky error and poisons its DATA/marker.
+                                worker_control.fail(format!("{error:#}"));
+                                return;
+                            }
+                        }
+                    }
+                }));
+                if result.is_err() {
+                    worker_control.fail("v7 extent initializer panicked".to_owned());
+                    bail!("v7 extent initializer panicked");
+                }
+                Ok(())
+            })
+            .context("failed to spawn v7 extent initializer")?;
+        Ok(Self {
+            control,
+            join: Some(join),
+        })
+    }
+
+    fn close(&mut self) -> Result<()> {
+        self.control.stopping.store(true, Ordering::Release);
+        self.control.requests.lock().take();
+        if let Some(join) = self.join.take() {
+            join.join()
+                .map_err(|_| anyhow!("v7 extent initializer panicked"))??;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for AsyncV7ExtentInitializer {
+    fn drop(&mut self) {
+        if let Err(error) = self.close() {
+            log::error!("failed to stop v7 extent initializer: {error:#}");
+        }
+    }
+}
+
 /// Parallel WAL runtime with admission-driven packing, an I/O worker, a
 /// single-owner durability coordinator, and ext-family extent lookahead.
 pub(crate) struct ParallelWalRuntime {
@@ -779,6 +1148,20 @@ impl ParallelWalRuntime {
         start.validate()?;
         start.validate_v7_file_handles(&worker_file, &sync_file, &preallocator)?;
         let initial_file_end = start.append_offset;
+        let initial_v7_commit_ts = start
+            .v7_allocator
+            .as_ref()
+            .map(|allocator| allocator.last_frontier().frontier.last_commit_ts);
+        let initial_v7_prefix = start.v7_metadata.as_ref().zip(initial_v7_commit_ts).map(
+            |(metadata, last_commit_ts)| WalV7PrefixMetadata {
+                logical_hasher: metadata.logical_hasher.clone(),
+                last_commit_ts,
+            },
+        );
+        let prepared_v7_extent_end = (start.v7_allocator.is_some()
+            && start.admission_open
+            && is_ext_filesystem(&preallocator))
+        .then_some(initial_file_end);
 
         ensure!(
             (start.min_append_offset..=start.max_file_size).contains(&initial_file_end),
@@ -787,6 +1170,9 @@ impl ParallelWalRuntime {
 
         let buffer_budget = Arc::new(BufferBudget::new());
         let buffer_pool = Arc::new(ArrayQueue::new(BUFFER_POOL_CAPACITY));
+        // v7's common one-frame writes use exact 4 KiB buffers. Keep these in
+        // their own bounded pool rather than retaining them in the 256 KiB v4 pool.
+        let v7_frame_buffer_pool = Arc::new(ArrayQueue::new(BUFFER_POOL_CAPACITY));
         if start.prewarm_buffers {
             for _ in 0..BUFFER_POOL_CAPACITY {
                 let _ = buffer_pool.push(ParallelBuffer::pooled(
@@ -804,7 +1190,11 @@ impl ParallelWalRuntime {
         } else {
             None
         };
-        let mut worker = IoWorker::spawn(worker_file, Arc::clone(&buffer_pool))?;
+        let mut worker = IoWorker::spawn(
+            worker_file,
+            Arc::clone(&buffer_pool),
+            prepared_v7_extent_end.map(|_| ALLOCATION_ONLY_MIN_BATCH_BYTES),
+        )?;
         let worker_client = worker.client();
         let sync_progress = worker.sync_progress();
         sync_progress.initialize_frontiers(start.next_ticket);
@@ -832,30 +1222,58 @@ impl ParallelWalRuntime {
                 v7_allocator: start.v7_allocator,
                 v7_header_digest: start.v7_header_digest,
                 v7_reservation_owner: start.v7_reservation_owner,
-                v7_metadata: start.v7_metadata,
+                v7_metadata: start.v7_metadata.zip(initial_v7_commit_ts).map(
+                    |(metadata, last_commit_ts)| {
+                        ParallelWalV7Metadata::from_runtime(metadata, last_commit_ts)
+                    },
+                ),
                 v7_prefixes: BTreeMap::new(),
+                v7_hash_pending: None,
+                v7_admitted: VecDeque::new(),
+                v7_ready_ticket: start.next_ticket,
+                v7_ready_batches: BTreeMap::new(),
                 v7_reservations: BTreeMap::new(),
                 queue: VecDeque::new(),
             }),
+            v7_prefix_ready: Condvar::new(),
+            v7_frames_ready: Condvar::new(),
+            v7_preparing_batches: Arc::new(AtomicU64::new(0)),
             packer_state: Mutex::new(PackerState {
                 next_ticket: start.next_ticket,
                 reserved_end: initial_file_end,
                 preallocated_end: initial_file_end,
                 initializer,
+                v7_prefix: initial_v7_prefix,
             }),
             packer_failures: Mutex::new(Some(packer_failures_tx)),
             packer_wake,
             #[cfg(test)]
             file_size_limit: std::sync::atomic::AtomicU64::new(MAX_WAL_FILE_SIZE),
+            #[cfg(test)]
+            v7_frame_join_micros: AtomicU64::new(V7_FRAME_JOIN_LIMIT.as_micros() as u64),
+            #[cfg(test)]
+            v7_solo_join_micros: AtomicU64::new(V7_SOLO_JOIN_LIMIT.as_micros() as u64),
+            #[cfg(test)]
+            v7_group_wait_cutoff: AtomicU64::new(u64::MAX),
             buffer_budget,
             buffer_pool,
+            v7_frame_buffer_pool,
             worker: worker_client,
             sync_progress,
             preallocator,
-            preallocation_lock: Mutex::new(()),
+            preallocation_lock: Mutex::new(prepared_v7_extent_end),
+            prepared_file_end: AtomicU64::new(initial_file_end),
+            async_v7_extents: prepared_v7_extent_end
+                .map(|start| Arc::new(AsyncV7ExtentControl::new(start))),
             max_file_size: start.max_file_size,
             durability: Arc::clone(&durability),
         });
+
+        let v7_initializer = if inner.async_v7_extents.is_some() {
+            Some(AsyncV7ExtentInitializer::spawn(&inner)?)
+        } else {
+            None
+        };
 
         let coordinator_inner = Arc::clone(&inner);
         let coordinator = match thread::Builder::new()
@@ -887,8 +1305,15 @@ impl ParallelWalRuntime {
             .name("wal-ordered-packer".to_owned())
             .spawn(move || {
                 match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let mut v7_batches = Vec::new();
+                    let mut v7_hash_inputs = Vec::new();
                     while let Ok(true) = packer_requests.recv() {
-                        pack_admitted_groups(&packer_inner, packer_inner.packer_state.lock())?;
+                        pack_admitted_groups(
+                            &packer_inner,
+                            packer_inner.packer_state.lock(),
+                            &mut v7_batches,
+                            &mut v7_hash_inputs,
+                        )?;
                     }
                     Ok(())
                 })) {
@@ -914,6 +1339,7 @@ impl ParallelWalRuntime {
                 packer: Some(packer),
                 worker: Some(worker),
                 coordinator: Some(coordinator),
+                v7_initializer,
                 closed: false,
                 close_error: None,
             }),
@@ -971,22 +1397,36 @@ impl ParallelWalRuntime {
             u64::try_from(capacity).context("v7 DATA buffer capacity exceeds u64")?;
         self.inner.buffer_budget.reserve(capacity_u64)?;
 
+        let mut direct_buffer = if capacity == WAL_V7_FRAME_LEN {
+            self.inner
+                .v7_frame_buffer_pool
+                .pop()
+                .unwrap_or_else(|| DirectBuf::new(capacity))
+        } else {
+            DirectBuf::new(capacity)
+        };
+        direct_buffer.clear();
+        let v7_frame_buffer_pool =
+            (capacity == WAL_V7_FRAME_LEN).then(|| Arc::clone(&self.inner.v7_frame_buffer_pool));
+
         Ok(ParallelBuffer::activate_unpooled(
-            DirectBuf::new(capacity),
+            direct_buffer,
             Arc::clone(&self.inner.buffer_budget),
             capacity_u64,
             reservation.pin_buffer(),
+            v7_frame_buffer_pool,
         ))
     }
 
-    /// Validate a v7 batch and hold its temporary preparation charge. Callers
-    /// may retain this value while assigning ordered MVCC metadata.
-    pub(crate) fn prepare_v7_batch<'a>(
+    /// Validate and encode a v7 entry stream with its charged frame buffer.
+    /// Callers may retain this owned value while assigning MVCC metadata.
+    pub(crate) fn prepare_v7_batch(
         &self,
-        batch: &'a WalBatch,
+        batch: &WalBatch,
         limits: WalV5Limits,
-    ) -> Result<WalV7PreparedBatch<'a>> {
+    ) -> Result<WalV7PreparedBatch> {
         ensure!(!batch.entries.is_empty(), "v7 WAL batch is empty");
+        let preparing = WalV7PreparingBatch::new(&self.inner.v7_preparing_batches)?;
         let limits = WalV5Limits {
             max_input_entry_count: limits
                 .max_input_entry_count
@@ -1019,37 +1459,6 @@ impl ParallelWalRuntime {
         let preparation = owner.reserve_preparation_buffer(preparation_bytes)?;
         let prepared = prepare_logical_batch(batch, limits)?;
 
-        Ok(WalV7PreparedBatch {
-            prepared,
-            owner,
-            preparation,
-            limits,
-        })
-    }
-
-    /// Prepare and admit one v7 ticket into the ordered parallel DATA packer.
-    /// The caller publishes the returned ticket only after `wait_durable`.
-    pub(crate) fn put_v7_batch(&self, batch: &WalBatch, limits: WalV5Limits) -> Result<(u64, u64)> {
-        let commit_ts = batch.commit_ts;
-        let recorded_at = batch.recorded_at;
-        let prepared = self.prepare_v7_batch(batch, limits)?;
-        self.put_v7_prepared_batch(prepared, commit_ts, recorded_at)
-    }
-
-    /// Admit a previously prepared batch with ordered MVCC metadata.
-    pub(crate) fn put_v7_prepared_batch(
-        &self,
-        prepared_batch: WalV7PreparedBatch<'_>,
-        commit_ts: u64,
-        sampled_recorded_at: crate::pitr::RecordedAt,
-    ) -> Result<(u64, u64)> {
-        let WalV7PreparedBatch {
-            prepared,
-            owner,
-            preparation,
-            limits,
-        } = prepared_batch;
-
         let encoded_batch_bytes =
             u64::try_from(prepared.encoded_len()).context("v7 logical batch length exceeds u64")?;
         let fragment_count = data_fragment_count(encoded_batch_bytes)
@@ -1068,7 +1477,7 @@ impl ParallelWalRuntime {
 
         // Charge persistent frames, marker headroom, seal index, and all batch
         // buffers before allocating a direct buffer or assigning coordinates.
-        let mut reservation = match owner.reserve_batch(encoded_batch_bytes) {
+        let reservation = match owner.reserve_batch(encoded_batch_bytes) {
             Ok(reservation) => reservation,
             Err(resource_error) => {
                 // Concurrent producers can consume the remaining segment space
@@ -1080,9 +1489,52 @@ impl ParallelWalRuntime {
                 return Err(resource_error).context("reserve v7 Parallel batch resources");
             }
         };
-        let mut buffer = self.allocate_v7_buffer(frame_bytes, &reservation)?;
-        let mut post_admission_failure = None;
-        let (ticket, first_data_offset) = {
+        let encoded_entries = prepared.encode_entry_stream()?;
+        drop(preparation);
+        let buffer = self.allocate_v7_buffer(frame_bytes, &reservation)?;
+
+        Ok(WalV7PreparedBatch {
+            encoded_entries,
+            buffer,
+            reservation,
+            fragment_count,
+            frame_bytes,
+            preparation: preparing,
+        })
+    }
+
+    /// Prepare and admit one v7 ticket into the ordered parallel DATA packer.
+    /// The caller publishes the returned ticket only after `wait_durable`.
+    pub(crate) fn put_v7_batch(
+        &self,
+        batch: &WalBatch,
+        limits: WalV5Limits,
+    ) -> Result<(u64, u64, Option<WalV7FrameJob>)> {
+        let commit_ts = batch.commit_ts;
+        let recorded_at = batch.recorded_at;
+        let prepared = self.prepare_v7_batch(batch, limits)?;
+        self.put_v7_prepared_batch(prepared, commit_ts, recorded_at)
+    }
+
+    /// Admit a previously prepared batch with ordered MVCC metadata.
+    pub(crate) fn put_v7_prepared_batch(
+        &self,
+        prepared_batch: WalV7PreparedBatch,
+        commit_ts: u64,
+        sampled_recorded_at: crate::pitr::RecordedAt,
+    ) -> Result<(u64, u64, Option<WalV7FrameJob>)> {
+        // Locals drop in reverse binding order on early rejection: buffers
+        // and encoded bytes must release before their reservation charge.
+        let WalV7PreparedBatch {
+            mut reservation,
+            encoded_entries,
+            buffer,
+            fragment_count,
+            frame_bytes,
+            preparation,
+        } = prepared_batch;
+
+        let (ticket, first_data_offset, frame_job) = {
             let mut admission = self.inner.admission.lock();
             ensure!(admission.open, "v7 Parallel WAL admission is closed");
             validate_v7_data_capacity(&admission, fragment_count)?;
@@ -1096,23 +1548,21 @@ impl ParallelWalRuntime {
                 ticket == admission.next_ticket,
                 "v7 Parallel admission ticket cursor disagrees with its allocator"
             );
-            let previous = allocator.last_frontier();
             let allocation_tail = allocator.allocation_tail();
-            let physical_hashed_end = admission
+            let physical_end = admission
                 .v7_metadata
                 .as_ref()
-                .map(|metadata| metadata.physical_hashed_end)
-                .context("v7 Parallel runtime has no hash metadata")?;
+                .map(|metadata| metadata.physical_end)
+                .context("v7 Parallel runtime has no metadata")?;
             ensure!(
-                physical_hashed_end == allocation_tail,
-                "v7 Parallel physical hash cursor disagrees with DATA allocator"
+                physical_end == allocation_tail,
+                "v7 Parallel physical cursor disagrees with DATA allocator"
             );
             let last_commit_ts = admission
-                .v7_prefixes
-                .last_key_value()
-                .map_or(previous.frontier.last_commit_ts, |(_, metadata)| {
-                    metadata.last_commit_ts
-                });
+                .v7_metadata
+                .as_ref()
+                .map(|metadata| metadata.last_commit_ts)
+                .context("v7 Parallel runtime has no commit timestamp metadata")?;
             ensure!(
                 commit_ts > last_commit_ts,
                 "v7 Parallel batch commit timestamp does not advance"
@@ -1124,8 +1574,8 @@ impl ParallelWalRuntime {
                 .map_or(sampled_recorded_at, |previous| {
                     previous.max(sampled_recorded_at)
                 });
-            let logical_batch = prepared.encode_with_metadata(ticket, commit_ts, recorded_at)?;
-            drop(preparation);
+            let logical_batch =
+                encoded_entries.into_logical_batch(ticket, commit_ts, recorded_at)?;
             let next_ticket = ticket
                 .checked_add(1)
                 .context("v7 Parallel ticket counter overflows")?;
@@ -1136,9 +1586,9 @@ impl ParallelWalRuntime {
                 !admission.v7_reservations.contains_key(&ticket),
                 "v7 Parallel admission reused a reservation ticket"
             );
-            // All expected fallible work is complete before reserve_data. If
-            // frame materialization fails after coordinate assignment, poison
-            // the runtime and leave the persistent charge with its image owner.
+            // Expected rejection is complete before assigning coordinates.
+            // Large framing jobs leave admission owned by their producer.
+            // Later failure poisons the assigned range and retains image charges.
             let allocation = admission
                 .v7_allocator
                 .as_mut()
@@ -1147,78 +1597,60 @@ impl ParallelWalRuntime {
             let first_data_offset = allocation.frame_range().start;
             let data_end = allocation.frame_range().end;
             reservation.mark_admitted();
-            let previous_reservation = admission.v7_reservations.insert(ticket, reservation);
-            debug_assert!(previous_reservation.is_none());
+            admission.v7_reservations.insert(ticket, reservation);
             admission.next_ticket = next_ticket;
             admission.admitted_end = data_end;
 
-            let encoded_len = encode_data_frames_into(
-                header_digest,
-                first_data_offset,
+            let metadata = admission
+                .v7_metadata
+                .as_mut()
+                .expect("v7 metadata is present for a v7 allocator");
+            metadata.last_commit_ts = commit_ts;
+            metadata.physical_end = data_end;
+            metadata.last_recorded_at = Some(recorded_at);
+            admission.v7_admitted.push_back(WalV7Admission {
                 ticket,
-                &logical_batch,
-                limits,
-                buffer.direct_mut().as_mut_slice(),
-            );
-            match encoded_len {
-                Ok(encoded_len) if encoded_len == frame_bytes => {
-                    buffer.direct_mut().set_len(encoded_len);
-                    let metadata = admission
-                        .v7_metadata
-                        .as_mut()
-                        .expect("v7 runtime metadata is present for a v7 allocator");
-                    metadata.logical_hasher.update(&logical_batch);
-                    let prefix_digest: [u8; 32] = metadata.logical_hasher.clone().finalize().into();
-                    metadata
-                        .physical_hasher
-                        .update(buffer.direct_mut().initialized_slice(0, encoded_len));
-                    metadata.physical_hashed_end = data_end;
-                    metadata.last_recorded_at = Some(recorded_at);
-                    admission.v7_prefixes.insert(
-                        next_ticket,
-                        WalV7PrefixMetadata {
-                            last_commit_ts: commit_ts,
-                            prefix_digest,
-                        },
-                    );
-                    admission.queue.push_back(AdmittedBatch {
-                        ticket,
-                        file_offset: first_data_offset,
-                        aligned_len: encoded_len,
-                        v7_allocation: Some(allocation),
-                        buffer,
-                    });
-                    #[cfg(feature = "chaos-testing")]
-                    crate::chaos::failpoint::note_parallel_wal_admission();
-                }
-                Ok(_) => {
-                    post_admission_failure = Some((
-                        ticket,
-                        anyhow!("v7 DATA materializer returned an unexpected frame length"),
-                    ));
-                }
-                Err(error) => post_admission_failure = Some((ticket, error)),
-            }
-            if let Some((failed_ticket, error)) = &post_admission_failure {
-                admission.open = false;
-                if admission
-                    .poison
-                    .as_ref()
-                    .is_none_or(|(current, _)| failed_ticket < current)
-                {
-                    admission.poison = Some((*failed_ticket, format!("{error:#}")));
-                }
-            }
-            (ticket, first_data_offset)
+                file_offset: first_data_offset,
+                aligned_len: frame_bytes,
+                commit_ts,
+            });
+            // Under the admission lock the packer sees either a preparing
+            // producer or its admitted ticket, never a gap between them.
+            drop(preparation);
+            let batch = AdmittedBatch {
+                ticket,
+                file_offset: first_data_offset,
+                aligned_len: frame_bytes,
+                v7_framed: false,
+                v7_allocation: Some(allocation),
+                v7_input: Some(WalV7AdmittedInput {
+                    logical_batch,
+                    header_digest,
+                    commit_ts,
+                }),
+                buffer,
+            };
+            let frame_job = if frame_bytes >= ALLOCATION_ONLY_MIN_BATCH_BYTES {
+                Some(WalV7FrameJob {
+                    batch: Some(batch),
+                    inner: Arc::clone(&self.inner),
+                    ticket,
+                    completed: false,
+                })
+            } else {
+                publish_v7_ready_batch(&mut admission, batch);
+                None
+            };
+            #[cfg(feature = "chaos-testing")]
+            crate::chaos::failpoint::note_parallel_wal_admission();
+            (ticket, first_data_offset, frame_job)
         };
 
-        if let Some((ticket, error)) = post_admission_failure {
-            report_packer_failure(&self.inner, ticket, &error);
-            return Err(error).context("materialize admitted v7 Parallel DATA frames");
-        }
-
+        // A waiting group may extend as soon as this ticket is admitted,
+        // regardless of whether its producer has finished framing.
+        self.inner.v7_frames_ready.notify_all();
         let _ = self.inner.packer_wake.try_send(true);
-        Ok((ticket, first_data_offset))
+        Ok((ticket, first_data_offset, frame_job))
     }
 
     fn activate_buffer(&self, capacity: usize, capacity_u64: u64) -> ParallelBuffer {
@@ -1322,7 +1754,9 @@ impl ParallelWalRuntime {
             ticket,
             file_offset,
             aligned_len,
+            v7_framed: false,
             v7_allocation: None,
+            v7_input: None,
             buffer,
         });
         #[cfg(feature = "chaos-testing")]
@@ -1476,14 +1910,39 @@ impl ParallelWalRuntime {
             };
         }
 
-        {
+        let cutoff = {
             let mut admission = self.inner.admission.lock();
             admission.open = false;
-            admission.close_cutoff = Some(admission.next_ticket);
-        }
+            admission.next_ticket
+        };
+        self.inner.v7_frames_ready.notify_all();
         self.inner.buffer_budget.close();
+        let abandoned_ticket = {
+            let mut admission = self.inner.admission.lock();
+            while admission.v7_allocator.is_some()
+                && admission.v7_ready_ticket < cutoff
+                && admission.poison.is_none()
+            {
+                self.inner.v7_frames_ready.wait(&mut admission);
+            }
+            // If a later ticket failed, an unfinished earlier producer may
+            // be held by the caller closing this runtime. Do not join a
+            // packer that waits forever for that producer to return.
+            let abandoned = admission.poison.as_ref().and_then(|(poison, _)| {
+                (admission.v7_ready_ticket < *poison).then_some(admission.v7_ready_ticket)
+            });
+            admission.close_cutoff = Some(cutoff);
+            abandoned
+        };
+        if let Some(ticket) = abandoned_ticket {
+            report_packer_failure(
+                &self.inner,
+                ticket,
+                &anyhow!("v7 producer framing was abandoned during poisoned close"),
+            );
+        }
 
-        let mut close_error = None;
+        let mut close_error = threads.close_error.clone();
         let _ = self.inner.packer_wake.send(false);
         if let Some(packer) = threads.packer.take() {
             match packer.join() {
@@ -1497,7 +1956,9 @@ impl ParallelWalRuntime {
             }
         }
         let packer = self.inner.packer_state.lock();
-        if let Err(error) = pack_admitted_groups(&self.inner, packer) {
+        if let Err(error) =
+            pack_admitted_groups(&self.inner, packer, &mut Vec::new(), &mut Vec::new())
+        {
             close_error = Some(format!("packer failed: {error:#}"));
         }
         self.inner.packer_failures.lock().take();
@@ -1508,6 +1969,11 @@ impl ParallelWalRuntime {
             && let Err(error) = initializer.close()
         {
             close_error.get_or_insert_with(|| format!("extent initializer failed: {error:#}"));
+        }
+        if let Some(mut initializer) = threads.v7_initializer.take()
+            && let Err(error) = initializer.close()
+        {
+            close_error.get_or_insert_with(|| format!("v7 extent initializer failed: {error:#}"));
         }
 
         if let Some(worker) = threads.worker.take()
@@ -1536,6 +2002,8 @@ impl ParallelWalRuntime {
         let remaining_reservations = {
             let mut admission = self.inner.admission.lock();
             admission.queue.clear();
+            admission.v7_admitted.clear();
+            admission.v7_ready_batches.clear();
             std::mem::take(&mut admission.v7_reservations)
         };
         for reservation in remaining_reservations.into_values() {
@@ -1563,6 +2031,20 @@ impl ParallelWalRuntime {
             Some(error) => Err(anyhow!(error)),
             None => Ok(()),
         }
+    }
+
+    /// Join unused v7 preparation before an external sealing operation can
+    /// truncate the allocated tail. Admission and the DATA runtime stay intact.
+    pub(crate) fn stop_v7_extent_initialization(&self) -> Result<()> {
+        let mut threads = self.threads.lock();
+        if let Some(mut initializer) = threads.v7_initializer.take()
+            && let Err(error) = initializer.close()
+        {
+            let message = format!("v7 extent initializer failed: {error:#}");
+            threads.close_error.get_or_insert_with(|| message.clone());
+            bail!(message);
+        }
+        Ok(())
     }
 
     #[cfg(feature = "chaos-testing")]
@@ -1603,10 +2085,98 @@ fn validate_v7_data_capacity(admission: &AdmissionState, fragment_count: u32) ->
 fn pack_admitted_groups(
     inner: &RuntimeInner,
     mut packer: MutexGuard<'_, PackerState>,
+    v7_batches: &mut Vec<AdmittedBatch>,
+    v7_hash_inputs: &mut Vec<WalV7AdmittedInput>,
 ) -> Result<()> {
+    ensure!(
+        v7_hash_inputs.is_empty(),
+        "v7 packer still owns unhashed inputs"
+    );
     loop {
         let packed_result = {
             let mut admission = inner.admission.lock();
+            // Admission records membership independently from frame readiness.
+            // Wait for the head, then let the window grow within one deadline.
+            let mut group_limit = PACKER_GROUP_MAX_TICKETS;
+            if admission.v7_allocator.is_some() {
+                loop {
+                    let healthy_end = admission
+                        .poison
+                        .as_ref()
+                        .map_or(admission.next_ticket, |(ticket, _)| {
+                            admission.next_ticket.min(*ticket)
+                        });
+                    if !admission.queue.is_empty() || packer.next_ticket >= healthy_end {
+                        break;
+                    }
+                    inner.v7_frames_ready.wait(&mut admission);
+                }
+                if !admission.v7_admitted.is_empty() {
+                    #[cfg(test)]
+                    let join_limit =
+                        Duration::from_micros(inner.v7_frame_join_micros.load(Ordering::Relaxed));
+                    #[cfg(not(test))]
+                    let join_limit = V7_FRAME_JOIN_LIMIT;
+                    #[cfg(test)]
+                    let solo_limit =
+                        Duration::from_micros(inner.v7_solo_join_micros.load(Ordering::Relaxed));
+                    #[cfg(not(test))]
+                    let solo_limit = V7_SOLO_JOIN_LIMIT;
+                    let opened = Instant::now();
+                    let deadline = opened + join_limit;
+                    let solo_deadline = opened + solo_limit.min(join_limit);
+                    let mut timed_out = false;
+                    loop {
+                        // A failure can discard the whole window while the
+                        // condition wait has released the admission lock.
+                        if admission.v7_admitted.is_empty() {
+                            break;
+                        }
+                        group_limit = admission.v7_admitted.len().min(PACKER_GROUP_MAX_TICKETS);
+                        let first = admission
+                            .v7_admitted
+                            .front()
+                            .expect("admitted window is nonempty");
+                        let last = &admission.v7_admitted[group_limit - 1];
+                        let cutoff = last
+                            .ticket
+                            .checked_add(1)
+                            .context("v7 group cutoff overflow")?;
+                        ensure!(
+                            first.ticket == packer.next_ticket
+                                && cutoff == packer.next_ticket.saturating_add(group_limit as u64),
+                            "v7 admitted group window is not ticket contiguous"
+                        );
+                        let unfinished = admission.v7_ready_ticket < cutoff;
+                        let solo_join = group_limit == 1
+                            && inner.v7_preparing_batches.load(Ordering::Acquire) > 0;
+                        if timed_out
+                            || !admission.open
+                            || admission.poison.is_some()
+                            || group_limit == PACKER_GROUP_MAX_TICKETS
+                            || (!unfinished && !solo_join)
+                        {
+                            break;
+                        }
+                        let wait_until = if unfinished { deadline } else { solo_deadline };
+                        if Instant::now() >= wait_until {
+                            break;
+                        }
+                        #[cfg(test)]
+                        inner.v7_group_wait_cutoff.store(cutoff, Ordering::Release);
+                        // Reinspect membership even on timeout: another
+                        // admission may have landed while reacquiring the lock.
+                        timed_out = inner
+                            .v7_frames_ready
+                            .wait_until(&mut admission, wait_until)
+                            .timed_out();
+                    }
+                    #[cfg(test)]
+                    inner
+                        .v7_group_wait_cutoff
+                        .store(u64::MAX, Ordering::Release);
+                }
+            }
             if admission.queue.is_empty() {
                 if admission.poison.is_none()
                     && let Some(cutoff) = admission.close_cutoff
@@ -1626,10 +2196,11 @@ fn pack_admitted_groups(
                 &mut admission,
                 packer.next_ticket,
                 packer.reserved_end,
-                PACKER_GROUP_MAX_TICKETS,
+                group_limit,
+                v7_batches,
             )
         };
-        let packed = match packed_result {
+        let mut packed = match packed_result {
             Ok(Some(packed)) => packed,
             Ok(None) => continue,
             Err(error) => {
@@ -1639,6 +2210,38 @@ fn pack_admitted_groups(
         };
         let first_ticket = packed.first_ticket;
         let expected_ticket = packed.next_ticket;
+        // This existing group flag is false only when every DATA buffer is
+        // large. Mixed and small groups retain inline prefix publication.
+        let hash_after_submit = packed.v7_layout && !packed.initialize_extents;
+        if packed.v7_layout {
+            let materialized = (|| -> Result<()> {
+                let prefix = packer
+                    .v7_prefix
+                    .as_mut()
+                    .context("v7 packer has no recovered logical prefix")?;
+                if hash_after_submit {
+                    frame_v7_batches_before_hash(
+                        v7_batches,
+                        prefix.last_commit_ts,
+                        &mut packed.writes,
+                        v7_hash_inputs,
+                    )?;
+                    let mut admission = inner.admission.lock();
+                    ensure!(
+                        admission.v7_hash_pending.replace(expected_ticket).is_none(),
+                        "v7 packer already has a pending digest"
+                    );
+                } else {
+                    materialize_v7_batches(v7_batches, prefix, &mut packed.writes)?;
+                    publish_v7_prefix(inner, expected_ticket, prefix)?;
+                }
+                Ok(())
+            })();
+            if let Err(error) = materialized {
+                report_packer_failure(inner, first_ticket, &error);
+                return Err(error).context("materialize admitted v7 DATA group");
+            }
+        }
         let allocation_start = packed.allocation_start;
         packer.reserved_end = packed.reserved_end;
         let writes = packed.writes;
@@ -1656,14 +2259,21 @@ fn pack_admitted_groups(
             report_packer_failure(inner, first_ticket, &error);
             return Err(error);
         }
-        if target_preallocated_end > packer.preallocated_end {
+        if target_preallocated_end > packer.preallocated_end
+            || (v7_layout && packer.reserved_end > inner.prepared_file_end.load(Ordering::Acquire))
+        {
             #[cfg(feature = "bench")]
             let preallocation_start = Instant::now();
             let allocation = match packer.initializer.as_mut() {
                 Some(initializer) => {
                     initializer.prepare(target_preallocated_end, packed.initialize_extents)
                 }
-                None => preallocate_runtime(inner, target_preallocated_end),
+                None => preallocate_runtime_for_write(
+                    inner,
+                    target_preallocated_end,
+                    packer.reserved_end,
+                    packed.initialize_extents,
+                ),
             };
             if let Err(error) = allocation {
                 report_packer_failure(inner, first_ticket, &error);
@@ -1716,17 +2326,52 @@ fn pack_admitted_groups(
             report_packer_failure(inner, first_ticket, &error);
             return Err(error).context("failed to submit packed WAL group");
         }
+        if hash_after_submit {
+            let hashed = (|| -> Result<()> {
+                #[cfg(all(test, feature = "chaos-testing"))]
+                crate::chaos::failpoint::before_parallel_wal_post_submit_hash();
+                #[cfg(feature = "chaos-testing")]
+                crate::chaos::failpoint::fail_point!(
+                    "parallel_wal.v7_post_submit_hash_failure",
+                    |_| { Err(anyhow!("injected v7 post-submit hash failure")) }
+                );
+                let prefix = packer
+                    .v7_prefix
+                    .as_mut()
+                    .context("v7 packer lost its logical prefix")?;
+                for input in v7_hash_inputs.drain(..) {
+                    ensure!(
+                        input.commit_ts > prefix.last_commit_ts,
+                        "v7 packer commit timestamp does not advance"
+                    );
+                    prefix.logical_hasher.update(input.logical_batch.as_bytes());
+                    prefix.last_commit_ts = input.commit_ts;
+                }
+                publish_v7_prefix(inner, expected_ticket, prefix)
+            })();
+            if let Err(error) = hashed {
+                report_packer_failure(inner, first_ticket, &error);
+                return Err(error).context("hash submitted v7 DATA group");
+            }
+        }
         packer.next_ticket = expected_ticket;
     }
 }
 
+/// Consume ordered admissions without framing or hashing their payloads.
+/// The packer reuses its bounded scratch vector across wakeups.
 fn take_admitted_group(
     admission: &mut AdmissionState,
     next_ticket: u64,
     reserved_end: u64,
     max_tickets: usize,
+    v7_batches: &mut Vec<AdmittedBatch>,
 ) -> Result<Option<PackedGroup>> {
     debug_assert!(max_tickets > 0);
+    ensure!(
+        v7_batches.is_empty(),
+        "v7 packer scratch still contains a previous group"
+    );
     let Some(first) = admission.queue.front() else {
         return Ok(None);
     };
@@ -1736,6 +2381,7 @@ fn take_admitted_group(
         .is_some_and(|(poison_ticket, _)| first.ticket >= *poison_ticket)
     {
         admission.queue.clear();
+        admission.v7_admitted.clear();
         return Ok(None);
     }
 
@@ -1747,7 +2393,7 @@ fn take_admitted_group(
     let mut initialize_extents = false;
     let mut expected_ticket = next_ticket;
     let mut packed_end = reserved_end;
-    while writes.len() < max_tickets {
+    for _ in 0..max_tickets {
         let Some(next) = admission.queue.front() else {
             break;
         };
@@ -1757,35 +2403,45 @@ fn take_admitted_group(
             .is_some_and(|(poison_ticket, _)| next.ticket >= *poison_ticket)
         {
             admission.queue.clear();
+            admission.v7_admitted.clear();
             break;
         }
-        let batch = admission
+        let mut batch = admission
             .queue
             .pop_front()
             .expect("front WAL batch remains queued");
-        let AdmittedBatch {
-            ticket,
-            file_offset,
-            aligned_len,
-            v7_allocation,
-            buffer,
-        } = batch;
-        // Keep zero-fill for groups containing small writes. Only extent
-        // preparation changes; every batch still uses the parallel pipeline.
-        initialize_extents |= aligned_len < ALLOCATION_ONLY_MIN_BATCH_BYTES;
+        initialize_extents |= batch.aligned_len < ALLOCATION_ONLY_MIN_BATCH_BYTES;
         ensure!(
-            ticket == expected_ticket,
+            batch.ticket == expected_ticket,
             "parallel WAL admission queue is not ticket contiguous"
         );
-        match (v7_layout, v7_allocation) {
+        match (v7_layout, batch.v7_allocation.take()) {
             (true, Some(allocation)) => {
+                let admitted = admission
+                    .v7_admitted
+                    .pop_front()
+                    .context("v7 ready DATA has no admission entry")?;
                 ensure!(
-                    allocation.ticket() == ticket
-                        && allocation.frame_range().start == file_offset
-                        && allocation.frame_range().end.checked_sub(file_offset)
-                            == Some(aligned_len as u64)
-                        && file_offset >= packed_end,
+                    admitted.ticket == batch.ticket
+                        && admitted.file_offset == batch.file_offset
+                        && admitted.aligned_len == batch.aligned_len
+                        && batch
+                            .v7_input
+                            .as_ref()
+                            .is_some_and(|input| input.commit_ts == admitted.commit_ts),
+                    "v7 ready DATA disagrees with its admission entry"
+                );
+                ensure!(
+                    allocation.ticket() == batch.ticket
+                        && allocation.frame_range().start == batch.file_offset
+                        && allocation.frame_range().end.checked_sub(batch.file_offset)
+                            == Some(batch.aligned_len as u64)
+                        && batch.file_offset >= packed_end,
                     "parallel v7 WAL batch disagrees with its physical allocation"
+                );
+                ensure!(
+                    batch.v7_input.is_some(),
+                    "v7 WAL batch has no deferred logical input"
                 );
                 packed_end = allocation.frame_range().end;
                 data_allocations
@@ -1795,30 +2451,41 @@ fn take_admitted_group(
             }
             (false, None) => {
                 ensure!(
-                    file_offset == packed_end,
+                    batch.file_offset == packed_end,
                     "parallel WAL admission queue is not offset contiguous"
                 );
-                packed_end = file_offset
-                    .checked_add(aligned_len as u64)
-                    .ok_or_else(|| anyhow!("parallel WAL offset overflow"))?;
+                ensure!(
+                    batch.v7_input.is_none(),
+                    "legacy WAL admission batch has v7 logical input"
+                );
+                packed_end = batch
+                    .file_offset
+                    .checked_add(batch.aligned_len as u64)
+                    .context("parallel WAL offset overflow")?;
             }
             (true, None) => bail!("v7 WAL admission batch has no physical allocation"),
             (false, Some(_)) => bail!("legacy WAL admission batch has a v7 physical allocation"),
         }
         expected_ticket = expected_ticket
             .checked_add(1)
-            .ok_or_else(|| anyhow!("parallel WAL ticket counter overflow"))?;
+            .context("parallel WAL ticket counter overflow")?;
         #[cfg(feature = "chaos-testing")]
         crate::chaos::failpoint::wal_crash_point("parallel_wal.offset_reserved");
-        writes.push(WriteBuffer::new(buffer, file_offset, aligned_len));
+        if v7_layout {
+            v7_batches.push(batch);
+        } else {
+            writes.push(WriteBuffer::new(
+                batch.buffer,
+                batch.file_offset,
+                batch.aligned_len,
+            ));
+        }
     }
-
     let frontier_offsets = if v7_layout {
         let allocator = admission
             .v7_allocator
             .as_ref()
             .expect("v7 layout has a physical allocator");
-        // Validate allocator ownership, ticket order, and every DATA gap.
         allocator.validate_data_group(
             data_allocations
                 .as_deref()
@@ -1828,7 +2495,6 @@ fn take_admitted_group(
     } else {
         Vec::new()
     };
-
     Ok(Some(PackedGroup {
         first_ticket,
         next_ticket: expected_ticket,
@@ -1841,11 +2507,131 @@ fn take_admitted_group(
     }))
 }
 
+fn frame_v7_batch(batch: &mut AdmittedBatch, input: &WalV7AdmittedInput) -> Result<()> {
+    if batch.v7_framed {
+        ensure!(
+            batch.buffer.len() == batch.aligned_len,
+            "ready v7 frame buffer has the wrong length"
+        );
+        return Ok(());
+    }
+    let encoded_len = input.logical_batch.encode_data_frames_into(
+        input.header_digest,
+        batch.file_offset,
+        batch.ticket,
+        batch.buffer.direct_mut().as_mut_slice(),
+    )?;
+    ensure!(
+        encoded_len == batch.aligned_len,
+        "v7 DATA materializer returned an unexpected frame length"
+    );
+    batch.buffer.direct_mut().set_len(encoded_len);
+
+    Ok(())
+}
+
+fn materialize_v7_batch(batch: &mut AdmittedBatch, prefix: &mut WalV7PrefixMetadata) -> Result<()> {
+    let input = batch
+        .v7_input
+        .take()
+        .context("v7 DATA batch has no logical input")?;
+    ensure!(
+        input.commit_ts > prefix.last_commit_ts,
+        "v7 packer commit timestamp does not advance"
+    );
+    frame_v7_batch(batch, &input)?;
+    prefix.logical_hasher.update(input.logical_batch.as_bytes());
+    prefix.last_commit_ts = input.commit_ts;
+
+    Ok(())
+}
+
+/// Keep logical bytes on the packer's stack until submission and hashing finish.
+/// The admission reservation still owns their charge: the coordinator cannot
+/// retire it before prefix publication, and close joins the packer before cleanup.
+fn frame_v7_batches_before_hash(
+    batches: &mut Vec<AdmittedBatch>,
+    mut last_commit_ts: u64,
+    writes: &mut WriteGroupBuffers<ParallelBuffer>,
+    hash_inputs: &mut Vec<WalV7AdmittedInput>,
+) -> Result<()> {
+    for mut batch in batches.drain(..) {
+        let input = batch
+            .v7_input
+            .take()
+            .context("v7 DATA batch has no logical input")?;
+        ensure!(
+            input.commit_ts > last_commit_ts,
+            "v7 packer commit timestamp does not advance"
+        );
+        last_commit_ts = input.commit_ts;
+        frame_v7_batch(&mut batch, &input)?;
+        hash_inputs.push(input);
+        writes.push(WriteBuffer::new(
+            batch.buffer,
+            batch.file_offset,
+            batch.aligned_len,
+        ));
+    }
+
+    Ok(())
+}
+
+fn publish_v7_prefix(
+    inner: &RuntimeInner,
+    target: u64,
+    prefix: &WalV7PrefixMetadata,
+) -> Result<()> {
+    let mut admission = inner.admission.lock();
+    ensure!(
+        admission
+            .v7_hash_pending
+            .is_none_or(|pending| pending == target),
+        "v7 packer pending digest endpoint disagrees with publication"
+    );
+    admission
+        .v7_metadata
+        .as_mut()
+        .context("v7 packer has no runtime metadata")?
+        .logical_hasher = prefix.logical_hasher.clone();
+    ensure!(
+        admission
+            .v7_prefixes
+            .insert(target, prefix.clone())
+            .is_none(),
+        "v7 WAL group endpoint already has logical prefix state"
+    );
+    let pending = admission.v7_hash_pending.take().is_some();
+    drop(admission);
+    if pending {
+        inner.v7_prefix_ready.notify_all();
+    }
+
+    Ok(())
+}
+
+fn materialize_v7_batches(
+    batches: &mut Vec<AdmittedBatch>,
+    prefix: &mut WalV7PrefixMetadata,
+    writes: &mut WriteGroupBuffers<ParallelBuffer>,
+) -> Result<()> {
+    for mut batch in batches.drain(..) {
+        materialize_v7_batch(&mut batch, prefix)?;
+        writes.push(WriteBuffer::new(
+            batch.buffer,
+            batch.file_offset,
+            batch.aligned_len,
+        ));
+    }
+    Ok(())
+}
+
 fn report_packer_failure(inner: &RuntimeInner, ticket: u64, error: &anyhow::Error) {
     let message = format!("{error:#}");
     {
         let mut admission = inner.admission.lock();
         admission.open = false;
+        admission.v7_hash_pending = None;
         if admission
             .poison
             .as_ref()
@@ -1858,7 +2644,15 @@ fn report_packer_failure(inner: &RuntimeInner, ticket: u64, error: &anyhow::Erro
             .as_ref()
             .map_or(ticket, |(poison_ticket, _)| *poison_ticket);
         admission.queue.retain(|batch| batch.ticket < poison_ticket);
+        admission
+            .v7_admitted
+            .retain(|entry| entry.ticket < poison_ticket);
+        admission
+            .v7_ready_batches
+            .retain(|ticket, _| *ticket < poison_ticket);
     }
+    inner.v7_prefix_ready.notify_all();
+    inner.v7_frames_ready.notify_all();
     let _ = inner.packer_wake.try_send(true);
     inner.buffer_budget.close();
     if let Some(failures) = inner.packer_failures.lock().as_ref() {
@@ -1880,10 +2674,15 @@ fn poison_unacknowledged(inner: &RuntimeInner, message: &str) {
     set_poison(&mut state, boundary, message.to_owned());
     let mut admission = inner.admission.lock();
     admission.open = false;
+    admission.v7_hash_pending = None;
     admission.poison = Some((boundary, message.to_owned()));
     admission.queue.clear();
+    admission.v7_admitted.clear();
+    admission.v7_ready_batches.clear();
     inner.buffer_budget.close();
     inner.durability.notify_change();
+    inner.v7_prefix_ready.notify_all();
+    inner.v7_frames_ready.notify_all();
 }
 
 fn run_sync_coordinator(
@@ -1892,20 +2691,19 @@ fn run_sync_coordinator(
     inner: Arc<RuntimeInner>,
 ) -> Result<()> {
     let mut last_sync_latency = None;
+    let v7_layout = inner.admission.lock().v7_allocator.is_some();
 
     while let Ok(result) = completions.recv() {
         process_group_result(&inner, result);
         #[cfg(all(test, feature = "chaos-testing"))]
         crate::chaos::failpoint::before_parallel_wal_result_drain();
         drain_ready_results(&inner, &completions);
-        if last_sync_latency.is_some_and(|latency| latency >= SYNC_COALESCE_MIN_SYNC) {
-            coalesce_admitted_prefix(&inner, &completions);
-            // Coalescing may return at its captured admission cutoff while
-            // later groups have already completed. Include the results that
-            // are queued now before capturing the next durability target.
-            // Bound this drain to its initial queue length so new completions
-            // cannot extend the coalescing window indefinitely.
-            drain_results_at_capture(&inner, &completions);
+        let large_batch_wave = v7_layout
+            && last_sync_latency.is_some_and(|latency| latency >= SYNC_COALESCE_MIN_SYNC)
+            && inner.durability.state.lock().large_batch_wave;
+        let coalesce_wait = sync_coalesce_wait(last_sync_latency, v7_layout, large_batch_wave);
+        if let Some(wait) = coalesce_wait {
+            coalesce_before_capture(&inner, &completions, wait, v7_layout);
         }
         if let Some(latency) = synchronize_written_prefix(&sync_file, &inner)? {
             last_sync_latency = Some(latency);
@@ -1920,7 +2718,61 @@ fn run_sync_coordinator(
     Ok(())
 }
 
-fn coalesce_admitted_prefix(inner: &RuntimeInner, completions: &Receiver<GroupWriteResult>) {
+fn coalesce_before_capture(
+    inner: &RuntimeInner,
+    completions: &Receiver<GroupWriteResult>,
+    wait: Duration,
+    v7_layout: bool,
+) {
+    if v7_layout {
+        let target = {
+            let state = inner.durability.state.lock();
+            (state.poison_ticket.is_none() && state.written_frontier > state.durable_frontier)
+                .then_some(state.written_frontier)
+        };
+        if let Some(target) = target {
+            let admission = inner.admission.lock();
+            if admission.v7_allocator.as_ref().is_some_and(|allocator| {
+                matches!(allocator.eligible_durable_end_for(target), Ok(None))
+            }) {
+                // Do not spend an optional batching window on a prefix that
+                // cannot retain its predecessor yet. Leave later results for
+                // the next iteration, which can start a normal window once
+                // eligible. The authoritative sync path still handles errors.
+                return;
+            }
+        }
+    }
+    coalesce_admitted_prefix(inner, completions, wait);
+    // Coalescing may return at its captured admission cutoff while later
+    // results are queued. Bound this drain to its initial length so new
+    // completions cannot extend the optional window indefinitely.
+    drain_results_at_capture(inner, completions);
+}
+
+fn sync_coalesce_wait(
+    last_sync_latency: Option<Duration>,
+    v7_layout: bool,
+    large_batch_wave: bool,
+) -> Option<Duration> {
+    match last_sync_latency {
+        Some(latency) if latency >= SYNC_COALESCE_MIN_SYNC => {
+            Some(if v7_layout && large_batch_wave {
+                V7_LARGE_BATCH_COALESCE_WAIT
+            } else {
+                SYNC_COALESCE_WAIT
+            })
+        }
+        Some(_) if v7_layout => Some(V7_FAST_SYNC_COALESCE_WAIT),
+        _ => None,
+    }
+}
+
+fn coalesce_admitted_prefix(
+    inner: &RuntimeInner,
+    completions: &Receiver<GroupWriteResult>,
+    wait: Duration,
+) {
     {
         let state = inner.durability.state.lock();
         if state.poison_ticket.is_some() || state.written_frontier <= state.durable_frontier {
@@ -1928,7 +2780,7 @@ fn coalesce_admitted_prefix(inner: &RuntimeInner, completions: &Receiver<GroupWr
         }
     }
 
-    let deadline = Instant::now() + SYNC_COALESCE_WAIT;
+    let deadline = Instant::now() + wait;
     let mut cutoff = inner.admission.lock().next_ticket;
     loop {
         let state = inner.durability.state.lock();
@@ -1936,10 +2788,15 @@ fn coalesce_admitted_prefix(inner: &RuntimeInner, completions: &Receiver<GroupWr
             return;
         }
         let written = state.written_frontier;
+        let durable = state.durable_frontier;
         drop(state);
         if written >= cutoff {
-            cutoff = inner.admission.lock().next_ticket;
-            if written >= cutoff {
+            let pending_preparation = {
+                let admission = inner.admission.lock();
+                cutoff = admission.next_ticket;
+                has_pending_v7_preparations(&admission, durable)
+            };
+            if written >= cutoff && !pending_preparation {
                 return;
             }
         }
@@ -1962,6 +2819,19 @@ fn coalesce_admitted_prefix(inner: &RuntimeInner, completions: &Receiver<GroupWr
             Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => return,
         }
     }
+}
+
+fn has_pending_v7_preparations(admission: &AdmissionState, durable: u64) -> bool {
+    // Already-reserved preparation can be part of the same producer wave.
+    // This hint only consumes the existing fixed coalescing deadline: capture
+    // and ACK still use the written prefix, and closing admission skips it.
+    admission.open
+        && admission
+            .v7_reservation_owner
+            .as_ref()
+            .is_some_and(|owner| {
+                owner.has_batch_operations_beyond(admission.next_ticket.saturating_sub(durable))
+            })
 }
 
 fn drain_results_at_capture(inner: &RuntimeInner, completions: &Receiver<GroupWriteResult>) {
@@ -2006,6 +2876,12 @@ fn process_group_result(inner: &RuntimeInner, result: GroupWriteResult) {
                 durability_poison_ticket.min(*poison_ticket)
             });
         admission.queue.retain(|batch| batch.ticket < poison_ticket);
+        admission
+            .v7_admitted
+            .retain(|entry| entry.ticket < poison_ticket);
+        admission
+            .v7_ready_batches
+            .retain(|ticket, _| *ticket < poison_ticket);
         inner.buffer_budget.close();
     } else {
         let previous = state.completed.insert(result.tickets.start, result);
@@ -2023,6 +2899,10 @@ fn process_group_result(inner: &RuntimeInner, result: GroupWriteResult) {
         {
             break;
         }
+        let single_large_batch = completed.tickets.end == completed.tickets.start.saturating_add(1)
+            && completed.write_bytes >= ALLOCATION_ONLY_MIN_BATCH_BYTES as u64;
+        state.large_batch_wave = single_large_batch
+            && (state.written_frontier == state.durable_frontier || state.large_batch_wave);
         state.written_frontier = completed.tickets.end;
     }
     debug_assert!(state.durable_frontier <= state.written_frontier);
@@ -2037,6 +2917,7 @@ fn process_group_result(inner: &RuntimeInner, result: GroupWriteResult) {
     // waiters can finish after fdatasync; poison must wake them immediately.
     if failed {
         inner.durability.notify_change();
+        inner.v7_frames_ready.notify_all();
     }
     drop(state);
 
@@ -2056,6 +2937,8 @@ fn terminalize_unresolved_prefix(inner: &RuntimeInner) {
         let mut admission = inner.admission.lock();
         admission.open = false;
         admission.queue.clear();
+        admission.v7_admitted.clear();
+        admission.v7_ready_batches.clear();
         if admission
             .poison
             .as_ref()
@@ -2066,6 +2949,7 @@ fn terminalize_unresolved_prefix(inner: &RuntimeInner) {
         inner.buffer_budget.close();
     }
     inner.durability.notify_change();
+    inner.v7_frames_ready.notify_all();
 }
 
 fn set_poison(state: &mut DurabilityState, ticket: u64, error: String) {
@@ -2095,6 +2979,8 @@ fn poison_v7_runtime(
     }
     admission.open = false;
     admission.queue.clear();
+    admission.v7_admitted.clear();
+    admission.v7_ready_batches.clear();
     if admission
         .poison
         .as_ref()
@@ -2104,6 +2990,7 @@ fn poison_v7_runtime(
     }
     inner.buffer_budget.close();
     inner.durability.notify_change();
+    inner.v7_frames_ready.notify_all();
 }
 
 fn append_v7_frontier(
@@ -2116,6 +3003,19 @@ fn append_v7_frontier(
     let mut frontier_reservation = None;
     let result = (|| -> Result<Option<WalV7FrontierCycle>> {
         let mut admission = inner.admission.lock();
+        while !admission.v7_prefixes.contains_key(&target) {
+            ensure!(
+                admission.v7_hash_pending == Some(target)
+                    && admission
+                        .poison
+                        .as_ref()
+                        .is_none_or(|(ticket, _)| *ticket >= target),
+                "v7 Parallel runtime has no pending digest for FRONTIER target"
+            );
+            // Release admission while the ordered packer hashes. DATA
+            // completion alone cannot create a FRONTIER or publish durability.
+            inner.v7_prefix_ready.wait(&mut admission);
+        }
         let allocator = admission
             .v7_allocator
             .as_ref()
@@ -2129,26 +3029,25 @@ fn append_v7_frontier(
             }
             return Ok(None);
         }
-        let mut frame = DirectBuf::new(WAL_V7_FRAME_LEN);
         let previous = allocator.last_frontier();
         let allocation_tail = allocator.allocation_tail();
         let previous_frontier_end = previous
             .frame_offset
             .checked_add(WAL_V7_FRAME_LEN as u64)
             .context("previous v7 FRONTIER end overflows")?;
-        let physical_hashed_end = admission
+        let physical_end = admission
             .v7_metadata
             .as_ref()
-            .map(|metadata| metadata.physical_hashed_end)
-            .context("v7 Parallel runtime has no hash metadata")?;
+            .map(|metadata| metadata.physical_end)
+            .context("v7 Parallel runtime has no metadata")?;
         ensure!(
-            physical_hashed_end == allocation_tail,
-            "v7 Parallel physical hash cursor disagrees with FRONTIER allocation tail"
+            physical_end == allocation_tail,
+            "v7 Parallel physical cursor disagrees with FRONTIER allocation tail"
         );
         let prefix = admission
             .v7_prefixes
             .get(&target)
-            .copied()
+            .cloned()
             .context("v7 Parallel runtime has no digest snapshot for FRONTIER target")?;
         let header_digest = admission
             .v7_header_digest
@@ -2160,32 +3059,6 @@ fn append_v7_frontier(
             .reserve_frontier(target)?;
         frontier_reservation = Some(reservation.clone());
 
-        let frontier = WalV7Frontier {
-            generation: previous
-                .frontier
-                .generation
-                .checked_add(1)
-                .context("v7 Parallel FRONTIER generation overflows")?,
-            ticket_end: target,
-            durable_end: reservation.durable_end(),
-            last_commit_ts: prefix.last_commit_ts,
-            prefix_digest: prefix.prefix_digest,
-            previous_frontier_offset: previous.frame_offset,
-            previous_frontier_digest: previous.frame_digest,
-        };
-        encode_frontier_successor_into(
-            frame.as_mut_slice(),
-            frontier,
-            previous.frontier,
-            previous.frame_offset,
-            &previous.frame_digest,
-            reservation.frame_offset(),
-            header_digest,
-        )
-        .context("encode v7 Parallel FRONTIER")?;
-        frame.set_len(WAL_V7_FRAME_LEN);
-        let frontier_bytes = frame.initialized_slice(0, WAL_V7_FRAME_LEN);
-        let frontier_digest = frame_record_digest(frontier_bytes)?;
         ensure!(
             previous_frontier_end <= reservation.durable_end()
                 && reservation.durable_end() <= reservation.frame_offset(),
@@ -2205,15 +3078,44 @@ fn append_v7_frontier(
         let metadata = admission
             .v7_metadata
             .as_mut()
-            .context("v7 Parallel runtime lost its hash metadata")?;
-        metadata.physical_hasher.update(frontier_bytes);
-        metadata.physical_hashed_end = frame_end;
+            .context("v7 Parallel runtime lost its metadata")?;
+        metadata.physical_end = frame_end;
         admission.admitted_end = frame_end;
-        // Record the marker in the shared hash cursor before producers can
-        // append after it. Any failure in the I/O below poisons this runtime.
+        // Publish the reserved marker's physical end before producers append
+        // after it. The single sync coordinator owns this cycle and its
+        // captured predecessor/prefix while encoding without admission held.
+        // Encoding or I/O failure below still poisons this reserved cycle.
         drop(admission);
 
-        preallocate_runtime(inner, preallocation_end)
+        let mut frame = DirectBuf::new(WAL_V7_FRAME_LEN);
+        let frontier = WalV7Frontier {
+            generation: previous
+                .frontier
+                .generation
+                .checked_add(1)
+                .context("v7 Parallel FRONTIER generation overflows")?,
+            ticket_end: target,
+            durable_end: reservation.durable_end(),
+            last_commit_ts: prefix.last_commit_ts,
+            prefix_digest: prefix.logical_hasher.finalize().into(),
+            previous_frontier_offset: previous.frame_offset,
+            previous_frontier_digest: previous.frame_digest,
+        };
+        encode_frontier_successor_into(
+            frame.as_mut_slice(),
+            frontier,
+            previous.frontier,
+            previous.frame_offset,
+            &previous.frame_digest,
+            reservation.frame_offset(),
+            header_digest,
+        )
+        .context("encode v7 Parallel FRONTIER")?;
+        frame.set_len(WAL_V7_FRAME_LEN);
+        let frontier_bytes = frame.initialized_slice(0, WAL_V7_FRAME_LEN);
+        let frontier_digest = frame_record_digest(frontier_bytes)?;
+
+        preallocate_runtime_for_write(inner, preallocation_end, frame_end, true)
             .context("preallocate v7 Parallel FRONTIER frame")?;
         #[cfg(feature = "bench")]
         let profile = inner.sync_progress.profile();
@@ -2517,9 +3419,178 @@ fn wal_sync_timestamp() -> Option<std::time::Instant> {
 /// already-sized range and avoid extending the WAL themselves.
 /// Only allocate the new suffix; revisiting the existing extents adds work
 /// as the WAL grows without reserving any additional space.
-fn preallocate_runtime(inner: &RuntimeInner, end: u64) -> Result<()> {
-    let _guard = inner.preallocation_lock.lock();
-    preallocate(&inner.preallocator, end)
+/// Active v7 writers also initialize that range before small DATA or FRONTIER
+/// I/O. Large DATA groups initialize their own extents. Their shared cursor
+/// prevents later preparation from overwriting either kind of write.
+fn preallocate_runtime(inner: &RuntimeInner, end: u64, initialize_extents: bool) -> Result<()> {
+    ensure!(
+        end <= inner.max_file_size,
+        "WAL preallocation exceeds the configured file cap"
+    );
+    if end <= inner.prepared_file_end.load(Ordering::Acquire) {
+        return Ok(());
+    }
+    let mut prepared_end = inner.preallocation_lock.lock();
+    if end <= inner.prepared_file_end.load(Ordering::Acquire) {
+        return Ok(());
+    }
+    check_v7_preparation_failure(inner)?;
+    preallocate(&inner.preallocator, end)?;
+    let initialized =
+        initialize_v7_extent_prefix(inner, &mut prepared_end, end, initialize_extents);
+    if let Err(error) = &initialized
+        && let Some(control) = &inner.async_v7_extents
+    {
+        control.fail(format!("{error:#}"));
+    }
+    initialized?;
+    // Preparation can fail after allocating the inode or writing only part
+    // of its zero-filled suffix. Neither makes that entire suffix ready.
+    inner.prepared_file_end.store(end, Ordering::Release);
+
+    Ok(())
+}
+
+fn check_v7_preparation_failure(inner: &RuntimeInner) -> Result<()> {
+    if let Some(control) = &inner.async_v7_extents
+        && let Some(error) = control.failure.lock().as_ref()
+    {
+        bail!("v7 extent preparation previously failed: {error}");
+    }
+    Ok(())
+}
+
+fn initialize_v7_extent_prefix(
+    inner: &RuntimeInner,
+    prepared_end: &mut Option<u64>,
+    end: u64,
+    initialize_extents: bool,
+) -> Result<()> {
+    if let Some(prepared_end) = prepared_end.as_mut() {
+        // The configured cap may end in a partial frame. Preserve that EOF
+        // while initializing only complete aligned ranges for direct writes.
+        let aligned_end = end - end % WAL_V7_FRAME_LEN as u64;
+        if !initialize_extents {
+            // Large DATA writes initialize their own extents. Mark their
+            // allocation usable so later FRONTIER preparation cannot zero it.
+            *prepared_end = (*prepared_end).max(aligned_end);
+        }
+        while *prepared_end < aligned_end {
+            #[cfg(feature = "chaos-testing")]
+            crate::chaos::failpoint::fail_point!("parallel_wal.v7_extent_init_failure", |_| {
+                Err(anyhow!("injected v7 extent initialization failure"))
+            });
+            let len =
+                (aligned_end - *prepared_end).min(EXTENT_INITIALIZATION_CHUNK as u64) as usize;
+            inner
+                .preallocator
+                .write_all_at(&EXTENT_ZEROS.0[..len], *prepared_end)
+                .context("failed to initialize v7 WAL extent")?;
+            *prepared_end += len as u64;
+        }
+    }
+    Ok(())
+}
+
+/// Allocate the same bounded extent as before, but require only the prefix
+/// used by this write to be ready. Demand can initialize that prefix itself;
+/// progress never depends on the background thread being scheduled.
+fn preallocate_runtime_for_write(
+    inner: &RuntimeInner,
+    end: u64,
+    required_end: u64,
+    initialize_extents: bool,
+) -> Result<()> {
+    ensure!(
+        required_end <= end && end <= inner.max_file_size,
+        "invalid WAL preparation bounds"
+    );
+    if required_end <= inner.prepared_file_end.load(Ordering::Acquire) {
+        return Ok(());
+    }
+    let Some(control) = inner
+        .async_v7_extents
+        .as_ref()
+        .filter(|control| initialize_extents && !control.stopping.load(Ordering::Acquire))
+    else {
+        return preallocate_runtime(inner, end, initialize_extents);
+    };
+    // A single commit cannot hide suffix I/O behind another producer. Keep
+    // its preparation before DATA/FRONTIER I/O so background zero writes do
+    // not compete with its sync. This count is only a scheduling hint: the
+    // shared cursor and readiness checks remain the correctness boundary.
+    let concurrent_preparation = inner
+        .admission
+        .lock()
+        .v7_reservation_owner
+        .as_ref()
+        .is_some_and(|owner| owner.has_batch_operations_beyond(1));
+    // Keep the first preparation small while producers are arriving. Later
+    // serial demand prepares the complete extent before its syncs, avoiding
+    // repeated small conversions and background I/O in a single-writer stream.
+    if !concurrent_preparation
+        && inner.prepared_file_end.load(Ordering::Acquire) > control.initial_end
+    {
+        return preallocate_runtime(inner, end, initialize_extents);
+    }
+    let mut prepared_end = inner.preallocation_lock.lock();
+    if required_end <= inner.prepared_file_end.load(Ordering::Acquire) {
+        return Ok(());
+    }
+    check_v7_preparation_failure(inner)?;
+    preallocate(&inner.preallocator, end)?;
+    let aligned_end = end - end % WAL_V7_FRAME_LEN as u64;
+    let needed = round_up(required_end, EXTENT_INITIALIZATION_CHUNK as u64)
+        .context("v7 required preparation prefix overflows")?
+        .min(aligned_end);
+    if let Err(error) = initialize_v7_extent_prefix(inner, &mut prepared_end, needed, true) {
+        control.fail(format!("{error:#}"));
+        return Err(error);
+    }
+    let ready = if needed == aligned_end { end } else { needed };
+    ensure!(
+        ready >= required_end,
+        "v7 write exceeds its aligned prepared prefix"
+    );
+    inner.prepared_file_end.store(ready, Ordering::Release);
+    drop(prepared_end);
+    if concurrent_preparation {
+        control.request(end);
+    }
+    Ok(())
+}
+
+/// Initialize one bounded chunk of an already allocated suffix. The same
+/// cursor protects DATA, FRONTIER, demand initialization and large-write skips.
+fn prepare_v7_background_chunk(inner: &RuntimeInner, target: u64) -> Result<()> {
+    ensure!(
+        target <= inner.max_file_size,
+        "v7 background preparation exceeds file cap"
+    );
+    let mut prepared_end = inner.preallocation_lock.lock();
+    if inner.prepared_file_end.load(Ordering::Acquire) >= target {
+        return Ok(());
+    }
+    check_v7_preparation_failure(inner)?;
+    let cursor = prepared_end
+        .as_ref()
+        .copied()
+        .context("v7 background preparation has no cursor")?;
+    let aligned_target = target - target % WAL_V7_FRAME_LEN as u64;
+    let next = cursor
+        .saturating_add(EXTENT_INITIALIZATION_CHUNK as u64)
+        .min(aligned_target);
+    if let Err(error) = initialize_v7_extent_prefix(inner, &mut prepared_end, next, true) {
+        // Publish the sticky failure before releasing the shared cursor lock;
+        // a demand caller must not retry this suffix in the intervening gap.
+        if let Some(control) = &inner.async_v7_extents {
+            control.fail(format!("{error:#}"));
+        }
+        return Err(error);
+    }
+    let ready = if next == aligned_target { target } else { next };
+    inner.prepared_file_end.store(ready, Ordering::Release);
+    Ok(())
 }
 
 fn preallocate(file: &File, end: u64) -> Result<()> {
@@ -2567,7 +3638,12 @@ fn round_up(value: u64, alignment: u64) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeMap, os::unix::fs::FileExt, path::Path, sync::Arc};
+    use std::{
+        collections::{BTreeMap, VecDeque},
+        os::unix::fs::FileExt,
+        path::Path,
+        sync::Arc,
+    };
 
     use crate::{
         pitr::{LIVE_WAL_V5_LIMITS, RecordedAt, WalBatch, WalEntry, manifest::ActiveBoundary},
@@ -2575,6 +3651,7 @@ mod tests {
             WalV7ReservationOwner, WalV7ResourceCharge, WalV7ResourceLedger, WalV7ResourceLimits,
         },
     };
+    use sha2::Digest;
 
     struct V7RuntimeTestWal {
         wal: Wal,
@@ -2690,6 +3767,469 @@ mod tests {
         Ok(())
     }
 
+    fn async_extent_test_directory() -> anyhow::Result<tempfile::TempDir> {
+        let base =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/wal-opt/async-extent-tests");
+        std::fs::create_dir_all(&base)?;
+        Ok(tempfile::tempdir_in(base)?)
+    }
+
+    fn pause_async_extent(
+        runtime: &super::ParallelWalRuntime,
+    ) -> Option<(
+        crossbeam_channel::Receiver<()>,
+        crossbeam_channel::Sender<()>,
+    )> {
+        let control = runtime.inner.async_v7_extents.as_ref()?;
+        let (entered, waiting) = crossbeam_channel::bounded(1);
+        let (resume, released) = crossbeam_channel::bounded(1);
+        *control.before_chunk.lock() = Some((entered, released));
+        Some((waiting, resume))
+    }
+
+    fn wait_for_extent_state(mut ready: impl FnMut() -> bool) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !ready() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "extent worker made no progress"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
+    fn async_extent_large_batch(commit_ts: u64) -> WalBatch {
+        let mut batch = v7_test_batch(commit_ts, 32 * 1024);
+        for index in 1..4 {
+            batch.entries.push(WalEntry::Put {
+                key: format!("large-{commit_ts}-{index}").into_bytes(),
+                value: vec![0x6b; 32 * 1024],
+            });
+        }
+        batch
+    }
+
+    #[test]
+    fn async_v7_extent_serial_rollover_does_not_schedule_background_work() -> anyhow::Result<()> {
+        use crate::wal::v7::{
+            install::recover_and_install_active, recovery::WalV7RecoveryAuthority,
+        };
+        for start_concurrent in [false, true] {
+            let directory = async_extent_test_directory()?;
+            let path = directory.path().join("serial-preparation.wal");
+            let Some(V7RuntimeTestWal { wal, owner, anchor }) =
+                live_v7_test_wal(&path, super::MAX_WAL_FILE_SIZE, v7_test_resource_limits())?
+            else {
+                return Ok(());
+            };
+            let runtime = wal.parallel_runtime.as_ref().unwrap();
+            let Some((entered, resume)) = pause_async_extent(runtime) else {
+                eprintln!("skipping async extent test (ext filesystem unavailable)");
+                return Ok(());
+            };
+            let control = Arc::clone(runtime.inner.async_v7_extents.as_ref().unwrap());
+            let initial_target = control.target.load(super::Ordering::Acquire);
+            let concurrent = start_concurrent
+                .then(|| owner.reserve_batch(256))
+                .transpose()?;
+            let mut batches = vec![v7_test_batch(1, 16)];
+            let ticket = wal
+                .put_v7_batch_with_index(&batches[0], LIVE_WAL_V5_LIMITS)?
+                .0;
+            wal.submit_and_commit(ticket)?;
+            if start_concurrent {
+                entered.recv_timeout(std::time::Duration::from_secs(5))?;
+                assert_eq!(
+                    runtime
+                        .inner
+                        .prepared_file_end
+                        .load(super::Ordering::Acquire),
+                    128 * 1024
+                );
+            } else {
+                assert_eq!(
+                    runtime
+                        .inner
+                        .prepared_file_end
+                        .load(super::Ordering::Acquire),
+                    super::EXTENT_INITIALIZATION_CHUNK as u64
+                );
+                assert_eq!(
+                    control.target.load(super::Ordering::Acquire),
+                    initial_target
+                );
+                assert!(matches!(
+                    entered.try_recv(),
+                    Err(crossbeam_channel::TryRecvError::Empty)
+                ));
+            }
+            let requested_target = control.target.load(super::Ordering::Acquire);
+            let first_end = runtime.logical_length() as usize;
+            let first_bytes = std::fs::read(&path)?[..first_end].to_vec();
+            drop(concurrent);
+            // Roll through multiple extents with only one real batch operation
+            // at a time, including a transition from a paused concurrent wave.
+            for ts in 2..=65 {
+                let batch = v7_test_batch(ts, 32 * 1024);
+                let ticket = wal.put_v7_batch_with_index(&batch, LIVE_WAL_V5_LIMITS)?.0;
+                wal.submit_and_commit(ticket)?;
+                batches.push(batch);
+            }
+            let physical_end = std::fs::metadata(&path)?.len();
+            assert!(physical_end >= 2 * super::PREALLOC_BLOCK);
+            assert_eq!(
+                runtime
+                    .inner
+                    .prepared_file_end
+                    .load(super::Ordering::Acquire),
+                physical_end
+            );
+            assert_eq!(
+                control.target.load(super::Ordering::Acquire),
+                requested_target
+            );
+            assert_eq!(control.completed_requests.load(super::Ordering::Acquire), 0);
+            assert_eq!(&std::fs::read(&path)?[..first_end], first_bytes);
+            wal.close()?;
+            assert_eq!(owner.snapshot().buffer_memory_bytes, 0);
+            drop(resume);
+            drop(wal);
+            let recovered = recover_and_install_active(
+                &path,
+                WalV7RecoveryAuthority::Active {
+                    predecessor: crate::pitr::ChainAnchor::Genesis {
+                        archive_epoch_id: crate::pitr::ArchiveEpochId(anchor.archive_epoch_id),
+                    },
+                    durable_anchors: vec![anchor],
+                },
+            )?;
+            assert_eq!(recovered.installed.batches, batches);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn async_v7_extent_preparation_allows_ready_prefix_acks() -> anyhow::Result<()> {
+        use crate::wal::v7::{
+            install::recover_and_install_active, recovery::WalV7RecoveryAuthority,
+        };
+        let directory = async_extent_test_directory()?;
+        let path = directory.path().join("background-ready.wal");
+        let Some(V7RuntimeTestWal { wal, owner, anchor }) =
+            live_v7_test_wal(&path, super::MAX_WAL_FILE_SIZE, v7_test_resource_limits())?
+        else {
+            return Ok(());
+        };
+        // Hold another producer in preparation while exercising background work.
+        let concurrent_preparation = owner.reserve_batch(256)?;
+        let runtime = wal.parallel_runtime.as_ref().unwrap();
+        let Some((entered, resume)) = pause_async_extent(runtime) else {
+            eprintln!("skipping async extent test (ext filesystem unavailable)");
+            return Ok(());
+        };
+        let control = Arc::clone(runtime.inner.async_v7_extents.as_ref().unwrap());
+        let mut batches = Vec::new();
+        for ts in 1..=8 {
+            let batch = v7_test_batch(ts, 16);
+            let ticket = wal.put_v7_batch_with_index(&batch, LIVE_WAL_V5_LIMITS)?.0;
+            wal.submit_and_commit(ticket)?;
+            if ts == 1 {
+                entered.recv_timeout(std::time::Duration::from_secs(5))?;
+            }
+            batches.push(batch);
+        }
+        assert_eq!(
+            runtime
+                .inner
+                .prepared_file_end
+                .load(super::Ordering::Acquire),
+            128 * 1024
+        );
+        assert_eq!(std::fs::metadata(&path)?.len(), super::PREALLOC_BLOCK);
+        let accepted_end = runtime.logical_length() as usize;
+        let before = std::fs::read(&path)?[..accepted_end].to_vec();
+        resume.send(())?;
+        wait_for_extent_state(|| control.completed_requests.load(super::Ordering::Acquire) > 0);
+        assert_eq!(
+            runtime
+                .inner
+                .prepared_file_end
+                .load(super::Ordering::Acquire),
+            super::PREALLOC_BLOCK
+        );
+        assert_eq!(&std::fs::read(&path)?[..accepted_end], before);
+        drop(concurrent_preparation);
+        wal.close()?;
+        assert_eq!(owner.snapshot().buffer_memory_bytes, 0);
+        drop(wal);
+        let recovered = recover_and_install_active(
+            &path,
+            WalV7RecoveryAuthority::Active {
+                predecessor: crate::pitr::ChainAnchor::Genesis {
+                    archive_epoch_id: crate::pitr::ArchiveEpochId(anchor.archive_epoch_id),
+                },
+                durable_anchors: vec![anchor],
+            },
+        )?;
+        assert_eq!(recovered.installed.batches, batches);
+        Ok(())
+    }
+
+    #[test]
+    fn async_v7_extent_demand_and_close_progress_while_background_is_paused() -> anyhow::Result<()>
+    {
+        use crate::wal::v7::{
+            install::recover_and_install_active, recovery::WalV7RecoveryAuthority,
+        };
+        let directory = async_extent_test_directory()?;
+        let path = directory.path().join("foreground-progress.wal");
+        let Some(V7RuntimeTestWal { wal, owner, anchor }) =
+            live_v7_test_wal(&path, super::MAX_WAL_FILE_SIZE, v7_test_resource_limits())?
+        else {
+            return Ok(());
+        };
+        // Hold another producer in preparation while exercising background work.
+        let concurrent_preparation = owner.reserve_batch(256)?;
+        let runtime = wal.parallel_runtime.as_ref().unwrap();
+        let Some((entered, resume)) = pause_async_extent(runtime) else {
+            eprintln!("skipping async extent test (ext filesystem unavailable)");
+            return Ok(());
+        };
+        let control = Arc::clone(runtime.inner.async_v7_extents.as_ref().unwrap());
+        let mut batches = Vec::new();
+        for ts in 1..=10 {
+            let batch = v7_test_batch(ts, if ts == 1 { 16 } else { 32 * 1024 });
+            let ticket = wal.put_v7_batch_with_index(&batch, LIVE_WAL_V5_LIMITS)?.0;
+            wal.submit_and_commit(ticket)?;
+            if ts == 1 {
+                entered.recv_timeout(std::time::Duration::from_secs(5))?;
+            }
+            batches.push(batch);
+        }
+        let ready = runtime
+            .inner
+            .prepared_file_end
+            .load(super::Ordering::Acquire);
+        assert!(ready > 128 * 1024 && ready < super::PREALLOC_BLOCK);
+        assert!(runtime.logical_length() <= ready);
+        assert_eq!(std::fs::metadata(&path)?.len(), super::PREALLOC_BLOCK);
+        // Close must stop/join the paused worker without another DATA write,
+        // a new wake, or a release from this test's resume sender.
+        drop(concurrent_preparation);
+        wal.close()?;
+        assert!(control.stopping.load(super::Ordering::Acquire));
+        assert!(control.requests.lock().is_none());
+        assert_eq!(owner.snapshot().buffer_memory_bytes, 0);
+        drop(resume);
+        drop(wal);
+        let recovered = recover_and_install_active(
+            &path,
+            WalV7RecoveryAuthority::Active {
+                predecessor: crate::pitr::ChainAnchor::Genesis {
+                    archive_epoch_id: crate::pitr::ArchiveEpochId(anchor.archive_epoch_id),
+                },
+                durable_anchors: vec![anchor],
+            },
+        )?;
+        assert_eq!(recovered.installed.batches, batches);
+        Ok(())
+    }
+
+    #[test]
+    fn async_v7_extent_large_data_skip_cancels_queued_zeroing() -> anyhow::Result<()> {
+        use crate::wal::v7::{
+            install::recover_and_install_active, recovery::WalV7RecoveryAuthority,
+        };
+        let directory = async_extent_test_directory()?;
+        let path = directory.path().join("background-large-skip.wal");
+        let Some(V7RuntimeTestWal { wal, owner, anchor }) =
+            live_v7_test_wal(&path, super::MAX_WAL_FILE_SIZE, v7_test_resource_limits())?
+        else {
+            return Ok(());
+        };
+        // Hold another producer in preparation while exercising background work.
+        let concurrent_preparation = owner.reserve_batch(256)?;
+        let runtime = wal.parallel_runtime.as_ref().unwrap();
+        let Some((entered, resume)) = pause_async_extent(runtime) else {
+            eprintln!("skipping async extent test (ext filesystem unavailable)");
+            return Ok(());
+        };
+        let control = Arc::clone(runtime.inner.async_v7_extents.as_ref().unwrap());
+        let first = v7_test_batch(1, 16);
+        let ticket = wal.put_v7_batch_with_index(&first, LIVE_WAL_V5_LIMITS)?.0;
+        wal.submit_and_commit(ticket)?;
+        entered.recv_timeout(std::time::Duration::from_secs(5))?;
+        assert_eq!(
+            runtime
+                .inner
+                .prepared_file_end
+                .load(super::Ordering::Acquire),
+            128 * 1024
+        );
+        let large = async_extent_large_batch(2);
+        let ticket = wal.put_v7_batch_with_index(&large, LIVE_WAL_V5_LIMITS)?.0;
+        wal.submit_and_commit(ticket)?;
+        assert_eq!(
+            runtime
+                .inner
+                .prepared_file_end
+                .load(super::Ordering::Acquire),
+            super::PREALLOC_BLOCK
+        );
+        let before = std::fs::read(&path)?;
+        resume.send(())?;
+        wait_for_extent_state(|| control.completed_requests.load(super::Ordering::Acquire) > 0);
+        assert_eq!(std::fs::read(&path)?, before);
+        drop(concurrent_preparation);
+        wal.close()?;
+        assert_eq!(owner.snapshot().buffer_memory_bytes, 0);
+        drop(wal);
+        let recovered = recover_and_install_active(
+            &path,
+            WalV7RecoveryAuthority::Active {
+                predecessor: crate::pitr::ChainAnchor::Genesis {
+                    archive_epoch_id: crate::pitr::ArchiveEpochId(anchor.archive_epoch_id),
+                },
+                durable_anchors: vec![anchor],
+            },
+        )?;
+        assert_eq!(recovered.installed.batches, vec![first, large]);
+        Ok(())
+    }
+
+    #[test]
+    fn async_v7_extent_quiesce_can_freeze_or_continue_writing() -> anyhow::Result<()> {
+        use crate::wal::v7::{
+            install::recover_and_install_active, recovery::WalV7RecoveryAuthority,
+        };
+        for freeze in [true, false] {
+            let directory = async_extent_test_directory()?;
+            let path = directory.path().join("quiesced-background.wal");
+            let Some(V7RuntimeTestWal { wal, owner, anchor }) =
+                live_v7_test_wal(&path, super::MAX_WAL_FILE_SIZE, v7_test_resource_limits())?
+            else {
+                return Ok(());
+            };
+            // Hold another producer in preparation while exercising background work.
+            let concurrent_preparation = owner.reserve_batch(256)?;
+            let runtime = wal.parallel_runtime.as_ref().unwrap();
+            let Some((entered, resume)) = pause_async_extent(runtime) else {
+                eprintln!("skipping async extent test (ext filesystem unavailable)");
+                return Ok(());
+            };
+            let mut batches = vec![v7_test_batch(1, 16)];
+            let ticket = wal
+                .put_v7_batch_with_index(&batches[0], LIVE_WAL_V5_LIMITS)?
+                .0;
+            wal.submit_and_commit(ticket)?;
+            entered.recv_timeout(std::time::Duration::from_secs(5))?;
+            wal.stop_v7_extent_initialization()?;
+            assert!(!runtime.is_closed());
+            assert!(runtime.admission_is_open());
+            drop(concurrent_preparation);
+            if freeze {
+                let sealed_end = runtime.logical_length();
+                runtime.inner.preallocator.set_len(sealed_end)?;
+                runtime.inner.preallocator.sync_all()?;
+                wal.close()?;
+                assert_eq!(std::fs::metadata(&path)?.len(), sealed_end);
+            } else {
+                // Stopping only preparation must not close the old writer
+                // before a fallible lifecycle transition has committed.
+                batches.push(async_extent_large_batch(2));
+                let ticket = wal
+                    .put_v7_batch_with_index(&batches[1], LIVE_WAL_V5_LIMITS)?
+                    .0;
+                wal.submit_and_commit(ticket)?;
+                wal.close()?;
+            }
+            assert_eq!(owner.snapshot().buffer_memory_bytes, 0);
+            drop(resume);
+            drop(wal);
+            let recovered = recover_and_install_active(
+                &path,
+                WalV7RecoveryAuthority::Active {
+                    predecessor: crate::pitr::ChainAnchor::Genesis {
+                        archive_epoch_id: crate::pitr::ArchiveEpochId(anchor.archive_epoch_id),
+                    },
+                    durable_anchors: vec![anchor],
+                },
+            )?;
+            assert_eq!(recovered.installed.batches, batches);
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "chaos-testing")]
+    #[test]
+    fn failpoint_async_v7_extent_failure_is_sticky_on_later_demand() -> anyhow::Result<()> {
+        use crate::{
+            chaos::failpoint::{self, FailScenario},
+            wal::v7::{install::recover_and_install_active, recovery::WalV7RecoveryAuthority},
+        };
+        let _scenario = FailScenario::setup();
+        let directory = async_extent_test_directory()?;
+        let path = directory.path().join("failed-background.wal");
+        let Some(V7RuntimeTestWal { wal, owner, anchor }) =
+            live_v7_test_wal(&path, super::MAX_WAL_FILE_SIZE, v7_test_resource_limits())?
+        else {
+            return Ok(());
+        };
+        // Hold another producer in preparation while exercising background work.
+        let concurrent_preparation = owner.reserve_batch(256)?;
+        let runtime = wal.parallel_runtime.as_ref().unwrap();
+        let Some((entered, resume)) = pause_async_extent(runtime) else {
+            eprintln!("skipping async extent test (ext filesystem unavailable)");
+            return Ok(());
+        };
+        let control = Arc::clone(runtime.inner.async_v7_extents.as_ref().unwrap());
+        let first = v7_test_batch(1, 16);
+        let first_ticket = wal.put_v7_batch_with_index(&first, LIVE_WAL_V5_LIMITS)?.0;
+        wal.submit_and_commit(first_ticket)?;
+        entered.recv_timeout(std::time::Duration::from_secs(5))?;
+        let ready = runtime
+            .inner
+            .prepared_file_end
+            .load(super::Ordering::Acquire);
+        failpoint::cfg("parallel_wal.v7_extent_init_failure", "return")
+            .expect("inject background initialization failure");
+        resume.send(())?;
+        wait_for_extent_state(|| control.failure.lock().is_some());
+        failpoint::cfg("parallel_wal.v7_extent_init_failure", "off")
+            .expect("disable background initialization failure");
+        assert_eq!(
+            runtime
+                .inner
+                .prepared_file_end
+                .load(super::Ordering::Acquire),
+            ready
+        );
+        runtime.wait_durable(first_ticket)?;
+        // Allocation-only large DATA must consume the cached failure too,
+        // rather than silently promoting the failed suffix to a ready range.
+        let later = async_extent_large_batch(2);
+        let failed_ticket = wal.put_v7_batch_with_index(&later, LIVE_WAL_V5_LIMITS)?.0;
+        let error = wal
+            .submit_and_commit(failed_ticket)
+            .expect_err("failed suffix poisons later demand");
+        assert!(format!("{error:#}").contains("injected v7 extent initialization failure"));
+        drop(concurrent_preparation);
+        assert!(wal.close().is_err());
+        assert_eq!(owner.snapshot().buffer_memory_bytes, 0);
+        drop(wal);
+        let recovered = recover_and_install_active(
+            &path,
+            WalV7RecoveryAuthority::Active {
+                predecessor: crate::pitr::ChainAnchor::Genesis {
+                    archive_epoch_id: crate::pitr::ArchiveEpochId(anchor.archive_epoch_id),
+                },
+                durable_anchors: vec![anchor],
+            },
+        )?;
+        assert_eq!(recovered.installed.batches, vec![first]);
+        Ok(())
+    }
+
     #[cfg(feature = "chaos-testing")]
     fn count_valid_v7_frontiers(path: &Path) -> anyhow::Result<usize> {
         use crate::wal::v7::codec::{
@@ -2728,11 +4268,1456 @@ mod tests {
         }
     }
 
+    #[test]
+    fn v7_producer_framing_publishes_only_a_contiguous_ready_prefix() -> anyhow::Result<()> {
+        use crate::wal::v7::{
+            install::recover_and_install_active, recovery::WalV7RecoveryAuthority,
+        };
+
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("producer-ready-order.wal");
+        let Some(V7RuntimeTestWal { wal, owner, anchor }) =
+            live_v7_test_wal(&path, super::MAX_WAL_FILE_SIZE, v7_test_resource_limits())?
+        else {
+            return Ok(());
+        };
+        #[cfg(feature = "bench")]
+        let profile = {
+            let profile = Arc::new(crate::mem_table::WriteProfile::default());
+            profile.set_wal_sync_diagnostics_enabled(true);
+            wal.set_write_profile(Arc::clone(&profile));
+            profile
+        };
+        let runtime = wal.parallel_runtime.as_ref().unwrap();
+        let packer = runtime.inner.packer_state.lock();
+        let batches = [v7_test_batch(1, 60 * 1024), v7_test_batch(2, 60 * 1024)];
+        let (first, _, first_job) =
+            wal.admit_v7_batch_with_index(&batches[0], LIVE_WAL_V5_LIMITS)?;
+        let (second, _, second_job) =
+            wal.admit_v7_batch_with_index(&batches[1], LIVE_WAL_V5_LIMITS)?;
+        {
+            let admission = runtime.inner.admission.lock();
+            assert_eq!(
+                admission
+                    .v7_admitted
+                    .iter()
+                    .map(|entry| (entry.ticket, entry.commit_ts))
+                    .collect::<Vec<_>>(),
+                vec![
+                    (first, batches[0].commit_ts),
+                    (second, batches[1].commit_ts)
+                ]
+            );
+            assert!(admission.queue.is_empty());
+            assert!(admission.v7_ready_batches.is_empty());
+        }
+        second_job
+            .expect("large successor has producer work")
+            .finish()?;
+        {
+            let admission = runtime.inner.admission.lock();
+            assert!(admission.queue.is_empty());
+            assert_eq!(admission.v7_admitted.len(), 2);
+            assert_eq!(admission.v7_ready_ticket, first);
+            assert!(admission.v7_ready_batches.contains_key(&second));
+            assert!(admission.v7_prefixes.is_empty());
+        }
+        first_job
+            .expect("large predecessor has producer work")
+            .finish()?;
+        {
+            let admission = runtime.inner.admission.lock();
+            assert_eq!(admission.v7_ready_ticket, second + 1);
+            assert!(admission.v7_ready_batches.is_empty());
+            assert_eq!(admission.queue.len(), 2);
+            for batch in &admission.queue {
+                assert!(batch.v7_framed);
+                assert_eq!(super::WorkerBuffer::len(&batch.buffer), batch.aligned_len);
+            }
+            assert!(
+                admission.v7_prefixes.is_empty(),
+                "producer framing cannot publish the digest"
+            );
+        }
+        drop(packer);
+        wal.submit_and_commit(second)?;
+        #[cfg(feature = "bench")]
+        {
+            let snapshot = profile.snapshot();
+            assert_eq!(snapshot.wal_commit_groups, 1);
+            assert_eq!(snapshot.wal_commit_buffers, 2);
+        }
+        wal.close()?;
+        assert_eq!(owner.snapshot().buffer_memory_bytes, 0);
+        drop(wal);
+        let recovered = recover_and_install_active(
+            &path,
+            WalV7RecoveryAuthority::Active {
+                predecessor: crate::pitr::ChainAnchor::Genesis {
+                    archive_epoch_id: crate::pitr::ArchiveEpochId(anchor.archive_epoch_id),
+                },
+                durable_anchors: vec![anchor],
+            },
+        )?;
+        assert_eq!(recovered.installed.batches, batches);
+
+        Ok(())
+    }
+
+    #[test]
+    fn v7_admission_wakes_packer_before_single_frame_is_ready() -> anyhow::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("admission-wakes-packer.wal");
+        let Some(V7RuntimeTestWal { wal, .. }) =
+            live_v7_test_wal(&path, super::MAX_WAL_FILE_SIZE, v7_test_resource_limits())?
+        else {
+            return Ok(());
+        };
+        let runtime = wal.parallel_runtime.as_ref().unwrap();
+        let (ticket, _, job) =
+            wal.admit_v7_batch_with_index(&v7_test_batch(1, 60 * 1024), LIVE_WAL_V5_LIMITS)?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if runtime.inner.packer_state.try_lock().is_none() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "packer did not wake on admission"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        job.expect("large batch has producer work").finish()?;
+        wal.submit_and_commit(ticket)?;
+        wal.close()?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn v7_admission_group_waits_for_out_of_order_producers() -> anyhow::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("admitted-out-of-order-group.wal");
+        let Some(V7RuntimeTestWal { wal, .. }) =
+            live_v7_test_wal(&path, super::MAX_WAL_FILE_SIZE, v7_test_resource_limits())?
+        else {
+            return Ok(());
+        };
+        #[cfg(feature = "bench")]
+        let profile = {
+            let profile = Arc::new(crate::mem_table::WriteProfile::default());
+            profile.set_wal_sync_diagnostics_enabled(true);
+            wal.set_write_profile(Arc::clone(&profile));
+            profile
+        };
+        let runtime = wal.parallel_runtime.as_ref().unwrap();
+        let packer = runtime.inner.packer_state.lock();
+        let (_, _, first_job) =
+            wal.admit_v7_batch_with_index(&v7_test_batch(1, 60 * 1024), LIVE_WAL_V5_LIMITS)?;
+        let (second, _, second_job) =
+            wal.admit_v7_batch_with_index(&v7_test_batch(2, 60 * 1024), LIVE_WAL_V5_LIMITS)?;
+        drop(packer);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if runtime.inner.packer_state.try_lock().is_none() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "packer did not capture admissions"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        second_job.expect("second producer job").finish()?;
+        first_job.expect("first producer job").finish()?;
+        wal.submit_and_commit(second)?;
+        #[cfg(feature = "bench")]
+        {
+            let snapshot = profile.snapshot();
+            assert_eq!(snapshot.wal_commit_groups, 1);
+            assert_eq!(snapshot.wal_commit_buffers, 2);
+        }
+        wal.close()?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn v7_admitted_window_joins_frames_ready_after_group_selection() -> anyhow::Result<()> {
+        use crate::wal::v7::{
+            install::recover_and_install_active, recovery::WalV7RecoveryAuthority,
+        };
+
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("admitted-window-ready-later.wal");
+        let Some(V7RuntimeTestWal { wal, anchor, .. }) =
+            live_v7_test_wal(&path, super::MAX_WAL_FILE_SIZE, v7_test_resource_limits())?
+        else {
+            return Ok(());
+        };
+        #[cfg(feature = "bench")]
+        let profile = {
+            let profile = Arc::new(crate::mem_table::WriteProfile::default());
+            profile.set_wal_sync_diagnostics_enabled(true);
+            wal.set_write_profile(Arc::clone(&profile));
+            profile
+        };
+        let runtime = wal.parallel_runtime.as_ref().unwrap();
+        // Allow the test to observe the selected window before releasing the
+        // successors; production uses the much shorter fixed join limit.
+        runtime
+            .inner
+            .v7_frame_join_micros
+            .store(10_000_000, std::sync::atomic::Ordering::Relaxed);
+        let packer = runtime.inner.packer_state.lock();
+        let batches = [
+            v7_test_batch(1, 60 * 1024),
+            v7_test_batch(2, 60 * 1024),
+            v7_test_batch(3, 60 * 1024),
+        ];
+        let (_, _, first_job) = wal.admit_v7_batch_with_index(&batches[0], LIVE_WAL_V5_LIMITS)?;
+        let (_, _, second_job) = wal.admit_v7_batch_with_index(&batches[1], LIVE_WAL_V5_LIMITS)?;
+        let (last, _, third_job) =
+            wal.admit_v7_batch_with_index(&batches[2], LIVE_WAL_V5_LIMITS)?;
+        first_job.expect("head has producer work").finish()?;
+        let mut successors = [second_job, third_job];
+        drop(packer);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while runtime
+            .inner
+            .v7_group_wait_cutoff
+            .load(std::sync::atomic::Ordering::Acquire)
+            != last + 1
+        {
+            if std::time::Instant::now() >= deadline {
+                // Dropping the jobs poisons their tickets and releases the
+                // packer even if this assertion fails.
+                drop(successors);
+                anyhow::bail!("packer did not select the admitted window");
+            }
+            std::thread::yield_now();
+        }
+        // Complete out of order after selection. The packer must join the
+        // already-admitted successors once their contiguous prefix is ready.
+        successors[1]
+            .take()
+            .expect("third producer work")
+            .finish()?;
+        successors[0]
+            .take()
+            .expect("second producer work")
+            .finish()?;
+        wal.submit_and_commit(last)?;
+        #[cfg(feature = "bench")]
+        {
+            let snapshot = profile.snapshot();
+            assert_eq!(snapshot.wal_commit_groups, 1);
+            assert_eq!(snapshot.wal_commit_buffers, 3);
+        }
+        wal.close()?;
+        drop(wal);
+        let recovered = recover_and_install_active(
+            &path,
+            WalV7RecoveryAuthority::Active {
+                predecessor: crate::pitr::ChainAnchor::Genesis {
+                    archive_epoch_id: crate::pitr::ArchiveEpochId(anchor.archive_epoch_id),
+                },
+                durable_anchors: vec![anchor],
+            },
+        )?;
+        assert_eq!(recovered.installed.batches, batches);
+        Ok(())
+    }
+
+    #[test]
+    fn v7_group_window_extends_for_later_admissions() -> anyhow::Result<()> {
+        use crate::wal::v7::{
+            install::recover_and_install_active, recovery::WalV7RecoveryAuthority,
+        };
+
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("dynamic-admitted-window.wal");
+        let Some(V7RuntimeTestWal { wal, anchor, .. }) =
+            live_v7_test_wal(&path, super::MAX_WAL_FILE_SIZE, v7_test_resource_limits())?
+        else {
+            return Ok(());
+        };
+        #[cfg(feature = "bench")]
+        let profile = {
+            let profile = Arc::new(crate::mem_table::WriteProfile::default());
+            profile.set_wal_sync_diagnostics_enabled(true);
+            wal.set_write_profile(Arc::clone(&profile));
+            profile
+        };
+        let runtime = wal.parallel_runtime.as_ref().unwrap();
+        runtime
+            .inner
+            .v7_frame_join_micros
+            .store(10_000_000, std::sync::atomic::Ordering::Relaxed);
+        let packer = runtime.inner.packer_state.lock();
+        let batches = [
+            v7_test_batch(1, 60 * 1024),
+            v7_test_batch(2, 60 * 1024),
+            v7_test_batch(3, 60 * 1024),
+        ];
+        let (_, _, first_job) = wal.admit_v7_batch_with_index(&batches[0], LIVE_WAL_V5_LIMITS)?;
+        let (second, _, second_job) =
+            wal.admit_v7_batch_with_index(&batches[1], LIVE_WAL_V5_LIMITS)?;
+        first_job.expect("head has producer work").finish()?;
+        drop(packer);
+
+        let wait_for_cutoff = |expected| -> anyhow::Result<()> {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while runtime
+                .inner
+                .v7_group_wait_cutoff
+                .load(std::sync::atomic::Ordering::Acquire)
+                != expected
+            {
+                if std::time::Instant::now() >= deadline {
+                    anyhow::bail!("packer did not observe admitted cutoff {expected}");
+                }
+                std::thread::yield_now();
+            }
+            Ok(())
+        };
+        wait_for_cutoff(second + 1)?;
+        // The third admission occurs after the group has begun waiting.
+        let (third, _, third_job) =
+            wal.admit_v7_batch_with_index(&batches[2], LIVE_WAL_V5_LIMITS)?;
+        wait_for_cutoff(third + 1)?;
+        third_job.expect("third producer work").finish()?;
+        second_job.expect("second producer work").finish()?;
+        wal.submit_and_commit(third)?;
+        #[cfg(feature = "bench")]
+        {
+            let snapshot = profile.snapshot();
+            assert_eq!(snapshot.wal_commit_groups, 1);
+            assert_eq!(snapshot.wal_commit_buffers, 3);
+        }
+        wal.close()?;
+        drop(wal);
+        let recovered = recover_and_install_active(
+            &path,
+            WalV7RecoveryAuthority::Active {
+                predecessor: crate::pitr::ChainAnchor::Genesis {
+                    archive_epoch_id: crate::pitr::ArchiveEpochId(anchor.archive_epoch_id),
+                },
+                durable_anchors: vec![anchor],
+            },
+        )?;
+        assert_eq!(recovered.installed.batches, batches);
+        Ok(())
+    }
+
+    #[test]
+    fn v7_solo_group_joins_a_producer_already_preparing() -> anyhow::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("solo-group-preparing-producer.wal");
+        let Some(V7RuntimeTestWal { wal, .. }) =
+            live_v7_test_wal(&path, super::MAX_WAL_FILE_SIZE, v7_test_resource_limits())?
+        else {
+            return Ok(());
+        };
+        #[cfg(feature = "bench")]
+        let profile = {
+            let profile = Arc::new(crate::mem_table::WriteProfile::default());
+            profile.set_wal_sync_diagnostics_enabled(true);
+            wal.set_write_profile(Arc::clone(&profile));
+            profile
+        };
+        let runtime = wal.parallel_runtime.as_ref().unwrap();
+        runtime
+            .inner
+            .v7_frame_join_micros
+            .store(10_000_000, std::sync::atomic::Ordering::Relaxed);
+        runtime
+            .inner
+            .v7_solo_join_micros
+            .store(10_000_000, std::sync::atomic::Ordering::Relaxed);
+        let second_batch = v7_test_batch(2, 60 * 1024);
+        let second_prepared = runtime.prepare_v7_batch(&second_batch, LIVE_WAL_V5_LIMITS)?;
+        let (first, _, first_job) =
+            wal.admit_v7_batch_with_index(&v7_test_batch(1, 60 * 1024), LIVE_WAL_V5_LIMITS)?;
+        first_job.expect("head has producer work").finish()?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while runtime
+            .inner
+            .v7_group_wait_cutoff
+            .load(std::sync::atomic::Ordering::Acquire)
+            != first + 1
+        {
+            if std::time::Instant::now() >= deadline {
+                anyhow::bail!("solo group did not wait for its concurrent producer");
+            }
+            std::thread::yield_now();
+        }
+        let (second, _, second_job) = runtime.put_v7_prepared_batch(
+            second_prepared,
+            second_batch.commit_ts,
+            second_batch.recorded_at,
+        )?;
+        second_job.expect("second producer work").finish()?;
+        wal.submit_and_commit(second)?;
+        #[cfg(feature = "bench")]
+        {
+            let snapshot = profile.snapshot();
+            assert_eq!(snapshot.wal_commit_groups, 1);
+            assert_eq!(snapshot.wal_commit_buffers, 2);
+        }
+        wal.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn v7_lone_producer_does_not_wait_for_a_join() -> anyhow::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("lone-producer-no-join.wal");
+        let Some(V7RuntimeTestWal { wal, .. }) =
+            live_v7_test_wal(&path, super::MAX_WAL_FILE_SIZE, v7_test_resource_limits())?
+        else {
+            return Ok(());
+        };
+        let runtime = wal.parallel_runtime.as_ref().unwrap();
+        runtime
+            .inner
+            .v7_frame_join_micros
+            .store(10_000_000, std::sync::atomic::Ordering::Relaxed);
+        runtime
+            .inner
+            .v7_solo_join_micros
+            .store(10_000_000, std::sync::atomic::Ordering::Relaxed);
+        // Dropping an unadmitted preparation must not leave a false contender.
+        let abandoned =
+            runtime.prepare_v7_batch(&v7_test_batch(2, 60 * 1024), LIVE_WAL_V5_LIMITS)?;
+        drop(abandoned);
+        let started = std::time::Instant::now();
+        let (ticket, _, job) =
+            wal.admit_v7_batch_with_index(&v7_test_batch(1, 60 * 1024), LIVE_WAL_V5_LIMITS)?;
+        job.expect("head has producer work").finish()?;
+        wal.submit_and_commit(ticket)?;
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "a lone producer waited for the configured ten-second join"
+        );
+        wal.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn v7_full_admitted_window_does_not_block_a_ready_prefix() -> anyhow::Result<()> {
+        use crate::wal::v7::{
+            install::recover_and_install_active, recovery::WalV7RecoveryAuthority,
+        };
+        use anyhow::Context;
+
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("full-admitted-window.wal");
+        let Some(V7RuntimeTestWal { wal, anchor, .. }) =
+            live_v7_test_wal(&path, super::MAX_WAL_FILE_SIZE, v7_test_resource_limits())?
+        else {
+            return Ok(());
+        };
+        let runtime = wal.parallel_runtime.as_ref().unwrap();
+        runtime
+            .inner
+            .v7_frame_join_micros
+            .store(10_000_000, std::sync::atomic::Ordering::Relaxed);
+        let packer = runtime.inner.packer_state.lock();
+        let batches: Vec<_> = (1..=super::PACKER_GROUP_MAX_TICKETS)
+            .map(|commit_ts| v7_test_batch(commit_ts as u64, 60 * 1024))
+            .collect();
+        let mut tickets = Vec::new();
+        let mut jobs = Vec::new();
+        for batch in &batches {
+            let (ticket, _, job) = wal.admit_v7_batch_with_index(batch, LIVE_WAL_V5_LIMITS)?;
+            tickets.push(ticket);
+            jobs.push(job);
+        }
+        jobs[0].take().expect("head has producer work").finish()?;
+        drop(packer);
+
+        std::thread::scope(|scope| -> anyhow::Result<()> {
+            let (sender, receiver) = std::sync::mpsc::channel();
+            let first = tickets[0];
+            let wal_for_wait = &wal;
+            let waiter = scope.spawn(move || {
+                let _ = sender.send(
+                    wal_for_wait
+                        .submit_and_commit(first)
+                        .map_err(|error| format!("{error:#}")),
+                );
+            });
+            let result = receiver.recv_timeout(std::time::Duration::from_secs(5));
+            if result.is_err() {
+                // Releasing unfinished jobs poisons their tickets so a failed
+                // assertion cannot strand the scoped waiter.
+                jobs.clear();
+            }
+            result
+                .context("full window blocked its ready prefix")?
+                .map_err(anyhow::Error::msg)?;
+            waiter.join().expect("first ticket waiter panicked");
+            Ok(())
+        })?;
+        for job in jobs.into_iter().flatten() {
+            job.finish()?;
+        }
+        wal.submit_and_commit(*tickets.last().unwrap())?;
+        wal.close()?;
+        drop(wal);
+        let recovered = recover_and_install_active(
+            &path,
+            WalV7RecoveryAuthority::Active {
+                predecessor: crate::pitr::ChainAnchor::Genesis {
+                    archive_epoch_id: crate::pitr::ArchiveEpochId(anchor.archive_epoch_id),
+                },
+                durable_anchors: vec![anchor],
+            },
+        )?;
+        assert_eq!(recovered.installed.batches, batches);
+        Ok(())
+    }
+
+    #[test]
+    fn v7_close_wakes_an_open_solo_group() -> anyhow::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("close-open-solo-group.wal");
+        let Some(V7RuntimeTestWal { wal, .. }) =
+            live_v7_test_wal(&path, super::MAX_WAL_FILE_SIZE, v7_test_resource_limits())?
+        else {
+            return Ok(());
+        };
+        let runtime = wal.parallel_runtime.as_ref().unwrap();
+        runtime
+            .inner
+            .v7_frame_join_micros
+            .store(10_000_000, std::sync::atomic::Ordering::Relaxed);
+        runtime
+            .inner
+            .v7_solo_join_micros
+            .store(10_000_000, std::sync::atomic::Ordering::Relaxed);
+        let prepared =
+            runtime.prepare_v7_batch(&v7_test_batch(2, 60 * 1024), LIVE_WAL_V5_LIMITS)?;
+        let (first, _, first_job) =
+            wal.admit_v7_batch_with_index(&v7_test_batch(1, 60 * 1024), LIVE_WAL_V5_LIMITS)?;
+        first_job.expect("head has producer work").finish()?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while runtime
+            .inner
+            .v7_group_wait_cutoff
+            .load(std::sync::atomic::Ordering::Acquire)
+            != first + 1
+        {
+            if std::time::Instant::now() >= deadline {
+                anyhow::bail!("solo group did not begin waiting");
+            }
+            std::thread::yield_now();
+        }
+        let started = std::time::Instant::now();
+        wal.close()?;
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "close did not wake the open group"
+        );
+        drop(prepared);
+        Ok(())
+    }
+
+    #[test]
+    fn v7_group_wait_wakes_when_a_later_producer_is_poisoned() -> anyhow::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("dynamic-window-poison.wal");
+        let Some(V7RuntimeTestWal { wal, .. }) =
+            live_v7_test_wal(&path, super::MAX_WAL_FILE_SIZE, v7_test_resource_limits())?
+        else {
+            return Ok(());
+        };
+        let runtime = wal.parallel_runtime.as_ref().unwrap();
+        runtime
+            .inner
+            .v7_frame_join_micros
+            .store(10_000_000, std::sync::atomic::Ordering::Relaxed);
+        let packer = runtime.inner.packer_state.lock();
+        let (first, _, first_job) =
+            wal.admit_v7_batch_with_index(&v7_test_batch(1, 60 * 1024), LIVE_WAL_V5_LIMITS)?;
+        let (second, _, second_job) =
+            wal.admit_v7_batch_with_index(&v7_test_batch(2, 60 * 1024), LIVE_WAL_V5_LIMITS)?;
+        first_job.expect("head has producer work").finish()?;
+        drop(packer);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while runtime
+            .inner
+            .v7_group_wait_cutoff
+            .load(std::sync::atomic::Ordering::Acquire)
+            != second + 1
+        {
+            if std::time::Instant::now() >= deadline {
+                anyhow::bail!("packer did not wait for the second producer");
+            }
+            std::thread::yield_now();
+        }
+        drop(second_job);
+        wal.submit_and_commit(first)?;
+        assert!(wal.submit_and_commit(second).is_err());
+        assert!(wal.close().is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn v7_admission_group_does_not_block_ready_prefix_on_slow_producer() -> anyhow::Result<()> {
+        use crate::wal::v7::{
+            install::recover_and_install_active, recovery::WalV7RecoveryAuthority,
+        };
+        use anyhow::Context;
+
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("slow-producer-prefix.wal");
+        let Some(V7RuntimeTestWal { wal, anchor, .. }) =
+            live_v7_test_wal(&path, super::MAX_WAL_FILE_SIZE, v7_test_resource_limits())?
+        else {
+            return Ok(());
+        };
+        let runtime = wal.parallel_runtime.as_ref().unwrap();
+        let packer = runtime.inner.packer_state.lock();
+        let batches = [v7_test_batch(1, 60 * 1024), v7_test_batch(2, 60 * 1024)];
+        let (first, _, first_job) =
+            wal.admit_v7_batch_with_index(&batches[0], LIVE_WAL_V5_LIMITS)?;
+        let (second, _, second_job) =
+            wal.admit_v7_batch_with_index(&batches[1], LIVE_WAL_V5_LIMITS)?;
+        first_job.expect("first producer job").finish()?;
+        let mut second_job = Some(second_job.expect("second producer job"));
+        drop(packer);
+        std::thread::scope(|scope| -> anyhow::Result<()> {
+            let (sender, receiver) = std::sync::mpsc::channel();
+            let wal_for_wait = &wal;
+            let waiter = scope.spawn(move || {
+                let _ = sender.send(
+                    wal_for_wait
+                        .submit_and_commit(first)
+                        .map_err(|error| format!("{error:#}")),
+                );
+            });
+            let result = receiver.recv_timeout(std::time::Duration::from_secs(5));
+            if result.is_err() {
+                // A dropped job poisons the outstanding ticket and releases
+                // waiters, so a failed assertion cannot deadlock the scope.
+                drop(second_job.take());
+            }
+            result
+                .context("ready first ticket blocked on the later producer")?
+                .map_err(anyhow::Error::msg)?;
+            waiter.join().expect("first ticket waiter panicked");
+            second_job.take().expect("second producer job").finish()?;
+            wal.submit_and_commit(second)?;
+            Ok(())
+        })?;
+        wal.close()?;
+        drop(wal);
+        let recovered = recover_and_install_active(
+            &path,
+            WalV7RecoveryAuthority::Active {
+                predecessor: crate::pitr::ChainAnchor::Genesis {
+                    archive_epoch_id: crate::pitr::ArchiveEpochId(anchor.archive_epoch_id),
+                },
+                durable_anchors: vec![anchor],
+            },
+        )?;
+        assert_eq!(recovered.installed.batches, batches);
+
+        Ok(())
+    }
+
+    #[test]
+    fn v7_admission_wait_preserves_healthy_prefix_after_later_poison() -> anyhow::Result<()> {
+        use crate::wal::v7::{
+            install::recover_and_install_active, recovery::WalV7RecoveryAuthority,
+        };
+
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("poisoned-later-producer.wal");
+        let Some(V7RuntimeTestWal { wal, anchor, .. }) =
+            live_v7_test_wal(&path, super::MAX_WAL_FILE_SIZE, v7_test_resource_limits())?
+        else {
+            return Ok(());
+        };
+        let runtime = wal.parallel_runtime.as_ref().unwrap();
+        let packer = runtime.inner.packer_state.lock();
+        let (first, _, first_job) =
+            wal.admit_v7_batch_with_index(&v7_test_batch(1, 60 * 1024), LIVE_WAL_V5_LIMITS)?;
+        let (second, _, second_job) =
+            wal.admit_v7_batch_with_index(&v7_test_batch(2, 60 * 1024), LIVE_WAL_V5_LIMITS)?;
+        drop(second_job);
+        {
+            let admission = runtime.inner.admission.lock();
+            assert_eq!(admission.v7_admitted.len(), 1);
+            assert_eq!(admission.v7_admitted[0].ticket, first);
+        }
+        drop(packer);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while runtime.inner.durability.state.lock().poison_ticket != Some(second) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "later failure was not observed"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        first_job.expect("first producer job").finish()?;
+        wal.submit_and_commit(first)?;
+        assert!(wal.submit_and_commit(second).is_err());
+        assert!(wal.close().is_err());
+        drop(wal);
+        let recovered = recover_and_install_active(
+            &path,
+            WalV7RecoveryAuthority::Active {
+                predecessor: crate::pitr::ChainAnchor::Genesis {
+                    archive_epoch_id: crate::pitr::ArchiveEpochId(anchor.archive_epoch_id),
+                },
+                durable_anchors: vec![anchor],
+            },
+        )?;
+        assert_eq!(
+            recovered.installed.batches,
+            vec![v7_test_batch(1, 60 * 1024)]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn v7_poisoned_close_abandons_unfinished_earlier_producer() -> anyhow::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory
+            .path()
+            .join("poisoned-close-unfinished-producer.wal");
+        let Some(V7RuntimeTestWal { wal, owner, .. }) =
+            live_v7_test_wal(&path, super::MAX_WAL_FILE_SIZE, v7_test_resource_limits())?
+        else {
+            return Ok(());
+        };
+        let (_, _, first_job) =
+            wal.admit_v7_batch_with_index(&v7_test_batch(1, 60 * 1024), LIVE_WAL_V5_LIMITS)?;
+        let (_, _, second_job) =
+            wal.admit_v7_batch_with_index(&v7_test_batch(2, 60 * 1024), LIVE_WAL_V5_LIMITS)?;
+        drop(second_job);
+        assert!(wal.close().is_err());
+        assert!(owner.snapshot().buffer_memory_bytes > 0);
+        drop(wal);
+        owner.retire_after_durable_cleanup()?;
+        assert!(owner.snapshot().buffer_memory_bytes > 0);
+        drop(first_job);
+        assert_eq!(owner.snapshot().buffer_memory_bytes, 0);
+
+        Ok(())
+    }
+
+    #[test]
+    fn v7_dropped_producer_job_poison_keeps_surviving_input_charged_after_close()
+    -> anyhow::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("dropped-producer.wal");
+        let Some(V7RuntimeTestWal { wal, owner, .. }) =
+            live_v7_test_wal(&path, super::MAX_WAL_FILE_SIZE, v7_test_resource_limits())?
+        else {
+            return Ok(());
+        };
+        let (_, _, first) =
+            wal.admit_v7_batch_with_index(&v7_test_batch(1, 60 * 1024), LIVE_WAL_V5_LIMITS)?;
+        let (later, _, survivor) =
+            wal.admit_v7_batch_with_index(&v7_test_batch(2, 60 * 1024), LIVE_WAL_V5_LIMITS)?;
+        drop(first);
+        assert!(wal.submit_and_commit(later).is_err());
+        assert!(wal.close().is_err());
+        assert!(owner.snapshot().buffer_memory_bytes > 0);
+        drop(wal);
+        owner.retire_after_durable_cleanup()?;
+        assert!(
+            owner.snapshot().buffer_memory_bytes > 0,
+            "surviving job pins logical bytes and DATA allocation"
+        );
+        drop(survivor);
+        assert_eq!(owner.snapshot().buffer_memory_bytes, 0);
+
+        Ok(())
+    }
+
+    #[cfg(feature = "chaos-testing")]
+    #[test]
+    fn failpoint_v7_producer_frame_error_and_panic_preserve_the_acknowledged_prefix()
+    -> anyhow::Result<()> {
+        use crate::wal::v7::{
+            install::recover_and_install_active, recovery::WalV7RecoveryAuthority,
+        };
+
+        for action in ["return", "panic"] {
+            let scenario = crate::chaos::failpoint::FailScenario::setup();
+            let directory = tempfile::tempdir()?;
+            let path = directory.path().join("producer-failure.wal");
+            let Some(V7RuntimeTestWal { wal, owner, anchor }) =
+                live_v7_test_wal(&path, super::MAX_WAL_FILE_SIZE, v7_test_resource_limits())?
+            else {
+                return Ok(());
+            };
+            let first = v7_test_batch(1, 8);
+            let acknowledged = wal.put_v7_batch_with_index(&first, LIVE_WAL_V5_LIMITS)?.0;
+            wal.submit_and_commit(acknowledged)?;
+            let (ticket, _, job) =
+                wal.admit_v7_batch_with_index(&v7_test_batch(2, 60 * 1024), LIVE_WAL_V5_LIMITS)?;
+            crate::chaos::failpoint::cfg("parallel_wal.v7_producer_frame_failure", action)
+                .map_err(anyhow::Error::msg)?;
+            let result =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| job.unwrap().finish()));
+            assert!(result.is_err() || result.unwrap().is_err());
+            assert!(wal.v7_requires_recovery());
+            assert!(wal.submit_and_commit(ticket).is_err());
+            wal.submit_and_commit(acknowledged)?;
+            assert!(wal.close().is_err());
+            assert_eq!(owner.snapshot().buffer_memory_bytes, 0);
+            drop(wal);
+            scenario.teardown();
+            let recovered = recover_and_install_active(
+                &path,
+                WalV7RecoveryAuthority::Active {
+                    predecessor: crate::pitr::ChainAnchor::Genesis {
+                        archive_epoch_id: crate::pitr::ArchiveEpochId(anchor.archive_epoch_id),
+                    },
+                    durable_anchors: vec![anchor],
+                },
+            )?;
+            assert_eq!(recovered.installed.batches, vec![first]);
+        }
+
+        Ok(())
+    }
+
+    #[cfg(feature = "chaos-testing")]
+    fn wait_for_v7_written(runtime: &super::ParallelWalRuntime, ticket_end: u64) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while runtime.inner.durability.state.lock().written_frontier < ticket_end {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "DATA did not finish while hashing was paused"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
+    #[cfg(feature = "chaos-testing")]
+    #[test]
+    fn failpoint_v7_post_submit_hash_keeps_data_unacknowledged_and_close_drains()
+    -> anyhow::Result<()> {
+        use crate::wal::v7::{
+            install::recover_and_install_active, recovery::WalV7RecoveryAuthority,
+        };
+
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("post-submit-hash-close.wal");
+        let Some(V7RuntimeTestWal { wal, owner, anchor }) =
+            live_v7_test_wal(&path, super::MAX_WAL_FILE_SIZE, v7_test_resource_limits())?
+        else {
+            return Ok(());
+        };
+        let runtime = wal.parallel_runtime.as_ref().unwrap();
+        let mut expected_hash = runtime
+            .inner
+            .packer_state
+            .lock()
+            .v7_prefix
+            .as_ref()
+            .unwrap()
+            .logical_hasher
+            .clone();
+        let gate = crate::chaos::failpoint::arm_parallel_wal_post_submit_hash_gate();
+        let batches = [
+            v7_test_batch(1, 60 * 1024),
+            v7_test_batch(2, 60 * 1024),
+            v7_test_batch(3, 17),
+        ];
+        let first = wal
+            .put_v7_batch_with_index(&batches[0], LIVE_WAL_V5_LIMITS)?
+            .0;
+        assert!(gate.wait_until_entered(std::time::Duration::from_secs(5)));
+        wait_for_v7_written(runtime, first + 1);
+        assert_eq!(runtime.inner.durability.state.lock().durable_frontier, 0);
+        {
+            let admission = runtime.inner.admission.lock();
+            assert_eq!(admission.v7_hash_pending, Some(first + 1));
+            assert!(admission.v7_prefixes.is_empty());
+        }
+        assert_eq!(runtime.inner.buffer_budget.state.lock().active_bytes, 0);
+        assert!(
+            owner.snapshot().buffer_memory_bytes > 0,
+            "logical input remains charged after DATA CQE"
+        );
+        assert_eq!(count_valid_v7_frontiers(&path)?, 1);
+        for batch in &batches[1..] {
+            wal.put_v7_batch_with_index(batch, LIVE_WAL_V5_LIMITS)?;
+        }
+        for (ticket, batch) in batches.iter().enumerate() {
+            let logical = super::prepare_logical_batch(batch, LIVE_WAL_V5_LIMITS)?
+                .encode_entry_stream()?
+                .into_logical_batch(ticket as u64, batch.commit_ts, batch.recorded_at)?;
+            expected_hash.update(logical.as_bytes());
+        }
+        std::thread::scope(|scope| -> anyhow::Result<()> {
+            // Moving the guard inside the scope releases the packer before
+            // scoped-thread joining, including if an assertion unwinds.
+            let gate = gate;
+            let closing = scope.spawn(|| wal.close());
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while runtime.admission_is_open() {
+                assert!(std::time::Instant::now() < deadline);
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            assert!(!closing.is_finished());
+            assert!(owner.snapshot().buffer_memory_bytes > 0);
+            assert_eq!(runtime.inner.durability.state.lock().durable_frontier, 0);
+            gate.release();
+            closing.join().expect("close thread panicked")?;
+            Ok(())
+        })?;
+        assert_eq!(owner.snapshot().buffer_memory_bytes, 0);
+        assert_eq!(
+            wal.v7_frontier_cursor()?.frontier.prefix_digest,
+            <[u8; 32]>::from(expected_hash.finalize())
+        );
+        drop(wal);
+        let recovered = recover_and_install_active(
+            &path,
+            WalV7RecoveryAuthority::Active {
+                predecessor: crate::pitr::ChainAnchor::Genesis {
+                    archive_epoch_id: crate::pitr::ArchiveEpochId(anchor.archive_epoch_id),
+                },
+                durable_anchors: vec![anchor],
+            },
+        )?;
+        assert_eq!(recovered.installed.batches, batches);
+
+        Ok(())
+    }
+
+    #[cfg(feature = "chaos-testing")]
+    #[test]
+    fn failpoint_v7_post_submit_hash_error_or_panic_wakes_waiters() -> anyhow::Result<()> {
+        use crate::wal::v7::{
+            install::recover_and_install_active, recovery::WalV7RecoveryAuthority,
+        };
+
+        for action in ["return", "panic"] {
+            let scenario = crate::chaos::failpoint::FailScenario::setup();
+            let directory = tempfile::tempdir()?;
+            let path = directory.path().join("post-submit-hash-failure.wal");
+            let Some(V7RuntimeTestWal { wal, owner, anchor }) =
+                live_v7_test_wal(&path, super::MAX_WAL_FILE_SIZE, v7_test_resource_limits())?
+            else {
+                return Ok(());
+            };
+            let first = v7_test_batch(1, 16);
+            let acknowledged = wal.put_v7_batch_with_index(&first, LIVE_WAL_V5_LIMITS)?.0;
+            wal.submit_and_commit(acknowledged)?;
+            let gate = crate::chaos::failpoint::arm_parallel_wal_post_submit_hash_gate();
+            let failed = wal
+                .put_v7_batch_with_index(&v7_test_batch(2, 60 * 1024), LIVE_WAL_V5_LIMITS)?
+                .0;
+            assert!(gate.wait_until_entered(std::time::Duration::from_secs(5)));
+            let runtime = wal.parallel_runtime.as_ref().unwrap();
+            wait_for_v7_written(runtime, failed + 1);
+            assert_eq!(
+                runtime.inner.durability.state.lock().durable_frontier,
+                acknowledged + 1
+            );
+            crate::chaos::failpoint::cfg("parallel_wal.v7_post_submit_hash_failure", action)
+                .map_err(anyhow::Error::msg)?;
+            gate.release();
+            assert!(wal.submit_and_commit(failed).is_err());
+            wal.submit_and_commit(acknowledged)?;
+            assert!(wal.close().is_err());
+            assert_eq!(owner.snapshot().buffer_memory_bytes, 0);
+            assert_eq!(count_valid_v7_frontiers(&path)?, 2);
+            drop(wal);
+            scenario.teardown();
+            let recovered = recover_and_install_active(
+                &path,
+                WalV7RecoveryAuthority::Active {
+                    predecessor: crate::pitr::ChainAnchor::Genesis {
+                        archive_epoch_id: crate::pitr::ArchiveEpochId(anchor.archive_epoch_id),
+                    },
+                    durable_anchors: vec![anchor],
+                },
+            )?;
+            assert_eq!(recovered.installed.batches, vec![first]);
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn v7_admission_defers_framing_and_hashing_until_ordered_packing() -> anyhow::Result<()> {
+        use crate::wal::v7::{
+            install::recover_and_install_active, recovery::WalV7RecoveryAuthority,
+        };
+
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("deferred-v7-data.wal");
+        let Some(V7RuntimeTestWal { wal, owner, anchor }) =
+            live_v7_test_wal(&path, super::MAX_WAL_FILE_SIZE, v7_test_resource_limits())?
+        else {
+            return Ok(());
+        };
+        let runtime = wal.parallel_runtime.as_ref().unwrap();
+        let packer = runtime.inner.packer_state.lock();
+        let mut expected_hash = packer.v7_prefix.as_ref().unwrap().logical_hasher.clone();
+        let original_hash: [u8; 32] = expected_hash.clone().finalize().into();
+        let first = v7_test_batch(1, 16);
+        let second = v7_test_batch(2, 5000);
+        let first_ticket = wal.put_v7_batch_with_index(&first, LIVE_WAL_V5_LIMITS)?.0;
+        let second_ticket = wal.put_v7_batch_with_index(&second, LIVE_WAL_V5_LIMITS)?.0;
+        {
+            let admission = runtime.inner.admission.lock();
+            assert_eq!(admission.queue.len(), 2);
+            assert!(admission.v7_prefixes.is_empty());
+            let observed_hash: [u8; 32] = admission
+                .v7_metadata
+                .as_ref()
+                .unwrap()
+                .logical_hasher
+                .clone()
+                .finalize()
+                .into();
+            assert_eq!(
+                observed_hash, original_hash,
+                "admission must not hash logical bytes"
+            );
+            for batch in &admission.queue {
+                assert_eq!(
+                    super::WorkerBuffer::len(&batch.buffer),
+                    0,
+                    "admission must not encode DATA frames"
+                );
+                expected_hash.update(batch.v7_input.as_ref().unwrap().logical_batch.as_bytes());
+            }
+        }
+        assert!(owner.snapshot().buffer_memory_bytes > 0);
+        drop(packer);
+        wal.submit_and_commit(second_ticket)?;
+        wal.submit_and_commit(first_ticket)?;
+        wal.close()?;
+        assert_eq!(owner.snapshot().buffer_memory_bytes, 0);
+        assert_eq!(
+            wal.v7_frontier_cursor()?.frontier.prefix_digest,
+            <[u8; 32]>::from(expected_hash.finalize())
+        );
+        drop(wal);
+        let recovered = recover_and_install_active(
+            &path,
+            WalV7RecoveryAuthority::Active {
+                predecessor: crate::pitr::ChainAnchor::Genesis {
+                    archive_epoch_id: crate::pitr::ArchiveEpochId(anchor.archive_epoch_id),
+                },
+                durable_anchors: vec![anchor],
+            },
+        )?;
+        assert_eq!(recovered.installed.batches, vec![first, second]);
+        Ok(())
+    }
+
+    #[test]
+    fn v7_deferred_framing_failure_preserves_the_acknowledged_prefix() -> anyhow::Result<()> {
+        use crate::wal::v7::{
+            install::recover_and_install_active, recovery::WalV7RecoveryAuthority,
+        };
+
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("failed-deferred-v7-data.wal");
+        let Some(V7RuntimeTestWal { wal, owner, anchor }) =
+            live_v7_test_wal(&path, super::MAX_WAL_FILE_SIZE, v7_test_resource_limits())?
+        else {
+            return Ok(());
+        };
+        let first = v7_test_batch(1, 16);
+        let acknowledged = wal.put_v7_batch_with_index(&first, LIVE_WAL_V5_LIMITS)?.0;
+        wal.submit_and_commit(acknowledged)?;
+        let runtime = wal.parallel_runtime.as_ref().unwrap();
+        let packer = runtime.inner.packer_state.lock();
+        let earlier = wal
+            .put_v7_batch_with_index(&v7_test_batch(2, 16), LIVE_WAL_V5_LIMITS)?
+            .0;
+        let later = wal
+            .put_v7_batch_with_index(&v7_test_batch(3, 5000), LIVE_WAL_V5_LIMITS)?
+            .0;
+        {
+            let mut admission = runtime.inner.admission.lock();
+            let input = admission
+                .queue
+                .back_mut()
+                .unwrap()
+                .v7_input
+                .as_mut()
+                .unwrap();
+            // Owned logical bytes have no mutable access. Inject a mismatched
+            // ticket instead to exercise the post-admission framing failure.
+            input.logical_batch =
+                super::prepare_logical_batch(&v7_test_batch(3, 5000), LIVE_WAL_V5_LIMITS)?
+                    .encode_entry_stream()?
+                    .into_logical_batch(later + 1, 3, RecordedAt { secs: 50, nanos: 0 })?;
+        }
+        drop(packer);
+        let error = wal
+            .submit_and_commit(later)
+            .expect_err("mismatched input must poison its group");
+        assert!(format!("{error:#}").to_ascii_lowercase().contains("ticket"));
+        assert!(runtime.wait_durable(earlier).is_err());
+        wal.submit_and_commit(acknowledged)?;
+        assert!(
+            wal.put_v7_batch_with_index(&v7_test_batch(4, 16), LIVE_WAL_V5_LIMITS)
+                .is_err()
+        );
+        assert!(wal.close().is_err());
+        assert_eq!(owner.snapshot().buffer_memory_bytes, 0);
+        #[cfg(feature = "chaos-testing")]
+        assert_eq!(count_valid_v7_frontiers(&path)?, 2);
+        drop(wal);
+        let recovered = recover_and_install_active(
+            &path,
+            WalV7RecoveryAuthority::Active {
+                predecessor: crate::pitr::ChainAnchor::Genesis {
+                    archive_epoch_id: crate::pitr::ArchiveEpochId(anchor.archive_epoch_id),
+                },
+                durable_anchors: vec![anchor],
+            },
+        )?;
+        assert_eq!(recovered.installed.batches, vec![first]);
+        Ok(())
+    }
+
+    fn v7_large_extent_test_batch(commit_ts: u64) -> WalBatch {
+        let mut batch = v7_test_batch(commit_ts, 0);
+        batch.entries = (0..40)
+            .map(|index| WalEntry::Put {
+                key: format!("large-{index:02}").into_bytes(),
+                value: vec![index as u8; 32 * 1024],
+            })
+            .collect();
+
+        batch
+    }
+
+    #[test]
+    fn v7_extent_initialization_preserves_data_and_frontiers_across_growth() -> anyhow::Result<()> {
+        use crate::wal::v7::{
+            install::recover_and_install_active, recovery::WalV7RecoveryAuthority,
+        };
+
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("initialized-v7-extents.wal");
+        let cap = 3 * super::PREALLOC_BLOCK + 1;
+        let Some(V7RuntimeTestWal { wal, owner, anchor }) =
+            live_v7_test_wal(&path, cap, v7_test_resource_limits())?
+        else {
+            return Ok(());
+        };
+        let runtime = wal.parallel_runtime.as_ref().unwrap();
+        let start = runtime.logical_length();
+        // Exercise initialization on any test filesystem, including tmpfs.
+        *runtime.inner.preallocation_lock.lock() = Some(start);
+        runtime.inner.preallocator.set_len(super::PREALLOC_BLOCK)?;
+        let mut garbage = super::DirectBuf::new(super::WAL_V7_FRAME_LEN);
+        garbage.as_mut_slice().fill(0xA5);
+        runtime
+            .inner
+            .preallocator
+            .write_all_at(garbage.as_mut_slice(), start)?;
+        super::preallocate_runtime(&runtime.inner, super::PREALLOC_BLOCK, true)?;
+        assert_eq!(
+            runtime
+                .inner
+                .prepared_file_end
+                .load(super::Ordering::Acquire),
+            super::PREALLOC_BLOCK
+        );
+        let initialized = std::fs::read(&path)?;
+        assert!(
+            initialized[start as usize..start as usize + super::WAL_V7_FRAME_LEN]
+                .iter()
+                .all(|byte| *byte == 0),
+            "a preallocated physical tail must still be initialized"
+        );
+
+        let first = v7_test_batch(1, 10);
+        let first_ticket = wal.put_v7_batch_with_index(&first, LIVE_WAL_V5_LIMITS)?.0;
+        wal.submit_and_commit(first_ticket)?;
+        let prefix_end = runtime.logical_length() as usize;
+        let prefix = std::fs::read(&path)?[..prefix_end].to_vec();
+        let large = v7_large_extent_test_batch(2);
+        let large_ticket = wal.put_v7_batch_with_index(&large, LIVE_WAL_V5_LIMITS)?.0;
+        wal.submit_and_commit(large_ticket)?;
+        assert!(runtime.logical_length() > super::PREALLOC_BLOCK);
+        assert_eq!(&std::fs::read(&path)?[..prefix_end], prefix.as_slice());
+        let image_after_large_data = std::fs::read(&path)?;
+        let prepared_end = runtime.inner.packer_state.lock().preallocated_end;
+        super::preallocate_runtime(&runtime.inner, prepared_end, true)?;
+        assert_eq!(std::fs::read(&path)?, image_after_large_data);
+        assert!(std::fs::metadata(&path)?.len() <= cap);
+        wal.close()?;
+        assert_eq!(owner.snapshot().buffer_memory_bytes, 0);
+        drop(wal);
+
+        let recovered = recover_and_install_active(
+            &path,
+            WalV7RecoveryAuthority::Active {
+                predecessor: crate::pitr::ChainAnchor::Genesis {
+                    archive_epoch_id: crate::pitr::ArchiveEpochId(anchor.archive_epoch_id),
+                },
+                durable_anchors: vec![anchor],
+            },
+        )?;
+        assert_eq!(recovered.installed.batches, vec![first, large]);
+
+        Ok(())
+    }
+
+    #[cfg(feature = "chaos-testing")]
+    #[test]
+    fn failpoint_v7_extent_initialization_failure_preserves_durable_prefix() -> anyhow::Result<()> {
+        use crate::{
+            chaos::failpoint::{self, FailScenario},
+            wal::v7::{install::recover_and_install_active, recovery::WalV7RecoveryAuthority},
+        };
+
+        let _scenario = FailScenario::setup();
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("failed-v7-extent-init.wal");
+        let Some(V7RuntimeTestWal { wal, owner, anchor }) =
+            live_v7_test_wal(&path, super::MAX_WAL_FILE_SIZE, v7_test_resource_limits())?
+        else {
+            return Ok(());
+        };
+        let runtime = wal.parallel_runtime.as_ref().unwrap();
+        *runtime.inner.preallocation_lock.lock() = Some(runtime.logical_length());
+        let first = v7_test_batch(1, 10);
+        let first_ticket = wal.put_v7_batch_with_index(&first, LIVE_WAL_V5_LIMITS)?.0;
+        wal.submit_and_commit(first_ticket)?;
+
+        let mut acknowledged = vec![first];
+        while runtime.logical_length() + 10 * super::WAL_V7_FRAME_LEN as u64
+            <= super::PREALLOC_BLOCK
+        {
+            let batch = v7_test_batch(acknowledged.len() as u64 + 1, 32 * 1024);
+            let ticket = wal.put_v7_batch_with_index(&batch, LIVE_WAL_V5_LIMITS)?.0;
+            wal.submit_and_commit(ticket)?;
+            acknowledged.push(batch);
+        }
+        // Establish the complete current extent before injecting the next
+        // demanded-range failure; unused background work is tested separately.
+        super::preallocate_runtime(&runtime.inner, std::fs::metadata(&path)?.len(), true)?;
+        let prepared_before_failure = runtime
+            .inner
+            .prepared_file_end
+            .load(super::Ordering::Acquire);
+        failpoint::cfg("parallel_wal.v7_extent_init_failure", "return")
+            .expect("inject v7 extent initialization failure");
+        let batch = v7_test_batch(acknowledged.len() as u64 + 1, 32 * 1024);
+        let failed_ticket = wal.put_v7_batch_with_index(&batch, LIVE_WAL_V5_LIMITS)?.0;
+        let failed = wal.submit_and_commit(failed_ticket);
+        failpoint::cfg("parallel_wal.v7_extent_init_failure", "off")
+            .expect("disable v7 extent initialization failure");
+        let error = failed.expect_err("an initialization failure must poison the DATA ticket");
+        assert!(format!("{error:#}").contains("injected v7 extent initialization failure"));
+        assert_eq!(
+            runtime
+                .inner
+                .prepared_file_end
+                .load(super::Ordering::Acquire),
+            prepared_before_failure,
+            "a partially initialized suffix must never become a cached ready prefix"
+        );
+        runtime.wait_durable(first_ticket)?;
+        assert!(
+            wal.put_v7_batch_with_index(&v7_test_batch(3, 10), LIVE_WAL_V5_LIMITS)
+                .is_err()
+        );
+        assert!(wal.close().is_err());
+        assert_eq!(owner.snapshot().buffer_memory_bytes, 0);
+        drop(wal);
+
+        let recovered = recover_and_install_active(
+            &path,
+            WalV7RecoveryAuthority::Active {
+                predecessor: crate::pitr::ChainAnchor::Genesis {
+                    archive_epoch_id: crate::pitr::ArchiveEpochId(anchor.archive_epoch_id),
+                },
+                durable_anchors: vec![anchor],
+            },
+        )?;
+        assert_eq!(recovered.installed.batches, acknowledged);
+
+        Ok(())
+    }
+
+    #[test]
+    fn v7_prepared_batches_own_bytes_and_release_cancelled_resources() -> anyhow::Result<()> {
+        use crate::wal::v7::{
+            install::recover_and_install_active, recovery::WalV7RecoveryAuthority,
+        };
+
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("owned-preparation.wal");
+        let Some(V7RuntimeTestWal { wal, owner, anchor }) =
+            live_v7_test_wal(&path, super::MAX_WAL_FILE_SIZE, v7_test_resource_limits())?
+        else {
+            return Ok(());
+        };
+        let baseline = owner.snapshot();
+        let cancelled = wal.prepare_v7_parallel_batch(&v7_test_batch(1, 10), LIVE_WAL_V5_LIMITS)?;
+        assert!(owner.snapshot().buffer_memory_bytes > baseline.buffer_memory_bytes);
+        assert!(owner.has_in_flight_source_spool_work());
+        assert_eq!(
+            wal.next_ticket.load(std::sync::atomic::Ordering::Acquire),
+            0
+        );
+        drop(cancelled);
+        assert_eq!(owner.snapshot(), baseline);
+        assert!(!owner.has_in_flight_source_spool_work());
+        let runtime = wal.parallel_runtime.as_ref().unwrap();
+        assert_eq!(runtime.inner.buffer_budget.state.lock().active_bytes, 0);
+
+        let first = v7_test_batch(1, 10);
+        let second = v7_test_batch(2, 20);
+        let first_entries = first.entries.clone();
+        let second_entries = second.entries.clone();
+        let first_prepared = wal.prepare_v7_parallel_batch(&first, LIVE_WAL_V5_LIMITS)?;
+        let second_prepared = wal.prepare_v7_parallel_batch(&second, LIVE_WAL_V5_LIMITS)?;
+        drop((first, second));
+        // Preparation order does not assign tickets, timestamps, or recorded
+        // time. Consume in reverse order with metadata chosen by the sequencer.
+        let recorded_at = RecordedAt { secs: 60, nanos: 5 };
+        let first_ticket = wal
+            .put_v7_prepared_batch_with_index(second_prepared, 7, recorded_at)?
+            .0;
+        let second_ticket = wal
+            .put_v7_prepared_batch_with_index(first_prepared, 9, RecordedAt { secs: 40, nanos: 0 })?
+            .0;
+        assert_eq!((first_ticket, second_ticket), (0, 1));
+        wal.submit_and_commit(second_ticket)?;
+        wal.close()?;
+        assert_eq!(owner.snapshot().buffer_memory_bytes, 0);
+        drop(wal);
+
+        let recovered = recover_and_install_active(
+            &path,
+            WalV7RecoveryAuthority::Active {
+                predecessor: crate::pitr::ChainAnchor::Genesis {
+                    archive_epoch_id: crate::pitr::ArchiveEpochId(anchor.archive_epoch_id),
+                },
+                durable_anchors: vec![anchor],
+            },
+        )?;
+        let batches = &recovered.installed.batches;
+        assert_eq!(batches.len(), 2);
+        assert_eq!((batches[0].commit_ts, batches[1].commit_ts), (7, 9));
+        assert_eq!(batches[0].entries, second_entries);
+        assert_eq!(batches[1].entries, first_entries);
+        assert_eq!(batches[0].recorded_at, recorded_at);
+        assert_eq!(batches[1].recorded_at, recorded_at);
+
+        Ok(())
+    }
+
+    #[test]
+    fn v7_prepared_batch_rechecks_capacity_and_retires_rejected_buffers() -> anyhow::Result<()> {
+        use crate::wal::v7::leader::WalV7LeaderCapacityError;
+
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("prepared-capacity-race.wal");
+        let limit = 4 * super::WAL_V7_FRAME_LEN as u64;
+        let Some(V7RuntimeTestWal { wal, owner, .. }) =
+            live_v7_test_wal(&path, limit, v7_test_resource_limits())?
+        else {
+            return Ok(());
+        };
+        let baseline = owner.snapshot();
+        let batch = v7_test_batch(1, 10);
+        let first = wal.prepare_v7_parallel_batch(&batch, LIVE_WAL_V5_LIMITS)?;
+        let second = wal.prepare_v7_parallel_batch(&batch, LIVE_WAL_V5_LIMITS)?;
+        let ticket = wal
+            .put_v7_prepared_batch_with_index(first, 1, batch.recorded_at)?
+            .0;
+        wal.submit_and_commit(ticket)?;
+        let error = wal
+            .put_v7_prepared_batch_with_index(second, 2, batch.recorded_at)
+            .expect_err("the first prepared batch has filled the segment");
+        assert_eq!(
+            error.downcast_ref::<WalV7LeaderCapacityError>(),
+            Some(&WalV7LeaderCapacityError::RotationRequired)
+        );
+        assert_eq!(
+            wal.next_ticket.load(std::sync::atomic::Ordering::Acquire),
+            1
+        );
+        assert!(!wal.parallel_runtime.as_ref().unwrap().is_poisoned());
+        wal.close()?;
+        let retained = owner.snapshot();
+        assert_eq!(retained.buffer_memory_bytes, 0);
+        assert_eq!(
+            retained.logical_wal_bytes - baseline.logical_wal_bytes,
+            8192
+        );
+        assert_eq!(
+            retained.source_spool_bytes - baseline.source_spool_bytes,
+            8192
+        );
+        assert_eq!(retained.seal_index_bytes - baseline.seal_index_bytes, 8);
+
+        Ok(())
+    }
+
+    fn take_test_ready_v7_batch(inner: &super::RuntimeInner) -> AdmittedBatch {
+        let mut admission = inner.admission.lock();
+        let batch = admission.queue.pop_front().expect("test DATA is ready");
+        let entry = admission
+            .v7_admitted
+            .pop_front()
+            .expect("test DATA has an admission entry");
+        assert_eq!(entry.ticket, batch.ticket);
+        batch
+    }
+
+    fn prepare_test_v7_data(
+        inner: &super::RuntimeInner,
+        packer: &mut super::PackerState,
+        mut batch: AdmittedBatch,
+    ) -> anyhow::Result<(AdmittedBatch, super::WalV7PrefixMetadata)> {
+        let prefix = packer
+            .v7_prefix
+            .as_mut()
+            .expect("v7 fixture has a recovered hash");
+        super::materialize_v7_batch(&mut batch, prefix)?;
+        inner
+            .admission
+            .lock()
+            .v7_metadata
+            .as_mut()
+            .unwrap()
+            .logical_hasher = prefix.logical_hasher.clone();
+        Ok((batch, prefix.clone()))
+    }
+
     fn complete_test_v7_data(
         inner: &super::RuntimeInner,
-        batch: AdmittedBatch,
+        batch: (AdmittedBatch, super::WalV7PrefixMetadata),
         error: Option<String>,
     ) -> anyhow::Result<()> {
+        let result = finish_test_v7_data(inner, batch, error)?;
+        super::process_group_result(inner, result);
+
+        Ok(())
+    }
+
+    fn finish_test_v7_data(
+        inner: &super::RuntimeInner,
+        (batch, prefix): (AdmittedBatch, super::WalV7PrefixMetadata),
+        error: Option<String>,
+    ) -> anyhow::Result<super::GroupWriteResult> {
         let AdmittedBatch {
             ticket,
             file_offset,
@@ -2740,7 +5725,18 @@ mod tests {
             buffer,
             ..
         } = batch;
+        // These tests bypass the packer and complete one batch per group;
+        // publish the same endpoint snapshot that take_admitted_group records.
+        assert!(
+            inner
+                .admission
+                .lock()
+                .v7_prefixes
+                .insert(ticket + 1, prefix,)
+                .is_none()
+        );
         if error.is_none() {
+            super::preallocate_runtime(inner, file_offset + aligned_len as u64, true)?;
             inner.preallocator.write_all_at(
                 buffer
                     .buffer
@@ -2751,16 +5747,327 @@ mod tests {
             )?;
         }
         super::WorkerBuffer::retire(buffer, &inner.buffer_pool);
+        Ok(super::GroupWriteResult {
+            group_id: ticket,
+            tickets: ticket..ticket + 1,
+            write_count: 1,
+            write_bytes: aligned_len as u64,
+            error,
+        })
+    }
+
+    #[test]
+    fn large_batch_coalescing_preserves_point_v4_and_fast_sync_policy() {
+        use std::time::Duration;
+
+        for v7 in [false, true] {
+            for large in [false, true] {
+                assert_eq!(super::sync_coalesce_wait(None, v7, large), None);
+                assert_eq!(
+                    super::sync_coalesce_wait(Some(Duration::from_micros(99)), v7, large),
+                    v7.then_some(super::V7_FAST_SYNC_COALESCE_WAIT)
+                );
+                let expected = if v7 && large {
+                    super::V7_LARGE_BATCH_COALESCE_WAIT
+                } else {
+                    super::SYNC_COALESCE_WAIT
+                };
+                assert_eq!(
+                    super::sync_coalesce_wait(Some(Duration::from_micros(100)), v7, large),
+                    Some(expected)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn v7_large_batch_wave_follows_contiguous_completion_and_durable_cutoffs() -> anyhow::Result<()>
+    {
+        use crate::wal::v7::{
+            install::recover_and_install_active, recovery::WalV7RecoveryAuthority,
+        };
+
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("large-batch-wave.wal");
+        let Some(V7RuntimeTestWal { wal, owner, anchor }) =
+            live_v7_test_wal(&path, super::MAX_WAL_FILE_SIZE, v7_test_resource_limits())?
+        else {
+            return Ok(());
+        };
+        let runtime = wal.parallel_runtime.as_ref().unwrap();
+        // Own the packer while injecting real encoded DATA completions. The
+        // coordinator remains idle because no I/O groups are submitted to it.
+        let mut packer = runtime.inner.packer_state.lock();
+        let batches: Vec<_> = (0..7)
+            .map(|ticket| v7_test_batch(ticket + 1, if ticket == 2 { 10 } else { 64 * 1024 - 1 }))
+            .collect();
+        let mut pending = std::collections::VecDeque::new();
+        for batch in &batches[..2] {
+            wal.put_v7_batch_with_index(batch, LIVE_WAL_V5_LIMITS)?;
+            let admitted = take_test_ready_v7_batch(&runtime.inner);
+            pending.push_back(prepare_test_v7_data(&runtime.inner, &mut packer, admitted)?);
+        }
+        let first = pending.pop_front().unwrap();
+        complete_test_v7_data(&runtime.inner, pending.pop_front().unwrap(), None)?;
+        {
+            let state = runtime.inner.durability.state.lock();
+            assert_eq!((state.written_frontier, state.durable_frontier), (0, 0));
+            assert!(
+                !state.large_batch_wave,
+                "out-of-order DATA cannot classify a prefix"
+            );
+        }
+        complete_test_v7_data(&runtime.inner, first, None)?;
+        {
+            let state = runtime.inner.durability.state.lock();
+            assert_eq!((state.written_frontier, state.durable_frontier), (2, 0));
+            assert!(state.large_batch_wave);
+        }
+        super::synchronize_written_prefix(&runtime.inner.preallocator, &runtime.inner)?;
+
+        for batch in &batches[2..4] {
+            wal.put_v7_batch_with_index(batch, LIVE_WAL_V5_LIMITS)?;
+            let admitted = take_test_ready_v7_batch(&runtime.inner);
+            pending.push_back(prepare_test_v7_data(&runtime.inner, &mut packer, admitted)?);
+        }
+        complete_test_v7_data(&runtime.inner, pending.pop_front().unwrap(), None)?;
+        complete_test_v7_data(&runtime.inner, pending.pop_front().unwrap(), None)?;
+        {
+            let state = runtime.inner.durability.state.lock();
+            assert_eq!((state.written_frontier, state.durable_frontier), (4, 2));
+            assert!(
+                !state.large_batch_wave,
+                "a later large batch cannot hide a small one"
+            );
+        }
+        super::synchronize_written_prefix(&runtime.inner.preallocator, &runtime.inner)?;
+        for batch in &batches[4..] {
+            wal.put_v7_batch_with_index(batch, LIVE_WAL_V5_LIMITS)?;
+            let admitted = take_test_ready_v7_batch(&runtime.inner);
+            pending.push_back(prepare_test_v7_data(&runtime.inner, &mut packer, admitted)?);
+        }
+        complete_test_v7_data(&runtime.inner, pending.pop_front().unwrap(), None)?;
+        assert!(runtime.inner.durability.state.lock().large_batch_wave);
+
+        // A multi-ticket CQE does not expose individual logical batch sizes.
+        // Even when these particular test batches are large, classify the
+        // group conservatively instead of using its average byte count.
+        let mut group_bytes = 0;
+        for (batch, prefix) in pending {
+            runtime
+                .inner
+                .admission
+                .lock()
+                .v7_prefixes
+                .insert(batch.ticket + 1, prefix);
+            super::preallocate_runtime(
+                &runtime.inner,
+                batch.file_offset + batch.aligned_len as u64,
+                false,
+            )?;
+            runtime.inner.preallocator.write_all_at(
+                batch
+                    .buffer
+                    .buffer
+                    .as_ref()
+                    .unwrap()
+                    .initialized_slice(0, batch.aligned_len),
+                batch.file_offset,
+            )?;
+            group_bytes += batch.aligned_len as u64;
+            super::WorkerBuffer::retire(batch.buffer, &runtime.inner.buffer_pool);
+        }
         super::process_group_result(
-            inner,
+            &runtime.inner,
             super::GroupWriteResult {
-                group_id: ticket,
-                tickets: ticket..ticket + 1,
-                write_count: 1,
-                write_bytes: aligned_len as u64,
-                error,
+                group_id: 5,
+                tickets: 5..7,
+                write_count: 2,
+                write_bytes: group_bytes,
+                error: None,
             },
         );
+        {
+            let state = runtime.inner.durability.state.lock();
+            assert_eq!((state.written_frontier, state.durable_frontier), (7, 4));
+            assert!(!state.large_batch_wave);
+        }
+        super::synchronize_written_prefix(&runtime.inner.preallocator, &runtime.inner)?;
+        packer.next_ticket = wal.next_ticket();
+        packer.reserved_end = runtime.logical_length();
+        packer.preallocated_end = std::fs::metadata(&path)?.len();
+        drop(packer);
+        wal.close()?;
+        assert_eq!(owner.snapshot().buffer_memory_bytes, 0);
+        drop(wal);
+
+        let recovered = recover_and_install_active(
+            &path,
+            WalV7RecoveryAuthority::Active {
+                predecessor: crate::pitr::ChainAnchor::Genesis {
+                    archive_epoch_id: crate::pitr::ArchiveEpochId(anchor.archive_epoch_id),
+                },
+                durable_anchors: vec![anchor],
+            },
+        )?;
+        assert_eq!(recovered.installed.batches, batches);
+
+        Ok(())
+    }
+
+    #[test]
+    fn v7_coalescing_preparation_hint_never_advances_durability_or_blocks_close()
+    -> anyhow::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("preparation-coalesce.wal");
+        let Some(V7RuntimeTestWal { wal, owner, .. }) =
+            live_v7_test_wal(&path, super::MAX_WAL_FILE_SIZE, v7_test_resource_limits())?
+        else {
+            return Ok(());
+        };
+        let runtime = wal.parallel_runtime.as_ref().unwrap();
+        let mut packer = runtime.inner.packer_state.lock();
+        let first = v7_test_batch(1, 10);
+        let ticket = wal.put_v7_batch_with_index(&first, LIVE_WAL_V5_LIMITS)?.0;
+        let batch = take_test_ready_v7_batch(&runtime.inner);
+        let data_end = batch.file_offset + batch.aligned_len as u64;
+        let batch = prepare_test_v7_data(&runtime.inner, &mut packer, batch)?;
+        complete_test_v7_data(&runtime.inner, batch, None)?;
+        packer.next_ticket = ticket + 1;
+        packer.reserved_end = data_end;
+
+        assert!(!super::has_pending_v7_preparations(
+            &runtime.inner.admission.lock(),
+            0
+        ));
+        let pending = runtime.prepare_v7_batch(&v7_test_batch(2, 10), LIVE_WAL_V5_LIMITS)?;
+        assert!(super::has_pending_v7_preparations(
+            &runtime.inner.admission.lock(),
+            0
+        ));
+        let (_sender, completions) = crossbeam_channel::bounded(1);
+        super::coalesce_admitted_prefix(
+            &runtime.inner,
+            &completions,
+            std::time::Duration::from_millis(1),
+        );
+        {
+            let state = runtime.inner.durability.state.lock();
+            assert_eq!(state.written_frontier, 1);
+            assert_eq!(state.durable_frontier, 0);
+        }
+        runtime.inner.admission.lock().open = false;
+        assert!(!super::has_pending_v7_preparations(
+            &runtime.inner.admission.lock(),
+            0
+        ));
+        // This fixture injects CQEs directly instead of waking the automatic
+        // coordinator, so perform its matching sync step before shutdown.
+        assert!(
+            super::synchronize_written_prefix(&runtime.inner.preallocator, &runtime.inner)?
+                .is_some()
+        );
+        drop(packer);
+        wal.close()?;
+        assert_eq!(runtime.inner.durability.state.lock().durable_frontier, 1);
+        assert!(runtime.wait_durable(1).is_err());
+        drop(pending);
+        assert_eq!(owner.snapshot().buffer_memory_bytes, 0);
+
+        Ok(())
+    }
+
+    #[test]
+    fn v7_coalescing_waits_only_after_a_written_prefix_becomes_eligible() -> anyhow::Result<()> {
+        use std::time::Duration;
+
+        use crate::wal::v7::{
+            install::recover_and_install_active, recovery::WalV7RecoveryAuthority,
+        };
+
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("eligible-coalescing.wal");
+        let Some(V7RuntimeTestWal { wal, owner, anchor }) =
+            live_v7_test_wal(&path, super::MAX_WAL_FILE_SIZE, v7_test_resource_limits())?
+        else {
+            return Ok(());
+        };
+        let runtime = wal.parallel_runtime.as_ref().unwrap();
+        let mut packer = runtime.inner.packer_state.lock();
+        let batches = (1..=4).map(|ts| v7_test_batch(ts, 10)).collect::<Vec<_>>();
+        let mut pending = std::collections::VecDeque::new();
+        for batch in &batches[..3] {
+            wal.put_v7_batch_with_index(batch, LIVE_WAL_V5_LIMITS)?;
+            let admitted = take_test_ready_v7_batch(&runtime.inner);
+            pending.push_back(prepare_test_v7_data(&runtime.inner, &mut packer, admitted)?);
+        }
+        complete_test_v7_data(&runtime.inner, pending.pop_front().unwrap(), None)?;
+        assert!(
+            super::synchronize_written_prefix(&runtime.inner.preallocator, &runtime.inner)?
+                .is_some()
+        );
+        complete_test_v7_data(&runtime.inner, pending.pop_front().unwrap(), None)?;
+        let (sender, completions) = crossbeam_channel::bounded(1);
+        sender.send(finish_test_v7_data(
+            &runtime.inner,
+            pending.pop_front().unwrap(),
+            None,
+        )?)?;
+
+        // F(T=1) follows D0,D1,D2. T=2 cannot retain that marker without
+        // retaining excluded D2. Even with its CQE queued, skip this optional
+        // window and leave the result for the next coordinator iteration.
+        super::coalesce_before_capture(&runtime.inner, &completions, Duration::from_secs(1), true);
+        assert_eq!(completions.len(), 1);
+        assert!(!runtime.is_poisoned());
+        let tail = runtime.logical_length();
+        assert!(
+            super::synchronize_written_prefix(&runtime.inner.preallocator, &runtime.inner)?
+                .is_none()
+        );
+        assert_eq!(runtime.logical_length(), tail);
+        {
+            let state = runtime.inner.durability.state.lock();
+            assert_eq!((state.written_frontier, state.durable_frontier), (2, 1));
+        }
+        runtime.wait_durable(0)?;
+
+        // The next received result makes T=3 eligible. Preserve a normal
+        // batching window: a later queued DATA result can join its capture.
+        super::process_group_result(&runtime.inner, completions.recv()?);
+        wal.put_v7_batch_with_index(&batches[3], LIVE_WAL_V5_LIMITS)?;
+        let admitted = take_test_ready_v7_batch(&runtime.inner);
+        let last = prepare_test_v7_data(&runtime.inner, &mut packer, admitted)?;
+        sender.send(finish_test_v7_data(&runtime.inner, last, None)?)?;
+        super::coalesce_before_capture(&runtime.inner, &completions, Duration::from_secs(1), true);
+        assert!(completions.is_empty());
+        {
+            let state = runtime.inner.durability.state.lock();
+            assert_eq!((state.written_frontier, state.durable_frontier), (4, 1));
+        }
+        assert!(
+            super::synchronize_written_prefix(&runtime.inner.preallocator, &runtime.inner)?
+                .is_some()
+        );
+        runtime.wait_durable(3)?;
+        packer.next_ticket = wal.next_ticket();
+        packer.reserved_end = runtime.logical_length();
+        packer.preallocated_end = std::fs::metadata(&path)?.len();
+        drop(packer);
+        wal.close()?;
+        assert_eq!(owner.snapshot().buffer_memory_bytes, 0);
+        drop(wal);
+
+        let recovered = recover_and_install_active(
+            &path,
+            WalV7RecoveryAuthority::Active {
+                predecessor: crate::pitr::ChainAnchor::Genesis {
+                    archive_epoch_id: crate::pitr::ArchiveEpochId(anchor.archive_epoch_id),
+                },
+                durable_anchors: vec![anchor],
+            },
+        )?;
+        assert_eq!(recovered.installed.batches, batches);
 
         Ok(())
     }
@@ -2789,10 +6096,23 @@ mod tests {
                 ticket as u64
             );
         }
-        let (mut pending, data_end) = {
+        let (pending, data_end) = {
             let mut admission = runtime.inner.admission.lock();
-            (std::mem::take(&mut admission.queue), admission.admitted_end)
+            let pending = std::mem::take(&mut admission.queue);
+            let entries = std::mem::take(&mut admission.v7_admitted);
+            assert_eq!(pending.len(), entries.len());
+            assert!(
+                pending
+                    .iter()
+                    .zip(entries)
+                    .all(|(batch, entry)| batch.ticket == entry.ticket)
+            );
+            (pending, admission.admitted_end)
         };
+        let mut pending = pending
+            .into_iter()
+            .map(|batch| prepare_test_v7_data(&runtime.inner, &mut packer, batch))
+            .collect::<anyhow::Result<std::collections::VecDeque<_>>>()?;
         complete_test_v7_data(&runtime.inner, pending.pop_front().unwrap(), None)?;
         assert!(
             super::synchronize_written_prefix(&runtime.inner.preallocator, &runtime.inner)?
@@ -2819,7 +6139,8 @@ mod tests {
                     .0,
                 3
             );
-            let failed = runtime.inner.admission.lock().queue.pop_front().unwrap();
+            let failed = take_test_ready_v7_batch(&runtime.inner);
+            let failed = prepare_test_v7_data(&runtime.inner, &mut packer, failed)?;
             complete_test_v7_data(
                 &runtime.inner,
                 failed,
@@ -3291,9 +6612,9 @@ mod tests {
             file_offset,
             aligned_len,
             ..
-        } = runtime.inner.admission.lock().queue.pop_front().unwrap();
+        } = take_test_ready_v7_batch(&runtime.inner);
         let data_end = file_offset + aligned_len as u64;
-        super::preallocate_runtime(&runtime.inner, data_end)?;
+        super::preallocate_runtime(&runtime.inner, data_end, true)?;
         // Retain the allocation just as WorkerCore::drop does for an ambiguous
         // submission. No SQE is actually submitted here, allowing the test to
         // release it safely after checking accounting across close/retirement.
@@ -3335,8 +6656,7 @@ mod tests {
     }
 
     #[test]
-    fn v7_admission_uses_exact_buffers_and_never_retires_them_into_the_v4_pool()
-    -> anyhow::Result<()> {
+    fn v7_admission_recycles_single_frame_buffers_in_its_separate_pool() -> anyhow::Result<()> {
         use crate::wal::v7::codec::WAL_V7_DATA_FRAGMENT_PAYLOAD_CAPACITY;
 
         let directory = tempfile::tempdir()?;
@@ -3387,6 +6707,24 @@ mod tests {
             drop(admission);
             drop(packer);
             wal.submit_and_commit(ticket)?;
+            assert!(runtime.inner.buffer_pool.is_empty());
+            let expected_v7_pool_len = if expected_capacity == super::WAL_V7_FRAME_LEN {
+                1
+            } else {
+                0
+            };
+            assert_eq!(
+                runtime.inner.v7_frame_buffer_pool.len(),
+                expected_v7_pool_len
+            );
+            if expected_capacity == super::WAL_V7_FRAME_LEN {
+                let next_batch = v7_test_batch(2, 10);
+                let (next_ticket, _) =
+                    wal.put_v7_batch_with_index(&next_batch, LIVE_WAL_V5_LIMITS)?;
+                assert!(runtime.inner.v7_frame_buffer_pool.is_empty());
+                wal.submit_and_commit(next_ticket)?;
+                assert_eq!(runtime.inner.v7_frame_buffer_pool.len(), 1);
+            }
             wal.close()?;
             assert!(runtime.inner.buffer_pool.is_empty());
             assert_eq!(owner.snapshot().buffer_memory_bytes, 0);
@@ -3426,7 +6764,6 @@ mod tests {
         let prefix_digest = logical_hasher.clone().finalize().into();
         let mut physical_hasher = Sha256::new();
         physical_hasher.update(b"normalized physical image");
-        let physical_digest: [u8; 32] = physical_hasher.clone().finalize().into();
         let last_recorded_at = Some(RecordedAt { secs: 60, nanos: 0 });
         let frontier_cursor = WalV7FrontierCursor {
             frontier: WalV7Frontier {
@@ -3730,11 +7067,8 @@ mod tests {
                 .as_ref()
                 .expect("runtime retains v7 metadata");
             let logical_digest: [u8; 32] = metadata.logical_hasher.clone().finalize().into();
-            let retained_physical_digest: [u8; 32] =
-                metadata.physical_hasher.clone().finalize().into();
             assert_eq!(logical_digest, prefix_digest);
-            assert_eq!(retained_physical_digest, physical_digest);
-            assert_eq!(metadata.physical_hashed_end, APPEND_OFFSET);
+            assert_eq!(metadata.physical_end, APPEND_OFFSET);
             assert_eq!(metadata.last_recorded_at, last_recorded_at);
         }
         assert!(runtime.inner.buffer_pool.is_empty());
@@ -3831,6 +7165,7 @@ mod tests {
             };
             let runtime = wal.parallel_runtime.as_ref().expect("v7 Parallel runtime");
             assert_eq!(runtime.inner.max_file_size, configured_limit);
+            *runtime.inner.preallocation_lock.lock() = Some(runtime.logical_length());
             let batch = v7_test_batch(1, 10);
             let (ticket, first_data_offset) =
                 wal.put_v7_batch_with_index(&batch, LIVE_WAL_V5_LIMITS)?;
@@ -4199,7 +7534,9 @@ mod tests {
             ticket,
             file_offset,
             aligned_len,
+            v7_framed: false,
             v7_allocation: None,
+            v7_input: None,
             buffer: ParallelBuffer::activate(
                 direct,
                 std::sync::Arc::clone(budget),
@@ -4225,7 +7562,26 @@ mod tests {
             ticket,
             file_offset: range.start,
             aligned_len,
+            v7_framed: false,
             v7_allocation: Some(allocation),
+            v7_input: Some(super::WalV7AdmittedInput {
+                logical_batch: super::prepare_logical_batch(
+                    &v7_test_batch(
+                        ticket + 1,
+                        (aligned_len / super::WAL_V7_FRAME_LEN - 1)
+                            * crate::wal::v7::codec::WAL_V7_DATA_FRAGMENT_PAYLOAD_CAPACITY
+                            + 10,
+                    ),
+                    LIVE_WAL_V5_LIMITS,
+                )
+                .unwrap()
+                .encode_entry_stream()
+                .unwrap()
+                .into_logical_batch(ticket, ticket + 1, RecordedAt { secs: 50, nanos: 0 })
+                .unwrap(),
+                header_digest: [0x11; 32],
+                commit_ts: ticket + 1,
+            }),
             buffer: ParallelBuffer::activate(
                 direct,
                 std::sync::Arc::clone(budget),
@@ -4251,6 +7607,10 @@ mod tests {
             v7_reservation_owner: None,
             v7_metadata: None,
             v7_prefixes: BTreeMap::new(),
+            v7_hash_pending: None,
+            v7_admitted: VecDeque::new(),
+            v7_ready_ticket: 0,
+            v7_ready_batches: BTreeMap::new(),
             v7_reservations: BTreeMap::new(),
             queue: std::collections::VecDeque::from([
                 admitted_batch_of_size(&budget, 0, WAL_HEADER_END, large),
@@ -4260,15 +7620,17 @@ mod tests {
             ]),
         };
 
-        let large_group = take_admitted_group(&mut admission, 0, WAL_HEADER_END, 2)
-            .unwrap()
-            .unwrap();
+        let large_group =
+            take_admitted_group(&mut admission, 0, WAL_HEADER_END, 2, &mut Vec::new())
+                .unwrap()
+                .unwrap();
         assert!(!large_group.initialize_extents);
         let mixed_group = take_admitted_group(
             &mut admission,
             large_group.next_ticket,
             large_group.reserved_end,
             2,
+            &mut Vec::new(),
         )
         .unwrap()
         .unwrap();
@@ -4295,6 +7657,10 @@ mod tests {
             v7_reservation_owner: None,
             v7_metadata: None,
             v7_prefixes: BTreeMap::new(),
+            v7_hash_pending: None,
+            v7_admitted: VecDeque::new(),
+            v7_ready_ticket: 0,
+            v7_ready_batches: BTreeMap::new(),
             v7_reservations: BTreeMap::new(),
             queue: std::collections::VecDeque::from([
                 admitted_batch(&budget, 0, WAL_HEADER_END),
@@ -4304,7 +7670,7 @@ mod tests {
             ]),
         };
 
-        let group = take_admitted_group(&mut admission, 0, WAL_HEADER_END, 8)
+        let group = take_admitted_group(&mut admission, 0, WAL_HEADER_END, 8, &mut Vec::new())
             .expect("contiguous tickets form a valid I/O group")
             .expect("tickets below the poison boundary remain packable");
 
@@ -4368,6 +7734,23 @@ mod tests {
             v7_reservation_owner: None,
             v7_metadata: None,
             v7_prefixes: BTreeMap::new(),
+            v7_hash_pending: None,
+            v7_admitted: VecDeque::from([
+                super::WalV7Admission {
+                    ticket: 0,
+                    file_offset: DATA_START,
+                    aligned_len: FRAME as usize,
+                    commit_ts: 1,
+                },
+                super::WalV7Admission {
+                    ticket: 1,
+                    file_offset: DATA_START + 2 * FRAME,
+                    aligned_len: 2 * FRAME as usize,
+                    commit_ts: 2,
+                },
+            ]),
+            v7_ready_ticket: 0,
+            v7_ready_batches: BTreeMap::new(),
             v7_reservations: BTreeMap::new(),
             queue: std::collections::VecDeque::from([
                 admitted_v7_batch(&budget, first),
@@ -4375,12 +7758,18 @@ mod tests {
             ]),
         };
 
-        let first_group = take_admitted_group(&mut admission, 0, DATA_START, 1)
+        let mut pending = Vec::new();
+        let mut prefix = super::WalV7PrefixMetadata {
+            last_commit_ts: 0,
+            logical_hasher: super::Sha256::new(),
+        };
+        let mut first_group = take_admitted_group(&mut admission, 0, DATA_START, 1, &mut pending)
             .expect("pack first v7 ticket")
             .expect("first ticket is queued");
         assert_eq!(first_group.allocation_start, DATA_START);
         assert_eq!(first_group.reserved_end, DATA_START + FRAME);
         assert!(first_group.frontier_offsets.is_empty());
+        super::materialize_v7_batches(&mut pending, &mut prefix, &mut first_group.writes).unwrap();
         super::WriteGroup::new_with_frontiers(
             first_group.first_ticket..first_group.next_ticket,
             first_group.writes,
@@ -4389,17 +7778,19 @@ mod tests {
         )
         .expect("first group ends immediately before the reserved marker");
 
-        let second_group = take_admitted_group(
+        let mut second_group = take_admitted_group(
             &mut admission,
             first_group.next_ticket,
             first_group.reserved_end,
             1,
+            &mut pending,
         )
         .expect("pack second v7 ticket across marker")
         .expect("second ticket is queued");
         assert_eq!(second_group.allocation_start, DATA_START + FRAME);
         assert_eq!(second_group.reserved_end, DATA_START + 4 * FRAME);
         assert_eq!(second_group.frontier_offsets, [DATA_START + FRAME]);
+        super::materialize_v7_batches(&mut pending, &mut prefix, &mut second_group.writes).unwrap();
         super::WriteGroup::new_with_frontiers(
             second_group.first_ticket..second_group.next_ticket,
             second_group.writes,

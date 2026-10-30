@@ -1,0 +1,112 @@
+{
+  "outside_sandbox": true,
+  "checks": [
+    {
+      "step": "fmt",
+      "command": [
+        "cargo",
+        "fmt",
+        "--all"
+      ],
+      "returncode": 0,
+      "elapsed_seconds": 1.2097625732421875,
+      "log_path": "target/wal-opt/20261029-v7-post-submit-hash/attempt2-fmt.log",
+      "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "step": "focused",
+      "command": [
+        "cargo",
+        "nextest",
+        "run",
+        "--workspace",
+        "--all-features",
+        "--lib",
+        "--retries",
+        "0",
+        "-E",
+        "test(wal::parallel_runtime)"
+      ],
+      "returncode": 0,
+      "elapsed_seconds": 12.66491985321045,
+      "log_path": "target/wal-opt/20261029-v7-post-submit-hash/attempt2-focused.log",
+      "log_sha256": "e5e09a80cd1797f25b01e01f22fc11f37f87484baef7f8921032c4a162255df2"
+    },
+    {
+      "step": "check",
+      "command": [
+        "cargo",
+        "make",
+        "check"
+      ],
+      "returncode": 0,
+      "elapsed_seconds": 22.90874934196472,
+      "log_path": "target/wal-opt/20261029-v7-post-submit-hash/attempt2-check.log",
+      "log_sha256": "993d0560946a270396f3680479b4ba9a8c33b5cdea8ac81d81abd5d739de1d37"
+    },
+    {
+      "step": "typos",
+      "command": [
+        "typos"
+      ],
+      "returncode": 0,
+      "elapsed_seconds": 0.3242185115814209,
+      "log_path": "target/wal-opt/20261029-v7-post-submit-hash/attempt2-typos.log",
+      "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "step": "release",
+      "command": [
+        "cargo",
+        "build",
+        "--release",
+        "--package",
+        "kv-engine",
+        "--bin",
+        "write-perf",
+        "--features",
+        "bench"
+      ],
+      "returncode": 0,
+      "elapsed_seconds": 17.8458731174469,
+      "log_path": "target/wal-opt/20261029-v7-post-submit-hash/attempt2-release.log",
+      "log_sha256": "0a8eb06284643addb1ddf191e335a57c4468fba6951ffac8261406f0d8b5a202"
+    }
+  ],
+  "initial_attempt": [
+    {
+      "step": "fmt",
+      "command": [
+        "cargo",
+        "fmt",
+        "--all"
+      ],
+      "returncode": 0,
+      "elapsed_seconds": 1.1023836135864258,
+      "log_path": "target/wal-opt/20261029-v7-post-submit-hash/fmt.log",
+      "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "step": "focused",
+      "command": [
+        "cargo",
+        "nextest",
+        "run",
+        "--workspace",
+        "--all-features",
+        "--lib",
+        "--retries",
+        "0",
+        "-E",
+        "test(wal::parallel_runtime)"
+      ],
+      "returncode": 101,
+      "elapsed_seconds": 3.4243979454040527,
+      "log_path": "target/wal-opt/20261029-v7-post-submit-hash/focused.log",
+      "log_sha256": "dbba4cfcbc386e1b31e7e257848a70c89ec18ab8f50bedc407afaecd787a9cde"
+    }
+  ],
+  "focused_tests": 55,
+  "candidate_tests": 1975,
+  "initial_failure": "Test-only failpoint configuration returns String; add explicit anyhow conversion before successful checks. No capture preceded that correction."
+}

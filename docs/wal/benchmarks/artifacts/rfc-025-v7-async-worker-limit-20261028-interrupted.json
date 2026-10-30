@@ -1,0 +1,30 @@
+{
+  "outcome": "Bounded-only cap fails the engine helper-count probe; no scored comparison is usable.",
+  "candidate_sha256": "568b4d41efed45ed06c83af198448e826a020ca0214a0649d2492ed749583255",
+  "completed_invocations": 5,
+  "completed_diagnostics": 3,
+  "completed_warmups": 2,
+  "completed_scored": 0,
+  "interrupted_invocations_without_json": 1,
+  "orchestration_error": "A shell command chain launched the matrix after the probe failed. Stopped only its owned process tree during the first scored baseline run. No score from this attempt is used.",
+  "probe_returncode": 1,
+  "probe_max_helpers": 231,
+  "global_completed_unique_invocations": 554,
+  "files": {
+    "docs/wal/benchmarks/artifacts/rfc-025-v7-async-worker-limit-20261028-ext4-batch16-host.jsonl": "4fbc69ea87da447a16f9e480d952835f9326411584bd984eab5ef1686a1dfb9d",
+    "docs/wal/benchmarks/artifacts/rfc-025-v7-async-worker-limit-20261028-ext4-batch16-runs.tsv": "059354dbb9ed373d28f3b7ef8c9c125473449715801f8b2dd43c6dadebf45cd5",
+    "docs/wal/benchmarks/artifacts/rfc-025-v7-async-worker-limit-20261028-ext4-batch16.jsonl": "0b29738eca3758c1a7ec32891d15b4e8fd58a208a45a4ba4130fe38f2ff3899d",
+    "target/wal-opt/20261028-v7-async-worker-limit/capture-stop.json": "8c57af993c13869509725318f692437fef5423f45b89466c952fb1eaf4ea2f43",
+    "target/wal-opt/20261028-v7-async-worker-limit/probe.log": "b81fdb0b822477acf717415c30a0d5bc908d8749e58a1dae6692fbd00c3cb602",
+    "target/wal-opt/20261028-v7-async-worker-limit/capture.log": "857009fd3df2a5d24d236b2857a7d8dbcd21ae711fa4f7d4cd862b1aea83be4e"
+  },
+  "kernel_sources": {
+    "target/wal-opt/20261028-v7-async-worker-limit/kernel-source/io-wq.c": "2f0a06104b5ad6876ac81759b1453c992086c2d75f8182a9f1cd681929aaa7c2",
+    "target/wal-opt/20261028-v7-async-worker-limit/kernel-source/io_uring.c": "3bc1ca667cba1639ef9a638e67fbee5605e9248b839a60c2c0ddf54cd3cc3c56",
+    "target/wal-opt/20261028-v7-async-worker-limit/kernel-source/opdef.c": "a397f3ab459bb0f949a16c4ba370642db4125e523c936cab8f9d64066fc208ec",
+    "target/wal-opt/20261028-v7-async-worker-limit/kernel-source/register.c": "64c72456d28143f67cfd99c76bfa55dc39684a398bdbac57e0b919a56423e2b9",
+    "target/wal-opt/20261028-v7-async-worker-limit/kernel-source/rw.c": "8d7e40300ef510aa4c19f9e2387a0862f69a0b837705be4dfa14ac3d590c8d17",
+    "target/wal-opt/20261028-v7-async-worker-limit/kernel-source/tctx.c": "ca92680ce1363ed7c563859e5ce9276479e27a739391e2aba09afd668d1809d8"
+  },
+  "kernel_source_url_prefix": "https://raw.githubusercontent.com/gregkh/linux/v6.12.71/io_uring/"
+}

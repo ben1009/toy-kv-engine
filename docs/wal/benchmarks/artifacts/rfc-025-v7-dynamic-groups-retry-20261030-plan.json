@@ -1,0 +1,32 @@
+{
+  "head": "0aac3ce8d119107c08b2bdc55d13d66c973ffbc5",
+  "source_patch_sha256": "0f2a42e82c117792af06746b646bbc4b2c6752514abc13f4e16f33bbb75e4af2",
+  "screen_cells": [
+    "ext4-batch8",
+    "ext4-batch16"
+  ],
+  "guard_cells": [],
+  "schedule": "Separately predeclared follow-up after the original screen lacked eligible high-concurrency samples: two batch64 screens, one warmup and two scored rounds per arm with balanced rotated order, 30 seconds initial cooldown and 5 seconds between invocations. No score-selected replacement runs.",
+  "ranking": "Highest eligible throughput within this follow-up for each exact binary and workload; p99 and grouping counts come from the same invocation. Do not hide or replace the original cohort.",
+  "stall_filter": {
+    "frontier_mean_ms_at_least": 0.12,
+    "fdatasync_mean_ms_at_least": 0.6,
+    "selection": "Flag each run independently using mean timings; a passing mean does not exclude brief SSD stalls."
+  },
+  "screen_gate": {
+    "minimum_throughput_ratio": 1.0,
+    "maximum_p99_ratio": 1.0,
+    "minimum_eligible_runs_per_arm": 2
+  },
+  "guard_gate": {
+    "minimum_throughput_ratio": 0.98,
+    "maximum_p99_ratio": 1.05,
+    "minimum_eligible_runs_per_arm": 2
+  },
+  "constraints": [
+    "Do not modify grouping, FRONTIER, sync, or wire code.",
+    "Do not infer full performance qualification from a batch-only screen.",
+    "All scratch databases are inside the local repository and only run-owned databases are removed.",
+    "The SSD showed stalls in previous captures; preserve and flag all samples."
+  ]
+}

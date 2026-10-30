@@ -1,0 +1,1649 @@
+[
+  {
+    "cell": "v4-point8",
+    "run_id": "1793066585130",
+    "excluded_from_scoring": true,
+    "binary": {
+      "path": "target/release/write-perf-v7-serial-startup",
+      "sha256": "e7f7712825d2166c14b5b67601388a8e29697f8fc034832e457061cf6e30ae19"
+    },
+    "command": [
+      "perf",
+      "record",
+      "-e",
+      "cpu-clock:u",
+      "-F",
+      "99",
+      "--call-graph",
+      "dwarf,16384",
+      "-o",
+      "/home/liu/proj/toy-kv-engine/target/wal-opt/20261027-v7-ssd-sync-preparation/v4-point8.perf.data",
+      "--",
+      "/home/liu/proj/toy-kv-engine/target/release/write-perf-v7-serial-startup",
+      "--suite",
+      "legacy",
+      "--preset",
+      "smoke",
+      "--wal",
+      "--bench",
+      "wal_concurrent",
+      "--num",
+      "100000",
+      "--threads",
+      "8",
+      "--value-size",
+      "1024",
+      "--target-sst-size",
+      "2147483648",
+      "--latency-sample-every",
+      "100",
+      "--output",
+      "json",
+      "--wal-io-mode",
+      "parallel",
+      "--profile",
+      "--path",
+      "/home/liu/proj/toy-kv-engine/target/wal-opt/20261027-v7-ssd-sync-preparation/v4-point8-profile-db"
+    ],
+    "audit": {
+      "benchmark_pid": 3801157,
+      "returncode": 0,
+      "sample_period_seconds": 1,
+      "before": {
+        "time_utc": "2026-10-27T02:03:05.066110+00:00",
+        "competing": [],
+        "load_average": [
+          0.07568359375,
+          0.14794921875,
+          0.3271484375
+        ],
+        "cpu_jiffies": [
+          17318872,
+          4949,
+          7810458,
+          6317367909,
+          3008551,
+          1125830,
+          1394539,
+          0,
+          0,
+          0
+        ]
+      },
+      "during": [
+        {
+          "time_utc": "2026-10-27T02:03:05.076031+00:00",
+          "competing": [],
+          "load_average": [
+            0.07568359375,
+            0.14794921875,
+            0.3271484375
+          ],
+          "cpu_jiffies": [
+            17318873,
+            4949,
+            7810460,
+            6317367938,
+            3008552,
+            1125830,
+            1394539,
+            0,
+            0,
+            0
+          ]
+        },
+        {
+          "time_utc": "2026-10-27T02:03:06.097567+00:00",
+          "competing": [],
+          "load_average": [
+            0.07568359375,
+            0.14794921875,
+            0.3271484375
+          ],
+          "cpu_jiffies": [
+            17318920,
+            4949,
+            7810483,
+            6317371074,
+            3008601,
+            1125833,
+            1394541,
+            0,
+            0,
+            0
+          ]
+        },
+        {
+          "time_utc": "2026-10-27T02:03:07.113372+00:00",
+          "competing": [],
+          "load_average": [
+            0.07568359375,
+            0.14794921875,
+            0.3271484375
+          ],
+          "cpu_jiffies": [
+            17318980,
+            4949,
+            7810512,
+            6317374175,
+            3008640,
+            1125837,
+            1394544,
+            0,
+            0,
+            0
+          ]
+        },
+        {
+          "time_utc": "2026-10-27T02:03:08.133713+00:00",
+          "competing": [],
+          "load_average": [
+            0.07568359375,
+            0.14794921875,
+            0.3271484375
+          ],
+          "cpu_jiffies": [
+            17319025,
+            4949,
+            7810535,
+            6317377304,
+            3008685,
+            1125840,
+            1394546,
+            0,
+            0,
+            0
+          ]
+        },
+        {
+          "time_utc": "2026-10-27T02:03:09.151929+00:00",
+          "competing": [],
+          "load_average": [
+            0.07568359375,
+            0.14794921875,
+            0.3271484375
+          ],
+          "cpu_jiffies": [
+            17319085,
+            4949,
+            7810558,
+            6317380416,
+            3008735,
+            1125844,
+            1394549,
+            0,
+            0,
+            0
+          ]
+        },
+        {
+          "time_utc": "2026-10-27T02:03:10.167263+00:00",
+          "competing": [],
+          "load_average": [
+            0.14990234375,
+            0.162109375,
+            0.3310546875
+          ],
+          "cpu_jiffies": [
+            17319127,
+            4949,
+            7810572,
+            6317383541,
+            3008785,
+            1125846,
+            1394551,
+            0,
+            0,
+            0
+          ]
+        },
+        {
+          "time_utc": "2026-10-27T02:03:11.184213+00:00",
+          "competing": [],
+          "load_average": [
+            0.14990234375,
+            0.162109375,
+            0.3310546875
+          ],
+          "cpu_jiffies": [
+            17319168,
+            4949,
+            7810593,
+            6317386679,
+            3008832,
+            1125849,
+            1394553,
+            0,
+            0,
+            0
+          ]
+        },
+        {
+          "time_utc": "2026-10-27T02:03:12.202086+00:00",
+          "competing": [],
+          "load_average": [
+            0.14990234375,
+            0.162109375,
+            0.3310546875
+          ],
+          "cpu_jiffies": [
+            17319210,
+            4949,
+            7810611,
+            6317389812,
+            3008876,
+            1125853,
+            1394555,
+            0,
+            0,
+            0
+          ]
+        },
+        {
+          "time_utc": "2026-10-27T02:03:13.218546+00:00",
+          "competing": [],
+          "load_average": [
+            0.14990234375,
+            0.162109375,
+            0.3310546875
+          ],
+          "cpu_jiffies": [
+            17319257,
+            4949,
+            7810635,
+            6317392938,
+            3008924,
+            1125856,
+            1394558,
+            0,
+            0,
+            0
+          ]
+        },
+        {
+          "time_utc": "2026-10-27T02:03:14.239530+00:00",
+          "competing": [],
+          "load_average": [
+            0.21826171875,
+            0.17626953125,
+            0.3349609375
+          ],
+          "cpu_jiffies": [
+            17319300,
+            4949,
+            7810655,
+            6317396077,
+            3008975,
+            1125859,
+            1394560,
+            0,
+            0,
+            0
+          ]
+        },
+        {
+          "time_utc": "2026-10-27T02:03:15.262964+00:00",
+          "competing": [],
+          "load_average": [
+            0.21826171875,
+            0.17626953125,
+            0.3349609375
+          ],
+          "cpu_jiffies": [
+            17319349,
+            4949,
+            7810681,
+            6317399229,
+            3009023,
+            1125862,
+            1394562,
+            0,
+            0,
+            0
+          ]
+        },
+        {
+          "time_utc": "2026-10-27T02:03:16.280415+00:00",
+          "competing": [],
+          "load_average": [
+            0.21826171875,
+            0.17626953125,
+            0.3349609375
+          ],
+          "cpu_jiffies": [
+            17319386,
+            4949,
+            7810706,
+            6317402354,
+            3009080,
+            1125865,
+            1394564,
+            0,
+            0,
+            0
+          ]
+        },
+        {
+          "time_utc": "2026-10-27T02:03:17.298967+00:00",
+          "competing": [],
+          "load_average": [
+            0.21826171875,
+            0.17626953125,
+            0.3349609375
+          ],
+          "cpu_jiffies": [
+            17319424,
+            4949,
+            7810724,
+            6317405489,
+            3009129,
+            1125868,
+            1394566,
+            0,
+            0,
+            0
+          ]
+        },
+        {
+          "time_utc": "2026-10-27T02:03:18.319797+00:00",
+          "competing": [],
+          "load_average": [
+            0.21826171875,
+            0.17626953125,
+            0.3349609375
+          ],
+          "cpu_jiffies": [
+            17319461,
+            4949,
+            7810742,
+            6317408635,
+            3009173,
+            1125870,
+            1394568,
+            0,
+            0,
+            0
+          ]
+        },
+        {
+          "time_utc": "2026-10-27T02:03:19.340539+00:00",
+          "competing": [],
+          "load_average": [
+            0.20068359375,
+            0.17333984375,
+            0.3330078125
+          ],
+          "cpu_jiffies": [
+            17319512,
+            4949,
+            7810758,
+            6317411774,
+            3009220,
+            1125873,
+            1394570,
+            0,
+            0,
+            0
+          ]
+        },
+        {
+          "time_utc": "2026-10-27T02:03:20.363324+00:00",
+          "competing": [],
+          "load_average": [
+            0.20068359375,
+            0.17333984375,
+            0.3330078125
+          ],
+          "cpu_jiffies": [
+            17319563,
+            4949,
+            7810783,
+            6317414926,
+            3009263,
+            1125876,
+            1394572,
+            0,
+            0,
+            0
+          ]
+        },
+        {
+          "time_utc": "2026-10-27T02:03:21.384143+00:00",
+          "competing": [],
+          "load_average": [
+            0.20068359375,
+            0.17333984375,
+            0.3330078125
+          ],
+          "cpu_jiffies": [
+            17319605,
+            4949,
+            7810804,
+            6317418067,
+            3009313,
+            1125879,
+            1394574,
+            0,
+            0,
+            0
+          ]
+        },
+        {
+          "time_utc": "2026-10-27T02:03:22.405218+00:00",
+          "competing": [],
+          "load_average": [
+            0.20068359375,
+            0.17333984375,
+            0.3330078125
+          ],
+          "cpu_jiffies": [
+            17319655,
+            4949,
+            7810826,
+            6317421214,
+            3009359,
+            1125882,
+            1394576,
+            0,
+            0,
+            0
+          ]
+        },
+        {
+          "time_utc": "2026-10-27T02:03:23.425719+00:00",
+          "competing": [],
+          "load_average": [
+            0.20068359375,
+            0.17333984375,
+            0.3330078125
+          ],
+          "cpu_jiffies": [
+            17319700,
+            4949,
+            7810849,
+            6317424353,
+            3009405,
+            1125885,
+            1394578,
+            0,
+            0,
+            0
+          ]
+        },
+        {
+          "time_utc": "2026-10-27T02:03:24.447359+00:00",
+          "competing": [],
+          "load_average": [
+            0.26513671875,
+            0.1875,
+            0.3369140625
+          ],
+          "cpu_jiffies": [
+            17319745,
+            4949,
+            7810879,
+            6317427485,
+            3009453,
+            1125889,
+            1394580,
+            0,
+            0,
+            0
+          ]
+        },
+        {
+          "time_utc": "2026-10-27T02:03:25.465298+00:00",
+          "competing": [],
+          "load_average": [
+            0.26513671875,
+            0.1875,
+            0.3369140625
+          ],
+          "cpu_jiffies": [
+            17319772,
+            4949,
+            7810909,
+            6317430602,
+            3009515,
+            1125891,
+            1394583,
+            0,
+            0,
+            0
+          ]
+        }
+      ],
+      "after": {
+        "time_utc": "2026-10-27T02:03:25.959915+00:00",
+        "competing": [],
+        "load_average": [
+          0.26513671875,
+          0.1875,
+          0.3369140625
+        ],
+        "cpu_jiffies": [
+          17319791,
+          4949,
+          7810917,
+          6317432125,
+          3009546,
+          1125892,
+          1394584,
+          0,
+          0,
+          0
+        ]
+      },
+      "sampling_errors": []
+    },
+    "samples": 452,
+    "lost_samples": 0,
+    "symbols": [
+      {
+        "percent": 18.81,
+        "symbol": "<crossbeam_channel::flavors::array::Channel<bool>>::recv"
+      },
+      {
+        "percent": 12.83,
+        "symbol": "<kv_engine::mvcc::LsmMvccInner>::publish_commit_ts"
+      },
+      {
+        "percent": 4.87,
+        "symbol": "<crossbeam_channel::flavors::list::Channel<kv_engine::wal::parallel_worker::GroupWriteResult>>::recv"
+      },
+      {
+        "percent": 3.76,
+        "symbol": "<kv_engine::mem_table::MemTable>::publish_raw_batch"
+      },
+      {
+        "percent": 3.54,
+        "symbol": "<crossbeam_channel::flavors::list::Channel<kv_engine::wal::parallel_worker::WorkerCommand<kv_engine::wal::parallel_runtime::ParallelBuffer>>>::recv"
+      },
+      {
+        "percent": 3.32,
+        "symbol": "__vdso_clock_gettime"
+      },
+      {
+        "percent": 2.21,
+        "symbol": "<crossbeam_skiplist::base::SkipList<bytes::bytes::Bytes, bytes::bytes::Bytes>>::search_position::<bytes::bytes::Bytes>"
+      },
+      {
+        "percent": 2.21,
+        "symbol": "<kv_engine::wal::Wal>::put_key_batch_profiled"
+      },
+      {
+        "percent": 2.21,
+        "symbol": "<parking_lot::raw_mutex::RawMutex>::lock_slow"
+      },
+      {
+        "percent": 1.99,
+        "symbol": "<parking_lot::condvar::Condvar>::wait_until_internal"
+      },
+      {
+        "percent": 1.77,
+        "symbol": "kv_engine::wal::parallel_worker::run_worker::<kv_engine::wal::parallel_runtime::ParallelBuffer>"
+      },
+      {
+        "percent": 1.55,
+        "symbol": "<kv_engine::wal::parallel_runtime::ParallelWalRuntime>::wait_durable"
+      },
+      {
+        "percent": 1.55,
+        "symbol": "<parking_lot::raw_mutex::RawMutex>::unlock_slow"
+      },
+      {
+        "percent": 1.55,
+        "symbol": "syscall"
+      },
+      {
+        "percent": 1.11,
+        "symbol": "0x00000000000a5ffc"
+      },
+      {
+        "percent": 0.88,
+        "symbol": "<arc_swap::strategy::hybrid::HybridStrategy<arc_swap::strategy::hybrid::DefaultConfig> as arc_swap::strategy::sealed::InnerStrategy<alloc::sync::Arc<kv_engine::mem_table::WriteProfile>>>::load::{closure#0}"
+      },
+      {
+        "percent": 0.88,
+        "symbol": "<kv_engine::lsm_storage::LsmStorageInner>::put_with_lifecycle_admission"
+      },
+      {
+        "percent": 0.88,
+        "symbol": "<kv_engine::mvcc::LsmMvccInner>::write_wal_only"
+      },
+      {
+        "percent": 0.88,
+        "symbol": "<kv_engine::wal::parallel_runtime::BufferBudget>::reserve"
+      },
+      {
+        "percent": 0.88,
+        "symbol": "<kv_engine::wal::parallel_worker::IoWorkerClient<kv_engine::wal::parallel_runtime::ParallelBuffer>>::submit_group"
+      },
+      {
+        "percent": 0.88,
+        "symbol": "<tokio::sync::notify::Notify>::notify_waiters"
+      },
+      {
+        "percent": 0.88,
+        "symbol": "crc32fast::specialized::pclmulqdq::calculate"
+      },
+      {
+        "percent": 0.88,
+        "symbol": "sha2::sha256::x86::digest_blocks"
+      },
+      {
+        "percent": 0.66,
+        "symbol": "<arc_swap::strategy::hybrid::HybridStrategy<arc_swap::strategy::hybrid::DefaultConfig> as arc_swap::strategy::sealed::InnerStrategy<core::option::Option<alloc::sync::Arc<kv_engine::mem_table::WriteProfile>>>>::load::{closure#0}"
+      },
+      {
+        "percent": 0.66,
+        "symbol": "<crossbeam_channel::flavors::list::Channel<kv_engine::wal::parallel_worker::WorkerCommand<kv_engine::wal::parallel_runtime::ParallelBuffer>>>::send"
+      },
+      {
+        "percent": 0.66,
+        "symbol": "<crossbeam_channel::waker::SyncWaker>::notify"
+      },
+      {
+        "percent": 0.66,
+        "symbol": "<kv_engine::wal::parallel_worker::WorkerCore<kv_engine::wal::parallel_runtime::ParallelBuffer>>::assert_invariants"
+      },
+      {
+        "percent": 0.66,
+        "symbol": "<parking_lot::condvar::Condvar>::notify_all_slow"
+      },
+      {
+        "percent": 0.66,
+        "symbol": "kv_engine::wal::parallel_runtime::pack_admitted_groups"
+      },
+      {
+        "percent": 0.66,
+        "symbol": "malloc"
+      },
+      {
+        "percent": 0.66,
+        "symbol": "0x000000000016c580"
+      },
+      {
+        "percent": 0.66,
+        "symbol": "0x000000000016c591"
+      }
+    ],
+    "files": {
+      "target/wal-opt/20261027-v7-ssd-sync-preparation/v4-point8.perf.data": "0c1e9b7979a0deff9cca99b43c0c35aed66095adf2a0e26ede2c1c4d26b461bf",
+      "target/wal-opt/20261027-v7-ssd-sync-preparation/v4-point8.stdout": "214280112683b70ccccc2be7c7f61c4b23439ba3fa699269694b9fa481efb0da",
+      "target/wal-opt/20261027-v7-ssd-sync-preparation/v4-point8.stderr": "7171f6f0c1a6fc660ca243e1afaf29e984b3f9dbc2b511d87e492a92613991ef",
+      "target/wal-opt/20261027-v7-ssd-sync-preparation/v4-point8-flat.txt": "018db8ebae169cc7a0dd3aeb24e85957d974fd466f06955ee9e3fa6c7fbfddac"
+    }
+  },
+  {
+    "cell": "v7-point8",
+    "run_id": "1793066606062",
+    "excluded_from_scoring": true,
+    "binary": {
+      "path": "target/release/write-perf-v7-serial-startup",
+      "sha256": "e7f7712825d2166c14b5b67601388a8e29697f8fc034832e457061cf6e30ae19"
+    },
+    "command": [
+      "perf",
+      "record",
+      "-e",
+      "cpu-clock:u",
+      "-F",
+      "99",
+      "--call-graph",
+      "dwarf,16384",
+      "-o",
+      "/home/liu/proj/toy-kv-engine/target/wal-opt/20261027-v7-ssd-sync-preparation/v7-point8.perf.data",
+      "--",
+      "/home/liu/proj/toy-kv-engine/target/release/write-perf-v7-serial-startup",
+      "--suite",
+      "legacy",
+      "--preset",
+      "smoke",
+      "--wal",
+      "--bench",
+      "wal_concurrent",
+      "--num",
+      "100000",
+      "--threads",
+      "8",
+      "--value-size",
+      "1024",
+      "--target-sst-size",
+      "2147483648",
+      "--latency-sample-every",
+      "100",
+      "--output",
+      "json",
+      "--wal-io-mode",
+      "parallel",
+      "--profile",
+      "--path",
+      "/home/liu/proj/toy-kv-engine/target/wal-opt/20261027-v7-ssd-sync-preparation/v7-point8-profile-db",
+      "--pitr",
+      "--pitr-format",
+      "v7"
+    ],
+    "audit": {
+      "benchmark_pid": 3801674,
+      "returncode": 0,
+      "sample_period_seconds": 1,
+      "before": {
+        "time_utc": "2026-10-27T02:03:26.048375+00:00",
+        "competing": [],
+        "load_average": [
+          0.26513671875,
+          0.1875,
+          0.3369140625
+        ],
+        "cpu_jiffies": [
+          17319799,
+          4949,
+          7810921,
+          6317432397,
+          3009546,
+          1125893,
+          1394584,
+          0,
+          0,
+          0
+        ]
+      },
+      "during": [
+        {
+          "time_utc": "2026-10-27T02:03:26.065068+00:00",
+          "competing": [],
+          "load_average": [
+            0.26513671875,
+            0.1875,
+            0.3369140625
+          ],
+          "cpu_jiffies": [
+            17319801,
+            4949,
+            7810922,
+            6317432447,
+            3009546,
+            1125893,
+            1394584,
+            0,
+            0,
+            0
+          ]
+        },
+        {
+          "time_utc": "2026-10-27T02:03:27.087534+00:00",
+          "competing": [],
+          "load_average": [
+            0.26513671875,
+            0.1875,
+            0.3369140625
+          ],
+          "cpu_jiffies": [
+            17319851,
+            4949,
+            7810941,
+            6317435584,
+            3009598,
+            1125896,
+            1394587,
+            0,
+            0,
+            0
+          ]
+        },
+        {
+          "time_utc": "2026-10-27T02:03:28.110219+00:00",
+          "competing": [],
+          "load_average": [
+            0.26513671875,
+            0.1875,
+            0.3369140625
+          ],
+          "cpu_jiffies": [
+            17319898,
+            4949,
+            7810959,
+            6317438735,
+            3009639,
+            1125899,
+            1394588,
+            0,
+            0,
+            0
+          ]
+        },
+        {
+          "time_utc": "2026-10-27T02:03:29.126382+00:00",
+          "competing": [],
+          "load_average": [
+            0.26513671875,
+            0.1875,
+            0.3369140625
+          ],
+          "cpu_jiffies": [
+            17319947,
+            4949,
+            7810980,
+            6317441869,
+            3009678,
+            1125902,
+            1394590,
+            0,
+            0,
+            0
+          ]
+        },
+        {
+          "time_utc": "2026-10-27T02:03:30.140957+00:00",
+          "competing": [],
+          "load_average": [
+            0.24365234375,
+            0.18408203125,
+            0.3349609375
+          ],
+          "cpu_jiffies": [
+            17319997,
+            4949,
+            7810996,
+            6317444985,
+            3009730,
+            1125905,
+            1394592,
+            0,
+            0,
+            0
+          ]
+        },
+        {
+          "time_utc": "2026-10-27T02:03:31.161381+00:00",
+          "competing": [],
+          "load_average": [
+            0.24365234375,
+            0.18408203125,
+            0.3349609375
+          ],
+          "cpu_jiffies": [
+            17320051,
+            4949,
+            7811011,
+            6317448133,
+            3009764,
+            1125908,
+            1394594,
+            0,
+            0,
+            0
+          ]
+        },
+        {
+          "time_utc": "2026-10-27T02:03:32.182056+00:00",
+          "competing": [],
+          "load_average": [
+            0.24365234375,
+            0.18408203125,
+            0.3349609375
+          ],
+          "cpu_jiffies": [
+            17320089,
+            4949,
+            7811029,
+            6317451267,
+            3009817,
+            1125910,
+            1394595,
+            0,
+            0,
+            0
+          ]
+        },
+        {
+          "time_utc": "2026-10-27T02:03:33.200679+00:00",
+          "competing": [],
+          "load_average": [
+            0.24365234375,
+            0.18408203125,
+            0.3349609375
+          ],
+          "cpu_jiffies": [
+            17320133,
+            4949,
+            7811045,
+            6317454390,
+            3009882,
+            1125913,
+            1394597,
+            0,
+            0,
+            0
+          ]
+        },
+        {
+          "time_utc": "2026-10-27T02:03:34.218710+00:00",
+          "competing": [],
+          "load_average": [
+            0.3046875,
+            0.19775390625,
+            0.3388671875
+          ],
+          "cpu_jiffies": [
+            17320193,
+            4949,
+            7811072,
+            6317457490,
+            3009934,
+            1125918,
+            1394599,
+            0,
+            0,
+            0
+          ]
+        },
+        {
+          "time_utc": "2026-10-27T02:03:35.239065+00:00",
+          "competing": [],
+          "load_average": [
+            0.3046875,
+            0.19775390625,
+            0.3388671875
+          ],
+          "cpu_jiffies": [
+            17320297,
+            4949,
+            7811116,
+            6317460529,
+            3009989,
+            1125924,
+            1394601,
+            0,
+            0,
+            0
+          ]
+        },
+        {
+          "time_utc": "2026-10-27T02:03:36.261151+00:00",
+          "competing": [],
+          "load_average": [
+            0.3046875,
+            0.19775390625,
+            0.3388671875
+          ],
+          "cpu_jiffies": [
+            17320388,
+            4949,
+            7811159,
+            6317463580,
+            3010044,
+            1125931,
+            1394603,
+            0,
+            0,
+            0
+          ]
+        },
+        {
+          "time_utc": "2026-10-27T02:03:37.277631+00:00",
+          "competing": [],
+          "load_average": [
+            0.3046875,
+            0.19775390625,
+            0.3388671875
+          ],
+          "cpu_jiffies": [
+            17320457,
+            4949,
+            7811201,
+            6317466612,
+            3010098,
+            1125937,
+            1394605,
+            0,
+            0,
+            0
+          ]
+        }
+      ],
+      "after": {
+        "time_utc": "2026-10-27T02:03:37.916005+00:00",
+        "competing": [],
+        "load_average": [
+          0.3046875,
+          0.19775390625,
+          0.3388671875
+        ],
+        "cpu_jiffies": [
+          17320502,
+          4949,
+          7811223,
+          6317468531,
+          3010127,
+          1125941,
+          1394606,
+          0,
+          0,
+          0
+        ]
+      },
+      "sampling_errors": []
+    },
+    "samples": 492,
+    "lost_samples": 0,
+    "symbols": [
+      {
+        "percent": 11.18,
+        "symbol": "<crossbeam_channel::flavors::array::Channel<bool>>::recv"
+      },
+      {
+        "percent": 8.33,
+        "symbol": "<kv_engine::mvcc::LsmMvccInner>::publish_commit_ts"
+      },
+      {
+        "percent": 5.28,
+        "symbol": "<crossbeam_channel::flavors::list::Channel<kv_engine::wal::parallel_worker::GroupWriteResult>>::recv"
+      },
+      {
+        "percent": 3.46,
+        "symbol": "<parking_lot::raw_mutex::RawMutex>::lock_slow"
+      },
+      {
+        "percent": 3.25,
+        "symbol": "<crossbeam_channel::flavors::list::Channel<kv_engine::wal::parallel_worker::WorkerCommand<kv_engine::wal::parallel_runtime::ParallelBuffer>>>::recv"
+      },
+      {
+        "percent": 3.05,
+        "symbol": "syscall"
+      },
+      {
+        "percent": 2.85,
+        "symbol": "sha2::sha256::x86::digest_blocks"
+      },
+      {
+        "percent": 2.24,
+        "symbol": "__vdso_clock_gettime"
+      },
+      {
+        "percent": 2.03,
+        "symbol": "<crossbeam_skiplist::base::SkipList<bytes::bytes::Bytes, bytes::bytes::Bytes>>::search_position::<bytes::bytes::Bytes>"
+      },
+      {
+        "percent": 2.03,
+        "symbol": "kv_engine::wal::parallel_worker::run_worker::<kv_engine::wal::parallel_runtime::ParallelBuffer>"
+      },
+      {
+        "percent": 1.83,
+        "symbol": "<kv_engine::mem_table::MemTable>::publish_raw_batch"
+      },
+      {
+        "percent": 1.83,
+        "symbol": "<kv_engine::wal::parallel_runtime::ParallelWalRuntime>::prepare_v7_batch"
+      },
+      {
+        "percent": 1.83,
+        "symbol": "kv_engine::wal::parallel_runtime::pack_admitted_groups"
+      },
+      {
+        "percent": 1.63,
+        "symbol": "sha2::sha256::x86::digest_blocks"
+      },
+      {
+        "percent": 1.42,
+        "symbol": "<kv_engine::lsm_storage::LsmStorageInner>::put_with_lifecycle_admission"
+      },
+      {
+        "percent": 1.42,
+        "symbol": "crc32fast::baseline::update_fast_16"
+      },
+      {
+        "percent": 1.22,
+        "symbol": "<kv_engine::lsm_storage::LsmStorageInner>::maybe_queue_pitr_maintenance"
+      },
+      {
+        "percent": 1.22,
+        "symbol": "<kv_engine::mvcc::LsmMvccInner>::write_wal_only"
+      },
+      {
+        "percent": 1.02,
+        "symbol": "<kv_engine::mem_table::MemTable>::commit_wal_ticket"
+      },
+      {
+        "percent": 1.02,
+        "symbol": "<kv_engine::mem_table::MemTable>::write_prepared_v7_pitr_wal_batch_only"
+      },
+      {
+        "percent": 1.02,
+        "symbol": "<parking_lot::condvar::Condvar>::wait_until_internal"
+      },
+      {
+        "percent": 1.02,
+        "symbol": "0x000000000016c591"
+      },
+      {
+        "percent": 1.02,
+        "symbol": "0x00000000000a5ffc"
+      },
+      {
+        "percent": 0.81,
+        "symbol": "<kv_engine::wal::v7::admission::WalV7OwnedBatchReservation>::release_unused_frontier_credit"
+      },
+      {
+        "percent": 0.81,
+        "symbol": "<kv_engine::wal::v7::admission::WalV7ReservationOwner>::reserve_batch"
+      },
+      {
+        "percent": 0.81,
+        "symbol": "<kv_engine::wal::v7::allocator::WalV7PhysicalAllocator>::data_reservation_bounds"
+      },
+      {
+        "percent": 0.81,
+        "symbol": "<parking_lot::raw_mutex::RawMutex>::lock_slow"
+      },
+      {
+        "percent": 0.81,
+        "symbol": "crc32fast::specialized::pclmulqdq::calculate"
+      },
+      {
+        "percent": 0.81,
+        "symbol": "crc32fast::specialized::pclmulqdq::calculate"
+      },
+      {
+        "percent": 0.81,
+        "symbol": "0x00000000000a5fdc"
+      },
+      {
+        "percent": 0.61,
+        "symbol": "<alloc::collections::btree::map::BTreeMap<u64, alloc::collections::btree::set_val::SetValZST>>::insert"
+      },
+      {
+        "percent": 0.61,
+        "symbol": "<core::hash::sip::Hasher<core::hash::sip::Sip13Rounds> as core::hash::Hasher>::write"
+      },
+      {
+        "percent": 0.61,
+        "symbol": "<kv_engine::wal::parallel_runtime::ParallelWalRuntime>::allocate_v7_buffer"
+      },
+      {
+        "percent": 0.61,
+        "symbol": "<parking_lot::condvar::Condvar>::notify_all_slow"
+      },
+      {
+        "percent": 0.61,
+        "symbol": "<parking_lot::raw_mutex::RawMutex>::unlock_slow"
+      },
+      {
+        "percent": 0.61,
+        "symbol": "<std::hash::random::RandomState as core::hash::BuildHasher>::hash_one::<&kv_engine::wal::parallel_worker::RequestId>"
+      },
+      {
+        "percent": 0.61,
+        "symbol": "<std::path::Components as core::iter::traits::double_ended::DoubleEndedIterator>::next_back"
+      },
+      {
+        "percent": 0.61,
+        "symbol": "core::ptr::drop_glue::<kv_engine::wal::parallel_runtime::ParallelBuffer>"
+      },
+      {
+        "percent": 0.61,
+        "symbol": "crc32fast::baseline::update_fast_16"
+      },
+      {
+        "percent": 0.61,
+        "symbol": "kv_engine::wal::parallel_runtime::synchronize_written_prefix"
+      },
+      {
+        "percent": 0.61,
+        "symbol": "malloc"
+      },
+      {
+        "percent": 0.61,
+        "symbol": "0x00000000000a481c"
+      }
+    ],
+    "files": {
+      "target/wal-opt/20261027-v7-ssd-sync-preparation/v7-point8.perf.data": "94b0b4e83695606db8bbace8f93900577960d99a2a3e686055fa42b1fa102a14",
+      "target/wal-opt/20261027-v7-ssd-sync-preparation/v7-point8.stdout": "9d278a2e450935884c206f9efd98ca1365330e6ad8a42d9946fe3626d88cbfa7",
+      "target/wal-opt/20261027-v7-ssd-sync-preparation/v7-point8.stderr": "73afe55bbc692d0b1a7bf55e747adfe2d0999752b332b6e44965b30c538654ad",
+      "target/wal-opt/20261027-v7-ssd-sync-preparation/v7-point8-flat.txt": "d9c432e979f3943842a3355a736a83dda0edf088d128004b5620cfd3b8c64d20"
+    }
+  },
+  {
+    "cell": "v7-batch8",
+    "run_id": "1793066618016",
+    "excluded_from_scoring": true,
+    "binary": {
+      "path": "target/release/write-perf-v7-serial-startup",
+      "sha256": "e7f7712825d2166c14b5b67601388a8e29697f8fc034832e457061cf6e30ae19"
+    },
+    "command": [
+      "perf",
+      "record",
+      "-e",
+      "cpu-clock:u",
+      "-F",
+      "99",
+      "--call-graph",
+      "dwarf,16384",
+      "-o",
+      "/home/liu/proj/toy-kv-engine/target/wal-opt/20261027-v7-ssd-sync-preparation/v7-batch8.perf.data",
+      "--",
+      "/home/liu/proj/toy-kv-engine/target/release/write-perf-v7-serial-startup",
+      "--suite",
+      "legacy",
+      "--preset",
+      "smoke",
+      "--wal",
+      "--bench",
+      "wal_batch_concurrent",
+      "--num",
+      "750000",
+      "--threads",
+      "8",
+      "--value-size",
+      "1024",
+      "--target-sst-size",
+      "2147483648",
+      "--latency-sample-every",
+      "10",
+      "--output",
+      "json",
+      "--wal-io-mode",
+      "parallel",
+      "--profile",
+      "--path",
+      "/home/liu/proj/toy-kv-engine/target/wal-opt/20261027-v7-ssd-sync-preparation/v7-batch8-profile-db",
+      "--wal-batch-size",
+      "64",
+      "--pitr",
+      "--pitr-format",
+      "v7"
+    ],
+    "audit": {
+      "benchmark_pid": 3801732,
+      "returncode": 0,
+      "sample_period_seconds": 1,
+      "before": {
+        "time_utc": "2026-10-27T02:03:37.997999+00:00",
+        "competing": [],
+        "load_average": [
+          0.3046875,
+          0.19775390625,
+          0.3388671875
+        ],
+        "cpu_jiffies": [
+          17320510,
+          4949,
+          7811225,
+          6317468783,
+          3010127,
+          1125941,
+          1394607,
+          0,
+          0,
+          0
+        ]
+      },
+      "during": [
+        {
+          "time_utc": "2026-10-27T02:03:38.016034+00:00",
+          "competing": [],
+          "load_average": [
+            0.3046875,
+            0.19775390625,
+            0.3388671875
+          ],
+          "cpu_jiffies": [
+            17320512,
+            4949,
+            7811227,
+            6317468837,
+            3010127,
+            1125941,
+            1394607,
+            0,
+            0,
+            0
+          ]
+        },
+        {
+          "time_utc": "2026-10-27T02:03:39.035345+00:00",
+          "competing": [],
+          "load_average": [
+            0.3046875,
+            0.19775390625,
+            0.3388671875
+          ],
+          "cpu_jiffies": [
+            17320650,
+            4949,
+            7811267,
+            6317471849,
+            3010186,
+            1125945,
+            1394609,
+            0,
+            0,
+            0
+          ]
+        },
+        {
+          "time_utc": "2026-10-27T02:03:40.056121+00:00",
+          "competing": [],
+          "load_average": [
+            0.76123046875,
+            0.29443359375,
+            0.36962890625
+          ],
+          "cpu_jiffies": [
+            17320724,
+            4949,
+            7811291,
+            6317474924,
+            3010261,
+            1125949,
+            1394611,
+            0,
+            0,
+            0
+          ]
+        },
+        {
+          "time_utc": "2026-10-27T02:03:41.075399+00:00",
+          "competing": [],
+          "load_average": [
+            0.76123046875,
+            0.29443359375,
+            0.36962890625
+          ],
+          "cpu_jiffies": [
+            17320806,
+            4949,
+            7811319,
+            6317477991,
+            3010334,
+            1125952,
+            1394613,
+            0,
+            0,
+            0
+          ]
+        },
+        {
+          "time_utc": "2026-10-27T02:03:42.097205+00:00",
+          "competing": [],
+          "load_average": [
+            0.76123046875,
+            0.29443359375,
+            0.36962890625
+          ],
+          "cpu_jiffies": [
+            17320873,
+            4949,
+            7811348,
+            6317481064,
+            3010410,
+            1125955,
+            1394615,
+            0,
+            0,
+            0
+          ]
+        },
+        {
+          "time_utc": "2026-10-27T02:03:43.116161+00:00",
+          "competing": [],
+          "load_average": [
+            0.76123046875,
+            0.29443359375,
+            0.36962890625
+          ],
+          "cpu_jiffies": [
+            17320953,
+            4949,
+            7811374,
+            6317484130,
+            3010485,
+            1125959,
+            1394618,
+            0,
+            0,
+            0
+          ]
+        },
+        {
+          "time_utc": "2026-10-27T02:03:44.138139+00:00",
+          "competing": [],
+          "load_average": [
+            0.76123046875,
+            0.29443359375,
+            0.36962890625
+          ],
+          "cpu_jiffies": [
+            17321026,
+            4949,
+            7811403,
+            6317487208,
+            3010558,
+            1125962,
+            1394620,
+            0,
+            0,
+            0
+          ]
+        },
+        {
+          "time_utc": "2026-10-27T02:03:45.162737+00:00",
+          "competing": [],
+          "load_average": [
+            0.86083984375,
+            0.32275390625,
+            0.37841796875
+          ],
+          "cpu_jiffies": [
+            17321099,
+            4949,
+            7811430,
+            6317490289,
+            3010633,
+            1125965,
+            1394622,
+            0,
+            0,
+            0
+          ]
+        },
+        {
+          "time_utc": "2026-10-27T02:03:46.186088+00:00",
+          "competing": [],
+          "load_average": [
+            0.86083984375,
+            0.32275390625,
+            0.37841796875
+          ],
+          "cpu_jiffies": [
+            17321169,
+            4949,
+            7811456,
+            6317493382,
+            3010700,
+            1125969,
+            1394624,
+            0,
+            0,
+            0
+          ]
+        }
+      ],
+      "after": {
+        "time_utc": "2026-10-27T02:03:46.639847+00:00",
+        "competing": [],
+        "load_average": [
+          0.86083984375,
+          0.32275390625,
+          0.37841796875
+        ],
+        "cpu_jiffies": [
+          17321192,
+          4949,
+          7811469,
+          6317494765,
+          3010719,
+          1125970,
+          1394625,
+          0,
+          0,
+          0
+        ]
+      },
+      "sampling_errors": []
+    },
+    "samples": 482,
+    "lost_samples": 0,
+    "symbols": [
+      {
+        "percent": 19.29,
+        "symbol": "sha2::sha256::x86::digest_blocks"
+      },
+      {
+        "percent": 6.02,
+        "symbol": "__vdso_clock_gettime"
+      },
+      {
+        "percent": 5.6,
+        "symbol": "<crossbeam_skiplist::base::SkipList<bytes::bytes::Bytes, bytes::bytes::Bytes>>::search_position::<bytes::bytes::Bytes>"
+      },
+      {
+        "percent": 4.98,
+        "symbol": "0x00000000000a5fdc"
+      },
+      {
+        "percent": 4.77,
+        "symbol": "<kv_engine::mvcc::LsmMvccInner>::publish_commit_ts"
+      },
+      {
+        "percent": 4.15,
+        "symbol": "<kv_engine::mem_table::MemTable>::publish_raw_batch"
+      },
+      {
+        "percent": 2.07,
+        "symbol": "<crossbeam_skiplist::base::SkipList<bytes::bytes::Bytes, bytes::bytes::Bytes>>::insert_internal::<<crossbeam_skiplist::base::SkipList<bytes::bytes::Bytes, bytes::bytes::Bytes>>::insert::{closure#0}, <crossbeam_skiplist::base::SkipList<bytes::bytes::Bytes, bytes::bytes::Bytes>>::insert::{closure#1}>"
+      },
+      {
+        "percent": 2.07,
+        "symbol": "crc32fast::baseline::update_fast_16"
+      },
+      {
+        "percent": 2.07,
+        "symbol": "0x000000000016c887"
+      },
+      {
+        "percent": 1.87,
+        "symbol": "0x00000000000a481c"
+      },
+      {
+        "percent": 1.87,
+        "symbol": "0x00000000000a5ffc"
+      },
+      {
+        "percent": 1.66,
+        "symbol": "<crossbeam_channel::flavors::array::Channel<bool>>::recv"
+      },
+      {
+        "percent": 1.45,
+        "symbol": "crc32fast::specialized::pclmulqdq::calculate"
+      },
+      {
+        "percent": 1.45,
+        "symbol": "syscall"
+      },
+      {
+        "percent": 1.45,
+        "symbol": "0x000000000016d053"
+      },
+      {
+        "percent": 1.24,
+        "symbol": "malloc"
+      },
+      {
+        "percent": 1.04,
+        "symbol": "<crossbeam_skiplist::map::Entry<bytes::bytes::Bytes, bytes::bytes::Bytes> as core::ops::drop::Drop>::drop"
+      },
+      {
+        "percent": 1.04,
+        "symbol": "cfree"
+      },
+      {
+        "percent": 1.04,
+        "symbol": "0x00000000000a4809"
+      },
+      {
+        "percent": 0.83,
+        "symbol": "<core::slice::iter::Iter<kv_engine::pitr::WalEntry> as core::iter::traits::iterator::Iterator>::try_fold::<(), <core::iter::adapters::enumerate::Enumerate<_> as core::iter::traits::iterator::Iterator>::try_fold::enumerate<&kv_engine::pitr::WalEntry, (), core::ops::control_flow::ControlFlow<&kv_engine::pitr::WalEntry>, core::iter::traits::iterator::Iterator::find_map::check<(usize, &kv_engine::pitr::WalEntry), &kv_engine::pitr::WalEntry, &mut <kv_engine::pitr::CanonicalWalEntryStream>::entries::{closure#0}>::{closure#0}>::{closure#0}, core::ops::control_flow::ControlFlow<&kv_engine::pitr::WalEntry>>"
+      },
+      {
+        "percent": 0.83,
+        "symbol": "<crossbeam_channel::flavors::list::Channel<kv_engine::wal::parallel_worker::GroupWriteResult>>::recv"
+      },
+      {
+        "percent": 0.83,
+        "symbol": "<crossbeam_channel::flavors::list::Channel<kv_engine::wal::parallel_worker::WorkerCommand<kv_engine::wal::parallel_runtime::ParallelBuffer>>>::recv"
+      },
+      {
+        "percent": 0.83,
+        "symbol": "crc32fast::baseline::update_fast_16"
+      },
+      {
+        "percent": 0.83,
+        "symbol": "0x000000000016d053"
+      },
+      {
+        "percent": 0.83,
+        "symbol": "0x00000000000a5c25"
+      },
+      {
+        "percent": 0.83,
+        "symbol": "0x000000000016c119"
+      },
+      {
+        "percent": 0.83,
+        "symbol": "0x000000000016c11d"
+      },
+      {
+        "percent": 0.62,
+        "symbol": "<bytes::bytes::Bytes as core::convert::From<alloc::vec::Vec<u8>>>::from"
+      },
+      {
+        "percent": 0.62,
+        "symbol": "<kv_engine::lsm_storage::LsmStorageInner>::write_batch_with_lifecycle_admission::<&[u8]>"
+      },
+      {
+        "percent": 0.62,
+        "symbol": "<parking_lot::condvar::Condvar>::wait_until_internal"
+      },
+      {
+        "percent": 0.62,
+        "symbol": "<std::sys::pal::unix::time::Timespec>::sub_timespec"
+      },
+      {
+        "percent": 0.62,
+        "symbol": "bytes::bytes::shared_drop"
+      },
+      {
+        "percent": 0.62,
+        "symbol": "clock_gettime"
+      },
+      {
+        "percent": 0.62,
+        "symbol": "kv_engine::pitr::write_entry_into"
+      },
+      {
+        "percent": 0.62,
+        "symbol": "0x000000000016bf08"
+      }
+    ],
+    "files": {
+      "target/wal-opt/20261027-v7-ssd-sync-preparation/v7-batch8.perf.data": "d6101364dd644b025504e4ff4357ecb07c5f0a1a7a4e67366b8d321905e91027",
+      "target/wal-opt/20261027-v7-ssd-sync-preparation/v7-batch8.stdout": "3e5b1a8cffcc071ed7531a45a9d8c0f58b9a93fc1a76e81a3635b4c1d5ab00aa",
+      "target/wal-opt/20261027-v7-ssd-sync-preparation/v7-batch8.stderr": "579d01c5754957e549a9801faa1dcc50a03aa5a40e6845476a605a67ced64842",
+      "target/wal-opt/20261027-v7-ssd-sync-preparation/v7-batch8-flat.txt": "ee59a80e1768032a021664e5908da3f4e776c2c5741a38da9853b67a521e1a2c"
+    }
+  }
+]

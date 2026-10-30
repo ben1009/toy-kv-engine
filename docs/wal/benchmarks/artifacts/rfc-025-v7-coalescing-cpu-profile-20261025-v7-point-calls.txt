@@ -1,0 +1,310 @@
+# To display the perf.data header info, please use --header/--header-only options.
+#
+#
+# Total Lost Samples: 0
+#
+# Samples: 1K of event 'cpu-clock:u'
+# Event count (approx.): 1744232651
+#
+# Children      Self  Command          Shared Object                       Symbol
+# ........  ........  ...............  ..................................  ...........................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................
+#
+    10.01%     9.49%  wal-sync-coordi  write-perf-v7-preparation-coalesce  [.] <crossbeam_channel::flavors::list::Channel<kv_engine::wal::parallel_worker::GroupWriteResult>>::recv
+            |
+             --6.96%--<crossbeam_channel::flavors::list::Channel<kv_engine::wal::parallel_worker::GroupWriteResult>>::recv
+
+     8.74%     8.45%  wal-ordered-pac  write-perf-v7-preparation-coalesce  [.] <crossbeam_channel::flavors::array::Channel<bool>>::recv
+     5.81%     1.50%  write-perf-v7-p  write-perf-v7-preparation-coalesce  [.] <std::thread::local::LocalKey<core::cell::RefCell<alloc::vec::Vec<u8>>>>::with::<<kv_engine::mem_table::MemTable>::publish_raw_batch::{closure#0}, ()>
+            |
+            ---<std::thread::local::LocalKey<core::cell::RefCell<alloc::vec::Vec<u8>>>>::with::<<kv_engine::mem_table::MemTable>::publish_raw_batch::{closure#0}, ()>
+               |
+               |--1.38%--<std::time::Instant>::elapsed
+               |          |
+               |           --1.32%--<std::sys::pal::unix::time::Timespec>::now
+               |                     clock_gettime
+               |                     |
+               |                      --1.27%--__vdso_clock_gettime
+               |
+                --1.27%--<std::sys::pal::unix::time::Timespec>::now
+                          |
+                           --1.15%--clock_gettime
+                                     |
+                                      --1.09%--__vdso_clock_gettime
+
+     5.41%     0.23%  write-perf-v7-p  write-perf-v7-preparation-coalesce  [.] <std::sys::pal::unix::time::Timespec>::now
+            |
+             --5.23%--<std::sys::pal::unix::time::Timespec>::now
+                       |
+                       |--4.20%--clock_gettime
+                       |          |
+                       |           --3.97%--__vdso_clock_gettime
+                       |
+                        --0.98%--kv_engine::key::decode_user_key_into
+
+     5.29%     0.23%  write-perf-v7-p  libc.so.6                           [.] clock_gettime
+            |
+             --5.06%--clock_gettime
+                       |
+                       |--3.97%--__vdso_clock_gettime
+                       |
+                        --0.98%--<std::sys::pal::unix::time::Timespec>::now
+                                  kv_engine::key::decode_user_key_into
+
+     4.77%     4.77%  write-perf-v7-p  write-perf-v7-preparation-coalesce  [.] <kv_engine::mvcc::LsmMvccInner>::publish_commit_ts
+            |
+             --4.60%--pthread_getattr_np
+                       <kv_engine::mvcc::LsmMvccInner>::publish_commit_ts
+
+     4.77%     3.91%  write-perf-v7-p  write-perf-v7-preparation-coalesce  [.] <parking_lot::raw_mutex::RawMutex>::lock_slow
+            |
+             --4.43%--<parking_lot::raw_mutex::RawMutex>::lock_slow
+                       |
+                        --0.86%--__sched_yield
+
+     4.66%     0.17%  wal-io-worker    write-perf-v7-preparation-coalesce  [.] kv_engine::wal::parallel_worker::process_worker_events::<kv_engine::wal::parallel_runtime::ParallelBuffer>
+            |
+             --4.60%--kv_engine::wal::parallel_worker::process_worker_events::<kv_engine::wal::parallel_runtime::ParallelBuffer>
+                       |
+                        --4.03%--<crossbeam_channel::flavors::list::Channel<kv_engine::wal::parallel_worker::WorkerCommand<kv_engine::wal::parallel_runtime::ParallelBuffer>>>::recv
+
+     4.60%     0.00%  write-perf-v7-p  libc.so.6                           [.] pthread_getattr_np
+            |
+            ---pthread_getattr_np
+               <kv_engine::mvcc::LsmMvccInner>::publish_commit_ts
+
+     4.08%     4.03%  wal-io-worker    write-perf-v7-preparation-coalesce  [.] <crossbeam_channel::flavors::list::Channel<kv_engine::wal::parallel_worker::WorkerCommand<kv_engine::wal::parallel_runtime::ParallelBuffer>>>::recv
+            |
+             --3.97%--kv_engine::wal::parallel_worker::process_worker_events::<kv_engine::wal::parallel_runtime::ParallelBuffer>
+                       <crossbeam_channel::flavors::list::Channel<kv_engine::wal::parallel_worker::WorkerCommand<kv_engine::wal::parallel_runtime::ParallelBuffer>>>::recv
+
+     3.97%     3.97%  write-perf-v7-p  [vdso]                              [.] __vdso_clock_gettime
+            |
+             --2.36%--<std::thread::local::LocalKey<core::cell::RefCell<alloc::vec::Vec<u8>>>>::with::<<kv_engine::mem_table::MemTable>::publish_raw_batch::{closure#0}, ()>
+                       |
+                       |--1.27%--<std::time::Instant>::elapsed
+                       |          <std::sys::pal::unix::time::Timespec>::now
+                       |          clock_gettime
+                       |          __vdso_clock_gettime
+                       |
+                        --1.09%--<std::sys::pal::unix::time::Timespec>::now
+                                  clock_gettime
+                                  __vdso_clock_gettime
+
+     3.22%     3.22%  wal-ordered-pac  write-perf-v7-preparation-coalesce  [.] sha2::sha256::x86::digest_blocks
+            |
+             --1.15%--sha2::sha256::x86::digest_blocks
+
+     2.59%     2.07%  write-perf-v7-p  write-perf-v7-preparation-coalesce  [.] <kv_engine::lsm_storage::LsmStorageInner>::maybe_queue_pitr_maintenance
+            |
+            ---<kv_engine::lsm_storage::LsmStorageInner>::maybe_queue_pitr_maintenance
+
+     2.47%     1.32%  write-perf-v7-p  write-perf-v7-preparation-coalesce  [.] <crossbeam_skiplist::base::SkipList<bytes::bytes::Bytes, bytes::bytes::Bytes>>::search_position::<bytes::bytes::Bytes>
+            |
+            ---<crossbeam_skiplist::base::SkipList<bytes::bytes::Bytes, bytes::bytes::Bytes>>::search_position::<bytes::bytes::Bytes>
+
+     2.36%     1.55%  wal-io-worker    write-perf-v7-preparation-coalesce  [.] kv_engine::wal::parallel_worker::run_worker::<kv_engine::wal::parallel_runtime::ParallelBuffer>
+            |
+             --1.61%--kv_engine::wal::parallel_worker::run_worker::<kv_engine::wal::parallel_runtime::ParallelBuffer>
+
+     2.13%     0.12%  write-perf-v7-p  write-perf-v7-preparation-coalesce  [.] <std::time::Instant>::elapsed
+            |
+             --2.07%--<std::time::Instant>::elapsed
+                       |
+                        --2.01%--<std::sys::pal::unix::time::Timespec>::now
+                                  |
+                                   --1.96%--clock_gettime
+                                             |
+                                              --1.84%--__vdso_clock_gettime
+
+     2.07%     2.07%  wal-sync-coordi  write-perf-v7-preparation-coalesce  [.] sha2::sha256::x86::digest_blocks
+     1.73%     0.00%  write-perf-v7-p  libc.so.6                           [.] 0x00007cad8bb7dfec
+            |
+            ---0x7cad8bb7dfec
+
+     1.61%     0.75%  wal-ordered-pac  write-perf-v7-preparation-coalesce  [.] kv_engine::wal::parallel_runtime::pack_admitted_groups
+            |
+             --0.98%--kv_engine::wal::parallel_runtime::pack_admitted_groups
+
+     1.61%     0.46%  write-perf-v7-p  write-perf-v7-preparation-coalesce  [.] <kv_engine::mvcc::LsmMvccInner>::write_wal_only
+            |
+             --1.32%--<kv_engine::mvcc::LsmMvccInner>::write_wal_only
+
+     1.55%     1.55%  wal-ordered-pac  write-perf-v7-preparation-coalesce  [.] crc32fast::baseline::update_fast_16
+            |
+             --0.86%--0x6ade0952
+                       crc32fast::baseline::update_fast_16
+
+     1.50%     1.50%  wal-ordered-pac  write-perf-v7-preparation-coalesce  [.] crc32fast::specialized::pclmulqdq::calculate
+            |
+            ---crc32fast::specialized::pclmulqdq::calculate
+
+     1.50%     0.00%  write-perf-v7-p  [unknown]                           [.] 0x0000000000001fff
+            |
+            ---0x1fff
+               |
+                --0.92%--<kv_engine::wal::v7::admission::WalV7ResourceLedger>::reserve_with_priority
+
+     1.38%     1.38%  write-perf-v7-p  write-perf-v7-preparation-coalesce  [.] <kv_engine::lsm_storage::LsmStorageInner>::put_with_lifecycle_admission
+            |
+             --0.86%--0x1007ffd5ebf528f
+                       <kv_engine::lsm_storage::LsmStorageInner>::put_with_lifecycle_admission
+
+     1.38%     0.00%  write-perf-v7-p  [unknown]                           [.] 0x000000000000fffe
+            |
+            ---0xfffe
+               |
+                --1.27%--<kv_engine::wal::parallel_runtime::ParallelWalRuntime>::put_v7_prepared_batch
+
+     1.32%     0.63%  write-perf-v7-p  write-perf-v7-preparation-coalesce  [.] <kv_engine::mem_table::MemTable>::commit_wal_ticket
+            |
+            ---<kv_engine::mem_table::MemTable>::commit_wal_ticket
+
+     1.27%     0.86%  write-perf-v7-p  write-perf-v7-preparation-coalesce  [.] <kv_engine::wal::parallel_runtime::ParallelWalRuntime>::put_v7_prepared_batch
+            |
+             --0.86%--0xfffe
+                       <kv_engine::wal::parallel_runtime::ParallelWalRuntime>::put_v7_prepared_batch
+
+     1.27%     0.58%  write-perf-v7-p  write-perf-v7-preparation-coalesce  [.] <parking_lot::condvar::Condvar>::wait_until_internal
+            |
+            ---<parking_lot::condvar::Condvar>::wait_until_internal
+
+     1.21%     1.21%  write-perf-v7-p  write-perf-v7-preparation-coalesce  [.] crc32fast::baseline::update_fast_16
+     1.15%     0.92%  write-perf-v7-p  write-perf-v7-preparation-coalesce  [.] kv_engine::key::decode_user_key_into
+            |
+             --0.86%--clock_gettime
+
+     1.15%     0.69%  write-perf-v7-p  write-perf-v7-preparation-coalesce  [.] <kv_engine::mem_table::MemTable>::write_prepared_v7_pitr_wal_batch_only
+            |
+             --0.92%--<kv_engine::mem_table::MemTable>::write_prepared_v7_pitr_wal_batch_only
+
+     1.15%     0.00%  wal-io-worker    write-perf-v7-preparation-coalesce  [.] std::sys::backtrace::__rust_begin_short_backtrace::<<kv_engine::wal::parallel_worker::IoWorker<kv_engine::wal::parallel_runtime::ParallelBuffer>>::spawn::{closure#0}, core::result::Result<(), anyhow::Error>>
+            |
+            ---std::sys::backtrace::__rust_begin_short_backtrace::<<kv_engine::wal::parallel_worker::IoWorker<kv_engine::wal::parallel_runtime::ParallelBuffer>>::spawn::{closure#0}, core::result::Result<(), anyhow::Error>>
+               std::sys::backtrace::__rust_begin_short_backtrace::<<kv_engine::wal::parallel_worker::IoWorker<kv_engine::wal::parallel_runtime::ParallelBuffer>>::spawn::{closure#0}, core::result::Result<(), anyhow::Error>>
+               kv_engine::wal::parallel_worker::run_worker::<kv_engine::wal::parallel_runtime::ParallelBuffer>
+
+     1.04%     1.04%  wal-sync-coordi  write-perf-v7-preparation-coalesce  [.] <kv_engine::wal::v7::admission::WalV7OwnedBatchReservation>::release_unused_frontier_credit
+            |
+            ---<kv_engine::wal::v7::admission::WalV7OwnedBatchReservation>::release_unused_frontier_credit
+
+     0.98%     0.98%  write-perf-v7-p  libc.so.6                           [.] syscall
+     0.98%     0.00%  write-perf-v7-p  write-perf-v7-preparation-coalesce  [.] <alloc::collections::btree::map::BTreeMap<_, _, _> as core::clone::Clone>::clone::clone_subtree::<u64, kv_engine::pitr::manifest::PitrObligation, alloc::alloc::Global>
+            |
+            ---<alloc::collections::btree::map::BTreeMap<_, _, _> as core::clone::Clone>::clone::clone_subtree::<u64, kv_engine::pitr::manifest::PitrObligation, alloc::alloc::Global>
+
+     0.98%     0.00%  write-perf-v7-p  [unknown]                           [.] 0x0000000000000400
+            |
+            ---0x400
+
+     0.92%     0.92%  write-perf-v7-p  libc.so.6                           [.] 0x00000000000a5fdc
+     0.92%     0.92%  write-perf-v7-p  write-perf-v7-preparation-coalesce  [.] <kv_engine::wal::parallel_runtime::ParallelWalRuntime>::prepare_v7_batch
+     0.92%     0.81%  write-perf-v7-p  write-perf-v7-preparation-coalesce  [.] <kv_engine::wal::v7::admission::WalV7ResourceLedger>::reserve_with_priority
+            |
+             --0.81%--0x1fff
+                       <kv_engine::wal::v7::admission::WalV7ResourceLedger>::reserve_with_priority
+
+     0.92%     0.40%  write-perf-v7-p  write-perf-v7-preparation-coalesce  [.] <kv_engine::wal::parallel_runtime::ParallelWalRuntime>::wait_durable
+            |
+            ---<kv_engine::wal::parallel_runtime::ParallelWalRuntime>::wait_durable
+
+     0.92%     0.23%  write-perf-v7-p  write-perf-v7-preparation-coalesce  [.] <bytes::bytes::Bytes as core::convert::From<alloc::vec::Vec<u8>>>::from
+            |
+             --0.86%--<bytes::bytes::Bytes as core::convert::From<alloc::vec::Vec<u8>>>::from
+
+     0.92%     0.00%  wal-ordered-pac  [unknown]                           [.] 0x000000006ade0952
+            |
+            ---0x6ade0952
+               |
+                --0.86%--crc32fast::baseline::update_fast_16
+
+     0.92%     0.00%  write-perf-v7-p  libc.so.6                           [.] 0x00007cad8bb7dfdc
+            |
+            ---0x7cad8bb7dfdc
+
+     0.86%     0.00%  wal-io-worker    [unknown]                           [.] 0x0000000000000fff
+            |
+            ---0xfff
+
+     0.86%     0.86%  wal-io-worker    write-perf-v7-preparation-coalesce  [.] <std::hash::random::RandomState as core::hash::BuildHasher>::hash_one::<&kv_engine::wal::parallel_worker::RequestId>
+     0.86%     0.86%  write-perf-v7-p  libc.so.6                           [.] __sched_yield
+            |
+             --0.81%--<parking_lot::raw_mutex::RawMutex>::lock_slow
+                       __sched_yield
+
+     0.86%     0.63%  write-perf-v7-p  write-perf-v7-preparation-coalesce  [.] <crossbeam_skiplist::base::SkipList<bytes::bytes::Bytes, bytes::bytes::Bytes>>::insert_internal::<<crossbeam_skiplist::base::SkipList<bytes::bytes::Bytes, bytes::bytes::Bytes>>::insert::{closure#0}, <crossbeam_skiplist::base::SkipList<bytes::bytes::Bytes, bytes::bytes::Bytes>>::insert::{closure#1}>
+            |
+            ---<crossbeam_skiplist::base::SkipList<bytes::bytes::Bytes, bytes::bytes::Bytes>>::insert_internal::<<crossbeam_skiplist::base::SkipList<bytes::bytes::Bytes, bytes::bytes::Bytes>>::insert::{closure#0}, <crossbeam_skiplist::base::SkipList<bytes::bytes::Bytes, bytes::bytes::Bytes>>::insert::{closure#1}>
+
+     0.86%     0.12%  wal-ordered-pac  write-perf-v7-preparation-coalesce  [.] kv_engine::wal::v7::codec::encode_data_frames_into
+            |
+            ---kv_engine::wal::v7::codec::encode_data_frames_into
+
+     0.86%     0.00%  write-perf-v7-p  [unknown]                           [.] 0x01007ffd5ebf528f
+            |
+            ---0x1007ffd5ebf528f
+               <kv_engine::lsm_storage::LsmStorageInner>::put_with_lifecycle_admission
+
+     0.81%     0.23%  write-perf-v7-p  write-perf-v7-preparation-coalesce  [.] <kv_engine::mem_table::MemTable>::publish_raw_batch
+            |
+            ---<kv_engine::mem_table::MemTable>::publish_raw_batch
+
+     0.75%     0.75%  write-perf-v7-p  libc.so.6                           [.] malloc
+     0.75%     0.75%  write-perf-v7-p  libc.so.6                           [.] 0x00000000000a5ffc
+     0.75%     0.58%  write-perf-v7-p  write-perf-v7-preparation-coalesce  [.] <parking_lot::raw_mutex::RawMutex>::unlock_slow
+     0.75%     0.23%  wal-sync-coordi  write-perf-v7-preparation-coalesce  [.] <kv_engine::wal::v7::admission::WalV7OwnedBatchReservation>::finish_after_io
+     0.75%     0.00%  write-perf-v7-p  libc.so.6                           [.] 0x00007cad8bb7dffc
+     0.69%     0.69%  wal-io-worker    write-perf-v7-preparation-coalesce  [.] <core::hash::sip::Hasher<core::hash::sip::Sip13Rounds> as core::hash::Hasher>::write
+     0.69%     0.46%  write-perf-v7-p  write-perf-v7-preparation-coalesce  [.] <kv_engine::wal::v7::admission::WalV7ReservationOwner>::reserve_batch
+     0.69%     0.06%  wal-ordered-pac  write-perf-v7-preparation-coalesce  [.] std::sys::backtrace::__rust_begin_short_backtrace::<<kv_engine::wal::parallel_runtime::ParallelWalRuntime>::spawn::{closure#4}, core::result::Result<(), anyhow::Error>>
+     0.69%     0.00%  wal-io-worker    libc.so.6                           [.] 0x00007cad8bb6b3e3
+     0.69%     0.12%  wal-io-worker    write-perf-v7-preparation-coalesce  [.] <kv_engine::wal::parallel_runtime::ParallelBuffer as kv_engine::wal::parallel_worker::WorkerBuffer>::retire
+     0.63%     0.63%  wal-ordered-pac  write-perf-v7-preparation-coalesce  [.] <parking_lot::raw_mutex::RawMutex>::lock_slow
+     0.63%     0.46%  wal-io-worker    write-perf-v7-preparation-coalesce  [.] kv_engine::wal::parallel_worker::enqueue_group_command::<kv_engine::wal::parallel_runtime::ParallelBuffer>
+     0.63%     0.35%  write-perf-v7-p  write-perf-v7-preparation-coalesce  [.] <kv_engine::lsm_storage::LsmStorageInner>::pitr_segment_of
+     0.63%     0.29%  wal-io-worker    write-perf-v7-preparation-coalesce  [.] <kv_engine::wal::parallel_worker::WorkerCore<kv_engine::wal::parallel_runtime::ParallelBuffer>>::assert_invariants
+     0.63%     0.06%  write-perf-v7-p  write-perf-v7-preparation-coalesce  [.] <alloc::raw_vec::RawVecInner<_>>::reserve::do_reserve_and_handle::<alloc::alloc::Global>
+     0.63%     0.06%  write-perf-v7-p  write-perf-v7-preparation-coalesce  [.] std::sys::backtrace::__rust_begin_short_backtrace::<write_perf::run_wal_concurrent::{closure#0}, core::result::Result<alloc::vec::Vec<u64>, anyhow::Error>>
+     0.58%     0.58%  wal-io-worker    libc.so.6                           [.] 0x000000000009ef32
+     0.58%     0.58%  write-perf-v7-p  write-perf-v7-preparation-coalesce  [.] kv_engine::pitr::write_entry_into
+     0.58%     0.23%  wal-io-worker    write-perf-v7-preparation-coalesce  [.] <kv_engine::wal::parallel_worker::WorkerCore<kv_engine::wal::parallel_runtime::ParallelBuffer>>::finish_completed_groups
+     0.58%     0.00%  wal-io-worker    libc.so.6                           [.] 0x00007cad8bb6b39b
+     0.58%     0.00%  wal-io-worker    libc.so.6                           [.] 0x00007cad8bb76f32
+     0.58%     0.00%  wal-ordered-pac  [unknown]                           [.] 0x0000000000000fff
+     0.58%     0.00%  write-perf-v7-p  [unknown]                           [.] 0x0000000000000449
+     0.52%     0.52%  wal-io-worker    write-perf-v7-preparation-coalesce  [.] core::ptr::drop_glue::<kv_engine::wal::parallel_runtime::ParallelBuffer>
+     0.52%     0.52%  write-perf-v7-p  write-perf-v7-preparation-coalesce  [.] <kv_engine::wal::parallel_runtime::BufferBudget>::reserve
+     0.52%     0.23%  write-perf-v7-p  write-perf-v7-preparation-coalesce  [.] core::fmt::write
+     0.52%     0.17%  wal-io-worker    write-perf-v7-preparation-coalesce  [.] <crossbeam_channel::flavors::list::Channel<kv_engine::wal::parallel_worker::WorkerCommand<kv_engine::wal::parallel_runtime::ParallelBuffer>>>::read
+     0.52%     0.17%  wal-sync-coordi  write-perf-v7-preparation-coalesce  [.] kv_engine::wal::parallel_runtime::run_sync_coordinator
+     0.52%     0.17%  write-perf-v7-p  write-perf-v7-preparation-coalesce  [.] bytes::bytes::shared_drop
+     0.52%     0.06%  write-perf-v7-p  write-perf-v7-preparation-coalesce  [.] kv_engine::key::encode_internal_key
+     0.52%     0.00%  write-perf-v7-p  libc.so.6                           [.] 0x00007cad8bb6e67f
+     0.52%     0.00%  write-perf-v7-p  libc.so.6                           [.] 0x00007cad8bb7dd07
+     0.46%     0.46%  write-perf-v7-p  write-perf-v7-preparation-coalesce  [.] <alloc::collections::btree::map::BTreeMap<u64, kv_engine::wal::v7::admission::WalV7OwnedBatchReservation>>::insert
+     0.46%     0.12%  write-perf-v7-p  write-perf-v7-preparation-coalesce  [.] alloc::fmt::format::format_inner
+     0.46%     0.06%  wal-io-worker    write-perf-v7-preparation-coalesce  [.] <kv_engine::wal::parallel_worker::WorkerWake>::drain
+     0.40%     0.00%  wal-io-worker    libc.so.6                           [.] read
+     0.40%     0.00%  wal-io-worker    [unknown]                           [.] 0xfffffffffffffffe
+     0.40%     0.40%  wal-io-worker    write-perf-v7-preparation-coalesce  [.] <arc_swap::strategy::hybrid::HybridStrategy<arc_swap::strategy::hybrid::DefaultConfig> as arc_swap::strategy::sealed::InnerStrategy<core::option::Option<alloc::sync::Arc<kv_engine::mem_table::WriteProfile>>>>::load::{closure#0}
+     0.40%     0.40%  write-perf-v7-p  write-perf-v7-preparation-coalesce  [.] <arc_swap::strategy::hybrid::HybridStrategy<arc_swap::strategy::hybrid::DefaultConfig> as arc_swap::strategy::sealed::InnerStrategy<alloc::sync::Arc<kv_engine::lsm_storage::LsmStorageState>>>::load::{closure#0}
+     0.40%     0.40%  write-perf-v7-p  write-perf-v7-preparation-coalesce  [.] <kv_engine::wal::Wal>::put_v7_prepared_batch_with_index
+     0.40%     0.23%  write-perf-v7-p  write-perf-v7-preparation-coalesce  [.] <hashbrown::map::HashMap<u64, kv_engine::wal::v7::admission::WalV7ResourceCharge, ahash::random_state::RandomState>>::insert
+     0.40%     0.00%  write-perf-v7-p  write-perf-v7-preparation-coalesce  [.] <kv_engine::wal::v7::codec::PreparedWalV7LogicalBatch>::encode_entry_stream
+     0.40%     0.23%  write-perf-v7-p  write-perf-v7-preparation-coalesce  [.] <kv_engine::mvcc::LsmMvccInner>::advance_ready_publications
+     0.40%     0.23%  write-perf-v7-p  write-perf-v7-preparation-coalesce  [.] <std::path::Path>::file_name
+     0.40%     0.00%  write-perf-v7-p  [unknown]                           [.] 0x0000000000000019
+     0.35%     0.00%  wal-io-worker    [unknown]                           [.] 0x000000000000000c
+     0.35%     0.35%  wal-io-worker    write-perf-v7-preparation-coalesce  [.] <crossbeam_channel::flavors::list::Channel<kv_engine::wal::parallel_worker::WorkerCommand<kv_engine::wal::parallel_runtime::ParallelBuffer>>>::start_recv
+     0.35%     0.35%  wal-ordered-pac  libc.so.6                           [.] 0x000000000016d053
+     0.35%     0.35%  write-perf-v7-p  write-perf-v7-preparation-coalesce  [.] <kv_engine::lsm_storage::LsmStorageInner>::try_freeze_memtable
+     0.35%     0.29%  wal-io-worker    write-perf-v7-preparation-coalesce  [.] <kv_engine::wal::parallel_runtime::ParallelBuffer>::release_budget
+     0.35%     0.29%  wal-sync-coordi  write-perf-v7-preparation-coalesce  [.] <kv_engine::wal::v7::admission::WalV7ReservationOwner>::finish_batch_operation
+     0.35%     0.29%  write-perf-v7-p  write-perf-v7-preparation-coalesce  [.] <kv_engine::wal::v7::admission::WalV7Reservation as core::ops::drop::Drop>::drop
+     0.35%     0.06%  write-perf-v7-p  write-perf-v7-preparation-coalesce  [.] <kv_engine::pitr::CanonicalWalEntryStream>::encode_into
+     0.35%     0.00%  wal-ordered-pac  libc.so.6                           [.] 0x00007cad8bc45053
+     0.35%     0.00%  write-perf-v7-p  [unknown]                           [.] 0x0000000007ffffff
+
+
+#
+# (Tip: Use parent filter to see specific call path: perf report -p <regex>)
+#

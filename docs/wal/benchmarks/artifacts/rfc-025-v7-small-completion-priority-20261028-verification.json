@@ -1,0 +1,22 @@
+{
+  "source_base": "b24cd80c114041566bc2c1f8075f76ce9e4b45c3",
+  "reconstructed_inputs": 128,
+  "final_inputs_verified": 128,
+  "summary_regenerates": true,
+  "all_seven_cells_complete": true,
+  "new_completed_invocations": 64,
+  "matrix_records": 64,
+  "scored_records": 50,
+  "global_unique_invocations": 803,
+  "full_archive_unique_invocations": 4899,
+  "inherited_interrupted_without_json": 1,
+  "source_retained": false,
+  "retained_source_restored": true,
+  "canonical_sha256": "f353022d846530a6754330aaea11f295319ea8f4de20afa09b6d2a3b57b021d8",
+  "candidate_tests": 1976,
+  "focused_tests": 50,
+  "restored_tests": 1973,
+  "decision_sha256": "ad18f711cf200762f4e542561810478a7d18cfc45a499ec4cf6b917bf458fb14",
+  "checks_sha256": "2e1779bc164437de534ee98eb55caef0e0a857e6f340b99485b6f803c63a60a0",
+  "verifier_sha256": "b562efecd3e7fea3f1c064d850040f2dae7d5f308ee6403499a92498249c5b28"
+}

@@ -1,0 +1,653 @@
+--- a/kv-engine/src/wal/parallel/runtime.rs
++++ b/kv-engine/src/wal/parallel/runtime.rs
+@@ -13 +13 @@
+-        atomic::{AtomicU64, Ordering},
++        atomic::{AtomicBool, AtomicU64, Ordering},
+@@ -53,0 +54,3 @@
++// Hashing a small group inline avoids a coordinator handoff for point writes.
++// After cheap syncs, larger inputs overlap later framing/I/O on the coordinator.
++const V7_INLINE_HASH_MAX_BYTES: usize = 32 * 1024;
+@@ -558,2 +561,3 @@
+-/// Coordinates are assigned, but DATA framing and logical hashing belong to
+-/// the ordered packer. The batch reservation already charges both allocations.
++/// The packer frames DATA and may hash bounded small groups. The coordinator
++/// hashes deferred logical inputs in order after completion. Both allocations
++/// retain their reservation until hashing and DATA I/O have finished.
+@@ -563,0 +568,13 @@
++    // Logical bytes can outlive their DATA CQE; free them before this pin.
++    _logical_pin: Option<WalV7BatchBufferPin>,
++}
++
++struct WalV7PendingHash {
++    ticket: u64,
++    input: WalV7AdmittedInput,
++}
++
++struct WalV7HashState {
++    next_ticket: u64,
++    prefix: WalV7PrefixMetadata,
++    pending: Vec<WalV7PendingHash>,
+@@ -589,0 +607 @@
++    v7_pending_hash: VecDeque<WalV7PendingHash>,
+@@ -664,0 +683,6 @@
++    // The packer tries bounded inline hashing only when this state is ready.
++    // The coordinator hashes deferred inputs without taking the packer mutex.
++    v7_hash_state: Mutex<Option<WalV7HashState>>,
++    // Scheduling hint only: slow storage favors hashing on the packer while
++    // the preceding sync is in flight. Start conservatively before measuring.
++    v7_defer_large_hashes: AtomicBool,
+@@ -698 +721,0 @@
+-    v7_prefix: Option<WalV7PrefixMetadata>,
+@@ -937,0 +961 @@
++                v7_pending_hash: VecDeque::new(),
+@@ -940,0 +965,6 @@
++            v7_defer_large_hashes: AtomicBool::new(false),
++            v7_hash_state: Mutex::new(initial_v7_prefix.map(|prefix| WalV7HashState {
++                next_ticket: start.next_ticket,
++                prefix,
++                pending: Vec::new(),
++            })),
+@@ -946 +975,0 @@
+-                v7_prefix: initial_v7_prefix,
+@@ -1275,0 +1305 @@
++            let logical_pin = reservation.pin_buffer();
+@@ -1295,0 +1326 @@
++                    _logical_pin: Some(logical_pin),
+@@ -1623,0 +1655 @@
++            admission.v7_pending_hash.clear();
+@@ -1731,21 +1763,13 @@
+-                let prefix = packer
+-                    .v7_prefix
+-                    .as_mut()
+-                    .context("v7 packer has no recovered logical prefix")?;
+-                materialize_v7_batches(v7_batches, prefix, &mut packed.writes)?;
+-                // Publish the endpoint snapshot before a worker can complete
+-                // this group. Framing and hashing held neither admission nor
+-                // the enclosing MVCC write sequencer.
+-                let mut admission = inner.admission.lock();
+-                admission
+-                    .v7_metadata
+-                    .as_mut()
+-                    .context("v7 packer has no runtime metadata")?
+-                    .logical_hasher = prefix.logical_hasher.clone();
+-                ensure!(
+-                    admission
+-                        .v7_prefixes
+-                        .insert(expected_ticket, prefix.clone())
+-                        .is_none(),
+-                    "v7 WAL group endpoint already has logical prefix state"
+-                );
++                frame_v7_batches(v7_batches)?;
++                if try_hash_v7_group(inner, v7_batches, expected_ticket)? {
++                    take_framed_v7_batches(v7_batches, None, &mut packed.writes)?;
++                } else {
++                    // Queue owned logical bytes before a worker can complete
++                    // the group. Never wait on hashing from the packer.
++                    let mut admission = inner.admission.lock();
++                    take_framed_v7_batches(
++                        v7_batches,
++                        Some(&mut admission.v7_pending_hash),
++                        &mut packed.writes,
++                    )?;
++                }
+@@ -1975 +1999 @@
+-fn materialize_v7_batch(batch: &mut AdmittedBatch, prefix: &mut WalV7PrefixMetadata) -> Result<()> {
++fn frame_v7_batch(batch: &mut AdmittedBatch) -> Result<()> {
+@@ -1978 +2002 @@
+-        .take()
++        .as_ref()
+@@ -1980,4 +2003,0 @@
+-    ensure!(
+-        input.commit_ts > prefix.last_commit_ts,
+-        "v7 packer commit timestamp does not advance"
+-    );
+@@ -1995,2 +2014,0 @@
+-    prefix.logical_hasher.update(input.logical_batch.as_bytes());
+-    prefix.last_commit_ts = input.commit_ts;
+@@ -2000 +2018,8 @@
+-fn materialize_v7_batches(
++fn frame_v7_batches(batches: &mut [AdmittedBatch]) -> Result<()> {
++    for batch in batches {
++        frame_v7_batch(batch)?;
++    }
++    Ok(())
++}
++
++fn take_framed_v7_batches(
+@@ -2002 +2027 @@
+-    prefix: &mut WalV7PrefixMetadata,
++    mut pending: Option<&mut VecDeque<WalV7PendingHash>>,
+@@ -2006 +2031,12 @@
+-        materialize_v7_batch(&mut batch, prefix)?;
++        let input = batch
++            .v7_input
++            .take()
++            .context("framed v7 DATA has no logical input")?;
++        if let Some(pending) = pending.as_mut() {
++            pending.push_back(WalV7PendingHash {
++                ticket: batch.ticket,
++                input,
++            });
++        } else {
++            drop(input);
++        }
+@@ -2015,0 +2052,125 @@
++fn advance_v7_logical_hash(
++    next_ticket: &mut u64,
++    prefix: &mut WalV7PrefixMetadata,
++    ticket: u64,
++    input: &WalV7AdmittedInput,
++) -> Result<()> {
++    ensure!(
++        ticket == *next_ticket,
++        "v7 logical hash ticket is not contiguous"
++    );
++    ensure!(
++        input.commit_ts > prefix.last_commit_ts,
++        "v7 logical hash commit timestamp does not advance"
++    );
++    prefix.logical_hasher.update(input.logical_batch.as_bytes());
++    prefix.last_commit_ts = input.commit_ts;
++    *next_ticket = next_ticket
++        .checked_add(1)
++        .context("v7 logical hash ticket overflows")?;
++    Ok(())
++}
++
++fn publish_v7_logical_hash(inner: &RuntimeInner, state: &WalV7HashState) -> Result<()> {
++    let mut admission = inner.admission.lock();
++    admission
++        .v7_metadata
++        .as_mut()
++        .context("v7 runtime has no logical hash metadata")?
++        .logical_hasher = state.prefix.logical_hasher.clone();
++    ensure!(
++        admission
++            .v7_prefixes
++            .insert(state.next_ticket, state.prefix.clone())
++            .is_none(),
++        "v7 WAL endpoint already has logical prefix state"
++    );
++    Ok(())
++}
++
++/// Hash inline when the preceding storage barrier is slow, or when this group
++/// is small. A busy state or deferred predecessor queues the entire group
++/// instead of blocking the packer. The hint never changes hash or ACK ordering.
++fn try_hash_v7_group(inner: &RuntimeInner, batches: &[AdmittedBatch], target: u64) -> Result<bool> {
++    if inner.v7_defer_large_hashes.load(Ordering::Relaxed) {
++        let logical_bytes = batches.iter().try_fold(0usize, |bytes, batch| {
++            bytes.checked_add(batch.v7_input.as_ref()?.logical_batch.as_bytes().len())
++        });
++        if logical_bytes.is_none_or(|bytes| bytes > V7_INLINE_HASH_MAX_BYTES) {
++            return Ok(false);
++        }
++    }
++    let Some(mut state) = inner.v7_hash_state.try_lock() else {
++        return Ok(false);
++    };
++    let state = state
++        .as_mut()
++        .context("v7 packer has no logical hash state")?;
++    if batches
++        .first()
++        .is_none_or(|batch| batch.ticket != state.next_ticket)
++    {
++        return Ok(false);
++    }
++    for batch in batches {
++        advance_v7_logical_hash(
++            &mut state.next_ticket,
++            &mut state.prefix,
++            batch.ticket,
++            batch
++                .v7_input
++                .as_ref()
++                .context("v7 inline hash has no logical input")?,
++        )?;
++    }
++    ensure!(
++        state.next_ticket == target,
++        "v7 inline hash does not reach group endpoint"
++    );
++    publish_v7_logical_hash(inner, state)?;
++    Ok(true)
++}
++
++/// Hash deferred inputs only through completed DATA. The single coordinator
++/// performs this without holding admission or the packer mutex. Inline group
++/// snapshots may already cover this target, or a later submitted group.
++fn hash_v7_written_prefix(inner: &RuntimeInner, target: u64) -> Result<()> {
++    let mut state = inner.v7_hash_state.lock();
++    let state = state
++        .as_mut()
++        .context("v7 coordinator has no logical hash state")?;
++    if state.next_ticket >= target {
++        return Ok(());
++    }
++    {
++        let mut admission = inner.admission.lock();
++        while admission
++            .v7_pending_hash
++            .front()
++            .is_some_and(|batch| batch.ticket < target)
++        {
++            state.pending.push(
++                admission
++                    .v7_pending_hash
++                    .pop_front()
++                    .expect("front hash batch is present"),
++            );
++        }
++    }
++    let WalV7HashState {
++        next_ticket,
++        prefix,
++        pending,
++    } = state;
++    for batch in pending.drain(..) {
++        advance_v7_logical_hash(next_ticket, prefix, batch.ticket, &batch.input)?;
++        // The encoded bytes drop before their reservation pin on each iteration.
++    }
++    ensure!(
++        *next_ticket == target,
++        "v7 coordinator has no logical bytes for written prefix"
++    );
++    publish_v7_logical_hash(inner, state)?;
++    Ok(())
++}
++
+@@ -2088,0 +2250,5 @@
++            if v7_layout {
++                inner
++                    .v7_defer_large_hashes
++                    .store(latency < SYNC_COALESCE_MIN_SYNC, Ordering::Relaxed);
++            }
+@@ -2569 +2735,19 @@
+-    let frontier_cycle = if inner.admission.lock().v7_allocator.is_some() {
++    let (v7_layout, hash_ready) = {
++        let admission = inner.admission.lock();
++        (
++            admission.v7_allocator.is_some(),
++            admission.v7_prefixes.contains_key(&target),
++        )
++    };
++    let frontier_cycle = if v7_layout {
++        // An inline snapshot already contains the exact ordered prefix; avoid
++        // contending with the next packer group over the shared hash state.
++        if !hash_ready && let Err(error) = hash_v7_written_prefix(inner, target) {
++            poison_v7_runtime(
++                inner,
++                None,
++                durable,
++                format!("v7 Parallel prefix hashing failed: {error:#}"),
++            );
++            return Err(error).context("hash completed v7 logical prefix");
++        }
+@@ -2813 +2997,6 @@
+-    use std::{collections::BTreeMap, os::unix::fs::FileExt, path::Path, sync::Arc};
++    use std::{
++        collections::{BTreeMap, VecDeque},
++        os::unix::fs::FileExt,
++        path::Path,
++        sync::Arc,
++    };
+@@ -2976 +3165 @@
+-    fn v7_admission_defers_framing_and_hashing_until_ordered_packing() -> anyhow::Result<()> {
++    fn v7_admission_defers_framing_and_coordinator_hashing() -> anyhow::Result<()> {
+@@ -2990 +3179,2 @@
+-        let mut expected_hash = packer.v7_prefix.as_ref().unwrap().logical_hasher.clone();
++        let hash_state = runtime.inner.v7_hash_state.lock();
++        let mut expected_hash = hash_state.as_ref().unwrap().prefix.logical_hasher.clone();
+@@ -3022,0 +3213,55 @@
++        let started = std::time::Instant::now();
++        while runtime.inner.durability.state.lock().written_frontier != second_ticket + 1 {
++            assert!(started.elapsed() < std::time::Duration::from_secs(5));
++            std::thread::sleep(std::time::Duration::from_millis(1));
++        }
++        // The coordinator is blocked on hashing the completed first group.
++        // A later group must still be framed, submitted, and reaped.
++        let packer = runtime.inner.packer_state.lock();
++        let third = v7_test_batch(3, 32);
++        let third_ticket = wal.put_v7_batch_with_index(&third, LIVE_WAL_V5_LIMITS)?.0;
++        {
++            let admission = runtime.inner.admission.lock();
++            expected_hash.update(
++                admission
++                    .queue
++                    .back()
++                    .unwrap()
++                    .v7_input
++                    .as_ref()
++                    .unwrap()
++                    .logical_batch
++                    .as_bytes(),
++            );
++        }
++        drop(packer);
++        let started = std::time::Instant::now();
++        loop {
++            let queued = runtime.inner.admission.lock().v7_pending_hash.len();
++            let active_bytes = runtime.inner.buffer_budget.state.lock().active_bytes;
++            if queued == 3 && active_bytes == 0 {
++                break;
++            }
++            assert!(started.elapsed() < std::time::Duration::from_secs(5));
++            std::thread::sleep(std::time::Duration::from_millis(1));
++        }
++        assert_eq!(runtime.inner.durability.state.lock().durable_frontier, 0);
++        assert_eq!(
++            runtime
++                .inner
++                .admission
++                .lock()
++                .v7_allocator
++                .as_ref()
++                .unwrap()
++                .last_frontier()
++                .frontier
++                .ticket_end,
++            0
++        );
++        assert!(
++            owner.snapshot().buffer_memory_bytes > 0,
++            "logical bytes remain charged after DATA CQEs"
++        );
++        drop(hash_state);
++        wal.submit_and_commit(third_ticket)?;
+@@ -3041 +3286 @@
+-        assert_eq!(recovered.installed.batches, vec![first, second]);
++        assert_eq!(recovered.installed.batches, vec![first, second, third]);
+@@ -3113,0 +3359,173 @@
++    #[test]
++    fn v7_inline_and_deferred_hashes_preserve_ticket_order_and_earlier_snapshots()
++    -> anyhow::Result<()> {
++        use crate::wal::v7::{
++            install::recover_and_install_active, recovery::WalV7RecoveryAuthority,
++        };
++
++        let directory = tempfile::tempdir()?;
++        let path = directory.path().join("mixed-prefix-hashing.wal");
++        let Some(V7RuntimeTestWal { wal, owner, anchor }) =
++            live_v7_test_wal(&path, super::MAX_WAL_FILE_SIZE, v7_test_resource_limits())?
++        else {
++            return Ok(());
++        };
++        let runtime = wal.parallel_runtime.as_ref().unwrap();
++        let mut packer = runtime.inner.packer_state.lock();
++        let batches = vec![
++            v7_test_batch(1, 32 * 1024),
++            v7_test_batch(2, 16),
++            v7_test_batch(3, 32 * 1024),
++            v7_test_batch(4, 8),
++        ];
++        for batch in &batches {
++            wal.put_v7_batch_with_index(batch, LIVE_WAL_V5_LIMITS)?;
++        }
++        let mut pending = std::mem::take(&mut runtime.inner.admission.lock().queue);
++        let mut first = pending.pop_front().unwrap();
++        let mut second = pending.pop_front().unwrap();
++        super::frame_v7_batch(&mut first)?;
++        super::frame_v7_batch(&mut second)?;
++        assert!(super::try_hash_v7_group(
++            &runtime.inner,
++            std::slice::from_ref(&first),
++            1
++        )?);
++        assert!(super::try_hash_v7_group(
++            &runtime.inner,
++            std::slice::from_ref(&second),
++            2
++        )?);
++        runtime
++            .inner
++            .v7_defer_large_hashes
++            .store(true, super::Ordering::Relaxed);
++        let large = pending.pop_front().unwrap();
++        assert!(!super::try_hash_v7_group(
++            &runtime.inner,
++            std::slice::from_ref(&large),
++            3
++        )?);
++        let large = prepare_test_v7_data(&runtime.inner, large)?;
++        runtime
++            .inner
++            .v7_defer_large_hashes
++            .store(false, super::Ordering::Relaxed);
++        let last_small = pending.pop_front().unwrap();
++        assert!(
++            !super::try_hash_v7_group(&runtime.inner, std::slice::from_ref(&last_small), 4)?,
++            "small input cannot skip a deferred predecessor"
++        );
++        let last_small = prepare_test_v7_data(&runtime.inner, last_small)?;
++        assert_eq!(
++            runtime
++                .inner
++                .v7_hash_state
++                .lock()
++                .as_ref()
++                .unwrap()
++                .next_ticket,
++            2
++        );
++        complete_test_v7_data(&runtime.inner, first, None)?;
++        assert!(
++            super::synchronize_written_prefix(&runtime.inner.preallocator, &runtime.inner)?
++                .is_some(),
++            "the first snapshot survives inline hashing of the second group"
++        );
++        runtime.wait_durable(0)?;
++        complete_test_v7_data(&runtime.inner, last_small, None)?;
++        complete_test_v7_data(&runtime.inner, second, None)?;
++        assert!(
++            super::synchronize_written_prefix(&runtime.inner.preallocator, &runtime.inner)?
++                .is_none()
++        );
++        complete_test_v7_data(&runtime.inner, large, None)?;
++        assert!(
++            super::synchronize_written_prefix(&runtime.inner.preallocator, &runtime.inner)?
++                .is_some()
++        );
++        runtime.wait_durable(3)?;
++        packer.next_ticket = wal.next_ticket();
++        packer.reserved_end = runtime.logical_length();
++        packer.preallocated_end = std::fs::metadata(&path)?.len();
++        drop(packer);
++        wal.close()?;
++        assert_eq!(owner.snapshot().buffer_memory_bytes, 0);
++        drop(wal);
++        let recovered = recover_and_install_active(
++            &path,
++            WalV7RecoveryAuthority::Active {
++                predecessor: crate::pitr::ChainAnchor::Genesis {
++                    archive_epoch_id: crate::pitr::ArchiveEpochId(anchor.archive_epoch_id),
++                },
++                durable_anchors: vec![anchor],
++            },
++        )?;
++        assert_eq!(recovered.installed.batches, batches);
++        Ok(())
++    }
++
++    #[test]
++    fn v7_coordinator_hash_failure_preserves_the_acknowledged_prefix() -> anyhow::Result<()> {
++        use crate::wal::v7::{
++            install::recover_and_install_active, recovery::WalV7RecoveryAuthority,
++        };
++
++        let directory = tempfile::tempdir()?;
++        let path = directory.path().join("failed-v7-prefix-hash.wal");
++        let Some(V7RuntimeTestWal { wal, owner, anchor }) =
++            live_v7_test_wal(&path, super::MAX_WAL_FILE_SIZE, v7_test_resource_limits())?
++        else {
++            return Ok(());
++        };
++        let first = v7_test_batch(1, 16);
++        let acknowledged = wal.put_v7_batch_with_index(&first, LIVE_WAL_V5_LIMITS)?.0;
++        wal.submit_and_commit(acknowledged)?;
++        let runtime = wal.parallel_runtime.as_ref().unwrap();
++        let packer = runtime.inner.packer_state.lock();
++        runtime
++            .inner
++            .v7_defer_large_hashes
++            .store(true, super::Ordering::Relaxed);
++        let failed = wal
++            .put_v7_batch_with_index(&v7_test_batch(2, 32 * 1024), LIVE_WAL_V5_LIMITS)?
++            .0;
++        runtime
++            .inner
++            .admission
++            .lock()
++            .queue
++            .back_mut()
++            .unwrap()
++            .v7_input
++            .as_mut()
++            .unwrap()
++            .commit_ts = 1;
++        drop(packer);
++        let error = wal
++            .submit_and_commit(failed)
++            .expect_err("hash failure must poison the runtime");
++        assert!(format!("{error:#}").contains("commit timestamp"));
++        wal.submit_and_commit(acknowledged)?;
++        assert!(runtime.is_poisoned());
++        assert!(
++            wal.put_v7_batch_with_index(&v7_test_batch(3, 16), LIVE_WAL_V5_LIMITS)
++                .is_err()
++        );
++        assert!(wal.close().is_err());
++        assert_eq!(owner.snapshot().buffer_memory_bytes, 0);
++        drop(wal);
++        let recovered = recover_and_install_active(
++            &path,
++            WalV7RecoveryAuthority::Active {
++                predecessor: crate::pitr::ChainAnchor::Genesis {
++                    archive_epoch_id: crate::pitr::ArchiveEpochId(anchor.archive_epoch_id),
++                },
++                durable_anchors: vec![anchor],
++            },
++        )?;
++        assert_eq!(recovered.installed.batches, vec![first]);
++        Ok(())
++    }
++
+@@ -3394 +3811,0 @@
+-        packer: &mut super::PackerState,
+@@ -3396,6 +3813,3 @@
+-    ) -> anyhow::Result<(AdmittedBatch, super::WalV7PrefixMetadata)> {
+-        let prefix = packer
+-            .v7_prefix
+-            .as_mut()
+-            .expect("v7 fixture has a recovered hash");
+-        super::materialize_v7_batch(&mut batch, prefix)?;
++    ) -> anyhow::Result<AdmittedBatch> {
++        super::frame_v7_batch(&mut batch)?;
++        let input = batch.v7_input.take().expect("fixture has logical bytes");
+@@ -3405,5 +3819,6 @@
+-            .v7_metadata
+-            .as_mut()
+-            .unwrap()
+-            .logical_hasher = prefix.logical_hasher.clone();
+-        Ok((batch, prefix.clone()))
++            .v7_pending_hash
++            .push_back(super::WalV7PendingHash {
++                ticket: batch.ticket,
++                input,
++            });
++        Ok(batch)
+@@ -3414 +3829 @@
+-        (batch, prefix): (AdmittedBatch, super::WalV7PrefixMetadata),
++        batch: AdmittedBatch,
+@@ -3424,10 +3838,0 @@
+-        // These tests bypass the packer and complete one batch per group;
+-        // publish the same endpoint snapshot that take_admitted_group records.
+-        assert!(
+-            inner
+-                .admission
+-                .lock()
+-                .v7_prefixes
+-                .insert(ticket + 1, prefix,)
+-                .is_none()
+-        );
+@@ -3476 +3881 @@
+-        let batch = prepare_test_v7_data(&runtime.inner, &mut packer, batch)?;
++        let batch = prepare_test_v7_data(&runtime.inner, batch)?;
+@@ -3552 +3957 @@
+-            .map(|batch| prepare_test_v7_data(&runtime.inner, &mut packer, batch))
++            .map(|batch| prepare_test_v7_data(&runtime.inner, batch))
+@@ -3581 +3986 @@
+-            let failed = prepare_test_v7_data(&runtime.inner, &mut packer, failed)?;
++            let failed = prepare_test_v7_data(&runtime.inner, failed)?;
+@@ -4096,0 +4502,40 @@
++    fn v7_logical_hash_input_keeps_its_charge_after_close_and_handle_drop() -> anyhow::Result<()> {
++        let directory = tempfile::tempdir()?;
++        let path = directory.path().join("retained-logical-input.wal");
++        let Some(V7RuntimeTestWal { wal, owner, .. }) =
++            live_v7_test_wal(&path, super::MAX_WAL_FILE_SIZE, v7_test_resource_limits())?
++        else {
++            return Ok(());
++        };
++        let runtime = wal.parallel_runtime.as_ref().unwrap();
++        let mut packer = runtime.inner.packer_state.lock();
++        let ticket = wal
++            .put_v7_batch_with_index(&v7_test_batch(1, 16), LIVE_WAL_V5_LIMITS)?
++            .0;
++        let mut batch = runtime.inner.admission.lock().queue.pop_front().unwrap();
++        let logical_input = batch.v7_input.take().unwrap();
++        let data_end = batch.file_offset + batch.aligned_len as u64;
++        drop(batch);
++        assert_eq!(runtime.inner.buffer_budget.state.lock().active_bytes, 0);
++        super::poison_v7_runtime(&runtime.inner, None, 0, "injected hash input abandonment");
++        packer.next_ticket = ticket + 1;
++        packer.reserved_end = data_end;
++        packer.preallocated_end = data_end;
++        drop(packer);
++
++        let before_close = owner.snapshot();
++        assert!(before_close.buffer_memory_bytes > 0);
++        assert!(wal.close().is_err());
++        assert_eq!(owner.snapshot(), before_close);
++        drop(wal);
++        assert_eq!(owner.snapshot(), before_close);
++        std::fs::remove_file(&path)?;
++        std::fs::File::open(directory.path())?.sync_all()?;
++        owner.retire_after_durable_cleanup()?;
++        assert_eq!(owner.snapshot(), before_close);
++        drop(logical_input);
++        assert_eq!(owner.snapshot(), WalV7ResourceCharge::default());
++        Ok(())
++    }
++
++    #[test]
+@@ -5019,0 +5465 @@
++                _logical_pin: None,
+@@ -5045,0 +5492 @@
++            v7_pending_hash: VecDeque::new(),
+@@ -5091,0 +5539 @@
++            v7_pending_hash: VecDeque::new(),
+@@ -5164,0 +5613 @@
++            v7_pending_hash: VecDeque::new(),
+@@ -5173,4 +5621,0 @@
+-        let mut prefix = super::WalV7PrefixMetadata {
+-            last_commit_ts: 0,
+-            logical_hasher: super::Sha256::new(),
+-        };
+@@ -5183 +5628,7 @@
+-        super::materialize_v7_batches(&mut pending, &mut prefix, &mut first_group.writes).unwrap();
++        super::frame_v7_batches(&mut pending).unwrap();
++        super::take_framed_v7_batches(
++            &mut pending,
++            Some(&mut admission.v7_pending_hash),
++            &mut first_group.writes,
++        )
++        .unwrap();
+@@ -5204 +5655,7 @@
+-        super::materialize_v7_batches(&mut pending, &mut prefix, &mut second_group.writes).unwrap();
++        super::frame_v7_batches(&mut pending).unwrap();
++        super::take_framed_v7_batches(
++            &mut pending,
++            Some(&mut admission.v7_pending_hash),
++            &mut second_group.writes,
++        )
++        .unwrap();

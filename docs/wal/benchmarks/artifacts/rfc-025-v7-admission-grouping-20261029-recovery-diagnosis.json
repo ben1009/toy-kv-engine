@@ -1,0 +1,21 @@
+{
+  "baseline_concurrent_passed": 15,
+  "baseline_concurrent_total": 16,
+  "candidate_concurrent_passed": 14,
+  "candidate_concurrent_total": 16,
+  "lifetime_diagnostic_passed": 46,
+  "lifetime_diagnostic_total": 48,
+  "lifetime_failed_old_engine_strong_count": 2,
+  "lifetime_passed_old_engine_strong_count": 0,
+  "process_fixture_concurrent_passed": 48,
+  "process_fixture_concurrent_total": 48,
+  "fix_commit": "16a9314e95f55e664a39550b53f0c3d19fffa73e",
+  "isolated_old_test_passed": 12,
+  "full_fixture_check": "1973 passed, zero retries with eight test processes and repository-local scratch",
+  "note": "Old test reopened while a prior engine could remain alive in background maintenance. The new fixture exits a child process while the failpoint remains active and validates that the target SegmentSealed record is absent before reopening.",
+  "final_candidate_fixture_concurrent_passed": 32,
+  "final_candidate_fixture_concurrent_total": 32,
+  "final_candidate_fixture_log": "target/wal-opt/20261029-v7-admission-grouping/recovery-wave-final.json",
+  "final_candidate_fixture_log_sha256": "420bae46c6f7c33b72da7bf8e753530673807f1942bc04fba90c3bcab07d6b48",
+  "full_candidate_timeout": "One PITR boundary test timed out under eight-way SSD load; ten isolated runs passed, then the complete 1,985-test suite passed at four-way concurrency with retries disabled."
+}

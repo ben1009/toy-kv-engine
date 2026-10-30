@@ -1,0 +1,19 @@
+{
+  "source_base": "3aca2bdb9b574e7d1c106aad12731db0c384191f",
+  "assessment_passed": false,
+  "source_retained": false,
+  "cpu_is_diagnostic": true,
+  "captured_cells": [
+    "ext4-batch8",
+    "ext4-batch16"
+  ],
+  "cancelled_cells": [
+    "ext4-batch1",
+    "ext4-point8",
+    "confirmation-batch8"
+  ],
+  "failed_v7_cells": [
+    "ext4-batch16"
+  ],
+  "reason": "Fixed comparison stopped after batch16 failed the raw guards. Both v4 controls varied strongly, and the fastest matched v7 batch16 pair is effectively tied (577743 versus 576255 puts/s; p99 4.392 versus 4.337ms). Preserve every raw run; do not interpret the stall-heavy gate as proof of a source regression. No independent confirmation or reproducible benefit establishes adoption. Restore retained f7. Subsequent excluded diagnostics investigate stalls and the earlier retirement-hint prototype separately."
+}

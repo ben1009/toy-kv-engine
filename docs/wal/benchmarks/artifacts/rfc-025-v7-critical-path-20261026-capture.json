@@ -1,0 +1,14 @@
+{
+  "v4-batch64": {
+    "perf_data_sha256": "77185d7111a202a2f87b4e83b805f0be7494107534483b1b175ccff4ea25b426",
+    "script_fields": "comm,pid,tid,period,ip,sym"
+  },
+  "v7-batch64": {
+    "perf_data_sha256": "72b649c7c53fc966a3dd0dd7d5fb0ed9ded887d03c77332baaefd39d6e34136d",
+    "script_fields": "comm,pid,tid,period,ip,sym"
+  },
+  "v7-point8": {
+    "perf_data_sha256": "a6a6e62e2bd4846c34f071328937c64ce3bd8caeb3321f22569c7137e996e96d",
+    "script_fields": "comm,pid,tid,period,ip,sym"
+  }
+}

@@ -1,0 +1,93 @@
+{
+  "outside_sandbox": true,
+  "checks": [
+    {
+      "phase": "focused",
+      "command": [
+        "cargo",
+        "nextest",
+        "run",
+        "--offline",
+        "--locked",
+        "--workspace",
+        "--all-features",
+        "--lib",
+        "--retries",
+        "0",
+        "--success-output",
+        "immediate",
+        "-E",
+        "test(v7_coalescing) or test(v7_frontier_) or test(large_batch_coalescing) or test(failpoint_parallel_wal_v7)"
+      ],
+      "exit_code": 0,
+      "log": "target/wal-opt/20261027-v7-eligible-coalescing/focused.log",
+      "log_sha256": "95dcb008c1f3285a6a651e0928fae75083e67df1d509c3eac110d7357422eb8c"
+    },
+    {
+      "phase": "format",
+      "command": [
+        "cargo",
+        "fmt",
+        "--all",
+        "--check"
+      ],
+      "exit_code": 0,
+      "log": "target/wal-opt/20261027-v7-eligible-coalescing/format.log",
+      "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "phase": "check",
+      "command": [
+        "cargo",
+        "make",
+        "check"
+      ],
+      "exit_code": 0,
+      "log": "target/wal-opt/20261027-v7-eligible-coalescing/check.log",
+      "log_sha256": "e4154861e96ab999ea0422554acfe8f3817105753fa5da9ca7adf365c11e575b"
+    },
+    {
+      "phase": "release",
+      "command": [
+        "cargo",
+        "build",
+        "--offline",
+        "--locked",
+        "--release",
+        "--package",
+        "kv-engine",
+        "--bin",
+        "write-perf",
+        "--features",
+        "bench"
+      ],
+      "exit_code": 0,
+      "log": "target/wal-opt/20261027-v7-eligible-coalescing/release.log",
+      "log_sha256": "cd493e64e5bef13f036f5115ec7d95e81ac393291a36b2d793d543de6e7f11ee"
+    },
+    {
+      "phase": "direct spelling",
+      "command": [
+        "typos",
+        "--format",
+        "brief"
+      ],
+      "exit_code": 0,
+      "log": "target/wal-opt/20261027-v7-eligible-coalescing/direct-spelling.log",
+      "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "phase": "final spelling",
+      "command": [
+        "typos",
+        "--format",
+        "brief"
+      ],
+      "exit_code": 0,
+      "log": "target/wal-opt/20261027-v7-eligible-coalescing/final-spelling.log",
+      "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    }
+  ],
+  "tests": 1972,
+  "focused_tests": 6
+}

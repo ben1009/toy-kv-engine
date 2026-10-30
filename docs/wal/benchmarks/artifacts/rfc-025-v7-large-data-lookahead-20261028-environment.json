@@ -1,0 +1,21 @@
+{
+  "source_base": "8ca9a3d60f43804d4bd69535e32de85916514c78",
+  "kernel": "6.12.71-1-lts",
+  "filesystem": "/dev/nvme0n1p3 ext4 rw,relatime",
+  "toolchain": "rustc 1.100.0-nightly (6bb1652a0 2026-09-22)\nbinary: rustc\ncommit-hash: 6bb1652a020e80cef79332741d89e996d71933c9\ncommit-date: 2026-09-22\nhost: x86_64-unknown-linux-gnu\nrelease: 1.100.0-nightly\nLLVM version: 23.1.1\n",
+  "numa_nodes": [
+    "node0"
+  ],
+  "max_processes": [
+    255469,
+    255469
+  ],
+  "allocator_environment_overrides": {},
+  "source_manifest_sha256": "929eb8082224651434a2391b2ddd075fdca6ddba331afe73e75d7df8c8afbc09",
+  "patch_sha256": "9c1c3ceca7bd571b41c03d27290e9c9ccbe95a9f6c0c7e86c54fb33fa7df640f",
+  "plan_sha256": "8a23f67252b130e962d67f52447281e645bc2758ace32d9f68fbffc8b70a6bfa",
+  "matrix_sha256": "bb8fb2644bcced9f08718377f42f66a22341b51c7d97134c5a53729440c43df7",
+  "driver_sha256": "9efa9692370953a2b2314227ec297114820fc1375aec58b2ab608586d737e8b2",
+  "prior_verification_sha256": "90978718b912ae929befeaad8dc1b31a9f8a83d8937bbd813a8b58e3f71fc070",
+  "kernel_source_provenance": "rfc-025-v7-async-worker-limit-20261028-interrupted.json"
+}

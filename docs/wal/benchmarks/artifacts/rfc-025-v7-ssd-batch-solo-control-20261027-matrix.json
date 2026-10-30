@@ -1,0 +1,23 @@
+{
+  "created_at_utc": "2026-10-27T04:35:03.381898+00:00",
+  "ssd_initial_cooldown_seconds": 30,
+  "ssd_between_seconds": 10,
+  "cells": {
+    "ext4-batch1": {
+      "kind": "ssd",
+      "bench": "wal_batch_concurrent",
+      "writers": 1,
+      "operations": 750000,
+      "reads": 500000,
+      "scan_num": 100000,
+      "batch": 64,
+      "sample_every": 10,
+      "arms": [
+        "old_ref_v7",
+        "old_repeat_v7",
+        "new_v7"
+      ],
+      "pairs": 5
+    }
+  }
+}

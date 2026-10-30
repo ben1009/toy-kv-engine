@@ -1,0 +1,88 @@
+{
+  "outside_sandbox": true,
+  "candidate_tests": 1985,
+  "focused_tests": 65,
+  "checks": [
+    {
+      "step": "fmt",
+      "command": [
+        "cargo",
+        "fmt",
+        "--all"
+      ],
+      "returncode": 0,
+      "elapsed_seconds": 1.0083208084106445,
+      "log_path": "target/wal-opt/20261029-v7-admission-grouping/candidate-fmt.log",
+      "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "step": "focused",
+      "command": [
+        "cargo",
+        "nextest",
+        "run",
+        "--workspace",
+        "--all-features",
+        "--lib",
+        "--retries",
+        "0",
+        "-E",
+        "test(wal::parallel_runtime) | test(mem_table::tests::failpoint_v7_producer) | test(mem_table::tests::failpoint_v7_small_admission)"
+      ],
+      "returncode": 0,
+      "elapsed_seconds": 0.6249432563781738,
+      "log_path": "target/wal-opt/20261029-v7-admission-grouping/candidate-focused.log",
+      "log_sha256": "085ac388c534c90d51f6351241e8abbff33940a24b74d54bf3e7b25e5d5feafd"
+    },
+    {
+      "step": "check",
+      "command": [
+        "cargo",
+        "make",
+        "check"
+      ],
+      "returncode": 0,
+      "elapsed_seconds": 60.66100358963013,
+      "log_path": "target/wal-opt/20261029-v7-admission-grouping/candidate-check.log",
+      "log_sha256": "c17ecace86eb6dfd529f94dc83a98cea6e3facf87c8b36e81d88ffc4fe6edf64"
+    },
+    {
+      "step": "typos",
+      "command": [
+        "typos"
+      ],
+      "returncode": 0,
+      "elapsed_seconds": 0.26993560791015625,
+      "log_path": "target/wal-opt/20261029-v7-admission-grouping/candidate-typos.log",
+      "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "step": "release",
+      "command": [
+        "cargo",
+        "build",
+        "--release",
+        "--package",
+        "kv-engine",
+        "--bin",
+        "write-perf",
+        "--features",
+        "bench"
+      ],
+      "returncode": 0,
+      "elapsed_seconds": 16.573791980743408,
+      "log_path": "target/wal-opt/20261029-v7-admission-grouping/candidate-release.log",
+      "log_sha256": "d6bde7e93abb47b5463b63cc68edfe24c27881fcc2a946bd1a0e5357664a2204"
+    }
+  ],
+  "race_runs": 10,
+  "race_tests_each": 5,
+  "race_log_path": "target/wal-opt/20261029-v7-admission-grouping/race-stress.log",
+  "race_log_sha256": "35761f6e7b80d7870cdefc12e92c99a48d9d50abb732f449b1a41545ff4c71a9",
+  "temporary_directory": "/home/liu/proj/toy-kv-engine/target/tmp/wal-grouping",
+  "test_threads": 4,
+  "retries": 0,
+  "prior_full_check": "One PITR test hit its five-second timeout under eight-way SSD load; ten isolated runs passed before this four-way check.",
+  "all_captures_follow_final_checks": true,
+  "initial_test_compile_correction": "The initial test-only thread closure needed to move its channel sender; corrected before validation."
+}

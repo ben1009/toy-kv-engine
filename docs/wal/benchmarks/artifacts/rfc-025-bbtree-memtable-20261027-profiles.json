@@ -1,0 +1,248 @@
+[
+  {
+    "backend": "skipmap",
+    "run_id": "1793065521647",
+    "binary": {
+      "path": "target/release/write-perf-bbtree-skipmap",
+      "sha256": "052f42f5bbea9b1e60982608163d87ed580155e74d537d30d50ea52469776fd9",
+      "features": "bench"
+    },
+    "command": [
+      "perf",
+      "record",
+      "-e",
+      "cpu-clock:u",
+      "-F",
+      "99",
+      "--call-graph",
+      "dwarf,16384",
+      "-o",
+      "/home/liu/proj/toy-kv-engine/target/wal-opt/20261027-bbtree-investigation/skipmap.perf.data",
+      "--",
+      "/home/liu/proj/toy-kv-engine/target/release/write-perf-bbtree-skipmap",
+      "--suite",
+      "legacy",
+      "--preset",
+      "smoke",
+      "--bench",
+      "memtable_publish_concurrent",
+      "--num",
+      "1000000",
+      "--threads",
+      "16",
+      "--wal-batch-size",
+      "64",
+      "--value-size",
+      "1024",
+      "--target-sst-size",
+      "2147483648",
+      "--output",
+      "json",
+      "--compaction",
+      "none",
+      "--path",
+      "/home/liu/proj/toy-kv-engine/target/wal-opt/20261027-bbtree-investigation/skipmap-diagnostic-db"
+    ],
+    "excluded_from_scoring": true,
+    "audit": {
+      "benchmark_pid": 3781162,
+      "returncode": 0,
+      "sample_period_seconds": 1,
+      "before": {
+        "time_utc": "2026-10-27T01:45:21.570964+00:00",
+        "competing": [],
+        "load_average": [
+          0.12939453125,
+          0.54296875,
+          0.5546875
+        ],
+        "cpu_jiffies": [
+          17295342,
+          4949,
+          7799797,
+          6314006758,
+          3005355,
+          1124431,
+          1392697,
+          0,
+          0,
+          0
+        ]
+      },
+      "during": [
+        {
+          "time_utc": "2026-10-27T01:45:21.585771+00:00",
+          "competing": [],
+          "load_average": [
+            0.12939453125,
+            0.54296875,
+            0.5546875
+          ],
+          "cpu_jiffies": [
+            17295344,
+            4949,
+            7799799,
+            6314006802,
+            3005356,
+            1124431,
+            1392697,
+            0,
+            0,
+            0
+          ]
+        }
+      ],
+      "after": {
+        "time_utc": "2026-10-27T01:45:22.360913+00:00",
+        "competing": [],
+        "load_average": [
+          0.12939453125,
+          0.54296875,
+          0.5546875
+        ],
+        "cpu_jiffies": [
+          17295484,
+          4949,
+          7800324,
+          6314008612,
+          3005356,
+          1124433,
+          1392699,
+          0,
+          0,
+          0
+        ]
+      },
+      "sampling_errors": []
+    },
+    "files": {
+      "target/wal-opt/20261027-bbtree-investigation/skipmap.perf.data": "22deae6a4c8d61d73e91e33ba13b01fad18e630ecfd19593d60df8cfed4f4da5",
+      "target/wal-opt/20261027-bbtree-investigation/skipmap-profile.stdout": "78a8bfba4771cc8c5ecd9fdb4c9c81c2c20e2ea9f795f2b896492c03ec7f6602",
+      "target/wal-opt/20261027-bbtree-investigation/skipmap-profile.stderr": "f20a10e86134c5eca8ccdcc3510a524b517e6ac24558c7388805ff69ea4c3173",
+      "target/wal-opt/20261027-bbtree-investigation/skipmap-profile.txt": "f99fafb88da914a8683badd83e15a529ae39ad1f7acad702765ea90304fdbe73"
+    }
+  },
+  {
+    "backend": "bbtree",
+    "run_id": "1793065522529",
+    "binary": {
+      "path": "target/release/write-perf-bbtree-bbtree",
+      "sha256": "41eb17d001a5702be859636c6d1a56c2afb04de05edfd41726f6c586f22896e4",
+      "features": "bench,bbtree-memtable"
+    },
+    "command": [
+      "perf",
+      "record",
+      "-e",
+      "cpu-clock:u",
+      "-F",
+      "99",
+      "--call-graph",
+      "dwarf,16384",
+      "-o",
+      "/home/liu/proj/toy-kv-engine/target/wal-opt/20261027-bbtree-investigation/bbtree.perf.data",
+      "--",
+      "/home/liu/proj/toy-kv-engine/target/release/write-perf-bbtree-bbtree",
+      "--suite",
+      "legacy",
+      "--preset",
+      "smoke",
+      "--bench",
+      "memtable_publish_concurrent",
+      "--num",
+      "1000000",
+      "--threads",
+      "16",
+      "--wal-batch-size",
+      "64",
+      "--value-size",
+      "1024",
+      "--target-sst-size",
+      "2147483648",
+      "--output",
+      "json",
+      "--compaction",
+      "none",
+      "--path",
+      "/home/liu/proj/toy-kv-engine/target/wal-opt/20261027-bbtree-investigation/bbtree-diagnostic-db"
+    ],
+    "excluded_from_scoring": true,
+    "audit": {
+      "benchmark_pid": 3781185,
+      "returncode": 0,
+      "sample_period_seconds": 1,
+      "before": {
+        "time_utc": "2026-10-27T01:45:22.515670+00:00",
+        "competing": [],
+        "load_average": [
+          0.12939453125,
+          0.54296875,
+          0.5546875
+        ],
+        "cpu_jiffies": [
+          17295499,
+          4949,
+          7800326,
+          6314009089,
+          3005356,
+          1124433,
+          1392699,
+          0,
+          0,
+          0
+        ]
+      },
+      "during": [
+        {
+          "time_utc": "2026-10-27T01:45:22.523386+00:00",
+          "competing": [],
+          "load_average": [
+            0.12939453125,
+            0.54296875,
+            0.5546875
+          ],
+          "cpu_jiffies": [
+            17295500,
+            4949,
+            7800326,
+            6314009113,
+            3005356,
+            1124434,
+            1392699,
+            0,
+            0,
+            0
+          ]
+        }
+      ],
+      "after": {
+        "time_utc": "2026-10-27T01:45:23.296792+00:00",
+        "competing": [],
+        "load_average": [
+          0.12939453125,
+          0.54296875,
+          0.5546875
+        ],
+        "cpu_jiffies": [
+          17295710,
+          4949,
+          7800826,
+          6314010874,
+          3005356,
+          1124435,
+          1392701,
+          0,
+          0,
+          0
+        ]
+      },
+      "sampling_errors": []
+    },
+    "files": {
+      "target/wal-opt/20261027-bbtree-investigation/bbtree.perf.data": "a2f27f865447648158057faaff5f092af093fc55dfbf07701309eaad1b732a90",
+      "target/wal-opt/20261027-bbtree-investigation/bbtree-profile.stdout": "17c25207a73bf93666d94b090ebeb0ec21b65edb8d1ced6cf46172ee3481cfff",
+      "target/wal-opt/20261027-bbtree-investigation/bbtree-profile.stderr": "6fbee83adae1ca1baa49623c1b5a026c2a3f7022abdbbb4bd862e3df7b904651",
+      "target/wal-opt/20261027-bbtree-investigation/bbtree-profile.txt": "fed395a82454c5dca95b86062954437633618f1db852c8ac31730d94fb9bb33a"
+    }
+  }
+]

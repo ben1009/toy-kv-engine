@@ -1,0 +1,29 @@
+{
+  "created_at_utc": "2026-10-29T01:33:27.773802+00:00",
+  "source_base": "d3366ebb11938aa659fe2f08f73e64281410f93f",
+  "baseline": {
+    "path": "target/release/write-perf-v7-large-data-async-dispatch",
+    "sha256": "f353022d846530a6754330aaea11f295319ea8f4de20afa09b6d2a3b57b021d8"
+  },
+  "candidate": {
+    "path": "target/release/write-perf-v7-signal-taskwork",
+    "sha256": "79592a3cbf0c4f9e5411690cd5e369e62b9abdc6991f88b03b0b0d9b42071889"
+  },
+  "scope": "Maintainer-requested independent rerun, expanded before capture to all six workloads after the question about the other data. Exact original candidate; no new policy or diagnostic captures. No pooling with either earlier cohort.",
+  "prior_verification": "rfc-025-v7-signal-taskwork-retry-20261029-verification.json",
+  "prior_verification_sha256": "46fab9c2a5c21447d651d97bb80779f21a5034d187e88b170333f76ebf29a156",
+  "prior_global_invocations": 869,
+  "prior_full_archive_invocations": 4965,
+  "source_origin": "rfc-025-v7-signal-taskwork-20261029",
+  "validation_origin": "rfc-025-v7-signal-taskwork-retry-20261029",
+  "candidate_patch_sha256": "e339370429eddb1f84793589b44814ca3162e91e2a2603dabe80a6981eafba97",
+  "configuration": "Fresh local ext4 databases; v7 Parallel,1KiB values,2GiB SST,no compaction. Batch64 uses750000 puts/sample10;point8/16 use100000/sample100;point1 uses20000/sample10. Reuse byte-identical saved baseline and candidate binaries.",
+  "schedule": "All six cells run regardless of interim performance. Batch16 and point8 each have2 warmups+5 alternating pairs;point1,point16,batch8,batch1 each have2 warmups+3 pairs. Exactly56 invocations:12 warmups+44 scored. No replacement pairs, pooling or score-selected extra runs. Stop on capture or audit errors.",
+  "cooldown": "60s before every cell and15s between invocations; no overlapping builds/tests/profiles/source edits or SSD health polling.",
+  "stall_policy": "Unchanged: exclude whole pair if either arm mean FRONTIER write>=1ms OR mean fdatasync>=1.5ms. Preserve every raw invocation. This aggregate mask misses short outliers and cannot establish stall-free conditions or source/environment attribution.",
+  "assessment": "Batch16 needs>=3 matched pairs; other guards>=2. Guard paired and arm-median throughput>=0.95 and paired p99<=1.10. Independent point8 confirmation needs>=3 pairs, paired and arm-median throughput>1 and paired p99<1. Identical DATA bytes. CPU/RSS diagnostic. Retain only if all six cells complete and pass; otherwise baseline source and canonical executable stay unchanged.",
+  "validation": "No source changes or new builds/tests before the rerun. Verify all128 live inputs against the retained baseline, both saved binaries against original build provenance, and the archived candidate focused49/full1975 and retained1973 checks from the immediately preceding retry. If all performance checks pass, apply the exact saved patch and run fresh correctness checks before retaining it.",
+  "source_during_capture": "retained baseline",
+  "canonical_during_capture_sha256": "f353022d846530a6754330aaea11f295319ea8f4de20afa09b6d2a3b57b021d8",
+  "publication": "Accepted source gets its own local commit; evidence separate. Otherwise evidence only, with live baseline/executable verified unchanged. No push/PR; stop for review."
+}

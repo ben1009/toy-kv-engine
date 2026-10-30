@@ -1,0 +1,75 @@
+{
+  "v4-batch64": {
+    "sampled_user_cpu_ns": 2514543563,
+    "leaf_samples": 2507,
+    "thread_percent": {
+      "write-perf-v7-v": 94.25608296769046,
+      "wal-io-worker": 1.7151974471479856,
+      "wal-ordered-pac": 2.2337455125648185,
+      "wal-sync-coordi": 1.7550857598723575,
+      "kv-background-r": 0.03988831272437176
+    },
+    "top_leaf_percent": {
+      "write-perf-v7-v | [unknown]": 24.770642201834864,
+      "write-perf-v7-v | <kv_engine::table::builder::SsTableBuilder>::add_inner": 18.82728360590347,
+      "write-perf-v7-v | sha2::sha256::x86::digest_blocks": 12.524930195452733,
+      "write-perf-v7-v | __vdso_clock_gettime": 5.225368966892701,
+      "write-perf-v7-v | <crossbeam_skiplist::base::SkipList<bytes::bytes::Bytes, bytes::bytes::Bytes>>::search_position::<bytes::bytes::Bytes>": 5.025927403270842,
+      "write-perf-v7-v | <kv_engine::mvcc::LsmMvccInner>::publish_commit_ts": 4.30793777423215,
+      "write-perf-v7-v | <std::thread::local::LocalKey<core::cell::RefCell<alloc::vec::Vec<u8>>>>::with::<<kv_engine::mem_table::MemTable>::publish_raw_batch::{closure#0}, ()>": 4.148384523334663,
+      "wal-ordered-pac | <crossbeam_channel::flavors::array::Channel<bool>>::recv": 1.7949740725967291,
+      "write-perf-v7-v | <crossbeam_skiplist::base::SkipList<bytes::bytes::Bytes, bytes::bytes::Bytes>>::insert_internal::<<crossbeam_skiplist::base::SkipList<bytes::bytes::Bytes, bytes::bytes::Bytes>>::insert::{closure#0}, <crossbeam_skiplist::base::SkipList<bytes::bytes::Bytes, bytes::bytes::Bytes>>::insert::{closure#1}>": 1.5556441962504985,
+      "write-perf-v7-v | crc32fast::specialized::pclmulqdq::calculate": 1.475867570801755,
+      "write-perf-v7-v | bytes::bytes::shared_drop": 1.0370961308336657,
+      "write-perf-v7-v | crc32fast::baseline::update_fast_16": 0.9972078181092939
+    }
+  },
+  "v7-batch64": {
+    "sampled_user_cpu_ns": 1997993928,
+    "leaf_samples": 1992,
+    "thread_percent": {
+      "write-perf-v7-v": 70.13052208835342,
+      "wal-ordered-pac": 23.49397590361446,
+      "wal-sync-coordi": 3.0622489959839356,
+      "wal-io-worker": 3.3132530120481927
+    },
+    "top_leaf_percent": {
+      "write-perf-v7-v | [unknown]": 26.907630522088354,
+      "wal-ordered-pac | sha2::sha256::x86::digest_blocks": 18.022088353413654,
+      "write-perf-v7-v | <crossbeam_skiplist::base::SkipList<bytes::bytes::Bytes, bytes::bytes::Bytes>>::search_position::<bytes::bytes::Bytes>": 6.475903614457831,
+      "write-perf-v7-v | __vdso_clock_gettime": 5.421686746987952,
+      "write-perf-v7-v | <std::thread::local::LocalKey<core::cell::RefCell<alloc::vec::Vec<u8>>>>::with::<<kv_engine::mem_table::MemTable>::publish_raw_batch::{closure#0}, ()>": 4.518072289156627,
+      "write-perf-v7-v | <crossbeam_skiplist::base::SkipList<bytes::bytes::Bytes, bytes::bytes::Bytes>>::insert_internal::<<crossbeam_skiplist::base::SkipList<bytes::bytes::Bytes, bytes::bytes::Bytes>>::insert::{closure#0}, <crossbeam_skiplist::base::SkipList<bytes::bytes::Bytes, bytes::bytes::Bytes>>::insert::{closure#1}>": 4.066265060240964,
+      "write-perf-v7-v | <kv_engine::mvcc::LsmMvccInner>::publish_commit_ts": 3.6144578313253013,
+      "wal-ordered-pac | [unknown]": 2.6606425702811247,
+      "write-perf-v7-v | crc32fast::baseline::update_fast_16": 1.8072289156626506,
+      "write-perf-v7-v | crc32fast::specialized::pclmulqdq::calculate": 1.7068273092369477,
+      "write-perf-v7-v | bytes::bytes::shared_drop": 1.5562248995983936,
+      "write-perf-v7-v | <core::slice::iter::Iter<kv_engine::pitr::WalEntry> as core::iter::traits::iterator::Iterator>::try_fold::<(), <core::iter::adapters::enumerate::Enumerate<_> as core::iter::traits::iterator::Iterator>::try_fold::enumerate<&kv_engine::pitr::WalEntry, (), core::ops::control_flow::ControlFlow<&kv_engine::pitr::WalEntry>, core::iter::traits::iterator::Iterator::find_map::check<(usize, &kv_engine::pitr::WalEntry), &kv_engine::pitr::WalEntry, &mut <kv_engine::pitr::CanonicalWalEntryStream>::entries::{closure#0}>::{closure#0}>::{closure#0}, core::ops::control_flow::ControlFlow<&kv_engine::pitr::WalEntry>>": 1.4558232931726907
+    }
+  },
+  "v7-point8": {
+    "sampled_user_cpu_ns": 1914744181,
+    "leaf_samples": 1909,
+    "thread_percent": {
+      "write-perf-v7-v": 49.921424829753796,
+      "wal-ordered-pac": 19.27710843373494,
+      "wal-io-worker": 13.61969617600838,
+      "wal-sync-coordi": 17.18177056050288
+    },
+    "top_leaf_percent": {
+      "wal-ordered-pac | <crossbeam_channel::flavors::array::Channel<bool>>::recv": 11.10529072812991,
+      "wal-sync-coordi | <crossbeam_channel::flavors::list::Channel<kv_engine::wal::parallel_worker::GroupWriteResult>>::recv": 9.690937663698271,
+      "write-perf-v7-v | <kv_engine::mvcc::LsmMvccInner>::publish_commit_ts": 7.333682556312206,
+      "write-perf-v7-v | [unknown]": 5.500261917234154,
+      "wal-io-worker | <crossbeam_channel::flavors::list::Channel<kv_engine::wal::parallel_worker::WorkerCommand<kv_engine::wal::parallel_runtime::ParallelBuffer>>>::recv": 4.557359874279728,
+      "write-perf-v7-v | <parking_lot::raw_mutex::RawMutex>::lock_slow": 3.247773703509691,
+      "wal-ordered-pac | sha2::sha256::x86::digest_blocks": 2.9858564693556837,
+      "write-perf-v7-v | __vdso_clock_gettime": 2.4620220010476688,
+      "write-perf-v7-v | <std::thread::local::LocalKey<core::cell::RefCell<alloc::vec::Vec<u8>>>>::with::<<kv_engine::mem_table::MemTable>::publish_raw_batch::{closure#0}, ()>": 2.095337873232059,
+      "wal-sync-coordi | sha2::sha256::x86::digest_blocks": 1.8334206390780514,
+      "wal-ordered-pac | [unknown]": 1.5191199580932426,
+      "write-perf-v7-v | <kv_engine::lsm_storage::LsmStorageInner>::maybe_queue_pitr_maintenance": 1.466736511262441
+    }
+  }
+}

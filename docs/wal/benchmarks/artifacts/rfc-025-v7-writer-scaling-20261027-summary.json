@@ -1,0 +1,789 @@
+{
+  "captures": {
+    "round1-baseline-8writers": {
+      "arm": "baseline",
+      "writers": 8,
+      "run_id": "1793086373334",
+      "raw_puts_s": 31779.323752142922,
+      "raw_p99_ms": 35.693677,
+      "markers": {
+        "count": 2282,
+        "mean_ms": 3.745684787905346,
+        "p99_ms": 14.932415,
+        "max_ms": 212.035511,
+        "total_ms": 8547.652686
+      },
+      "fdatasync": {
+        "count": 2282,
+        "mean_ms": 4.452895272567923,
+        "p99_ms": 16.91179,
+        "max_ms": 40.876044,
+        "total_ms": 10161.507012
+      },
+      "fallocate": {
+        "count": 787,
+        "mean_ms": 1.8116528017789073,
+        "p99_ms": 13.084616,
+        "max_ms": 16.93579,
+        "total_ms": 1425.770755
+      },
+      "initialization": {
+        "count": 219,
+        "mean_ms": 4.273096447488585,
+        "p99_ms": 14.015583,
+        "max_ms": 25.186826,
+        "total_ms": 935.808122,
+        "bytes": 28704768
+      },
+      "coordinator_fallocate_calls": 117,
+      "speculative_tail": {
+        "mean_bytes": 144928.75723049956,
+        "max_bytes": 487424,
+        "fraction_nonzero": 0.8685363716038562
+      },
+      "wal_thread_states": {
+        "wal-io-worker": {
+          "S/futex_wait_queue": 54,
+          "S/do_sys_poll": 132,
+          "D/do_get_write_access": 20,
+          "R/0": 9,
+          "R/futex_wait_queue": 2,
+          "S/0": 4,
+          "S/do_get_write_access": 1,
+          "D/ext4_map_blocks": 1,
+          "R/do_sys_poll": 2
+        },
+        "wal-v7-extent-i": {
+          "S/futex_wait_queue": 219,
+          "D/__iomap_dio_rw": 6
+        },
+        "wal-sync-coordi": {
+          "S/futex_wait_queue": 26,
+          "D/jbd2_log_wait_commit": 105,
+          "D/__iomap_dio_rw": 77,
+          "R/futex_wait_queue": 4,
+          "S/0": 5,
+          "R/jbd2_log_wait_commit": 3,
+          "D/inode_dio_wait": 2,
+          "D/0": 1,
+          "D/submit_bio_wait": 1,
+          "R/0": 1
+        },
+        "wal-ordered-pac": {
+          "S/futex_wait_queue": 191,
+          "D/inode_dio_wait": 11,
+          "R/0": 14,
+          "D/ext4_fallocate": 5,
+          "S/0": 2,
+          "R/futex_wait_queue": 2
+        }
+      },
+      "wal_thread_syscalls": {
+        "wal-io-worker": {
+          "202": 60,
+          "7": 134,
+          "426": 23,
+          "219": 2,
+          "running": 6
+        },
+        "wal-v7-extent-i": {
+          "202": 219,
+          "18": 6
+        },
+        "wal-sync-coordi": {
+          "202": 33,
+          "75": 107,
+          "18": 78,
+          "running": 5,
+          "285": 2
+        },
+        "wal-ordered-pac": {
+          "202": 195,
+          "285": 17,
+          "running": 13
+        }
+      },
+      "device_sample_window": {
+        "elapsed_ms": 23936.064882,
+        "writes": 19818,
+        "write_bytes": 902569984,
+        "mean_write_ms": 3.040115046927036,
+        "busy_ms": 20243,
+        "flushes": 2346,
+        "flush_ms": 2054
+      }
+    },
+    "round1-baseline-16writers": {
+      "arm": "baseline",
+      "writers": 16,
+      "run_id": "1793086412345",
+      "raw_puts_s": 26799.32677116783,
+      "raw_p99_ms": 98.821187,
+      "markers": {
+        "count": 1347,
+        "mean_ms": 10.425746340014848,
+        "p99_ms": 38.400881,
+        "max_ms": 181.075979,
+        "total_ms": 14043.48032
+      },
+      "fdatasync": {
+        "count": 1347,
+        "mean_ms": 5.905748048255383,
+        "p99_ms": 28.547243,
+        "max_ms": 39.27163,
+        "total_ms": 7955.042621
+      },
+      "fallocate": {
+        "count": 783,
+        "mean_ms": 9.99172275989783,
+        "p99_ms": 38.125384,
+        "max_ms": 74.374322,
+        "total_ms": 7823.518921
+      },
+      "initialization": {
+        "count": 139,
+        "mean_ms": 2.041990287769784,
+        "p99_ms": 15.750216,
+        "max_ms": 23.251866,
+        "total_ms": 283.83665,
+        "bytes": 18219008
+      },
+      "coordinator_fallocate_calls": 86,
+      "speculative_tail": {
+        "mean_bytes": 273927.2219747587,
+        "max_bytes": 974848,
+        "fraction_nonzero": 0.9198218262806236
+      },
+      "wal_thread_states": {
+        "wal-io-worker": {
+          "S/futex_wait_queue": 29,
+          "S/do_sys_poll": 212,
+          "R/0": 5,
+          "D/do_get_write_access": 5,
+          "R/do_sys_poll": 4,
+          "R/futex_wait_queue": 2,
+          "S/0": 8
+        },
+        "wal-v7-extent-i": {
+          "S/futex_wait_queue": 265
+        },
+        "wal-sync-coordi": {
+          "S/futex_wait_queue": 47,
+          "D/jbd2_log_wait_commit": 73,
+          "D/__iomap_dio_rw": 132,
+          "R/__iomap_dio_rw": 1,
+          "S/0": 2,
+          "D/inode_dio_wait": 5,
+          "R/futex_wait_queue": 3,
+          "R/0": 1,
+          "D/0": 1
+        },
+        "wal-ordered-pac": {
+          "S/futex_wait_queue": 184,
+          "D/ext4_fallocate": 27,
+          "D/inode_dio_wait": 22,
+          "R/futex_wait_queue": 5,
+          "R/0": 26,
+          "D/0": 1
+        }
+      },
+      "wal_thread_syscalls": {
+        "wal-io-worker": {
+          "202": 35,
+          "7": 216,
+          "426": 5,
+          "running": 8,
+          "219": 1
+        },
+        "wal-v7-extent-i": {
+          "202": 265
+        },
+        "wal-sync-coordi": {
+          "202": 51,
+          "75": 72,
+          "18": 133,
+          "running": 4,
+          "285": 5
+        },
+        "wal-ordered-pac": {
+          "202": 188,
+          "285": 49,
+          "running": 28
+        }
+      },
+      "device_sample_window": {
+        "elapsed_ms": 28303.346915,
+        "writes": 15912,
+        "write_bytes": 873156608,
+        "mean_write_ms": 7.8281799899446955,
+        "busy_ms": 24716,
+        "flushes": 1411,
+        "flush_ms": 1230
+      }
+    },
+    "round1-candidate-16writers": {
+      "arm": "candidate",
+      "writers": 16,
+      "run_id": "1793086455741",
+      "raw_puts_s": 565226.4115642412,
+      "raw_p99_ms": 4.539397,
+      "markers": {
+        "count": 1173,
+        "mean_ms": 0.057099757885763,
+        "p99_ms": 0.406818,
+        "max_ms": 0.585709,
+        "total_ms": 66.978016
+      },
+      "fdatasync": {
+        "count": 1173,
+        "mean_ms": 0.3853924936061381,
+        "p99_ms": 0.716871,
+        "max_ms": 45.630162,
+        "total_ms": 452.065395
+      },
+      "fallocate": {
+        "count": 782,
+        "mean_ms": 0.04146142327365729,
+        "p99_ms": 0.300767,
+        "max_ms": 0.617527,
+        "total_ms": 32.422833
+      },
+      "initialization": {
+        "count": 559,
+        "mean_ms": 0.11653022182468695,
+        "p99_ms": 0.621445,
+        "max_ms": 0.693668,
+        "total_ms": 65.140394,
+        "bytes": 73269248
+      },
+      "coordinator_fallocate_calls": 102,
+      "speculative_tail": {
+        "mean_bytes": 155319.76129582268,
+        "max_bytes": 1044480,
+        "fraction_nonzero": 0.5319693094629157
+      },
+      "wal_thread_states": {
+        "wal-io-worker": {
+          "S/do_sys_poll": 5,
+          "R/do_sys_poll": 1,
+          "S/0": 1,
+          "S/futex_wait_queue": 6
+        },
+        "wal-v7-extent-i": {
+          "S/futex_wait_queue": 13
+        },
+        "wal-sync-coordi": {
+          "S/futex_wait_queue": 8,
+          "D/jbd2_log_wait_commit": 4,
+          "S/0": 1
+        },
+        "wal-ordered-pac": {
+          "R/0": 10,
+          "R/inode_dio_wait": 1,
+          "S/futex_wait_queue": 2
+        }
+      },
+      "wal_thread_syscalls": {
+        "wal-io-worker": {
+          "running": 2,
+          "7": 5,
+          "202": 6
+        },
+        "wal-v7-extent-i": {
+          "202": 13
+        },
+        "wal-sync-coordi": {
+          "202": 9,
+          "75": 4
+        },
+        "wal-ordered-pac": {
+          "202": 3,
+          "285": 1,
+          "running": 9
+        }
+      },
+      "device_sample_window": {
+        "elapsed_ms": 1463.233978,
+        "writes": 13522,
+        "write_bytes": 922730496,
+        "mean_write_ms": 0.119434994823251,
+        "busy_ms": 614,
+        "flushes": 1232,
+        "flush_ms": 338
+      }
+    },
+    "round1-candidate-8writers": {
+      "arm": "candidate",
+      "writers": 8,
+      "run_id": "1793086472266",
+      "raw_puts_s": 367538.27271961316,
+      "raw_p99_ms": 2.986993,
+      "markers": {
+        "count": 1687,
+        "mean_ms": 0.07152399822169532,
+        "p99_ms": 0.254706,
+        "max_ms": 53.206837,
+        "total_ms": 120.660985
+      },
+      "fdatasync": {
+        "count": 1687,
+        "mean_ms": 0.3160967741553053,
+        "p99_ms": 0.647782,
+        "max_ms": 1.094839,
+        "total_ms": 533.255258
+      },
+      "fallocate": {
+        "count": 784,
+        "mean_ms": 0.01605541581632653,
+        "p99_ms": 0.207883,
+        "max_ms": 0.427417,
+        "total_ms": 12.587446
+      },
+      "initialization": {
+        "count": 154,
+        "mean_ms": 0.13426707792207793,
+        "p99_ms": 0.372648,
+        "max_ms": 0.517721,
+        "total_ms": 20.67713,
+        "bytes": 20185088
+      },
+      "coordinator_fallocate_calls": 36,
+      "speculative_tail": {
+        "mean_bytes": 23444.561944279787,
+        "max_bytes": 417792,
+        "fraction_nonzero": 0.13692946058091288
+      },
+      "wal_thread_states": {
+        "wal-io-worker": {
+          "R/futex_wait_queue": 5,
+          "S/do_sys_poll": 3,
+          "R/0": 2,
+          "S/futex_wait_queue": 7,
+          "S/0": 3
+        },
+        "wal-v7-extent-i": {
+          "S/futex_wait_queue": 20
+        },
+        "wal-sync-coordi": {
+          "S/futex_wait_queue": 11,
+          "D/jbd2_log_wait_commit": 3,
+          "S/__iomap_dio_rw": 1,
+          "S/0": 3,
+          "D/submit_bio_wait": 1,
+          "R/futex_wait_queue": 1
+        },
+        "wal-ordered-pac": {
+          "R/0": 16,
+          "S/futex_wait_queue": 4
+        }
+      },
+      "wal_thread_syscalls": {
+        "wal-io-worker": {
+          "202": 14,
+          "running": 3,
+          "7": 3
+        },
+        "wal-v7-extent-i": {
+          "202": 20
+        },
+        "wal-sync-coordi": {
+          "202": 13,
+          "75": 4,
+          "running": 3
+        },
+        "wal-ordered-pac": {
+          "running": 15,
+          "202": 5
+        }
+      },
+      "device_sample_window": {
+        "elapsed_ms": 2196.466486,
+        "writes": 15989,
+        "write_bytes": 879808512,
+        "mean_write_ms": 0.07054850209519044,
+        "busy_ms": 880,
+        "flushes": 1746,
+        "flush_ms": 424
+      }
+    },
+    "round2-candidate-8writers": {
+      "arm": "candidate",
+      "writers": 8,
+      "run_id": "1793086489516",
+      "raw_puts_s": 458415.40713646373,
+      "raw_p99_ms": 2.568468,
+      "markers": {
+        "count": 1573,
+        "mean_ms": 0.025237467895740624,
+        "p99_ms": 0.170475,
+        "max_ms": 0.489998,
+        "total_ms": 39.698537
+      },
+      "fdatasync": {
+        "count": 1573,
+        "mean_ms": 0.33999830514939605,
+        "p99_ms": 0.620269,
+        "max_ms": 53.287989,
+        "total_ms": 534.817334
+      },
+      "fallocate": {
+        "count": 784,
+        "mean_ms": 0.015353144132653061,
+        "p99_ms": 0.249308,
+        "max_ms": 0.338806,
+        "total_ms": 12.036865
+      },
+      "initialization": {
+        "count": 61,
+        "mean_ms": 0.18919168852459017,
+        "p99_ms": 0.630501,
+        "max_ms": 0.645946,
+        "total_ms": 11.540693,
+        "bytes": 7995392
+      },
+      "coordinator_fallocate_calls": 16,
+      "speculative_tail": {
+        "mean_bytes": 11642.222504767959,
+        "max_bytes": 417792,
+        "fraction_nonzero": 0.07374443738080101
+      },
+      "wal_thread_states": {
+        "wal-io-worker": {
+          "S/do_sys_poll": 1,
+          "S/futex_wait_queue": 14,
+          "S/0": 1
+        },
+        "wal-v7-extent-i": {
+          "S/futex_wait_queue": 16
+        },
+        "wal-sync-coordi": {
+          "S/futex_wait_queue": 5,
+          "D/jbd2_log_wait_commit": 9,
+          "S/0": 1,
+          "R/futex_wait_queue": 1
+        },
+        "wal-ordered-pac": {
+          "R/0": 6,
+          "S/futex_wait_queue": 9,
+          "R/futex_wait_queue": 1
+        }
+      },
+      "wal_thread_syscalls": {
+        "wal-io-worker": {
+          "7": 1,
+          "202": 15
+        },
+        "wal-v7-extent-i": {
+          "202": 16
+        },
+        "wal-sync-coordi": {
+          "running": 2,
+          "75": 8,
+          "202": 6
+        },
+        "wal-ordered-pac": {
+          "running": 6,
+          "202": 10
+        }
+      },
+      "device_sample_window": {
+        "elapsed_ms": 1756.495016,
+        "writes": 15790,
+        "write_bytes": 865312768,
+        "mean_write_ms": 0.06269791006966434,
+        "busy_ms": 800,
+        "flushes": 1632,
+        "flush_ms": 408
+      }
+    },
+    "round2-candidate-16writers": {
+      "arm": "candidate",
+      "writers": 16,
+      "run_id": "1793086506343",
+      "raw_puts_s": 419079.9314673559,
+      "raw_p99_ms": 18.328617,
+      "markers": {
+        "count": 1212,
+        "mean_ms": 0.19610008250825084,
+        "p99_ms": 2.172393,
+        "max_ms": 52.814723,
+        "total_ms": 237.6733
+      },
+      "fdatasync": {
+        "count": 1212,
+        "mean_ms": 0.4793275742574257,
+        "p99_ms": 3.254202,
+        "max_ms": 18.320637,
+        "total_ms": 580.94502
+      },
+      "fallocate": {
+        "count": 782,
+        "mean_ms": 0.1783564296675192,
+        "p99_ms": 2.61494,
+        "max_ms": 16.015961,
+        "total_ms": 139.474728
+      },
+      "initialization": {
+        "count": 730,
+        "mean_ms": 0.12320132328767124,
+        "p99_ms": 0.646306,
+        "max_ms": 1.766388,
+        "total_ms": 89.936966,
+        "bytes": 95682560
+      },
+      "coordinator_fallocate_calls": 135,
+      "speculative_tail": {
+        "mean_bytes": 196972.9900990099,
+        "max_bytes": 974848,
+        "fraction_nonzero": 0.6600660066006601
+      },
+      "wal_thread_states": {
+        "wal-io-worker": {
+          "S/do_sys_poll": 8,
+          "S/0": 1,
+          "S/futex_wait_queue": 7
+        },
+        "wal-v7-extent-i": {
+          "S/futex_wait_queue": 14,
+          "D/__iomap_dio_rw": 2
+        },
+        "wal-sync-coordi": {
+          "S/futex_wait_queue": 5,
+          "D/jbd2_log_wait_commit": 5,
+          "D/__iomap_dio_rw": 4,
+          "D/futex_wait_queue": 1,
+          "R/__iomap_dio_rw": 1
+        },
+        "wal-ordered-pac": {
+          "S/futex_wait_queue": 6,
+          "R/0": 7,
+          "D/ext4_fallocate": 3
+        }
+      },
+      "wal_thread_syscalls": {
+        "wal-io-worker": {
+          "7": 8,
+          "202": 7,
+          "running": 1
+        },
+        "wal-v7-extent-i": {
+          "202": 14,
+          "18": 2
+        },
+        "wal-sync-coordi": {
+          "202": 5,
+          "75": 6,
+          "18": 5
+        },
+        "wal-ordered-pac": {
+          "202": 6,
+          "running": 7,
+          "285": 3
+        }
+      },
+      "device_sample_window": {
+        "elapsed_ms": 1948.707477,
+        "writes": 14156,
+        "write_bytes": 945631232,
+        "mean_write_ms": 0.22054252613732692,
+        "busy_ms": 946,
+        "flushes": 1270,
+        "flush_ms": 368
+      }
+    },
+    "round2-baseline-16writers": {
+      "arm": "baseline",
+      "writers": 16,
+      "run_id": "1793086523349",
+      "raw_puts_s": 174947.43804527126,
+      "raw_p99_ms": 22.963001,
+      "markers": {
+        "count": 1190,
+        "mean_ms": 1.1461443294117648,
+        "p99_ms": 3.185176,
+        "max_ms": 228.793036,
+        "total_ms": 1363.911752
+      },
+      "fdatasync": {
+        "count": 1190,
+        "mean_ms": 1.2881687420168066,
+        "p99_ms": 5.171997,
+        "max_ms": 253.889151,
+        "total_ms": 1532.920803
+      },
+      "fallocate": {
+        "count": 782,
+        "mean_ms": 1.3113531777493606,
+        "p99_ms": 3.046299,
+        "max_ms": 434.376787,
+        "total_ms": 1025.478185
+      },
+      "initialization": {
+        "count": 550,
+        "mean_ms": 0.5404174509090909,
+        "p99_ms": 0.621188,
+        "max_ms": 228.603374,
+        "total_ms": 297.229598,
+        "bytes": 72089600
+      },
+      "coordinator_fallocate_calls": 101,
+      "speculative_tail": {
+        "mean_bytes": 161409.93613445378,
+        "max_bytes": 905216,
+        "fraction_nonzero": 0.584873949579832
+      },
+      "wal_thread_states": {
+        "wal-io-worker": {
+          "S/futex_wait_queue": 9,
+          "S/do_sys_poll": 27,
+          "S/0": 4
+        },
+        "wal-v7-extent-i": {
+          "S/futex_wait_queue": 39,
+          "D/__iomap_dio_rw": 1
+        },
+        "wal-sync-coordi": {
+          "S/futex_wait_queue": 9,
+          "D/jbd2_log_wait_commit": 15,
+          "S/jbd2_log_wait_commit": 1,
+          "D/__iomap_dio_rw": 14,
+          "D/0": 1
+        },
+        "wal-ordered-pac": {
+          "R/0": 6,
+          "S/futex_wait_queue": 24,
+          "R/futex_wait_queue": 1,
+          "D/inode_dio_wait": 4,
+          "D/ext4_fallocate": 5
+        }
+      },
+      "wal_thread_syscalls": {
+        "wal-io-worker": {
+          "202": 10,
+          "7": 29,
+          "running": 1
+        },
+        "wal-v7-extent-i": {
+          "202": 39,
+          "18": 1
+        },
+        "wal-sync-coordi": {
+          "202": 11,
+          "75": 15,
+          "18": 14
+        },
+        "wal-ordered-pac": {
+          "running": 6,
+          "202": 25,
+          "285": 9
+        }
+      },
+      "device_sample_window": {
+        "elapsed_ms": 4390.769402,
+        "writes": 13986,
+        "write_bytes": 921264128,
+        "mean_write_ms": 1.0960960960960962,
+        "busy_ms": 3447,
+        "flushes": 1249,
+        "flush_ms": 595
+      }
+    },
+    "round2-baseline-8writers": {
+      "arm": "baseline",
+      "writers": 8,
+      "run_id": "1793086542836",
+      "raw_puts_s": 321626.60492394154,
+      "raw_p99_ms": 8.715043,
+      "markers": {
+        "count": 1733,
+        "mean_ms": 0.13698008020773225,
+        "p99_ms": 2.162121,
+        "max_ms": 37.190501,
+        "total_ms": 237.386479
+      },
+      "fdatasync": {
+        "count": 1733,
+        "mean_ms": 0.4220937270628967,
+        "p99_ms": 2.7699,
+        "max_ms": 18.148853,
+        "total_ms": 731.488429
+      },
+      "fallocate": {
+        "count": 784,
+        "mean_ms": 0.06280545408163266,
+        "p99_ms": 0.327601,
+        "max_ms": 15.986512,
+        "total_ms": 49.239475999999996
+      },
+      "initialization": {
+        "count": 193,
+        "mean_ms": 0.41923588601036266,
+        "p99_ms": 2.679949,
+        "max_ms": 37.988958,
+        "total_ms": 80.912526,
+        "bytes": 25296896
+      },
+      "coordinator_fallocate_calls": 39,
+      "speculative_tail": {
+        "mean_bytes": 33349.42873629544,
+        "max_bytes": 487424,
+        "fraction_nonzero": 0.19272937103289095
+      },
+      "wal_thread_states": {
+        "wal-io-worker": {
+          "S/futex_wait_queue": 14,
+          "R/do_sys_poll": 2,
+          "S/0": 3,
+          "S/do_sys_poll": 2,
+          "D/do_get_write_access": 1
+        },
+        "wal-v7-extent-i": {
+          "S/futex_wait_queue": 22
+        },
+        "wal-sync-coordi": {
+          "S/futex_wait_queue": 16,
+          "D/jbd2_log_wait_commit": 5,
+          "R/futex_wait_queue": 1
+        },
+        "wal-ordered-pac": {
+          "S/0": 1,
+          "R/0": 9,
+          "S/futex_wait_queue": 10,
+          "R/futex_wait_queue": 2
+        }
+      },
+      "wal_thread_syscalls": {
+        "wal-io-worker": {
+          "202": 13,
+          "running": 4,
+          "7": 4,
+          "426": 1
+        },
+        "wal-v7-extent-i": {
+          "202": 22
+        },
+        "wal-sync-coordi": {
+          "202": 16,
+          "75": 5,
+          "running": 1
+        },
+        "wal-ordered-pac": {
+          "running": 12,
+          "202": 10
+        }
+      },
+      "device_sample_window": {
+        "elapsed_ms": 2495.464661,
+        "writes": 16143,
+        "write_bytes": 886267904,
+        "mean_write_ms": 0.13702533605897294,
+        "busy_ms": 1167,
+        "flushes": 1792,
+        "flush_ms": 467
+      }
+    }
+  },
+  "excluded_invocations": 8,
+  "limits": "Diagnostic preload and 100ms sampling can perturb timing. Device statistics are host-wide; thread samples miss short waits. Initializer totals count synchronous non-frame WAL writes only within the active FRONTIER window. DATA io_uring requests are not visible in this trace. Scheduler run-delay accounting was disabled; kernel waits establish I/O delay, not an SSD firmware or thermal cause.",
+  "analyzer_sha256": "eafce4ebde4f4dab48960f68ae277bc67c6b094702892ba38076a1faf79ce299"
+}

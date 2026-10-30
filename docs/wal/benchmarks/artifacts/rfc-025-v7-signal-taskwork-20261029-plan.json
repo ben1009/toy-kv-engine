@@ -1,0 +1,24 @@
+{
+  "created_at_utc": "2026-10-29T00:00:26.832119+00:00",
+  "source_base": "05dd9c2c74901741d635a8b9559638a88594f143",
+  "baseline": {
+    "path": "target/release/write-perf-v7-large-data-async-dispatch",
+    "sha256": "f353022d846530a6754330aaea11f295319ea8f4de20afa09b6d2a3b57b021d8"
+  },
+  "candidate": "For active ext-filesystem v7 workers, request SINGLE_ISSUER without COOP_TASKRUN, selecting ordinary completion notification. Other runtimes retain COOP_TASKRUN+SINGLE_ISSUER. Preserve EINVAL fallback, forced-large-DATA async dispatch and all submission/completion/wait/ownership/durability rules.",
+  "motivation": "Two excluded current retained-policy traces map every API call. DATA submit-return-to-reap averages843us/768us at1/8writers while submission itself averages6-10us; durable-publication/wakeup is much smaller. Kernel6.12.71 selects TWA_SIGNAL_NO_IPI with COOP_TASKRUN and TWA_SIGNAL without it. Test notification choice as a source hypothesis; traces do not distinguish kernel/device completion delay from reaping or establish the flags as its cause.",
+  "scope": "One source candidate, staged SSD qualification. Local repository only; stop for review, no push or PR.",
+  "validation": "Real O_DIRECT worker tests cover96 mixed groups and96 small groups across the32-group bound, close after submission, exact completion tickets/lengths and bytes. Existing short/stale/out-of-order CQE, partial-submit, poison, close/recovery and failpoint tests plus full checks.",
+  "configuration": "Fresh local ext4,1KiB values,2GiB SST,explicit v7 Parallel/no compaction. Screen/confirmation point8 and guard point16 use100000 puts/sample100;point1 uses20000/sample10. Batch64 guards at1/8/16writers use750000 puts/sample10. Host audit before/1Hz/after;30s initial cooldown and10s gaps, no overlapping builds/tests/profiles/edits or SSD health polling.",
+  "schedule": "Screen: two warmups plus five alternating point8 pairs. If screen passes, run all five guards with two warmups plus three pairs each regardless of interim guard performance. If all guards pass, independent point8 confirmation has two warmups plus five pairs. Otherwise cancel dependent stages. No replacements or score-selected retries; stop on capture/audit errors.",
+  "stall_policy": "Preserve every raw invocation. Predeclare an obvious-stall flag when mean FRONTIER-write >=1ms or mean fdatasync >=1.5ms, relative to observed quiet markers~20-150us and syncs~350us. Exclude a pair from the filtered comparison if either invocation is flagged. This conservative aggregate mask misses short outliers and cannot prove retained samples stall-free or distinguish source-induced I/O changes from environment. Report exclusions by arm and all raw ratios.",
+  "assessment": "Point8 screen and independent confirmation each need at least3 filtered matched pairs, paired and arm-median throughput>1 and paired p99<1. Each guard needs at least2 filtered pairs, paired and arm-median throughput>=0.95 and paired p99<=1.10. Identical DATA bytes. CPU/RSS diagnostic. Retain only if all seven cells pass; otherwise restore exact retained source/executable.",
+  "publication": "Keep accepted source in its own local commit, with evidence separate. For a failed or inconclusive candidate, evidence-only commit plus exact restoration.",
+  "prior_verification": "rfc-025-v7-point-handoff-20261029-verification.json",
+  "prior_global_invocations": 805,
+  "diagnostic_invocations": 0,
+  "candidate_probe": "No additional diagnostic captures for the candidate; current retained-policy point-handoff traces are separately preserved and counted once.",
+  "diagnosis_summary_sha256": "076618f57ce6ba452edaed3b3bde69aa220dc3de02192354c4f6beddd15671cc",
+  "kernel_source_provenance": "rfc-025-v7-async-worker-limit-20261028-interrupted.json",
+  "prior_diagnostic_verification_sha256": "4b3076bc04c8552641e2f49ce725dedaa3467dbb223ebfe787ce4357c8e9cd6b"
+}

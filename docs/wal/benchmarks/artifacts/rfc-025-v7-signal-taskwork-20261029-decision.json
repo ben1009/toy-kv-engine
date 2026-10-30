@@ -1,0 +1,30 @@
+{
+  "assessment_passed": false,
+  "assessment": "inconclusive",
+  "source_retained": false,
+  "source_restored": true,
+  "cpu_is_diagnostic": true,
+  "source_candidates_in_scored_matrix": 1,
+  "captured_cells": [
+    "ext4-point8",
+    "ext4-point1",
+    "ext4-point16",
+    "ext4-batch8",
+    "ext4-batch16",
+    "ext4-batch1"
+  ],
+  "cancelled_cells": [
+    "ext4-point8-confirm"
+  ],
+  "screen_passed": true,
+  "reason": "The current point-write diagnosis motivates normal notification for active ext-filesystem v7. The screen and four guards pass, but all3 batch16 pairs are excluded by the frozen I/O-stall mask, leaving0 matched pairs instead of2. Independent confirmation is cancelled by the original stage policy. Candidate qualification is inconclusive; restore the retained source/executable without replacing stalled observations.",
+  "canonical_sha256": "f353022d846530a6754330aaea11f295319ea8f4de20afa09b6d2a3b57b021d8",
+  "restored_source_sha256": "1d351aadce5cf93d97b381a3eee7b13fa6bc0d0d704eba1854ad3ef2b120e0d9",
+  "candidate_tests": 1975,
+  "candidate_focused_tests": 49,
+  "matrix_invocations": 52,
+  "new_diagnostic_invocations": 0,
+  "preceding_diagnostic_invocations": 2,
+  "global_completed_unique_invocations": 857,
+  "inherited_interrupted_without_json": 1
+}

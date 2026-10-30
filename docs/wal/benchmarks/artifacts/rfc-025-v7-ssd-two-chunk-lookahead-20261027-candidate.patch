@@ -1,0 +1,101 @@
+diff --git a/kv-engine/src/wal/parallel/runtime.rs b/kv-engine/src/wal/parallel/runtime.rs
+--- a/kv-engine/src/wal/parallel/runtime.rs
++++ b/kv-engine/src/wal/parallel/runtime.rs
+@@ -3034 +3034,8 @@
+-        control.request(end);
++        // Keep two chunks ready ahead of demand rather than issuing the
++        // entire allocated suffix while DATA/FRONTIER syncs are active.
++        // Allocation stays at the same charged extent; foreground demand
++        // still prepares its own bytes without waiting for this worker.
++        let lookahead_end = needed
++            .saturating_add(2 * EXTENT_INITIALIZATION_CHUNK as u64)
++            .min(end);
++        control.request(lookahead_end);
+@@ -3421,0 +3429,13 @@
++        let lookahead_end = 3 * super::EXTENT_INITIALIZATION_CHUNK;
++        assert_eq!(
++            control.target.load(super::Ordering::Acquire),
++            lookahead_end as u64
++        );
++        // A completed background request must leave the unused allocated
++        // suffix untouched, including pre-existing bytes after its target.
++        let mut sentinel = super::DirectBuf::new(super::WAL_V7_FRAME_LEN);
++        sentinel.as_mut_slice().fill(0xA5);
++        runtime
++            .inner
++            .preallocator
++            .write_all_at(sentinel.as_mut_slice(), lookahead_end as u64)?;
+@@ -3429,3 +3449,8 @@
+-            super::PREALLOC_BLOCK
+-        );
+-        assert_eq!(&std::fs::read(&path)?[..accepted_end], before);
++            lookahead_end as u64
++        );
++        let image = std::fs::read(&path)?;
++        assert_eq!(&image[..accepted_end], before);
++        assert_eq!(
++            &image[lookahead_end..lookahead_end + super::WAL_V7_FRAME_LEN],
++            sentinel.as_mut_slice()
++        );
+@@ -3445,0 +3471,61 @@
++        Ok(())
++    }
++
++    #[test]
++    fn async_v7_extent_lookahead_respects_partial_file_caps() -> anyhow::Result<()> {
++        use crate::wal::v7::{
++            install::recover_and_install_active, recovery::WalV7RecoveryAuthority,
++        };
++        let directory = async_extent_test_directory()?;
++        for extra in [0, 1] {
++            let path = directory.path().join(format!("bounded-tail-{extra}.wal"));
++            let cap = 192 * 1024 + extra;
++            let Some(V7RuntimeTestWal { wal, owner, anchor }) =
++                live_v7_test_wal(&path, cap, v7_test_resource_limits())?
++            else {
++                return Ok(());
++            };
++            let concurrent_preparation = owner.reserve_batch(256)?;
++            let runtime = wal.parallel_runtime.as_ref().unwrap();
++            let Some((entered, resume)) = pause_async_extent(runtime) else {
++                eprintln!("skipping async extent test (ext filesystem unavailable)");
++                return Ok(());
++            };
++            let control = Arc::clone(runtime.inner.async_v7_extents.as_ref().unwrap());
++            let first = v7_test_batch(1, 16);
++            let ticket = wal.put_v7_batch_with_index(&first, LIVE_WAL_V5_LIMITS)?.0;
++            wal.submit_and_commit(ticket)?;
++            entered.recv_timeout(std::time::Duration::from_secs(5))?;
++            assert_eq!(control.target.load(super::Ordering::Acquire), cap);
++            assert_eq!(std::fs::metadata(&path)?.len(), cap);
++            let prefix_end = runtime.logical_length() as usize;
++            let prefix = std::fs::read(&path)?[..prefix_end].to_vec();
++            resume.send(())?;
++            wait_for_extent_state(|| control.completed_requests.load(super::Ordering::Acquire) > 0);
++            assert_eq!(
++                runtime
++                    .inner
++                    .prepared_file_end
++                    .load(super::Ordering::Acquire),
++                cap
++            );
++            assert_eq!(&std::fs::read(&path)?[..prefix_end], prefix);
++            let second = v7_test_batch(2, 32 * 1024);
++            let ticket = wal.put_v7_batch_with_index(&second, LIVE_WAL_V5_LIMITS)?.0;
++            wal.submit_and_commit(ticket)?;
++            assert_eq!(std::fs::metadata(&path)?.len(), cap);
++            drop(concurrent_preparation);
++            wal.close()?;
++            assert_eq!(owner.snapshot().buffer_memory_bytes, 0);
++            drop(wal);
++            let recovered = recover_and_install_active(
++                &path,
++                WalV7RecoveryAuthority::Active {
++                    predecessor: crate::pitr::ChainAnchor::Genesis {
++                        archive_epoch_id: crate::pitr::ArchiveEpochId(anchor.archive_epoch_id),
++                    },
++                    durable_anchors: vec![anchor],
++                },
++            )?;
++            assert_eq!(recovered.installed.batches, vec![first, second]);
++        }

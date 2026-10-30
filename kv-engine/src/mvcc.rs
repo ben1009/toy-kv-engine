@@ -500,6 +500,20 @@ impl LsmMvccInner {
         }
     }
 
+    fn finish_v7_frame_job(
+        &self,
+        memtable: &MemTable,
+        commit_ts: u64,
+        frame_job: crate::wal::WalV7FrameJob,
+    ) -> anyhow::Result<()> {
+        if let Err(error) = frame_job.finish() {
+            self.record_wal_append_failure(memtable, commit_ts);
+            return Err(error);
+        }
+
+        Ok(())
+    }
+
     /// The serial v7 adapter includes its sync in append. An append error after
     /// admission can therefore leave a recoverable batch, just like a failed
     /// ticket barrier; only a pre-admission rejection can retire a data-free gap.
@@ -729,6 +743,9 @@ impl LsmMvccInner {
             !(value.len() == 1 && value[0] == crate::vlog::KvKind::Tombstone as u8),
             "value must not be the tombstone marker byte (0x02)"
         );
+        if memtable.uses_v7_wal() && memtable.uses_parallel_wal() {
+            return self.write_v7_parallel_wal_only(user_key, value, memtable);
+        }
         let _write_guard = self.write_lock.lock();
         let commit_ts = self.reserve_commit_ts()?;
         let _unwind_guard = self.guard_v7_commit_unwind(memtable, commit_ts);
@@ -768,6 +785,53 @@ impl LsmMvccInner {
         Ok((commit_ts, encoded_key, prefixed, ticket))
     }
 
+    /// Prepare owned v7 bytes and buffer reservations before taking the MVCC
+    /// sequencer. Ticket assignment and admission remain timestamp ordered.
+    fn write_v7_parallel_wal_only(
+        &self,
+        user_key: &[u8],
+        value: &[u8],
+        memtable: &MemTable,
+    ) -> Result<WalPublish, anyhow::Error> {
+        let recorded_at = self.next_pitr_recorded_at(std::time::SystemTime::now())?;
+        let mut prefixed = Vec::with_capacity(1 + value.len());
+        prefixed.push(crate::vlog::KvKind::Inline as u8);
+        prefixed.extend_from_slice(value);
+        let batch = crate::pitr::WalBatch {
+            commit_ts: 1,
+            recorded_at,
+            entries: vec![crate::pitr::WalEntry::Put {
+                key: user_key.to_vec(),
+                value: prefixed.clone(),
+            }],
+        };
+        let prepared =
+            memtable.prepare_v7_pitr_wal_batch(&batch, crate::pitr::LIVE_WAL_V5_LIMITS)?;
+        drop(batch);
+
+        let _write_guard = self.write_lock.lock();
+        let commit_ts = self.reserve_commit_ts()?;
+        let _unwind_guard = self.guard_v7_commit_unwind(memtable, commit_ts);
+        let encoded_key = encode_internal_key(user_key, commit_ts);
+        let (ticket, frame_job) = match memtable.admit_prepared_v7_pitr_wal_batch_only(
+            prepared,
+            commit_ts,
+            recorded_at,
+        ) {
+            Ok(ticket) => ticket,
+            Err(error) => {
+                self.record_wal_append_failure(memtable, commit_ts);
+                return Err(error);
+            }
+        };
+        if let Some(frame_job) = frame_job {
+            drop(_write_guard);
+            self.finish_v7_frame_job(memtable, commit_ts, frame_job)?;
+        }
+
+        Ok((commit_ts, encoded_key, prefixed, ticket))
+    }
+
     /// Write a tombstone to WAL only. Returns `(commit_ts, encoded_key, tombstone_value,
     /// wal_ticket)`. The caller must subsequently call [`MemTable::commit_wal_ticket`] then
     /// [`MemTable::publish_raw_batch`].
@@ -781,9 +845,9 @@ impl LsmMvccInner {
         let _unwind_guard = self.guard_v7_commit_unwind(memtable, commit_ts);
         let encoded_key = encode_internal_key(user_key, commit_ts);
         let tombstone_val = vec![crate::vlog::KvKind::Tombstone as u8];
-        let ticket = match if memtable.uses_pitr_batch_wal() {
+        let (ticket, frame_job) = match if memtable.uses_pitr_batch_wal() {
             let recorded_at = self.pitr_recorded_at_for_commit(commit_ts)?;
-            memtable.write_pitr_wal_batch_only(
+            memtable.admit_pitr_wal_batch_only(
                 &crate::pitr::WalBatch {
                     commit_ts,
                     recorded_at,
@@ -794,10 +858,12 @@ impl LsmMvccInner {
                 crate::pitr::LIVE_WAL_V5_LIMITS,
             )
         } else {
-            memtable.write_wal_batch_only(&[(
-                crate::key::KeySlice::from_slice(&encoded_key),
-                tombstone_val.as_slice(),
-            )])
+            memtable
+                .write_wal_batch_only(&[(
+                    crate::key::KeySlice::from_slice(&encoded_key),
+                    tombstone_val.as_slice(),
+                )])
+                .map(|ticket| (ticket, None))
         } {
             Ok(ticket) => ticket,
             Err(error) => {
@@ -805,6 +871,10 @@ impl LsmMvccInner {
                 return Err(error);
             }
         };
+        if let Some(frame_job) = frame_job {
+            drop(_write_guard);
+            self.finish_v7_frame_job(memtable, commit_ts, frame_job)?;
+        }
         // Do NOT advance current_ts here — see write_wal_only comment.
 
         Ok((commit_ts, encoded_key, tombstone_val, ticket))
@@ -832,9 +902,9 @@ impl LsmMvccInner {
         let expire_at = crate::vlog::compute_expire_at(ttl);
         let prefixed =
             crate::vlog::encode_ttl_value(crate::vlog::KvKind::TtlInline, expire_at, value);
-        let ticket = match if memtable.uses_pitr_batch_wal() {
+        let (ticket, frame_job) = match if memtable.uses_pitr_batch_wal() {
             let recorded_at = self.pitr_recorded_at_for_commit(commit_ts)?;
-            memtable.write_pitr_wal_batch_only(
+            memtable.admit_pitr_wal_batch_only(
                 &crate::pitr::WalBatch {
                     commit_ts,
                     recorded_at,
@@ -846,10 +916,12 @@ impl LsmMvccInner {
                 crate::pitr::LIVE_WAL_V5_LIMITS,
             )
         } else {
-            memtable.write_wal_batch_only(&[(
-                crate::key::KeySlice::from_slice(&encoded_key),
-                prefixed.as_slice(),
-            )])
+            memtable
+                .write_wal_batch_only(&[(
+                    crate::key::KeySlice::from_slice(&encoded_key),
+                    prefixed.as_slice(),
+                )])
+                .map(|ticket| (ticket, None))
         } {
             Ok(ticket) => ticket,
             Err(error) => {
@@ -857,6 +929,10 @@ impl LsmMvccInner {
                 return Err(error);
             }
         };
+        if let Some(frame_job) = frame_job {
+            drop(_write_guard);
+            self.finish_v7_frame_job(memtable, commit_ts, frame_job)?;
+        }
 
         Ok((commit_ts, encoded_key, prefixed, ticket))
     }
@@ -882,7 +958,7 @@ impl LsmMvccInner {
         let _write_guard = self.write_lock.lock();
         let commit_ts = self.reserve_commit_ts()?;
         let _unwind_guard = self.guard_v7_commit_unwind(memtable, commit_ts);
-        let ticket = match if memtable.uses_pitr_batch_wal() {
+        let (ticket, frame_job) = match if memtable.uses_pitr_batch_wal() {
             let recorded_at = self.pitr_recorded_at_for_commit(commit_ts)?;
             let mut wal_entries = Vec::with_capacity(entries.len());
             for (start, end) in entries {
@@ -891,7 +967,7 @@ impl LsmMvccInner {
                     end: (*end).to_vec(),
                 });
             }
-            memtable.write_pitr_wal_batch_only(
+            memtable.admit_pitr_wal_batch_only(
                 &crate::pitr::WalBatch {
                     commit_ts,
                     recorded_at,
@@ -900,7 +976,9 @@ impl LsmMvccInner {
                 crate::pitr::LIVE_WAL_V5_LIMITS,
             )
         } else {
-            memtable.put_range_tombstone_batch_wal_only(entries, commit_ts, 0)
+            memtable
+                .put_range_tombstone_batch_wal_only(entries, commit_ts, 0)
+                .map(|ticket| (ticket, None))
         } {
             Ok(ticket) => ticket,
             Err(error) => {
@@ -908,6 +986,10 @@ impl LsmMvccInner {
                 return Err(error);
             }
         };
+        if let Some(frame_job) = frame_job {
+            drop(_write_guard);
+            self.finish_v7_frame_job(memtable, commit_ts, frame_job)?;
+        }
         // Do NOT advance current_ts here — see write_wal_only comment.
 
         Ok((commit_ts, ticket))
@@ -956,7 +1038,7 @@ impl LsmMvccInner {
         };
         let commit_ts = self.reserve_commit_ts()?;
         let _unwind_guard = self.guard_v7_commit_unwind(memtable, commit_ts);
-        let ticket = match memtable.write_prepared_v7_pitr_wal_batch_only(
+        let (ticket, frame_job) = match memtable.admit_prepared_v7_pitr_wal_batch_only(
             prepared,
             commit_ts,
             recorded_at,
@@ -967,6 +1049,10 @@ impl LsmMvccInner {
                 return Err(error);
             }
         };
+        if let Some(frame_job) = frame_job {
+            drop(_write_guard);
+            self.finish_v7_frame_job(memtable, commit_ts, frame_job)?;
+        }
 
         Ok(Some((commit_ts, ticket)))
     }
@@ -1161,7 +1247,7 @@ impl LsmMvccInner {
             let ticket_result = if let Some(prepared) = prepared_v7 {
                 let recorded_at =
                     v7_sampled_recorded_at.expect("prepared v7 batch has a sampled recorded time");
-                memtable.write_prepared_v7_pitr_wal_batch_only(prepared, commit_ts, recorded_at)
+                memtable.admit_prepared_v7_pitr_wal_batch_only(prepared, commit_ts, recorded_at)
             } else {
                 let recorded_at = self.pitr_recorded_at_for_commit(commit_ts)?;
                 let wal_entries = entries
@@ -1188,7 +1274,7 @@ impl LsmMvccInner {
                         }
                     })
                     .collect();
-                memtable.write_pitr_wal_batch_only(
+                memtable.admit_pitr_wal_batch_only(
                     &crate::pitr::WalBatch {
                         commit_ts,
                         recorded_at,
@@ -1197,13 +1283,27 @@ impl LsmMvccInner {
                     crate::pitr::LIVE_WAL_V5_LIMITS,
                 )
             };
-            let ticket = match ticket_result {
+            let (ticket, frame_job) = match ticket_result {
                 Ok(ticket) => ticket,
                 Err(error) => {
                     self.record_wal_append_failure(memtable, commit_ts);
                     return Err(error);
                 }
             };
+            #[cfg(all(test, feature = "chaos-testing"))]
+            let small_v7_ticket = if frame_job.is_none() && memtable.uses_v7_wal() {
+                ticket
+            } else {
+                None
+            };
+            if let Some(frame_job) = frame_job {
+                drop(_write_guard);
+                self.finish_v7_frame_job(memtable, commit_ts, frame_job)?;
+            }
+            #[cfg(all(test, feature = "chaos-testing"))]
+            if let Some(ticket) = small_v7_ticket {
+                crate::chaos::failpoint::after_parallel_wal_small_admission(ticket);
+            }
             let publish_data = if shared_publish_bytes {
                 DeferredBatchPublish::from_entries_without_refs(publish_data)
             } else {
@@ -1289,7 +1389,7 @@ impl LsmMvccInner {
             .collect();
         if memtable.uses_pitr_batch_wal() {
             let recorded_at = self.pitr_recorded_at_for_commit(commit_ts)?;
-            let ticket = match memtable.write_pitr_wal_batch_only(
+            let (ticket, frame_job) = match memtable.admit_pitr_wal_batch_only(
                 &crate::pitr::WalBatch {
                     commit_ts,
                     recorded_at,
@@ -1306,6 +1406,10 @@ impl LsmMvccInner {
                     return Err(error);
                 }
             };
+            if let Some(frame_job) = frame_job {
+                drop(_write_guard);
+                self.finish_v7_frame_job(memtable, commit_ts, frame_job)?;
+            }
             let publish_data = if shared_publish_bytes {
                 DeferredBatchPublish::from_entries_without_refs(publish_data)
             } else {

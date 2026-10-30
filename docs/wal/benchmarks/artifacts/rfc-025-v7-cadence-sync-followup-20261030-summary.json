@@ -1,0 +1,358 @@
+{
+  "method": "Highest eligible throughput per exact binary and workload; p99, syncs, frontiers, coalesce waits and grouping counts come from that same invocation. Report unfiltered samples too.",
+  "cells": {
+    "ext4-batch8": {
+      "sync_cost": null,
+      "vs_v4": null,
+      "invocations": 6,
+      "scored_records": 4,
+      "run_ids": [
+        "1793347695406",
+        "1793347702735",
+        "1793347710496",
+        "1793347725119",
+        "1793347739450",
+        "1793347754188"
+      ],
+      "peaks": {
+        "retained-v7": {
+          "scored": 2,
+          "eligible": 0,
+          "best": null,
+          "raw_best": {
+            "run_id": "1793347725119",
+            "arm": "retained-v7",
+            "phase": "scored",
+            "round": 1,
+            "puts_s": 83497.85100467566,
+            "p99_ms": 22.072747,
+            "elapsed_ms": 8982.2671,
+            "cpu_ms": 8324.465,
+            "flagged": true,
+            "frontier_mean_ms": 1.2987052261904761,
+            "fdatasync_mean_ms": 1.3558718866843034,
+            "raw_sha256": "0a0b2a3cb5dc19fd7b671beb4110bd71413ae78ff180687652230f6f64842ca0",
+            "binary_sha256": "53d9ddddf0490142bbc5449ebf47b20af363e06c04259f4e74367cc3e7614907",
+            "pipeline": {
+              "commit_groups": 8969,
+              "commit_solo_groups": 6309,
+              "commit_buffers": 11720,
+              "commit_bytes": 816021504,
+              "cqe_count": 11720,
+              "inflight_groups_max": 8,
+              "outstanding_write_sqes_max": 8,
+              "sync_count": 2268,
+              "worker_eventfd_notifications": 8969,
+              "worker_eventfd_writes": 2724,
+              "preallocation_ns": 786225767,
+              "fdatasync_ns": 3075117439,
+              "wal_sync_wait_ns": 62541585016,
+              "frontier_writes": 2268,
+              "frontier_bytes": 9289728,
+              "frontier_write_ns": 2945463453,
+              "sync_coalesce_wait_calls": 5377,
+              "sync_coalesce_wait_ns": 1257896068,
+              "memtable_insert_ns": 1978204734,
+              "wal_file_length_bytes": 827334656,
+              "wal_allocated_bytes": 827346944
+            }
+          },
+          "median_all_rate": 81475.25630964918
+        },
+        "candidate-v7": {
+          "scored": 2,
+          "eligible": 0,
+          "best": null,
+          "raw_best": {
+            "run_id": "1793347710496",
+            "arm": "candidate-v7",
+            "phase": "scored",
+            "round": 1,
+            "puts_s": 80399.00192846236,
+            "p99_ms": 27.931369,
+            "elapsed_ms": 9328.474011,
+            "cpu_ms": 7928.621,
+            "flagged": true,
+            "frontier_mean_ms": 0.9315491003793406,
+            "fdatasync_mean_ms": 1.3778315430405603,
+            "raw_sha256": "571f1b3fb628a100df8d62673c455fa6c60940f3c4626d4aef56f0af1b4affb9",
+            "binary_sha256": "368e3fc3a38ed74debd4b69c68ee9755e3745a3a4e7ae924a70de42205c6ddce",
+            "pipeline": {
+              "commit_groups": 8147,
+              "commit_solo_groups": 4722,
+              "commit_buffers": 11720,
+              "commit_bytes": 816021504,
+              "cqe_count": 11720,
+              "inflight_groups_max": 7,
+              "outstanding_write_sqes_max": 8,
+              "sync_count": 3427,
+              "worker_eventfd_notifications": 8147,
+              "worker_eventfd_writes": 3795,
+              "preallocation_ns": 1177138392,
+              "fdatasync_ns": 4721828698,
+              "wal_sync_wait_ns": 66934899855,
+              "frontier_writes": 3427,
+              "frontier_bytes": 14036992,
+              "frontier_write_ns": 3192418767,
+              "sync_coalesce_wait_calls": 71,
+              "sync_coalesce_wait_ns": 2130196,
+              "memtable_insert_ns": 1951401825,
+              "wal_file_length_bytes": 831528960,
+              "wal_allocated_bytes": 831541248
+            }
+          },
+          "median_all_rate": 78256.26114747187
+        }
+      },
+      "ratios": null,
+      "checks": {
+        "enough_eligible": false,
+        "throughput": false,
+        "p99": false
+      },
+      "passed": false,
+      "stall_masks": [
+        {
+          "run_id": "1793347695406",
+          "arm": "retained-v7",
+          "phase": "warmup",
+          "round": 0,
+          "flagged": false,
+          "frontier_mean_ms": 0.07110065313327449,
+          "fdatasync_mean_ms": 0.3238342140335393
+        },
+        {
+          "run_id": "1793347702735",
+          "arm": "candidate-v7",
+          "phase": "warmup",
+          "round": 0,
+          "flagged": true,
+          "frontier_mean_ms": 0.22953002431029773,
+          "fdatasync_mean_ms": 0.358465707456979
+        },
+        {
+          "run_id": "1793347710496",
+          "arm": "candidate-v7",
+          "phase": "scored",
+          "round": 1,
+          "flagged": true,
+          "frontier_mean_ms": 0.9315491003793406,
+          "fdatasync_mean_ms": 1.3778315430405603
+        },
+        {
+          "run_id": "1793347725119",
+          "arm": "retained-v7",
+          "phase": "scored",
+          "round": 1,
+          "flagged": true,
+          "frontier_mean_ms": 1.2987052261904761,
+          "fdatasync_mean_ms": 1.3558718866843034
+        },
+        {
+          "run_id": "1793347739450",
+          "arm": "retained-v7",
+          "phase": "scored",
+          "round": 2,
+          "flagged": true,
+          "frontier_mean_ms": 1.2153796098786103,
+          "fdatasync_mean_ms": 1.5245112318961909
+        },
+        {
+          "run_id": "1793347754188",
+          "arm": "candidate-v7",
+          "phase": "scored",
+          "round": 2,
+          "flagged": true,
+          "frontier_mean_ms": 1.0365950008828722,
+          "fdatasync_mean_ms": 1.3630594137728074
+        }
+      ],
+      "artifact_sha256": {
+        ".jsonl": "6eaf99566733518760344d7bc4ca70b69ae144fac873c3f27d4d38595c4e1fac",
+        "-runs.tsv": "a5ff605e4fc1282d1127acf0bc0bac3b86d424d58e39c91fdc034c4f5545cd72",
+        "-host.jsonl": "58a2cc35475f999c6a534f12ead5971dafe5d5306a67229feed2a8d5db642947"
+      }
+    },
+    "ext4-batch16": {
+      "sync_cost": null,
+      "vs_v4": null,
+      "invocations": 6,
+      "scored_records": 4,
+      "run_ids": [
+        "1793347799426",
+        "1793347805973",
+        "1793347812654",
+        "1793347819863",
+        "1793347827277",
+        "1793347834797"
+      ],
+      "peaks": {
+        "retained-v7": {
+          "scored": 2,
+          "eligible": 0,
+          "best": null,
+          "raw_best": {
+            "run_id": "1793347812654",
+            "arm": "retained-v7",
+            "phase": "scored",
+            "round": 1,
+            "puts_s": 377144.2860843691,
+            "p99_ms": 15.782266,
+            "elapsed_ms": 1988.628829,
+            "cpu_ms": 5829.752,
+            "flagged": true,
+            "frontier_mean_ms": 0.18914422582872928,
+            "fdatasync_mean_ms": 0.5527811754143647,
+            "raw_sha256": "f079c491514b4cb49a1961d2789e88a373628c27c48905381dc6381cc5bcb9e0",
+            "binary_sha256": "53d9ddddf0490142bbc5449ebf47b20af363e06c04259f4e74367cc3e7614907",
+            "pipeline": {
+              "commit_groups": 5917,
+              "commit_solo_groups": 1244,
+              "commit_buffers": 11728,
+              "commit_bytes": 816054272,
+              "cqe_count": 11728,
+              "inflight_groups_max": 10,
+              "outstanding_write_sqes_max": 15,
+              "sync_count": 1448,
+              "worker_eventfd_notifications": 5917,
+              "worker_eventfd_writes": 2071,
+              "preallocation_ns": 175593964,
+              "fdatasync_ns": 800427142,
+              "wal_sync_wait_ns": 22744535264,
+              "frontier_writes": 1448,
+              "frontier_bytes": 5931008,
+              "frontier_write_ns": 273880839,
+              "sync_coalesce_wait_calls": 3462,
+              "sync_coalesce_wait_ns": 527412173,
+              "memtable_insert_ns": 1720844074,
+              "wal_file_length_bytes": 823140352,
+              "wal_allocated_bytes": 823152640
+            }
+          },
+          "median_all_rate": 225193.80634488096
+        },
+        "candidate-v7": {
+          "scored": 2,
+          "eligible": 0,
+          "best": null,
+          "raw_best": {
+            "run_id": "1793347819863",
+            "arm": "candidate-v7",
+            "phase": "scored",
+            "round": 1,
+            "puts_s": 344140.256312506,
+            "p99_ms": 15.926512,
+            "elapsed_ms": 2179.343992,
+            "cpu_ms": 5961.534,
+            "flagged": true,
+            "frontier_mean_ms": 0.2822021753875969,
+            "fdatasync_mean_ms": 0.560571039244186,
+            "raw_sha256": "1fda93b5eed8139445859482768440e146a70eff0c5feaceb9d2eb63c00eaff5",
+            "binary_sha256": "368e3fc3a38ed74debd4b69c68ee9755e3745a3a4e7ae924a70de42205c6ddce",
+            "pipeline": {
+              "commit_groups": 5744,
+              "commit_solo_groups": 1193,
+              "commit_buffers": 11728,
+              "commit_bytes": 816054272,
+              "cqe_count": 11728,
+              "inflight_groups_max": 11,
+              "outstanding_write_sqes_max": 14,
+              "sync_count": 2064,
+              "worker_eventfd_notifications": 5744,
+              "worker_eventfd_writes": 3056,
+              "preallocation_ns": 314518976,
+              "fdatasync_ns": 1157018625,
+              "wal_sync_wait_ns": 25986697023,
+              "frontier_writes": 2064,
+              "frontier_bytes": 8454144,
+              "frontier_write_ns": 582465290,
+              "sync_coalesce_wait_calls": 74,
+              "sync_coalesce_wait_ns": 6733805,
+              "memtable_insert_ns": 1645408877,
+              "wal_file_length_bytes": 826286080,
+              "wal_allocated_bytes": 826298368
+            }
+          },
+          "median_all_rate": 335070.1958138864
+        }
+      },
+      "ratios": null,
+      "checks": {
+        "enough_eligible": false,
+        "throughput": false,
+        "p99": false
+      },
+      "passed": false,
+      "stall_masks": [
+        {
+          "run_id": "1793347799426",
+          "arm": "retained-v7",
+          "phase": "warmup",
+          "round": 0,
+          "flagged": false,
+          "frontier_mean_ms": 0.06916179053084648,
+          "fdatasync_mean_ms": 0.36994076685796273
+        },
+        {
+          "run_id": "1793347805973",
+          "arm": "candidate-v7",
+          "phase": "warmup",
+          "round": 0,
+          "flagged": true,
+          "frontier_mean_ms": 0.22043262952380954,
+          "fdatasync_mean_ms": 0.35317822904761903
+        },
+        {
+          "run_id": "1793347812654",
+          "arm": "retained-v7",
+          "phase": "scored",
+          "round": 1,
+          "flagged": true,
+          "frontier_mean_ms": 0.18914422582872928,
+          "fdatasync_mean_ms": 0.5527811754143647
+        },
+        {
+          "run_id": "1793347819863",
+          "arm": "candidate-v7",
+          "phase": "scored",
+          "round": 1,
+          "flagged": true,
+          "frontier_mean_ms": 0.2822021753875969,
+          "fdatasync_mean_ms": 0.560571039244186
+        },
+        {
+          "run_id": "1793347827277",
+          "arm": "candidate-v7",
+          "phase": "scored",
+          "round": 2,
+          "flagged": true,
+          "frontier_mean_ms": 0.3199389295432459,
+          "fdatasync_mean_ms": 0.5646571049562682
+        },
+        {
+          "run_id": "1793347834797",
+          "arm": "retained-v7",
+          "phase": "scored",
+          "round": 2,
+          "flagged": true,
+          "frontier_mean_ms": 2.44269081962482,
+          "fdatasync_mean_ms": 3.399192000721501
+        }
+      ],
+      "artifact_sha256": {
+        ".jsonl": "078d7f18d01d6186490dfc1ea5a15fa6f37784e9479029ac76916582b3582a62",
+        "-runs.tsv": "5f58eb306bf670ccd4212e344676cdc25ec44247e38b719c5ce1bf425e6a0276",
+        "-host.jsonl": "559f305f3c47103ed231e6468d6e94af9ffd1b63f0df33e79548724cb2d13e40"
+      }
+    }
+  },
+  "invocations": 12,
+  "scored_records": 8,
+  "screens_complete": true,
+  "screen_passed": false,
+  "guards_complete": false,
+  "retention_passed": false,
+  "missing_cells": [],
+  "plan_sha256": "0c9df63276d0ca2c1cc17333defe7d89dddf97025324b0f20137beacc71d164b",
+  "analyzer_sha256": "107b53f669a551c902da72423123655d8565b11bfe3bd713537d4f5fcb77b125"
+}

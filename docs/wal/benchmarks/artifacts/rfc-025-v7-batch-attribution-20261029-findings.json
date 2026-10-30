@@ -1,0 +1,24 @@
+{
+  "primary": "V7 framing and logical-prefix SHA256 are serialized on the packer before DATA submission.",
+  "same_build_solo_best": {
+    "v4_puts_s": 85618,
+    "v7_puts_s": 71166,
+    "throughput_gap_pct": -16.9
+  },
+  "single_writer_trace_cpu_ms": {
+    "v4_packer": 24.06,
+    "v7_packer": 2050.78,
+    "v7_data_framing_crc": 849.86,
+    "v7_logical_prefix_sha256": 1139.88,
+    "v7_canonical_prepare": 717.66,
+    "v4_caller_pre_wait": 738.61,
+    "v7_caller_pre_wait": 1443.36
+  },
+  "interpretation": "The v7 packer stage is almost entirely CPU rather than blocked I/O in the solo trace; framing and prefix hashing account for about97percent of that stage CPU. The caller also has additional canonical preparation and owned PITR-entry work. Component timings are nested where indicated and must not be summed across overlapping threads/calls.",
+  "not_proven": "The diagnostic v4/v7 captures have different long-I/O conditions. Their raw throughput is excluded, and the measured CPU components do not assign an exact fraction of the scored17percent gap. No inherent uniform v7 slowdown, missing SHA acceleration, or extent-initialization fix is established.",
+  "next_targets": [
+    "Reduce additional PITR entry allocation/copying and canonical preparation.",
+    "Reduce frame construction/zeroing/checksum work while preserving byte-exact output.",
+    "Examine whether prefix hashing can overlap DATA I/O with an explicit hash-ready durability dependency; past overlap trials did not qualify, so this is an investigation target, not a new recommendation to repeat them unchanged."
+  ]
+}

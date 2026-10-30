@@ -1,0 +1,16 @@
+{
+  "inputs": 128,
+  "baseline_manifest": "docs/wal/benchmarks/artifacts/rfc-025-v7-serial-startup-20261027-source-sha256.tsv",
+  "baseline_manifest_sha256": "7fd5013e9bc6e21979acfb42dbddd672079efd360939de3c2d0d08b94f67a4e9",
+  "candidate_manifest": "docs/wal/benchmarks/artifacts/rfc-025-v7-ssd-batch-window-followup-20261027-source-sha256.tsv",
+  "candidate_manifest_sha256": "aa82fc48bbe344da5434fb5a21a32c882848a23bd1db593cc93acacd7732ca30",
+  "differing_paths": [
+    "kv-engine/src/wal/parallel/runtime.rs"
+  ],
+  "baseline_inputs_match_source_base": true,
+  "baseline_runtime_sha256": "a73c272d82f49b6eb3f369d517e297e99164779dcf7e24996d149acd28986bb7",
+  "candidate_runtime_sha256": "81986cd243505af166add3a9acc4bd1a003e41aec6edcb77da5bdffc0dc2e647",
+  "baseline_build": "cargo build --release --package kv-engine --bin write-perf --features bench",
+  "candidate_build": "cargo build --offline --locked --release --package kv-engine --bin write-perf --features bench",
+  "note": "Recorded release profile/features match. Offline/locked affect dependency resolution rather than code generation. Baseline saved executable is bound to its prior128-input manifest."
+}

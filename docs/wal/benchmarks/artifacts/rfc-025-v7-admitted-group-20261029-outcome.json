@@ -1,0 +1,42 @@
+{
+  "source_retained": false,
+  "reason": "The eight-writer SSD comparison was inconclusive in two cohorts; the candidate, patch and raw captures are preserved for later qualification.",
+  "rust_mtimes_refreshed": true,
+  "atomic_binary_replacement": true,
+  "restored_files": [
+    "kv-engine/src/chaos/failpoint.rs",
+    "kv-engine/src/mem_table.rs",
+    "kv-engine/src/mvcc.rs",
+    "kv-engine/src/wal/parallel/runtime.rs",
+    "kv-engine/src/wal.rs"
+  ],
+  "canonical_sha256": "f353022d846530a6754330aaea11f295319ea8f4de20afa09b6d2a3b57b021d8",
+  "restored_checks": [
+    {
+      "step": "restored-check",
+      "command": [
+        "cargo",
+        "make",
+        "check"
+      ],
+      "returncode": 0,
+      "elapsed_seconds": 174.01786637306213,
+      "log_path": "target/wal-opt/20261029-v7-admitted-group/restored-check.log",
+      "log_sha256": "8d5992cacaab413402b2b81f112d2f2bbf3a9ec9537ddf3677427310e897fce3"
+    },
+    {
+      "step": "restored-typos",
+      "command": [
+        "typos"
+      ],
+      "returncode": 0,
+      "elapsed_seconds": 0.2695019245147705,
+      "log_path": "target/wal-opt/20261029-v7-admitted-group/restored-typos.log",
+      "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    }
+  ],
+  "candidate_tests": 1986,
+  "restored_tests": 1973,
+  "test_threads": 2,
+  "retries": 0
+}

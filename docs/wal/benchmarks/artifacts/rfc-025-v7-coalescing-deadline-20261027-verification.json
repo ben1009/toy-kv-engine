@@ -1,0 +1,28 @@
+{
+  "source_base": "cda2ce872f6a520743c02ba5e20b1accf3fa21a5",
+  "reconstructed_inputs": 128,
+  "changed_input": "kv-engine/src/wal/parallel/runtime.rs",
+  "verified_binaries": 2,
+  "summary_regenerates": true,
+  "records": 20,
+  "scored_records": 16,
+  "warmup_records": 4,
+  "excluded_diagnostic_invocations": 0,
+  "global_unique_invocations": 453,
+  "stall_filter_fixed_before_capture": true,
+  "filtered_pairs": {
+    "batch16": 3,
+    "batch8": 3
+  },
+  "tests": 1972,
+  "focused_tests": 6,
+  "restored_tests": 1971,
+  "restored_flaky_tests": 1,
+  "source_retained": false,
+  "retained_source_restored": true,
+  "cpu_is_diagnostic": true,
+  "canonical_sha256": "f7fd96e5ca0ecaaaa23f59f135e7ce9430521f986834e5c95f2d32070e378d54",
+  "checks_sha256": "6c6955e726af11e57010566b1d10cc1a5ba482934837f369c990e5fc364362c5",
+  "decision_sha256": "a7ede38faf452d973c86961d7fd0588de44bf20902b84d9e09f17ca5f06f6b01",
+  "verifier_sha256": "7e2726577bb2e74ee2fa59f3beca218b7765dd781b1f0b5aa96cc4b8bf86dae3"
+}

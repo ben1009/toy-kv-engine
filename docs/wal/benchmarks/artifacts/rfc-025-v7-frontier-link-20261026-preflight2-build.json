@@ -1,0 +1,9 @@
+{
+  "command": "cc -std=c11 -O3 -g -Wall -Wextra -Werror /home/liu/proj/toy-kv-engine/docs/wal/benchmarks/artifacts/rfc-025-v7-frontier-link-20261026-probe.c -o /home/liu/proj/toy-kv-engine/target/wal-opt/20261026-v7-frontier-link/frontier-probe -luring",
+  "compiler": "cc (GCC) 15.2.1 20260209\nCopyright (C) 2025 Free Software Foundation, Inc.\nThis is free software; see the source for copying conditions.  There is NO\nwarranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.\n\n",
+  "liburing_version": "2.14",
+  "binary_path": "target/wal-opt/20261026-v7-frontier-link/frontier-probe",
+  "binary_sha256": "fffeb058e03146e34f5913a663d5c032ad2c1bcd7c990c49660b212a0dbd6fc6",
+  "source_sha256": "5d9f1eb5e0c286b1e09ed7a094290bc72e8febc0e0a69d5a1090ed292daa8dd3",
+  "plan_sha256": "c3892be6af28386551544c89bb414e7de773c73bd194a6911b522c7ead287a09"
+}

@@ -454,6 +454,92 @@ pub(crate) struct PreparedWalV7LogicalBatch<'a> {
     limits: WalV5Limits,
 }
 
+/// Canonically encoded entry bytes whose ticket and commit metadata have not
+/// yet been assigned by ordered WAL admission.
+pub(crate) struct EncodedWalV7Entries {
+    output: Vec<u8>,
+    entry_stream_crc: u32,
+    entry_count: u32,
+    limits: WalV5Limits,
+}
+
+/// An encoder-owned logical batch whose entry CRC and ordered header are complete.
+/// The bytes stay immutable until DATA framing and logical hashing finish.
+pub(crate) struct EncodedWalV7LogicalBatch {
+    output: Vec<u8>,
+    segment_ticket: u64,
+}
+
+impl EncodedWalV7LogicalBatch {
+    pub(crate) fn as_bytes(&self) -> &[u8] {
+        &self.output
+    }
+
+    /// Frame the bytes produced by this codec without rereading their entry CRC.
+    /// Physical bounds and the assigned ticket still require validation.
+    pub(crate) fn encode_data_frames_into(
+        &self,
+        header_digest: [u8; 32],
+        first_frame_offset: u64,
+        segment_ticket: u64,
+        output: &mut [u8],
+    ) -> Result<usize> {
+        ensure!(
+            self.segment_ticket == segment_ticket,
+            "v7 logical batch ticket does not match its DATA frame assignment"
+        );
+        let (fragment_count, output_len) =
+            validate_data_frame_output(first_frame_offset, self.output.len(), output.len())?;
+        encode_data_frame_sequence(
+            header_digest,
+            first_frame_offset,
+            segment_ticket,
+            &self.output,
+            fragment_count,
+            output_len,
+            output,
+        )
+    }
+}
+
+impl EncodedWalV7Entries {
+    /// Fill the reserved logical header after admission assigns ordered metadata.
+    pub(crate) fn encode_with_metadata(
+        self,
+        segment_ticket: u64,
+        commit_ts: u64,
+        recorded_at: RecordedAt,
+    ) -> Result<Vec<u8>> {
+        Ok(self
+            .into_logical_batch(segment_ticket, commit_ts, recorded_at)?
+            .output)
+    }
+
+    /// Complete ordered metadata while preserving immutable ownership of the
+    /// already-encoded entries and their computed checksum.
+    pub(crate) fn into_logical_batch(
+        mut self,
+        segment_ticket: u64,
+        commit_ts: u64,
+        recorded_at: RecordedAt,
+    ) -> Result<EncodedWalV7LogicalBatch> {
+        let data_len = self.output.len() - WAL_V7_LOGICAL_BATCH_HEADER_LEN;
+        let header = WalV7LogicalBatchHeader {
+            segment_ticket,
+            commit_ts,
+            recorded_at_secs: recorded_at.secs,
+            recorded_at_nanos: recorded_at.nanos,
+            entry_count: self.entry_count,
+        }
+        .encode_with_data_crc(data_len, self.entry_stream_crc, self.limits)?;
+        self.output[..WAL_V7_LOGICAL_BATCH_HEADER_LEN].copy_from_slice(&header);
+        Ok(EncodedWalV7LogicalBatch {
+            output: self.output,
+            segment_ticket,
+        })
+    }
+}
+
 impl PreparedWalV7LogicalBatch<'_> {
     pub(crate) fn encoded_len(&self) -> usize {
         self.logical_len
@@ -476,6 +562,13 @@ impl PreparedWalV7LogicalBatch<'_> {
         commit_ts: u64,
         recorded_at: RecordedAt,
     ) -> Result<Vec<u8>> {
+        self.encode_entry_stream()?
+            .encode_with_metadata(segment_ticket, commit_ts, recorded_at)
+    }
+
+    /// Encode the canonical entries before ordered admission takes its mutex.
+    /// The logical header is reserved and filled once the ticket is assigned.
+    pub(crate) fn encode_entry_stream(self) -> Result<EncodedWalV7Entries> {
         let Self {
             batch: _,
             canonical,
@@ -495,17 +588,12 @@ impl PreparedWalV7LogicalBatch<'_> {
             written == entry_stream_len,
             "v7 logical batch entry stream length changed while encoding"
         );
-        let header = WalV7LogicalBatchHeader {
-            segment_ticket,
-            commit_ts,
-            recorded_at_secs: recorded_at.secs,
-            recorded_at_nanos: recorded_at.nanos,
+        Ok(EncodedWalV7Entries {
+            output,
+            entry_stream_crc,
             entry_count: canonical.entry_count(),
-        }
-        .encode_with_data_crc(entry_stream.len(), entry_stream_crc, limits)?;
-        output[..WAL_V7_LOGICAL_BATCH_HEADER_LEN].copy_from_slice(&header);
-
-        Ok(output)
+            limits,
+        })
     }
 }
 
@@ -642,11 +730,41 @@ pub(crate) fn encode_data_frames_into(
     limits: WalV5Limits,
     output: &mut [u8],
 ) -> Result<usize> {
+    let (fragment_count, output_len) =
+        validate_data_frame_output(first_frame_offset, logical_batch.len(), output.len())?;
+    let entry_stream = &logical_batch[WAL_V7_LOGICAL_BATCH_HEADER_LEN..];
+    let header = WalV7LogicalBatchHeader::decode(
+        &logical_batch[..WAL_V7_LOGICAL_BATCH_HEADER_LEN],
+        entry_stream,
+        segment_ticket,
+        u64::try_from(logical_batch.len())?,
+        limits,
+    )?;
     ensure!(
-        logical_batch.len() >= WAL_V7_LOGICAL_BATCH_HEADER_LEN,
+        header.segment_ticket == segment_ticket,
+        "v7 logical batch ticket does not match its DATA frame assignment"
+    );
+    encode_data_frame_sequence(
+        header_digest,
+        first_frame_offset,
+        segment_ticket,
+        logical_batch,
+        fragment_count,
+        output_len,
+        output,
+    )
+}
+
+fn validate_data_frame_output(
+    first_frame_offset: u64,
+    logical_batch_len: usize,
+    output_capacity: usize,
+) -> Result<(u32, usize)> {
+    ensure!(
+        logical_batch_len >= WAL_V7_LOGICAL_BATCH_HEADER_LEN,
         "v7 logical batch is shorter than its header"
     );
-    let batch_bytes = u64::try_from(logical_batch.len())?;
+    let batch_bytes = u64::try_from(logical_batch_len)?;
     let fragment_count = data_fragment_count(batch_bytes)
         .ok_or_else(|| anyhow::anyhow!("v7 logical batch length is outside wire bounds"))?;
     let frame_count = usize::try_from(fragment_count)?;
@@ -654,10 +772,9 @@ pub(crate) fn encode_data_frames_into(
         .checked_mul(WAL_V7_FRAME_LEN)
         .ok_or_else(|| anyhow::anyhow!("v7 DATA frame sequence length overflows"))?;
     ensure!(
-        output.len() >= output_len,
+        output_capacity >= output_len,
         "v7 DATA frame output buffer is too small"
     );
-
     ensure!(
         first_frame_offset >= (WAL_V7_HEADER_LEN + WAL_V7_FRAME_LEN) as u64,
         "v7 DATA frame sequence overlaps the generation-zero FRONTIER"
@@ -668,19 +785,19 @@ pub(crate) fn encode_data_frames_into(
         .checked_add(physical_len)
         .ok_or_else(|| anyhow::anyhow!("v7 DATA frame sequence end overflows"))?;
 
-    let entry_stream = &logical_batch[WAL_V7_LOGICAL_BATCH_HEADER_LEN..];
-    let header = WalV7LogicalBatchHeader::decode(
-        &logical_batch[..WAL_V7_LOGICAL_BATCH_HEADER_LEN],
-        entry_stream,
-        segment_ticket,
-        batch_bytes,
-        limits,
-    )?;
-    ensure!(
-        header.segment_ticket == segment_ticket,
-        "v7 logical batch ticket does not match its DATA frame assignment"
-    );
+    Ok((fragment_count, output_len))
+}
 
+fn encode_data_frame_sequence(
+    header_digest: [u8; 32],
+    first_frame_offset: u64,
+    segment_ticket: u64,
+    logical_batch: &[u8],
+    fragment_count: u32,
+    output_len: usize,
+    output: &mut [u8],
+) -> Result<usize> {
+    let batch_bytes = u64::try_from(logical_batch.len())?;
     for (fragment_index, payload) in logical_batch
         .chunks(WAL_V7_DATA_FRAGMENT_PAYLOAD_CAPACITY)
         .enumerate()
@@ -1698,6 +1815,123 @@ mod tests {
             );
         }
 
+        Ok(())
+    }
+
+    #[test]
+    fn encoder_owned_data_frames_match_checked_materialization() -> Result<()> {
+        let limits = crate::pitr::LIVE_WAL_V5_LIMITS;
+        let header_digest = golden_header().digest()?;
+        let recorded_at = RecordedAt { secs: -2, nanos: 3 };
+        for value_len in [0, 1, 3944, 3945, 3946, 7952, 7953, 7954, 16384, 65535] {
+            for mixed in [false, true] {
+                let mut batch = WalBatch {
+                    commit_ts: 23,
+                    recorded_at,
+                    entries: vec![WalEntry::Put {
+                        key: b"k".to_vec(),
+                        value: vec![0x5a; value_len],
+                    }],
+                };
+                if mixed {
+                    batch.entries.extend([
+                        WalEntry::PointDelete { key: b"a".to_vec() },
+                        WalEntry::RangeDelete {
+                            start: b"a".to_vec(),
+                            end: b"z".to_vec(),
+                        },
+                        WalEntry::Put {
+                            key: b"a".to_vec(),
+                            value: b"last".to_vec(),
+                        },
+                    ]);
+                }
+                let owned = prepare_logical_batch(&batch, limits)?
+                    .encode_entry_stream()?
+                    .into_logical_batch(41, batch.commit_ts, recorded_at)?;
+                let checked = encode_logical_batch(41, &batch, limits)?;
+                assert_eq!(owned.as_bytes(), checked);
+                let frame_bytes =
+                    usize::try_from(data_fragment_count(checked.len() as u64).unwrap())?
+                        * WAL_V7_FRAME_LEN;
+                let mut expected = vec![0xa5; frame_bytes + 17];
+                let mut actual = expected.clone();
+                let first_offset = 5 * WAL_V7_FRAME_LEN as u64;
+                let expected_len = encode_data_frames_into(
+                    header_digest,
+                    first_offset,
+                    41,
+                    &checked,
+                    limits,
+                    &mut expected,
+                )?;
+                let actual_len =
+                    owned.encode_data_frames_into(header_digest, first_offset, 41, &mut actual)?;
+                assert_eq!(actual_len, expected_len);
+                assert_eq!(actual, expected);
+                assert!(actual[actual_len..].iter().all(|byte| *byte == 0xa5));
+                let (frames, remainder) = actual[..actual_len].as_chunks::<WAL_V7_FRAME_LEN>();
+                assert!(remainder.is_empty());
+                for (index, frame) in frames.iter().enumerate() {
+                    decode_frame_structural(
+                        frame,
+                        first_offset + index as u64 * WAL_V7_FRAME_LEN as u64,
+                        &header_digest,
+                    )?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn encoder_owned_batch_rejects_invalid_metadata_and_frame_assignment() -> Result<()> {
+        let limits = crate::pitr::LIVE_WAL_V5_LIMITS;
+        let batch = WalBatch {
+            commit_ts: 23,
+            recorded_at: RecordedAt { secs: -2, nanos: 3 },
+            entries: vec![WalEntry::Put {
+                key: b"k".to_vec(),
+                value: b"value".to_vec(),
+            }],
+        };
+        for (commit_ts, recorded_at) in [
+            (0, batch.recorded_at),
+            (
+                23,
+                RecordedAt {
+                    secs: 0,
+                    nanos: 1_000_000_000,
+                },
+            ),
+        ] {
+            assert!(
+                prepare_logical_batch(&batch, limits)?
+                    .encode_entry_stream()?
+                    .into_logical_batch(41, commit_ts, recorded_at)
+                    .is_err()
+            );
+        }
+        let owned = prepare_logical_batch(&batch, limits)?
+            .encode_entry_stream()?
+            .into_logical_batch(41, batch.commit_ts, batch.recorded_at)?;
+        for (offset, ticket, capacity) in [
+            (0, 41, 4096),
+            (4096, 41, 4096),
+            (8193, 41, 4096),
+            (u64::MAX - 4095, 41, 4096),
+            (8192, 42, 4096),
+            (8192, 41, 0),
+            (8192, 41, 4095),
+        ] {
+            let mut output = vec![0xa5; capacity];
+            assert!(
+                owned
+                    .encode_data_frames_into([0x11; 32], offset, ticket, &mut output)
+                    .is_err()
+            );
+            assert!(output.iter().all(|byte| *byte == 0xa5));
+        }
         Ok(())
     }
 

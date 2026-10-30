@@ -1,0 +1,6 @@
+{
+  "adopted": false,
+  "reason": "Initial SSD phase fails: point throughput is flat (-0.04% raw); batch loses 1.5% raw and 7.2% normalized. Material-gain requirement and normalized batch floor fail.",
+  "conditional_ram_and_confirmation_cancelled": true,
+  "summary_sha256": "9eb79c42c62dbe5826fc9873ba915f3aad5e36716c9adadc168ca3a5dafd679b"
+}

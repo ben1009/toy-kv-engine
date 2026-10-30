@@ -1,0 +1,19 @@
+{
+  "source_base": "dc3e3c1a8fce0f15700ff7c5d2ef2cb1c2875d4d",
+  "assessment_passed": false,
+  "source_retained": false,
+  "cpu_is_diagnostic": true,
+  "captured_cells": [
+    "ext4-point8",
+    "ext4-batch16"
+  ],
+  "cancelled_cells": [
+    "ext4-batch1",
+    "ext4-batch8",
+    "confirmation-batch8"
+  ],
+  "failed_v7_cells": [
+    "ext4-batch16"
+  ],
+  "reason": "Point8 passes, but batch16 paired throughput is 0.990x and p99 is 1.231x. The p99 ceiling fails; three dependent batch stages are cancelled. Preserve all 32 invocations and restore retained f7. CPU is not a veto. No further prototype within this slice."
+}

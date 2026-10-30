@@ -1,0 +1,20 @@
+{
+  "assessment_passed": false,
+  "source_retained": false,
+  "source_restored": true,
+  "cpu_is_diagnostic": true,
+  "captured_cells": [
+    "ext4-batch16"
+  ],
+  "cancelled_cells": [
+    "ext4-batch8",
+    "ext4-point8",
+    "ext4-batch1"
+  ],
+  "reason": "Three matched pairs after excluding two baseline stalls: throughput -2.48%, p99 +10.28%; no filtered screen benefit. Dependent stages cancelled without replacements.",
+  "candidate_tests": 1974,
+  "candidate_focused_tests": 20,
+  "source_candidates": 1,
+  "canonical_sha256": "e9abcc91b499c3cecd0acc137a0c9b8f65228b76ac3cb31ba3894bf9a0d06d40",
+  "restored_source_sha256": "8979edacc62576db9ff01fcb0944a6410dbb9039632f1c64471481d11d7425f0"
+}

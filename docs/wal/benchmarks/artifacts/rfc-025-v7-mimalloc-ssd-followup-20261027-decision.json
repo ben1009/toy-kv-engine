@@ -1,0 +1,23 @@
+{
+  "source_base": "e16e433a90a826d4f51fd8e29e5ec14f8f1ae0fc",
+  "assessment_passed": false,
+  "allocator_source_retained": false,
+  "default_allocator_changed": false,
+  "ssd_optimizations_preserved": true,
+  "reason": "The full mimalloc policy fails the fixed guards. V7 batch8 throughput -15.5%, CPU +56.8% and sync count +11.9%; batch16 CPU +27.3% and sync count above limit. Point8 arm medians and point16/v4 latency guards also fail amid large moving SSD stalls and failed independent controls. V7 peak RSS rises in every cell. This test does not establish a general allocator or version verdict.",
+  "restored_source_files": [
+    "Cargo.lock",
+    "kv-engine/Cargo.toml",
+    "kv-engine/src/lib.rs",
+    "kv-engine/src/wal.rs"
+  ],
+  "retained_ssd_source_commits": [
+    "0ffebd516b865b01371ed65014ac0347ae2fb420",
+    "71bd7c23ba240de2fffac33110c4d92c3691c881"
+  ],
+  "publication": "Local evidence commit only; no PR, push, default adoption or further optimization.",
+  "scored_records": 90,
+  "warmups": 30,
+  "excluded_profiles": 1,
+  "host_samples": 1453
+}

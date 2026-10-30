@@ -1,0 +1,30 @@
+{
+  "base": "7a41545149e81e8c15f13bf6787bd094afba2349",
+  "candidate_source_inputs": 128,
+  "candidate_patch_reconstructs_all_inputs": true,
+  "live_candidate_matched_manifest_before_restore": true,
+  "all_saved_binaries_match_identity": true,
+  "restored_source_paths": 3,
+  "canonical_binary_sha256": "614f0cb1adde43cabe900eb032c6f884783d658c597471d9d9ddc8faff314aa9",
+  "patch_sha256": "b93f7b509b606fa3010184c5a0d041848d8262acd36058898faa792b34d3250a",
+  "source_manifest_sha256": "27d09334e1b36a723f4838f26db32f0628ce6b360b086e516e566675eb358144",
+  "validation": {
+    "candidate": {
+      "command": "cargo make check",
+      "log": "target/wal-opt/20261026-v7-durability-cycle-cost/check.log",
+      "nextest_run_id": "2e465065-dc41-4322-a633-d41239a6bb58",
+      "test_summary": "1964 tests run: 1964 passed, 0 skipped"
+    },
+    "restored": {
+      "command": "cargo make check",
+      "log": "target/wal-opt/20261026-v7-durability-cycle-cost/restored-check.log",
+      "nextest_run_id": "166515a3-d572-4ce5-8f5e-6e4a3128ccad",
+      "test_summary": "1963 tests run: 1963 passed (1 slow), 0 skipped"
+    }
+  },
+  "scored_runs": 76,
+  "warmups": 20,
+  "unique_run_ids": 96,
+  "confirmation_run": false,
+  "direct_typos_passed": true
+}

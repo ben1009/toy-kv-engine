@@ -1,0 +1,10 @@
+{
+  "baseline": {
+    "path": "target/release/write-perf-v7-eligible-coalescing",
+    "sha256": "e9abcc91b499c3cecd0acc137a0c9b8f65228b76ac3cb31ba3894bf9a0d06d40"
+  },
+  "candidate": {
+    "path": "target/release/write-perf-v7-large-frontier-allocation",
+    "sha256": "7ad88dac2dba0a39b1538b0698afb0d8e3f41deda3f6a0491533a44c1c5d0b3b"
+  }
+}

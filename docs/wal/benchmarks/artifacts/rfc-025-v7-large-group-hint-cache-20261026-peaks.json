@@ -1,0 +1,88 @@
+{
+  "ext4-batch64": {
+    "peak_scored_references": {
+      "v4_control": {
+        "puts_per_sec": 412502.82488122024,
+        "run_id": "1792984537116",
+        "arm": "new_v4",
+        "binary_sha256": "8e909820c5b7680913fdeade04c92124990904f654a9e55bcf93793b0af0c1c0",
+        "manifest": "rfc-025-v7-hash-scheduling-ext4-batch64-20261026-runs.tsv",
+        "raw": "rfc-025-v7-hash-scheduling-ext4-batch64-20261026.jsonl",
+        "raw_record_sha256": "25db723eb715d0b307717bd5a1bc02e5590f009fffab395f8fac6faf6f936fc9"
+      },
+      "retained_v7": {
+        "puts_per_sec": 480373.0901766222,
+        "run_id": "1792989818168",
+        "arm": "old_v7",
+        "binary_sha256": "614f0cb1adde43cabe900eb032c6f884783d658c597471d9d9ddc8faff314aa9",
+        "manifest": "rfc-025-v7-large-group-hint-cache-confirmation-ext4-batch64-20261026-runs.tsv",
+        "raw": "rfc-025-v7-large-group-hint-cache-confirmation-ext4-batch64-20261026.jsonl",
+        "raw_record_sha256": "bd7cf83c7984967fc2e4ef7083dee0a01d59f03a1234d9416ff977ab8dcb6227"
+      },
+      "candidate_v7": {
+        "puts_per_sec": 453655.438388702,
+        "run_id": "1792988410321",
+        "arm": "new_v7",
+        "binary_sha256": "f9d920a1980bb6a334bedbafed1d661f313ebef3ae39660a1f1d7ddb7e093fe1",
+        "manifest": "rfc-025-v7-large-group-hint-cache-ext4-batch64-20261026-runs.tsv",
+        "raw": "rfc-025-v7-large-group-hint-cache-ext4-batch64-20261026.jsonl",
+        "raw_record_sha256": "0cead325e17631628ad375e1d1607cab52c49cc35ae7e1c0be010691057e2182"
+      }
+    },
+    "input_sha256": {
+      "rfc-025-v7-prefix-hash-overlap-ext4-batch64-20261026.jsonl": "95c8b07bdf93b3a0e7a360f4d5def4832da4173f742a8bcef229651d37bbb772",
+      "rfc-025-v7-prefix-hash-overlap-ext4-batch64-20261026-runs.tsv": "3b911f7901b12addb463c1fea6d3a6f15c6d4fbb5580d83957d6413ed9255dec",
+      "rfc-025-v7-hash-scheduling-ext4-batch64-20261026.jsonl": "9be8c68a09ae0cd09abca8ba885bc9d55295d1d2ef61e36648c14d2e6ea291a4",
+      "rfc-025-v7-hash-scheduling-ext4-batch64-20261026-runs.tsv": "93a82b6b0a9c1b5a2ff991e6d9f115d07c8ce5a17283f0176dab38484362d36f",
+      "rfc-025-v7-hash-pipeline-ext4-batch64-20261026.jsonl": "f0f5d8f16c8068c8df0500194a6164ede92cf8e0f04fdeff194f8ea739ff189d",
+      "rfc-025-v7-hash-pipeline-ext4-batch64-20261026-runs.tsv": "d9cca8441766a5daacdbf22fc43a2b149738b0ac30deb44f1d302f332302b288",
+      "rfc-025-v7-large-group-hint-cache-ext4-batch64-20261026.jsonl": "33b3cb9447f727ac4850807f647197227080062c4d8d8c2eb6767c94ff04afd8",
+      "rfc-025-v7-large-group-hint-cache-ext4-batch64-20261026-runs.tsv": "f6e895a80e580b40f204fa88017d62010304a7bd64805c71f48f770740611f76",
+      "rfc-025-v7-large-group-hint-cache-confirmation-ext4-batch64-20261026.jsonl": "c374ea66dac29483206aed0ad238aa1fc360e409d719f9584f0c1b843678d584",
+      "rfc-025-v7-large-group-hint-cache-confirmation-ext4-batch64-20261026-runs.tsv": "eeb4ae1b3c938e6ecf10fab2a65e1c85485c5b199edd967732dc1c65dc580339"
+    }
+  },
+  "ext4-point8": {
+    "peak_scored_references": {
+      "v4_control": {
+        "puts_per_sec": 18379.334030826732,
+        "run_id": "1792983845990",
+        "arm": "old_v4",
+        "binary_sha256": "614f0cb1adde43cabe900eb032c6f884783d658c597471d9d9ddc8faff314aa9",
+        "manifest": "rfc-025-v7-prefix-hash-overlap-ext4-point8-20261026-runs.tsv",
+        "raw": "rfc-025-v7-prefix-hash-overlap-ext4-point8-20261026.jsonl",
+        "raw_record_sha256": "c3906aebb705499af9665eed1e1a1f13a028e6593ea4a1066f7c6847e00f15fb"
+      },
+      "retained_v7": {
+        "puts_per_sec": 16574.02886702917,
+        "run_id": "1792989161230",
+        "arm": "old_v7",
+        "binary_sha256": "614f0cb1adde43cabe900eb032c6f884783d658c597471d9d9ddc8faff314aa9",
+        "manifest": "rfc-025-v7-large-group-hint-cache-ext4-point8-20261026-runs.tsv",
+        "raw": "rfc-025-v7-large-group-hint-cache-ext4-point8-20261026.jsonl",
+        "raw_record_sha256": "1f0d17f32b859ef4405ba4f9bb535754f6f3a2f02e55494f91f06877c597fe37"
+      },
+      "candidate_v7": {
+        "puts_per_sec": 16410.53445015455,
+        "run_id": "1792988878192",
+        "arm": "new_v7",
+        "binary_sha256": "f9d920a1980bb6a334bedbafed1d661f313ebef3ae39660a1f1d7ddb7e093fe1",
+        "manifest": "rfc-025-v7-large-group-hint-cache-ext4-point8-20261026-runs.tsv",
+        "raw": "rfc-025-v7-large-group-hint-cache-ext4-point8-20261026.jsonl",
+        "raw_record_sha256": "b077e5fd063dbdff8b4c4c87a6f993cd1b1383e3d43395536072a0c632cccb59"
+      }
+    },
+    "input_sha256": {
+      "rfc-025-v7-prefix-hash-overlap-ext4-point8-20261026.jsonl": "8c6bd1568608f4f1307c4379fbe7e86e81497ee07b247efb0216bd6ad8d9e4a6",
+      "rfc-025-v7-prefix-hash-overlap-ext4-point8-20261026-runs.tsv": "4abcf9b934fea6520c9cfbf7428b3cfcb66e287698d9f30389e450ab0dbd9941",
+      "rfc-025-v7-hash-scheduling-ext4-point8-20261026.jsonl": "02637a3111f70419332aa4c2a6195777a1fb1f73a2d6994d6171e724cdba6a19",
+      "rfc-025-v7-hash-scheduling-ext4-point8-20261026-runs.tsv": "9d174d36e7d6177c9760be00b1ffcdc56a11b9b64f74d165adc5edc5c7b842a3",
+      "rfc-025-v7-hash-pipeline-ext4-point8-20261026.jsonl": "76442170af5d3081f48391626ad288ac072850eecec4efced3274b63b7f5e9bf",
+      "rfc-025-v7-hash-pipeline-ext4-point8-20261026-runs.tsv": "0ba66470f99104c8b72738e63d1bc9f2b2a483ff23f19f4596b61d1e131ab125",
+      "rfc-025-v7-large-group-hint-cache-ext4-point8-20261026.jsonl": "ac53bf54d78e356b87a2995899f217a293c8764a986972bbff5c656d4c9640e7",
+      "rfc-025-v7-large-group-hint-cache-ext4-point8-20261026-runs.tsv": "9410ccce75e4620850415b967d6e82bbdea89b52dbbdfa6b92523c3916fd4c78"
+    }
+  },
+  "limits": "Peaks are distinct from paired medians. Only the same longer operation counts, 2-GiB SST target, and sampling settings are included. Earlier 50K/100K-put, 1-GiB-target records remain separate references.",
+  "analysis_sha256": "b3b3b334881f63de11238907d3eb76d643817ae35b008126bca467c8496ea1c6"
+}

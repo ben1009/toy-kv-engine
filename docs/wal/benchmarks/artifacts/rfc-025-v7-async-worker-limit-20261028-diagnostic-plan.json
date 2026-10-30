@@ -1,0 +1,31 @@
+{
+  "created_at_utc": "2026-10-27T16:21:33.096268+00:00",
+  "source_base": "976a1e35d1cbf35707f59a50cd4ad674f713e15a",
+  "binary": {
+    "path": "target/release/write-perf-v7-large-data-async-dispatch",
+    "sha256": "f353022d846530a6754330aaea11f295319ea8f4de20afa09b6d2a3b57b021d8"
+  },
+  "schedule": [
+    8,
+    16
+  ],
+  "operations": 750000,
+  "batch": 64,
+  "value_size": 1024,
+  "sst_size": 2147483648,
+  "initial_seconds": 30,
+  "between_seconds": 15,
+  "sampler_seconds": 0.1,
+  "excluded_from_scoring": true,
+  "source_changed": false,
+  "purpose": "Observe kernel io-wq helper count and task state for the retained async-dispatch binary before choosing whether a per-ring concurrency cap is a useful candidate. Earlier native v4 traces show helper handoff adds scheduling; no current-v7 bottleneck is assumed.",
+  "scope": "Two fixed diagnostics only; no source edits/builds/tests overlap. Samples and native WAL syscall events retained, no SMART/temperature polling. These runs do not qualify performance.",
+  "prior_verification": "rfc-025-v7-large-data-async-retention-20261028-verification.json",
+  "prior_verification_sha256": "c691aa2fffd5a4fbc8a4cbb6b1efc552323db081b4b20286525c8e67f928103e",
+  "prior_global_invocations": 549,
+  "trace_library": {
+    "path": "target/wal-opt/20261027-v7-writer-scaling/io-trace.so",
+    "sha256": "7bef6a9cfadc9c803f955fb96e86bd65f5bdebd07aab39184d283832bfe3e46b"
+  },
+  "trace_source_sha256": "628b683e22047bc9cdfbe80f142cf686795f8a9eef2eb0593208832fecd09308"
+}

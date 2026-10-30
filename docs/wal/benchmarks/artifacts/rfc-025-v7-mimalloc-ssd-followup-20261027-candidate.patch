@@ -1,0 +1,170 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index 1c6b3393..fd5a966b 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -168,0 +169,10 @@ checksum = "37b2a672a2cb129a2e41c10b1224bb368f9f37a2b16b612598138befd7b37eb5"
++[[package]]
++name = "cc"
++version = "1.10.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "86e055fa6e3e40ad6187ba25b6855eeb635d5271f8e0f0e1e9a5826b8d75bea0"
++dependencies = [
++ "find-msvc-tools",
++ "shlex",
++]
++
+@@ -514,0 +525,6 @@ checksum = "658bd65b1cf4c852a3cc96f18a8ce7b5640f6b703f905c7d74532294c2a63984"
++[[package]]
++name = "find-msvc-tools"
++version = "0.1.15"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "1c66915cc5391097de7a2b0b972e8505aa33c0df401fd3a6811dbdb32881ba48"
++
+@@ -828,0 +845 @@ dependencies = [
++ "mimalloc",
+@@ -856,0 +874,9 @@ checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
++[[package]]
++name = "libmimalloc-sys"
++version = "0.1.49"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "6a45a52f43e1c16f667ccfe4dd8c85b7f7c204fd5e3bf46c5b0db9a5c3c0b8e9"
++dependencies = [
++ "cc",
++]
++
+@@ -980,0 +1007,9 @@ checksum = "6b947ae49db0d222b1dbc6b113ce7248a3fc3a6ca21b696717bfc000ba4484d8"
++[[package]]
++name = "mimalloc"
++version = "0.1.52"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "2d4139bb28d14ad1facf21d5eb8825051b326e172d216b39f6d31df53cc97862"
++dependencies = [
++ "libmimalloc-sys",
++]
++
+@@ -1502,0 +1538,6 @@ dependencies = [
++[[package]]
++name = "shlex"
++version = "2.0.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
++
+diff --git a/kv-engine/Cargo.toml b/kv-engine/Cargo.toml
+index 35877b5b..162cf650 100644
+--- a/kv-engine/Cargo.toml
++++ b/kv-engine/Cargo.toml
+@@ -27,0 +28 @@ hotpath-profile = ["dep:hotpath", "hotpath/hotpath", "hotpath/threads"]
++mimalloc-allocator = ["dep:mimalloc"]
+@@ -48,0 +50 @@ logforth = { version = "0.30", features = ["starter-log", "layout-json", "append
++mimalloc = { version = "0.1.52", optional = true }
+diff --git a/kv-engine/src/lib.rs b/kv-engine/src/lib.rs
+index 119a6683..13210b25 100644
+--- a/kv-engine/src/lib.rs
++++ b/kv-engine/src/lib.rs
+@@ -0,0 +1,9 @@
++#![cfg_attr(feature = "mimalloc-allocator", feature(cfg_sanitize))]
++
++/// Optional process-wide Rust allocator for controlled allocator comparisons.
++#[cfg(feature = "mimalloc-allocator")]
++// Sanitizers need the System allocator so their allocation tracking stays active.
++#[cfg(not(any(sanitize = "address", sanitize = "leak")))]
++#[global_allocator]
++static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
++
+diff --git a/kv-engine/src/wal.rs b/kv-engine/src/wal.rs
+index 71b32c84..f2a09a6a 100644
+--- a/kv-engine/src/wal.rs
++++ b/kv-engine/src/wal.rs
+@@ -126,2 +126,3 @@ pub enum WalIoMode {
+-/// If the pool is full, the buffer is dropped (freed) — this is safe because
+-/// `Drop` calls `libc::free` on the `posix_memalign` allocation.
++/// If the pool is full, the buffer is dropped using the matching allocation
++/// backend. The optional mimalloc configuration routes aligned allocations
++/// through Rust's global allocator; the default uses libc.
+@@ -144,10 +145,22 @@ impl DirectBuf {
+-        let mut ptr: *mut libc::c_void = std::ptr::null_mut();
+-        let ret = unsafe { libc::posix_memalign(&mut ptr, 4096, cap) };
+-        // posix_memalign failure is OOM — recovery is impossible at this point.
+-        assert_eq!(ret, 0, "posix_memalign failed (OOM)");
+-
+-        Self {
+-            ptr: ptr as *mut u8,
+-            len: 0,
+-            cap,
+-        }
++        #[cfg(feature = "mimalloc-allocator")]
++        let ptr = {
++            let layout = std::alloc::Layout::from_size_align(cap, 4096)
++                .expect("DirectBuf capacity has a valid aligned allocation layout");
++            // SAFETY: capacity is nonzero and the validated layout retains
++            // the 4096-byte alignment required by every direct-I/O caller.
++            let ptr = unsafe { std::alloc::alloc(layout) };
++            if ptr.is_null() {
++                std::alloc::handle_alloc_error(layout);
++            }
++            ptr
++        };
++        #[cfg(not(feature = "mimalloc-allocator"))]
++        let ptr = {
++            let mut ptr: *mut libc::c_void = std::ptr::null_mut();
++            let ret = unsafe { libc::posix_memalign(&mut ptr, 4096, cap) };
++            // posix_memalign failure is OOM — recovery is impossible at this point.
++            assert_eq!(ret, 0, "posix_memalign failed (OOM)");
++            ptr.cast::<u8>()
++        };
++
++        Self { ptr, len: 0, cap }
+@@ -178 +191 @@ impl DirectBuf {
+-    /// `posix_memalign` is uninitialised, and a recycled buffer's only
++    /// either allocation backend is uninitialised, and a recycled buffer's only
+@@ -239 +252,49 @@ impl Drop for DirectBuf {
+-        unsafe { libc::free(self.ptr as *mut libc::c_void) };
++        #[cfg(feature = "mimalloc-allocator")]
++        {
++            let layout = std::alloc::Layout::from_size_align(self.cap, 4096)
++                .expect("DirectBuf allocation layout was validated at construction");
++            // SAFETY: this allocation was created with Rust's global
++            // allocator and the exact same capacity and alignment.
++            unsafe { std::alloc::dealloc(self.ptr, layout) };
++        }
++        #[cfg(not(feature = "mimalloc-allocator"))]
++        unsafe {
++            libc::free(self.ptr as *mut libc::c_void)
++        };
++    }
++}
++
++#[cfg(test)]
++mod direct_buffer_tests {
++    use super::DirectBuf;
++
++    #[test]
++    fn aligned_buffers_preserve_contents_and_cross_thread_ownership() {
++        for requested in [0, 1, 4096, 4097, 65536, 1_048_576] {
++            let mut buffer = DirectBuf::new(requested);
++            let capacity = buffer.cap();
++            assert!(capacity >= requested.max(4096));
++            assert!(capacity.is_multiple_of(4096));
++            assert_eq!(buffer.as_ptr() as usize % 4096, 0);
++            buffer.zero_range(0, capacity);
++            buffer.write_at(0, b"aligned");
++            buffer.write_at(capacity - 4, b"tail");
++            buffer.set_len(capacity);
++
++            std::thread::spawn(move || {
++                assert_eq!(buffer.len(), capacity);
++                assert_eq!(&buffer.initialized_slice(0, capacity)[..7], b"aligned");
++                assert_eq!(buffer.initialized_slice(capacity - 4, capacity), b"tail");
++                assert!(
++                    buffer
++                        .initialized_slice(7, capacity - 4)
++                        .iter()
++                        .all(|b| *b == 0)
++                );
++                // Dropping on this thread exercises the selected backend's
++                // ownership transfer independently of producer-local frees.
++                drop(buffer);
++            })
++            .join()
++            .expect("aligned buffer consumer completes");
++        }

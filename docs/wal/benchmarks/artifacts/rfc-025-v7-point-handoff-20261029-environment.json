@@ -1,0 +1,20 @@
+{
+  "kernel": "6.12.71-1-lts",
+  "filesystem": "/dev/nvme0n1p3[/liu/proj/toy-kv-engine] ext4 rw,nosuid,nodev,relatime",
+  "observations": {
+    "/proc/self/cgroup": "0::/user.slice/user-1000.slice/session-3.scope\n",
+    "/proc/self/timerslack_ns": "50000\n",
+    "/proc/sys/kernel/sched_schedstats": "0\n",
+    "/sys/fs/cgroup/cpu.stat": "usage_usec 300432783984\nuser_usec 187943452564\nsystem_usec 112489331420\nnice_usec 52758488\ncore_sched.force_idle_usec 0\nnr_periods 0\nnr_throttled 0\nthrottled_usec 0\nnr_bursts 0\nburst_usec 0\n",
+    "/sys/fs/cgroup/cpuset.cpus.effective": "0-31\n",
+    "/sys/fs/cgroup/user.slice/user-1000.slice/session-3.scope/cpu.max": "max 100000\n",
+    "/sys/fs/cgroup/user.slice/user-1000.slice/session-3.scope/cpu.stat": "usage_usec 156741053861\nuser_usec 127730352591\nsystem_usec 29010701270\nnice_usec 36480\ncore_sched.force_idle_usec 0\nnr_periods 0\nnr_throttled 0\nthrottled_usec 0\nnr_bursts 0\nburst_usec 0\n",
+    "/sys/fs/cgroup/user.slice/user-1000.slice/cpu.max": "max 100000\n",
+    "/sys/fs/cgroup/user.slice/cpu.max": "max 100000\n"
+  },
+  "driver_sha256": "7ee8595c45b41c8688a1836630f36628d8a1f1a62ef0a705623ac9a9790dd415",
+  "plan_sha256": "7071a9996184ba7b1bc92eea8d52aa15b905bfd3f7d811c547acc91bacd5d79f",
+  "patch_sha256": "46b1ca4c6a93862bf7c40c56be845613f4ef9bf99e4926e59fa3f92f0479e230",
+  "source_manifest_sha256": "eb32839ee293716fefb80ef849ff8a332ead10d870211171c7724da5364b6642",
+  "prior_verification_sha256": "17936b5f7640233afc717ff1511400ca9f6432f10d85988e6c790e8d8c59d0e8"
+}

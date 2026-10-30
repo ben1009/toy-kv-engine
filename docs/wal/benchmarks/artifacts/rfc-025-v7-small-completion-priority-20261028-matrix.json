@@ -1,0 +1,128 @@
+{
+  "created_at_utc": "2026-10-28T14:03:30.612655+00:00",
+  "ssd_initial_cooldown_seconds": 30,
+  "ssd_between_seconds": 10,
+  "cells": {
+    "ext4-point8": {
+      "kind": "ssd",
+      "bench": "wal_concurrent",
+      "writers": 8,
+      "operations": 100000,
+      "reads": 500000,
+      "scan_num": 100000,
+      "batch": null,
+      "sample_every": 100,
+      "arms": [
+        "old_v7",
+        "new_v7"
+      ],
+      "pairs": 5
+    },
+    "ext4-point1": {
+      "kind": "ssd",
+      "bench": "wal_concurrent",
+      "writers": 1,
+      "operations": 20000,
+      "reads": 500000,
+      "scan_num": 100000,
+      "batch": null,
+      "sample_every": 10,
+      "arms": [
+        "old_v7",
+        "new_v7"
+      ],
+      "pairs": 3
+    },
+    "ext4-point16": {
+      "kind": "ssd",
+      "bench": "wal_concurrent",
+      "writers": 16,
+      "operations": 100000,
+      "reads": 500000,
+      "scan_num": 100000,
+      "batch": null,
+      "sample_every": 100,
+      "arms": [
+        "old_v7",
+        "new_v7"
+      ],
+      "pairs": 3
+    },
+    "ext4-batch8": {
+      "kind": "ssd",
+      "bench": "wal_batch_concurrent",
+      "writers": 8,
+      "operations": 750000,
+      "reads": 500000,
+      "scan_num": 100000,
+      "batch": 64,
+      "sample_every": 10,
+      "arms": [
+        "old_v7",
+        "new_v7"
+      ],
+      "pairs": 3
+    },
+    "ext4-batch16": {
+      "kind": "ssd",
+      "bench": "wal_batch_concurrent",
+      "writers": 16,
+      "operations": 750000,
+      "reads": 500000,
+      "scan_num": 100000,
+      "batch": 64,
+      "sample_every": 10,
+      "arms": [
+        "old_v7",
+        "new_v7"
+      ],
+      "pairs": 3
+    },
+    "ext4-batch1": {
+      "kind": "ssd",
+      "bench": "wal_batch_concurrent",
+      "writers": 1,
+      "operations": 750000,
+      "reads": 500000,
+      "scan_num": 100000,
+      "batch": 64,
+      "sample_every": 10,
+      "arms": [
+        "old_v7",
+        "new_v7"
+      ],
+      "pairs": 3
+    },
+    "ext4-point8-confirm": {
+      "kind": "ssd",
+      "bench": "wal_concurrent",
+      "writers": 8,
+      "operations": 100000,
+      "reads": 500000,
+      "scan_num": 100000,
+      "batch": null,
+      "sample_every": 100,
+      "arms": [
+        "old_v7",
+        "new_v7"
+      ],
+      "pairs": 5
+    }
+  },
+  "screen": [
+    "ext4-point8"
+  ],
+  "followup": [
+    "ext4-point1",
+    "ext4-point16",
+    "ext4-batch8",
+    "ext4-batch16",
+    "ext4-batch1"
+  ],
+  "confirmation": [
+    "ext4-point8-confirm"
+  ],
+  "guard_scope": "Predeclared aggregate-stall matched-pair view, raw evidence always retained; CPU diagnostic.",
+  "run_all_cells_regardless_of_performance": false,
+  "stage_policy": "Cancel followups/confirmation on failed screen. After screen pass run all guards; confirm only after all guards pass."
+}
