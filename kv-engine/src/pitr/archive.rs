@@ -1135,6 +1135,14 @@ mod tests {
     }
 
     fn v8_archive_objects_with_one_batch() -> (SegmentMetadata, Vec<u8>, Vec<u8>, WalBatch) {
+        v8_archive_objects_with_one_batch_after(ChainAnchor::Genesis {
+            archive_epoch_id: ArchiveEpochId([3; 16]),
+        })
+    }
+
+    fn v8_archive_objects_with_one_batch_after(
+        predecessor: ChainAnchor,
+    ) -> (SegmentMetadata, Vec<u8>, Vec<u8>, WalBatch) {
         use crate::wal::v8::{
             codec::{
                 WAL_V8_DATA_FRAGMENT_PAYLOAD_CAPACITY, WAL_V8_FRAME_LEN, WalV8DataFragmentHeader,
@@ -1149,9 +1157,6 @@ mod tests {
             timeline_id: TimelineId([2; 16]),
             archive_epoch_id: ArchiveEpochId([3; 16]),
             segment_id: SegmentId(9),
-        };
-        let predecessor = ChainAnchor::Genesis {
-            archive_epoch_id: key.archive_epoch_id,
         };
         let header = WalV8Header {
             timeline_id: key.timeline_id,
@@ -1604,6 +1609,92 @@ mod tests {
         .unwrap();
 
         assert_eq!(batches, vec![expected_batch]);
+    }
+
+    #[test]
+    fn exact_restore_replays_a_v7_to_v8_chain() {
+        use crate::pitr::{
+            WalBatch, WalEntry,
+            base::{PITR_BASE_WAL_REPLAY_VERSION, PitrBaseMetadata, PitrBaseTimeAnchor},
+            manifest::{PersistedChainAnchor, PersistedRecordedAt},
+            restore::{
+                ExactRestoreExecutor, PitrRestoreTarget, plan_exact_restore,
+                required_source_objects,
+            },
+        };
+
+        let archive_epoch_id = ArchiveEpochId([3; 16]);
+        let first_batch = WalBatch {
+            commit_ts: 10,
+            recorded_at: crate::pitr::RecordedAt { secs: 10, nanos: 0 },
+            entries: vec![WalEntry::Put {
+                key: b"v7-key".to_vec(),
+                value: b"from-v7".to_vec(),
+            }],
+        };
+        let (first, first_wal, first_seal) = v7_archive_objects_with_batches(
+            SegmentId(8),
+            ChainAnchor::Genesis { archive_epoch_id },
+            &[first_batch],
+        );
+        let (second, second_wal, second_seal, second_batch) =
+            v8_archive_objects_with_one_batch_after(ChainAnchor::Segment(first.anchor));
+        let base_time = PersistedRecordedAt { secs: 1, nanos: 0 };
+        let base = PitrBaseMetadata {
+            repository_id: first.key.repository_id,
+            timeline_id: first.key.timeline_id.0,
+            archive_epoch_id: first.key.archive_epoch_id.0,
+            included_commit_ts: Some(7),
+            boundary_segment_id: first.key.segment_id.0,
+            boundary_anchor: PersistedChainAnchor::Genesis {
+                archive_epoch_id: archive_epoch_id.0,
+            },
+            base_recorded_at: base_time,
+            time_anchor: PitrBaseTimeAnchor::Observed {
+                commit_ts: Some(7),
+                observed_at: base_time,
+            },
+            wal_replay_version: PITR_BASE_WAL_REPLAY_VERSION,
+            compatibility_digest: [7; 32],
+        };
+        let segments = vec![first.clone(), second.clone()];
+        let plan = plan_exact_restore(
+            &base,
+            segments.clone(),
+            PitrRestoreTarget::CommitTs(second_batch.commit_ts),
+        )
+        .unwrap();
+        assert_eq!(
+            plan.segments,
+            vec![first.key.segment_id, second.key.segment_id]
+        );
+        let expected = required_source_objects(&base, &segments, &plan).unwrap();
+        let loaded = expected
+            .iter()
+            .cloned()
+            .map(|object| {
+                let bytes = match (object.segment_id, object.kind) {
+                    (SegmentId(8), ArchiveObjectKind::Wal) => first_wal.clone(),
+                    (SegmentId(8), ArchiveObjectKind::Seal) => first_seal.clone(),
+                    (SegmentId(9), ArchiveObjectKind::Wal) => second_wal.clone(),
+                    (SegmentId(9), ArchiveObjectKind::Seal) => second_seal.clone(),
+                    _ => unreachable!("unexpected mixed-version restore source"),
+                };
+                (object, bytes)
+            })
+            .collect::<Vec<_>>();
+
+        let mut executor = ExactRestoreExecutor::new_with_sources(plan, Some(expected));
+        let info = executor
+            .run_exact_restore_with_segments(|| Ok(()), &loaded, crate::pitr::LIVE_WAL_V5_LIMITS)
+            .unwrap();
+        assert_eq!(info.last_commit_ts, Some(second_batch.commit_ts));
+        assert_eq!(info.applied_batches, 2);
+        assert_eq!(executor.get(b"v7-key"), Some(b"from-v7".as_slice()));
+        assert_eq!(
+            executor.get(b"archive-key"),
+            Some(b"archive-value".as_slice())
+        );
     }
 
     #[test]
