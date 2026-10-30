@@ -1935,6 +1935,44 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn repository_verification_checks_v8_objects_at_shallow_and_deep_depths() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("objects")).unwrap();
+        std::fs::create_dir(root.path().join("backups")).unwrap();
+        std::fs::write(root.path().join("BACKUP_CATALOG_LOG"), []).unwrap();
+        let (metadata, wal, seal, batch) = v8_archive_objects_with_one_batch();
+        let mut catalog = PitrArchiveCatalog::default();
+        let prepared = catalog.prepare_objects(&metadata, &wal, &seal).unwrap();
+        let stager = ArchiveObjectStager::new(root.path()).unwrap();
+        stager.publish(&prepared, &wal, &seal).unwrap();
+        catalog.commit_segment(metadata, &prepared).unwrap();
+        std::fs::write(root.path().join("PITR_CATALOG_LOG"), catalog.bytes()).unwrap();
+        drop(stager);
+        let repository = crate::backup::BackupRepository::open(root.path()).unwrap();
+        let shallow_options = crate::pitr::api::VerifyPitrOptions {
+            depth: crate::pitr::api::VerifyPitrDepth::Shallow,
+            selector: None,
+            cursor: None,
+            page_size: crate::pitr::api::MAX_VERIFY_PAGE_SIZE,
+        };
+
+        let shallow = repository.verify_pitr(shallow_options).unwrap();
+        assert!(shallow.first_failure.is_none());
+
+        let deep = repository
+            .verify_pitr(crate::pitr::api::VerifyPitrOptions {
+                depth: crate::pitr::api::VerifyPitrDepth::Deep {
+                    sampled_targets: std::num::NonZeroUsize::new(1).unwrap(),
+                },
+                ..shallow_options
+            })
+            .unwrap();
+        assert!(deep.first_failure.is_none());
+        assert_eq!(deep.last_verified_commit_ts, Some(batch.commit_ts));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn deep_repository_verification_reports_rehashed_v7_structural_corruption() {
         assert_deep_v7_corruption_reports(false);
     }

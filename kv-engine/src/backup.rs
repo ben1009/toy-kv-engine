@@ -2006,7 +2006,11 @@ impl BackupRepository {
         let mut last_verified_commit_ts = None;
         for (page_index, metadata) in segments[start..end].iter().enumerate() {
             let verified_end = start + page_index;
-            let v7 = metadata.wal_format_version == crate::wal::format::WAL_FORMAT_VERSION_V7;
+            let sealed_frontier_format = matches!(
+                metadata.wal_format_version,
+                crate::wal::format::WAL_FORMAT_VERSION_V7
+                    | crate::wal::format::WAL_FORMAT_VERSION_V8
+            );
             let wal_name = crate::pitr::archive::archive_object_name(
                 metadata.key.timeline_id,
                 metadata.key.archive_epoch_id,
@@ -2021,8 +2025,8 @@ impl BackupRepository {
                 crate::pitr::archive::ArchiveObjectKind::Seal,
                 metadata.seal_digest,
             );
-            let mut v7_wal_bytes = None;
-            let mut v7_seal_bytes = None;
+            let mut sealed_wal_bytes = None;
+            let mut sealed_seal_bytes = None;
             for (name, expected_bytes, expected_digest, digest, kind, object_kind) in [
                 (
                     wal_name,
@@ -2081,34 +2085,47 @@ impl BackupRepository {
                         last_verified_commit_ts,
                     });
                 }
-                if deep && !v7 && object_kind == crate::pitr::archive::ArchiveObjectKind::Wal {
+                if deep
+                    && !sealed_frontier_format
+                    && object_kind == crate::pitr::archive::ArchiveObjectKind::Wal
+                {
                     crate::pitr::restore::decode_restore_wal_batches_for_segment(
                         &bytes,
                         metadata,
                         crate::pitr::LIVE_WAL_V5_LIMITS,
                     )?;
                 }
-                if deep && v7 {
+                if deep && sealed_frontier_format {
                     match object_kind {
                         crate::pitr::archive::ArchiveObjectKind::Wal => {
-                            v7_wal_bytes = Some(bytes);
+                            sealed_wal_bytes = Some(bytes);
                         }
                         crate::pitr::archive::ArchiveObjectKind::Seal => {
-                            v7_seal_bytes = Some(bytes);
+                            sealed_seal_bytes = Some(bytes);
                         }
                     }
                 }
             }
-            if deep && v7 {
-                let verification = crate::pitr::archive::verify_v7_archive_objects(
-                    metadata,
-                    v7_wal_bytes
-                        .as_deref()
-                        .context("deep v7 PITR verification did not load the WAL object")?,
-                    v7_seal_bytes
-                        .as_deref()
-                        .context("deep v7 PITR verification did not load the seal object")?,
-                );
+            if deep && sealed_frontier_format {
+                let wal_bytes = sealed_wal_bytes
+                    .as_deref()
+                    .context("deep PITR verification did not load the sealed WAL object")?;
+                let seal_bytes = sealed_seal_bytes
+                    .as_deref()
+                    .context("deep PITR verification did not load the seal object")?;
+                let verification = match metadata.wal_format_version {
+                    crate::wal::format::WAL_FORMAT_VERSION_V7 => {
+                        crate::pitr::archive::verify_v7_archive_objects(
+                            metadata, wal_bytes, seal_bytes,
+                        )
+                    }
+                    crate::wal::format::WAL_FORMAT_VERSION_V8 => {
+                        crate::pitr::archive::verify_v8_archive_objects(
+                            metadata, wal_bytes, seal_bytes,
+                        )
+                    }
+                    _ => unreachable!("sealed frontier format was checked above"),
+                };
                 if verification.is_err() {
                     return Ok(crate::pitr::api::VerifyPitrReport {
                         verified_intervals: intervals_through(verified_end)?,
