@@ -123,7 +123,12 @@ remain unqualified, so v8 creation stays disabled.
 4. **Runtime durability and recovery:** add the v8 writer and reader using the
    RFC 025 single-sync frontier protocol, v8 logical digest folding,
    intermediate hard-anchor checks, Active fallback and fresh-inode recovery
-   normalization. Keep v8 creation disabled until this slice is complete.
+   normalization. A staged MemTable adapter now replays a normalized Active
+   image and resumes serial appends from its installed ticket and digest
+   boundary; a reopen test verifies replay and cursor continuity. High-level
+   LSM startup is not wired to this adapter, and the format registry still
+   rejects v8 reader and writer selection. Keep v8 creation disabled until
+   this slice is complete.
 5. **Persistence and transitions:** version persisted seal/manifest/backup
    digest references, validate v8 archive objects, support v5/v6/v7/v8 chain
    transitions and the old-reader compatibility gate above. Add capacity and

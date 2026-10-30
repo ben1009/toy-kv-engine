@@ -526,6 +526,47 @@ impl WalV8LeaderWriter {
     pub(crate) fn is_poisoned(&self) -> bool {
         self.coordinator.is_poisoned()
     }
+
+    pub(crate) fn try_clone_sync_file(&self) -> Result<File> {
+        self.sync_file
+            .try_clone()
+            .context("clone v8 WAL sync handle")
+    }
+
+    pub(crate) fn image_len(&self) -> Result<u64> {
+        self.frontier_offset
+            .checked_add(FRAME_LEN_U64)
+            .context("v8 Active WAL image length overflows")
+    }
+
+    pub(crate) fn active_boundaries(
+        &self,
+    ) -> Result<(
+        crate::pitr::manifest::ActiveBoundary,
+        crate::pitr::manifest::ActiveBoundary,
+    )> {
+        let empty = crate::pitr::manifest::ActiveBoundary {
+            timeline_id: self.header.timeline_id.0,
+            archive_epoch_id: self.header.archive_epoch_id.0,
+            segment_id: self.header.segment_id.0,
+            incarnation: self.header.incarnation,
+            wal_format: crate::pitr::manifest::PitrWalFormat::V8,
+            ticket_end: 0,
+            durable_end: HEADER_LEN_U64,
+            last_commit_ts: 0,
+            prefix_digest: self.initial_prefix_digest,
+        };
+        let active = crate::pitr::manifest::ActiveBoundary {
+            ticket_end: self.frontier.ticket_end,
+            durable_end: self.frontier.durable_end,
+            last_commit_ts: self.frontier.last_commit_ts,
+            prefix_digest: self.frontier.prefix_digest,
+            ..empty
+        };
+        empty.validate()?;
+        active.validate()?;
+        Ok((empty, active))
+    }
 }
 
 fn bounded_limits(limits: WalV5Limits) -> WalV5Limits {
@@ -989,7 +1030,7 @@ mod tests {
         let original_inode = std::fs::metadata(&path)?.ino();
         let recovered = super::super::install::recover_and_install_active(
             &path,
-            &[installed.active_boundary.clone()],
+            std::slice::from_ref(&installed.active_boundary),
             header.predecessor,
             LIVE_WAL_V5_LIMITS,
             MAX_WAL_FILE_SIZE,

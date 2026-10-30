@@ -23977,10 +23977,10 @@ mod tests {
         source_obligation.state = ObligationState::Sealed;
         source_obligation.successor_segment_id = successor_id;
 
-        let mut unsupported_v8_boundary = successor_boundary.clone();
+        let mut unsupported_v8_boundary = successor_boundary;
         unsupported_v8_boundary.wal_format = PitrWalFormat::V8;
         let mut unsupported_v8_state = successor_state.clone();
-        unsupported_v8_state.active_boundary = Some(unsupported_v8_boundary.clone());
+        unsupported_v8_state.active_boundary = Some(unsupported_v8_boundary);
         let unsupported_v8_error = LsmStorageInner::recreate_missing_sealed_v7_successor(
             &database,
             &unsupported_v8_state,

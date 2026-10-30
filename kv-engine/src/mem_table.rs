@@ -1451,6 +1451,51 @@ impl MemTable {
         Ok((ret, max_commit_ts))
     }
 
+    /// Recover and reopen a normalized Active v8 WAL with its serial Leader
+    /// writer. The caller must have authority-checked and durably installed the
+    /// image before attaching it to a writable memtable.
+    #[cfg(target_os = "linux")]
+    #[allow(dead_code)] // Wired into LSM Active v8 startup in a later slice.
+    pub(crate) fn recover_from_v8_active(
+        id: usize,
+        vlog_enabled: bool,
+        path: impl AsRef<Path>,
+        installed: crate::wal::v8::install::WalV8InstalledRecovery,
+        max_file_size: u64,
+    ) -> Result<(Self, u64)> {
+        let path = path.as_ref().to_path_buf();
+        let max_commit_ts = installed.active_boundary.last_commit_ts;
+        let recovered_recorded_at = installed.last_recorded_at;
+        let mut ret = Self::create(id, vlog_enabled);
+        ret.wal_v8_source = true;
+        for batch in &installed.selection.batches {
+            ret.apply_recovered_batch(batch)?;
+        }
+
+        let write_file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .with_context(|| format!("open installed v8 Active WAL {}", path.display()))?;
+        let sync_file = write_file
+            .try_clone()
+            .context("clone installed v8 Active WAL sync handle")?;
+        let writer = crate::wal::v8::leader::WalV8LeaderWriter::new(
+            write_file,
+            sync_file,
+            &installed,
+            max_file_size,
+        )?;
+        ret.wal = Some(Wal::from_v8_leader(writer, &installed)?);
+        ret.wal_path = Some(path);
+        ret.last_ticket
+            .store(installed.next_ticket, std::sync::atomic::Ordering::Release);
+        ret.recovered_recorded_at = recovered_recorded_at;
+        ret.rebuild_bloom();
+
+        Ok((ret, max_commit_ts))
+    }
+
     /// Recover an Active v7 image covered by a durable Sealing obligation as a
     /// read-only source. The recovered cursor and resource owner are retained
     /// so explicit PITR resume can build and install the seal without starting
@@ -2030,6 +2075,11 @@ impl MemTable {
             let ticket = wal.put_v5_batch(batch, limits, None)?;
             (ticket, None)
         };
+        let ticket_end = ticket
+            .checked_add(1)
+            .context("PITR WAL ticket end overflows")?;
+        self.last_ticket
+            .fetch_max(ticket_end, std::sync::atomic::Ordering::Release);
         #[cfg(feature = "bench")]
         self.write_profile.load().wal_write_ns.fetch_add(
             started.elapsed().as_nanos() as u64,
@@ -2226,6 +2276,11 @@ impl MemTable {
         self.wal_v7_source || self.wal.as_ref().is_some_and(Wal::is_v7)
     }
 
+    #[allow(dead_code)] // Used by Active v8 capture after LSM recovery is wired.
+    pub(crate) fn uses_v8_wal(&self) -> bool {
+        self.wal_v8_source || self.wal.as_ref().is_some_and(Wal::is_v8)
+    }
+
     /// Capture both the canonical empty floor and the writer's latest v7
     /// frontier. The caller must have stopped commit admission and synced the
     /// WAL before using the returned active boundary as manifest authority.
@@ -2314,6 +2369,20 @@ impl MemTable {
         );
 
         Ok((empty, current))
+    }
+
+    #[allow(dead_code)] // Used by Active v8 manifest capture after LSM recovery is wired.
+    pub(crate) fn v8_active_boundaries(
+        &self,
+    ) -> Result<(
+        crate::pitr::manifest::ActiveBoundary,
+        crate::pitr::manifest::ActiveBoundary,
+    )> {
+        anyhow::ensure!(self.uses_v8_wal(), "memtable WAL is not v8");
+        self.wal
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("memtable has no Active v8 writer"))?
+            .v8_active_boundaries()
     }
 
     pub(crate) fn v7_frontier_cursor(
@@ -3551,6 +3620,13 @@ mod tests {
             install::{WalV7InstalledRecovery, recover_and_install_active},
             recovery::WalV7RecoveryAuthority,
         },
+        wal::v8::{
+            codec::WalV8Header,
+            install::{
+                WalV8InstalledRecovery, create_empty_active_image,
+                recover_and_install_active as recover_and_install_v8_active,
+            },
+        },
     };
 
     #[cfg(target_os = "linux")]
@@ -3560,6 +3636,37 @@ mod tests {
     use crate::wal::v7::admission::{WalV7ResourceCharge, WalV7RetainedResources};
 
     const TEST_V7_MAX_FILE_SIZE: u64 = 1 << 30;
+    const TEST_V8_MAX_IMAGE_LEN: u64 = 1 << 30;
+
+    #[cfg(target_os = "linux")]
+    fn install_empty_v8(path: &Path) -> Result<(WalV8Header, ActiveBoundary)> {
+        let header = WalV8Header {
+            timeline_id: TimelineId([21; 16]),
+            archive_epoch_id: ArchiveEpochId([22; 16]),
+            segment_id: SegmentId(8),
+            predecessor: ChainAnchor::Genesis {
+                archive_epoch_id: ArchiveEpochId([22; 16]),
+            },
+            incarnation: [23; 16],
+        };
+        let boundary = create_empty_active_image(path, header)?;
+        Ok((header, boundary))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn recover_v8(
+        path: &Path,
+        header: WalV8Header,
+        anchors: &[ActiveBoundary],
+    ) -> Result<WalV8InstalledRecovery> {
+        recover_and_install_v8_active(
+            path,
+            anchors,
+            header.predecessor,
+            LIVE_WAL_V5_LIMITS,
+            TEST_V8_MAX_IMAGE_LEN,
+        )
+    }
 
     fn recover_v7(path: &Path, anchor: ActiveBoundary) -> Result<WalV7InstalledRecovery> {
         Ok(recover_and_install_active(
@@ -4096,6 +4203,114 @@ mod tests {
             Some(Bytes::from(expected_value))
         );
         assert_eq!(reopened.range_tombstones().len(), 2);
+
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn v8_active_memtable_reopens_from_normalized_prefix() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("active-v8.wal");
+        let (header, empty_anchor) = install_empty_v8(&path)?;
+        let installed = recover_v8(&path, header, &[empty_anchor])?;
+        let (memtable, max_ts) =
+            MemTable::recover_from_v8_active(8, false, &path, installed, TEST_V8_MAX_IMAGE_LEN)?;
+
+        assert_eq!(max_ts, 0);
+        assert!(memtable.uses_pitr_batch_wal());
+        assert!(memtable.uses_v8_wal());
+        assert_eq!(memtable.wal_batch_count(), Some(0));
+        let (empty, current) = memtable.v8_active_boundaries()?;
+        assert_eq!(empty, empty_anchor);
+        assert_eq!(current, empty_anchor);
+
+        let first_recorded_at = RecordedAt {
+            secs: 100,
+            nanos: 7,
+        };
+        let first_ticket = memtable
+            .write_pitr_wal_batch_only(
+                &WalBatch {
+                    commit_ts: 1,
+                    recorded_at: first_recorded_at,
+                    entries: vec![WalEntry::Put {
+                        key: b"first".to_vec(),
+                        value: vec![crate::vlog::KvKind::Inline as u8, b'1'],
+                    }],
+                },
+                LIVE_WAL_V5_LIMITS,
+            )?
+            .expect("v8 Active WAL assigns the first ticket");
+        assert_eq!(first_ticket, 0);
+        memtable.commit_wal_ticket(Some(first_ticket))?;
+        let (empty, first_boundary) = memtable.v8_active_boundaries()?;
+        assert_eq!(empty, empty_anchor);
+        assert_eq!(first_boundary.ticket_end, 1);
+        assert_eq!(first_boundary.last_commit_ts, 1);
+
+        drop(memtable);
+
+        let installed = recover_v8(&path, header, &[empty_anchor, first_boundary])?;
+        let (memtable, max_ts) =
+            MemTable::recover_from_v8_active(8, false, &path, installed, TEST_V8_MAX_IMAGE_LEN)?;
+        assert_eq!(max_ts, 1);
+        assert_eq!(memtable.wal_batch_count(), Some(1));
+        assert_eq!(memtable.recovered_recorded_at(), Some(first_recorded_at));
+        assert_eq!(
+            memtable.get_raw_exact(&crate::key::encode_internal_key(b"first", 1)),
+            Some(Bytes::from_static(&[
+                crate::vlog::KvKind::Inline as u8,
+                b'1'
+            ]))
+        );
+
+        let second_ticket = memtable
+            .write_pitr_wal_batch_only(
+                &WalBatch {
+                    commit_ts: 2,
+                    recorded_at: RecordedAt {
+                        secs: 101,
+                        nanos: 9,
+                    },
+                    entries: vec![WalEntry::Put {
+                        key: b"second".to_vec(),
+                        value: vec![crate::vlog::KvKind::Inline as u8, b'2'],
+                    }],
+                },
+                LIVE_WAL_V5_LIMITS,
+            )?
+            .expect("reopened v8 Active WAL assigns the next ticket");
+        assert_eq!(second_ticket, 1);
+        memtable.commit_wal_ticket(Some(second_ticket))?;
+        let (_, second_boundary) = memtable.v8_active_boundaries()?;
+        assert_eq!(second_boundary.ticket_end, 2);
+        assert_eq!(second_boundary.last_commit_ts, 2);
+        drop(memtable);
+
+        let installed = recover_v8(
+            &path,
+            header,
+            &[empty_anchor, first_boundary, second_boundary],
+        )?;
+        let (reopened, max_ts) =
+            MemTable::recover_from_v8_active(8, false, &path, installed, TEST_V8_MAX_IMAGE_LEN)?;
+        assert_eq!(max_ts, 2);
+        assert_eq!(reopened.wal_batch_count(), Some(2));
+        assert_eq!(
+            reopened.get_raw_exact(&crate::key::encode_internal_key(b"first", 1)),
+            Some(Bytes::from_static(&[
+                crate::vlog::KvKind::Inline as u8,
+                b'1'
+            ]))
+        );
+        assert_eq!(
+            reopened.get_raw_exact(&crate::key::encode_internal_key(b"second", 2)),
+            Some(Bytes::from_static(&[
+                crate::vlog::KvKind::Inline as u8,
+                b'2'
+            ]))
+        );
 
         Ok(())
     }
