@@ -34461,6 +34461,17 @@ mod tests {
     fn assert_pre_v8_cli_rejects_guarded_active_v7_without_mutation(
         state: PreV8ReaderGuardState,
     ) -> anyhow::Result<()> {
+        assert_pre_v8_cli_rejects_guarded_active_v7_with_env_without_mutation(
+            state,
+            "TOY_KV_PRE_V8_CLI",
+        )
+    }
+
+    #[cfg(target_os = "linux")]
+    fn assert_pre_v8_cli_rejects_guarded_active_v7_with_env_without_mutation(
+        state: PreV8ReaderGuardState,
+        cli_env: &str,
+    ) -> anyhow::Result<()> {
         use std::{
             collections::BTreeMap,
             os::unix::fs::MetadataExt,
@@ -34555,8 +34566,8 @@ mod tests {
             Ok(())
         }
 
-        let old_cli = std::env::var_os("TOY_KV_PRE_V8_CLI")
-            .ok_or_else(|| anyhow::anyhow!("TOY_KV_PRE_V8_CLI must name the old CLI binary"))?;
+        let old_cli = std::env::var_os(cli_env)
+            .ok_or_else(|| anyhow::anyhow!("{cli_env} must name the old CLI binary"))?;
         let dir = tempdir()?;
         let options = v7_recovery_test_database(dir.path())?;
         let engine = KvEngine::open_with_wal_io_mode(
@@ -34795,6 +34806,16 @@ mod tests {
     -> anyhow::Result<()> {
         assert_pre_v8_cli_rejects_guarded_active_v7_without_mutation(
             PreV8ReaderGuardState::AfterSnapshotRename,
+        )
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires the earlier pre-v8 CLI path in TOY_KV_EARLY_PRE_V8_CLI"]
+    fn v8_compatibility_guard_rejects_earlier_pre_v8_cli_without_mutation() -> anyhow::Result<()> {
+        assert_pre_v8_cli_rejects_guarded_active_v7_with_env_without_mutation(
+            PreV8ReaderGuardState::Published,
+            "TOY_KV_EARLY_PRE_V8_CLI",
         )
     }
 
