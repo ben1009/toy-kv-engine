@@ -75,8 +75,12 @@ the error identifies the unknown v8 manifest variant. Re-run it with:
 
 ```bash
 TOY_KV_PRE_V8_CLI=/path/to/kv-engine-cli cargo test --package kv-engine --lib \
-  v8_compatibility_guard_rejects_pre_v8_cli_without_database_mutation -- --ignored
+  v8_compatibility_guard_rejects_pre_v8_cli -- --ignored
 ```
+
+The filter runs both process cases: the guarded database with its normal
+`MANIFEST` and the same database with `MANIFEST` removed, exercising the old
+reader's `ENGINE_MANIFEST` fallback path.
 
 The publisher requires a token holding both PITR lifecycle barriers;
 the migration caller must retain it through the v7-to-v8 transition so a

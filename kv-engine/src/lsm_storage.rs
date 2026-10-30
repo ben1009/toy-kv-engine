@@ -34447,9 +34447,9 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
-    #[test]
-    #[ignore = "requires the pre-v8 CLI path in TOY_KV_PRE_V8_CLI"]
-    fn v8_compatibility_guard_rejects_pre_v8_cli_without_database_mutation() -> anyhow::Result<()> {
+    fn assert_pre_v8_cli_rejects_guarded_active_v7_without_mutation(
+        remove_manifest: bool,
+    ) -> anyhow::Result<()> {
         use std::{
             collections::BTreeMap,
             os::unix::fs::MetadataExt,
@@ -34548,6 +34548,10 @@ mod tests {
         drop(engine);
 
         let database_path = dir.path().join("db");
+        if remove_manifest {
+            std::fs::remove_file(database_path.join("MANIFEST"))?;
+            std::fs::File::open(&database_path)?.sync_all()?;
+        }
         let before = snapshot_database(&database_path)?;
         let output = Command::new(old_cli)
             .arg("--path")
@@ -34566,11 +34570,14 @@ mod tests {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
+        let identifies_expected_v8_record = if remove_manifest {
+            diagnostic.contains("V8Snapshot")
+        } else {
+            diagnostic.contains("V8CompatibilityGuard") || diagnostic.contains("V8Snapshot")
+        };
         anyhow::ensure!(
-            diagnostic.contains("unknown variant")
-                && (diagnostic.contains("V8CompatibilityGuard")
-                    || diagnostic.contains("V8Snapshot")),
-            "pre-v8 CLI failed for a reason other than rejecting the unknown v8 manifest record: {diagnostic}"
+            diagnostic.contains("unknown variant") && identifies_expected_v8_record,
+            "pre-v8 CLI failed for a reason other than rejecting the expected v8 manifest record: {diagnostic}"
         );
         let after = snapshot_database(&database_path)?;
         anyhow::ensure!(
@@ -34578,6 +34585,21 @@ mod tests {
             "pre-v8 CLI mutated database files or directory entries before rejecting the v8 guard"
         );
         Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires the pre-v8 CLI path in TOY_KV_PRE_V8_CLI"]
+    fn v8_compatibility_guard_rejects_pre_v8_cli_without_database_mutation() -> anyhow::Result<()> {
+        assert_pre_v8_cli_rejects_guarded_active_v7_without_mutation(false)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires the pre-v8 CLI path in TOY_KV_PRE_V8_CLI"]
+    fn v8_compatibility_guard_rejects_pre_v8_cli_with_missing_manifest_without_mutation()
+    -> anyhow::Result<()> {
+        assert_pre_v8_cli_rejects_guarded_active_v7_without_mutation(true)
     }
 
     #[cfg(target_os = "linux")]
