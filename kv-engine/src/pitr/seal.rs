@@ -3491,4 +3491,40 @@ mod tests {
         assert!(seal.verify_wal(&corrupt_terminal).is_err());
         Ok(())
     }
+
+    #[test]
+    fn recovers_a_sealed_v8_wal_as_a_read_only_pitr_memtable() -> Result<()> {
+        let (wal, seal) = v8_one_batch_fixture()?;
+        let directory = tempfile::tempdir()?;
+        let wal_path = directory.path().join("sealed-v8.wal");
+        std::fs::write(&wal_path, &wal)?;
+
+        let (memtable, max_commit_ts) = crate::mem_table::MemTable::recover_from_v8_sealed(
+            13,
+            false,
+            &wal_path,
+            &seal,
+            crate::pitr::LIVE_WAL_V5_LIMITS,
+        )?;
+
+        assert_eq!(max_commit_ts, 1);
+        assert_eq!(
+            memtable.get_raw_exact(&crate::key::encode_internal_key(b"k", 1)),
+            Some(bytes::Bytes::from_static(b"v"))
+        );
+        assert!(memtable.uses_pitr_batch_wal());
+        assert!(!memtable.uses_v7_wal());
+        assert_eq!(
+            memtable.wal_format_version(),
+            Some(crate::wal::format::WAL_FORMAT_VERSION_V8)
+        );
+        assert_eq!(
+            memtable.recovered_recorded_at(),
+            Some(RecordedAt {
+                secs: -2,
+                nanos: 500_000_000,
+            })
+        );
+        Ok(())
+    }
 }

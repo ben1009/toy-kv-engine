@@ -1089,6 +1089,9 @@ pub struct MemTable {
     /// True when this memtable's source image is an immutable or active v7
     /// PITR WAL. Sealed recovery retains the source without attaching a writer.
     wal_v7_source: bool,
+    /// True when this memtable was replayed from a frozen v8 PITR WAL. V8
+    /// sealed sources are read-only and retain their format identity for PITR.
+    wal_v8_source: bool,
     /// Terminal cursor retained while a durable Sealing source is recovered
     /// read-only. Explicit resume uses it to finish sealing without starting an
     /// append runtime for the frozen source.
@@ -1137,6 +1140,7 @@ impl MemTable {
             wal: None,
             wal_path: None,
             wal_v7_source: false,
+            wal_v8_source: false,
             wal_v7_sealing_frontier: None,
             wal_v7_reservation_owner: None,
             wal_v7_seal_index: None,
@@ -1507,6 +1511,38 @@ impl MemTable {
 
         ret.wal_path = Some(path);
         ret.wal_v7_source = true;
+        ret.recovered_recorded_at = seal.entries.last().map(|entry| entry.recorded_at);
+        ret.rebuild_bloom();
+
+        Ok((ret, seal.boundary.active.last_commit_ts))
+    }
+
+    /// Recover a frozen v8 PITR source as a read-only memtable. The seal
+    /// visitor validates the terminal FRONTIER, logical prefix, whole-image
+    /// digest and ticket index before replaying any batch. The caller must
+    /// first bind the seal to the manifest obligation for this source.
+    #[allow(dead_code)] // Connected to LSM startup dispatch in the next recovery slice.
+    pub(crate) fn recover_from_v8_sealed(
+        id: usize,
+        vlog_enabled: bool,
+        path: impl AsRef<Path>,
+        seal: &crate::pitr::seal::V8Seal,
+        limits: crate::pitr::WalV5Limits,
+    ) -> Result<(Self, u64)> {
+        let path = path.as_ref().to_path_buf();
+        let mut reader = File::open(&path)
+            .with_context(|| format!("open sealed v8 PITR WAL {}", path.display()))?;
+        let wal_len = reader
+            .metadata()
+            .with_context(|| format!("inspect sealed v8 PITR WAL {}", path.display()))?
+            .len();
+        let mut ret = Self::create(id, vlog_enabled);
+        seal.visit_wal_batches_from_reader(&mut reader, wal_len, limits, |batch| {
+            ret.apply_recovered_batch(&batch)
+        })?;
+
+        ret.wal_path = Some(path);
+        ret.wal_v8_source = true;
         ret.recovered_recorded_at = seal.entries.last().map(|entry| entry.recorded_at);
         ret.rebuild_bloom();
 
@@ -2169,8 +2205,12 @@ impl MemTable {
 
     pub(crate) fn wal_format_version(&self) -> Option<u16> {
         self.wal.as_ref().map(Wal::format_version).or_else(|| {
-            self.wal_v7_sealing_frontier
-                .map(|_| crate::wal::format::WAL_FORMAT_VERSION_V7)
+            if self.wal_v8_source {
+                Some(crate::wal::format::WAL_FORMAT_VERSION_V8)
+            } else {
+                self.wal_v7_sealing_frontier
+                    .map(|_| crate::wal::format::WAL_FORMAT_VERSION_V7)
+            }
         })
     }
 
@@ -2179,7 +2219,7 @@ impl MemTable {
     }
 
     pub(crate) fn uses_pitr_batch_wal(&self) -> bool {
-        self.wal_v7_source || self.wal.as_ref().is_some_and(Wal::is_pitr)
+        self.wal_v7_source || self.wal_v8_source || self.wal.as_ref().is_some_and(Wal::is_pitr)
     }
 
     pub(crate) fn uses_v7_wal(&self) -> bool {
