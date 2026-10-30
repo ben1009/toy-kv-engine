@@ -90,9 +90,13 @@ explicit compatibility decision and any necessary RFC amendment.
    digest references, validate v8 archive objects, support v5/v6/v7/v8 chain
    transitions and the old-reader compatibility gate above. Add capacity and
    migration preflight without relabeling or rewriting existing segments in
-   place. The catalog now recognizes the v8 `seal_format_version = 3`
-   descriptor and binds an empty v8 prefix to its header; archive publication
-   still fails closed pending v8 sidecar verification.
+   place. The catalog recognizes the v8 `seal_format_version = 3` descriptor
+   and binds an empty v8 prefix to its header. Archive publication now verifies
+   the frozen v8 WAL and sidecar, and shallow/deep repository verification and
+   ticket-ordered restore dispatch by format. Tests cover source-path archival,
+   catalog reopen, sealed-source startup recovery, and exact restore across a
+   v7-to-v8 chain. V8 creation remains disabled pending the compatibility and
+   qualification gates.
 6. **Qualification and adoption:** complete the RFC 026 crash, recovery,
    compatibility and performance matrix. Keep v7 as the default unless the
    measured results justify an explicit later adoption decision.
