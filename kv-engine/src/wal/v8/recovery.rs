@@ -1083,7 +1083,9 @@ mod tests {
     use std::{
         fs::File,
         io::{self, Cursor, Read, Seek, SeekFrom},
-        os::unix::fs::MetadataExt,
+        os::unix::{fs::MetadataExt, process::ExitStatusExt},
+        process::{Command, Stdio},
+        time::{Duration, Instant},
     };
 
     use anyhow::Result;
@@ -1532,6 +1534,215 @@ mod tests {
         assert_eq!(reopened.active_boundary, installed.active_boundary);
         assert_eq!(reopened.candidate.frontier, installed.frontier);
         assert_eq!(reopened.batches.len(), 1);
+        Ok(())
+    }
+
+    #[cfg(feature = "chaos-testing")]
+    #[test]
+    fn failpoint_active_recovery_crashes_at_install_boundaries_and_retries() -> Result<()> {
+        const CHILD_WAL_ENV: &str = "TOY_KV_V8_RECOVERY_CHILD_WAL";
+        const CRASH_POINTS: [&str; 4] = [
+            "wal_v8.recovery.after_temp_write_before_sync",
+            "wal_v8.recovery.after_temp_sync_before_rename",
+            "wal_v8.recovery.after_rename_before_directory_sync",
+            "wal_v8.recovery.after_directory_sync",
+        ];
+        const TEST_NAME: &str = "wal::v8::recovery::tests::failpoint_active_recovery_crashes_at_install_boundaries_and_retries";
+
+        if let Some(wal_path) = std::env::var_os(CHILD_WAL_ENV) {
+            let fixture = two_batch_image()?;
+            crate::wal::v8::install::recover_and_install_active(
+                wal_path,
+                &[active_boundary(fixture.first_frontier)],
+                test_header().predecessor,
+                LIVE_WAL_V5_LIMITS,
+                crate::wal::MAX_WAL_FILE_SIZE,
+            )?;
+            anyhow::bail!("configured V8 recovery crash point did not stop the child")
+        }
+
+        let fixture = two_batch_image()?;
+        let anchor = active_boundary(fixture.first_frontier);
+        for crash_point in CRASH_POINTS {
+            let directory = tempfile::tempdir()?;
+            let wal_path = directory.path().join("active-v8.wal");
+            let marker_path = directory.path().join("crash.marker");
+            let mut damaged = fixture.bytes.clone();
+            let second_data_offset =
+                usize::try_from(fixture.first_frontier.durable_end + FRAME_LEN_U64)?;
+            damaged[second_data_offset + 64] ^= 0x80;
+            std::fs::write(&wal_path, damaged)?;
+
+            // Repeated interruption also verifies that a retry removes any
+            // stale temporary image from the previous attempt.
+            for _ in 0..2 {
+                let _ = std::fs::remove_file(&marker_path);
+                let mut child = Command::new(std::env::current_exe()?);
+                child
+                    .arg("--exact")
+                    .arg(TEST_NAME)
+                    .arg("--nocapture")
+                    .env(CHILD_WAL_ENV, &wal_path)
+                    .env(
+                        crate::chaos::failpoint::PARALLEL_WAL_CRASH_POINT_ENV,
+                        crash_point,
+                    )
+                    .env(
+                        crate::chaos::failpoint::PARALLEL_WAL_CRASH_OCCURRENCE_ENV,
+                        "1",
+                    )
+                    .env(
+                        crate::chaos::failpoint::PARALLEL_WAL_CRASH_MARKER_ENV,
+                        &marker_path,
+                    )
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null());
+                let mut child = child.spawn()?;
+                let deadline = Instant::now() + Duration::from_secs(30);
+                loop {
+                    if marker_path.is_file() {
+                        break;
+                    }
+                    if let Some(status) = child.try_wait()? {
+                        anyhow::bail!(
+                            "V8 recovery child exited before reaching {crash_point}: {status}"
+                        );
+                    }
+                    if Instant::now() >= deadline {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        anyhow::bail!("V8 recovery child did not reach {crash_point}");
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+
+                child.kill()?;
+                let status = child.wait()?;
+                ensure!(
+                    status.signal() == Some(libc::SIGKILL),
+                    "V8 recovery child was not killed at {crash_point}: {status}"
+                );
+                ensure!(
+                    std::fs::read_to_string(&marker_path)?.trim() == crash_point,
+                    "V8 recovery child reached an unexpected crash point"
+                );
+            }
+
+            let recovered = crate::wal::v8::install::recover_and_install_active(
+                &wal_path,
+                &[anchor],
+                test_header().predecessor,
+                LIVE_WAL_V5_LIMITS,
+                crate::wal::MAX_WAL_FILE_SIZE,
+            )?;
+            assert_eq!(recovered.active_boundary, anchor);
+            assert_eq!(recovered.frontier.ticket_end, 1);
+            assert_eq!(recovered.selection.batches.len(), 1);
+            assert_eq!(recovered.selection.batches[0].commit_ts, 10);
+            for entry in std::fs::read_dir(directory.path())? {
+                let entry = entry?;
+                ensure!(
+                    !entry
+                        .file_name()
+                        .as_encoded_bytes()
+                        .starts_with(b".toy-kv-v8-recovery-"),
+                    "successful retry left a stale v8 recovery image"
+                );
+            }
+
+            let reopened = crate::wal::v8::install::recover_and_install_active(
+                &wal_path,
+                &[anchor],
+                test_header().predecessor,
+                LIVE_WAL_V5_LIMITS,
+                crate::wal::MAX_WAL_FILE_SIZE,
+            )?;
+            assert_eq!(reopened.active_boundary, anchor);
+            assert_eq!(reopened.frontier, recovered.frontier);
+            assert_eq!(reopened.selection.batches, recovered.selection.batches);
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "chaos-testing")]
+    #[test]
+    fn failpoint_active_recovery_install_errors_preserve_or_recover_the_anchor() -> Result<()> {
+        const FAILURES: [(&str, &str, bool); 3] = [
+            (
+                "wal_v8.recovery.before_temp_sync",
+                "injected Active v8 recovery image sync failure",
+                false,
+            ),
+            (
+                "wal_v8.recovery.before_rename",
+                "injected Active v8 recovery rename failure",
+                false,
+            ),
+            (
+                "wal_v8.recovery.before_directory_sync",
+                "injected Active v8 recovery directory sync failure",
+                true,
+            ),
+        ];
+        // The directory-sync error is injected before the first sync syscall;
+        // recovery cleanup retries that sync after the renamed image is found.
+
+        let fixture = two_batch_image()?;
+        let anchor = active_boundary(fixture.first_frontier);
+        let mut damaged = fixture.bytes.clone();
+        let second_data_offset =
+            usize::try_from(fixture.first_frontier.durable_end + FRAME_LEN_U64)?;
+        damaged[second_data_offset + 64] ^= 0x80;
+
+        for (failpoint, expected_error, rename_completed) in FAILURES {
+            let directory = tempfile::tempdir()?;
+            let wal_path = directory.path().join("active-v8.wal");
+            std::fs::write(&wal_path, &damaged)?;
+            let original = std::fs::read(&wal_path)?;
+            let scenario = crate::chaos::failpoint::FailScenario::setup();
+            crate::chaos::failpoint::cfg(failpoint, "return").map_err(anyhow::Error::msg)?;
+            let operation = crate::wal::v8::install::recover_and_install_active(
+                &wal_path,
+                &[anchor],
+                test_header().predecessor,
+                LIVE_WAL_V5_LIMITS,
+                crate::wal::MAX_WAL_FILE_SIZE,
+            );
+            crate::chaos::failpoint::cfg(failpoint, "off").map_err(anyhow::Error::msg)?;
+            scenario.teardown();
+
+            let error = operation
+                .err()
+                .context("Active v8 recovery succeeded despite an injected install failure")?;
+            ensure!(
+                format!("{error:#}").contains(expected_error),
+                "unexpected Active v8 recovery error: {error:#}"
+            );
+            let image_after_failure = std::fs::read(&wal_path)?;
+            if rename_completed {
+                ensure!(
+                    image_after_failure != original,
+                    "directory-sync failure should happen after WAL replacement"
+                );
+            } else {
+                ensure!(
+                    image_after_failure == original,
+                    "pre-rename failure must preserve the source WAL"
+                );
+            }
+
+            let recovered = crate::wal::v8::install::recover_and_install_active(
+                &wal_path,
+                &[anchor],
+                test_header().predecessor,
+                LIVE_WAL_V5_LIMITS,
+                crate::wal::MAX_WAL_FILE_SIZE,
+            )?;
+            assert_eq!(recovered.active_boundary, anchor);
+            assert_eq!(recovered.frontier.ticket_end, 1);
+            assert_eq!(recovered.selection.batches.len(), 1);
+            assert_eq!(recovered.selection.batches[0].commit_ts, 10);
+        }
         Ok(())
     }
 

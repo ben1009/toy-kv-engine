@@ -95,8 +95,11 @@ explicit compatibility decision and any necessary RFC amendment.
    the frozen v8 WAL and sidecar, and shallow/deep repository verification and
    ticket-ordered restore dispatch by format. Tests cover source-path archival,
    catalog reopen, sealed-source startup recovery, and exact restore across a
-   v7-to-v8 chain. V8 creation remains disabled pending the compatibility and
-   qualification gates.
+   v7-to-v8 chain. Active recovery normalization is tested with repeated process
+   interruption after temp-image write, temp sync, rename, and directory sync;
+   retries preserve the hard anchor. Returned errors before sync, rename, and
+   directory sync are also covered. V8 creation remains disabled pending the
+   compatibility and qualification gates.
 6. **Qualification and adoption:** complete the RFC 026 crash, recovery,
    compatibility and performance matrix. Keep v7 as the default unless the
    measured results justify an explicit later adoption decision.

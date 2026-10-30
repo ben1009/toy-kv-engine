@@ -360,6 +360,8 @@ fn install_normalized_image(request: InstallRequest<'_>) -> Result<WalV8Installe
         );
         temp.flush()
             .context("flush normalized Active v8 recovery image before verification")?;
+        #[cfg(feature = "chaos-testing")]
+        crate::chaos::failpoint::wal_crash_point("wal_v8.recovery.after_temp_write_before_sync");
         let mut verification_file =
             File::open(&temp_path).context("open normalized Active v8 image for verification")?;
         let verification_discovery = discover_frontier_candidates(
@@ -382,14 +384,34 @@ fn install_normalized_image(request: InstallRequest<'_>) -> Result<WalV8Installe
             "normalized Active v8 image does not reproduce its selected logical boundary"
         );
         drop(verification_file);
+        #[cfg(feature = "chaos-testing")]
+        crate::chaos::failpoint::fail_point!("wal_v8.recovery.before_temp_sync", |_| Err(
+            anyhow::anyhow!("injected Active v8 recovery image sync failure")
+        ));
         temp.sync_all()
             .context("sync normalized Active v8 recovery image")?;
+        #[cfg(feature = "chaos-testing")]
+        crate::chaos::failpoint::wal_crash_point("wal_v8.recovery.after_temp_sync_before_rename");
         drop(temp);
 
+        #[cfg(feature = "chaos-testing")]
+        crate::chaos::failpoint::fail_point!("wal_v8.recovery.before_rename", |_| Err(
+            anyhow::anyhow!("injected Active v8 recovery rename failure")
+        ));
         fs::rename(&temp_path, path).context("atomically replace Active v8 WAL")?;
+        #[cfg(feature = "chaos-testing")]
+        crate::chaos::failpoint::wal_crash_point(
+            "wal_v8.recovery.after_rename_before_directory_sync",
+        );
+        #[cfg(feature = "chaos-testing")]
+        crate::chaos::failpoint::fail_point!("wal_v8.recovery.before_directory_sync", |_| Err(
+            anyhow::anyhow!("injected Active v8 recovery directory sync failure")
+        ));
         parent_dir
             .sync_all()
             .context("sync Active v8 WAL directory after replacement")?;
+        #[cfg(feature = "chaos-testing")]
+        crate::chaos::failpoint::wal_crash_point("wal_v8.recovery.after_directory_sync");
         let installed_metadata =
             fs::symlink_metadata(path).context("inspect installed Active v8 WAL inode")?;
         ensure!(
