@@ -67,17 +67,28 @@ the log to that generation. Guarded snapshot recovery cuts the old log at the
 matching generation and preserves records after that cut. Focused tests
 exercise generation cuts, missing `MANIFEST`, process interruption at each
 publication boundary, and rejection of the new JSON variants by a pre-v8
-enum. The publisher requires a token holding both PITR lifecycle barriers;
+enum. An opt-in process test also runs the historical CLI at
+`18c5f0a8ccfb` against a guarded Active v7 database with WAL enabled; it
+verifies that the old binary rejects the database and that recursive file
+contents, entry names and file metadata remain unchanged. It also checks that
+the error identifies the unknown v8 manifest variant. Re-run it with:
+
+```bash
+TOY_KV_PRE_V8_CLI=/path/to/kv-engine-cli cargo test --package kv-engine --lib \
+  v8_compatibility_guard_rejects_pre_v8_cli_without_database_mutation -- --ignored
+```
+
+The publisher requires a token holding both PITR lifecycle barriers;
 the migration caller must retain it through the v7-to-v8 transition so a
 concurrent resume cannot reopen commit admission between guard publication
 and WAL migration.
 
-This is implementation progress, not compatibility qualification. Before
-enabling v8 creation, run process-level tests against the actual older binaries
-for normal and snapshot recovery, missing manifest, interrupted migration,
-WAL-lock and value-log startup, and compare database files and directory
-entries before and after rejection. The complete historical-binary matrix and
-startup ordering remain unqualified, so v8 creation stays disabled.
+This is partial compatibility qualification. Before enabling v8 creation, run
+the remaining process-level tests against the actual older binaries for normal
+and snapshot recovery, missing manifest, interrupted migration, WAL-lock and
+value-log startup, and compare database files and directory entries before and
+after rejection. The complete historical-binary matrix and startup ordering
+remain unqualified, so v8 creation stays disabled.
 
 ## Slices
 

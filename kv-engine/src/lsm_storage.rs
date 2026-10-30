@@ -34448,6 +34448,140 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    #[ignore = "requires the pre-v8 CLI path in TOY_KV_PRE_V8_CLI"]
+    fn v8_compatibility_guard_rejects_pre_v8_cli_without_database_mutation() -> anyhow::Result<()> {
+        use std::{
+            collections::BTreeMap,
+            os::unix::fs::MetadataExt,
+            process::{Command, Stdio},
+        };
+
+        #[derive(Debug, Eq, PartialEq)]
+        struct EntrySnapshot {
+            kind: u8,
+            mode: u32,
+            device: u64,
+            inode: u64,
+            length: u64,
+            modified_seconds: i64,
+            modified_nanoseconds: i64,
+            contents: Vec<u8>,
+        }
+
+        fn snapshot_tree(
+            root: &std::path::Path,
+            directory: &std::path::Path,
+            entries: &mut BTreeMap<std::path::PathBuf, EntrySnapshot>,
+        ) -> anyhow::Result<()> {
+            for entry in std::fs::read_dir(directory)? {
+                let entry = entry?;
+                let path = entry.path();
+                let relative = path.strip_prefix(root)?.to_path_buf();
+                let metadata = std::fs::symlink_metadata(&path)?;
+                let file_type = metadata.file_type();
+                let (kind, contents) = if file_type.is_dir() {
+                    (1, Vec::new())
+                } else if file_type.is_file() {
+                    (2, std::fs::read(&path)?)
+                } else if file_type.is_symlink() {
+                    (
+                        3,
+                        std::fs::read_link(&path)?
+                            .as_os_str()
+                            .as_encoded_bytes()
+                            .to_vec(),
+                    )
+                } else {
+                    anyhow::bail!("unexpected filesystem entry type at {}", path.display());
+                };
+                entries.insert(
+                    relative,
+                    EntrySnapshot {
+                        kind,
+                        mode: metadata.mode(),
+                        device: metadata.dev(),
+                        inode: metadata.ino(),
+                        length: metadata.len(),
+                        modified_seconds: metadata.mtime(),
+                        modified_nanoseconds: metadata.mtime_nsec(),
+                        contents,
+                    },
+                );
+                if file_type.is_dir() {
+                    snapshot_tree(root, &path, entries)?;
+                }
+            }
+            Ok(())
+        }
+
+        fn snapshot_database(
+            root: &std::path::Path,
+        ) -> anyhow::Result<BTreeMap<std::path::PathBuf, EntrySnapshot>> {
+            let mut entries = BTreeMap::new();
+            snapshot_tree(root, root, &mut entries)?;
+            Ok(entries)
+        }
+
+        let old_cli = std::env::var_os("TOY_KV_PRE_V8_CLI")
+            .ok_or_else(|| anyhow::anyhow!("TOY_KV_PRE_V8_CLI must name the old CLI binary"))?;
+        let dir = tempdir()?;
+        let options = v7_recovery_test_database(dir.path())?;
+        let engine = KvEngine::open_with_wal_io_mode(
+            dir.path().join("db"),
+            options,
+            crate::wal::WalIoMode::Leader,
+        )?;
+        suspend_pitr_maintenance_for_test(&engine);
+        engine.put(b"guarded", b"value")?;
+        engine
+            .inner
+            .mvcc
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("v7 compatibility test database has no MVCC"))?
+            .stop_commit_admission_and_capture()?;
+        let publication_guards = engine.lock_v8_compatibility_publication();
+        engine
+            .inner
+            .publish_v8_compatibility_guard(&publication_guards)?;
+        drop(publication_guards);
+        engine.close_storage()?;
+        drop(engine);
+
+        let database_path = dir.path().join("db");
+        let before = snapshot_database(&database_path)?;
+        let output = Command::new(old_cli)
+            .arg("--path")
+            .arg(&database_path)
+            .arg("--enable-wal")
+            .stdin(Stdio::null())
+            .output()?;
+        let diagnostic = format!(
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        anyhow::ensure!(
+            !output.status.success(),
+            "pre-v8 CLI unexpectedly opened a guarded database; stdout: {}; stderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        anyhow::ensure!(
+            diagnostic.contains("unknown variant")
+                && (diagnostic.contains("V8CompatibilityGuard")
+                    || diagnostic.contains("V8Snapshot")),
+            "pre-v8 CLI failed for a reason other than rejecting the unknown v8 manifest record: {diagnostic}"
+        );
+        let after = snapshot_database(&database_path)?;
+        anyhow::ensure!(
+            before == after,
+            "pre-v8 CLI mutated database files or directory entries before rejecting the v8 guard"
+        );
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn pitr_forced_flush_and_checkpoint_preserve_archive_chain_on_reopen() {
         let dir = tempdir().unwrap();
         let engine = pitr_flush_test_engine(dir.path());
