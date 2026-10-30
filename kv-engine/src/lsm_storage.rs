@@ -34476,6 +34476,8 @@ mod tests {
             length: u64,
             modified_seconds: i64,
             modified_nanoseconds: i64,
+            changed_seconds: i64,
+            changed_nanoseconds: i64,
             contents: Vec<u8>,
         }
 
@@ -34515,6 +34517,8 @@ mod tests {
                         length: metadata.len(),
                         modified_seconds: metadata.mtime(),
                         modified_nanoseconds: metadata.mtime_nsec(),
+                        changed_seconds: metadata.ctime(),
+                        changed_nanoseconds: metadata.ctime_nsec(),
                         contents,
                     },
                 );
