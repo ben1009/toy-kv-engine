@@ -3211,6 +3211,16 @@ impl KvEngine {
                             None
                         }
                     };
+                status.v8_migration_capacity =
+                    match self.pitr_v8_migration_capacity_status(&state, &active) {
+                        Ok(capacity) => capacity,
+                        Err(error) => {
+                            log::warn!(
+                                "omitting advisory PITR v8 migration capacity estimate: {error:#}"
+                            );
+                            None
+                        }
+                    };
                 status.active_wal_bytes = active.wal_logical_length().unwrap_or(0);
                 status.latest_durable_commit_ts = self
                     .inner
@@ -3373,6 +3383,182 @@ impl KvEngine {
             }
             Err(error) => Err(error),
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn pitr_v8_migration_capacity_status(
+        &self,
+        state: &crate::pitr::manifest::PitrState,
+        active: &MemTable,
+    ) -> Result<Option<crate::pitr::api::PitrV8MigrationCapacityStatus>> {
+        use std::{io::Read, os::unix::fs::OpenOptionsExt};
+
+        use crate::pitr::manifest::{PitrMode, PitrWalFormat};
+
+        if !active.uses_v7_wal()
+            || active.wal_io_mode().is_none()
+            || state.mode != PitrMode::Enabled
+            || state.uncertain_segment_id.is_some()
+            || state.recovery_gap.is_some()
+            || state.legacy_v7_boundary_recovery
+        {
+            return Ok(None);
+        }
+        let Some(active_segment_id) = state.active_segment_id else {
+            return Ok(None);
+        };
+        let Some(boundary) = state.active_boundary else {
+            return Ok(None);
+        };
+        if LsmStorageInner::pitr_segment_of(active) != Some(active_segment_id)
+            || boundary.wal_format != PitrWalFormat::V7
+            || boundary.segment_id != active_segment_id
+            || state.timeline_id != Some(boundary.timeline_id)
+            || state.archive_epoch_id != Some(boundary.archive_epoch_id)
+            || boundary.validate().is_err()
+            || state
+                .obligations
+                .get(&active_segment_id)
+                .is_some_and(|obligation| {
+                    obligation.state == crate::pitr::manifest::ObligationState::Sealing
+                })
+        {
+            return Ok(None);
+        }
+        let config = state
+            .config
+            .as_ref()
+            .ok_or_else(|| anyhow!("Active v7 PITR WAL has no persisted configuration"))?;
+        let active_wal_path = active
+            .wal_path()
+            .ok_or_else(|| anyhow!("Active v7 PITR WAL has no source path"))?;
+        let database_path = active_wal_path
+            .parent()
+            .ok_or_else(|| anyhow!("Active v7 PITR WAL has no parent directory"))?;
+        let source_v7_active_image_bytes = active
+            .wal_logical_length()
+            .ok_or_else(|| anyhow!("Active v7 PITR WAL has no logical length"))?;
+        let mut active_file = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+            .open(active_wal_path)
+            .with_context(|| {
+                format!(
+                    "inspect Active v7 PITR WAL {} for migration capacity",
+                    active_wal_path.display()
+                )
+            })?;
+        let active_metadata = active_file.metadata().with_context(|| {
+            format!(
+                "inspect opened Active v7 PITR WAL {} for migration capacity",
+                active_wal_path.display()
+            )
+        })?;
+        ensure!(
+            active_metadata.file_type().is_file(),
+            "Active v7 PITR WAL {} is not a regular file",
+            active_wal_path.display()
+        );
+        let mut header_bytes = [0; crate::wal::v7::codec::WAL_V7_HEADER_LEN];
+        active_file.read_exact(&mut header_bytes).with_context(|| {
+            format!(
+                "read Active v7 PITR WAL header {} for migration capacity",
+                active_wal_path.display()
+            )
+        })?;
+        let header = crate::wal::v7::codec::WalV7Header::decode(&header_bytes)?;
+        if header.timeline_id.0 != boundary.timeline_id
+            || header.archive_epoch_id.0 != boundary.archive_epoch_id
+            || header.segment_id.0 != boundary.segment_id
+            || header.incarnation != boundary.incarnation
+        {
+            return Ok(None);
+        }
+        let active_allocated_bytes = LsmStorageInner::filesystem_allocated_bytes(&active_metadata)?;
+        let (mut visible_segment_allocations, staging_bytes, unattributed_bytes) =
+            LsmStorageInner::pitr_source_allocations(database_path, Some(active_segment_id))?;
+        let active_visible_bytes = visible_segment_allocations
+            .entry(active_segment_id)
+            .or_default();
+        *active_visible_bytes = LsmStorageInner::add_active_v7_wal_source_charge(
+            *active_visible_bytes,
+            source_v7_active_image_bytes,
+            active_allocated_bytes,
+        )?;
+
+        let segment_allocations = if let Some(segments) = self.pitr_segments.lock().as_ref() {
+            let mut charges = segments.source_spool_charges_by_segment()?;
+            for (segment_id, allocated_bytes) in visible_segment_allocations {
+                let charge = charges.entry(segment_id).or_default();
+                *charge = (*charge).max(allocated_bytes);
+            }
+            charges
+        } else {
+            visible_segment_allocations
+        };
+        let retained_segment_source_bytes =
+            segment_allocations
+                .values()
+                .try_fold(0_u64, |total, bytes| {
+                    total
+                        .checked_add(*bytes)
+                        .ok_or_else(|| anyhow!("PITR retained source allocation overflows"))
+                })?;
+        let retained_source_spool_bytes = retained_segment_source_bytes
+            .checked_add(staging_bytes)
+            .and_then(|bytes| bytes.checked_add(unattributed_bytes))
+            .ok_or_else(|| anyhow!("PITR retained source allocation overflows"))?;
+        let allocation_unit =
+            crate::pitr::segment::filesystem_allocation_reservation(database_path, 1)?;
+        let capacity = crate::pitr::migration::assess_v8_migration_capacity(
+            config,
+            source_v7_active_image_bytes,
+            active_allocated_bytes,
+            retained_source_spool_bytes,
+            allocation_unit,
+        )?;
+        let decision = match capacity.decision {
+            crate::pitr::migration::V8MigrationCapacityDecision::Eligible => {
+                crate::pitr::api::PitrV8MigrationCapacityDecision::Eligible
+            }
+            crate::pitr::migration::V8MigrationCapacityDecision::Deferred(reason) => {
+                let reason = match reason {
+                    crate::pitr::migration::V8MigrationDeferralReason::SegmentLimitTooSmall => {
+                        crate::pitr::api::PitrV8MigrationDeferralReason::SegmentLimitTooSmall
+                    }
+                    crate::pitr::migration::V8MigrationDeferralReason::SegmentLimitTooLarge => {
+                        crate::pitr::api::PitrV8MigrationDeferralReason::SegmentLimitTooLarge
+                    }
+                    crate::pitr::migration::V8MigrationDeferralReason::InsufficientSourceSpool => {
+                        crate::pitr::api::PitrV8MigrationDeferralReason::InsufficientSourceSpool
+                    }
+                };
+                crate::pitr::api::PitrV8MigrationCapacityDecision::Deferred(reason)
+            }
+        };
+
+        Ok(Some(crate::pitr::api::PitrV8MigrationCapacityStatus {
+            decision,
+            required_transition_bytes: capacity.required_transition_bytes,
+            required_total_bytes: capacity.required_total_bytes,
+            available_capacity_bytes: capacity.available_capacity_bytes,
+            retained_source_spool_bytes,
+            source_spool_limit_bytes: capacity.source_spool_limit_bytes,
+            source_v7_active_image_bytes,
+            source_v7_active_allocated_bytes: active_allocated_bytes,
+            source_v7_active_growth_bytes: capacity.source_v7_active_growth_bytes,
+            retained_segment_source_bytes,
+            retained_staging_bytes: staging_bytes,
+            retained_unattributed_bytes: unattributed_bytes,
+            configured_segment_limit_bytes: capacity.configured_segment_limit_bytes,
+            v8_active_image_bytes: capacity.v8_active_image_bytes,
+            recovery_workspace_bytes: capacity.recovery_workspace_bytes,
+            source_v7_seal_sidecar_bytes: capacity.source_v7_seal_sidecar_bytes,
+            v8_seal_sidecar_bytes: capacity.v8_seal_sidecar_bytes,
+            successor_image_bytes: capacity.successor_image_bytes,
+            successor_staging_bytes: capacity.successor_staging_bytes,
+            terminal_manifest_headroom_bytes: capacity.terminal_manifest_headroom_bytes,
+        }))
     }
 
     #[cfg(target_os = "linux")]
@@ -11002,6 +11188,17 @@ impl LsmStorageInner {
         }
 
         Ok((by_segment, staging_bytes, unattributed_bytes))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn add_active_v7_wal_source_charge(
+        segment_source_bytes: u64,
+        active_image_bytes: u64,
+        active_allocated_bytes: u64,
+    ) -> Result<u64> {
+        segment_source_bytes
+            .checked_add(active_image_bytes.max(active_allocated_bytes))
+            .ok_or_else(|| anyhow!("PITR retained source allocation overflows"))
     }
 
     #[cfg(target_os = "linux")]
@@ -18785,6 +18982,23 @@ mod tests {
             .collect()
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn v8_capacity_counts_active_logical_wal_image_when_allocation_lags() {
+        let existing_segment_charge = 4096;
+        let logical_image_bytes = 3 * 4096;
+        let allocated_bytes = 2 * 4096;
+
+        let charge = LsmStorageInner::add_active_v7_wal_source_charge(
+            existing_segment_charge,
+            logical_image_bytes,
+            allocated_bytes,
+        )
+        .unwrap();
+
+        assert_eq!(charge, existing_segment_charge + logical_image_bytes);
+    }
+
     fn write_random_file(path: &std::path::Path, len: usize, seed: u64) -> anyhow::Result<()> {
         use std::io::Write;
 
@@ -20324,6 +20538,10 @@ mod tests {
             })
             .unwrap();
         let capacity = status.v7_migration_capacity.unwrap();
+        assert!(
+            status.v8_migration_capacity.is_none(),
+            "a legacy Active WAL cannot use the v7-to-v8 estimate"
+        );
 
         let expected_decision = match expected.decision {
             crate::pitr::migration::V7MigrationCapacityDecision::Eligible => {
@@ -20556,6 +20774,78 @@ mod tests {
             migrated_status.active_wal_io_mode,
             Some(crate::pitr::api::PitrWalIoMode::Parallel)
         );
+        let v8_capacity = migrated_status.v8_migration_capacity.unwrap();
+        let migrated_active = engine.inner.state.load().memtable.clone();
+        assert!(migrated_active.uses_v7_wal());
+        assert_eq!(
+            v8_capacity.source_v7_active_image_bytes,
+            migrated_active.wal_logical_length().unwrap()
+        );
+        assert_eq!(
+            v8_capacity.source_v7_active_allocated_bytes,
+            LsmStorageInner::filesystem_file_allocated_bytes(migrated_active.wal_path().unwrap())?
+        );
+        assert!(v8_capacity.source_v7_active_growth_bytes > 0);
+        assert_eq!(
+            v8_capacity.retained_segment_source_bytes
+                + v8_capacity.retained_staging_bytes
+                + v8_capacity.retained_unattributed_bytes,
+            v8_capacity.retained_source_spool_bytes
+        );
+        let mut mismatched_state = engine.pitr_manifest_state.lock().clone();
+        mismatched_state.active_segment_id = mismatched_state
+            .active_segment_id
+            .map(|segment_id| segment_id.saturating_add(1));
+        assert!(
+            engine
+                .pitr_v8_migration_capacity_status(&mismatched_state, &migrated_active)?
+                .is_none()
+        );
+
+        let mut missing_boundary = engine.pitr_manifest_state.lock().clone();
+        missing_boundary.active_boundary = None;
+        assert!(
+            engine
+                .pitr_v8_migration_capacity_status(&missing_boundary, &migrated_active)?
+                .is_none()
+        );
+
+        let mut wrong_format = engine.pitr_manifest_state.lock().clone();
+        wrong_format.active_boundary.as_mut().unwrap().wal_format =
+            crate::pitr::manifest::PitrWalFormat::V8;
+        assert!(
+            engine
+                .pitr_v8_migration_capacity_status(&wrong_format, &migrated_active)?
+                .is_none()
+        );
+
+        let mut wrong_incarnation = engine.pitr_manifest_state.lock().clone();
+        wrong_incarnation
+            .active_boundary
+            .as_mut()
+            .unwrap()
+            .incarnation[0] ^= 1;
+        assert!(
+            engine
+                .pitr_v8_migration_capacity_status(&wrong_incarnation, &migrated_active)?
+                .is_none()
+        );
+
+        let mut unsettled = engine.pitr_manifest_state.lock().clone();
+        unsettled.mode = crate::pitr::manifest::PitrMode::ReconciliationRequired;
+        assert!(
+            engine
+                .pitr_v8_migration_capacity_status(&unsettled, &migrated_active)?
+                .is_none()
+        );
+
+        let mut uncertain = engine.pitr_manifest_state.lock().clone();
+        uncertain.uncertain_segment_id = uncertain.active_segment_id;
+        assert!(
+            engine
+                .pitr_v8_migration_capacity_status(&uncertain, &migrated_active)?
+                .is_none()
+        );
         engine.put(b"after-capacity-returns", b"value")?;
         engine.close_storage()?;
         Ok(())
@@ -20634,6 +20924,7 @@ mod tests {
         };
         let status = engine.pitr_status(options).unwrap();
         assert!(status.v7_migration_capacity.is_some());
+        assert!(status.v8_migration_capacity.is_none());
         let enabling = replay_pitr_records([PitrManifestRecord::EnableIntent {
             repository_id: enabled.repository_id.unwrap(),
             timeline_id: enabled.timeline_id.unwrap(),
@@ -20666,6 +20957,7 @@ mod tests {
                 Some(crate::pitr::api::PitrWalIoMode::Leader)
             );
             assert!(status.v7_migration_capacity.is_none());
+            assert!(status.v8_migration_capacity.is_none());
         }
         *engine.pitr_manifest_state.lock() = enabled;
         engine.close_storage().unwrap();

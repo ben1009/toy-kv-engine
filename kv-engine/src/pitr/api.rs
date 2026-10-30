@@ -355,6 +355,58 @@ pub struct PitrV7MigrationCapacityStatus {
     pub terminal_manifest_headroom_bytes: u64,
 }
 
+/// Why a v7 Active WAL cannot transition to v8 with its persisted limits.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PitrV8MigrationDeferralReason {
+    SegmentLimitTooSmall,
+    SegmentLimitTooLarge,
+    InsufficientSourceSpool,
+}
+
+/// Result of the read-only capacity estimate for a v7 Active WAL.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PitrV8MigrationCapacityDecision {
+    Eligible,
+    Deferred(PitrV8MigrationDeferralReason),
+}
+
+/// Advisory capacity details for a future transition from a v7 Active WAL to
+/// v8. This estimate does not reserve resources or enable v8 creation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PitrV8MigrationCapacityStatus {
+    pub decision: PitrV8MigrationCapacityDecision,
+    pub required_transition_bytes: u64,
+    /// Retained source-spool usage plus the complete estimated transition.
+    pub required_total_bytes: u64,
+    pub available_capacity_bytes: u64,
+    pub retained_source_spool_bytes: u64,
+    pub source_spool_limit_bytes: u64,
+    /// Current Active v7 WAL image length and allocated filesystem blocks.
+    /// The allocated byte count is included in `retained_segment_source_bytes`.
+    pub source_v7_active_image_bytes: u64,
+    pub source_v7_active_allocated_bytes: u64,
+    /// Additional spool allowance for the Active v7 image to grow to its
+    /// configured segment bound before rotation. The retained-source report
+    /// includes the active WAL's current logical/allocated source charge.
+    pub source_v7_active_growth_bytes: u64,
+    /// Current retained source usage, partitioned by accounting source.
+    pub retained_segment_source_bytes: u64,
+    pub retained_staging_bytes: u64,
+    pub retained_unattributed_bytes: u64,
+    /// Persisted segment limit, reported as configured. V8 image and recovery
+    /// workspace estimates cap it at the maximum supported WAL size; a larger
+    /// configured limit still produces a deferred decision.
+    pub configured_segment_limit_bytes: u64,
+    /// Estimated transition reservation components.
+    pub v8_active_image_bytes: u64,
+    pub recovery_workspace_bytes: u64,
+    pub source_v7_seal_sidecar_bytes: u64,
+    pub v8_seal_sidecar_bytes: u64,
+    pub successor_image_bytes: u64,
+    pub successor_staging_bytes: u64,
+    pub terminal_manifest_headroom_bytes: u64,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PitrStatus {
     pub state: PitrArchiveState,
@@ -366,6 +418,11 @@ pub struct PitrStatus {
     /// Omitted when the Active WAL is not legacy, the manifest has no Active
     /// segment or names a different segment, or snapshot construction fails.
     pub v7_migration_capacity: Option<PitrV7MigrationCapacityStatus>,
+    /// Read-only v8 migration estimate for a settled v7 Active WAL on Linux.
+    /// Omitted unless the active memtable, manifest boundary and on-disk WAL
+    /// header identify the same v7 segment and incarnation. The estimate is
+    /// advisory and does not reserve capacity or enable v8 creation.
+    pub v8_migration_capacity: Option<PitrV8MigrationCapacityStatus>,
     pub latest_durable_commit_ts: Option<u64>,
     pub latest_archived_commit_ts: Option<u64>,
     pub recoverable_intervals: Vec<RecoveryInterval>,
@@ -910,6 +967,7 @@ impl PitrStatus {
             active_wal_format_version: None,
             active_wal_io_mode: None,
             v7_migration_capacity: None,
+            v8_migration_capacity: None,
             latest_durable_commit_ts: state.last_commit_anchor.map(|anchor| anchor.commit_ts),
             latest_archived_commit_ts,
             recoverable_intervals: Vec::new(),

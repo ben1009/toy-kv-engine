@@ -95,7 +95,11 @@ explicit compatibility decision and any necessary RFC amendment.
    the frozen v8 WAL and sidecar, and shallow/deep repository verification and
    ticket-ordered restore dispatch by format. Tests cover source-path archival,
    catalog reopen, sealed-source startup recovery, and exact restore from
-   persisted archive objects across a v7-to-v8 chain. Active recovery
+   persisted archive objects across a v7-to-v8 chain. `PitrStatus` reports a
+   read-only v7-to-v8 capacity estimate only for a settled Active v7 boundary
+   that matches the on-disk WAL header, including retained source allocations,
+   growth allowance to the configured segment limit, and rounded transition
+   workspace; this estimate does not reserve capacity or enable v8 creation. Active recovery
    normalization is tested with repeated process
    interruption after temp-image write, temp sync, rename, and directory sync;
    retries preserve the hard anchor. Returned errors before sync, rename, and
