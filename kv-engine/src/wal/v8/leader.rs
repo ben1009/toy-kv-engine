@@ -658,7 +658,7 @@ fn read_exact_at<const N: usize>(file: &File, offset: u64) -> io::Result<[u8; N]
 
 #[cfg(test)]
 mod tests {
-    use std::{ffi::CString, fs::OpenOptions, io::Write, os::fd::FromRawFd, path::Path};
+    use std::{ffi::CString, fs::OpenOptions, os::fd::FromRawFd, path::Path};
 
     use anyhow::Result;
 
@@ -678,33 +678,8 @@ mod tests {
         }
     }
 
-    fn empty_boundary(header: WalV8Header) -> Result<ActiveBoundary> {
-        Ok(ActiveBoundary {
-            timeline_id: header.timeline_id.0,
-            archive_epoch_id: header.archive_epoch_id.0,
-            segment_id: header.segment_id.0,
-            incarnation: header.incarnation,
-            wal_format: crate::pitr::manifest::PitrWalFormat::V8,
-            ticket_end: 0,
-            durable_end: HEADER_LEN_U64,
-            last_commit_ts: 0,
-            prefix_digest: header.initial_prefix_digest()?,
-        })
-    }
-
     fn create_empty_active(path: &Path, header: WalV8Header) -> Result<ActiveBoundary> {
-        let header_bytes = header.encode()?;
-        let physical_header_digest: [u8; 32] = Sha256::digest(header_bytes).into();
-        let initial_prefix_digest = header.initial_prefix_digest()?;
-        let frontier = super::super::codec::encode_generation_zero_frontier(
-            physical_header_digest,
-            initial_prefix_digest,
-        )?;
-        let mut file = File::create(path)?;
-        file.write_all(&header_bytes)?;
-        file.write_all(&frontier)?;
-        file.sync_all()?;
-        empty_boundary(header)
+        super::super::install::create_empty_active_image(path, header)
     }
 
     fn install_empty(path: &Path, header: WalV8Header) -> Result<WalV8InstalledRecovery> {
@@ -739,6 +714,46 @@ mod tests {
             installed,
             MAX_WAL_FILE_SIZE,
         )
+    }
+
+    #[test]
+    fn empty_active_image_creation_is_canonical_and_idempotent() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("active-v8.wal");
+        let header = header();
+
+        let boundary = super::super::install::create_empty_active_image(&path, header)?;
+        assert_eq!(
+            boundary.wal_format,
+            crate::pitr::manifest::PitrWalFormat::V8
+        );
+        assert_eq!(boundary.ticket_end, 0);
+        assert_eq!(boundary.durable_end, HEADER_LEN_U64);
+        assert_eq!(boundary.prefix_digest, header.initial_prefix_digest()?);
+
+        let image = std::fs::read(&path)?;
+        assert_eq!(image.len(), WAL_V8_HEADER_LEN + WAL_V8_FRAME_LEN);
+        let decoded_header = WalV8Header::decode(&image[..WAL_V8_HEADER_LEN])?;
+        assert_eq!(decoded_header, header);
+        let physical_header_digest = header.physical_digest()?;
+        let initial_prefix_digest = header.initial_prefix_digest()?;
+        let frame = &image[WAL_V8_HEADER_LEN..];
+        let decoded = decode_frame_structural(
+            frame,
+            HEADER_LEN_U64,
+            &physical_header_digest,
+            &initial_prefix_digest,
+        )?;
+        assert_eq!(decoded.kind, super::super::codec::WalV8FrameKind::Frontier);
+        WalV8Frontier::decode_body(&decoded.body)?
+            .validate_generation_zero(&initial_prefix_digest, HEADER_LEN_U64)?;
+
+        assert_eq!(
+            super::super::install::create_empty_active_image(&path, header)?,
+            boundary
+        );
+        assert_eq!(std::fs::read(&path)?, image);
+        Ok(())
     }
 
     fn boundary_for(header: WalV8Header, frontier: WalV8Frontier) -> ActiveBoundary {

@@ -21,8 +21,8 @@ use crate::{
 
 use super::{
     codec::{
-        WAL_V8_FRAME_LEN, WalV8Frontier, decode_frame_structural, encode_frontier_successor,
-        encode_generation_zero_frontier, frame_record_digest,
+        WAL_V8_FRAME_LEN, WalV8Frontier, WalV8Header, decode_frame_structural,
+        encode_frontier_successor, encode_generation_zero_frontier, frame_record_digest,
     },
     recovery::{WalV8RecoverySelection, discover_frontier_candidates, select_active_candidate},
 };
@@ -47,6 +47,85 @@ pub(crate) struct WalV8InstalledRecovery {
     pub(crate) installed_dev: u64,
     pub(crate) installed_ino: u64,
     pub(crate) last_recorded_at: Option<RecordedAt>,
+}
+
+/// Durably create the canonical empty Active image for a new v8 segment.
+///
+/// This is a creation path, not recovery. The caller must have a durable
+/// manifest transition authorizing the segment identity and predecessor
+/// before publishing the returned boundary to writers.
+#[cfg(target_os = "linux")]
+pub(crate) fn create_empty_active_image(
+    path: impl AsRef<Path>,
+    header: WalV8Header,
+) -> Result<ActiveBoundary> {
+    let path = path.as_ref();
+    let header_bytes = header.encode()?;
+    let physical_header_digest = header.physical_digest()?;
+    let initial_prefix_digest = header.initial_prefix_digest()?;
+    let generation_zero =
+        encode_generation_zero_frontier(physical_header_digest, initial_prefix_digest)?;
+    let mut image = [0_u8; super::WAL_V8_HEADER_LEN + WAL_V8_FRAME_LEN];
+    image[..super::WAL_V8_HEADER_LEN].copy_from_slice(&header_bytes);
+    image[super::WAL_V8_HEADER_LEN..].copy_from_slice(&generation_zero);
+
+    crate::pitr::segment::install_pitr_file_no_replace_with_faults(
+        path,
+        &image,
+        crate::pitr::segment::PitrFileInstallFaults {
+            after_header_write_before_remainder: Some(
+                "wal_v8.active_image.after_temp_header_write_before_frontier_write",
+            ),
+            after_file_write_before_sync: Some("wal_v8.active_image.after_temp_write_before_sync"),
+            after_file_sync_before_rename: Some(
+                "wal_v8.active_image.after_temp_sync_before_rename",
+            ),
+            after_rename_before_directory_sync: Some(
+                "wal_v8.active_image.after_rename_before_directory_sync",
+            ),
+            inject_empty_active_image_failures: false,
+        },
+    )?;
+
+    let mut file = File::open(path).context("open newly installed empty v8 Active WAL")?;
+    let metadata = file.metadata().context("inspect empty v8 Active WAL")?;
+    ensure!(
+        metadata.len() == image.len() as u64,
+        "new empty v8 Active WAL has an unexpected length"
+    );
+    let mut installed_image = [0_u8; super::WAL_V8_HEADER_LEN + WAL_V8_FRAME_LEN];
+    file.read_exact(&mut installed_image)
+        .context("verify newly installed empty v8 Active WAL")?;
+    ensure!(
+        installed_image == image,
+        "new empty v8 Active WAL differs from its canonical image"
+    );
+
+    let frame_offset = HEADER_LEN_U64;
+    let decoded = decode_frame_structural(
+        &generation_zero,
+        frame_offset,
+        &physical_header_digest,
+        &initial_prefix_digest,
+    )?;
+    ensure!(
+        decoded.kind == super::codec::WalV8FrameKind::Frontier,
+        "new empty v8 Active WAL does not begin with generation-zero FRONTIER"
+    );
+    let frontier = WalV8Frontier::decode_body(&decoded.body)?;
+    frontier.validate_generation_zero(&initial_prefix_digest, frame_offset)?;
+
+    Ok(ActiveBoundary {
+        timeline_id: header.timeline_id.0,
+        archive_epoch_id: header.archive_epoch_id.0,
+        segment_id: header.segment_id.0,
+        incarnation: header.incarnation,
+        wal_format: crate::pitr::manifest::PitrWalFormat::V8,
+        ticket_end: 0,
+        durable_end: frame_offset,
+        last_commit_ts: 0,
+        prefix_digest: initial_prefix_digest,
+    })
 }
 
 /// Discover, validate, normalize and install an Active v8 WAL.
