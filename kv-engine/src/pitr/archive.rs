@@ -2120,6 +2120,115 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn deep_repository_verification_rejects_rehashed_v8_payload_corruption() {
+        use crate::wal::v8::{
+            WAL_V8_HEADER_LEN,
+            codec::{WAL_V8_FRAME_LEN, WalV8Header, decode_frame_structural, encode_data_frame},
+        };
+
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("wal")).unwrap();
+        std::fs::create_dir(root.path().join("objects")).unwrap();
+        std::fs::create_dir(root.path().join("backups")).unwrap();
+        std::fs::write(root.path().join("BACKUP_CATALOG_LOG"), []).unwrap();
+        std::fs::write(root.path().join("LOCK"), []).unwrap();
+        let (mut metadata, mut wal, seal_bytes, _) = v8_archive_objects_with_one_batch();
+
+        let header = WalV8Header::decode(&wal[..WAL_V8_HEADER_LEN]).unwrap();
+        let physical_header_digest = header.physical_digest().unwrap();
+        let initial_prefix_digest = header.initial_prefix_digest().unwrap();
+        let data_offset = WAL_V8_HEADER_LEN + WAL_V8_FRAME_LEN;
+        let decoded = decode_frame_structural(
+            &wal[data_offset..data_offset + WAL_V8_FRAME_LEN],
+            u64::try_from(data_offset).unwrap(),
+            &physical_header_digest,
+            &initial_prefix_digest,
+        )
+        .unwrap();
+        let mut body = decoded.body;
+        *body.last_mut().unwrap() ^= 1;
+        let logical_header_start = crate::wal::v8::codec::WAL_V8_DATA_FRAGMENT_HEADER_LEN;
+        let logical_header_end =
+            logical_header_start + crate::wal::v8::codec::WAL_V8_LOGICAL_BATCH_HEADER_LEN;
+        let entry_stream_crc = crc32fast::hash(&body[logical_header_end..]);
+        body[logical_header_start + 36..logical_header_start + 40]
+            .copy_from_slice(&entry_stream_crc.to_be_bytes());
+        let logical_header_crc =
+            crc32fast::hash(&body[logical_header_start..logical_header_start + 40]);
+        body[logical_header_start + 40..logical_header_start + 44]
+            .copy_from_slice(&logical_header_crc.to_be_bytes());
+        let corrupt_frame = encode_data_frame(
+            physical_header_digest,
+            initial_prefix_digest,
+            u64::try_from(data_offset).unwrap(),
+            &body,
+        )
+        .unwrap();
+        wal[data_offset..data_offset + WAL_V8_FRAME_LEN].copy_from_slice(&corrupt_frame);
+
+        let mut seal = crate::pitr::seal::V8Seal::decode(&seal_bytes, metadata.wal_bytes).unwrap();
+        seal.boundary.wal_digest = Sha256::digest(&wal).into();
+        let seal_bytes = seal.encode().unwrap();
+        metadata.wal_digest = seal.boundary.wal_digest;
+        metadata.anchor.wal_digest = metadata.wal_digest;
+        metadata.immutable_boundary = Some(Box::new(seal.boundary));
+        metadata.seal_digest = Sha256::digest(&seal_bytes).into();
+        metadata.anchor.seal_digest = metadata.seal_digest;
+        let mut source_identity = Sha256::new();
+        source_identity.update(metadata.wal_digest);
+        source_identity.update(metadata.seal_digest);
+        metadata.source_identity = source_identity.finalize().into();
+
+        for (kind, bytes, digest) in [
+            (ArchiveObjectKind::Wal, wal.as_slice(), metadata.wal_digest),
+            (
+                ArchiveObjectKind::Seal,
+                seal_bytes.as_slice(),
+                metadata.seal_digest,
+            ),
+        ] {
+            let name = archive_object_name(
+                metadata.key.timeline_id,
+                metadata.key.archive_epoch_id,
+                metadata.key.segment_id,
+                kind,
+                digest,
+            );
+            std::fs::write(root.path().join("wal").join(name), bytes).unwrap();
+        }
+        let catalog = encode_catalog(&[PitrCatalogRecord::CommitSegment { metadata }]).unwrap();
+        std::fs::write(root.path().join("PITR_CATALOG_LOG"), catalog).unwrap();
+        let repository = crate::backup::BackupRepository::open(root.path()).unwrap();
+        let shallow = crate::pitr::api::VerifyPitrOptions {
+            depth: crate::pitr::api::VerifyPitrDepth::Shallow,
+            selector: None,
+            cursor: None,
+            page_size: crate::pitr::api::MAX_VERIFY_PAGE_SIZE,
+        };
+        assert!(
+            repository
+                .verify_pitr(shallow)
+                .unwrap()
+                .first_failure
+                .is_none()
+        );
+
+        let deep = repository
+            .verify_pitr(crate::pitr::api::VerifyPitrOptions {
+                depth: crate::pitr::api::VerifyPitrDepth::Deep {
+                    sampled_targets: std::num::NonZeroUsize::new(1).unwrap(),
+                },
+                ..shallow
+            })
+            .unwrap();
+        let failure = deep.first_failure.unwrap();
+        assert_eq!(failure.kind, crate::pitr::api::SegmentFailureKind::Corrupt);
+        assert_eq!(failure.expected_segment_id, Some(9));
+        assert_eq!(deep.last_verified_commit_ts, None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn deep_repository_verification_reports_rehashed_v7_structural_corruption() {
         assert_deep_v7_corruption_reports(false);
     }
