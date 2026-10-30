@@ -29,6 +29,7 @@ mod parallel;
 
 pub(crate) mod format;
 pub(crate) mod v7;
+pub(crate) mod v8;
 
 // Parallel WAL is the default for ordinary v4 WALs. Legacy and PITR WALs
 // keep their existing I/O paths.
