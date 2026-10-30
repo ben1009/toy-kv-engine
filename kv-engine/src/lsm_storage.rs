@@ -846,6 +846,9 @@ impl ManifestRecoveryState<'_> {
             ManifestRecord::FormatVersion(_) => {
                 // Already validated above; nothing to replay.
             }
+            ManifestRecord::V8CompatibilityGuard { .. } | ManifestRecord::V8Snapshot { .. } => {
+                anyhow::bail!("v8 compatibility markers must be handled during manifest recovery");
+            }
             ManifestRecord::Pitr(mut record) => {
                 let is_snapshot = matches!(
                     record,
@@ -2385,6 +2388,16 @@ pub struct KvEngine {
     pitr_close_point: Mutex<Option<crate::pitr::api::RecoveryPoint>>,
 }
 
+/// Lifecycle locks required during v8 compatibility publication and the
+/// v7-to-v8 transition. Retain this token until the transition completes or
+/// commit admission is deliberately reopened.
+#[cfg(target_os = "linux")]
+pub(crate) struct V8CompatibilityPublicationGuards<'a> {
+    inner: &'a LsmStorageInner,
+    _operation_guard: MutexGuard<'a, ()>,
+    _barrier_guard: MutexGuard<'a, ()>,
+}
+
 impl Drop for KvEngine {
     fn drop(&mut self) {
         // Best-effort bounded cleanup — join background threads.
@@ -2394,6 +2407,22 @@ impl Drop for KvEngine {
 }
 
 impl KvEngine {
+    /// Acquire the PITR lifecycle barriers required by v8 compatibility
+    /// publication. Retain the returned token through WAL migration so a
+    /// concurrent lifecycle operation cannot reopen commit admission between
+    /// publishing the guard and completing the transition.
+    #[cfg(target_os = "linux")]
+    #[allow(dead_code)]
+    pub(crate) fn lock_v8_compatibility_publication(&self) -> V8CompatibilityPublicationGuards<'_> {
+        let operation_guard = self.pitr_operation_lock.lock();
+        let barrier_guard = self.pitr_barrier_lock.lock();
+        V8CompatibilityPublicationGuards {
+            inner: self.inner.as_ref(),
+            _operation_guard: operation_guard,
+            _barrier_guard: barrier_guard,
+        }
+    }
+
     /// Gracefully close storage after syncing admitted work.
     ///
     /// When the active WAL is v7, PITR remains enabled and its Active segment
@@ -17410,14 +17439,10 @@ impl LsmStorageInner {
         Ok(())
     }
 
-    /// Publish a canonical current-version snapshot containing metadata for the
-    /// live immutable file set. Safe to call repeatedly; each call replaces
-    /// the manifest snapshot atomically.
-    #[allow(dead_code)]
-    pub(crate) fn ensure_manifest_v7(&self) -> Result<()> {
-        let state_lock = self.state_lock.lock();
-        let guard = self.state.load();
-        let state = guard.as_ref();
+    fn build_current_manifest_snapshot(
+        &self,
+        state: &LsmStorageState,
+    ) -> Result<(ManifestRecord, Vec<ImmutableFileMetadata>)> {
         let mut vlog_references = Vec::new();
         if let Some(vlog) = &self.vlog {
             for sst_id in state
@@ -17480,6 +17505,18 @@ impl LsmStorageInner {
             immutable_file_metadata: metadata.clone(),
             pitr_state: Some(self.pitr_state.lock().clone()),
         };
+        Ok((record, metadata))
+    }
+
+    /// Publish a canonical current-version snapshot containing metadata for the
+    /// live immutable file set. Safe to call repeatedly; each call replaces the
+    /// manifest snapshot atomically.
+    #[allow(dead_code)]
+    pub(crate) fn ensure_manifest_v7(&self) -> Result<()> {
+        let _state_lock = self.state_lock.lock();
+        let guard = self.state.load();
+        let state = guard.as_ref();
+        let (record, metadata) = self.build_current_manifest_snapshot(state)?;
         self.manifest
             .as_ref()
             .ok_or_else(|| anyhow!("manifest is not initialized"))?
@@ -17489,7 +17526,97 @@ impl LsmStorageInner {
             updated_state.set_immutable_file_metadata(metadata)?;
             self.state.store(Arc::new(updated_state));
         }
-        drop(state_lock);
+
+        Ok(())
+    }
+
+    /// Publish the compatibility guard while the v7 Active WAL is exclusively
+    /// owned and commit admission is stopped. The caller must pass the token
+    /// produced by `KvEngine::lock_v8_compatibility_publication` and retain it
+    /// through the migration. V8 WAL creation remains disabled until a
+    /// migration path checks this durable result.
+    #[cfg(target_os = "linux")]
+    #[allow(dead_code)]
+    pub(crate) fn publish_v8_compatibility_guard(
+        &self,
+        publication_guards: &V8CompatibilityPublicationGuards<'_>,
+    ) -> Result<()> {
+        ensure!(
+            std::ptr::eq(publication_guards.inner, self),
+            "v8 compatibility guard locks belong to a different engine"
+        );
+        let mvcc = self
+            .mvcc
+            .as_ref()
+            .ok_or_else(|| anyhow!("v8 compatibility guard requires MVCC"))?;
+        ensure!(
+            !mvcc.commit_admission_is_open(),
+            "v8 compatibility guard requires stopped commit admission"
+        );
+
+        let _state_lock = self.state_lock.lock();
+        ensure!(
+            !mvcc.commit_admission_is_open(),
+            "commit admission resumed before v8 compatibility guard publication"
+        );
+        let guard = self.state.load();
+        let state = guard.as_ref();
+        ensure!(
+            state.memtable.uses_v7_wal() && Self::pitr_segment_of(&state.memtable).is_some(),
+            "v8 compatibility guard requires an Active v7 PITR WAL"
+        );
+
+        let open_lock = self.wal_v7_open_lock.lock();
+        let open_lock = open_lock
+            .as_ref()
+            .ok_or_else(|| anyhow!("v8 compatibility guard requires the held v7 WAL lock"))?;
+        let lock_path = self.path.join(".wal-v7-open.lock");
+        let held_metadata = open_lock._file.metadata()?;
+        let path_metadata = fs::symlink_metadata(&lock_path)
+            .context("v7 WAL open-lock path is missing during v8 guard publication")?;
+        use std::os::unix::fs::MetadataExt;
+        ensure!(
+            path_metadata.is_file()
+                && !path_metadata.file_type().is_symlink()
+                && held_metadata.dev() == path_metadata.dev()
+                && held_metadata.ino() == path_metadata.ino(),
+            "v7 WAL open-lock path no longer names the held lock file"
+        );
+        open_lock
+            ._file
+            .sync_all()
+            .context("failed to sync v7 WAL open-lock file")?;
+
+        // Older binaries open these paths before manifest recovery. Make both
+        // entries durable so their startup work does not mutate the directory.
+        let vlog_path = self.path.join("vlog");
+        fs::create_dir_all(&vlog_path).context("failed to prepare vLog directory for v8 guard")?;
+        let vlog_metadata = fs::symlink_metadata(&vlog_path)?;
+        ensure!(
+            vlog_metadata.is_dir() && !vlog_metadata.file_type().is_symlink(),
+            "vLog path must be a real directory before v8 guard publication"
+        );
+        File::open(&vlog_path)
+            .context("failed to open vLog directory for sync")?
+            .sync_all()
+            .context("failed to sync vLog directory")?;
+        self.sync_dir()?;
+
+        let (record, metadata) = self.build_current_manifest_snapshot(state)?;
+        let manifest = self
+            .manifest
+            .as_ref()
+            .ok_or_else(|| anyhow!("manifest is not initialized"))?;
+        manifest.publish_v8_compatibility_guard(record)?;
+        ensure!(
+            manifest.v8_compatibility_guard_ready(),
+            "v8 compatibility guard is not durably ready"
+        );
+        if state.immutable_file_metadata != metadata {
+            let mut updated_state = state.clone();
+            updated_state.set_immutable_file_metadata(metadata)?;
+            self.state.store(Arc::new(updated_state));
+        }
 
         Ok(())
     }
@@ -34264,6 +34391,59 @@ mod tests {
             .unwrap();
 
         engine
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn v8_compatibility_guard_requires_fenced_active_v7_storage() -> anyhow::Result<()> {
+        let dir = tempdir().unwrap();
+        let options = v7_recovery_test_database(dir.path())?;
+        let engine = KvEngine::open_with_wal_io_mode(
+            dir.path().join("db"),
+            options,
+            crate::wal::WalIoMode::Leader,
+        )?;
+        suspend_pitr_maintenance_for_test(&engine);
+        engine.put(b"guarded", b"value").unwrap();
+
+        let publication_guards = engine.lock_v8_compatibility_publication();
+        assert!(
+            engine
+                .inner
+                .publish_v8_compatibility_guard(&publication_guards)
+                .is_err()
+        );
+        drop(publication_guards);
+        let manifest = engine.inner.manifest.as_ref().unwrap();
+        assert!(!manifest.v8_compatibility_guard_ready());
+
+        engine
+            .inner
+            .mvcc
+            .as_ref()
+            .unwrap()
+            .stop_commit_admission_and_capture()
+            .unwrap();
+        let publication_guards = engine.lock_v8_compatibility_publication();
+        engine
+            .inner
+            .publish_v8_compatibility_guard(&publication_guards)
+            .unwrap();
+        assert!(manifest.v8_compatibility_guard_ready());
+
+        let database_path = dir.path().join("db");
+        assert!(database_path.join(".wal-v7-open.lock").is_file());
+        assert!(database_path.join("vlog").is_dir());
+
+        drop(publication_guards);
+        engine
+            .inner
+            .mvcc
+            .as_ref()
+            .unwrap()
+            .resume_commit_admission();
+        engine.close()?;
+        Ok(())
     }
 
     #[cfg(target_os = "linux")]

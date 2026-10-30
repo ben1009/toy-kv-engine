@@ -49,23 +49,35 @@ unchanged for those checks.
 
 ## Old-reader compatibility gate
 
-Existing binaries can rewrite `MANIFEST` during recovery before checking its
-numeric format version. They can also create the WAL open-lock file or open
-the value log before parsing the manifest. A version-8 WAL header or a higher
-manifest version alone therefore does not establish RFC 026's rejection before
-mutation requirement.
+An older binary tested at `18c5f0a8ccfb` can rewrite `MANIFEST` during
+recovery before checking its numeric format version. It can also create the
+WAL open-lock file and open the value log before parsing the manifest. A
+version-8 WAL header or a higher manifest version alone therefore does not
+establish RFC 026's rejection-before-mutation requirement. The old binary
+rejected unknown top-level enum records and snapshot wrappers, while ignoring
+an unknown field added to a known record.
 
-Before enabling v8 creation, establish and durably publish a compatibility
-guard that every older reader lacking v8 support rejects before it can mutate
-the database. Preserve the guard across manifest logs, snapshot replacement and
-interrupted migration for as long as v8 history remains. A marker that relies
-on an ignored JSON field is insufficient. Verify the guard against actual older
-binaries with process-level tests covering normal and snapshot recovery,
-missing manifest, interrupted migration, WAL lock and value-log startup, and
-compare database files and directory entries before and after rejection. The
-guard and startup ordering are not yet proven; if an older binary cannot be
-made to satisfy the requirement, v8 creation remains disabled pending an
-explicit compatibility decision and any necessary RFC amendment.
+The guard publisher now syncs the existing v7 WAL open-lock file and the
+`vlog/` directory (and the database directory entry) before publishing a
+manifest guard. It syncs the unknown `MANIFEST` marker before creating the
+generation-wrapped `ENGINE_MANIFEST.tmp`; otherwise a temp wrapper could be
+mistaken for an authoritative snapshot while the manifest is empty, before
+older readers are blocked. It then installs the matching wrapper and compacts
+the log to that generation. Guarded snapshot recovery cuts the old log at the
+matching generation and preserves records after that cut. Focused tests
+exercise generation cuts, missing `MANIFEST`, process interruption at each
+publication boundary, and rejection of the new JSON variants by a pre-v8
+enum. The publisher requires a token holding both PITR lifecycle barriers;
+the migration caller must retain it through the v7-to-v8 transition so a
+concurrent resume cannot reopen commit admission between guard publication
+and WAL migration.
+
+This is implementation progress, not compatibility qualification. Before
+enabling v8 creation, run process-level tests against the actual older binaries
+for normal and snapshot recovery, missing manifest, interrupted migration,
+WAL-lock and value-log startup, and compare database files and directory
+entries before and after rejection. The complete historical-binary matrix and
+startup ordering remain unqualified, so v8 creation stays disabled.
 
 ## Slices
 
