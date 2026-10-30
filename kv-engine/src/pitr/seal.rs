@@ -83,7 +83,7 @@ pub(crate) fn read_seal_sidecar(
 ) -> Result<(SealSidecarFormat, Vec<u8>)> {
     let file =
         File::open(path).with_context(|| format!("open PITR seal sidecar {}", path.display()))?;
-    read_seal_file_inner(file, max_segment_bytes, None)
+    read_seal_file_inner(file, max_segment_bytes, None, None)
 }
 
 /// Read a local seal sidecar only when it uses the format authorized by its
@@ -93,9 +93,27 @@ pub(crate) fn read_seal_sidecar_for_format(
     max_segment_bytes: Option<u64>,
     expected_format: SealSidecarFormat,
 ) -> Result<(SealSidecarFormat, Vec<u8>)> {
+    read_seal_sidecar_for_format_with_limit(path, max_segment_bytes, expected_format, None)
+}
+
+/// Read a seal sidecar with both its expected format and an explicit encoded
+/// byte limit. The explicit limit is needed for legacy seals, whose format cap
+/// otherwise cannot be derived from the WAL segment bound in the sidecar
+/// reader.
+pub(crate) fn read_seal_sidecar_for_format_with_limit(
+    path: &Path,
+    max_segment_bytes: Option<u64>,
+    expected_format: SealSidecarFormat,
+    max_sidecar_bytes: Option<u64>,
+) -> Result<(SealSidecarFormat, Vec<u8>)> {
     let file =
         File::open(path).with_context(|| format!("open PITR seal sidecar {}", path.display()))?;
-    read_seal_file_inner(file, max_segment_bytes, Some(expected_format))
+    read_seal_file_inner(
+        file,
+        max_segment_bytes,
+        Some(expected_format),
+        max_sidecar_bytes,
+    )
 }
 
 /// Read a seal object only after checking its format-specific size cap.
@@ -106,13 +124,14 @@ pub(crate) fn read_seal_file(
     file: File,
     max_segment_bytes: Option<u64>,
 ) -> Result<(SealSidecarFormat, Vec<u8>)> {
-    read_seal_file_inner(file, max_segment_bytes, None)
+    read_seal_file_inner(file, max_segment_bytes, None, None)
 }
 
 fn read_seal_file_inner(
     mut file: File,
     max_segment_bytes: Option<u64>,
     expected_format: Option<SealSidecarFormat>,
+    max_sidecar_bytes: Option<u64>,
 ) -> Result<(SealSidecarFormat, Vec<u8>)> {
     let sidecar_len = file.metadata()?.len();
     let mut magic = [0; 8];
@@ -121,7 +140,7 @@ fn read_seal_file_inner(
         "PITR source seal is truncated"
     );
     file.read_exact(&mut magic)?;
-    let (format, max_sidecar_bytes) = match &magic {
+    let (format, format_max_sidecar_bytes) = match &magic {
         b"TKVSEAL1" => (SealSidecarFormat::V5, V5Seal::max_encoded_len()?),
         b"TKVSEAL2" => {
             let max_segment_bytes = max_segment_bytes
@@ -145,8 +164,11 @@ fn read_seal_file_inner(
         expected_format.is_none_or(|expected| expected == format),
         "PITR source seal format differs from its manifest obligation"
     );
+    let format_limit = u64::try_from(format_max_sidecar_bytes)?;
+    let effective_sidecar_limit =
+        max_sidecar_bytes.map_or(format_limit, |limit| limit.min(format_limit));
     ensure!(
-        sidecar_len <= u64::try_from(max_sidecar_bytes)?,
+        sidecar_len <= effective_sidecar_limit,
         "PITR source seal exceeds its format size limit"
     );
 
@@ -155,13 +177,14 @@ fn read_seal_file_inner(
         .try_reserve_exact(usize::try_from(sidecar_len)?)
         .map_err(|error| anyhow::anyhow!("reserve PITR source seal sidecar: {error}"))?;
     bytes.extend_from_slice(&magic);
-    let bounded_read = u64::try_from(max_sidecar_bytes)?
+    let bounded_read = effective_sidecar_limit
         .checked_add(1)
         .and_then(|limit| limit.checked_sub(magic.len() as u64))
         .ok_or_else(|| anyhow::anyhow!("PITR source seal sidecar limit overflows"))?;
     file.take(bounded_read).read_to_end(&mut bytes)?;
     ensure!(
-        bytes.len() <= max_sidecar_bytes && u64::try_from(bytes.len())? == sidecar_len,
+        u64::try_from(bytes.len())? <= effective_sidecar_limit
+            && u64::try_from(bytes.len())? == sidecar_len,
         "PITR source seal sidecar changed while reading"
     );
     Ok((format, bytes))

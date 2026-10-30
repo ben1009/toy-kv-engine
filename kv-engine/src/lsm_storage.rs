@@ -7071,48 +7071,11 @@ impl KvEngine {
                 if !seal_path.try_exists()? {
                     continue;
                 }
-                let (format, bytes) = crate::pitr::seal::read_seal_sidecar(
+                LsmStorageInner::validate_reclaimable_pitr_seal_sidecar(
+                    &state,
+                    expected_segment_id,
                     &seal_path,
-                    state.config.as_ref().map(|config| config.max_segment_bytes),
                 )?;
-                let segment_id = match format {
-                    crate::pitr::seal::SealSidecarFormat::V5 => {
-                        crate::pitr::seal::V5Seal::decode(&bytes)?
-                            .header
-                            .segment_id
-                            .0
-                    }
-                    crate::pitr::seal::SealSidecarFormat::V7 => {
-                        let max_segment_bytes = state
-                            .config
-                            .as_ref()
-                            .map(|config| config.max_segment_bytes)
-                            .ok_or_else(|| {
-                                anyhow!("PITR v7 source has no persisted segment limit")
-                            })?;
-                        crate::pitr::seal::V7Seal::decode(&bytes, max_segment_bytes)?
-                            .header
-                            .segment_id
-                            .0
-                    }
-                    crate::pitr::seal::SealSidecarFormat::V8 => {
-                        let max_segment_bytes = state
-                            .config
-                            .as_ref()
-                            .map(|config| config.max_segment_bytes)
-                            .ok_or_else(|| {
-                                anyhow!("PITR v8 source has no persisted segment limit")
-                            })?;
-                        crate::pitr::seal::V8Seal::decode(&bytes, max_segment_bytes)?
-                            .header
-                            .segment_id
-                            .0
-                    }
-                };
-                ensure!(
-                    segment_id == expected_segment_id,
-                    "PITR source seal filename does not match its segment ID"
-                );
                 std::fs::remove_file(&seal_path)?;
             }
             self.inner.sync_dir()?;
@@ -10364,6 +10327,106 @@ impl LsmStorageInner {
         seal.verify_wal_from_reader(&mut wal, wal_len)?;
 
         Ok(seal)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn validate_reclaimable_pitr_seal_sidecar(
+        state: &crate::pitr::manifest::PitrState,
+        segment_id: u64,
+        seal_path: &Path,
+    ) -> Result<()> {
+        use crate::pitr::manifest::PitrWalFormat;
+        use crate::pitr::seal::SealSidecarFormat;
+
+        let obligation = state
+            .obligations
+            .get(&segment_id)
+            .ok_or_else(|| anyhow!("PITR source has no reclamation obligation"))?;
+        let config = state
+            .config
+            .as_ref()
+            .ok_or_else(|| anyhow!("PITR state is missing its persisted configuration"))?;
+        let (expected_format, sidecar_image_limit, encoded_sidecar_limit) =
+            match obligation.wal_format {
+                PitrWalFormat::LegacyV5V6 => {
+                    ensure!(
+                        obligation.immutable_boundary.is_none(),
+                        "legacy PITR source has a versioned immutable boundary"
+                    );
+                    (
+                        SealSidecarFormat::V5,
+                        Some(config.max_segment_bytes),
+                        Some(crate::pitr::seal::V5Seal::max_encoded_len_for_segment(
+                            obligation.logical_length,
+                        )?),
+                    )
+                }
+                PitrWalFormat::V7 | PitrWalFormat::V8 => {
+                    let boundary = obligation.immutable_boundary.ok_or_else(|| {
+                        anyhow!("versioned PITR source has no immutable boundary")
+                    })?;
+                    ensure!(
+                        obligation.logical_length == boundary.sealed_end
+                            && boundary.active.segment_id == segment_id
+                            && boundary.active.wal_format == obligation.wal_format,
+                        "versioned PITR source boundary differs from its manifest obligation"
+                    );
+                    let format = match obligation.wal_format {
+                        PitrWalFormat::V7 => SealSidecarFormat::V7,
+                        PitrWalFormat::V8 => SealSidecarFormat::V8,
+                        PitrWalFormat::Unspecified | PitrWalFormat::LegacyV5V6 => {
+                            unreachable!("guarded to versioned PITR formats")
+                        }
+                    };
+                    (format, Some(boundary.sealed_end), None)
+                }
+                PitrWalFormat::Unspecified => {
+                    anyhow::bail!("PITR source has an unspecified WAL format")
+                }
+            };
+        let (format, bytes) = crate::pitr::seal::read_seal_sidecar_for_format_with_limit(
+            seal_path,
+            sidecar_image_limit,
+            expected_format,
+            encoded_sidecar_limit,
+        )?;
+        ensure!(
+            format == expected_format,
+            "PITR source seal format differs from its manifest obligation"
+        );
+        let decoded_segment_id = match format {
+            SealSidecarFormat::V5 => {
+                crate::pitr::seal::V5Seal::decode(&bytes)?
+                    .header
+                    .segment_id
+                    .0
+            }
+            SealSidecarFormat::V7 => {
+                crate::pitr::seal::V7Seal::decode(
+                    &bytes,
+                    sidecar_image_limit
+                        .ok_or_else(|| anyhow!("PITR v7 source has no persisted segment limit"))?,
+                )?
+                .header
+                .segment_id
+                .0
+            }
+            SealSidecarFormat::V8 => {
+                crate::pitr::seal::V8Seal::decode(
+                    &bytes,
+                    sidecar_image_limit
+                        .ok_or_else(|| anyhow!("PITR v8 source has no persisted segment limit"))?,
+                )?
+                .header
+                .segment_id
+                .0
+            }
+        };
+        ensure!(
+            decoded_segment_id == segment_id,
+            "PITR source seal filename does not match its segment ID"
+        );
+        Ok(())
     }
 
     /// Validate a retained legacy source that authorizes a not-yet-installed
@@ -23502,6 +23565,23 @@ mod tests {
                 .to_string()
                 .contains("format differs from its manifest obligation")
         );
+        sealed_v8_state
+            .obligations
+            .get_mut(&segment_id)
+            .unwrap()
+            .state = ObligationState::Reclaimable;
+        let wrong_format_reclamation_error =
+            LsmStorageInner::validate_reclaimable_pitr_seal_sidecar(
+                &sealed_v8_state,
+                segment_id,
+                &seal_path,
+            )
+            .expect_err("PITR cleanup must reject a legacy seal under a v8 obligation");
+        assert!(
+            wrong_format_reclamation_error
+                .to_string()
+                .contains("format differs from its manifest obligation")
+        );
         assert!(
             LsmStorageInner::recreate_missing_sealed_v7_successor(
                 &database,
@@ -23512,6 +23592,11 @@ mod tests {
         );
         assert!(!successor_path.exists());
         std::fs::write(&seal_path, &seal_bytes)?;
+        LsmStorageInner::validate_reclaimable_pitr_seal_sidecar(
+            &sealed_v8_state,
+            segment_id,
+            &seal_path,
+        )?;
 
         wal_bytes[WAL_V8_HEADER_LEN + 80] ^= 1;
         std::fs::write(&wal_path, &wal_bytes)?;
@@ -23526,6 +23611,57 @@ mod tests {
         assert!(!successor_path.exists());
         assert!(engine.load_pitr_source_segment(&state, segment_id).is_err());
         engine.close_storage()?;
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn reclaimable_legacy_seal_read_uses_manifest_wal_bound() -> anyhow::Result<()> {
+        use std::io::Write;
+
+        use crate::pitr::manifest::{
+            ObligationState, PersistedPitrConfig, PitrObligation, PitrState, PitrWalFormat,
+        };
+
+        let directory = tempdir()?;
+        let seal_path = directory.path().join("pitr-00000000000000000007.seal");
+        let logical_length = crate::pitr::WAL_V5_HEADER_LEN as u64 + 4096;
+        let manifest_sidecar_limit =
+            crate::pitr::seal::V5Seal::max_encoded_len_for_segment(logical_length)?;
+        let global_sidecar_limit = u64::try_from(crate::pitr::seal::V5Seal::max_encoded_len()?)?;
+        assert!(manifest_sidecar_limit + 1 < global_sidecar_limit);
+
+        let mut seal_file = std::fs::File::create(&seal_path)?;
+        seal_file.write_all(b"TKVSEAL1")?;
+        seal_file.set_len(manifest_sidecar_limit + 1)?;
+        drop(seal_file);
+
+        let segment_id = 7;
+        let mut state = PitrState {
+            config: Some(PersistedPitrConfig {
+                archive_interval_ms: 1_000,
+                max_segment_bytes: 64 * 1024,
+                max_unarchived_bytes: 128 * 1024,
+                max_source_spool_bytes: 256 * 1024,
+            }),
+            ..PitrState::default()
+        };
+        state.obligations.insert(
+            segment_id,
+            PitrObligation {
+                state: ObligationState::Reclaimable,
+                successor_segment_id: segment_id + 1,
+                logical_length,
+                wal_format: PitrWalFormat::LegacyV5V6,
+                immutable_boundary: None,
+                migration_successor_boundary: None,
+            },
+        );
+
+        let error =
+            LsmStorageInner::validate_reclaimable_pitr_seal_sidecar(&state, segment_id, &seal_path)
+                .expect_err("a legacy seal must be bounded by the manifest WAL image");
+        assert!(error.to_string().contains("exceeds its format size limit"));
         Ok(())
     }
 
