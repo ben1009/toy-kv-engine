@@ -65,6 +65,7 @@ pub(crate) struct PreparedWalV8Batch<'a, R> {
     canonical: CanonicalWalEntryStream<'a>,
     limits: WalV5Limits,
     logical_batch_bytes: usize,
+    logical_batch: Vec<u8>,
     fragment_count: u32,
     frame_buffer_bytes: usize,
     preparation_reservation: R,
@@ -101,11 +102,16 @@ impl<'a, R> PreparedWalV8Batch<'a, R> {
         let frame_buffer_bytes = usize::try_from(fragment_count)?
             .checked_mul(codec::WAL_V8_FRAME_LEN)
             .context("v8 DATA frame buffer length overflows")?;
+        let mut logical_batch = Vec::new();
+        logical_batch
+            .try_reserve_exact(logical_batch_bytes)
+            .context("reserve v8 logical batch bytes")?;
 
         Ok(PreparedWalV8Batch {
             canonical,
             limits,
             logical_batch_bytes,
+            logical_batch,
             fragment_count,
             frame_buffer_bytes,
             preparation_reservation,
@@ -146,6 +152,7 @@ impl<'a, R> PreparedWalV8Batch<'a, R> {
             canonical: self.canonical,
             limits: self.limits,
             logical_batch_bytes: self.logical_batch_bytes,
+            logical_batch: self.logical_batch,
             assignment,
             fragment_count: self.fragment_count,
             frame_buffer_bytes: self.frame_buffer_bytes,
@@ -183,6 +190,7 @@ pub(crate) struct AdmittedWalV8Batch<'a, G, R> {
     canonical: CanonicalWalEntryStream<'a>,
     limits: WalV5Limits,
     logical_batch_bytes: usize,
+    logical_batch: Vec<u8>,
     assignment: WalV8BatchAssignment,
     fragment_count: u32,
     frame_buffer_bytes: usize,
@@ -198,6 +206,7 @@ impl<G: WalV8AdmissionGuard, R> AdmittedWalV8Batch<'_, G, R> {
             canonical,
             limits,
             logical_batch_bytes,
+            mut logical_batch,
             assignment,
             fragment_count,
             frame_buffer_bytes,
@@ -205,10 +214,6 @@ impl<G: WalV8AdmissionGuard, R> AdmittedWalV8Batch<'_, G, R> {
             preparation_reservation: _preparation_reservation,
         } = self;
         let entry_stream_len = canonical.data_len();
-        let mut logical_batch = Vec::new();
-        logical_batch
-            .try_reserve_exact(logical_batch_bytes)
-            .context("reserve v8 logical batch bytes")?;
         logical_batch.resize(logical_batch_bytes, 0);
 
         let expected_entry_len = u64::try_from(entry_stream_len)?;
@@ -266,6 +271,10 @@ pub(crate) struct EncodedWalV8Batch<G> {
 }
 
 impl<G: WalV8AdmissionGuard> EncodedWalV8Batch<G> {
+    pub(crate) fn assignment(&self) -> WalV8BatchAssignment {
+        self.assignment
+    }
+
     pub(crate) fn as_bytes(&self) -> &[u8] {
         &self.logical_batch
     }
