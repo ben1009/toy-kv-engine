@@ -309,10 +309,21 @@ impl WalV8LogicalBatchHeader {
         entry_stream: &[u8],
         limits: WalV5Limits,
     ) -> Result<[u8; WAL_V8_LOGICAL_BATCH_HEADER_LEN]> {
-        validate_batch_limits(limits)?;
-        self.validate(entry_stream.len(), limits)?;
+        self.encode_with_data_crc(entry_stream.len(), crc32fast::hash(entry_stream), limits)
+    }
 
-        let data_len = u32::try_from(entry_stream.len())?;
+    /// Encode the logical header using the CRC accumulated while the canonical
+    /// entry stream was emitted. This avoids scanning that stream a second time.
+    pub(crate) fn encode_with_data_crc(
+        self,
+        entry_stream_len: usize,
+        entry_stream_crc: u32,
+        limits: WalV5Limits,
+    ) -> Result<[u8; WAL_V8_LOGICAL_BATCH_HEADER_LEN]> {
+        validate_batch_limits(limits)?;
+        self.validate(entry_stream_len, limits)?;
+
+        let data_len = u32::try_from(entry_stream_len)?;
         let mut output = [0; WAL_V8_LOGICAL_BATCH_HEADER_LEN];
         output[0..8].copy_from_slice(&self.segment_ticket.to_be_bytes());
         output[8..16].copy_from_slice(&self.commit_ts.to_be_bytes());
@@ -320,7 +331,7 @@ impl WalV8LogicalBatchHeader {
         output[24..28].copy_from_slice(&self.recorded_at_nanos.to_be_bytes());
         output[28..32].copy_from_slice(&self.entry_count.to_be_bytes());
         output[32..36].copy_from_slice(&data_len.to_be_bytes());
-        output[36..40].copy_from_slice(&crc32fast::hash(entry_stream).to_be_bytes());
+        output[36..40].copy_from_slice(&entry_stream_crc.to_be_bytes());
         let header_crc = crc32fast::hash(&output[..40]);
         output[40..44].copy_from_slice(&header_crc.to_be_bytes());
         Ok(output)
@@ -425,22 +436,64 @@ fn encode_frame(
     frame_offset: u64,
     body: &[u8],
 ) -> Result<[u8; WAL_V8_FRAME_LEN]> {
-    kind.validate_body_len(body.len())?;
-    validate_frame_offset(frame_offset)?;
-    kind.validate_position(body, &initial_prefix_digest, frame_offset)?;
-
     let mut output = [0_u8; WAL_V8_FRAME_LEN];
+    encode_frame_into(
+        kind,
+        physical_header_digest,
+        initial_prefix_digest,
+        frame_offset,
+        body.len(),
+        &mut output,
+        |body_output| {
+            body_output.copy_from_slice(body);
+            Ok(())
+        },
+    )?;
+    Ok(output)
+}
+
+/// Encode a complete frame directly into a caller-owned aligned frame buffer.
+/// The body closure fills only the advertised body bytes; remaining frame bytes
+/// are zero padding and are included in the frame CRC.
+fn encode_frame_into<F>(
+    kind: WalV8FrameKind,
+    physical_header_digest: [u8; 32],
+    initial_prefix_digest: digest::WalV8Digest,
+    frame_offset: u64,
+    body_len: usize,
+    output: &mut [u8],
+    fill_body: F,
+) -> Result<()>
+where
+    F: FnOnce(&mut [u8]) -> Result<()>,
+{
+    kind.validate_body_len(body_len)?;
+    validate_frame_offset(frame_offset)?;
+    ensure!(
+        output.len() == WAL_V8_FRAME_LEN,
+        "v8 frame output buffer must be exactly one frame"
+    );
+    let body_len_u32 = u32::try_from(body_len)?;
+
+    output.fill(0);
     output[..8].copy_from_slice(&WAL_V8_FRAME_MAGIC);
     output[8..10].copy_from_slice(&WAL_V8_FRAME_VERSION.to_be_bytes());
     output[10..12].copy_from_slice(&kind.to_wire().to_be_bytes());
     output[12..14].copy_from_slice(&(WAL_V8_FRAME_HEADER_LEN as u16).to_be_bytes());
     output[16..48].copy_from_slice(&physical_header_digest);
     output[48..56].copy_from_slice(&frame_offset.to_be_bytes());
-    output[56..60].copy_from_slice(&u32::try_from(body.len())?.to_be_bytes());
-    output[WAL_V8_FRAME_HEADER_LEN..WAL_V8_FRAME_HEADER_LEN + body.len()].copy_from_slice(body);
-    let crc = frame_crc(&output);
+    output[56..60].copy_from_slice(&body_len_u32.to_be_bytes());
+
+    let body_end = WAL_V8_FRAME_HEADER_LEN
+        .checked_add(body_len)
+        .context("v8 frame body end overflows")?;
+    let body = &mut output[WAL_V8_FRAME_HEADER_LEN..body_end];
+    fill_body(body)?;
+    kind.validate_position(body, &initial_prefix_digest, frame_offset)?;
+
+    let crc = frame_crc(output);
     output[60..64].copy_from_slice(&crc.to_be_bytes());
-    Ok(output)
+    Ok(())
 }
 
 pub(crate) fn encode_data_frame(
@@ -455,6 +508,38 @@ pub(crate) fn encode_data_frame(
         initial_prefix_digest,
         frame_offset,
         body,
+    )
+}
+
+/// Encode a DATA fragment directly into its final frame, avoiding temporary
+/// fragment-body and full-frame allocations.
+pub(crate) fn encode_data_fragment_frame_into(
+    physical_header_digest: [u8; 32],
+    initial_prefix_digest: digest::WalV8Digest,
+    frame_offset: u64,
+    fragment: WalV8DataFragmentHeader,
+    payload: &[u8],
+    output: &mut [u8],
+) -> Result<()> {
+    fragment.validate_payload_len(payload.len())?;
+    let body_len = WAL_V8_DATA_FRAGMENT_HEADER_LEN
+        .checked_add(payload.len())
+        .context("v8 DATA fragment body length overflows")?;
+    encode_frame_into(
+        WalV8FrameKind::Data,
+        physical_header_digest,
+        initial_prefix_digest,
+        frame_offset,
+        body_len,
+        output,
+        |body| {
+            body[0..8].copy_from_slice(&fragment.segment_ticket.to_be_bytes());
+            body[8..12].copy_from_slice(&fragment.fragment_index.to_be_bytes());
+            body[12..16].copy_from_slice(&fragment.fragment_count.to_be_bytes());
+            body[16..24].copy_from_slice(&fragment.batch_bytes.to_be_bytes());
+            body[WAL_V8_DATA_FRAGMENT_HEADER_LEN..].copy_from_slice(payload);
+            Ok(())
+        },
     )
 }
 

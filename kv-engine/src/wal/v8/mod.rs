@@ -6,5 +6,6 @@
 
 pub(crate) mod codec;
 pub(crate) mod digest;
+pub(crate) mod prepare;
 
 pub(crate) const WAL_V8_HEADER_LEN: usize = 4096;
