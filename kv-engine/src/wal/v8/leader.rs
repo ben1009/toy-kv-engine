@@ -713,6 +713,23 @@ mod tests {
         )
     }
 
+    fn replayed_batches(
+        path: &Path,
+        installed: &super::super::install::WalV8InstalledRecovery,
+    ) -> Result<Vec<WalBatch>> {
+        let mut batches = Vec::new();
+        super::super::install::replay_installed_active_batches(
+            path,
+            installed,
+            LIVE_WAL_V5_LIMITS,
+            |batch| {
+                batches.push(batch.clone());
+                Ok(())
+            },
+        )?;
+        Ok(batches)
+    }
+
     fn batch(commit_ts: u64) -> WalBatch {
         WalBatch {
             commit_ts,
@@ -815,8 +832,9 @@ mod tests {
             MAX_WAL_FILE_SIZE,
         )?;
         assert_eq!(recovered.active_boundary.ticket_end, 1);
-        assert_eq!(recovered.selection.batches.len(), 1);
-        assert_eq!(recovered.selection.batches[0], batch(10));
+        assert!(recovered.selection.batches.is_empty());
+        assert_eq!(recovered.replay_tickets.len(), 1);
+        assert_eq!(replayed_batches(&path, &recovered)?, [batch(10)]);
         Ok(())
     }
 
@@ -861,7 +879,7 @@ mod tests {
             MAX_WAL_FILE_SIZE,
         )?;
         assert_eq!(
-            recovered.selection.batches,
+            replayed_batches(&path, &recovered)?,
             batches.into_iter().chain([next_batch]).collect::<Vec<_>>()
         );
         Ok(())
@@ -1036,7 +1054,7 @@ mod tests {
             MAX_WAL_FILE_SIZE,
         )?;
         assert_eq!(recovered.active_boundary.ticket_end, 1);
-        assert_eq!(recovered.selection.batches, [batch(10)]);
+        assert_eq!(replayed_batches(&path, &recovered)?, [batch(10)]);
         assert_ne!(std::fs::metadata(&path)?.ino(), original_inode);
         Ok(())
     }

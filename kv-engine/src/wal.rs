@@ -1313,9 +1313,8 @@ impl Wal {
     }
 
     /// Attach the serial v8 writer after an Active image has been recovered
-    /// and installed. This adapter is used only by explicit recovery tests and
-    /// migration work; the format registry still disables v8 production use.
-    #[allow(dead_code)] // High-level LSM Active v8 recovery wiring is a later slice.
+    /// and installed. High-level LSM recovery uses this adapter to resume
+    /// serial appends while the format registry still disables v8 creation.
     pub(crate) fn from_v8_leader(
         writer: v8::leader::WalV8LeaderWriter,
         installed: &v8::install::WalV8InstalledRecovery,
@@ -1458,7 +1457,6 @@ impl Wal {
         self.format_version == WAL_FORMAT_VERSION_V7
     }
 
-    #[allow(dead_code)] // Consumed by staged Active v8 recovery and capture APIs.
     pub(crate) fn is_v8(&self) -> bool {
         self.format_version == WAL_FORMAT_VERSION_V8
     }
@@ -1480,7 +1478,6 @@ impl Wal {
 
     /// Return the recovered v8 writer's current manifest boundaries after its
     /// synchronous commit barrier has completed.
-    #[allow(dead_code)] // Used by Active v8 manifest capture in a later slice.
     pub(crate) fn v8_active_boundaries(
         &self,
     ) -> Result<(

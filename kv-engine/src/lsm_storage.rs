@@ -227,21 +227,21 @@ impl std::error::Error for PitrManifestPublicationError {}
 
 #[cfg(target_os = "linux")]
 #[derive(Debug)]
-struct V7ActiveBoundaryNotPublished(anyhow::Error);
+struct ActiveBoundaryNotPublished(anyhow::Error);
 
 #[cfg(target_os = "linux")]
-impl std::fmt::Display for V7ActiveBoundaryNotPublished {
+impl std::fmt::Display for ActiveBoundaryNotPublished {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             formatter,
-            "Active v7 manifest boundary was not published: {}",
+            "Active PITR manifest boundary was not published: {}",
             self.0
         )
     }
 }
 
 #[cfg(target_os = "linux")]
-impl std::error::Error for V7ActiveBoundaryNotPublished {
+impl std::error::Error for ActiveBoundaryNotPublished {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         Some(self.0.as_ref())
     }
@@ -2425,20 +2425,20 @@ impl KvEngine {
 
     /// Gracefully close storage after syncing admitted work.
     ///
-    /// When the active WAL is v7, PITR remains enabled and its Active segment
-    /// is retained for recovery. Reopening with the same repository resumes
-    /// PITR. Close drains admission, syncs the active WAL, and persists its
-    /// latest logical Active boundary. Use `close_pitr` to archive the final
-    /// boundary before closing storage.
+    /// When the active WAL is a versioned PITR format, PITR remains enabled and
+    /// its Active segment is retained for recovery. Reopening with the same
+    /// repository resumes PITR. Close drains admission, syncs the active WAL,
+    /// and persists its latest logical Active boundary.
     pub fn close(&self) -> Result<()> {
-        // A v7 storage close drains and syncs the active WAL, persists its
-        // logical Active boundary, and retains its enabled lifecycle and Active
-        // segment for recovery without establishing a final archive boundary.
+        // A versioned storage close drains and syncs the active WAL, persists
+        // its logical Active boundary, and retains its enabled lifecycle and
+        // Active segment for recovery without establishing a final archive boundary.
         let pitr_mode = self.pitr_manifest_state.lock().mode;
         if pitr_mode == crate::pitr::manifest::PitrMode::Enabled
-            && self.inner.state.load().memtable.uses_v7_wal()
+            && (self.inner.state.load().memtable.uses_v7_wal()
+                || self.inner.state.load().memtable.uses_v8_wal())
         {
-            return self.close_active_v7_pitr_storage();
+            return self.close_active_versioned_pitr_storage();
         }
         match pitr_mode {
             crate::pitr::manifest::PitrMode::Enabled
@@ -2468,7 +2468,7 @@ impl KvEngine {
         Self::close_storage_parts(&self.inner, &self.background_workers)
     }
 
-    fn close_active_v7_pitr_storage(&self) -> Result<()> {
+    fn close_active_versioned_pitr_storage(&self) -> Result<()> {
         #[cfg(target_os = "linux")]
         {
             // Serialize lifecycle close with PITR resume. An admitted writer
@@ -2513,11 +2513,11 @@ impl KvEngine {
             let (boundary_error, active_wal_synced) = if admission_error.is_none() {
                 let active_memtable_guard = self.inner.active_memtable_lock.read();
                 let active_memtable = self.inner.state.load().memtable.clone();
-                if active_memtable.uses_v7_wal() {
+                if active_memtable.uses_v7_wal() || active_memtable.uses_v8_wal() {
                     if self.pitr_publication_unknown.load(Ordering::Acquire) {
                         (
                             Some(anyhow!(
-                                "Active v7 close cannot publish a manifest boundary while a PITR transition has an unknown outcome; reopen the database first"
+                                "Active versioned WAL close cannot publish a manifest boundary while a PITR transition has an unknown outcome; reopen the database first"
                             )),
                             false,
                         )
@@ -2525,10 +2525,16 @@ impl KvEngine {
                         let sync_result = active_memtable.sync_wal();
                         let active_wal_synced = sync_result.is_ok();
                         let boundary_result = sync_result
-                            .and_then(|()| active_memtable.v7_active_boundaries())
+                            .and_then(|()| {
+                                if active_memtable.uses_v8_wal() {
+                                    active_memtable.v8_active_boundaries()
+                                } else {
+                                    active_memtable.v7_active_boundaries()
+                                }
+                            })
                             .and_then(|boundaries| {
                                 drop(active_memtable_guard);
-                                Self::persist_v7_active_boundary(
+                                Self::persist_active_boundary(
                                     &self.inner,
                                     &self.pitr_manifest_state,
                                     &self.pitr_publication_unknown,
@@ -2622,7 +2628,7 @@ impl KvEngine {
             (None, close_result) => close_result,
             (Some(barrier_error), Ok(())) => Err(barrier_error),
             (Some(barrier_error), Err(close_error)) => Err(close_error.context(format!(
-                "v7 close barrier failed before storage shutdown: {barrier_error:#}; storage close also failed"
+                "versioned WAL close barrier failed before storage shutdown: {barrier_error:#}; storage close also failed"
             ))),
         };
         // A close waiter may reopen immediately after observing completion.
@@ -2697,6 +2703,7 @@ impl KvEngine {
             && inner.options.pitr_repository.is_none()
             && inner.options.enable_wal)
             || inner.state.load().memtable.uses_v7_wal()
+            || inner.state.load().memtable.uses_v8_wal()
             || pitr_state.obligations.values().any(|obligation| {
                 obligation.state != crate::pitr::manifest::ObligationState::Reclaimable
             })
@@ -5923,7 +5930,7 @@ impl KvEngine {
             .wal_v7_reservation_owner()
             .ok_or_else(|| anyhow!("Active v7 recovery-point WAL has no reservation owner"))?;
         let boundaries = active.v7_active_boundaries()?;
-        Self::persist_v7_active_boundary(
+        Self::persist_active_boundary(
             &self.inner,
             &self.pitr_manifest_state,
             &self.pitr_publication_unknown,
@@ -6416,6 +6423,10 @@ impl KvEngine {
         ensure!(
             state.mode == crate::pitr::manifest::PitrMode::Enabled,
             "PITR is not actively enabled"
+        );
+        ensure!(
+            !self.inner.state.load().memtable.uses_v8_wal(),
+            "PITR recovery points are not enabled for Active v8 WAL until sealing is implemented"
         );
         let sequencer = self
             .inner
@@ -8067,31 +8078,35 @@ impl KvEngine {
         pitr_publication_unknown: Arc<AtomicBool>,
         mut lifecycle_guard: Option<AdmissionGuard>,
     ) -> Result<()> {
-        if inner.state.load().memtable.uses_v7_wal() {
+        if inner.state.load().memtable.uses_v7_wal() || inner.state.load().memtable.uses_v8_wal() {
             if lifecycle_guard.is_none() {
                 lifecycle_guard = Some(inner.lifecycle.admit_write()?);
             }
             let _pitr_barrier = pitr_barrier_lock.lock();
             ensure!(
                 !pitr_publication_unknown.load(Ordering::Acquire),
-                "Active v7 sync cannot append a manifest boundary while a PITR transition has an unknown outcome; reopen the database first"
+                "Active versioned WAL sync cannot append a manifest boundary while a PITR transition has an unknown outcome; reopen the database first"
             );
             // The lifecycle guard is the admission point. If close begins
             // while this operation waits on the PITR barrier, close must drain
             // this admitted sync instead of rejecting it here.
             let _active_memtable_guard = inner.active_memtable_lock.read();
             let active_memtable = inner.state.load().memtable.clone();
-            if active_memtable.uses_v7_wal() {
+            if active_memtable.uses_v7_wal() || active_memtable.uses_v8_wal() {
                 let sequencer = inner
                     .mvcc
                     .as_ref()
-                    .ok_or_else(|| anyhow!("Active v7 PITR sync requires MVCC"))?;
+                    .ok_or_else(|| anyhow!("Active PITR sync requires MVCC"))?;
                 let admission_was_open = sequencer.commit_admission_is_open();
                 sequencer.stop_commit_admission_and_capture()?;
                 active_memtable.sync_wal()?;
-                let boundaries = active_memtable.v7_active_boundaries()?;
+                let boundaries = if active_memtable.uses_v8_wal() {
+                    active_memtable.v8_active_boundaries()?
+                } else {
+                    active_memtable.v7_active_boundaries()?
+                };
                 drop(_active_memtable_guard);
-                let publication = Self::persist_v7_active_boundary(
+                let publication = Self::persist_active_boundary(
                     inner,
                     &pitr_manifest_state,
                     &pitr_publication_unknown,
@@ -8099,9 +8114,7 @@ impl KvEngine {
                 );
                 if let Err(error) = publication {
                     if admission_was_open
-                        && error
-                            .downcast_ref::<V7ActiveBoundaryNotPublished>()
-                            .is_some()
+                        && error.downcast_ref::<ActiveBoundaryNotPublished>().is_some()
                     {
                         sequencer.resume_commit_admission();
                     }
@@ -8120,7 +8133,7 @@ impl KvEngine {
     }
 
     #[cfg(target_os = "linux")]
-    fn persist_v7_active_boundary(
+    fn persist_active_boundary(
         inner: &LsmStorageInner,
         pitr_manifest_state: &Mutex<crate::pitr::manifest::PitrState>,
         pitr_publication_unknown: &AtomicBool,
@@ -8138,13 +8151,17 @@ impl KvEngine {
         );
         ensure!(
             current_state.mode == crate::pitr::manifest::PitrMode::Enabled,
-            "Active v7 boundary publication requires enabled PITR"
+            "Active WAL boundary publication requires enabled PITR"
         );
         ensure!(
             current_state.active_segment_id == Some(active_boundary.segment_id)
                 && current_state.timeline_id == Some(active_boundary.timeline_id)
                 && current_state.archive_epoch_id == Some(active_boundary.archive_epoch_id),
-            "Active v7 boundary identity disagrees with PITR manifest state"
+            "Active WAL boundary identity disagrees with PITR manifest state"
+        );
+        ensure!(
+            empty_boundary.wal_format == active_boundary.wal_format,
+            "Active WAL boundary format changed during sync"
         );
         let manifest = inner
             .manifest
@@ -8158,8 +8175,9 @@ impl KvEngine {
                     previous.timeline_id == empty_boundary.timeline_id
                         && previous.archive_epoch_id == empty_boundary.archive_epoch_id
                         && previous.segment_id == empty_boundary.segment_id
-                        && previous.incarnation == empty_boundary.incarnation,
-                    "Active v7 boundary incarnation changed during sync"
+                        && previous.incarnation == empty_boundary.incarnation
+                        && previous.wal_format == empty_boundary.wal_format,
+                    "Active WAL boundary identity changed during sync"
                 );
                 if active_boundary == previous {
                     manifest.ensure_durability_certain()?;
@@ -8216,7 +8234,7 @@ impl KvEngine {
                     // Absence of this append cannot clear manifest poison
                     // left by an earlier operation.
                     manifest.ensure_durability_certain()?;
-                    return Err(anyhow::Error::new(V7ActiveBoundaryNotPublished(error)));
+                    return Err(anyhow::Error::new(ActiveBoundaryNotPublished(error)));
                 }
                 Err(revalidation_error) => {
                     pitr_publication_unknown.store(true, Ordering::Release);
@@ -10335,6 +10353,69 @@ impl LsmStorageInner {
         Self::decode_v7_active_header_for_state(state, bytes)
     }
 
+    /// Decode a canonical v8 Active header and bind its physical identity to
+    /// the persisted PITR state. Unlike v7, the Active boundary's prefix
+    /// digest is logical BLAKE3 state and is validated by v8 recovery itself.
+    #[cfg(target_os = "linux")]
+    fn decode_v8_active_header_for_state(
+        state: &crate::pitr::manifest::PitrState,
+        bytes: &[u8],
+    ) -> Result<crate::wal::v8::codec::WalV8Header> {
+        use crate::pitr::manifest::PitrWalFormat;
+
+        let header = crate::wal::v8::codec::WalV8Header::decode(bytes)
+            .context("persisted Active v8 boundary requires a canonical v8 WAL header")?;
+        ensure!(
+            header.encode()?.as_slice() == bytes,
+            "Active v8 WAL header is not canonical"
+        );
+        let timeline_id = state
+            .timeline_id
+            .ok_or_else(|| anyhow!("PITR state is missing its timeline identity"))?;
+        let archive_epoch_id = state
+            .archive_epoch_id
+            .ok_or_else(|| anyhow!("PITR state is missing its archive epoch"))?;
+        let active_segment_id = state
+            .active_segment_id
+            .ok_or_else(|| anyhow!("PITR state is missing its Active segment"))?;
+        let predecessor = state
+            .predecessor_anchor
+            .map(pitr_chain_anchor_from_persisted)
+            .ok_or_else(|| anyhow!("PITR state is missing its predecessor anchor"))?;
+        ensure!(
+            header.timeline_id.0 == timeline_id
+                && header.archive_epoch_id.0 == archive_epoch_id
+                && header.segment_id.0 == active_segment_id
+                && header.predecessor == predecessor,
+            "Active v8 WAL header differs from its manifest identity"
+        );
+        let boundary = state
+            .active_boundary
+            .ok_or_else(|| anyhow!("PITR manifest is missing the Active v8 boundary"))?;
+        ensure!(
+            boundary.wal_format == PitrWalFormat::V8
+                && boundary.timeline_id == timeline_id
+                && boundary.archive_epoch_id == archive_epoch_id
+                && boundary.segment_id == active_segment_id
+                && boundary.incarnation == header.incarnation,
+            "Active v8 WAL header differs from its manifest boundary"
+        );
+
+        Ok(header)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn validate_v8_active_recovery_header(
+        state: &crate::pitr::manifest::PitrState,
+        bytes: &[u8],
+    ) -> Result<crate::wal::v8::codec::WalV8Header> {
+        ensure!(
+            state.active_boundary.is_some(),
+            "PITR manifest is missing the Active v8 boundary"
+        );
+        Self::decode_v8_active_header_for_state(state, bytes)
+    }
+
     fn restore_legacy_v7_active_boundary(
         state: &mut crate::pitr::manifest::PitrState,
         bytes: &[u8],
@@ -11533,48 +11614,81 @@ impl LsmStorageInner {
                     pitr_state.validate_for_status()?;
                 }
             }
-            if let Some(boundary) = pitr_state.active_boundary {
-                ensure!(
-                    boundary.wal_format == crate::pitr::manifest::PitrWalFormat::V7,
-                    "Active v8 PITR WAL recovery is not enabled"
-                );
-                ensure!(
-                    options.enable_wal,
-                    "opening a v7 Active PITR WAL requires enable_wal"
-                );
-                // Persisted authority decides the required format before a
-                // legacy recovery path can adopt or truncate a replacement WAL.
-                let wal_path = path.join(format!("pitr-{:020}.wal", boundary.segment_id));
-                if !wal_path.try_exists()? {
-                    // Registration follows durable image installation. Once it
-                    // exists, a missing WAL may contain acknowledged writes;
-                    // it cannot be the pre-install crash gap repaired below.
-                    ensure!(
-                        !pitr_memtable_segments
-                            .values()
-                            .any(|segment_id| *segment_id == boundary.segment_id),
-                        "manifest-registered Active v7 WAL {} is missing",
-                        boundary.segment_id
-                    );
-                    Self::recreate_missing_sealed_v7_successor(path, &pitr_state, boundary)?;
-                }
-                let mut file = File::open(&wal_path).with_context(|| {
-                    format!(
-                        "failed to open manifest-bound Active v7 WAL {}",
-                        wal_path.display()
-                    )
-                })?;
-                let mut bytes = vec![0; crate::wal::v7::codec::WAL_V7_HEADER_LEN];
-                std::io::Read::read_exact(&mut file, &mut bytes).with_context(|| {
-                    format!(
-                        "failed to read manifest-bound Active v7 header {}",
-                        wal_path.display()
-                    )
-                })?;
-                Self::validate_v7_active_recovery_header(&pitr_state, &bytes)?;
-            }
             let mut recovered_v7_active_segment_id = None;
             let mut recovered_v7_active_memtable_id = None;
+            let mut recovered_v8_active_segment_id = None;
+            let mut recovered_v8_active_memtable_id = None;
+            if let Some(boundary) = pitr_state.active_boundary {
+                let wal_path = path.join(format!("pitr-{:020}.wal", boundary.segment_id));
+                match boundary.wal_format {
+                    crate::pitr::manifest::PitrWalFormat::V7 => {
+                        ensure!(
+                            options.enable_wal,
+                            "opening a v7 Active PITR WAL requires enable_wal"
+                        );
+                        // Persisted authority decides the required format before a
+                        // legacy recovery path can adopt or truncate a replacement WAL.
+                        if !wal_path.try_exists()? {
+                            ensure!(
+                                !pitr_memtable_segments
+                                    .values()
+                                    .any(|segment_id| *segment_id == boundary.segment_id),
+                                "manifest-registered Active v7 WAL {} is missing",
+                                boundary.segment_id
+                            );
+                            Self::recreate_missing_sealed_v7_successor(
+                                path,
+                                &pitr_state,
+                                boundary,
+                            )?;
+                        }
+                        let mut file = File::open(&wal_path).with_context(|| {
+                            format!(
+                                "failed to open manifest-bound Active v7 WAL {}",
+                                wal_path.display()
+                            )
+                        })?;
+                        let mut bytes = vec![0; crate::wal::v7::codec::WAL_V7_HEADER_LEN];
+                        std::io::Read::read_exact(&mut file, &mut bytes).with_context(|| {
+                            format!(
+                                "failed to read manifest-bound Active v7 header {}",
+                                wal_path.display()
+                            )
+                        })?;
+                        Self::validate_v7_active_recovery_header(&pitr_state, &bytes)?;
+                    }
+                    crate::pitr::manifest::PitrWalFormat::V8 => {
+                        ensure!(
+                            options.enable_wal,
+                            "opening a v8 Active PITR WAL requires enable_wal"
+                        );
+                        ensure!(
+                            wal_path.try_exists()?,
+                            "manifest-bound Active v8 WAL {} is missing",
+                            boundary.segment_id
+                        );
+                        let mut file = File::open(&wal_path).with_context(|| {
+                            format!(
+                                "failed to open manifest-bound Active v8 WAL {}",
+                                wal_path.display()
+                            )
+                        })?;
+                        let mut bytes = vec![0; crate::wal::v8::WAL_V8_HEADER_LEN];
+                        std::io::Read::read_exact(&mut file, &mut bytes).with_context(|| {
+                            format!(
+                                "failed to read manifest-bound Active v8 header {}",
+                                wal_path.display()
+                            )
+                        })?;
+                        Self::validate_v8_active_recovery_header(&pitr_state, &bytes)?;
+                        recovered_v8_active_segment_id = Some(boundary.segment_id);
+                    }
+                    crate::pitr::manifest::PitrWalFormat::Unspecified
+                    | crate::pitr::manifest::PitrWalFormat::LegacyV5V6 => {
+                        anyhow::bail!("manifest Active boundary has an unsupported WAL format");
+                    }
+                }
+            }
             let mut v7_pitr_sealed_sources: BTreeMap<u64, (PathBuf, crate::pitr::seal::V7Seal)> =
                 BTreeMap::new();
             let mut v8_pitr_sealed_sources: BTreeMap<u64, (PathBuf, crate::pitr::seal::V8Seal)> =
@@ -11673,10 +11787,26 @@ impl LsmStorageInner {
                             == Some(expected_name.as_str()),
                         "PITR WAL filename does not match its segment identity"
                     );
-                    ensure!(
-                        pitr_state.active_segment_id != Some(segment_id),
-                        "v8 Active PITR WAL recovery is not enabled"
-                    );
+                    if pitr_state.active_segment_id == Some(segment_id) {
+                        Self::validate_v8_active_recovery_header(&pitr_state, &bytes)?;
+                        ensure!(
+                            pitr_state
+                                .obligations
+                                .get(&segment_id)
+                                .is_none_or(|obligation| {
+                                    obligation.state
+                                        != crate::pitr::manifest::ObligationState::Sealing
+                                }),
+                            "Active v8 Sealing recovery is not enabled yet"
+                        );
+                        ensure!(
+                            recovered_v8_active_segment_id
+                                .is_none_or(|active_id| active_id == segment_id),
+                            "v8 Active PITR WAL identity changed during recovery"
+                        );
+                        recovered_v8_active_segment_id = Some(segment_id);
+                        continue;
+                    }
                     let obligation = pitr_state.obligations.get(&segment_id);
                     ensure!(
                         obligation.is_some_and(|obligation| {
@@ -11750,8 +11880,64 @@ impl LsmStorageInner {
                         std::io::Read::read_exact(&mut file, &mut bytes)?;
                         let format_version = u16::from_be_bytes(bytes[4..6].try_into()?);
                         if format_version == crate::wal::format::WAL_FORMAT_VERSION_V8 {
-                            // The manifest-bound source scan above already validated
-                            // this v8 image. Keep it out of legacy v5 pairing.
+                            let mut header_bytes = [0; crate::wal::v8::WAL_V8_HEADER_LEN];
+                            std::io::Seek::seek(&mut file, std::io::SeekFrom::Start(0))?;
+                            std::io::Read::read_exact(&mut file, &mut header_bytes)?;
+                            let header =
+                                crate::wal::v8::codec::WalV8Header::decode(&header_bytes)?;
+                            let segment_id = header.segment_id.0;
+                            let expected_name = format!("pitr-{segment_id:020}.wal");
+                            ensure!(
+                                candidate.file_name().and_then(|name| name.to_str())
+                                    == Some(expected_name.as_str()),
+                                "PITR WAL filename does not match its segment identity"
+                            );
+                            if pitr_state.active_segment_id == Some(segment_id) {
+                                ensure!(
+                                    options.enable_wal,
+                                    "opening a v8 Active PITR WAL requires enable_wal"
+                                );
+                                Self::validate_v8_active_recovery_header(
+                                    &pitr_state,
+                                    &header_bytes,
+                                )?;
+                                ensure!(
+                                    pitr_state.obligations.get(&segment_id).is_none_or(
+                                        |obligation| {
+                                            obligation.state
+                                                != crate::pitr::manifest::ObligationState::Sealing
+                                        }
+                                    ),
+                                    "Active v8 Sealing recovery is not enabled yet"
+                                );
+                                ensure!(
+                                    recovered_v8_active_segment_id
+                                        .is_none_or(|active_id| active_id == segment_id),
+                                    "duplicate v8 Active PITR WAL"
+                                );
+                                recovered_v8_active_segment_id = Some(segment_id);
+                            } else {
+                                let obligation = pitr_state.obligations.get(&segment_id);
+                                ensure!(
+                                    obligation.is_some_and(|obligation| {
+                                        obligation.wal_format
+                                            == crate::pitr::manifest::PitrWalFormat::V8
+                                    }),
+                                    "v8 PITR WAL format differs from its manifest obligation"
+                                );
+                                if obligation.is_some_and(|obligation| {
+                                    obligation.state
+                                        == crate::pitr::manifest::ObligationState::Reclaimable
+                                }) {
+                                    return Ok(None);
+                                }
+                                ensure!(
+                                    v8_pitr_sealed_sources.contains_key(&segment_id),
+                                    "v8 PITR source is not covered by a durable Sealed obligation"
+                                );
+                            }
+                            // Keep v8 out of legacy v5 pairing. Active v8 is
+                            // attached by the explicit Active recovery path.
                             return Ok(None);
                         }
                         if format_version == crate::wal::format::WAL_FORMAT_VERSION_V7 {
@@ -11884,6 +12070,23 @@ impl LsmStorageInner {
                         recovered_v7_active_memtable_id = Some(id);
                     }
                 }
+                if let Some(active_segment_id) = recovered_v8_active_segment_id {
+                    let active_ids = pitr_memtable_segments
+                        .iter()
+                        .filter_map(|(id, segment_id)| {
+                            (*segment_id == active_segment_id && im_memtables.contains(id))
+                                .then_some(*id)
+                        })
+                        .collect::<Vec<_>>();
+                    ensure!(
+                        active_ids.len() <= 1,
+                        "multiple immutable memtables claim the v8 Active segment"
+                    );
+                    if let Some(id) = active_ids.first().copied() {
+                        im_memtables.remove(&id);
+                        recovered_v8_active_memtable_id = Some(id);
+                    }
+                }
                 let mut missing_ids = im_memtables
                     .iter()
                     .copied()
@@ -11912,7 +12115,8 @@ impl LsmStorageInner {
                 // stays fail-closed.
                 if repair_unrecoverable
                     && pitr_state.timeline_id.is_none()
-                    && missing_ids.len() > pitr_wal_fallbacks.len() + selected_v7.len()
+                    && missing_ids.len()
+                        > pitr_wal_fallbacks.len() + selected_v7.len() + selected_v8.len()
                 {
                     let dropped_ids: Vec<_> = missing_ids
                         .drain(..missing_ids.len() - pitr_wal_fallbacks.len())
@@ -12112,6 +12316,7 @@ impl LsmStorageInner {
                     .chain(selected_v7.values().map(|(segment_id, ..)| *segment_id))
                     .chain(selected_v8.values().map(|(segment_id, ..)| *segment_id))
                     .chain(recovered_v7_active_segment_id)
+                    .chain(recovered_v8_active_segment_id)
                     .max();
                 let unowned = newest_claimed.map_or(0, |newest| newest + 1);
                 for (segment_id, (wal_path, _)) in by_segment.range(unowned..) {
@@ -12140,6 +12345,8 @@ impl LsmStorageInner {
                     .max();
                 if recovered_v7_active_segment_id.is_some() {
                     recovered_pitr_segment_id = recovered_v7_active_segment_id;
+                } else if recovered_v8_active_segment_id.is_some() {
+                    recovered_pitr_segment_id = recovered_v8_active_segment_id;
                 }
                 // The frontier may lag the segments on disk, but it must never run
                 // ahead of them: that would mean newer segments were lost. The one
@@ -12440,6 +12647,80 @@ impl LsmStorageInner {
                         state.memtable = Arc::new(memtable);
                         recovered_pitr_segment_id = Some(active_segment_id);
                         recovered_unbound_pitr_active = true;
+                    } else if format_version == crate::wal::format::WAL_FORMAT_VERSION_V8 {
+                        ensure!(
+                            recovered_v8_active_segment_id
+                                .is_none_or(|segment_id| segment_id == active_segment_id),
+                            "v8 Active PITR WAL identity changed during recovery"
+                        );
+                        ensure!(
+                            pitr_state.obligations.get(&active_segment_id).is_none_or(
+                                |obligation| {
+                                    obligation.state
+                                        != crate::pitr::manifest::ObligationState::Sealing
+                                }
+                            ),
+                            "Active v8 Sealing recovery is not enabled yet"
+                        );
+                        let mut header_bytes = [0; crate::wal::v8::WAL_V8_HEADER_LEN];
+                        std::io::Seek::seek(&mut file, std::io::SeekFrom::Start(0))?;
+                        std::io::Read::read_exact(&mut file, &mut header_bytes)?;
+                        let header =
+                            Self::validate_v8_active_recovery_header(&pitr_state, &header_bytes)?;
+                        let boundary = pitr_state.active_boundary.ok_or_else(|| {
+                            anyhow!("PITR manifest is missing the Active v8 boundary")
+                        })?;
+                        let source_metadata = file.metadata()?;
+                        let source_file_len = source_metadata.len();
+                        let source_file_allocated_bytes =
+                            Self::filesystem_allocated_bytes(&source_metadata)?;
+                        drop(file);
+                        let max_segment_bytes = pitr_state
+                            .config
+                            .as_ref()
+                            .ok_or_else(|| anyhow!("PITR state is missing configuration"))?
+                            .max_segment_bytes;
+                        let temporary_buffer_memory_bytes =
+                            crate::pitr::seal::V8Seal::max_validation_memory_bytes(
+                                max_segment_bytes,
+                            )?;
+                        let (_, _recovery_workspace, _) =
+                            Self::reserve_v7_active_recovery_workspace_with_buffer_memory(
+                                &pitr_state,
+                                path,
+                                active_segment_id,
+                                source_file_len,
+                                source_file_allocated_bytes,
+                                temporary_buffer_memory_bytes,
+                            )?;
+                        let recovery = crate::wal::v8::install::recover_and_install_active(
+                            &wal_path,
+                            &[boundary],
+                            header.predecessor,
+                            crate::pitr::LIVE_WAL_V5_LIMITS,
+                            max_segment_bytes,
+                        )?;
+                        ensure!(
+                            recovery.image_len <= max_segment_bytes,
+                            "recovered Active v8 WAL exceeds the configured segment limit"
+                        );
+                        let memtable_id = recovered_v8_active_memtable_id.unwrap_or(max_id);
+                        let (memtable, wal_max_ts) = MemTable::recover_from_v8_active(
+                            memtable_id,
+                            vlog_enabled,
+                            &wal_path,
+                            recovery,
+                            max_segment_bytes,
+                        )?;
+                        max_commit_ts = max_commit_ts.max(wal_max_ts);
+                        if let Some(current) = memtable.recovered_recorded_at() {
+                            max_recorded_at = Some(
+                                max_recorded_at.map_or(current, |previous| previous.max(current)),
+                            );
+                        }
+                        state.memtable = Arc::new(memtable);
+                        recovered_pitr_segment_id = Some(active_segment_id);
+                        recovered_unbound_pitr_active = true;
                     } else {
                         let header = crate::pitr::decode_v5_file_header(&bytes)?;
                         let expected_timeline_id = pitr_state.timeline_id.ok_or_else(|| {
@@ -12493,8 +12774,9 @@ impl LsmStorageInner {
                 std::io::Read::read_exact(&mut file, &mut prefix)?;
                 let version = u16::from_be_bytes(prefix[4..6].try_into()?);
                 anyhow::ensure!(
-                    version != crate::wal::format::WAL_FORMAT_VERSION_V7,
-                    "opening a v7 Active PITR WAL requires enable_wal"
+                    version != crate::wal::format::WAL_FORMAT_VERSION_V7
+                        && version != crate::wal::format::WAL_FORMAT_VERSION_V8,
+                    "opening an Active v7/v8 PITR WAL requires enable_wal"
                 );
             }
         }
@@ -12511,7 +12793,8 @@ impl LsmStorageInner {
             .copied()
             .collect();
 
-        let wal_v7_open_lock = state.memtable.uses_v7_wal().then_some(wal_v7_open_lock);
+        let wal_v7_open_lock = (state.memtable.uses_v7_wal() || state.memtable.uses_v8_wal())
+            .then_some(wal_v7_open_lock);
 
         Ok(RecoveryPlan {
             state,
@@ -13026,8 +13309,10 @@ impl LsmStorageInner {
     /// returned close error cannot leave dedicated WAL threads running.
     pub(crate) fn sync_and_close_parallel_wals(&self, active_wal_synced: bool) -> Result<()> {
         ensure!(
-            !active_wal_synced || self.state.load().memtable.uses_v7_wal(),
-            "only an already-synced Active v7 WAL may skip the close sync"
+            !active_wal_synced
+                || self.state.load().memtable.uses_v7_wal()
+                || self.state.load().memtable.uses_v8_wal(),
+            "only an already-synced Active versioned WAL may skip the close sync"
         );
         let sync_result = if active_wal_synced {
             Ok(())
@@ -16493,6 +16778,12 @@ impl LsmStorageInner {
 
     pub(crate) fn try_freeze_memtable(&self) -> Result<()> {
         let state = self.state.load();
+        // Active v8 recovery can resume appends, but its seal-and-successor
+        // transition is not wired yet. Keep it active until that transition is
+        // implemented, rather than sending it through v5/v7 maintenance.
+        if state.memtable.uses_v8_wal() {
+            return Ok(());
+        }
         // PITR WALs rotate through a segment boundary. In particular, a v7
         // commit must not reach ordinary freeze after publishing its data:
         // maintenance and capacity retries establish the immutable segment
@@ -16816,6 +17107,9 @@ impl LsmStorageInner {
             .as_ref()
             .ok_or_else(|| anyhow!("enabled PITR state has no configuration"))?;
         let memtable = self.state.load().memtable.clone();
+        if memtable.uses_v8_wal() {
+            return Ok(());
+        }
         if !memtable.uses_pitr_batch_wal() {
             return Ok(());
         }
@@ -17623,8 +17917,8 @@ impl LsmStorageInner {
 
     fn ensure_memtable_rotation_healthy(&self) -> Result<()> {
         ensure!(
-            !self.state.load().memtable.uses_v7_wal(),
-            "ordinary memtable freeze cannot rotate a v7 Active PITR WAL"
+            !self.state.load().memtable.uses_v7_wal() && !self.state.load().memtable.uses_v8_wal(),
+            "ordinary memtable freeze cannot rotate an Active versioned PITR WAL"
         );
         self.ensure_memtable_rotation_runtime_healthy()
     }
@@ -17739,6 +18033,10 @@ impl LsmStorageInner {
         {
             let active = self.state.load();
             let has_data = !active.memtable.is_empty();
+            ensure!(
+                !active.memtable.uses_v8_wal() || !has_data,
+                "Active v8 PITR rotation is not enabled yet"
+            );
             if active.memtable.uses_v7_wal() || (active.memtable.uses_pitr_batch_wal() && has_data)
             {
                 drop(active);
@@ -21705,6 +22003,157 @@ mod tests {
             pitr_repository: Some(directory.join("repository")),
             ..LsmStorageOptions::default_for_test()
         })
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn active_v8_lsm_recovery_publishes_anchor_and_resumes_appends() -> anyhow::Result<()> {
+        use crate::{
+            pitr::manifest::{PitrManifestRecord, PitrWalFormat},
+            pitr::{
+                ArchiveEpochId, LIVE_WAL_V5_LIMITS, RecordedAt, SegmentId, TimelineId, WalBatch,
+                WalEntry,
+            },
+            wal::v8::{
+                codec::WalV8Header,
+                install::{create_empty_active_image, recover_and_install_active},
+                leader::WalV8LeaderWriter,
+            },
+        };
+
+        let directory = tempdir()?;
+        let initial_engine = pitr_flush_test_engine_with_segment_limit_and_interval(
+            directory.path(),
+            1 << 20,
+            std::time::Duration::from_secs(3600),
+        );
+        let pitr_state = initial_engine.pitr_manifest_state.lock().clone();
+        let segment_id = pitr_state
+            .active_segment_id
+            .ok_or_else(|| anyhow::anyhow!("PITR fixture has no Active segment"))?;
+        initial_engine.close_storage()?;
+        drop(initial_engine);
+
+        let database = directory.path().join("db");
+        let wal_path = database.join(format!("pitr-{segment_id:020}.wal"));
+        std::fs::remove_file(&wal_path)?;
+        let header = WalV8Header {
+            timeline_id: TimelineId(pitr_state.timeline_id.unwrap()),
+            archive_epoch_id: ArchiveEpochId(pitr_state.archive_epoch_id.unwrap()),
+            segment_id: SegmentId(segment_id),
+            predecessor: super::pitr_chain_anchor_from_persisted(
+                pitr_state.predecessor_anchor.unwrap(),
+            ),
+            incarnation: [8; 16],
+        };
+        let empty_boundary = create_empty_active_image(&wal_path, header)?;
+        let manifest = crate::manifest::Manifest::recover(database.join("MANIFEST"))?.0;
+        manifest.add_records_when_init(&[crate::manifest::ManifestRecord::Pitr(
+            PitrManifestRecord::ActiveBoundaryAdvanced {
+                boundary: empty_boundary,
+            },
+        )])?;
+        drop(manifest);
+
+        let max_segment_bytes = pitr_state.config.as_ref().unwrap().max_segment_bytes;
+        let installed = recover_and_install_active(
+            &wal_path,
+            &[empty_boundary],
+            header.predecessor,
+            crate::pitr::LIVE_WAL_V5_LIMITS,
+            max_segment_bytes,
+        )?;
+        let write_file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&wal_path)?;
+        let sync_file = write_file.try_clone()?;
+        let mut writer =
+            WalV8LeaderWriter::new(write_file, sync_file, &installed, max_segment_bytes)?;
+        writer.append_batch(
+            &WalBatch {
+                commit_ts: 7,
+                recorded_at: RecordedAt {
+                    secs: 1_800_000_000,
+                    nanos: 0,
+                },
+                entries: vec![WalEntry::Put {
+                    key: b"seed".to_vec(),
+                    value: vec![crate::vlog::KvKind::Inline as u8, b'v'],
+                }],
+            },
+            LIVE_WAL_V5_LIMITS,
+        )?;
+        drop(writer);
+
+        let options = LsmStorageOptions {
+            enable_wal: true,
+            pitr_repository: Some(directory.path().join("repository")),
+            ..LsmStorageOptions::default_for_test()
+        };
+        let engine = KvEngine::open(&database, options.clone())?;
+        assert!(engine.inner.state.load().memtable.uses_v8_wal());
+        assert_eq!(engine.get(b"seed")?, Some(Bytes::from_static(b"v")));
+        let recovery_point_error = match engine.create_recovery_point() {
+            Ok(_) => anyhow::bail!("Active v8 recovery-point creation unexpectedly succeeded"),
+            Err(error) => error,
+        };
+        assert!(format!("{recovery_point_error:#}").contains("not enabled for Active v8"));
+        engine.put(b"after-recovery", b"appended")?;
+        engine.sync()?;
+        let durable_boundary = engine
+            .pitr_manifest_state
+            .lock()
+            .active_boundary
+            .expect("v8 sync publishes its Active boundary");
+        assert_eq!(durable_boundary.wal_format, PitrWalFormat::V8);
+        assert_eq!(durable_boundary.ticket_end, 2);
+        let (_, persisted_records) = crate::manifest::Manifest::recover(database.join("MANIFEST"))?;
+        let persisted_pitr_state =
+            crate::pitr::manifest::replay_pitr_records(persisted_records.into_iter().filter_map(
+                |record| match record {
+                    crate::manifest::ManifestRecord::Pitr(record) => Some(record),
+                    crate::manifest::ManifestRecord::Snapshot {
+                        pitr_state: Some(state),
+                        ..
+                    } => Some(PitrManifestRecord::Snapshot(Box::new(state))),
+                    _ => None,
+                },
+            ))?;
+        assert_eq!(persisted_pitr_state.active_boundary, Some(durable_boundary));
+        engine.close()?;
+        drop(engine);
+
+        let reopened = KvEngine::open(&database, options.clone())?;
+        assert!(reopened.inner.state.load().memtable.uses_v8_wal());
+        assert_eq!(reopened.get(b"seed")?, Some(Bytes::from_static(b"v")));
+        assert_eq!(
+            reopened.get(b"after-recovery")?,
+            Some(Bytes::from_static(b"appended"))
+        );
+        reopened.close()?;
+
+        let mut wal_file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&wal_path)?;
+        let first_data_offset = u64::try_from(
+            crate::wal::v8::WAL_V8_HEADER_LEN + crate::wal::v8::codec::WAL_V8_FRAME_LEN,
+        )?;
+        use std::io::{Read, Seek, SeekFrom, Write};
+        wal_file.seek(SeekFrom::Start(first_data_offset + 64))?;
+        let mut byte = [0];
+        wal_file.read_exact(&mut byte)?;
+        byte[0] ^= 1;
+        wal_file.seek(SeekFrom::Start(first_data_offset + 64))?;
+        wal_file.write_all(&byte)?;
+        wal_file.sync_all()?;
+        assert!(
+            KvEngine::open(&database, options).is_err(),
+            "recovery must reject corruption below the persisted Active v8 anchor"
+        );
+
+        Ok(())
     }
 
     #[cfg(target_os = "linux")]

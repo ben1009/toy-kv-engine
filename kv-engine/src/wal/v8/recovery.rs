@@ -64,7 +64,10 @@ struct PrefixFrontier {
 }
 
 /// An Active candidate validated against its entire covered prefix and all
-/// supplied hard anchors. `batches` is truncated to the accepted ticket end.
+/// supplied hard anchors. `batches` is truncated to the accepted ticket end
+/// when materialized replay is requested. Installed Active recovery instead
+/// retains a compact ticket index and streams decoded batches into the
+/// memtable.
 pub(crate) struct WalV8RecoverySelection {
     pub(crate) header: WalV8Header,
     pub(crate) header_bytes: [u8; HEADER_LEN],
@@ -82,6 +85,7 @@ pub(crate) struct WalV8RecoverySelection {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct WalV8SealTicket {
     pub(crate) first_data_offset: u64,
+    pub(crate) data_end: u64,
     pub(crate) commit_ts: u64,
     pub(crate) recorded_at: RecordedAt,
 }
@@ -98,6 +102,8 @@ pub(crate) struct WalV8SealSelection {
 #[derive(Clone, Copy)]
 enum SelectionPayload {
     RecoveryBatches,
+    RecoveryIndex,
+    ValidationOnly,
     SealIndex,
     SealedReplay,
 }
@@ -223,6 +229,50 @@ pub(crate) fn select_active_candidate<R: Read + Seek>(
         expected_predecessor,
         limits,
         SelectionPayload::RecoveryBatches,
+    )?;
+    Ok(selection)
+}
+
+/// Verify an Active boundary while retaining only the compact per-ticket
+/// replay index. The decoded key/value batches are streamed into the memtable
+/// after the normalized image is durably installed.
+pub(crate) fn select_active_candidate_for_replay<R: Read + Seek>(
+    reader: &mut R,
+    file_len: u64,
+    discovery: &WalV8FrontierDiscovery,
+    anchors: &[ActiveBoundary],
+    expected_predecessor: crate::pitr::ChainAnchor,
+    limits: WalV5Limits,
+) -> Result<(WalV8RecoverySelection, Vec<WalV8SealTicket>)> {
+    select_active_candidate_inner(
+        reader,
+        file_len,
+        discovery,
+        anchors,
+        expected_predecessor,
+        limits,
+        SelectionPayload::RecoveryIndex,
+    )
+}
+
+/// Verify an already normalized Active image without retaining replay batches
+/// or building a ticket index.
+pub(crate) fn select_active_candidate_for_validation<R: Read + Seek>(
+    reader: &mut R,
+    file_len: u64,
+    discovery: &WalV8FrontierDiscovery,
+    anchors: &[ActiveBoundary],
+    expected_predecessor: crate::pitr::ChainAnchor,
+    limits: WalV5Limits,
+) -> Result<WalV8RecoverySelection> {
+    let (selection, _) = select_active_candidate_inner(
+        reader,
+        file_len,
+        discovery,
+        anchors,
+        expected_predecessor,
+        limits,
+        SelectionPayload::ValidationOnly,
     )?;
     Ok(selection)
 }
@@ -682,7 +732,9 @@ fn select_active_candidate_inner<R: Read + Seek>(
     let mut seal_tickets = Vec::new();
     if matches!(
         payload,
-        SelectionPayload::SealIndex | SelectionPayload::SealedReplay
+        SelectionPayload::RecoveryIndex
+            | SelectionPayload::SealIndex
+            | SelectionPayload::SealedReplay
     ) {
         seal_tickets
             .try_reserve_exact(ticket_end)
@@ -690,6 +742,7 @@ fn select_active_candidate_inner<R: Read + Seek>(
         for checkpoint in checkpoints.iter().skip(1).take(ticket_end) {
             seal_tickets.push(WalV8SealTicket {
                 first_data_offset: checkpoint.data_start,
+                data_end: checkpoint.data_end,
                 commit_ts: checkpoint.last_commit_ts,
                 recorded_at: checkpoint
                     .recorded_at
@@ -815,6 +868,63 @@ fn decode_selected_batches<R: Read + Seek>(
         "selected v8 batches do not reproduce the accepted FRONTIER"
     );
     Ok(batches)
+}
+
+/// Decode and verify accepted Active batches one at a time. This avoids
+/// retaining a second WAL-sized collection of owned keys and values during
+/// LSM startup recovery.
+pub(crate) fn replay_selected_batches<R: Read + Seek>(
+    reader: &mut R,
+    selection: &WalV8RecoverySelection,
+    tickets: &[WalV8SealTicket],
+    limits: WalV5Limits,
+    mut apply: impl FnMut(&WalBatch) -> Result<()>,
+) -> Result<()> {
+    ensure!(
+        u64::try_from(tickets.len())? == selection.active_boundary.ticket_end,
+        "v8 replay index does not match the accepted ticket boundary"
+    );
+    let mut prefix_digest = selection.initial_prefix_digest;
+    for (ticket_number, ticket) in tickets.iter().enumerate() {
+        ensure!(
+            ticket.first_data_offset < ticket.data_end
+                && ticket.data_end <= selection.active_boundary.durable_end,
+            "v8 replay ticket range is outside the accepted durable prefix"
+        );
+        let ticket_number = u64::try_from(ticket_number)?;
+        let (logical_bytes, batch) = decode_batch_at(
+            reader,
+            ticket.first_data_offset,
+            ticket.data_end,
+            ticket_number,
+            &selection.physical_header_digest,
+            &selection.initial_prefix_digest,
+            limits,
+        )?;
+        ensure!(
+            batch.commit_ts == ticket.commit_ts && batch.recorded_at == ticket.recorded_at,
+            "v8 replay batch metadata differs from its verified ticket index"
+        );
+        let entry_bytes = &logical_bytes[WAL_V8_LOGICAL_BATCH_HEADER_LEN..];
+        let mut entry_hasher = WalV8EntryHasher::new(u64::try_from(entry_bytes.len())?);
+        entry_hasher.update(entry_bytes)?;
+        let entry_digest = entry_hasher.finish()?;
+        let logical_header: &[u8; WAL_V8_LOGICAL_BATCH_HEADER_LEN] =
+            logical_bytes[..WAL_V8_LOGICAL_BATCH_HEADER_LEN].try_into()?;
+        let batch_digest = digest::batch_digest(logical_header, &entry_digest);
+        prefix_digest = digest::advance_prefix(
+            &prefix_digest,
+            ticket_number,
+            u64::try_from(logical_bytes.len())?,
+            &batch_digest,
+        );
+        apply(&batch)?;
+    }
+    ensure!(
+        prefix_digest == selection.active_boundary.prefix_digest,
+        "streamed v8 batches do not reproduce the accepted FRONTIER"
+    );
+    Ok(())
 }
 
 fn decode_batch_at<R: Read + Seek>(
@@ -1082,7 +1192,7 @@ fn read_frame<R: Read + Seek>(reader: &mut R, offset: u64) -> Result<[u8; FRAME_
 mod tests {
     use std::{
         fs::File,
-        io::{self, Cursor, Read, Seek, SeekFrom},
+        io::{self, Cursor, Read, Seek, SeekFrom, Write},
         os::unix::fs::MetadataExt,
     };
 
@@ -1403,6 +1513,23 @@ mod tests {
         )
     }
 
+    fn installed_batches(
+        path: impl AsRef<std::path::Path>,
+        installed: &crate::wal::v8::install::WalV8InstalledRecovery,
+    ) -> Result<Vec<WalBatch>> {
+        let mut batches = Vec::new();
+        crate::wal::v8::install::replay_installed_active_batches(
+            path,
+            installed,
+            LIVE_WAL_V5_LIMITS,
+            |batch| {
+                batches.push(batch.clone());
+                Ok(())
+            },
+        )?;
+        Ok(batches)
+    }
+
     struct FailingReader {
         cursor: Cursor<Vec<u8>>,
         fail_at: u64,
@@ -1517,8 +1644,23 @@ mod tests {
             installed.image_len,
             fixture.first_frontier.durable_end + FRAME_LEN_U64
         );
-        assert_eq!(installed.selection.batches.len(), 1);
+        assert_eq!(installed_batches(&path, &installed)?.len(), 1);
         assert_eq!(installed_metadata.len(), installed.image_len);
+
+        let mut installed_file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)?;
+        let mut magic = [0; 1];
+        installed_file.read_exact(&mut magic)?;
+        installed_file.seek(SeekFrom::Start(0))?;
+        installed_file.write_all(&[magic[0] ^ 0xff])?;
+        installed_file.sync_all()?;
+        assert!(installed_batches(&path, &installed).is_err());
+        installed_file.seek(SeekFrom::Start(0))?;
+        installed_file.write_all(&magic)?;
+        installed_file.sync_all()?;
+        drop(installed_file);
 
         let mut installed_file = File::open(&path)?;
         let initial_prefix_digest = header.initial_prefix_digest()?;
@@ -1642,8 +1784,7 @@ mod tests {
             )?;
             assert_eq!(recovered.active_boundary, anchor);
             assert_eq!(recovered.frontier.ticket_end, 1);
-            assert_eq!(recovered.selection.batches.len(), 1);
-            assert_eq!(recovered.selection.batches[0].commit_ts, 10);
+            assert_eq!(installed_batches(&wal_path, &recovered)?[0].commit_ts, 10);
             for entry in std::fs::read_dir(directory.path())? {
                 let entry = entry?;
                 ensure!(
@@ -1664,7 +1805,10 @@ mod tests {
             )?;
             assert_eq!(reopened.active_boundary, anchor);
             assert_eq!(reopened.frontier, recovered.frontier);
-            assert_eq!(reopened.selection.batches, recovered.selection.batches);
+            assert_eq!(
+                installed_batches(&wal_path, &reopened)?,
+                installed_batches(&wal_path, &recovered)?
+            );
         }
         Ok(())
     }
@@ -1745,8 +1889,7 @@ mod tests {
             )?;
             assert_eq!(recovered.active_boundary, anchor);
             assert_eq!(recovered.frontier.ticket_end, 1);
-            assert_eq!(recovered.selection.batches.len(), 1);
-            assert_eq!(recovered.selection.batches[0].commit_ts, 10);
+            assert_eq!(installed_batches(&wal_path, &recovered)?[0].commit_ts, 10);
         }
         Ok(())
     }

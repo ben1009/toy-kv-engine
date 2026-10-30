@@ -24,7 +24,11 @@ use super::{
         WAL_V8_FRAME_LEN, WalV8Frontier, WalV8Header, decode_frame_structural,
         encode_frontier_successor, encode_generation_zero_frontier, frame_record_digest,
     },
-    recovery::{WalV8RecoverySelection, discover_frontier_candidates, select_active_candidate},
+    recovery::{
+        WalV8RecoverySelection, WalV8SealTicket, discover_frontier_candidates,
+        replay_selected_batches, select_active_candidate_for_replay,
+        select_active_candidate_for_validation,
+    },
 };
 
 const FRAME_LEN_U64: u64 = WAL_V8_FRAME_LEN as u64;
@@ -36,7 +40,11 @@ static TEMP_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 /// Recovered v8 Active state after the accepted boundary is normalized and
 /// durably installed on a fresh inode.
 pub(crate) struct WalV8InstalledRecovery {
+    /// The accepted boundary and frontier-chain metadata. Active recovery
+    /// leaves `selection.batches` empty and streams replay using the compact
+    /// ticket index below.
     pub(crate) selection: WalV8RecoverySelection,
+    pub(crate) replay_tickets: Vec<WalV8SealTicket>,
     pub(crate) active_boundary: ActiveBoundary,
     pub(crate) header_digest: [u8; 32],
     pub(crate) frontier: WalV8Frontier,
@@ -185,7 +193,7 @@ pub(crate) fn recover_and_install_active(
         &header_digest,
         &initial_prefix_digest,
     )?;
-    let selection = select_active_candidate(
+    let (selection, replay_tickets) = select_active_candidate_for_replay(
         &mut source,
         source_len,
         &discovery,
@@ -205,6 +213,7 @@ pub(crate) fn recover_and_install_active(
         source_len,
         source_permissions: source_metadata.permissions(),
         selection,
+        replay_tickets,
         header_digest,
         initial_prefix_digest,
         limits,
@@ -230,6 +239,7 @@ struct InstallRequest<'a> {
     source_len: u64,
     source_permissions: fs::Permissions,
     selection: WalV8RecoverySelection,
+    replay_tickets: Vec<WalV8SealTicket>,
     header_digest: [u8; 32],
     initial_prefix_digest: super::digest::WalV8Digest,
     limits: WalV5Limits,
@@ -243,6 +253,7 @@ fn install_normalized_image(request: InstallRequest<'_>) -> Result<WalV8Installe
         source_len,
         source_permissions,
         selection,
+        replay_tickets,
         header_digest,
         initial_prefix_digest,
         limits,
@@ -370,7 +381,7 @@ fn install_normalized_image(request: InstallRequest<'_>) -> Result<WalV8Installe
             &header_digest,
             &initial_prefix_digest,
         )?;
-        let verified = select_active_candidate(
+        let verified = select_active_candidate_for_validation(
             &mut verification_file,
             normalized_len,
             &verification_discovery,
@@ -419,7 +430,7 @@ fn install_normalized_image(request: InstallRequest<'_>) -> Result<WalV8Installe
             "installed Active v8 WAL has an unexpected file type or length"
         );
 
-        let last_recorded_at = selection.batches.last().map(|batch| batch.recorded_at);
+        let last_recorded_at = replay_tickets.last().map(|ticket| ticket.recorded_at);
         Ok(WalV8InstalledRecovery {
             next_ticket: selection.active_boundary.ticket_end,
             last_recorded_at,
@@ -431,6 +442,7 @@ fn install_normalized_image(request: InstallRequest<'_>) -> Result<WalV8Installe
             image_len: normalized_len,
             installed_dev: installed_metadata.dev(),
             installed_ino: installed_metadata.ino(),
+            replay_tickets,
             selection,
         })
     })();
@@ -446,6 +458,63 @@ fn install_normalized_image(request: InstallRequest<'_>) -> Result<WalV8Installe
         }
         other => other,
     }
+}
+
+/// Replay batches from a normalized image after checking that the installed
+/// inode still matches the recovery result. Only one decoded batch is retained
+/// at a time while the caller applies it to the recovered memtable.
+pub(crate) fn replay_installed_active_batches(
+    path: impl AsRef<Path>,
+    installed: &WalV8InstalledRecovery,
+    limits: WalV5Limits,
+    apply: impl FnMut(&crate::pitr::WalBatch) -> Result<()>,
+) -> Result<()> {
+    let path = path.as_ref();
+    let path_metadata = fs::symlink_metadata(path).context("inspect installed Active v8 WAL")?;
+    ensure!(
+        path_metadata.file_type().is_file(),
+        "installed Active v8 WAL path is not a regular file"
+    );
+    ensure!(
+        path_metadata.dev() == installed.installed_dev
+            && path_metadata.ino() == installed.installed_ino
+            && path_metadata.len() == installed.image_len,
+        "installed Active v8 WAL changed before memtable replay"
+    );
+    let mut file = File::open(path).context("open installed Active v8 WAL for replay")?;
+    let file_metadata = file
+        .metadata()
+        .context("inspect opened Active v8 WAL for replay")?;
+    ensure!(
+        file_metadata.is_file()
+            && file_metadata.dev() == installed.installed_dev
+            && file_metadata.ino() == installed.installed_ino
+            && file_metadata.len() == installed.image_len,
+        "opened Active v8 WAL differs from the installed recovery inode"
+    );
+    let mut header_bytes = [0; super::WAL_V8_HEADER_LEN];
+    file.seek(SeekFrom::Start(0))
+        .context("seek installed Active v8 WAL header for replay")?;
+    file.read_exact(&mut header_bytes)
+        .context("read installed Active v8 WAL header for replay")?;
+    let header = WalV8Header::decode(&header_bytes)?;
+    ensure!(
+        header.encode()? == header_bytes && header == installed.selection.header,
+        "installed Active v8 WAL header changed before memtable replay"
+    );
+    let header_digest: [u8; 32] = Sha256::digest(header_bytes).into();
+    ensure!(
+        header_digest == installed.header_digest
+            && header_digest == installed.selection.physical_header_digest,
+        "installed Active v8 WAL header digest changed before memtable replay"
+    );
+    replay_selected_batches(
+        &mut file,
+        &installed.selection,
+        &installed.replay_tickets,
+        limits,
+        apply,
+    )
 }
 
 fn validate_selected_candidate(

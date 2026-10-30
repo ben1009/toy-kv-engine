@@ -1196,6 +1196,32 @@ impl V8Seal {
             .ok_or_else(|| anyhow::anyhow!("v8 seal validation workspace overflows"))
     }
 
+    /// Bound the temporary memory needed to validate any Active v8 image
+    /// within the configured segment limit. Active images can end in a torn
+    /// partial frame, so callers must reserve from the persisted limit instead
+    /// of passing the current physical file length to `validation_memory_bytes`.
+    pub(crate) fn max_validation_memory_bytes(max_segment_bytes: u64) -> Result<u64> {
+        let minimum = crate::wal::v8::WAL_V8_HEADER_LEN
+            .checked_add(crate::wal::v8::codec::WAL_V8_FRAME_LEN)
+            .ok_or_else(|| anyhow::anyhow!("v8 PITR minimum image length overflows"))?;
+        ensure!(
+            max_segment_bytes >= u64::try_from(minimum)?,
+            "persisted v8 PITR segment limit is too small"
+        );
+        ensure!(
+            max_segment_bytes <= crate::wal::MAX_WAL_FILE_SIZE,
+            "persisted v8 PITR segment limit exceeds the WAL format limit"
+        );
+        let frame_len = u64::try_from(crate::wal::v8::codec::WAL_V8_FRAME_LEN)?;
+        let max_sealable_end = max_segment_bytes - max_segment_bytes % frame_len;
+        let maximum_ticket_end = max_sealable_end.saturating_sub(u64::try_from(
+            crate::wal::v8::WAL_V8_HEADER_LEN
+                .checked_add(2 * crate::wal::v8::codec::WAL_V8_FRAME_LEN)
+                .ok_or_else(|| anyhow::anyhow!("v8 PITR ticket bound overflows"))?,
+        )?) / frame_len;
+        Self::validation_memory_bytes(max_sealable_end, maximum_ticket_end)
+    }
+
     pub(crate) fn encode(&self) -> Result<Vec<u8>> {
         self.validate()?;
         let body_len = self

@@ -1455,7 +1455,6 @@ impl MemTable {
     /// writer. The caller must have authority-checked and durably installed the
     /// image before attaching it to a writable memtable.
     #[cfg(target_os = "linux")]
-    #[allow(dead_code)] // Wired into LSM Active v8 startup in a later slice.
     pub(crate) fn recover_from_v8_active(
         id: usize,
         vlog_enabled: bool,
@@ -1468,9 +1467,12 @@ impl MemTable {
         let recovered_recorded_at = installed.last_recorded_at;
         let mut ret = Self::create(id, vlog_enabled);
         ret.wal_v8_source = true;
-        for batch in &installed.selection.batches {
-            ret.apply_recovered_batch(batch)?;
-        }
+        crate::wal::v8::install::replay_installed_active_batches(
+            &path,
+            &installed,
+            crate::pitr::LIVE_WAL_V5_LIMITS,
+            |batch| ret.apply_recovered_batch(batch),
+        )?;
 
         let write_file = std::fs::OpenOptions::new()
             .read(true)
@@ -2276,7 +2278,6 @@ impl MemTable {
         self.wal_v7_source || self.wal.as_ref().is_some_and(Wal::is_v7)
     }
 
-    #[allow(dead_code)] // Used by Active v8 capture after LSM recovery is wired.
     pub(crate) fn uses_v8_wal(&self) -> bool {
         self.wal_v8_source || self.wal.as_ref().is_some_and(Wal::is_v8)
     }
@@ -2371,7 +2372,6 @@ impl MemTable {
         Ok((empty, current))
     }
 
-    #[allow(dead_code)] // Used by Active v8 manifest capture after LSM recovery is wired.
     pub(crate) fn v8_active_boundaries(
         &self,
     ) -> Result<(
