@@ -34449,6 +34449,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     fn assert_pre_v8_cli_rejects_guarded_active_v7_without_mutation(
         remove_manifest: bool,
+        pending_snapshot: bool,
     ) -> anyhow::Result<()> {
         use std::{
             collections::BTreeMap,
@@ -34548,6 +34549,16 @@ mod tests {
         drop(engine);
 
         let database_path = dir.path().join("db");
+        if pending_snapshot {
+            anyhow::ensure!(
+                remove_manifest,
+                "pending snapshot compatibility case requires a missing MANIFEST"
+            );
+            std::fs::rename(
+                database_path.join("ENGINE_MANIFEST"),
+                database_path.join("ENGINE_MANIFEST.tmp"),
+            )?;
+        }
         if remove_manifest {
             std::fs::remove_file(database_path.join("MANIFEST"))?;
             std::fs::File::open(&database_path)?.sync_all()?;
@@ -34591,7 +34602,7 @@ mod tests {
     #[test]
     #[ignore = "requires the pre-v8 CLI path in TOY_KV_PRE_V8_CLI"]
     fn v8_compatibility_guard_rejects_pre_v8_cli_without_database_mutation() -> anyhow::Result<()> {
-        assert_pre_v8_cli_rejects_guarded_active_v7_without_mutation(false)
+        assert_pre_v8_cli_rejects_guarded_active_v7_without_mutation(false, false)
     }
 
     #[cfg(target_os = "linux")]
@@ -34599,7 +34610,15 @@ mod tests {
     #[ignore = "requires the pre-v8 CLI path in TOY_KV_PRE_V8_CLI"]
     fn v8_compatibility_guard_rejects_pre_v8_cli_with_missing_manifest_without_mutation()
     -> anyhow::Result<()> {
-        assert_pre_v8_cli_rejects_guarded_active_v7_without_mutation(true)
+        assert_pre_v8_cli_rejects_guarded_active_v7_without_mutation(true, false)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires the pre-v8 CLI path in TOY_KV_PRE_V8_CLI"]
+    fn v8_compatibility_guard_rejects_pre_v8_cli_with_missing_manifest_and_pending_snapshot_without_mutation()
+    -> anyhow::Result<()> {
+        assert_pre_v8_cli_rejects_guarded_active_v7_without_mutation(true, true)
     }
 
     #[cfg(target_os = "linux")]
