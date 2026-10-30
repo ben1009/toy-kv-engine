@@ -10235,13 +10235,16 @@ impl LsmStorageInner {
         );
 
         let seal_path = database_path.join(format!("pitr-{segment_id:020}.seal"));
-        let (format, bytes) =
-            crate::pitr::seal::read_seal_sidecar(&seal_path, Some(boundary.sealed_end))?;
+        let (format, bytes) = crate::pitr::seal::read_seal_sidecar_for_format(
+            &seal_path,
+            Some(boundary.sealed_end),
+            crate::pitr::seal::SealSidecarFormat::V7,
+        )?;
         ensure!(
             format == crate::pitr::seal::SealSidecarFormat::V7,
             "v7 PITR source has a non-v7 seal sidecar"
         );
-        let seal = crate::pitr::seal::V7Seal::decode(&bytes, max_segment_bytes)?;
+        let seal = crate::pitr::seal::V7Seal::decode(&bytes, boundary.sealed_end)?;
         ensure!(
             seal.header == header && seal.boundary == boundary,
             "v7 PITR seal differs from its manifest obligation or WAL header"
@@ -10320,8 +10323,11 @@ impl LsmStorageInner {
         );
 
         let seal_path = database_path.join(format!("pitr-{segment_id:020}.seal"));
-        let (format, bytes) =
-            crate::pitr::seal::read_seal_sidecar(&seal_path, Some(boundary.sealed_end))?;
+        let (format, bytes) = crate::pitr::seal::read_seal_sidecar_for_format(
+            &seal_path,
+            Some(boundary.sealed_end),
+            crate::pitr::seal::SealSidecarFormat::V8,
+        )?;
         ensure!(
             format == crate::pitr::seal::SealSidecarFormat::V8,
             "v8 PITR predecessor has a non-v8 seal sidecar"
@@ -23118,6 +23124,29 @@ mod tests {
         assert_eq!(metadata.wal_bytes, sealed_end);
         assert_eq!(metadata.batch_count, u64::try_from(seal.entries.len())?);
 
+        let mut sealed_state = sealing_state.clone();
+        sealed_state.obligations.get_mut(&segment_id).unwrap().state =
+            crate::pitr::manifest::ObligationState::Sealed;
+        std::fs::write(&seal_path, b"TKVSEAL1")?;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&seal_path)?
+            .set_len(sealed_end + 1)?;
+        let wrong_format_error = LsmStorageInner::load_v7_sealed_recovery_source(
+            &database,
+            &sealed_state,
+            segment_id,
+            &wal_path,
+            seal.header,
+        )
+        .expect_err("v7 recovery must reject a legacy seal before decoding its body");
+        assert!(
+            wrong_format_error
+                .to_string()
+                .contains("format differs from its manifest obligation")
+        );
+        std::fs::write(&seal_path, seal.encode()?)?;
+
         let malformed_seal_path = database.join("malformed.seal");
         let mut malformed_seal = std::fs::File::create(&malformed_seal_path)?;
         malformed_seal.write_all(b"NOTSEAL!")?;
@@ -23452,6 +23481,24 @@ mod tests {
             })?;
         assert!(
             wrong_format_summary_error
+                .to_string()
+                .contains("format differs from its manifest obligation")
+        );
+        let mut sealed_v8_state = state.clone();
+        sealed_v8_state
+            .obligations
+            .get_mut(&segment_id)
+            .unwrap()
+            .state = ObligationState::Sealed;
+        let wrong_format_recovery_error = LsmStorageInner::load_v8_sealed_recovery_source(
+            &database,
+            &sealed_v8_state,
+            segment_id,
+            &wal_path,
+        )
+        .expect_err("v8 recovery must reject a legacy seal before decoding its body");
+        assert!(
+            wrong_format_recovery_error
                 .to_string()
                 .contains("format differs from its manifest obligation")
         );
