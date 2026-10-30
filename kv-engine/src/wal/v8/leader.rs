@@ -838,14 +838,10 @@ mod tests {
         let read_only_file = OpenOptions::new().read(true).open(&path)?;
         let sync_file = OpenOptions::new().read(true).write(true).open(&path)?;
 
-        let error = WalV8LeaderWriter::new(
-            read_only_file,
-            sync_file,
-            &installed,
-            MAX_WAL_FILE_SIZE,
-        )
-        .err()
-        .context("read-only positional write handle should be rejected")?;
+        let error =
+            WalV8LeaderWriter::new(read_only_file, sync_file, &installed, MAX_WAL_FILE_SIZE)
+                .err()
+                .context("read-only positional write handle should be rejected")?;
         assert!(format!("{error:#}").contains("not writable"));
         assert_eq!(std::fs::read(&path)?, before);
 
@@ -920,6 +916,19 @@ mod tests {
         assert!(format!("{error:#}").contains("fdatasync"));
         assert!(writer.is_poisoned());
         assert!(writer.append_batch(&batch(20), LIVE_WAL_V5_LIMITS).is_err());
+        drop(writer);
+
+        let original_inode = std::fs::metadata(&path)?.ino();
+        let recovered = super::super::install::recover_and_install_active(
+            &path,
+            &[installed.active_boundary.clone()],
+            header.predecessor,
+            LIVE_WAL_V5_LIMITS,
+            MAX_WAL_FILE_SIZE,
+        )?;
+        assert_eq!(recovered.active_boundary.ticket_end, 1);
+        assert_eq!(recovered.selection.batches, [batch(10)]);
+        assert_ne!(std::fs::metadata(&path)?.ino(), original_inode);
         Ok(())
     }
 }
