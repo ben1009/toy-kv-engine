@@ -10086,6 +10086,10 @@ impl LsmStorageInner {
         );
         if let Some(boundary) = state.active_boundary {
             ensure!(
+                boundary.wal_format == crate::pitr::manifest::PitrWalFormat::V7,
+                "Active v8 PITR WAL recovery is not enabled"
+            );
+            ensure!(
                 boundary.timeline_id == timeline_id
                     && boundary.archive_epoch_id == archive_epoch_id
                     && boundary.segment_id == active_segment_id
@@ -10234,8 +10238,9 @@ impl LsmStorageInner {
         Ok(seal)
     }
 
-    /// Validate a retained v8 source before using its format-independent
-    /// sealed-image digests as the predecessor anchor of a missing successor.
+    /// Load a retained v8 source only when its exact immutable boundary is
+    /// backed by a durable sealing obligation. The sidecar is checked against
+    /// the frozen WAL before callers use its digest or replay its batches.
     #[cfg(target_os = "linux")]
     fn load_v8_sealed_recovery_source(
         database_path: &Path,
@@ -10250,9 +10255,11 @@ impl LsmStorageInner {
             .get(&segment_id)
             .ok_or_else(|| anyhow!("v8 PITR source has no manifest sealing obligation"))?;
         ensure!(
-            obligation.state == ObligationState::Sealed
-                && obligation.wal_format == PitrWalFormat::V8,
-            "v8 PITR predecessor is not covered by a durable Sealed obligation"
+            matches!(
+                obligation.state,
+                ObligationState::Sealed | ObligationState::Archived | ObligationState::Reclaimable
+            ) && obligation.wal_format == PitrWalFormat::V8,
+            "v8 PITR source is not covered by a durable Sealed obligation"
         );
         let boundary = obligation
             .immutable_boundary
@@ -10550,6 +10557,10 @@ impl LsmStorageInner {
         use crate::pitr::manifest::{ObligationState, PersistedChainAnchor, PitrWalFormat};
         use crate::wal::v7::codec::{WAL_V7_FRAME_LEN, WAL_V7_HEADER_LEN, WalV7Header};
 
+        ensure!(
+            boundary.wal_format == PitrWalFormat::V7,
+            "Active v8 PITR WAL recovery is not enabled"
+        );
         let active_path = database_path.join(format!("pitr-{:020}.wal", boundary.segment_id));
         if active_path.try_exists()? {
             return Ok(false);
@@ -11298,6 +11309,10 @@ impl LsmStorageInner {
             }
             if let Some(boundary) = pitr_state.active_boundary {
                 ensure!(
+                    boundary.wal_format == crate::pitr::manifest::PitrWalFormat::V7,
+                    "Active v8 PITR WAL recovery is not enabled"
+                );
+                ensure!(
                     options.enable_wal,
                     "opening a v7 Active PITR WAL requires enable_wal"
                 );
@@ -11336,6 +11351,8 @@ impl LsmStorageInner {
             let mut recovered_v7_active_memtable_id = None;
             let mut v7_pitr_sealed_sources: BTreeMap<u64, (PathBuf, crate::pitr::seal::V7Seal)> =
                 BTreeMap::new();
+            let mut v8_pitr_sealed_sources: BTreeMap<u64, (PathBuf, crate::pitr::seal::V8Seal)> =
+                BTreeMap::new();
             // Manifest authority decides the required format before dispatching
             // on untrusted file bytes. Sealed/Archived sources remain required
             // after their memtables flush. A Reclaimable source is still needed
@@ -11351,6 +11368,30 @@ impl LsmStorageInner {
                     && pitr_memtable_segments.iter().any(|(id, mapped_segment)| {
                         *mapped_segment == segment_id && im_memtables.contains(id)
                     });
+                let needs_v8_reclaimable_replay = obligation.state == ObligationState::Reclaimable
+                    && obligation.logical_length
+                        != (crate::wal::v8::WAL_V8_HEADER_LEN
+                            + crate::wal::v8::codec::WAL_V8_FRAME_LEN)
+                            as u64
+                    && pitr_memtable_segments.iter().any(|(id, mapped_segment)| {
+                        *mapped_segment == segment_id && im_memtables.contains(id)
+                    });
+                if obligation.wal_format == PitrWalFormat::V8
+                    && (matches!(
+                        obligation.state,
+                        ObligationState::Sealed | ObligationState::Archived
+                    ) || needs_v8_reclaimable_replay)
+                {
+                    let candidate = path.join(format!("pitr-{segment_id:020}.wal"));
+                    let seal = Self::load_v8_sealed_recovery_source(
+                        path,
+                        &pitr_state,
+                        segment_id,
+                        &candidate,
+                    )?;
+                    v8_pitr_sealed_sources.insert(segment_id, (candidate, seal));
+                    continue;
+                }
                 if obligation.wal_format != PitrWalFormat::V7
                     || !(matches!(
                         obligation.state,
@@ -11394,6 +11435,40 @@ impl LsmStorageInner {
                 let mut version_bytes = [0; 6];
                 std::io::Read::read_exact(&mut file, &mut version_bytes)?;
                 let format_version = u16::from_be_bytes(version_bytes[4..6].try_into()?);
+                if format_version == crate::wal::format::WAL_FORMAT_VERSION_V8 {
+                    let mut bytes = [0; crate::wal::v8::WAL_V8_HEADER_LEN];
+                    std::io::Seek::seek(&mut file, std::io::SeekFrom::Start(0))?;
+                    std::io::Read::read_exact(&mut file, &mut bytes)?;
+                    let header = crate::wal::v8::codec::WalV8Header::decode(&bytes)?;
+                    let segment_id = header.segment_id.0;
+                    let expected_name = format!("pitr-{segment_id:020}.wal");
+                    ensure!(
+                        candidate.file_name().and_then(|name| name.to_str())
+                            == Some(expected_name.as_str()),
+                        "PITR WAL filename does not match its segment identity"
+                    );
+                    ensure!(
+                        pitr_state.active_segment_id != Some(segment_id),
+                        "v8 Active PITR WAL recovery is not enabled"
+                    );
+                    let obligation = pitr_state.obligations.get(&segment_id);
+                    ensure!(
+                        obligation.is_some_and(|obligation| {
+                            obligation.wal_format == crate::pitr::manifest::PitrWalFormat::V8
+                        }),
+                        "v8 PITR WAL format differs from its manifest obligation"
+                    );
+                    if obligation.is_some_and(|obligation| {
+                        obligation.state == crate::pitr::manifest::ObligationState::Reclaimable
+                    }) {
+                        continue;
+                    }
+                    ensure!(
+                        v8_pitr_sealed_sources.contains_key(&segment_id),
+                        "v8 PITR source is not covered by a durable Sealed obligation"
+                    );
+                    continue;
+                }
                 if format_version != crate::wal::format::WAL_FORMAT_VERSION_V7 {
                     continue;
                 }
@@ -11448,6 +11523,11 @@ impl LsmStorageInner {
                         let mut bytes = vec![0; crate::pitr::WAL_V5_HEADER_LEN];
                         std::io::Read::read_exact(&mut file, &mut bytes)?;
                         let format_version = u16::from_be_bytes(bytes[4..6].try_into()?);
+                        if format_version == crate::wal::format::WAL_FORMAT_VERSION_V8 {
+                            // The manifest-bound source scan above already validated
+                            // this v8 image. Keep it out of legacy v5 pairing.
+                            return Ok(None);
+                        }
                         if format_version == crate::wal::format::WAL_FORMAT_VERSION_V7 {
                             let header = crate::wal::v7::codec::WalV7Header::decode(&bytes)?;
                             let expected_name = format!("pitr-{:020}.wal", header.segment_id.0);
@@ -11584,11 +11664,16 @@ impl LsmStorageInner {
                     .filter(|id| !Self::path_of_wal_static(path, *id).exists())
                     .collect::<Vec<_>>();
                 let mut selected_v7 = BTreeMap::new();
+                let mut selected_v8 = BTreeMap::new();
                 for id in &missing_ids {
                     if let Some(segment_id) = pitr_memtable_segments.get(id)
                         && let Some((wal_path, seal)) = v7_pitr_sealed_sources.get(segment_id)
                     {
                         selected_v7.insert(*id, (*segment_id, wal_path.clone(), seal.clone()));
+                    } else if let Some(segment_id) = pitr_memtable_segments.get(id)
+                        && let Some((wal_path, seal)) = v8_pitr_sealed_sources.get(segment_id)
+                    {
+                        selected_v8.insert(*id, (*segment_id, wal_path.clone(), seal.clone()));
                     }
                 }
                 // A memtable whose WAL is gone cannot be recovered from anything
@@ -11619,6 +11704,7 @@ impl LsmStorageInner {
                     needs_manifest_upgrade = true;
                 }
                 selected_v7.retain(|id, _| missing_ids.contains(id));
+                selected_v8.retain(|id, _| missing_ids.contains(id));
                 // A memtable the barrier froze into a segment that has since been
                 // reclaimed outlives its own WAL, and the record of it outlives
                 // the memtable. An *empty* memtable is dropped from the
@@ -11655,6 +11741,12 @@ impl LsmStorageInner {
                                                     && obligation.logical_length
                                                         == (crate::wal::v7::codec::WAL_V7_HEADER_LEN
                                                             + crate::wal::v7::codec::WAL_V7_FRAME_LEN)
+                                                            as u64)
+                                                || (obligation.wal_format
+                                                    == crate::pitr::manifest::PitrWalFormat::V8
+                                                    && obligation.logical_length
+                                                        == (crate::wal::v8::WAL_V8_HEADER_LEN
+                                                            + crate::wal::v8::codec::WAL_V8_FRAME_LEN)
                                                             as u64))
                                     },
                                 )
@@ -11680,10 +11772,11 @@ impl LsmStorageInner {
                     needs_manifest_upgrade = true;
                 }
                 selected_v7.retain(|id, _| missing_ids.contains(id));
+                selected_v8.retain(|id, _| missing_ids.contains(id));
                 let legacy_missing_ids = missing_ids
                     .iter()
                     .copied()
-                    .filter(|id| !selected_v7.contains_key(id))
+                    .filter(|id| !selected_v7.contains_key(id) && !selected_v8.contains_key(id))
                     .collect::<Vec<_>>();
                 ensure!(
                     legacy_missing_ids.len() <= pitr_wal_fallbacks.len(),
@@ -11702,6 +11795,12 @@ impl LsmStorageInner {
                 let mut unrecorded_ids = Vec::new();
                 let mut recorded_segments: BTreeMap<u64, usize> = BTreeMap::new();
                 for (&id, (segment_id, _, _)) in &selected_v7 {
+                    ensure!(
+                        recorded_segments.insert(*segment_id, id).is_none(),
+                        "two memtables record the same PITR segment {segment_id}"
+                    );
+                }
+                for (&id, (segment_id, _, _)) in &selected_v8 {
                     ensure!(
                         recorded_segments.insert(*segment_id, id).is_none(),
                         "two memtables record the same PITR segment {segment_id}"
@@ -11762,6 +11861,7 @@ impl LsmStorageInner {
                             selected_v7
                                 .get(id)
                                 .map(|(segment_id, ..)| *segment_id)
+                                .or_else(|| selected_v8.get(id).map(|(segment_id, ..)| *segment_id))
                                 .or_else(|| selected.get(id).map(|(segment_id, ..)| *segment_id))
                         })
                         .is_sorted(),
@@ -11784,6 +11884,7 @@ impl LsmStorageInner {
                     .values()
                     .map(|(segment_id, ..)| *segment_id)
                     .chain(selected_v7.values().map(|(segment_id, ..)| *segment_id))
+                    .chain(selected_v8.values().map(|(segment_id, ..)| *segment_id))
                     .chain(recovered_v7_active_segment_id)
                     .max();
                 let unowned = newest_claimed.map_or(0, |newest| newest + 1);
@@ -11809,6 +11910,7 @@ impl LsmStorageInner {
                     .values()
                     .map(|(segment_id, ..)| *segment_id)
                     .chain(selected_v7.values().map(|(segment_id, ..)| *segment_id))
+                    .chain(selected_v8.values().map(|(segment_id, ..)| *segment_id))
                     .max();
                 if recovered_v7_active_segment_id.is_some() {
                     recovered_pitr_segment_id = recovered_v7_active_segment_id;
@@ -11856,6 +11958,15 @@ impl LsmStorageInner {
                     let (m, wal_max_ts, pitr_segment_id) =
                         if let Some((segment_id, wal_path, seal)) = selected_v7.remove(&id) {
                             let (memtable, max_ts) = MemTable::recover_from_v7_sealed(
+                                id,
+                                vlog_enabled,
+                                wal_path,
+                                &seal,
+                                crate::pitr::LIVE_WAL_V5_LIMITS,
+                            )?;
+                            (memtable, max_ts, Some(segment_id))
+                        } else if let Some((segment_id, wal_path, seal)) = selected_v8.remove(&id) {
+                            let (memtable, max_ts) = MemTable::recover_from_v8_sealed(
                                 id,
                                 vlog_enabled,
                                 wal_path,
@@ -11920,6 +12031,10 @@ impl LsmStorageInner {
                 ensure!(
                     selected_v7.is_empty(),
                     "unused v7 PITR WAL recovery mapping"
+                );
+                ensure!(
+                    selected_v8.is_empty(),
+                    "unused v8 PITR WAL recovery mapping"
                 );
             }
 
@@ -23442,6 +23557,27 @@ mod tests {
         let source_obligation = successor_state.obligations.get_mut(&segment_id).unwrap();
         source_obligation.state = ObligationState::Sealed;
         source_obligation.successor_segment_id = successor_id;
+
+        let mut unsupported_v8_boundary = successor_boundary.clone();
+        unsupported_v8_boundary.wal_format = PitrWalFormat::V8;
+        let mut unsupported_v8_state = successor_state.clone();
+        unsupported_v8_state.active_boundary = Some(unsupported_v8_boundary.clone());
+        let unsupported_v8_error = LsmStorageInner::recreate_missing_sealed_v7_successor(
+            &database,
+            &unsupported_v8_state,
+            unsupported_v8_boundary,
+        )
+        .expect_err("v8 Active boundaries must not enter the v7 successor installer");
+        assert!(
+            unsupported_v8_error
+                .to_string()
+                .contains("Active v8 PITR WAL recovery is not enabled")
+        );
+        assert!(
+            !successor_path.exists(),
+            "rejecting an unsupported Active v8 boundary must not create a v7 image"
+        );
+
         let v8_validation_buffer_bytes =
             V8Seal::validation_memory_bytes(sealed_end, active.ticket_end)?;
         let (retained, validation_workspace, _) =
@@ -23611,6 +23747,316 @@ mod tests {
         assert!(!successor_path.exists());
         assert!(engine.load_pitr_source_segment(&state, segment_id).is_err());
         engine.close_storage()?;
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn startup_recovers_manifest_bound_sealed_v8_memtables() -> anyhow::Result<()> {
+        use crate::{
+            manifest::{Manifest, ManifestRecord},
+            pitr::{
+                ArchiveEpochId, CanonicalWalEntryStream, ChainAnchor, CommitTimeHighWater,
+                RecordedAt, SegmentAnchor, SegmentId, TimelineId, WalBatch, WalEntry,
+                commit_time_entry_digest,
+                manifest::{
+                    ActiveBoundary, ImmutableBoundary, PersistedChainAnchor, PersistedCommitAnchor,
+                    PersistedPitrConfig, PersistedRecordedAt, PitrManifestRecord, PitrWalFormat,
+                },
+                seal::{V8Seal, V8SealEntry},
+            },
+            wal::{
+                WalIoMode,
+                v7::{
+                    codec::{WAL_V7_HEADER_LEN, WalV7Header},
+                    install::create_empty_active_image,
+                },
+                v8::{
+                    WAL_V8_HEADER_LEN,
+                    codec::{
+                        WAL_V8_FRAME_LEN, WalV8DataFragmentHeader, WalV8Frontier, WalV8Header,
+                        WalV8LogicalBatchHeader, data_fragment_count, decode_frame_structural,
+                        encode_data_frame, encode_frontier_successor,
+                        encode_generation_zero_frontier, frame_record_digest,
+                    },
+                    digest::{self, WalV8EntryHasher},
+                },
+            },
+        };
+        use sha2::{Digest, Sha256};
+
+        let directory = tempfile::tempdir()?;
+        let database = directory.path().join("db");
+        let bootstrap = KvEngine::open(&database, LsmStorageOptions::default_for_test())?;
+        bootstrap.close_storage()?;
+        drop(bootstrap);
+
+        let timeline_id = [0x31; 16];
+        let archive_epoch_id = [0x32; 16];
+        let repository_id = [0x33; 16];
+        let source_segment_id = 41;
+        let successor_segment_id = source_segment_id + 1;
+        let recorded_at = RecordedAt {
+            secs: 1_800_000_000,
+            nanos: 123,
+        };
+        let source_header = WalV8Header {
+            timeline_id: TimelineId(timeline_id),
+            archive_epoch_id: ArchiveEpochId(archive_epoch_id),
+            segment_id: SegmentId(source_segment_id),
+            predecessor: ChainAnchor::Genesis {
+                archive_epoch_id: ArchiveEpochId(archive_epoch_id),
+            },
+            incarnation: [0x34; 16],
+        };
+        let source_header_bytes = source_header.encode()?;
+        let physical_header_digest = source_header.physical_digest()?;
+        let initial_prefix_digest = source_header.initial_prefix_digest()?;
+        let generation_zero_frame =
+            encode_generation_zero_frontier(physical_header_digest, initial_prefix_digest)?;
+        let generation_zero_digest = frame_record_digest(&generation_zero_frame)?;
+        let generation_zero = WalV8Frontier::decode_body(
+            &decode_frame_structural(
+                &generation_zero_frame,
+                WAL_V8_HEADER_LEN as u64,
+                &physical_header_digest,
+                &initial_prefix_digest,
+            )?
+            .body,
+        )?;
+
+        let batch = WalBatch {
+            commit_ts: 1,
+            recorded_at,
+            entries: vec![WalEntry::Put {
+                key: b"v8-key".to_vec(),
+                value: vec![crate::vlog::KvKind::Inline as u8, b'v'],
+            }],
+        };
+        let limits = crate::pitr::LIVE_WAL_V5_LIMITS;
+        let entry_stream = CanonicalWalEntryStream::new(&batch, limits)?;
+        let mut entry_bytes = vec![0; entry_stream.data_len()];
+        let (written, entry_crc) = entry_stream.encode_into(&mut entry_bytes)?;
+        anyhow::ensure!(written == entry_bytes.len(), "v8 test entry length changed");
+        let logical_header = WalV8LogicalBatchHeader {
+            segment_ticket: 0,
+            commit_ts: batch.commit_ts,
+            recorded_at_secs: recorded_at.secs,
+            recorded_at_nanos: recorded_at.nanos,
+            entry_count: entry_stream.entry_count(),
+        }
+        .encode_with_data_crc(written, entry_crc, limits)?;
+        let mut logical_batch = Vec::with_capacity(logical_header.len() + entry_bytes.len());
+        logical_batch.extend_from_slice(&logical_header);
+        logical_batch.extend_from_slice(&entry_bytes);
+        let mut entry_hasher = WalV8EntryHasher::new(u64::try_from(entry_bytes.len())?);
+        entry_hasher.update(&entry_bytes)?;
+        let batch_digest = digest::batch_digest(&logical_header, &entry_hasher.finish()?);
+        let logical_batch_len = u64::try_from(logical_batch.len())?;
+        let prefix_digest =
+            digest::advance_prefix(&initial_prefix_digest, 0, logical_batch_len, &batch_digest);
+
+        let first_data_offset = (WAL_V8_HEADER_LEN + WAL_V8_FRAME_LEN) as u64;
+        let fragment_count = data_fragment_count(logical_batch_len)
+            .ok_or_else(|| anyhow::anyhow!("invalid v8 test fragment count"))?;
+        let fragment = WalV8DataFragmentHeader {
+            segment_ticket: 0,
+            fragment_index: 0,
+            fragment_count,
+            batch_bytes: logical_batch_len,
+        };
+        let data_body = fragment.encode_body(&logical_batch)?;
+        let data_frame = encode_data_frame(
+            physical_header_digest,
+            initial_prefix_digest,
+            first_data_offset,
+            &data_body,
+        )?;
+        let terminal_frontier_offset = first_data_offset + WAL_V8_FRAME_LEN as u64;
+        let terminal_frontier = WalV8Frontier {
+            generation: 1,
+            ticket_end: 1,
+            durable_end: terminal_frontier_offset,
+            last_commit_ts: batch.commit_ts,
+            prefix_digest,
+            previous_frontier_offset: WAL_V8_HEADER_LEN as u64,
+            previous_frontier_digest: generation_zero_digest,
+        };
+        let terminal_frontier_frame = encode_frontier_successor(
+            terminal_frontier,
+            generation_zero,
+            WAL_V8_HEADER_LEN as u64,
+            &generation_zero_digest,
+            terminal_frontier_offset,
+            physical_header_digest,
+            initial_prefix_digest,
+        )?;
+        let mut source_wal_bytes = Vec::new();
+        source_wal_bytes.extend_from_slice(&source_header_bytes);
+        source_wal_bytes.extend_from_slice(&generation_zero_frame);
+        source_wal_bytes.extend_from_slice(&data_frame);
+        source_wal_bytes.extend_from_slice(&terminal_frontier_frame);
+        let source_sealed_end = u64::try_from(source_wal_bytes.len())?;
+        let source_boundary = ImmutableBoundary {
+            active: ActiveBoundary {
+                timeline_id,
+                archive_epoch_id,
+                segment_id: source_segment_id,
+                incarnation: source_header.incarnation,
+                wal_format: PitrWalFormat::V8,
+                ticket_end: 1,
+                durable_end: terminal_frontier_offset,
+                last_commit_ts: batch.commit_ts,
+                prefix_digest,
+            },
+            sealed_end: source_sealed_end,
+            terminal_frontier_digest: frame_record_digest(&terminal_frontier_frame)?,
+            wal_digest: Sha256::digest(&source_wal_bytes).into(),
+        };
+        let source_seal = V8Seal {
+            header: source_header,
+            boundary: source_boundary,
+            entries: vec![V8SealEntry {
+                ticket: 0,
+                first_data_offset,
+                commit_ts: batch.commit_ts,
+                recorded_at,
+            }],
+        };
+        let source_seal_bytes = source_seal.encode()?;
+        let source_wal_path = database.join(format!("pitr-{source_segment_id:020}.wal"));
+        std::fs::write(&source_wal_path, &source_wal_bytes)?;
+        std::fs::write(source_wal_path.with_extension("seal"), &source_seal_bytes)?;
+
+        let successor_predecessor = SegmentAnchor {
+            segment_id: SegmentId(source_segment_id),
+            wal_digest: source_boundary.wal_digest,
+            seal_digest: Sha256::digest(&source_seal_bytes).into(),
+        };
+        let successor_header = WalV7Header {
+            timeline_id: TimelineId(timeline_id),
+            archive_epoch_id: ArchiveEpochId(archive_epoch_id),
+            segment_id: SegmentId(successor_segment_id),
+            predecessor: ChainAnchor::Segment(successor_predecessor),
+            incarnation: [0x35; 16],
+        };
+        let successor_active_boundary = ActiveBoundary {
+            timeline_id,
+            archive_epoch_id,
+            segment_id: successor_segment_id,
+            incarnation: successor_header.incarnation,
+            wal_format: PitrWalFormat::V7,
+            ticket_end: 0,
+            durable_end: WAL_V7_HEADER_LEN as u64,
+            last_commit_ts: 0,
+            prefix_digest: successor_header.digest()?,
+        };
+        let successor_wal_path = database.join(format!("pitr-{successor_segment_id:020}.wal"));
+        create_empty_active_image(&successor_wal_path, successor_header)?;
+
+        let last_recorded_at = PersistedRecordedAt {
+            secs: recorded_at.secs,
+            nanos: recorded_at.nanos,
+        };
+        let last_commit_anchor = PersistedCommitAnchor {
+            segment_id: source_segment_id,
+            commit_ts: batch.commit_ts,
+            recorded_at: last_recorded_at,
+            entry_digest: commit_time_entry_digest(CommitTimeHighWater {
+                archive_epoch_id: ArchiveEpochId(archive_epoch_id),
+                segment_id: SegmentId(source_segment_id),
+                commit_ts: batch.commit_ts,
+                recorded_at,
+                entry_digest: [0; 32],
+            }),
+        };
+        let records = [
+            ManifestRecord::Pitr(PitrManifestRecord::EnableIntent {
+                repository_id,
+                timeline_id,
+                archive_epoch_id,
+                config: PersistedPitrConfig {
+                    archive_interval_ms: 1_000,
+                    max_segment_bytes: 64 * 1024,
+                    max_unarchived_bytes: 128 * 1024,
+                    max_source_spool_bytes: 256 * 1024,
+                },
+            }),
+            ManifestRecord::Pitr(PitrManifestRecord::EnableComplete {
+                active_segment_id: source_segment_id,
+            }),
+            ManifestRecord::Pitr(PitrManifestRecord::ActiveBoundaryAdvanced {
+                boundary: ActiveBoundary {
+                    timeline_id,
+                    archive_epoch_id,
+                    segment_id: source_segment_id,
+                    incarnation: source_header.incarnation,
+                    wal_format: PitrWalFormat::V8,
+                    ticket_end: 0,
+                    durable_end: WAL_V8_HEADER_LEN as u64,
+                    last_commit_ts: 0,
+                    prefix_digest: initial_prefix_digest,
+                },
+            }),
+            ManifestRecord::Pitr(PitrManifestRecord::ActiveBoundaryAdvanced {
+                boundary: source_boundary.active,
+            }),
+            ManifestRecord::NewPitrMemtable {
+                id: 50,
+                segment_id: source_segment_id,
+            },
+            ManifestRecord::Pitr(PitrManifestRecord::SealStarted {
+                segment_id: source_segment_id,
+                successor_segment_id,
+                logical_length: source_sealed_end,
+                immutable_boundary: Some(source_boundary),
+            }),
+            ManifestRecord::Pitr(PitrManifestRecord::SegmentSealed {
+                segment_id: source_segment_id,
+                segment_anchor: PersistedChainAnchor::Segment {
+                    segment_id: source_segment_id,
+                    wal_digest: source_boundary.wal_digest,
+                    seal_digest: successor_predecessor.seal_digest,
+                },
+                last_recorded_at: Some(last_recorded_at),
+                last_commit_anchor: Some(last_commit_anchor),
+                successor_active_boundary: Some(successor_active_boundary),
+            }),
+            ManifestRecord::NewPitrMemtable {
+                id: 51,
+                segment_id: successor_segment_id,
+            },
+        ];
+        Manifest::recover(database.join("MANIFEST"))?
+            .0
+            .add_records_when_init(&records)?;
+
+        let mut options = LsmStorageOptions::default_for_test();
+        options.enable_wal = true;
+        options.pitr_repository = None;
+        let engine = KvEngine::open_with_wal_io_mode(&database, options, WalIoMode::Leader)?;
+        assert_eq!(
+            engine.get(b"v8-key")?,
+            Some(bytes::Bytes::from_static(b"v"))
+        );
+        let state = engine.inner.state.load();
+        let source = state
+            .imm_memtables
+            .iter()
+            .find(|memtable| memtable.wal_path() == Some(source_wal_path.as_path()))
+            .ok_or_else(|| anyhow::anyhow!("sealed v8 source memtable was not recovered"))?;
+        assert!(source.uses_pitr_batch_wal());
+        assert!(!source.uses_v7_wal());
+        assert_eq!(
+            source.wal_format_version(),
+            Some(crate::wal::format::WAL_FORMAT_VERSION_V8)
+        );
+        assert_eq!(
+            engine.inner.state.load().memtable.wal_format_version(),
+            Some(crate::wal::format::WAL_FORMAT_VERSION_V7)
+        );
+        engine.close_storage()?;
+
         Ok(())
     }
 
