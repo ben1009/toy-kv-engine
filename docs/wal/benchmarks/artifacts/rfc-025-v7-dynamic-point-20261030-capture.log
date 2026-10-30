@@ -1,0 +1,31 @@
+START ext4-point1
+ext4-point1 warmup 0 retained-v7 clean_sampled
+ext4-point1 warmup 0 candidate-v7 clean_sampled
+ext4-point1 scored 1 candidate-v7 clean_sampled
+ext4-point1 scored 1 retained-v7 clean_sampled
+ext4-point1 scored 2 retained-v7 clean_sampled
+ext4-point1 scored 2 candidate-v7 clean_sampled
+ext4-point1 scored 3 candidate-v7 clean_sampled
+ext4-point1 scored 3 retained-v7 clean_sampled
+FINISH ext4-point1
+START ext4-point8
+ext4-point8 warmup 0 retained-v7 clean_sampled
+ext4-point8 warmup 0 candidate-v7 clean_sampled
+ext4-point8 scored 1 retained-v7 clean_sampled
+ext4-point8 scored 1 candidate-v7 clean_sampled
+ext4-point8 scored 2 candidate-v7 clean_sampled
+ext4-point8 scored 2 retained-v7 clean_sampled
+ext4-point8 scored 3 retained-v7 clean_sampled
+ext4-point8 scored 3 candidate-v7 clean_sampled
+FINISH ext4-point8
+START ext4-point16
+ext4-point16 warmup 0 retained-v7 clean_sampled
+ext4-point16 warmup 0 candidate-v7 clean_sampled
+ext4-point16 scored 1 candidate-v7 clean_sampled
+ext4-point16 scored 1 retained-v7 clean_sampled
+ext4-point16 scored 2 retained-v7 clean_sampled
+ext4-point16 scored 2 candidate-v7 clean_sampled
+ext4-point16 scored 3 candidate-v7 clean_sampled
+ext4-point16 scored 3 retained-v7 clean_sampled
+FINISH ext4-point16
+CAPTURE COMPLETE

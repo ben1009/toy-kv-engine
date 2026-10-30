@@ -48,6 +48,7 @@ the retained and rejected experiments.
 - [RFC 025 admission-driven producer framing (not retained; batch grouping remains fragmented), 2026-10-29](benchmarks/rfc-025-v7-admission-grouping-20261029.md)
 - [RFC 025 admitted-ticket grouping (not retained; eight-writer SSD qualification inconclusive), 2026-10-29](benchmarks/rfc-025-v7-admitted-group-20261029.md)
 - [RFC 025 admitted-ticket SSD rerun (inconclusive; all writer counts under-sampled), 2026-10-29](benchmarks/rfc-025-v7-ssd-rerun-20261029.md)
+- [RFC 025 dynamic admitted-window grouping (experimental; performance unqualified), 2026-10-30](benchmarks/rfc-025-v7-dynamic-window-20261030.md)
 - [RFC 025 completion priority for small writes (not retained; independent p99 benefit fails to repeat), 2026-10-28](benchmarks/rfc-025-v7-small-completion-priority-20261028.md)
 - [RFC 025 ready-completion-first scheduling (not retained; batch p99 checks fail), 2026-10-28](benchmarks/rfc-025-v7-ready-completion-first-20261028.md)
 - [RFC 025 unused-suffix preparation after large DATA (not retained; extra writes fail SSD batch checks), 2026-10-28](benchmarks/rfc-025-v7-large-data-lookahead-20261028.md)
