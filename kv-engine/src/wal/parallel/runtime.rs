@@ -51,10 +51,10 @@ const NORMAL_ACTIVE_BUFFER_BUDGET: u64 = 64 * 1024 * 1024;
 const MAX_BUFFER_CAPACITY: u64 = 240 * 1024 * 1024;
 const WAL_HEADER_END: u64 = 4096;
 const PACKER_GROUP_MAX_TICKETS: usize = 8;
-// Preserve the admitted group snapshot while allowing slow producer framing
-// to fall back to an already-ready prefix. This is separate from WAL sync
-// coalescing and does not delay a group that has no unfinished producers.
+// Keep one fixed deadline while joining admitted producers. A shorter
+// opportunity applies when only one ready batch has a concurrent preparer.
 const V7_FRAME_JOIN_LIMIT: Duration = Duration::from_micros(100);
+const V7_SOLO_JOIN_LIMIT: Duration = Duration::from_micros(10);
 const EXTENT_INITIALIZATION_CHUNK: usize = 128 * 1024;
 #[repr(align(4096))]
 struct ExtentZeros([u8; EXTENT_INITIALIZATION_CHUNK]);
@@ -94,6 +94,33 @@ pub(crate) struct WalV7PreparedBatch {
     reservation: WalV7OwnedBatchReservation,
     fragment_count: u32,
     frame_bytes: usize,
+    preparation: WalV7PreparingBatch,
+}
+
+/// A hint that another producer may yet join an open group. This does not
+/// assign a ticket or participate in the WAL's ordering or durability rules.
+struct WalV7PreparingBatch {
+    count: Arc<AtomicU64>,
+}
+
+impl WalV7PreparingBatch {
+    fn new(count: &Arc<AtomicU64>) -> Result<Self> {
+        count
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+                value.checked_add(1)
+            })
+            .map_err(|_| anyhow!("v7 producer preparation count overflow"))?;
+        Ok(Self {
+            count: Arc::clone(count),
+        })
+    }
+}
+
+impl Drop for WalV7PreparingBatch {
+    fn drop(&mut self) {
+        let previous = self.count.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(previous > 0, "v7 producer preparation count underflow");
+    }
 }
 
 /// Coordinates and resource owner from which a parallel runtime begins admission.
@@ -773,6 +800,7 @@ struct RuntimeInner {
     admission: Mutex<AdmissionState>,
     v7_prefix_ready: Condvar,
     v7_frames_ready: Condvar,
+    v7_preparing_batches: Arc<AtomicU64>,
     packer_state: Mutex<PackerState>,
     packer_failures: Mutex<Option<Sender<GroupWriteResult>>>,
     packer_wake: Sender<bool>,
@@ -780,6 +808,8 @@ struct RuntimeInner {
     file_size_limit: std::sync::atomic::AtomicU64,
     #[cfg(test)]
     v7_frame_join_micros: AtomicU64,
+    #[cfg(test)]
+    v7_solo_join_micros: AtomicU64,
     #[cfg(test)]
     v7_group_wait_cutoff: AtomicU64,
     buffer_budget: Arc<BufferBudget>,
@@ -1207,6 +1237,7 @@ impl ParallelWalRuntime {
             }),
             v7_prefix_ready: Condvar::new(),
             v7_frames_ready: Condvar::new(),
+            v7_preparing_batches: Arc::new(AtomicU64::new(0)),
             packer_state: Mutex::new(PackerState {
                 next_ticket: start.next_ticket,
                 reserved_end: initial_file_end,
@@ -1220,6 +1251,8 @@ impl ParallelWalRuntime {
             file_size_limit: std::sync::atomic::AtomicU64::new(MAX_WAL_FILE_SIZE),
             #[cfg(test)]
             v7_frame_join_micros: AtomicU64::new(V7_FRAME_JOIN_LIMIT.as_micros() as u64),
+            #[cfg(test)]
+            v7_solo_join_micros: AtomicU64::new(V7_SOLO_JOIN_LIMIT.as_micros() as u64),
             #[cfg(test)]
             v7_group_wait_cutoff: AtomicU64::new(u64::MAX),
             buffer_budget,
@@ -1393,6 +1426,7 @@ impl ParallelWalRuntime {
         limits: WalV5Limits,
     ) -> Result<WalV7PreparedBatch> {
         ensure!(!batch.entries.is_empty(), "v7 WAL batch is empty");
+        let preparing = WalV7PreparingBatch::new(&self.inner.v7_preparing_batches)?;
         let limits = WalV5Limits {
             max_input_entry_count: limits
                 .max_input_entry_count
@@ -1465,6 +1499,7 @@ impl ParallelWalRuntime {
             reservation,
             fragment_count,
             frame_bytes,
+            preparation: preparing,
         })
     }
 
@@ -1496,6 +1531,7 @@ impl ParallelWalRuntime {
             buffer,
             fragment_count,
             frame_bytes,
+            preparation,
         } = prepared_batch;
 
         let (ticket, first_data_offset, frame_job) = {
@@ -1578,6 +1614,9 @@ impl ParallelWalRuntime {
                 aligned_len: frame_bytes,
                 commit_ts,
             });
+            // Under the admission lock the packer sees either a preparing
+            // producer or its admitted ticket, never a gap between them.
+            drop(preparation);
             let batch = AdmittedBatch {
                 ticket,
                 file_offset: first_data_offset,
@@ -1607,8 +1646,9 @@ impl ParallelWalRuntime {
             (ticket, first_data_offset, frame_job)
         };
 
-        // Admission, rather than producer completion, schedules the packer.
-        // The packer snapshots its group and waits for the admitted frames.
+        // A waiting group may extend as soon as this ticket is admitted,
+        // regardless of whether its producer has finished framing.
+        self.inner.v7_frames_ready.notify_all();
         let _ = self.inner.packer_wake.try_send(true);
         Ok((ticket, first_data_offset, frame_job))
     }
@@ -1875,6 +1915,7 @@ impl ParallelWalRuntime {
             admission.open = false;
             admission.next_ticket
         };
+        self.inner.v7_frames_ready.notify_all();
         self.inner.buffer_budget.close();
         let abandoned_ticket = {
             let mut admission = self.inner.admission.lock();
@@ -2055,8 +2096,7 @@ fn pack_admitted_groups(
         let packed_result = {
             let mut admission = inner.admission.lock();
             // Admission records membership independently from frame readiness.
-            // Wait for the head, then snapshot the admitted window. Once a
-            // prefix is ready, a slow successor can delay it only briefly.
+            // Wait for the head, then let the window grow within one deadline.
             let mut group_limit = PACKER_GROUP_MAX_TICKETS;
             if admission.v7_allocator.is_some() {
                 loop {
@@ -2072,44 +2112,64 @@ fn pack_admitted_groups(
                     inner.v7_frames_ready.wait(&mut admission);
                 }
                 if !admission.v7_admitted.is_empty() {
-                    group_limit = admission.v7_admitted.len().min(PACKER_GROUP_MAX_TICKETS);
-                    let first = admission
-                        .v7_admitted
-                        .front()
-                        .expect("admitted window is nonempty");
-                    let last = &admission.v7_admitted[group_limit - 1];
-                    let cutoff = last
-                        .ticket
-                        .checked_add(1)
-                        .context("v7 group cutoff overflow")?;
-                    ensure!(
-                        first.ticket == packer.next_ticket
-                            && cutoff == packer.next_ticket.saturating_add(group_limit as u64),
-                        "v7 admitted group window is not ticket contiguous"
-                    );
                     #[cfg(test)]
                     let join_limit =
                         Duration::from_micros(inner.v7_frame_join_micros.load(Ordering::Relaxed));
                     #[cfg(not(test))]
                     let join_limit = V7_FRAME_JOIN_LIMIT;
-                    let deadline = Instant::now() + join_limit;
                     #[cfg(test)]
-                    if admission.v7_ready_ticket < cutoff {
-                        inner.v7_group_wait_cutoff.store(cutoff, Ordering::Release);
-                    }
-                    while admission.v7_ready_ticket < cutoff {
-                        let healthy_cutoff = admission
-                            .poison
-                            .as_ref()
-                            .map_or(cutoff, |(ticket, _)| cutoff.min(*ticket));
-                        if admission.v7_ready_ticket >= healthy_cutoff
-                            || inner
-                                .v7_frames_ready
-                                .wait_until(&mut admission, deadline)
-                                .timed_out()
+                    let solo_limit =
+                        Duration::from_micros(inner.v7_solo_join_micros.load(Ordering::Relaxed));
+                    #[cfg(not(test))]
+                    let solo_limit = V7_SOLO_JOIN_LIMIT;
+                    let opened = Instant::now();
+                    let deadline = opened + join_limit;
+                    let solo_deadline = opened + solo_limit.min(join_limit);
+                    let mut timed_out = false;
+                    loop {
+                        // A failure can discard the whole window while the
+                        // condition wait has released the admission lock.
+                        if admission.v7_admitted.is_empty() {
+                            break;
+                        }
+                        group_limit = admission.v7_admitted.len().min(PACKER_GROUP_MAX_TICKETS);
+                        let first = admission
+                            .v7_admitted
+                            .front()
+                            .expect("admitted window is nonempty");
+                        let last = &admission.v7_admitted[group_limit - 1];
+                        let cutoff = last
+                            .ticket
+                            .checked_add(1)
+                            .context("v7 group cutoff overflow")?;
+                        ensure!(
+                            first.ticket == packer.next_ticket
+                                && cutoff == packer.next_ticket.saturating_add(group_limit as u64),
+                            "v7 admitted group window is not ticket contiguous"
+                        );
+                        let unfinished = admission.v7_ready_ticket < cutoff;
+                        let solo_join = group_limit == 1
+                            && inner.v7_preparing_batches.load(Ordering::Acquire) > 0;
+                        if timed_out
+                            || !admission.open
+                            || admission.poison.is_some()
+                            || group_limit == PACKER_GROUP_MAX_TICKETS
+                            || (!unfinished && !solo_join)
                         {
                             break;
                         }
+                        let wait_until = if unfinished { deadline } else { solo_deadline };
+                        if Instant::now() >= wait_until {
+                            break;
+                        }
+                        #[cfg(test)]
+                        inner.v7_group_wait_cutoff.store(cutoff, Ordering::Release);
+                        // Reinspect membership even on timeout: another
+                        // admission may have landed while reacquiring the lock.
+                        timed_out = inner
+                            .v7_frames_ready
+                            .wait_until(&mut admission, wait_until)
+                            .timed_out();
                     }
                     #[cfg(test)]
                     inner
@@ -4466,6 +4526,341 @@ mod tests {
             },
         )?;
         assert_eq!(recovered.installed.batches, batches);
+        Ok(())
+    }
+
+    #[test]
+    fn v7_group_window_extends_for_later_admissions() -> anyhow::Result<()> {
+        use crate::wal::v7::{
+            install::recover_and_install_active, recovery::WalV7RecoveryAuthority,
+        };
+
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("dynamic-admitted-window.wal");
+        let Some(V7RuntimeTestWal { wal, anchor, .. }) =
+            live_v7_test_wal(&path, super::MAX_WAL_FILE_SIZE, v7_test_resource_limits())?
+        else {
+            return Ok(());
+        };
+        #[cfg(feature = "bench")]
+        let profile = {
+            let profile = Arc::new(crate::mem_table::WriteProfile::default());
+            profile.set_wal_sync_diagnostics_enabled(true);
+            wal.set_write_profile(Arc::clone(&profile));
+            profile
+        };
+        let runtime = wal.parallel_runtime.as_ref().unwrap();
+        runtime
+            .inner
+            .v7_frame_join_micros
+            .store(10_000_000, std::sync::atomic::Ordering::Relaxed);
+        let packer = runtime.inner.packer_state.lock();
+        let batches = [
+            v7_test_batch(1, 60 * 1024),
+            v7_test_batch(2, 60 * 1024),
+            v7_test_batch(3, 60 * 1024),
+        ];
+        let (_, _, first_job) = wal.admit_v7_batch_with_index(&batches[0], LIVE_WAL_V5_LIMITS)?;
+        let (second, _, second_job) =
+            wal.admit_v7_batch_with_index(&batches[1], LIVE_WAL_V5_LIMITS)?;
+        first_job.expect("head has producer work").finish()?;
+        drop(packer);
+
+        let wait_for_cutoff = |expected| -> anyhow::Result<()> {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while runtime
+                .inner
+                .v7_group_wait_cutoff
+                .load(std::sync::atomic::Ordering::Acquire)
+                != expected
+            {
+                if std::time::Instant::now() >= deadline {
+                    anyhow::bail!("packer did not observe admitted cutoff {expected}");
+                }
+                std::thread::yield_now();
+            }
+            Ok(())
+        };
+        wait_for_cutoff(second + 1)?;
+        // The third admission occurs after the group has begun waiting.
+        let (third, _, third_job) =
+            wal.admit_v7_batch_with_index(&batches[2], LIVE_WAL_V5_LIMITS)?;
+        wait_for_cutoff(third + 1)?;
+        third_job.expect("third producer work").finish()?;
+        second_job.expect("second producer work").finish()?;
+        wal.submit_and_commit(third)?;
+        #[cfg(feature = "bench")]
+        {
+            let snapshot = profile.snapshot();
+            assert_eq!(snapshot.wal_commit_groups, 1);
+            assert_eq!(snapshot.wal_commit_buffers, 3);
+        }
+        wal.close()?;
+        drop(wal);
+        let recovered = recover_and_install_active(
+            &path,
+            WalV7RecoveryAuthority::Active {
+                predecessor: crate::pitr::ChainAnchor::Genesis {
+                    archive_epoch_id: crate::pitr::ArchiveEpochId(anchor.archive_epoch_id),
+                },
+                durable_anchors: vec![anchor],
+            },
+        )?;
+        assert_eq!(recovered.installed.batches, batches);
+        Ok(())
+    }
+
+    #[test]
+    fn v7_solo_group_joins_a_producer_already_preparing() -> anyhow::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("solo-group-preparing-producer.wal");
+        let Some(V7RuntimeTestWal { wal, .. }) =
+            live_v7_test_wal(&path, super::MAX_WAL_FILE_SIZE, v7_test_resource_limits())?
+        else {
+            return Ok(());
+        };
+        #[cfg(feature = "bench")]
+        let profile = {
+            let profile = Arc::new(crate::mem_table::WriteProfile::default());
+            profile.set_wal_sync_diagnostics_enabled(true);
+            wal.set_write_profile(Arc::clone(&profile));
+            profile
+        };
+        let runtime = wal.parallel_runtime.as_ref().unwrap();
+        runtime
+            .inner
+            .v7_frame_join_micros
+            .store(10_000_000, std::sync::atomic::Ordering::Relaxed);
+        runtime
+            .inner
+            .v7_solo_join_micros
+            .store(10_000_000, std::sync::atomic::Ordering::Relaxed);
+        let second_batch = v7_test_batch(2, 60 * 1024);
+        let second_prepared = runtime.prepare_v7_batch(&second_batch, LIVE_WAL_V5_LIMITS)?;
+        let (first, _, first_job) =
+            wal.admit_v7_batch_with_index(&v7_test_batch(1, 60 * 1024), LIVE_WAL_V5_LIMITS)?;
+        first_job.expect("head has producer work").finish()?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while runtime
+            .inner
+            .v7_group_wait_cutoff
+            .load(std::sync::atomic::Ordering::Acquire)
+            != first + 1
+        {
+            if std::time::Instant::now() >= deadline {
+                anyhow::bail!("solo group did not wait for its concurrent producer");
+            }
+            std::thread::yield_now();
+        }
+        let (second, _, second_job) = runtime.put_v7_prepared_batch(
+            second_prepared,
+            second_batch.commit_ts,
+            second_batch.recorded_at,
+        )?;
+        second_job.expect("second producer work").finish()?;
+        wal.submit_and_commit(second)?;
+        #[cfg(feature = "bench")]
+        {
+            let snapshot = profile.snapshot();
+            assert_eq!(snapshot.wal_commit_groups, 1);
+            assert_eq!(snapshot.wal_commit_buffers, 2);
+        }
+        wal.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn v7_lone_producer_does_not_wait_for_a_join() -> anyhow::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("lone-producer-no-join.wal");
+        let Some(V7RuntimeTestWal { wal, .. }) =
+            live_v7_test_wal(&path, super::MAX_WAL_FILE_SIZE, v7_test_resource_limits())?
+        else {
+            return Ok(());
+        };
+        let runtime = wal.parallel_runtime.as_ref().unwrap();
+        runtime
+            .inner
+            .v7_frame_join_micros
+            .store(10_000_000, std::sync::atomic::Ordering::Relaxed);
+        runtime
+            .inner
+            .v7_solo_join_micros
+            .store(10_000_000, std::sync::atomic::Ordering::Relaxed);
+        // Dropping an unadmitted preparation must not leave a false contender.
+        let abandoned =
+            runtime.prepare_v7_batch(&v7_test_batch(2, 60 * 1024), LIVE_WAL_V5_LIMITS)?;
+        drop(abandoned);
+        let started = std::time::Instant::now();
+        let (ticket, _, job) =
+            wal.admit_v7_batch_with_index(&v7_test_batch(1, 60 * 1024), LIVE_WAL_V5_LIMITS)?;
+        job.expect("head has producer work").finish()?;
+        wal.submit_and_commit(ticket)?;
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "a lone producer waited for the configured ten-second join"
+        );
+        wal.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn v7_full_admitted_window_does_not_block_a_ready_prefix() -> anyhow::Result<()> {
+        use crate::wal::v7::{
+            install::recover_and_install_active, recovery::WalV7RecoveryAuthority,
+        };
+        use anyhow::Context;
+
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("full-admitted-window.wal");
+        let Some(V7RuntimeTestWal { wal, anchor, .. }) =
+            live_v7_test_wal(&path, super::MAX_WAL_FILE_SIZE, v7_test_resource_limits())?
+        else {
+            return Ok(());
+        };
+        let runtime = wal.parallel_runtime.as_ref().unwrap();
+        runtime
+            .inner
+            .v7_frame_join_micros
+            .store(10_000_000, std::sync::atomic::Ordering::Relaxed);
+        let packer = runtime.inner.packer_state.lock();
+        let batches: Vec<_> = (1..=super::PACKER_GROUP_MAX_TICKETS)
+            .map(|commit_ts| v7_test_batch(commit_ts as u64, 60 * 1024))
+            .collect();
+        let mut tickets = Vec::new();
+        let mut jobs = Vec::new();
+        for batch in &batches {
+            let (ticket, _, job) = wal.admit_v7_batch_with_index(batch, LIVE_WAL_V5_LIMITS)?;
+            tickets.push(ticket);
+            jobs.push(job);
+        }
+        jobs[0].take().expect("head has producer work").finish()?;
+        drop(packer);
+
+        std::thread::scope(|scope| -> anyhow::Result<()> {
+            let (sender, receiver) = std::sync::mpsc::channel();
+            let first = tickets[0];
+            let wal_for_wait = &wal;
+            let waiter = scope.spawn(move || {
+                let _ = sender.send(
+                    wal_for_wait
+                        .submit_and_commit(first)
+                        .map_err(|error| format!("{error:#}")),
+                );
+            });
+            let result = receiver.recv_timeout(std::time::Duration::from_secs(5));
+            if result.is_err() {
+                // Releasing unfinished jobs poisons their tickets so a failed
+                // assertion cannot strand the scoped waiter.
+                jobs.clear();
+            }
+            result
+                .context("full window blocked its ready prefix")?
+                .map_err(anyhow::Error::msg)?;
+            waiter.join().expect("first ticket waiter panicked");
+            Ok(())
+        })?;
+        for job in jobs.into_iter().flatten() {
+            job.finish()?;
+        }
+        wal.submit_and_commit(*tickets.last().unwrap())?;
+        wal.close()?;
+        drop(wal);
+        let recovered = recover_and_install_active(
+            &path,
+            WalV7RecoveryAuthority::Active {
+                predecessor: crate::pitr::ChainAnchor::Genesis {
+                    archive_epoch_id: crate::pitr::ArchiveEpochId(anchor.archive_epoch_id),
+                },
+                durable_anchors: vec![anchor],
+            },
+        )?;
+        assert_eq!(recovered.installed.batches, batches);
+        Ok(())
+    }
+
+    #[test]
+    fn v7_close_wakes_an_open_solo_group() -> anyhow::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("close-open-solo-group.wal");
+        let Some(V7RuntimeTestWal { wal, .. }) =
+            live_v7_test_wal(&path, super::MAX_WAL_FILE_SIZE, v7_test_resource_limits())?
+        else {
+            return Ok(());
+        };
+        let runtime = wal.parallel_runtime.as_ref().unwrap();
+        runtime
+            .inner
+            .v7_frame_join_micros
+            .store(10_000_000, std::sync::atomic::Ordering::Relaxed);
+        runtime
+            .inner
+            .v7_solo_join_micros
+            .store(10_000_000, std::sync::atomic::Ordering::Relaxed);
+        let prepared =
+            runtime.prepare_v7_batch(&v7_test_batch(2, 60 * 1024), LIVE_WAL_V5_LIMITS)?;
+        let (first, _, first_job) =
+            wal.admit_v7_batch_with_index(&v7_test_batch(1, 60 * 1024), LIVE_WAL_V5_LIMITS)?;
+        first_job.expect("head has producer work").finish()?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while runtime
+            .inner
+            .v7_group_wait_cutoff
+            .load(std::sync::atomic::Ordering::Acquire)
+            != first + 1
+        {
+            if std::time::Instant::now() >= deadline {
+                anyhow::bail!("solo group did not begin waiting");
+            }
+            std::thread::yield_now();
+        }
+        let started = std::time::Instant::now();
+        wal.close()?;
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "close did not wake the open group"
+        );
+        drop(prepared);
+        Ok(())
+    }
+
+    #[test]
+    fn v7_group_wait_wakes_when_a_later_producer_is_poisoned() -> anyhow::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("dynamic-window-poison.wal");
+        let Some(V7RuntimeTestWal { wal, .. }) =
+            live_v7_test_wal(&path, super::MAX_WAL_FILE_SIZE, v7_test_resource_limits())?
+        else {
+            return Ok(());
+        };
+        let runtime = wal.parallel_runtime.as_ref().unwrap();
+        runtime
+            .inner
+            .v7_frame_join_micros
+            .store(10_000_000, std::sync::atomic::Ordering::Relaxed);
+        let packer = runtime.inner.packer_state.lock();
+        let (first, _, first_job) =
+            wal.admit_v7_batch_with_index(&v7_test_batch(1, 60 * 1024), LIVE_WAL_V5_LIMITS)?;
+        let (second, _, second_job) =
+            wal.admit_v7_batch_with_index(&v7_test_batch(2, 60 * 1024), LIVE_WAL_V5_LIMITS)?;
+        first_job.expect("head has producer work").finish()?;
+        drop(packer);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while runtime
+            .inner
+            .v7_group_wait_cutoff
+            .load(std::sync::atomic::Ordering::Acquire)
+            != second + 1
+        {
+            if std::time::Instant::now() >= deadline {
+                anyhow::bail!("packer did not wait for the second producer");
+            }
+            std::thread::yield_now();
+        }
+        drop(second_job);
+        wal.submit_and_commit(first)?;
+        assert!(wal.submit_and_commit(second).is_err());
+        assert!(wal.close().is_err());
         Ok(())
     }
 
