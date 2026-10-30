@@ -33,6 +33,7 @@ the retained and rejected experiments.
 ## Proposed extensions
 
 - [RFC 025: Parallel WAL with Embedded Frontiers and One Sync](../../rfcs/025-parallel-wal-embedded-frontiers.md)
+- [RFC 026: Composable WAL Prefix Digests](../../rfcs/026-composable-wal-prefix-digest.md)
 
 ## Benchmarks and qualification
 

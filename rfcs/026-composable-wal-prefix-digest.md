@@ -21,9 +21,13 @@ format-specific validation and a new logical digest definition.
 This is a proposal, not an implemented format, adoption decision, or claim of
 v4/v7 performance parity. In particular, it does not alter the digest of any
 existing v7 segment. V8 MUST support Parallel by default under RFC 025. Leader
-and Parallel MUST compute the same logical digest for the same header and
-ordered batches, and encode identical DATA frames at the same offsets. Their
-FRONTIER placement and frequency may differ with group formation.
+and Parallel MUST produce the same canonical logical batch bytes and logical
+prefix digests for the same header and ordered batch metadata and payloads.
+Their FRONTIER placement and frequency, and therefore physical DATA offsets,
+MAY differ with group formation. Each DATA frame MUST encode its actual offset
+and a valid frame CRC under RFC 025; offset fields and CRCs may consequently
+differ across schedules. Identical canonical DATA frame bytes are required
+when both the logical input and assigned physical offsets are identical.
 
 ## 2. Motivation and scope
 
@@ -273,10 +277,19 @@ Active recovery independently discovers aligned FRONTIER candidates as in RFC
 all retained control frames and their unique linear chain, canonical fragments,
 logical batch CRCs, contiguous tickets, commit timestamps and recorded times.
 It MUST recompute each `E_i` from the actual canonical `S_i`, compute `B_i`
-using the complete validated `Q_i`, fold the chain from `P_0`, and compare `P_T`
-with the candidate and every applicable hard anchor. Reassembly or streaming
-validation MUST produce identical results regardless of fragmentation or
-buffer size. An invalid or missing batch, wrong digest,
+using the complete validated `Q_i`, fold the chain from `P_0`, and compare the
+resulting `P_T` with the candidate FRONTIER at its exclusive `ticket_end = T`.
+For each applicable hard anchor bound to this segment at exclusive ticket end
+`U`, recovery MUST require `U <= T` and compare the recomputed `P_U` with that
+anchor's digest. Validate the anchor's identity, physical boundary and timestamp
+at its own boundary under RFC 025's anchor rules. A later candidate's `P_T`
+MUST NOT be compared with an earlier anchor's `P_U`. This check does not require
+a retained FRONTIER at `U`; recovery computes the intermediate prefix value
+while folding batches. Empty anchors use `P_0`, and every applicable anchor
+must be satisfied even when a later candidate is otherwise valid.
+
+Reassembly or streaming validation MUST produce identical results regardless
+of fragmentation or buffer size. An invalid or missing batch, wrong digest,
 reordered/duplicated/skipped ticket, or conflicting anchor rejects that
 candidate. Recovery MUST NOT trust a marker merely because its own CRC or
 predecessor chain is valid.
@@ -304,8 +317,8 @@ directory sync as required by RFC 025 before service. Normalization retains the
 same logical `P_T` and may change physical marker identity.
 
 An Active durable anchor binds segment identity/incarnation, format or digest
-scheme, exclusive ticket end, durable physical end, last commit timestamp, and
-`P_T`. The format may be obtained from an independently validated bound segment
+scheme, exclusive ticket end `U`, durable physical end, last commit timestamp,
+and `P_U`. The format may be obtained from an independently validated bound segment
 identity; any standalone persisted anchor that cannot derive it MUST encode it
 explicitly in a versioned record. It MUST NOT rely on an Active frontier offset,
 generation or frontier-record digest as its logical identity. Existing v7
@@ -381,7 +394,10 @@ the implementation plan MUST cover at least:
   recovery at field, entry, BLAKE3 chunk and DATA fragment boundaries. Mutate
   payload bytes while recomputing CRCs to ensure the cryptographic digest still
   rejects. Exercise empty and nonempty segments, canonical mixed operations,
-  and both Leader and Parallel writers.
+  and both Leader and Parallel writers. For the same WAL header and logical
+  inputs, exercise different FRONTIER schedules and DATA offsets: logical bytes and prefix
+  digests must match, and each physical frame must encode its own offset and
+  correct CRC. Require identical frame bytes when assigned offsets also match.
 - Deterministic out-of-order digest/DATA completion, failure and panic,
   cancellation, backpressure, lost-wakeup, close and resource-retirement tests.
   Pause a Parallel producer at the start of payload encoding and verify that
@@ -399,7 +415,11 @@ the implementation plan MUST cover at least:
   atomic rename and directory-sync failures, anchor relocation, malformed
   frontier forks, strict Sealing/Sealed/archive validation, checkpoint/backup
   and PITR restore across v5/v6/v7/v8 transitions. Unknown or incompatible
-  readers must fail before mutation. Exercise insufficient recovery workspace.
+  readers must fail before mutation. Validate candidates beyond multiple earlier
+  hard anchors, including boundaries without retained FRONTIERs, and candidates
+  at an anchor's exact boundary. Exercise empty anchors, an anchor beyond the
+  candidate, and an incorrect intermediate anchor digest despite a valid later
+  candidate digest. Exercise insufficient recovery workspace.
 - Predeclared, reproducible v7 Parallel versus v8 Parallel comparisons, with
   v8 Leader as a control and v4 Parallel as context. Cover point writes and
   batch sizes including 64, with 1, 2, 4, 8 and 16 writers on ext4 SSD; report
