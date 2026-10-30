@@ -5187,11 +5187,78 @@ impl KvEngine {
                     .map(|config| config.max_segment_bytes)
                     .ok_or_else(|| anyhow!("PITR v8 source has no persisted segment limit"))?;
                 let seal = crate::pitr::seal::V8Seal::decode(&bytes, max_segment_bytes)?;
+                if seal.header.segment_id.0 != segment_id {
+                    continue;
+                }
+                ensure!(selected.is_none(), "duplicate PITR source seal for segment");
+                let obligation = state
+                    .obligations
+                    .get(&segment_id)
+                    .ok_or_else(|| anyhow!("v8 PITR source has no manifest sealing obligation"))?;
                 ensure!(
-                    seal.header.segment_id.0 == segment_id,
-                    "sealed v8 PITR source filename does not match its segment ID"
+                    obligation.wal_format == crate::pitr::manifest::PitrWalFormat::V8
+                        && obligation.logical_length == seal.boundary.sealed_end
+                        && obligation.immutable_boundary == Some(seal.boundary),
+                    "v8 PITR source seal differs from its manifest sealing authority"
                 );
-                anyhow::bail!("v8 PITR source manifest verification is not implemented")
+
+                let wal_path = path.with_extension("wal");
+                let mut wal = File::open(&wal_path)
+                    .with_context(|| format!("open frozen v8 PITR WAL {}", wal_path.display()))?;
+                let wal_bytes = wal.metadata()?.len();
+                ensure!(
+                    wal_bytes == seal.boundary.sealed_end,
+                    "sealed v8 PITR source WAL length differs from its immutable boundary"
+                );
+                seal.verify_wal_from_reader(&mut wal, wal_bytes)?;
+
+                let repository_id = state
+                    .repository_id
+                    .ok_or_else(|| anyhow!("PITR repository identity is missing"))?;
+                let timeline_id = state
+                    .timeline_id
+                    .ok_or_else(|| anyhow!("PITR timeline identity is missing"))?;
+                let archive_epoch_id = state
+                    .archive_epoch_id
+                    .ok_or_else(|| anyhow!("PITR archive epoch identity is missing"))?;
+                ensure!(
+                    seal.header.timeline_id.0 == timeline_id
+                        && seal.header.archive_epoch_id.0 == archive_epoch_id,
+                    "sealed v8 PITR source identity mismatch"
+                );
+                let wal_digest = seal.boundary.wal_digest;
+                let seal_digest: [u8; 32] = sha2::Sha256::digest(&bytes).into();
+                let source_identity: [u8; 32] =
+                    sha2::Sha256::digest([wal_digest.as_slice(), seal_digest.as_slice()].concat())
+                        .into();
+                let metadata = crate::pitr::catalog::SegmentMetadata {
+                    key: crate::pitr::catalog::SegmentKey {
+                        repository_id,
+                        timeline_id: crate::pitr::TimelineId(timeline_id),
+                        archive_epoch_id: crate::pitr::ArchiveEpochId(archive_epoch_id),
+                        segment_id: crate::pitr::SegmentId(segment_id),
+                    },
+                    wal_format_version: crate::wal::format::WAL_FORMAT_VERSION_V8,
+                    seal_format_version: 3,
+                    immutable_boundary: Some(Box::new(seal.boundary)),
+                    anchor: crate::pitr::SegmentAnchor {
+                        segment_id: crate::pitr::SegmentId(segment_id),
+                        wal_digest,
+                        seal_digest,
+                    },
+                    predecessor: seal.header.predecessor,
+                    first_commit_ts: seal.entries.first().map(|entry| entry.commit_ts),
+                    last_commit_ts: seal.entries.last().map(|entry| entry.commit_ts),
+                    batch_count: u64::try_from(seal.entries.len())?,
+                    logical_bytes: seal.boundary.sealed_end,
+                    wal_bytes: seal.boundary.sealed_end,
+                    wal_digest,
+                    seal_digest,
+                    source_identity,
+                };
+                metadata.validate()?;
+                selected = Some((metadata, wal_path, path));
+                continue;
             }
 
             let seal = crate::pitr::seal::V5Seal::decode(&bytes)?;
@@ -22893,6 +22960,146 @@ mod tests {
             baseline_resources.source_spool_bytes,
             "reclaiming both the sidecar and pending successor releases their spool reservations"
         );
+        engine.close_storage()?;
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn v8_source_discovery_requires_manifest_authority_and_verifies_frozen_wal()
+    -> anyhow::Result<()> {
+        use crate::{
+            pitr::{
+                ArchiveEpochId, ChainAnchor, SegmentId, TimelineId,
+                manifest::{
+                    ActiveBoundary, ImmutableBoundary, ObligationState, PersistedChainAnchor,
+                    PersistedPitrConfig, PitrMode, PitrObligation, PitrState, PitrWalFormat,
+                },
+                seal::V8Seal,
+            },
+            wal::v8::{
+                WAL_V8_HEADER_LEN,
+                codec::{
+                    WAL_V8_FRAME_LEN, WalV8Header, encode_generation_zero_frontier,
+                    frame_record_digest,
+                },
+            },
+        };
+        use sha2::{Digest, Sha256};
+
+        let directory = tempfile::tempdir()?;
+        let database = directory.path().join("db");
+        let engine = KvEngine::open(&database, LsmStorageOptions::default())?;
+
+        let timeline_id = [3; 16];
+        let archive_epoch_id = [4; 16];
+        let repository_id = [5; 16];
+        let segment_id = 41;
+        let header = WalV8Header {
+            timeline_id: TimelineId(timeline_id),
+            archive_epoch_id: ArchiveEpochId(archive_epoch_id),
+            segment_id: SegmentId(segment_id),
+            predecessor: ChainAnchor::Genesis {
+                archive_epoch_id: ArchiveEpochId(archive_epoch_id),
+            },
+            incarnation: [6; 16],
+        };
+        let header_bytes = header.encode()?;
+        let initial_prefix_digest = header.initial_prefix_digest()?;
+        let generation_zero_frontier =
+            encode_generation_zero_frontier(header.physical_digest()?, initial_prefix_digest)?;
+        let sealed_end = u64::try_from(WAL_V8_HEADER_LEN + WAL_V8_FRAME_LEN)?;
+        let mut wal_bytes = Vec::with_capacity(usize::try_from(sealed_end)?);
+        wal_bytes.extend_from_slice(&header_bytes);
+        wal_bytes.extend_from_slice(&generation_zero_frontier);
+        let active = ActiveBoundary {
+            timeline_id,
+            archive_epoch_id,
+            segment_id,
+            incarnation: header.incarnation,
+            wal_format: PitrWalFormat::V8,
+            ticket_end: 0,
+            durable_end: WAL_V8_HEADER_LEN as u64,
+            last_commit_ts: 0,
+            prefix_digest: initial_prefix_digest,
+        };
+        let boundary = ImmutableBoundary {
+            active,
+            sealed_end,
+            terminal_frontier_digest: frame_record_digest(&generation_zero_frontier)?,
+            wal_digest: Sha256::digest(&wal_bytes).into(),
+        };
+        let seal = V8Seal {
+            header,
+            boundary,
+            entries: Vec::new(),
+        };
+        let seal_bytes = seal.encode()?;
+        let wal_path = database.join(format!("pitr-{segment_id:020}.wal"));
+        let seal_path = database.join(format!("pitr-{segment_id:020}.seal"));
+        std::fs::write(&wal_path, &wal_bytes)?;
+        std::fs::write(&seal_path, &seal_bytes)?;
+
+        let mut state = PitrState {
+            mode: PitrMode::Enabled,
+            database_timeline_id: Some(timeline_id),
+            repository_id: Some(repository_id),
+            timeline_id: Some(timeline_id),
+            archive_epoch_id: Some(archive_epoch_id),
+            config: Some(PersistedPitrConfig {
+                archive_interval_ms: 1_000,
+                max_segment_bytes: 64 * 1024,
+                max_unarchived_bytes: 128 * 1024,
+                max_source_spool_bytes: 256 * 1024,
+            }),
+            active_segment_id: Some(segment_id),
+            active_boundary: Some(active),
+            next_segment_id: segment_id + 2,
+            predecessor_anchor: Some(PersistedChainAnchor::Genesis { archive_epoch_id }),
+            ..PitrState::default()
+        };
+        state.obligations.insert(
+            segment_id,
+            PitrObligation {
+                state: ObligationState::Sealing,
+                successor_segment_id: segment_id + 1,
+                logical_length: sealed_end,
+                wal_format: PitrWalFormat::V8,
+                immutable_boundary: Some(boundary),
+                migration_successor_boundary: None,
+            },
+        );
+
+        let (metadata, loaded_wal_path, loaded_seal_path) =
+            engine.load_pitr_source_segment(&state, segment_id)?;
+        assert_eq!(loaded_wal_path, wal_path);
+        assert_eq!(loaded_seal_path, seal_path);
+        assert_eq!(
+            metadata.wal_format_version,
+            crate::wal::format::WAL_FORMAT_VERSION_V8
+        );
+        assert_eq!(metadata.seal_format_version, 3);
+        assert_eq!(metadata.immutable_boundary.as_deref(), Some(&boundary));
+        assert_eq!(metadata.batch_count, 0);
+
+        let mut wrong_authority = state.clone();
+        wrong_authority
+            .obligations
+            .get_mut(&segment_id)
+            .unwrap()
+            .immutable_boundary
+            .as_mut()
+            .unwrap()
+            .wal_digest[0] ^= 1;
+        assert!(
+            engine
+                .load_pitr_source_segment(&wrong_authority, segment_id)
+                .is_err()
+        );
+
+        wal_bytes[WAL_V8_HEADER_LEN + 80] ^= 1;
+        std::fs::write(&wal_path, &wal_bytes)?;
+        assert!(engine.load_pitr_source_segment(&state, segment_id).is_err());
         engine.close_storage()?;
         Ok(())
     }
