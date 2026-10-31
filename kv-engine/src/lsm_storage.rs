@@ -4003,7 +4003,9 @@ impl KvEngine {
 
             Err(error) => return Err(error),
         };
-        let repository_id = repository.ensure_pitr_repository_identity()?;
+        let repository_id = repository
+            .ensure_pitr_repository_identity()
+            .context("load PITR repository identity during resume")?;
         *self.pitr_repository_path.lock() = Some(options.repository.clone());
         crate::pitr::enable::PitrEnableCoordinator::request_from_public(options, repository_id)
     }
@@ -4055,7 +4057,9 @@ impl KvEngine {
         let archive_epoch_id = state
             .archive_epoch_id
             .ok_or_else(|| anyhow!("PITR archive epoch identity is missing"))?;
-        let has_base = repository.has_pitr_base(timeline_id, archive_epoch_id)?;
+        let has_base = repository
+            .has_pitr_base(timeline_id, archive_epoch_id)
+            .context("check for a PITR base during resume")?;
         drop(repository);
         *self.pitr_repository_path.lock() = Some(repository_path.clone());
         if state.mode == crate::pitr::manifest::PitrMode::Enabling {
@@ -4129,7 +4133,8 @@ impl KvEngine {
                     | crate::pitr::manifest::PitrMode::PublicationUncertain
             )
         {
-            self.resume_pitr_lifecycle(state.clone())?;
+            self.resume_pitr_lifecycle(state.clone())
+                .context("install PITR lifecycle during resume")?;
         }
         let controller = match self.pitr_runtime.lock().clone() {
             Some(controller) => controller,
@@ -4192,16 +4197,21 @@ impl KvEngine {
         } else {
             None
         };
-        let (mut state, mut migration_reservation) =
-            self.resume_v7_successor_install_with_reservation(state, None)?;
-        state = self.reconcile_durable_archive_obligations(state)?;
+        let (mut state, mut migration_reservation) = self
+            .resume_v7_successor_install_with_reservation(state, None)
+            .context("resume v7 successor installation")?;
+        state = self
+            .reconcile_durable_archive_obligations(state)
+            .context("reconcile PITR archive obligations during resume")?;
         if state.obligations.values().any(|obligation| {
             obligation.state == crate::pitr::manifest::ObligationState::Reclaimable
         }) {
             // The first pass makes newly archived sources durably Reclaimable.
             // Only then may cleanup unlink already-flushed sources and release
             // their spool/index quota before reporting a successful resume.
-            state = self.reconcile_durable_archive_obligations(state)?;
+            state = self
+                .reconcile_durable_archive_obligations(state)
+                .context("reconcile PITR reclamation during resume")?;
         }
         if migration_reservation.is_none()
             && let Some((migration_state, reservation)) =
@@ -4232,7 +4242,8 @@ impl KvEngine {
             ));
         }
         if state.mode == crate::pitr::manifest::PitrMode::Enabled && !has_base {
-            self.publish_pitr_base(&repository_path, false)?;
+            self.publish_pitr_base(&repository_path, false)
+                .context("publish PITR base during resume")?;
         }
         if state.mode == crate::pitr::manifest::PitrMode::Enabled
             && state.obligations.values().all(|obligation| {
@@ -23219,11 +23230,32 @@ mod tests {
                 seal_digest: source_anchor.seal_digest,
             })
         );
+        recovered.resume_pitr(directory.path().join("repository"))?;
+        recovered.put(b"successor", b"v2")?;
+        recovered.sync()?;
+        assert_eq!(
+            recovered.get(b"successor")?,
+            Some(Bytes::from_static(b"v2"))
+        );
+        let advanced_boundary = recovered
+            .pitr_manifest_state
+            .lock()
+            .active_boundary
+            .ok_or_else(|| anyhow::anyhow!("resumed v8 successor has no durable boundary"))?;
+        assert_eq!(advanced_boundary.segment_id, successor_segment_id);
+        assert_eq!(advanced_boundary.ticket_end, 1);
+        assert!(advanced_boundary.last_commit_ts > 0);
+        assert_eq!(
+            advanced_boundary.durable_end,
+            u64::try_from(
+                crate::wal::v8::WAL_V8_HEADER_LEN + 2 * crate::wal::v8::codec::WAL_V8_FRAME_LEN
+            )?
+        );
         assert!(successor_wal_path.exists());
         assert_eq!(
             std::fs::metadata(&successor_wal_path)?.len(),
             u64::try_from(
-                crate::wal::v8::WAL_V8_HEADER_LEN + crate::wal::v8::codec::WAL_V8_FRAME_LEN
+                crate::wal::v8::WAL_V8_HEADER_LEN + 3 * crate::wal::v8::codec::WAL_V8_FRAME_LEN
             )?
         );
         assert_eq!(

@@ -2450,20 +2450,30 @@ impl BackupRepository {
                     File::from(seal_fd),
                     Some(metadata.wal_bytes),
                 )?;
-                let (first_recorded_at, last_recorded_at) = if metadata.wal_format_version
-                    == crate::wal::format::WAL_FORMAT_VERSION_V7
-                {
-                    let seal = crate::pitr::archive::decode_v7_archive_seal(metadata, &seal_bytes)?;
-                    (
-                        seal.entries.first().map(|entry| entry.recorded_at),
-                        seal.entries.last().map(|entry| entry.recorded_at),
-                    )
-                } else {
-                    let seal = crate::pitr::seal::V5Seal::decode(&seal_bytes)?;
-                    (
-                        seal.entries.first().map(|entry| entry.recorded_at),
-                        seal.entries.last().map(|entry| entry.recorded_at),
-                    )
+                let (first_recorded_at, last_recorded_at) = match metadata.wal_format_version {
+                    crate::wal::format::WAL_FORMAT_VERSION_V7 => {
+                        let seal =
+                            crate::pitr::archive::decode_v7_archive_seal(metadata, &seal_bytes)?;
+                        (
+                            seal.entries.first().map(|entry| entry.recorded_at),
+                            seal.entries.last().map(|entry| entry.recorded_at),
+                        )
+                    }
+                    crate::wal::format::WAL_FORMAT_VERSION_V8 => {
+                        let seal =
+                            crate::pitr::archive::decode_v8_archive_seal(metadata, &seal_bytes)?;
+                        (
+                            seal.entries.first().map(|entry| entry.recorded_at),
+                            seal.entries.last().map(|entry| entry.recorded_at),
+                        )
+                    }
+                    _ => {
+                        let seal = crate::pitr::seal::V5Seal::decode(&seal_bytes)?;
+                        (
+                            seal.entries.first().map(|entry| entry.recorded_at),
+                            seal.entries.last().map(|entry| entry.recorded_at),
+                        )
+                    }
                 };
                 if let Some(first) = first_recorded_at {
                     let first = first.as_system_time()?;
