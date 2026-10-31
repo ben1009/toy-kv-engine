@@ -21849,8 +21849,11 @@ mod tests {
         reopened.close()?;
         drop(reopened);
 
-        let recovered =
-            KvEngine::open_with_wal_io_mode(&database, options, crate::wal::WalIoMode::Leader)?;
+        let recovered = KvEngine::open_with_wal_io_mode(
+            &database,
+            options.clone(),
+            crate::wal::WalIoMode::Leader,
+        )?;
         assert_eq!(
             recovered.get(b"before-v8-migration")?,
             Some(Bytes::from_static(b"value"))
@@ -21922,6 +21925,8 @@ mod tests {
         let intent = engine
             .publish_pitr_v8_migration_intent(&guards)?
             .ok_or_else(|| anyhow::anyhow!("exact-fit v8 migration intent was deferred"))?;
+        let successor_segment_id =
+            intent.state.obligations[&source_segment_id].successor_segment_id;
         drop(intent);
         drop(guards);
 
@@ -21945,8 +21950,12 @@ mod tests {
         engine.close_storage()?;
         drop(engine);
 
-        let reopened =
-            KvEngine::open_with_wal_io_mode(&database, options, crate::wal::WalIoMode::Leader)?;
+        let reopened = KvEngine::open_with_wal_io_mode(
+            &database,
+            options.clone(),
+            crate::wal::WalIoMode::Leader,
+        )?;
+        suspend_pitr_maintenance_for_test(&reopened);
         let active = reopened.inner.state.load().memtable.clone();
         let recovered_capacity = reopened
             .pitr_v8_migration_capacity_status(&reopened.pitr_manifest_state.lock(), &active)?
@@ -21968,15 +21977,41 @@ mod tests {
             reopened.pitr_manifest_state.lock().obligations[&source_segment_id].state,
             crate::pitr::manifest::ObligationState::Sealed
         );
-        reopened
+        reopened.close_storage()?;
+        drop(reopened);
+
+        let recovered = KvEngine::open_with_wal_io_mode(
+            &database,
+            options.clone(),
+            crate::wal::WalIoMode::Leader,
+        )?;
+        let active = recovered.inner.state.load().memtable.clone();
+        assert!(active.uses_v8_wal());
+        assert_eq!(
+            LsmStorageInner::pitr_segment_of(&active),
+            Some(successor_segment_id),
+            "startup must recreate the exact authorized successor after SegmentSealed"
+        );
+        recovered
             .resume_pitr(&repository)
             .map_err(|error| error.context("retry exact-fit v8 migration after SegmentSealed"))?;
-        assert!(reopened.inner.state.load().memtable.uses_v8_wal());
+        assert!(recovered.inner.state.load().memtable.uses_v8_wal());
         assert_eq!(
-            reopened.get(b"before-v8-migration")?,
+            recovered.get(b"before-v8-migration")?,
             Some(Bytes::from_static(b"value"))
         );
-        reopened.close_storage()?;
+        recovered.put(b"after-recovered-v8-migration", b"durable")?;
+        recovered.sync()?;
+        recovered.close_storage()?;
+        drop(recovered);
+
+        let final_reopen =
+            KvEngine::open_with_wal_io_mode(&database, options, crate::wal::WalIoMode::Leader)?;
+        assert_eq!(
+            final_reopen.get(b"after-recovered-v8-migration")?,
+            Some(Bytes::from_static(b"durable"))
+        );
+        final_reopen.close_storage()?;
 
         Ok(())
     }
