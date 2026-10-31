@@ -211,6 +211,33 @@ struct PitrV8MigrationReservation {
     _transition: crate::pitr::migration::V8MigrationTransitionReservation,
 }
 
+#[cfg(target_os = "linux")]
+fn unsupported_v7_to_v8_migration_source(
+    state: &crate::pitr::manifest::PitrState,
+    active_memtable_segment: Option<u64>,
+) -> Option<u64> {
+    use crate::pitr::manifest::{ObligationState, PitrWalFormat};
+
+    state
+        .obligations
+        .iter()
+        .find(|(source_segment_id, obligation)| {
+            let successor_is_v8 = obligation
+                .migration_successor_boundary
+                .is_some_and(|boundary| boundary.wal_format == PitrWalFormat::V8);
+            let source_still_installed = match obligation.state {
+                ObligationState::Sealing => state.active_segment_id == Some(**source_segment_id),
+                ObligationState::Sealed => active_memtable_segment == Some(**source_segment_id),
+                ObligationState::Archived
+                | ObligationState::Reclaimable
+                | ObligationState::Abandoned => false,
+            };
+
+            obligation.wal_format == PitrWalFormat::V7 && successor_is_v8 && source_still_installed
+        })
+        .map(|(source_segment_id, _)| *source_segment_id)
+}
+
 struct BatchGetContext<'a> {
     bloom_hashes: Vec<u32>,
     sorted_keys: Vec<(usize, &'a [u8])>,
@@ -4722,6 +4749,16 @@ impl KvEngine {
         Option<PitrV7MigrationReservation>,
     )> {
         use crate::pitr::manifest::{ObligationState, PitrWalFormat};
+
+        let active_memtable_segment =
+            LsmStorageInner::pitr_segment_of(&self.inner.state.load().memtable);
+        if let Some(source_segment_id) =
+            unsupported_v7_to_v8_migration_source(&state, active_memtable_segment)
+        {
+            anyhow::bail!(
+                "cannot resume v7-to-v8 PITR migration for source segment {source_segment_id}: migration execution is disabled until its compatibility and capacity gates are connected"
+            );
+        }
 
         let sequencer = self
             .inner
@@ -20899,13 +20936,80 @@ mod tests {
 
     use super::{
         DELETE_ONLY_KEY_BATCH_MIN_ENTRIES, KvEngine, LsmStorageInner, LsmStorageOptions,
-        WriteBatchRecord,
+        WriteBatchRecord, unsupported_v7_to_v8_migration_source,
     };
 
     fn delete_records(count: usize) -> Vec<WriteBatchRecord<Vec<u8>>> {
         (0..count)
             .map(|idx| WriteBatchRecord::Del(format!("k{idx:04}").into_bytes()))
             .collect()
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unsupported_v7_to_v8_resume_is_detected_only_while_source_is_installed() {
+        use crate::pitr::manifest::{
+            ActiveBoundary, ObligationState, PitrObligation, PitrState, PitrWalFormat,
+        };
+
+        fn state(obligation_state: ObligationState, migration: bool) -> PitrState {
+            let source_segment_id = 7;
+            let successor_segment_id = 8;
+            let mut state = PitrState {
+                active_segment_id: Some(match obligation_state {
+                    ObligationState::Sealing => source_segment_id,
+                    ObligationState::Sealed => successor_segment_id,
+                    ObligationState::Archived
+                    | ObligationState::Reclaimable
+                    | ObligationState::Abandoned => successor_segment_id,
+                }),
+                ..PitrState::default()
+            };
+            state.obligations.insert(
+                source_segment_id,
+                PitrObligation {
+                    state: obligation_state,
+                    successor_segment_id,
+                    logical_length: 8192,
+                    wal_format: PitrWalFormat::V7,
+                    immutable_boundary: None,
+                    migration_successor_boundary: migration.then_some(ActiveBoundary {
+                        timeline_id: [1; 16],
+                        archive_epoch_id: [2; 16],
+                        segment_id: successor_segment_id,
+                        incarnation: [3; 16],
+                        wal_format: PitrWalFormat::V8,
+                        ticket_end: 0,
+                        durable_end: 4096,
+                        last_commit_ts: 0,
+                        prefix_digest: [4; 32],
+                    }),
+                },
+            );
+            state
+        }
+
+        let sealing = state(ObligationState::Sealing, true);
+        assert_eq!(
+            unsupported_v7_to_v8_migration_source(&sealing, Some(7)),
+            Some(7)
+        );
+
+        let sealed_source_still_installed = state(ObligationState::Sealed, true);
+        assert_eq!(
+            unsupported_v7_to_v8_migration_source(&sealed_source_still_installed, Some(7)),
+            Some(7)
+        );
+        assert_eq!(
+            unsupported_v7_to_v8_migration_source(&sealed_source_still_installed, Some(8)),
+            None
+        );
+
+        let ordinary_v7_rotation = state(ObligationState::Sealing, false);
+        assert_eq!(
+            unsupported_v7_to_v8_migration_source(&ordinary_v7_rotation, Some(7)),
+            None
+        );
     }
 
     #[cfg(target_os = "linux")]
