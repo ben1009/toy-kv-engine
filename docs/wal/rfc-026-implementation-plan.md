@@ -164,7 +164,12 @@ remain unqualified, so v8 creation stays disabled.
    read-only v7-to-v8 capacity estimate only for a settled Active v7 boundary
    that matches the on-disk WAL header, including retained source allocations,
    growth allowance to the configured segment limit, and rounded transition
-   workspace; this estimate does not reserve capacity or enable v8 creation. Active recovery
+   workspace; this estimate does not reserve capacity or enable v8 creation. A
+   matching reservation primitive now atomically books reconstructed retained
+   source charges and transition source-spool/recovery-workspace charges; a
+   stale or deferred estimate leaves the ledger unchanged. The primitive is
+   not yet connected to migration intent publication, so migration execution
+   remains disabled. Active recovery
    normalization is tested with repeated process
    interruption after temp-image write, temp sync, rename, and directory sync;
    retries preserve the hard anchor. Returned errors before sync, rename, and

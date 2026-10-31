@@ -1,11 +1,11 @@
-//! Capacity decisions for migrating a legacy PITR epoch to v7.
+//! Capacity decisions and owned reservations for PITR WAL format migrations.
 //!
 //! This module estimates the transition's source-spool requirement, including
 //! the next v7 seal/rotation headroom. The caller must provide the reconstructed
 //! allocation charge for every existing obligation, pin, orphan, and staging
-//! file, plus the recovered legacy Active WAL image length. The capacity result
-//! can be atomically acquired from the live v7 resource ledger as an owned
-//! reservation before publishing durable intent.
+//! file, plus the recovered Active WAL image length. V7 and v8 migration
+//! capacity results can be atomically acquired from the live v7 resource ledger
+//! as owned reservations before publishing durable intent.
 
 use anyhow::{Result, ensure};
 use std::{error::Error, fmt};
@@ -174,6 +174,50 @@ pub(crate) struct V7MigrationTransitionReservation {
     _reservation: WalV7Reservation,
 }
 
+/// Failure to acquire the whole v7-to-v8 migration charge from the live
+/// resource ledger.
+#[derive(Debug)]
+pub(crate) enum V8MigrationReservationError {
+    Deferred(V8MigrationDeferralReason),
+    InvalidAssessment,
+    Ledger(WalV7ReservationError),
+}
+
+impl fmt::Display for V8MigrationReservationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Deferred(reason) => {
+                write!(formatter, "PITR v8 migration is deferred: {reason:?}")
+            }
+            Self::InvalidAssessment => {
+                formatter.write_str("invalid PITR v8 migration capacity assessment")
+            }
+            Self::Ledger(error) => write!(
+                formatter,
+                "could not reserve PITR v8 migration capacity: {error}"
+            ),
+        }
+    }
+}
+
+impl Error for V8MigrationReservationError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Ledger(error) => Some(error),
+            Self::Deferred(_) | Self::InvalidAssessment => None,
+        }
+    }
+}
+
+/// Owns the complete transition headroom for a v7-to-v8 migration. The caller
+/// must retain this guard through intent publication, sealing, successor
+/// installation and durable cleanup.
+#[must_use = "retain the migration reservation through v8 successor installation and cleanup"]
+#[derive(Debug)]
+pub(crate) struct V8MigrationTransitionReservation {
+    _reservation: WalV7Reservation,
+}
+
 /// Atomically reserve the capacity represented by a successful preflight.
 ///
 /// The assessment is a snapshot and may become stale while other work reserves
@@ -222,6 +266,54 @@ pub(crate) fn reserve_v7_migration_transition(
         .map_err(V7MigrationReservationError::Ledger)?;
 
     Ok(V7MigrationTransitionReservation {
+        _reservation: reservation,
+    })
+}
+
+/// Atomically reserve the source-spool and recovery-workspace charges from a
+/// successful v7-to-v8 preflight. The report is only a snapshot, so the live
+/// ledger remains authoritative if another operation reserved capacity after
+/// it was produced.
+pub(crate) fn reserve_v8_migration_transition(
+    capacity: V8MigrationCapacity,
+    ledger: &WalV7ResourceLedger,
+) -> std::result::Result<V8MigrationTransitionReservation, V8MigrationReservationError> {
+    if let V8MigrationCapacityDecision::Deferred(reason) = capacity.decision {
+        return Err(V8MigrationReservationError::Deferred(reason));
+    }
+
+    let Some(source_spool_bytes) = capacity
+        .required_transition_bytes
+        .checked_sub(capacity.recovery_workspace_bytes)
+    else {
+        return Err(V8MigrationReservationError::InvalidAssessment);
+    };
+    let Some(required_total_bytes) = capacity
+        .retained_source_spool_bytes
+        .checked_add(capacity.required_transition_bytes)
+    else {
+        return Err(V8MigrationReservationError::InvalidAssessment);
+    };
+    if source_spool_bytes == 0
+        || required_total_bytes != capacity.required_total_bytes
+        || capacity.available_capacity_bytes
+            != capacity
+                .source_spool_limit_bytes
+                .saturating_sub(capacity.retained_source_spool_bytes)
+        || capacity.required_transition_bytes > capacity.available_capacity_bytes
+    {
+        return Err(V8MigrationReservationError::InvalidAssessment);
+    }
+
+    let reservation = ledger
+        .reserve(WalV7ResourceCharge {
+            source_spool_bytes,
+            recovery_workspace_bytes: capacity.recovery_workspace_bytes,
+            ..WalV7ResourceCharge::default()
+        })
+        .map_err(V8MigrationReservationError::Ledger)?;
+
+    Ok(V8MigrationTransitionReservation {
         _reservation: reservation,
     })
 }
@@ -501,6 +593,13 @@ mod tests {
             .unwrap()
     }
 
+    fn invalid_v8_assessment_error(capacity: V8MigrationCapacity) -> V8MigrationReservationError {
+        let ledger = resource_ledger(u64::MAX, u64::MAX);
+        reserve_v8_migration_transition(capacity, &ledger)
+            .err()
+            .unwrap()
+    }
+
     #[test]
     fn v8_migration_capacity_accounts_for_all_transition_and_retained_charges() {
         let capacity = eligible_v8_migration_capacity();
@@ -662,6 +761,95 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn v8_migration_reservation_owns_both_charges_until_drop() {
+        let capacity = eligible_v8_migration_capacity();
+        assert_eq!(capacity.decision, V8MigrationCapacityDecision::Eligible);
+        let source_spool_bytes =
+            capacity.required_transition_bytes - capacity.recovery_workspace_bytes;
+        let ledger = resource_ledger(
+            capacity.source_spool_limit_bytes,
+            capacity.recovery_workspace_bytes,
+        );
+
+        let reservation = reserve_v8_migration_transition(capacity, &ledger).unwrap();
+        assert_eq!(
+            ledger.snapshot(),
+            WalV7ResourceCharge {
+                source_spool_bytes,
+                recovery_workspace_bytes: capacity.recovery_workspace_bytes,
+                ..WalV7ResourceCharge::default()
+            }
+        );
+
+        drop(reservation);
+        assert_eq!(ledger.snapshot(), WalV7ResourceCharge::default());
+    }
+
+    #[test]
+    fn v8_migration_reservation_rejects_deferred_and_malformed_assessments() {
+        let deferred = assess_v8_migration_capacity(
+            &config(
+                MINIMUM_NONEMPTY_V8_SEGMENT_BYTES,
+                MINIMUM_NONEMPTY_V8_SEGMENT_BYTES,
+            ),
+            MINIMUM_EMPTY_V7_IMAGE_BYTES,
+            MINIMUM_EMPTY_V7_IMAGE_BYTES,
+            0,
+            4096,
+        )
+        .unwrap();
+        let ledger = resource_ledger(u64::MAX, u64::MAX);
+        let error = reserve_v8_migration_transition(deferred, &ledger).unwrap_err();
+        assert!(matches!(
+            error,
+            V8MigrationReservationError::Deferred(
+                V8MigrationDeferralReason::InsufficientSourceSpool
+            )
+        ));
+        assert_eq!(
+            error.to_string(),
+            "PITR v8 migration is deferred: InsufficientSourceSpool"
+        );
+        assert!(error.source().is_none());
+        assert_eq!(ledger.snapshot(), WalV7ResourceCharge::default());
+
+        let mut invalid = eligible_v8_migration_capacity();
+        invalid.required_transition_bytes = invalid.recovery_workspace_bytes - 1;
+        let error = invalid_v8_assessment_error(invalid);
+        assert!(matches!(
+            error,
+            V8MigrationReservationError::InvalidAssessment
+        ));
+        assert_eq!(
+            error.to_string(),
+            "invalid PITR v8 migration capacity assessment"
+        );
+        assert!(error.source().is_none());
+    }
+
+    #[test]
+    fn v8_migration_reservation_reports_live_ledger_rejection_atomically() {
+        let capacity = eligible_v8_migration_capacity();
+        let source_spool_bytes =
+            capacity.required_transition_bytes - capacity.recovery_workspace_bytes;
+        let ledger = resource_ledger(source_spool_bytes - 1, capacity.recovery_workspace_bytes);
+
+        let error = reserve_v8_migration_transition(capacity, &ledger).unwrap_err();
+        assert!(matches!(
+            error,
+            V8MigrationReservationError::Ledger(WalV7ReservationError::SourceSpoolLimit {
+                generation: 0
+            })
+        ));
+        assert_eq!(
+            error.to_string(),
+            "could not reserve PITR v8 migration capacity: v7 source spool limit exceeded"
+        );
+        assert!(error.source().is_some());
+        assert_eq!(ledger.snapshot(), WalV7ResourceCharge::default());
     }
 
     #[test]

@@ -203,6 +203,14 @@ struct PitrV7MigrationReservation {
     _transition: crate::pitr::migration::V7MigrationTransitionReservation,
 }
 
+#[cfg(target_os = "linux")]
+#[must_use = "retain the capacity reservation through the v7-to-v8 handoff"]
+#[allow(dead_code)]
+struct PitrV8MigrationReservation {
+    _retained_source_spool: crate::wal::v7::admission::WalV7Reservation,
+    _transition: crate::pitr::migration::V8MigrationTransitionReservation,
+}
+
 struct BatchGetContext<'a> {
     bloom_hashes: Vec<u32>,
     sorted_keys: Vec<(usize, &'a [u8])>,
@@ -3955,6 +3963,95 @@ impl KvEngine {
             crate::pitr::migration::reserve_v7_migration_transition(capacity, &ledger)?;
 
         Ok(PitrV7MigrationReservation {
+            _retained_source_spool: retained_source_spool,
+            _transition: transition,
+        })
+    }
+
+    /// Rebuild and atomically reserve retained and transition charges before a
+    /// v7-to-v8 intent can become durable. The caller holds the PITR lifecycle
+    /// barriers and has stopped commit admission; keep the returned guard until
+    /// the v8 successor owns the reservations.
+    #[cfg(target_os = "linux")]
+    #[allow(dead_code)]
+    fn reserve_pitr_v8_migration_capacity(
+        status: crate::pitr::api::PitrV8MigrationCapacityStatus,
+        config: &crate::pitr::manifest::PersistedPitrConfig,
+    ) -> Result<PitrV8MigrationReservation> {
+        use crate::wal::v7::admission::{
+            WalV7ResourceCharge, WalV7ResourceLedger, WalV7ResourceLimits,
+        };
+
+        ensure!(
+            status.source_spool_limit_bytes == config.max_source_spool_bytes
+                && status.configured_segment_limit_bytes == config.max_segment_bytes,
+            "PITR v8 migration assessment no longer matches the persisted configuration"
+        );
+
+        let decision = match status.decision {
+            crate::pitr::api::PitrV8MigrationCapacityDecision::Eligible => {
+                crate::pitr::migration::V8MigrationCapacityDecision::Eligible
+            }
+            crate::pitr::api::PitrV8MigrationCapacityDecision::Deferred(reason) => {
+                let reason = match reason {
+                    crate::pitr::api::PitrV8MigrationDeferralReason::SegmentLimitTooSmall => {
+                        crate::pitr::migration::V8MigrationDeferralReason::SegmentLimitTooSmall
+                    }
+                    crate::pitr::api::PitrV8MigrationDeferralReason::SegmentLimitTooLarge => {
+                        crate::pitr::migration::V8MigrationDeferralReason::SegmentLimitTooLarge
+                    }
+                    crate::pitr::api::PitrV8MigrationDeferralReason::InsufficientSourceSpool => {
+                        crate::pitr::migration::V8MigrationDeferralReason::InsufficientSourceSpool
+                    }
+                };
+                crate::pitr::migration::V8MigrationCapacityDecision::Deferred(reason)
+            }
+        };
+        let capacity = crate::pitr::migration::V8MigrationCapacity {
+            decision,
+            source_spool_limit_bytes: status.source_spool_limit_bytes,
+            retained_source_spool_bytes: status.retained_source_spool_bytes,
+            available_capacity_bytes: status.available_capacity_bytes,
+            required_transition_bytes: status.required_transition_bytes,
+            required_total_bytes: status.required_total_bytes,
+            configured_segment_limit_bytes: status.configured_segment_limit_bytes,
+            source_v7_active_image_bytes: status.source_v7_active_image_bytes,
+            source_v7_active_growth_bytes: status.source_v7_active_growth_bytes,
+            v8_active_image_bytes: status.v8_active_image_bytes,
+            recovery_workspace_bytes: status.recovery_workspace_bytes,
+            source_v7_seal_sidecar_bytes: status.source_v7_seal_sidecar_bytes,
+            v8_seal_sidecar_bytes: status.v8_seal_sidecar_bytes,
+            successor_image_bytes: status.successor_image_bytes,
+            successor_staging_bytes: status.successor_staging_bytes,
+            terminal_manifest_headroom_bytes: status.terminal_manifest_headroom_bytes,
+        };
+        if let crate::pitr::migration::V8MigrationCapacityDecision::Deferred(reason) =
+            capacity.decision
+        {
+            return Err(
+                crate::pitr::migration::V8MigrationReservationError::Deferred(reason).into(),
+            );
+        }
+        ensure!(
+            config.max_unarchived_bytes > 0 && capacity.retained_source_spool_bytes > 0,
+            "PITR v8 migration reservation has an empty retained-resource charge"
+        );
+
+        let ledger = WalV7ResourceLedger::new(WalV7ResourceLimits {
+            max_logical_wal_bytes: config.max_unarchived_bytes,
+            max_source_spool_bytes: capacity.source_spool_limit_bytes,
+            max_recovery_workspace_bytes: capacity.recovery_workspace_bytes,
+            max_buffer_memory_bytes: 0,
+            max_seal_index_bytes: 0,
+        })?;
+        let retained_source_spool = ledger.reserve(WalV7ResourceCharge {
+            source_spool_bytes: capacity.retained_source_spool_bytes,
+            ..WalV7ResourceCharge::default()
+        })?;
+        let transition =
+            crate::pitr::migration::reserve_v8_migration_transition(capacity, &ledger)?;
+
+        Ok(PitrV8MigrationReservation {
             _retained_source_spool: retained_source_spool,
             _transition: transition,
         })
@@ -20826,6 +20923,113 @@ mod tests {
         .unwrap();
 
         assert_eq!(charge, existing_segment_charge + logical_image_bytes);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn v8_migration_reservation_keeps_capacity_deferral_reason() {
+        use crate::{
+            pitr::{api::PitrV8MigrationCapacityStatus, migration},
+            wal::{v7::codec::WAL_V7_FRAME_LEN, v8::codec::WAL_V8_FRAME_LEN},
+        };
+
+        fn status(
+            capacity: migration::V8MigrationCapacity,
+            source_v7_active_allocated_bytes: u64,
+        ) -> PitrV8MigrationCapacityStatus {
+            let decision = match capacity.decision {
+                migration::V8MigrationCapacityDecision::Eligible => {
+                    crate::pitr::api::PitrV8MigrationCapacityDecision::Eligible
+                }
+                migration::V8MigrationCapacityDecision::Deferred(reason) => {
+                    let reason = match reason {
+                        migration::V8MigrationDeferralReason::SegmentLimitTooSmall => {
+                            crate::pitr::api::PitrV8MigrationDeferralReason::SegmentLimitTooSmall
+                        }
+                        migration::V8MigrationDeferralReason::SegmentLimitTooLarge => {
+                            crate::pitr::api::PitrV8MigrationDeferralReason::SegmentLimitTooLarge
+                        }
+                        migration::V8MigrationDeferralReason::InsufficientSourceSpool => {
+                            crate::pitr::api::PitrV8MigrationDeferralReason::InsufficientSourceSpool
+                        }
+                    };
+                    crate::pitr::api::PitrV8MigrationCapacityDecision::Deferred(reason)
+                }
+            };
+
+            PitrV8MigrationCapacityStatus {
+                decision,
+                required_transition_bytes: capacity.required_transition_bytes,
+                required_total_bytes: capacity.required_total_bytes,
+                available_capacity_bytes: capacity.available_capacity_bytes,
+                retained_source_spool_bytes: capacity.retained_source_spool_bytes,
+                source_spool_limit_bytes: capacity.source_spool_limit_bytes,
+                source_v7_active_image_bytes: capacity.source_v7_active_image_bytes,
+                source_v7_active_allocated_bytes,
+                source_v7_active_growth_bytes: capacity.source_v7_active_growth_bytes,
+                retained_segment_source_bytes: capacity.retained_source_spool_bytes,
+                retained_staging_bytes: 0,
+                retained_unattributed_bytes: 0,
+                configured_segment_limit_bytes: capacity.configured_segment_limit_bytes,
+                v8_active_image_bytes: capacity.v8_active_image_bytes,
+                recovery_workspace_bytes: capacity.recovery_workspace_bytes,
+                source_v7_seal_sidecar_bytes: capacity.source_v7_seal_sidecar_bytes,
+                v8_seal_sidecar_bytes: capacity.v8_seal_sidecar_bytes,
+                successor_image_bytes: capacity.successor_image_bytes,
+                successor_staging_bytes: capacity.successor_staging_bytes,
+                terminal_manifest_headroom_bytes: capacity.terminal_manifest_headroom_bytes,
+            }
+        }
+
+        let source_image_bytes =
+            (crate::wal::v7::codec::WAL_V7_HEADER_LEN + WAL_V7_FRAME_LEN) as u64;
+        let segment_limit_bytes = (crate::wal::v8::WAL_V8_HEADER_LEN + 3 * WAL_V8_FRAME_LEN) as u64;
+        let retained_source_spool_bytes = source_image_bytes;
+        let eligible_config = crate::pitr::manifest::PersistedPitrConfig {
+            archive_interval_ms: 1,
+            max_segment_bytes: segment_limit_bytes,
+            max_unarchived_bytes: segment_limit_bytes,
+            max_source_spool_bytes: 512 * 1024,
+        };
+        let eligible = migration::assess_v8_migration_capacity(
+            &eligible_config,
+            source_image_bytes,
+            source_image_bytes,
+            retained_source_spool_bytes,
+            4096,
+        )
+        .unwrap();
+        let reservation = KvEngine::reserve_pitr_v8_migration_capacity(
+            status(eligible, source_image_bytes),
+            &eligible_config,
+        )
+        .unwrap();
+        drop(reservation);
+
+        let constrained_config = crate::pitr::manifest::PersistedPitrConfig {
+            max_source_spool_bytes: segment_limit_bytes,
+            ..eligible_config
+        };
+        let deferred = migration::assess_v8_migration_capacity(
+            &constrained_config,
+            source_image_bytes,
+            source_image_bytes,
+            retained_source_spool_bytes,
+            4096,
+        )
+        .unwrap();
+        let error = KvEngine::reserve_pitr_v8_migration_capacity(
+            status(deferred, source_image_bytes),
+            &constrained_config,
+        )
+        .err()
+        .unwrap();
+        assert!(matches!(
+            error.downcast_ref::<migration::V8MigrationReservationError>(),
+            Some(migration::V8MigrationReservationError::Deferred(
+                migration::V8MigrationDeferralReason::InsufficientSourceSpool
+            ))
+        ));
     }
 
     fn write_random_file(path: &std::path::Path, len: usize, seed: u64) -> anyhow::Result<()> {
