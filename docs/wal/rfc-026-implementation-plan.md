@@ -156,7 +156,11 @@ remain unqualified, so v8 creation stays disabled.
    the frozen v8 WAL and sidecar, and shallow/deep repository verification and
    ticket-ordered restore dispatch by format. Tests cover source-path archival,
    catalog reopen, sealed-source startup recovery, and exact restore from
-   persisted archive objects across a v7-to-v8 chain. `PitrStatus` reports a
+   persisted archive objects across a v7-to-v8 chain. The PITR manifest state
+   machine can durably represent a v7-to-v8 migration intent that binds the
+   immutable v7 source boundary and exact empty v8 successor; migration
+   execution remains disabled until its fenced capacity and compatibility
+   gates are connected. `PitrStatus` reports a
    read-only v7-to-v8 capacity estimate only for a settled Active v7 boundary
    that matches the on-disk WAL header, including retained source allocations,
    growth allowance to the configured segment limit, and rounded transition
