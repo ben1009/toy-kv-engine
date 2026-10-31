@@ -38822,6 +38822,7 @@ mod tests {
     #[derive(Clone, Copy)]
     enum PreV8ReaderGuardState {
         Published,
+        MigratedToV8,
         MissingManifest,
         MissingManifestPendingSnapshot,
         AfterGuardAppend,
@@ -38916,6 +38917,22 @@ mod tests {
             root: &std::path::Path,
         ) -> anyhow::Result<BTreeMap<std::path::PathBuf, EntrySnapshot>> {
             let mut entries = BTreeMap::new();
+            let metadata = std::fs::symlink_metadata(root)?;
+            entries.insert(
+                std::path::PathBuf::new(),
+                EntrySnapshot {
+                    kind: 1,
+                    mode: metadata.mode(),
+                    device: metadata.dev(),
+                    inode: metadata.ino(),
+                    length: metadata.len(),
+                    modified_seconds: metadata.mtime(),
+                    modified_nanoseconds: metadata.mtime_nsec(),
+                    changed_seconds: metadata.ctime(),
+                    changed_nanoseconds: metadata.ctime_nsec(),
+                    contents: Vec::new(),
+                },
+            );
             snapshot_tree(root, root, &mut entries)?;
             Ok(entries)
         }
@@ -38944,11 +38961,12 @@ mod tests {
         let options = v7_recovery_test_database(dir.path())?;
         let engine = KvEngine::open_with_wal_io_mode(
             dir.path().join("db"),
-            options,
+            options.clone(),
             crate::wal::WalIoMode::Leader,
         )?;
         suspend_pitr_maintenance_for_test(&engine);
         engine.put(b"guarded", b"value")?;
+        engine.sync()?;
         engine
             .inner
             .mvcc
@@ -38977,6 +38995,12 @@ mod tests {
         engine
             .inner
             .publish_v8_compatibility_guard(&publication_guards)?;
+        if matches!(state, PreV8ReaderGuardState::MigratedToV8) {
+            let intent = engine
+                .publish_pitr_v8_migration_intent(&publication_guards)?
+                .ok_or_else(|| anyhow::anyhow!("eligible v8 migration intent was deferred"))?;
+            drop(intent);
+        }
         let snapshot_at_publication = std::fs::read(database_path.join("ENGINE_MANIFEST"))?;
         let v8_snapshot_at_publication: crate::manifest::ManifestRecord =
             serde_json::from_slice(&snapshot_at_publication)?;
@@ -38988,6 +39012,29 @@ mod tests {
         engine.close_storage()?;
         drop(engine);
 
+        if matches!(state, PreV8ReaderGuardState::MigratedToV8) {
+            let repository = dir.path().join("repository");
+            let migrated = KvEngine::open_with_wal_io_mode(
+                &database_path,
+                options.clone(),
+                crate::wal::WalIoMode::Leader,
+            )?;
+            suspend_pitr_maintenance_for_test(&migrated);
+            anyhow::ensure!(
+                migrated.inner.state.load().memtable.uses_v7_wal(),
+                "v8 migration fixture must reopen at its fenced v7 source"
+            );
+            migrated.resume_pitr(&repository)?;
+            anyhow::ensure!(
+                migrated.inner.state.load().memtable.uses_v8_wal(),
+                "v8 migration fixture did not install its v8 successor"
+            );
+            migrated.put(b"after-v8-migration", b"successor-value")?;
+            migrated.sync()?;
+            migrated.close_storage()?;
+            drop(migrated);
+        }
+
         let mut manifest_with_guard = manifest_before_guard;
         manifest_with_guard.extend_from_slice(&serde_json::to_vec(
             &crate::manifest::ManifestRecord::V8CompatibilityGuard {
@@ -38996,7 +39043,7 @@ mod tests {
             },
         )?);
         match state {
-            PreV8ReaderGuardState::Published => {}
+            PreV8ReaderGuardState::Published | PreV8ReaderGuardState::MigratedToV8 => {}
             PreV8ReaderGuardState::MissingManifest => {
                 std::fs::remove_file(database_path.join("MANIFEST"))?;
             }
@@ -39097,7 +39144,7 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
         let identifies_expected_v8_record = match state {
-            PreV8ReaderGuardState::Published => {
+            PreV8ReaderGuardState::Published | PreV8ReaderGuardState::MigratedToV8 => {
                 diagnostic.contains("V8CompatibilityGuard") || diagnostic.contains("V8Snapshot")
             }
             PreV8ReaderGuardState::MissingManifest
@@ -39128,6 +39175,15 @@ mod tests {
     fn v8_compatibility_guard_rejects_pre_v8_cli_without_database_mutation() -> anyhow::Result<()> {
         assert_pre_v8_cli_rejects_guarded_active_v7_without_mutation(
             PreV8ReaderGuardState::Published,
+        )
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires the pre-v8 CLI path in TOY_KV_PRE_V8_CLI"]
+    fn v8_migrated_database_rejects_pre_v8_cli_without_database_mutation() -> anyhow::Result<()> {
+        assert_pre_v8_cli_rejects_guarded_active_v7_without_mutation(
+            PreV8ReaderGuardState::MigratedToV8,
         )
     }
 
