@@ -77,17 +77,22 @@ variant. Re-run the full process matrix with:
 
 ```bash
 TOY_KV_PRE_V8_CLI=/path/to/kv-engine-cli \
+TOY_KV_PRE_V8_VLOG_CLI=/path/to/vlog-enabled-pre-v8-reader \
 TOY_KV_EARLY_PRE_V8_CLI=/path/to/earlier/kv-engine-cli \
 cargo test --package kv-engine --lib --features chaos-testing \
   pre_v8_cli -- --ignored --test-threads=1
 ```
 
-The filter runs ten process cases: six guard-publication cases covering the
+The filter runs eleven process cases: six guard-publication cases covering the
 normal `MANIFEST`, guard append, synced `ENGINE_MANIFEST.tmp`, snapshot rename,
 missing `MANIFEST` with an installed snapshot, and missing `MANIFEST` with a
 pending snapshot; the durable migration-intent, post-`SegmentSealed`, and
-completed-v8 cases against the `18c5f0a8ccfb` CLI; and the published-guard case
-against the earlier historical CLI.
+completed-v8 cases against the `18c5f0a8ccfb` CLI; a vLog-enabled published-
+guard case against a small reader harness built from the same historical
+library revision with WAL and value separation enabled; and the published-
+guard case against the earlier historical CLI. The vLog case verifies the
+older startup path rejects the v8 guard without touching a real `.vlog` file,
+even though vLog initialization precedes manifest parsing.
 
 An additional process case runs the fully published database against the
 earlier historical CLI at `3420eb05b23c5b6ddd22694a4a2f84698589655a`:
@@ -113,15 +118,18 @@ published-guard case also passed against the earlier CLI built from
 case verified rejection of the expected unknown v8 manifest record and
 unchanged file contents, entry names, metadata for recursively enumerated
 entries and subdirectories, and database-root metadata. After adding migration
-states, the expanded ten-case process matrix passed against those same CLI
-builds. This covers only the exercised fixtures and states.
+states and the vLog-enabled historical reader, the expanded eleven-case
+process matrix passed. The vLog reader harness was built offline from the
+`18c5f0a8ccfb` library sources with WAL and value separation enabled; its
+SHA-256 was
+`1417e8107c1faedbde4dcf7ccb5e365168983d8edae8b542cbf90400ae985819`. This
+covers only the exercised fixtures and states.
 
 This is partial compatibility qualification. Before enabling v8 creation,
-extend the process matrix to normal and snapshot recovery variants and a
-vLog-enabled database; continue comparing database files and directory entries
-before and after rejection. The complete historical-binary matrix and startup
-ordering remain unqualified, as does the performance matrix, so v8 creation
-stays disabled.
+extend the process matrix to normal and snapshot recovery variants; continue
+comparing database files and directory entries before and after rejection.
+The complete historical-binary matrix and startup ordering remain
+unqualified, as does the performance matrix, so v8 creation stays disabled.
 
 ## Slices
 

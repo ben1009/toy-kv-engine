@@ -38824,6 +38824,7 @@ mod tests {
         Published,
         MigrationIntent,
         MigratedToV8,
+        VLogEnabled,
         #[cfg(feature = "chaos-testing")]
         SealedBeforeSuccessorRegistration,
         MissingManifest,
@@ -38961,7 +38962,14 @@ mod tests {
         let old_cli = std::env::var_os(cli_env)
             .ok_or_else(|| anyhow::anyhow!("{cli_env} must name the old CLI binary"))?;
         let dir = tempdir()?;
-        let options = v7_recovery_test_database(dir.path())?;
+        let mut options = v7_recovery_test_database(dir.path())?;
+        if matches!(state, PreV8ReaderGuardState::VLogEnabled) {
+            options.value_separation = Some(crate::vlog::ValueSeparationOptions {
+                enabled: true,
+                min_value_size: 1,
+                ..crate::vlog::ValueSeparationOptions::default()
+            });
+        }
         let engine = KvEngine::open_with_wal_io_mode(
             dir.path().join("db"),
             options.clone(),
@@ -39020,6 +39028,15 @@ mod tests {
         drop(publication_guards);
         engine.close_storage()?;
         drop(engine);
+
+        if matches!(state, PreV8ReaderGuardState::VLogEnabled) {
+            let vlog_dir = database_path.join("vlog");
+            std::fs::create_dir_all(&vlog_dir)?;
+            let mut writer =
+                crate::vlog::builder::ValueLogWriter::create(vlog_dir.join("0.vlog"), 0)?;
+            writer.append(b"compatibility-vlog-key", b"valid-vlog-fixture-value")?;
+            writer.close()?;
+        }
 
         let migration_resume_needed = match state {
             PreV8ReaderGuardState::MigratedToV8 => true,
@@ -39089,6 +39106,7 @@ mod tests {
             PreV8ReaderGuardState::Published
             | PreV8ReaderGuardState::MigrationIntent
             | PreV8ReaderGuardState::MigratedToV8 => {}
+            PreV8ReaderGuardState::VLogEnabled => {}
             #[cfg(feature = "chaos-testing")]
             PreV8ReaderGuardState::SealedBeforeSuccessorRegistration => {}
             PreV8ReaderGuardState::MissingManifest => {
@@ -39196,6 +39214,9 @@ mod tests {
             | PreV8ReaderGuardState::MigratedToV8 => {
                 diagnostic.contains("V8CompatibilityGuard") || diagnostic.contains("V8Snapshot")
             }
+            PreV8ReaderGuardState::VLogEnabled => {
+                diagnostic.contains("V8CompatibilityGuard") || diagnostic.contains("V8Snapshot")
+            }
             #[cfg(feature = "chaos-testing")]
             PreV8ReaderGuardState::SealedBeforeSuccessorRegistration => {
                 diagnostic.contains("V8CompatibilityGuard") || diagnostic.contains("V8Snapshot")
@@ -39246,6 +39267,17 @@ mod tests {
     fn v8_migrated_database_rejects_pre_v8_cli_without_database_mutation() -> anyhow::Result<()> {
         assert_pre_v8_cli_rejects_guarded_active_v7_without_mutation(
             PreV8ReaderGuardState::MigratedToV8,
+        )
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires the vLog-enabled pre-v8 reader path in TOY_KV_PRE_V8_VLOG_CLI"]
+    fn v8_compatibility_guard_rejects_pre_v8_cli_with_vlog_without_database_mutation()
+    -> anyhow::Result<()> {
+        assert_pre_v8_cli_rejects_guarded_active_v7_with_env_without_mutation(
+            PreV8ReaderGuardState::VLogEnabled,
+            "TOY_KV_PRE_V8_VLOG_CLI",
         )
     }
 
