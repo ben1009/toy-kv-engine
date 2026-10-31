@@ -23084,6 +23084,159 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn sealed_v8_recovery_recreates_missing_successor_from_durable_boundary() -> anyhow::Result<()>
+    {
+        use sha2::Digest;
+
+        use crate::pitr::manifest::{
+            ActiveBoundary, PersistedChainAnchor, PersistedCommitAnchor, PersistedRecordedAt,
+            PitrManifestRecord, PitrWalFormat,
+        };
+
+        let directory = tempdir()?;
+        let (options, source_segment_id) =
+            active_v8_recovery_test_database(directory.path(), true)?;
+        let database = directory.path().join("db");
+        let engine = KvEngine::open_with_wal_io_mode(
+            &database,
+            options.clone(),
+            crate::wal::WalIoMode::Leader,
+        )?;
+        engine.sync()?;
+        let pitr_state = engine.pitr_manifest_state.lock().clone();
+        let active_boundary = pitr_state
+            .active_boundary
+            .ok_or_else(|| anyhow::anyhow!("v8 fixture has no durable Active boundary"))?;
+        assert_eq!(active_boundary.segment_id, source_segment_id);
+        engine.close()?;
+        drop(engine);
+
+        let source_wal_path = database.join(format!("pitr-{source_segment_id:020}.wal"));
+        let source_wal_bytes = std::fs::read(&source_wal_path)?;
+        let header = crate::wal::v8::codec::WalV8Header::decode(
+            &source_wal_bytes[..crate::wal::v8::WAL_V8_HEADER_LEN],
+        )?;
+        let mut source = std::io::Cursor::new(&source_wal_bytes);
+        let (seal, seal_bytes) = crate::pitr::seal::build_v8_seal_from_reader(
+            &mut source,
+            u64::try_from(source_wal_bytes.len())?,
+            active_boundary,
+            header.predecessor,
+        )?;
+        let seal_digest: [u8; 32] = sha2::Sha256::digest(&seal_bytes).into();
+        let source_anchor = crate::pitr::SegmentAnchor {
+            segment_id: crate::pitr::SegmentId(source_segment_id),
+            wal_digest: seal.boundary.wal_digest,
+            seal_digest,
+        };
+        let successor_segment_id = pitr_state.next_segment_id;
+        let successor_header = crate::wal::v8::codec::WalV8Header {
+            timeline_id: header.timeline_id,
+            archive_epoch_id: header.archive_epoch_id,
+            segment_id: crate::pitr::SegmentId(successor_segment_id),
+            predecessor: crate::pitr::ChainAnchor::Segment(source_anchor),
+            incarnation: [0x91; 16],
+        };
+        let successor_boundary = ActiveBoundary {
+            timeline_id: successor_header.timeline_id.0,
+            archive_epoch_id: successor_header.archive_epoch_id.0,
+            segment_id: successor_segment_id,
+            incarnation: successor_header.incarnation,
+            wal_format: PitrWalFormat::V8,
+            ticket_end: 0,
+            durable_end: crate::wal::v8::WAL_V8_HEADER_LEN as u64,
+            last_commit_ts: 0,
+            prefix_digest: successor_header.initial_prefix_digest()?,
+        };
+        let successor_wal_path = database.join(format!("pitr-{successor_segment_id:020}.wal"));
+        assert!(!successor_wal_path.exists());
+
+        crate::pitr::segment::install_pitr_file_no_replace(
+            &source_wal_path.with_extension("seal"),
+            &seal_bytes,
+        )?;
+        let last_entry = seal
+            .entries
+            .last()
+            .ok_or_else(|| anyhow::anyhow!("seeded v8 source has no sealed entry"))?;
+        let recorded_at = PersistedRecordedAt {
+            secs: last_entry.recorded_at.secs,
+            nanos: last_entry.recorded_at.nanos,
+        };
+        let last_commit_anchor = PersistedCommitAnchor {
+            segment_id: source_segment_id,
+            commit_ts: last_entry.commit_ts,
+            recorded_at,
+            entry_digest: crate::pitr::commit_time_entry_digest(crate::pitr::CommitTimeHighWater {
+                archive_epoch_id: header.archive_epoch_id,
+                segment_id: header.segment_id,
+                commit_ts: last_entry.commit_ts,
+                recorded_at: last_entry.recorded_at,
+                entry_digest: [0; 32],
+            }),
+        };
+        let manifest = crate::manifest::Manifest::recover(database.join("MANIFEST"))?.0;
+        manifest.add_records_when_init(&[
+            crate::manifest::ManifestRecord::Pitr(PitrManifestRecord::SealStarted {
+                segment_id: source_segment_id,
+                successor_segment_id,
+                logical_length: seal.boundary.sealed_end,
+                immutable_boundary: Some(seal.boundary),
+            }),
+            crate::manifest::ManifestRecord::Pitr(PitrManifestRecord::SegmentSealed {
+                segment_id: source_segment_id,
+                segment_anchor: PersistedChainAnchor::Segment {
+                    segment_id: source_segment_id,
+                    wal_digest: source_anchor.wal_digest,
+                    seal_digest: source_anchor.seal_digest,
+                },
+                last_recorded_at: Some(recorded_at),
+                last_commit_anchor: Some(last_commit_anchor),
+                successor_active_boundary: Some(successor_boundary),
+            }),
+        ])?;
+        drop(manifest);
+
+        let recovered = KvEngine::open_with_wal_io_mode(
+            &database,
+            options.clone(),
+            crate::wal::WalIoMode::Leader,
+        )?;
+        assert!(
+            recovered.inner.state.load().memtable.uses_v8_wal(),
+            "startup must install the manifest-authorized v8 successor as Active"
+        );
+        assert_eq!(recovered.get(b"seed")?, Some(Bytes::from_static(b"v")));
+        assert_eq!(
+            recovered.pitr_manifest_state.lock().active_boundary,
+            Some(successor_boundary)
+        );
+        assert_eq!(
+            recovered.pitr_manifest_state.lock().predecessor_anchor,
+            Some(PersistedChainAnchor::Segment {
+                segment_id: source_segment_id,
+                wal_digest: source_anchor.wal_digest,
+                seal_digest: source_anchor.seal_digest,
+            })
+        );
+        assert!(successor_wal_path.exists());
+        assert_eq!(
+            std::fs::metadata(&successor_wal_path)?.len(),
+            u64::try_from(
+                crate::wal::v8::WAL_V8_HEADER_LEN + crate::wal::v8::codec::WAL_V8_FRAME_LEN
+            )?
+        );
+        assert_eq!(
+            std::fs::read(&successor_wal_path)?[..crate::wal::v8::WAL_V8_HEADER_LEN],
+            successor_header.encode()?
+        );
+        recovered.close()?;
+
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn v7_active_reopen_clamps_recorded_time_after_wall_clock_rollback() -> anyhow::Result<()> {
         let directory = tempdir()?;
         let options = v7_recovery_test_database(directory.path())?;
