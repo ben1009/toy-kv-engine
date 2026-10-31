@@ -40,9 +40,9 @@ static TEMP_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 /// Recovered v8 Active state after the accepted boundary is normalized and
 /// durably installed on a fresh inode.
 pub(crate) struct WalV8InstalledRecovery {
-    /// The accepted boundary and frontier-chain metadata. Active recovery
-    /// leaves `selection.batches` empty and streams replay using the compact
-    /// ticket index below.
+    /// The accepted boundary, frontier-chain metadata, and diagnostics for
+    /// rejected newer candidates. Active recovery leaves `selection.batches`
+    /// empty and streams replay using the compact ticket index below.
     pub(crate) selection: WalV8RecoverySelection,
     pub(crate) replay_tickets: Vec<WalV8SealTicket>,
     pub(crate) active_boundary: ActiveBoundary,
@@ -898,5 +898,80 @@ fn cleanup_failed_recovery_image(temp_path: &Path, parent_dir: &File) -> Result<
             .sync_all()
             .context("sync directory after confirming failed v8 recovery image is absent"),
         Err(error) => Err(error).context("remove failed v8 recovery image"),
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+    use crate::pitr::{ArchiveEpochId, ChainAnchor, LIVE_WAL_V5_LIMITS, SegmentId, TimelineId};
+
+    fn test_header() -> WalV8Header {
+        let archive_epoch_id = ArchiveEpochId([2; 16]);
+        WalV8Header {
+            timeline_id: TimelineId([1; 16]),
+            archive_epoch_id,
+            segment_id: SegmentId(3),
+            predecessor: ChainAnchor::Genesis { archive_epoch_id },
+            incarnation: [4; 16],
+        }
+    }
+
+    #[test]
+    fn active_install_does_not_report_a_partial_speculative_tail() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("active-v8.wal");
+        let header = test_header();
+        let anchor = create_empty_active_image(&path, header)?;
+        let mut source = OpenOptions::new().append(true).open(&path)?;
+        source.write_all(b"partial speculative frame")?;
+        drop(source);
+
+        let installed = recover_and_install_active(
+            &path,
+            &[anchor],
+            header.predecessor,
+            LIVE_WAL_V5_LIMITS,
+            MAX_WAL_FILE_SIZE,
+        )?;
+
+        assert_eq!(installed.active_boundary, anchor);
+        assert_eq!(
+            installed.selection.diagnostics,
+            super::super::recovery::WalV8RecoveryDiagnostics::default()
+        );
+        assert_eq!(installed.image_len, HEADER_LEN_U64 + FRAME_LEN_U64);
+        Ok(())
+    }
+
+    #[test]
+    fn active_install_exposes_a_rejected_frontier_header() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("active-v8.wal");
+        let header = test_header();
+        let anchor = create_empty_active_image(&path, header)?;
+        let generation_zero = encode_generation_zero_frontier(
+            header.physical_digest()?,
+            header.initial_prefix_digest()?,
+        )?;
+        let mut source = OpenOptions::new().append(true).open(&path)?;
+        source.write_all(&generation_zero)?;
+        drop(source);
+
+        let installed = recover_and_install_active(
+            &path,
+            &[anchor],
+            header.predecessor,
+            LIVE_WAL_V5_LIMITS,
+            MAX_WAL_FILE_SIZE,
+        )?;
+
+        assert_eq!(installed.active_boundary, anchor);
+        let rejected = &installed.selection.diagnostics.rejected_newer_frontiers;
+        assert_eq!(rejected.len(), 1);
+        assert_eq!(rejected[0].frame_offset, HEADER_LEN_U64 + FRAME_LEN_U64);
+        assert_eq!(rejected[0].frame_end, HEADER_LEN_U64 + 2 * FRAME_LEN_U64);
+        assert!(rejected[0].reason.contains("frame offset mismatch"));
+        Ok(())
     }
 }

@@ -1461,7 +1461,6 @@ impl Wal {
         self.format_version == WAL_FORMAT_VERSION_V8
     }
 
-    #[allow(dead_code)] // Consumed by staged Active v8 LSM recovery handling.
     pub(crate) fn v8_requires_recovery(&self) -> bool {
         if !self.is_v8() {
             return false;

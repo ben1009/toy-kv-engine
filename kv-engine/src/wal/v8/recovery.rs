@@ -30,6 +30,8 @@ use crate::wal::MAX_WAL_FILE_SIZE;
 const FRAME_LEN_U64: u64 = FRAME_LEN as u64;
 const HEADER_LEN_U64: u64 = HEADER_LEN as u64;
 const DISCOVERY_BATCH_FRAMES: usize = 64;
+const MAX_REJECTED_CANDIDATE_DIAGNOSTICS: usize = 64;
+const MAX_REJECTION_REASON_CHARS: usize = 192;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct WalV8FrontierCandidate {
@@ -38,13 +40,79 @@ pub(crate) struct WalV8FrontierCandidate {
     pub(crate) frame_digest: [u8; 32],
 }
 
+/// A frame whose header claims FRONTIER but whose envelope is invalid or torn.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct WalV8RejectedFrontier {
+    pub(crate) frame_offset: u64,
+    /// End of the available frame bytes, which may be before a full frame end.
+    pub(crate) frame_end: u64,
+    pub(crate) reason: String,
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct WalV8FrontierDiscovery {
     /// Structural candidates in descending physical-offset order.
     pub(crate) candidates: Vec<WalV8FrontierCandidate>,
+    /// A bounded sample in descending physical-offset order.
+    pub(crate) rejected_frontiers: Vec<WalV8RejectedFrontier>,
     pub(crate) rejected_frontier_count: u64,
     pub(crate) scanned_frame_count: u64,
     pub(crate) incomplete_tail_bytes: u64,
+}
+
+impl WalV8FrontierDiscovery {
+    fn reject(
+        &mut self,
+        frame_offset: u64,
+        frame_end: u64,
+        reason: impl std::fmt::Display,
+    ) -> Result<()> {
+        self.rejected_frontier_count = self
+            .rejected_frontier_count
+            .checked_add(1)
+            .context("v8 rejected FRONTIER count overflows")?;
+        if self.rejected_frontiers.len() < MAX_REJECTED_CANDIDATE_DIAGNOSTICS {
+            self.rejected_frontiers
+                .try_reserve(1)
+                .context("reserve v8 rejected FRONTIER diagnostic")?;
+            self.rejected_frontiers.push(WalV8RejectedFrontier {
+                frame_offset,
+                frame_end,
+                reason: reason
+                    .to_string()
+                    .chars()
+                    .take(MAX_REJECTION_REASON_CHARS)
+                    .collect(),
+            });
+        }
+        Ok(())
+    }
+}
+
+/// A structurally valid newer marker that failed prefix or chain validation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct WalV8RejectedCandidate {
+    pub(crate) frame_offset: u64,
+    pub(crate) durable_end: u64,
+    pub(crate) ticket_end: u64,
+    pub(crate) reason: String,
+}
+
+/// Bounded diagnostics for a fallback from rejected newer markers.
+///
+/// Structurally rejected marker-shaped frames are separate from verified
+/// candidates; they do not prove that a durability boundary existed.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct WalV8RecoveryDiagnostics {
+    pub(crate) rejected_newer_candidate_count: u64,
+    pub(crate) rejected_newer_candidates: Vec<WalV8RejectedCandidate>,
+    /// Bounded sample of later aligned frames whose headers claim FRONTIER.
+    pub(crate) rejected_newer_frontiers: Vec<WalV8RejectedFrontier>,
+    /// The bounded sample might omit additional later rejected frames.
+    pub(crate) rejected_newer_frontiers_may_be_truncated: bool,
+    /// Original byte range replaced during normalization, when fallback was
+    /// required. The accepted marker itself may lie inside this range.
+    pub(crate) discarded_physical_tail: Option<(u64, u64)>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -75,6 +143,7 @@ pub(crate) struct WalV8RecoverySelection {
     pub(crate) initial_prefix_digest: WalV8Digest,
     pub(crate) candidate: WalV8FrontierCandidate,
     pub(crate) active_boundary: ActiveBoundary,
+    pub(crate) diagnostics: WalV8RecoveryDiagnostics,
     pub(crate) hard_anchors: Vec<ActiveBoundary>,
     pub(crate) batches: Vec<WalBatch>,
     pub(crate) last_frontier: WalV8Frontier,
@@ -130,6 +199,28 @@ pub(crate) fn discover_frontier_candidates<R: Read + Seek>(
         incomplete_tail_bytes: file_len - complete_end,
         ..WalV8FrontierDiscovery::default()
     };
+    // The final partial frame is not an acceptable candidate. If its complete
+    // magic and kind still claim FRONTIER, retain that evidence separately.
+    const FRONTIER_CLAIM_LEN: u64 = 12;
+    if complete_end >= HEADER_LEN_U64 && discovery.incomplete_tail_bytes >= FRONTIER_CLAIM_LEN {
+        let mut header = [0; FRONTIER_CLAIM_LEN as usize];
+        reader
+            .seek(SeekFrom::Start(complete_end))
+            .context("seek partial v8 WAL frame during discovery")?;
+        reader
+            .read_exact(&mut header)
+            .context("read partial v8 WAL frame header during discovery")?;
+        if is_frontier_frame_header(&header) {
+            discovery.reject(
+                complete_end,
+                file_len,
+                format!(
+                    "truncated v8 FRONTIER frame: {} of {FRAME_LEN_U64} bytes",
+                    discovery.incomplete_tail_bytes
+                ),
+            )?;
+        }
+    }
     let Some(mut last_offset) = complete_end.checked_sub(FRAME_LEN_U64) else {
         return Ok(discovery);
     };
@@ -173,28 +264,32 @@ pub(crate) fn discover_frontier_candidates<R: Read + Seek>(
             let frame_offset = first_offset
                 .checked_add(u64::try_from(start)?)
                 .context("v8 discovered frame offset overflows")?;
-            if let Ok(frame) = decode_frame_structural(
+            match decode_frame_structural(
                 frame_bytes,
                 frame_offset,
                 physical_header_digest,
                 initial_prefix_digest,
-            ) && frame.kind == WalV8FrameKind::Frontier
-            {
-                let frontier = WalV8Frontier::decode_body(&frame.body)?;
-                discovery
-                    .candidates
-                    .try_reserve(1)
-                    .context("reserve v8 FRONTIER candidate")?;
-                discovery.candidates.push(WalV8FrontierCandidate {
+            ) {
+                Ok(frame) if frame.kind == WalV8FrameKind::Frontier => {
+                    let frontier = WalV8Frontier::decode_body(&frame.body)?;
+                    discovery
+                        .candidates
+                        .try_reserve(1)
+                        .context("reserve v8 FRONTIER candidate")?;
+                    discovery.candidates.push(WalV8FrontierCandidate {
+                        frame_offset,
+                        frontier,
+                        frame_digest: frame_record_digest(frame_bytes)?,
+                    });
+                }
+                Ok(_) => discovery.reject(
                     frame_offset,
-                    frontier,
-                    frame_digest: frame_record_digest(frame_bytes)?,
-                });
-            } else {
-                discovery.rejected_frontier_count = discovery
-                    .rejected_frontier_count
-                    .checked_add(1)
-                    .context("v8 rejected FRONTIER count overflows")?;
+                    frame_offset + FRAME_LEN_U64,
+                    "v8 FRONTIER header decoded as DATA",
+                )?,
+                Err(error) => {
+                    discovery.reject(frame_offset, frame_offset + FRAME_LEN_U64, error)?
+                }
             }
         }
 
@@ -689,33 +784,106 @@ fn select_active_candidate_inner<R: Read + Seek>(
         validate_anchor_prefix(*anchor, &checkpoints, &frontiers)?;
     }
 
-    let mut eligible = Vec::new();
-    for candidate in &discovery.candidates {
-        if candidate.frontier.durable_end > cursor {
-            continue;
-        }
-        if validate_candidate(
-            candidate,
-            &physical_header_digest,
-            &initial_prefix_digest,
-            &frontiers,
-            &checkpoints,
-        )
-        .is_err()
-        {
-            continue;
-        }
-        if anchors
+    let candidate = discovery
+        .candidates
+        .iter()
+        .filter(|candidate| {
+            candidate.frontier.durable_end <= cursor
+                && validate_candidate(
+                    candidate,
+                    &physical_header_digest,
+                    &initial_prefix_digest,
+                    &frontiers,
+                    &checkpoints,
+                )
+                .is_ok()
+                && anchors
+                    .iter()
+                    .all(|anchor| candidate_covers_anchor(candidate, anchor))
+        })
+        .max_by_key(|candidate| candidate.frame_offset)
+        .cloned()
+        .context("no fully verified v8 FRONTIER satisfies all durable anchors")?;
+
+    let mut diagnostics = WalV8RecoveryDiagnostics::default();
+    let newer_frontier_sample_len = discovery
+        .rejected_frontiers
+        .iter()
+        .take_while(|rejected| rejected.frame_offset > candidate.frame_offset)
+        .count();
+    diagnostics
+        .rejected_newer_frontiers
+        .try_reserve_exact(newer_frontier_sample_len)
+        .context("reserve v8 rejected FRONTIER diagnostics")?;
+    diagnostics.rejected_newer_frontiers.extend(
+        discovery
+            .rejected_frontiers
             .iter()
-            .all(|anchor| candidate_covers_anchor(candidate, anchor))
+            .take(newer_frontier_sample_len)
+            .cloned(),
+    );
+    diagnostics.rejected_newer_frontiers_may_be_truncated = newer_frontier_sample_len > 0
+        && newer_frontier_sample_len == discovery.rejected_frontiers.len()
+        && discovery.rejected_frontier_count > u64::try_from(discovery.rejected_frontiers.len())?;
+
+    for rejected in &discovery.candidates {
+        // Do not warn about malformed bytes outside a retained prefix, or a
+        // stray marker that claims no progress beyond the selected ticket.
+        if rejected.frame_offset <= candidate.frame_offset
+            || rejected.frontier.ticket_end <= candidate.frontier.ticket_end
         {
-            eligible.push(candidate.clone());
+            continue;
+        }
+        let reason = if rejected.frontier.durable_end > cursor {
+            Some(stopped_at.as_ref().map_or_else(
+                || "candidate prefix was not fully verified".to_owned(),
+                |(offset, reason)| format!("prefix stopped at {offset}: {reason}"),
+            ))
+        } else {
+            validate_candidate(
+                rejected,
+                &physical_header_digest,
+                &initial_prefix_digest,
+                &frontiers,
+                &checkpoints,
+            )
+            .err()
+            .map(|error| format!("{error:#}"))
+        };
+        let Some(reason) = reason else {
+            // A valid marker that cannot satisfy the hard anchors is not a
+            // failed prefix; it may describe a speculative older boundary.
+            continue;
+        };
+        diagnostics.rejected_newer_candidate_count = diagnostics
+            .rejected_newer_candidate_count
+            .checked_add(1)
+            .context("v8 rejected candidate count overflows")?;
+        if diagnostics.rejected_newer_candidates.len() < MAX_REJECTED_CANDIDATE_DIAGNOSTICS {
+            diagnostics
+                .rejected_newer_candidates
+                .try_reserve(1)
+                .context("reserve v8 rejected candidate diagnostic")?;
+            diagnostics
+                .rejected_newer_candidates
+                .push(WalV8RejectedCandidate {
+                    frame_offset: rejected.frame_offset,
+                    durable_end: rejected.frontier.durable_end,
+                    ticket_end: rejected.frontier.ticket_end,
+                    reason: reason.chars().take(MAX_REJECTION_REASON_CHARS).collect(),
+                });
         }
     }
-    let candidate = eligible
-        .into_iter()
-        .max_by_key(|candidate| candidate.frame_offset)
-        .context("no fully verified v8 FRONTIER satisfies all durable anchors")?;
+    if diagnostics.rejected_newer_candidate_count > 0
+        || !diagnostics.rejected_newer_frontiers.is_empty()
+    {
+        let discarded_start = if candidate.frontier.ticket_end == 0 {
+            HEADER_LEN_U64 + FRAME_LEN_U64
+        } else {
+            candidate.frontier.durable_end
+        };
+        diagnostics.discarded_physical_tail = Some((discarded_start, file_len));
+    }
 
     let mut hard_anchors = Vec::new();
     hard_anchors
@@ -786,6 +954,7 @@ fn select_active_candidate_inner<R: Read + Seek>(
             initial_prefix_digest,
             candidate,
             active_boundary,
+            diagnostics,
             hard_anchors,
             batches,
             last_frontier: predecessor.frontier,
@@ -1559,6 +1728,7 @@ mod tests {
         assert_eq!(selected.batches[0].commit_ts, 10);
         assert_eq!(selected.batches[1].commit_ts, 20);
         assert_eq!(selected.last_frontier, image.first_frontier);
+        assert_eq!(selected.diagnostics, WalV8RecoveryDiagnostics::default());
         assert_eq!(
             selected.last_frontier_offset,
             image.first_frontier.durable_end
@@ -1620,6 +1790,225 @@ mod tests {
         assert_eq!(selected.candidate.frontier, image.first_frontier);
         assert_eq!(selected.batches.len(), 1);
         assert_eq!(selected.batches[0].commit_ts, 10);
+        let diagnostics = &selected.diagnostics;
+        assert_eq!(diagnostics.rejected_newer_candidate_count, 1);
+        assert_eq!(diagnostics.rejected_newer_candidates.len(), 1);
+        let rejected = &diagnostics.rejected_newer_candidates[0];
+        assert_eq!(rejected.frame_offset, image.last_frontier.durable_end);
+        assert_eq!(rejected.durable_end, image.last_frontier.durable_end);
+        assert_eq!(rejected.ticket_end, 2);
+        assert!(rejected.reason.contains("CRC mismatch"));
+        assert!(rejected.reason.contains(&data_offset.to_string()));
+        assert_eq!(
+            diagnostics.discarded_physical_tail,
+            Some((
+                image.first_frontier.durable_end,
+                u64::try_from(image.bytes.len())?
+            ))
+        );
+        assert!(
+            select(
+                &image.bytes,
+                &image.physical_header_digest,
+                &[active_boundary(image.last_frontier)],
+            )
+            .is_err(),
+            "fallback must still reject a damaged hard anchor"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn active_recovery_does_not_report_only_speculative_tail_damage() -> Result<()> {
+        let mut image = two_batch_image()?;
+        let marker_offset = usize::try_from(image.last_frontier.durable_end)?;
+        image.bytes.truncate(marker_offset);
+        let speculative_data = usize::try_from(image.first_frontier.durable_end + FRAME_LEN_U64)?;
+        image.bytes[speculative_data + 64] ^= 1;
+        image.bytes.extend_from_slice(b"partial tail");
+        let anchor = active_boundary(image.first_frontier);
+
+        let selected = select(&image.bytes, &image.physical_header_digest, &[anchor])?;
+
+        assert_eq!(selected.candidate.frontier, image.first_frontier);
+        assert_eq!(selected.diagnostics, WalV8RecoveryDiagnostics::default());
+        Ok(())
+    }
+
+    #[test]
+    fn active_recovery_reports_newer_structurally_invalid_frontiers() -> Result<()> {
+        for (byte_offset, expected_reason) in [
+            (60, "frame CRC mismatch"),
+            (48, "frame offset mismatch"),
+            (16, "frame header digest mismatch"),
+        ] {
+            let mut image = two_batch_image()?;
+            let marker_offset = usize::try_from(image.last_frontier.durable_end)?;
+            image.bytes[marker_offset + byte_offset] ^= 1;
+
+            let selected = select(
+                &image.bytes,
+                &image.physical_header_digest,
+                &[active_boundary(image.first_frontier)],
+            )?;
+
+            assert_eq!(selected.candidate.frontier, image.first_frontier);
+            let diagnostics = &selected.diagnostics;
+            assert_eq!(diagnostics.rejected_newer_candidate_count, 0);
+            assert_eq!(diagnostics.rejected_newer_frontiers.len(), 1);
+            let rejected = &diagnostics.rejected_newer_frontiers[0];
+            assert_eq!(rejected.frame_offset, image.last_frontier.durable_end);
+            assert_eq!(rejected.frame_end, u64::try_from(image.bytes.len())?);
+            assert!(
+                rejected.reason.contains(expected_reason),
+                "{}",
+                rejected.reason
+            );
+            assert!(!diagnostics.rejected_newer_frontiers_may_be_truncated);
+            assert_eq!(
+                diagnostics.discarded_physical_tail,
+                Some((
+                    image.first_frontier.durable_end,
+                    u64::try_from(image.bytes.len())?
+                ))
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn active_recovery_reports_partial_frontier_header_and_propagates_read_failure() -> Result<()> {
+        let mut image = two_batch_image()?;
+        let marker_offset = usize::try_from(image.last_frontier.durable_end)?;
+        image.bytes.truncate(marker_offset + 128);
+        let selected = select(
+            &image.bytes,
+            &image.physical_header_digest,
+            &[active_boundary(image.first_frontier)],
+        )?;
+        let rejected = &selected.diagnostics.rejected_newer_frontiers;
+        assert_eq!(rejected.len(), 1);
+        assert_eq!(rejected[0].frame_offset, u64::try_from(marker_offset)?);
+        assert_eq!(rejected[0].frame_end, u64::try_from(image.bytes.len())?);
+        assert!(rejected[0].reason.contains("truncated v8 FRONTIER frame"));
+
+        let mut reader = FailingReader {
+            cursor: Cursor::new(image.bytes.clone()),
+            fail_at: u64::try_from(marker_offset)?,
+        };
+        let error = discover_frontier_candidates(
+            &mut reader,
+            u64::try_from(image.bytes.len())?,
+            &image.physical_header_digest,
+            &test_header().initial_prefix_digest()?,
+        )
+        .expect_err("a partial-frame header read failure must remain fatal");
+        assert!(format!("{error:#}").contains("injected recovery read failure"));
+        Ok(())
+    }
+
+    #[test]
+    fn active_recovery_ignores_invalid_markers_in_the_selected_speculative_gap() -> Result<()> {
+        let mut image = two_batch_image()?;
+        let marker_offset = usize::try_from(image.last_frontier.durable_end)?;
+        image.bytes[marker_offset + 60] ^= 1;
+        let (_, _, generation_zero, generation_zero_digest) = empty_image()?;
+        let relocated_offset = u64::try_from(image.bytes.len())?;
+        let relocated = encode_frontier_successor(
+            image.first_frontier,
+            generation_zero,
+            HEADER_LEN_U64,
+            &generation_zero_digest,
+            relocated_offset,
+            image.physical_header_digest,
+            test_header().initial_prefix_digest()?,
+        )?;
+        install_frame(&mut image.bytes, relocated_offset, &relocated)?;
+
+        let selected = select(
+            &image.bytes,
+            &image.physical_header_digest,
+            &[active_boundary(image.first_frontier)],
+        )?;
+        assert_eq!(selected.candidate.frame_offset, relocated_offset);
+        assert_eq!(selected.diagnostics, WalV8RecoveryDiagnostics::default());
+        Ok(())
+    }
+
+    #[test]
+    fn active_recovery_bounds_structurally_invalid_frontier_diagnostics() -> Result<()> {
+        let mut image = two_batch_image()?;
+        let marker_offset = usize::try_from(image.last_frontier.durable_end)?;
+        let mut invalid_marker = image.bytes[marker_offset..].to_vec();
+        invalid_marker[60] ^= 1;
+        image.bytes[marker_offset..].copy_from_slice(&invalid_marker);
+        for _ in 0..MAX_REJECTED_CANDIDATE_DIAGNOSTICS + 6 {
+            image.bytes.extend_from_slice(&invalid_marker);
+        }
+
+        let selected = select(
+            &image.bytes,
+            &image.physical_header_digest,
+            &[active_boundary(image.first_frontier)],
+        )?;
+        assert_eq!(selected.candidate.frontier, image.first_frontier);
+        assert_eq!(
+            selected.diagnostics.rejected_newer_frontiers.len(),
+            MAX_REJECTED_CANDIDATE_DIAGNOSTICS
+        );
+        assert!(
+            selected
+                .diagnostics
+                .rejected_newer_frontiers_may_be_truncated
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn active_recovery_bounds_rejected_marker_diagnostics() -> Result<()> {
+        let mut image = two_batch_image()?;
+        let mut bad_prefix = image.final_prefix;
+        bad_prefix[0] ^= 1;
+        let count = MAX_REJECTED_CANDIDATE_DIAGNOSTICS + 6;
+        for index in 0..count {
+            append_frontier(
+                &mut image.bytes,
+                image.physical_header_digest,
+                FrontierAppend {
+                    previous: image.first_frontier,
+                    previous_offset: image.first_frontier.durable_end,
+                    previous_digest: image.first_frontier_digest,
+                    frame_offset: image.last_frontier.durable_end
+                        + u64::try_from(index)? * FRAME_LEN_U64,
+                    ticket_end: image.last_frontier.ticket_end,
+                    durable_end: image.last_frontier.durable_end,
+                    last_commit_ts: image.last_frontier.last_commit_ts,
+                    prefix_digest: bad_prefix,
+                },
+            )?;
+        }
+        let selected = select(
+            &image.bytes,
+            &image.physical_header_digest,
+            &[active_boundary(image.first_frontier)],
+        )?;
+
+        assert_eq!(selected.candidate.frontier, image.first_frontier);
+        assert_eq!(
+            selected.diagnostics.rejected_newer_candidate_count,
+            u64::try_from(count)?
+        );
+        assert_eq!(
+            selected.diagnostics.rejected_newer_candidates.len(),
+            MAX_REJECTED_CANDIDATE_DIAGNOSTICS
+        );
+        assert!(
+            selected
+                .diagnostics
+                .rejected_newer_candidates
+                .iter()
+                .all(|candidate| candidate.reason.contains("logical prefix digest mismatch"))
+        );
         Ok(())
     }
 
@@ -1673,6 +2062,18 @@ mod tests {
         assert_eq!(installed.next_ticket, 1);
         assert_eq!(installed.frontier.ticket_end, 1);
         assert_eq!(
+            installed
+                .selection
+                .diagnostics
+                .rejected_newer_candidate_count,
+            1
+        );
+        assert!(
+            installed.selection.diagnostics.rejected_newer_candidates[0]
+                .reason
+                .contains("CRC mismatch")
+        );
+        assert_eq!(
             installed.image_len,
             fixture.first_frontier.durable_end + FRAME_LEN_U64
         );
@@ -1713,6 +2114,7 @@ mod tests {
         assert_eq!(reopened.active_boundary, installed.active_boundary);
         assert_eq!(reopened.candidate.frontier, installed.frontier);
         assert_eq!(reopened.batches.len(), 1);
+        assert_eq!(reopened.diagnostics, WalV8RecoveryDiagnostics::default());
         Ok(())
     }
 
@@ -2130,7 +2532,8 @@ mod tests {
             )?;
             assert_eq!(recovered.active_boundary, anchor);
             assert_eq!(recovered.frontier.ticket_end, 1);
-            assert_eq!(installed_batches(&wal_path, &recovered)?[0].commit_ts, 10);
+            let recovered_batches = installed_batches(&wal_path, &recovered)?;
+            assert_eq!(recovered_batches[0].commit_ts, 10);
             for entry in std::fs::read_dir(directory.path())? {
                 let entry = entry?;
                 ensure!(
@@ -2151,10 +2554,7 @@ mod tests {
             )?;
             assert_eq!(reopened.active_boundary, anchor);
             assert_eq!(reopened.frontier, recovered.frontier);
-            assert_eq!(
-                installed_batches(&wal_path, &reopened)?,
-                installed_batches(&wal_path, &recovered)?
-            );
+            assert_eq!(installed_batches(&wal_path, &reopened)?, recovered_batches);
         }
         Ok(())
     }

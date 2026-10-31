@@ -7,6 +7,7 @@
 //! runtime.
 
 use std::{
+    cell::RefCell,
     error::Error,
     fmt,
     fs::File,
@@ -15,6 +16,7 @@ use std::{
         fs::{FileExt, MetadataExt},
         io::AsRawFd,
     },
+    sync::Arc,
     thread,
 };
 
@@ -23,7 +25,7 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     pitr::{LIVE_WAL_V5_LIMITS, WalBatch, WalV5Limits},
-    wal::{DirectBuf, MAX_WAL_FILE_SIZE},
+    wal::{DirectBuf, MAX_WAL_FILE_SIZE, v7::admission::WalV7OwnedBatchReservation},
 };
 
 use super::{
@@ -38,7 +40,11 @@ use super::{
         WalV8ParallelAdmissionGuard, WalV8ParallelConfig, WalV8ParallelCoordinator,
         WalV8PreparationReservation,
     },
-    prepare::{EncodedWalV8Batch, PreparedWalV8Batch, WalV8BatchAssignment, WalV8DigestReady},
+    prepare::{
+        EncodedWalV8Batch, PreparedWalV8Batch, WalV8AdmissionPlan, WalV8AdmissionPublisher,
+        WalV8BatchAssignment, WalV8DigestReady,
+    },
+    resource::WalV8ReservationOwner,
 };
 
 const FRAME_LEN_U64: u64 = WAL_V8_FRAME_LEN as u64;
@@ -56,7 +62,7 @@ impl fmt::Display for WalV8LeaderCapacityError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
             Self::RotationRequired => "v8 WAL segment rotation required before retrying batch",
-            Self::BatchTooLarge => "v8 WAL batch cannot fit a fresh segment",
+            Self::BatchTooLarge => "v8 WAL batch or group cannot fit a fresh segment",
             Self::GroupExceedsAdmissionWindow => {
                 "v8 WAL group exceeds the bounded admission memory window"
             }
@@ -95,6 +101,7 @@ pub(crate) struct WalV8LeaderWriter {
     physical_header_digest: [u8; 32],
     initial_prefix_digest: digest::WalV8Digest,
     coordinator: WalV8ParallelCoordinator,
+    reservation_owner: Option<Arc<WalV8ReservationOwner>>,
     frontier: WalV8Frontier,
     frontier_offset: u64,
     frontier_digest: [u8; 32],
@@ -109,13 +116,64 @@ struct ProducerCompletion {
     encoded: EncodedWalV8Batch<WalV8ParallelAdmissionGuard>,
 }
 
+/// Mark the persistent resource charge at the exact admission boundary, even
+/// if a later assignment validation fails or the caller unwinds.
+struct WalV8LeaderAdmissionPublisher<'a> {
+    coordinator: &'a WalV8ParallelCoordinator,
+    reservation: RefCell<&'a mut Option<WalV7OwnedBatchReservation>>,
+}
+
+impl WalV8AdmissionPublisher for WalV8LeaderAdmissionPublisher<'_> {
+    type Guard = WalV8ParallelAdmissionGuard;
+
+    fn admit_and_publish(
+        &self,
+        plan: WalV8AdmissionPlan,
+    ) -> Result<(WalV8BatchAssignment, Self::Guard)> {
+        let admitted = self.coordinator.admit_and_publish(plan)?;
+        if let Some(reservation) = self.reservation.borrow_mut().as_mut() {
+            reservation.mark_admitted();
+        }
+        Ok(admitted)
+    }
+}
+
 impl WalV8LeaderWriter {
+    /// Resume a writer with image-bound source and recovery-workspace charges.
+    pub(crate) fn new_with_reservation_owner(
+        write_file: File,
+        sync_file: File,
+        installed: &WalV8InstalledRecovery,
+        max_file_size: u64,
+        reservation_owner: Arc<WalV8ReservationOwner>,
+    ) -> Result<Self> {
+        reservation_owner.validate_image_and_workspace(installed, max_file_size)?;
+        Self::new_inner(
+            write_file,
+            sync_file,
+            installed,
+            max_file_size,
+            Some(reservation_owner),
+        )
+    }
+
     /// Resume a v8 Leader writer from a durably installed Active recovery.
+    #[cfg(test)]
     pub(crate) fn new(
         write_file: File,
         sync_file: File,
         installed: &WalV8InstalledRecovery,
         max_file_size: u64,
+    ) -> Result<Self> {
+        Self::new_inner(write_file, sync_file, installed, max_file_size, None)
+    }
+
+    fn new_inner(
+        write_file: File,
+        sync_file: File,
+        installed: &WalV8InstalledRecovery,
+        max_file_size: u64,
+        reservation_owner: Option<Arc<WalV8ReservationOwner>>,
     ) -> Result<Self> {
         ensure!(
             max_file_size >= installed.image_len && max_file_size <= MAX_WAL_FILE_SIZE,
@@ -209,6 +267,7 @@ impl WalV8LeaderWriter {
             physical_header_digest,
             initial_prefix_digest,
             coordinator,
+            reservation_owner,
             frontier: installed.frontier,
             frontier_offset: installed.frontier_offset,
             frontier_digest: installed.frontier_digest,
@@ -244,6 +303,16 @@ impl WalV8LeaderWriter {
             "v8 Leader group size is outside its bounded ticket window"
         );
         let limits = bounded_limits(limits);
+        // Declare resource guards before the allocations they cover, so the
+        // buffers and canonical indexes are dropped first even on unwind.
+        let mut preparation_resources = Vec::new();
+        preparation_resources
+            .try_reserve_exact(batches.len())
+            .context("reserve v8 preparation resource guards")?;
+        let mut batch_resources = Vec::new();
+        batch_resources
+            .try_reserve_exact(batches.len())
+            .context("reserve v8 batch resource guards")?;
         let mut prepared_batches = Vec::new();
         prepared_batches
             .try_reserve_exact(batches.len())
@@ -282,7 +351,15 @@ impl WalV8LeaderWriter {
                         preparation_index_bytes <= self.max_file_size,
                         WalV8LeaderCapacityError::GroupExceedsAdmissionWindow
                     );
-                    self.coordinator.reserve_preparation(bytes)
+                    let resource = self
+                        .reservation_owner
+                        .as_ref()
+                        .map(|owner| owner.reserve_preparation_buffer(bytes))
+                        .transpose()?
+                        .flatten();
+                    let reservation = self.coordinator.reserve_preparation(bytes)?;
+                    preparation_resources.push(resource);
+                    Ok(reservation)
                 },
             )?;
             prepared_batches.push(prepared);
@@ -299,26 +376,9 @@ impl WalV8LeaderWriter {
                 .context("v8 group DATA allocation end overflows")?;
             previous_commit_ts = batch.commit_ts;
         }
-        let frontier_end = frontier_offset
-            .checked_add(FRAME_LEN_U64)
-            .context("v8 group FRONTIER allocation end overflows")?;
-        if frontier_end > self.max_file_size {
-            let fresh_end = HEADER_LEN_U64
-                .checked_add(FRAME_LEN_U64)
-                .and_then(|start| {
-                    prepared_batches.iter().try_fold(start, |offset, prepared| {
-                        offset.checked_add(u64::try_from(prepared.frame_buffer_bytes()).ok()?)
-                    })
-                })
-                .and_then(|end| end.checked_add(FRAME_LEN_U64))
-                .context("v8 fresh-segment capacity calculation overflows")?;
-            let error = if fresh_end <= self.max_file_size {
-                WalV8LeaderCapacityError::RotationRequired
-            } else {
-                WalV8LeaderCapacityError::BatchTooLarge
-            };
-            return Err(anyhow::Error::new(error));
-        }
+        let group_marker_bytes = u64::try_from(prepared_batches.len())?
+            .checked_mul(FRAME_LEN_U64)
+            .context("v8 group FRONTIER reservation overflows")?;
         let next_generation = self
             .frontier
             .generation
@@ -351,6 +411,45 @@ impl WalV8LeaderWriter {
             WalV8LeaderCapacityError::GroupExceedsAdmissionWindow
         );
 
+        // Admission reserves one worst-case marker per ticket, even though
+        // this Leader group normally publishes a single shared FRONTIER.
+        let reserved_end = frontier_offset
+            .checked_add(group_marker_bytes)
+            .context("v8 group FRONTIER allocation end overflows")?;
+        if reserved_end > self.max_file_size {
+            let fresh_end = HEADER_LEN_U64
+                .checked_add(FRAME_LEN_U64)
+                .and_then(|start| {
+                    prepared_batches.iter().try_fold(start, |offset, prepared| {
+                        offset.checked_add(u64::try_from(prepared.frame_buffer_bytes()).ok()?)
+                    })
+                })
+                .and_then(|end| end.checked_add(group_marker_bytes))
+                .context("v8 fresh-segment capacity calculation overflows")?;
+            let error = if fresh_end <= self.max_file_size {
+                WalV8LeaderCapacityError::RotationRequired
+            } else {
+                WalV8LeaderCapacityError::BatchTooLarge
+            };
+            return Err(anyhow::Error::new(error));
+        }
+
+        // Reserve every DATA range, worst-case marker, and buffer before the
+        // first ticket is assigned or a frame buffer is allocated.
+        for prepared in &prepared_batches {
+            let reservation = self
+                .reservation_owner
+                .as_ref()
+                .map(|owner| {
+                    owner.reserve_batch(
+                        u64::try_from(prepared.logical_batch_bytes())?,
+                        u64::try_from(prepared.frame_buffer_bytes())?,
+                    )
+                })
+                .transpose()?;
+            batch_resources.push(reservation);
+        }
+
         // Delay large aligned allocations and handle clones until metadata,
         // timestamp, physical-capacity, and aggregate-memory preflight pass.
         for prepared in &prepared_batches {
@@ -371,8 +470,12 @@ impl WalV8LeaderWriter {
             self.coordinator.admitted_window().is_empty(),
             "serial v8 protocol writer has unresolved tickets"
         );
-        for prepared in prepared_batches {
-            admitted_batches.push(prepared.admit(&self.coordinator)?);
+        for (prepared, reservation) in prepared_batches.into_iter().zip(&mut batch_resources) {
+            let publisher = WalV8LeaderAdmissionPublisher {
+                coordinator: &self.coordinator,
+                reservation: RefCell::new(reservation),
+            };
+            admitted_batches.push(prepared.admit(&publisher)?);
         }
 
         let producer_result = thread::scope(|scope| -> Result<()> {
@@ -499,6 +602,13 @@ impl WalV8LeaderWriter {
         )
         .context("write v8 Leader FRONTIER")?;
         fdatasync_once(&self.sync_file).context("fdatasync v8 Leader WAL")?;
+        // The group used one marker. Retire each additional marker credit only
+        // after that marker and all DATA have reached the durable boundary.
+        for reservation in batch_resources.iter_mut().skip(1).flatten() {
+            reservation
+                .release_unused_frontier_credit()
+                .context("release coalesced v8 FRONTIER reservation")?;
+        }
         self.coordinator.publish_durable_frontier(reservation)?;
 
         // Everything below is infallible publication after the successful
@@ -643,6 +753,10 @@ fn write_aligned_once(file: &File, bytes: &[u8], offset: u64) -> io::Result<()> 
 }
 
 fn fdatasync_once(file: &File) -> io::Result<()> {
+    #[cfg(feature = "chaos-testing")]
+    crate::chaos::failpoint::fail_point!("wal.v8.leader.fdatasync", |_| Err(io::Error::other(
+        "injected v8 WAL sync failure"
+    )));
     loop {
         // SAFETY: fdatasync only borrows the live descriptor for the call.
         let result = unsafe { libc::fdatasync(file.as_raw_fd()) };
@@ -685,6 +799,9 @@ mod tests {
     use crate::pitr::{
         ArchiveEpochId, ChainAnchor, RecordedAt, SegmentId, TimelineId, WalEntry,
         manifest::ActiveBoundary,
+    };
+    use crate::wal::v7::admission::{
+        WalV7ResourceCharge, WalV7ResourceLedger, WalV7ResourceLimits, WalV7RetainedResources,
     };
 
     fn header() -> WalV8Header {
@@ -751,6 +868,197 @@ mod tests {
             installed,
             MAX_WAL_FILE_SIZE,
         )
+    }
+
+    fn open_accounted_writer(
+        path: &Path,
+        installed: &WalV8InstalledRecovery,
+        max_file_size: u64,
+        max_source_spool_bytes: u64,
+        allocation_unit: u64,
+        sync_file: File,
+    ) -> Result<(WalV8LeaderWriter, Arc<WalV8ReservationOwner>)> {
+        let ledger = WalV7ResourceLedger::new(WalV7ResourceLimits {
+            max_logical_wal_bytes: max_file_size,
+            max_source_spool_bytes,
+            max_recovery_workspace_bytes: max_file_size,
+            max_buffer_memory_bytes: max_file_size * 2,
+            max_seal_index_bytes: max_file_size,
+        })?;
+        let retained = WalV7RetainedResources::new(ledger);
+        retained.reserve_segment(
+            installed.selection.header.segment_id.0,
+            WalV7ResourceCharge {
+                source_spool_bytes: HEADER_LEN_U64 + FRAME_LEN_U64,
+                ..WalV7ResourceCharge::default()
+            },
+        )?;
+        let owner = Arc::new(WalV8ReservationOwner::new_with_retained_resources(
+            retained,
+            installed,
+            installed.image_len,
+            max_file_size,
+            allocation_unit,
+        )?);
+        let writer = WalV8LeaderWriter::new_with_reservation_owner(
+            OpenOptions::new().read(true).write(true).open(path)?,
+            sync_file,
+            installed,
+            max_file_size,
+            Arc::clone(&owner),
+        )?;
+        Ok((writer, owner))
+    }
+
+    #[test]
+    fn accounted_group_retains_one_marker_and_recovery_workspace() -> Result<()> {
+        const SEGMENT_LIMIT: u64 = 64 * 1024;
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("active-v8.wal");
+        let installed = install_empty(&path, header())?;
+        let sync_file = OpenOptions::new().read(true).write(true).open(&path)?;
+        let (mut writer, owner) = open_accounted_writer(
+            &path,
+            &installed,
+            SEGMENT_LIMIT,
+            2 * SEGMENT_LIMIT,
+            8192,
+            sync_file,
+        )?;
+
+        writer.append_group(&[batch(10), batch(20)], LIVE_WAL_V5_LIMITS)?;
+        let charge = owner.image_owner().snapshot();
+        assert_eq!(charge.logical_wal_bytes, 3 * FRAME_LEN_U64);
+        assert_eq!(charge.source_spool_bytes, FIXED_IMAGE_TEST_BYTES + 3 * 8192);
+        assert_eq!(charge.recovery_workspace_bytes, SEGMENT_LIMIT);
+        assert_eq!(charge.buffer_memory_bytes, 0);
+        assert_eq!(
+            charge.seal_index_bytes,
+            2 * std::mem::size_of::<u64>() as u64
+        );
+        assert_eq!(
+            writer.image_len()?,
+            FIXED_IMAGE_TEST_BYTES + 3 * FRAME_LEN_U64
+        );
+        Ok(())
+    }
+
+    const FIXED_IMAGE_TEST_BYTES: u64 = HEADER_LEN_U64 + FRAME_LEN_U64;
+
+    #[test]
+    fn spool_pressure_rejects_before_ticket_and_preserves_workspace() -> Result<()> {
+        const SEGMENT_LIMIT: u64 = 64 * 1024;
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("active-v8.wal");
+        let installed = install_empty(&path, header())?;
+        let sync_file = OpenOptions::new().read(true).write(true).open(&path)?;
+        let (mut writer, owner) = open_accounted_writer(
+            &path,
+            &installed,
+            SEGMENT_LIMIT,
+            SEGMENT_LIMIT + FIXED_IMAGE_TEST_BYTES + 2 * FRAME_LEN_U64 - 1,
+            FRAME_LEN_U64,
+            sync_file,
+        )?;
+
+        assert!(writer.append_batch(&batch(10), LIVE_WAL_V5_LIMITS).is_err());
+        assert_eq!(writer.coordinator.next_ticket(), 0);
+        assert!(!writer.is_poisoned());
+        let charge = owner.image_owner().snapshot();
+        assert_eq!(charge.logical_wal_bytes, 0);
+        assert_eq!(charge.source_spool_bytes, FIXED_IMAGE_TEST_BYTES);
+        assert_eq!(charge.recovery_workspace_bytes, SEGMENT_LIMIT);
+        assert_eq!(charge.buffer_memory_bytes, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn uncertain_sync_keeps_admitted_source_and_workspace_charged() -> Result<()> {
+        const SEGMENT_LIMIT: u64 = 64 * 1024;
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("active-v8.wal");
+        let installed = install_empty(&path, header())?;
+        let path_c = CString::new(path.as_os_str().as_encoded_bytes())?;
+        // SAFETY: path_c is NUL-terminated; ownership of the returned fd is transferred below.
+        let sync_fd = unsafe { libc::open(path_c.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
+        ensure!(
+            sync_fd >= 0,
+            "open O_PATH sync handle: {}",
+            io::Error::last_os_error()
+        );
+        // SAFETY: sync_fd is a newly opened descriptor with no other owner.
+        let sync_file = unsafe { File::from_raw_fd(sync_fd) };
+        let (mut writer, owner) = open_accounted_writer(
+            &path,
+            &installed,
+            SEGMENT_LIMIT,
+            2 * SEGMENT_LIMIT,
+            FRAME_LEN_U64,
+            sync_file,
+        )?;
+
+        assert!(writer.append_batch(&batch(10), LIVE_WAL_V5_LIMITS).is_err());
+        assert!(writer.is_poisoned());
+        let charge = owner.image_owner().snapshot();
+        assert_eq!(charge.logical_wal_bytes, 2 * FRAME_LEN_U64);
+        assert_eq!(
+            charge.source_spool_bytes,
+            FIXED_IMAGE_TEST_BYTES + 2 * FRAME_LEN_U64
+        );
+        assert_eq!(charge.recovery_workspace_bytes, SEGMENT_LIMIT);
+        assert_eq!(charge.buffer_memory_bytes, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn recovered_image_recharges_its_existing_source_and_logical_bytes() -> Result<()> {
+        const SEGMENT_LIMIT: u64 = 64 * 1024;
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("active-v8.wal");
+        let header = header();
+        let installed = install_empty(&path, header)?;
+        let sync_file = OpenOptions::new().read(true).write(true).open(&path)?;
+        let (mut writer, owner) = open_accounted_writer(
+            &path,
+            &installed,
+            SEGMENT_LIMIT,
+            2 * SEGMENT_LIMIT,
+            FRAME_LEN_U64,
+            sync_file,
+        )?;
+        writer.append_group(&[batch(10), batch(20)], LIVE_WAL_V5_LIMITS)?;
+        let (_, boundary) = writer.active_boundaries()?;
+        drop(writer);
+        drop(owner);
+
+        let recovered = super::super::install::recover_and_install_active(
+            &path,
+            &[boundary],
+            header.predecessor,
+            LIVE_WAL_V5_LIMITS,
+            SEGMENT_LIMIT,
+        )?;
+        let sync_file = OpenOptions::new().read(true).write(true).open(&path)?;
+        let (mut writer, owner) = open_accounted_writer(
+            &path,
+            &recovered,
+            SEGMENT_LIMIT,
+            2 * SEGMENT_LIMIT,
+            FRAME_LEN_U64,
+            sync_file,
+        )?;
+        let charge = owner.image_owner().snapshot();
+        assert_eq!(
+            charge.logical_wal_bytes,
+            recovered.image_len - FIXED_IMAGE_TEST_BYTES
+        );
+        assert_eq!(charge.source_spool_bytes, recovered.image_len);
+        assert_eq!(charge.recovery_workspace_bytes, SEGMENT_LIMIT);
+        assert_eq!(
+            writer.append_batch(&batch(30), LIVE_WAL_V5_LIMITS)?.ticket,
+            2
+        );
+        Ok(())
     }
 
     #[test]
@@ -904,6 +1212,49 @@ mod tests {
         assert!(error.downcast_ref::<WalV8LeaderCapacityError>().is_some());
         assert!(!writer.is_poisoned());
         assert_eq!(std::fs::metadata(&path)?.len(), installed.image_len);
+        Ok(())
+    }
+
+    #[test]
+    fn group_capacity_failure_preserves_writer_before_any_admission() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("active-v8.wal");
+        let installed = install_empty(&path, header())?;
+        // Two DATA frames and one shared marker would fit, but the two
+        // worst-case per-ticket marker reservations do not.
+        let max_file_size = FIXED_IMAGE_TEST_BYTES + 3 * FRAME_LEN_U64;
+        let mut writer = WalV8LeaderWriter::new(
+            OpenOptions::new().read(true).write(true).open(&path)?,
+            OpenOptions::new().read(true).write(true).open(&path)?,
+            &installed,
+            max_file_size,
+        )?;
+        let first = batch(10);
+        let second = batch(20);
+        let error = writer
+            .append_group(&[first.clone(), second.clone()], LIVE_WAL_V5_LIMITS)
+            .err()
+            .context("group should exceed fresh-segment reservation capacity")?;
+        assert_eq!(
+            error.downcast_ref::<WalV8LeaderCapacityError>(),
+            Some(&WalV8LeaderCapacityError::BatchTooLarge)
+        );
+        assert_eq!(writer.coordinator.next_ticket(), 0);
+        assert_eq!(std::fs::metadata(&path)?.len(), installed.image_len);
+        assert!(!writer.is_poisoned());
+
+        // The rejected group left the writer usable. A single batch fits, and
+        // the next one reports rotation rather than poisoning on admission.
+        assert_eq!(writer.append_batch(&first, LIVE_WAL_V5_LIMITS)?.ticket, 0);
+        let error = writer
+            .append_batch(&second, LIVE_WAL_V5_LIMITS)
+            .expect_err("next batch should require a fresh segment");
+        assert_eq!(
+            error.downcast_ref::<WalV8LeaderCapacityError>(),
+            Some(&WalV8LeaderCapacityError::RotationRequired)
+        );
+        assert_eq!(writer.coordinator.next_ticket(), 1);
+        assert!(!writer.is_poisoned());
         Ok(())
     }
 

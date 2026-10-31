@@ -283,6 +283,7 @@ struct WalV7ReservationOwnerState {
 pub(crate) struct WalV7OwnedBatchReservation {
     operation: Arc<WalV7BatchOperation>,
     frontier_credit_held: bool,
+    frontier_source_credit: u64,
 }
 
 struct WalV7BatchOperation {
@@ -364,11 +365,45 @@ impl WalV7ReservationOwner {
         sealing: bool,
     ) -> anyhow::Result<Self> {
         let seed = installed.runtime_seed()?;
-        let mut reservations = AHashMap::new();
         let mut recovered_charge = installed.recovered_resource_charge()?;
         if sealing {
             recovered_charge.logical_wal_bytes = 0;
         }
+        Self::new_image(
+            ledger,
+            retained_resources,
+            seed.installed_dev,
+            seed.installed_ino,
+            recovered_charge,
+        )
+    }
+
+    /// Bind another versioned WAL image to the same reconstructed PITR ledger.
+    /// The caller supplies a verified inode and a charge excluding any fixed
+    /// image bytes already retained by the segment ledger.
+    pub(crate) fn new_with_retained_image_charge(
+        retained_resources: Arc<WalV7RetainedResources>,
+        installed_dev: u64,
+        installed_ino: u64,
+        recovered_charge: WalV7ResourceCharge,
+    ) -> anyhow::Result<Self> {
+        Self::new_image(
+            retained_resources.ledger(),
+            Some(retained_resources),
+            installed_dev,
+            installed_ino,
+            recovered_charge,
+        )
+    }
+
+    fn new_image(
+        ledger: WalV7ResourceLedger,
+        retained_resources: Option<Arc<WalV7RetainedResources>>,
+        installed_dev: u64,
+        installed_ino: u64,
+        recovered_charge: WalV7ResourceCharge,
+    ) -> anyhow::Result<Self> {
+        let mut reservations = AHashMap::new();
         if recovered_charge != WalV7ResourceCharge::default() {
             let reservation = ledger.reserve(recovered_charge)?;
             reservations.insert(reservation.id, reservation);
@@ -376,8 +411,8 @@ impl WalV7ReservationOwner {
         Ok(Self {
             ledger,
             retained_resources,
-            installed_dev: seed.installed_dev,
-            installed_ino: seed.installed_ino,
+            installed_dev,
+            installed_ino,
             state: Mutex::new(WalV7ReservationOwnerState {
                 retired: false,
                 active_batch_operations: 0,
@@ -435,6 +470,26 @@ impl WalV7ReservationOwner {
         self: &Arc<Self>,
         encoded_batch_bytes: u64,
     ) -> Result<WalV7OwnedBatchReservation, WalV7ReservationError> {
+        self.reserve_batch_charge(
+            WalV7ResourceCharge::for_batch(encoded_batch_bytes)?,
+            WAL_V7_FRAME_LEN as u64,
+        )
+    }
+
+    /// Reserve a checked versioned-WAL batch charge with its physical marker
+    /// credit. The marker may occupy more than one frame on filesystems with
+    /// allocation units larger than the WAL frame size.
+    pub(crate) fn reserve_batch_charge(
+        self: &Arc<Self>,
+        charge: WalV7ResourceCharge,
+        frontier_source_credit: u64,
+    ) -> Result<WalV7OwnedBatchReservation, WalV7ReservationError> {
+        if charge.logical_wal_bytes < WAL_V7_FRAME_LEN as u64
+            || frontier_source_credit < WAL_V7_FRAME_LEN as u64
+            || charge.source_spool_bytes < frontier_source_credit
+        {
+            return Err(WalV7ReservationError::InvalidBatchLength);
+        }
         let mut state = self.state.lock();
         if state.retired {
             return Err(WalV7ReservationError::ReservationOwnerRetired);
@@ -443,7 +498,7 @@ impl WalV7ReservationOwner {
             .active_batch_operations
             .checked_add(1)
             .ok_or(WalV7ReservationError::ArithmeticOverflow)?;
-        let reservation = self.ledger.reserve_batch(encoded_batch_bytes)?;
+        let reservation = self.ledger.reserve(charge)?;
         let id = reservation.id;
         state.reservations.insert(id, reservation);
         state.active_batch_operations = active_batch_operations;
@@ -456,6 +511,7 @@ impl WalV7ReservationOwner {
                 finished: false,
             }),
             frontier_credit_held: true,
+            frontier_source_credit,
         })
     }
 
@@ -586,13 +642,18 @@ impl WalV7ReservationOwner {
         result.and(operation_result)
     }
 
-    fn release_frontier_credit(&self, id: u64) -> Result<(), WalV7ReservationError> {
+    fn release_frontier_credit(
+        &self,
+        id: u64,
+        source_credit: u64,
+    ) -> Result<(), WalV7ReservationError> {
         let mut state = self.state.lock();
         let reservation = state
             .reservations
             .get_mut(&id)
             .ok_or(WalV7ReservationError::UnknownReservation)?;
-        self.ledger.release_frontier_credit(reservation)
+        self.ledger
+            .release_frontier_credit(reservation, source_credit)
     }
 
     #[cfg(test)]
@@ -677,7 +738,7 @@ impl WalV7OwnedBatchReservation {
         }
         self.operation
             .owner
-            .release_frontier_credit(self.operation.id)?;
+            .release_frontier_credit(self.operation.id, self.frontier_source_credit)?;
         self.frontier_credit_held = false;
         Ok(())
     }
@@ -1002,6 +1063,7 @@ impl WalV7ResourceLedger {
     fn release_frontier_credit(
         &self,
         reservation: &mut WalV7Reservation,
+        source_credit: u64,
     ) -> Result<(), WalV7ReservationError> {
         if !Arc::ptr_eq(&reservation.ledger, &self.inner) {
             return Err(WalV7ReservationError::ForeignReservation);
@@ -1018,7 +1080,7 @@ impl WalV7ResourceLedger {
         }
         let retired = WalV7ResourceCharge {
             logical_wal_bytes: credit,
-            source_spool_bytes: credit,
+            source_spool_bytes: source_credit,
             ..WalV7ResourceCharge::default()
         };
         let retained = issued_charge

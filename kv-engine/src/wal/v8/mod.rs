@@ -12,5 +12,6 @@ pub(crate) mod leader;
 pub(crate) mod parallel;
 pub(crate) mod prepare;
 pub(crate) mod recovery;
+pub(crate) mod resource;
 
 pub(crate) const WAL_V8_HEADER_LEN: usize = 4096;

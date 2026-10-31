@@ -35,16 +35,16 @@ const PUBLICATION_DISTANCE_THRESHOLD: u64 = 16;
 const DRAIN_RECHECK: std::time::Duration = std::time::Duration::from_millis(1);
 type WalPublish = (u64, Vec<u8>, Vec<u8>, Option<u64>);
 
-/// A caught v7 panic cannot leave an outstanding reservation without closing
+/// A caught versioned-WAL panic cannot leave an outstanding reservation without closing
 /// admission. The synchronous append may already have written or synced its
 /// batch, so conservatively require recovery even if the panic preceded I/O.
-struct V7CommitUnwindGuard<'a> {
+struct VersionedCommitUnwindGuard<'a> {
     mvcc: &'a LsmMvccInner,
     commit_ts: u64,
     enabled: bool,
 }
 
-impl Drop for V7CommitUnwindGuard<'_> {
+impl Drop for VersionedCommitUnwindGuard<'_> {
     fn drop(&mut self) {
         if self.enabled && std::thread::panicking() {
             self.mvcc.poison_commit_ts(self.commit_ts);
@@ -159,6 +159,7 @@ pub(crate) struct LsmMvccInner {
 
 struct PublicationState {
     admission_open: bool,
+    fence_generation: u64,
     next_to_publish: u64,
     retired: BTreeSet<u64>,
     /// Memtable publication is complete, but an earlier reservation still
@@ -198,11 +199,33 @@ impl LsmMvccInner {
 
     #[allow(dead_code)]
     pub(crate) fn stop_commit_admission_and_capture(&self) -> anyhow::Result<Option<u64>> {
+        self.stop_commit_admission(false)
+            .map(|(_, current)| current)
+    }
+
+    /// Drain a sync without replacing an existing owner's admission fence.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn stop_commit_admission_for_sync(&self) -> anyhow::Result<bool> {
+        self.stop_commit_admission(true)
+            .map(|(was_open, _)| was_open)
+    }
+
+    fn stop_commit_admission(
+        &self,
+        preserve_closed_fence: bool,
+    ) -> anyhow::Result<(bool, Option<u64>)> {
         let mut publication = self.publication.lock();
         anyhow::ensure!(
             publication.poisoned_at.is_none(),
             "commit publication barrier requires recovery"
         );
+        let was_open = publication.admission_open;
+        if was_open || !preserve_closed_fence {
+            publication.fence_generation = publication
+                .fence_generation
+                .checked_add(1)
+                .ok_or_else(|| anyhow::anyhow!("commit admission fence generation exhausted"))?;
+        }
         publication.admission_open = false;
         // Before reading the drain target: a writer that still sees the gate
         // open must have allocated below it. See `commit_gate`.
@@ -243,7 +266,7 @@ impl LsmMvccInner {
         self.publish_frontier(&publication);
         let current = self.current_ts.load(Ordering::Acquire);
 
-        Ok((current != 0).then_some(current))
+        Ok((was_open, (current != 0).then_some(current)))
     }
 
     #[allow(dead_code)]
@@ -257,6 +280,26 @@ impl LsmMvccInner {
         }
         self.publication_condvar.notify_all();
         self.async_publication_changed.notify_waiters();
+    }
+
+    pub(crate) fn closed_admission_generation(&self) -> Option<u64> {
+        let publication = self.publication.lock();
+        (!publication.admission_open).then_some(publication.fence_generation)
+    }
+
+    pub(crate) fn resume_commit_admission_if_generation(&self, generation: u64) -> bool {
+        let mut publication = self.publication.lock();
+        if publication.admission_open
+            || publication.fence_generation != generation
+            || publication.poisoned_at.is_some()
+        {
+            return false;
+        }
+        publication.admission_open = true;
+        self.commit_gate.store(false, Ordering::SeqCst);
+        self.publication_condvar.notify_all();
+        self.async_publication_changed.notify_waiters();
+        true
     }
 
     #[cfg(any(target_os = "linux", test))]
@@ -289,6 +332,7 @@ impl LsmMvccInner {
             recorded_at_high_water: Mutex::new(None),
             publication: Mutex::new(PublicationState {
                 admission_open: true,
+                fence_generation: 0,
                 next_to_publish: initial_ts.saturating_add(1),
                 retired: BTreeSet::new(),
                 ready: BTreeSet::new(),
@@ -488,15 +532,15 @@ impl LsmMvccInner {
         }
     }
 
-    fn guard_v7_commit_unwind(
+    fn guard_versioned_commit_unwind(
         &self,
         memtable: &MemTable,
         commit_ts: u64,
-    ) -> V7CommitUnwindGuard<'_> {
-        V7CommitUnwindGuard {
+    ) -> VersionedCommitUnwindGuard<'_> {
+        VersionedCommitUnwindGuard {
             mvcc: self,
             commit_ts,
-            enabled: memtable.uses_v7_wal(),
+            enabled: memtable.uses_v7_wal() || memtable.uses_v8_wal(),
         }
     }
 
@@ -514,11 +558,11 @@ impl LsmMvccInner {
         Ok(())
     }
 
-    /// The serial v7 adapter includes its sync in append. An append error after
+    /// The serial v7 and v8 adapters include their sync in append. An error after
     /// admission can therefore leave a recoverable batch, just like a failed
     /// ticket barrier; only a pre-admission rejection can retire a data-free gap.
     fn record_wal_append_failure(&self, memtable: &MemTable, commit_ts: u64) {
-        if memtable.v7_wal_requires_recovery() {
+        if memtable.versioned_wal_requires_recovery() {
             self.poison_commit_ts(commit_ts);
         } else {
             self.retire_commit_ts(commit_ts);
@@ -748,7 +792,7 @@ impl LsmMvccInner {
         }
         let _write_guard = self.write_lock.lock();
         let commit_ts = self.reserve_commit_ts()?;
-        let _unwind_guard = self.guard_v7_commit_unwind(memtable, commit_ts);
+        let _unwind_guard = self.guard_versioned_commit_unwind(memtable, commit_ts);
         let encoded_key = encode_internal_key(user_key, commit_ts);
         let mut prefixed = Vec::with_capacity(1 + value.len());
         prefixed.push(crate::vlog::KvKind::Inline as u8);
@@ -811,7 +855,7 @@ impl LsmMvccInner {
 
         let _write_guard = self.write_lock.lock();
         let commit_ts = self.reserve_commit_ts()?;
-        let _unwind_guard = self.guard_v7_commit_unwind(memtable, commit_ts);
+        let _unwind_guard = self.guard_versioned_commit_unwind(memtable, commit_ts);
         let encoded_key = encode_internal_key(user_key, commit_ts);
         let (ticket, frame_job) = match memtable.admit_prepared_v7_pitr_wal_batch_only(
             prepared,
@@ -842,7 +886,7 @@ impl LsmMvccInner {
     ) -> Result<WalPublish, anyhow::Error> {
         let _write_guard = self.write_lock.lock();
         let commit_ts = self.reserve_commit_ts()?;
-        let _unwind_guard = self.guard_v7_commit_unwind(memtable, commit_ts);
+        let _unwind_guard = self.guard_versioned_commit_unwind(memtable, commit_ts);
         let encoded_key = encode_internal_key(user_key, commit_ts);
         let tombstone_val = vec![crate::vlog::KvKind::Tombstone as u8];
         let (ticket, frame_job) = match if memtable.uses_pitr_batch_wal() {
@@ -897,7 +941,7 @@ impl LsmMvccInner {
         );
         let _write_guard = self.write_lock.lock();
         let commit_ts = self.reserve_commit_ts()?;
-        let _unwind_guard = self.guard_v7_commit_unwind(memtable, commit_ts);
+        let _unwind_guard = self.guard_versioned_commit_unwind(memtable, commit_ts);
         let encoded_key = encode_internal_key(user_key, commit_ts);
         let expire_at = crate::vlog::compute_expire_at(ttl);
         let prefixed =
@@ -957,7 +1001,7 @@ impl LsmMvccInner {
         );
         let _write_guard = self.write_lock.lock();
         let commit_ts = self.reserve_commit_ts()?;
-        let _unwind_guard = self.guard_v7_commit_unwind(memtable, commit_ts);
+        let _unwind_guard = self.guard_versioned_commit_unwind(memtable, commit_ts);
         let (ticket, frame_job) = match if memtable.uses_pitr_batch_wal() {
             let recorded_at = self.pitr_recorded_at_for_commit(commit_ts)?;
             let mut wal_entries = Vec::with_capacity(entries.len());
@@ -1037,7 +1081,7 @@ impl LsmMvccInner {
             return Ok(None);
         };
         let commit_ts = self.reserve_commit_ts()?;
-        let _unwind_guard = self.guard_v7_commit_unwind(memtable, commit_ts);
+        let _unwind_guard = self.guard_versioned_commit_unwind(memtable, commit_ts);
         let (ticket, frame_job) = match memtable.admit_prepared_v7_pitr_wal_batch_only(
             prepared,
             commit_ts,
@@ -1219,7 +1263,7 @@ impl LsmMvccInner {
 
         let _write_guard = write_guard.unwrap_or_else(|| self.write_lock.lock());
         let commit_ts = self.reserve_commit_ts()?;
-        let _unwind_guard = self.guard_v7_commit_unwind(memtable, commit_ts);
+        let _unwind_guard = self.guard_versioned_commit_unwind(memtable, commit_ts);
         let publish_data: Vec<(Bytes, Bytes)> = entries
             .iter()
             .map(|(key, value, kind)| match kind {
@@ -1377,7 +1421,7 @@ impl LsmMvccInner {
         }
         let _write_guard = self.write_lock.lock();
         let commit_ts = self.reserve_commit_ts()?;
-        let _unwind_guard = self.guard_v7_commit_unwind(memtable, commit_ts);
+        let _unwind_guard = self.guard_versioned_commit_unwind(memtable, commit_ts);
         let publish_data: Vec<(Bytes, Bytes)> = keys
             .iter()
             .map(|key| {

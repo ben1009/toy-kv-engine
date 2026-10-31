@@ -755,7 +755,7 @@ async fn acquire_native_preparation(
     }
 }
 
-async fn wait_for_v7_source_spool_capacity(
+pub(crate) async fn wait_for_v7_source_spool_capacity(
     inner: Arc<LsmStorageInner>,
     blocking: BlockingExecutor,
     generation: u64,
@@ -763,6 +763,26 @@ async fn wait_for_v7_source_spool_capacity(
     source_spool_error: anyhow::Error,
 ) -> Result<()> {
     let active_memtable = inner.state.load().memtable.clone();
+    if active_memtable.uses_v8_wal() {
+        return blocking
+            .run_result_with_reserved_capacity(move || {
+                let mut retries = 0;
+                if allow_lifecycle_closing {
+                    inner.retry_after_capacity_error_admitted(
+                        source_spool_error,
+                        &active_memtable,
+                        &mut retries,
+                    )
+                } else {
+                    inner.retry_after_capacity_error(
+                        source_spool_error,
+                        &active_memtable,
+                        &mut retries,
+                    )
+                }
+            })
+            .await;
+    }
     let owner = active_memtable
         .wal_v7_reservation_owner()
         .context("v7 source-spool rejection has no reservation owner")?;

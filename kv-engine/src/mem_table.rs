@@ -1092,6 +1092,10 @@ pub struct MemTable {
     /// True when this memtable was replayed from a frozen v8 PITR WAL. V8
     /// sealed sources are read-only and retain their format identity for PITR.
     wal_v8_source: bool,
+    /// Owns the recovered v8 image's persistent spool and workspace charges.
+    wal_v8_reservation_owner: Option<Arc<crate::wal::v8::resource::WalV8ReservationOwner>>,
+    /// Physical length and ticket count of a read-only sealed v8 source.
+    wal_v8_sealed_extent: Option<(u64, u64)>,
     /// Terminal cursor retained while a durable Sealing source is recovered
     /// read-only. Explicit resume uses it to finish sealing without starting an
     /// append runtime for the frozen source.
@@ -1141,6 +1145,8 @@ impl MemTable {
             wal_path: None,
             wal_v7_source: false,
             wal_v8_source: false,
+            wal_v8_reservation_owner: None,
+            wal_v8_sealed_extent: None,
             wal_v7_sealing_frontier: None,
             wal_v7_reservation_owner: None,
             wal_v7_seal_index: None,
@@ -1454,7 +1460,7 @@ impl MemTable {
     /// Recover and reopen a normalized Active v8 WAL with its serial Leader
     /// writer. The caller must have authority-checked and durably installed the
     /// image before attaching it to a writable memtable.
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", test))]
     pub(crate) fn recover_from_v8_active(
         id: usize,
         vlog_enabled: bool,
@@ -1462,6 +1468,76 @@ impl MemTable {
         installed: crate::wal::v8::install::WalV8InstalledRecovery,
         max_file_size: u64,
     ) -> Result<(Self, u64)> {
+        Self::recover_from_v8_active_inner(
+            id,
+            vlog_enabled,
+            path,
+            installed,
+            |write, sync, installed| {
+                let writer = crate::wal::v8::leader::WalV8LeaderWriter::new(
+                    write,
+                    sync,
+                    installed,
+                    max_file_size,
+                )?;
+                Ok((writer, None))
+            },
+        )
+    }
+
+    /// Replay under the caller's recovery reservation, then attach an
+    /// image-bound owner before the recovered WAL can accept writes.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn recover_from_v8_active_with_owner<F>(
+        id: usize,
+        vlog_enabled: bool,
+        path: impl AsRef<Path>,
+        installed: crate::wal::v8::install::WalV8InstalledRecovery,
+        max_file_size: u64,
+        create_owner: F,
+    ) -> Result<(Self, u64)>
+    where
+        F: FnOnce(
+            &crate::wal::v8::install::WalV8InstalledRecovery,
+        ) -> Result<Arc<crate::wal::v8::resource::WalV8ReservationOwner>>,
+    {
+        Self::recover_from_v8_active_inner(
+            id,
+            vlog_enabled,
+            path,
+            installed,
+            |write, sync, installed| {
+                let owner = create_owner(installed)?;
+                let writer = crate::wal::v8::leader::WalV8LeaderWriter::new_with_reservation_owner(
+                    write,
+                    sync,
+                    installed,
+                    max_file_size,
+                    Arc::clone(&owner),
+                )?;
+                Ok((writer, Some(owner)))
+            },
+        )
+    }
+
+    #[cfg(target_os = "linux")]
+    fn recover_from_v8_active_inner<F>(
+        id: usize,
+        vlog_enabled: bool,
+        path: impl AsRef<Path>,
+        installed: crate::wal::v8::install::WalV8InstalledRecovery,
+        create_writer: F,
+    ) -> Result<(Self, u64)>
+    where
+        F: FnOnce(
+            File,
+            File,
+            &crate::wal::v8::install::WalV8InstalledRecovery,
+        ) -> Result<(
+            crate::wal::v8::leader::WalV8LeaderWriter,
+            Option<Arc<crate::wal::v8::resource::WalV8ReservationOwner>>,
+        )>,
+    {
         let path = path.as_ref().to_path_buf();
         let max_commit_ts = installed.active_boundary.last_commit_ts;
         let recovered_recorded_at = installed.last_recorded_at;
@@ -1482,13 +1558,9 @@ impl MemTable {
         let sync_file = write_file
             .try_clone()
             .context("clone installed v8 Active WAL sync handle")?;
-        let writer = crate::wal::v8::leader::WalV8LeaderWriter::new(
-            write_file,
-            sync_file,
-            &installed,
-            max_file_size,
-        )?;
+        let (writer, reservation_owner) = create_writer(write_file, sync_file, &installed)?;
         ret.wal = Some(Wal::from_v8_leader(writer, &installed)?);
+        ret.wal_v8_reservation_owner = reservation_owner;
         ret.wal_path = Some(path);
         ret.last_ticket
             .store(installed.next_ticket, std::sync::atomic::Ordering::Release);
@@ -1590,6 +1662,8 @@ impl MemTable {
 
         ret.wal_path = Some(path);
         ret.wal_v8_source = true;
+        ret.wal_v8_sealed_extent =
+            Some((seal.boundary.sealed_end, seal.boundary.active.ticket_end));
         ret.recovered_recorded_at = seal.entries.last().map(|entry| entry.recorded_at);
         ret.rebuild_bloom();
 
@@ -1599,6 +1673,12 @@ impl MemTable {
     #[allow(dead_code)]
     pub(crate) fn wal_v7_reservation_owner(&self) -> Option<Arc<WalV7ReservationOwner>> {
         self.wal_v7_reservation_owner.clone()
+    }
+
+    pub(crate) fn wal_v8_reservation_owner(
+        &self,
+    ) -> Option<Arc<crate::wal::v8::resource::WalV8ReservationOwner>> {
+        self.wal_v8_reservation_owner.clone()
     }
 
     #[allow(dead_code)]
@@ -2400,6 +2480,14 @@ impl MemTable {
         self.wal.as_ref().is_some_and(Wal::v7_requires_recovery)
     }
 
+    /// An admitted versioned WAL append may have reached disk even when it
+    /// returns an error, so MVCC must fence publication until recovery.
+    pub(crate) fn versioned_wal_requires_recovery(&self) -> bool {
+        self.wal
+            .as_ref()
+            .is_some_and(|wal| wal.v7_requires_recovery() || wal.v8_requires_recovery())
+    }
+
     pub(crate) fn stop_v7_extent_initialization(&self) -> Result<()> {
         if let Some(wal) = &self.wal {
             wal.stop_v7_extent_initialization()?;
@@ -2455,19 +2543,27 @@ impl MemTable {
 
     pub(crate) fn wal_logical_length(&self) -> Option<u64> {
         self.wal.as_ref().map(Wal::logical_length).or_else(|| {
-            self.wal_v7_sealing_frontier.and_then(|cursor| {
-                cursor
-                    .frame_offset
-                    .checked_add(crate::wal::v7::codec::WAL_V7_FRAME_LEN as u64)
-            })
+            self.wal_v8_sealed_extent
+                .map(|(length, _)| length)
+                .or_else(|| {
+                    self.wal_v7_sealing_frontier.and_then(|cursor| {
+                        cursor
+                            .frame_offset
+                            .checked_add(crate::wal::v7::codec::WAL_V7_FRAME_LEN as u64)
+                    })
+                })
         })
     }
 
     #[allow(dead_code)]
     pub(crate) fn wal_batch_count(&self) -> Option<u64> {
         self.wal.as_ref().map(Wal::batch_count).or_else(|| {
-            self.wal_v7_sealing_frontier
-                .map(|cursor| cursor.frontier.ticket_end)
+            self.wal_v8_sealed_extent
+                .map(|(_, tickets)| tickets)
+                .or_else(|| {
+                    self.wal_v7_sealing_frontier
+                        .map(|cursor| cursor.frontier.ticket_end)
+                })
         })
     }
 
@@ -4311,6 +4407,158 @@ mod tests {
                 b'2'
             ]))
         );
+
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn v8_pre_admission_rejection_leaves_mvcc_retryable() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("active-v8.wal");
+        let (header, anchor) = install_empty_v8(&path)?;
+        let installed = recover_v8(&path, header, &[anchor])?;
+        let (memtable, max_ts) =
+            MemTable::recover_from_v8_active(8, false, &path, installed, TEST_V8_MAX_IMAGE_LEN)?;
+        let mvcc = LsmMvccInner::new(max_ts);
+        let key = vec![b'k'; LIVE_WAL_V5_LIMITS.max_key_bytes + 1];
+
+        assert!(mvcc.write_wal_only(&key, b"value", &memtable).is_err());
+        assert!(!memtable.versioned_wal_requires_recovery());
+        assert_eq!(mvcc.stop_commit_admission_and_capture()?, None);
+        mvcc.resume_commit_admission();
+        let (commit_ts, key, value, ticket) = mvcc.write_wal_only(b"retry", b"value", &memtable)?;
+        memtable.commit_wal_ticket(ticket)?;
+        memtable.publish_raw_batch(&[(crate::key::KeySlice::from_slice(&key), &value)])?;
+        mvcc.publish_commit_ts(commit_ts)?;
+        assert_eq!(mvcc.latest_commit_ts(), 2);
+
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn v8_active_writer_accepts_unaligned_segment_limit() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("active-v8.wal");
+        let (header, anchor) = install_empty_v8(&path)?;
+        let installed = recover_v8(&path, header, &[anchor])?;
+        let max_segment_bytes = 64 * 1024 + 1;
+        let (memtable, _) =
+            MemTable::recover_from_v8_active(8, false, &path, installed, max_segment_bytes)?;
+        for timestamp in 1..=7 {
+            let ticket = memtable.write_pitr_wal_batch_only(
+                &WalBatch {
+                    commit_ts: timestamp,
+                    recorded_at: RecordedAt {
+                        secs: timestamp as i64,
+                        nanos: 0,
+                    },
+                    entries: vec![WalEntry::Put {
+                        key: vec![timestamp as u8],
+                        value: b"value".to_vec(),
+                    }],
+                },
+                LIVE_WAL_V5_LIMITS,
+            )?;
+            memtable.commit_wal_ticket(ticket)?;
+        }
+        assert_eq!(fs::metadata(&path)?.len(), 64 * 1024);
+        let (_, current_anchor) = memtable.v8_active_boundaries()?;
+        drop(memtable);
+
+        let installed = recover_and_install_v8_active(
+            &path,
+            &[current_anchor],
+            header.predecessor,
+            LIVE_WAL_V5_LIMITS,
+            max_segment_bytes,
+        )?;
+        let (reopened, max_ts) =
+            MemTable::recover_from_v8_active(8, false, &path, installed, max_segment_bytes)?;
+        assert_eq!(max_ts, 7);
+        assert_eq!(reopened.wal_batch_count(), Some(7));
+
+        Ok(())
+    }
+
+    #[cfg(all(target_os = "linux", feature = "chaos-testing"))]
+    #[test]
+    fn failpoint_v8_sync_failures_poison_mvcc_for_every_write_path() -> Result<()> {
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+
+        use crate::chaos::failpoint::{self, FailScenario};
+
+        for action in ["return", "panic"] {
+            for operation in ["put", "delete", "ttl", "ranges", "batch", "deletes"] {
+                let scenario = FailScenario::setup();
+                let directory = tempfile::tempdir()?;
+                let path = directory.path().join("active-v8.wal");
+                let (header, anchor) = install_empty_v8(&path)?;
+                let installed = recover_v8(&path, header, &[anchor])?;
+                let (memtable, max_ts) = MemTable::recover_from_v8_active(
+                    8,
+                    false,
+                    &path,
+                    installed,
+                    TEST_V8_MAX_IMAGE_LEN,
+                )?;
+                let mvcc = LsmMvccInner::new(max_ts);
+                failpoint::cfg("wal.v8.leader.fdatasync", action).expect("arm v8 sync failure");
+                let result = catch_unwind(AssertUnwindSafe(|| match operation {
+                    "put" => mvcc.write_wal_only(b"key", b"value", &memtable).map(|_| ()),
+                    "delete" => mvcc.write_tombstone_wal_only(b"key", &memtable).map(|_| ()),
+                    "ttl" => mvcc
+                        .write_ttl_wal_only(
+                            b"key",
+                            b"value",
+                            std::time::Duration::from_secs(60),
+                            &memtable,
+                        )
+                        .map(|_| ()),
+                    "ranges" => mvcc
+                        .write_range_batch_wal_only(&[(b"a", b"z")], &memtable)
+                        .map(|_| ()),
+                    "batch" => mvcc
+                        .write_batch_wal_only(
+                            &[(
+                                Bytes::from_static(b"key"),
+                                Bytes::from_static(b"value"),
+                                BatchEntryKind::PutRaw,
+                            )],
+                            &memtable,
+                            false,
+                        )
+                        .map(|_| ()),
+                    "deletes" => mvcc
+                        .write_delete_batch_wal_only(
+                            &[Bytes::from_static(b"key")],
+                            &memtable,
+                            false,
+                        )
+                        .map(|_| ()),
+                    _ => unreachable!(),
+                }));
+                scenario.teardown();
+
+                if action == "panic" {
+                    assert!(result.is_err(), "{operation} must unwind at the v8 sync");
+                } else {
+                    let error = result
+                        .expect("v8 sync returns an error")
+                        .expect_err("v8 sync fails after DATA and FRONTIER writes");
+                    assert!(format!("{error:#}").contains("fdatasync"), "{operation}");
+                }
+                assert!(mvcc.reserve_commit_ts().is_err(), "{operation}/{action}");
+                assert!(mvcc.stop_commit_admission_and_capture().is_err());
+                assert!(memtable.is_empty());
+                drop(memtable);
+
+                let recovered = recover_v8(&path, header, &[anchor])?;
+                assert_eq!(recovered.next_ticket, 1, "{operation}/{action}");
+                assert_eq!(recovered.active_boundary.last_commit_ts, 1);
+            }
+        }
 
         Ok(())
     }

@@ -458,6 +458,10 @@ impl LsmStorageInner {
             !self.state.load().memtable.uses_v7_wal(),
             "PITR engine owner is not installed"
         );
+        ensure!(
+            !self.state.load().memtable.uses_v8_wal(),
+            "checkpoint capture for an Active v8 PITR WAL is not supported"
+        );
 
         capture(false)
     }
@@ -472,6 +476,10 @@ impl LsmStorageInner {
         ensure!(
             !self.state.load().memtable.uses_v7_wal(),
             "v7 PITR checkpoint capture requires Linux"
+        );
+        ensure!(
+            !self.state.load().memtable.uses_v8_wal(),
+            "checkpoint capture for an Active v8 PITR WAL is not supported"
         );
         let _checkpoint_guard = self.checkpoint_lock.lock();
         if !staging_prepared {
@@ -558,6 +566,10 @@ impl LsmStorageInner {
         {
             let state_lock = self.state_lock.lock();
             let active_memtable_guard = self.active_memtable_lock.write();
+            ensure!(
+                !self.state.load().memtable.uses_v8_wal(),
+                "checkpoint or backup capture for an Active v8 PITR WAL is not supported"
+            );
             // Check after draining native leases, including when cancellation
             // left the active memtable empty and no freeze would run.
             if let Some(mvcc) = &self.mvcc {
@@ -590,6 +602,10 @@ impl LsmStorageInner {
         ensure!(
             !self.state.load().memtable.uses_v7_wal(),
             "backup capture for an Active v7 PITR WAL is not supported"
+        );
+        ensure!(
+            !self.state.load().memtable.uses_v8_wal(),
+            "backup capture for an Active v8 PITR WAL is not supported"
         );
         self.prepare_forced_memtable_freeze(None, false)?;
         let _checkpoint_guard = self.checkpoint_lock.lock();

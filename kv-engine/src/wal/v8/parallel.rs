@@ -136,8 +136,7 @@ impl WalV8ParallelCoordinator {
             "v8 Parallel byte window must be nonempty"
         );
         ensure!(
-            (DATA_START..=MAX_WAL_FILE_SIZE).contains(&config.max_file_size)
-                && config.max_file_size.is_multiple_of(FRAME_LEN_U64),
+            (DATA_START..=MAX_WAL_FILE_SIZE).contains(&config.max_file_size),
             "invalid v8 Parallel segment size"
         );
         ensure!(
@@ -622,9 +621,18 @@ impl WalV8AdmissionPublisher for WalV8ParallelCoordinator {
         let data_end = first_data_offset
             .checked_add(data_bytes)
             .context("v8 Parallel DATA allocation end overflows")?;
+        // Each admitted ticket retains space for its own FRONTIER until it is
+        // durable: earlier tickets may finish before later DATA is ready. A
+        // pending marker occupies one of those reserved slots; unused group
+        // reservations are released only when that marker becomes durable.
+        let reserved_frontier_bytes = next_ticket
+            .checked_sub(state.durable_ticket_end)
+            .and_then(|tickets| tickets.checked_sub(u64::from(state.pending_frontier.is_some())))
+            .and_then(|tickets| tickets.checked_mul(FRAME_LEN_U64))
+            .context("v8 Parallel FRONTIER reservation overflows")?;
         ensure!(
             data_end
-                .checked_add(FRAME_LEN_U64)
+                .checked_add(reserved_frontier_bytes)
                 .is_some_and(|end| end <= self.inner.max_file_size),
             "v8 Parallel WAL segment rotation required"
         );
@@ -849,6 +857,14 @@ mod tests {
         max_inflight_tickets: usize,
         max_inflight_bytes: u64,
     ) -> Result<WalV8ParallelCoordinator> {
+        coordinator_with_limits(max_inflight_tickets, max_inflight_bytes, MAX_WAL_FILE_SIZE)
+    }
+
+    fn coordinator_with_limits(
+        max_inflight_tickets: usize,
+        max_inflight_bytes: u64,
+        max_file_size: u64,
+    ) -> Result<WalV8ParallelCoordinator> {
         let wal_header = header();
         WalV8ParallelCoordinator::new(
             wal_header,
@@ -860,7 +876,7 @@ mod tests {
                 durable_prefix_digest: wal_header.initial_prefix_digest()?,
                 max_inflight_tickets,
                 max_inflight_bytes,
-                max_file_size: MAX_WAL_FILE_SIZE,
+                max_file_size,
             },
         )
     }
@@ -1199,6 +1215,69 @@ mod tests {
         assert!(!coordinator.is_poisoned());
         assert_eq!(coordinator.durable_ticket_end(), 4);
         assert_eq!(coordinator.durable_prefix_digest(), prefix_four);
+        Ok(())
+    }
+
+    #[test]
+    fn frontier_space_covers_every_admitted_ticket() -> Result<()> {
+        let coordinator =
+            coordinator_with_limits(8, 64 * 1024 * 1024, DATA_START + 4 * FRAME_LEN_U64)?;
+        let first = batch(10);
+        let second = batch(20);
+        let third = batch(30);
+        let mut first_encoded = admit(&first, &coordinator)?.encode()?;
+        let mut second_encoded = admit(&second, &coordinator)?.encode()?;
+
+        // Both tickets must remain able to commit separately, even if the
+        // second DATA write is not complete when the first FRONTIER is issued.
+        assert!(admit(&third, &coordinator).is_err());
+        mark_producer_ready(&mut first_encoded, &coordinator, true)?;
+        let first_frontier = coordinator.reserve_frontier(1)?;
+        assert!(admit(&third, &coordinator).is_err());
+        coordinator.publish_durable_frontier(first_frontier)?;
+        first_encoded.disarm_after_durable();
+
+        mark_producer_ready(&mut second_encoded, &coordinator, true)?;
+        let second_frontier = coordinator.reserve_frontier(2)?;
+        assert_eq!(
+            second_frontier.frame_offset + FRAME_LEN_U64,
+            DATA_START + 4 * FRAME_LEN_U64
+        );
+        coordinator.publish_durable_frontier(second_frontier)?;
+        second_encoded.disarm_after_durable();
+        assert_eq!(coordinator.durable_ticket_end(), 2);
+        assert!(!coordinator.is_poisoned());
+        Ok(())
+    }
+
+    #[test]
+    fn group_frontier_releases_unused_marker_space_after_durability() -> Result<()> {
+        let coordinator =
+            coordinator_with_limits(8, 64 * 1024 * 1024, DATA_START + 5 * FRAME_LEN_U64)?;
+        let first = batch(10);
+        let second = batch(20);
+        let third = batch(30);
+        let mut first_encoded = admit(&first, &coordinator)?.encode()?;
+        let mut second_encoded = admit(&second, &coordinator)?.encode()?;
+        assert!(admit(&third, &coordinator).is_err());
+
+        mark_producer_ready(&mut first_encoded, &coordinator, true)?;
+        mark_producer_ready(&mut second_encoded, &coordinator, true)?;
+        let group_frontier = coordinator.reserve_frontier(2)?;
+        // The unused marker reservation is retained until the pending group
+        // has actually become durable.
+        assert!(admit(&third, &coordinator).is_err());
+        coordinator.publish_durable_frontier(group_frontier)?;
+        first_encoded.disarm_after_durable();
+        second_encoded.disarm_after_durable();
+
+        let mut third_encoded = admit(&third, &coordinator)?.encode()?;
+        mark_producer_ready(&mut third_encoded, &coordinator, true)?;
+        let final_frontier = coordinator.reserve_frontier(3)?;
+        coordinator.publish_durable_frontier(final_frontier)?;
+        third_encoded.disarm_after_durable();
+        assert_eq!(coordinator.durable_ticket_end(), 3);
+        assert!(!coordinator.is_poisoned());
         Ok(())
     }
 

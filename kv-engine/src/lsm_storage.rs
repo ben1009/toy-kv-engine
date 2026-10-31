@@ -2354,6 +2354,9 @@ fn check_pitr_cancellation(cancellation: Option<&std::sync::atomic::AtomicBool>)
     Ok(())
 }
 
+/// Timeline, archive epoch, active segment, and admission fence generation.
+type PitrV8PendingResume = ([u8; 16], [u8; 16], u64, u64);
+
 /// A thin wrapper for `LsmStorageInner` and the user interface for `KvEngine`.
 pub struct KvEngine {
     pub(crate) inner: Arc<LsmStorageInner>,
@@ -2369,6 +2372,9 @@ pub struct KvEngine {
     /// resolved to durable-or-absent. Retrying an enable would then risk a
     /// second timeline/epoch, so a reopen must re-read the manifest first.
     pitr_publication_unknown: Arc<AtomicBool>,
+    /// Identity of a v8 resume attempt that owns the stopped admission fence
+    /// while retrying previously authorized archive obligations.
+    pitr_v8_pending_resume: Mutex<Option<PitrV8PendingResume>>,
     /// Persisted PITR state snapshot used by the status projection.
     pitr_manifest_state: Arc<Mutex<crate::pitr::manifest::PitrState>>,
     /// Independent PITR segment lifecycle, reconstructed from persisted state.
@@ -2760,6 +2766,7 @@ impl KvEngine {
             pitr_runtime: Mutex::new(None),
             pitr_operation_lock: Mutex::new(()),
             pitr_publication_unknown: Arc::new(AtomicBool::new(false)),
+            pitr_v8_pending_resume: Mutex::new(None),
             pitr_manifest_state: Arc::new(Mutex::new(pitr_state)),
             pitr_segments: Mutex::new(None),
             #[cfg(target_os = "linux")]
@@ -3146,7 +3153,11 @@ impl KvEngine {
         ) {
             if let (Some(segment_id), Some(owner)) = (
                 LsmStorageInner::pitr_segment_of(memtable),
-                memtable.wal_v7_reservation_owner(),
+                memtable.wal_v7_reservation_owner().or_else(|| {
+                    memtable
+                        .wal_v8_reservation_owner()
+                        .map(|owner| owner.image_owner())
+                }),
             ) {
                 segments.retain_v7_reservation_owner(segment_id, owner)?;
             }
@@ -3247,6 +3258,28 @@ impl KvEngine {
             }
             let active = self.inner.state.load().memtable.clone();
             if active.uses_pitr_batch_wal() {
+                if let Some(owner) = active.wal_v8_reservation_owner() {
+                    status.source_spool_bytes = owner
+                        .image_owner()
+                        .retained_resources()
+                        .context("v8 reservation owner has no retained resource ledger")?
+                        .ledger()
+                        .snapshot()
+                        .source_spool_bytes;
+                } else if active.uses_v8_wal() && self.has_active_v8_sealing_source() {
+                    let (sources, staging, unattributed) =
+                        LsmStorageInner::pitr_source_allocations(&self.inner.path, None)?;
+                    status.source_spool_bytes = sources.values().try_fold(
+                        staging.checked_add(unattributed).ok_or_else(|| {
+                            anyhow!("PITR source allocation accounting overflows")
+                        })?,
+                        |total, bytes| {
+                            total.checked_add(*bytes).ok_or_else(|| {
+                                anyhow!("PITR source allocation accounting overflows")
+                            })
+                        },
+                    )?;
+                }
                 status.active_wal_format_version = active.wal_format_version();
                 status.active_wal_io_mode = active.wal_io_mode().map(|mode| match mode {
                     crate::wal::WalIoMode::Leader => crate::pitr::api::PitrWalIoMode::Leader,
@@ -3291,9 +3324,19 @@ impl KvEngine {
                     })
                     .map(|obligation| obligation.logical_length)
                     .sum();
-                status.archive_lag_bytes = status
-                    .active_wal_bytes
-                    .saturating_add(status.sealed_unarchived_wal_bytes);
+                let active_is_sealing = LsmStorageInner::pitr_segment_of(&active)
+                    .and_then(|id| state.obligations.get(&id))
+                    .is_some_and(|obligation| {
+                        obligation.state == crate::pitr::manifest::ObligationState::Sealing
+                    });
+                status.archive_lag_bytes =
+                    status
+                        .sealed_unarchived_wal_bytes
+                        .saturating_add(if active_is_sealing {
+                            0
+                        } else {
+                            status.active_wal_bytes
+                        });
                 let active_batch_count = active.wal_batch_count();
                 let counted_active_segment_id =
                     active_batch_count.and_then(|_| LsmStorageInner::pitr_segment_of(&active));
@@ -4076,6 +4119,7 @@ impl KvEngine {
         // leaving a database nothing can open again. Every other reconcile caller
         // reads under the barrier; this one has to as well.
         let barrier = self.pitr_barrier_lock.lock();
+        self.inner.lifecycle.ensure_open()?;
         state = self.pitr_manifest_state.lock().clone();
         if self.pitr_runtime.lock().is_none()
             && matches!(
@@ -4121,6 +4165,33 @@ impl KvEngine {
             );
         }
         drop(archiver);
+        // This explicit resume owns the recovery fence only after the
+        // repository identity and base have been verified. Keep its identity
+        // across a failed archive attempt so maintenance can finish that same
+        // resume, without opening an unrelated fence or a later PITR epoch.
+        let fence_generation = self
+            .inner
+            .mvcc
+            .as_ref()
+            .and_then(|mvcc| mvcc.closed_admission_generation());
+        *self.pitr_v8_pending_resume.lock() = if has_base
+            && state.mode == crate::pitr::manifest::PitrMode::Enabled
+            && state.timeline_id == Some(timeline_id)
+            && state.archive_epoch_id == Some(archive_epoch_id)
+            && self.inner.state.load().memtable.uses_v8_wal()
+            && !self.has_active_v8_sealing_source()
+            && !self.pitr_publication_unknown.load(Ordering::Acquire)
+            && fence_generation.is_some()
+            && state.obligations.values().any(|obligation| {
+                obligation.state != crate::pitr::manifest::ObligationState::Reclaimable
+            }) {
+            state
+                .active_segment_id
+                .zip(fence_generation)
+                .map(|(segment, generation)| (timeline_id, archive_epoch_id, segment, generation))
+        } else {
+            None
+        };
         let (mut state, mut migration_reservation) =
             self.resume_v7_successor_install_with_reservation(state, None)?;
         state = self.reconcile_durable_archive_obligations(state)?;
@@ -4179,13 +4250,27 @@ impl KvEngine {
             let _barrier = self.pitr_barrier_lock.lock();
             let reopening_permitted = self.pitr_manifest_state.lock().mode
                 == crate::pitr::manifest::PitrMode::Enabled
-                && !self.pitr_publication_unknown.load(Ordering::Acquire);
+                && !self.pitr_publication_unknown.load(Ordering::Acquire)
+                && self.inner.lifecycle.ensure_open().is_ok();
             if reopening_permitted {
-                self.inner
+                let sequencer = self
+                    .inner
                     .mvcc
                     .as_ref()
-                    .ok_or_else(|| anyhow!("PITR resume requires MVCC"))?
-                    .resume_commit_admission();
+                    .ok_or_else(|| anyhow!("PITR resume requires MVCC"))?;
+                if self.inner.state.load().memtable.uses_v8_wal() {
+                    if let Some(generation) = fence_generation
+                        && sequencer.resume_commit_admission_if_generation(generation)
+                    {
+                        let mut pending = self.pitr_v8_pending_resume.lock();
+                        if pending.is_some_and(|(_, _, _, saved)| saved == generation) {
+                            *pending = None;
+                        }
+                    }
+                } else {
+                    sequencer.resume_commit_admission();
+                    *self.pitr_v8_pending_resume.lock() = None;
+                }
             }
         }
         if state.obligations.values().any(|obligation| {
@@ -4208,20 +4293,31 @@ impl KvEngine {
         // The flag matters as much as the mode: a disable whose publication
         // outcome is unknown keeps the mode Enabled while it deliberately stops
         // admitting writes, and reporting `Resumed` would hide that.
-        let (current_mode, publication_unknown) = {
+        let (current_mode, publication_unknown, v8_admission_closed) = {
             let _barrier = self.pitr_barrier_lock.lock();
             (
                 self.pitr_manifest_state.lock().mode,
                 self.pitr_publication_unknown.load(Ordering::Acquire),
+                self.inner.state.load().memtable.uses_v8_wal()
+                    && self
+                        .inner
+                        .mvcc
+                        .as_ref()
+                        .is_none_or(|sequencer| !sequencer.commit_admission_is_open()),
             )
         };
-        if current_mode != crate::pitr::manifest::PitrMode::Enabled || publication_unknown {
+        if current_mode != crate::pitr::manifest::PitrMode::Enabled
+            || publication_unknown
+            || v8_admission_closed
+        {
             return Ok(crate::pitr::api::PitrResumeOutcome::ReconciliationRequired(
                 crate::pitr::api::PitrArchiveError {
                     operation: crate::pitr::api::PitrOperation::Reconcile,
                     path: repository_path,
                     kind: crate::pitr::api::PitrArchiveErrorKind::Unavailable,
-                    source: anyhow!("PITR left the enabled lifecycle while resume was completing"),
+                    source: anyhow!(
+                        "PITR lifecycle or admission changed while resume was completing"
+                    ),
                 },
             ));
         }
@@ -5853,6 +5949,10 @@ impl KvEngine {
         let _operation_guard = self.pitr_operation_lock.lock();
         let _barrier = self.pitr_barrier_lock.lock();
         self.inner.lifecycle.ensure_open()?;
+        ensure!(
+            !self.inner.state.load().memtable.uses_v8_wal(),
+            "checkpoint capture for an Active v8 PITR WAL is not supported"
+        );
         if !self.inner.state.load().memtable.uses_v7_wal() {
             return capture(false);
         }
@@ -6890,6 +6990,52 @@ impl KvEngine {
         {
             return Ok(());
         }
+        if self.inner.state.load().memtable.uses_v8_wal() {
+            // V8 successor installation is not implemented. Reconcile only
+            // already sealed sources.
+            if state.obligations.values().any(|obligation| {
+                obligation.state == crate::pitr::manifest::ObligationState::Sealing
+            }) {
+                return Ok(());
+            }
+            ensure!(
+                !self.pitr_publication_unknown.load(Ordering::Acquire),
+                "PITR maintenance cannot resume an unknown manifest transition; reopen the database first"
+            );
+            state = self.reconcile_durable_archive_obligations(state)?;
+            if state.obligations.values().any(|obligation| {
+                obligation.state == crate::pitr::manifest::ObligationState::Reclaimable
+            }) {
+                state = self.reconcile_durable_archive_obligations(state)?;
+            }
+            let identity = state
+                .timeline_id
+                .zip(state.archive_epoch_id)
+                .zip(state.active_segment_id)
+                .map(|((timeline, epoch), segment)| (timeline, epoch, segment));
+            let mut pending = self.pitr_v8_pending_resume.lock();
+            if let Some((timeline, epoch, segment, generation)) = *pending
+                && Some((timeline, epoch, segment)) == identity
+                && state.mode == crate::pitr::manifest::PitrMode::Enabled
+                && state.obligations.values().all(|obligation| {
+                    obligation.state == crate::pitr::manifest::ObligationState::Reclaimable
+                })
+                && !self.pitr_publication_unknown.load(Ordering::Acquire)
+            {
+                if let Some(manifest) = self.inner.manifest.as_ref() {
+                    manifest.ensure_durability_certain()?;
+                }
+                let sequencer = self
+                    .inner
+                    .mvcc
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("PITR maintenance requires MVCC"))?;
+                sequencer.ensure_publication_healthy()?;
+                sequencer.resume_commit_admission_if_generation(generation);
+                *pending = None;
+            }
+            return Ok(());
+        }
         if self.inner.pitr_maintenance_needs_reconciliation(&state) {
             ensure!(
                 !self.pitr_publication_unknown.load(Ordering::Acquire),
@@ -7380,6 +7526,10 @@ impl KvEngine {
         ensure!(
             !self.inner.state.load().memtable.uses_v7_wal(),
             "cannot disable PITR with an Active v7 WAL because post-PITR WAL rotation is not supported"
+        );
+        ensure!(
+            !self.inner.state.load().memtable.uses_v8_wal(),
+            "cannot disable PITR with an Active v8 WAL because post-PITR WAL rotation is not supported"
         );
         let state = self.pitr_manifest_state.lock().clone();
         ensure!(
@@ -8116,8 +8266,7 @@ impl KvEngine {
                     .mvcc
                     .as_ref()
                     .ok_or_else(|| anyhow!("Active PITR sync requires MVCC"))?;
-                let admission_was_open = sequencer.commit_admission_is_open();
-                sequencer.stop_commit_admission_and_capture()?;
+                let admission_was_open = sequencer.stop_commit_admission_for_sync()?;
                 active_memtable.sync_wal()?;
                 let boundaries = if active_memtable.uses_v8_wal() {
                     active_memtable.v8_active_boundaries()?
@@ -8837,6 +8986,7 @@ impl KvEngine {
             pitr_runtime: Mutex::new(None),
             pitr_operation_lock: Mutex::new(()),
             pitr_publication_unknown: Arc::new(AtomicBool::new(false)),
+            pitr_v8_pending_resume: Mutex::new(None),
             pitr_manifest_state: Arc::new(Mutex::new(pitr_state)),
             pitr_segments: Mutex::new(None),
             #[cfg(target_os = "linux")]
@@ -11071,6 +11221,20 @@ impl LsmStorageInner {
         )
     }
 
+    #[cfg(target_os = "linux")]
+    fn v8_recovery_validation_memory_bytes(
+        max_segment_bytes: u64,
+        source_file_len: u64,
+    ) -> Result<u64> {
+        ensure!(
+            source_file_len <= crate::wal::MAX_WAL_FILE_SIZE,
+            "Active v8 WAL source exceeds the WAL format limit"
+        );
+        crate::pitr::seal::V8Seal::max_validation_memory_bytes(
+            max_segment_bytes.max(source_file_len),
+        )
+    }
+
     fn reserve_v7_active_recovery_workspace_with_buffer_memory(
         state: &crate::pitr::manifest::PitrState,
         database_path: &Path,
@@ -11447,6 +11611,9 @@ impl LsmStorageInner {
         {
             if let Some(owner) = memtable.wal_v7_reservation_owner() {
                 owner.release_startup_staging_resources();
+            }
+            if let Some(owner) = memtable.wal_v8_reservation_owner() {
+                owner.image_owner().release_startup_staging_resources();
             }
         }
     }
@@ -12757,10 +12924,11 @@ impl LsmStorageInner {
                             .ok_or_else(|| anyhow!("PITR state is missing configuration"))?
                             .max_segment_bytes;
                         let temporary_buffer_memory_bytes =
-                            crate::pitr::seal::V8Seal::max_validation_memory_bytes(
+                            Self::v8_recovery_validation_memory_bytes(
                                 max_segment_bytes,
+                                source_file_len,
                             )?;
-                        let (_, _recovery_workspace, _) =
+                        let (retained_resources, recovery_workspace, _) =
                             Self::reserve_v7_active_recovery_workspace_with_buffer_memory(
                                 &pitr_state,
                                 path,
@@ -12805,12 +12973,72 @@ impl LsmStorageInner {
                                 recovery.image_len <= max_segment_bytes,
                                 "recovered Active v8 WAL exceeds the configured segment limit"
                             );
-                            MemTable::recover_from_v8_active(
+                            let diagnostics = &recovery.selection.diagnostics;
+                            if diagnostics.rejected_newer_candidate_count > 0 {
+                                log::warn!(
+                                    "Active v8 WAL recovery selected ticket {} after rejecting {} newer FRONTIER candidates; replaced tail {:?}",
+                                    recovery.active_boundary.ticket_end,
+                                    diagnostics.rejected_newer_candidate_count,
+                                    diagnostics.discarded_physical_tail,
+                                );
+                                for rejected in &diagnostics.rejected_newer_candidates {
+                                    log::warn!(
+                                        "Rejected v8 FRONTIER at {} for ticket {} and durable end {}: {}",
+                                        rejected.frame_offset,
+                                        rejected.ticket_end,
+                                        rejected.durable_end,
+                                        rejected.reason,
+                                    );
+                                }
+                            }
+                            for rejected in &diagnostics.rejected_newer_frontiers {
+                                log::warn!(
+                                    "Rejected v8 FRONTIER-shaped frame at [{}, {}): {}",
+                                    rejected.frame_offset,
+                                    rejected.frame_end,
+                                    rejected.reason,
+                                );
+                            }
+                            if diagnostics.rejected_newer_frontiers_may_be_truncated {
+                                log::warn!(
+                                    "Additional rejected v8 FRONTIER diagnostics may have been omitted"
+                                );
+                            }
+                            let workspace_bytes =
+                                crate::pitr::segment::filesystem_allocation_reservation(
+                                    path,
+                                    max_segment_bytes,
+                                )?;
+                            let allocation_unit =
+                                crate::pitr::segment::filesystem_allocation_reservation(path, 1)?;
+                            MemTable::recover_from_v8_active_with_owner(
                                 memtable_id,
                                 vlog_enabled,
                                 &wal_path,
                                 recovery,
                                 max_segment_bytes,
+                                |installed| {
+                                    let metadata = std::fs::metadata(&wal_path)?;
+                                    ensure!(
+                                        metadata.dev() == installed.installed_dev
+                                            && metadata.ino() == installed.installed_ino,
+                                        "installed v8 recovery inode changed before reservation transfer"
+                                    );
+                                    let allocated = Self::filesystem_allocated_bytes(&metadata)?;
+                                    // Replay is complete. Replace the temporary recovery
+                                    // charge with persistent image and workspace charges
+                                    // before the writer becomes reachable.
+                                    drop(recovery_workspace);
+                                    Ok(Arc::new(
+                                        crate::wal::v8::resource::WalV8ReservationOwner::new_with_retained_resources(
+                                            retained_resources,
+                                            installed,
+                                            allocated,
+                                            workspace_bytes,
+                                            allocation_unit,
+                                        )?,
+                                    ))
+                                },
                             )?
                         };
                         max_commit_ts = max_commit_ts.max(wal_max_ts);
@@ -16959,6 +17187,24 @@ impl LsmStorageInner {
         allow_lifecycle_closing: bool,
     ) -> Result<()> {
         if let Some(generation) = crate::wal::Wal::v7_source_spool_wait_generation(&error)
+            && let Some(owner) = expected_memtable.wal_v8_reservation_owner()
+        {
+            let image_owner = owner.image_owner();
+            // A recovered immutable source can hold reclaimable spool space.
+            // Flush it without attempting an unsupported Active v8 rotation.
+            while !self.state.load().imm_memtables.is_empty()
+                && !image_owner.source_spool_generation_changed(generation)
+            {
+                self.flush_immutable_for_source_spool_pressure().context(
+                    "failed to flush an immutable memtable under v8 source-spool pressure",
+                )?;
+            }
+            if image_owner.source_spool_generation_changed(generation) {
+                return Ok(());
+            }
+            return Err(error.context("v8 source-spool capacity is exhausted"));
+        }
+        if let Some(generation) = crate::wal::Wal::v7_source_spool_wait_generation(&error)
             && let Some(owner) = expected_memtable.wal_v7_reservation_owner()
         {
             let work_generation = owner.source_spool_work_generation();
@@ -17208,14 +17454,25 @@ impl LsmStorageInner {
             .as_ref()
             .ok_or_else(|| anyhow!("enabled PITR state has no configuration"))?;
         let memtable = self.state.load().memtable.clone();
-        if memtable.uses_v8_wal() {
-            return Ok(());
-        }
         if !memtable.uses_pitr_batch_wal() {
             return Ok(());
         }
         let has_pending_obligation = self.pitr_maintenance_needs_reconciliation(&state);
-        if memtable.is_empty() && !has_pending_obligation {
+        let pending_v8_resume = memtable.uses_v8_wal()
+            && self
+                .weak_engine
+                .get()
+                .and_then(std::sync::Weak::upgrade)
+                .is_some_and(|engine| engine.pitr_v8_pending_resume.lock().is_some());
+        if memtable.uses_v8_wal()
+            && (!(has_pending_obligation || pending_v8_resume)
+                || state.obligations.values().any(|obligation| {
+                    obligation.state == crate::pitr::manifest::ObligationState::Sealing
+                }))
+        {
+            return Ok(());
+        }
+        if memtable.is_empty() && !has_pending_obligation && !pending_v8_resume {
             return Ok(());
         }
         let logical_length = memtable
@@ -17228,7 +17485,7 @@ impl LsmStorageInner {
         });
         let size_due = check_size
             && (logical_length >= config.max_segment_bytes || memtable.pitr_rotation_needed());
-        if !has_pending_obligation && !timer_due && !size_due {
+        if !has_pending_obligation && !pending_v8_resume && !timer_due && !size_due {
             return Ok(());
         }
         if self
@@ -19148,9 +19405,10 @@ impl LsmStorageInner {
         // memtable. Capture this before the memtable is dropped below.
         let is_pitr_segment_wal = memtable_to_flush.uses_pitr_batch_wal();
         #[cfg(target_os = "linux")]
-        let pitr_segment_id = if memtable_to_flush.uses_v7_wal() {
+        let pitr_segment_id = if memtable_to_flush.uses_v7_wal() || memtable_to_flush.uses_v8_wal()
+        {
             Some(Self::pitr_segment_of(&memtable_to_flush).ok_or_else(|| {
-                anyhow!("frozen v7 memtable has no canonical PITR segment WAL path")
+                anyhow!("frozen versioned memtable has no canonical PITR segment WAL path")
             })?)
         } else if memtable_to_flush.uses_wal_v5() {
             let wal = std::fs::read(&wal_path)?;
@@ -19303,6 +19561,11 @@ impl LsmStorageInner {
                     .find_map(|memtable| {
                         memtable
                             .wal_v7_reservation_owner()
+                            .or_else(|| {
+                                memtable
+                                    .wal_v8_reservation_owner()
+                                    .map(|owner| owner.image_owner())
+                            })
                             .and_then(|owner| owner.retained_resources())
                     })
             };
@@ -22107,10 +22370,12 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
-    #[test]
-    fn active_v8_lsm_recovery_publishes_anchor_and_resumes_appends() -> anyhow::Result<()> {
+    fn active_v8_recovery_test_database(
+        directory: &std::path::Path,
+        with_seed: bool,
+    ) -> anyhow::Result<(LsmStorageOptions, u64)> {
         use crate::{
-            pitr::manifest::{PitrManifestRecord, PitrWalFormat},
+            pitr::manifest::PitrManifestRecord,
             pitr::{
                 ArchiveEpochId, LIVE_WAL_V5_LIMITS, RecordedAt, SegmentId, TimelineId, WalBatch,
                 WalEntry,
@@ -22122,9 +22387,8 @@ mod tests {
             },
         };
 
-        let directory = tempdir()?;
         let initial_engine = pitr_flush_test_engine_with_segment_limit_and_interval(
-            directory.path(),
+            directory,
             1 << 20,
             std::time::Duration::from_secs(3600),
         );
@@ -22135,7 +22399,7 @@ mod tests {
         initial_engine.close_storage()?;
         drop(initial_engine);
 
-        let database = directory.path().join("db");
+        let database = directory.join("db");
         let wal_path = database.join(format!("pitr-{segment_id:020}.wal"));
         std::fs::remove_file(&wal_path)?;
         let header = WalV8Header {
@@ -22171,27 +22435,370 @@ mod tests {
         let sync_file = write_file.try_clone()?;
         let mut writer =
             WalV8LeaderWriter::new(write_file, sync_file, &installed, max_segment_bytes)?;
-        writer.append_batch(
-            &WalBatch {
-                commit_ts: 7,
-                recorded_at: RecordedAt {
-                    secs: 1_800_000_000,
-                    nanos: 0,
+        if with_seed {
+            writer.append_batch(
+                &WalBatch {
+                    commit_ts: 7,
+                    recorded_at: RecordedAt {
+                        secs: 1_800_000_000,
+                        nanos: 0,
+                    },
+                    entries: vec![WalEntry::Put {
+                        key: b"seed".to_vec(),
+                        value: vec![crate::vlog::KvKind::Inline as u8, b'v'],
+                    }],
                 },
-                entries: vec![WalEntry::Put {
-                    key: b"seed".to_vec(),
-                    value: vec![crate::vlog::KvKind::Inline as u8, b'v'],
-                }],
-            },
-            LIVE_WAL_V5_LIMITS,
-        )?;
+                LIVE_WAL_V5_LIMITS,
+            )?;
+        }
         drop(writer);
 
-        let options = LsmStorageOptions {
-            enable_wal: true,
-            pitr_repository: Some(directory.path().join("repository")),
-            ..LsmStorageOptions::default_for_test()
+        Ok((
+            LsmStorageOptions {
+                enable_wal: true,
+                pitr_repository: Some(directory.join("repository")),
+                ..LsmStorageOptions::default_for_test()
+            },
+            segment_id,
+        ))
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn active_v8_maintenance_does_not_rotate_or_resume_admission() -> anyhow::Result<()> {
+        let directory = tempdir()?;
+        let (options, segment_id) = active_v8_recovery_test_database(directory.path(), true)?;
+        let engine = KvEngine::open(directory.path().join("db"), options)?;
+        let active = engine.inner.state.load().memtable.clone();
+        let boundary = active.v8_active_boundaries()?;
+        let sequencer = engine.inner.mvcc.as_ref().unwrap();
+        sequencer.stop_commit_admission_and_capture()?;
+        engine.run_pitr_maintenance(segment_id)?;
+        assert!(Arc::ptr_eq(&active, &engine.inner.state.load().memtable));
+        assert_eq!(active.v8_active_boundaries()?, boundary);
+        assert!(sequencer.reserve_commit_ts().is_err());
+        // Only a verified resume attempt may transfer its fence to maintenance.
+        let state = engine.pitr_manifest_state.lock().clone();
+        *engine.pitr_v8_pending_resume.lock() = Some((
+            state.timeline_id.unwrap(),
+            state.archive_epoch_id.unwrap(),
+            segment_id,
+            sequencer.closed_admission_generation().unwrap(),
+        ));
+        engine
+            .pitr_publication_unknown
+            .store(true, std::sync::atomic::Ordering::Release);
+        assert!(engine.run_pitr_maintenance(segment_id).is_err());
+        assert!(!sequencer.commit_admission_is_open());
+        engine
+            .pitr_publication_unknown
+            .store(false, std::sync::atomic::Ordering::Release);
+        *engine.pitr_v8_pending_resume.lock() = Some((
+            state.timeline_id.unwrap(),
+            state.archive_epoch_id.unwrap(),
+            segment_id + 1,
+            sequencer.closed_admission_generation().unwrap(),
+        ));
+        engine.run_pitr_maintenance(segment_id)?;
+        assert!(!sequencer.commit_admission_is_open());
+        *engine.pitr_v8_pending_resume.lock() = Some((
+            state.timeline_id.unwrap(),
+            state.archive_epoch_id.unwrap(),
+            segment_id,
+            sequencer.closed_admission_generation().unwrap(),
+        ));
+        sequencer.stop_commit_admission_and_capture()?;
+        engine.run_pitr_maintenance(segment_id)?;
+        assert!(!sequencer.commit_admission_is_open());
+        *engine.pitr_v8_pending_resume.lock() = Some((
+            state.timeline_id.unwrap(),
+            state.archive_epoch_id.unwrap(),
+            segment_id,
+            sequencer.closed_admission_generation().unwrap(),
+        ));
+        let saved_generation = sequencer.closed_admission_generation();
+        engine.sync()?;
+        assert_eq!(sequencer.closed_admission_generation(), saved_generation);
+        assert!(!sequencer.commit_admission_is_open());
+        engine.run_pitr_maintenance(segment_id)?;
+        assert!(sequencer.commit_admission_is_open());
+        assert!(engine.pitr_v8_pending_resume.lock().is_none());
+        engine.close()?;
+        assert!(engine.run_pitr_maintenance(segment_id).is_err());
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn empty_active_v8_rejects_checkpoint_and_ordinary_backup_capture() -> anyhow::Result<()> {
+        use crate::pitr::manifest::{
+            CoverageBreakReason, PersistedRecoveryGap, PitrManifestRecord,
         };
+
+        let directory = tempdir()?;
+        let (options, _) = active_v8_recovery_test_database(directory.path(), false)?;
+        let database = directory.path().join("db");
+        let engine = KvEngine::open(&database, options.clone())?;
+        let active = engine.inner.state.load().memtable.clone();
+        assert!(active.uses_v8_wal() && active.is_empty());
+        drop(active);
+
+        let checkpoint_path = directory.path().join("checkpoint");
+        let checkpoint_error = match engine.create_checkpoint(&checkpoint_path) {
+            Ok(_) => anyhow::bail!("checkpoint of an empty Active v8 WAL unexpectedly succeeded"),
+            Err(error) => error,
+        };
+        assert!(format!("{checkpoint_error:#}").contains("Active v8 PITR WAL"));
+        assert!(!checkpoint_path.exists());
+
+        let before = engine.pitr_manifest_state.lock().clone();
+        let gap = PersistedRecoveryGap {
+            repository_id: before.repository_id.unwrap(),
+            timeline_id: before.timeline_id.unwrap(),
+            archive_epoch_id: before.archive_epoch_id.unwrap(),
+            after: before.predecessor_anchor.unwrap(),
+            last_archived_commit_ts: before.last_commit_anchor.map(|anchor| anchor.commit_ts),
+            first_uncovered_commit_ts: before
+                .last_commit_anchor
+                .and_then(|anchor| anchor.commit_ts.checked_add(1)),
+            reason: CoverageBreakReason::ForcedDisable,
+        };
+        engine.close()?;
+        drop(engine);
+
+        // A persisted coverage gap leaves the v8 source retained while public
+        // backup selects the ordinary capture path during reconciliation.
+        let manifest = crate::manifest::Manifest::recover(database.join("MANIFEST"))?.0;
+        manifest.add_records_when_init(&[crate::manifest::ManifestRecord::Pitr(
+            PitrManifestRecord::CoverageGap(gap),
+        )])?;
+        drop(manifest);
+        let engine = KvEngine::open(&database, options)?;
+        let backup_path = directory.path().join("ordinary-backup");
+        let result = engine.create_backup(crate::backup::BackupOptions {
+            repository: backup_path.clone(),
+            use_hard_links: false,
+        });
+        let backup_error = match result {
+            Ok(_) => anyhow::bail!("backup of an empty Active v8 WAL unexpectedly succeeded"),
+            Err(error) => error,
+        };
+        assert!(format!("{backup_error:#}").contains("Active v8 PITR WAL"));
+        assert!(!backup_path.exists());
+
+        engine.close()?;
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn force_disable_rejects_active_v8_before_recording_a_gap() -> anyhow::Result<()> {
+        use crate::pitr::manifest::PitrMode;
+
+        let directory = tempdir()?;
+        let (options, segment_id) = active_v8_recovery_test_database(directory.path(), true)?;
+        let database = directory.path().join("db");
+        let engine = KvEngine::open(&database, options.clone())?;
+        assert!(engine.inner.state.load().memtable.uses_v8_wal());
+        let wal_path = database.join(format!("pitr-{segment_id:020}.wal"));
+        let before_wal = std::fs::read(&wal_path)?;
+        let before_state = engine.pitr_manifest_state.lock().clone();
+        assert_eq!(before_state.mode, PitrMode::Enabled);
+        let manifest_path = database.join("MANIFEST");
+        let before_manifest = std::fs::read(&manifest_path)?;
+
+        let error = match engine.disable_pitr_allow_gap() {
+            Ok(_) => anyhow::bail!("force-disabling an Active v8 WAL unexpectedly succeeded"),
+            Err(error) => error,
+        };
+        assert!(format!("{error:#}").contains("Active v8 WAL"));
+        assert_eq!(*engine.pitr_manifest_state.lock(), before_state);
+        assert_eq!(*engine.inner.pitr_state.lock(), before_state);
+        assert_eq!(std::fs::read(&manifest_path)?, before_manifest);
+        assert_eq!(std::fs::read(&wal_path)?, before_wal);
+        assert!(
+            engine
+                .inner
+                .mvcc
+                .as_ref()
+                .is_some_and(|mvcc| mvcc.commit_admission_is_open())
+        );
+
+        engine.put(b"after-rejected-disable", b"value")?;
+        engine.close()?;
+        drop(engine);
+
+        let reopened = KvEngine::open(&database, options)?;
+        assert_eq!(
+            reopened.get(b"after-rejected-disable")?,
+            Some(Bytes::from_static(b"value"))
+        );
+        let reopened_state = reopened.pitr_manifest_state.lock().clone();
+        assert_eq!(reopened_state.mode, PitrMode::Enabled);
+        assert!(reopened_state.recovery_gap.is_none());
+        reopened.close()?;
+
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn active_v8_recovery_budgets_the_full_speculative_source() -> anyhow::Result<()> {
+        let directory = tempdir()?;
+        let (options, segment_id) = active_v8_recovery_test_database(directory.path(), true)?;
+        let database = directory.path().join("db");
+        let wal_path = database.join(format!("pitr-{segment_id:020}.wal"));
+        let configured_limit = 1 << 20;
+        let source_len = configured_limit + crate::wal::v8::codec::WAL_V8_FRAME_LEN as u64 + 17;
+        let configured_memory =
+            crate::pitr::seal::V8Seal::max_validation_memory_bytes(configured_limit)?;
+        let source_memory = crate::pitr::seal::V8Seal::max_validation_memory_bytes(source_len)?;
+        assert!(source_memory > configured_memory);
+        assert_eq!(
+            LsmStorageInner::v8_recovery_validation_memory_bytes(configured_limit, source_len)?,
+            source_memory
+        );
+        assert!(
+            LsmStorageInner::v8_recovery_validation_memory_bytes(
+                configured_limit,
+                crate::wal::MAX_WAL_FILE_SIZE + 1,
+            )
+            .is_err()
+        );
+
+        let file = std::fs::OpenOptions::new().write(true).open(&wal_path)?;
+        file.set_len(source_len)?;
+        file.sync_all()?;
+        drop(file);
+        let engine = KvEngine::open(&database, options.clone())?;
+        assert_eq!(engine.get(b"seed")?, Some(Bytes::from_static(b"v")));
+        assert!(std::fs::metadata(&wal_path)?.len() <= configured_limit);
+        engine.close()?;
+        drop(engine);
+
+        let file = std::fs::OpenOptions::new().write(true).open(&wal_path)?;
+        file.set_len(crate::wal::MAX_WAL_FILE_SIZE + 1)?;
+        file.sync_all()?;
+        drop(file);
+        let error = match KvEngine::open(&database, options) {
+            Ok(_) => anyhow::bail!("an over-limit v8 source unexpectedly recovered"),
+            Err(error) => error,
+        };
+        assert!(format!("{error:#}").contains("Active v8 WAL source exceeds the WAL format limit"));
+        assert_eq!(
+            std::fs::metadata(&wal_path)?.len(),
+            crate::wal::MAX_WAL_FILE_SIZE + 1
+        );
+
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn recovered_active_v8_preserves_recovery_workspace_under_spool_pressure() -> anyhow::Result<()>
+    {
+        use crate::pitr::api::{MAX_STATUS_PAGE_SIZE, PitrStatusOptions};
+
+        for permitted_writes in [0_u64, 1] {
+            let directory = tempdir()?;
+            let (options, segment_id) = active_v8_recovery_test_database(directory.path(), false)?;
+            let database = directory.path().join("db");
+            let wal_path = database.join(format!("pitr-{segment_id:020}.wal"));
+
+            // The fixture starts with a generous migration budget. Persist a
+            // tight valid configuration in a canonical snapshot, then reopen
+            // so startup reconstructs its ledger from that on-disk limit.
+            let engine = KvEngine::open(&database, options.clone())?;
+            let active = engine.inner.state.load().memtable.clone();
+            let owner = active
+                .wal_v8_reservation_owner()
+                .ok_or_else(|| anyhow::anyhow!("recovered v8 WAL has no resource owner"))?;
+            let resources = owner.image_owner().snapshot();
+            let frame_charge = crate::pitr::segment::filesystem_allocation_reservation(
+                &database,
+                crate::wal::v8::codec::WAL_V8_FRAME_LEN as u64,
+            )?;
+            let one_batch_charge = frame_charge.checked_mul(2).unwrap();
+            let spool_limit = resources
+                .source_spool_bytes
+                .checked_add(resources.recovery_workspace_bytes)
+                .and_then(|bytes| bytes.checked_add(permitted_writes * one_batch_charge))
+                .unwrap();
+            let mut state = engine.pitr_manifest_state.lock().clone();
+            let config = state.config.as_mut().unwrap();
+            config.max_unarchived_bytes = config.max_segment_bytes;
+            config.max_source_spool_bytes = spool_limit;
+            *engine.inner.pitr_state.lock() = state.clone();
+            *engine.pitr_manifest_state.lock() = state;
+            engine.inner.ensure_manifest_v7()?;
+            engine.close()?;
+            drop(owner);
+            drop(active);
+            drop(engine);
+
+            let engine = KvEngine::open(&database, options.clone())?;
+            let active = engine.inner.state.load().memtable.clone();
+            let owner = active
+                .wal_v8_reservation_owner()
+                .ok_or_else(|| anyhow::anyhow!("reopened v8 WAL has no resource owner"))?;
+            let resources = owner.image_owner().snapshot();
+            assert_eq!(
+                resources.source_spool_bytes + resources.recovery_workspace_bytes,
+                spool_limit - permitted_writes * one_batch_charge
+            );
+            let status_before = engine.pitr_status(PitrStatusOptions {
+                cursor: None,
+                page_size: MAX_STATUS_PAGE_SIZE,
+            })?;
+            assert_eq!(
+                status_before.source_spool_bytes,
+                resources.source_spool_bytes
+            );
+
+            if permitted_writes == 1 {
+                engine.put(b"permitted", b"value")?;
+                let status_after = engine.pitr_status(PitrStatusOptions {
+                    cursor: None,
+                    page_size: MAX_STATUS_PAGE_SIZE,
+                })?;
+                assert!(status_after.source_spool_bytes > status_before.source_spool_bytes);
+            }
+            let before_boundary = active.v8_active_boundaries()?.1;
+            let before_wal = std::fs::read(&wal_path)?;
+            let before_resources = owner.image_owner().snapshot();
+            let error = engine.put(b"over-quota", b"value").unwrap_err();
+            assert!(format!("{error:#}").contains("source spool limit"));
+            assert_eq!(active.v8_active_boundaries()?.1, before_boundary);
+            assert_eq!(active.wal_batch_count(), Some(permitted_writes));
+            assert_eq!(std::fs::read(&wal_path)?, before_wal);
+            assert_eq!(owner.image_owner().snapshot(), before_resources);
+            assert_eq!(engine.get(b"over-quota")?, None);
+
+            engine.close()?;
+            drop(owner);
+            drop(active);
+            drop(engine);
+            let reopened = KvEngine::open(&database, options)?;
+            assert_eq!(reopened.get(b"over-quota")?, None);
+            assert_eq!(
+                reopened.get(b"permitted")?,
+                (permitted_writes == 1).then(|| Bytes::from_static(b"value"))
+            );
+            reopened.close()?;
+        }
+
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn active_v8_lsm_recovery_publishes_anchor_and_resumes_appends() -> anyhow::Result<()> {
+        use crate::pitr::manifest::{PitrManifestRecord, PitrWalFormat};
+
+        let directory = tempdir()?;
+        let (options, segment_id) = active_v8_recovery_test_database(directory.path(), true)?;
+        let database = directory.path().join("db");
+        let wal_path = database.join(format!("pitr-{segment_id:020}.wal"));
         let engine = KvEngine::open(&database, options.clone())?;
         assert!(engine.inner.state.load().memtable.uses_v8_wal());
         assert_eq!(engine.get(b"seed")?, Some(Bytes::from_static(b"v")));
@@ -22371,6 +22978,17 @@ mod tests {
         let engine = KvEngine::open(&database, options.clone())?;
         assert!(engine.inner.state.load().memtable.uses_v8_wal());
         assert_eq!(engine.get(b"sealing-key")?, Some(Bytes::from_static(b"v")));
+        let status = engine.pitr_status(crate::pitr::api::PitrStatusOptions {
+            cursor: None,
+            page_size: crate::pitr::api::MAX_STATUS_PAGE_SIZE,
+        })?;
+        assert_eq!(status.active_wal_bytes, u64::try_from(source_bytes.len())?);
+        assert_eq!(status.archive_lag_commits, 1);
+        assert_eq!(status.archive_lag_bytes, u64::try_from(source_bytes.len())?);
+        assert!(
+            status.source_spool_bytes
+                >= LsmStorageInner::filesystem_file_allocated_bytes(&wal_path)?
+        );
         assert!(
             engine
                 .inner
@@ -25194,7 +25812,19 @@ mod tests {
             Some(crate::wal::format::WAL_FORMAT_VERSION_V8)
         );
         assert!(engine.inner.state.load().memtable.uses_v8_wal());
+        drop(state);
         engine.close_storage()?;
+        drop(engine);
+        Manifest::recover(database.join("MANIFEST"))?
+            .0
+            .add_records_when_init(&[
+                ManifestRecord::Pitr(PitrManifestRecord::SegmentArchived {
+                    segment_id: source_segment_id,
+                }),
+                ManifestRecord::Pitr(PitrManifestRecord::SegmentReclaimable {
+                    segment_id: source_segment_id,
+                }),
+            ])?;
 
         let reopened = KvEngine::open_with_wal_io_mode(
             &database,
@@ -25207,6 +25837,46 @@ mod tests {
             WalIoMode::Leader,
         )?;
         assert!(reopened.inner.state.load().memtable.uses_v8_wal());
+        assert_eq!(
+            reopened.get(b"v8-key")?,
+            Some(bytes::Bytes::from_static(b"v"))
+        );
+        let owner = reopened
+            .inner
+            .state
+            .load()
+            .memtable
+            .wal_v8_reservation_owner()
+            .expect("recovered Active v8 WAL has a reservation owner")
+            .image_owner();
+        let before = owner.snapshot().source_spool_bytes;
+        let generation = (0..10_000)
+            .find(|&generation| !owner.source_spool_generation_changed(generation))
+            .expect("source spool generation is bounded in this fixture");
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(crate::mvcc::txn::wait_for_v7_source_spool_capacity(
+                Arc::clone(&reopened.inner),
+                reopened.inner.blocking.clone(),
+                generation,
+                false,
+                anyhow::Error::new(
+                    crate::wal::v7::admission::WalV7ReservationError::SourceSpoolLimit {
+                        generation,
+                    },
+                ),
+            ))?;
+        assert!(!source_wal_path.exists());
+        assert!(!source_wal_path.with_extension("seal").exists());
+        assert!(owner.snapshot().source_spool_bytes < before);
+        assert!(
+            !reopened
+                .pitr_manifest_state
+                .lock()
+                .obligations
+                .contains_key(&source_segment_id)
+        );
         assert_eq!(
             reopened.get(b"v8-key")?,
             Some(bytes::Bytes::from_static(b"v"))
