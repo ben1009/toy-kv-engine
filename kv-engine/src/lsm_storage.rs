@@ -4304,6 +4304,70 @@ impl KvEngine {
         }))
     }
 
+    /// Explicitly migrate an already enabled PITR database to v8 for the
+    /// opt-in `write-perf` benchmark. This benchmark-only entry point does not
+    /// change automatic format selection or the default writer format.
+    #[cfg(all(target_os = "linux", feature = "bench"))]
+    #[doc(hidden)]
+    pub fn start_v8_pitr_for_benchmark(
+        &self,
+        repository: impl AsRef<std::path::Path>,
+    ) -> Result<()> {
+        match self.resume_pitr(&repository)? {
+            crate::pitr::api::PitrResumeOutcome::Resumed => {}
+            crate::pitr::api::PitrResumeOutcome::ReconciliationRequired(error) => {
+                anyhow::bail!("v8 PITR benchmark setup requires reconciliation: {error:?}");
+            }
+        }
+        self.inner
+            .mvcc
+            .as_ref()
+            .ok_or_else(|| anyhow!("v8 PITR benchmark requires MVCC"))?
+            .stop_commit_admission_and_capture()?;
+
+        let guards = self.lock_v8_compatibility_publication();
+        let Some(intent) = self.publish_pitr_v8_migration_intent(&guards)? else {
+            drop(guards);
+            match self.resume_pitr(&repository)? {
+                crate::pitr::api::PitrResumeOutcome::Resumed => {}
+                crate::pitr::api::PitrResumeOutcome::ReconciliationRequired(error) => {
+                    anyhow::bail!(
+                        "v8 PITR benchmark migration preflight was deferred and resume requires reconciliation: {error:?}"
+                    );
+                }
+            }
+            anyhow::bail!("v8 PITR benchmark migration was deferred by capacity preflight");
+        };
+
+        // Keep both the transition reservation and compatibility lifecycle
+        // barriers alive until the durable intent has installed its exact v8
+        // successor. Calling `resume_pitr` before this handoff would drop the
+        // reservation and leave a gap in lifecycle serialization.
+        let source_segment_id =
+            unsupported_v7_to_v8_migration_source(&intent.state).ok_or_else(|| {
+                anyhow!("published v8 benchmark migration intent has no Active source")
+            })?;
+        let successor_segment_id = intent
+            .state
+            .obligations
+            .get(&source_segment_id)
+            .ok_or_else(|| anyhow!("published v8 benchmark migration source has no obligation"))?
+            .successor_segment_id;
+        let prepared = self
+            .seal_rotate_v7_active_wal(source_segment_id, successor_segment_id)
+            .context("install the benchmark v8 successor")?;
+        drop(prepared);
+        drop(intent);
+        drop(guards);
+
+        match self.resume_pitr(repository)? {
+            crate::pitr::api::PitrResumeOutcome::Resumed => Ok(()),
+            crate::pitr::api::PitrResumeOutcome::ReconciliationRequired(error) => {
+                anyhow::bail!("v8 PITR benchmark migration requires reconciliation: {error:?}");
+            }
+        }
+    }
+
     /// Preflight a new PITR epoch against the complete v7 transition budget
     /// before publishing its durable enable intent. A disabled database has no
     /// live PITR segment manager, so account every visible PITR source, staging,

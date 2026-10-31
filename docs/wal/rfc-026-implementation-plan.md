@@ -250,6 +250,16 @@ disabled.
    compatibility and performance matrix. Keep v7 as the default unless the
    measured results justify an explicit later adoption decision.
 
+The Linux `write-perf --features bench` binary now accepts the explicit
+`--pitr --pitr-format v8` selector. It prepares the database through the
+capacity-checked v6-to-v7 and v7-to-v8 migration paths before the measured
+workload; the default PITR format remains v7. This is a benchmark setup path,
+not a qualification result or a production v8 creation policy. The current v8
+writer implements Leader only, so this interim harness requires
+`--wal-io-mode leader`; Parallel v8 and the RFC performance matrix remain
+unqualified. The normal build rejects the v8 selector before opening a
+database.
+
 Each slice must leave existing v2-v7 reads, writes, recovery and digest
 interpretation unchanged. Tests for each completed slice are part of its
 review evidence; end-to-end crash and performance qualification remains a
