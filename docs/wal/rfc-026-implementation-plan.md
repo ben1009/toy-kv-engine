@@ -149,7 +149,8 @@ remain unqualified, so v8 creation stays disabled.
    post-`SegmentSealed` install is retried from that durable boundary. Explicit
    `create_recovery_point` now completes the Active v8 rotation, installs its
    v8 successor and archives the sealed source. Automatic v8 rotation, general
-   format-registry selection and v7-to-v8 migration remain disabled.
+  format-registry selection and new v7-to-v8 migration initiation remain
+  disabled; explicit resume only completes an already-published intent.
 5. **Persistence and transitions:** version persisted seal/manifest/backup
    digest references, validate v8 archive objects, support v5/v6/v7/v8 chain
    transitions and the old-reader compatibility gate above. Add capacity and
@@ -161,10 +162,12 @@ remain unqualified, so v8 creation stays disabled.
    catalog reopen, sealed-source startup recovery, and exact restore from
    persisted archive objects across a v7-to-v8 chain. The PITR manifest state
    machine can durably represent a v7-to-v8 migration intent that binds the
-   immutable v7 source boundary and exact empty v8 successor; migration
-   execution remains disabled until its fenced capacity and compatibility
-   gates are connected. Pre-seal v7-to-v8 intents remain fail-closed and are
-   never routed through ordinary v7 rotation. Once `SegmentSealed` durably
+  immutable v7 source boundary and exact empty v8 successor. Explicit
+  `resume_pitr` now rechecks and reserves migration capacity after restart,
+  then finishes a pre-seal intent through the existing v7 sealing path and
+  installs only its exact authorized v8 successor. It keeps commit admission
+  fenced throughout. New migration initiation and automatic v8 adoption remain
+  disabled pending compatibility qualification. Once `SegmentSealed` durably
    binds the v7 source and exact empty v8 boundary, startup can strictly
    validate that source and recreate/register the v8 successor if interrupted
    before engine-manifest registration. `PitrStatus` reports a
@@ -178,8 +181,8 @@ remain unqualified, so v8 creation stays disabled.
    preparation now syncs and persists the exact v7 Active boundary, reserves
    that complete transition budget, and only then publishes the old-reader
    compatibility guard followed by `V8MigrationStarted`; the returned owner
-   retains the reservation. No runtime path invokes this preparation yet, and
-   migration execution remains disabled pending compatibility qualification.
+  retains the reservation. No automatic runtime path invokes this preparation;
+  explicit resume only completes an already-published durable intent.
    Active recovery
    normalization is tested with repeated process
    interruption after temp-image write, temp sync, rename, and directory sync;
