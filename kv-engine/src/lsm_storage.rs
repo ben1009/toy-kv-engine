@@ -12954,13 +12954,51 @@ impl LsmStorageInner {
                                     && recovered.installed_ino == installed_metadata.ino(),
                                 "installed Sealing v8 WAL differs from its immutable manifest boundary"
                             );
-                            MemTable::recover_from_v8_sealed(
+                            let image_len = recovered.image_len;
+                            let installed_dev = recovered.installed_dev;
+                            let installed_ino = recovered.installed_ino;
+                            let (mut memtable, wal_max_ts) = MemTable::recover_from_v8_sealed(
                                 memtable_id,
                                 vlog_enabled,
                                 &wal_path,
                                 &recovered.seal,
                                 crate::pitr::LIVE_WAL_V5_LIMITS,
-                            )?
+                            )?;
+                            drop(recovered);
+                            // Strict recovery and replay are complete. Transfer
+                            // the temporary source/workspace charge to a
+                            // persistent read-only owner before publishing the
+                            // memtable or releasing the startup fence.
+                            drop(recovery_workspace);
+                            let installed_metadata = std::fs::metadata(&wal_path)?;
+                            ensure!(
+                                installed_metadata.len() == image_len
+                                    && installed_metadata.dev() == installed_dev
+                                    && installed_metadata.ino() == installed_ino,
+                                "installed Sealing v8 WAL changed before resource ownership transfer"
+                            );
+                            let installed_allocated_bytes =
+                                Self::filesystem_allocated_bytes(&installed_metadata)?;
+                            let workspace_bytes =
+                                crate::pitr::segment::filesystem_allocation_reservation(
+                                    path,
+                                    max_segment_bytes,
+                                )?;
+                            let allocation_unit =
+                                crate::pitr::segment::filesystem_allocation_reservation(path, 1)?;
+                            let owner = Arc::new(
+                                crate::wal::v8::resource::WalV8ReservationOwner::new_sealing_with_retained_resources(
+                                    retained_resources,
+                                    installed_dev,
+                                    installed_ino,
+                                    image_len,
+                                    installed_allocated_bytes,
+                                    workspace_bytes,
+                                    allocation_unit,
+                                )?,
+                            );
+                            memtable.attach_v8_reservation_owner(owner)?;
+                            (memtable, wal_max_ts)
                         } else {
                             let recovery = crate::wal::v8::install::recover_and_install_active(
                                 &wal_path,
@@ -22977,6 +23015,18 @@ mod tests {
         };
         let engine = KvEngine::open(&database, options.clone())?;
         assert!(engine.inner.state.load().memtable.uses_v8_wal());
+        let sealing_source = engine.inner.state.load().memtable.clone();
+        let source_owner = sealing_source
+            .wal_v8_reservation_owner()
+            .ok_or_else(|| anyhow::anyhow!("Active v8 Sealing source has no resource owner"))?;
+        assert!(
+            source_owner
+                .image_owner()
+                .snapshot()
+                .recovery_workspace_bytes
+                > 0,
+            "read-only Sealing sources must retain recovery workspace"
+        );
         assert_eq!(engine.get(b"sealing-key")?, Some(Bytes::from_static(b"v")));
         let status = engine.pitr_status(crate::pitr::api::PitrStatusOptions {
             cursor: None,
@@ -23011,6 +23061,8 @@ mod tests {
             sealing_state.obligations[&segment_id].state,
             crate::pitr::manifest::ObligationState::Sealing
         );
+        drop(source_owner);
+        drop(sealing_source);
         engine.close()?;
         drop(engine);
 

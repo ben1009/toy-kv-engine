@@ -72,6 +72,55 @@ impl WalV8ReservationOwner {
         })
     }
 
+    /// Own a durably fenced v8 Sealing source without charging its logical WAL
+    /// bytes a second time. The sealing obligation already accounts those
+    /// bytes; this owner retains the physical image and the workspace required
+    /// to validate or normalize it during a later resume.
+    pub(crate) fn new_sealing_with_retained_resources(
+        retained_resources: Arc<WalV7RetainedResources>,
+        installed_dev: u64,
+        installed_ino: u64,
+        image_len: u64,
+        installed_allocated_bytes: u64,
+        recovery_workspace_bytes: u64,
+        source_allocation_unit: u64,
+    ) -> Result<Self> {
+        ensure!(
+            source_allocation_unit > 0,
+            "v8 source allocation unit is zero"
+        );
+        ensure!(
+            image_len >= FIXED_IMAGE_BYTES,
+            "installed v8 Sealing image is shorter than its fixed prefix"
+        );
+        ensure!(
+            recovery_workspace_bytes >= round_up(image_len, source_allocation_unit)?,
+            "v8 Sealing recovery workspace cannot hold its image"
+        );
+        let workspace = retained_resources
+            .ledger()
+            .reserve_maintenance(WalV7ResourceCharge {
+                recovery_workspace_bytes,
+                ..WalV7ResourceCharge::default()
+            })?;
+        let image_owner = Arc::new(WalV7ReservationOwner::new_with_retained_image_charge(
+            retained_resources,
+            installed_dev,
+            installed_ino,
+            WalV7ResourceCharge {
+                source_spool_bytes: installed_allocated_bytes.saturating_sub(FIXED_IMAGE_BYTES),
+                ..WalV7ResourceCharge::default()
+            },
+        )?);
+
+        Ok(Self {
+            image_owner,
+            _recovery_workspace: workspace,
+            recovery_workspace_bytes,
+            source_allocation_unit,
+        })
+    }
+
     /// Give the segment lifecycle the same image owner and retained ledger used
     /// by the writer, so source cleanup releases the matching charges.
     pub(crate) fn image_owner(&self) -> Arc<WalV7ReservationOwner> {

@@ -1670,6 +1670,42 @@ impl MemTable {
         Ok((ret, seal.boundary.active.last_commit_ts))
     }
 
+    /// Attach resource ownership after a recovered Sealing source has been
+    /// replayed and its temporary recovery reservation has been released.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn attach_v8_reservation_owner(
+        &mut self,
+        owner: Arc<crate::wal::v8::resource::WalV8ReservationOwner>,
+    ) -> Result<()> {
+        use std::os::unix::fs::MetadataExt;
+
+        anyhow::ensure!(
+            self.wal_v8_source && self.wal.is_none() && self.wal_v8_reservation_owner.is_none(),
+            "v8 reservation owner can only attach to an unowned sealed source"
+        );
+        let path = self
+            .wal_path
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("sealed v8 source has no WAL path"))?;
+        let metadata = std::fs::symlink_metadata(path)
+            .with_context(|| format!("inspect sealed v8 source {}", path.display()))?;
+        anyhow::ensure!(
+            metadata.is_file() && !metadata.file_type().is_symlink(),
+            "sealed v8 source path is not a regular file"
+        );
+        owner
+            .image_owner()
+            .validate_image(metadata.dev(), metadata.ino())?;
+        anyhow::ensure!(
+            self.wal_v8_sealed_extent
+                .is_some_and(|(sealed_end, _)| sealed_end == metadata.len()),
+            "sealed v8 source extent differs from its owned image"
+        );
+        self.wal_v8_reservation_owner = Some(owner);
+
+        Ok(())
+    }
+
     #[allow(dead_code)]
     pub(crate) fn wal_v7_reservation_owner(&self) -> Option<Arc<WalV7ReservationOwner>> {
         self.wal_v7_reservation_owner.clone()
