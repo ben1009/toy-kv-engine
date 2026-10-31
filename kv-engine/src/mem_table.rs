@@ -1095,7 +1095,7 @@ pub struct MemTable {
     /// Owns the recovered v8 image's persistent spool and workspace charges.
     wal_v8_reservation_owner: Option<Arc<crate::wal::v8::resource::WalV8ReservationOwner>>,
     /// Physical length and ticket count of a read-only sealed v8 source.
-    wal_v8_sealed_extent: Option<(u64, u64)>,
+    wal_v8_sealed_boundary: Option<crate::pitr::manifest::ImmutableBoundary>,
     /// Terminal cursor retained while a durable Sealing source is recovered
     /// read-only. Explicit resume uses it to finish sealing without starting an
     /// append runtime for the frozen source.
@@ -1146,7 +1146,7 @@ impl MemTable {
             wal_v7_source: false,
             wal_v8_source: false,
             wal_v8_reservation_owner: None,
-            wal_v8_sealed_extent: None,
+            wal_v8_sealed_boundary: None,
             wal_v7_sealing_frontier: None,
             wal_v7_reservation_owner: None,
             wal_v7_seal_index: None,
@@ -1662,8 +1662,7 @@ impl MemTable {
 
         ret.wal_path = Some(path);
         ret.wal_v8_source = true;
-        ret.wal_v8_sealed_extent =
-            Some((seal.boundary.sealed_end, seal.boundary.active.ticket_end));
+        ret.wal_v8_sealed_boundary = Some(seal.boundary);
         ret.recovered_recorded_at = seal.entries.last().map(|entry| entry.recorded_at);
         ret.rebuild_bloom();
 
@@ -1697,8 +1696,8 @@ impl MemTable {
             .image_owner()
             .validate_image(metadata.dev(), metadata.ino())?;
         anyhow::ensure!(
-            self.wal_v8_sealed_extent
-                .is_some_and(|(sealed_end, _)| sealed_end == metadata.len()),
+            self.wal_v8_sealed_boundary
+                .is_some_and(|boundary| boundary.sealed_end == metadata.len()),
             "sealed v8 source extent differs from its owned image"
         );
         self.wal_v8_reservation_owner = Some(owner);
@@ -2495,10 +2494,51 @@ impl MemTable {
         crate::pitr::manifest::ActiveBoundary,
     )> {
         anyhow::ensure!(self.uses_v8_wal(), "memtable WAL is not v8");
-        self.wal
+        if let Some(wal) = &self.wal {
+            return wal.v8_active_boundaries();
+        }
+        let boundary = self
+            .wal_v8_sealed_boundary
+            .ok_or_else(|| anyhow::anyhow!("memtable has no Active v8 boundary"))?;
+        let path = self
+            .wal_path
             .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("memtable has no Active v8 writer"))?
-            .v8_active_boundaries()
+            .ok_or_else(|| anyhow::anyhow!("sealed v8 memtable has no WAL path"))?;
+        let mut file = File::open(path).with_context(|| {
+            format!("open sealed v8 WAL {} for boundary capture", path.display())
+        })?;
+        let mut header_bytes = [0; crate::wal::v8::WAL_V8_HEADER_LEN];
+        file.read_exact(&mut header_bytes)
+            .context("read sealed v8 WAL header for boundary capture")?;
+        let header = crate::wal::v8::codec::WalV8Header::decode(&header_bytes)
+            .context("decode sealed v8 WAL header for boundary capture")?;
+        anyhow::ensure!(
+            header.segment_id.0 == boundary.active.segment_id
+                && header.timeline_id.0 == boundary.active.timeline_id
+                && header.archive_epoch_id.0 == boundary.active.archive_epoch_id
+                && header.incarnation == boundary.active.incarnation,
+            "sealed v8 WAL header differs from its immutable boundary"
+        );
+        let empty = crate::pitr::manifest::ActiveBoundary {
+            ticket_end: 0,
+            durable_end: crate::wal::v8::WAL_V8_HEADER_LEN as u64,
+            last_commit_ts: 0,
+            prefix_digest: header.initial_prefix_digest()?,
+            ..boundary.active
+        };
+        empty.validate()?;
+        boundary.active.validate()?;
+        Ok((empty, boundary.active))
+    }
+
+    pub(crate) fn v8_wal_image_len(&self) -> Result<u64> {
+        anyhow::ensure!(self.uses_v8_wal(), "memtable WAL is not v8");
+        if let Some(wal) = &self.wal {
+            return wal.v8_image_len();
+        }
+        self.wal_v8_sealed_boundary
+            .map(|boundary| boundary.sealed_end)
+            .ok_or_else(|| anyhow::anyhow!("memtable has no Active v8 image length"))
     }
 
     pub(crate) fn v7_frontier_cursor(
@@ -2579,8 +2619,8 @@ impl MemTable {
 
     pub(crate) fn wal_logical_length(&self) -> Option<u64> {
         self.wal.as_ref().map(Wal::logical_length).or_else(|| {
-            self.wal_v8_sealed_extent
-                .map(|(length, _)| length)
+            self.wal_v8_sealed_boundary
+                .map(|boundary| boundary.sealed_end)
                 .or_else(|| {
                     self.wal_v7_sealing_frontier.and_then(|cursor| {
                         cursor
@@ -2594,8 +2634,8 @@ impl MemTable {
     #[allow(dead_code)]
     pub(crate) fn wal_batch_count(&self) -> Option<u64> {
         self.wal.as_ref().map(Wal::batch_count).or_else(|| {
-            self.wal_v8_sealed_extent
-                .map(|(_, tickets)| tickets)
+            self.wal_v8_sealed_boundary
+                .map(|boundary| boundary.active.ticket_end)
                 .or_else(|| {
                     self.wal_v7_sealing_frontier
                         .map(|cursor| cursor.frontier.ticket_end)

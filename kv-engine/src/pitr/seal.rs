@@ -1148,6 +1148,17 @@ pub(crate) struct V8Seal {
 }
 
 impl V8Seal {
+    pub(crate) fn encoded_len_for_entry_count(entry_count: u64) -> Result<u64> {
+        let entry_count = usize::try_from(entry_count)?;
+        u64::try_from(v8_max_seal_bytes(entry_count)?).map_err(Into::into)
+    }
+
+    /// Bound the temporary memory needed to rebuild and encode an Active v8
+    /// seal before its Sealing intent becomes durable.
+    pub(crate) fn preparation_memory_bytes(sealed_end: u64, ticket_end: u64) -> Result<u64> {
+        Self::validation_memory_bytes(sealed_end, ticket_end)
+    }
+
     pub(crate) fn max_encoded_len(max_segment_bytes: u64) -> Result<usize> {
         let minimum = crate::wal::v8::WAL_V8_HEADER_LEN
             .checked_add(crate::wal::v8::codec::WAL_V8_FRAME_LEN)

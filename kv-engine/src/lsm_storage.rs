@@ -132,6 +132,59 @@ impl PreparedV7PitrSeal<'_> {
 }
 
 #[cfg(target_os = "linux")]
+#[must_use = "install only after durable SealStarted and retain all reservations through reclamation"]
+#[allow(dead_code)] // Connected to the v8 rotation/resume path in a later slice.
+pub(crate) struct PreparedV8PitrSeal<'guard> {
+    seal: crate::pitr::seal::V8Seal,
+    wal_path: PathBuf,
+    seal_path: PathBuf,
+    bytes: Vec<u8>,
+    reservation: Option<crate::wal::v7::admission::WalV7OwnedPreparationReservation>,
+    successor_segment_id: u64,
+    retained_resources: Arc<crate::wal::v7::admission::WalV7RetainedResources>,
+    successor_reservation: Option<crate::wal::v7::admission::WalV7SuccessorReservation>,
+    installed: bool,
+    _lifecycle_guards: std::marker::PhantomData<&'guard ()>,
+}
+
+#[cfg(target_os = "linux")]
+#[allow(dead_code)] // Connected to the v8 rotation/resume path in a later slice.
+impl PreparedV8PitrSeal<'_> {
+    pub(crate) fn boundary(&self) -> crate::pitr::manifest::ImmutableBoundary {
+        self.seal.boundary
+    }
+
+    pub(crate) fn encoded_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    pub(crate) fn into_installed(
+        mut self,
+    ) -> Result<(
+        crate::pitr::seal::V8Seal,
+        PathBuf,
+        PathBuf,
+        crate::wal::v7::admission::WalV7OwnedPreparationReservation,
+    )> {
+        ensure!(self.installed, "v8 PITR seal sidecar was not installed");
+        let reservation = self
+            .reservation
+            .take()
+            .ok_or_else(|| anyhow!("v8 PITR seal reservation is missing"))?;
+        Ok((self.seal, self.wal_path, self.seal_path, reservation))
+    }
+
+    fn retain_reservation_for_possible_sidecar(&mut self) -> Result<()> {
+        if let Some(reservation) = self.reservation.take() {
+            self.retained_resources
+                .retain_preparation_reservation(self.seal.header.segment_id.0, reservation)?;
+        }
+
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
 struct PreparedPitrRecoveryPoint {
     active_segment_id: u64,
     successor_segment_id: u64,
@@ -19101,6 +19154,377 @@ impl LsmStorageInner {
         Ok((seal, wal_path, seal_path))
     }
 
+    /// Prepare a v8 seal from the stopped Active WAL without publishing it or
+    /// mutating the source image. The caller holds `state_lock` before the
+    /// active-memtable write guard through `SealStarted` and installation.
+    #[cfg(target_os = "linux")]
+    #[allow(dead_code)] // Connected to v8 rotation/resume in a later slice.
+    pub(crate) fn prepare_v8_pitr_seal_for_active_wal<'guard>(
+        &self,
+        _state_lock: &'guard MutexGuard<'_, ()>,
+        _active_memtable_guard: &'guard ActiveMemtableWriteGuard<'_>,
+    ) -> Result<PreparedV8PitrSeal<'guard>> {
+        use std::os::unix::fs::MetadataExt;
+
+        let state = self.pitr_state.lock().clone();
+        ensure!(
+            state.mode == crate::pitr::manifest::PitrMode::Enabled,
+            "v8 PITR seal requires enabled PITR"
+        );
+        let segment_id = state
+            .active_segment_id
+            .ok_or_else(|| anyhow!("PITR state has no active segment"))?;
+        let active_boundary = state
+            .active_boundary
+            .ok_or_else(|| anyhow!("v8 PITR state has no persisted Active boundary"))?;
+        ensure!(
+            active_boundary.segment_id == segment_id
+                && active_boundary.wal_format == crate::pitr::manifest::PitrWalFormat::V8,
+            "persisted Active boundary does not name the current v8 PITR segment"
+        );
+        let max_segment_bytes = state
+            .config
+            .as_ref()
+            .ok_or_else(|| anyhow!("v8 PITR state has no persisted configuration"))?
+            .max_segment_bytes;
+        let sequencer = self
+            .mvcc
+            .as_ref()
+            .ok_or_else(|| anyhow!("v8 PITR sealing requires MVCC"))?;
+        ensure!(
+            !sequencer.commit_admission_is_open(),
+            "v8 PITR seal requires stopped commit admission"
+        );
+
+        let obligation = state.obligations.get(&segment_id);
+        if let Some(obligation) = obligation {
+            ensure!(
+                obligation.state == crate::pitr::manifest::ObligationState::Sealing
+                    && obligation.wal_format == crate::pitr::manifest::PitrWalFormat::V8,
+                "v8 active source already has a different lifecycle obligation"
+            );
+        }
+        let successor_segment_id = obligation.map_or(state.next_segment_id, |obligation| {
+            obligation.successor_segment_id
+        });
+        ensure!(
+            successor_segment_id > segment_id,
+            "v8 successor segment ID does not advance the active segment"
+        );
+        successor_segment_id
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("PITR segment ID exhausted"))?;
+
+        let predecessor = pitr_chain_anchor_from_persisted(
+            state
+                .predecessor_anchor
+                .ok_or_else(|| anyhow!("v8 PITR state has no predecessor anchor"))?,
+        );
+        let memtable = self.state.load().memtable.clone();
+        ensure!(memtable.uses_v8_wal(), "active WAL is not PITR v8");
+        let (empty_boundary, writer_boundary) = memtable.v8_active_boundaries()?;
+        ensure!(
+            writer_boundary == active_boundary,
+            "persisted v8 Active boundary differs from the stopped source"
+        );
+        let wal_path = memtable
+            .wal_path()
+            .ok_or_else(|| anyhow!("active v8 PITR WAL has no source path"))?
+            .to_path_buf();
+        let v8_owner = memtable
+            .wal_v8_reservation_owner()
+            .ok_or_else(|| anyhow!("active v8 PITR WAL has no resource reservation owner"))?;
+        let reservation_owner = v8_owner.image_owner();
+        let retained_resources = reservation_owner
+            .retained_resources()
+            .ok_or_else(|| anyhow!("active v8 PITR WAL has no retained resource ledger"))?;
+
+        let metadata = std::fs::symlink_metadata(&wal_path)
+            .with_context(|| format!("inspect Active v8 WAL {}", wal_path.display()))?;
+        ensure!(
+            metadata.file_type().is_file(),
+            "Active v8 WAL path is not a regular file"
+        );
+        reservation_owner.validate_image(metadata.dev(), metadata.ino())?;
+        let mut wal = File::open(&wal_path)
+            .with_context(|| format!("open Active v8 WAL {} for sealing", wal_path.display()))?;
+        let mut header_bytes = [0; crate::wal::v8::WAL_V8_HEADER_LEN];
+        std::io::Read::read_exact(&mut wal, &mut header_bytes)
+            .context("read Active v8 WAL header for sealing")?;
+        let header = crate::wal::v8::codec::WalV8Header::decode(&header_bytes)?;
+        ensure!(
+            header.encode()?.as_slice() == header_bytes
+                && header.timeline_id.0 == active_boundary.timeline_id
+                && header.archive_epoch_id.0 == active_boundary.archive_epoch_id
+                && header.segment_id.0 == segment_id
+                && header.incarnation == active_boundary.incarnation
+                && header.predecessor == predecessor,
+            "Active v8 WAL header differs from its persisted identity"
+        );
+        let expected_empty_boundary = crate::pitr::manifest::ActiveBoundary {
+            timeline_id: header.timeline_id.0,
+            archive_epoch_id: header.archive_epoch_id.0,
+            segment_id,
+            incarnation: header.incarnation,
+            wal_format: crate::pitr::manifest::PitrWalFormat::V8,
+            ticket_end: 0,
+            durable_end: crate::wal::v8::WAL_V8_HEADER_LEN as u64,
+            last_commit_ts: 0,
+            prefix_digest: header.initial_prefix_digest()?,
+        };
+        ensure!(
+            empty_boundary == expected_empty_boundary,
+            "v8 source empty boundary differs from its immutable header"
+        );
+        let sealed_end = active_boundary
+            .durable_end
+            .checked_add(crate::wal::v8::codec::WAL_V8_FRAME_LEN as u64)
+            .ok_or_else(|| anyhow!("v8 PITR sealed image length overflows"))?;
+        ensure!(
+            memtable.v8_wal_image_len()? == sealed_end,
+            "v8 writer image does not end after the persisted terminal FRONTIER"
+        );
+        ensure!(
+            sealed_end <= max_segment_bytes,
+            "v8 PITR sealed image exceeds the persisted segment limit"
+        );
+
+        let sidecar_bytes =
+            crate::pitr::seal::V8Seal::encoded_len_for_entry_count(active_boundary.ticket_end)?;
+        let seal_path = wal_path.with_extension("seal");
+        let sidecar_exists = match std::fs::symlink_metadata(&seal_path) {
+            Ok(metadata) => {
+                ensure!(
+                    metadata.file_type().is_file() && metadata.len() == sidecar_bytes,
+                    "existing v8 PITR seal sidecar has an invalid type or length"
+                );
+                true
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(error) => return Err(error.into()),
+        };
+        let sidecar_charge_retained = retained_resources.has_seal_sidecar_charge(segment_id);
+        let sidecar_spool_reservation = if sidecar_exists {
+            if !sidecar_charge_retained {
+                let source_spool_bytes = crate::pitr::segment::filesystem_allocation_reservation(
+                    wal_path
+                        .parent()
+                        .ok_or_else(|| anyhow!("Active v8 WAL has no parent directory"))?,
+                    sidecar_bytes,
+                )?;
+                ensure!(
+                    source_spool_bytes > 0,
+                    "existing v8 seal sidecar has no allocated source-spool charge"
+                );
+                retained_resources
+                    .retain_existing_seal_sidecar_charge(segment_id, source_spool_bytes)?;
+            }
+            0
+        } else if sidecar_charge_retained {
+            0
+        } else {
+            crate::pitr::segment::filesystem_allocation_reservation(
+                wal_path
+                    .parent()
+                    .ok_or_else(|| anyhow!("Active v8 WAL has no parent directory"))?,
+                sidecar_bytes,
+            )?
+        };
+        ensure!(
+            sidecar_exists || sidecar_charge_retained || sidecar_spool_reservation > 0,
+            "v8 seal sidecar has no retained source-spool charge"
+        );
+
+        let successor_image_len = u64::try_from(
+            crate::wal::v8::WAL_V8_HEADER_LEN + crate::wal::v8::codec::WAL_V8_FRAME_LEN,
+        )?;
+        ensure!(
+            successor_image_len <= max_segment_bytes,
+            "v8 segment limit cannot hold an empty Active successor image"
+        );
+        let successor_wal_path = self
+            .path
+            .join(format!("pitr-{successor_segment_id:020}.wal"));
+        ensure!(
+            !successor_wal_path.try_exists()?,
+            "v8 successor WAL already exists; recovery must reconcile it before sealing"
+        );
+        let successor_spool_reservation = crate::pitr::segment::filesystem_allocation_reservation(
+            successor_wal_path
+                .parent()
+                .ok_or_else(|| anyhow!("v8 successor WAL has no parent directory"))?,
+            successor_image_len,
+        )?;
+        let successor_reservation =
+            if retained_resources.has_pending_successor(successor_segment_id) {
+                None
+            } else {
+                Some(
+                    retained_resources
+                        .reserve_successor(successor_segment_id, successor_spool_reservation)?,
+                )
+            };
+
+        let preparation_memory = crate::pitr::seal::V8Seal::preparation_memory_bytes(
+            sealed_end,
+            active_boundary.ticket_end,
+        )?;
+        let reservation = reservation_owner
+            .reserve_maintenance_preparation_resources(
+                crate::wal::v7::admission::WalV7ResourceCharge {
+                    source_spool_bytes: sidecar_spool_reservation,
+                    buffer_memory_bytes: preparation_memory,
+                    ..crate::wal::v7::admission::WalV7ResourceCharge::default()
+                },
+            )?
+            .ok_or_else(|| anyhow!("v8 seal reservation was unexpectedly empty"))?;
+
+        let physical_len = wal.metadata()?.len();
+        ensure!(
+            physical_len >= sealed_end,
+            "Active v8 WAL is shorter than its persisted terminal FRONTIER"
+        );
+        let (seal, bytes) = crate::pitr::seal::build_v8_seal_from_reader(
+            &mut wal,
+            sealed_end,
+            active_boundary,
+            predecessor,
+        )?;
+        if let Some(obligation) = obligation {
+            ensure!(
+                obligation.logical_length == seal.boundary.sealed_end
+                    && obligation.immutable_boundary == Some(seal.boundary),
+                "v8 PITR seal differs from its persisted Sealing obligation"
+            );
+        }
+        if sidecar_exists {
+            let mut existing = File::open(&seal_path).with_context(|| {
+                format!("open existing v8 PITR seal sidecar {}", seal_path.display())
+            })?;
+            let existing_len = existing.metadata()?.len();
+            ensure!(
+                existing_len == u64::try_from(bytes.len())?,
+                "existing v8 PITR seal sidecar length changed during preparation"
+            );
+            let mut offset = 0;
+            let mut buffer = [0; 64 * 1024];
+            while offset < bytes.len() {
+                let chunk_len = (bytes.len() - offset).min(buffer.len());
+                std::io::Read::read_exact(&mut existing, &mut buffer[..chunk_len])
+                    .context("read existing v8 PITR seal sidecar")?;
+                let end = offset + chunk_len;
+                ensure!(
+                    buffer[..chunk_len] == bytes[offset..end],
+                    "existing v8 PITR seal sidecar differs from the prepared seal"
+                );
+                offset = end;
+            }
+        }
+        ensure!(
+            bytes.len() <= crate::pitr::seal::V8Seal::max_encoded_len(max_segment_bytes)?,
+            "v8 PITR seal sidecar exceeds the persisted segment limit"
+        );
+        Ok(PreparedV8PitrSeal {
+            seal,
+            wal_path,
+            seal_path,
+            bytes,
+            reservation: Some(reservation),
+            successor_segment_id,
+            retained_resources,
+            successor_reservation,
+            installed: false,
+            _lifecycle_guards: std::marker::PhantomData,
+        })
+    }
+
+    /// Install a prepared v8 sidecar only after its exact Sealing obligation is
+    /// durable. The source image is normalized and synced before sidecar
+    /// publication; failures after SealStarted leave admission stopped.
+    #[cfg(target_os = "linux")]
+    #[allow(dead_code)] // Connected to v8 rotation/resume in a later slice.
+    pub(crate) fn install_v8_pitr_seal_for_sealing_obligation(
+        &self,
+        prepared: &mut PreparedV8PitrSeal<'_>,
+    ) -> Result<()> {
+        ensure!(
+            !prepared.installed,
+            "v8 PITR seal sidecar is already installed"
+        );
+        let state = self.pitr_state.lock().clone();
+        ensure!(
+            state.mode == crate::pitr::manifest::PitrMode::Enabled,
+            "v8 PITR seal installation requires enabled PITR"
+        );
+        let segment_id = prepared.seal.header.segment_id.0;
+        ensure!(
+            state.active_boundary == Some(prepared.seal.boundary.active),
+            "v8 PITR seal differs from the current Active manifest boundary"
+        );
+        let obligation = state
+            .obligations
+            .get(&segment_id)
+            .ok_or_else(|| anyhow!("v8 PITR seal has no manifest sealing obligation"))?;
+        ensure!(
+            obligation.state == crate::pitr::manifest::ObligationState::Sealing
+                && obligation.wal_format == crate::pitr::manifest::PitrWalFormat::V8
+                && obligation.logical_length == prepared.seal.boundary.sealed_end
+                && obligation.immutable_boundary == Some(prepared.seal.boundary)
+                && obligation.successor_segment_id == prepared.successor_segment_id,
+            "v8 PITR seal differs from its manifest sealing obligation"
+        );
+        if let Some(reservation) = prepared.successor_reservation.take() {
+            prepared
+                .retained_resources
+                .retain_pending_successor(prepared.successor_segment_id, reservation)?;
+        } else {
+            ensure!(
+                prepared
+                    .retained_resources
+                    .has_pending_successor(prepared.successor_segment_id),
+                "v8 Sealing obligation has no reserved successor capacity"
+            );
+        }
+        self.manifest
+            .as_ref()
+            .ok_or_else(|| anyhow!("manifest is not initialized"))?
+            .ensure_durability_certain()?;
+
+        let source_memtable = self.state.load().memtable.clone();
+        ensure!(
+            source_memtable.uses_v8_wal()
+                && source_memtable
+                    .wal_path()
+                    .is_some_and(|path| path == prepared.wal_path.as_path())
+                && source_memtable.v8_active_boundaries()?.1 == prepared.seal.boundary.active,
+            "v8 seal preparation no longer names the current source WAL"
+        );
+        let sealed_end = prepared.seal.boundary.sealed_end;
+        let wal = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&prepared.wal_path)
+            .with_context(|| {
+                format!(
+                    "open Active v8 WAL {} to finish its durable seal",
+                    prepared.wal_path.display()
+                )
+            })?;
+        let physical_len = wal.metadata()?.len();
+        ensure!(
+            physical_len >= sealed_end,
+            "Active v8 WAL is shorter than its durable Sealing boundary"
+        );
+        if physical_len != sealed_end {
+            wal.set_len(sealed_end)
+                .context("truncate Active v8 WAL after durable SealStarted")?;
+        }
+        wal.sync_all()
+            .context("sync exact frozen v8 WAL image after durable SealStarted")?;
+        crate::pitr::segment::install_pitr_file_no_replace(&prepared.seal_path, &prepared.bytes)?;
+        prepared.installed = true;
+        Ok(())
+    }
+
     /// Prepare the immutable v7 sidecar for a stopped Active WAL without
     /// publishing it or mutating the source WAL. After stopping commit admission, the caller must
     /// acquire `state_lock` before the active-memtable write guard and hold both through
@@ -22910,6 +23334,163 @@ mod tests {
             "recovery must reject corruption below the persisted Active v8 anchor"
         );
 
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn active_v8_seal_preparation_is_reserved_and_installs_only_after_seal_started()
+    -> anyhow::Result<()> {
+        use crate::pitr::manifest::{ObligationState, PitrManifestRecord, PitrWalFormat};
+
+        let directory = tempdir()?;
+        let (options, segment_id) = active_v8_recovery_test_database(directory.path(), true)?;
+        let database = directory.path().join("db");
+        let engine =
+            KvEngine::open_with_wal_io_mode(&database, options, crate::wal::WalIoMode::Leader)?;
+        suspend_pitr_maintenance_for_test(&engine);
+        engine.sync()?;
+
+        let state = engine.pitr_manifest_state.lock().clone();
+        let active_boundary = state
+            .active_boundary
+            .ok_or_else(|| anyhow::anyhow!("v8 fixture has no durable Active boundary"))?;
+        assert_eq!(active_boundary.segment_id, segment_id);
+        assert_eq!(active_boundary.wal_format, PitrWalFormat::V8);
+        let source = engine.inner.state.load().memtable.clone();
+        let wal_path = source
+            .wal_path()
+            .ok_or_else(|| anyhow::anyhow!("active v8 WAL has no source path"))?
+            .to_path_buf();
+        let seal_path = wal_path.with_extension("seal");
+        let owner = source
+            .wal_v8_reservation_owner()
+            .ok_or_else(|| anyhow::anyhow!("active v8 WAL has no resource owner"))?;
+        let image_owner = owner.image_owner();
+        let baseline_resources = image_owner.snapshot();
+        let sequencer = engine.inner.mvcc.as_ref().unwrap();
+        sequencer.stop_commit_admission_and_capture()?;
+        let state_lock = engine.inner.state_lock.lock();
+        let active_memtable_guard = engine.inner.active_memtable_lock.write();
+        let original_wal = std::fs::read(&wal_path)?;
+
+        let expected_sidecar_len =
+            crate::pitr::seal::V8Seal::encoded_len_for_entry_count(active_boundary.ticket_end)?;
+        let malformed_sidecar = vec![0xa5; usize::try_from(expected_sidecar_len)?];
+        std::fs::write(&seal_path, &malformed_sidecar)?;
+        let malformed_error = match engine
+            .inner
+            .prepare_v8_pitr_seal_for_active_wal(&state_lock, &active_memtable_guard)
+        {
+            Ok(_) => anyhow::bail!("preparation accepted a same-length mismatched sidecar"),
+            Err(error) => error,
+        };
+        assert!(
+            format!("{malformed_error:#}").contains("differs from the prepared seal"),
+            "mismatched sidecars must fail before SealStarted: {malformed_error:#}"
+        );
+        assert_eq!(std::fs::read(&wal_path)?, original_wal);
+        assert_eq!(std::fs::read(&seal_path)?, malformed_sidecar);
+        std::fs::remove_file(&seal_path)?;
+
+        let mut prepared = engine
+            .inner
+            .prepare_v8_pitr_seal_for_active_wal(&state_lock, &active_memtable_guard)?;
+        let boundary = prepared.boundary();
+        let sealed_end = boundary.sealed_end;
+        assert_eq!(boundary.active, active_boundary);
+        assert_eq!(std::fs::read(&wal_path)?, original_wal);
+        assert!(!seal_path.exists());
+        let decoded = crate::pitr::seal::V8Seal::decode(prepared.encoded_bytes(), sealed_end)?;
+        assert_eq!(decoded.boundary, boundary);
+
+        let sidecar_spool_bytes = crate::pitr::segment::filesystem_allocation_reservation(
+            wal_path.parent().unwrap(),
+            u64::try_from(prepared.encoded_bytes().len())?,
+        )?;
+        let successor_image_len = u64::try_from(
+            crate::wal::v8::WAL_V8_HEADER_LEN + crate::wal::v8::codec::WAL_V8_FRAME_LEN,
+        )?;
+        let successor_spool_bytes = crate::pitr::segment::filesystem_allocation_reservation(
+            wal_path.parent().unwrap(),
+            successor_image_len,
+        )?;
+        let preparation_memory = crate::pitr::seal::V8Seal::preparation_memory_bytes(
+            sealed_end,
+            active_boundary.ticket_end,
+        )?;
+        let prepared_resources = image_owner.snapshot();
+        assert_eq!(
+            prepared_resources.source_spool_bytes,
+            baseline_resources.source_spool_bytes + sidecar_spool_bytes + 2 * successor_spool_bytes,
+            "v8 seal preparation reserves the sidecar and both successor extents before Sealing"
+        );
+        assert_eq!(
+            prepared_resources.buffer_memory_bytes,
+            baseline_resources.buffer_memory_bytes + preparation_memory,
+            "v8 seal decode and encode workspace is reserved before construction"
+        );
+
+        let premature_install = engine
+            .inner
+            .install_v8_pitr_seal_for_sealing_obligation(&mut prepared)
+            .expect_err("an Active manifest must not authorize a v8 seal sidecar");
+        assert!(
+            premature_install
+                .to_string()
+                .contains("no manifest sealing obligation")
+        );
+        assert_eq!(std::fs::read(&wal_path)?, original_wal);
+        assert!(!seal_path.exists());
+
+        let seal_started = PitrManifestRecord::SealStarted {
+            segment_id,
+            successor_segment_id: state.next_segment_id,
+            logical_length: sealed_end,
+            immutable_boundary: Some(boundary),
+        };
+        engine.persist_pitr_lifecycle_with_state_guard(
+            std::slice::from_ref(&seal_started),
+            crate::pitr::manifest::replay_pitr_records([
+                PitrManifestRecord::Snapshot(Box::new(state.clone())),
+                seal_started.clone(),
+            ])?,
+            &state_lock,
+        )?;
+        engine
+            .inner
+            .install_v8_pitr_seal_for_sealing_obligation(&mut prepared)?;
+        assert_eq!(std::fs::metadata(&wal_path)?.len(), sealed_end);
+        assert!(seal_path.is_file());
+        assert_eq!(
+            std::fs::read(&seal_path)?,
+            prepared.encoded_bytes(),
+            "the installed sidecar is the exact prepared v8 seal"
+        );
+        let (seal, installed_wal_path, installed_seal_path, mut reservation) =
+            prepared.into_installed()?;
+        assert_eq!(installed_wal_path, wal_path);
+        assert_eq!(installed_seal_path, seal_path);
+        assert_eq!(seal.boundary, boundary);
+        reservation.release_buffer_memory()?;
+        let installed_resources = image_owner.snapshot();
+        assert_eq!(
+            installed_resources.buffer_memory_bytes, baseline_resources.buffer_memory_bytes,
+            "temporary v8 seal workspace retires after installation"
+        );
+        assert_eq!(
+            installed_resources.source_spool_bytes, prepared_resources.source_spool_bytes,
+            "the installed sidecar and pending successor remain charged"
+        );
+        assert_eq!(
+            engine.pitr_manifest_state.lock().obligations[&segment_id].state,
+            ObligationState::Sealing
+        );
+
+        drop(active_memtable_guard);
+        drop(state_lock);
+        engine.close()?;
+        drop(reservation);
         Ok(())
     }
 

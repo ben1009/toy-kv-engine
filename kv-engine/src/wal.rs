@@ -1491,6 +1491,15 @@ impl Wal {
             .active_boundaries()
     }
 
+    pub(crate) fn v8_image_len(&self) -> Result<u64> {
+        ensure!(self.is_v8(), "WAL is not v8");
+        self.v8_leader
+            .as_ref()
+            .context("v8 WAL has no serial Active writer")?
+            .lock()
+            .image_len()
+    }
+
     /// Return the writer's latest v7 FRONTIER after its durability barrier
     /// completes. The caller must stop admission before capturing this value.
     pub(crate) fn v7_frontier_cursor(&self) -> Result<WalV7FrontierCursor> {
