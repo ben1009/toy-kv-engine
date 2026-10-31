@@ -98,12 +98,25 @@ the migration caller must retain it through the v7-to-v8 transition so a
 concurrent resume cannot reopen commit admission between guard publication
 and WAL migration.
 
-This is partial compatibility qualification. Before enabling v8 creation, run
-the remaining process-level tests against the actual older binaries for normal
-and snapshot recovery, missing manifest, interrupted migration, WAL-lock and
-value-log startup, and compare database files and directory entries before and
-after rejection. The complete historical-binary matrix and startup ordering
-remain unqualified, so v8 creation stays disabled.
+Local probe results (2026-10-31): the six process cases above passed against a
+release CLI built offline from `18c5f0a8ccfb` with `nightly-2026-09-23`. Its
+SHA-256 was
+`e83ea47c4d385f160a5a28722706c374b25448b1dc31e8fa2a512b91bb92eb97`. The
+published-guard case also passed against the earlier CLI built from
+`3420eb05b23c5b6ddd22694a4a2f84698589655a`; its SHA-256 was
+`15121655cdd8e69eb9d1f260adb7a996dd85933a6a936e05025ac83519fd76a0`. Each
+case verified that the old reader rejected the expected unknown v8 manifest
+record and left recursive file contents, entry names, file metadata and
+metadata for recursively enumerated subdirectories unchanged. These runs
+qualify only the exercised guarded v7 fixture and publication states.
+
+This is partial compatibility qualification: the tested database is a guarded
+Active v7 fixture, not a completed v7-to-v8 migration. Before enabling v8
+creation, extend the process matrix to migrated and interrupted-migration
+states, normal and snapshot recovery variants, and a vLog-enabled database;
+continue comparing database files and directory entries before and after
+rejection. The complete historical-binary matrix and startup ordering remain
+unqualified, as does the performance matrix, so v8 creation stays disabled.
 
 ## Slices
 
