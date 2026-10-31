@@ -172,9 +172,13 @@ remain unqualified, so v8 creation stays disabled.
    workspace; this estimate does not reserve capacity or enable v8 creation. A
    matching reservation primitive now atomically books reconstructed retained
    source charges and transition source-spool/recovery-workspace charges; a
-   stale or deferred estimate leaves the ledger unchanged. The primitive is
-   not yet connected to migration intent publication, so migration execution
-   remains disabled. Active recovery
+   stale or deferred estimate leaves the ledger unchanged. Fenced intent
+   preparation now syncs and persists the exact v7 Active boundary, reserves
+   that complete transition budget, and only then publishes the old-reader
+   compatibility guard followed by `V8MigrationStarted`; the returned owner
+   retains the reservation. No runtime path invokes this preparation yet, and
+   migration execution remains disabled pending compatibility qualification
+   and successor-install recovery. Active recovery
    normalization is tested with repeated process
    interruption after temp-image write, temp sync, rename, and directory sync;
    retries preserve the hard anchor. Returned errors before sync, rename, and
