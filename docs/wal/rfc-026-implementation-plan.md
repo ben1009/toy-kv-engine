@@ -84,7 +84,7 @@ cargo test --package kv-engine --lib --features chaos-testing \
   pre_v8 -- --ignored --test-threads=1
 ```
 
-The filter runs twelve process cases: six guard-publication cases covering the
+The filter runs fifteen process cases: six guard-publication cases covering the
 normal `MANIFEST`, guard append, synced `ENGINE_MANIFEST.tmp`, snapshot rename,
 missing `MANIFEST` with an installed snapshot, and missing `MANIFEST` with a
 pending snapshot; the durable migration-intent, post-`SegmentSealed`, and
@@ -92,17 +92,20 @@ completed-v8 cases against the `18c5f0a8ccfb` CLI; a vLog-enabled published-
 guard case against a small reader harness built from the same historical
 library revision with WAL and value separation enabled; and the published-
 guard cases against the earlier historical library, with vLog both disabled
-and enabled. The vLog cases verify the older startup paths reject the v8 guard
-without touching a real `.vlog` file, even though vLog initialization
+and enabled, plus its durable migration-intent, post-`SegmentSealed`, and
+completed-v8 cases. The vLog cases verify the older startup paths reject the
+v8 guard without touching a real `.vlog` file, even though vLog initialization
 precedes manifest parsing.
 
 The earlier historical reader at `3420eb05b23c5b6ddd22694a4a2f84698589655a`
-is tested in both configurations against the fully published database:
+is tested in both configurations against the fully published database. Its
+stock CLI is also tested against durable migration-intent, post-`SegmentSealed`,
+and completed-v8 states:
 
 ```bash
 TOY_KV_EARLY_PRE_V8_CLI=/path/to/earlier/kv-engine-cli \
 TOY_KV_EARLY_PRE_V8_VLOG_CLI=/path/to/vlog-enabled-earlier-reader \
-cargo test --package kv-engine --lib v8_compatibility_guard_rejects_earlier_pre_v8_ \
+cargo test --package kv-engine --lib --features chaos-testing earlier_pre_v8 \
   -- --ignored --test-threads=1
 ```
 
@@ -134,9 +137,10 @@ published-guard case also passed against the earlier CLI built from
 `15121655cdd8e69eb9d1f260adb7a996dd85933a6a936e05025ac83519fd76a0`. Each
 case verified rejection of the expected unknown v8 manifest record and
 unchanged file contents, entry names, metadata for recursively enumerated
-entries and subdirectories, and database-root metadata. After adding migration
-states and vLog-enabled historical readers, the expanded twelve-case
-process matrix passed. The vLog reader harness for `18c5f0a8ccfb` was built
+entries and subdirectories, and database-root metadata. After adding earlier-
+reader migration states and vLog-enabled historical readers, the expanded
+fifteen-case process matrix passed. The vLog reader harness for `18c5f0a8ccfb`
+was built
 offline from that revision's library sources with WAL and value separation
 enabled; its SHA-256 was
 `1417e8107c1faedbde4dcf7ccb5e365168983d8edae8b542cbf90400ae985819`. The

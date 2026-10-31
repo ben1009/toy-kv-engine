@@ -39364,6 +39364,39 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    #[ignore = "requires the earlier pre-v8 CLI path in TOY_KV_EARLY_PRE_V8_CLI"]
+    fn v8_migration_intent_rejects_earlier_pre_v8_cli_without_database_mutation()
+    -> anyhow::Result<()> {
+        assert_pre_v8_cli_rejects_guarded_active_v7_with_env_without_mutation(
+            PreV8ReaderGuardState::MigrationIntent,
+            "TOY_KV_EARLY_PRE_V8_CLI",
+        )
+    }
+
+    #[cfg(all(target_os = "linux", feature = "chaos-testing"))]
+    #[test]
+    #[ignore = "requires the earlier pre-v8 CLI path in TOY_KV_EARLY_PRE_V8_CLI"]
+    fn failpoint_v8_sealed_migration_rejects_earlier_pre_v8_cli_without_database_mutation()
+    -> anyhow::Result<()> {
+        assert_pre_v8_cli_rejects_guarded_active_v7_with_env_without_mutation(
+            PreV8ReaderGuardState::SealedBeforeSuccessorRegistration,
+            "TOY_KV_EARLY_PRE_V8_CLI",
+        )
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires the earlier pre-v8 CLI path in TOY_KV_EARLY_PRE_V8_CLI"]
+    fn v8_migrated_database_rejects_earlier_pre_v8_cli_without_database_mutation()
+    -> anyhow::Result<()> {
+        assert_pre_v8_cli_rejects_guarded_active_v7_with_env_without_mutation(
+            PreV8ReaderGuardState::MigratedToV8,
+            "TOY_KV_EARLY_PRE_V8_CLI",
+        )
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn pitr_forced_flush_and_checkpoint_preserve_archive_chain_on_reopen() {
         let dir = tempdir().unwrap();
         let engine = pitr_flush_test_engine(dir.path());
