@@ -6657,7 +6657,7 @@ impl KvEngine {
         &self,
         active_segment_id: u64,
         successor_segment_id: u64,
-    ) -> Result<()> {
+    ) -> Result<PreparedPitrRecoveryPoint> {
         use crate::pitr::manifest::{
             ObligationState, PersistedChainAnchor, PitrManifestRecord, PitrWalFormat,
         };
@@ -6674,6 +6674,13 @@ impl KvEngine {
         let source_owner = active
             .wal_v8_reservation_owner()
             .ok_or_else(|| anyhow!("Active v8 sealing source has no reservation owner"))?;
+        let boundaries = active.v8_active_boundaries()?;
+        Self::persist_active_boundary(
+            &self.inner,
+            &self.pitr_manifest_state,
+            &self.pitr_publication_unknown,
+            boundaries,
+        )?;
 
         // Segment-manager locks precede the engine manifest lock. Keep both,
         // plus the active-memtable fence, through the durable seal transition.
@@ -6684,22 +6691,28 @@ impl KvEngine {
         );
         let state_lock = self.inner.state_lock.lock();
         let state = self.pitr_manifest_state.lock().clone();
-        let obligation = state
-            .obligations
-            .get(&active_segment_id)
-            .ok_or_else(|| anyhow!("v8 Active source has no Sealing obligation"))?;
+        let existing_obligation = state.obligations.get(&active_segment_id).copied();
         ensure!(
-            obligation.state == ObligationState::Sealing
-                && obligation.wal_format == PitrWalFormat::V8
-                && obligation.successor_segment_id == successor_segment_id
-                && state.active_segment_id == Some(active_segment_id)
-                && state.next_segment_id == successor_segment_id.saturating_add(1),
-            "v8 Sealing obligation differs from the requested successor"
+            existing_obligation.is_none_or(|obligation| {
+                obligation.state == ObligationState::Sealing
+                    && obligation.wal_format == PitrWalFormat::V8
+            }),
+            "v8 Active source already has a different lifecycle obligation"
+        );
+        ensure!(
+            state.active_segment_id == Some(active_segment_id)
+                && (if let Some(obligation) = existing_obligation {
+                    obligation.successor_segment_id == successor_segment_id
+                        && state.next_segment_id == successor_segment_id.saturating_add(1)
+                } else {
+                    state.next_segment_id == successor_segment_id
+                }),
+            "v8 recovery-point segment identity changed while draining admission"
         );
         let active_memtable_guard = self.inner.active_memtable_lock.write();
         ensure!(
             Arc::ptr_eq(&self.inner.state.load().memtable, &active),
-            "v8 sealing source changed before completing its obligation"
+            "v8 sealing source changed before sealing"
         );
         let mut prepared = self
             .inner
@@ -6709,9 +6722,11 @@ impl KvEngine {
             immutable_boundary.active.segment_id == active_segment_id
                 && immutable_boundary.active.wal_format == PitrWalFormat::V8
                 && prepared.successor_segment_id == successor_segment_id
-                && obligation.logical_length == immutable_boundary.sealed_end
-                && obligation.immutable_boundary == Some(immutable_boundary),
-            "prepared v8 seal differs from its durable Sealing obligation"
+                && existing_obligation.is_none_or(|obligation| {
+                    obligation.logical_length == immutable_boundary.sealed_end
+                        && obligation.immutable_boundary == Some(immutable_boundary)
+                }),
+            "prepared v8 seal differs from its recovery-point boundary"
         );
 
         let seal_digest: [u8; 32] = sha2::Sha256::digest(prepared.encoded_bytes()).into();
@@ -6810,6 +6825,52 @@ impl KvEngine {
             }
         });
 
+        let point = crate::pitr::api::RecoveryPoint {
+            commit_ts: last_record
+                .map(|(commit_ts, _)| commit_ts)
+                .or_else(|| state.last_commit_anchor.map(|anchor| anchor.commit_ts)),
+            observed_at: match last_record {
+                Some((_, recorded_at)) => recorded_at.as_system_time()?,
+                None => state
+                    .last_recorded_at
+                    .map(|time| {
+                        crate::pitr::RecordedAt {
+                            secs: time.secs,
+                            nanos: time.nanos,
+                        }
+                        .as_system_time()
+                    })
+                    .transpose()?
+                    .unwrap_or_else(std::time::SystemTime::now),
+            },
+        };
+
+        let sealing_state = if let Some(obligation) = existing_obligation {
+            ensure!(
+                obligation.logical_length == immutable_boundary.sealed_end
+                    && obligation.immutable_boundary == Some(immutable_boundary),
+                "recovered v8 seal differs from its durable Sealing obligation"
+            );
+            state.clone()
+        } else {
+            let seal_started = PitrManifestRecord::SealStarted {
+                segment_id: active_segment_id,
+                successor_segment_id,
+                logical_length: immutable_boundary.sealed_end,
+                immutable_boundary: Some(immutable_boundary),
+            };
+            let sealing_state = crate::pitr::manifest::replay_pitr_records([
+                PitrManifestRecord::Snapshot(Box::new(state.clone())),
+                seal_started.clone(),
+            ])?;
+            self.persist_pitr_lifecycle_with_state_guard(
+                std::slice::from_ref(&seal_started),
+                sealing_state.clone(),
+                &state_lock,
+            )?;
+            sealing_state
+        };
+
         if let Err(error) = self
             .inner
             .install_v8_pitr_seal_for_sealing_obligation(&mut prepared)
@@ -6827,7 +6888,7 @@ impl KvEngine {
             return Err(error);
         }
         let retained_resources = Arc::clone(&prepared.retained_resources);
-        let (installed_seal, _, _, seal_reservation) = prepared.into_installed()?;
+        let (installed_seal, wal_path, seal_path, seal_reservation) = prepared.into_installed()?;
         ensure!(
             installed_seal.boundary == immutable_boundary,
             "installed v8 seal differs from its immutable boundary"
@@ -6847,7 +6908,7 @@ impl KvEngine {
             successor_active_boundary: Some(successor_active_boundary),
         };
         let sealed_state = crate::pitr::manifest::replay_pitr_records([
-            PitrManifestRecord::Snapshot(Box::new(state)),
+            PitrManifestRecord::Snapshot(Box::new(sealing_state)),
             sealed_record.clone(),
         ])?;
         let mut sealed_segments = segments
@@ -6898,7 +6959,16 @@ impl KvEngine {
         drop(state_lock);
         drop(segments);
 
-        Ok(())
+        Ok(PreparedPitrRecoveryPoint {
+            active_segment_id,
+            successor_segment_id,
+            logical_length: immutable_boundary.sealed_end,
+            source_reservation_owner: source_owner.image_owner(),
+            metadata,
+            wal_path,
+            seal_path,
+            point,
+        })
     }
 
     #[cfg(target_os = "linux")]
@@ -6928,7 +6998,7 @@ impl KvEngine {
                 .saturating_sub(sealed_payload_bytes)
                 .max(4096);
             let active = self.inner.state.load().memtable.clone();
-            if !active.uses_v7_wal() {
+            if active.uses_wal_v5() {
                 active.configure_pitr_wal_limits(
                     config.max_segment_bytes.min(successor_budget),
                     successor_budget,
@@ -7046,7 +7116,7 @@ impl KvEngine {
         // once Reclaimable is durable, without waiting for resume or reopen.
         let reclaim_state = self.pitr_manifest_state.lock().clone();
         self.reconcile_durable_archive_obligations(reclaim_state)?;
-        if resume_admission_on_success && !self.inner.state.load().memtable.uses_v7_wal() {
+        if resume_admission_on_success && self.inner.state.load().memtable.uses_wal_v5() {
             let config = state.config.as_ref().unwrap();
             self.inner
                 .state
@@ -7081,10 +7151,6 @@ impl KvEngine {
         ensure!(
             state.mode == crate::pitr::manifest::PitrMode::Enabled,
             "PITR is not actively enabled"
-        );
-        ensure!(
-            !self.inner.state.load().memtable.uses_v8_wal(),
-            "PITR recovery points are not enabled for Active v8 WAL until sealing is implemented"
         );
         let sequencer = self
             .inner
@@ -7122,6 +7188,26 @@ impl KvEngine {
             if self.inner.state.load().memtable.uses_v7_wal() {
                 let prepared =
                     self.seal_rotate_v7_active_wal(active_segment_id, successor_segment_id)?;
+                return self.archive_recovery_point_boundary(
+                    &state,
+                    prepared.active_segment_id,
+                    prepared.successor_segment_id,
+                    prepared.logical_length,
+                    prepared.metadata,
+                    &prepared.source_reservation_owner,
+                    &prepared.wal_path,
+                    &prepared.seal_path,
+                    prepared.point,
+                    resume_admission_on_success,
+                    cancellation,
+                    sequencer,
+                    &mut admission_released_for_archive,
+                );
+            }
+            if self.inner.state.load().memtable.uses_v8_wal() {
+                let prepared =
+                    self.seal_rotate_v8_active_wal(active_segment_id, successor_segment_id)?;
+                state = self.pitr_manifest_state.lock().clone();
                 return self.archive_recovery_point_boundary(
                     &state,
                     prepared.active_segment_id,
@@ -24192,15 +24278,26 @@ mod tests {
         let directory = tempdir()?;
         let (options, segment_id) = active_v8_recovery_test_database(directory.path(), true)?;
         let database = directory.path().join("db");
-        let wal_path = database.join(format!("pitr-{segment_id:020}.wal"));
         let engine = KvEngine::open(&database, options.clone())?;
         assert!(engine.inner.state.load().memtable.uses_v8_wal());
         assert_eq!(engine.get(b"seed")?, Some(Bytes::from_static(b"v")));
-        let recovery_point_error = match engine.create_recovery_point() {
-            Ok(_) => anyhow::bail!("Active v8 recovery-point creation unexpectedly succeeded"),
-            Err(error) => error,
+        let recovery_point = match engine.create_recovery_point()? {
+            crate::pitr::api::RecoveryPointOutcome::Durable(point) => point,
+            other => anyhow::bail!("v8 recovery-point publication was not durable: {other:?}"),
         };
-        assert!(format!("{recovery_point_error:#}").contains("not enabled for Active v8"));
+        assert_eq!(recovery_point.commit_ts, Some(7));
+        let successor_segment_id = segment_id + 1;
+        let successor = engine.inner.state.load().memtable.clone();
+        assert!(successor.uses_v8_wal());
+        assert_eq!(
+            LsmStorageInner::pitr_segment_of(&successor),
+            Some(successor_segment_id)
+        );
+        let wal_path = successor
+            .wal_path()
+            .ok_or_else(|| anyhow::anyhow!("v8 recovery-point successor has no WAL path"))?
+            .to_path_buf();
+        assert_eq!(engine.get(b"seed")?, Some(Bytes::from_static(b"v")));
         engine.put(b"after-recovery", b"appended")?;
         engine.sync()?;
         let durable_boundary = engine
@@ -24209,7 +24306,8 @@ mod tests {
             .active_boundary
             .expect("v8 sync publishes its Active boundary");
         assert_eq!(durable_boundary.wal_format, PitrWalFormat::V8);
-        assert_eq!(durable_boundary.ticket_end, 2);
+        assert_eq!(durable_boundary.ticket_end, 1);
+        assert_eq!(durable_boundary.segment_id, successor_segment_id);
         let (_, persisted_records) = crate::manifest::Manifest::recover(database.join("MANIFEST"))?;
         let persisted_pitr_state =
             crate::pitr::manifest::replay_pitr_records(persisted_records.into_iter().filter_map(

@@ -145,8 +145,10 @@ remain unqualified, so v8 creation stays disabled.
    pre-existing sidecar before `SealStarted`. Explicit `resume_pitr` can now
    finish a durable Active v8 Sealing obligation through `SegmentSealed` and
    install only its exact manifest-authorized empty successor. A failed
-   post-`SegmentSealed` install is retried from that durable boundary. New v8
-   rotations and general format-registry selection remain disabled.
+   post-`SegmentSealed` install is retried from that durable boundary. Explicit
+   `create_recovery_point` now completes the Active v8 rotation, installs its
+   v8 successor and archives the sealed source. Automatic v8 rotation, general
+   format-registry selection and v7-to-v8 migration remain disabled.
 5. **Persistence and transitions:** version persisted seal/manifest/backup
    digest references, validate v8 archive objects, support v5/v6/v7/v8 chain
    transitions and the old-reader compatibility gate above. Add capacity and
@@ -176,8 +178,8 @@ remain unqualified, so v8 creation stays disabled.
    normalization is tested with repeated process
    interruption after temp-image write, temp sync, rename, and directory sync;
    retries preserve the hard anchor. Returned errors before sync, rename, and
-   directory sync are also covered. V8 creation remains disabled pending the
-   compatibility and qualification gates.
+   directory sync are also covered. Automatic v8 creation remains disabled
+   pending the compatibility and qualification gates.
 6. **Qualification and adoption:** complete the RFC 026 crash, recovery,
    compatibility and performance matrix. Keep v7 as the default unless the
    measured results justify an explicit later adoption decision.
