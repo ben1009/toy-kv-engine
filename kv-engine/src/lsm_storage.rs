@@ -39236,9 +39236,17 @@ mod tests {
             }
             PreV8ReaderGuardState::AfterSnapshotRename => diagnostic.contains("V8Snapshot"),
         };
+        let rejects_before_v8_guard = cli_env == "TOY_KV_EARLY_PRE_V8_CLI"
+            && matches!(
+                state,
+                PreV8ReaderGuardState::AfterGuardAppend
+                    | PreV8ReaderGuardState::AfterSnapshotTempSync
+            )
+            && diagnostic.contains("ActiveBoundaryAdvanced");
         anyhow::ensure!(
-            diagnostic.contains("unknown variant") && identifies_expected_v8_record,
-            "pre-v8 CLI failed for a reason other than rejecting the expected v8 manifest record: {diagnostic}"
+            diagnostic.contains("unknown variant")
+                && (identifies_expected_v8_record || rejects_before_v8_guard),
+            "pre-v8 CLI failed for a reason other than rejecting the expected v8 or legacy manifest record: {diagnostic}"
         );
         Ok(())
     }
@@ -39347,6 +39355,39 @@ mod tests {
     fn v8_compatibility_guard_rejects_earlier_pre_v8_cli_without_mutation() -> anyhow::Result<()> {
         assert_pre_v8_cli_rejects_guarded_active_v7_with_env_without_mutation(
             PreV8ReaderGuardState::Published,
+            "TOY_KV_EARLY_PRE_V8_CLI",
+        )
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires the earlier pre-v8 CLI path in TOY_KV_EARLY_PRE_V8_CLI"]
+    fn v8_compatibility_guard_rejects_earlier_pre_v8_cli_after_guard_append_without_mutation()
+    -> anyhow::Result<()> {
+        assert_pre_v8_cli_rejects_guarded_active_v7_with_env_without_mutation(
+            PreV8ReaderGuardState::AfterGuardAppend,
+            "TOY_KV_EARLY_PRE_V8_CLI",
+        )
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires the earlier pre-v8 CLI path in TOY_KV_EARLY_PRE_V8_CLI"]
+    fn v8_compatibility_guard_rejects_earlier_pre_v8_cli_after_snapshot_temp_sync_without_mutation()
+    -> anyhow::Result<()> {
+        assert_pre_v8_cli_rejects_guarded_active_v7_with_env_without_mutation(
+            PreV8ReaderGuardState::AfterSnapshotTempSync,
+            "TOY_KV_EARLY_PRE_V8_CLI",
+        )
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires the earlier pre-v8 CLI path in TOY_KV_EARLY_PRE_V8_CLI"]
+    fn v8_compatibility_guard_rejects_earlier_pre_v8_cli_after_snapshot_rename_without_mutation()
+    -> anyhow::Result<()> {
+        assert_pre_v8_cli_rejects_guarded_active_v7_with_env_without_mutation(
+            PreV8ReaderGuardState::AfterSnapshotRename,
             "TOY_KV_EARLY_PRE_V8_CLI",
         )
     }
