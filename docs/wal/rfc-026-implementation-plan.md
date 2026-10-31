@@ -67,23 +67,27 @@ the log to that generation. Guarded snapshot recovery cuts the old log at the
 matching generation and preserves records after that cut. Focused tests
 exercise generation cuts, missing `MANIFEST`, process interruption at each
 publication boundary, and rejection of the new JSON variants by a pre-v8
-enum. An opt-in process test also runs the historical CLI at
-`18c5f0a8ccfb` against a guarded Active v7 database with WAL enabled; it
-verifies that the old binary rejects the database and that recursive file
-contents, entry names and file metadata remain unchanged. It also checks that
-the error identifies the unknown v8 manifest variant. Re-run it with:
+enum. Opt-in process tests also run the historical CLI at
+`18c5f0a8ccfb` against guarded Active v7 publication states, a durable v7-to-v8
+migration intent, a migration stopped after `SegmentSealed` but before
+successor registration, and a completed v8 migration with a synced v8 WAL
+record. They verify rejection without changing database entries, including the
+database root's metadata, and check that the error identifies a v8 manifest
+variant. Re-run the full process matrix with:
 
 ```bash
-TOY_KV_PRE_V8_CLI=/path/to/kv-engine-cli cargo test --package kv-engine --lib \
-  v8_compatibility_guard_rejects_pre_v8_cli -- --ignored
+TOY_KV_PRE_V8_CLI=/path/to/kv-engine-cli \
+TOY_KV_EARLY_PRE_V8_CLI=/path/to/earlier/kv-engine-cli \
+cargo test --package kv-engine --lib --features chaos-testing \
+  pre_v8_cli -- --ignored --test-threads=1
 ```
 
-The first filter runs six process cases: the guarded database with its normal
-`MANIFEST`; after the guard append but before snapshot installation; after the
-new wrapper is synced as `ENGINE_MANIFEST.tmp`; after the wrapper is renamed to
-`ENGINE_MANIFEST` but before `MANIFEST` compaction; with `MANIFEST` removed and
-the installed `ENGINE_MANIFEST`; and with `MANIFEST` missing while the guarded
-snapshot remains pending as `ENGINE_MANIFEST.tmp`.
+The filter runs ten process cases: six guard-publication cases covering the
+normal `MANIFEST`, guard append, synced `ENGINE_MANIFEST.tmp`, snapshot rename,
+missing `MANIFEST` with an installed snapshot, and missing `MANIFEST` with a
+pending snapshot; the durable migration-intent, post-`SegmentSealed`, and
+completed-v8 cases against the `18c5f0a8ccfb` CLI; and the published-guard case
+against the earlier historical CLI.
 
 An additional process case runs the fully published database against the
 earlier historical CLI at `3420eb05b23c5b6ddd22694a4a2f84698589655a`:
@@ -98,25 +102,26 @@ the migration caller must retain it through the v7-to-v8 transition so a
 concurrent resume cannot reopen commit admission between guard publication
 and WAL migration.
 
-Local probe results (2026-10-31): the six process cases above passed against a
-release CLI built offline from `18c5f0a8ccfb` with `nightly-2026-09-23`. Its
+Local probe results (2026-10-31): the six publication-state cases first passed
+against a release CLI built offline from `18c5f0a8ccfb` with
+`nightly-2026-09-23`. Its
 SHA-256 was
 `e83ea47c4d385f160a5a28722706c374b25448b1dc31e8fa2a512b91bb92eb97`. The
 published-guard case also passed against the earlier CLI built from
 `3420eb05b23c5b6ddd22694a4a2f84698589655a`; its SHA-256 was
 `15121655cdd8e69eb9d1f260adb7a996dd85933a6a936e05025ac83519fd76a0`. Each
-case verified that the old reader rejected the expected unknown v8 manifest
-record and left recursive file contents, entry names, file metadata and
-metadata for recursively enumerated subdirectories unchanged. These runs
-qualify only the exercised guarded v7 fixture and publication states.
+case verified rejection of the expected unknown v8 manifest record and
+unchanged file contents, entry names, metadata for recursively enumerated
+entries and subdirectories, and database-root metadata. After adding migration
+states, the expanded ten-case process matrix passed against those same CLI
+builds. This covers only the exercised fixtures and states.
 
-This is partial compatibility qualification: the tested database is a guarded
-Active v7 fixture, not a completed v7-to-v8 migration. Before enabling v8
-creation, extend the process matrix to migrated and interrupted-migration
-states, normal and snapshot recovery variants, and a vLog-enabled database;
-continue comparing database files and directory entries before and after
-rejection. The complete historical-binary matrix and startup ordering remain
-unqualified, as does the performance matrix, so v8 creation stays disabled.
+This is partial compatibility qualification. Before enabling v8 creation,
+extend the process matrix to normal and snapshot recovery variants and a
+vLog-enabled database; continue comparing database files and directory entries
+before and after rejection. The complete historical-binary matrix and startup
+ordering remain unqualified, as does the performance matrix, so v8 creation
+stays disabled.
 
 ## Slices
 

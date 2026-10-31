@@ -38822,7 +38822,10 @@ mod tests {
     #[derive(Clone, Copy)]
     enum PreV8ReaderGuardState {
         Published,
+        MigrationIntent,
         MigratedToV8,
+        #[cfg(feature = "chaos-testing")]
+        SealedBeforeSuccessorRegistration,
         MissingManifest,
         MissingManifestPendingSnapshot,
         AfterGuardAppend,
@@ -38995,7 +38998,13 @@ mod tests {
         engine
             .inner
             .publish_v8_compatibility_guard(&publication_guards)?;
-        if matches!(state, PreV8ReaderGuardState::MigratedToV8) {
+        let migration_intent_needed = match state {
+            PreV8ReaderGuardState::MigrationIntent | PreV8ReaderGuardState::MigratedToV8 => true,
+            #[cfg(feature = "chaos-testing")]
+            PreV8ReaderGuardState::SealedBeforeSuccessorRegistration => true,
+            _ => false,
+        };
+        if migration_intent_needed {
             let intent = engine
                 .publish_pitr_v8_migration_intent(&publication_guards)?
                 .ok_or_else(|| anyhow::anyhow!("eligible v8 migration intent was deferred"))?;
@@ -39012,7 +39021,13 @@ mod tests {
         engine.close_storage()?;
         drop(engine);
 
-        if matches!(state, PreV8ReaderGuardState::MigratedToV8) {
+        let migration_resume_needed = match state {
+            PreV8ReaderGuardState::MigratedToV8 => true,
+            #[cfg(feature = "chaos-testing")]
+            PreV8ReaderGuardState::SealedBeforeSuccessorRegistration => true,
+            _ => false,
+        };
+        if migration_resume_needed {
             let repository = dir.path().join("repository");
             let migrated = KvEngine::open_with_wal_io_mode(
                 &database_path,
@@ -39024,13 +39039,41 @@ mod tests {
                 migrated.inner.state.load().memtable.uses_v7_wal(),
                 "v8 migration fixture must reopen at its fenced v7 source"
             );
-            migrated.resume_pitr(&repository)?;
-            anyhow::ensure!(
-                migrated.inner.state.load().memtable.uses_v8_wal(),
-                "v8 migration fixture did not install its v8 successor"
-            );
-            migrated.put(b"after-v8-migration", b"successor-value")?;
-            migrated.sync()?;
+            if matches!(state, PreV8ReaderGuardState::MigratedToV8) {
+                migrated.resume_pitr(&repository)?;
+                anyhow::ensure!(
+                    migrated.inner.state.load().memtable.uses_v8_wal(),
+                    "v8 migration fixture did not install its v8 successor"
+                );
+                migrated.put(b"after-v8-migration", b"successor-value")?;
+                migrated.sync()?;
+            }
+            #[cfg(feature = "chaos-testing")]
+            if matches!(
+                state,
+                PreV8ReaderGuardState::SealedBeforeSuccessorRegistration
+            ) {
+                fail::cfg("pitr.v7_before_successor_install", "return")
+                    .map_err(anyhow::Error::msg)?;
+                let interrupted = migrated.resume_pitr(&repository);
+                fail::remove("pitr.v7_before_successor_install");
+                anyhow::ensure!(
+                    format!("{:#}", interrupted.unwrap_err())
+                        .contains("injected v7 failure before successor installation"),
+                    "migration did not stop after SegmentSealed"
+                );
+                anyhow::ensure!(
+                    migrated
+                        .pitr_manifest_state
+                        .lock()
+                        .obligations
+                        .values()
+                        .any(|obligation| {
+                            obligation.state == crate::pitr::manifest::ObligationState::Sealed
+                        }),
+                    "interrupted migration did not persist SegmentSealed"
+                );
+            }
             migrated.close_storage()?;
             drop(migrated);
         }
@@ -39043,7 +39086,11 @@ mod tests {
             },
         )?);
         match state {
-            PreV8ReaderGuardState::Published | PreV8ReaderGuardState::MigratedToV8 => {}
+            PreV8ReaderGuardState::Published
+            | PreV8ReaderGuardState::MigrationIntent
+            | PreV8ReaderGuardState::MigratedToV8 => {}
+            #[cfg(feature = "chaos-testing")]
+            PreV8ReaderGuardState::SealedBeforeSuccessorRegistration => {}
             PreV8ReaderGuardState::MissingManifest => {
                 std::fs::remove_file(database_path.join("MANIFEST"))?;
             }
@@ -39144,7 +39191,13 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
         let identifies_expected_v8_record = match state {
-            PreV8ReaderGuardState::Published | PreV8ReaderGuardState::MigratedToV8 => {
+            PreV8ReaderGuardState::Published
+            | PreV8ReaderGuardState::MigrationIntent
+            | PreV8ReaderGuardState::MigratedToV8 => {
+                diagnostic.contains("V8CompatibilityGuard") || diagnostic.contains("V8Snapshot")
+            }
+            #[cfg(feature = "chaos-testing")]
+            PreV8ReaderGuardState::SealedBeforeSuccessorRegistration => {
                 diagnostic.contains("V8CompatibilityGuard") || diagnostic.contains("V8Snapshot")
             }
             PreV8ReaderGuardState::MissingManifest
@@ -39181,9 +39234,28 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     #[ignore = "requires the pre-v8 CLI path in TOY_KV_PRE_V8_CLI"]
+    fn v8_migration_intent_rejects_pre_v8_cli_without_database_mutation() -> anyhow::Result<()> {
+        assert_pre_v8_cli_rejects_guarded_active_v7_without_mutation(
+            PreV8ReaderGuardState::MigrationIntent,
+        )
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires the pre-v8 CLI path in TOY_KV_PRE_V8_CLI"]
     fn v8_migrated_database_rejects_pre_v8_cli_without_database_mutation() -> anyhow::Result<()> {
         assert_pre_v8_cli_rejects_guarded_active_v7_without_mutation(
             PreV8ReaderGuardState::MigratedToV8,
+        )
+    }
+
+    #[cfg(all(target_os = "linux", feature = "chaos-testing"))]
+    #[test]
+    #[ignore = "requires the pre-v8 CLI path in TOY_KV_PRE_V8_CLI"]
+    fn failpoint_v8_sealed_migration_rejects_pre_v8_cli_without_database_mutation()
+    -> anyhow::Result<()> {
+        assert_pre_v8_cli_rejects_guarded_active_v7_without_mutation(
+            PreV8ReaderGuardState::SealedBeforeSuccessorRegistration,
         )
     }
 
