@@ -136,9 +136,10 @@ remain unqualified, so v8 creation stays disabled.
    any existing v8 sidecar, and installs an exact fresh-inode copy of the
    accepted physical image. High-level startup can attach that recovered
    image as a read-only memtable, keep commit admission fenced, and close
-   without advancing the immutable boundary. Startup can also recreate an
-   empty v8 successor when a durable `SegmentSealed` record names its exact
-   Active boundary but the process stopped before installing its image; the
+  without advancing the immutable boundary. Startup can also recreate an
+  empty v7 or v8 successor when a durable `SegmentSealed` record names its exact
+  Active boundary but the process stopped before engine-manifest registration;
+  an existing unregistered image must match the canonical empty image. The
   sealed predecessor and sidecar are strictly revalidated first. Stopped-source
   v8 seal preparation and installation primitives now follow the v7 reservation
    and manifest-authority sequence, including byte-exact validation of any
@@ -162,10 +163,11 @@ remain unqualified, so v8 creation stays disabled.
    machine can durably represent a v7-to-v8 migration intent that binds the
    immutable v7 source boundary and exact empty v8 successor; migration
    execution remains disabled until its fenced capacity and compatibility
-   gates are connected. Recovery explicitly rejects an unfinished v7-to-v8
-   intent before sealing or installing a successor, including the crash window
-   after `SegmentSealed` but before the engine registers the v8 successor, rather
-   than routing it through the v7-to-v7 rotation path. `PitrStatus` reports a
+   gates are connected. Pre-seal v7-to-v8 intents remain fail-closed and are
+   never routed through ordinary v7 rotation. Once `SegmentSealed` durably
+   binds the v7 source and exact empty v8 boundary, startup can strictly
+   validate that source and recreate/register the v8 successor if interrupted
+   before engine-manifest registration. `PitrStatus` reports a
    read-only v7-to-v8 capacity estimate only for a settled Active v7 boundary
    that matches the on-disk WAL header, including retained source allocations,
    growth allowance to the configured segment limit, and rounded transition
@@ -177,8 +179,8 @@ remain unqualified, so v8 creation stays disabled.
    that complete transition budget, and only then publishes the old-reader
    compatibility guard followed by `V8MigrationStarted`; the returned owner
    retains the reservation. No runtime path invokes this preparation yet, and
-   migration execution remains disabled pending compatibility qualification
-   and successor-install recovery. Active recovery
+   migration execution remains disabled pending compatibility qualification.
+   Active recovery
    normalization is tested with repeated process
    interruption after temp-image write, temp sync, rename, and directory sync;
    retries preserve the hard anchor. Returned errors before sync, rename, and
