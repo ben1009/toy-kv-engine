@@ -39299,6 +39299,66 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     #[ignore = "requires the vLog-enabled pre-v8 reader path in TOY_KV_PRE_V8_VLOG_CLI"]
+    fn v8_compatibility_guard_rejects_pre_v8_cli_with_vlog_after_guard_append_without_mutation()
+    -> anyhow::Result<()> {
+        assert_pre_v8_cli_rejects_guarded_active_v7_with_env_and_vlog_without_mutation(
+            PreV8ReaderGuardState::AfterGuardAppend,
+            "TOY_KV_PRE_V8_VLOG_CLI",
+            true,
+        )
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires the vLog-enabled pre-v8 reader path in TOY_KV_PRE_V8_VLOG_CLI"]
+    fn v8_compatibility_guard_rejects_pre_v8_cli_with_vlog_after_snapshot_temp_sync_without_mutation()
+    -> anyhow::Result<()> {
+        assert_pre_v8_cli_rejects_guarded_active_v7_with_env_and_vlog_without_mutation(
+            PreV8ReaderGuardState::AfterSnapshotTempSync,
+            "TOY_KV_PRE_V8_VLOG_CLI",
+            true,
+        )
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires the vLog-enabled pre-v8 reader path in TOY_KV_PRE_V8_VLOG_CLI"]
+    fn v8_compatibility_guard_rejects_pre_v8_cli_with_vlog_after_snapshot_rename_without_mutation()
+    -> anyhow::Result<()> {
+        assert_pre_v8_cli_rejects_guarded_active_v7_with_env_and_vlog_without_mutation(
+            PreV8ReaderGuardState::AfterSnapshotRename,
+            "TOY_KV_PRE_V8_VLOG_CLI",
+            true,
+        )
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires the vLog-enabled pre-v8 reader path in TOY_KV_PRE_V8_VLOG_CLI"]
+    fn v8_compatibility_guard_rejects_pre_v8_cli_with_vlog_and_missing_manifest_without_mutation()
+    -> anyhow::Result<()> {
+        assert_pre_v8_cli_rejects_guarded_active_v7_with_env_and_vlog_without_mutation(
+            PreV8ReaderGuardState::MissingManifest,
+            "TOY_KV_PRE_V8_VLOG_CLI",
+            true,
+        )
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires the vLog-enabled pre-v8 reader path in TOY_KV_PRE_V8_VLOG_CLI"]
+    fn v8_compatibility_guard_rejects_pre_v8_cli_with_vlog_and_missing_manifest_pending_snapshot_without_mutation()
+    -> anyhow::Result<()> {
+        assert_pre_v8_cli_rejects_guarded_active_v7_with_env_and_vlog_without_mutation(
+            PreV8ReaderGuardState::MissingManifestPendingSnapshot,
+            "TOY_KV_PRE_V8_VLOG_CLI",
+            true,
+        )
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires the vLog-enabled pre-v8 reader path in TOY_KV_PRE_V8_VLOG_CLI"]
     fn v8_migration_intent_rejects_pre_v8_cli_with_vlog_without_database_mutation()
     -> anyhow::Result<()> {
         assert_pre_v8_cli_rejects_guarded_active_v7_with_env_and_vlog_without_mutation(
