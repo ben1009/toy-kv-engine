@@ -161,8 +161,9 @@ remain unqualified, so v8 creation stays disabled.
    immutable v7 source boundary and exact empty v8 successor; migration
    execution remains disabled until its fenced capacity and compatibility
    gates are connected. Recovery explicitly rejects an unfinished v7-to-v8
-   intent before sealing or installing a successor, rather than routing it
-   through the v7-to-v7 rotation path. `PitrStatus` reports a
+   intent before sealing or installing a successor, including the crash window
+   after `SegmentSealed` but before the engine registers the v8 successor, rather
+   than routing it through the v7-to-v7 rotation path. `PitrStatus` reports a
    read-only v7-to-v8 capacity estimate only for a settled Active v7 boundary
    that matches the on-disk WAL header, including retained source allocations,
    growth allowance to the configured segment limit, and rounded transition

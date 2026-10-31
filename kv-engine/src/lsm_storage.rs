@@ -215,6 +215,7 @@ struct PitrV8MigrationReservation {
 fn unsupported_v7_to_v8_migration_source(
     state: &crate::pitr::manifest::PitrState,
     active_memtable_segment: Option<u64>,
+    v8_successor_is_registered: bool,
 ) -> Option<u64> {
     use crate::pitr::manifest::{ObligationState, PitrWalFormat};
 
@@ -222,18 +223,29 @@ fn unsupported_v7_to_v8_migration_source(
         .obligations
         .iter()
         .find(|(source_segment_id, obligation)| {
-            let successor_is_v8 = obligation
+            let migration_intended_v8 = obligation
                 .migration_successor_boundary
                 .is_some_and(|boundary| boundary.wal_format == PitrWalFormat::V8);
+            let sealed_v8_successor_is_active = obligation.state == ObligationState::Sealed
+                && state.active_segment_id == Some(obligation.successor_segment_id)
+                && state.active_boundary.is_some_and(|boundary| {
+                    boundary.segment_id == obligation.successor_segment_id
+                        && boundary.wal_format == PitrWalFormat::V8
+                });
             let source_still_installed = match obligation.state {
                 ObligationState::Sealing => state.active_segment_id == Some(**source_segment_id),
-                ObligationState::Sealed => active_memtable_segment == Some(**source_segment_id),
+                ObligationState::Sealed => {
+                    active_memtable_segment == Some(**source_segment_id)
+                        || (sealed_v8_successor_is_active && !v8_successor_is_registered)
+                }
                 ObligationState::Archived
                 | ObligationState::Reclaimable
                 | ObligationState::Abandoned => false,
             };
 
-            obligation.wal_format == PitrWalFormat::V7 && successor_is_v8 && source_still_installed
+            obligation.wal_format == PitrWalFormat::V7
+                && (migration_intended_v8 || sealed_v8_successor_is_active)
+                && source_still_installed
         })
         .map(|(source_segment_id, _)| *source_segment_id)
 }
@@ -4750,11 +4762,15 @@ impl KvEngine {
     )> {
         use crate::pitr::manifest::{ObligationState, PitrWalFormat};
 
-        let active_memtable_segment =
-            LsmStorageInner::pitr_segment_of(&self.inner.state.load().memtable);
-        if let Some(source_segment_id) =
-            unsupported_v7_to_v8_migration_source(&state, active_memtable_segment)
-        {
+        let active_memtable = self.inner.state.load().memtable.clone();
+        let active_memtable_segment = LsmStorageInner::pitr_segment_of(&active_memtable);
+        let v8_successor_is_registered =
+            active_memtable.uses_v8_wal() && active_memtable_segment == state.active_segment_id;
+        if let Some(source_segment_id) = unsupported_v7_to_v8_migration_source(
+            &state,
+            active_memtable_segment,
+            v8_successor_is_registered,
+        ) {
             anyhow::bail!(
                 "cannot resume v7-to-v8 PITR migration for source segment {source_segment_id}: migration execution is disabled until its compatibility and capacity gates are connected"
             );
@@ -12422,6 +12438,18 @@ impl LsmStorageInner {
                             options.enable_wal,
                             "opening a v8 Active PITR WAL requires enable_wal"
                         );
+                        let v8_successor_is_registered = pitr_memtable_segments
+                            .values()
+                            .any(|segment_id| *segment_id == boundary.segment_id);
+                        if let Some(source_segment_id) = unsupported_v7_to_v8_migration_source(
+                            &pitr_state,
+                            None,
+                            v8_successor_is_registered,
+                        ) {
+                            anyhow::bail!(
+                                "cannot recover v7-to-v8 PITR migration for source segment {source_segment_id}: migration execution is disabled until its compatibility and capacity gates are connected"
+                            );
+                        }
                         if !wal_path.try_exists()? {
                             ensure!(
                                 !pitr_memtable_segments
@@ -20947,7 +20975,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn unsupported_v7_to_v8_resume_is_detected_only_while_source_is_installed() {
+    fn unsupported_v7_to_v8_migration_is_detected_until_successor_is_registered() {
         use crate::pitr::manifest::{
             ActiveBoundary, ObligationState, PitrObligation, PitrState, PitrWalFormat,
         };
@@ -20963,17 +20991,8 @@ mod tests {
                     | ObligationState::Reclaimable
                     | ObligationState::Abandoned => successor_segment_id,
                 }),
-                ..PitrState::default()
-            };
-            state.obligations.insert(
-                source_segment_id,
-                PitrObligation {
-                    state: obligation_state,
-                    successor_segment_id,
-                    logical_length: 8192,
-                    wal_format: PitrWalFormat::V7,
-                    immutable_boundary: None,
-                    migration_successor_boundary: migration.then_some(ActiveBoundary {
+                active_boundary: (obligation_state == ObligationState::Sealed && migration)
+                    .then_some(ActiveBoundary {
                         timeline_id: [1; 16],
                         archive_epoch_id: [2; 16],
                         segment_id: successor_segment_id,
@@ -20984,6 +21003,29 @@ mod tests {
                         last_commit_ts: 0,
                         prefix_digest: [4; 32],
                     }),
+                ..PitrState::default()
+            };
+            state.obligations.insert(
+                source_segment_id,
+                PitrObligation {
+                    state: obligation_state,
+                    successor_segment_id,
+                    logical_length: 8192,
+                    wal_format: PitrWalFormat::V7,
+                    immutable_boundary: None,
+                    migration_successor_boundary: (obligation_state == ObligationState::Sealing
+                        && migration)
+                        .then_some(ActiveBoundary {
+                            timeline_id: [1; 16],
+                            archive_epoch_id: [2; 16],
+                            segment_id: successor_segment_id,
+                            incarnation: [3; 16],
+                            wal_format: PitrWalFormat::V8,
+                            ticket_end: 0,
+                            durable_end: 4096,
+                            last_commit_ts: 0,
+                            prefix_digest: [4; 32],
+                        }),
                 },
             );
             state
@@ -20991,23 +21033,27 @@ mod tests {
 
         let sealing = state(ObligationState::Sealing, true);
         assert_eq!(
-            unsupported_v7_to_v8_migration_source(&sealing, Some(7)),
+            unsupported_v7_to_v8_migration_source(&sealing, Some(7), false),
             Some(7)
         );
 
         let sealed_source_still_installed = state(ObligationState::Sealed, true);
         assert_eq!(
-            unsupported_v7_to_v8_migration_source(&sealed_source_still_installed, Some(7)),
+            unsupported_v7_to_v8_migration_source(&sealed_source_still_installed, Some(7), false),
             Some(7)
         );
         assert_eq!(
-            unsupported_v7_to_v8_migration_source(&sealed_source_still_installed, Some(8)),
+            unsupported_v7_to_v8_migration_source(&sealed_source_still_installed, None, false),
+            Some(7)
+        );
+        assert_eq!(
+            unsupported_v7_to_v8_migration_source(&sealed_source_still_installed, None, true),
             None
         );
 
         let ordinary_v7_rotation = state(ObligationState::Sealing, false);
         assert_eq!(
-            unsupported_v7_to_v8_migration_source(&ordinary_v7_rotation, Some(7)),
+            unsupported_v7_to_v8_migration_source(&ordinary_v7_rotation, Some(7), false),
             None
         );
     }
