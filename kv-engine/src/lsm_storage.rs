@@ -39353,6 +39353,17 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    #[ignore = "requires the vLog-enabled earlier pre-v8 reader in TOY_KV_EARLY_PRE_V8_VLOG_CLI"]
+    fn v8_compatibility_guard_rejects_earlier_pre_v8_vlog_cli_without_database_mutation()
+    -> anyhow::Result<()> {
+        assert_pre_v8_cli_rejects_guarded_active_v7_with_env_without_mutation(
+            PreV8ReaderGuardState::VLogEnabled,
+            "TOY_KV_EARLY_PRE_V8_VLOG_CLI",
+        )
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn pitr_forced_flush_and_checkpoint_preserve_archive_chain_on_reopen() {
         let dir = tempdir().unwrap();
         let engine = pitr_flush_test_engine(dir.path());

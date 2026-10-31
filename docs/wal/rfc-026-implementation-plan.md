@@ -79,28 +79,36 @@ variant. Re-run the full process matrix with:
 TOY_KV_PRE_V8_CLI=/path/to/kv-engine-cli \
 TOY_KV_PRE_V8_VLOG_CLI=/path/to/vlog-enabled-pre-v8-reader \
 TOY_KV_EARLY_PRE_V8_CLI=/path/to/earlier/kv-engine-cli \
+TOY_KV_EARLY_PRE_V8_VLOG_CLI=/path/to/vlog-enabled-earlier-reader \
 cargo test --package kv-engine --lib --features chaos-testing \
-  pre_v8_cli -- --ignored --test-threads=1
+  pre_v8 -- --ignored --test-threads=1
 ```
 
-The filter runs eleven process cases: six guard-publication cases covering the
+The filter runs twelve process cases: six guard-publication cases covering the
 normal `MANIFEST`, guard append, synced `ENGINE_MANIFEST.tmp`, snapshot rename,
 missing `MANIFEST` with an installed snapshot, and missing `MANIFEST` with a
 pending snapshot; the durable migration-intent, post-`SegmentSealed`, and
 completed-v8 cases against the `18c5f0a8ccfb` CLI; a vLog-enabled published-
 guard case against a small reader harness built from the same historical
 library revision with WAL and value separation enabled; and the published-
-guard case against the earlier historical CLI. The vLog case verifies the
-older startup path rejects the v8 guard without touching a real `.vlog` file,
-even though vLog initialization precedes manifest parsing.
+guard cases against the earlier historical library, with vLog both disabled
+and enabled. The vLog cases verify the older startup paths reject the v8 guard
+without touching a real `.vlog` file, even though vLog initialization
+precedes manifest parsing.
 
-An additional process case runs the fully published database against the
-earlier historical CLI at `3420eb05b23c5b6ddd22694a4a2f84698589655a`:
+The earlier historical reader at `3420eb05b23c5b6ddd22694a4a2f84698589655a`
+is tested in both configurations against the fully published database:
 
 ```bash
-TOY_KV_EARLY_PRE_V8_CLI=/path/to/earlier/kv-engine-cli cargo test --package kv-engine --lib \
-  v8_compatibility_guard_rejects_earlier_pre_v8_cli_without_mutation -- --ignored
+TOY_KV_EARLY_PRE_V8_CLI=/path/to/earlier/kv-engine-cli \
+TOY_KV_EARLY_PRE_V8_VLOG_CLI=/path/to/vlog-enabled-earlier-reader \
+cargo test --package kv-engine --lib v8_compatibility_guard_rejects_earlier_pre_v8_ \
+  -- --ignored --test-threads=1
 ```
+
+Both vLog-enabled harnesses are small binaries built from their respective
+historical library sources with WAL and value separation enabled. Their
+stock CLIs do not expose a vLog-enabled open configuration.
 
 That earlier reader is qualified only with the durable `MANIFEST` guard
 present. A probe with `MANIFEST` absent and either an installed or pending
@@ -127,11 +135,14 @@ published-guard case also passed against the earlier CLI built from
 case verified rejection of the expected unknown v8 manifest record and
 unchanged file contents, entry names, metadata for recursively enumerated
 entries and subdirectories, and database-root metadata. After adding migration
-states and the vLog-enabled historical reader, the expanded eleven-case
-process matrix passed. The vLog reader harness was built offline from the
-`18c5f0a8ccfb` library sources with WAL and value separation enabled; its
-SHA-256 was
-`1417e8107c1faedbde4dcf7ccb5e365168983d8edae8b542cbf90400ae985819`. This
+states and vLog-enabled historical readers, the expanded twelve-case
+process matrix passed. The vLog reader harness for `18c5f0a8ccfb` was built
+offline from that revision's library sources with WAL and value separation
+enabled; its SHA-256 was
+`1417e8107c1faedbde4dcf7ccb5e365168983d8edae8b542cbf90400ae985819`. The
+vLog reader harness built from `3420eb05b23c5b6ddd22694a4a2f84698589655a`
+with the same options has SHA-256
+`d8a7b704246773d23ea3fe2617faca2321176e9036abd61f7c867cbfaedb8b3d`. This
 covers only the exercised fixtures and states.
 
 This is partial compatibility qualification. The `18c5f0a8ccfb` reader is
