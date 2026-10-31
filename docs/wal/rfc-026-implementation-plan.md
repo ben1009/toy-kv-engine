@@ -84,7 +84,7 @@ cargo test --package kv-engine --lib --features chaos-testing \
   pre_v8 -- --ignored --test-threads=1
 ```
 
-The filter runs eighteen process cases: six guard-publication cases covering the
+The filter runs twenty-four process cases: six guard-publication cases covering the
 normal `MANIFEST`, guard append, synced `ENGINE_MANIFEST.tmp`, snapshot rename,
 missing `MANIFEST` with an installed snapshot, and missing `MANIFEST` with a
 pending snapshot; the durable migration-intent, post-`SegmentSealed`, and
@@ -96,7 +96,9 @@ enabled, plus its stock CLI against guard append, synced snapshot temp,
 snapshot rename, durable migration-intent, post-`SegmentSealed`, and completed-
 v8 cases. The vLog cases verify the older startup paths reject the v8 guard
 without touching a real `.vlog` file, even though vLog initialization precedes
-manifest parsing.
+manifest parsing. Each vLog-enabled reader is also exercised with durable
+migration intent, interruption after `SegmentSealed`, and completed v8
+migration, covering four guarded states per historical reader.
 
 The earlier historical reader at `3420eb05b23c5b6ddd22694a4a2f84698589655a`
 is tested in both configurations against the fully published database. Its
@@ -144,7 +146,7 @@ guard-append and synced-snapshot-temp cuts, that reader rejects the older
 `ActiveBoundaryAdvanced` v7 PITR-manifest record before reaching the v8 guard;
 the later pre-v8 reader reaches and rejects the guard itself. After adding earlier-
 reader publication and migration states and vLog-enabled historical readers,
-the expanded eighteen-case process matrix passed. The vLog reader harness for
+the expanded twenty-four-case process matrix passed. The vLog reader harness for
 `18c5f0a8ccfb` was built offline from that revision's library sources with WAL
 and value separation enabled; its SHA-256 was
 `1417e8107c1faedbde4dcf7ccb5e365168983d8edae8b542cbf90400ae985819`. The
