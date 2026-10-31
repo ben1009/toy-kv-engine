@@ -39202,6 +39202,11 @@ mod tests {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
+        let after = snapshot_database(&database_path)?;
+        anyhow::ensure!(
+            before == after,
+            "pre-v8 CLI mutated database files or directory entries before rejecting the v8 guard"
+        );
         anyhow::ensure!(
             !output.status.success(),
             "pre-v8 CLI unexpectedly opened a guarded database; stdout: {}; stderr: {}",
@@ -39234,11 +39239,6 @@ mod tests {
         anyhow::ensure!(
             diagnostic.contains("unknown variant") && identifies_expected_v8_record,
             "pre-v8 CLI failed for a reason other than rejecting the expected v8 manifest record: {diagnostic}"
-        );
-        let after = snapshot_database(&database_path)?;
-        anyhow::ensure!(
-            before == after,
-            "pre-v8 CLI mutated database files or directory entries before rejecting the v8 guard"
         );
         Ok(())
     }

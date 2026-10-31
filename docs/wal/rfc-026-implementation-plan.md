@@ -102,6 +102,15 @@ TOY_KV_EARLY_PRE_V8_CLI=/path/to/earlier/kv-engine-cli cargo test --package kv-e
   v8_compatibility_guard_rejects_earlier_pre_v8_cli_without_mutation -- --ignored
 ```
 
+That earlier reader is qualified only with the durable `MANIFEST` guard
+present. A probe with `MANIFEST` absent and either an installed or pending
+snapshot showed that this binary initializes a new database instead of
+recovering from the snapshot, mutating the directory. Those snapshot-only
+states are unsupported corruption cases for that reader and are not reachable
+through the guard publication sequence, which durably appends the guard before
+installing or replacing `ENGINE_MANIFEST`. The `18c5f0a8ccfb` reader is tested
+against both snapshot-only recovery fixtures.
+
 The publisher requires a token holding both PITR lifecycle barriers;
 the migration caller must retain it through the v7-to-v8 transition so a
 concurrent resume cannot reopen commit admission between guard publication
@@ -125,11 +134,12 @@ SHA-256 was
 `1417e8107c1faedbde4dcf7ccb5e365168983d8edae8b542cbf90400ae985819`. This
 covers only the exercised fixtures and states.
 
-This is partial compatibility qualification. Before enabling v8 creation,
-extend the process matrix to normal and snapshot recovery variants; continue
-comparing database files and directory entries before and after rejection.
-The complete historical-binary matrix and startup ordering remain
-unqualified, as does the performance matrix, so v8 creation stays disabled.
+This is partial compatibility qualification. The `18c5f0a8ccfb` reader is
+covered for ordinary manifest replay and installed/pending snapshot recovery;
+the earlier reader is covered only while its required manifest remains
+present. The complete supported historical-binary matrix and startup ordering
+remain unqualified, as does the performance matrix, so v8 creation stays
+disabled.
 
 ## Slices
 
