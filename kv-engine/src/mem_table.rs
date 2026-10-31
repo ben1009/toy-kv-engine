@@ -1277,6 +1277,99 @@ impl MemTable {
         Ok(memtable)
     }
 
+    /// Create and attach a fresh v8 Active successor after its predecessor's
+    /// durable Sealed obligation authorizes the exact header. V8 remains
+    /// unavailable through the format registry; this helper is used only by
+    /// the explicit PITR recovery transition.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn create_with_wal_v8_active<F>(
+        id: usize,
+        vlog_enabled: bool,
+        path: impl AsRef<Path>,
+        header: crate::wal::v8::codec::WalV8Header,
+        max_file_size: u64,
+        retained_resources: Arc<WalV7RetainedResources>,
+        create_owner: F,
+    ) -> Result<(Self, Arc<crate::wal::v8::resource::WalV8ReservationOwner>)>
+    where
+        F: FnOnce(
+            &crate::wal::v8::install::WalV8InstalledRecovery,
+        ) -> Result<Arc<crate::wal::v8::resource::WalV8ReservationOwner>>,
+    {
+        use anyhow::ensure;
+
+        let path = path.as_ref().to_path_buf();
+        let image_len = u64::try_from(
+            crate::wal::v8::WAL_V8_HEADER_LEN + crate::wal::v8::codec::WAL_V8_FRAME_LEN,
+        )?;
+        ensure!(
+            image_len <= max_file_size,
+            "v8 segment limit cannot hold an empty Active image"
+        );
+        ensure!(
+            retained_resources.has_pending_successor(header.segment_id.0)
+                || retained_resources.has_segment_reservation(header.segment_id.0),
+            "v8 successor capacity was not reserved before its Sealing intent"
+        );
+
+        // A previous attempt may have durably installed the canonical empty
+        // image before it attached the leader. Its complete header must match
+        // the manifest-authorized boundary, including incarnation.
+        if path.try_exists()? {
+            let mut file = File::open(&path)
+                .with_context(|| format!("open existing v8 successor WAL {}", path.display()))?;
+            let mut bytes = [0; crate::wal::v8::WAL_V8_HEADER_LEN];
+            file.read_exact(&mut bytes)
+                .context("read existing v8 successor WAL header")?;
+            let existing = crate::wal::v8::codec::WalV8Header::decode(&bytes)
+                .context("decode existing v8 successor WAL header")?;
+            ensure!(
+                existing == header,
+                "existing v8 successor WAL header differs from its Sealed obligation"
+            );
+        }
+
+        let empty_boundary = crate::wal::v8::install::create_empty_active_image(&path, header)?;
+        let installed = crate::wal::v8::install::recover_and_install_active(
+            &path,
+            &[empty_boundary],
+            header.predecessor,
+            crate::pitr::LIVE_WAL_V5_LIMITS,
+            max_file_size,
+        )?;
+        ensure!(
+            installed.active_boundary == empty_boundary
+                && installed.image_len == image_len
+                && installed.next_ticket == 0,
+            "installed v8 successor differs from its authorized empty boundary"
+        );
+        let (memtable, recovered_commit_ts) = Self::recover_from_v8_active_with_owner(
+            id,
+            vlog_enabled,
+            &path,
+            installed,
+            max_file_size,
+            create_owner,
+        )?;
+        ensure!(
+            recovered_commit_ts == 0,
+            "new empty v8 successor unexpectedly contains committed batches"
+        );
+        let owner = memtable
+            .wal_v8_reservation_owner()
+            .ok_or_else(|| anyhow::anyhow!("new v8 PITR successor has no reservation owner"))?;
+        let owner_resources = owner.image_owner().retained_resources().ok_or_else(|| {
+            anyhow::anyhow!("new v8 PITR successor has no retained resource ledger")
+        })?;
+        ensure!(
+            Arc::ptr_eq(&owner_resources, &retained_resources),
+            "new v8 PITR successor uses a different retained resource ledger"
+        );
+        retained_resources.activate_pending_successor(header.segment_id.0)?;
+
+        Ok((memtable, owner))
+    }
+
     /// Create a new mem-table with WAL and vLog (kind-prefixed values).
     pub fn create_with_wal_vlog(id: usize, path: impl AsRef<Path>) -> Result<Self> {
         Self::create_with_wal(id, true, path)

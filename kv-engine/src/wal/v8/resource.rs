@@ -3,6 +3,7 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Result, ensure};
+use parking_lot::Mutex;
 
 use crate::wal::v7::admission::{
     WalV7OwnedBatchReservation, WalV7OwnedPreparationReservation, WalV7Reservation,
@@ -18,7 +19,7 @@ const FIXED_IMAGE_BYTES: u64 = (WAL_V8_HEADER_LEN + WAL_V8_FRAME_LEN) as u64;
 #[derive(Debug)]
 pub(crate) struct WalV8ReservationOwner {
     image_owner: Arc<WalV7ReservationOwner>,
-    _recovery_workspace: WalV7Reservation,
+    recovery_workspace: Mutex<Option<WalV7Reservation>>,
     recovery_workspace_bytes: u64,
     source_allocation_unit: u64,
 }
@@ -66,7 +67,7 @@ impl WalV8ReservationOwner {
 
         Ok(Self {
             image_owner,
-            _recovery_workspace: workspace,
+            recovery_workspace: Mutex::new(Some(workspace)),
             recovery_workspace_bytes,
             source_allocation_unit,
         })
@@ -115,7 +116,7 @@ impl WalV8ReservationOwner {
 
         Ok(Self {
             image_owner,
-            _recovery_workspace: workspace,
+            recovery_workspace: Mutex::new(Some(workspace)),
             recovery_workspace_bytes,
             source_allocation_unit,
         })
@@ -125,6 +126,14 @@ impl WalV8ReservationOwner {
     /// by the writer, so source cleanup releases the matching charges.
     pub(crate) fn image_owner(&self) -> Arc<WalV7ReservationOwner> {
         Arc::clone(&self.image_owner)
+    }
+
+    /// Release the fresh-inode workspace after this image has become a strict
+    /// Sealed source. Its immutable image and source-spool charges remain owned
+    /// until archive cleanup, while the workspace can move to the new Active
+    /// successor.
+    pub(crate) fn release_recovery_workspace(&self) {
+        self.recovery_workspace.lock().take();
     }
 
     pub(crate) fn validate_image_and_workspace(

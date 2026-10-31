@@ -141,10 +141,12 @@ remain unqualified, so v8 creation stays disabled.
    Active boundary but the process stopped before installing its image; the
   sealed predecessor and sidecar are strictly revalidated first. Stopped-source
   v8 seal preparation and installation primitives now follow the v7 reservation
-  and manifest-authority sequence, including byte-exact validation of any
-  pre-existing sidecar before `SealStarted`. Resuming an Active v8 Sealing source
-  and initiating v8 rotation still fail closed; v8 creation and general
-  format-registry selection remain disabled.
+   and manifest-authority sequence, including byte-exact validation of any
+   pre-existing sidecar before `SealStarted`. Explicit `resume_pitr` can now
+   finish a durable Active v8 Sealing obligation through `SegmentSealed` and
+   install only its exact manifest-authorized empty successor. A failed
+   post-`SegmentSealed` install is retried from that durable boundary. New v8
+   rotations and general format-registry selection remain disabled.
 5. **Persistence and transitions:** version persisted seal/manifest/backup
    digest references, validate v8 archive objects, support v5/v6/v7/v8 chain
    transitions and the old-reader compatibility gate above. Add capacity and
