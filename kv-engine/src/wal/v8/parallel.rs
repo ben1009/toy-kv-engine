@@ -616,6 +616,15 @@ impl WalV8ParallelCoordinator {
         self.inner.state.lock().next_ticket
     }
 
+    /// Run a diagnostics-state update while excluding ticket admission. This
+    /// keeps the benchmark-only enablement check atomic with publication of a
+    /// new ticket.
+    #[cfg(feature = "bench")]
+    pub(crate) fn with_next_ticket<T>(&self, update: impl FnOnce(u64) -> T) -> T {
+        let state = self.inner.state.lock();
+        update(state.next_ticket)
+    }
+
     pub(crate) fn last_frontier_end(&self) -> u64 {
         self.inner.state.lock().last_frontier_end
     }

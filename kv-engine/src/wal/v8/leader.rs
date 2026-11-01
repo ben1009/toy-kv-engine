@@ -151,6 +151,8 @@ pub(crate) struct WalV8ParallelWriter {
     installed_dev: u64,
     installed_ino: u64,
     #[cfg(feature = "bench")]
+    initial_ticket: u64,
+    #[cfg(feature = "bench")]
     profile: arc_swap::ArcSwapOption<crate::mem_table::WriteProfile>,
 }
 
@@ -469,6 +471,8 @@ impl WalV8LeaderWriter {
     /// Transfer the validated image and coordinator to the concurrent
     /// producer path. Only the frontier write and WAL sync remain serialized.
     pub(crate) fn into_parallel(self) -> WalV8ParallelWriter {
+        #[cfg(feature = "bench")]
+        let initial_ticket = self.coordinator.next_ticket();
         WalV8ParallelWriter {
             write_file: self.write_file,
             sync_file: self.sync_file,
@@ -487,6 +491,8 @@ impl WalV8LeaderWriter {
             max_file_size: self.max_file_size,
             installed_dev: self.installed_dev,
             installed_ino: self.installed_ino,
+            #[cfg(feature = "bench")]
+            initial_ticket,
             #[cfg(feature = "bench")]
             profile: self.profile,
         }
@@ -1025,6 +1031,24 @@ impl WalV8ParallelWriter {
     #[cfg(feature = "bench")]
     pub(crate) fn set_write_profile(&self, profile: Arc<crate::mem_table::WriteProfile>) {
         self.profile.store(Some(profile));
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn set_wal_sync_diagnostics_enabled(
+        &self,
+        profile: &crate::mem_table::WriteProfile,
+        enabled: bool,
+    ) -> Result<()> {
+        self.coordinator.with_next_ticket(|next_ticket| {
+            ensure!(
+                !enabled
+                    || profile.wal_sync_diagnostics_enabled()
+                    || next_ticket == self.initial_ticket,
+                "WAL sync diagnostics must be enabled before the first WAL ticket"
+            );
+            profile.set_wal_sync_diagnostics_enabled(enabled);
+            Ok(())
+        })
     }
 
     /// Reserve bounded preparation state before canonicalizing a batch.
@@ -1718,6 +1742,45 @@ mod tests {
         parallel.wait_durable(1)?;
         assert_one_two_ticket_profile(&parallel_profile);
 
+        Ok(())
+    }
+
+    #[cfg(feature = "bench")]
+    #[test]
+    fn parallel_sync_diagnostics_transition_uses_the_recovered_ticket_boundary() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("diagnostics-v8.wal");
+        let mut leader = open_writer(&path, &install_empty(&path, header())?)?;
+        leader.append_batch(&batch(10), LIVE_WAL_V5_LIMITS)?;
+        let (_, boundary) = leader.active_boundaries()?;
+        drop(leader);
+
+        let installed = super::super::install::recover_and_install_active(
+            &path,
+            &[boundary],
+            header().predecessor,
+            LIVE_WAL_V5_LIMITS,
+            MAX_WAL_FILE_SIZE,
+        )?;
+        assert_eq!(installed.next_ticket, 1);
+
+        let writer = open_writer(&path, &installed)?.into_parallel();
+        let profile = Arc::new(crate::mem_table::WriteProfile::default());
+        writer.set_write_profile(Arc::clone(&profile));
+        writer.set_wal_sync_diagnostics_enabled(&profile, true)?;
+
+        let next = batch(20);
+        writer.append_prepared_batch(
+            writer.preflight_batch(&next, LIVE_WAL_V5_LIMITS)?,
+            20,
+            next.recorded_at,
+        )?;
+        writer.set_wal_sync_diagnostics_enabled(&profile, false)?;
+        let error = writer
+            .set_wal_sync_diagnostics_enabled(&profile, true)
+            .expect_err("diagnostics re-enable after a new ticket must be rejected");
+        assert!(error.to_string().contains("before the first WAL ticket"));
+        assert!(!profile.wal_sync_diagnostics_enabled());
         Ok(())
     }
 
