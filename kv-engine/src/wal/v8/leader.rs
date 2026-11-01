@@ -59,6 +59,9 @@ use super::{
 const FRAME_LEN_U64: u64 = WAL_V8_FRAME_LEN as u64;
 const HEADER_LEN_U64: u64 = WAL_V8_HEADER_LEN as u64;
 const MAX_GROUP_TICKETS: usize = 8;
+// Keep enough admitted producers in flight to form larger shared FRONTIERs
+// under contention; explicit Leader groups retain their separate smaller cap.
+const MAX_PARALLEL_INFLIGHT_TICKETS: usize = 32;
 
 pub(crate) type WalV8PreparedBatch<'a> = PreparedWalV8Batch<'a, WalV8PreflightReservation>;
 
@@ -408,7 +411,7 @@ impl WalV8LeaderWriter {
                 last_commit_ts: installed.active_boundary.last_commit_ts,
                 last_recorded_at: installed.last_recorded_at,
                 durable_prefix_digest: installed.active_boundary.prefix_digest,
-                max_inflight_tickets: MAX_GROUP_TICKETS,
+                max_inflight_tickets: MAX_PARALLEL_INFLIGHT_TICKETS,
                 max_inflight_bytes: max_file_size,
                 max_file_size,
             },
