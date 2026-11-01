@@ -1054,6 +1054,7 @@ struct WalPipelineRecord {
     frontier_writes: u64,
     frontier_bytes: u64,
     frontier_write_ns: u64,
+    v8_data_write_call_ns: u64,
     sync_coalesce_wait_calls: u64,
     sync_coalesce_wait_ns: u64,
     memtable_insert_ns: u64,
@@ -1162,6 +1163,7 @@ fn wal_pipeline_record(
         frontier_writes: profile.wal_frontier_writes,
         frontier_bytes: profile.wal_frontier_bytes,
         frontier_write_ns: profile.wal_frontier_write_ns,
+        v8_data_write_call_ns: profile.wal_v8_data_write_call_ns,
         sync_coalesce_wait_calls: profile.wal_sync_coalesce_wait_calls,
         sync_coalesce_wait_ns: profile.wal_sync_coalesce_wait_ns,
         memtable_insert_ns: profile.memtable_insert_ns,
@@ -9988,6 +9990,7 @@ mod tests {
                     frontier_writes: 2,
                     frontier_bytes: 8192,
                     frontier_write_ns: 4500,
+                    v8_data_write_call_ns: 0,
                     sync_coalesce_wait_calls: 3,
                     sync_coalesce_wait_ns: 9000,
                     ..WalPipelineRecord::default()
@@ -10009,6 +10012,7 @@ mod tests {
             assert_eq!(json["result"]["wal_pipeline"]["frontier_writes"], 2);
             assert_eq!(json["result"]["wal_pipeline"]["frontier_bytes"], 8192);
             assert_eq!(json["result"]["wal_pipeline"]["frontier_write_ns"], 4500);
+            assert_eq!(json["result"]["wal_pipeline"]["v8_data_write_call_ns"], 0);
             assert_eq!(
                 json["result"]["wal_pipeline"]["sync_coalesce_wait_calls"],
                 3

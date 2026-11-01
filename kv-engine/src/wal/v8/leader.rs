@@ -205,6 +205,8 @@ pub(crate) struct WalV8FrameJob<'a> {
     producer_guards: Arc<Mutex<BTreeMap<u64, EncodedWalV8Batch<WalV8ParallelAdmissionGuard>>>>,
     write_file: File,
     data_buffer: DirectBuf,
+    #[cfg(feature = "bench")]
+    profile: Option<Arc<crate::mem_table::WriteProfile>>,
 }
 
 impl WalV8FrameJob<'_> {
@@ -248,12 +250,20 @@ impl WalV8FrameJob<'_> {
         self.data_buffer.set_len(data_len);
         self.coordinator
             .mark_frames_ready(self.assignment.segment_ticket)?;
-        write_aligned_once(
+        #[cfg(feature = "bench")]
+        let write_started = self.profile.as_ref().map(|_| Instant::now());
+        let write_result = write_aligned_once(
             &self.write_file,
             self.data_buffer.initialized_slice(0, data_len),
             self.assignment.first_data_offset,
-        )
-        .context("write v8 Parallel DATA frames")?;
+        );
+        #[cfg(feature = "bench")]
+        if let (Some(profile), Some(started)) = (&self.profile, write_started) {
+            profile.record_wal_v8_data_write_call_ns(
+                started.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+            );
+        }
+        write_result.context("write v8 Parallel DATA frames")?;
         // The admission reservation accounts for this buffer until DATA
         // completion is published. Drop it before notifying the coordinator,
         // which may retire that reservation as soon as the frontier syncs.
@@ -743,6 +753,8 @@ impl WalV8LeaderWriter {
                 .zip(data_buffers.into_iter().zip(write_handles))
             {
                 let coordinator = self.coordinator.clone();
+                #[cfg(feature = "bench")]
+                let data_write_profile = profile.clone();
                 handles.push(scope.spawn(move || -> Result<ProducerCompletion> {
                     let mut encoded = admitted.encode()?;
                     let assignment = encoded.assignment();
@@ -755,12 +767,20 @@ impl WalV8LeaderWriter {
                     );
                     data_buffer.set_len(data_len);
                     coordinator.mark_frames_ready(assignment.segment_ticket)?;
-                    write_aligned_once(
+                    #[cfg(feature = "bench")]
+                    let write_started = data_write_profile.as_ref().map(|_| Instant::now());
+                    let write_result = write_aligned_once(
                         &write_file,
                         data_buffer.initialized_slice(0, data_len),
                         assignment.first_data_offset,
-                    )
-                    .context("write v8 Parallel DATA frames")?;
+                    );
+                    #[cfg(feature = "bench")]
+                    if let (Some(profile), Some(started)) = (&data_write_profile, write_started) {
+                        profile.record_wal_v8_data_write_call_ns(
+                            started.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+                        );
+                    }
+                    write_result.context("write v8 Parallel DATA frames")?;
                     coordinator.mark_data_complete(assignment.segment_ticket)?;
                     Ok(ProducerCompletion {
                         assignment,
@@ -1134,6 +1154,8 @@ impl WalV8ParallelWriter {
             producer_guards: Arc::clone(&self.producer_guards),
             write_file,
             data_buffer,
+            #[cfg(feature = "bench")]
+            profile: self.profile.load_full(),
         })
     }
 

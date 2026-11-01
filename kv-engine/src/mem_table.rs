@@ -164,6 +164,9 @@ pub struct WriteProfile {
     pub wal_v8_post_encode_hash_reread_bytes: AtomicU64,
     /// Tickets included in the sampled v8 digest CPU timings.
     pub wal_v8_cpu_timing_sampled_tickets: AtomicU64,
+    /// Aggregate producer time in v8 positional DATA write calls, including retries.
+    /// Concurrent calls overlap, so this is summed call time, not wall time.
+    pub wal_v8_data_write_call_ns: AtomicU64,
     /// Number of WAL commit groups that reached fdatasync.
     pub wal_commit_groups: AtomicU64,
     /// Number of WAL commit groups that only contained one pending buffer.
@@ -267,6 +270,7 @@ impl WriteProfile {
         self.wal_v8_ordered_link_hash_cpu_ns.store(0, o);
         self.wal_v8_post_encode_hash_reread_bytes.store(0, o);
         self.wal_v8_cpu_timing_sampled_tickets.store(0, o);
+        self.wal_v8_data_write_call_ns.store(0, o);
         self.wal_commit_groups.store(0, o);
         self.wal_commit_solo_groups.store(0, o);
         self.wal_commit_buffers.store(0, o);
@@ -332,6 +336,7 @@ impl WriteProfile {
             wal_v8_ordered_link_hash_cpu_ns: self.wal_v8_ordered_link_hash_cpu_ns.load(o),
             wal_v8_post_encode_hash_reread_bytes: self.wal_v8_post_encode_hash_reread_bytes.load(o),
             wal_v8_cpu_timing_sampled_tickets: self.wal_v8_cpu_timing_sampled_tickets.load(o),
+            wal_v8_data_write_call_ns: self.wal_v8_data_write_call_ns.load(o),
             wal_commit_groups: self.wal_commit_groups.load(o),
             wal_commit_solo_groups: self.wal_commit_solo_groups.load(o),
             wal_commit_buffers: self.wal_commit_buffers.load(o),
@@ -372,6 +377,12 @@ impl WriteProfile {
         let o = std::sync::atomic::Ordering::Relaxed;
         self.wal_sync_coalesce_wait_calls.fetch_add(1, o);
         self.wal_sync_coalesce_wait_ns.fetch_add(nanos, o);
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn record_wal_v8_data_write_call_ns(&self, nanos: u64) {
+        self.wal_v8_data_write_call_ns
+            .fetch_add(nanos, std::sync::atomic::Ordering::Relaxed);
     }
 
     #[cfg(feature = "bench")]
@@ -662,6 +673,7 @@ pub struct WriteProfileSnapshot {
     pub wal_v8_ordered_link_hash_cpu_ns: u64,
     pub wal_v8_post_encode_hash_reread_bytes: u64,
     pub wal_v8_cpu_timing_sampled_tickets: u64,
+    pub wal_v8_data_write_call_ns: u64,
     pub wal_commit_groups: u64,
     pub wal_commit_solo_groups: u64,
     pub wal_commit_buffers: u64,
@@ -790,6 +802,9 @@ impl WriteProfileSnapshot {
             wal_v8_cpu_timing_sampled_tickets: self
                 .wal_v8_cpu_timing_sampled_tickets
                 .saturating_sub(before.wal_v8_cpu_timing_sampled_tickets),
+            wal_v8_data_write_call_ns: self
+                .wal_v8_data_write_call_ns
+                .saturating_sub(before.wal_v8_data_write_call_ns),
             wal_commit_groups: self
                 .wal_commit_groups
                 .saturating_sub(before.wal_commit_groups),
