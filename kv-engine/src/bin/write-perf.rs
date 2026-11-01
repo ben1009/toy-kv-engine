@@ -53,6 +53,49 @@ const STEADY_STATE_WARMUP_STREAM_LABEL: u64 = 0x0180_0010;
 const STEADY_STATE_MEASUREMENT_STREAM_LABEL: u64 = 0x0180_0011;
 const STEADY_STATE_ZIPFIAN_EXPONENT: f64 = 0.99;
 const RAND_CHACHA_VERSION: &str = "0.3.1";
+const PITR_ADMISSION_BARRIER_ERROR: &str = "commit admission is stopped at a PITR barrier";
+const PITR_ADMISSION_RETRY_BUDGET: Duration = Duration::from_secs(5);
+
+/// A PITR cutoff rejects commits that have not yet reserved a timestamp. Keep
+/// those workload operations intact and retry them while the boundary drains;
+/// the retry time remains part of the measured latency and throughput.
+fn with_pitr_admission_retry<T>(
+    enabled: bool,
+    mut attempt: impl FnMut() -> Result<T>,
+) -> Result<T> {
+    with_pitr_admission_retry_budget(enabled, PITR_ADMISSION_RETRY_BUDGET, &mut attempt)
+}
+
+fn with_pitr_admission_retry_budget<T>(
+    enabled: bool,
+    budget: Duration,
+    attempt: &mut impl FnMut() -> Result<T>,
+) -> Result<T> {
+    let deadline = Instant::now() + budget;
+    let mut backoff = Duration::from_micros(50);
+
+    loop {
+        match attempt() {
+            Ok(value) => return Ok(value),
+            Err(error)
+                if enabled
+                    && error
+                        .chain()
+                        .any(|cause| cause.to_string() == PITR_ADMISSION_BARRIER_ERROR) =>
+            {
+                let now = Instant::now();
+                if now >= deadline {
+                    return Err(error.context(format!(
+                        "PITR benchmark admission did not reopen within {budget:?}"
+                    )));
+                }
+                std::thread::sleep(backoff.min(deadline - now));
+                backoff = (backoff * 2).min(Duration::from_millis(2));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, ValueEnum, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -3450,6 +3493,7 @@ fn run_wal_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
     let value = vec![b'x'; cfg.value_size];
     let num_keys = cfg.num;
     let writer_threads = cfg.threads;
+    let retry_pitr_barrier = cfg.pitr;
     let baseline = collect_counters(&engine)?;
     let cpu_start = process_cpu_times();
     let per_thread = num_keys / writer_threads;
@@ -3468,7 +3512,9 @@ fn run_wal_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
                 let sample_start = sample_every
                     .filter(|every| i.is_multiple_of(*every))
                     .map(|_| Instant::now());
-                eng.put(format!("key{:08}", start_idx + i).as_bytes(), &val)?;
+                with_pitr_admission_retry(retry_pitr_barrier, || {
+                    eng.put(format!("key{:08}", start_idx + i).as_bytes(), &val)
+                })?;
                 if let Some(start) = sample_start {
                     latency_samples.push(start.elapsed().as_nanos() as u64);
                 }
@@ -3583,6 +3629,7 @@ fn run_wal_batch_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>
     let value = vec![b'x'; cfg.value_size];
     let num_keys = cfg.num;
     let writer_threads = cfg.threads;
+    let retry_pitr_barrier = cfg.pitr;
     let baseline = collect_counters(&engine)?;
     let cpu_start = process_cpu_times();
     let per_thread = num_keys / writer_threads;
@@ -3613,7 +3660,7 @@ fn run_wal_batch_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>
                 let sample_start = sample_every
                     .filter(|every| batch_index.is_multiple_of(*every))
                     .map(|_| Instant::now());
-                eng.write_batch(&batch)?;
+                with_pitr_admission_retry(retry_pitr_barrier, || eng.write_batch(&batch))?;
                 if let Some(sample_start) = sample_start {
                     latency_samples.push(sample_start.elapsed().as_nanos() as u64);
                 }
@@ -8396,6 +8443,62 @@ fn validate_run_mode(cfg: &HarnessConfig, bench_arg: Option<&str>) -> Result<()>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pitr_benchmark_retries_only_unadmitted_barrier_rejections() {
+        let mut attempts = 0;
+        let mut operation = || {
+            attempts += 1;
+            if attempts == 1 {
+                Err(anyhow!(PITR_ADMISSION_BARRIER_ERROR).context("write batch rejected"))
+            } else {
+                Ok(42)
+            }
+        };
+
+        let result =
+            with_pitr_admission_retry_budget(true, Duration::from_millis(100), &mut operation)
+                .expect("retry after the PITR cutoff reopens");
+        assert_eq!(result, 42);
+        assert_eq!(attempts, 2);
+
+        let mut attempts = 0;
+        let mut operation = || {
+            attempts += 1;
+            Err::<(), _>(anyhow!(PITR_ADMISSION_BARRIER_ERROR))
+        };
+        assert!(
+            with_pitr_admission_retry_budget(false, Duration::from_millis(100), &mut operation,)
+                .is_err()
+        );
+        assert_eq!(attempts, 1);
+
+        let mut attempts = 0;
+        let mut operation = || {
+            attempts += 1;
+            Err::<(), _>(anyhow!("unrelated write failure"))
+        };
+        assert!(
+            with_pitr_admission_retry_budget(true, Duration::from_millis(100), &mut operation,)
+                .is_err()
+        );
+        assert_eq!(attempts, 1);
+    }
+
+    #[test]
+    fn pitr_benchmark_barrier_retry_has_a_deadline() {
+        let mut operation = || Err::<(), _>(anyhow!(PITR_ADMISSION_BARRIER_ERROR));
+        let error =
+            with_pitr_admission_retry_budget(true, Duration::from_millis(3), &mut operation)
+                .expect_err("a barrier that never reopens must stop retrying");
+
+        assert!(error.to_string().contains("did not reopen"));
+        assert!(
+            error
+                .chain()
+                .any(|cause| cause.to_string() == PITR_ADMISSION_BARRIER_ERROR)
+        );
+    }
 
     fn legacy_cfg() -> HarnessConfig {
         HarnessConfig::from_args(Args::try_parse_from(["write-perf"]).expect("parse args"))

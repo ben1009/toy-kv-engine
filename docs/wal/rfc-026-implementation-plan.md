@@ -272,7 +272,10 @@ durability-group, FRONTIER-write and `fdatasync` counters to the same
 by one FRONTIER/fdatasync cycle; `commit_buffers` counts those ticket buffers
 and `commit_bytes` their aligned DATA frame bytes. io_uring, CQE and eventfd
 counters remain zero because V8 submits positional writes directly. The normal
-build rejects the v8 selector before opening a database.
+build rejects the v8 selector before opening a database. PITR write-perf workers
+retry only the exact pre-admission `commit admission is stopped at a PITR
+barrier` error, with a bounded five-second wait. The retry time remains inside
+the measured operation latency; other errors still fail the run immediately.
 
 Each slice must leave existing v2-v7 reads, writes, recovery and digest
 interpretation unchanged. Tests for each completed slice are part of its
