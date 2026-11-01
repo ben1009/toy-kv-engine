@@ -1214,6 +1214,27 @@ fn replay_pitr_records_inner(
                         Some(boundary),
                     ) => {
                         boundary.validate()?;
+                        let successor_format_is_authorized =
+                            match (obligation.wal_format, boundary.wal_format) {
+                                (PitrWalFormat::V7, PitrWalFormat::V7)
+                                | (PitrWalFormat::V8, PitrWalFormat::V8) => {
+                                    obligation.migration_successor_boundary.is_none()
+                                }
+                                (PitrWalFormat::V7, PitrWalFormat::V8) => {
+                                    obligation.migration_successor_boundary == Some(boundary)
+                                }
+                                // Older legacy seal records can publish the initial
+                                // v7 boundary without a separate MigrationStarted
+                                // record. Preserve that on-disk transition; any
+                                // explicit intent is still checked against this
+                                // exact boundary above.
+                                (PitrWalFormat::LegacyV5V6, PitrWalFormat::V7) => true,
+                                _ => false,
+                            };
+                        ensure!(
+                            successor_format_is_authorized,
+                            "sealed successor WAL format is not authorized by its source obligation"
+                        );
                         ensure!(
                             Some(boundary.timeline_id) == state.timeline_id
                                 && Some(boundary.archive_epoch_id) == state.archive_epoch_id
@@ -2111,6 +2132,98 @@ mod tests {
         relabeled.wal_format = PitrWalFormat::V7;
         assert!(validate_active_boundary_advance(v8_active, relabeled).is_err());
         assert!(validate_active_boundary_advance(v7_active, v8_active).is_err());
+    }
+
+    #[test]
+    fn segment_sealed_rejects_unauthorized_successor_wal_format_transitions() {
+        use crate::pitr::{ArchiveEpochId, ChainAnchor, SegmentAnchor, SegmentId, TimelineId};
+        use crate::wal::v8::codec::WalV8Header;
+
+        let predecessor = SegmentAnchor {
+            segment_id: SegmentId(1),
+            wal_digest: [4; 32],
+            seal_digest: [5; 32],
+        };
+        let mut v8_successor = ActiveBoundary {
+            wal_format: PitrWalFormat::V8,
+            ..empty_successor_active_boundary(2)
+        };
+        let successor_header = WalV8Header {
+            timeline_id: TimelineId(v8_successor.timeline_id),
+            archive_epoch_id: ArchiveEpochId(v8_successor.archive_epoch_id),
+            segment_id: SegmentId(v8_successor.segment_id),
+            predecessor: ChainAnchor::Segment(predecessor),
+            incarnation: v8_successor.incarnation,
+        };
+        v8_successor.prefix_digest = successor_header.initial_prefix_digest().unwrap();
+
+        let v7_source = empty_active_boundary_for_enabled_segment();
+        let v7_to_v8_without_intent = [
+            enable()[0].clone(),
+            enable()[1].clone(),
+            PitrManifestRecord::ActiveBoundaryAdvanced {
+                boundary: v7_source,
+            },
+            PitrManifestRecord::SealStarted {
+                segment_id: 1,
+                successor_segment_id: 2,
+                logical_length: 8192,
+                immutable_boundary: Some(immutable_boundary(v7_source, 8192)),
+            },
+            PitrManifestRecord::SegmentSealed {
+                segment_id: 1,
+                segment_anchor: anchor(1),
+                last_recorded_at: None,
+                last_commit_anchor: None,
+                successor_active_boundary: Some(v8_successor),
+            },
+        ];
+        assert!(replay_pitr_records(v7_to_v8_without_intent).is_err());
+
+        let v8_source = ActiveBoundary {
+            wal_format: PitrWalFormat::V8,
+            ..empty_active_boundary_for_enabled_segment()
+        };
+        let v8_to_v7 = [
+            enable()[0].clone(),
+            enable()[1].clone(),
+            PitrManifestRecord::ActiveBoundaryAdvanced {
+                boundary: v8_source,
+            },
+            PitrManifestRecord::SealStarted {
+                segment_id: 1,
+                successor_segment_id: 2,
+                logical_length: 8192,
+                immutable_boundary: Some(immutable_boundary(v8_source, 8192)),
+            },
+            PitrManifestRecord::SegmentSealed {
+                segment_id: 1,
+                segment_anchor: anchor(1),
+                last_recorded_at: None,
+                last_commit_anchor: None,
+                successor_active_boundary: Some(empty_successor_active_boundary(2)),
+            },
+        ];
+        assert!(replay_pitr_records(v8_to_v7).is_err());
+
+        let legacy_to_v8 = [
+            enable()[0].clone(),
+            enable()[1].clone(),
+            PitrManifestRecord::SealStarted {
+                segment_id: 1,
+                successor_segment_id: 2,
+                logical_length: 4096,
+                immutable_boundary: None,
+            },
+            PitrManifestRecord::SegmentSealed {
+                segment_id: 1,
+                segment_anchor: anchor(1),
+                last_recorded_at: None,
+                last_commit_anchor: None,
+                successor_active_boundary: Some(v8_successor),
+            },
+        ];
+        assert!(replay_pitr_records(legacy_to_v8).is_err());
     }
 
     #[test]
