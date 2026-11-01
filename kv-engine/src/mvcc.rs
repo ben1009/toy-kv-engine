@@ -818,7 +818,7 @@ impl LsmMvccInner {
             !(value.len() == 1 && value[0] == crate::vlog::KvKind::Tombstone as u8),
             "value must not be the tombstone marker byte (0x02)"
         );
-        if memtable.uses_v8_wal() {
+        if memtable.uses_v8_wal() && memtable.uses_parallel_wal() {
             return self.write_v8_parallel_wal_only(user_key, value, memtable);
         }
         if memtable.uses_v7_wal() && memtable.uses_parallel_wal() {
@@ -974,6 +974,7 @@ impl LsmMvccInner {
         });
         let prepared_v8 = v8_batch
             .as_ref()
+            .filter(|_| memtable.uses_parallel_wal())
             .map(|batch| memtable.prepare_v8_pitr_wal_batch(batch, crate::pitr::LIVE_WAL_V5_LIMITS))
             .transpose()?;
         let _write_guard = self.write_lock.lock();
@@ -1061,20 +1062,17 @@ impl LsmMvccInner {
         });
         let prepared_v8 = v8_batch
             .as_ref()
+            .filter(|_| memtable.uses_parallel_wal())
             .map(|batch| memtable.prepare_v8_pitr_wal_batch(batch, crate::pitr::LIVE_WAL_V5_LIMITS))
             .transpose()?;
         let _write_guard = self.write_lock.lock();
         let commit_ts = self.reserve_commit_ts()?;
         let _unwind_guard = self.guard_versioned_commit_unwind(memtable, commit_ts);
         let encoded_key = encode_internal_key(user_key, commit_ts);
-        let (ticket, frame_job) = match if memtable.uses_v8_wal() {
+        let (ticket, frame_job) = match if let Some(prepared) = prepared_v8 {
             let recorded_at = self.pitr_recorded_at_for_commit(commit_ts)?;
             memtable
-                .admit_prepared_v8_pitr_wal_batch_only(
-                    prepared_v8.expect("v8 WAL batch was prepared before the sequencer"),
-                    commit_ts,
-                    recorded_at,
-                )
+                .admit_prepared_v8_pitr_wal_batch_only(prepared, commit_ts, recorded_at)
                 .map(|(ticket, frame_job)| {
                     (
                         ticket,
@@ -1159,6 +1157,7 @@ impl LsmMvccInner {
         };
         let prepared_v8 = v8_batch
             .as_ref()
+            .filter(|_| memtable.uses_parallel_wal())
             .map(|batch| memtable.prepare_v8_pitr_wal_batch(batch, crate::pitr::LIVE_WAL_V5_LIMITS))
             .transpose()?;
         let _write_guard = self.write_lock.lock();
@@ -1406,7 +1405,7 @@ impl LsmMvccInner {
             } else {
                 None
             };
-        let prepare_v8 = memtable.uses_v8_wal();
+        let prepare_v8 = memtable.uses_v8_wal() && memtable.uses_parallel_wal();
         let preparation_batch = if v7_sampled_recorded_at.is_some() || prepare_v8 {
             Some(crate::pitr::WalBatch {
                 // Canonical entry preparation does not depend on these
@@ -1645,6 +1644,7 @@ impl LsmMvccInner {
         });
         let prepared_v8 = v8_batch
             .as_ref()
+            .filter(|_| memtable.uses_parallel_wal())
             .map(|batch| memtable.prepare_v8_pitr_wal_batch(batch, crate::pitr::LIVE_WAL_V5_LIMITS))
             .transpose()?;
         let _write_guard = self.write_lock.lock();

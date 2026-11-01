@@ -8344,10 +8344,6 @@ fn validate_config(cfg: &HarnessConfig) -> Result<()> {
                 cfg!(all(feature = "bench", target_os = "linux")),
                 "PITR v8 comparison requires a Linux write-perf build with --features bench"
             );
-            anyhow::ensure!(
-                cfg.wal_io_mode == WalIoModeArg::Leader,
-                "PITR v8 currently supports only --wal-io-mode leader; Parallel v8 is not implemented"
-            );
         }
         if format == PitrFormatArg::V6 && cfg.wal_io_mode_explicit {
             anyhow::ensure!(
@@ -8613,12 +8609,7 @@ mod tests {
         assert_eq!(v8_parallel.pitr_format, Some(PitrFormatArg::V8));
         assert_eq!(v8_parallel.pitr_format.map(PitrFormatArg::version), Some(8));
         if cfg!(all(feature = "bench", target_os = "linux")) {
-            assert!(
-                validate_config(&v8_parallel)
-                    .unwrap_err()
-                    .to_string()
-                    .contains("Parallel v8 is not implemented")
-            );
+            validate_config(&v8_parallel).expect("v8 supports the default Parallel mode");
         } else {
             assert!(
                 validate_config(&v8_parallel)

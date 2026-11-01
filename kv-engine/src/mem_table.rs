@@ -1357,6 +1357,7 @@ impl MemTable {
         header: crate::wal::v8::codec::WalV8Header,
         max_file_size: u64,
         retained_resources: Arc<WalV7RetainedResources>,
+        io_mode: WalIoMode,
         create_owner: F,
     ) -> Result<(Self, Arc<crate::wal::v8::resource::WalV8ReservationOwner>)>
     where
@@ -1417,6 +1418,7 @@ impl MemTable {
             &path,
             installed,
             max_file_size,
+            io_mode,
             create_owner,
         )?;
         ensure!(
@@ -1618,9 +1620,9 @@ impl MemTable {
         Ok((ret, max_commit_ts))
     }
 
-    /// Recover and reopen a normalized Active v8 WAL with its serial Leader
-    /// writer. The caller must have authority-checked and durably installed the
-    /// image before attaching it to a writable memtable.
+    /// Recover and reopen a normalized Active v8 WAL with the Parallel writer.
+    /// The caller must have authority-checked and durably installed the image
+    /// before attaching it to a writable memtable.
     #[cfg(all(target_os = "linux", test))]
     pub(crate) fn recover_from_v8_active(
         id: usize,
@@ -1634,6 +1636,7 @@ impl MemTable {
             vlog_enabled,
             path,
             installed,
+            WalIoMode::Parallel,
             |write, sync, installed| {
                 let writer = crate::wal::v8::leader::WalV8LeaderWriter::new(
                     write,
@@ -1655,6 +1658,7 @@ impl MemTable {
         path: impl AsRef<Path>,
         installed: crate::wal::v8::install::WalV8InstalledRecovery,
         max_file_size: u64,
+        io_mode: WalIoMode,
         create_owner: F,
     ) -> Result<(Self, u64)>
     where
@@ -1667,6 +1671,7 @@ impl MemTable {
             vlog_enabled,
             path,
             installed,
+            io_mode,
             |write, sync, installed| {
                 let owner = create_owner(installed)?;
                 let writer = crate::wal::v8::leader::WalV8LeaderWriter::new_with_reservation_owner(
@@ -1687,6 +1692,7 @@ impl MemTable {
         vlog_enabled: bool,
         path: impl AsRef<Path>,
         installed: crate::wal::v8::install::WalV8InstalledRecovery,
+        io_mode: WalIoMode,
         create_writer: F,
     ) -> Result<(Self, u64)>
     where
@@ -1720,7 +1726,10 @@ impl MemTable {
             .try_clone()
             .context("clone installed v8 Active WAL sync handle")?;
         let (writer, reservation_owner) = create_writer(write_file, sync_file, &installed)?;
-        ret.wal = Some(Wal::from_v8_parallel(writer.into_parallel(), &installed)?);
+        ret.wal = Some(match io_mode {
+            WalIoMode::Leader => Wal::from_v8_leader(writer, &installed)?,
+            WalIoMode::Parallel => Wal::from_v8_parallel(writer.into_parallel(), &installed)?,
+        });
         ret.wal_v8_reservation_owner = reservation_owner;
         ret.wal_path = Some(path);
         ret.last_ticket
@@ -2377,7 +2386,10 @@ impl MemTable {
             .wal
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("PITR WAL is not configured"))?;
-        anyhow::ensure!(wal.is_v8(), "prepared v8 batch requires a v8 WAL");
+        anyhow::ensure!(
+            wal.is_v8() && wal.is_parallel(),
+            "prepared v8 batch requires a Parallel v8 WAL"
+        );
         wal.preflight_v8_leader_batch(batch, limits)
     }
 
@@ -2397,7 +2409,10 @@ impl MemTable {
             .wal
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("PITR WAL is not configured"))?;
-        anyhow::ensure!(wal.is_v8(), "prepared v8 batch requires a v8 WAL");
+        anyhow::ensure!(
+            wal.is_v8() && wal.is_parallel(),
+            "prepared v8 batch requires a Parallel v8 WAL"
+        );
         let (ticket, frame_job) =
             wal.admit_v8_prepared_parallel_batch(prepared, commit_ts, recorded_at)?;
         self.last_ticket

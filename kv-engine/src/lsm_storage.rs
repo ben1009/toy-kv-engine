@@ -14140,6 +14140,7 @@ impl LsmStorageInner {
                                 &wal_path,
                                 recovery,
                                 max_segment_bytes,
+                                wal_io_mode,
                                 |installed| {
                                     let metadata = std::fs::metadata(&wal_path)?;
                                     ensure!(
@@ -20278,6 +20279,7 @@ impl LsmStorageInner {
             header,
             max_segment_bytes,
             Arc::clone(&retained_resources),
+            self.wal_io_mode,
             |installed| {
                 use std::os::unix::fs::MetadataExt;
 
@@ -25214,6 +25216,84 @@ mod tests {
             KvEngine::open(&database, options).is_err(),
             "recovery must reject corruption below the persisted Active v8 anchor"
         );
+
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn active_v8_recovery_honors_selected_wal_io_mode() -> anyhow::Result<()> {
+        for mode in [
+            crate::wal::WalIoMode::Leader,
+            crate::wal::WalIoMode::Parallel,
+        ] {
+            let directory = tempdir()?;
+            let (options, _) = active_v8_recovery_test_database(directory.path(), true)?;
+            let database = directory.path().join("db");
+            let engine = KvEngine::open_with_wal_io_mode(&database, options.clone(), mode)?;
+            let active = engine.inner.state.load().memtable.clone();
+            assert_eq!(active.wal_io_mode(), Some(mode));
+            assert_eq!(
+                active.uses_parallel_wal(),
+                mode == crate::wal::WalIoMode::Parallel
+            );
+            assert!(matches!(
+                engine.create_recovery_point()?,
+                crate::pitr::api::RecoveryPointOutcome::Durable(_)
+            ));
+            let active = engine.inner.state.load().memtable.clone();
+            assert_eq!(active.wal_io_mode(), Some(mode));
+            assert_eq!(
+                active.uses_parallel_wal(),
+                mode == crate::wal::WalIoMode::Parallel
+            );
+
+            engine.put(b"mode-point", b"value")?;
+            engine.put_with_ttl(b"mode-ttl", b"value", std::time::Duration::from_secs(3600))?;
+            engine.delete(b"seed")?;
+            engine.write_batch(&[
+                WriteBatchRecord::Put(&b"batch-put"[..], &b"value"[..]),
+                WriteBatchRecord::PutWithTtl(&b"batch-ttl"[..], &b"value"[..], 3600),
+                WriteBatchRecord::Del(&b"batch-delete"[..]),
+            ])?;
+            engine.put(b"range-a", b"hidden")?;
+            engine.put(b"range-z", b"visible")?;
+            engine.delete_range(b"range-a", b"range-z")?;
+            engine.sync()?;
+            engine.close()?;
+
+            let reopened = KvEngine::open_with_wal_io_mode(&database, options, mode)?;
+            let active = reopened.inner.state.load().memtable.clone();
+            assert_eq!(active.wal_io_mode(), Some(mode));
+            assert_eq!(
+                active.uses_parallel_wal(),
+                mode == crate::wal::WalIoMode::Parallel
+            );
+            assert_eq!(
+                reopened.get(b"mode-point")?,
+                Some(Bytes::from_static(b"value"))
+            );
+            assert_eq!(
+                reopened.get(b"mode-ttl")?,
+                Some(Bytes::from_static(b"value"))
+            );
+            assert_eq!(reopened.get(b"seed")?, None);
+            assert_eq!(
+                reopened.get(b"batch-put")?,
+                Some(Bytes::from_static(b"value"))
+            );
+            assert_eq!(
+                reopened.get(b"batch-ttl")?,
+                Some(Bytes::from_static(b"value"))
+            );
+            assert_eq!(reopened.get(b"batch-delete")?, None);
+            assert_eq!(reopened.get(b"range-a")?, None);
+            assert_eq!(
+                reopened.get(b"range-z")?,
+                Some(Bytes::from_static(b"visible"))
+            );
+            reopened.close()?;
+        }
 
         Ok(())
     }
