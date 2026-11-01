@@ -1032,6 +1032,7 @@ struct WalSyncObservationRecord {
     next_ticket_frames_ready: bool,
     next_ticket_digest_folded: bool,
     next_ticket_data_complete: bool,
+    next_ticket_data_write_elapsed_ns: Option<u64>,
     write_sqes_submitted: u64,
     write_cqes_completed: u64,
     groups_completed: u64,
@@ -1127,6 +1128,7 @@ impl From<kv_engine_wrapper::mem_table::WalSyncObservation> for WalSyncObservati
             next_ticket_frames_ready: observation.next_ticket_frames_ready,
             next_ticket_digest_folded: observation.next_ticket_digest_folded,
             next_ticket_data_complete: observation.next_ticket_data_complete,
+            next_ticket_data_write_elapsed_ns: observation.next_ticket_data_write_elapsed_ns,
             write_sqes_submitted: observation.write_sqes_submitted,
             write_cqes_completed: observation.write_cqes_completed,
             groups_completed: observation.groups_completed,
@@ -12580,6 +12582,7 @@ mod tests {
                 next_ticket_frames_ready: true,
                 next_ticket_digest_folded: false,
                 next_ticket_data_complete: true,
+                next_ticket_data_write_elapsed_ns: Some(123_456),
                 write_sqes_submitted: 6,
                 write_cqes_completed: 4,
                 groups_completed: 2,
@@ -12598,6 +12601,7 @@ mod tests {
         assert_eq!(json["next_ticket_frames_ready"], true);
         assert_eq!(json["next_ticket_digest_folded"], false);
         assert_eq!(json["next_ticket_data_complete"], true);
+        assert_eq!(json["next_ticket_data_write_elapsed_ns"], 123_456);
         assert_eq!(json["write_sqes_submitted"], 6);
         assert_eq!(json["write_cqes_completed"], 4);
         assert_eq!(json["groups_completed"], 2);

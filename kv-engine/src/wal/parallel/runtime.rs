@@ -3327,6 +3327,7 @@ fn synchronize_written_prefix(sync_file: &File, inner: &RuntimeInner) -> Result<
                 next_ticket_frames_ready: false,
                 next_ticket_digest_folded: false,
                 next_ticket_data_complete: false,
+                next_ticket_data_write_elapsed_ns: None,
                 write_sqes_submitted: _sync_end.write_sqes_submitted,
                 write_cqes_completed: _sync_end.write_cqes_completed,
                 groups_completed: _sync_end.groups_completed,

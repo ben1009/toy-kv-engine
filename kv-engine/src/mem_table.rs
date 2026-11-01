@@ -218,6 +218,9 @@ pub struct WalSyncObservation {
     pub next_ticket_frames_ready: bool,
     pub next_ticket_digest_folded: bool,
     pub next_ticket_data_complete: bool,
+    /// Elapsed time since the next v8 ticket started its positional DATA write.
+    /// Other WAL formats and tickets not yet writing leave this unset.
+    pub next_ticket_data_write_elapsed_ns: Option<u64>,
     pub write_sqes_submitted: u64,
     pub write_cqes_completed: u64,
     pub groups_completed: u64,

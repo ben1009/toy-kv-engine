@@ -7,6 +7,9 @@
 
 use std::{collections::VecDeque, sync::Arc, time::Duration};
 
+#[cfg(feature = "bench")]
+use std::time::Instant;
+
 use anyhow::{Context, Result, ensure};
 use parking_lot::{Condvar, Mutex};
 
@@ -94,6 +97,8 @@ struct TicketState {
     digest_ready: Option<WalV8DigestReady>,
     prefix_digest_after: Option<WalV8Digest>,
     data_complete: bool,
+    #[cfg(feature = "bench")]
+    data_write_started_at: Option<Instant>,
 }
 
 /// Immutable view of one ticket in the admission window.
@@ -108,6 +113,8 @@ pub(crate) struct WalV8TicketProgress {
     /// have published their producer digests.
     pub(crate) prefix_digest_after: Option<WalV8Digest>,
     pub(crate) data_complete: bool,
+    #[cfg(feature = "bench")]
+    pub(crate) data_write_elapsed_ns: Option<u64>,
 }
 
 /// Atomic view of the durability decision point. `next_not_ready` is the
@@ -317,6 +324,31 @@ impl WalV8ParallelCoordinator {
         }
         state.tickets[index].frames_ready = true;
         signal_change(&self.inner, &mut state);
+        Ok(())
+    }
+
+    /// Record when a producer begins its positional DATA write for opt-in
+    /// benchmark diagnostics. This timestamp is not part of readiness policy.
+    #[cfg(feature = "bench")]
+    pub(crate) fn mark_data_write_started(&self, ticket: u64) -> Result<()> {
+        let mut state = self.inner.state.lock();
+        ensure!(!state.poisoned, "v8 Parallel coordinator is poisoned");
+        let Some(index) = state
+            .tickets
+            .iter()
+            .position(|entry| entry.assignment.segment_ticket == ticket)
+        else {
+            poison_locked(&self.inner, &mut state);
+            anyhow::bail!("v8 DATA-write start event names an unknown ticket")
+        };
+        if !state.tickets[index].frames_ready
+            || state.tickets[index].data_complete
+            || state.tickets[index].data_write_started_at.is_some()
+        {
+            poison_locked(&self.inner, &mut state);
+            anyhow::bail!("v8 DATA-write start event is invalid for its ticket")
+        }
+        state.tickets[index].data_write_started_at = Some(Instant::now());
         Ok(())
     }
 
@@ -751,6 +783,8 @@ impl WalV8AdmissionPublisher for WalV8ParallelCoordinator {
             digest_ready: None,
             prefix_digest_after: None,
             data_complete: false,
+            #[cfg(feature = "bench")]
+            data_write_started_at: None,
         });
         state.next_ticket = next_ticket;
         state.next_data_offset = data_end;
@@ -845,6 +879,10 @@ impl TicketState {
             digest_ready: self.digest_ready,
             prefix_digest_after: self.prefix_digest_after,
             data_complete: self.data_complete,
+            #[cfg(feature = "bench")]
+            data_write_elapsed_ns: self
+                .data_write_started_at
+                .map(|started| started.elapsed().as_nanos().min(u64::MAX as u128) as u64),
         }
     }
 
@@ -1169,6 +1207,7 @@ mod tests {
         assert!(!blocked.frames_ready);
         assert!(blocked.prefix_digest_after.is_some());
         assert!(!blocked.data_complete);
+        assert_eq!(blocked.data_write_elapsed_ns, None);
 
         let mut second_frames = vec![0; second.frame_buffer_bytes()];
         second.encode_data_frames_into(&mut second_frames)?;
@@ -1180,6 +1219,14 @@ mod tests {
         assert!(blocked.frames_ready);
         assert!(blocked.prefix_digest_after.is_some());
         assert!(!blocked.data_complete);
+        assert_eq!(blocked.data_write_elapsed_ns, None);
+
+        coordinator.mark_data_write_started(1)?;
+        let snapshot = coordinator.frontier_ready_snapshot();
+        let blocked = snapshot
+            .next_not_ready
+            .expect("second ticket still awaits DATA completion");
+        assert!(blocked.data_write_elapsed_ns.is_some());
 
         coordinator.mark_data_complete(1)?;
         let snapshot = coordinator.frontier_ready_snapshot();

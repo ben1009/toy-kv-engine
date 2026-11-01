@@ -251,6 +251,15 @@ impl WalV8FrameJob<'_> {
         self.coordinator
             .mark_frames_ready(self.assignment.segment_ticket)?;
         #[cfg(feature = "bench")]
+        if self
+            .profile
+            .as_ref()
+            .is_some_and(|profile| profile.wal_sync_diagnostics_enabled())
+        {
+            self.coordinator
+                .mark_data_write_started(self.assignment.segment_ticket)?;
+        }
+        #[cfg(feature = "bench")]
         let write_started = self.profile.as_ref().map(|_| Instant::now());
         let write_result = write_aligned_once(
             &self.write_file,
@@ -1309,6 +1318,8 @@ impl WalV8ParallelWriter {
                             .is_some_and(|ticket| ticket.prefix_digest_after.is_some()),
                         next_ticket_data_complete: next_ticket
                             .is_some_and(|ticket| ticket.data_complete),
+                        next_ticket_data_write_elapsed_ns: next_ticket
+                            .and_then(|ticket| ticket.data_write_elapsed_ns),
                         groups_completed: groups,
                         groups_covered: groups,
                         duration_ns,
