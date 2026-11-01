@@ -205,9 +205,11 @@ disabled.
    install only its exact manifest-authorized empty successor. A failed
    post-`SegmentSealed` install is retried from that durable boundary. Explicit
    `create_recovery_point` now completes the Active v8 rotation, installs its
-   v8 successor and archives the sealed source. Automatic v8 rotation, general
-  format-registry selection and new v7-to-v8 migration initiation remain
-  disabled; explicit resume only completes an already-published intent.
+   v8 successor and archives the sealed source. Once an Active v8 segment
+   exists, automatic same-format size/timer rotation and archival use the
+   normal maintenance path. Automatic v8 format selection and new v7-to-v8
+   migration initiation remain disabled; explicit resume only completes an
+   already-published intent.
 5. **Persistence and transitions:** version persisted seal/manifest/backup
    digest references, validate v8 archive objects, support v5/v6/v7/v8 chain
    transitions and the old-reader compatibility gate above. Add capacity and

@@ -8046,9 +8046,22 @@ impl KvEngine {
                 sequencer.resume_commit_admission_if_generation(generation);
                 *pending = None;
             }
-            return Ok(());
+            // A normal Active v8 WAL can use the same interval/size rotation
+            // path as v7 once no recovery or archive obligation is pending.
+            // Keep externally closed admission fenced: only a verified
+            // `resume_pitr` handoff may reopen it.
+            if !self
+                .inner
+                .mvcc
+                .as_ref()
+                .is_some_and(|sequencer| sequencer.commit_admission_is_open())
+            {
+                return Ok(());
+            }
         }
-        if self.inner.pitr_maintenance_needs_reconciliation(&state) {
+        if !self.inner.state.load().memtable.uses_v8_wal()
+            && self.inner.pitr_maintenance_needs_reconciliation(&state)
+        {
             ensure!(
                 !self.pitr_publication_unknown.load(Ordering::Acquire),
                 "PITR maintenance cannot resume an unknown manifest transition; reopen the database first"
@@ -14626,9 +14639,10 @@ impl LsmStorageInner {
                 });
         let recovered_recorded_at = plan.max_recorded_at;
         // `Instant` cannot be persisted across restarts. Start the interval
-        // clock when reopening a populated Active v7 WAL so idle databases
+        // clock when reopening a populated Active v7/v8 WAL so idle databases
         // still advance the archive boundary after one configured interval.
-        let pitr_active_started_at = (plan.state.memtable.uses_v7_wal()
+        let pitr_active_started_at = ((plan.state.memtable.uses_v7_wal()
+            || plan.state.memtable.uses_v8_wal())
             && !plan.state.memtable.is_empty())
         .then(std::time::Instant::now);
         let storage = Self {
@@ -18231,14 +18245,8 @@ impl LsmStorageInner {
 
     pub(crate) fn try_freeze_memtable(&self) -> Result<()> {
         let state = self.state.load();
-        // Active v8 recovery can resume appends, but its seal-and-successor
-        // transition is not wired yet. Keep it active until that transition is
-        // implemented, rather than sending it through v5/v7 maintenance.
-        if state.memtable.uses_v8_wal() {
-            return Ok(());
-        }
         // PITR WALs rotate through a segment boundary. In particular, a v7
-        // commit must not reach ordinary freeze after publishing its data:
+        // or v8 commit must not reach ordinary freeze after publishing its data:
         // maintenance and capacity retries establish the immutable segment
         // boundary before installing a successor.
         if state.memtable.uses_pitr_batch_wal() {
@@ -18589,10 +18597,9 @@ impl LsmStorageInner {
                 .and_then(std::sync::Weak::upgrade)
                 .is_some_and(|engine| engine.pitr_v8_pending_resume.lock().is_some());
         if memtable.uses_v8_wal()
-            && (!(has_pending_obligation || pending_v8_resume)
-                || state.obligations.values().any(|obligation| {
-                    obligation.state == crate::pitr::manifest::ObligationState::Sealing
-                }))
+            && state.obligations.values().any(|obligation| {
+                obligation.state == crate::pitr::manifest::ObligationState::Sealing
+            })
         {
             return Ok(());
         }
@@ -24718,6 +24725,19 @@ mod tests {
         directory: &std::path::Path,
         with_seed: bool,
     ) -> anyhow::Result<(LsmStorageOptions, u64)> {
+        active_v8_recovery_test_database_with_interval(
+            directory,
+            with_seed,
+            std::time::Duration::from_secs(3600),
+        )
+    }
+
+    #[cfg(target_os = "linux")]
+    fn active_v8_recovery_test_database_with_interval(
+        directory: &std::path::Path,
+        with_seed: bool,
+        archive_interval: std::time::Duration,
+    ) -> anyhow::Result<(LsmStorageOptions, u64)> {
         use crate::{
             pitr::manifest::PitrManifestRecord,
             pitr::{
@@ -24734,7 +24754,7 @@ mod tests {
         let initial_engine = pitr_flush_test_engine_with_segment_limit_and_interval(
             directory,
             1 << 20,
-            std::time::Duration::from_secs(3600),
+            archive_interval,
         );
         let pitr_state = initial_engine.pitr_manifest_state.lock().clone();
         let segment_id = pitr_state
@@ -41249,6 +41269,42 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    fn wait_for_v8_background_archive(
+        engine: &KvEngine,
+        source_segment_id: u64,
+    ) -> anyhow::Result<()> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let state = engine.pitr_manifest_state.lock().clone();
+            let archived = state.active_segment_id == Some(source_segment_id + 1)
+                && state
+                    .obligations
+                    .get(&source_segment_id)
+                    .is_none_or(|obligation| {
+                        matches!(
+                            obligation.state,
+                            crate::pitr::manifest::ObligationState::Archived
+                                | crate::pitr::manifest::ObligationState::Reclaimable
+                        )
+                    });
+            if archived
+                && engine
+                    .inner
+                    .mvcc
+                    .as_ref()
+                    .is_some_and(|sequencer| sequencer.commit_admission_is_open())
+            {
+                return Ok(());
+            }
+            anyhow::ensure!(
+                std::time::Instant::now() < deadline,
+                "automatic v8 maintenance did not archive its boundary"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
     #[test]
     fn v7_background_maintenance_rotates_at_segment_target() -> anyhow::Result<()> {
         const SEGMENT_LIMIT: u64 = 16 * 1024;
@@ -41313,6 +41369,56 @@ mod tests {
         );
         assert!(engine.inner.state.load().memtable.uses_v7_wal());
         engine.close()?;
+
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn v8_active_wal_rotates_after_archive_interval_and_preserves_io_mode() -> anyhow::Result<()> {
+        let directory = tempdir()?;
+        let (options, source_segment_id) = active_v8_recovery_test_database_with_interval(
+            directory.path(),
+            true,
+            std::time::Duration::from_millis(10),
+        )?;
+        let database = directory.path().join("db");
+        let engine = KvEngine::open_with_wal_io_mode(
+            &database,
+            options.clone(),
+            crate::wal::WalIoMode::Parallel,
+        )?;
+
+        wait_for_v8_background_archive(&engine, source_segment_id)?;
+        assert_eq!(
+            engine
+                .pitr_status(crate::pitr::api::PitrStatusOptions {
+                    cursor: None,
+                    page_size: crate::pitr::api::MAX_STATUS_PAGE_SIZE,
+                })?
+                .latest_archived_commit_ts,
+            Some(7)
+        );
+        let active = engine.inner.state.load().memtable.clone();
+        assert!(active.uses_v8_wal());
+        assert_eq!(active.wal_io_mode(), Some(crate::wal::WalIoMode::Parallel));
+        assert_eq!(engine.get(b"seed")?, Some(Bytes::from_static(b"v")));
+        engine.put(b"after-v8-rotation", b"value")?;
+        engine.sync()?;
+        engine.close()?;
+
+        let reopened =
+            KvEngine::open_with_wal_io_mode(database, options, crate::wal::WalIoMode::Parallel)?;
+        assert_eq!(
+            reopened.get(b"after-v8-rotation")?,
+            Some(Bytes::from_static(b"value"))
+        );
+        assert!(reopened.inner.state.load().memtable.uses_v8_wal());
+        assert_eq!(
+            reopened.inner.state.load().memtable.wal_io_mode(),
+            Some(crate::wal::WalIoMode::Parallel)
+        );
+        reopened.close()?;
 
         Ok(())
     }
