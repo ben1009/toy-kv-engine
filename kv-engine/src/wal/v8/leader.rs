@@ -47,8 +47,8 @@ use super::{
         WalV8PreparationReservation,
     },
     prepare::{
-        EncodedWalV8Batch, PreparedWalV8Batch, WalV8AdmissionPlan, WalV8AdmissionPublisher,
-        WalV8BatchAssignment, WalV8DigestReady,
+        AdmittedWalV8Batch, EncodedWalV8Batch, PreparedWalV8Batch, WalV8AdmissionPlan,
+        WalV8AdmissionPublisher, WalV8BatchAssignment, WalV8DigestReady,
     },
     resource::WalV8ReservationOwner,
 };
@@ -138,6 +138,7 @@ pub(crate) struct WalV8ParallelWriter {
     reservation_owner: Option<Arc<WalV8ReservationOwner>>,
     frontier: Mutex<WalV8ParallelFrontier>,
     frontier_resources: Mutex<BTreeMap<u64, WalV7OwnedBatchReservation>>,
+    producer_guards: Arc<Mutex<BTreeMap<u64, EncodedWalV8Batch<WalV8ParallelAdmissionGuard>>>>,
     max_file_size: u64,
     installed_dev: u64,
     installed_ino: u64,
@@ -149,10 +150,123 @@ struct WalV8ParallelFrontier {
     digest: [u8; 32],
 }
 
+/// Poison the runtime if a reserved FRONTIER cycle exits before its new
+/// durable boundary has been fully published, including during unwinding.
+struct WalV8FrontierCycleGuard {
+    coordinator: WalV8ParallelCoordinator,
+    armed: bool,
+}
+
+impl WalV8FrontierCycleGuard {
+    fn new(coordinator: &WalV8ParallelCoordinator) -> Self {
+        Self {
+            coordinator: coordinator.clone(),
+            armed: true,
+        }
+    }
+
+    fn complete(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for WalV8FrontierCycleGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.coordinator.poison();
+        }
+    }
+}
+
 struct ProducerCompletion {
     assignment: WalV8BatchAssignment,
     digest_ready: WalV8DigestReady,
     encoded: EncodedWalV8Batch<WalV8ParallelAdmissionGuard>,
+}
+
+/// Admitted v8 DATA work that can be finished after releasing the MVCC
+/// sequencer. Its ticket remains guarded until a successful frontier sync.
+#[must_use = "finish the admitted v8 producer job or drop it to poison the WAL"]
+pub(crate) struct WalV8FrameJob<'a> {
+    admitted:
+        Option<AdmittedWalV8Batch<'a, WalV8ParallelAdmissionGuard, WalV8PreflightReservation>>,
+    assignment: WalV8BatchAssignment,
+    coordinator: WalV8ParallelCoordinator,
+    producer_guards: Arc<Mutex<BTreeMap<u64, EncodedWalV8Batch<WalV8ParallelAdmissionGuard>>>>,
+    write_file: File,
+    data_buffer: DirectBuf,
+}
+
+impl WalV8FrameJob<'_> {
+    pub(crate) fn assignment(&self) -> WalV8BatchAssignment {
+        self.assignment
+    }
+
+    pub(crate) fn frame_buffer_bytes(&self) -> usize {
+        self.data_buffer.cap()
+    }
+
+    pub(crate) fn finish(mut self) -> Result<digest::WalV8DigestMetrics> {
+        let admitted = self
+            .admitted
+            .take()
+            .context("v8 producer job lost its admitted batch")?;
+        let mut encoded = match admitted.encode() {
+            Ok(encoded) => encoded,
+            Err(error) => {
+                self.coordinator.poison();
+                return Err(error);
+            }
+        };
+        let digest_ready = encoded.digest_ready()?;
+        #[cfg(feature = "bench")]
+        let ordered_link_hash_cpu_ns = self.coordinator.mark_digest_ready_with_cpu(digest_ready)?;
+        #[cfg(not(feature = "bench"))]
+        self.coordinator.mark_digest_ready(digest_ready)?;
+        #[cfg(feature = "bench")]
+        let metrics = {
+            let mut metrics = encoded.digest_metrics();
+            metrics.ordered_link_hash_cpu_ns = ordered_link_hash_cpu_ns;
+            metrics
+        };
+
+        let data_len = encoded.encode_data_frames_into(self.data_buffer.as_mut_slice())?;
+        ensure!(
+            data_len == self.data_buffer.cap(),
+            "v8 DATA materializer returned an unexpected frame length"
+        );
+        self.data_buffer.set_len(data_len);
+        self.coordinator
+            .mark_frames_ready(self.assignment.segment_ticket)?;
+        write_aligned_once(
+            &self.write_file,
+            self.data_buffer.initialized_slice(0, data_len),
+            self.assignment.first_data_offset,
+        )
+        .context("write v8 Parallel DATA frames")?;
+        // The admission reservation accounts for this buffer until DATA
+        // completion is published. Drop it before notifying the coordinator,
+        // which may retire that reservation as soon as the frontier syncs.
+        drop(self.data_buffer);
+
+        let ticket = self.assignment.segment_ticket;
+        let previous = self.producer_guards.lock().insert(ticket, encoded);
+        if previous.is_some() {
+            self.coordinator.poison();
+            anyhow::bail!("v8 Parallel ticket already owns a producer guard");
+        }
+        if let Err(error) = self.coordinator.mark_data_complete(ticket) {
+            self.coordinator.poison();
+            return Err(error);
+        }
+
+        #[cfg(feature = "bench")]
+        return Ok(metrics);
+        #[cfg(not(feature = "bench"))]
+        {
+            Ok(digest::WalV8DigestMetrics)
+        }
+    }
 }
 
 /// Mark the persistent resource charge at the exact admission boundary, even
@@ -333,6 +447,7 @@ impl WalV8LeaderWriter {
                 digest: self.frontier_digest,
             }),
             frontier_resources: Mutex::new(BTreeMap::new()),
+            producer_guards: Arc::new(Mutex::new(BTreeMap::new())),
             max_file_size: self.max_file_size,
             installed_dev: self.installed_dev,
             installed_ino: self.installed_ino,
@@ -867,6 +982,48 @@ impl WalV8ParallelWriter {
     where
         F: FnOnce(),
     {
+        let job =
+            self.admit_prepared_batch_inner(prepared, commit_ts, recorded_at, after_admission)?;
+        let assignment = job.assignment();
+        let metrics = job.finish()?;
+        if let Err(error) = self.wait_durable(assignment.segment_ticket) {
+            self.coordinator.poison();
+            return Err(error);
+        }
+
+        let frontier = self.frontier.lock();
+        let commit = WalV8LeaderCommit {
+            ticket: assignment.segment_ticket,
+            first_data_offset: assignment.first_data_offset,
+            frontier: frontier.frontier,
+            frontier_offset: frontier.offset,
+            frontier_digest: frontier.digest,
+        };
+        Ok((commit, metrics))
+    }
+
+    /// Admit one batch and return its producer job without doing payload-sized
+    /// encoding or I/O. The caller can release the MVCC sequencer before
+    /// finishing this job, allowing later tickets to be admitted concurrently.
+    pub(crate) fn admit_prepared_batch<'a>(
+        &self,
+        prepared: WalV8PreparedBatch<'a>,
+        commit_ts: u64,
+        recorded_at: crate::pitr::RecordedAt,
+    ) -> Result<WalV8FrameJob<'a>> {
+        self.admit_prepared_batch_inner(prepared, commit_ts, recorded_at, || {})
+    }
+
+    fn admit_prepared_batch_inner<'a, F>(
+        &self,
+        prepared: WalV8PreparedBatch<'a>,
+        commit_ts: u64,
+        recorded_at: crate::pitr::RecordedAt,
+        after_admission: F,
+    ) -> Result<WalV8FrameJob<'a>>
+    where
+        F: FnOnce(),
+    {
         ensure!(!self.is_poisoned(), "v8 Parallel WAL is poisoned");
         let logical_bytes = u64::try_from(prepared.logical_batch_bytes())?;
         let frame_bytes = u64::try_from(prepared.frame_buffer_bytes())?;
@@ -879,7 +1036,7 @@ impl WalV8ParallelWriter {
         // Allocate buffers and handles before publishing the ticket. Once
         // admission succeeds, every resource required to finish is already
         // owned by this producer.
-        let mut data_buffer = DirectBuf::new(prepared.frame_buffer_bytes());
+        let data_buffer = DirectBuf::new(prepared.frame_buffer_bytes());
         let write_file = self
             .write_file
             .try_clone()
@@ -901,60 +1058,14 @@ impl WalV8ParallelWriter {
             }
         }
         after_admission();
-
-        let mut encoded = match admitted.encode() {
-            Ok(encoded) => encoded,
-            Err(error) => {
-                self.coordinator.poison();
-                return Err(error);
-            }
-        };
-        let digest_ready = encoded.digest_ready()?;
-        #[cfg(feature = "bench")]
-        let ordered_link_hash_cpu_ns = self.coordinator.mark_digest_ready_with_cpu(digest_ready)?;
-        #[cfg(not(feature = "bench"))]
-        self.coordinator.mark_digest_ready(digest_ready)?;
-        let data_len = encoded.encode_data_frames_into(data_buffer.as_mut_slice())?;
-        ensure!(
-            data_len == data_buffer.cap(),
-            "v8 DATA materializer returned an unexpected frame length"
-        );
-        data_buffer.set_len(data_len);
-        self.coordinator
-            .mark_frames_ready(assignment.segment_ticket)?;
-        write_aligned_once(
-            &write_file,
-            data_buffer.initialized_slice(0, data_len),
-            assignment.first_data_offset,
-        )
-        .context("write v8 Parallel DATA frames")?;
-        self.coordinator
-            .mark_data_complete(assignment.segment_ticket)?;
-        drop(data_buffer);
-
-        if let Err(error) = self.advance_frontier_through(assignment.segment_ticket) {
-            self.coordinator.poison();
-            return Err(error);
-        }
-        encoded.disarm_after_durable();
-
-        let frontier = self.frontier.lock();
-        let commit = WalV8LeaderCommit {
-            ticket: assignment.segment_ticket,
-            first_data_offset: assignment.first_data_offset,
-            frontier: frontier.frontier,
-            frontier_offset: frontier.offset,
-            frontier_digest: frontier.digest,
-        };
-        #[cfg(feature = "bench")]
-        let mut metrics = encoded.digest_metrics();
-        #[cfg(feature = "bench")]
-        {
-            metrics.ordered_link_hash_cpu_ns = ordered_link_hash_cpu_ns;
-        }
-        #[cfg(not(feature = "bench"))]
-        let metrics = digest::WalV8DigestMetrics;
-        Ok((commit, metrics))
+        Ok(WalV8FrameJob {
+            admitted: Some(admitted),
+            assignment,
+            coordinator: self.coordinator.clone(),
+            producer_guards: Arc::clone(&self.producer_guards),
+            write_file,
+            data_buffer,
+        })
     }
 
     fn advance_frontier_through(&self, ticket: u64) -> Result<()> {
@@ -1006,6 +1117,7 @@ impl WalV8ParallelWriter {
                 .checked_add(FRAME_LEN_U64)
                 .context("v8 previous FRONTIER end overflows")?;
             let reservation = self.coordinator.reserve_frontier(frontier_ticket_end)?;
+            let mut cycle_guard = WalV8FrontierCycleGuard::new(&self.coordinator);
             let durable_end = last_data_end.max(previous_frontier_end);
             ensure!(
                 previous_frontier_end <= durable_end
@@ -1049,9 +1161,11 @@ impl WalV8ParallelWriter {
 
             self.retire_frontier_resources(first_ticket, frontier_ticket_end)?;
             self.coordinator.publish_durable_frontier(reservation)?;
+            self.retire_frontier_guards(first_ticket, frontier_ticket_end)?;
             previous.frontier = frontier;
             previous.offset = reservation.frame_offset;
             previous.digest = frontier_digest;
+            cycle_guard.complete();
         }
     }
 
@@ -1085,6 +1199,26 @@ impl WalV8ParallelWriter {
         Ok(())
     }
 
+    fn retire_frontier_guards(&self, first_ticket: u64, ticket_end: u64) -> Result<()> {
+        let mut guards = self.producer_guards.lock();
+        let tickets: Vec<u64> = guards
+            .range(first_ticket..ticket_end)
+            .map(|(&ticket, _)| ticket)
+            .collect();
+        let expected = usize::try_from(ticket_end - first_ticket)?;
+        ensure!(
+            tickets.len() == expected,
+            "v8 Parallel durable prefix is missing producer guards"
+        );
+        for ticket in tickets {
+            let mut encoded = guards
+                .remove(&ticket)
+                .context("v8 Parallel producer guard disappeared")?;
+            encoded.disarm_after_durable();
+        }
+        Ok(())
+    }
+
     pub(crate) fn sync(&self) -> Result<()> {
         ensure!(!self.is_poisoned(), "v8 Parallel WAL is poisoned");
         let ticket_end = self.coordinator.next_ticket();
@@ -1096,6 +1230,26 @@ impl WalV8ParallelWriter {
             return Err(error);
         }
         Ok(())
+    }
+
+    pub(crate) fn wait_durable(&self, ticket: u64) -> Result<()> {
+        ensure!(!self.is_poisoned(), "v8 Parallel WAL is poisoned");
+        ensure!(
+            ticket < self.coordinator.next_ticket(),
+            "v8 Parallel durability wait names an unassigned ticket"
+        );
+        if self.coordinator.durable_ticket_end() > ticket {
+            return Ok(());
+        }
+        if let Err(error) = self.advance_frontier_through(ticket) {
+            self.coordinator.poison();
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn next_ticket(&self) -> u64 {
+        self.coordinator.next_ticket()
     }
 
     pub(crate) fn is_poisoned(&self) -> bool {

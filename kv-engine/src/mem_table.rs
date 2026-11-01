@@ -1720,7 +1720,7 @@ impl MemTable {
             .try_clone()
             .context("clone installed v8 Active WAL sync handle")?;
         let (writer, reservation_owner) = create_writer(write_file, sync_file, &installed)?;
-        ret.wal = Some(Wal::from_v8_leader(writer, &installed)?);
+        ret.wal = Some(Wal::from_v8_parallel(writer.into_parallel(), &installed)?);
         ret.wal_v8_reservation_owner = reservation_owner;
         ret.wal_path = Some(path);
         ret.last_ticket
@@ -2381,38 +2381,50 @@ impl MemTable {
         wal.preflight_v8_leader_batch(batch, limits)
     }
 
-    /// Admit a preflighted v8 batch with sequencer-allocated metadata and wait
-    /// for its embedded FRONTIER and WAL sync before returning.
-    pub(crate) fn admit_prepared_v8_pitr_wal_batch_only(
+    /// Admit a preflighted v8 batch with sequencer-allocated metadata. The
+    /// returned producer job must be finished after releasing the MVCC
+    /// sequencer, before waiting for the ticket's durability.
+    pub(crate) fn admit_prepared_v8_pitr_wal_batch_only<'a>(
         &self,
-        prepared: crate::wal::v8::leader::WalV8PreparedBatch<'_>,
+        prepared: crate::wal::v8::leader::WalV8PreparedBatch<'a>,
         commit_ts: u64,
         recorded_at: crate::pitr::RecordedAt,
-    ) -> Result<Option<u64>> {
+    ) -> Result<(
+        Option<u64>,
+        Option<crate::wal::v8::leader::WalV8FrameJob<'a>>,
+    )> {
         let wal = self
             .wal
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("PITR WAL is not configured"))?;
         anyhow::ensure!(wal.is_v8(), "prepared v8 batch requires a v8 WAL");
-        #[cfg(feature = "bench")]
-        let started = Instant::now();
-        #[cfg(feature = "bench")]
-        let (ticket, digest_metrics) =
-            wal.put_v8_prepared_leader_batch(prepared, commit_ts, recorded_at)?;
-        #[cfg(not(feature = "bench"))]
-        let (ticket, _) = wal.put_v8_prepared_leader_batch(prepared, commit_ts, recorded_at)?;
-        #[cfg(feature = "bench")]
-        self.write_profile
-            .load()
-            .record_wal_v8_digest_metrics(digest_metrics);
+        let (ticket, frame_job) =
+            wal.admit_v8_prepared_parallel_batch(prepared, commit_ts, recorded_at)?;
         self.last_ticket
             .fetch_max(ticket + 1, std::sync::atomic::Ordering::Release);
+        Ok((Some(ticket), Some(frame_job)))
+    }
+
+    pub(crate) fn finish_v8_frame_job(
+        &self,
+        frame_job: crate::wal::v8::leader::WalV8FrameJob<'_>,
+    ) -> Result<()> {
         #[cfg(feature = "bench")]
-        self.write_profile.load().wal_write_ns.fetch_add(
-            started.elapsed().as_nanos() as u64,
-            std::sync::atomic::Ordering::Relaxed,
-        );
-        Ok(Some(ticket))
+        let started = Instant::now();
+        let digest_metrics = frame_job.finish()?;
+        #[cfg(feature = "bench")]
+        {
+            self.write_profile
+                .load()
+                .record_wal_v8_digest_metrics(digest_metrics);
+            self.write_profile.load().wal_write_ns.fetch_add(
+                started.elapsed().as_nanos() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
+        #[cfg(not(feature = "bench"))]
+        let _ = digest_metrics;
+        Ok(())
     }
 
     /// Prepare a v7 Parallel point batch before entering the MVCC sequencer.
@@ -4601,6 +4613,7 @@ mod tests {
         assert_eq!(max_ts, 0);
         assert!(memtable.uses_pitr_batch_wal());
         assert!(memtable.uses_v8_wal());
+        assert!(memtable.wal.as_ref().is_some_and(|wal| wal.is_parallel()));
         assert_eq!(memtable.wal_batch_count(), Some(0));
         let (empty, current) = memtable.v8_active_boundaries()?;
         assert_eq!(empty, empty_anchor);
@@ -4749,6 +4762,12 @@ mod tests {
             memtable.commit_wal_ticket(ticket)?;
         }
         assert_eq!(fs::metadata(&path)?.len(), 64 * 1024);
+        let mvcc = LsmMvccInner::new(7);
+        assert!(mvcc.write_wal_only(b"next", b"value", &memtable).is_err());
+        assert!(memtable.pitr_rotation_needed());
+        let retry_commit_ts = mvcc.reserve_commit_ts()?;
+        assert_eq!(retry_commit_ts, 9);
+        mvcc.retire_commit_ts(retry_commit_ts);
         let (_, current_anchor) = memtable.v8_active_boundaries()?;
         drop(memtable);
 
@@ -4790,44 +4809,67 @@ mod tests {
                 )?;
                 let mvcc = LsmMvccInner::new(max_ts);
                 failpoint::cfg("wal.v8.leader.fdatasync", action).expect("arm v8 sync failure");
-                let result = catch_unwind(AssertUnwindSafe(|| match operation {
-                    "put" => mvcc.write_wal_only(b"key", b"value", &memtable).map(|_| ()),
-                    "delete" => mvcc.write_tombstone_wal_only(b"key", &memtable).map(|_| ()),
-                    "ttl" => mvcc
-                        .write_ttl_wal_only(
-                            b"key",
-                            b"value",
-                            std::time::Duration::from_secs(60),
-                            &memtable,
-                        )
-                        .map(|_| ()),
-                    "ranges" => mvcc
-                        .write_range_batch_wal_only(&[(b"a", b"z")], &memtable)
-                        .map(|_| ()),
-                    "batch" => mvcc
-                        .write_batch_wal_only(
-                            &[(
-                                Bytes::from_static(b"key"),
-                                Bytes::from_static(b"value"),
-                                BatchEntryKind::PutRaw,
-                            )],
-                            &memtable,
-                            false,
-                        )
-                        .map(|_| ()),
-                    "deletes" => mvcc
-                        .write_delete_batch_wal_only(
-                            &[Bytes::from_static(b"key")],
-                            &memtable,
-                            false,
-                        )
-                        .map(|_| ()),
-                    _ => unreachable!(),
+                let mut admitted_commit_ts = None;
+                let result = catch_unwind(AssertUnwindSafe(|| {
+                    let append_result = match operation {
+                        "put" => mvcc
+                            .write_wal_only(b"key", b"value", &memtable)
+                            .map(|(commit_ts, _, _, ticket)| (commit_ts, ticket)),
+                        "delete" => mvcc
+                            .write_tombstone_wal_only(b"key", &memtable)
+                            .map(|(commit_ts, _, _, ticket)| (commit_ts, ticket)),
+                        "ttl" => mvcc
+                            .write_ttl_wal_only(
+                                b"key",
+                                b"value",
+                                std::time::Duration::from_secs(60),
+                                &memtable,
+                            )
+                            .map(|(commit_ts, _, _, ticket)| (commit_ts, ticket)),
+                        "ranges" => mvcc
+                            .write_range_batch_wal_only(&[(b"a", b"z")], &memtable)
+                            .map(|(commit_ts, ticket)| (commit_ts, ticket)),
+                        "batch" => mvcc
+                            .write_batch_wal_only(
+                                &[(
+                                    Bytes::from_static(b"key"),
+                                    Bytes::from_static(b"value"),
+                                    BatchEntryKind::PutRaw,
+                                )],
+                                &memtable,
+                                false,
+                            )
+                            .map(|(commit_ts, _, ticket)| (commit_ts, ticket)),
+                        "deletes" => mvcc
+                            .write_delete_batch_wal_only(
+                                &[Bytes::from_static(b"key")],
+                                &memtable,
+                                false,
+                            )
+                            .map(|(commit_ts, _, ticket)| (commit_ts, ticket)),
+                        _ => unreachable!(),
+                    };
+                    append_result.and_then(|(commit_ts, ticket)| {
+                        admitted_commit_ts = Some(commit_ts);
+                        if let Err(error) = memtable.commit_wal_ticket(ticket) {
+                            mvcc.poison_commit_ts(commit_ts);
+                            Err(error)
+                        } else {
+                            Ok(())
+                        }
+                    })
                 }));
                 scenario.teardown();
+                assert!(
+                    memtable.versioned_wal_requires_recovery(),
+                    "{operation}/{action} must poison the uncertain v8 frontier cycle"
+                );
 
                 if action == "panic" {
                     assert!(result.is_err(), "{operation} must unwind at the v8 sync");
+                    mvcc.poison_commit_ts(
+                        admitted_commit_ts.expect("sync failpoint ran after WAL admission"),
+                    );
                 } else {
                     let error = result
                         .expect("v8 sync returns an error")

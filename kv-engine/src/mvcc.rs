@@ -35,6 +35,11 @@ const PUBLICATION_DISTANCE_THRESHOLD: u64 = 16;
 const DRAIN_RECHECK: std::time::Duration = std::time::Duration::from_millis(1);
 type WalPublish = (u64, Vec<u8>, Vec<u8>, Option<u64>);
 
+enum VersionedWalFrameJob<'a> {
+    V7(Box<crate::wal::WalV7FrameJob>),
+    V8(Box<crate::wal::v8::leader::WalV8FrameJob<'a>>),
+}
+
 /// A caught versioned-WAL panic cannot leave an outstanding reservation without closing
 /// admission. The synchronous append may already have written or synced its
 /// batch, so conservatively require recovery even if the panic preceded I/O.
@@ -558,9 +563,35 @@ impl LsmMvccInner {
         Ok(())
     }
 
-    /// The serial v7 and v8 adapters include their sync in append. An error after
-    /// admission can therefore leave a recoverable batch, just like a failed
-    /// ticket barrier; only a pre-admission rejection can retire a data-free gap.
+    fn finish_v8_frame_job(
+        &self,
+        memtable: &MemTable,
+        commit_ts: u64,
+        frame_job: crate::wal::v8::leader::WalV8FrameJob<'_>,
+    ) -> anyhow::Result<()> {
+        if let Err(error) = memtable.finish_v8_frame_job(frame_job) {
+            self.record_wal_append_failure(memtable, commit_ts);
+            return Err(error);
+        }
+
+        Ok(())
+    }
+
+    fn finish_versioned_frame_job(
+        &self,
+        memtable: &MemTable,
+        commit_ts: u64,
+        frame_job: VersionedWalFrameJob<'_>,
+    ) -> anyhow::Result<()> {
+        match frame_job {
+            VersionedWalFrameJob::V7(job) => self.finish_v7_frame_job(memtable, commit_ts, *job),
+            VersionedWalFrameJob::V8(job) => self.finish_v8_frame_job(memtable, commit_ts, *job),
+        }
+    }
+
+    /// A versioned producer failure after admission can leave a recoverable batch,
+    /// just like a failed ticket barrier; only a pre-admission rejection can
+    /// retire a data-free gap.
     fn record_wal_append_failure(&self, memtable: &MemTable, commit_ts: u64) {
         if memtable.versioned_wal_requires_recovery() {
             self.poison_commit_ts(commit_ts);
@@ -787,6 +818,9 @@ impl LsmMvccInner {
             !(value.len() == 1 && value[0] == crate::vlog::KvKind::Tombstone as u8),
             "value must not be the tombstone marker byte (0x02)"
         );
+        if memtable.uses_v8_wal() {
+            return self.write_v8_parallel_wal_only(user_key, value, memtable);
+        }
         if memtable.uses_v7_wal() && memtable.uses_parallel_wal() {
             return self.write_v7_parallel_wal_only(user_key, value, memtable);
         }
@@ -825,6 +859,53 @@ impl LsmMvccInner {
         // Do NOT advance current_ts here — readers would see the timestamp
         // before the data is published to the skiplist. The caller must
         // advance current_ts after commit_wal_ticket + publish_raw_batch succeed.
+
+        Ok((commit_ts, encoded_key, prefixed, ticket))
+    }
+
+    /// Preflight v8 canonical bytes before taking the sequencer, then release
+    /// it immediately after ticket admission so producer hashing and DATA I/O
+    /// can overlap with later commits.
+    fn write_v8_parallel_wal_only(
+        &self,
+        user_key: &[u8],
+        value: &[u8],
+        memtable: &MemTable,
+    ) -> Result<WalPublish, anyhow::Error> {
+        let mut prefixed = Vec::with_capacity(1 + value.len());
+        prefixed.push(crate::vlog::KvKind::Inline as u8);
+        prefixed.extend_from_slice(value);
+        let batch = crate::pitr::WalBatch {
+            commit_ts: 1,
+            recorded_at: crate::pitr::RecordedAt { secs: 0, nanos: 0 },
+            entries: vec![crate::pitr::WalEntry::Put {
+                key: user_key.to_vec(),
+                value: prefixed.clone(),
+            }],
+        };
+        let prepared =
+            memtable.prepare_v8_pitr_wal_batch(&batch, crate::pitr::LIVE_WAL_V5_LIMITS)?;
+
+        let write_guard = self.write_lock.lock();
+        let commit_ts = self.reserve_commit_ts()?;
+        let _unwind_guard = self.guard_versioned_commit_unwind(memtable, commit_ts);
+        let encoded_key = encode_internal_key(user_key, commit_ts);
+        let recorded_at = self.pitr_recorded_at_for_commit(commit_ts)?;
+        let (ticket, frame_job) = match memtable.admit_prepared_v8_pitr_wal_batch_only(
+            prepared,
+            commit_ts,
+            recorded_at,
+        ) {
+            Ok((ticket, frame_job)) => (ticket, frame_job),
+            Err(error) => {
+                self.record_wal_append_failure(memtable, commit_ts);
+                return Err(error);
+            }
+        };
+        drop(write_guard);
+        if let Some(frame_job) = frame_job {
+            self.finish_v8_frame_job(memtable, commit_ts, frame_job)?;
+        }
 
         Ok((commit_ts, encoded_key, prefixed, ticket))
     }
@@ -904,19 +985,31 @@ impl LsmMvccInner {
             let recorded_at = self.pitr_recorded_at_for_commit(commit_ts)?;
             memtable
                 .admit_prepared_v8_pitr_wal_batch_only(prepared, commit_ts, recorded_at)
-                .map(|ticket| (ticket, None))
+                .map(|(ticket, frame_job)| {
+                    (
+                        ticket,
+                        frame_job.map(|job| VersionedWalFrameJob::V8(Box::new(job))),
+                    )
+                })
         } else if memtable.uses_pitr_batch_wal() {
             let recorded_at = self.pitr_recorded_at_for_commit(commit_ts)?;
-            memtable.admit_pitr_wal_batch_only(
-                &crate::pitr::WalBatch {
-                    commit_ts,
-                    recorded_at,
-                    entries: vec![crate::pitr::WalEntry::PointDelete {
-                        key: user_key.to_vec(),
-                    }],
-                },
-                crate::pitr::LIVE_WAL_V5_LIMITS,
-            )
+            memtable
+                .admit_pitr_wal_batch_only(
+                    &crate::pitr::WalBatch {
+                        commit_ts,
+                        recorded_at,
+                        entries: vec![crate::pitr::WalEntry::PointDelete {
+                            key: user_key.to_vec(),
+                        }],
+                    },
+                    crate::pitr::LIVE_WAL_V5_LIMITS,
+                )
+                .map(|(ticket, frame_job)| {
+                    (
+                        ticket,
+                        frame_job.map(|job| VersionedWalFrameJob::V7(Box::new(job))),
+                    )
+                })
         } else {
             memtable
                 .write_wal_batch_only(&[(
@@ -933,7 +1026,7 @@ impl LsmMvccInner {
         };
         if let Some(frame_job) = frame_job {
             drop(_write_guard);
-            self.finish_v7_frame_job(memtable, commit_ts, frame_job)?;
+            self.finish_versioned_frame_job(memtable, commit_ts, frame_job)?;
         }
         // Do NOT advance current_ts here — see write_wal_only comment.
 
@@ -955,42 +1048,59 @@ impl LsmMvccInner {
             !(value.len() == 1 && value[0] == crate::vlog::KvKind::Tombstone as u8),
             "value must not be the tombstone marker byte (0x02)"
         );
+        let expire_at = crate::vlog::compute_expire_at(ttl);
+        let prefixed =
+            crate::vlog::encode_ttl_value(crate::vlog::KvKind::TtlInline, expire_at, value);
+        let v8_batch = memtable.uses_v8_wal().then(|| crate::pitr::WalBatch {
+            commit_ts: 1,
+            recorded_at: crate::pitr::RecordedAt { secs: 0, nanos: 0 },
+            entries: vec![crate::pitr::WalEntry::Put {
+                key: user_key.to_vec(),
+                value: prefixed.clone(),
+            }],
+        });
+        let prepared_v8 = v8_batch
+            .as_ref()
+            .map(|batch| memtable.prepare_v8_pitr_wal_batch(batch, crate::pitr::LIVE_WAL_V5_LIMITS))
+            .transpose()?;
         let _write_guard = self.write_lock.lock();
         let commit_ts = self.reserve_commit_ts()?;
         let _unwind_guard = self.guard_versioned_commit_unwind(memtable, commit_ts);
         let encoded_key = encode_internal_key(user_key, commit_ts);
-        let expire_at = crate::vlog::compute_expire_at(ttl);
-        let prefixed =
-            crate::vlog::encode_ttl_value(crate::vlog::KvKind::TtlInline, expire_at, value);
         let (ticket, frame_job) = match if memtable.uses_v8_wal() {
             let recorded_at = self.pitr_recorded_at_for_commit(commit_ts)?;
-            let batch = crate::pitr::WalBatch {
-                commit_ts: 1,
-                recorded_at: crate::pitr::RecordedAt { secs: 0, nanos: 0 },
-                entries: vec![crate::pitr::WalEntry::Put {
-                    key: user_key.to_vec(),
-                    value: prefixed.clone(),
-                }],
-            };
-            match memtable.prepare_v8_pitr_wal_batch(&batch, crate::pitr::LIVE_WAL_V5_LIMITS) {
-                Ok(prepared) => memtable
-                    .admit_prepared_v8_pitr_wal_batch_only(prepared, commit_ts, recorded_at)
-                    .map(|ticket| (ticket, None)),
-                Err(error) => Err(error),
-            }
-        } else if memtable.uses_pitr_batch_wal() {
-            let recorded_at = self.pitr_recorded_at_for_commit(commit_ts)?;
-            memtable.admit_pitr_wal_batch_only(
-                &crate::pitr::WalBatch {
+            memtable
+                .admit_prepared_v8_pitr_wal_batch_only(
+                    prepared_v8.expect("v8 WAL batch was prepared before the sequencer"),
                     commit_ts,
                     recorded_at,
-                    entries: vec![crate::pitr::WalEntry::Put {
-                        key: user_key.to_vec(),
-                        value: prefixed.clone(),
-                    }],
-                },
-                crate::pitr::LIVE_WAL_V5_LIMITS,
-            )
+                )
+                .map(|(ticket, frame_job)| {
+                    (
+                        ticket,
+                        frame_job.map(|job| VersionedWalFrameJob::V8(Box::new(job))),
+                    )
+                })
+        } else if memtable.uses_pitr_batch_wal() {
+            let recorded_at = self.pitr_recorded_at_for_commit(commit_ts)?;
+            memtable
+                .admit_pitr_wal_batch_only(
+                    &crate::pitr::WalBatch {
+                        commit_ts,
+                        recorded_at,
+                        entries: vec![crate::pitr::WalEntry::Put {
+                            key: user_key.to_vec(),
+                            value: prefixed.clone(),
+                        }],
+                    },
+                    crate::pitr::LIVE_WAL_V5_LIMITS,
+                )
+                .map(|(ticket, frame_job)| {
+                    (
+                        ticket,
+                        frame_job.map(|job| VersionedWalFrameJob::V7(Box::new(job))),
+                    )
+                })
         } else {
             memtable
                 .write_wal_batch_only(&[(
@@ -1007,7 +1117,7 @@ impl LsmMvccInner {
         };
         if let Some(frame_job) = frame_job {
             drop(_write_guard);
-            self.finish_v7_frame_job(memtable, commit_ts, frame_job)?;
+            self.finish_versioned_frame_job(memtable, commit_ts, frame_job)?;
         }
 
         Ok((commit_ts, encoded_key, prefixed, ticket))
@@ -1058,7 +1168,12 @@ impl LsmMvccInner {
             let recorded_at = self.pitr_recorded_at_for_commit(commit_ts)?;
             memtable
                 .admit_prepared_v8_pitr_wal_batch_only(prepared, commit_ts, recorded_at)
-                .map(|ticket| (ticket, None))
+                .map(|(ticket, frame_job)| {
+                    (
+                        ticket,
+                        frame_job.map(|job| VersionedWalFrameJob::V8(Box::new(job))),
+                    )
+                })
         } else if memtable.uses_pitr_batch_wal() {
             let recorded_at = self.pitr_recorded_at_for_commit(commit_ts)?;
             let mut wal_entries = Vec::with_capacity(entries.len());
@@ -1068,14 +1183,21 @@ impl LsmMvccInner {
                     end: (*end).to_vec(),
                 });
             }
-            memtable.admit_pitr_wal_batch_only(
-                &crate::pitr::WalBatch {
-                    commit_ts,
-                    recorded_at,
-                    entries: wal_entries,
-                },
-                crate::pitr::LIVE_WAL_V5_LIMITS,
-            )
+            memtable
+                .admit_pitr_wal_batch_only(
+                    &crate::pitr::WalBatch {
+                        commit_ts,
+                        recorded_at,
+                        entries: wal_entries,
+                    },
+                    crate::pitr::LIVE_WAL_V5_LIMITS,
+                )
+                .map(|(ticket, frame_job)| {
+                    (
+                        ticket,
+                        frame_job.map(|job| VersionedWalFrameJob::V7(Box::new(job))),
+                    )
+                })
         } else {
             memtable
                 .put_range_tombstone_batch_wal_only(entries, commit_ts, 0)
@@ -1089,7 +1211,7 @@ impl LsmMvccInner {
         };
         if let Some(frame_job) = frame_job {
             drop(_write_guard);
-            self.finish_v7_frame_job(memtable, commit_ts, frame_job)?;
+            self.finish_versioned_frame_job(memtable, commit_ts, frame_job)?;
         }
         // Do NOT advance current_ts here — see write_wal_only comment.
 
@@ -1362,11 +1484,23 @@ impl LsmMvccInner {
                 let recorded_at = self.pitr_recorded_at_for_commit(commit_ts)?;
                 memtable
                     .admit_prepared_v8_pitr_wal_batch_only(prepared, commit_ts, recorded_at)
-                    .map(|ticket| (ticket, None))
+                    .map(|(ticket, frame_job)| {
+                        (
+                            ticket,
+                            frame_job.map(|job| VersionedWalFrameJob::V8(Box::new(job))),
+                        )
+                    })
             } else if let Some(prepared) = prepared_v7 {
                 let recorded_at = v7_sampled_recorded_at
                     .expect("prepared v7 batch has a preflighted recorded time");
-                memtable.admit_prepared_v7_pitr_wal_batch_only(prepared, commit_ts, recorded_at)
+                memtable
+                    .admit_prepared_v7_pitr_wal_batch_only(prepared, commit_ts, recorded_at)
+                    .map(|(ticket, frame_job)| {
+                        (
+                            ticket,
+                            frame_job.map(|job| VersionedWalFrameJob::V7(Box::new(job))),
+                        )
+                    })
             } else {
                 let recorded_at = self.pitr_recorded_at_for_commit(commit_ts)?;
                 let wal_entries = entries
@@ -1393,14 +1527,21 @@ impl LsmMvccInner {
                         }
                     })
                     .collect();
-                memtable.admit_pitr_wal_batch_only(
-                    &crate::pitr::WalBatch {
-                        commit_ts,
-                        recorded_at,
-                        entries: wal_entries,
-                    },
-                    crate::pitr::LIVE_WAL_V5_LIMITS,
-                )
+                memtable
+                    .admit_pitr_wal_batch_only(
+                        &crate::pitr::WalBatch {
+                            commit_ts,
+                            recorded_at,
+                            entries: wal_entries,
+                        },
+                        crate::pitr::LIVE_WAL_V5_LIMITS,
+                    )
+                    .map(|(ticket, frame_job)| {
+                        (
+                            ticket,
+                            frame_job.map(|job| VersionedWalFrameJob::V7(Box::new(job))),
+                        )
+                    })
             };
             let (ticket, frame_job) = match ticket_result {
                 Ok(ticket) => ticket,
@@ -1417,7 +1558,7 @@ impl LsmMvccInner {
             };
             if let Some(frame_job) = frame_job {
                 drop(_write_guard);
-                self.finish_v7_frame_job(memtable, commit_ts, frame_job)?;
+                self.finish_versioned_frame_job(memtable, commit_ts, frame_job)?;
             }
             #[cfg(all(test, feature = "chaos-testing"))]
             if let Some(ticket) = small_v7_ticket {
@@ -1523,19 +1664,31 @@ impl LsmMvccInner {
             let ticket_result = if let Some(prepared) = prepared_v8 {
                 memtable
                     .admit_prepared_v8_pitr_wal_batch_only(prepared, commit_ts, recorded_at)
-                    .map(|ticket| (ticket, None))
+                    .map(|(ticket, frame_job)| {
+                        (
+                            ticket,
+                            frame_job.map(|job| VersionedWalFrameJob::V8(Box::new(job))),
+                        )
+                    })
             } else {
-                memtable.admit_pitr_wal_batch_only(
-                    &crate::pitr::WalBatch {
-                        commit_ts,
-                        recorded_at,
-                        entries: keys
-                            .iter()
-                            .map(|key| crate::pitr::WalEntry::PointDelete { key: key.to_vec() })
-                            .collect(),
-                    },
-                    crate::pitr::LIVE_WAL_V5_LIMITS,
-                )
+                memtable
+                    .admit_pitr_wal_batch_only(
+                        &crate::pitr::WalBatch {
+                            commit_ts,
+                            recorded_at,
+                            entries: keys
+                                .iter()
+                                .map(|key| crate::pitr::WalEntry::PointDelete { key: key.to_vec() })
+                                .collect(),
+                        },
+                        crate::pitr::LIVE_WAL_V5_LIMITS,
+                    )
+                    .map(|(ticket, frame_job)| {
+                        (
+                            ticket,
+                            frame_job.map(|job| VersionedWalFrameJob::V7(Box::new(job))),
+                        )
+                    })
             };
             let (ticket, frame_job) = match ticket_result {
                 Ok(ticket) => ticket,
@@ -1546,7 +1699,7 @@ impl LsmMvccInner {
             };
             if let Some(frame_job) = frame_job {
                 drop(_write_guard);
-                self.finish_v7_frame_job(memtable, commit_ts, frame_job)?;
+                self.finish_versioned_frame_job(memtable, commit_ts, frame_job)?;
             }
             let publish_data = if shared_publish_bytes {
                 DeferredBatchPublish::from_entries_without_refs(publish_data)

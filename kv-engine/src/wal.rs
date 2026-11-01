@@ -475,9 +475,10 @@ pub struct Wal {
     /// Serial v7 writer. Each append performs DATA + FRONTIER + one WAL sync
     /// before returning, so its completion watermark is already durable.
     v7_leader: Option<Mutex<WalV7LeaderWriter>>,
-    /// Staged v8 serial writer, used only to resume a recovered Active image.
-    /// Format registration keeps ordinary v8 creation and selection disabled.
+    /// V8 Leader control writer, retained for serialized comparisons.
     v8_leader: Option<Mutex<v8::leader::WalV8LeaderWriter>>,
+    /// Concurrent v8 writer for the embedded-frontier Parallel pipeline.
+    v8_parallel: Option<v8::leader::WalV8ParallelWriter>,
     /// Whether this WAL uses v3 typed entries (kind prefix).
     /// Only meaningful when `mvcc_format` is true. When false, the WAL uses v2
     /// untyped entries. Preserved from recovery so appended records match the
@@ -816,6 +817,7 @@ impl Wal {
                 parallel_runtime,
                 v7_leader: None,
                 v8_leader: None,
+                v8_parallel: None,
                 is_v3,
                 direct_file: Some(direct_file),
                 ring: Mutex::new(ring),
@@ -848,6 +850,7 @@ impl Wal {
                 parallel_runtime: None,
                 v7_leader: None,
                 v8_leader: None,
+                v8_parallel: None,
                 is_v3,
                 direct_file: None,
                 ring: Mutex::new(None),
@@ -1186,6 +1189,7 @@ impl Wal {
             parallel_runtime,
             v7_leader: None,
             v8_leader: None,
+            v8_parallel: None,
             is_v3: true,
             direct_file: Some(direct_file),
             ring: Mutex::new(ring),
@@ -1244,6 +1248,7 @@ impl Wal {
             parallel_runtime: None,
             v7_leader: None,
             v8_leader: None,
+            v8_parallel: None,
             is_v3: true,
             direct_file: Some(direct_file),
             ring: Mutex::new(Some(ring)),
@@ -1289,6 +1294,7 @@ impl Wal {
             parallel_runtime: None,
             v7_leader: Some(Mutex::new(writer)),
             v8_leader: None,
+            v8_parallel: None,
             is_v3: true,
             direct_file: None,
             ring: Mutex::new(None),
@@ -1315,6 +1321,7 @@ impl Wal {
     /// Attach the serial v8 writer after an Active image has been recovered
     /// and installed. High-level LSM recovery uses this adapter to resume
     /// serial appends while the format registry still disables v8 creation.
+    #[allow(dead_code)]
     pub(crate) fn from_v8_leader(
         writer: v8::leader::WalV8LeaderWriter,
         installed: &v8::install::WalV8InstalledRecovery,
@@ -1339,6 +1346,56 @@ impl Wal {
             parallel_runtime: None,
             v7_leader: None,
             v8_leader: Some(Mutex::new(writer)),
+            v8_parallel: None,
+            is_v3: true,
+            direct_file: None,
+            ring: Mutex::new(None),
+            direct_buf_pool: Self::new_direct_buf_pool(false),
+            pending: Mutex::new(Vec::new()),
+            next_ticket: AtomicU64::new(next_ticket),
+            alloc_offset: AtomicU64::new(append_offset),
+            preallocated_size: AtomicU64::new(append_offset),
+            completion_state: CompletionState::with_durable_ticket(next_ticket),
+            submitting: AtomicBool::new(false),
+            #[cfg(feature = "bench")]
+            last_release_ns: AtomicU64::new(0),
+            poisoned: AtomicBool::new(false),
+            pitr_max_segment_bytes: AtomicU64::new(u64::MAX),
+            pitr_max_unarchived_bytes: AtomicU64::new(u64::MAX),
+            pitr_segment_start: AtomicU64::new(data_start),
+            pitr_reserved_end: Mutex::new(append_offset),
+            pitr_rotation_needed: AtomicBool::new(false),
+            pitr_seal: None,
+            pitr_seal_append: Mutex::new(()),
+        })
+    }
+
+    /// Attach a recovered v8 Active image to the concurrent Parallel writer.
+    pub(crate) fn from_v8_parallel(
+        writer: v8::leader::WalV8ParallelWriter,
+        installed: &v8::install::WalV8InstalledRecovery,
+    ) -> Result<Self> {
+        let (_, active_boundary) = writer.active_boundaries()?;
+        ensure!(
+            active_boundary == installed.active_boundary
+                && writer.image_len()? == installed.image_len
+                && installed.next_ticket == installed.active_boundary.ticket_end,
+            "v8 Parallel runtime differs from its installed recovery boundary"
+        );
+        let buffered_file = writer.try_clone_sync_file()?;
+        let next_ticket = installed.next_ticket;
+        let append_offset = installed.image_len;
+        let data_start = u64::try_from(v8::WAL_V8_HEADER_LEN + v8::codec::WAL_V8_FRAME_LEN)?;
+
+        Ok(Self {
+            buffered_file: Arc::new(Mutex::new(BufWriter::new(buffered_file))),
+            mvcc_format: true,
+            format_version: WAL_FORMAT_VERSION_V8,
+            io_mode: WalIoMode::Parallel,
+            parallel_runtime: None,
+            v7_leader: None,
+            v8_leader: None,
+            v8_parallel: Some(writer),
             is_v3: true,
             direct_file: None,
             ring: Mutex::new(None),
@@ -1417,6 +1474,7 @@ impl Wal {
             parallel_runtime: Some(parallel_runtime),
             v7_leader: None,
             v8_leader: None,
+            v8_parallel: None,
             is_v3: true,
             direct_file: Some(direct_file),
             ring: Mutex::new(None),
@@ -1465,11 +1523,15 @@ impl Wal {
         if !self.is_v8() {
             return false;
         }
-        if self
+        let leader_poisoned = self
             .v8_leader
             .as_ref()
-            .is_some_and(|writer| writer.lock().is_poisoned())
-        {
+            .is_some_and(|writer| writer.lock().is_poisoned());
+        let parallel_poisoned = self
+            .v8_parallel
+            .as_ref()
+            .is_some_and(v8::leader::WalV8ParallelWriter::is_poisoned);
+        if leader_poisoned || parallel_poisoned {
             self.poisoned.store(true, Ordering::Release);
         }
         self.poisoned.load(Ordering::Acquire)
@@ -1484,18 +1546,24 @@ impl Wal {
         crate::pitr::manifest::ActiveBoundary,
     )> {
         ensure!(self.is_v8(), "WAL is not v8");
+        if let Some(writer) = &self.v8_parallel {
+            return writer.active_boundaries();
+        }
         self.v8_leader
             .as_ref()
-            .context("v8 WAL has no serial Active writer")?
+            .context("v8 WAL has no Active writer")?
             .lock()
             .active_boundaries()
     }
 
     pub(crate) fn v8_image_len(&self) -> Result<u64> {
         ensure!(self.is_v8(), "WAL is not v8");
+        if let Some(writer) = &self.v8_parallel {
+            return writer.image_len();
+        }
         self.v8_leader
             .as_ref()
-            .context("v8 WAL has no serial Active writer")?
+            .context("v8 WAL has no Active writer")?
             .lock()
             .image_len()
     }
@@ -1562,7 +1630,7 @@ impl Wal {
     }
 
     pub(crate) fn is_parallel(&self) -> bool {
-        self.parallel_runtime.is_some()
+        self.parallel_runtime.is_some() || self.v8_parallel.is_some()
     }
 
     #[cfg(test)]
@@ -2154,6 +2222,17 @@ impl Wal {
             !self.poisoned.load(Ordering::Acquire),
             "WAL is poisoned due to a previous I/O error"
         );
+        if let Some(writer) = &self.v8_parallel {
+            let prepared = writer.preflight_batch(batch, limits)?;
+            return match writer.append_prepared_batch(prepared, batch.commit_ts, batch.recorded_at)
+            {
+                Ok((commit, _)) => self.publish_v8_parallel_commit(writer, commit.ticket),
+                Err(error) => {
+                    self.record_v8_parallel_error(writer, &error);
+                    Err(error)
+                }
+            };
+        }
         let writer = self
             .v8_leader
             .as_ref()
@@ -2191,50 +2270,55 @@ impl Wal {
             "v8 batch preflight selected for format {}",
             self.format_version
         );
-        let writer = self
-            .v8_leader
+        if let Some(writer) = &self.v8_parallel {
+            return writer.preflight_batch(batch, limits);
+        }
+        self.v8_leader
             .as_ref()
-            .context("v8 WAL has no recovered Active writer")?;
-        writer.lock().preflight_batch(batch, limits)
+            .context("v8 WAL has no recovered Active writer")?
+            .lock()
+            .preflight_batch(batch, limits)
     }
 
-    pub(crate) fn put_v8_prepared_leader_batch(
+    pub(crate) fn admit_v8_prepared_parallel_batch<'a>(
         &self,
-        prepared: v8::leader::WalV8PreparedBatch<'_>,
+        prepared: v8::leader::WalV8PreparedBatch<'a>,
         commit_ts: u64,
         recorded_at: crate::pitr::RecordedAt,
-    ) -> Result<(u64, v8::digest::WalV8DigestMetrics)> {
+    ) -> Result<(u64, v8::leader::WalV8FrameJob<'a>)> {
+        ensure!(
+            self.format_version == WAL_FORMAT_VERSION_V8,
+            "v8 batch admission selected for format {}",
+            self.format_version
+        );
         ensure!(
             !self.poisoned.load(Ordering::Acquire),
             "WAL is poisoned due to a previous I/O error"
         );
         let writer = self
-            .v8_leader
+            .v8_parallel
             .as_ref()
-            .context("v8 WAL has no recovered Active writer")?;
-        let mut writer = writer.lock();
-        ensure!(
-            !self.poisoned.load(Ordering::Acquire),
-            "WAL is poisoned due to a previous I/O error"
-        );
-        let previous_ticket_end = self.next_ticket.load(Ordering::Acquire);
-
-        match writer.append_prepared_batch(prepared, commit_ts, recorded_at) {
-            Ok((commit, metrics)) => self
-                .publish_v8_leader_commit(previous_ticket_end, commit)
-                .map(|ticket| (ticket, metrics)),
+            .context("v8 WAL has no Parallel writer")?;
+        let job = match writer.admit_prepared_batch(prepared, commit_ts, recorded_at) {
+            Ok(job) => job,
             Err(error) => {
-                if writer.is_poisoned() {
-                    self.poisoned.store(true, Ordering::Release);
-                }
-                if error.downcast_ref::<v8::leader::WalV8LeaderCapacityError>()
-                    == Some(&v8::leader::WalV8LeaderCapacityError::RotationRequired)
-                {
-                    self.pitr_rotation_needed.store(true, Ordering::Release);
-                }
-                Err(error)
+                self.record_v8_parallel_error(writer, &error);
+                return Err(error);
             }
-        }
+        };
+        let assignment = job.assignment();
+        let data_end = assignment
+            .first_data_offset
+            .checked_add(u64::try_from(job.frame_buffer_bytes())?)
+            .context("v8 Parallel DATA allocation end overflows after admission")?;
+        self.next_ticket
+            .fetch_max(writer.next_ticket(), Ordering::Release);
+        self.alloc_offset.fetch_max(data_end, Ordering::Release);
+        self.preallocated_size
+            .fetch_max(data_end, Ordering::Release);
+        let mut reserved_end = self.pitr_reserved_end.lock();
+        *reserved_end = (*reserved_end).max(data_end);
+        Ok((assignment.segment_ticket, job))
     }
 
     fn publish_v8_leader_commit(
@@ -2264,6 +2348,63 @@ impl Wal {
             .store(ticket_end, Ordering::Release);
         self.next_ticket.store(ticket_end, Ordering::Release);
         Ok(commit.ticket)
+    }
+
+    fn publish_v8_parallel_commit(
+        &self,
+        writer: &v8::leader::WalV8ParallelWriter,
+        ticket: u64,
+    ) -> Result<u64> {
+        let result = (|| {
+            let durable_ticket_end = self.refresh_v8_parallel_cursor(writer)?;
+            ensure!(
+                ticket < durable_ticket_end,
+                "v8 Parallel append returned before its ticket became durable"
+            );
+            Ok(ticket)
+        })();
+        if result.is_err() {
+            self.poisoned.store(true, Ordering::Release);
+        }
+        result
+    }
+
+    fn refresh_v8_parallel_cursor(&self, writer: &v8::leader::WalV8ParallelWriter) -> Result<u64> {
+        let result = (|| {
+            let (_, active) = writer.active_boundaries()?;
+            let append_offset = writer.image_len()?;
+            self.alloc_offset
+                .fetch_max(append_offset, Ordering::Release);
+            self.preallocated_size
+                .fetch_max(append_offset, Ordering::Release);
+            let mut reserved_end = self.pitr_reserved_end.lock();
+            *reserved_end = (*reserved_end).max(append_offset);
+            self.completion_state
+                .durable_ticket
+                .fetch_max(active.ticket_end, Ordering::Release);
+            self.next_ticket
+                .fetch_max(writer.next_ticket(), Ordering::Release);
+            Ok(active.ticket_end)
+        })();
+        if result.is_err() {
+            self.poisoned.store(true, Ordering::Release);
+        }
+        result
+    }
+
+    fn record_v8_parallel_error(
+        &self,
+        writer: &v8::leader::WalV8ParallelWriter,
+        error: &anyhow::Error,
+    ) {
+        if writer.is_poisoned() {
+            self.poisoned.store(true, Ordering::Release);
+        }
+        if error.downcast_ref::<v8::leader::WalV8LeaderCapacityError>()
+            == Some(&v8::leader::WalV8LeaderCapacityError::RotationRequired)
+        {
+            self.pitr_rotation_needed.store(true, Ordering::Release);
+        }
     }
 
     fn publish_v7_durable_cursor(&self, ticket_end: u64, append_offset: u64) -> Result<()> {
@@ -2356,6 +2497,32 @@ impl Wal {
             );
         }
 
+        Ok(())
+    }
+
+    fn wait_for_v8_parallel(
+        &self,
+        writer: &v8::leader::WalV8ParallelWriter,
+        ticket: Option<u64>,
+    ) -> Result<()> {
+        if let Some(ticket) = ticket
+            && self.completion_state.durable_ticket.load(Ordering::Acquire) > ticket
+        {
+            return Ok(());
+        }
+        ensure!(
+            !self.poisoned.load(Ordering::Acquire),
+            "WAL is poisoned due to a previous I/O error"
+        );
+        let result = match ticket {
+            Some(ticket) => writer.wait_durable(ticket),
+            None => writer.sync(),
+        };
+        if let Err(error) = result {
+            self.record_v8_parallel_error(writer, &error);
+            return Err(error);
+        }
+        self.refresh_v8_parallel_cursor(writer)?;
         Ok(())
     }
 
@@ -3271,6 +3438,9 @@ impl Wal {
         if let Some(runtime) = &self.parallel_runtime {
             return runtime.wait_durable_async(ticket).await;
         }
+        if let Some(writer) = &self.v8_parallel {
+            return self.wait_for_v8_parallel(writer, Some(ticket));
+        }
         if let Some(writer) = &self.v8_leader {
             return self.wait_for_v8_leader(writer, Some(ticket));
         }
@@ -3412,7 +3582,7 @@ impl Wal {
 
     /// Durably sync the WAL to disk.
     ///
-    /// Serial v7 WALs wait for any in-flight append and check writer health.
+    /// Serial v7/v8 WALs wait for any in-flight append and check writer health.
     /// Other MVCC WALs delegate to `submit_and_commit` (io_uring path).
     /// For legacy WALs: flushes and fsyncs the BufWriter directly.
     pub fn sync(&self) -> Result<()> {
@@ -3421,6 +3591,9 @@ impl Wal {
         }
         if let Some(writer) = &self.v7_leader {
             return self.wait_for_v7_leader(writer, None);
+        }
+        if let Some(writer) = &self.v8_parallel {
+            return self.wait_for_v8_parallel(writer, None);
         }
         if let Some(writer) = &self.v8_leader {
             return self.wait_for_v8_leader(writer, None);
@@ -3451,6 +3624,9 @@ impl Wal {
         }
         if let Some(writer) = &self.v7_leader {
             return self.wait_for_v7_leader(writer, None);
+        }
+        if let Some(writer) = &self.v8_parallel {
+            return self.wait_for_v8_parallel(writer, None);
         }
         if let Some(writer) = &self.v8_leader {
             return self.wait_for_v8_leader(writer, None);
@@ -3528,6 +3704,9 @@ impl Wal {
         }
         if let Some(writer) = &self.v7_leader {
             return self.wait_for_v7_leader(writer, Some(ticket));
+        }
+        if let Some(writer) = &self.v8_parallel {
+            return self.wait_for_v8_parallel(writer, Some(ticket));
         }
         if let Some(writer) = &self.v8_leader {
             return self.wait_for_v8_leader(writer, Some(ticket));

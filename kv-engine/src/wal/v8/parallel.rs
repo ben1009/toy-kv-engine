@@ -16,6 +16,7 @@ use super::{
     WAL_V8_HEADER_LEN,
     codec::{self, WAL_V8_FRAME_LEN, WalV8Header},
     digest::WalV8Digest,
+    leader::WalV8LeaderCapacityError,
     prepare::{
         WalV8AdmissionGuard, WalV8AdmissionPlan, WalV8AdmissionPublisher, WalV8BatchAssignment,
         WalV8DigestReady,
@@ -651,12 +652,22 @@ impl WalV8AdmissionPublisher for WalV8ParallelCoordinator {
             .and_then(|tickets| tickets.checked_sub(u64::from(state.pending_frontier.is_some())))
             .and_then(|tickets| tickets.checked_mul(FRAME_LEN_U64))
             .context("v8 Parallel FRONTIER reservation overflows")?;
-        ensure!(
-            data_end
-                .checked_add(reserved_frontier_bytes)
-                .is_some_and(|end| end <= self.inner.max_file_size),
-            "v8 Parallel WAL segment rotation required"
-        );
+        if !data_end
+            .checked_add(reserved_frontier_bytes)
+            .is_some_and(|end| end <= self.inner.max_file_size)
+        {
+            let fresh_end = u64::try_from(WAL_V8_HEADER_LEN)
+                .ok()
+                .and_then(|header| header.checked_add(FRAME_LEN_U64))
+                .and_then(|data_start| data_start.checked_add(data_bytes))
+                .and_then(|data_end| data_end.checked_add(FRAME_LEN_U64));
+            let error = if fresh_end.is_some_and(|end| end <= self.inner.max_file_size) {
+                WalV8LeaderCapacityError::RotationRequired
+            } else {
+                WalV8LeaderCapacityError::BatchTooLarge
+            };
+            return Err(anyhow::Error::new(error));
+        }
         let assignment = WalV8BatchAssignment {
             segment_ticket: ticket,
             commit_ts: plan.commit_ts,
