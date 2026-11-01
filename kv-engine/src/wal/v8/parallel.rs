@@ -110,6 +110,15 @@ pub(crate) struct WalV8TicketProgress {
     pub(crate) data_complete: bool,
 }
 
+/// Atomic view of the durability decision point. `next_not_ready` is the
+/// first admitted ticket beyond the prefix that can be covered by a FRONTIER.
+#[cfg(feature = "bench")]
+pub(crate) struct WalV8FrontierReadySnapshot {
+    pub(crate) ready_prefix: Vec<WalV8TicketProgress>,
+    pub(crate) admitted_ticket_count: usize,
+    pub(crate) next_not_ready: Option<WalV8TicketProgress>,
+}
+
 /// The reservation for appending a FRONTIER after the current physical tail.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct WalV8FrontierReservation {
@@ -254,6 +263,38 @@ impl WalV8ParallelCoordinator {
             .take_while(|ticket| ticket.is_frontier_ready())
             .map(TicketState::progress)
             .collect()
+    }
+
+    /// Snapshot the frontier-ready prefix and the first admitted ticket that
+    /// would extend it, under one lock acquisition. Benchmark diagnostics use
+    /// the blocked ticket's readiness to identify why a durability group
+    /// stopped at this boundary.
+    #[cfg(feature = "bench")]
+    pub(crate) fn frontier_ready_snapshot(&self) -> WalV8FrontierReadySnapshot {
+        let state = self.inner.state.lock();
+        if state.poisoned {
+            return WalV8FrontierReadySnapshot {
+                ready_prefix: Vec::new(),
+                admitted_ticket_count: 0,
+                next_not_ready: None,
+            };
+        }
+        let mut ready_prefix = Vec::new();
+        for ticket in &state.tickets {
+            if !ticket.is_frontier_ready() {
+                break;
+            }
+            ready_prefix.push(ticket.progress());
+        }
+        let next_not_ready = state
+            .tickets
+            .get(ready_prefix.len())
+            .map(TicketState::progress);
+        WalV8FrontierReadySnapshot {
+            ready_prefix,
+            admitted_ticket_count: state.tickets.len(),
+            next_not_ready,
+        }
     }
 
     /// Publish that one ticket's physical DATA frames have been materialized.
@@ -1099,6 +1140,51 @@ mod tests {
         let reservation = coordinator.reserve_frontier(1)?;
         coordinator.publish_durable_frontier(reservation)?;
         encoded.disarm_after_durable();
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(feature = "bench")]
+    fn frontier_snapshot_reports_the_first_blocking_ticket_stage() -> Result<()> {
+        let coordinator = coordinator(8)?;
+        let first_batch = batch(10);
+        let second_batch = batch(20);
+        let mut first = admit(&first_batch, &coordinator)?.encode()?;
+        let mut second = admit(&second_batch, &coordinator)?.encode()?;
+
+        mark_producer_ready(&mut first, &coordinator, true)?;
+        coordinator.mark_digest_ready(second.digest_ready()?)?;
+
+        let snapshot = coordinator.frontier_ready_snapshot();
+        assert_eq!(snapshot.admitted_ticket_count, 2);
+        assert_eq!(snapshot.ready_prefix.len(), 1);
+        let blocked = snapshot
+            .next_not_ready
+            .expect("second admitted ticket blocks the prefix");
+        assert!(!blocked.frames_ready);
+        assert!(blocked.prefix_digest_after.is_some());
+        assert!(!blocked.data_complete);
+
+        let mut second_frames = vec![0; second.frame_buffer_bytes()];
+        second.encode_data_frames_into(&mut second_frames)?;
+        coordinator.mark_frames_ready(1)?;
+        let snapshot = coordinator.frontier_ready_snapshot();
+        let blocked = snapshot
+            .next_not_ready
+            .expect("second ticket still awaits DATA completion");
+        assert!(blocked.frames_ready);
+        assert!(blocked.prefix_digest_after.is_some());
+        assert!(!blocked.data_complete);
+
+        coordinator.mark_data_complete(1)?;
+        let snapshot = coordinator.frontier_ready_snapshot();
+        assert_eq!(snapshot.ready_prefix.len(), 2);
+        assert!(snapshot.next_not_ready.is_none());
+
+        let reservation = coordinator.reserve_frontier(2)?;
+        coordinator.publish_durable_frontier(reservation)?;
+        first.disarm_after_durable();
+        second.disarm_after_durable();
         Ok(())
     }
 

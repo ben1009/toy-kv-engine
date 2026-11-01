@@ -207,6 +207,15 @@ pub struct WalSyncObservation {
     pub captured_target: u64,
     pub written_frontier_start: u64,
     pub written_frontier_end: u64,
+    /// Number of unresolved tickets admitted when a v8 FRONTIER decision was
+    /// made. Other WAL formats leave this at zero.
+    pub admitted_ticket_count: u64,
+    /// Whether there is an admitted ticket beyond the candidate v8 prefix.
+    pub next_ticket_present: bool,
+    /// Readiness of the first admitted ticket beyond the candidate v8 prefix.
+    pub next_ticket_frames_ready: bool,
+    pub next_ticket_digest_folded: bool,
+    pub next_ticket_data_complete: bool,
     pub write_sqes_submitted: u64,
     pub write_cqes_completed: u64,
     pub groups_completed: u64,

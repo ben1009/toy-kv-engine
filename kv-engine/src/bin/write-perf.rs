@@ -1026,6 +1026,11 @@ struct WalSyncObservationRecord {
     captured_target: u64,
     written_frontier_start: u64,
     written_frontier_end: u64,
+    admitted_ticket_count: u64,
+    next_ticket_present: bool,
+    next_ticket_frames_ready: bool,
+    next_ticket_digest_folded: bool,
+    next_ticket_data_complete: bool,
     write_sqes_submitted: u64,
     write_cqes_completed: u64,
     groups_completed: u64,
@@ -1115,6 +1120,11 @@ impl From<kv_engine_wrapper::mem_table::WalSyncObservation> for WalSyncObservati
             captured_target: observation.captured_target,
             written_frontier_start: observation.written_frontier_start,
             written_frontier_end: observation.written_frontier_end,
+            admitted_ticket_count: observation.admitted_ticket_count,
+            next_ticket_present: observation.next_ticket_present,
+            next_ticket_frames_ready: observation.next_ticket_frames_ready,
+            next_ticket_digest_folded: observation.next_ticket_digest_folded,
+            next_ticket_data_complete: observation.next_ticket_data_complete,
             write_sqes_submitted: observation.write_sqes_submitted,
             write_cqes_completed: observation.write_cqes_completed,
             groups_completed: observation.groups_completed,
@@ -12562,6 +12572,11 @@ mod tests {
                 captured_target: 10,
                 written_frontier_start: 10,
                 written_frontier_end: 14,
+                admitted_ticket_count: 5,
+                next_ticket_present: true,
+                next_ticket_frames_ready: true,
+                next_ticket_digest_folded: false,
+                next_ticket_data_complete: true,
                 write_sqes_submitted: 6,
                 write_cqes_completed: 4,
                 groups_completed: 2,
@@ -12574,6 +12589,11 @@ mod tests {
         assert_eq!(json["captured_target"], 10);
         assert_eq!(json["written_frontier_start"], 10);
         assert_eq!(json["written_frontier_end"], 14);
+        assert_eq!(json["admitted_ticket_count"], 5);
+        assert_eq!(json["next_ticket_present"], true);
+        assert_eq!(json["next_ticket_frames_ready"], true);
+        assert_eq!(json["next_ticket_digest_folded"], false);
+        assert_eq!(json["next_ticket_data_complete"], true);
         assert_eq!(json["write_sqes_submitted"], 6);
         assert_eq!(json["write_cqes_completed"], 4);
         assert_eq!(json["groups_completed"], 2);

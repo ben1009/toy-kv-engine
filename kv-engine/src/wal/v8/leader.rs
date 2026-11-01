@@ -1191,6 +1191,24 @@ impl WalV8ParallelWriter {
                 continue;
             }
 
+            #[cfg(feature = "bench")]
+            let profile = self.profile.load_full();
+            #[cfg(feature = "bench")]
+            let diagnostics_enabled = profile
+                .as_ref()
+                .is_some_and(|profile| profile.wal_sync_diagnostics_enabled());
+            #[cfg(feature = "bench")]
+            let (ready, frontier_observation) = if diagnostics_enabled {
+                let snapshot = self.coordinator.frontier_ready_snapshot();
+                let observation = (
+                    snapshot.admitted_ticket_count as u64,
+                    snapshot.next_not_ready,
+                );
+                (snapshot.ready_prefix, Some(observation))
+            } else {
+                (ready, None)
+            };
+
             let first_ticket = self.coordinator.durable_ticket_end();
             let frontier_ticket_end = first_ticket
                 .checked_add(u64::try_from(ready.len())?)
@@ -1243,8 +1261,6 @@ impl WalV8ParallelWriter {
             frontier_buffer.as_mut_slice()[..WAL_V8_FRAME_LEN].copy_from_slice(&frontier_frame);
             frontier_buffer.set_len(WAL_V8_FRAME_LEN);
             #[cfg(feature = "bench")]
-            let profile = self.profile.load_full();
-            #[cfg(feature = "bench")]
             let frontier_write_started = profile.as_ref().map(|_| Instant::now());
             write_aligned_once(
                 &self.write_file,
@@ -1273,11 +1289,21 @@ impl WalV8ParallelWriter {
                 let groups = ready.len() as u64;
                 profile.record_wal_sync(groups);
                 profile.record_wal_fdatasync_ns(duration_ns);
-                if profile.wal_sync_diagnostics_enabled() {
+                if diagnostics_enabled {
+                    let (admitted_ticket_count, next_ticket) = frontier_observation
+                        .expect("detailed v8 sync diagnostics capture a frontier snapshot");
                     profile.record_wal_sync_observation(crate::mem_table::WalSyncObservation {
                         captured_target: frontier_ticket_end,
                         written_frontier_start: first_ticket,
                         written_frontier_end: frontier_ticket_end,
+                        admitted_ticket_count,
+                        next_ticket_present: next_ticket.is_some(),
+                        next_ticket_frames_ready: next_ticket
+                            .is_some_and(|ticket| ticket.frames_ready),
+                        next_ticket_digest_folded: next_ticket
+                            .is_some_and(|ticket| ticket.prefix_digest_after.is_some()),
+                        next_ticket_data_complete: next_ticket
+                            .is_some_and(|ticket| ticket.data_complete),
                         groups_completed: groups,
                         groups_covered: groups,
                         duration_ns,
