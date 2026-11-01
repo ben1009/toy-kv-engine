@@ -3322,6 +3322,7 @@ fn synchronize_written_prefix(sync_file: &File, inner: &RuntimeInner) -> Result<
                 written_frontier_start: _sync_end.written_frontier_start,
                 written_frontier_end: _sync_end.written_frontier_end,
                 admitted_ticket_count: 0,
+                v8_preparation_reserved_bytes: 0,
                 next_ticket_present: false,
                 next_ticket_frames_ready: false,
                 next_ticket_digest_folded: false,

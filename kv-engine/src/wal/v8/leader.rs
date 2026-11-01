@@ -1202,6 +1202,7 @@ impl WalV8ParallelWriter {
                 let snapshot = self.coordinator.frontier_ready_snapshot();
                 let observation = (
                     snapshot.admitted_ticket_count as u64,
+                    snapshot.reserved_preparation_bytes,
                     snapshot.next_not_ready,
                 );
                 (snapshot.ready_prefix, Some(observation))
@@ -1290,13 +1291,15 @@ impl WalV8ParallelWriter {
                 profile.record_wal_sync(groups);
                 profile.record_wal_fdatasync_ns(duration_ns);
                 if diagnostics_enabled {
-                    let (admitted_ticket_count, next_ticket) = frontier_observation
-                        .expect("detailed v8 sync diagnostics capture a frontier snapshot");
+                    let (admitted_ticket_count, v8_preparation_reserved_bytes, next_ticket) =
+                        frontier_observation
+                            .expect("detailed v8 sync diagnostics capture a frontier snapshot");
                     profile.record_wal_sync_observation(crate::mem_table::WalSyncObservation {
                         captured_target: frontier_ticket_end,
                         written_frontier_start: first_ticket,
                         written_frontier_end: frontier_ticket_end,
                         admitted_ticket_count,
+                        v8_preparation_reserved_bytes,
                         next_ticket_present: next_ticket.is_some(),
                         next_ticket_frames_ready: next_ticket
                             .is_some_and(|ticket| ticket.frames_ready),

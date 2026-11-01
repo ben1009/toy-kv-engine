@@ -210,6 +210,8 @@ pub struct WalSyncObservation {
     /// Number of unresolved tickets admitted when a v8 FRONTIER decision was
     /// made. Other WAL formats leave this at zero.
     pub admitted_ticket_count: u64,
+    /// Bytes held by v8 preflight reservations that have not finished encoding.
+    pub v8_preparation_reserved_bytes: u64,
     /// Whether there is an admitted ticket beyond the candidate v8 prefix.
     pub next_ticket_present: bool,
     /// Readiness of the first admitted ticket beyond the candidate v8 prefix.

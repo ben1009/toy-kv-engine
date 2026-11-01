@@ -116,6 +116,7 @@ pub(crate) struct WalV8TicketProgress {
 pub(crate) struct WalV8FrontierReadySnapshot {
     pub(crate) ready_prefix: Vec<WalV8TicketProgress>,
     pub(crate) admitted_ticket_count: usize,
+    pub(crate) reserved_preparation_bytes: u64,
     pub(crate) next_not_ready: Option<WalV8TicketProgress>,
 }
 
@@ -276,6 +277,7 @@ impl WalV8ParallelCoordinator {
             return WalV8FrontierReadySnapshot {
                 ready_prefix: Vec::new(),
                 admitted_ticket_count: 0,
+                reserved_preparation_bytes: 0,
                 next_not_ready: None,
             };
         }
@@ -293,6 +295,7 @@ impl WalV8ParallelCoordinator {
         WalV8FrontierReadySnapshot {
             ready_prefix,
             admitted_ticket_count: state.tickets.len(),
+            reserved_preparation_bytes: state.reserved_preparation_bytes,
             next_not_ready,
         }
     }
@@ -1151,12 +1154,14 @@ mod tests {
         let second_batch = batch(20);
         let mut first = admit(&first_batch, &coordinator)?.encode()?;
         let mut second = admit(&second_batch, &coordinator)?.encode()?;
+        let preparation = coordinator.reserve_preparation(640)?;
 
         mark_producer_ready(&mut first, &coordinator, true)?;
         coordinator.mark_digest_ready(second.digest_ready()?)?;
 
         let snapshot = coordinator.frontier_ready_snapshot();
         assert_eq!(snapshot.admitted_ticket_count, 2);
+        assert_eq!(snapshot.reserved_preparation_bytes, 640);
         assert_eq!(snapshot.ready_prefix.len(), 1);
         let blocked = snapshot
             .next_not_ready
@@ -1185,6 +1190,7 @@ mod tests {
         coordinator.publish_durable_frontier(reservation)?;
         first.disarm_after_durable();
         second.disarm_after_durable();
+        drop(preparation);
         Ok(())
     }
 

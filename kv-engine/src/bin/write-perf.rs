@@ -1027,6 +1027,7 @@ struct WalSyncObservationRecord {
     written_frontier_start: u64,
     written_frontier_end: u64,
     admitted_ticket_count: u64,
+    v8_preparation_reserved_bytes: u64,
     next_ticket_present: bool,
     next_ticket_frames_ready: bool,
     next_ticket_digest_folded: bool,
@@ -1121,6 +1122,7 @@ impl From<kv_engine_wrapper::mem_table::WalSyncObservation> for WalSyncObservati
             written_frontier_start: observation.written_frontier_start,
             written_frontier_end: observation.written_frontier_end,
             admitted_ticket_count: observation.admitted_ticket_count,
+            v8_preparation_reserved_bytes: observation.v8_preparation_reserved_bytes,
             next_ticket_present: observation.next_ticket_present,
             next_ticket_frames_ready: observation.next_ticket_frames_ready,
             next_ticket_digest_folded: observation.next_ticket_digest_folded,
@@ -12573,6 +12575,7 @@ mod tests {
                 written_frontier_start: 10,
                 written_frontier_end: 14,
                 admitted_ticket_count: 5,
+                v8_preparation_reserved_bytes: 640,
                 next_ticket_present: true,
                 next_ticket_frames_ready: true,
                 next_ticket_digest_folded: false,
@@ -12590,6 +12593,7 @@ mod tests {
         assert_eq!(json["written_frontier_start"], 10);
         assert_eq!(json["written_frontier_end"], 14);
         assert_eq!(json["admitted_ticket_count"], 5);
+        assert_eq!(json["v8_preparation_reserved_bytes"], 640);
         assert_eq!(json["next_ticket_present"], true);
         assert_eq!(json["next_ticket_frames_ready"], true);
         assert_eq!(json["next_ticket_digest_folded"], false);
