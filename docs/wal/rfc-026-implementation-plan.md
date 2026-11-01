@@ -265,8 +265,14 @@ capacity-checked v6-to-v7 and v7-to-v8 migration paths before the measured
 workload; the default PITR format remains v7. This is a benchmark setup path,
 not a qualification result or a production v8 creation policy. V8 Leader and
 Parallel modes are selectable explicitly, and the harness verifies that the
-active WAL reports the requested mode. The normal build rejects the v8
-selector before opening a database.
+active WAL reports the requested mode. V8 Leader and Parallel now contribute
+durability-group, FRONTIER-write and `fdatasync` counters to the same
+`wal_pipeline` record used for v4-v7, while V8 digest CPU counters remain in
+`wal_v8_digest`. For V8, a commit group is the set of logical tickets covered
+by one FRONTIER/fdatasync cycle; `commit_buffers` counts those ticket buffers
+and `commit_bytes` their aligned DATA frame bytes. io_uring, CQE and eventfd
+counters remain zero because V8 submits positional writes directly. The normal
+build rejects the v8 selector before opening a database.
 
 Each slice must leave existing v2-v7 reads, writes, recovery and digest
 interpretation unchanged. Tests for each completed slice are part of its

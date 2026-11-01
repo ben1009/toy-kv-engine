@@ -159,7 +159,7 @@ impl WalRunInfo {
     }
 
     fn runtime_counters_available(self) -> bool {
-        cfg!(feature = "bench") && matches!(self.format_version, 4..=7)
+        cfg!(feature = "bench") && matches!(self.format_version, 4..=8)
     }
 }
 
@@ -8641,12 +8641,13 @@ mod tests {
                     .contains("requires a Linux write-perf build with --features bench")
             );
         }
-        assert!(
-            !WalRunInfo {
+        assert_eq!(
+            WalRunInfo {
                 format_version: 8,
                 io_mode: "leader",
             }
-            .runtime_counters_available()
+            .runtime_counters_available(),
+            cfg!(feature = "bench")
         );
 
         assert!(Args::try_parse_from(["write-perf", "--pitr-format", "v6"]).is_err());

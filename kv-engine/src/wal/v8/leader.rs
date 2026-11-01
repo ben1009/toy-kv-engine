@@ -22,6 +22,9 @@ use std::{
     time::Duration,
 };
 
+#[cfg(feature = "bench")]
+use std::time::Instant;
+
 use anyhow::{Context, Result, ensure};
 use parking_lot::Mutex;
 use sha2::{Digest, Sha256};
@@ -123,6 +126,8 @@ pub(crate) struct WalV8LeaderWriter {
     max_file_size: u64,
     installed_dev: u64,
     installed_ino: u64,
+    #[cfg(feature = "bench")]
+    profile: arc_swap::ArcSwapOption<crate::mem_table::WriteProfile>,
 }
 
 /// Shared v8 writer path for concurrent producers. Admission and DATA writes
@@ -142,6 +147,8 @@ pub(crate) struct WalV8ParallelWriter {
     max_file_size: u64,
     installed_dev: u64,
     installed_ino: u64,
+    #[cfg(feature = "bench")]
+    profile: arc_swap::ArcSwapOption<crate::mem_table::WriteProfile>,
 }
 
 struct WalV8ParallelFrontier {
@@ -427,7 +434,14 @@ impl WalV8LeaderWriter {
             max_file_size,
             installed_dev: installed.installed_dev,
             installed_ino: installed.installed_ino,
+            #[cfg(feature = "bench")]
+            profile: arc_swap::ArcSwapOption::empty(),
         })
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn set_write_profile(&self, profile: Arc<crate::mem_table::WriteProfile>) {
+        self.profile.store(Some(profile));
     }
 
     /// Transfer the validated image and coordinator to the concurrent
@@ -451,6 +465,8 @@ impl WalV8LeaderWriter {
             max_file_size: self.max_file_size,
             installed_dev: self.installed_dev,
             installed_ino: self.installed_ino,
+            #[cfg(feature = "bench")]
+            profile: self.profile,
         }
     }
 
@@ -549,6 +565,8 @@ impl WalV8LeaderWriter {
         ensure!(!self.is_poisoned(), "v8 Leader WAL is poisoned");
         #[cfg(feature = "bench")]
         let ordered_link_hash_cpu_ns_before = self.coordinator.ordered_link_hash_cpu_ns();
+        #[cfg(feature = "bench")]
+        let profile = self.profile.load_full();
         ensure!(
             !prepared_batches.is_empty()
                 && prepared_batches.len() <= MAX_GROUP_TICKETS
@@ -829,13 +847,49 @@ impl WalV8LeaderWriter {
         frontier_buffer.set_len(WAL_V8_FRAME_LEN);
         let frontier_digest = frame_record_digest(&frontier_frame)?;
 
+        #[cfg(feature = "bench")]
+        let frontier_write_started = profile.as_ref().map(|_| Instant::now());
         write_aligned_once(
             &self.write_file,
             frontier_buffer.initialized_slice(0, WAL_V8_FRAME_LEN),
             frontier_offset,
         )
         .context("write v8 Leader FRONTIER")?;
-        fdatasync_once(&self.sync_file).context("fdatasync v8 Leader WAL")?;
+        #[cfg(feature = "bench")]
+        if let (Some(profile), Some(started)) = (&profile, frontier_write_started) {
+            let data_bytes = producer_completions
+                .iter()
+                .fold(0_u64, |total, completion| {
+                    total.saturating_add(completion.encoded.frame_buffer_bytes() as u64)
+                });
+            profile.record_wal_commit_group(producer_completions.len() as u64, data_bytes);
+            profile.record_wal_frontier_write(
+                WAL_V8_FRAME_LEN as u64,
+                started.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+            );
+        }
+        #[cfg(feature = "bench")]
+        let sync_started = profile.as_ref().map(|_| Instant::now());
+        let sync_result = fdatasync_once(&self.sync_file);
+        #[cfg(feature = "bench")]
+        if let (Some(profile), Some(started)) = (&profile, sync_started) {
+            let duration_ns = started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+            profile.record_wal_sync(producer_completions.len() as u64);
+            profile.record_wal_fdatasync_ns(duration_ns);
+            if profile.wal_sync_diagnostics_enabled() {
+                profile.record_wal_sync_observation(crate::mem_table::WalSyncObservation {
+                    captured_target: ticket_end,
+                    written_frontier_start: self.frontier.ticket_end,
+                    written_frontier_end: ticket_end,
+                    groups_completed: producer_completions.len() as u64,
+                    groups_covered: producer_completions.len() as u64,
+                    duration_ns,
+                    succeeded: sync_result.is_ok(),
+                    ..crate::mem_table::WalSyncObservation::default()
+                });
+            }
+        }
+        sync_result.context("fdatasync v8 Leader WAL")?;
         // The group used one marker. Retire each additional marker credit only
         // after that marker and all DATA have reached the durable boundary.
         for reservation in batch_resources.iter_mut().skip(1).flatten() {
@@ -867,6 +921,9 @@ impl WalV8LeaderWriter {
                 .coordinator
                 .ordered_link_hash_cpu_ns()
                 .saturating_sub(ordered_link_hash_cpu_ns_before);
+            if let Some(profile) = &profile {
+                profile.record_wal_v8_digest_metrics(digest_metrics);
+            }
         }
 
         for completion in producer_completions {
@@ -933,6 +990,11 @@ impl WalV8LeaderWriter {
 }
 
 impl WalV8ParallelWriter {
+    #[cfg(feature = "bench")]
+    pub(crate) fn set_write_profile(&self, profile: Arc<crate::mem_table::WriteProfile>) {
+        self.profile.store(Some(profile));
+    }
+
     /// Reserve bounded preparation state before canonicalizing a batch.
     pub(crate) fn preflight_batch<'a>(
         &self,
@@ -986,6 +1048,10 @@ impl WalV8ParallelWriter {
             self.admit_prepared_batch_inner(prepared, commit_ts, recorded_at, after_admission)?;
         let assignment = job.assignment();
         let metrics = job.finish()?;
+        #[cfg(feature = "bench")]
+        if let Some(profile) = self.profile.load_full() {
+            profile.record_wal_v8_digest_metrics(metrics);
+        }
         if let Err(error) = self.wait_durable(assignment.segment_ticket) {
             self.coordinator.poison();
             return Err(error);
@@ -1151,13 +1217,51 @@ impl WalV8ParallelWriter {
             let mut frontier_buffer = DirectBuf::new(WAL_V8_FRAME_LEN);
             frontier_buffer.as_mut_slice()[..WAL_V8_FRAME_LEN].copy_from_slice(&frontier_frame);
             frontier_buffer.set_len(WAL_V8_FRAME_LEN);
+            #[cfg(feature = "bench")]
+            let profile = self.profile.load_full();
+            #[cfg(feature = "bench")]
+            let frontier_write_started = profile.as_ref().map(|_| Instant::now());
             write_aligned_once(
                 &self.write_file,
                 frontier_buffer.initialized_slice(0, WAL_V8_FRAME_LEN),
                 reservation.frame_offset,
             )
             .context("write v8 Parallel FRONTIER")?;
-            fdatasync_once(&self.sync_file).context("fdatasync v8 Parallel WAL")?;
+            #[cfg(feature = "bench")]
+            if let (Some(profile), Some(started)) = (&profile, frontier_write_started) {
+                let data_bytes = ready.iter().fold(0_u64, |total, progress| {
+                    total.saturating_add(progress.frame_buffer_bytes as u64)
+                });
+                let groups = ready.len() as u64;
+                profile.record_wal_commit_group(groups, data_bytes);
+                profile.record_wal_frontier_write(
+                    WAL_V8_FRAME_LEN as u64,
+                    started.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+                );
+            }
+            #[cfg(feature = "bench")]
+            let sync_started = profile.as_ref().map(|_| Instant::now());
+            let sync_result = fdatasync_once(&self.sync_file);
+            #[cfg(feature = "bench")]
+            if let (Some(profile), Some(started)) = (&profile, sync_started) {
+                let duration_ns = started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+                let groups = ready.len() as u64;
+                profile.record_wal_sync(groups);
+                profile.record_wal_fdatasync_ns(duration_ns);
+                if profile.wal_sync_diagnostics_enabled() {
+                    profile.record_wal_sync_observation(crate::mem_table::WalSyncObservation {
+                        captured_target: frontier_ticket_end,
+                        written_frontier_start: first_ticket,
+                        written_frontier_end: frontier_ticket_end,
+                        groups_completed: groups,
+                        groups_covered: groups,
+                        duration_ns,
+                        succeeded: sync_result.is_ok(),
+                        ..crate::mem_table::WalSyncObservation::default()
+                    });
+                }
+            }
+            sync_result.context("fdatasync v8 Parallel WAL")?;
 
             self.retire_frontier_resources(first_ticket, frontier_ticket_end)?;
             self.coordinator.publish_durable_frontier(reservation)?;
@@ -1502,6 +1606,52 @@ mod tests {
             installed,
             MAX_WAL_FILE_SIZE,
         )
+    }
+
+    #[cfg(feature = "bench")]
+    fn assert_one_two_ticket_profile(profile: &crate::mem_table::WriteProfile) {
+        let snapshot = profile.snapshot();
+        assert_eq!(snapshot.wal_commit_groups, 1);
+        assert_eq!(snapshot.wal_commit_solo_groups, 0);
+        assert_eq!(snapshot.wal_commit_buffers, 2);
+        assert_eq!(snapshot.wal_commit_bytes, 2 * FRAME_LEN_U64);
+        assert_eq!(snapshot.wal_sync_count, 1);
+        assert_eq!(snapshot.wal_sync_groups_total, 2);
+        assert_eq!(snapshot.wal_frontier_writes, 1);
+        assert_eq!(snapshot.wal_frontier_bytes, FRAME_LEN_U64);
+        assert!(snapshot.wal_fdatasync_ns > 0);
+    }
+
+    #[cfg(feature = "bench")]
+    #[test]
+    fn benchmark_profile_counts_v8_leader_and_parallel_durability_groups() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let leader_path = directory.path().join("leader-v8.wal");
+        let leader_installed = install_empty(&leader_path, header())?;
+        let leader_profile = Arc::new(crate::mem_table::WriteProfile::default());
+        let mut leader = open_writer(&leader_path, &leader_installed)?;
+        leader.set_write_profile(Arc::clone(&leader_profile));
+        leader.append_group(&[batch(10), batch(20)], LIVE_WAL_V5_LIMITS)?;
+        assert_one_two_ticket_profile(&leader_profile);
+        assert!(leader_profile.snapshot().wal_v8_payload_hash_bytes > 0);
+
+        let parallel_path = directory.path().join("parallel-v8.wal");
+        let parallel_installed = install_empty(&parallel_path, header())?;
+        let parallel_profile = Arc::new(crate::mem_table::WriteProfile::default());
+        let parallel = open_writer(&parallel_path, &parallel_installed)?.into_parallel();
+        parallel.set_write_profile(Arc::clone(&parallel_profile));
+        let first_batch = batch(10);
+        let second_batch = batch(20);
+        let first = parallel.preflight_batch(&first_batch, LIVE_WAL_V5_LIMITS)?;
+        let second = parallel.preflight_batch(&second_batch, LIVE_WAL_V5_LIMITS)?;
+        let first_job = parallel.admit_prepared_batch(first, 10, first_batch.recorded_at)?;
+        let second_job = parallel.admit_prepared_batch(second, 20, second_batch.recorded_at)?;
+        first_job.finish()?;
+        second_job.finish()?;
+        parallel.wait_durable(1)?;
+        assert_one_two_ticket_profile(&parallel_profile);
+
+        Ok(())
     }
 
     fn open_accounted_writer(

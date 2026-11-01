@@ -1784,7 +1784,15 @@ impl Wal {
         }
         #[cfg(feature = "bench")]
         if let Some(writer) = &self.v7_leader {
-            writer.lock().set_write_profile(profile);
+            writer.lock().set_write_profile(Arc::clone(&profile));
+        }
+        #[cfg(feature = "bench")]
+        if let Some(writer) = &self.v8_leader {
+            writer.lock().set_write_profile(Arc::clone(&profile));
+        }
+        #[cfg(feature = "bench")]
+        if let Some(writer) = &self.v8_parallel {
+            writer.set_write_profile(Arc::clone(&profile));
         }
     }
 
