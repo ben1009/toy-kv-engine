@@ -2006,7 +2006,11 @@ impl BackupRepository {
         let mut last_verified_commit_ts = None;
         for (page_index, metadata) in segments[start..end].iter().enumerate() {
             let verified_end = start + page_index;
-            let v7 = metadata.wal_format_version == crate::wal::format::WAL_FORMAT_VERSION_V7;
+            let sealed_frontier_format = matches!(
+                metadata.wal_format_version,
+                crate::wal::format::WAL_FORMAT_VERSION_V7
+                    | crate::wal::format::WAL_FORMAT_VERSION_V8
+            );
             let wal_name = crate::pitr::archive::archive_object_name(
                 metadata.key.timeline_id,
                 metadata.key.archive_epoch_id,
@@ -2021,8 +2025,8 @@ impl BackupRepository {
                 crate::pitr::archive::ArchiveObjectKind::Seal,
                 metadata.seal_digest,
             );
-            let mut v7_wal_bytes = None;
-            let mut v7_seal_bytes = None;
+            let mut sealed_wal_bytes = None;
+            let mut sealed_seal_bytes = None;
             for (name, expected_bytes, expected_digest, digest, kind, object_kind) in [
                 (
                     wal_name,
@@ -2081,34 +2085,47 @@ impl BackupRepository {
                         last_verified_commit_ts,
                     });
                 }
-                if deep && !v7 && object_kind == crate::pitr::archive::ArchiveObjectKind::Wal {
+                if deep
+                    && !sealed_frontier_format
+                    && object_kind == crate::pitr::archive::ArchiveObjectKind::Wal
+                {
                     crate::pitr::restore::decode_restore_wal_batches_for_segment(
                         &bytes,
                         metadata,
                         crate::pitr::LIVE_WAL_V5_LIMITS,
                     )?;
                 }
-                if deep && v7 {
+                if deep && sealed_frontier_format {
                     match object_kind {
                         crate::pitr::archive::ArchiveObjectKind::Wal => {
-                            v7_wal_bytes = Some(bytes);
+                            sealed_wal_bytes = Some(bytes);
                         }
                         crate::pitr::archive::ArchiveObjectKind::Seal => {
-                            v7_seal_bytes = Some(bytes);
+                            sealed_seal_bytes = Some(bytes);
                         }
                     }
                 }
             }
-            if deep && v7 {
-                let verification = crate::pitr::archive::verify_v7_archive_objects(
-                    metadata,
-                    v7_wal_bytes
-                        .as_deref()
-                        .context("deep v7 PITR verification did not load the WAL object")?,
-                    v7_seal_bytes
-                        .as_deref()
-                        .context("deep v7 PITR verification did not load the seal object")?,
-                );
+            if deep && sealed_frontier_format {
+                let wal_bytes = sealed_wal_bytes
+                    .as_deref()
+                    .context("deep PITR verification did not load the sealed WAL object")?;
+                let seal_bytes = sealed_seal_bytes
+                    .as_deref()
+                    .context("deep PITR verification did not load the seal object")?;
+                let verification = match metadata.wal_format_version {
+                    crate::wal::format::WAL_FORMAT_VERSION_V7 => {
+                        crate::pitr::archive::verify_v7_archive_objects(
+                            metadata, wal_bytes, seal_bytes,
+                        )
+                    }
+                    crate::wal::format::WAL_FORMAT_VERSION_V8 => {
+                        crate::pitr::archive::verify_v8_archive_objects(
+                            metadata, wal_bytes, seal_bytes,
+                        )
+                    }
+                    _ => unreachable!("sealed frontier format was checked above"),
+                };
                 if verification.is_err() {
                     return Ok(crate::pitr::api::VerifyPitrReport {
                         verified_intervals: intervals_through(verified_end)?,
@@ -2433,20 +2450,30 @@ impl BackupRepository {
                     File::from(seal_fd),
                     Some(metadata.wal_bytes),
                 )?;
-                let (first_recorded_at, last_recorded_at) = if metadata.wal_format_version
-                    == crate::wal::format::WAL_FORMAT_VERSION_V7
-                {
-                    let seal = crate::pitr::archive::decode_v7_archive_seal(metadata, &seal_bytes)?;
-                    (
-                        seal.entries.first().map(|entry| entry.recorded_at),
-                        seal.entries.last().map(|entry| entry.recorded_at),
-                    )
-                } else {
-                    let seal = crate::pitr::seal::V5Seal::decode(&seal_bytes)?;
-                    (
-                        seal.entries.first().map(|entry| entry.recorded_at),
-                        seal.entries.last().map(|entry| entry.recorded_at),
-                    )
+                let (first_recorded_at, last_recorded_at) = match metadata.wal_format_version {
+                    crate::wal::format::WAL_FORMAT_VERSION_V7 => {
+                        let seal =
+                            crate::pitr::archive::decode_v7_archive_seal(metadata, &seal_bytes)?;
+                        (
+                            seal.entries.first().map(|entry| entry.recorded_at),
+                            seal.entries.last().map(|entry| entry.recorded_at),
+                        )
+                    }
+                    crate::wal::format::WAL_FORMAT_VERSION_V8 => {
+                        let seal =
+                            crate::pitr::archive::decode_v8_archive_seal(metadata, &seal_bytes)?;
+                        (
+                            seal.entries.first().map(|entry| entry.recorded_at),
+                            seal.entries.last().map(|entry| entry.recorded_at),
+                        )
+                    }
+                    _ => {
+                        let seal = crate::pitr::seal::V5Seal::decode(&seal_bytes)?;
+                        (
+                            seal.entries.first().map(|entry| entry.recorded_at),
+                            seal.entries.last().map(|entry| entry.recorded_at),
+                        )
+                    }
                 };
                 if let Some(first) = first_recorded_at {
                     let first = first.as_system_time()?;
@@ -3460,6 +3487,7 @@ impl BackupRepository {
         let target = match requested_target {
             crate::pitr::api::RecoveryTarget::Latest => segments
                 .iter()
+                .filter(|metadata| metadata.key.segment_id.0 >= base.boundary_segment_id)
                 .filter_map(|metadata| metadata.last_commit_ts)
                 .max()
                 .map(crate::pitr::restore::PitrRestoreTarget::CommitTs)
@@ -3474,7 +3502,10 @@ impl BackupRepository {
                 }
                 .as_system_time()?;
                 let mut resolved = base.included_commit_ts.filter(|_| base_time <= time);
-                for metadata in &segments {
+                for metadata in segments
+                    .iter()
+                    .filter(|metadata| metadata.key.segment_id.0 >= base.boundary_segment_id)
+                {
                     check_pitr_cancellation(cancellation)?;
                     for batch in read_batches(metadata)? {
                         check_pitr_cancellation(cancellation)?;
@@ -5919,7 +5950,17 @@ impl crate::lsm_storage::LsmStorageInner {
         &self,
         base: &crate::pitr::base::PitrBaseMetadata,
     ) -> Result<crate::checkpoint::CheckpointCapture<'_>> {
-        self.hash_checkpoint_capture(self.capture_checkpoint_state_after_pitr_boundary(base)?)
+        let mut capture = self.capture_checkpoint_state_after_pitr_boundary(base)?;
+        // A PITR base backup contains the flushed state at its boundary, not
+        // the source engine's empty Active WAL successor or repository. Keep
+        // the base metadata in BACKUP_METADATA, but make the restored engine
+        // manifest self-contained just like a standalone checkpoint.
+        if let crate::manifest::ManifestRecord::Snapshot { pitr_state, .. } =
+            &mut capture.snapshot_record
+        {
+            *pitr_state = Some(crate::pitr::manifest::PitrState::default());
+        }
+        self.hash_checkpoint_capture(capture)
     }
 
     fn hash_checkpoint_capture<'a>(
@@ -7477,6 +7518,7 @@ mod tests {
                 archive_epoch_id: archive_epoch_id.0,
                 segment_id: segment_id.0,
                 incarnation: header.incarnation,
+                wal_format: crate::pitr::manifest::PitrWalFormat::V7,
                 ticket_end: 1,
                 durable_end: 3 * 4096,
                 last_commit_ts: 20,

@@ -104,8 +104,9 @@ pub(crate) struct SegmentMetadata {
     pub(crate) key: SegmentKey,
     pub(crate) wal_format_version: u16,
     pub(crate) seal_format_version: u16,
-    /// The frozen physical boundary for v7 segments. Legacy v5/v6 catalog
-    /// entries keep this absent and retain their original wire representation.
+    /// The frozen physical boundary for embedded-frontier segments. Legacy
+    /// v5/v6 catalog entries keep this absent and retain their original wire
+    /// representation.
     pub(crate) immutable_boundary: Option<Box<ImmutableBoundary>>,
     pub(crate) anchor: SegmentAnchor,
     pub(crate) predecessor: ChainAnchor,
@@ -131,12 +132,16 @@ impl SegmentMetadata {
         match (
             crate::pitr::is_v5_family(self.wal_format_version),
             self.wal_format_version == crate::wal::format::WAL_FORMAT_VERSION_V7,
+            self.wal_format_version == crate::wal::format::WAL_FORMAT_VERSION_V8,
             self.seal_format_version,
             self.immutable_boundary.as_deref(),
         ) {
-            (true, false, 1, None) => {}
-            (false, true, 2, Some(boundary)) => {
+            (true, false, false, 1, None) => {}
+            (false, true, false, 2, Some(boundary)) => {
                 self.validate_v7_boundary(boundary)?;
+            }
+            (false, false, true, 3, Some(boundary)) => {
+                self.validate_v8_boundary(boundary)?;
             }
             _ => bail!("unsupported PITR WAL/seal descriptor"),
         }
@@ -180,7 +185,8 @@ impl SegmentMetadata {
         boundary.validate()?;
         let active = boundary.active;
         ensure!(
-            active.timeline_id == self.key.timeline_id.0
+            active.wal_format == crate::pitr::manifest::PitrWalFormat::V7
+                && active.timeline_id == self.key.timeline_id.0
                 && active.archive_epoch_id == self.key.archive_epoch_id.0
                 && active.segment_id == self.key.segment_id.0,
             "v7 catalog boundary identity mismatch"
@@ -263,6 +269,103 @@ impl SegmentMetadata {
             ensure!(
                 active.prefix_digest == header.digest()?,
                 "empty v7 catalog prefix digest differs from its header"
+            );
+        }
+
+        Ok(())
+    }
+
+    fn validate_v8_boundary(&self, boundary: &ImmutableBoundary) -> Result<()> {
+        use crate::wal::v8::{
+            WAL_V8_HEADER_LEN,
+            codec::{WAL_V8_FRAME_LEN, WalV8Header},
+        };
+
+        boundary.validate()?;
+        let active = boundary.active;
+        ensure!(
+            active.wal_format == crate::pitr::manifest::PitrWalFormat::V8
+                && active.timeline_id == self.key.timeline_id.0
+                && active.archive_epoch_id == self.key.archive_epoch_id.0
+                && active.segment_id == self.key.segment_id.0,
+            "v8 catalog boundary identity mismatch"
+        );
+        if let ChainAnchor::Segment(predecessor) = self.predecessor {
+            ensure!(
+                predecessor.wal_digest != [0; 32] && predecessor.seal_digest != [0; 32],
+                "v8 catalog predecessor digest is empty"
+            );
+        }
+        let expected_sealed_end = active
+            .durable_end
+            .checked_add(WAL_V8_FRAME_LEN as u64)
+            .ok_or_else(|| anyhow::anyhow!("v8 catalog sealed image length overflows"))?;
+        ensure!(
+            boundary.sealed_end == expected_sealed_end,
+            "v8 catalog image does not end immediately after its terminal FRONTIER"
+        );
+        ensure!(
+            boundary.sealed_end <= crate::wal::MAX_WAL_FILE_SIZE,
+            "v8 catalog sealed image exceeds the WAL format limit"
+        );
+        let fixed_bytes = (WAL_V8_HEADER_LEN + 2 * WAL_V8_FRAME_LEN) as u64;
+        let max_batch_count =
+            boundary.sealed_end.saturating_sub(fixed_bytes) / WAL_V8_FRAME_LEN as u64;
+        ensure!(
+            self.batch_count <= max_batch_count,
+            "v8 catalog batch count exceeds its sealed image capacity"
+        );
+        ensure!(
+            active.ticket_end == self.batch_count,
+            "v8 catalog batch count differs from its durable ticket boundary"
+        );
+        ensure!(
+            active.last_commit_ts == self.last_commit_ts.unwrap_or_default(),
+            "v8 catalog timestamp differs from its durable boundary"
+        );
+        ensure!(
+            self.first_commit_ts.is_none_or(|first| first != 0),
+            "v8 catalog first commit timestamp is zero"
+        );
+        if let (Some(first), Some(last)) = (self.first_commit_ts, self.last_commit_ts) {
+            let timestamp_capacity = last
+                .checked_sub(first)
+                .and_then(|span| span.checked_add(1))
+                .ok_or_else(|| anyhow::anyhow!("v8 catalog commit range is invalid"))?;
+            ensure!(
+                self.batch_count <= timestamp_capacity,
+                "v8 catalog batch count exceeds its commit timestamp range"
+            );
+            ensure!(
+                self.batch_count != 1 || first == last,
+                "v8 catalog singleton commit timestamps differ"
+            );
+        }
+        ensure!(
+            boundary.sealed_end == self.wal_bytes,
+            "v8 catalog WAL length differs from its immutable boundary"
+        );
+        ensure!(
+            boundary.wal_digest == self.wal_digest,
+            "v8 catalog WAL digest differs from its immutable boundary"
+        );
+        ensure!(
+            active.prefix_digest != [0; 32]
+                && boundary.terminal_frontier_digest != [0; 32]
+                && boundary.wal_digest != [0; 32],
+            "v8 catalog boundary digest is empty"
+        );
+        if active.ticket_end == 0 {
+            let header = WalV8Header {
+                timeline_id: self.key.timeline_id,
+                archive_epoch_id: self.key.archive_epoch_id,
+                segment_id: self.key.segment_id,
+                predecessor: self.predecessor,
+                incarnation: active.incarnation,
+            };
+            ensure!(
+                active.prefix_digest == header.initial_prefix_digest()?,
+                "empty v8 catalog prefix digest differs from its header"
             );
         }
 
@@ -1165,7 +1268,20 @@ fn decode_metadata_prefix(
                 std::mem::size_of::<ImmutableBoundary>() <= max_owned_bytes,
                 "catalog metadata allocation exceeds decoded-state limit"
             );
-            Some(Box::new(decode_immutable_boundary(&mut cursor)?))
+            Some(Box::new(decode_immutable_boundary(
+                &mut cursor,
+                crate::pitr::manifest::PitrWalFormat::V7,
+            )?))
+        }
+        3 if wal_format_version == crate::wal::format::WAL_FORMAT_VERSION_V8 => {
+            ensure!(
+                std::mem::size_of::<ImmutableBoundary>() <= max_owned_bytes,
+                "catalog metadata allocation exceeds decoded-state limit"
+            );
+            Some(Box::new(decode_immutable_boundary(
+                &mut cursor,
+                crate::pitr::manifest::PitrWalFormat::V8,
+            )?))
         }
         _ => bail!("unsupported PITR WAL/seal descriptor"),
     };
@@ -1205,12 +1321,16 @@ fn encode_immutable_boundary(out: &mut Vec<u8>, boundary: ImmutableBoundary) {
     put_bytes(out, &boundary.wal_digest);
 }
 
-fn decode_immutable_boundary(cursor: &mut Cursor<'_>) -> Result<ImmutableBoundary> {
+fn decode_immutable_boundary(
+    cursor: &mut Cursor<'_>,
+    wal_format: crate::pitr::manifest::PitrWalFormat,
+) -> Result<ImmutableBoundary> {
     let active = crate::pitr::manifest::ActiveBoundary {
         timeline_id: cursor.fixed()?,
         archive_epoch_id: cursor.fixed()?,
         segment_id: cursor.u64()?,
         incarnation: cursor.fixed()?,
+        wal_format,
         ticket_end: cursor.u64()?,
         durable_end: cursor.u64()?,
         last_commit_ts: cursor.u64()?,
@@ -1469,6 +1589,7 @@ mod tests {
                 archive_epoch_id: key.archive_epoch_id.0,
                 segment_id,
                 incarnation: [11; 16],
+                wal_format: crate::pitr::manifest::PitrWalFormat::V7,
                 ticket_end: 1,
                 durable_end: 3 * 4096,
                 last_commit_ts: segment_id * 10,
@@ -1501,6 +1622,54 @@ mod tests {
         }
     }
 
+    fn v8_metadata(segment_id: u64, predecessor: ChainAnchor) -> SegmentMetadata {
+        let wal_digest = [segment_id as u8 + 50; 32];
+        let seal_digest = [segment_id as u8 + 60; 32];
+        let key = SegmentKey {
+            repository_id: [7; 16],
+            timeline_id: TimelineId([8; 16]),
+            archive_epoch_id: ArchiveEpochId([9; 16]),
+            segment_id: SegmentId(segment_id),
+        };
+        let boundary = ImmutableBoundary {
+            active: crate::pitr::manifest::ActiveBoundary {
+                timeline_id: key.timeline_id.0,
+                archive_epoch_id: key.archive_epoch_id.0,
+                segment_id,
+                incarnation: [15; 16],
+                wal_format: crate::pitr::manifest::PitrWalFormat::V8,
+                ticket_end: 1,
+                durable_end: 3 * 4096,
+                last_commit_ts: segment_id * 10,
+                prefix_digest: [16; 32],
+            },
+            sealed_end: 4 * 4096,
+            terminal_frontier_digest: [17; 32],
+            wal_digest,
+        };
+
+        SegmentMetadata {
+            key,
+            wal_format_version: crate::wal::format::WAL_FORMAT_VERSION_V8,
+            seal_format_version: 3,
+            immutable_boundary: Some(Box::new(boundary)),
+            anchor: SegmentAnchor {
+                segment_id: key.segment_id,
+                wal_digest,
+                seal_digest,
+            },
+            predecessor,
+            first_commit_ts: Some(segment_id * 10),
+            last_commit_ts: Some(segment_id * 10),
+            batch_count: 1,
+            logical_bytes: 64,
+            wal_bytes: boundary.sealed_end,
+            wal_digest,
+            seal_digest,
+            source_identity: [segment_id as u8 + 70; 32],
+        }
+    }
+
     fn empty_v7_metadata(segment_id: u64, predecessor: ChainAnchor) -> SegmentMetadata {
         use crate::wal::v7::codec::{
             WAL_V7_HEADER_LEN, WalV7Header, encode_generation_zero_frontier,
@@ -1527,6 +1696,7 @@ mod tests {
             archive_epoch_id: header.archive_epoch_id.0,
             segment_id,
             incarnation: header.incarnation,
+            wal_format: crate::pitr::manifest::PitrWalFormat::V7,
             ticket_end: 0,
             durable_end: WAL_V7_HEADER_LEN as u64,
             last_commit_ts: 0,
@@ -1618,6 +1788,91 @@ mod tests {
             vec![snapshot_record],
             "snapshot metadata prefixes must consume the v7 descriptor"
         );
+    }
+
+    #[test]
+    fn catalog_round_trips_v8_boundary_after_legacy_and_v7_segments() {
+        let first = metadata(
+            1,
+            ChainAnchor::Genesis {
+                archive_epoch_id: ArchiveEpochId([9; 16]),
+            },
+        );
+        let second = v7_metadata(2, ChainAnchor::Segment(first.anchor));
+        let third = v8_metadata(3, ChainAnchor::Segment(second.anchor));
+        let records = [
+            PitrCatalogRecord::CommitSegment { metadata: first },
+            PitrCatalogRecord::CommitSegment { metadata: second },
+            PitrCatalogRecord::CommitSegment {
+                metadata: third.clone(),
+            },
+        ];
+
+        let encoded = encode_catalog(&records).unwrap();
+        let replay = replay_catalog(&encoded).unwrap();
+        assert_eq!(replay.records, records);
+        assert_eq!(replay.retained_offset, encoded.len());
+        assert_eq!(third.seal_format_version, 3);
+
+        let mut mislabeled_v8 = third.clone();
+        mislabeled_v8.seal_format_version = 2;
+        assert!(mislabeled_v8.validate().is_err());
+
+        let mut mislabeled_v7 = v7_metadata(4, ChainAnchor::Segment(third.anchor));
+        mislabeled_v7.seal_format_version = 3;
+        assert!(mislabeled_v7.validate().is_err());
+    }
+
+    #[test]
+    fn v8_catalog_empty_prefix_is_bound_to_the_v8_header() {
+        use crate::wal::v8::codec::WalV8Header;
+
+        let mut metadata = v8_metadata(
+            1,
+            ChainAnchor::Genesis {
+                archive_epoch_id: ArchiveEpochId([9; 16]),
+            },
+        );
+        let active = &mut metadata.immutable_boundary.as_mut().unwrap().active;
+        active.ticket_end = 0;
+        active.durable_end = 4096;
+        active.last_commit_ts = 0;
+        active.prefix_digest = WalV8Header {
+            timeline_id: metadata.key.timeline_id,
+            archive_epoch_id: metadata.key.archive_epoch_id,
+            segment_id: metadata.key.segment_id,
+            predecessor: metadata.predecessor,
+            incarnation: active.incarnation,
+        }
+        .initial_prefix_digest()
+        .unwrap();
+        let boundary = metadata.immutable_boundary.as_mut().unwrap();
+        boundary.sealed_end = 2 * 4096;
+        metadata.first_commit_ts = None;
+        metadata.last_commit_ts = None;
+        metadata.batch_count = 0;
+        metadata.logical_bytes = 0;
+        metadata.wal_bytes = boundary.sealed_end;
+
+        metadata.validate().unwrap();
+        let encoded = encode_catalog(&[PitrCatalogRecord::CommitSegment {
+            metadata: metadata.clone(),
+        }])
+        .unwrap();
+        assert_eq!(
+            replay_catalog(&encoded).unwrap().records,
+            vec![PitrCatalogRecord::CommitSegment {
+                metadata: metadata.clone()
+            }]
+        );
+
+        metadata
+            .immutable_boundary
+            .as_mut()
+            .unwrap()
+            .active
+            .prefix_digest[0] ^= 1;
+        assert!(metadata.validate().is_err());
     }
 
     #[test]

@@ -1263,6 +1263,7 @@ mod tests {
             archive_epoch_id: header.archive_epoch_id.0,
             segment_id: header.segment_id.0,
             incarnation: header.incarnation,
+            wal_format: crate::pitr::manifest::PitrWalFormat::V7,
             ticket_end: 0,
             durable_end: WAL_V7_HEADER_LEN as u64,
             last_commit_ts: 0,

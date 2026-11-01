@@ -1,11 +1,11 @@
-//! Capacity decisions for migrating a legacy PITR epoch to v7.
+//! Capacity decisions and owned reservations for PITR WAL format migrations.
 //!
 //! This module estimates the transition's source-spool requirement, including
 //! the next v7 seal/rotation headroom. The caller must provide the reconstructed
 //! allocation charge for every existing obligation, pin, orphan, and staging
-//! file, plus the recovered legacy Active WAL image length. The capacity result
-//! can be atomically acquired from the live v7 resource ledger as an owned
-//! reservation before publishing durable intent.
+//! file, plus the recovered Active WAL image length. V7 and v8 migration
+//! capacity results can be atomically acquired from the live v7 resource ledger
+//! as owned reservations before publishing durable intent.
 
 use anyhow::{Result, ensure};
 use std::{error::Error, fmt};
@@ -24,6 +24,10 @@ use crate::{
 // terminal frontier before it can acknowledge its first batch.
 const MINIMUM_NONEMPTY_V7_SEGMENT_BYTES: u64 = (WAL_V7_HEADER_LEN + 3 * WAL_V7_FRAME_LEN) as u64;
 const MINIMUM_EMPTY_V7_IMAGE_BYTES: u64 = (WAL_V7_HEADER_LEN + WAL_V7_FRAME_LEN) as u64;
+const MINIMUM_NONEMPTY_V8_SEGMENT_BYTES: u64 =
+    (crate::wal::v8::WAL_V8_HEADER_LEN + 3 * crate::wal::v8::codec::WAL_V8_FRAME_LEN) as u64;
+const MINIMUM_EMPTY_V8_IMAGE_BYTES: u64 =
+    (crate::wal::v8::WAL_V8_HEADER_LEN + crate::wal::v8::codec::WAL_V8_FRAME_LEN) as u64;
 // Bound the complete SealStarted, SegmentSealed, and NewPitrMemtable JSON
 // sequence independently of filesystem allocation size. The encoding-bound
 // regression below exercises all fields at their maximum serialized widths.
@@ -40,6 +44,19 @@ pub(crate) enum V7MigrationDeferralReason {
 pub(crate) enum V7MigrationCapacityDecision {
     Eligible,
     Deferred(V7MigrationDeferralReason),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum V8MigrationDeferralReason {
+    SegmentLimitTooSmall,
+    SegmentLimitTooLarge,
+    InsufficientSourceSpool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum V8MigrationCapacityDecision {
+    Eligible,
+    Deferred(V8MigrationDeferralReason),
 }
 
 /// Checked source-spool estimate for one legacy-to-v7 transition.
@@ -88,6 +105,32 @@ impl V7MigrationCapacity {
     }
 }
 
+/// Read-only capacity estimate for transitioning a v7 Active segment to v8.
+///
+/// This estimate does not reserve resources or authorize a format handoff. A
+/// future transition must stop admission, refresh the source image and retained
+/// allocation measurements, and atomically reserve the resulting charge before
+/// publishing durable migration intent.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct V8MigrationCapacity {
+    pub(crate) decision: V8MigrationCapacityDecision,
+    pub(crate) source_spool_limit_bytes: u64,
+    pub(crate) retained_source_spool_bytes: u64,
+    pub(crate) available_capacity_bytes: u64,
+    pub(crate) required_transition_bytes: u64,
+    pub(crate) required_total_bytes: u64,
+    pub(crate) configured_segment_limit_bytes: u64,
+    pub(crate) source_v7_active_image_bytes: u64,
+    pub(crate) source_v7_active_growth_bytes: u64,
+    pub(crate) v8_active_image_bytes: u64,
+    pub(crate) recovery_workspace_bytes: u64,
+    pub(crate) source_v7_seal_sidecar_bytes: u64,
+    pub(crate) v8_seal_sidecar_bytes: u64,
+    pub(crate) successor_image_bytes: u64,
+    pub(crate) successor_staging_bytes: u64,
+    pub(crate) terminal_manifest_headroom_bytes: u64,
+}
+
 /// Failure to acquire the whole migration charge from the live resource ledger.
 #[derive(Debug)]
 pub(crate) enum V7MigrationReservationError {
@@ -128,6 +171,50 @@ impl Error for V7MigrationReservationError {
 #[must_use = "retain the migration reservation through successor installation and cleanup"]
 #[derive(Debug)]
 pub(crate) struct V7MigrationTransitionReservation {
+    _reservation: WalV7Reservation,
+}
+
+/// Failure to acquire the whole v7-to-v8 migration charge from the live
+/// resource ledger.
+#[derive(Debug)]
+pub(crate) enum V8MigrationReservationError {
+    Deferred(V8MigrationDeferralReason),
+    InvalidAssessment,
+    Ledger(WalV7ReservationError),
+}
+
+impl fmt::Display for V8MigrationReservationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Deferred(reason) => {
+                write!(formatter, "PITR v8 migration is deferred: {reason:?}")
+            }
+            Self::InvalidAssessment => {
+                formatter.write_str("invalid PITR v8 migration capacity assessment")
+            }
+            Self::Ledger(error) => write!(
+                formatter,
+                "could not reserve PITR v8 migration capacity: {error}"
+            ),
+        }
+    }
+}
+
+impl Error for V8MigrationReservationError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Ledger(error) => Some(error),
+            Self::Deferred(_) | Self::InvalidAssessment => None,
+        }
+    }
+}
+
+/// Owns the complete transition headroom for a v7-to-v8 migration. The caller
+/// must retain this guard through intent publication, sealing, successor
+/// installation and durable cleanup.
+#[must_use = "retain the migration reservation through v8 successor installation and cleanup"]
+#[derive(Debug)]
+pub(crate) struct V8MigrationTransitionReservation {
     _reservation: WalV7Reservation,
 }
 
@@ -179,6 +266,54 @@ pub(crate) fn reserve_v7_migration_transition(
         .map_err(V7MigrationReservationError::Ledger)?;
 
     Ok(V7MigrationTransitionReservation {
+        _reservation: reservation,
+    })
+}
+
+/// Atomically reserve the source-spool and recovery-workspace charges from a
+/// successful v7-to-v8 preflight. The report is only a snapshot, so the live
+/// ledger remains authoritative if another operation reserved capacity after
+/// it was produced.
+pub(crate) fn reserve_v8_migration_transition(
+    capacity: V8MigrationCapacity,
+    ledger: &WalV7ResourceLedger,
+) -> std::result::Result<V8MigrationTransitionReservation, V8MigrationReservationError> {
+    if let V8MigrationCapacityDecision::Deferred(reason) = capacity.decision {
+        return Err(V8MigrationReservationError::Deferred(reason));
+    }
+
+    let Some(source_spool_bytes) = capacity
+        .required_transition_bytes
+        .checked_sub(capacity.recovery_workspace_bytes)
+    else {
+        return Err(V8MigrationReservationError::InvalidAssessment);
+    };
+    let Some(required_total_bytes) = capacity
+        .retained_source_spool_bytes
+        .checked_add(capacity.required_transition_bytes)
+    else {
+        return Err(V8MigrationReservationError::InvalidAssessment);
+    };
+    if source_spool_bytes == 0
+        || required_total_bytes != capacity.required_total_bytes
+        || capacity.available_capacity_bytes
+            != capacity
+                .source_spool_limit_bytes
+                .saturating_sub(capacity.retained_source_spool_bytes)
+        || capacity.required_transition_bytes > capacity.available_capacity_bytes
+    {
+        return Err(V8MigrationReservationError::InvalidAssessment);
+    }
+
+    let reservation = ledger
+        .reserve(WalV7ResourceCharge {
+            source_spool_bytes,
+            recovery_workspace_bytes: capacity.recovery_workspace_bytes,
+            ..WalV7ResourceCharge::default()
+        })
+        .map_err(V8MigrationReservationError::Ledger)?;
+
+    Ok(V8MigrationTransitionReservation {
         _reservation: reservation,
     })
 }
@@ -286,6 +421,110 @@ pub(crate) fn assess_v7_migration_capacity(
     })
 }
 
+/// Estimate the retained spool and transition workspace for a future v7 to v8
+/// rotation. The v7 source remains archived under its original digest rule;
+/// v8 image, seal, successor and recovery workspace use v8 bounds. This is
+/// advisory only and must be refreshed and reserved atomically before intent.
+pub(crate) fn assess_v8_migration_capacity(
+    config: &PersistedPitrConfig,
+    source_v7_active_image_bytes: u64,
+    source_v7_active_allocated_bytes: u64,
+    retained_source_spool_bytes: u64,
+    filesystem_allocation_unit: u64,
+) -> Result<V8MigrationCapacity> {
+    ensure!(
+        filesystem_allocation_unit > 0,
+        "PITR filesystem allocation unit is zero"
+    );
+    ensure!(
+        config.max_source_spool_bytes >= config.max_segment_bytes,
+        "PITR source-spool limit is below the segment limit"
+    );
+    ensure!(
+        ((WAL_V7_HEADER_LEN + WAL_V7_FRAME_LEN) as u64..=crate::wal::MAX_WAL_FILE_SIZE)
+            .contains(&source_v7_active_image_bytes)
+            && source_v7_active_image_bytes.is_multiple_of(WAL_V7_FRAME_LEN as u64),
+        "PITR v7 Active WAL image is outside its format bounds"
+    );
+
+    let image_limit_bytes = config.max_segment_bytes.min(crate::wal::MAX_WAL_FILE_SIZE);
+    let v8_active_image_bytes =
+        round_up_to_allocation_unit(image_limit_bytes, filesystem_allocation_unit)?;
+    let recovery_workspace_bytes =
+        round_up_to_allocation_unit(image_limit_bytes, filesystem_allocation_unit)?;
+    // The Active source may grow to its configured segment limit before the
+    // future rotation. Budget its remaining physical allocation and a seal
+    // large enough for that final image, while covering a source that already
+    // exceeds the current limit.
+    let source_v7_seal_image_bytes = source_v7_active_image_bytes.max(image_limit_bytes);
+    let source_v7_max_allocated_bytes =
+        round_up_to_allocation_unit(source_v7_seal_image_bytes, filesystem_allocation_unit)?;
+    let source_v7_current_charge_bytes = source_v7_active_image_bytes
+        .max(source_v7_active_allocated_bytes)
+        .min(source_v7_max_allocated_bytes);
+    let source_v7_active_growth_bytes =
+        source_v7_max_allocated_bytes.saturating_sub(source_v7_current_charge_bytes);
+    let source_v7_seal_logical_bytes = u64::try_from(crate::pitr::seal::V7Seal::max_encoded_len(
+        source_v7_seal_image_bytes,
+    )?)?;
+    let source_v7_seal_sidecar_bytes =
+        round_up_to_allocation_unit(source_v7_seal_logical_bytes, filesystem_allocation_unit)?;
+    let v8_seal_logical_bytes = u64::try_from(crate::pitr::seal::V8Seal::max_encoded_len(
+        image_limit_bytes.max(MINIMUM_EMPTY_V8_IMAGE_BYTES),
+    )?)?;
+    let v8_seal_sidecar_bytes =
+        round_up_to_allocation_unit(v8_seal_logical_bytes, filesystem_allocation_unit)?;
+    let successor_image_bytes =
+        round_up_to_allocation_unit(MINIMUM_EMPTY_V8_IMAGE_BYTES, filesystem_allocation_unit)?;
+    let successor_staging_bytes = successor_image_bytes;
+    let terminal_manifest_headroom_bytes =
+        round_up_to_allocation_unit(V7_TRANSITION_MANIFEST_BYTES, filesystem_allocation_unit)?;
+    let required_transition_bytes = v8_active_image_bytes
+        .checked_add(recovery_workspace_bytes)
+        .and_then(|bytes| bytes.checked_add(source_v7_active_growth_bytes))
+        .and_then(|bytes| bytes.checked_add(source_v7_seal_sidecar_bytes))
+        .and_then(|bytes| bytes.checked_add(v8_seal_sidecar_bytes))
+        .and_then(|bytes| bytes.checked_add(successor_image_bytes))
+        .and_then(|bytes| bytes.checked_add(successor_staging_bytes))
+        .and_then(|bytes| bytes.checked_add(terminal_manifest_headroom_bytes))
+        .ok_or_else(|| anyhow::anyhow!("PITR v8 migration capacity requirement overflows"))?;
+    let required_total_bytes = retained_source_spool_bytes
+        .checked_add(required_transition_bytes)
+        .ok_or_else(|| anyhow::anyhow!("PITR v8 migration total capacity overflows"))?;
+    let available_capacity_bytes = config
+        .max_source_spool_bytes
+        .saturating_sub(retained_source_spool_bytes);
+
+    let decision = if config.max_segment_bytes < MINIMUM_NONEMPTY_V8_SEGMENT_BYTES {
+        V8MigrationCapacityDecision::Deferred(V8MigrationDeferralReason::SegmentLimitTooSmall)
+    } else if config.max_segment_bytes > crate::wal::MAX_WAL_FILE_SIZE {
+        V8MigrationCapacityDecision::Deferred(V8MigrationDeferralReason::SegmentLimitTooLarge)
+    } else if required_transition_bytes > available_capacity_bytes {
+        V8MigrationCapacityDecision::Deferred(V8MigrationDeferralReason::InsufficientSourceSpool)
+    } else {
+        V8MigrationCapacityDecision::Eligible
+    };
+
+    Ok(V8MigrationCapacity {
+        decision,
+        source_spool_limit_bytes: config.max_source_spool_bytes,
+        retained_source_spool_bytes,
+        available_capacity_bytes,
+        required_transition_bytes,
+        required_total_bytes,
+        configured_segment_limit_bytes: config.max_segment_bytes,
+        source_v7_active_image_bytes,
+        source_v7_active_growth_bytes,
+        v8_active_image_bytes,
+        recovery_workspace_bytes,
+        source_v7_seal_sidecar_bytes,
+        v8_seal_sidecar_bytes,
+        successor_image_bytes,
+        successor_staging_bytes,
+        terminal_manifest_headroom_bytes,
+    })
+}
+
 fn round_up_to_allocation_unit(bytes: u64, allocation_unit: u64) -> Result<u64> {
     let remainder = bytes % allocation_unit;
     if remainder == 0 {
@@ -322,6 +561,17 @@ mod tests {
         .unwrap()
     }
 
+    fn eligible_v8_migration_capacity() -> V8MigrationCapacity {
+        assess_v8_migration_capacity(
+            &config(MINIMUM_NONEMPTY_V8_SEGMENT_BYTES, 256 * 1024),
+            MINIMUM_EMPTY_V7_IMAGE_BYTES,
+            MINIMUM_EMPTY_V7_IMAGE_BYTES,
+            MINIMUM_EMPTY_V7_IMAGE_BYTES,
+            4096,
+        )
+        .unwrap()
+    }
+
     fn resource_ledger(
         max_source_spool_bytes: u64,
         max_recovery_workspace_bytes: u64,
@@ -341,6 +591,265 @@ mod tests {
         reserve_v7_migration_transition(capacity, &ledger)
             .err()
             .unwrap()
+    }
+
+    fn invalid_v8_assessment_error(capacity: V8MigrationCapacity) -> V8MigrationReservationError {
+        let ledger = resource_ledger(u64::MAX, u64::MAX);
+        reserve_v8_migration_transition(capacity, &ledger)
+            .err()
+            .unwrap()
+    }
+
+    #[test]
+    fn v8_migration_capacity_accounts_for_all_transition_and_retained_charges() {
+        let capacity = eligible_v8_migration_capacity();
+        assert_eq!(capacity.decision, V8MigrationCapacityDecision::Eligible);
+        assert_eq!(
+            capacity.source_v7_active_image_bytes,
+            MINIMUM_EMPTY_V7_IMAGE_BYTES
+        );
+        assert_eq!(
+            capacity.source_v7_active_growth_bytes,
+            MINIMUM_NONEMPTY_V8_SEGMENT_BYTES - MINIMUM_EMPTY_V7_IMAGE_BYTES
+        );
+        assert_eq!(
+            capacity.v8_active_image_bytes,
+            MINIMUM_NONEMPTY_V8_SEGMENT_BYTES
+        );
+        assert_eq!(
+            capacity.recovery_workspace_bytes,
+            capacity.v8_active_image_bytes
+        );
+        assert_eq!(capacity.source_v7_seal_sidecar_bytes, 4096);
+        assert_eq!(capacity.v8_seal_sidecar_bytes, 4096);
+        assert_eq!(capacity.successor_image_bytes, MINIMUM_EMPTY_V8_IMAGE_BYTES);
+        assert_eq!(
+            capacity.successor_staging_bytes,
+            MINIMUM_EMPTY_V8_IMAGE_BYTES
+        );
+        assert_eq!(capacity.terminal_manifest_headroom_bytes, 4096);
+        assert_eq!(
+            capacity.required_total_bytes,
+            capacity.retained_source_spool_bytes + capacity.required_transition_bytes
+        );
+        assert_eq!(
+            capacity.available_capacity_bytes,
+            256 * 1024 - MINIMUM_EMPTY_V7_IMAGE_BYTES
+        );
+
+        let exact_fit = assess_v8_migration_capacity(
+            &config(
+                MINIMUM_NONEMPTY_V8_SEGMENT_BYTES,
+                capacity.required_total_bytes,
+            ),
+            capacity.source_v7_active_image_bytes,
+            MINIMUM_EMPTY_V7_IMAGE_BYTES,
+            capacity.retained_source_spool_bytes,
+            4096,
+        )
+        .unwrap();
+        assert_eq!(exact_fit.decision, V8MigrationCapacityDecision::Eligible);
+
+        let one_unit_short = assess_v8_migration_capacity(
+            &config(
+                MINIMUM_NONEMPTY_V8_SEGMENT_BYTES,
+                exact_fit.required_total_bytes - 4096,
+            ),
+            exact_fit.source_v7_active_image_bytes,
+            MINIMUM_EMPTY_V7_IMAGE_BYTES,
+            exact_fit.retained_source_spool_bytes,
+            4096,
+        )
+        .unwrap();
+        assert_eq!(
+            one_unit_short.decision,
+            V8MigrationCapacityDecision::Deferred(
+                V8MigrationDeferralReason::InsufficientSourceSpool
+            )
+        );
+
+        let larger_segment_limit = 1024 * 1024;
+        let larger_segment = assess_v8_migration_capacity(
+            &config(larger_segment_limit, 4 * 1024 * 1024),
+            MINIMUM_EMPTY_V7_IMAGE_BYTES,
+            MINIMUM_EMPTY_V7_IMAGE_BYTES,
+            0,
+            4096,
+        )
+        .unwrap();
+        let expected_source_seal_bytes =
+            crate::pitr::seal::V7Seal::max_encoded_len(larger_segment_limit).unwrap();
+        assert_eq!(
+            larger_segment.source_v7_seal_sidecar_bytes,
+            round_up_to_allocation_unit(u64::try_from(expected_source_seal_bytes).unwrap(), 4096,)
+                .unwrap()
+        );
+        assert!(larger_segment.source_v7_seal_sidecar_bytes > 4096);
+    }
+
+    #[test]
+    fn v8_migration_capacity_rounds_extents_and_defers_invalid_limits() {
+        let rounded = assess_v8_migration_capacity(
+            &config(MINIMUM_NONEMPTY_V8_SEGMENT_BYTES + 1, 512 * 1024),
+            MINIMUM_EMPTY_V7_IMAGE_BYTES,
+            MINIMUM_EMPTY_V7_IMAGE_BYTES,
+            2 * MINIMUM_EMPTY_V7_IMAGE_BYTES,
+            8192,
+        )
+        .unwrap();
+        for bytes in [
+            rounded.source_v7_active_growth_bytes,
+            rounded.v8_active_image_bytes,
+            rounded.recovery_workspace_bytes,
+            rounded.source_v7_seal_sidecar_bytes,
+            rounded.v8_seal_sidecar_bytes,
+            rounded.successor_image_bytes,
+            rounded.successor_staging_bytes,
+            rounded.terminal_manifest_headroom_bytes,
+        ] {
+            assert_eq!(bytes % 8192, 0);
+        }
+        assert_eq!(rounded.decision, V8MigrationCapacityDecision::Eligible);
+
+        let too_small = assess_v8_migration_capacity(
+            &config(MINIMUM_NONEMPTY_V8_SEGMENT_BYTES - 1, 512 * 1024),
+            MINIMUM_EMPTY_V7_IMAGE_BYTES,
+            MINIMUM_EMPTY_V7_IMAGE_BYTES,
+            0,
+            4096,
+        )
+        .unwrap();
+        assert_eq!(
+            too_small.decision,
+            V8MigrationCapacityDecision::Deferred(V8MigrationDeferralReason::SegmentLimitTooSmall)
+        );
+
+        let too_large = assess_v8_migration_capacity(
+            &config(crate::wal::MAX_WAL_FILE_SIZE + 1, u64::MAX),
+            MINIMUM_EMPTY_V7_IMAGE_BYTES,
+            MINIMUM_EMPTY_V7_IMAGE_BYTES,
+            0,
+            4096,
+        )
+        .unwrap();
+        assert_eq!(
+            too_large.decision,
+            V8MigrationCapacityDecision::Deferred(V8MigrationDeferralReason::SegmentLimitTooLarge)
+        );
+
+        assert!(
+            assess_v8_migration_capacity(
+                &config(MINIMUM_NONEMPTY_V8_SEGMENT_BYTES, 512 * 1024),
+                MINIMUM_EMPTY_V7_IMAGE_BYTES + 1,
+                MINIMUM_EMPTY_V7_IMAGE_BYTES,
+                0,
+                4096,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn v8_migration_capacity_rejects_total_charge_overflow() {
+        assert!(
+            assess_v8_migration_capacity(
+                &config(MINIMUM_NONEMPTY_V8_SEGMENT_BYTES, u64::MAX),
+                MINIMUM_EMPTY_V7_IMAGE_BYTES,
+                MINIMUM_EMPTY_V7_IMAGE_BYTES,
+                u64::MAX,
+                4096,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn v8_migration_reservation_owns_both_charges_until_drop() {
+        let capacity = eligible_v8_migration_capacity();
+        assert_eq!(capacity.decision, V8MigrationCapacityDecision::Eligible);
+        let source_spool_bytes =
+            capacity.required_transition_bytes - capacity.recovery_workspace_bytes;
+        let ledger = resource_ledger(
+            capacity.source_spool_limit_bytes,
+            capacity.recovery_workspace_bytes,
+        );
+
+        let reservation = reserve_v8_migration_transition(capacity, &ledger).unwrap();
+        assert_eq!(
+            ledger.snapshot(),
+            WalV7ResourceCharge {
+                source_spool_bytes,
+                recovery_workspace_bytes: capacity.recovery_workspace_bytes,
+                ..WalV7ResourceCharge::default()
+            }
+        );
+
+        drop(reservation);
+        assert_eq!(ledger.snapshot(), WalV7ResourceCharge::default());
+    }
+
+    #[test]
+    fn v8_migration_reservation_rejects_deferred_and_malformed_assessments() {
+        let deferred = assess_v8_migration_capacity(
+            &config(
+                MINIMUM_NONEMPTY_V8_SEGMENT_BYTES,
+                MINIMUM_NONEMPTY_V8_SEGMENT_BYTES,
+            ),
+            MINIMUM_EMPTY_V7_IMAGE_BYTES,
+            MINIMUM_EMPTY_V7_IMAGE_BYTES,
+            0,
+            4096,
+        )
+        .unwrap();
+        let ledger = resource_ledger(u64::MAX, u64::MAX);
+        let error = reserve_v8_migration_transition(deferred, &ledger).unwrap_err();
+        assert!(matches!(
+            error,
+            V8MigrationReservationError::Deferred(
+                V8MigrationDeferralReason::InsufficientSourceSpool
+            )
+        ));
+        assert_eq!(
+            error.to_string(),
+            "PITR v8 migration is deferred: InsufficientSourceSpool"
+        );
+        assert!(error.source().is_none());
+        assert_eq!(ledger.snapshot(), WalV7ResourceCharge::default());
+
+        let mut invalid = eligible_v8_migration_capacity();
+        invalid.required_transition_bytes = invalid.recovery_workspace_bytes - 1;
+        let error = invalid_v8_assessment_error(invalid);
+        assert!(matches!(
+            error,
+            V8MigrationReservationError::InvalidAssessment
+        ));
+        assert_eq!(
+            error.to_string(),
+            "invalid PITR v8 migration capacity assessment"
+        );
+        assert!(error.source().is_none());
+    }
+
+    #[test]
+    fn v8_migration_reservation_reports_live_ledger_rejection_atomically() {
+        let capacity = eligible_v8_migration_capacity();
+        let source_spool_bytes =
+            capacity.required_transition_bytes - capacity.recovery_workspace_bytes;
+        let ledger = resource_ledger(source_spool_bytes - 1, capacity.recovery_workspace_bytes);
+
+        let error = reserve_v8_migration_transition(capacity, &ledger).unwrap_err();
+        assert!(matches!(
+            error,
+            V8MigrationReservationError::Ledger(WalV7ReservationError::SourceSpoolLimit {
+                generation: 0
+            })
+        ));
+        assert_eq!(
+            error.to_string(),
+            "could not reserve PITR v8 migration capacity: v7 source spool limit exceeded"
+        );
+        assert!(error.source().is_some());
+        assert_eq!(ledger.snapshot(), WalV7ResourceCharge::default());
     }
 
     #[test]
@@ -689,6 +1198,7 @@ mod tests {
             archive_epoch_id: [u8::MAX; 16],
             segment_id: u64::MAX,
             incarnation: [u8::MAX; 16],
+            wal_format: crate::pitr::manifest::PitrWalFormat::V7,
             ticket_end: u64::MAX,
             durable_end: u64::MAX,
             last_commit_ts: u64::MAX,

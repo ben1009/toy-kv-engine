@@ -1,0 +1,977 @@
+//! Crash-safe fresh-inode installation for an Active v8 recovery boundary.
+//!
+//! The caller must own exclusive recovery: all writers and descriptors for the
+//! source image must be drained before selection and installation begin.
+
+use std::{
+    fs::{self, File, OpenOptions},
+    io::{Read, Seek, SeekFrom, Write},
+    os::unix::fs::MetadataExt,
+    path::Path,
+    sync::atomic::{AtomicU64, Ordering},
+};
+
+use anyhow::{Context, Result, ensure};
+use sha2::{Digest, Sha256};
+
+use crate::{
+    pitr::{RecordedAt, WalV5Limits, manifest::ActiveBoundary},
+    wal::MAX_WAL_FILE_SIZE,
+};
+
+use super::{
+    codec::{
+        WAL_V8_FRAME_LEN, WalV8Frontier, WalV8Header, decode_frame_structural,
+        encode_frontier_successor, encode_generation_zero_frontier, frame_record_digest,
+    },
+    recovery::{
+        WalV8RecoverySelection, WalV8SealTicket, discover_frontier_candidates,
+        replay_selected_batches, select_active_candidate_for_replay,
+        select_active_candidate_for_validation,
+    },
+};
+
+const FRAME_LEN_U64: u64 = WAL_V8_FRAME_LEN as u64;
+const HEADER_LEN_U64: u64 = super::WAL_V8_HEADER_LEN as u64;
+const COPY_BUFFER_LEN: usize = 64 * 1024;
+
+static TEMP_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+/// Recovered v8 Active state after the accepted boundary is normalized and
+/// durably installed on a fresh inode.
+pub(crate) struct WalV8InstalledRecovery {
+    /// The accepted boundary, frontier-chain metadata, and diagnostics for
+    /// rejected newer candidates. Active recovery leaves `selection.batches`
+    /// empty and streams replay using the compact ticket index below.
+    pub(crate) selection: WalV8RecoverySelection,
+    pub(crate) replay_tickets: Vec<WalV8SealTicket>,
+    pub(crate) active_boundary: ActiveBoundary,
+    pub(crate) header_digest: [u8; 32],
+    pub(crate) frontier: WalV8Frontier,
+    pub(crate) frontier_offset: u64,
+    pub(crate) frontier_digest: [u8; 32],
+    pub(crate) image_len: u64,
+    pub(crate) next_ticket: u64,
+    pub(crate) installed_dev: u64,
+    pub(crate) installed_ino: u64,
+    pub(crate) last_recorded_at: Option<RecordedAt>,
+}
+
+/// Strictly verified v8 Sealing authority rebuilt from the immutable WAL
+/// prefix. The caller may install the returned sidecar only after the durable
+/// Sealing obligation is present in the manifest.
+#[allow(dead_code)] // Consumed by the Active v8 sealing lifecycle integration slice.
+pub(crate) struct WalV8SealingRecovery {
+    pub(crate) seal: crate::pitr::seal::V8Seal,
+    pub(crate) seal_bytes: Vec<u8>,
+    pub(crate) image_len: u64,
+    pub(crate) installed_dev: u64,
+    pub(crate) installed_ino: u64,
+}
+
+/// Durably create the canonical empty Active image for a new v8 segment.
+///
+/// This is a creation path, not recovery. The caller must have a durable
+/// manifest transition authorizing the segment identity and predecessor
+/// before publishing the returned boundary to writers.
+#[cfg(target_os = "linux")]
+pub(crate) fn create_empty_active_image(
+    path: impl AsRef<Path>,
+    header: WalV8Header,
+) -> Result<ActiveBoundary> {
+    let path = path.as_ref();
+    let header_bytes = header.encode()?;
+    let physical_header_digest = header.physical_digest()?;
+    let initial_prefix_digest = header.initial_prefix_digest()?;
+    let generation_zero =
+        encode_generation_zero_frontier(physical_header_digest, initial_prefix_digest)?;
+    let mut image = [0_u8; super::WAL_V8_HEADER_LEN + WAL_V8_FRAME_LEN];
+    image[..super::WAL_V8_HEADER_LEN].copy_from_slice(&header_bytes);
+    image[super::WAL_V8_HEADER_LEN..].copy_from_slice(&generation_zero);
+
+    crate::pitr::segment::install_pitr_file_no_replace_with_faults(
+        path,
+        &image,
+        crate::pitr::segment::PitrFileInstallFaults {
+            after_header_write_before_remainder: Some(
+                "wal_v8.active_image.after_temp_header_write_before_frontier_write",
+            ),
+            after_file_write_before_sync: Some("wal_v8.active_image.after_temp_write_before_sync"),
+            after_file_sync_before_rename: Some(
+                "wal_v8.active_image.after_temp_sync_before_rename",
+            ),
+            after_rename_before_directory_sync: Some(
+                "wal_v8.active_image.after_rename_before_directory_sync",
+            ),
+            inject_empty_active_image_failures: false,
+        },
+    )?;
+
+    let mut file = File::open(path).context("open newly installed empty v8 Active WAL")?;
+    let metadata = file.metadata().context("inspect empty v8 Active WAL")?;
+    ensure!(
+        metadata.len() == image.len() as u64,
+        "new empty v8 Active WAL has an unexpected length"
+    );
+    let mut installed_image = [0_u8; super::WAL_V8_HEADER_LEN + WAL_V8_FRAME_LEN];
+    file.read_exact(&mut installed_image)
+        .context("verify newly installed empty v8 Active WAL")?;
+    ensure!(
+        installed_image == image,
+        "new empty v8 Active WAL differs from its canonical image"
+    );
+
+    let frame_offset = HEADER_LEN_U64;
+    let decoded = decode_frame_structural(
+        &generation_zero,
+        frame_offset,
+        &physical_header_digest,
+        &initial_prefix_digest,
+    )?;
+    ensure!(
+        decoded.kind == super::codec::WalV8FrameKind::Frontier,
+        "new empty v8 Active WAL does not begin with generation-zero FRONTIER"
+    );
+    let frontier = WalV8Frontier::decode_body(&decoded.body)?;
+    frontier.validate_generation_zero(&initial_prefix_digest, frame_offset)?;
+
+    Ok(ActiveBoundary {
+        timeline_id: header.timeline_id.0,
+        archive_epoch_id: header.archive_epoch_id.0,
+        segment_id: header.segment_id.0,
+        incarnation: header.incarnation,
+        wal_format: crate::pitr::manifest::PitrWalFormat::V8,
+        ticket_end: 0,
+        durable_end: frame_offset,
+        last_commit_ts: 0,
+        prefix_digest: initial_prefix_digest,
+    })
+}
+
+/// Discover, validate, normalize and install an Active v8 WAL.
+///
+/// The complete source image remains the recovery authority until the
+/// replacement has been synced, renamed over it, and the containing directory
+/// has been synced. The selected marker is rewritten at the normalized physical
+/// boundary so a second crash during startup still leaves a recovery
+/// certificate.
+pub(crate) fn recover_and_install_active(
+    path: impl AsRef<Path>,
+    anchors: &[ActiveBoundary],
+    expected_predecessor: crate::pitr::ChainAnchor,
+    limits: WalV5Limits,
+    max_image_len: u64,
+) -> Result<WalV8InstalledRecovery> {
+    let path = path.as_ref();
+    let path_metadata = fs::symlink_metadata(path).context("inspect Active v8 WAL path")?;
+    ensure!(
+        path_metadata.file_type().is_file(),
+        "Active v8 WAL path is not a regular file"
+    );
+
+    let mut source = File::open(path).context("open Active v8 WAL for recovery")?;
+    let source_metadata = source.metadata().context("read Active v8 WAL metadata")?;
+    ensure!(
+        source_metadata.is_file(),
+        "Active v8 WAL is not a regular file"
+    );
+    let source_len = source_metadata.len();
+    ensure!(
+        (HEADER_LEN_U64 + FRAME_LEN_U64..=MAX_WAL_FILE_SIZE).contains(&source_len),
+        "Active v8 WAL length is outside the supported range"
+    );
+
+    let mut header_bytes = [0; super::WAL_V8_HEADER_LEN];
+    source
+        .seek(SeekFrom::Start(0))
+        .context("seek Active v8 WAL header")?;
+    source
+        .read_exact(&mut header_bytes)
+        .context("read Active v8 WAL header")?;
+    let header = super::codec::WalV8Header::decode(&header_bytes)?;
+    ensure!(
+        header.encode()? == header_bytes,
+        "Active v8 WAL header is not canonical"
+    );
+    ensure!(
+        header.predecessor == expected_predecessor,
+        "v8 WAL predecessor differs from authoritative segment identity"
+    );
+    let header_digest: [u8; 32] = Sha256::digest(header_bytes).into();
+    let initial_prefix_digest = header.initial_prefix_digest()?;
+    let discovery = discover_frontier_candidates(
+        &mut source,
+        source_len,
+        &header_digest,
+        &initial_prefix_digest,
+    )?;
+    let (selection, replay_tickets) = select_active_candidate_for_replay(
+        &mut source,
+        source_len,
+        &discovery,
+        anchors,
+        expected_predecessor,
+        limits,
+    )?;
+    let normalized_len = normalized_image_len(&selection)?;
+    ensure!(
+        normalized_len <= max_image_len && normalized_len <= MAX_WAL_FILE_SIZE,
+        "normalized Active v8 WAL exceeds the configured segment limit"
+    );
+
+    let installed = install_normalized_image(InstallRequest {
+        path,
+        source: &mut source,
+        source_len,
+        source_permissions: source_metadata.permissions(),
+        selection,
+        replay_tickets,
+        header_digest,
+        initial_prefix_digest,
+        limits,
+        normalized_len,
+    })?;
+    Ok(installed)
+}
+
+/// Recover an Active v8 image named by a durable Sealing obligation.
+///
+/// Unlike Active recovery this path never falls back or rewrites accepted
+/// bytes: it verifies the exact immutable boundary, checks any existing seal
+/// sidecar against that image, and installs an exact fresh-inode copy. Bytes
+/// after `boundary.sealed_end` are discarded only after the complete immutable
+/// prefix has passed strict validation.
+#[cfg(target_os = "linux")]
+#[allow(dead_code)] // Consumed by the Active v8 sealing lifecycle integration slice.
+pub(crate) fn recover_sealing_active(
+    path: impl AsRef<Path>,
+    boundary: crate::pitr::manifest::ImmutableBoundary,
+    expected_predecessor: crate::pitr::ChainAnchor,
+    max_image_len: u64,
+) -> Result<WalV8SealingRecovery> {
+    use crate::pitr::seal::build_v8_seal_from_reader;
+
+    boundary.validate()?;
+    ensure!(
+        boundary.active.wal_format == crate::pitr::manifest::PitrWalFormat::V8,
+        "v8 Sealing recovery received a non-v8 immutable boundary"
+    );
+    ensure!(
+        boundary.sealed_end <= max_image_len && max_image_len <= MAX_WAL_FILE_SIZE,
+        "immutable v8 WAL exceeds its configured segment limit"
+    );
+
+    let path = path.as_ref();
+    let path_metadata = fs::symlink_metadata(path).context("inspect Sealing v8 WAL path")?;
+    ensure!(
+        path_metadata.file_type().is_file(),
+        "Sealing v8 WAL path is not a regular file"
+    );
+    let mut source = File::open(path).context("open Sealing v8 WAL for strict recovery")?;
+    let source_metadata = source.metadata().context("inspect opened Sealing v8 WAL")?;
+    let source_len = source_metadata.len();
+    ensure!(
+        source_metadata.is_file()
+            && source_metadata.dev() == path_metadata.dev()
+            && source_metadata.ino() == path_metadata.ino()
+            && source_len >= boundary.sealed_end
+            && source_len <= max_image_len,
+        "Sealing v8 WAL length or inode is outside its durable boundary and configured limit"
+    );
+
+    let (seal, seal_bytes) = build_v8_seal_from_reader(
+        &mut source,
+        boundary.sealed_end,
+        boundary.active,
+        expected_predecessor,
+    )?;
+    ensure!(
+        seal.boundary == boundary
+            && seal.header.segment_id.0 == boundary.active.segment_id
+            && seal.header.timeline_id.0 == boundary.active.timeline_id
+            && seal.header.archive_epoch_id.0 == boundary.active.archive_epoch_id
+            && seal.header.incarnation == boundary.active.incarnation,
+        "strict v8 Sealing recovery differs from its immutable manifest boundary"
+    );
+    validate_existing_v8_sealing_sidecar(path, boundary, max_image_len, &seal, &seal_bytes)?;
+
+    let installed_metadata = install_exact_v8_recovery_image(
+        path,
+        &mut source,
+        source_len,
+        boundary.sealed_end,
+        boundary.wal_digest,
+    )?;
+    Ok(WalV8SealingRecovery {
+        seal,
+        seal_bytes,
+        image_len: boundary.sealed_end,
+        installed_dev: installed_metadata.dev(),
+        installed_ino: installed_metadata.ino(),
+    })
+}
+
+fn validate_existing_v8_sealing_sidecar(
+    wal_path: &Path,
+    boundary: crate::pitr::manifest::ImmutableBoundary,
+    max_image_len: u64,
+    expected_seal: &crate::pitr::seal::V8Seal,
+    expected_bytes: &[u8],
+) -> Result<()> {
+    let seal_path = wal_path.with_extension("seal");
+    match fs::symlink_metadata(&seal_path) {
+        Ok(metadata) => ensure!(
+            metadata.file_type().is_file(),
+            "Sealing v8 seal sidecar is not a regular file"
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error).context("inspect Sealing v8 seal sidecar"),
+    }
+    let (format, bytes) = crate::pitr::seal::read_seal_sidecar_for_format(
+        &seal_path,
+        Some(max_image_len),
+        crate::pitr::seal::SealSidecarFormat::V8,
+    )?;
+    ensure!(
+        format == crate::pitr::seal::SealSidecarFormat::V8,
+        "Sealing v8 sidecar has the wrong seal format"
+    );
+    let seal = crate::pitr::seal::V8Seal::decode(&bytes, boundary.sealed_end)?;
+    ensure!(
+        seal == *expected_seal && bytes == expected_bytes,
+        "Sealing v8 sidecar differs from its immutable WAL authority"
+    );
+    Ok(())
+}
+
+/// Copy an already validated immutable v8 image to a fresh inode and durably
+/// replace its canonical pathname without changing any image bytes.
+fn install_exact_v8_recovery_image(
+    source_path: &Path,
+    source: &mut File,
+    source_len: u64,
+    image_len: u64,
+    expected_digest: [u8; 32],
+) -> Result<fs::Metadata> {
+    ensure!(
+        image_len <= source_len,
+        "immutable v8 image exceeds its source length"
+    );
+    let file_name = source_path
+        .file_name()
+        .filter(|name| !name.is_empty())
+        .context("immutable v8 WAL path has no file name")?;
+    let parent = source_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let source_metadata = source
+        .metadata()
+        .context("read immutable v8 WAL metadata")?;
+    ensure!(
+        source_metadata.is_file(),
+        "immutable v8 WAL is not a regular file"
+    );
+
+    let parent_dir = File::open(parent).context("open immutable v8 WAL directory")?;
+    let temp_prefix = recovery_temp_prefix(file_name);
+    cleanup_stale_recovery_images(parent, &parent_dir, &temp_prefix)?;
+    let temp_path = parent.join(format!(
+        "{temp_prefix}{}-{}",
+        std::process::id(),
+        TEMP_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    ));
+    let mut temp_created = false;
+    let result = (|| -> Result<fs::Metadata> {
+        let mut temp = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)
+            .context("create immutable v8 recovery image")?;
+        temp_created = true;
+        fs::set_permissions(&temp_path, source_metadata.permissions())
+            .context("preserve immutable v8 WAL permissions")?;
+
+        source
+            .seek(SeekFrom::Start(0))
+            .context("seek immutable v8 WAL for copy")?;
+        let mut copied_hasher = Sha256::new();
+        let mut remaining = image_len;
+        let mut buffer = [0_u8; COPY_BUFFER_LEN];
+        while remaining > 0 {
+            let chunk_len = usize::try_from(remaining.min(COPY_BUFFER_LEN as u64))?;
+            source
+                .read_exact(&mut buffer[..chunk_len])
+                .context("read immutable v8 WAL for copy")?;
+            temp.write_all(&buffer[..chunk_len])
+                .context("write immutable v8 recovery image")?;
+            copied_hasher.update(&buffer[..chunk_len]);
+            remaining -= u64::try_from(chunk_len)?;
+        }
+        let copied_digest: [u8; 32] = copied_hasher.finalize().into();
+        ensure!(
+            copied_digest == expected_digest,
+            "copied immutable v8 image differs from its Sealing digest"
+        );
+        ensure!(
+            source.metadata()?.len() == source_len,
+            "immutable v8 WAL changed during exclusive recovery"
+        );
+        let current_path_metadata = fs::symlink_metadata(source_path)
+            .context("reinspect immutable v8 WAL path before replacement")?;
+        ensure!(
+            current_path_metadata.file_type().is_file()
+                && current_path_metadata.dev() == source_metadata.dev()
+                && current_path_metadata.ino() == source_metadata.ino(),
+            "immutable v8 WAL path changed during exclusive recovery"
+        );
+        let temp_metadata = temp.metadata()?;
+        ensure!(
+            temp_metadata.len() == image_len && temp_metadata.dev() == source_metadata.dev(),
+            "immutable v8 recovery image has an unexpected size or device"
+        );
+        #[cfg(feature = "chaos-testing")]
+        crate::chaos::failpoint::wal_crash_point(
+            "wal_v8.sealing_recovery.after_temp_write_before_sync",
+        );
+        #[cfg(feature = "chaos-testing")]
+        crate::chaos::failpoint::fail_point!("wal_v8.sealing_recovery.before_temp_sync", |_| Err(
+            anyhow::anyhow!("injected immutable v8 recovery image sync failure")
+        ));
+        temp.sync_all()
+            .context("sync exact immutable v8 recovery image")?;
+        #[cfg(feature = "chaos-testing")]
+        crate::chaos::failpoint::wal_crash_point(
+            "wal_v8.sealing_recovery.after_temp_sync_before_rename",
+        );
+        drop(temp);
+
+        #[cfg(feature = "chaos-testing")]
+        crate::chaos::failpoint::fail_point!("wal_v8.sealing_recovery.before_rename", |_| Err(
+            anyhow::anyhow!("injected immutable v8 recovery rename failure")
+        ));
+        fs::rename(&temp_path, source_path)
+            .context("atomically replace immutable v8 WAL with recovery image")?;
+        #[cfg(feature = "chaos-testing")]
+        crate::chaos::failpoint::wal_crash_point(
+            "wal_v8.sealing_recovery.after_rename_before_directory_sync",
+        );
+        #[cfg(feature = "chaos-testing")]
+        crate::chaos::failpoint::fail_point!(
+            "wal_v8.sealing_recovery.before_directory_sync",
+            |_| Err(anyhow::anyhow!(
+                "injected immutable v8 recovery directory sync failure"
+            ))
+        );
+        parent_dir
+            .sync_all()
+            .context("sync immutable v8 WAL directory after replacement")?;
+        #[cfg(feature = "chaos-testing")]
+        crate::chaos::failpoint::wal_crash_point("wal_v8.sealing_recovery.after_directory_sync");
+        let installed_metadata = fs::symlink_metadata(source_path)
+            .context("inspect installed immutable v8 WAL inode")?;
+        ensure!(
+            installed_metadata.file_type().is_file()
+                && installed_metadata.len() == image_len
+                && installed_metadata.dev() == source_metadata.dev(),
+            "installed immutable v8 WAL has an unexpected file type, size, or device"
+        );
+        Ok(installed_metadata)
+    })();
+
+    match result {
+        Err(operation_error) if temp_created => {
+            match cleanup_failed_recovery_image(&temp_path, &parent_dir) {
+                Ok(()) => Err(operation_error),
+                Err(cleanup_error) => Err(anyhow::anyhow!(
+                    "{operation_error:#}; additionally, failed to durably clean the temporary immutable v8 recovery image: {cleanup_error:#}"
+                )),
+            }
+        }
+        other => other,
+    }
+}
+
+fn normalized_image_len(selection: &WalV8RecoverySelection) -> Result<u64> {
+    if selection.active_boundary.ticket_end == 0 {
+        return Ok(HEADER_LEN_U64 + FRAME_LEN_U64);
+    }
+    selection
+        .active_boundary
+        .durable_end
+        .checked_add(FRAME_LEN_U64)
+        .context("normalized Active v8 image length overflows")
+}
+
+struct InstallRequest<'a> {
+    path: &'a Path,
+    source: &'a mut File,
+    source_len: u64,
+    source_permissions: fs::Permissions,
+    selection: WalV8RecoverySelection,
+    replay_tickets: Vec<WalV8SealTicket>,
+    header_digest: [u8; 32],
+    initial_prefix_digest: super::digest::WalV8Digest,
+    limits: WalV5Limits,
+    normalized_len: u64,
+}
+
+fn install_normalized_image(request: InstallRequest<'_>) -> Result<WalV8InstalledRecovery> {
+    let InstallRequest {
+        path,
+        source,
+        source_len,
+        source_permissions,
+        selection,
+        replay_tickets,
+        header_digest,
+        initial_prefix_digest,
+        limits,
+        normalized_len,
+    } = request;
+    let file_name = path
+        .file_name()
+        .filter(|name| !name.is_empty())
+        .context("Active v8 WAL path has no file name")?;
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let parent_dir = File::open(parent).context("open Active v8 WAL directory")?;
+    let temp_prefix = recovery_temp_prefix(file_name);
+    cleanup_stale_recovery_images(parent, &parent_dir, &temp_prefix)?;
+    let temp_path = parent.join(format!(
+        "{temp_prefix}{}-{}",
+        std::process::id(),
+        TEMP_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    ));
+
+    let mut temp_created = false;
+    let result = (|| -> Result<WalV8InstalledRecovery> {
+        let mut temp = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)
+            .context("create Active v8 recovery image")?;
+        temp_created = true;
+        fs::set_permissions(&temp_path, source_permissions)
+            .context("preserve Active v8 WAL permissions")?;
+
+        let (frontier, frontier_offset, frontier_digest) =
+            if selection.active_boundary.ticket_end == 0 {
+                ensure!(
+                    selection.candidate.frontier.generation == 0
+                        && selection.candidate.frame_offset == HEADER_LEN_U64
+                        && selection.candidate.frontier.prefix_digest == initial_prefix_digest,
+                    "empty Active v8 recovery selected a noncanonical initial frontier"
+                );
+                let frame = encode_generation_zero_frontier(header_digest, initial_prefix_digest)?;
+                let digest = frame_record_digest(&frame)?;
+                ensure!(
+                    selection.candidate.frame_digest == digest,
+                    "empty Active v8 FRONTIER digest changed after selection"
+                );
+                validate_selected_candidate(
+                    source,
+                    source_len,
+                    &selection,
+                    header_digest,
+                    initial_prefix_digest,
+                )?;
+                temp.write_all(&selection.header_bytes)
+                    .context("write normalized Active v8 header")?;
+                temp.write_all(&frame)
+                    .context("write normalized Active v8 generation-zero FRONTIER")?;
+                (selection.candidate.frontier, HEADER_LEN_U64, digest)
+            } else {
+                let durable_end = selection.active_boundary.durable_end;
+                ensure!(
+                    durable_end >= HEADER_LEN_U64 + FRAME_LEN_U64
+                        && durable_end.is_multiple_of(FRAME_LEN_U64)
+                        && durable_end <= source_len,
+                    "Active v8 durable boundary is outside the source image"
+                );
+                temp.write_all(&selection.header_bytes)
+                    .context("write normalized Active v8 header")?;
+                copy_retained_prefix(source, &mut temp, durable_end - HEADER_LEN_U64)?;
+                ensure!(
+                    source.metadata()?.len() == source_len,
+                    "Active v8 WAL changed during exclusive recovery"
+                );
+
+                let frontier_offset = durable_end;
+                let generation = selection
+                    .last_frontier
+                    .generation
+                    .checked_add(1)
+                    .context("normalized Active v8 FRONTIER generation overflows")?;
+                let frontier = WalV8Frontier {
+                    generation,
+                    ticket_end: selection.active_boundary.ticket_end,
+                    durable_end,
+                    last_commit_ts: selection.active_boundary.last_commit_ts,
+                    prefix_digest: selection.active_boundary.prefix_digest,
+                    previous_frontier_offset: selection.last_frontier_offset,
+                    previous_frontier_digest: selection.last_frontier_digest,
+                };
+                let frame = encode_frontier_successor(
+                    frontier,
+                    selection.last_frontier,
+                    selection.last_frontier_offset,
+                    &selection.last_frontier_digest,
+                    frontier_offset,
+                    header_digest,
+                    initial_prefix_digest,
+                )?;
+                validate_selected_candidate(
+                    source,
+                    source_len,
+                    &selection,
+                    header_digest,
+                    initial_prefix_digest,
+                )?;
+                temp.write_all(&frame)
+                    .context("append normalized Active v8 recovery FRONTIER")?;
+                (frontier, frontier_offset, frame_record_digest(&frame)?)
+            };
+
+        ensure!(
+            temp.metadata()?.len() == normalized_len,
+            "normalized Active v8 WAL has an unexpected length"
+        );
+        temp.flush()
+            .context("flush normalized Active v8 recovery image before verification")?;
+        #[cfg(feature = "chaos-testing")]
+        crate::chaos::failpoint::wal_crash_point("wal_v8.recovery.after_temp_write_before_sync");
+        let mut verification_file =
+            File::open(&temp_path).context("open normalized Active v8 image for verification")?;
+        let verification_discovery = discover_frontier_candidates(
+            &mut verification_file,
+            normalized_len,
+            &header_digest,
+            &initial_prefix_digest,
+        )?;
+        let verified = select_active_candidate_for_validation(
+            &mut verification_file,
+            normalized_len,
+            &verification_discovery,
+            &selection.hard_anchors,
+            selection.header.predecessor,
+            limits,
+        )?;
+        ensure!(
+            verified.active_boundary == selection.active_boundary
+                && verified.candidate.frontier == frontier,
+            "normalized Active v8 image does not reproduce its selected logical boundary"
+        );
+        drop(verification_file);
+        #[cfg(feature = "chaos-testing")]
+        crate::chaos::failpoint::fail_point!("wal_v8.recovery.before_temp_sync", |_| Err(
+            anyhow::anyhow!("injected Active v8 recovery image sync failure")
+        ));
+        temp.sync_all()
+            .context("sync normalized Active v8 recovery image")?;
+        #[cfg(feature = "chaos-testing")]
+        crate::chaos::failpoint::wal_crash_point("wal_v8.recovery.after_temp_sync_before_rename");
+        drop(temp);
+
+        #[cfg(feature = "chaos-testing")]
+        crate::chaos::failpoint::fail_point!("wal_v8.recovery.before_rename", |_| Err(
+            anyhow::anyhow!("injected Active v8 recovery rename failure")
+        ));
+        fs::rename(&temp_path, path).context("atomically replace Active v8 WAL")?;
+        #[cfg(feature = "chaos-testing")]
+        crate::chaos::failpoint::wal_crash_point(
+            "wal_v8.recovery.after_rename_before_directory_sync",
+        );
+        #[cfg(feature = "chaos-testing")]
+        crate::chaos::failpoint::fail_point!("wal_v8.recovery.before_directory_sync", |_| Err(
+            anyhow::anyhow!("injected Active v8 recovery directory sync failure")
+        ));
+        parent_dir
+            .sync_all()
+            .context("sync Active v8 WAL directory after replacement")?;
+        #[cfg(feature = "chaos-testing")]
+        crate::chaos::failpoint::wal_crash_point("wal_v8.recovery.after_directory_sync");
+        let installed_metadata =
+            fs::symlink_metadata(path).context("inspect installed Active v8 WAL inode")?;
+        ensure!(
+            installed_metadata.file_type().is_file() && installed_metadata.len() == normalized_len,
+            "installed Active v8 WAL has an unexpected file type or length"
+        );
+
+        let last_recorded_at = replay_tickets.last().map(|ticket| ticket.recorded_at);
+        Ok(WalV8InstalledRecovery {
+            next_ticket: selection.active_boundary.ticket_end,
+            last_recorded_at,
+            active_boundary: selection.active_boundary,
+            header_digest,
+            frontier,
+            frontier_offset,
+            frontier_digest,
+            image_len: normalized_len,
+            installed_dev: installed_metadata.dev(),
+            installed_ino: installed_metadata.ino(),
+            replay_tickets,
+            selection,
+        })
+    })();
+
+    match result {
+        Err(operation_error) if temp_created => {
+            match cleanup_failed_recovery_image(&temp_path, &parent_dir) {
+                Ok(()) => Err(operation_error),
+                Err(cleanup_error) => Err(anyhow::anyhow!(
+                    "{operation_error:#}; additionally, failed to durably clean the temporary Active v8 recovery image: {cleanup_error:#}"
+                )),
+            }
+        }
+        other => other,
+    }
+}
+
+/// Replay batches from a normalized image after checking that the installed
+/// inode still matches the recovery result. Only one decoded batch is retained
+/// at a time while the caller applies it to the recovered memtable.
+pub(crate) fn replay_installed_active_batches(
+    path: impl AsRef<Path>,
+    installed: &WalV8InstalledRecovery,
+    limits: WalV5Limits,
+    mut apply: impl FnMut(&crate::pitr::WalBatch) -> Result<()>,
+) -> Result<()> {
+    let path = path.as_ref();
+    let path_metadata = fs::symlink_metadata(path).context("inspect installed Active v8 WAL")?;
+    ensure!(
+        path_metadata.file_type().is_file(),
+        "installed Active v8 WAL path is not a regular file"
+    );
+    ensure!(
+        path_metadata.dev() == installed.installed_dev
+            && path_metadata.ino() == installed.installed_ino
+            && path_metadata.len() == installed.image_len,
+        "installed Active v8 WAL changed before memtable replay"
+    );
+    let mut file = File::open(path).context("open installed Active v8 WAL for replay")?;
+    let file_metadata = file
+        .metadata()
+        .context("inspect opened Active v8 WAL for replay")?;
+    ensure!(
+        file_metadata.is_file()
+            && file_metadata.dev() == installed.installed_dev
+            && file_metadata.ino() == installed.installed_ino
+            && file_metadata.len() == installed.image_len,
+        "opened Active v8 WAL differs from the installed recovery inode"
+    );
+    let mut header_bytes = [0; super::WAL_V8_HEADER_LEN];
+    file.seek(SeekFrom::Start(0))
+        .context("seek installed Active v8 WAL header for replay")?;
+    file.read_exact(&mut header_bytes)
+        .context("read installed Active v8 WAL header for replay")?;
+    let header = WalV8Header::decode(&header_bytes)?;
+    ensure!(
+        header.encode()? == header_bytes && header == installed.selection.header,
+        "installed Active v8 WAL header changed before memtable replay"
+    );
+    let header_digest: [u8; 32] = Sha256::digest(header_bytes).into();
+    ensure!(
+        header_digest == installed.header_digest
+            && header_digest == installed.selection.physical_header_digest,
+        "installed Active v8 WAL header digest changed before memtable replay"
+    );
+    replay_selected_batches(
+        &mut file,
+        &installed.selection,
+        &installed.replay_tickets,
+        limits,
+        |batch| apply(&batch),
+    )
+}
+
+fn validate_selected_candidate(
+    source: &mut File,
+    source_len: u64,
+    selection: &WalV8RecoverySelection,
+    header_digest: [u8; 32],
+    initial_prefix_digest: super::digest::WalV8Digest,
+) -> Result<()> {
+    let candidate_end = selection
+        .candidate
+        .frame_offset
+        .checked_add(FRAME_LEN_U64)
+        .context("selected Active v8 FRONTIER end overflows")?;
+    ensure!(
+        candidate_end <= source_len,
+        "selected Active v8 FRONTIER exceeds the source image"
+    );
+    let mut bytes = [0; WAL_V8_FRAME_LEN];
+    source
+        .seek(SeekFrom::Start(selection.candidate.frame_offset))
+        .context("seek selected Active v8 FRONTIER")?;
+    source
+        .read_exact(&mut bytes)
+        .context("read selected Active v8 FRONTIER")?;
+    ensure!(
+        frame_record_digest(&bytes)? == selection.candidate.frame_digest,
+        "selected Active v8 FRONTIER changed after selection"
+    );
+    let decoded = decode_frame_structural(
+        &bytes,
+        selection.candidate.frame_offset,
+        &header_digest,
+        &initial_prefix_digest,
+    )?;
+    ensure!(
+        decoded.kind == super::codec::WalV8FrameKind::Frontier
+            && WalV8Frontier::decode_body(&decoded.body)? == selection.candidate.frontier,
+        "selected Active v8 FRONTIER contents changed after selection"
+    );
+    Ok(())
+}
+
+fn copy_retained_prefix(
+    source: &mut File,
+    destination: &mut File,
+    mut remaining: u64,
+) -> Result<()> {
+    source
+        .seek(SeekFrom::Start(HEADER_LEN_U64))
+        .context("seek Active v8 retained prefix")?;
+    let mut buffer = [0; COPY_BUFFER_LEN];
+    while remaining > 0 {
+        let chunk_len = usize::try_from(remaining.min(COPY_BUFFER_LEN as u64))?;
+        source
+            .read_exact(&mut buffer[..chunk_len])
+            .context("read Active v8 retained prefix")?;
+        destination
+            .write_all(&buffer[..chunk_len])
+            .context("write normalized Active v8 retained prefix")?;
+        remaining -= u64::try_from(chunk_len)?;
+    }
+    Ok(())
+}
+
+fn recovery_temp_prefix(file_name: &std::ffi::OsStr) -> String {
+    let digest = Sha256::digest(file_name.as_encoded_bytes());
+    let mut output = String::with_capacity(digest.len() * 2);
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    for byte in digest {
+        output.push(char::from(HEX[usize::from(byte >> 4)]));
+        output.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    format!(".toy-kv-v8-recovery-{output}.tmp-")
+}
+
+fn cleanup_stale_recovery_images(parent: &Path, parent_dir: &File, prefix: &str) -> Result<()> {
+    for entry in fs::read_dir(parent).context("scan for stale v8 recovery images")? {
+        let entry = entry.context("read v8 recovery directory entry")?;
+        if !entry
+            .file_name()
+            .as_encoded_bytes()
+            .starts_with(prefix.as_bytes())
+        {
+            continue;
+        }
+        if !entry
+            .file_type()
+            .context("inspect stale v8 recovery image")?
+            .is_file()
+        {
+            continue;
+        }
+        match fs::remove_file(entry.path()) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error).context("remove stale v8 recovery image"),
+        }
+    }
+    parent_dir
+        .sync_all()
+        .context("sync directory after checking stale v8 recovery images")
+}
+
+fn cleanup_failed_recovery_image(temp_path: &Path, parent_dir: &File) -> Result<()> {
+    match fs::remove_file(temp_path) {
+        Ok(()) => parent_dir
+            .sync_all()
+            .context("sync directory after removing failed v8 recovery image"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => parent_dir
+            .sync_all()
+            .context("sync directory after confirming failed v8 recovery image is absent"),
+        Err(error) => Err(error).context("remove failed v8 recovery image"),
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+    use crate::pitr::{ArchiveEpochId, ChainAnchor, LIVE_WAL_V5_LIMITS, SegmentId, TimelineId};
+
+    fn test_header() -> WalV8Header {
+        let archive_epoch_id = ArchiveEpochId([2; 16]);
+        WalV8Header {
+            timeline_id: TimelineId([1; 16]),
+            archive_epoch_id,
+            segment_id: SegmentId(3),
+            predecessor: ChainAnchor::Genesis { archive_epoch_id },
+            incarnation: [4; 16],
+        }
+    }
+
+    #[test]
+    fn active_install_does_not_report_a_partial_speculative_tail() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("active-v8.wal");
+        let header = test_header();
+        let anchor = create_empty_active_image(&path, header)?;
+        let mut source = OpenOptions::new().append(true).open(&path)?;
+        source.write_all(b"partial speculative frame")?;
+        drop(source);
+
+        let installed = recover_and_install_active(
+            &path,
+            &[anchor],
+            header.predecessor,
+            LIVE_WAL_V5_LIMITS,
+            MAX_WAL_FILE_SIZE,
+        )?;
+
+        assert_eq!(installed.active_boundary, anchor);
+        assert_eq!(
+            installed.selection.diagnostics,
+            super::super::recovery::WalV8RecoveryDiagnostics::default()
+        );
+        assert_eq!(installed.image_len, HEADER_LEN_U64 + FRAME_LEN_U64);
+        Ok(())
+    }
+
+    #[test]
+    fn active_install_exposes_a_rejected_frontier_header() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("active-v8.wal");
+        let header = test_header();
+        let anchor = create_empty_active_image(&path, header)?;
+        let generation_zero = encode_generation_zero_frontier(
+            header.physical_digest()?,
+            header.initial_prefix_digest()?,
+        )?;
+        let mut source = OpenOptions::new().append(true).open(&path)?;
+        source.write_all(&generation_zero)?;
+        drop(source);
+
+        let installed = recover_and_install_active(
+            &path,
+            &[anchor],
+            header.predecessor,
+            LIVE_WAL_V5_LIMITS,
+            MAX_WAL_FILE_SIZE,
+        )?;
+
+        assert_eq!(installed.active_boundary, anchor);
+        let rejected = &installed.selection.diagnostics.rejected_newer_frontiers;
+        assert_eq!(rejected.len(), 1);
+        assert_eq!(rejected[0].frame_offset, HEADER_LEN_U64 + FRAME_LEN_U64);
+        assert_eq!(rejected[0].frame_end, HEADER_LEN_U64 + 2 * FRAME_LEN_U64);
+        assert!(rejected[0].reason.contains("frame offset mismatch"));
+        Ok(())
+    }
+}

@@ -40,6 +40,9 @@ use serde::{Deserialize, Serialize};
 
 const JSON_SCHEMA_V1: &str = "kv-engine.write-perf.v1";
 const JSON_SCHEMA_V2: &str = "kv-engine.write-perf.v2";
+#[cfg(feature = "bench")]
+// Keep in sync with `wal::v8::digest::WAL_V8_HASH_CPU_SAMPLE_RATE`.
+const WAL_V8_HASH_CPU_SAMPLE_RATE: u64 = 64;
 const GOLDEN_MANIFEST_SCHEMA_V1: &str = "kv-engine.steady-state-golden.v1";
 const ENGINE_NAME: &str = "kv-engine";
 const STEADY_STATE_SEED_VERSION: &str = "splitmix64-v2";
@@ -50,6 +53,49 @@ const STEADY_STATE_WARMUP_STREAM_LABEL: u64 = 0x0180_0010;
 const STEADY_STATE_MEASUREMENT_STREAM_LABEL: u64 = 0x0180_0011;
 const STEADY_STATE_ZIPFIAN_EXPONENT: f64 = 0.99;
 const RAND_CHACHA_VERSION: &str = "0.3.1";
+const PITR_ADMISSION_BARRIER_ERROR: &str = "commit admission is stopped at a PITR barrier";
+const PITR_ADMISSION_RETRY_BUDGET: Duration = Duration::from_secs(5);
+
+/// A PITR cutoff rejects commits that have not yet reserved a timestamp. Keep
+/// those workload operations intact and retry them while the boundary drains;
+/// the retry time remains part of the measured latency and throughput.
+fn with_pitr_admission_retry<T>(
+    enabled: bool,
+    mut attempt: impl FnMut() -> Result<T>,
+) -> Result<T> {
+    with_pitr_admission_retry_budget(enabled, PITR_ADMISSION_RETRY_BUDGET, &mut attempt)
+}
+
+fn with_pitr_admission_retry_budget<T>(
+    enabled: bool,
+    budget: Duration,
+    attempt: &mut impl FnMut() -> Result<T>,
+) -> Result<T> {
+    let deadline = Instant::now() + budget;
+    let mut backoff = Duration::from_micros(50);
+
+    loop {
+        match attempt() {
+            Ok(value) => return Ok(value),
+            Err(error)
+                if enabled
+                    && error
+                        .chain()
+                        .any(|cause| cause.to_string() == PITR_ADMISSION_BARRIER_ERROR) =>
+            {
+                let now = Instant::now();
+                if now >= deadline {
+                    return Err(error.context(format!(
+                        "PITR benchmark admission did not reopen within {budget:?}"
+                    )));
+                }
+                std::thread::sleep(backoff.min(deadline - now));
+                backoff = (backoff * 2).min(Duration::from_millis(2));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, ValueEnum, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -127,6 +173,8 @@ enum PitrFormatArg {
     V6,
     #[value(name = "v7")]
     V7,
+    #[value(name = "v8")]
+    V8,
 }
 
 impl PitrFormatArg {
@@ -134,6 +182,7 @@ impl PitrFormatArg {
         match self {
             Self::V6 => 6,
             Self::V7 => 7,
+            Self::V8 => 8,
         }
     }
 }
@@ -153,7 +202,7 @@ impl WalRunInfo {
     }
 
     fn runtime_counters_available(self) -> bool {
-        cfg!(feature = "bench") && matches!(self.format_version, 4..=7)
+        cfg!(feature = "bench") && matches!(self.format_version, 4..=8)
     }
 }
 
@@ -235,7 +284,7 @@ struct Args {
     /// exercised at all, whatever the build contains.
     #[arg(long)]
     pitr: bool,
-    /// PITR format for WAL comparisons (v7 by default; v6 selects the isolated legacy control).
+    /// PITR format for WAL comparisons (v7 default; v6 legacy control; v8 bench-only opt-in).
     #[arg(long, value_enum, requires = "pitr")]
     pitr_format: Option<PitrFormatArg>,
     #[arg(long)]
@@ -968,6 +1017,8 @@ struct MeasurementResult {
     process_cpu_system_ms: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     wal_pipeline: Option<WalPipelineRecord>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    wal_v8_digest: Option<WalV8DigestRecord>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -975,6 +1026,13 @@ struct WalSyncObservationRecord {
     captured_target: u64,
     written_frontier_start: u64,
     written_frontier_end: u64,
+    admitted_ticket_count: u64,
+    v8_preparation_reserved_bytes: u64,
+    next_ticket_present: bool,
+    next_ticket_frames_ready: bool,
+    next_ticket_digest_folded: bool,
+    next_ticket_data_complete: bool,
+    next_ticket_data_write_elapsed_ns: Option<u64>,
     write_sqes_submitted: u64,
     write_cqes_completed: u64,
     groups_completed: u64,
@@ -1003,6 +1061,7 @@ struct WalPipelineRecord {
     frontier_writes: u64,
     frontier_bytes: u64,
     frontier_write_ns: u64,
+    v8_data_write_call_ns: u64,
     sync_coalesce_wait_calls: u64,
     sync_coalesce_wait_ns: u64,
     memtable_insert_ns: u64,
@@ -1013,6 +1072,49 @@ struct WalPipelineRecord {
     sync_observations: Option<Vec<WalSyncObservationRecord>>,
 }
 
+/// V8 CPU times are raw sums from sampled tickets, not extrapolated totals.
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+struct WalV8DigestRecord {
+    payload_hash_bytes: u64,
+    payload_hash_cpu_ns: u64,
+    header_batch_hash_cpu_ns: u64,
+    ordered_link_hash_cpu_ns: u64,
+    post_encode_hash_reread_bytes: u64,
+    cpu_timing_sample_rate: u64,
+    cpu_timing_sampled_tickets: u64,
+}
+
+#[cfg(feature = "bench")]
+fn wal_v8_digest_record(engine: &KvEngine, wal_run_info: WalRunInfo) -> Option<WalV8DigestRecord> {
+    if wal_run_info.format_version != 8 {
+        return None;
+    }
+
+    let profile = engine.write_profile();
+    Some(WalV8DigestRecord {
+        payload_hash_bytes: profile.wal_v8_payload_hash_bytes,
+        payload_hash_cpu_ns: profile.wal_v8_payload_hash_cpu_ns,
+        header_batch_hash_cpu_ns: profile.wal_v8_header_batch_hash_cpu_ns,
+        ordered_link_hash_cpu_ns: profile.wal_v8_ordered_link_hash_cpu_ns,
+        post_encode_hash_reread_bytes: profile.wal_v8_post_encode_hash_reread_bytes,
+        cpu_timing_sample_rate: WAL_V8_HASH_CPU_SAMPLE_RATE,
+        cpu_timing_sampled_tickets: profile.wal_v8_cpu_timing_sampled_tickets,
+    })
+}
+
+fn print_wal_v8_digest_profile(label: &str, profile: &WalV8DigestRecord) {
+    eprintln!(
+        "{label}: v8 digest metrics: payload_hash_bytes={} payload_hash_cpu_ns={} header_batch_hash_cpu_ns={} ordered_link_hash_cpu_ns={} post_encode_hash_reread_bytes={} cpu_timing_sample_rate={} cpu_timing_sampled_tickets={}",
+        profile.payload_hash_bytes,
+        profile.payload_hash_cpu_ns,
+        profile.header_batch_hash_cpu_ns,
+        profile.ordered_link_hash_cpu_ns,
+        profile.post_encode_hash_reread_bytes,
+        profile.cpu_timing_sample_rate,
+        profile.cpu_timing_sampled_tickets,
+    );
+}
+
 #[cfg(feature = "bench")]
 impl From<kv_engine_wrapper::mem_table::WalSyncObservation> for WalSyncObservationRecord {
     fn from(observation: kv_engine_wrapper::mem_table::WalSyncObservation) -> Self {
@@ -1020,6 +1122,13 @@ impl From<kv_engine_wrapper::mem_table::WalSyncObservation> for WalSyncObservati
             captured_target: observation.captured_target,
             written_frontier_start: observation.written_frontier_start,
             written_frontier_end: observation.written_frontier_end,
+            admitted_ticket_count: observation.admitted_ticket_count,
+            v8_preparation_reserved_bytes: observation.v8_preparation_reserved_bytes,
+            next_ticket_present: observation.next_ticket_present,
+            next_ticket_frames_ready: observation.next_ticket_frames_ready,
+            next_ticket_digest_folded: observation.next_ticket_digest_folded,
+            next_ticket_data_complete: observation.next_ticket_data_complete,
+            next_ticket_data_write_elapsed_ns: observation.next_ticket_data_write_elapsed_ns,
             write_sqes_submitted: observation.write_sqes_submitted,
             write_cqes_completed: observation.write_cqes_completed,
             groups_completed: observation.groups_completed,
@@ -1068,6 +1177,7 @@ fn wal_pipeline_record(
         frontier_writes: profile.wal_frontier_writes,
         frontier_bytes: profile.wal_frontier_bytes,
         frontier_write_ns: profile.wal_frontier_write_ns,
+        v8_data_write_call_ns: profile.wal_v8_data_write_call_ns,
         sync_coalesce_wait_calls: profile.wal_sync_coalesce_wait_calls,
         sync_coalesce_wait_ns: profile.wal_sync_coalesce_wait_ns,
         memtable_insert_ns: profile.memtable_insert_ns,
@@ -3279,10 +3389,11 @@ fn pitr_wal_run_info(status: &PitrStatus) -> Result<WalRunInfo> {
 /// archiving outside the measurement.
 fn enable_pitr_for_workload(
     cfg: &HarnessConfig,
-    engine: &KvEngine,
     path: &Path,
+    options: LsmStorageOptions,
     batch_size: usize,
-) -> Result<WalRunInfo> {
+) -> Result<(Arc<KvEngine>, WalRunInfo)> {
+    let engine = KvEngine::open_with_wal_io_mode(path, options.clone(), cfg.wal_io_mode.into())?;
     let (segment, budget) = pitr_workload_limits(cfg, batch_size)?;
     let repository = path.with_extension("pitr-repository");
     let _ = std::fs::remove_dir_all(&repository);
@@ -3316,7 +3427,7 @@ fn enable_pitr_for_workload(
     );
 
     let requested_format = cfg.pitr_format.unwrap_or(PitrFormatArg::V7);
-    if requested_format == PitrFormatArg::V7 {
+    if matches!(requested_format, PitrFormatArg::V7 | PitrFormatArg::V8) {
         // A nonempty v6 source lets the regular, capacity-checked migration
         // path install v7. Setup is outside the measured interval.
         engine.put(b"write-perf-v7-migration-seed", b"setup")?;
@@ -3327,6 +3438,28 @@ fn enable_pitr_for_workload(
             }
         }
     }
+    #[cfg(all(feature = "bench", target_os = "linux"))]
+    let engine = if requested_format == PitrFormatArg::V8 {
+        // RFC 026 v8 creation is gated in production. Keep the explicit
+        // migration reachable only through this bench-feature binary. Reopen
+        // after the setup v6-to-v7 migration so this process holds the v7 WAL
+        // compatibility lock required to publish the v8 guard.
+        engine.close()?;
+        drop(engine);
+        let engine = KvEngine::open_with_wal_io_mode(path, options, cfg.wal_io_mode.into())?;
+        engine.start_v8_pitr_for_benchmark(&repository)?;
+        engine
+    } else {
+        engine
+    };
+    #[cfg(not(all(feature = "bench", target_os = "linux")))]
+    let engine = {
+        ensure!(
+            requested_format != PitrFormatArg::V8,
+            "PITR v8 comparison requires a Linux write-perf build with --features bench"
+        );
+        engine
+    };
 
     let status = engine.pitr_status(PitrStatusOptions {
         cursor: None,
@@ -3350,7 +3483,7 @@ fn enable_pitr_for_workload(
         actual.io_mode
     );
 
-    Ok(actual)
+    Ok((engine, actual))
 }
 
 fn run_wal_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
@@ -3358,11 +3491,13 @@ fn run_wal_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
     let path = prepare_path(cfg, workload)?;
     let cleanup = CleanupPathOnDrop::new(cfg, &path);
     let options = cfg.build_options(true, false);
-    let engine = KvEngine::open_with_wal_io_mode(&path, options.clone(), cfg.wal_io_mode.into())?;
-    let wal_run_info = if cfg.pitr {
-        enable_pitr_for_workload(cfg, &engine, &path, 1)?
+    let (engine, wal_run_info) = if cfg.pitr {
+        enable_pitr_for_workload(cfg, &path, options.clone(), 1)?
     } else {
-        WalRunInfo::v4(cfg.wal_io_mode)
+        (
+            KvEngine::open_with_wal_io_mode(&path, options.clone(), cfg.wal_io_mode.into())?,
+            WalRunInfo::v4(cfg.wal_io_mode),
+        )
     };
     #[cfg(feature = "bench")]
     {
@@ -3374,6 +3509,7 @@ fn run_wal_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
     let value = vec![b'x'; cfg.value_size];
     let num_keys = cfg.num;
     let writer_threads = cfg.threads;
+    let retry_pitr_barrier = cfg.pitr;
     let baseline = collect_counters(&engine)?;
     let cpu_start = process_cpu_times();
     let per_thread = num_keys / writer_threads;
@@ -3392,7 +3528,9 @@ fn run_wal_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
                 let sample_start = sample_every
                     .filter(|every| i.is_multiple_of(*every))
                     .map(|_| Instant::now());
-                eng.put(format!("key{:08}", start_idx + i).as_bytes(), &val)?;
+                with_pitr_admission_retry(retry_pitr_barrier, || {
+                    eng.put(format!("key{:08}", start_idx + i).as_bytes(), &val)
+                })?;
                 if let Some(start) = sample_start {
                     latency_samples.push(start.elapsed().as_nanos() as u64);
                 }
@@ -3424,9 +3562,15 @@ fn run_wal_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
     let wal_pipeline = wal_pipeline_record(&engine, cfg.profile, wal_run_info)?;
     #[cfg(not(feature = "bench"))]
     let wal_pipeline = None;
+    #[cfg(feature = "bench")]
+    let wal_v8_digest = wal_v8_digest_record(&engine, wal_run_info);
+    #[cfg(not(feature = "bench"))]
+    let wal_v8_digest = None;
     if cfg.profile {
         if wal_run_info.runtime_counters_available() {
             print_write_profile(&engine, workload);
+        } else if let Some(profile) = &wal_v8_digest {
+            print_wal_v8_digest_profile(workload, profile);
         } else {
             eprintln!("{workload}: WAL runtime counters and sync observations are unavailable");
         }
@@ -3466,6 +3610,7 @@ fn run_wal_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
             process_cpu_user_ms,
             process_cpu_system_ms,
             wal_pipeline,
+            wal_v8_digest,
             ..MeasurementResult::default()
         },
         counters,
@@ -3482,11 +3627,13 @@ fn run_wal_batch_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>
     let path = prepare_path(cfg, workload)?;
     let cleanup = CleanupPathOnDrop::new(cfg, &path);
     let options = cfg.build_options(true, false);
-    let engine = KvEngine::open_with_wal_io_mode(&path, options.clone(), cfg.wal_io_mode.into())?;
-    let wal_run_info = if cfg.pitr {
-        enable_pitr_for_workload(cfg, &engine, &path, cfg.wal_batch_size)?
+    let (engine, wal_run_info) = if cfg.pitr {
+        enable_pitr_for_workload(cfg, &path, options.clone(), cfg.wal_batch_size)?
     } else {
-        WalRunInfo::v4(cfg.wal_io_mode)
+        (
+            KvEngine::open_with_wal_io_mode(&path, options.clone(), cfg.wal_io_mode.into())?,
+            WalRunInfo::v4(cfg.wal_io_mode),
+        )
     };
     #[cfg(feature = "bench")]
     {
@@ -3498,6 +3645,7 @@ fn run_wal_batch_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>
     let value = vec![b'x'; cfg.value_size];
     let num_keys = cfg.num;
     let writer_threads = cfg.threads;
+    let retry_pitr_barrier = cfg.pitr;
     let baseline = collect_counters(&engine)?;
     let cpu_start = process_cpu_times();
     let per_thread = num_keys / writer_threads;
@@ -3528,7 +3676,7 @@ fn run_wal_batch_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>
                 let sample_start = sample_every
                     .filter(|every| batch_index.is_multiple_of(*every))
                     .map(|_| Instant::now());
-                eng.write_batch(&batch)?;
+                with_pitr_admission_retry(retry_pitr_barrier, || eng.write_batch(&batch))?;
                 if let Some(sample_start) = sample_start {
                     latency_samples.push(sample_start.elapsed().as_nanos() as u64);
                 }
@@ -3563,9 +3711,15 @@ fn run_wal_batch_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>
     let wal_pipeline = wal_pipeline_record(&engine, cfg.profile, wal_run_info)?;
     #[cfg(not(feature = "bench"))]
     let wal_pipeline = None;
+    #[cfg(feature = "bench")]
+    let wal_v8_digest = wal_v8_digest_record(&engine, wal_run_info);
+    #[cfg(not(feature = "bench"))]
+    let wal_v8_digest = None;
     if cfg.profile {
         if wal_run_info.runtime_counters_available() {
             print_write_profile(&engine, workload);
+        } else if let Some(profile) = &wal_v8_digest {
+            print_wal_v8_digest_profile(workload, profile);
         } else {
             eprintln!("{workload}: WAL runtime counters and sync observations are unavailable");
         }
@@ -3601,6 +3755,7 @@ fn run_wal_batch_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>
             process_cpu_user_ms,
             process_cpu_system_ms,
             wal_pipeline,
+            wal_v8_digest,
             ..MeasurementResult::default()
         },
         counters,
@@ -8247,6 +8402,12 @@ fn validate_config(cfg: &HarnessConfig) -> Result<()> {
     );
     if let Some(format) = cfg.pitr_format {
         anyhow::ensure!(cfg.pitr, "--pitr-format requires --pitr");
+        if format == PitrFormatArg::V8 {
+            anyhow::ensure!(
+                cfg!(all(feature = "bench", target_os = "linux")),
+                "PITR v8 comparison requires a Linux write-perf build with --features bench"
+            );
+        }
         if format == PitrFormatArg::V6 && cfg.wal_io_mode_explicit {
             anyhow::ensure!(
                 cfg.wal_io_mode == WalIoModeArg::Leader,
@@ -8298,6 +8459,62 @@ fn validate_run_mode(cfg: &HarnessConfig, bench_arg: Option<&str>) -> Result<()>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pitr_benchmark_retries_only_unadmitted_barrier_rejections() {
+        let mut attempts = 0;
+        let mut operation = || {
+            attempts += 1;
+            if attempts == 1 {
+                Err(anyhow!(PITR_ADMISSION_BARRIER_ERROR).context("write batch rejected"))
+            } else {
+                Ok(42)
+            }
+        };
+
+        let result =
+            with_pitr_admission_retry_budget(true, Duration::from_millis(100), &mut operation)
+                .expect("retry after the PITR cutoff reopens");
+        assert_eq!(result, 42);
+        assert_eq!(attempts, 2);
+
+        let mut attempts = 0;
+        let mut operation = || {
+            attempts += 1;
+            Err::<(), _>(anyhow!(PITR_ADMISSION_BARRIER_ERROR))
+        };
+        assert!(
+            with_pitr_admission_retry_budget(false, Duration::from_millis(100), &mut operation,)
+                .is_err()
+        );
+        assert_eq!(attempts, 1);
+
+        let mut attempts = 0;
+        let mut operation = || {
+            attempts += 1;
+            Err::<(), _>(anyhow!("unrelated write failure"))
+        };
+        assert!(
+            with_pitr_admission_retry_budget(true, Duration::from_millis(100), &mut operation,)
+                .is_err()
+        );
+        assert_eq!(attempts, 1);
+    }
+
+    #[test]
+    fn pitr_benchmark_barrier_retry_has_a_deadline() {
+        let mut operation = || Err::<(), _>(anyhow!(PITR_ADMISSION_BARRIER_ERROR));
+        let error =
+            with_pitr_admission_retry_budget(true, Duration::from_millis(3), &mut operation)
+                .expect_err("a barrier that never reopens must stop retrying");
+
+        assert!(error.to_string().contains("did not reopen"));
+        assert!(
+            error
+                .chain()
+                .any(|cause| cause.to_string() == PITR_ADMISSION_BARRIER_ERROR)
+        );
+    }
 
     fn legacy_cfg() -> HarnessConfig {
         HarnessConfig::from_args(Args::try_parse_from(["write-perf"]).expect("parse args"))
@@ -8502,6 +8719,55 @@ mod tests {
         );
         assert_eq!(v7_leader.wal_io_mode, WalIoModeArg::Leader);
         validate_config(&v7_leader).expect("v7 supports the explicit Leader comparison");
+
+        let v8_parallel = HarnessConfig::from_args(
+            Args::try_parse_from(["write-perf", "--pitr", "--pitr-format", "v8"])
+                .expect("parse explicit v8 comparison"),
+        );
+        assert_eq!(v8_parallel.wal_io_mode, WalIoModeArg::Parallel);
+        assert_eq!(v8_parallel.pitr_format, Some(PitrFormatArg::V8));
+        assert_eq!(v8_parallel.pitr_format.map(PitrFormatArg::version), Some(8));
+        if cfg!(all(feature = "bench", target_os = "linux")) {
+            validate_config(&v8_parallel).expect("v8 supports the default Parallel mode");
+        } else {
+            assert!(
+                validate_config(&v8_parallel)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("requires a Linux write-perf build with --features bench")
+            );
+        }
+
+        let v8_leader = HarnessConfig::from_args(
+            Args::try_parse_from([
+                "write-perf",
+                "--pitr",
+                "--pitr-format",
+                "v8",
+                "--wal-io-mode",
+                "leader",
+            ])
+            .expect("parse v8 Leader comparison"),
+        );
+        assert_eq!(v8_leader.wal_io_mode, WalIoModeArg::Leader);
+        if cfg!(all(feature = "bench", target_os = "linux")) {
+            validate_config(&v8_leader).expect("v8 supports the explicit Leader comparison");
+        } else {
+            assert!(
+                validate_config(&v8_leader)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("requires a Linux write-perf build with --features bench")
+            );
+        }
+        assert_eq!(
+            WalRunInfo {
+                format_version: 8,
+                io_mode: "leader",
+            }
+            .runtime_counters_available(),
+            cfg!(feature = "bench")
+        );
 
         assert!(Args::try_parse_from(["write-perf", "--pitr-format", "v6"]).is_err());
     }
@@ -9738,6 +10004,7 @@ mod tests {
                     frontier_writes: 2,
                     frontier_bytes: 8192,
                     frontier_write_ns: 4500,
+                    v8_data_write_call_ns: 0,
                     sync_coalesce_wait_calls: 3,
                     sync_coalesce_wait_ns: 9000,
                     ..WalPipelineRecord::default()
@@ -9759,6 +10026,7 @@ mod tests {
             assert_eq!(json["result"]["wal_pipeline"]["frontier_writes"], 2);
             assert_eq!(json["result"]["wal_pipeline"]["frontier_bytes"], 8192);
             assert_eq!(json["result"]["wal_pipeline"]["frontier_write_ns"], 4500);
+            assert_eq!(json["result"]["wal_pipeline"]["v8_data_write_call_ns"], 0);
             assert_eq!(
                 json["result"]["wal_pipeline"]["sync_coalesce_wait_calls"],
                 3
@@ -9785,6 +10053,32 @@ mod tests {
         assert!(json.get("latency").is_none());
         assert!(json.get("validation").is_none());
         assert!(json.get("drain").is_none());
+    }
+
+    #[test]
+    fn v8_digest_metrics_serialize_separately_from_pipeline_counters() {
+        let result = MeasurementResult {
+            wal_v8_digest: Some(WalV8DigestRecord {
+                payload_hash_bytes: 1200,
+                payload_hash_cpu_ns: 3400,
+                header_batch_hash_cpu_ns: 500,
+                ordered_link_hash_cpu_ns: 600,
+                post_encode_hash_reread_bytes: 0,
+                cpu_timing_sample_rate: 64,
+                cpu_timing_sampled_tickets: 3,
+            }),
+            ..MeasurementResult::default()
+        };
+
+        let json = serde_json::to_value(result).expect("serialize v8 digest metrics");
+        assert_eq!(json["wal_v8_digest"]["payload_hash_bytes"], 1200);
+        assert_eq!(json["wal_v8_digest"]["payload_hash_cpu_ns"], 3400);
+        assert_eq!(json["wal_v8_digest"]["header_batch_hash_cpu_ns"], 500);
+        assert_eq!(json["wal_v8_digest"]["ordered_link_hash_cpu_ns"], 600);
+        assert_eq!(json["wal_v8_digest"]["post_encode_hash_reread_bytes"], 0);
+        assert_eq!(json["wal_v8_digest"]["cpu_timing_sample_rate"], 64);
+        assert_eq!(json["wal_v8_digest"]["cpu_timing_sampled_tickets"], 3);
+        assert!(json.get("wal_pipeline").is_none());
     }
 
     #[test]
@@ -12282,6 +12576,13 @@ mod tests {
                 captured_target: 10,
                 written_frontier_start: 10,
                 written_frontier_end: 14,
+                admitted_ticket_count: 5,
+                v8_preparation_reserved_bytes: 640,
+                next_ticket_present: true,
+                next_ticket_frames_ready: true,
+                next_ticket_digest_folded: false,
+                next_ticket_data_complete: true,
+                next_ticket_data_write_elapsed_ns: Some(123_456),
                 write_sqes_submitted: 6,
                 write_cqes_completed: 4,
                 groups_completed: 2,
@@ -12294,6 +12595,13 @@ mod tests {
         assert_eq!(json["captured_target"], 10);
         assert_eq!(json["written_frontier_start"], 10);
         assert_eq!(json["written_frontier_end"], 14);
+        assert_eq!(json["admitted_ticket_count"], 5);
+        assert_eq!(json["v8_preparation_reserved_bytes"], 640);
+        assert_eq!(json["next_ticket_present"], true);
+        assert_eq!(json["next_ticket_frames_ready"], true);
+        assert_eq!(json["next_ticket_digest_folded"], false);
+        assert_eq!(json["next_ticket_data_complete"], true);
+        assert_eq!(json["next_ticket_data_write_elapsed_ns"], 123_456);
         assert_eq!(json["write_sqes_submitted"], 6);
         assert_eq!(json["write_cqes_completed"], 4);
         assert_eq!(json["groups_completed"], 2);

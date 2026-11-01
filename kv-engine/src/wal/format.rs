@@ -1,8 +1,8 @@
 //! WAL format descriptors shared by creation and recovery.
 //!
 //! This registry records the on-disk and I/O contracts for released formats
-//! plus the planned v7 contract. Registering a format does not make its reader
-//! or writer available: those capabilities are explicit descriptor fields.
+//! plus the planned v7/v8 contracts. Registering a format does not make its
+//! reader or writer available: those capabilities are explicit descriptor fields.
 #![allow(dead_code)]
 
 use super::WalIoMode;
@@ -12,6 +12,7 @@ pub(crate) const WAL_FORMAT_VERSION_V2: u16 = 2;
 pub(crate) const WAL_FORMAT_VERSION_V3: u16 = 3;
 pub(crate) const WAL_FORMAT_VERSION_V4: u16 = 4;
 pub(crate) const WAL_FORMAT_VERSION_V7: u16 = 7;
+pub(crate) const WAL_FORMAT_VERSION_V8: u16 = 8;
 pub(crate) const WAL_HEADER_SIZE: usize = 6;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -216,6 +217,21 @@ const V7: WalFormatDescriptor = WalFormatDescriptor {
     writer_implemented: false,
 };
 
+const V8: WalFormatDescriptor = WalFormatDescriptor {
+    version: Some(WAL_FORMAT_VERSION_V8),
+    framing: WalFraming::EmbeddedFrontier,
+    alignment: 4096,
+    data_start: 8192,
+    digest: WalDigestPolicy::LogicalTicketPrefix,
+    recovery: WalRecoveryPolicy::ActiveFrontierFallback,
+    io: WalIoPolicy::Selectable {
+        default: WalIoMode::Parallel,
+    },
+    parallel_recovery: WalParallelRecovery::PendingImplementation,
+    reader_implemented: false,
+    writer_implemented: false,
+};
+
 impl WalFormatDescriptor {
     pub(crate) const fn legacy() -> &'static Self {
         &LEGACY
@@ -231,6 +247,7 @@ impl WalFormatDescriptor {
             crate::pitr::WAL_V5_VERSION_LEGACY => Some(&V5),
             crate::pitr::WAL_V5_VERSION => Some(&V6),
             WAL_FORMAT_VERSION_V7 => Some(&V7),
+            WAL_FORMAT_VERSION_V8 => Some(&V8),
             _ => None,
         }
     }
@@ -417,5 +434,23 @@ mod tests {
         assert!(descriptor.io.supports(WalIoMode::Leader));
         assert!(descriptor.io.supports(WalIoMode::Parallel));
         assert!(WalFormatDescriptor::writer(WAL_FORMAT_VERSION_V7).is_err());
+    }
+
+    #[test]
+    fn v8_contract_is_registered_without_enabling_production_io() {
+        let descriptor = WalFormatDescriptor::for_version(WAL_FORMAT_VERSION_V8).unwrap();
+        assert_eq!(descriptor.framing, WalFraming::EmbeddedFrontier);
+        assert_eq!(descriptor.data_start, 8192);
+        assert_eq!(descriptor.alignment, 4096);
+        assert_eq!(descriptor.digest, WalDigestPolicy::LogicalTicketPrefix);
+        assert_eq!(
+            descriptor.recovery,
+            WalRecoveryPolicy::ActiveFrontierFallback
+        );
+        assert_eq!(descriptor.io.default_path(), WalIoPath::Parallel);
+        assert!(!descriptor.reader_implemented);
+        assert!(!descriptor.writer_implemented);
+        assert!(WalFormatDescriptor::reader(WAL_FORMAT_VERSION_V8).is_err());
+        assert!(WalFormatDescriptor::writer(WAL_FORMAT_VERSION_V8).is_err());
     }
 }

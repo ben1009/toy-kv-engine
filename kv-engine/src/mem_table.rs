@@ -152,6 +152,21 @@ pub struct WriteProfile {
     /// batch's alignment padding, so this is what the seal's cost is proportional
     /// to - not the segment's length, which the padding dominates.
     pub pitr_seal_bytes: AtomicU64,
+    /// Canonical entry bytes fed to the v8 producer-side BLAKE3 digest.
+    pub wal_v8_payload_hash_bytes: AtomicU64,
+    /// Time spent in v8 producer-side entry-stream BLAKE3 updates/finalization.
+    pub wal_v8_payload_hash_cpu_ns: AtomicU64,
+    /// Time hashing each v8 logical batch header and entry digest into its batch digest.
+    pub wal_v8_header_batch_hash_cpu_ns: AtomicU64,
+    /// Time spent folding fixed-size v8 prefix links in ticket order.
+    pub wal_v8_ordered_link_hash_cpu_ns: AtomicU64,
+    /// Canonical entry bytes reread by a separate post-encoding cryptographic pass.
+    pub wal_v8_post_encode_hash_reread_bytes: AtomicU64,
+    /// Tickets included in the sampled v8 digest CPU timings.
+    pub wal_v8_cpu_timing_sampled_tickets: AtomicU64,
+    /// Aggregate producer time in v8 positional DATA write calls, including retries.
+    /// Concurrent calls overlap, so this is summed call time, not wall time.
+    pub wal_v8_data_write_call_ns: AtomicU64,
     /// Number of WAL commit groups that reached fdatasync.
     pub wal_commit_groups: AtomicU64,
     /// Number of WAL commit groups that only contained one pending buffer.
@@ -192,6 +207,20 @@ pub struct WalSyncObservation {
     pub captured_target: u64,
     pub written_frontier_start: u64,
     pub written_frontier_end: u64,
+    /// Number of unresolved tickets admitted when a v8 FRONTIER decision was
+    /// made. Other WAL formats leave this at zero.
+    pub admitted_ticket_count: u64,
+    /// Bytes held by v8 preflight reservations that have not finished encoding.
+    pub v8_preparation_reserved_bytes: u64,
+    /// Whether there is an admitted ticket beyond the candidate v8 prefix.
+    pub next_ticket_present: bool,
+    /// Readiness of the first admitted ticket beyond the candidate v8 prefix.
+    pub next_ticket_frames_ready: bool,
+    pub next_ticket_digest_folded: bool,
+    pub next_ticket_data_complete: bool,
+    /// Elapsed time since the next v8 ticket started its positional DATA write.
+    /// Other WAL formats and tickets not yet writing leave this unset.
+    pub next_ticket_data_write_elapsed_ns: Option<u64>,
     pub write_sqes_submitted: u64,
     pub write_cqes_completed: u64,
     pub groups_completed: u64,
@@ -249,6 +278,13 @@ impl WriteProfile {
         self.memtable_publish_accounting_ns.store(0, o);
         self.pitr_seal_append_ns.store(0, o);
         self.pitr_seal_bytes.store(0, o);
+        self.wal_v8_payload_hash_bytes.store(0, o);
+        self.wal_v8_payload_hash_cpu_ns.store(0, o);
+        self.wal_v8_header_batch_hash_cpu_ns.store(0, o);
+        self.wal_v8_ordered_link_hash_cpu_ns.store(0, o);
+        self.wal_v8_post_encode_hash_reread_bytes.store(0, o);
+        self.wal_v8_cpu_timing_sampled_tickets.store(0, o);
+        self.wal_v8_data_write_call_ns.store(0, o);
         self.wal_commit_groups.store(0, o);
         self.wal_commit_solo_groups.store(0, o);
         self.wal_commit_buffers.store(0, o);
@@ -308,6 +344,13 @@ impl WriteProfile {
             memtable_publish_accounting_ns: self.memtable_publish_accounting_ns.load(o),
             pitr_seal_append_ns: self.pitr_seal_append_ns.load(o),
             pitr_seal_bytes: self.pitr_seal_bytes.load(o),
+            wal_v8_payload_hash_bytes: self.wal_v8_payload_hash_bytes.load(o),
+            wal_v8_payload_hash_cpu_ns: self.wal_v8_payload_hash_cpu_ns.load(o),
+            wal_v8_header_batch_hash_cpu_ns: self.wal_v8_header_batch_hash_cpu_ns.load(o),
+            wal_v8_ordered_link_hash_cpu_ns: self.wal_v8_ordered_link_hash_cpu_ns.load(o),
+            wal_v8_post_encode_hash_reread_bytes: self.wal_v8_post_encode_hash_reread_bytes.load(o),
+            wal_v8_cpu_timing_sampled_tickets: self.wal_v8_cpu_timing_sampled_tickets.load(o),
+            wal_v8_data_write_call_ns: self.wal_v8_data_write_call_ns.load(o),
             wal_commit_groups: self.wal_commit_groups.load(o),
             wal_commit_solo_groups: self.wal_commit_solo_groups.load(o),
             wal_commit_buffers: self.wal_commit_buffers.load(o),
@@ -348,6 +391,12 @@ impl WriteProfile {
         let o = std::sync::atomic::Ordering::Relaxed;
         self.wal_sync_coalesce_wait_calls.fetch_add(1, o);
         self.wal_sync_coalesce_wait_ns.fetch_add(nanos, o);
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn record_wal_v8_data_write_call_ns(&self, nanos: u64) {
+        self.wal_v8_data_write_call_ns
+            .fetch_add(nanos, std::sync::atomic::Ordering::Relaxed);
     }
 
     #[cfg(feature = "bench")]
@@ -482,6 +531,26 @@ impl WriteProfile {
     }
 
     #[cfg(feature = "bench")]
+    pub(crate) fn record_wal_v8_digest_metrics(
+        &self,
+        metrics: crate::wal::v8::digest::WalV8DigestMetrics,
+    ) {
+        let o = std::sync::atomic::Ordering::Relaxed;
+        self.wal_v8_payload_hash_bytes
+            .fetch_add(metrics.payload_hash_bytes, o);
+        self.wal_v8_payload_hash_cpu_ns
+            .fetch_add(metrics.payload_hash_cpu_ns, o);
+        self.wal_v8_header_batch_hash_cpu_ns
+            .fetch_add(metrics.header_batch_hash_cpu_ns, o);
+        self.wal_v8_ordered_link_hash_cpu_ns
+            .fetch_add(metrics.ordered_link_hash_cpu_ns, o);
+        self.wal_v8_post_encode_hash_reread_bytes
+            .fetch_add(metrics.post_encode_hash_reread_bytes, o);
+        self.wal_v8_cpu_timing_sampled_tickets
+            .fetch_add(metrics.cpu_timing_sampled_tickets, o);
+    }
+
+    #[cfg(feature = "bench")]
     pub(crate) fn record_wal_validate_ns(&self, nanos: u64) {
         self.wal_validate_ns
             .fetch_add(nanos, std::sync::atomic::Ordering::Relaxed);
@@ -612,6 +681,13 @@ pub struct WriteProfileSnapshot {
     pub memtable_publish_accounting_ns: u64,
     pub pitr_seal_append_ns: u64,
     pub pitr_seal_bytes: u64,
+    pub wal_v8_payload_hash_bytes: u64,
+    pub wal_v8_payload_hash_cpu_ns: u64,
+    pub wal_v8_header_batch_hash_cpu_ns: u64,
+    pub wal_v8_ordered_link_hash_cpu_ns: u64,
+    pub wal_v8_post_encode_hash_reread_bytes: u64,
+    pub wal_v8_cpu_timing_sampled_tickets: u64,
+    pub wal_v8_data_write_call_ns: u64,
     pub wal_commit_groups: u64,
     pub wal_commit_solo_groups: u64,
     pub wal_commit_buffers: u64,
@@ -722,6 +798,27 @@ impl WriteProfileSnapshot {
                 .pitr_seal_append_ns
                 .saturating_sub(before.pitr_seal_append_ns),
             pitr_seal_bytes: self.pitr_seal_bytes.saturating_sub(before.pitr_seal_bytes),
+            wal_v8_payload_hash_bytes: self
+                .wal_v8_payload_hash_bytes
+                .saturating_sub(before.wal_v8_payload_hash_bytes),
+            wal_v8_payload_hash_cpu_ns: self
+                .wal_v8_payload_hash_cpu_ns
+                .saturating_sub(before.wal_v8_payload_hash_cpu_ns),
+            wal_v8_header_batch_hash_cpu_ns: self
+                .wal_v8_header_batch_hash_cpu_ns
+                .saturating_sub(before.wal_v8_header_batch_hash_cpu_ns),
+            wal_v8_ordered_link_hash_cpu_ns: self
+                .wal_v8_ordered_link_hash_cpu_ns
+                .saturating_sub(before.wal_v8_ordered_link_hash_cpu_ns),
+            wal_v8_post_encode_hash_reread_bytes: self
+                .wal_v8_post_encode_hash_reread_bytes
+                .saturating_sub(before.wal_v8_post_encode_hash_reread_bytes),
+            wal_v8_cpu_timing_sampled_tickets: self
+                .wal_v8_cpu_timing_sampled_tickets
+                .saturating_sub(before.wal_v8_cpu_timing_sampled_tickets),
+            wal_v8_data_write_call_ns: self
+                .wal_v8_data_write_call_ns
+                .saturating_sub(before.wal_v8_data_write_call_ns),
             wal_commit_groups: self
                 .wal_commit_groups
                 .saturating_sub(before.wal_commit_groups),
@@ -1089,6 +1186,13 @@ pub struct MemTable {
     /// True when this memtable's source image is an immutable or active v7
     /// PITR WAL. Sealed recovery retains the source without attaching a writer.
     wal_v7_source: bool,
+    /// True when this memtable was replayed from a frozen v8 PITR WAL. V8
+    /// sealed sources are read-only and retain their format identity for PITR.
+    wal_v8_source: bool,
+    /// Owns the recovered v8 image's persistent spool and workspace charges.
+    wal_v8_reservation_owner: Option<Arc<crate::wal::v8::resource::WalV8ReservationOwner>>,
+    /// Physical length and ticket count of a read-only sealed v8 source.
+    wal_v8_sealed_boundary: Option<crate::pitr::manifest::ImmutableBoundary>,
     /// Terminal cursor retained while a durable Sealing source is recovered
     /// read-only. Explicit resume uses it to finish sealing without starting an
     /// append runtime for the frozen source.
@@ -1137,6 +1241,9 @@ impl MemTable {
             wal: None,
             wal_path: None,
             wal_v7_source: false,
+            wal_v8_source: false,
+            wal_v8_reservation_owner: None,
+            wal_v8_sealed_boundary: None,
             wal_v7_sealing_frontier: None,
             wal_v7_reservation_owner: None,
             wal_v7_seal_index: None,
@@ -1265,6 +1372,105 @@ impl MemTable {
         retained_resources.activate_pending_successor(header.segment_id.0)?;
 
         Ok(memtable)
+    }
+
+    /// Create and attach a fresh v8 Active successor after its predecessor's
+    /// durable Sealed obligation authorizes the exact header. V8 remains
+    /// unavailable through the format registry; this helper is used only by
+    /// the explicit PITR recovery transition.
+    #[cfg(target_os = "linux")]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the owner factory deliberately binds the installed image to caller-owned reservation accounting"
+    )]
+    pub(crate) fn create_with_wal_v8_active<F>(
+        id: usize,
+        vlog_enabled: bool,
+        path: impl AsRef<Path>,
+        header: crate::wal::v8::codec::WalV8Header,
+        max_file_size: u64,
+        retained_resources: Arc<WalV7RetainedResources>,
+        io_mode: WalIoMode,
+        create_owner: F,
+    ) -> Result<(Self, Arc<crate::wal::v8::resource::WalV8ReservationOwner>)>
+    where
+        F: FnOnce(
+            &crate::wal::v8::install::WalV8InstalledRecovery,
+        ) -> Result<Arc<crate::wal::v8::resource::WalV8ReservationOwner>>,
+    {
+        use anyhow::ensure;
+
+        let path = path.as_ref().to_path_buf();
+        let image_len = u64::try_from(
+            crate::wal::v8::WAL_V8_HEADER_LEN + crate::wal::v8::codec::WAL_V8_FRAME_LEN,
+        )?;
+        ensure!(
+            image_len <= max_file_size,
+            "v8 segment limit cannot hold an empty Active image"
+        );
+        ensure!(
+            retained_resources.has_pending_successor(header.segment_id.0)
+                || retained_resources.has_segment_reservation(header.segment_id.0),
+            "v8 successor capacity was not reserved before its Sealing intent"
+        );
+
+        // A previous attempt may have durably installed the canonical empty
+        // image before it attached the leader. Its complete header must match
+        // the manifest-authorized boundary, including incarnation.
+        if path.try_exists()? {
+            let mut file = File::open(&path)
+                .with_context(|| format!("open existing v8 successor WAL {}", path.display()))?;
+            let mut bytes = [0; crate::wal::v8::WAL_V8_HEADER_LEN];
+            file.read_exact(&mut bytes)
+                .context("read existing v8 successor WAL header")?;
+            let existing = crate::wal::v8::codec::WalV8Header::decode(&bytes)
+                .context("decode existing v8 successor WAL header")?;
+            ensure!(
+                existing == header,
+                "existing v8 successor WAL header differs from its Sealed obligation"
+            );
+        }
+
+        let empty_boundary = crate::wal::v8::install::create_empty_active_image(&path, header)?;
+        let installed = crate::wal::v8::install::recover_and_install_active(
+            &path,
+            &[empty_boundary],
+            header.predecessor,
+            crate::pitr::LIVE_WAL_V5_LIMITS,
+            max_file_size,
+        )?;
+        ensure!(
+            installed.active_boundary == empty_boundary
+                && installed.image_len == image_len
+                && installed.next_ticket == 0,
+            "installed v8 successor differs from its authorized empty boundary"
+        );
+        let (memtable, recovered_commit_ts) = Self::recover_from_v8_active_with_owner(
+            id,
+            vlog_enabled,
+            &path,
+            installed,
+            max_file_size,
+            io_mode,
+            create_owner,
+        )?;
+        ensure!(
+            recovered_commit_ts == 0,
+            "new empty v8 successor unexpectedly contains committed batches"
+        );
+        let owner = memtable
+            .wal_v8_reservation_owner()
+            .ok_or_else(|| anyhow::anyhow!("new v8 PITR successor has no reservation owner"))?;
+        let owner_resources = owner.image_owner().retained_resources().ok_or_else(|| {
+            anyhow::anyhow!("new v8 PITR successor has no retained resource ledger")
+        })?;
+        ensure!(
+            Arc::ptr_eq(&owner_resources, &retained_resources),
+            "new v8 PITR successor uses a different retained resource ledger"
+        );
+        retained_resources.activate_pending_successor(header.segment_id.0)?;
+
+        Ok((memtable, owner))
     }
 
     /// Create a new mem-table with WAL and vLog (kind-prefixed values).
@@ -1447,6 +1653,126 @@ impl MemTable {
         Ok((ret, max_commit_ts))
     }
 
+    /// Recover and reopen a normalized Active v8 WAL with the Parallel writer.
+    /// The caller must have authority-checked and durably installed the image
+    /// before attaching it to a writable memtable.
+    #[cfg(all(target_os = "linux", test))]
+    pub(crate) fn recover_from_v8_active(
+        id: usize,
+        vlog_enabled: bool,
+        path: impl AsRef<Path>,
+        installed: crate::wal::v8::install::WalV8InstalledRecovery,
+        max_file_size: u64,
+    ) -> Result<(Self, u64)> {
+        Self::recover_from_v8_active_inner(
+            id,
+            vlog_enabled,
+            path,
+            installed,
+            WalIoMode::Parallel,
+            |write, sync, installed| {
+                let writer = crate::wal::v8::leader::WalV8LeaderWriter::new(
+                    write,
+                    sync,
+                    installed,
+                    max_file_size,
+                )?;
+                Ok((writer, None))
+            },
+        )
+    }
+
+    /// Replay under the caller's recovery reservation, then attach an
+    /// image-bound owner before the recovered WAL can accept writes.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn recover_from_v8_active_with_owner<F>(
+        id: usize,
+        vlog_enabled: bool,
+        path: impl AsRef<Path>,
+        installed: crate::wal::v8::install::WalV8InstalledRecovery,
+        max_file_size: u64,
+        io_mode: WalIoMode,
+        create_owner: F,
+    ) -> Result<(Self, u64)>
+    where
+        F: FnOnce(
+            &crate::wal::v8::install::WalV8InstalledRecovery,
+        ) -> Result<Arc<crate::wal::v8::resource::WalV8ReservationOwner>>,
+    {
+        Self::recover_from_v8_active_inner(
+            id,
+            vlog_enabled,
+            path,
+            installed,
+            io_mode,
+            |write, sync, installed| {
+                let owner = create_owner(installed)?;
+                let writer = crate::wal::v8::leader::WalV8LeaderWriter::new_with_reservation_owner(
+                    write,
+                    sync,
+                    installed,
+                    max_file_size,
+                    Arc::clone(&owner),
+                )?;
+                Ok((writer, Some(owner)))
+            },
+        )
+    }
+
+    #[cfg(target_os = "linux")]
+    fn recover_from_v8_active_inner<F>(
+        id: usize,
+        vlog_enabled: bool,
+        path: impl AsRef<Path>,
+        installed: crate::wal::v8::install::WalV8InstalledRecovery,
+        io_mode: WalIoMode,
+        create_writer: F,
+    ) -> Result<(Self, u64)>
+    where
+        F: FnOnce(
+            File,
+            File,
+            &crate::wal::v8::install::WalV8InstalledRecovery,
+        ) -> Result<(
+            crate::wal::v8::leader::WalV8LeaderWriter,
+            Option<Arc<crate::wal::v8::resource::WalV8ReservationOwner>>,
+        )>,
+    {
+        let path = path.as_ref().to_path_buf();
+        let max_commit_ts = installed.active_boundary.last_commit_ts;
+        let recovered_recorded_at = installed.last_recorded_at;
+        let mut ret = Self::create(id, vlog_enabled);
+        ret.wal_v8_source = true;
+        crate::wal::v8::install::replay_installed_active_batches(
+            &path,
+            &installed,
+            crate::pitr::LIVE_WAL_V5_LIMITS,
+            |batch| ret.apply_recovered_batch(batch),
+        )?;
+
+        let write_file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .with_context(|| format!("open installed v8 Active WAL {}", path.display()))?;
+        let sync_file = write_file
+            .try_clone()
+            .context("clone installed v8 Active WAL sync handle")?;
+        let (writer, reservation_owner) = create_writer(write_file, sync_file, &installed)?;
+        ret.wal = Some(match io_mode {
+            WalIoMode::Leader => Wal::from_v8_leader(writer, &installed)?,
+            WalIoMode::Parallel => Wal::from_v8_parallel(writer.into_parallel(), &installed)?,
+        });
+        ret.wal_v8_reservation_owner = reservation_owner;
+        ret.wal_path = Some(path);
+        ret.last_ticket
+            .store(installed.next_ticket, std::sync::atomic::Ordering::Release);
+        ret.recovered_recorded_at = recovered_recorded_at;
+        ret.rebuild_bloom();
+
+        Ok((ret, max_commit_ts))
+    }
+
     /// Recover an Active v7 image covered by a durable Sealing obligation as a
     /// read-only source. The recovered cursor and resource owner are retained
     /// so explicit PITR resume can build and install the seal without starting
@@ -1513,9 +1839,84 @@ impl MemTable {
         Ok((ret, seal.boundary.active.last_commit_ts))
     }
 
+    /// Recover a frozen v8 PITR source as a read-only memtable. The seal
+    /// visitor validates the terminal FRONTIER, logical prefix, whole-image
+    /// digest and ticket index before replaying any batch. The caller must
+    /// first bind the seal to the manifest obligation for this source.
+    #[allow(dead_code)] // Connected to LSM startup dispatch in the next recovery slice.
+    pub(crate) fn recover_from_v8_sealed(
+        id: usize,
+        vlog_enabled: bool,
+        path: impl AsRef<Path>,
+        seal: &crate::pitr::seal::V8Seal,
+        limits: crate::pitr::WalV5Limits,
+    ) -> Result<(Self, u64)> {
+        let path = path.as_ref().to_path_buf();
+        let mut reader = File::open(&path)
+            .with_context(|| format!("open sealed v8 PITR WAL {}", path.display()))?;
+        let wal_len = reader
+            .metadata()
+            .with_context(|| format!("inspect sealed v8 PITR WAL {}", path.display()))?
+            .len();
+        let mut ret = Self::create(id, vlog_enabled);
+        seal.visit_wal_batches_from_reader(&mut reader, wal_len, limits, |batch| {
+            ret.apply_recovered_batch(&batch)
+        })?;
+
+        ret.wal_path = Some(path);
+        ret.wal_v8_source = true;
+        ret.wal_v8_sealed_boundary = Some(seal.boundary);
+        ret.recovered_recorded_at = seal.entries.last().map(|entry| entry.recorded_at);
+        ret.rebuild_bloom();
+
+        Ok((ret, seal.boundary.active.last_commit_ts))
+    }
+
+    /// Attach resource ownership after a recovered Sealing source has been
+    /// replayed and its temporary recovery reservation has been released.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn attach_v8_reservation_owner(
+        &mut self,
+        owner: Arc<crate::wal::v8::resource::WalV8ReservationOwner>,
+    ) -> Result<()> {
+        use std::os::unix::fs::MetadataExt;
+
+        anyhow::ensure!(
+            self.wal_v8_source && self.wal.is_none() && self.wal_v8_reservation_owner.is_none(),
+            "v8 reservation owner can only attach to an unowned sealed source"
+        );
+        let path = self
+            .wal_path
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("sealed v8 source has no WAL path"))?;
+        let metadata = std::fs::symlink_metadata(path)
+            .with_context(|| format!("inspect sealed v8 source {}", path.display()))?;
+        anyhow::ensure!(
+            metadata.is_file() && !metadata.file_type().is_symlink(),
+            "sealed v8 source path is not a regular file"
+        );
+        owner
+            .image_owner()
+            .validate_image(metadata.dev(), metadata.ino())?;
+        anyhow::ensure!(
+            self.wal_v8_sealed_boundary
+                .is_some_and(|boundary| boundary.sealed_end == metadata.len()),
+            "sealed v8 source extent differs from its owned image"
+        );
+        self.wal_v8_reservation_owner = Some(owner);
+
+        Ok(())
+    }
+
     #[allow(dead_code)]
     pub(crate) fn wal_v7_reservation_owner(&self) -> Option<Arc<WalV7ReservationOwner>> {
         self.wal_v7_reservation_owner.clone()
+    }
+
+    pub(crate) fn wal_v8_reservation_owner(
+        &self,
+    ) -> Option<Arc<crate::wal::v8::resource::WalV8ReservationOwner>> {
+        self.wal_v8_reservation_owner.clone()
     }
 
     #[allow(dead_code)]
@@ -1994,6 +2395,11 @@ impl MemTable {
             let ticket = wal.put_v5_batch(batch, limits, None)?;
             (ticket, None)
         };
+        let ticket_end = ticket
+            .checked_add(1)
+            .context("PITR WAL ticket end overflows")?;
+        self.last_ticket
+            .fetch_max(ticket_end, std::sync::atomic::Ordering::Release);
         #[cfg(feature = "bench")]
         self.write_profile.load().wal_write_ns.fetch_add(
             started.elapsed().as_nanos() as u64,
@@ -2001,6 +2407,72 @@ impl MemTable {
         );
 
         Ok((Some(ticket), frame_job))
+    }
+
+    /// Preflight a v8 batch before entering the MVCC commit sequencer.
+    pub(crate) fn prepare_v8_pitr_wal_batch<'a>(
+        &self,
+        batch: &'a crate::pitr::WalBatch,
+        limits: crate::pitr::WalV5Limits,
+    ) -> Result<crate::wal::v8::leader::WalV8PreparedBatch<'a>> {
+        let wal = self
+            .wal
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("PITR WAL is not configured"))?;
+        anyhow::ensure!(
+            wal.is_v8() && wal.is_parallel(),
+            "prepared v8 batch requires a Parallel v8 WAL"
+        );
+        wal.preflight_v8_leader_batch(batch, limits)
+    }
+
+    /// Admit a preflighted v8 batch with sequencer-allocated metadata. The
+    /// returned producer job must be finished after releasing the MVCC
+    /// sequencer, before waiting for the ticket's durability.
+    pub(crate) fn admit_prepared_v8_pitr_wal_batch_only<'a>(
+        &self,
+        prepared: crate::wal::v8::leader::WalV8PreparedBatch<'a>,
+        commit_ts: u64,
+        recorded_at: crate::pitr::RecordedAt,
+    ) -> Result<(
+        Option<u64>,
+        Option<crate::wal::v8::leader::WalV8FrameJob<'a>>,
+    )> {
+        let wal = self
+            .wal
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("PITR WAL is not configured"))?;
+        anyhow::ensure!(
+            wal.is_v8() && wal.is_parallel(),
+            "prepared v8 batch requires a Parallel v8 WAL"
+        );
+        let (ticket, frame_job) =
+            wal.admit_v8_prepared_parallel_batch(prepared, commit_ts, recorded_at)?;
+        self.last_ticket
+            .fetch_max(ticket + 1, std::sync::atomic::Ordering::Release);
+        Ok((Some(ticket), Some(frame_job)))
+    }
+
+    pub(crate) fn finish_v8_frame_job(
+        &self,
+        frame_job: crate::wal::v8::leader::WalV8FrameJob<'_>,
+    ) -> Result<()> {
+        #[cfg(feature = "bench")]
+        let started = Instant::now();
+        let digest_metrics = frame_job.finish()?;
+        #[cfg(feature = "bench")]
+        {
+            self.write_profile
+                .load()
+                .record_wal_v8_digest_metrics(digest_metrics);
+            self.write_profile.load().wal_write_ns.fetch_add(
+                started.elapsed().as_nanos() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
+        #[cfg(not(feature = "bench"))]
+        let _ = digest_metrics;
+        Ok(())
     }
 
     /// Prepare a v7 Parallel point batch before entering the MVCC sequencer.
@@ -2169,8 +2641,12 @@ impl MemTable {
 
     pub(crate) fn wal_format_version(&self) -> Option<u16> {
         self.wal.as_ref().map(Wal::format_version).or_else(|| {
-            self.wal_v7_sealing_frontier
-                .map(|_| crate::wal::format::WAL_FORMAT_VERSION_V7)
+            if self.wal_v8_source {
+                Some(crate::wal::format::WAL_FORMAT_VERSION_V8)
+            } else {
+                self.wal_v7_sealing_frontier
+                    .map(|_| crate::wal::format::WAL_FORMAT_VERSION_V7)
+            }
         })
     }
 
@@ -2179,11 +2655,15 @@ impl MemTable {
     }
 
     pub(crate) fn uses_pitr_batch_wal(&self) -> bool {
-        self.wal_v7_source || self.wal.as_ref().is_some_and(Wal::is_pitr)
+        self.wal_v7_source || self.wal_v8_source || self.wal.as_ref().is_some_and(Wal::is_pitr)
     }
 
     pub(crate) fn uses_v7_wal(&self) -> bool {
         self.wal_v7_source || self.wal.as_ref().is_some_and(Wal::is_v7)
+    }
+
+    pub(crate) fn uses_v8_wal(&self) -> bool {
+        self.wal_v8_source || self.wal.as_ref().is_some_and(Wal::is_v8)
     }
 
     /// Capture both the canonical empty floor and the writer's latest v7
@@ -2233,6 +2713,7 @@ impl MemTable {
                 archive_epoch_id: header.archive_epoch_id.0,
                 segment_id: header.segment_id.0,
                 incarnation: header.incarnation,
+                wal_format: crate::pitr::manifest::PitrWalFormat::V7,
                 ticket_end: frontier.ticket_end,
                 durable_end: frontier.durable_end,
                 last_commit_ts: frontier.last_commit_ts,
@@ -2275,6 +2756,60 @@ impl MemTable {
         Ok((empty, current))
     }
 
+    pub(crate) fn v8_active_boundaries(
+        &self,
+    ) -> Result<(
+        crate::pitr::manifest::ActiveBoundary,
+        crate::pitr::manifest::ActiveBoundary,
+    )> {
+        anyhow::ensure!(self.uses_v8_wal(), "memtable WAL is not v8");
+        if let Some(wal) = &self.wal {
+            return wal.v8_active_boundaries();
+        }
+        let boundary = self
+            .wal_v8_sealed_boundary
+            .ok_or_else(|| anyhow::anyhow!("memtable has no Active v8 boundary"))?;
+        let path = self
+            .wal_path
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("sealed v8 memtable has no WAL path"))?;
+        let mut file = File::open(path).with_context(|| {
+            format!("open sealed v8 WAL {} for boundary capture", path.display())
+        })?;
+        let mut header_bytes = [0; crate::wal::v8::WAL_V8_HEADER_LEN];
+        file.read_exact(&mut header_bytes)
+            .context("read sealed v8 WAL header for boundary capture")?;
+        let header = crate::wal::v8::codec::WalV8Header::decode(&header_bytes)
+            .context("decode sealed v8 WAL header for boundary capture")?;
+        anyhow::ensure!(
+            header.segment_id.0 == boundary.active.segment_id
+                && header.timeline_id.0 == boundary.active.timeline_id
+                && header.archive_epoch_id.0 == boundary.active.archive_epoch_id
+                && header.incarnation == boundary.active.incarnation,
+            "sealed v8 WAL header differs from its immutable boundary"
+        );
+        let empty = crate::pitr::manifest::ActiveBoundary {
+            ticket_end: 0,
+            durable_end: crate::wal::v8::WAL_V8_HEADER_LEN as u64,
+            last_commit_ts: 0,
+            prefix_digest: header.initial_prefix_digest()?,
+            ..boundary.active
+        };
+        empty.validate()?;
+        boundary.active.validate()?;
+        Ok((empty, boundary.active))
+    }
+
+    pub(crate) fn v8_wal_image_len(&self) -> Result<u64> {
+        anyhow::ensure!(self.uses_v8_wal(), "memtable WAL is not v8");
+        if let Some(wal) = &self.wal {
+            return wal.v8_image_len();
+        }
+        self.wal_v8_sealed_boundary
+            .map(|boundary| boundary.sealed_end)
+            .ok_or_else(|| anyhow::anyhow!("memtable has no Active v8 image length"))
+    }
+
     pub(crate) fn v7_frontier_cursor(
         &self,
     ) -> Result<crate::wal::v7::allocator::WalV7FrontierCursor> {
@@ -2288,6 +2823,14 @@ impl MemTable {
 
     pub(crate) fn v7_wal_requires_recovery(&self) -> bool {
         self.wal.as_ref().is_some_and(Wal::v7_requires_recovery)
+    }
+
+    /// An admitted versioned WAL append may have reached disk even when it
+    /// returns an error, so MVCC must fence publication until recovery.
+    pub(crate) fn versioned_wal_requires_recovery(&self) -> bool {
+        self.wal
+            .as_ref()
+            .is_some_and(|wal| wal.v7_requires_recovery() || wal.v8_requires_recovery())
     }
 
     pub(crate) fn stop_v7_extent_initialization(&self) -> Result<()> {
@@ -2345,19 +2888,27 @@ impl MemTable {
 
     pub(crate) fn wal_logical_length(&self) -> Option<u64> {
         self.wal.as_ref().map(Wal::logical_length).or_else(|| {
-            self.wal_v7_sealing_frontier.and_then(|cursor| {
-                cursor
-                    .frame_offset
-                    .checked_add(crate::wal::v7::codec::WAL_V7_FRAME_LEN as u64)
-            })
+            self.wal_v8_sealed_boundary
+                .map(|boundary| boundary.sealed_end)
+                .or_else(|| {
+                    self.wal_v7_sealing_frontier.and_then(|cursor| {
+                        cursor
+                            .frame_offset
+                            .checked_add(crate::wal::v7::codec::WAL_V7_FRAME_LEN as u64)
+                    })
+                })
         })
     }
 
     #[allow(dead_code)]
     pub(crate) fn wal_batch_count(&self) -> Option<u64> {
         self.wal.as_ref().map(Wal::batch_count).or_else(|| {
-            self.wal_v7_sealing_frontier
-                .map(|cursor| cursor.frontier.ticket_end)
+            self.wal_v8_sealed_boundary
+                .map(|boundary| boundary.active.ticket_end)
+                .or_else(|| {
+                    self.wal_v7_sealing_frontier
+                        .map(|cursor| cursor.frontier.ticket_end)
+                })
         })
     }
 
@@ -3510,6 +4061,13 @@ mod tests {
             install::{WalV7InstalledRecovery, recover_and_install_active},
             recovery::WalV7RecoveryAuthority,
         },
+        wal::v8::{
+            codec::WalV8Header,
+            install::{
+                WalV8InstalledRecovery, create_empty_active_image,
+                recover_and_install_active as recover_and_install_v8_active,
+            },
+        },
     };
 
     #[cfg(target_os = "linux")]
@@ -3519,6 +4077,37 @@ mod tests {
     use crate::wal::v7::admission::{WalV7ResourceCharge, WalV7RetainedResources};
 
     const TEST_V7_MAX_FILE_SIZE: u64 = 1 << 30;
+    const TEST_V8_MAX_IMAGE_LEN: u64 = 1 << 30;
+
+    #[cfg(target_os = "linux")]
+    fn install_empty_v8(path: &Path) -> Result<(WalV8Header, ActiveBoundary)> {
+        let header = WalV8Header {
+            timeline_id: TimelineId([21; 16]),
+            archive_epoch_id: ArchiveEpochId([22; 16]),
+            segment_id: SegmentId(8),
+            predecessor: ChainAnchor::Genesis {
+                archive_epoch_id: ArchiveEpochId([22; 16]),
+            },
+            incarnation: [23; 16],
+        };
+        let boundary = create_empty_active_image(path, header)?;
+        Ok((header, boundary))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn recover_v8(
+        path: &Path,
+        header: WalV8Header,
+        anchors: &[ActiveBoundary],
+    ) -> Result<WalV8InstalledRecovery> {
+        recover_and_install_v8_active(
+            path,
+            anchors,
+            header.predecessor,
+            LIVE_WAL_V5_LIMITS,
+            TEST_V8_MAX_IMAGE_LEN,
+        )
+    }
 
     fn recover_v7(path: &Path, anchor: ActiveBoundary) -> Result<WalV7InstalledRecovery> {
         Ok(recover_and_install_active(
@@ -3553,6 +4142,7 @@ mod tests {
                 archive_epoch_id: header.archive_epoch_id.0,
                 segment_id: header.segment_id.0,
                 incarnation: header.incarnation,
+                wal_format: crate::pitr::manifest::PitrWalFormat::V7,
                 ticket_end: 0,
                 durable_end: WAL_V7_HEADER_LEN as u64,
                 last_commit_ts: 0,
@@ -4054,6 +4644,297 @@ mod tests {
             Some(Bytes::from(expected_value))
         );
         assert_eq!(reopened.range_tombstones().len(), 2);
+
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn v8_active_memtable_reopens_from_normalized_prefix() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("active-v8.wal");
+        let (header, empty_anchor) = install_empty_v8(&path)?;
+        let installed = recover_v8(&path, header, &[empty_anchor])?;
+        let (memtable, max_ts) =
+            MemTable::recover_from_v8_active(8, false, &path, installed, TEST_V8_MAX_IMAGE_LEN)?;
+
+        assert_eq!(max_ts, 0);
+        assert!(memtable.uses_pitr_batch_wal());
+        assert!(memtable.uses_v8_wal());
+        assert!(memtable.wal.as_ref().is_some_and(|wal| wal.is_parallel()));
+        assert_eq!(memtable.wal_batch_count(), Some(0));
+        let (empty, current) = memtable.v8_active_boundaries()?;
+        assert_eq!(empty, empty_anchor);
+        assert_eq!(current, empty_anchor);
+
+        let first_recorded_at = RecordedAt {
+            secs: 100,
+            nanos: 7,
+        };
+        let first_ticket = memtable
+            .write_pitr_wal_batch_only(
+                &WalBatch {
+                    commit_ts: 1,
+                    recorded_at: first_recorded_at,
+                    entries: vec![WalEntry::Put {
+                        key: b"first".to_vec(),
+                        value: vec![crate::vlog::KvKind::Inline as u8, b'1'],
+                    }],
+                },
+                LIVE_WAL_V5_LIMITS,
+            )?
+            .expect("v8 Active WAL assigns the first ticket");
+        assert_eq!(first_ticket, 0);
+        memtable.commit_wal_ticket(Some(first_ticket))?;
+        let (empty, first_boundary) = memtable.v8_active_boundaries()?;
+        assert_eq!(empty, empty_anchor);
+        assert_eq!(first_boundary.ticket_end, 1);
+        assert_eq!(first_boundary.last_commit_ts, 1);
+
+        drop(memtable);
+
+        let installed = recover_v8(&path, header, &[empty_anchor, first_boundary])?;
+        let (memtable, max_ts) =
+            MemTable::recover_from_v8_active(8, false, &path, installed, TEST_V8_MAX_IMAGE_LEN)?;
+        assert_eq!(max_ts, 1);
+        assert_eq!(memtable.wal_batch_count(), Some(1));
+        assert_eq!(memtable.recovered_recorded_at(), Some(first_recorded_at));
+        assert_eq!(
+            memtable.get_raw_exact(&crate::key::encode_internal_key(b"first", 1)),
+            Some(Bytes::from_static(&[
+                crate::vlog::KvKind::Inline as u8,
+                b'1'
+            ]))
+        );
+
+        let second_ticket = memtable
+            .write_pitr_wal_batch_only(
+                &WalBatch {
+                    commit_ts: 2,
+                    recorded_at: RecordedAt {
+                        secs: 101,
+                        nanos: 9,
+                    },
+                    entries: vec![WalEntry::Put {
+                        key: b"second".to_vec(),
+                        value: vec![crate::vlog::KvKind::Inline as u8, b'2'],
+                    }],
+                },
+                LIVE_WAL_V5_LIMITS,
+            )?
+            .expect("reopened v8 Active WAL assigns the next ticket");
+        assert_eq!(second_ticket, 1);
+        memtable.commit_wal_ticket(Some(second_ticket))?;
+        let (_, second_boundary) = memtable.v8_active_boundaries()?;
+        assert_eq!(second_boundary.ticket_end, 2);
+        assert_eq!(second_boundary.last_commit_ts, 2);
+        drop(memtable);
+
+        let installed = recover_v8(
+            &path,
+            header,
+            &[empty_anchor, first_boundary, second_boundary],
+        )?;
+        let (reopened, max_ts) =
+            MemTable::recover_from_v8_active(8, false, &path, installed, TEST_V8_MAX_IMAGE_LEN)?;
+        assert_eq!(max_ts, 2);
+        assert_eq!(reopened.wal_batch_count(), Some(2));
+        assert_eq!(
+            reopened.get_raw_exact(&crate::key::encode_internal_key(b"first", 1)),
+            Some(Bytes::from_static(&[
+                crate::vlog::KvKind::Inline as u8,
+                b'1'
+            ]))
+        );
+        assert_eq!(
+            reopened.get_raw_exact(&crate::key::encode_internal_key(b"second", 2)),
+            Some(Bytes::from_static(&[
+                crate::vlog::KvKind::Inline as u8,
+                b'2'
+            ]))
+        );
+
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn v8_pre_admission_rejection_leaves_mvcc_retryable() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("active-v8.wal");
+        let (header, anchor) = install_empty_v8(&path)?;
+        let installed = recover_v8(&path, header, &[anchor])?;
+        let (memtable, max_ts) =
+            MemTable::recover_from_v8_active(8, false, &path, installed, TEST_V8_MAX_IMAGE_LEN)?;
+        let mvcc = LsmMvccInner::new(max_ts);
+        let key = vec![b'k'; LIVE_WAL_V5_LIMITS.max_key_bytes + 1];
+
+        assert!(mvcc.write_wal_only(&key, b"value", &memtable).is_err());
+        assert!(!memtable.versioned_wal_requires_recovery());
+        assert_eq!(memtable.wal_batch_count(), Some(0));
+        assert_eq!(mvcc.latest_commit_ts(), 0);
+        assert_eq!(mvcc.stop_commit_admission_and_capture()?, None);
+        mvcc.resume_commit_admission();
+        let (commit_ts, key, value, ticket) = mvcc.write_wal_only(b"retry", b"value", &memtable)?;
+        assert_eq!((commit_ts, ticket), (1, Some(0)));
+        memtable.commit_wal_ticket(ticket)?;
+        memtable.publish_raw_batch(&[(crate::key::KeySlice::from_slice(&key), &value)])?;
+        mvcc.publish_commit_ts(commit_ts)?;
+        assert_eq!(mvcc.latest_commit_ts(), 1);
+
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn v8_active_writer_accepts_unaligned_segment_limit() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("active-v8.wal");
+        let (header, anchor) = install_empty_v8(&path)?;
+        let installed = recover_v8(&path, header, &[anchor])?;
+        let max_segment_bytes = 64 * 1024 + 1;
+        let (memtable, _) =
+            MemTable::recover_from_v8_active(8, false, &path, installed, max_segment_bytes)?;
+        for timestamp in 1..=7 {
+            let ticket = memtable.write_pitr_wal_batch_only(
+                &WalBatch {
+                    commit_ts: timestamp,
+                    recorded_at: RecordedAt {
+                        secs: timestamp as i64,
+                        nanos: 0,
+                    },
+                    entries: vec![WalEntry::Put {
+                        key: vec![timestamp as u8],
+                        value: b"value".to_vec(),
+                    }],
+                },
+                LIVE_WAL_V5_LIMITS,
+            )?;
+            memtable.commit_wal_ticket(ticket)?;
+        }
+        assert_eq!(fs::metadata(&path)?.len(), 64 * 1024);
+        let mvcc = LsmMvccInner::new(7);
+        assert!(mvcc.write_wal_only(b"next", b"value", &memtable).is_err());
+        assert!(memtable.pitr_rotation_needed());
+        let retry_commit_ts = mvcc.reserve_commit_ts()?;
+        assert_eq!(retry_commit_ts, 9);
+        mvcc.retire_commit_ts(retry_commit_ts);
+        let (_, current_anchor) = memtable.v8_active_boundaries()?;
+        drop(memtable);
+
+        let installed = recover_and_install_v8_active(
+            &path,
+            &[current_anchor],
+            header.predecessor,
+            LIVE_WAL_V5_LIMITS,
+            max_segment_bytes,
+        )?;
+        let (reopened, max_ts) =
+            MemTable::recover_from_v8_active(8, false, &path, installed, max_segment_bytes)?;
+        assert_eq!(max_ts, 7);
+        assert_eq!(reopened.wal_batch_count(), Some(7));
+
+        Ok(())
+    }
+
+    #[cfg(all(target_os = "linux", feature = "chaos-testing"))]
+    #[test]
+    fn failpoint_v8_sync_failures_poison_mvcc_for_every_write_path() -> Result<()> {
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+
+        use crate::chaos::failpoint::{self, FailScenario};
+
+        for action in ["return", "panic"] {
+            for operation in ["put", "delete", "ttl", "ranges", "batch", "deletes"] {
+                let scenario = FailScenario::setup();
+                let directory = tempfile::tempdir()?;
+                let path = directory.path().join("active-v8.wal");
+                let (header, anchor) = install_empty_v8(&path)?;
+                let installed = recover_v8(&path, header, &[anchor])?;
+                let (memtable, max_ts) = MemTable::recover_from_v8_active(
+                    8,
+                    false,
+                    &path,
+                    installed,
+                    TEST_V8_MAX_IMAGE_LEN,
+                )?;
+                let mvcc = LsmMvccInner::new(max_ts);
+                failpoint::cfg("wal.v8.leader.fdatasync", action).expect("arm v8 sync failure");
+                let mut admitted_commit_ts = None;
+                let result = catch_unwind(AssertUnwindSafe(|| {
+                    let append_result = match operation {
+                        "put" => mvcc
+                            .write_wal_only(b"key", b"value", &memtable)
+                            .map(|(commit_ts, _, _, ticket)| (commit_ts, ticket)),
+                        "delete" => mvcc
+                            .write_tombstone_wal_only(b"key", &memtable)
+                            .map(|(commit_ts, _, _, ticket)| (commit_ts, ticket)),
+                        "ttl" => mvcc
+                            .write_ttl_wal_only(
+                                b"key",
+                                b"value",
+                                std::time::Duration::from_secs(60),
+                                &memtable,
+                            )
+                            .map(|(commit_ts, _, _, ticket)| (commit_ts, ticket)),
+                        "ranges" => mvcc.write_range_batch_wal_only(&[(b"a", b"z")], &memtable),
+                        "batch" => mvcc
+                            .write_batch_wal_only(
+                                &[(
+                                    Bytes::from_static(b"key"),
+                                    Bytes::from_static(b"value"),
+                                    BatchEntryKind::PutRaw,
+                                )],
+                                &memtable,
+                                false,
+                            )
+                            .map(|(commit_ts, _, ticket)| (commit_ts, ticket)),
+                        "deletes" => mvcc
+                            .write_delete_batch_wal_only(
+                                &[Bytes::from_static(b"key")],
+                                &memtable,
+                                false,
+                            )
+                            .map(|(commit_ts, _, ticket)| (commit_ts, ticket)),
+                        _ => unreachable!(),
+                    };
+                    append_result.and_then(|(commit_ts, ticket)| {
+                        admitted_commit_ts = Some(commit_ts);
+                        if let Err(error) = memtable.commit_wal_ticket(ticket) {
+                            mvcc.poison_commit_ts(commit_ts);
+                            Err(error)
+                        } else {
+                            Ok(())
+                        }
+                    })
+                }));
+                scenario.teardown();
+                assert!(
+                    memtable.versioned_wal_requires_recovery(),
+                    "{operation}/{action} must poison the uncertain v8 frontier cycle"
+                );
+
+                if action == "panic" {
+                    assert!(result.is_err(), "{operation} must unwind at the v8 sync");
+                    mvcc.poison_commit_ts(
+                        admitted_commit_ts.expect("sync failpoint ran after WAL admission"),
+                    );
+                } else {
+                    let error = result
+                        .expect("v8 sync returns an error")
+                        .expect_err("v8 sync fails after DATA and FRONTIER writes");
+                    assert!(format!("{error:#}").contains("fdatasync"), "{operation}");
+                }
+                assert!(mvcc.reserve_commit_ts().is_err(), "{operation}/{action}");
+                assert!(mvcc.stop_commit_admission_and_capture().is_err());
+                assert!(memtable.is_empty());
+                drop(memtable);
+
+                let recovered = recover_v8(&path, header, &[anchor])?;
+                assert_eq!(recovered.next_ticket, 1, "{operation}/{action}");
+                assert_eq!(recovered.active_boundary.last_commit_ts, 1);
+            }
+        }
 
         Ok(())
     }

@@ -4,7 +4,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
 };
 
@@ -21,6 +21,10 @@ pub(crate) struct Manifest {
     file: Arc<Mutex<File>>,
     path: PathBuf,
     durability_uncertain: AtomicBool,
+    v8_compatibility_guarded: AtomicBool,
+    v8_compatibility_snapshot: AtomicBool,
+    v8_compatibility_generation: AtomicU64,
+    v8_compatibility_snapshot_lock: Mutex<()>,
 }
 
 #[cfg(test)]
@@ -294,6 +298,7 @@ mod manifest_revalidation_tests {
                         archive_epoch_id: [2; 16],
                         segment_id: 8,
                         incarnation: [3; 16],
+                        wal_format: crate::pitr::manifest::PitrWalFormat::V7,
                         ticket_end: 0,
                         durable_end: 4096,
                         last_commit_ts: 0,
@@ -603,6 +608,332 @@ mod manifest_revalidation_tests {
 }
 
 #[cfg(test)]
+mod v8_compatibility_guard_tests {
+    use std::fs::File;
+
+    use serde::Deserialize;
+
+    use super::{MANIFEST_FORMAT_VERSION, Manifest, ManifestRecord};
+
+    fn snapshot(next_sst_id: usize) -> ManifestRecord {
+        ManifestRecord::Snapshot {
+            l0_sstables: Vec::new(),
+            levels: Vec::new(),
+            range_only_ssts: Vec::new(),
+            next_sst_id,
+            vlog_references: Vec::new(),
+            imm_memtable_ids: Vec::new(),
+            pitr_memtable_segments: Vec::new(),
+            active_compaction_filters: Vec::new(),
+            next_compaction_filter_id: 0,
+            format_version: MANIFEST_FORMAT_VERSION,
+            immutable_file_metadata: Vec::new(),
+            pitr_state: Some(crate::pitr::manifest::PitrState::default()),
+        }
+    }
+
+    fn read_records(path: &std::path::Path) -> Vec<ManifestRecord> {
+        let bytes = std::fs::read(path).unwrap();
+        serde_json::Deserializer::from_slice(&bytes)
+            .into_iter::<ManifestRecord>()
+            .collect::<serde_json::Result<Vec<_>>>()
+            .unwrap()
+    }
+
+    fn write_wrapped_snapshot(path: &std::path::Path, snapshot_id: u64, record: ManifestRecord) {
+        let snapshot_path = Manifest::snapshot_path(path);
+        let mut file = File::create(snapshot_path).unwrap();
+        serde_json::to_writer(
+            &mut file,
+            &ManifestRecord::V8Snapshot {
+                snapshot_id,
+                snapshot: Box::new(record),
+            },
+        )
+        .unwrap();
+        file.sync_all().unwrap();
+    }
+
+    #[test]
+    fn publishing_and_recovering_guard_keeps_unknown_snapshot_and_log_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("MANIFEST");
+        let manifest = Manifest::create(&path).unwrap();
+        manifest
+            .publish_v8_compatibility_guard(snapshot(2))
+            .unwrap();
+        assert!(manifest.v8_compatibility_guard_ready());
+
+        let wrapped: ManifestRecord =
+            serde_json::from_slice(&std::fs::read(Manifest::snapshot_path(&path)).unwrap())
+                .unwrap();
+        assert!(matches!(
+            wrapped,
+            ManifestRecord::V8Snapshot {
+                snapshot_id: 1,
+                snapshot,
+            } if matches!(*snapshot, ManifestRecord::Snapshot { next_sst_id: 2, .. })
+        ));
+        assert!(matches!(
+            read_records(&path).as_slice(),
+            [ManifestRecord::V8CompatibilityGuard {
+                format_version: crate::wal::format::WAL_FORMAT_VERSION_V8,
+                snapshot_id: 1,
+            }]
+        ));
+        drop(manifest);
+
+        let (manifest, records) = Manifest::recover(&path).unwrap();
+        assert!(manifest.v8_compatibility_guard_ready());
+        assert!(matches!(
+            records.as_slice(),
+            [ManifestRecord::Snapshot { next_sst_id: 2, .. }]
+        ));
+
+        manifest.snapshot(snapshot(3)).unwrap();
+        assert!(matches!(
+            read_records(&path).as_slice(),
+            [ManifestRecord::V8CompatibilityGuard {
+                format_version: crate::wal::format::WAL_FORMAT_VERSION_V8,
+                snapshot_id: 2,
+            }]
+        ));
+        drop(manifest);
+        let (manifest, records) = Manifest::recover(&path).unwrap();
+        assert!(manifest.v8_compatibility_guard_ready());
+        assert!(matches!(
+            records.as_slice(),
+            [ManifestRecord::Snapshot { next_sst_id: 3, .. }]
+        ));
+    }
+
+    #[test]
+    fn recovery_cuts_old_log_at_matching_snapshot_generation_and_keeps_suffix() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("MANIFEST");
+        let manifest = Manifest::create(&path).unwrap();
+        manifest
+            .add_records_when_init(&[
+                ManifestRecord::Flush(1),
+                ManifestRecord::V8CompatibilityGuard {
+                    format_version: crate::wal::format::WAL_FORMAT_VERSION_V8,
+                    snapshot_id: 1,
+                },
+                ManifestRecord::Flush(2),
+                ManifestRecord::V8CompatibilityGuard {
+                    format_version: crate::wal::format::WAL_FORMAT_VERSION_V8,
+                    snapshot_id: 2,
+                },
+                ManifestRecord::Flush(3),
+            ])
+            .unwrap();
+        write_wrapped_snapshot(&path, 2, snapshot(3));
+        drop(manifest);
+
+        let (manifest, records) = Manifest::recover(&path).unwrap();
+        assert!(manifest.v8_compatibility_guard_ready());
+        assert!(matches!(
+            records.as_slice(),
+            [
+                ManifestRecord::Snapshot { next_sst_id: 3, .. },
+                ManifestRecord::Flush(3),
+            ]
+        ));
+        assert!(matches!(
+            read_records(&path).as_slice(),
+            [
+                ManifestRecord::V8CompatibilityGuard { snapshot_id: 2, .. },
+                ManifestRecord::Flush(3),
+            ]
+        ));
+
+        drop(manifest);
+        let (manifest, records) = Manifest::recover(&path).unwrap();
+        assert!(manifest.v8_compatibility_guard_ready());
+        assert!(matches!(
+            records.as_slice(),
+            [
+                ManifestRecord::Snapshot { next_sst_id: 3, .. },
+                ManifestRecord::Flush(3),
+            ]
+        ));
+    }
+
+    #[test]
+    fn wrapped_snapshot_recovers_when_manifest_is_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("MANIFEST");
+        write_wrapped_snapshot(&path, 7, snapshot(8));
+
+        let (manifest, records) = Manifest::recover(&path).unwrap();
+        assert!(manifest.v8_compatibility_guard_ready());
+        assert!(matches!(
+            records.as_slice(),
+            [ManifestRecord::Snapshot { next_sst_id: 8, .. }]
+        ));
+        assert!(matches!(
+            read_records(&path).as_slice(),
+            [ManifestRecord::V8CompatibilityGuard { snapshot_id: 7, .. }]
+        ));
+    }
+
+    #[test]
+    fn durable_guard_without_installed_snapshot_survives_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("MANIFEST");
+        let manifest = Manifest::create(&path).unwrap();
+        manifest
+            .add_records_when_init(&[
+                ManifestRecord::Flush(1),
+                ManifestRecord::V8CompatibilityGuard {
+                    format_version: crate::wal::format::WAL_FORMAT_VERSION_V8,
+                    snapshot_id: 1,
+                },
+            ])
+            .unwrap();
+        drop(manifest);
+
+        let (manifest, records) = Manifest::recover(&path).unwrap();
+        assert!(!manifest.v8_compatibility_guard_ready());
+        assert!(matches!(records.as_slice(), [ManifestRecord::Flush(1)]));
+        assert!(matches!(
+            read_records(&path).as_slice(),
+            [
+                ManifestRecord::Flush(1),
+                ManifestRecord::V8CompatibilityGuard { snapshot_id: 1, .. },
+            ]
+        ));
+
+        manifest
+            .publish_v8_compatibility_guard(snapshot(2))
+            .unwrap();
+        assert!(manifest.v8_compatibility_guard_ready());
+        assert!(matches!(
+            read_records(&path).as_slice(),
+            [ManifestRecord::V8CompatibilityGuard { snapshot_id: 2, .. }]
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn guard_publication_process_crashes_recover_at_each_boundary() {
+        let child_path = std::env::var_os("PITR_V8_GUARD_CHILD_PATH");
+        if let Some(path) = child_path {
+            let path = std::path::PathBuf::from(path);
+            let (manifest, _) = Manifest::recover(&path).unwrap();
+            manifest
+                .publish_v8_compatibility_guard(snapshot(2))
+                .unwrap();
+            unreachable!("child must exit at the injected v8 guard crash boundary");
+        }
+
+        for boundary in [
+            "PITR_PROCESS_KILL_AFTER_V8_GUARD_APPEND",
+            "PITR_PROCESS_KILL_AFTER_V8_GUARD_SNAPSHOT_RENAME",
+            "PITR_PROCESS_KILL_AFTER_V8_GUARD_MANIFEST_RENAME",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("MANIFEST");
+            let manifest = Manifest::create(&path).unwrap();
+            manifest
+                .add_record_when_init(ManifestRecord::Flush(1))
+                .unwrap();
+            drop(manifest);
+
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .arg("--exact")
+                .arg(
+                    "manifest::v8_compatibility_guard_tests::guard_publication_process_crashes_recover_at_each_boundary",
+                )
+                .arg("--nocapture")
+                .env("PITR_V8_GUARD_CHILD_PATH", &path)
+                .env(boundary, "1")
+                .status()
+                .unwrap();
+            assert_eq!(status.code(), Some(137), "boundary {boundary}");
+
+            let (manifest, records) = Manifest::recover(&path).unwrap();
+            if boundary == "PITR_PROCESS_KILL_AFTER_V8_GUARD_APPEND" {
+                assert!(!manifest.v8_compatibility_guard_ready());
+                assert!(matches!(records.as_slice(), [ManifestRecord::Flush(1)]));
+                manifest
+                    .publish_v8_compatibility_guard(snapshot(2))
+                    .unwrap();
+                assert!(manifest.v8_compatibility_guard_ready());
+            } else {
+                assert!(manifest.v8_compatibility_guard_ready());
+                assert!(matches!(
+                    records.as_slice(),
+                    [ManifestRecord::Snapshot { next_sst_id: 2, .. }]
+                ));
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("MANIFEST");
+        let manifest = Manifest::create(&path).unwrap();
+        manifest.snapshot(snapshot(1)).unwrap();
+        drop(manifest);
+        let snapshot_path = Manifest::snapshot_path(&path);
+        let original_snapshot = std::fs::read(&snapshot_path).unwrap();
+        assert!(std::fs::read(&path).unwrap().is_empty());
+
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg(
+                "manifest::v8_compatibility_guard_tests::guard_publication_process_crashes_recover_at_each_boundary",
+            )
+            .arg("--nocapture")
+            .env("PITR_V8_GUARD_CHILD_PATH", &path)
+            .env("PITR_PROCESS_KILL_AFTER_V8_GUARD_TMP_SYNC", "1")
+            .status()
+            .unwrap();
+        assert_eq!(status.code(), Some(137));
+        assert!(Manifest::snapshot_tmp_path(&path).exists());
+        assert_eq!(std::fs::read(&snapshot_path).unwrap(), original_snapshot);
+
+        let (manifest, records) = Manifest::recover(&path).unwrap();
+        assert!(!manifest.v8_compatibility_guard_ready());
+        assert!(matches!(
+            records.as_slice(),
+            [ManifestRecord::Snapshot { next_sst_id: 1, .. }]
+        ));
+        assert_eq!(std::fs::read(&snapshot_path).unwrap(), original_snapshot);
+        assert!(matches!(
+            read_records(&path).as_slice(),
+            [ManifestRecord::V8CompatibilityGuard { snapshot_id: 1, .. }]
+        ));
+
+        manifest
+            .publish_v8_compatibility_guard(snapshot(2))
+            .unwrap();
+        assert!(manifest.v8_compatibility_guard_ready());
+    }
+
+    #[test]
+    fn old_reader_enum_rejects_guard_records_and_snapshot_wrappers() {
+        #[derive(Deserialize)]
+        #[allow(dead_code)]
+        enum PreV8Record {
+            Flush(usize),
+        }
+
+        let guard = serde_json::to_vec(&ManifestRecord::V8CompatibilityGuard {
+            format_version: crate::wal::format::WAL_FORMAT_VERSION_V8,
+            snapshot_id: 1,
+        })
+        .unwrap();
+        let snapshot = serde_json::to_vec(&ManifestRecord::V8Snapshot {
+            snapshot_id: 1,
+            snapshot: Box::new(snapshot(0)),
+        })
+        .unwrap();
+        assert!(serde_json::from_slice::<PreV8Record>(&guard).is_err());
+        assert!(serde_json::from_slice::<PreV8Record>(&snapshot).is_err());
+    }
+}
+
+#[cfg(test)]
 mod immutable_file_metadata_tests {
     use super::{ImmutableFileKind, ImmutableFileMetadata};
 
@@ -632,6 +963,18 @@ pub(crate) enum ManifestRecord {
     /// 9 = durable Active v7 successor boundaries, 10 = pending migration intent.
     /// Absence of this record means pre-MVCC.
     FormatVersion(u32),
+    /// Unknown to v2-v7 readers. It is persisted after a v8-compatible
+    /// snapshot is installed so those readers fail while replaying MANIFEST.
+    V8CompatibilityGuard {
+        format_version: u16,
+        snapshot_id: u64,
+    },
+    /// Unknown to v2-v7 readers. This wrapper makes a v8 guard visible before
+    /// recovery opens or creates MANIFEST, including when MANIFEST is missing.
+    V8Snapshot {
+        snapshot_id: u64,
+        snapshot: Box<ManifestRecord>,
+    },
     /// Dormant PITR v7 transition record. Replayed only when PITR is enabled.
     Pitr(PitrManifestRecord),
     Flush(usize),
@@ -726,6 +1069,10 @@ impl Manifest {
             file: Arc::new(Mutex::new(f)),
             path,
             durability_uncertain: AtomicBool::new(false),
+            v8_compatibility_guarded: AtomicBool::new(false),
+            v8_compatibility_snapshot: AtomicBool::new(false),
+            v8_compatibility_generation: AtomicU64::new(0),
+            v8_compatibility_snapshot_lock: Mutex::new(()),
         })
     }
 
@@ -744,14 +1091,125 @@ impl Manifest {
     pub fn recover(path: impl AsRef<Path>) -> Result<(Self, Vec<ManifestRecord>)> {
         let path = path.as_ref();
         let snapshot = Self::read_recovery_snapshot(path)?;
+        let mut v8_compatibility_snapshot_generation = None;
+        let mut v8_compatibility_generation = 0;
         let mut records = if let Some((_, bytes)) = &snapshot {
-            vec![serde_json::from_slice(bytes).context("failed to deserialize manifest snapshot")?]
+            let record: ManifestRecord =
+                serde_json::from_slice(bytes).context("failed to deserialize manifest snapshot")?;
+            match record {
+                ManifestRecord::V8Snapshot {
+                    snapshot_id,
+                    snapshot,
+                } => {
+                    ensure!(
+                        matches!(*snapshot, ManifestRecord::Snapshot { .. }),
+                        "v8 manifest guard must wrap a Snapshot record"
+                    );
+                    ensure!(
+                        snapshot_id > 0,
+                        "v8 compatibility snapshot generation must be nonzero"
+                    );
+                    v8_compatibility_snapshot_generation = Some(snapshot_id);
+                    v8_compatibility_generation = snapshot_id;
+                    vec![*snapshot]
+                }
+                record => vec![record],
+            }
         } else {
             Vec::new()
         };
         let mut f = Self::open_recovery_manifest(path)?;
-        let bytes = Self::recover_manifest_records(&mut f, &mut records)?;
+        let mut bytes = Self::recover_manifest_records(&mut f, &mut records)?;
         drop(f);
+        let v8_compatibility_snapshot = v8_compatibility_snapshot_generation.is_some();
+        let mut v8_compatibility_guarded = v8_compatibility_snapshot;
+        let mut guard_indices = Vec::new();
+        let mut previous_guard_generation = 0;
+        for (index, record) in records.iter().enumerate() {
+            match record {
+                ManifestRecord::V8CompatibilityGuard {
+                    format_version,
+                    snapshot_id,
+                } => {
+                    ensure!(
+                        *format_version == crate::wal::format::WAL_FORMAT_VERSION_V8,
+                        "manifest v8 compatibility guard has an unsupported format version"
+                    );
+                    ensure!(
+                        *snapshot_id > 0,
+                        "manifest v8 guard generation must be nonzero"
+                    );
+                    ensure!(
+                        *snapshot_id > previous_guard_generation,
+                        "manifest v8 guard generations must increase"
+                    );
+                    previous_guard_generation = *snapshot_id;
+                    v8_compatibility_generation = v8_compatibility_generation.max(*snapshot_id);
+                    guard_indices.push((index, *snapshot_id));
+                    v8_compatibility_guarded = true;
+                }
+                ManifestRecord::V8Snapshot { .. } => {
+                    anyhow::bail!("v8 compatibility snapshots are only valid in ENGINE_MANIFEST");
+                }
+                _ => {}
+            }
+        }
+
+        if let Some(snapshot_id) = v8_compatibility_snapshot_generation {
+            // The wrapped image is complete. During its installation, the
+            // previous manifest prefix can remain on disk beside it. The
+            // guard generation embedded in the snapshot marks exactly how far
+            // into that log recovery may discard records.
+            let matching_guards = guard_indices
+                .iter()
+                .filter(|(_, guard_id)| *guard_id == snapshot_id)
+                .map(|(index, _)| *index)
+                .collect::<Vec<_>>();
+            ensure!(
+                matching_guards.len() <= 1,
+                "manifest contains duplicate guards for the v8 snapshot generation"
+            );
+            let suffix_start = if let Some(&guard_index) = matching_guards.first() {
+                guard_index + 1
+            } else {
+                ensure!(
+                    records.len() == 1,
+                    "manifest is missing the guard matching its v8 snapshot"
+                );
+                records.len()
+            };
+            ensure!(
+                matches!(records.first(), Some(ManifestRecord::Snapshot { .. })),
+                "v8 compatibility snapshot must be the first recovered record"
+            );
+            let snapshot_record = records.remove(0);
+            let suffix = records
+                .drain(suffix_start.saturating_sub(1)..)
+                .collect::<Vec<_>>();
+            records.clear();
+            records.push(snapshot_record);
+
+            let mut normalized = Vec::new();
+            serde_json::to_writer(
+                &mut normalized,
+                &ManifestRecord::V8CompatibilityGuard {
+                    format_version: crate::wal::format::WAL_FORMAT_VERSION_V8,
+                    snapshot_id,
+                },
+            )?;
+            for record in &suffix {
+                serde_json::to_writer(&mut normalized, record)?;
+            }
+            bytes = normalized;
+            records.extend(
+                suffix.into_iter().filter(|record| {
+                    !matches!(record, ManifestRecord::V8CompatibilityGuard { .. })
+                }),
+            );
+            v8_compatibility_guarded = true;
+        } else {
+            records.retain(|record| !matches!(record, ManifestRecord::V8CompatibilityGuard { .. }));
+        }
         if let Some((source_path, snapshot_bytes)) = &snapshot {
             // Stabilize a pending snapshot under its pending name before making
             // MANIFEST's empty state durable. Its final rename must wait until
@@ -773,14 +1231,16 @@ impl Manifest {
             Self::sync_parent_directory(&snapshot_path)?;
         }
 
-        Ok((
-            Self {
-                file: Arc::new(Mutex::new(f)),
-                path: path.to_path_buf(),
-                durability_uncertain: AtomicBool::new(false),
-            },
-            records,
-        ))
+        let manifest = Self {
+            file: Arc::new(Mutex::new(f)),
+            path: path.to_path_buf(),
+            durability_uncertain: AtomicBool::new(false),
+            v8_compatibility_guarded: AtomicBool::new(v8_compatibility_guarded),
+            v8_compatibility_snapshot: AtomicBool::new(v8_compatibility_snapshot),
+            v8_compatibility_generation: AtomicU64::new(v8_compatibility_generation),
+            v8_compatibility_snapshot_lock: Mutex::new(()),
+        };
+        Ok((manifest, records))
     }
 
     /// Take a snapshot of the current state and replace the manifest file.
@@ -805,6 +1265,9 @@ impl Manifest {
     /// - After step 3 durable: snapshot + empty manifest → clean recovery
     pub fn snapshot(&self, record: ManifestRecord) -> Result<()> {
         self.ensure_durability_certain()?;
+        if self.v8_compatibility_guarded.load(Ordering::Acquire) {
+            return self.snapshot_with_v8_compatibility_guard(record);
+        }
         let snapshot_path = Self::snapshot_path(&self.path);
         let tmp_path = snapshot_path.with_extension("tmp");
 
@@ -881,6 +1344,179 @@ impl Manifest {
         Ok(())
     }
 
+    /// Durably reject older readers before a v8 WAL can be created.
+    ///
+    /// The guard appears as an unknown top-level manifest record and as an
+    /// unknown wrapper around the canonical snapshot. Each snapshot carries the
+    /// generation of the matching log guard so recovery can find its exact cut.
+    pub(crate) fn publish_v8_compatibility_guard(&self, snapshot: ManifestRecord) -> Result<()> {
+        ensure!(
+            matches!(snapshot, ManifestRecord::Snapshot { .. }),
+            "v8 compatibility guard requires a complete Snapshot record"
+        );
+        self.ensure_durability_certain()?;
+
+        self.snapshot_with_v8_compatibility_guard(snapshot)?;
+        ensure!(
+            self.v8_compatibility_guard_ready(),
+            "v8 compatibility guard publication did not reach a durable state"
+        );
+        Ok(())
+    }
+
+    pub(crate) fn v8_compatibility_guard_ready(&self) -> bool {
+        self.v8_compatibility_guarded.load(Ordering::Acquire)
+            && self.v8_compatibility_snapshot.load(Ordering::Acquire)
+            && !self.durability_uncertain.load(Ordering::Acquire)
+    }
+
+    fn snapshot_with_v8_compatibility_guard(&self, record: ManifestRecord) -> Result<()> {
+        ensure!(
+            matches!(record, ManifestRecord::Snapshot { .. }),
+            "v8 compatibility snapshot requires a complete Snapshot record"
+        );
+        let _snapshot_guard = self.v8_compatibility_snapshot_lock.lock();
+        self.ensure_durability_certain()?;
+        let generation = self
+            .v8_compatibility_generation
+            .load(Ordering::Acquire)
+            .checked_add(1)
+            .context("v8 compatibility snapshot generation overflow")?;
+        let guard_record = ManifestRecord::V8CompatibilityGuard {
+            format_version: crate::wal::format::WAL_FORMAT_VERSION_V8,
+            snapshot_id: generation,
+        };
+        let wrapped_record = ManifestRecord::V8Snapshot {
+            snapshot_id: generation,
+            snapshot: Box::new(record),
+        };
+        let snapshot_path = Self::snapshot_path(&self.path);
+        let snapshot_tmp_path = Self::snapshot_tmp_path(&self.path);
+        let snapshot_bytes = serde_json::to_vec(&wrapped_record)?;
+        let mut manifest_file = self.file.lock();
+        self.ensure_durability_certain()?;
+
+        // Publish the rejection marker before creating ENGINE_MANIFEST.tmp.
+        // Recovery may consider a temporary snapshot authoritative when
+        // MANIFEST is empty, so placing the temp file first could let a stale
+        // pending image survive an old binary's subsequent MANIFEST rewrite.
+        // If a crash leaves the previous snapshot installed, recovery uses the
+        // matching older marker and replays records after it, including this
+        // new generation marker.
+        let guard_log_bytes = serde_json::to_vec(&guard_record)?;
+        if let Err(error) = manifest_file.write_all(&guard_log_bytes) {
+            self.mark_durability_uncertain();
+            return Err(error).context("failed to append v8 compatibility guard");
+        }
+        self.sync_locked_file(&manifest_file)
+            .context("failed to sync v8 compatibility guard")?;
+        self.v8_compatibility_guarded.store(true, Ordering::Release);
+        self.v8_compatibility_generation
+            .store(generation, Ordering::Release);
+
+        #[cfg(test)]
+        if std::env::var_os("PITR_PROCESS_KILL_AFTER_V8_GUARD_APPEND").is_some() {
+            // SAFETY: this is an isolated child-process crash boundary after
+            // the unknown log marker is durable and before snapshot temp creation.
+            unsafe { libc::_exit(137) }
+        }
+
+        {
+            let mut tmp_file = File::create(&snapshot_tmp_path)
+                .context("failed to create guarded ENGINE_MANIFEST.tmp")?;
+            tmp_file.write_all(&snapshot_bytes)?;
+            Self::sync_file(&tmp_file, &snapshot_path)
+                .context("failed to sync guarded ENGINE_MANIFEST.tmp")?;
+        }
+
+        #[cfg(feature = "chaos-testing")]
+        crate::chaos::failpoint::fail_point!("manifest.after_snapshot_tmp_sync");
+
+        #[cfg(test)]
+        if std::env::var_os("PITR_PROCESS_KILL_AFTER_V8_GUARD_TMP_SYNC").is_some() {
+            // SAFETY: this is an isolated child-process crash boundary after
+            // the guard snapshot temp is synced but before it is installed.
+            unsafe { libc::_exit(137) }
+        }
+
+        // Older readers reject the durable log marker until the wrapped
+        // snapshot is durable. Once it is installed, it also protects recovery
+        // paths that create a missing MANIFEST before parsing it.
+        if let Err(error) = fs::rename(&snapshot_tmp_path, &snapshot_path) {
+            self.mark_durability_uncertain();
+            return Err(error).context("failed to install guarded ENGINE_MANIFEST");
+        }
+        if let Err(error) = Self::sync_parent_directory(&snapshot_path) {
+            self.mark_durability_uncertain();
+            return Err(error);
+        }
+        self.v8_compatibility_snapshot
+            .store(true, Ordering::Release);
+
+        #[cfg(test)]
+        if std::env::var_os("PITR_PROCESS_KILL_AFTER_V8_GUARD_SNAPSHOT_RENAME").is_some() {
+            // SAFETY: this is an isolated child-process crash boundary after
+            // the rejecting snapshot wrapper is durable and before log rewrite.
+            unsafe { libc::_exit(137) }
+        }
+
+        let manifest_tmp_path = Self::v8_guard_manifest_tmp_path(&self.path);
+        match fs::remove_file(&manifest_tmp_path) {
+            std::result::Result::Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                self.mark_durability_uncertain();
+                return Err(error).context("failed to remove stale v8 guard manifest temporary");
+            }
+        }
+        let mut guard_file = match File::create_new(&manifest_tmp_path) {
+            std::result::Result::Ok(file) => file,
+            Err(error) => {
+                self.mark_durability_uncertain();
+                return Err(error).context("failed to create v8 guard manifest temporary");
+            }
+        };
+        if let Err(error) = (|| {
+            guard_file.set_permissions(fs::metadata(&self.path)?.permissions())?;
+            guard_file.write_all(&guard_log_bytes)?;
+            Self::sync_file(&guard_file, &self.path)
+                .context("failed to sync v8 guard manifest temporary")?;
+            Ok(())
+        })() {
+            self.mark_durability_uncertain();
+            let _ = fs::remove_file(&manifest_tmp_path);
+            return Err(error);
+        }
+        drop(guard_file);
+
+        if let Err(error) = fs::rename(&manifest_tmp_path, &self.path) {
+            self.mark_durability_uncertain();
+            let _ = fs::remove_file(&manifest_tmp_path);
+            return Err(error).context("failed to install v8 guard manifest");
+        }
+        if let Err(error) = Self::sync_parent_directory(&self.path) {
+            self.mark_durability_uncertain();
+            return Err(error);
+        }
+        let replacement = match File::options().read(true).append(true).open(&self.path) {
+            std::result::Result::Ok(file) => file,
+            Err(error) => {
+                self.mark_durability_uncertain();
+                return Err(error).context("failed to reopen installed v8 guard manifest");
+            }
+        };
+        *manifest_file = replacement;
+
+        #[cfg(test)]
+        if std::env::var_os("PITR_PROCESS_KILL_AFTER_V8_GUARD_MANIFEST_RENAME").is_some() {
+            // SAFETY: this is an isolated child-process crash boundary after
+            // the compact rejecting MANIFEST has been installed and synced.
+            unsafe { libc::_exit(137) }
+        }
+
+        Ok(())
+    }
+
     /// Return the current size of the manifest file in bytes.
     pub fn file_size(&self) -> Result<u64> {
         let file = self.file.lock();
@@ -895,6 +1531,10 @@ impl Manifest {
             .parent()
             .unwrap_or(Path::new("."))
             .join("ENGINE_MANIFEST")
+    }
+
+    fn v8_guard_manifest_tmp_path(manifest_path: &Path) -> PathBuf {
+        manifest_path.with_extension("v8-guard.tmp")
     }
 
     fn snapshot_tmp_path(manifest_path: &Path) -> PathBuf {
