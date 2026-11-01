@@ -1176,20 +1176,6 @@ impl WalV8ParallelWriter {
             if self.coordinator.durable_ticket_end() >= ticket_end {
                 return Ok(());
             }
-            let ready = self.coordinator.frontier_ready_prefix();
-            if ready.is_empty() {
-                drop(previous);
-                let wake = self
-                    .coordinator
-                    .wait_for_change(observed_generation, Duration::from_secs(1));
-                if wake.poisoned {
-                    anyhow::bail!("v8 Parallel WAL was poisoned while waiting for durability");
-                }
-                if wake.closed && self.coordinator.durable_ticket_end() < ticket_end {
-                    anyhow::bail!("v8 Parallel WAL closed before the ticket became durable");
-                }
-                continue;
-            }
 
             #[cfg(feature = "bench")]
             let profile = self.profile.load_full();
@@ -1207,8 +1193,24 @@ impl WalV8ParallelWriter {
                 );
                 (snapshot.ready_prefix, Some(observation))
             } else {
-                (ready, None)
+                (self.coordinator.frontier_ready_prefix(), None)
             };
+            #[cfg(not(feature = "bench"))]
+            let ready = self.coordinator.frontier_ready_prefix();
+
+            if ready.is_empty() {
+                drop(previous);
+                let wake = self
+                    .coordinator
+                    .wait_for_change(observed_generation, Duration::from_secs(1));
+                if wake.poisoned {
+                    anyhow::bail!("v8 Parallel WAL was poisoned while waiting for durability");
+                }
+                if wake.closed && self.coordinator.durable_ticket_end() < ticket_end {
+                    anyhow::bail!("v8 Parallel WAL closed before the ticket became durable");
+                }
+                continue;
+            }
 
             let first_ticket = self.coordinator.durable_ticket_end();
             let frontier_ticket_end = first_ticket
