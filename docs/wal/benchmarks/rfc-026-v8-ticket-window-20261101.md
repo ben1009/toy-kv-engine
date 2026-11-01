@@ -59,3 +59,23 @@ stalls and had too few latency samples.
 The repeatable mechanism signal is that the 32-ticket window increased average
 ticket coverage per durability sync from 3.45 to about 4.95. Qualification
 still needs repeated paired ext4 runs and the full RFC 026 workload matrix.
+
+## Follow-up screens
+
+An 8-writer pair was not comparable because the 8-ticket control was stalled:
+
+| Limit | Throughput (entries/s) | p99 (ms) | Syncs | fdatasync time (s) |
+|---:|---:|---:|---:|---:|
+| 8 | 46,685 | 47.671 | 2,973 | 14.647 |
+| 32 | 263,122 | 3.329 | 3,072 | 1.899 |
+
+The control spent most of its 16.1 s run in `fdatasync`; the candidate finished
+in 2.85 s. The candidate also had slightly more syncs, so this pair says nothing
+reliable about the 32-ticket cap at 8 writers.
+
+A 64-ticket cap was screened at 16 writers. One attempt failed before metrics
+because the PITR admission barrier did not reopen within 5 s. The successful
+retry (`1793501267713`) measured 331,831 entries/s, p99 5.370 ms, and 2,316
+syncs for 11,728 tickets. This is close to the 32-ticket candidate's 2,319–
+2,419 syncs and is only one successful sample, so the 64-ticket cap was not
+retained. The committed cap remains 32.
