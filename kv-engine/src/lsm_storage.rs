@@ -2921,6 +2921,42 @@ impl KvEngine {
         self.inner.state.load().memtable.uses_v8_wal() && self.has_active_versioned_sealing_source()
     }
 
+    /// The caller holds the PITR barrier while checking the installed writer
+    /// before reopening commit admission after a v8 handoff.
+    #[cfg(target_os = "linux")]
+    fn validate_installed_v8_active_boundary(
+        &self,
+        state: &crate::pitr::manifest::PitrState,
+    ) -> Result<()> {
+        let expected = state
+            .active_boundary
+            .ok_or_else(|| anyhow!("v8 admission requires a manifest Active boundary"))?;
+        ensure!(
+            expected.wal_format == crate::pitr::manifest::PitrWalFormat::V8
+                && state.active_segment_id == Some(expected.segment_id)
+                && state.timeline_id == Some(expected.timeline_id)
+                && state.archive_epoch_id == Some(expected.archive_epoch_id),
+            "v8 admission boundary differs from the PITR manifest identity"
+        );
+        let active = self.inner.state.load().memtable.clone();
+        ensure!(
+            active.uses_v8_wal()
+                && active.wal_io_mode().is_some()
+                && LsmStorageInner::pitr_segment_of(&active) == Some(expected.segment_id),
+            "v8 successor must be installed before reopening commit admission"
+        );
+        let (empty, _) = active.v8_active_boundaries()?;
+        ensure!(
+            empty.timeline_id == expected.timeline_id
+                && empty.archive_epoch_id == expected.archive_epoch_id
+                && empty.segment_id == expected.segment_id
+                && empty.incarnation == expected.incarnation,
+            "installed Active v8 WAL differs from the manifest boundary"
+        );
+
+        Ok(())
+    }
+
     /// Update PITR scheduling options without changing persisted safety state.
     ///
     /// Runtime options are accepted only after a durable PITR enable/resume has
@@ -4718,7 +4754,8 @@ impl KvEngine {
             // flag `enable_pitr` refuses to proceed on. Reopening admission there
             // would let the epoch accept writes it can no longer archive.
             let _barrier = self.pitr_barrier_lock.lock();
-            let reopening_permitted = self.pitr_manifest_state.lock().mode
+            let current_state = self.pitr_manifest_state.lock().clone();
+            let reopening_permitted = current_state.mode
                 == crate::pitr::manifest::PitrMode::Enabled
                 && !self.pitr_publication_unknown.load(Ordering::Acquire)
                 && self.inner.lifecycle.ensure_open().is_ok();
@@ -4728,7 +4765,12 @@ impl KvEngine {
                     .mvcc
                     .as_ref()
                     .ok_or_else(|| anyhow!("PITR resume requires MVCC"))?;
-                if self.inner.state.load().memtable.uses_v8_wal() {
+                if self.inner.state.load().memtable.uses_v8_wal()
+                    || current_state.active_boundary.is_some_and(|boundary| {
+                        boundary.wal_format == crate::pitr::manifest::PitrWalFormat::V8
+                    })
+                {
+                    self.validate_installed_v8_active_boundary(&current_state)?;
                     if let Some(generation) = fence_generation
                         && sequencer.resume_commit_admission_if_generation(generation)
                     {
@@ -5858,9 +5900,7 @@ impl KvEngine {
                 ])?;
                 records.push(record);
             }
-            if obligation_state == crate::pitr::manifest::ObligationState::Sealed
-                && !committed.contains(&segment_id)
-            {
+            if obligation_state == crate::pitr::manifest::ObligationState::Sealed {
                 // Archiving publishes the segment and lets the reclaim unlink its
                 // source, so it may only run once the engine has stopped writing
                 // to it. Mid-process the segment is still the one receiving
@@ -5872,21 +5912,27 @@ impl KvEngine {
                 // boundary whose archive failed leaves it naming a segment the
                 // engine has already frozen past. Asking the manager would refuse
                 // exactly the case the next boundary exists to publish.
+                // V8 publishes SegmentSealed before installing its successor.
+                // Preserve that handoff obligation while the source remains
+                // installed, even if its archive already exists, so resume can
+                // install the successor before reopening commit admission.
                 let active = self.inner.state.load().memtable.clone();
                 ensure!(
-                    !((active.uses_wal_v5() || active.uses_v7_wal())
+                    !((active.uses_wal_v5() || active.uses_v7_wal() || active.uses_v8_wal())
                         && LsmStorageInner::pitr_segment_of(&active) == Some(segment_id)),
                     "PITR segment {segment_id} is still the one this process is writing to; \
                      its successor must be installed before archive reconciliation"
                 );
-                let (metadata, wal_path, seal_path) =
-                    self.load_pitr_source_segment(&state, segment_id)?;
-                if matches!(
-                    self.archive_pitr_segment_from_paths(metadata, wal_path, seal_path)?,
-                    crate::pitr::archiver::ArchiveTransactionOutcome::Committed { .. }
-                        | crate::pitr::archiver::ArchiveTransactionOutcome::AlreadyCommitted { .. }
-                ) {
-                    committed.insert(segment_id);
+                if !committed.contains(&segment_id) {
+                    let (metadata, wal_path, seal_path) =
+                        self.load_pitr_source_segment(&state, segment_id)?;
+                    if matches!(
+                        self.archive_pitr_segment_from_paths(metadata, wal_path, seal_path)?,
+                        crate::pitr::archiver::ArchiveTransactionOutcome::Committed { .. }
+                            | crate::pitr::archiver::ArchiveTransactionOutcome::AlreadyCommitted { .. }
+                    ) {
+                        committed.insert(segment_id);
+                    }
                 }
             }
             if state
@@ -8057,6 +8103,7 @@ impl KvEngine {
                     .as_ref()
                     .ok_or_else(|| anyhow!("PITR maintenance requires MVCC"))?;
                 sequencer.ensure_publication_healthy()?;
+                self.validate_installed_v8_active_boundary(&state)?;
                 sequencer.resume_commit_admission_if_generation(generation);
                 *pending = None;
             }
@@ -8431,12 +8478,18 @@ impl KvEngine {
     /// The disable marker is written to the engine manifest before any
     /// in-memory runtime is detached, so a crash cannot make a successful
     /// disable look enabled after reopen.
+    /// Active v7/v8 WALs are rejected before publishing a boundary because their
+    /// transition to an ordinary WAL is not implemented.
     #[cfg(target_os = "linux")]
     pub fn disable_pitr(&self) -> Result<crate::pitr::api::DisablePitrOutcome> {
         let _barrier = self.pitr_barrier_lock.lock();
         ensure!(
             !self.inner.state.load().memtable.uses_v7_wal(),
             "cannot disable PITR with an Active v7 WAL because post-PITR WAL rotation is not supported"
+        );
+        ensure!(
+            !self.inner.state.load().memtable.uses_v8_wal(),
+            "cannot disable PITR with an Active v8 WAL because post-PITR WAL rotation is not supported"
         );
         let final_point = match self.create_recovery_point_locked(false)? {
             crate::pitr::api::RecoveryPointOutcome::Durable(point) => point,
@@ -8559,6 +8612,9 @@ impl KvEngine {
     }
 
     /// Explicitly disable PITR while recording a durable coverage gap.
+    ///
+    /// Active v7/v8 WALs are rejected before recording the gap because their
+    /// transition to an ordinary WAL is not implemented.
     #[cfg(target_os = "linux")]
     pub fn disable_pitr_allow_gap(&self) -> Result<crate::pitr::api::DisablePitrOutcome> {
         let _barrier = self.pitr_barrier_lock.lock();
@@ -24970,7 +25026,16 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn force_disable_rejects_active_v8_before_recording_a_gap() -> anyhow::Result<()> {
+    fn disabling_pitr_rejects_active_v8_before_publishing_a_boundary() -> anyhow::Result<()> {
+        for allow_gap in [false, true] {
+            assert_disable_rejects_active_v8_without_mutation(allow_gap)?;
+        }
+
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn assert_disable_rejects_active_v8_without_mutation(allow_gap: bool) -> anyhow::Result<()> {
         use crate::pitr::manifest::PitrMode;
 
         let directory = tempdir()?;
@@ -24985,15 +25050,24 @@ mod tests {
         let manifest_path = database.join("MANIFEST");
         let before_manifest = std::fs::read(&manifest_path)?;
 
-        let error = match engine.disable_pitr_allow_gap() {
-            Ok(_) => anyhow::bail!("force-disabling an Active v8 WAL unexpectedly succeeded"),
+        let result = if allow_gap {
+            engine.disable_pitr_allow_gap()
+        } else {
+            engine.disable_pitr()
+        };
+        let error = match result {
+            Ok(_) => anyhow::bail!("disabling an Active v8 WAL unexpectedly succeeded"),
             Err(error) => error,
         };
-        assert!(format!("{error:#}").contains("Active v8 WAL"));
-        assert_eq!(*engine.pitr_manifest_state.lock(), before_state);
+        assert_eq!(
+            *engine.pitr_manifest_state.lock(),
+            before_state,
+            "rejected v8 disable changed the persisted PITR state (allow_gap={allow_gap})"
+        );
         assert_eq!(*engine.inner.pitr_state.lock(), before_state);
         assert_eq!(std::fs::read(&manifest_path)?, before_manifest);
         assert_eq!(std::fs::read(&wal_path)?, before_wal);
+        assert!(format!("{error:#}").contains("Active v8 WAL"));
         assert!(
             engine
                 .inner
@@ -25661,6 +25735,33 @@ mod tests {
                 Some(segment_id),
                 "a failed install must leave the Sealing source installed for retry"
             );
+
+            let before_maintenance_manifest = std::fs::read(database.join("MANIFEST"))?;
+            let maintenance = engine.run_pitr_maintenance(successor_segment_id);
+            assert_eq!(
+                *engine.pitr_manifest_state.lock(),
+                sealed_state,
+                "maintenance must retain the Sealed handoff until its successor is installed"
+            );
+            assert!(
+                format!("{:#}", maintenance.unwrap_err())
+                    .contains("successor must be installed before archive reconciliation")
+            );
+            assert_eq!(
+                std::fs::read(database.join("MANIFEST"))?,
+                before_maintenance_manifest
+            );
+            assert_eq!(std::fs::read(&wal_path)?, source_bytes);
+            assert!(!successor_path.exists());
+            assert!(
+                !engine
+                    .inner
+                    .mvcc
+                    .as_ref()
+                    .unwrap()
+                    .commit_admission_is_open()
+            );
+            assert!(engine.put(b"before-successor", b"forbidden").is_err());
 
             let boundary = sealed_state
                 .active_boundary
