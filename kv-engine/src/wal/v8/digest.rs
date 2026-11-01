@@ -3,11 +3,77 @@
 use anyhow::{Result, bail, ensure};
 use blake3::Hasher;
 
+#[cfg(all(feature = "bench", target_os = "linux"))]
+pub(crate) fn thread_cpu_time_ns() -> u64 {
+    let mut time = std::mem::MaybeUninit::<libc::timespec>::uninit();
+    // SAFETY: `clock_gettime` initializes the supplied timespec on success.
+    if unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, time.as_mut_ptr()) } != 0 {
+        return 0;
+    }
+    // SAFETY: the successful `clock_gettime` call initialized `time`.
+    let time = unsafe { time.assume_init() };
+    u64::try_from(time.tv_sec)
+        .unwrap_or(u64::MAX)
+        .saturating_mul(1_000_000_000)
+        .saturating_add(u64::try_from(time.tv_nsec).unwrap_or(u64::MAX))
+}
+
+#[cfg(all(feature = "bench", not(target_os = "linux")))]
+pub(crate) fn thread_cpu_time_ns() -> u64 {
+    0
+}
+
 pub(crate) const WAL_V8_DIGEST_LEN: usize = 32;
 pub(crate) const WAL_V8_LOGICAL_BATCH_HEADER_LEN: usize = 48;
 pub(crate) const WAL_V8_LINK_INPUT_LEN: usize = 113;
+#[cfg(feature = "bench")]
+pub(crate) const WAL_V8_HASH_CPU_SAMPLE_RATE: u64 = 64;
+
+#[cfg(feature = "bench")]
+pub(crate) fn should_sample_hash_cpu(ticket: u64) -> bool {
+    ticket.is_multiple_of(WAL_V8_HASH_CPU_SAMPLE_RATE)
+}
 
 pub(crate) type WalV8Digest = [u8; WAL_V8_DIGEST_LEN];
+
+#[cfg(feature = "bench")]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct WalV8DigestMetrics {
+    pub(crate) payload_hash_bytes: u64,
+    pub(crate) payload_hash_cpu_ns: u64,
+    pub(crate) header_batch_hash_cpu_ns: u64,
+    pub(crate) ordered_link_hash_cpu_ns: u64,
+    pub(crate) post_encode_hash_reread_bytes: u64,
+    pub(crate) cpu_timing_sampled_tickets: u64,
+}
+
+#[cfg(not(feature = "bench"))]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct WalV8DigestMetrics;
+
+#[cfg(feature = "bench")]
+impl WalV8DigestMetrics {
+    pub(crate) fn add_assign(&mut self, other: Self) {
+        self.payload_hash_bytes = self
+            .payload_hash_bytes
+            .saturating_add(other.payload_hash_bytes);
+        self.payload_hash_cpu_ns = self
+            .payload_hash_cpu_ns
+            .saturating_add(other.payload_hash_cpu_ns);
+        self.header_batch_hash_cpu_ns = self
+            .header_batch_hash_cpu_ns
+            .saturating_add(other.header_batch_hash_cpu_ns);
+        self.ordered_link_hash_cpu_ns = self
+            .ordered_link_hash_cpu_ns
+            .saturating_add(other.ordered_link_hash_cpu_ns);
+        self.post_encode_hash_reread_bytes = self
+            .post_encode_hash_reread_bytes
+            .saturating_add(other.post_encode_hash_reread_bytes);
+        self.cpu_timing_sampled_tickets = self
+            .cpu_timing_sampled_tickets
+            .saturating_add(other.cpu_timing_sampled_tickets);
+    }
+}
 
 const HEADER_DOMAIN: &[u8] = b"toy-kv-engine/wal-prefix/v8/header\0";
 const ENTRIES_DOMAIN: &[u8] = b"toy-kv-engine/wal-prefix/v8/entries\0";
@@ -27,10 +93,27 @@ pub(crate) struct WalV8EntryHasher {
     expected_len: u64,
     encoded_len: u64,
     failed: bool,
+    #[cfg(feature = "bench")]
+    hash_cpu_ns: u64,
+    #[cfg(feature = "bench")]
+    measure_cpu: bool,
 }
 
 impl WalV8EntryHasher {
     pub(crate) fn new(expected_len: u64) -> Self {
+        Self::new_inner(expected_len, false)
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn new_for_ticket(expected_len: u64, ticket: u64) -> Self {
+        Self::new_inner(expected_len, should_sample_hash_cpu(ticket))
+    }
+
+    fn new_inner(expected_len: u64, measure_cpu: bool) -> Self {
+        #[cfg(feature = "bench")]
+        let started = measure_cpu.then(thread_cpu_time_ns);
+        #[cfg(not(feature = "bench"))]
+        let _ = measure_cpu;
         let mut hasher = Hasher::new();
         hasher.update(ENTRIES_DOMAIN);
         hasher.update(&expected_len.to_be_bytes());
@@ -40,6 +123,12 @@ impl WalV8EntryHasher {
             expected_len,
             encoded_len: 0,
             failed: false,
+            #[cfg(feature = "bench")]
+            hash_cpu_ns: started
+                .map(|started| thread_cpu_time_ns().saturating_sub(started))
+                .unwrap_or_default(),
+            #[cfg(feature = "bench")]
+            measure_cpu,
         }
     }
 
@@ -57,18 +146,52 @@ impl WalV8EntryHasher {
             bail!("v8 entry stream exceeds its preflighted length");
         }
 
+        #[cfg(feature = "bench")]
+        let started = self.measure_cpu.then(thread_cpu_time_ns);
         self.hasher.update(canonical_bytes);
+        #[cfg(feature = "bench")]
+        if let Some(started) = started {
+            self.hash_cpu_ns = self
+                .hash_cpu_ns
+                .saturating_add(thread_cpu_time_ns().saturating_sub(started));
+        }
         self.encoded_len = next_len;
         Ok(())
     }
 
     pub(crate) fn finish(self) -> Result<WalV8Digest> {
+        self.validate_complete()?;
+        Ok(*self.hasher.finalize().as_bytes())
+    }
+
+    pub(crate) fn finish_with_metrics(self) -> Result<(WalV8Digest, WalV8DigestMetrics)> {
+        self.validate_complete()?;
+        #[cfg(feature = "bench")]
+        let started = self.measure_cpu.then(thread_cpu_time_ns);
+        let digest = *self.hasher.finalize().as_bytes();
+        #[cfg(feature = "bench")]
+        let metrics = WalV8DigestMetrics {
+            payload_hash_bytes: self.encoded_len,
+            payload_hash_cpu_ns: self.hash_cpu_ns.saturating_add(
+                started
+                    .map(|started| thread_cpu_time_ns().saturating_sub(started))
+                    .unwrap_or_default(),
+            ),
+            cpu_timing_sampled_tickets: u64::from(self.measure_cpu),
+            ..WalV8DigestMetrics::default()
+        };
+        #[cfg(not(feature = "bench"))]
+        let metrics = WalV8DigestMetrics;
+        Ok((digest, metrics))
+    }
+
+    fn validate_complete(&self) -> Result<()> {
         ensure!(!self.failed, "v8 entry stream hasher failed");
         ensure!(
             self.encoded_len == self.expected_len,
             "v8 entry stream length does not match its preflighted length"
         );
-        Ok(*self.hasher.finalize().as_bytes())
+        Ok(())
     }
 }
 
@@ -413,6 +536,16 @@ mod tests {
         assert!(overflow.update(&[1]).is_err());
         assert!(overflow.finish().is_err());
         Ok(())
+    }
+
+    #[cfg(feature = "bench")]
+    #[test]
+    fn cpu_timing_samples_one_ticket_in_each_fixed_window() {
+        assert!(should_sample_hash_cpu(0));
+        assert!(!should_sample_hash_cpu(1));
+        assert!(!should_sample_hash_cpu(WAL_V8_HASH_CPU_SAMPLE_RATE - 1));
+        assert!(should_sample_hash_cpu(WAL_V8_HASH_CPU_SAMPLE_RATE));
+        assert!(should_sample_hash_cpu(WAL_V8_HASH_CPU_SAMPLE_RATE * 2));
     }
 
     #[test]

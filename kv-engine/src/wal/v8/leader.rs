@@ -96,6 +96,8 @@ pub(crate) struct WalV8LeaderCommit {
 pub(crate) struct WalV8LeaderCommitGroup {
     pub(crate) commits: Vec<WalV8LeaderCommit>,
     pub(crate) frontier: WalV8Frontier,
+    #[cfg(feature = "bench")]
+    pub(crate) digest_metrics: digest::WalV8DigestMetrics,
 }
 
 /// Serial protocol exerciser resumed only from a normalized Active image.
@@ -361,13 +363,17 @@ impl WalV8LeaderWriter {
         prepared: WalV8PreparedBatch<'_>,
         commit_ts: u64,
         recorded_at: crate::pitr::RecordedAt,
-    ) -> Result<WalV8LeaderCommit> {
-        let mut commits =
-            self.append_prepared_group(vec![prepared], &[(commit_ts, recorded_at)])?;
-        commits
+    ) -> Result<(WalV8LeaderCommit, digest::WalV8DigestMetrics)> {
+        let mut group = self.append_prepared_group(vec![prepared], &[(commit_ts, recorded_at)])?;
+        let commit = group
             .commits
             .pop()
-            .context("v8 one-ticket group returned no commit")
+            .context("v8 one-ticket group returned no commit")?;
+        #[cfg(feature = "bench")]
+        let digest_metrics = group.digest_metrics;
+        #[cfg(not(feature = "bench"))]
+        let digest_metrics = digest::WalV8DigestMetrics;
+        Ok((commit, digest_metrics))
     }
 
     fn append_prepared_group<'a>(
@@ -376,6 +382,8 @@ impl WalV8LeaderWriter {
         metadata: &[(u64, crate::pitr::RecordedAt)],
     ) -> Result<WalV8LeaderCommitGroup> {
         ensure!(!self.is_poisoned(), "v8 Leader WAL is poisoned");
+        #[cfg(feature = "bench")]
+        let ordered_link_hash_cpu_ns_before = self.coordinator.ordered_link_hash_cpu_ns();
         ensure!(
             !prepared_batches.is_empty()
                 && prepared_batches.len() <= MAX_GROUP_TICKETS
@@ -682,6 +690,20 @@ impl WalV8LeaderWriter {
             completion.encoded.disarm_after_durable();
         }
 
+        #[cfg(feature = "bench")]
+        let mut digest_metrics = digest::WalV8DigestMetrics::default();
+        #[cfg(feature = "bench")]
+        for completion in &producer_completions {
+            digest_metrics.add_assign(completion.encoded.digest_metrics());
+        }
+        #[cfg(feature = "bench")]
+        {
+            digest_metrics.ordered_link_hash_cpu_ns = self
+                .coordinator
+                .ordered_link_hash_cpu_ns()
+                .saturating_sub(ordered_link_hash_cpu_ns_before);
+        }
+
         for completion in producer_completions {
             commits.push(WalV8LeaderCommit {
                 ticket: completion.assignment.segment_ticket,
@@ -691,7 +713,12 @@ impl WalV8LeaderWriter {
                 frontier_digest,
             });
         }
-        Ok(WalV8LeaderCommitGroup { commits, frontier })
+        Ok(WalV8LeaderCommitGroup {
+            commits,
+            frontier,
+            #[cfg(feature = "bench")]
+            digest_metrics,
+        })
     }
 
     pub(crate) fn is_poisoned(&self) -> bool {
@@ -1221,7 +1248,7 @@ mod tests {
             nanos: 123,
         };
 
-        let commit = writer.append_prepared_batch(prepared, 20, recorded_at)?;
+        let (commit, _) = writer.append_prepared_batch(prepared, 20, recorded_at)?;
         assert_eq!(commit.ticket, 0);
         assert_eq!(commit.frontier.last_commit_ts, 20);
 
@@ -1251,6 +1278,11 @@ mod tests {
 
         let group = writer.append_group(&batches, LIVE_WAL_V5_LIMITS)?;
         assert_eq!(group.commits.len(), 3);
+        #[cfg(feature = "bench")]
+        {
+            assert!(group.digest_metrics.payload_hash_bytes > 0);
+            assert_eq!(group.digest_metrics.post_encode_hash_reread_bytes, 0);
+        }
         assert_eq!(group.commits[0].ticket, 0);
         assert_eq!(group.commits[1].ticket, 1);
         assert_eq!(group.commits[2].ticket, 2);

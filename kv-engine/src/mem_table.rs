@@ -152,6 +152,18 @@ pub struct WriteProfile {
     /// batch's alignment padding, so this is what the seal's cost is proportional
     /// to - not the segment's length, which the padding dominates.
     pub pitr_seal_bytes: AtomicU64,
+    /// Canonical entry bytes fed to the v8 producer-side BLAKE3 digest.
+    pub wal_v8_payload_hash_bytes: AtomicU64,
+    /// Time spent in v8 producer-side entry-stream BLAKE3 updates/finalization.
+    pub wal_v8_payload_hash_cpu_ns: AtomicU64,
+    /// Time hashing each v8 logical batch header and entry digest into its batch digest.
+    pub wal_v8_header_batch_hash_cpu_ns: AtomicU64,
+    /// Time spent folding fixed-size v8 prefix links in ticket order.
+    pub wal_v8_ordered_link_hash_cpu_ns: AtomicU64,
+    /// Canonical entry bytes reread by a separate post-encoding cryptographic pass.
+    pub wal_v8_post_encode_hash_reread_bytes: AtomicU64,
+    /// Tickets included in the sampled v8 digest CPU timings.
+    pub wal_v8_cpu_timing_sampled_tickets: AtomicU64,
     /// Number of WAL commit groups that reached fdatasync.
     pub wal_commit_groups: AtomicU64,
     /// Number of WAL commit groups that only contained one pending buffer.
@@ -249,6 +261,12 @@ impl WriteProfile {
         self.memtable_publish_accounting_ns.store(0, o);
         self.pitr_seal_append_ns.store(0, o);
         self.pitr_seal_bytes.store(0, o);
+        self.wal_v8_payload_hash_bytes.store(0, o);
+        self.wal_v8_payload_hash_cpu_ns.store(0, o);
+        self.wal_v8_header_batch_hash_cpu_ns.store(0, o);
+        self.wal_v8_ordered_link_hash_cpu_ns.store(0, o);
+        self.wal_v8_post_encode_hash_reread_bytes.store(0, o);
+        self.wal_v8_cpu_timing_sampled_tickets.store(0, o);
         self.wal_commit_groups.store(0, o);
         self.wal_commit_solo_groups.store(0, o);
         self.wal_commit_buffers.store(0, o);
@@ -308,6 +326,12 @@ impl WriteProfile {
             memtable_publish_accounting_ns: self.memtable_publish_accounting_ns.load(o),
             pitr_seal_append_ns: self.pitr_seal_append_ns.load(o),
             pitr_seal_bytes: self.pitr_seal_bytes.load(o),
+            wal_v8_payload_hash_bytes: self.wal_v8_payload_hash_bytes.load(o),
+            wal_v8_payload_hash_cpu_ns: self.wal_v8_payload_hash_cpu_ns.load(o),
+            wal_v8_header_batch_hash_cpu_ns: self.wal_v8_header_batch_hash_cpu_ns.load(o),
+            wal_v8_ordered_link_hash_cpu_ns: self.wal_v8_ordered_link_hash_cpu_ns.load(o),
+            wal_v8_post_encode_hash_reread_bytes: self.wal_v8_post_encode_hash_reread_bytes.load(o),
+            wal_v8_cpu_timing_sampled_tickets: self.wal_v8_cpu_timing_sampled_tickets.load(o),
             wal_commit_groups: self.wal_commit_groups.load(o),
             wal_commit_solo_groups: self.wal_commit_solo_groups.load(o),
             wal_commit_buffers: self.wal_commit_buffers.load(o),
@@ -482,6 +506,26 @@ impl WriteProfile {
     }
 
     #[cfg(feature = "bench")]
+    pub(crate) fn record_wal_v8_digest_metrics(
+        &self,
+        metrics: crate::wal::v8::digest::WalV8DigestMetrics,
+    ) {
+        let o = std::sync::atomic::Ordering::Relaxed;
+        self.wal_v8_payload_hash_bytes
+            .fetch_add(metrics.payload_hash_bytes, o);
+        self.wal_v8_payload_hash_cpu_ns
+            .fetch_add(metrics.payload_hash_cpu_ns, o);
+        self.wal_v8_header_batch_hash_cpu_ns
+            .fetch_add(metrics.header_batch_hash_cpu_ns, o);
+        self.wal_v8_ordered_link_hash_cpu_ns
+            .fetch_add(metrics.ordered_link_hash_cpu_ns, o);
+        self.wal_v8_post_encode_hash_reread_bytes
+            .fetch_add(metrics.post_encode_hash_reread_bytes, o);
+        self.wal_v8_cpu_timing_sampled_tickets
+            .fetch_add(metrics.cpu_timing_sampled_tickets, o);
+    }
+
+    #[cfg(feature = "bench")]
     pub(crate) fn record_wal_validate_ns(&self, nanos: u64) {
         self.wal_validate_ns
             .fetch_add(nanos, std::sync::atomic::Ordering::Relaxed);
@@ -612,6 +656,12 @@ pub struct WriteProfileSnapshot {
     pub memtable_publish_accounting_ns: u64,
     pub pitr_seal_append_ns: u64,
     pub pitr_seal_bytes: u64,
+    pub wal_v8_payload_hash_bytes: u64,
+    pub wal_v8_payload_hash_cpu_ns: u64,
+    pub wal_v8_header_batch_hash_cpu_ns: u64,
+    pub wal_v8_ordered_link_hash_cpu_ns: u64,
+    pub wal_v8_post_encode_hash_reread_bytes: u64,
+    pub wal_v8_cpu_timing_sampled_tickets: u64,
     pub wal_commit_groups: u64,
     pub wal_commit_solo_groups: u64,
     pub wal_commit_buffers: u64,
@@ -722,6 +772,24 @@ impl WriteProfileSnapshot {
                 .pitr_seal_append_ns
                 .saturating_sub(before.pitr_seal_append_ns),
             pitr_seal_bytes: self.pitr_seal_bytes.saturating_sub(before.pitr_seal_bytes),
+            wal_v8_payload_hash_bytes: self
+                .wal_v8_payload_hash_bytes
+                .saturating_sub(before.wal_v8_payload_hash_bytes),
+            wal_v8_payload_hash_cpu_ns: self
+                .wal_v8_payload_hash_cpu_ns
+                .saturating_sub(before.wal_v8_payload_hash_cpu_ns),
+            wal_v8_header_batch_hash_cpu_ns: self
+                .wal_v8_header_batch_hash_cpu_ns
+                .saturating_sub(before.wal_v8_header_batch_hash_cpu_ns),
+            wal_v8_ordered_link_hash_cpu_ns: self
+                .wal_v8_ordered_link_hash_cpu_ns
+                .saturating_sub(before.wal_v8_ordered_link_hash_cpu_ns),
+            wal_v8_post_encode_hash_reread_bytes: self
+                .wal_v8_post_encode_hash_reread_bytes
+                .saturating_sub(before.wal_v8_post_encode_hash_reread_bytes),
+            wal_v8_cpu_timing_sampled_tickets: self
+                .wal_v8_cpu_timing_sampled_tickets
+                .saturating_sub(before.wal_v8_cpu_timing_sampled_tickets),
             wal_commit_groups: self
                 .wal_commit_groups
                 .saturating_sub(before.wal_commit_groups),
@@ -2328,7 +2396,15 @@ impl MemTable {
         anyhow::ensure!(wal.is_v8(), "prepared v8 batch requires a v8 WAL");
         #[cfg(feature = "bench")]
         let started = Instant::now();
-        let ticket = wal.put_v8_prepared_leader_batch(prepared, commit_ts, recorded_at)?;
+        #[cfg(feature = "bench")]
+        let (ticket, digest_metrics) =
+            wal.put_v8_prepared_leader_batch(prepared, commit_ts, recorded_at)?;
+        #[cfg(not(feature = "bench"))]
+        let (ticket, _) = wal.put_v8_prepared_leader_batch(prepared, commit_ts, recorded_at)?;
+        #[cfg(feature = "bench")]
+        self.write_profile
+            .load()
+            .record_wal_v8_digest_metrics(digest_metrics);
         self.last_ticket
             .fetch_max(ticket + 1, std::sync::atomic::Ordering::Release);
         #[cfg(feature = "bench")]

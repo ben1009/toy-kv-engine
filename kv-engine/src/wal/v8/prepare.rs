@@ -258,6 +258,10 @@ impl<G: WalV8AdmissionGuard, R> AdmittedWalV8Batch<'_, G, R> {
         logical_batch.resize(logical_batch_bytes, 0);
 
         let expected_entry_len = u64::try_from(entry_stream_len)?;
+        #[cfg(feature = "bench")]
+        let mut entry_hasher =
+            digest::WalV8EntryHasher::new_for_ticket(expected_entry_len, assignment.segment_ticket);
+        #[cfg(not(feature = "bench"))]
         let mut entry_hasher = digest::WalV8EntryHasher::new(expected_entry_len);
         let entry_stream = &mut logical_batch[codec::WAL_V8_LOGICAL_BATCH_HEADER_LEN..];
         let (written, entry_stream_crc) = canonical
@@ -266,6 +270,9 @@ impl<G: WalV8AdmissionGuard, R> AdmittedWalV8Batch<'_, G, R> {
             written == entry_stream_len,
             "v8 canonical entry stream length changed while encoding"
         );
+        #[cfg(feature = "bench")]
+        let (entry_digest, mut digest_metrics) = entry_hasher.finish_with_metrics()?;
+        #[cfg(not(feature = "bench"))]
         let entry_digest = entry_hasher.finish()?;
 
         let header = codec::WalV8LogicalBatchHeader {
@@ -277,7 +284,17 @@ impl<G: WalV8AdmissionGuard, R> AdmittedWalV8Batch<'_, G, R> {
         }
         .encode_with_data_crc(written, entry_stream_crc, limits)?;
         logical_batch[..codec::WAL_V8_LOGICAL_BATCH_HEADER_LEN].copy_from_slice(&header);
+        #[cfg(feature = "bench")]
+        let batch_hash_started = digest::should_sample_hash_cpu(assignment.segment_ticket)
+            .then(digest::thread_cpu_time_ns);
         let batch_digest = digest::batch_digest(&header, &entry_digest);
+        #[cfg(feature = "bench")]
+        {
+            if let Some(batch_hash_started) = batch_hash_started {
+                digest_metrics.header_batch_hash_cpu_ns =
+                    digest::thread_cpu_time_ns().saturating_sub(batch_hash_started);
+            }
+        }
 
         // Release the shared preparation charge only after its index storage
         // has actually been dropped, on both success and error paths.
@@ -289,6 +306,8 @@ impl<G: WalV8AdmissionGuard, R> AdmittedWalV8Batch<'_, G, R> {
             assignment,
             entry_digest,
             batch_digest,
+            #[cfg(feature = "bench")]
+            digest_metrics,
             fragment_count,
             frame_buffer_bytes,
             admission_guard,
@@ -311,6 +330,8 @@ pub(crate) struct EncodedWalV8Batch<G> {
     assignment: WalV8BatchAssignment,
     entry_digest: digest::WalV8Digest,
     batch_digest: digest::WalV8Digest,
+    #[cfg(feature = "bench")]
+    digest_metrics: digest::WalV8DigestMetrics,
     fragment_count: u32,
     frame_buffer_bytes: usize,
     admission_guard: G,
@@ -331,6 +352,11 @@ impl<G: WalV8AdmissionGuard> EncodedWalV8Batch<G> {
 
     pub(crate) fn batch_digest(&self) -> &digest::WalV8Digest {
         &self.batch_digest
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn digest_metrics(&self) -> digest::WalV8DigestMetrics {
+        self.digest_metrics
     }
 
     /// Publish this fixed-size result independently from DATA framing or I/O.

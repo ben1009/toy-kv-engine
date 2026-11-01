@@ -2203,7 +2203,7 @@ impl Wal {
         prepared: v8::leader::WalV8PreparedBatch<'_>,
         commit_ts: u64,
         recorded_at: crate::pitr::RecordedAt,
-    ) -> Result<u64> {
+    ) -> Result<(u64, v8::digest::WalV8DigestMetrics)> {
         ensure!(
             !self.poisoned.load(Ordering::Acquire),
             "WAL is poisoned due to a previous I/O error"
@@ -2220,7 +2220,9 @@ impl Wal {
         let previous_ticket_end = self.next_ticket.load(Ordering::Acquire);
 
         match writer.append_prepared_batch(prepared, commit_ts, recorded_at) {
-            Ok(commit) => self.publish_v8_leader_commit(previous_ticket_end, commit),
+            Ok((commit, metrics)) => self
+                .publish_v8_leader_commit(previous_ticket_end, commit)
+                .map(|ticket| (ticket, metrics)),
             Err(error) => {
                 if writer.is_poisoned() {
                     self.poisoned.store(true, Ordering::Release);

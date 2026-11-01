@@ -79,6 +79,8 @@ struct CoordinatorState {
     change_generation: u64,
     closed: bool,
     poisoned: bool,
+    #[cfg(feature = "bench")]
+    ordered_link_hash_cpu_ns: u64,
 }
 
 struct TicketState {
@@ -194,6 +196,8 @@ impl WalV8ParallelCoordinator {
                     change_generation: 0,
                     closed: false,
                     poisoned: false,
+                    #[cfg(feature = "bench")]
+                    ordered_link_hash_cpu_ns: 0,
                 }),
                 changed: Condvar::new(),
                 segment_incarnation: header.incarnation,
@@ -480,6 +484,11 @@ impl WalV8ParallelCoordinator {
 
     pub(crate) fn is_poisoned(&self) -> bool {
         self.inner.state.lock().poisoned
+    }
+
+    #[cfg(feature = "bench")]
+    pub(crate) fn ordered_link_hash_cpu_ns(&self) -> u64 {
+        self.inner.state.lock().ordered_link_hash_cpu_ns
     }
 
     pub(crate) fn durable_ticket_end(&self) -> u64 {
@@ -782,12 +791,21 @@ fn fold_ready_digests(state: &mut CoordinatorState) -> Result<()> {
         );
         let logical_batch_bytes = u64::try_from(ticket.plan.logical_batch_bytes)
             .context("v8 folded logical batch length exceeds u64")?;
+        #[cfg(feature = "bench")]
+        let hash_started = super::digest::should_sample_hash_cpu(state.folded_ticket_end)
+            .then(super::digest::thread_cpu_time_ns);
         let prefix_digest = super::digest::advance_prefix(
             &state.folded_prefix_digest,
             state.folded_ticket_end,
             logical_batch_bytes,
             &batch_digest.batch_digest,
         );
+        #[cfg(feature = "bench")]
+        if let Some(hash_started) = hash_started {
+            state.ordered_link_hash_cpu_ns = state
+                .ordered_link_hash_cpu_ns
+                .saturating_add(super::digest::thread_cpu_time_ns().saturating_sub(hash_started));
+        }
         let next_ticket = state
             .folded_ticket_end
             .checked_add(1)

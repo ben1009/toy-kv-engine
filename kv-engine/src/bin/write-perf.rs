@@ -40,6 +40,9 @@ use serde::{Deserialize, Serialize};
 
 const JSON_SCHEMA_V1: &str = "kv-engine.write-perf.v1";
 const JSON_SCHEMA_V2: &str = "kv-engine.write-perf.v2";
+#[cfg(feature = "bench")]
+// Keep in sync with `wal::v8::digest::WAL_V8_HASH_CPU_SAMPLE_RATE`.
+const WAL_V8_HASH_CPU_SAMPLE_RATE: u64 = 64;
 const GOLDEN_MANIFEST_SCHEMA_V1: &str = "kv-engine.steady-state-golden.v1";
 const ENGINE_NAME: &str = "kv-engine";
 const STEADY_STATE_SEED_VERSION: &str = "splitmix64-v2";
@@ -971,6 +974,8 @@ struct MeasurementResult {
     process_cpu_system_ms: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     wal_pipeline: Option<WalPipelineRecord>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    wal_v8_digest: Option<WalV8DigestRecord>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -1014,6 +1019,49 @@ struct WalPipelineRecord {
     wal_allocated_bytes: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     sync_observations: Option<Vec<WalSyncObservationRecord>>,
+}
+
+/// V8 CPU times are raw sums from sampled tickets, not extrapolated totals.
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+struct WalV8DigestRecord {
+    payload_hash_bytes: u64,
+    payload_hash_cpu_ns: u64,
+    header_batch_hash_cpu_ns: u64,
+    ordered_link_hash_cpu_ns: u64,
+    post_encode_hash_reread_bytes: u64,
+    cpu_timing_sample_rate: u64,
+    cpu_timing_sampled_tickets: u64,
+}
+
+#[cfg(feature = "bench")]
+fn wal_v8_digest_record(engine: &KvEngine, wal_run_info: WalRunInfo) -> Option<WalV8DigestRecord> {
+    if wal_run_info.format_version != 8 {
+        return None;
+    }
+
+    let profile = engine.write_profile();
+    Some(WalV8DigestRecord {
+        payload_hash_bytes: profile.wal_v8_payload_hash_bytes,
+        payload_hash_cpu_ns: profile.wal_v8_payload_hash_cpu_ns,
+        header_batch_hash_cpu_ns: profile.wal_v8_header_batch_hash_cpu_ns,
+        ordered_link_hash_cpu_ns: profile.wal_v8_ordered_link_hash_cpu_ns,
+        post_encode_hash_reread_bytes: profile.wal_v8_post_encode_hash_reread_bytes,
+        cpu_timing_sample_rate: WAL_V8_HASH_CPU_SAMPLE_RATE,
+        cpu_timing_sampled_tickets: profile.wal_v8_cpu_timing_sampled_tickets,
+    })
+}
+
+fn print_wal_v8_digest_profile(label: &str, profile: &WalV8DigestRecord) {
+    eprintln!(
+        "{label}: v8 digest metrics: payload_hash_bytes={} payload_hash_cpu_ns={} header_batch_hash_cpu_ns={} ordered_link_hash_cpu_ns={} post_encode_hash_reread_bytes={} cpu_timing_sample_rate={} cpu_timing_sampled_tickets={}",
+        profile.payload_hash_bytes,
+        profile.payload_hash_cpu_ns,
+        profile.header_batch_hash_cpu_ns,
+        profile.ordered_link_hash_cpu_ns,
+        profile.post_encode_hash_reread_bytes,
+        profile.cpu_timing_sample_rate,
+        profile.cpu_timing_sampled_tickets,
+    );
 }
 
 #[cfg(feature = "bench")]
@@ -3452,9 +3500,15 @@ fn run_wal_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
     let wal_pipeline = wal_pipeline_record(&engine, cfg.profile, wal_run_info)?;
     #[cfg(not(feature = "bench"))]
     let wal_pipeline = None;
+    #[cfg(feature = "bench")]
+    let wal_v8_digest = wal_v8_digest_record(&engine, wal_run_info);
+    #[cfg(not(feature = "bench"))]
+    let wal_v8_digest = None;
     if cfg.profile {
         if wal_run_info.runtime_counters_available() {
             print_write_profile(&engine, workload);
+        } else if let Some(profile) = &wal_v8_digest {
+            print_wal_v8_digest_profile(workload, profile);
         } else {
             eprintln!("{workload}: WAL runtime counters and sync observations are unavailable");
         }
@@ -3494,6 +3548,7 @@ fn run_wal_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
             process_cpu_user_ms,
             process_cpu_system_ms,
             wal_pipeline,
+            wal_v8_digest,
             ..MeasurementResult::default()
         },
         counters,
@@ -3593,9 +3648,15 @@ fn run_wal_batch_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>
     let wal_pipeline = wal_pipeline_record(&engine, cfg.profile, wal_run_info)?;
     #[cfg(not(feature = "bench"))]
     let wal_pipeline = None;
+    #[cfg(feature = "bench")]
+    let wal_v8_digest = wal_v8_digest_record(&engine, wal_run_info);
+    #[cfg(not(feature = "bench"))]
+    let wal_v8_digest = None;
     if cfg.profile {
         if wal_run_info.runtime_counters_available() {
             print_write_profile(&engine, workload);
+        } else if let Some(profile) = &wal_v8_digest {
+            print_wal_v8_digest_profile(workload, profile);
         } else {
             eprintln!("{workload}: WAL runtime counters and sync observations are unavailable");
         }
@@ -3631,6 +3692,7 @@ fn run_wal_batch_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>
             process_cpu_user_ms,
             process_cpu_system_ms,
             wal_pipeline,
+            wal_v8_digest,
             ..MeasurementResult::default()
         },
         counters,
@@ -9878,6 +9940,32 @@ mod tests {
         assert!(json.get("latency").is_none());
         assert!(json.get("validation").is_none());
         assert!(json.get("drain").is_none());
+    }
+
+    #[test]
+    fn v8_digest_metrics_serialize_separately_from_pipeline_counters() {
+        let result = MeasurementResult {
+            wal_v8_digest: Some(WalV8DigestRecord {
+                payload_hash_bytes: 1200,
+                payload_hash_cpu_ns: 3400,
+                header_batch_hash_cpu_ns: 500,
+                ordered_link_hash_cpu_ns: 600,
+                post_encode_hash_reread_bytes: 0,
+                cpu_timing_sample_rate: 64,
+                cpu_timing_sampled_tickets: 3,
+            }),
+            ..MeasurementResult::default()
+        };
+
+        let json = serde_json::to_value(result).expect("serialize v8 digest metrics");
+        assert_eq!(json["wal_v8_digest"]["payload_hash_bytes"], 1200);
+        assert_eq!(json["wal_v8_digest"]["payload_hash_cpu_ns"], 3400);
+        assert_eq!(json["wal_v8_digest"]["header_batch_hash_cpu_ns"], 500);
+        assert_eq!(json["wal_v8_digest"]["ordered_link_hash_cpu_ns"], 600);
+        assert_eq!(json["wal_v8_digest"]["post_encode_hash_reread_bytes"], 0);
+        assert_eq!(json["wal_v8_digest"]["cpu_timing_sample_rate"], 64);
+        assert_eq!(json["wal_v8_digest"]["cpu_timing_sampled_tickets"], 3);
+        assert!(json.get("wal_pipeline").is_none());
     }
 
     #[test]

@@ -654,9 +654,10 @@ impl<'a> CanonicalWalEntryStream<'a> {
         Ok((pos, hasher.finalize()))
     }
 
-    /// Emit the same canonical stream as [`Self::encode_into`], observing each
-    /// emitted range while the existing entry CRC is updated. This lets a new
-    /// format add a streaming digest without rereading the completed buffer.
+    /// Emit the same canonical stream as [`Self::encode_into`], observing
+    /// contiguous chunks after each entry while the existing entry CRC is
+    /// updated. This lets a new format add a streaming digest without a second
+    /// full-buffer pass or a timer read for every small field.
     pub(crate) fn encode_into_with_observer<F>(
         &self,
         dst: &mut [u8],
@@ -672,8 +673,16 @@ impl<'a> CanonicalWalEntryStream<'a> {
 
         let mut crc = crc32fast::Hasher::new();
         let mut pos = 0;
+        let mut observed_pos = 0;
         for entry in self.entries() {
-            pos = write_entry_into_observed(dst, pos, entry, &mut crc, &mut observe)?;
+            pos = write_entry_into(dst, pos, entry, &mut crc)?;
+            if pos - observed_pos >= WAL_V8_OBSERVER_CHUNK_BYTES {
+                observe(&dst[observed_pos..pos])?;
+                observed_pos = pos;
+            }
+        }
+        if observed_pos < pos {
+            observe(&dst[observed_pos..pos])?;
         }
         ensure!(
             pos == self.data_len,
@@ -683,6 +692,10 @@ impl<'a> CanonicalWalEntryStream<'a> {
         Ok((pos, crc.finalize()))
     }
 }
+
+/// Bound the number of streaming digest updates and associated benchmark timer
+/// reads while still hashing incrementally during canonical encoding.
+const WAL_V8_OBSERVER_CHUNK_BYTES: usize = 64 * 1024;
 
 /// Everything the encoder refuses before it writes a byte.
 fn validate_encoding_inputs(batch: &WalBatch, limits: WalV5Limits) -> Result<()> {
@@ -738,74 +751,6 @@ fn write_entry_into(
     }
 
     Ok(at)
-}
-
-/// Write an entry while feeding both the existing CRC and a streaming observer
-/// from the exact byte slices copied into the canonical destination.
-fn write_entry_into_observed<F>(
-    dst: &mut [u8],
-    pos: usize,
-    entry: &WalEntry,
-    crc: &mut crc32fast::Hasher,
-    observe: &mut F,
-) -> Result<usize>
-where
-    F: FnMut(&[u8]) -> Result<()>,
-{
-    let (kind, fields): (u8, &[&[u8]]) = match entry {
-        WalEntry::Put { key, value } => (1, &[key.as_slice(), value.as_slice()]),
-        WalEntry::PointDelete { key } => (2, &[key.as_slice()]),
-        WalEntry::RangeDelete { start, end } => (3, &[start.as_slice(), end.as_slice()]),
-    };
-    let payload_len = fields.iter().try_fold(0_usize, |length, field| {
-        length
-            .checked_add(4)
-            .and_then(|length| length.checked_add(field.len()))
-            .context("v5 payload size overflow")
-    })?;
-    let mut header = [0_u8; 6];
-    header[0] = kind;
-    header[2..6].copy_from_slice(
-        &u32::try_from(payload_len)
-            .context("v5 payload too large")?
-            .to_be_bytes(),
-    );
-
-    let mut at = pos;
-    write_observed_range(dst, &mut at, &header, crc, observe)?;
-    for field in fields {
-        let prefix = u32::try_from(field.len())
-            .context("v5 field too large")?
-            .to_be_bytes();
-        write_observed_range(dst, &mut at, &prefix, crc, observe)?;
-        write_observed_range(dst, &mut at, field, crc, observe)?;
-    }
-
-    Ok(at)
-}
-
-fn write_observed_range<F>(
-    dst: &mut [u8],
-    at: &mut usize,
-    bytes: &[u8],
-    crc: &mut crc32fast::Hasher,
-    observe: &mut F,
-) -> Result<()>
-where
-    F: FnMut(&[u8]) -> Result<()>,
-{
-    let end = at
-        .checked_add(bytes.len())
-        .context("v5 entry stream output offset overflows")?;
-    ensure!(
-        end <= dst.len(),
-        "v5 entry stream output buffer is too small"
-    );
-    dst[*at..end].copy_from_slice(bytes);
-    crc.update(bytes);
-    observe(bytes)?;
-    *at = end;
-    Ok(())
 }
 
 /// The encoder as it was before it learned to write into the caller's buffer:
@@ -1327,6 +1272,48 @@ mod tests {
             encoded_v5[WAL_V5_BATCH_HEADER_LEN..WAL_V5_BATCH_HEADER_LEN + written]
         );
         assert_eq!(crc, crc32fast::hash(&encoded_stream));
+
+        Ok(())
+    }
+
+    #[test]
+    fn canonical_entry_stream_observes_bounded_contiguous_chunks() -> Result<()> {
+        let limits = WalV5Limits {
+            max_input_entry_count: 32,
+            max_batch_data_bytes: 256 * 1024,
+            max_entry_count: 16,
+            max_key_bytes: 32,
+            max_value_bytes: 64 * 1024,
+        };
+        let batch = WalBatch {
+            commit_ts: 11,
+            recorded_at: RecordedAt {
+                secs: -2,
+                nanos: 500_000_000,
+            },
+            entries: (0..3)
+                .map(|index| WalEntry::Put {
+                    key: vec![b'a' + index],
+                    value: vec![index; 40 * 1024],
+                })
+                .collect(),
+        };
+        let stream = CanonicalWalEntryStream::new(&batch, limits)?;
+        let mut encoded = vec![0; stream.data_len()];
+        let mut observed = Vec::new();
+        let mut chunks = Vec::new();
+        let (written, crc) = stream.encode_into_with_observer(&mut encoded, |chunk| {
+            chunks.push(chunk.len());
+            observed.extend_from_slice(chunk);
+            Ok(())
+        })?;
+
+        assert_eq!(written, encoded.len());
+        assert_eq!(observed, encoded);
+        assert_eq!(crc, crc32fast::hash(&encoded));
+        assert_eq!(chunks.len(), 2);
+        assert!(chunks[0] >= WAL_V8_OBSERVER_CHUNK_BYTES);
+        assert!(chunks[1] < WAL_V8_OBSERVER_CHUNK_BYTES);
 
         Ok(())
     }
