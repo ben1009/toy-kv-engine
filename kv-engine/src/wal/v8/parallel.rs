@@ -1411,6 +1411,52 @@ mod tests {
     }
 
     #[test]
+    fn closing_wakes_an_admission_waiter() -> Result<()> {
+        use std::sync::mpsc;
+
+        let coordinator = coordinator(1)?;
+        let first = batch(10);
+        let _first_admitted = admit(&first, &coordinator)?;
+
+        let waiter_coordinator = coordinator.clone();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (result_tx, result_rx) = mpsc::channel();
+        let waiter = std::thread::spawn(move || -> Result<()> {
+            let second = batch(20);
+            started_tx
+                .send(())
+                .context("notify test that the waiter is starting")?;
+            let result = admit(&second, &waiter_coordinator).map(|_| ());
+            result_tx
+                .send(result.map_err(|error| error.to_string()))
+                .context("publish closed admission result")?;
+            Ok(())
+        });
+
+        started_rx
+            .recv()
+            .context("wait for admission waiter to start")?;
+        let observed_waiter = std::time::Instant::now() + Duration::from_secs(1);
+        while coordinator.ticket_admission_waiter_count() == 0
+            && std::time::Instant::now() < observed_waiter
+        {
+            std::thread::yield_now();
+        }
+        assert_eq!(coordinator.ticket_admission_waiter_count(), 1);
+
+        coordinator.close();
+        let error = result_rx
+            .recv_timeout(Duration::from_secs(1))
+            .context("wait for closed admission to wake its waiter")?
+            .expect_err("closed ticket window unexpectedly admitted a ticket");
+        assert!(error.contains("coordinator is closed"));
+        waiter
+            .join()
+            .map_err(|_| anyhow::anyhow!("admission waiter panicked"))??;
+        Ok(())
+    }
+
+    #[test]
     fn preparation_reservation_counts_against_admission_window() -> Result<()> {
         let mut batch = batch(10);
         batch.entries.push(WalEntry::Put {
