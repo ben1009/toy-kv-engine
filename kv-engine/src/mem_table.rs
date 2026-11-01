@@ -1365,6 +1365,10 @@ impl MemTable {
     /// unavailable through the format registry; this helper is used only by
     /// the explicit PITR recovery transition.
     #[cfg(target_os = "linux")]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the owner factory deliberately binds the installed image to caller-owned reservation accounting"
+    )]
     pub(crate) fn create_with_wal_v8_active<F>(
         id: usize,
         vlog_enabled: bool,
@@ -4859,9 +4863,7 @@ mod tests {
                                 &memtable,
                             )
                             .map(|(commit_ts, _, _, ticket)| (commit_ts, ticket)),
-                        "ranges" => mvcc
-                            .write_range_batch_wal_only(&[(b"a", b"z")], &memtable)
-                            .map(|(commit_ts, ticket)| (commit_ts, ticket)),
+                        "ranges" => mvcc.write_range_batch_wal_only(&[(b"a", b"z")], &memtable),
                         "batch" => mvcc
                             .write_batch_wal_only(
                                 &[(

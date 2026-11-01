@@ -5054,7 +5054,7 @@ impl KvEngine {
                 .as_ref()
                 .ok_or_else(|| anyhow!("v8 migration has no persisted PITR configuration"))?;
             let _migration_reservation = Self::reserve_pitr_v8_migration_capacity(
-                capacity_status.clone(),
+                capacity_status,
                 config,
             )
             .with_context(|| {
@@ -25827,7 +25827,7 @@ mod tests {
         assert!(!successor_wal_path.exists());
 
         crate::pitr::segment::install_pitr_file_no_replace(
-            &source_wal_path.with_extension("seal"),
+            source_wal_path.with_extension("seal"),
             &seal_bytes,
         )?;
         let last_entry = seal
