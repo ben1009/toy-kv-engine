@@ -34672,8 +34672,11 @@ mod tests {
     #[test]
     fn v8_pitr_base_backup_captures_and_restores_the_active_boundary() -> anyhow::Result<()> {
         let directory = tempdir()?;
-        let (options, source_segment_id) =
-            active_v8_recovery_test_database(directory.path(), true)?;
+        let (options, source_segment_id) = active_v8_recovery_test_database_with_interval(
+            directory.path(),
+            false,
+            std::time::Duration::from_secs(3600),
+        )?;
         let repository_path = options
             .pitr_repository
             .clone()
@@ -34684,6 +34687,7 @@ mod tests {
             options.clone(),
             crate::wal::WalIoMode::Parallel,
         )?;
+        engine.put(b"seed", b"v")?;
         engine.put(b"backup-key", b"included")?;
         let included_commit_ts = engine.inner.mvcc.as_ref().unwrap().latest_commit_ts();
 
@@ -34709,6 +34713,7 @@ mod tests {
                 .commit_admission_is_open()
         );
 
+        let before_after_base = std::time::SystemTime::now();
         engine.put(b"after-base", b"replayed")?;
         let replayed_commit_ts = engine.inner.mvcc.as_ref().unwrap().latest_commit_ts();
         assert!(matches!(
@@ -34782,6 +34787,40 @@ mod tests {
             Some(Bytes::from_static(b"replayed"))
         );
         replayed.close_storage()?;
+
+        drop(repository);
+        let repository = crate::backup::BackupRepository::open(&repository_path)?;
+        let wall_clock_destination = directory.path().join("restored-v8-wall-clock");
+        let wall_clock_outcome = repository.restore_to(
+            crate::pitr::api::RecoveryTarget::AtOrBeforeSystemTime(before_after_base),
+            &wall_clock_destination,
+            crate::pitr::api::PitrRestoreOptions {
+                selector: crate::pitr::api::RecoverySelector {
+                    timeline_id: lifecycle.timeline_id.unwrap(),
+                    archive_epoch_id: lifecycle.archive_epoch_id,
+                    base_backup_id: Some(backup.backup_id),
+                },
+                implementations: crate::pitr::api::ImplementationRegistry,
+                executor_threads: std::num::NonZeroUsize::new(1).unwrap(),
+                cache_capacity: 4096,
+                storage: LsmStorageOptions::default_for_test(),
+            },
+        )?;
+        assert!(matches!(
+            wall_clock_outcome,
+            crate::pitr::api::RestoreToOutcome::Restored(info)
+                if info.resolved_commit_ts == Some(included_commit_ts)
+        ));
+        let wall_clock = KvEngine::open(
+            &wall_clock_destination,
+            LsmStorageOptions::default_for_test(),
+        )?;
+        assert_eq!(
+            wall_clock.get(b"backup-key")?,
+            Some(Bytes::from_static(b"included"))
+        );
+        assert_eq!(wall_clock.get(b"after-base")?, None);
+        wall_clock.close_storage()?;
 
         drop(repository);
         let repository = crate::backup::BackupRepository::open(&repository_path)?;
