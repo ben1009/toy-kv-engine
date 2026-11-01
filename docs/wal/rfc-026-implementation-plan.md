@@ -84,21 +84,23 @@ cargo test --package kv-engine --lib --features chaos-testing \
   pre_v8 -- --ignored --test-threads=1
 ```
 
-The filter runs twenty-nine process cases: six guard-publication cases covering the
+The filter runs thirty-two process cases: six guard-publication cases covering the
 normal `MANIFEST`, guard append, synced `ENGINE_MANIFEST.tmp`, snapshot rename,
 missing `MANIFEST` with an installed snapshot, and missing `MANIFEST` with a
 pending snapshot; the durable migration-intent, post-`SegmentSealed`, and
-completed-v8 cases against the `18c5f0a8ccfb` CLI; six vLog-enabled publication cases against a small reader harness built from the same historical
-library revision with WAL and value separation enabled; and the published
-guard against the earlier historical library with vLog both disabled and
-enabled, plus its stock CLI against guard append, synced snapshot temp,
-snapshot rename, durable migration-intent, post-`SegmentSealed`, and completed-
-v8 cases. The vLog cases verify the older startup paths reject the v8 guard
-without touching a real `.vlog` file, even though vLog initialization precedes
-manifest parsing. Both vLog-enabled readers are also exercised with durable
-migration intent, interruption after `SegmentSealed`, and completed v8
-migration. The newer reader harness additionally covers all six publication
-states; the earlier reader remains limited to states with the durable guard.
+completed-v8 cases against the `18c5f0a8ccfb` CLI; six vLog-enabled publication
+cases against a small reader harness built from the same historical library
+revision with WAL and value separation enabled; and the published guard against
+the earlier historical library with vLog both disabled and enabled. The earlier
+vLog-enabled harness also covers guard append, synced snapshot temp, and snapshot
+rename; its stock CLI covers those three states plus durable migration intent,
+post-`SegmentSealed`, and completed v8. The vLog cases verify the older startup
+paths reject the v8 guard without touching a real `.vlog` file, even though
+vLog initialization precedes manifest parsing. Both vLog-enabled readers are
+also exercised with durable migration intent, interruption after
+`SegmentSealed`, and completed v8 migration. The newer reader harness covers
+all six publication states; the earlier reader remains limited to states with
+the durable guard.
 
 The earlier historical reader at `3420eb05b23c5b6ddd22694a4a2f84698589655a`
 is tested in both configurations against the fully published database. Its
@@ -146,7 +148,10 @@ guard-append and synced-snapshot-temp cuts, that reader rejects the older
 `ActiveBoundaryAdvanced` v7 PITR-manifest record before reaching the v8 guard;
 the later pre-v8 reader reaches and rejects the guard itself. After adding earlier-
 reader publication and migration states and vLog-enabled historical readers,
-the expanded twenty-nine-case process matrix passed. The vLog reader harness for
+the expanded twenty-nine-case process matrix passed. Three more cases now cover
+the earlier vLog-enabled reader at guard append, synced snapshot temp, and
+snapshot rename. The resulting thirty-two-case process matrix passed under
+`cargo nextest` on 2026-11-01. The vLog reader harness for
 `18c5f0a8ccfb` was built offline from that revision's library sources with WAL
 and value separation enabled; its SHA-256 was
 `1417e8107c1faedbde4dcf7ccb5e365168983d8edae8b542cbf90400ae985819`. The
@@ -155,12 +160,16 @@ with the same options has SHA-256
 `d8a7b704246773d23ea3fe2617faca2321176e9036abd61f7c867cbfaedb8b3d`. This
 covers only the exercised fixtures and states.
 
-This is partial compatibility qualification. The `18c5f0a8ccfb` reader is
-covered for ordinary manifest replay and installed/pending snapshot recovery;
-the earlier reader is covered only while its required manifest remains
-present. The complete supported historical-binary matrix and startup ordering
-remain unqualified, as does the performance matrix, so v8 creation stays
-disabled.
+The supported historical-reader matrix is qualified for the two pinned
+revisions and the publication and migration states listed above. Rejection
+before mutation, including WAL-lock and vLog startup paths, is verified for
+these fixtures. The earlier reader is covered only while its required durable
+`MANIFEST` guard remains present; its missing-manifest snapshot-only states are
+excluded because the reader mutates the database there and those states are
+unreachable through the guard publication sequence. This does not claim
+compatibility with every historical release. The performance matrix remains
+outstanding, so v7 remains the default and automatic v8 creation and new v7-to-v8
+migration initiation stay disabled.
 
 ## Slices
 
@@ -226,8 +235,9 @@ disabled.
   then finishes a pre-seal intent through the existing v7 sealing path and
   installs only its exact authorized v8 successor. It keeps commit admission
   fenced throughout. New migration initiation and automatic v8 adoption remain
-  disabled pending compatibility qualification. Once `SegmentSealed` durably
-   binds the v7 source and exact empty v8 boundary, startup can strictly
+  disabled pending the remaining qualification gates, including performance.
+  Once `SegmentSealed` durably binds the v7 source and exact empty v8 boundary,
+  startup can strictly
    validate that source and recreate/register the v8 successor if interrupted
    before engine-manifest registration. `PitrStatus` reports a
    read-only v7-to-v8 capacity estimate only for a settled Active v7 boundary
@@ -247,17 +257,19 @@ disabled.
    interruption after temp-image write, temp sync, rename, and directory sync;
    retries preserve the hard anchor. Returned errors before sync, rename, and
    directory sync are also covered. Automatic v8 creation remains disabled
-   pending the compatibility and qualification gates. Active v8 checkpoint
-   capture now seals the fixed cutoff, flushes its immutable state, and resumes
-   writes on an empty v8 successor. PITR base backups use the same boundary and
+   pending the remaining qualification gates, including performance. Active v8
+   checkpoint capture now seals the fixed cutoff, flushes its immutable state,
+   and resumes writes on an empty v8 successor. PITR base backups use the same boundary and
    store a detached engine manifest, so an exact-base restore does not retain a
    reference to the source's uncopied Active WAL or repository. Later restores
   validate the archived history and replay only segments at or after the
   persisted base boundary. Wall-clock restore targets are resolved against the
   base cutoff before later archived batches are considered.
-6. **Qualification and adoption:** complete the RFC 026 crash, recovery,
-   compatibility and performance matrix. Keep v7 as the default unless the
-   measured results justify an explicit later adoption decision.
+6. **Qualification and adoption:** the non-performance crash, recovery, and
+   compatibility tests pass for the implemented states and the two pinned
+   historical readers described above. The predeclared performance matrix is
+   the remaining qualification gate; keep v7 as the default unless its results
+   justify an explicit later adoption decision.
 
 The Linux `write-perf --features bench` binary now accepts the explicit
 `--pitr --pitr-format v8` selector. It prepares the database through the
@@ -282,6 +294,6 @@ full. The admission waiter is released by frontier publication, close or
 poison, and a focused coordinator test covers the durable-capacity handoff.
 
 Each slice must leave existing v2-v7 reads, writes, recovery and digest
-interpretation unchanged. Tests for each completed slice are part of its
-review evidence; end-to-end crash and performance qualification remains a
-separate gate before v8 is enabled.
+interpretation unchanged. The non-performance workspace and historical-reader
+test gates have passed; performance qualification remains the final gate before
+any decision to enable v8.

@@ -39786,13 +39786,13 @@ mod tests {
             }
             PreV8ReaderGuardState::AfterSnapshotRename => diagnostic.contains("V8Snapshot"),
         };
-        let rejects_before_v8_guard = cli_env == "TOY_KV_EARLY_PRE_V8_CLI"
-            && matches!(
-                state,
-                PreV8ReaderGuardState::AfterGuardAppend
-                    | PreV8ReaderGuardState::AfterSnapshotTempSync
-            )
-            && diagnostic.contains("ActiveBoundaryAdvanced");
+        let rejects_before_v8_guard = matches!(
+            cli_env,
+            "TOY_KV_EARLY_PRE_V8_CLI" | "TOY_KV_EARLY_PRE_V8_VLOG_CLI"
+        ) && matches!(
+            state,
+            PreV8ReaderGuardState::AfterGuardAppend | PreV8ReaderGuardState::AfterSnapshotTempSync
+        ) && diagnostic.contains("ActiveBoundaryAdvanced");
         anyhow::ensure!(
             diagnostic.contains("unknown variant")
                 && (identifies_expected_v8_record || rejects_before_v8_guard),
@@ -40046,6 +40046,42 @@ mod tests {
     -> anyhow::Result<()> {
         assert_pre_v8_cli_rejects_guarded_active_v7_with_env_and_vlog_without_mutation(
             PreV8ReaderGuardState::Published,
+            "TOY_KV_EARLY_PRE_V8_VLOG_CLI",
+            true,
+        )
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires the vLog-enabled earlier pre-v8 reader in TOY_KV_EARLY_PRE_V8_VLOG_CLI"]
+    fn v8_compatibility_guard_rejects_earlier_pre_v8_vlog_cli_after_guard_append_without_database_mutation()
+    -> anyhow::Result<()> {
+        assert_pre_v8_cli_rejects_guarded_active_v7_with_env_and_vlog_without_mutation(
+            PreV8ReaderGuardState::AfterGuardAppend,
+            "TOY_KV_EARLY_PRE_V8_VLOG_CLI",
+            true,
+        )
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires the vLog-enabled earlier pre-v8 reader in TOY_KV_EARLY_PRE_V8_VLOG_CLI"]
+    fn v8_compatibility_guard_rejects_earlier_pre_v8_vlog_cli_after_snapshot_temp_sync_without_database_mutation()
+    -> anyhow::Result<()> {
+        assert_pre_v8_cli_rejects_guarded_active_v7_with_env_and_vlog_without_mutation(
+            PreV8ReaderGuardState::AfterSnapshotTempSync,
+            "TOY_KV_EARLY_PRE_V8_VLOG_CLI",
+            true,
+        )
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires the vLog-enabled earlier pre-v8 reader in TOY_KV_EARLY_PRE_V8_VLOG_CLI"]
+    fn v8_compatibility_guard_rejects_earlier_pre_v8_vlog_cli_after_snapshot_rename_without_database_mutation()
+    -> anyhow::Result<()> {
+        assert_pre_v8_cli_rejects_guarded_active_v7_with_env_and_vlog_without_mutation(
+            PreV8ReaderGuardState::AfterSnapshotRename,
             "TOY_KV_EARLY_PRE_V8_VLOG_CLI",
             true,
         )
