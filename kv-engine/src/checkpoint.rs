@@ -314,7 +314,9 @@ impl LsmStorageInner {
         cleanup_checkpoint_tmps_for_target(&target_dir)?;
 
         let result = (|| {
-            let staging_prepared = if self.state.load().memtable.uses_v7_wal() {
+            let active_memtable = self.state.load().memtable.clone();
+            let staging_prepared = if active_memtable.uses_v7_wal() || active_memtable.uses_v8_wal()
+            {
                 self.prepare_checkpoint_staging(&target_dir, &tmp_dir)?;
                 true
             } else {
@@ -436,15 +438,17 @@ impl LsmStorageInner {
         tmp_dir: &Path,
         staging_prepared: bool,
     ) -> Result<CheckpointCapture<'_>> {
-        let capture = |is_v7| {
+        let capture = |wal_format: Option<crate::pitr::manifest::PitrWalFormat>| {
             let _checkpoint_guard = self.checkpoint_lock.lock();
             if !staging_prepared {
                 self.prepare_checkpoint_staging(target_dir, tmp_dir)?;
             }
             let mut capture = self.capture_checkpoint_state_locked()?;
-            // A standalone v7 checkpoint contains its committed state in the
-            // pinned immutable files and does not copy the source Active WAL.
-            if is_v7
+            // A standalone versioned-PITR checkpoint contains its committed
+            // state in the pinned immutable files and does not copy the source
+            // WAL or repository. Its capture boundary was sealed and checked
+            // using the source WAL format before this snapshot was pinned.
+            if wal_format.is_some()
                 && let ManifestRecord::Snapshot { pitr_state, .. } = &mut capture.snapshot_record
             {
                 *pitr_state = Some(crate::pitr::manifest::PitrState::default());
@@ -460,10 +464,10 @@ impl LsmStorageInner {
         );
         ensure!(
             !self.state.load().memtable.uses_v8_wal(),
-            "checkpoint capture for an Active v8 PITR WAL is not supported"
+            "Active v8 PITR checkpoint capture requires the engine owner"
         );
 
-        capture(false)
+        capture(None)
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -479,7 +483,7 @@ impl LsmStorageInner {
         );
         ensure!(
             !self.state.load().memtable.uses_v8_wal(),
-            "checkpoint capture for an Active v8 PITR WAL is not supported"
+            "v8 PITR checkpoint capture requires Linux"
         );
         let _checkpoint_guard = self.checkpoint_lock.lock();
         if !staging_prepared {
@@ -566,9 +570,10 @@ impl LsmStorageInner {
         {
             let state_lock = self.state_lock.lock();
             let active_memtable_guard = self.active_memtable_lock.write();
+            let active_memtable = self.state.load().memtable.clone();
             ensure!(
-                !self.state.load().memtable.uses_v8_wal(),
-                "checkpoint or backup capture for an Active v8 PITR WAL is not supported"
+                !active_memtable.uses_v8_wal() || active_memtable.is_empty(),
+                "Active v8 checkpoint boundary must be sealed before capture"
             );
             // Check after draining native leases, including when cancellation
             // left the active memtable empty and no freeze would run.

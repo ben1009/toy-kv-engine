@@ -6540,9 +6540,9 @@ impl KvEngine {
 
     #[cfg(all(target_os = "linux", test))]
     fn with_v7_checkpoint_boundary<T>(&self, capture: impl FnOnce() -> Result<T>) -> Result<T> {
-        self.with_checkpoint_wal_boundary(|is_v7| {
+        self.with_checkpoint_wal_boundary(|wal_format| {
             ensure!(
-                is_v7,
+                wal_format == Some(crate::pitr::manifest::PitrWalFormat::V7),
                 "v7 checkpoint boundary requires an Active v7 PITR WAL"
             );
             capture()
@@ -6550,33 +6550,38 @@ impl KvEngine {
     }
 
     /// Choose the standalone checkpoint protocol while excluding PITR format
-    /// changes. For v7, admission stays stopped through the source flush and
-    /// manifest snapshot, then resumes after the checkpoint view is pinned.
+    /// changes. For v7/v8, admission stays stopped through the source seal,
+    /// archive, flush and manifest snapshot, then resumes after the checkpoint
+    /// view is pinned.
     #[cfg(target_os = "linux")]
     pub(crate) fn with_checkpoint_wal_boundary<T>(
         &self,
-        capture: impl FnOnce(bool) -> Result<T>,
+        capture: impl FnOnce(Option<crate::pitr::manifest::PitrWalFormat>) -> Result<T>,
     ) -> Result<T> {
         let _operation_guard = self.pitr_operation_lock.lock();
         let _barrier = self.pitr_barrier_lock.lock();
         self.inner.lifecycle.ensure_open()?;
-        ensure!(
-            !self.inner.state.load().memtable.uses_v8_wal(),
-            "checkpoint capture for an Active v8 PITR WAL is not supported"
-        );
-        if !self.inner.state.load().memtable.uses_v7_wal() {
-            return capture(false);
+        let active = self.inner.state.load().memtable.clone();
+        let wal_format = if active.uses_v7_wal() {
+            Some(crate::pitr::manifest::PitrWalFormat::V7)
+        } else if active.uses_v8_wal() {
+            Some(crate::pitr::manifest::PitrWalFormat::V8)
+        } else {
+            None
+        };
+        if wal_format.is_none() {
+            return capture(None);
         }
         ensure!(
             !self.pitr_publication_unknown.load(Ordering::Acquire),
-            "v7 checkpoint capture cannot proceed while a PITR manifest transition has an unknown outcome; reopen the database first"
+            "versioned PITR checkpoint capture cannot proceed while a manifest transition has an unknown outcome; reopen the database first"
         );
 
         let sequencer = self
             .inner
             .mvcc
             .as_ref()
-            .ok_or_else(|| anyhow!("v7 checkpoint capture requires MVCC"))?;
+            .ok_or_else(|| anyhow!("versioned PITR checkpoint capture requires MVCC"))?;
         let admission_was_open = sequencer.commit_admission_is_open();
         sequencer.stop_commit_admission_and_capture()?;
 
@@ -6585,8 +6590,10 @@ impl KvEngine {
         // in the recovery point and flushed into the captured SST set.
         let active = self.inner.state.load().memtable.clone();
         ensure!(
-            active.uses_v7_wal(),
-            "Active WAL changed during v7 checkpoint admission drain"
+            (wal_format == Some(crate::pitr::manifest::PitrWalFormat::V7) && active.uses_v7_wal())
+                || (wal_format == Some(crate::pitr::manifest::PitrWalFormat::V8)
+                    && active.uses_v8_wal()),
+            "Active WAL changed during versioned PITR checkpoint admission drain"
         );
         if !active.is_empty() {
             match self.create_recovery_point_locked(false)? {
@@ -6596,33 +6603,40 @@ impl KvEngine {
                     ..
                 } => {
                     return Err(anyhow!(
-                        "v7 checkpoint boundary archive is not durable: {error}"
+                        "versioned PITR checkpoint boundary archive is not durable: {error}"
                     ));
                 }
                 crate::pitr::api::RecoveryPointOutcome::PublicationUnknown { .. } => {
                     return Err(anyhow!(
-                        "v7 checkpoint boundary archive publication is unknown"
+                        "versioned PITR checkpoint boundary archive publication is unknown"
                     ));
                 }
             }
         }
 
-        let captured = capture(true);
+        let captured = capture(wal_format);
         if admission_was_open {
             let health = (|| -> Result<()> {
                 ensure!(
                     !self.pitr_publication_unknown.load(Ordering::Acquire),
-                    "v7 checkpoint capture cannot reopen writes after uncertain PITR publication"
+                    "versioned PITR checkpoint capture cannot reopen writes after uncertain publication"
                 );
                 sequencer.ensure_publication_healthy()?;
                 self.inner
                     .manifest
                     .as_ref()
-                    .ok_or_else(|| anyhow!("v7 checkpoint capture requires a manifest"))?
+                    .ok_or_else(|| {
+                        anyhow!("versioned PITR checkpoint capture requires a manifest")
+                    })?
                     .ensure_durability_certain()?;
                 ensure!(
-                    !self.inner.state.load().memtable.v7_wal_requires_recovery(),
-                    "Active v7 WAL is poisoned; reopen the database before writing"
+                    !self
+                        .inner
+                        .state
+                        .load()
+                        .memtable
+                        .versioned_wal_requires_recovery(),
+                    "Active versioned PITR WAL is poisoned; reopen the database before writing"
                 );
                 Ok(())
             })();
@@ -6630,7 +6644,7 @@ impl KvEngine {
                 return match captured {
                     Ok(_) => Err(health_error),
                     Err(capture_error) => Err(capture_error.context(format!(
-                        "commit admission remains closed because v7 checkpoint state is unhealthy: {health_error:#}"
+                        "commit admission remains closed because versioned PITR checkpoint state is unhealthy: {health_error:#}"
                     ))),
                 };
             }
@@ -24894,9 +24908,10 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn empty_active_v8_rejects_checkpoint_and_ordinary_backup_capture() -> anyhow::Result<()> {
+    fn empty_active_v8_checkpoint_succeeds_but_ordinary_backup_capture_is_rejected()
+    -> anyhow::Result<()> {
         use crate::pitr::manifest::{
-            CoverageBreakReason, PersistedRecoveryGap, PitrManifestRecord,
+            CoverageBreakReason, PersistedRecoveryGap, PitrManifestRecord, PitrMode,
         };
 
         let directory = tempdir()?;
@@ -24908,12 +24923,11 @@ mod tests {
         drop(active);
 
         let checkpoint_path = directory.path().join("checkpoint");
-        let checkpoint_error = match engine.create_checkpoint(&checkpoint_path) {
-            Ok(_) => anyhow::bail!("checkpoint of an empty Active v8 WAL unexpectedly succeeded"),
-            Err(error) => error,
-        };
-        assert!(format!("{checkpoint_error:#}").contains("Active v8 PITR WAL"));
-        assert!(!checkpoint_path.exists());
+        engine.create_checkpoint(&checkpoint_path)?;
+        let checkpoint = KvEngine::open(&checkpoint_path, LsmStorageOptions::default_for_test())?;
+        assert_eq!(checkpoint.inner.pitr_state.lock().mode, PitrMode::Disabled);
+        assert_eq!(checkpoint.get(b"seed")?, None);
+        checkpoint.close()?;
 
         let before = engine.pitr_manifest_state.lock().clone();
         let gap = PersistedRecoveryGap {
@@ -34572,6 +34586,160 @@ mod tests {
                 engine.close_storage()?;
             }
         }
+
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn v8_checkpoint_capture_seals_and_flushes_the_fixed_cutoff() -> anyhow::Result<()> {
+        for mode in [
+            crate::wal::WalIoMode::Leader,
+            crate::wal::WalIoMode::Parallel,
+        ] {
+            for asynchronous in [false, true] {
+                let directory = tempdir()?;
+                let (options, source_segment_id) =
+                    active_v8_recovery_test_database(directory.path(), true)?;
+                let database = directory.path().join("db");
+                let checkpoint_path = directory.path().join("checkpoint");
+                let engine = KvEngine::open_with_wal_io_mode(&database, options.clone(), mode)?;
+                engine.put(b"before-checkpoint", b"included")?;
+
+                let active_before = engine.inner.state.load().memtable.clone();
+                assert!(active_before.uses_v8_wal());
+                assert_eq!(active_before.wal_io_mode(), Some(mode));
+                if asynchronous {
+                    engine.create_checkpoint_async(&checkpoint_path).await?;
+                } else {
+                    engine.create_checkpoint(&checkpoint_path)?;
+                }
+
+                let active_after = engine.inner.state.load().memtable.clone();
+                assert!(!Arc::ptr_eq(&active_before, &active_after));
+                assert!(active_after.uses_v8_wal());
+                assert!(active_after.is_empty());
+                assert_eq!(active_after.wal_io_mode(), Some(mode));
+                let lifecycle = engine.pitr_manifest_state.lock().clone();
+                assert_eq!(lifecycle.active_segment_id, Some(source_segment_id + 1));
+                assert_eq!(
+                    lifecycle.active_boundary.unwrap().wal_format,
+                    crate::pitr::manifest::PitrWalFormat::V8
+                );
+                assert!(
+                    engine
+                        .inner
+                        .mvcc
+                        .as_ref()
+                        .unwrap()
+                        .commit_admission_is_open()
+                );
+
+                let checkpoint =
+                    KvEngine::open(&checkpoint_path, LsmStorageOptions::default_for_test())?;
+                assert_eq!(checkpoint.get(b"seed")?, Some(Bytes::from_static(b"v")));
+                assert_eq!(
+                    checkpoint.get(b"before-checkpoint")?,
+                    Some(Bytes::from_static(b"included"))
+                );
+                engine.put(b"after-checkpoint", b"newer")?;
+                assert_eq!(checkpoint.get(b"after-checkpoint")?, None);
+                checkpoint.close()?;
+                engine.close_storage()?;
+                drop(engine);
+
+                let reopened = KvEngine::open_with_wal_io_mode(&database, options, mode)?;
+                let active_reopened = reopened.inner.state.load().memtable.clone();
+                assert!(active_reopened.uses_v8_wal());
+                assert_eq!(active_reopened.wal_io_mode(), Some(mode));
+                assert_eq!(reopened.get(b"seed")?, Some(Bytes::from_static(b"v")));
+                assert_eq!(
+                    reopened.get(b"before-checkpoint")?,
+                    Some(Bytes::from_static(b"included"))
+                );
+                assert_eq!(
+                    reopened.get(b"after-checkpoint")?,
+                    Some(Bytes::from_static(b"newer"))
+                );
+                reopened.close_storage()?;
+            }
+        }
+
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn v8_pitr_base_backup_captures_and_restores_the_active_boundary() -> anyhow::Result<()> {
+        let directory = tempdir()?;
+        let (options, source_segment_id) =
+            active_v8_recovery_test_database(directory.path(), true)?;
+        let repository_path = options
+            .pitr_repository
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("v8 fixture has no PITR repository"))?;
+        let database = directory.path().join("db");
+        let engine = KvEngine::open_with_wal_io_mode(
+            &database,
+            options.clone(),
+            crate::wal::WalIoMode::Parallel,
+        )?;
+        engine.put(b"backup-key", b"included")?;
+        let included_commit_ts = engine.inner.mvcc.as_ref().unwrap().latest_commit_ts();
+
+        let backup = match engine.create_backup(crate::backup::BackupOptions {
+            repository: repository_path.clone(),
+            use_hard_links: false,
+        })? {
+            crate::backup::CreateBackupOutcome::Committed(info) => info,
+            outcome => anyhow::bail!("v8 PITR base backup was not durably committed: {outcome:?}"),
+        };
+        let lifecycle = engine.pitr_manifest_state.lock().clone();
+        assert_eq!(lifecycle.active_segment_id, Some(source_segment_id + 1));
+        assert_eq!(
+            lifecycle.active_boundary.unwrap().wal_format,
+            crate::pitr::manifest::PitrWalFormat::V8
+        );
+        assert!(
+            engine
+                .inner
+                .mvcc
+                .as_ref()
+                .unwrap()
+                .commit_admission_is_open()
+        );
+        engine.close_storage()?;
+        drop(engine);
+
+        let repository = crate::backup::BackupRepository::open(&repository_path)?;
+        let destination = directory.path().join("restored-v8-base");
+        let outcome = repository.restore_to(
+            crate::pitr::api::RecoveryTarget::CommitTs(included_commit_ts),
+            &destination,
+            crate::pitr::api::PitrRestoreOptions {
+                selector: crate::pitr::api::RecoverySelector {
+                    timeline_id: lifecycle.timeline_id.unwrap(),
+                    archive_epoch_id: lifecycle.archive_epoch_id,
+                    base_backup_id: Some(backup.backup_id),
+                },
+                implementations: crate::pitr::api::ImplementationRegistry,
+                executor_threads: std::num::NonZeroUsize::new(1).unwrap(),
+                cache_capacity: 4096,
+                storage: LsmStorageOptions::default_for_test(),
+            },
+        )?;
+        assert!(matches!(
+            outcome,
+            crate::pitr::api::RestoreToOutcome::Restored(info)
+                if info.resolved_commit_ts == Some(included_commit_ts)
+        ));
+        let restored = KvEngine::open(&destination, LsmStorageOptions::default_for_test())?;
+        assert_eq!(restored.get(b"seed")?, Some(Bytes::from_static(b"v")));
+        assert_eq!(
+            restored.get(b"backup-key")?,
+            Some(Bytes::from_static(b"included"))
+        );
+        restored.close_storage()?;
 
         Ok(())
     }

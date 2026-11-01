@@ -5946,7 +5946,17 @@ impl crate::lsm_storage::LsmStorageInner {
         &self,
         base: &crate::pitr::base::PitrBaseMetadata,
     ) -> Result<crate::checkpoint::CheckpointCapture<'_>> {
-        self.hash_checkpoint_capture(self.capture_checkpoint_state_after_pitr_boundary(base)?)
+        let mut capture = self.capture_checkpoint_state_after_pitr_boundary(base)?;
+        // A PITR base backup contains the flushed state at its boundary, not
+        // the source engine's empty Active WAL successor or repository. Keep
+        // the base metadata in BACKUP_METADATA, but make the restored engine
+        // manifest self-contained just like a standalone checkpoint.
+        if let crate::manifest::ManifestRecord::Snapshot { pitr_state, .. } =
+            &mut capture.snapshot_record
+        {
+            *pitr_state = Some(crate::pitr::manifest::PitrState::default());
+        }
+        self.hash_checkpoint_capture(capture)
     }
 
     fn hash_checkpoint_capture<'a>(

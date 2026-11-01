@@ -247,7 +247,11 @@ disabled.
    interruption after temp-image write, temp sync, rename, and directory sync;
    retries preserve the hard anchor. Returned errors before sync, rename, and
    directory sync are also covered. Automatic v8 creation remains disabled
-   pending the compatibility and qualification gates.
+   pending the compatibility and qualification gates. Active v8 checkpoint
+   capture now seals the fixed cutoff, flushes its immutable state, and resumes
+   writes on an empty v8 successor. PITR base backups use the same boundary and
+   store a detached engine manifest, so an exact-base restore does not retain a
+   reference to the source's uncopied Active WAL or repository.
 6. **Qualification and adoption:** complete the RFC 026 crash, recovery,
    compatibility and performance matrix. Keep v7 as the default unless the
    measured results justify an explicit later adoption decision.
