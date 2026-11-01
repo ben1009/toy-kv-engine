@@ -3487,6 +3487,7 @@ impl BackupRepository {
         let target = match requested_target {
             crate::pitr::api::RecoveryTarget::Latest => segments
                 .iter()
+                .filter(|metadata| metadata.key.segment_id.0 >= base.boundary_segment_id)
                 .filter_map(|metadata| metadata.last_commit_ts)
                 .max()
                 .map(crate::pitr::restore::PitrRestoreTarget::CommitTs)
@@ -3501,7 +3502,10 @@ impl BackupRepository {
                 }
                 .as_system_time()?;
                 let mut resolved = base.included_commit_ts.filter(|_| base_time <= time);
-                for metadata in &segments {
+                for metadata in segments
+                    .iter()
+                    .filter(|metadata| metadata.key.segment_id.0 >= base.boundary_segment_id)
+                {
                     check_pitr_cancellation(cancellation)?;
                     for batch in read_batches(metadata)? {
                         check_pitr_cancellation(cancellation)?;

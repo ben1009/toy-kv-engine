@@ -251,7 +251,9 @@ disabled.
    capture now seals the fixed cutoff, flushes its immutable state, and resumes
    writes on an empty v8 successor. PITR base backups use the same boundary and
    store a detached engine manifest, so an exact-base restore does not retain a
-   reference to the source's uncopied Active WAL or repository.
+   reference to the source's uncopied Active WAL or repository. Later restores
+   validate the archived history and replay only segments at or after the
+   persisted base boundary.
 6. **Qualification and adoption:** complete the RFC 026 crash, recovery,
    compatibility and performance matrix. Keep v7 as the default unless the
    measured results justify an explicit later adoption decision.

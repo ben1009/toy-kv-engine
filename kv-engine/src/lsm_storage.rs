@@ -34708,6 +34708,13 @@ mod tests {
                 .unwrap()
                 .commit_admission_is_open()
         );
+
+        engine.put(b"after-base", b"replayed")?;
+        let replayed_commit_ts = engine.inner.mvcc.as_ref().unwrap().latest_commit_ts();
+        assert!(matches!(
+            engine.create_recovery_point()?,
+            crate::pitr::api::RecoveryPointOutcome::Durable(_)
+        ));
         engine.close_storage()?;
         drop(engine);
 
@@ -34740,6 +34747,71 @@ mod tests {
             Some(Bytes::from_static(b"included"))
         );
         restored.close_storage()?;
+
+        drop(repository);
+        let repository = crate::backup::BackupRepository::open(&repository_path)?;
+        let replay_destination = directory.path().join("restored-v8-replay");
+        let replay_outcome = repository.restore_to(
+            crate::pitr::api::RecoveryTarget::CommitTs(replayed_commit_ts),
+            &replay_destination,
+            crate::pitr::api::PitrRestoreOptions {
+                selector: crate::pitr::api::RecoverySelector {
+                    timeline_id: lifecycle.timeline_id.unwrap(),
+                    archive_epoch_id: lifecycle.archive_epoch_id,
+                    base_backup_id: Some(backup.backup_id),
+                },
+                implementations: crate::pitr::api::ImplementationRegistry,
+                executor_threads: std::num::NonZeroUsize::new(1).unwrap(),
+                cache_capacity: 4096,
+                storage: LsmStorageOptions::default_for_test(),
+            },
+        )?;
+        assert!(matches!(
+            replay_outcome,
+            crate::pitr::api::RestoreToOutcome::Restored(info)
+                if info.resolved_commit_ts == Some(replayed_commit_ts)
+        ));
+        let replayed = KvEngine::open(&replay_destination, LsmStorageOptions::default_for_test())?;
+        assert_eq!(replayed.get(b"seed")?, Some(Bytes::from_static(b"v")));
+        assert_eq!(
+            replayed.get(b"backup-key")?,
+            Some(Bytes::from_static(b"included"))
+        );
+        assert_eq!(
+            replayed.get(b"after-base")?,
+            Some(Bytes::from_static(b"replayed"))
+        );
+        replayed.close_storage()?;
+
+        drop(repository);
+        let repository = crate::backup::BackupRepository::open(&repository_path)?;
+        let latest_destination = directory.path().join("restored-v8-latest");
+        let latest_outcome = repository.restore_to(
+            crate::pitr::api::RecoveryTarget::Latest,
+            &latest_destination,
+            crate::pitr::api::PitrRestoreOptions {
+                selector: crate::pitr::api::RecoverySelector {
+                    timeline_id: lifecycle.timeline_id.unwrap(),
+                    archive_epoch_id: lifecycle.archive_epoch_id,
+                    base_backup_id: Some(backup.backup_id),
+                },
+                implementations: crate::pitr::api::ImplementationRegistry,
+                executor_threads: std::num::NonZeroUsize::new(1).unwrap(),
+                cache_capacity: 4096,
+                storage: LsmStorageOptions::default_for_test(),
+            },
+        )?;
+        assert!(matches!(
+            latest_outcome,
+            crate::pitr::api::RestoreToOutcome::Restored(info)
+                if info.resolved_commit_ts == Some(replayed_commit_ts)
+        ));
+        let latest = KvEngine::open(&latest_destination, LsmStorageOptions::default_for_test())?;
+        assert_eq!(
+            latest.get(b"after-base")?,
+            Some(Bytes::from_static(b"replayed"))
+        );
+        latest.close_storage()?;
 
         Ok(())
     }

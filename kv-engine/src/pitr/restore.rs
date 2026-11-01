@@ -1076,9 +1076,13 @@ pub(crate) fn plan_exact_restore(
         .collect::<Vec<_>>();
     retained.sort_by_key(|segment| segment.key.segment_id);
 
+    let base_boundary_index =
+        retained.partition_point(|segment| segment.key.segment_id.0 < base.boundary_segment_id);
+    retained.drain(..base_boundary_index);
     if let Some(first) = retained.first() {
         ensure!(
-            first.predecessor == persisted_to_chain_anchor(base.boundary_anchor),
+            first.key.segment_id.0 == base.boundary_segment_id
+                && first.predecessor == persisted_to_chain_anchor(base.boundary_anchor),
             "PITR restore chain does not start at the base boundary"
         );
     }
