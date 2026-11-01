@@ -131,13 +131,37 @@ impl<'a, R> PreparedWalV8Batch<'a, R> {
 
     /// Complete Parallel admission and publication before returning a value
     /// that can encode payload bytes.
+    #[cfg(test)]
     pub(crate) fn admit<P>(self, publisher: &P) -> Result<AdmittedWalV8Batch<'a, P::Guard, R>>
     where
         P: WalV8AdmissionPublisher,
     {
+        let commit_ts = self.commit_ts;
+        let recorded_at = self.recorded_at;
+        self.admit_with_metadata(commit_ts, recorded_at, publisher)
+    }
+
+    /// Complete admission with MVCC metadata allocated by the sequencer.
+    /// Parallel callers can preflight canonical operation sizes before taking
+    /// that sequencer, then publish the actual ticket and timestamp before
+    /// encoding or hashing payload bytes.
+    pub(crate) fn admit_with_metadata<P>(
+        self,
+        commit_ts: u64,
+        recorded_at: RecordedAt,
+        publisher: &P,
+    ) -> Result<AdmittedWalV8Batch<'a, P::Guard, R>>
+    where
+        P: WalV8AdmissionPublisher,
+    {
+        ensure!(commit_ts > 0, "v8 admission commit timestamp is zero");
+        ensure!(
+            recorded_at.nanos < 1_000_000_000,
+            "v8 admission recorded-at timestamp is invalid"
+        );
         let plan = WalV8AdmissionPlan {
-            commit_ts: self.commit_ts,
-            recorded_at: self.recorded_at,
+            commit_ts,
+            recorded_at,
             logical_batch_bytes: self.logical_batch_bytes,
             fragment_count: self.fragment_count,
             frame_buffer_bytes: self.frame_buffer_bytes,
@@ -539,6 +563,77 @@ mod tests {
     fn prepare_and_encode(batch: &WalBatch) -> Result<EncodedWalV8Batch<TestAdmissionGuard>> {
         let publisher = TestPublisher::new(WAL_V8_DATA_START);
         preflight(batch)?.admit(&publisher)?.encode()
+    }
+
+    #[test]
+    fn admission_uses_sequencer_metadata_from_after_preflight() -> Result<()> {
+        let batch = batch(32);
+        let prepared = preflight(&batch)?;
+        let mut publisher = TestPublisher::new(WAL_V8_DATA_START);
+        let commit_ts = 42;
+        let recorded_at = RecordedAt {
+            secs: 123,
+            nanos: 456,
+        };
+        publisher.assignment.commit_ts = commit_ts;
+        publisher.assignment.recorded_at = recorded_at;
+
+        let mut encoded = prepared
+            .admit_with_metadata(commit_ts, recorded_at, &publisher)?
+            .encode()?;
+        assert_eq!(publisher.group_window(), vec![3]);
+        assert_eq!(
+            publisher.plans.lock().as_slice(),
+            &[WalV8AdmissionPlan {
+                commit_ts,
+                recorded_at,
+                logical_batch_bytes: encoded.as_bytes().len(),
+                fragment_count: encoded.fragment_count,
+                frame_buffer_bytes: encoded.frame_buffer_bytes,
+            }]
+        );
+
+        let logical_bytes = encoded.as_bytes();
+        let header = codec::WalV8LogicalBatchHeader::decode(
+            &logical_bytes[..codec::WAL_V8_LOGICAL_BATCH_HEADER_LEN],
+            &logical_bytes[codec::WAL_V8_LOGICAL_BATCH_HEADER_LEN..],
+            3,
+            u64::try_from(logical_bytes.len())?,
+            crate::pitr::LIVE_WAL_V5_LIMITS,
+        )?;
+        assert_eq!(header.commit_ts, commit_ts);
+        assert_eq!(header.recorded_at_secs, recorded_at.secs);
+        assert_eq!(header.recorded_at_nanos, recorded_at.nanos);
+        encoded.disarm_after_durable();
+
+        Ok(())
+    }
+
+    #[test]
+    fn invalid_sequencer_metadata_is_rejected_before_publication() -> Result<()> {
+        let batch = batch(16);
+        let publisher = TestPublisher::new(WAL_V8_DATA_START);
+        assert!(
+            preflight(&batch)?
+                .admit_with_metadata(0, batch.recorded_at, &publisher)
+                .is_err()
+        );
+        assert!(
+            preflight(&batch)?
+                .admit_with_metadata(
+                    batch.commit_ts,
+                    RecordedAt {
+                        secs: batch.recorded_at.secs,
+                        nanos: 1_000_000_000,
+                    },
+                    &publisher,
+                )
+                .is_err()
+        );
+        assert!(publisher.group_window().is_empty());
+        assert!(publisher.plans.lock().is_empty());
+
+        Ok(())
     }
 
     #[test]

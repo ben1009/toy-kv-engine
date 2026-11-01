@@ -470,12 +470,20 @@ impl WalV8LeaderWriter {
             self.coordinator.admitted_window().is_empty(),
             "serial v8 protocol writer has unresolved tickets"
         );
-        for (prepared, reservation) in prepared_batches.into_iter().zip(&mut batch_resources) {
+        for ((prepared, reservation), batch) in prepared_batches
+            .into_iter()
+            .zip(&mut batch_resources)
+            .zip(batches)
+        {
             let publisher = WalV8LeaderAdmissionPublisher {
                 coordinator: &self.coordinator,
                 reservation: RefCell::new(reservation),
             };
-            admitted_batches.push(prepared.admit(&publisher)?);
+            admitted_batches.push(prepared.admit_with_metadata(
+                batch.commit_ts,
+                batch.recorded_at,
+                &publisher,
+            )?);
         }
 
         let producer_result = thread::scope(|scope| -> Result<()> {
