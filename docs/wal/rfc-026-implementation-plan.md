@@ -276,6 +276,10 @@ build rejects the v8 selector before opening a database. PITR write-perf workers
 retry only the exact pre-admission `commit admission is stopped at a PITR
 barrier` error, with a bounded five-second wait. The retry time remains inside
 the measured operation latency; other errors still fail the run immediately.
+V8 Parallel producers also wait for a bounded ticket slot to become durable
+instead of failing a write when the in-flight ticket window is temporarily
+full. The admission waiter is released by frontier publication, close or
+poison, and a focused coordinator test covers the durable-capacity handoff.
 
 Each slice must leave existing v2-v7 reads, writes, recovery and digest
 interpretation unchanged. Tests for each completed slice are part of its

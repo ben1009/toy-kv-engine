@@ -80,6 +80,8 @@ struct CoordinatorState {
     change_generation: u64,
     closed: bool,
     poisoned: bool,
+    #[cfg(test)]
+    ticket_admission_waiters: usize,
     #[cfg(feature = "bench")]
     ordered_link_hash_cpu_ns: u64,
 }
@@ -197,6 +199,8 @@ impl WalV8ParallelCoordinator {
                     change_generation: 0,
                     closed: false,
                     poisoned: false,
+                    #[cfg(test)]
+                    ticket_admission_waiters: 0,
                     #[cfg(feature = "bench")]
                     ordered_link_hash_cpu_ns: 0,
                 }),
@@ -544,6 +548,11 @@ impl WalV8ParallelCoordinator {
         self.inner.state.lock().change_generation
     }
 
+    #[cfg(test)]
+    fn ticket_admission_waiter_count(&self) -> usize {
+        self.inner.state.lock().ticket_admission_waiters
+    }
+
     /// Wait until admission, readiness, close, or poison changes, with a
     /// deadline so callers can periodically recheck group policy.
     pub(crate) fn wait_for_change(
@@ -611,12 +620,24 @@ impl WalV8AdmissionPublisher for WalV8ParallelCoordinator {
         );
 
         let mut state = self.inner.state.lock();
+        while state.tickets.len() >= self.inner.max_inflight_tickets {
+            ensure!(!state.poisoned, "v8 Parallel coordinator is poisoned");
+            ensure!(!state.closed, "v8 Parallel coordinator is closed");
+            // Ticket capacity is a backpressure boundary, not a failed write.
+            // The durability worker frees slots and signals this condition
+            // after publishing a successful FRONTIER.
+            #[cfg(test)]
+            {
+                state.ticket_admission_waiters += 1;
+            }
+            self.inner.changed.wait(&mut state);
+            #[cfg(test)]
+            {
+                state.ticket_admission_waiters -= 1;
+            }
+        }
         ensure!(!state.poisoned, "v8 Parallel coordinator is poisoned");
         ensure!(!state.closed, "v8 Parallel coordinator is closed");
-        ensure!(
-            state.tickets.len() < self.inner.max_inflight_tickets,
-            "v8 Parallel ticket window is full"
-        );
         let new_reserved_bytes = state
             .reserved_bytes
             .checked_add(reserved_bytes)
@@ -1323,16 +1344,69 @@ mod tests {
     }
 
     #[test]
-    fn bounded_admission_does_not_consume_a_ticket_when_full() -> Result<()> {
+    fn bounded_admission_waits_until_a_ticket_is_durable() -> Result<()> {
+        use std::sync::mpsc;
+
         let coordinator = coordinator(1)?;
         let first = batch(10);
-        let second = batch(20);
-        let admitted = admit(&first, &coordinator)?;
-        assert!(admit(&second, &coordinator).is_err());
-        assert_eq!(coordinator.next_ticket(), 1);
-        assert_eq!(coordinator.admitted_window().len(), 1);
-        drop(admitted);
-        assert!(coordinator.is_poisoned());
+        let mut first_encoded = admit(&first, &coordinator)?.encode()?;
+        mark_producer_ready(&mut first_encoded, &coordinator, true)?;
+
+        let waiter_coordinator = coordinator.clone();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (ticket_tx, ticket_rx) = mpsc::channel();
+        let (durable_tx, durable_rx) = mpsc::channel();
+        let waiter = std::thread::spawn(move || -> Result<()> {
+            let second = batch(20);
+            started_tx
+                .send(())
+                .context("notify test that the waiter is starting")?;
+            let mut encoded = admit(&second, &waiter_coordinator)?.encode()?;
+            let ticket = encoded.assignment().segment_ticket;
+            mark_producer_ready(&mut encoded, &waiter_coordinator, true)?;
+            ticket_tx
+                .send(ticket)
+                .context("publish second test ticket")?;
+            durable_rx
+                .recv()
+                .context("wait for second test ticket durability")?;
+            encoded.disarm_after_durable();
+            Ok(())
+        });
+
+        started_rx
+            .recv()
+            .context("wait for admission waiter to start")?;
+        let observed_waiter = std::time::Instant::now() + Duration::from_secs(1);
+        while coordinator.ticket_admission_waiter_count() == 0
+            && std::time::Instant::now() < observed_waiter
+        {
+            std::thread::yield_now();
+        }
+        assert_eq!(coordinator.ticket_admission_waiter_count(), 1);
+        assert!(matches!(
+            ticket_rx.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+
+        let first_frontier = coordinator.reserve_frontier(1)?;
+        coordinator.publish_durable_frontier(first_frontier)?;
+        first_encoded.disarm_after_durable();
+
+        let second_ticket = ticket_rx
+            .recv_timeout(Duration::from_secs(1))
+            .context("wait for admission after durable capacity is released")?;
+        assert_eq!(second_ticket, 1);
+        let second_frontier = coordinator.reserve_frontier(2)?;
+        coordinator.publish_durable_frontier(second_frontier)?;
+        durable_tx
+            .send(())
+            .context("release second test ticket guard")?;
+        waiter
+            .join()
+            .map_err(|_| anyhow::anyhow!("admission waiter panicked"))??;
+        assert_eq!(coordinator.durable_ticket_end(), 2);
+        assert!(!coordinator.is_poisoned());
         Ok(())
     }
 

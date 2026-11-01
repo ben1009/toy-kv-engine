@@ -52,7 +52,9 @@ pub(crate) trait WalV8AdmissionGuard {
 /// return only after that publication is visible. The guard owns the charges
 /// and poisons the ticket if dropped before durable publication. If an error
 /// occurs after ticket allocation but before the guard is returned, the
-/// implementation must poison that ticket before returning the error.
+/// implementation must poison that ticket before returning the error. Callers
+/// must serialize ordered commit metadata through this call so a producer
+/// waiting for ticket capacity cannot be overtaken by a later commit timestamp.
 pub(crate) trait WalV8AdmissionPublisher {
     type Guard: WalV8AdmissionGuard;
 
