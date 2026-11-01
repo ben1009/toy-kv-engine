@@ -4753,13 +4753,16 @@ mod tests {
 
         assert!(mvcc.write_wal_only(&key, b"value", &memtable).is_err());
         assert!(!memtable.versioned_wal_requires_recovery());
+        assert_eq!(memtable.wal_batch_count(), Some(0));
+        assert_eq!(mvcc.latest_commit_ts(), 0);
         assert_eq!(mvcc.stop_commit_admission_and_capture()?, None);
         mvcc.resume_commit_admission();
         let (commit_ts, key, value, ticket) = mvcc.write_wal_only(b"retry", b"value", &memtable)?;
+        assert_eq!((commit_ts, ticket), (1, Some(0)));
         memtable.commit_wal_ticket(ticket)?;
         memtable.publish_raw_batch(&[(crate::key::KeySlice::from_slice(&key), &value)])?;
         mvcc.publish_commit_ts(commit_ts)?;
-        assert_eq!(mvcc.latest_commit_ts(), 2);
+        assert_eq!(mvcc.latest_commit_ts(), 1);
 
         Ok(())
     }
