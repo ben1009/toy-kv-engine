@@ -236,6 +236,12 @@ pub(crate) struct AdmittedWalV8Batch<'a, G, R> {
 }
 
 impl<G: WalV8AdmissionGuard, R> AdmittedWalV8Batch<'_, G, R> {
+    /// Coordinates published during admission, available before payload
+    /// encoding so persistent reservations can be attached to the ticket.
+    pub(crate) fn assignment(&self) -> WalV8BatchAssignment {
+        self.assignment
+    }
+
     /// Encode canonical entries while updating CRC and BLAKE3 from the same
     /// emitted slices, then finalize the assigned logical header and batch hash.
     pub(crate) fn encode(self) -> Result<EncodedWalV8Batch<G>> {

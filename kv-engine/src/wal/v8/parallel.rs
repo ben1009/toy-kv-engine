@@ -274,6 +274,12 @@ impl WalV8ParallelCoordinator {
     /// Publish one producer's fixed-size digest independently of frame
     /// materialization and DATA I/O completion.
     pub(crate) fn mark_digest_ready(&self, digest: WalV8DigestReady) -> Result<()> {
+        self.mark_digest_ready_with_cpu(digest).map(|_| ())
+    }
+
+    /// Publish a producer digest and return the ordered-link CPU time spent
+    /// folding digests that became contiguous because of this event.
+    pub(crate) fn mark_digest_ready_with_cpu(&self, digest: WalV8DigestReady) -> Result<u64> {
         let mut state = self.inner.state.lock();
         ensure!(!state.poisoned, "v8 Parallel coordinator is poisoned");
         let Some(index) = state
@@ -299,19 +305,25 @@ impl WalV8ParallelCoordinator {
             anyhow::bail!("v8 digest-ready event does not match its admitted ticket");
         }
         match state.tickets[index].digest_ready {
-            Some(existing) if existing == digest => return Ok(()),
+            Some(existing) if existing == digest => return Ok(0),
             Some(_) => {
                 poison_locked(&self.inner, &mut state);
                 anyhow::bail!("conflicting v8 digest-ready event")
             }
             None => state.tickets[index].digest_ready = Some(digest),
         }
+        #[cfg(feature = "bench")]
+        let cpu_before = state.ordered_link_hash_cpu_ns;
         if let Err(error) = fold_ready_digests(&mut state) {
             poison_locked(&self.inner, &mut state);
             return Err(error);
         }
+        #[cfg(feature = "bench")]
+        let ordered_link_hash_cpu_ns = state.ordered_link_hash_cpu_ns.saturating_sub(cpu_before);
+        #[cfg(not(feature = "bench"))]
+        let ordered_link_hash_cpu_ns = 0;
         signal_change(&self.inner, &mut state);
-        Ok(())
+        Ok(ordered_link_hash_cpu_ns)
     }
 
     /// Publish that a submitted DATA write has completed. Frame readiness must

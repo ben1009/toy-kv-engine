@@ -8,6 +8,7 @@
 
 use std::{
     cell::RefCell,
+    collections::BTreeMap,
     error::Error,
     fmt,
     fs::File,
@@ -18,9 +19,11 @@ use std::{
     },
     sync::Arc,
     thread,
+    time::Duration,
 };
 
 use anyhow::{Context, Result, ensure};
+use parking_lot::Mutex;
 use sha2::{Digest, Sha256};
 
 use crate::{
@@ -120,6 +123,30 @@ pub(crate) struct WalV8LeaderWriter {
     max_file_size: u64,
     installed_dev: u64,
     installed_ino: u64,
+}
+
+/// Shared v8 writer path for concurrent producers. Admission and DATA writes
+/// can overlap across callers; this mutex protects only the one-at-a-time
+/// FRONTIER write and sync cycle.
+pub(crate) struct WalV8ParallelWriter {
+    write_file: File,
+    sync_file: File,
+    header: WalV8Header,
+    physical_header_digest: [u8; 32],
+    initial_prefix_digest: digest::WalV8Digest,
+    coordinator: WalV8ParallelCoordinator,
+    reservation_owner: Option<Arc<WalV8ReservationOwner>>,
+    frontier: Mutex<WalV8ParallelFrontier>,
+    frontier_resources: Mutex<BTreeMap<u64, WalV7OwnedBatchReservation>>,
+    max_file_size: u64,
+    installed_dev: u64,
+    installed_ino: u64,
+}
+
+struct WalV8ParallelFrontier {
+    frontier: WalV8Frontier,
+    offset: u64,
+    digest: [u8; 32],
 }
 
 struct ProducerCompletion {
@@ -287,6 +314,29 @@ impl WalV8LeaderWriter {
             installed_dev: installed.installed_dev,
             installed_ino: installed.installed_ino,
         })
+    }
+
+    /// Transfer the validated image and coordinator to the concurrent
+    /// producer path. Only the frontier write and WAL sync remain serialized.
+    pub(crate) fn into_parallel(self) -> WalV8ParallelWriter {
+        WalV8ParallelWriter {
+            write_file: self.write_file,
+            sync_file: self.sync_file,
+            header: self.header,
+            physical_header_digest: self.physical_header_digest,
+            initial_prefix_digest: self.initial_prefix_digest,
+            coordinator: self.coordinator,
+            reservation_owner: self.reservation_owner,
+            frontier: Mutex::new(WalV8ParallelFrontier {
+                frontier: self.frontier,
+                offset: self.frontier_offset,
+                digest: self.frontier_digest,
+            }),
+            frontier_resources: Mutex::new(BTreeMap::new()),
+            max_file_size: self.max_file_size,
+            installed_dev: self.installed_dev,
+            installed_ino: self.installed_ino,
+        }
     }
 
     /// Encode, write, and durably publish one ticket using a single WAL sync.
@@ -767,6 +817,340 @@ impl WalV8LeaderWriter {
     }
 }
 
+impl WalV8ParallelWriter {
+    /// Reserve bounded preparation state before canonicalizing a batch.
+    pub(crate) fn preflight_batch<'a>(
+        &self,
+        batch: &'a WalBatch,
+        limits: WalV5Limits,
+    ) -> Result<WalV8PreparedBatch<'a>> {
+        ensure!(!self.is_poisoned(), "v8 Parallel WAL is poisoned");
+        let limits = bounded_limits(limits);
+        WalV8PreparedBatch::preflight(batch, limits, |bytes| {
+            ensure!(
+                bytes <= self.max_file_size,
+                WalV8LeaderCapacityError::GroupExceedsAdmissionWindow
+            );
+            let source = self
+                .reservation_owner
+                .as_ref()
+                .map(|owner| owner.reserve_preparation_buffer(bytes))
+                .transpose()?
+                .flatten();
+            let coordinator = self.coordinator.reserve_preparation(bytes)?;
+            Ok(WalV8PreflightReservation {
+                _coordinator: coordinator,
+                _source: source,
+            })
+        })
+    }
+
+    /// Admit, encode and write one ticket without serializing it behind other
+    /// producers. The caller returns only after its ticket is covered by a
+    /// successful embedded FRONTIER and WAL sync.
+    pub(crate) fn append_prepared_batch(
+        &self,
+        prepared: WalV8PreparedBatch<'_>,
+        commit_ts: u64,
+        recorded_at: crate::pitr::RecordedAt,
+    ) -> Result<(WalV8LeaderCommit, digest::WalV8DigestMetrics)> {
+        self.append_prepared_batch_inner(prepared, commit_ts, recorded_at, || {})
+    }
+
+    fn append_prepared_batch_inner<F>(
+        &self,
+        prepared: WalV8PreparedBatch<'_>,
+        commit_ts: u64,
+        recorded_at: crate::pitr::RecordedAt,
+        after_admission: F,
+    ) -> Result<(WalV8LeaderCommit, digest::WalV8DigestMetrics)>
+    where
+        F: FnOnce(),
+    {
+        ensure!(!self.is_poisoned(), "v8 Parallel WAL is poisoned");
+        let logical_bytes = u64::try_from(prepared.logical_batch_bytes())?;
+        let frame_bytes = u64::try_from(prepared.frame_buffer_bytes())?;
+        let mut reservation = self
+            .reservation_owner
+            .as_ref()
+            .map(|owner| owner.reserve_batch(logical_bytes, frame_bytes))
+            .transpose()?;
+
+        // Allocate buffers and handles before publishing the ticket. Once
+        // admission succeeds, every resource required to finish is already
+        // owned by this producer.
+        let mut data_buffer = DirectBuf::new(prepared.frame_buffer_bytes());
+        let write_file = self
+            .write_file
+            .try_clone()
+            .context("clone v8 Parallel DATA write handle before admission")?;
+        let publisher = WalV8LeaderAdmissionPublisher {
+            coordinator: &self.coordinator,
+            reservation: RefCell::new(&mut reservation),
+        };
+        let admitted = prepared.admit_with_metadata(commit_ts, recorded_at, &publisher)?;
+        let assignment = admitted.assignment();
+        if let Some(reservation) = reservation.take() {
+            let previous = self
+                .frontier_resources
+                .lock()
+                .insert(assignment.segment_ticket, reservation);
+            if previous.is_some() {
+                self.coordinator.poison();
+                anyhow::bail!("v8 Parallel ticket already owns a resource reservation");
+            }
+        }
+        after_admission();
+
+        let mut encoded = match admitted.encode() {
+            Ok(encoded) => encoded,
+            Err(error) => {
+                self.coordinator.poison();
+                return Err(error);
+            }
+        };
+        let digest_ready = encoded.digest_ready()?;
+        #[cfg(feature = "bench")]
+        let ordered_link_hash_cpu_ns = self.coordinator.mark_digest_ready_with_cpu(digest_ready)?;
+        #[cfg(not(feature = "bench"))]
+        self.coordinator.mark_digest_ready(digest_ready)?;
+        let data_len = encoded.encode_data_frames_into(data_buffer.as_mut_slice())?;
+        ensure!(
+            data_len == data_buffer.cap(),
+            "v8 DATA materializer returned an unexpected frame length"
+        );
+        data_buffer.set_len(data_len);
+        self.coordinator
+            .mark_frames_ready(assignment.segment_ticket)?;
+        write_aligned_once(
+            &write_file,
+            data_buffer.initialized_slice(0, data_len),
+            assignment.first_data_offset,
+        )
+        .context("write v8 Parallel DATA frames")?;
+        self.coordinator
+            .mark_data_complete(assignment.segment_ticket)?;
+        drop(data_buffer);
+
+        if let Err(error) = self.advance_frontier_through(assignment.segment_ticket) {
+            self.coordinator.poison();
+            return Err(error);
+        }
+        encoded.disarm_after_durable();
+
+        let frontier = self.frontier.lock();
+        let commit = WalV8LeaderCommit {
+            ticket: assignment.segment_ticket,
+            first_data_offset: assignment.first_data_offset,
+            frontier: frontier.frontier,
+            frontier_offset: frontier.offset,
+            frontier_digest: frontier.digest,
+        };
+        #[cfg(feature = "bench")]
+        let mut metrics = encoded.digest_metrics();
+        #[cfg(feature = "bench")]
+        {
+            metrics.ordered_link_hash_cpu_ns = ordered_link_hash_cpu_ns;
+        }
+        #[cfg(not(feature = "bench"))]
+        let metrics = digest::WalV8DigestMetrics;
+        Ok((commit, metrics))
+    }
+
+    fn advance_frontier_through(&self, ticket: u64) -> Result<()> {
+        let ticket_end = ticket
+            .checked_add(1)
+            .context("v8 Parallel durable ticket end overflows")?;
+        loop {
+            if self.coordinator.is_poisoned() {
+                anyhow::bail!("v8 Parallel WAL is poisoned");
+            }
+            if self.coordinator.durable_ticket_end() >= ticket_end {
+                return Ok(());
+            }
+
+            let observed_generation = self.coordinator.change_generation();
+            let mut previous = self.frontier.lock();
+            if self.coordinator.durable_ticket_end() >= ticket_end {
+                return Ok(());
+            }
+            let ready = self.coordinator.frontier_ready_prefix();
+            if ready.is_empty() {
+                drop(previous);
+                let wake = self
+                    .coordinator
+                    .wait_for_change(observed_generation, Duration::from_secs(1));
+                if wake.poisoned {
+                    anyhow::bail!("v8 Parallel WAL was poisoned while waiting for durability");
+                }
+                if wake.closed && self.coordinator.durable_ticket_end() < ticket_end {
+                    anyhow::bail!("v8 Parallel WAL closed before the ticket became durable");
+                }
+                continue;
+            }
+
+            let first_ticket = self.coordinator.durable_ticket_end();
+            let frontier_ticket_end = first_ticket
+                .checked_add(u64::try_from(ready.len())?)
+                .context("v8 Parallel frontier ticket end overflows")?;
+            let last = ready
+                .last()
+                .context("v8 Parallel ready prefix unexpectedly empty")?;
+            let last_data_end = last
+                .assignment
+                .first_data_offset
+                .checked_add(u64::try_from(last.frame_buffer_bytes)?)
+                .context("v8 Parallel durable DATA end overflows")?;
+            let previous_frontier_end = previous
+                .offset
+                .checked_add(FRAME_LEN_U64)
+                .context("v8 previous FRONTIER end overflows")?;
+            let reservation = self.coordinator.reserve_frontier(frontier_ticket_end)?;
+            let durable_end = last_data_end.max(previous_frontier_end);
+            ensure!(
+                previous_frontier_end <= durable_end
+                    && durable_end <= reservation.frame_offset
+                    && reservation.frame_offset + FRAME_LEN_U64 <= self.max_file_size,
+                "v8 Parallel FRONTIER physical boundaries are invalid"
+            );
+            let frontier = WalV8Frontier {
+                generation: previous
+                    .frontier
+                    .generation
+                    .checked_add(1)
+                    .context("v8 FRONTIER generation overflows")?,
+                ticket_end: frontier_ticket_end,
+                durable_end,
+                last_commit_ts: last.assignment.commit_ts,
+                prefix_digest: reservation.prefix_digest,
+                previous_frontier_offset: previous.offset,
+                previous_frontier_digest: previous.digest,
+            };
+            let frontier_frame = encode_frontier_successor(
+                frontier,
+                previous.frontier,
+                previous.offset,
+                &previous.digest,
+                reservation.frame_offset,
+                self.physical_header_digest,
+                self.initial_prefix_digest,
+            )?;
+            let frontier_digest = frame_record_digest(&frontier_frame)?;
+            let mut frontier_buffer = DirectBuf::new(WAL_V8_FRAME_LEN);
+            frontier_buffer.as_mut_slice()[..WAL_V8_FRAME_LEN].copy_from_slice(&frontier_frame);
+            frontier_buffer.set_len(WAL_V8_FRAME_LEN);
+            write_aligned_once(
+                &self.write_file,
+                frontier_buffer.initialized_slice(0, WAL_V8_FRAME_LEN),
+                reservation.frame_offset,
+            )
+            .context("write v8 Parallel FRONTIER")?;
+            fdatasync_once(&self.sync_file).context("fdatasync v8 Parallel WAL")?;
+
+            self.retire_frontier_resources(first_ticket, frontier_ticket_end)?;
+            self.coordinator.publish_durable_frontier(reservation)?;
+            previous.frontier = frontier;
+            previous.offset = reservation.frame_offset;
+            previous.digest = frontier_digest;
+        }
+    }
+
+    fn retire_frontier_resources(&self, first_ticket: u64, ticket_end: u64) -> Result<()> {
+        if self.reservation_owner.is_none() {
+            return Ok(());
+        }
+        let mut resources = self.frontier_resources.lock();
+        let tickets: Vec<u64> = resources
+            .range(first_ticket..ticket_end)
+            .map(|(&t, _)| t)
+            .collect();
+        let expected = usize::try_from(ticket_end - first_ticket)?;
+        ensure!(
+            tickets.len() == expected,
+            "v8 Parallel durable prefix is missing resource reservations"
+        );
+        for (index, ticket) in tickets.into_iter().enumerate() {
+            let mut reservation = resources
+                .remove(&ticket)
+                .context("v8 Parallel resource reservation disappeared")?;
+            if index > 0 {
+                reservation
+                    .release_unused_frontier_credit()
+                    .context("release coalesced v8 FRONTIER reservation")?;
+            }
+            reservation
+                .finish_after_io()
+                .context("retire durable v8 batch resources")?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn sync(&self) -> Result<()> {
+        ensure!(!self.is_poisoned(), "v8 Parallel WAL is poisoned");
+        let ticket_end = self.coordinator.next_ticket();
+        if ticket_end == 0 {
+            return Ok(());
+        }
+        if let Err(error) = self.advance_frontier_through(ticket_end - 1) {
+            self.coordinator.poison();
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn is_poisoned(&self) -> bool {
+        self.coordinator.is_poisoned()
+    }
+
+    pub(crate) fn try_clone_sync_file(&self) -> Result<File> {
+        self.sync_file
+            .try_clone()
+            .context("clone v8 Parallel WAL sync handle")
+    }
+
+    pub(crate) fn image_len(&self) -> Result<u64> {
+        self.frontier
+            .lock()
+            .offset
+            .checked_add(FRAME_LEN_U64)
+            .context("v8 Active WAL image length overflows")
+    }
+
+    pub(crate) fn logical_tail(&self) -> u64 {
+        self.coordinator.last_frontier_end()
+    }
+
+    pub(crate) fn active_boundaries(
+        &self,
+    ) -> Result<(
+        crate::pitr::manifest::ActiveBoundary,
+        crate::pitr::manifest::ActiveBoundary,
+    )> {
+        let frontier = self.frontier.lock();
+        let empty = crate::pitr::manifest::ActiveBoundary {
+            timeline_id: self.header.timeline_id.0,
+            archive_epoch_id: self.header.archive_epoch_id.0,
+            segment_id: self.header.segment_id.0,
+            incarnation: self.header.incarnation,
+            wal_format: crate::pitr::manifest::PitrWalFormat::V8,
+            ticket_end: 0,
+            durable_end: HEADER_LEN_U64,
+            last_commit_ts: 0,
+            prefix_digest: self.initial_prefix_digest,
+        };
+        let active = crate::pitr::manifest::ActiveBoundary {
+            ticket_end: frontier.frontier.ticket_end,
+            durable_end: frontier.frontier.durable_end,
+            last_commit_ts: frontier.frontier.last_commit_ts,
+            prefix_digest: frontier.frontier.prefix_digest,
+            ..empty
+        };
+        empty.validate()?;
+        active.validate()?;
+        Ok((empty, active))
+    }
+}
+
 fn bounded_limits(limits: WalV5Limits) -> WalV5Limits {
     WalV5Limits {
         max_input_entry_count: limits
@@ -879,7 +1263,15 @@ fn read_exact_at<const N: usize>(file: &File, offset: u64) -> io::Result<[u8; N]
 
 #[cfg(test)]
 mod tests {
-    use std::{ffi::CString, fs::OpenOptions, os::fd::FromRawFd, path::Path};
+    use std::{
+        ffi::CString,
+        fs::OpenOptions,
+        os::fd::FromRawFd,
+        path::Path,
+        sync::{Arc, mpsc},
+        thread,
+        time::{Duration, Instant},
+    };
 
     use anyhow::Result;
 
@@ -1533,6 +1925,153 @@ mod tests {
         assert_eq!(recovered.active_boundary.ticket_end, 1);
         assert_eq!(replayed_batches(&path, &recovered)?, [batch(10)]);
         assert_ne!(std::fs::metadata(&path)?.ino(), original_inode);
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_sync_failure_poisons_parallel_writer() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("active-v8.wal");
+        let header = header();
+        let installed = install_empty(&path, header)?;
+        let write_file = OpenOptions::new().read(true).write(true).open(&path)?;
+        let path_c = CString::new(path.as_os_str().as_encoded_bytes())?;
+        // SAFETY: O_PATH returns a descriptor owned below.
+        let sync_fd = unsafe { libc::open(path_c.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
+        ensure!(
+            sync_fd >= 0,
+            "open O_PATH sync handle: {}",
+            io::Error::last_os_error()
+        );
+        // SAFETY: sync_fd was returned by open and ownership transfers to File.
+        let sync_file = unsafe { File::from_raw_fd(sync_fd) };
+        let writer = WalV8LeaderWriter::new(write_file, sync_file, &installed, MAX_WAL_FILE_SIZE)?
+            .into_parallel();
+        let first_batch = batch(10);
+        let prepared = writer.preflight_batch(&first_batch, LIVE_WAL_V5_LIMITS)?;
+        let mut data_buffer = DirectBuf::new(prepared.frame_buffer_bytes());
+        let mut reservation = None;
+        let publisher = WalV8LeaderAdmissionPublisher {
+            coordinator: &writer.coordinator,
+            reservation: RefCell::new(&mut reservation),
+        };
+        let admitted = prepared.admit_with_metadata(10, first_batch.recorded_at, &publisher)?;
+        let mut encoded = admitted.encode()?;
+        let assignment = encoded.assignment();
+        let digest_ready = encoded.digest_ready()?;
+        writer.coordinator.mark_digest_ready(digest_ready)?;
+        let data_len = encoded.encode_data_frames_into(data_buffer.as_mut_slice())?;
+        ensure!(
+            data_len == data_buffer.cap(),
+            "v8 DATA materializer returned an unexpected frame length"
+        );
+        data_buffer.set_len(data_len);
+        writer
+            .coordinator
+            .mark_frames_ready(assignment.segment_ticket)?;
+        write_aligned_once(
+            &writer.write_file,
+            data_buffer.initialized_slice(0, data_len),
+            assignment.first_data_offset,
+        )?;
+        writer
+            .coordinator
+            .mark_data_complete(assignment.segment_ticket)?;
+        drop(data_buffer);
+
+        let error = writer
+            .sync()
+            .expect_err("explicit fdatasync failure must reject the durability advance");
+        assert!(format!("{error:#}").contains("fdatasync"));
+        assert!(writer.is_poisoned());
+        assert!(
+            writer
+                .preflight_batch(&batch(20), LIVE_WAL_V5_LIMITS)
+                .is_err()
+        );
+        drop(encoded);
+        Ok(())
+    }
+
+    #[test]
+    fn concurrent_producers_share_one_frontier_after_admitted_head_finishes() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("active-v8.wal");
+        let header = header();
+        let installed = install_empty(&path, header)?;
+        let writer = Arc::new(open_writer(&path, &installed)?.into_parallel());
+        let first_batch = batch(10);
+        let second_batch = batch(20);
+        let first_prepared = writer.preflight_batch(&first_batch, LIVE_WAL_V5_LIMITS)?;
+        let second_prepared = writer.preflight_batch(&second_batch, LIVE_WAL_V5_LIMITS)?;
+        let (admitted_tx, admitted_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+
+        let (first_commit, second_commit) = thread::scope(|scope| -> Result<_> {
+            let first_writer = Arc::clone(&writer);
+            let first_handle = scope.spawn(move || {
+                first_writer.append_prepared_batch_inner(
+                    first_prepared,
+                    10,
+                    first_batch.recorded_at,
+                    || {
+                        admitted_tx
+                            .send(())
+                            .expect("admission receiver remains open");
+                        release_rx.recv().expect("test releases the first producer");
+                    },
+                )
+            });
+            admitted_rx.recv_timeout(Duration::from_secs(2))?;
+
+            let second_writer = Arc::clone(&writer);
+            let second_handle = scope.spawn(move || {
+                second_writer.append_prepared_batch(second_prepared, 20, second_batch.recorded_at)
+            });
+
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                let admitted = writer.coordinator.admitted_window();
+                if admitted.len() == 2 && admitted[1].data_complete {
+                    break;
+                }
+                ensure!(
+                    Instant::now() < deadline,
+                    "later v8 producer did not complete while the head was preparing"
+                );
+                thread::yield_now();
+            }
+            release_tx
+                .send(())
+                .expect("first producer is still waiting");
+
+            let first_commit = first_handle
+                .join()
+                .map_err(|_| anyhow::anyhow!("first v8 producer panicked"))??;
+            let second_commit = second_handle
+                .join()
+                .map_err(|_| anyhow::anyhow!("second v8 producer panicked"))??;
+            Ok((first_commit, second_commit))
+        })?;
+        assert_eq!(first_commit.0.ticket, 0);
+        assert_eq!(second_commit.0.ticket, 1);
+        assert_eq!(writer.active_boundaries()?.1.ticket_end, 2);
+        assert_eq!(
+            writer.image_len()?,
+            installed.image_len + 3 * FRAME_LEN_U64,
+            "two DATA frames and one shared FRONTIER are durable"
+        );
+
+        drop(writer);
+        let recovered = super::super::install::recover_and_install_active(
+            &path,
+            &[installed.active_boundary],
+            header.predecessor,
+            LIVE_WAL_V5_LIMITS,
+            MAX_WAL_FILE_SIZE,
+        )?;
+        assert_eq!(recovered.active_boundary.ticket_end, 2);
+        assert_eq!(replayed_batches(&path, &recovered)?, [batch(10), batch(20)]);
         Ok(())
     }
 }
