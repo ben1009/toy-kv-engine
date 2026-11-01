@@ -2166,30 +2166,7 @@ impl Wal {
         let previous_ticket_end = self.next_ticket.load(Ordering::Acquire);
 
         match writer.append_batch(batch, limits) {
-            Ok(commit) => {
-                let ticket_end = commit
-                    .ticket
-                    .checked_add(1)
-                    .context("v8 WAL ticket end overflows")?;
-                let append_offset = commit
-                    .frontier_offset
-                    .checked_add(u64::try_from(v8::codec::WAL_V8_FRAME_LEN)?)
-                    .context("v8 WAL append offset overflows")?;
-                if commit.ticket != previous_ticket_end {
-                    self.poisoned.store(true, Ordering::Release);
-                    anyhow::bail!("v8 Leader ticket disagrees with the WAL completion cursor");
-                }
-
-                self.alloc_offset.store(append_offset, Ordering::Release);
-                self.preallocated_size
-                    .store(append_offset, Ordering::Release);
-                *self.pitr_reserved_end.lock() = append_offset;
-                self.completion_state
-                    .durable_ticket
-                    .store(ticket_end, Ordering::Release);
-                self.next_ticket.store(ticket_end, Ordering::Release);
-                Ok(commit.ticket)
-            }
+            Ok(commit) => self.publish_v8_leader_commit(previous_ticket_end, commit),
             Err(error) => {
                 if writer.is_poisoned() {
                     self.poisoned.store(true, Ordering::Release);
@@ -2202,6 +2179,89 @@ impl Wal {
                 Err(error)
             }
         }
+    }
+
+    pub(crate) fn preflight_v8_leader_batch<'a>(
+        &self,
+        batch: &'a crate::pitr::WalBatch,
+        limits: crate::pitr::WalV5Limits,
+    ) -> Result<v8::leader::WalV8PreparedBatch<'a>> {
+        ensure!(
+            self.format_version == WAL_FORMAT_VERSION_V8,
+            "v8 batch preflight selected for format {}",
+            self.format_version
+        );
+        let writer = self
+            .v8_leader
+            .as_ref()
+            .context("v8 WAL has no recovered Active writer")?;
+        writer.lock().preflight_batch(batch, limits)
+    }
+
+    pub(crate) fn put_v8_prepared_leader_batch(
+        &self,
+        prepared: v8::leader::WalV8PreparedBatch<'_>,
+        commit_ts: u64,
+        recorded_at: crate::pitr::RecordedAt,
+    ) -> Result<u64> {
+        ensure!(
+            !self.poisoned.load(Ordering::Acquire),
+            "WAL is poisoned due to a previous I/O error"
+        );
+        let writer = self
+            .v8_leader
+            .as_ref()
+            .context("v8 WAL has no recovered Active writer")?;
+        let mut writer = writer.lock();
+        ensure!(
+            !self.poisoned.load(Ordering::Acquire),
+            "WAL is poisoned due to a previous I/O error"
+        );
+        let previous_ticket_end = self.next_ticket.load(Ordering::Acquire);
+
+        match writer.append_prepared_batch(prepared, commit_ts, recorded_at) {
+            Ok(commit) => self.publish_v8_leader_commit(previous_ticket_end, commit),
+            Err(error) => {
+                if writer.is_poisoned() {
+                    self.poisoned.store(true, Ordering::Release);
+                }
+                if error.downcast_ref::<v8::leader::WalV8LeaderCapacityError>()
+                    == Some(&v8::leader::WalV8LeaderCapacityError::RotationRequired)
+                {
+                    self.pitr_rotation_needed.store(true, Ordering::Release);
+                }
+                Err(error)
+            }
+        }
+    }
+
+    fn publish_v8_leader_commit(
+        &self,
+        previous_ticket_end: u64,
+        commit: v8::leader::WalV8LeaderCommit,
+    ) -> Result<u64> {
+        let ticket_end = commit
+            .ticket
+            .checked_add(1)
+            .context("v8 WAL ticket end overflows")?;
+        let append_offset = commit
+            .frontier_offset
+            .checked_add(u64::try_from(v8::codec::WAL_V8_FRAME_LEN)?)
+            .context("v8 WAL append offset overflows")?;
+        if commit.ticket != previous_ticket_end {
+            self.poisoned.store(true, Ordering::Release);
+            anyhow::bail!("v8 Leader ticket disagrees with the WAL completion cursor");
+        }
+
+        self.alloc_offset.store(append_offset, Ordering::Release);
+        self.preallocated_size
+            .store(append_offset, Ordering::Release);
+        *self.pitr_reserved_end.lock() = append_offset;
+        self.completion_state
+            .durable_ticket
+            .store(ticket_end, Ordering::Release);
+        self.next_ticket.store(ticket_end, Ordering::Release);
+        Ok(commit.ticket)
     }
 
     fn publish_v7_durable_cursor(&self, ticket_end: u64, append_offset: u64) -> Result<()> {

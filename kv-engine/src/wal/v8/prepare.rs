@@ -69,6 +69,7 @@ pub(crate) struct PreparedWalV8Batch<'a, R> {
     commit_ts: u64,
     recorded_at: RecordedAt,
     logical_batch_bytes: usize,
+    preparation_buffer_bytes: u64,
     fragment_count: u32,
     frame_buffer_bytes: usize,
     preparation_reservation: R,
@@ -111,6 +112,7 @@ impl<'a, R> PreparedWalV8Batch<'a, R> {
             commit_ts: batch.commit_ts,
             recorded_at: batch.recorded_at,
             logical_batch_bytes,
+            preparation_buffer_bytes: preparation_bytes,
             fragment_count,
             frame_buffer_bytes,
             preparation_reservation,
@@ -119,6 +121,10 @@ impl<'a, R> PreparedWalV8Batch<'a, R> {
 
     pub(crate) fn logical_batch_bytes(&self) -> usize {
         self.logical_batch_bytes
+    }
+
+    pub(crate) fn preparation_index_bytes(&self) -> u64 {
+        self.preparation_buffer_bytes
     }
 
     pub(crate) fn fragment_count(&self) -> u32 {

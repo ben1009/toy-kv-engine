@@ -2299,6 +2299,46 @@ impl MemTable {
         Ok((Some(ticket), frame_job))
     }
 
+    /// Preflight a v8 batch before entering the MVCC commit sequencer.
+    pub(crate) fn prepare_v8_pitr_wal_batch<'a>(
+        &self,
+        batch: &'a crate::pitr::WalBatch,
+        limits: crate::pitr::WalV5Limits,
+    ) -> Result<crate::wal::v8::leader::WalV8PreparedBatch<'a>> {
+        let wal = self
+            .wal
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("PITR WAL is not configured"))?;
+        anyhow::ensure!(wal.is_v8(), "prepared v8 batch requires a v8 WAL");
+        wal.preflight_v8_leader_batch(batch, limits)
+    }
+
+    /// Admit a preflighted v8 batch with sequencer-allocated metadata and wait
+    /// for its embedded FRONTIER and WAL sync before returning.
+    pub(crate) fn admit_prepared_v8_pitr_wal_batch_only(
+        &self,
+        prepared: crate::wal::v8::leader::WalV8PreparedBatch<'_>,
+        commit_ts: u64,
+        recorded_at: crate::pitr::RecordedAt,
+    ) -> Result<Option<u64>> {
+        let wal = self
+            .wal
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("PITR WAL is not configured"))?;
+        anyhow::ensure!(wal.is_v8(), "prepared v8 batch requires a v8 WAL");
+        #[cfg(feature = "bench")]
+        let started = Instant::now();
+        let ticket = wal.put_v8_prepared_leader_batch(prepared, commit_ts, recorded_at)?;
+        self.last_ticket
+            .fetch_max(ticket + 1, std::sync::atomic::Ordering::Release);
+        #[cfg(feature = "bench")]
+        self.write_profile.load().wal_write_ns.fetch_add(
+            started.elapsed().as_nanos() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        Ok(Some(ticket))
+    }
+
     /// Prepare a v7 Parallel point batch before entering the MVCC sequencer.
     pub(crate) fn prepare_v7_pitr_wal_batch(
         &self,

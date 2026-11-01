@@ -25,7 +25,10 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     pitr::{LIVE_WAL_V5_LIMITS, WalBatch, WalV5Limits},
-    wal::{DirectBuf, MAX_WAL_FILE_SIZE, v7::admission::WalV7OwnedBatchReservation},
+    wal::{
+        DirectBuf, MAX_WAL_FILE_SIZE,
+        v7::admission::{WalV7OwnedBatchReservation, WalV7OwnedPreparationReservation},
+    },
 };
 
 use super::{
@@ -50,6 +53,13 @@ use super::{
 const FRAME_LEN_U64: u64 = WAL_V8_FRAME_LEN as u64;
 const HEADER_LEN_U64: u64 = WAL_V8_HEADER_LEN as u64;
 const MAX_GROUP_TICKETS: usize = 8;
+
+pub(crate) type WalV8PreparedBatch<'a> = PreparedWalV8Batch<'a, WalV8PreflightReservation>;
+
+pub(crate) struct WalV8PreflightReservation {
+    _coordinator: WalV8PreparationReservation,
+    _source: Option<WalV7OwnedPreparationReservation>,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum WalV8LeaderCapacityError {
@@ -302,79 +312,122 @@ impl WalV8LeaderWriter {
             !batches.is_empty() && batches.len() <= MAX_GROUP_TICKETS,
             "v8 Leader group size is outside its bounded ticket window"
         );
-        let limits = bounded_limits(limits);
-        // Declare resource guards before the allocations they cover, so the
-        // buffers and canonical indexes are dropped first even on unwind.
-        let mut preparation_resources = Vec::new();
-        preparation_resources
-            .try_reserve_exact(batches.len())
-            .context("reserve v8 preparation resource guards")?;
-        let mut batch_resources = Vec::new();
-        batch_resources
-            .try_reserve_exact(batches.len())
-            .context("reserve v8 batch resource guards")?;
         let mut prepared_batches = Vec::new();
         prepared_batches
             .try_reserve_exact(batches.len())
             .context("reserve v8 preflighted group")?;
+        let mut metadata = Vec::new();
+        metadata
+            .try_reserve_exact(batches.len())
+            .context("reserve v8 group metadata")?;
+        for batch in batches {
+            prepared_batches.push(self.preflight_batch(batch, limits)?);
+            metadata.push((batch.commit_ts, batch.recorded_at));
+        }
+        self.append_prepared_group(prepared_batches, &metadata)
+    }
+
+    /// Preflight canonical operation sizes and reserve preparation memory
+    /// before the caller enters the MVCC commit sequencer.
+    pub(crate) fn preflight_batch<'a>(
+        &self,
+        batch: &'a WalBatch,
+        limits: WalV5Limits,
+    ) -> Result<WalV8PreparedBatch<'a>> {
+        ensure!(!self.is_poisoned(), "v8 Leader WAL is poisoned");
+        let limits = bounded_limits(limits);
+        WalV8PreparedBatch::preflight(batch, limits, |bytes| {
+            ensure!(
+                bytes <= self.max_file_size,
+                WalV8LeaderCapacityError::GroupExceedsAdmissionWindow
+            );
+            let source = self
+                .reservation_owner
+                .as_ref()
+                .map(|owner| owner.reserve_preparation_buffer(bytes))
+                .transpose()?
+                .flatten();
+            let coordinator = self.coordinator.reserve_preparation(bytes)?;
+            Ok(WalV8PreflightReservation {
+                _coordinator: coordinator,
+                _source: source,
+            })
+        })
+    }
+
+    /// Admit a preflighted ticket with sequencer-owned MVCC metadata.
+    pub(crate) fn append_prepared_batch(
+        &mut self,
+        prepared: WalV8PreparedBatch<'_>,
+        commit_ts: u64,
+        recorded_at: crate::pitr::RecordedAt,
+    ) -> Result<WalV8LeaderCommit> {
+        let mut commits =
+            self.append_prepared_group(vec![prepared], &[(commit_ts, recorded_at)])?;
+        commits
+            .commits
+            .pop()
+            .context("v8 one-ticket group returned no commit")
+    }
+
+    fn append_prepared_group<'a>(
+        &mut self,
+        mut prepared_batches: Vec<WalV8PreparedBatch<'a>>,
+        metadata: &[(u64, crate::pitr::RecordedAt)],
+    ) -> Result<WalV8LeaderCommitGroup> {
+        ensure!(!self.is_poisoned(), "v8 Leader WAL is poisoned");
+        ensure!(
+            !prepared_batches.is_empty()
+                && prepared_batches.len() <= MAX_GROUP_TICKETS
+                && prepared_batches.len() == metadata.len(),
+            "v8 preflighted group size is outside its bounded ticket window"
+        );
+        let mut batch_resources = Vec::new();
+        batch_resources
+            .try_reserve_exact(prepared_batches.len())
+            .context("reserve v8 batch resource guards")?;
         let mut data_buffers = Vec::new();
         data_buffers
-            .try_reserve_exact(batches.len())
+            .try_reserve_exact(prepared_batches.len())
             .context("reserve v8 producer frame buffers")?;
         let mut write_handles = Vec::new();
         write_handles
-            .try_reserve_exact(batches.len())
+            .try_reserve_exact(prepared_batches.len())
             .context("reserve v8 producer write handles")?;
         let mut admitted_batches = Vec::new();
         admitted_batches
-            .try_reserve_exact(batches.len())
+            .try_reserve_exact(prepared_batches.len())
             .context("reserve v8 admitted group")?;
         let mut producer_completions = Vec::new();
         producer_completions
-            .try_reserve_exact(batches.len())
+            .try_reserve_exact(prepared_batches.len())
             .context("reserve v8 producer completions")?;
         let mut commits = Vec::new();
         commits
-            .try_reserve_exact(batches.len())
+            .try_reserve_exact(prepared_batches.len())
             .context("reserve v8 durable commit results")?;
 
-        let mut preparation_index_bytes = 0_u64;
-        for batch in batches {
-            let prepared = PreparedWalV8Batch::<WalV8PreparationReservation>::preflight(
-                batch,
-                limits,
-                |bytes| {
-                    preparation_index_bytes = preparation_index_bytes
-                        .checked_add(bytes)
-                        .context("v8 group preparation index reservation overflows")?;
-                    ensure!(
-                        preparation_index_bytes <= self.max_file_size,
-                        WalV8LeaderCapacityError::GroupExceedsAdmissionWindow
-                    );
-                    let resource = self
-                        .reservation_owner
-                        .as_ref()
-                        .map(|owner| owner.reserve_preparation_buffer(bytes))
-                        .transpose()?
-                        .flatten();
-                    let reservation = self.coordinator.reserve_preparation(bytes)?;
-                    preparation_resources.push(resource);
-                    Ok(reservation)
-                },
-            )?;
-            prepared_batches.push(prepared);
-        }
+        let preparation_index_bytes =
+            prepared_batches.iter().try_fold(0_u64, |total, prepared| {
+                total
+                    .checked_add(prepared.preparation_index_bytes())
+                    .context("v8 group preparation index reservation overflows")
+            })?;
+        ensure!(
+            preparation_index_bytes <= self.max_file_size,
+            WalV8LeaderCapacityError::GroupExceedsAdmissionWindow
+        );
         let mut previous_commit_ts = self.frontier.last_commit_ts;
         let mut frontier_offset = self.coordinator.last_frontier_end();
-        for (batch, prepared) in batches.iter().zip(&prepared_batches) {
+        for ((commit_ts, _), prepared) in metadata.iter().zip(&prepared_batches) {
             ensure!(
-                batch.commit_ts > previous_commit_ts,
+                *commit_ts > previous_commit_ts,
                 "v8 Leader group commit timestamps do not advance"
             );
             frontier_offset = frontier_offset
                 .checked_add(u64::try_from(prepared.frame_buffer_bytes())?)
                 .context("v8 group DATA allocation end overflows")?;
-            previous_commit_ts = batch.commit_ts;
+            previous_commit_ts = *commit_ts;
         }
         let group_marker_bytes = u64::try_from(prepared_batches.len())?
             .checked_mul(FRAME_LEN_U64)
@@ -470,18 +523,18 @@ impl WalV8LeaderWriter {
             self.coordinator.admitted_window().is_empty(),
             "serial v8 protocol writer has unresolved tickets"
         );
-        for ((prepared, reservation), batch) in prepared_batches
-            .into_iter()
+        for ((prepared, reservation), (commit_ts, recorded_at)) in prepared_batches
+            .drain(..)
             .zip(&mut batch_resources)
-            .zip(batches)
+            .zip(metadata.iter().copied())
         {
             let publisher = WalV8LeaderAdmissionPublisher {
                 coordinator: &self.coordinator,
                 reservation: RefCell::new(reservation),
             };
             admitted_batches.push(prepared.admit_with_metadata(
-                batch.commit_ts,
-                batch.recorded_at,
+                commit_ts,
+                recorded_at,
                 &publisher,
             )?);
         }
@@ -1151,6 +1204,39 @@ mod tests {
         assert!(recovered.selection.batches.is_empty());
         assert_eq!(recovered.replay_tickets.len(), 1);
         assert_eq!(replayed_batches(&path, &recovered)?, [batch(10)]);
+        Ok(())
+    }
+
+    #[test]
+    fn preflighted_batch_uses_sequencer_metadata_at_admission() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("active-v8.wal");
+        let header = header();
+        let installed = install_empty(&path, header)?;
+        let mut writer = open_writer(&path, &installed)?;
+        let input = batch(10);
+        let prepared = writer.preflight_batch(&input, LIVE_WAL_V5_LIMITS)?;
+        let recorded_at = RecordedAt {
+            secs: 55,
+            nanos: 123,
+        };
+
+        let commit = writer.append_prepared_batch(prepared, 20, recorded_at)?;
+        assert_eq!(commit.ticket, 0);
+        assert_eq!(commit.frontier.last_commit_ts, 20);
+
+        let recovered = super::super::install::recover_and_install_active(
+            &path,
+            &[boundary_for(header, commit.frontier)],
+            header.predecessor,
+            LIVE_WAL_V5_LIMITS,
+            MAX_WAL_FILE_SIZE,
+        )?;
+        let batches = replayed_batches(&path, &recovered)?;
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].commit_ts, 20);
+        assert_eq!(batches[0].recorded_at, recorded_at);
+        assert_eq!(batches[0].entries, input.entries);
         Ok(())
     }
 

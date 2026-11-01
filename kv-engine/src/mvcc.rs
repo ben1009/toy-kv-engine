@@ -1227,38 +1227,51 @@ impl LsmMvccInner {
             } else {
                 None
             };
-        let v7_wal_batch = v7_sampled_recorded_at.map(|recorded_at| crate::pitr::WalBatch {
-            // Canonical entry preparation does not depend on the commit
-            // timestamp. The actual timestamp is substituted at admission.
-            commit_ts: 1,
-            recorded_at,
-            entries: entries
-                .iter()
-                .map(|(key, value, kind)| match kind {
-                    BatchEntryKind::Delete => {
-                        crate::pitr::WalEntry::PointDelete { key: key.to_vec() }
-                    }
-                    BatchEntryKind::PutPrefixed => crate::pitr::WalEntry::Put {
-                        key: key.to_vec(),
-                        value: value.to_vec(),
-                    },
-                    BatchEntryKind::PutRaw => {
-                        let mut prefixed = Vec::with_capacity(1 + value.len());
-                        prefixed.push(crate::vlog::KvKind::Inline as u8);
-                        prefixed.extend_from_slice(value);
-                        crate::pitr::WalEntry::Put {
-                            key: key.to_vec(),
-                            value: prefixed,
+        let prepare_v8 = memtable.uses_v8_wal();
+        let preparation_batch = if v7_sampled_recorded_at.is_some() || prepare_v8 {
+            Some(crate::pitr::WalBatch {
+                // Canonical entry preparation does not depend on these
+                // sequencer-owned values. V7 substitutes its pre-sampled time;
+                // v8 substitutes both values after entering the sequencer.
+                commit_ts: 1,
+                recorded_at: v7_sampled_recorded_at
+                    .unwrap_or(crate::pitr::RecordedAt { secs: 0, nanos: 0 }),
+                entries: entries
+                    .iter()
+                    .map(|(key, value, kind)| match kind {
+                        BatchEntryKind::Delete => {
+                            crate::pitr::WalEntry::PointDelete { key: key.to_vec() }
                         }
-                    }
-                })
-                .collect(),
-        });
-        let prepared_v7 = match v7_wal_batch.as_ref() {
-            Some(batch) => {
+                        BatchEntryKind::PutPrefixed => crate::pitr::WalEntry::Put {
+                            key: key.to_vec(),
+                            value: value.to_vec(),
+                        },
+                        BatchEntryKind::PutRaw => {
+                            let mut prefixed = Vec::with_capacity(1 + value.len());
+                            prefixed.push(crate::vlog::KvKind::Inline as u8);
+                            prefixed.extend_from_slice(value);
+                            crate::pitr::WalEntry::Put {
+                                key: key.to_vec(),
+                                value: prefixed,
+                            }
+                        }
+                    })
+                    .collect(),
+            })
+        } else {
+            None
+        };
+        let prepared_v7 = match (v7_sampled_recorded_at, preparation_batch.as_ref()) {
+            (Some(_), Some(batch)) => {
                 Some(memtable.prepare_v7_pitr_wal_batch(batch, crate::pitr::LIVE_WAL_V5_LIMITS)?)
             }
-            None => None,
+            _ => None,
+        };
+        let prepared_v8 = match (prepare_v8, preparation_batch.as_ref()) {
+            (true, Some(batch)) => {
+                Some(memtable.prepare_v8_pitr_wal_batch(batch, crate::pitr::LIVE_WAL_V5_LIMITS)?)
+            }
+            _ => None,
         };
 
         let _write_guard = write_guard.unwrap_or_else(|| self.write_lock.lock());
@@ -1288,9 +1301,14 @@ impl LsmMvccInner {
             })
             .collect();
         if memtable.uses_pitr_batch_wal() {
-            let ticket_result = if let Some(prepared) = prepared_v7 {
-                let recorded_at =
-                    v7_sampled_recorded_at.expect("prepared v7 batch has a sampled recorded time");
+            let ticket_result = if let Some(prepared) = prepared_v8 {
+                let recorded_at = self.pitr_recorded_at_for_commit(commit_ts)?;
+                memtable
+                    .admit_prepared_v8_pitr_wal_batch_only(prepared, commit_ts, recorded_at)
+                    .map(|ticket| (ticket, None))
+            } else if let Some(prepared) = prepared_v7 {
+                let recorded_at = v7_sampled_recorded_at
+                    .expect("prepared v7 batch has a preflighted recorded time");
                 memtable.admit_prepared_v7_pitr_wal_batch_only(prepared, commit_ts, recorded_at)
             } else {
                 let recorded_at = self.pitr_recorded_at_for_commit(commit_ts)?;
