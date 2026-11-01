@@ -275,6 +275,8 @@ impl WalV8FrameJob<'_> {
             );
         }
         write_result.context("write v8 Parallel DATA frames")?;
+        #[cfg(feature = "chaos-testing")]
+        crate::chaos::failpoint::wal_crash_point("wal_v8.parallel.after_data_write");
         // The admission reservation accounts for this buffer until DATA
         // completion is published. Drop it before notifying the coordinator,
         // which may retire that reservation as soon as the frontier syncs.
@@ -1304,6 +1306,8 @@ impl WalV8ParallelWriter {
                 reservation.frame_offset,
             )
             .context("write v8 Parallel FRONTIER")?;
+            #[cfg(feature = "chaos-testing")]
+            crate::chaos::failpoint::wal_crash_point("wal_v8.parallel.after_frontier_write");
             #[cfg(feature = "bench")]
             if let (Some(profile), Some(started)) = (&profile, frontier_write_started) {
                 let data_bytes = ready.iter().fold(0_u64, |total, progress| {
@@ -1353,9 +1357,13 @@ impl WalV8ParallelWriter {
                 }
             }
             sync_result.context("fdatasync v8 Parallel WAL")?;
+            #[cfg(feature = "chaos-testing")]
+            crate::chaos::failpoint::wal_crash_point("wal_v8.parallel.after_fdatasync");
 
             self.retire_frontier_resources(first_ticket, frontier_ticket_end)?;
             self.coordinator.publish_durable_frontier(reservation)?;
+            #[cfg(feature = "chaos-testing")]
+            crate::chaos::failpoint::wal_crash_point("wal_v8.parallel.after_durable_publish");
             self.retire_frontier_guards(first_ticket, frontier_ticket_end)?;
             previous.frontier = frontier;
             previous.offset = reservation.frame_offset;
@@ -1622,6 +1630,12 @@ mod tests {
         time::{Duration, Instant},
     };
 
+    #[cfg(feature = "chaos-testing")]
+    use std::{
+        os::unix::process::ExitStatusExt,
+        process::{Command, Stdio},
+    };
+
     use anyhow::Result;
 
     use super::*;
@@ -1742,6 +1756,128 @@ mod tests {
         parallel.wait_durable(1)?;
         assert_one_two_ticket_profile(&parallel_profile);
 
+        Ok(())
+    }
+
+    #[cfg(feature = "chaos-testing")]
+    #[test]
+    fn failpoint_parallel_writer_crashes_at_durability_boundaries() -> Result<()> {
+        const CHILD_WAL_ENV: &str = "TOY_KV_V8_PARALLEL_CRASH_CHILD_WAL";
+        const CHILD_ACK_ENV: &str = "TOY_KV_V8_PARALLEL_CRASH_CHILD_ACK";
+        const TEST_NAME: &str =
+            "wal::v8::leader::tests::failpoint_parallel_writer_crashes_at_durability_boundaries";
+        const CRASH_POINTS: [(&str, u64, u64); 4] = [
+            ("wal_v8.parallel.after_data_write", 0, 0),
+            ("wal_v8.parallel.after_frontier_write", 0, 1),
+            ("wal_v8.parallel.after_fdatasync", 1, 1),
+            ("wal_v8.parallel.after_durable_publish", 1, 1),
+        ];
+
+        if let (Some(wal_path), Some(ack_path)) = (
+            std::env::var_os(CHILD_WAL_ENV),
+            std::env::var_os(CHILD_ACK_ENV),
+        ) {
+            let wal_path = Path::new(&wal_path);
+            let scratch_path = wal_path.with_extension("empty-fixture.wal");
+            let boundary = create_empty_active(&scratch_path, header())?;
+            std::fs::remove_file(&scratch_path)?;
+            let installed = super::super::install::recover_and_install_active(
+                wal_path,
+                &[boundary],
+                header().predecessor,
+                LIVE_WAL_V5_LIMITS,
+                MAX_WAL_FILE_SIZE,
+            )?;
+            let writer = open_writer(wal_path, &installed)?.into_parallel();
+            let value = batch(10);
+            writer.append_prepared_batch(
+                writer.preflight_batch(&value, LIVE_WAL_V5_LIMITS)?,
+                10,
+                value.recorded_at,
+            )?;
+            std::fs::write(ack_path, b"acknowledged")?;
+            anyhow::bail!("configured V8 writer crash point did not stop the child")
+        }
+
+        for (crash_point, expected_min_ticket_end, expected_max_ticket_end) in CRASH_POINTS {
+            let directory = tempfile::tempdir()?;
+            let wal_path = directory.path().join("active-v8.wal");
+            let ack_path = directory.path().join("acknowledged");
+            let marker_path = directory.path().join("crash.marker");
+            let anchor = create_empty_active(&wal_path, header())?;
+
+            let mut child = Command::new(std::env::current_exe()?);
+            child
+                .arg("--exact")
+                .arg(TEST_NAME)
+                .arg("--nocapture")
+                .env(CHILD_WAL_ENV, &wal_path)
+                .env(CHILD_ACK_ENV, &ack_path)
+                .env(
+                    crate::chaos::failpoint::PARALLEL_WAL_CRASH_POINT_ENV,
+                    crash_point,
+                )
+                .env(
+                    crate::chaos::failpoint::PARALLEL_WAL_CRASH_OCCURRENCE_ENV,
+                    "1",
+                )
+                .env(
+                    crate::chaos::failpoint::PARALLEL_WAL_CRASH_MARKER_ENV,
+                    &marker_path,
+                )
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            let mut child = child.spawn()?;
+            let deadline = Instant::now() + Duration::from_secs(30);
+            loop {
+                if marker_path.is_file() {
+                    break;
+                }
+                if let Some(status) = child.try_wait()? {
+                    anyhow::bail!("V8 writer child exited before reaching {crash_point}: {status}");
+                }
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    anyhow::bail!("V8 writer child did not reach {crash_point}");
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+
+            child.kill()?;
+            let status = child.wait()?;
+            ensure!(
+                status.signal() == Some(libc::SIGKILL),
+                "V8 writer child was not killed at {crash_point}: {status}"
+            );
+            assert_eq!(std::fs::read_to_string(&marker_path)?.trim(), crash_point);
+            assert!(!ack_path.exists(), "crashed V8 write was acknowledged");
+
+            let recovered = super::super::install::recover_and_install_active(
+                &wal_path,
+                &[anchor],
+                header().predecessor,
+                LIVE_WAL_V5_LIMITS,
+                MAX_WAL_FILE_SIZE,
+            )?;
+            assert!(
+                (expected_min_ticket_end..=expected_max_ticket_end)
+                    .contains(&recovered.active_boundary.ticket_end),
+                "recovered ticket end {} is outside the permitted range for {crash_point}",
+                recovered.active_boundary.ticket_end,
+            );
+            let batches = replayed_batches(&wal_path, &recovered)?;
+            assert_eq!(
+                batches.len() as u64,
+                recovered.active_boundary.ticket_end,
+                "replay count differs from recovered boundary at {crash_point}"
+            );
+            if recovered.active_boundary.ticket_end == 1 {
+                assert_eq!(batches, [batch(10)]);
+            } else {
+                assert!(batches.is_empty());
+            }
+        }
         Ok(())
     }
 
