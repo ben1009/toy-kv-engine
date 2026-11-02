@@ -1,0 +1,412 @@
+--- a/kv-engine/src/wal/parallel/worker.rs
++++ b/kv-engine/src/wal/parallel/worker.rs
+@@ -1550,6 +1550,51 @@
+     }
+ }
+ 
++/// Optional inline completion publication for runtimes that do not need a
++/// separate completion consumer. Methods run on the I/O worker and must not
++/// wait for I/O, submit work, or acquire a lock held across worker backpressure.
++pub(crate) trait IoWorkerCompletion: Send + 'static {
++    fn group_finished(&self, result: GroupWriteResult);
++    fn worker_stopped(&self);
++}
++
++trait CompletionTarget {
++    fn publish(&self, result: GroupWriteResult) -> bool;
++}
++
++impl CompletionTarget for Sender<GroupWriteResult> {
++    fn publish(&self, result: GroupWriteResult) -> bool {
++        self.send(result).is_ok()
++    }
++}
++
++enum WorkerCompletions {
++    Channel(Sender<GroupWriteResult>),
++    Inline(Box<dyn IoWorkerCompletion>),
++}
++
++impl CompletionTarget for WorkerCompletions {
++    fn publish(&self, result: GroupWriteResult) -> bool {
++        match self {
++            Self::Channel(sender) => sender.publish(result),
++            Self::Inline(handler) => {
++                handler.group_finished(result);
++                true
++            }
++        }
++    }
++}
++
++impl Drop for WorkerCompletions {
++    fn drop(&mut self) {
++        if let Self::Inline(handler) = self {
++            // Also runs on startup failure and unwinding, so the owning
++            // runtime never waits forever for a disappeared worker.
++            handler.worker_stopped();
++        }
++    }
++}
++
+ /// A handle to one dedicated WAL write thread. The thread creates and owns its
+ /// registered ring and retains the WAL file until it has reaped all CQEs.
+ pub(crate) struct IoWorker<B: WorkerBuffer = DirectBuf> {
+@@ -1591,9 +1636,36 @@
+         buffer_pool: Arc<ArrayQueue<B>>,
+         async_write_min_bytes: Option<usize>,
+     ) -> Result<Self> {
++        Self::spawn_inner(wal_file, buffer_pool, async_write_min_bytes, None)
++    }
++
++    pub(crate) fn spawn_with_completion_handler(
++        wal_file: Arc<File>,
++        buffer_pool: Arc<ArrayQueue<B>>,
++        async_write_min_bytes: Option<usize>,
++        handler: impl IoWorkerCompletion,
++    ) -> Result<Self> {
++        Self::spawn_inner(
++            wal_file,
++            buffer_pool,
++            async_write_min_bytes,
++            Some(Box::new(handler)),
++        )
++    }
++
++    fn spawn_inner(
++        wal_file: Arc<File>,
++        buffer_pool: Arc<ArrayQueue<B>>,
++        async_write_min_bytes: Option<usize>,
++        completion_handler: Option<Box<dyn IoWorkerCompletion>>,
++    ) -> Result<Self> {
+         let (command_tx, command_rx) = unbounded();
+         let (completion_tx, completion_rx) = unbounded::<GroupWriteResult>();
+         let failure_events = completion_tx.clone();
++        let completions = match completion_handler {
++            Some(handler) => WorkerCompletions::Inline(handler),
++            None => WorkerCompletions::Channel(completion_tx),
++        };
+         let (startup_tx, startup_rx) = bounded::<Result<()>>(1);
+         let slots = Arc::new(GroupSlots {
+             state: Mutex::new(SlotState {
+@@ -1648,7 +1720,7 @@
+                     &mut ring,
+                     buffer_pool,
+                     command_rx,
+-                    completion_tx,
++                    completions,
+                     worker_slots,
+                     &worker_wake,
+                     worker_sync_progress,
+@@ -1833,7 +1905,7 @@
+     ring: &mut io_uring::IoUring,
+     buffer_pool: Arc<ArrayQueue<B>>,
+     commands: Receiver<WorkerCommand<B>>,
+-    completions: Sender<GroupWriteResult>,
++    completions: WorkerCompletions,
+     slots: Arc<GroupSlots>,
+     wake: &WorkerWake,
+     sync_progress: Arc<WalSyncProgress>,
+@@ -1878,7 +1950,7 @@
+         let reason = format!("WAL I/O worker stopped: {error:#}");
+         fail_shutdown_reply(&mut shutdown_reply, &reason);
+         for result in core.failed_group_results(&reason) {
+-            let _ = completions.send(result);
++            completions.publish(result);
+         }
+         for command in commands.try_iter() {
+             match command {
+@@ -1886,7 +1958,7 @@
+                     let tickets = group.tickets.clone();
+                     drop(group);
+                     drop(permit);
+-                    let _ = completions.send(GroupWriteResult {
++                    completions.publish(GroupWriteResult {
+                         group_id: id.0,
+                         tickets,
+                         write_count: 0,
+@@ -1909,7 +1981,7 @@
+     ring: &mut io_uring::IoUring,
+     buffer_pool: &ArrayQueue<B>,
+     commands: &Receiver<WorkerCommand<B>>,
+-    completions: &Sender<GroupWriteResult>,
++    completions: &impl CompletionTarget,
+     slots: &GroupSlots,
+     wake: &WorkerWake,
+     sync_progress: &WalSyncProgress,
+@@ -2061,7 +2133,7 @@
+     permit: GroupPermit,
+     core: &mut WorkerCore<B>,
+     group_permits: &mut HashMap<GroupId, GroupPermit>,
+-    completions: &Sender<GroupWriteResult>,
++    completions: &impl CompletionTarget,
+ ) -> Result<()> {
+     let tickets = group.tickets.clone();
+     match core.enqueue(group) {
+@@ -2072,7 +2144,7 @@
+         Err(WorkerError::Poisoned) => {
+             let poison_ticket = core.poison_ticket.unwrap_or(tickets.start);
+             drop(permit);
+-            let _ = completions.send(GroupWriteResult {
++            completions.publish(GroupWriteResult {
+                 group_id: id.0,
+                 tickets,
+                 write_count: 0,
+@@ -2082,7 +2154,7 @@
+         }
+         Err(error) => {
+             drop(permit);
+-            let _ = completions.send(GroupWriteResult {
++            completions.publish(GroupWriteResult {
+                 group_id: id.0,
+                 tickets,
+                 write_count: 0,
+@@ -2229,7 +2301,7 @@
+     core: &mut WorkerCore<B>,
+     buffer_pool: &ArrayQueue<B>,
+     group_permits: &mut HashMap<GroupId, GroupPermit>,
+-    completion_tx: &Sender<GroupWriteResult>,
++    completion_tx: &impl CompletionTarget,
+     slots: &GroupSlots,
+     io_event: &WalIoEvent<'_>,
+ ) -> Result<()> {
+@@ -2268,7 +2340,7 @@
+     events: Vec<WorkerEvent<B>>,
+     buffer_pool: &ArrayQueue<B>,
+     group_permits: &mut HashMap<GroupId, GroupPermit>,
+-    completion_tx: &Sender<GroupWriteResult>,
++    completion_tx: &impl CompletionTarget,
+     io_event: &WalIoEvent<'_>,
+ ) {
+     for event in events {
+@@ -2283,11 +2355,11 @@
+                 io_event.record_group_completion(&result);
+                 group_permits.remove(&GroupId(result.group_id));
+                 #[cfg(all(test, feature = "chaos-testing"))]
+-                if completion_tx.send(result).is_ok() && injected_failure {
++                if completion_tx.publish(result) && injected_failure {
+                     crate::chaos::failpoint::note_parallel_wal_injected_group_failure();
+                 }
+                 #[cfg(not(all(test, feature = "chaos-testing")))]
+-                let _ = completion_tx.send(result);
++                completion_tx.publish(result);
+             }
+         }
+     }
+@@ -2343,10 +2415,10 @@
+     use super::SyncProgressSnapshot;
+     use super::{
+         DIRECT_IO_ALIGNMENT, DirectBuf, GroupId, GroupPermit, GroupSlots, GroupWriteResult,
+-        IoWorker, RequestId, SlotState, WalSyncProgress, WorkerCommand, WorkerCore, WorkerError,
+-        WorkerEvent, WorkerWake, WriteBuffer, WriteGroup, WriteGroupBuffers, close_group_admission,
+-        enqueue_group_command, fail_shutdown_reply, flush_staged_writes, process_completions,
+-        retry_interrupted, wait_for_worker_progress,
++        IoWorker, IoWorkerCompletion, RequestId, SlotState, WalSyncProgress, WorkerCommand,
++        WorkerCore, WorkerError, WorkerEvent, WorkerWake, WriteBuffer, WriteGroup,
++        WriteGroupBuffers, close_group_admission, enqueue_group_command, fail_shutdown_reply,
++        flush_staged_writes, process_completions, retry_interrupted, wait_for_worker_progress,
+     };
+     use crossbeam_queue::ArrayQueue;
+     use parking_lot::{Condvar, Mutex};
+@@ -2556,6 +2628,109 @@
+     #[test]
+     fn io_worker_writes_groups_through_its_owned_ring() {
+         check_io_worker_writes_groups(None);
++    }
++
++    struct InlineCompletionProbe {
++        events: std::sync::mpsc::Sender<(thread::ThreadId, Option<GroupWriteResult>)>,
++        panic_after_completion: bool,
++    }
++
++    impl IoWorkerCompletion for InlineCompletionProbe {
++        fn group_finished(&self, result: GroupWriteResult) {
++            self.events
++                .send((thread::current().id(), Some(result)))
++                .expect("observe inline group completion");
++            assert!(!self.panic_after_completion, "injected completion panic");
++        }
++
++        fn worker_stopped(&self) {
++            self.events
++                .send((thread::current().id(), None))
++                .expect("observe worker stopping");
++        }
++    }
++
++    fn check_inline_worker_completion(read_only: bool, panic_after_completion: bool) {
++        let base =
++            Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/wal-opt/inline-completion-tests");
++        std::fs::create_dir_all(&base).expect("create local test directory");
++        let directory = tempfile::tempdir_in(base).expect("create temporary directory");
++        let path = directory.path().join("wal");
++        File::create(&path)
++            .expect("create WAL file")
++            .set_len(4096)
++            .expect("size WAL file");
++        let file = File::options()
++            .read(true)
++            .write(!read_only)
++            .custom_flags(libc::O_DIRECT)
++            .open(&path)
++            .expect("open WAL handle");
++        let (events, observations) = std::sync::mpsc::channel();
++        let worker = match IoWorker::spawn_with_completion_handler(
++            Arc::new(file),
++            Arc::new(ArrayQueue::new(1)),
++            None,
++            InlineCompletionProbe {
++                events,
++                panic_after_completion,
++            },
++        ) {
++            Ok(worker) => worker,
++            Err(error) if io_uring_unavailable(&error) => {
++                eprintln!("skipping test (io_uring unavailable): {error:#}");
++                return;
++            }
++            Err(error) => panic!("failed to start WAL I/O worker: {error:#}"),
++        };
++        let mut buffer = DirectBuf::new(4096);
++        buffer.as_mut_slice().fill(0x53);
++        buffer.set_len(4096);
++        worker
++            .submit_group(
++                WriteGroup::new(0..1, vec![WriteBuffer::new(buffer, 0, 4096)])
++                    .expect("build group"),
++            )
++            .expect("submit group");
++        let (worker_thread, result) = observations
++            .recv_timeout(Duration::from_secs(5))
++            .expect("inline group result");
++        let result = result.expect("group completion precedes worker shutdown");
++        assert_ne!(worker_thread, thread::current().id());
++        assert_eq!(result.tickets, 0..1);
++        assert_eq!(result.error.is_some(), read_only);
++        assert_eq!(worker.slots.state.lock().active_groups, 0);
++        assert!(worker.completions().try_recv().is_err());
++        let closed = worker.close();
++        assert_eq!(closed.is_err(), panic_after_completion);
++        let (stopped_thread, result) = observations
++            .recv_timeout(Duration::from_secs(5))
++            .expect("worker stop notification");
++        assert_eq!(stopped_thread, worker_thread);
++        assert!(result.is_none());
++        assert!(observations.try_recv().is_err());
++        let expected = if read_only { 0 } else { 0x53 };
++        assert!(
++            std::fs::read(path)
++                .expect("read WAL contents")
++                .iter()
++                .all(|&byte| byte == expected)
++        );
++    }
++
++    #[test]
++    fn inline_worker_completion_publishes_after_permit_release_and_notifies_shutdown() {
++        check_inline_worker_completion(false, false);
++    }
++
++    #[test]
++    fn inline_worker_completion_reports_failed_writes_before_shutdown() {
++        check_inline_worker_completion(true, false);
++    }
++
++    #[test]
++    fn inline_worker_completion_notifies_runtime_when_worker_panics() {
++        check_inline_worker_completion(false, true);
+     }
+ 
+     #[test]
+--- a/kv-engine/src/wal/v8/leader.rs
++++ b/kv-engine/src/wal/v8/leader.rs
+@@ -36,7 +36,8 @@
+     wal::{
+         DirectBuf, MAX_WAL_FILE_SIZE,
+         parallel_worker::{
+-            GroupWriteResult, IoWorker, IoWorkerClient, WorkerBuffer, WriteBuffer, WriteGroup,
++            GroupWriteResult, IoWorker, IoWorkerClient, IoWorkerCompletion, WorkerBuffer,
++            WriteBuffer, WriteGroup,
+         },
+         v7::admission::{WalV7OwnedBatchReservation, WalV7OwnedPreparationReservation},
+     },
+@@ -231,7 +232,21 @@
+     group_join_micros: std::sync::atomic::AtomicU64,
+     coordinator: WalV8ParallelCoordinator,
+     progress: Arc<crate::wal::parallel_worker::WalSyncProgress>,
+-    completion_thread: Mutex<Option<thread::JoinHandle<()>>>,
++}
++
++struct WalV8CompletionPublisher(WalV8ParallelCoordinator);
++
++impl IoWorkerCompletion for WalV8CompletionPublisher {
++    fn group_finished(&self, result: GroupWriteResult) {
++        if let Err(error) = reap_v8_group_result(&self.0, result) {
++            log::error!("v8 WAL completion publication failed: {error:#}");
++            self.0.poison();
++        }
++    }
++
++    fn worker_stopped(&self) {
++        self.0.poison();
++    }
+ }
+ 
+ impl WalV8ParallelIo {
+@@ -240,10 +255,11 @@
+         coordinator: WalV8ParallelCoordinator,
+         first_ticket: u64,
+     ) -> Result<Arc<Self>> {
+-        let mut worker = IoWorker::spawn(
++        let worker = IoWorker::spawn_with_completion_handler(
+             Arc::new(worker_file),
+             Arc::new(ArrayQueue::<WalV8DataBuffer>::new(1)),
+             None,
++            WalV8CompletionPublisher(coordinator.clone()),
+         )?;
+         let client = worker.client();
+         let progress = worker.sync_progress();
+@@ -252,23 +268,6 @@
+         // worker still contributes SQE/CQE and eventfd metrics, but its DATA
+         // submission groups are not V8 durability groups.
+         progress.suppress_commit_group_metrics();
+-        let completions = worker.take_completions();
+-        let completion_coordinator = coordinator.clone();
+-        let completion_thread = thread::Builder::new()
+-            .name("wal-v8-completion-reaper".to_owned())
+-            .spawn(move || {
+-                while let Ok(result) = completions.recv() {
+-                    if let Err(error) = reap_v8_group_result(&completion_coordinator, result) {
+-                        log::error!("v8 WAL completion reaper failed: {error:#}");
+-                        completion_coordinator.poison();
+-                    }
+-                }
+-                // A worker that disappears without a normal group result must
+-                // wake every waiter rather than leave an admitted ticket stuck.
+-                completion_coordinator.poison();
+-            })
+-            .context("failed to spawn v8 WAL completion reaper")?;
+-
+         Ok(Arc::new(Self {
+             client,
+             worker: Mutex::new(Some(worker)),
+@@ -288,7 +287,6 @@
+             ),
+             coordinator,
+             progress,
+-            completion_thread: Mutex::new(Some(completion_thread)),
+         }))
+     }
+ 
+@@ -571,11 +569,6 @@
+             && let Err(error) = worker.close()
+         {
+             log::error!("failed to close v8 WAL I/O worker: {error:#}");
+-        }
+-        if let Some(completion_thread) = self.completion_thread.get_mut().take()
+-            && completion_thread.join().is_err()
+-        {
+-            log::error!("v8 WAL completion reaper panicked");
+         }
+     }
+ }

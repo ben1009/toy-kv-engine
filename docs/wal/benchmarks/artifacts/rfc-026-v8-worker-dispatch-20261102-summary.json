@@ -1,0 +1,905 @@
+[
+  {
+    "experiment": "inline",
+    "workload": "batch",
+    "threads": 1,
+    "arm": "baseline",
+    "format": "v8",
+    "eligible": 1,
+    "total": 3,
+    "best": {
+      "name": "00-cooled-guard-batch-1-baseline-v8",
+      "ops_s": 73720.72206158332,
+      "p99_ms": 1.326407,
+      "cpu_s": 5.6844660000000005
+    },
+    "median_ops_s": 73720.72206158332,
+    "median_p99_ms": 1.326407
+  },
+  {
+    "experiment": "inline",
+    "workload": "batch",
+    "threads": 1,
+    "arm": "inline",
+    "format": "v4",
+    "eligible": 1,
+    "total": 1,
+    "best": {
+      "name": "19-format-control-batch-1-inline-v4",
+      "ops_s": 79366.59206712843,
+      "p99_ms": 1.205122,
+      "cpu_s": 5.365062
+    },
+    "median_ops_s": 79366.59206712843,
+    "median_p99_ms": 1.205122
+  },
+  {
+    "experiment": "inline",
+    "workload": "batch",
+    "threads": 1,
+    "arm": "inline",
+    "format": "v7",
+    "eligible": 0,
+    "total": 1,
+    "best": null,
+    "median_ops_s": null,
+    "median_p99_ms": null
+  },
+  {
+    "experiment": "inline",
+    "workload": "batch",
+    "threads": 1,
+    "arm": "inline",
+    "format": "v8",
+    "eligible": 1,
+    "total": 3,
+    "best": {
+      "name": "01-cooled-guard-batch-1-inline-v8",
+      "ops_s": 71958.02400627617,
+      "p99_ms": 1.320075,
+      "cpu_s": 5.740315
+    },
+    "median_ops_s": 71958.02400627617,
+    "median_p99_ms": 1.320075
+  },
+  {
+    "experiment": "inline",
+    "workload": "batch",
+    "threads": 8,
+    "arm": "baseline",
+    "format": "v8",
+    "eligible": 2,
+    "total": 2,
+    "best": {
+      "name": "09-batch-r2-batch-8-baseline-v8",
+      "ops_s": 327763.0413790583,
+      "p99_ms": 2.81543,
+      "cpu_s": 8.198765999999999
+    },
+    "median_ops_s": 323290.1368621972,
+    "median_p99_ms": 3.3073685
+  },
+  {
+    "experiment": "inline",
+    "workload": "batch",
+    "threads": 8,
+    "arm": "inline",
+    "format": "v4",
+    "eligible": 1,
+    "total": 1,
+    "best": {
+      "name": "21-format-control-batch-8-inline-v4",
+      "ops_s": 377648.1536353012,
+      "p99_ms": 2.690807,
+      "cpu_s": 6.192409
+    },
+    "median_ops_s": 377648.1536353012,
+    "median_p99_ms": 2.690807
+  },
+  {
+    "experiment": "inline",
+    "workload": "batch",
+    "threads": 8,
+    "arm": "inline",
+    "format": "v7",
+    "eligible": 1,
+    "total": 1,
+    "best": {
+      "name": "20-format-control-batch-8-inline-v7",
+      "ops_s": 351321.20249764004,
+      "p99_ms": 2.82531,
+      "cpu_s": 5.306978
+    },
+    "median_ops_s": 351321.20249764004,
+    "median_p99_ms": 2.82531
+  },
+  {
+    "experiment": "inline",
+    "workload": "batch",
+    "threads": 8,
+    "arm": "inline",
+    "format": "v8",
+    "eligible": 2,
+    "total": 2,
+    "best": {
+      "name": "03-batch-r1-batch-8-inline-v8",
+      "ops_s": 332712.5046645129,
+      "p99_ms": 2.683437,
+      "cpu_s": 7.73795
+    },
+    "median_ops_s": 328230.73333677044,
+    "median_p99_ms": 2.8594345
+  },
+  {
+    "experiment": "inline",
+    "workload": "batch",
+    "threads": 16,
+    "arm": "baseline",
+    "format": "v8",
+    "eligible": 2,
+    "total": 2,
+    "best": {
+      "name": "04-batch-r1-batch-16-baseline-v8",
+      "ops_s": 440634.17951154464,
+      "p99_ms": 4.898659,
+      "cpu_s": 10.337394
+    },
+    "median_ops_s": 434043.99258218973,
+    "median_p99_ms": 4.8758385
+  },
+  {
+    "experiment": "inline",
+    "workload": "batch",
+    "threads": 16,
+    "arm": "inline",
+    "format": "v4",
+    "eligible": 1,
+    "total": 1,
+    "best": {
+      "name": "23-format-control-batch-16-inline-v4",
+      "ops_s": 564613.980095546,
+      "p99_ms": 3.250132,
+      "cpu_s": 7.700634
+    },
+    "median_ops_s": 564613.980095546,
+    "median_p99_ms": 3.250132
+  },
+  {
+    "experiment": "inline",
+    "workload": "batch",
+    "threads": 16,
+    "arm": "inline",
+    "format": "v7",
+    "eligible": 1,
+    "total": 1,
+    "best": {
+      "name": "22-format-control-batch-16-inline-v7",
+      "ops_s": 540844.1445217358,
+      "p99_ms": 4.745946,
+      "cpu_s": 5.107995
+    },
+    "median_ops_s": 540844.1445217358,
+    "median_p99_ms": 4.745946
+  },
+  {
+    "experiment": "inline",
+    "workload": "batch",
+    "threads": 16,
+    "arm": "inline",
+    "format": "v8",
+    "eligible": 2,
+    "total": 2,
+    "best": {
+      "name": "05-batch-r1-batch-16-inline-v8",
+      "ops_s": 445352.0994700494,
+      "p99_ms": 4.883009,
+      "cpu_s": 10.364608
+    },
+    "median_ops_s": 439948.0186190228,
+    "median_p99_ms": 5.0017385
+  },
+  {
+    "experiment": "inline",
+    "workload": "point",
+    "threads": 1,
+    "arm": "baseline",
+    "format": "v8",
+    "eligible": 2,
+    "total": 2,
+    "best": {
+      "name": "06-cooled-guard-point-1-baseline-v8",
+      "ops_s": 1574.516878138223,
+      "p99_ms": 1.319065,
+      "cpu_s": 0.829203
+    },
+    "median_ops_s": 1130.9844228014344,
+    "median_p99_ms": 5.6327995
+  },
+  {
+    "experiment": "inline",
+    "workload": "point",
+    "threads": 1,
+    "arm": "inline",
+    "format": "v8",
+    "eligible": 2,
+    "total": 2,
+    "best": {
+      "name": "07-cooled-guard-point-1-inline-v8",
+      "ops_s": 1641.3083659701867,
+      "p99_ms": 1.244976,
+      "cpu_s": 0.6321659999999999
+    },
+    "median_ops_s": 1628.9463404906348,
+    "median_p99_ms": 1.2445785
+  },
+  {
+    "experiment": "inline",
+    "workload": "point",
+    "threads": 8,
+    "arm": "baseline",
+    "format": "v8",
+    "eligible": 1,
+    "total": 2,
+    "best": {
+      "name": "02-cooled-guard-point-8-baseline-v8",
+      "ops_s": 8771.049784358851,
+      "p99_ms": 1.735138,
+      "cpu_s": 4.384684999999999
+    },
+    "median_ops_s": 8771.049784358851,
+    "median_p99_ms": 1.735138
+  },
+  {
+    "experiment": "inline",
+    "workload": "point",
+    "threads": 8,
+    "arm": "inline",
+    "format": "v8",
+    "eligible": 1,
+    "total": 2,
+    "best": {
+      "name": "03-cooled-guard-point-8-inline-v8",
+      "ops_s": 8988.39864735009,
+      "p99_ms": 1.879712,
+      "cpu_s": 3.890029
+    },
+    "median_ops_s": 8988.39864735009,
+    "median_p99_ms": 1.879712
+  },
+  {
+    "experiment": "inline",
+    "workload": "point",
+    "threads": 16,
+    "arm": "baseline",
+    "format": "v8",
+    "eligible": 1,
+    "total": 2,
+    "best": {
+      "name": "05-cooled-guard-point-16-baseline-v8",
+      "ops_s": 8561.002694941582,
+      "p99_ms": 3.790873,
+      "cpu_s": 7.1790769999999995
+    },
+    "median_ops_s": 8561.002694941582,
+    "median_p99_ms": 3.790873
+  },
+  {
+    "experiment": "inline",
+    "workload": "point",
+    "threads": 16,
+    "arm": "inline",
+    "format": "v8",
+    "eligible": 1,
+    "total": 2,
+    "best": {
+      "name": "04-cooled-guard-point-16-inline-v8",
+      "ops_s": 8530.914062561393,
+      "p99_ms": 4.363127,
+      "cpu_s": 6.74903
+    },
+    "median_ops_s": 8530.914062561393,
+    "median_p99_ms": 4.363127
+  },
+  {
+    "experiment": "async",
+    "workload": "batch",
+    "threads": 1,
+    "arm": "async",
+    "format": "v8",
+    "eligible": 2,
+    "total": 2,
+    "best": {
+      "name": "06-async-r2-batch-1-async-v8",
+      "ops_s": 80027.24475690094,
+      "p99_ms": 1.385379,
+      "cpu_s": 4.472995
+    },
+    "median_ops_s": 77827.39698109002,
+    "median_p99_ms": 1.3268939999999998
+  },
+  {
+    "experiment": "async",
+    "workload": "batch",
+    "threads": 1,
+    "arm": "baseline",
+    "format": "v8",
+    "eligible": 2,
+    "total": 2,
+    "best": {
+      "name": "07-async-r2-batch-1-baseline-v8",
+      "ops_s": 81457.83028292232,
+      "p99_ms": 1.283716,
+      "cpu_s": 4.670230999999999
+    },
+    "median_ops_s": 77045.01485219342,
+    "median_p99_ms": 1.341979
+  },
+  {
+    "experiment": "async",
+    "workload": "batch",
+    "threads": 8,
+    "arm": "async",
+    "format": "v8",
+    "eligible": 2,
+    "total": 2,
+    "best": {
+      "name": "08-async-r2-batch-8-async-v8",
+      "ops_s": 305249.6475410525,
+      "p99_ms": 3.285439,
+      "cpu_s": 8.197974
+    },
+    "median_ops_s": 292364.28747020697,
+    "median_p99_ms": 3.2204300000000003
+  },
+  {
+    "experiment": "async",
+    "workload": "batch",
+    "threads": 8,
+    "arm": "baseline",
+    "format": "v8",
+    "eligible": 1,
+    "total": 2,
+    "best": {
+      "name": "02-async-r1-batch-8-baseline-v8",
+      "ops_s": 319949.3364065192,
+      "p99_ms": 2.35823,
+      "cpu_s": 8.602481
+    },
+    "median_ops_s": 319949.3364065192,
+    "median_p99_ms": 2.35823
+  },
+  {
+    "experiment": "async",
+    "workload": "batch",
+    "threads": 16,
+    "arm": "async",
+    "format": "v8",
+    "eligible": 1,
+    "total": 2,
+    "best": {
+      "name": "05-async-r1-batch-16-async-v8",
+      "ops_s": 405903.6075439725,
+      "p99_ms": 4.945423,
+      "cpu_s": 11.116278999999999
+    },
+    "median_ops_s": 405903.6075439725,
+    "median_p99_ms": 4.945423
+  },
+  {
+    "experiment": "async",
+    "workload": "batch",
+    "threads": 16,
+    "arm": "baseline",
+    "format": "v8",
+    "eligible": 1,
+    "total": 2,
+    "best": {
+      "name": "04-async-r1-batch-16-baseline-v8",
+      "ops_s": 447986.9759888353,
+      "p99_ms": 4.477168,
+      "cpu_s": 10.223137
+    },
+    "median_ops_s": 447986.9759888353,
+    "median_p99_ms": 4.477168
+  },
+  {
+    "experiment": "async",
+    "workload": "point",
+    "threads": 1,
+    "arm": "async",
+    "format": "v8",
+    "eligible": 1,
+    "total": 1,
+    "best": {
+      "name": "13-async-point-point-1-async-v8",
+      "ops_s": 1634.3415823643425,
+      "p99_ms": 1.238866,
+      "cpu_s": 0.7242829999999999
+    },
+    "median_ops_s": 1634.3415823643425,
+    "median_p99_ms": 1.238866
+  },
+  {
+    "experiment": "async",
+    "workload": "point",
+    "threads": 1,
+    "arm": "baseline",
+    "format": "v8",
+    "eligible": 0,
+    "total": 1,
+    "best": null,
+    "median_ops_s": null,
+    "median_p99_ms": null
+  },
+  {
+    "experiment": "async",
+    "workload": "point",
+    "threads": 8,
+    "arm": "async",
+    "format": "v8",
+    "eligible": 1,
+    "total": 1,
+    "best": {
+      "name": "14-async-point-point-8-async-v8",
+      "ops_s": 9568.592633310853,
+      "p99_ms": 1.565743,
+      "cpu_s": 4.055064
+    },
+    "median_ops_s": 9568.592633310853,
+    "median_p99_ms": 1.565743
+  },
+  {
+    "experiment": "async",
+    "workload": "point",
+    "threads": 8,
+    "arm": "baseline",
+    "format": "v8",
+    "eligible": 1,
+    "total": 1,
+    "best": {
+      "name": "15-async-point-point-8-baseline-v8",
+      "ops_s": 9503.729654594938,
+      "p99_ms": 1.522711,
+      "cpu_s": 4.005764
+    },
+    "median_ops_s": 9503.729654594938,
+    "median_p99_ms": 1.522711
+  },
+  {
+    "experiment": "async",
+    "workload": "point",
+    "threads": 16,
+    "arm": "async",
+    "format": "v8",
+    "eligible": 1,
+    "total": 1,
+    "best": {
+      "name": "17-async-point-point-16-async-v8",
+      "ops_s": 11554.066255928701,
+      "p99_ms": 3.509681,
+      "cpu_s": 5.4507010000000005
+    },
+    "median_ops_s": 11554.066255928701,
+    "median_p99_ms": 3.509681
+  },
+  {
+    "experiment": "async",
+    "workload": "point",
+    "threads": 16,
+    "arm": "baseline",
+    "format": "v8",
+    "eligible": 1,
+    "total": 1,
+    "best": {
+      "name": "16-async-point-point-16-baseline-v8",
+      "ops_s": 10162.73032294975,
+      "p99_ms": 3.534884,
+      "cpu_s": 6.189018
+    },
+    "median_ops_s": 10162.73032294975,
+    "median_p99_ms": 3.534884
+  },
+  {
+    "experiment": "combined",
+    "workload": "batch",
+    "threads": 1,
+    "arm": "async",
+    "format": "v8",
+    "eligible": 2,
+    "total": 2,
+    "best": {
+      "name": "06-async-r2-batch-1-async-v8",
+      "ops_s": 80027.24475690094,
+      "p99_ms": 1.385379,
+      "cpu_s": 4.472995
+    },
+    "median_ops_s": 77827.39698109002,
+    "median_p99_ms": 1.3268939999999998
+  },
+  {
+    "experiment": "combined",
+    "workload": "batch",
+    "threads": 1,
+    "arm": "baseline",
+    "format": "v8",
+    "eligible": 3,
+    "total": 5,
+    "best": {
+      "name": "07-async-r2-batch-1-baseline-v8",
+      "ops_s": 81457.83028292232,
+      "p99_ms": 1.283716,
+      "cpu_s": 4.670230999999999
+    },
+    "median_ops_s": 73720.72206158332,
+    "median_p99_ms": 1.326407
+  },
+  {
+    "experiment": "combined",
+    "workload": "batch",
+    "threads": 1,
+    "arm": "inline",
+    "format": "v4",
+    "eligible": 1,
+    "total": 1,
+    "best": {
+      "name": "19-format-control-batch-1-inline-v4",
+      "ops_s": 79366.59206712843,
+      "p99_ms": 1.205122,
+      "cpu_s": 5.365062
+    },
+    "median_ops_s": 79366.59206712843,
+    "median_p99_ms": 1.205122
+  },
+  {
+    "experiment": "combined",
+    "workload": "batch",
+    "threads": 1,
+    "arm": "inline",
+    "format": "v7",
+    "eligible": 0,
+    "total": 1,
+    "best": null,
+    "median_ops_s": null,
+    "median_p99_ms": null
+  },
+  {
+    "experiment": "combined",
+    "workload": "batch",
+    "threads": 1,
+    "arm": "inline",
+    "format": "v8",
+    "eligible": 1,
+    "total": 3,
+    "best": {
+      "name": "01-cooled-guard-batch-1-inline-v8",
+      "ops_s": 71958.02400627617,
+      "p99_ms": 1.320075,
+      "cpu_s": 5.740315
+    },
+    "median_ops_s": 71958.02400627617,
+    "median_p99_ms": 1.320075
+  },
+  {
+    "experiment": "combined",
+    "workload": "batch",
+    "threads": 8,
+    "arm": "async",
+    "format": "v8",
+    "eligible": 2,
+    "total": 2,
+    "best": {
+      "name": "08-async-r2-batch-8-async-v8",
+      "ops_s": 305249.6475410525,
+      "p99_ms": 3.285439,
+      "cpu_s": 8.197974
+    },
+    "median_ops_s": 292364.28747020697,
+    "median_p99_ms": 3.2204300000000003
+  },
+  {
+    "experiment": "combined",
+    "workload": "batch",
+    "threads": 8,
+    "arm": "baseline",
+    "format": "v8",
+    "eligible": 3,
+    "total": 4,
+    "best": {
+      "name": "09-batch-r2-batch-8-baseline-v8",
+      "ops_s": 327763.0413790583,
+      "p99_ms": 2.81543,
+      "cpu_s": 8.198765999999999
+    },
+    "median_ops_s": 319949.3364065192,
+    "median_p99_ms": 2.81543
+  },
+  {
+    "experiment": "combined",
+    "workload": "batch",
+    "threads": 8,
+    "arm": "inline",
+    "format": "v4",
+    "eligible": 1,
+    "total": 1,
+    "best": {
+      "name": "21-format-control-batch-8-inline-v4",
+      "ops_s": 377648.1536353012,
+      "p99_ms": 2.690807,
+      "cpu_s": 6.192409
+    },
+    "median_ops_s": 377648.1536353012,
+    "median_p99_ms": 2.690807
+  },
+  {
+    "experiment": "combined",
+    "workload": "batch",
+    "threads": 8,
+    "arm": "inline",
+    "format": "v7",
+    "eligible": 1,
+    "total": 1,
+    "best": {
+      "name": "20-format-control-batch-8-inline-v7",
+      "ops_s": 351321.20249764004,
+      "p99_ms": 2.82531,
+      "cpu_s": 5.306978
+    },
+    "median_ops_s": 351321.20249764004,
+    "median_p99_ms": 2.82531
+  },
+  {
+    "experiment": "combined",
+    "workload": "batch",
+    "threads": 8,
+    "arm": "inline",
+    "format": "v8",
+    "eligible": 2,
+    "total": 2,
+    "best": {
+      "name": "03-batch-r1-batch-8-inline-v8",
+      "ops_s": 332712.5046645129,
+      "p99_ms": 2.683437,
+      "cpu_s": 7.73795
+    },
+    "median_ops_s": 328230.73333677044,
+    "median_p99_ms": 2.8594345
+  },
+  {
+    "experiment": "combined",
+    "workload": "batch",
+    "threads": 16,
+    "arm": "async",
+    "format": "v8",
+    "eligible": 1,
+    "total": 2,
+    "best": {
+      "name": "05-async-r1-batch-16-async-v8",
+      "ops_s": 405903.6075439725,
+      "p99_ms": 4.945423,
+      "cpu_s": 11.116278999999999
+    },
+    "median_ops_s": 405903.6075439725,
+    "median_p99_ms": 4.945423
+  },
+  {
+    "experiment": "combined",
+    "workload": "batch",
+    "threads": 16,
+    "arm": "baseline",
+    "format": "v8",
+    "eligible": 3,
+    "total": 4,
+    "best": {
+      "name": "04-async-r1-batch-16-baseline-v8",
+      "ops_s": 447986.9759888353,
+      "p99_ms": 4.477168,
+      "cpu_s": 10.223137
+    },
+    "median_ops_s": 440634.17951154464,
+    "median_p99_ms": 4.853018
+  },
+  {
+    "experiment": "combined",
+    "workload": "batch",
+    "threads": 16,
+    "arm": "inline",
+    "format": "v4",
+    "eligible": 1,
+    "total": 1,
+    "best": {
+      "name": "23-format-control-batch-16-inline-v4",
+      "ops_s": 564613.980095546,
+      "p99_ms": 3.250132,
+      "cpu_s": 7.700634
+    },
+    "median_ops_s": 564613.980095546,
+    "median_p99_ms": 3.250132
+  },
+  {
+    "experiment": "combined",
+    "workload": "batch",
+    "threads": 16,
+    "arm": "inline",
+    "format": "v7",
+    "eligible": 1,
+    "total": 1,
+    "best": {
+      "name": "22-format-control-batch-16-inline-v7",
+      "ops_s": 540844.1445217358,
+      "p99_ms": 4.745946,
+      "cpu_s": 5.107995
+    },
+    "median_ops_s": 540844.1445217358,
+    "median_p99_ms": 4.745946
+  },
+  {
+    "experiment": "combined",
+    "workload": "batch",
+    "threads": 16,
+    "arm": "inline",
+    "format": "v8",
+    "eligible": 2,
+    "total": 2,
+    "best": {
+      "name": "05-batch-r1-batch-16-inline-v8",
+      "ops_s": 445352.0994700494,
+      "p99_ms": 4.883009,
+      "cpu_s": 10.364608
+    },
+    "median_ops_s": 439948.0186190228,
+    "median_p99_ms": 5.0017385
+  },
+  {
+    "experiment": "combined",
+    "workload": "point",
+    "threads": 1,
+    "arm": "async",
+    "format": "v8",
+    "eligible": 1,
+    "total": 1,
+    "best": {
+      "name": "13-async-point-point-1-async-v8",
+      "ops_s": 1634.3415823643425,
+      "p99_ms": 1.238866,
+      "cpu_s": 0.7242829999999999
+    },
+    "median_ops_s": 1634.3415823643425,
+    "median_p99_ms": 1.238866
+  },
+  {
+    "experiment": "combined",
+    "workload": "point",
+    "threads": 1,
+    "arm": "baseline",
+    "format": "v8",
+    "eligible": 2,
+    "total": 3,
+    "best": {
+      "name": "06-cooled-guard-point-1-baseline-v8",
+      "ops_s": 1574.516878138223,
+      "p99_ms": 1.319065,
+      "cpu_s": 0.829203
+    },
+    "median_ops_s": 1130.9844228014344,
+    "median_p99_ms": 5.6327995
+  },
+  {
+    "experiment": "combined",
+    "workload": "point",
+    "threads": 1,
+    "arm": "inline",
+    "format": "v8",
+    "eligible": 2,
+    "total": 2,
+    "best": {
+      "name": "07-cooled-guard-point-1-inline-v8",
+      "ops_s": 1641.3083659701867,
+      "p99_ms": 1.244976,
+      "cpu_s": 0.6321659999999999
+    },
+    "median_ops_s": 1628.9463404906348,
+    "median_p99_ms": 1.2445785
+  },
+  {
+    "experiment": "combined",
+    "workload": "point",
+    "threads": 8,
+    "arm": "async",
+    "format": "v8",
+    "eligible": 1,
+    "total": 1,
+    "best": {
+      "name": "14-async-point-point-8-async-v8",
+      "ops_s": 9568.592633310853,
+      "p99_ms": 1.565743,
+      "cpu_s": 4.055064
+    },
+    "median_ops_s": 9568.592633310853,
+    "median_p99_ms": 1.565743
+  },
+  {
+    "experiment": "combined",
+    "workload": "point",
+    "threads": 8,
+    "arm": "baseline",
+    "format": "v8",
+    "eligible": 2,
+    "total": 3,
+    "best": {
+      "name": "15-async-point-point-8-baseline-v8",
+      "ops_s": 9503.729654594938,
+      "p99_ms": 1.522711,
+      "cpu_s": 4.005764
+    },
+    "median_ops_s": 9137.389719476894,
+    "median_p99_ms": 1.6289245
+  },
+  {
+    "experiment": "combined",
+    "workload": "point",
+    "threads": 8,
+    "arm": "inline",
+    "format": "v8",
+    "eligible": 1,
+    "total": 2,
+    "best": {
+      "name": "03-cooled-guard-point-8-inline-v8",
+      "ops_s": 8988.39864735009,
+      "p99_ms": 1.879712,
+      "cpu_s": 3.890029
+    },
+    "median_ops_s": 8988.39864735009,
+    "median_p99_ms": 1.879712
+  },
+  {
+    "experiment": "combined",
+    "workload": "point",
+    "threads": 16,
+    "arm": "async",
+    "format": "v8",
+    "eligible": 1,
+    "total": 1,
+    "best": {
+      "name": "17-async-point-point-16-async-v8",
+      "ops_s": 11554.066255928701,
+      "p99_ms": 3.509681,
+      "cpu_s": 5.4507010000000005
+    },
+    "median_ops_s": 11554.066255928701,
+    "median_p99_ms": 3.509681
+  },
+  {
+    "experiment": "combined",
+    "workload": "point",
+    "threads": 16,
+    "arm": "baseline",
+    "format": "v8",
+    "eligible": 2,
+    "total": 3,
+    "best": {
+      "name": "16-async-point-point-16-baseline-v8",
+      "ops_s": 10162.73032294975,
+      "p99_ms": 3.534884,
+      "cpu_s": 6.189018
+    },
+    "median_ops_s": 9361.866508945666,
+    "median_p99_ms": 3.6628784999999997
+  },
+  {
+    "experiment": "combined",
+    "workload": "point",
+    "threads": 16,
+    "arm": "inline",
+    "format": "v8",
+    "eligible": 1,
+    "total": 2,
+    "best": {
+      "name": "04-cooled-guard-point-16-inline-v8",
+      "ops_s": 8530.914062561393,
+      "p99_ms": 4.363127,
+      "cpu_s": 6.74903
+    },
+    "median_ops_s": 8530.914062561393,
+    "median_p99_ms": 4.363127
+  }
+]

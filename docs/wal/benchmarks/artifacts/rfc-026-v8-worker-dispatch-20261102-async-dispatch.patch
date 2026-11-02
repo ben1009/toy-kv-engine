@@ -1,0 +1,21 @@
+--- a/kv-engine/src/wal/v8/leader.rs
++++ b/kv-engine/src/wal/v8/leader.rs
+@@ -68,6 +68,7 @@
+ // under contention; explicit Leader groups retain their separate smaller cap.
+ const MAX_PARALLEL_INFLIGHT_TICKETS: usize = 32;
+ const DATA_GROUP_JOIN_BUDGET: Duration = Duration::from_micros(10);
++const ASYNC_DATA_WRITE_MIN_BYTES: usize = 64 * 1024;
+ 
+ pub(crate) type WalV8PreparedBatch<'a> = PreparedWalV8Batch<'a, WalV8PreflightReservation>;
+ 
+@@ -243,7 +244,9 @@
+         let mut worker = IoWorker::spawn(
+             Arc::new(worker_file),
+             Arc::new(ArrayQueue::<WalV8DataBuffer>::new(1)),
+-            None,
++            // As on v7, keep large ext4 allocation/conversion work off the
++            // issuing thread. One-frame DATA retains ordinary dispatch.
++            Some(ASYNC_DATA_WRITE_MIN_BYTES),
+         )?;
+         let client = worker.client();
+         let progress = worker.sync_progress();
