@@ -1,0 +1,31 @@
+COOLDOWN 60s round 0 pair 0
+START 00-v8-writers
+{"name": "00-v8-writers", "puts_s": 96003, "p99_ms": 30.668, "cpu_s": 11.728, "syncs": 1699, "mean_sync_ms": 2.508, "stall_flag": true, "role_masks_validated": true, "context": {"involuntary": 523, "voluntary": 117092}}
+START 01-v8-kernel_only
+{"name": "01-v8-kernel_only", "puts_s": 219187, "p99_ms": 23.033, "cpu_s": 7.663, "syncs": 1120, "mean_sync_ms": 1.473, "stall_flag": true, "role_masks_validated": true, "context": {"involuntary": 442, "voluntary": 94128}}
+COOLDOWN 60s round 0 pair 1
+START 02-v8-io
+{"name": "02-v8-io", "puts_s": 273283, "p99_ms": 23.901, "cpu_s": 7.434, "syncs": 1084, "mean_sync_ms": 1.194, "stall_flag": true, "role_masks_validated": true, "context": {"involuntary": 810, "voluntary": 96739}}
+START 03-v8-reaper
+{"name": "03-v8-reaper", "puts_s": 106037, "p99_ms": 28.317, "cpu_s": 10.653, "syncs": 1562, "mean_sync_ms": 2.642, "stall_flag": true, "role_masks_validated": true, "context": {"involuntary": 1633, "voluntary": 111864}}
+COOLDOWN 60s round 0 pair 2
+START 04-v8-userspace
+{"name": "04-v8-userspace", "puts_s": 105633, "p99_ms": 27.248, "cpu_s": 10.528, "syncs": 1525, "mean_sync_ms": 2.685, "stall_flag": true, "role_masks_validated": true, "context": {"involuntary": 1653, "voluntary": 110558}}
+START 05-v8-whole
+{"name": "05-v8-whole", "puts_s": 102960, "p99_ms": 26.913, "cpu_s": 10.597, "syncs": 1552, "mean_sync_ms": 2.536, "stall_flag": true, "role_masks_validated": true, "context": {"involuntary": 1596, "voluntary": 112168}}
+COOLDOWN 60s round 1 pair 0
+START 06-v8-whole
+{"name": "06-v8-whole", "puts_s": 104012, "p99_ms": 29.403, "cpu_s": 10.703, "syncs": 1545, "mean_sync_ms": 2.527, "stall_flag": true, "role_masks_validated": true, "context": {"involuntary": 898, "voluntary": 112016}}
+START 07-v8-userspace
+{"name": "07-v8-userspace", "puts_s": 239219, "p99_ms": 29.379, "cpu_s": 7.331, "syncs": 1096, "mean_sync_ms": 1.478, "stall_flag": true, "role_masks_validated": true, "context": {"involuntary": 865, "voluntary": 96830}}
+COOLDOWN 60s round 1 pair 1
+START 08-v8-reaper
+{"name": "08-v8-reaper", "puts_s": 239132, "p99_ms": 24.865, "cpu_s": 7.96, "syncs": 1148, "mean_sync_ms": 1.273, "stall_flag": true, "role_masks_validated": true, "context": {"involuntary": 864, "voluntary": 97815}}
+START 09-v8-io
+{"name": "09-v8-io", "puts_s": 106983, "p99_ms": 27.938, "cpu_s": 10.676, "syncs": 1536, "mean_sync_ms": 2.348, "stall_flag": true, "role_masks_validated": true, "context": {"involuntary": 972, "voluntary": 111104}}
+COOLDOWN 60s round 1 pair 2
+START 10-v8-kernel_only
+{"name": "10-v8-kernel_only", "puts_s": 106052, "p99_ms": 26.409, "cpu_s": 10.49, "syncs": 1557, "mean_sync_ms": 2.334, "stall_flag": true, "role_masks_validated": true, "context": {"involuntary": 870, "voluntary": 110295}}
+START 11-v8-writers
+{"name": "11-v8-writers", "puts_s": 96784, "p99_ms": 30.966, "cpu_s": 11.847, "syncs": 1704, "mean_sync_ms": 2.425, "stall_flag": true, "role_masks_validated": true, "context": {"involuntary": 682, "voluntary": 117101}}
+RERUN DONE

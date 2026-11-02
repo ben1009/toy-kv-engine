@@ -1,10 +1,11 @@
 # If there are words that you think should not be treated as typo.
 # Please list here along with a comment.
 [default]
-# Preserve literal Linux thread names in benchmark affinity audit records.
+# Preserve literal Linux thread names and the quoted prefix used by affinity audits.
 extend-ignore-re = [
     '\bwal-v8-completi\b',
     '\biou-wrk-(?:[0-9]+|\*)',
+    '"iou-wrk-"',
 ]
 
 [default.extend-words]
@@ -17,3 +18,7 @@ extend-ignore-re = [
 "FiFoQueues"="FiFoQueues" # Preserve TinyUFO's type name in CPU profiles.
 
 [files]
+# Compressed diagnostic text is checked by decompression and content hashes.
+extend-exclude = [
+    "docs/wal/benchmarks/artifacts/*-storage-trace-events.txt.gz",
+]

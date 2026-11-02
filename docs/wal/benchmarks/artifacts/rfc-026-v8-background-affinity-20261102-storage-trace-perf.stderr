@@ -1,0 +1,2 @@
+[ perf record: Woken up 18 times to write data ]
+[ perf record: Captured and wrote 10.672 MB /proc/self/fd/3 (73892 samples) ]

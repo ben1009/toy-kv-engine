@@ -1,0 +1,25 @@
+{
+  "purpose": "Application-level mitigation screen: amortize synchronous storage costs with larger atomic write batches. This changes workload/request size, not production runtime or the SSD, and is not a V8 retention/parity benchmark.",
+  "binary": "/home/liu/proj/toy-kv-engine/target/rfc-026-v8-background-affinity-20261102/write-perf-background-affinity",
+  "binary_sha256": "2ee0a92c06ff4d1f69937fb1bfe0130582b3a679c1b5730fa0c4110bb22578f1",
+  "schedule": [
+    64,
+    256,
+    256,
+    64
+  ],
+  "puts_per_capture": 750000,
+  "writers": 16,
+  "value_bytes": 1024,
+  "format": "v8",
+  "wal_io_mode": "parallel",
+  "cpu_mask": "whole process 0-15, explicitly registered io-wq 0-15 in every capture",
+  "initial_idle_seconds": 15,
+  "between_captures_seconds": 3,
+  "durability": "Unchanged engine semantics: ACK after durable frontier sync; batch256 changes the atomic application request from 64 to 256 entries.",
+  "latency": "p99 is per application batch, not per individual put; report alongside throughput and sync count.",
+  "storage_flag": "Keep existing p99_ms >10 OR mean fdatasync_ms >1 labels. Preserve EVERY run, including flagged records, since slow-storage behavior is the mitigation target. Do not treat flagged performance as a qualified RFC gain.",
+  "interpretation": "Require the mechanism (reduced sync count) and consistent directions in both adjacent reversed-order comparisons before describing an operational benefit; changing device state remains a confound. No runtime adoption or threshold relaxation.",
+  "device_settings_changed": false,
+  "runtime_changed": false
+}

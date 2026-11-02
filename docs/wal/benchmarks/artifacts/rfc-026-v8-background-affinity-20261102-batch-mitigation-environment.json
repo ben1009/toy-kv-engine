@@ -1,0 +1,8 @@
+{
+  "captured_at_utc": "2026-11-02T15:51:09.023121+00:00",
+  "native_host_query": true,
+  "df": "Filesystem      Size  Used Avail Use% Mounted on\n/dev/nvme0n1p3  888G  300G  544G  36% /home",
+  "mount": "/home /dev/nvme0n1p3 ext4 rw,relatime",
+  "trim_last": "Result=success\nExecMainStartTimestamp=Mon 2026-11-02 00:17:30 CST\nExecMainExitTimestamp=Mon 2026-11-02 00:23:15 CST",
+  "trim_timer": "ActiveState=active\nNextElapseUSecRealtime=Mon 2026-11-09 00:39:19 CST\nLastTriggerUSec=Mon 2026-11-02 00:17:30 CST"
+}

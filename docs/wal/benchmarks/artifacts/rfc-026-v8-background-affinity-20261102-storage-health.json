@@ -1,0 +1,51 @@
+{
+  "model_name": "SOLIDIGM SSDPFKNU010TZ",
+  "firmware_version": "004C",
+  "smart_status": {
+    "passed": true,
+    "nvme": {
+      "value": 0
+    }
+  },
+  "nvme_smart_health_information_log": {
+    "nsid": 1,
+    "critical_warning": 0,
+    "temperature": 35,
+    "available_spare": 100,
+    "available_spare_threshold": 10,
+    "percentage_used": 6,
+    "data_units_read": 2576449,
+    "data_units_written": 46696047,
+    "host_reads": 13900855,
+    "host_writes": 992660573,
+    "controller_busy_time": 1008,
+    "power_cycles": 57,
+    "power_on_hours": 6857,
+    "unsafe_shutdowns": 49,
+    "media_errors": 0,
+    "num_err_log_entries": 0,
+    "warning_temp_time": 0,
+    "critical_comp_time": 0
+  },
+  "nvme_self_test_log": {
+    "nsid": -1,
+    "current_self_test_operation": {
+      "value": 0,
+      "string": "No self-test in progress"
+    },
+    "table": [
+      {
+        "self_test_code": {
+          "value": 1,
+          "string": "Short"
+        },
+        "self_test_result": {
+          "value": 0,
+          "string": "Completed without error"
+        },
+        "power_on_hours": 1
+      }
+    ]
+  },
+  "smartctl_returncode": 0
+}

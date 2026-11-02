@@ -1,0 +1,142 @@
+{
+  "base_revision": "604b870e801d2ef3e5e6f6cf5275328e2107cf49",
+  "binary": "/home/liu/proj/toy-kv-engine/target/rfc-026-v8-background-affinity-20261102/write-perf-background-affinity",
+  "binary_sha256": "2ee0a92c06ff4d1f69937fb1bfe0130582b3a679c1b5730fa0c4110bb22578f1",
+  "schedule": [
+    {
+      "round": 0,
+      "position": 0,
+      "mode": "writers",
+      "format": "v8"
+    },
+    {
+      "round": 0,
+      "position": 1,
+      "mode": "whole",
+      "format": "v8"
+    },
+    {
+      "round": 1,
+      "position": 0,
+      "mode": "whole",
+      "format": "v8"
+    },
+    {
+      "round": 1,
+      "position": 1,
+      "mode": "writers",
+      "format": "v8"
+    }
+  ],
+  "modes": {
+    "writers": "Writers P-core; all other userspace and io-wq masks 0-31.",
+    "kernel_only": "Writers plus explicitly registered io-wq P-core; all userspace background threads remain 0-31. Harness affinity mode is writers; kernel registration is the only change.",
+    "io": "Kernel-only plus wal-io-worker P-core; other userspace background roles 0-31.",
+    "reaper": "IO plus V8 completion reaper P-core.",
+    "userspace": "Reaper plus all remaining userspace background threads (engine runtime and Tokio); main stays 0-31. V8 has no additional dedicated userspace WAL role.",
+    "whole": "Whole-process taskset 0-15, including main; same explicit io-wq P-core registration as all non-control arms."
+  },
+  "workload": {
+    "puts": 750000,
+    "writers": 16,
+    "batch": 64,
+    "value_bytes": 1024,
+    "format": "v8",
+    "wal_io_mode": "parallel",
+    "target_sst_size": 2147483648,
+    "compaction": "none",
+    "latency_sample_every": 10
+  },
+  "cooldown_before_each_round_seconds": null,
+  "between_runs_seconds": 3,
+  "selection": "Highest eligible throughput per mode, all same-run metrics; preserve all raw captures and medians. Control pairs executed forward/reverse. Role expansion is predeclared conditional on a jointly eligible control pair. No device/admin queries or tracing during this cohort.",
+  "storage_flag": "p99_ms >10 OR mean fdatasync_ms >1, unchanged across modes; all flagged records retained and excluded from scores.",
+  "measurement": "One normal-counter executable; no --profile, perf, phase clocks, or per-batch affinity changes. Existing 1/64 digest CPU samples. Background affinity setup and /proc snapshots before timer; writer set/get at thread entry inside existing launch interval. Context delta and final thread audit outside timed CPU/wall metrics.",
+  "kernel_hook": "Startup-only bench-feature hook uses io-uring 0.6.4 register_iowq_aff in EVERY mode: 0-31 for writers, 0-15 for all other modes. Both preliminary smoke attempts showed that pinning the I/O worker also narrowed new kernel workers, even after full-mask registration. Failed preflights are preserved separately and never scored. Therefore kernel-only is tested BEFORE cumulative userspace roles, holding actual kernel masks constant for IO/reaper/shared-background comparisons. Success logged and actual masks audited. Source changes removed after building.",
+  "role_limit": "Affinity means allowed CPUs, not actual residency. Whole-process changes core count, frequency/SMT/cache and pipeline timing. Foreground writers include publication and some DATA/coordinator/frontier work; names identify dedicated background roles.",
+  "runtime_changed": false,
+  "benchmark_hook_retained": false,
+  "historical_scores": "Context only; all six scored modes use this same executable and cohort.",
+  "conditional_role_schedule": [
+    {
+      "round": 2,
+      "position": 0,
+      "mode": "writers",
+      "format": "v8"
+    },
+    {
+      "round": 2,
+      "position": 1,
+      "mode": "kernel_only",
+      "format": "v8"
+    },
+    {
+      "round": 2,
+      "position": 2,
+      "mode": "io",
+      "format": "v8"
+    },
+    {
+      "round": 2,
+      "position": 3,
+      "mode": "reaper",
+      "format": "v8"
+    },
+    {
+      "round": 2,
+      "position": 4,
+      "mode": "userspace",
+      "format": "v8"
+    },
+    {
+      "round": 2,
+      "position": 5,
+      "mode": "whole",
+      "format": "v8"
+    },
+    {
+      "round": 3,
+      "position": 0,
+      "mode": "whole",
+      "format": "v8"
+    },
+    {
+      "round": 3,
+      "position": 1,
+      "mode": "userspace",
+      "format": "v8"
+    },
+    {
+      "round": 3,
+      "position": 2,
+      "mode": "reaper",
+      "format": "v8"
+    },
+    {
+      "round": 3,
+      "position": 3,
+      "mode": "io",
+      "format": "v8"
+    },
+    {
+      "round": 3,
+      "position": 4,
+      "mode": "kernel_only",
+      "format": "v8"
+    },
+    {
+      "round": 3,
+      "position": 5,
+      "mode": "writers",
+      "format": "v8"
+    }
+  ],
+  "cohort": "user-requested rerun-02 with endpoint controls first",
+  "cooldown_before_each_pair_seconds": null,
+  "control_idle_seconds": [
+    15,
+    45
+  ],
+  "conditional_role_idle_before_each_pair_seconds": 45,
+  "expansion_gate": "Run the twelve additional role captures only if at least one of the two writer-only/whole-process control pairs is jointly eligible. Fixed existing filter: p99_ms <=10 AND mean fdatasync_ms <=1 for both endpoints. Otherwise finish after four controls and report the lack of eligible controls."
+}

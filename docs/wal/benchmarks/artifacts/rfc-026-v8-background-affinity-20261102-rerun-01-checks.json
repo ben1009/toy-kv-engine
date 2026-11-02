@@ -1,0 +1,16 @@
+{
+  "normal_captures_completed": 12,
+  "all_returncodes_zero": true,
+  "all_16_writer_masks_and_all_background_roles_validated_every_capture": true,
+  "kernel_registration_success_and_actual_masks_verified": true,
+  "all_750000_operation_counts_and_V8_hash_byte_counts_validated": true,
+  "post_encode_hash_reread_bytes": 0,
+  "runtime_diff_empty": true,
+  "benchmark_hook_retained": false,
+  "same_binary_as_original_cohort": true,
+  "binary_sha256": "2ee0a92c06ff4d1f69937fb1bfe0130582b3a679c1b5730fa0c4110bb22578f1",
+  "source_hashes": {
+    "kv-engine/src/bin/write-perf.rs": "83c7352eab8b9f0eefc49ba6c128142908941a5c95214a3f4eb288f9538cd5b9",
+    "kv-engine/src/wal/parallel/worker.rs": "19c104c5e5fa401f5382625025a2761571c32bd1a77fb98a16afec55820904b3"
+  }
+}

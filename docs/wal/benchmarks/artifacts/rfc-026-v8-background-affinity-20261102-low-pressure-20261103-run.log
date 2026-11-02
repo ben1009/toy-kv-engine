@@ -1,0 +1,12 @@
+COOLDOWN 15s pair 0
+START 00-v8-writers
+{"name": "00-v8-writers", "puts_s": 103449, "p99_ms": 28.956, "cpu_s": 2.252, "syncs": 332, "mean_sync_ms": 2.251, "stall_flag": true, "role_masks_validated": true, "context": {"involuntary": 348, "voluntary": 21997}}
+START 01-v8-whole
+{"name": "01-v8-whole", "puts_s": 108621, "p99_ms": 22.506, "cpu_s": 2.158, "syncs": 309, "mean_sync_ms": 2.58, "stall_flag": true, "role_masks_validated": true, "context": {"involuntary": 244, "voluntary": 22437}}
+COOLDOWN 15s pair 1
+START 02-v8-whole
+{"name": "02-v8-whole", "puts_s": 106468, "p99_ms": 40.639, "cpu_s": 2.202, "syncs": 323, "mean_sync_ms": 2.541, "stall_flag": true, "role_masks_validated": true, "context": {"involuntary": 188, "voluntary": 22691}}
+START 03-v8-writers
+{"name": "03-v8-writers", "puts_s": 98789, "p99_ms": 29.099, "cpu_s": 2.133, "syncs": 336, "mean_sync_ms": 2.524, "stall_flag": true, "role_masks_validated": true, "context": {"involuntary": 110, "voluntary": 23185}}
+{"captures": 4, "storage_eligible": 0, "jointly_eligible_pairs": [false, false], "RFC_performance_qualified": false, "scope": "150k-put diagnostic: workload reduced by 80%; same binary, batch64, roles, device and thresholds. Not a sustained SSD or V4/V7 parity score.", "runtime_changed": false, "device_settings_changed": false}
+DONE

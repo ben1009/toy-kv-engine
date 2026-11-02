@@ -1,0 +1,53 @@
+COOLDOWN 45s round 0
+START 00-v8-writers
+{"name": "00-v8-writers", "puts_s": 79402, "p99_ms": 28.976, "cpu_s": 12.008, "syncs": 1736, "mean_sync_ms": 2.195, "stall_flag": true, "role_masks_validated": true, "context": {"involuntary": 649, "voluntary": 118833}}
+START 01-v8-kernel_only
+{"name": "01-v8-kernel_only", "puts_s": 85365, "p99_ms": 28.372, "cpu_s": 10.92, "syncs": 1607, "mean_sync_ms": 2.231, "stall_flag": true, "role_masks_validated": true, "context": {"involuntary": 767, "voluntary": 111384}}
+START 02-v8-io
+{"name": "02-v8-io", "puts_s": 287344, "p99_ms": 36.645, "cpu_s": 6.466, "syncs": 1023, "mean_sync_ms": 0.961, "stall_flag": true, "role_masks_validated": true, "context": {"involuntary": 1136, "voluntary": 95152}}
+START 03-v8-reaper
+{"name": "03-v8-reaper", "puts_s": 143020, "p99_ms": 27.728, "cpu_s": 9.397, "syncs": 1329, "mean_sync_ms": 1.811, "stall_flag": true, "role_masks_validated": true, "context": {"involuntary": 792, "voluntary": 103882}}
+START 04-v8-userspace
+{"name": "04-v8-userspace", "puts_s": 83155, "p99_ms": 31.421, "cpu_s": 11.269, "syncs": 1608, "mean_sync_ms": 2.771, "stall_flag": true, "role_masks_validated": true, "context": {"involuntary": 1010, "voluntary": 112949}}
+START 05-v8-whole
+{"name": "05-v8-whole", "puts_s": 84039, "p99_ms": 28.658, "cpu_s": 10.859, "syncs": 1583, "mean_sync_ms": 2.568, "stall_flag": true, "role_masks_validated": true, "context": {"involuntary": 786, "voluntary": 112139}}
+COOLDOWN 45s round 1
+START 06-v8-whole
+{"name": "06-v8-whole", "puts_s": 87147, "p99_ms": 30.758, "cpu_s": 10.639, "syncs": 1560, "mean_sync_ms": 2.514, "stall_flag": true, "role_masks_validated": true, "context": {"involuntary": 1480, "voluntary": 111279}}
+START 07-v8-userspace
+{"name": "07-v8-userspace", "puts_s": 667497, "p99_ms": 3.394, "cpu_s": 5.873, "syncs": 942, "mean_sync_ms": 0.408, "stall_flag": false, "role_masks_validated": true, "context": {"involuntary": 710, "voluntary": 92226}}
+START 08-v8-reaper
+{"name": "08-v8-reaper", "puts_s": 104110, "p99_ms": 28.938, "cpu_s": 10.168, "syncs": 1509, "mean_sync_ms": 2.033, "stall_flag": true, "role_masks_validated": true, "context": {"involuntary": 883, "voluntary": 109497}}
+START 09-v8-io
+{"name": "09-v8-io", "puts_s": 84869, "p99_ms": 28.829, "cpu_s": 10.899, "syncs": 1584, "mean_sync_ms": 2.429, "stall_flag": true, "role_masks_validated": true, "context": {"involuntary": 922, "voluntary": 111577}}
+START 10-v8-kernel_only
+{"name": "10-v8-kernel_only", "puts_s": 72167, "p99_ms": 46.276, "cpu_s": 11.151, "syncs": 1680, "mean_sync_ms": 2.445, "stall_flag": true, "role_masks_validated": true, "context": {"involuntary": 905, "voluntary": 112996}}
+START 11-v8-writers
+{"name": "11-v8-writers", "puts_s": 89059, "p99_ms": 223.964, "cpu_s": 11.032, "syncs": 1619, "mean_sync_ms": 2.197, "stall_flag": true, "role_masks_validated": true, "context": {"involuntary": 530, "voluntary": 112995}}
+COOLDOWN 45s round 2
+START 12-v8-reaper
+{"name": "12-v8-reaper", "puts_s": 402141, "p99_ms": 15.931, "cpu_s": 6.834, "syncs": 1088, "mean_sync_ms": 0.76, "stall_flag": true, "role_masks_validated": true, "context": {"involuntary": 483, "voluntary": 95654}}
+START 13-v8-whole
+{"name": "13-v8-whole", "puts_s": 86268, "p99_ms": 28.06, "cpu_s": 10.764, "syncs": 1568, "mean_sync_ms": 2.603, "stall_flag": true, "role_masks_validated": true, "context": {"involuntary": 968, "voluntary": 111555}}
+START 14-v8-io
+{"name": "14-v8-io", "puts_s": 84805, "p99_ms": 30.189, "cpu_s": 11.057, "syncs": 1610, "mean_sync_ms": 2.446, "stall_flag": true, "role_masks_validated": true, "context": {"involuntary": 926, "voluntary": 111741}}
+START 15-v8-kernel_only
+{"name": "15-v8-kernel_only", "puts_s": 81369, "p99_ms": 31.195, "cpu_s": 11.056, "syncs": 1638, "mean_sync_ms": 2.324, "stall_flag": true, "role_masks_validated": true, "context": {"involuntary": 868, "voluntary": 110825}}
+START 16-v8-writers
+{"name": "16-v8-writers", "puts_s": 168392, "p99_ms": 27.637, "cpu_s": 9.979, "syncs": 1483, "mean_sync_ms": 1.163, "stall_flag": true, "role_masks_validated": true, "context": {"involuntary": 761, "voluntary": 104541}}
+START 17-v8-userspace
+{"name": "17-v8-userspace", "puts_s": 628803, "p99_ms": 4.208, "cpu_s": 6.7, "syncs": 896, "mean_sync_ms": 0.405, "stall_flag": false, "role_masks_validated": true, "context": {"involuntary": 537, "voluntary": 90854}}
+COOLDOWN 45s round 3
+START 18-v8-userspace
+{"name": "18-v8-userspace", "puts_s": 418146, "p99_ms": 17.844, "cpu_s": 6.589, "syncs": 1036, "mean_sync_ms": 0.799, "stall_flag": true, "role_masks_validated": true, "context": {"involuntary": 896, "voluntary": 94323}}
+START 19-v8-writers
+{"name": "19-v8-writers", "puts_s": 101430, "p99_ms": 28.762, "cpu_s": 11.358, "syncs": 1706, "mean_sync_ms": 2.318, "stall_flag": true, "role_masks_validated": true, "context": {"involuntary": 542, "voluntary": 116697}}
+START 20-v8-kernel_only
+{"name": "20-v8-kernel_only", "puts_s": 103854, "p99_ms": 29.494, "cpu_s": 10.472, "syncs": 1576, "mean_sync_ms": 2.419, "stall_flag": true, "role_masks_validated": true, "context": {"involuntary": 1219, "voluntary": 110053}}
+START 21-v8-io
+{"name": "21-v8-io", "puts_s": 103582, "p99_ms": 28.428, "cpu_s": 10.484, "syncs": 1557, "mean_sync_ms": 2.627, "stall_flag": true, "role_masks_validated": true, "context": {"involuntary": 720, "voluntary": 112157}}
+START 22-v8-whole
+{"name": "22-v8-whole", "puts_s": 104360, "p99_ms": 29.138, "cpu_s": 10.449, "syncs": 1535, "mean_sync_ms": 2.665, "stall_flag": true, "role_masks_validated": true, "context": {"involuntary": 1565, "voluntary": 111973}}
+START 23-v8-reaper
+{"name": "23-v8-reaper", "puts_s": 190089, "p99_ms": 28.596, "cpu_s": 7.824, "syncs": 1186, "mean_sync_ms": 1.719, "stall_flag": true, "role_masks_validated": true, "context": {"involuntary": 1117, "voluntary": 100118}}
+DONE

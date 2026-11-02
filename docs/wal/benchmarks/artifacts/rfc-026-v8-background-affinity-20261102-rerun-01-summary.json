@@ -1,0 +1,51 @@
+{
+  "samples": 12,
+  "flagged": 12,
+  "groups": [
+    {
+      "mode": "writers",
+      "total": 2,
+      "eligible": 0,
+      "best_eligible": null,
+      "median_eligible": null
+    },
+    {
+      "mode": "kernel_only",
+      "total": 2,
+      "eligible": 0,
+      "best_eligible": null,
+      "median_eligible": null
+    },
+    {
+      "mode": "io",
+      "total": 2,
+      "eligible": 0,
+      "best_eligible": null,
+      "median_eligible": null
+    },
+    {
+      "mode": "reaper",
+      "total": 2,
+      "eligible": 0,
+      "best_eligible": null,
+      "median_eligible": null
+    },
+    {
+      "mode": "userspace",
+      "total": 2,
+      "eligible": 0,
+      "best_eligible": null,
+      "median_eligible": null
+    },
+    {
+      "mode": "whole",
+      "total": 2,
+      "eligible": 0,
+      "best_eligible": null,
+      "median_eligible": null
+    }
+  ],
+  "runtime_changed": false,
+  "binary_sha256": "2ee0a92c06ff4d1f69937fb1bfe0130582b3a679c1b5730fa0c4110bb22578f1",
+  "scope": "One new executable for six cumulative placement modes; all masks audited and io-wq registration explicitly verified. Historical scores are context only. No production affinity change."
+}

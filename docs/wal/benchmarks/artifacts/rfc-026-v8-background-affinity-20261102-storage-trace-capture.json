@@ -1,0 +1,25 @@
+{
+  "command": [
+    "perf",
+    "record",
+    "-a",
+    "-m",
+    "256",
+    "-e",
+    "nvme:nvme_setup_cmd",
+    "-e",
+    "nvme:nvme_complete_rq",
+    "-o",
+    "/proc/self/fd/3",
+    "--",
+    "taskset",
+    "-c",
+    "0-15",
+    "python3",
+    "/home/liu/proj/toy-kv-engine/target/rfc-026-v8-background-affinity-20261102/storage-trace/probe.py"
+  ],
+  "returncode": 0,
+  "trace_in_memory_during_workload": true,
+  "trace_bytes": 11242092,
+  "global_device_settings_changed": false
+}

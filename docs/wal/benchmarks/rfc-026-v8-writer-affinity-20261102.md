@@ -63,7 +63,7 @@ Writer-only is therefore broader than a hash-only experiment.
 
 Each of the 16 writer masks is checked, and all other threads are audited before
 and after the timed interval. For writer-only, `wal-io-worker`,
-`wal-v8-completi`, background reclamation, Tokio runtime workers and visible
+`wal-v8-completi`, the engine background runtime, Tokio runtime workers and visible
 kernel `iou-wrk-*` tasks retain `0-31`. Whole-process runs inherit `0-15` for
 all these roles. All 18 full captures and all six smoke captures pass these
 role assertions. Delayed writer task cleanup, if present, is identified by

@@ -1,0 +1,17 @@
+{
+  "command": [
+    "cargo",
+    "build",
+    "--release",
+    "--features",
+    "bench",
+    "--bin",
+    "write-perf"
+  ],
+  "binary_sha256": "d323b9633846138f5dde2f5e8f765fd6c1ecef32cc5292038ba1b858c0e09657",
+  "base_revision": "604b870e801d2ef3e5e6f6cf5275328e2107cf49",
+  "instrumented_source_hashes": {
+    "kv-engine/src/bin/write-perf.rs": "e45e189cb08e667e2a9badccd40ea6da6fdb267f8fd47038f07fe89a92780307",
+    "kv-engine/src/wal/parallel/worker.rs": "206d0f19bd35750e3d439b22f2573fd4d20cb476f73595a46636c685715cb938"
+  }
+}
