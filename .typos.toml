@@ -21,4 +21,5 @@ extend-ignore-re = [
 # Compressed diagnostic text is checked by decompression and content hashes.
 extend-exclude = [
     "docs/wal/benchmarks/artifacts/*-storage-trace-events.txt.gz",
+    "docs/wal/benchmarks/artifacts/rfc-026-v8-pcore-cpu-20261103-*-stacks.txt.gz",
 ]

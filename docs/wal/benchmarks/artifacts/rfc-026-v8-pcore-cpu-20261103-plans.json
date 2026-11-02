@@ -1,0 +1,74 @@
+{
+  "formats": {
+    "purpose": "Timed CPU attribution on the existing single physical SSD; compare V7/V8 under identical whole-process P-core affinity. Diagnostic only, not an SSD performance ranking.",
+    "binary": "/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution",
+    "binary_sha256": "fbb90ea8a6f20bf476760e79ae60e04cda3edae04138d45ae5a9e6346da299f1",
+    "runtime_revision": "b8da402a276d7969f4c40ca99787a10a63d93f33",
+    "schedule": [
+      "v7",
+      "v8",
+      "v8",
+      "v7"
+    ],
+    "puts_per_capture": 750000,
+    "writers": 16,
+    "batch": 64,
+    "value_bytes": 1024,
+    "wal_io_mode": "parallel",
+    "target_sst_size": 2147483648,
+    "compaction": "none",
+    "latency_sample_every": 10,
+    "placement": "taskset 0-15 on benchmark; inherited by application, WAL and engine threads. Verify zero E-core userspace samples. No global scheduler or device changes.",
+    "perf_mmap_pages": 64,
+    "profiling": "Preserved phase scopes sample 1/64 calls per thread with CPU and wall clocks; inclusive scopes are not summed with children. perf cpu-clock:u 499Hz, DWARF4096, sample-cpu, enabled only during timed writes via existing control FIFOs. perf stream remains in memfd until workload completion.",
+    "storage_flag": "p99_ms >10 OR mean fdatasync_ms >1; preserve every diagnostic and label flags. Diagnostics do not enter best-score tables even when eligible.",
+    "comparison": "Inspect CPU hotspots repeated across reversed format order, not just relative percentages. Stalls change concurrency and CPU work, so phase differences do not by themselves prove a source-level regression.",
+    "initial_idle_seconds": 15,
+    "between_captures_seconds": 3,
+    "runtime_changed": false,
+    "device_settings_changed": false
+  },
+  "allocator": {
+    "purpose": "Reversible V8 allocator CPU diagnostic: baseline glibc versus installed mimalloc C overrides, including aligned buffers. perf collector does not inherit the override. Not a production allocator adoption or qualified SSD gain.",
+    "binary": "/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution",
+    "binary_sha256": "fbb90ea8a6f20bf476760e79ae60e04cda3edae04138d45ae5a9e6346da299f1",
+    "runtime_revision": "b8da402a276d7969f4c40ca99787a10a63d93f33",
+    "memory_metric": "wait4 ru_maxrss for the perf command tree: maximum individual process RSS, not the sum or a timed-only peak. Includes the benchmark and profiler.",
+    "allocator_activation": {
+      "mi_version_raw": 224,
+      "library_sha256": "0480b3b2de1eea334388482e4e8554a318e0887d717a0dd684a8df74dce462bb",
+      "symbols": {
+        "malloc": "/usr/lib/libmimalloc.so.2",
+        "calloc": "/usr/lib/libmimalloc.so.2",
+        "realloc": "/usr/lib/libmimalloc.so.2",
+        "free": "/usr/lib/libmimalloc.so.2",
+        "posix_memalign": "/usr/lib/libmimalloc.so.2"
+      },
+      "aligned_allocation_contents_and_matching_free_pass": true
+    },
+    "override": "LD_PRELOAD=/usr/lib/libmimalloc.so.2 on the benchmark child only; no package install or host allocator setting changes",
+    "schedule": [
+      "system",
+      "mimalloc",
+      "mimalloc",
+      "system"
+    ],
+    "puts_per_capture": 750000,
+    "writers": 16,
+    "batch": 64,
+    "value_bytes": 1024,
+    "wal_io_mode": "parallel",
+    "target_sst_size": 2147483648,
+    "compaction": "none",
+    "latency_sample_every": 10,
+    "placement": "taskset 0-15 on benchmark; inherited by application, WAL and engine threads. Verify zero E-core userspace samples. No global scheduler or device changes.",
+    "perf_mmap_pages": 64,
+    "profiling": "Preserved phase scopes sample 1/64 calls per thread with CPU and wall clocks; inclusive scopes are not summed with children. perf cpu-clock:u 499Hz, DWARF4096, sample-cpu, enabled only during timed writes via existing control FIFOs. perf stream remains in memfd until workload completion.",
+    "storage_flag": "p99_ms >10 OR mean fdatasync_ms >1; preserve every diagnostic and label flags. Diagnostics do not enter best-score tables even when eligible.",
+    "comparison": "Inspect CPU hotspots repeated across reversed format order, not just relative percentages. Stalls change concurrency and CPU work, so phase differences do not by themselves prove a source-level regression.",
+    "initial_idle_seconds": 15,
+    "between_captures_seconds": 3,
+    "runtime_changed": false,
+    "device_settings_changed": false
+  }
+}

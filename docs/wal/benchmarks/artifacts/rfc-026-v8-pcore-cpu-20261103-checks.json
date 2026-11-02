@@ -1,0 +1,18 @@
+{
+  "json_files_validated": 6,
+  "python_files_parsed": 4,
+  "compressed_stacks_and_local_perf_hashes_verified": 8,
+  "analyzer_reproduces_identical_summary": true,
+  "all_full_captures_have_zero_reported_sample_loss": true,
+  "runtime_sources_match_HEAD": true,
+  "runtime_sources_match_b8da402a": true,
+  "tracked_whitespace_check_pass": true,
+  "local_links_pass": true,
+  "runtime_changed": false,
+  "benchmark_samples_used_for_performance_ranking": 0,
+  "cargo_fmt_check_pass": true,
+  "typos_pass": true,
+  "typos_text_files_checked": 81,
+  "retained_code_tests_repeated": false,
+  "test_scope_reason": "Only diagnostic records, scripts, documentation and compressed-data spell-check exclusions changed; retained Rust sources match HEAD and b8da402a."
+}

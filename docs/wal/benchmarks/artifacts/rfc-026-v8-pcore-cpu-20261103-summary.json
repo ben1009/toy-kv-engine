@@ -1,0 +1,4394 @@
+{
+  "purpose": "Existing-SSD CPU attribution and reversible allocator screen, not performance qualification.",
+  "runtime_changed": false,
+  "allocator_retained": false,
+  "measurement_count": 8,
+  "storage_flagged": 8,
+  "phase_method": "Per-thread calls/samples scaling of sampled thread CPU clocks. Inclusive parents and children must not be added. Missing samples are reported, not imputed.",
+  "sample_method": "Timed userspace cpu-clock samples at 499 Hz. Leaf shares locate sampled userspace work; they are not percentages of process user+system CPU. Partial callchains do not make every caller identifiable.",
+  "memory_method": "wait4 command-tree ru_maxrss: maximum individual-process RSS, not sum, delta or timed-only peak; includes benchmark/profiler lifetimes.",
+  "allocator_pairs": [
+    {
+      "baseline": "00-system",
+      "candidate": "01-mimalloc",
+      "cpu_change_pct": 23.887531342764802,
+      "peak_rss_change_pct": 25.458057868979147,
+      "diagnostic_only": true,
+      "storage_flags_on_both": true
+    },
+    {
+      "baseline": "03-system",
+      "candidate": "02-mimalloc",
+      "cpu_change_pct": -9.405895189727808,
+      "peak_rss_change_pct": 25.55273696545153,
+      "diagnostic_only": true,
+      "storage_flags_on_both": true
+    }
+  ],
+  "measurements": [
+    {
+      "cohort": "formats",
+      "name": "00-v7",
+      "format": "v7",
+      "allocator": "system",
+      "puts_s": 108734.17322459984,
+      "p99_ms": 27.592978,
+      "mean_sync_ms": 1.7565538298008991,
+      "syncs": 1557,
+      "worker_groups": 5745,
+      "process_cpu_s": 9.270235000000001,
+      "command_tree_max_individual_rss_kib": null,
+      "storage_flag": true,
+      "performance_ranking_eligible": false,
+      "profiler_lost_samples": 0,
+      "phase_estimates": {
+        "producer": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "preflight": {
+          "calls": 11728,
+          "samples": 192,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.18533837808333334,
+          "estimated_wall_s": 0.20929892641666667
+        },
+        "encode": {
+          "calls": 11728,
+          "samples": 192,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.7653066695833334,
+          "estimated_wall_s": 0.7769324771666666
+        },
+        "frame": {
+          "calls": 11728,
+          "samples": 193,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.904822581,
+          "estimated_wall_s": 0.917313183
+        },
+        "direct_alloc": {
+          "calls": 13285,
+          "samples": 217,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.11230866593666666,
+          "estimated_wall_s": 0.12504896159333334
+        },
+        "admit": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "digest_ready": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "frames_ready": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "data_complete": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "reserve_frontier": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "publish_durable": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "snapshot": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "coalesce": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "coordinator_lock_wait": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "submission_lock_wait": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "submit_data": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "pack_data": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "worker_submit": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "worker_cqe": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "completion_receive": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "completion_publish": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "frontier_encode": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "frontier_write": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "frontier_sync": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "resources_retire": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "guards_retire": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "v7_materialize": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "v7_sync_cycle": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "worker_receive": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "memtable_publish": {
+          "calls": 11728,
+          "samples": 192,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 2.6541105985833333,
+          "estimated_wall_s": 2.7028903436666667
+        },
+        "mvcc_publish": {
+          "calls": 11728,
+          "samples": 192,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.3391172579166667,
+          "estimated_wall_s": 0.37978580825
+        },
+        "v7_logical_hash": {
+          "calls": 11728,
+          "samples": 184,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 1.3661051027826088,
+          "estimated_wall_s": 1.3979927699130434
+        },
+        "frontier_lock_wait": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "coordinator_wait": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "logical_alloc": {
+          "calls": 11728,
+          "samples": 192,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.3108098974166667,
+          "estimated_wall_s": 0.32099481025
+        },
+        "entry_encode": {
+          "calls": 11728,
+          "samples": 192,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.40400858733333334,
+          "estimated_wall_s": 0.41577720775
+        }
+      },
+      "cpu_samples": {
+        "samples": 3528,
+        "P_samples": 3528,
+        "E_samples": 0,
+        "threads": 20,
+        "samples_without_stack": 0,
+        "one_frame_stacks": 1855,
+        "categories": {
+          "sha256": {
+            "samples": 681,
+            "pct": 19.302721088435373
+          },
+          "skiplist_insert": {
+            "samples": 149,
+            "pct": 4.223356009070295
+          },
+          "libc": {
+            "samples": 1093,
+            "pct": 30.980725623582767
+          },
+          "other": {
+            "samples": 805,
+            "pct": 22.817460317460316
+          },
+          "skiplist_search": {
+            "samples": 247,
+            "pct": 7.001133786848072
+          },
+          "mvcc_publish": {
+            "samples": 180,
+            "pct": 5.1020408163265305
+          },
+          "clock_gettime": {
+            "samples": 161,
+            "pct": 4.563492063492063
+          },
+          "crc32": {
+            "samples": 212,
+            "pct": 6.00907029478458
+          }
+        },
+        "top_leaf_symbols": [
+          [
+            "[unknown] (/usr/lib/libc.so.6)",
+            970
+          ],
+          [
+            "sha2::sha256::x86::digest_blocks (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            681
+          ],
+          [
+            "<crossbeam_skiplist::base::SkipList<bytes::bytes::Bytes, bytes::bytes::Bytes>>::search_position::<bytes::bytes::Bytes> (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            247
+          ],
+          [
+            "<kv_engine::mvcc::LsmMvccInner>::publish_commit_ts (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            180
+          ],
+          [
+            "<std::thread::local::LocalKey<core::cell::RefCell<alloc::vec::Vec<u8>>>>::with::<<kv_engine::mem_table::MemTable>::publish_raw_batch::{closure#0}, ()> (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            176
+          ],
+          [
+            "__vdso_clock_gettime ([vdso])",
+            161
+          ],
+          [
+            "<crossbeam_skiplist::base::SkipList<bytes::bytes::Bytes, bytes::bytes::Bytes>>::insert_internal::<<crossbeam_skiplist::base::SkipList<bytes::bytes::Bytes, bytes::bytes::Bytes>>::insert::{closure#0}, <crossbeam_skiplist::base::SkipList<bytes::bytes::Bytes, bytes::bytes::Bytes>>::insert::{closure#1}> (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            149
+          ],
+          [
+            "crc32fast::baseline::update_fast_16 (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            104
+          ],
+          [
+            "crc32fast::specialized::pclmulqdq::calculate (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            96
+          ],
+          [
+            "<core::slice::iter::Iter<kv_engine::pitr::WalEntry> as core::iter::traits::iterator::Iterator>::try_fold::<(), <core::iter::adapters::enumerate::Enumerate<_> as core::iter::traits::iterator::Iterator>::try_fold::enumerate<&kv_engine::pitr::WalEntry, (), core::ops::control_flow::ControlFlow<&kv_engine::pitr::WalEntry>, core::iter::traits::iterator::Iterator::find_map::check<(usize, &kv_engine::pitr::WalEntry), &kv_engine::pitr::WalEntry, &mut <kv_engine::pitr::CanonicalWalEntryStream>::entries::{closure#0}>::{closure#0}>::{closure#0}, core::ops::control_flow::ControlFlow<&kv_engine::pitr::WalEntry>> (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            51
+          ],
+          [
+            "malloc (/usr/lib/libc.so.6)",
+            43
+          ],
+          [
+            "cfree (/usr/lib/libc.so.6)",
+            34
+          ],
+          [
+            "<crossbeam_channel::flavors::list::Channel<kv_engine::wal::parallel_worker::WorkerCommand<kv_engine::wal::parallel_runtime::ParallelBuffer>>>::recv (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            25
+          ],
+          [
+            "<crossbeam_channel::flavors::list::Channel<kv_engine::wal::parallel_worker::GroupWriteResult>>::recv (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            24
+          ],
+          [
+            "<kv_engine::lsm_storage::LsmStorageInner>::push_point_batch_entry::<&[u8]> (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            23
+          ],
+          [
+            "<parking_lot::raw_mutex::RawMutex>::lock_slow (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            20
+          ],
+          [
+            "syscall (/usr/lib/libc.so.6)",
+            20
+          ],
+          [
+            "<kv_engine::lsm_storage::LsmStorageInner>::write_batch_with_lifecycle_admission::<&[u8]> (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            19
+          ],
+          [
+            "<bytes::bytes::Bytes as core::convert::From<alloc::vec::Vec<u8>>>::from (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            19
+          ],
+          [
+            "crossbeam_epoch::default::with_handle::<crossbeam_epoch::default::pin::{closure#0}, crossbeam_epoch::guard::Guard> (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            18
+          ]
+        ],
+        "libc_elf_base": "0x72a05f1a9000",
+        "libc_build_id": "7a8d41a2df4fde040b4c6ac2832311ab645a1e41",
+        "top_libc_offsets": [
+          [
+            "0xa5fdc",
+            145
+          ],
+          [
+            "0x16d053",
+            85
+          ],
+          [
+            "0xa5ffc",
+            77
+          ],
+          [
+            "0x16c11d",
+            53
+          ],
+          [
+            "0x16c119",
+            35
+          ],
+          [
+            "0xa481c",
+            34
+          ],
+          [
+            "0xa4809",
+            32
+          ],
+          [
+            "0x16be20",
+            24
+          ],
+          [
+            "0x11806d",
+            20
+          ],
+          [
+            "0x16c887",
+            19
+          ],
+          [
+            "0x16bf08",
+            18
+          ],
+          [
+            "0x16cfe8",
+            13
+          ],
+          [
+            "0x16bf04",
+            12
+          ],
+          [
+            "0x16c580",
+            12
+          ],
+          [
+            "0x16bf0c",
+            11
+          ],
+          [
+            "0xa753b",
+            10
+          ],
+          [
+            "0x16c1cb",
+            9
+          ],
+          [
+            "0xa5c25",
+            9
+          ],
+          [
+            "0xa7013",
+            9
+          ],
+          [
+            "0xe3350",
+            9
+          ]
+        ],
+        "top_libc_non_libc_callers": [
+          [
+            "<crossbeam_skiplist::base::SkipList<bytes::bytes::Bytes, bytes::bytes::Bytes>>::search_position::<bytes::bytes::Bytes> (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            149
+          ],
+          [
+            "<std::thread::local::LocalKey<core::cell::RefCell<alloc::vec::Vec<u8>>>>::with::<<kv_engine::mem_table::MemTable>::publish_raw_batch::{closure#0}, ()> (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            107
+          ],
+          [
+            "<core::iter::adapters::map::Map<core::slice::iter::Iter<(bytes::bytes::Bytes, bytes::bytes::Bytes, kv_engine::mvcc::BatchEntryKind)>, <kv_engine::mvcc::LsmMvccInner>::write_batch_wal_only_inner::{closure#5}> as core::iter::traits::iterator::Iterator>::fold::<(), core::iter::traits::iterator::Iterator::for_each::call<kv_engine::pitr::WalEntry, <alloc::vec::Vec<kv_engine::pitr::WalEntry>>::extend_trusted<core::iter::adapters::map::Map<core::slice::iter::Iter<(bytes::bytes::Bytes, bytes::bytes::Bytes, kv_engine::mvcc::BatchEntryKind)>, <kv_engine::mvcc::LsmMvccInner>::write_batch_wal_only_inner::{closure#5}>>::{closure#0}>::{closure#0}> (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            92
+          ],
+          [
+            "<core::slice::iter::Iter<kv_engine::pitr::WalEntry> as core::iter::traits::iterator::Iterator>::try_fold::<(), <core::iter::adapters::enumerate::Enumerate<_> as core::iter::traits::iterator::Iterator>::try_fold::enumerate<&kv_engine::pitr::WalEntry, (), core::ops::control_flow::ControlFlow<&kv_engine::pitr::WalEntry>, core::iter::traits::iterator::Iterator::find_map::check<(usize, &kv_engine::pitr::WalEntry), &kv_engine::pitr::WalEntry, &mut <kv_engine::pitr::CanonicalWalEntryStream>::entries::{closure#0}>::{closure#0}>::{closure#0}, core::ops::control_flow::ControlFlow<&kv_engine::pitr::WalEntry>> (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            76
+          ],
+          [
+            "<bytes::bytes::Bytes as core::convert::From<alloc::vec::Vec<u8>>>::from (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            70
+          ],
+          [
+            "kv_engine::wal::v7::codec::encode_data_frame_sequence (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            67
+          ],
+          [
+            "<crossbeam_skiplist::base::SkipList<bytes::bytes::Bytes, bytes::bytes::Bytes>>::insert_internal::<<crossbeam_skiplist::base::SkipList<bytes::bytes::Bytes, bytes::bytes::Bytes>>::insert::{closure#0}, <crossbeam_skiplist::base::SkipList<bytes::bytes::Bytes, bytes::bytes::Bytes>>::insert::{closure#1}> (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            64
+          ],
+          [
+            "<bytes::bytes::Bytes>::copy_from_slice (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            45
+          ],
+          [
+            "<kv_engine::wal::v7::codec::PreparedWalV7LogicalBatch>::encode_entry_stream (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            44
+          ],
+          [
+            "<kv_engine::lsm_storage::LsmStorageInner>::encode_kind_value_for_batch (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            42
+          ],
+          [
+            "bytes::bytes::shallow_clone_vec (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            39
+          ],
+          [
+            "<alloc::vec::Vec<(bytes::bytes::Bytes, bytes::bytes::Bytes)> as core::ops::drop::Drop>::drop (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            34
+          ]
+        ],
+        "exact_verified_libc_lock_site_samples": 288,
+        "exact_verified_libc_lock_site_pct": 8.16326530612245,
+        "lock_site_note": "Lower bound from four exact sampled lock/xchg branch sites, not all libc or allocator CPU; private function names are stripped."
+      }
+    },
+    {
+      "cohort": "formats",
+      "name": "01-v8",
+      "format": "v8",
+      "allocator": "system",
+      "puts_s": 102261.82516743576,
+      "p99_ms": 28.149031,
+      "mean_sync_ms": 2.8961325073954987,
+      "syncs": 1555,
+      "worker_groups": 6556,
+      "process_cpu_s": 10.463625,
+      "command_tree_max_individual_rss_kib": null,
+      "storage_flag": true,
+      "performance_ranking_eligible": false,
+      "profiler_lost_samples": 0,
+      "phase_estimates": {
+        "producer": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "preflight": {
+          "calls": 11728,
+          "samples": 192,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.18999677633333334,
+          "estimated_wall_s": 0.21358709858333336
+        },
+        "encode": {
+          "calls": 11728,
+          "samples": 192,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 2.2398191818333335,
+          "estimated_wall_s": 2.2837116494166665
+        },
+        "frame": {
+          "calls": 11728,
+          "samples": 192,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.4328383325,
+          "estimated_wall_s": 0.44623335775
+        },
+        "direct_alloc": {
+          "calls": 13283,
+          "samples": 216,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.18541071806043954,
+          "estimated_wall_s": 0.21374975641758243
+        },
+        "admit": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "digest_ready": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "frames_ready": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "data_complete": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "reserve_frontier": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "publish_durable": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "snapshot": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "coalesce": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "coordinator_lock_wait": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "submission_lock_wait": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "submit_data": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "pack_data": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "worker_submit": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "worker_cqe": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "completion_receive": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "completion_publish": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "frontier_encode": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "frontier_write": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "frontier_sync": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "resources_retire": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "guards_retire": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "v7_materialize": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "v7_sync_cycle": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "worker_receive": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "memtable_publish": {
+          "calls": 11728,
+          "samples": 192,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 3.1341587123333334,
+          "estimated_wall_s": 3.18284854275
+        },
+        "mvcc_publish": {
+          "calls": 11728,
+          "samples": 192,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.7735306241666666,
+          "estimated_wall_s": 0.8515702021666667
+        },
+        "v7_logical_hash": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "frontier_lock_wait": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "coordinator_wait": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "logical_alloc": {
+          "calls": 11728,
+          "samples": 192,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.84668298575,
+          "estimated_wall_s": 0.8591939519166666
+        },
+        "entry_encode": {
+          "calls": 11728,
+          "samples": 192,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 1.2711348209166669,
+          "estimated_wall_s": 1.2898199071666667
+        }
+      },
+      "cpu_samples": {
+        "samples": 3821,
+        "P_samples": 3821,
+        "E_samples": 0,
+        "threads": 19,
+        "samples_without_stack": 0,
+        "one_frame_stacks": 1559,
+        "categories": {
+          "blake3": {
+            "samples": 399,
+            "pct": 10.442292593561895
+          },
+          "other": {
+            "samples": 884,
+            "pct": 23.135304894006804
+          },
+          "libc": {
+            "samples": 1242,
+            "pct": 32.504579952891916
+          },
+          "skiplist_search": {
+            "samples": 289,
+            "pct": 7.5634650615022245
+          },
+          "skiplist_insert": {
+            "samples": 262,
+            "pct": 6.856843758178488
+          },
+          "clock_gettime": {
+            "samples": 187,
+            "pct": 4.89400680450144
+          },
+          "mvcc_publish": {
+            "samples": 346,
+            "pct": 9.05522114629678
+          },
+          "crc32": {
+            "samples": 204,
+            "pct": 5.33891651400157
+          },
+          "sha256": {
+            "samples": 8,
+            "pct": 0.2093692750588851
+          }
+        },
+        "top_leaf_symbols": [
+          [
+            "[unknown] (/usr/lib/libc.so.6)",
+            1112
+          ],
+          [
+            "<kv_engine::mvcc::LsmMvccInner>::publish_commit_ts (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            346
+          ],
+          [
+            "_blake3_hash_many_avx2 (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            306
+          ],
+          [
+            "<crossbeam_skiplist::base::SkipList<bytes::bytes::Bytes, bytes::bytes::Bytes>>::search_position::<bytes::bytes::Bytes> (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            289
+          ],
+          [
+            "<crossbeam_skiplist::base::SkipList<bytes::bytes::Bytes, bytes::bytes::Bytes>>::insert_internal::<<crossbeam_skiplist::base::SkipList<bytes::bytes::Bytes, bytes::bytes::Bytes>>::insert::{closure#0}, <crossbeam_skiplist::base::SkipList<bytes::bytes::Bytes, bytes::bytes::Bytes>>::insert::{closure#1}> (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            262
+          ],
+          [
+            "__vdso_clock_gettime ([vdso])",
+            187
+          ],
+          [
+            "<std::thread::local::LocalKey<core::cell::RefCell<alloc::vec::Vec<u8>>>>::with::<<kv_engine::mem_table::MemTable>::publish_raw_batch::{closure#0}, ()> (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            172
+          ],
+          [
+            "crc32fast::baseline::update_fast_16 (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            108
+          ],
+          [
+            "crc32fast::specialized::pclmulqdq::calculate (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            87
+          ],
+          [
+            "_blake3_compress_in_place_sse41 (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            83
+          ],
+          [
+            "<core::slice::iter::Iter<kv_engine::pitr::WalEntry> as core::iter::traits::iterator::Iterator>::try_fold::<(), <core::iter::adapters::enumerate::Enumerate<_> as core::iter::traits::iterator::Iterator>::try_fold::enumerate<&kv_engine::pitr::WalEntry, (), core::ops::control_flow::ControlFlow<&kv_engine::pitr::WalEntry>, core::iter::traits::iterator::Iterator::find_map::check<(usize, &kv_engine::pitr::WalEntry), &kv_engine::pitr::WalEntry, &mut <kv_engine::pitr::CanonicalWalEntryStream>::entries::{closure#0}>::{closure#0}>::{closure#0}, core::ops::control_flow::ControlFlow<&kv_engine::pitr::WalEntry>> (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            63
+          ],
+          [
+            "malloc (/usr/lib/libc.so.6)",
+            53
+          ],
+          [
+            "<parking_lot::raw_mutex::RawMutex>::lock_slow (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            47
+          ],
+          [
+            "<crossbeam_channel::flavors::list::Channel<kv_engine::wal::parallel_worker::GroupWriteResult>>::recv (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            43
+          ],
+          [
+            "<kv_engine::lsm_storage::LsmStorageInner>::push_point_batch_entry::<&[u8]> (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            31
+          ],
+          [
+            "cfree (/usr/lib/libc.so.6)",
+            27
+          ],
+          [
+            "syscall (/usr/lib/libc.so.6)",
+            22
+          ],
+          [
+            "<parking_lot::condvar::Condvar>::wait_until_internal (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            20
+          ],
+          [
+            "kv_engine::key::decode_user_key_into (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            19
+          ],
+          [
+            "<std::sys::pal::unix::time::Timespec>::sub_timespec (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            17
+          ]
+        ],
+        "libc_elf_base": "0x74edc27e3000",
+        "libc_build_id": "7a8d41a2df4fde040b4c6ac2832311ab645a1e41",
+        "top_libc_offsets": [
+          [
+            "0xa5fdc",
+            185
+          ],
+          [
+            "0xa5ffc",
+            107
+          ],
+          [
+            "0xa481c",
+            58
+          ],
+          [
+            "0x16d053",
+            58
+          ],
+          [
+            "0x16c11d",
+            52
+          ],
+          [
+            "0x16c119",
+            41
+          ],
+          [
+            "0x16bf08",
+            35
+          ],
+          [
+            "0xa4809",
+            33
+          ],
+          [
+            "0x16c887",
+            31
+          ],
+          [
+            "0x16be20",
+            23
+          ],
+          [
+            "0x16bf04",
+            18
+          ],
+          [
+            "0x11806d",
+            16
+          ],
+          [
+            "0xa702f",
+            14
+          ],
+          [
+            "0x16bf0c",
+            13
+          ],
+          [
+            "0xa5c25",
+            12
+          ],
+          [
+            "0xa5c10",
+            11
+          ],
+          [
+            "0x16c724",
+            11
+          ],
+          [
+            "0x16c6f1",
+            11
+          ],
+          [
+            "0xa7018",
+            10
+          ],
+          [
+            "0x16c580",
+            10
+          ]
+        ],
+        "top_libc_non_libc_callers": [
+          [
+            "<crossbeam_skiplist::base::SkipList<bytes::bytes::Bytes, bytes::bytes::Bytes>>::search_position::<bytes::bytes::Bytes> (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            171
+          ],
+          [
+            "<core::iter::adapters::map::Map<core::slice::iter::Iter<(bytes::bytes::Bytes, bytes::bytes::Bytes, kv_engine::mvcc::BatchEntryKind)>, <kv_engine::mvcc::LsmMvccInner>::write_batch_wal_only_inner::{closure#0}> as core::iter::traits::iterator::Iterator>::fold::<(), core::iter::traits::iterator::Iterator::for_each::call<kv_engine::pitr::WalEntry, <alloc::vec::Vec<kv_engine::pitr::WalEntry>>::extend_trusted<core::iter::adapters::map::Map<core::slice::iter::Iter<(bytes::bytes::Bytes, bytes::bytes::Bytes, kv_engine::mvcc::BatchEntryKind)>, <kv_engine::mvcc::LsmMvccInner>::write_batch_wal_only_inner::{closure#0}>>::{closure#0}>::{closure#0}> (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            154
+          ],
+          [
+            "<std::thread::local::LocalKey<core::cell::RefCell<alloc::vec::Vec<u8>>>>::with::<<kv_engine::mem_table::MemTable>::publish_raw_batch::{closure#0}, ()> (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            135
+          ],
+          [
+            "<bytes::bytes::Bytes as core::convert::From<alloc::vec::Vec<u8>>>::from (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            84
+          ],
+          [
+            "<crossbeam_skiplist::base::SkipList<bytes::bytes::Bytes, bytes::bytes::Bytes>>::insert_internal::<<crossbeam_skiplist::base::SkipList<bytes::bytes::Bytes, bytes::bytes::Bytes>>::insert::{closure#0}, <crossbeam_skiplist::base::SkipList<bytes::bytes::Bytes, bytes::bytes::Bytes>>::insert::{closure#1}> (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            75
+          ],
+          [
+            "<core::slice::iter::Iter<kv_engine::pitr::WalEntry> as core::iter::traits::iterator::Iterator>::try_fold::<(), <core::iter::adapters::enumerate::Enumerate<_> as core::iter::traits::iterator::Iterator>::try_fold::enumerate<&kv_engine::pitr::WalEntry, (), core::ops::control_flow::ControlFlow<&kv_engine::pitr::WalEntry>, core::iter::traits::iterator::Iterator::find_map::check<(usize, &kv_engine::pitr::WalEntry), &kv_engine::pitr::WalEntry, &mut <kv_engine::pitr::CanonicalWalEntryStream>::entries::{closure#0}>::{closure#0}>::{closure#0}, core::ops::control_flow::ControlFlow<&kv_engine::pitr::WalEntry>> (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            72
+          ],
+          [
+            "kv_engine::wal::v8::codec::encode_data_fragment_frame_into (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            47
+          ],
+          [
+            "<kv_engine::wal::v8::prepare::AdmittedWalV8Batch<kv_engine::wal::v8::parallel::WalV8ParallelAdmissionGuard, kv_engine::wal::v8::leader::WalV8PreflightReservation>>::encode (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            46
+          ],
+          [
+            "<kv_engine::mvcc::LsmMvccInner>::write_batch_wal_only_inner (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            45
+          ],
+          [
+            "<kv_engine::lsm_storage::LsmStorageInner>::encode_kind_value_for_batch (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            45
+          ],
+          [
+            "std::sys::backtrace::__rust_begin_short_backtrace::<write_perf::run_wal_batch_concurrent::{closure#0}, core::result::Result<alloc::vec::Vec<u64>, anyhow::Error>> (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            39
+          ],
+          [
+            "<alloc::vec::Vec<(bytes::bytes::Bytes, bytes::bytes::Bytes)> as core::ops::drop::Drop>::drop (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            33
+          ]
+        ],
+        "exact_verified_libc_lock_site_samples": 383,
+        "exact_verified_libc_lock_site_pct": 10.023554043444124,
+        "lock_site_note": "Lower bound from four exact sampled lock/xchg branch sites, not all libc or allocator CPU; private function names are stripped."
+      },
+      "digest_metrics": {
+        "payload_hash_bytes": 787500000,
+        "payload_hash_cpu_ns": 14095346,
+        "header_batch_hash_cpu_ns": 282860,
+        "ordered_link_hash_cpu_ns": 214859,
+        "post_encode_hash_reread_bytes": 0,
+        "cpu_timing_sample_rate": 64,
+        "cpu_timing_sampled_tickets": 184
+      },
+      "digest_estimated_cpu_s": {
+        "payload_hash_cpu_ns": 0.8984250972173913,
+        "header_batch_hash_cpu_ns": 0.01802925043478261,
+        "ordered_link_hash_cpu_ns": 0.013694925826086958
+      }
+    },
+    {
+      "cohort": "formats",
+      "name": "02-v8",
+      "format": "v8",
+      "allocator": "system",
+      "puts_s": 104664.32506465889,
+      "p99_ms": 29.076272,
+      "mean_sync_ms": 2.651029899491094,
+      "syncs": 1572,
+      "worker_groups": 6505,
+      "process_cpu_s": 10.677299999999999,
+      "command_tree_max_individual_rss_kib": null,
+      "storage_flag": true,
+      "performance_ranking_eligible": false,
+      "profiler_lost_samples": 0,
+      "phase_estimates": {
+        "producer": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "preflight": {
+          "calls": 11728,
+          "samples": 192,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.18880644541666666,
+          "estimated_wall_s": 0.21317674075
+        },
+        "encode": {
+          "calls": 11728,
+          "samples": 192,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 2.2018260204166666,
+          "estimated_wall_s": 2.24086841025
+        },
+        "frame": {
+          "calls": 11728,
+          "samples": 192,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.4219348353333333,
+          "estimated_wall_s": 0.4380958360833333
+        },
+        "direct_alloc": {
+          "calls": 13300,
+          "samples": 216,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.1941424267747253,
+          "estimated_wall_s": 0.22051010596153847
+        },
+        "admit": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "digest_ready": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "frames_ready": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "data_complete": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "reserve_frontier": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "publish_durable": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "snapshot": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "coalesce": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "coordinator_lock_wait": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "submission_lock_wait": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "submit_data": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "pack_data": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "worker_submit": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "worker_cqe": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "completion_receive": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "completion_publish": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "frontier_encode": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "frontier_write": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "frontier_sync": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "resources_retire": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "guards_retire": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "v7_materialize": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "v7_sync_cycle": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "worker_receive": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "memtable_publish": {
+          "calls": 11728,
+          "samples": 192,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 3.1897881591666666,
+          "estimated_wall_s": 3.23502953
+        },
+        "mvcc_publish": {
+          "calls": 11728,
+          "samples": 192,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.7294657183333334,
+          "estimated_wall_s": 0.8341329873333334
+        },
+        "v7_logical_hash": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "frontier_lock_wait": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "coordinator_wait": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "logical_alloc": {
+          "calls": 11728,
+          "samples": 192,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.8524735025,
+          "estimated_wall_s": 0.87285951525
+        },
+        "entry_encode": {
+          "calls": 11728,
+          "samples": 192,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 1.2353436525833332,
+          "estimated_wall_s": 1.2587112039166668
+        }
+      },
+      "cpu_samples": {
+        "samples": 3983,
+        "P_samples": 3983,
+        "E_samples": 0,
+        "threads": 19,
+        "samples_without_stack": 0,
+        "one_frame_stacks": 1658,
+        "categories": {
+          "other": {
+            "samples": 900,
+            "pct": 22.596033140848608
+          },
+          "mvcc_publish": {
+            "samples": 384,
+            "pct": 9.640974140095405
+          },
+          "libc": {
+            "samples": 1290,
+            "pct": 32.387647501883
+          },
+          "skiplist_insert": {
+            "samples": 273,
+            "pct": 6.854130052724077
+          },
+          "blake3": {
+            "samples": 427,
+            "pct": 10.720562390158172
+          },
+          "crc32": {
+            "samples": 203,
+            "pct": 5.0966608084358525
+          },
+          "skiplist_search": {
+            "samples": 337,
+            "pct": 8.460959076073312
+          },
+          "clock_gettime": {
+            "samples": 165,
+            "pct": 4.142606075822244
+          },
+          "sha256": {
+            "samples": 4,
+            "pct": 0.10042681395932714
+          }
+        },
+        "top_leaf_symbols": [
+          [
+            "[unknown] (/usr/lib/libc.so.6)",
+            1155
+          ],
+          [
+            "<kv_engine::mvcc::LsmMvccInner>::publish_commit_ts (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            384
+          ],
+          [
+            "<crossbeam_skiplist::base::SkipList<bytes::bytes::Bytes, bytes::bytes::Bytes>>::search_position::<bytes::bytes::Bytes> (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            337
+          ],
+          [
+            "_blake3_hash_many_avx2 (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            321
+          ],
+          [
+            "<crossbeam_skiplist::base::SkipList<bytes::bytes::Bytes, bytes::bytes::Bytes>>::insert_internal::<<crossbeam_skiplist::base::SkipList<bytes::bytes::Bytes, bytes::bytes::Bytes>>::insert::{closure#0}, <crossbeam_skiplist::base::SkipList<bytes::bytes::Bytes, bytes::bytes::Bytes>>::insert::{closure#1}> (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            273
+          ],
+          [
+            "__vdso_clock_gettime ([vdso])",
+            165
+          ],
+          [
+            "<std::thread::local::LocalKey<core::cell::RefCell<alloc::vec::Vec<u8>>>>::with::<<kv_engine::mem_table::MemTable>::publish_raw_batch::{closure#0}, ()> (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            152
+          ],
+          [
+            "crc32fast::baseline::update_fast_16 (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            107
+          ],
+          [
+            "_blake3_compress_in_place_sse41 (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            94
+          ],
+          [
+            "crc32fast::specialized::pclmulqdq::calculate (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            88
+          ],
+          [
+            "<core::slice::iter::Iter<kv_engine::pitr::WalEntry> as core::iter::traits::iterator::Iterator>::try_fold::<(), <core::iter::adapters::enumerate::Enumerate<_> as core::iter::traits::iterator::Iterator>::try_fold::enumerate<&kv_engine::pitr::WalEntry, (), core::ops::control_flow::ControlFlow<&kv_engine::pitr::WalEntry>, core::iter::traits::iterator::Iterator::find_map::check<(usize, &kv_engine::pitr::WalEntry), &kv_engine::pitr::WalEntry, &mut <kv_engine::pitr::CanonicalWalEntryStream>::entries::{closure#0}>::{closure#0}>::{closure#0}, core::ops::control_flow::ControlFlow<&kv_engine::pitr::WalEntry>> (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            47
+          ],
+          [
+            "<crossbeam_channel::flavors::list::Channel<kv_engine::wal::parallel_worker::GroupWriteResult>>::recv (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            43
+          ],
+          [
+            "<parking_lot::raw_mutex::RawMutex>::lock_slow (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            38
+          ],
+          [
+            "malloc (/usr/lib/libc.so.6)",
+            35
+          ],
+          [
+            "<kv_engine::lsm_storage::LsmStorageInner>::push_point_batch_entry::<&[u8]> (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            31
+          ],
+          [
+            "cfree (/usr/lib/libc.so.6)",
+            31
+          ],
+          [
+            "syscall (/usr/lib/libc.so.6)",
+            31
+          ],
+          [
+            "clock_gettime (/usr/lib/libc.so.6)",
+            25
+          ],
+          [
+            "<parking_lot::raw_mutex::RawMutex>::unlock_slow (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            21
+          ],
+          [
+            "kv_engine::key::decode_user_key_into (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            20
+          ]
+        ],
+        "libc_elf_base": "0x7418c4df2000",
+        "libc_build_id": "7a8d41a2df4fde040b4c6ac2832311ab645a1e41",
+        "top_libc_offsets": [
+          [
+            "0xa5fdc",
+            161
+          ],
+          [
+            "0xa5ffc",
+            123
+          ],
+          [
+            "0xa481c",
+            65
+          ],
+          [
+            "0x16c11d",
+            58
+          ],
+          [
+            "0x16d053",
+            57
+          ],
+          [
+            "0xa4809",
+            47
+          ],
+          [
+            "0x16bf08",
+            30
+          ],
+          [
+            "0x16be20",
+            30
+          ],
+          [
+            "0x16c887",
+            29
+          ],
+          [
+            "0x11806d",
+            28
+          ],
+          [
+            "0x16c119",
+            27
+          ],
+          [
+            "0xa5c25",
+            15
+          ],
+          [
+            "0xa5c1c",
+            13
+          ],
+          [
+            "0x16c724",
+            13
+          ],
+          [
+            "0x16c1cb",
+            11
+          ],
+          [
+            "0x16cfe8",
+            11
+          ],
+          [
+            "0xa753b",
+            10
+          ],
+          [
+            "0xa49e1",
+            10
+          ],
+          [
+            "0xa528b",
+            9
+          ],
+          [
+            "0xa5c14",
+            9
+          ]
+        ],
+        "top_libc_non_libc_callers": [
+          [
+            "<crossbeam_skiplist::base::SkipList<bytes::bytes::Bytes, bytes::bytes::Bytes>>::search_position::<bytes::bytes::Bytes> (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            159
+          ],
+          [
+            "<core::iter::adapters::map::Map<core::slice::iter::Iter<(bytes::bytes::Bytes, bytes::bytes::Bytes, kv_engine::mvcc::BatchEntryKind)>, <kv_engine::mvcc::LsmMvccInner>::write_batch_wal_only_inner::{closure#0}> as core::iter::traits::iterator::Iterator>::fold::<(), core::iter::traits::iterator::Iterator::for_each::call<kv_engine::pitr::WalEntry, <alloc::vec::Vec<kv_engine::pitr::WalEntry>>::extend_trusted<core::iter::adapters::map::Map<core::slice::iter::Iter<(bytes::bytes::Bytes, bytes::bytes::Bytes, kv_engine::mvcc::BatchEntryKind)>, <kv_engine::mvcc::LsmMvccInner>::write_batch_wal_only_inner::{closure#0}>>::{closure#0}>::{closure#0}> (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            148
+          ],
+          [
+            "<std::thread::local::LocalKey<core::cell::RefCell<alloc::vec::Vec<u8>>>>::with::<<kv_engine::mem_table::MemTable>::publish_raw_batch::{closure#0}, ()> (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            121
+          ],
+          [
+            "<crossbeam_skiplist::base::SkipList<bytes::bytes::Bytes, bytes::bytes::Bytes>>::insert_internal::<<crossbeam_skiplist::base::SkipList<bytes::bytes::Bytes, bytes::bytes::Bytes>>::insert::{closure#0}, <crossbeam_skiplist::base::SkipList<bytes::bytes::Bytes, bytes::bytes::Bytes>>::insert::{closure#1}> (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            88
+          ],
+          [
+            "<core::slice::iter::Iter<kv_engine::pitr::WalEntry> as core::iter::traits::iterator::Iterator>::try_fold::<(), <core::iter::adapters::enumerate::Enumerate<_> as core::iter::traits::iterator::Iterator>::try_fold::enumerate<&kv_engine::pitr::WalEntry, (), core::ops::control_flow::ControlFlow<&kv_engine::pitr::WalEntry>, core::iter::traits::iterator::Iterator::find_map::check<(usize, &kv_engine::pitr::WalEntry), &kv_engine::pitr::WalEntry, &mut <kv_engine::pitr::CanonicalWalEntryStream>::entries::{closure#0}>::{closure#0}>::{closure#0}, core::ops::control_flow::ControlFlow<&kv_engine::pitr::WalEntry>> (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            78
+          ],
+          [
+            "<bytes::bytes::Bytes as core::convert::From<alloc::vec::Vec<u8>>>::from (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            75
+          ],
+          [
+            "<kv_engine::mvcc::LsmMvccInner>::write_batch_wal_only_inner (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            51
+          ],
+          [
+            "kv_engine::wal::v8::codec::encode_data_fragment_frame_into (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            51
+          ],
+          [
+            "<kv_engine::lsm_storage::LsmStorageInner>::encode_kind_value_for_batch (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            49
+          ],
+          [
+            "<bytes::bytes::Bytes>::copy_from_slice (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            42
+          ],
+          [
+            "<alloc::vec::Vec<(bytes::bytes::Bytes, bytes::bytes::Bytes)> as core::ops::drop::Drop>::drop (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            42
+          ],
+          [
+            "<kv_engine::wal::v8::prepare::AdmittedWalV8Batch<kv_engine::wal::v8::parallel::WalV8ParallelAdmissionGuard, kv_engine::wal::v8::leader::WalV8PreflightReservation>>::encode (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            40
+          ]
+        ],
+        "exact_verified_libc_lock_site_samples": 396,
+        "exact_verified_libc_lock_site_pct": 9.942254581973387,
+        "lock_site_note": "Lower bound from four exact sampled lock/xchg branch sites, not all libc or allocator CPU; private function names are stripped."
+      },
+      "digest_metrics": {
+        "payload_hash_bytes": 787500000,
+        "payload_hash_cpu_ns": 14266190,
+        "header_batch_hash_cpu_ns": 283840,
+        "ordered_link_hash_cpu_ns": 226748,
+        "post_encode_hash_reread_bytes": 0,
+        "cpu_timing_sample_rate": 64,
+        "cpu_timing_sampled_tickets": 184
+      },
+      "digest_estimated_cpu_s": {
+        "payload_hash_cpu_ns": 0.9093145452173913,
+        "header_batch_hash_cpu_ns": 0.018091714782608695,
+        "ordered_link_hash_cpu_ns": 0.014452720347826088
+      }
+    },
+    {
+      "cohort": "formats",
+      "name": "03-v7",
+      "format": "v7",
+      "allocator": "system",
+      "puts_s": 207517.9673400166,
+      "p99_ms": 20.593221,
+      "mean_sync_ms": 1.0049600570054944,
+      "syncs": 1456,
+      "worker_groups": 5404,
+      "process_cpu_s": 6.25061,
+      "command_tree_max_individual_rss_kib": null,
+      "storage_flag": true,
+      "performance_ranking_eligible": false,
+      "profiler_lost_samples": 0,
+      "phase_estimates": {
+        "producer": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "preflight": {
+          "calls": 11728,
+          "samples": 192,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.12856484041666666,
+          "estimated_wall_s": 0.142514991
+        },
+        "encode": {
+          "calls": 11728,
+          "samples": 192,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.5406618384166666,
+          "estimated_wall_s": 0.5493225388333334
+        },
+        "frame": {
+          "calls": 11728,
+          "samples": 193,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.631276941,
+          "estimated_wall_s": 0.645390277
+        },
+        "direct_alloc": {
+          "calls": 13184,
+          "samples": 215,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.07630137294565217,
+          "estimated_wall_s": 0.08505512263043478
+        },
+        "admit": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "digest_ready": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "frames_ready": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "data_complete": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "reserve_frontier": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "publish_durable": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "snapshot": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "coalesce": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "coordinator_lock_wait": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "submission_lock_wait": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "submit_data": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "pack_data": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "worker_submit": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "worker_cqe": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "completion_receive": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "completion_publish": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "frontier_encode": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "frontier_write": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "frontier_sync": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "resources_retire": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "guards_retire": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "v7_materialize": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "v7_sync_cycle": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "worker_receive": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "memtable_publish": {
+          "calls": 11728,
+          "samples": 192,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 1.9743593225,
+          "estimated_wall_s": 2.0032513726666665
+        },
+        "mvcc_publish": {
+          "calls": 11728,
+          "samples": 192,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.16148661916666665,
+          "estimated_wall_s": 0.17313954775
+        },
+        "v7_logical_hash": {
+          "calls": 11728,
+          "samples": 184,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.9309293129565217,
+          "estimated_wall_s": 0.950713747826087
+        },
+        "frontier_lock_wait": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "coordinator_wait": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "logical_alloc": {
+          "calls": 11728,
+          "samples": 192,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.20409658108333334,
+          "estimated_wall_s": 0.210877503
+        },
+        "entry_encode": {
+          "calls": 11728,
+          "samples": 192,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.3014741650833333,
+          "estimated_wall_s": 0.3103813978333333
+        }
+      },
+      "cpu_samples": {
+        "samples": 2429,
+        "P_samples": 2429,
+        "E_samples": 0,
+        "threads": 19,
+        "samples_without_stack": 0,
+        "one_frame_stacks": 1259,
+        "categories": {
+          "sha256": {
+            "samples": 452,
+            "pct": 18.608480856319474
+          },
+          "other": {
+            "samples": 523,
+            "pct": 21.531494442157268
+          },
+          "libc": {
+            "samples": 752,
+            "pct": 30.95924248662001
+          },
+          "skiplist_insert": {
+            "samples": 131,
+            "pct": 5.3931659118979
+          },
+          "mvcc_publish": {
+            "samples": 101,
+            "pct": 4.158089748867847
+          },
+          "skiplist_search": {
+            "samples": 192,
+            "pct": 7.904487443392343
+          },
+          "crc32": {
+            "samples": 151,
+            "pct": 6.216550020584603
+          },
+          "clock_gettime": {
+            "samples": 127,
+            "pct": 5.22848909016056
+          }
+        },
+        "top_leaf_symbols": [
+          [
+            "[unknown] (/usr/lib/libc.so.6)",
+            683
+          ],
+          [
+            "sha2::sha256::x86::digest_blocks (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            452
+          ],
+          [
+            "<crossbeam_skiplist::base::SkipList<bytes::bytes::Bytes, bytes::bytes::Bytes>>::search_position::<bytes::bytes::Bytes> (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            192
+          ],
+          [
+            "<crossbeam_skiplist::base::SkipList<bytes::bytes::Bytes, bytes::bytes::Bytes>>::insert_internal::<<crossbeam_skiplist::base::SkipList<bytes::bytes::Bytes, bytes::bytes::Bytes>>::insert::{closure#0}, <crossbeam_skiplist::base::SkipList<bytes::bytes::Bytes, bytes::bytes::Bytes>>::insert::{closure#1}> (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            131
+          ],
+          [
+            "__vdso_clock_gettime ([vdso])",
+            127
+          ],
+          [
+            "<kv_engine::mvcc::LsmMvccInner>::publish_commit_ts (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            101
+          ],
+          [
+            "<std::thread::local::LocalKey<core::cell::RefCell<alloc::vec::Vec<u8>>>>::with::<<kv_engine::mem_table::MemTable>::publish_raw_batch::{closure#0}, ()> (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            84
+          ],
+          [
+            "crc32fast::baseline::update_fast_16 (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            74
+          ],
+          [
+            "crc32fast::specialized::pclmulqdq::calculate (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            70
+          ],
+          [
+            "<core::slice::iter::Iter<kv_engine::pitr::WalEntry> as core::iter::traits::iterator::Iterator>::try_fold::<(), <core::iter::adapters::enumerate::Enumerate<_> as core::iter::traits::iterator::Iterator>::try_fold::enumerate<&kv_engine::pitr::WalEntry, (), core::ops::control_flow::ControlFlow<&kv_engine::pitr::WalEntry>, core::iter::traits::iterator::Iterator::find_map::check<(usize, &kv_engine::pitr::WalEntry), &kv_engine::pitr::WalEntry, &mut <kv_engine::pitr::CanonicalWalEntryStream>::entries::{closure#0}>::{closure#0}>::{closure#0}, core::ops::control_flow::ControlFlow<&kv_engine::pitr::WalEntry>> (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            37
+          ],
+          [
+            "malloc (/usr/lib/libc.so.6)",
+            28
+          ],
+          [
+            "<crossbeam_channel::flavors::list::Channel<kv_engine::wal::parallel_worker::WorkerCommand<kv_engine::wal::parallel_runtime::ParallelBuffer>>>::recv (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            27
+          ],
+          [
+            "<crossbeam_channel::flavors::list::Channel<kv_engine::wal::parallel_worker::GroupWriteResult>>::recv (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            20
+          ],
+          [
+            "clock_gettime (/usr/lib/libc.so.6)",
+            17
+          ],
+          [
+            "crossbeam_epoch::default::with_handle::<crossbeam_epoch::default::pin::{closure#0}, crossbeam_epoch::guard::Guard> (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            14
+          ],
+          [
+            "<crossbeam_channel::flavors::array::Channel<bool>>::recv (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            14
+          ],
+          [
+            "cfree (/usr/lib/libc.so.6)",
+            13
+          ],
+          [
+            "kv_engine::key::decode_user_key_into (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            12
+          ],
+          [
+            "bytes::bytes::shared_drop (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            12
+          ],
+          [
+            "<crossbeam_epoch::internal::Global>::try_advance (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            12
+          ]
+        ],
+        "libc_elf_base": "0x781e49462000",
+        "libc_build_id": "7a8d41a2df4fde040b4c6ac2832311ab645a1e41",
+        "top_libc_offsets": [
+          [
+            "0xa5fdc",
+            107
+          ],
+          [
+            "0x16d053",
+            72
+          ],
+          [
+            "0xa5ffc",
+            65
+          ],
+          [
+            "0x16c11d",
+            30
+          ],
+          [
+            "0xa481c",
+            26
+          ],
+          [
+            "0xa4809",
+            19
+          ],
+          [
+            "0x16c119",
+            18
+          ],
+          [
+            "0x16be20",
+            16
+          ],
+          [
+            "0x16c887",
+            15
+          ],
+          [
+            "0x16bf08",
+            14
+          ],
+          [
+            "0x16bf04",
+            13
+          ],
+          [
+            "0xe3350",
+            12
+          ],
+          [
+            "0x16bf0c",
+            11
+          ],
+          [
+            "0xa7018",
+            9
+          ],
+          [
+            "0x16bf0e",
+            9
+          ],
+          [
+            "0x16c580",
+            9
+          ],
+          [
+            "0x11806d",
+            7
+          ],
+          [
+            "0x16c115",
+            7
+          ],
+          [
+            "0xa5c14",
+            7
+          ],
+          [
+            "0x16cfe8",
+            7
+          ]
+        ],
+        "top_libc_non_libc_callers": [
+          [
+            "<crossbeam_skiplist::base::SkipList<bytes::bytes::Bytes, bytes::bytes::Bytes>>::search_position::<bytes::bytes::Bytes> (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            106
+          ],
+          [
+            "<std::thread::local::LocalKey<core::cell::RefCell<alloc::vec::Vec<u8>>>>::with::<<kv_engine::mem_table::MemTable>::publish_raw_batch::{closure#0}, ()> (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            73
+          ],
+          [
+            "<core::iter::adapters::map::Map<core::slice::iter::Iter<(bytes::bytes::Bytes, bytes::bytes::Bytes, kv_engine::mvcc::BatchEntryKind)>, <kv_engine::mvcc::LsmMvccInner>::write_batch_wal_only_inner::{closure#5}> as core::iter::traits::iterator::Iterator>::fold::<(), core::iter::traits::iterator::Iterator::for_each::call<kv_engine::pitr::WalEntry, <alloc::vec::Vec<kv_engine::pitr::WalEntry>>::extend_trusted<core::iter::adapters::map::Map<core::slice::iter::Iter<(bytes::bytes::Bytes, bytes::bytes::Bytes, kv_engine::mvcc::BatchEntryKind)>, <kv_engine::mvcc::LsmMvccInner>::write_batch_wal_only_inner::{closure#5}>>::{closure#0}>::{closure#0}> (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            66
+          ],
+          [
+            "<bytes::bytes::Bytes as core::convert::From<alloc::vec::Vec<u8>>>::from (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            59
+          ],
+          [
+            "<crossbeam_skiplist::base::SkipList<bytes::bytes::Bytes, bytes::bytes::Bytes>>::insert_internal::<<crossbeam_skiplist::base::SkipList<bytes::bytes::Bytes, bytes::bytes::Bytes>>::insert::{closure#0}, <crossbeam_skiplist::base::SkipList<bytes::bytes::Bytes, bytes::bytes::Bytes>>::insert::{closure#1}> (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            54
+          ],
+          [
+            "kv_engine::wal::v7::codec::encode_data_frame_sequence (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            49
+          ],
+          [
+            "<core::slice::iter::Iter<kv_engine::pitr::WalEntry> as core::iter::traits::iterator::Iterator>::try_fold::<(), <core::iter::adapters::enumerate::Enumerate<_> as core::iter::traits::iterator::Iterator>::try_fold::enumerate<&kv_engine::pitr::WalEntry, (), core::ops::control_flow::ControlFlow<&kv_engine::pitr::WalEntry>, core::iter::traits::iterator::Iterator::find_map::check<(usize, &kv_engine::pitr::WalEntry), &kv_engine::pitr::WalEntry, &mut <kv_engine::pitr::CanonicalWalEntryStream>::entries::{closure#0}>::{closure#0}>::{closure#0}, core::ops::control_flow::ControlFlow<&kv_engine::pitr::WalEntry>> (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            48
+          ],
+          [
+            "<kv_engine::wal::v7::codec::PreparedWalV7LogicalBatch>::encode_entry_stream (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            42
+          ],
+          [
+            "<kv_engine::lsm_storage::LsmStorageInner>::encode_kind_value_for_batch (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            27
+          ],
+          [
+            "<bytes::bytes::Bytes>::copy_from_slice (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            27
+          ],
+          [
+            "kv_engine::key::encode_internal_key (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            25
+          ],
+          [
+            "bytes::bytes::shallow_clone_vec (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            24
+          ]
+        ],
+        "exact_verified_libc_lock_site_samples": 217,
+        "exact_verified_libc_lock_site_pct": 8.93371757925072,
+        "lock_site_note": "Lower bound from four exact sampled lock/xchg branch sites, not all libc or allocator CPU; private function names are stripped."
+      }
+    },
+    {
+      "cohort": "allocator",
+      "name": "00-system",
+      "format": "v8",
+      "allocator": "system",
+      "puts_s": 194610.52821903402,
+      "p99_ms": 25.883523,
+      "mean_sync_ms": 1.7323726580912862,
+      "syncs": 1205,
+      "worker_groups": 5920,
+      "process_cpu_s": 8.458890000000002,
+      "command_tree_max_individual_rss_kib": 931760,
+      "storage_flag": true,
+      "performance_ranking_eligible": false,
+      "profiler_lost_samples": 0,
+      "phase_estimates": {
+        "producer": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "preflight": {
+          "calls": 11728,
+          "samples": 192,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.15107356008333334,
+          "estimated_wall_s": 0.16790104108333334
+        },
+        "encode": {
+          "calls": 11728,
+          "samples": 192,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 1.7607465078333333,
+          "estimated_wall_s": 1.7881607689166668
+        },
+        "frame": {
+          "calls": 11728,
+          "samples": 192,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.3506555330833333,
+          "estimated_wall_s": 0.3610969348333333
+        },
+        "direct_alloc": {
+          "calls": 12933,
+          "samples": 208,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.1536395693846154,
+          "estimated_wall_s": 0.17637483384615385
+        },
+        "admit": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "digest_ready": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "frames_ready": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "data_complete": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "reserve_frontier": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "publish_durable": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "snapshot": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "coalesce": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "coordinator_lock_wait": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "submission_lock_wait": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "submit_data": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "pack_data": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "worker_submit": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "worker_cqe": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "completion_receive": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "completion_publish": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "frontier_encode": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "frontier_write": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "frontier_sync": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "resources_retire": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "guards_retire": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "v7_materialize": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "v7_sync_cycle": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "worker_receive": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "memtable_publish": {
+          "calls": 11728,
+          "samples": 192,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 2.6758857685,
+          "estimated_wall_s": 2.7049152561666667
+        },
+        "mvcc_publish": {
+          "calls": 11728,
+          "samples": 192,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.7875444846666666,
+          "estimated_wall_s": 1.0986521633333333
+        },
+        "v7_logical_hash": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "frontier_lock_wait": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "coordinator_wait": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "logical_alloc": {
+          "calls": 11728,
+          "samples": 192,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.6690502701666666,
+          "estimated_wall_s": 0.6840461063333334
+        },
+        "entry_encode": {
+          "calls": 11728,
+          "samples": 192,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 1.0025273374166666,
+          "estimated_wall_s": 1.0194447941666667
+        }
+      },
+      "cpu_samples": {
+        "samples": 3189,
+        "P_samples": 3189,
+        "E_samples": 0,
+        "threads": 18,
+        "samples_without_stack": 0,
+        "one_frame_stacks": 1369,
+        "categories": {
+          "libc": {
+            "samples": 999,
+            "pct": 31.32643461900282
+          },
+          "blake3": {
+            "samples": 330,
+            "pct": 10.348071495766698
+          },
+          "skiplist_search": {
+            "samples": 283,
+            "pct": 8.87425525243023
+          },
+          "mvcc_publish": {
+            "samples": 291,
+            "pct": 9.125117591721542
+          },
+          "other": {
+            "samples": 708,
+            "pct": 22.20131702728128
+          },
+          "clock_gettime": {
+            "samples": 143,
+            "pct": 4.484164314832236
+          },
+          "skiplist_insert": {
+            "samples": 269,
+            "pct": 8.435246158670429
+          },
+          "crc32": {
+            "samples": 164,
+            "pct": 5.142677955471934
+          },
+          "sha256": {
+            "samples": 2,
+            "pct": 0.06271558482282848
+          }
+        },
+        "top_leaf_symbols": [
+          [
+            "[unknown] (/usr/lib/libc.so.6)",
+            904
+          ],
+          [
+            "<kv_engine::mvcc::LsmMvccInner>::publish_commit_ts (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            291
+          ],
+          [
+            "<crossbeam_skiplist::base::SkipList<bytes::bytes::Bytes, bytes::bytes::Bytes>>::search_position::<bytes::bytes::Bytes> (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            283
+          ],
+          [
+            "<crossbeam_skiplist::base::SkipList<bytes::bytes::Bytes, bytes::bytes::Bytes>>::insert_internal::<<crossbeam_skiplist::base::SkipList<bytes::bytes::Bytes, bytes::bytes::Bytes>>::insert::{closure#0}, <crossbeam_skiplist::base::SkipList<bytes::bytes::Bytes, bytes::bytes::Bytes>>::insert::{closure#1}> (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            269
+          ],
+          [
+            "_blake3_hash_many_avx2 (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            255
+          ],
+          [
+            "__vdso_clock_gettime ([vdso])",
+            143
+          ],
+          [
+            "<std::thread::local::LocalKey<core::cell::RefCell<alloc::vec::Vec<u8>>>>::with::<<kv_engine::mem_table::MemTable>::publish_raw_batch::{closure#0}, ()> (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            127
+          ],
+          [
+            "crc32fast::baseline::update_fast_16 (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            92
+          ],
+          [
+            "crc32fast::specialized::pclmulqdq::calculate (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            69
+          ],
+          [
+            "_blake3_compress_in_place_sse41 (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            68
+          ],
+          [
+            "<core::slice::iter::Iter<kv_engine::pitr::WalEntry> as core::iter::traits::iterator::Iterator>::try_fold::<(), <core::iter::adapters::enumerate::Enumerate<_> as core::iter::traits::iterator::Iterator>::try_fold::enumerate<&kv_engine::pitr::WalEntry, (), core::ops::control_flow::ControlFlow<&kv_engine::pitr::WalEntry>, core::iter::traits::iterator::Iterator::find_map::check<(usize, &kv_engine::pitr::WalEntry), &kv_engine::pitr::WalEntry, &mut <kv_engine::pitr::CanonicalWalEntryStream>::entries::{closure#0}>::{closure#0}>::{closure#0}, core::ops::control_flow::ControlFlow<&kv_engine::pitr::WalEntry>> (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            44
+          ],
+          [
+            "<crossbeam_channel::flavors::list::Channel<kv_engine::wal::parallel_worker::GroupWriteResult>>::recv (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            40
+          ],
+          [
+            "malloc (/usr/lib/libc.so.6)",
+            34
+          ],
+          [
+            "cfree (/usr/lib/libc.so.6)",
+            28
+          ],
+          [
+            "<std::sys::pal::unix::time::Timespec>::sub_timespec (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            23
+          ],
+          [
+            "<kv_engine::lsm_storage::LsmStorageInner>::push_point_batch_entry::<&[u8]> (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            21
+          ],
+          [
+            "<parking_lot::raw_mutex::RawMutex>::lock_slow (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            20
+          ],
+          [
+            "bytes::bytes::promotable_even_drop (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            17
+          ],
+          [
+            "kv_engine::key::decode_user_key_into (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            14
+          ],
+          [
+            "alloc::fmt::format::format_inner (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            14
+          ]
+        ],
+        "libc_elf_base": "0x71d9d1a26000",
+        "libc_build_id": "7a8d41a2df4fde040b4c6ac2832311ab645a1e41",
+        "top_libc_offsets": [
+          [
+            "0xa5fdc",
+            143
+          ],
+          [
+            "0xa5ffc",
+            102
+          ],
+          [
+            "0xa481c",
+            43
+          ],
+          [
+            "0x16d053",
+            36
+          ],
+          [
+            "0x16c11d",
+            34
+          ],
+          [
+            "0x16c119",
+            33
+          ],
+          [
+            "0x16bf08",
+            31
+          ],
+          [
+            "0x16c887",
+            28
+          ],
+          [
+            "0xa4809",
+            26
+          ],
+          [
+            "0x16be20",
+            21
+          ],
+          [
+            "0x16bf04",
+            14
+          ],
+          [
+            "0x16c580",
+            11
+          ],
+          [
+            "0xa5c1c",
+            10
+          ],
+          [
+            "0x11806d",
+            10
+          ],
+          [
+            "0x16c6f1",
+            9
+          ],
+          [
+            "0x16bf00",
+            8
+          ],
+          [
+            "0xa5c14",
+            8
+          ],
+          [
+            "0xa5c10",
+            8
+          ],
+          [
+            "0x16bf0e",
+            8
+          ],
+          [
+            "0x16c724",
+            7
+          ]
+        ],
+        "top_libc_non_libc_callers": [
+          [
+            "<crossbeam_skiplist::base::SkipList<bytes::bytes::Bytes, bytes::bytes::Bytes>>::search_position::<bytes::bytes::Bytes> (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            140
+          ],
+          [
+            "<core::iter::adapters::map::Map<core::slice::iter::Iter<(bytes::bytes::Bytes, bytes::bytes::Bytes, kv_engine::mvcc::BatchEntryKind)>, <kv_engine::mvcc::LsmMvccInner>::write_batch_wal_only_inner::{closure#0}> as core::iter::traits::iterator::Iterator>::fold::<(), core::iter::traits::iterator::Iterator::for_each::call<kv_engine::pitr::WalEntry, <alloc::vec::Vec<kv_engine::pitr::WalEntry>>::extend_trusted<core::iter::adapters::map::Map<core::slice::iter::Iter<(bytes::bytes::Bytes, bytes::bytes::Bytes, kv_engine::mvcc::BatchEntryKind)>, <kv_engine::mvcc::LsmMvccInner>::write_batch_wal_only_inner::{closure#0}>>::{closure#0}>::{closure#0}> (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            115
+          ],
+          [
+            "<std::thread::local::LocalKey<core::cell::RefCell<alloc::vec::Vec<u8>>>>::with::<<kv_engine::mem_table::MemTable>::publish_raw_batch::{closure#0}, ()> (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            101
+          ],
+          [
+            "<crossbeam_skiplist::base::SkipList<bytes::bytes::Bytes, bytes::bytes::Bytes>>::insert_internal::<<crossbeam_skiplist::base::SkipList<bytes::bytes::Bytes, bytes::bytes::Bytes>>::insert::{closure#0}, <crossbeam_skiplist::base::SkipList<bytes::bytes::Bytes, bytes::bytes::Bytes>>::insert::{closure#1}> (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            91
+          ],
+          [
+            "<bytes::bytes::Bytes as core::convert::From<alloc::vec::Vec<u8>>>::from (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            64
+          ],
+          [
+            "<core::slice::iter::Iter<kv_engine::pitr::WalEntry> as core::iter::traits::iterator::Iterator>::try_fold::<(), <core::iter::adapters::enumerate::Enumerate<_> as core::iter::traits::iterator::Iterator>::try_fold::enumerate<&kv_engine::pitr::WalEntry, (), core::ops::control_flow::ControlFlow<&kv_engine::pitr::WalEntry>, core::iter::traits::iterator::Iterator::find_map::check<(usize, &kv_engine::pitr::WalEntry), &kv_engine::pitr::WalEntry, &mut <kv_engine::pitr::CanonicalWalEntryStream>::entries::{closure#0}>::{closure#0}>::{closure#0}, core::ops::control_flow::ControlFlow<&kv_engine::pitr::WalEntry>> (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            55
+          ],
+          [
+            "kv_engine::wal::v8::codec::encode_data_fragment_frame_into (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            46
+          ],
+          [
+            "<kv_engine::mvcc::LsmMvccInner>::write_batch_wal_only_inner (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            39
+          ],
+          [
+            "<kv_engine::lsm_storage::LsmStorageInner>::encode_kind_value_for_batch (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            39
+          ],
+          [
+            "<bytes::bytes::Bytes>::copy_from_slice (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            31
+          ],
+          [
+            "<alloc::vec::Vec<(bytes::bytes::Bytes, bytes::bytes::Bytes)> as core::ops::drop::Drop>::drop (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            30
+          ],
+          [
+            "<kv_engine::lsm_storage::LsmStorageInner>::write_batch_with_lifecycle_admission::<&[u8]> (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            23
+          ]
+        ],
+        "exact_verified_libc_lock_site_samples": 314,
+        "exact_verified_libc_lock_site_pct": 9.84634681718407,
+        "lock_site_note": "Lower bound from four exact sampled lock/xchg branch sites, not all libc or allocator CPU; private function names are stripped."
+      },
+      "digest_metrics": {
+        "payload_hash_bytes": 787500000,
+        "payload_hash_cpu_ns": 11857406,
+        "header_batch_hash_cpu_ns": 238597,
+        "ordered_link_hash_cpu_ns": 183753,
+        "post_encode_hash_reread_bytes": 0,
+        "cpu_timing_sample_rate": 64,
+        "cpu_timing_sampled_tickets": 184
+      },
+      "digest_estimated_cpu_s": {
+        "payload_hash_cpu_ns": 0.7557807476521738,
+        "header_batch_hash_cpu_ns": 0.015207965304347827,
+        "ordered_link_hash_cpu_ns": 0.01171225643478261
+      }
+    },
+    {
+      "cohort": "allocator",
+      "name": "01-mimalloc",
+      "format": "v8",
+      "allocator": "mimalloc",
+      "puts_s": 102297.95744111254,
+      "p99_ms": 29.314527,
+      "mean_sync_ms": 2.5142453065976715,
+      "syncs": 1546,
+      "worker_groups": 4948,
+      "process_cpu_s": 10.47951,
+      "command_tree_max_individual_rss_kib": 1168968,
+      "storage_flag": true,
+      "performance_ranking_eligible": false,
+      "profiler_lost_samples": 0,
+      "phase_estimates": {
+        "producer": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "preflight": {
+          "calls": 11728,
+          "samples": 192,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.19045361858333335,
+          "estimated_wall_s": 0.21563589466666666
+        },
+        "encode": {
+          "calls": 11728,
+          "samples": 192,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 2.0572473900833335,
+          "estimated_wall_s": 2.1009368166666667
+        },
+        "frame": {
+          "calls": 11728,
+          "samples": 192,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.42310751316666667,
+          "estimated_wall_s": 0.4408308423333333
+        },
+        "direct_alloc": {
+          "calls": 13274,
+          "samples": 214,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.04012084191208791,
+          "estimated_wall_s": 0.06709061671428572
+        },
+        "admit": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "digest_ready": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "frames_ready": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "data_complete": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "reserve_frontier": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "publish_durable": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "snapshot": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "coalesce": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "coordinator_lock_wait": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "submission_lock_wait": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "submit_data": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "pack_data": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "worker_submit": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "worker_cqe": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "completion_receive": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "completion_publish": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "frontier_encode": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "frontier_write": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "frontier_sync": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "resources_retire": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "guards_retire": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "v7_materialize": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "v7_sync_cycle": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "worker_receive": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "memtable_publish": {
+          "calls": 11728,
+          "samples": 192,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 3.0283132069166667,
+          "estimated_wall_s": 3.13952604375
+        },
+        "mvcc_publish": {
+          "calls": 11728,
+          "samples": 192,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 1.2536957125,
+          "estimated_wall_s": 1.4746164760833333
+        },
+        "v7_logical_hash": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "frontier_lock_wait": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "coordinator_wait": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "logical_alloc": {
+          "calls": 11728,
+          "samples": 192,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.5852077144166666,
+          "estimated_wall_s": 0.60108510525
+        },
+        "entry_encode": {
+          "calls": 11728,
+          "samples": 192,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 1.3512508046666667,
+          "estimated_wall_s": 1.38547793425
+        }
+      },
+      "cpu_samples": {
+        "samples": 3784,
+        "P_samples": 3784,
+        "E_samples": 0,
+        "threads": 19,
+        "samples_without_stack": 0,
+        "one_frame_stacks": 1802,
+        "categories": {
+          "mvcc_publish": {
+            "samples": 595,
+            "pct": 15.724101479915433
+          },
+          "libc": {
+            "samples": 567,
+            "pct": 14.984143763213531
+          },
+          "skiplist_search": {
+            "samples": 256,
+            "pct": 6.765327695560254
+          },
+          "blake3": {
+            "samples": 450,
+            "pct": 11.89217758985201
+          },
+          "mimalloc": {
+            "samples": 274,
+            "pct": 7.241014799154334
+          },
+          "other": {
+            "samples": 960,
+            "pct": 25.36997885835095
+          },
+          "clock_gettime": {
+            "samples": 201,
+            "pct": 5.311839323467231
+          },
+          "skiplist_insert": {
+            "samples": 247,
+            "pct": 6.527484143763213
+          },
+          "crc32": {
+            "samples": 229,
+            "pct": 6.0517970401691334
+          },
+          "sha256": {
+            "samples": 5,
+            "pct": 0.1321353065539112
+          }
+        },
+        "top_leaf_symbols": [
+          [
+            "<kv_engine::mvcc::LsmMvccInner>::publish_commit_ts (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            595
+          ],
+          [
+            "[unknown] (/usr/lib/libc.so.6)",
+            507
+          ],
+          [
+            "_blake3_hash_many_avx2 (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            341
+          ],
+          [
+            "<crossbeam_skiplist::base::SkipList<bytes::bytes::Bytes, bytes::bytes::Bytes>>::search_position::<bytes::bytes::Bytes> (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            256
+          ],
+          [
+            "<crossbeam_skiplist::base::SkipList<bytes::bytes::Bytes, bytes::bytes::Bytes>>::insert_internal::<<crossbeam_skiplist::base::SkipList<bytes::bytes::Bytes, bytes::bytes::Bytes>>::insert::{closure#0}, <crossbeam_skiplist::base::SkipList<bytes::bytes::Bytes, bytes::bytes::Bytes>>::insert::{closure#1}> (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            247
+          ],
+          [
+            "__vdso_clock_gettime ([vdso])",
+            201
+          ],
+          [
+            "[unknown] (/usr/lib/libmimalloc.so.2.2)",
+            174
+          ],
+          [
+            "<std::thread::local::LocalKey<core::cell::RefCell<alloc::vec::Vec<u8>>>>::with::<<kv_engine::mem_table::MemTable>::publish_raw_batch::{closure#0}, ()> (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            162
+          ],
+          [
+            "crc32fast::baseline::update_fast_16 (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            121
+          ],
+          [
+            "crc32fast::specialized::pclmulqdq::calculate (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            99
+          ],
+          [
+            "_blake3_compress_in_place_sse41 (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            89
+          ],
+          [
+            "mi_malloc (/usr/lib/libmimalloc.so.2.2)",
+            63
+          ],
+          [
+            "<core::slice::iter::Iter<kv_engine::pitr::WalEntry> as core::iter::traits::iterator::Iterator>::try_fold::<(), <core::iter::adapters::enumerate::Enumerate<_> as core::iter::traits::iterator::Iterator>::try_fold::enumerate<&kv_engine::pitr::WalEntry, (), core::ops::control_flow::ControlFlow<&kv_engine::pitr::WalEntry>, core::iter::traits::iterator::Iterator::find_map::check<(usize, &kv_engine::pitr::WalEntry), &kv_engine::pitr::WalEntry, &mut <kv_engine::pitr::CanonicalWalEntryStream>::entries::{closure#0}>::{closure#0}>::{closure#0}, core::ops::control_flow::ControlFlow<&kv_engine::pitr::WalEntry>> (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            52
+          ],
+          [
+            "<kv_engine::lsm_storage::LsmStorageInner>::push_point_batch_entry::<&[u8]> (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            49
+          ],
+          [
+            "<parking_lot::raw_mutex::RawMutex>::lock_slow (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            45
+          ],
+          [
+            "<crossbeam_channel::flavors::list::Channel<kv_engine::wal::parallel_worker::GroupWriteResult>>::recv (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            42
+          ],
+          [
+            "syscall (/usr/lib/libc.so.6)",
+            37
+          ],
+          [
+            "crossbeam_epoch::default::with_handle::<crossbeam_epoch::default::pin::{closure#0}, crossbeam_epoch::guard::Guard> (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            24
+          ],
+          [
+            "operator delete[](void*) (/usr/lib/libmimalloc.so.2.2)",
+            23
+          ],
+          [
+            "clock_gettime (/usr/lib/libc.so.6)",
+            19
+          ]
+        ],
+        "libc_elf_base": "0x736cff4f1000",
+        "libc_build_id": "7a8d41a2df4fde040b4c6ac2832311ab645a1e41",
+        "top_libc_offsets": [
+          [
+            "0x16c11d",
+            57
+          ],
+          [
+            "0x16d053",
+            54
+          ],
+          [
+            "0x16c887",
+            40
+          ],
+          [
+            "0x16bf08",
+            40
+          ],
+          [
+            "0x16c119",
+            35
+          ],
+          [
+            "0x11806d",
+            32
+          ],
+          [
+            "0x16be20",
+            29
+          ],
+          [
+            "0x16c733",
+            19
+          ],
+          [
+            "0x16c6f1",
+            17
+          ],
+          [
+            "0x16bf0c",
+            16
+          ],
+          [
+            "0x16c729",
+            16
+          ],
+          [
+            "0x16cfe8",
+            15
+          ],
+          [
+            "0x16c591",
+            13
+          ],
+          [
+            "0x16c758",
+            9
+          ],
+          [
+            "0x16c74a",
+            8
+          ],
+          [
+            "0xe3350",
+            8
+          ],
+          [
+            "0x16c580",
+            8
+          ],
+          [
+            "0x16bf04",
+            8
+          ],
+          [
+            "0x16c740",
+            8
+          ],
+          [
+            "0x16c128",
+            6
+          ]
+        ],
+        "top_libc_non_libc_callers": [
+          [
+            "<crossbeam_skiplist::base::SkipList<bytes::bytes::Bytes, bytes::bytes::Bytes>>::search_position::<bytes::bytes::Bytes> (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            144
+          ],
+          [
+            "<core::slice::iter::Iter<kv_engine::pitr::WalEntry> as core::iter::traits::iterator::Iterator>::try_fold::<(), <core::iter::adapters::enumerate::Enumerate<_> as core::iter::traits::iterator::Iterator>::try_fold::enumerate<&kv_engine::pitr::WalEntry, (), core::ops::control_flow::ControlFlow<&kv_engine::pitr::WalEntry>, core::iter::traits::iterator::Iterator::find_map::check<(usize, &kv_engine::pitr::WalEntry), &kv_engine::pitr::WalEntry, &mut <kv_engine::pitr::CanonicalWalEntryStream>::entries::{closure#0}>::{closure#0}>::{closure#0}, core::ops::control_flow::ControlFlow<&kv_engine::pitr::WalEntry>> (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            77
+          ],
+          [
+            "kv_engine::wal::v8::codec::encode_data_fragment_frame_into (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            58
+          ],
+          [
+            "<core::iter::adapters::map::Map<core::slice::iter::Iter<(bytes::bytes::Bytes, bytes::bytes::Bytes, kv_engine::mvcc::BatchEntryKind)>, <kv_engine::mvcc::LsmMvccInner>::write_batch_wal_only_inner::{closure#0}> as core::iter::traits::iterator::Iterator>::fold::<(), core::iter::traits::iterator::Iterator::for_each::call<kv_engine::pitr::WalEntry, <alloc::vec::Vec<kv_engine::pitr::WalEntry>>::extend_trusted<core::iter::adapters::map::Map<core::slice::iter::Iter<(bytes::bytes::Bytes, bytes::bytes::Bytes, kv_engine::mvcc::BatchEntryKind)>, <kv_engine::mvcc::LsmMvccInner>::write_batch_wal_only_inner::{closure#0}>>::{closure#0}>::{closure#0}> (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            53
+          ],
+          [
+            "<std::thread::local::LocalKey<core::cell::RefCell<alloc::vec::Vec<u8>>>>::with::<<kv_engine::mem_table::MemTable>::publish_raw_batch::{closure#0}, ()> (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            51
+          ],
+          [
+            "<kv_engine::wal::v8::prepare::AdmittedWalV8Batch<kv_engine::wal::v8::parallel::WalV8ParallelAdmissionGuard, kv_engine::wal::v8::leader::WalV8PreflightReservation>>::encode (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            40
+          ],
+          [
+            "<parking_lot::condvar::Condvar>::wait_until_internal (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            26
+          ],
+          [
+            "<std::sys::pal::unix::time::Timespec>::now (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            18
+          ],
+          [
+            "kv_engine::pitr::write_entry_into (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            15
+          ],
+          [
+            "<kv_engine::lsm_storage::LsmStorageInner>::encode_kind_value_for_batch (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            14
+          ],
+          [
+            "<crossbeam_skiplist::base::SkipList<bytes::bytes::Bytes, bytes::bytes::Bytes>>::insert_internal::<<crossbeam_skiplist::base::SkipList<bytes::bytes::Bytes, bytes::bytes::Bytes>>::insert::{closure#0}, <crossbeam_skiplist::base::SkipList<bytes::bytes::Bytes, bytes::bytes::Bytes>>::insert::{closure#1}> (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            12
+          ],
+          [
+            "<kv_engine::lsm_storage::LsmStorageInner>::write_batch_with_lifecycle_admission::<&[u8]> (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            6
+          ]
+        ],
+        "exact_verified_libc_lock_site_samples": 0,
+        "exact_verified_libc_lock_site_pct": 0.0,
+        "lock_site_note": "Lower bound from four exact sampled lock/xchg branch sites, not all libc or allocator CPU; private function names are stripped."
+      },
+      "digest_metrics": {
+        "payload_hash_bytes": 787500000,
+        "payload_hash_cpu_ns": 15744247,
+        "header_batch_hash_cpu_ns": 328795,
+        "ordered_link_hash_cpu_ns": 272757,
+        "post_encode_hash_reread_bytes": 0,
+        "cpu_timing_sample_rate": 64,
+        "cpu_timing_sampled_tickets": 184
+      },
+      "digest_estimated_cpu_s": {
+        "payload_hash_cpu_ns": 1.0035246131304347,
+        "header_batch_hash_cpu_ns": 0.02095710739130435,
+        "ordered_link_hash_cpu_ns": 0.017385294
+      }
+    },
+    {
+      "cohort": "allocator",
+      "name": "02-mimalloc",
+      "format": "v8",
+      "allocator": "mimalloc",
+      "puts_s": 104534.33396950341,
+      "p99_ms": 30.927379,
+      "mean_sync_ms": 2.423478411461687,
+      "syncs": 1553,
+      "worker_groups": 4936,
+      "process_cpu_s": 10.183802,
+      "command_tree_max_individual_rss_kib": 1170036,
+      "storage_flag": true,
+      "performance_ranking_eligible": false,
+      "profiler_lost_samples": 0,
+      "phase_estimates": {
+        "producer": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "preflight": {
+          "calls": 11728,
+          "samples": 192,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.19325196825,
+          "estimated_wall_s": 0.21970294516666666
+        },
+        "encode": {
+          "calls": 11728,
+          "samples": 192,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 2.0398921490833333,
+          "estimated_wall_s": 2.0726310443333333
+        },
+        "frame": {
+          "calls": 11728,
+          "samples": 192,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.454459267,
+          "estimated_wall_s": 0.468794548
+        },
+        "direct_alloc": {
+          "calls": 13281,
+          "samples": 215,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.03916868290659341,
+          "estimated_wall_s": 0.06513819588461539
+        },
+        "admit": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "digest_ready": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "frames_ready": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "data_complete": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "reserve_frontier": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "publish_durable": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "snapshot": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "coalesce": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "coordinator_lock_wait": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "submission_lock_wait": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "submit_data": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "pack_data": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "worker_submit": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "worker_cqe": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "completion_receive": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "completion_publish": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "frontier_encode": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "frontier_write": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "frontier_sync": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "resources_retire": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "guards_retire": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "v7_materialize": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "v7_sync_cycle": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "worker_receive": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "memtable_publish": {
+          "calls": 11728,
+          "samples": 192,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 3.0524469265,
+          "estimated_wall_s": 3.1572592684166665
+        },
+        "mvcc_publish": {
+          "calls": 11728,
+          "samples": 192,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 1.5210445739166667,
+          "estimated_wall_s": 1.862774366
+        },
+        "v7_logical_hash": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "frontier_lock_wait": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "coordinator_wait": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "logical_alloc": {
+          "calls": 11728,
+          "samples": 192,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.5574414911666666,
+          "estimated_wall_s": 0.57408211825
+        },
+        "entry_encode": {
+          "calls": 11728,
+          "samples": 192,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 1.3658070851666668,
+          "estimated_wall_s": 1.39136722275
+        }
+      },
+      "cpu_samples": {
+        "samples": 3628,
+        "P_samples": 3628,
+        "E_samples": 0,
+        "threads": 20,
+        "samples_without_stack": 0,
+        "one_frame_stacks": 1730,
+        "categories": {
+          "crc32": {
+            "samples": 196,
+            "pct": 5.402425578831312
+          },
+          "clock_gettime": {
+            "samples": 209,
+            "pct": 5.7607497243660415
+          },
+          "mvcc_publish": {
+            "samples": 546,
+            "pct": 15.049614112458656
+          },
+          "other": {
+            "samples": 920,
+            "pct": 25.35832414553473
+          },
+          "blake3": {
+            "samples": 468,
+            "pct": 12.899669239250276
+          },
+          "skiplist_insert": {
+            "samples": 250,
+            "pct": 6.890848952590959
+          },
+          "skiplist_search": {
+            "samples": 243,
+            "pct": 6.697905181918412
+          },
+          "libc": {
+            "samples": 560,
+            "pct": 15.43550165380375
+          },
+          "mimalloc": {
+            "samples": 232,
+            "pct": 6.39470782800441
+          },
+          "sha256": {
+            "samples": 4,
+            "pct": 0.11025358324145534
+          }
+        },
+        "top_leaf_symbols": [
+          [
+            "<kv_engine::mvcc::LsmMvccInner>::publish_commit_ts (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            546
+          ],
+          [
+            "[unknown] (/usr/lib/libc.so.6)",
+            498
+          ],
+          [
+            "_blake3_hash_many_avx2 (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            347
+          ],
+          [
+            "<crossbeam_skiplist::base::SkipList<bytes::bytes::Bytes, bytes::bytes::Bytes>>::insert_internal::<<crossbeam_skiplist::base::SkipList<bytes::bytes::Bytes, bytes::bytes::Bytes>>::insert::{closure#0}, <crossbeam_skiplist::base::SkipList<bytes::bytes::Bytes, bytes::bytes::Bytes>>::insert::{closure#1}> (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            250
+          ],
+          [
+            "<crossbeam_skiplist::base::SkipList<bytes::bytes::Bytes, bytes::bytes::Bytes>>::search_position::<bytes::bytes::Bytes> (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            243
+          ],
+          [
+            "__vdso_clock_gettime ([vdso])",
+            209
+          ],
+          [
+            "<std::thread::local::LocalKey<core::cell::RefCell<alloc::vec::Vec<u8>>>>::with::<<kv_engine::mem_table::MemTable>::publish_raw_batch::{closure#0}, ()> (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            169
+          ],
+          [
+            "[unknown] (/usr/lib/libmimalloc.so.2.2)",
+            132
+          ],
+          [
+            "_blake3_compress_in_place_sse41 (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            102
+          ],
+          [
+            "crc32fast::baseline::update_fast_16 (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            100
+          ],
+          [
+            "crc32fast::specialized::pclmulqdq::calculate (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            87
+          ],
+          [
+            "mi_malloc (/usr/lib/libmimalloc.so.2.2)",
+            68
+          ],
+          [
+            "<core::slice::iter::Iter<kv_engine::pitr::WalEntry> as core::iter::traits::iterator::Iterator>::try_fold::<(), <core::iter::adapters::enumerate::Enumerate<_> as core::iter::traits::iterator::Iterator>::try_fold::enumerate<&kv_engine::pitr::WalEntry, (), core::ops::control_flow::ControlFlow<&kv_engine::pitr::WalEntry>, core::iter::traits::iterator::Iterator::find_map::check<(usize, &kv_engine::pitr::WalEntry), &kv_engine::pitr::WalEntry, &mut <kv_engine::pitr::CanonicalWalEntryStream>::entries::{closure#0}>::{closure#0}>::{closure#0}, core::ops::control_flow::ControlFlow<&kv_engine::pitr::WalEntry>> (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            52
+          ],
+          [
+            "<crossbeam_channel::flavors::list::Channel<kv_engine::wal::parallel_worker::GroupWriteResult>>::recv (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            39
+          ],
+          [
+            "<parking_lot::raw_mutex::RawMutex>::lock_slow (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            35
+          ],
+          [
+            "<kv_engine::lsm_storage::LsmStorageInner>::push_point_batch_entry::<&[u8]> (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            33
+          ],
+          [
+            "syscall (/usr/lib/libc.so.6)",
+            27
+          ],
+          [
+            "crossbeam_epoch::default::with_handle::<crossbeam_epoch::default::pin::{closure#0}, crossbeam_epoch::guard::Guard> (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            24
+          ],
+          [
+            "clock_gettime (/usr/lib/libc.so.6)",
+            24
+          ],
+          [
+            "operator delete[](void*) (/usr/lib/libmimalloc.so.2.2)",
+            21
+          ]
+        ],
+        "libc_elf_base": "0x7f3f2ed75000",
+        "libc_build_id": "7a8d41a2df4fde040b4c6ac2832311ab645a1e41",
+        "top_libc_offsets": [
+          [
+            "0x16d053",
+            59
+          ],
+          [
+            "0x16c11d",
+            52
+          ],
+          [
+            "0x16c119",
+            38
+          ],
+          [
+            "0x16c887",
+            34
+          ],
+          [
+            "0x16bf08",
+            31
+          ],
+          [
+            "0x16bf0c",
+            27
+          ],
+          [
+            "0x16be20",
+            23
+          ],
+          [
+            "0x11806d",
+            23
+          ],
+          [
+            "0x16c729",
+            20
+          ],
+          [
+            "0x16c591",
+            12
+          ],
+          [
+            "0x16c733",
+            12
+          ],
+          [
+            "0x16c6f1",
+            11
+          ],
+          [
+            "0xe3350",
+            11
+          ],
+          [
+            "0x16bf04",
+            10
+          ],
+          [
+            "0x16c580",
+            9
+          ],
+          [
+            "0x1016eb",
+            8
+          ],
+          [
+            "0x16cfe8",
+            8
+          ],
+          [
+            "0x16c123",
+            7
+          ],
+          [
+            "0x16c758",
+            6
+          ],
+          [
+            "0x16c724",
+            6
+          ]
+        ],
+        "top_libc_non_libc_callers": [
+          [
+            "<crossbeam_skiplist::base::SkipList<bytes::bytes::Bytes, bytes::bytes::Bytes>>::search_position::<bytes::bytes::Bytes> (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            135
+          ],
+          [
+            "<core::slice::iter::Iter<kv_engine::pitr::WalEntry> as core::iter::traits::iterator::Iterator>::try_fold::<(), <core::iter::adapters::enumerate::Enumerate<_> as core::iter::traits::iterator::Iterator>::try_fold::enumerate<&kv_engine::pitr::WalEntry, (), core::ops::control_flow::ControlFlow<&kv_engine::pitr::WalEntry>, core::iter::traits::iterator::Iterator::find_map::check<(usize, &kv_engine::pitr::WalEntry), &kv_engine::pitr::WalEntry, &mut <kv_engine::pitr::CanonicalWalEntryStream>::entries::{closure#0}>::{closure#0}>::{closure#0}, core::ops::control_flow::ControlFlow<&kv_engine::pitr::WalEntry>> (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            84
+          ],
+          [
+            "kv_engine::wal::v8::codec::encode_data_fragment_frame_into (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            49
+          ],
+          [
+            "<kv_engine::wal::v8::prepare::AdmittedWalV8Batch<kv_engine::wal::v8::parallel::WalV8ParallelAdmissionGuard, kv_engine::wal::v8::leader::WalV8PreflightReservation>>::encode (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            47
+          ],
+          [
+            "<std::thread::local::LocalKey<core::cell::RefCell<alloc::vec::Vec<u8>>>>::with::<<kv_engine::mem_table::MemTable>::publish_raw_batch::{closure#0}, ()> (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            47
+          ],
+          [
+            "<core::iter::adapters::map::Map<core::slice::iter::Iter<(bytes::bytes::Bytes, bytes::bytes::Bytes, kv_engine::mvcc::BatchEntryKind)>, <kv_engine::mvcc::LsmMvccInner>::write_batch_wal_only_inner::{closure#0}> as core::iter::traits::iterator::Iterator>::fold::<(), core::iter::traits::iterator::Iterator::for_each::call<kv_engine::pitr::WalEntry, <alloc::vec::Vec<kv_engine::pitr::WalEntry>>::extend_trusted<core::iter::adapters::map::Map<core::slice::iter::Iter<(bytes::bytes::Bytes, bytes::bytes::Bytes, kv_engine::mvcc::BatchEntryKind)>, <kv_engine::mvcc::LsmMvccInner>::write_batch_wal_only_inner::{closure#0}>>::{closure#0}>::{closure#0}> (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            41
+          ],
+          [
+            "<std::sys::pal::unix::time::Timespec>::now (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            23
+          ],
+          [
+            "<crossbeam_skiplist::base::SkipList<bytes::bytes::Bytes, bytes::bytes::Bytes>>::insert_internal::<<crossbeam_skiplist::base::SkipList<bytes::bytes::Bytes, bytes::bytes::Bytes>>::insert::{closure#0}, <crossbeam_skiplist::base::SkipList<bytes::bytes::Bytes, bytes::bytes::Bytes>>::insert::{closure#1}> (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            21
+          ],
+          [
+            "<kv_engine::lsm_storage::LsmStorageInner>::encode_kind_value_for_batch (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            14
+          ],
+          [
+            "<parking_lot::condvar::Condvar>::wait_until_internal (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            12
+          ],
+          [
+            "<parking_lot::raw_mutex::RawMutex>::lock_slow (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            10
+          ],
+          [
+            "kv_engine::pitr::write_entry_into (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            10
+          ]
+        ],
+        "exact_verified_libc_lock_site_samples": 0,
+        "exact_verified_libc_lock_site_pct": 0.0,
+        "lock_site_note": "Lower bound from four exact sampled lock/xchg branch sites, not all libc or allocator CPU; private function names are stripped."
+      },
+      "digest_metrics": {
+        "payload_hash_bytes": 787500000,
+        "payload_hash_cpu_ns": 16045756,
+        "header_batch_hash_cpu_ns": 314274,
+        "ordered_link_hash_cpu_ns": 279947,
+        "post_encode_hash_reread_bytes": 0,
+        "cpu_timing_sample_rate": 64,
+        "cpu_timing_sampled_tickets": 184
+      },
+      "digest_estimated_cpu_s": {
+        "payload_hash_cpu_ns": 1.0227425346086956,
+        "header_batch_hash_cpu_ns": 0.02003155147826087,
+        "ordered_link_hash_cpu_ns": 0.017843578347826086
+      }
+    },
+    {
+      "cohort": "allocator",
+      "name": "03-system",
+      "format": "v8",
+      "allocator": "system",
+      "puts_s": 103547.70698354345,
+      "p99_ms": 26.887857,
+      "mean_sync_ms": 2.461684231446541,
+      "syncs": 1590,
+      "worker_groups": 6592,
+      "process_cpu_s": 11.241131000000001,
+      "command_tree_max_individual_rss_kib": 931908,
+      "storage_flag": true,
+      "performance_ranking_eligible": false,
+      "profiler_lost_samples": 0,
+      "phase_estimates": {
+        "producer": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "preflight": {
+          "calls": 11728,
+          "samples": 192,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.20437499891666666,
+          "estimated_wall_s": 0.23060900783333335
+        },
+        "encode": {
+          "calls": 11728,
+          "samples": 192,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 2.3249346531666664,
+          "estimated_wall_s": 2.3742235889166663
+        },
+        "frame": {
+          "calls": 11728,
+          "samples": 192,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.4591203529166667,
+          "estimated_wall_s": 0.47529027183333333
+        },
+        "direct_alloc": {
+          "calls": 13318,
+          "samples": 215,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.19508338357142857,
+          "estimated_wall_s": 0.2231362271208791
+        },
+        "admit": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "digest_ready": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "frames_ready": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "data_complete": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "reserve_frontier": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "publish_durable": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "snapshot": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "coalesce": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "coordinator_lock_wait": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "submission_lock_wait": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "submit_data": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "pack_data": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "worker_submit": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "worker_cqe": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "completion_receive": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "completion_publish": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "frontier_encode": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "frontier_write": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "frontier_sync": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "resources_retire": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "guards_retire": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "v7_materialize": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "v7_sync_cycle": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "worker_receive": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "memtable_publish": {
+          "calls": 11728,
+          "samples": 192,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 3.4293596801666664,
+          "estimated_wall_s": 3.4854280718333337
+        },
+        "mvcc_publish": {
+          "calls": 11728,
+          "samples": 192,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.6039565105833333,
+          "estimated_wall_s": 0.6464916454166666
+        },
+        "v7_logical_hash": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "frontier_lock_wait": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "coordinator_wait": {
+          "calls": 0,
+          "samples": 0,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.0,
+          "estimated_wall_s": 0.0
+        },
+        "logical_alloc": {
+          "calls": 11728,
+          "samples": 192,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 0.8590293323333333,
+          "estimated_wall_s": 0.89114603275
+        },
+        "entry_encode": {
+          "calls": 11728,
+          "samples": 192,
+          "calls_without_any_samples_in_thread": 0,
+          "estimated_cpu_s": 1.3389906466666668,
+          "estimated_wall_s": 1.3599024036666667
+        }
+      },
+      "cpu_samples": {
+        "samples": 4101,
+        "P_samples": 4101,
+        "E_samples": 0,
+        "threads": 19,
+        "samples_without_stack": 0,
+        "one_frame_stacks": 1600,
+        "categories": {
+          "crc32": {
+            "samples": 212,
+            "pct": 5.169470860765667
+          },
+          "libc": {
+            "samples": 1394,
+            "pct": 33.99170933918556
+          },
+          "mvcc_publish": {
+            "samples": 407,
+            "pct": 9.92440868080956
+          },
+          "other": {
+            "samples": 876,
+            "pct": 21.360643745427943
+          },
+          "skiplist_insert": {
+            "samples": 279,
+            "pct": 6.803218727139722
+          },
+          "skiplist_search": {
+            "samples": 295,
+            "pct": 7.193367471348451
+          },
+          "blake3": {
+            "samples": 420,
+            "pct": 10.241404535479152
+          },
+          "clock_gettime": {
+            "samples": 211,
+            "pct": 5.145086564252622
+          },
+          "sha256": {
+            "samples": 7,
+            "pct": 0.17069007559131918
+          }
+        },
+        "top_leaf_symbols": [
+          [
+            "[unknown] (/usr/lib/libc.so.6)",
+            1240
+          ],
+          [
+            "<kv_engine::mvcc::LsmMvccInner>::publish_commit_ts (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            407
+          ],
+          [
+            "_blake3_hash_many_avx2 (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            328
+          ],
+          [
+            "<crossbeam_skiplist::base::SkipList<bytes::bytes::Bytes, bytes::bytes::Bytes>>::search_position::<bytes::bytes::Bytes> (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            295
+          ],
+          [
+            "<crossbeam_skiplist::base::SkipList<bytes::bytes::Bytes, bytes::bytes::Bytes>>::insert_internal::<<crossbeam_skiplist::base::SkipList<bytes::bytes::Bytes, bytes::bytes::Bytes>>::insert::{closure#0}, <crossbeam_skiplist::base::SkipList<bytes::bytes::Bytes, bytes::bytes::Bytes>>::insert::{closure#1}> (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            279
+          ],
+          [
+            "__vdso_clock_gettime ([vdso])",
+            211
+          ],
+          [
+            "<std::thread::local::LocalKey<core::cell::RefCell<alloc::vec::Vec<u8>>>>::with::<<kv_engine::mem_table::MemTable>::publish_raw_batch::{closure#0}, ()> (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            144
+          ],
+          [
+            "crc32fast::baseline::update_fast_16 (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            117
+          ],
+          [
+            "crc32fast::specialized::pclmulqdq::calculate (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            86
+          ],
+          [
+            "_blake3_compress_in_place_sse41 (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            80
+          ],
+          [
+            "<crossbeam_channel::flavors::list::Channel<kv_engine::wal::parallel_worker::GroupWriteResult>>::recv (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            53
+          ],
+          [
+            "<core::slice::iter::Iter<kv_engine::pitr::WalEntry> as core::iter::traits::iterator::Iterator>::try_fold::<(), <core::iter::adapters::enumerate::Enumerate<_> as core::iter::traits::iterator::Iterator>::try_fold::enumerate<&kv_engine::pitr::WalEntry, (), core::ops::control_flow::ControlFlow<&kv_engine::pitr::WalEntry>, core::iter::traits::iterator::Iterator::find_map::check<(usize, &kv_engine::pitr::WalEntry), &kv_engine::pitr::WalEntry, &mut <kv_engine::pitr::CanonicalWalEntryStream>::entries::{closure#0}>::{closure#0}>::{closure#0}, core::ops::control_flow::ControlFlow<&kv_engine::pitr::WalEntry>> (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            50
+          ],
+          [
+            "malloc (/usr/lib/libc.so.6)",
+            44
+          ],
+          [
+            "<parking_lot::raw_mutex::RawMutex>::lock_slow (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            42
+          ],
+          [
+            "cfree (/usr/lib/libc.so.6)",
+            32
+          ],
+          [
+            "syscall (/usr/lib/libc.so.6)",
+            32
+          ],
+          [
+            "<std::time::Instant>::elapsed (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            24
+          ],
+          [
+            "clock_gettime (/usr/lib/libc.so.6)",
+            24
+          ],
+          [
+            "<kv_engine::lsm_storage::LsmStorageInner>::push_point_batch_entry::<&[u8]> (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            21
+          ],
+          [
+            "<parking_lot::raw_mutex::RawMutex>::unlock_slow (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            20
+          ]
+        ],
+        "libc_elf_base": "0x7fa473c95000",
+        "libc_build_id": "7a8d41a2df4fde040b4c6ac2832311ab645a1e41",
+        "top_libc_offsets": [
+          [
+            "0xa5fdc",
+            177
+          ],
+          [
+            "0xa5ffc",
+            128
+          ],
+          [
+            "0x16c11d",
+            61
+          ],
+          [
+            "0x16c119",
+            49
+          ],
+          [
+            "0x16d053",
+            44
+          ],
+          [
+            "0x16c887",
+            43
+          ],
+          [
+            "0xa481c",
+            41
+          ],
+          [
+            "0xa4809",
+            38
+          ],
+          [
+            "0x16bf08",
+            37
+          ],
+          [
+            "0x16be20",
+            31
+          ],
+          [
+            "0x11806d",
+            29
+          ],
+          [
+            "0xa5c1c",
+            15
+          ],
+          [
+            "0xa5c25",
+            15
+          ],
+          [
+            "0xa702f",
+            15
+          ],
+          [
+            "0x16cfe8",
+            14
+          ],
+          [
+            "0xa5c14",
+            13
+          ],
+          [
+            "0xa753b",
+            13
+          ],
+          [
+            "0x16bf0e",
+            12
+          ],
+          [
+            "0x16c115",
+            12
+          ],
+          [
+            "0xe3350",
+            12
+          ]
+        ],
+        "top_libc_non_libc_callers": [
+          [
+            "<crossbeam_skiplist::base::SkipList<bytes::bytes::Bytes, bytes::bytes::Bytes>>::search_position::<bytes::bytes::Bytes> (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            188
+          ],
+          [
+            "<core::iter::adapters::map::Map<core::slice::iter::Iter<(bytes::bytes::Bytes, bytes::bytes::Bytes, kv_engine::mvcc::BatchEntryKind)>, <kv_engine::mvcc::LsmMvccInner>::write_batch_wal_only_inner::{closure#0}> as core::iter::traits::iterator::Iterator>::fold::<(), core::iter::traits::iterator::Iterator::for_each::call<kv_engine::pitr::WalEntry, <alloc::vec::Vec<kv_engine::pitr::WalEntry>>::extend_trusted<core::iter::adapters::map::Map<core::slice::iter::Iter<(bytes::bytes::Bytes, bytes::bytes::Bytes, kv_engine::mvcc::BatchEntryKind)>, <kv_engine::mvcc::LsmMvccInner>::write_batch_wal_only_inner::{closure#0}>>::{closure#0}>::{closure#0}> (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            165
+          ],
+          [
+            "<std::thread::local::LocalKey<core::cell::RefCell<alloc::vec::Vec<u8>>>>::with::<<kv_engine::mem_table::MemTable>::publish_raw_batch::{closure#0}, ()> (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            153
+          ],
+          [
+            "<crossbeam_skiplist::base::SkipList<bytes::bytes::Bytes, bytes::bytes::Bytes>>::insert_internal::<<crossbeam_skiplist::base::SkipList<bytes::bytes::Bytes, bytes::bytes::Bytes>>::insert::{closure#0}, <crossbeam_skiplist::base::SkipList<bytes::bytes::Bytes, bytes::bytes::Bytes>>::insert::{closure#1}> (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            91
+          ],
+          [
+            "<core::slice::iter::Iter<kv_engine::pitr::WalEntry> as core::iter::traits::iterator::Iterator>::try_fold::<(), <core::iter::adapters::enumerate::Enumerate<_> as core::iter::traits::iterator::Iterator>::try_fold::enumerate<&kv_engine::pitr::WalEntry, (), core::ops::control_flow::ControlFlow<&kv_engine::pitr::WalEntry>, core::iter::traits::iterator::Iterator::find_map::check<(usize, &kv_engine::pitr::WalEntry), &kv_engine::pitr::WalEntry, &mut <kv_engine::pitr::CanonicalWalEntryStream>::entries::{closure#0}>::{closure#0}>::{closure#0}, core::ops::control_flow::ControlFlow<&kv_engine::pitr::WalEntry>> (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            89
+          ],
+          [
+            "<bytes::bytes::Bytes as core::convert::From<alloc::vec::Vec<u8>>>::from (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            84
+          ],
+          [
+            "<bytes::bytes::Bytes>::copy_from_slice (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            57
+          ],
+          [
+            "kv_engine::wal::v8::codec::encode_data_fragment_frame_into (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            54
+          ],
+          [
+            "<kv_engine::mvcc::LsmMvccInner>::write_batch_wal_only_inner (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            46
+          ],
+          [
+            "<kv_engine::lsm_storage::LsmStorageInner>::encode_kind_value_for_batch (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            44
+          ],
+          [
+            "<kv_engine::wal::v8::prepare::AdmittedWalV8Batch<kv_engine::wal::v8::parallel::WalV8ParallelAdmissionGuard, kv_engine::wal::v8::leader::WalV8PreflightReservation>>::encode (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            40
+          ],
+          [
+            "bytes::bytes::shallow_clone_vec (/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution)",
+            38
+          ]
+        ],
+        "exact_verified_libc_lock_site_samples": 384,
+        "exact_verified_libc_lock_site_pct": 9.363569861009509,
+        "lock_site_note": "Lower bound from four exact sampled lock/xchg branch sites, not all libc or allocator CPU; private function names are stripped."
+      },
+      "digest_metrics": {
+        "payload_hash_bytes": 787500000,
+        "payload_hash_cpu_ns": 15566063,
+        "header_batch_hash_cpu_ns": 313426,
+        "ordered_link_hash_cpu_ns": 233976,
+        "post_encode_hash_reread_bytes": 0,
+        "cpu_timing_sample_rate": 64,
+        "cpu_timing_sampled_tickets": 184
+      },
+      "digest_estimated_cpu_s": {
+        "payload_hash_cpu_ns": 0.9921673199130435,
+        "header_batch_hash_cpu_ns": 0.019977500695652177,
+        "ordered_link_hash_cpu_ns": 0.014913426782608695
+      }
+    }
+  ]
+}

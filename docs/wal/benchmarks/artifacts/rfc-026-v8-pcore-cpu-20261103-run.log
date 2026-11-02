@@ -1,0 +1,10 @@
+COOLDOWN 15s
+START 00-v7
+{"name": "00-v7", "puts_s": 108734.17322459984, "p99_ms": 27.592978, "cpu_s": 9.270235000000001, "syncs": 1557, "mean_sync_ms": 1.7565538298008991, "storage_flag": true, "diagnostic_only": true}
+START 01-v8
+{"name": "01-v8", "puts_s": 102261.82516743576, "p99_ms": 28.149031, "cpu_s": 10.463625, "syncs": 1555, "mean_sync_ms": 2.8961325073954987, "storage_flag": true, "diagnostic_only": true}
+START 02-v8
+{"name": "02-v8", "puts_s": 104664.32506465889, "p99_ms": 29.076272, "cpu_s": 10.677299999999999, "syncs": 1572, "mean_sync_ms": 2.651029899491094, "storage_flag": true, "diagnostic_only": true}
+START 03-v7
+{"name": "03-v7", "puts_s": 207517.9673400166, "p99_ms": 20.593221, "cpu_s": 6.25061, "syncs": 1456, "mean_sync_ms": 1.0049600570054944, "storage_flag": true, "diagnostic_only": true}
+DONE

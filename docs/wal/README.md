@@ -38,6 +38,7 @@ the retained and rejected experiments.
 
 ## Benchmarks and qualification
 
+- [RFC 026 P-core CPU profiles and allocator screen (not retained), 2026-11-03](benchmarks/rfc-026-v8-pcore-cpu-20261103.md)
 - [RFC 026 V8 background-role and kernel-worker affinity (inconclusive), 2026-11-02](benchmarks/rfc-026-v8-background-affinity-20261102.md)
 - [RFC 026 writer-only versus whole-process P-core affinity, 2026-11-02](benchmarks/rfc-026-v8-writer-affinity-20261102.md)
 - [RFC 026 V7/V8 P-core affinity comparison and V7 rerun, 2026-11-02](benchmarks/rfc-026-v8-pcore-affinity-20261102.md)

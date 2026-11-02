@@ -1,0 +1,101 @@
+{
+  "purpose": "Resolve native libc IFUNC addresses and conservative sampled instruction sites; private stripped function names remain unknown.",
+  "libc_sha256": "6e1a998254af9c39b1a554d60611d42ecb2169915d7167d0b424d44f6c62f247",
+  "libc_build_id": "7a8d41a2df4fde040b4c6ac2832311ab645a1e41",
+  "ifunc_and_exported_symbol_offsets": {
+    "memcpy": {
+      "library": "/usr/lib/libc.so.6",
+      "resolved_elf_offset": "0x16c580"
+    },
+    "memmove": {
+      "library": "/usr/lib/libc.so.6",
+      "resolved_elf_offset": "0x16c580"
+    },
+    "memset": {
+      "library": "/usr/lib/libc.so.6",
+      "resolved_elf_offset": "0x16cf80"
+    },
+    "memcmp": {
+      "library": "/usr/lib/libc.so.6",
+      "resolved_elf_offset": "0x16be20"
+    },
+    "bcmp": {
+      "library": "/usr/lib/libc.so.6",
+      "resolved_elf_offset": "0x16be20"
+    },
+    "strlen": {
+      "library": "/usr/lib/libc.so.6",
+      "resolved_elf_offset": "0x16f300"
+    },
+    "strcmp": {
+      "library": "/usr/lib/libc.so.6",
+      "resolved_elf_offset": "0x16eb50"
+    },
+    "malloc": {
+      "library": "/usr/lib/libc.so.6",
+      "resolved_elf_offset": "0xa6fd0"
+    },
+    "calloc": {
+      "library": "/usr/lib/libc.so.6",
+      "resolved_elf_offset": "0xa7d70"
+    },
+    "realloc": {
+      "library": "/usr/lib/libc.so.6",
+      "resolved_elf_offset": "0xa77b0"
+    },
+    "free": {
+      "library": "/usr/lib/libc.so.6",
+      "resolved_elf_offset": "0xa7520"
+    },
+    "pthread_mutex_lock": {
+      "library": "/usr/lib/libc.so.6",
+      "resolved_elf_offset": "0x9a010"
+    },
+    "pthread_cond_wait": {
+      "library": "/usr/lib/libc.so.6",
+      "resolved_elf_offset": "0x95d10"
+    }
+  },
+  "mimalloc_package": "mimalloc 2.2.4-1",
+  "mimalloc_library": "/usr/lib/libmimalloc.so.2.2",
+  "mimalloc_library_sha256": "0480b3b2de1eea334388482e4e8554a318e0887d717a0dd684a8df74dce462bb",
+  "kernel": "6.12.71-1-lts",
+  "cpu_core_mask": "0-15",
+  "cpu_atom_mask": "16-31",
+  "collector_allowed_cpus": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18,
+    19,
+    20,
+    21,
+    22,
+    23,
+    24,
+    25,
+    26,
+    27,
+    28,
+    29,
+    30,
+    31
+  ],
+  "perf_version": "perf version 6.19-2",
+  "settings_changed": false
+}

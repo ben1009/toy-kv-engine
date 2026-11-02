@@ -1,0 +1,84 @@
+
+/usr/lib/libc.so.6:     file format elf64-x86-64
+
+
+Disassembly of section .text:
+
+00000000000a47f0 <__default_morecore@GLIBC_2.2.5+0x780>:
+   a47f0:	eb b8                	jmp    a47aa <__default_morecore@GLIBC_2.2.5+0x73a>
+   a47f2:	66 0f 1f 44 00 00    	nop    WORD PTR [rax+rax*1+0x0]
+   a47f8:	85 c9                	test   ecx,ecx
+   a47fa:	75 88                	jne    a4784 <__default_morecore@GLIBC_2.2.5+0x714>
+   a47fc:	41 b8 01 00 00 00    	mov    r8d,0x1
+   a4802:	89 c8                	mov    eax,ecx
+   a4804:	f0 44 0f b1 07       	lock cmpxchg DWORD PTR [rdi],r8d
+   a4809:	75 25                	jne    a4830 <__default_morecore@GLIBC_2.2.5+0x7c0>
+   a480b:	48 89 7d e8          	mov    QWORD PTR [rbp-0x18],rdi
+   a480f:	e8 fc fd ff ff       	call   a4610 <__default_morecore@GLIBC_2.2.5+0x5a0>
+   a4814:	48 8b 7d e8          	mov    rdi,QWORD PTR [rbp-0x18]
+   a4818:	31 c0                	xor    eax,eax
+   a481a:	87 07                	xchg   DWORD PTR [rdi],eax
+   a481c:	83 f8 01             	cmp    eax,0x1
+   a481f:	7e 91                	jle    a47b2 <__default_morecore@GLIBC_2.2.5+0x742>
+   a4821:	e8 da f0 fe ff       	call   93900 <__lll_lock_wake_private@@GLIBC_PRIVATE>
+   a4826:	eb 8a                	jmp    a47b2 <__default_morecore@GLIBC_2.2.5+0x742>
+   a4828:	0f 1f 84 00 00 00 00 	nop    DWORD PTR [rax+rax*1+0x0]
+   a482f:	00 
+   a4830:	48 89 55 d8          	mov    QWORD PTR [rbp-0x28],rdx
+   a4834:	48 89 75 e0          	mov    QWORD PTR [rbp-0x20],rsi
+   a4838:	48 89 7d e8          	mov    QWORD PTR [rbp-0x18],rdi
+   a483c:	e8                   	.byte 0xe8
+   a483d:	ff                   	jmp    (bad)
+   a483e:	ef                   	out    dx,eax
+   a483f:	fe                   	.byte 0xfe
+
+
+/usr/lib/libc.so.6:     file format elf64-x86-64
+
+
+Disassembly of section .text:
+
+00000000000a5fc0 <__default_morecore@GLIBC_2.2.5+0x1f50>:
+   a5fc0:	14 00                	adc    al,0x0
+   a5fc2:	64 4c 8b 20          	mov    r12,QWORD PTR fs:[rax]
+   a5fc6:	4d 85 e4             	test   r12,r12
+   a5fc9:	0f 84 81 00 00 00    	je     a6050 <__default_morecore@GLIBC_2.2.5+0x1fe0>
+   a5fcf:	31 c0                	xor    eax,eax
+   a5fd1:	ba 01 00 00 00       	mov    edx,0x1
+   a5fd6:	f0 41 0f b1 14 24    	lock cmpxchg DWORD PTR [r12],edx
+   a5fdc:	0f 85 2e 01 00 00    	jne    a6110 <__default_morecore@GLIBC_2.2.5+0x20a0>
+   a5fe2:	48 89 de             	mov    rsi,rbx
+   a5fe5:	4c 89 e7             	mov    rdi,r12
+   a5fe8:	e8 83 f2 ff ff       	call   a5270 <__default_morecore@GLIBC_2.2.5+0x1200>
+   a5fed:	48 85 c0             	test   rax,rax
+   a5ff0:	0f 84 7a 00 00 00    	je     a6070 <__default_morecore@GLIBC_2.2.5+0x2000>
+   a5ff6:	31 d2                	xor    edx,edx
+   a5ff8:	41 87 14 24          	xchg   DWORD PTR [r12],edx
+   a5ffc:	83 fa 01             	cmp    edx,0x1
+   a5fff:	0f 8f 1b 01 00 00    	jg     a6120 <__default_morecore@GLIBC_2.2.5+0x20b0>
+   a6005:	48 8b 50 f8          	mov    rdx,QWORD PTR [rax-0x8]
+   a6009:	f6 c2 02             	test   dl,0x2
+   a600c:	0f 85 8c 00 00 00    	jne    a609e <__default_morecore@GLIBC_2.2.5+0x202e>
+   a6012:	83 e2 04             	and    edx,0x4
+   a6015:	48 8d 0d a4 1a 14 00 	lea    rcx,[rip+0x141aa4]        # 1e7ac0 <_IO_2_1_stdin_@@GLIBC_2.2.5+0x1e0>
+   a601c:	74 0e                	je     a602c <__default_morecore@GLIBC_2.2.5+0x1fbc>
+   a601e:	48                   	rex.W
+   a601f:	8d                   	.byte 0x8d
+
+
+/usr/lib/libc.so.6:     file format elf64-x86-64
+
+
+Disassembly of section .text:
+
+000000000016d040 <_dl_mcount_wrapper@GLIBC_2.2.5+0x1510>:
+  16d040:	48 3b 15 49 12 08 00 	cmp    rdx,QWORD PTR [rip+0x81249]        # 1ee290 <_obstack@GLIBC_2.2.5+0x98>
+  16d047:	73 77                	jae    16d0c0 <_dl_mcount_wrapper@GLIBC_2.2.5+0x1590>
+  16d049:	40 0f b6 c6          	movzx  eax,sil
+  16d04d:	48 89 d1             	mov    rcx,rdx
+  16d050:	48 89 fa             	mov    rdx,rdi
+  16d053:	f3 aa                	rep stos BYTE PTR [rdi],al
+  16d055:	48 89 d0             	mov    rax,rdx
+  16d058:	c5 f8 77             	vzeroupper
+  16d05b:	c3                   	ret
+  16d05c:	0f 1f 40 00          	nop    DWORD PTR [rax+0x0]
