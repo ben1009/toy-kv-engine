@@ -1,0 +1,17 @@
+{
+  "fixed_1800_seconds_completed": true,
+  "quiet_samples": 360,
+  "runner_hash_matches_measured_script": true,
+  "all_probes_match_4_MiB_and_256_flushes_at_device_counters": true,
+  "endpoint_data_contents_validated": true,
+  "summary_reproducible_from_all_raw_latencies": true,
+  "no_benchmark_jobs_observed": true,
+  "python_AST_pass": true,
+  "runtime_sources_unchanged_from_HEAD": true,
+  "tracked_whitespace_check_pass": true,
+  "normal_engine_performance_score": false,
+  "rust_tests_repeated": false,
+  "scope": "Only a standalone scratch-file diagnostic, reports and analysis scripts changed.",
+  "typos_pass": true,
+  "local_report_links_validated": 56
+}

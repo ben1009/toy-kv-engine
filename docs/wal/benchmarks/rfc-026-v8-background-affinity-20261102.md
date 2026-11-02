@@ -9,6 +9,11 @@ are storage-flagged, even with 60s idle before every pair. It adds no eligible
 score. The original cohort, rerun and registration calibration are reported
 separately below.
 
+A later [thirty-minute quiet-recovery test](#thirty-minute-quiet-recovery-test-november-3)
+also fails to restore the fast same-file durability behavior. OS background
+writes and flushes continue during that pause; it does not establish an
+uninterrupted thirty-minute device idle or identify garbage collection.
+
 **Putting all userspace background roles and io_uring workers on P-cores can
 reach 667,497 puts/s while main remains unrestricted.** However, 22 of 24 full
 captures fail the predeclared storage filter, leaving no eligible narrow-role
@@ -348,6 +353,58 @@ The [plan](artifacts/rfc-026-v8-background-affinity-20261102-low-pressure-202611
 [summary](artifacts/rfc-026-v8-background-affinity-20261102-low-pressure-20261103-summary.json),
 and [validation](artifacts/rfc-026-v8-background-affinity-20261102-low-pressure-20261103-checks.json)
 preserve this single-device continuation.
+
+### Thirty-minute quiet-recovery test, November 3
+
+A fixed paired experiment tests a substantially longer powered-on interval
+without benchmark writes. The same previously initialized 8 MiB scratch inode
+is held open throughout. Each endpoint overwrites 1,024 aligned 4 KiB blocks
+(4 MiB total), with `fdatasync` after every four writes, on the same ext4
+filesystem. Both endpoints run on CPU 8 and use identical data, offsets and a
+matching durable prelude. No file allocation, initialization, TRIM, admin query,
+profiling or device-setting change occurs between endpoints.
+
+The measured interval is **1,800.020 seconds**. A RAM-held collector reads
+whole-device counters every five seconds and checks benchmark/maintenance
+process names every minute. No matching job is observed. The reference file
+is untouched during the pause, and reports are written only after the second
+probe. Ordinary OS work continues: the SSD records **77.027 MiB of writes,
+361 flushes, zero read sectors and zero discard sectors** during the pause.
+The longest observed counter interval without completed host I/O is about
+15 seconds. This is a low-activity operating system, not thirty minutes of
+uninterrupted device idleness; host counters do not expose internal NAND work.
+
+| Same-file durability probe | Before quiet interval | After quiet interval |
+|---|---:|---:|
+| Writes/s, including periodic syncs | 3,407 | 3,317 |
+| Mean direct-write time, µs | 230.860 | 237.774 |
+| First write after probe fdatasync, median µs | 640.057 | 640.137 |
+| Other writes, median µs | 13.539 | 16.250 |
+| Mean fdatasync, µs | 248.105 | 251.909 |
+| Writes over 5 ms / 1,024 | 8 | 8 |
+| Maximum write, ms | 9.156 | 9.486 |
+
+**The longer pause does not restore the fast state in this experiment.**
+Throughput changes by −2.7%; the routine post-sync delay is essentially
+unchanged. Every write exceeding 5 ms is the first write after the preceding
+probe fdatasync in both endpoints. These are syscall sequence observations,
+not another NVMe trace or proof of the controller's internal ordering.
+
+The overall write p99 is only 0.644/0.643 ms because eight long writes among
+1,024 fall below one percent. That percentile must not be substituted for the
+slow-write count or interpreted as recovery. This small standalone diagnostic
+does not use the engine's storage filter and does not enter best-score tables.
+
+This result does not establish garbage collection, cache exhaustion or their
+absence. It rejects assuming that a thirty-minute benchmark pause alone resets
+this state on the running system. OS flushes remain a confound for completely
+idle cleanup; a single before/after sequence is not a randomized causal test.
+The [raw result](artifacts/rfc-026-v8-background-affinity-20261102-quiet-recovery-20261103-result.json),
+[runner](artifacts/rfc-026-v8-background-affinity-20261102-quiet-recovery-20261103-run.py),
+[analyzer](artifacts/rfc-026-v8-background-affinity-20261102-quiet-recovery-20261103-analyze.py),
+[summary](artifacts/rfc-026-v8-background-affinity-20261102-quiet-recovery-20261103-summary.json)
+and [checks](artifacts/rfc-026-v8-background-affinity-20261102-quiet-recovery-20261103-checks.json)
+preserve all write/sync latencies and 360 quiet-interval counter snapshots.
 
 ## Artifacts
 
