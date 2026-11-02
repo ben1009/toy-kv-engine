@@ -8,31 +8,36 @@
 
 use std::{
     cell::RefCell,
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     error::Error,
     fmt,
     fs::File,
     io,
+    ops::{Deref, DerefMut},
     os::unix::{
         fs::{FileExt, MetadataExt},
         io::AsRawFd,
     },
     sync::Arc,
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
-#[cfg(feature = "bench")]
-use std::time::Instant;
+#[cfg(test)]
+use std::os::unix::fs::OpenOptionsExt;
 
 use anyhow::{Context, Result, ensure};
-use parking_lot::Mutex;
+use crossbeam_queue::ArrayQueue;
+use parking_lot::{Condvar, Mutex};
 use sha2::{Digest, Sha256};
 
 use crate::{
     pitr::{LIVE_WAL_V5_LIMITS, WalBatch, WalV5Limits},
     wal::{
         DirectBuf, MAX_WAL_FILE_SIZE,
+        parallel_worker::{
+            GroupWriteResult, IoWorker, IoWorkerClient, WorkerBuffer, WriteBuffer, WriteGroup,
+        },
         v7::admission::{WalV7OwnedBatchReservation, WalV7OwnedPreparationReservation},
     },
 };
@@ -62,6 +67,7 @@ const MAX_GROUP_TICKETS: usize = 8;
 // Keep enough admitted producers in flight to form larger shared FRONTIERs
 // under contention; explicit Leader groups retain their separate smaller cap.
 const MAX_PARALLEL_INFLIGHT_TICKETS: usize = 32;
+const DATA_GROUP_JOIN_BUDGET: Duration = Duration::from_micros(10);
 
 pub(crate) type WalV8PreparedBatch<'a> = PreparedWalV8Batch<'a, WalV8PreflightReservation>;
 
@@ -143,6 +149,7 @@ pub(crate) struct WalV8ParallelWriter {
     physical_header_digest: [u8; 32],
     initial_prefix_digest: digest::WalV8Digest,
     coordinator: WalV8ParallelCoordinator,
+    io: Arc<WalV8ParallelIo>,
     reservation_owner: Option<Arc<WalV8ReservationOwner>>,
     frontier: Mutex<WalV8ParallelFrontier>,
     frontier_resources: Mutex<BTreeMap<u64, WalV7OwnedBatchReservation>>,
@@ -160,6 +167,417 @@ struct WalV8ParallelFrontier {
     frontier: WalV8Frontier,
     offset: u64,
     digest: [u8; 32],
+    last_sync_latency: Option<Duration>,
+}
+
+struct PendingV8DataWrite {
+    file_offset: u64,
+    buffer: WalV8DataBuffer,
+}
+
+/// V8 accounts DATA frame buffers per admitted ticket, so completed buffers
+/// must be dropped rather than retained in the generic worker's reusable pool.
+struct WalV8DataBuffer(DirectBuf);
+
+impl Deref for WalV8DataBuffer {
+    type Target = DirectBuf;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl DerefMut for WalV8DataBuffer {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl WorkerBuffer for WalV8DataBuffer {
+    fn as_ptr(&self) -> *const u8 {
+        self.0.as_ptr()
+    }
+
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    fn cap(&self) -> usize {
+        self.0.cap()
+    }
+
+    fn retire(self, _pool: &ArrayQueue<Self>) {}
+}
+
+struct WalV8SubmissionState {
+    next_ticket: u64,
+    next_file_offset: Option<u64>,
+    pending: BTreeMap<u64, PendingV8DataWrite>,
+    frontier_offsets: BTreeSet<u64>,
+    packing: bool,
+    #[cfg(test)]
+    group_wait_cutoff: Option<u64>,
+}
+
+/// Ordered DATA submission over the repository's bounded io_uring worker.
+/// Producer jobs may finish out of order; only contiguous ticket ranges are
+/// submitted, and embedded FRONTIER frames account for physical gaps.
+struct WalV8ParallelIo {
+    client: IoWorkerClient<WalV8DataBuffer>,
+    worker: Mutex<Option<IoWorker<WalV8DataBuffer>>>,
+    submission: Mutex<WalV8SubmissionState>,
+    frames_ready: Condvar,
+    #[cfg(test)]
+    group_join_micros: std::sync::atomic::AtomicU64,
+    coordinator: WalV8ParallelCoordinator,
+    progress: Arc<crate::wal::parallel_worker::WalSyncProgress>,
+    completion_thread: Mutex<Option<thread::JoinHandle<()>>>,
+}
+
+impl WalV8ParallelIo {
+    fn spawn(
+        worker_file: File,
+        coordinator: WalV8ParallelCoordinator,
+        first_ticket: u64,
+    ) -> Result<Arc<Self>> {
+        let mut worker = IoWorker::spawn(
+            Arc::new(worker_file),
+            Arc::new(ArrayQueue::<WalV8DataBuffer>::new(1)),
+            None,
+        )?;
+        let client = worker.client();
+        let progress = worker.sync_progress();
+        progress.initialize_frontiers(first_ticket);
+        // V8 reports one commit group per embedded FRONTIER/sync cycle. The
+        // worker still contributes SQE/CQE and eventfd metrics, but its DATA
+        // submission groups are not V8 durability groups.
+        progress.suppress_commit_group_metrics();
+        let completions = worker.take_completions();
+        let completion_coordinator = coordinator.clone();
+        let completion_thread = thread::Builder::new()
+            .name("wal-v8-completion-reaper".to_owned())
+            .spawn(move || {
+                while let Ok(result) = completions.recv() {
+                    if let Err(error) = reap_v8_group_result(&completion_coordinator, result) {
+                        log::error!("v8 WAL completion reaper failed: {error:#}");
+                        completion_coordinator.poison();
+                    }
+                }
+                // A worker that disappears without a normal group result must
+                // wake every waiter rather than leave an admitted ticket stuck.
+                completion_coordinator.poison();
+            })
+            .context("failed to spawn v8 WAL completion reaper")?;
+
+        Ok(Arc::new(Self {
+            client,
+            worker: Mutex::new(Some(worker)),
+            submission: Mutex::new(WalV8SubmissionState {
+                next_ticket: first_ticket,
+                next_file_offset: None,
+                pending: BTreeMap::new(),
+                frontier_offsets: BTreeSet::new(),
+                packing: false,
+                #[cfg(test)]
+                group_wait_cutoff: None,
+            }),
+            frames_ready: Condvar::new(),
+            #[cfg(test)]
+            group_join_micros: std::sync::atomic::AtomicU64::new(
+                DATA_GROUP_JOIN_BUDGET.as_micros() as u64,
+            ),
+            coordinator,
+            progress,
+            completion_thread: Mutex::new(Some(completion_thread)),
+        }))
+    }
+
+    #[cfg(feature = "bench")]
+    fn set_profile(&self, profile: Arc<crate::mem_table::WriteProfile>) {
+        self.progress.set_profile(profile);
+    }
+
+    fn register_frontier_offset(&self, offset: u64) -> Result<()> {
+        ensure!(
+            offset.is_multiple_of(FRAME_LEN_U64),
+            "v8 FRONTIER worker offset is not frame aligned"
+        );
+        let mut submission = self.submission.lock();
+        ensure!(
+            submission
+                .next_file_offset
+                .is_none_or(|next_offset| offset >= next_offset),
+            "v8 FRONTIER worker offset precedes submitted DATA"
+        );
+        ensure!(
+            submission.frontier_offsets.insert(offset),
+            "v8 FRONTIER worker offset was registered twice"
+        );
+        // A producer may already have queued the next DATA ticket while it
+        // was waiting for this physical gap to be assigned. Revisit the
+        // queue now that the gap is known; otherwise its DATA can remain
+        // pending forever when no later producer publishes another ticket.
+        self.frames_ready.notify_all();
+        // This callback holds the coordinator's admission lock. An elected
+        // packer will observe the gap after waking; otherwise drain ready
+        // work directly without acquiring the coordinator in reverse order.
+        if !submission.packing {
+            self.drain_ready_locked(&mut submission)
+                .context("submit v8 DATA after registering a FRONTIER gap")?;
+        }
+        Ok(())
+    }
+
+    fn publish_data(&self, ticket: u64, file_offset: u64, buffer: WalV8DataBuffer) -> Result<()> {
+        let mut submission = self.submission.lock();
+        ensure!(
+            ticket >= submission.next_ticket,
+            "v8 DATA ticket was already submitted"
+        );
+        ensure!(
+            submission
+                .pending
+                .insert(
+                    ticket,
+                    PendingV8DataWrite {
+                        file_offset,
+                        buffer
+                    }
+                )
+                .is_none(),
+            "v8 DATA ticket was queued twice"
+        );
+        self.frames_ready.notify_all();
+        if submission.packing || !submission.pending.contains_key(&submission.next_ticket) {
+            return Ok(());
+        }
+        // Admission publishes this atomic before any producer can encode.
+        // With no admitted successor there is no join opportunity. Single-
+        // frame jobs also keep immediate submission: their preparation is too
+        // small to justify an optional readiness wait. Both paths still use
+        // the admitted high-water mark as their grouping window.
+        let small_head =
+            submission.pending[&submission.next_ticket].buffer.len() == WAL_V8_FRAME_LEN;
+        if small_head
+            || self.coordinator.admitted_ticket_end() == submission.next_ticket.saturating_add(1)
+        {
+            return self.drain_ready_locked(&mut submission);
+        }
+        let first_ticket = submission.next_ticket;
+        submission.packing = true;
+        drop(submission);
+        self.pack_admitted_group(first_ticket)
+    }
+
+    fn pack_admitted_group(&self, first_ticket: u64) -> Result<()> {
+        let mut guard = WalV8DataPackingGuard {
+            io: self,
+            armed: true,
+        };
+        #[cfg(test)]
+        let budget = Duration::from_micros(
+            self.group_join_micros
+                .load(std::sync::atomic::Ordering::Relaxed),
+        );
+        #[cfg(not(test))]
+        let budget = DATA_GROUP_JOIN_BUDGET;
+        let mut deadline = None;
+        loop {
+            // Never hold submission while entering the coordinator: FRONTIER
+            // registration uses coordinator -> submission lock order.
+            let window = self
+                .coordinator
+                .data_group_window(first_ticket, MAX_GROUP_TICKETS)?;
+            ensure!(
+                window.ticket_end > first_ticket,
+                "v8 DATA packer has no admitted head"
+            );
+            let mut submission = self.submission.lock();
+            ensure!(
+                submission.packing && submission.next_ticket == first_ticket,
+                "v8 DATA packer lost its submission cursor"
+            );
+            let mut ready_end = first_ticket;
+            while ready_end < window.ticket_end && submission.pending.contains_key(&ready_end) {
+                ready_end += 1;
+            }
+            if ready_end > first_ticket && ready_end < window.ticket_end && !window.closed {
+                let deadline = deadline.get_or_insert_with(|| Instant::now() + budget);
+                if let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
+                    #[cfg(test)]
+                    {
+                        submission.group_wait_cutoff = Some(window.ticket_end);
+                    }
+                    self.frames_ready.wait_for(&mut submission, remaining);
+                    #[cfg(test)]
+                    {
+                        submission.group_wait_cutoff = None;
+                    }
+                    drop(submission);
+                    // Membership may grow while waiting for frames. Reinspect
+                    // admission even after timeout, using the same deadline.
+                    continue;
+                }
+            }
+            self.submit_group_locked(&mut submission, window.ticket_end)?;
+            // Bound this producer's packer tenure: drain only work currently
+            // ready under this lock, then atomically release ownership so a
+            // subsequent publisher can open the next admitted window.
+            self.drain_ready_locked(&mut submission)?;
+            submission.packing = false;
+            guard.armed = false;
+            return Ok(());
+        }
+    }
+
+    fn drain_ready_locked(&self, state: &mut WalV8SubmissionState) -> Result<()> {
+        let admitted_end = self.coordinator.admitted_ticket_end();
+        loop {
+            let limit = state
+                .next_ticket
+                .saturating_add(MAX_GROUP_TICKETS as u64)
+                .min(admitted_end);
+            if limit == state.next_ticket {
+                return Ok(());
+            }
+            if self.submit_group_locked(state, limit)? == 0 {
+                return Ok(());
+            }
+        }
+    }
+
+    /// Submit one currently contiguous ready prefix. A physical gap is
+    /// accepted only when it is tiled by FRONTIER offsets published under the
+    /// coordinator's admission lock.
+    fn submit_group_locked(
+        &self,
+        state: &mut WalV8SubmissionState,
+        ticket_end: u64,
+    ) -> Result<usize> {
+        if let Some(first) = state.pending.get(&state.next_ticket) {
+            let allocation_start = state.next_file_offset.unwrap_or(first.file_offset);
+            let mut cursor = allocation_start;
+            let mut next_ticket = state.next_ticket;
+            let mut selected = Vec::with_capacity(MAX_GROUP_TICKETS);
+            let mut frontier_offsets = Vec::new();
+
+            'collect: while next_ticket < ticket_end {
+                let Some(pending) = state.pending.get(&next_ticket) else {
+                    break;
+                };
+                while cursor < pending.file_offset {
+                    if !state.frontier_offsets.contains(&cursor) {
+                        break 'collect;
+                    }
+                    frontier_offsets.push(cursor);
+                    cursor = cursor
+                        .checked_add(FRAME_LEN_U64)
+                        .context("v8 worker FRONTIER offset overflows")?;
+                }
+                ensure!(
+                    cursor == pending.file_offset,
+                    "v8 worker DATA offsets are not contiguous"
+                );
+                ensure!(
+                    pending.buffer.len() > 0
+                        && pending.buffer.len().is_multiple_of(WAL_V8_FRAME_LEN)
+                        && pending.file_offset.is_multiple_of(FRAME_LEN_U64),
+                    "v8 worker DATA buffer is not frame aligned"
+                );
+                cursor = cursor
+                    .checked_add(u64::try_from(pending.buffer.len())?)
+                    .context("v8 worker DATA end overflows")?;
+                selected.push(next_ticket);
+                next_ticket = next_ticket
+                    .checked_add(1)
+                    .context("v8 worker ticket overflows")?;
+            }
+            if selected.is_empty() {
+                return Ok(0);
+            }
+
+            let mut writes = Vec::with_capacity(selected.len());
+            for ticket in &selected {
+                let pending = state
+                    .pending
+                    .remove(ticket)
+                    .context("v8 worker pending DATA disappeared")?;
+                let write_len = pending.buffer.len();
+                writes.push(WriteBuffer::new(
+                    pending.buffer,
+                    pending.file_offset,
+                    write_len,
+                ));
+            }
+
+            let group = WriteGroup::new_with_frontiers(
+                state.next_ticket..next_ticket,
+                writes,
+                allocation_start..cursor,
+                &frontier_offsets,
+            )
+            .map_err(|error| anyhow::anyhow!("build v8 DATA worker group: {error:?}"))?;
+            self.client
+                .submit_group(group)
+                .context("submit v8 DATA worker group")?;
+
+            for offset in frontier_offsets {
+                let removed = state.frontier_offsets.remove(&offset);
+                ensure!(removed, "v8 worker FRONTIER offset disappeared");
+            }
+            state.next_ticket = next_ticket;
+            state.next_file_offset = Some(cursor);
+            return Ok(selected.len());
+        }
+        Ok(0)
+    }
+}
+
+/// Failure or unwinding during packing must poison admitted work and release
+/// the ownership flag. Buffer ownership stays with pending or worker writes.
+struct WalV8DataPackingGuard<'a> {
+    io: &'a WalV8ParallelIo,
+    armed: bool,
+}
+
+impl Drop for WalV8DataPackingGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.io.coordinator.poison();
+            self.io.submission.lock().packing = false;
+            self.io.frames_ready.notify_all();
+        }
+    }
+}
+
+fn reap_v8_group_result(
+    coordinator: &WalV8ParallelCoordinator,
+    result: GroupWriteResult,
+) -> Result<()> {
+    if let Some(error) = result.error {
+        coordinator.poison();
+        anyhow::bail!("v8 DATA worker group {} failed: {error}", result.group_id);
+    }
+    #[cfg(feature = "chaos-testing")]
+    crate::chaos::failpoint::wal_crash_point("wal_v8.parallel.after_data_write");
+    coordinator
+        .mark_data_group_complete(result.tickets)
+        .context("publish v8 DATA worker group completion")
+}
+
+impl Drop for WalV8ParallelIo {
+    fn drop(&mut self) {
+        if let Some(worker) = self.worker.get_mut().take()
+            && let Err(error) = worker.close()
+        {
+            log::error!("failed to close v8 WAL I/O worker: {error:#}");
+        }
+        if let Some(completion_thread) = self.completion_thread.get_mut().take()
+            && completion_thread.join().is_err()
+        {
+            log::error!("v8 WAL completion reaper panicked");
+        }
+    }
 }
 
 /// Poison the runtime if a reserved FRONTIER cycle exits before its new
@@ -205,8 +623,8 @@ pub(crate) struct WalV8FrameJob<'a> {
     assignment: WalV8BatchAssignment,
     coordinator: WalV8ParallelCoordinator,
     producer_guards: Arc<Mutex<BTreeMap<u64, EncodedWalV8Batch<WalV8ParallelAdmissionGuard>>>>,
-    write_file: File,
-    data_buffer: DirectBuf,
+    io: Arc<WalV8ParallelIo>,
+    data_buffer: Option<WalV8DataBuffer>,
     #[cfg(feature = "bench")]
     profile: Option<Arc<crate::mem_table::WriteProfile>>,
 }
@@ -217,7 +635,7 @@ impl WalV8FrameJob<'_> {
     }
 
     pub(crate) fn frame_buffer_bytes(&self) -> usize {
-        self.data_buffer.cap()
+        self.data_buffer.as_ref().map_or(0, |buffer| buffer.cap())
     }
 
     pub(crate) fn finish(mut self) -> Result<digest::WalV8DigestMetrics> {
@@ -244,12 +662,16 @@ impl WalV8FrameJob<'_> {
             metrics
         };
 
-        let data_len = encoded.encode_data_frames_into(self.data_buffer.as_mut_slice())?;
+        let data_buffer = self
+            .data_buffer
+            .as_mut()
+            .context("v8 producer job lost its DATA buffer")?;
+        let data_len = encoded.encode_data_frames_into(data_buffer.as_mut_slice())?;
         ensure!(
-            data_len == self.data_buffer.cap(),
+            data_len == data_buffer.cap(),
             "v8 DATA materializer returned an unexpected frame length"
         );
-        self.data_buffer.set_len(data_len);
+        data_buffer.set_len(data_len);
         self.coordinator
             .mark_frames_ready(self.assignment.segment_ticket)?;
         #[cfg(feature = "bench")]
@@ -261,36 +683,22 @@ impl WalV8FrameJob<'_> {
             self.coordinator
                 .mark_data_write_started(self.assignment.segment_ticket)?;
         }
-        #[cfg(feature = "bench")]
-        let write_started = self.profile.as_ref().map(|_| Instant::now());
-        let write_result = write_aligned_once(
-            &self.write_file,
-            self.data_buffer.initialized_slice(0, data_len),
-            self.assignment.first_data_offset,
-        );
-        #[cfg(feature = "bench")]
-        if let (Some(profile), Some(started)) = (&self.profile, write_started) {
-            profile.record_wal_v8_data_write_call_ns(
-                started.elapsed().as_nanos().min(u64::MAX as u128) as u64,
-            );
-        }
-        write_result.context("write v8 Parallel DATA frames")?;
-        #[cfg(feature = "chaos-testing")]
-        crate::chaos::failpoint::wal_crash_point("wal_v8.parallel.after_data_write");
-        // The admission reservation accounts for this buffer until DATA
-        // completion is published. Drop it before notifying the coordinator,
-        // which may retire that reservation as soon as the frontier syncs.
-        drop(self.data_buffer);
-
+        let data_buffer = self
+            .data_buffer
+            .take()
+            .context("v8 producer job lost its DATA buffer before submission")?;
         let ticket = self.assignment.segment_ticket;
         let previous = self.producer_guards.lock().insert(ticket, encoded);
         if previous.is_some() {
             self.coordinator.poison();
             anyhow::bail!("v8 Parallel ticket already owns a producer guard");
         }
-        if let Err(error) = self.coordinator.mark_data_complete(ticket) {
+        let write_result =
+            self.io
+                .publish_data(ticket, self.assignment.first_data_offset, data_buffer);
+        if let Err(error) = write_result {
             self.coordinator.poison();
-            return Err(error);
+            return Err(error).context("submit v8 Parallel DATA frames");
         }
 
         #[cfg(feature = "bench")]
@@ -471,22 +879,52 @@ impl WalV8LeaderWriter {
     }
 
     /// Transfer the validated image and coordinator to the concurrent
-    /// producer path. Only the frontier write and WAL sync remain serialized.
-    pub(crate) fn into_parallel(self) -> WalV8ParallelWriter {
-        #[cfg(feature = "bench")]
+    /// producer path, using the same file handle for worker DATA submissions.
+    pub(crate) fn into_parallel(self) -> Result<WalV8ParallelWriter> {
+        let worker_file = self
+            .write_file
+            .try_clone()
+            .context("clone v8 WAL handle for the I/O worker")?;
+        self.into_parallel_with_worker_file(worker_file)
+    }
+
+    /// Transfer the validated image and coordinator to the concurrent
+    /// producer path with a caller-opened worker handle (normally O_DIRECT).
+    pub(crate) fn into_parallel_with_worker_file(
+        self,
+        worker_file: File,
+    ) -> Result<WalV8ParallelWriter> {
+        validate_positional_write_handle(&worker_file)
+            .context("validate v8 WAL I/O worker handle")?;
+        let worker_metadata = worker_file
+            .metadata()
+            .context("inspect v8 WAL I/O worker handle")?;
+        ensure!(
+            worker_metadata.dev() == self.installed_dev
+                && worker_metadata.ino() == self.installed_ino
+                && worker_metadata.len() >= self.coordinator.last_frontier_end(),
+            "v8 WAL I/O worker handle does not refer to the installed Active inode"
+        );
         let initial_ticket = self.coordinator.next_ticket();
-        WalV8ParallelWriter {
+        let io = WalV8ParallelIo::spawn(worker_file, self.coordinator.clone(), initial_ticket)?;
+        #[cfg(feature = "bench")]
+        if let Some(profile) = self.profile.load_full() {
+            io.set_profile(profile);
+        }
+        Ok(WalV8ParallelWriter {
             write_file: self.write_file,
             sync_file: self.sync_file,
             header: self.header,
             physical_header_digest: self.physical_header_digest,
             initial_prefix_digest: self.initial_prefix_digest,
             coordinator: self.coordinator,
+            io,
             reservation_owner: self.reservation_owner,
             frontier: Mutex::new(WalV8ParallelFrontier {
                 frontier: self.frontier,
                 offset: self.frontier_offset,
                 digest: self.frontier_digest,
+                last_sync_latency: None,
             }),
             frontier_resources: Mutex::new(BTreeMap::new()),
             producer_guards: Arc::new(Mutex::new(BTreeMap::new())),
@@ -497,7 +935,7 @@ impl WalV8LeaderWriter {
             initial_ticket,
             #[cfg(feature = "bench")]
             profile: self.profile,
-        }
+        })
     }
 
     /// Encode, write, and durably publish one ticket using a single WAL sync.
@@ -1032,6 +1470,7 @@ impl WalV8LeaderWriter {
 impl WalV8ParallelWriter {
     #[cfg(feature = "bench")]
     pub(crate) fn set_write_profile(&self, profile: Arc<crate::mem_table::WriteProfile>) {
+        self.io.set_profile(Arc::clone(&profile));
         self.profile.store(Some(profile));
     }
 
@@ -1157,14 +1596,10 @@ impl WalV8ParallelWriter {
             .map(|owner| owner.reserve_batch(logical_bytes, frame_bytes))
             .transpose()?;
 
-        // Allocate buffers and handles before publishing the ticket. Once
+        // Allocate the frame buffer before publishing the ticket. Once
         // admission succeeds, every resource required to finish is already
         // owned by this producer.
-        let data_buffer = DirectBuf::new(prepared.frame_buffer_bytes());
-        let write_file = self
-            .write_file
-            .try_clone()
-            .context("clone v8 Parallel DATA write handle before admission")?;
+        let data_buffer = WalV8DataBuffer(DirectBuf::new(prepared.frame_buffer_bytes()));
         let publisher = WalV8LeaderAdmissionPublisher {
             coordinator: &self.coordinator,
             reservation: RefCell::new(&mut reservation),
@@ -1187,8 +1622,8 @@ impl WalV8ParallelWriter {
             assignment,
             coordinator: self.coordinator.clone(),
             producer_guards: Arc::clone(&self.producer_guards),
-            write_file,
-            data_buffer,
+            io: Arc::clone(&self.io),
+            data_buffer: Some(data_buffer),
             #[cfg(feature = "bench")]
             profile: self.profile.load_full(),
         })
@@ -1214,24 +1649,40 @@ impl WalV8ParallelWriter {
 
             #[cfg(feature = "bench")]
             let profile = self.profile.load_full();
+            let mut snapshot = self.coordinator.frontier_ready_snapshot();
+            if !snapshot.ready_prefix.is_empty()
+                && snapshot.ready_prefix.len() < snapshot.admitted_ticket_count
+                && let Some(latency) = previous.last_sync_latency
+            {
+                let budget = if latency >= Duration::from_micros(100) {
+                    Duration::from_micros(400)
+                } else {
+                    Duration::from_micros(100)
+                };
+                #[cfg(feature = "bench")]
+                let started = Instant::now();
+                let waited = self.coordinator.coalesce_frontier_ready(budget);
+                #[cfg(feature = "bench")]
+                if waited && let Some(profile) = &profile {
+                    profile.record_wal_sync_coalesce_wait(
+                        started.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+                    );
+                }
+                #[cfg(not(feature = "bench"))]
+                let _ = waited;
+                snapshot = self.coordinator.frontier_ready_snapshot();
+            }
             #[cfg(feature = "bench")]
             let diagnostics_enabled = profile
                 .as_ref()
                 .is_some_and(|profile| profile.wal_sync_diagnostics_enabled());
             #[cfg(feature = "bench")]
-            let (ready, frontier_observation) = if diagnostics_enabled {
-                let snapshot = self.coordinator.frontier_ready_snapshot();
-                let observation = (
-                    snapshot.admitted_ticket_count as u64,
-                    snapshot.reserved_preparation_bytes,
-                    snapshot.next_not_ready,
-                );
-                (snapshot.ready_prefix, Some(observation))
-            } else {
-                (self.coordinator.frontier_ready_prefix(), None)
-            };
-            #[cfg(not(feature = "bench"))]
-            let ready = self.coordinator.frontier_ready_prefix();
+            let frontier_observation = diagnostics_enabled.then_some((
+                snapshot.admitted_ticket_count as u64,
+                snapshot.reserved_preparation_bytes,
+                snapshot.next_not_ready,
+            ));
+            let ready = snapshot.ready_prefix;
 
             if ready.is_empty() {
                 drop(previous);
@@ -1263,7 +1714,11 @@ impl WalV8ParallelWriter {
                 .offset
                 .checked_add(FRAME_LEN_U64)
                 .context("v8 previous FRONTIER end overflows")?;
-            let reservation = self.coordinator.reserve_frontier(frontier_ticket_end)?;
+            let reservation = self
+                .coordinator
+                .reserve_frontier_with(frontier_ticket_end, |reservation| {
+                    self.io.register_frontier_offset(reservation.frame_offset)
+                })?;
             let mut cycle_guard = WalV8FrontierCycleGuard::new(&self.coordinator);
             let durable_end = last_data_end.max(previous_frontier_end);
             ensure!(
@@ -1320,12 +1775,12 @@ impl WalV8ParallelWriter {
                     started.elapsed().as_nanos().min(u64::MAX as u128) as u64,
                 );
             }
-            #[cfg(feature = "bench")]
-            let sync_started = profile.as_ref().map(|_| Instant::now());
+            let sync_started = Instant::now();
             let sync_result = fdatasync_once(&self.sync_file);
+            previous.last_sync_latency = Some(sync_started.elapsed());
             #[cfg(feature = "bench")]
-            if let (Some(profile), Some(started)) = (&profile, sync_started) {
-                let duration_ns = started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+            if let Some(profile) = &profile {
+                let duration_ns = sync_started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
                 let groups = ready.len() as u64;
                 profile.record_wal_sync(groups);
                 profile.record_wal_fdatasync_ns(duration_ns);
@@ -1362,6 +1817,10 @@ impl WalV8ParallelWriter {
 
             self.retire_frontier_resources(first_ticket, frontier_ticket_end)?;
             self.coordinator.publish_durable_frontier(reservation)?;
+            // The shared worker tracks completed groups for its diagnostics.
+            // Retire the physical DATA groups covered by this V8 durability
+            // boundary so long-running diagnostic runs keep that map bounded.
+            self.io.progress.mark_durable(frontier_ticket_end);
             #[cfg(feature = "chaos-testing")]
             crate::chaos::failpoint::wal_crash_point("wal_v8.parallel.after_durable_publish");
             self.retire_frontier_guards(first_ticket, frontier_ticket_end)?;
@@ -1704,6 +2163,26 @@ mod tests {
         }
     }
 
+    fn multi_frame_batch(commit_ts: u64) -> WalBatch {
+        WalBatch {
+            entries: vec![WalEntry::Put {
+                key: b"k".to_vec(),
+                value: vec![0x5a; WAL_V8_FRAME_LEN],
+            }],
+            ..batch(commit_ts)
+        }
+    }
+
+    #[test]
+    fn v8_data_buffers_are_not_retained_by_the_generic_worker_pool() {
+        let pool = ArrayQueue::new(1);
+        let buffer = WalV8DataBuffer(DirectBuf::new(crate::wal::BUFFER_POOL_BUF_SIZE));
+
+        buffer.retire(&pool);
+
+        assert!(pool.is_empty());
+    }
+
     fn open_writer(path: &Path, installed: &WalV8InstalledRecovery) -> Result<WalV8LeaderWriter> {
         WalV8LeaderWriter::new(
             OpenOptions::new().read(true).write(true).open(path)?,
@@ -1743,7 +2222,7 @@ mod tests {
         let parallel_path = directory.path().join("parallel-v8.wal");
         let parallel_installed = install_empty(&parallel_path, header())?;
         let parallel_profile = Arc::new(crate::mem_table::WriteProfile::default());
-        let parallel = open_writer(&parallel_path, &parallel_installed)?.into_parallel();
+        let parallel = open_writer(&parallel_path, &parallel_installed)?.into_parallel()?;
         parallel.set_write_profile(Arc::clone(&parallel_profile));
         let first_batch = batch(10);
         let second_batch = batch(20);
@@ -1753,6 +2232,14 @@ mod tests {
         let second_job = parallel.admit_prepared_batch(second, 20, second_batch.recorded_at)?;
         first_job.finish()?;
         second_job.finish()?;
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while parallel.coordinator.frontier_ready_prefix().len() < 2 {
+            ensure!(
+                Instant::now() < deadline,
+                "both v8 tickets did not become frontier-ready"
+            );
+            thread::yield_now();
+        }
         parallel.wait_durable(1)?;
         assert_one_two_ticket_profile(&parallel_profile);
 
@@ -1788,7 +2275,7 @@ mod tests {
                 LIVE_WAL_V5_LIMITS,
                 MAX_WAL_FILE_SIZE,
             )?;
-            let writer = open_writer(wal_path, &installed)?.into_parallel();
+            let writer = open_writer(wal_path, &installed)?.into_parallel()?;
             let value = batch(10);
             writer.append_prepared_batch(
                 writer.preflight_batch(&value, LIVE_WAL_V5_LIMITS)?,
@@ -1900,7 +2387,7 @@ mod tests {
         )?;
         assert_eq!(installed.next_ticket, 1);
 
-        let writer = open_writer(&path, &installed)?.into_parallel();
+        let writer = open_writer(&path, &installed)?.into_parallel()?;
         let profile = Arc::new(crate::mem_table::WriteProfile::default());
         writer.set_write_profile(Arc::clone(&profile));
         writer.set_wal_sync_diagnostics_enabled(&profile, true)?;
@@ -2516,7 +3003,7 @@ mod tests {
         // SAFETY: sync_fd was returned by open and ownership transfers to File.
         let sync_file = unsafe { File::from_raw_fd(sync_fd) };
         let writer = WalV8LeaderWriter::new(write_file, sync_file, &installed, MAX_WAL_FILE_SIZE)?
-            .into_parallel();
+            .into_parallel()?;
         let first_batch = batch(10);
         let prepared = writer.preflight_batch(&first_batch, LIVE_WAL_V5_LIMITS)?;
         let mut data_buffer = DirectBuf::new(prepared.frame_buffer_bytes());
@@ -2563,13 +3050,208 @@ mod tests {
         Ok(())
     }
 
+    fn wait_for_data_group_cutoff(writer: &WalV8ParallelWriter, cutoff: u64) -> Result<()> {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while writer.io.submission.lock().group_wait_cutoff != Some(cutoff) {
+            ensure!(
+                Instant::now() < deadline,
+                "v8 DATA group did not observe cutoff {cutoff}"
+            );
+            thread::yield_now();
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn data_groups_observe_admission_before_frames_and_grow_while_waiting() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("admitted-groups.wal");
+        let header = header();
+        let installed = install_empty(&path, header)?;
+        let writer = open_writer(&path, &installed)?.into_parallel()?;
+        writer
+            .io
+            .group_join_micros
+            .store(2_000_000, std::sync::atomic::Ordering::Relaxed);
+        #[cfg(feature = "bench")]
+        let profile = Arc::new(crate::mem_table::WriteProfile::default());
+        #[cfg(feature = "bench")]
+        writer.set_write_profile(Arc::clone(&profile));
+        let first = multi_frame_batch(10);
+        let second = batch(20);
+        let third = batch(30);
+        let first_job = writer.admit_prepared_batch(
+            writer.preflight_batch(&first, LIVE_WAL_V5_LIMITS)?,
+            10,
+            first.recorded_at,
+        )?;
+        let second_job = writer.admit_prepared_batch(
+            writer.preflight_batch(&second, LIVE_WAL_V5_LIMITS)?,
+            20,
+            second.recorded_at,
+        )?;
+        thread::scope(|scope| -> Result<()> {
+            let first_handle = scope.spawn(move || first_job.finish());
+            wait_for_data_group_cutoff(&writer, 2)?;
+            assert_eq!(writer.io.submission.lock().next_ticket, 0);
+            assert!(!writer.coordinator.admitted_window()[1].frames_ready);
+            #[cfg(feature = "bench")]
+            assert_eq!(profile.snapshot().wal_worker_eventfd_notifications, 0);
+
+            let third_job = writer.admit_prepared_batch(
+                writer.preflight_batch(&third, LIVE_WAL_V5_LIMITS)?,
+                30,
+                third.recorded_at,
+            )?;
+            second_job.finish()?;
+            wait_for_data_group_cutoff(&writer, 3)?;
+            assert_eq!(writer.io.submission.lock().next_ticket, 0);
+            third_job.finish()?;
+            first_handle.join().expect("first DATA producer panicked")?;
+            Ok(())
+        })?;
+        writer.wait_durable(2)?;
+        assert_eq!(writer.io.submission.lock().next_ticket, 3);
+        #[cfg(feature = "bench")]
+        {
+            assert_eq!(profile.snapshot().wal_worker_eventfd_notifications, 1);
+            assert_eq!(profile.snapshot().wal_sync_count, 1);
+        }
+        drop(writer);
+        let recovered = super::super::install::recover_and_install_active(
+            &path,
+            &[installed.active_boundary],
+            header.predecessor,
+            LIVE_WAL_V5_LIMITS,
+            MAX_WAL_FILE_SIZE,
+        )?;
+        assert_eq!(replayed_batches(&path, &recovered)?, [first, second, third]);
+        Ok(())
+    }
+
+    #[test]
+    fn single_frame_head_skips_the_optional_join_for_unfinished_successors() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("small-data-group.wal");
+        let installed = install_empty(&path, header())?;
+        let writer = open_writer(&path, &installed)?.into_parallel()?;
+        writer
+            .io
+            .group_join_micros
+            .store(2_000_000, std::sync::atomic::Ordering::Relaxed);
+        let first = batch(10);
+        let second = batch(20);
+        let first_job = writer.admit_prepared_batch(
+            writer.preflight_batch(&first, LIVE_WAL_V5_LIMITS)?,
+            10,
+            first.recorded_at,
+        )?;
+        let second_job = writer.admit_prepared_batch(
+            writer.preflight_batch(&second, LIVE_WAL_V5_LIMITS)?,
+            20,
+            second.recorded_at,
+        )?;
+        thread::scope(|scope| -> Result<()> {
+            let (tx, rx) = mpsc::channel();
+            let first_handle = scope.spawn(move || {
+                let _ = tx.send(first_job.finish());
+            });
+            rx.recv_timeout(Duration::from_secs(1))??;
+            first_handle
+                .join()
+                .expect("single-frame DATA producer panicked");
+            Ok(())
+        })?;
+        assert_eq!(writer.io.submission.lock().next_ticket, 1);
+        assert!(!writer.io.submission.lock().packing);
+        writer.wait_durable(0)?;
+        second_job.finish()?;
+        writer.wait_durable(1)?;
+        Ok(())
+    }
+
+    #[test]
+    fn unfinished_data_successor_does_not_block_a_ready_head_indefinitely() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("slow-data-successor.wal");
+        let installed = install_empty(&path, header())?;
+        let writer = open_writer(&path, &installed)?.into_parallel()?;
+        let first = multi_frame_batch(10);
+        let second = batch(20);
+        let first_job = writer.admit_prepared_batch(
+            writer.preflight_batch(&first, LIVE_WAL_V5_LIMITS)?,
+            10,
+            first.recorded_at,
+        )?;
+        let second_job = writer.admit_prepared_batch(
+            writer.preflight_batch(&second, LIVE_WAL_V5_LIMITS)?,
+            20,
+            second.recorded_at,
+        )?;
+        first_job.finish()?;
+        writer.wait_durable(0)?;
+        assert_eq!(writer.coordinator.durable_ticket_end(), 1);
+        assert_eq!(writer.io.submission.lock().next_ticket, 1);
+        assert!(!writer.io.submission.lock().packing);
+        second_job.finish()?;
+        writer.wait_durable(1)?;
+        assert_eq!(writer.coordinator.durable_ticket_end(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn data_group_wait_is_bounded_when_closed_or_poisoned() -> Result<()> {
+        for poison in [false, true] {
+            let directory = tempfile::tempdir()?;
+            let path = directory.path().join("stopped-data-group.wal");
+            let installed = install_empty(&path, header())?;
+            let writer = open_writer(&path, &installed)?.into_parallel()?;
+            writer
+                .io
+                .group_join_micros
+                .store(100_000, std::sync::atomic::Ordering::Relaxed);
+            let first = multi_frame_batch(10);
+            let second = batch(20);
+            let first_job = writer.admit_prepared_batch(
+                writer.preflight_batch(&first, LIVE_WAL_V5_LIMITS)?,
+                10,
+                first.recorded_at,
+            )?;
+            let _unfinished = writer.admit_prepared_batch(
+                writer.preflight_batch(&second, LIVE_WAL_V5_LIMITS)?,
+                20,
+                second.recorded_at,
+            )?;
+            thread::scope(|scope| -> Result<()> {
+                let (tx, rx) = mpsc::channel();
+                let first_handle = scope.spawn(move || {
+                    let _ = tx.send(first_job.finish());
+                });
+                wait_for_data_group_cutoff(&writer, 2)?;
+                if poison {
+                    writer.coordinator.poison();
+                } else {
+                    writer.coordinator.close();
+                }
+                let result = rx.recv_timeout(Duration::from_secs(1))?;
+                assert_eq!(result.is_err(), poison);
+                first_handle.join().expect("stopped DATA packer panicked");
+                Ok(())
+            })?;
+            assert!(!writer.io.submission.lock().packing);
+            assert_eq!(writer.coordinator.durable_ticket_end(), 0);
+            assert_eq!(writer.io.submission.lock().next_ticket, u64::from(!poison));
+        }
+        Ok(())
+    }
+
     #[test]
     fn concurrent_producers_share_one_frontier_after_admitted_head_finishes() -> Result<()> {
         let directory = tempfile::tempdir()?;
         let path = directory.path().join("active-v8.wal");
         let header = header();
         let installed = install_empty(&path, header)?;
-        let writer = Arc::new(open_writer(&path, &installed)?.into_parallel());
+        let writer = Arc::new(open_writer(&path, &installed)?.into_parallel()?);
         let first_batch = batch(10);
         let second_batch = batch(20);
         let first_prepared = writer.preflight_batch(&first_batch, LIVE_WAL_V5_LIMITS)?;
@@ -2602,12 +3284,18 @@ mod tests {
             let deadline = Instant::now() + Duration::from_secs(2);
             loop {
                 let admitted = writer.coordinator.admitted_window();
-                if admitted.len() == 2 && admitted[1].data_complete {
+                let second_data_queued = writer.io.submission.lock().pending.contains_key(&1);
+                if admitted.len() == 2
+                    && admitted[1].frames_ready
+                    && admitted[1].digest_ready.is_some()
+                    && second_data_queued
+                {
+                    assert!(!admitted[1].data_complete);
                     break;
                 }
                 ensure!(
                     Instant::now() < deadline,
-                    "later v8 producer did not complete while the head was preparing"
+                    "later v8 producer did not finish preparation while the head was blocked"
                 );
                 thread::yield_now();
             }
@@ -2642,6 +3330,63 @@ mod tests {
         )?;
         assert_eq!(recovered.active_boundary.ticket_end, 2);
         assert_eq!(replayed_batches(&path, &recovered)?, [batch(10), batch(20)]);
+        Ok(())
+    }
+
+    #[test]
+    fn parallel_worker_submits_data_across_an_embedded_frontier_gap() -> Result<()> {
+        let directory =
+            tempfile::tempdir_in(Path::new(env!("CARGO_MANIFEST_DIR")).join("../target"))?;
+        let path = directory.path().join("active-v8.wal");
+        let header = header();
+        let installed = install_empty(&path, header)?;
+        let worker_file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_DIRECT)
+            .open(&path)?;
+        let writer = open_writer(&path, &installed)?.into_parallel_with_worker_file(worker_file)?;
+
+        let first_batch = batch(10);
+        let first = writer
+            .append_prepared_batch(
+                writer.preflight_batch(&first_batch, LIVE_WAL_V5_LIMITS)?,
+                10,
+                first_batch.recorded_at,
+            )?
+            .0;
+        let second_batch = batch(20);
+        let second = writer
+            .append_prepared_batch(
+                writer.preflight_batch(&second_batch, LIVE_WAL_V5_LIMITS)?,
+                20,
+                second_batch.recorded_at,
+            )?
+            .0;
+
+        assert_eq!(
+            second.first_data_offset,
+            first.frontier_offset + FRAME_LEN_U64,
+            "the second ticket follows the first embedded FRONTIER"
+        );
+        assert_eq!(second.frontier.ticket_end, 2);
+        assert_eq!(second.frontier.generation, 2);
+        assert_eq!(writer.image_len()?, second.frontier_offset + FRAME_LEN_U64);
+        let (_, boundary) = writer.active_boundaries()?;
+        drop(writer);
+
+        let recovered = super::super::install::recover_and_install_active(
+            &path,
+            &[boundary],
+            header.predecessor,
+            LIVE_WAL_V5_LIMITS,
+            MAX_WAL_FILE_SIZE,
+        )?;
+        assert_eq!(recovered.active_boundary.ticket_end, 2);
+        assert_eq!(
+            replayed_batches(&path, &recovered)?,
+            [first_batch, second_batch]
+        );
         Ok(())
     }
 }

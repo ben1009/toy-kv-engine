@@ -37,6 +37,8 @@ pub(crate) struct WalSyncProgress {
     #[cfg(feature = "bench")]
     profile: arc_swap::ArcSwapOption<crate::mem_table::WriteProfile>,
     #[cfg(feature = "bench")]
+    suppress_commit_group_metrics: AtomicBool,
+    #[cfg(feature = "bench")]
     sync_active: AtomicBool,
     #[cfg(feature = "bench")]
     io_event_gate: Mutex<()>,
@@ -190,8 +192,19 @@ impl WalSyncProgress {
         self.profile.store(Some(profile));
     }
 
+    /// Let a format with its own logical durability groups report those groups
+    /// while still using this worker for physical write and completion metrics.
+    #[cfg(feature = "bench")]
+    pub(crate) fn suppress_commit_group_metrics(&self) {
+        self.suppress_commit_group_metrics
+            .store(true, Ordering::Relaxed);
+    }
+
     #[cfg(not(feature = "bench"))]
     pub(crate) fn set_profile(&self, _profile: std::sync::Arc<crate::mem_table::WriteProfile>) {}
+
+    #[cfg(not(feature = "bench"))]
+    pub(crate) fn suppress_commit_group_metrics(&self) {}
 
     #[cfg(feature = "bench")]
     pub(crate) fn profile(&self) -> Option<std::sync::Arc<crate::mem_table::WriteProfile>> {
@@ -321,7 +334,9 @@ impl WalSyncProgress {
         if result.error.is_none()
             && let Some(profile) = self.profile()
         {
-            profile.record_wal_commit_group(result.write_count, result.write_bytes);
+            if !self.suppress_commit_group_metrics.load(Ordering::Relaxed) {
+                profile.record_wal_commit_group(result.write_count, result.write_bytes);
+            }
             if profile.wal_sync_diagnostics_enabled() {
                 let mut state = self.state.lock();
                 let previous = state.completed_groups.insert(
@@ -2773,6 +2788,38 @@ mod tests {
         assert_eq!(profile.wal_inflight_groups_max, 1);
         assert_eq!(profile.wal_outstanding_write_sqes_max, 1);
         assert_eq!(profile.wal_cqe_count, 1);
+    }
+
+    #[cfg(feature = "bench")]
+    #[test]
+    fn sync_progress_retires_diagnostic_groups_at_durable_frontier() {
+        let progress = WalSyncProgress::default();
+        let profile = Arc::new(crate::mem_table::WriteProfile::default());
+        profile.set_wal_sync_diagnostics_enabled(true);
+        progress.set_profile(profile);
+        progress.initialize_frontiers(10);
+
+        for (group_id, tickets) in [(0, 10..11), (1, 11..12), (2, 12..13)] {
+            progress.record_group_completion(
+                &GroupWriteResult {
+                    group_id,
+                    tickets,
+                    write_count: 1,
+                    write_bytes: 4096,
+                    error: None,
+                },
+                false,
+                Some(std::time::Instant::now()),
+            );
+        }
+        assert_eq!(progress.state.lock().completed_groups.len(), 3);
+
+        progress.mark_durable(12);
+
+        let state = progress.state.lock();
+        assert_eq!(state.completed_groups.len(), 1);
+        assert!(state.completed_groups.contains_key(&12));
+        assert_eq!(state.durable_frontier, 12);
     }
 
     #[cfg(feature = "bench")]

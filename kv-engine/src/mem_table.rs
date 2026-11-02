@@ -11,6 +11,14 @@ use std::{
     time::Instant,
 };
 
+#[cfg(all(target_os = "linux", not(test)))]
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+#[cfg(all(target_os = "linux", not(test)))]
+use std::fs::OpenOptions;
+
+#[cfg(all(target_os = "linux", not(test)))]
+use anyhow::ensure;
 use anyhow::{Context, Ok, Result};
 use bytes::Bytes;
 use crossbeam_skiplist::SkipMap;
@@ -164,8 +172,8 @@ pub struct WriteProfile {
     pub wal_v8_post_encode_hash_reread_bytes: AtomicU64,
     /// Tickets included in the sampled v8 digest CPU timings.
     pub wal_v8_cpu_timing_sampled_tickets: AtomicU64,
-    /// Aggregate producer time in v8 positional DATA write calls, including retries.
-    /// Concurrent calls overlap, so this is summed call time, not wall time.
+    /// Aggregate time in v8 Leader's synchronous positional DATA write calls.
+    /// Parallel mode uses the shared worker's submission/CQE counters instead.
     pub wal_v8_data_write_call_ns: AtomicU64,
     /// Number of WAL commit groups that reached fdatasync.
     pub wal_commit_groups: AtomicU64,
@@ -218,8 +226,9 @@ pub struct WalSyncObservation {
     pub next_ticket_frames_ready: bool,
     pub next_ticket_digest_folded: bool,
     pub next_ticket_data_complete: bool,
-    /// Elapsed time since the next v8 ticket started its positional DATA write.
-    /// Other WAL formats and tickets not yet writing leave this unset.
+    /// Elapsed time since the next v8 producer began publishing DATA to the
+    /// ordered submitter. This is not physical I/O latency; other formats and
+    /// tickets not yet queued leave it unset.
     pub next_ticket_data_write_elapsed_ns: Option<u64>,
     pub write_sqes_submitted: u64,
     pub write_cqes_completed: u64,
@@ -1758,10 +1767,51 @@ impl MemTable {
         let sync_file = write_file
             .try_clone()
             .context("clone installed v8 Active WAL sync handle")?;
+        let worker_file = if io_mode == WalIoMode::Parallel {
+            #[cfg(test)]
+            {
+                Some(
+                    write_file
+                        .try_clone()
+                        .context("clone installed v8 Active WAL test worker handle")?,
+                )
+            }
+            #[cfg(not(test))]
+            {
+                let worker_file = OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .custom_flags(libc::O_DIRECT)
+                    .open(&path)
+                    .with_context(|| {
+                        format!(
+                            "open installed v8 Active WAL for direct I/O: {}",
+                            path.display()
+                        )
+                    })?;
+                let metadata = worker_file
+                    .metadata()
+                    .context("inspect installed v8 Active WAL worker handle")?;
+                ensure!(
+                    metadata.dev() == installed.installed_dev
+                        && metadata.ino() == installed.installed_ino
+                        && metadata.len() >= installed.image_len,
+                    "v8 WAL worker handle does not refer to the installed Active inode"
+                );
+                Some(worker_file)
+            }
+        } else {
+            None
+        };
         let (writer, reservation_owner) = create_writer(write_file, sync_file, &installed)?;
         ret.wal = Some(match io_mode {
             WalIoMode::Leader => Wal::from_v8_leader(writer, &installed)?,
-            WalIoMode::Parallel => Wal::from_v8_parallel(writer.into_parallel(), &installed)?,
+            WalIoMode::Parallel => Wal::from_v8_parallel(
+                writer.into_parallel_with_worker_file(
+                    worker_file.context("v8 Parallel WAL has no worker file handle")?,
+                )?,
+                &installed,
+            )?,
         });
         ret.wal_v8_reservation_owner = reservation_owner;
         ret.wal_path = Some(path);

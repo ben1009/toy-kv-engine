@@ -5,10 +5,15 @@
 //! so the live writer can form groups from admitted work without waiting for
 //! producer preparation.
 
-use std::{collections::VecDeque, sync::Arc, time::Duration};
-
-#[cfg(feature = "bench")]
-use std::time::Instant;
+use std::{
+    collections::VecDeque,
+    ops::Range,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::{Duration, Instant},
+};
 
 use anyhow::{Context, Result, ensure};
 use parking_lot::{Condvar, Mutex};
@@ -58,6 +63,10 @@ pub(crate) struct WalV8ParallelCoordinator {
 struct CoordinatorInner {
     state: Mutex<CoordinatorState>,
     changed: Condvar,
+    /// Published before releasing admission or returning a producer job. A
+    /// DATA submitter can identify a lone admitted head without taking the
+    /// coordinator lock under its submission lock.
+    admitted_ticket_end: AtomicU64,
     segment_incarnation: [u8; 16],
     physical_header_digest: [u8; 32],
     initial_prefix_digest: WalV8Digest,
@@ -85,6 +94,8 @@ struct CoordinatorState {
     poisoned: bool,
     #[cfg(test)]
     ticket_admission_waiters: usize,
+    #[cfg(test)]
+    frontier_coalesce_waiters: usize,
     #[cfg(feature = "bench")]
     ordered_link_hash_cpu_ns: u64,
 }
@@ -119,12 +130,20 @@ pub(crate) struct WalV8TicketProgress {
 
 /// Atomic view of the durability decision point. `next_not_ready` is the
 /// first admitted ticket beyond the prefix that can be covered by a FRONTIER.
-#[cfg(feature = "bench")]
 pub(crate) struct WalV8FrontierReadySnapshot {
     pub(crate) ready_prefix: Vec<WalV8TicketProgress>,
     pub(crate) admitted_ticket_count: usize,
+    #[cfg(feature = "bench")]
     pub(crate) reserved_preparation_bytes: u64,
+    #[cfg(feature = "bench")]
     pub(crate) next_not_ready: Option<WalV8TicketProgress>,
+}
+
+/// DATA group membership comes from admission, including tickets whose
+/// producers have not encoded or framed their bytes yet.
+pub(crate) struct WalV8DataGroupWindow {
+    pub(crate) ticket_end: u64,
+    pub(crate) closed: bool,
 }
 
 /// The reservation for appending a FRONTIER after the current physical tail.
@@ -218,10 +237,13 @@ impl WalV8ParallelCoordinator {
                     poisoned: false,
                     #[cfg(test)]
                     ticket_admission_waiters: 0,
+                    #[cfg(test)]
+                    frontier_coalesce_waiters: 0,
                     #[cfg(feature = "bench")]
                     ordered_link_hash_cpu_ns: 0,
                 }),
                 changed: Condvar::new(),
+                admitted_ticket_end: AtomicU64::new(config.next_ticket),
                 segment_incarnation: header.incarnation,
                 physical_header_digest,
                 initial_prefix_digest,
@@ -242,6 +264,29 @@ impl WalV8ParallelCoordinator {
             .iter()
             .map(TicketState::progress)
             .collect()
+    }
+
+    pub(crate) fn data_group_window(
+        &self,
+        first_ticket: u64,
+        max_tickets: usize,
+    ) -> Result<WalV8DataGroupWindow> {
+        ensure!(max_tickets > 0, "v8 DATA group window must be nonempty");
+        let state = self.inner.state.lock();
+        ensure!(!state.poisoned, "v8 Parallel coordinator is poisoned");
+        ensure!(
+            first_ticket >= state.durable_ticket_end && first_ticket <= state.next_ticket,
+            "v8 DATA group starts outside the admitted window"
+        );
+        let count = (state.next_ticket - first_ticket).min(u64::try_from(max_tickets)?);
+        Ok(WalV8DataGroupWindow {
+            ticket_end: first_ticket + count,
+            closed: state.closed,
+        })
+    }
+
+    pub(crate) fn admitted_ticket_end(&self) -> u64 {
+        self.inner.admitted_ticket_end.load(Ordering::Acquire)
     }
 
     /// Return the contiguous head prefix whose DATA frames are ready to submit.
@@ -273,18 +318,54 @@ impl WalV8ParallelCoordinator {
             .collect()
     }
 
+    /// Give already-admitted successors one bounded opportunity to join a
+    /// ready durability prefix. A lone producer or fully ready window never
+    /// waits, and close/poison terminates the optional wait immediately.
+    pub(crate) fn coalesce_frontier_ready(&self, budget: Duration) -> bool {
+        let mut state = self.inner.state.lock();
+        let deadline = Instant::now() + budget;
+        let mut waited = false;
+        while !state.closed
+            && !state.poisoned
+            && state
+                .tickets
+                .front()
+                .is_some_and(TicketState::is_frontier_ready)
+            && state
+                .tickets
+                .iter()
+                .any(|ticket| !ticket.is_frontier_ready())
+        {
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                break;
+            };
+            waited = true;
+            #[cfg(test)]
+            {
+                state.frontier_coalesce_waiters += 1;
+            }
+            self.inner.changed.wait_for(&mut state, remaining);
+            #[cfg(test)]
+            {
+                state.frontier_coalesce_waiters -= 1;
+            }
+        }
+        waited
+    }
+
     /// Snapshot the frontier-ready prefix and the first admitted ticket that
     /// would extend it, under one lock acquisition. Benchmark diagnostics use
     /// the blocked ticket's readiness to identify why a durability group
     /// stopped at this boundary.
-    #[cfg(feature = "bench")]
     pub(crate) fn frontier_ready_snapshot(&self) -> WalV8FrontierReadySnapshot {
         let state = self.inner.state.lock();
         if state.poisoned {
             return WalV8FrontierReadySnapshot {
                 ready_prefix: Vec::new(),
                 admitted_ticket_count: 0,
+                #[cfg(feature = "bench")]
                 reserved_preparation_bytes: 0,
+                #[cfg(feature = "bench")]
                 next_not_ready: None,
             };
         }
@@ -295,6 +376,7 @@ impl WalV8ParallelCoordinator {
             }
             ready_prefix.push(ticket.progress());
         }
+        #[cfg(feature = "bench")]
         let next_not_ready = state
             .tickets
             .get(ready_prefix.len())
@@ -302,7 +384,9 @@ impl WalV8ParallelCoordinator {
         WalV8FrontierReadySnapshot {
             ready_prefix,
             admitted_ticket_count: state.tickets.len(),
+            #[cfg(feature = "bench")]
             reserved_preparation_bytes: state.reserved_preparation_bytes,
+            #[cfg(feature = "bench")]
             next_not_ready,
         }
     }
@@ -327,8 +411,9 @@ impl WalV8ParallelCoordinator {
         Ok(())
     }
 
-    /// Record when a producer begins its positional DATA write for opt-in
-    /// benchmark diagnostics. This timestamp is not part of readiness policy.
+    /// Record when a producer begins publishing DATA to the ordered worker
+    /// submitter for opt-in diagnostics. This is not a physical-write or
+    /// readiness timestamp.
     #[cfg(feature = "bench")]
     pub(crate) fn mark_data_write_started(&self, ticket: u64) -> Result<()> {
         let mut state = self.inner.state.lock();
@@ -432,10 +517,99 @@ impl WalV8ParallelCoordinator {
         Ok(())
     }
 
+    /// Publish a worker group's DATA completion atomically so frontier
+    /// formation cannot observe a partial completion from one group.
+    pub(crate) fn mark_data_group_complete(&self, tickets: Range<u64>) -> Result<()> {
+        let mut state = self.inner.state.lock();
+        ensure!(!state.poisoned, "v8 Parallel coordinator is poisoned");
+        let Some(ticket_count) = tickets.end.checked_sub(tickets.start) else {
+            poison_locked(&self.inner, &mut state);
+            anyhow::bail!("v8 DATA completion group has an invalid ticket range")
+        };
+        let Ok(ticket_count) = usize::try_from(ticket_count) else {
+            poison_locked(&self.inner, &mut state);
+            anyhow::bail!("v8 DATA completion group exceeds addressable tickets")
+        };
+        if ticket_count == 0 {
+            poison_locked(&self.inner, &mut state);
+            anyhow::bail!("v8 DATA completion group is empty")
+        }
+        let Some(start_index) = state
+            .tickets
+            .iter()
+            .position(|entry| entry.assignment.segment_ticket == tickets.start)
+        else {
+            poison_locked(&self.inner, &mut state);
+            anyhow::bail!("v8 DATA-completion group names an unknown ticket")
+        };
+        let Some(end_index) = start_index.checked_add(ticket_count) else {
+            poison_locked(&self.inner, &mut state);
+            anyhow::bail!("v8 DATA-completion group index overflows")
+        };
+        if end_index > state.tickets.len() {
+            poison_locked(&self.inner, &mut state);
+            anyhow::bail!("v8 DATA-completion group extends past admitted tickets")
+        }
+        let mut all_complete = true;
+        for (offset, entry) in state
+            .tickets
+            .iter()
+            .skip(start_index)
+            .take(ticket_count)
+            .enumerate()
+        {
+            let expected_ticket = tickets
+                .start
+                .checked_add(u64::try_from(offset)?)
+                .context("v8 DATA-completion ticket overflows")?;
+            if entry.assignment.segment_ticket != expected_ticket || !entry.frames_ready {
+                poison_locked(&self.inner, &mut state);
+                anyhow::bail!("v8 DATA-completion group does not match ready admitted tickets")
+            }
+            all_complete &= entry.data_complete;
+        }
+        if all_complete {
+            return Ok(());
+        }
+        if state
+            .tickets
+            .iter()
+            .skip(start_index)
+            .take(ticket_count)
+            .any(|entry| entry.data_complete)
+        {
+            poison_locked(&self.inner, &mut state);
+            anyhow::bail!("v8 DATA-completion group partially duplicates prior completion")
+        }
+        for entry in state
+            .tickets
+            .iter_mut()
+            .skip(start_index)
+            .take(ticket_count)
+        {
+            entry.data_complete = true;
+        }
+        signal_change(&self.inner, &mut state);
+        Ok(())
+    }
+
     /// Reserve a physical tail slot for the next FRONTIER. Admission after this
     /// call allocates DATA after the marker, even if the selected prefix's
     /// earlier DATA is still awaiting a sync.
     pub(crate) fn reserve_frontier(&self, ticket_end: u64) -> Result<WalV8FrontierReservation> {
+        self.reserve_frontier_with(ticket_end, |_| Ok(()))
+    }
+
+    /// Reserve a frontier and publish its physical offset to the DATA
+    /// submitter before another admission can allocate beyond that marker.
+    pub(crate) fn reserve_frontier_with<F>(
+        &self,
+        ticket_end: u64,
+        publish: F,
+    ) -> Result<WalV8FrontierReservation>
+    where
+        F: FnOnce(WalV8FrontierReservation) -> Result<()>,
+    {
         let mut state = self.inner.state.lock();
         ensure!(!state.poisoned, "v8 Parallel coordinator is poisoned");
         ensure!(
@@ -480,6 +654,10 @@ impl WalV8ParallelCoordinator {
         };
         state.next_data_offset = frontier_end;
         state.pending_frontier = Some(reservation);
+        if let Err(error) = publish(reservation) {
+            poison_locked(&self.inner, &mut state);
+            return Err(error).context("publish v8 FRONTIER offset to DATA submitter");
+        }
         signal_change(&self.inner, &mut state);
         Ok(reservation)
     }
@@ -800,6 +978,9 @@ impl WalV8AdmissionPublisher for WalV8ParallelCoordinator {
         state.last_commit_ts = plan.commit_ts;
         state.last_recorded_at = Some(recorded_at);
         state.reserved_bytes = new_reserved_bytes;
+        self.inner
+            .admitted_ticket_end
+            .store(next_ticket, Ordering::Release);
         signal_change(&self.inner, &mut state);
 
         Ok((
@@ -1104,6 +1285,88 @@ mod tests {
         drop(first_admitted);
         drop(second_admitted);
         assert!(coordinator.is_poisoned());
+        Ok(())
+    }
+
+    fn wait_for_frontier_coalescer(coordinator: &WalV8ParallelCoordinator) -> Result<()> {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while coordinator.inner.state.lock().frontier_coalesce_waiters == 0 {
+            ensure!(
+                Instant::now() < deadline,
+                "frontier coalescer did not start waiting"
+            );
+            std::thread::yield_now();
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn frontier_coalescing_skips_lone_producers_and_bounds_unfinished_successors() -> Result<()> {
+        let coordinator = coordinator(8)?;
+        let first = batch(10);
+        let mut first_encoded = admit(&first, &coordinator)?.encode()?;
+        assert!(!coordinator.coalesce_frontier_ready(Duration::from_secs(1)));
+        mark_producer_ready(&mut first_encoded, &coordinator, true)?;
+        assert!(!coordinator.coalesce_frontier_ready(Duration::from_secs(1)));
+
+        let second = batch(20);
+        let _unfinished = admit(&second, &coordinator)?;
+        assert!(coordinator.coalesce_frontier_ready(Duration::from_millis(1)));
+        assert_eq!(coordinator.frontier_ready_prefix().len(), 1);
+        assert_eq!(coordinator.durable_ticket_end(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn frontier_coalescing_joins_completed_successors_without_publishing_durability() -> Result<()>
+    {
+        let coordinator = coordinator(8)?;
+        let first = batch(10);
+        let second = batch(20);
+        let mut first_encoded = admit(&first, &coordinator)?.encode()?;
+        let mut second_encoded = admit(&second, &coordinator)?.encode()?;
+        mark_producer_ready(&mut first_encoded, &coordinator, true)?;
+        mark_producer_ready(&mut second_encoded, &coordinator, false)?;
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let waiting = coordinator.clone();
+        let waiter = std::thread::spawn(move || {
+            let _ = tx.send(waiting.coalesce_frontier_ready(Duration::from_secs(2)));
+        });
+        wait_for_frontier_coalescer(&coordinator)?;
+        coordinator.mark_data_complete(1)?;
+        assert!(rx.recv_timeout(Duration::from_secs(1))?);
+        waiter.join().expect("frontier coalescer panicked");
+        assert_eq!(coordinator.frontier_ready_prefix().len(), 2);
+        assert_eq!(coordinator.durable_ticket_end(), 0);
+        assert!(!coordinator.coalesce_frontier_ready(Duration::from_secs(1)));
+        Ok(())
+    }
+
+    #[test]
+    fn close_and_poison_wake_frontier_coalescing() -> Result<()> {
+        for poison in [false, true] {
+            let coordinator = coordinator(8)?;
+            let first = batch(10);
+            let second = batch(20);
+            let mut first_encoded = admit(&first, &coordinator)?.encode()?;
+            let _unfinished = admit(&second, &coordinator)?;
+            mark_producer_ready(&mut first_encoded, &coordinator, true)?;
+            let (tx, rx) = std::sync::mpsc::channel();
+            let waiting = coordinator.clone();
+            let waiter = std::thread::spawn(move || {
+                let _ = tx.send(waiting.coalesce_frontier_ready(Duration::from_secs(2)));
+            });
+            wait_for_frontier_coalescer(&coordinator)?;
+            if poison {
+                coordinator.poison();
+            } else {
+                coordinator.close();
+            }
+            assert!(rx.recv_timeout(Duration::from_secs(1))?);
+            waiter.join().expect("frontier coalescer panicked");
+            assert_eq!(coordinator.durable_ticket_end(), 0);
+        }
         Ok(())
     }
 
