@@ -1,0 +1,208 @@
+{
+  "source_revision": "efa90f118742296cd95eb7a1593e0c636df46acd",
+  "runtime_revision": "b8da402a276d7969f4c40ca99787a10a63d93f33",
+  "binary_paths": {
+    "normal": "/home/liu/proj/toy-kv-engine/target/rfc-026-v8-notification-split-20261102/write-perf-cursor",
+    "diagnostic": "/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution"
+  },
+  "binary_sha256": {
+    "normal": "937a3843a044e107e15db756674be151875e388ff3a0a392cbd4e97463bbd2aa",
+    "diagnostic": "fbb90ea8a6f20bf476760e79ae60e04cda3edae04138d45ae5a9e6346da299f1"
+  },
+  "schedule": [
+    {
+      "mode": "normal",
+      "round": 0,
+      "position": 0,
+      "format": "v7",
+      "affinity": "hybrid"
+    },
+    {
+      "mode": "normal",
+      "round": 0,
+      "position": 1,
+      "format": "v8",
+      "affinity": "hybrid"
+    },
+    {
+      "mode": "normal",
+      "round": 0,
+      "position": 2,
+      "format": "v8",
+      "affinity": "pcore"
+    },
+    {
+      "mode": "normal",
+      "round": 0,
+      "position": 3,
+      "format": "v7",
+      "affinity": "pcore"
+    },
+    {
+      "mode": "normal",
+      "round": 1,
+      "position": 0,
+      "format": "v8",
+      "affinity": "hybrid"
+    },
+    {
+      "mode": "normal",
+      "round": 1,
+      "position": 1,
+      "format": "v7",
+      "affinity": "pcore"
+    },
+    {
+      "mode": "normal",
+      "round": 1,
+      "position": 2,
+      "format": "v7",
+      "affinity": "hybrid"
+    },
+    {
+      "mode": "normal",
+      "round": 1,
+      "position": 3,
+      "format": "v8",
+      "affinity": "pcore"
+    },
+    {
+      "mode": "normal",
+      "round": 2,
+      "position": 0,
+      "format": "v7",
+      "affinity": "pcore"
+    },
+    {
+      "mode": "normal",
+      "round": 2,
+      "position": 1,
+      "format": "v8",
+      "affinity": "pcore"
+    },
+    {
+      "mode": "normal",
+      "round": 2,
+      "position": 2,
+      "format": "v8",
+      "affinity": "hybrid"
+    },
+    {
+      "mode": "normal",
+      "round": 2,
+      "position": 3,
+      "format": "v7",
+      "affinity": "hybrid"
+    },
+    {
+      "mode": "normal",
+      "round": 3,
+      "position": 0,
+      "format": "v8",
+      "affinity": "pcore"
+    },
+    {
+      "mode": "normal",
+      "round": 3,
+      "position": 1,
+      "format": "v7",
+      "affinity": "hybrid"
+    },
+    {
+      "mode": "normal",
+      "round": 3,
+      "position": 2,
+      "format": "v7",
+      "affinity": "pcore"
+    },
+    {
+      "mode": "normal",
+      "round": 3,
+      "position": 3,
+      "format": "v8",
+      "affinity": "hybrid"
+    },
+    {
+      "mode": "diagnostic",
+      "round": 0,
+      "position": 0,
+      "format": "v7",
+      "affinity": "hybrid"
+    },
+    {
+      "mode": "diagnostic",
+      "round": 0,
+      "position": 1,
+      "format": "v8",
+      "affinity": "hybrid"
+    },
+    {
+      "mode": "diagnostic",
+      "round": 0,
+      "position": 2,
+      "format": "v8",
+      "affinity": "pcore"
+    },
+    {
+      "mode": "diagnostic",
+      "round": 0,
+      "position": 3,
+      "format": "v7",
+      "affinity": "pcore"
+    },
+    {
+      "mode": "diagnostic",
+      "round": 1,
+      "position": 0,
+      "format": "v7",
+      "affinity": "pcore"
+    },
+    {
+      "mode": "diagnostic",
+      "round": 1,
+      "position": 1,
+      "format": "v8",
+      "affinity": "pcore"
+    },
+    {
+      "mode": "diagnostic",
+      "round": 1,
+      "position": 2,
+      "format": "v8",
+      "affinity": "hybrid"
+    },
+    {
+      "mode": "diagnostic",
+      "round": 1,
+      "position": 3,
+      "format": "v7",
+      "affinity": "hybrid"
+    }
+  ],
+  "affinity": {
+    "hybrid": "inherited native mask 0-31; no taskset",
+    "pcore": "taskset -c 0-15 applied to benchmark and inherited by its userspace threads"
+  },
+  "workload": {
+    "puts": 750000,
+    "writers": 16,
+    "batch": 64,
+    "value_bytes": 1024,
+    "wal_io_mode": "parallel",
+    "compaction": "none",
+    "target_sst_size": 2147483648,
+    "latency_sample_every": 10
+  },
+  "normal": "Same retained executable for all four cells. Timed process CPU, normal WAL/digest counters, timed getrusage context deltas. No perf or attribution scopes.",
+  "diagnostic": "Same preserved diagnostic executable for all four cells. Whole-batch phase CPU/wall scopes sampled 1/64/thread, existing digest sample metrics, perf cpu-clock:u 499Hz, DWARF4096, --sample-cpu; perf enabled only during timed interval and recorded to memfd.",
+  "cooldown_before_each_round_seconds": 45,
+  "between_runs_seconds": 3,
+  "stall_flag": "p99_ms > 10 OR mean fdatasync_ms > 1; all records retained, flagged scores excluded from best/eligible comparisons",
+  "selection": "Highest eligible normal throughput per cell with same-run p99/CPU/contexts; also report eligible medians and complete raw cohort. Diagnostics never enter best-score rankings.",
+  "limits": [
+    "Whole-process P affinity changes available physical-core count, SMT and contention for all roles; it cannot isolate hash placement alone.",
+    "CPU sample shares are time-weighted sample shares, not batch/byte proportions; do not use them as job-placement probabilities.",
+    "Sampled phase scopes are inclusive; child scopes cannot be added to encoding parent."
+  ],
+  "production_runtime_modified": false
+}

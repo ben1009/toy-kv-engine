@@ -1,0 +1,114 @@
+# To display the perf.data header info, please use --header/--header-only options.
+#
+#
+# Total Lost Samples: 0
+#
+# Samples: 2K of event 'cpu-clock:u'
+# Event count (approx.): 5342685328
+#
+# Overhead Symbol IPC [IPC Coverage]
+# ........ ....................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................... ....................
+#
+9.90% [.] <kv_engine::mvcc::LsmMvccInner>::publish_commit_ts - -
+9.53% [.] _blake3_hash_many_avx2 - -
+|
+|--1.35%--0x27
+|
+|--1.35%--0x7
+|
+|--1.28%--0xf
+|
+|--1.13%--0x1f
+|
+|--1.09%--0x37
+|
+|--1.01%--0x2f
+|
+|--0.86%--0x17
+|
+--0.68%--0x3
+
+8.81% [.] <crossbeam_skiplist::base::SkipList<bytes::bytes::Bytes, bytes::bytes::Bytes>>::search_position::<bytes::bytes::Bytes> - -
+6.94% [.] <crossbeam_skiplist::base::SkipList<bytes::bytes::Bytes, bytes::bytes::Bytes>>::insert_internal::<<crossbeam_skiplist::base::SkipList<bytes::bytes::Bytes, bytes::bytes::Bytes>>::insert::{closure#0}, <crossbeam_skiplist::base::SkipList<bytes::bytes::Bytes, bytes::bytes::Bytes>>::insert::{closure#1}> - -
+5.03% [.] 0x00000000000a5fdc - -
+|
+|--1.88%--<core::iter::adapters::map::Map<core::slice::iter::Iter<(bytes::bytes::Bytes, bytes::bytes::Bytes, kv_engine::mvcc::BatchEntryKind)>, <kv_engine::mvcc::LsmMvccInner>::write_batch_wal_only_inner::{closure#0}> as core::iter::traits::iterator::Iterator>::fold::<(), core::iter::traits::iterator::Iterator::for_each::call<kv_engine::pitr::WalEntry, <alloc::vec::Vec<kv_engine::pitr::WalEntry>>::extend_trusted<core::iter::adapters::map::Map<core::slice::iter::Iter<(bytes::bytes::Bytes, bytes::bytes::Bytes, kv_engine::mvcc::BatchEntryKind)>, <kv_engine::mvcc::LsmMvccInner>::write_batch_wal_only_inner::{closure#0}>>::{closure#0}>::{closure#0}>
+| |
+| --1.69%--0x3f
+|
+|--1.05%--<crossbeam_skiplist::base::SkipList<bytes::bytes::Bytes, bytes::bytes::Bytes>>::insert_internal::<<crossbeam_skiplist::base::SkipList<bytes::bytes::Bytes, bytes::bytes::Bytes>>::insert::{closure#0}, <crossbeam_skiplist::base::SkipList<bytes::bytes::Bytes, bytes::bytes::Bytes>>::insert::{closure#1}>
+|
+--0.94%--<bytes::bytes::Bytes as core::convert::From<alloc::vec::Vec<u8>>>::from
+
+4.95% [.] __vdso_clock_gettime - -
+|
+---clock_gettime
+|
+--4.91%--<std::sys::pal::unix::time::Timespec>::now
+|
+|--2.66%--<std::time::Instant>::elapsed
+| |
+| --2.51%--<std::thread::local::LocalKey<core::cell::RefCell<alloc::vec::Vec<u8>>>>::with::<<kv_engine::mem_table::MemTable>::publish_raw_batch::{closure#0}, ()>
+|
+--2.10%--<std::thread::local::LocalKey<core::cell::RefCell<alloc::vec::Vec<u8>>>>::with::<<kv_engine::mem_table::MemTable>::publish_raw_batch::{closure#0}, ()>
+
+3.98% [.] <std::thread::local::LocalKey<core::cell::RefCell<alloc::vec::Vec<u8>>>>::with::<<kv_engine::mem_table::MemTable>::publish_raw_batch::{closure#0}, ()> - -
+3.19% [.] 0x00000000000a5ffc - -
+|
+--1.24%--<core::iter::adapters::map::Map<core::slice::iter::Iter<(bytes::bytes::Bytes, bytes::bytes::Bytes, kv_engine::mvcc::BatchEntryKind)>, <kv_engine::mvcc::LsmMvccInner>::write_batch_wal_only_inner::{closure#0}> as core::iter::traits::iterator::Iterator>::fold::<(), core::iter::traits::iterator::Iterator::for_each::call<kv_engine::pitr::WalEntry, <alloc::vec::Vec<kv_engine::pitr::WalEntry>>::extend_trusted<core::iter::adapters::map::Map<core::slice::iter::Iter<(bytes::bytes::Bytes, bytes::bytes::Bytes, kv_engine::mvcc::BatchEntryKind)>, <kv_engine::mvcc::LsmMvccInner>::write_batch_wal_only_inner::{closure#0}>>::{closure#0}>::{closure#0}>
+|
+--1.20%--0x3f
+
+2.70% [.] crc32fast::baseline::update_fast_16 - -
+|
+|--1.20%--<kv_engine::pitr::CanonicalWalEntryStream>::encode_into_with_observer::<<kv_engine::wal::v8::prepare::AdmittedWalV8Batch<kv_engine::wal::v8::parallel::WalV8ParallelAdmissionGuard, kv_engine::wal::v8::leader::WalV8PreflightReservation>>::encode::{closure#0}>
+|
+--0.71%--0xf08defa401f93d76
+
+1.95% [.] crc32fast::specialized::pclmulqdq::calculate - -
+1.73% [.] _blake3_compress_in_place_sse41 - -
+1.39% [.] 0x00000000000a481c - -
+1.13% [.] 0x000000000016c119 - -
+|
+--0.98%--<crossbeam_skiplist::base::SkipList<bytes::bytes::Bytes, bytes::bytes::Bytes>>::search_position::<bytes::bytes::Bytes>
+
+1.09% [.] 0x00000000000a4809 - -
+1.05% [.] malloc - -
+1.05% [.] 0x000000000016c11d - -
+|
+--0.56%--<core::slice::iter::Iter<kv_engine::pitr::WalEntry> as core::iter::traits::iterator::Iterator>::try_fold::<(), <core::iter::adapters::enumerate::Enumerate<_> as core::iter::traits::iterator::Iterator>::try_fold::enumerate<&kv_engine::pitr::WalEntry, (), core::ops::control_flow::ControlFlow<&kv_engine::pitr::WalEntry>, core::iter::traits::iterator::Iterator::find_map::check<(usize, &kv_engine::pitr::WalEntry), &kv_engine::pitr::WalEntry, &mut <kv_engine::pitr::CanonicalWalEntryStream>::entries::{closure#0}>::{closure#0}>::{closure#0}, core::ops::control_flow::ControlFlow<&kv_engine::pitr::WalEntry>>
+
+1.01% [.] 0x000000000016bf08 - -
+|
+--0.68%--<crossbeam_skiplist::base::SkipList<bytes::bytes::Bytes, bytes::bytes::Bytes>>::search_position::<bytes::bytes::Bytes>
+
+0.94% [.] <parking_lot::raw_mutex::RawMutex>::lock_slow - -
+0.90% [.] <core::slice::iter::Iter<kv_engine::pitr::WalEntry> as core::iter::traits::iterator::Iterator>::try_fold::<(), <core::iter::adapters::enumerate::Enumerate<_> as core::iter::traits::iterator::Iterator>::try_fold::enumerate<&kv_engine::pitr::WalEntry, (), core::ops::control_flow::ControlFlow<&kv_engine::pitr::WalEntry>, core::iter::traits::iterator::Iterator::find_map::check<(usize, &kv_engine::pitr::WalEntry), &kv_engine::pitr::WalEntry, &mut <kv_engine::pitr::CanonicalWalEntryStream>::entries::{closure#0}>::{closure#0}>::{closure#0}, core::ops::control_flow::ControlFlow<&kv_engine::pitr::WalEntry>> - -
+0.86% [.] <crossbeam_channel::flavors::list::Channel<kv_engine::wal::parallel_worker::GroupWriteResult>>::recv - -
+0.79% [.] 0x000000000016d053 - -
+|
+--0.64%--<kv_engine::wal::v8::prepare::AdmittedWalV8Batch<kv_engine::wal::v8::parallel::WalV8ParallelAdmissionGuard, kv_engine::wal::v8::leader::WalV8PreflightReservation>>::encode
+
+0.71% [.] 0x000000000016be20 - -
+0.68% [.] cfree - -
+0.60% [.] <kv_engine::lsm_storage::LsmStorageInner>::push_point_batch_entry::<&[u8]> - -
+0.60% [.] <usize as core::fmt::Display>::fmt - -
+|
+---core::fmt::write
+alloc::fmt::format::format_inner
+std::sys::backtrace::__rust_begin_short_backtrace::<write_perf::run_wal_batch_concurrent::{closure#0}, core::result::Result<alloc::vec::Vec<u64>, anyhow::Error>>
+0x9
+
+0.53% [.] crossbeam_epoch::default::with_handle::<crossbeam_epoch::default::pin::{closure#0}, crossbeam_epoch::guard::Guard> - -
+|
+---<std::thread::local::LocalKey<core::cell::RefCell<alloc::vec::Vec<u8>>>>::with::<<kv_engine::mem_table::MemTable>::publish_raw_batch::{closure#0}, ()>
+
+0.53% [.] 0x000000000016c887 - -
+|
+---kv_engine::wal::v8::codec::encode_data_fragment_frame_into
+
+
+
+#
+# (Tip: To record every process run by a user: perf record -u <user>)
+#

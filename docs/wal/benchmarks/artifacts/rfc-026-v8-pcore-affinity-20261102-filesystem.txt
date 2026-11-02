@@ -1,0 +1,10 @@
+{
+   "filesystems": [
+      {
+         "source": "/dev/nvme0n1p3",
+         "fstype": "ext4",
+         "target": "/home",
+         "options": "rw,relatime"
+      }
+   ]
+}

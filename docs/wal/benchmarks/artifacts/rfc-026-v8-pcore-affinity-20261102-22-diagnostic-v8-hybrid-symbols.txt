@@ -1,0 +1,108 @@
+# To display the perf.data header info, please use --header/--header-only options.
+#
+#
+# Total Lost Samples: 0
+#
+# Samples: 3K of event 'cpu-clock:u'
+# Event count (approx.): 7885771480
+#
+# Overhead Symbol IPC [IPC Coverage]
+# ........ ....................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................... ....................
+#
+12.17% [.] <kv_engine::mvcc::LsmMvccInner>::publish_commit_ts - -
+9.05% [.] _blake3_hash_many_avx2 - -
+|
+|--1.52%--0x7
+|
+|--1.12%--0x27
+|
+|--0.99%--0x17
+|
+|--0.97%--0x2f
+|
+|--0.91%--0x1f
+|
+|--0.81%--0xf
+|
+|--0.79%--0x37
+|
+|--0.76%--0x3
+|
+--0.74%--0xffffffffffffffff
+
+7.06% [.] <crossbeam_skiplist::base::SkipList<bytes::bytes::Bytes, bytes::bytes::Bytes>>::search_position::<bytes::bytes::Bytes> - -
+4.80% [.] __vdso_clock_gettime - -
+|
+---clock_gettime
+<std::sys::pal::unix::time::Timespec>::now
+|
+|--2.44%--<std::time::Instant>::elapsed
+| |
+| --2.36%--<std::thread::local::LocalKey<core::cell::RefCell<alloc::vec::Vec<u8>>>>::with::<<kv_engine::mem_table::MemTable>::publish_raw_batch::{closure#0}, ()>
+|
+--1.96%--<std::thread::local::LocalKey<core::cell::RefCell<alloc::vec::Vec<u8>>>>::with::<<kv_engine::mem_table::MemTable>::publish_raw_batch::{closure#0}, ()>
+
+4.70% [.] 0x00000000000a5fdc - -
+|
+|--1.55%--<core::iter::adapters::map::Map<core::slice::iter::Iter<(bytes::bytes::Bytes, bytes::bytes::Bytes, kv_engine::mvcc::BatchEntryKind)>, <kv_engine::mvcc::LsmMvccInner>::write_batch_wal_only_inner::{closure#0}> as core::iter::traits::iterator::Iterator>::fold::<(), core::iter::traits::iterator::Iterator::for_each::call<kv_engine::pitr::WalEntry, <alloc::vec::Vec<kv_engine::pitr::WalEntry>>::extend_trusted<core::iter::adapters::map::Map<core::slice::iter::Iter<(bytes::bytes::Bytes, bytes::bytes::Bytes, kv_engine::mvcc::BatchEntryKind)>, <kv_engine::mvcc::LsmMvccInner>::write_batch_wal_only_inner::{closure#0}>>::{closure#0}>::{closure#0}>
+| |
+| --1.30%--0x3f
+|
+|--1.02%--<crossbeam_skiplist::base::SkipList<bytes::bytes::Bytes, bytes::bytes::Bytes>>::insert_internal::<<crossbeam_skiplist::base::SkipList<bytes::bytes::Bytes, bytes::bytes::Bytes>>::insert::{closure#0}, <crossbeam_skiplist::base::SkipList<bytes::bytes::Bytes, bytes::bytes::Bytes>>::insert::{closure#1}>
+|
+--0.58%--<bytes::bytes::Bytes as core::convert::From<alloc::vec::Vec<u8>>>::from
+
+4.63% [.] <crossbeam_skiplist::base::SkipList<bytes::bytes::Bytes, bytes::bytes::Bytes>>::insert_internal::<<crossbeam_skiplist::base::SkipList<bytes::bytes::Bytes, bytes::bytes::Bytes>>::insert::{closure#0}, <crossbeam_skiplist::base::SkipList<bytes::bytes::Bytes, bytes::bytes::Bytes>>::insert::{closure#1}> - -
+3.46% [.] <std::thread::local::LocalKey<core::cell::RefCell<alloc::vec::Vec<u8>>>>::with::<<kv_engine::mem_table::MemTable>::publish_raw_batch::{closure#0}, ()> - -
+3.38% [.] 0x00000000000a5ffc - -
+|
+|--1.50%--<core::iter::adapters::map::Map<core::slice::iter::Iter<(bytes::bytes::Bytes, bytes::bytes::Bytes, kv_engine::mvcc::BatchEntryKind)>, <kv_engine::mvcc::LsmMvccInner>::write_batch_wal_only_inner::{closure#0}> as core::iter::traits::iterator::Iterator>::fold::<(), core::iter::traits::iterator::Iterator::for_each::call<kv_engine::pitr::WalEntry, <alloc::vec::Vec<kv_engine::pitr::WalEntry>>::extend_trusted<core::iter::adapters::map::Map<core::slice::iter::Iter<(bytes::bytes::Bytes, bytes::bytes::Bytes, kv_engine::mvcc::BatchEntryKind)>, <kv_engine::mvcc::LsmMvccInner>::write_batch_wal_only_inner::{closure#0}>>::{closure#0}>::{closure#0}>
+| |
+| --1.32%--0x3f
+|
+--0.61%--<std::thread::local::LocalKey<core::cell::RefCell<alloc::vec::Vec<u8>>>>::with::<<kv_engine::mem_table::MemTable>::publish_raw_batch::{closure#0}, ()>
+
+2.90% [.] crc32fast::baseline::update_fast_16 - -
+|
+|--1.14%--<kv_engine::pitr::CanonicalWalEntryStream>::encode_into_with_observer::<<kv_engine::wal::v8::prepare::AdmittedWalV8Batch<kv_engine::wal::v8::parallel::WalV8ParallelAdmissionGuard, kv_engine::wal::v8::leader::WalV8PreflightReservation>>::encode::{closure#0}>
+|
+--1.09%--0xc7e12e1aba7a72a4
+
+1.83% [.] crc32fast::specialized::pclmulqdq::calculate - -
+1.78% [.] 0x000000000016d053 - -
+|
+--1.32%--<kv_engine::wal::v8::prepare::AdmittedWalV8Batch<kv_engine::wal::v8::parallel::WalV8ParallelAdmissionGuard, kv_engine::wal::v8::leader::WalV8PreflightReservation>>::encode
+
+1.73% [.] _blake3_compress_in_place_sse41 - -
+1.42% [.] malloc - -
+1.35% [.] <core::slice::iter::Iter<kv_engine::pitr::WalEntry> as core::iter::traits::iterator::Iterator>::try_fold::<(), <core::iter::adapters::enumerate::Enumerate<_> as core::iter::traits::iterator::Iterator>::try_fold::enumerate<&kv_engine::pitr::WalEntry, (), core::ops::control_flow::ControlFlow<&kv_engine::pitr::WalEntry>, core::iter::traits::iterator::Iterator::find_map::check<(usize, &kv_engine::pitr::WalEntry), &kv_engine::pitr::WalEntry, &mut <kv_engine::pitr::CanonicalWalEntryStream>::entries::{closure#0}>::{closure#0}>::{closure#0}, core::ops::control_flow::ControlFlow<&kv_engine::pitr::WalEntry>> - -
+|
+--0.51%--0x3f
+
+1.09% [.] 0x00000000000a481c - -
+1.04% [.] 0x00000000000a4809 - -
+1.02% [.] <parking_lot::raw_mutex::RawMutex>::lock_slow - -
+0.86% [.] cfree - -
+0.84% [.] 0x000000000016c11d - -
+0.76% [.] clock_gettime - -
+|
+---<std::sys::pal::unix::time::Timespec>::now
+
+0.74% [.] syscall - -
+0.66% [.] <crossbeam_channel::flavors::list::Channel<kv_engine::wal::parallel_worker::GroupWriteResult>>::recv - -
+0.66% [.] <kv_engine::lsm_storage::LsmStorageInner>::write_batch_with_lifecycle_admission::<&[u8]> - -
+0.66% [.] <parking_lot::condvar::Condvar>::wait_until_internal - -
+0.66% [.] <parking_lot::raw_mutex::RawMutex>::unlock_slow - -
+0.66% [.] 0x000000000016bf08 - -
+0.56% [.] <kv_engine::lsm_storage::LsmStorageInner>::push_point_batch_entry::<&[u8]> - -
+0.56% [.] 0x000000000016c887 - -
+|
+--0.53%--kv_engine::wal::v8::codec::encode_data_fragment_frame_into
+
+0.53% [.] kv_engine::key::decode_user_key_into - -
+0.51% [.] 0x000000000016c119 - -
+
+
+#
+# (Tip: If you have debuginfo enabled, try: perf report -s sym,srcline)
+#

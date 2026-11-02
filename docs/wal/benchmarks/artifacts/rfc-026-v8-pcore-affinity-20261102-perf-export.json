@@ -1,0 +1,266 @@
+[
+  {
+    "sample": "16-diagnostic-v7-hybrid",
+    "artifact": "16-diagnostic-v7-hybrid-stacks.txt",
+    "command": [
+      "perf",
+      "script",
+      "--ns",
+      "-i",
+      "target/rfc-026-v8-pcore-affinity-20261102/16-diagnostic-v7-hybrid.perf",
+      "-F",
+      "comm,pid,tid,cpu,time,event,ip,sym,dso"
+    ],
+    "returncode": 0,
+    "bytes": 1044995
+  },
+  {
+    "sample": "16-diagnostic-v7-hybrid",
+    "artifact": "16-diagnostic-v7-hybrid-symbols.txt",
+    "command": [
+      "perf",
+      "report",
+      "--stdio",
+      "--no-children",
+      "--percent-limit",
+      "0.5",
+      "--sort",
+      "symbol",
+      "-i",
+      "target/rfc-026-v8-pcore-affinity-20261102/16-diagnostic-v7-hybrid.perf"
+    ],
+    "returncode": 0,
+    "bytes": 22952
+  },
+  {
+    "sample": "17-diagnostic-v8-hybrid",
+    "artifact": "17-diagnostic-v8-hybrid-stacks.txt",
+    "command": [
+      "perf",
+      "script",
+      "--ns",
+      "-i",
+      "target/rfc-026-v8-pcore-affinity-20261102/17-diagnostic-v8-hybrid.perf",
+      "-F",
+      "comm,pid,tid,cpu,time,event,ip,sym,dso"
+    ],
+    "returncode": 0,
+    "bytes": 1595701
+  },
+  {
+    "sample": "17-diagnostic-v8-hybrid",
+    "artifact": "17-diagnostic-v8-hybrid-symbols.txt",
+    "command": [
+      "perf",
+      "report",
+      "--stdio",
+      "--no-children",
+      "--percent-limit",
+      "0.5",
+      "--sort",
+      "symbol",
+      "-i",
+      "target/rfc-026-v8-pcore-affinity-20261102/17-diagnostic-v8-hybrid.perf"
+    ],
+    "returncode": 0,
+    "bytes": 42416
+  },
+  {
+    "sample": "18-diagnostic-v8-pcore",
+    "artifact": "18-diagnostic-v8-pcore-stacks.txt",
+    "command": [
+      "perf",
+      "script",
+      "--ns",
+      "-i",
+      "target/rfc-026-v8-pcore-affinity-20261102/18-diagnostic-v8-pcore.perf",
+      "-F",
+      "comm,pid,tid,cpu,time,event,ip,sym,dso"
+    ],
+    "returncode": 0,
+    "bytes": 1146178
+  },
+  {
+    "sample": "18-diagnostic-v8-pcore",
+    "artifact": "18-diagnostic-v8-pcore-symbols.txt",
+    "command": [
+      "perf",
+      "report",
+      "--stdio",
+      "--no-children",
+      "--percent-limit",
+      "0.5",
+      "--sort",
+      "symbol",
+      "-i",
+      "target/rfc-026-v8-pcore-affinity-20261102/18-diagnostic-v8-pcore.perf"
+    ],
+    "returncode": 0,
+    "bytes": 26216
+  },
+  {
+    "sample": "19-diagnostic-v7-pcore",
+    "artifact": "19-diagnostic-v7-pcore-stacks.txt",
+    "command": [
+      "perf",
+      "script",
+      "--ns",
+      "-i",
+      "target/rfc-026-v8-pcore-affinity-20261102/19-diagnostic-v7-pcore.perf",
+      "-F",
+      "comm,pid,tid,cpu,time,event,ip,sym,dso"
+    ],
+    "returncode": 0,
+    "bytes": 1445454
+  },
+  {
+    "sample": "19-diagnostic-v7-pcore",
+    "artifact": "19-diagnostic-v7-pcore-symbols.txt",
+    "command": [
+      "perf",
+      "report",
+      "--stdio",
+      "--no-children",
+      "--percent-limit",
+      "0.5",
+      "--sort",
+      "symbol",
+      "-i",
+      "target/rfc-026-v8-pcore-affinity-20261102/19-diagnostic-v7-pcore.perf"
+    ],
+    "returncode": 0,
+    "bytes": 49008
+  },
+  {
+    "sample": "20-diagnostic-v7-pcore",
+    "artifact": "20-diagnostic-v7-pcore-stacks.txt",
+    "command": [
+      "perf",
+      "script",
+      "--ns",
+      "-i",
+      "target/rfc-026-v8-pcore-affinity-20261102/20-diagnostic-v7-pcore.perf",
+      "-F",
+      "comm,pid,tid,cpu,time,event,ip,sym,dso"
+    ],
+    "returncode": 0,
+    "bytes": 1434007
+  },
+  {
+    "sample": "20-diagnostic-v7-pcore",
+    "artifact": "20-diagnostic-v7-pcore-symbols.txt",
+    "command": [
+      "perf",
+      "report",
+      "--stdio",
+      "--no-children",
+      "--percent-limit",
+      "0.5",
+      "--sort",
+      "symbol",
+      "-i",
+      "target/rfc-026-v8-pcore-affinity-20261102/20-diagnostic-v7-pcore.perf"
+    ],
+    "returncode": 0,
+    "bytes": 23843
+  },
+  {
+    "sample": "21-diagnostic-v8-pcore",
+    "artifact": "21-diagnostic-v8-pcore-stacks.txt",
+    "command": [
+      "perf",
+      "script",
+      "--ns",
+      "-i",
+      "target/rfc-026-v8-pcore-affinity-20261102/21-diagnostic-v8-pcore.perf",
+      "-F",
+      "comm,pid,tid,cpu,time,event,ip,sym,dso"
+    ],
+    "returncode": 0,
+    "bytes": 1649732
+  },
+  {
+    "sample": "21-diagnostic-v8-pcore",
+    "artifact": "21-diagnostic-v8-pcore-symbols.txt",
+    "command": [
+      "perf",
+      "report",
+      "--stdio",
+      "--no-children",
+      "--percent-limit",
+      "0.5",
+      "--sort",
+      "symbol",
+      "-i",
+      "target/rfc-026-v8-pcore-affinity-20261102/21-diagnostic-v8-pcore.perf"
+    ],
+    "returncode": 0,
+    "bytes": 46030
+  },
+  {
+    "sample": "22-diagnostic-v8-hybrid",
+    "artifact": "22-diagnostic-v8-hybrid-stacks.txt",
+    "command": [
+      "perf",
+      "script",
+      "--ns",
+      "-i",
+      "target/rfc-026-v8-pcore-affinity-20261102/22-diagnostic-v8-hybrid.perf",
+      "-F",
+      "comm,pid,tid,cpu,time,event,ip,sym,dso"
+    ],
+    "returncode": 0,
+    "bytes": 1645069
+  },
+  {
+    "sample": "22-diagnostic-v8-hybrid",
+    "artifact": "22-diagnostic-v8-hybrid-symbols.txt",
+    "command": [
+      "perf",
+      "report",
+      "--stdio",
+      "--no-children",
+      "--percent-limit",
+      "0.5",
+      "--sort",
+      "symbol",
+      "-i",
+      "target/rfc-026-v8-pcore-affinity-20261102/22-diagnostic-v8-hybrid.perf"
+    ],
+    "returncode": 0,
+    "bytes": 27204
+  },
+  {
+    "sample": "23-diagnostic-v7-hybrid",
+    "artifact": "23-diagnostic-v7-hybrid-stacks.txt",
+    "command": [
+      "perf",
+      "script",
+      "--ns",
+      "-i",
+      "target/rfc-026-v8-pcore-affinity-20261102/23-diagnostic-v7-hybrid.perf",
+      "-F",
+      "comm,pid,tid,cpu,time,event,ip,sym,dso"
+    ],
+    "returncode": 0,
+    "bytes": 1455448
+  },
+  {
+    "sample": "23-diagnostic-v7-hybrid",
+    "artifact": "23-diagnostic-v7-hybrid-symbols.txt",
+    "command": [
+      "perf",
+      "report",
+      "--stdio",
+      "--no-children",
+      "--percent-limit",
+      "0.5",
+      "--sort",
+      "symbol",
+      "-i",
+      "target/rfc-026-v8-pcore-affinity-20261102/23-diagnostic-v7-hybrid.perf"
+    ],
+    "returncode": 0,
+    "bytes": 23806
+  }
+]
