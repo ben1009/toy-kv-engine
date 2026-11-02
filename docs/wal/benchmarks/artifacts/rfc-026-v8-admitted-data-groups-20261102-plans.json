@@ -1,0 +1,407 @@
+{
+  "guards-plan.json": {
+    "schedule": [
+      [
+        "batch",
+        16,
+        750000,
+        "baseline"
+      ],
+      [
+        "batch",
+        16,
+        750000,
+        "candidate"
+      ],
+      [
+        "point",
+        8,
+        20000,
+        "baseline"
+      ],
+      [
+        "point",
+        8,
+        20000,
+        "candidate"
+      ],
+      [
+        "point",
+        16,
+        20000,
+        "candidate"
+      ],
+      [
+        "point",
+        16,
+        20000,
+        "baseline"
+      ],
+      [
+        "batch",
+        1,
+        750000,
+        "candidate"
+      ],
+      [
+        "batch",
+        1,
+        750000,
+        "baseline"
+      ],
+      [
+        "point",
+        1,
+        5000,
+        "baseline"
+      ],
+      [
+        "point",
+        1,
+        5000,
+        "candidate"
+      ]
+    ],
+    "stall_flags": "p99>10ms or mean sync>1ms; retain all raw samples"
+  },
+  "confirmation-plan.json": {
+    "schedule": [
+      [
+        "batch",
+        8,
+        750000,
+        "final"
+      ],
+      [
+        "batch",
+        8,
+        750000,
+        "baseline"
+      ],
+      [
+        "batch",
+        16,
+        750000,
+        "baseline"
+      ],
+      [
+        "batch",
+        16,
+        750000,
+        "final"
+      ],
+      [
+        "point",
+        8,
+        20000,
+        "baseline"
+      ],
+      [
+        "point",
+        8,
+        20000,
+        "final"
+      ]
+    ],
+    "stall_flags": "p99>10ms or mean sync>1ms; retain all raw samples"
+  },
+  "final-plan.json": {
+    "schedule": [
+      [
+        "batch",
+        1,
+        750000,
+        "baseline"
+      ],
+      [
+        "batch",
+        1,
+        750000,
+        "final"
+      ],
+      [
+        "batch",
+        8,
+        750000,
+        "baseline"
+      ],
+      [
+        "batch",
+        8,
+        750000,
+        "final"
+      ],
+      [
+        "batch",
+        16,
+        750000,
+        "final"
+      ],
+      [
+        "batch",
+        16,
+        750000,
+        "baseline"
+      ],
+      [
+        "point",
+        8,
+        20000,
+        "final"
+      ],
+      [
+        "point",
+        8,
+        20000,
+        "baseline"
+      ],
+      [
+        "point",
+        16,
+        20000,
+        "baseline"
+      ],
+      [
+        "point",
+        16,
+        20000,
+        "final"
+      ],
+      [
+        "point",
+        1,
+        5000,
+        "final"
+      ],
+      [
+        "point",
+        1,
+        5000,
+        "baseline"
+      ]
+    ],
+    "stall_flags": "p99>10ms or mean sync>1ms; retain all raw samples"
+  },
+  "point-reverse-plan.json": {
+    "schedule": [
+      [
+        "point",
+        8,
+        20000,
+        "final"
+      ],
+      [
+        "point",
+        8,
+        20000,
+        "baseline"
+      ]
+    ],
+    "stall_flags": "p99>10ms or mean sync>1ms; retain all raw samples"
+  },
+  "short-plan.json": {
+    "schedule": [
+      [
+        "batch",
+        8,
+        750000,
+        "baseline"
+      ],
+      [
+        "batch",
+        8,
+        750000,
+        "short-join"
+      ],
+      [
+        "batch",
+        8,
+        750000,
+        "short-join"
+      ],
+      [
+        "batch",
+        8,
+        750000,
+        "baseline"
+      ],
+      [
+        "batch",
+        16,
+        750000,
+        "baseline"
+      ],
+      [
+        "batch",
+        16,
+        750000,
+        "short-join"
+      ],
+      [
+        "point",
+        8,
+        20000,
+        "baseline"
+      ],
+      [
+        "point",
+        8,
+        20000,
+        "short-join"
+      ],
+      [
+        "point",
+        16,
+        20000,
+        "short-join"
+      ],
+      [
+        "point",
+        16,
+        20000,
+        "baseline"
+      ],
+      [
+        "batch",
+        1,
+        750000,
+        "baseline"
+      ],
+      [
+        "batch",
+        1,
+        750000,
+        "short-join"
+      ],
+      [
+        "point",
+        1,
+        5000,
+        "short-join"
+      ],
+      [
+        "point",
+        1,
+        5000,
+        "baseline"
+      ]
+    ],
+    "stall_flags": "p99>10ms or mean sync>1ms; retain all raw samples"
+  },
+  "small-direct-plan.json": {
+    "schedule": [
+      [
+        "batch",
+        8,
+        750000,
+        "baseline"
+      ],
+      [
+        "batch",
+        8,
+        750000,
+        "small-direct"
+      ],
+      [
+        "batch",
+        16,
+        750000,
+        "small-direct"
+      ],
+      [
+        "batch",
+        16,
+        750000,
+        "baseline"
+      ],
+      [
+        "point",
+        8,
+        20000,
+        "baseline"
+      ],
+      [
+        "point",
+        8,
+        20000,
+        "small-direct"
+      ],
+      [
+        "point",
+        16,
+        20000,
+        "small-direct"
+      ],
+      [
+        "point",
+        16,
+        20000,
+        "baseline"
+      ]
+    ],
+    "stall_flags": "p99>10ms or mean sync>1ms; retain all raw samples"
+  },
+  "plan.json": {
+    "workload": "750000 puts, batch64, 1KiB values, PITR V8 Parallel, ext4 SSD, no compaction, 2GiB target SST, latency sample every 10 batches",
+    "schedule": [
+      [
+        8,
+        "baseline"
+      ],
+      [
+        8,
+        "candidate"
+      ],
+      [
+        8,
+        "candidate"
+      ],
+      [
+        8,
+        "baseline"
+      ],
+      [
+        16,
+        "candidate"
+      ],
+      [
+        16,
+        "baseline"
+      ],
+      [
+        16,
+        "baseline"
+      ],
+      [
+        16,
+        "candidate"
+      ]
+    ],
+    "baseline": "retained bounded durability coalescing, original readiness-driven DATA submission",
+    "candidate": "cooperative DATA packer observes admitted ticket cutoff, dynamically extends it during a bounded 100us readiness wait, then drains ready work and atomically releases ownership",
+    "stall_flags": "p99 >10ms OR mean fdatasync >1ms; retain all results; best eligible with distributions and paired evidence",
+    "retention": "improve throughput and p99 on concurrent workloads; solo/point guards if promising; keep core admission visibility fix reviewable independently of tuning",
+    "binary_sha256": {
+      "baseline": "97e69480b1c0faccc36d11406801b1373cc5b35974dc749d5d6f6f2c4bcdee68",
+      "candidate": "12985d010bf83631b0170e14c27256f9447336bcc2d49c3576a51d2d351f78d8"
+    }
+  },
+  "binary_sha256": {
+    "baseline": "97e69480b1c0faccc36d11406801b1373cc5b35974dc749d5d6f6f2c4bcdee68",
+    "candidate": "12985d010bf83631b0170e14c27256f9447336bcc2d49c3576a51d2d351f78d8",
+    "short-join": "e523414a9a4543845042d16cdd1f8ab544502a79aa1351cffc2dc4a1cc44a7a1",
+    "final": "bf90a4163b50acb11dfff543b48de1ad2bb36be65b81cb095aae8e73800a5760",
+    "small-direct": "5f9bc6248986cb14b50ff5ced29c7ff8c9ec4c446447a813b49a89fb92938c7e"
+  },
+  "variant_names": {
+    "candidate": "100us",
+    "short-join": "10us",
+    "final": "fast-path",
+    "small-direct": "retained admission-window implementation; multi-frame head joins for up to10us, single-frame head submits directly"
+  },
+  "notes": [
+    "All raw records are retained. Point samples with 239ms/309ms maxima remain eligible under the original aggregate filter, but are explicitly discussed in the report.",
+    "The short-runner was paused after observing a stall sequence and resumed after I/O PSI avg10 fell to0.02%; some output was buffered, so this is not treated as a controlled cooldown between particular samples.",
+    "Final and small-direct variants have separate binaries; earlier prototype results do not qualify the retained binary."
+  ]
+}
