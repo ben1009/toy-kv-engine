@@ -1,0 +1,320 @@
+--- a/kv-engine/src/wal/v8/leader.rs
++++ b/kv-engine/src/wal/v8/leader.rs
+@@ -20,14 +20,11 @@
+     },
+     sync::Arc,
+     thread,
+-    time::Duration,
++    time::{Duration, Instant},
+ };
+ 
+ #[cfg(test)]
+ use std::os::unix::fs::OpenOptionsExt;
+-
+-#[cfg(feature = "bench")]
+-use std::time::Instant;
+ 
+ use anyhow::{Context, Result, ensure};
+ use crossbeam_queue::ArrayQueue;
+@@ -169,6 +166,7 @@
+     frontier: WalV8Frontier,
+     offset: u64,
+     digest: [u8; 32],
++    last_sync_latency: Option<Duration>,
+ }
+ 
+ struct PendingV8DataWrite {
+@@ -789,6 +787,7 @@
+                 frontier: self.frontier,
+                 offset: self.frontier_offset,
+                 digest: self.frontier_digest,
++                last_sync_latency: None,
+             }),
+             frontier_resources: Mutex::new(BTreeMap::new()),
+             producer_guards: Arc::new(Mutex::new(BTreeMap::new())),
+@@ -1513,24 +1512,40 @@
+ 
+             #[cfg(feature = "bench")]
+             let profile = self.profile.load_full();
++            let mut snapshot = self.coordinator.frontier_ready_snapshot();
++            if !snapshot.ready_prefix.is_empty()
++                && snapshot.ready_prefix.len() < snapshot.admitted_ticket_count
++                && let Some(latency) = previous.last_sync_latency
++            {
++                let budget = if latency >= Duration::from_micros(100) {
++                    Duration::from_micros(400)
++                } else {
++                    Duration::from_micros(100)
++                };
++                #[cfg(feature = "bench")]
++                let started = Instant::now();
++                let waited = self.coordinator.coalesce_frontier_ready(budget);
++                #[cfg(feature = "bench")]
++                if waited && let Some(profile) = &profile {
++                    profile.record_wal_sync_coalesce_wait(
++                        started.elapsed().as_nanos().min(u64::MAX as u128) as u64,
++                    );
++                }
++                #[cfg(not(feature = "bench"))]
++                let _ = waited;
++                snapshot = self.coordinator.frontier_ready_snapshot();
++            }
+             #[cfg(feature = "bench")]
+             let diagnostics_enabled = profile
+                 .as_ref()
+                 .is_some_and(|profile| profile.wal_sync_diagnostics_enabled());
+             #[cfg(feature = "bench")]
+-            let (ready, frontier_observation) = if diagnostics_enabled {
+-                let snapshot = self.coordinator.frontier_ready_snapshot();
+-                let observation = (
+-                    snapshot.admitted_ticket_count as u64,
+-                    snapshot.reserved_preparation_bytes,
+-                    snapshot.next_not_ready,
+-                );
+-                (snapshot.ready_prefix, Some(observation))
+-            } else {
+-                (self.coordinator.frontier_ready_prefix(), None)
+-            };
+-            #[cfg(not(feature = "bench"))]
+-            let ready = self.coordinator.frontier_ready_prefix();
++            let frontier_observation = diagnostics_enabled.then_some((
++                snapshot.admitted_ticket_count as u64,
++                snapshot.reserved_preparation_bytes,
++                snapshot.next_not_ready,
++            ));
++            let ready = snapshot.ready_prefix;
+ 
+             if ready.is_empty() {
+                 drop(previous);
+@@ -1623,12 +1638,12 @@
+                     started.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+                 );
+             }
++            let sync_started = Instant::now();
++            let sync_result = fdatasync_once(&self.sync_file);
++            previous.last_sync_latency = Some(sync_started.elapsed());
+             #[cfg(feature = "bench")]
+-            let sync_started = profile.as_ref().map(|_| Instant::now());
+-            let sync_result = fdatasync_once(&self.sync_file);
+-            #[cfg(feature = "bench")]
+-            if let (Some(profile), Some(started)) = (&profile, sync_started) {
+-                let duration_ns = started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
++            if let Some(profile) = &profile {
++                let duration_ns = sync_started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+                 let groups = ready.len() as u64;
+                 profile.record_wal_sync(groups);
+                 profile.record_wal_fdatasync_ns(duration_ns);
+--- a/kv-engine/src/wal/v8/parallel.rs
++++ b/kv-engine/src/wal/v8/parallel.rs
+@@ -5,10 +5,12 @@
+ //! so the live writer can form groups from admitted work without waiting for
+ //! producer preparation.
+ 
+-use std::{collections::VecDeque, ops::Range, sync::Arc, time::Duration};
+-
+-#[cfg(feature = "bench")]
+-use std::time::Instant;
++use std::{
++    collections::VecDeque,
++    ops::Range,
++    sync::Arc,
++    time::{Duration, Instant},
++};
+ 
+ use anyhow::{Context, Result, ensure};
+ use parking_lot::{Condvar, Mutex};
+@@ -85,6 +87,8 @@
+     poisoned: bool,
+     #[cfg(test)]
+     ticket_admission_waiters: usize,
++    #[cfg(test)]
++    frontier_coalesce_waiters: usize,
+     #[cfg(feature = "bench")]
+     ordered_link_hash_cpu_ns: u64,
+ }
+@@ -119,11 +123,12 @@
+ 
+ /// Atomic view of the durability decision point. `next_not_ready` is the
+ /// first admitted ticket beyond the prefix that can be covered by a FRONTIER.
+-#[cfg(feature = "bench")]
+ pub(crate) struct WalV8FrontierReadySnapshot {
+     pub(crate) ready_prefix: Vec<WalV8TicketProgress>,
+     pub(crate) admitted_ticket_count: usize,
++    #[cfg(feature = "bench")]
+     pub(crate) reserved_preparation_bytes: u64,
++    #[cfg(feature = "bench")]
+     pub(crate) next_not_ready: Option<WalV8TicketProgress>,
+ }
+ 
+@@ -218,6 +223,8 @@
+                     poisoned: false,
+                     #[cfg(test)]
+                     ticket_admission_waiters: 0,
++                    #[cfg(test)]
++                    frontier_coalesce_waiters: 0,
+                     #[cfg(feature = "bench")]
+                     ordered_link_hash_cpu_ns: 0,
+                 }),
+@@ -273,18 +280,54 @@
+             .collect()
+     }
+ 
++    /// Give already-admitted successors one bounded opportunity to join a
++    /// ready durability prefix. A lone producer or fully ready window never
++    /// waits, and close/poison terminates the optional wait immediately.
++    pub(crate) fn coalesce_frontier_ready(&self, budget: Duration) -> bool {
++        let mut state = self.inner.state.lock();
++        let deadline = Instant::now() + budget;
++        let mut waited = false;
++        while !state.closed
++            && !state.poisoned
++            && state
++                .tickets
++                .front()
++                .is_some_and(TicketState::is_frontier_ready)
++            && state
++                .tickets
++                .iter()
++                .any(|ticket| !ticket.is_frontier_ready())
++        {
++            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
++                break;
++            };
++            waited = true;
++            #[cfg(test)]
++            {
++                state.frontier_coalesce_waiters += 1;
++            }
++            self.inner.changed.wait_for(&mut state, remaining);
++            #[cfg(test)]
++            {
++                state.frontier_coalesce_waiters -= 1;
++            }
++        }
++        waited
++    }
++
+     /// Snapshot the frontier-ready prefix and the first admitted ticket that
+     /// would extend it, under one lock acquisition. Benchmark diagnostics use
+     /// the blocked ticket's readiness to identify why a durability group
+     /// stopped at this boundary.
+-    #[cfg(feature = "bench")]
+     pub(crate) fn frontier_ready_snapshot(&self) -> WalV8FrontierReadySnapshot {
+         let state = self.inner.state.lock();
+         if state.poisoned {
+             return WalV8FrontierReadySnapshot {
+                 ready_prefix: Vec::new(),
+                 admitted_ticket_count: 0,
++                #[cfg(feature = "bench")]
+                 reserved_preparation_bytes: 0,
++                #[cfg(feature = "bench")]
+                 next_not_ready: None,
+             };
+         }
+@@ -295,6 +338,7 @@
+             }
+             ready_prefix.push(ticket.progress());
+         }
++        #[cfg(feature = "bench")]
+         let next_not_ready = state
+             .tickets
+             .get(ready_prefix.len())
+@@ -302,7 +346,9 @@
+         WalV8FrontierReadySnapshot {
+             ready_prefix,
+             admitted_ticket_count: state.tickets.len(),
++            #[cfg(feature = "bench")]
+             reserved_preparation_bytes: state.reserved_preparation_bytes,
++            #[cfg(feature = "bench")]
+             next_not_ready,
+         }
+     }
+@@ -1201,6 +1247,88 @@
+         Ok(())
+     }
+ 
++    fn wait_for_frontier_coalescer(coordinator: &WalV8ParallelCoordinator) -> Result<()> {
++        let deadline = Instant::now() + Duration::from_secs(1);
++        while coordinator.inner.state.lock().frontier_coalesce_waiters == 0 {
++            ensure!(
++                Instant::now() < deadline,
++                "frontier coalescer did not start waiting"
++            );
++            std::thread::yield_now();
++        }
++        Ok(())
++    }
++
++    #[test]
++    fn frontier_coalescing_skips_lone_producers_and_bounds_unfinished_successors() -> Result<()> {
++        let coordinator = coordinator(8)?;
++        let first = batch(10);
++        let mut first_encoded = admit(&first, &coordinator)?.encode()?;
++        assert!(!coordinator.coalesce_frontier_ready(Duration::from_secs(1)));
++        mark_producer_ready(&mut first_encoded, &coordinator, true)?;
++        assert!(!coordinator.coalesce_frontier_ready(Duration::from_secs(1)));
++
++        let second = batch(20);
++        let _unfinished = admit(&second, &coordinator)?;
++        assert!(coordinator.coalesce_frontier_ready(Duration::from_millis(1)));
++        assert_eq!(coordinator.frontier_ready_prefix().len(), 1);
++        assert_eq!(coordinator.durable_ticket_end(), 0);
++        Ok(())
++    }
++
++    #[test]
++    fn frontier_coalescing_joins_completed_successors_without_publishing_durability() -> Result<()>
++    {
++        let coordinator = coordinator(8)?;
++        let first = batch(10);
++        let second = batch(20);
++        let mut first_encoded = admit(&first, &coordinator)?.encode()?;
++        let mut second_encoded = admit(&second, &coordinator)?.encode()?;
++        mark_producer_ready(&mut first_encoded, &coordinator, true)?;
++        mark_producer_ready(&mut second_encoded, &coordinator, false)?;
++
++        let (tx, rx) = std::sync::mpsc::channel();
++        let waiting = coordinator.clone();
++        let waiter = std::thread::spawn(move || {
++            let _ = tx.send(waiting.coalesce_frontier_ready(Duration::from_secs(2)));
++        });
++        wait_for_frontier_coalescer(&coordinator)?;
++        coordinator.mark_data_complete(1)?;
++        assert!(rx.recv_timeout(Duration::from_secs(1))?);
++        waiter.join().expect("frontier coalescer panicked");
++        assert_eq!(coordinator.frontier_ready_prefix().len(), 2);
++        assert_eq!(coordinator.durable_ticket_end(), 0);
++        assert!(!coordinator.coalesce_frontier_ready(Duration::from_secs(1)));
++        Ok(())
++    }
++
++    #[test]
++    fn close_and_poison_wake_frontier_coalescing() -> Result<()> {
++        for poison in [false, true] {
++            let coordinator = coordinator(8)?;
++            let first = batch(10);
++            let second = batch(20);
++            let mut first_encoded = admit(&first, &coordinator)?.encode()?;
++            let _unfinished = admit(&second, &coordinator)?;
++            mark_producer_ready(&mut first_encoded, &coordinator, true)?;
++            let (tx, rx) = std::sync::mpsc::channel();
++            let waiting = coordinator.clone();
++            let waiter = std::thread::spawn(move || {
++                let _ = tx.send(waiting.coalesce_frontier_ready(Duration::from_secs(2)));
++            });
++            wait_for_frontier_coalescer(&coordinator)?;
++            if poison {
++                coordinator.poison();
++            } else {
++                coordinator.close();
++            }
++            assert!(rx.recv_timeout(Duration::from_secs(1))?);
++            waiter.join().expect("frontier coalescer panicked");
++            assert_eq!(coordinator.durable_ticket_end(), 0);
++        }
++        Ok(())
++    }
++
+     #[test]
+     fn later_ticket_readiness_waits_for_a_contiguous_head_prefix() -> Result<()> {
+         let coordinator = coordinator(8)?;
