@@ -1,0 +1,97 @@
+{
+  "controls-plan.json": {
+    "binary_sha256": "f3d7dd9b52f727936f02c8031f30f6d960b1d4df0364444e728078a80139d7f5",
+    "schedule": [
+      "v7",
+      "v8",
+      "v8",
+      "v7"
+    ],
+    "threads": 16,
+    "operations": 750000,
+    "sampling": "none; perf stat enabled only in timed interval",
+    "eligibility": "flag p99>10ms or mean fdatasync>1ms; highest eligible throughput; all raw retained"
+  },
+  "normal-plan.json": {
+    "binary_sha256": "5aa246f157ba1396c753ac944355e6a2bea337c6bf613d800acaa9556aa1539c",
+    "schedule": [
+      "v8",
+      "v7"
+    ],
+    "threads": 16,
+    "operations": 750000,
+    "batch": 64,
+    "value_bytes": 1024,
+    "perf": "cpu-clock:u 499Hz DWARF4096; timed interval only; output Linux memfd",
+    "scopes": "inclusive, 1/64 samples; diagnostic, not throughput qualification"
+  },
+  "complete-plan.json": {
+    "binary_sha256": "5aa246f157ba1396c753ac944355e6a2bea337c6bf613d800acaa9556aa1539c",
+    "schedule": [
+      "v8",
+      "v7"
+    ],
+    "threads": 16,
+    "operations": 750000,
+    "batch": 64,
+    "value_bytes": 1024,
+    "perf": "cpu-clock:u 499Hz DWARF4096; timed interval only; output Linux memfd",
+    "scopes": "inclusive, 1/64 samples; diagnostic, not throughput qualification"
+  },
+  "mirrors-plan.json": {
+    "schedule": [
+      [
+        "baseline",
+        8
+      ],
+      [
+        "mirrors",
+        8
+      ],
+      [
+        "mirrors",
+        16
+      ],
+      [
+        "baseline",
+        16
+      ],
+      [
+        "mirrors",
+        8
+      ],
+      [
+        "baseline",
+        8
+      ],
+      [
+        "baseline",
+        16
+      ],
+      [
+        "mirrors",
+        16
+      ]
+    ],
+    "binary_hashes": {
+      "baseline": "5f9bc6248986cb14b50ff5ced29c7ff8c9ec4c446447a813b49a89fb92938c7e",
+      "mirrors": "3a8daa212f2860ddfe9baf77ec5ec4d336fa4849b90154ae987ae844e0a9683e"
+    },
+    "selection": "highest eligible throughput with same-run p99; flag p99>10ms or mean fdatasync>1ms; preserve all; normal counters, detailed diagnostics off"
+  },
+  "plan.json": {
+    "binary_sha256": "c122e04fb5141954fe6438f11fc5af265eef882790269a0764b45edb175feeef",
+    "schedule": [
+      "v7",
+      "v8",
+      "v8",
+      "v7"
+    ],
+    "threads": 16,
+    "operations": 750000,
+    "batch": 64,
+    "value_bytes": 1024,
+    "perf": "cpu-clock:u 499Hz DWARF4096; timed interval only; output Linux memfd",
+    "scopes": "inclusive, 1/64 samples; diagnostic, not throughput qualification"
+  }
+}

@@ -38,6 +38,7 @@ the retained and rejected experiments.
 
 ## Benchmarks and qualification
 
+- [RFC 026 V8/V7 timed CPU attribution and rejected atomic-status prototype, 2026-11-02](benchmarks/rfc-026-v8-coordination-attribution-20261102.md)
 - [RFC 026 V8 copy and publication screens (not retained), 2026-11-02](benchmarks/rfc-026-v8-copy-publication-20261102.md)
 - [RFC 025 point-write handoff diagnosis, 2026-10-29](benchmarks/rfc-025-v7-point-handoff-20261029.md)
 - [RFC 025 ordinary v7 completion notification (inconclusive; batch16 has no matched pairs), 2026-10-29](benchmarks/rfc-025-v7-signal-taskwork-20261029.md)

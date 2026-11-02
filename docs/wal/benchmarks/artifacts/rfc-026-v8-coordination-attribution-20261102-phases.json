@@ -1,0 +1,1858 @@
+{
+  "01-v8-16-phases": {
+    "phase_estimates_are_inclusive": true,
+    "sample_rate": 64,
+    "process_usage_delta": {
+      "involuntary": 727,
+      "major_faults": 0,
+      "minor_faults": 231077,
+      "system_us": 2351916,
+      "user_us": 8497556,
+      "voluntary": 155713
+    },
+    "allocation_fields": [
+      "rust_alloc_calls",
+      "rust_alloc_bytes",
+      "rust_free_calls",
+      "rust_free_bytes",
+      "native_alloc_calls",
+      "native_alloc_bytes",
+      "native_free_calls",
+      "native_free_bytes"
+    ],
+    "allocations": [
+      9920230,
+      3597576100,
+      6163827,
+      2702279236,
+      13274,
+      822386688,
+      1546,
+      6332416
+    ],
+    "phases": {
+      "producer": {
+        "calls": 11728,
+        "samples": 192,
+        "estimated_cpu_ms": 10681.73827866667,
+        "estimated_wall_ms": 39146.342732749996
+      },
+      "preflight": {
+        "calls": 11728,
+        "samples": 192,
+        "estimated_cpu_ms": 163.0138246666667,
+        "estimated_wall_ms": 174.49510908333335
+      },
+      "encode": {
+        "calls": 11728,
+        "samples": 192,
+        "estimated_cpu_ms": 2049.56274025,
+        "estimated_wall_ms": 2141.8190364999996
+      },
+      "frame": {
+        "calls": 11728,
+        "samples": 192,
+        "estimated_cpu_ms": 428.7009750833333,
+        "estimated_wall_ms": 442.1650855833334
+      },
+      "direct_alloc": {
+        "calls": 13274,
+        "samples": 215,
+        "estimated_cpu_ms": 169.0112622912088,
+        "estimated_wall_ms": 207.40828046153845
+      },
+      "admit": {
+        "calls": 11728,
+        "samples": 192,
+        "estimated_cpu_ms": 38.48561525,
+        "estimated_wall_ms": 52.74179333333333
+      },
+      "digest_ready": {
+        "calls": 11728,
+        "samples": 192,
+        "estimated_cpu_ms": 49.69691133333333,
+        "estimated_wall_ms": 64.87355416666666
+      },
+      "frames_ready": {
+        "calls": 11728,
+        "samples": 192,
+        "estimated_cpu_ms": 35.6505545,
+        "estimated_wall_ms": 46.843342333333325
+      },
+      "data_complete": {
+        "calls": 0,
+        "samples": 0,
+        "estimated_cpu_ms": 0.0,
+        "estimated_wall_ms": 0.0
+      },
+      "reserve_frontier": {
+        "calls": 1546,
+        "samples": 32,
+        "estimated_cpu_ms": 3.856066500000001,
+        "estimated_wall_ms": 5.324187000000001
+      },
+      "publish_durable": {
+        "calls": 1546,
+        "samples": 32,
+        "estimated_cpu_ms": 2.529538,
+        "estimated_wall_ms": 3.5480045
+      },
+      "snapshot": {
+        "calls": 38161,
+        "samples": 604,
+        "estimated_cpu_ms": 63.775940594443306,
+        "estimated_wall_ms": 104.23831539940493
+      },
+      "coalesce": {
+        "calls": 851,
+        "samples": 18,
+        "estimated_cpu_ms": 48.2364535,
+        "estimated_wall_ms": 300.7479415
+      },
+      "coordinator_lock_wait": {
+        "calls": 447873,
+        "samples": 7006,
+        "estimated_cpu_ms": 653.0741379619493,
+        "estimated_wall_ms": 1287.9699815568222
+      },
+      "submission_lock_wait": {
+        "calls": 24353,
+        "samples": 388,
+        "estimated_cpu_ms": 26.687604477608698,
+        "estimated_wall_ms": 55.88787249652174
+      },
+      "submit_data": {
+        "calls": 11728,
+        "samples": 192,
+        "estimated_cpu_ms": 164.08259974999999,
+        "estimated_wall_ms": 483.6545348333334
+      },
+      "pack_data": {
+        "calls": 5594,
+        "samples": 94,
+        "estimated_cpu_ms": 106.59518840952383,
+        "estimated_wall_ms": 373.34943365714287
+      },
+      "worker_submit": {
+        "calls": 6205,
+        "samples": 104,
+        "estimated_cpu_ms": 31.68947745833334,
+        "estimated_wall_ms": 39.06467576190476
+      },
+      "worker_cqe": {
+        "calls": 0,
+        "samples": 0,
+        "estimated_cpu_ms": 0.0,
+        "estimated_wall_ms": 0.0
+      },
+      "completion_receive": {
+        "calls": 0,
+        "samples": 0,
+        "estimated_cpu_ms": 0.0,
+        "estimated_wall_ms": 0.0
+      },
+      "completion_publish": {
+        "calls": 0,
+        "samples": 0,
+        "estimated_cpu_ms": 0.0,
+        "estimated_wall_ms": 0.0
+      },
+      "frontier_encode": {
+        "calls": 1546,
+        "samples": 32,
+        "estimated_cpu_ms": 12.580418,
+        "estimated_wall_ms": 13.692940499999999
+      },
+      "frontier_write": {
+        "calls": 1546,
+        "samples": 32,
+        "estimated_cpu_ms": 33.520158499999994,
+        "estimated_wall_ms": 2349.919007
+      },
+      "frontier_sync": {
+        "calls": 1546,
+        "samples": 32,
+        "estimated_cpu_ms": 95.474008,
+        "estimated_wall_ms": 2078.3387675
+      },
+      "resources_retire": {
+        "calls": 1546,
+        "samples": 32,
+        "estimated_cpu_ms": 20.1544165,
+        "estimated_wall_ms": 21.308636500000006
+      },
+      "guards_retire": {
+        "calls": 1546,
+        "samples": 32,
+        "estimated_cpu_ms": 14.963891499999999,
+        "estimated_wall_ms": 16.070279
+      },
+      "v7_materialize": {
+        "calls": 0,
+        "samples": 0,
+        "estimated_cpu_ms": 0.0,
+        "estimated_wall_ms": 0.0
+      },
+      "v7_sync_cycle": {
+        "calls": 0,
+        "samples": 0,
+        "estimated_cpu_ms": 0.0,
+        "estimated_wall_ms": 0.0
+      },
+      "worker_receive": {
+        "calls": 0,
+        "samples": 0,
+        "estimated_cpu_ms": 0.0,
+        "estimated_wall_ms": 0.0
+      },
+      "memtable_publish": {
+        "calls": 11728,
+        "samples": 192,
+        "estimated_cpu_ms": 3257.132595249999,
+        "estimated_wall_ms": 3286.7392593333334
+      },
+      "mvcc_publish": {
+        "calls": 11728,
+        "samples": 192,
+        "estimated_cpu_ms": 952.4796245,
+        "estimated_wall_ms": 1412.4936876666668
+      },
+      "v7_logical_hash": {
+        "calls": 0,
+        "samples": 0,
+        "estimated_cpu_ms": 0.0,
+        "estimated_wall_ms": 0.0
+      }
+    }
+  },
+  "00-v7-16-phases": {
+    "phase_estimates_are_inclusive": true,
+    "sample_rate": 64,
+    "process_usage_delta": {
+      "involuntary": 883,
+      "major_faults": 0,
+      "minor_faults": 231341,
+      "system_us": 2574384,
+      "user_us": 8617269,
+      "voluntary": 80405
+    },
+    "allocation_fields": [
+      "rust_alloc_calls",
+      "rust_alloc_bytes",
+      "rust_free_calls",
+      "rust_free_bytes",
+      "native_alloc_calls",
+      "native_alloc_bytes",
+      "native_free_calls",
+      "native_free_bytes"
+    ],
+    "allocations": [
+      10017826,
+      3804744331,
+      6267782,
+      2910573704,
+      13005,
+      821284864,
+      13005,
+      821284864
+    ],
+    "phases": {
+      "producer": {
+        "calls": 11728,
+        "samples": 192,
+        "estimated_cpu_ms": 8600.857258249998,
+        "estimated_wall_ms": 143700.24234883333
+      },
+      "preflight": {
+        "calls": 11728,
+        "samples": 192,
+        "estimated_cpu_ms": 208.77147183333332,
+        "estimated_wall_ms": 231.9212
+      },
+      "encode": {
+        "calls": 0,
+        "samples": 0,
+        "estimated_cpu_ms": 0.0,
+        "estimated_wall_ms": 0.0
+      },
+      "frame": {
+        "calls": 23440,
+        "samples": 376,
+        "estimated_cpu_ms": 1003.9366920434784,
+        "estimated_wall_ms": 1044.9553348260868
+      },
+      "direct_alloc": {
+        "calls": 13005,
+        "samples": 212,
+        "estimated_cpu_ms": 140.2686533,
+        "estimated_wall_ms": 162.24011678333332
+      },
+      "admit": {
+        "calls": 0,
+        "samples": 0,
+        "estimated_cpu_ms": 0.0,
+        "estimated_wall_ms": 0.0
+      },
+      "digest_ready": {
+        "calls": 0,
+        "samples": 0,
+        "estimated_cpu_ms": 0.0,
+        "estimated_wall_ms": 0.0
+      },
+      "frames_ready": {
+        "calls": 0,
+        "samples": 0,
+        "estimated_cpu_ms": 0.0,
+        "estimated_wall_ms": 0.0
+      },
+      "data_complete": {
+        "calls": 0,
+        "samples": 0,
+        "estimated_cpu_ms": 0.0,
+        "estimated_wall_ms": 0.0
+      },
+      "reserve_frontier": {
+        "calls": 0,
+        "samples": 0,
+        "estimated_cpu_ms": 0.0,
+        "estimated_wall_ms": 0.0
+      },
+      "publish_durable": {
+        "calls": 0,
+        "samples": 0,
+        "estimated_cpu_ms": 0.0,
+        "estimated_wall_ms": 0.0
+      },
+      "snapshot": {
+        "calls": 0,
+        "samples": 0,
+        "estimated_cpu_ms": 0.0,
+        "estimated_wall_ms": 0.0
+      },
+      "coalesce": {
+        "calls": 0,
+        "samples": 0,
+        "estimated_cpu_ms": 0.0,
+        "estimated_wall_ms": 0.0
+      },
+      "coordinator_lock_wait": {
+        "calls": 0,
+        "samples": 0,
+        "estimated_cpu_ms": 0.0,
+        "estimated_wall_ms": 0.0
+      },
+      "submission_lock_wait": {
+        "calls": 0,
+        "samples": 0,
+        "estimated_cpu_ms": 0.0,
+        "estimated_wall_ms": 0.0
+      },
+      "submit_data": {
+        "calls": 0,
+        "samples": 0,
+        "estimated_cpu_ms": 0.0,
+        "estimated_wall_ms": 0.0
+      },
+      "pack_data": {
+        "calls": 0,
+        "samples": 0,
+        "estimated_cpu_ms": 0.0,
+        "estimated_wall_ms": 0.0
+      },
+      "worker_submit": {
+        "calls": 8430,
+        "samples": 132,
+        "estimated_cpu_ms": 38.02504772727273,
+        "estimated_wall_ms": 50.79477340909091
+      },
+      "worker_cqe": {
+        "calls": 17538,
+        "samples": 275,
+        "estimated_cpu_ms": 67.45918359272727,
+        "estimated_wall_ms": 97.03890194181818
+      },
+      "completion_receive": {
+        "calls": 0,
+        "samples": 0,
+        "estimated_cpu_ms": 0.0,
+        "estimated_wall_ms": 0.0
+      },
+      "completion_publish": {
+        "calls": 0,
+        "samples": 0,
+        "estimated_cpu_ms": 0.0,
+        "estimated_wall_ms": 0.0
+      },
+      "frontier_encode": {
+        "calls": 0,
+        "samples": 0,
+        "estimated_cpu_ms": 0.0,
+        "estimated_wall_ms": 0.0
+      },
+      "frontier_write": {
+        "calls": 0,
+        "samples": 0,
+        "estimated_cpu_ms": 0.0,
+        "estimated_wall_ms": 0.0
+      },
+      "frontier_sync": {
+        "calls": 0,
+        "samples": 0,
+        "estimated_cpu_ms": 0.0,
+        "estimated_wall_ms": 0.0
+      },
+      "resources_retire": {
+        "calls": 0,
+        "samples": 0,
+        "estimated_cpu_ms": 0.0,
+        "estimated_wall_ms": 0.0
+      },
+      "guards_retire": {
+        "calls": 0,
+        "samples": 0,
+        "estimated_cpu_ms": 0.0,
+        "estimated_wall_ms": 0.0
+      },
+      "v7_materialize": {
+        "calls": 27,
+        "samples": 1,
+        "estimated_cpu_ms": 3.45951,
+        "estimated_wall_ms": 3.528495
+      },
+      "v7_sync_cycle": {
+        "calls": 1287,
+        "samples": 21,
+        "estimated_cpu_ms": 165.01601442857142,
+        "estimated_wall_ms": 5118.069589285714
+      },
+      "worker_receive": {
+        "calls": 4041,
+        "samples": 64,
+        "estimated_cpu_ms": 99.7621875,
+        "estimated_wall_ms": 2040.209472375
+      },
+      "memtable_publish": {
+        "calls": 11728,
+        "samples": 192,
+        "estimated_cpu_ms": 2523.8345085833334,
+        "estimated_wall_ms": 2571.603813166667
+      },
+      "mvcc_publish": {
+        "calls": 11728,
+        "samples": 192,
+        "estimated_cpu_ms": 739.77896725,
+        "estimated_wall_ms": 1111.77023675
+      },
+      "v7_logical_hash": {
+        "calls": 11728,
+        "samples": 184,
+        "estimated_cpu_ms": 1329.3856908695652,
+        "estimated_wall_ms": 1346.2814046086958
+      }
+    }
+  },
+  "02-v8-16-phases": {
+    "phase_estimates_are_inclusive": true,
+    "sample_rate": 64,
+    "process_usage_delta": {
+      "involuntary": 596,
+      "major_faults": 0,
+      "minor_faults": 231081,
+      "system_us": 2231015,
+      "user_us": 8850774,
+      "voluntary": 146746
+    },
+    "allocation_fields": [
+      "rust_alloc_calls",
+      "rust_alloc_bytes",
+      "rust_free_calls",
+      "rust_free_bytes",
+      "native_alloc_calls",
+      "native_alloc_bytes",
+      "native_free_calls",
+      "native_free_bytes"
+    ],
+    "allocations": [
+      9920429,
+      3597563476,
+      6163978,
+      2702252892,
+      13332,
+      822624256,
+      1604,
+      6569984
+    ],
+    "phases": {
+      "producer": {
+        "calls": 11728,
+        "samples": 192,
+        "estimated_cpu_ms": 10695.063974333336,
+        "estimated_wall_ms": 30597.946284499994
+      },
+      "preflight": {
+        "calls": 11728,
+        "samples": 192,
+        "estimated_cpu_ms": 172.58356725,
+        "estimated_wall_ms": 184.471178
+      },
+      "encode": {
+        "calls": 11728,
+        "samples": 192,
+        "estimated_cpu_ms": 2106.9100336666665,
+        "estimated_wall_ms": 2141.2444255833334
+      },
+      "frame": {
+        "calls": 11728,
+        "samples": 192,
+        "estimated_cpu_ms": 426.47051716666664,
+        "estimated_wall_ms": 441.91977491666665
+      },
+      "direct_alloc": {
+        "calls": 13332,
+        "samples": 216,
+        "estimated_cpu_ms": 157.50621364285715,
+        "estimated_wall_ms": 174.12463723626377
+      },
+      "admit": {
+        "calls": 11728,
+        "samples": 192,
+        "estimated_cpu_ms": 40.39062116666666,
+        "estimated_wall_ms": 54.55767866666666
+      },
+      "digest_ready": {
+        "calls": 11728,
+        "samples": 192,
+        "estimated_cpu_ms": 45.263666249999986,
+        "estimated_wall_ms": 62.052664750000005
+      },
+      "frames_ready": {
+        "calls": 11728,
+        "samples": 192,
+        "estimated_cpu_ms": 41.24432183333332,
+        "estimated_wall_ms": 68.94940066666666
+      },
+      "data_complete": {
+        "calls": 0,
+        "samples": 0,
+        "estimated_cpu_ms": 0.0,
+        "estimated_wall_ms": 0.0
+      },
+      "reserve_frontier": {
+        "calls": 1604,
+        "samples": 33,
+        "estimated_cpu_ms": 3.5357188333333336,
+        "estimated_wall_ms": 5.064382333333334
+      },
+      "publish_durable": {
+        "calls": 1604,
+        "samples": 33,
+        "estimated_cpu_ms": 2.5350423333333336,
+        "estimated_wall_ms": 3.6643893333333337
+      },
+      "snapshot": {
+        "calls": 32618,
+        "samples": 517,
+        "estimated_cpu_ms": 57.24462748040798,
+        "estimated_wall_ms": 94.13926149865726
+      },
+      "coalesce": {
+        "calls": 837,
+        "samples": 18,
+        "estimated_cpu_ms": 74.53657800000002,
+        "estimated_wall_ms": 354.559623
+      },
+      "coordinator_lock_wait": {
+        "calls": 414626,
+        "samples": 6487,
+        "estimated_cpu_ms": 622.8652408870347,
+        "estimated_wall_ms": 1216.1773216472839
+      },
+      "submission_lock_wait": {
+        "calls": 24416,
+        "samples": 389,
+        "estimated_cpu_ms": 29.759882723573018,
+        "estimated_wall_ms": 58.174673732709024
+      },
+      "submit_data": {
+        "calls": 11728,
+        "samples": 192,
+        "estimated_cpu_ms": 164.61469666666665,
+        "estimated_wall_ms": 499.1249885
+      },
+      "pack_data": {
+        "calls": 5603,
+        "samples": 96,
+        "estimated_cpu_ms": 115.97524546666666,
+        "estimated_wall_ms": 414.7961323666666
+      },
+      "worker_submit": {
+        "calls": 6228,
+        "samples": 108,
+        "estimated_cpu_ms": 33.9915580952381,
+        "estimated_wall_ms": 41.015047339285715
+      },
+      "worker_cqe": {
+        "calls": 0,
+        "samples": 0,
+        "estimated_cpu_ms": 0.0,
+        "estimated_wall_ms": 0.0
+      },
+      "completion_receive": {
+        "calls": 0,
+        "samples": 0,
+        "estimated_cpu_ms": 0.0,
+        "estimated_wall_ms": 0.0
+      },
+      "completion_publish": {
+        "calls": 0,
+        "samples": 0,
+        "estimated_cpu_ms": 0.0,
+        "estimated_wall_ms": 0.0
+      },
+      "frontier_encode": {
+        "calls": 1604,
+        "samples": 33,
+        "estimated_cpu_ms": 12.238269833333334,
+        "estimated_wall_ms": 14.620990499999998
+      },
+      "frontier_write": {
+        "calls": 1604,
+        "samples": 33,
+        "estimated_cpu_ms": 33.74651516666666,
+        "estimated_wall_ms": 82.28250933333331
+      },
+      "frontier_sync": {
+        "calls": 1604,
+        "samples": 33,
+        "estimated_cpu_ms": 88.92755416666668,
+        "estimated_wall_ms": 785.8629783333334
+      },
+      "resources_retire": {
+        "calls": 1604,
+        "samples": 33,
+        "estimated_cpu_ms": 21.887249166666667,
+        "estimated_wall_ms": 23.150637666666665
+      },
+      "guards_retire": {
+        "calls": 1604,
+        "samples": 33,
+        "estimated_cpu_ms": 17.887840166666667,
+        "estimated_wall_ms": 19.1069815
+      },
+      "v7_materialize": {
+        "calls": 0,
+        "samples": 0,
+        "estimated_cpu_ms": 0.0,
+        "estimated_wall_ms": 0.0
+      },
+      "v7_sync_cycle": {
+        "calls": 0,
+        "samples": 0,
+        "estimated_cpu_ms": 0.0,
+        "estimated_wall_ms": 0.0
+      },
+      "worker_receive": {
+        "calls": 0,
+        "samples": 0,
+        "estimated_cpu_ms": 0.0,
+        "estimated_wall_ms": 0.0
+      },
+      "memtable_publish": {
+        "calls": 11728,
+        "samples": 192,
+        "estimated_cpu_ms": 3414.8365068333333,
+        "estimated_wall_ms": 3451.41314575
+      },
+      "mvcc_publish": {
+        "calls": 11728,
+        "samples": 192,
+        "estimated_cpu_ms": 1086.2740534166667,
+        "estimated_wall_ms": 2187.9383580833332
+      },
+      "v7_logical_hash": {
+        "calls": 0,
+        "samples": 0,
+        "estimated_cpu_ms": 0.0,
+        "estimated_wall_ms": 0.0
+      }
+    }
+  },
+  "complete-01-v7-16-phases": {
+    "phase_estimates_are_inclusive": true,
+    "sample_rate": 64,
+    "process_usage_delta": {
+      "involuntary": 710,
+      "major_faults": 0,
+      "minor_faults": 231341,
+      "system_us": 1268223,
+      "user_us": 4933519,
+      "voluntary": 69887
+    },
+    "allocation_fields": [
+      "rust_alloc_calls",
+      "rust_alloc_bytes",
+      "rust_free_calls",
+      "rust_free_bytes",
+      "native_alloc_calls",
+      "native_alloc_bytes",
+      "native_free_calls",
+      "native_free_bytes"
+    ],
+    "allocations": [
+      10012722,
+      3823887523,
+      6262657,
+      2929703152,
+      13244,
+      822263808,
+      13244,
+      822263808
+    ],
+    "phases": {
+      "producer": {
+        "calls": 11728,
+        "samples": 192,
+        "estimated_cpu_ms": 5212.463665333333,
+        "estimated_wall_ms": 26847.888903416664
+      },
+      "preflight": {
+        "calls": 11728,
+        "samples": 192,
+        "estimated_cpu_ms": 132.82534183333334,
+        "estimated_wall_ms": 145.09289091666668
+      },
+      "encode": {
+        "calls": 0,
+        "samples": 0,
+        "estimated_cpu_ms": 0.0,
+        "estimated_wall_ms": 0.0
+      },
+      "frame": {
+        "calls": 23440,
+        "samples": 376,
+        "estimated_cpu_ms": 766.7588294347827,
+        "estimated_wall_ms": 788.722446304348
+      },
+      "direct_alloc": {
+        "calls": 13244,
+        "samples": 216,
+        "estimated_cpu_ms": 95.54619458333332,
+        "estimated_wall_ms": 108.35849658333333
+      },
+      "admit": {
+        "calls": 0,
+        "samples": 0,
+        "estimated_cpu_ms": 0.0,
+        "estimated_wall_ms": 0.0
+      },
+      "digest_ready": {
+        "calls": 0,
+        "samples": 0,
+        "estimated_cpu_ms": 0.0,
+        "estimated_wall_ms": 0.0
+      },
+      "frames_ready": {
+        "calls": 0,
+        "samples": 0,
+        "estimated_cpu_ms": 0.0,
+        "estimated_wall_ms": 0.0
+      },
+      "data_complete": {
+        "calls": 0,
+        "samples": 0,
+        "estimated_cpu_ms": 0.0,
+        "estimated_wall_ms": 0.0
+      },
+      "reserve_frontier": {
+        "calls": 0,
+        "samples": 0,
+        "estimated_cpu_ms": 0.0,
+        "estimated_wall_ms": 0.0
+      },
+      "publish_durable": {
+        "calls": 0,
+        "samples": 0,
+        "estimated_cpu_ms": 0.0,
+        "estimated_wall_ms": 0.0
+      },
+      "snapshot": {
+        "calls": 0,
+        "samples": 0,
+        "estimated_cpu_ms": 0.0,
+        "estimated_wall_ms": 0.0
+      },
+      "coalesce": {
+        "calls": 0,
+        "samples": 0,
+        "estimated_cpu_ms": 0.0,
+        "estimated_wall_ms": 0.0
+      },
+      "coordinator_lock_wait": {
+        "calls": 0,
+        "samples": 0,
+        "estimated_cpu_ms": 0.0,
+        "estimated_wall_ms": 0.0
+      },
+      "submission_lock_wait": {
+        "calls": 0,
+        "samples": 0,
+        "estimated_cpu_ms": 0.0,
+        "estimated_wall_ms": 0.0
+      },
+      "submit_data": {
+        "calls": 0,
+        "samples": 0,
+        "estimated_cpu_ms": 0.0,
+        "estimated_wall_ms": 0.0
+      },
+      "pack_data": {
+        "calls": 0,
+        "samples": 0,
+        "estimated_cpu_ms": 0.0,
+        "estimated_wall_ms": 0.0
+      },
+      "worker_submit": {
+        "calls": 5922,
+        "samples": 93,
+        "estimated_cpu_ms": 16.217747225806452,
+        "estimated_wall_ms": 20.565705096774195
+      },
+      "worker_cqe": {
+        "calls": 19360,
+        "samples": 303,
+        "estimated_cpu_ms": 40.2384501650165,
+        "estimated_wall_ms": 55.47694257425743
+      },
+      "completion_receive": {
+        "calls": 0,
+        "samples": 0,
+        "estimated_cpu_ms": 0.0,
+        "estimated_wall_ms": 0.0
+      },
+      "completion_publish": {
+        "calls": 0,
+        "samples": 0,
+        "estimated_cpu_ms": 0.0,
+        "estimated_wall_ms": 0.0
+      },
+      "frontier_encode": {
+        "calls": 0,
+        "samples": 0,
+        "estimated_cpu_ms": 0.0,
+        "estimated_wall_ms": 0.0
+      },
+      "frontier_write": {
+        "calls": 0,
+        "samples": 0,
+        "estimated_cpu_ms": 0.0,
+        "estimated_wall_ms": 0.0
+      },
+      "frontier_sync": {
+        "calls": 0,
+        "samples": 0,
+        "estimated_cpu_ms": 0.0,
+        "estimated_wall_ms": 0.0
+      },
+      "resources_retire": {
+        "calls": 0,
+        "samples": 0,
+        "estimated_cpu_ms": 0.0,
+        "estimated_wall_ms": 0.0
+      },
+      "guards_retire": {
+        "calls": 0,
+        "samples": 0,
+        "estimated_cpu_ms": 0.0,
+        "estimated_wall_ms": 0.0
+      },
+      "v7_materialize": {
+        "calls": 23,
+        "samples": 1,
+        "estimated_cpu_ms": 0.570906,
+        "estimated_wall_ms": 0.578243
+      },
+      "v7_sync_cycle": {
+        "calls": 1559,
+        "samples": 25,
+        "estimated_cpu_ms": 102.75462540000001,
+        "estimated_wall_ms": 718.2216342
+      },
+      "worker_receive": {
+        "calls": 4088,
+        "samples": 64,
+        "estimated_cpu_ms": 74.084205125,
+        "estimated_wall_ms": 727.10458275
+      },
+      "memtable_publish": {
+        "calls": 11728,
+        "samples": 192,
+        "estimated_cpu_ms": 1837.2811146666668,
+        "estimated_wall_ms": 1859.9542706666664
+      },
+      "mvcc_publish": {
+        "calls": 11728,
+        "samples": 192,
+        "estimated_cpu_ms": 190.43004041666666,
+        "estimated_wall_ms": 200.23183858333334
+      },
+      "v7_logical_hash": {
+        "calls": 11728,
+        "samples": 184,
+        "estimated_cpu_ms": 838.120549826087,
+        "estimated_wall_ms": 848.0866090434782
+      },
+      "frontier_lock_wait": {
+        "calls": 0,
+        "samples": 0,
+        "estimated_cpu_ms": 0.0,
+        "estimated_wall_ms": 0.0
+      },
+      "coordinator_wait": {
+        "calls": 0,
+        "samples": 0,
+        "estimated_cpu_ms": 0.0,
+        "estimated_wall_ms": 0.0
+      }
+    }
+  },
+  "normal-01-v7-16-phases": {
+    "phase_estimates_are_inclusive": true,
+    "sample_rate": 64,
+    "process_usage_delta": {
+      "involuntary": 940,
+      "major_faults": 0,
+      "minor_faults": 231304,
+      "system_us": 2487130,
+      "user_us": 8420711,
+      "voluntary": 82253
+    },
+    "allocation_fields": [
+      "rust_alloc_calls",
+      "rust_alloc_bytes",
+      "rust_free_calls",
+      "rust_free_bytes",
+      "native_alloc_calls",
+      "native_alloc_bytes",
+      "native_free_calls",
+      "native_free_bytes"
+    ],
+    "allocations": [
+      10017230,
+      3806939347,
+      6267174,
+      2912961968,
+      13008,
+      821297152,
+      13008,
+      821297152
+    ],
+    "phases": {
+      "producer": {
+        "calls": 11728,
+        "samples": 192,
+        "estimated_cpu_ms": 8284.884658583334,
+        "estimated_wall_ms": 132673.150265
+      },
+      "preflight": {
+        "calls": 11728,
+        "samples": 192,
+        "estimated_cpu_ms": 203.3313901666667,
+        "estimated_wall_ms": 234.84409858333333
+      },
+      "encode": {
+        "calls": 0,
+        "samples": 0,
+        "estimated_cpu_ms": 0.0,
+        "estimated_wall_ms": 0.0
+      },
+      "frame": {
+        "calls": 23440,
+        "samples": 376,
+        "estimated_cpu_ms": 966.8887016521741,
+        "estimated_wall_ms": 1003.232300826087
+      },
+      "direct_alloc": {
+        "calls": 13008,
+        "samples": 212,
+        "estimated_cpu_ms": 134.09932616666666,
+        "estimated_wall_ms": 148.25553616666667
+      },
+      "admit": {
+        "calls": 0,
+        "samples": 0,
+        "estimated_cpu_ms": 0.0,
+        "estimated_wall_ms": 0.0
+      },
+      "digest_ready": {
+        "calls": 0,
+        "samples": 0,
+        "estimated_cpu_ms": 0.0,
+        "estimated_wall_ms": 0.0
+      },
+      "frames_ready": {
+        "calls": 0,
+        "samples": 0,
+        "estimated_cpu_ms": 0.0,
+        "estimated_wall_ms": 0.0
+      },
+      "data_complete": {
+        "calls": 0,
+        "samples": 0,
+        "estimated_cpu_ms": 0.0,
+        "estimated_wall_ms": 0.0
+      },
+      "reserve_frontier": {
+        "calls": 0,
+        "samples": 0,
+        "estimated_cpu_ms": 0.0,
+        "estimated_wall_ms": 0.0
+      },
+      "publish_durable": {
+        "calls": 0,
+        "samples": 0,
+        "estimated_cpu_ms": 0.0,
+        "estimated_wall_ms": 0.0
+      },
+      "snapshot": {
+        "calls": 0,
+        "samples": 0,
+        "estimated_cpu_ms": 0.0,
+        "estimated_wall_ms": 0.0
+      },
+      "coalesce": {
+        "calls": 0,
+        "samples": 0,
+        "estimated_cpu_ms": 0.0,
+        "estimated_wall_ms": 0.0
+      },
+      "coordinator_lock_wait": {
+        "calls": 0,
+        "samples": 0,
+        "estimated_cpu_ms": 0.0,
+        "estimated_wall_ms": 0.0
+      },
+      "submission_lock_wait": {
+        "calls": 0,
+        "samples": 0,
+        "estimated_cpu_ms": 0.0,
+        "estimated_wall_ms": 0.0
+      },
+      "submit_data": {
+        "calls": 0,
+        "samples": 0,
+        "estimated_cpu_ms": 0.0,
+        "estimated_wall_ms": 0.0
+      },
+      "pack_data": {
+        "calls": 0,
+        "samples": 0,
+        "estimated_cpu_ms": 0.0,
+        "estimated_wall_ms": 0.0
+      },
+      "worker_submit": {
+        "calls": 8696,
+        "samples": 136,
+        "estimated_cpu_ms": 42.18595847058824,
+        "estimated_wall_ms": 59.365098294117644
+      },
+      "worker_cqe": {
+        "calls": 17849,
+        "samples": 279,
+        "estimated_cpu_ms": 65.73927444802868,
+        "estimated_wall_ms": 97.17443424372759
+      },
+      "completion_receive": {
+        "calls": 0,
+        "samples": 0,
+        "estimated_cpu_ms": 0.0,
+        "estimated_wall_ms": 0.0
+      },
+      "completion_publish": {
+        "calls": 0,
+        "samples": 0,
+        "estimated_cpu_ms": 0.0,
+        "estimated_wall_ms": 0.0
+      },
+      "frontier_encode": {
+        "calls": 0,
+        "samples": 0,
+        "estimated_cpu_ms": 0.0,
+        "estimated_wall_ms": 0.0
+      },
+      "frontier_write": {
+        "calls": 0,
+        "samples": 0,
+        "estimated_cpu_ms": 0.0,
+        "estimated_wall_ms": 0.0
+      },
+      "frontier_sync": {
+        "calls": 0,
+        "samples": 0,
+        "estimated_cpu_ms": 0.0,
+        "estimated_wall_ms": 0.0
+      },
+      "resources_retire": {
+        "calls": 0,
+        "samples": 0,
+        "estimated_cpu_ms": 0.0,
+        "estimated_wall_ms": 0.0
+      },
+      "guards_retire": {
+        "calls": 0,
+        "samples": 0,
+        "estimated_cpu_ms": 0.0,
+        "estimated_wall_ms": 0.0
+      },
+      "v7_materialize": {
+        "calls": 20,
+        "samples": 1,
+        "estimated_cpu_ms": 1.51942,
+        "estimated_wall_ms": 1.60252
+      },
+      "v7_sync_cycle": {
+        "calls": 1281,
+        "samples": 21,
+        "estimated_cpu_ms": 163.159323,
+        "estimated_wall_ms": 7379.952569
+      },
+      "worker_receive": {
+        "calls": 3943,
+        "samples": 62,
+        "estimated_cpu_ms": 84.97241316129032,
+        "estimated_wall_ms": 1966.683879887097
+      },
+      "memtable_publish": {
+        "calls": 11728,
+        "samples": 192,
+        "estimated_cpu_ms": 2347.975653,
+        "estimated_wall_ms": 2393.1070127499993
+      },
+      "mvcc_publish": {
+        "calls": 11728,
+        "samples": 192,
+        "estimated_cpu_ms": 728.5360910833332,
+        "estimated_wall_ms": 1018.7681740833334
+      },
+      "v7_logical_hash": {
+        "calls": 11728,
+        "samples": 184,
+        "estimated_cpu_ms": 1173.5213357391306,
+        "estimated_wall_ms": 1193.7846426956523
+      },
+      "frontier_lock_wait": {
+        "calls": 0,
+        "samples": 0,
+        "estimated_cpu_ms": 0.0,
+        "estimated_wall_ms": 0.0
+      },
+      "coordinator_wait": {
+        "calls": 0,
+        "samples": 0,
+        "estimated_cpu_ms": 0.0,
+        "estimated_wall_ms": 0.0
+      }
+    }
+  },
+  "complete-00-v8-16-phases": {
+    "phase_estimates_are_inclusive": true,
+    "sample_rate": 64,
+    "process_usage_delta": {
+      "involuntary": 724,
+      "major_faults": 0,
+      "minor_faults": 231094,
+      "system_us": 2252449,
+      "user_us": 8489210,
+      "voluntary": 151539
+    },
+    "allocation_fields": [
+      "rust_alloc_calls",
+      "rust_alloc_bytes",
+      "rust_free_calls",
+      "rust_free_bytes",
+      "native_alloc_calls",
+      "native_alloc_bytes",
+      "native_free_calls",
+      "native_free_bytes"
+    ],
+    "allocations": [
+      10037611,
+      3890974053,
+      6287564,
+      2996959216,
+      13291,
+      822456320,
+      13291,
+      822456320
+    ],
+    "phases": {
+      "producer": {
+        "calls": 11728,
+        "samples": 192,
+        "estimated_cpu_ms": 10392.764023666667,
+        "estimated_wall_ms": 30594.04440333334
+      },
+      "preflight": {
+        "calls": 11728,
+        "samples": 192,
+        "estimated_cpu_ms": 155.2820795833333,
+        "estimated_wall_ms": 167.34958074999997
+      },
+      "encode": {
+        "calls": 11728,
+        "samples": 192,
+        "estimated_cpu_ms": 2088.6926625,
+        "estimated_wall_ms": 2132.7776647499995
+      },
+      "frame": {
+        "calls": 11728,
+        "samples": 192,
+        "estimated_cpu_ms": 404.09111091666665,
+        "estimated_wall_ms": 416.0861672500001
+      },
+      "direct_alloc": {
+        "calls": 13291,
+        "samples": 214,
+        "estimated_cpu_ms": 141.15917984615388,
+        "estimated_wall_ms": 156.40637809890111
+      },
+      "admit": {
+        "calls": 11728,
+        "samples": 192,
+        "estimated_cpu_ms": 36.766730249999995,
+        "estimated_wall_ms": 52.598614000000005
+      },
+      "digest_ready": {
+        "calls": 11728,
+        "samples": 192,
+        "estimated_cpu_ms": 45.06398483333333,
+        "estimated_wall_ms": 55.27406400000001
+      },
+      "frames_ready": {
+        "calls": 11728,
+        "samples": 192,
+        "estimated_cpu_ms": 32.28785591666666,
+        "estimated_wall_ms": 41.811419500000014
+      },
+      "data_complete": {
+        "calls": 6235,
+        "samples": 98,
+        "estimated_cpu_ms": 39.74697979591837,
+        "estimated_wall_ms": 52.60151387755102
+      },
+      "reserve_frontier": {
+        "calls": 1563,
+        "samples": 32,
+        "estimated_cpu_ms": 3.1799815,
+        "estimated_wall_ms": 4.5626775
+      },
+      "publish_durable": {
+        "calls": 1563,
+        "samples": 32,
+        "estimated_cpu_ms": 2.4907345000000003,
+        "estimated_wall_ms": 3.510954
+      },
+      "snapshot": {
+        "calls": 36016,
+        "samples": 570,
+        "estimated_cpu_ms": 59.625795809621344,
+        "estimated_wall_ms": 101.65182178540589
+      },
+      "coalesce": {
+        "calls": 832,
+        "samples": 18,
+        "estimated_cpu_ms": 70.761192,
+        "estimated_wall_ms": 303.84379300000006
+      },
+      "coordinator_lock_wait": {
+        "calls": 441380,
+        "samples": 6905,
+        "estimated_cpu_ms": 606.9113650848747,
+        "estimated_wall_ms": 1178.139907443577
+      },
+      "submission_lock_wait": {
+        "calls": 24442,
+        "samples": 389,
+        "estimated_cpu_ms": 28.30143183076923,
+        "estimated_wall_ms": 55.31394473179487
+      },
+      "submit_data": {
+        "calls": 11728,
+        "samples": 192,
+        "estimated_cpu_ms": 145.9222804166667,
+        "estimated_wall_ms": 461.42728716666676
+      },
+      "pack_data": {
+        "calls": 5612,
+        "samples": 97,
+        "estimated_cpu_ms": 109.57305038095238,
+        "estimated_wall_ms": 380.8933122619047
+      },
+      "worker_submit": {
+        "calls": 6235,
+        "samples": 105,
+        "estimated_cpu_ms": 33.289796595238094,
+        "estimated_wall_ms": 40.896120595238095
+      },
+      "worker_cqe": {
+        "calls": 23753,
+        "samples": 372,
+        "estimated_cpu_ms": 67.07464087096774,
+        "estimated_wall_ms": 94.38752596774194
+      },
+      "completion_receive": {
+        "calls": 6235,
+        "samples": 98,
+        "estimated_cpu_ms": 118.62488321428572,
+        "estimated_wall_ms": 1926.4235600510203
+      },
+      "completion_publish": {
+        "calls": 6235,
+        "samples": 98,
+        "estimated_cpu_ms": 56.38552265306122,
+        "estimated_wall_ms": 72.02341163265305
+      },
+      "frontier_encode": {
+        "calls": 1563,
+        "samples": 32,
+        "estimated_cpu_ms": 13.9611355,
+        "estimated_wall_ms": 15.146124
+      },
+      "frontier_write": {
+        "calls": 1563,
+        "samples": 32,
+        "estimated_cpu_ms": 38.6524845,
+        "estimated_wall_ms": 107.14206449999998
+      },
+      "frontier_sync": {
+        "calls": 1563,
+        "samples": 32,
+        "estimated_cpu_ms": 86.26312399999999,
+        "estimated_wall_ms": 814.4281285000001
+      },
+      "resources_retire": {
+        "calls": 1563,
+        "samples": 32,
+        "estimated_cpu_ms": 19.250508500000002,
+        "estimated_wall_ms": 20.382409499999998
+      },
+      "guards_retire": {
+        "calls": 1563,
+        "samples": 32,
+        "estimated_cpu_ms": 15.5779175,
+        "estimated_wall_ms": 16.673262499999996
+      },
+      "v7_materialize": {
+        "calls": 0,
+        "samples": 0,
+        "estimated_cpu_ms": 0.0,
+        "estimated_wall_ms": 0.0
+      },
+      "v7_sync_cycle": {
+        "calls": 0,
+        "samples": 0,
+        "estimated_cpu_ms": 0.0,
+        "estimated_wall_ms": 0.0
+      },
+      "worker_receive": {
+        "calls": 1382,
+        "samples": 22,
+        "estimated_cpu_ms": 33.49358663636364,
+        "estimated_wall_ms": 1222.1068088181817
+      },
+      "memtable_publish": {
+        "calls": 11728,
+        "samples": 192,
+        "estimated_cpu_ms": 3159.7267296666664,
+        "estimated_wall_ms": 3221.914083166667
+      },
+      "mvcc_publish": {
+        "calls": 11728,
+        "samples": 192,
+        "estimated_cpu_ms": 1308.8364315833333,
+        "estimated_wall_ms": 2223.4877585833333
+      },
+      "v7_logical_hash": {
+        "calls": 0,
+        "samples": 0,
+        "estimated_cpu_ms": 0.0,
+        "estimated_wall_ms": 0.0
+      },
+      "frontier_lock_wait": {
+        "calls": 45410,
+        "samples": 718,
+        "estimated_cpu_ms": 318.056803007242,
+        "estimated_wall_ms": 14637.47248043755
+      },
+      "coordinator_wait": {
+        "calls": 33621,
+        "samples": 535,
+        "estimated_cpu_ms": 244.85864898894425,
+        "estimated_wall_ms": 956.337232940334
+      }
+    }
+  },
+  "normal-00-v8-16-phases": {
+    "phase_estimates_are_inclusive": true,
+    "sample_rate": 64,
+    "process_usage_delta": {
+      "involuntary": 1446,
+      "major_faults": 0,
+      "minor_faults": 231059,
+      "system_us": 3492486,
+      "user_us": 10134573,
+      "voluntary": 170499
+    },
+    "allocation_fields": [
+      "rust_alloc_calls",
+      "rust_alloc_bytes",
+      "rust_free_calls",
+      "rust_free_bytes",
+      "native_alloc_calls",
+      "native_alloc_bytes",
+      "native_free_calls",
+      "native_free_bytes"
+    ],
+    "allocations": [
+      10048112,
+      3904787365,
+      6298062,
+      3010961928,
+      13540,
+      823476224,
+      13540,
+      823476224
+    ],
+    "phases": {
+      "producer": {
+        "calls": 11728,
+        "samples": 192,
+        "estimated_cpu_ms": 12463.81746875,
+        "estimated_wall_ms": 154887.27069575
+      },
+      "preflight": {
+        "calls": 11728,
+        "samples": 192,
+        "estimated_cpu_ms": 176.3565015,
+        "estimated_wall_ms": 190.81932450000002
+      },
+      "encode": {
+        "calls": 11728,
+        "samples": 192,
+        "estimated_cpu_ms": 2295.4408100000005,
+        "estimated_wall_ms": 2349.738273666667
+      },
+      "frame": {
+        "calls": 11728,
+        "samples": 192,
+        "estimated_cpu_ms": 438.0339586666666,
+        "estimated_wall_ms": 451.31512458333333
+      },
+      "direct_alloc": {
+        "calls": 13540,
+        "samples": 221,
+        "estimated_cpu_ms": 241.33463771428575,
+        "estimated_wall_ms": 274.5396807307692
+      },
+      "admit": {
+        "calls": 11728,
+        "samples": 192,
+        "estimated_cpu_ms": 60.28967758333332,
+        "estimated_wall_ms": 118.12130074999997
+      },
+      "digest_ready": {
+        "calls": 11728,
+        "samples": 192,
+        "estimated_cpu_ms": 43.73743808333333,
+        "estimated_wall_ms": 55.05715708333334
+      },
+      "frames_ready": {
+        "calls": 11728,
+        "samples": 192,
+        "estimated_cpu_ms": 32.51985041666667,
+        "estimated_wall_ms": 49.88883516666666
+      },
+      "data_complete": {
+        "calls": 7663,
+        "samples": 120,
+        "estimated_cpu_ms": 52.44978665,
+        "estimated_wall_ms": 68.227328925
+      },
+      "reserve_frontier": {
+        "calls": 1812,
+        "samples": 35,
+        "estimated_cpu_ms": 5.120545166666666,
+        "estimated_wall_ms": 7.441234833333333
+      },
+      "publish_durable": {
+        "calls": 1812,
+        "samples": 35,
+        "estimated_cpu_ms": 3.419166666666667,
+        "estimated_wall_ms": 4.788733499999999
+      },
+      "snapshot": {
+        "calls": 44554,
+        "samples": 704,
+        "estimated_cpu_ms": 81.54734235487305,
+        "estimated_wall_ms": 146.45489084959948
+      },
+      "coalesce": {
+        "calls": 1152,
+        "samples": 27,
+        "estimated_cpu_ms": 80.33028300000001,
+        "estimated_wall_ms": 418.88774399999994
+      },
+      "coordinator_lock_wait": {
+        "calls": 483698,
+        "samples": 7568,
+        "estimated_cpu_ms": 817.3015695631262,
+        "estimated_wall_ms": 1731.1153236833038
+      },
+      "submission_lock_wait": {
+        "calls": 27015,
+        "samples": 429,
+        "estimated_cpu_ms": 36.23223101902727,
+        "estimated_wall_ms": 75.52107859310134
+      },
+      "submit_data": {
+        "calls": 11728,
+        "samples": 192,
+        "estimated_cpu_ms": 216.50877549999998,
+        "estimated_wall_ms": 688.3508931666667
+      },
+      "pack_data": {
+        "calls": 6768,
+        "samples": 112,
+        "estimated_cpu_ms": 159.09649452380953,
+        "estimated_wall_ms": 570.165093452381
+      },
+      "worker_submit": {
+        "calls": 7663,
+        "samples": 128,
+        "estimated_cpu_ms": 61.413197017857144,
+        "estimated_wall_ms": 76.83573201785713
+      },
+      "worker_cqe": {
+        "calls": 24903,
+        "samples": 390,
+        "estimated_cpu_ms": 91.18980540000001,
+        "estimated_wall_ms": 132.5469198923077
+      },
+      "completion_receive": {
+        "calls": 7663,
+        "samples": 120,
+        "estimated_cpu_ms": 159.93990095833334,
+        "estimated_wall_ms": 9236.592005191667
+      },
+      "completion_publish": {
+        "calls": 7663,
+        "samples": 120,
+        "estimated_cpu_ms": 76.07583738333334,
+        "estimated_wall_ms": 98.19227711666666
+      },
+      "frontier_encode": {
+        "calls": 1812,
+        "samples": 35,
+        "estimated_cpu_ms": 15.570202999999998,
+        "estimated_wall_ms": 16.925936000000004
+      },
+      "frontier_write": {
+        "calls": 1812,
+        "samples": 35,
+        "estimated_cpu_ms": 51.46812083333333,
+        "estimated_wall_ms": 1453.3606050000005
+      },
+      "frontier_sync": {
+        "calls": 1812,
+        "samples": 35,
+        "estimated_cpu_ms": 106.574381,
+        "estimated_wall_ms": 3137.829590500001
+      },
+      "resources_retire": {
+        "calls": 1812,
+        "samples": 35,
+        "estimated_cpu_ms": 28.828819166666662,
+        "estimated_wall_ms": 30.333076833333333
+      },
+      "guards_retire": {
+        "calls": 1812,
+        "samples": 35,
+        "estimated_cpu_ms": 23.108795500000003,
+        "estimated_wall_ms": 24.707228
+      },
+      "v7_materialize": {
+        "calls": 0,
+        "samples": 0,
+        "estimated_cpu_ms": 0.0,
+        "estimated_wall_ms": 0.0
+      },
+      "v7_sync_cycle": {
+        "calls": 0,
+        "samples": 0,
+        "estimated_cpu_ms": 0.0,
+        "estimated_wall_ms": 0.0
+      },
+      "worker_receive": {
+        "calls": 1449,
+        "samples": 23,
+        "estimated_cpu_ms": 37.805103,
+        "estimated_wall_ms": 3534.478794
+      },
+      "memtable_publish": {
+        "calls": 11728,
+        "samples": 192,
+        "estimated_cpu_ms": 3284.002726,
+        "estimated_wall_ms": 3328.1292038333336
+      },
+      "mvcc_publish": {
+        "calls": 11728,
+        "samples": 192,
+        "estimated_cpu_ms": 1907.5987209166667,
+        "estimated_wall_ms": 10067.771431416666
+      },
+      "v7_logical_hash": {
+        "calls": 0,
+        "samples": 0,
+        "estimated_cpu_ms": 0.0,
+        "estimated_wall_ms": 0.0
+      },
+      "frontier_lock_wait": {
+        "calls": 53552,
+        "samples": 847,
+        "estimated_cpu_ms": 618.3568186818161,
+        "estimated_wall_ms": 109059.25355893529
+      },
+      "coordinator_wait": {
+        "calls": 41590,
+        "samples": 657,
+        "estimated_cpu_ms": 438.907219148309,
+        "estimated_wall_ms": 11878.559283377539
+      }
+    }
+  },
+  "03-v7-16-phases": {
+    "phase_estimates_are_inclusive": true,
+    "sample_rate": 64,
+    "process_usage_delta": {
+      "involuntary": 662,
+      "major_faults": 0,
+      "minor_faults": 231344,
+      "system_us": 1212749,
+      "user_us": 4984568,
+      "voluntary": 69150
+    },
+    "allocation_fields": [
+      "rust_alloc_calls",
+      "rust_alloc_bytes",
+      "rust_free_calls",
+      "rust_free_bytes",
+      "native_alloc_calls",
+      "native_alloc_bytes",
+      "native_free_calls",
+      "native_free_bytes"
+    ],
+    "allocations": [
+      10009254,
+      3807760307,
+      6259212,
+      2913602320,
+      13236,
+      822231040,
+      13236,
+      822231040
+    ],
+    "phases": {
+      "producer": {
+        "calls": 11728,
+        "samples": 192,
+        "estimated_cpu_ms": 4787.042804166666,
+        "estimated_wall_ms": 24035.115201666667
+      },
+      "preflight": {
+        "calls": 11728,
+        "samples": 192,
+        "estimated_cpu_ms": 118.41413424999999,
+        "estimated_wall_ms": 128.39270758333333
+      },
+      "encode": {
+        "calls": 0,
+        "samples": 0,
+        "estimated_cpu_ms": 0.0,
+        "estimated_wall_ms": 0.0
+      },
+      "frame": {
+        "calls": 23440,
+        "samples": 376,
+        "estimated_cpu_ms": 652.5199502173914,
+        "estimated_wall_ms": 672.3760020434781
+      },
+      "direct_alloc": {
+        "calls": 13236,
+        "samples": 216,
+        "estimated_cpu_ms": 80.05772466666666,
+        "estimated_wall_ms": 91.01398216666668
+      },
+      "admit": {
+        "calls": 0,
+        "samples": 0,
+        "estimated_cpu_ms": 0.0,
+        "estimated_wall_ms": 0.0
+      },
+      "digest_ready": {
+        "calls": 0,
+        "samples": 0,
+        "estimated_cpu_ms": 0.0,
+        "estimated_wall_ms": 0.0
+      },
+      "frames_ready": {
+        "calls": 0,
+        "samples": 0,
+        "estimated_cpu_ms": 0.0,
+        "estimated_wall_ms": 0.0
+      },
+      "data_complete": {
+        "calls": 0,
+        "samples": 0,
+        "estimated_cpu_ms": 0.0,
+        "estimated_wall_ms": 0.0
+      },
+      "reserve_frontier": {
+        "calls": 0,
+        "samples": 0,
+        "estimated_cpu_ms": 0.0,
+        "estimated_wall_ms": 0.0
+      },
+      "publish_durable": {
+        "calls": 0,
+        "samples": 0,
+        "estimated_cpu_ms": 0.0,
+        "estimated_wall_ms": 0.0
+      },
+      "snapshot": {
+        "calls": 0,
+        "samples": 0,
+        "estimated_cpu_ms": 0.0,
+        "estimated_wall_ms": 0.0
+      },
+      "coalesce": {
+        "calls": 0,
+        "samples": 0,
+        "estimated_cpu_ms": 0.0,
+        "estimated_wall_ms": 0.0
+      },
+      "coordinator_lock_wait": {
+        "calls": 0,
+        "samples": 0,
+        "estimated_cpu_ms": 0.0,
+        "estimated_wall_ms": 0.0
+      },
+      "submission_lock_wait": {
+        "calls": 0,
+        "samples": 0,
+        "estimated_cpu_ms": 0.0,
+        "estimated_wall_ms": 0.0
+      },
+      "submit_data": {
+        "calls": 0,
+        "samples": 0,
+        "estimated_cpu_ms": 0.0,
+        "estimated_wall_ms": 0.0
+      },
+      "pack_data": {
+        "calls": 0,
+        "samples": 0,
+        "estimated_cpu_ms": 0.0,
+        "estimated_wall_ms": 0.0
+      },
+      "worker_submit": {
+        "calls": 5879,
+        "samples": 92,
+        "estimated_cpu_ms": 16.895606978260872,
+        "estimated_wall_ms": 21.969631293478262
+      },
+      "worker_cqe": {
+        "calls": 18044,
+        "samples": 282,
+        "estimated_cpu_ms": 44.09211364539007,
+        "estimated_wall_ms": 61.861998411347514
+      },
+      "completion_receive": {
+        "calls": 0,
+        "samples": 0,
+        "estimated_cpu_ms": 0.0,
+        "estimated_wall_ms": 0.0
+      },
+      "completion_publish": {
+        "calls": 0,
+        "samples": 0,
+        "estimated_cpu_ms": 0.0,
+        "estimated_wall_ms": 0.0
+      },
+      "frontier_encode": {
+        "calls": 0,
+        "samples": 0,
+        "estimated_cpu_ms": 0.0,
+        "estimated_wall_ms": 0.0
+      },
+      "frontier_write": {
+        "calls": 0,
+        "samples": 0,
+        "estimated_cpu_ms": 0.0,
+        "estimated_wall_ms": 0.0
+      },
+      "frontier_sync": {
+        "calls": 0,
+        "samples": 0,
+        "estimated_cpu_ms": 0.0,
+        "estimated_wall_ms": 0.0
+      },
+      "resources_retire": {
+        "calls": 0,
+        "samples": 0,
+        "estimated_cpu_ms": 0.0,
+        "estimated_wall_ms": 0.0
+      },
+      "guards_retire": {
+        "calls": 0,
+        "samples": 0,
+        "estimated_cpu_ms": 0.0,
+        "estimated_wall_ms": 0.0
+      },
+      "v7_materialize": {
+        "calls": 28,
+        "samples": 1,
+        "estimated_cpu_ms": 2.14816,
+        "estimated_wall_ms": 2.199652
+      },
+      "v7_sync_cycle": {
+        "calls": 1574,
+        "samples": 25,
+        "estimated_cpu_ms": 97.47316095999999,
+        "estimated_wall_ms": 665.52730552
+      },
+      "worker_receive": {
+        "calls": 4097,
+        "samples": 64,
+        "estimated_cpu_ms": 62.598383078125,
+        "estimated_wall_ms": 508.259416484375
+      },
+      "memtable_publish": {
+        "calls": 11728,
+        "samples": 192,
+        "estimated_cpu_ms": 1733.932757,
+        "estimated_wall_ms": 1751.9315109166669
+      },
+      "mvcc_publish": {
+        "calls": 11728,
+        "samples": 192,
+        "estimated_cpu_ms": 186.20460083333336,
+        "estimated_wall_ms": 198.51570233333337
+      },
+      "v7_logical_hash": {
+        "calls": 11728,
+        "samples": 184,
+        "estimated_cpu_ms": 823.6462856521739,
+        "estimated_wall_ms": 834.6808676521739
+      }
+    }
+  }
+}

@@ -8,8 +8,10 @@ Reducing publication spinning, moving batch-64 buffers into the memtable,
 combining those copy removals and retaining one FRONTIER owner also fail
 throughput/p99 checks. The runtime has been restored.
 
-These screens preceded a separate timed V8/V7 CPU investigation. They are
-recorded to distinguish tested negative results from proposed optimizations. No RFC digest, wire, recovery or sync contract changed.
+These screens preceded the
+[timed V8/V7 attribution](rfc-026-v8-coordination-attribution-20261102.md).
+They are recorded to distinguish tested negative results from proposed
+optimizations. No RFC digest, wire, recovery or sync contract changed.
 
 ## Method
 
