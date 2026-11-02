@@ -1,5 +1,12 @@
 # If there are words that you think should not be treated as typo.
 # Please list here along with a comment.
+[default]
+# Preserve literal Linux thread names in benchmark affinity audit records.
+extend-ignore-re = [
+    '\bwal-v8-completi\b',
+    '\biou-wrk-(?:[0-9]+|\*)',
+]
+
 [default.extend-words]
 "BA"="BA"
 "datas"="datas"

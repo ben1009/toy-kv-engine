@@ -1,0 +1,84 @@
+{
+  "samples": 18,
+  "flagged": 10,
+  "groups": [
+    {
+      "mode": "default",
+      "total": 6,
+      "eligible": 2,
+      "best_eligible": {
+        "name": "05-v8-default",
+        "puts_s": 475250.2552675261,
+        "p99_ms": 3.935405,
+        "cpu_s": 9.082491,
+        "context": {
+          "involuntary": 1376,
+          "voluntary": 98825
+        },
+        "syncs": 1405,
+        "mean_sync_ms": 0.4522422007117438,
+        "payload_hash_cpu_estimated_s": 0.9713513946956522,
+        "ordered_link_cpu_estimated_s": 0.013935604782608697
+      },
+      "median_eligible": {
+        "puts_s": 468153.9486202162,
+        "p99_ms": 3.8014075,
+        "cpu_s": 9.3769645,
+        "payload_hash_cpu_estimated_s": 1.006537689304348
+      }
+    },
+    {
+      "mode": "writers",
+      "total": 6,
+      "eligible": 3,
+      "best_eligible": {
+        "name": "01-v8-writers",
+        "puts_s": 475292.73873894854,
+        "p99_ms": 3.461045,
+        "cpu_s": 9.146904000000001,
+        "context": {
+          "involuntary": 355,
+          "voluntary": 98904
+        },
+        "syncs": 1360,
+        "mean_sync_ms": 0.4437656044117647,
+        "payload_hash_cpu_estimated_s": 0.9109884622608696,
+        "ordered_link_cpu_estimated_s": 0.014506388695652175
+      },
+      "median_eligible": {
+        "puts_s": 474633.83031528705,
+        "p99_ms": 3.949057,
+        "cpu_s": 9.146904000000001,
+        "payload_hash_cpu_estimated_s": 0.9109884622608696
+      }
+    },
+    {
+      "mode": "whole",
+      "total": 6,
+      "eligible": 3,
+      "best_eligible": {
+        "name": "02-v8-whole",
+        "puts_s": 655686.129435348,
+        "p99_ms": 3.356596,
+        "cpu_s": 5.852629000000001,
+        "context": {
+          "involuntary": 743,
+          "voluntary": 90928
+        },
+        "syncs": 928,
+        "mean_sync_ms": 0.4131106142241379,
+        "payload_hash_cpu_estimated_s": 0.5489808599130436,
+        "ordered_link_cpu_estimated_s": 0.008736595130434784
+      },
+      "median_eligible": {
+        "puts_s": 654516.0457828842,
+        "p99_ms": 3.234413,
+        "cpu_s": 5.852629000000001,
+        "payload_hash_cpu_estimated_s": 0.5527642872173913
+      }
+    }
+  ],
+  "runtime_changed": false,
+  "binary_sha256": "b422f940a95fef7fa81da96d85e3787e8909e8226fe6d5e62a720fd0d8e1e81d",
+  "scope": "One new benchmark-only executable for the three placement modes; historical binary scores are context only. No production affinity change or worker pool."
+}
