@@ -282,9 +282,17 @@ durability-group, FRONTIER-write and `fdatasync` counters to the same
 `wal_pipeline` record used for v4-v7, while V8 digest CPU counters remain in
 `wal_v8_digest`. For V8, a commit group is the set of logical tickets covered
 by one FRONTIER/fdatasync cycle; `commit_buffers` counts those ticket buffers
-and `commit_bytes` their aligned DATA frame bytes. io_uring, CQE and eventfd
-counters remain zero because V8 submits positional writes directly. The normal
-build rejects the v8 selector before opening a database. PITR write-perf workers
+and `commit_bytes` their aligned DATA frame bytes. V8 Parallel submits DATA
+through the existing bounded `IoWorker` and reports its io_uring, CQE and
+eventfd activity; the FRONTIER remains a direct aligned write followed by the
+single durability sync. The positional DATA-write timing counter applies only
+to Leader mode; Parallel mode uses worker metrics. V8 Parallel now gives
+already-admitted unfinished successors a bounded 100–400 microsecond
+durability coalescing opportunity, selected by the previous sync latency.
+Lone producers and fully ready windows skip the wait; close and poison wake
+it. The [coalescing screen](benchmarks/rfc-026-v8-bounded-coalescing-20261102.md)
+records the gains and remaining tail-latency uncertainty. The normal build rejects the v8 selector before
+opening a database. PITR write-perf workers
 retry only the exact pre-admission `commit admission is stopped at a PITR
 barrier` error, with a bounded five-second wait. The retry time remains inside
 the measured operation latency; other errors still fail the run immediately.
@@ -292,6 +300,17 @@ V8 Parallel producers also wait for a bounded ticket slot to become durable
 instead of failing a write when the in-flight ticket window is temporarily
 full. The admission waiter is released by frontier publication, close or
 poison, and a focused coordinator test covers the durable-capacity handoff.
+
+The DATA submitter now derives its group window from the admitted ticket
+high-water mark, independently of the ready-buffer map. A multi-frame head
+with admitted successors may open a group for up to 10 microseconds while
+their frames become ready, refreshing membership within the same deadline.
+Single-frame heads and a lone admitted ticket submit immediately. A
+cooperative producer owns packing only until it has drained currently ready
+work; later readiness cannot race its ownership release and leave a queued
+head stranded. The [DATA-group screen](benchmarks/rfc-026-v8-admitted-data-groups-20261102.md)
+records correctness coverage, rejected policies, and the remaining performance
+uncertainty. Its retained binary is not yet qualified against v7 or v4.
 
 Each slice must leave existing v2-v7 reads, writes, recovery and digest
 interpretation unchanged. The non-performance workspace and historical-reader
