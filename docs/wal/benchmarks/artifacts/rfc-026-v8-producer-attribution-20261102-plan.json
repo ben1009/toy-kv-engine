@@ -1,0 +1,89 @@
+{
+  "base_revision": "b8da402a276d7969f4c40ca99787a10a63d93f33",
+  "schedule": [
+    [
+      "diagnostic",
+      "v7",
+      1
+    ],
+    [
+      "diagnostic",
+      "v8",
+      1
+    ],
+    [
+      "diagnostic",
+      "v7",
+      16
+    ],
+    [
+      "diagnostic",
+      "v8",
+      16
+    ],
+    [
+      "diagnostic",
+      "v8",
+      16
+    ],
+    [
+      "diagnostic",
+      "v7",
+      16
+    ],
+    [
+      "diagnostic",
+      "v8",
+      1
+    ],
+    [
+      "diagnostic",
+      "v7",
+      1
+    ],
+    [
+      "control",
+      "v7",
+      16
+    ],
+    [
+      "control",
+      "v8",
+      16
+    ],
+    [
+      "control",
+      "v8",
+      16
+    ],
+    [
+      "control",
+      "v7",
+      16
+    ]
+  ],
+  "binary_sha256": {
+    "diagnostic": "fbb90ea8a6f20bf476760e79ae60e04cda3edae04138d45ae5a9e6346da299f1",
+    "control": "937a3843a044e107e15db756674be151875e388ff3a0a392cbd4e97463bbd2aa"
+  },
+  "binary_paths": {
+    "diagnostic": "/home/liu/proj/toy-kv-engine/target/rfc-026-v8-producer-attribution-20261102/write-perf-producer-attribution",
+    "control": "/home/liu/proj/toy-kv-engine/target/rfc-026-v8-notification-split-20261102/write-perf-cursor"
+  },
+  "diagnostic": "Whole-batch CPU/wall phase scopes sampled 1/64 per thread, existing ticket-sampled BLAKE3 metrics, no allocation wrapper, no detailed --profile. perf cpu-clock:u 499Hz DWARF4096 enabled only for timed interval; output memfd until completion.",
+  "control": "Existing kept normal-counter executable, no attribution hooks or perf sampling; batch context-switch probe only.",
+  "workload": {
+    "puts": 750000,
+    "batch": 64,
+    "value_bytes": 1024,
+    "target_sst_size": 2147483648,
+    "compaction": "none",
+    "wal_io_mode": "parallel",
+    "latency_sample_every": 10
+  },
+  "cooldown_seconds": 45,
+  "between_runs_seconds": 3,
+  "flag": "p99 >10ms or mean fdatasync >1ms; retain every diagnostic and report flagged status. Diagnostics never enter performance best-score rankings.",
+  "selection": "Highest eligible throughput only within each diagnostic/control format and writer count, with all same-run CPU and phase data; all runs and medians retained. One fixed cohort, no code tuning.",
+  "retained_runtime": "Notification separation, single durability driver and published cursor unchanged; all temporary instrumentation will be removed after profiling."
+}

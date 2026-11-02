@@ -1,0 +1,434 @@
+[
+  {
+    "cpu": 8,
+    "entries": 2,
+    "stage": "blake3_only",
+    "samples": 14,
+    "median_cpu_us_per_batch": 1.55306775,
+    "min_cpu_us_per_batch": 1.550926,
+    "max_cpu_us_per_batch": 1.8118185
+  },
+  {
+    "cpu": 8,
+    "entries": 2,
+    "stage": "copy_without_crc",
+    "samples": 14,
+    "median_cpu_us_per_batch": 0.031322,
+    "min_cpu_us_per_batch": 0.030391500000000002,
+    "max_cpu_us_per_batch": 0.032216
+  },
+  {
+    "cpu": 8,
+    "entries": 2,
+    "stage": "encode_crc_inline_blake3",
+    "samples": 14,
+    "median_cpu_us_per_batch": 1.69553025,
+    "min_cpu_us_per_batch": 1.6908535,
+    "max_cpu_us_per_batch": 1.6985205
+  },
+  {
+    "cpu": 8,
+    "entries": 2,
+    "stage": "encode_entry_crc",
+    "samples": 14,
+    "median_cpu_us_per_batch": 0.1397895,
+    "min_cpu_us_per_batch": 0.135077,
+    "max_cpu_us_per_batch": 0.152377
+  },
+  {
+    "cpu": 8,
+    "entries": 2,
+    "stage": "frame_crc_only",
+    "samples": 14,
+    "median_cpu_us_per_batch": 0.175619,
+    "min_cpu_us_per_batch": 0.172393,
+    "max_cpu_us_per_batch": 0.177741
+  },
+  {
+    "cpu": 8,
+    "entries": 2,
+    "stage": "sha256_only",
+    "samples": 14,
+    "median_cpu_us_per_batch": 0.85303675,
+    "min_cpu_us_per_batch": 0.8524930000000001,
+    "max_cpu_us_per_batch": 0.9260900000000001
+  },
+  {
+    "cpu": 8,
+    "entries": 2,
+    "stage": "v7_frame_codec",
+    "samples": 14,
+    "median_cpu_us_per_batch": 0.21582075,
+    "min_cpu_us_per_batch": 0.215613,
+    "max_cpu_us_per_batch": 0.21751099999999998
+  },
+  {
+    "cpu": 8,
+    "entries": 2,
+    "stage": "v8_frame_codec",
+    "samples": 14,
+    "median_cpu_us_per_batch": 0.2182995,
+    "min_cpu_us_per_batch": 0.218054,
+    "max_cpu_us_per_batch": 0.530125
+  },
+  {
+    "cpu": 8,
+    "entries": 8,
+    "stage": "blake3_only",
+    "samples": 14,
+    "median_cpu_us_per_batch": 3.4242980000000003,
+    "min_cpu_us_per_batch": 3.4229555,
+    "max_cpu_us_per_batch": 3.4304745
+  },
+  {
+    "cpu": 8,
+    "entries": 8,
+    "stage": "copy_without_crc",
+    "samples": 14,
+    "median_cpu_us_per_batch": 0.14634025,
+    "min_cpu_us_per_batch": 0.1413115,
+    "max_cpu_us_per_batch": 0.15474700000000002
+  },
+  {
+    "cpu": 8,
+    "entries": 8,
+    "stage": "encode_crc_inline_blake3",
+    "samples": 14,
+    "median_cpu_us_per_batch": 4.00414225,
+    "min_cpu_us_per_batch": 3.9763015,
+    "max_cpu_us_per_batch": 4.016709
+  },
+  {
+    "cpu": 8,
+    "entries": 8,
+    "stage": "encode_entry_crc",
+    "samples": 14,
+    "median_cpu_us_per_batch": 0.58886675,
+    "min_cpu_us_per_batch": 0.5568529999999999,
+    "max_cpu_us_per_batch": 0.5970915
+  },
+  {
+    "cpu": 8,
+    "entries": 8,
+    "stage": "frame_crc_only",
+    "samples": 14,
+    "median_cpu_us_per_batch": 0.521844,
+    "min_cpu_us_per_batch": 0.520812,
+    "max_cpu_us_per_batch": 0.5322680000000001
+  },
+  {
+    "cpu": 8,
+    "entries": 8,
+    "stage": "sha256_only",
+    "samples": 14,
+    "median_cpu_us_per_batch": 3.30232825,
+    "min_cpu_us_per_batch": 3.3021885,
+    "max_cpu_us_per_batch": 3.3150619999999997
+  },
+  {
+    "cpu": 8,
+    "entries": 8,
+    "stage": "v7_frame_codec",
+    "samples": 14,
+    "median_cpu_us_per_batch": 0.6557205,
+    "min_cpu_us_per_batch": 0.6533479999999999,
+    "max_cpu_us_per_batch": 0.6569065000000001
+  },
+  {
+    "cpu": 8,
+    "entries": 8,
+    "stage": "v8_frame_codec",
+    "samples": 14,
+    "median_cpu_us_per_batch": 0.6494815,
+    "min_cpu_us_per_batch": 0.647957,
+    "max_cpu_us_per_batch": 0.6512825
+  },
+  {
+    "cpu": 8,
+    "entries": 64,
+    "stage": "blake3_only",
+    "samples": 14,
+    "median_cpu_us_per_batch": 15.15433325,
+    "min_cpu_us_per_batch": 15.1444575,
+    "max_cpu_us_per_batch": 15.8566895
+  },
+  {
+    "cpu": 8,
+    "entries": 64,
+    "stage": "copy_without_crc",
+    "samples": 14,
+    "median_cpu_us_per_batch": 2.42317575,
+    "min_cpu_us_per_batch": 2.4009355,
+    "max_cpu_us_per_batch": 2.561726
+  },
+  {
+    "cpu": 8,
+    "entries": 64,
+    "stage": "encode_crc_inline_blake3",
+    "samples": 14,
+    "median_cpu_us_per_batch": 21.05417275,
+    "min_cpu_us_per_batch": 20.994799999999998,
+    "max_cpu_us_per_batch": 21.560661
+  },
+  {
+    "cpu": 8,
+    "entries": 64,
+    "stage": "encode_entry_crc",
+    "samples": 14,
+    "median_cpu_us_per_batch": 5.87112925,
+    "min_cpu_us_per_batch": 5.7239585,
+    "max_cpu_us_per_batch": 5.972652500000001
+  },
+  {
+    "cpu": 8,
+    "entries": 64,
+    "stage": "frame_crc_only",
+    "samples": 14,
+    "median_cpu_us_per_batch": 2.9777467499999997,
+    "min_cpu_us_per_batch": 2.937734,
+    "max_cpu_us_per_batch": 3.0393209999999997
+  },
+  {
+    "cpu": 8,
+    "entries": 64,
+    "stage": "sha256_only",
+    "samples": 14,
+    "median_cpu_us_per_batch": 26.059593500000002,
+    "min_cpu_us_per_batch": 26.0448,
+    "max_cpu_us_per_batch": 26.169151999999997
+  },
+  {
+    "cpu": 8,
+    "entries": 64,
+    "stage": "v7_frame_codec",
+    "samples": 14,
+    "median_cpu_us_per_batch": 4.282947500000001,
+    "min_cpu_us_per_batch": 4.257217,
+    "max_cpu_us_per_batch": 4.312716999999999
+  },
+  {
+    "cpu": 8,
+    "entries": 64,
+    "stage": "v8_frame_codec",
+    "samples": 14,
+    "median_cpu_us_per_batch": 4.271285,
+    "min_cpu_us_per_batch": 4.246637,
+    "max_cpu_us_per_batch": 4.302871
+  },
+  {
+    "cpu": 31,
+    "entries": 2,
+    "stage": "blake3_only",
+    "samples": 14,
+    "median_cpu_us_per_batch": 2.09654175,
+    "min_cpu_us_per_batch": 2.0897534999999996,
+    "max_cpu_us_per_batch": 2.1072694999999997
+  },
+  {
+    "cpu": 31,
+    "entries": 2,
+    "stage": "copy_without_crc",
+    "samples": 14,
+    "median_cpu_us_per_batch": 0.06687125000000001,
+    "min_cpu_us_per_batch": 0.0620685,
+    "max_cpu_us_per_batch": 0.0720885
+  },
+  {
+    "cpu": 31,
+    "entries": 2,
+    "stage": "encode_crc_inline_blake3",
+    "samples": 14,
+    "median_cpu_us_per_batch": 2.34269975,
+    "min_cpu_us_per_batch": 2.334964,
+    "max_cpu_us_per_batch": 2.3498384999999997
+  },
+  {
+    "cpu": 31,
+    "entries": 2,
+    "stage": "encode_entry_crc",
+    "samples": 14,
+    "median_cpu_us_per_batch": 0.24270424999999998,
+    "min_cpu_us_per_batch": 0.241416,
+    "max_cpu_us_per_batch": 0.2501675
+  },
+  {
+    "cpu": 31,
+    "entries": 2,
+    "stage": "frame_crc_only",
+    "samples": 14,
+    "median_cpu_us_per_batch": 0.233253,
+    "min_cpu_us_per_batch": 0.23176449999999998,
+    "max_cpu_us_per_batch": 0.2335485
+  },
+  {
+    "cpu": 31,
+    "entries": 2,
+    "stage": "sha256_only",
+    "samples": 14,
+    "median_cpu_us_per_batch": 0.8712085,
+    "min_cpu_us_per_batch": 0.870541,
+    "max_cpu_us_per_batch": 0.873216
+  },
+  {
+    "cpu": 31,
+    "entries": 2,
+    "stage": "v7_frame_codec",
+    "samples": 14,
+    "median_cpu_us_per_batch": 0.38907825,
+    "min_cpu_us_per_batch": 0.3875725,
+    "max_cpu_us_per_batch": 0.3894375
+  },
+  {
+    "cpu": 31,
+    "entries": 2,
+    "stage": "v8_frame_codec",
+    "samples": 14,
+    "median_cpu_us_per_batch": 0.38792125,
+    "min_cpu_us_per_batch": 0.38764800000000005,
+    "max_cpu_us_per_batch": 0.9385285
+  },
+  {
+    "cpu": 31,
+    "entries": 8,
+    "stage": "blake3_only",
+    "samples": 14,
+    "median_cpu_us_per_batch": 6.4784305,
+    "min_cpu_us_per_batch": 6.4731215,
+    "max_cpu_us_per_batch": 6.4848490000000005
+  },
+  {
+    "cpu": 31,
+    "entries": 8,
+    "stage": "copy_without_crc",
+    "samples": 14,
+    "median_cpu_us_per_batch": 0.38613474999999997,
+    "min_cpu_us_per_batch": 0.36023200000000005,
+    "max_cpu_us_per_batch": 0.4158985
+  },
+  {
+    "cpu": 31,
+    "entries": 8,
+    "stage": "encode_crc_inline_blake3",
+    "samples": 14,
+    "median_cpu_us_per_batch": 7.533514499999999,
+    "min_cpu_us_per_batch": 7.526804,
+    "max_cpu_us_per_batch": 7.543347499999999
+  },
+  {
+    "cpu": 31,
+    "entries": 8,
+    "stage": "encode_entry_crc",
+    "samples": 14,
+    "median_cpu_us_per_batch": 1.04203375,
+    "min_cpu_us_per_batch": 1.0396025,
+    "max_cpu_us_per_batch": 1.0433264999999998
+  },
+  {
+    "cpu": 31,
+    "entries": 8,
+    "stage": "frame_crc_only",
+    "samples": 14,
+    "median_cpu_us_per_batch": 0.70616975,
+    "min_cpu_us_per_batch": 0.7052625,
+    "max_cpu_us_per_batch": 0.707017
+  },
+  {
+    "cpu": 31,
+    "entries": 8,
+    "stage": "sha256_only",
+    "samples": 14,
+    "median_cpu_us_per_batch": 3.3654965,
+    "min_cpu_us_per_batch": 3.3653425,
+    "max_cpu_us_per_batch": 3.366276
+  },
+  {
+    "cpu": 31,
+    "entries": 8,
+    "stage": "v7_frame_codec",
+    "samples": 14,
+    "median_cpu_us_per_batch": 1.1759119999999998,
+    "min_cpu_us_per_batch": 1.174469,
+    "max_cpu_us_per_batch": 1.1781295
+  },
+  {
+    "cpu": 31,
+    "entries": 8,
+    "stage": "v8_frame_codec",
+    "samples": 14,
+    "median_cpu_us_per_batch": 1.1839727500000001,
+    "min_cpu_us_per_batch": 1.1817114999999998,
+    "max_cpu_us_per_batch": 1.187054
+  },
+  {
+    "cpu": 31,
+    "entries": 64,
+    "stage": "blake3_only",
+    "samples": 14,
+    "median_cpu_us_per_batch": 32.65897675,
+    "min_cpu_us_per_batch": 32.613080000000004,
+    "max_cpu_us_per_batch": 32.691587500000004
+  },
+  {
+    "cpu": 31,
+    "entries": 64,
+    "stage": "copy_without_crc",
+    "samples": 14,
+    "median_cpu_us_per_batch": 5.944902249999999,
+    "min_cpu_us_per_batch": 5.6431605,
+    "max_cpu_us_per_batch": 6.258253
+  },
+  {
+    "cpu": 31,
+    "entries": 64,
+    "stage": "encode_crc_inline_blake3",
+    "samples": 14,
+    "median_cpu_us_per_batch": 43.32595574999999,
+    "min_cpu_us_per_batch": 43.176379999999995,
+    "max_cpu_us_per_batch": 43.473586000000005
+  },
+  {
+    "cpu": 31,
+    "entries": 64,
+    "stage": "encode_entry_crc",
+    "samples": 14,
+    "median_cpu_us_per_batch": 10.48880625,
+    "min_cpu_us_per_batch": 10.378680000000001,
+    "max_cpu_us_per_batch": 10.584305500000001
+  },
+  {
+    "cpu": 31,
+    "entries": 64,
+    "stage": "frame_crc_only",
+    "samples": 14,
+    "median_cpu_us_per_batch": 3.98174075,
+    "min_cpu_us_per_batch": 3.978674,
+    "max_cpu_us_per_batch": 3.9840394999999997
+  },
+  {
+    "cpu": 31,
+    "entries": 64,
+    "stage": "sha256_only",
+    "samples": 14,
+    "median_cpu_us_per_batch": 26.48872925,
+    "min_cpu_us_per_batch": 26.487485,
+    "max_cpu_us_per_batch": 26.4915985
+  },
+  {
+    "cpu": 31,
+    "entries": 64,
+    "stage": "v7_frame_codec",
+    "samples": 14,
+    "median_cpu_us_per_batch": 8.05609075,
+    "min_cpu_us_per_batch": 8.053671999999999,
+    "max_cpu_us_per_batch": 8.0609305
+  },
+  {
+    "cpu": 31,
+    "entries": 64,
+    "stage": "v8_frame_codec",
+    "samples": 14,
+    "median_cpu_us_per_batch": 8.5508145,
+    "min_cpu_us_per_batch": 8.5377275,
+    "max_cpu_us_per_batch": 8.565073
+  }
+]

@@ -1,0 +1,21 @@
+{
+  "runtime_restored_to": "b8da402a276d7969f4c40ca99787a10a63d93f33",
+  "source_matches_baseline": true,
+  "kept_notification_optimization_unchanged": true,
+  "temporary_probe_files_removed": [
+    "kv-engine/src/profiling/wal_attribution.rs",
+    "kv-engine/src/profiling/wal_preparation.rs"
+  ],
+  "source_sha256": {
+    "kv-engine/src/profiling.rs": "cb1264ccfcf93acb116388a776a1ab3ce73de0d1ba696fc6b62a9c93fa1f3f09",
+    "kv-engine/src/bin/write-perf.rs": "83c7352eab8b9f0eefc49ba6c128142908941a5c95214a3f4eb288f9538cd5b9",
+    "kv-engine/src/pitr/mod.rs": "1a9bf9966d456a72eadb3a5f5776f3a218ff7f672b302301a939d3253069c729",
+    "kv-engine/src/wal.rs": "89988769b9ef7eb20d2557892f8f2bdfa046e35e24da7ec8364f18c5d99d3861",
+    "kv-engine/src/wal/v7/codec.rs": "bef96d727ae876a73de9ad1ad8a1732f51a92905089e3d4eb727e8f57c20b5dd",
+    "kv-engine/src/wal/v8/prepare.rs": "2e75e3a2b8a7fc3aba3d9800f8f1ca322f587da8be04a55539955c71d980653e",
+    "kv-engine/src/wal/v8/digest.rs": "9aad38548ec5f60dbafed3d4557da3edfc3fcf6b35e21c9fe2ef75623e04cf53",
+    "kv-engine/src/wal/parallel/runtime.rs": "f10f1de5b04fd8a3c6c5a3e173a59a493a94a8aa89c8e8e9b8e4d946439251df",
+    "kv-engine/src/mem_table.rs": "4fc975e5c0d7b315703f3d01e7ef01df65554c4ecd4bc3c8618ea4f1a0aea0a0",
+    "kv-engine/src/mvcc.rs": "2605882844d0088a44e75cbc42feb4c2c9b31285dd13cf7151cb12100072a20d"
+  }
+}

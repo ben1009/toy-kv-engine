@@ -1,0 +1,96 @@
+{
+  "samples": 14,
+  "stall_flagged": 10,
+  "groups": [
+    {
+      "cohort": "cpu-aware-followup",
+      "mode": "diagnostic",
+      "format": "v7",
+      "writers": 16,
+      "eligible": 0,
+      "total": 1,
+      "best_eligible_sample": null,
+      "best_eligible_puts_s": null,
+      "median_eligible_puts_s": null
+    },
+    {
+      "cohort": "cpu-aware-followup",
+      "mode": "diagnostic",
+      "format": "v8",
+      "writers": 16,
+      "eligible": 0,
+      "total": 1,
+      "best_eligible_sample": null,
+      "best_eligible_puts_s": null,
+      "median_eligible_puts_s": null
+    },
+    {
+      "cohort": "initial",
+      "mode": "control",
+      "format": "v7",
+      "writers": 16,
+      "eligible": 0,
+      "total": 2,
+      "best_eligible_sample": null,
+      "best_eligible_puts_s": null,
+      "median_eligible_puts_s": null
+    },
+    {
+      "cohort": "initial",
+      "mode": "control",
+      "format": "v8",
+      "writers": 16,
+      "eligible": 1,
+      "total": 2,
+      "best_eligible_sample": "10-control-v8-16",
+      "best_eligible_puts_s": 477784.27839033864,
+      "median_eligible_puts_s": 477784.27839033864
+    },
+    {
+      "cohort": "initial",
+      "mode": "diagnostic",
+      "format": "v7",
+      "writers": 1,
+      "eligible": 1,
+      "total": 2,
+      "best_eligible_sample": "00-diagnostic-v7-1",
+      "best_eligible_puts_s": 73213.39532417462,
+      "median_eligible_puts_s": 73213.39532417462
+    },
+    {
+      "cohort": "initial",
+      "mode": "diagnostic",
+      "format": "v7",
+      "writers": 16,
+      "eligible": 1,
+      "total": 2,
+      "best_eligible_sample": "05-diagnostic-v7-16",
+      "best_eligible_puts_s": 489033.58487047453,
+      "median_eligible_puts_s": 489033.58487047453
+    },
+    {
+      "cohort": "initial",
+      "mode": "diagnostic",
+      "format": "v8",
+      "writers": 1,
+      "eligible": 1,
+      "total": 2,
+      "best_eligible_sample": "06-diagnostic-v8-1",
+      "best_eligible_puts_s": 65655.16060120113,
+      "median_eligible_puts_s": 65655.16060120113
+    },
+    {
+      "cohort": "initial",
+      "mode": "diagnostic",
+      "format": "v8",
+      "writers": 16,
+      "eligible": 0,
+      "total": 2,
+      "best_eligible_sample": null,
+      "best_eligible_puts_s": null,
+      "median_eligible_puts_s": null
+    }
+  ],
+  "scope_limit": "Whole-batch timings are sampled/inclusive; do not add child allocation/entry scopes to their encode parent. CPU-only values cannot be subtracted from live profiles. All diagnostic throughput excluded from performance qualification.",
+  "runtime_unchanged": true
+}

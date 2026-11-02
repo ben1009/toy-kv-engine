@@ -1,0 +1,875 @@
+diff --git a/kv-engine/src/bin/write-perf.rs b/kv-engine/src/bin/write-perf.rs
+index e61ce944..67732ac0 100644
+--- a/kv-engine/src/bin/write-perf.rs
++++ b/kv-engine/src/bin/write-perf.rs
+@@ -3626,7 +3626,29 @@ fn run_wal_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
+     Ok(vec![measurement])
+ }
+ 
++fn perf_timed_control(command: &str) -> Result<()> {
++    use std::io::{BufRead, Write};
++    let Some(directory) = std::env::var_os("KV_PERF_CONTROL_DIR") else {
++        return Ok(());
++    };
++    let directory = std::path::Path::new(&directory);
++    let mut control = std::fs::OpenOptions::new()
++        .write(true)
++        .open(directory.join("control"))?;
++    let ack = std::fs::OpenOptions::new()
++        .read(true)
++        .write(true)
++        .open(directory.join("ack"))?;
++    writeln!(control, "{command}")?;
++    let mut response = String::new();
++    std::io::BufReader::new(ack).read_line(&mut response)?;
++    Ok(())
++}
++
+ fn run_wal_batch_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
++    if kv_engine::profiling::wal_preparation::run_if_requested()? {
++        return Ok(vec![]);
++    }
+     let workload = "wal_batch_concurrent";
+     let path = prepare_path(cfg, workload)?;
+     let cleanup = CleanupPathOnDrop::new(cfg, &path);
+@@ -3651,6 +3673,8 @@ fn run_wal_batch_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>
+     let writer_threads = cfg.threads;
+     let retry_pitr_barrier = cfg.pitr;
+     let baseline = collect_counters(&engine)?;
++    kv_engine::profiling::wal_attribution::begin();
++    perf_timed_control("enable")?;
+     let cpu_start = process_cpu_times();
+     let per_thread = num_keys / writer_threads;
+     let remainder = num_keys % writer_threads;
+@@ -3687,6 +3711,7 @@ fn run_wal_batch_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>
+                 next += current_batch;
+                 batch_index += 1;
+             }
++            kv_engine::profiling::wal_attribution::producer_finished();
+             Ok(latency_samples)
+         }));
+     }
+@@ -3711,6 +3736,8 @@ fn run_wal_batch_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>
+     let elapsed = start.elapsed();
+     let (process_cpu_user_ms, process_cpu_system_ms) =
+         process_cpu_delta(cpu_start, process_cpu_times());
++    kv_engine::profiling::wal_attribution::end();
++    perf_timed_control("disable")?;
+     #[cfg(feature = "bench")]
+     let wal_pipeline = wal_pipeline_record(&engine, cfg.profile, wal_run_info)?;
+     #[cfg(not(feature = "bench"))]
+@@ -3733,6 +3760,8 @@ fn run_wal_batch_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>
+     }
+     let counters = collect_counter_delta(&baseline, &collect_counters(&engine)?);
+     engine.close()?;
++    drop(engine);
++    kv_engine::profiling::wal_attribution::finish()?;
+     cleanup.finalize()?;
+ 
+     let mut measurement = make_measurement(
+diff --git a/kv-engine/src/mem_table.rs b/kv-engine/src/mem_table.rs
+index ccbbbc6a..919bf7aa 100644
+--- a/kv-engine/src/mem_table.rs
++++ b/kv-engine/src/mem_table.rs
+@@ -3058,6 +3058,7 @@ impl MemTable {
+     }
+ 
+     pub(crate) fn publish_raw_batch(&self, data: &[(KeySlice, &[u8])]) -> Result<()> {
++        crate::wal_attribution!(MemtablePublish);
+         struct AbortOnPanic;
+         impl Drop for AbortOnPanic {
+             fn drop(&mut self) {
+@@ -3183,6 +3184,7 @@ impl MemTable {
+     }
+ 
+     pub(crate) fn publish_raw_batch_owned(&self, entries: Vec<(Bytes, Bytes)>) -> Result<()> {
++        crate::wal_attribution!(MemtablePublish);
+         struct AbortOnPanic;
+         impl Drop for AbortOnPanic {
+             fn drop(&mut self) {
+diff --git a/kv-engine/src/mvcc.rs b/kv-engine/src/mvcc.rs
+index 0c560573..ef0fe274 100644
+--- a/kv-engine/src/mvcc.rs
++++ b/kv-engine/src/mvcc.rs
+@@ -719,6 +719,7 @@ impl LsmMvccInner {
+     }
+ 
+     pub(crate) fn publish_commit_ts(&self, commit_ts: u64) -> anyhow::Result<()> {
++        crate::wal_attribution!(MvccPublish);
+         let mut publication = self.publication.lock();
+         if publication
+             .poisoned_at
+diff --git a/kv-engine/src/pitr/mod.rs b/kv-engine/src/pitr/mod.rs
+index 490cd906..ca2d83e4 100644
+--- a/kv-engine/src/pitr/mod.rs
++++ b/kv-engine/src/pitr/mod.rs
+@@ -542,6 +542,7 @@ impl<'a> CanonicalWalEntryStream<'a> {
+     }
+ 
+     pub(crate) fn new(batch: &'a WalBatch, limits: WalV5Limits) -> Result<Self> {
++        crate::wal_attribution!(Preflight);
+         let limits = limits.validate()?;
+         let point_index_capacity = Self::point_index_capacity(batch, limits)?;
+         let mut last_point = Vec::new();
+@@ -636,6 +637,7 @@ impl<'a> CanonicalWalEntryStream<'a> {
+     /// Emit the entry stream without a v5-family header or alignment padding,
+     /// returning the bytes written and their CRC.
+     pub(crate) fn encode_into(&self, dst: &mut [u8]) -> Result<(usize, u32)> {
++        crate::wal_attribution!(EntryEncode);
+         ensure!(
+             dst.len() >= self.data_len,
+             "v5 entry stream output buffer is too small"
+@@ -654,6 +656,25 @@ impl<'a> CanonicalWalEntryStream<'a> {
+         Ok((pos, hasher.finalize()))
+     }
+ 
++    #[cfg(feature = "bench")]
++    pub(crate) fn encode_without_crc_probe(&self, dst: &mut [u8]) -> Result<(usize, u32)> {
++        ensure!(
++            dst.len() >= self.data_len,
++            "v5 entry stream output buffer is too small"
++        );
++
++        let mut pos = 0;
++        for entry in self.entries() {
++            pos = write_entry_without_crc_probe(dst, pos, entry)?;
++        }
++        ensure!(
++            pos == self.data_len,
++            "v5 entry stream length changed while encoding"
++        );
++
++        Ok((pos, 0))
++    }
++
+     /// Emit the same canonical stream as [`Self::encode_into`], observing
+     /// contiguous chunks after each entry while the existing entry CRC is
+     /// updated. This lets a new format add a streaming digest without a second
+@@ -666,6 +687,7 @@ impl<'a> CanonicalWalEntryStream<'a> {
+     where
+         F: FnMut(&[u8]) -> Result<()>,
+     {
++        crate::wal_attribution!(EntryEncode);
+         ensure!(
+             dst.len() >= self.data_len,
+             "v5 entry stream output buffer is too small"
+@@ -1932,3 +1954,35 @@ mod tests {
+         }
+     }
+ }
++
++#[cfg(feature = "bench")]
++fn write_entry_without_crc_probe(dst: &mut [u8], pos: usize, entry: &WalEntry) -> Result<usize> {
++    let (kind, fields): (u8, &[&[u8]]) = match entry {
++        WalEntry::Put { key, value } => (1, &[key.as_slice(), value.as_slice()]),
++        WalEntry::PointDelete { key } => (2, &[key.as_slice()]),
++        WalEntry::RangeDelete { start, end } => (3, &[start.as_slice(), end.as_slice()]),
++    };
++    let payload_len: usize = fields.iter().map(|field| 4 + field.len()).sum();
++    let mut header = [0_u8; 6];
++    header[0] = kind;
++    header[2..6].copy_from_slice(
++        &u32::try_from(payload_len)
++            .context("v5 payload too large")?
++            .to_be_bytes(),
++    );
++    let mut at = pos;
++    dst[at..at + header.len()].copy_from_slice(&header);
++    at += header.len();
++
++    for field in fields {
++        let prefix = u32::try_from(field.len())
++            .context("v5 field too large")?
++            .to_be_bytes();
++        dst[at..at + prefix.len()].copy_from_slice(&prefix);
++        at += prefix.len();
++        dst[at..at + field.len()].copy_from_slice(field);
++        at += field.len();
++    }
++
++    Ok(at)
++}
+diff --git a/kv-engine/src/profiling.rs b/kv-engine/src/profiling.rs
+index df4b9776..b5a53a8d 100644
+--- a/kv-engine/src/profiling.rs
++++ b/kv-engine/src/profiling.rs
+@@ -44,3 +44,26 @@ macro_rules! profile_scope {
+         }
+     }};
+ }
++
++#[cfg(feature = "bench")]
++pub mod wal_attribution;
++
++#[macro_export]
++macro_rules! wal_attribution {
++    ($phase:ident) => {
++        #[cfg(feature = "bench")]
++        let _wal_attribution_scope = $crate::profiling::wal_attribution::scope(
++            $crate::profiling::wal_attribution::Phase::$phase,
++        );
++    };
++    ($phase:ident, $expr:expr) => {{
++        #[cfg(feature = "bench")]
++        let _wal_attribution_scope = $crate::profiling::wal_attribution::scope(
++            $crate::profiling::wal_attribution::Phase::$phase,
++        );
++        $expr
++    }};
++}
++
++#[cfg(feature = "bench")]
++pub mod wal_preparation;
+diff --git a/kv-engine/src/wal.rs b/kv-engine/src/wal.rs
+index 3e6d93b1..2ae66a08 100644
+--- a/kv-engine/src/wal.rs
++++ b/kv-engine/src/wal.rs
+@@ -138,6 +138,7 @@ unsafe impl Send for DirectBuf {}
+ 
+ impl DirectBuf {
+     pub(crate) fn new(size: usize) -> Self {
++        crate::wal_attribution!(DirectAlloc);
+         // Cap must be 4KB-aligned to prevent io_uring out-of-bounds reads.
+         // align_up() rounds write sizes to 4KB; if cap is smaller, io_uring
+         // reads past the allocation.
+diff --git a/kv-engine/src/wal/parallel/runtime.rs b/kv-engine/src/wal/parallel/runtime.rs
+index 6e5fb40d..5890af8b 100644
+--- a/kv-engine/src/wal/parallel/runtime.rs
++++ b/kv-engine/src/wal/parallel/runtime.rs
+@@ -2344,7 +2344,10 @@ fn pack_admitted_groups(
+                         input.commit_ts > prefix.last_commit_ts,
+                         "v7 packer commit timestamp does not advance"
+                     );
+-                    prefix.logical_hasher.update(input.logical_batch.as_bytes());
++                    crate::wal_attribution!(
++                        V7LogicalHash,
++                        prefix.logical_hasher.update(input.logical_batch.as_bytes())
++                    );
+                     prefix.last_commit_ts = input.commit_ts;
+                 }
+                 publish_v7_prefix(inner, expected_ticket, prefix)
+@@ -2540,7 +2543,10 @@ fn materialize_v7_batch(batch: &mut AdmittedBatch, prefix: &mut WalV7PrefixMetad
+         "v7 packer commit timestamp does not advance"
+     );
+     frame_v7_batch(batch, &input)?;
+-    prefix.logical_hasher.update(input.logical_batch.as_bytes());
++    crate::wal_attribution!(
++        V7LogicalHash,
++        prefix.logical_hasher.update(input.logical_batch.as_bytes())
++    );
+     prefix.last_commit_ts = input.commit_ts;
+ 
+     Ok(())
+diff --git a/kv-engine/src/wal/v7/codec.rs b/kv-engine/src/wal/v7/codec.rs
+index 9a472c75..498e5912 100644
+--- a/kv-engine/src/wal/v7/codec.rs
++++ b/kv-engine/src/wal/v7/codec.rs
+@@ -484,6 +484,7 @@ impl EncodedWalV7LogicalBatch {
+         segment_ticket: u64,
+         output: &mut [u8],
+     ) -> Result<usize> {
++        crate::wal_attribution!(Frame);
+         ensure!(
+             self.segment_ticket == segment_ticket,
+             "v7 logical batch ticket does not match its DATA frame assignment"
+@@ -569,6 +570,7 @@ impl PreparedWalV7LogicalBatch<'_> {
+     /// Encode the canonical entries before ordered admission takes its mutex.
+     /// The logical header is reserved and filled once the ticket is assigned.
+     pub(crate) fn encode_entry_stream(self) -> Result<EncodedWalV7Entries> {
++        crate::wal_attribution!(Encode);
+         let Self {
+             batch: _,
+             canonical,
+@@ -581,7 +583,7 @@ impl PreparedWalV7LogicalBatch<'_> {
+             WAL_V7_LOGICAL_BATCH_HEADER_LEN + entry_stream_len
+         );
+ 
+-        let mut output = vec![0; logical_len];
++        let mut output = crate::wal_attribution!(LogicalAlloc, vec![0; logical_len]);
+         let entry_stream = &mut output[WAL_V7_LOGICAL_BATCH_HEADER_LEN..];
+         let (written, entry_stream_crc) = canonical.encode_into(entry_stream)?;
+         ensure!(
+diff --git a/kv-engine/src/wal/v8/digest.rs b/kv-engine/src/wal/v8/digest.rs
+index 29cdf14b..5057cb4a 100644
+--- a/kv-engine/src/wal/v8/digest.rs
++++ b/kv-engine/src/wal/v8/digest.rs
+@@ -148,6 +148,8 @@ impl WalV8EntryHasher {
+ 
+         #[cfg(feature = "bench")]
+         let started = self.measure_cpu.then(thread_cpu_time_ns);
++        #[cfg(feature = "bench")]
++        crate::profiling::wal_attribution::hash_update(canonical_bytes.len());
+         self.hasher.update(canonical_bytes);
+         #[cfg(feature = "bench")]
+         if let Some(started) = started {
+diff --git a/kv-engine/src/wal/v8/prepare.rs b/kv-engine/src/wal/v8/prepare.rs
+index 2f9c5d46..fa3893a3 100644
+--- a/kv-engine/src/wal/v8/prepare.rs
++++ b/kv-engine/src/wal/v8/prepare.rs
+@@ -247,6 +247,7 @@ impl<G: WalV8AdmissionGuard, R> AdmittedWalV8Batch<'_, G, R> {
+     /// Encode canonical entries while updating CRC and BLAKE3 from the same
+     /// emitted slices, then finalize the assigned logical header and batch hash.
+     pub(crate) fn encode(self) -> Result<EncodedWalV8Batch<G>> {
++        crate::wal_attribution!(Encode);
+         let Self {
+             preparation_reservation,
+             canonical,
+@@ -259,11 +260,14 @@ impl<G: WalV8AdmissionGuard, R> AdmittedWalV8Batch<'_, G, R> {
+         } = self;
+         let entry_stream_len = canonical.data_len();
+         let entry_count = canonical.entry_count();
+-        let mut logical_batch = Vec::new();
+-        logical_batch
+-            .try_reserve_exact(logical_batch_bytes)
+-            .context("reserve admitted v8 logical batch bytes")?;
+-        logical_batch.resize(logical_batch_bytes, 0);
++        let mut logical_batch = crate::wal_attribution!(LogicalAlloc, {
++            let mut logical_batch = Vec::new();
++            logical_batch
++                .try_reserve_exact(logical_batch_bytes)
++                .context("reserve admitted v8 logical batch bytes")?;
++            logical_batch.resize(logical_batch_bytes, 0);
++            logical_batch
++        });
+ 
+         let expected_entry_len = u64::try_from(entry_stream_len)?;
+         #[cfg(feature = "bench")]
+@@ -398,6 +402,7 @@ impl<G: WalV8AdmissionGuard> EncodedWalV8Batch<G> {
+     }
+ 
+     fn encode_data_frames(&self, output: &mut [u8]) -> Result<usize> {
++        crate::wal_attribution!(Frame);
+         ensure!(
+             output.len() >= self.frame_buffer_bytes,
+             "v8 DATA frame output buffer is too small"
+--- /dev/null
++++ b/kv-engine/src/profiling/wal_attribution.rs
+@@ -0,0 +1,305 @@
++//! Temporary, opt-in timed-interval WAL attribution. Scope timings are sampled
++//! and inclusive. Allocation counts cover active-interval Rust allocations and
++//! separately instrumented native aligned buffers.
++
++use serde::Serialize;
++use std::{
++    cell::{Cell, RefCell},
++    sync::{
++        Mutex,
++        atomic::{AtomicBool, Ordering},
++    },
++    time::Instant,
++};
++
++pub static ACTIVE: AtomicBool = AtomicBool::new(false);
++const SAMPLE_RATE: u64 = 64;
++const COUNT: usize = 36;
++#[derive(Clone, Copy)]
++#[repr(usize)]
++pub enum Phase {
++    Producer,
++    Preflight,
++    Encode,
++    Frame,
++    DirectAlloc,
++    Admit,
++    Digest,
++    FramesReady,
++    DataComplete,
++    ReserveFrontier,
++    PublishDurable,
++    Snapshot,
++    Coalesce,
++    CoordinatorLock,
++    SubmissionLock,
++    SubmitData,
++    PackData,
++    WorkerSubmit,
++    WorkerCqe,
++    CompletionReceive,
++    CompletionPublish,
++    FrontierEncode,
++    FrontierWrite,
++    FrontierSync,
++    ResourcesRetire,
++    GuardsRetire,
++    V7Materialize,
++    V7SyncCycle,
++    WorkerReceive,
++    MemtablePublish,
++    MvccPublish,
++    V7LogicalHash,
++    FrontierLock,
++    CoordinatorWait,
++    LogicalAlloc,
++    EntryEncode,
++}
++const NAMES: [&str; COUNT] = [
++    "producer",
++    "preflight",
++    "encode",
++    "frame",
++    "direct_alloc",
++    "admit",
++    "digest_ready",
++    "frames_ready",
++    "data_complete",
++    "reserve_frontier",
++    "publish_durable",
++    "snapshot",
++    "coalesce",
++    "coordinator_lock_wait",
++    "submission_lock_wait",
++    "submit_data",
++    "pack_data",
++    "worker_submit",
++    "worker_cqe",
++    "completion_receive",
++    "completion_publish",
++    "frontier_encode",
++    "frontier_write",
++    "frontier_sync",
++    "resources_retire",
++    "guards_retire",
++    "v7_materialize",
++    "v7_sync_cycle",
++    "worker_receive",
++    "memtable_publish",
++    "mvcc_publish",
++    "v7_logical_hash",
++    "frontier_lock_wait",
++    "coordinator_wait",
++    "logical_alloc",
++    "entry_encode",
++];
++
++#[derive(Clone, Copy, Default, Serialize)]
++struct Bucket {
++    calls: u64,
++    samples: u64,
++    cpu_ns: u64,
++    wall_ns: u64,
++}
++#[derive(Clone, Copy, Default, Serialize)]
++struct Usage {
++    user_us: u64,
++    system_us: u64,
++    voluntary: u64,
++    involuntary: u64,
++    minor_faults: u64,
++    major_faults: u64,
++}
++#[derive(Serialize)]
++struct ThreadStats {
++    tid: u32,
++    name: String,
++    buckets: Vec<Bucket>,
++    first_usage: Usage,
++    last_usage: Usage,
++    allocations: [u64; 8],
++    hash_updates: [u64; 8],
++}
++static THREADS: Mutex<Vec<ThreadStats>> = Mutex::new(Vec::new());
++static PROCESS: Mutex<(Usage, Usage)> = Mutex::new((
++    Usage {
++        user_us: 0,
++        system_us: 0,
++        voluntary: 0,
++        involuntary: 0,
++        minor_faults: 0,
++        major_faults: 0,
++    },
++    Usage {
++        user_us: 0,
++        system_us: 0,
++        voluntary: 0,
++        involuntary: 0,
++        minor_faults: 0,
++        major_faults: 0,
++    },
++));
++struct LocalStats(Option<ThreadStats>);
++impl Drop for LocalStats {
++    fn drop(&mut self) {
++        if let Some(mut stats) = self.0.take() {
++            stats.allocations = ALLOCATIONS.try_with(Cell::get).unwrap_or_default();
++            THREADS.lock().unwrap().push(stats);
++        }
++    }
++}
++thread_local! {
++    static LOCAL: RefCell<LocalStats> = const { RefCell::new(LocalStats(None)) };
++    static ALLOCATIONS: Cell<[u64; 8]> = const { Cell::new([0; 8]) };
++}
++
++pub fn allocation(event: usize, bytes: usize) {
++    if ACTIVE.load(Ordering::Relaxed) {
++        let _ = ALLOCATIONS.try_with(|cell| {
++            let mut counters = cell.get();
++            counters[event] += 1;
++            counters[event + 1] += bytes as u64;
++            cell.set(counters);
++        });
++    }
++}
++
++fn usage(who: i32) -> Usage {
++    let mut raw = std::mem::MaybeUninit::<libc::rusage>::uninit();
++    // SAFETY: getrusage initializes the supplied struct on success.
++    if unsafe { libc::getrusage(who, raw.as_mut_ptr()) } != 0 {
++        return Usage::default();
++    }
++    // SAFETY: successful getrusage initialized the value.
++    let raw = unsafe { raw.assume_init() };
++    Usage {
++        user_us: (raw.ru_utime.tv_sec * 1_000_000 + raw.ru_utime.tv_usec) as u64,
++        system_us: (raw.ru_stime.tv_sec * 1_000_000 + raw.ru_stime.tv_usec) as u64,
++        voluntary: raw.ru_nvcsw as u64,
++        involuntary: raw.ru_nivcsw as u64,
++        minor_faults: raw.ru_minflt as u64,
++        major_faults: raw.ru_majflt as u64,
++    }
++}
++
++pub struct Scope {
++    phase: usize,
++    started: Instant,
++    cpu: u64,
++}
++pub fn scope(phase: Phase) -> Option<Scope> {
++    if !ACTIVE.load(Ordering::Relaxed) {
++        return None;
++    }
++    let sampled = LOCAL.with(|cell| {
++        let mut local = cell.borrow_mut();
++        let stats = local.0.get_or_insert_with(|| ThreadStats {
++            // SAFETY: gettid has no memory arguments.
++            tid: unsafe { libc::syscall(libc::SYS_gettid) as u32 },
++            name: std::thread::current()
++                .name()
++                .unwrap_or("producer")
++                .to_owned(),
++            buckets: vec![Bucket::default(); COUNT],
++            first_usage: usage(libc::RUSAGE_THREAD),
++            last_usage: Usage::default(),
++            allocations: [0; 8],
++            hash_updates: [0; 8],
++        });
++        let b = &mut stats.buckets[phase as usize];
++        b.calls += 1;
++        b.calls % SAMPLE_RATE == 1
++    });
++    sampled.then(|| Scope {
++        phase: phase as usize,
++        started: Instant::now(),
++        cpu: crate::wal::v8::digest::thread_cpu_time_ns(),
++    })
++}
++impl Drop for Scope {
++    fn drop(&mut self) {
++        let cpu = crate::wal::v8::digest::thread_cpu_time_ns().saturating_sub(self.cpu);
++        let wall = self.started.elapsed().as_nanos() as u64;
++        if !ACTIVE.load(Ordering::Relaxed) {
++            return;
++        }
++        LOCAL.with(|cell| {
++            if let Some(stats) = cell.borrow_mut().0.as_mut() {
++                let b = &mut stats.buckets[self.phase];
++                b.samples += 1;
++                b.cpu_ns += cpu;
++                b.wall_ns += wall;
++                stats.last_usage = usage(libc::RUSAGE_THREAD);
++            }
++        });
++    }
++}
++
++pub fn begin() {
++    if std::env::var_os("TOYKV_WAL_ATTRIBUTION").is_none() {
++        return;
++    }
++    *THREADS.lock().unwrap() = Vec::with_capacity(128);
++    PROCESS.lock().unwrap().0 = usage(libc::RUSAGE_SELF);
++    ACTIVE.store(true, Ordering::Release);
++}
++pub fn producer_finished() {
++    if ACTIVE.load(Ordering::Relaxed) {
++        LOCAL.with(|cell| {
++            if let Some(stats) = cell.borrow_mut().0.as_mut() {
++                stats.last_usage = usage(libc::RUSAGE_THREAD);
++            }
++        });
++    }
++}
++pub fn end() {
++    if ACTIVE.swap(false, Ordering::AcqRel) {
++        PROCESS.lock().unwrap().1 = usage(libc::RUSAGE_SELF);
++    }
++}
++pub fn finish() -> anyhow::Result<()> {
++    let Some(path) = std::env::var_os("TOYKV_WAL_ATTRIBUTION") else {
++        return Ok(());
++    };
++    LOCAL.with(|cell| {
++        cell.borrow_mut()
++            .0
++            .take()
++            .map(|s| drop(LocalStats(Some(s))));
++    });
++    let threads = THREADS.lock().unwrap();
++    let process = PROCESS.lock().unwrap();
++    serde_json::to_writer_pretty(
++        std::fs::File::create(path)?,
++        &serde_json::json!({
++            "sample_rate": SAMPLE_RATE, "scopes_are_inclusive": true,
++            "allocator_probe_enabled": false,
++            "hash_update_fields": ["bytes_le_64", "bytes_le_256", "bytes_le_1024", "bytes_le_4096", "bytes_le_16384", "bytes_le_65536", "bytes_gt_65536", "total_bytes"],
++            "allocation_fields": ["rust_alloc_calls", "rust_alloc_bytes", "rust_free_calls", "rust_free_bytes", "native_alloc_calls", "native_alloc_bytes", "native_free_calls", "native_free_bytes"],
++            "phase_names": &NAMES[..], "process_before": process.0, "process_after": process.1, "threads": *threads,
++        }),
++    )?;
++    Ok(())
++}
++
++/// Payload update histogram; no clocks are read here.
++pub fn hash_update(bytes: usize) {
++    if !ACTIVE.load(Ordering::Relaxed) {
++        return;
++    }
++    LOCAL.with(|cell| {
++        if let Some(stats) = cell.borrow_mut().0.as_mut() {
++            let bucket = match bytes {
++                0..=64 => 0,
++                65..=256 => 1,
++                257..=1024 => 2,
++                1025..=4096 => 3,
++                4097..=16384 => 4,
++                16385..=65536 => 5,
++                _ => 6,
++            };
++            stats.hash_updates[bucket] += 1;
++            stats.hash_updates[7] += bytes as u64;
++        }
++    });
++}
+--- /dev/null
++++ b/kv-engine/src/profiling/wal_preparation.rs
+@@ -0,0 +1,220 @@
++//! Temporary CPU-only attribution, with real canonical and frame codecs.
++
++use std::{hint::black_box, time::Instant};
++
++use anyhow::{Result, ensure};
++use serde::Serialize;
++use sha2::{Digest, Sha256};
++
++use crate::{
++    pitr::{CanonicalWalEntryStream, LIVE_WAL_V5_LIMITS, RecordedAt, WalBatch, WalEntry},
++    wal::{
++        DirectBuf,
++        v7::codec as v7,
++        v8::{codec as v8, digest},
++    },
++};
++
++#[derive(Serialize)]
++struct Sample {
++    entries: usize,
++    entry_bytes: usize,
++    frame_bytes: usize,
++    round: usize,
++    stage: &'static str,
++    iterations: usize,
++    cpu_ns: u64,
++    wall_ns: u64,
++}
++
++fn frame_v8(logical: &[u8], output: &mut [u8]) -> Result<()> {
++    let count = v8::data_fragment_count(logical.len() as u64).unwrap();
++    for (index, payload) in logical
++        .chunks(v8::WAL_V8_DATA_FRAGMENT_PAYLOAD_CAPACITY)
++        .enumerate()
++    {
++        v8::encode_data_fragment_frame_into(
++            [3; 32],
++            [4; 32],
++            8192 + (index * 4096) as u64,
++            v8::WalV8DataFragmentHeader {
++                segment_ticket: 0,
++                fragment_index: index as u32,
++                fragment_count: count,
++                batch_bytes: logical.len() as u64,
++            },
++            payload,
++            &mut output[index * 4096..(index + 1) * 4096],
++        )?;
++    }
++    Ok(())
++}
++
++pub fn run_if_requested() -> Result<bool> {
++    let Some(path) = std::env::var_os("TOYKV_PREPARATION_MICRO") else {
++        return Ok(false);
++    };
++    let mut samples = Vec::new();
++    let stages = [
++        "copy_without_crc",
++        "encode_entry_crc",
++        "encode_crc_inline_blake3",
++        "blake3_only",
++        "sha256_only",
++        "frame_crc_only",
++        "v7_frame_codec",
++        "v8_frame_codec",
++    ];
++    for entries in [2, 8, 64] {
++        let batch = WalBatch {
++            commit_ts: 1,
++            recorded_at: RecordedAt { secs: 1, nanos: 0 },
++            entries: (0..entries)
++                .map(|i| {
++                    let mut key = vec![0];
++                    key.extend_from_slice(format!("key{i:08}").as_bytes());
++                    WalEntry::Put {
++                        key,
++                        value: vec![b'x'; 1024],
++                    }
++                })
++                .collect(),
++        };
++        let canonical = CanonicalWalEntryStream::new(&batch, LIVE_WAL_V5_LIMITS)?;
++        let len = canonical.data_len();
++        let mut reference = vec![0; len];
++        let (_, crc) = canonical.encode_into(&mut reference)?;
++        ensure!(
++            crc == crc32fast::hash(&reference),
++            "canonical CRC probe mismatch"
++        );
++        let mut output = vec![0; len];
++        canonical.encode_without_crc_probe(&mut output)?;
++        ensure!(
++            output == reference,
++            "copy-only reference changes wire bytes"
++        );
++        let mut hasher = digest::WalV8EntryHasher::new(len as u64);
++        hasher.update(&reference)?;
++        let expected_digest = hasher.finish()?;
++        let mut inline = digest::WalV8EntryHasher::new(len as u64);
++        let (_, observed_crc) =
++            canonical.encode_into_with_observer(&mut output, |range| inline.update(range))?;
++        ensure!(
++            output == reference && observed_crc == crc && inline.finish()? == expected_digest,
++            "inline probe changes canonical bytes, CRC or digest"
++        );
++
++        let encoded_v7 = v7::prepare_logical_batch(&batch, LIVE_WAL_V5_LIMITS)?
++            .encode_entry_stream()?
++            .into_logical_batch(0, 1, batch.recorded_at)?;
++        let header = v8::WalV8LogicalBatchHeader {
++            segment_ticket: 0,
++            commit_ts: 1,
++            recorded_at_secs: 1,
++            recorded_at_nanos: 0,
++            entry_count: canonical.entry_count(),
++        }
++        .encode_with_data_crc(len, crc, LIVE_WAL_V5_LIMITS)?;
++        let mut logical = header.to_vec();
++        logical.extend_from_slice(&reference);
++        ensure!(
++            encoded_v7.as_bytes() == logical,
++            "v7/v8 canonical logical bytes differ"
++        );
++        let frame_bytes = v8::data_fragment_count(logical.len() as u64).unwrap() as usize * 4096;
++        let mut frames = DirectBuf::new(frame_bytes);
++        frame_v8(&logical, frames.as_mut_slice())?;
++        for (index, frame) in frames.as_mut_slice().chunks_exact(4096).enumerate() {
++            v8::decode_frame_structural(frame, 8192 + (index * 4096) as u64, &[3; 32], &[4; 32])?;
++        }
++        let mut v7_frames = DirectBuf::new(frame_bytes);
++        encoded_v7.encode_data_frames_into([3; 32], 8192, 0, v7_frames.as_mut_slice())?;
++
++        // Measure a whole repeated stage with two clock reads, rather than
++        // timing every tiny CRC update. Buffers and canonical indexes are reused.
++        for round in 0..8 {
++            let order: Vec<usize> = if round % 2 == 0 {
++                (0..stages.len()).collect()
++            } else {
++                (0..stages.len()).rev().collect()
++            };
++            for stage in order {
++                let iterations = if round == 0 { 200 } else { 2000 };
++                let cpu_start = digest::thread_cpu_time_ns();
++                let wall_start = Instant::now();
++                for _ in 0..iterations {
++                    match stage {
++                        0 => {
++                            black_box(canonical.encode_without_crc_probe(black_box(&mut output))?);
++                        }
++                        1 => {
++                            black_box(canonical.encode_into(black_box(&mut output))?);
++                        }
++                        2 => {
++                            let mut inline = digest::WalV8EntryHasher::new(len as u64);
++                            black_box(
++                                canonical
++                                    .encode_into_with_observer(black_box(&mut output), |range| {
++                                        inline.update(range)
++                                    })?,
++                            );
++                            black_box(inline.finish()?);
++                        }
++                        3 => {
++                            let mut hash = digest::WalV8EntryHasher::new(len as u64);
++                            hash.update(black_box(&reference))?;
++                            black_box(hash.finish()?);
++                        }
++                        4 => {
++                            black_box(Sha256::digest(black_box(encoded_v7.as_bytes())));
++                        }
++                        5 => {
++                            for frame in black_box(frames.as_mut_slice()).chunks_exact(4096) {
++                                let mut crc = crc32fast::Hasher::new();
++                                crc.update(&frame[..60]);
++                                crc.update(&frame[64..]);
++                                black_box(crc.finalize());
++                            }
++                        }
++                        6 => {
++                            black_box(encoded_v7.encode_data_frames_into(
++                                [3; 32],
++                                8192,
++                                0,
++                                black_box(v7_frames.as_mut_slice()),
++                            )?);
++                        }
++                        7 => {
++                            frame_v8(black_box(&logical), black_box(frames.as_mut_slice()))?;
++                        }
++                        _ => unreachable!(),
++                    }
++                }
++                let cpu_ns = digest::thread_cpu_time_ns().saturating_sub(cpu_start);
++                let wall_ns = wall_start.elapsed().as_nanos() as u64;
++                if round > 0 {
++                    samples.push(Sample {
++                        entries,
++                        entry_bytes: len,
++                        frame_bytes,
++                        round,
++                        stage: stages[stage],
++                        iterations,
++                        cpu_ns,
++                        wall_ns,
++                    });
++                }
++            }
++        }
++    }
++    std::fs::write(
++        path,
++        serde_json::to_vec_pretty(&serde_json::json!({
++            "method": "Seven CPU-only rounds, one warmup, reversed stage order; reusable buffers; real canonical and frame codecs; copy-only diagnostic clone omits CRC only; no SSD or candidate retained",
++            "all_canonical_bytes_crcs_and_entry_digests_validated": true,
++            "samples": samples,
++        }))?,
++    )?;
++    Ok(true)
++}

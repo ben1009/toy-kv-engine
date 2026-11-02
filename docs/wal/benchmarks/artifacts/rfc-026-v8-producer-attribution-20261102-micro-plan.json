@@ -1,0 +1,15 @@
+{
+  "cpu": 31,
+  "binary_sha256": "fbb90ea8a6f20bf476760e79ae60e04cda3edae04138d45ae5a9e6346da299f1",
+  "cases": [
+    2,
+    8,
+    64
+  ],
+  "value_bytes": 1024,
+  "entry_key_bytes": 12,
+  "warmup_rounds": 1,
+  "scored_rounds": 7,
+  "iterations_per_stage": 2000,
+  "method": "Each whole repeated stage timed with one CPU clock pair; reused buffers, single pinned CPU, no SSD I/O; temporary phase sampler disabled; CRC/BLAKE3/backend unchanged."
+}
