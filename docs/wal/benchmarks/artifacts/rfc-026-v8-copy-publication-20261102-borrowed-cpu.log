@@ -1,0 +1,24 @@
+   Compiling regex-syntax v0.8.10
+   Compiling regex-automata v0.4.14
+   Compiling regex v1.12.3
+   Compiling criterion v0.5.1
+   Compiling kv-engine v0.1.0 (/home/liu/proj/toy-kv-engine/kv-engine)
+    Finished `release` profile [optimized] target(s) in 36.21s
+     Running unittests src/lib.rs (target/release/build/kv-engine/3c83dedc813beaf3/out/kv_engine-3c83dedc813beaf3)
+
+running 1 test
+round=0 borrowed=false us_per_batch=40.529
+round=0 borrowed=true us_per_batch=27.214
+round=1 borrowed=true us_per_batch=27.211
+round=1 borrowed=false us_per_batch=35.558
+round=2 borrowed=false us_per_batch=35.692
+round=2 borrowed=true us_per_batch=27.225
+round=3 borrowed=true us_per_batch=27.183
+round=3 borrowed=false us_per_batch=67.092
+round=4 borrowed=false us_per_batch=35.223
+round=4 borrowed=true us_per_batch=27.150
+round=5 borrowed=true us_per_batch=27.150
+round=5 borrowed=false us_per_batch=35.218
+test wal::v8::prepare::tests::benchmark_borrowed_input_cpu ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1799 filtered out; finished in 1.24s

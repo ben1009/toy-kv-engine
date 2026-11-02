@@ -1,0 +1,648 @@
+--- a/kv-engine/src/mem_table.rs
++++ b/kv-engine/src/mem_table.rs
+@@ -2460,6 +2460,18 @@
+     }
+ 
+     /// Preflight a v8 batch before entering the MVCC commit sequencer.
++    pub(crate) fn prepare_v8_pitr_point_batch<'a>(
++        &self,
++        entries: &'a [(Bytes, Bytes, crate::mvcc::BatchEntryKind)],
++        limits: crate::pitr::WalV5Limits,
++    ) -> Result<crate::wal::v8::leader::WalV8PreparedBatch<'a>> {
++        self.wal
++            .as_ref()
++            .context("PITR WAL is not configured")?
++            .preflight_v8_parallel_points(entries, limits)
++    }
++
++    /// Preflight a v8 batch before entering the MVCC commit sequencer.
+     pub(crate) fn prepare_v8_pitr_wal_batch<'a>(
+         &self,
+         batch: &'a crate::pitr::WalBatch,
+--- a/kv-engine/src/mvcc.rs
++++ b/kv-engine/src/mvcc.rs
+@@ -1406,7 +1406,7 @@
+                 None
+             };
+         let prepare_v8 = memtable.uses_v8_wal() && memtable.uses_parallel_wal();
+-        let preparation_batch = if v7_sampled_recorded_at.is_some() || prepare_v8 {
++        let preparation_batch = if v7_sampled_recorded_at.is_some() {
+             Some(crate::pitr::WalBatch {
+                 // Canonical entry preparation does not depend on these
+                 // sequencer-owned values. V7 substitutes its pre-sampled time;
+@@ -1445,11 +1445,10 @@
+             }
+             _ => None,
+         };
+-        let prepared_v8 = match (prepare_v8, preparation_batch.as_ref()) {
+-            (true, Some(batch)) => {
+-                Some(memtable.prepare_v8_pitr_wal_batch(batch, crate::pitr::LIVE_WAL_V5_LIMITS)?)
+-            }
+-            _ => None,
++        let prepared_v8 = if prepare_v8 {
++            Some(memtable.prepare_v8_pitr_point_batch(entries, crate::pitr::LIVE_WAL_V5_LIMITS)?)
++        } else {
++            None
+         };
+ 
+         let _write_guard = write_guard.unwrap_or_else(|| self.write_lock.lock());
+--- a/kv-engine/src/wal/v8/leader.rs
++++ b/kv-engine/src/wal/v8/leader.rs
+@@ -1468,6 +1468,31 @@
+ }
+ 
+ impl WalV8ParallelWriter {
++    pub(crate) fn preflight_points<'a>(
++        &self,
++        entries: &'a [(bytes::Bytes, bytes::Bytes, crate::mvcc::BatchEntryKind)],
++        limits: WalV5Limits,
++    ) -> Result<WalV8PreparedBatch<'a>> {
++        ensure!(!self.is_poisoned(), "v8 Parallel WAL is poisoned");
++        PreparedWalV8Batch::preflight_points(entries, bounded_limits(limits), |bytes| {
++            ensure!(
++                bytes <= self.max_file_size,
++                WalV8LeaderCapacityError::GroupExceedsAdmissionWindow
++            );
++            let source = self
++                .reservation_owner
++                .as_ref()
++                .map(|owner| owner.reserve_preparation_buffer(bytes))
++                .transpose()?
++                .flatten();
++            let coordinator = self.coordinator.reserve_preparation(bytes)?;
++            Ok(WalV8PreflightReservation {
++                _coordinator: coordinator,
++                _source: source,
++            })
++        })
++    }
++
+     #[cfg(feature = "bench")]
+     pub(crate) fn set_write_profile(&self, profile: Arc<crate::mem_table::WriteProfile>) {
+         self.io.set_profile(Arc::clone(&profile));
+--- a/kv-engine/src/wal/v8/mod.rs
++++ b/kv-engine/src/wal/v8/mod.rs
+@@ -10,6 +10,7 @@
+ pub(crate) mod install;
+ pub(crate) mod leader;
+ pub(crate) mod parallel;
++mod point;
+ pub(crate) mod prepare;
+ pub(crate) mod recovery;
+ pub(crate) mod resource;
+--- /dev/null
++++ b/kv-engine/src/wal/v8/point.rs
+@@ -0,0 +1,319 @@
++//! Borrow point-batch inputs until the admitted producer encodes them.
++
++use anyhow::{Context, Result, ensure};
++use bytes::Bytes;
++
++use crate::{mvcc::BatchEntryKind, pitr::WalV5Limits};
++
++type PointEntry = (Bytes, Bytes, BatchEntryKind);
++const OBSERVER_CHUNK_BYTES: usize = 64 * 1024;
++
++pub(super) struct WalV8PointStream<'a> {
++    entries: &'a [PointEntry],
++    retained: Vec<usize>,
++    data_len: usize,
++    entry_count: u32,
++}
++
++impl<'a> WalV8PointStream<'a> {
++    pub(super) fn preparation_buffer_bytes(
++        entries: &[PointEntry],
++        limits: WalV5Limits,
++    ) -> Result<u64> {
++        let limits = limits.validate()?;
++        ensure!(!entries.is_empty(), "v8 batch must contain an entry");
++        ensure!(
++            entries.len() <= limits.max_input_entry_count && entries.len() <= u32::MAX as usize,
++            "v8 input entry count exceeds configured limit"
++        );
++        let index_count = if entries.len() > 1 { entries.len() } else { 0 };
++        let bytes = index_count
++            .checked_mul(std::mem::size_of::<usize>())
++            .context("v8 point index size overflows")?;
++        u64::try_from(bytes).context("v8 point index size exceeds u64")
++    }
++
++    pub(super) fn new(entries: &'a [PointEntry], limits: WalV5Limits) -> Result<Self> {
++        Self::preparation_buffer_bytes(entries, limits)?;
++        let mut retained = Vec::new();
++        if entries.len() > 1 {
++            retained
++                .try_reserve_exact(entries.len())
++                .context("reserve v8 point index")?;
++            retained.extend(0..entries.len());
++            // Highest input index first for each key, then retain that final
++            // operation and restore the surviving operations' input order.
++            retained.sort_unstable_by(|&left, &right| {
++                entries[left]
++                    .0
++                    .cmp(&entries[right].0)
++                    .then_with(|| right.cmp(&left))
++            });
++            retained.dedup_by(|right, left| entries[*right].0 == entries[*left].0);
++            retained.sort_unstable();
++        }
++        let entry_count = if retained.is_empty() {
++            entries.len()
++        } else {
++            retained.len()
++        };
++        ensure!(
++            entry_count <= limits.max_entry_count,
++            "v8 entry count exceeds configured limit"
++        );
++        let mut stream = Self {
++            entries,
++            retained,
++            data_len: 0,
++            entry_count: u32::try_from(entry_count)?,
++        };
++        let mut data_len = 0_usize;
++        for (key, value, kind) in stream.entries() {
++            ensure!(
++                key.len() <= limits.max_key_bytes,
++                "v8 key exceeds configured limit"
++            );
++            let len = if matches!(kind, BatchEntryKind::Delete) {
++                10_usize.checked_add(key.len())
++            } else {
++                let value_len = value
++                    .len()
++                    .checked_add(usize::from(matches!(kind, BatchEntryKind::PutRaw)))
++                    .context("v8 value length overflows")?;
++                ensure!(
++                    value_len <= limits.max_value_bytes,
++                    "v8 value exceeds configured limit"
++                );
++                14_usize
++                    .checked_add(key.len())
++                    .and_then(|len| len.checked_add(value_len))
++            }
++            .context("v8 entry size overflows")?;
++            data_len = data_len
++                .checked_add(len)
++                .context("v8 batch size overflows")?;
++            ensure!(
++                data_len <= limits.max_batch_data_bytes,
++                "v8 batch data exceeds configured limit"
++            );
++        }
++        stream.data_len = data_len;
++        Ok(stream)
++    }
++
++    fn entries(&self) -> impl Iterator<Item = &PointEntry> {
++        (0..self.entry_count as usize)
++            .map(|index| &self.entries[self.retained.get(index).copied().unwrap_or(index)])
++    }
++
++    pub(super) fn data_len(&self) -> usize {
++        self.data_len
++    }
++
++    pub(super) fn entry_count(&self) -> u32 {
++        self.entry_count
++    }
++
++    pub(super) fn encode_into_with_observer<F>(
++        &self,
++        dst: &mut [u8],
++        mut observe: F,
++    ) -> Result<(usize, u32)>
++    where
++        F: FnMut(&[u8]) -> Result<()>,
++    {
++        ensure!(
++            dst.len() >= self.data_len,
++            "v8 point entry output buffer is too small"
++        );
++        let mut crc = crc32fast::Hasher::new();
++        let mut pos = 0;
++        let mut observed = 0;
++        for (key, value, kind) in self.entries() {
++            let put = !matches!(kind, BatchEntryKind::Delete);
++            let raw = matches!(kind, BatchEntryKind::PutRaw);
++            let value_len = value.len() + usize::from(raw);
++            let payload_len = if put {
++                8 + key.len() + value_len
++            } else {
++                4 + key.len()
++            };
++            let mut header = [0; 6];
++            header[0] = if put { 1 } else { 2 };
++            header[2..].copy_from_slice(&u32::try_from(payload_len)?.to_be_bytes());
++            for bytes in [
++                &header[..],
++                &u32::try_from(key.len())?.to_be_bytes(),
++                &key[..],
++            ] {
++                emit(dst, &mut pos, &mut crc, bytes);
++            }
++            if put {
++                emit(
++                    dst,
++                    &mut pos,
++                    &mut crc,
++                    &u32::try_from(value_len)?.to_be_bytes(),
++                );
++                if raw {
++                    emit(
++                        dst,
++                        &mut pos,
++                        &mut crc,
++                        &[crate::vlog::KvKind::Inline as u8],
++                    );
++                }
++                emit(dst, &mut pos, &mut crc, value);
++            }
++            if pos - observed >= OBSERVER_CHUNK_BYTES {
++                observe(&dst[observed..pos])?;
++                observed = pos;
++            }
++        }
++        if observed < pos {
++            observe(&dst[observed..pos])?;
++        }
++        ensure!(
++            pos == self.data_len,
++            "v8 point entry stream length changed while encoding"
++        );
++        Ok((pos, crc.finalize()))
++    }
++}
++
++fn emit(dst: &mut [u8], pos: &mut usize, crc: &mut crc32fast::Hasher, bytes: &[u8]) {
++    dst[*pos..*pos + bytes.len()].copy_from_slice(bytes);
++    crc.update(bytes);
++    *pos += bytes.len();
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::pitr::{CanonicalWalEntryStream, RecordedAt, WalBatch, WalEntry};
++
++    pub(super) fn owned(entries: &[PointEntry]) -> WalBatch {
++        WalBatch {
++            commit_ts: 17,
++            recorded_at: RecordedAt { secs: -2, nanos: 7 },
++            entries: entries
++                .iter()
++                .map(|(key, value, kind)| match kind {
++                    BatchEntryKind::Delete => WalEntry::PointDelete { key: key.to_vec() },
++                    BatchEntryKind::PutPrefixed => WalEntry::Put {
++                        key: key.to_vec(),
++                        value: value.to_vec(),
++                    },
++                    BatchEntryKind::PutRaw => {
++                        let mut bytes = vec![crate::vlog::KvKind::Inline as u8];
++                        bytes.extend_from_slice(value);
++                        WalEntry::Put {
++                            key: key.to_vec(),
++                            value: bytes,
++                        }
++                    }
++                })
++                .collect(),
++        }
++    }
++
++    #[test]
++    fn borrowed_point_stream_matches_owned_codec_with_duplicate_and_raw_points() -> Result<()> {
++        let limits = crate::pitr::LIVE_WAL_V5_LIMITS;
++        let pool = [
++            (
++                Bytes::from_static(b"a"),
++                Bytes::from_static(b""),
++                BatchEntryKind::PutRaw,
++            ),
++            (
++                Bytes::from_static(b"b"),
++                Bytes::from_static(b"\x01b"),
++                BatchEntryKind::PutPrefixed,
++            ),
++            (
++                Bytes::from_static(b"a"),
++                Bytes::from_static(b"ignored"),
++                BatchEntryKind::Delete,
++            ),
++            (
++                Bytes::from_static(b"b"),
++                Bytes::from_static(b"\x02"),
++                BatchEntryKind::PutRaw,
++            ),
++        ];
++        for mut pattern in 0..256 {
++            let mut entries = Vec::new();
++            for _ in 0..4 {
++                entries.push(pool[pattern % pool.len()].clone());
++                pattern /= pool.len();
++            }
++            let batch = owned(&entries);
++            let expected = CanonicalWalEntryStream::new(&batch, limits)?;
++            let stream = WalV8PointStream::new(&entries, limits)?;
++            assert_eq!(stream.entry_count(), expected.entry_count());
++            let mut bytes = vec![0; stream.data_len()];
++            let mut reference = vec![0; expected.data_len()];
++            let expected_crc = expected.encode_into(&mut reference)?.1;
++            let mut observed = Vec::new();
++            let (_, crc) = stream.encode_into_with_observer(&mut bytes, |range| {
++                observed.extend_from_slice(range);
++                Ok(())
++            })?;
++            assert_eq!(bytes, reference);
++            assert_eq!(observed, reference);
++            assert_eq!(crc, expected_crc);
++        }
++        Ok(())
++    }
++
++    #[test]
++    fn borrowed_point_limits_apply_after_dedup_and_count_raw_value_prefix() -> Result<()> {
++        let limits = WalV5Limits {
++            max_input_entry_count: 4,
++            max_entry_count: 1,
++            max_batch_data_bytes: 64,
++            max_key_bytes: 1,
++            max_value_bytes: 2,
++        };
++        let mut entries = vec![
++            (
++                Bytes::from_static(b"a"),
++                Bytes::from_static(b"too long"),
++                BatchEntryKind::PutRaw,
++            ),
++            (
++                Bytes::from_static(b"a"),
++                Bytes::from_static(b"x"),
++                BatchEntryKind::PutRaw,
++            ),
++        ];
++        let stream = WalV8PointStream::new(&entries, limits)?;
++        assert_eq!(stream.entry_count(), 1);
++        let mut dst = vec![0xa5; stream.data_len() - 1];
++        assert!(
++            stream
++                .encode_into_with_observer(&mut dst, |_| Ok(()))
++                .is_err()
++        );
++        assert!(dst.iter().all(|&byte| byte == 0xa5));
++        entries[1].1 = Bytes::from_static(b"xx");
++        assert!(WalV8PointStream::new(&entries, limits).is_err());
++        entries[1].2 = BatchEntryKind::Delete;
++        assert!(WalV8PointStream::new(&entries, limits).is_ok());
++        entries[1].0 = Bytes::from_static(b"b");
++        assert!(WalV8PointStream::new(&entries, limits).is_err());
++        assert!(WalV8PointStream::new(&[], limits).is_err());
++        assert!(
++            WalV8PointStream::preparation_buffer_bytes(
++                &entries,
++                WalV5Limits {
++                    max_input_entry_count: 1,
++                    ..limits
++                }
++            )
++            .is_err()
++        );
++        Ok(())
++    }
++}
+--- a/kv-engine/src/wal/v8/prepare.rs
++++ b/kv-engine/src/wal/v8/prepare.rs
+@@ -5,10 +5,43 @@
+ //! serialize payload bytes or update the payload digest.
+ 
+ use anyhow::{Context, Result, ensure};
+-
++use bytes::Bytes;
++
++use crate::mvcc::BatchEntryKind;
+ use crate::pitr::{CanonicalWalEntryStream, RecordedAt, WalBatch, WalV5Limits};
+ 
+-use super::{WAL_V8_HEADER_LEN, codec, digest};
++use super::{WAL_V8_HEADER_LEN, codec, digest, point::WalV8PointStream};
++
++enum CanonicalV8Stream<'a> {
++    Batch(CanonicalWalEntryStream<'a>),
++    Points(WalV8PointStream<'a>),
++}
++
++impl CanonicalV8Stream<'_> {
++    fn data_len(&self) -> usize {
++        match self {
++            Self::Batch(stream) => stream.data_len(),
++            Self::Points(stream) => stream.data_len(),
++        }
++    }
++
++    fn entry_count(&self) -> u32 {
++        match self {
++            Self::Batch(stream) => stream.entry_count(),
++            Self::Points(stream) => stream.entry_count(),
++        }
++    }
++
++    fn encode_into_with_observer<F>(&self, dst: &mut [u8], observe: F) -> Result<(usize, u32)>
++    where
++        F: FnMut(&[u8]) -> Result<()>,
++    {
++        match self {
++            Self::Batch(stream) => stream.encode_into_with_observer(dst, observe),
++            Self::Points(stream) => stream.encode_into_with_observer(dst, observe),
++        }
++    }
++}
+ 
+ const WAL_V8_DATA_START: u64 = (WAL_V8_HEADER_LEN + codec::WAL_V8_FRAME_LEN) as u64;
+ 
+@@ -66,7 +99,7 @@
+ 
+ /// Canonical operations and checked encoded sizes, with no serialized payload.
+ pub(crate) struct PreparedWalV8Batch<'a, R> {
+-    canonical: CanonicalWalEntryStream<'a>,
++    canonical: CanonicalV8Stream<'a>,
+     limits: WalV5Limits,
+     commit_ts: u64,
+     recorded_at: RecordedAt,
+@@ -97,7 +130,48 @@
+     {
+         let preparation_bytes = Self::preparation_buffer_bytes(batch, limits)?;
+         let preparation_reservation = reserve_preparation(preparation_bytes)?;
+-        let canonical = CanonicalWalEntryStream::new(batch, limits)?;
++        let canonical = CanonicalV8Stream::Batch(CanonicalWalEntryStream::new(batch, limits)?);
++        Self::from_canonical(
++            canonical,
++            limits,
++            batch.commit_ts,
++            batch.recorded_at,
++            preparation_bytes,
++            preparation_reservation,
++        )
++    }
++
++    /// Preflight the caller's immutable point inputs without allocating owned
++    /// key/value copies. Ticket metadata is supplied only during admission.
++    pub(crate) fn preflight_points<F>(
++        entries: &'a [(Bytes, Bytes, BatchEntryKind)],
++        limits: WalV5Limits,
++        reserve_preparation: F,
++    ) -> Result<Self>
++    where
++        F: FnOnce(u64) -> Result<R>,
++    {
++        let preparation_bytes = WalV8PointStream::preparation_buffer_bytes(entries, limits)?;
++        let preparation_reservation = reserve_preparation(preparation_bytes)?;
++        let canonical = CanonicalV8Stream::Points(WalV8PointStream::new(entries, limits)?);
++        Self::from_canonical(
++            canonical,
++            limits,
++            1,
++            RecordedAt { secs: 0, nanos: 0 },
++            preparation_bytes,
++            preparation_reservation,
++        )
++    }
++
++    fn from_canonical(
++        canonical: CanonicalV8Stream<'a>,
++        limits: WalV5Limits,
++        commit_ts: u64,
++        recorded_at: RecordedAt,
++        preparation_bytes: u64,
++        preparation_reservation: R,
++    ) -> Result<Self> {
+         let logical_batch_bytes = codec::WAL_V8_LOGICAL_BATCH_HEADER_LEN
+             .checked_add(canonical.data_len())
+             .context("v8 logical batch length overflows")?;
+@@ -111,8 +185,8 @@
+         Ok(PreparedWalV8Batch {
+             canonical,
+             limits,
+-            commit_ts: batch.commit_ts,
+-            recorded_at: batch.recorded_at,
++            commit_ts,
++            recorded_at,
+             logical_batch_bytes,
+             preparation_buffer_bytes: preparation_bytes,
+             fragment_count,
+@@ -227,7 +301,7 @@
+ 
+ /// A preflighted batch whose group membership has already been published.
+ pub(crate) struct AdmittedWalV8Batch<'a, G, R> {
+-    canonical: CanonicalWalEntryStream<'a>,
++    canonical: CanonicalV8Stream<'a>,
+     limits: WalV5Limits,
+     logical_batch_bytes: usize,
+     assignment: WalV8BatchAssignment,
+@@ -578,6 +652,82 @@
+                 },
+             ],
+         }
++    }
++
++    #[test]
++    fn borrowed_point_preparation_matches_owned_logical_digest_and_frames() -> Result<()> {
++        let entries = vec![
++            (
++                Bytes::from_static(b"a"),
++                Bytes::from(vec![0x7a; 70000]),
++                BatchEntryKind::PutRaw,
++            ),
++            (
++                Bytes::from_static(b"b"),
++                Bytes::from(vec![crate::vlog::KvKind::Inline as u8; 30000]),
++                BatchEntryKind::PutPrefixed,
++            ),
++            (
++                Bytes::from_static(b"a"),
++                Bytes::new(),
++                BatchEntryKind::Delete,
++            ),
++            (
++                Bytes::from_static(b"c"),
++                Bytes::from(vec![0x6b; 60000]),
++                BatchEntryKind::PutRaw,
++            ),
++        ];
++        let batch = WalBatch {
++            commit_ts: 17,
++            recorded_at: RecordedAt { secs: -2, nanos: 7 },
++            entries: vec![
++                WalEntry::Put {
++                    key: b"a".to_vec(),
++                    value: [vec![crate::vlog::KvKind::Inline as u8], vec![0x7a; 70000]].concat(),
++                },
++                WalEntry::Put {
++                    key: b"b".to_vec(),
++                    value: vec![crate::vlog::KvKind::Inline as u8; 30000],
++                },
++                WalEntry::PointDelete { key: b"a".to_vec() },
++                WalEntry::Put {
++                    key: b"c".to_vec(),
++                    value: [vec![crate::vlog::KvKind::Inline as u8], vec![0x6b; 60000]].concat(),
++                },
++            ],
++        };
++        let publisher = TestPublisher::new(WAL_V8_DATA_START);
++        let mut reference =
++            PreparedWalV8Batch::preflight(&batch, crate::pitr::LIVE_WAL_V5_LIMITS, |_| Ok(()))?
++                .admit_with_metadata(batch.commit_ts, batch.recorded_at, &publisher)?
++                .encode()?;
++        let publisher = TestPublisher::new(WAL_V8_DATA_START);
++        let mut reserved = 0;
++        let prepared = PreparedWalV8Batch::preflight_points(
++            &entries,
++            crate::pitr::LIVE_WAL_V5_LIMITS,
++            |bytes| {
++                reserved = bytes;
++                Ok(())
++            },
++        )?;
++        assert_eq!(
++            reserved,
++            (entries.len() * std::mem::size_of::<usize>()) as u64
++        );
++        let mut actual = prepared
++            .admit_with_metadata(batch.commit_ts, batch.recorded_at, &publisher)?
++            .encode()?;
++        assert_eq!(actual.as_bytes(), reference.as_bytes());
++        assert_eq!(actual.entry_digest(), reference.entry_digest());
++        assert_eq!(actual.batch_digest(), reference.batch_digest());
++        let mut frames = vec![0; actual.frame_buffer_bytes];
++        let mut expected_frames = vec![0; reference.frame_buffer_bytes];
++        actual.encode_data_frames_into(&mut frames)?;
++        reference.encode_data_frames_into(&mut expected_frames)?;
++        assert_eq!(frames, expected_frames);
++        Ok(())
+     }
+ 
+     fn assignment(first_data_offset: u64) -> WalV8BatchAssignment {
+--- a/kv-engine/src/wal.rs
++++ b/kv-engine/src/wal.rs
+@@ -2288,6 +2288,21 @@
+             .context("v8 WAL has no recovered Active writer")?
+             .lock()
+             .preflight_batch(batch, limits)
++    }
++
++    pub(crate) fn preflight_v8_parallel_points<'a>(
++        &self,
++        entries: &'a [(bytes::Bytes, bytes::Bytes, crate::mvcc::BatchEntryKind)],
++        limits: crate::pitr::WalV5Limits,
++    ) -> Result<v8::leader::WalV8PreparedBatch<'a>> {
++        ensure!(
++            self.format_version == WAL_FORMAT_VERSION_V8,
++            "v8 point preflight requires v8 WAL"
++        );
++        self.v8_parallel
++            .as_ref()
++            .context("v8 point preflight requires Parallel WAL")?
++            .preflight_points(entries, limits)
+     }
+ 
+     pub(crate) fn admit_v8_prepared_parallel_batch<'a>(

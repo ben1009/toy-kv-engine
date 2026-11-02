@@ -1,0 +1,11 @@
+--- a/kv-engine/src/lsm_storage.rs
++++ b/kv-engine/src/lsm_storage.rs
+@@ -16538,7 +16538,7 @@
+     }
+ 
+     fn use_owned_batch_publish(entries: usize) -> bool {
+-        const OWNED_PUBLISH_MIN_BATCH: usize = 512;
++        const OWNED_PUBLISH_MIN_BATCH: usize = 64;
+         entries >= OWNED_PUBLISH_MIN_BATCH
+     }
+ 
