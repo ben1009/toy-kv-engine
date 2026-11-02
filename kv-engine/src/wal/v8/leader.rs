@@ -1633,6 +1633,17 @@ impl WalV8ParallelWriter {
         let ticket_end = ticket
             .checked_add(1)
             .context("v8 Parallel durable ticket end overflows")?;
+        let Some(mut driver) = self.coordinator.acquire_durability_driver(ticket_end)? else {
+            return Ok(());
+        };
+        let result = self.drive_frontier_through(ticket_end);
+        if result.is_ok() {
+            driver.complete();
+        }
+        result
+    }
+
+    fn drive_frontier_through(&self, ticket_end: u64) -> Result<()> {
         loop {
             if self.coordinator.is_poisoned() {
                 anyhow::bail!("v8 Parallel WAL is poisoned");
@@ -1641,7 +1652,7 @@ impl WalV8ParallelWriter {
                 return Ok(());
             }
 
-            let observed_generation = self.coordinator.change_generation();
+            let observed_generation = self.coordinator.durability_generation();
             let mut previous = self.frontier.lock();
             if self.coordinator.durable_ticket_end() >= ticket_end {
                 return Ok(());
@@ -1688,7 +1699,7 @@ impl WalV8ParallelWriter {
                 drop(previous);
                 let wake = self
                     .coordinator
-                    .wait_for_change(observed_generation, Duration::from_secs(1));
+                    .wait_for_durability_change(observed_generation, Duration::from_secs(1));
                 if wake.poisoned {
                     anyhow::bail!("v8 Parallel WAL was poisoned while waiting for durability");
                 }
@@ -1912,6 +1923,12 @@ impl WalV8ParallelWriter {
 
     pub(crate) fn next_ticket(&self) -> u64 {
         self.coordinator.next_ticket()
+    }
+
+    /// Completing callers consume published state without waiting for the
+    /// physical FRONTIER mutex, which may already cover a later sync cycle.
+    pub(crate) fn published_cursor(&self) -> (u64, u64, u64) {
+        self.coordinator.published_cursor()
     }
 
     pub(crate) fn is_poisoned(&self) -> bool {
@@ -3330,6 +3347,36 @@ mod tests {
         )?;
         assert_eq!(recovered.active_boundary.ticket_end, 2);
         assert_eq!(replayed_batches(&path, &recovered)?, [batch(10), batch(20)]);
+        Ok(())
+    }
+
+    #[test]
+    fn published_cursor_is_readable_while_the_physical_frontier_mutex_is_held() -> Result<()> {
+        let directory =
+            tempfile::tempdir_in(Path::new(env!("CARGO_MANIFEST_DIR")).join("../target"))?;
+        let path = directory.path().join("cursor-v8.wal");
+        let installed = install_empty(&path, header())?;
+        let writer = Arc::new(open_writer(&path, &installed)?.into_parallel()?);
+        assert_eq!(writer.published_cursor(), (0, installed.image_len, 0));
+        let first = batch(10);
+        writer.append_prepared_batch(
+            writer.preflight_batch(&first, LIVE_WAL_V5_LIMITS)?,
+            10,
+            first.recorded_at,
+        )?;
+        let expected = (1, writer.image_len()?, 1);
+        let frontier = writer.frontier.lock();
+        let reading = Arc::clone(&writer);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let reader = thread::spawn(move || {
+            let _ = tx.send(reading.published_cursor());
+        });
+        let snapshot = rx.recv_timeout(Duration::from_secs(1));
+        // Release before joining so a regression fails by timeout rather
+        // than leaving this test deadlocked on its own assertion path.
+        drop(frontier);
+        reader.join().expect("published cursor reader panicked");
+        assert_eq!(snapshot?, expected);
         Ok(())
     }
 
