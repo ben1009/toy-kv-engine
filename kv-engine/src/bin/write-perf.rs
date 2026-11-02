@@ -3460,6 +3460,10 @@ fn enable_pitr_for_workload(
         );
         engine
     };
+    #[cfg(all(feature = "bench", target_os = "linux"))]
+    if requested_format == PitrFormatArg::V8 {
+        engine.wait_for_pitr_benchmark_maintenance()?;
+    }
 
     let status = engine.pitr_status(PitrStatusOptions {
         cursor: None,

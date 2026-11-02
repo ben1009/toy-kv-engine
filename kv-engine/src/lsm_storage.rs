@@ -4404,6 +4404,46 @@ impl KvEngine {
         }
     }
 
+    /// Drain PITR maintenance made eligible by the benchmark-only v8 migration
+    /// before a timed write workload begins. The migration can leave a sealed
+    /// predecessor that causes the periodic worker to capture a recovery point;
+    /// allowing that barrier to race the measured writes makes the benchmark
+    /// depend on startup scheduling rather than steady-state WAL behavior.
+    #[cfg(all(target_os = "linux", feature = "bench"))]
+    #[doc(hidden)]
+    pub fn wait_for_pitr_benchmark_maintenance(&self) -> Result<()> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        let mut settled_since = None;
+        loop {
+            self.inner.maybe_queue_pitr_maintenance(true)?;
+            let maintenance_queued = self.inner.pitr_maintenance_queued.load(Ordering::Acquire);
+            if !maintenance_queued {
+                ensure!(
+                    self.pitr_last_archive_error.lock().is_none(),
+                    "PITR maintenance failed while preparing the benchmark"
+                );
+            }
+            let admission_open = self
+                .inner
+                .mvcc
+                .as_ref()
+                .is_none_or(|sequencer| sequencer.commit_admission_is_open());
+            if !maintenance_queued && admission_open {
+                let settled_since = settled_since.get_or_insert_with(std::time::Instant::now);
+                if settled_since.elapsed() >= Duration::from_millis(50) {
+                    return Ok(());
+                }
+            } else {
+                settled_since = None;
+            }
+            ensure!(
+                std::time::Instant::now() < deadline,
+                "PITR maintenance did not settle before the benchmark deadline"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
     /// Preflight a new PITR epoch against the complete v7 transition budget
     /// before publishing its durable enable intent. A disabled database has no
     /// live PITR segment manager, so account every visible PITR source, staging,
