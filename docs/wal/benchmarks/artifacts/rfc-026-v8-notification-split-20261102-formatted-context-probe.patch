@@ -1,0 +1,51 @@
+--- a/kv-engine/src/bin/write-perf.rs
++++ b/kv-engine/src/bin/write-perf.rs
+@@ -3626,6 +3626,21 @@
+     Ok(vec![measurement])
+ }
+ 
++// Temporary benchmark-only context-switch attribution, outside the hot path.
++fn wal_context_switches() -> Option<(u64, u64)> {
++    if std::env::var_os("TOYKV_WAL_CONTEXT").is_none() {
++        return None;
++    }
++    let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
++    // SAFETY: getrusage initializes the supplied structure on success.
++    if unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) } != 0 {
++        return None;
++    }
++    // SAFETY: the successful call initialized usage.
++    let usage = unsafe { usage.assume_init() };
++    Some((usage.ru_nvcsw as u64, usage.ru_nivcsw as u64))
++}
++
+ fn run_wal_batch_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
+     let workload = "wal_batch_concurrent";
+     let path = prepare_path(cfg, workload)?;
+@@ -3651,6 +3666,7 @@
+     let writer_threads = cfg.threads;
+     let retry_pitr_barrier = cfg.pitr;
+     let baseline = collect_counters(&engine)?;
++    let context_start = wal_context_switches();
+     let cpu_start = process_cpu_times();
+     let per_thread = num_keys / writer_threads;
+     let remainder = num_keys % writer_threads;
+@@ -3711,6 +3727,18 @@
+     let elapsed = start.elapsed();
+     let (process_cpu_user_ms, process_cpu_system_ms) =
+         process_cpu_delta(cpu_start, process_cpu_times());
++    let context_end = wal_context_switches();
++    if let (Some(before), Some(after)) = (context_start, context_end) {
++        if let Some(path) = std::env::var_os("TOYKV_WAL_CONTEXT") {
++            std::fs::write(
++                path,
++                serde_json::to_vec_pretty(&serde_json::json!({
++                    "voluntary": after.0.saturating_sub(before.0),
++                    "involuntary": after.1.saturating_sub(before.1),
++                }))?,
++            )?;
++        }
++    }
+     #[cfg(feature = "bench")]
+     let wal_pipeline = wal_pipeline_record(&engine, cfg.profile, wal_run_info)?;
+     #[cfg(not(feature = "bench"))]

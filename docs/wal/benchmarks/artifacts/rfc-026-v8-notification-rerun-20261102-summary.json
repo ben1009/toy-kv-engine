@@ -1,0 +1,816 @@
+{
+  "cohorts": [
+    "confirmation",
+    "rerun"
+  ],
+  "total": 36,
+  "stall_flagged": 18,
+  "selection": "Highest eligible throughput per workload/writer/arm; p99, CPU and counters from the same sample.",
+  "retention": "Kept at explicit maintainer request; no performance-triggered revert.",
+  "arms": [
+    {
+      "cohort": "confirmation",
+      "kind": "batch",
+      "writers": 8,
+      "arm": "baseline",
+      "eligible": 0,
+      "total": 2,
+      "median_eligible_puts_s": null,
+      "median_eligible_cpu_s": null,
+      "best": null
+    },
+    {
+      "cohort": "confirmation",
+      "kind": "batch",
+      "writers": 8,
+      "arm": "kept",
+      "eligible": 0,
+      "total": 2,
+      "median_eligible_puts_s": null,
+      "median_eligible_cpu_s": null,
+      "best": null
+    },
+    {
+      "cohort": "confirmation",
+      "kind": "batch",
+      "writers": 16,
+      "arm": "baseline",
+      "eligible": 2,
+      "total": 2,
+      "median_eligible_puts_s": 427136.0274667332,
+      "median_eligible_cpu_s": 10.2402215,
+      "best": {
+        "sample": "confirmation-07-batch-baseline-16",
+        "puts_s": 428908.6966359413,
+        "p99_ms": 4.777116,
+        "cpu_s": 10.177404999999998,
+        "context_switches": {
+          "involuntary": 709,
+          "voluntary": 158862
+        },
+        "eventfd_requests": 5912,
+        "eventfd_writes": 4071,
+        "sync_count": 1485,
+        "mean_sync_ms": 0.4807499771043771,
+        "fdatasync_ms": 713.913716
+      }
+    },
+    {
+      "cohort": "confirmation",
+      "kind": "batch",
+      "writers": 16,
+      "arm": "kept",
+      "eligible": 2,
+      "total": 2,
+      "median_eligible_puts_s": 485836.89894621965,
+      "median_eligible_cpu_s": 8.988009,
+      "best": {
+        "sample": "confirmation-06-batch-kept-16",
+        "puts_s": 488629.9657376968,
+        "p99_ms": 4.091141,
+        "cpu_s": 8.951362000000001,
+        "context_switches": {
+          "involuntary": 502,
+          "voluntary": 97582
+        },
+        "eventfd_requests": 6058,
+        "eventfd_writes": 4243,
+        "sync_count": 1364,
+        "mean_sync_ms": 0.46843410703812316,
+        "fdatasync_ms": 638.944122
+      }
+    },
+    {
+      "cohort": "confirmation",
+      "kind": "point",
+      "writers": 8,
+      "arm": "baseline",
+      "eligible": 2,
+      "total": 2,
+      "median_eligible_puts_s": 9381.540928818355,
+      "median_eligible_cpu_s": 3.9856225,
+      "best": {
+        "sample": "confirmation-09-point-baseline-8",
+        "puts_s": 9488.50272834566,
+        "p99_ms": 1.749881,
+        "cpu_s": 3.919281,
+        "context_switches": null,
+        "eventfd_requests": 19319,
+        "eventfd_writes": 11363,
+        "sync_count": 2538,
+        "mean_sync_ms": 0.3758380772261623,
+        "fdatasync_ms": 953.87704
+      }
+    },
+    {
+      "cohort": "confirmation",
+      "kind": "point",
+      "writers": 8,
+      "arm": "kept",
+      "eligible": 2,
+      "total": 2,
+      "median_eligible_puts_s": 9756.593198024473,
+      "median_eligible_cpu_s": 3.0232845,
+      "best": {
+        "sample": "confirmation-08-point-kept-8",
+        "puts_s": 9782.853986360607,
+        "p99_ms": 1.951667,
+        "cpu_s": 2.959104,
+        "context_switches": null,
+        "eventfd_requests": 19874,
+        "eventfd_writes": 9870,
+        "sync_count": 2537,
+        "mean_sync_ms": 0.35741510878990934,
+        "fdatasync_ms": 906.762131
+      }
+    },
+    {
+      "cohort": "rerun",
+      "kind": "batch",
+      "writers": 1,
+      "arm": "baseline",
+      "eligible": 1,
+      "total": 2,
+      "median_eligible_puts_s": 69453.25863531156,
+      "median_eligible_cpu_s": 6.3784089999999996,
+      "best": {
+        "sample": "rerun-22-batch-baseline-1",
+        "puts_s": 69453.25863531156,
+        "p99_ms": 1.335603,
+        "cpu_s": 6.3784089999999996,
+        "context_switches": {
+          "involuntary": 113,
+          "voluntary": 94991
+        },
+        "eventfd_requests": 11719,
+        "eventfd_writes": 0,
+        "sync_count": 11719,
+        "mean_sync_ms": 0.36690102150354126,
+        "fdatasync_ms": 4299.713071
+      }
+    },
+    {
+      "cohort": "rerun",
+      "kind": "batch",
+      "writers": 1,
+      "arm": "kept",
+      "eligible": 1,
+      "total": 2,
+      "median_eligible_puts_s": 69087.80326303342,
+      "median_eligible_cpu_s": 6.352919999999999,
+      "best": {
+        "sample": "rerun-01-batch-kept-1",
+        "puts_s": 69087.80326303342,
+        "p99_ms": 1.341064,
+        "cpu_s": 6.352919999999999,
+        "context_switches": {
+          "involuntary": 143,
+          "voluntary": 95020
+        },
+        "eventfd_requests": 11719,
+        "eventfd_writes": 0,
+        "sync_count": 11719,
+        "mean_sync_ms": 0.3642685316153255,
+        "fdatasync_ms": 4268.862922
+      }
+    },
+    {
+      "cohort": "rerun",
+      "kind": "batch",
+      "writers": 8,
+      "arm": "baseline",
+      "eligible": 1,
+      "total": 2,
+      "median_eligible_puts_s": 328506.35224520677,
+      "median_eligible_cpu_s": 8.165627999999998,
+      "best": {
+        "sample": "rerun-04-batch-baseline-8",
+        "puts_s": 328506.35224520677,
+        "p99_ms": 3.243252,
+        "cpu_s": 8.165627999999998,
+        "context_switches": {
+          "involuntary": 433,
+          "voluntary": 143374
+        },
+        "eventfd_requests": 6307,
+        "eventfd_writes": 4198,
+        "sync_count": 1556,
+        "mean_sync_ms": 0.46431614781491004,
+        "fdatasync_ms": 722.475926
+      }
+    },
+    {
+      "cohort": "rerun",
+      "kind": "batch",
+      "writers": 8,
+      "arm": "kept",
+      "eligible": 0,
+      "total": 2,
+      "median_eligible_puts_s": null,
+      "median_eligible_cpu_s": null,
+      "best": null
+    },
+    {
+      "cohort": "rerun",
+      "kind": "batch",
+      "writers": 16,
+      "arm": "baseline",
+      "eligible": 1,
+      "total": 2,
+      "median_eligible_puts_s": 423321.2317458029,
+      "median_eligible_cpu_s": 10.70796,
+      "best": {
+        "sample": "rerun-14-batch-baseline-16",
+        "puts_s": 423321.2317458029,
+        "p99_ms": 4.501643,
+        "cpu_s": 10.70796,
+        "context_switches": {
+          "involuntary": 687,
+          "voluntary": 160173
+        },
+        "eventfd_requests": 5915,
+        "eventfd_writes": 4238,
+        "sync_count": 1442,
+        "mean_sync_ms": 0.44588123439667127,
+        "fdatasync_ms": 642.96074
+      }
+    },
+    {
+      "cohort": "rerun",
+      "kind": "batch",
+      "writers": 16,
+      "arm": "kept",
+      "eligible": 0,
+      "total": 2,
+      "median_eligible_puts_s": null,
+      "median_eligible_cpu_s": null,
+      "best": null
+    },
+    {
+      "cohort": "rerun",
+      "kind": "point",
+      "writers": 1,
+      "arm": "baseline",
+      "eligible": 2,
+      "total": 2,
+      "median_eligible_puts_s": 1574.5064292463012,
+      "median_eligible_cpu_s": 0.8384115000000001,
+      "best": {
+        "sample": "rerun-21-point-baseline-1",
+        "puts_s": 1577.1370387220304,
+        "p99_ms": 1.310475,
+        "cpu_s": 0.856481,
+        "context_switches": null,
+        "eventfd_requests": 5000,
+        "eventfd_writes": 0,
+        "sync_count": 5000,
+        "mean_sync_ms": 0.3593825722,
+        "fdatasync_ms": 1796.912861
+      }
+    },
+    {
+      "cohort": "rerun",
+      "kind": "point",
+      "writers": 1,
+      "arm": "kept",
+      "eligible": 2,
+      "total": 2,
+      "median_eligible_puts_s": 1585.161188958422,
+      "median_eligible_cpu_s": 0.8274724999999999,
+      "best": {
+        "sample": "rerun-20-point-kept-1",
+        "puts_s": 1591.0964731112456,
+        "p99_ms": 1.234866,
+        "cpu_s": 0.824799,
+        "context_switches": null,
+        "eventfd_requests": 5000,
+        "eventfd_writes": 0,
+        "sync_count": 5000,
+        "mean_sync_ms": 0.36190600079999996,
+        "fdatasync_ms": 1809.530004
+      }
+    },
+    {
+      "cohort": "rerun",
+      "kind": "point",
+      "writers": 8,
+      "arm": "baseline",
+      "eligible": 0,
+      "total": 2,
+      "median_eligible_puts_s": null,
+      "median_eligible_cpu_s": null,
+      "best": null
+    },
+    {
+      "cohort": "rerun",
+      "kind": "point",
+      "writers": 8,
+      "arm": "kept",
+      "eligible": 0,
+      "total": 2,
+      "median_eligible_puts_s": null,
+      "median_eligible_cpu_s": null,
+      "best": null
+    },
+    {
+      "cohort": "rerun",
+      "kind": "point",
+      "writers": 16,
+      "arm": "baseline",
+      "eligible": 1,
+      "total": 2,
+      "median_eligible_puts_s": 8784.653061411227,
+      "median_eligible_cpu_s": 7.131004999999999,
+      "best": {
+        "sample": "rerun-13-point-baseline-16",
+        "puts_s": 8784.653061411227,
+        "p99_ms": 3.840645,
+        "cpu_s": 7.131004999999999,
+        "context_switches": null,
+        "eventfd_requests": 19331,
+        "eventfd_writes": 9026,
+        "sync_count": 2458,
+        "mean_sync_ms": 0.4587297978030919,
+        "fdatasync_ms": 1127.557843
+      }
+    },
+    {
+      "cohort": "rerun",
+      "kind": "point",
+      "writers": 16,
+      "arm": "kept",
+      "eligible": 1,
+      "total": 2,
+      "median_eligible_puts_s": 14211.684797357375,
+      "median_eligible_cpu_s": 3.9403919999999997,
+      "best": {
+        "sample": "rerun-12-point-kept-16",
+        "puts_s": 14211.684797357375,
+        "p99_ms": 3.19597,
+        "cpu_s": 3.9403919999999997,
+        "context_switches": null,
+        "eventfd_requests": 19747,
+        "eventfd_writes": 7465,
+        "sync_count": 1407,
+        "mean_sync_ms": 0.39608731627576405,
+        "fdatasync_ms": 557.294854
+      }
+    }
+  ],
+  "comparisons": [
+    {
+      "cohort": "confirmation",
+      "kind": "batch",
+      "writers": 8,
+      "arms": {
+        "baseline": {
+          "cohort": "confirmation",
+          "kind": "batch",
+          "writers": 8,
+          "arm": "baseline",
+          "eligible": 0,
+          "total": 2,
+          "median_eligible_puts_s": null,
+          "median_eligible_cpu_s": null,
+          "best": null
+        },
+        "kept": {
+          "cohort": "confirmation",
+          "kind": "batch",
+          "writers": 8,
+          "arm": "kept",
+          "eligible": 0,
+          "total": 2,
+          "median_eligible_puts_s": null,
+          "median_eligible_cpu_s": null,
+          "best": null
+        }
+      },
+      "differences": null
+    },
+    {
+      "cohort": "confirmation",
+      "kind": "batch",
+      "writers": 16,
+      "arms": {
+        "baseline": {
+          "cohort": "confirmation",
+          "kind": "batch",
+          "writers": 16,
+          "arm": "baseline",
+          "eligible": 2,
+          "total": 2,
+          "median_eligible_puts_s": 427136.0274667332,
+          "median_eligible_cpu_s": 10.2402215,
+          "best": {
+            "sample": "confirmation-07-batch-baseline-16",
+            "puts_s": 428908.6966359413,
+            "p99_ms": 4.777116,
+            "cpu_s": 10.177404999999998,
+            "context_switches": {
+              "involuntary": 709,
+              "voluntary": 158862
+            },
+            "eventfd_requests": 5912,
+            "eventfd_writes": 4071,
+            "sync_count": 1485,
+            "mean_sync_ms": 0.4807499771043771,
+            "fdatasync_ms": 713.913716
+          }
+        },
+        "kept": {
+          "cohort": "confirmation",
+          "kind": "batch",
+          "writers": 16,
+          "arm": "kept",
+          "eligible": 2,
+          "total": 2,
+          "median_eligible_puts_s": 485836.89894621965,
+          "median_eligible_cpu_s": 8.988009,
+          "best": {
+            "sample": "confirmation-06-batch-kept-16",
+            "puts_s": 488629.9657376968,
+            "p99_ms": 4.091141,
+            "cpu_s": 8.951362000000001,
+            "context_switches": {
+              "involuntary": 502,
+              "voluntary": 97582
+            },
+            "eventfd_requests": 6058,
+            "eventfd_writes": 4243,
+            "sync_count": 1364,
+            "mean_sync_ms": 0.46843410703812316,
+            "fdatasync_ms": 638.944122
+          }
+        }
+      },
+      "differences": {
+        "puts_s_change_pct": 13.924005171769016,
+        "p99_ms_change_pct": -14.359605251369235,
+        "cpu_s_change_pct": -12.046715248140337,
+        "sync_count_change_pct": -8.148148148148149,
+        "eventfd_writes_change_pct": 4.2250061409973005,
+        "voluntary_switches_change_pct": -38.574360136470645,
+        "involuntary_switches_change_pct": -29.196050775740478
+      }
+    },
+    {
+      "cohort": "confirmation",
+      "kind": "point",
+      "writers": 8,
+      "arms": {
+        "baseline": {
+          "cohort": "confirmation",
+          "kind": "point",
+          "writers": 8,
+          "arm": "baseline",
+          "eligible": 2,
+          "total": 2,
+          "median_eligible_puts_s": 9381.540928818355,
+          "median_eligible_cpu_s": 3.9856225,
+          "best": {
+            "sample": "confirmation-09-point-baseline-8",
+            "puts_s": 9488.50272834566,
+            "p99_ms": 1.749881,
+            "cpu_s": 3.919281,
+            "context_switches": null,
+            "eventfd_requests": 19319,
+            "eventfd_writes": 11363,
+            "sync_count": 2538,
+            "mean_sync_ms": 0.3758380772261623,
+            "fdatasync_ms": 953.87704
+          }
+        },
+        "kept": {
+          "cohort": "confirmation",
+          "kind": "point",
+          "writers": 8,
+          "arm": "kept",
+          "eligible": 2,
+          "total": 2,
+          "median_eligible_puts_s": 9756.593198024473,
+          "median_eligible_cpu_s": 3.0232845,
+          "best": {
+            "sample": "confirmation-08-point-kept-8",
+            "puts_s": 9782.853986360607,
+            "p99_ms": 1.951667,
+            "cpu_s": 2.959104,
+            "context_switches": null,
+            "eventfd_requests": 19874,
+            "eventfd_writes": 9870,
+            "sync_count": 2537,
+            "mean_sync_ms": 0.35741510878990934,
+            "fdatasync_ms": 906.762131
+          }
+        }
+      },
+      "differences": {
+        "puts_s_change_pct": 3.102188685003071,
+        "p99_ms_change_pct": 11.531412707492672,
+        "cpu_s_change_pct": -24.49880475525995,
+        "sync_count_change_pct": -0.03940110323088497,
+        "eventfd_writes_change_pct": -13.139135791604328
+      }
+    },
+    {
+      "cohort": "rerun",
+      "kind": "batch",
+      "writers": 1,
+      "arms": {
+        "baseline": {
+          "cohort": "rerun",
+          "kind": "batch",
+          "writers": 1,
+          "arm": "baseline",
+          "eligible": 1,
+          "total": 2,
+          "median_eligible_puts_s": 69453.25863531156,
+          "median_eligible_cpu_s": 6.3784089999999996,
+          "best": {
+            "sample": "rerun-22-batch-baseline-1",
+            "puts_s": 69453.25863531156,
+            "p99_ms": 1.335603,
+            "cpu_s": 6.3784089999999996,
+            "context_switches": {
+              "involuntary": 113,
+              "voluntary": 94991
+            },
+            "eventfd_requests": 11719,
+            "eventfd_writes": 0,
+            "sync_count": 11719,
+            "mean_sync_ms": 0.36690102150354126,
+            "fdatasync_ms": 4299.713071
+          }
+        },
+        "kept": {
+          "cohort": "rerun",
+          "kind": "batch",
+          "writers": 1,
+          "arm": "kept",
+          "eligible": 1,
+          "total": 2,
+          "median_eligible_puts_s": 69087.80326303342,
+          "median_eligible_cpu_s": 6.352919999999999,
+          "best": {
+            "sample": "rerun-01-batch-kept-1",
+            "puts_s": 69087.80326303342,
+            "p99_ms": 1.341064,
+            "cpu_s": 6.352919999999999,
+            "context_switches": {
+              "involuntary": 143,
+              "voluntary": 95020
+            },
+            "eventfd_requests": 11719,
+            "eventfd_writes": 0,
+            "sync_count": 11719,
+            "mean_sync_ms": 0.3642685316153255,
+            "fdatasync_ms": 4268.862922
+          }
+        }
+      },
+      "differences": {
+        "puts_s_change_pct": -0.5261889498908823,
+        "p99_ms_change_pct": 0.40887898574650805,
+        "cpu_s_change_pct": -0.39961375948140976,
+        "sync_count_change_pct": 0.0,
+        "eventfd_writes_change_pct": null,
+        "voluntary_switches_change_pct": 0.03052920803023884,
+        "involuntary_switches_change_pct": 26.54867256637168
+      }
+    },
+    {
+      "cohort": "rerun",
+      "kind": "batch",
+      "writers": 8,
+      "arms": {
+        "baseline": {
+          "cohort": "rerun",
+          "kind": "batch",
+          "writers": 8,
+          "arm": "baseline",
+          "eligible": 1,
+          "total": 2,
+          "median_eligible_puts_s": 328506.35224520677,
+          "median_eligible_cpu_s": 8.165627999999998,
+          "best": {
+            "sample": "rerun-04-batch-baseline-8",
+            "puts_s": 328506.35224520677,
+            "p99_ms": 3.243252,
+            "cpu_s": 8.165627999999998,
+            "context_switches": {
+              "involuntary": 433,
+              "voluntary": 143374
+            },
+            "eventfd_requests": 6307,
+            "eventfd_writes": 4198,
+            "sync_count": 1556,
+            "mean_sync_ms": 0.46431614781491004,
+            "fdatasync_ms": 722.475926
+          }
+        },
+        "kept": {
+          "cohort": "rerun",
+          "kind": "batch",
+          "writers": 8,
+          "arm": "kept",
+          "eligible": 0,
+          "total": 2,
+          "median_eligible_puts_s": null,
+          "median_eligible_cpu_s": null,
+          "best": null
+        }
+      },
+      "differences": null
+    },
+    {
+      "cohort": "rerun",
+      "kind": "batch",
+      "writers": 16,
+      "arms": {
+        "baseline": {
+          "cohort": "rerun",
+          "kind": "batch",
+          "writers": 16,
+          "arm": "baseline",
+          "eligible": 1,
+          "total": 2,
+          "median_eligible_puts_s": 423321.2317458029,
+          "median_eligible_cpu_s": 10.70796,
+          "best": {
+            "sample": "rerun-14-batch-baseline-16",
+            "puts_s": 423321.2317458029,
+            "p99_ms": 4.501643,
+            "cpu_s": 10.70796,
+            "context_switches": {
+              "involuntary": 687,
+              "voluntary": 160173
+            },
+            "eventfd_requests": 5915,
+            "eventfd_writes": 4238,
+            "sync_count": 1442,
+            "mean_sync_ms": 0.44588123439667127,
+            "fdatasync_ms": 642.96074
+          }
+        },
+        "kept": {
+          "cohort": "rerun",
+          "kind": "batch",
+          "writers": 16,
+          "arm": "kept",
+          "eligible": 0,
+          "total": 2,
+          "median_eligible_puts_s": null,
+          "median_eligible_cpu_s": null,
+          "best": null
+        }
+      },
+      "differences": null
+    },
+    {
+      "cohort": "rerun",
+      "kind": "point",
+      "writers": 1,
+      "arms": {
+        "baseline": {
+          "cohort": "rerun",
+          "kind": "point",
+          "writers": 1,
+          "arm": "baseline",
+          "eligible": 2,
+          "total": 2,
+          "median_eligible_puts_s": 1574.5064292463012,
+          "median_eligible_cpu_s": 0.8384115000000001,
+          "best": {
+            "sample": "rerun-21-point-baseline-1",
+            "puts_s": 1577.1370387220304,
+            "p99_ms": 1.310475,
+            "cpu_s": 0.856481,
+            "context_switches": null,
+            "eventfd_requests": 5000,
+            "eventfd_writes": 0,
+            "sync_count": 5000,
+            "mean_sync_ms": 0.3593825722,
+            "fdatasync_ms": 1796.912861
+          }
+        },
+        "kept": {
+          "cohort": "rerun",
+          "kind": "point",
+          "writers": 1,
+          "arm": "kept",
+          "eligible": 2,
+          "total": 2,
+          "median_eligible_puts_s": 1585.161188958422,
+          "median_eligible_cpu_s": 0.8274724999999999,
+          "best": {
+            "sample": "rerun-20-point-kept-1",
+            "puts_s": 1591.0964731112456,
+            "p99_ms": 1.234866,
+            "cpu_s": 0.824799,
+            "context_switches": null,
+            "eventfd_requests": 5000,
+            "eventfd_writes": 0,
+            "sync_count": 5000,
+            "mean_sync_ms": 0.36190600079999996,
+            "fdatasync_ms": 1809.530004
+          }
+        }
+      },
+      "differences": {
+        "puts_s_change_pct": 0.8851123299042252,
+        "p99_ms_change_pct": -5.769587363360618,
+        "cpu_s_change_pct": -3.699089647055809,
+        "sync_count_change_pct": 0.0,
+        "eventfd_writes_change_pct": null
+      }
+    },
+    {
+      "cohort": "rerun",
+      "kind": "point",
+      "writers": 8,
+      "arms": {
+        "baseline": {
+          "cohort": "rerun",
+          "kind": "point",
+          "writers": 8,
+          "arm": "baseline",
+          "eligible": 0,
+          "total": 2,
+          "median_eligible_puts_s": null,
+          "median_eligible_cpu_s": null,
+          "best": null
+        },
+        "kept": {
+          "cohort": "rerun",
+          "kind": "point",
+          "writers": 8,
+          "arm": "kept",
+          "eligible": 0,
+          "total": 2,
+          "median_eligible_puts_s": null,
+          "median_eligible_cpu_s": null,
+          "best": null
+        }
+      },
+      "differences": null
+    },
+    {
+      "cohort": "rerun",
+      "kind": "point",
+      "writers": 16,
+      "arms": {
+        "baseline": {
+          "cohort": "rerun",
+          "kind": "point",
+          "writers": 16,
+          "arm": "baseline",
+          "eligible": 1,
+          "total": 2,
+          "median_eligible_puts_s": 8784.653061411227,
+          "median_eligible_cpu_s": 7.131004999999999,
+          "best": {
+            "sample": "rerun-13-point-baseline-16",
+            "puts_s": 8784.653061411227,
+            "p99_ms": 3.840645,
+            "cpu_s": 7.131004999999999,
+            "context_switches": null,
+            "eventfd_requests": 19331,
+            "eventfd_writes": 9026,
+            "sync_count": 2458,
+            "mean_sync_ms": 0.4587297978030919,
+            "fdatasync_ms": 1127.557843
+          }
+        },
+        "kept": {
+          "cohort": "rerun",
+          "kind": "point",
+          "writers": 16,
+          "arm": "kept",
+          "eligible": 1,
+          "total": 2,
+          "median_eligible_puts_s": 14211.684797357375,
+          "median_eligible_cpu_s": 3.9403919999999997,
+          "best": {
+            "sample": "rerun-12-point-kept-16",
+            "puts_s": 14211.684797357375,
+            "p99_ms": 3.19597,
+            "cpu_s": 3.9403919999999997,
+            "context_switches": null,
+            "eventfd_requests": 19747,
+            "eventfd_writes": 7465,
+            "sync_count": 1407,
+            "mean_sync_ms": 0.39608731627576405,
+            "fdatasync_ms": 557.294854
+          }
+        }
+      },
+      "differences": {
+        "puts_s_change_pct": 61.77855514619848,
+        "p99_ms_change_pct": -16.78559200342651,
+        "cpu_s_change_pct": -44.74282376747737,
+        "sync_count_change_pct": -42.758340113913754,
+        "eventfd_writes_change_pct": -17.29448260580545
+      }
+    }
+  ]
+}

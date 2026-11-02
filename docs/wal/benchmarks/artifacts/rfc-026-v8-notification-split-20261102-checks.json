@@ -1,0 +1,17 @@
+{
+  "base_revision": "fdde06706ffc96c458c50fb87a431c13ec76d4d7",
+  "prototype": "role-separated notifications plus published cursor",
+  "command": "./dev check",
+  "result": "passed before prototype was reverted",
+  "tests_passed": 2151,
+  "tests_skipped": 32,
+  "slow_tests": 1,
+  "duration_seconds": 59.18,
+  "runtime_retained": false,
+  "runtime_restored_to_base": true,
+  "post_restore_checks": [
+    "Runtime source diff against HEAD is empty",
+    "All six experimental/probe patches pass git apply --check"
+  ],
+  "full_log": "target/rfc-026-v8-notification-split-20261102/check.log"
+}

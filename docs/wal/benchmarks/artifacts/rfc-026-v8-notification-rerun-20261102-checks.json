@@ -1,0 +1,32 @@
+{
+  "retained_locally": true,
+  "code_changed_during_rerun": false,
+  "source_sha256": {
+    "kv-engine/src/wal.rs": "89988769b9ef7eb20d2557892f8f2bdfa046e35e24da7ec8364f18c5d99d3861",
+    "kv-engine/src/wal/v8/parallel.rs": "4eb7f192be918fc16e6ea162ae8fcefd2a5cf29e2d426a302390f8ab9f99f5a1",
+    "kv-engine/src/wal/v8/leader.rs": "85bd911696e0e8c2e78a1c01532cfbd6a4d8662f5c1588c926552e8609748198"
+  },
+  "source_matches_previously_checked_prototype": true,
+  "previous_full_check": {
+    "command": "./dev check",
+    "tests_passed": 2151,
+    "tests_skipped": 32,
+    "log": "target/rfc-026-v8-notification-split-20261102/check.log",
+    "repeated_this_rerun": false
+  },
+  "fresh_checks": {
+    "cargo fmt --all -- --check": "passed",
+    "targeted typos": "passed",
+    "git diff --check": "passed",
+    "raw records, flags and best selection": "passed",
+    "executable and source hashes": "passed",
+    "artifact copies, Python syntax and relative links": "passed"
+  },
+  "benchmarks": {
+    "completed": 36,
+    "stall_flagged": 18,
+    "failed_commands": 0
+  },
+  "pushed": false,
+  "merged": false
+}

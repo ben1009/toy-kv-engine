@@ -1,0 +1,541 @@
+{
+  "base_revision": "fdde06706ffc96c458c50fb87a431c13ec76d4d7",
+  "plans": {
+    "guards-plan.json": {
+      "schedule": [
+        [
+          "batch",
+          1,
+          "baseline"
+        ],
+        [
+          "batch",
+          1,
+          "roles"
+        ],
+        [
+          "point",
+          1,
+          "roles"
+        ],
+        [
+          "point",
+          1,
+          "baseline"
+        ],
+        [
+          "batch",
+          8,
+          "baseline"
+        ],
+        [
+          "batch",
+          8,
+          "roles"
+        ],
+        [
+          "point",
+          8,
+          "roles"
+        ],
+        [
+          "point",
+          8,
+          "baseline"
+        ],
+        [
+          "batch",
+          16,
+          "baseline"
+        ],
+        [
+          "batch",
+          16,
+          "roles"
+        ],
+        [
+          "point",
+          16,
+          "roles"
+        ],
+        [
+          "point",
+          16,
+          "baseline"
+        ],
+        [
+          "point",
+          16,
+          "roles"
+        ],
+        [
+          "point",
+          16,
+          "baseline"
+        ],
+        [
+          "batch",
+          16,
+          "baseline"
+        ],
+        [
+          "batch",
+          16,
+          "roles"
+        ],
+        [
+          "point",
+          8,
+          "roles"
+        ],
+        [
+          "point",
+          8,
+          "baseline"
+        ],
+        [
+          "batch",
+          8,
+          "baseline"
+        ],
+        [
+          "batch",
+          8,
+          "roles"
+        ],
+        [
+          "point",
+          1,
+          "roles"
+        ],
+        [
+          "point",
+          1,
+          "baseline"
+        ],
+        [
+          "batch",
+          1,
+          "baseline"
+        ],
+        [
+          "batch",
+          1,
+          "roles"
+        ]
+      ],
+      "binary_sha256": {
+        "baseline": "5387771a5278302e65236fbfac65856c87b7e51bb37be5f0e9e62c05ac19279a",
+        "roles": "c634346d5ec3f81a0bcb49f5d658dfa53a3397ecb3a284c700bed7069c1ddab4"
+      },
+      "selection": "Highest eligible throughput per workload/writer/arm, with p99 and CPU from the same sample. p99>10ms or mean fdatasync>1ms flagged; preserve all. Qualify throughput/p99 and CPU savings; missing eligible arm means unqualified.",
+      "purpose": "Complete production-binary guard cohort after CPU diagnostic showed lower CPU/context switches and nearly unchanged throughput. No source changes or retuning. No per-phase instrumentation.",
+      "cooldown_seconds": 45,
+      "operations": {
+        "batch": 750000,
+        "point_1": 5000,
+        "point_8_16": 20000
+      }
+    },
+    "cursor-guards-plan.json": {
+      "schedule": [
+        [
+          "batch",
+          1,
+          "baseline"
+        ],
+        [
+          "batch",
+          1,
+          "cursor"
+        ],
+        [
+          "point",
+          1,
+          "cursor"
+        ],
+        [
+          "point",
+          1,
+          "baseline"
+        ],
+        [
+          "batch",
+          8,
+          "baseline"
+        ],
+        [
+          "batch",
+          8,
+          "cursor"
+        ],
+        [
+          "point",
+          8,
+          "cursor"
+        ],
+        [
+          "point",
+          8,
+          "baseline"
+        ],
+        [
+          "batch",
+          16,
+          "baseline"
+        ],
+        [
+          "batch",
+          16,
+          "cursor"
+        ],
+        [
+          "point",
+          16,
+          "cursor"
+        ],
+        [
+          "point",
+          16,
+          "baseline"
+        ],
+        [
+          "point",
+          16,
+          "cursor"
+        ],
+        [
+          "point",
+          16,
+          "baseline"
+        ],
+        [
+          "batch",
+          16,
+          "baseline"
+        ],
+        [
+          "batch",
+          16,
+          "cursor"
+        ],
+        [
+          "point",
+          8,
+          "cursor"
+        ],
+        [
+          "point",
+          8,
+          "baseline"
+        ],
+        [
+          "batch",
+          8,
+          "baseline"
+        ],
+        [
+          "batch",
+          8,
+          "cursor"
+        ],
+        [
+          "point",
+          1,
+          "cursor"
+        ],
+        [
+          "point",
+          1,
+          "baseline"
+        ],
+        [
+          "batch",
+          1,
+          "baseline"
+        ],
+        [
+          "batch",
+          1,
+          "cursor"
+        ]
+      ],
+      "binary_sha256": {
+        "baseline": "5387771a5278302e65236fbfac65856c87b7e51bb37be5f0e9e62c05ac19279a",
+        "cursor": "937a3843a044e107e15db756674be151875e388ff3a0a392cbd4e97463bbd2aa"
+      },
+      "selection": "Highest eligible throughput per workload/writer/arm, with p99 and CPU from the same sample. p99>10ms or mean fdatasync>1ms flagged; preserve all. Qualify throughput/p99 and CPU savings; missing eligible arm means unqualified.",
+      "purpose": "Complete guard cohort for role-separated notifications plus published-cursor completion. Both initial batch8/16 best-score screens passed throughput/p99/CPU checks. No source changes or retuning; no per-phase instrumentation.",
+      "cooldown_seconds": 45,
+      "operations": {
+        "batch": 750000,
+        "point_1": 5000,
+        "point_8_16": 20000
+      }
+    },
+    "cursor-plan.json": {
+      "schedule": [
+        [
+          "baseline",
+          8
+        ],
+        [
+          "cursor",
+          8
+        ],
+        [
+          "cursor",
+          16
+        ],
+        [
+          "baseline",
+          16
+        ],
+        [
+          "cursor",
+          8
+        ],
+        [
+          "baseline",
+          8
+        ],
+        [
+          "baseline",
+          16
+        ],
+        [
+          "cursor",
+          16
+        ]
+      ],
+      "binary_sha256": {
+        "baseline": "5387771a5278302e65236fbfac65856c87b7e51bb37be5f0e9e62c05ac19279a",
+        "cursor": "937a3843a044e107e15db756674be151875e388ff3a0a392cbd4e97463bbd2aa"
+      },
+      "selection": "Highest throughput eligible per arm/writer count; same-run p99, CPU and context switches. Flag p99>10ms or mean fdatasync>1ms; retain all raw samples.",
+      "stage": "End-to-end durable-only completion: role-separated notifications plus consuming the already-published cursor without the physical frontier mutex. No digest, DATA grouping or sync policy changes. Same original baseline.",
+      "context": "getrusage RUSAGE_SELF deltas only around timed write interval; identical optional probe in both binaries; no hot-path attribution or perf sampling."
+    },
+    "confirmation-plan.json": {
+      "schedule": [
+        [
+          "batch",
+          1,
+          "baseline"
+        ],
+        [
+          "batch",
+          1,
+          "cursor"
+        ],
+        [
+          "batch",
+          8,
+          "cursor"
+        ],
+        [
+          "batch",
+          8,
+          "baseline"
+        ],
+        [
+          "point",
+          16,
+          "baseline"
+        ],
+        [
+          "point",
+          16,
+          "cursor"
+        ],
+        [
+          "point",
+          16,
+          "cursor"
+        ],
+        [
+          "point",
+          16,
+          "baseline"
+        ],
+        [
+          "batch",
+          8,
+          "baseline"
+        ],
+        [
+          "batch",
+          8,
+          "cursor"
+        ],
+        [
+          "batch",
+          1,
+          "cursor"
+        ],
+        [
+          "batch",
+          1,
+          "baseline"
+        ]
+      ],
+      "binary_sha256": {
+        "baseline": "5387771a5278302e65236fbfac65856c87b7e51bb37be5f0e9e62c05ac19279a",
+        "cursor": "937a3843a044e107e15db756674be151875e388ff3a0a392cbd4e97463bbd2aa"
+      },
+      "selection": "Highest eligible throughput per workload/writer/arm, with p99 and CPU from the same sample. p99>10ms or mean fdatasync>1ms flagged; preserve all. Qualify throughput/p99 and CPU savings; missing eligible arm means unqualified.",
+      "purpose": "Final focused confirmation with unchanged binaries: batch1/batch8 near-negative guard samples and point16 missing eligible arms. Two reversed rounds, one fixed 45s cooldown. No source changes, tuning, or additional automatic cohorts after this.",
+      "cooldown_seconds": 45,
+      "operations": {
+        "batch": 750000,
+        "point_1": 5000,
+        "point_8_16": 20000
+      }
+    },
+    "cpu-plan.json": {
+      "schedule": [
+        "baseline",
+        "roles",
+        "roles",
+        "baseline"
+      ],
+      "writers": 16,
+      "binary_sha256": {
+        "baseline": "6358dadb554259064be3f7c42b829291930433ff236ea633b0bdb8035097e1ad",
+        "roles": "fd1d5942c01e6518884a9c57cc8c1842e877b4e6f0b7dab8830605ad37006390"
+      },
+      "purpose": "Publication CPU diagnostic only: memtable/MVCC scopes, sample rate 64; no global allocator wrapper, stack sampling or detailed WAL diagnostics. Do not treat as retention qualification.",
+      "cooldown_seconds": 45,
+      "selection": "Preserve and flag all p99>10ms or mean fdatasync>1ms runs. Compare complete same-run metrics. Inclusive phase estimates, scaled separately per thread; sampling overhead retained in both arms."
+    },
+    "roles-plan.json": {
+      "schedule": [
+        [
+          "baseline",
+          8
+        ],
+        [
+          "roles",
+          8
+        ],
+        [
+          "roles",
+          16
+        ],
+        [
+          "baseline",
+          16
+        ],
+        [
+          "roles",
+          8
+        ],
+        [
+          "baseline",
+          8
+        ],
+        [
+          "baseline",
+          16
+        ],
+        [
+          "roles",
+          16
+        ]
+      ],
+      "binary_sha256": {
+        "baseline": "5387771a5278302e65236fbfac65856c87b7e51bb37be5f0e9e62c05ac19279a",
+        "roles": "c634346d5ec3f81a0bcb49f5d658dfa53a3397ecb3a284c700bed7069c1ddab4"
+      },
+      "selection": "Highest throughput eligible per arm/writer count; same-run p99, CPU and context switches. Flag p99>10ms or mean fdatasync>1ms; retain all raw samples.",
+      "stage": "Role separation: one readiness subscriber; followers subscribe only to durable publication/handoff. Same batch64 8/16 screen; solo/point guards conditional on passing. No policy or digest changes.",
+      "context": "getrusage RUSAGE_SELF deltas only around timed write interval; identical optional probe in both binaries; no hot-path attribution or perf sampling."
+    },
+    "retry-plan.json": {
+      "schedule": [
+        [
+          "split",
+          8
+        ],
+        [
+          "baseline",
+          8
+        ],
+        [
+          "baseline",
+          16
+        ],
+        [
+          "split",
+          16
+        ],
+        [
+          "baseline",
+          8
+        ],
+        [
+          "split",
+          8
+        ],
+        [
+          "split",
+          16
+        ],
+        [
+          "baseline",
+          16
+        ]
+      ],
+      "binary_sha256": {
+        "baseline": "5387771a5278302e65236fbfac65856c87b7e51bb37be5f0e9e62c05ac19279a",
+        "split": "817c190096e73676dcf0dd640dd32a91a6c2db32fe8abbf1695f193e14413865"
+      },
+      "selection": "Highest throughput eligible per arm/writer count; same-run p99, CPU and context switches. Flag p99>10ms or mean fdatasync>1ms; retain all raw samples.",
+      "stage": "Unchanged-source confirmation after first cohort had only one eligible eight-writer sample per arm and one eligible sixteen-writer candidate. Reverse order; one fixed 20-second cooldown. No retuning.",
+      "context": "getrusage RUSAGE_SELF deltas only around timed write interval; identical optional probe in both binaries; no hot-path attribution or perf sampling."
+    },
+    "plan.json": {
+      "schedule": [
+        [
+          "baseline",
+          8
+        ],
+        [
+          "split",
+          8
+        ],
+        [
+          "split",
+          16
+        ],
+        [
+          "baseline",
+          16
+        ],
+        [
+          "split",
+          8
+        ],
+        [
+          "baseline",
+          8
+        ],
+        [
+          "baseline",
+          16
+        ],
+        [
+          "split",
+          16
+        ]
+      ],
+      "binary_sha256": {
+        "baseline": "5387771a5278302e65236fbfac65856c87b7e51bb37be5f0e9e62c05ac19279a",
+        "split": "817c190096e73676dcf0dd640dd32a91a6c2db32fe8abbf1695f193e14413865"
+      },
+      "selection": "Highest throughput eligible per arm/writer count; same-run p99, CPU and context switches. Flag p99>10ms or mean fdatasync>1ms; retain all raw samples.",
+      "stage": "Batch64 8/16 screen. Solo and point guards follow only if the initial throughput/p99/CPU screen supports retaining the candidate. No compiler/tests during measurement.",
+      "context": "getrusage RUSAGE_SELF deltas only around timed write interval; identical optional probe in both binaries; no hot-path attribution or perf sampling."
+    }
+  }
+}

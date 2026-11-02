@@ -1,0 +1,152 @@
+{
+  "base_revision": "fdde06706ffc96c458c50fb87a431c13ec76d4d7",
+  "schedule": [
+    [
+      "batch",
+      1,
+      "baseline"
+    ],
+    [
+      "batch",
+      1,
+      "kept"
+    ],
+    [
+      "point",
+      1,
+      "kept"
+    ],
+    [
+      "point",
+      1,
+      "baseline"
+    ],
+    [
+      "batch",
+      8,
+      "baseline"
+    ],
+    [
+      "batch",
+      8,
+      "kept"
+    ],
+    [
+      "point",
+      8,
+      "kept"
+    ],
+    [
+      "point",
+      8,
+      "baseline"
+    ],
+    [
+      "batch",
+      16,
+      "baseline"
+    ],
+    [
+      "batch",
+      16,
+      "kept"
+    ],
+    [
+      "point",
+      16,
+      "kept"
+    ],
+    [
+      "point",
+      16,
+      "baseline"
+    ],
+    [
+      "point",
+      16,
+      "kept"
+    ],
+    [
+      "point",
+      16,
+      "baseline"
+    ],
+    [
+      "batch",
+      16,
+      "baseline"
+    ],
+    [
+      "batch",
+      16,
+      "kept"
+    ],
+    [
+      "point",
+      8,
+      "kept"
+    ],
+    [
+      "point",
+      8,
+      "baseline"
+    ],
+    [
+      "batch",
+      8,
+      "baseline"
+    ],
+    [
+      "batch",
+      8,
+      "kept"
+    ],
+    [
+      "point",
+      1,
+      "kept"
+    ],
+    [
+      "point",
+      1,
+      "baseline"
+    ],
+    [
+      "batch",
+      1,
+      "baseline"
+    ],
+    [
+      "batch",
+      1,
+      "kept"
+    ]
+  ],
+  "binary_sha256": {
+    "baseline": "5387771a5278302e65236fbfac65856c87b7e51bb37be5f0e9e62c05ac19279a",
+    "kept": "937a3843a044e107e15db756674be151875e388ff3a0a392cbd4e97463bbd2aa"
+  },
+  "binary_paths": {
+    "baseline": "/home/liu/proj/toy-kv-engine/target/rfc-026-v8-notification-split-20261102/write-perf-baseline",
+    "kept": "/home/liu/proj/toy-kv-engine/target/rfc-026-v8-notification-split-20261102/write-perf-cursor"
+  },
+  "selection": "Highest eligible throughput per workload/writer/arm; p99, CPU and counters from the same sample.",
+  "stall_filter": {
+    "p99_ms_greater_than": 10,
+    "mean_fdatasync_ms_greater_than": 1
+  },
+  "purpose": "Fresh unchanged-code rerun after the maintainer explicitly requested keeping the combined notification and cursor changes. Keep code regardless of performance outcome; no push or merge.",
+  "initial_cooldown_seconds": 45,
+  "between_runs_seconds": 3,
+  "operations": {
+    "batch": 750000,
+    "point_1": 5000,
+    "point_8_16": 20000
+  },
+  "value_size": 1024,
+  "wal_batch_size": 64,
+  "latency_sample_every": 10,
+  "detailed_wal_profile": false,
+  "publication_cpu_probe": false,
+  "context_probe": "Batch-only before/after timed interval; absent for point writes."
+}

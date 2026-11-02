@@ -1,0 +1,375 @@
+--- a/kv-engine/src/wal/v8/parallel.rs
++++ b/kv-engine/src/wal/v8/parallel.rs
+@@ -63,6 +63,9 @@
+ struct CoordinatorInner {
+     state: Mutex<CoordinatorState>,
+     changed: Condvar,
++    /// Preparation and admission changes cannot make a durability waiter
++    /// useful. Subscribe frontier formation to DATA/prefix progress instead.
++    durability_changed: Condvar,
+     /// Published before releasing admission or returning a producer job. A
+     /// DATA submitter can identify a lone admitted head without taking the
+     /// coordinator lock under its submission lock.
+@@ -90,12 +93,15 @@
+     pending_frontier: Option<WalV8FrontierReservation>,
+     last_frontier_end: u64,
+     change_generation: u64,
++    durability_generation: u64,
+     closed: bool,
+     poisoned: bool,
+     #[cfg(test)]
+     ticket_admission_waiters: usize,
+     #[cfg(test)]
+     frontier_coalesce_waiters: usize,
++    #[cfg(test)]
++    durability_waiters: usize,
+     #[cfg(feature = "bench")]
+     ordered_link_hash_cpu_ns: u64,
+ }
+@@ -233,16 +239,20 @@
+                     pending_frontier: None,
+                     last_frontier_end: config.next_data_offset,
+                     change_generation: 0,
++                    durability_generation: 0,
+                     closed: false,
+                     poisoned: false,
+                     #[cfg(test)]
+                     ticket_admission_waiters: 0,
+                     #[cfg(test)]
+                     frontier_coalesce_waiters: 0,
++                    #[cfg(test)]
++                    durability_waiters: 0,
+                     #[cfg(feature = "bench")]
+                     ordered_link_hash_cpu_ns: 0,
+                 }),
+                 changed: Condvar::new(),
++                durability_changed: Condvar::new(),
+                 admitted_ticket_end: AtomicU64::new(config.next_ticket),
+                 segment_incarnation: header.incarnation,
+                 physical_header_digest,
+@@ -344,7 +354,9 @@
+             {
+                 state.frontier_coalesce_waiters += 1;
+             }
+-            self.inner.changed.wait_for(&mut state, remaining);
++            self.inner
++                .durability_changed
++                .wait_for(&mut state, remaining);
+             #[cfg(test)]
+             {
+                 state.frontier_coalesce_waiters -= 1;
+@@ -480,6 +492,7 @@
+         }
+         #[cfg(feature = "bench")]
+         let cpu_before = state.ordered_link_hash_cpu_ns;
++        let folded_before = state.folded_ticket_end;
+         if let Err(error) = fold_ready_digests(&mut state) {
+             poison_locked(&self.inner, &mut state);
+             return Err(error);
+@@ -489,6 +502,18 @@
+         #[cfg(not(feature = "bench"))]
+         let ordered_link_hash_cpu_ns = 0;
+         signal_change(&self.inner, &mut state);
++        // DATA may complete before the producer digest. Only a newly folded
++        // digest inside the contiguous ready prefix can unblock durability;
++        // hashing in front of unfinished DATA is preparation progress only.
++        if state.folded_ticket_end > folded_before
++            && state
++                .tickets
++                .iter()
++                .take_while(|ticket| ticket.is_frontier_ready())
++                .any(|ticket| ticket.assignment.segment_ticket >= folded_before)
++        {
++            signal_durability_progress(&self.inner, &mut state);
++        }
+         Ok(ordered_link_hash_cpu_ns)
+     }
+ 
+@@ -514,6 +539,7 @@
+         }
+         state.tickets[index].data_complete = true;
+         signal_change(&self.inner, &mut state);
++        signal_durability_progress(&self.inner, &mut state);
+         Ok(())
+     }
+ 
+@@ -590,6 +616,7 @@
+             entry.data_complete = true;
+         }
+         signal_change(&self.inner, &mut state);
++        signal_durability_progress(&self.inner, &mut state);
+         Ok(())
+     }
+ 
+@@ -735,6 +762,7 @@
+         state.last_frontier_end = frontier_end;
+         state.pending_frontier = None;
+         signal_change(&self.inner, &mut state);
++        signal_durability_progress(&self.inner, &mut state);
+         Ok(())
+     }
+ 
+@@ -744,6 +772,7 @@
+         if !state.closed {
+             state.closed = true;
+             signal_change(&self.inner, &mut state);
++            signal_durability_progress(&self.inner, &mut state);
+         }
+     }
+ 
+@@ -809,6 +838,46 @@
+ 
+     pub(crate) fn change_generation(&self) -> u64 {
+         self.inner.state.lock().change_generation
++    }
++
++    /// Notification generation for DATA/prefix readiness and durable
++    /// publication. This is independent of the on-disk FRONTIER generation.
++    pub(crate) fn durability_generation(&self) -> u64 {
++        self.inner.state.lock().durability_generation
++    }
++
++    /// Wait for durability progress without subscribing to producer
++    /// preparation notifications. The locked predicate prevents lost wakes;
++    /// one deadline bounds the wait even after a spurious notification.
++    pub(crate) fn wait_for_durability_change(
++        &self,
++        observed_generation: u64,
++        timeout: Duration,
++    ) -> WalV8CoordinatorWake {
++        let deadline = Instant::now() + timeout;
++        let mut state = self.inner.state.lock();
++        while state.durability_generation == observed_generation && !state.closed && !state.poisoned
++        {
++            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
++                break;
++            };
++            #[cfg(test)]
++            {
++                state.durability_waiters += 1;
++            }
++            self.inner
++                .durability_changed
++                .wait_for(&mut state, remaining);
++            #[cfg(test)]
++            {
++                state.durability_waiters -= 1;
++            }
++        }
++        WalV8CoordinatorWake {
++            change_generation: state.durability_generation,
++            closed: state.closed,
++            poisoned: state.poisoned,
++        }
+     }
+ 
+     #[cfg(test)]
+@@ -1161,10 +1230,16 @@
+     inner.changed.notify_all();
+ }
+ 
++fn signal_durability_progress(inner: &CoordinatorInner, state: &mut CoordinatorState) {
++    state.durability_generation = state.durability_generation.wrapping_add(1);
++    inner.durability_changed.notify_all();
++}
++
+ fn poison_locked(inner: &CoordinatorInner, state: &mut CoordinatorState) {
+     if !state.poisoned {
+         state.poisoned = true;
+         signal_change(inner, state);
++        signal_durability_progress(inner, state);
+     }
+ }
+ 
+@@ -1965,4 +2040,170 @@
+         assert_eq!(coordinator.next_ticket(), 0);
+         Ok(())
+     }
+-}
++
++    fn wait_for_durability_subscriber(coordinator: &WalV8ParallelCoordinator) -> Result<()> {
++        let deadline = Instant::now() + Duration::from_secs(1);
++        while coordinator.inner.state.lock().durability_waiters == 0 {
++            ensure!(
++                Instant::now() < deadline,
++                "durability subscriber did not start waiting"
++            );
++            std::thread::yield_now();
++        }
++        Ok(())
++    }
++
++    #[test]
++    fn preparation_updates_do_not_release_durability_waiters() -> Result<()> {
++        let coordinator = coordinator(8)?;
++        let generation = coordinator.durability_generation();
++        let waiting = coordinator.clone();
++        let (tx, rx) = std::sync::mpsc::channel();
++        let waiter = std::thread::spawn(move || {
++            let _ = tx.send(waiting.wait_for_durability_change(generation, Duration::from_secs(5)));
++        });
++        wait_for_durability_subscriber(&coordinator)?;
++
++        let first = batch(10);
++        let mut encoded = admit(&first, &coordinator)?.encode()?;
++        mark_producer_ready(&mut encoded, &coordinator, false)?;
++        assert!(coordinator.change_generation() > 0);
++        assert_eq!(coordinator.durability_generation(), generation);
++        assert!(matches!(
++            rx.try_recv(),
++            Err(std::sync::mpsc::TryRecvError::Empty)
++        ));
++
++        coordinator.mark_data_complete(0)?;
++        let wake = rx.recv_timeout(Duration::from_secs(1))?;
++        assert_ne!(wake.change_generation, generation);
++        assert!(!wake.closed && !wake.poisoned);
++        assert_eq!(coordinator.durable_ticket_end(), 0);
++        waiter.join().expect("durability subscriber panicked");
++        let frontier = coordinator.reserve_frontier(1)?;
++        coordinator.publish_durable_frontier(frontier)?;
++        encoded.disarm_after_durable();
++        Ok(())
++    }
++
++    #[test]
++    fn late_digest_fold_wakes_durability_waiters_after_data_completes() -> Result<()> {
++        let coordinator = coordinator(8)?;
++        let first = batch(10);
++        let second = batch(20);
++        let mut first_encoded = admit(&first, &coordinator)?.encode()?;
++        let mut second_encoded = admit(&second, &coordinator)?.encode()?;
++        coordinator.mark_frames_ready(0)?;
++        coordinator.mark_frames_ready(1)?;
++        coordinator.mark_data_group_complete(0..2)?;
++        assert!(coordinator.frontier_ready_prefix().is_empty());
++
++        let generation = coordinator.durability_generation();
++        let waiting = coordinator.clone();
++        let (tx, rx) = std::sync::mpsc::channel();
++        let waiter = std::thread::spawn(move || {
++            let _ = tx.send(waiting.wait_for_durability_change(generation, Duration::from_secs(5)));
++        });
++        wait_for_durability_subscriber(&coordinator)?;
++        coordinator.mark_digest_ready(second_encoded.digest_ready()?)?;
++        assert_eq!(coordinator.durability_generation(), generation);
++        assert!(matches!(
++            rx.try_recv(),
++            Err(std::sync::mpsc::TryRecvError::Empty)
++        ));
++
++        coordinator.mark_digest_ready(first_encoded.digest_ready()?)?;
++        let wake = rx.recv_timeout(Duration::from_secs(1))?;
++        assert_ne!(wake.change_generation, generation);
++        assert_eq!(coordinator.frontier_ready_prefix().len(), 2);
++        assert_eq!(coordinator.durable_ticket_end(), 0);
++        waiter.join().expect("late-digest subscriber panicked");
++        let frontier = coordinator.reserve_frontier(2)?;
++        coordinator.publish_durable_frontier(frontier)?;
++        first_encoded.disarm_after_durable();
++        second_encoded.disarm_after_durable();
++        Ok(())
++    }
++
++    #[test]
++    fn frontier_reservation_does_not_replace_durable_publication_notification() -> Result<()> {
++        let coordinator = coordinator(8)?;
++        let first = batch(10);
++        let mut encoded = admit(&first, &coordinator)?.encode()?;
++        mark_producer_ready(&mut encoded, &coordinator, true)?;
++        let generation = coordinator.durability_generation();
++        let frontier = coordinator.reserve_frontier(1)?;
++        assert_eq!(coordinator.durability_generation(), generation);
++        assert_eq!(coordinator.durable_ticket_end(), 0);
++
++        let waiting = coordinator.clone();
++        let (tx, rx) = std::sync::mpsc::channel();
++        let waiter = std::thread::spawn(move || {
++            let _ = tx.send(waiting.wait_for_durability_change(generation, Duration::from_secs(5)));
++        });
++        wait_for_durability_subscriber(&coordinator)?;
++        coordinator.publish_durable_frontier(frontier)?;
++        let wake = rx.recv_timeout(Duration::from_secs(1))?;
++        assert_ne!(wake.change_generation, generation);
++        assert_eq!(coordinator.durable_ticket_end(), 1);
++        waiter
++            .join()
++            .expect("durable-publication subscriber panicked");
++        encoded.disarm_after_durable();
++        Ok(())
++    }
++
++    #[test]
++    fn close_and_poison_wake_durability_subscribers() -> Result<()> {
++        for poison in [false, true] {
++            let coordinator = coordinator(8)?;
++            let generation = coordinator.durability_generation();
++            let waiting = coordinator.clone();
++            let (tx, rx) = std::sync::mpsc::channel();
++            let waiter = std::thread::spawn(move || {
++                let _ =
++                    tx.send(waiting.wait_for_durability_change(generation, Duration::from_secs(5)));
++            });
++            wait_for_durability_subscriber(&coordinator)?;
++            if poison {
++                coordinator.poison();
++            } else {
++                coordinator.close();
++            }
++            let wake = rx.recv_timeout(Duration::from_secs(1))?;
++            assert_ne!(wake.change_generation, generation);
++            assert_eq!(wake.poisoned, poison);
++            assert_eq!(wake.closed, !poison);
++            waiter.join().expect("lifecycle subscriber panicked");
++        }
++        Ok(())
++    }
++
++    #[test]
++    fn late_digest_wakes_frontier_coalescing_without_a_data_completion_event() -> Result<()> {
++        let coordinator = coordinator(8)?;
++        let first = batch(10);
++        let second = batch(20);
++        let mut first_encoded = admit(&first, &coordinator)?.encode()?;
++        let mut second_encoded = admit(&second, &coordinator)?.encode()?;
++        mark_producer_ready(&mut first_encoded, &coordinator, true)?;
++        coordinator.mark_frames_ready(1)?;
++        coordinator.mark_data_complete(1)?;
++
++        let waiting = coordinator.clone();
++        let (tx, rx) = std::sync::mpsc::channel();
++        let waiter = std::thread::spawn(move || {
++            let _ = tx.send(waiting.coalesce_frontier_ready(Duration::from_secs(5)));
++        });
++        wait_for_frontier_coalescer(&coordinator)?;
++        coordinator.mark_digest_ready(second_encoded.digest_ready()?)?;
++        assert!(rx.recv_timeout(Duration::from_secs(1))?);
++        assert_eq!(coordinator.frontier_ready_prefix().len(), 2);
++        waiter.join().expect("late-digest coalescer panicked");
++        let frontier = coordinator.reserve_frontier(2)?;
++        coordinator.publish_durable_frontier(frontier)?;
++        first_encoded.disarm_after_durable();
++        second_encoded.disarm_after_durable();
++        Ok(())
++    }
++}
+--- a/kv-engine/src/wal/v8/leader.rs
++++ b/kv-engine/src/wal/v8/leader.rs
+@@ -1641,7 +1641,7 @@
+                 return Ok(());
+             }
+ 
+-            let observed_generation = self.coordinator.change_generation();
++            let observed_generation = self.coordinator.durability_generation();
+             let mut previous = self.frontier.lock();
+             if self.coordinator.durable_ticket_end() >= ticket_end {
+                 return Ok(());
+@@ -1688,7 +1688,7 @@
+                 drop(previous);
+                 let wake = self
+                     .coordinator
+-                    .wait_for_change(observed_generation, Duration::from_secs(1));
++                    .wait_for_durability_change(observed_generation, Duration::from_secs(1));
+                 if wake.poisoned {
+                     anyhow::bail!("v8 Parallel WAL was poisoned while waiting for durability");
+                 }
