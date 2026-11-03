@@ -1,0 +1,408 @@
+{
+  "RFC_performance_qualified": false,
+  "classes": {
+    "{\"first_write\":\"WAL_ordinary\",\"first_write_size\":\"le_131072\",\"flush_queue\":\"2-7\",\"fua_before_DATA\":false,\"intervening_reads\":false,\"ordinary_before_DATA\":false,\"peak\":\"2-7\",\"queue\":\"2-7\",\"size\":\"le_131072\",\"workload\":\"batch64\"}": {
+      "accepted": false,
+      "reason": "insufficient_training_windows",
+      "validation_windows": 0,
+      "windows": 1
+    },
+    "{\"first_write\":\"WAL_ordinary\",\"first_write_size\":\"le_4096\",\"flush_queue\":\"0\",\"fua_before_DATA\":false,\"intervening_reads\":false,\"ordinary_before_DATA\":false,\"peak\":\"0\",\"queue\":\"0\",\"size\":\"le_4096\",\"workload\":\"point\"}": {
+      "accepted": false,
+      "reason": "no_separated_namespace_modes",
+      "validation_windows": 1230,
+      "windows": 2459
+    },
+    "{\"first_write\":\"non_WAL_FUA\",\"first_write_size\":\"le_4096\",\"flush_queue\":\"0\",\"fua_before_DATA\":true,\"intervening_reads\":false,\"ordinary_before_DATA\":false,\"peak\":\"0\",\"queue\":\"0\",\"size\":\"le_131072\",\"workload\":\"batch64\"}": {
+      "accepted": false,
+      "reason": "no_separated_namespace_modes",
+      "validation_windows": 1,
+      "windows": 72
+    },
+    "{\"first_write\":\"non_WAL_FUA\",\"first_write_size\":\"le_4096\",\"flush_queue\":\"0\",\"fua_before_DATA\":true,\"intervening_reads\":false,\"ordinary_before_DATA\":false,\"peak\":\"0\",\"queue\":\"0\",\"size\":\"le_4096\",\"workload\":\"point\"}": {
+      "accepted": false,
+      "reason": "no_separated_namespace_modes",
+      "validation_windows": 2497,
+      "windows": 1249
+    },
+    "{\"first_write\":\"non_WAL_FUA\",\"first_write_size\":\"le_4096\",\"flush_queue\":\"0\",\"fua_before_DATA\":true,\"intervening_reads\":false,\"ordinary_before_DATA\":false,\"peak\":\"1\",\"queue\":\"0\",\"size\":\"le_131072\",\"workload\":\"batch64\"}": {
+      "accepted": false,
+      "reason": "insufficient_training_windows",
+      "validation_windows": 7,
+      "windows": 9
+    },
+    "{\"first_write\":\"non_WAL_FUA\",\"first_write_size\":\"le_4096\",\"flush_queue\":\"0\",\"fua_before_DATA\":true,\"intervening_reads\":false,\"ordinary_before_DATA\":false,\"peak\":\"2-7\",\"queue\":\"0\",\"size\":\"le_131072\",\"workload\":\"batch64\"}": {
+      "accepted": false,
+      "reason": "insufficient_training_windows",
+      "validation_windows": 1,
+      "windows": 0
+    },
+    "{\"first_write\":\"non_WAL_FUA\",\"first_write_size\":\"le_4096\",\"flush_queue\":\"0\",\"fua_before_DATA\":true,\"intervening_reads\":false,\"ordinary_before_DATA\":true,\"peak\":\"1\",\"queue\":\"1\",\"size\":\"le_131072\",\"workload\":\"batch64\"}": {
+      "accepted": false,
+      "reason": "no_separated_namespace_modes",
+      "validation_windows": 15,
+      "windows": 13
+    },
+    "{\"first_write\":\"non_WAL_FUA\",\"first_write_size\":\"le_4096\",\"flush_queue\":\"0\",\"fua_before_DATA\":true,\"intervening_reads\":false,\"ordinary_before_DATA\":true,\"peak\":\"2-7\",\"queue\":\"1\",\"size\":\"le_131072\",\"workload\":\"batch64\"}": {
+      "accepted": false,
+      "reason": "no_separated_namespace_modes",
+      "validation_windows": 10,
+      "windows": 19
+    },
+    "{\"first_write\":\"non_WAL_FUA\",\"first_write_size\":\"le_4096\",\"flush_queue\":\"1\",\"fua_before_DATA\":true,\"intervening_reads\":false,\"ordinary_before_DATA\":false,\"peak\":\"0\",\"queue\":\"0\",\"size\":\"le_131072\",\"workload\":\"batch64\"}": {
+      "accepted": false,
+      "reason": "no_separated_namespace_modes",
+      "validation_windows": 0,
+      "windows": 18
+    },
+    "{\"first_write\":\"non_WAL_FUA\",\"first_write_size\":\"le_4096\",\"flush_queue\":\"1\",\"fua_before_DATA\":true,\"intervening_reads\":false,\"ordinary_before_DATA\":true,\"peak\":\"2-7\",\"queue\":\"1\",\"size\":\"le_131072\",\"workload\":\"batch64\"}": {
+      "accepted": false,
+      "reason": "insufficient_training_windows",
+      "validation_windows": 0,
+      "windows": 1
+    },
+    "{\"first_write\":\"non_WAL_FUA\",\"first_write_size\":\"le_4096\",\"flush_queue\":\"2-7\",\"fua_before_DATA\":true,\"intervening_reads\":false,\"ordinary_before_DATA\":false,\"peak\":\"1\",\"queue\":\"0\",\"size\":\"le_131072\",\"workload\":\"batch64\"}": {
+      "accepted": false,
+      "reason": "insufficient_training_windows",
+      "validation_windows": 0,
+      "windows": 2
+    },
+    "{\"first_write\":\"non_WAL_FUA\",\"first_write_size\":\"le_4096\",\"flush_queue\":\"2-7\",\"fua_before_DATA\":true,\"intervening_reads\":false,\"ordinary_before_DATA\":false,\"peak\":\"2-7\",\"queue\":\"0\",\"size\":\"le_131072\",\"workload\":\"batch64\"}": {
+      "accepted": false,
+      "reason": "no_separated_namespace_modes",
+      "validation_windows": 16,
+      "windows": 33
+    },
+    "{\"first_write\":\"non_WAL_FUA\",\"first_write_size\":\"le_4096\",\"flush_queue\":\"2-7\",\"fua_before_DATA\":true,\"intervening_reads\":false,\"ordinary_before_DATA\":false,\"peak\":\"2-7\",\"queue\":\"0\",\"size\":\"le_65536\",\"workload\":\"batch64\"}": {
+      "accepted": false,
+      "reason": "insufficient_training_windows",
+      "validation_windows": 1,
+      "windows": 1
+    },
+    "{\"first_write\":\"non_WAL_FUA\",\"first_write_size\":\"le_4096\",\"flush_queue\":\"2-7\",\"fua_before_DATA\":true,\"intervening_reads\":false,\"ordinary_before_DATA\":false,\"peak\":\"2-7\",\"queue\":\"2-7\",\"size\":\"le_131072\",\"workload\":\"batch64\"}": {
+      "accepted": false,
+      "reason": "insufficient_training_windows",
+      "validation_windows": 4,
+      "windows": 11
+    },
+    "{\"first_write\":\"non_WAL_FUA\",\"first_write_size\":\"le_4096\",\"flush_queue\":\"2-7\",\"fua_before_DATA\":true,\"intervening_reads\":false,\"ordinary_before_DATA\":true,\"peak\":\"2-7\",\"queue\":\"0\",\"size\":\"le_131072\",\"workload\":\"batch64\"}": {
+      "accepted": false,
+      "reason": "insufficient_training_windows",
+      "validation_windows": 0,
+      "windows": 3
+    },
+    "{\"first_write\":\"non_WAL_FUA\",\"first_write_size\":\"le_4096\",\"flush_queue\":\"2-7\",\"fua_before_DATA\":true,\"intervening_reads\":false,\"ordinary_before_DATA\":true,\"peak\":\"2-7\",\"queue\":\"1\",\"size\":\"le_131072\",\"workload\":\"batch64\"}": {
+      "accepted": false,
+      "reason": "no_separated_namespace_modes",
+      "validation_windows": 11,
+      "windows": 26
+    }
+  },
+  "features": [
+    "first_namespace_write_us",
+    "post_flush_write_us",
+    "flush_to_write_gap_us"
+  ],
+  "frozen_monotonic_ns": 2603796711637519,
+  "frozen_unix_ns": 1793686072859110514,
+  "policy": {
+    "assignment_margin": 0.2,
+    "confirm_windows": 5,
+    "distance_weights": [
+      2.0,
+      1.0,
+      1.0
+    ],
+    "dominant_class_fraction": 0.8,
+    "envelope_expansion": 2.0,
+    "guard_ns": 20000000,
+    "interval_max_ns": 110000000,
+    "interval_min_ns": 90000000,
+    "invalid_trace": "quarantine_entire_run_as_unknown",
+    "max_fit_iterations": 50,
+    "max_pair_class_tv": 0.1,
+    "max_window_ns": 250000000,
+    "min_episode_ns": 500000000,
+    "min_io_observations": 16,
+    "min_percentile_samples": 100,
+    "min_supported_fraction": 0.95,
+    "namespace_median_separation": 4.0,
+    "namespace_quantile_separation": 2.0,
+    "pairs": [
+      [
+        0,
+        1
+      ],
+      [
+        2,
+        3
+      ]
+    ],
+    "radius_floor": 0.35,
+    "radius_p95_scale": 1.5,
+    "scope": "conditional latency-mode diagnostic; no RFC qualification",
+    "train_min_per_format_mode": 2,
+    "train_min_per_mode": 4,
+    "train_min_windows": 12,
+    "validation_min_coverage": 0.8,
+    "validation_min_per_format_mode": 2,
+    "validation_min_persistence_ns": 100000000,
+    "window_samples": 16
+  },
+  "schema": "kv-engine.wal-path-calibration.v1",
+  "source_sha256": {
+    "capture_wal_trace.py": "0543c3c202f490ad681788d4aa8577bad7c6d7c8e328996af781823961d32489",
+    "wal_extent_trace.py": "0e99fa82409828a3a1d7de56da10428661b57f7815ad8738120ff05247ec121e",
+    "wal_state_calibration.py": "dce69dc13b042f611799d5d037ffc0a4719b724afd6cb4da7fef85d31275f413",
+    "wal_trace_regimes.py": "5e20d0ae14b00eba82dd75d8e1c3a50cfbfea3a2cf0d5936dcaddf8594f29f39"
+  },
+  "study_sha256": "1947fb0a35f01f2e3175a38c9f625171eded7258d42e98f48d4bd04c3c4f97db",
+  "training": {
+    "identity": {
+      "analyzer_sha256": "5e20d0ae14b00eba82dd75d8e1c3a50cfbfea3a2cf0d5936dcaddf8594f29f39",
+      "binary_sha256": "9d35fcabc018c4815cc1b882af7f53d4c38f3724f04101a1aec977e0154c9747",
+      "boot_id": "b801063f-4f4d-427b-8842-8d2809a4776e",
+      "clock": "CLOCK_MONOTONIC",
+      "cpu_mask": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15
+      ],
+      "device": {
+        "disk": "nvme0n1",
+        "disk_major": 259,
+        "disk_minor": 0,
+        "fs_major": 259,
+        "fs_minor": 3,
+        "logical_block_bytes": 512,
+        "nsid": 1,
+        "partition_start_bytes": 54761881600
+      },
+      "events": [
+        "nvme/nvme_setup_cmd",
+        "nvme/nvme_complete_rq",
+        "block/block_rq_issue",
+        "block/block_rq_complete",
+        "ext4/ext4_ext_map_blocks_exit",
+        "ext4/ext4_free_blocks"
+      ],
+      "extent_helper_sha256": "0e99fa82409828a3a1d7de56da10428661b57f7815ad8738120ff05247ec121e",
+      "kernel": "6.12.71-1-lts",
+      "order": [
+        "v7",
+        "v8",
+        "v8",
+        "v7"
+      ],
+      "perf": "perf version 6.19-2",
+      "policy": {
+        "confirm_windows": 5,
+        "counter_interval_ms": 100,
+        "guard_ns": 20000000,
+        "max_sample_gap_ns": 250000000,
+        "min_interval_ns": 50000000,
+        "min_percentile_samples": 100,
+        "mode": "calibration_only_no_performance_ratio",
+        "window_samples": 16
+      },
+      "runner_sha256": "0543c3c202f490ad681788d4aa8577bad7c6d7c8e328996af781823961d32489",
+      "uid": 1000,
+      "workloads": [
+        {
+          "batch": 1,
+          "name": "point",
+          "num": 20000,
+          "writers": 1
+        },
+        {
+          "batch": 64,
+          "name": "batch64",
+          "num": 750000,
+          "writers": 16
+        }
+      ]
+    },
+    "path": "/home/liu/proj/toy-kv-engine/target/rfc-026-v8-calibrated-states-20261103-v2/training",
+    "sha256": {
+      "batch64-0-v7-benchmark.json": "ab6248eed849e1eca104f4d29b9e9483f6e007c16e15e0be9a198bc2f6b43a87",
+      "batch64-0-v7-capture.json": "e3490a7a2ddd02d95888c770c2b16af39255a4162a8c8b154b5b9749fd575584",
+      "batch64-0-v7-extent-analysis.json": "82823172e2be39b50c7e259c7167a1134042eb16326fa8511427dc742a95e99a",
+      "batch64-0-v7-timeline.json": "e15b845400b07725939f3d2579df4e9843597ef9bbc12978d4f1326b894a8320",
+      "batch64-0-v7.perf": "2cd371d4780736d16b4a59d1702a812bb0f7ae50aaa867fe507559be4136d393",
+      "batch64-1-v8-benchmark.json": "0e02f40234d22a5f4e9a4f1ba92f09644e81795e1342d340a5e9f4e93f12582c",
+      "batch64-1-v8-capture.json": "0280038d2250484f370a50830a65c6fb86c840ecc1964bf9719ffba786adba5b",
+      "batch64-1-v8-extent-analysis.json": "a4caee322d47ffeff7b6ab11184d2da709b2fe5a1990ec3768e96a9ef14146ba",
+      "batch64-1-v8-timeline.json": "e97b41c186be6da32817ae52740e1b73dee9c43b9f9a516302ae8610d2a0854a",
+      "batch64-1-v8.perf": "26cc5dcda580f784c2f574af338905b1a015f35bf7dfef7cd8a96f71582cf5e0",
+      "batch64-2-v8-benchmark.json": "a7ffe9e70dbcdb2c3907cfa488f09266bfd31831642f32303758f033b1872074",
+      "batch64-2-v8-capture.json": "767af88058997d3bf55dcbd3e8fd7e62c7fac0280b2d99c15cd1cc2d81915274",
+      "batch64-2-v8-extent-analysis.json": "09d62b8d278232c1fed3f9064cc4b9a780f8277903177d65bb77c89b9a1bfbc5",
+      "batch64-2-v8-timeline.json": "8c21756dbc24c9e160bb75b5f47525657742e287cef90cc67bec78a44a56b247",
+      "batch64-2-v8.perf": "54b9934cadc1020df89d8770019600daa9808f5b61d3e805f057062d444be865",
+      "batch64-3-v7-benchmark.json": "763489c978c901f33d938b0e29643dcc6463f44a3ac9c3f4de6c21a28004fd06",
+      "batch64-3-v7-capture.json": "feea5c8bd7c8ea021f2282b78d055c179bacd5d73c72c849b14831b55d2c7973",
+      "batch64-3-v7-extent-analysis.json": "58b307d7b128bde9dd76d86c1698684fdbb8480811c6bc340db4b7564008743e",
+      "batch64-3-v7-timeline.json": "7ae137ff9c1a64bbc7c8f2e75e7edfcbf4cb34498ccf6eb79b62822a419800dc",
+      "batch64-3-v7.perf": "d739a3e74c1dc36c3b24beaa2d277fba8bcdd50c62889be4bcc432d5b8711b56",
+      "formats.json": "6fa7549f2424d44a7e936909b438c1a0a3b137da29a65ceb0e231a3e0007a454",
+      "plan.json": "e9fae586113f25b6fd0de3e66cce1eaed97f8a0e9a949ee19b3369df208c86a8",
+      "point-0-v7-benchmark.json": "117367b1a8963e3c8d0348ae57b3a406c45582b522d37a5e3f59f5a2403dca4d",
+      "point-0-v7-capture.json": "698eea9fb6269e0dbe49fc4ce69e7e9038bd4d2ce6b64fb74c216135cf173acb",
+      "point-0-v7-extent-analysis.json": "ddd65e13983fb4769af99bf6aabdb532352b167e7b84dd9af6ec3263fbdef7d7",
+      "point-0-v7-timeline.json": "3b0d469e83a38f94b4f22e75f84262cb30002679295f84bd8d676efbc4aeb339",
+      "point-0-v7.perf": "c9ba3d4649f79fd63c607f9efc44d6011caa19a48ac629ded4b079f1228493af",
+      "point-1-v8-benchmark.json": "702ff0858970d94b853226ab2d3c6ecc0081919a8974b1fac1de09268e72fa11",
+      "point-1-v8-capture.json": "9cdea86bc73a4efb5c203a523757c22ec45b9a52cb650ce39f4ea65b48391b4a",
+      "point-1-v8-extent-analysis.json": "247e669d5f05b3fa8b67a1dccf5a586a0608641f91ab002d8a2e3a46c8d836a3",
+      "point-1-v8-timeline.json": "a580e9db08dc80b9cea838c9acfcd503b4b5be33a6513cc163f7e7d9aac27f4a",
+      "point-1-v8.perf": "e3394b6a659f3dfe6b61a67220562bff944a2432244d5f00677d5f95311df4af",
+      "point-2-v8-benchmark.json": "71740eceb5a907b8a2554f00001e3326e77a5c79b131bb15a1fd37960af1ab39",
+      "point-2-v8-capture.json": "b6014c67cf1f582f2da32b4dd25c56f1e365a5c87342d9e140e9eb5de909c087",
+      "point-2-v8-extent-analysis.json": "486f7d4d000d9c3a7e430a4015381a8e76ad168105412346f02adbaa1b7a8964",
+      "point-2-v8-timeline.json": "f4ca19fb0e8103716a2c086eb8858de9270e01bffaa7ec63a3bc15f38d190300",
+      "point-2-v8.perf": "74decb2536b10ddb0916c2b1fe1100ae437f83e1e6982296797c9e3d3d317363",
+      "point-3-v7-benchmark.json": "f49d71c9e627fc5ef46b01c3e7833c89e85dca187870b76b34d95322a5ea447c",
+      "point-3-v7-capture.json": "5e3fae1d089aeb4f75c8472bfb0491dea71d249df4e03a664d06077ebbf23497",
+      "point-3-v7-extent-analysis.json": "32322e6dbc08be496d0fe193d61b1e07f8658f3f64918a92194d7ca512a79175",
+      "point-3-v7-timeline.json": "14824592706178b75e3fc1dac97df9a2bd690bc5e2904d0fcb491bb34fbdb3d3",
+      "point-3-v7.perf": "ac34bb977f0236ede7d725fa53244d0d0d7994457c11db84fbf063ffbf6238ac"
+    }
+  },
+  "validation": {
+    "identity": {
+      "analyzer_sha256": "5e20d0ae14b00eba82dd75d8e1c3a50cfbfea3a2cf0d5936dcaddf8594f29f39",
+      "binary_sha256": "9d35fcabc018c4815cc1b882af7f53d4c38f3724f04101a1aec977e0154c9747",
+      "boot_id": "b801063f-4f4d-427b-8842-8d2809a4776e",
+      "clock": "CLOCK_MONOTONIC",
+      "cpu_mask": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15
+      ],
+      "device": {
+        "disk": "nvme0n1",
+        "disk_major": 259,
+        "disk_minor": 0,
+        "fs_major": 259,
+        "fs_minor": 3,
+        "logical_block_bytes": 512,
+        "nsid": 1,
+        "partition_start_bytes": 54761881600
+      },
+      "events": [
+        "nvme/nvme_setup_cmd",
+        "nvme/nvme_complete_rq",
+        "block/block_rq_issue",
+        "block/block_rq_complete",
+        "ext4/ext4_ext_map_blocks_exit",
+        "ext4/ext4_free_blocks"
+      ],
+      "extent_helper_sha256": "0e99fa82409828a3a1d7de56da10428661b57f7815ad8738120ff05247ec121e",
+      "kernel": "6.12.71-1-lts",
+      "order": [
+        "v7",
+        "v8",
+        "v8",
+        "v7"
+      ],
+      "perf": "perf version 6.19-2",
+      "policy": {
+        "confirm_windows": 5,
+        "counter_interval_ms": 100,
+        "guard_ns": 20000000,
+        "max_sample_gap_ns": 250000000,
+        "min_interval_ns": 50000000,
+        "min_percentile_samples": 100,
+        "mode": "calibration_only_no_performance_ratio",
+        "window_samples": 16
+      },
+      "runner_sha256": "0543c3c202f490ad681788d4aa8577bad7c6d7c8e328996af781823961d32489",
+      "uid": 1000,
+      "workloads": [
+        {
+          "batch": 1,
+          "name": "point",
+          "num": 20000,
+          "writers": 1
+        },
+        {
+          "batch": 64,
+          "name": "batch64",
+          "num": 750000,
+          "writers": 16
+        }
+      ]
+    },
+    "path": "/home/liu/proj/toy-kv-engine/target/rfc-026-v8-calibrated-states-20261103-v2/validation",
+    "sha256": {
+      "batch64-0-v7-benchmark.json": "7fd59cd49d115b33eb10fa930fb458c1f3e554c89b48b7314d6b606bb2396a8a",
+      "batch64-0-v7-capture.json": "8c8f2d87cf61bdbfd6a3577b2511a5c736428074e3069ed6ae20bc9a469675cc",
+      "batch64-0-v7-extent-analysis.json": "536723cfb1a730757c969b1fc7c3ab1fdebe2cc0cd36c55c1238136c0bd73192",
+      "batch64-0-v7-timeline.json": "5ee82ba91273435827a7f2e520f405d6830cc5429cbdd587f10811aaff3c1133",
+      "batch64-0-v7.perf": "a47d6251a0c5b8e0ecc58f5a4f7ebc4a7dc89bdb5aa125eba6324ebddf685e5d",
+      "batch64-1-v8-benchmark.json": "fad523ec7355817980cbde711f574a6e3feabc457cc574ef69ba85ac0755051a",
+      "batch64-1-v8-capture.json": "0a92a72ff07f5881a61c9315b754d6769b5090a86b05fec662aedbed49cd9c3e",
+      "batch64-1-v8-extent-analysis.json": "2adaa40730cd1b54d45ba5df6cadc61ff51d1b3642bd554d11037eb43543f819",
+      "batch64-1-v8-timeline.json": "0d51ed8bfe5aa90dca4936b9c85ac32a9bf1ae5399c7cfc760031e6ae0033933",
+      "batch64-1-v8.perf": "4ebb498dfef84fbd8b67f7ca1a65a536861e5819edeb26ea6611cfc8f3fa8db5",
+      "batch64-2-v8-benchmark.json": "7a7a4678501777760ed10dc3189ff353a87c503ab3d21135783d579ae8c28d1b",
+      "batch64-2-v8-capture.json": "80e60742691b9d2774095e3bc3608d6c4e782cb3b3abc7f0ede01fd282795ebe",
+      "batch64-2-v8-extent-analysis.json": "6ec9451ebb0d62363299d50c68dd6dedac92c9c7f972d95987834f072fdca939",
+      "batch64-2-v8-timeline.json": "9eede514a7f5a31727a6ddb6bcbcfcf612c8b7ffd886e9b57ec6c897e051f510",
+      "batch64-2-v8.perf": "cb941fd82a0cdc8be979253cd5bf4dcd854a5e1cf776236485c786310a79611b",
+      "batch64-3-v7-benchmark.json": "14d30b9db50cd0b0850df0b00df373ae0ee16a67addbd85e424eab09bf0ec66c",
+      "batch64-3-v7-capture.json": "cf672170b8d431faae4d52940a635d4fad82ba288d440ace2145758082a675b2",
+      "batch64-3-v7-extent-analysis.json": "f73abeff14978aa8229b3154292f358175e283bae96dc80afe2de99d0fa5b146",
+      "batch64-3-v7-timeline.json": "83490efdc16914e0ed2d026d7640c3385de7a2855d5ce2be4389ad199e4bf853",
+      "batch64-3-v7.perf": "baac485f4ec6286271c382d29dc5b2a6dafe8a206e4ee2302f08798647775fca",
+      "formats.json": "6fa7549f2424d44a7e936909b438c1a0a3b137da29a65ceb0e231a3e0007a454",
+      "plan.json": "e9fae586113f25b6fd0de3e66cce1eaed97f8a0e9a949ee19b3369df208c86a8",
+      "point-0-v7-benchmark.json": "33c2366dfbb4f8d89fc72fbbab7ed2f36097bc2b00b6a6e8bf9ccc31fc1c366f",
+      "point-0-v7-capture.json": "e78a475616b7d561bc244ecac3931c38bf0311029013c505f183c20d63623d34",
+      "point-0-v7-extent-analysis.json": "658efec659b5a0d5d0da1eb4f4c2c43cfca5e542fb4137f78ebff5243455b225",
+      "point-0-v7-timeline.json": "4fa51b6550de58cb33dcf3022d6edf2553c45dd2c08da5fb05a09e04b7588a3f",
+      "point-0-v7.perf": "1205796ce17c28db37bbf4e932bcb361cb4f91e65c86227c089d6f3a5b9e2b41",
+      "point-1-v8-benchmark.json": "794053aa376d36ef0837eaf9b2bb7c147226b0dffe8ef905890c88d75f64814d",
+      "point-1-v8-capture.json": "b98792701d2d043c60e0ab8fe441aeeb878af8a5f0ce1040a16255520706b634",
+      "point-1-v8-extent-analysis.json": "f0022678a63ffdb83223f9f9a28e5190e758942359d03a57599f09c5202ec65d",
+      "point-1-v8-timeline.json": "9eda9bdb06fa21eb76b4db791da2b80b6bfeaa108629ab845341a1064ff2ddb4",
+      "point-1-v8.perf": "c92c67c26d48b21a1a3e50c702d39dc56bdcd34d87ebbcb314764f2c6c679f3a",
+      "point-2-v8-benchmark.json": "05238bf0c0497ca012fd9f60f681d47f9dc0f98bcdbb62937d3542942b9264d0",
+      "point-2-v8-capture.json": "fbc56bf03760faa049e49cde23eb9b98880171bc9824f8984c6fa2ee0e0d16d7",
+      "point-2-v8-extent-analysis.json": "f78d5259fc6099de8d9b172952c431b315e0c681aec8123bb047d910d11321c5",
+      "point-2-v8-timeline.json": "92521d60272505b93a2c399e4805441b6d87f9b6a32d7588a6c8cc5375da267f",
+      "point-2-v8.perf": "c778ec545e68b0e05ca3dafdc3e0edfb7f4ef4c12cb4fb3e38b653c59bff842e",
+      "point-3-v7-benchmark.json": "89116e471c81a9897e2c8a6c3eb732e987fc105f5b5387d158cf345ca5e9c7da",
+      "point-3-v7-capture.json": "86e24828ae60ad08a732dcc225af95d854198d2a81c8d4c5acc5a784d7b8b546",
+      "point-3-v7-extent-analysis.json": "d6c099db0a251266a8aa606e9ce07099adadbe95e21b8120168f3107e062a1c3",
+      "point-3-v7-timeline.json": "c801c08bd2af31b461141e4a9ec1d56742416d8eb96d767f87c67f2e4d70687e",
+      "point-3-v7.perf": "16dd2318282c05cc438e4ac3ced326c1a999009e7296388fab3a6f6a92dadb8f"
+    }
+  }
+}

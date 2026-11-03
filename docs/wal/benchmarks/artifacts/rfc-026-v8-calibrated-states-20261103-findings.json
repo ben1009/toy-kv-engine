@@ -1,0 +1,1235 @@
+{
+  "accepted_classes": 0,
+  "class_diagnostics": [
+    {
+      "class": {
+        "first_write": "WAL_ordinary",
+        "first_write_size": "le_131072",
+        "flush_queue": "2-7",
+        "fua_before_DATA": false,
+        "intervening_reads": false,
+        "ordinary_before_DATA": false,
+        "peak": "2-7",
+        "queue": "2-7",
+        "size": "le_131072",
+        "workload": "batch64"
+      },
+      "rejection_reason": "insufficient_training_windows",
+      "training": {
+        "v7": {
+          "namespace_p10_us": 45.59199999999999,
+          "namespace_p50_us": 45.59199999999999,
+          "namespace_p90_us": 45.59199999999999,
+          "windows": 1
+        },
+        "v8": {
+          "namespace_p10_us": null,
+          "namespace_p50_us": null,
+          "namespace_p90_us": null,
+          "windows": 0
+        }
+      },
+      "validation": {
+        "v7": {
+          "namespace_p10_us": null,
+          "namespace_p50_us": null,
+          "namespace_p90_us": null,
+          "windows": 0
+        },
+        "v8": {
+          "namespace_p10_us": null,
+          "namespace_p50_us": null,
+          "namespace_p90_us": null,
+          "windows": 0
+        }
+      }
+    },
+    {
+      "class": {
+        "first_write": "WAL_ordinary",
+        "first_write_size": "le_4096",
+        "flush_queue": "0",
+        "fua_before_DATA": false,
+        "intervening_reads": false,
+        "ordinary_before_DATA": false,
+        "peak": "0",
+        "queue": "0",
+        "size": "le_4096",
+        "workload": "point"
+      },
+      "rejection_reason": "no_separated_namespace_modes",
+      "training": {
+        "v7": {
+          "namespace_p10_us": 70.33049999999999,
+          "namespace_p50_us": 75.57949999999998,
+          "namespace_p90_us": 577.6354999999999,
+          "windows": 2459
+        },
+        "v8": {
+          "namespace_p10_us": null,
+          "namespace_p50_us": null,
+          "namespace_p90_us": null,
+          "windows": 0
+        }
+      },
+      "validation": {
+        "v7": {
+          "namespace_p10_us": 69.7795,
+          "namespace_p50_us": 73.65025,
+          "namespace_p90_us": 75.93050000000002,
+          "windows": 1230
+        },
+        "v8": {
+          "namespace_p10_us": null,
+          "namespace_p50_us": null,
+          "namespace_p90_us": null,
+          "windows": 0
+        }
+      }
+    },
+    {
+      "class": {
+        "first_write": "non_WAL_FUA",
+        "first_write_size": "le_4096",
+        "flush_queue": "0",
+        "fua_before_DATA": true,
+        "intervening_reads": false,
+        "ordinary_before_DATA": false,
+        "peak": "0",
+        "queue": "0",
+        "size": "le_131072",
+        "workload": "batch64"
+      },
+      "rejection_reason": "no_separated_namespace_modes",
+      "training": {
+        "v7": {
+          "namespace_p10_us": null,
+          "namespace_p50_us": null,
+          "namespace_p90_us": null,
+          "windows": 0
+        },
+        "v8": {
+          "namespace_p10_us": 24.131500000000003,
+          "namespace_p50_us": 24.79725,
+          "namespace_p90_us": 27.34700000000001,
+          "windows": 72
+        }
+      },
+      "validation": {
+        "v7": {
+          "namespace_p10_us": null,
+          "namespace_p50_us": null,
+          "namespace_p90_us": null,
+          "windows": 0
+        },
+        "v8": {
+          "namespace_p10_us": 28.626500000000004,
+          "namespace_p50_us": 28.626500000000004,
+          "namespace_p90_us": 28.626500000000004,
+          "windows": 1
+        }
+      }
+    },
+    {
+      "class": {
+        "first_write": "non_WAL_FUA",
+        "first_write_size": "le_4096",
+        "flush_queue": "0",
+        "fua_before_DATA": true,
+        "intervening_reads": false,
+        "ordinary_before_DATA": false,
+        "peak": "0",
+        "queue": "0",
+        "size": "le_4096",
+        "workload": "point"
+      },
+      "rejection_reason": "no_separated_namespace_modes",
+      "training": {
+        "v7": {
+          "namespace_p10_us": null,
+          "namespace_p50_us": null,
+          "namespace_p90_us": null,
+          "windows": 0
+        },
+        "v8": {
+          "namespace_p10_us": 24.163500000000003,
+          "namespace_p50_us": 25.231000000000005,
+          "namespace_p90_us": 26.126499999999997,
+          "windows": 1249
+        }
+      },
+      "validation": {
+        "v7": {
+          "namespace_p10_us": null,
+          "namespace_p50_us": null,
+          "namespace_p90_us": null,
+          "windows": 0
+        },
+        "v8": {
+          "namespace_p10_us": 24.700499999999998,
+          "namespace_p50_us": 633.665,
+          "namespace_p90_us": 635.3400000000001,
+          "windows": 2497
+        }
+      }
+    },
+    {
+      "class": {
+        "first_write": "non_WAL_FUA",
+        "first_write_size": "le_4096",
+        "flush_queue": "0",
+        "fua_before_DATA": true,
+        "intervening_reads": false,
+        "ordinary_before_DATA": false,
+        "peak": "1",
+        "queue": "0",
+        "size": "le_131072",
+        "workload": "batch64"
+      },
+      "rejection_reason": "insufficient_training_windows",
+      "training": {
+        "v7": {
+          "namespace_p10_us": 26.737500000000008,
+          "namespace_p50_us": 27.237,
+          "namespace_p90_us": 28.948999999999995,
+          "windows": 9
+        },
+        "v8": {
+          "namespace_p10_us": null,
+          "namespace_p50_us": null,
+          "namespace_p90_us": null,
+          "windows": 0
+        }
+      },
+      "validation": {
+        "v7": {
+          "namespace_p10_us": 26.557999999999996,
+          "namespace_p50_us": 27.833499999999994,
+          "namespace_p90_us": 29.323500000000003,
+          "windows": 7
+        },
+        "v8": {
+          "namespace_p10_us": null,
+          "namespace_p50_us": null,
+          "namespace_p90_us": null,
+          "windows": 0
+        }
+      }
+    },
+    {
+      "class": {
+        "first_write": "non_WAL_FUA",
+        "first_write_size": "le_4096",
+        "flush_queue": "0",
+        "fua_before_DATA": true,
+        "intervening_reads": false,
+        "ordinary_before_DATA": false,
+        "peak": "2-7",
+        "queue": "0",
+        "size": "le_131072",
+        "workload": "batch64"
+      },
+      "rejection_reason": "insufficient_training_windows",
+      "training": {
+        "v7": {
+          "namespace_p10_us": null,
+          "namespace_p50_us": null,
+          "namespace_p90_us": null,
+          "windows": 0
+        },
+        "v8": {
+          "namespace_p10_us": null,
+          "namespace_p50_us": null,
+          "namespace_p90_us": null,
+          "windows": 0
+        }
+      },
+      "validation": {
+        "v7": {
+          "namespace_p10_us": 28.449,
+          "namespace_p50_us": 28.449,
+          "namespace_p90_us": 28.449,
+          "windows": 1
+        },
+        "v8": {
+          "namespace_p10_us": null,
+          "namespace_p50_us": null,
+          "namespace_p90_us": null,
+          "windows": 0
+        }
+      }
+    },
+    {
+      "class": {
+        "first_write": "non_WAL_FUA",
+        "first_write_size": "le_4096",
+        "flush_queue": "0",
+        "fua_before_DATA": true,
+        "intervening_reads": false,
+        "ordinary_before_DATA": true,
+        "peak": "1",
+        "queue": "1",
+        "size": "le_131072",
+        "workload": "batch64"
+      },
+      "rejection_reason": "no_separated_namespace_modes",
+      "training": {
+        "v7": {
+          "namespace_p10_us": null,
+          "namespace_p50_us": null,
+          "namespace_p90_us": null,
+          "windows": 0
+        },
+        "v8": {
+          "namespace_p10_us": 24.264499999999995,
+          "namespace_p50_us": 24.753999999999998,
+          "namespace_p90_us": 26.973,
+          "windows": 13
+        }
+      },
+      "validation": {
+        "v7": {
+          "namespace_p10_us": null,
+          "namespace_p50_us": null,
+          "namespace_p90_us": null,
+          "windows": 0
+        },
+        "v8": {
+          "namespace_p10_us": 611.9714999999999,
+          "namespace_p50_us": 630.1614999999997,
+          "namespace_p90_us": 633.9690000000002,
+          "windows": 15
+        }
+      }
+    },
+    {
+      "class": {
+        "first_write": "non_WAL_FUA",
+        "first_write_size": "le_4096",
+        "flush_queue": "0",
+        "fua_before_DATA": true,
+        "intervening_reads": false,
+        "ordinary_before_DATA": true,
+        "peak": "2-7",
+        "queue": "1",
+        "size": "le_131072",
+        "workload": "batch64"
+      },
+      "rejection_reason": "no_separated_namespace_modes",
+      "training": {
+        "v7": {
+          "namespace_p10_us": 25.77600000000001,
+          "namespace_p50_us": 26.499000000000002,
+          "namespace_p90_us": 27.7395,
+          "windows": 19
+        },
+        "v8": {
+          "namespace_p10_us": null,
+          "namespace_p50_us": null,
+          "namespace_p90_us": null,
+          "windows": 0
+        }
+      },
+      "validation": {
+        "v7": {
+          "namespace_p10_us": 26.339000000000002,
+          "namespace_p50_us": 27.24375,
+          "namespace_p90_us": 27.738999999999994,
+          "windows": 10
+        },
+        "v8": {
+          "namespace_p10_us": null,
+          "namespace_p50_us": null,
+          "namespace_p90_us": null,
+          "windows": 0
+        }
+      }
+    },
+    {
+      "class": {
+        "first_write": "non_WAL_FUA",
+        "first_write_size": "le_4096",
+        "flush_queue": "1",
+        "fua_before_DATA": true,
+        "intervening_reads": false,
+        "ordinary_before_DATA": false,
+        "peak": "0",
+        "queue": "0",
+        "size": "le_131072",
+        "workload": "batch64"
+      },
+      "rejection_reason": "no_separated_namespace_modes",
+      "training": {
+        "v7": {
+          "namespace_p10_us": null,
+          "namespace_p50_us": null,
+          "namespace_p90_us": null,
+          "windows": 0
+        },
+        "v8": {
+          "namespace_p10_us": 9.307999999999998,
+          "namespace_p50_us": 9.83125,
+          "namespace_p90_us": 10.224000000000002,
+          "windows": 18
+        }
+      },
+      "validation": {
+        "v7": {
+          "namespace_p10_us": null,
+          "namespace_p50_us": null,
+          "namespace_p90_us": null,
+          "windows": 0
+        },
+        "v8": {
+          "namespace_p10_us": null,
+          "namespace_p50_us": null,
+          "namespace_p90_us": null,
+          "windows": 0
+        }
+      }
+    },
+    {
+      "class": {
+        "first_write": "non_WAL_FUA",
+        "first_write_size": "le_4096",
+        "flush_queue": "1",
+        "fua_before_DATA": true,
+        "intervening_reads": false,
+        "ordinary_before_DATA": true,
+        "peak": "2-7",
+        "queue": "1",
+        "size": "le_131072",
+        "workload": "batch64"
+      },
+      "rejection_reason": "insufficient_training_windows",
+      "training": {
+        "v7": {
+          "namespace_p10_us": 9.874500000000001,
+          "namespace_p50_us": 9.874500000000001,
+          "namespace_p90_us": 9.874500000000001,
+          "windows": 1
+        },
+        "v8": {
+          "namespace_p10_us": null,
+          "namespace_p50_us": null,
+          "namespace_p90_us": null,
+          "windows": 0
+        }
+      },
+      "validation": {
+        "v7": {
+          "namespace_p10_us": null,
+          "namespace_p50_us": null,
+          "namespace_p90_us": null,
+          "windows": 0
+        },
+        "v8": {
+          "namespace_p10_us": null,
+          "namespace_p50_us": null,
+          "namespace_p90_us": null,
+          "windows": 0
+        }
+      }
+    },
+    {
+      "class": {
+        "first_write": "non_WAL_FUA",
+        "first_write_size": "le_4096",
+        "flush_queue": "2-7",
+        "fua_before_DATA": true,
+        "intervening_reads": false,
+        "ordinary_before_DATA": false,
+        "peak": "1",
+        "queue": "0",
+        "size": "le_131072",
+        "workload": "batch64"
+      },
+      "rejection_reason": "insufficient_training_windows",
+      "training": {
+        "v7": {
+          "namespace_p10_us": 25.004499999999993,
+          "namespace_p50_us": 25.73925,
+          "namespace_p90_us": 25.004499999999993,
+          "windows": 2
+        },
+        "v8": {
+          "namespace_p10_us": null,
+          "namespace_p50_us": null,
+          "namespace_p90_us": null,
+          "windows": 0
+        }
+      },
+      "validation": {
+        "v7": {
+          "namespace_p10_us": null,
+          "namespace_p50_us": null,
+          "namespace_p90_us": null,
+          "windows": 0
+        },
+        "v8": {
+          "namespace_p10_us": null,
+          "namespace_p50_us": null,
+          "namespace_p90_us": null,
+          "windows": 0
+        }
+      }
+    },
+    {
+      "class": {
+        "first_write": "non_WAL_FUA",
+        "first_write_size": "le_4096",
+        "flush_queue": "2-7",
+        "fua_before_DATA": true,
+        "intervening_reads": false,
+        "ordinary_before_DATA": false,
+        "peak": "2-7",
+        "queue": "0",
+        "size": "le_131072",
+        "workload": "batch64"
+      },
+      "rejection_reason": "no_separated_namespace_modes",
+      "training": {
+        "v7": {
+          "namespace_p10_us": 28.2075,
+          "namespace_p50_us": 37.18949999999999,
+          "namespace_p90_us": 38.73700000000001,
+          "windows": 33
+        },
+        "v8": {
+          "namespace_p10_us": null,
+          "namespace_p50_us": null,
+          "namespace_p90_us": null,
+          "windows": 0
+        }
+      },
+      "validation": {
+        "v7": {
+          "namespace_p10_us": 30.272999999999996,
+          "namespace_p50_us": 39.1455,
+          "namespace_p90_us": 40.81099999999999,
+          "windows": 16
+        },
+        "v8": {
+          "namespace_p10_us": null,
+          "namespace_p50_us": null,
+          "namespace_p90_us": null,
+          "windows": 0
+        }
+      }
+    },
+    {
+      "class": {
+        "first_write": "non_WAL_FUA",
+        "first_write_size": "le_4096",
+        "flush_queue": "2-7",
+        "fua_before_DATA": true,
+        "intervening_reads": false,
+        "ordinary_before_DATA": false,
+        "peak": "2-7",
+        "queue": "0",
+        "size": "le_65536",
+        "workload": "batch64"
+      },
+      "rejection_reason": "insufficient_training_windows",
+      "training": {
+        "v7": {
+          "namespace_p10_us": 32.709500000000006,
+          "namespace_p50_us": 32.709500000000006,
+          "namespace_p90_us": 32.709500000000006,
+          "windows": 1
+        },
+        "v8": {
+          "namespace_p10_us": null,
+          "namespace_p50_us": null,
+          "namespace_p90_us": null,
+          "windows": 0
+        }
+      },
+      "validation": {
+        "v7": {
+          "namespace_p10_us": 24.904,
+          "namespace_p50_us": 24.904,
+          "namespace_p90_us": 24.904,
+          "windows": 1
+        },
+        "v8": {
+          "namespace_p10_us": null,
+          "namespace_p50_us": null,
+          "namespace_p90_us": null,
+          "windows": 0
+        }
+      }
+    },
+    {
+      "class": {
+        "first_write": "non_WAL_FUA",
+        "first_write_size": "le_4096",
+        "flush_queue": "2-7",
+        "fua_before_DATA": true,
+        "intervening_reads": false,
+        "ordinary_before_DATA": false,
+        "peak": "2-7",
+        "queue": "2-7",
+        "size": "le_131072",
+        "workload": "batch64"
+      },
+      "rejection_reason": "insufficient_training_windows",
+      "training": {
+        "v7": {
+          "namespace_p10_us": 38.71699999999999,
+          "namespace_p50_us": 41.18900000000001,
+          "namespace_p90_us": 49.6165,
+          "windows": 11
+        },
+        "v8": {
+          "namespace_p10_us": null,
+          "namespace_p50_us": null,
+          "namespace_p90_us": null,
+          "windows": 0
+        }
+      },
+      "validation": {
+        "v7": {
+          "namespace_p10_us": 34.80350000000001,
+          "namespace_p50_us": 38.83800000000001,
+          "namespace_p90_us": 38.86700000000001,
+          "windows": 4
+        },
+        "v8": {
+          "namespace_p10_us": null,
+          "namespace_p50_us": null,
+          "namespace_p90_us": null,
+          "windows": 0
+        }
+      }
+    },
+    {
+      "class": {
+        "first_write": "non_WAL_FUA",
+        "first_write_size": "le_4096",
+        "flush_queue": "2-7",
+        "fua_before_DATA": true,
+        "intervening_reads": false,
+        "ordinary_before_DATA": true,
+        "peak": "2-7",
+        "queue": "0",
+        "size": "le_131072",
+        "workload": "batch64"
+      },
+      "rejection_reason": "insufficient_training_windows",
+      "training": {
+        "v7": {
+          "namespace_p10_us": 28.161500000000004,
+          "namespace_p50_us": 32.32249999999999,
+          "namespace_p90_us": 32.32249999999999,
+          "windows": 3
+        },
+        "v8": {
+          "namespace_p10_us": null,
+          "namespace_p50_us": null,
+          "namespace_p90_us": null,
+          "windows": 0
+        }
+      },
+      "validation": {
+        "v7": {
+          "namespace_p10_us": null,
+          "namespace_p50_us": null,
+          "namespace_p90_us": null,
+          "windows": 0
+        },
+        "v8": {
+          "namespace_p10_us": null,
+          "namespace_p50_us": null,
+          "namespace_p90_us": null,
+          "windows": 0
+        }
+      }
+    },
+    {
+      "class": {
+        "first_write": "non_WAL_FUA",
+        "first_write_size": "le_4096",
+        "flush_queue": "2-7",
+        "fua_before_DATA": true,
+        "intervening_reads": false,
+        "ordinary_before_DATA": true,
+        "peak": "2-7",
+        "queue": "1",
+        "size": "le_131072",
+        "workload": "batch64"
+      },
+      "rejection_reason": "no_separated_namespace_modes",
+      "training": {
+        "v7": {
+          "namespace_p10_us": 26.936,
+          "namespace_p50_us": 31.549000000000003,
+          "namespace_p90_us": 37.80899999999999,
+          "windows": 26
+        },
+        "v8": {
+          "namespace_p10_us": null,
+          "namespace_p50_us": null,
+          "namespace_p90_us": null,
+          "windows": 0
+        }
+      },
+      "validation": {
+        "v7": {
+          "namespace_p10_us": 22.421000000000003,
+          "namespace_p50_us": 28.685,
+          "namespace_p90_us": 36.4095,
+          "windows": 11
+        },
+        "v8": {
+          "namespace_p10_us": null,
+          "namespace_p50_us": null,
+          "namespace_p90_us": null,
+          "windows": 0
+        }
+      }
+    }
+  ],
+  "classes": 16,
+  "cohorts": {
+    "evaluation": {
+      "eligible_observations": 65496,
+      "lost": 0,
+      "observed_routing_classes": 145,
+      "quality_pass": 7,
+      "runs": [
+        {
+          "DATA_p50_us": 75.48,
+          "anomalies": {
+            "setup_without_completion": 0
+          },
+          "application_intervals": 155,
+          "coverage_percent": 100.0,
+          "eligible_observations": 19998,
+          "first_namespace_p50_us": 75.495,
+          "first_roles": {
+            "WAL_ordinary": 19679,
+            "non_WAL_FUA": 158,
+            "non_WAL_ordinary": 5
+          },
+          "flush_to_DATA_gap_p50_us": 60.573,
+          "lost": 0,
+          "name": "point-0-v7",
+          "quality": true,
+          "raw_observations": 19999,
+          "raw_perf_qualified": false,
+          "raw_puts_s": 1293.5054318509913
+        },
+        {
+          "DATA_p50_us": null,
+          "anomalies": {
+            "completion_without_setup": 1,
+            "same_key_same_timestamp": 1,
+            "setup_without_completion": 0
+          },
+          "application_intervals": 126,
+          "coverage_percent": 100.0,
+          "eligible_observations": 0,
+          "first_namespace_p50_us": null,
+          "first_roles": {},
+          "flush_to_DATA_gap_p50_us": null,
+          "lost": 0,
+          "name": "point-1-v8",
+          "quality": false,
+          "raw_observations": 19999,
+          "raw_perf_qualified": false,
+          "raw_puts_s": 1586.589575386638
+        },
+        {
+          "DATA_p50_us": 142.821,
+          "anomalies": {
+            "setup_without_completion": 0
+          },
+          "application_intervals": 128,
+          "coverage_percent": 100.0,
+          "eligible_observations": 19999,
+          "first_namespace_p50_us": 25.363,
+          "first_roles": {
+            "non_WAL_FUA": 19999
+          },
+          "flush_to_DATA_gap_p50_us": 95.035,
+          "lost": 0,
+          "name": "point-2-v8",
+          "quality": true,
+          "raw_observations": 19999,
+          "raw_perf_qualified": false,
+          "raw_puts_s": 1566.4206044104142
+        },
+        {
+          "DATA_p50_us": 74.62899999999999,
+          "anomalies": {
+            "setup_without_completion": 0
+          },
+          "application_intervals": 90,
+          "coverage_percent": 100.0,
+          "eligible_observations": 19998,
+          "first_namespace_p50_us": 74.706,
+          "first_roles": {
+            "WAL_ordinary": 19684,
+            "non_WAL_FUA": 158
+          },
+          "flush_to_DATA_gap_p50_us": 60.601,
+          "lost": 0,
+          "name": "point-3-v7",
+          "quality": true,
+          "raw_observations": 19999,
+          "raw_perf_qualified": false,
+          "raw_puts_s": 2227.5760391141994
+        },
+        {
+          "DATA_p50_us": 190.3295,
+          "anomalies": {
+            "setup_without_completion": 0
+          },
+          "application_intervals": 13,
+          "coverage_percent": 99.91065692258272,
+          "eligible_observations": 1376,
+          "first_namespace_p50_us": 28.674500000000002,
+          "first_roles": {
+            "WAL_ordinary": 44,
+            "non_WAL_FUA": 1332
+          },
+          "flush_to_DATA_gap_p50_us": 257.673,
+          "lost": 0,
+          "name": "batch64-0-v7",
+          "quality": true,
+          "raw_observations": 1376,
+          "raw_perf_qualified": false,
+          "raw_puts_s": 612064.573742868
+        },
+        {
+          "DATA_p50_us": 87.1105,
+          "anomalies": {
+            "setup_without_completion": 0
+          },
+          "application_intervals": 52,
+          "coverage_percent": 99.99498072598779,
+          "eligible_observations": 1210,
+          "first_namespace_p50_us": 28.0215,
+          "first_roles": {
+            "WAL_ordinary": 91,
+            "non_WAL_FUA": 1119
+          },
+          "flush_to_DATA_gap_p50_us": 478.908,
+          "lost": 0,
+          "name": "batch64-1-v8",
+          "quality": true,
+          "raw_observations": 1210,
+          "raw_perf_qualified": false,
+          "raw_puts_s": 146883.77142512935
+        },
+        {
+          "DATA_p50_us": 146.3175,
+          "anomalies": {
+            "setup_without_completion": 0
+          },
+          "application_intervals": 89,
+          "coverage_percent": 99.98193061355606,
+          "eligible_observations": 1472,
+          "first_namespace_p50_us": 606.7785,
+          "first_roles": {
+            "WAL_ordinary": 195,
+            "non_WAL_FUA": 1277
+          },
+          "flush_to_DATA_gap_p50_us": 1210.3564999999999,
+          "lost": 0,
+          "name": "batch64-2-v8",
+          "quality": true,
+          "raw_observations": 1473,
+          "raw_perf_qualified": false,
+          "raw_puts_s": 84223.96409618028
+        },
+        {
+          "DATA_p50_us": 209.918,
+          "anomalies": {
+            "setup_without_completion": 0
+          },
+          "application_intervals": 89,
+          "coverage_percent": 99.86598538387408,
+          "eligible_observations": 1443,
+          "first_namespace_p50_us": 598.739,
+          "first_roles": {
+            "WAL_ordinary": 104,
+            "non_WAL_FUA": 1339
+          },
+          "flush_to_DATA_gap_p50_us": 691.105,
+          "lost": 0,
+          "name": "batch64-3-v7",
+          "quality": true,
+          "raw_observations": 1446,
+          "raw_perf_qualified": false,
+          "raw_puts_s": 85064.70003050605
+        }
+      ]
+    },
+    "training": {
+      "eligible_observations": 64554,
+      "lost": 0,
+      "observed_routing_classes": 111,
+      "quality_pass": 7,
+      "runs": [
+        {
+          "DATA_p50_us": 75.363,
+          "anomalies": {
+            "setup_without_completion": 0
+          },
+          "application_intervals": 91,
+          "coverage_percent": 100.0,
+          "eligible_observations": 19998,
+          "first_namespace_p50_us": 75.394,
+          "first_roles": {
+            "WAL_ordinary": 19683,
+            "non_WAL_FUA": 159,
+            "non_WAL_ordinary": 1
+          },
+          "flush_to_DATA_gap_p50_us": 63.436499999999995,
+          "lost": 0,
+          "name": "point-0-v7",
+          "quality": true,
+          "raw_observations": 19999,
+          "raw_perf_qualified": false,
+          "raw_puts_s": 2200.1514128581252
+        },
+        {
+          "DATA_p50_us": 145.248,
+          "anomalies": {
+            "setup_without_completion": 0
+          },
+          "application_intervals": 152,
+          "coverage_percent": 100.0,
+          "eligible_observations": 19999,
+          "first_namespace_p50_us": 25.223,
+          "first_roles": {
+            "non_WAL_FUA": 19999
+          },
+          "flush_to_DATA_gap_p50_us": 93.657,
+          "lost": 0,
+          "name": "point-1-v8",
+          "quality": true,
+          "raw_observations": 19999,
+          "raw_perf_qualified": false,
+          "raw_puts_s": 1314.5263349511165
+        },
+        {
+          "DATA_p50_us": null,
+          "anomalies": {
+            "completion_without_setup": 1,
+            "duplicate_live_key": 2,
+            "same_key_same_timestamp": 3,
+            "setup_without_completion": 0
+          },
+          "application_intervals": 424,
+          "coverage_percent": 100.0,
+          "eligible_observations": 0,
+          "first_namespace_p50_us": null,
+          "first_roles": {},
+          "flush_to_DATA_gap_p50_us": null,
+          "lost": 0,
+          "name": "point-2-v8",
+          "quality": false,
+          "raw_observations": 19999,
+          "raw_perf_qualified": false,
+          "raw_puts_s": 471.0075341250048
+        },
+        {
+          "DATA_p50_us": 76.4265,
+          "anomalies": {
+            "setup_without_completion": 0
+          },
+          "application_intervals": 180,
+          "coverage_percent": 100.0,
+          "eligible_observations": 19998,
+          "first_namespace_p50_us": 76.496,
+          "first_roles": {
+            "WAL_ordinary": 19683,
+            "non_WAL_FUA": 158,
+            "non_WAL_ordinary": 1
+          },
+          "flush_to_DATA_gap_p50_us": 64.4175,
+          "lost": 0,
+          "name": "point-3-v7",
+          "quality": true,
+          "raw_observations": 19999,
+          "raw_perf_qualified": false,
+          "raw_puts_s": 1113.4331448203634
+        },
+        {
+          "DATA_p50_us": 187.0045,
+          "anomalies": {
+            "setup_without_completion": 0
+          },
+          "application_intervals": 13,
+          "coverage_percent": 99.8810432059107,
+          "eligible_observations": 1372,
+          "first_namespace_p50_us": 27.430500000000002,
+          "first_roles": {
+            "WAL_ordinary": 67,
+            "non_WAL_FUA": 1305
+          },
+          "flush_to_DATA_gap_p50_us": 259.1245,
+          "lost": 0,
+          "name": "batch64-0-v7",
+          "quality": true,
+          "raw_observations": 1372,
+          "raw_perf_qualified": false,
+          "raw_puts_s": 619980.6562398033
+        },
+        {
+          "DATA_p50_us": 84.8925,
+          "anomalies": {
+            "setup_without_completion": 0
+          },
+          "application_intervals": 13,
+          "coverage_percent": 100.0,
+          "eligible_observations": 924,
+          "first_namespace_p50_us": 24.429,
+          "first_roles": {
+            "WAL_ordinary": 8,
+            "non_WAL_FUA": 916
+          },
+          "flush_to_DATA_gap_p50_us": 481.6315,
+          "lost": 0,
+          "name": "batch64-1-v8",
+          "quality": true,
+          "raw_observations": 924,
+          "raw_perf_qualified": false,
+          "raw_puts_s": 617066.449676045
+        },
+        {
+          "DATA_p50_us": 84.673,
+          "anomalies": {
+            "setup_without_completion": 0
+          },
+          "application_intervals": 12,
+          "coverage_percent": 100.0,
+          "eligible_observations": 919,
+          "first_namespace_p50_us": 24.831,
+          "first_roles": {
+            "WAL_ordinary": 9,
+            "non_WAL_FUA": 910
+          },
+          "flush_to_DATA_gap_p50_us": 445.391,
+          "lost": 0,
+          "name": "batch64-2-v8",
+          "quality": true,
+          "raw_observations": 919,
+          "raw_perf_qualified": false,
+          "raw_puts_s": 655121.1681671345
+        },
+        {
+          "DATA_p50_us": 198.435,
+          "anomalies": {
+            "setup_without_completion": 0
+          },
+          "application_intervals": 12,
+          "coverage_percent": 99.89660295534854,
+          "eligible_observations": 1344,
+          "first_namespace_p50_us": 28.725,
+          "first_roles": {
+            "WAL_ordinary": 47,
+            "non_WAL_FUA": 1297
+          },
+          "flush_to_DATA_gap_p50_us": 270.43100000000004,
+          "lost": 0,
+          "name": "batch64-3-v7",
+          "quality": true,
+          "raw_observations": 1344,
+          "raw_perf_qualified": false,
+          "raw_puts_s": 653780.3907471925
+        }
+      ]
+    },
+    "validation": {
+      "eligible_observations": 65707,
+      "lost": 0,
+      "observed_routing_classes": 141,
+      "quality_pass": 7,
+      "runs": [
+        {
+          "DATA_p50_us": null,
+          "anomalies": {
+            "completion_without_setup": 1,
+            "same_key_same_timestamp": 1,
+            "setup_without_completion": 0
+          },
+          "application_intervals": 128,
+          "coverage_percent": 100.0,
+          "eligible_observations": 0,
+          "first_namespace_p50_us": null,
+          "first_roles": {},
+          "flush_to_DATA_gap_p50_us": null,
+          "lost": 0,
+          "name": "point-0-v7",
+          "quality": false,
+          "raw_observations": 19999,
+          "raw_perf_qualified": false,
+          "raw_puts_s": 1561.5398752521614
+        },
+        {
+          "DATA_p50_us": 146.877,
+          "anomalies": {
+            "setup_without_completion": 0
+          },
+          "application_intervals": 444,
+          "coverage_percent": 100.0,
+          "eligible_observations": 19999,
+          "first_namespace_p50_us": 634.761,
+          "first_roles": {
+            "non_WAL_FUA": 19999
+          },
+          "flush_to_DATA_gap_p50_us": 721.919,
+          "lost": 0,
+          "name": "point-1-v8",
+          "quality": true,
+          "raw_observations": 19999,
+          "raw_perf_qualified": false,
+          "raw_puts_s": 450.4800737765993
+        },
+        {
+          "DATA_p50_us": 143.905,
+          "anomalies": {
+            "setup_without_completion": 0
+          },
+          "application_intervals": 162,
+          "coverage_percent": 100.0,
+          "eligible_observations": 19999,
+          "first_namespace_p50_us": 25.274,
+          "first_roles": {
+            "non_WAL_FUA": 19999
+          },
+          "flush_to_DATA_gap_p50_us": 93.493,
+          "lost": 0,
+          "name": "point-2-v8",
+          "quality": true,
+          "raw_observations": 19999,
+          "raw_perf_qualified": false,
+          "raw_puts_s": 1234.2436915492415
+        },
+        {
+          "DATA_p50_us": 74.90549999999999,
+          "anomalies": {
+            "setup_without_completion": 0
+          },
+          "application_intervals": 90,
+          "coverage_percent": 100.0,
+          "eligible_observations": 19998,
+          "first_namespace_p50_us": 74.9505,
+          "first_roles": {
+            "WAL_ordinary": 19684,
+            "non_WAL_FUA": 158
+          },
+          "flush_to_DATA_gap_p50_us": 61.373000000000005,
+          "lost": 0,
+          "name": "point-3-v7",
+          "quality": true,
+          "raw_observations": 19999,
+          "raw_perf_qualified": false,
+          "raw_puts_s": 2237.255637976215
+        },
+        {
+          "DATA_p50_us": 190.42700000000002,
+          "anomalies": {
+            "setup_without_completion": 0
+          },
+          "application_intervals": 12,
+          "coverage_percent": 99.90915114037905,
+          "eligible_observations": 1316,
+          "first_namespace_p50_us": 28.119,
+          "first_roles": {
+            "WAL_ordinary": 35,
+            "non_WAL_FUA": 1281
+          },
+          "flush_to_DATA_gap_p50_us": 261.312,
+          "lost": 0,
+          "name": "batch64-0-v7",
+          "quality": true,
+          "raw_observations": 1317,
+          "raw_perf_qualified": false,
+          "raw_puts_s": 651463.0773207594
+        },
+        {
+          "DATA_p50_us": 171.6575,
+          "anomalies": {
+            "setup_without_completion": 0
+          },
+          "application_intervals": 85,
+          "coverage_percent": 100.0,
+          "eligible_observations": 1440,
+          "first_namespace_p50_us": 608.4705,
+          "first_roles": {
+            "WAL_ordinary": 147,
+            "non_WAL_FUA": 1293
+          },
+          "flush_to_DATA_gap_p50_us": 997.74,
+          "lost": 0,
+          "name": "batch64-1-v8",
+          "quality": true,
+          "raw_observations": 1440,
+          "raw_perf_qualified": false,
+          "raw_puts_s": 89018.29758656198
+        },
+        {
+          "DATA_p50_us": 145.191,
+          "anomalies": {
+            "setup_without_completion": 0
+          },
+          "application_intervals": 93,
+          "coverage_percent": 99.99799229039512,
+          "eligible_observations": 1503,
+          "first_namespace_p50_us": 606.633,
+          "first_roles": {
+            "WAL_ordinary": 167,
+            "non_WAL_FUA": 1336
+          },
+          "flush_to_DATA_gap_p50_us": 1220.725,
+          "lost": 0,
+          "name": "batch64-2-v8",
+          "quality": true,
+          "raw_observations": 1503,
+          "raw_perf_qualified": false,
+          "raw_puts_s": 81134.31286518808
+        },
+        {
+          "DATA_p50_us": 200.6695,
+          "anomalies": {
+            "setup_without_completion": 0
+          },
+          "application_intervals": 94,
+          "coverage_percent": 99.86548345647286,
+          "eligible_observations": 1452,
+          "first_namespace_p50_us": 583.749,
+          "first_roles": {
+            "WAL_ordinary": 111,
+            "non_WAL_FUA": 1337
+          },
+          "flush_to_DATA_gap_p50_us": 713.461,
+          "lost": 0,
+          "name": "batch64-3-v7",
+          "quality": true,
+          "raw_observations": 1455,
+          "raw_perf_qualified": false,
+          "raw_puts_s": 80360.90207987148
+        }
+      ]
+    }
+  },
+  "evaluation": {
+    "RFC_performance_qualified": false,
+    "qualified_intervals": 0,
+    "qualified_pairs": 0,
+    "rejection_reasons": {
+      "counter_interval_out_of_range": 6,
+      "insufficient_calibrated_coverage": 709,
+      "io_observation_gap": 6,
+      "sparse_io_observations": 9,
+      "unbracketed_interval": 12
+    },
+    "total_intervals": 742
+  },
+  "model_sha256": "07e2f0dd96c4c3acfca4d5f1e5027aad1e4240f9d8a69ca07c9733edcb9e5a7c"
+}

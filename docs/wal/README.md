@@ -38,6 +38,8 @@ the retained and rejected experiments.
 
 ## Benchmarks and qualification
 
+- [Held-out WAL latency calibration method](benchmarks/wal-state-calibration-method.md)
+- [RFC 026 held-out calibration: no qualified V7/V8 ratio, 2026-11-03](benchmarks/rfc-026-v8-calibrated-states-20261103.md)
 - [WAL extent attribution and calibration observations](benchmarks/wal-extent-attribution-method.md)
 - [RFC 026 extent-aware traces: DATA coverage and intervening FUA, 2026-11-03](benchmarks/rfc-026-v8-wal-extents-20261103.md)
 - [Passive WAL trace regimes and monotonic metric joins](benchmarks/passive-wal-trace-method.md)
