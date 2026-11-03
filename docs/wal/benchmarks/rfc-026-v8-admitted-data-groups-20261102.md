@@ -6,7 +6,7 @@ The V8 DATA submitter now observes admitted membership before producers finish
 encoding or framing. Keep this implementation for review as the RFC 026
 group-visibility correction. Its end-to-end performance qualification remains
 open. The latest binary has no eligible batch measurement in this screen;
-both final batch runs were flagged for storage stalls. Earlier prototype wins
+both small-direct batch runs were flagged for storage stalls. Earlier prototype wins
 must not be presented as measurements of the final binary.
 
 The retained policy gives multi-frame heads with admitted successors up to

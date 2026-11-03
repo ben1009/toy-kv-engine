@@ -6,7 +6,9 @@ Keep this candidate for review as a provisional V8 scheduling improvement.
 Concurrent workloads improve substantially, while the final single-writer
 batch control is essentially flat. The fastest eight-writer batch sample has
 a slightly worse p99 than the fastest control, so this is not an unconditional
-tail-latency win or RFC 026 qualification. V7 remains the default.
+tail-latency win or RFC 026 qualification. V7 was the default during this
+screen; the later [V8 adoption decision](../rfc-026-v8-default-20261103.md)
+did not claim performance qualification.
 
 The change gives an already-ready durability prefix a bounded opportunity to
 include admitted, unfinished successors. It uses the previous sync latency:
@@ -19,14 +21,39 @@ frame, recovery and single-sync durability rules are preserved.
 
 ## Method
 
-The preserved baseline is the uncommitted worker-backed V8 implementation on
-top of `6e5989a2`. Both arms use PITR V8 Parallel on `/dev/nvme0n1p3` (ext4),
+The baseline executable is the uncommitted worker-backed V8 implementation on
+top of `6e5989a2`; its SHA-256 is recorded in the plan and the local executable
+still matches it. Commit `d6003ed1` preserves the later retained implementation,
+including coalescing and admission-aware grouping, so it is not the exact
+baseline source. To recover the affected baseline V8 source files from a copy
+of `d6003ed1`, reverse the archived admission-aware grouping patch and then
+the bounded-coalescing patch; both apply cleanly. This does not establish that
+every other baseline source file can be reconstructed byte-for-byte.
+
+Both arms use PITR V8 Parallel on `/dev/nvme0n1p3` (ext4),
 1 KiB values, no compaction, a 2 GiB target SST and latency sampling every ten
 operations. Batch-64 runs use 750,000 puts. Point runs use 20,000 puts at eight
 and sixteen writers and 5,000 puts at one writer. Migration/setup completes
 before timing. The benchmark cleans up database and repository data after each
 run. Executables and working files remain under the local repository's target
-directory.
+directory. The host was a 13th Gen Intel Core i9-13900T running Linux
+`6.12.71-1-lts`; the current boot began on 2026-10-04, before these runs.
+
+The [initial runner](artifacts/rfc-026-v8-bounded-coalescing-20261102-run.txt),
+[guards](artifacts/rfc-026-v8-bounded-coalescing-20261102-guards.txt),
+[guard repeat](artifacts/rfc-026-v8-bounded-coalescing-20261102-guard-repeat.txt),
+[final screen](artifacts/rfc-026-v8-bounded-coalescing-20261102-final.txt), and
+[confirmation](artifacts/rfc-026-v8-bounded-coalescing-20261102-confirmation.txt)
+preserve the literal executable paths and arguments. These text copies were
+saved from the original local run directory without changing the scripts; the schedule and
+binary hashes identify each invocation. All variants use this command shape:
+
+```text
+write-perf-{arm} --bench {wal_batch_concurrent|wal_concurrent} --wal-batch-size 64
+  --pitr --pitr-format v8 --wal-io-mode parallel --num {num} --threads {threads}
+  --value-size 1024 --target-sst-size 2147483648 --compaction none
+  --output json --latency-sample-every 10 --path {sample-db}
+```
 
 The initial schedule alternated two pairs each at eight and sixteen writers.
 Solo and point checks followed. Borderline checks were repeated in reversed
@@ -100,4 +127,4 @@ unfinished successor reaching the wait deadline, completion waking the wait,
 close/poison waking it, and the wait never publishing durability. Clippy with
 all features/targets and the ordinary library check pass. The
 [candidate patch](artifacts/rfc-026-v8-bounded-coalescing-20261102-candidate.patch)
-is relative to the preserved baseline source.
+is relative to the baseline V8 source described above.
