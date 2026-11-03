@@ -1,22 +1,20 @@
 # WAL documentation
 
-Start with [RFC 024](../../rfcs/024-dedicated-wal-pipeline.md) and the
-[default adoption note](rfc-024-parallel-wal-default-20261005.md). Ordinary
-v4 WALs default to ticket-ordered parallel I/O by maintainer decision. PITR
-v5/v6 and older MVCC WALs retain leader I/O; legacy unframed WALs retain
-buffered I/O. The full RFC performance gate remains unqualified; the reports
-retain measured revisions and failed controls.
+Ordinary V4 WALs and new PITR V8 WALs default to Parallel I/O by maintainer
+decision. Start with the [V8 default adoption note](rfc-026-v8-default-20261103.md)
+for selection, migration, capacity, and compatibility behavior. The
+[V4 adoption note](rfc-024-parallel-wal-default-20261005.md) covers ordinary WALs.
+The performance qualification matrices remain unqualified; default adoption
+is not a performance parity claim.
 
-[RFC 025](../../rfcs/025-parallel-wal-embedded-frontiers.md) proposes Parallel as
-the default for future WAL formats, with narrowly documented exceptions. PITR
-v7 embeds DATA/FRONTIER frames in the WAL and uses one sync per durability
-advance. Active recovery validates candidate prefixes and permits fallback
-above durable manifest boundaries; sealing/archive validation remains strict.
-Active anchors bind the logical boundary and survive marker relocation;
-Sealing binds the frozen physical image. Legacy PITR databases lacking v7
-recovery capacity keep Leader writes and rotations until an explicit capacity
-transition permits migration.
-The proposal has not changed the current format defaults above.
+[RFC 025](../../rfcs/025-parallel-wal-embedded-frontiers.md) defines V7's
+embedded DATA/FRONTIER frames and single-sync durability protocol.
+[RFC 026](../../rfcs/026-composable-wal-prefix-digest.md) retains that protocol
+and adds V8's BLAKE3 entry/batch digests and fixed-size ordered prefix chain.
+Eligible legacy/V7 databases migrate on resume; capacity deferral preserves
+older writers. Explicit V6/V7 controls never downgrade existing V8 segments.
+Active recovery validates logical hard anchors before candidate fallback and
+fresh-inode normalization; sealed/archive validation stays strict.
 
 Dated filenames identify individual measurements and follow-ups. The
 [benchmark overview](benchmarks/rfc-024-parallel-wal-benchmark.md) connects
@@ -24,6 +22,7 @@ the retained and rejected experiments.
 
 ## Implementation and adoption
 
+- [V8 PITR WAL default adoption](rfc-026-v8-default-20261103.md)
 - [Parallel WAL default adoption](rfc-024-parallel-wal-default-20261005.md)
 - [Parallel WAL Implementation Plan](rfc-024-parallel-wal-implementation-plan.md)
 - [RFC 025 Implementation Plan: Parallel WAL with Embedded Frontiers and One Sync](rfc-025-parallel-wal-embedded-frontiers-implementation-plan.md)

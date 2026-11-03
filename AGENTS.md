@@ -317,19 +317,21 @@ Enable via `LsmStorageOptions::value_separation`.
 ### WAL
 
 Write-ahead logging is optional (`enable_wal: bool`). When enabled, each memtable has an associated WAL file for crash recovery.
-Ordinary v4 WALs default to the parallel pipeline (`WalIoMode::Parallel`); PITR
-v5/v6 and older MVCC WALs retain leader I/O, and legacy unframed WALs remain
-buffered. The explicit leader selector remains available for comparison. See
-[the default adoption note](docs/wal/rfc-024-parallel-wal-default-20261005.md).
-The pipeline has 32 in-flight group slots and 256 ring entries. The maintainer
-selected the default despite the still-unqualified RFC performance gate; see
-[the benchmark overview](docs/wal/benchmarks/rfc-024-parallel-wal-benchmark.md) for evidence.
-[RFC 025](rfcs/025-parallel-wal-embedded-frontiers.md) proposes Parallel as the
-default for future formats, with narrowly documented format exceptions. PITR
-v7 uses in-WAL DATA/FRONTIER frames and one WAL sync per durability advance.
-Active v7 recovery validates candidate prefixes and may fall back above durable
-manifest boundaries; sealed objects stay strict. This proposal does not change
-the current v5/v6 mode or recovery rules.
+Ordinary V4 WALs and new PITR V8 WALs default to `WalIoMode::Parallel`.
+`LsmStorageOptions::pitr_writer_format` defaults to `PitrWriterFormat::V8`;
+V6/V7 remain explicit compatibility controls, and Leader I/O remains selectable.
+Eligible legacy/V7 PITR databases migrate on resume through durable, capacity-
+checked transitions. Capacity deferral preserves the existing writer; selecting
+an older preference never downgrades V8. V5/V6 retain Leader I/O until migration,
+and legacy unframed WALs remain buffered. See the
+[V8 adoption note](docs/wal/rfc-026-v8-default-20261103.md), including the existing
+V7/V8 PITR-disable limitation and the unqualified performance matrix.
+V7/V8 embed DATA/FRONTIER frames with one WAL sync per durability advance.
+V8 uses RFC 026's encode-time BLAKE3 entry digest and fixed-size ordered link.
+Active recovery validates prefixes above hard manifest anchors before fallback
+and fresh-inode normalization; sealed/archive objects remain strict.
+The V4 pipeline has 32 in-flight group slots and 256 ring entries; see the
+[V4 adoption note](docs/wal/rfc-024-parallel-wal-default-20261005.md).
 
 ### Block Cache
 

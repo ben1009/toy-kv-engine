@@ -2,14 +2,14 @@
 
 | Field | Value |
 | --- | --- |
-| Status | Proposed |
+| Status | Implemented; default adopted 2026-11-03, performance unqualified |
 | Date | 2026-10-30 |
 | Author | kv-engine Contributors |
 | Builds on | [RFC 023](023-point-in-time-recovery.md), [RFC 024](024-dedicated-wal-pipeline.md), [RFC 025](025-parallel-wal-embedded-frontiers.md) |
 
 ## 1. Summary
 
-This RFC proposes a new PITR WAL format, provisionally **v8**, whose logical
+This RFC defines PITR WAL format **v8**, whose logical
 prefix uses **BLAKE3-256 entry-stream digests, batch digests, and an ordered
 chain**. Producers hash canonical entry bytes during encoding, then bind the
 completed logical header to that entry digest. Parallel publishes each admitted
@@ -18,9 +18,10 @@ ordered coordinator hashes only a fixed-size link for each ticket. The physical
 DATA/FRONTIER layout and single-sync durability protocol follow RFC 025, with
 format-specific validation and a new logical digest definition.
 
-This is a proposal, not an implemented format, adoption decision, or claim of
-v4/v7 performance parity. In particular, it does not alter the digest of any
-existing v7 segment. V8 MUST support Parallel by default under RFC 025. Leader
+The maintainer selected V8 as the default on 2026-11-03 while the performance
+matrix remains unqualified; see the [adoption note](../docs/wal/rfc-026-v8-default-20261103.md).
+This is not a claim of V4/V7 performance parity. V8 does not alter the digest
+of any existing v7 segment. V8 MUST support Parallel by default under RFC 025. Leader
 and Parallel MUST produce the same canonical logical batch bytes and logical
 prefix digests for the same header and ordered batch metadata and payloads.
 Their FRONTIER placement and frequency, and therefore physical DATA offsets,
@@ -382,7 +383,11 @@ a chain digest cannot prove that a particular sync succeeded.
 
 ## 8. Implementation and validation gates
 
-Implementation begins only after this RFC is accepted. Before default adoption,
+The following are the original qualification requirements. The explicit
+2026-11-03 maintainer adoption retains the correctness, resource and compatibility
+gates while leaving the performance matrix unqualified. It overrides the
+performance-dependent default-selection requirement below; the historical
+measurements remain evidence rather than a parity claim. For qualification,
 the implementation plan MUST cover at least:
 
 - Exact v8 wire identifiers, every format-dispatch and persisted descriptor

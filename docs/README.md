@@ -18,6 +18,7 @@ parallel WAL policy and its measured results.
 
 ## WAL implementation
 
+- [V8 PITR WAL default adoption](wal/rfc-026-v8-default-20261103.md)
 - [RFC 024: Parallel WAL Implementation Plan](wal/rfc-024-parallel-wal-implementation-plan.md)
 - [RFC 025 Implementation Plan: Parallel WAL with Embedded Frontiers and One Sync](wal/rfc-025-parallel-wal-embedded-frontiers-implementation-plan.md)
 

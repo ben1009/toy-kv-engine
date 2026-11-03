@@ -60,9 +60,10 @@ The CLI supports basic manual operations such as `fill`, `get`, `del`, `scan`,
 ### Durability And Writes
 
 - Write-ahead logging is optional. Ordinary v4 WALs use ticket-based group
-  commit with parallel I/O by default. PITR v5/v6 and older MVCC WALs retain
-  leader I/O; legacy unframed WALs retain buffered I/O. See the
-  [default adoption note](docs/wal/rfc-024-parallel-wal-default-20261005.md).
+  commit with parallel I/O by default. New PITR WALs default to V8 with
+  parallel I/O; retained V5/V6 and older MVCC WALs use Leader I/O, and legacy
+  unframed WALs use buffered I/O. See the
+  [V8 adoption and compatibility note](docs/wal/rfc-026-v8-default-20261103.md).
 - Framed MVCC WAL writes use `io_uring` + `O_DIRECT` for durability.
 - Point-in-time recovery from archived WAL segments, with timeline-aware
   restore support.
@@ -429,6 +430,7 @@ requires both p95 and p99 to pass, and allows at most 5% regression per metric.
 - [RFC 022 Incremental Backup Implementation Plan](docs/backup/rfc-022-incremental-backup-plan.md)
 - [RFC 023 PITR Implementation Plan](docs/pitr/rfc-023-pitr-implementation-plan.md)
 - [RFC 024 Parallel WAL Implementation Plan](docs/wal/rfc-024-parallel-wal-implementation-plan.md)
+- [V8 PITR WAL Default Adoption](docs/wal/rfc-026-v8-default-20261103.md)
 - [Parallel v4 WAL Default Adoption](docs/wal/rfc-024-parallel-wal-default-20261005.md)
 
 ### RFCs
