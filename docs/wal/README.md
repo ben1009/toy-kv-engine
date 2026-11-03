@@ -129,6 +129,7 @@ the retained and rejected experiments.
 
 ## Environment investigations
 
+- [P41 Plus 004C: file-based APST and verified FUA controls, 2026-11-03](environment/rfc-026-p41-plus-apst-fua-20261103.md)
 - [Buffered WAL diagnostic](environment/rfc-024-buffered-wal-diagnostic-20261004.md)
 - [Physical SSD environment mitigation attempts, 2026-10-04](environment/rfc-024-environment-mitigations-20261004.md)
 - [Investigation of unstable ext4 measurements](environment/rfc-024-wal-stall-diagnosis.md)

@@ -1,0 +1,90 @@
+{
+  "algorithm": "SHA-256",
+  "excluded": "This manifest is excluded from its own hashes.",
+  "files": {
+    "docs/wal/environment/rfc-026-p41-plus-apst-fua-20261103.md": {
+      "sha256": "0bc530ed92142c7de037971bb72e8b08a98199c9fb610f12bb02cc590ff7eee7",
+      "bytes": 9892
+    },
+    ".typos.toml": {
+      "sha256": "20779057adcedab0c4ee660616a3770148695c3c93df5b52e9deb3aff796cd9c",
+      "bytes": 814
+    },
+    "docs/wal/README.md": {
+      "sha256": "b00e96f757f9a1a1e0b2f70c9d6276be2cd10a9ca29e86b9bf02092740099014",
+      "bytes": 17282
+    },
+    "docs/wal/benchmarks/artifacts/rfc-026-v8-flush-fua-20261103-analyze.py": {
+      "sha256": "e9361c8e858e677275de015208b564dc8198ce49ef55e92443f4300c8fa342e8",
+      "bytes": 4933
+    },
+    "docs/wal/benchmarks/artifacts/rfc-026-v8-flush-fua-20261103-as_user.py": {
+      "sha256": "88f7b71d867ed48dba2454f551936eb064a4dfdfd298458e16371962bace625f",
+      "bytes": 282
+    },
+    "docs/wal/benchmarks/artifacts/rfc-026-v8-flush-fua-20261103-checks.json": {
+      "sha256": "29d86fb83c241993540419dc2f0327b30bdb4c4103f458a485d33021c478dc92",
+      "bytes": 951
+    },
+    "docs/wal/benchmarks/artifacts/rfc-026-v8-flush-fua-20261103-confirm.py": {
+      "sha256": "ba5aa6aa4e0dc1653f9e529debb61551d908636ff3b680ec04880a248f5b41ab",
+      "bytes": 3305
+    },
+    "docs/wal/benchmarks/artifacts/rfc-026-v8-flush-fua-20261103-confirmation.perf.gz": {
+      "sha256": "ad83ed620e961306ae86729e5aaeff84a19049a4ec5a028e2f8286b3dcfac204",
+      "bytes": 175711
+    },
+    "docs/wal/benchmarks/artifacts/rfc-026-v8-flush-fua-20261103-decode.py": {
+      "sha256": "569a109ca1a46ed10eb42b5353240b91193eaed74d62ae3002bec6f04a35c95a",
+      "bytes": 3975
+    },
+    "docs/wal/benchmarks/artifacts/rfc-026-v8-flush-fua-20261103-environment.json": {
+      "sha256": "6d2b01e49d74d4dd87d24dcb37c5b7be501d523697aa89e08aceefe0993a0252",
+      "bytes": 354
+    },
+    "docs/wal/benchmarks/artifacts/rfc-026-v8-flush-fua-20261103-full-apst-disabled.perf.gz": {
+      "sha256": "189d5375ff871a278f79cba5dc4e7cc75ba84fb3fd9bf7a0fe177960bff2bced",
+      "bytes": 174276
+    },
+    "docs/wal/benchmarks/artifacts/rfc-026-v8-flush-fua-20261103-full-original.perf.gz": {
+      "sha256": "e783eb6194c7420545c411bccb6a06fb73c2cf85a6efb2db093172b7f44775eb",
+      "bytes": 170883
+    },
+    "docs/wal/benchmarks/artifacts/rfc-026-v8-flush-fua-20261103-full-restored.perf.gz": {
+      "sha256": "d9c0e4c13ffa1f851744c13573d8c171d4b37674be4e5376506cd6914d35ca60",
+      "bytes": 117074
+    },
+    "docs/wal/benchmarks/artifacts/rfc-026-v8-flush-fua-20261103-guard.py": {
+      "sha256": "7da31dd0ba3bdb9a176d030a3e23e9f494238c406dbc0443f41b2688c7d9d109",
+      "bytes": 7260
+    },
+    "docs/wal/benchmarks/artifacts/rfc-026-v8-flush-fua-20261103-inspect.py": {
+      "sha256": "fb7f5adfa1515da5aabe76db01eae7853a55159e6f5262b68b951cb5a5c7bf64",
+      "bytes": 2561
+    },
+    "docs/wal/benchmarks/artifacts/rfc-026-v8-flush-fua-20261103-measurements.json": {
+      "sha256": "cf003b3b4b9bdc2e025402832b862922f8eda523bba61773cdabe674f1fe7565",
+      "bytes": 689051
+    },
+    "docs/wal/benchmarks/artifacts/rfc-026-v8-flush-fua-20261103-nvme_readonly.py": {
+      "sha256": "b740dc2efcc918d942d89175f231d7643e31b1dbaadd7f49bb30703c493ac431",
+      "bytes": 1668
+    },
+    "docs/wal/benchmarks/artifacts/rfc-026-v8-flush-fua-20261103-nvme_setup_cmd-format.txt": {
+      "sha256": "762735930750befc4947482b68e1ca8a79346f40d82653909617fe9512de9416",
+      "bytes": 3820
+    },
+    "docs/wal/benchmarks/artifacts/rfc-026-v8-flush-fua-20261103-probe.py": {
+      "sha256": "5cc39ea3201e1787c04ec726c3953d68d67aa51a11b1506d245a5574616e4631",
+      "bytes": 3064
+    },
+    "docs/wal/benchmarks/artifacts/rfc-026-v8-flush-fua-20261103-smoke-smoke.perf.gz": {
+      "sha256": "68ce516b3a2dd8a098d1308cdfa15d1cafd58391516f8c2803e1f43eef22ba63",
+      "bytes": 91339
+    },
+    "docs/wal/benchmarks/artifacts/rfc-026-v8-flush-fua-20261103-summary.json": {
+      "sha256": "dbe83f5cea1131a0c6f1ae7bdacabd35162bb71c69324c1e12aa95c4c171aa10",
+      "bytes": 39398
+    }
+  }
+}

@@ -1,0 +1,14 @@
+{
+  "kernel": "6.12.71-1-lts",
+  "perf_version": "perf version 6.19-2",
+  "fio": null,
+  "nvme_cli": null,
+  "python": "3.14.2 (main, Jan  2 2026, 14:27:39) [GCC 15.2.1 20251112]",
+  "native_loss_checks": {
+    "confirm.perf": 0,
+    "full-apst-disabled.perf": 0,
+    "full-original.perf": 0,
+    "full-restored.perf": 0,
+    "smoke-smoke.perf": 0
+  }
+}

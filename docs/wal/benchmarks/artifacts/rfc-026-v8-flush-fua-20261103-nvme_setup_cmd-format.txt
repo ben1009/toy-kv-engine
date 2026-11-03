@@ -1,0 +1,20 @@
+name: nvme_setup_cmd
+ID: 1642
+format:
+	field:unsigned short common_type;	offset:0;	size:2;	signed:0;
+	field:unsigned char common_flags;	offset:2;	size:1;	signed:0;
+	field:unsigned char common_preempt_count;	offset:3;	size:1;	signed:0;
+	field:int common_pid;	offset:4;	size:4;	signed:1;
+
+	field:char disk[32];	offset:8;	size:32;	signed:0;
+	field:int ctrl_id;	offset:40;	size:4;	signed:1;
+	field:int qid;	offset:44;	size:4;	signed:1;
+	field:u8 opcode;	offset:48;	size:1;	signed:0;
+	field:u8 flags;	offset:49;	size:1;	signed:0;
+	field:u8 fctype;	offset:50;	size:1;	signed:0;
+	field:u16 cid;	offset:52;	size:2;	signed:0;
+	field:u32 nsid;	offset:56;	size:4;	signed:0;
+	field:bool metadata;	offset:60;	size:1;	signed:0;
+	field:u8 cdw10[24];	offset:61;	size:24;	signed:0;
+
+print fmt: "nvme%d: %sqid=%d, cmdid=%u, nsid=%u, flags=0x%x, meta=0x%x, cmd=(%s %s)", REC->ctrl_id, nvme_trace_disk_name(p, REC->disk), REC->qid, REC->cid, REC->nsid, REC->flags, REC->metadata, ((REC->opcode) == nvme_fabrics_command ? __print_symbolic(REC->fctype, { nvme_fabrics_type_property_set, "nvme_fabrics_type_property_set" }, { nvme_fabrics_type_connect, "nvme_fabrics_type_connect" }, { nvme_fabrics_type_property_get, "nvme_fabrics_type_property_get" }, { nvme_fabrics_type_auth_send, "nvme_fabrics_type_auth_send" }, { nvme_fabrics_type_auth_receive, "nvme_fabrics_type_auth_receive" }) : ((REC->qid) ? __print_symbolic(REC->opcode, { nvme_cmd_flush, "nvme_cmd_flush" }, { nvme_cmd_write, "nvme_cmd_write" }, { nvme_cmd_read, "nvme_cmd_read" }, { nvme_cmd_write_uncor, "nvme_cmd_write_uncor" }, { nvme_cmd_compare, "nvme_cmd_compare" }, { nvme_cmd_write_zeroes, "nvme_cmd_write_zeroes" }, { nvme_cmd_dsm, "nvme_cmd_dsm" }, { nvme_cmd_verify, "nvme_cmd_verify" }, { nvme_cmd_resv_register, "nvme_cmd_resv_register" }, { nvme_cmd_resv_report, "nvme_cmd_resv_report" }, { nvme_cmd_resv_acquire, "nvme_cmd_resv_acquire" }, { nvme_cmd_resv_release, "nvme_cmd_resv_release" }, { nvme_cmd_zone_mgmt_send, "nvme_cmd_zone_mgmt_send" }, { nvme_cmd_zone_mgmt_recv, "nvme_cmd_zone_mgmt_recv" }, { nvme_cmd_zone_append, "nvme_cmd_zone_append" }) : __print_symbolic(REC->opcode, { nvme_admin_delete_sq, "nvme_admin_delete_sq" }, { nvme_admin_create_sq, "nvme_admin_create_sq" }, { nvme_admin_get_log_page, "nvme_admin_get_log_page" }, { nvme_admin_delete_cq, "nvme_admin_delete_cq" }, { nvme_admin_create_cq, "nvme_admin_create_cq" }, { nvme_admin_identify, "nvme_admin_identify" }, { nvme_admin_abort_cmd, "nvme_admin_abort_cmd" }, { nvme_admin_set_features, "nvme_admin_set_features" }, { nvme_admin_get_features, "nvme_admin_get_features" }, { nvme_admin_async_event, "nvme_admin_async_event" }, { nvme_admin_ns_mgmt, "nvme_admin_ns_mgmt" }, { nvme_admin_activate_fw, "nvme_admin_activate_fw" }, { nvme_admin_download_fw, "nvme_admin_download_fw" }, { nvme_admin_dev_self_test, "nvme_admin_dev_self_test" }, { nvme_admin_ns_attach, "nvme_admin_ns_attach" }, { nvme_admin_keep_alive, "nvme_admin_keep_alive" }, { nvme_admin_directive_send, "nvme_admin_directive_send" }, { nvme_admin_directive_recv, "nvme_admin_directive_recv" }, { nvme_admin_virtual_mgmt, "nvme_admin_virtual_mgmt" }, { nvme_admin_nvme_mi_send, "nvme_admin_nvme_mi_send" }, { nvme_admin_nvme_mi_recv, "nvme_admin_nvme_mi_recv" }, { nvme_admin_dbbuf, "nvme_admin_dbbuf" }, { nvme_admin_format_nvm, "nvme_admin_format_nvm" }, { nvme_admin_security_send, "nvme_admin_security_send" }, { nvme_admin_security_recv, "nvme_admin_security_recv" }, { nvme_admin_sanitize_nvm, "nvme_admin_sanitize_nvm" }, { nvme_admin_get_lba_status, "nvme_admin_get_lba_status" }))), ((REC->opcode) == nvme_fabrics_command ? nvme_trace_parse_fabrics_cmd(p, REC->fctype, REC->cdw10) : ((REC->qid) ? nvme_trace_parse_nvm_cmd(p, REC->opcode, REC->cdw10) : nvme_trace_parse_admin_cmd(p, REC->opcode, REC->cdw10)))
