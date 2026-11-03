@@ -1,3 +1,6 @@
+#[cfg(feature = "bench")]
+#[path = "write_perf/timeline.rs"]
+mod wal_timeline;
 mod wrapper;
 
 use parking_lot::Mutex;
@@ -3626,6 +3629,13 @@ fn run_wal_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
     Ok(vec![measurement])
 }
 
+#[derive(Default)]
+struct WalWriterResult {
+    latency_samples: Vec<u64>,
+    #[cfg(feature = "bench")]
+    spans: Vec<wal_timeline::RequestSpan>,
+}
+
 fn run_wal_batch_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>> {
     let workload = "wal_batch_concurrent";
     let path = prepare_path(cfg, workload)?;
@@ -3651,6 +3661,10 @@ fn run_wal_batch_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>
     let writer_threads = cfg.threads;
     let retry_pitr_barrier = cfg.pitr;
     let baseline = collect_counters(&engine)?;
+    #[cfg(feature = "bench")]
+    let timeline = wal_timeline::Capture::from_env(engine.clone())?;
+    #[cfg(feature = "bench")]
+    let timeline_enabled = timeline.is_some();
     let cpu_start = process_cpu_times();
     let per_thread = num_keys / writer_threads;
     let remainder = num_keys % writer_threads;
@@ -3661,12 +3675,18 @@ fn run_wal_batch_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>
         let eng = engine.clone();
         let val = value.clone();
         let sample_every = cfg.latency_sample_every;
-        handles.push(std::thread::spawn(move || -> Result<Vec<u64>> {
+        handles.push(std::thread::spawn(move || -> Result<WalWriterResult> {
             let thread_ops = per_thread + usize::from(t < remainder);
             let start_idx = t * per_thread + remainder.min(t);
             let mut next = 0usize;
             let mut batch_index = 0usize;
             let mut latency_samples = Vec::new();
+            #[cfg(feature = "bench")]
+            let mut spans = if timeline_enabled {
+                Vec::with_capacity(thread_ops.div_ceil(batch_size))
+            } else {
+                Vec::new()
+            };
             while next < thread_ops {
                 let current_batch = (thread_ops - next).min(batch_size);
                 let mut keys = Vec::with_capacity(current_batch);
@@ -3677,20 +3697,38 @@ fn run_wal_batch_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>
                     .iter()
                     .map(|key| WriteBatchRecord::Put(key.as_slice(), val.as_slice()))
                     .collect();
+                #[cfg(feature = "bench")]
+                let request_start = timeline_enabled
+                    .then(wal_timeline::monotonic_ns)
+                    .transpose()?;
                 let sample_start = sample_every
                     .filter(|every| batch_index.is_multiple_of(*every))
                     .map(|_| Instant::now());
                 with_pitr_admission_retry(retry_pitr_barrier, || eng.write_batch(&batch))?;
+                #[cfg(feature = "bench")]
+                if let Some(start_ns) = request_start {
+                    spans.push(wal_timeline::RequestSpan {
+                        start_ns,
+                        end_ns: wal_timeline::monotonic_ns()?,
+                        puts: current_batch as u64,
+                    });
+                }
                 if let Some(sample_start) = sample_start {
                     latency_samples.push(sample_start.elapsed().as_nanos() as u64);
                 }
                 next += current_batch;
                 batch_index += 1;
             }
-            Ok(latency_samples)
+            Ok(WalWriterResult {
+                latency_samples,
+                #[cfg(feature = "bench")]
+                spans,
+            })
         }));
     }
     let mut latency_samples = Vec::new();
+    #[cfg(feature = "bench")]
+    let mut timeline_spans = Vec::new();
     let mut writer_error = None;
     for handle in handles {
         let result = match handle.join() {
@@ -3698,7 +3736,11 @@ fn run_wal_batch_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>
             Err(_) => Err(anyhow!("writer thread panicked")),
         };
         match result {
-            Ok(samples) => latency_samples.extend(samples),
+            Ok(output) => {
+                latency_samples.extend(output.latency_samples);
+                #[cfg(feature = "bench")]
+                timeline_spans.extend(output.spans);
+            }
             Err(error) => {
                 writer_error.get_or_insert(error);
             }
@@ -3711,6 +3753,10 @@ fn run_wal_batch_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>
     let elapsed = start.elapsed();
     let (process_cpu_user_ms, process_cpu_system_ms) =
         process_cpu_delta(cpu_start, process_cpu_times());
+    #[cfg(feature = "bench")]
+    let timeline_output = timeline
+        .map(|capture| capture.finish(timeline_spans))
+        .transpose()?;
     #[cfg(feature = "bench")]
     let wal_pipeline = wal_pipeline_record(&engine, cfg.profile, wal_run_info)?;
     #[cfg(not(feature = "bench"))]
@@ -3733,6 +3779,10 @@ fn run_wal_batch_concurrent(cfg: &HarnessConfig) -> Result<Vec<BenchMeasurement>
     }
     let counters = collect_counter_delta(&baseline, &collect_counters(&engine)?);
     engine.close()?;
+    #[cfg(feature = "bench")]
+    if let Some(output) = timeline_output {
+        output.persist()?;
+    }
     cleanup.finalize()?;
 
     let mut measurement = make_measurement(

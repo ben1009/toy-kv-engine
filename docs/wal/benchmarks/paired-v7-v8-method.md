@@ -6,6 +6,11 @@ therefore need separate conclusions. This method supplements the existing
 RFC gates; it does not replace them or promote slow-state captures into
 normal best-score tables.
 
+A separate [passive trace method](passive-wal-trace-method.md) records native
+NVMe/block events and joins monotonic application intervals without detection
+writes. Its calibrated signal currently has limited coverage; it does not
+retroactively change this probe protocol or its rejected results.
+
 ## Three questions
 
 | Level | Question | Evidence |
